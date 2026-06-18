@@ -17,4 +17,4 @@ includes = ["*.nix"]
 [formatter.oxfmt]
 command = "oxfmt"
 options = ["--write"]
-includes = ["*.js", "*.json", "*.yaml", "*.toml", "*.md"]
+includes = ["*.js", "*.html", "*.json", "*.yaml", "*.toml", "*.md"]

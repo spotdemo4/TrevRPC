@@ -8,6 +8,7 @@
   },
   "files": [
     "bin",
+    "examples",
     "src"
   ],
   "type": "module",
@@ -17,6 +18,7 @@
   },
   "scripts": {
     "check": "npm run lint && npm test",
+    "example:greeter": "node examples/greeter/static-server.js",
     "format": "oxfmt --write",
     "format:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",

@@ -125,6 +125,20 @@ test("generated JavaScript clients call the runtime", async () => {
   assert.equal(reply.message, "hello Trev");
 });
 
+test("checked-in greeter example binding targets the shared service", async () => {
+  const example = await import("../examples/greeter/greeter.trevrpc.js");
+
+  assert.equal(example.GreeterService.fullName, "example.greeter.Greeter");
+  assert.deepEqual(Object.keys(example.GreeterService.methods), [
+    "sayHello",
+    "lotsOfReplies",
+    "lotsOfGreetings",
+    "bidiHello",
+  ]);
+  assert.equal(example.root.lookupType("example.greeter.HelloRequest").fields.name.id, 1);
+  assert.equal(example.root.lookupType("example.greeter.HelloReply").fields.message.id, 1);
+});
+
 function greeterRequest(parameter = "") {
   return {
     parameter,

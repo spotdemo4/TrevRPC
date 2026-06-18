@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TrevRPC JavaScript Greeter Client</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at top left, rgb(80 80 180 / 30%), transparent 35rem), Canvas;
+        color: CanvasText;
+      }
+
+      main {
+        box-sizing: border-box;
+        width: min(54rem, 100%);
+        margin: 0 auto;
+        padding: 3rem 1rem;
+      }
+
+      form,
+      pre {
+        border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+        border-radius: 1rem;
+        background: color-mix(in srgb, Canvas 92%, CanvasText 8%);
+        box-shadow: 0 1rem 3rem rgb(0 0 0 / 12%);
+      }
+
+      form {
+        display: grid;
+        gap: 1rem;
+        padding: 1rem;
+      }
+
+      label {
+        display: grid;
+        gap: 0.35rem;
+        font-weight: 700;
+      }
+
+      input,
+      button {
+        border: 1px solid color-mix(in srgb, CanvasText 22%, transparent);
+        border-radius: 0.7rem;
+        font: inherit;
+        padding: 0.75rem;
+      }
+
+      button {
+        cursor: pointer;
+        font-weight: 800;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+      }
+
+      #submit {
+        background: #5b5bd6;
+        color: white;
+      }
+
+      small {
+        opacity: 0.75;
+      }
+
+      pre {
+        min-height: 14rem;
+        overflow: auto;
+        padding: 1rem;
+        white-space: pre-wrap;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "protobufjs": "https://esm.sh/protobufjs@7.6.4"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>TrevRPC JavaScript Greeter Client</h1>
+      <p>
+        Connect this page to a WebTransport-enabled TrevRPC Go or Rust greeter server and run all
+        four RPC shapes from the browser.
+      </p>
+
+      <form id="client-form">
+        <label>
+          WebTransport URL
+          <input name="url" required value="https://127.0.0.1:50051/trevrpc" />
+        </label>
+        <div class="actions">
+          <button type="button" data-url="https://127.0.0.1:50051/trevrpc">Go default URL</button>
+          <button type="button" data-url="https://127.0.0.1:5000/trevrpc">Rust default URL</button>
+        </div>
+        <label>
+          Name
+          <input name="name" value="TrevRPC" />
+        </label>
+        <label>
+          Bearer token
+          <input name="token" placeholder="local-example-token for the Rust example server" />
+        </label>
+        <label>
+          Server certificate SHA-256 hash
+          <input name="certificate-hash" placeholder="optional hex or base64 hash" />
+          <small>Leave empty when the browser already trusts the server certificate.</small>
+        </label>
+        <button id="submit" type="submit">Run RPCs</button>
+      </form>
+
+      <h2>Output</h2>
+      <pre id="output" aria-live="polite"></pre>
+    </main>
+    <script type="module" src="./client.js"></script>
+  </body>
+</html>
