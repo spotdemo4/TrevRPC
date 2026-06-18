@@ -30,30 +30,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PACKAGES: |
-            packages.x86_64-linux.default.aarch64-unknown-linux-musl
-            packages.x86_64-linux.default.armv7l-unknown-linux-musleabihf
-            packages.x86_64-linux.default.x86_64-unknown-linux-musl
-            packages.x86_64-linux.default.x86_64-w64-mingw32
-            images.x86_64-linux.default.aarch64-unknown-linux-musl
-            images.x86_64-linux.default.armv7l-unknown-linux-musleabihf
-            images.x86_64-linux.default.x86_64-unknown-linux-musl
-
-  darwin:
-    runs-on: macos-26
-    permissions:
-      id-token: write
-      contents: write
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@1fdd7d95bd30822380ce472de2bd4e40bc7e648b # v1.52.0
-        with:
-          fetch_depth: 0
-          shell: release
-
-      - name: Release to GitHub
-        run: flake-release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PACKAGES: |
-            packages.aarch64-darwin.default
-            packages.aarch64-darwin.default.x86_64-apple-darwin
+            packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl
+            packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl

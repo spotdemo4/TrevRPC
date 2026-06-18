@@ -9,6 +9,34 @@ permissions:
   contents: read
 
 jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@0ed51e7d18520fd8adba3839acc6ded28fcb4db3 # v1.51.0
+        with:
+          shell: vulnerable
+
+      - name: Run cargo audit
+        working-directory: trevrpc-rust
+        run: cargo-audit audit
+
+  go:
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@0ed51e7d18520fd8adba3839acc6ded28fcb4db3 # v1.51.0
+        with:
+          shell: vulnerable
+
+      - name: Run govulncheck
+        working-directory: trevrpc-go
+        run: govulncheck ./...
+
   nix:
     runs-on: ubuntu-24.04
     permissions:
@@ -34,17 +62,3 @@ jobs:
 
       - name: Run zizmor
         run: zizmor .github
-
-  rust:
-    runs-on: ubuntu-24.04
-    permissions:
-      id-token: write
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@1fdd7d95bd30822380ce472de2bd4e40bc7e648b # v1.52.0
-        with:
-          shell: vulnerable
-
-      - name: Run cargo audit
-        run: cargo-audit audit
-        working-directory: trevrpc-rust
