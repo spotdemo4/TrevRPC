@@ -25,7 +25,7 @@ path = "main.rs"
 [features]
 default = ["client", "server", "quinn"]
 client = ["dep:tokio"]
-server = []
+server = ["dep:tokio"]
 quinn = ["client", "server", "dep:quinn", "dep:tokio"]
 tracing = ["dep:tracing"]
 

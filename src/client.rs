@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::stream::MessageStream;
@@ -14,6 +14,9 @@ use prost::Message;
 pub struct CallOptions {
     timeout: Option<Duration>,
     max_response_body_size: usize,
+    max_response_messages: Option<usize>,
+    max_response_stream_body_size: Option<usize>,
+    stream_idle_timeout: Option<Duration>,
     metadata: Metadata,
 }
 
@@ -22,6 +25,9 @@ impl Default for CallOptions {
         Self {
             timeout: None,
             max_response_body_size: DEFAULT_MAX_FRAME_SIZE,
+            max_response_messages: Some(4096),
+            max_response_stream_body_size: Some(64 * 1024 * 1024),
+            stream_idle_timeout: Some(Duration::from_secs(30)),
             metadata: Metadata::new(),
         }
     }
@@ -44,6 +50,21 @@ impl CallOptions {
     }
 
     #[must_use]
+    pub const fn max_response_messages(&self) -> Option<usize> {
+        self.max_response_messages
+    }
+
+    #[must_use]
+    pub const fn max_response_stream_body_size(&self) -> Option<usize> {
+        self.max_response_stream_body_size
+    }
+
+    #[must_use]
+    pub const fn stream_idle_timeout(&self) -> Option<Duration> {
+        self.stream_idle_timeout
+    }
+
+    #[must_use]
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
@@ -63,6 +84,30 @@ impl CallOptions {
     #[must_use]
     pub const fn with_max_response_body_size(mut self, max_response_body_size: usize) -> Self {
         self.max_response_body_size = max_response_body_size;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_response_messages(
+        mut self,
+        max_response_messages: Option<usize>,
+    ) -> Self {
+        self.max_response_messages = max_response_messages;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_response_stream_body_size(
+        mut self,
+        max_response_stream_body_size: Option<usize>,
+    ) -> Self {
+        self.max_response_stream_body_size = max_response_stream_body_size;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_stream_idle_timeout(mut self, stream_idle_timeout: Option<Duration>) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
         self
     }
 
@@ -111,11 +156,17 @@ where
     let CallOptions {
         timeout,
         max_response_body_size,
+        max_response_messages: _,
+        max_response_stream_body_size: _,
+        stream_idle_timeout: _,
         metadata,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
+    let deadline_unix_nanos = deadline_unix_nanos(timeout)?;
 
-    let request = RpcRequest::new(service, method, request.encode_to_vec()).with_metadata(metadata);
+    let request = RpcRequest::new(service, method, request.encode_to_vec())
+        .with_metadata(metadata)
+        .with_deadline_unix_nanos(deadline_unix_nanos);
     let response = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, transport.call(request))
             .await
@@ -157,6 +208,9 @@ where
         request,
         deadline,
         max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
     } = prepare_streaming_request(
         service,
         method,
@@ -170,6 +224,9 @@ where
     Ok(Box::new(ResponseMessageStream::<Res>::new(
         response,
         max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
         deadline,
     )))
 }
@@ -190,6 +247,9 @@ where
         request,
         deadline,
         max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
     } = prepare_streaming_request(
         service,
         method,
@@ -205,7 +265,15 @@ where
     )
     .await?;
 
-    read_unary_response_from_stream(response, max_response_body_size, deadline).await
+    read_unary_response_from_stream(
+        response,
+        max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
+        deadline,
+    )
+    .await
 }
 
 pub async fn bidirectional_streaming<T, Req, Res>(
@@ -224,6 +292,9 @@ where
         request,
         deadline,
         max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
     } = prepare_streaming_request(
         service,
         method,
@@ -242,6 +313,9 @@ where
     Ok(Box::new(ResponseMessageStream::<Res>::new(
         response,
         max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
         deadline,
     )))
 }
@@ -250,6 +324,9 @@ struct PreparedStreamingCall {
     request: RpcRequest,
     deadline: Option<Instant>,
     max_response_body_size: usize,
+    max_response_messages: Option<usize>,
+    max_response_stream_body_size: Option<usize>,
+    stream_idle_timeout: Option<Duration>,
 }
 
 fn prepare_streaming_request(
@@ -262,17 +339,46 @@ fn prepare_streaming_request(
     let CallOptions {
         timeout,
         max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
         metadata,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
+    let deadline_unix_nanos = deadline_unix_nanos(timeout)?;
 
     Ok(PreparedStreamingCall {
         request: RpcRequest::new(service, method, body)
             .with_kind(kind)
-            .with_metadata(metadata),
+            .with_metadata(metadata)
+            .with_deadline_unix_nanos(deadline_unix_nanos),
         deadline: timeout.and_then(|timeout| Instant::now().checked_add(timeout)),
         max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
     })
+}
+
+fn deadline_unix_nanos(timeout: Option<Duration>) -> Result<u64> {
+    let Some(timeout) = timeout else {
+        return Ok(0);
+    };
+
+    let deadline = SystemTime::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::from(Status::invalid_argument("RPC deadline overflowed")))?;
+    let nanos = deadline
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| {
+            Error::from(Status::invalid_argument(
+                "RPC deadline is before Unix epoch",
+            ))
+        })?
+        .as_nanos();
+
+    u64::try_from(nanos)
+        .map_err(|_| Error::from(Status::invalid_argument("RPC deadline is too large")))
 }
 
 async fn streaming_call_with_deadline<T>(
@@ -297,13 +403,22 @@ where
 async fn read_unary_response_from_stream<Res>(
     response: BoxMessageStream<RpcStreamFrame>,
     max_response_body_size: usize,
+    max_response_messages: Option<usize>,
+    max_response_stream_body_size: Option<usize>,
+    stream_idle_timeout: Option<Duration>,
     deadline: Option<Instant>,
 ) -> Result<Res>
 where
     Res: Message + Default + Send + 'static,
 {
-    let mut response =
-        ResponseMessageStream::<Res>::new(response, max_response_body_size, deadline);
+    let mut response = ResponseMessageStream::<Res>::new(
+        response,
+        max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
+        deadline,
+    );
     let Some(first) = response.next().await else {
         return Err(Error::from(Status::internal(
             "response stream ended without a response message",
@@ -323,6 +438,11 @@ where
 struct ResponseMessageStream<T> {
     inner: BoxMessageStream<RpcStreamFrame>,
     max_body_size: usize,
+    max_messages: Option<usize>,
+    max_stream_body_size: Option<usize>,
+    stream_idle_timeout: Option<Duration>,
+    messages: usize,
+    stream_body_size: usize,
     deadline: Option<Instant>,
     done: bool,
     _marker: PhantomData<T>,
@@ -332,11 +452,19 @@ impl<T> ResponseMessageStream<T> {
     const fn new(
         inner: BoxMessageStream<RpcStreamFrame>,
         max_body_size: usize,
+        max_messages: Option<usize>,
+        max_stream_body_size: Option<usize>,
+        stream_idle_timeout: Option<Duration>,
         deadline: Option<Instant>,
     ) -> Self {
         Self {
             inner,
             max_body_size,
+            max_messages,
+            max_stream_body_size,
+            stream_idle_timeout,
+            messages: 0,
+            stream_body_size: 0,
             deadline,
             done: false,
             _marker: PhantomData,
@@ -354,27 +482,51 @@ where
             return None;
         }
 
-        let frame = match next_frame_with_deadline(&mut self.inner, self.deadline).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => {
-                self.done = true;
-                return Some(Err(Error::from(Status::internal(
-                    "response stream ended before final status",
-                ))));
-            }
-            Err(error) => {
-                self.done = true;
-                return Some(Err(error));
-            }
-        };
+        let frame =
+            match next_frame_with_timeout(&mut self.inner, self.deadline, self.stream_idle_timeout)
+                .await
+            {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    self.done = true;
+                    return Some(Err(Error::from(Status::internal(
+                        "response stream ended before final status",
+                    ))));
+                }
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            };
 
         match frame.frame_kind() {
             Some(RpcStreamFrameKind::Message) => {
+                if let Some(max) = self.max_messages
+                    && self.messages >= max
+                {
+                    self.done = true;
+                    return Some(Err(Error::from(Status::resource_exhausted(format!(
+                        "response stream exceeded maximum of {max} messages"
+                    )))));
+                }
+
                 if frame.body.len() > self.max_body_size {
                     return Some(Err(Error::FrameTooLarge {
                         len: frame.body.len(),
                         max: self.max_body_size,
                     }));
+                }
+
+                self.messages = self.messages.saturating_add(1);
+                self.stream_body_size = self.stream_body_size.saturating_add(frame.body.len());
+
+                if let Some(max) = self.max_stream_body_size
+                    && self.stream_body_size > max
+                {
+                    self.done = true;
+                    return Some(Err(Error::from(Status::resource_exhausted(format!(
+                        "response stream exceeded maximum body size of {max} bytes"
+                    )))));
                 }
 
                 Some(T::decode(frame.body.as_slice()).map_err(Error::from))
@@ -402,17 +554,48 @@ where
     }
 }
 
-async fn next_frame_with_deadline(
+async fn next_frame_with_timeout(
     stream: &mut BoxMessageStream<RpcStreamFrame>,
     deadline: Option<Instant>,
+    idle_timeout: Option<Duration>,
 ) -> Result<Option<RpcStreamFrame>> {
-    match remaining_timeout(deadline)? {
-        Some(timeout) => tokio::time::timeout(timeout, stream.next())
+    match next_timeout(deadline, idle_timeout)? {
+        Some((timeout, reason)) => tokio::time::timeout(timeout, stream.next())
             .await
-            .map_err(|_| Error::from(Status::deadline_exceeded("RPC deadline exceeded")))?
+            .map_err(|_| Error::from(reason.status()))?
             .transpose(),
         None => stream.next().await.transpose(),
     }
+}
+
+#[derive(Clone, Copy)]
+enum TimeoutReason {
+    Deadline,
+    Idle,
+}
+
+impl TimeoutReason {
+    fn status(self) -> Status {
+        match self {
+            Self::Deadline => Status::deadline_exceeded("RPC deadline exceeded"),
+            Self::Idle => Status::unavailable("response stream idle timeout"),
+        }
+    }
+}
+
+fn next_timeout(
+    deadline: Option<Instant>,
+    idle_timeout: Option<Duration>,
+) -> Result<Option<(Duration, TimeoutReason)>> {
+    let deadline = remaining_timeout(deadline)?.map(|timeout| (timeout, TimeoutReason::Deadline));
+    let idle = idle_timeout.map(|timeout| (timeout, TimeoutReason::Idle));
+
+    Ok(match (deadline, idle) {
+        (Some(deadline), Some(idle)) if deadline.0 <= idle.0 => Some(deadline),
+        (Some(_) | None, Some(idle)) => Some(idle),
+        (Some(deadline), None) => Some(deadline),
+        (None, None) => None,
+    })
 }
 
 fn remaining_timeout(deadline: Option<Instant>) -> Result<Option<Duration>> {
@@ -446,9 +629,14 @@ fn validate_response_metadata(response: &RpcResponse) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RpcStreamFrame, Status};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use super::{CallOptions, read_unary_response_from_stream};
+    use crate::{Code, MessageStream, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+
+    use super::{
+        CallOptions, ResponseMessageStream, RpcTransport, read_unary_response_from_stream, unary,
+    };
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct TestMessage {
@@ -480,11 +668,189 @@ mod tests {
         let decoded = read_unary_response_from_stream::<TestMessage>(
             response,
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(4096),
+            Some(64 * 1024 * 1024),
+            Some(Duration::from_secs(30)),
             None,
         )
         .await
         .expect("response should decode");
 
         assert_eq!(decoded, message);
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingTransport {
+        request: Arc<Mutex<Option<RpcRequest>>>,
+    }
+
+    #[crate::async_trait]
+    impl RpcTransport for RecordingTransport {
+        async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
+            *self
+                .request
+                .lock()
+                .expect("request lock should not be poisoned") = Some(request);
+            Ok(RpcResponse::ok(prost::Message::encode_to_vec(
+                &TestMessage {
+                    value: "response".to_owned(),
+                },
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_calls_propagate_deadlines() {
+        let transport = RecordingTransport::default();
+        let request = TestMessage {
+            value: "request".to_owned(),
+        };
+
+        let response = unary::<_, _, TestMessage>(
+            &transport,
+            "example.Greeter",
+            "SayHello",
+            &request,
+            CallOptions::new().with_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .expect("unary call should succeed");
+
+        assert_eq!(response.value, "response");
+        let recorded = transport
+            .request
+            .lock()
+            .expect("request lock should not be poisoned")
+            .clone()
+            .expect("transport should receive request");
+        assert_eq!(recorded.service, "example.Greeter");
+        assert_eq!(recorded.method, "SayHello");
+        assert_ne!(recorded.deadline_unix_nanos, 0);
+    }
+
+    #[tokio::test]
+    async fn response_message_limit_returns_resource_exhausted() {
+        let message = TestMessage {
+            value: "hello".to_owned(),
+        };
+        let mut response = ResponseMessageStream::<TestMessage>::new(
+            crate::stream::from_iter([
+                RpcStreamFrame::message(prost::Message::encode_to_vec(&message)),
+                RpcStreamFrame::message(prost::Message::encode_to_vec(&message)),
+                RpcStreamFrame::status(Status::ok()),
+            ]),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(1),
+            Some(64 * 1024 * 1024),
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        assert_eq!(
+            response
+                .next()
+                .await
+                .expect("first response should exist")
+                .expect("first response should decode"),
+            message
+        );
+        let error = response
+            .next()
+            .await
+            .expect("limit error should be emitted")
+            .expect_err("second response should exceed message limit");
+
+        assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_stream_body_limit_returns_resource_exhausted() {
+        let first = TestMessage {
+            value: "one".to_owned(),
+        };
+        let second = TestMessage {
+            value: "two".to_owned(),
+        };
+        let mut response = ResponseMessageStream::<TestMessage>::new(
+            crate::stream::from_iter([
+                RpcStreamFrame::message(prost::Message::encode_to_vec(&first)),
+                RpcStreamFrame::message(prost::Message::encode_to_vec(&second)),
+                RpcStreamFrame::status(Status::ok()),
+            ]),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(4096),
+            Some(prost::Message::encoded_len(&first)),
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        assert_eq!(
+            response
+                .next()
+                .await
+                .expect("first response should exist")
+                .expect("first response should decode"),
+            first
+        );
+        let error = response
+            .next()
+            .await
+            .expect("limit error should be emitted")
+            .expect_err("second response should exceed byte limit");
+
+        assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+        assert!(response.next().await.is_none());
+    }
+
+    struct PendingFrameStream;
+
+    #[crate::async_trait]
+    impl MessageStream<RpcStreamFrame> for PendingFrameStream {
+        async fn next(&mut self) -> Option<Result<RpcStreamFrame>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_idle_timeout_returns_unavailable() {
+        let mut response = ResponseMessageStream::<TestMessage>::new(
+            Box::new(PendingFrameStream),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(4096),
+            Some(64 * 1024 * 1024),
+            Some(Duration::from_millis(1)),
+            None,
+        );
+
+        let error = response
+            .next()
+            .await
+            .expect("timeout error should be emitted")
+            .expect_err("pending response should hit idle timeout");
+
+        assert_eq!(error.into_status().code(), Code::Unavailable);
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_stream_deadline_returns_deadline_exceeded() {
+        let mut response = ResponseMessageStream::<TestMessage>::new(
+            Box::new(PendingFrameStream),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(4096),
+            Some(64 * 1024 * 1024),
+            Some(Duration::from_secs(30)),
+            Some(std::time::Instant::now() + Duration::from_millis(1)),
+        );
+
+        let error = response
+            .next()
+            .await
+            .expect("timeout error should be emitted")
+            .expect_err("pending response should hit deadline");
+
+        assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+        assert!(response.next().await.is_none());
     }
 }

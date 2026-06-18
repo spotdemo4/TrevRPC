@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 pub type Metadata = HashMap<String, Vec<u8>>;
 
+pub const WIRE_VERSION: u32 = 1;
+
 pub const MAX_METADATA_ENTRIES: usize = 64;
 pub const MAX_METADATA_KEY_LEN: usize = 128;
 pub const MAX_METADATA_VALUE_LEN: usize = 8 * 1024;
@@ -106,6 +108,10 @@ pub struct RpcRequest {
     pub metadata: Metadata,
     #[prost(enumeration = "RpcKind", tag = "5")]
     pub kind: i32,
+    #[prost(uint32, tag = "6")]
+    pub version: u32,
+    #[prost(uint64, tag = "7")]
+    pub deadline_unix_nanos: u64,
 }
 
 impl RpcRequest {
@@ -117,7 +123,20 @@ impl RpcRequest {
             body,
             metadata: Metadata::new(),
             kind: RpcKind::Unary as i32,
+            version: WIRE_VERSION,
+            deadline_unix_nanos: 0,
         }
+    }
+
+    pub fn validate_protocol(&self) -> std::result::Result<(), crate::Status> {
+        if self.version != WIRE_VERSION {
+            return Err(crate::Status::failed_precondition(format!(
+                "unsupported TrevRPC wire version {}; expected {WIRE_VERSION}",
+                self.version
+            )));
+        }
+
+        Ok(())
     }
 
     #[must_use]
@@ -128,6 +147,12 @@ impl RpcRequest {
     #[must_use]
     pub const fn with_kind(mut self, kind: RpcKind) -> Self {
         self.kind = kind as i32;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_deadline_unix_nanos(mut self, deadline_unix_nanos: u64) -> Self {
+        self.deadline_unix_nanos = deadline_unix_nanos;
         self
     }
 
@@ -218,8 +243,11 @@ mod tests {
 
     use super::{
         MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN, RpcKind, RpcRequest,
-        RpcStreamFrame, RpcStreamFrameKind, normalize_metadata_key, validate_metadata,
+        RpcStreamFrame, RpcStreamFrameKind, WIRE_VERSION, normalize_metadata_key,
+        validate_metadata,
     };
+
+    use prost::Message;
 
     #[test]
     fn validates_well_formed_metadata() {
@@ -268,6 +296,19 @@ mod tests {
         let request = RpcRequest::new("service", "method", Vec::new());
 
         assert_eq!(request.rpc_kind(), RpcKind::Unary);
+        assert_eq!(request.version, WIRE_VERSION);
+    }
+
+    #[test]
+    fn rejects_unsupported_wire_versions() {
+        let mut request = RpcRequest::new("service", "method", Vec::new());
+        request.version = WIRE_VERSION + 1;
+
+        let status = request
+            .validate_protocol()
+            .expect_err("version should be rejected");
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
     }
 
     #[test]
@@ -277,5 +318,24 @@ mod tests {
         assert_eq!(frame.frame_kind(), Some(RpcStreamFrameKind::Status));
         assert_eq!(frame.status_value().code(), Code::Unavailable);
         assert_eq!(frame.status_value().message(), "retry later");
+    }
+
+    #[test]
+    fn unary_request_encoding_is_stable() {
+        let request = RpcRequest::new("svc", "m", b"hi".to_vec());
+
+        assert_eq!(
+            request.encode_to_vec(),
+            b"\x0a\x03svc\x12\x01m\x1a\x02hi\x30\x01"
+        );
+    }
+
+    #[test]
+    fn stream_frame_encoding_is_stable() {
+        let message = RpcStreamFrame::message(b"hi".to_vec());
+        assert_eq!(message.encode_to_vec(), b"\x22\x02hi");
+
+        let status = RpcStreamFrame::status(crate::Status::unavailable("down"));
+        assert_eq!(status.encode_to_vec(), b"\x08\x01\x10\x0e\x1a\x04down");
     }
 }

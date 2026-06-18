@@ -117,8 +117,18 @@ impl Status {
     }
 
     #[must_use]
+    pub fn resource_exhausted(message: impl Into<String>) -> Self {
+        Self::new(Code::ResourceExhausted, message)
+    }
+
+    #[must_use]
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(Code::Unavailable, message)
+    }
+
+    #[must_use]
+    pub fn failed_precondition(message: impl Into<String>) -> Self {
+        Self::new(Code::FailedPrecondition, message)
     }
 
     #[must_use]
