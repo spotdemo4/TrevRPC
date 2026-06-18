@@ -1,0 +1,83 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1781328464,
+        "narHash": "sha256-j9uBlHI0eJ9zWU9IlF6SlBBPdeJu30hcvar31IRKHpw=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "5a722a7155bfc9fbe657f28d26b71860d95324bc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "systems": "systems",
+        "trevpkgs": "trevpkgs"
+      }
+    },
+    "schema": {
+      "locked": {
+        "lastModified": 1780327564,
+        "narHash": "sha256-HiRPtA0spK+Dkgbhz/1zW9glXxNVB+L4Rj2VYmdawb8=",
+        "owner": "DeterminateSystems",
+        "repo": "flake-schemas",
+        "rev": "6cc9bd98891b1fc6bb2b8cb3277df8bc72799ca6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "DeterminateSystems",
+        "repo": "flake-schemas",
+        "type": "github"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1774907047,
+        "narHash": "sha256-dhGYA99iXafW9QblBWbh5mggjbdJt0SZO8vzuL0XvKo=",
+        "owner": "spotdemo4",
+        "repo": "systems",
+        "rev": "7759b373a7b0119835939988964a9b49bc3023af",
+        "type": "github"
+      },
+      "original": {
+        "owner": "spotdemo4",
+        "repo": "systems",
+        "type": "github"
+      }
+    },
+    "trevpkgs": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "schema": "schema",
+        "systems": [
+          "systems"
+        ]
+      },
+      "locked": {
+        "lastModified": 1781420388,
+        "narHash": "sha256-aRhbDggg8MorgUWihHFj+qtkglqxkAGIwbRqwVJyhqI=",
+        "owner": "spotdemo4",
+        "repo": "trevpkgs",
+        "rev": "0a85d32350f1cbcd2534b89ebb1b5bfd93a0b74e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "spotdemo4",
+        "repo": "trevpkgs",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# yaml-language-server-disable is not allowed
+enable-openid-connect: true
+
+jobs:
+  linux:
+    # zizmor: ignore[excessive-permissions]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@0ed51e7d18520fd8adba3839acc6ded28fcb4db3 # v1.51.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          fetch_depth: 0
+          shell: release
+
+      - name: Release to Forgejo
+        run: flake-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          REGISTRY: trev.zip
+          REGISTRY_PASSWORD: ${{ secrets.PACKAGE_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: true
+          PACKAGES: |
+            packages.x86_64-linux.default.x86_64-unknown-linux-musl
+            packages.x86_64-linux.default.aarch64-unknown-linux-musl
+            packages.x86_64-linux.default.armv7l-unknown-linux-musleabihf
+            packages.x86_64-linux.default.x86_64-w64-mingw32
+            images.x86_64-linux.default.x86_64-unknown-linux-musl
+            images.x86_64-linux.default.aarch64-unknown-linux-musl
+            images.x86_64-linux.default.armv7l-unknown-linux-musleabihf
+
+      - name: Release to Cargo
+        run: cargo publish --registry forgejo --locked # zizmor: ignore[use-trusted-publishing]
+        env:
+          CARGO_REGISTRIES_FORGEJO_INDEX: sparse+${{ forgejo.SERVER_URL }}/api/packages/${{ forgejo.REPOSITORY_OWNER }}/cargo/
+          CARGO_REGISTRIES_FORGEJO_TOKEN: Bearer ${{ secrets.PACKAGE_TOKEN }}

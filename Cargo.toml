@@ -1,0 +1,18 @@
+[package]
+name = "rust-template"
+version = "0.7.2"
+edition = "2024"
+rust-version = "1.95.0"
+description = "rust template"
+readme = "README.md"
+repository = "https://trev.zip/template/rust"
+license-file = "LICENSE"
+
+[lints.clippy]
+pedantic = "warn"
+
+[[bin]]
+name = "rust-template"
+path = "main.rs"
+
+[dependencies]

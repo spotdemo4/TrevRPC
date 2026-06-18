@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@0ed51e7d18520fd8adba3839acc6ded28fcb4db3 # v1.51.0
+        with:
+          fetch_depth: 0
+          shell: release
+
+      - name: Release to GitHub
+        run: flake-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGES: |
+            packages.x86_64-linux.default.aarch64-unknown-linux-musl
+            packages.x86_64-linux.default.armv7l-unknown-linux-musleabihf
+            packages.x86_64-linux.default.x86_64-unknown-linux-musl
+            packages.x86_64-linux.default.x86_64-w64-mingw32
+            images.x86_64-linux.default.aarch64-unknown-linux-musl
+            images.x86_64-linux.default.armv7l-unknown-linux-musleabihf
+            images.x86_64-linux.default.x86_64-unknown-linux-musl
+
+  darwin:
+    runs-on: macos-26
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@0ed51e7d18520fd8adba3839acc6ded28fcb4db3 # v1.51.0
+        with:
+          fetch_depth: 0
+          shell: release
+
+      - name: Release to GitHub
+        run: flake-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGES: |
+            packages.aarch64-darwin.default
+            packages.aarch64-darwin.default.x86_64-apple-darwin

@@ -1,0 +1,29 @@
+name: update
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # every day at 09:00 UTC
+  workflow_dispatch:
+
+# yaml-language-server-disable is not allowed
+enable-openid-connect: true
+
+jobs:
+  renovate:
+    # zizmor: ignore[excessive-permissions]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@0ed51e7d18520fd8adba3839acc6ded28fcb4db3 # v1.51.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          shell: update
+
+      - name: Renovate
+        run: renovate
+        env:
+          RENOVATE_CONFIG_FILE: .forgejo/renovate.json
+          RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+          RENOVATE_GITHUB_COM_TOKEN: ${{ secrets.GH_TOKEN }}
+          LOG_LEVEL: ${{ runner.debug == '1' && 'debug' || 'info' }}
