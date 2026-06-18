@@ -12,5 +12,5 @@ pub(super) fn certificate_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(home)
         .join(".config")
         .join("trevrpc")
-        .join("trevrpc-example-cert.der"))
+        .join("trevrpc-example-cert.pem"))
 }

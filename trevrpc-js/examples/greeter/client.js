@@ -5,6 +5,8 @@ const form = document.querySelector("#client-form");
 const output = document.querySelector("#output");
 const submit = document.querySelector("#submit");
 
+void loadExampleDefaults();
+
 form.addEventListener("submit", (event) => {
   event.preventDefault();
   void runFromForm(new FormData(form));
@@ -80,6 +82,28 @@ function webTransportOptions(certificateHash) {
       },
     ],
   };
+}
+
+async function loadExampleDefaults() {
+  try {
+    const response = await fetch("./certificate-hash.json", { cache: "no-store" });
+    if (!response.ok) {
+      return;
+    }
+
+    const config = await response.json();
+    if (typeof config.bearerToken === "string" && form.elements.token.value === "") {
+      form.elements.token.value = config.bearerToken;
+    }
+    if (config.exists && typeof config.sha256Base64 === "string") {
+      form.elements["certificate-hash"].value = config.sha256Base64;
+      log(`loaded certificate hash from ${config.path}`);
+    } else if (typeof config.path === "string") {
+      log(`certificate not found at ${config.path}; start a Go or Rust example server first`);
+    }
+  } catch (error) {
+    log(`could not load local certificate hash: ${error?.message ?? String(error)}`);
+  }
 }
 
 function parseSha256Hash(value) {

@@ -110,7 +110,7 @@
         </label>
         <div class="actions">
           <button type="button" data-url="https://127.0.0.1:50051/trevrpc">Go default URL</button>
-          <button type="button" data-url="https://127.0.0.1:5000/trevrpc">Rust default URL</button>
+          <button type="button" data-url="https://127.0.0.1:5001/trevrpc">Rust default URL</button>
         </div>
         <label>
           Name
@@ -118,12 +118,16 @@
         </label>
         <label>
           Bearer token
-          <input name="token" placeholder="local-example-token for the Rust example server" />
+          <input name="token" value="trevrpc-example-token" />
         </label>
         <label>
           Server certificate SHA-256 hash
           <input name="certificate-hash" placeholder="optional hex or base64 hash" />
-          <small>Leave empty when the browser already trusts the server certificate.</small>
+          <small>
+            The local static server loads this from
+            <code>~/.config/trevrpc/trevrpc-example-cert.pem</code> when available. Leave empty when
+            the browser already trusts the server certificate.
+          </small>
         </label>
         <button id="submit" type="submit">Run RPCs</button>
       </form>

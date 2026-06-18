@@ -15,7 +15,10 @@ import (
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/internal/examplecert"
 )
 
-const serverAddr = "127.0.0.1:50051"
+const (
+	serverAddr = "127.0.0.1:50051"
+	authToken  = "trevrpc-example-token"
+)
 
 func main() {
 	name := "TrevRPC"
@@ -37,7 +40,11 @@ func main() {
 	}
 	defer conn.CloseWithError(0, "client done")
 
-	client := greeter.NewGreeterClient(trevrpc.NewQuinnTransport(conn), trevrpc.WithTimeout(5*time.Second))
+	client := greeter.NewGreeterClient(
+		trevrpc.NewQuinnTransport(conn),
+		trevrpc.WithTimeout(5*time.Second),
+		trevrpc.WithMetadata("authorization", []byte("Bearer "+authToken)),
+	)
 	request := &greeter.HelloRequest{Name: name}
 
 	response, err := client.SayHello(ctx, request)

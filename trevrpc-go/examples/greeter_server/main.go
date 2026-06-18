@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -18,12 +19,16 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/internal/examplecert"
 )
 
-const listenAddr = "127.0.0.1:50051"
+const (
+	listenAddr = "127.0.0.1:50051"
+	authToken  = "trevrpc-example-token"
+)
 
 type greeterService struct{}
 
@@ -82,16 +87,25 @@ func main() {
 		log.Fatal(err)
 	}
 
-	listener, err := quic.ListenAddr(listenAddr, tlsConfig, &quic.Config{})
+	listener, err := quic.ListenAddr(listenAddr, tlsConfig, &quic.Config{
+		EnableDatagrams:                  true,
+		EnableStreamResetPartialDelivery: true,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer listener.Close()
 
 	server := trevrpc.NewServer()
+	server.SetAuthorizer(trevrpc.BearerAuthorizer(authToken))
+	options := server.Options()
+	options.EnableWebTransport = true
+	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, greeterService{})
 
-	log.Printf("greeter server listening on %s", listener.Addr())
+	log.Printf("greeter server listening on %s for native QUIC and WebTransport", listener.Addr())
+	log.Printf("WebTransport URL: https://%s/trevrpc", listener.Addr())
+	log.Printf("bearer token: %s", authToken)
 	log.Printf("wrote client trust certificate to %s", certPath)
 	if err := trevrpc.ServeQUIC(context.Background(), listener, server); err != nil {
 		log.Fatal(err)
@@ -99,7 +113,7 @@ func main() {
 }
 
 func serverTLSConfig() (*tls.Config, string, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, "", err
 	}
@@ -110,7 +124,7 @@ func serverTLSConfig() (*tls.Config, string, error) {
 		Subject:      pkix.Name{CommonName: "localhost"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{"localhost"},
 		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
@@ -122,7 +136,11 @@ func serverTLSConfig() (*tls.Config, string, error) {
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, "", err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, "", err
@@ -139,5 +157,5 @@ func serverTLSConfig() (*tls.Config, string, error) {
 		return nil, "", err
 	}
 
-	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN}}, certPath, nil
+	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN, http3.NextProtoH3}}, certPath, nil
 }

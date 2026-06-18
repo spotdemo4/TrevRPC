@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::pki_types::CertificateDer;
+use quinn::rustls::pki_types::pem::PemObject;
 
 #[path = "shared/cert.rs"]
 mod cert;
@@ -14,7 +15,7 @@ mod greeter;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5000";
 const DEFAULT_NAME: &str = "TrevRPC";
-const AUTH_TOKEN: &str = "local-example-token";
+const AUTH_TOKEN: &str = "trevrpc-example-token";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -87,9 +88,10 @@ fn call_options() -> trevrpc::client::CallOptions {
 }
 
 fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {
-    let cert_der = std::fs::read(cert::certificate_path()?)?;
+    let cert_pem = std::fs::read(cert::certificate_path()?)?;
+    let cert_der = CertificateDer::from_pem_slice(&cert_pem)?;
     let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(CertificateDer::from(cert_der))?;
+    roots.add(cert_der)?;
 
     let mut client_crypto = quinn::rustls::ClientConfig::builder()
         .with_root_certificates(roots)

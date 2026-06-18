@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 )
 
-const envName = "TREVRPC_GO_EXAMPLE_CERT"
+const envName = "TREVRPC_EXAMPLE_CERT"
 
 func Path() (string, error) {
 	if path := os.Getenv(envName); path != "" {
@@ -17,5 +17,5 @@ func Path() (string, error) {
 		return "", err
 	}
 
-	return filepath.Join(home, ".config", "trevrpc", "trevrpc-go-example-cert.pem"), nil
+	return filepath.Join(home, ".config", "trevrpc", "trevrpc-example-cert.pem"), nil
 }
