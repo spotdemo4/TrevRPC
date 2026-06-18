@@ -526,17 +526,25 @@ func (s *echoTestMessages) Recv() (*testMessage, error) {
 	return &testMessage{Value: "echo, " + request.Value}, nil
 }
 
+func (s *echoTestMessages) Close() error {
+	return s.requests.Close()
+}
+
 type pendingByteStream struct{}
 
 func (pendingByteStream) Recv() ([]byte, error) {
 	select {}
 }
 
+func (pendingByteStream) Close() error { return nil }
+
 type pendingFrameStream struct{}
 
 func (pendingFrameStream) Recv() (*RpcStreamFrame, error) {
 	select {}
 }
+
+func (pendingFrameStream) Close() error { return nil }
 
 type recordingMetrics struct {
 	mu    sync.Mutex
@@ -915,7 +923,7 @@ func TestQuicMTLSRejectsClientsWithoutCertificates(t *testing.T) {
 	}
 }
 
-func TestQuicMalformedRequestFramesReturnInternalStatus(t *testing.T) {
+func TestQuicMalformedRequestFramesReturnInvalidArgumentStatus(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
@@ -936,8 +944,8 @@ func TestQuicMalformedRequestFramesReturnInternalStatus(t *testing.T) {
 	if err := ReadFrame(stream, response, DefaultMaxFrameSize); err != nil {
 		t.Fatalf("read malformed response: %v", err)
 	}
-	if CodeFromUint32(response.Status) != CodeInternal {
-		t.Fatalf("expected internal status, got %#v", response)
+	if CodeFromUint32(response.Status) != CodeInvalidArgument {
+		t.Fatalf("expected invalid argument status, got %#v", response)
 	}
 }
 
@@ -1192,6 +1200,11 @@ func (s *firstThenPendingTestMessages) Recv() (*testMessage, error) {
 	}
 
 	select {}
+}
+
+func (s *firstThenPendingTestMessages) Close() error {
+	s.first = nil
+	return nil
 }
 
 func authenticatedOptions() []CallOption {

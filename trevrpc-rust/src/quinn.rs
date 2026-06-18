@@ -167,7 +167,7 @@ impl Drop for CancellableSendStream {
 
 struct QuinnResponseStream {
     recv: Option<quinn::RecvStream>,
-    write_task: JoinHandle<Result<()>>,
+    write_task: Option<JoinHandle<Result<()>>>,
     max_frame_size: usize,
     complete: bool,
 }
@@ -180,7 +180,7 @@ impl QuinnResponseStream {
     ) -> Self {
         Self {
             recv: Some(recv),
-            write_task,
+            write_task: Some(write_task),
             max_frame_size,
             complete: false,
         }
@@ -205,17 +205,53 @@ impl MessageStream<RpcStreamFrame> for QuinnResponseStream {
             Ok(Some(frame)) => {
                 if frame.frame_kind() == Some(RpcStreamFrameKind::Status) {
                     self.complete = true;
+                    if let Err(error) = self.stop_writer(true).await {
+                        return Some(Err(error));
+                    }
                 }
                 Some(Ok(frame))
             }
             Ok(None) => {
                 self.complete = true;
+                if let Err(error) = self.stop_writer(false).await {
+                    return Some(Err(error));
+                }
                 None
             }
             Err(error) => {
                 self.complete = true;
+                let _ = self.stop_writer(true).await;
                 Some(Err(error))
             }
+        }
+    }
+}
+
+impl QuinnResponseStream {
+    async fn stop_writer(&mut self, ignore_cancelled: bool) -> Result<()> {
+        let Some(write_task) = self.write_task.take() else {
+            return Ok(());
+        };
+
+        if !write_task.is_finished() {
+            write_task.abort();
+        }
+
+        match write_task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if ignore_cancelled && is_cancelled_error(&error) => Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(error) if ignore_cancelled && error.is_cancelled() => Ok(()),
+            Err(error) => Err(Error::transport(error)),
+        }
+    }
+}
+
+fn is_cancelled_error(error: &Error) -> bool {
+    match error {
+        Error::Status(status) => status.code() == crate::Code::Cancelled,
+        Error::Transport(_) | Error::Encode(_) | Error::Decode(_) | Error::FrameTooLarge { .. } => {
+            false
         }
     }
 }
@@ -228,7 +264,9 @@ impl Drop for QuinnResponseStream {
             let _ = recv.stop(CANCELLED_STREAM_CODE.into());
         }
 
-        self.write_task.abort();
+        if let Some(write_task) = &self.write_task {
+            write_task.abort();
+        }
     }
 }
 
@@ -567,21 +605,11 @@ async fn handle_connection(
                     continue;
                 };
 
-                let Some(request_permit) = try_acquire_permit(request_limit.as_ref()) else {
-                    write_status(
-                        send,
-                        Status::unavailable("too many concurrent RPCs"),
-                        server.max_frame_size(),
-                    )
-                    .await;
-                    continue;
-                };
-
                 let server = server.clone();
+                let request_limit = request_limit.clone();
                 stream_tasks.spawn(async move {
                     let _stream_permit = stream_permit;
-                    let _request_permit = request_permit;
-                    handle_stream(server, send, recv).await;
+                    handle_stream(server, request_limit, send, recv).await;
                 });
             }
             changed = shutdown.changed() => {
@@ -613,20 +641,27 @@ async fn handle_connection(
 
 async fn handle_stream(
     server: crate::server::Server,
+    request_limit: Option<Arc<Semaphore>>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) {
     let request = match read_initial_request(&server, &mut recv).await {
         Ok(request) => request,
         Err(error) => {
-            write_status(
-                send,
-                Status::internal(error.to_string()),
-                server.max_frame_size(),
-            )
-            .await;
+            write_status(send, error.into_status(), server.max_frame_size()).await;
             return;
         }
+    };
+
+    let Some(_request_permit) = try_acquire_permit(request_limit.as_ref()) else {
+        write_rpc_status(
+            send,
+            &request,
+            Status::unavailable("too many concurrent RPCs"),
+            server.max_frame_size(),
+        )
+        .await;
+        return;
     };
 
     if request.rpc_kind() != RpcKind::Unary {
@@ -712,6 +747,23 @@ async fn handle_streaming_rpc(
     }
 
     let _ = send.finish();
+}
+
+async fn write_rpc_status(
+    mut send: quinn::SendStream,
+    request: &RpcRequest,
+    status: Status,
+    max_frame_size: usize,
+) {
+    let result = if request.rpc_kind() == RpcKind::Unary {
+        write_frame(&mut send, &status.into_response(Vec::new()), max_frame_size).await
+    } else {
+        write_frame(&mut send, &RpcStreamFrame::status(status), max_frame_size).await
+    };
+
+    if result.is_ok() {
+        let _ = send.finish();
+    }
 }
 
 struct QuinnRequestStream {

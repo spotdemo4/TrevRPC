@@ -700,7 +700,7 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
 }
 
 #[tokio::test]
-async fn quinn_malformed_request_frames_return_internal_status() -> TestResult {
+async fn quinn_malformed_request_frames_return_invalid_argument_status() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -715,7 +715,7 @@ async fn quinn_malformed_request_frames_return_internal_status() -> TestResult {
     )
     .await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::Internal);
+    assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
 
     close_client(endpoint, connection).await;
     server.shutdown().await

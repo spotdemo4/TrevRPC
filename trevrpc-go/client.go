@@ -29,7 +29,7 @@ func DefaultCallOptions() CallOptions {
 	return CallOptions{
 		MaxResponseBodySize:       DefaultMaxFrameSize,
 		MaxResponseMessages:       4096,
-		MaxResponseStreamBodySize: 64 * 1024 * 1024,
+		MaxResponseStreamBodySize: 16 * 1024 * 1024,
 		StreamIdleTimeout:         30 * time.Second,
 		Metadata:                  Metadata{},
 	}
@@ -314,7 +314,7 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 	if !ok {
 		s.finish()
 		var zero T
-		return zero, Internal("response stream contained an unknown frame kind")
+		return zero, InvalidArgument("response stream contained an unknown frame kind")
 	}
 
 	switch frameKind {
@@ -326,6 +326,7 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		}
 
 		if len(frame.Body) > s.options.MaxResponseBodySize {
+			s.finish()
 			var zero T
 			return zero, &FrameTooLargeError{Len: len(frame.Body), Max: s.options.MaxResponseBodySize}
 		}
@@ -340,8 +341,9 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 
 		message := s.newMessage()
 		if err := UnmarshalMessage(frame.Body, message); err != nil {
+			s.finish()
 			var zero T
-			return zero, err
+			return zero, InvalidArgument("failed to decode response: " + err.Error())
 		}
 
 		return message, nil
@@ -363,7 +365,7 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 	default:
 		s.finish()
 		var zero T
-		return zero, Internal("response stream contained an unknown frame kind")
+		return zero, InvalidArgument("response stream contained an unknown frame kind")
 	}
 }
 

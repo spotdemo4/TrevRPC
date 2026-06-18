@@ -511,6 +511,7 @@ where
                 }
 
                 if frame.body.len() > self.max_body_size {
+                    self.done = true;
                     return Some(Err(Error::FrameTooLarge {
                         len: frame.body.len(),
                         max: self.max_body_size,
@@ -529,7 +530,13 @@ where
                     )))));
                 }
 
-                Some(T::decode(frame.body.as_slice()).map_err(Error::from))
+                match T::decode(frame.body.as_slice()).map_err(Error::from) {
+                    Ok(message) => Some(Ok(message)),
+                    Err(error) => {
+                        self.done = true;
+                        Some(Err(error))
+                    }
+                }
             }
             Some(RpcStreamFrameKind::Status) => {
                 self.done = true;

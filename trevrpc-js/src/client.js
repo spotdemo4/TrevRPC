@@ -132,7 +132,7 @@ export async function clientStreaming(
     frames = await withTimeout(
       transport.streamingCall(
         rpcRequest,
-        encodeRequestStream(requestType, requests),
+        encodeRequestStream(requestType, requests, abortScope.options.signal),
         abortScope.options,
       ),
       callOptions.timeoutMs,
@@ -173,7 +173,7 @@ export async function bidirectionalStreaming(
     frames = await withTimeout(
       transport.streamingCall(
         rpcRequest,
-        encodeRequestStream(requestType, requests),
+        encodeRequestStream(requestType, requests, abortScope.options.signal),
         abortScope.options,
       ),
       callOptions.timeoutMs,
@@ -335,6 +335,7 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
         case RpcStreamFrameKind.Status: {
           complete = true;
           validateResponseMetadata(frame.metadata ?? {});
+          abortScope?.abort(cancelled("response stream completed"));
           const status = {
             code: frame.status ?? Code.Ok,
             statusMessage: frame.message ?? "",
@@ -498,10 +499,46 @@ function callAbortScope(options) {
   };
 }
 
-async function* encodeRequestStream(requestType, requests) {
-  for await (const request of requests) {
-    yield marshalMessage(requestType, request);
+async function* encodeRequestStream(requestType, requests, signal) {
+  const iterator = requests[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const result = await nextRequest(iterator, signal);
+      if (result.done) {
+        return;
+      }
+
+      yield marshalMessage(requestType, result.value);
+    }
+  } finally {
+    if (signal?.aborted && typeof iterator.return === "function") {
+      await iterator.return();
+    }
   }
+}
+
+function nextRequest(iterator, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason ?? cancelled("request stream cancelled"));
+  }
+  if (signal == null) {
+    return iterator.next();
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? cancelled("request stream cancelled"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    iterator.next().then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 async function* emptyAsyncIterable() {}

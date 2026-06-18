@@ -29,7 +29,10 @@ impl Error {
                 Status::resource_exhausted(format!("frame length {len} exceeds maximum {max}"))
             }
             Self::Transport(error) => transport_status(error.as_ref()),
-            error => Status::internal(error.to_string()),
+            Self::Decode(error) => {
+                Status::invalid_argument(format!("failed to decode protobuf message: {error}"))
+            }
+            Self::Encode(error) => Status::internal(error.to_string()),
         }
     }
 }

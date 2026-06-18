@@ -83,6 +83,10 @@ func (s *echoReplies) Recv() (*greeter.HelloReply, error) {
 	return &greeter.HelloReply{Message: "stream hello, " + request.Name}, nil
 }
 
+func (s *echoReplies) Close() error {
+	return s.requests.Close()
+}
+
 func main() {
 	tlsConfig, certPath, err := serverTLSConfig()
 	if err != nil {

@@ -33,22 +33,24 @@ func (t *QuicClient) Conn() *quic.Conn {
 func (t *QuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.conn.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, transportStatus(err)
+		return nil, transportOrContextStatus(ctx, err)
 	}
 	defer stream.CancelRead(cancelledStreamCode)
+	stopCancel := cancelQUICStreamOnContext(ctx, stream)
+	defer stopCancel()
 
 	if err := WriteFrame(stream, request, t.maxFrameSize); err != nil {
 		stream.CancelWrite(cancelledStreamCode)
-		return nil, transportStatus(err)
+		return nil, transportOrContextStatus(ctx, err)
 	}
 
 	if err := stream.Close(); err != nil {
-		return nil, transportStatus(err)
+		return nil, transportOrContextStatus(ctx, err)
 	}
 
 	response := &RpcResponse{}
 	if err := ReadFrame(stream, response, t.maxFrameSize); err != nil {
-		return nil, transportStatus(err)
+		return nil, transportOrContextStatus(ctx, err)
 	}
 
 	return response, nil
@@ -97,6 +99,9 @@ func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
 
 	if frame.Kind == RpcStreamFrameKindStatus {
 		s.finish(false)
+		if err := s.writerError(true); err != nil {
+			return nil, err
+		}
 	}
 
 	return frame, nil
@@ -104,7 +109,7 @@ func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
 
 func (s *quicResponseStream) Close() error {
 	s.finish(true)
-	return nil
+	return s.writerError(true)
 }
 
 func (s *quicResponseStream) finish(cancelRead bool) {
@@ -121,6 +126,37 @@ func (s *quicResponseStream) finish(cancelRead bool) {
 		s.stream.CancelRead(cancelledStreamCode)
 	}
 	s.stream.CancelWrite(cancelledStreamCode)
+}
+
+func (s *quicResponseStream) writerError(ignoreCancelled bool) error {
+	if s.writerDone == nil {
+		return nil
+	}
+
+	err := <-s.writerDone
+	s.writerDone = nil
+	if err == nil {
+		return nil
+	}
+	if ignoreCancelled && StatusFromError(err).Code == CodeCancelled {
+		return nil
+	}
+
+	return err
+}
+
+func cancelQUICStreamOnContext(ctx context.Context, stream *quic.Stream) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			stream.CancelRead(cancelledStreamCode)
+			stream.CancelWrite(cancelledStreamCode)
+		case <-done:
+		}
+	}()
+
+	return func() { close(done) }
 }
 
 func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
@@ -264,16 +300,9 @@ func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 			continue
 		}
 
-		if !tryAcquire(requestLimit) {
-			release(streamLimit)
-			writeStatusResponse(stream, Unavailable("too many concurrent RPCs"), server.options.MaxFrameSize)
-			continue
-		}
-
 		streamTasks.Go(func() {
 			defer release(streamLimit)
-			defer release(requestLimit)
-			handleQUICStream(stream.Context(), server, stream)
+			handleQUICStream(stream.Context(), server, requestLimit, stream)
 		})
 	}
 
@@ -286,8 +315,8 @@ func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 	}
 }
 
-func handleQUICStream(ctx context.Context, server *Server, stream *quic.Stream) {
-	handleRPCStream(ctx, server, stream)
+func handleQUICStream(ctx context.Context, server *Server, requestLimit semaphore, stream *quic.Stream) {
+	handleRPCStream(ctx, server, requestLimit, stream)
 }
 
 type rpcStream interface {
@@ -296,13 +325,18 @@ type rpcStream interface {
 	Close() error
 }
 
-func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
+func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore, stream rpcStream) {
 	request := &RpcRequest{}
 	if err := readInitialRequestFrame(ctx, server, stream, request); err != nil {
-		_ = WriteFrame(stream, StatusFromError(err).IntoResponse(nil), server.options.MaxFrameSize)
+		_ = WriteFrame(stream, requestFrameStatus(err).IntoResponse(nil), server.options.MaxFrameSize)
 		_ = stream.Close()
 		return
 	}
+	if !tryAcquire(requestLimit) {
+		writeRPCStatus(stream, request, Unavailable("too many concurrent RPCs"), server.options.MaxFrameSize)
+		return
+	}
+	defer release(requestLimit)
 
 	if request.RPCKind() == RpcKindUnary {
 		response, ok := handleUnaryQUICRequest(ctx, server, request)
@@ -342,6 +376,25 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	}
 
 	_ = stream.Close()
+}
+
+func requestFrameStatus(err error) *Status {
+	if err == nil {
+		return OK()
+	}
+
+	var frameTooLarge *FrameTooLargeError
+	if errors.As(err, &frameTooLarge) {
+		return ResourceExhausted(frameTooLarge.Error())
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return statusFromContextError(err)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return Unavailable("transport unavailable: " + err.Error())
+	}
+
+	return InvalidArgument("invalid RPC request frame: " + err.Error())
 }
 
 func handleUnaryQUICRequest(ctx context.Context, server *Server, request *RpcRequest) (*RpcResponse, bool) {
@@ -433,6 +486,16 @@ func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {
 	_ = stream.Close()
 }
 
+func writeRPCStatus(stream rpcStream, request *RpcRequest, status *Status, maxFrameSize int) {
+	if request.RPCKind() == RpcKindUnary {
+		writeStatusResponse(stream, status, maxFrameSize)
+		return
+	}
+
+	_ = WriteFrame(stream, StatusFrame(status), maxFrameSize)
+	_ = stream.Close()
+}
+
 type rpcRequestStream struct {
 	stream       io.Reader
 	maxFrameSize int
@@ -459,7 +522,7 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 	frameKind, ok := frame.FrameKind()
 	if !ok {
 		s.done = true
-		return nil, Internal("request stream contained an unknown frame kind")
+		return nil, InvalidArgument("request stream contained an unknown frame kind")
 	}
 
 	if frameKind == RpcStreamFrameKindStatus {
@@ -473,6 +536,19 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 	}
 
 	return frame.Body, nil
+}
+
+func (s *rpcRequestStream) Close() error {
+	s.done = true
+	return nil
+}
+
+func transportOrContextStatus(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return statusFromContextError(ctx.Err())
+	}
+
+	return transportStatus(err)
 }
 
 func transportStatus(err error) error {

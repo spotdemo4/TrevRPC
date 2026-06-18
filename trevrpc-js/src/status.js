@@ -112,7 +112,7 @@ export function statusFromTransportError(error) {
   }
 
   if (error instanceof FrameTooLargeError) {
-    return unavailable(`transport unavailable: ${error.message}`);
+    return resourceExhausted(error.message);
   }
 
   if (error?.name === "AbortError") {

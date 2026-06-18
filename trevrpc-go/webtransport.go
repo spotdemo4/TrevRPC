@@ -64,22 +64,24 @@ func (t *WebTransportClient) Session() *webtransport.Session {
 func (t *WebTransportClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.session.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, webTransportStatus(err)
+		return nil, webTransportOrContextStatus(ctx, err)
 	}
 	defer stream.CancelRead(cancelledWebTransportStreamCode)
+	stopCancel := cancelWebTransportStreamOnContext(ctx, stream)
+	defer stopCancel()
 
 	if err := WriteFrame(stream, request, t.maxFrameSize); err != nil {
 		stream.CancelWrite(cancelledWebTransportStreamCode)
-		return nil, webTransportStatus(err)
+		return nil, webTransportOrContextStatus(ctx, err)
 	}
 
 	if err := stream.Close(); err != nil {
-		return nil, webTransportStatus(err)
+		return nil, webTransportOrContextStatus(ctx, err)
 	}
 
 	response := &RpcResponse{}
 	if err := ReadFrame(stream, response, t.maxFrameSize); err != nil {
-		return nil, webTransportStatus(err)
+		return nil, webTransportOrContextStatus(ctx, err)
 	}
 
 	return response, nil
@@ -128,6 +130,9 @@ func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
 
 	if frame.Kind == RpcStreamFrameKindStatus {
 		s.finish(false)
+		if err := s.writerError(true); err != nil {
+			return nil, err
+		}
 	}
 
 	return frame, nil
@@ -135,7 +140,7 @@ func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
 
 func (s *webTransportResponseStream) Close() error {
 	s.finish(true)
-	return nil
+	return s.writerError(true)
 }
 
 func (s *webTransportResponseStream) finish(cancelRead bool) {
@@ -152,6 +157,37 @@ func (s *webTransportResponseStream) finish(cancelRead bool) {
 		s.stream.CancelRead(cancelledWebTransportStreamCode)
 	}
 	s.stream.CancelWrite(cancelledWebTransportStreamCode)
+}
+
+func (s *webTransportResponseStream) writerError(ignoreCancelled bool) error {
+	if s.writerDone == nil {
+		return nil
+	}
+
+	err := <-s.writerDone
+	s.writerDone = nil
+	if err == nil {
+		return nil
+	}
+	if ignoreCancelled && StatusFromError(err).Code == CodeCancelled {
+		return nil
+	}
+
+	return err
+}
+
+func cancelWebTransportStreamOnContext(ctx context.Context, stream *webtransport.Stream) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			stream.CancelRead(cancelledWebTransportStreamCode)
+			stream.CancelWrite(cancelledWebTransportStreamCode)
+		case <-done:
+		}
+	}()
+
+	return func() { close(done) }
 }
 
 func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
@@ -252,22 +288,23 @@ func handleWebTransportSession(ctx context.Context, session *webtransport.Sessio
 			continue
 		}
 
-		if !tryAcquire(requestLimit) {
-			release(streamLimit)
-			writeStatusResponse(stream, Unavailable("too many concurrent RPCs"), server.options.MaxFrameSize)
-			continue
-		}
-
 		streamTasks.Go(func() {
 			defer release(streamLimit)
-			defer release(requestLimit)
-			handleRPCStream(ctx, server, stream)
+			handleRPCStream(ctx, server, requestLimit, stream)
 		})
 	}
 
 	waitForWaitGroup(&streamTasks, server.options.GracefulShutdownTimeout, func() {
 		_ = session.CloseWithError(cancelledWebTransportSessionCode, "server WebTransport stream drain timed out")
 	})
+}
+
+func webTransportOrContextStatus(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return statusFromContextError(ctx.Err())
+	}
+
+	return webTransportStatus(err)
 }
 
 func webTransportStatus(err error) error {

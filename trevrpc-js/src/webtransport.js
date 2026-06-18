@@ -1,5 +1,5 @@
 import { DefaultMaxFrameSize, FrameReader, writeFrame } from "./framing.js";
-import { statusFromTransportError, unavailable } from "./status.js";
+import { Code, statusFromTransportError, unavailable } from "./status.js";
 import {
   RpcRequest,
   RpcResponse,
@@ -127,10 +127,15 @@ class WebTransportResponseFrameStream {
     this.maxFrameSize = maxFrameSize;
     this.done = false;
     this.writerError = null;
+    this.writerSettled = false;
     this.cleanupAbort = cleanupAbort;
-    this.writerDone = writerTask.catch((error) => {
-      this.writerError = statusFromTransportError(error);
-    });
+    this.writerDone = writerTask
+      .catch((error) => {
+        this.writerError = statusFromTransportError(error);
+      })
+      .finally(() => {
+        this.writerSettled = true;
+      });
   }
 
   [Symbol.asyncIterator]() {
@@ -158,6 +163,13 @@ class WebTransportResponseFrameStream {
         this.done = true;
         releaseLock(this.reader);
         this.cleanupAbort();
+        await abortWriter(this.writer);
+        if (this.writerSettled) {
+          await this.writerDone;
+          if (this.writerError != null && this.writerError.code !== Code.Cancelled) {
+            throw this.writerError;
+          }
+        }
       }
 
       return { done: false, value: frame };

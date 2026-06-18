@@ -11,7 +11,10 @@ import {
   RpcKind,
   RpcRequest,
   RpcResponse,
+  RpcStreamFrame,
+  RpcStreamFrameKind,
   WireVersion,
+  bidirectionalStreaming,
   createRoot,
   decodeFrame,
   encodeFrame,
@@ -126,6 +129,78 @@ test("unary timeout aborts transport signal", async () => {
     (error) => error.code === Code.DeadlineExceeded,
   );
   assert.equal(signal.aborted, true);
+});
+
+test("terminal streaming status cancels pending request iterable", async () => {
+  const root = createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const Hello = root.lookupType("hello.v1.Hello");
+  let returned = false;
+  let writerDone;
+  const requests = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return new Promise(() => {});
+        },
+        return() {
+          returned = true;
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
+  const transport = {
+    async streamingCall(_request, requestBody) {
+      writerDone = (async () => {
+        try {
+          for await (const _body of requestBody) {
+            // The request stream intentionally never yields in this test.
+          }
+        } catch {
+          // The terminal response cancels the upload side.
+        }
+      })();
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield RpcStreamFrame.create({
+            kind: RpcStreamFrameKind.Status,
+            status: Code.Ok,
+            metadata: {},
+          });
+        },
+      };
+    },
+  };
+
+  const stream = await bidirectionalStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "BidiHello",
+    Hello,
+    Hello,
+    requests,
+  );
+  const result = await stream[Symbol.asyncIterator]().next();
+  await writerDone;
+
+  assert.equal(result.done, true);
+  assert.equal(returned, true);
 });
 
 test("generator emits JavaScript service clients", () => {

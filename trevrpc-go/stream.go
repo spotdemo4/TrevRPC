@@ -4,6 +4,7 @@ import "io"
 
 type MessageStream[T any] interface {
 	Recv() (T, error)
+	Close() error
 }
 
 type ByteStream = MessageStream[[]byte]
