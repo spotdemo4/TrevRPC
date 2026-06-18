@@ -7,6 +7,7 @@
   "platform": "forgejo",
   "endpoint": "https://trev.zip/api/v1",
   "repositories": ["llc/TrevRPC"],
+  "allowedCommands": ["fix-hash .#trevrpc-go"],
 
   // repository
   "extends": ["config:recommended"],
@@ -17,7 +18,11 @@
   "lockFileMaintenance": {
     "enabled": true,
     "automerge": true,
-    "schedule": ["* * * * 0"] // sunday
+    "schedule": ["* * * * 0"], // sunday
+    "skipInstalls": false,
+    "postUpgradeTasks": {
+      "commands": ["fix-hash .#trevrpc-go"]
+    }
   },
   "packageRules": [
     {
@@ -35,6 +40,13 @@
     {
       "matchManagers": ["cargo"],
       "addLabels": ["rust"]
+    },
+    {
+      "matchManagers": ["gomod"],
+      "addLabels": ["go"],
+      "postUpgradeTasks": {
+        "commands": ["fix-hash .#trevrpc-go"]
+      }
     }
   ]
 }
