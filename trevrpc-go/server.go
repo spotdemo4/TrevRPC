@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"time"
 )
 
@@ -39,6 +40,7 @@ type ServerOptions struct {
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
 	EnableWebTransport                bool
+	WebTransportCheckOrigin           func(*http.Request) bool
 }
 
 func DefaultServerOptions() ServerOptions {

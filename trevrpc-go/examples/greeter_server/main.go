@@ -13,6 +13,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,8 +27,9 @@ import (
 )
 
 const (
-	listenAddr = "127.0.0.1:50051"
-	authToken  = "trevrpc-example-token"
+	listenAddr           = "127.0.0.1:50051"
+	browserExampleOrigin = "http://127.0.0.1:8080"
+	authToken            = "trevrpc-example-token"
 )
 
 type greeterService struct{}
@@ -100,6 +102,7 @@ func main() {
 	server.SetAuthorizer(trevrpc.BearerAuthorizer(authToken))
 	options := server.Options()
 	options.EnableWebTransport = true
+	options.WebTransportCheckOrigin = allowBrowserExampleOrigin
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, greeterService{})
 
@@ -110,6 +113,11 @@ func main() {
 	if err := trevrpc.ServeQUIC(context.Background(), listener, server); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func allowBrowserExampleOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	return origin == "" || origin == browserExampleOrigin
 }
 
 func serverTLSConfig() (*tls.Config, string, error) {

@@ -191,6 +191,7 @@ func handleWebTransportConnection(ctx context.Context, conn *quic.Conn, server *
 	var sessionTasks sync.WaitGroup
 	var wtServer *webtransport.Server
 	wtServer = &webtransport.Server{
+		CheckOrigin: server.options.WebTransportCheckOrigin,
 		H3: &http3.Server{
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				session, err := wtServer.Upgrade(w, r)

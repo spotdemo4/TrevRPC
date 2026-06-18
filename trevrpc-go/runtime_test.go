@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -607,6 +608,35 @@ func TestWebTransportRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 		if err := runMixedQUICCall(transport, index); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestWebTransportCheckOriginAllowsBrowserOrigin(t *testing.T) {
+	origin := "http://127.0.0.1:8080"
+	running := startTestWebTransportServer(t, func(server *Server) {
+		options := server.Options()
+		options.WebTransportCheckOrigin = func(r *http.Request) bool {
+			return r.Header.Get("Origin") == origin
+		}
+		server.SetOptions(options)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/trevrpc", WebTransportDialOptions{
+		TLSClientConfig: running.clientTLS.Clone(),
+		QUICConfig:      testWebTransportQUICConfig(),
+		RequestHeader:   http.Header{"Origin": []string{origin}},
+	})
+	if err != nil {
+		t.Fatalf("dial WebTransport with origin: %v", err)
+	}
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+
+	_, err = Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "origin"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("unary call failed: %v", err)
 	}
 }
 
