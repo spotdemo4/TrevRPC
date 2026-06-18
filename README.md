@@ -34,6 +34,46 @@ nix fmt
 nix flake check
 ```
 
+## protobuf generation
+
+`protoc-gen-trevrpc` is a Buf/protoc plugin that generates TrevRPC service traits, clients, and
+server registration glue.
+
+Install the plugin locally while developing:
+
+```sh
+cargo install --path crates/protoc-gen-trevrpc
+```
+
+Example `buf.gen.yaml`:
+
+```yaml
+version: v2
+plugins:
+  - local: protoc-gen-trevrpc
+    out: src/generated
+    opt:
+      - runtime_path=::trevrpc
+```
+
+The plugin emits one service file per protobuf package, such as `hello.v1.trevrpc.rs`. Include it
+in the same Rust module as the corresponding prost messages:
+
+```rust
+pub mod hello {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/hello.v1.rs"));
+        include!(concat!(env!("OUT_DIR"), "/hello.v1.trevrpc.rs"));
+    }
+}
+```
+
+Supported plugin options:
+
+- `runtime_path=::trevrpc`
+- `file_suffix=.trevrpc.rs`
+- `package_root=crate`
+
 ### build
 
 ```sh
