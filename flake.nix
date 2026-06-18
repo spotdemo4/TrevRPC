@@ -119,7 +119,7 @@
               checkPhase = ''
                 cargo fmt --check
                 cargo test --workspace --offline
-                cargo clippy --workspace --offline -- -D warnings
+                cargo clippy --workspace --all-targets --offline -- -D warnings
               '';
 
               meta = {

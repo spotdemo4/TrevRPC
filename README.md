@@ -74,6 +74,23 @@ Supported plugin options:
 - `file_suffix=.trevrpc.rs`
 - `package_root=crate`
 
+## examples
+
+Run the QUIC greeter server:
+
+```sh
+cargo run --example greeter_server
+```
+
+Then call it from another shell:
+
+```sh
+cargo run --example greeter_client -- TrevRPC
+```
+
+The server writes a local self-signed certificate to `target/trevrpc-example-cert.der`; the client
+reads that certificate before connecting. Override the path with `TREVRPC_EXAMPLE_CERT`.
+
 ### build
 
 ```sh
