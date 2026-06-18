@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/protoadapt"
 )
 
 const DefaultMaxFrameSize = 16 * 1024 * 1024
+
+type ProtoMessage = protoadapt.MessageV1
 
 type FrameTooLargeError struct {
 	Len int
@@ -19,8 +22,16 @@ func (e *FrameTooLargeError) Error() string {
 	return fmt.Sprintf("frame length %d exceeds maximum %d", e.Len, e.Max)
 }
 
-func EncodeFrame(message proto.Message, maxFrameSize int) ([]byte, error) {
-	body, err := proto.Marshal(message)
+func MarshalMessage(message ProtoMessage) ([]byte, error) {
+	return proto.Marshal(protoadapt.MessageV2Of(message))
+}
+
+func UnmarshalMessage(body []byte, message ProtoMessage) error {
+	return proto.Unmarshal(body, protoadapt.MessageV2Of(message))
+}
+
+func EncodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
+	body, err := MarshalMessage(message)
 	if err != nil {
 		return nil, err
 	}
@@ -36,11 +47,11 @@ func EncodeFrame(message proto.Message, maxFrameSize int) ([]byte, error) {
 	return frame, nil
 }
 
-func DecodeFrame(body []byte, message proto.Message) error {
-	return proto.Unmarshal(body, message)
+func DecodeFrame(body []byte, message ProtoMessage) error {
+	return UnmarshalMessage(body, message)
 }
 
-func WriteFrame(writer io.Writer, message proto.Message, maxFrameSize int) error {
+func WriteFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error {
 	frame, err := EncodeFrame(message, maxFrameSize)
 	if err != nil {
 		return err
@@ -50,7 +61,7 @@ func WriteFrame(writer io.Writer, message proto.Message, maxFrameSize int) error
 	return err
 }
 
-func ReadFrame(reader io.Reader, message proto.Message, maxFrameSize int) error {
+func ReadFrame(reader io.Reader, message ProtoMessage, maxFrameSize int) error {
 	read, err := ReadFrameOrEOF(reader, message, maxFrameSize)
 	if err != nil {
 		return err
@@ -63,7 +74,7 @@ func ReadFrame(reader io.Reader, message proto.Message, maxFrameSize int) error 
 	return nil
 }
 
-func ReadFrameOrEOF(reader io.Reader, message proto.Message, maxFrameSize int) (bool, error) {
+func ReadFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (bool, error) {
 	header := [4]byte{}
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		if err == io.EOF {

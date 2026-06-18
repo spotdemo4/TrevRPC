@@ -41,11 +41,14 @@
 
               # go
               go
+              gopls
+              gotools
               protobuf
 
               # lint
               clippy
               cargo-audit
+              go-tools
               nixd
               nil
 
@@ -129,6 +132,44 @@
               };
             }
           );
+
+          go = pkgs.buildGoModule (
+            final: with pkgs.lib; {
+              pname = "trevrpc-go";
+              version = "0.1.0";
+
+              src = fileset.toSource {
+                root = ./trevrpc-go;
+                fileset = fileset.fileFilter (
+                  file: file.hasExt "go" || file.name == "go.mod" || file.name == "go.sum"
+                ) ./trevrpc-go;
+              };
+              vendorHash = "sha256-2lBD0Ws8tIL/pTDa0pQwvkg9v9jCNCeHE8nEoJnv5AY=";
+              subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
+
+              nativeCheckInputs = with pkgs; [
+                go-tools
+                gotools
+              ];
+              checkPhase = ''
+                export HOME=$(mktemp -d)
+                go test ./...
+                go vet ./...
+                staticcheck ./...
+                modernize ./...
+              '';
+
+              meta = {
+                mainProgram = "protoc-gen-trevrpc-go";
+                description = "Go runtime and code generator for TrevRPC";
+                license = licenses.mit;
+                platforms = platforms.all;
+                homepage = "https://trev.zip/llc/TrevRPC";
+                changelog = "https://trev.zip/llc/TrevRPC/releases";
+                downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+              };
+            }
+          );
         };
 
         # nix build #images.[...]
@@ -159,17 +200,11 @@
             '';
           };
 
-          go = pkgs.buildGoModule {
-            pname = "trevrpc-go";
-            version = "0.1.0";
-            src = pkgs.lib.fileset.toSource {
-              root = ./trevrpc-go;
-              fileset = pkgs.lib.fileset.fileFilter (
-                file: file.hasExt "go" || file.name == "go.mod" || file.name == "go.sum"
-              ) ./trevrpc-go;
-            };
-            vendorHash = "sha256-W+2u5G2Tfp1McAOzndRHXhLNWMHP72nDuzrPJLiq8jE=";
-            subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
+          go = self.packages.${system}.go.overrideAttrs {
+            dontBuild = true;
+            installPhase = ''
+              touch $out
+            '';
           };
 
           nix = {

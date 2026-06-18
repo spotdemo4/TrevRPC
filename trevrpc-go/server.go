@@ -6,8 +6,6 @@ import (
 	"io"
 	"math"
 	"time"
-
-	"github.com/golang/protobuf/proto"
 )
 
 type UnaryHandler func(context.Context, []byte) ([]byte, error)
@@ -145,10 +143,10 @@ func (s *Server) RouteStreaming(service, method string, kind RpcKind, handler St
 	s.routes[methodKey{service: service, method: method}] = route{kind: kind, streamingHandler: handler}
 }
 
-func RegisterUnary[Req proto.Message, Res proto.Message](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (Res, error)) {
+func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (Res, error)) {
 	s.Route(service, method, func(ctx context.Context, body []byte) ([]byte, error) {
 		request := newRequest()
-		if err := proto.Unmarshal(body, request); err != nil {
+		if err := UnmarshalMessage(body, request); err != nil {
 			return nil, InvalidArgument("failed to decode request: " + err.Error())
 		}
 
@@ -157,7 +155,7 @@ func RegisterUnary[Req proto.Message, Res proto.Message](s *Server, service, met
 			return nil, err
 		}
 
-		return proto.Marshal(response)
+		return MarshalMessage(response)
 	})
 }
 

@@ -6,8 +6,6 @@ import (
 	"io"
 	"math"
 	"time"
-
-	"github.com/golang/protobuf/proto"
 )
 
 type Transport interface {
@@ -109,14 +107,14 @@ func WithMetadataMap(metadata Metadata) CallOption {
 	}
 }
 
-func Unary[Req proto.Message, Res proto.Message](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (Res, error) {
+func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (Res, error) {
 	callOptions := applyCallOptions(options)
 	if err := ValidateMetadata(callOptions.Metadata); err != nil {
 		var zero Res
 		return zero, err
 	}
 
-	requestBody, err := proto.Marshal(request)
+	requestBody, err := MarshalMessage(request)
 	if err != nil {
 		var zero Res
 		return zero, err
@@ -143,7 +141,7 @@ func Unary[Req proto.Message, Res proto.Message](ctx context.Context, transport 
 	}
 
 	message := newResponse()
-	if err := proto.Unmarshal(response.Body, message); err != nil {
+	if err := UnmarshalMessage(response.Body, message); err != nil {
 		var zero Res
 		return zero, err
 	}
@@ -151,9 +149,9 @@ func Unary[Req proto.Message, Res proto.Message](ctx context.Context, transport 
 	return message, nil
 }
 
-func ServerStreaming[Req proto.Message, Res proto.Message](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
+func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
 	callOptions := applyCallOptions(options)
-	requestBody, err := proto.Marshal(request)
+	requestBody, err := MarshalMessage(request)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +171,7 @@ func ServerStreaming[Req proto.Message, Res proto.Message](ctx context.Context, 
 	return newResponseMessageStream(response, newResponse, callOptions, ctx, cancel), nil
 }
 
-func ClientStreaming[Req proto.Message, Res proto.Message](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (Res, error) {
+func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (Res, error) {
 	callOptions := applyCallOptions(options)
 	rpcRequest, err := prepareClientRequest(service, method, RpcKindClientStreaming, nil, callOptions)
 	if err != nil {
@@ -193,7 +191,7 @@ func ClientStreaming[Req proto.Message, Res proto.Message](ctx context.Context, 
 	return readUnaryResponseFromStream(response, newResponse, callOptions, ctx)
 }
 
-func BidirectionalStreaming[Req proto.Message, Res proto.Message](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
+func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
 	callOptions := applyCallOptions(options)
 	rpcRequest, err := prepareClientRequest(service, method, RpcKindBidirectionalStreaming, nil, callOptions)
 	if err != nil {
@@ -280,7 +278,7 @@ func validateResponse(response *RpcResponse, maxBodySize int) error {
 	return nil
 }
 
-type responseMessageStream[T proto.Message] struct {
+type responseMessageStream[T ProtoMessage] struct {
 	inner          FrameStream
 	newMessage     func() T
 	options        CallOptions
@@ -291,7 +289,7 @@ type responseMessageStream[T proto.Message] struct {
 	done           bool
 }
 
-func newResponseMessageStream[T proto.Message](inner FrameStream, newMessage func() T, options CallOptions, ctx context.Context, cancel context.CancelFunc) MessageStream[T] {
+func newResponseMessageStream[T ProtoMessage](inner FrameStream, newMessage func() T, options CallOptions, ctx context.Context, cancel context.CancelFunc) MessageStream[T] {
 	return &responseMessageStream[T]{inner: inner, newMessage: newMessage, options: options, ctx: ctx, cancel: cancel}
 }
 
@@ -341,7 +339,7 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		}
 
 		message := s.newMessage()
-		if err := proto.Unmarshal(frame.Body, message); err != nil {
+		if err := UnmarshalMessage(frame.Body, message); err != nil {
 			var zero T
 			return zero, err
 		}
@@ -406,7 +404,7 @@ func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout t
 	}
 }
 
-func readUnaryResponseFromStream[Res proto.Message](stream FrameStream, newResponse func() Res, options CallOptions, ctx context.Context) (Res, error) {
+func readUnaryResponseFromStream[Res ProtoMessage](stream FrameStream, newResponse func() Res, options CallOptions, ctx context.Context) (Res, error) {
 	responses := newResponseMessageStream(stream, newResponse, options, ctx, func() {})
 	first, err := responses.Recv()
 	if err != nil {

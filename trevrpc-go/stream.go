@@ -1,10 +1,6 @@
 package trevrpc
 
-import (
-	"io"
-
-	"github.com/golang/protobuf/proto"
-)
+import "io"
 
 type MessageStream[T any] interface {
 	Recv() (T, error)
@@ -62,11 +58,11 @@ func (s *statusFrameStream) Recv() (*RpcStreamFrame, error) {
 	return StatusFrame(s.status), nil
 }
 
-type encodeStream[T proto.Message] struct {
+type encodeStream[T ProtoMessage] struct {
 	inner MessageStream[T]
 }
 
-func EncodeStream[T proto.Message](inner MessageStream[T]) ByteStream {
+func EncodeStream[T ProtoMessage](inner MessageStream[T]) ByteStream {
 	return &encodeStream[T]{inner: inner}
 }
 
@@ -76,15 +72,15 @@ func (s *encodeStream[T]) Recv() ([]byte, error) {
 		return nil, err
 	}
 
-	return proto.Marshal(message)
+	return MarshalMessage(message)
 }
 
-type decodeStream[T proto.Message] struct {
+type decodeStream[T ProtoMessage] struct {
 	inner      ByteStream
 	newMessage func() T
 }
 
-func DecodeStream[T proto.Message](inner ByteStream, newMessage func() T) MessageStream[T] {
+func DecodeStream[T ProtoMessage](inner ByteStream, newMessage func() T) MessageStream[T] {
 	return &decodeStream[T]{inner: inner, newMessage: newMessage}
 }
 
@@ -96,7 +92,7 @@ func (s *decodeStream[T]) Recv() (T, error) {
 	}
 
 	message := s.newMessage()
-	if err := proto.Unmarshal(body, message); err != nil {
+	if err := UnmarshalMessage(body, message); err != nil {
 		var zero T
 		return zero, err
 	}
@@ -104,6 +100,6 @@ func (s *decodeStream[T]) Recv() (T, error) {
 	return message, nil
 }
 
-func SingleMessageStream[T proto.Message](message T) ByteStream {
+func SingleMessageStream[T ProtoMessage](message T) ByteStream {
 	return EncodeStream(FromSlice(message))
 }

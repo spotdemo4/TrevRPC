@@ -3,8 +3,6 @@ package trevrpc
 import (
 	"fmt"
 	"strings"
-
-	"github.com/golang/protobuf/proto"
 )
 
 const (
@@ -59,7 +57,7 @@ func NewRpcRequest(service, method string, body []byte) *RpcRequest {
 }
 
 func (m *RpcRequest) Reset()         { *m = RpcRequest{} }
-func (m *RpcRequest) String() string { return proto.CompactTextString(m) }
+func (m *RpcRequest) String() string { return fmt.Sprintf("%+v", *m) }
 func (*RpcRequest) ProtoMessage()    {}
 
 func (m *RpcRequest) ValidateProtocol() error {
@@ -91,7 +89,7 @@ func OKResponse(body []byte) *RpcResponse {
 }
 
 func (m *RpcResponse) Reset()         { *m = RpcResponse{} }
-func (m *RpcResponse) String() string { return proto.CompactTextString(m) }
+func (m *RpcResponse) String() string { return fmt.Sprintf("%+v", *m) }
 func (*RpcResponse) ProtoMessage()    {}
 
 type RpcStreamFrame struct {
@@ -129,7 +127,7 @@ func StatusFrameWithMetadata(status *Status, metadata Metadata) *RpcStreamFrame 
 }
 
 func (m *RpcStreamFrame) Reset()         { *m = RpcStreamFrame{} }
-func (m *RpcStreamFrame) String() string { return proto.CompactTextString(m) }
+func (m *RpcStreamFrame) String() string { return fmt.Sprintf("%+v", *m) }
 func (*RpcStreamFrame) ProtoMessage()    {}
 
 func (m *RpcStreamFrame) FrameKind() (RpcStreamFrameKind, bool) {

@@ -3,7 +3,6 @@ package greeter
 import (
 	"context"
 
-	"github.com/golang/protobuf/proto"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 )
 
@@ -18,7 +17,7 @@ type HelloRequest struct {
 }
 
 func (m *HelloRequest) Reset()         { *m = HelloRequest{} }
-func (m *HelloRequest) String() string { return proto.CompactTextString(m) }
+func (m *HelloRequest) String() string { return m.Name }
 func (*HelloRequest) ProtoMessage()    {}
 
 type HelloReply struct {
@@ -26,7 +25,7 @@ type HelloReply struct {
 }
 
 func (m *HelloReply) Reset()         { *m = HelloReply{} }
-func (m *HelloReply) String() string { return proto.CompactTextString(m) }
+func (m *HelloReply) String() string { return m.Message }
 func (*HelloReply) ProtoMessage()    {}
 
 type GreeterServer interface {
@@ -54,7 +53,7 @@ func (c *GreeterClient) LotsOfReplies(ctx context.Context, request *HelloRequest
 func RegisterGreeterServer(server *trevrpc.Server, implementation GreeterServer) {
 	server.Route(ServiceName, MethodSayHello, func(ctx context.Context, body []byte) ([]byte, error) {
 		request := &HelloRequest{}
-		if err := proto.Unmarshal(body, request); err != nil {
+		if err := trevrpc.UnmarshalMessage(body, request); err != nil {
 			return nil, trevrpc.InvalidArgument("failed to decode request: " + err.Error())
 		}
 
@@ -66,12 +65,12 @@ func RegisterGreeterServer(server *trevrpc.Server, implementation GreeterServer)
 			return nil, trevrpc.Internal("handler returned nil response")
 		}
 
-		return proto.Marshal(response)
+		return trevrpc.MarshalMessage(response)
 	})
 
 	server.RouteStreaming(ServiceName, MethodLotsOfReplies, trevrpc.RpcKindServerStreaming, func(ctx context.Context, body []byte, _ trevrpc.ByteStream) (trevrpc.ByteStream, error) {
 		request := &HelloRequest{}
-		if err := proto.Unmarshal(body, request); err != nil {
+		if err := trevrpc.UnmarshalMessage(body, request); err != nil {
 			return nil, trevrpc.InvalidArgument("failed to decode request: " + err.Error())
 		}
 

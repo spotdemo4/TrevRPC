@@ -10,9 +10,9 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/golang/protobuf/proto"
-	descriptor "github.com/golang/protobuf/protoc-gen-go/descriptor"
-	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
+	"google.golang.org/protobuf/proto"
+	descriptor "google.golang.org/protobuf/types/descriptorpb"
+	plugin "google.golang.org/protobuf/types/pluginpb"
 )
 
 type pluginOptions struct {
@@ -102,7 +102,7 @@ func parseOptions(parameter string) (pluginOptions, error) {
 		return options, nil
 	}
 
-	for _, option := range strings.Split(parameter, ",") {
+	for option := range strings.SplitSeq(parameter, ",") {
 		if option == "" {
 			continue
 		}
@@ -163,7 +163,6 @@ func generateFile(file *descriptor.FileDescriptorProto, files []*descriptor.File
 	goPackage := fileGoPackageName(file)
 	imports := map[string]string{
 		"context": "context",
-		"proto":   "github.com/golang/protobuf/proto",
 		"trevrpc": options.runtimeImport,
 	}
 
@@ -328,13 +327,13 @@ func generateServerRegistration(buffer *bytes.Buffer, fullServiceName string, me
 	if !method.clientStreaming && !method.serverStreaming {
 		fmt.Fprintf(buffer, "\tserver.Route(%q, %q, func(ctx context.Context, body []byte) ([]byte, error) {\n", fullServiceName, method.protoName)
 		fmt.Fprintf(buffer, "\t\trequest := &%s{}\n", strings.TrimPrefix(method.inputType, "*"))
-		buffer.WriteString("\t\tif err := proto.Unmarshal(body, request); err != nil {\n")
+		buffer.WriteString("\t\tif err := trevrpc.UnmarshalMessage(body, request); err != nil {\n")
 		buffer.WriteString("\t\t\treturn nil, trevrpc.InvalidArgument(\"failed to decode request: \"+err.Error())\n")
 		buffer.WriteString("\t\t}\n")
 		fmt.Fprintf(buffer, "\t\tresponse, err := implementation.%s(ctx, request)\n", method.name)
 		buffer.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
 		buffer.WriteString("\t\tif response == nil {\n\t\t\treturn nil, trevrpc.Internal(\"handler returned nil response\")\n\t\t}\n")
-		buffer.WriteString("\t\treturn proto.Marshal(response)\n")
+		buffer.WriteString("\t\treturn trevrpc.MarshalMessage(response)\n")
 		buffer.WriteString("\t})\n")
 		return
 	}
@@ -351,7 +350,7 @@ func generateServerRegistration(buffer *bytes.Buffer, fullServiceName string, me
 		fmt.Fprintf(buffer, "\t\trequestStream := trevrpc.DecodeStream[%s](requests, func() %s { return &%s{} })\n", method.inputType, method.inputType, strings.TrimPrefix(method.inputType, "*"))
 	} else {
 		fmt.Fprintf(buffer, "\t\trequest := &%s{}\n", strings.TrimPrefix(method.inputType, "*"))
-		buffer.WriteString("\t\tif err := proto.Unmarshal(body, request); err != nil {\n")
+		buffer.WriteString("\t\tif err := trevrpc.UnmarshalMessage(body, request); err != nil {\n")
 		buffer.WriteString("\t\t\treturn nil, trevrpc.InvalidArgument(\"failed to decode request: \"+err.Error())\n")
 		buffer.WriteString("\t\t}\n")
 	}

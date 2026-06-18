@@ -11,10 +11,10 @@ import (
 	"encoding/pem"
 	"io"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/quic-go/quic-go"
 )
 
@@ -23,7 +23,7 @@ type testMessage struct {
 }
 
 func (m *testMessage) Reset()         { *m = testMessage{} }
-func (m *testMessage) String() string { return proto.CompactTextString(m) }
+func (m *testMessage) String() string { return m.Value }
 func (*testMessage) ProtoMessage()    {}
 
 type localTransport struct {
@@ -98,7 +98,7 @@ func TestStreamingClientServer(t *testing.T) {
 	server := NewServer()
 	server.RouteStreaming("example.Greeter", "LotsOfReplies", RpcKindServerStreaming, func(_ context.Context, body []byte, _ ByteStream) (ByteStream, error) {
 		request := &testMessage{}
-		if err := proto.Unmarshal(body, request); err != nil {
+		if err := UnmarshalMessage(body, request); err != nil {
 			return nil, err
 		}
 
@@ -134,7 +134,7 @@ func TestStreamingClientServer(t *testing.T) {
 func TestClientStreamingClientServer(t *testing.T) {
 	server := NewServer()
 	server.RouteStreaming("example.Greeter", "LotsOfGreetings", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
-		var combined string
+		var combined strings.Builder
 		for {
 			body, err := requests.Recv()
 			if err == io.EOF {
@@ -145,14 +145,14 @@ func TestClientStreamingClientServer(t *testing.T) {
 			}
 
 			request := &testMessage{}
-			if err := proto.Unmarshal(body, request); err != nil {
+			if err := UnmarshalMessage(body, request); err != nil {
 				return nil, err
 			}
 
-			combined += request.Value
+			combined.WriteString(request.Value)
 		}
 
-		return SingleMessageStream(&testMessage{Value: combined}), nil
+		return SingleMessageStream(&testMessage{Value: combined.String()}), nil
 	})
 
 	response, err := ClientStreaming(context.Background(), localTransport{server: server}, "example.Greeter", "LotsOfGreetings", FromSlice(
