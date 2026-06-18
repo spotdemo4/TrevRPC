@@ -7,11 +7,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use quinn::rustls::server::WebPkiClientVerifier;
 use tokio::sync::{Notify, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{CallOptions, RpcTransport};
 use trevrpc::server::{MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions};
-use trevrpc::{Code, MessageStream, RpcRequest, Status};
+use trevrpc::{Code, MessageStream, RpcRequest, RpcResponse, Status};
 
 #[path = "../examples/shared/greeter.rs"]
 mod greeter;
@@ -323,6 +324,142 @@ async fn quinn_request_stream_limits_return_resource_exhausted() -> TestResult {
 }
 
 #[tokio::test]
+async fn quinn_response_stream_limits_return_resource_exhausted() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let mut replies = client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "limited".to_owned(),
+            },
+            authenticated_options().with_max_response_messages(Some(1)),
+        )
+        .await?;
+    let first = replies
+        .next()
+        .await
+        .expect("response stream should yield first item")?;
+    assert_eq!(first.message, "hello, limited");
+
+    let error = replies
+        .next()
+        .await
+        .expect("response stream should yield limit error")
+        .expect_err("second response should exceed client limit");
+    assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_stream_concurrency_limit_returns_unavailable() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_options(
+            fast_server_options()
+                .with_max_concurrent_streams_per_connection(Some(1))
+                .with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
+        );
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+    let hanging = hold_server_stream_open(&client).await?;
+
+    let error = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "second".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await
+        .expect_err("second stream should exceed stream concurrency limit");
+
+    assert_eq!(error.into_status().code(), Code::Unavailable);
+
+    drop(hanging);
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_options(
+            fast_server_options()
+                .with_max_concurrent_requests(Some(1))
+                .with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
+        );
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+    let hanging = hold_server_stream_open(&client).await?;
+
+    let error = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "second".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await
+        .expect_err("second request should exceed global request concurrency limit");
+
+    assert_eq!(error.into_status().code(), Code::Unavailable);
+
+    drop(hanging);
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_options(
+            fast_server_options()
+                .with_max_concurrent_connections(Some(1))
+                .with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
+        );
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+    let hanging = hold_server_stream_open(&client).await?;
+    let second_endpoint = make_client_endpoint(server.cert_der.clone())?;
+
+    let connect = tokio::time::timeout(
+        TEST_TIMEOUT,
+        second_endpoint.connect(server.addr, "localhost")?,
+    )
+    .await
+    .expect("second connection attempt should complete");
+
+    if let Ok(connection) = connect {
+        let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+        let error = trevrpc::client::unary::<_, _, greeter::HelloReply>(
+            &transport,
+            greeter::GreeterClient::<()>::SERVICE,
+            "SayHello",
+            &greeter::HelloRequest {
+                name: "refused".to_owned(),
+            },
+            CallOptions::new().with_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("RPC on refused connection should fail");
+        assert_ne!(error.into_status().code(), Code::Ok);
+        connection.close(0_u32.into(), b"second done");
+    }
+
+    second_endpoint.close(0_u32.into(), b"second done");
+    drop(hanging);
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
     let metrics = RecordingMetrics::default();
     let server_metrics = metrics.clone();
@@ -375,8 +512,149 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn quinn_rejects_alpn_mismatch() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let endpoint = make_client_endpoint_with_alpn(server.cert_der.clone(), b"not-trevrpc")?;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
+        .await
+        .expect("ALPN mismatch handshake should complete");
+
+    assert!(result.is_err(), "ALPN mismatch should reject connection");
+
+    endpoint.close(0_u32.into(), b"test complete");
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_rejects_tls_identity_mismatch() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let endpoint = make_client_endpoint(server.cert_der.clone())?;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.addr, "wronghost")?)
+        .await
+        .expect("identity mismatch handshake should complete");
+
+    assert!(result.is_err(), "SNI mismatch should reject connection");
+
+    endpoint.close(0_u32.into(), b"test complete");
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
+    let server = spawn_greeter_server_with_endpoint(make_mtls_server_endpoint()?, |_| {})?;
+    let endpoint = make_client_endpoint(server.cert_der.clone())?;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
+        .await
+        .expect("mTLS rejection handshake should complete");
+
+    if let Ok(connection) = result {
+        let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+        trevrpc::client::unary::<_, _, greeter::HelloReply>(
+            &transport,
+            greeter::GreeterClient::<()>::SERVICE,
+            "SayHello",
+            &greeter::HelloRequest {
+                name: "anonymous".to_owned(),
+            },
+            CallOptions::new().with_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("server requiring mTLS should reject anonymous clients");
+        connection.close(0_u32.into(), b"test complete");
+    }
+
+    endpoint.close(0_u32.into(), b"test complete");
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_malformed_request_frames_return_internal_status() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+
+    send.write_all(&2_u32.to_be_bytes()).await?;
+    send.write_all(&[0xff, 0xff]).await?;
+    send.finish()?;
+
+    let response = trevrpc::quinn::read_frame::<RpcResponse>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+
+    assert_eq!(Code::from_u32(response.status), Code::Internal);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_handles_many_concurrent_unary_calls() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+    let mut calls = JoinSet::new();
+
+    for index in 0..64 {
+        let client = client.clone();
+        calls.spawn(async move {
+            let name = format!("concurrent-{index}");
+            let response = client
+                .say_hello(
+                    greeter::HelloRequest { name: name.clone() },
+                    authenticated_options(),
+                )
+                .await?;
+            Ok::<_, trevrpc::Error>((name, response.message))
+        });
+    }
+
+    let mut completed = 0;
+    while let Some(result) = calls.join_next().await {
+        let (name, message) = result??;
+        assert_eq!(message, format!("hello, {name}"));
+        completed += 1;
+    }
+    assert_eq!(completed, 64);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+async fn hold_server_stream_open(
+    client: &greeter::GreeterClient<trevrpc::quinn::QuinnTransport>,
+) -> TestResult<trevrpc::BoxMessageStream<greeter::HelloReply>> {
+    let mut replies = client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "cancel".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    let first = replies
+        .next()
+        .await
+        .expect("response stream should yield first item")?;
+    assert_eq!(first.message, "first");
+
+    Ok(replies)
+}
+
 fn spawn_greeter_server(configure: impl FnOnce(&mut Server)) -> TestResult<RunningServer> {
-    let (endpoint, cert_der) = make_server_endpoint()?;
+    spawn_greeter_server_with_endpoint(make_server_endpoint()?, configure)
+}
+
+fn spawn_greeter_server_with_endpoint(
+    (endpoint, cert_der): (quinn::Endpoint, CertificateDer<'static>),
+    configure: impl FnOnce(&mut Server),
+) -> TestResult<RunningServer> {
     let addr = endpoint.local_addr()?;
     let mut server = Server::new();
     server.set_options(fast_server_options());
@@ -464,14 +742,46 @@ fn make_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static
     ))
 }
 
+fn make_mtls_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+    let cert_der = CertificateDer::from(cert.cert);
+    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    let mut client_roots = quinn::rustls::RootCertStore::empty();
+    client_roots.add(cert_der.clone())?;
+    let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots)).build()?;
+
+    let mut server_crypto = quinn::rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
+    server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+    let transport_config = Arc::get_mut(&mut server_config.transport)
+        .expect("server config should have one transport reference");
+    transport_config.max_concurrent_uni_streams(0_u8.into());
+
+    Ok((
+        quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?,
+        cert_der,
+    ))
+}
+
 fn make_client_endpoint(cert_der: CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
+    make_client_endpoint_with_alpn(cert_der, trevrpc::ALPN)
+}
+
+fn make_client_endpoint_with_alpn(
+    cert_der: CertificateDer<'static>,
+    alpn: &[u8],
+) -> TestResult<quinn::Endpoint> {
     let mut roots = quinn::rustls::RootCertStore::empty();
     roots.add(cert_der)?;
 
     let mut client_crypto = quinn::rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    client_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+    client_crypto.alpn_protocols = vec![alpn.to_vec()];
 
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
