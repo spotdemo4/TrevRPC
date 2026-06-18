@@ -30,18 +30,58 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = greeter::GreeterClient::new(transport);
 
     let reply = client
-        .say_hello(
-            greeter::HelloRequest { name },
-            trevrpc::client::CallOptions::new()
-                .with_timeout(Duration::from_secs(5))
-                .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes()),
+        .say_hello(greeter::HelloRequest { name: name.clone() }, call_options())
+        .await?;
+    println!("unary: {}", reply.message);
+
+    let mut replies = client
+        .lots_of_replies(greeter::HelloRequest { name: name.clone() }, call_options())
+        .await?;
+    while let Some(reply) = replies.next().await {
+        println!("server-streaming: {}", reply?.message);
+    }
+
+    let summary = client
+        .lots_of_greetings(
+            trevrpc::stream::from_iter([
+                greeter::HelloRequest {
+                    name: format!("{name} client stream 1"),
+                },
+                greeter::HelloRequest {
+                    name: format!("{name} client stream 2"),
+                },
+            ]),
+            call_options(),
         )
         .await?;
-    println!("{}", reply.message);
+    println!("client-streaming: {}", summary.message);
+
+    let mut replies = client
+        .bidi_hello(
+            trevrpc::stream::from_iter([
+                greeter::HelloRequest {
+                    name: format!("{name} bidi 1"),
+                },
+                greeter::HelloRequest {
+                    name: format!("{name} bidi 2"),
+                },
+            ]),
+            call_options(),
+        )
+        .await?;
+    while let Some(reply) = replies.next().await {
+        println!("bidi: {}", reply?.message);
+    }
 
     endpoint.wait_idle().await;
 
     Ok(())
+}
+
+fn call_options() -> trevrpc::client::CallOptions {
+    trevrpc::client::CallOptions::new()
+        .with_timeout(Duration::from_secs(5))
+        .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
 }
 
 fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {

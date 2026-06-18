@@ -25,6 +25,64 @@ impl greeter::Greeter for GreeterService {
             message: format!("hello, {}", request.name),
         })
     }
+
+    async fn lots_of_replies(
+        &self,
+        request: greeter::HelloRequest,
+    ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
+        Ok(trevrpc::stream::from_iter([
+            greeter::HelloReply {
+                message: format!("hello, {}", request.name),
+            },
+            greeter::HelloReply {
+                message: format!("hello again, {}", request.name),
+            },
+            greeter::HelloReply {
+                message: format!("goodbye, {}", request.name),
+            },
+        ]))
+    }
+
+    async fn lots_of_greetings(
+        &self,
+        mut requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
+    ) -> core::result::Result<greeter::HelloReply, trevrpc::Status> {
+        let mut names = Vec::new();
+
+        while let Some(request) = requests.next().await {
+            names.push(request?.name);
+        }
+
+        let message = if names.is_empty() {
+            "hello, nobody".to_owned()
+        } else {
+            format!("hello, {}", names.join(", "))
+        };
+
+        Ok(greeter::HelloReply { message })
+    }
+
+    async fn bidi_hello(
+        &self,
+        requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
+    ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
+        Ok(Box::new(EchoReplies { requests }))
+    }
+}
+
+struct EchoReplies {
+    requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
+}
+
+#[trevrpc::async_trait]
+impl trevrpc::MessageStream<greeter::HelloReply> for EchoReplies {
+    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloReply>> {
+        self.requests.next().await.map(|request| {
+            request.map(|request| greeter::HelloReply {
+                message: format!("stream hello, {}", request.name),
+            })
+        })
+    }
 }
 
 #[tokio::main]
