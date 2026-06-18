@@ -449,7 +449,7 @@ async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
         )
         .await
         .expect_err("RPC on refused connection should fail");
-        assert_ne!(error.into_status().code(), Code::Ok);
+        assert_eq!(error.into_status().code(), Code::Unavailable);
         connection.close(0_u32.into(), b"second done");
     }
 
@@ -506,10 +506,34 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
         )
         .await
         .expect_err("RPC on drained connection should fail");
-    assert_ne!(error.into_status().code(), Code::Ok);
+    assert_eq!(error.into_status().code(), Code::Unavailable);
 
     close_client(endpoint, connection).await;
     Ok(())
+}
+
+#[tokio::test]
+async fn quinn_local_close_maps_to_cancelled() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    connection.close(0_u32.into(), b"client closed");
+
+    let error = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "after local close".to_owned(),
+            },
+            CallOptions::new().with_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("RPC on locally closed connection should fail");
+    assert_eq!(error.into_status().code(), Code::Cancelled);
+
+    tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle())
+        .await
+        .expect("client endpoint should become idle");
+    server.shutdown().await
 }
 
 #[tokio::test]
@@ -553,7 +577,7 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
 
     if let Ok(connection) = result {
         let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
-        trevrpc::client::unary::<_, _, greeter::HelloReply>(
+        let status = trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
             greeter::GreeterClient::<()>::SERVICE,
             "SayHello",
@@ -563,7 +587,9 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
             CallOptions::new().with_timeout(Duration::from_millis(100)),
         )
         .await
+        .map_err(trevrpc::Error::into_status)
         .expect_err("server requiring mTLS should reject anonymous clients");
+        assert_eq!(status.code(), Code::Unavailable);
         connection.close(0_u32.into(), b"test complete");
     }
 
@@ -625,6 +651,130 @@ async fn quinn_handles_many_concurrent_unary_calls() -> TestResult {
 
     close_client(endpoint, connection).await;
     server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_handles_bounded_mixed_load() -> TestResult {
+    run_mixed_workload(192, 64).await
+}
+
+#[tokio::test]
+#[ignore = "longer soak test; run with `cargo test --test quinn_integration -- --ignored quinn_soaks_mixed_workload`"]
+async fn quinn_soaks_mixed_workload() -> TestResult {
+    let calls = std::env::var("TREVRPC_SOAK_CALLS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2048);
+
+    run_mixed_workload(calls, 128).await
+}
+
+async fn run_mixed_workload(total_calls: usize, batch_size: usize) -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_options(
+            fast_server_options()
+                .with_max_concurrent_streams_per_connection(Some(512))
+                .with_max_concurrent_requests(Some(1024)),
+        );
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let mut completed = 0;
+    for batch_start in (0..total_calls).step_by(batch_size.max(1)) {
+        let batch_end = total_calls.min(batch_start + batch_size.max(1));
+        let mut calls = JoinSet::new();
+
+        for index in batch_start..batch_end {
+            let client = client.clone();
+            calls.spawn(async move { run_mixed_call(client, index).await });
+        }
+
+        while let Some(result) = calls.join_next().await {
+            result??;
+            completed += 1;
+        }
+    }
+
+    assert_eq!(completed, total_calls);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+async fn run_mixed_call(
+    client: greeter::GreeterClient<trevrpc::quinn::QuinnTransport>,
+    index: usize,
+) -> trevrpc::Result<()> {
+    match index % 4 {
+        0 => {
+            let name = format!("load-unary-{index}");
+            let response = client
+                .say_hello(
+                    greeter::HelloRequest { name: name.clone() },
+                    authenticated_options(),
+                )
+                .await?;
+            assert_eq!(response.message, format!("hello, {name}"));
+        }
+        1 => {
+            let name = format!("load-server-stream-{index}");
+            let mut responses = client
+                .lots_of_replies(
+                    greeter::HelloRequest { name: name.clone() },
+                    authenticated_options(),
+                )
+                .await?;
+            let mut count = 0;
+            while let Some(response) = responses.next().await {
+                assert!(response?.message.contains(&name));
+                count += 1;
+            }
+            assert_eq!(count, 2);
+        }
+        2 => {
+            let response = client
+                .lots_of_greetings(
+                    trevrpc::stream::from_iter([
+                        greeter::HelloRequest {
+                            name: format!("load-client-{index}-a"),
+                        },
+                        greeter::HelloRequest {
+                            name: format!("load-client-{index}-b"),
+                        },
+                    ]),
+                    authenticated_options(),
+                )
+                .await?;
+            assert_eq!(
+                response.message,
+                format!("load-client-{index}-a,load-client-{index}-b")
+            );
+        }
+        _ => {
+            let mut responses = client
+                .bidi_hello(
+                    trevrpc::stream::from_iter([
+                        greeter::HelloRequest {
+                            name: format!("load-bidi-{index}-a"),
+                        },
+                        greeter::HelloRequest {
+                            name: format!("load-bidi-{index}-b"),
+                        },
+                    ]),
+                    authenticated_options(),
+                )
+                .await?;
+            let mut count = 0;
+            while let Some(response) = responses.next().await {
+                assert!(response?.message.starts_with("echo, load-bidi-"));
+                count += 1;
+            }
+            assert_eq!(count, 2);
+        }
+    }
+
+    Ok(())
 }
 
 async fn hold_server_stream_open(
