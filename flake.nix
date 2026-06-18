@@ -199,18 +199,7 @@
             '';
           };
 
-          renovate-gh = {
-            root = ./.github;
-            files = ./.github/renovate.json;
-            packages = with pkgs; [
-              renovate
-            ];
-            script = ''
-              renovate-config-validator renovate.json
-            '';
-          };
-
-          renovate-fj = {
+          renovate = {
             root = ./.forgejo;
             files = ./.forgejo/renovate.json;
             packages = with pkgs; [
