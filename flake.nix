@@ -107,7 +107,7 @@
                   ./Cargo.toml
                   ./LICENSE
                   ./README.md
-                  (fileset.fileFilter (file: file.hasExt "rs") ./.)
+                  (fileset.fileFilter (file: file.hasExt "rs" || file.name == "Cargo.toml") ./.)
                 ];
               };
               cargoLock.lockFile = ./Cargo.lock;
@@ -118,8 +118,8 @@
               ];
               checkPhase = ''
                 cargo fmt --check
-                cargo test --offline
-                cargo clippy --offline -- -D warnings
+                cargo test --workspace --offline
+                cargo clippy --workspace --offline -- -D warnings
               '';
 
               meta = {

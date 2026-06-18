@@ -8,11 +8,28 @@ readme = "README.md"
 repository = "https://trev.zip/llc/TrevRPC"
 license-file = "LICENSE"
 
+[workspace]
+members = ["crates/trevrpc-build"]
+resolver = "3"
+
 [lints.clippy]
 pedantic = "warn"
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "trevrpc"
 path = "main.rs"
 
+[features]
+default = ["client", "server", "quinn"]
+client = []
+server = []
+quinn = ["client", "server", "dep:quinn", "dep:tokio"]
+
 [dependencies]
+async-trait = "0.1.89"
+prost = "0.13.5"
+quinn = { version = "0.11.8", optional = true }
+tokio = { version = "1.48.0", features = ["rt"], optional = true }

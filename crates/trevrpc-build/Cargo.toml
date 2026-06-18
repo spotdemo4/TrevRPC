@@ -1,0 +1,15 @@
+[package]
+name = "trevrpc-build"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "prost-build service generator for TrevRPC"
+readme = "../../README.md"
+repository = "https://trev.zip/llc/TrevRPC"
+license-file = "../../LICENSE"
+
+[lints.clippy]
+pedantic = "warn"
+
+[dependencies]
+prost-build = "0.13.5"
