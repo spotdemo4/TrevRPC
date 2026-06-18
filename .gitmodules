@@ -1,0 +1,3 @@
+[submodule "wiki"]
+	path = wiki
+	url = https://trev.zip/llc/TrevRPC.wiki.git
