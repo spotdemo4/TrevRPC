@@ -39,6 +39,10 @@
               rustc
               cargo
 
+              # go
+              go
+              protobuf
+
               # lint
               clippy
               cargo-audit
@@ -75,6 +79,7 @@
             packages = with pkgs; [
               renovate
               cargo # rust
+              go # go
             ];
           };
 
@@ -89,8 +94,8 @@
 
         # nix run [#...]
         apps = pkgs.mkApps {
-          dev = "cargo run";
-          test = "cargo test";
+          dev = "cargo run --manifest-path trevrpc-rust/Cargo.toml";
+          test = "nix flake check";
         };
 
         # nix build [#...]
@@ -100,20 +105,8 @@
               pname = "trevrpc";
               version = "0.1.0";
 
-              src = fileset.toSource {
-                root = ./.;
-                fileset = fileset.unions [
-                  ./Cargo.lock
-                  ./Cargo.toml
-                  ./LICENSE
-                  ./README.md
-                  (fileset.fileFilter (
-                    file:
-                    file.hasExt "rs" || file.hasExt "proto" || file.name == "buf.gen.yaml" || file.name == "Cargo.toml"
-                  ) ./.)
-                ];
-              };
-              cargoLock.lockFile = ./Cargo.lock;
+              src = ./trevrpc-rust;
+              cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
 
               nativeCheckInputs = with pkgs; [
                 rustfmt
@@ -151,6 +144,7 @@
           configFile = ./treefmt.toml;
           runtimeInputs = with pkgs; [
             rustfmt
+            go
             nixfmt
             oxfmt
           ];
@@ -163,6 +157,19 @@
             installPhase = ''
               touch $out
             '';
+          };
+
+          go = pkgs.buildGoModule {
+            pname = "trevrpc-go";
+            version = "0.1.0";
+            src = pkgs.lib.fileset.toSource {
+              root = ./trevrpc-go;
+              fileset = pkgs.lib.fileset.fileFilter (
+                file: file.hasExt "go" || file.name == "go.mod" || file.name == "go.sum"
+              ) ./trevrpc-go;
+            };
+            vendorHash = "sha256-W+2u5G2Tfp1McAOzndRHXhLNWMHP72nDuzrPJLiq8jE=";
+            subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
           };
 
           nix = {

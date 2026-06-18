@@ -24,6 +24,7 @@ jobs:
 
       - name: Run cargo audit
         run: cargo-audit audit
+        working-directory: trevrpc-rust
 
   nix:
     # zizmor: ignore[excessive-permissions]

@@ -13,3 +13,7 @@
 
 # rust
 /target/
+/trevrpc-rust/target/
+
+# go
+/trevrpc-go/bin/
