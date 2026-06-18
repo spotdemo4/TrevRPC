@@ -24,7 +24,7 @@ Use whichever WebTransport greeter endpoint you started:
 
 ```text
 https://127.0.0.1:50051/trevrpc  # Go default in this example UI
-https://127.0.0.1:5001/trevrpc   # Rust WebTransport default in this example UI
+https://127.0.0.1:5000/trevrpc   # Rust default in this example UI
 ```
 
 The URL path is only the WebTransport session path. TrevRPC service routing still happens inside the `RpcRequest` frame.

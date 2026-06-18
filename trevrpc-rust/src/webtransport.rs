@@ -15,19 +15,19 @@ use crate::{
 
 const CANCELLED_STREAM_CODE: u32 = 1;
 
-type ServerEndpoint = wtransport::Endpoint<wtransport::endpoint::endpoint_side::Server>;
+type ServerEndpoint = web_transport_quinn::Server;
 
 #[derive(Clone)]
 pub struct WebTransportTransport {
-    connection: wtransport::Connection,
+    session: web_transport_quinn::Session,
     max_frame_size: usize,
 }
 
 impl WebTransportTransport {
     #[must_use]
-    pub const fn new(connection: wtransport::Connection) -> Self {
+    pub const fn new(session: web_transport_quinn::Session) -> Self {
         Self {
-            connection,
+            session,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
     }
@@ -39,8 +39,13 @@ impl WebTransportTransport {
     }
 
     #[must_use]
-    pub const fn connection(&self) -> &wtransport::Connection {
-        &self.connection
+    pub const fn session(&self) -> &web_transport_quinn::Session {
+        &self.session
+    }
+
+    #[must_use]
+    pub const fn connection(&self) -> &web_transport_quinn::Session {
+        &self.session
     }
 
     #[must_use]
@@ -52,21 +57,11 @@ impl WebTransportTransport {
 #[crate::async_trait]
 impl RpcTransport for WebTransportTransport {
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        let (send, recv) = self
-            .connection
-            .open_bi()
-            .await
-            .map_err(Error::transport)?
-            .await
-            .map_err(Error::transport)?;
+        let (send, recv) = self.session.open_bi().await.map_err(Error::transport)?;
         let mut streams = CancellableBiStream::new(send, recv);
 
         write_frame(streams.send_mut(), &request, self.max_frame_size).await?;
-        streams
-            .send_mut()
-            .finish()
-            .await
-            .map_err(Error::transport)?;
+        streams.send_mut().finish().map_err(Error::transport)?;
 
         let response = read_frame(streams.recv_mut(), self.max_frame_size).await?;
         streams.complete();
@@ -79,13 +74,7 @@ impl RpcTransport for WebTransportTransport {
         request: RpcRequest,
         request_body: BoxMessageStream<Vec<u8>>,
     ) -> Result<BoxMessageStream<RpcStreamFrame>> {
-        let (send, recv) = self
-            .connection
-            .open_bi()
-            .await
-            .map_err(Error::transport)?
-            .await
-            .map_err(Error::transport)?;
+        let (send, recv) = self.session.open_bi().await.map_err(Error::transport)?;
         let max_frame_size = self.max_frame_size;
         let write_task = tokio::spawn(async move {
             write_streaming_request(send, request, request_body, max_frame_size).await
@@ -100,13 +89,13 @@ impl RpcTransport for WebTransportTransport {
 }
 
 struct CancellableBiStream {
-    send: Option<wtransport::SendStream>,
-    recv: Option<wtransport::RecvStream>,
+    send: Option<web_transport_quinn::SendStream>,
+    recv: Option<web_transport_quinn::RecvStream>,
     complete: bool,
 }
 
 impl CancellableBiStream {
-    fn new(send: wtransport::SendStream, recv: wtransport::RecvStream) -> Self {
+    fn new(send: web_transport_quinn::SendStream, recv: web_transport_quinn::RecvStream) -> Self {
         Self {
             send: Some(send),
             recv: Some(recv),
@@ -114,13 +103,13 @@ impl CancellableBiStream {
         }
     }
 
-    fn send_mut(&mut self) -> &mut wtransport::SendStream {
+    fn send_mut(&mut self) -> &mut web_transport_quinn::SendStream {
         self.send
             .as_mut()
             .expect("send stream should be present until completion")
     }
 
-    fn recv_mut(&mut self) -> &mut wtransport::RecvStream {
+    fn recv_mut(&mut self) -> &mut web_transport_quinn::RecvStream {
         self.recv
             .as_mut()
             .expect("recv stream should be present until completion")
@@ -141,26 +130,26 @@ impl Drop for CancellableBiStream {
             let _ = send.reset(cancelled_stream_code());
         }
 
-        if let Some(recv) = self.recv.take() {
-            recv.stop(cancelled_stream_code());
+        if let Some(recv) = &mut self.recv {
+            let _ = recv.stop(cancelled_stream_code());
         }
     }
 }
 
 struct CancellableSendStream {
-    send: Option<wtransport::SendStream>,
+    send: Option<web_transport_quinn::SendStream>,
     complete: bool,
 }
 
 impl CancellableSendStream {
-    fn new(send: wtransport::SendStream) -> Self {
+    fn new(send: web_transport_quinn::SendStream) -> Self {
         Self {
             send: Some(send),
             complete: false,
         }
     }
 
-    fn send_mut(&mut self) -> &mut wtransport::SendStream {
+    fn send_mut(&mut self) -> &mut web_transport_quinn::SendStream {
         self.send
             .as_mut()
             .expect("send stream should be present until completion")
@@ -184,7 +173,7 @@ impl Drop for CancellableSendStream {
 }
 
 struct WebTransportResponseStream {
-    recv: Option<wtransport::RecvStream>,
+    recv: Option<web_transport_quinn::RecvStream>,
     write_task: JoinHandle<Result<()>>,
     max_frame_size: usize,
     complete: bool,
@@ -192,7 +181,7 @@ struct WebTransportResponseStream {
 
 impl WebTransportResponseStream {
     const fn new(
-        recv: wtransport::RecvStream,
+        recv: web_transport_quinn::RecvStream,
         write_task: JoinHandle<Result<()>>,
         max_frame_size: usize,
     ) -> Self {
@@ -204,7 +193,7 @@ impl WebTransportResponseStream {
         }
     }
 
-    fn recv_mut(&mut self) -> &mut wtransport::RecvStream {
+    fn recv_mut(&mut self) -> &mut web_transport_quinn::RecvStream {
         self.recv
             .as_mut()
             .expect("recv stream should be present until completion")
@@ -241,9 +230,9 @@ impl MessageStream<RpcStreamFrame> for WebTransportResponseStream {
 impl Drop for WebTransportResponseStream {
     fn drop(&mut self) {
         if !self.complete
-            && let Some(recv) = self.recv.take()
+            && let Some(recv) = &mut self.recv
         {
-            recv.stop(cancelled_stream_code());
+            let _ = recv.stop(cancelled_stream_code());
         }
 
         self.write_task.abort();
@@ -251,7 +240,7 @@ impl Drop for WebTransportResponseStream {
 }
 
 pub async fn write_frame<M>(
-    send: &mut wtransport::SendStream,
+    send: &mut web_transport_quinn::SendStream,
     message: &M,
     max_frame_size: usize,
 ) -> Result<()>
@@ -262,7 +251,10 @@ where
     send.write_all(&frame).await.map_err(Error::transport)
 }
 
-pub async fn read_frame<M>(recv: &mut wtransport::RecvStream, max_frame_size: usize) -> Result<M>
+pub async fn read_frame<M>(
+    recv: &mut web_transport_quinn::RecvStream,
+    max_frame_size: usize,
+) -> Result<M>
 where
     M: Message + Default,
 {
@@ -279,7 +271,7 @@ where
 }
 
 async fn read_frame_or_eof<M>(
-    recv: &mut wtransport::RecvStream,
+    recv: &mut web_transport_quinn::RecvStream,
     max_frame_size: usize,
 ) -> Result<Option<M>>
 where
@@ -297,7 +289,10 @@ where
     decode_frame(&body).map(Some)
 }
 
-async fn read_exact_or_eof(recv: &mut wtransport::RecvStream, buf: &mut [u8]) -> Result<bool> {
+async fn read_exact_or_eof(
+    recv: &mut web_transport_quinn::RecvStream,
+    buf: &mut [u8],
+) -> Result<bool> {
     let mut offset = 0;
 
     while offset < buf.len() {
@@ -317,7 +312,7 @@ async fn read_exact_or_eof(recv: &mut wtransport::RecvStream, buf: &mut [u8]) ->
 }
 
 async fn read_exact_or_unexpected_eof(
-    recv: &mut wtransport::RecvStream,
+    recv: &mut web_transport_quinn::RecvStream,
     buf: &mut [u8],
 ) -> Result<()> {
     if read_exact_or_eof(recv, buf).await? {
@@ -335,7 +330,7 @@ fn unexpected_eof() -> Error {
 }
 
 async fn write_streaming_request(
-    send: wtransport::SendStream,
+    send: web_transport_quinn::SendStream,
     request: RpcRequest,
     mut request_body: BoxMessageStream<Vec<u8>>,
     max_frame_size: usize,
@@ -352,7 +347,7 @@ async fn write_streaming_request(
         .await?;
     }
 
-    send.send_mut().finish().await.map_err(Error::transport)?;
+    send.send_mut().finish().map_err(Error::transport)?;
     send.complete();
 
     Ok(())
@@ -366,7 +361,7 @@ impl crate::server::Server {
 
     pub async fn serve_webtransport_with_shutdown<S>(
         self,
-        endpoint: ServerEndpoint,
+        mut endpoint: ServerEndpoint,
         shutdown: S,
     ) -> Result<()>
     where
@@ -387,9 +382,13 @@ impl crate::server::Server {
 
         loop {
             tokio::select! {
-                incoming = endpoint.accept() => {
+                request = endpoint.accept() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+
                     let Some(connection_permit) = try_acquire_permit(connection_limit.as_ref()) else {
-                        incoming.refuse();
+                        let _ = request.reject(web_transport_quinn::http::StatusCode::SERVICE_UNAVAILABLE).await;
                         continue;
                     };
 
@@ -397,10 +396,10 @@ impl crate::server::Server {
                     let request_limit = request_limit.clone();
                     let shutdown = shutdown_rx.clone();
                     connection_tasks.spawn(async move {
-                        if let Ok(request) = incoming.await
-                            && let Ok(connection) = request.accept().await
+                        let _connection_permit = connection_permit;
+                        if let Ok(session) = request.ok().await
                         {
-                            handle_connection(server, connection, request_limit, connection_permit, shutdown).await;
+                            handle_session(server, session, request_limit, shutdown).await;
                         }
                     });
                 }
@@ -430,11 +429,10 @@ impl crate::server::Server {
     }
 }
 
-async fn handle_connection(
+pub(crate) async fn handle_session(
     server: crate::server::Server,
-    connection: wtransport::Connection,
+    session: web_transport_quinn::Session,
     request_limit: Option<Arc<Semaphore>>,
-    _connection_permit: Permit,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let stream_limit = server
@@ -445,7 +443,7 @@ async fn handle_connection(
 
     loop {
         tokio::select! {
-            accepted = connection.accept_bi(), if !*shutdown.borrow() => {
+            accepted = session.accept_bi(), if !*shutdown.borrow() => {
                 let Ok((send, recv)) = accepted else {
                     break;
                 };
@@ -495,12 +493,12 @@ async fn handle_connection(
     drain_streams(
         &mut stream_tasks,
         server.options().graceful_shutdown_timeout(),
-        &connection,
+        &session,
     )
     .await;
 
     if *shutdown.borrow() {
-        connection.close(
+        session.close(
             cancelled_stream_code(),
             b"server drained WebTransport connection",
         );
@@ -509,8 +507,8 @@ async fn handle_connection(
 
 async fn handle_stream(
     server: crate::server::Server,
-    mut send: wtransport::SendStream,
-    mut recv: wtransport::RecvStream,
+    mut send: web_transport_quinn::SendStream,
+    mut recv: web_transport_quinn::RecvStream,
 ) {
     let request = match read_frame::<RpcRequest>(&mut recv, server.max_frame_size()).await {
         Ok(request) => request,
@@ -545,14 +543,14 @@ async fn handle_stream(
         .await
         .is_ok()
     {
-        let _ = send.finish().await;
+        let _ = send.finish();
     }
 }
 
 async fn handle_streaming_rpc(
     server: crate::server::Server,
-    mut send: wtransport::SendStream,
-    recv: wtransport::RecvStream,
+    mut send: web_transport_quinn::SendStream,
+    recv: web_transport_quinn::RecvStream,
     request: RpcRequest,
 ) {
     let max_frame_size = server.max_frame_size();
@@ -593,17 +591,17 @@ async fn handle_streaming_rpc(
         }
     }
 
-    let _ = send.finish().await;
+    let _ = send.finish();
 }
 
 struct WebTransportRequestStream {
-    recv: wtransport::RecvStream,
+    recv: web_transport_quinn::RecvStream,
     max_frame_size: usize,
     done: bool,
 }
 
 impl WebTransportRequestStream {
-    const fn new(recv: wtransport::RecvStream, max_frame_size: usize) -> Self {
+    const fn new(recv: web_transport_quinn::RecvStream, max_frame_size: usize) -> Self {
         Self {
             recv,
             max_frame_size,
@@ -663,28 +661,32 @@ fn try_acquire_permit(limit: Option<&Arc<Semaphore>>) -> Option<Permit> {
     })
 }
 
-async fn write_status(mut send: wtransport::SendStream, status: Status, max_frame_size: usize) {
+async fn write_status(
+    mut send: web_transport_quinn::SendStream,
+    status: Status,
+    max_frame_size: usize,
+) {
     let response = status.into_response(Vec::new());
 
     if write_frame(&mut send, &response, max_frame_size)
         .await
         .is_ok()
     {
-        let _ = send.finish().await;
+        let _ = send.finish();
     }
 }
 
 async fn drain_streams(
     stream_tasks: &mut JoinSet<()>,
     timeout: Option<std::time::Duration>,
-    connection: &wtransport::Connection,
+    session: &web_transport_quinn::Session,
 ) {
     if let Some(timeout) = timeout {
         if tokio::time::timeout(timeout, drain_stream_tasks(stream_tasks))
             .await
             .is_err()
         {
-            connection.close(
+            session.close(
                 cancelled_stream_code(),
                 b"server WebTransport stream drain timed out",
             );
@@ -716,18 +718,15 @@ async fn drain_connections(
             .await
             .is_err()
         {
-            endpoint.close(
-                cancelled_stream_code(),
-                b"server graceful shutdown timed out",
-            );
+            endpoint.close(0_u32.into(), b"server graceful shutdown timed out");
             connection_tasks.abort_all();
             while connection_tasks.join_next().await.is_some() {}
         } else {
-            endpoint.close(cancelled_stream_code(), b"server shutdown complete");
+            endpoint.close(0_u32.into(), b"server shutdown complete");
         }
     } else {
         drain_connection_tasks(connection_tasks).await;
-        endpoint.close(cancelled_stream_code(), b"server shutdown complete");
+        endpoint.close(0_u32.into(), b"server shutdown complete");
     }
 }
 
@@ -741,6 +740,6 @@ async fn drain_connection_tasks(connection_tasks: &mut JoinSet<()>) {
     }
 }
 
-fn cancelled_stream_code() -> wtransport::VarInt {
-    wtransport::VarInt::from_u32(CANCELLED_STREAM_CODE)
+fn cancelled_stream_code() -> u32 {
+    CANCELLED_STREAM_CODE
 }

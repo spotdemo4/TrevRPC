@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use quinn::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 #[path = "shared/cert.rs"]
 mod cert;
@@ -13,7 +13,6 @@ mod cert;
 mod greeter;
 
 const DEFAULT_QUIC_ADDR: &str = "127.0.0.1:5000";
-const DEFAULT_WEBTRANSPORT_ADDR: &str = "127.0.0.1:5001";
 const AUTH_TOKEN: &str = "trevrpc-example-token";
 
 struct GreeterService;
@@ -91,22 +90,17 @@ impl trevrpc::MessageStream<greeter::HelloReply> for EchoReplies {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
-    let quic_addr = args
+    let addr = args
         .next()
         .unwrap_or_else(|| DEFAULT_QUIC_ADDR.to_owned())
         .parse::<SocketAddr>()?;
-    let webtransport_addr = args
-        .next()
-        .unwrap_or_else(|| DEFAULT_WEBTRANSPORT_ADDR.to_owned())
-        .parse::<SocketAddr>()?;
 
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"])?;
+    let identity =
+        rcgen::generate_simple_self_signed(["localhost".to_owned(), "127.0.0.1".to_owned()])?;
     let certificate_path = cert::certificate_path()?;
     write_certificate(&identity, &certificate_path)?;
 
-    let quic_endpoint = make_quic_endpoint(quic_addr, &identity)?;
-    let webtransport_endpoint =
-        make_webtransport_endpoint(webtransport_addr, identity.clone_identity())?;
+    let endpoint = make_endpoint(addr, &identity)?;
 
     let mut server = trevrpc::server::Server::new();
     server.set_options(
@@ -120,71 +114,52 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     println!(
         "TrevRPC greeter native QUIC server listening on {}",
-        quic_endpoint.local_addr()?
+        endpoint.local_addr()?
     );
     println!(
         "TrevRPC greeter WebTransport server listening on https://{}/trevrpc",
-        webtransport_endpoint.local_addr()?
+        endpoint.local_addr()?
     );
     println!("certificate written to {}", certificate_path.display());
     println!("bearer token: {AUTH_TOKEN}");
     println!("press Ctrl+C to shut down");
 
-    tokio::try_join!(
-        server
-            .clone()
-            .serve_quinn_with_shutdown(quic_endpoint, shutdown_signal()),
-        server.serve_webtransport_with_shutdown(webtransport_endpoint, shutdown_signal()),
-    )?;
+    server
+        .serve_quinn_and_webtransport_with_shutdown(endpoint, shutdown_signal())
+        .await?;
 
     Ok(())
 }
 
-fn make_quic_endpoint(
+fn make_endpoint(
     addr: SocketAddr,
-    identity: &wtransport::Identity,
+    identity: &rcgen::CertifiedKey<rcgen::KeyPair>,
 ) -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {
-    let cert_der = CertificateDer::from(identity.certificate_chain().as_slice()[0].der().to_vec());
-    let key_der = PrivatePkcs8KeyDer::from(identity.private_key().secret_der().to_vec());
+    let cert_der = identity.cert.der().clone();
+    let key_der = PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der());
 
     let mut server_crypto = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], PrivateKeyDer::from(key_der))?;
-    server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+    server_crypto.alpn_protocols = vec![
+        trevrpc::ALPN.to_vec(),
+        web_transport_quinn::ALPN.as_bytes().to_vec(),
+    ];
 
-    let mut server_config =
+    let server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    let transport_config = Arc::get_mut(&mut server_config.transport)
-        .expect("server config should have one transport reference");
-    transport_config.max_concurrent_uni_streams(0_u8.into());
 
     Ok(quinn::Endpoint::server(server_config, addr)?)
 }
 
-fn make_webtransport_endpoint(
-    addr: SocketAddr,
-    identity: wtransport::Identity,
-) -> Result<
-    wtransport::Endpoint<wtransport::endpoint::endpoint_side::Server>,
-    Box<dyn Error + Send + Sync>,
-> {
-    let config = wtransport::ServerConfig::builder()
-        .with_bind_address(addr)
-        .with_identity(identity)
-        .build();
-
-    Ok(wtransport::Endpoint::server(config)?)
-}
-
 fn write_certificate(
-    identity: &wtransport::Identity,
+    identity: &rcgen::CertifiedKey<rcgen::KeyPair>,
     path: &Path,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let certificate = identity.certificate_chain().as_slice()[0].to_pem();
-    std::fs::write(path, certificate)?;
+    std::fs::write(path, identity.cert.pem())?;
     Ok(())
 }
 

@@ -145,7 +145,7 @@ impl Drop for RunningServer {
 
 struct RunningWebTransportServer {
     addr: SocketAddr,
-    cert_hash: wtransport::tls::Sha256Digest,
+    cert_der: CertificateDer<'static>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<trevrpc::Result<()>>>,
 }
@@ -932,13 +932,10 @@ fn spawn_greeter_server_with_endpoint(
 fn spawn_webtransport_greeter_server(
     configure: impl FnOnce(&mut Server),
 ) -> TestResult<RunningWebTransportServer> {
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"])?;
-    let cert_hash = identity.certificate_chain().as_slice()[0].hash();
-    let config = wtransport::ServerConfig::builder()
-        .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .with_identity(identity)
-        .build();
-    let endpoint = wtransport::Endpoint::server(config)?;
+    let (endpoint, cert_der) = make_server_endpoint_with_alpns(
+        &[trevrpc::ALPN, web_transport_quinn::ALPN.as_bytes()],
+        true,
+    )?;
     let addr = endpoint.local_addr()?;
     let mut server = Server::new();
     server.set_options(fast_server_options());
@@ -947,7 +944,7 @@ fn spawn_webtransport_greeter_server(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         server
-            .serve_webtransport_with_shutdown(endpoint, async {
+            .serve_quinn_and_webtransport_with_shutdown(endpoint, async {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -955,7 +952,7 @@ fn spawn_webtransport_greeter_server(
 
     Ok(RunningWebTransportServer {
         addr,
-        cert_hash,
+        cert_der,
         shutdown: Some(shutdown_tx),
         task: Some(task),
     })
@@ -983,32 +980,30 @@ async fn connect_client(
 async fn connect_webtransport_client(
     server: &RunningWebTransportServer,
 ) -> TestResult<(
-    wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
-    wtransport::Connection,
+    web_transport_quinn::Client,
+    web_transport_quinn::Session,
     greeter::GreeterClient<trevrpc::webtransport::WebTransportTransport>,
 )> {
-    let config = wtransport::ClientConfig::builder()
-        .with_bind_default()
-        .with_server_certificate_hashes([server.cert_hash.clone()])
-        .build();
-    let endpoint = wtransport::Endpoint::client(config)?;
-    let connection = endpoint
-        .connect(format!("https://127.0.0.1:{}/trevrpc", server.addr.port()))
+    let webtransport_client = web_transport_quinn::ClientBuilder::new()
+        .with_server_certificates(vec![server.cert_der.clone()])?;
+    let url: url::Url = format!("https://127.0.0.1:{}/trevrpc", server.addr.port()).parse()?;
+    let session = webtransport_client
+        .connect(web_transport_quinn::proto::ConnectRequest::new(url))
         .await?;
-    let transport = trevrpc::webtransport::WebTransportTransport::new(connection.clone());
-    let client = greeter::GreeterClient::new(transport);
+    let transport = trevrpc::webtransport::WebTransportTransport::new(session.clone());
+    let greeter_client = greeter::GreeterClient::new(transport);
 
-    Ok((endpoint, connection, client))
+    Ok((webtransport_client, session, greeter_client))
 }
 
 async fn close_webtransport_client(
-    endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
-    connection: wtransport::Connection,
+    _client: web_transport_quinn::Client,
+    session: web_transport_quinn::Session,
 ) {
-    connection.close(wtransport::VarInt::from_u32(0), b"test complete");
-    tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle())
+    session.close(0, b"test complete");
+    tokio::time::timeout(TEST_TIMEOUT, session.closed())
         .await
-        .expect("client endpoint should become idle");
+        .expect("client WebTransport session should close");
 }
 
 async fn close_client(endpoint: quinn::Endpoint, connection: quinn::Connection) {
@@ -1036,6 +1031,13 @@ fn expired_deadline_unix_nanos() -> u64 {
 }
 
 fn make_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
+    make_server_endpoint_with_alpns(&[trevrpc::ALPN], false)
+}
+
+fn make_server_endpoint_with_alpns(
+    alpns: &[&[u8]],
+    allow_uni_streams: bool,
+) -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
     let cert_der = CertificateDer::from(cert.cert);
     let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
@@ -1043,13 +1045,15 @@ fn make_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static
     let mut server_crypto = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
-    server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+    server_crypto.alpn_protocols = alpns.iter().map(|alpn| (*alpn).to_vec()).collect();
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    let transport_config = Arc::get_mut(&mut server_config.transport)
-        .expect("server config should have one transport reference");
-    transport_config.max_concurrent_uni_streams(0_u8.into());
+    if !allow_uni_streams {
+        let transport_config = Arc::get_mut(&mut server_config.transport)
+            .expect("server config should have one transport reference");
+        transport_config.max_concurrent_uni_streams(0_u8.into());
+    }
 
     Ok((
         quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?,
