@@ -103,7 +103,7 @@
 
         # nix build [#...]
         packages = {
-          default = pkgs.rustPlatform.buildRustPackage (
+          trevrpc-rust = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
               pname = "trevrpc-rust";
               version = "0.1.0";
@@ -134,17 +134,12 @@
             }
           );
 
-          go = pkgs.buildGoModule (
+          trevrpc-go = pkgs.buildGoModule (
             final: with pkgs.lib; {
               pname = "trevrpc-go";
               version = "0.1.0";
 
-              src = fileset.toSource {
-                root = ./trevrpc-go;
-                fileset = fileset.fileFilter (
-                  file: file.hasExt "go" || file.name == "go.mod" || file.name == "go.sum"
-                ) ./trevrpc-go;
-              };
+              src = ./trevrpc-go;
               vendorHash = "sha256-2lBD0Ws8tIL/pTDa0pQwvkg9v9jCNCeHE8nEoJnv5AY=";
               subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
 
@@ -173,14 +168,6 @@
           );
         };
 
-        # nix build #images.[...]
-        images = {
-          default = pkgs.mkImage {
-            src = self.packages.${system}.default;
-            contents = with pkgs; [ dockerTools.caCertificates ];
-          };
-        };
-
         # nix fmt
         formatter = pkgs.treefmt.withConfig {
           configFile = ./treefmt.toml;
@@ -194,14 +181,14 @@
 
         # nix flake check
         checks = pkgs.mkChecks {
-          rust = self.packages.${system}.default.overrideAttrs {
+          rust = self.packages.${system}.trevrpc-rust.overrideAttrs {
             dontBuild = true;
             installPhase = ''
               touch $out
             '';
           };
 
-          go = self.packages.${system}.go.overrideAttrs {
+          go = self.packages.${system}.trevrpc-go.overrideAttrs {
             dontBuild = true;
             installPhase = ''
               touch $out
