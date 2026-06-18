@@ -7,12 +7,12 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
+	"trev.zip/llc/trevrpc/trevrpc-go/examples/internal/examplecert"
 )
 
 const serverAddr = "127.0.0.1:50051"
@@ -64,9 +64,9 @@ func main() {
 }
 
 func clientTLSConfig() (*tls.Config, error) {
-	certPath := os.Getenv("TREVRPC_GO_EXAMPLE_CERT")
-	if certPath == "" {
-		certPath = filepath.Join("target", "trevrpc-go-example-cert.pem")
+	certPath, err := examplecert.Path()
+	if err != nil {
+		return nil, err
 	}
 
 	certPEM, err := os.ReadFile(certPath)

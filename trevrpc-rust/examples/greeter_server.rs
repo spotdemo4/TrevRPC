@@ -1,11 +1,13 @@
 use std::error::Error;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
+#[path = "shared/cert.rs"]
+mod cert;
 #[allow(dead_code)]
 #[path = "shared/greeter.rs"]
 mod greeter;
@@ -92,7 +94,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or_else(|| DEFAULT_ADDR.to_owned())
         .parse::<SocketAddr>()?;
     let (endpoint, cert_der) = make_server_endpoint(addr)?;
-    write_certificate(&cert_der)?;
+    let certificate_path = cert::certificate_path()?;
+    write_certificate(&cert_der, &certificate_path)?;
 
     let mut server = trevrpc::server::Server::new();
     server.set_options(
@@ -108,7 +111,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         "TrevRPC greeter server listening on {}",
         endpoint.local_addr()?
     );
-    println!("certificate written to {}", certificate_path().display());
+    println!("certificate written to {}", certificate_path.display());
     println!("press Ctrl+C to shut down");
 
     server
@@ -141,18 +144,13 @@ fn make_server_endpoint(
     Ok((quinn::Endpoint::server(server_config, addr)?, cert_der))
 }
 
-fn write_certificate(cert_der: &CertificateDer<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let path = certificate_path();
+fn write_certificate(
+    cert_der: &CertificateDer<'_>,
+    path: &Path,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, cert_der.as_ref())?;
     Ok(())
-}
-
-fn certificate_path() -> PathBuf {
-    std::env::var_os("TREVRPC_EXAMPLE_CERT").map_or_else(
-        || PathBuf::from("target/trevrpc-example-cert.der"),
-        PathBuf::from,
-    )
 }

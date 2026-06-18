@@ -1,12 +1,13 @@
 use std::error::Error;
 use std::net::{Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::pki_types::CertificateDer;
 
+#[path = "shared/cert.rs"]
+mod cert;
 #[allow(dead_code)]
 #[path = "shared/greeter.rs"]
 mod greeter;
@@ -86,7 +87,7 @@ fn call_options() -> trevrpc::client::CallOptions {
 }
 
 fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {
-    let cert_der = std::fs::read(certificate_path())?;
+    let cert_der = std::fs::read(cert::certificate_path()?)?;
     let mut roots = quinn::rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(cert_der))?;
 
@@ -101,11 +102,4 @@ fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync
     )));
 
     Ok(endpoint)
-}
-
-fn certificate_path() -> PathBuf {
-    std::env::var_os("TREVRPC_EXAMPLE_CERT").map_or_else(
-        || PathBuf::from("target/trevrpc-example-cert.der"),
-        PathBuf::from,
-    )
 }
