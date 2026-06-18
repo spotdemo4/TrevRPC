@@ -26,9 +26,9 @@ jobs:
           shell: release
 
       - name: Release to GitHub
-        run: flake-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PACKAGES: |
             packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl
             packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl
+        run: flake-release

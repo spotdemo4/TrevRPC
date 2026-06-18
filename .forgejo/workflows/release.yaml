@@ -23,7 +23,6 @@ jobs:
           shell: release
 
       - name: Release to Forgejo
-        run: flake-release
         env:
           GITHUB_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           REGISTRY: trev.zip
@@ -32,16 +31,20 @@ jobs:
           PACKAGES: |
             packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl
             packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl
+        run: flake-release
 
       - name: Release to Cargo
         working-directory: trevrpc-rust
-        run: cargo publish --registry forgejo --locked # zizmor: ignore[use-trusted-publishing]
         env:
           CARGO_REGISTRIES_FORGEJO_INDEX: sparse+${{ forgejo.SERVER_URL }}/api/packages/${{ forgejo.REPOSITORY_OWNER }}/cargo/
           CARGO_REGISTRIES_FORGEJO_TOKEN: Bearer ${{ secrets.PACKAGE_TOKEN }}
+        run: cargo publish --registry forgejo --locked # zizmor: ignore[use-trusted-publishing]
 
       - name: Release to proxy
         working-directory: trevrpc-go
+        env:
+          FORGEJO_GO_UPLOAD_URL: ${{ forgejo.SERVER_URL }}/api/packages/${{ forgejo.REPOSITORY_OWNER }}/go/upload
+          FORGEJO_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -65,6 +68,15 @@ jobs:
             --header "Authorization: token ${FORGEJO_TOKEN}" \
             --upload-file "${archive}" \
             "${FORGEJO_GO_UPLOAD_URL}"
+
+      - name: Release to NPM
+        working-directory: trevrpc-js
         env:
-          FORGEJO_GO_UPLOAD_URL: ${{ forgejo.SERVER_URL }}/api/packages/${{ forgejo.REPOSITORY_OWNER }}/go/upload
-          FORGEJO_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          SERVER_URL: ${{ forgejo.SERVER_URL }}
+          REPOSITORY_OWNER: ${{ forgejo.REPOSITORY_OWNER }}
+          PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: | # zizmor: ignore[use-trusted-publishing]
+          npm config set @trev:registry "${SERVER_URL}/api/packages/${REPOSITORY_OWNER}/npm/"
+          npm config set "//trev.zip/api/packages/${REPOSITORY_OWNER}/npm/:_authToken=${PACKAGE_TOKEN}"
+          npm ci
+          npm publish --scope=@trev --registry="${SERVER_URL}/api/packages/${REPOSITORY_OWNER}/npm/"

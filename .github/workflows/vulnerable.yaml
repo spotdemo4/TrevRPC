@@ -37,6 +37,20 @@ jobs:
         working-directory: trevrpc-go
         run: govulncheck ./...
 
+  npm:
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@1fdd7d95bd30822380ce472de2bd4e40bc7e648b # v1.52.0
+        with:
+          shell: vulnerable
+
+      - name: Run npm audit
+        working-directory: trevrpc-js
+        run: npm audit --audit-level moderate
+
   nix:
     runs-on: ubuntu-24.04
     permissions:

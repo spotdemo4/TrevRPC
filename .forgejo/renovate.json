@@ -7,7 +7,7 @@
   "platform": "forgejo",
   "endpoint": "https://trev.zip/api/v1",
   "repositories": ["llc/TrevRPC"],
-  "allowedCommands": ["fix-hash .#trevrpc-go"],
+  "allowedCommands": ["fix-hash .#trevrpc-go", "npm audit fix --prefix trevrpc-js"],
 
   // repository
   "extends": ["config:recommended"],
@@ -21,7 +21,7 @@
     "schedule": ["* * * * 0"], // sunday
     "skipInstalls": false,
     "postUpgradeTasks": {
-      "commands": ["fix-hash .#trevrpc-go"]
+      "commands": ["fix-hash .#trevrpc-go", "npm audit fix --prefix trevrpc-js"]
     }
   },
   "packageRules": [
@@ -47,6 +47,17 @@
       "postUpgradeTasks": {
         "commands": ["fix-hash .#trevrpc-go"]
       }
+    },
+    {
+      "matchManagers": ["npm"],
+      "addLabels": ["node"],
+      "rangeStrategy": "bump",
+      "postUpdateOptions": ["npmInstallTwice"]
+    },
+    {
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["engines"],
+      "enabled": false
     }
   ]
 }
