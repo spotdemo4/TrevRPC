@@ -105,11 +105,12 @@
         packages = {
           default = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
-              pname = "trevrpc";
+              pname = "trevrpc-rust";
               version = "0.1.0";
 
               src = ./trevrpc-rust;
               cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
+              cargoBuildFlags = [ "--workspace" ];
 
               nativeCheckInputs = with pkgs; [
                 rustfmt
@@ -122,7 +123,7 @@
               '';
 
               meta = {
-                mainProgram = "trevrpc";
+                mainProgram = "protoc-gen-trevrpc-rust";
                 description = "Protobuf over QUIC & WebTransport";
                 license = licenses.mit;
                 platforms = platforms.all;

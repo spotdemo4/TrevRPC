@@ -18,10 +18,6 @@ pedantic = "warn"
 [lib]
 path = "src/lib.rs"
 
-[[bin]]
-name = "trevrpc"
-path = "main.rs"
-
 [features]
 default = ["client", "server", "quinn"]
 client = ["dep:tokio"]
