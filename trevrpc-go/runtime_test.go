@@ -1062,7 +1062,7 @@ func connectTestQUICClient(t *testing.T, running *runningTestQUICServer) *quic.C
 	return conn
 }
 
-func connectTestWebTransportClient(t *testing.T, running *runningTestQUICServer) *WebTransportTransport {
+func connectTestWebTransportClient(t *testing.T, running *runningTestQUICServer) *WebTransportClient {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()

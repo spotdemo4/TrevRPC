@@ -5,10 +5,10 @@ JavaScript WebTransport client runtime and `protoc`/buf plugin for TrevRPC.
 ## Runtime
 
 ```js
-import { WebTransportTransport } from "trevrpc-js";
+import { WebTransportClient } from "trevrpc-js";
 import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
 
-const transport = await WebTransportTransport.connect("https://localhost:50051/trevrpc");
+const transport = await WebTransportClient.connect("https://localhost:50051/trevrpc");
 const client = new GreeterClient(transport, { timeoutMs: 5000 });
 
 const reply = await client.sayHello({ name: "Trev" });

@@ -10,7 +10,7 @@ import {
 
 const CancelledStreamReason = "TrevRPC stream cancelled";
 
-export class WebTransportTransport {
+export class WebTransportClient {
   constructor(session, options = {}) {
     this.session = session;
     this.maxFrameSize = options.maxFrameSize ?? DefaultMaxFrameSize;
@@ -24,7 +24,7 @@ export class WebTransportTransport {
 
     const session = new WebTransportCtor(url, options.webTransportOptions ?? {});
     await session.ready;
-    return new WebTransportTransport(session, options);
+    return new WebTransportClient(session, options);
   }
 
   async ready() {

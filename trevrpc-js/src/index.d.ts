@@ -288,21 +288,21 @@ export interface WebTransportConstructorLike {
   new (url: string | URL, options?: unknown): WebTransportSessionLike;
 }
 
-export interface WebTransportTransportOptions extends CallOptions {
+export interface WebTransportClientOptions extends CallOptions {
   WebTransport?: WebTransportConstructorLike;
   webTransportOptions?: unknown;
 }
 
-export class WebTransportTransport implements Transport {
+export class WebTransportClient implements Transport {
   session: WebTransportSessionLike;
   maxFrameSize: number;
 
-  constructor(session: WebTransportSessionLike, options?: WebTransportTransportOptions);
+  constructor(session: WebTransportSessionLike, options?: WebTransportClientOptions);
 
   static connect(
     url: string | URL,
-    options?: WebTransportTransportOptions,
-  ): Promise<WebTransportTransport>;
+    options?: WebTransportClientOptions,
+  ): Promise<WebTransportClient>;
   ready(): Promise<void>;
   close(closeInfo?: WebTransportCloseInfoLike): void;
   call(request: RpcRequestMessage, options?: ResolvedCallOptions): Promise<RpcResponseMessage>;

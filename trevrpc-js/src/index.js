@@ -56,4 +56,4 @@ export {
   serverStreaming,
   unary,
 } from "./client.js";
-export { WebTransportResponseFrameStream, WebTransportTransport } from "./webtransport.js";
+export { WebTransportClient, WebTransportResponseFrameStream } from "./webtransport.js";

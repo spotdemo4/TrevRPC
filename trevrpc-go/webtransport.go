@@ -27,12 +27,12 @@ type WebTransportDialOptions struct {
 	StreamReorderingTimeout time.Duration
 }
 
-type WebTransportTransport struct {
+type WebTransportClient struct {
 	session      *webtransport.Session
 	maxFrameSize int
 }
 
-func DialWebTransport(ctx context.Context, url string, options WebTransportDialOptions) (*WebTransportTransport, error) {
+func DialWebTransport(ctx context.Context, url string, options WebTransportDialOptions) (*WebTransportClient, error) {
 	dialer := &webtransport.Dialer{
 		TLSClientConfig:         options.TLSClientConfig,
 		QUICConfig:              options.QUICConfig,
@@ -45,23 +45,23 @@ func DialWebTransport(ctx context.Context, url string, options WebTransportDialO
 		return nil, webTransportStatus(err)
 	}
 
-	return NewWebTransportTransport(session), nil
+	return NewWebTransportClient(session), nil
 }
 
-func NewWebTransportTransport(session *webtransport.Session) *WebTransportTransport {
-	return &WebTransportTransport{session: session, maxFrameSize: DefaultMaxFrameSize}
+func NewWebTransportClient(session *webtransport.Session) *WebTransportClient {
+	return &WebTransportClient{session: session, maxFrameSize: DefaultMaxFrameSize}
 }
 
-func (t *WebTransportTransport) WithMaxFrameSize(maxFrameSize int) *WebTransportTransport {
+func (t *WebTransportClient) WithMaxFrameSize(maxFrameSize int) *WebTransportClient {
 	t.maxFrameSize = maxFrameSize
 	return t
 }
 
-func (t *WebTransportTransport) Session() *webtransport.Session {
+func (t *WebTransportClient) Session() *webtransport.Session {
 	return t.session
 }
 
-func (t *WebTransportTransport) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (t *WebTransportClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.session.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, webTransportStatus(err)
@@ -85,7 +85,7 @@ func (t *WebTransportTransport) Call(ctx context.Context, request *RpcRequest) (
 	return response, nil
 }
 
-func (t *WebTransportTransport) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+func (t *WebTransportClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := t.session.OpenStreamSync(streamCtx)
 	if err != nil {

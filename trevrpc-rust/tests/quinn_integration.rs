@@ -982,7 +982,7 @@ async fn connect_webtransport_client(
 ) -> TestResult<(
     web_transport_quinn::Client,
     web_transport_quinn::Session,
-    greeter::GreeterClient<trevrpc::webtransport::WebTransportTransport>,
+    greeter::GreeterClient<trevrpc::webtransport::WebTransportClient>,
 )> {
     let webtransport_client = web_transport_quinn::ClientBuilder::new()
         .with_server_certificates(vec![server.cert_der.clone()])?;
@@ -990,7 +990,7 @@ async fn connect_webtransport_client(
     let session = webtransport_client
         .connect(web_transport_quinn::proto::ConnectRequest::new(url))
         .await?;
-    let transport = trevrpc::webtransport::WebTransportTransport::new(session.clone());
+    let transport = trevrpc::webtransport::WebTransportClient::new(session.clone());
     let greeter_client = greeter::GreeterClient::new(transport);
 
     Ok((webtransport_client, session, greeter_client))
