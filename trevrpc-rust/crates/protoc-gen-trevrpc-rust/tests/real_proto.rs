@@ -20,7 +20,7 @@ fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error
     request.encode(&mut input)?;
     let mut output = Vec::new();
 
-    protoc_gen_trevrpc::run_plugin(input.as_slice(), &mut output)?;
+    protoc_gen_trevrpc_rust::run_plugin(input.as_slice(), &mut output)?;
 
     let response = CodeGeneratorResponse::decode(output.as_slice())?;
     assert_eq!(response.error, None);
@@ -50,7 +50,7 @@ fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error
     assert!(content.contains("::trevrpc::RpcKind::BidirectionalStreaming"));
 
     let buf_config = include_str!("proto/buf.gen.yaml");
-    assert!(buf_config.contains("protoc-gen-trevrpc"));
+    assert!(buf_config.contains("protoc-gen-trevrpc-rust"));
 
     compile_generated_service(content)?;
 

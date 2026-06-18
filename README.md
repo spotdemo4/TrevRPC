@@ -38,12 +38,12 @@ Rust lives under `trevrpc-rust/`. Go lives under `trevrpc-go/`.
 
 ## protobuf generation
 
-`protoc-gen-trevrpc` and `protoc-gen-trevrpc-go` are Buf/protoc plugins that generate TrevRPC service traits/interfaces, clients, and server registration glue.
+`protoc-gen-trevrpc-rust` and `protoc-gen-trevrpc-go` are Buf/protoc plugins that generate TrevRPC service traits/interfaces, clients, and server registration glue.
 
 Install the plugin locally while developing:
 
 ```sh
-cargo install --path trevrpc-rust/crates/protoc-gen-trevrpc
+cargo install --path trevrpc-rust/crates/protoc-gen-trevrpc-rust
 go install ./trevrpc-go/cmd/protoc-gen-trevrpc-go
 ```
 
@@ -52,7 +52,7 @@ Example `buf.gen.yaml`:
 ```yaml
 version: v2
 plugins:
-  - local: protoc-gen-trevrpc
+  - local: protoc-gen-trevrpc-rust
     out: trevrpc-rust/src/generated
     opt:
       - runtime_path=::trevrpc
@@ -101,6 +101,21 @@ cargo run --manifest-path trevrpc-rust/Cargo.toml --example greeter_client -- Tr
 
 The server writes a local self-signed certificate to `target/trevrpc-example-cert.der`; the client
 reads that certificate before connecting. Override the path with `TREVRPC_EXAMPLE_CERT`.
+
+Run the Go QUIC greeter server:
+
+```sh
+go run ./trevrpc-go/examples/greeter_server
+```
+
+Then call it from another shell:
+
+```sh
+go run ./trevrpc-go/examples/greeter_client -- TrevRPC
+```
+
+The Go server writes a local self-signed certificate to `target/trevrpc-go-example-cert.pem`; the
+Go client reads that certificate before connecting. Override the path with `TREVRPC_GO_EXAMPLE_CERT`.
 
 The examples also show the production-facing defaults:
 

@@ -9,7 +9,7 @@ repository = "https://trev.zip/llc/TrevRPC"
 license-file = "../LICENSE"
 
 [workspace]
-members = ["crates/protoc-gen-trevrpc"]
+members = ["crates/protoc-gen-trevrpc-rust"]
 resolver = "3"
 
 [lints.clippy]

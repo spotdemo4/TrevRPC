@@ -1,6 +1,6 @@
 version: v2
 plugins:
-  - local: protoc-gen-trevrpc
+  - local: protoc-gen-trevrpc-rust
     out: gen
     opt:
       - runtime_path=::trevrpc
