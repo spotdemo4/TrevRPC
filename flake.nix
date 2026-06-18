@@ -77,8 +77,12 @@
           release = pkgs.mkShell {
             packages = with pkgs; [
               flake-release
+              # rust
               rustc
               cargo
+              # go
+              go
+              # javascript
               nodejs_24
             ];
           };
@@ -86,20 +90,29 @@
           update = pkgs.mkShell {
             packages = with pkgs; [
               renovate
-              cargo # rust
-              go # go
-              nodejs_24 # javascript
+              # rust
+              rustc
+              cargo
+              # go
+              go
+              # javascript
+              nodejs_24
             ];
           };
 
           vulnerable = pkgs.mkShell {
             packages = with pkgs; [
-              cargo-audit # rust
+              # rust
+              cargo-audit
+              # go
               go
-              govulncheck # go
-              nodejs_24 # javascript
-              flake-checker # nix
-              zizmor # actions
+              govulncheck
+              # javascript
+              nodejs_24
+              # nix
+              flake-checker
+              # actions
+              zizmor
             ];
           };
         };
