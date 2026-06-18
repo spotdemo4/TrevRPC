@@ -1,18 +1,18 @@
 [package]
-name = "rust-template"
-version = "0.7.2"
+name = "trevrpc"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
-description = "rust template"
+description = "Protobuf over QUIC & WebTransport"
 readme = "README.md"
-repository = "https://trev.zip/template/rust"
+repository = "https://trev.zip/llc/TrevRPC"
 license-file = "LICENSE"
 
 [lints.clippy]
 pedantic = "warn"
 
 [[bin]]
-name = "rust-template"
+name = "trevrpc"
 path = "main.rs"
 
 [dependencies]

@@ -1,5 +1,5 @@
 {
-  description = "rust template";
+  description = "Protobuf over QUIC & WebTransport";
 
   nixConfig = {
     extra-substituters = [
@@ -97,8 +97,8 @@
         packages = {
           default = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
-              pname = "rust-template";
-              version = "0.7.2";
+              pname = "trevrpc";
+              version = "0.1.0";
 
               src = fileset.toSource {
                 root = ./.;
@@ -123,13 +123,13 @@
               '';
 
               meta = {
-                mainProgram = "rust-template";
-                description = "rust template";
+                mainProgram = "trevrpc";
+                description = "Protobuf over QUIC & WebTransport";
                 license = licenses.mit;
                 platforms = platforms.all;
-                homepage = "https://trev.zip/template/rust";
-                changelog = "https://trev.zip/template/rust/releases";
-                downloadPage = "https://trev.zip/template/rust/releases/tag/v${final.version}";
+                homepage = "https://trev.zip/llc/TrevRPC";
+                changelog = "https://trev.zip/llc/TrevRPC/releases";
+                downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
               };
             }
           );

@@ -6,7 +6,7 @@
   "requireConfig": "ignored",
   "platform": "forgejo",
   "endpoint": "https://trev.zip/api/v1",
-  "repositories": ["template/rust"],
+  "repositories": ["llc/TrevRPC"],
 
   // repository
   "extends": ["config:recommended"],

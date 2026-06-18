@@ -5,7 +5,7 @@
   "onboarding": false,
   "requireConfig": "ignored",
   "platform": "github",
-  "repositories": ["spotdemo4/rust-template"],
+  "repositories": ["llc/TrevRPC"],
 
   // repository
   "extends": ["config:recommended"],

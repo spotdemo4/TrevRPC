@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    println!("TrevRPC: Protobuf over QUIC & WebTransport");
 }
