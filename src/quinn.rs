@@ -9,6 +9,8 @@ use crate::client::RpcTransport;
 use crate::framing::{DEFAULT_MAX_FRAME_SIZE, decode_frame, encode_frame_with_max, frame_body_len};
 use crate::{Error, Result, RpcRequest, RpcResponse, Status};
 
+const CANCELLED_STREAM_CODE: u32 = 1;
+
 #[derive(Clone)]
 pub struct QuinnTransport {
     connection: quinn::Connection,
@@ -44,12 +46,64 @@ impl QuinnTransport {
 #[crate::async_trait]
 impl RpcTransport for QuinnTransport {
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        let (mut send, mut recv) = self.connection.open_bi().await.map_err(Error::transport)?;
+        let (send, recv) = self.connection.open_bi().await.map_err(Error::transport)?;
+        let mut streams = CancellableBiStream::new(send, recv);
 
-        write_frame(&mut send, &request, self.max_frame_size).await?;
-        send.finish().map_err(Error::transport)?;
+        write_frame(streams.send_mut(), &request, self.max_frame_size).await?;
+        streams.send_mut().finish().map_err(Error::transport)?;
 
-        read_frame(&mut recv, self.max_frame_size).await
+        let response = read_frame(streams.recv_mut(), self.max_frame_size).await?;
+        streams.complete();
+
+        Ok(response)
+    }
+}
+
+struct CancellableBiStream {
+    send: Option<quinn::SendStream>,
+    recv: Option<quinn::RecvStream>,
+    complete: bool,
+}
+
+impl CancellableBiStream {
+    fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        Self {
+            send: Some(send),
+            recv: Some(recv),
+            complete: false,
+        }
+    }
+
+    fn send_mut(&mut self) -> &mut quinn::SendStream {
+        self.send
+            .as_mut()
+            .expect("send stream should be present until completion")
+    }
+
+    fn recv_mut(&mut self) -> &mut quinn::RecvStream {
+        self.recv
+            .as_mut()
+            .expect("recv stream should be present until completion")
+    }
+
+    fn complete(mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for CancellableBiStream {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+
+        if let Some(send) = &mut self.send {
+            let _ = send.reset(CANCELLED_STREAM_CODE.into());
+        }
+
+        if let Some(recv) = &mut self.recv {
+            let _ = recv.stop(CANCELLED_STREAM_CODE.into());
+        }
     }
 }
 
@@ -217,7 +271,12 @@ async fn handle_connection(
         }
     }
 
-    drain_streams(&mut stream_tasks).await;
+    drain_streams(
+        &mut stream_tasks,
+        server.options().graceful_shutdown_timeout(),
+        &connection,
+    )
+    .await;
 
     if *shutdown.borrow() {
         connection.close(0_u32.into(), b"server drained connection");
@@ -230,7 +289,18 @@ async fn handle_stream(
     mut recv: quinn::RecvStream,
 ) {
     let response = match read_frame::<RpcRequest>(&mut recv, server.max_frame_size()).await {
-        Ok(request) => server.handle_request(request).await,
+        Ok(request) => {
+            tokio::select! {
+                biased;
+                response = server.handle_request(request) => response,
+                stopped = send.stopped() => {
+                    let _ = &stopped;
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("client stopped response stream before RPC completed");
+                    return;
+                }
+            }
+        }
         Err(error) => Status::internal(error.to_string()).into_response(Vec::new()),
     };
 
@@ -266,7 +336,26 @@ async fn write_status(mut send: quinn::SendStream, status: Status, max_frame_siz
     }
 }
 
-async fn drain_streams(stream_tasks: &mut JoinSet<()>) {
+async fn drain_streams(
+    stream_tasks: &mut JoinSet<()>,
+    timeout: Option<std::time::Duration>,
+    connection: &quinn::Connection,
+) {
+    if let Some(timeout) = timeout {
+        if tokio::time::timeout(timeout, drain_stream_tasks(stream_tasks))
+            .await
+            .is_err()
+        {
+            connection.close(0_u32.into(), b"server stream drain timed out");
+            stream_tasks.abort_all();
+            while stream_tasks.join_next().await.is_some() {}
+        }
+    } else {
+        drain_stream_tasks(stream_tasks).await;
+    }
+}
+
+async fn drain_stream_tasks(stream_tasks: &mut JoinSet<()>) {
     while let Some(result) = stream_tasks.join_next().await {
         if let Err(error) = result {
             let _ = &error;
@@ -281,23 +370,42 @@ async fn drain_connections(
     timeout: Option<std::time::Duration>,
     endpoint: &quinn::Endpoint,
 ) {
-    let drain = async {
-        while let Some(result) = connection_tasks.join_next().await {
-            if let Err(error) = result {
-                let _ = &error;
-                #[cfg(feature = "tracing")]
-                tracing::warn!(%error, "connection task failed while draining");
-            }
-        }
-    };
-
     if let Some(timeout) = timeout {
-        if tokio::time::timeout(timeout, drain).await.is_err() {
+        if tokio::time::timeout(timeout, drain_connection_tasks(connection_tasks, endpoint))
+            .await
+            .is_err()
+        {
             endpoint.close(0_u32.into(), b"server graceful shutdown timed out");
             connection_tasks.abort_all();
             while connection_tasks.join_next().await.is_some() {}
+        } else {
+            endpoint.close(0_u32.into(), b"server shutdown complete");
         }
     } else {
-        drain.await;
+        drain_connection_tasks(connection_tasks, endpoint).await;
+        endpoint.close(0_u32.into(), b"server shutdown complete");
+    }
+}
+
+async fn drain_connection_tasks(connection_tasks: &mut JoinSet<()>, endpoint: &quinn::Endpoint) {
+    let mut accepting = true;
+
+    while !connection_tasks.is_empty() {
+        tokio::select! {
+            incoming = endpoint.accept(), if accepting => {
+                if let Some(incoming) = incoming {
+                    incoming.refuse();
+                } else {
+                    accepting = false;
+                }
+            }
+            result = connection_tasks.join_next() => {
+                if let Some(Err(error)) = result {
+                    let _ = &error;
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(%error, "connection task failed while draining");
+                }
+            }
+        }
     }
 }

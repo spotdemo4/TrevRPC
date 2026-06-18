@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
+use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{Code, Error, Result, RpcRequest, RpcResponse, Status};
 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
@@ -130,6 +131,8 @@ impl ServerOptions {
 
 #[crate::async_trait]
 pub trait Authorizer: Send + Sync + 'static {
+    /// Authorizes a request after metadata validation but before route lookup.
+    /// This intentionally avoids leaking method existence to unauthenticated callers.
     async fn authorize(&self, request: &RpcRequest) -> std::result::Result<(), Status>;
 }
 
@@ -142,8 +145,10 @@ pub struct MetadataValueAuthorizer {
 impl MetadataValueAuthorizer {
     #[must_use]
     pub fn new(key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        let key = key.into();
+
         Self {
-            key: key.into(),
+            key: normalize_metadata_key(&key),
             value: value.into(),
         }
     }
@@ -169,8 +174,10 @@ impl Authorizer for MetadataValueAuthorizer {
 }
 
 pub trait Metrics: Send + Sync + 'static {
+    /// Called inline on the RPC task. Implementations must not block.
     fn rpc_started(&self, _event: &RpcStarted) {}
 
+    /// Called inline on the RPC task. Implementations must not block.
     fn rpc_finished(&self, _event: &RpcFinished) {}
 }
 
@@ -327,6 +334,16 @@ impl Server {
             "rpc started"
         );
 
+        if let Err(status) = validate_metadata(&request.metadata) {
+            return self.finish_response(
+                &service,
+                &method,
+                request_body_len,
+                started_at,
+                status.into_response(Vec::new()),
+            );
+        }
+
         if let Some(authorizer) = &self.authorizer {
             match authorizer.authorize(&request).await {
                 Ok(()) => {}
@@ -434,7 +451,7 @@ mod tests {
         let finished = Arc::clone(&metrics.finished);
         let mut server = Server::new();
         server.set_authorizer(MetadataValueAuthorizer::new(
-            "authorization",
+            "Authorization",
             b"ok".to_vec(),
         ));
         server.set_metrics(metrics);
@@ -476,5 +493,50 @@ mod tests {
 
         assert_eq!(Code::from_u32(response.status), Code::Unauthenticated);
         assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_metadata_is_rejected_before_authorization() {
+        let metrics = TestMetrics::default();
+        let finished = Arc::clone(&metrics.finished);
+        let mut server = Server::new();
+        server.set_authorizer(MetadataValueAuthorizer::new(
+            "authorization",
+            b"ok".to_vec(),
+        ));
+        server.set_metrics(metrics);
+        server.route("example.Greeter", "SayHello", |_| async {
+            Ok(b"hello".to_vec())
+        });
+
+        let mut request = RpcRequest::new("example.Greeter", "SayHello", Vec::new());
+        request
+            .metadata
+            .insert("Authorization".to_owned(), b"ok".to_vec());
+
+        let response = server.handle_request(request).await;
+
+        assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+        assert_eq!(
+            *finished
+                .lock()
+                .expect("metrics lock should not be poisoned"),
+            vec![Code::InvalidArgument]
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_requests_do_not_leak_unknown_methods() {
+        let mut server = Server::new();
+        server.set_authorizer(MetadataValueAuthorizer::new(
+            "authorization",
+            b"ok".to_vec(),
+        ));
+
+        let response = server
+            .handle_request(RpcRequest::new("example.Greeter", "Missing", Vec::new()))
+            .await;
+
+        assert_eq!(Code::from_u32(response.status), Code::Unauthenticated);
     }
 }

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
+use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{Error, Metadata, Result, RpcRequest, RpcResponse, Status};
 use prost::Message;
 
@@ -62,7 +63,9 @@ impl CallOptions {
 
     #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
-        self.metadata.insert(key.into(), value.into());
+        let key = key.into();
+        self.metadata
+            .insert(normalize_metadata_key(&key), value.into());
         self
     }
 
@@ -95,6 +98,8 @@ where
         max_response_body_size,
         metadata,
     } = options;
+    validate_metadata(&metadata).map_err(Error::from)?;
+
     let request = RpcRequest::new(service, method, request.encode_to_vec()).with_metadata(metadata);
     let response = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, transport.call(request))
@@ -103,6 +108,8 @@ where
     } else {
         transport.call(request).await?
     };
+
+    validate_response_metadata(&response)?;
 
     if response.body.len() > max_response_body_size {
         return Err(Error::FrameTooLarge {
@@ -117,4 +124,29 @@ where
     }
 
     Res::decode(response.body.as_slice()).map_err(Error::from)
+}
+
+fn validate_response_metadata(response: &RpcResponse) -> Result<()> {
+    validate_metadata(&response.metadata).map_err(|status| {
+        Error::from(Status::internal(format!(
+            "invalid response metadata: {}",
+            status.message()
+        )))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CallOptions;
+
+    #[test]
+    fn call_options_normalize_metadata_keys() {
+        let options = CallOptions::new().with_metadata("Authorization", b"ok".to_vec());
+
+        assert_eq!(
+            options.metadata().get("authorization").map(Vec::as_slice),
+            Some(&b"ok"[..])
+        );
+        assert!(!options.metadata().contains_key("Authorization"));
+    }
 }

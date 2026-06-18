@@ -98,7 +98,7 @@ The examples also show the production-facing defaults:
 - Client calls attach request metadata through `CallOptions::with_metadata`.
 - The server enforces metadata auth with `trevrpc::server::MetadataValueAuthorizer`.
 - Server calls use `trevrpc::server::ServerOptions` for connection and RPC concurrency limits.
-- The server uses `serve_quinn_with_shutdown` to stop accepting new work on Ctrl+C and drain active streams.
+- The server uses `serve_quinn_with_shutdown` to refuse new connections on Ctrl+C, drain active streams, then force-close after the configured timeout.
 
 ## production hooks
 
@@ -108,12 +108,19 @@ Authentication can be enforced in two places:
   certificates or mTLS before constructing the endpoint.
 - Request-level authorization belongs in TrevRPC metadata. Implement `trevrpc::server::Authorizer`
   or use `MetadataValueAuthorizer` for simple fixed metadata checks.
+- Metadata keys are normalized by `CallOptions::with_metadata`, then validated on both client and
+  server. User metadata keys must be lowercase ASCII using letters, digits, `.`, `_`, or `-`; the
+  `trevrpc-` prefix is reserved for protocol use.
+- Authorization runs after metadata validation but before route lookup, so unauthenticated callers
+  do not learn whether a method exists.
 
 Observability hooks are intentionally small:
 
 - Enable the `tracing` feature for structured RPC lifecycle events.
 - Install custom `trevrpc::server::Metrics` to collect RPC start/finish events, status codes,
   latency, and body sizes.
+- Metrics callbacks run inline on the RPC task and must be fast/non-blocking. Forward to a channel
+  or recorder instead of doing I/O in the callback.
 
 The plugin has an integration test that compiles a real `.proto` fixture and exercises the
 Buf/protoc plugin protocol. The fixture includes a `buf.gen.yaml` example for the generated service
