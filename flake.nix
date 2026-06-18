@@ -179,20 +179,7 @@
               pname = "trevrpc-js";
               version = "0.1.0";
 
-              src = fileset.toSource {
-                root = ./trevrpc-js;
-                fileset = fileset.unions [
-                  ./trevrpc-js/.oxfmtrc.json
-                  ./trevrpc-js/.oxlintrc.json
-                  ./trevrpc-js/README.md
-                  ./trevrpc-js/package-lock.json
-                  ./trevrpc-js/package.json
-                  ./trevrpc-js/bin
-                  ./trevrpc-js/src
-                  ./trevrpc-js/test
-                ];
-              };
-
+              src = ./trevrpc-js;
               nodejs = pkgs.nodejs_24;
               dontNpmBuild = true;
               npmConfigHook = pkgs.importNpmLock.npmConfigHook;
