@@ -61,6 +61,34 @@ func main() {
 
 		log.Printf("LotsOfReplies: %s", reply.Message)
 	}
+
+	summary, err := client.LotsOfGreetings(ctx, trevrpc.FromSlice(
+		&greeter.HelloRequest{Name: name + " client stream 1"},
+		&greeter.HelloRequest{Name: name + " client stream 2"},
+	))
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("LotsOfGreetings: %s", summary.Message)
+
+	bidiReplies, err := client.BidiHello(ctx, trevrpc.FromSlice(
+		&greeter.HelloRequest{Name: name + " bidi 1"},
+		&greeter.HelloRequest{Name: name + " bidi 2"},
+	))
+	if err != nil {
+		log.Fatal(err)
+	}
+	for {
+		reply, err := bidiReplies.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		log.Printf("BidiHello: %s", reply.Message)
+	}
 }
 
 func clientTLSConfig() (*tls.Config, error) {

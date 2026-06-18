@@ -8,11 +8,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"log"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -34,6 +36,44 @@ func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloReq
 		&greeter.HelloReply{Message: "hello " + request.Name},
 		&greeter.HelloReply{Message: "welcome to TrevRPC over QUIC"},
 	), nil
+}
+
+func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*greeter.HelloReply, error) {
+	var names []string
+	for {
+		request, err := requests.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		names = append(names, request.Name)
+	}
+
+	if len(names) == 0 {
+		return &greeter.HelloReply{Message: "hello, nobody"}, nil
+	}
+
+	return &greeter.HelloReply{Message: "hello, " + strings.Join(names, ", ")}, nil
+}
+
+func (greeterService) BidiHello(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (trevrpc.MessageStream[*greeter.HelloReply], error) {
+	return &echoReplies{requests: requests}, nil
+}
+
+type echoReplies struct {
+	requests trevrpc.MessageStream[*greeter.HelloRequest]
+}
+
+func (s *echoReplies) Recv() (*greeter.HelloReply, error) {
+	request, err := s.requests.Recv()
+	if err != nil {
+		return nil, err
+	}
+
+	return &greeter.HelloReply{Message: "stream hello, " + request.Name}, nil
 }
 
 func main() {

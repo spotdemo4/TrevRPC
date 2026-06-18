@@ -9,9 +9,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
+	"net"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,6 +33,11 @@ func (*testMessage) ProtoMessage()    {}
 type localTransport struct {
 	server *Server
 }
+
+const (
+	testAuthToken = "integration-token"
+	testTimeout   = 2 * time.Second
+)
 
 func (t localTransport) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	return t.server.HandleRequest(ctx, request), nil
@@ -57,6 +66,33 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWireStableEncoding(t *testing.T) {
+	request := NewRpcRequest("svc", "m", []byte("hi"))
+	encodedRequest, err := MarshalMessage(request)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	if !bytes.Equal(encodedRequest, []byte("\x0a\x03svc\x12\x01m\x1a\x02hi\x30\x01")) {
+		t.Fatalf("unexpected request encoding: %q", encodedRequest)
+	}
+
+	message, err := MarshalMessage(MessageFrame([]byte("hi")))
+	if err != nil {
+		t.Fatalf("marshal message frame: %v", err)
+	}
+	if !bytes.Equal(message, []byte("\x22\x02hi")) {
+		t.Fatalf("unexpected message frame encoding: %q", message)
+	}
+
+	status, err := MarshalMessage(StatusFrame(Unavailable("down")))
+	if err != nil {
+		t.Fatalf("marshal status frame: %v", err)
+	}
+	if !bytes.Equal(status, []byte("\x08\x01\x10\x0e\x1a\x04down")) {
+		t.Fatalf("unexpected status frame encoding: %q", status)
+	}
+}
+
 func TestMetadataValidation(t *testing.T) {
 	if err := ValidateMetadata(Metadata{"authorization": []byte("ok")}); err != nil {
 		t.Fatalf("valid metadata was rejected: %v", err)
@@ -68,6 +104,51 @@ func TestMetadataValidation(t *testing.T) {
 
 	if NormalizeMetadataKey("Authorization") != "authorization" {
 		t.Fatal("metadata key was not normalized")
+	}
+
+	for _, key := range []string{"", "trevrpc-timeout", "bad key"} {
+		if err := ValidateMetadata(Metadata{key: []byte("ok")}); err == nil {
+			t.Fatalf("metadata key %q should be rejected", key)
+		}
+	}
+
+	tooManyEntries := Metadata{}
+	for i := 0; i <= MaxMetadataEntries; i++ {
+		tooManyEntries[fmt.Sprintf("key-%d", i)] = nil
+	}
+	if err := ValidateMetadata(tooManyEntries); err == nil {
+		t.Fatal("metadata entry limit should be rejected")
+	}
+
+	if err := ValidateMetadata(Metadata{"key": make([]byte, MaxMetadataValueLen+1)}); err == nil {
+		t.Fatal("metadata value limit should be rejected")
+	}
+
+	if err := ValidateMetadata(Metadata{"key": make([]byte, MaxMetadataTotalSize+1)}); err == nil {
+		t.Fatal("metadata total size limit should be rejected")
+	}
+}
+
+func TestWireProtocolValidation(t *testing.T) {
+	request := NewRpcRequest("service", "method", nil)
+	if request.RPCKind() != RpcKindUnary {
+		t.Fatalf("expected unary default kind, got %d", request.RPCKind())
+	}
+	if request.Version != WireVersion {
+		t.Fatalf("expected wire version %d, got %d", WireVersion, request.Version)
+	}
+
+	request.Version = WireVersion + 1
+	if status := StatusFromError(request.ValidateProtocol()); status.Code != CodeFailedPrecondition {
+		t.Fatalf("expected failed precondition, got %v", status)
+	}
+
+	frame := StatusFrame(Unavailable("retry later"))
+	if kind, ok := frame.FrameKind(); !ok || kind != RpcStreamFrameKindStatus {
+		t.Fatalf("expected status frame kind, got %d %t", kind, ok)
+	}
+	if status := frame.StatusValue(); status.Code != CodeUnavailable || status.Message != "retry later" {
+		t.Fatalf("unexpected status value: %v", status)
 	}
 }
 
@@ -168,6 +249,270 @@ func TestClientStreamingClientServer(t *testing.T) {
 	}
 }
 
+func TestBidirectionalStreamingClientServer(t *testing.T) {
+	server := NewServer()
+	server.RouteStreaming("example.Greeter", "BidiHello", RpcKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		return EncodeStream[*testMessage](&echoTestMessages{requests: DecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} })}), nil
+	})
+
+	stream, err := BidirectionalStreaming(context.Background(), localTransport{server: server}, "example.Greeter", "BidiHello", FromSlice(
+		&testMessage{Value: "left"},
+		&testMessage{Value: "right"},
+	), func() *testMessage { return &testMessage{} })
+	if err != nil {
+		t.Fatalf("bidi RPC failed: %v", err)
+	}
+
+	first, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("first bidi response failed: %v", err)
+	}
+	second, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("second bidi response failed: %v", err)
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("expected final EOF, got %v", err)
+	}
+
+	if first.Value != "echo, left" || second.Value != "echo, right" {
+		t.Fatalf("unexpected bidi responses: %q %q", first.Value, second.Value)
+	}
+}
+
+func TestServerRejectsUnsupportedWireVersionBeforeRouteLookup(t *testing.T) {
+	server := NewServer()
+	request := NewRpcRequest("example.Greeter", "Missing", nil)
+	request.Version = WireVersion + 1
+
+	response := server.HandleRequest(context.Background(), request)
+	if CodeFromUint32(response.Status) != CodeFailedPrecondition {
+		t.Fatalf("expected failed precondition, got %#v", response)
+	}
+}
+
+func TestServerRejectsExpiredDeadlineBeforeRouteLookup(t *testing.T) {
+	server := NewServer()
+	request := NewRpcRequest("example.Greeter", "Missing", nil)
+	request.DeadlineUnixNanos = uint64(time.Now().Add(-time.Second).UnixNano())
+
+	response := server.HandleRequest(context.Background(), request)
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %#v", response)
+	}
+}
+
+func TestServerUnaryDeadlineCancelsSlowHandler(t *testing.T) {
+	server := NewServer()
+	server.Route("example.Greeter", "Slow", func(context.Context, []byte) ([]byte, error) {
+		select {}
+	})
+	request := NewRpcRequest("example.Greeter", "Slow", nil)
+	request.DeadlineUnixNanos = uint64(time.Now().Add(time.Millisecond).UnixNano())
+
+	response := server.HandleRequest(context.Background(), request)
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %#v", response)
+	}
+}
+
+func TestRequestStreamMessageLimitReturnsResourceExhausted(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamMessages = 1
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		for {
+			_, err := requests.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return EmptyStream[[]byte](), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Upload", nil)
+	request.Kind = RpcKindClientStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, FromSlice([]byte("one"), []byte("two")))
+	frame, err := response.Recv()
+	if err != nil {
+		t.Fatalf("read status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeResourceExhausted {
+		t.Fatalf("expected resource exhausted status, got %#v", frame)
+	}
+}
+
+func TestRequestStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamMessages = -1
+	options.StreamIdleTimeout = time.Millisecond
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		for {
+			_, err := requests.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return EmptyStream[[]byte](), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Upload", nil)
+	request.Kind = RpcKindClientStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, pendingByteStream{})
+	frame, err := response.Recv()
+	if err != nil {
+		t.Fatalf("read status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeUnavailable {
+		t.Fatalf("expected unavailable status, got %#v", frame)
+	}
+}
+
+func TestResponseStreamBodyLimitReturnsResourceExhausted(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamBodySize = 3
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return FromSlice([]byte("four")), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	frame, err := response.Recv()
+	if err != nil {
+		t.Fatalf("read status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeResourceExhausted {
+		t.Fatalf("expected resource exhausted status, got %#v", frame)
+	}
+}
+
+func TestResponseStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.StreamIdleTimeout = time.Millisecond
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return pendingByteStream{}, nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	frame, err := response.Recv()
+	if err != nil {
+		t.Fatalf("read status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeUnavailable {
+		t.Fatalf("expected unavailable status, got %#v", frame)
+	}
+}
+
+func TestResponseStreamCloseRecordsCancelled(t *testing.T) {
+	metrics := &recordingMetrics{}
+	server := NewServer()
+	server.SetMetrics(metrics)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return pendingByteStream{}, nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	closeMessageStream(response)
+
+	if !metrics.hasCode(CodeCancelled) {
+		t.Fatalf("expected cancelled metric, got %#v", metrics.codes)
+	}
+}
+
+func TestClientResponseStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
+	options := DefaultCallOptions()
+	options.StreamIdleTimeout = time.Millisecond
+	stream := newResponseMessageStream[*testMessage](pendingFrameStream{}, func() *testMessage { return &testMessage{} }, options, context.Background(), func() {})
+
+	_, err := stream.Recv()
+	if code := StatusFromError(err).Code; code != CodeUnavailable {
+		t.Fatalf("expected unavailable, got %v (%v)", code, err)
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("expected EOF after idle timeout, got %v", err)
+	}
+}
+
+func TestClientResponseStreamDeadlineReturnsDeadlineExceeded(t *testing.T) {
+	options := DefaultCallOptions()
+	options.StreamIdleTimeout = testTimeout
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	stream := newResponseMessageStream[*testMessage](pendingFrameStream{}, func() *testMessage { return &testMessage{} }, options, ctx, func() {})
+
+	_, err := stream.Recv()
+	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("expected EOF after deadline, got %v", err)
+	}
+}
+
+type echoTestMessages struct {
+	requests MessageStream[*testMessage]
+}
+
+func (s *echoTestMessages) Recv() (*testMessage, error) {
+	request, err := s.requests.Recv()
+	if err != nil {
+		return nil, err
+	}
+
+	return &testMessage{Value: "echo, " + request.Value}, nil
+}
+
+type pendingByteStream struct{}
+
+func (pendingByteStream) Recv() ([]byte, error) {
+	select {}
+}
+
+type pendingFrameStream struct{}
+
+func (pendingFrameStream) Recv() (*RpcStreamFrame, error) {
+	select {}
+}
+
+type recordingMetrics struct {
+	mu    sync.Mutex
+	codes []Code
+}
+
+func (m *recordingMetrics) RPCStarted(RPCStarted) {}
+
+func (m *recordingMetrics) RPCFinished(event RPCFinished) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.codes = append(m.codes, event.Code)
+}
+
+func (m *recordingMetrics) hasCode(code Code) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Contains(m.codes, code)
+}
+
 func TestQuinnTransportUnary(t *testing.T) {
 	server := NewServer()
 	RegisterUnary(server, "example.Greeter", "SayHello", func() *testMessage { return &testMessage{} }, func(_ context.Context, request *testMessage) (*testMessage, error) {
@@ -203,6 +548,631 @@ func TestQuinnTransportUnary(t *testing.T) {
 	}
 }
 
+func TestQuinnRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	transport := NewQuinnTransport(conn)
+
+	reply, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "unary"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("unary RPC failed: %v", err)
+	}
+	if reply.Value != "hello, unary" {
+		t.Fatalf("unexpected unary reply: %q", reply.Value)
+	}
+
+	replies, err := ServerStreaming(context.Background(), transport, testServiceName, "LotsOfReplies", &testMessage{Value: "server stream"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("server-streaming RPC failed: %v", err)
+	}
+	if messages := collectTestMessages(t, replies); !equalStrings(messages, []string{"hello, server stream", "goodbye, server stream"}) {
+		t.Fatalf("unexpected server stream replies: %#v", messages)
+	}
+
+	summary, err := ClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", FromSlice(
+		&testMessage{Value: "one"},
+		&testMessage{Value: "two"},
+	), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("client-streaming RPC failed: %v", err)
+	}
+	if summary.Value != "one,two" {
+		t.Fatalf("unexpected client stream summary: %q", summary.Value)
+	}
+
+	bidi, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "BidiHello", FromSlice(
+		&testMessage{Value: "left"},
+		&testMessage{Value: "right"},
+	), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("bidi RPC failed: %v", err)
+	}
+	if messages := collectTestMessages(t, bidi); !equalStrings(messages, []string{"echo, left", "echo, right"}) {
+		t.Fatalf("unexpected bidi replies: %#v", messages)
+	}
+}
+
+func TestQuinnAuthFailuresReturnStatusErrors(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+
+	_, err := Unary(context.Background(), NewQuinnTransport(conn), testServiceName, "SayHello", &testMessage{Value: "missing auth"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	if code := StatusFromError(err).Code; code != CodeUnauthenticated {
+		t.Fatalf("expected unauthenticated, got %v (%v)", code, err)
+	}
+}
+
+func TestQuinnExpiredDeadlinesRejectedOverWire(t *testing.T) {
+	running := startTestQUICServer(t, func(*Server) {})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	request := NewRpcRequest(testServiceName, "Missing", nil)
+	request.DeadlineUnixNanos = uint64(time.Now().Add(-time.Second).UnixNano())
+
+	response, err := NewQuinnTransport(conn).Call(context.Background(), request)
+	if err != nil {
+		t.Fatalf("raw transport call failed: %v", err)
+	}
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %#v", response)
+	}
+}
+
+func TestQuinnRequestStreamLimitsReturnResourceExhausted(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.MaxStreamMessages = 1
+		options.StreamIdleTimeout = testTimeout
+		server.SetOptions(options)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+
+	_, err := ClientStreaming(context.Background(), NewQuinnTransport(conn), testServiceName, "LotsOfGreetings", FromSlice(
+		&testMessage{Value: "one"},
+		&testMessage{Value: "two"},
+	), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if code := StatusFromError(err).Code; code != CodeResourceExhausted {
+		t.Fatalf("expected resource exhausted, got %v (%v)", code, err)
+	}
+}
+
+func TestQuinnResponseStreamLimitsReturnResourceExhausted(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+
+	replies, err := ServerStreaming(context.Background(), NewQuinnTransport(conn), testServiceName, "LotsOfReplies", &testMessage{Value: "limited"}, func() *testMessage { return &testMessage{} }, append(authenticatedOptions(), WithMaxResponseMessages(1))...)
+	if err != nil {
+		t.Fatalf("server-streaming RPC failed: %v", err)
+	}
+	first, err := replies.Recv()
+	if err != nil {
+		t.Fatalf("first response failed: %v", err)
+	}
+	if first.Value != "hello, limited" {
+		t.Fatalf("unexpected first response: %q", first.Value)
+	}
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodeResourceExhausted {
+		t.Fatalf("expected resource exhausted, got %v (%v)", code, err)
+	}
+}
+
+func TestQuinnStreamConcurrencyLimitReturnsUnavailable(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.MaxConcurrentStreamsPerConnection = 1
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	transport := NewQuinnTransport(conn)
+	hanging := holdServerStreamOpen(t, transport)
+	defer closeMessageStream(hanging)
+
+	_, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "second"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if code := StatusFromError(err).Code; code != CodeUnavailable {
+		t.Fatalf("expected unavailable, got %v (%v)", code, err)
+	}
+}
+
+func TestQuinnRequestConcurrencyLimitReturnsUnavailable(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.MaxConcurrentRequests = 1
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	transport := NewQuinnTransport(conn)
+	hanging := holdServerStreamOpen(t, transport)
+	defer closeMessageStream(hanging)
+
+	_, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "second"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if code := StatusFromError(err).Code; code != CodeUnavailable {
+		t.Fatalf("expected unavailable, got %v (%v)", code, err)
+	}
+}
+
+func TestQuinnConnectionLimitRefusesNewConnections(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.MaxConcurrentConnections = 1
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	hanging := holdServerStreamOpen(t, NewQuinnTransport(conn))
+	defer closeMessageStream(hanging)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	secondConn, err := quic.DialAddr(ctx, running.addr, running.clientTLS.Clone(), &quic.Config{})
+	if err != nil {
+		return
+	}
+	defer secondConn.CloseWithError(0, "test complete")
+
+	_, err = Unary(context.Background(), NewQuinnTransport(secondConn), testServiceName, "SayHello", &testMessage{Value: "refused"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if code := StatusFromError(err).Code; code != CodeUnavailable {
+		t.Fatalf("expected unavailable, got %v (%v)", code, err)
+	}
+}
+
+func TestQuinnDroppedResponseStreamCancelsServerWork(t *testing.T) {
+	metrics := &recordingMetrics{}
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetMetrics(metrics)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	replies := holdServerStreamOpen(t, NewQuinnTransport(conn))
+
+	closeMessageStream(replies)
+	waitForMetricCode(t, metrics, CodeCancelled)
+}
+
+func TestQuinnShutdownClosesActiveConnections(t *testing.T) {
+	running := startTestQUICServer(t, func(*Server) {})
+	conn := connectTestQUICClient(t, running)
+	transport := NewQuinnTransport(conn)
+	running.stop(t)
+
+	_, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "after shutdown"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
+	if code := StatusFromError(err).Code; code != CodeUnavailable {
+		t.Fatalf("expected unavailable, got %v (%v)", code, err)
+	}
+	conn.CloseWithError(0, "test complete")
+}
+
+func TestQuinnLocalCloseMapsToCancelled(t *testing.T) {
+	running := startTestQUICServer(t, func(*Server) {})
+	conn := connectTestQUICClient(t, running)
+	conn.CloseWithError(0, "client closed")
+
+	_, err := Unary(context.Background(), NewQuinnTransport(conn), testServiceName, "SayHello", &testMessage{Value: "after local close"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled, got %v (%v)", code, err)
+	}
+}
+
+func TestQuinnRejectsALPNMismatch(t *testing.T) {
+	running := startTestQUICServer(t, func(*Server) {})
+	clientTLS := running.clientTLS.Clone()
+	clientTLS.NextProtos = []string{"not-trevrpc"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, running.addr, clientTLS, &quic.Config{})
+	if err == nil {
+		conn.CloseWithError(0, "test complete")
+		t.Fatal("ALPN mismatch should reject connection")
+	}
+}
+
+func TestQuinnRejectsTLSIdentityMismatch(t *testing.T) {
+	running := startTestQUICServer(t, func(*Server) {})
+	clientTLS := running.clientTLS.Clone()
+	clientTLS.ServerName = "wronghost"
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, running.addr, clientTLS, &quic.Config{})
+	if err == nil {
+		conn.CloseWithError(0, "test complete")
+		t.Fatal("identity mismatch should reject connection")
+	}
+}
+
+func TestQuinnMTLSRejectsClientsWithoutCertificates(t *testing.T) {
+	serverTLS, clientTLS := testTLSConfig(t)
+	serverTLS.ClientAuth = tls.RequireAnyClientCert
+	running := startTestQUICServerWithTLS(t, serverTLS, clientTLS, func(*Server) {})
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS, &quic.Config{})
+	if err == nil {
+		_, rpcErr := Unary(context.Background(), NewQuinnTransport(conn), testServiceName, "SayHello", &testMessage{Value: "anonymous"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
+		conn.CloseWithError(0, "test complete")
+		if code := StatusFromError(rpcErr).Code; code != CodeUnavailable {
+			t.Fatalf("expected unavailable for anonymous mTLS client, got %v (%v)", code, rpcErr)
+		}
+	}
+}
+
+func TestQuinnMalformedRequestFramesReturnInternalStatus(t *testing.T) {
+	running := startTestQUICServer(t, func(*Server) {})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	if _, err := stream.Write([]byte{0, 0, 0, 2, 0xff, 0xff}); err != nil {
+		t.Fatalf("write malformed frame: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close malformed stream: %v", err)
+	}
+
+	response := &RpcResponse{}
+	if err := ReadFrame(stream, response, DefaultMaxFrameSize); err != nil {
+		t.Fatalf("read malformed response: %v", err)
+	}
+	if CodeFromUint32(response.Status) != CodeInternal {
+		t.Fatalf("expected internal status, got %#v", response)
+	}
+}
+
+func TestQuinnHandlesManyConcurrentUnaryCalls(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	transport := NewQuinnTransport(conn)
+
+	var group sync.WaitGroup
+	errors := make(chan error, 64)
+	for i := range 64 {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			name := fmt.Sprintf("concurrent-%d", index)
+			response, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: name}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+			if err != nil {
+				errors <- err
+				return
+			}
+			if response.Value != "hello, "+name {
+				errors <- fmt.Errorf("unexpected response %q", response.Value)
+			}
+		}(i)
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		t.Fatal(err)
+	}
+}
+
+func TestQuinnHandlesBoundedMixedLoad(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.MaxConcurrentStreamsPerConnection = 512
+		options.MaxConcurrentRequests = 1024
+		server.SetOptions(options)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	transport := NewQuinnTransport(conn)
+
+	var group sync.WaitGroup
+	errors := make(chan error, 64)
+	for i := range 64 {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			if err := runMixedQUICCall(transport, index); err != nil {
+				errors <- err
+			}
+		}(i)
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		t.Fatal(err)
+	}
+}
+
+const testServiceName = "example.Greeter"
+
+type runningTestQUICServer struct {
+	addr      string
+	clientTLS *tls.Config
+	cancel    context.CancelFunc
+	done      chan error
+}
+
+func startTestQUICServer(t *testing.T, configure func(*Server)) *runningTestQUICServer {
+	t.Helper()
+	serverTLS, clientTLS := testTLSConfig(t)
+	return startTestQUICServerWithTLS(t, serverTLS, clientTLS, configure)
+}
+
+func startTestQUICServerWithTLS(t *testing.T, serverTLS, clientTLS *tls.Config, configure func(*Server)) *runningTestQUICServer {
+	t.Helper()
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	server := NewServer()
+	registerTestGreeter(server)
+	configure(server)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeQUIC(ctx, listener, server)
+	}()
+
+	running := &runningTestQUICServer{
+		addr:      listener.Addr().String(),
+		clientTLS: clientTLS,
+		cancel:    cancel,
+		done:      done,
+	}
+	t.Cleanup(func() {
+		running.stop(t)
+	})
+
+	return running
+}
+
+func (s *runningTestQUICServer) stop(t *testing.T) {
+	t.Helper()
+	if s.cancel == nil {
+		return
+	}
+
+	s.cancel()
+	s.cancel = nil
+	select {
+	case err := <-s.done:
+		if err != nil {
+			t.Fatalf("serve QUIC: %v", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("server did not shut down")
+	}
+}
+
+func connectTestQUICClient(t *testing.T, running *runningTestQUICServer) *quic.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS.Clone(), &quic.Config{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	return conn
+}
+
+func registerTestGreeter(server *Server) {
+	RegisterUnary(server, testServiceName, "SayHello", func() *testMessage { return &testMessage{} }, func(_ context.Context, request *testMessage) (*testMessage, error) {
+		return &testMessage{Value: "hello, " + request.Value}, nil
+	})
+	server.RouteStreaming(testServiceName, "LotsOfReplies", RpcKindServerStreaming, func(_ context.Context, body []byte, _ ByteStream) (ByteStream, error) {
+		request := &testMessage{}
+		if err := UnmarshalMessage(body, request); err != nil {
+			return nil, err
+		}
+		if request.Value == "cancel" {
+			return EncodeStream[*testMessage](&firstThenPendingTestMessages{first: &testMessage{Value: "first"}}), nil
+		}
+
+		return EncodeStream(FromSlice(
+			&testMessage{Value: "hello, " + request.Value},
+			&testMessage{Value: "goodbye, " + request.Value},
+		)), nil
+	})
+	server.RouteStreaming(testServiceName, "LotsOfGreetings", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		decoded := DecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} })
+		var values []string
+		for {
+			request, err := decoded.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			values = append(values, request.Value)
+		}
+
+		return SingleMessageStream(&testMessage{Value: strings.Join(values, ",")}), nil
+	})
+	server.RouteStreaming(testServiceName, "BidiHello", RpcKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		return EncodeStream[*testMessage](&echoTestMessages{requests: DecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} })}), nil
+	})
+}
+
+type firstThenPendingTestMessages struct {
+	first *testMessage
+}
+
+func (s *firstThenPendingTestMessages) Recv() (*testMessage, error) {
+	if s.first != nil {
+		first := s.first
+		s.first = nil
+		return first, nil
+	}
+
+	select {}
+}
+
+func authenticatedOptions() []CallOption {
+	return []CallOption{WithTimeout(testTimeout), WithMetadata("authorization", []byte("Bearer "+testAuthToken))}
+}
+
+func collectTestMessages(t *testing.T, stream MessageStream[*testMessage]) []string {
+	t.Helper()
+	var messages []string
+	for {
+		message, err := stream.Recv()
+		if err == io.EOF {
+			return messages
+		}
+		if err != nil {
+			t.Fatalf("receive stream message: %v", err)
+		}
+
+		messages = append(messages, message.Value)
+	}
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func holdServerStreamOpen(t *testing.T, transport Transport) MessageStream[*testMessage] {
+	t.Helper()
+	replies, err := ServerStreaming(context.Background(), transport, testServiceName, "LotsOfReplies", &testMessage{Value: "cancel"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("start hanging stream: %v", err)
+	}
+	first, err := replies.Recv()
+	if err != nil {
+		t.Fatalf("read first hanging response: %v", err)
+	}
+	if first.Value != "first" {
+		t.Fatalf("unexpected first hanging response: %q", first.Value)
+	}
+
+	return replies
+}
+
+func waitForMetricCode(t *testing.T, metrics *recordingMetrics, code Code) {
+	t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		if metrics.hasCode(code) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("metric code %v was not recorded", code)
+}
+
+func runMixedQUICCall(transport Transport, index int) error {
+	switch index % 4 {
+	case 0:
+		name := fmt.Sprintf("load-unary-%d", index)
+		response, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: name}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		if err != nil {
+			return err
+		}
+		if response.Value != "hello, "+name {
+			return fmt.Errorf("unexpected unary response %q", response.Value)
+		}
+	case 1:
+		name := fmt.Sprintf("load-server-%d", index)
+		responses, err := ServerStreaming(context.Background(), transport, testServiceName, "LotsOfReplies", &testMessage{Value: name}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		if err != nil {
+			return err
+		}
+		messages := collectTestMessagesNoFatal(responses)
+		if messages.err != nil {
+			return messages.err
+		}
+		if !equalStrings(messages.values, []string{"hello, " + name, "goodbye, " + name}) {
+			return fmt.Errorf("unexpected server stream responses %#v", messages.values)
+		}
+	case 2:
+		response, err := ClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", FromSlice(
+			&testMessage{Value: fmt.Sprintf("load-client-%d-a", index)},
+			&testMessage{Value: fmt.Sprintf("load-client-%d-b", index)},
+		), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		if err != nil {
+			return err
+		}
+		expected := fmt.Sprintf("load-client-%d-a,load-client-%d-b", index, index)
+		if response.Value != expected {
+			return fmt.Errorf("unexpected client stream response %q", response.Value)
+		}
+	default:
+		responses, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "BidiHello", FromSlice(
+			&testMessage{Value: fmt.Sprintf("load-bidi-%d-a", index)},
+			&testMessage{Value: fmt.Sprintf("load-bidi-%d-b", index)},
+		), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		if err != nil {
+			return err
+		}
+		messages := collectTestMessagesNoFatal(responses)
+		if messages.err != nil {
+			return messages.err
+		}
+		if len(messages.values) != 2 || !strings.HasPrefix(messages.values[0], "echo, load-bidi-") || !strings.HasPrefix(messages.values[1], "echo, load-bidi-") {
+			return fmt.Errorf("unexpected bidi responses %#v", messages.values)
+		}
+	}
+
+	return nil
+}
+
+type collectedMessages struct {
+	values []string
+	err    error
+}
+
+func collectTestMessagesNoFatal(stream MessageStream[*testMessage]) collectedMessages {
+	var messages []string
+	for {
+		message, err := stream.Recv()
+		if err == io.EOF {
+			return collectedMessages{values: messages}
+		}
+		if err != nil {
+			return collectedMessages{values: messages, err: err}
+		}
+
+		messages = append(messages, message.Value)
+	}
+}
+
 func testTLSConfig(t *testing.T) (*tls.Config, *tls.Config) {
 	t.Helper()
 
@@ -219,6 +1189,7 @@ func testTLSConfig(t *testing.T) (*tls.Config, *tls.Config) {
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
@@ -233,7 +1204,12 @@ func testTLSConfig(t *testing.T) (*tls.Config, *tls.Config) {
 		t.Fatalf("load certificate: %v", err)
 	}
 
+	certPool := x509.NewCertPool()
+	if !certPool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("append generated certificate to root pool")
+	}
+
 	serverTLS := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{ALPN}}
-	clientTLS := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{ALPN}}
+	clientTLS := &tls.Config{RootCAs: certPool, ServerName: "localhost", NextProtos: []string{ALPN}}
 	return serverTLS, clientTLS
 }

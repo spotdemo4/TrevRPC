@@ -177,7 +177,7 @@ func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcRes
 		return s.finishResponse(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown RPC method %s/%s", request.Service, request.Method)).IntoResponse(nil))
 	}
 
-	responseBody, err := route.unaryHandler(ctx, request.Body)
+	responseBody, err := invokeUnaryHandler(ctx, route.unaryHandler, request.Body)
 	if err != nil {
 		return s.finishResponse(service, method, requestBodyLen, startedAt, StatusFromError(err).IntoResponse(nil))
 	}
@@ -199,7 +199,7 @@ func (s *Server) HandleStreamingRequest(ctx context.Context, request *RpcRequest
 	}
 
 	limits := streamLimitsFromOptions(s.options)
-	requestBody = limitByteStream(requestBody, limits, "request")
+	requestBody = limitByteStream(ctx, requestBody, limits, "request")
 
 	route, ok := s.routes[methodKey{service: request.Service, method: request.Method}]
 	if !ok || route.streamingHandler == nil {
@@ -212,7 +212,7 @@ func (s *Server) HandleStreamingRequest(ctx context.Context, request *RpcRequest
 		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s/%s: expected %d, got %d", request.Service, request.Method, route.kind, request.RPCKind())))
 	}
 
-	responseBody, err := route.streamingHandler(ctx, request.Body, requestBody)
+	responseBody, err := invokeStreamingHandler(ctx, route.streamingHandler, request.Body, requestBody)
 	if err != nil {
 		cancel()
 		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, StatusFromError(err))
@@ -225,8 +225,49 @@ func (s *Server) HandleStreamingRequest(ctx context.Context, request *RpcRequest
 		method:         method,
 		requestBodyLen: requestBodyLen,
 		startedAt:      startedAt,
+		ctx:            ctx,
 		limits:         limits,
 		cancel:         cancel,
+	}
+}
+
+type unaryHandlerResult struct {
+	body []byte
+	err  error
+}
+
+func invokeUnaryHandler(ctx context.Context, handler UnaryHandler, body []byte) ([]byte, error) {
+	result := make(chan unaryHandlerResult, 1)
+	go func() {
+		responseBody, err := handler(ctx, body)
+		result <- unaryHandlerResult{body: responseBody, err: err}
+	}()
+
+	select {
+	case result := <-result:
+		return result.body, result.err
+	case <-ctx.Done():
+		return nil, statusFromContextError(ctx.Err())
+	}
+}
+
+type streamingHandlerResult struct {
+	stream ByteStream
+	err    error
+}
+
+func invokeStreamingHandler(ctx context.Context, handler StreamingHandler, body []byte, requestBody ByteStream) (ByteStream, error) {
+	result := make(chan streamingHandlerResult, 1)
+	go func() {
+		responseBody, err := handler(ctx, body, requestBody)
+		result <- streamingHandlerResult{stream: responseBody, err: err}
+	}()
+
+	select {
+	case result := <-result:
+		return result.stream, result.err
+	case <-ctx.Done():
+		return nil, statusFromContextError(ctx.Err())
 	}
 }
 
@@ -314,6 +355,7 @@ func streamLimitsFromOptions(options ServerOptions) streamLimits {
 
 type limitedByteStream struct {
 	inner     ByteStream
+	ctx       context.Context
 	limits    streamLimits
 	direction string
 	messages  int
@@ -321,8 +363,8 @@ type limitedByteStream struct {
 	done      bool
 }
 
-func limitByteStream(inner ByteStream, limits streamLimits, direction string) ByteStream {
-	return &limitedByteStream{inner: inner, limits: limits, direction: direction}
+func limitByteStream(ctx context.Context, inner ByteStream, limits streamLimits, direction string) ByteStream {
+	return &limitedByteStream{inner: inner, ctx: ctx, limits: limits, direction: direction}
 }
 
 func (s *limitedByteStream) Recv() ([]byte, error) {
@@ -330,7 +372,7 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	body, err := s.inner.Recv()
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, s.direction)
 	if err != nil {
 		s.done = true
 		return nil, err
@@ -342,6 +384,45 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 	}
 
 	return body, nil
+}
+
+func (s *limitedByteStream) Close() error {
+	if !s.done {
+		s.done = true
+		closeMessageStream(s.inner)
+	}
+
+	return nil
+}
+
+func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout time.Duration, direction string) ([]byte, error) {
+	type recvResult struct {
+		body []byte
+		err  error
+	}
+
+	results := make(chan recvResult, 1)
+	go func() {
+		body, err := stream.Recv()
+		results <- recvResult{body: body, err: err}
+	}()
+
+	var idle <-chan time.Time
+	var timer *time.Timer
+	if idleTimeout > 0 {
+		timer = time.NewTimer(idleTimeout)
+		idle = timer.C
+		defer timer.Stop()
+	}
+
+	select {
+	case result := <-results:
+		return result.body, result.err
+	case <-ctx.Done():
+		return nil, statusFromContextError(ctx.Err())
+	case <-idle:
+		return nil, Unavailable(fmt.Sprintf("%s stream idle timeout", direction))
+	}
 }
 
 func checkStreamLimits(direction string, limits streamLimits, messages, bodySize *int, itemLen int) error {
@@ -367,6 +448,7 @@ type serverResponseStream struct {
 	requestBodyLen  int
 	responseBodyLen int
 	startedAt       time.Time
+	ctx             context.Context
 	limits          streamLimits
 	messages        int
 	done            bool
@@ -378,7 +460,7 @@ func (s *serverResponseStream) Recv() (*RpcStreamFrame, error) {
 		return nil, io.EOF
 	}
 
-	body, err := s.inner.Recv()
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response")
 	if err == io.EOF {
 		s.finish(CodeOK)
 		return StatusFrame(OK()), nil
@@ -399,6 +481,15 @@ func (s *serverResponseStream) Recv() (*RpcStreamFrame, error) {
 	return MessageFrame(body), nil
 }
 
+func (s *serverResponseStream) Close() error {
+	if !s.done {
+		s.finish(CodeCancelled)
+		closeMessageStream(s.inner)
+	}
+
+	return nil
+}
+
 func (s *serverResponseStream) finish(code Code) {
 	if s.done {
 		return
@@ -406,6 +497,7 @@ func (s *serverResponseStream) finish(code Code) {
 
 	s.done = true
 	s.cancel()
+	closeMessageStream(s.inner)
 	s.metrics.RPCFinished(RPCFinished{
 		Service:         s.service,
 		Method:          s.method,

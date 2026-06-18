@@ -20,6 +20,8 @@ func (emptyStream[T]) Recv() (T, error) {
 	return zero, io.EOF
 }
 
+func (emptyStream[T]) Close() error { return nil }
+
 type sliceStream[T any] struct {
 	items []T
 	next  int
@@ -40,6 +42,11 @@ func (s *sliceStream[T]) Recv() (T, error) {
 	return item, nil
 }
 
+func (s *sliceStream[T]) Close() error {
+	s.next = len(s.items)
+	return nil
+}
+
 type statusFrameStream struct {
 	status *Status
 	done   bool
@@ -58,6 +65,11 @@ func (s *statusFrameStream) Recv() (*RpcStreamFrame, error) {
 	return StatusFrame(s.status), nil
 }
 
+func (s *statusFrameStream) Close() error {
+	s.done = true
+	return nil
+}
+
 type encodeStream[T ProtoMessage] struct {
 	inner MessageStream[T]
 }
@@ -73,6 +85,11 @@ func (s *encodeStream[T]) Recv() ([]byte, error) {
 	}
 
 	return MarshalMessage(message)
+}
+
+func (s *encodeStream[T]) Close() error {
+	closeMessageStream(s.inner)
+	return nil
 }
 
 type decodeStream[T ProtoMessage] struct {
@@ -100,6 +117,17 @@ func (s *decodeStream[T]) Recv() (T, error) {
 	return message, nil
 }
 
+func (s *decodeStream[T]) Close() error {
+	closeMessageStream(s.inner)
+	return nil
+}
+
 func SingleMessageStream[T ProtoMessage](message T) ByteStream {
 	return EncodeStream(FromSlice(message))
+}
+
+func closeMessageStream(stream any) {
+	if closer, ok := stream.(io.Closer); ok {
+		_ = closer.Close()
+	}
 }

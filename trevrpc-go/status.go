@@ -1,6 +1,7 @@
 package trevrpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -121,6 +122,18 @@ func StatusFromError(err error) *Status {
 	}
 
 	return Internal(err.Error())
+}
+
+func statusFromContextError(err error) *Status {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return DeadlineExceeded("RPC deadline exceeded")
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return Cancelled("RPC cancelled")
+	}
+
+	return Unavailable("context unavailable: " + err.Error())
 }
 
 func (c Code) String() string {

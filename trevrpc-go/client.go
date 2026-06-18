@@ -371,7 +371,13 @@ func (s *responseMessageStream[T]) finish() {
 	if !s.done {
 		s.done = true
 		s.cancel()
+		closeMessageStream(s.inner)
 	}
+}
+
+func (s *responseMessageStream[T]) Close() error {
+	s.finish()
+	return nil
 }
 
 func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout time.Duration) (*RpcStreamFrame, error) {
@@ -398,7 +404,7 @@ func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout t
 	case result := <-results:
 		return result.frame, result.err
 	case <-ctx.Done():
-		return nil, DeadlineExceeded("RPC deadline exceeded")
+		return nil, statusFromContextError(ctx.Err())
 	case <-idle:
 		return nil, Unavailable("response stream idle timeout")
 	}

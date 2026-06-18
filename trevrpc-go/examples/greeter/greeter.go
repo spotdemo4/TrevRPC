@@ -7,9 +7,11 @@ import (
 )
 
 const (
-	ServiceName         = "example.greeter.Greeter"
-	MethodSayHello      = "SayHello"
-	MethodLotsOfReplies = "LotsOfReplies"
+	ServiceName           = "example.greeter.Greeter"
+	MethodSayHello        = "SayHello"
+	MethodLotsOfReplies   = "LotsOfReplies"
+	MethodLotsOfGreetings = "LotsOfGreetings"
+	MethodBidiHello       = "BidiHello"
 )
 
 type HelloRequest struct {
@@ -31,6 +33,8 @@ func (*HelloReply) ProtoMessage()    {}
 type GreeterServer interface {
 	SayHello(context.Context, *HelloRequest) (*HelloReply, error)
 	LotsOfReplies(context.Context, *HelloRequest) (trevrpc.MessageStream[*HelloReply], error)
+	LotsOfGreetings(context.Context, trevrpc.MessageStream[*HelloRequest]) (*HelloReply, error)
+	BidiHello(context.Context, trevrpc.MessageStream[*HelloRequest]) (trevrpc.MessageStream[*HelloReply], error)
 }
 
 type GreeterClient struct {
@@ -48,6 +52,14 @@ func (c *GreeterClient) SayHello(ctx context.Context, request *HelloRequest, opt
 
 func (c *GreeterClient) LotsOfReplies(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (trevrpc.MessageStream[*HelloReply], error) {
 	return trevrpc.ServerStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfReplies, request, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
+}
+
+func (c *GreeterClient) LotsOfGreetings(ctx context.Context, requests trevrpc.MessageStream[*HelloRequest], options ...trevrpc.CallOption) (*HelloReply, error) {
+	return trevrpc.ClientStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfGreetings, requests, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
+}
+
+func (c *GreeterClient) BidiHello(ctx context.Context, requests trevrpc.MessageStream[*HelloRequest], options ...trevrpc.CallOption) (trevrpc.MessageStream[*HelloReply], error) {
+	return trevrpc.BidirectionalStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodBidiHello, requests, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
 }
 
 func RegisterGreeterServer(server *trevrpc.Server, implementation GreeterServer) {
@@ -75,6 +87,29 @@ func RegisterGreeterServer(server *trevrpc.Server, implementation GreeterServer)
 		}
 
 		responses, err := implementation.LotsOfReplies(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+
+		return trevrpc.EncodeStream[*HelloReply](responses), nil
+	})
+
+	server.RouteStreaming(ServiceName, MethodLotsOfGreetings, trevrpc.RpcKindClientStreaming, func(ctx context.Context, _ []byte, requests trevrpc.ByteStream) (trevrpc.ByteStream, error) {
+		requestStream := trevrpc.DecodeStream[*HelloRequest](requests, func() *HelloRequest { return &HelloRequest{} })
+		response, err := implementation.LotsOfGreetings(ctx, requestStream)
+		if err != nil {
+			return nil, err
+		}
+		if response == nil {
+			return nil, trevrpc.Internal("handler returned nil response")
+		}
+
+		return trevrpc.SingleMessageStream(response), nil
+	})
+
+	server.RouteStreaming(ServiceName, MethodBidiHello, trevrpc.RpcKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests trevrpc.ByteStream) (trevrpc.ByteStream, error) {
+		requestStream := trevrpc.DecodeStream[*HelloRequest](requests, func() *HelloRequest { return &HelloRequest{} })
+		responses, err := implementation.BidiHello(ctx, requestStream)
 		if err != nil {
 			return nil, err
 		}
