@@ -372,12 +372,11 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
 
 fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String) {
     buf.push_str(&format!(
-        "    pub async fn {}(&self, request: {}) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::unary(&self.transport, Self::SERVICE, {:?}, &request).await\n    }}\n\n    pub async fn {}_with_options(\n        &self,\n        request: {},\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::unary_with_options(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
+        "    pub async fn {}(\n        &self,\n        request: {},\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::unary(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
         method.name,
         method.input_type,
         method.output_type,
-        method.proto_name,
-        method.name, method.input_type, method.output_type, method.proto_name
+        method.proto_name
     ));
 }
 
@@ -574,7 +573,7 @@ mod tests {
         assert!(content.contains("pub struct GreeterClient<T>"));
         assert!(content.contains("pub fn register_greeter<S>"));
         assert!(content.contains("async fn say_hello"));
-        assert!(content.contains("async fn say_hello_with_options"));
+        assert!(content.contains("options: ::trevrpc::client::CallOptions"));
         assert!(content.contains("HelloRequest"));
         assert!(content.contains("HelloReply"));
     }

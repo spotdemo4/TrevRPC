@@ -64,20 +64,6 @@ pub async fn unary<T, Req, Res>(
     service: &str,
     method: &str,
     request: &Req,
-) -> Result<Res>
-where
-    T: RpcTransport,
-    Req: Message,
-    Res: Message + Default,
-{
-    unary_with_options(transport, service, method, request, CallOptions::default()).await
-}
-
-pub async fn unary_with_options<T, Req, Res>(
-    transport: &T,
-    service: &str,
-    method: &str,
-    request: &Req,
     options: CallOptions,
 ) -> Result<Res>
 where

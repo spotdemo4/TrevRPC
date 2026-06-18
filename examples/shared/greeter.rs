@@ -34,14 +34,7 @@ impl<T> GreeterClient<T> {
         Self { transport }
     }
 
-    pub async fn say_hello(&self, request: HelloRequest) -> trevrpc::Result<HelloReply>
-    where
-        T: trevrpc::client::RpcTransport,
-    {
-        trevrpc::client::unary(&self.transport, Self::SERVICE, "SayHello", &request).await
-    }
-
-    pub async fn say_hello_with_options(
+    pub async fn say_hello(
         &self,
         request: HelloRequest,
         options: trevrpc::client::CallOptions,
@@ -49,7 +42,7 @@ impl<T> GreeterClient<T> {
     where
         T: trevrpc::client::RpcTransport,
     {
-        trevrpc::client::unary_with_options(
+        trevrpc::client::unary(
             &self.transport,
             Self::SERVICE,
             "SayHello",

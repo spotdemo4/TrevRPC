@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = greeter::GreeterClient::new(transport);
 
     let reply = client
-        .say_hello_with_options(
+        .say_hello(
             greeter::HelloRequest { name },
             trevrpc::client::CallOptions::new().with_timeout(Duration::from_secs(5)),
         )
