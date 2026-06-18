@@ -16,12 +16,12 @@ use crate::{
 const CANCELLED_STREAM_CODE: u32 = 1;
 
 #[derive(Clone)]
-pub struct QuinnTransport {
+pub struct Client {
     connection: quinn::Connection,
     max_frame_size: usize,
 }
 
-impl QuinnTransport {
+impl Client {
     #[must_use]
     pub const fn new(connection: quinn::Connection) -> Self {
         Self {
@@ -48,7 +48,7 @@ impl QuinnTransport {
 }
 
 #[crate::async_trait]
-impl RpcTransport for QuinnTransport {
+impl RpcTransport for Client {
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
         let (send, recv) = self.connection.open_bi().await.map_err(Error::transport)?;
         let mut streams = CancellableBiStream::new(send, recv);

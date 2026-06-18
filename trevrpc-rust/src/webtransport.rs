@@ -18,12 +18,12 @@ const CANCELLED_STREAM_CODE: u32 = 1;
 type ServerEndpoint = web_transport_quinn::Server;
 
 #[derive(Clone)]
-pub struct WebTransportClient {
+pub struct Client {
     session: web_transport_quinn::Session,
     max_frame_size: usize,
 }
 
-impl WebTransportClient {
+impl Client {
     #[must_use]
     pub const fn new(session: web_transport_quinn::Session) -> Self {
         Self {
@@ -44,18 +44,13 @@ impl WebTransportClient {
     }
 
     #[must_use]
-    pub const fn connection(&self) -> &web_transport_quinn::Session {
-        &self.session
-    }
-
-    #[must_use]
     pub const fn max_frame_size(&self) -> usize {
         self.max_frame_size
     }
 }
 
 #[crate::async_trait]
-impl RpcTransport for WebTransportClient {
+impl RpcTransport for Client {
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
         let (send, recv) = self.session.open_bi().await.map_err(Error::transport)?;
         let mut streams = CancellableBiStream::new(send, recv);

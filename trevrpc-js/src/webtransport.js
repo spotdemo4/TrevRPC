@@ -92,7 +92,7 @@ export class WebTransportClient {
   }
 }
 
-export class WebTransportResponseFrameStream {
+class WebTransportResponseFrameStream {
   constructor(reader, writer, writerTask, maxFrameSize = DefaultMaxFrameSize) {
     this.reader = reader;
     this.writer = writer;

@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let endpoint = make_client_endpoint()?;
     let connection = endpoint.connect(addr, "localhost")?.await?;
-    let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+    let transport = trevrpc::quinn::Client::new(connection.clone());
     let client = greeter::GreeterClient::new(transport);
 
     let reply = client

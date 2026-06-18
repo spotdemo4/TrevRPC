@@ -310,19 +310,6 @@ export class WebTransportClient implements Transport {
     request: RpcRequestMessage,
     requestBody: AsyncIterable<Uint8Array>,
     options?: ResolvedCallOptions,
-  ): Promise<WebTransportResponseFrameStream>;
+  ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
   openBidirectionalStream(): Promise<WebTransportBidirectionalStreamLike>;
-}
-
-export class WebTransportResponseFrameStream implements AsyncIterableIterator<RpcStreamFrameMessage> {
-  constructor(
-    reader: ReadableStreamDefaultReader<Uint8Array>,
-    writer: WritableStreamDefaultWriter<Uint8Array>,
-    writerTask: Promise<void>,
-    maxFrameSize?: number,
-  );
-
-  [Symbol.asyncIterator](): AsyncIterableIterator<RpcStreamFrameMessage>;
-  next(): Promise<IteratorResult<RpcStreamFrameMessage>>;
-  return(): Promise<IteratorResult<RpcStreamFrameMessage>>;
 }

@@ -12,25 +12,25 @@ import (
 
 const cancelledStreamCode quic.StreamErrorCode = 1
 
-type QuinnTransport struct {
+type QuicClient struct {
 	conn         *quic.Conn
 	maxFrameSize int
 }
 
-func NewQuinnTransport(conn *quic.Conn) *QuinnTransport {
-	return &QuinnTransport{conn: conn, maxFrameSize: DefaultMaxFrameSize}
+func NewQuicClient(conn *quic.Conn) *QuicClient {
+	return &QuicClient{conn: conn, maxFrameSize: DefaultMaxFrameSize}
 }
 
-func (t *QuinnTransport) WithMaxFrameSize(maxFrameSize int) *QuinnTransport {
+func (t *QuicClient) WithMaxFrameSize(maxFrameSize int) *QuicClient {
 	t.maxFrameSize = maxFrameSize
 	return t
 }
 
-func (t *QuinnTransport) Conn() *quic.Conn {
+func (t *QuicClient) Conn() *quic.Conn {
 	return t.conn
 }
 
-func (t *QuinnTransport) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (t *QuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, transportStatus(err)
@@ -54,7 +54,7 @@ func (t *QuinnTransport) Call(ctx context.Context, request *RpcRequest) (*RpcRes
 	return response, nil
 }
 
-func (t *QuinnTransport) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+func (t *QuicClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := t.conn.OpenStreamSync(streamCtx)
 	if err != nil {
@@ -67,10 +67,10 @@ func (t *QuinnTransport) StreamingCall(ctx context.Context, request *RpcRequest,
 		writerDone <- writeStreamingRequest(streamCtx, stream, request, requestBody, t.maxFrameSize)
 	}()
 
-	return &quinnResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, maxFrameSize: t.maxFrameSize}, nil
+	return &quicResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, maxFrameSize: t.maxFrameSize}, nil
 }
 
-type quinnResponseStream struct {
+type quicResponseStream struct {
 	stream       *quic.Stream
 	writerDone   <-chan error
 	cancel       context.CancelFunc
@@ -78,7 +78,7 @@ type quinnResponseStream struct {
 	done         bool
 }
 
-func (s *quinnResponseStream) Recv() (*RpcStreamFrame, error) {
+func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
 	if s.done {
 		return nil, io.EOF
 	}
@@ -102,12 +102,12 @@ func (s *quinnResponseStream) Recv() (*RpcStreamFrame, error) {
 	return frame, nil
 }
 
-func (s *quinnResponseStream) Close() error {
+func (s *quicResponseStream) Close() error {
 	s.finish(true)
 	return nil
 }
 
-func (s *quinnResponseStream) finish(cancelRead bool) {
+func (s *quicResponseStream) finish(cancelRead bool) {
 	if s.cancel != nil {
 		s.cancel()
 	}

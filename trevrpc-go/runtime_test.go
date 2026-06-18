@@ -515,7 +515,7 @@ func (m *recordingMetrics) hasCode(code Code) bool {
 	return slices.Contains(m.codes, code)
 }
 
-func TestQuinnTransportUnary(t *testing.T) {
+func TestQuicClientUnary(t *testing.T) {
 	server := NewServer()
 	RegisterUnary(server, "example.Greeter", "SayHello", func() *testMessage { return &testMessage{} }, func(_ context.Context, request *testMessage) (*testMessage, error) {
 		return &testMessage{Value: "hello " + request.Value}, nil
@@ -540,7 +540,7 @@ func TestQuinnTransportUnary(t *testing.T) {
 	}
 	defer conn.CloseWithError(0, "test complete")
 
-	response, err := Unary(ctx, NewQuinnTransport(conn), "example.Greeter", "SayHello", &testMessage{Value: "QUIC"}, func() *testMessage { return &testMessage{} })
+	response, err := Unary(ctx, NewQuicClient(conn), "example.Greeter", "SayHello", &testMessage{Value: "QUIC"}, func() *testMessage { return &testMessage{} })
 	if err != nil {
 		t.Fatalf("quic unary RPC failed: %v", err)
 	}
@@ -550,13 +550,13 @@ func TestQuinnTransportUnary(t *testing.T) {
 	}
 }
 
-func TestQuinnRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
+func TestQuicRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuinnTransport(conn)
+	transport := NewQuicClient(conn)
 
 	reply, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "unary"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if err != nil {
@@ -640,27 +640,27 @@ func TestWebTransportCheckOriginAllowsBrowserOrigin(t *testing.T) {
 	}
 }
 
-func TestQuinnAuthFailuresReturnStatusErrors(t *testing.T) {
+func TestQuicAuthFailuresReturnStatusErrors(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	_, err := Unary(context.Background(), NewQuinnTransport(conn), testServiceName, "SayHello", &testMessage{Value: "missing auth"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	_, err := Unary(context.Background(), NewQuicClient(conn), testServiceName, "SayHello", &testMessage{Value: "missing auth"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if code := StatusFromError(err).Code; code != CodeUnauthenticated {
 		t.Fatalf("expected unauthenticated, got %v (%v)", code, err)
 	}
 }
 
-func TestQuinnExpiredDeadlinesRejectedOverWire(t *testing.T) {
+func TestQuicExpiredDeadlinesRejectedOverWire(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 	request := NewRpcRequest(testServiceName, "Missing", nil)
 	request.DeadlineUnixNanos = uint64(time.Now().Add(-time.Second).UnixNano())
 
-	response, err := NewQuinnTransport(conn).Call(context.Background(), request)
+	response, err := NewQuicClient(conn).Call(context.Background(), request)
 	if err != nil {
 		t.Fatalf("raw transport call failed: %v", err)
 	}
@@ -669,7 +669,7 @@ func TestQuinnExpiredDeadlinesRejectedOverWire(t *testing.T) {
 	}
 }
 
-func TestQuinnRequestStreamLimitsReturnResourceExhausted(t *testing.T) {
+func TestQuicRequestStreamLimitsReturnResourceExhausted(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		options := DefaultServerOptions()
 		options.MaxStreamMessages = 1
@@ -680,7 +680,7 @@ func TestQuinnRequestStreamLimitsReturnResourceExhausted(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	_, err := ClientStreaming(context.Background(), NewQuinnTransport(conn), testServiceName, "LotsOfGreetings", FromSlice(
+	_, err := ClientStreaming(context.Background(), NewQuicClient(conn), testServiceName, "LotsOfGreetings", FromSlice(
 		&testMessage{Value: "one"},
 		&testMessage{Value: "two"},
 	), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
@@ -689,14 +689,14 @@ func TestQuinnRequestStreamLimitsReturnResourceExhausted(t *testing.T) {
 	}
 }
 
-func TestQuinnResponseStreamLimitsReturnResourceExhausted(t *testing.T) {
+func TestQuicResponseStreamLimitsReturnResourceExhausted(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	replies, err := ServerStreaming(context.Background(), NewQuinnTransport(conn), testServiceName, "LotsOfReplies", &testMessage{Value: "limited"}, func() *testMessage { return &testMessage{} }, append(authenticatedOptions(), WithMaxResponseMessages(1))...)
+	replies, err := ServerStreaming(context.Background(), NewQuicClient(conn), testServiceName, "LotsOfReplies", &testMessage{Value: "limited"}, func() *testMessage { return &testMessage{} }, append(authenticatedOptions(), WithMaxResponseMessages(1))...)
 	if err != nil {
 		t.Fatalf("server-streaming RPC failed: %v", err)
 	}
@@ -713,7 +713,7 @@ func TestQuinnResponseStreamLimitsReturnResourceExhausted(t *testing.T) {
 	}
 }
 
-func TestQuinnStreamConcurrencyLimitReturnsUnavailable(t *testing.T) {
+func TestQuicStreamConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		options := DefaultServerOptions()
 		options.MaxConcurrentStreamsPerConnection = 1
@@ -723,7 +723,7 @@ func TestQuinnStreamConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuinnTransport(conn)
+	transport := NewQuicClient(conn)
 	hanging := holdServerStreamOpen(t, transport)
 	defer closeMessageStream(hanging)
 
@@ -733,7 +733,7 @@ func TestQuinnStreamConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	}
 }
 
-func TestQuinnRequestConcurrencyLimitReturnsUnavailable(t *testing.T) {
+func TestQuicRequestConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		options := DefaultServerOptions()
 		options.MaxConcurrentRequests = 1
@@ -743,7 +743,7 @@ func TestQuinnRequestConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuinnTransport(conn)
+	transport := NewQuicClient(conn)
 	hanging := holdServerStreamOpen(t, transport)
 	defer closeMessageStream(hanging)
 
@@ -753,7 +753,7 @@ func TestQuinnRequestConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	}
 }
 
-func TestQuinnConnectionLimitRefusesNewConnections(t *testing.T) {
+func TestQuicConnectionLimitRefusesNewConnections(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		options := DefaultServerOptions()
 		options.MaxConcurrentConnections = 1
@@ -763,7 +763,7 @@ func TestQuinnConnectionLimitRefusesNewConnections(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	hanging := holdServerStreamOpen(t, NewQuinnTransport(conn))
+	hanging := holdServerStreamOpen(t, NewQuicClient(conn))
 	defer closeMessageStream(hanging)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -774,13 +774,13 @@ func TestQuinnConnectionLimitRefusesNewConnections(t *testing.T) {
 	}
 	defer secondConn.CloseWithError(0, "test complete")
 
-	_, err = Unary(context.Background(), NewQuinnTransport(secondConn), testServiceName, "SayHello", &testMessage{Value: "refused"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	_, err = Unary(context.Background(), NewQuicClient(secondConn), testServiceName, "SayHello", &testMessage{Value: "refused"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if code := StatusFromError(err).Code; code != CodeUnavailable {
 		t.Fatalf("expected unavailable, got %v (%v)", code, err)
 	}
 }
 
-func TestQuinnDroppedResponseStreamCancelsServerWork(t *testing.T) {
+func TestQuicDroppedResponseStreamCancelsServerWork(t *testing.T) {
 	metrics := &recordingMetrics{}
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetMetrics(metrics)
@@ -788,16 +788,16 @@ func TestQuinnDroppedResponseStreamCancelsServerWork(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	replies := holdServerStreamOpen(t, NewQuinnTransport(conn))
+	replies := holdServerStreamOpen(t, NewQuicClient(conn))
 
 	closeMessageStream(replies)
 	waitForMetricCode(t, metrics, CodeCancelled)
 }
 
-func TestQuinnShutdownClosesActiveConnections(t *testing.T) {
+func TestQuicShutdownClosesActiveConnections(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
-	transport := NewQuinnTransport(conn)
+	transport := NewQuicClient(conn)
 	running.stop(t)
 
 	_, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "after shutdown"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
@@ -807,18 +807,18 @@ func TestQuinnShutdownClosesActiveConnections(t *testing.T) {
 	conn.CloseWithError(0, "test complete")
 }
 
-func TestQuinnLocalCloseMapsToCancelled(t *testing.T) {
+func TestQuicLocalCloseMapsToCancelled(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
 	conn.CloseWithError(0, "client closed")
 
-	_, err := Unary(context.Background(), NewQuinnTransport(conn), testServiceName, "SayHello", &testMessage{Value: "after local close"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
+	_, err := Unary(context.Background(), NewQuicClient(conn), testServiceName, "SayHello", &testMessage{Value: "after local close"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
 	if code := StatusFromError(err).Code; code != CodeCancelled {
 		t.Fatalf("expected cancelled, got %v (%v)", code, err)
 	}
 }
 
-func TestQuinnRejectsALPNMismatch(t *testing.T) {
+func TestQuicRejectsALPNMismatch(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	clientTLS := running.clientTLS.Clone()
 	clientTLS.NextProtos = []string{"not-trevrpc"}
@@ -832,7 +832,7 @@ func TestQuinnRejectsALPNMismatch(t *testing.T) {
 	}
 }
 
-func TestQuinnRejectsTLSIdentityMismatch(t *testing.T) {
+func TestQuicRejectsTLSIdentityMismatch(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	clientTLS := running.clientTLS.Clone()
 	clientTLS.ServerName = "wronghost"
@@ -846,7 +846,7 @@ func TestQuinnRejectsTLSIdentityMismatch(t *testing.T) {
 	}
 }
 
-func TestQuinnMTLSRejectsClientsWithoutCertificates(t *testing.T) {
+func TestQuicMTLSRejectsClientsWithoutCertificates(t *testing.T) {
 	serverTLS, clientTLS := testTLSConfig(t)
 	serverTLS.ClientAuth = tls.RequireAnyClientCert
 	running := startTestQUICServerWithTLS(t, serverTLS, clientTLS, func(*Server) {})
@@ -855,7 +855,7 @@ func TestQuinnMTLSRejectsClientsWithoutCertificates(t *testing.T) {
 	defer cancel()
 	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS, &quic.Config{})
 	if err == nil {
-		_, rpcErr := Unary(context.Background(), NewQuinnTransport(conn), testServiceName, "SayHello", &testMessage{Value: "anonymous"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
+		_, rpcErr := Unary(context.Background(), NewQuicClient(conn), testServiceName, "SayHello", &testMessage{Value: "anonymous"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
 		conn.CloseWithError(0, "test complete")
 		if code := StatusFromError(rpcErr).Code; code != CodeUnavailable {
 			t.Fatalf("expected unavailable for anonymous mTLS client, got %v (%v)", code, rpcErr)
@@ -863,7 +863,7 @@ func TestQuinnMTLSRejectsClientsWithoutCertificates(t *testing.T) {
 	}
 }
 
-func TestQuinnMalformedRequestFramesReturnInternalStatus(t *testing.T) {
+func TestQuicMalformedRequestFramesReturnInternalStatus(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
@@ -889,13 +889,13 @@ func TestQuinnMalformedRequestFramesReturnInternalStatus(t *testing.T) {
 	}
 }
 
-func TestQuinnHandlesManyConcurrentUnaryCalls(t *testing.T) {
+func TestQuicHandlesManyConcurrentUnaryCalls(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuinnTransport(conn)
+	transport := NewQuicClient(conn)
 
 	var group sync.WaitGroup
 	errors := make(chan error, 64)
@@ -921,7 +921,7 @@ func TestQuinnHandlesManyConcurrentUnaryCalls(t *testing.T) {
 	}
 }
 
-func TestQuinnHandlesBoundedMixedLoad(t *testing.T) {
+func TestQuicHandlesBoundedMixedLoad(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		options := DefaultServerOptions()
 		options.MaxConcurrentStreamsPerConnection = 512
@@ -931,7 +931,7 @@ func TestQuinnHandlesBoundedMixedLoad(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuinnTransport(conn)
+	transport := NewQuicClient(conn)
 
 	var group sync.WaitGroup
 	errors := make(chan error, 64)

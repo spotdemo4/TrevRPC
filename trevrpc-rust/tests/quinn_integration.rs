@@ -380,7 +380,7 @@ async fn quinn_auth_failures_return_status_errors() -> TestResult {
 async fn quinn_expired_deadlines_are_rejected_over_the_wire() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+    let transport = trevrpc::quinn::Client::new(connection.clone());
     let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "Missing", Vec::new())
         .with_deadline_unix_nanos(expired_deadline_unix_nanos());
 
@@ -539,7 +539,7 @@ async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
     .expect("second connection attempt should complete");
 
     if let Ok(connection) = connect {
-        let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+        let transport = trevrpc::quinn::Client::new(connection.clone());
         let error = trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
             greeter::GreeterClient::<()>::SERVICE,
@@ -678,7 +678,7 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
         .expect("mTLS rejection handshake should complete");
 
     if let Ok(connection) = result {
-        let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+        let transport = trevrpc::quinn::Client::new(connection.clone());
         let status = trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
             greeter::GreeterClient::<()>::SERVICE,
@@ -805,7 +805,7 @@ async fn run_mixed_workload(total_calls: usize, batch_size: usize) -> TestResult
 }
 
 async fn run_mixed_call(
-    client: greeter::GreeterClient<trevrpc::quinn::QuinnTransport>,
+    client: greeter::GreeterClient<trevrpc::quinn::Client>,
     index: usize,
 ) -> trevrpc::Result<()> {
     match index % 4 {
@@ -880,7 +880,7 @@ async fn run_mixed_call(
 }
 
 async fn hold_server_stream_open(
-    client: &greeter::GreeterClient<trevrpc::quinn::QuinnTransport>,
+    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
 ) -> TestResult<trevrpc::BoxMessageStream<greeter::HelloReply>> {
     let mut replies = client
         .lots_of_replies(
@@ -967,11 +967,11 @@ async fn connect_client(
 ) -> TestResult<(
     quinn::Endpoint,
     quinn::Connection,
-    greeter::GreeterClient<trevrpc::quinn::QuinnTransport>,
+    greeter::GreeterClient<trevrpc::quinn::Client>,
 )> {
     let endpoint = make_client_endpoint(server.cert_der.clone())?;
     let connection = endpoint.connect(server.addr, "localhost")?.await?;
-    let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+    let transport = trevrpc::quinn::Client::new(connection.clone());
     let client = greeter::GreeterClient::new(transport);
 
     Ok((endpoint, connection, client))
@@ -982,7 +982,7 @@ async fn connect_webtransport_client(
 ) -> TestResult<(
     web_transport_quinn::Client,
     web_transport_quinn::Session,
-    greeter::GreeterClient<trevrpc::webtransport::WebTransportClient>,
+    greeter::GreeterClient<trevrpc::webtransport::Client>,
 )> {
     let webtransport_client = web_transport_quinn::ClientBuilder::new()
         .with_server_certificates(vec![server.cert_der.clone()])?;
@@ -990,7 +990,7 @@ async fn connect_webtransport_client(
     let session = webtransport_client
         .connect(web_transport_quinn::proto::ConnectRequest::new(url))
         .await?;
-    let transport = trevrpc::webtransport::WebTransportClient::new(session.clone());
+    let transport = trevrpc::webtransport::Client::new(session.clone());
     let greeter_client = greeter::GreeterClient::new(transport);
 
     Ok((webtransport_client, session, greeter_client))

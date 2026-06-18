@@ -41,7 +41,7 @@ func main() {
 	defer conn.CloseWithError(0, "client done")
 
 	client := greeter.NewGreeterClient(
-		trevrpc.NewQuinnTransport(conn),
+		trevrpc.NewQuicClient(conn),
 		trevrpc.WithTimeout(5*time.Second),
 		trevrpc.WithMetadata("authorization", []byte("Bearer "+authToken)),
 	)
