@@ -36,7 +36,17 @@ fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error
     assert!(content.contains("pub trait Greeter"));
     assert!(content.contains("pub struct GreeterClient<T>"));
     assert!(content.contains("async fn say_hello"));
+    assert!(content.contains("async fn lots_of_replies"));
+    assert!(content.contains("async fn lots_of_greetings"));
+    assert!(content.contains("async fn bidi_hello"));
     assert!(content.contains("options: ::trevrpc::client::CallOptions"));
+    assert!(content.contains("::trevrpc::client::server_streaming"));
+    assert!(content.contains("::trevrpc::client::client_streaming"));
+    assert!(content.contains("::trevrpc::client::bidirectional_streaming"));
+    assert!(content.contains("server.route_streaming"));
+    assert!(content.contains("::trevrpc::RpcKind::ServerStreaming"));
+    assert!(content.contains("::trevrpc::RpcKind::ClientStreaming"));
+    assert!(content.contains("::trevrpc::RpcKind::BidirectionalStreaming"));
 
     let buf_config = include_str!("proto/buf.gen.yaml");
     assert!(buf_config.contains("protoc-gen-trevrpc"));

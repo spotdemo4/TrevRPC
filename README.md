@@ -74,6 +74,11 @@ Supported plugin options:
 - `file_suffix=.trevrpc.rs`
 - `package_root=crate`
 
+Generated services support unary, client-streaming, server-streaming, and bidirectional-streaming
+RPCs. Streaming methods use `trevrpc::BoxMessageStream<T>` for streamed inputs and outputs. The
+runtime includes `trevrpc::stream::from_iter`, `empty`, `encode`, and `decode` helpers for simple
+stream construction and protobuf item conversion.
+
 ## examples
 
 Run the QUIC greeter server:
@@ -95,6 +100,9 @@ The examples also show the production-facing defaults:
 
 - QUIC TLS ALPN is set to `trevrpc::ALPN` (`trevrpc/1`).
 - Client calls use `trevrpc::client::CallOptions` for deadlines.
+- Streaming calls use one QUIC bidirectional stream per RPC. The initial frame identifies the RPC
+  kind, streamed messages use `RpcStreamFrame::message`, and every response stream ends with a
+  final status frame.
 - Client calls attach request metadata through `CallOptions::with_metadata`.
 - The server enforces metadata auth with `trevrpc::server::MetadataValueAuthorizer`.
 - Server calls use `trevrpc::server::ServerOptions` for connection and RPC concurrency limits.

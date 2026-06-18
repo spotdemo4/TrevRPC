@@ -305,27 +305,6 @@ fn descriptor_method(
 }
 
 fn generate_service(runtime_path: &str, service: &Service, buf: &mut String) {
-    let unsupported_methods = service
-        .methods
-        .iter()
-        .filter(|method| method.client_streaming || method.server_streaming);
-
-    for method in unsupported_methods {
-        let message = format!(
-            "TrevRPC only supports unary RPCs right now: {}.{}",
-            service.proto_name, method.proto_name
-        );
-        buf.push_str(&format!("compile_error!({message:?});\n"));
-    }
-
-    if service
-        .methods
-        .iter()
-        .any(|method| method.client_streaming || method.server_streaming)
-    {
-        return;
-    }
-
     generate_trait(runtime_path, service, buf);
     generate_client(runtime_path, service, buf);
     generate_registration(runtime_path, service, buf);
@@ -338,10 +317,27 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
     ));
 
     for method in &service.methods {
-        buf.push_str(&format!(
-            "    async fn {}(&self, request: {}) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
-            method.name, method.input_type, method.output_type
-        ));
+        if method.client_streaming && method.server_streaming {
+            buf.push_str(&format!(
+                "    async fn {}(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
+                method.name, method.input_type, method.output_type
+            ));
+        } else if method.client_streaming {
+            buf.push_str(&format!(
+                "    async fn {}(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
+                method.name, method.input_type, method.output_type
+            ));
+        } else if method.server_streaming {
+            buf.push_str(&format!(
+                "    async fn {}(&self, request: {}) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
+                method.name, method.input_type, method.output_type
+            ));
+        } else {
+            buf.push_str(&format!(
+                "    async fn {}(&self, request: {}) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
+                method.name, method.input_type, method.output_type
+            ));
+        }
     }
 
     buf.push_str("}\n\n");
@@ -371,13 +367,39 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
 }
 
 fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String) {
-    buf.push_str(&format!(
-        "    pub async fn {}(\n        &self,\n        request: {},\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::unary(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
-        method.name,
-        method.input_type,
-        method.output_type,
-        method.proto_name
-    ));
+    if method.client_streaming && method.server_streaming {
+        buf.push_str(&format!(
+            "    pub async fn {}(\n        &self,\n        requests: {runtime_path}::BoxMessageStream<{}>,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.proto_name
+        ));
+    } else if method.client_streaming {
+        buf.push_str(&format!(
+            "    pub async fn {}(\n        &self,\n        requests: {runtime_path}::BoxMessageStream<{}>,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.proto_name
+        ));
+    } else if method.server_streaming {
+        buf.push_str(&format!(
+            "    pub async fn {}(\n        &self,\n        request: {},\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::server_streaming(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.proto_name
+        ));
+    } else {
+        buf.push_str(&format!(
+            "    pub async fn {}(\n        &self,\n        request: {},\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::unary(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.proto_name
+        ));
+    }
 }
 
 fn generate_registration(runtime_path: &str, service: &Service, buf: &mut String) {
@@ -390,17 +412,39 @@ fn generate_registration(runtime_path: &str, service: &Service, buf: &mut String
     ));
 
     for method in &service.methods {
-        generate_registration_method(&service_name, method, buf);
+        generate_registration_method(runtime_path, &service_name, method, buf);
     }
 
     buf.push_str("}\n");
 }
 
-fn generate_registration_method(service_name: &str, method: &Method, buf: &mut String) {
-    buf.push_str(&format!(
-        "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route({service_name:?}, {:?}, move |body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(request).await?;\n                Ok(::prost::Message::encode_to_vec(&response))\n            }}\n        }});\n    }}\n",
-        method.proto_name, method.input_type, method.name
-    ));
+fn generate_registration_method(
+    runtime_path: &str,
+    service_name: &str,
+    method: &Method,
+    buf: &mut String,
+) {
+    if method.client_streaming && method.server_streaming {
+        buf.push_str(&format!(
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming({service_name:?}, {:?}, {runtime_path}::RpcKind::BidirectionalStreaming, move |_body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let responses = service.{}(requests).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
+            method.proto_name, method.input_type, method.name
+        ));
+    } else if method.client_streaming {
+        buf.push_str(&format!(
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming({service_name:?}, {:?}, {runtime_path}::RpcKind::ClientStreaming, move |_body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let response = service.{}(requests).await?;\n                Ok({runtime_path}::stream::encode({runtime_path}::stream::from_iter([response])))\n            }}\n        }});\n    }}\n",
+            method.proto_name, method.input_type, method.name
+        ));
+    } else if method.server_streaming {
+        buf.push_str(&format!(
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming({service_name:?}, {:?}, {runtime_path}::RpcKind::ServerStreaming, move |body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let responses = service.{}(request).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
+            method.proto_name, method.input_type, method.name
+        ));
+    } else {
+        buf.push_str(&format!(
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route({service_name:?}, {:?}, move |body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(request).await?;\n                Ok(::prost::Message::encode_to_vec(&response))\n            }}\n        }});\n    }}\n",
+            method.proto_name, method.input_type, method.name
+        ));
+    }
 }
 
 fn service_path(service: &Service) -> String {
@@ -549,6 +593,56 @@ mod tests {
         assert!(generated.contains("pub fn register_greeter<S>"));
         assert!(generated.contains("hello.v1.Greeter"));
         assert!(generated.contains("SayHello"));
+    }
+
+    #[test]
+    fn generates_streaming_service_api() {
+        let service = Service {
+            name: "Greeter".to_owned(),
+            proto_name: "Greeter".to_owned(),
+            package: "hello.v1".to_owned(),
+            methods: vec![
+                Method {
+                    name: "lots_of_replies".to_owned(),
+                    proto_name: "LotsOfReplies".to_owned(),
+                    input_type: "HelloRequest".to_owned(),
+                    output_type: "HelloReply".to_owned(),
+                    client_streaming: false,
+                    server_streaming: true,
+                },
+                Method {
+                    name: "lots_of_greetings".to_owned(),
+                    proto_name: "LotsOfGreetings".to_owned(),
+                    input_type: "HelloRequest".to_owned(),
+                    output_type: "HelloReply".to_owned(),
+                    client_streaming: true,
+                    server_streaming: false,
+                },
+                Method {
+                    name: "bidi_hello".to_owned(),
+                    proto_name: "BidiHello".to_owned(),
+                    input_type: "HelloRequest".to_owned(),
+                    output_type: "HelloReply".to_owned(),
+                    client_streaming: true,
+                    server_streaming: true,
+                },
+            ],
+        };
+        let mut generated = String::new();
+
+        generate_service("::trevrpc", &service, &mut generated);
+
+        assert!(generated.contains("BoxMessageStream<HelloRequest>"));
+        assert!(generated.contains("BoxMessageStream<HelloReply>"));
+        assert!(generated.contains("::trevrpc::client::server_streaming"));
+        assert!(generated.contains("::trevrpc::client::client_streaming"));
+        assert!(generated.contains("::trevrpc::client::bidirectional_streaming"));
+        assert!(generated.contains("server.route_streaming"));
+        assert!(generated.contains("::trevrpc::RpcKind::ServerStreaming"));
+        assert!(generated.contains("::trevrpc::RpcKind::ClientStreaming"));
+        assert!(generated.contains("::trevrpc::RpcKind::BidirectionalStreaming"));
+        assert!(generated.contains("::trevrpc::stream::decode::<HelloRequest>"));
+        assert!(generated.contains("::trevrpc::stream::encode"));
     }
 
     #[test]

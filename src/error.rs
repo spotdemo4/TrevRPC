@@ -35,6 +35,12 @@ impl From<Status> for Error {
     }
 }
 
+impl From<Error> for Status {
+    fn from(error: Error) -> Self {
+        error.into_status()
+    }
+}
+
 impl From<prost::EncodeError> for Error {
     fn from(error: prost::EncodeError) -> Self {
         Self::Encode(error)

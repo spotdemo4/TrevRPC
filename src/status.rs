@@ -142,6 +142,11 @@ impl Status {
     }
 
     #[must_use]
+    pub fn into_parts(self) -> (Code, String) {
+        (self.code, self.message)
+    }
+
+    #[must_use]
     pub const fn is_ok(&self) -> bool {
         matches!(self.code, Code::Ok)
     }

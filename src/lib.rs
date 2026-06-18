@@ -4,6 +4,7 @@
 pub mod error;
 pub mod framing;
 pub mod status;
+pub mod stream;
 pub mod wire;
 
 pub const ALPN: &[u8] = b"trevrpc/1";
@@ -20,4 +21,5 @@ pub mod server;
 pub use async_trait::async_trait;
 pub use error::{Error, Result};
 pub use status::{Code, Status};
-pub use wire::{Metadata, RpcRequest, RpcResponse};
+pub use stream::{BoxMessageStream, MessageStream};
+pub use wire::{Metadata, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, RpcStreamFrameKind};

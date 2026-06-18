@@ -8,6 +8,22 @@ pub const MAX_METADATA_VALUE_LEN: usize = 8 * 1024;
 pub const MAX_METADATA_TOTAL_SIZE: usize = 64 * 1024;
 pub const RESERVED_METADATA_PREFIX: &str = "trevrpc-";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, prost::Enumeration)]
+#[repr(i32)]
+pub enum RpcKind {
+    Unary = 0,
+    ClientStreaming = 1,
+    ServerStreaming = 2,
+    BidirectionalStreaming = 3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, prost::Enumeration)]
+#[repr(i32)]
+pub enum RpcStreamFrameKind {
+    Message = 0,
+    Status = 1,
+}
+
 #[must_use]
 pub fn normalize_metadata_key(key: &str) -> String {
     key.to_ascii_lowercase()
@@ -88,6 +104,8 @@ pub struct RpcRequest {
     pub body: Vec<u8>,
     #[prost(map = "string, bytes", tag = "4")]
     pub metadata: Metadata,
+    #[prost(enumeration = "RpcKind", tag = "5")]
+    pub kind: i32,
 }
 
 impl RpcRequest {
@@ -98,7 +116,19 @@ impl RpcRequest {
             method: method.into(),
             body,
             metadata: Metadata::new(),
+            kind: RpcKind::Unary as i32,
         }
+    }
+
+    #[must_use]
+    pub fn rpc_kind(&self) -> RpcKind {
+        RpcKind::try_from(self.kind).unwrap_or(RpcKind::Unary)
+    }
+
+    #[must_use]
+    pub const fn with_kind(mut self, kind: RpcKind) -> Self {
+        self.kind = kind as i32;
+        self
     }
 
     #[must_use]
@@ -127,13 +157,68 @@ impl RpcResponse {
     }
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RpcStreamFrame {
+    #[prost(enumeration = "RpcStreamFrameKind", tag = "1")]
+    pub kind: i32,
+    #[prost(uint32, tag = "2")]
+    pub status: u32,
+    #[prost(string, tag = "3")]
+    pub message: String,
+    #[prost(bytes = "vec", tag = "4")]
+    pub body: Vec<u8>,
+    #[prost(map = "string, bytes", tag = "5")]
+    pub metadata: Metadata,
+}
+
+impl RpcStreamFrame {
+    #[must_use]
+    pub fn message(body: Vec<u8>) -> Self {
+        Self {
+            kind: RpcStreamFrameKind::Message as i32,
+            status: crate::Code::Ok.as_u32(),
+            message: String::new(),
+            body,
+            metadata: Metadata::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn status(status: crate::Status) -> Self {
+        Self::status_with_metadata(status, Metadata::new())
+    }
+
+    #[must_use]
+    pub fn status_with_metadata(status: crate::Status, metadata: Metadata) -> Self {
+        let (code, message) = status.into_parts();
+
+        Self {
+            kind: RpcStreamFrameKind::Status as i32,
+            status: code.as_u32(),
+            message,
+            body: Vec::new(),
+            metadata,
+        }
+    }
+
+    #[must_use]
+    pub fn frame_kind(&self) -> Option<RpcStreamFrameKind> {
+        RpcStreamFrameKind::try_from(self.kind).ok()
+    }
+
+    #[must_use]
+    pub fn status_value(&self) -> crate::Status {
+        crate::Status::new(crate::Code::from_u32(self.status), self.message.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Code, Metadata};
 
     use super::{
-        MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN,
-        normalize_metadata_key, validate_metadata,
+        MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN, RpcKind, RpcRequest,
+        RpcStreamFrame, RpcStreamFrameKind, normalize_metadata_key, validate_metadata,
     };
 
     #[test]
@@ -176,5 +261,21 @@ mod tests {
         let mut total_too_large = Metadata::new();
         total_too_large.insert("key".to_owned(), vec![0; MAX_METADATA_TOTAL_SIZE + 1]);
         assert!(validate_metadata(&total_too_large).is_err());
+    }
+
+    #[test]
+    fn request_defaults_to_unary_kind() {
+        let request = RpcRequest::new("service", "method", Vec::new());
+
+        assert_eq!(request.rpc_kind(), RpcKind::Unary);
+    }
+
+    #[test]
+    fn stream_frame_carries_status() {
+        let frame = RpcStreamFrame::status(crate::Status::unavailable("retry later"));
+
+        assert_eq!(frame.frame_kind(), Some(RpcStreamFrameKind::Status));
+        assert_eq!(frame.status_value().code(), Code::Unavailable);
+        assert_eq!(frame.status_value().message(), "retry later");
     }
 }

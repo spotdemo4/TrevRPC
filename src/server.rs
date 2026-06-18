@@ -6,10 +6,26 @@ use std::time::{Duration, Instant};
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::wire::{normalize_metadata_key, validate_metadata};
-use crate::{Code, Error, Result, RpcRequest, RpcResponse, Status};
+use crate::{
+    BoxMessageStream, Code, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse,
+    RpcStreamFrame, Status,
+};
 
-type HandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
-type Handler = Arc<dyn Fn(Vec<u8>) -> HandlerFuture + Send + Sync + 'static>;
+type UnaryHandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
+type UnaryHandler = Arc<dyn Fn(Vec<u8>) -> UnaryHandlerFuture + Send + Sync + 'static>;
+type StreamingHandlerFuture =
+    Pin<Box<dyn Future<Output = Result<BoxMessageStream<Vec<u8>>>> + Send + 'static>>;
+type StreamingHandler =
+    Arc<dyn Fn(Vec<u8>, BoxMessageStream<Vec<u8>>) -> StreamingHandlerFuture + Send + Sync>;
+
+#[derive(Clone)]
+enum Route {
+    Unary(UnaryHandler),
+    Streaming {
+        kind: RpcKind,
+        handler: StreamingHandler,
+    },
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct MethodKey {
@@ -28,7 +44,7 @@ impl MethodKey {
 
 #[derive(Clone)]
 pub struct Server {
-    routes: Arc<HashMap<MethodKey, Handler>>,
+    routes: Arc<HashMap<MethodKey, Route>>,
     options: ServerOptions,
     authorizer: Option<Arc<dyn Authorizer>>,
     metrics: Arc<dyn Metrics>,
@@ -309,7 +325,26 @@ impl Server {
     {
         Arc::make_mut(&mut self.routes).insert(
             MethodKey::new(service, method),
-            Arc::new(move |body| Box::pin(handler(body))),
+            Route::Unary(Arc::new(move |body| Box::pin(handler(body)))),
+        );
+    }
+
+    pub fn route_streaming<F, Fut>(
+        &mut self,
+        service: impl Into<String>,
+        method: impl Into<String>,
+        kind: RpcKind,
+        handler: F,
+    ) where
+        F: Fn(Vec<u8>, BoxMessageStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BoxMessageStream<Vec<u8>>>> + Send + 'static,
+    {
+        Arc::make_mut(&mut self.routes).insert(
+            MethodKey::new(service, method),
+            Route::Streaming {
+                kind,
+                handler: Arc::new(move |body, stream| Box::pin(handler(body, stream))),
+            },
         );
     }
 
@@ -360,7 +395,7 @@ impl Server {
         }
 
         let key = MethodKey::new(request.service.clone(), request.method.clone());
-        let Some(handler) = self.routes.get(&key).cloned() else {
+        let Some(Route::Unary(handler)) = self.routes.get(&key).cloned() else {
             return self.finish_response(
                 &service,
                 &method,
@@ -380,6 +415,111 @@ impl Server {
         };
 
         self.finish_response(&service, &method, request_body_len, started_at, response)
+    }
+
+    pub async fn handle_streaming_request(
+        &self,
+        request: RpcRequest,
+        request_body: BoxMessageStream<Vec<u8>>,
+    ) -> BoxMessageStream<RpcStreamFrame> {
+        let started_at = Instant::now();
+        let service = request.service.clone();
+        let method = request.method.clone();
+        let request_body_len = request.body.len();
+
+        self.metrics.rpc_started(&RpcStarted {
+            service: service.clone(),
+            method: method.clone(),
+            request_body_len,
+        });
+
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            service = %service,
+            method = %method,
+            request_body_len,
+            metadata_count = request.metadata.len(),
+            kind = ?request.rpc_kind(),
+            "streaming rpc started"
+        );
+
+        if let Err(status) = validate_metadata(&request.metadata) {
+            return self.finish_streaming_status(
+                &service,
+                &method,
+                request_body_len,
+                started_at,
+                status,
+            );
+        }
+
+        if let Some(authorizer) = &self.authorizer {
+            match authorizer.authorize(&request).await {
+                Ok(()) => {}
+                Err(status) => {
+                    return self.finish_streaming_status(
+                        &service,
+                        &method,
+                        request_body_len,
+                        started_at,
+                        status,
+                    );
+                }
+            }
+        }
+
+        let key = MethodKey::new(request.service.clone(), request.method.clone());
+        let Some(Route::Streaming { kind, handler }) = self.routes.get(&key).cloned() else {
+            let status = Status::unimplemented(format!(
+                "unknown streaming RPC method {}/{}",
+                request.service, request.method
+            ));
+            return self.finish_streaming_status(
+                &service,
+                &method,
+                request_body_len,
+                started_at,
+                status,
+            );
+        };
+
+        if request.rpc_kind() != kind {
+            let status = Status::invalid_argument(format!(
+                "streaming RPC kind mismatch for {}/{}: expected {:?}, got {:?}",
+                request.service,
+                request.method,
+                kind,
+                request.rpc_kind()
+            ));
+            return self.finish_streaming_status(
+                &service,
+                &method,
+                request_body_len,
+                started_at,
+                status,
+            );
+        }
+
+        match handler(request.body, request_body).await {
+            Ok(response_body) => Box::new(ServerResponseStream::new(
+                response_body,
+                Arc::clone(&self.metrics),
+                service,
+                method,
+                request_body_len,
+                started_at,
+            )),
+            Err(error) => {
+                let status = error.into_status();
+                self.finish_streaming_status(
+                    &service,
+                    &method,
+                    request_body_len,
+                    started_at,
+                    status,
+                )
+            }
+        }
     }
 
     fn finish_response(
@@ -415,6 +555,160 @@ impl Server {
 
         response
     }
+
+    fn finish_streaming_response(
+        &self,
+        service: &str,
+        method: &str,
+        request_body_len: usize,
+        started_at: Instant,
+        response_body_len: usize,
+        code: Code,
+    ) {
+        finish_streaming_response(
+            self.metrics.as_ref(),
+            service,
+            method,
+            request_body_len,
+            started_at,
+            response_body_len,
+            code,
+        );
+    }
+
+    fn finish_streaming_status(
+        &self,
+        service: &str,
+        method: &str,
+        request_body_len: usize,
+        started_at: Instant,
+        status: Status,
+    ) -> BoxMessageStream<RpcStreamFrame> {
+        self.finish_streaming_response(
+            service,
+            method,
+            request_body_len,
+            started_at,
+            0,
+            status.code(),
+        );
+        status_stream(status)
+    }
+}
+
+fn status_stream(status: Status) -> BoxMessageStream<RpcStreamFrame> {
+    crate::stream::from_iter([RpcStreamFrame::status(status)])
+}
+
+struct ServerResponseStream {
+    inner: BoxMessageStream<Vec<u8>>,
+    metrics: Arc<dyn Metrics>,
+    service: String,
+    method: String,
+    request_body_len: usize,
+    response_body_len: usize,
+    started_at: Instant,
+    done: bool,
+}
+
+impl ServerResponseStream {
+    fn new(
+        inner: BoxMessageStream<Vec<u8>>,
+        metrics: Arc<dyn Metrics>,
+        service: String,
+        method: String,
+        request_body_len: usize,
+        started_at: Instant,
+    ) -> Self {
+        Self {
+            inner,
+            metrics,
+            service,
+            method,
+            request_body_len,
+            response_body_len: 0,
+            started_at,
+            done: false,
+        }
+    }
+
+    fn finish(&mut self, code: Code) {
+        self.done = true;
+        finish_streaming_response(
+            self.metrics.as_ref(),
+            &self.service,
+            &self.method,
+            self.request_body_len,
+            self.started_at,
+            self.response_body_len,
+            code,
+        );
+    }
+}
+
+#[crate::async_trait]
+impl MessageStream<RpcStreamFrame> for ServerResponseStream {
+    async fn next(&mut self) -> Option<Result<RpcStreamFrame>> {
+        if self.done {
+            return None;
+        }
+
+        match self.inner.next().await {
+            Some(Ok(body)) => {
+                self.response_body_len = self.response_body_len.saturating_add(body.len());
+                Some(Ok(RpcStreamFrame::message(body)))
+            }
+            Some(Err(error)) => {
+                let status = error.into_status();
+                self.finish(status.code());
+                Some(Ok(RpcStreamFrame::status(status)))
+            }
+            None => {
+                self.finish(Code::Ok);
+                Some(Ok(RpcStreamFrame::status(Status::ok())))
+            }
+        }
+    }
+}
+
+impl Drop for ServerResponseStream {
+    fn drop(&mut self) {
+        if !self.done {
+            self.finish(Code::Cancelled);
+        }
+    }
+}
+
+fn finish_streaming_response(
+    metrics: &dyn Metrics,
+    service: &str,
+    method: &str,
+    request_body_len: usize,
+    started_at: Instant,
+    response_body_len: usize,
+    code: Code,
+) {
+    let elapsed = started_at.elapsed();
+
+    metrics.rpc_finished(&RpcFinished {
+        service: service.to_owned(),
+        method: method.to_owned(),
+        request_body_len,
+        response_body_len,
+        code,
+        elapsed,
+    });
+
+    #[cfg(feature = "tracing")]
+    tracing::info!(
+        service = %service,
+        method = %method,
+        request_body_len,
+        response_body_len,
+        status = ?code,
+        elapsed_ms = elapsed.as_millis(),
+        "streaming rpc finished"
+    );
 }
 
 impl From<Error> for RpcResponse {
@@ -427,7 +721,7 @@ impl From<Error> for RpcResponse {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::{Code, RpcRequest};
+    use crate::{Code, RpcKind, RpcRequest, RpcStreamFrameKind};
 
     use super::{MetadataValueAuthorizer, Metrics, RpcFinished, Server};
 
@@ -538,5 +832,59 @@ mod tests {
             .await;
 
         assert_eq!(Code::from_u32(response.status), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn streaming_route_emits_messages_and_final_status() {
+        let metrics = TestMetrics::default();
+        let finished = Arc::clone(&metrics.finished);
+        let mut server = Server::new();
+        server.set_metrics(metrics);
+        server.route_streaming(
+            "example.Greeter",
+            "StreamHello",
+            RpcKind::ServerStreaming,
+            |body, _requests| async move {
+                assert_eq!(body, b"request".to_vec());
+                Ok(crate::stream::from_iter([b"one".to_vec(), b"two".to_vec()]))
+            },
+        );
+
+        let request = RpcRequest::new("example.Greeter", "StreamHello", b"request".to_vec())
+            .with_kind(RpcKind::ServerStreaming);
+        let mut response = server
+            .handle_streaming_request(request, crate::stream::empty())
+            .await;
+
+        let first = response
+            .next()
+            .await
+            .expect("stream should yield first frame")
+            .expect("first frame should be ok");
+        assert_eq!(first.frame_kind(), Some(RpcStreamFrameKind::Message));
+        assert_eq!(first.body, b"one".to_vec());
+
+        let second = response
+            .next()
+            .await
+            .expect("stream should yield second frame")
+            .expect("second frame should be ok");
+        assert_eq!(second.frame_kind(), Some(RpcStreamFrameKind::Message));
+        assert_eq!(second.body, b"two".to_vec());
+
+        let status = response
+            .next()
+            .await
+            .expect("stream should yield status frame")
+            .expect("status frame should be ok");
+        assert_eq!(status.frame_kind(), Some(RpcStreamFrameKind::Status));
+        assert_eq!(Code::from_u32(status.status), Code::Ok);
+        assert!(response.next().await.is_none());
+        assert_eq!(
+            *finished
+                .lock()
+                .expect("metrics lock should not be poisoned"),
+            vec![Code::Ok]
+        );
     }
 }

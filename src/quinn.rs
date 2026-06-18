@@ -1,13 +1,17 @@
 use std::future::{Future, pending};
+use std::io;
 use std::sync::Arc;
 
 use prost::Message;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client::RpcTransport;
 use crate::framing::{DEFAULT_MAX_FRAME_SIZE, decode_frame, encode_frame_with_max, frame_body_len};
-use crate::{Error, Result, RpcRequest, RpcResponse, Status};
+use crate::{
+    BoxMessageStream, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse,
+    RpcStreamFrame, RpcStreamFrameKind, Status,
+};
 
 const CANCELLED_STREAM_CODE: u32 = 1;
 
@@ -56,6 +60,24 @@ impl RpcTransport for QuinnTransport {
         streams.complete();
 
         Ok(response)
+    }
+
+    async fn streaming_call(
+        &self,
+        request: RpcRequest,
+        request_body: BoxMessageStream<Vec<u8>>,
+    ) -> Result<BoxMessageStream<RpcStreamFrame>> {
+        let (send, recv) = self.connection.open_bi().await.map_err(Error::transport)?;
+        let max_frame_size = self.max_frame_size;
+        let write_task = tokio::spawn(async move {
+            write_streaming_request(send, request, request_body, max_frame_size).await
+        });
+
+        Ok(Box::new(QuinnResponseStream::new(
+            recv,
+            write_task,
+            self.max_frame_size,
+        )))
     }
 }
 
@@ -107,6 +129,109 @@ impl Drop for CancellableBiStream {
     }
 }
 
+struct CancellableSendStream {
+    send: Option<quinn::SendStream>,
+    complete: bool,
+}
+
+impl CancellableSendStream {
+    fn new(send: quinn::SendStream) -> Self {
+        Self {
+            send: Some(send),
+            complete: false,
+        }
+    }
+
+    fn send_mut(&mut self) -> &mut quinn::SendStream {
+        self.send
+            .as_mut()
+            .expect("send stream should be present until completion")
+    }
+
+    fn complete(mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for CancellableSendStream {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+
+        if let Some(send) = &mut self.send {
+            let _ = send.reset(CANCELLED_STREAM_CODE.into());
+        }
+    }
+}
+
+struct QuinnResponseStream {
+    recv: Option<quinn::RecvStream>,
+    write_task: JoinHandle<Result<()>>,
+    max_frame_size: usize,
+    complete: bool,
+}
+
+impl QuinnResponseStream {
+    const fn new(
+        recv: quinn::RecvStream,
+        write_task: JoinHandle<Result<()>>,
+        max_frame_size: usize,
+    ) -> Self {
+        Self {
+            recv: Some(recv),
+            write_task,
+            max_frame_size,
+            complete: false,
+        }
+    }
+
+    fn recv_mut(&mut self) -> &mut quinn::RecvStream {
+        self.recv
+            .as_mut()
+            .expect("recv stream should be present until completion")
+    }
+}
+
+#[crate::async_trait]
+impl MessageStream<RpcStreamFrame> for QuinnResponseStream {
+    async fn next(&mut self) -> Option<Result<RpcStreamFrame>> {
+        if self.complete {
+            return None;
+        }
+
+        let max_frame_size = self.max_frame_size;
+        match read_frame_or_eof::<RpcStreamFrame>(self.recv_mut(), max_frame_size).await {
+            Ok(Some(frame)) => {
+                if frame.frame_kind() == Some(RpcStreamFrameKind::Status) {
+                    self.complete = true;
+                }
+                Some(Ok(frame))
+            }
+            Ok(None) => {
+                self.complete = true;
+                None
+            }
+            Err(error) => {
+                self.complete = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl Drop for QuinnResponseStream {
+    fn drop(&mut self) {
+        if !self.complete
+            && let Some(recv) = &mut self.recv
+        {
+            let _ = recv.stop(CANCELLED_STREAM_CODE.into());
+        }
+
+        self.write_task.abort();
+    }
+}
+
 pub async fn write_frame<M>(
     send: &mut quinn::SendStream,
     message: &M,
@@ -133,6 +258,83 @@ where
     recv.read_exact(&mut body).await.map_err(Error::transport)?;
 
     decode_frame(&body)
+}
+
+async fn read_frame_or_eof<M>(
+    recv: &mut quinn::RecvStream,
+    max_frame_size: usize,
+) -> Result<Option<M>>
+where
+    M: Message + Default,
+{
+    let mut header = [0; 4];
+    if !read_exact_or_eof(recv, &mut header).await? {
+        return Ok(None);
+    }
+
+    let len = frame_body_len(header, max_frame_size)?;
+    let mut body = vec![0; len];
+    read_exact_or_unexpected_eof(recv, &mut body).await?;
+
+    decode_frame(&body).map(Some)
+}
+
+async fn read_exact_or_eof(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<bool> {
+    let mut offset = 0;
+
+    while offset < buf.len() {
+        match recv
+            .read(&mut buf[offset..])
+            .await
+            .map_err(Error::transport)?
+        {
+            Some(0) => {}
+            Some(read) => offset += read,
+            None if offset == 0 => return Ok(false),
+            None => return Err(unexpected_eof()),
+        }
+    }
+
+    Ok(true)
+}
+
+async fn read_exact_or_unexpected_eof(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> {
+    if read_exact_or_eof(recv, buf).await? {
+        Ok(())
+    } else {
+        Err(unexpected_eof())
+    }
+}
+
+fn unexpected_eof() -> Error {
+    Error::transport(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "stream ended in the middle of a frame",
+    ))
+}
+
+async fn write_streaming_request(
+    send: quinn::SendStream,
+    request: RpcRequest,
+    mut request_body: BoxMessageStream<Vec<u8>>,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut send = CancellableSendStream::new(send);
+    write_frame(send.send_mut(), &request, max_frame_size).await?;
+
+    while let Some(body) = request_body.next().await.transpose()? {
+        write_frame(
+            send.send_mut(),
+            &RpcStreamFrame::message(body),
+            max_frame_size,
+        )
+        .await?;
+    }
+
+    send.send_mut().finish().map_err(Error::transport)?;
+    send.complete();
+
+    Ok(())
 }
 
 impl crate::server::Server {
@@ -288,20 +490,33 @@ async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) {
-    let response = match read_frame::<RpcRequest>(&mut recv, server.max_frame_size()).await {
-        Ok(request) => {
-            tokio::select! {
-                biased;
-                response = server.handle_request(request) => response,
-                stopped = send.stopped() => {
-                    let _ = &stopped;
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("client stopped response stream before RPC completed");
-                    return;
-                }
-            }
+    let request = match read_frame::<RpcRequest>(&mut recv, server.max_frame_size()).await {
+        Ok(request) => request,
+        Err(error) => {
+            write_status(
+                send,
+                Status::internal(error.to_string()),
+                server.max_frame_size(),
+            )
+            .await;
+            return;
         }
-        Err(error) => Status::internal(error.to_string()).into_response(Vec::new()),
+    };
+
+    if request.rpc_kind() != RpcKind::Unary {
+        handle_streaming_rpc(server, send, recv, request).await;
+        return;
+    }
+
+    let response = tokio::select! {
+        biased;
+        response = server.handle_request(request) => response,
+        stopped = send.stopped() => {
+            let _ = &stopped;
+            #[cfg(feature = "tracing")]
+            tracing::debug!("client stopped response stream before RPC completed");
+            return;
+        }
     };
 
     if write_frame(&mut send, &response, server.max_frame_size())
@@ -309,6 +524,107 @@ async fn handle_stream(
         .is_ok()
     {
         let _ = send.finish();
+    }
+}
+
+async fn handle_streaming_rpc(
+    server: crate::server::Server,
+    mut send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    request: RpcRequest,
+) {
+    let max_frame_size = server.max_frame_size();
+    let request_body = Box::new(QuinnRequestStream::new(recv, max_frame_size));
+    let mut response = server.handle_streaming_request(request, request_body).await;
+
+    loop {
+        let frame = tokio::select! {
+            biased;
+            frame = response.next() => frame,
+            stopped = send.stopped() => {
+                let _ = &stopped;
+                #[cfg(feature = "tracing")]
+                tracing::debug!("client stopped response stream before streaming RPC completed");
+                return;
+            }
+        };
+
+        let Some(frame) = frame else {
+            break;
+        };
+
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => RpcStreamFrame::status(error.into_status()),
+        };
+        let is_status = frame.frame_kind() == Some(RpcStreamFrameKind::Status);
+
+        if write_frame(&mut send, &frame, max_frame_size)
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        if is_status {
+            break;
+        }
+    }
+
+    let _ = send.finish();
+}
+
+struct QuinnRequestStream {
+    recv: quinn::RecvStream,
+    max_frame_size: usize,
+    done: bool,
+}
+
+impl QuinnRequestStream {
+    const fn new(recv: quinn::RecvStream, max_frame_size: usize) -> Self {
+        Self {
+            recv,
+            max_frame_size,
+            done: false,
+        }
+    }
+}
+
+#[crate::async_trait]
+impl MessageStream<Vec<u8>> for QuinnRequestStream {
+    async fn next(&mut self) -> Option<Result<Vec<u8>>> {
+        if self.done {
+            return None;
+        }
+
+        match read_frame_or_eof::<RpcStreamFrame>(&mut self.recv, self.max_frame_size).await {
+            Ok(Some(frame)) => match frame.frame_kind() {
+                Some(RpcStreamFrameKind::Message) => Some(Ok(frame.body)),
+                Some(RpcStreamFrameKind::Status) => {
+                    self.done = true;
+                    let status = frame.status_value();
+                    if status.is_ok() {
+                        None
+                    } else {
+                        Some(Err(Error::from(status)))
+                    }
+                }
+                None => {
+                    self.done = true;
+                    Some(Err(Error::from(Status::internal(
+                        "request stream contained an unknown frame kind",
+                    ))))
+                }
+            },
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(error) => {
+                self.done = true;
+                Some(Err(error))
+            }
+        }
     }
 }
 
