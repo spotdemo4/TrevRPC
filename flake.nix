@@ -45,6 +45,9 @@
               gotools
               protobuf
 
+              # javascript
+              nodejs
+
               # lint
               clippy
               cargo-audit

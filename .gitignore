@@ -17,3 +17,6 @@
 
 # go
 /trevrpc-go/bin/
+
+# javascript
+/trevrpc-js/node_modules/
