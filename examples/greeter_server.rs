@@ -11,6 +11,7 @@ use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer
 mod greeter;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5000";
+const AUTH_TOKEN: &str = "local-example-token";
 
 struct GreeterService;
 
@@ -42,6 +43,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .with_max_concurrent_streams_per_connection(Some(64))
             .with_max_concurrent_requests(Some(1024)),
     );
+    server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     greeter::register_greeter(&mut server, GreeterService);
 
     println!(

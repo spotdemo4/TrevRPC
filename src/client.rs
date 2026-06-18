@@ -1,13 +1,14 @@
 use std::time::Duration;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
-use crate::{Error, Result, RpcRequest, RpcResponse, Status};
+use crate::{Error, Metadata, Result, RpcRequest, RpcResponse, Status};
 use prost::Message;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {
     timeout: Option<Duration>,
     max_response_body_size: usize,
+    metadata: Metadata,
 }
 
 impl Default for CallOptions {
@@ -15,6 +16,7 @@ impl Default for CallOptions {
         Self {
             timeout: None,
             max_response_body_size: DEFAULT_MAX_FRAME_SIZE,
+            metadata: Metadata::new(),
         }
     }
 }
@@ -36,6 +38,11 @@ impl CallOptions {
     }
 
     #[must_use]
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -50,6 +57,18 @@ impl CallOptions {
     #[must_use]
     pub const fn with_max_response_body_size(mut self, max_response_body_size: usize) -> Self {
         self.max_response_body_size = max_response_body_size;
+        self
+    }
+
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_metadata_map(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
         self
     }
 }
@@ -71,8 +90,13 @@ where
     Req: Message,
     Res: Message + Default,
 {
-    let request = RpcRequest::new(service, method, request.encode_to_vec());
-    let response = if let Some(timeout) = options.timeout {
+    let CallOptions {
+        timeout,
+        max_response_body_size,
+        metadata,
+    } = options;
+    let request = RpcRequest::new(service, method, request.encode_to_vec()).with_metadata(metadata);
+    let response = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, transport.call(request))
             .await
             .map_err(|_| Error::from(Status::deadline_exceeded("RPC deadline exceeded")))??
@@ -80,10 +104,10 @@ where
         transport.call(request).await?
     };
 
-    if response.body.len() > options.max_response_body_size {
+    if response.body.len() > max_response_body_size {
         return Err(Error::FrameTooLarge {
             len: response.body.len(),
-            max: options.max_response_body_size,
+            max: max_response_body_size,
         });
     }
 

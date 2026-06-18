@@ -20,4 +20,4 @@ pub mod server;
 pub use async_trait::async_trait;
 pub use error::{Error, Result};
 pub use status::{Code, Status};
-pub use wire::{RpcRequest, RpcResponse};
+pub use wire::{Metadata, RpcRequest, RpcResponse};

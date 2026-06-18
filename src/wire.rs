@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+
+pub type Metadata = HashMap<String, Vec<u8>>;
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct RpcRequest {
     #[prost(string, tag = "1")]
@@ -6,6 +10,8 @@ pub struct RpcRequest {
     pub method: String,
     #[prost(bytes = "vec", tag = "3")]
     pub body: Vec<u8>,
+    #[prost(map = "string, bytes", tag = "4")]
+    pub metadata: Metadata,
 }
 
 impl RpcRequest {
@@ -15,7 +21,14 @@ impl RpcRequest {
             service: service.into(),
             method: method.into(),
             body,
+            metadata: Metadata::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 
@@ -27,6 +40,8 @@ pub struct RpcResponse {
     pub message: String,
     #[prost(bytes = "vec", tag = "3")]
     pub body: Vec<u8>,
+    #[prost(map = "string, bytes", tag = "4")]
+    pub metadata: Metadata,
 }
 
 impl RpcResponse {

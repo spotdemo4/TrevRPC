@@ -27,12 +27,14 @@ default = ["client", "server", "quinn"]
 client = ["dep:tokio"]
 server = []
 quinn = ["client", "server", "dep:quinn", "dep:tokio"]
+tracing = ["dep:tracing"]
 
 [dependencies]
 async-trait = "0.1.89"
-prost = "0.13.5"
+prost = "0.14.4"
 quinn = { version = "0.11.8", optional = true }
-tokio = { version = "1.48.0", features = ["rt", "sync", "time"], optional = true }
+tokio = { version = "1.48.0", features = ["macros", "rt", "sync", "time"], optional = true }
+tracing = { version = "0.1.44", optional = true }
 
 [dev-dependencies]
 rcgen = "0.14"

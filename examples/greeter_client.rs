@@ -13,6 +13,7 @@ mod greeter;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5000";
 const DEFAULT_NAME: &str = "TrevRPC";
+const AUTH_TOKEN: &str = "local-example-token";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -31,7 +32,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let reply = client
         .say_hello(
             greeter::HelloRequest { name },
-            trevrpc::client::CallOptions::new().with_timeout(Duration::from_secs(5)),
+            trevrpc::client::CallOptions::new()
+                .with_timeout(Duration::from_secs(5))
+                .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes()),
         )
         .await?;
     println!("{}", reply.message);

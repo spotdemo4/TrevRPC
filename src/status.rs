@@ -122,6 +122,11 @@ impl Status {
     }
 
     #[must_use]
+    pub fn unauthenticated(message: impl Into<String>) -> Self {
+        Self::new(Code::Unauthenticated, message)
+    }
+
+    #[must_use]
     pub fn unimplemented(message: impl Into<String>) -> Self {
         Self::new(Code::Unimplemented, message)
     }
@@ -143,10 +148,20 @@ impl Status {
 
     #[must_use]
     pub fn into_response(self, body: Vec<u8>) -> RpcResponse {
+        self.into_response_with_metadata(body, crate::Metadata::new())
+    }
+
+    #[must_use]
+    pub fn into_response_with_metadata(
+        self,
+        body: Vec<u8>,
+        metadata: crate::Metadata,
+    ) -> RpcResponse {
         RpcResponse {
             status: self.code.as_u32(),
             message: self.message,
             body,
+            metadata,
         }
     }
 

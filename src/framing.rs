@@ -79,5 +79,6 @@ mod tests {
         assert_eq!(decoded.service, request.service);
         assert_eq!(decoded.method, request.method);
         assert_eq!(decoded.body, request.body);
+        assert_eq!(decoded.metadata, request.metadata);
     }
 }

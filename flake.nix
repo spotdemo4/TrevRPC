@@ -107,7 +107,10 @@
                   ./Cargo.toml
                   ./LICENSE
                   ./README.md
-                  (fileset.fileFilter (file: file.hasExt "rs" || file.name == "Cargo.toml") ./.)
+                  (fileset.fileFilter (
+                    file:
+                    file.hasExt "rs" || file.hasExt "proto" || file.name == "buf.gen.yaml" || file.name == "Cargo.toml"
+                  ) ./.)
                 ];
               };
               cargoLock.lockFile = ./Cargo.lock;

@@ -95,8 +95,29 @@ The examples also show the production-facing defaults:
 
 - QUIC TLS ALPN is set to `trevrpc::ALPN` (`trevrpc/1`).
 - Client calls use `trevrpc::client::CallOptions` for deadlines.
+- Client calls attach request metadata through `CallOptions::with_metadata`.
+- The server enforces metadata auth with `trevrpc::server::MetadataValueAuthorizer`.
 - Server calls use `trevrpc::server::ServerOptions` for connection and RPC concurrency limits.
-- The server uses `serve_quinn_with_shutdown` to stop accepting new work on Ctrl+C.
+- The server uses `serve_quinn_with_shutdown` to stop accepting new work on Ctrl+C and drain active streams.
+
+## production hooks
+
+Authentication can be enforced in two places:
+
+- Transport identity belongs in Quinn/rustls. Configure Quinn's TLS client/server configs for real
+  certificates or mTLS before constructing the endpoint.
+- Request-level authorization belongs in TrevRPC metadata. Implement `trevrpc::server::Authorizer`
+  or use `MetadataValueAuthorizer` for simple fixed metadata checks.
+
+Observability hooks are intentionally small:
+
+- Enable the `tracing` feature for structured RPC lifecycle events.
+- Install custom `trevrpc::server::Metrics` to collect RPC start/finish events, status codes,
+  latency, and body sizes.
+
+The plugin has an integration test that compiles a real `.proto` fixture and exercises the
+Buf/protoc plugin protocol. The fixture includes a `buf.gen.yaml` example for the generated service
+path.
 
 ### build
 
