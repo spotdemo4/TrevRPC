@@ -30,7 +30,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "protobufjs": "^7.4.0"
+    "protobufjs": "^7.6.4"
   },
   "devDependencies": {
     "typescript": "^6.0.3"
