@@ -95,6 +95,8 @@
           vulnerable = pkgs.mkShell {
             packages = with pkgs; [
               cargo-audit # rust
+              go
+              govulncheck # go
               nodejs_24 # javascript
               flake-checker # nix
               zizmor # actions
