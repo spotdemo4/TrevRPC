@@ -2,7 +2,9 @@ use std::error::Error;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::pki_types::CertificateDer;
 
 #[allow(dead_code)]
@@ -26,7 +28,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let transport = trevrpc::quinn::QuinnTransport::new(connection);
     let client = greeter::GreeterClient::new(transport);
 
-    let reply = client.say_hello(greeter::HelloRequest { name }).await?;
+    let reply = client
+        .say_hello_with_options(
+            greeter::HelloRequest { name },
+            trevrpc::client::CallOptions::new().with_timeout(Duration::from_secs(5)),
+        )
+        .await?;
     println!("{}", reply.message);
 
     endpoint.wait_idle().await;
@@ -39,10 +46,15 @@ fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync
     let mut roots = quinn::rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(cert_der))?;
 
+    let mut client_crypto = quinn::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
-    endpoint.set_default_client_config(quinn::ClientConfig::with_root_certificates(Arc::new(
-        roots,
-    ))?);
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(client_crypto)?,
+    )));
 
     Ok(endpoint)
 }

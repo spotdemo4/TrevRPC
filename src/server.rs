@@ -27,14 +27,93 @@ impl MethodKey {
 #[derive(Clone)]
 pub struct Server {
     routes: Arc<HashMap<MethodKey, Handler>>,
-    max_frame_size: usize,
+    options: ServerOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerOptions {
+    frame_size: usize,
+    connections: Option<usize>,
+    streams_per_connection: Option<usize>,
+    requests: Option<usize>,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            frame_size: DEFAULT_MAX_FRAME_SIZE,
+            connections: Some(1024),
+            streams_per_connection: Some(128),
+            requests: Some(4096),
+        }
+    }
+}
+
+impl ServerOptions {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub const fn max_frame_size(&self) -> usize {
+        self.frame_size
+    }
+
+    #[must_use]
+    pub const fn max_concurrent_connections(&self) -> Option<usize> {
+        self.connections
+    }
+
+    #[must_use]
+    pub const fn max_concurrent_streams_per_connection(&self) -> Option<usize> {
+        self.streams_per_connection
+    }
+
+    #[must_use]
+    pub const fn max_concurrent_requests(&self) -> Option<usize> {
+        self.requests
+    }
+
+    #[must_use]
+    pub const fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
+        self.frame_size = max_frame_size;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_concurrent_connections(
+        mut self,
+        max_concurrent_connections: Option<usize>,
+    ) -> Self {
+        self.connections = max_concurrent_connections;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_concurrent_streams_per_connection(
+        mut self,
+        max_concurrent_streams_per_connection: Option<usize>,
+    ) -> Self {
+        self.streams_per_connection = max_concurrent_streams_per_connection;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_concurrent_requests(
+        mut self,
+        max_concurrent_requests: Option<usize>,
+    ) -> Self {
+        self.requests = max_concurrent_requests;
+        self
+    }
 }
 
 impl Default for Server {
     fn default() -> Self {
         Self {
             routes: Arc::new(HashMap::new()),
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            options: ServerOptions::default(),
         }
     }
 }
@@ -47,11 +126,45 @@ impl Server {
 
     #[must_use]
     pub const fn max_frame_size(&self) -> usize {
-        self.max_frame_size
+        self.options.frame_size
+    }
+
+    #[must_use]
+    pub const fn options(&self) -> &ServerOptions {
+        &self.options
+    }
+
+    pub fn set_options(&mut self, options: ServerOptions) -> &mut Self {
+        self.options = options;
+        self
     }
 
     pub fn set_max_frame_size(&mut self, max_frame_size: usize) -> &mut Self {
-        self.max_frame_size = max_frame_size;
+        self.options.frame_size = max_frame_size;
+        self
+    }
+
+    pub fn set_max_concurrent_connections(
+        &mut self,
+        max_concurrent_connections: Option<usize>,
+    ) -> &mut Self {
+        self.options.connections = max_concurrent_connections;
+        self
+    }
+
+    pub fn set_max_concurrent_streams_per_connection(
+        &mut self,
+        max_concurrent_streams_per_connection: Option<usize>,
+    ) -> &mut Self {
+        self.options.streams_per_connection = max_concurrent_streams_per_connection;
+        self
+    }
+
+    pub fn set_max_concurrent_requests(
+        &mut self,
+        max_concurrent_requests: Option<usize>,
+    ) -> &mut Self {
+        self.options.requests = max_concurrent_requests;
         self
     }
 

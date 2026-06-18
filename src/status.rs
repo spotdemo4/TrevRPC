@@ -107,6 +107,11 @@ impl Status {
     }
 
     #[must_use]
+    pub fn deadline_exceeded(message: impl Into<String>) -> Self {
+        Self::new(Code::DeadlineExceeded, message)
+    }
+
+    #[must_use]
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(Code::NotFound, message)
     }

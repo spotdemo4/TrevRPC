@@ -40,6 +40,24 @@ impl<T> GreeterClient<T> {
     {
         trevrpc::client::unary(&self.transport, Self::SERVICE, "SayHello", &request).await
     }
+
+    pub async fn say_hello_with_options(
+        &self,
+        request: HelloRequest,
+        options: trevrpc::client::CallOptions,
+    ) -> trevrpc::Result<HelloReply>
+    where
+        T: trevrpc::client::RpcTransport,
+    {
+        trevrpc::client::unary_with_options(
+            &self.transport,
+            Self::SERVICE,
+            "SayHello",
+            &request,
+            options,
+        )
+        .await
+    }
 }
 
 pub fn register_greeter<S>(server: &mut trevrpc::server::Server, service: S)

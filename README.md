@@ -91,6 +91,13 @@ cargo run --example greeter_client -- TrevRPC
 The server writes a local self-signed certificate to `target/trevrpc-example-cert.der`; the client
 reads that certificate before connecting. Override the path with `TREVRPC_EXAMPLE_CERT`.
 
+The examples also show the production-facing defaults:
+
+- QUIC TLS ALPN is set to `trevrpc::ALPN` (`trevrpc/1`).
+- Client calls use `trevrpc::client::CallOptions` for deadlines.
+- Server calls use `trevrpc::server::ServerOptions` for connection and RPC concurrency limits.
+- The server uses `serve_quinn_with_shutdown` to stop accepting new work on Ctrl+C.
+
 ### build
 
 ```sh

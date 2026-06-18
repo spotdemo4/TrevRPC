@@ -6,6 +6,8 @@ pub mod framing;
 pub mod status;
 pub mod wire;
 
+pub const ALPN: &[u8] = b"trevrpc/1";
+
 #[cfg(feature = "client")]
 pub mod client;
 

@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use quinn::crypto::rustls::QuicServerConfig;
+use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 #[allow(dead_code)]
 #[path = "shared/greeter.rs"]
@@ -35,6 +36,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     write_certificate(&cert_der)?;
 
     let mut server = trevrpc::server::Server::new();
+    server.set_options(
+        trevrpc::server::ServerOptions::new()
+            .with_max_concurrent_connections(Some(512))
+            .with_max_concurrent_streams_per_connection(Some(64))
+            .with_max_concurrent_requests(Some(1024)),
+    );
     greeter::register_greeter(&mut server, GreeterService);
 
     println!(
@@ -42,8 +49,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         endpoint.local_addr()?
     );
     println!("certificate written to {}", certificate_path().display());
+    println!("press Ctrl+C to shut down");
 
-    server.serve_quinn(endpoint).await?;
+    server
+        .serve_quinn_with_shutdown(endpoint, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
 
     Ok(())
 }
@@ -55,10 +67,13 @@ fn make_server_endpoint(
     let cert_der = CertificateDer::from(cert.cert);
     let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
 
-    let mut server_config = quinn::ServerConfig::with_single_cert(
-        vec![cert_der.clone()],
-        quinn::rustls::pki_types::PrivateKeyDer::from(key_der),
-    )?;
+    let mut server_crypto = quinn::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
+    server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     let transport_config = Arc::get_mut(&mut server_config.transport)
         .expect("server config should have one transport reference");
     transport_config.max_concurrent_uni_streams(0_u8.into());
