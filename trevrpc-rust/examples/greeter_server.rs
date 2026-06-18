@@ -95,8 +95,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or_else(|| DEFAULT_QUIC_ADDR.to_owned())
         .parse::<SocketAddr>()?;
 
-    let identity =
-        rcgen::generate_simple_self_signed(["localhost".to_owned(), "127.0.0.1".to_owned()])?;
+    let identity = make_identity()?;
     let certificate_path = cert::certificate_path()?;
     write_certificate(&identity, &certificate_path)?;
 
@@ -129,6 +128,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
 
     Ok(())
+}
+
+fn make_identity() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, Box<dyn Error + Send + Sync>> {
+    let signing_key = rcgen::KeyPair::generate()?;
+    let not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let mut params =
+        rcgen::CertificateParams::new(["localhost".to_owned(), "127.0.0.1".to_owned()])?;
+    params.not_before = not_before;
+    params.not_after = not_before + time::Duration::hours(25);
+    let cert = params.self_signed(&signing_key)?;
+
+    Ok(rcgen::CertifiedKey { cert, signing_key })
 }
 
 fn make_endpoint(

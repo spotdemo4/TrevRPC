@@ -61,4 +61,4 @@ For a temporary self-signed WebTransport certificate, enter the SHA-256 digest o
 openssl x509 -in server.pem -outform der | openssl dgst -sha256 -binary | openssl base64
 ```
 
-Browsers enforce WebTransport certificate rules. If a self-signed certificate is rejected even with a hash, use a browser-compatible WebTransport development certificate or trust the certificate through the OS/browser trust store.
+Browsers enforce WebTransport certificate rules. Certificate hashes only work for short-lived self-signed certificates, so restart the example server if the generated certificate is stale. If a self-signed certificate is still rejected even with a hash, use a browser-compatible WebTransport development certificate or trust the certificate through the OS/browser trust store.
