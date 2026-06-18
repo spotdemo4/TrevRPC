@@ -209,6 +209,7 @@
               checkPhase = ''
                 oxfmt --check
                 oxlint --deny-warnings
+                npm run typecheck
                 npm test
               '';
 

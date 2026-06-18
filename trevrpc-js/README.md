@@ -37,3 +37,13 @@ plugins:
 ```
 
 Generated files embed a protobuf.js reflection root for the request and response messages used by the service clients, so they can encode plain JavaScript objects directly.
+
+The generator also emits a companion `.d.ts` file for each generated `.js` file. TypeScript projects can import the same generated JavaScript module and get typed service clients:
+
+```ts
+import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
+import type { HelloRequest } from "./hello/v1/greeter.trevrpc.js";
+
+const request: HelloRequest = { name: "Trev" };
+const reply = await client.sayHello(request);
+```
