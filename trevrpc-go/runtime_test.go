@@ -145,6 +145,12 @@ func TestWireProtocolValidation(t *testing.T) {
 		t.Fatalf("expected failed precondition, got %v", status)
 	}
 
+	request.Version = WireVersion
+	request.Kind = RpcKind(99)
+	if status := StatusFromError(request.ValidateProtocol()); status.Code != CodeInvalidArgument {
+		t.Fatalf("expected invalid argument for unknown RPC kind, got %v", status)
+	}
+
 	frame := StatusFrame(Unavailable("retry later"))
 	if kind, ok := frame.FrameKind(); !ok || kind != RpcStreamFrameKindStatus {
 		t.Fatalf("expected status frame kind, got %d %t", kind, ok)
@@ -293,6 +299,17 @@ func TestServerRejectsUnsupportedWireVersionBeforeRouteLookup(t *testing.T) {
 	}
 }
 
+func TestServerRejectsUnsupportedRpcKindBeforeRouteLookup(t *testing.T) {
+	server := NewServer()
+	request := NewRpcRequest("example.Greeter", "Missing", nil)
+	request.Kind = RpcKind(99)
+
+	response := server.HandleRequest(context.Background(), request)
+	if CodeFromUint32(response.Status) != CodeInvalidArgument {
+		t.Fatalf("expected invalid argument, got %#v", response)
+	}
+}
+
 func TestServerRejectsExpiredDeadlineBeforeRouteLookup(t *testing.T) {
 	server := NewServer()
 	request := NewRpcRequest("example.Greeter", "Missing", nil)
@@ -315,6 +332,31 @@ func TestServerUnaryDeadlineCancelsSlowHandler(t *testing.T) {
 	response := server.HandleRequest(context.Background(), request)
 	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got %#v", response)
+	}
+}
+
+func TestServerUnaryHandlerPanicReturnsInternal(t *testing.T) {
+	server := NewServer()
+	server.Route("example.Greeter", "Panic", func(context.Context, []byte) ([]byte, error) {
+		panic("boom")
+	})
+
+	response := server.HandleRequest(context.Background(), NewRpcRequest("example.Greeter", "Panic", nil))
+	if CodeFromUint32(response.Status) != CodeInternal {
+		t.Fatalf("expected internal status, got %#v", response)
+	}
+}
+
+func TestServerMetricsPanicDoesNotFailRequest(t *testing.T) {
+	server := NewServer()
+	server.SetMetrics(panickingMetrics{})
+	server.Route("example.Greeter", "SayHello", func(context.Context, []byte) ([]byte, error) {
+		return nil, nil
+	})
+
+	response := server.HandleRequest(context.Background(), NewRpcRequest("example.Greeter", "SayHello", nil))
+	if CodeFromUint32(response.Status) != CodeOK {
+		t.Fatalf("expected ok status, got %#v", response)
 	}
 }
 
@@ -499,6 +541,16 @@ func (pendingFrameStream) Recv() (*RpcStreamFrame, error) {
 type recordingMetrics struct {
 	mu    sync.Mutex
 	codes []Code
+}
+
+type panickingMetrics struct{}
+
+func (panickingMetrics) RPCStarted(RPCStarted) {
+	panic("started")
+}
+
+func (panickingMetrics) RPCFinished(RPCFinished) {
+	panic("finished")
 }
 
 func (m *recordingMetrics) RPCStarted(RPCStarted) {}
@@ -1011,6 +1063,9 @@ func startTestWebTransportServer(t *testing.T, configure func(*Server)) *running
 	configure(server)
 	options := server.Options()
 	options.EnableWebTransport = true
+	if options.WebTransportCheckOrigin == nil {
+		options.WebTransportCheckOrigin = func(*http.Request) bool { return true }
+	}
 	server.SetOptions(options)
 
 	ctx, cancel := context.WithCancel(context.Background())

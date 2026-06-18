@@ -245,6 +245,11 @@ func HandleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 }
 
 func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, requestLimit semaphore, closeOnShutdown bool) {
+	if conn.ConnectionState().TLS.NegotiatedProtocol != ALPN {
+		conn.CloseWithError(0, "unsupported ALPN")
+		return
+	}
+
 	streamLimit := newSemaphore(server.options.MaxConcurrentStreamsPerConnection)
 	var streamTasks sync.WaitGroup
 
@@ -293,8 +298,8 @@ type rpcStream interface {
 
 func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	request := &RpcRequest{}
-	if err := ReadFrame(stream, request, server.options.MaxFrameSize); err != nil {
-		_ = WriteFrame(stream, Internal(err.Error()).IntoResponse(nil), server.options.MaxFrameSize)
+	if err := readInitialRequestFrame(ctx, server, stream, request); err != nil {
+		_ = WriteFrame(stream, StatusFromError(err).IntoResponse(nil), server.options.MaxFrameSize)
 		_ = stream.Close()
 		return
 	}
@@ -392,8 +397,35 @@ func waitForWaitGroup(group *sync.WaitGroup, timeout time.Duration, onTimeout fu
 	case <-done:
 	case <-timer.C:
 		onTimeout()
-		<-done
 	}
+}
+
+type readDeadlineStream interface {
+	SetReadDeadline(time.Time) error
+}
+
+func readInitialRequestFrame(ctx context.Context, server *Server, stream rpcStream, request *RpcRequest) error {
+	if deadline, ok := readDeadline(ctx, server.options.InitialRequestTimeout); ok {
+		if deadlineStream, ok := stream.(readDeadlineStream); ok {
+			_ = deadlineStream.SetReadDeadline(deadline)
+			defer deadlineStream.SetReadDeadline(time.Time{})
+		}
+	}
+
+	return ReadFrame(stream, request, server.options.MaxFrameSize)
+}
+
+func readDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) {
+	deadline, ok := ctx.Deadline()
+	if timeout > 0 {
+		requestDeadline := time.Now().Add(timeout)
+		if !ok || requestDeadline.Before(deadline) {
+			deadline = requestDeadline
+			ok = true
+		}
+	}
+
+	return deadline, ok
 }
 
 func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {

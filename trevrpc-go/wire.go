@@ -65,16 +65,28 @@ func (m *RpcRequest) ValidateProtocol() error {
 		return FailedPrecondition(fmt.Sprintf("unsupported TrevRPC wire version %d; expected %d", m.Version, WireVersion))
 	}
 
+	if !m.Kind.IsValid() {
+		return InvalidArgument(fmt.Sprintf("unsupported TrevRPC RPC kind %d", m.Kind))
+	}
+
 	return nil
 }
 
-func (m *RpcRequest) RPCKind() RpcKind {
-	switch m.Kind {
+func (k RpcKind) IsValid() bool {
+	switch k {
 	case RpcKindUnary, RpcKindClientStreaming, RpcKindServerStreaming, RpcKindBidirectionalStreaming:
-		return m.Kind
+		return true
 	default:
-		return RpcKindUnary
+		return false
 	}
+}
+
+func (m *RpcRequest) RPCKind() RpcKind {
+	if m.Kind.IsValid() {
+		return m.Kind
+	}
+
+	return RpcKindUnary
 }
 
 type RpcResponse struct {

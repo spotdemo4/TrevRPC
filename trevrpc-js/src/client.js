@@ -3,6 +3,7 @@ import { normalizeMetadata, validateMetadata } from "./metadata.js";
 import {
   Code,
   FrameTooLargeError,
+  cancelled,
   deadlineExceeded,
   internal,
   invalidArgument,
@@ -18,9 +19,10 @@ export function defaultCallOptions() {
     timeoutMs: undefined,
     maxResponseBodySize: DefaultMaxFrameSize,
     maxResponseMessages: 4096,
-    maxResponseStreamBodySize: 64 * 1024 * 1024,
+    maxResponseStreamBodySize: 16 * 1024 * 1024,
     streamIdleTimeoutMs: 30_000,
     metadata: {},
+    signal: undefined,
   };
 }
 
@@ -45,16 +47,29 @@ export async function unary(
   options = {},
 ) {
   const callOptions = mergeCallOptions(options);
+  const abortScope = callAbortScope(callOptions);
   const requestBody = marshalMessage(requestType, request);
-  const rpcRequest = prepareClientRequest(service, method, RpcKind.Unary, requestBody, callOptions);
-  const response = await withTimeout(
-    transport.call(rpcRequest, callOptions),
-    callOptions.timeoutMs,
-    () => deadlineExceeded("RPC deadline exceeded"),
+  const rpcRequest = prepareClientRequest(
+    service,
+    method,
+    RpcKind.Unary,
+    requestBody,
+    abortScope.options,
   );
 
-  validateResponse(response, callOptions.maxResponseBodySize);
-  return unmarshalMessage(responseType, response.body ?? new Uint8Array(0));
+  try {
+    const response = await withTimeout(
+      transport.call(rpcRequest, abortScope.options),
+      callOptions.timeoutMs,
+      () => deadlineExceeded("RPC deadline exceeded"),
+      abortScope.abort,
+    );
+
+    validateResponse(response, callOptions.maxResponseBodySize);
+    return unmarshalMessage(responseType, response.body ?? new Uint8Array(0));
+  } finally {
+    abortScope.cleanup();
+  }
 }
 
 export async function serverStreaming(
@@ -67,22 +82,30 @@ export async function serverStreaming(
   options = {},
 ) {
   const callOptions = mergeCallOptions(options);
+  const abortScope = callAbortScope(callOptions);
   const requestBody = marshalMessage(requestType, request);
   const rpcRequest = prepareClientRequest(
     service,
     method,
     RpcKind.ServerStreaming,
     requestBody,
-    callOptions,
+    abortScope.options,
   );
   const deadlineAt = localDeadline(callOptions.timeoutMs);
-  const frames = await withTimeout(
-    transport.streamingCall(rpcRequest, emptyAsyncIterable(), callOptions),
-    callOptions.timeoutMs,
-    () => deadlineExceeded("RPC deadline exceeded"),
-  );
+  let frames;
+  try {
+    frames = await withTimeout(
+      transport.streamingCall(rpcRequest, emptyAsyncIterable(), abortScope.options),
+      callOptions.timeoutMs,
+      () => deadlineExceeded("RPC deadline exceeded"),
+      abortScope.abort,
+    );
+  } catch (error) {
+    abortScope.cleanup();
+    throw error;
+  }
 
-  return responseMessageStream(frames, responseType, callOptions, deadlineAt);
+  return responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope);
 }
 
 export async function clientStreaming(
@@ -95,22 +118,34 @@ export async function clientStreaming(
   options = {},
 ) {
   const callOptions = mergeCallOptions(options);
+  const abortScope = callAbortScope(callOptions);
   const rpcRequest = prepareClientRequest(
     service,
     method,
     RpcKind.ClientStreaming,
     new Uint8Array(0),
-    callOptions,
+    abortScope.options,
   );
   const deadlineAt = localDeadline(callOptions.timeoutMs);
-  const frames = await withTimeout(
-    transport.streamingCall(rpcRequest, encodeRequestStream(requestType, requests), callOptions),
-    callOptions.timeoutMs,
-    () => deadlineExceeded("RPC deadline exceeded"),
-  );
+  let frames;
+  try {
+    frames = await withTimeout(
+      transport.streamingCall(
+        rpcRequest,
+        encodeRequestStream(requestType, requests),
+        abortScope.options,
+      ),
+      callOptions.timeoutMs,
+      () => deadlineExceeded("RPC deadline exceeded"),
+      abortScope.abort,
+    );
+  } catch (error) {
+    abortScope.cleanup();
+    throw error;
+  }
 
   return readUnaryResponseFromStream(
-    responseMessageStream(frames, responseType, callOptions, deadlineAt),
+    responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope),
   );
 }
 
@@ -124,21 +159,33 @@ export async function bidirectionalStreaming(
   options = {},
 ) {
   const callOptions = mergeCallOptions(options);
+  const abortScope = callAbortScope(callOptions);
   const rpcRequest = prepareClientRequest(
     service,
     method,
     RpcKind.BidirectionalStreaming,
     new Uint8Array(0),
-    callOptions,
+    abortScope.options,
   );
   const deadlineAt = localDeadline(callOptions.timeoutMs);
-  const frames = await withTimeout(
-    transport.streamingCall(rpcRequest, encodeRequestStream(requestType, requests), callOptions),
-    callOptions.timeoutMs,
-    () => deadlineExceeded("RPC deadline exceeded"),
-  );
+  let frames;
+  try {
+    frames = await withTimeout(
+      transport.streamingCall(
+        rpcRequest,
+        encodeRequestStream(requestType, requests),
+        abortScope.options,
+      ),
+      callOptions.timeoutMs,
+      () => deadlineExceeded("RPC deadline exceeded"),
+      abortScope.abort,
+    );
+  } catch (error) {
+    abortScope.cleanup();
+    throw error;
+  }
 
-  return responseMessageStream(frames, responseType, callOptions, deadlineAt);
+  return responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope);
 }
 
 export function createServiceClient(transport, service, root, options = {}) {
@@ -239,7 +286,7 @@ function validateResponse(response, maxBodySize) {
   }
 }
 
-async function* responseMessageStream(frameStream, responseType, options, deadlineAt) {
+async function* responseMessageStream(frameStream, responseType, options, deadlineAt, abortScope) {
   const iterator = frameStream[Symbol.asyncIterator]();
   let messages = 0;
   let streamBodySize = 0;
@@ -247,7 +294,12 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
 
   try {
     for (;;) {
-      const result = await nextFrameWithTimeout(iterator, deadlineAt, options.streamIdleTimeoutMs);
+      const result = await nextFrameWithTimeout(
+        iterator,
+        deadlineAt,
+        options.streamIdleTimeoutMs,
+        abortScope?.abort,
+      );
       if (result.done) {
         throw internal("response stream ended before final status");
       }
@@ -303,9 +355,13 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
       }
     }
   } finally {
+    if (!complete) {
+      abortScope?.abort(cancelled("response stream cancelled"));
+    }
     if (!complete && typeof iterator.return === "function") {
       await iterator.return();
     }
+    abortScope?.cleanup();
   }
 }
 
@@ -335,13 +391,13 @@ async function readUnaryResponseFromStream(stream) {
   throw internal("client-streaming RPC returned more than one response message");
 }
 
-async function nextFrameWithTimeout(iterator, deadlineAt, idleTimeoutMs) {
+async function nextFrameWithTimeout(iterator, deadlineAt, idleTimeoutMs, onTimeout) {
   const timeout = nextTimeout(deadlineAt, idleTimeoutMs);
   if (timeout == null) {
     return iterator.next();
   }
 
-  return withTimeout(iterator.next(), timeout.ms, () => timeout.error);
+  return withTimeout(iterator.next(), timeout.ms, () => timeout.error, onTimeout);
 }
 
 function nextTimeout(deadlineAt, idleTimeoutMs) {
@@ -387,7 +443,7 @@ function localDeadline(timeoutMs) {
   return Date.now() + timeoutMs;
 }
 
-function withTimeout(promise, timeoutMs, makeError) {
+function withTimeout(promise, timeoutMs, makeError, onTimeout) {
   if (timeoutMs == null) {
     return promise;
   }
@@ -397,7 +453,11 @@ function withTimeout(promise, timeoutMs, makeError) {
   }
 
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(makeError()), timeoutMs);
+    const timer = setTimeout(() => {
+      const error = makeError();
+      onTimeout?.(error);
+      reject(error);
+    }, timeoutMs);
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -409,6 +469,33 @@ function withTimeout(promise, timeoutMs, makeError) {
       },
     );
   });
+}
+
+function callAbortScope(options) {
+  const controller = new AbortController();
+  const parentSignal = options.signal;
+  const abort = (reason) => {
+    if (!controller.signal.aborted) {
+      controller.abort(reason);
+    }
+  };
+  const onParentAbort = () => abort(parentSignal.reason ?? cancelled("RPC cancelled"));
+
+  if (parentSignal != null) {
+    if (parentSignal.aborted) {
+      onParentAbort();
+    } else {
+      parentSignal.addEventListener("abort", onParentAbort, { once: true });
+    }
+  }
+
+  return {
+    options: { ...options, signal: controller.signal },
+    abort,
+    cleanup() {
+      parentSignal?.removeEventListener?.("abort", onParentAbort);
+    },
+  };
 }
 
 async function* encodeRequestStream(requestType, requests) {

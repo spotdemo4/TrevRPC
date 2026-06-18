@@ -9,7 +9,7 @@ import (
 	"google.golang.org/protobuf/protoadapt"
 )
 
-const DefaultMaxFrameSize = 16 * 1024 * 1024
+const DefaultMaxFrameSize = 4 * 1024 * 1024
 
 type ProtoMessage = protoadapt.MessageV1
 

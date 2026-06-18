@@ -81,6 +81,53 @@ test("unary decodes protobuf.js response bodies", async () => {
   assert.equal(response.value, "hello Trev");
 });
 
+test("unary timeout aborts transport signal", async () => {
+  const root = createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const Hello = root.lookupType("hello.v1.Hello");
+  let signal;
+
+  const transport = {
+    call(_request, options) {
+      signal = options.signal;
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(options.signal.reason), {
+          once: true,
+        });
+      });
+    },
+  };
+
+  await assert.rejects(
+    unary(
+      transport,
+      "hello.v1.Greeter",
+      "SayHello",
+      Hello,
+      Hello,
+      { value: "Trev" },
+      { timeoutMs: 1 },
+    ),
+    (error) => error.code === Code.DeadlineExceeded,
+  );
+  assert.equal(signal.aborted, true);
+});
+
 test("generator emits JavaScript service clients", () => {
   const response = generateBindings(greeterRequest());
   const generatedJavaScript = generatedFile(response, "hello/v1/greeter.trevrpc.js");

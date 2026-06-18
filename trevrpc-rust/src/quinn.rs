@@ -381,7 +381,11 @@ impl crate::server::Server {
                     let shutdown = shutdown_rx.clone();
                     connection_tasks.spawn(async move {
                         if let Ok(connection) = incoming.await {
-                            handle_connection(server, connection, request_limit, connection_permit, shutdown).await;
+                            if negotiated_protocol(&connection).as_deref() == Some(crate::ALPN) {
+                                handle_connection(server, connection, request_limit, connection_permit, shutdown).await;
+                            } else {
+                                connection.close(0_u32.into(), b"unsupported ALPN");
+                            }
                         }
                     });
                 }
@@ -526,7 +530,6 @@ async fn handle_webtransport_connection(
     crate::webtransport::handle_session(server, session, request_limit, shutdown).await;
 }
 
-#[cfg(feature = "webtransport")]
 fn negotiated_protocol(connection: &quinn::Connection) -> Option<Vec<u8>> {
     connection
         .handshake_data()
@@ -613,7 +616,7 @@ async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) {
-    let request = match read_frame::<RpcRequest>(&mut recv, server.max_frame_size()).await {
+    let request = match read_initial_request(&server, &mut recv).await {
         Ok(request) => request,
         Err(error) => {
             write_status(
@@ -647,6 +650,20 @@ async fn handle_stream(
         .is_ok()
     {
         let _ = send.finish();
+    }
+}
+
+async fn read_initial_request(
+    server: &crate::server::Server,
+    recv: &mut quinn::RecvStream,
+) -> Result<RpcRequest> {
+    let read = read_frame::<RpcRequest>(recv, server.max_frame_size());
+    if let Some(timeout) = server.options().initial_request_timeout() {
+        tokio::time::timeout(timeout, read)
+            .await
+            .map_err(|_| Error::from(Status::deadline_exceeded("initial request frame timeout")))?
+    } else {
+        read.await
     }
 }
 

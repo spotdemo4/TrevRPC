@@ -1,6 +1,6 @@
 import { FrameTooLargeError, invalidArgument, unavailable } from "./status.js";
 
-export const DefaultMaxFrameSize = 16 * 1024 * 1024;
+export const DefaultMaxFrameSize = 4 * 1024 * 1024;
 
 export function marshalMessage(messageType, message) {
   const prepared = prepareMessage(messageType, message);

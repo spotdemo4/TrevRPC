@@ -36,6 +36,7 @@ type ServerOptions struct {
 	MaxConcurrentStreamsPerConnection int
 	MaxConcurrentRequests             int
 	GracefulShutdownTimeout           time.Duration
+	InitialRequestTimeout             time.Duration
 	MaxStreamMessages                 int
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
@@ -46,12 +47,13 @@ type ServerOptions struct {
 func DefaultServerOptions() ServerOptions {
 	return ServerOptions{
 		MaxFrameSize:                      DefaultMaxFrameSize,
-		MaxConcurrentConnections:          1024,
-		MaxConcurrentStreamsPerConnection: 128,
-		MaxConcurrentRequests:             4096,
+		MaxConcurrentConnections:          256,
+		MaxConcurrentStreamsPerConnection: 64,
+		MaxConcurrentRequests:             1024,
 		GracefulShutdownTimeout:           30 * time.Second,
+		InitialRequestTimeout:             10 * time.Second,
 		MaxStreamMessages:                 4096,
-		MaxStreamBodySize:                 64 * 1024 * 1024,
+		MaxStreamBodySize:                 16 * 1024 * 1024,
 		StreamIdleTimeout:                 30 * time.Second,
 	}
 }
@@ -167,7 +169,7 @@ func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcRes
 	service := request.Service
 	method := request.Method
 	requestBodyLen := len(request.Body)
-	s.metrics.RPCStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen})
+	recordRPCStarted(s.metrics, RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen})
 
 	ctx, cancel, err := s.prepareRequest(ctx, request)
 	if err != nil {
@@ -193,7 +195,7 @@ func (s *Server) HandleStreamingRequest(ctx context.Context, request *RpcRequest
 	service := request.Service
 	method := request.Method
 	requestBodyLen := len(request.Body)
-	s.metrics.RPCStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen})
+	recordRPCStarted(s.metrics, RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen})
 
 	ctx, cancel, err := s.prepareRequest(ctx, request)
 	if err != nil {
@@ -242,6 +244,12 @@ type unaryHandlerResult struct {
 func invokeUnaryHandler(ctx context.Context, handler UnaryHandler, body []byte) ([]byte, error) {
 	result := make(chan unaryHandlerResult, 1)
 	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				result <- unaryHandlerResult{err: Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))}
+			}
+		}()
+
 		responseBody, err := handler(ctx, body)
 		result <- unaryHandlerResult{body: responseBody, err: err}
 	}()
@@ -262,6 +270,12 @@ type streamingHandlerResult struct {
 func invokeStreamingHandler(ctx context.Context, handler StreamingHandler, body []byte, requestBody ByteStream) (ByteStream, error) {
 	result := make(chan streamingHandlerResult, 1)
 	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				result <- streamingHandlerResult{err: Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))}
+			}
+		}()
+
 		responseBody, err := handler(ctx, body, requestBody)
 		result <- streamingHandlerResult{stream: responseBody, err: err}
 	}()
@@ -318,7 +332,7 @@ func requestContext(ctx context.Context, request *RpcRequest) (context.Context, 
 }
 
 func (s *Server) finishResponse(service, method string, requestBodyLen int, startedAt time.Time, response *RpcResponse) *RpcResponse {
-	s.metrics.RPCFinished(RPCFinished{
+	recordRPCFinished(s.metrics, RPCFinished{
 		Service:         service,
 		Method:          method,
 		RequestBodyLen:  requestBodyLen,
@@ -336,7 +350,7 @@ func (s *Server) finishStreamingStatus(service, method string, requestBodyLen in
 }
 
 func (s *Server) finishStreamingResponse(service, method string, requestBodyLen, responseBodyLen int, startedAt time.Time, code Code) {
-	s.metrics.RPCFinished(RPCFinished{
+	recordRPCFinished(s.metrics, RPCFinished{
 		Service:         service,
 		Method:          method,
 		RequestBodyLen:  requestBodyLen,
@@ -501,7 +515,7 @@ func (s *serverResponseStream) finish(code Code) {
 	s.done = true
 	s.cancel()
 	closeMessageStream(s.inner)
-	s.metrics.RPCFinished(RPCFinished{
+	recordRPCFinished(s.metrics, RPCFinished{
 		Service:         s.service,
 		Method:          s.method,
 		RequestBodyLen:  s.requestBodyLen,
@@ -509,4 +523,14 @@ func (s *serverResponseStream) finish(code Code) {
 		Code:            code,
 		Elapsed:         time.Since(s.startedAt),
 	})
+}
+
+func recordRPCStarted(metrics Metrics, event RPCStarted) {
+	defer func() { _ = recover() }()
+	metrics.RPCStarted(event)
+}
+
+func recordRPCFinished(metrics Metrics, event RPCFinished) {
+	defer func() { _ = recover() }()
+	metrics.RPCFinished(event)
 }

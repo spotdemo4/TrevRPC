@@ -194,6 +194,11 @@ func handleWebTransportConnection(ctx context.Context, conn *quic.Conn, server *
 		CheckOrigin: server.options.WebTransportCheckOrigin,
 		H3: &http3.Server{
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if server.options.WebTransportCheckOrigin == nil {
+					http.Error(w, "WebTransport origin policy is not configured", http.StatusForbidden)
+					return
+				}
+
 				session, err := wtServer.Upgrade(w, r)
 				if err != nil {
 					http.Error(w, err.Error(), http.StatusBadRequest)

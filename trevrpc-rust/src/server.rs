@@ -57,6 +57,7 @@ pub struct ServerOptions {
     streams_per_connection: Option<usize>,
     requests: Option<usize>,
     shutdown_timeout: Option<Duration>,
+    initial_request_timeout: Option<Duration>,
     stream_messages: Option<usize>,
     stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
@@ -66,12 +67,13 @@ impl Default for ServerOptions {
     fn default() -> Self {
         Self {
             frame_size: DEFAULT_MAX_FRAME_SIZE,
-            connections: Some(1024),
-            streams_per_connection: Some(128),
-            requests: Some(4096),
+            connections: Some(256),
+            streams_per_connection: Some(64),
+            requests: Some(1024),
             shutdown_timeout: Some(Duration::from_secs(30)),
+            initial_request_timeout: Some(Duration::from_secs(10)),
             stream_messages: Some(4096),
-            stream_body_size: Some(64 * 1024 * 1024),
+            stream_body_size: Some(16 * 1024 * 1024),
             stream_idle_timeout: Some(Duration::from_secs(30)),
         }
     }
@@ -106,6 +108,11 @@ impl ServerOptions {
     #[must_use]
     pub const fn graceful_shutdown_timeout(&self) -> Option<Duration> {
         self.shutdown_timeout
+    }
+
+    #[must_use]
+    pub const fn initial_request_timeout(&self) -> Option<Duration> {
+        self.initial_request_timeout
     }
 
     #[must_use]
@@ -162,6 +169,15 @@ impl ServerOptions {
         graceful_shutdown_timeout: Option<Duration>,
     ) -> Self {
         self.shutdown_timeout = graceful_shutdown_timeout;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_initial_request_timeout(
+        mut self,
+        initial_request_timeout: Option<Duration>,
+    ) -> Self {
+        self.initial_request_timeout = initial_request_timeout;
         self
     }
 
@@ -324,6 +340,14 @@ impl Server {
         graceful_shutdown_timeout: Option<Duration>,
     ) -> &mut Self {
         self.options.shutdown_timeout = graceful_shutdown_timeout;
+        self
+    }
+
+    pub fn set_initial_request_timeout(
+        &mut self,
+        initial_request_timeout: Option<Duration>,
+    ) -> &mut Self {
+        self.options.initial_request_timeout = initial_request_timeout;
         self
     }
 
@@ -1112,6 +1136,32 @@ mod tests {
         let response = server.handle_request(request).await;
 
         assert_eq!(Code::from_u32(response.status), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn unsupported_rpc_kinds_are_rejected_before_route_lookup() {
+        let server = Server::new();
+        let mut request = RpcRequest::new("example.Greeter", "Missing", Vec::new());
+        request.kind = 99;
+
+        let response = server.handle_request(request).await;
+
+        assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn default_options_use_bounded_production_limits() {
+        let options = ServerOptions::new();
+
+        assert_eq!(options.max_frame_size(), 4 * 1024 * 1024);
+        assert_eq!(options.max_concurrent_connections(), Some(256));
+        assert_eq!(options.max_concurrent_streams_per_connection(), Some(64));
+        assert_eq!(options.max_concurrent_requests(), Some(1024));
+        assert_eq!(
+            options.initial_request_timeout(),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(options.max_stream_body_size(), Some(16 * 1024 * 1024));
     }
 
     #[tokio::test]

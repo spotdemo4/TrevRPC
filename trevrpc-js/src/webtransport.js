@@ -41,19 +41,28 @@ export class WebTransportClient {
     let writer;
     let reader;
     let complete = false;
+    let cleanupAbort = () => {};
 
     try {
-      await this.ready();
-      const stream = await this.openBidirectionalStream();
+      throwIfAborted(options.signal);
+      await abortable(this.ready(), options.signal);
+      const stream = await abortable(this.openBidirectionalStream(), options.signal);
       writer = stream.writable.getWriter();
       reader = stream.readable.getReader();
+      cleanupAbort = onAbort(options.signal, () => {
+        void abortWriter(writer);
+        void cancelReader(reader);
+      });
       const frameReader = new FrameReader(reader);
 
-      await writeFrame(writer, RpcRequest, request, options.maxFrameSize ?? this.maxFrameSize);
-      await writer.close();
-      const response = await frameReader.readFrame(
-        RpcResponse,
-        options.maxFrameSize ?? this.maxFrameSize,
+      await abortable(
+        writeFrame(writer, RpcRequest, request, options.maxFrameSize ?? this.maxFrameSize),
+        options.signal,
+      );
+      await abortable(writer.close(), options.signal);
+      const response = await abortable(
+        frameReader.readFrame(RpcResponse, options.maxFrameSize ?? this.maxFrameSize),
+        options.signal,
       );
       complete = true;
       return response;
@@ -66,18 +75,30 @@ export class WebTransportClient {
       }
       releaseLock(writer);
       releaseLock(reader);
+      cleanupAbort();
     }
   }
 
   async streamingCall(request, requestBody, options = {}) {
     try {
-      await this.ready();
-      const stream = await this.openBidirectionalStream();
+      throwIfAborted(options.signal);
+      await abortable(this.ready(), options.signal);
+      const stream = await abortable(this.openBidirectionalStream(), options.signal);
       const writer = stream.writable.getWriter();
       const reader = stream.readable.getReader();
       const maxFrameSize = options.maxFrameSize ?? this.maxFrameSize;
+      const cleanupAbort = onAbort(options.signal, () => {
+        void abortWriter(writer);
+        void cancelReader(reader);
+      });
       const writerTask = writeStreamingRequest(writer, request, requestBody, maxFrameSize);
-      return new WebTransportResponseFrameStream(reader, writer, writerTask, maxFrameSize);
+      return new WebTransportResponseFrameStream(
+        reader,
+        writer,
+        writerTask,
+        maxFrameSize,
+        cleanupAbort,
+      );
     } catch (error) {
       throw statusFromTransportError(error);
     }
@@ -93,13 +114,20 @@ export class WebTransportClient {
 }
 
 class WebTransportResponseFrameStream {
-  constructor(reader, writer, writerTask, maxFrameSize = DefaultMaxFrameSize) {
+  constructor(
+    reader,
+    writer,
+    writerTask,
+    maxFrameSize = DefaultMaxFrameSize,
+    cleanupAbort = () => {},
+  ) {
     this.reader = reader;
     this.writer = writer;
     this.frameReader = new FrameReader(reader);
     this.maxFrameSize = maxFrameSize;
     this.done = false;
     this.writerError = null;
+    this.cleanupAbort = cleanupAbort;
     this.writerDone = writerTask.catch((error) => {
       this.writerError = statusFromTransportError(error);
     });
@@ -129,6 +157,7 @@ class WebTransportResponseFrameStream {
       if (frame.kind === RpcStreamFrameKind.Status) {
         this.done = true;
         releaseLock(this.reader);
+        this.cleanupAbort();
       }
 
       return { done: false, value: frame };
@@ -144,8 +173,51 @@ class WebTransportResponseFrameStream {
     await abortWriter(this.writer);
     releaseLock(this.reader);
     releaseLock(this.writer);
+    this.cleanupAbort();
     return { done: true, value: undefined };
   }
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("RPC cancelled", "AbortError");
+  }
+}
+
+function abortable(promise, signal) {
+  throwIfAborted(signal);
+  if (signal == null) {
+    return promise;
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new DOMException("RPC cancelled", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function onAbort(signal, abort) {
+  if (signal == null) {
+    return () => {};
+  }
+
+  if (signal.aborted) {
+    abort();
+    return () => {};
+  }
+
+  signal.addEventListener("abort", abort, { once: true });
+  return () => signal.removeEventListener("abort", abort);
 }
 
 async function writeStreamingRequest(writer, request, requestBody, maxFrameSize) {

@@ -505,7 +505,7 @@ async fn handle_stream(
     mut send: web_transport_quinn::SendStream,
     mut recv: web_transport_quinn::RecvStream,
 ) {
-    let request = match read_frame::<RpcRequest>(&mut recv, server.max_frame_size()).await {
+    let request = match read_initial_request(&server, &mut recv).await {
         Ok(request) => request,
         Err(error) => {
             write_status(
@@ -539,6 +539,20 @@ async fn handle_stream(
         .is_ok()
     {
         let _ = send.finish();
+    }
+}
+
+async fn read_initial_request(
+    server: &crate::server::Server,
+    recv: &mut web_transport_quinn::RecvStream,
+) -> Result<RpcRequest> {
+    let read = read_frame::<RpcRequest>(recv, server.max_frame_size());
+    if let Some(timeout) = server.options().initial_request_timeout() {
+        tokio::time::timeout(timeout, read)
+            .await
+            .map_err(|_| Error::from(Status::deadline_exceeded("initial request frame timeout")))?
+    } else {
+        read.await
     }
 }
 

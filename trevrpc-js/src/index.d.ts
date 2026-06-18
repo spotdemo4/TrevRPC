@@ -185,6 +185,7 @@ export interface CallOptions {
   maxResponseStreamBodySize?: number;
   streamIdleTimeoutMs?: number;
   metadata?: MetadataInput;
+  signal?: AbortSignal;
 }
 
 export interface ResolvedCallOptions {
@@ -195,6 +196,7 @@ export interface ResolvedCallOptions {
   maxResponseStreamBodySize: number;
   streamIdleTimeoutMs: number;
   metadata: Metadata;
+  signal?: AbortSignal;
 }
 
 export interface Transport {

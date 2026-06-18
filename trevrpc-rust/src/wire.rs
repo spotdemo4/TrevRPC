@@ -136,6 +136,13 @@ impl RpcRequest {
             )));
         }
 
+        if RpcKind::try_from(self.kind).is_err() {
+            return Err(crate::Status::invalid_argument(format!(
+                "unsupported TrevRPC RPC kind {}",
+                self.kind
+            )));
+        }
+
         Ok(())
     }
 
@@ -309,6 +316,18 @@ mod tests {
             .expect_err("version should be rejected");
 
         assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn rejects_unknown_rpc_kinds() {
+        let mut request = RpcRequest::new("service", "method", Vec::new());
+        request.kind = 99;
+
+        let status = request
+            .validate_protocol()
+            .expect_err("unknown RPC kind should be rejected");
+
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 
     #[test]
