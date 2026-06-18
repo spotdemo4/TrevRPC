@@ -18,6 +18,9 @@ pub mod quinn;
 #[cfg(feature = "server")]
 pub mod server;
 
+#[cfg(feature = "webtransport")]
+pub mod webtransport;
+
 pub use async_trait::async_trait;
 pub use error::{Error, Result};
 pub use status::{Code, Status};

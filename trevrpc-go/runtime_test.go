@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 type testMessage struct {
@@ -595,6 +596,20 @@ func TestQuinnRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 	}
 }
 
+func TestWebTransportRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
+	running := startTestWebTransportServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+
+	for index := range 4 {
+		if err := runMixedQUICCall(transport, index); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestQuinnAuthFailuresReturnStatusErrors(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
@@ -950,6 +965,43 @@ func startTestQUICServerWithTLS(t *testing.T, serverTLS, clientTLS *tls.Config, 
 	return running
 }
 
+func startTestWebTransportServer(t *testing.T, configure func(*Server)) *runningTestQUICServer {
+	t.Helper()
+	serverTLS, clientTLS := testTLSConfig(t)
+	serverTLS.NextProtos = []string{http3.NextProtoH3}
+	clientTLS.NextProtos = []string{http3.NextProtoH3}
+
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, testWebTransportQUICConfig())
+	if err != nil {
+		t.Fatalf("listen WebTransport: %v", err)
+	}
+
+	server := NewServer()
+	registerTestGreeter(server)
+	configure(server)
+	options := server.Options()
+	options.EnableWebTransport = true
+	server.SetOptions(options)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeQUIC(ctx, listener, server)
+	}()
+
+	running := &runningTestQUICServer{
+		addr:      listener.Addr().String(),
+		clientTLS: clientTLS,
+		cancel:    cancel,
+		done:      done,
+	}
+	t.Cleanup(func() {
+		running.stop(t)
+	})
+
+	return running
+}
+
 func (s *runningTestQUICServer) stop(t *testing.T) {
 	t.Helper()
 	if s.cancel == nil {
@@ -978,6 +1030,29 @@ func connectTestQUICClient(t *testing.T, running *runningTestQUICServer) *quic.C
 	}
 
 	return conn
+}
+
+func connectTestWebTransportClient(t *testing.T, running *runningTestQUICServer) *WebTransportTransport {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/trevrpc", WebTransportDialOptions{
+		TLSClientConfig: running.clientTLS.Clone(),
+		QUICConfig:      testWebTransportQUICConfig(),
+	})
+	if err != nil {
+		t.Fatalf("dial WebTransport: %v", err)
+	}
+
+	return transport
+}
+
+func testWebTransportQUICConfig() *quic.Config {
+	return &quic.Config{
+		EnableDatagrams:                  true,
+		EnableStreamResetPartialDelivery: true,
+	}
 }
 
 func registerTestGreeter(server *Server) {

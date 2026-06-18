@@ -143,6 +143,39 @@ impl Drop for RunningServer {
     }
 }
 
+struct RunningWebTransportServer {
+    addr: SocketAddr,
+    cert_hash: wtransport::tls::Sha256Digest,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<trevrpc::Result<()>>>,
+}
+
+impl RunningWebTransportServer {
+    async fn shutdown(mut self) -> TestResult {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+
+        if let Some(task) = self.task.take() {
+            tokio::time::timeout(TEST_TIMEOUT, task).await???;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for RunningWebTransportServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct RecordingMetrics {
     codes: Arc<Mutex<Vec<Code>>>,
@@ -248,6 +281,75 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
     assert_eq!(messages, ["echo, left", "echo, right"]);
 
     close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_webtransport_client(&server).await?;
+
+    let reply = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "unary".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, unary");
+
+    let mut replies = client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "server stream".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    let mut messages = Vec::new();
+    while let Some(reply) = replies.next().await {
+        messages.push(reply?.message);
+    }
+    assert_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
+
+    let summary = client
+        .lots_of_greetings(
+            trevrpc::stream::from_iter([
+                greeter::HelloRequest {
+                    name: "one".to_owned(),
+                },
+                greeter::HelloRequest {
+                    name: "two".to_owned(),
+                },
+            ]),
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(summary.message, "one,two");
+
+    let mut replies = client
+        .bidi_hello(
+            trevrpc::stream::from_iter([
+                greeter::HelloRequest {
+                    name: "left".to_owned(),
+                },
+                greeter::HelloRequest {
+                    name: "right".to_owned(),
+                },
+            ]),
+            authenticated_options(),
+        )
+        .await?;
+    let mut messages = Vec::new();
+    while let Some(reply) = replies.next().await {
+        messages.push(reply?.message);
+    }
+    assert_eq!(messages, ["echo, left", "echo, right"]);
+
+    close_webtransport_client(endpoint, connection).await;
     server.shutdown().await
 }
 
@@ -827,6 +929,38 @@ fn spawn_greeter_server_with_endpoint(
     })
 }
 
+fn spawn_webtransport_greeter_server(
+    configure: impl FnOnce(&mut Server),
+) -> TestResult<RunningWebTransportServer> {
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"])?;
+    let cert_hash = identity.certificate_chain().as_slice()[0].hash();
+    let config = wtransport::ServerConfig::builder()
+        .with_bind_address(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .with_identity(identity)
+        .build();
+    let endpoint = wtransport::Endpoint::server(config)?;
+    let addr = endpoint.local_addr()?;
+    let mut server = Server::new();
+    server.set_options(fast_server_options());
+    configure(&mut server);
+    greeter::register_greeter(&mut server, TestGreeter);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        server
+            .serve_webtransport_with_shutdown(endpoint, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    Ok(RunningWebTransportServer {
+        addr,
+        cert_hash,
+        shutdown: Some(shutdown_tx),
+        task: Some(task),
+    })
+}
+
 fn fast_server_options() -> ServerOptions {
     ServerOptions::new().with_graceful_shutdown_timeout(Some(Duration::from_millis(200)))
 }
@@ -844,6 +978,37 @@ async fn connect_client(
     let client = greeter::GreeterClient::new(transport);
 
     Ok((endpoint, connection, client))
+}
+
+async fn connect_webtransport_client(
+    server: &RunningWebTransportServer,
+) -> TestResult<(
+    wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
+    wtransport::Connection,
+    greeter::GreeterClient<trevrpc::webtransport::WebTransportTransport>,
+)> {
+    let config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes([server.cert_hash.clone()])
+        .build();
+    let endpoint = wtransport::Endpoint::client(config)?;
+    let connection = endpoint
+        .connect(format!("https://127.0.0.1:{}/trevrpc", server.addr.port()))
+        .await?;
+    let transport = trevrpc::webtransport::WebTransportTransport::new(connection.clone());
+    let client = greeter::GreeterClient::new(transport);
+
+    Ok((endpoint, connection, client))
+}
+
+async fn close_webtransport_client(
+    endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
+    connection: wtransport::Connection,
+) {
+    connection.close(wtransport::VarInt::from_u32(0), b"test complete");
+    tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle())
+        .await
+        .expect("client endpoint should become idle");
 }
 
 async fn close_client(endpoint: quinn::Endpoint, connection: quinn::Connection) {

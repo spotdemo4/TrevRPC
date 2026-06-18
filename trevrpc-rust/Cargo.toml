@@ -19,11 +19,12 @@ pedantic = "warn"
 path = "src/lib.rs"
 
 [features]
-default = ["client", "server", "quinn"]
+default = ["client", "server", "quinn", "webtransport"]
 client = ["dep:tokio"]
 server = ["dep:tokio"]
 quinn = ["client", "server", "dep:quinn", "dep:tokio"]
 tracing = ["dep:tracing"]
+webtransport = ["client", "server", "dep:tokio", "dep:wtransport"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -31,6 +32,7 @@ prost = "0.14.4"
 quinn = { version = "0.11.8", optional = true }
 tokio = { version = "1.48.0", features = ["macros", "rt", "sync", "time"], optional = true }
 tracing = { version = "0.1.44", optional = true }
+wtransport = { version = "0.7.1", optional = true }
 
 [dev-dependencies]
 rcgen = "0.14"

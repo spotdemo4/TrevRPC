@@ -140,7 +140,7 @@
               version = "0.1.0";
 
               src = ./trevrpc-go;
-              vendorHash = "sha256-2lBD0Ws8tIL/pTDa0pQwvkg9v9jCNCeHE8nEoJnv5AY=";
+              vendorHash = "sha256-b1Qj4m2yyMpJr2z7pDYJYY2kOThR9FnAHVk5NZbvba8=";
               subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
 
               nativeCheckInputs = with pkgs; [

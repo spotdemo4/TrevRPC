@@ -38,6 +38,7 @@ type ServerOptions struct {
 	MaxStreamMessages                 int
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
+	EnableWebTransport                bool
 }
 
 func DefaultServerOptions() ServerOptions {

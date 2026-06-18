@@ -55,6 +55,31 @@ fn transport_status(error: &(dyn StdError + Send + Sync + 'static)) -> Status {
         return quinn_write_status(error);
     }
 
+    #[cfg(feature = "webtransport")]
+    if let Some(error) = error.downcast_ref::<wtransport::error::ConnectionError>() {
+        return webtransport_connection_status(error);
+    }
+
+    #[cfg(feature = "webtransport")]
+    if let Some(error) = error.downcast_ref::<wtransport::error::StreamOpeningError>() {
+        return webtransport_stream_opening_status(error);
+    }
+
+    #[cfg(feature = "webtransport")]
+    if let Some(error) = error.downcast_ref::<wtransport::error::StreamReadError>() {
+        return webtransport_stream_read_status(error);
+    }
+
+    #[cfg(feature = "webtransport")]
+    if let Some(error) = error.downcast_ref::<wtransport::error::StreamReadExactError>() {
+        return webtransport_stream_read_exact_status(error);
+    }
+
+    #[cfg(feature = "webtransport")]
+    if let Some(error) = error.downcast_ref::<wtransport::error::StreamWriteError>() {
+        return webtransport_stream_write_status(error);
+    }
+
     if let Some(error) = error.downcast_ref::<io::Error>() {
         return io_status(error);
     }
@@ -108,6 +133,55 @@ fn quinn_write_status(error: &quinn::WriteError) -> Status {
         | quinn::WriteError::ClosedStream
         | quinn::WriteError::ZeroRttRejected => Status::cancelled(error.to_string()),
         quinn::WriteError::ConnectionLost(error) => quinn_connection_status(error),
+    }
+}
+
+#[cfg(feature = "webtransport")]
+fn webtransport_connection_status(error: &wtransport::error::ConnectionError) -> Status {
+    match error {
+        wtransport::error::ConnectionError::LocallyClosed => {
+            Status::cancelled("transport closed locally")
+        }
+        _ => transport_unavailable(error),
+    }
+}
+
+#[cfg(feature = "webtransport")]
+fn webtransport_stream_opening_status(error: &wtransport::error::StreamOpeningError) -> Status {
+    match error {
+        wtransport::error::StreamOpeningError::Refused => Status::cancelled(error.to_string()),
+        wtransport::error::StreamOpeningError::NotConnected => transport_unavailable(error),
+    }
+}
+
+#[cfg(feature = "webtransport")]
+fn webtransport_stream_read_status(error: &wtransport::error::StreamReadError) -> Status {
+    match error {
+        wtransport::error::StreamReadError::Reset(_) => Status::cancelled(error.to_string()),
+        wtransport::error::StreamReadError::NotConnected
+        | wtransport::error::StreamReadError::QuicProto => transport_unavailable(error),
+    }
+}
+
+#[cfg(feature = "webtransport")]
+fn webtransport_stream_read_exact_status(
+    error: &wtransport::error::StreamReadExactError,
+) -> Status {
+    match error {
+        wtransport::error::StreamReadExactError::FinishedEarly(_) => transport_unavailable(error),
+        wtransport::error::StreamReadExactError::Read(error) => {
+            webtransport_stream_read_status(error)
+        }
+    }
+}
+
+#[cfg(feature = "webtransport")]
+fn webtransport_stream_write_status(error: &wtransport::error::StreamWriteError) -> Status {
+    match error {
+        wtransport::error::StreamWriteError::Closed
+        | wtransport::error::StreamWriteError::Stopped(_) => Status::cancelled(error.to_string()),
+        wtransport::error::StreamWriteError::NotConnected
+        | wtransport::error::StreamWriteError::QuicProto => transport_unavailable(error),
     }
 }
 

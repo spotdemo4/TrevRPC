@@ -223,6 +223,11 @@ func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) err
 				delete(active, conn)
 				activeMu.Unlock()
 			}()
+			if isWebTransportQUICConnection(conn, server.options) {
+				handleWebTransportConnection(connectionsCtx, conn, server, requestLimit, true)
+				return
+			}
+
 			handleQUICConnection(connectionsCtx, conn, server, requestLimit, true)
 		})
 	}
@@ -277,6 +282,16 @@ func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 }
 
 func handleQUICStream(ctx context.Context, server *Server, stream *quic.Stream) {
+	handleRPCStream(ctx, server, stream)
+}
+
+type rpcStream interface {
+	io.Reader
+	io.Writer
+	Close() error
+}
+
+func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	request := &RpcRequest{}
 	if err := ReadFrame(stream, request, server.options.MaxFrameSize); err != nil {
 		_ = WriteFrame(stream, Internal(err.Error()).IntoResponse(nil), server.options.MaxFrameSize)
@@ -295,7 +310,7 @@ func handleQUICStream(ctx context.Context, server *Server, stream *quic.Stream) 
 		return
 	}
 
-	requestBody := &quinnRequestStream{stream: stream, maxFrameSize: server.options.MaxFrameSize}
+	requestBody := &rpcRequestStream{stream: stream, maxFrameSize: server.options.MaxFrameSize}
 	response := server.HandleStreamingRequest(ctx, request, requestBody)
 	for {
 		frame, err := recvResponseFrame(ctx, response)
@@ -381,18 +396,18 @@ func waitForWaitGroup(group *sync.WaitGroup, timeout time.Duration, onTimeout fu
 	}
 }
 
-func writeStatusResponse(stream *quic.Stream, status *Status, maxFrameSize int) {
+func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {
 	_ = WriteFrame(stream, status.IntoResponse(nil), maxFrameSize)
 	_ = stream.Close()
 }
 
-type quinnRequestStream struct {
-	stream       *quic.Stream
+type rpcRequestStream struct {
+	stream       io.Reader
 	maxFrameSize int
 	done         bool
 }
 
-func (s *quinnRequestStream) Recv() ([]byte, error) {
+func (s *rpcRequestStream) Recv() ([]byte, error) {
 	if s.done {
 		return nil, io.EOF
 	}
