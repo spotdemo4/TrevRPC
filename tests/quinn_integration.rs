@@ -1,0 +1,482 @@
+#![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
+
+use std::error::Error;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::sync::{Notify, oneshot};
+use tokio::task::JoinHandle;
+use trevrpc::client::{CallOptions, RpcTransport};
+use trevrpc::server::{MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions};
+use trevrpc::{Code, MessageStream, RpcRequest, Status};
+
+#[path = "../examples/shared/greeter.rs"]
+mod greeter;
+
+const AUTH_TOKEN: &str = "integration-token";
+const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+struct TestGreeter;
+
+#[trevrpc::async_trait]
+impl greeter::Greeter for TestGreeter {
+    async fn say_hello(
+        &self,
+        request: greeter::HelloRequest,
+    ) -> core::result::Result<greeter::HelloReply, Status> {
+        Ok(greeter::HelloReply {
+            message: format!("hello, {}", request.name),
+        })
+    }
+
+    async fn lots_of_replies(
+        &self,
+        request: greeter::HelloRequest,
+    ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, Status> {
+        if request.name == "cancel" {
+            return Ok(Box::new(FirstThenPendingReply {
+                first: Some(greeter::HelloReply {
+                    message: "first".to_owned(),
+                }),
+            }));
+        }
+
+        Ok(trevrpc::stream::from_iter([
+            greeter::HelloReply {
+                message: format!("hello, {}", request.name),
+            },
+            greeter::HelloReply {
+                message: format!("goodbye, {}", request.name),
+            },
+        ]))
+    }
+
+    async fn lots_of_greetings(
+        &self,
+        mut requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
+    ) -> core::result::Result<greeter::HelloReply, Status> {
+        let mut names = Vec::new();
+
+        while let Some(request) = requests.next().await {
+            names.push(request?.name);
+        }
+
+        Ok(greeter::HelloReply {
+            message: names.join(","),
+        })
+    }
+
+    async fn bidi_hello(
+        &self,
+        requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
+    ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, Status> {
+        Ok(Box::new(BidiReplies { requests }))
+    }
+}
+
+struct FirstThenPendingReply {
+    first: Option<greeter::HelloReply>,
+}
+
+#[trevrpc::async_trait]
+impl MessageStream<greeter::HelloReply> for FirstThenPendingReply {
+    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloReply>> {
+        if let Some(first) = self.first.take() {
+            return Some(Ok(first));
+        }
+
+        std::future::pending().await
+    }
+}
+
+struct BidiReplies {
+    requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
+}
+
+#[trevrpc::async_trait]
+impl MessageStream<greeter::HelloReply> for BidiReplies {
+    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloReply>> {
+        self.requests.next().await.map(|request| {
+            request.map(|request| greeter::HelloReply {
+                message: format!("echo, {}", request.name),
+            })
+        })
+    }
+}
+
+struct RunningServer {
+    addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<trevrpc::Result<()>>>,
+}
+
+impl RunningServer {
+    async fn shutdown(mut self) -> TestResult {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+
+        if let Some(task) = self.task.take() {
+            tokio::time::timeout(TEST_TIMEOUT, task).await???;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingMetrics {
+    codes: Arc<Mutex<Vec<Code>>>,
+    notify: Arc<Notify>,
+}
+
+impl RecordingMetrics {
+    async fn wait_for_code(&self, code: Code) {
+        let wait = async {
+            loop {
+                if self
+                    .codes
+                    .lock()
+                    .expect("metrics lock should not be poisoned")
+                    .contains(&code)
+                {
+                    return;
+                }
+
+                self.notify.notified().await;
+            }
+        };
+
+        tokio::time::timeout(TEST_TIMEOUT, wait)
+            .await
+            .expect("server metrics should record expected code");
+    }
+}
+
+impl Metrics for RecordingMetrics {
+    fn rpc_finished(&self, event: &RpcFinished) {
+        self.codes
+            .lock()
+            .expect("metrics lock should not be poisoned")
+            .push(event.code);
+        self.notify.notify_waiters();
+    }
+}
+
+#[tokio::test]
+async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let reply = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "unary".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, unary");
+
+    let mut replies = client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "server stream".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    let mut messages = Vec::new();
+    while let Some(reply) = replies.next().await {
+        messages.push(reply?.message);
+    }
+    assert_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
+
+    let summary = client
+        .lots_of_greetings(
+            trevrpc::stream::from_iter([
+                greeter::HelloRequest {
+                    name: "one".to_owned(),
+                },
+                greeter::HelloRequest {
+                    name: "two".to_owned(),
+                },
+            ]),
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(summary.message, "one,two");
+
+    let mut replies = client
+        .bidi_hello(
+            trevrpc::stream::from_iter([
+                greeter::HelloRequest {
+                    name: "left".to_owned(),
+                },
+                greeter::HelloRequest {
+                    name: "right".to_owned(),
+                },
+            ]),
+            authenticated_options(),
+        )
+        .await?;
+    let mut messages = Vec::new();
+    while let Some(reply) = replies.next().await {
+        messages.push(reply?.message);
+    }
+    assert_eq!(messages, ["echo, left", "echo, right"]);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_auth_failures_return_status_errors() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let error = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "missing auth".to_owned(),
+            },
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await
+        .expect_err("request without auth should fail");
+
+    assert_eq!(error.into_status().code(), Code::Unauthenticated);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_expired_deadlines_are_rejected_over_the_wire() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "Missing", Vec::new())
+        .with_deadline_unix_nanos(expired_deadline_unix_nanos());
+
+    let response = transport.call(request).await?;
+
+    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_request_stream_limits_return_resource_exhausted() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_options(
+            fast_server_options()
+                .with_max_stream_messages(Some(1))
+                .with_stream_idle_timeout(Some(TEST_TIMEOUT)),
+        );
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let error = client
+        .lots_of_greetings(
+            trevrpc::stream::from_iter([
+                greeter::HelloRequest {
+                    name: "one".to_owned(),
+                },
+                greeter::HelloRequest {
+                    name: "two".to_owned(),
+                },
+            ]),
+            authenticated_options(),
+        )
+        .await
+        .expect_err("request stream should exceed message limit");
+
+    assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let server_metrics = metrics.clone();
+    let server = spawn_greeter_server(move |server| {
+        server.set_metrics(server_metrics);
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let mut replies = client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "cancel".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    let first = replies
+        .next()
+        .await
+        .expect("response stream should yield first item")?;
+    assert_eq!(first.message, "first");
+
+    drop(replies);
+    metrics.wait_for_code(Code::Cancelled).await;
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_shutdown_closes_active_connections() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    server.shutdown().await?;
+
+    let error = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "after shutdown".to_owned(),
+            },
+            CallOptions::new().with_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("RPC on drained connection should fail");
+    assert_ne!(error.into_status().code(), Code::Ok);
+
+    close_client(endpoint, connection).await;
+    Ok(())
+}
+
+fn spawn_greeter_server(configure: impl FnOnce(&mut Server)) -> TestResult<RunningServer> {
+    let (endpoint, cert_der) = make_server_endpoint()?;
+    let addr = endpoint.local_addr()?;
+    let mut server = Server::new();
+    server.set_options(fast_server_options());
+    configure(&mut server);
+    greeter::register_greeter(&mut server, TestGreeter);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        server
+            .serve_quinn_with_shutdown(endpoint, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    Ok(RunningServer {
+        addr,
+        cert_der,
+        shutdown: Some(shutdown_tx),
+        task: Some(task),
+    })
+}
+
+fn fast_server_options() -> ServerOptions {
+    ServerOptions::new().with_graceful_shutdown_timeout(Some(Duration::from_millis(200)))
+}
+
+async fn connect_client(
+    server: &RunningServer,
+) -> TestResult<(
+    quinn::Endpoint,
+    quinn::Connection,
+    greeter::GreeterClient<trevrpc::quinn::QuinnTransport>,
+)> {
+    let endpoint = make_client_endpoint(server.cert_der.clone())?;
+    let connection = endpoint.connect(server.addr, "localhost")?.await?;
+    let transport = trevrpc::quinn::QuinnTransport::new(connection.clone());
+    let client = greeter::GreeterClient::new(transport);
+
+    Ok((endpoint, connection, client))
+}
+
+async fn close_client(endpoint: quinn::Endpoint, connection: quinn::Connection) {
+    connection.close(0_u32.into(), b"test complete");
+    tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle())
+        .await
+        .expect("client endpoint should become idle");
+}
+
+fn authenticated_options() -> CallOptions {
+    CallOptions::new()
+        .with_timeout(TEST_TIMEOUT)
+        .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
+}
+
+fn expired_deadline_unix_nanos() -> u64 {
+    SystemTime::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("time should support one second subtraction")
+        .duration_since(UNIX_EPOCH)
+        .expect("deadline should be after Unix epoch")
+        .as_nanos()
+        .try_into()
+        .expect("deadline should fit in u64")
+}
+
+fn make_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+    let cert_der = CertificateDer::from(cert.cert);
+    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+
+    let mut server_crypto = quinn::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
+    server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+    let transport_config = Arc::get_mut(&mut server_config.transport)
+        .expect("server config should have one transport reference");
+    transport_config.max_concurrent_uni_streams(0_u8.into());
+
+    Ok((
+        quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?,
+        cert_der,
+    ))
+}
+
+fn make_client_endpoint(cert_der: CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert_der)?;
+
+    let mut client_crypto = quinn::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(client_crypto)?,
+    )));
+
+    Ok(endpoint)
+}
