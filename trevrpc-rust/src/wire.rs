@@ -111,7 +111,7 @@ pub struct RpcRequest {
     #[prost(uint32, tag = "6")]
     pub version: u32,
     #[prost(uint64, tag = "7")]
-    pub deadline_unix_nanos: u64,
+    pub timeout_nanos: u64,
 }
 
 impl RpcRequest {
@@ -124,7 +124,7 @@ impl RpcRequest {
             metadata: Metadata::new(),
             kind: RpcKind::Unary as i32,
             version: WIRE_VERSION,
-            deadline_unix_nanos: 0,
+            timeout_nanos: 0,
         }
     }
 
@@ -158,8 +158,8 @@ impl RpcRequest {
     }
 
     #[must_use]
-    pub const fn with_deadline_unix_nanos(mut self, deadline_unix_nanos: u64) -> Self {
-        self.deadline_unix_nanos = deadline_unix_nanos;
+    pub const fn with_timeout_nanos(mut self, timeout_nanos: u64) -> Self {
+        self.timeout_nanos = timeout_nanos;
         self
     }
 

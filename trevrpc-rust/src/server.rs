@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::wire::{normalize_metadata_key, validate_metadata};
@@ -61,6 +61,9 @@ pub struct ServerOptions {
     stream_messages: Option<usize>,
     stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
+    webtransport_path: &'static str,
+    webtransport_allowed_authorities: &'static [&'static str],
+    webtransport_allowed_origins: &'static [&'static str],
 }
 
 impl Default for ServerOptions {
@@ -75,6 +78,9 @@ impl Default for ServerOptions {
             stream_messages: Some(4096),
             stream_body_size: Some(16 * 1024 * 1024),
             stream_idle_timeout: Some(Duration::from_secs(30)),
+            webtransport_path: "/trevrpc",
+            webtransport_allowed_authorities: &[],
+            webtransport_allowed_origins: &[],
         }
     }
 }
@@ -128,6 +134,21 @@ impl ServerOptions {
     #[must_use]
     pub const fn stream_idle_timeout(&self) -> Option<Duration> {
         self.stream_idle_timeout
+    }
+
+    #[must_use]
+    pub const fn webtransport_path(&self) -> &'static str {
+        self.webtransport_path
+    }
+
+    #[must_use]
+    pub const fn webtransport_allowed_authorities(&self) -> &'static [&'static str] {
+        self.webtransport_allowed_authorities
+    }
+
+    #[must_use]
+    pub const fn webtransport_allowed_origins(&self) -> &'static [&'static str] {
+        self.webtransport_allowed_origins
     }
 
     #[must_use]
@@ -198,6 +219,30 @@ impl ServerOptions {
         self.stream_idle_timeout = stream_idle_timeout;
         self
     }
+
+    #[must_use]
+    pub const fn with_webtransport_path(mut self, webtransport_path: &'static str) -> Self {
+        self.webtransport_path = webtransport_path;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_webtransport_allowed_authorities(
+        mut self,
+        webtransport_allowed_authorities: &'static [&'static str],
+    ) -> Self {
+        self.webtransport_allowed_authorities = webtransport_allowed_authorities;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_webtransport_allowed_origins(
+        mut self,
+        webtransport_allowed_origins: &'static [&'static str],
+    ) -> Self {
+        self.webtransport_allowed_origins = webtransport_allowed_origins;
+        self
+    }
 }
 
 #[crate::async_trait]
@@ -236,12 +281,29 @@ impl MetadataValueAuthorizer {
 #[crate::async_trait]
 impl Authorizer for MetadataValueAuthorizer {
     async fn authorize(&self, request: &RpcRequest) -> std::result::Result<(), Status> {
-        if request.metadata.get(&self.key) == Some(&self.value) {
+        if request
+            .metadata
+            .get(&self.key)
+            .is_some_and(|value| constant_time_eq(value, &self.value))
+        {
             Ok(())
         } else {
             Err(Status::unauthenticated("request is not authenticated"))
         }
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+
+    for index in 0..max_len {
+        let left = left.get(index).copied().unwrap_or(0);
+        let right = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left ^ right);
+    }
+
+    diff == 0
 }
 
 pub trait Metrics: Send + Sync + 'static {
@@ -363,6 +425,27 @@ impl Server {
 
     pub fn set_stream_idle_timeout(&mut self, stream_idle_timeout: Option<Duration>) -> &mut Self {
         self.options.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    pub fn set_webtransport_path(&mut self, webtransport_path: &'static str) -> &mut Self {
+        self.options.webtransport_path = webtransport_path;
+        self
+    }
+
+    pub fn set_webtransport_allowed_authorities(
+        &mut self,
+        webtransport_allowed_authorities: &'static [&'static str],
+    ) -> &mut Self {
+        self.options.webtransport_allowed_authorities = webtransport_allowed_authorities;
+        self
+    }
+
+    pub fn set_webtransport_allowed_origins(
+        &mut self,
+        webtransport_allowed_origins: &'static [&'static str],
+    ) -> &mut Self {
+        self.options.webtransport_allowed_origins = webtransport_allowed_origins;
         self
     }
 
@@ -689,21 +772,18 @@ where
 }
 
 fn request_deadline(request: &RpcRequest) -> std::result::Result<Option<Instant>, Status> {
-    if request.deadline_unix_nanos == 0 {
+    if request.timeout_nanos == 0 {
         return Ok(None);
     }
 
-    let deadline = UNIX_EPOCH
-        .checked_add(Duration::from_nanos(request.deadline_unix_nanos))
-        .ok_or_else(|| Status::invalid_argument("RPC deadline overflowed"))?;
-    let remaining = deadline
-        .duration_since(SystemTime::now())
-        .map_err(|_| Status::deadline_exceeded("RPC deadline exceeded"))?;
+    if request.timeout_nanos > i64::MAX as u64 {
+        return Err(Status::invalid_argument("RPC timeout is too large"));
+    }
 
     Instant::now()
-        .checked_add(remaining)
+        .checked_add(Duration::from_nanos(request.timeout_nanos))
         .map(Some)
-        .ok_or_else(|| Status::invalid_argument("RPC deadline overflowed"))
+        .ok_or_else(|| Status::invalid_argument("RPC timeout overflowed"))
 }
 
 fn remaining_deadline(deadline: Option<Instant>) -> std::result::Result<Option<Duration>, Status> {
@@ -1009,7 +1089,7 @@ impl From<Error> for RpcResponse {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use crate::{Code, Error, MessageStream, RpcKind, RpcRequest, RpcStreamFrameKind};
 
@@ -1165,21 +1245,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_deadlines_are_rejected_before_route_lookup() {
+    async fn oversized_timeouts_are_rejected_before_route_lookup() {
         let server = Server::new();
         let mut request = RpcRequest::new("example.Greeter", "Missing", Vec::new());
-        request.deadline_unix_nanos = SystemTime::now()
-            .checked_sub(Duration::from_secs(1))
-            .expect("time should support one second subtraction")
-            .duration_since(UNIX_EPOCH)
-            .expect("deadline should be after Unix epoch")
-            .as_nanos()
-            .try_into()
-            .expect("deadline should fit in u64");
+        request.timeout_nanos = u64::MAX;
 
         let response = server.handle_request(request).await;
 
-        assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+        assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
     }
 
     #[tokio::test]

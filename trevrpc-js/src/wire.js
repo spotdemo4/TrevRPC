@@ -42,7 +42,7 @@ export const wireRoot = protobuf.Root.fromJSON({
             metadata: { keyType: "string", type: "bytes", id: 4 },
             kind: { type: "RpcKind", id: 5 },
             version: { type: "uint32", id: 6 },
-            deadlineUnixNanos: { type: "uint64", id: 7 },
+            timeoutNanos: { type: "uint64", id: 7 },
           },
         },
         RpcResponse: {

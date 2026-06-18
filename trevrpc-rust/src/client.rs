@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::stream::MessageStream;
@@ -162,11 +162,11 @@ where
         metadata,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
-    let deadline_unix_nanos = deadline_unix_nanos(timeout)?;
+    let timeout_nanos = timeout_nanos(timeout)?;
 
     let request = RpcRequest::new(service, method, request.encode_to_vec())
         .with_metadata(metadata)
-        .with_deadline_unix_nanos(deadline_unix_nanos);
+        .with_timeout_nanos(timeout_nanos);
     let response = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, transport.call(request))
             .await
@@ -345,13 +345,13 @@ fn prepare_streaming_request(
         metadata,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
-    let deadline_unix_nanos = deadline_unix_nanos(timeout)?;
+    let timeout_nanos = timeout_nanos(timeout)?;
 
     Ok(PreparedStreamingCall {
         request: RpcRequest::new(service, method, body)
             .with_kind(kind)
             .with_metadata(metadata)
-            .with_deadline_unix_nanos(deadline_unix_nanos),
+            .with_timeout_nanos(timeout_nanos),
         deadline: timeout.and_then(|timeout| Instant::now().checked_add(timeout)),
         max_response_body_size,
         max_response_messages,
@@ -360,25 +360,15 @@ fn prepare_streaming_request(
     })
 }
 
-fn deadline_unix_nanos(timeout: Option<Duration>) -> Result<u64> {
+fn timeout_nanos(timeout: Option<Duration>) -> Result<u64> {
     let Some(timeout) = timeout else {
         return Ok(0);
     };
 
-    let deadline = SystemTime::now()
-        .checked_add(timeout)
-        .ok_or_else(|| Error::from(Status::invalid_argument("RPC deadline overflowed")))?;
-    let nanos = deadline
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| {
-            Error::from(Status::invalid_argument(
-                "RPC deadline is before Unix epoch",
-            ))
-        })?
-        .as_nanos();
+    let nanos = timeout.as_nanos().max(1);
 
     u64::try_from(nanos)
-        .map_err(|_| Error::from(Status::invalid_argument("RPC deadline is too large")))
+        .map_err(|_| Error::from(Status::invalid_argument("RPC timeout is too large")))
 }
 
 async fn streaming_call_with_deadline<T>(
@@ -732,7 +722,7 @@ mod tests {
             .expect("transport should receive request");
         assert_eq!(recorded.service, "example.Greeter");
         assert_eq!(recorded.method, "SayHello");
-        assert_ne!(recorded.deadline_unix_nanos, 0);
+        assert_eq!(recorded.timeout_nanos, 5_000_000_000);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"math"
@@ -41,6 +42,7 @@ type ServerOptions struct {
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
 	EnableWebTransport                bool
+	WebTransportPath                  string
 	WebTransportCheckOrigin           func(*http.Request) bool
 }
 
@@ -55,6 +57,7 @@ func DefaultServerOptions() ServerOptions {
 		MaxStreamMessages:                 4096,
 		MaxStreamBodySize:                 16 * 1024 * 1024,
 		StreamIdleTimeout:                 30 * time.Second,
+		WebTransportPath:                  "/trevrpc",
 	}
 }
 
@@ -76,7 +79,7 @@ func BearerAuthorizer(token string) MetadataValueAuthorizer {
 }
 
 func (a MetadataValueAuthorizer) Authorize(_ context.Context, request *RpcRequest) error {
-	if string(request.Metadata[a.key]) == string(a.value) {
+	if subtle.ConstantTimeCompare(request.Metadata[a.key], a.value) == 1 {
 		return nil
 	}
 
@@ -313,21 +316,16 @@ func (s *Server) prepareRequest(ctx context.Context, request *RpcRequest) (conte
 }
 
 func requestContext(ctx context.Context, request *RpcRequest) (context.Context, context.CancelFunc, error) {
-	if request.DeadlineUnixNanos == 0 {
+	if request.TimeoutNanos == 0 {
 		ctx, cancel := context.WithCancel(ctx)
 		return ctx, cancel, nil
 	}
 
-	if request.DeadlineUnixNanos > math.MaxInt64 {
-		return ctx, func() {}, InvalidArgument("RPC deadline is too large")
+	if request.TimeoutNanos > math.MaxInt64 {
+		return ctx, func() {}, InvalidArgument("RPC timeout is too large")
 	}
 
-	deadline := time.Unix(0, int64(request.DeadlineUnixNanos))
-	if time.Until(deadline) <= 0 {
-		return ctx, func() {}, DeadlineExceeded("RPC deadline exceeded")
-	}
-
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(request.TimeoutNanos))
 	return ctx, cancel, nil
 }
 

@@ -264,7 +264,7 @@ function prepareClientRequest(service, method, kind, body, options) {
     metadata,
     kind,
     version: WireVersion,
-    deadlineUnixNanos: deadlineUnixNanos(options.timeoutMs),
+    timeoutNanos: timeoutNanos(options.timeoutMs),
   };
 }
 
@@ -420,7 +420,7 @@ function nextTimeout(deadlineAt, idleTimeoutMs) {
   return timeouts.reduce((best, candidate) => (candidate.ms < best.ms ? candidate : best));
 }
 
-function deadlineUnixNanos(timeoutMs) {
+function timeoutNanos(timeoutMs) {
   if (timeoutMs == null) {
     return "0";
   }
@@ -429,7 +429,8 @@ function deadlineUnixNanos(timeoutMs) {
     throw invalidArgument("RPC timeout must be a non-negative finite number of milliseconds");
   }
 
-  return String((BigInt(Date.now()) + BigInt(Math.ceil(timeoutMs))) * 1_000_000n);
+  const nanos = BigInt(Math.ceil(timeoutMs)) * 1_000_000n;
+  return String(nanos === 0n ? 1n : nanos);
 }
 
 function localDeadline(timeoutMs) {

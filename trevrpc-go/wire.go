@@ -36,13 +36,13 @@ const (
 )
 
 type RpcRequest struct {
-	Service           string   `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"`
-	Method            string   `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
-	Body              []byte   `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
-	Metadata          Metadata `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	Kind              RpcKind  `protobuf:"varint,5,opt,name=kind,proto3,enum=trevrpc.RpcKind" json:"kind,omitempty"`
-	Version           uint32   `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
-	DeadlineUnixNanos uint64   `protobuf:"varint,7,opt,name=deadline_unix_nanos,json=deadlineUnixNanos,proto3" json:"deadline_unix_nanos,omitempty"`
+	Service      string   `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"`
+	Method       string   `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	Body         []byte   `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
+	Metadata     Metadata `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	Kind         RpcKind  `protobuf:"varint,5,opt,name=kind,proto3,enum=trevrpc.RpcKind" json:"kind,omitempty"`
+	Version      uint32   `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
+	TimeoutNanos uint64   `protobuf:"varint,7,opt,name=timeout_nanos,json=timeoutNanos,proto3" json:"timeout_nanos,omitempty"`
 }
 
 func NewRpcRequest(service, method string, body []byte) *RpcRequest {

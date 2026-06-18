@@ -420,6 +420,11 @@ impl crate::server::Server {
                         break;
                     };
 
+                    if let Some(status) = validate_request(&self, &request) {
+                        let _ = request.reject(status).await;
+                        continue;
+                    }
+
                     let Some(connection_permit) = try_acquire_permit(connection_limit.as_ref()) else {
                         let _ = request.reject(web_transport_quinn::http::StatusCode::SERVICE_UNAVAILABLE).await;
                         continue;
@@ -460,6 +465,53 @@ impl crate::server::Server {
 
         Ok(())
     }
+}
+
+pub(crate) fn validate_request(
+    server: &crate::server::Server,
+    request: &web_transport_quinn::Request,
+) -> Option<web_transport_quinn::http::StatusCode> {
+    let options = server.options();
+    if request.url.path() != options.webtransport_path() {
+        return Some(web_transport_quinn::http::StatusCode::NOT_FOUND);
+    }
+
+    let allowed_authorities = options.webtransport_allowed_authorities();
+    if !allowed_authorities.is_empty() && !authority_allowed(request, allowed_authorities) {
+        return Some(web_transport_quinn::http::StatusCode::FORBIDDEN);
+    }
+
+    if let Some(origin) = request
+        .headers
+        .get(web_transport_quinn::http::header::ORIGIN)
+    {
+        let Ok(origin) = origin.to_str() else {
+            return Some(web_transport_quinn::http::StatusCode::FORBIDDEN);
+        };
+
+        if !options.webtransport_allowed_origins().contains(&origin) {
+            return Some(web_transport_quinn::http::StatusCode::FORBIDDEN);
+        }
+    }
+
+    None
+}
+
+fn authority_allowed(request: &web_transport_quinn::Request, allowed_authorities: &[&str]) -> bool {
+    let Some(host) = request.url.host_str() else {
+        return false;
+    };
+
+    if allowed_authorities.contains(&host) {
+        return true;
+    }
+
+    let Some(port) = request.url.port() else {
+        return false;
+    };
+    let authority = format!("{host}:{port}");
+
+    allowed_authorities.contains(&authority.as_str())
 }
 
 pub(crate) async fn handle_session(

@@ -222,7 +222,7 @@ func prepareClientRequest(service, method string, kind RpcKind, body []byte, opt
 		return nil, err
 	}
 
-	deadlineUnixNanos, err := deadlineUnixNanos(options)
+	timeoutNanos, err := timeoutNanos(options)
 	if err != nil {
 		return nil, err
 	}
@@ -230,23 +230,25 @@ func prepareClientRequest(service, method string, kind RpcKind, body []byte, opt
 	request := NewRpcRequest(service, method, body)
 	request.Kind = kind
 	request.Metadata = options.Metadata
-	request.DeadlineUnixNanos = deadlineUnixNanos
+	request.TimeoutNanos = timeoutNanos
 
 	return request, nil
 }
 
-func deadlineUnixNanos(options CallOptions) (uint64, error) {
+func timeoutNanos(options CallOptions) (uint64, error) {
 	if !options.HasTimeout {
 		return 0, nil
 	}
 
-	deadline := time.Now().Add(options.Timeout)
-	nanos := deadline.UnixNano()
-	if nanos < 0 {
-		return 0, InvalidArgument("RPC deadline is before Unix epoch")
+	if options.Timeout < 0 {
+		return 0, InvalidArgument("RPC timeout is negative")
 	}
 
-	return uint64(nanos), nil
+	if options.Timeout == 0 {
+		return 1, nil
+	}
+
+	return uint64(options.Timeout), nil
 }
 
 func callContext(ctx context.Context, options CallOptions) (context.Context, context.CancelFunc) {

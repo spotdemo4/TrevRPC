@@ -555,6 +555,11 @@ async fn handle_webtransport_connection(
         }
     };
 
+    if let Some(status) = crate::webtransport::validate_request(&server, &request) {
+        let _ = request.reject(status).await;
+        return;
+    }
+
     let session = match request.ok().await {
         Ok(session) => session,
         Err(error) => {

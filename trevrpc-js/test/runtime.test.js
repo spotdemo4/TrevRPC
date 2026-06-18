@@ -30,7 +30,7 @@ test("frames round-trip TrevRPC requests", () => {
     metadata: normalizeMetadata({ Authorization: "Bearer token" }),
     kind: RpcKind.Unary,
     version: WireVersion,
-    deadlineUnixNanos: "0",
+    timeoutNanos: "0",
   });
 
   const decoded = decodeFrame(RpcRequest, frame.subarray(4));

@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -310,14 +311,14 @@ func TestServerRejectsUnsupportedRpcKindBeforeRouteLookup(t *testing.T) {
 	}
 }
 
-func TestServerRejectsExpiredDeadlineBeforeRouteLookup(t *testing.T) {
+func TestServerRejectsOversizedTimeoutBeforeRouteLookup(t *testing.T) {
 	server := NewServer()
 	request := NewRpcRequest("example.Greeter", "Missing", nil)
-	request.DeadlineUnixNanos = uint64(time.Now().Add(-time.Second).UnixNano())
+	request.TimeoutNanos = math.MaxInt64 + 1
 
 	response := server.HandleRequest(context.Background(), request)
-	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
-		t.Fatalf("expected deadline exceeded, got %#v", response)
+	if CodeFromUint32(response.Status) != CodeInvalidArgument {
+		t.Fatalf("expected invalid argument, got %#v", response)
 	}
 }
 
@@ -327,7 +328,7 @@ func TestServerUnaryDeadlineCancelsSlowHandler(t *testing.T) {
 		select {}
 	})
 	request := NewRpcRequest("example.Greeter", "Slow", nil)
-	request.DeadlineUnixNanos = uint64(time.Now().Add(time.Millisecond).UnixNano())
+	request.TimeoutNanos = uint64(time.Millisecond)
 
 	response := server.HandleRequest(context.Background(), request)
 	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
@@ -700,6 +701,23 @@ func TestWebTransportCheckOriginAllowsBrowserOrigin(t *testing.T) {
 	}
 }
 
+func TestWebTransportRejectsUnexpectedPath(t *testing.T) {
+	running := startTestWebTransportServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/wrong", WebTransportDialOptions{
+		TLSClientConfig: running.clientTLS.Clone(),
+		QUICConfig:      testWebTransportQUICConfig(),
+	})
+	if err == nil {
+		transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+		t.Fatal("unexpected WebTransport path should be rejected")
+	}
+}
+
 func TestQuicAuthFailuresReturnStatusErrors(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
@@ -713,19 +731,19 @@ func TestQuicAuthFailuresReturnStatusErrors(t *testing.T) {
 	}
 }
 
-func TestQuicExpiredDeadlinesRejectedOverWire(t *testing.T) {
+func TestQuicOversizedTimeoutRejectedOverWire(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 	request := NewRpcRequest(testServiceName, "Missing", nil)
-	request.DeadlineUnixNanos = uint64(time.Now().Add(-time.Second).UnixNano())
+	request.TimeoutNanos = math.MaxInt64 + 1
 
 	response, err := NewQuicClient(conn).Call(context.Background(), request)
 	if err != nil {
 		t.Fatalf("raw transport call failed: %v", err)
 	}
-	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
-		t.Fatalf("expected deadline exceeded, got %#v", response)
+	if CodeFromUint32(response.Status) != CodeInvalidArgument {
+		t.Fatalf("expected invalid argument, got %#v", response)
 	}
 }
 

@@ -93,7 +93,7 @@ export interface RpcRequestMessage {
   metadata: Metadata;
   kind: RpcKindValue;
   version: number;
-  deadlineUnixNanos?: number | string | Long;
+  timeoutNanos?: number | string | Long;
 }
 
 export interface RpcResponseMessage {

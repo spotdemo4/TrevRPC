@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -354,6 +354,82 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
 }
 
 #[tokio::test]
+async fn webtransport_rejects_unexpected_path() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|_| {})?;
+    let client = make_webtransport_client(&server)?;
+    let request =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/wrong")?);
+
+    let error = expect_webtransport_connect_error(&client, request).await;
+
+    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::NOT_FOUND);
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_rejects_browser_origin_without_allowlist() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|_| {})?;
+    let client = make_webtransport_client(&server)?;
+    let request =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?)
+            .with_header(
+                web_transport_quinn::http::header::ORIGIN,
+                web_transport_quinn::http::HeaderValue::from_static("https://example.invalid"),
+            );
+
+    let error = expect_webtransport_connect_error(&client, request).await;
+
+    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::FORBIDDEN);
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_allows_configured_browser_origin() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_webtransport_allowed_origins(&["https://example.invalid"]);
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let client = make_webtransport_client(&server)?;
+    let request =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?)
+            .with_header(
+                web_transport_quinn::http::header::ORIGIN,
+                web_transport_quinn::http::HeaderValue::from_static("https://example.invalid"),
+            );
+    let session = client.connect(request).await?;
+    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let greeter_client = greeter::GreeterClient::new(transport);
+
+    let reply = greeter_client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "origin".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+
+    assert_eq!(reply.message, "hello, origin");
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_rejects_unexpected_authority_when_allowlist_is_set() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_webtransport_allowed_authorities(&["expected.example"]);
+    })?;
+    let client = make_webtransport_client(&server)?;
+    let request =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?);
+
+    let error = expect_webtransport_connect_error(&client, request).await;
+
+    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::FORBIDDEN);
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_auth_failures_return_status_errors() -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
@@ -377,16 +453,16 @@ async fn quinn_auth_failures_return_status_errors() -> TestResult {
 }
 
 #[tokio::test]
-async fn quinn_expired_deadlines_are_rejected_over_the_wire() -> TestResult {
+async fn quinn_oversized_timeouts_are_rejected_over_the_wire() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let transport = trevrpc::quinn::Client::new(connection.clone());
     let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "Missing", Vec::new())
-        .with_deadline_unix_nanos(expired_deadline_unix_nanos());
+        .with_timeout_nanos(u64::MAX);
 
     let response = transport.call(request).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
 
     close_client(endpoint, connection).await;
     server.shutdown().await
@@ -984,16 +1060,55 @@ async fn connect_webtransport_client(
     web_transport_quinn::Session,
     greeter::GreeterClient<trevrpc::webtransport::Client>,
 )> {
-    let webtransport_client = web_transport_quinn::ClientBuilder::new()
-        .with_server_certificates(vec![server.cert_der.clone()])?;
-    let url: url::Url = format!("https://127.0.0.1:{}/trevrpc", server.addr.port()).parse()?;
+    let webtransport_client = make_webtransport_client(server)?;
     let session = webtransport_client
-        .connect(web_transport_quinn::proto::ConnectRequest::new(url))
+        .connect(web_transport_quinn::proto::ConnectRequest::new(
+            webtransport_url(server, "/trevrpc")?,
+        ))
         .await?;
     let transport = trevrpc::webtransport::Client::new(session.clone());
     let greeter_client = greeter::GreeterClient::new(transport);
 
     Ok((webtransport_client, session, greeter_client))
+}
+
+fn make_webtransport_client(
+    server: &RunningWebTransportServer,
+) -> TestResult<web_transport_quinn::Client> {
+    Ok(web_transport_quinn::ClientBuilder::new()
+        .with_server_certificates(vec![server.cert_der.clone()])?)
+}
+
+fn webtransport_url(server: &RunningWebTransportServer, path: &str) -> TestResult<url::Url> {
+    Ok(format!("https://127.0.0.1:{}{path}", server.addr.port()).parse()?)
+}
+
+async fn expect_webtransport_connect_error(
+    client: &web_transport_quinn::Client,
+    request: web_transport_quinn::proto::ConnectRequest,
+) -> web_transport_quinn::ClientError {
+    match client.connect(request).await {
+        Ok(session) => {
+            session.close(0, b"unexpected test session");
+            panic!("WebTransport connect should have failed");
+        }
+        Err(error) => error,
+    }
+}
+
+fn assert_webtransport_connect_rejected(
+    error: web_transport_quinn::ClientError,
+    expected: web_transport_quinn::http::StatusCode,
+) {
+    match error {
+        web_transport_quinn::ClientError::HttpError(
+            web_transport_quinn::ConnectError::ErrorStatus(actual),
+        ) => assert_eq!(actual, expected),
+        web_transport_quinn::ClientError::HttpError(
+            web_transport_quinn::ConnectError::ProtoError(_),
+        ) => {}
+        other => panic!("expected WebTransport HTTP status {expected}, got {other:?}"),
+    }
 }
 
 async fn close_webtransport_client(
@@ -1017,17 +1132,6 @@ fn authenticated_options() -> CallOptions {
     CallOptions::new()
         .with_timeout(TEST_TIMEOUT)
         .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
-}
-
-fn expired_deadline_unix_nanos() -> u64 {
-    SystemTime::now()
-        .checked_sub(Duration::from_secs(1))
-        .expect("time should support one second subtraction")
-        .duration_since(UNIX_EPOCH)
-        .expect("deadline should be after Unix epoch")
-        .as_nanos()
-        .try_into()
-        .expect("deadline should fit in u64")
 }
 
 fn make_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
