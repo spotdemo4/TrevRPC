@@ -499,7 +499,6 @@ func (s *serverResponseStream) Recv() (*RpcStreamFrame, error) {
 func (s *serverResponseStream) Close() error {
 	if !s.done {
 		s.finish(CodeCancelled)
-		closeMessageStream(s.inner)
 	}
 
 	return nil

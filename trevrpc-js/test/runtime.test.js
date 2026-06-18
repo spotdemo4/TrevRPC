@@ -13,6 +13,7 @@ import {
   RpcResponse,
   RpcStreamFrame,
   RpcStreamFrameKind,
+  WebTransportClient,
   WireVersion,
   bidirectionalStreaming,
   createRoot,
@@ -203,6 +204,68 @@ test("terminal streaming status cancels pending request iterable", async () => {
   assert.equal(returned, true);
 });
 
+test("WebTransport timeout cleans up stream opened after abort", async () => {
+  let resolveStream;
+  let abortDone;
+  let cancelDone;
+  let abortReason;
+  let cancelReason;
+  const streamCleanup = Promise.all([
+    new Promise((resolve) => {
+      abortDone = resolve;
+    }),
+    new Promise((resolve) => {
+      cancelDone = resolve;
+    }),
+  ]);
+  const stream = fakeBidirectionalStream({
+    onAbort(reason) {
+      abortReason = reason;
+      abortDone();
+    },
+    onCancel(reason) {
+      cancelReason = reason;
+      cancelDone();
+    },
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return new Promise((resolve) => {
+        resolveStream = resolve;
+      });
+    },
+  });
+  const controller = new AbortController();
+  const call = client.call(
+    RpcRequest.create({
+      service: "hello.v1.Greeter",
+      method: "SayHello",
+      body: new Uint8Array(),
+      metadata: {},
+      kind: RpcKind.Unary,
+      version: WireVersion,
+    }),
+    { signal: controller.signal },
+  );
+
+  while (resolveStream == null) {
+    await Promise.resolve();
+  }
+  controller.abort(new DOMException("timeout", "AbortError"));
+  await assert.rejects(call, (error) => error.code === Code.Cancelled);
+  resolveStream(stream);
+  await Promise.race([
+    streamCleanup,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("stream cleanup did not finish")), 100);
+    }),
+  ]);
+
+  assert.equal(abortReason?.name, "AbortError");
+  assert.equal(cancelReason?.name, "AbortError");
+});
+
 test("generator emits JavaScript service clients", () => {
   const response = generateBindings(greeterRequest());
   const generatedJavaScript = generatedFile(response, "hello/v1/greeter.trevrpc.js");
@@ -382,6 +445,33 @@ function importedTypeRequest() {
         ],
       },
     ],
+  };
+}
+
+function fakeBidirectionalStream({ onAbort = () => {}, onCancel = () => {} } = {}) {
+  return {
+    writable: {
+      getWriter() {
+        return {
+          abort(reason) {
+            onAbort(reason);
+            return Promise.resolve();
+          },
+          releaseLock() {},
+        };
+      },
+    },
+    readable: {
+      getReader() {
+        return {
+          cancel(reason) {
+            onCancel(reason);
+            return Promise.resolve();
+          },
+          releaseLock() {},
+        };
+      },
+    },
   };
 }
 

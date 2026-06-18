@@ -798,6 +798,52 @@ async fn quinn_malformed_request_frames_return_invalid_argument_status() -> Test
 }
 
 #[tokio::test]
+async fn quinn_initial_request_timeout_rejects_partial_header() -> TestResult {
+    let server = spawn_greeter_server_with_initial_request_timeout(Duration::from_millis(50))?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(&[0, 0]).await?;
+
+    let response = read_raw_quinn_response(&mut recv).await?;
+
+    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_initial_request_timeout_rejects_partial_body() -> TestResult {
+    let server = spawn_greeter_server_with_initial_request_timeout(Duration::from_millis(50))?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(&8_u32.to_be_bytes()).await?;
+    send.write_all(&[1]).await?;
+
+    let response = read_raw_quinn_response(&mut recv).await?;
+
+    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_oversized_initial_frame_is_rejected_before_body() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let oversized = (trevrpc::framing::DEFAULT_MAX_FRAME_SIZE + 1)
+        .try_into()
+        .expect("default frame size should fit in u32");
+    send.write_all(&u32::to_be_bytes(oversized)).await?;
+
+    let response = read_raw_quinn_response(&mut recv).await?;
+
+    assert_eq!(Code::from_u32(response.status), Code::ResourceExhausted);
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_handles_many_concurrent_unary_calls() -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
@@ -979,6 +1025,14 @@ fn spawn_greeter_server(configure: impl FnOnce(&mut Server)) -> TestResult<Runni
     spawn_greeter_server_with_endpoint(make_server_endpoint()?, configure)
 }
 
+fn spawn_greeter_server_with_initial_request_timeout(
+    timeout: Duration,
+) -> TestResult<RunningServer> {
+    spawn_greeter_server(|server| {
+        server.set_options(fast_server_options().with_initial_request_timeout(Some(timeout)));
+    })
+}
+
 fn spawn_greeter_server_with_endpoint(
     (endpoint, cert_der): (quinn::Endpoint, CertificateDer<'static>),
     configure: impl FnOnce(&mut Server),
@@ -1036,6 +1090,14 @@ fn spawn_webtransport_greeter_server(
 
 fn fast_server_options() -> ServerOptions {
     ServerOptions::new().with_graceful_shutdown_timeout(Some(Duration::from_millis(200)))
+}
+
+async fn read_raw_quinn_response(recv: &mut quinn::RecvStream) -> TestResult<RpcResponse> {
+    Ok(tokio::time::timeout(
+        TEST_TIMEOUT,
+        trevrpc::quinn::read_frame::<RpcResponse>(recv, trevrpc::framing::DEFAULT_MAX_FRAME_SIZE),
+    )
+    .await??)
 }
 
 async fn connect_client(

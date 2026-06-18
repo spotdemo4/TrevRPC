@@ -89,8 +89,7 @@ func (s *encodeStream[T]) Recv() ([]byte, error) {
 }
 
 func (s *encodeStream[T]) Close() error {
-	closeMessageStream(s.inner)
-	return nil
+	return closeMessageStream(s.inner)
 }
 
 type decodeStream[T ProtoMessage] struct {
@@ -119,16 +118,17 @@ func (s *decodeStream[T]) Recv() (T, error) {
 }
 
 func (s *decodeStream[T]) Close() error {
-	closeMessageStream(s.inner)
-	return nil
+	return closeMessageStream(s.inner)
 }
 
 func SingleMessageStream[T ProtoMessage](message T) ByteStream {
 	return EncodeStream(FromSlice(message))
 }
 
-func closeMessageStream(stream any) {
+func closeMessageStream(stream any) error {
 	if closer, ok := stream.(io.Closer); ok {
-		_ = closer.Close()
+		return closer.Close()
 	}
+
+	return nil
 }

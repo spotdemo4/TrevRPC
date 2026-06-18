@@ -8,7 +8,7 @@ import {
   messageFrame,
 } from "./wire.js";
 
-const CancelledStreamReason = "TrevRPC stream cancelled";
+const CancelledStreamReason = new DOMException("TrevRPC stream cancelled", "AbortError");
 
 export class WebTransportClient {
   constructor(session, options = {}) {
@@ -46,7 +46,10 @@ export class WebTransportClient {
     try {
       throwIfAborted(options.signal);
       await abortable(this.ready(), options.signal);
-      const stream = await abortable(this.openBidirectionalStream(), options.signal);
+      const stream = await abortableBidirectionalStream(
+        this.openBidirectionalStream(),
+        options.signal,
+      );
       writer = stream.writable.getWriter();
       reader = stream.readable.getReader();
       cleanupAbort = onAbort(options.signal, () => {
@@ -83,7 +86,10 @@ export class WebTransportClient {
     try {
       throwIfAborted(options.signal);
       await abortable(this.ready(), options.signal);
-      const stream = await abortable(this.openBidirectionalStream(), options.signal);
+      const stream = await abortableBidirectionalStream(
+        this.openBidirectionalStream(),
+        options.signal,
+      );
       const writer = stream.writable.getWriter();
       const reader = stream.readable.getReader();
       const maxFrameSize = options.maxFrameSize ?? this.maxFrameSize;
@@ -218,6 +224,38 @@ function abortable(promise, signal) {
   });
 }
 
+function abortableBidirectionalStream(promise, signal) {
+  throwIfAborted(signal);
+  if (signal == null) {
+    return promise;
+  }
+
+  let aborted = false;
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      aborted = true;
+      reject(signal.reason ?? new DOMException("RPC cancelled", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (stream) => {
+        signal.removeEventListener("abort", onAbort);
+        if (aborted || signal.aborted) {
+          void cleanupBidirectionalStream(stream);
+          reject(signal.reason ?? new DOMException("RPC cancelled", "AbortError"));
+          return;
+        }
+
+        resolve(stream);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 function onAbort(signal, abort) {
   if (signal == null) {
     return () => {};
@@ -264,6 +302,24 @@ async function abortWriter(writer) {
     } catch {
       // The stream may already be closed or reset by the peer.
     }
+  }
+}
+
+async function cleanupBidirectionalStream(stream) {
+  let writer;
+  let reader;
+  try {
+    writer = stream?.writable?.getWriter?.();
+    await abortWriter(writer);
+  } finally {
+    releaseLock(writer);
+  }
+
+  try {
+    reader = stream?.readable?.getReader?.();
+    await cancelReader(reader);
+  } finally {
+    releaseLock(reader);
   }
 }
 

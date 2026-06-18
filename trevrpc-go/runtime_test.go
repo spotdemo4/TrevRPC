@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -872,6 +873,20 @@ func TestQuicDroppedResponseStreamCancelsServerWork(t *testing.T) {
 	waitForMetricCode(t, metrics, CodeCancelled)
 }
 
+func TestWebTransportDroppedResponseStreamCancelsServerWork(t *testing.T) {
+	metrics := &recordingMetrics{}
+	running := startTestWebTransportServer(t, func(server *Server) {
+		server.SetMetrics(metrics)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	replies := holdServerStreamOpen(t, transport)
+
+	closeMessageStream(replies)
+	waitForMetricCode(t, metrics, CodeCancelled)
+}
+
 func TestQuicShutdownClosesActiveConnections(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
@@ -967,6 +982,58 @@ func TestQuicMalformedRequestFramesReturnInvalidArgumentStatus(t *testing.T) {
 	}
 }
 
+func TestQuicInitialRequestTimeoutRejectsPartialHeader(t *testing.T) {
+	running := startTestQUICServerWithInitialRequestTimeout(t, 50*time.Millisecond)
+	stream := openRawTestQUICStream(t, running)
+	defer stream.CancelRead(cancelledStreamCode)
+	defer stream.CancelWrite(cancelledStreamCode)
+	if _, err := stream.Write([]byte{0, 0}); err != nil {
+		t.Fatalf("write partial header: %v", err)
+	}
+
+	response := readRawTestQUICResponse(t, stream)
+
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded status, got %#v", response)
+	}
+}
+
+func TestQuicInitialRequestTimeoutRejectsPartialBody(t *testing.T) {
+	running := startTestQUICServerWithInitialRequestTimeout(t, 50*time.Millisecond)
+	stream := openRawTestQUICStream(t, running)
+	defer stream.CancelRead(cancelledStreamCode)
+	defer stream.CancelWrite(cancelledStreamCode)
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, 8)
+	if _, err := stream.Write(append(header, 1)); err != nil {
+		t.Fatalf("write partial body: %v", err)
+	}
+
+	response := readRawTestQUICResponse(t, stream)
+
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded status, got %#v", response)
+	}
+}
+
+func TestQuicOversizedInitialFrameIsRejectedBeforeBody(t *testing.T) {
+	running := startTestQUICServerWithInitialRequestTimeout(t, testTimeout)
+	stream := openRawTestQUICStream(t, running)
+	defer stream.CancelRead(cancelledStreamCode)
+	defer stream.CancelWrite(cancelledStreamCode)
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, uint32(DefaultMaxFrameSize+1))
+	if _, err := stream.Write(header); err != nil {
+		t.Fatalf("write oversized frame header: %v", err)
+	}
+
+	response := readRawTestQUICResponse(t, stream)
+
+	if CodeFromUint32(response.Status) != CodeResourceExhausted {
+		t.Fatalf("expected resource exhausted status, got %#v", response)
+	}
+}
+
 func TestQuicHandlesManyConcurrentUnaryCalls(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
@@ -1042,6 +1109,16 @@ func startTestQUICServer(t *testing.T, configure func(*Server)) *runningTestQUIC
 	t.Helper()
 	serverTLS, clientTLS := testTLSConfig(t)
 	return startTestQUICServerWithTLS(t, serverTLS, clientTLS, configure)
+}
+
+func startTestQUICServerWithInitialRequestTimeout(t *testing.T, timeout time.Duration) *runningTestQUICServer {
+	t.Helper()
+	return startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.InitialRequestTimeout = timeout
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
+	})
 }
 
 func startTestQUICServerWithTLS(t *testing.T, serverTLS, clientTLS *tls.Config, configure func(*Server)) *runningTestQUICServer {
@@ -1141,6 +1218,34 @@ func connectTestQUICClient(t *testing.T, running *runningTestQUICServer) *quic.C
 	}
 
 	return conn
+}
+
+func openRawTestQUICStream(t *testing.T, running *runningTestQUICServer) *quic.Stream {
+	t.Helper()
+	conn := connectTestQUICClient(t, running)
+	t.Cleanup(func() { conn.CloseWithError(0, "test complete") })
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open raw stream: %v", err)
+	}
+
+	return stream
+}
+
+func readRawTestQUICResponse(t *testing.T, stream *quic.Stream) *RpcResponse {
+	t.Helper()
+	if err := stream.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
+		t.Fatalf("set raw stream read deadline: %v", err)
+	}
+	defer stream.SetReadDeadline(time.Time{})
+	response := &RpcResponse{}
+	if err := ReadFrame(stream, response, DefaultMaxFrameSize); err != nil {
+		t.Fatalf("read raw response: %v", err)
+	}
+
+	return response
 }
 
 func connectTestWebTransportClient(t *testing.T, running *runningTestQUICServer) *WebTransportClient {

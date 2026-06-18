@@ -589,6 +589,7 @@ async fn handle_stream(
     let request = match read_initial_request(&server, &mut recv).await {
         Ok(request) => request,
         Err(error) => {
+            let _ = recv.stop(cancelled_stream_code());
             write_status(send, error.into_status(), server.max_frame_size()).await;
             return;
         }
@@ -651,7 +652,16 @@ async fn handle_streaming_rpc(
 ) {
     let max_frame_size = server.max_frame_size();
     let request_body = Box::new(WebTransportRequestStream::new(recv, max_frame_size));
-    let mut response = server.handle_streaming_request(request, request_body).await;
+    let mut response = tokio::select! {
+        biased;
+        response = server.handle_streaming_request(request, request_body) => response,
+        stopped = send.stopped() => {
+            let _ = &stopped;
+            #[cfg(feature = "tracing")]
+            tracing::debug!(?stopped, "client stopped WebTransport response stream before streaming RPC handler completed");
+            return;
+        }
+    };
 
     loop {
         let frame = tokio::select! {
@@ -719,6 +729,14 @@ impl WebTransportRequestStream {
             recv,
             max_frame_size,
             done: false,
+        }
+    }
+}
+
+impl Drop for WebTransportRequestStream {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.recv.stop(cancelled_stream_code());
         }
     }
 }

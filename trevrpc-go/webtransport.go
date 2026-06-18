@@ -191,6 +191,8 @@ func cancelWebTransportStreamOnContext(ctx context.Context, stream *webtransport
 }
 
 func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
+	defer closeMessageStream(requestBody)
+
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
 		stream.CancelWrite(cancelledWebTransportStreamCode)
 		return webTransportStatus(err)
@@ -295,13 +297,28 @@ func handleWebTransportSession(ctx context.Context, session *webtransport.Sessio
 
 		streamTasks.Go(func() {
 			defer release(streamLimit)
-			handleRPCStream(ctx, server, requestLimit, stream)
+			streamCtx, cancel := contextWithAdditionalCancel(stream.Context(), ctx)
+			defer cancel()
+			handleRPCStream(streamCtx, server, requestLimit, stream)
 		})
 	}
 
 	waitForWaitGroup(&streamTasks, server.options.GracefulShutdownTimeout, func() {
 		_ = session.CloseWithError(cancelledWebTransportSessionCode, "server WebTransport stream drain timed out")
 	})
+}
+
+func contextWithAdditionalCancel(ctx context.Context, cancelOn context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-cancelOn.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	return ctx, cancel
 }
 
 func webTransportOrContextStatus(ctx context.Context, err error) error {

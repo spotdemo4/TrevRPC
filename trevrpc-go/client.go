@@ -371,17 +371,18 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 	}
 }
 
-func (s *responseMessageStream[T]) finish() {
+func (s *responseMessageStream[T]) finish() error {
 	if !s.done {
 		s.done = true
 		s.cancel()
-		closeMessageStream(s.inner)
+		return closeMessageStream(s.inner)
 	}
+
+	return nil
 }
 
 func (s *responseMessageStream[T]) Close() error {
-	s.finish()
-	return nil
+	return s.finish()
 }
 
 func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout time.Duration) (*RpcStreamFrame, error) {

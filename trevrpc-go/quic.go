@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -160,6 +162,8 @@ func cancelQUICStreamOnContext(ctx context.Context, stream *quic.Stream) func() 
 }
 
 func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
+	defer closeMessageStream(requestBody)
+
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
 		stream.CancelWrite(cancelledStreamCode)
 		return transportStatus(err)
@@ -390,11 +394,23 @@ func requestFrameStatus(err error) *Status {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return statusFromContextError(err)
 	}
+	if isTimeoutError(err) {
+		return DeadlineExceeded("initial request frame timeout")
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return Unavailable("transport unavailable: " + err.Error())
 	}
 
 	return InvalidArgument("invalid RPC request frame: " + err.Error())
+}
+
+func isTimeoutError(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+
+	var netError net.Error
+	return errors.As(err, &netError) && netError.Timeout()
 }
 
 func handleUnaryQUICRequest(ctx context.Context, server *Server, request *RpcRequest) (*RpcResponse, bool) {
