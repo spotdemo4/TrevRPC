@@ -9,7 +9,7 @@ import {
   isOkStatus,
   resourceExhausted,
   statusFromResponse,
-  unavailable
+  unavailable,
 } from "./status.js";
 import { RpcKind, RpcStreamFrameKind, WireVersion } from "./wire.js";
 
@@ -20,7 +20,7 @@ export function defaultCallOptions() {
     maxResponseMessages: 4096,
     maxResponseStreamBodySize: 64 * 1024 * 1024,
     streamIdleTimeoutMs: 30_000,
-    metadata: {}
+    metadata: {},
   };
 }
 
@@ -30,66 +30,112 @@ export function mergeCallOptions(base = {}, override = {}) {
   copyDefined(merged, override);
   merged.metadata = {
     ...normalizeMetadata(base.metadata ?? {}),
-    ...normalizeMetadata(override.metadata ?? {})
+    ...normalizeMetadata(override.metadata ?? {}),
   };
   return merged;
 }
 
-export async function unary(transport, service, method, requestType, responseType, request, options = {}) {
+export async function unary(
+  transport,
+  service,
+  method,
+  requestType,
+  responseType,
+  request,
+  options = {},
+) {
   const callOptions = mergeCallOptions(options);
   const requestBody = marshalMessage(requestType, request);
   const rpcRequest = prepareClientRequest(service, method, RpcKind.Unary, requestBody, callOptions);
   const response = await withTimeout(
     transport.call(rpcRequest, callOptions),
     callOptions.timeoutMs,
-    () => deadlineExceeded("RPC deadline exceeded")
+    () => deadlineExceeded("RPC deadline exceeded"),
   );
 
   validateResponse(response, callOptions.maxResponseBodySize);
   return unmarshalMessage(responseType, response.body ?? new Uint8Array(0));
 }
 
-export async function serverStreaming(transport, service, method, requestType, responseType, request, options = {}) {
+export async function serverStreaming(
+  transport,
+  service,
+  method,
+  requestType,
+  responseType,
+  request,
+  options = {},
+) {
   const callOptions = mergeCallOptions(options);
   const requestBody = marshalMessage(requestType, request);
-  const rpcRequest = prepareClientRequest(service, method, RpcKind.ServerStreaming, requestBody, callOptions);
+  const rpcRequest = prepareClientRequest(
+    service,
+    method,
+    RpcKind.ServerStreaming,
+    requestBody,
+    callOptions,
+  );
   const deadlineAt = localDeadline(callOptions.timeoutMs);
   const frames = await withTimeout(
     transport.streamingCall(rpcRequest, emptyAsyncIterable(), callOptions),
     callOptions.timeoutMs,
-    () => deadlineExceeded("RPC deadline exceeded")
+    () => deadlineExceeded("RPC deadline exceeded"),
   );
 
   return responseMessageStream(frames, responseType, callOptions, deadlineAt);
 }
 
-export async function clientStreaming(transport, service, method, requestType, responseType, requests, options = {}) {
+export async function clientStreaming(
+  transport,
+  service,
+  method,
+  requestType,
+  responseType,
+  requests,
+  options = {},
+) {
   const callOptions = mergeCallOptions(options);
-  const rpcRequest = prepareClientRequest(service, method, RpcKind.ClientStreaming, new Uint8Array(0), callOptions);
+  const rpcRequest = prepareClientRequest(
+    service,
+    method,
+    RpcKind.ClientStreaming,
+    new Uint8Array(0),
+    callOptions,
+  );
   const deadlineAt = localDeadline(callOptions.timeoutMs);
   const frames = await withTimeout(
     transport.streamingCall(rpcRequest, encodeRequestStream(requestType, requests), callOptions),
     callOptions.timeoutMs,
-    () => deadlineExceeded("RPC deadline exceeded")
+    () => deadlineExceeded("RPC deadline exceeded"),
   );
 
-  return readUnaryResponseFromStream(responseMessageStream(frames, responseType, callOptions, deadlineAt));
+  return readUnaryResponseFromStream(
+    responseMessageStream(frames, responseType, callOptions, deadlineAt),
+  );
 }
 
-export async function bidirectionalStreaming(transport, service, method, requestType, responseType, requests, options = {}) {
+export async function bidirectionalStreaming(
+  transport,
+  service,
+  method,
+  requestType,
+  responseType,
+  requests,
+  options = {},
+) {
   const callOptions = mergeCallOptions(options);
   const rpcRequest = prepareClientRequest(
     service,
     method,
     RpcKind.BidirectionalStreaming,
     new Uint8Array(0),
-    callOptions
+    callOptions,
   );
   const deadlineAt = localDeadline(callOptions.timeoutMs);
   const frames = await withTimeout(
     transport.streamingCall(rpcRequest, encodeRequestStream(requestType, requests), callOptions),
     callOptions.timeoutMs,
-    () => deadlineExceeded("RPC deadline exceeded")
+    () => deadlineExceeded("RPC deadline exceeded"),
   );
 
   return responseMessageStream(frames, responseType, callOptions, deadlineAt);
@@ -106,19 +152,51 @@ export function createServiceClient(transport, service, root, options = {}) {
     switch (method.kind) {
       case "unary":
         client[jsName] = (request, override) =>
-          unary(transport, service.fullName, method.name, requestType, responseType, request, callOptions(override));
+          unary(
+            transport,
+            service.fullName,
+            method.name,
+            requestType,
+            responseType,
+            request,
+            callOptions(override),
+          );
         break;
       case "serverStreaming":
         client[jsName] = (request, override) =>
-          serverStreaming(transport, service.fullName, method.name, requestType, responseType, request, callOptions(override));
+          serverStreaming(
+            transport,
+            service.fullName,
+            method.name,
+            requestType,
+            responseType,
+            request,
+            callOptions(override),
+          );
         break;
       case "clientStreaming":
         client[jsName] = (requests, override) =>
-          clientStreaming(transport, service.fullName, method.name, requestType, responseType, requests, callOptions(override));
+          clientStreaming(
+            transport,
+            service.fullName,
+            method.name,
+            requestType,
+            responseType,
+            requests,
+            callOptions(override),
+          );
         break;
       case "bidirectionalStreaming":
         client[jsName] = (requests, override) =>
-          bidirectionalStreaming(transport, service.fullName, method.name, requestType, responseType, requests, callOptions(override));
+          bidirectionalStreaming(
+            transport,
+            service.fullName,
+            method.name,
+            requestType,
+            responseType,
+            requests,
+            callOptions(override),
+          );
         break;
       default:
         throw internal(`unsupported generated RPC kind ${JSON.stringify(method.kind)}`);
@@ -139,7 +217,7 @@ function prepareClientRequest(service, method, kind, body, options) {
     metadata,
     kind,
     version: WireVersion,
-    deadlineUnixNanos: deadlineUnixNanos(options.timeoutMs)
+    deadlineUnixNanos: deadlineUnixNanos(options.timeoutMs),
   };
 }
 
@@ -179,7 +257,9 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
         case RpcStreamFrameKind.Message: {
           const body = frame.body ?? new Uint8Array(0);
           if (options.maxResponseMessages >= 0 && messages >= options.maxResponseMessages) {
-            throw resourceExhausted(`response stream exceeded maximum of ${options.maxResponseMessages} messages`);
+            throw resourceExhausted(
+              `response stream exceeded maximum of ${options.maxResponseMessages} messages`,
+            );
           }
 
           if (body.byteLength > options.maxResponseBodySize) {
@@ -188,9 +268,12 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
 
           messages += 1;
           streamBodySize = saturatingAdd(streamBodySize, body.byteLength);
-          if (options.maxResponseStreamBodySize >= 0 && streamBodySize > options.maxResponseStreamBodySize) {
+          if (
+            options.maxResponseStreamBodySize >= 0 &&
+            streamBodySize > options.maxResponseStreamBodySize
+          ) {
             throw resourceExhausted(
-              `response stream exceeded maximum body size of ${options.maxResponseStreamBodySize} bytes`
+              `response stream exceeded maximum body size of ${options.maxResponseStreamBodySize} bytes`,
             );
           }
 
@@ -203,13 +286,17 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
           const status = {
             code: frame.status ?? Code.Ok,
             statusMessage: frame.message ?? "",
-            metadata: frame.metadata ?? {}
+            metadata: frame.metadata ?? {},
           };
           if (status.code === Code.Ok) {
             return;
           }
 
-          throw statusFromResponse({ status: status.code, message: status.statusMessage, metadata: status.metadata });
+          throw statusFromResponse({
+            status: status.code,
+            message: status.statusMessage,
+            metadata: status.metadata,
+          });
         }
         default:
           throw internal("response stream contained an unknown frame kind");
@@ -260,7 +347,10 @@ async function nextFrameWithTimeout(iterator, deadlineAt, idleTimeoutMs) {
 function nextTimeout(deadlineAt, idleTimeoutMs) {
   const timeouts = [];
   if (deadlineAt != null) {
-    timeouts.push({ ms: deadlineAt - Date.now(), error: deadlineExceeded("RPC deadline exceeded") });
+    timeouts.push({
+      ms: deadlineAt - Date.now(),
+      error: deadlineExceeded("RPC deadline exceeded"),
+    });
   }
   if (idleTimeoutMs != null && idleTimeoutMs > 0) {
     timeouts.push({ ms: idleTimeoutMs, error: unavailable("response stream idle timeout") });
@@ -316,7 +406,7 @@ function withTimeout(promise, timeoutMs, makeError) {
       (error) => {
         clearTimeout(timer);
         reject(error);
-      }
+      },
     );
   });
 }

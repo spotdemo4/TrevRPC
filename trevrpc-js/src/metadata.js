@@ -51,7 +51,9 @@ export function metadataValueToBytes(value) {
 export function validateMetadata(metadata = {}) {
   const entries = Object.entries(metadata);
   if (entries.length > MaxMetadataEntries) {
-    throw invalidArgument(`metadata has ${entries.length} entries, maximum is ${MaxMetadataEntries}`);
+    throw invalidArgument(
+      `metadata has ${entries.length} entries, maximum is ${MaxMetadataEntries}`,
+    );
   }
 
   let totalSize = 0;
@@ -60,7 +62,7 @@ export function validateMetadata(metadata = {}) {
     const bytes = metadataValueToBytes(value);
     if (bytes.byteLength > MaxMetadataValueLen) {
       throw invalidArgument(
-        `metadata value ${JSON.stringify(key)} is ${bytes.byteLength} bytes, maximum is ${MaxMetadataValueLen}`
+        `metadata value ${JSON.stringify(key)} is ${bytes.byteLength} bytes, maximum is ${MaxMetadataValueLen}`,
       );
     }
 
@@ -78,11 +80,15 @@ function validateMetadataKey(key) {
   }
 
   if (key.length > MaxMetadataKeyLen) {
-    throw invalidArgument(`metadata key ${JSON.stringify(key)} is ${key.length} bytes, maximum is ${MaxMetadataKeyLen}`);
+    throw invalidArgument(
+      `metadata key ${JSON.stringify(key)} is ${key.length} bytes, maximum is ${MaxMetadataKeyLen}`,
+    );
   }
 
   if (key.startsWith(ReservedMetadataPrefix)) {
-    throw invalidArgument(`metadata key ${JSON.stringify(key)} uses reserved prefix ${JSON.stringify(ReservedMetadataPrefix)}`);
+    throw invalidArgument(
+      `metadata key ${JSON.stringify(key)} uses reserved prefix ${JSON.stringify(ReservedMetadataPrefix)}`,
+    );
   }
 
   for (let index = 0; index < key.length; index += 1) {
@@ -95,7 +101,7 @@ function validateMetadataKey(key) {
       code === 0x2d;
     if (!valid) {
       throw invalidArgument(
-        `metadata key ${JSON.stringify(key)} must use lowercase ASCII letters, digits, '.', '_' or '-'`
+        `metadata key ${JSON.stringify(key)} must use lowercase ASCII letters, digits, '.', '_' or '-'`,
       );
     }
   }

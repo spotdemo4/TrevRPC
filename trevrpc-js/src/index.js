@@ -12,7 +12,7 @@ export {
   resourceExhausted,
   statusError,
   statusFromResponse,
-  unavailable
+  unavailable,
 } from "./status.js";
 export {
   MaxMetadataEntries,
@@ -23,7 +23,7 @@ export {
   metadataValueToBytes,
   normalizeMetadata,
   normalizeMetadataKey,
-  validateMetadata
+  validateMetadata,
 } from "./metadata.js";
 export {
   RpcKind,
@@ -35,7 +35,7 @@ export {
   createRoot,
   messageFrame,
   protobuf,
-  wireRoot
+  wireRoot,
 } from "./wire.js";
 export {
   DefaultMaxFrameSize,
@@ -45,7 +45,7 @@ export {
   frameBodyLength,
   marshalMessage,
   unmarshalMessage,
-  writeFrame
+  writeFrame,
 } from "./framing.js";
 export {
   bidirectionalStreaming,
@@ -54,6 +54,6 @@ export {
   defaultCallOptions,
   mergeCallOptions,
   serverStreaming,
-  unary
+  unary,
 } from "./client.js";
 export { WebTransportResponseFrameStream, WebTransportTransport } from "./webtransport.js";

@@ -1,6 +1,12 @@
 import { DefaultMaxFrameSize, FrameReader, writeFrame } from "./framing.js";
 import { statusFromTransportError, unavailable } from "./status.js";
-import { RpcRequest, RpcResponse, RpcStreamFrame, RpcStreamFrameKind, messageFrame } from "./wire.js";
+import {
+  RpcRequest,
+  RpcResponse,
+  RpcStreamFrame,
+  RpcStreamFrameKind,
+  messageFrame,
+} from "./wire.js";
 
 const CancelledStreamReason = "TrevRPC stream cancelled";
 
@@ -45,7 +51,10 @@ export class WebTransportTransport {
 
       await writeFrame(writer, RpcRequest, request, options.maxFrameSize ?? this.maxFrameSize);
       await writer.close();
-      const response = await frameReader.readFrame(RpcResponse, options.maxFrameSize ?? this.maxFrameSize);
+      const response = await frameReader.readFrame(
+        RpcResponse,
+        options.maxFrameSize ?? this.maxFrameSize,
+      );
       complete = true;
       return response;
     } catch (error) {

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { generate as generateBindings } from "../src/generator.js";
 import {
   Code,
   RpcKind,
@@ -15,9 +16,8 @@ import {
   decodeFrame,
   encodeFrame,
   normalizeMetadata,
-  unary
+  unary,
 } from "../src/index.js";
-import { generate as generateBindings } from "../src/generator.js";
 
 test("frames round-trip TrevRPC requests", () => {
   const frame = encodeFrame(RpcRequest, {
@@ -27,7 +27,7 @@ test("frames round-trip TrevRPC requests", () => {
     metadata: normalizeMetadata({ Authorization: "Bearer token" }),
     kind: RpcKind.Unary,
     version: WireVersion,
-    deadlineUnixNanos: "0"
+    deadlineUnixNanos: "0",
   });
 
   const decoded = decodeFrame(RpcRequest, frame.subarray(4));
@@ -37,7 +37,10 @@ test("frames round-trip TrevRPC requests", () => {
   assert.deepEqual(decoded.body, new Uint8Array([1, 2, 3]));
   assert.equal(decoded.kind, RpcKind.Unary);
   assert.equal(decoded.version, WireVersion);
-  assert.deepEqual(decoded.metadata.authorization, new Uint8Array([66, 101, 97, 114, 101, 114, 32, 116, 111, 107, 101, 110]));
+  assert.deepEqual(
+    decoded.metadata.authorization,
+    new Uint8Array([66, 101, 97, 114, 101, 114, 32, 116, 111, 107, 101, 110]),
+  );
 });
 
 test("unary decodes protobuf.js response bodies", async () => {
@@ -49,14 +52,14 @@ test("unary decodes protobuf.js response bodies", async () => {
             nested: {
               Hello: {
                 fields: {
-                  value: { type: "string", id: 1 }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
   });
   const Hello = root.lookupType("hello.v1.Hello");
 
@@ -66,12 +69,14 @@ test("unary decodes protobuf.js response bodies", async () => {
       return RpcResponse.create({
         status: Code.Ok,
         body: Hello.encode({ value: `hello ${decoded.value}` }).finish(),
-        metadata: {}
+        metadata: {},
       });
-    }
+    },
   };
 
-  const response = await unary(transport, "hello.v1.Greeter", "SayHello", Hello, Hello, { value: "Trev" });
+  const response = await unary(transport, "hello.v1.Greeter", "SayHello", Hello, Hello, {
+    value: "Trev",
+  });
 
   assert.equal(response.value, "hello Trev");
 });
@@ -109,9 +114,9 @@ test("generated JavaScript clients call the runtime", async () => {
       return RpcResponse.create({
         status: Code.Ok,
         body: HelloReply.encode({ message: `hello ${decoded.name}` }).finish(),
-        metadata: {}
+        metadata: {},
       });
-    }
+    },
   };
 
   const client = new generated.GreeterClient(transport);
@@ -131,12 +136,12 @@ function greeterRequest(parameter = "") {
         messageType: [
           {
             name: "HelloRequest",
-            field: [{ name: "name", number: 1, label: 1, type: 9, jsonName: "name" }]
+            field: [{ name: "name", number: 1, label: 1, type: 9, jsonName: "name" }],
           },
           {
             name: "HelloReply",
-            field: [{ name: "message", number: 1, label: 1, type: 9, jsonName: "message" }]
-          }
+            field: [{ name: "message", number: 1, label: 1, type: 9, jsonName: "message" }],
+          },
         ],
         service: [
           {
@@ -145,31 +150,31 @@ function greeterRequest(parameter = "") {
               {
                 name: "SayHello",
                 inputType: ".hello.v1.HelloRequest",
-                outputType: ".hello.v1.HelloReply"
+                outputType: ".hello.v1.HelloReply",
               },
               {
                 name: "LotsOfReplies",
                 inputType: ".hello.v1.HelloRequest",
                 outputType: ".hello.v1.HelloReply",
-                serverStreaming: true
+                serverStreaming: true,
               },
               {
                 name: "LotsOfGreetings",
                 inputType: ".hello.v1.HelloRequest",
                 outputType: ".hello.v1.HelloReply",
-                clientStreaming: true
+                clientStreaming: true,
               },
               {
                 name: "BidiHello",
                 inputType: ".hello.v1.HelloRequest",
                 outputType: ".hello.v1.HelloReply",
                 clientStreaming: true,
-                serverStreaming: true
-              }
-            ]
-          }
-        ]
-      }
-    ]
+                serverStreaming: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
   };
 }

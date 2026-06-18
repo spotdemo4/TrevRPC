@@ -46,12 +46,13 @@
               protobuf
 
               # javascript
-              nodejs
+              nodejs_24
 
               # lint
               clippy
               cargo-audit
               go-tools
+              oxlint
               nixd
               nil
 
@@ -78,6 +79,7 @@
               flake-release
               rustc
               cargo
+              nodejs_24
             ];
           };
 
@@ -86,12 +88,14 @@
               renovate
               cargo # rust
               go # go
+              nodejs_24 # javascript
             ];
           };
 
           vulnerable = pkgs.mkShell {
             packages = with pkgs; [
               cargo-audit # rust
+              nodejs_24 # javascript
               flake-checker # nix
               zizmor # actions
             ];
@@ -169,6 +173,55 @@
               };
             }
           );
+
+          trevrpc-js = pkgs.buildNpmPackage (
+            final: with pkgs.lib; {
+              pname = "trevrpc-js";
+              version = "0.1.0";
+
+              src = fileset.toSource {
+                root = ./trevrpc-js;
+                fileset = fileset.unions [
+                  ./trevrpc-js/.oxfmtrc.json
+                  ./trevrpc-js/.oxlintrc.json
+                  ./trevrpc-js/README.md
+                  ./trevrpc-js/package-lock.json
+                  ./trevrpc-js/package.json
+                  ./trevrpc-js/bin
+                  ./trevrpc-js/src
+                  ./trevrpc-js/test
+                ];
+              };
+
+              nodejs = pkgs.nodejs_24;
+              dontNpmBuild = true;
+              npmConfigHook = pkgs.importNpmLock.npmConfigHook;
+              npmDeps = pkgs.importNpmLock {
+                npmRoot = final.src;
+              };
+
+              nativeCheckInputs = with pkgs; [
+                oxfmt
+                oxlint
+              ];
+              checkPhase = ''
+                oxfmt --check
+                oxlint --deny-warnings
+                npm test
+              '';
+
+              meta = {
+                mainProgram = "protoc-gen-trevrpc-js";
+                description = "JavaScript WebTransport runtime and code generator for TrevRPC";
+                license = licenses.mit;
+                platforms = platforms.all;
+                badPlatforms = [ systems.inspect.platformPatterns.isStatic ];
+                homepage = "https://trev.zip/llc/TrevRPC";
+                changelog = "https://trev.zip/llc/TrevRPC/releases";
+                downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+              };
+            }
+          );
         };
 
         # nix fmt
@@ -192,6 +245,13 @@
           };
 
           go = self.packages.${system}.trevrpc-go.overrideAttrs {
+            dontBuild = true;
+            installPhase = ''
+              touch $out
+            '';
+          };
+
+          js = self.packages.${system}.trevrpc-js.overrideAttrs {
             dontBuild = true;
             installPhase = ''
               touch $out

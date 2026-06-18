@@ -15,7 +15,7 @@ export const Code = Object.freeze({
   Internal: 13,
   Unavailable: 14,
   DataLoss: 15,
-  Unauthenticated: 16
+  Unauthenticated: 16,
 });
 
 const CODE_NAMES = Object.freeze([
@@ -35,7 +35,7 @@ const CODE_NAMES = Object.freeze([
   "Internal",
   "Unavailable",
   "DataLoss",
-  "Unauthenticated"
+  "Unauthenticated",
 ]);
 
 export class TrevRpcError extends Error {

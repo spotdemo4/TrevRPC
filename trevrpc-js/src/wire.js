@@ -8,12 +8,12 @@ export const RpcKind = Object.freeze({
   Unary: 0,
   ClientStreaming: 1,
   ServerStreaming: 2,
-  BidirectionalStreaming: 3
+  BidirectionalStreaming: 3,
 });
 
 export const RpcStreamFrameKind = Object.freeze({
   Message: 0,
-  Status: 1
+  Status: 1,
 });
 
 export const wireRoot = protobuf.Root.fromJSON({
@@ -25,14 +25,14 @@ export const wireRoot = protobuf.Root.fromJSON({
             Unary: 0,
             ClientStreaming: 1,
             ServerStreaming: 2,
-            BidirectionalStreaming: 3
-          }
+            BidirectionalStreaming: 3,
+          },
         },
         RpcStreamFrameKind: {
           values: {
             Message: 0,
-            Status: 1
-          }
+            Status: 1,
+          },
         },
         RpcRequest: {
           fields: {
@@ -42,16 +42,16 @@ export const wireRoot = protobuf.Root.fromJSON({
             metadata: { keyType: "string", type: "bytes", id: 4 },
             kind: { type: "RpcKind", id: 5 },
             version: { type: "uint32", id: 6 },
-            deadlineUnixNanos: { type: "uint64", id: 7 }
-          }
+            deadlineUnixNanos: { type: "uint64", id: 7 },
+          },
         },
         RpcResponse: {
           fields: {
             status: { type: "uint32", id: 1 },
             message: { type: "string", id: 2 },
             body: { type: "bytes", id: 3 },
-            metadata: { keyType: "string", type: "bytes", id: 4 }
-          }
+            metadata: { keyType: "string", type: "bytes", id: 4 },
+          },
         },
         RpcStreamFrame: {
           fields: {
@@ -59,12 +59,12 @@ export const wireRoot = protobuf.Root.fromJSON({
             status: { type: "uint32", id: 2 },
             message: { type: "string", id: 3 },
             body: { type: "bytes", id: 4 },
-            metadata: { keyType: "string", type: "bytes", id: 5 }
-          }
-        }
-      }
-    }
-  }
+            metadata: { keyType: "string", type: "bytes", id: 5 },
+          },
+        },
+      },
+    },
+  },
 });
 
 export const RpcRequest = wireRoot.lookupType("trevrpc.RpcRequest");
@@ -81,6 +81,6 @@ export function messageFrame(body) {
     status: 0,
     message: "",
     body,
-    metadata: {}
+    metadata: {},
   };
 }

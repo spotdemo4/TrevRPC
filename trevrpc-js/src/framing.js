@@ -118,7 +118,8 @@ export function frameBodyLength(header, maxFrameSize = DefaultMaxFrameSize) {
 }
 
 function prepareMessage(messageType, message) {
-  const prepared = typeof messageType.fromObject === "function" ? messageType.fromObject(message) : message;
+  const prepared =
+    typeof messageType.fromObject === "function" ? messageType.fromObject(message) : message;
   const error = typeof messageType.verify === "function" ? messageType.verify(prepared) : null;
   if (error != null) {
     throw invalidArgument(`failed to encode protobuf message: ${error}`);
