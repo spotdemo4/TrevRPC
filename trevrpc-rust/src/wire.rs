@@ -250,7 +250,7 @@ mod tests {
 
     use super::{
         MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN, RpcKind, RpcRequest,
-        RpcStreamFrame, RpcStreamFrameKind, WIRE_VERSION, normalize_metadata_key,
+        RpcResponse, RpcStreamFrame, RpcStreamFrameKind, WIRE_VERSION, normalize_metadata_key,
         validate_metadata,
     };
 
@@ -340,21 +340,101 @@ mod tests {
     }
 
     #[test]
-    fn unary_request_encoding_is_stable() {
-        let request = RpcRequest::new("svc", "m", b"hi".to_vec());
+    fn wire_golden_vectors_stay_stable() {
+        let vectors = golden_vectors();
 
-        assert_eq!(
-            request.encode_to_vec(),
-            b"\x0a\x03svc\x12\x01m\x1a\x02hi\x30\x01"
+        let timeout_request =
+            RpcRequest::new("svc", "m", b"hi".to_vec()).with_timeout_nanos(123_456);
+
+        let mut metadata = Metadata::new();
+        metadata.insert("authorization".to_owned(), b"ok".to_vec());
+        let metadata_request = RpcRequest::new("svc", "m", b"hi".to_vec()).with_metadata(metadata);
+
+        assert_wire_golden_vector(
+            &vectors,
+            "rpc_request.unary",
+            &RpcRequest::new("svc", "m", b"hi".to_vec()),
+        );
+        assert_wire_golden_vector(&vectors, "rpc_request.timeout", &timeout_request);
+        assert_wire_golden_vector(&vectors, "rpc_request.metadata", &metadata_request);
+        assert_wire_golden_vector(
+            &vectors,
+            "rpc_stream_frame.message",
+            &RpcStreamFrame::message(b"hi".to_vec()),
+        );
+        assert_wire_golden_vector(
+            &vectors,
+            "rpc_stream_frame.status",
+            &RpcStreamFrame::status(crate::Status::unavailable("down")),
+        );
+        assert_wire_golden_vector(
+            &vectors,
+            "rpc_response.ok_body",
+            &RpcResponse::ok(b"hi".to_vec()),
+        );
+        assert_wire_golden_vector(
+            &vectors,
+            "rpc_response.unavailable",
+            &crate::Status::unavailable("down").into_response(Vec::new()),
         );
     }
 
-    #[test]
-    fn stream_frame_encoding_is_stable() {
-        let message = RpcStreamFrame::message(b"hi".to_vec());
-        assert_eq!(message.encode_to_vec(), b"\x22\x02hi");
+    fn assert_wire_golden_vector<M>(
+        vectors: &std::collections::HashMap<String, Vec<u8>>,
+        name: &str,
+        message: &M,
+    ) where
+        M: Message,
+    {
+        let body_name = format!("{name}.body");
+        let frame_name = format!("{name}.frame");
+        let body = message.encode_to_vec();
+        let frame = crate::framing::encode_frame(message).expect("frame should encode");
 
-        let status = RpcStreamFrame::status(crate::Status::unavailable("down"));
-        assert_eq!(status.encode_to_vec(), b"\x08\x01\x10\x0e\x1a\x04down");
+        assert_eq!(body.as_slice(), golden_vector(vectors, &body_name));
+        assert_eq!(frame.as_slice(), golden_vector(vectors, &frame_name));
+    }
+
+    fn golden_vectors() -> std::collections::HashMap<String, Vec<u8>> {
+        let mut vectors = std::collections::HashMap::new();
+
+        for (index, line) in include_str!("../../testdata/wire-golden-vectors.txt")
+            .lines()
+            .enumerate()
+        {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let (name, value) = line
+                .split_once('=')
+                .unwrap_or_else(|| panic!("invalid wire golden vector line {}", index + 1));
+            vectors.insert(name.trim().to_owned(), decode_hex(value.trim()));
+        }
+
+        vectors
+    }
+
+    fn golden_vector<'a>(
+        vectors: &'a std::collections::HashMap<String, Vec<u8>>,
+        name: &str,
+    ) -> &'a [u8] {
+        vectors.get(name).map_or_else(
+            || panic!("missing wire golden vector {name:?}"),
+            Vec::as_slice,
+        )
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "invalid hex length for {hex:?}");
+
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| {
+                u8::from_str_radix(&hex[index..index + 2], 16)
+                    .unwrap_or_else(|error| panic!("invalid hex byte in {hex:?}: {error}"))
+            })
+            .collect()
     }
 }

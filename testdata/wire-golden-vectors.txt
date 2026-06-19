@@ -1,0 +1,24 @@
+# TrevRPC wire golden vectors.
+# Each entry is hex-encoded protobuf body bytes or a 4-byte big-endian
+# length-prefixed frame using the same body bytes.
+
+rpc_request.unary.body = 0a0373766312016d1a0268693001
+rpc_request.unary.frame = 0000000e0a0373766312016d1a0268693001
+
+rpc_request.timeout.body = 0a0373766312016d1a026869300138c0c407
+rpc_request.timeout.frame = 000000120a0373766312016d1a026869300138c0c407
+
+rpc_request.metadata.body = 0a0373766312016d1a02686922130a0d617574686f72697a6174696f6e12026f6b3001
+rpc_request.metadata.frame = 000000230a0373766312016d1a02686922130a0d617574686f72697a6174696f6e12026f6b3001
+
+rpc_stream_frame.message.body = 22026869
+rpc_stream_frame.message.frame = 0000000422026869
+
+rpc_stream_frame.status.body = 0801100e1a04646f776e
+rpc_stream_frame.status.frame = 0000000a0801100e1a04646f776e
+
+rpc_response.ok_body.body = 1a026869
+rpc_response.ok_body.frame = 000000041a026869
+
+rpc_response.unavailable.body = 080e1204646f776e
+rpc_response.unavailable.frame = 00000008080e1204646f776e

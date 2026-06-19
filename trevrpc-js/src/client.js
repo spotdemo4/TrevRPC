@@ -256,16 +256,24 @@ export function createServiceClient(transport, service, root, options = {}) {
 function prepareClientRequest(service, method, kind, body, options) {
   const metadata = normalizeMetadata(options.metadata ?? {});
   validateMetadata(metadata);
-
-  return {
+  const request = {
     service,
     method,
     body,
     metadata,
-    kind,
     version: WireVersion,
-    timeoutNanos: timeoutNanos(options.timeoutMs),
   };
+  const timeout = timeoutNanos(options.timeoutMs);
+
+  if (kind !== RpcKind.Unary) {
+    request.kind = kind;
+  }
+
+  if (timeout != null) {
+    request.timeoutNanos = timeout;
+  }
+
+  return request;
 }
 
 function validateResponse(response, maxBodySize) {
@@ -433,7 +441,7 @@ function nextTimeout(deadlineAt, idleTimeoutMs) {
 
 function timeoutNanos(timeoutMs) {
   if (timeoutMs == null) {
-    return "0";
+    return null;
   }
 
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {

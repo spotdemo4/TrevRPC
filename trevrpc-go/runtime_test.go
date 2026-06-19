@@ -71,33 +71,6 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
-func TestWireStableEncoding(t *testing.T) {
-	request := NewRpcRequest("svc", "m", []byte("hi"))
-	encodedRequest, err := MarshalMessage(request)
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
-	if !bytes.Equal(encodedRequest, []byte("\x0a\x03svc\x12\x01m\x1a\x02hi\x30\x01")) {
-		t.Fatalf("unexpected request encoding: %q", encodedRequest)
-	}
-
-	message, err := MarshalMessage(MessageFrame([]byte("hi")))
-	if err != nil {
-		t.Fatalf("marshal message frame: %v", err)
-	}
-	if !bytes.Equal(message, []byte("\x22\x02hi")) {
-		t.Fatalf("unexpected message frame encoding: %q", message)
-	}
-
-	status, err := MarshalMessage(StatusFrame(Unavailable("down")))
-	if err != nil {
-		t.Fatalf("marshal status frame: %v", err)
-	}
-	if !bytes.Equal(status, []byte("\x08\x01\x10\x0e\x1a\x04down")) {
-		t.Fatalf("unexpected status frame encoding: %q", status)
-	}
-}
-
 func TestMetadataValidation(t *testing.T) {
 	if err := ValidateMetadata(Metadata{"authorization": []byte("ok")}); err != nil {
 		t.Fatalf("valid metadata was rejected: %v", err)

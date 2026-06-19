@@ -139,6 +139,8 @@
                 clippy
               ];
               checkPhase = ''
+                mkdir -p ../testdata
+                cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
                 cargo fmt --check
                 cargo test --workspace --offline
                 cargo clippy --workspace --all-targets --offline -- -D warnings
@@ -171,6 +173,8 @@
               ];
               checkPhase = ''
                 export HOME=$(mktemp -d)
+                mkdir -p ../testdata
+                cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
                 go test ./...
                 go vet ./...
                 staticcheck ./...
@@ -207,6 +211,8 @@
                 oxlint
               ];
               checkPhase = ''
+                mkdir -p ../testdata
+                cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
                 oxfmt --check
                 oxlint --deny-warnings
                 npm run typecheck

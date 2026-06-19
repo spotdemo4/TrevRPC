@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,6 +20,7 @@ import {
   decodeFrame,
   encodeFrame,
   invalidArgument,
+  marshalMessage,
   normalizeMetadata,
   unary,
 } from "../src/index.js";
@@ -46,6 +47,81 @@ test("frames round-trip TrevRPC requests", () => {
     decoded.metadata.authorization,
     new Uint8Array([66, 101, 97, 114, 101, 114, 32, 116, 111, 107, 101, 110]),
   );
+});
+
+test("wire golden vectors stay stable", async () => {
+  const vectors = await readWireGoldenVectors();
+  const timeoutRequest = RpcRequest.create({
+    service: "svc",
+    method: "m",
+    body: new Uint8Array([104, 105]),
+    metadata: {},
+    version: WireVersion,
+    timeoutNanos: 123456,
+  });
+  const metadataRequest = RpcRequest.create({
+    service: "svc",
+    method: "m",
+    body: new Uint8Array([104, 105]),
+    metadata: { authorization: new Uint8Array([111, 107]) },
+    version: WireVersion,
+  });
+
+  const tests = [
+    {
+      name: "rpc_request.unary",
+      messageType: RpcRequest,
+      message: RpcRequest.create({
+        service: "svc",
+        method: "m",
+        body: new Uint8Array([104, 105]),
+        metadata: {},
+        version: WireVersion,
+      }),
+    },
+    { name: "rpc_request.timeout", messageType: RpcRequest, message: timeoutRequest },
+    { name: "rpc_request.metadata", messageType: RpcRequest, message: metadataRequest },
+    {
+      name: "rpc_stream_frame.message",
+      messageType: RpcStreamFrame,
+      message: RpcStreamFrame.create({
+        body: new Uint8Array([104, 105]),
+      }),
+    },
+    {
+      name: "rpc_stream_frame.status",
+      messageType: RpcStreamFrame,
+      message: RpcStreamFrame.create({
+        kind: RpcStreamFrameKind.Status,
+        status: Code.Unavailable,
+        message: "down",
+      }),
+    },
+    {
+      name: "rpc_response.ok_body",
+      messageType: RpcResponse,
+      message: RpcResponse.create({
+        body: new Uint8Array([104, 105]),
+      }),
+    },
+    {
+      name: "rpc_response.unavailable",
+      messageType: RpcResponse,
+      message: RpcResponse.create({
+        status: Code.Unavailable,
+        message: "down",
+      }),
+    },
+  ];
+
+  for (const { name, messageType, message } of tests) {
+    assert.equal(
+      bytesToHex(marshalMessage(messageType, message)),
+      vectors.get(`${name}.body`),
+      name,
+    );
+    assert.equal(bytesToHex(encodeFrame(messageType, message)), vectors.get(`${name}.frame`), name);
+  }
 });
 
 test("unary decodes protobuf.js response bodies", async () => {
@@ -573,6 +649,38 @@ function importedTypeRequest() {
       },
     ],
   };
+}
+
+async function readWireGoldenVectors() {
+  const text = await readFile(
+    new URL("../../testdata/wire-golden-vectors.txt", import.meta.url),
+    "utf8",
+  );
+  const vectors = new Map();
+
+  for (const [index, rawLine] of text.split(/\r?\n/u).entries()) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) {
+      continue;
+    }
+
+    const separator = line.indexOf("=");
+    assert.notEqual(separator, -1, `invalid wire golden vector line ${index + 1}`);
+
+    const value = line
+      .slice(separator + 1)
+      .trim()
+      .toLowerCase();
+    assert.match(value, /^(?:[0-9a-f]{2})*$/u, `invalid wire golden vector line ${index + 1}`);
+
+    vectors.set(line.slice(0, separator).trim(), value);
+  }
+
+  return vectors;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function fakeBidirectionalStream({
