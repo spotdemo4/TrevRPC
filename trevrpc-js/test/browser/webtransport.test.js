@@ -12,13 +12,123 @@ import { chromium } from "playwright";
 const jsRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const repoRoot = resolve(jsRoot, "..");
 const goRoot = join(repoRoot, "trevrpc-go");
+const rustRoot = join(repoRoot, "trevrpc-rust");
 
 test("browser WebTransport client calls Go greeter example", { timeout: 120_000 }, async () => {
+  await runBrowserGreeterScenario({
+    server: servers.go,
+    name: "Go Playwright",
+    assertOutput(output) {
+      assert.match(output, /SayHello: hello Go Playwright/);
+      assert.match(output, /LotsOfReplies: hello Go Playwright/);
+      assert.match(output, /LotsOfReplies: welcome to TrevRPC over QUIC/);
+      assert.match(
+        output,
+        /LotsOfGreetings: hello, Go Playwright client stream 1, Go Playwright client stream 2/,
+      );
+      assert.match(output, /BidiHello: stream hello, Go Playwright bidi 1/);
+      assert.match(output, /BidiHello: stream hello, Go Playwright bidi 2/);
+    },
+  });
+});
+
+test("browser WebTransport client calls Rust greeter example", { timeout: 120_000 }, async () => {
+  await runBrowserGreeterScenario({
+    server: servers.rust,
+    name: "Rust Playwright",
+    assertOutput(output) {
+      assert.match(output, /SayHello: hello, Rust Playwright/);
+      assert.match(output, /LotsOfReplies: hello, Rust Playwright/);
+      assert.match(output, /LotsOfReplies: hello again, Rust Playwright/);
+      assert.match(output, /LotsOfReplies: goodbye, Rust Playwright/);
+      assert.match(
+        output,
+        /LotsOfGreetings: hello, Rust Playwright client stream 1, Rust Playwright client stream 2/,
+      );
+      assert.match(output, /BidiHello: stream hello, Rust Playwright bidi 1/);
+      assert.match(output, /BidiHello: stream hello, Rust Playwright bidi 2/);
+    },
+  });
+});
+
+test("browser WebTransport rejects an unexpected path", { timeout: 120_000 }, async () => {
+  await runBrowserGreeterScenario({
+    server: servers.go,
+    path: "/wrong",
+    expectError: true,
+  });
+});
+
+test("browser WebTransport rejects an unexpected origin", { timeout: 120_000 }, async () => {
+  await runBrowserGreeterScenario({
+    server: servers.go,
+    allowedOrigin: "http://127.0.0.1:1",
+    expectError: true,
+  });
+});
+
+test("browser WebTransport rejects an unexpected authority", { timeout: 120_000 }, async () => {
+  await runBrowserGreeterScenario({
+    server: servers.rust,
+    authorities: ["expected.example"],
+    expectError: true,
+  });
+});
+
+const servers = {
+  go: {
+    readyPattern: /WebTransport URL: https:\/\/[^\s]+\/trevrpc/,
+    certificatePattern: /wrote client trust certificate/,
+    spawn({ addr, origin, certPath }) {
+      const serverPath = process.env.TREVRPC_BROWSER_GO_SERVER;
+      const options = {
+        cwd: serverPath == null || serverPath === "" ? goRoot : repoRoot,
+        env: serverEnv({ addr, origin, certPath }),
+      };
+      if (serverPath != null && serverPath !== "") {
+        return spawnManaged(serverPath, [], options);
+      }
+
+      return spawnManaged("go", ["run", "./examples/greeter_server"], options);
+    },
+  },
+  rust: {
+    readyPattern: /TrevRPC greeter WebTransport server listening on https:\/\/[^\s]+\/trevrpc/,
+    certificatePattern: /certificate written to/,
+    spawn({ addr, authorities, origin, certPath }) {
+      const serverPath = process.env.TREVRPC_BROWSER_RUST_SERVER;
+      const options = {
+        cwd: serverPath == null || serverPath === "" ? rustRoot : repoRoot,
+        env: serverEnv({ addr, authorities, origin, certPath }),
+      };
+      if (serverPath != null && serverPath !== "") {
+        return spawnManaged(serverPath, [addr], options);
+      }
+
+      return spawnManaged(
+        "cargo",
+        ["run", "--quiet", "--example", "greeter_server", "--", addr],
+        options,
+      );
+    },
+  },
+};
+
+async function runBrowserGreeterScenario({
+  server,
+  allowedOrigin,
+  assertOutput = () => {},
+  authorities,
+  expectError = false,
+  name = "Playwright",
+  path = "/trevrpc",
+}) {
   const tempDir = await mkdtemp(join(tmpdir(), "trevrpc-browser-"));
-  const goPort = await freePort();
+  const serverPort = await freePort();
   const staticPort = await freePort();
-  const webTransportURL = `https://127.0.0.1:${goPort}/trevrpc`;
-  const staticURL = `http://127.0.0.1:${staticPort}/examples/greeter/`;
+  const staticOrigin = `http://127.0.0.1:${staticPort}`;
+  const webTransportURL = `https://127.0.0.1:${serverPort}${path}`;
+  const staticURL = `${staticOrigin}/examples/greeter/`;
   const certPath = join(tempDir, "server.pem");
   const children = [];
   let browser;
@@ -26,14 +136,15 @@ test("browser WebTransport client calls Go greeter example", { timeout: 120_000 
   let pageErrors = [];
 
   try {
-    const goServer = spawnGoServer({
-      addr: `127.0.0.1:${goPort}`,
-      origin: `http://127.0.0.1:${staticPort}`,
+    const rpcServer = server.spawn({
+      addr: `127.0.0.1:${serverPort}`,
+      authorities,
+      origin: allowedOrigin ?? staticOrigin,
       certPath,
     });
-    children.push(goServer);
-    await waitForOutput(goServer, /WebTransport URL: https:\/\/[^\s]+\/trevrpc/, 60_000);
-    await waitForOutput(goServer, /wrote client trust certificate/, 10_000);
+    children.push(rpcServer);
+    await waitForOutput(rpcServer, server.readyPattern, 60_000);
+    await waitForOutput(rpcServer, server.certificatePattern, 10_000);
 
     const staticServer = spawnManaged(process.execPath, ["examples/greeter/static-server.js"], {
       cwd: jsRoot,
@@ -45,20 +156,7 @@ test("browser WebTransport client calls Go greeter example", { timeout: 120_000 
     children.push(staticServer);
     await waitForOutput(staticServer, /serving trevrpc-js from http:\/\/127\.0\.0\.1:/, 10_000);
 
-    const launchOptions = {
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
-      chromiumSandbox: false,
-      dumpio: process.env.TREVRPC_BROWSER_DUMPIO === "1",
-    };
-    if (process.env.TREVRPC_BROWSER_CHROMIUM != null) {
-      launchOptions.executablePath = process.env.TREVRPC_BROWSER_CHROMIUM;
-    }
-    browser = await chromium.launch(launchOptions);
+    browser = await launchBrowser();
     page = await browser.newPage();
     pageErrors = [];
     page.on("pageerror", (error) => pageErrors.push(error.message));
@@ -70,7 +168,7 @@ test("browser WebTransport client calls Go greeter example", { timeout: 120_000 
 
     await page.goto(staticURL, { waitUntil: "domcontentloaded" });
     await page.fill('input[name="url"]', webTransportURL);
-    await page.fill('input[name="name"]', "Playwright");
+    await page.fill('input[name="name"]', name);
     await page.waitForFunction(
       () => document.querySelector('input[name="certificate-hash"]')?.value?.length > 0,
       null,
@@ -78,21 +176,24 @@ test("browser WebTransport client calls Go greeter example", { timeout: 120_000 
     );
     await page.click("#submit");
     await page.waitForFunction(
-      () => document.querySelector("#output")?.textContent?.includes("complete"),
-      null,
+      (shouldError) => {
+        const output = document.querySelector("#output")?.textContent ?? "";
+        return shouldError
+          ? /(?:^|\n)(?:error|RPC error):/i.test(output)
+          : output.includes("complete");
+      },
+      expectError,
       { timeout: 30_000 },
     );
 
     const output = await page.textContent("#output");
-    assert.match(output, /SayHello: hello Playwright/);
-    assert.match(output, /LotsOfReplies: hello Playwright/);
-    assert.match(output, /LotsOfReplies: welcome to TrevRPC over QUIC/);
-    assert.match(
-      output,
-      /LotsOfGreetings: hello, Playwright client stream 1, Playwright client stream 2/,
-    );
-    assert.match(output, /BidiHello: stream hello, Playwright bidi 1/);
-    assert.match(output, /BidiHello: stream hello, Playwright bidi 2/);
+    if (expectError) {
+      assert.match(output, /(?:^|\n)(?:error|RPC error):/i);
+      assert.doesNotMatch(output, /(?:^|\n)complete\n?$/i);
+      return;
+    }
+
+    assertOutput(output);
     assert.doesNotMatch(output, /(?:^|\n)(?:error|RPC error):/i);
     assert.deepEqual(pageErrors, []);
   } catch (error) {
@@ -112,7 +213,20 @@ test("browser WebTransport client calls Go greeter example", { timeout: 120_000 
     await Promise.all(children.map((child) => stopProcess(child)));
     await rm(tempDir, { force: true, recursive: true });
   }
-});
+}
+
+async function launchBrowser() {
+  const launchOptions = {
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    chromiumSandbox: false,
+    dumpio: process.env.TREVRPC_BROWSER_DUMPIO === "1",
+  };
+  if (process.env.TREVRPC_BROWSER_CHROMIUM != null) {
+    launchOptions.executablePath = process.env.TREVRPC_BROWSER_CHROMIUM;
+  }
+
+  return chromium.launch(launchOptions);
+}
 
 async function closeBrowser(browser) {
   const closed = await Promise.race([
@@ -124,27 +238,16 @@ async function closeBrowser(browser) {
   }
 }
 
-function spawnGoServer({ addr, origin, certPath }) {
-  const serverPath = process.env.TREVRPC_BROWSER_GO_SERVER;
-  if (serverPath != null && serverPath !== "") {
-    return spawnManaged(serverPath, [], {
-      cwd: repoRoot,
-      env: goServerEnv({ addr, origin, certPath }),
-    });
-  }
-
-  return spawnManaged("go", ["run", "./examples/greeter_server"], {
-    cwd: goRoot,
-    env: goServerEnv({ addr, origin, certPath }),
-  });
-}
-
-function goServerEnv({ addr, origin, certPath }) {
-  return {
+function serverEnv({ addr, authorities, origin, certPath }) {
+  const env = {
     TREVRPC_EXAMPLE_ADDR: addr,
     TREVRPC_EXAMPLE_ORIGIN: origin,
     TREVRPC_EXAMPLE_CERT: certPath,
   };
+  if (authorities != null) {
+    env.TREVRPC_EXAMPLE_AUTHORITIES = authorities.join(",");
+  }
+  return env;
 }
 
 function spawnManaged(command, args, options) {

@@ -34,7 +34,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Go/Rust native QUIC cross-runtime smoke tests cover unary, all streaming modes, auth failure, and malformed initial-frame protocol errors in both directions.
 - Shutdown tests cover stuck handlers and long-running streams.
 - Browser WebTransport greeter examples document and enforce explicit path, authority, origin, certificate, and bearer-token policy.
-- Playwright Chromium coverage exercises the JavaScript browser WebTransport client against the Go greeter server across unary, server-streaming, client-streaming, and bidirectional-streaming RPCs with certificate-hash trust and bearer auth.
+- Playwright Chromium coverage exercises the JavaScript browser WebTransport client against Go and Rust greeter servers across unary, server-streaming, client-streaming, and bidirectional-streaming RPCs with certificate-hash trust, bearer auth, and negative path/origin/authority policy cases.
 
 ## Remaining Work
 
@@ -53,7 +53,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 ### 4. Protocol and Security Validation
 
 - Expand fuzz/property tests into longer-running CI jobs for frame parsing, metadata validation, stream limits, and protobuf wire compatibility.
-- Expand cross-runtime integration beyond Go/Rust native QUIC and JS-browser-to-Go WebTransport smoke tests to include Rust WebTransport/browser paths and negative browser policy cases.
+- Expand cross-runtime integration beyond Go/Rust native QUIC and JS-browser WebTransport smoke tests to include broader browser matrices and longer-lived streaming sessions.
 
 ### 5. Shutdown, Panics, and Failure Isolation
 

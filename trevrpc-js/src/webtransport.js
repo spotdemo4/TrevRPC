@@ -228,7 +228,10 @@ function isTerminalCleanupWriterError(error) {
   }
 
   const message = error?.statusMessage ?? error?.message ?? "";
-  return error?.code === Code.Unavailable && /stream canceled with error code 0/i.test(message);
+  return (
+    error?.code === Code.Unavailable &&
+    /(?:stream canceled with error code 0|received stop_sending)/i.test(message)
+  );
 }
 
 function throwIfAborted(signal) {

@@ -829,7 +829,7 @@ test("WebTransport terminal OK does not hide local upload error", async () => {
   );
 });
 
-test("WebTransport terminal OK ignores browser code-zero upload close", async () => {
+test("WebTransport terminal OK ignores browser upload cleanup transport closes", async () => {
   const root = createRoot({
     nested: {
       hello: {
@@ -848,39 +848,44 @@ test("WebTransport terminal OK ignores browser code-zero upload close", async ()
     },
   });
   const Hello = root.lookupType("hello.v1.Hello");
-  const stream = fakeBidirectionalStream({
-    closeError: new Error("stream canceled with error code 0"),
-    readableChunks: [
-      encodeFrame(
-        RpcStreamFrame,
-        RpcStreamFrame.create({
-          kind: RpcStreamFrameKind.Status,
-          status: Code.Ok,
-          metadata: {},
-        }),
-      ),
-    ],
-  });
-  const client = new WebTransportClient({
-    ready: Promise.resolve(),
-    createBidirectionalStream() {
-      return Promise.resolve(stream);
-    },
-  });
+  for (const closeError of [
+    new Error("stream canceled with error code 0"),
+    new Error("Received STOP_SENDING."),
+  ]) {
+    const stream = fakeBidirectionalStream({
+      closeError,
+      readableChunks: [
+        encodeFrame(
+          RpcStreamFrame,
+          RpcStreamFrame.create({
+            kind: RpcStreamFrameKind.Status,
+            status: Code.Ok,
+            metadata: {},
+          }),
+        ),
+      ],
+    });
+    const client = new WebTransportClient({
+      ready: Promise.resolve(),
+      createBidirectionalStream() {
+        return Promise.resolve(stream);
+      },
+    });
 
-  const responses = await bidirectionalStreaming(
-    client,
-    "hello.v1.Greeter",
-    "BidiHello",
-    Hello,
-    Hello,
-    [],
-  );
+    const responses = await bidirectionalStreaming(
+      client,
+      "hello.v1.Greeter",
+      "BidiHello",
+      Hello,
+      Hello,
+      [],
+    );
 
-  assert.deepEqual(await responses[Symbol.asyncIterator]().next(), {
-    done: true,
-    value: undefined,
-  });
+    assert.deepEqual(await responses[Symbol.asyncIterator]().next(), {
+      done: true,
+      value: undefined,
+    });
+  }
 });
 
 test("WebTransport terminal error wins over local upload error", async () => {

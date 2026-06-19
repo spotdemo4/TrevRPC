@@ -13,8 +13,8 @@ mod cert;
 mod greeter;
 
 const DEFAULT_QUIC_ADDR: &str = "127.0.0.1:5000";
-const BROWSER_EXAMPLE_ORIGIN: &str = "http://127.0.0.1:8080";
-const AUTH_TOKEN: &str = "trevrpc-example-token";
+const DEFAULT_BROWSER_EXAMPLE_ORIGIN: &str = "http://127.0.0.1:8080";
+const DEFAULT_AUTH_TOKEN: &str = "trevrpc-example-token";
 
 struct GreeterService;
 
@@ -99,7 +99,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let identity = make_identity()?;
     let certificate_path = cert::certificate_path()?;
     write_certificate(&identity, &certificate_path)?;
-    let webtransport_authorities = webtransport_authorities(addr);
+    let webtransport_authorities =
+        env_list("TREVRPC_EXAMPLE_AUTHORITIES").unwrap_or_else(|| webtransport_authorities(addr));
+    let browser_example_origin = env_or("TREVRPC_EXAMPLE_ORIGIN", DEFAULT_BROWSER_EXAMPLE_ORIGIN);
+    let auth_token = env_or("TREVRPC_EXAMPLE_TOKEN", DEFAULT_AUTH_TOKEN);
 
     let mut server = trevrpc::server::Server::new();
     let options = trevrpc::server::ServerOptions::new()
@@ -107,9 +110,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_max_concurrent_streams_per_connection(Some(64))
         .with_max_concurrent_requests(Some(1024))
         .with_webtransport_allowed_authorities(webtransport_authorities)
-        .with_webtransport_allowed_origins(&[BROWSER_EXAMPLE_ORIGIN]);
+        .with_webtransport_allowed_origins(leak_slice([browser_example_origin]));
     server.set_options(options);
-    server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(auth_token));
     greeter::register_greeter(&mut server, GreeterService);
 
     let endpoint = make_endpoint(addr, &identity, server.options())?;
@@ -123,7 +126,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         endpoint.local_addr()?
     );
     println!("certificate written to {}", certificate_path.display());
-    println!("bearer token: {AUTH_TOKEN}");
+    println!("bearer token: {auth_token}");
     println!("press Ctrl+C to shut down");
 
     server
@@ -170,7 +173,30 @@ fn make_endpoint(
 
 fn webtransport_authorities(addr: SocketAddr) -> &'static [&'static str] {
     let authority: &'static str = Box::leak(addr.to_string().into_boxed_str());
-    Box::leak(vec![authority].into_boxed_slice())
+    leak_slice([authority])
+}
+
+fn env_or(name: &str, fallback: &'static str) -> &'static str {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Box::leak(value.into_boxed_str()),
+        _ => fallback,
+    }
+}
+
+fn env_list(name: &str) -> Option<&'static [&'static str]> {
+    let values = std::env::var(name).ok()?;
+    let values = values
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| Box::leak(value.to_owned().into_boxed_str()) as &'static str)
+        .collect::<Vec<_>>();
+
+    (!values.is_empty()).then(|| Box::leak(values.into_boxed_slice()) as &'static [&'static str])
+}
+
+fn leak_slice<const N: usize>(values: [&'static str; N]) -> &'static [&'static str] {
+    Box::leak(Vec::from(values).into_boxed_slice())
 }
 
 fn write_certificate(

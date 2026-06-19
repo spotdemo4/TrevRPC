@@ -307,11 +307,33 @@
 
                 meta.mainProgram = "greeter_server";
               });
+              browserRustServer = pkgs.rustPlatform.buildRustPackage {
+                pname = "trevrpc-browser-rust-server";
+                version = "0.1.0";
+
+                src = ./trevrpc-rust;
+                cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
+                cargoBuildFlags = [
+                  "--example"
+                  "greeter_server"
+                ];
+                doCheck = false;
+
+                installPhase = ''
+                  runHook preInstall
+                  server=$(find target -path '*/release/examples/greeter_server' -type f -perm -0100 | head -n1)
+                  install -Dm755 "$server" $out/bin/greeter_server
+                  runHook postInstall
+                '';
+
+                meta.mainProgram = "greeter_server";
+              };
             in
             self.packages.${system}.trevrpc-js.overrideAttrs {
               dontBuild = true;
               PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
               TREVRPC_BROWSER_GO_SERVER = "${browserGoServer}/bin/greeter_server";
+              TREVRPC_BROWSER_RUST_SERVER = "${browserRustServer}/bin/greeter_server";
               checkPhase = ''
                 export HOME=$(mktemp -d)
                 for chromium in ${pkgs.playwright-driver.browsers}/chromium-*/chrome-linux*/chrome; do
