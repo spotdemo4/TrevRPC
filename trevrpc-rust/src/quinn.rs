@@ -324,8 +324,12 @@ impl MessageStream<RpcStreamFrame> for QuinnResponseStream {
             Ok(Some(frame)) => {
                 if frame.frame_kind() == Some(RpcStreamFrameKind::Status) {
                     self.complete = true;
-                    if let Err(error) = self.stop_writer(true).await {
-                        return Some(Err(error));
+                    if frame.status_value().is_ok() {
+                        if let Err(error) = self.stop_writer(true).await {
+                            return Some(Err(error));
+                        }
+                    } else {
+                        self.ignore_writer_error();
                     }
                 }
                 Some(Ok(frame))
@@ -362,6 +366,14 @@ impl QuinnResponseStream {
             Ok(Err(error)) => Err(error),
             Err(error) if ignore_cancelled && error.is_cancelled() => Ok(()),
             Err(error) => Err(Error::transport(error)),
+        }
+    }
+
+    fn ignore_writer_error(&mut self) {
+        if let Some(write_task) = self.write_task.take()
+            && !write_task.is_finished()
+        {
+            write_task.abort();
         }
     }
 }

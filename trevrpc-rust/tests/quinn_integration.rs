@@ -157,6 +157,32 @@ impl Drop for PendingGreeterRequests {
     }
 }
 
+struct FirstThenErrorGreeterRequests {
+    sent: bool,
+}
+
+impl FirstThenErrorGreeterRequests {
+    fn new() -> Self {
+        Self { sent: false }
+    }
+}
+
+#[trevrpc::async_trait]
+impl MessageStream<greeter::HelloRequest> for FirstThenErrorGreeterRequests {
+    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloRequest>> {
+        if !self.sent {
+            self.sent = true;
+            return Some(Ok(greeter::HelloRequest {
+                name: "uploaded".to_owned(),
+            }));
+        }
+
+        Some(Err(trevrpc::Error::from(Status::invalid_argument(
+            "local upload failed",
+        ))))
+    }
+}
+
 struct RunningServer {
     addr: SocketAddr,
     cert_der: CertificateDer<'static>,
@@ -972,6 +998,56 @@ async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResu
 }
 
 #[tokio::test]
+async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
+    let server = spawn_greeter_server(register_accept_upload_route)?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let mut replies = trevrpc::client::bidirectional_streaming::<_, _, greeter::HelloReply>(
+        &transport,
+        greeter::GreeterClient::<()>::SERVICE,
+        "AcceptUpload",
+        Box::new(FirstThenErrorGreeterRequests::new()),
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+    )
+    .await?;
+
+    let error = replies
+        .next()
+        .await
+        .expect("local upload error should be delivered")
+        .expect_err("terminal OK should not hide local upload error");
+
+    assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_terminal_ok_surfaces_local_upload_error() -> TestResult {
+    let server = spawn_webtransport_greeter_server(register_accept_upload_route)?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let mut replies = trevrpc::client::bidirectional_streaming::<_, _, greeter::HelloReply>(
+        &transport,
+        greeter::GreeterClient::<()>::SERVICE,
+        "AcceptUpload",
+        Box::new(FirstThenErrorGreeterRequests::new()),
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+    )
+    .await?;
+
+    let error = replies
+        .next()
+        .await
+        .expect("local upload error should be delivered")
+        .expect_err("terminal OK should not hide local upload error");
+
+    assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_shutdown_closes_active_connections() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, client) = connect_client(&server).await?;
@@ -1474,6 +1550,15 @@ fn register_reject_upload_route(server: &mut Server) {
                 "upload rejected",
             )))
         },
+    );
+}
+
+fn register_accept_upload_route(server: &mut Server) {
+    server.route_streaming(
+        greeter::GreeterClient::<()>::SERVICE,
+        "AcceptUpload",
+        trevrpc::RpcKind::BidirectionalStreaming,
+        |_body, _requests| async { Ok(trevrpc::stream::empty()) },
     );
 }
 

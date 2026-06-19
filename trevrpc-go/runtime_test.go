@@ -322,6 +322,25 @@ func TestResponseStreamTerminalOKDoesNotHideCloseError(t *testing.T) {
 	}
 }
 
+func TestResponseStreamTerminalErrorWinsOverCloseError(t *testing.T) {
+	closeErr := InvalidArgument("local upload failed")
+	stream := newResponseMessageStream[*testMessage](
+		&closeErrorFrameStream{
+			frames: []*RpcStreamFrame{StatusFrame(NewStatus(CodePermissionDenied, "remote rejected upload"))},
+			err:    closeErr,
+		},
+		func() *testMessage { return &testMessage{} },
+		DefaultCallOptions(),
+		context.Background(),
+		func() {},
+	)
+
+	_, err := stream.Recv()
+	if code := StatusFromError(err).Code; code != CodePermissionDenied {
+		t.Fatalf("expected remote permission denied to win, got %v (%v)", code, err)
+	}
+}
+
 func TestResponseStreamCloseIsIdempotentAndSurfacesCloseError(t *testing.T) {
 	closeErr := InvalidArgument("local close failed")
 	inner := &closeErrorFrameStream{err: closeErr}
@@ -1409,6 +1428,22 @@ func TestQuicTerminalStatusClosesPendingRequestStream(t *testing.T) {
 	requests.waitClosed(t)
 }
 
+func TestQuicTerminalOKSurfacesLocalUploadError(t *testing.T) {
+	running := startTestQUICServer(t, registerAcceptUploadRoute)
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed")}
+
+	replies, err := BidirectionalStreaming(context.Background(), NewQuicClient(conn), testServiceName, "AcceptUpload", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	if err != nil {
+		t.Fatalf("start accepting bidi stream: %v", err)
+	}
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodeInvalidArgument {
+		t.Fatalf("expected local invalid argument, got %v (%v)", code, err)
+	}
+}
+
 func TestWebTransportTerminalStatusClosesPendingRequestStream(t *testing.T) {
 	running := startTestWebTransportServer(t, registerRejectUploadRoute)
 	transport := connectTestWebTransportClient(t, running)
@@ -1424,6 +1459,22 @@ func TestWebTransportTerminalStatusClosesPendingRequestStream(t *testing.T) {
 		t.Fatalf("expected permission denied, got %v (%v)", code, err)
 	}
 	requests.waitClosed(t)
+}
+
+func TestWebTransportTerminalOKSurfacesLocalUploadError(t *testing.T) {
+	running := startTestWebTransportServer(t, registerAcceptUploadRoute)
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed")}
+
+	replies, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "AcceptUpload", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	if err != nil {
+		t.Fatalf("start accepting WebTransport bidi stream: %v", err)
+	}
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodeInvalidArgument {
+		t.Fatalf("expected local invalid argument, got %v (%v)", code, err)
+	}
 }
 
 func TestQuicShutdownClosesActiveConnections(t *testing.T) {
@@ -1978,6 +2029,12 @@ func registerRejectUploadRoute(server *Server) {
 	})
 }
 
+func registerAcceptUploadRoute(server *Server) {
+	server.RouteStreaming(testServiceName, "AcceptUpload", RpcKindBidirectionalStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return EmptyStream[[]byte](), nil
+	})
+}
+
 type closeErrorFrameStream struct {
 	frames []*RpcStreamFrame
 	err    error
@@ -2052,6 +2109,12 @@ type blockingTestMessages struct {
 	once   sync.Once
 }
 
+type firstThenErrorTestMessages struct {
+	message *testMessage
+	err     error
+	sent    bool
+}
+
 func newBlockingTestMessages() *blockingTestMessages {
 	return &blockingTestMessages{closed: make(chan struct{})}
 }
@@ -2073,6 +2136,19 @@ func (s *blockingTestMessages) waitClosed(t *testing.T) {
 	case <-time.After(testTimeout):
 		t.Fatal("request stream was not closed")
 	}
+}
+
+func (s *firstThenErrorTestMessages) Recv() (*testMessage, error) {
+	if !s.sent {
+		s.sent = true
+		return s.message, nil
+	}
+
+	return nil, s.err
+}
+
+func (*firstThenErrorTestMessages) Close() error {
+	return nil
 }
 
 type firstThenPendingTestMessages struct {

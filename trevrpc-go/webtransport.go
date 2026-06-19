@@ -120,18 +120,28 @@ func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
 	read, err := ReadFrameOrEOF(s.stream, frame, s.maxFrameSize)
 	if err != nil {
 		s.finish(false)
+		if writerErr := s.writerError(false); writerErr != nil {
+			return nil, writerErr
+		}
 		return nil, webTransportStatus(err)
 	}
 
 	if !read {
 		s.finish(false)
+		if writerErr := s.writerError(false); writerErr != nil {
+			return nil, writerErr
+		}
 		return nil, io.EOF
 	}
 
 	if frame.Kind == RpcStreamFrameKindStatus {
 		s.finish(false)
-		if err := s.writerError(true); err != nil {
-			return nil, err
+		if frame.StatusValue().IsOK() {
+			if err := s.writerError(true); err != nil {
+				return nil, err
+			}
+		} else {
+			s.ignoreWriterError()
 		}
 	}
 
@@ -174,6 +184,10 @@ func (s *webTransportResponseStream) writerError(ignoreCancelled bool) error {
 	}
 
 	return err
+}
+
+func (s *webTransportResponseStream) ignoreWriterError() {
+	s.writerDone = nil
 }
 
 func cancelWebTransportStreamOnContext(ctx context.Context, stream *webtransport.Stream) func() {

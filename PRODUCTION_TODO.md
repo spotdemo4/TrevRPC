@@ -21,6 +21,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Go and Rust shutdown cancellation reaches active native QUIC/WebTransport stream tasks.
 - Streaming terminal-status, early-close, upload-writer, and request-iterable cleanup paths have targeted coverage.
 - Public response-stream close/drop/return semantics are documented and covered for Go, JavaScript, and Rust transports.
+- Terminal streaming status precedence is covered so terminal `OK` surfaces meaningful local upload/close failures while terminal non-OK statuses win once received.
 - Cancellation/deadline race coverage exists for unary, server-streaming, client-streaming, and bidirectional-streaming client paths across Go, JavaScript, and Rust.
 - Native QUIC/WebTransport integration tests cover pending response-read and request-upload cancellation/deadline races in Go and Rust.
 - Slowloris-style partial-header, partial-body, and oversized-initial-frame tests exist where the transports expose those states.
@@ -43,8 +44,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 
 ### 3. Streaming Lifecycle and Error Propagation
 
-- Add more close/drop/return race tests against terminal statuses, local cancellation, and local upload failures.
-- Finish cross-runtime coverage for local encode/write failures racing successful remote responses.
+- Add more browser/runtime WebTransport lifecycle tests for terminal statuses, local cancellation, and local upload failures where mock/unit coverage cannot prove browser behavior.
 
 ### 4. Protocol and Security Validation
 
