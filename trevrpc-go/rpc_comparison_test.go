@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,8 +44,11 @@ func BenchmarkRPCComparison(b *testing.B) {
 	env := startRPCComparisonEnvironment(b)
 
 	b.Run("unary_round_trip", func(b *testing.B) {
+		b.Run("trevrpc_local", func(b *testing.B) {
+			benchmarkTrevRPCUnary(b, env.trevrpcLocalClient)
+		})
 		b.Run("trevrpc_quic", func(b *testing.B) {
-			benchmarkTrevRPCUnary(b, env.trevrpcClient)
+			benchmarkTrevRPCUnary(b, env.trevrpcQUICClient)
 		})
 		b.Run("grpc_go", func(b *testing.B) {
 			benchmarkGRPCUnary(b, env.grpcConn)
@@ -52,8 +56,11 @@ func BenchmarkRPCComparison(b *testing.B) {
 	})
 
 	b.Run("server_stream_16_messages", func(b *testing.B) {
+		b.Run("trevrpc_local", func(b *testing.B) {
+			benchmarkTrevRPCServerStreaming(b, env.trevrpcLocalClient)
+		})
 		b.Run("trevrpc_quic", func(b *testing.B) {
-			benchmarkTrevRPCServerStreaming(b, env.trevrpcClient)
+			benchmarkTrevRPCServerStreaming(b, env.trevrpcQUICClient)
 		})
 		b.Run("grpc_go", func(b *testing.B) {
 			benchmarkGRPCServerStreaming(b, env.grpcConn)
@@ -61,8 +68,11 @@ func BenchmarkRPCComparison(b *testing.B) {
 	})
 
 	b.Run("client_stream_16_messages", func(b *testing.B) {
+		b.Run("trevrpc_local", func(b *testing.B) {
+			benchmarkTrevRPCClientStreaming(b, env.trevrpcLocalClient)
+		})
 		b.Run("trevrpc_quic", func(b *testing.B) {
-			benchmarkTrevRPCClientStreaming(b, env.trevrpcClient)
+			benchmarkTrevRPCClientStreaming(b, env.trevrpcQUICClient)
 		})
 		b.Run("grpc_go", func(b *testing.B) {
 			benchmarkGRPCClientStreaming(b, env.grpcConn)
@@ -70,8 +80,11 @@ func BenchmarkRPCComparison(b *testing.B) {
 	})
 
 	b.Run("bidi_stream_16_messages", func(b *testing.B) {
+		b.Run("trevrpc_local", func(b *testing.B) {
+			benchmarkTrevRPCBidiStreaming(b, env.trevrpcLocalClient)
+		})
 		b.Run("trevrpc_quic", func(b *testing.B) {
-			benchmarkTrevRPCBidiStreaming(b, env.trevrpcClient)
+			benchmarkTrevRPCBidiStreaming(b, env.trevrpcQUICClient)
 		})
 		b.Run("grpc_go", func(b *testing.B) {
 			benchmarkGRPCBidiStreaming(b, env.grpcConn)
@@ -184,16 +197,18 @@ func benchmarkGRPCBidiStreaming(b *testing.B, conn *grpc.ClientConn) {
 }
 
 type rpcComparisonEnvironment struct {
-	trevrpcClient *greeter.GreeterClient
-	grpcConn      *grpc.ClientConn
+	trevrpcLocalClient *greeter.GreeterClient
+	trevrpcQUICClient  *greeter.GreeterClient
+	grpcConn           *grpc.ClientConn
 }
 
 func startRPCComparisonEnvironment(b *testing.B) *rpcComparisonEnvironment {
 	b.Helper()
 
-	trevrpcClient := startTrevRPCComparisonClient(b)
+	trevrpcLocalClient := startTrevRPCLocalComparisonClient()
+	trevrpcQUICClient := startTrevRPCQUICComparisonClient(b)
 	grpcConn := startGRPCComparisonClient(b)
-	env := &rpcComparisonEnvironment{trevrpcClient: trevrpcClient, grpcConn: grpcConn}
+	env := &rpcComparisonEnvironment{trevrpcLocalClient: trevrpcLocalClient, trevrpcQUICClient: trevrpcQUICClient, grpcConn: grpcConn}
 	warmRPCComparisonEnvironment(b, env)
 	return env
 }
@@ -204,25 +219,37 @@ func warmRPCComparisonEnvironment(b *testing.B, env *rpcComparisonEnvironment) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := env.trevrpcClient.SayHello(ctx, comparisonRequests[0]); err != nil {
+	if _, err := env.trevrpcLocalClient.SayHello(ctx, comparisonRequests[0]); err != nil {
+		b.Fatalf("warm TrevRPC local unary: %v", err)
+	}
+	if _, err := env.trevrpcQUICClient.SayHello(ctx, comparisonRequests[0]); err != nil {
 		b.Fatalf("warm TrevRPC unary: %v", err)
 	}
 	if _, err := grpcUnaryCall(ctx, env.grpcConn); err != nil {
 		b.Fatalf("warm grpc unary: %v", err)
 	}
-	if _, err := trevrpcServerStreamingCall(ctx, env.trevrpcClient); err != nil {
+	if _, err := trevrpcServerStreamingCall(ctx, env.trevrpcLocalClient); err != nil {
+		b.Fatalf("warm TrevRPC local server streaming: %v", err)
+	}
+	if _, err := trevrpcServerStreamingCall(ctx, env.trevrpcQUICClient); err != nil {
 		b.Fatalf("warm TrevRPC server streaming: %v", err)
 	}
 	if _, err := grpcServerStreamingCall(ctx, env.grpcConn); err != nil {
 		b.Fatalf("warm grpc server streaming: %v", err)
 	}
-	if _, err := trevrpcClientStreamingCall(ctx, env.trevrpcClient); err != nil {
+	if _, err := trevrpcClientStreamingCall(ctx, env.trevrpcLocalClient); err != nil {
+		b.Fatalf("warm TrevRPC local client streaming: %v", err)
+	}
+	if _, err := trevrpcClientStreamingCall(ctx, env.trevrpcQUICClient); err != nil {
 		b.Fatalf("warm TrevRPC client streaming: %v", err)
 	}
 	if _, err := grpcClientStreamingCall(ctx, env.grpcConn); err != nil {
 		b.Fatalf("warm grpc client streaming: %v", err)
 	}
-	if _, err := trevrpcBidiStreamingCall(ctx, env.trevrpcClient); err != nil {
+	if _, err := trevrpcBidiStreamingCall(ctx, env.trevrpcLocalClient); err != nil {
+		b.Fatalf("warm TrevRPC local bidi streaming: %v", err)
+	}
+	if _, err := trevrpcBidiStreamingCall(ctx, env.trevrpcQUICClient); err != nil {
 		b.Fatalf("warm TrevRPC bidi streaming: %v", err)
 	}
 	if _, err := grpcBidiStreamingCall(ctx, env.grpcConn); err != nil {
@@ -230,16 +257,15 @@ func warmRPCComparisonEnvironment(b *testing.B, env *rpcComparisonEnvironment) {
 	}
 }
 
-func startTrevRPCComparisonClient(b *testing.B) *greeter.GreeterClient {
+func startTrevRPCLocalComparisonClient() *greeter.GreeterClient {
+	return greeter.NewGreeterClient(localComparisonTransport{server: newComparisonTrevRPCServer()}, trevrpc.WithoutStreamIdleTimeout())
+}
+
+func startTrevRPCQUICComparisonClient(b *testing.B) *greeter.GreeterClient {
 	b.Helper()
 
 	serverTLS, clientTLS := comparisonTLSConfig(b)
-	server := trevrpc.NewServer()
-	options := server.Options()
-	options.GracefulShutdownTimeout = time.Second
-	options.StreamIdleTimeout = 0
-	server.SetOptions(options)
-	greeter.RegisterGreeterServer(server, comparisonGreeter{})
+	server := newComparisonTrevRPCServer()
 
 	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, trevrpc.QUICServerConfig(server.Options(), comparisonQUICConfig()))
 	if err != nil {
@@ -274,6 +300,56 @@ func startTrevRPCComparisonClient(b *testing.B) *greeter.GreeterClient {
 	})
 
 	return greeter.NewGreeterClient(trevrpc.NewQuicClient(conn), trevrpc.WithoutStreamIdleTimeout())
+}
+
+func newComparisonTrevRPCServer() *trevrpc.Server {
+	server := trevrpc.NewServer()
+	options := server.Options()
+	options.GracefulShutdownTimeout = time.Second
+	options.StreamIdleTimeout = 0
+	server.SetOptions(options)
+	greeter.RegisterGreeterServer(server, comparisonGreeter{})
+	return server
+}
+
+type localComparisonTransport struct {
+	server *trevrpc.Server
+}
+
+func (t localComparisonTransport) Call(ctx context.Context, request *trevrpc.RpcRequest) (*trevrpc.RpcResponse, error) {
+	return t.server.HandleRequest(ctx, request), nil
+}
+
+func (t localComparisonTransport) StreamingCall(ctx context.Context, request *trevrpc.RpcRequest, requestBody trevrpc.ByteStream) (trevrpc.FrameStream, error) {
+	responses := make(chan trevrpc.FrameStream, 1)
+	go func() {
+		responses <- t.server.HandleStreamingRequest(ctx, request, requestBody)
+	}()
+	return &localComparisonFrameStream{responses: responses}, nil
+}
+
+type localComparisonFrameStream struct {
+	responses <-chan trevrpc.FrameStream
+	once      sync.Once
+	stream    trevrpc.FrameStream
+}
+
+func (s *localComparisonFrameStream) Recv() (*trevrpc.RpcStreamFrame, error) {
+	return s.responseStream().Recv()
+}
+
+func (s *localComparisonFrameStream) Close() error {
+	if s.stream == nil {
+		return nil
+	}
+	return s.stream.Close()
+}
+
+func (s *localComparisonFrameStream) responseStream() trevrpc.FrameStream {
+	s.once.Do(func() {
+		s.stream = <-s.responses
+	})
+	return s.stream
 }
 
 func startGRPCComparisonClient(b *testing.B) *grpc.ClientConn {
