@@ -341,6 +341,55 @@ func TestResponseStreamTerminalErrorWinsOverCloseError(t *testing.T) {
 	}
 }
 
+func TestResponseStreamLocalCancelWinsOverReadyStreamError(t *testing.T) {
+	errors := make(chan error, 1)
+	errors <- InvalidArgument("response read failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stream := newResponseMessageStream[*testMessage](
+		uploadErrorFrameStream{errors: errors},
+		func() *testMessage { return &testMessage{} },
+		DefaultCallOptions(),
+		ctx,
+		func() {},
+	)
+
+	_, err := stream.Recv()
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled to win over response read error, got %v (%v)", code, err)
+	}
+}
+
+func TestResponseStreamLocalCancelWinsOverTerminalOKCloseError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stream := newResponseMessageStream[*testMessage](
+		&closeErrorFrameStream{
+			frames: []*RpcStreamFrame{StatusFrame(OK())},
+			err:    InvalidArgument("local close failed"),
+		},
+		func() *testMessage { return &testMessage{} },
+		DefaultCallOptions(),
+		ctx,
+		func() {},
+	)
+
+	_, err := stream.Recv()
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled to win over close error, got %v (%v)", code, err)
+	}
+}
+
+func TestRecvRequestBodyLocalCancelWinsOverRequestError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := recvRequestBody(ctx, byteErrorStream{err: InvalidArgument("upload failed")})
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled to win over upload error, got %v (%v)", code, err)
+	}
+}
+
 func TestResponseStreamCloseIsIdempotentAndSurfacesCloseError(t *testing.T) {
 	closeErr := InvalidArgument("local close failed")
 	inner := &closeErrorFrameStream{err: closeErr}
@@ -2083,11 +2132,21 @@ type uploadErrorFrameStream struct {
 	errors <-chan error
 }
 
+type byteErrorStream struct {
+	err error
+}
+
 func (s uploadErrorFrameStream) Recv() (*RpcStreamFrame, error) {
 	return nil, <-s.errors
 }
 
 func (uploadErrorFrameStream) Close() error { return nil }
+
+func (s byteErrorStream) Recv() ([]byte, error) {
+	return nil, s.err
+}
+
+func (byteErrorStream) Close() error { return nil }
 
 func (s *closeErrorFrameStream) Recv() (*RpcStreamFrame, error) {
 	if len(s.frames) == 0 {

@@ -180,7 +180,7 @@ func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *Rp
 
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
 		stream.CancelWrite(cancelledStreamCode)
-		return transportStatus(err)
+		return transportOrContextStatus(ctx, err)
 	}
 
 	for {
@@ -191,19 +191,27 @@ func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *Rp
 
 		if err != nil {
 			stream.CancelWrite(cancelledStreamCode)
-			return transportStatus(err)
+			return transportOrContextStatus(ctx, err)
 		}
 
 		if err := WriteFrame(stream, MessageFrame(body), maxFrameSize); err != nil {
 			stream.CancelWrite(cancelledStreamCode)
-			return transportStatus(err)
+			return transportOrContextStatus(ctx, err)
 		}
 	}
 
-	return transportStatus(stream.Close())
+	if err := stream.Close(); err != nil {
+		return transportOrContextStatus(ctx, err)
+	}
+
+	return nil
 }
 
 func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContextError(err)
+	}
+
 	type recvResult struct {
 		body []byte
 		err  error
@@ -217,6 +225,12 @@ func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error
 
 	select {
 	case result := <-results:
+		if result.err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, statusFromContextError(err)
+			}
+		}
+
 		return result.body, result.err
 	case <-ctx.Done():
 		return nil, statusFromContextError(ctx.Err())

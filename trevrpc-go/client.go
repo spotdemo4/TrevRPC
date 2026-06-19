@@ -391,6 +391,10 @@ func (s *responseMessageStream[T]) Close() error {
 }
 
 func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout time.Duration) (*RpcStreamFrame, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContextError(err)
+	}
+
 	type recvResult struct {
 		frame *RpcStreamFrame
 		err   error
@@ -412,10 +416,20 @@ func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout t
 
 	select {
 	case result := <-results:
+		if result.err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, statusFromContextError(err)
+			}
+		}
+
 		return result.frame, result.err
 	case <-ctx.Done():
 		return nil, statusFromContextError(ctx.Err())
 	case <-idle:
+		if err := ctx.Err(); err != nil {
+			return nil, statusFromContextError(err)
+		}
+
 		return nil, Unavailable("response stream idle timeout")
 	}
 }

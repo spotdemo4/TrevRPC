@@ -209,7 +209,7 @@ func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport
 
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
 		stream.CancelWrite(cancelledWebTransportStreamCode)
-		return webTransportStatus(err)
+		return webTransportOrContextStatus(ctx, err)
 	}
 
 	for {
@@ -220,16 +220,20 @@ func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport
 
 		if err != nil {
 			stream.CancelWrite(cancelledWebTransportStreamCode)
-			return webTransportStatus(err)
+			return webTransportOrContextStatus(ctx, err)
 		}
 
 		if err := WriteFrame(stream, MessageFrame(body), maxFrameSize); err != nil {
 			stream.CancelWrite(cancelledWebTransportStreamCode)
-			return webTransportStatus(err)
+			return webTransportOrContextStatus(ctx, err)
 		}
 	}
 
-	return webTransportStatus(stream.Close())
+	if err := stream.Close(); err != nil {
+		return webTransportOrContextStatus(ctx, err)
+	}
+
+	return nil
 }
 
 func isWebTransportQUICConnection(conn *quic.Conn, options ServerOptions) bool {

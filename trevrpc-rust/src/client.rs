@@ -630,7 +630,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::{Code, MessageStream, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+    use crate::{
+        Code, Error, MessageStream, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status,
+    };
 
     use super::{
         CallOptions, ResponseMessageStream, RpcTransport, bidirectional_streaming,
@@ -980,10 +982,21 @@ mod tests {
 
     struct PendingFrameStream;
 
+    struct ErrorFrameStream;
+
     #[crate::async_trait]
     impl MessageStream<RpcStreamFrame> for PendingFrameStream {
         async fn next(&mut self) -> Option<Result<RpcStreamFrame>> {
             std::future::pending().await
+        }
+    }
+
+    #[crate::async_trait]
+    impl MessageStream<RpcStreamFrame> for ErrorFrameStream {
+        async fn next(&mut self) -> Option<Result<RpcStreamFrame>> {
+            Some(Err(Error::from(Status::invalid_argument(
+                "response read failed",
+            ))))
         }
     }
 
@@ -1024,6 +1037,31 @@ mod tests {
             .await
             .expect("timeout error should be emitted")
             .expect_err("pending response should hit deadline");
+
+        assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_stream_deadline_wins_over_ready_response_error() {
+        let mut response = ResponseMessageStream::<TestMessage>::new(
+            Box::new(ErrorFrameStream),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(4096),
+            Some(64 * 1024 * 1024),
+            Some(Duration::from_secs(30)),
+            Some(
+                std::time::Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("test deadline should be representable"),
+            ),
+        );
+
+        let error = response
+            .next()
+            .await
+            .expect("deadline error should be emitted")
+            .expect_err("expired deadline should win over response error");
 
         assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
         assert!(response.next().await.is_none());

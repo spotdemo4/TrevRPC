@@ -23,6 +23,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Public response-stream close/drop/return semantics are documented and covered for Go, JavaScript, and Rust transports.
 - Terminal streaming status precedence is covered so terminal `OK` surfaces meaningful local upload/close failures while terminal non-OK statuses win once received.
 - Cancellation/deadline race coverage exists for unary, server-streaming, client-streaming, and bidirectional-streaming client paths across Go, JavaScript, and Rust.
+- Local cancellation/deadline precedence is covered so Go cancellation and Rust deadlines win over ready upload, response-read, and cleanup errors on deterministic client paths.
 - Native QUIC/WebTransport integration tests cover pending response-read and request-upload cancellation/deadline races in Go and Rust.
 - Slowloris-style partial-header, partial-body, and oversized-initial-frame tests exist where the transports expose those states.
 - Frame readers avoid allocating the full advertised body length before bytes arrive, with large partial-body coverage in Go, JavaScript, and Rust.
@@ -36,7 +37,6 @@ This repository is not production-ready yet. Track the remaining work here so ru
 ### 1. Cancellation and Deadlines
 
 - Continue auditing transport-level waits for hard cancellation bounds, especially stream close, session shutdown waits, and races between local cancellation and remote terminal statuses not covered by deterministic integration cases.
-- Ensure Go and Rust clients consistently surface local context cancellation when request upload, response read, and transport close fail concurrently.
 
 ### 2. Initial Frame, Header, Body, and Resource Limits
 
