@@ -201,12 +201,14 @@
 
               src = ./trevrpc-js;
               nodejs = pkgs.nodejs_24;
-              dontNpmBuild = true;
-              PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
+
               npmConfigHook = pkgs.importNpmLock.npmConfigHook;
               npmDeps = pkgs.importNpmLock {
                 npmRoot = final.src;
               };
+
+              dontNpmBuild = true;
+              PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
               nativeCheckInputs = with pkgs; [
                 oxfmt
