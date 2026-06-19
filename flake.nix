@@ -165,7 +165,7 @@
               version = "0.1.0";
 
               src = ./trevrpc-go;
-              vendorHash = "sha256-b1Qj4m2yyMpJr2z7pDYJYY2kOThR9FnAHVk5NZbvba8=";
+              vendorHash = "sha256-AMBWQuMuYw4z/ettBdrlCc3QuyX68F/RDCYOOc1GDOk=";
               subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
 
               nativeCheckInputs = with pkgs; [
@@ -278,7 +278,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-b1Qj4m2yyMpJr2z7pDYJYY2kOThR9FnAHVk5NZbvba8=";
+                vendorHash = "sha256-AMBWQuMuYw4z/ettBdrlCc3QuyX68F/RDCYOOc1GDOk=";
                 subPackages = [ "cmd/trevrpc-xruntime-go" ];
 
                 meta.mainProgram = "trevrpc-xruntime-go";
@@ -302,7 +302,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-b1Qj4m2yyMpJr2z7pDYJYY2kOThR9FnAHVk5NZbvba8=";
+                vendorHash = "sha256-AMBWQuMuYw4z/ettBdrlCc3QuyX68F/RDCYOOc1GDOk=";
                 subPackages = [ "examples/greeter_server" ];
 
                 meta.mainProgram = "greeter_server";
@@ -312,7 +312,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-b1Qj4m2yyMpJr2z7pDYJYY2kOThR9FnAHVk5NZbvba8=";
+                vendorHash = "sha256-AMBWQuMuYw4z/ettBdrlCc3QuyX68F/RDCYOOc1GDOk=";
                 subPackages = [ "cmd/trevrpc-browser-lifecycle-go" ];
 
                 meta.mainProgram = "trevrpc-browser-lifecycle-go";
