@@ -11,6 +11,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Default frame and concurrency limits were reduced to bounded production defaults.
 - Request/response stream message count, body-size, and idle-timeout limits exist.
 - Unknown `RpcKind` and `RpcStreamFrameKind` values are rejected as protocol errors.
+- Malformed frame protobuf, oversized frames, decode errors, transport failures, cancellations, and deadlines map to stable canonical statuses on core paths.
 - Native QUIC ALPN confusion, WebTransport path, authority, and browser origin policy are tested.
 - Bearer and metadata-value authorizers use constant-time comparison where practical.
 - The wire schema, compatibility policy, rolling-upgrade policy, and shared golden vectors are documented and tested across Go, JavaScript, and Rust.
@@ -44,7 +45,6 @@ This repository is not production-ready yet. Track the remaining work here so ru
 
 ### 4. Protocol and Security Validation
 
-- Normalize malformed input, oversized frames, protobuf decode errors, and transport read/write failures to stable canonical statuses on every path.
 - Add fuzz/property tests for frame parsing, metadata validation, stream limits, and protobuf wire compatibility.
 - Add cross-runtime integration tests beyond golden vectors so Go, JavaScript, and Rust clients/servers exchange real RPCs.
 

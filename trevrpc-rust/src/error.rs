@@ -257,13 +257,22 @@ impl StdError for Error {
 mod tests {
     use std::io;
 
-    use crate::{Code, Error};
+    use crate::{Code, Error, RpcRequest};
 
     #[test]
     fn frame_too_large_maps_to_resource_exhausted() {
         let status = Error::FrameTooLarge { len: 11, max: 10 }.into_status();
 
         assert_eq!(status.code(), Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn protobuf_decode_errors_map_to_invalid_argument() {
+        let status = crate::framing::decode_frame::<RpcRequest>(&[0xff, 0xff])
+            .expect_err("malformed protobuf should fail")
+            .into_status();
+
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 
     #[test]

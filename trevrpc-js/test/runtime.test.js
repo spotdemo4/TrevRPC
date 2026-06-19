@@ -22,6 +22,7 @@ import {
   invalidArgument,
   marshalMessage,
   normalizeMetadata,
+  serverStreaming,
   unary,
 } from "../src/index.js";
 
@@ -46,6 +47,75 @@ test("frames round-trip TrevRPC requests", () => {
   assert.deepEqual(
     decoded.metadata.authorization,
     new Uint8Array([66, 101, 97, 114, 101, 114, 32, 116, 111, 107, 101, 110]),
+  );
+});
+
+test("WebTransport malformed protobuf response frame maps to invalid argument", async () => {
+  const stream = fakeBidirectionalStream({
+    readableChunks: [new Uint8Array([0, 0, 0, 2, 0xff, 0xff])],
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+
+  await assert.rejects(
+    client.call(
+      RpcRequest.create({
+        service: "hello.v1.Greeter",
+        method: "SayHello",
+        body: new Uint8Array(),
+        metadata: {},
+        version: WireVersion,
+      }),
+    ),
+    (error) => error.code === Code.InvalidArgument,
+  );
+});
+
+test("unknown response stream frame kind maps to invalid argument", async () => {
+  const root = createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const Hello = root.lookupType("hello.v1.Hello");
+  const transport = {
+    async streamingCall() {
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield RpcStreamFrame.create({ kind: 99 });
+        },
+      };
+    },
+  };
+
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+  );
+
+  await assert.rejects(
+    stream[Symbol.asyncIterator]().next(),
+    (error) => error.code === Code.InvalidArgument,
   );
 });
 

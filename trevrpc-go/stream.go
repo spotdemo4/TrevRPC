@@ -111,7 +111,7 @@ func (s *decodeStream[T]) Recv() (T, error) {
 	message := s.newMessage()
 	if err := UnmarshalMessage(body, message); err != nil {
 		var zero T
-		return zero, err
+		return zero, InvalidArgument("failed to decode message: " + err.Error())
 	}
 
 	return message, nil

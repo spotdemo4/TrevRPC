@@ -543,7 +543,7 @@ where
             }
             None => {
                 self.done = true;
-                Some(Err(Error::from(Status::internal(
+                Some(Err(Error::from(Status::invalid_argument(
                     "response stream contained an unknown frame kind",
                 ))))
             }
@@ -797,6 +797,33 @@ mod tests {
             .expect_err("second response should exceed byte limit");
 
         assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_response_frame_kind_returns_invalid_argument() {
+        let mut response = ResponseMessageStream::<TestMessage>::new(
+            crate::stream::from_iter([RpcStreamFrame {
+                kind: 99,
+                status: Code::Ok.as_u32(),
+                message: String::new(),
+                body: Vec::new(),
+                metadata: crate::Metadata::new(),
+            }]),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(4096),
+            Some(64 * 1024 * 1024),
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        let error = response
+            .next()
+            .await
+            .expect("unknown frame kind should yield an error")
+            .expect_err("unknown frame kind should be invalid");
+
+        assert_eq!(error.into_status().code(), Code::InvalidArgument);
         assert!(response.next().await.is_none());
     }
 

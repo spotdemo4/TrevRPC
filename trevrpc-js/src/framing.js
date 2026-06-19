@@ -8,7 +8,11 @@ export function marshalMessage(messageType, message) {
 }
 
 export function unmarshalMessage(messageType, body) {
-  return messageType.decode(body);
+  try {
+    return messageType.decode(body);
+  } catch (error) {
+    throw invalidArgument(`failed to decode protobuf message: ${error?.message ?? String(error)}`);
+  }
 }
 
 export function encodeFrame(messageType, message, maxFrameSize = DefaultMaxFrameSize) {

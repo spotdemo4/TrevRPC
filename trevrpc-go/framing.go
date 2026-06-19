@@ -18,8 +18,20 @@ type FrameTooLargeError struct {
 	Max int
 }
 
+type FrameDecodeError struct {
+	Err error
+}
+
 func (e *FrameTooLargeError) Error() string {
 	return fmt.Sprintf("frame length %d exceeds maximum %d", e.Len, e.Max)
+}
+
+func (e *FrameDecodeError) Error() string {
+	return "failed to decode RPC frame: " + e.Err.Error()
+}
+
+func (e *FrameDecodeError) Unwrap() error {
+	return e.Err
 }
 
 func MarshalMessage(message ProtoMessage) ([]byte, error) {
@@ -48,7 +60,11 @@ func EncodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
 }
 
 func DecodeFrame(body []byte, message ProtoMessage) error {
-	return UnmarshalMessage(body, message)
+	if err := UnmarshalMessage(body, message); err != nil {
+		return &FrameDecodeError{Err: err}
+	}
+
+	return nil
 }
 
 func WriteFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error {

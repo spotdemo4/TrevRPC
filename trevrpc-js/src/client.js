@@ -371,7 +371,7 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
           });
         }
         default:
-          throw internal("response stream contained an unknown frame kind");
+          throw invalidArgument("response stream contained an unknown frame kind");
       }
     }
   } finally {

@@ -580,6 +580,11 @@ func transportStatus(err error) error {
 		return status
 	}
 
+	var frameDecode *FrameDecodeError
+	if errors.As(err, &frameDecode) {
+		return InvalidArgument(frameDecode.Error())
+	}
+
 	if errors.Is(err, context.Canceled) {
 		return Cancelled("transport closed locally")
 	}

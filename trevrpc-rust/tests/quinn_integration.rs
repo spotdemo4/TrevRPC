@@ -13,7 +13,7 @@ use tokio::sync::{Notify, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{CallOptions, RpcTransport};
 use trevrpc::server::{MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions};
-use trevrpc::{Code, MessageStream, RpcRequest, RpcResponse, Status};
+use trevrpc::{Code, MessageStream, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
 #[path = "../examples/shared/greeter.rs"]
 mod greeter;
@@ -946,6 +946,54 @@ async fn quinn_malformed_request_frames_return_invalid_argument_status() -> Test
     .await?;
 
     assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_unknown_request_stream_frame_kind_returns_invalid_argument_status() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "LotsOfGreetings",
+        Vec::new(),
+    )
+    .with_kind(RpcKind::ClientStreaming);
+
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &RpcStreamFrame {
+            kind: 99,
+            status: Code::Ok.as_u32(),
+            message: String::new(),
+            body: Vec::new(),
+            metadata: trevrpc::Metadata::new(),
+        },
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    send.finish()?;
+
+    let frame = trevrpc::quinn::read_frame::<RpcStreamFrame>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+
+    assert_eq!(
+        frame.frame_kind(),
+        Some(trevrpc::RpcStreamFrameKind::Status)
+    );
+    assert_eq!(Code::from_u32(frame.status), Code::InvalidArgument);
 
     close_client(endpoint, connection).await;
     server.shutdown().await

@@ -762,7 +762,7 @@ impl MessageStream<Vec<u8>> for WebTransportRequestStream {
                 }
                 None => {
                     self.done = true;
-                    Some(Err(Error::from(Status::internal(
+                    Some(Err(Error::from(Status::invalid_argument(
                         "request stream contained an unknown frame kind",
                     ))))
                 }

@@ -71,6 +71,18 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFrameDecodeErrorMapsToInvalidArgument(t *testing.T) {
+	request := &RpcRequest{}
+	err := DecodeFrame([]byte{0xff, 0xff}, request)
+
+	if status := StatusFromError(err); status.Code != CodeInvalidArgument {
+		t.Fatalf("expected invalid argument for malformed protobuf frame, got %v", status)
+	}
+	if status := StatusFromError(transportStatus(err)); status.Code != CodeInvalidArgument {
+		t.Fatalf("expected transport invalid argument for malformed protobuf frame, got %v", status)
+	}
+}
+
 func TestMetadataValidation(t *testing.T) {
 	if err := ValidateMetadata(Metadata{"authorization": []byte("ok")}); err != nil {
 		t.Fatalf("valid metadata was rejected: %v", err)
@@ -1134,6 +1146,37 @@ func TestQuicMalformedRequestFramesReturnInvalidArgumentStatus(t *testing.T) {
 	}
 	if CodeFromUint32(response.Status) != CodeInvalidArgument {
 		t.Fatalf("expected invalid argument status, got %#v", response)
+	}
+}
+
+func TestQuicMalformedRequestStreamMessageReturnsInvalidArgumentStatus(t *testing.T) {
+	running := startTestQUICServer(t, func(*Server) {})
+	stream := openRawTestQUICStream(t, running)
+	defer stream.CancelRead(cancelledStreamCode)
+	defer stream.CancelWrite(cancelledStreamCode)
+
+	request := NewRpcRequest(testServiceName, "LotsOfGreetings", nil)
+	request.Kind = RpcKindClientStreaming
+	if err := WriteFrame(stream, request, DefaultMaxFrameSize); err != nil {
+		t.Fatalf("write initial request: %v", err)
+	}
+	if err := WriteFrame(stream, MessageFrame([]byte{0xff, 0xff}), DefaultMaxFrameSize); err != nil {
+		t.Fatalf("write malformed message frame: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close malformed stream: %v", err)
+	}
+
+	frame := &RpcStreamFrame{}
+	if err := stream.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
+		t.Fatalf("set stream read deadline: %v", err)
+	}
+	defer stream.SetReadDeadline(time.Time{})
+	if err := ReadFrame(stream, frame, DefaultMaxFrameSize); err != nil {
+		t.Fatalf("read status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeInvalidArgument {
+		t.Fatalf("expected invalid argument status, got %#v", frame)
 	}
 }
 

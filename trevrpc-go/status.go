@@ -121,6 +121,11 @@ func StatusFromError(err error) *Status {
 		return ResourceExhausted(frameTooLarge.Error())
 	}
 
+	var frameDecode *FrameDecodeError
+	if errors.As(err, &frameDecode) {
+		return InvalidArgument(frameDecode.Error())
+	}
+
 	return Internal(err.Error())
 }
 
