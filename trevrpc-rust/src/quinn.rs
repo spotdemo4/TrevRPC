@@ -14,6 +14,7 @@ use crate::{
 };
 
 const CANCELLED_STREAM_CODE: u32 = 1;
+const FRAME_READ_CHUNK_LEN: usize = 32 * 1024;
 
 #[derive(Clone)]
 pub struct Client {
@@ -292,8 +293,7 @@ where
         .map_err(Error::transport)?;
 
     let len = frame_body_len(header, max_frame_size)?;
-    let mut body = vec![0; len];
-    recv.read_exact(&mut body).await.map_err(Error::transport)?;
+    let body = read_body(recv, len).await?;
 
     decode_frame(&body)
 }
@@ -311,10 +311,33 @@ where
     }
 
     let len = frame_body_len(header, max_frame_size)?;
-    let mut body = vec![0; len];
-    read_exact_or_unexpected_eof(recv, &mut body).await?;
+    let body = read_body(recv, len).await?;
 
     decode_frame(&body).map(Some)
+}
+
+async fn read_body(recv: &mut quinn::RecvStream, len: usize) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut body = Vec::with_capacity(len.min(FRAME_READ_CHUNK_LEN));
+    let mut chunk = vec![0; len.min(FRAME_READ_CHUNK_LEN)];
+    while body.len() < len {
+        let remaining = len - body.len();
+        let read_len = remaining.min(chunk.len());
+        match recv
+            .read(&mut chunk[..read_len])
+            .await
+            .map_err(Error::transport)?
+        {
+            Some(0) => {}
+            Some(read) => body.extend_from_slice(&chunk[..read]),
+            None => return Err(unexpected_eof()),
+        }
+    }
+
+    Ok(body)
 }
 
 async fn read_exact_or_eof(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<bool> {
@@ -334,14 +357,6 @@ async fn read_exact_or_eof(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Resu
     }
 
     Ok(true)
-}
-
-async fn read_exact_or_unexpected_eof(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> {
-    if read_exact_or_eof(recv, buf).await? {
-        Ok(())
-    } else {
-        Err(unexpected_eof())
-    }
 }
 
 fn unexpected_eof() -> Error {

@@ -83,6 +83,20 @@ func TestFrameDecodeErrorMapsToInvalidArgument(t *testing.T) {
 	}
 }
 
+func TestReadFrameLargePartialBodyDoesNotAllocateAdvertisedLength(t *testing.T) {
+	const length = 1 << 30
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, length)
+
+	read, err := ReadFrameOrEOF(bytes.NewReader(header), &RpcRequest{}, length)
+	if read {
+		t.Fatal("incomplete frame should not be reported as read")
+	}
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected EOF for incomplete large frame body, got %v", err)
+	}
+}
+
 func TestMetadataValidation(t *testing.T) {
 	if err := ValidateMetadata(Metadata{"authorization": []byte("ok")}); err != nil {
 		t.Fatalf("valid metadata was rejected: %v", err)
@@ -1424,6 +1438,40 @@ func TestQuicInitialRequestTimeoutRejectsPartialBody(t *testing.T) {
 
 	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded status, got %#v", response)
+	}
+}
+
+func TestQuicLargePartialInitialBodyDoesNotHoldRequestPermit(t *testing.T) {
+	const largeFrameSize = 1 << 30
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.MaxFrameSize = largeFrameSize
+		options.MaxConcurrentRequests = 1
+		options.InitialRequestTimeout = testTimeout
+		server.SetOptions(options)
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open partial stream: %v", err)
+	}
+	defer stream.CancelRead(cancelledStreamCode)
+	defer stream.CancelWrite(cancelledStreamCode)
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, largeFrameSize)
+	if _, err := stream.Write(append(header, 1)); err != nil {
+		t.Fatalf("write partial large body: %v", err)
+	}
+
+	response, err := Unary(context.Background(), NewQuicClient(conn), testServiceName, "SayHello", &testMessage{Value: "after partial"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	if err != nil {
+		t.Fatalf("request permit should not be held before initial frame completes: %v", err)
+	}
+	if response.Value != "hello, after partial" {
+		t.Fatalf("unexpected response after partial initial frame: %q", response.Value)
 	}
 }
 

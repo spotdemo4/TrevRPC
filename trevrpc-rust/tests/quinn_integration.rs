@@ -1222,6 +1222,38 @@ async fn quinn_initial_request_timeout_rejects_partial_body() -> TestResult {
 }
 
 #[tokio::test]
+async fn quinn_large_partial_initial_body_does_not_hold_request_permit() -> TestResult {
+    const LARGE_FRAME_SIZE: usize = 1 << 30;
+    let server = spawn_greeter_server(|server| {
+        server.set_options(
+            fast_server_options()
+                .with_max_frame_size(LARGE_FRAME_SIZE)
+                .with_max_concurrent_requests(Some(1))
+                .with_initial_request_timeout(Some(TEST_TIMEOUT)),
+        );
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (mut send, _recv) = connection.open_bi().await?;
+    let large_frame_size = u32::try_from(LARGE_FRAME_SIZE)?;
+    send.write_all(&large_frame_size.to_be_bytes()).await?;
+    send.write_all(&[1]).await?;
+
+    let reply = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "after partial".to_owned(),
+            },
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, after partial");
+
+    let _ = send.reset(1_u32.into());
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_oversized_initial_frame_is_rejected_before_body() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;

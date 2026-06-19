@@ -90,6 +90,17 @@ test("frame reader maps malformed protobuf bodies to invalid argument", async ()
   }
 });
 
+test("frame reader rejects large partial body without buffering advertised length", async () => {
+  const header = new Uint8Array(4);
+  new DataView(header.buffer).setUint32(0, 1 << 30, false);
+  const reader = new FrameReader(fakeReaderFromChunks([header]));
+
+  await assert.rejects(
+    reader.readFrame(RpcRequest, 1 << 30),
+    (error) => error.code === Code.Unavailable,
+  );
+});
+
 test("metadata validation boundary cases are stable", () => {
   const maxEntries = {};
   for (let index = 0; index < MaxMetadataEntries; index += 1) {

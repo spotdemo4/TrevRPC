@@ -10,6 +10,7 @@ import (
 )
 
 const DefaultMaxFrameSize = 4 * 1024 * 1024
+const maxFrameReadChunkSize = 32 * 1024
 
 type ProtoMessage = protoadapt.MessageV1
 
@@ -105,10 +106,42 @@ func ReadFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (b
 		return false, &FrameTooLargeError{Len: length, Max: maxFrameSize}
 	}
 
-	body := make([]byte, length)
-	if _, err := io.ReadFull(reader, body); err != nil {
+	body, err := readFrameBody(reader, length)
+	if err != nil {
 		return false, err
 	}
 
 	return true, DecodeFrame(body, message)
+}
+
+func readFrameBody(reader io.Reader, length int) ([]byte, error) {
+	if length == 0 {
+		return []byte{}, nil
+	}
+
+	bufferSize := minInt(length, maxFrameReadChunkSize)
+	body := make([]byte, 0, bufferSize)
+	buffer := make([]byte, bufferSize)
+	remaining := length
+	for remaining > 0 {
+		readSize := minInt(remaining, len(buffer))
+		read, err := io.ReadFull(reader, buffer[:readSize])
+		if read > 0 {
+			body = append(body, buffer[:read]...)
+			remaining -= read
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return body, nil
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+
+	return right
 }

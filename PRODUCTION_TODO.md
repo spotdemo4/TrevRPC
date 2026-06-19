@@ -24,6 +24,8 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Cancellation/deadline race coverage exists for unary, server-streaming, client-streaming, and bidirectional-streaming client paths across Go, JavaScript, and Rust.
 - Native QUIC/WebTransport integration tests cover pending response-read and request-upload cancellation/deadline races in Go and Rust.
 - Slowloris-style partial-header, partial-body, and oversized-initial-frame tests exist where the transports expose those states.
+- Frame readers avoid allocating the full advertised body length before bytes arrive, with large partial-body coverage in Go, JavaScript, and Rust.
+- Go and Rust request permits are acquired only after the initial request frame completes, with native QUIC regression coverage for large partial initial bodies.
 - Shutdown tests cover stuck handlers and long-running streams.
 
 ## Remaining Work
@@ -35,8 +37,6 @@ This repository is not production-ready yet. Track the remaining work here so ru
 
 ### 2. Initial Frame, Header, Body, and Resource Limits
 
-- Avoid acquiring scarce request permits indefinitely for peers that open streams but do not send request frames on transports that expose such streams before bytes arrive.
-- Avoid eager max-sized allocations before a peer has delivered the frame body.
 - Align QUIC/WebTransport transport flow-control limits with TrevRPC frame and stream limits.
 - Split request-body, response-body, streaming-message, and total-stream byte budgets further if real workloads need different limits.
 
