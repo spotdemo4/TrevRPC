@@ -41,7 +41,7 @@ criterion = { version = "0.7", features = ["async_tokio"] }
 rcgen = "0.14"
 time = "0.3"
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "signal"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 url = "2"
