@@ -557,7 +557,7 @@ function callAbortScope(options) {
 }
 
 async function* encodeRequestStream(requestType, requests, signal) {
-  const iterator = requests[Symbol.asyncIterator]();
+  const iterator = requestIterator(requests);
   try {
     for (;;) {
       const result = await nextRequest(iterator, signal);
@@ -572,6 +572,30 @@ async function* encodeRequestStream(requestType, requests, signal) {
       await iterator.return();
     }
   }
+}
+
+function requestIterator(requests) {
+  if (typeof requests?.[Symbol.asyncIterator] === "function") {
+    return requests[Symbol.asyncIterator]();
+  }
+
+  if (typeof requests?.[Symbol.iterator] === "function") {
+    const iterator = requests[Symbol.iterator]();
+    return {
+      next() {
+        return Promise.resolve(iterator.next());
+      },
+      return() {
+        return Promise.resolve(
+          typeof iterator.return === "function"
+            ? iterator.return()
+            : { done: true, value: undefined },
+        );
+      },
+    };
+  }
+
+  throw invalidArgument("request stream must be an async iterable or iterable");
 }
 
 function nextRequest(iterator, signal) {

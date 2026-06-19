@@ -27,15 +27,17 @@ import (
 )
 
 const (
-	listenAddr           = "127.0.0.1:50051"
-	browserExampleOrigin = "http://127.0.0.1:8080"
-	authToken            = "trevrpc-example-token"
+	defaultListenAddr           = "127.0.0.1:50051"
+	defaultBrowserExampleOrigin = "http://127.0.0.1:8080"
+	defaultAuthToken            = "trevrpc-example-token"
 )
 
-var webTransportAuthorities = map[string]struct{}{
-	listenAddr:        {},
-	"localhost:50051": {},
-}
+var (
+	listenAddr              = envOr("TREVRPC_EXAMPLE_ADDR", defaultListenAddr)
+	browserExampleOrigin    = envOr("TREVRPC_EXAMPLE_ORIGIN", defaultBrowserExampleOrigin)
+	authToken               = envOr("TREVRPC_EXAMPLE_TOKEN", defaultAuthToken)
+	webTransportAuthorities = allowedWebTransportAuthorities(listenAddr)
+)
 
 type greeterService struct{}
 
@@ -128,6 +130,31 @@ func allowBrowserExampleOrigin(r *http.Request) bool {
 
 	origin := r.Header.Get("Origin")
 	return origin == "" || origin == browserExampleOrigin
+}
+
+func envOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+
+	return fallback
+}
+
+func allowedWebTransportAuthorities(addr string) map[string]struct{} {
+	authorities := map[string]struct{}{addr: struct{}{}}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return authorities
+	}
+
+	switch host {
+	case "127.0.0.1":
+		authorities[net.JoinHostPort("localhost", port)] = struct{}{}
+	case "localhost":
+		authorities[net.JoinHostPort("127.0.0.1", port)] = struct{}{}
+	}
+
+	return authorities
 }
 
 func serverTLSConfig() (*tls.Config, string, error) {

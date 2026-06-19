@@ -136,6 +136,7 @@ class WebTransportResponseFrameStream {
     this.writerSettled = false;
     this.returnDone = null;
     this.returnErrorReported = false;
+    this.suppressReturnWriterError = false;
     this.cleanupAbort = cleanupAbort;
     this.writerDone = writerTask
       .catch((error) => {
@@ -178,10 +179,12 @@ class WebTransportResponseFrameStream {
           if (
             statusCode === Code.Ok &&
             this.writerError != null &&
-            this.writerError.code !== Code.Cancelled
+            !isTerminalCleanupWriterError(this.writerError)
           ) {
             throw this.writerError;
           }
+        } else {
+          this.suppressReturnWriterError = true;
         }
       }
 
@@ -208,14 +211,24 @@ class WebTransportResponseFrameStream {
     await this.returnDone;
     if (
       !this.returnErrorReported &&
+      !this.suppressReturnWriterError &&
       this.writerError != null &&
-      this.writerError.code !== Code.Cancelled
+      !isTerminalCleanupWriterError(this.writerError)
     ) {
       this.returnErrorReported = true;
       throw this.writerError;
     }
     return { done: true, value: undefined };
   }
+}
+
+function isTerminalCleanupWriterError(error) {
+  if (error?.code === Code.Cancelled) {
+    return true;
+  }
+
+  const message = error?.statusMessage ?? error?.message ?? "";
+  return error?.code === Code.Unavailable && /stream canceled with error code 0/i.test(message);
 }
 
 function throwIfAborted(signal) {

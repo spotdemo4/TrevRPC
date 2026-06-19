@@ -202,6 +202,7 @@
               src = ./trevrpc-js;
               nodejs = pkgs.nodejs_24;
               dontNpmBuild = true;
+              PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
               npmConfigHook = pkgs.importNpmLock.npmConfigHook;
               npmDeps = pkgs.importNpmLock {
                 npmRoot = final.src;
@@ -286,6 +287,36 @@
               TREVRPC_XRUNTIME_GO = "${crossRuntimeGo}/bin/trevrpc-xruntime-go";
               checkPhase = ''
                 cargo test --test cross_runtime --offline -- --nocapture
+              '';
+              installPhase = ''
+                touch $out
+              '';
+            };
+
+          browser-webtransport =
+            let
+              browserGoServer = pkgs.buildGoModule (final: {
+                pname = "trevrpc-browser-go-server";
+                version = "0.1.0";
+
+                src = ./trevrpc-go;
+                vendorHash = "sha256-b1Qj4m2yyMpJr2z7pDYJYY2kOThR9FnAHVk5NZbvba8=";
+                subPackages = [ "examples/greeter_server" ];
+
+                meta.mainProgram = "greeter_server";
+              });
+            in
+            self.packages.${system}.trevrpc-js.overrideAttrs {
+              dontBuild = true;
+              PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+              TREVRPC_BROWSER_GO_SERVER = "${browserGoServer}/bin/greeter_server";
+              checkPhase = ''
+                export HOME=$(mktemp -d)
+                for chromium in ${pkgs.playwright-driver.browsers}/chromium-*/chrome-linux*/chrome; do
+                  export TREVRPC_BROWSER_CHROMIUM="$chromium"
+                  break
+                done
+                npm run test:browser
               '';
               installPhase = ''
                 touch $out

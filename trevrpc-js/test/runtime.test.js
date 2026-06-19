@@ -829,6 +829,60 @@ test("WebTransport terminal OK does not hide local upload error", async () => {
   );
 });
 
+test("WebTransport terminal OK ignores browser code-zero upload close", async () => {
+  const root = createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const Hello = root.lookupType("hello.v1.Hello");
+  const stream = fakeBidirectionalStream({
+    closeError: new Error("stream canceled with error code 0"),
+    readableChunks: [
+      encodeFrame(
+        RpcStreamFrame,
+        RpcStreamFrame.create({
+          kind: RpcStreamFrameKind.Status,
+          status: Code.Ok,
+          metadata: {},
+        }),
+      ),
+    ],
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+
+  const responses = await bidirectionalStreaming(
+    client,
+    "hello.v1.Greeter",
+    "BidiHello",
+    Hello,
+    Hello,
+    [],
+  );
+
+  assert.deepEqual(await responses[Symbol.asyncIterator]().next(), {
+    done: true,
+    value: undefined,
+  });
+});
+
 test("WebTransport terminal error wins over local upload error", async () => {
   const root = createRoot({
     nested: {
@@ -1216,6 +1270,7 @@ function fakeReaderFromChunks(chunks) {
 }
 
 function fakeBidirectionalStream({
+  closeError = null,
   onAbort = () => {},
   onCancel = () => {},
   readableChunks = [],
@@ -1229,7 +1284,7 @@ function fakeBidirectionalStream({
             return Promise.resolve();
           },
           close() {
-            return Promise.resolve();
+            return closeError == null ? Promise.resolve() : Promise.reject(closeError);
           },
           abort(reason) {
             onAbort(reason);

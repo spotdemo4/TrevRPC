@@ -27,12 +27,14 @@
     "format:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",
     "test": "node --test test/*.test.js",
+    "test:browser": "node --test test/browser/*.test.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "protobufjs": "^7.6.4"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "typescript": "^6.0.3"
   },
   "engines": {
