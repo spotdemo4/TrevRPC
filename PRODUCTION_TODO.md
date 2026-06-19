@@ -35,6 +35,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Shutdown tests cover stuck handlers and long-running streams.
 - Browser WebTransport greeter examples document and enforce explicit path, authority, origin, certificate, and bearer-token policy.
 - Playwright Chromium coverage exercises the JavaScript browser WebTransport client against Go and Rust greeter servers across unary, server-streaming, client-streaming, and bidirectional-streaming RPCs with certificate-hash trust, bearer auth, and negative path/origin/authority policy cases.
+- Playwright Chromium lifecycle coverage exercises terminal OK/error while uploads are pending, local abort while a response read is pending, and early response-stream return cancelling server work.
 
 ## Remaining Work
 
@@ -48,7 +49,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 
 ### 3. Streaming Lifecycle and Error Propagation
 
-- Add more browser/runtime WebTransport lifecycle tests for terminal statuses, local cancellation, and local upload failures where mock/unit coverage cannot prove browser behavior.
+- Continue expanding browser/runtime WebTransport lifecycle tests into longer-lived streams and failure cases that Node-style mocks cannot prove.
 
 ### 4. Protocol and Security Validation
 

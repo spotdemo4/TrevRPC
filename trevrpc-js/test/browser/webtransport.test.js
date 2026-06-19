@@ -75,6 +75,61 @@ test("browser WebTransport rejects an unexpected authority", { timeout: 120_000 
   });
 });
 
+test(
+  "browser WebTransport terminal OK completes while upload is pending",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleScenario({
+      scenario: "early-ok",
+      assertResult(result) {
+        assert.deepEqual(result, { value: "early ok" });
+      },
+    });
+  },
+);
+
+test(
+  "browser WebTransport terminal error wins over pending upload",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleScenario({
+      scenario: "early-error",
+      assertResult(result) {
+        assert.equal(result.code, 7);
+        assert.equal(result.message, "remote rejected upload");
+      },
+    });
+  },
+);
+
+test(
+  "browser WebTransport local abort cancels pending response read",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleScenario({
+      eventPattern: /EVENT pending_cancelled/,
+      scenario: "local-abort",
+      assertResult(result) {
+        assert.equal(result.code, 1);
+      },
+    });
+  },
+);
+
+test(
+  "browser WebTransport response stream return cancels server work",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleScenario({
+      eventPattern: /EVENT response_stream_closed/,
+      scenario: "early-return",
+      assertResult(result) {
+        assert.deepEqual(result, { first: "first" });
+      },
+    });
+  },
+);
+
 const servers = {
   go: {
     readyPattern: /WebTransport URL: https:\/\/[^\s]+\/trevrpc/,
@@ -112,7 +167,235 @@ const servers = {
       );
     },
   },
+  lifecycle: {
+    readyPattern: /READY https:\/\/[^\s]+\/trevrpc/,
+    certificatePattern: /certificate written to/,
+    spawn({ addr, authorities, origin, certPath }) {
+      const serverPath = process.env.TREVRPC_BROWSER_LIFECYCLE_GO_SERVER;
+      const options = {
+        cwd: serverPath == null || serverPath === "" ? goRoot : repoRoot,
+        env: serverEnv({ addr, authorities, origin, certPath }),
+      };
+      if (serverPath != null && serverPath !== "") {
+        return spawnManaged(serverPath, [], options);
+      }
+
+      return spawnManaged("go", ["run", "./cmd/trevrpc-browser-lifecycle-go"], options);
+    },
+  },
 };
+
+async function runBrowserLifecycleScenario({ assertResult, eventPattern, scenario }) {
+  const tempDir = await mkdtemp(join(tmpdir(), "trevrpc-browser-"));
+  const serverPort = await freePort();
+  const staticPort = await freePort();
+  const staticOrigin = `http://127.0.0.1:${staticPort}`;
+  const webTransportURL = `https://127.0.0.1:${serverPort}/trevrpc`;
+  const staticURL = `${staticOrigin}/examples/greeter/`;
+  const certPath = join(tempDir, "server.pem");
+  const children = [];
+  let browser;
+  let page;
+  let pageErrors = [];
+
+  try {
+    const rpcServer = servers.lifecycle.spawn({
+      addr: `127.0.0.1:${serverPort}`,
+      origin: staticOrigin,
+      certPath,
+    });
+    children.push(rpcServer);
+    await waitForOutput(rpcServer, servers.lifecycle.readyPattern, 60_000);
+    await waitForOutput(rpcServer, servers.lifecycle.certificatePattern, 10_000);
+
+    const staticServer = spawnManaged(process.execPath, ["examples/greeter/static-server.js"], {
+      cwd: jsRoot,
+      env: {
+        PORT: String(staticPort),
+        TREVRPC_EXAMPLE_CERT: certPath,
+      },
+    });
+    children.push(staticServer);
+    await waitForOutput(staticServer, /serving trevrpc-js from http:\/\/127\.0\.0\.1:/, 10_000);
+
+    browser = await launchBrowser();
+    page = await browser.newPage();
+    pageErrors = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        pageErrors.push(message.text());
+      }
+    });
+
+    await page.goto(staticURL, { waitUntil: "domcontentloaded" });
+    const result = await page.evaluate(runLifecycleBrowserScenario, { scenario, webTransportURL });
+    assertResult(result);
+    if (eventPattern != null) {
+      await waitForOutput(rpcServer, eventPattern, 10_000);
+    }
+    assert.deepEqual(pageErrors, []);
+  } catch (error) {
+    console.error(error?.stack ?? error);
+    console.error(pageErrors.join("\n"));
+    for (const child of children) {
+      console.error(child.output);
+    }
+    throw error;
+  } finally {
+    if (browser != null) {
+      await closeBrowser(browser);
+    }
+    await Promise.all(children.map((child) => stopProcess(child)));
+    await rm(tempDir, { force: true, recursive: true });
+  }
+}
+
+async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
+  const {
+    WebTransportClient,
+    bidirectionalStreaming,
+    clientStreaming,
+    createRoot,
+    serverStreaming,
+  } = await import("/src/index.js");
+  const service = "browser.lifecycle.Lifecycle";
+  const Message = createRoot({
+    nested: {
+      browser: {
+        nested: {
+          lifecycle: {
+            nested: {
+              Message: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  }).lookupType("browser.lifecycle.Message");
+  const transport = await WebTransportClient.connect(webTransportURL, {
+    webTransportOptions: await webTransportOptions(),
+  });
+  const options = {
+    metadata: { authorization: "Bearer trevrpc-example-token" },
+    streamIdleTimeoutMs: 10_000,
+    timeoutMs: 10_000,
+  };
+
+  try {
+    switch (scenario) {
+      case "early-ok": {
+        const response = await clientStreaming(
+          transport,
+          service,
+          "EarlyOk",
+          Message,
+          Message,
+          pendingRequests(),
+          options,
+        );
+        return { value: response.value };
+      }
+      case "early-error": {
+        const stream = await bidirectionalStreaming(
+          transport,
+          service,
+          "EarlyError",
+          Message,
+          Message,
+          pendingRequests(),
+          options,
+        );
+        try {
+          await stream[Symbol.asyncIterator]().next();
+        } catch (error) {
+          return { code: error.code, message: error.statusMessage };
+        }
+        throw new Error("expected terminal error");
+      }
+      case "local-abort": {
+        const controller = new AbortController();
+        const stream = await serverStreaming(
+          transport,
+          service,
+          "Pending",
+          Message,
+          Message,
+          {},
+          { ...options, signal: controller.signal },
+        );
+        const next = stream[Symbol.asyncIterator]().next();
+        setTimeout(() => controller.abort(new DOMException("user cancelled", "AbortError")), 50);
+        try {
+          await next;
+        } catch (error) {
+          return { code: error.code };
+        }
+        throw new Error("expected local cancellation");
+      }
+      case "early-return": {
+        const stream = await serverStreaming(
+          transport,
+          service,
+          "FirstThenPending",
+          Message,
+          Message,
+          {},
+          options,
+        );
+        const iterator = stream[Symbol.asyncIterator]();
+        const first = await iterator.next();
+        await iterator.return();
+        return { first: first.value.value };
+      }
+      default:
+        throw new Error(`unknown lifecycle scenario ${scenario}`);
+    }
+  } finally {
+    transport.close({ closeCode: 0, reason: "browser lifecycle scenario complete" });
+  }
+
+  function pendingRequests() {
+    return {
+      [Symbol.asyncIterator]() {
+        return {
+          next() {
+            return new Promise(() => {});
+          },
+          return() {
+            return Promise.resolve({ done: true, value: undefined });
+          },
+        };
+      },
+    };
+  }
+
+  async function webTransportOptions() {
+    const response = await fetch("./certificate-hash.json", { cache: "no-store" });
+    const config = await response.json();
+    return {
+      serverCertificateHashes: [
+        {
+          algorithm: "sha-256",
+          value: base64Bytes(config.sha256Base64),
+        },
+      ],
+    };
+  }
+
+  function base64Bytes(value) {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  }
+}
 
 async function runBrowserGreeterScenario({
   server,

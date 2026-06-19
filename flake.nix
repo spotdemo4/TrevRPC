@@ -307,6 +307,16 @@
 
                 meta.mainProgram = "greeter_server";
               });
+              browserLifecycleGoServer = pkgs.buildGoModule (final: {
+                pname = "trevrpc-browser-lifecycle-go-server";
+                version = "0.1.0";
+
+                src = ./trevrpc-go;
+                vendorHash = "sha256-b1Qj4m2yyMpJr2z7pDYJYY2kOThR9FnAHVk5NZbvba8=";
+                subPackages = [ "cmd/trevrpc-browser-lifecycle-go" ];
+
+                meta.mainProgram = "trevrpc-browser-lifecycle-go";
+              });
               browserRustServer = pkgs.rustPlatform.buildRustPackage {
                 pname = "trevrpc-browser-rust-server";
                 version = "0.1.0";
@@ -333,6 +343,7 @@
               dontBuild = true;
               PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
               TREVRPC_BROWSER_GO_SERVER = "${browserGoServer}/bin/greeter_server";
+              TREVRPC_BROWSER_LIFECYCLE_GO_SERVER = "${browserLifecycleGoServer}/bin/trevrpc-browser-lifecycle-go";
               TREVRPC_BROWSER_RUST_SERVER = "${browserRustServer}/bin/greeter_server";
               checkPhase = ''
                 export HOME=$(mktemp -d)
