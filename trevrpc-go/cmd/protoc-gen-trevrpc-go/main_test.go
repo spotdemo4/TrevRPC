@@ -39,8 +39,12 @@ func TestGenerateGreeterService(t *testing.T) {
 		"trevrpc.ServerStreaming[*HelloRequest, *HelloReply]",
 		"trevrpc.ClientStreaming[*HelloRequest, *HelloReply]",
 		"trevrpc.ClientStreamingCall[*HelloRequest, *HelloReply]",
+		"trevrpc.ClientStreamingFromStream[*HelloRequest, *HelloReply]",
+		"func (c *GreeterClient) LotsOfGreetingsFromStream",
 		"trevrpc.BidirectionalStreaming[*HelloRequest, *HelloReply]",
 		"trevrpc.BidirectionalStreamingCall[*HelloRequest, *HelloReply]",
+		"trevrpc.BidirectionalStreamingFromStream[*HelloRequest, *HelloReply]",
+		"func (c *GreeterClient) BidiHelloFromStream",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("generated content missing %q:\n%s", want, content)

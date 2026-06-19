@@ -217,6 +217,16 @@ func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
+	if isNonBlockingStream(requestBody) {
+		body, err := requestBody.Recv()
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, statusFromContextError(ctxErr)
+			}
+		}
+
+		return body, err
+	}
 
 	type recvResult struct {
 		body []byte

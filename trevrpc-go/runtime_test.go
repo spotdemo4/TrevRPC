@@ -284,6 +284,47 @@ func TestClientStreamingClientServer(t *testing.T) {
 	}
 }
 
+func TestClientStreamingFromStreamClientServer(t *testing.T) {
+	server := NewServer()
+	server.RouteStreaming("example.Greeter", "LotsOfGreetings", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		var combined strings.Builder
+		for {
+			body, err := requests.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			request := &testMessage{}
+			if err := UnmarshalMessage(body, request); err != nil {
+				return nil, err
+			}
+
+			combined.WriteString(request.Value)
+		}
+
+		return SingleMessageStream(&testMessage{Value: combined.String()}), nil
+	})
+
+	response, err := ClientStreamingFromStream[*testMessage, *testMessage](
+		context.Background(),
+		localTransport{server: server},
+		"example.Greeter",
+		"LotsOfGreetings",
+		FromSlice(&testMessage{Value: "hello"}, &testMessage{Value: " direct"}),
+		func() *testMessage { return &testMessage{} },
+	)
+	if err != nil {
+		t.Fatalf("direct client streaming RPC failed: %v", err)
+	}
+
+	if response.Value != "hello direct" {
+		t.Fatalf("unexpected response: %q", response.Value)
+	}
+}
+
 func TestBidirectionalStreamingClientServer(t *testing.T) {
 	server := NewServer()
 	server.RouteStreaming("example.Greeter", "BidiHello", RpcKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
@@ -293,6 +334,41 @@ func TestBidirectionalStreamingClientServer(t *testing.T) {
 	stream, err := runTestBidiStreaming(context.Background(), localTransport{server: server}, "example.Greeter", "BidiHello", []string{"left", "right"})
 	if err != nil {
 		t.Fatalf("bidi RPC failed: %v", err)
+	}
+
+	first, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("first bidi response failed: %v", err)
+	}
+	second, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("second bidi response failed: %v", err)
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("expected final EOF, got %v", err)
+	}
+
+	if first.Value != "echo, left" || second.Value != "echo, right" {
+		t.Fatalf("unexpected bidi responses: %q %q", first.Value, second.Value)
+	}
+}
+
+func TestBidirectionalStreamingFromStreamClientServer(t *testing.T) {
+	server := NewServer()
+	server.RouteStreaming("example.Greeter", "BidiHello", RpcKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		return EncodeStream[*testMessage](&echoTestMessages{requests: DecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} })}), nil
+	})
+
+	stream, err := BidirectionalStreamingFromStream[*testMessage, *testMessage](
+		context.Background(),
+		localTransport{server: server},
+		"example.Greeter",
+		"BidiHello",
+		FromSlice(&testMessage{Value: "left"}, &testMessage{Value: "right"}),
+		func() *testMessage { return &testMessage{} },
+	)
+	if err != nil {
+		t.Fatalf("direct bidi RPC failed: %v", err)
 	}
 
 	first, err := stream.Recv()

@@ -20,6 +20,10 @@ type ByteStream = MessageStream[[]byte]
 // FrameStream is a stream of TrevRPC stream frames.
 type FrameStream = MessageStream[*RpcStreamFrame]
 
+type nonBlockingStream interface {
+	trevrpcNonBlockingStream() bool
+}
+
 // MessagePipe is a sendable message stream.
 type MessagePipe[T any] struct {
 	ctx       context.Context
@@ -109,6 +113,8 @@ func EmptyStream[T any]() MessageStream[T] {
 	return emptyStream[T]{}
 }
 
+func (emptyStream[T]) trevrpcNonBlockingStream() bool { return true }
+
 func (emptyStream[T]) Recv() (T, error) {
 	var zero T
 	return zero, io.EOF
@@ -125,6 +131,8 @@ type sliceStream[T any] struct {
 func FromSlice[T any](items ...T) MessageStream[T] {
 	return &sliceStream[T]{items: items}
 }
+
+func (s *sliceStream[T]) trevrpcNonBlockingStream() bool { return true }
 
 func (s *sliceStream[T]) Recv() (T, error) {
 	if s.next >= len(s.items) {
@@ -175,6 +183,10 @@ func EncodeStream[T ProtoMessage](inner MessageStream[T]) ByteStream {
 	return &encodeStream[T]{inner: inner}
 }
 
+func (s *encodeStream[T]) trevrpcNonBlockingStream() bool {
+	return isNonBlockingStream(s.inner)
+}
+
 func (s *encodeStream[T]) Recv() ([]byte, error) {
 	message, err := s.inner.Recv()
 	if err != nil {
@@ -216,6 +228,14 @@ func (s *decodeStream[T]) Recv() (T, error) {
 
 func (s *decodeStream[T]) Close() error {
 	return closeMessageStream(s.inner)
+}
+
+func isNonBlockingStream(stream any) bool {
+	if stream == nil {
+		return false
+	}
+	nonBlocking, ok := stream.(nonBlockingStream)
+	return ok && nonBlocking.trevrpcNonBlockingStream()
 }
 
 // SingleMessageStream returns a byte stream containing one encoded protobuf message.

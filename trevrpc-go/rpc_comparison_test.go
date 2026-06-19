@@ -237,6 +237,7 @@ func startTrevRPCComparisonClient(b *testing.B) *greeter.GreeterClient {
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.GracefulShutdownTimeout = time.Second
+	options.StreamIdleTimeout = 0
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, comparisonGreeter{})
 
@@ -337,39 +338,16 @@ func trevrpcServerStreamingCall(ctx context.Context, client *greeter.GreeterClie
 }
 
 func trevrpcClientStreamingCall(ctx context.Context, client *greeter.GreeterClient) (string, error) {
-	stream, err := client.LotsOfGreetings(ctx)
+	response, err := client.LotsOfGreetingsFromStream(ctx, trevrpc.FromSlice(comparisonRequests...))
 	if err != nil {
-		return "", err
-	}
-
-	for _, request := range comparisonRequests {
-		if err := stream.Send(request); err != nil {
-			_ = stream.Close()
-			return "", err
-		}
-	}
-	response, err := stream.CloseAndRecv()
-	if err != nil {
-		_ = stream.Close()
 		return "", err
 	}
 	return response.Message, nil
 }
 
 func trevrpcBidiStreamingCall(ctx context.Context, client *greeter.GreeterClient) (int, error) {
-	stream, err := client.BidiHello(ctx)
+	stream, err := client.BidiHelloFromStream(ctx, trevrpc.FromSlice(comparisonRequests...))
 	if err != nil {
-		return 0, err
-	}
-
-	for _, request := range comparisonRequests {
-		if err := stream.Send(request); err != nil {
-			_ = stream.Close()
-			return 0, err
-		}
-	}
-	if err := stream.CloseSend(); err != nil {
-		_ = stream.Close()
 		return 0, err
 	}
 

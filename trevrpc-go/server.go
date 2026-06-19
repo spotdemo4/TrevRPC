@@ -459,6 +459,20 @@ func (s *limitedByteStream) Close() error {
 }
 
 func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout time.Duration, direction string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContextError(err)
+	}
+	if idleTimeout <= 0 && isNonBlockingStream(stream) {
+		body, err := recvByte(stream, direction)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, statusFromContextError(ctxErr)
+			}
+		}
+
+		return body, err
+	}
+
 	type recvResult struct {
 		body []byte
 		err  error
@@ -466,13 +480,7 @@ func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout tim
 
 	results := make(chan recvResult, 1)
 	go func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				results <- recvResult{err: Internal(fmt.Sprintf("%s stream panicked: %v", direction, recovered))}
-			}
-		}()
-
-		body, err := stream.Recv()
+		body, err := recvByte(stream, direction)
 		results <- recvResult{body: body, err: err}
 	}()
 
@@ -492,6 +500,16 @@ func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout tim
 	case <-idle:
 		return nil, Unavailable(fmt.Sprintf("%s stream idle timeout", direction))
 	}
+}
+
+func recvByte(stream ByteStream, direction string) (body []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = Internal(fmt.Sprintf("%s stream panicked: %v", direction, recovered))
+		}
+	}()
+
+	return stream.Recv()
 }
 
 func checkStreamLimits(direction string, limits streamLimits, messages, bodySize *int, itemLen int) error {

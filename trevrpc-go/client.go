@@ -223,7 +223,6 @@ func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 
 	ctx, cancel := callContext(ctx, callOptions)
 	requests := NewMessagePipe[Req](ctx)
-
 	response, err := transport.StreamingCall(ctx, rpcRequest, EncodeStream(requests))
 	if err != nil {
 		cancel()
@@ -235,6 +234,17 @@ func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 		responses: newResponseMessageStream(response, newResponse, callOptions, ctx, cancel),
 		cancel:    cancel,
 	}, nil
+}
+
+// ClientStreamingFromStream calls a client-streaming RPC from an existing request stream.
+func ClientStreamingFromStream[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (Res, error) {
+	responses, _, err := startRequestStreaming(ctx, transport, service, method, RpcKindClientStreaming, requests, newResponse, options)
+	if err != nil {
+		var zero Res
+		return zero, err
+	}
+
+	return readUnaryResponseFromMessageStream(responses)
 }
 
 // BidirectionalStreaming starts a bidirectional-streaming RPC.
@@ -257,6 +267,37 @@ func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Cont
 		requests:  requests,
 		responses: newResponseMessageStream(response, newResponse, callOptions, ctx, cancel),
 	}, nil
+}
+
+// BidirectionalStreamingFromStream calls a bidirectional-streaming RPC from an existing request stream.
+func BidirectionalStreamingFromStream[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
+	responses, _, err := startRequestStreaming(ctx, transport, service, method, RpcKindBidirectionalStreaming, requests, newResponse, options)
+	if err != nil {
+		return nil, err
+	}
+
+	return responses, nil
+}
+
+func startRequestStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, kind RpcKind, requests MessageStream[Req], newResponse func() Res, options []CallOption) (MessageStream[Res], context.CancelFunc, error) {
+	if requests == nil {
+		return nil, func() {}, InvalidArgument("request stream is nil")
+	}
+
+	callOptions := applyCallOptions(options)
+	rpcRequest, err := prepareClientRequest(service, method, kind, nil, callOptions)
+	if err != nil {
+		return nil, func() {}, err
+	}
+
+	ctx, cancel := callContext(ctx, callOptions)
+	response, err := transport.StreamingCall(ctx, rpcRequest, EncodeStream(requests))
+	if err != nil {
+		cancel()
+		return nil, func() {}, err
+	}
+
+	return newResponseMessageStream(response, newResponse, callOptions, ctx, cancel), cancel, nil
 }
 
 type clientStreamingCall[Req ProtoMessage, Res ProtoMessage] struct {

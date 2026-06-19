@@ -316,9 +316,17 @@ func generateClientMethod(buffer *bytes.Buffer, serviceName, fullServiceName str
 	case method.clientStreaming && method.serverStreaming:
 		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[%s, %s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
 		fmt.Fprintf(buffer, "\treturn trevrpc.BidirectionalStreaming[%s, %s](ctx, c.transport, %q, %q, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
+		buffer.WriteString("}\n\n")
+		fmt.Fprintf(buffer, "// %sFromStream calls the %s RPC from an existing request stream.\n", method.name, method.protoName)
+		fmt.Fprintf(buffer, "func (c *%sClient) %sFromStream(ctx context.Context, requests trevrpc.MessageStream[%s], options ...trevrpc.CallOption) (trevrpc.MessageStream[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
+		fmt.Fprintf(buffer, "\treturn trevrpc.BidirectionalStreamingFromStream[%s, %s](ctx, c.transport, %q, %q, requests, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
 	case method.clientStreaming:
 		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[%s, %s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
 		fmt.Fprintf(buffer, "\treturn trevrpc.ClientStreaming[%s, %s](ctx, c.transport, %q, %q, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
+		buffer.WriteString("}\n\n")
+		fmt.Fprintf(buffer, "// %sFromStream calls the %s RPC from an existing request stream.\n", method.name, method.protoName)
+		fmt.Fprintf(buffer, "func (c *%sClient) %sFromStream(ctx context.Context, requests trevrpc.MessageStream[%s], options ...trevrpc.CallOption) (%s, error) {\n", serviceName, method.name, method.inputType, method.outputType)
+		fmt.Fprintf(buffer, "\treturn trevrpc.ClientStreamingFromStream[%s, %s](ctx, c.transport, %q, %q, requests, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
 	case method.serverStreaming:
 		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, request %s, options ...trevrpc.CallOption) (trevrpc.MessageStream[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
 		fmt.Fprintf(buffer, "\treturn trevrpc.ServerStreaming[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
