@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -307,10 +308,10 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub trait Metrics: Send + Sync + 'static {
-    /// Called inline on the RPC task. Implementations must not block.
+    /// Called inline on the RPC task. Implementations must not block. Panics are isolated.
     fn rpc_started(&self, _event: &RpcStarted) {}
 
-    /// Called inline on the RPC task. Implementations must not block.
+    /// Called inline on the RPC task. Implementations must not block. Panics are isolated.
     fn rpc_finished(&self, _event: &RpcFinished) {}
 }
 
@@ -515,11 +516,14 @@ impl Server {
         let method = request.method.clone();
         let request_body_len = request.body.len();
 
-        self.metrics.rpc_started(&RpcStarted {
-            service: service.clone(),
-            method: method.clone(),
-            request_body_len,
-        });
+        record_rpc_started(
+            self.metrics.as_ref(),
+            &RpcStarted {
+                service: service.clone(),
+                method: method.clone(),
+                request_body_len,
+            },
+        );
 
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -558,9 +562,12 @@ impl Server {
             );
         };
 
-        let response = match with_deadline(handler(request.body), deadline).await {
-            Ok(Ok(body)) => RpcResponse::ok(body),
-            Ok(Err(error)) => error.into_status().into_response(Vec::new()),
+        let response = match invoke_unary_handler(&handler, request.body) {
+            Ok(future) => match run_handler_with_deadline(future, deadline).await {
+                Ok(Ok(body)) => RpcResponse::ok(body),
+                Ok(Err(error)) => error.into_status().into_response(Vec::new()),
+                Err(status) => status.into_response(Vec::new()),
+            },
             Err(status) => status.into_response(Vec::new()),
         };
 
@@ -577,11 +584,14 @@ impl Server {
         let method = request.method.clone();
         let request_body_len = request.body.len();
 
-        self.metrics.rpc_started(&RpcStarted {
-            service: service.clone(),
-            method: method.clone(),
-            request_body_len,
-        });
+        record_rpc_started(
+            self.metrics.as_ref(),
+            &RpcStarted {
+                service: service.clone(),
+                method: method.clone(),
+                request_body_len,
+            },
+        );
 
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -640,7 +650,12 @@ impl Server {
             );
         }
 
-        match with_deadline(handler(request.body, request_body), deadline).await {
+        let handler_result = match invoke_streaming_handler(&handler, request.body, request_body) {
+            Ok(future) => run_handler_with_deadline(future, deadline).await,
+            Err(status) => Err(status),
+        };
+
+        match handler_result {
             Err(status) => self.finish_streaming_status(
                 &service,
                 &method,
@@ -696,14 +711,17 @@ impl Server {
         let elapsed = started_at.elapsed();
         let code = Code::from_u32(response.status);
 
-        self.metrics.rpc_finished(&RpcFinished {
-            service: service.to_owned(),
-            method: method.to_owned(),
-            request_body_len,
-            response_body_len: response.body.len(),
-            code,
-            elapsed,
-        });
+        record_rpc_finished(
+            self.metrics.as_ref(),
+            &RpcFinished {
+                service: service.to_owned(),
+                method: method.to_owned(),
+                request_body_len,
+                response_body_len: response.body.len(),
+                code,
+                elapsed,
+            },
+        );
 
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -768,6 +786,40 @@ where
             .await
             .map_err(|_| Status::deadline_exceeded("RPC deadline exceeded")),
         None => Ok(future.await),
+    }
+}
+
+fn invoke_unary_handler(
+    handler: &UnaryHandler,
+    body: Vec<u8>,
+) -> std::result::Result<UnaryHandlerFuture, Status> {
+    catch_unwind(AssertUnwindSafe(|| handler(body)))
+        .map_err(|_| Status::internal("RPC handler panicked"))
+}
+
+fn invoke_streaming_handler(
+    handler: &StreamingHandler,
+    body: Vec<u8>,
+    request_body: BoxMessageStream<Vec<u8>>,
+) -> std::result::Result<StreamingHandlerFuture, Status> {
+    catch_unwind(AssertUnwindSafe(|| handler(body, request_body)))
+        .map_err(|_| Status::internal("RPC handler panicked"))
+}
+
+async fn run_handler_with_deadline<T, F>(
+    future: F,
+    deadline: Option<Instant>,
+) -> std::result::Result<T, Status>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    match tokio::spawn(with_deadline(future, deadline)).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => Err(Status::internal("RPC handler panicked")),
+        Err(error) => Err(Status::internal(format!(
+            "RPC handler task failed: {error}"
+        ))),
     }
 }
 
@@ -1059,14 +1111,17 @@ fn finish_streaming_response(
 ) {
     let elapsed = started_at.elapsed();
 
-    metrics.rpc_finished(&RpcFinished {
-        service: service.to_owned(),
-        method: method.to_owned(),
-        request_body_len,
-        response_body_len,
-        code,
-        elapsed,
-    });
+    record_rpc_finished(
+        metrics,
+        &RpcFinished {
+            service: service.to_owned(),
+            method: method.to_owned(),
+            request_body_len,
+            response_body_len,
+            code,
+            elapsed,
+        },
+    );
 
     #[cfg(feature = "tracing")]
     tracing::info!(
@@ -1078,6 +1133,14 @@ fn finish_streaming_response(
         elapsed_ms = elapsed.as_millis(),
         "streaming rpc finished"
     );
+}
+
+fn record_rpc_started(metrics: &dyn Metrics, event: &RpcStarted) {
+    let _ = catch_unwind(AssertUnwindSafe(|| metrics.rpc_started(event)));
+}
+
+fn record_rpc_finished(metrics: &dyn Metrics, event: &RpcFinished) {
+    let _ = catch_unwind(AssertUnwindSafe(|| metrics.rpc_finished(event)));
 }
 
 impl From<Error> for RpcResponse {
@@ -1106,6 +1169,18 @@ mod tests {
                 .lock()
                 .expect("metrics lock should not be poisoned")
                 .push(event.code);
+        }
+    }
+
+    struct PanickingMetrics;
+
+    impl Metrics for PanickingMetrics {
+        fn rpc_started(&self, _event: &super::RpcStarted) {
+            panic!("started");
+        }
+
+        fn rpc_finished(&self, _event: &RpcFinished) {
+            panic!("finished");
         }
     }
 
@@ -1166,6 +1241,63 @@ mod tests {
 
         assert_eq!(Code::from_u32(response.status), Code::Unauthenticated);
         assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_panics_do_not_fail_request() {
+        let mut server = Server::new();
+        server.set_metrics(PanickingMetrics);
+        server.route("example.Greeter", "SayHello", |_| async {
+            Ok(b"hello".to_vec())
+        });
+
+        let response = server
+            .handle_request(RpcRequest::new("example.Greeter", "SayHello", Vec::new()))
+            .await;
+
+        assert_eq!(Code::from_u32(response.status), Code::Ok);
+        assert_eq!(response.body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn unary_handler_panics_return_internal() {
+        let mut server = Server::new();
+        server.route("example.Greeter", "Panic", |_| async {
+            panic!("boom");
+        });
+
+        let response = server
+            .handle_request(RpcRequest::new("example.Greeter", "Panic", Vec::new()))
+            .await;
+
+        assert_eq!(Code::from_u32(response.status), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn streaming_handler_panics_return_internal_status() {
+        let mut server = Server::new();
+        server.route_streaming(
+            "example.Greeter",
+            "Panic",
+            RpcKind::ServerStreaming,
+            |_, _| async {
+                panic!("boom");
+            },
+        );
+        let request = RpcRequest::new("example.Greeter", "Panic", Vec::new())
+            .with_kind(RpcKind::ServerStreaming);
+
+        let mut response = server
+            .handle_streaming_request(request, crate::stream::empty())
+            .await;
+        let frame = response
+            .next()
+            .await
+            .expect("status frame should be emitted")
+            .expect("status frame should not be transport error");
+
+        assert_eq!(frame.frame_kind(), Some(RpcStreamFrameKind::Status));
+        assert_eq!(Code::from_u32(frame.status), Code::Internal);
     }
 
     #[tokio::test]

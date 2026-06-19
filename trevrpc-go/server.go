@@ -419,6 +419,12 @@ func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout tim
 
 	results := make(chan recvResult, 1)
 	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				results <- recvResult{err: Internal(fmt.Sprintf("%s stream panicked: %v", direction, recovered))}
+			}
+		}()
+
 		body, err := stream.Recv()
 		results <- recvResult{body: body, err: err}
 	}()

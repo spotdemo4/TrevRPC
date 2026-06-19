@@ -125,7 +125,13 @@ func SingleMessageStream[T ProtoMessage](message T) ByteStream {
 	return EncodeStream(FromSlice(message))
 }
 
-func closeMessageStream(stream any) error {
+func closeMessageStream(stream any) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = Internal("stream close panicked")
+		}
+	}()
+
 	if closer, ok := stream.(io.Closer); ok {
 		return closer.Close()
 	}

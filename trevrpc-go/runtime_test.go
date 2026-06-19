@@ -368,6 +368,47 @@ func TestServerMetricsPanicDoesNotFailRequest(t *testing.T) {
 	}
 }
 
+func TestServerRequestStreamPanicReturnsInternal(t *testing.T) {
+	server := NewServer()
+	server.RouteStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		_, err := requests.Recv()
+		if err != nil {
+			return nil, err
+		}
+
+		return EmptyStream[[]byte](), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Upload", nil)
+	request.Kind = RpcKindClientStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, panickingByteStream{})
+	frame, err := response.Recv()
+	if err != nil {
+		t.Fatalf("read status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeInternal {
+		t.Fatalf("expected internal status, got %#v", frame)
+	}
+}
+
+func TestServerResponseStreamPanicReturnsInternal(t *testing.T) {
+	server := NewServer()
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return panickingByteStream{}, nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	frame, err := response.Recv()
+	if err != nil {
+		t.Fatalf("read status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeInternal {
+		t.Fatalf("expected internal status, got %#v", frame)
+	}
+}
+
 func TestRequestStreamMessageLimitReturnsResourceExhausted(t *testing.T) {
 	server := NewServer()
 	options := DefaultServerOptions()
@@ -553,6 +594,16 @@ func (pendingFrameStream) Recv() (*RpcStreamFrame, error) {
 }
 
 func (pendingFrameStream) Close() error { return nil }
+
+type panickingByteStream struct{}
+
+func (panickingByteStream) Recv() ([]byte, error) {
+	panic("boom")
+}
+
+func (panickingByteStream) Close() error {
+	panic("close boom")
+}
 
 type recordingMetrics struct {
 	mu    sync.Mutex
