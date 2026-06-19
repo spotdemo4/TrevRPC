@@ -34,7 +34,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	conn, err := quic.DialAddr(ctx, serverAddr, tlsConfig, &quic.Config{})
+	conn, err := quic.DialAddr(ctx, serverAddr, tlsConfig, trevrpc.QUICClientConfig(trevrpc.DefaultMaxFrameSize, nil))
 	if err != nil {
 		log.Fatal(err)
 	}

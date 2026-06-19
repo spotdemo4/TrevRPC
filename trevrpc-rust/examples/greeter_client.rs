@@ -99,9 +99,14 @@ fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync
     client_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
 
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(client_crypto)?,
-    )));
+    let mut client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
+    trevrpc::quinn::configure_client_config(
+        &mut client_config,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        false,
+    );
+    endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
 }

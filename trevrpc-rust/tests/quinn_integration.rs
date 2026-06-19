@@ -1449,7 +1449,11 @@ async fn hold_server_stream_open(
 }
 
 fn spawn_greeter_server(configure: impl FnOnce(&mut Server)) -> TestResult<RunningServer> {
-    spawn_greeter_server_with_endpoint(make_server_endpoint()?, configure)
+    let mut server = Server::new();
+    server.set_options(fast_server_options());
+    configure(&mut server);
+    let endpoint = make_server_endpoint(server.options())?;
+    spawn_configured_greeter_server(endpoint, server)
 }
 
 fn register_reject_upload_route(server: &mut Server) {
@@ -1478,10 +1482,17 @@ fn spawn_greeter_server_with_endpoint(
     (endpoint, cert_der): (quinn::Endpoint, CertificateDer<'static>),
     configure: impl FnOnce(&mut Server),
 ) -> TestResult<RunningServer> {
-    let addr = endpoint.local_addr()?;
     let mut server = Server::new();
     server.set_options(fast_server_options());
     configure(&mut server);
+    spawn_configured_greeter_server((endpoint, cert_der), server)
+}
+
+fn spawn_configured_greeter_server(
+    (endpoint, cert_der): (quinn::Endpoint, CertificateDer<'static>),
+    mut server: Server,
+) -> TestResult<RunningServer> {
+    let addr = endpoint.local_addr()?;
     greeter::register_greeter(&mut server, TestGreeter);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -1503,14 +1514,15 @@ fn spawn_greeter_server_with_endpoint(
 fn spawn_webtransport_greeter_server(
     configure: impl FnOnce(&mut Server),
 ) -> TestResult<RunningWebTransportServer> {
-    let (endpoint, cert_der) = make_server_endpoint_with_alpns(
-        &[trevrpc::ALPN, web_transport_quinn::ALPN.as_bytes()],
-        true,
-    )?;
-    let addr = endpoint.local_addr()?;
     let mut server = Server::new();
     server.set_options(fast_server_options());
     configure(&mut server);
+    let (endpoint, cert_der) = make_server_endpoint_with_alpns(
+        &[trevrpc::ALPN, web_transport_quinn::ALPN.as_bytes()],
+        true,
+        server.options(),
+    )?;
+    let addr = endpoint.local_addr()?;
     greeter::register_greeter(&mut server, TestGreeter);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -1643,13 +1655,16 @@ fn short_authenticated_options() -> CallOptions {
         .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
 }
 
-fn make_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
-    make_server_endpoint_with_alpns(&[trevrpc::ALPN], false)
+fn make_server_endpoint(
+    options: &ServerOptions,
+) -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
+    make_server_endpoint_with_alpns(&[trevrpc::ALPN], false, options)
 }
 
 fn make_server_endpoint_with_alpns(
     alpns: &[&[u8]],
     allow_uni_streams: bool,
+    options: &ServerOptions,
 ) -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
     let cert_der = CertificateDer::from(cert.cert);
@@ -1662,11 +1677,7 @@ fn make_server_endpoint_with_alpns(
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    if !allow_uni_streams {
-        let transport_config = Arc::get_mut(&mut server_config.transport)
-            .expect("server config should have one transport reference");
-        transport_config.max_concurrent_uni_streams(0_u8.into());
-    }
+    trevrpc::quinn::configure_server_config(&mut server_config, options, allow_uni_streams);
 
     Ok((
         quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?,
@@ -1689,9 +1700,7 @@ fn make_mtls_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'s
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    let transport_config = Arc::get_mut(&mut server_config.transport)
-        .expect("server config should have one transport reference");
-    transport_config.max_concurrent_uni_streams(0_u8.into());
+    trevrpc::quinn::configure_server_config(&mut server_config, &ServerOptions::new(), false);
 
     Ok((
         quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?,
@@ -1716,9 +1725,14 @@ fn make_client_endpoint_with_alpn(
     client_crypto.alpn_protocols = vec![alpn.to_vec()];
 
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(client_crypto)?,
-    )));
+    let mut client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
+    trevrpc::quinn::configure_client_config(
+        &mut client_config,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        false,
+    );
+    endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
 }

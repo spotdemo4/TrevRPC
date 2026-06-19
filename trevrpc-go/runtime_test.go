@@ -737,6 +737,69 @@ func (m *recordingMetrics) hasCode(code Code) bool {
 	return slices.Contains(m.codes, code)
 }
 
+func TestQUICServerConfigAlignsTransportLimits(t *testing.T) {
+	options := DefaultServerOptions()
+	options.MaxFrameSize = 1024
+	options.MaxStreamBodySize = 4096
+	options.MaxConcurrentStreamsPerConnection = 10
+	base := &quic.Config{
+		InitialStreamReceiveWindow:     1 << 20,
+		MaxStreamReceiveWindow:         1 << 20,
+		InitialConnectionReceiveWindow: 1 << 20,
+		MaxConnectionReceiveWindow:     1 << 20,
+		MaxIncomingStreams:             100,
+	}
+
+	config := QUICServerConfig(options, base)
+
+	if base.InitialStreamReceiveWindow != 1<<20 {
+		t.Fatal("QUICServerConfig should not mutate the base config")
+	}
+	if config.InitialStreamReceiveWindow != 1028 || config.MaxStreamReceiveWindow != 1028 {
+		t.Fatalf("stream receive windows should match one TrevRPC frame, got initial=%d max=%d", config.InitialStreamReceiveWindow, config.MaxStreamReceiveWindow)
+	}
+	if config.InitialConnectionReceiveWindow != 4096 || config.MaxConnectionReceiveWindow != 4096 {
+		t.Fatalf("connection receive windows should match bounded stream budget, got initial=%d max=%d", config.InitialConnectionReceiveWindow, config.MaxConnectionReceiveWindow)
+	}
+	if config.MaxIncomingStreams != 11 {
+		t.Fatalf("incoming bidirectional streams should include one rejection slot, got %d", config.MaxIncomingStreams)
+	}
+	if config.MaxIncomingUniStreams != -1 {
+		t.Fatalf("native QUIC should disable peer-initiated unidirectional streams, got %d", config.MaxIncomingUniStreams)
+	}
+
+	options.EnableWebTransport = true
+	config = QUICServerConfig(options, nil)
+	if !config.EnableDatagrams || !config.EnableStreamResetPartialDelivery {
+		t.Fatal("WebTransport QUIC config should enable required QUIC extensions")
+	}
+	if config.MaxIncomingUniStreams != 0 {
+		t.Fatalf("WebTransport QUIC config should leave HTTP/3 unidirectional stream defaults available, got %d", config.MaxIncomingUniStreams)
+	}
+}
+
+func TestQUICClientConfigAlignsTransportLimits(t *testing.T) {
+	config := QUICClientConfig(2048, &quic.Config{MaxStreamReceiveWindow: 1 << 20})
+
+	if config.InitialStreamReceiveWindow != 2052 || config.MaxStreamReceiveWindow != 2052 {
+		t.Fatalf("client stream receive windows should match one TrevRPC frame, got initial=%d max=%d", config.InitialStreamReceiveWindow, config.MaxStreamReceiveWindow)
+	}
+	if config.InitialConnectionReceiveWindow != 2052 || config.MaxConnectionReceiveWindow != 2052 {
+		t.Fatalf("client connection receive windows should match one response frame, got initial=%d max=%d", config.InitialConnectionReceiveWindow, config.MaxConnectionReceiveWindow)
+	}
+	if config.MaxIncomingStreams != -1 || config.MaxIncomingUniStreams != -1 {
+		t.Fatalf("native client should reject peer-initiated streams, got bidi=%d uni=%d", config.MaxIncomingStreams, config.MaxIncomingUniStreams)
+	}
+
+	config = WebTransportQUICClientConfig(2048, nil)
+	if !config.EnableDatagrams || !config.EnableStreamResetPartialDelivery {
+		t.Fatal("WebTransport client QUIC config should enable required QUIC extensions")
+	}
+	if config.MaxIncomingStreams != -1 || config.MaxIncomingUniStreams != 0 {
+		t.Fatalf("WebTransport client should reject peer-initiated bidi streams while leaving HTTP/3 uni defaults, got bidi=%d uni=%d", config.MaxIncomingStreams, config.MaxIncomingUniStreams)
+	}
+}
+
 func TestQuicClientUnary(t *testing.T) {
 	server := NewServer()
 	RegisterUnary(server, "example.Greeter", "SayHello", func() *testMessage { return &testMessage{} }, func(_ context.Context, request *testMessage) (*testMessage, error) {
@@ -744,7 +807,7 @@ func TestQuicClientUnary(t *testing.T) {
 	})
 
 	serverTLS, clientTLS := testTLSConfig(t)
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{})
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICServerConfig(server.Options(), nil))
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -756,7 +819,7 @@ func TestQuicClientUnary(t *testing.T) {
 		_ = ServeQUIC(ctx, listener, server)
 	}()
 
-	conn, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, &quic.Config{})
+	conn, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, QUICClientConfig(DefaultMaxFrameSize, nil))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -848,7 +911,7 @@ func TestWebTransportCheckOriginAllowsBrowserOrigin(t *testing.T) {
 	defer cancel()
 	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/trevrpc", WebTransportDialOptions{
 		TLSClientConfig: running.clientTLS.Clone(),
-		QUICConfig:      testWebTransportQUICConfig(),
+		QUICConfig:      WebTransportQUICClientConfig(DefaultMaxFrameSize, nil),
 		RequestHeader:   http.Header{"Origin": []string{origin}},
 	})
 	if err != nil {
@@ -871,7 +934,7 @@ func TestWebTransportRejectsUnexpectedPath(t *testing.T) {
 	defer cancel()
 	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/wrong", WebTransportDialOptions{
 		TLSClientConfig: running.clientTLS.Clone(),
-		QUICConfig:      testWebTransportQUICConfig(),
+		QUICConfig:      WebTransportQUICClientConfig(DefaultMaxFrameSize, nil),
 	})
 	if err == nil {
 		transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
@@ -1582,14 +1645,14 @@ func startTestQUICServerWithInitialRequestTimeout(t *testing.T, timeout time.Dur
 
 func startTestQUICServerWithTLS(t *testing.T, serverTLS, clientTLS *tls.Config, configure func(*Server)) *runningTestQUICServer {
 	t.Helper()
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{})
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-
 	server := NewServer()
 	registerTestGreeter(server)
 	configure(server)
+
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICServerConfig(server.Options(), nil))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -1615,11 +1678,6 @@ func startTestWebTransportServer(t *testing.T, configure func(*Server)) *running
 	serverTLS.NextProtos = []string{http3.NextProtoH3}
 	clientTLS.NextProtos = []string{http3.NextProtoH3}
 
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, testWebTransportQUICConfig())
-	if err != nil {
-		t.Fatalf("listen WebTransport: %v", err)
-	}
-
 	server := NewServer()
 	registerTestGreeter(server)
 	configure(server)
@@ -1629,6 +1687,11 @@ func startTestWebTransportServer(t *testing.T, configure func(*Server)) *running
 		options.WebTransportCheckOrigin = func(*http.Request) bool { return true }
 	}
 	server.SetOptions(options)
+
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICServerConfig(server.Options(), nil))
+	if err != nil {
+		t.Fatalf("listen WebTransport: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -1671,7 +1734,7 @@ func connectTestQUICClient(t *testing.T, running *runningTestQUICServer) *quic.C
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS.Clone(), &quic.Config{})
+	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS.Clone(), QUICClientConfig(DefaultMaxFrameSize, nil))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1714,20 +1777,13 @@ func connectTestWebTransportClient(t *testing.T, running *runningTestQUICServer)
 
 	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/trevrpc", WebTransportDialOptions{
 		TLSClientConfig: running.clientTLS.Clone(),
-		QUICConfig:      testWebTransportQUICConfig(),
+		QUICConfig:      WebTransportQUICClientConfig(DefaultMaxFrameSize, nil),
 	})
 	if err != nil {
 		t.Fatalf("dial WebTransport: %v", err)
 	}
 
 	return transport
-}
-
-func testWebTransportQUICConfig() *quic.Config {
-	return &quic.Config{
-		EnableDatagrams:                  true,
-		EnableStreamResetPartialDelivery: true,
-	}
 }
 
 func registerTestGreeter(server *Server) {

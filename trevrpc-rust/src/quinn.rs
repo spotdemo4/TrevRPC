@@ -8,6 +8,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client::RpcTransport;
 use crate::framing::{DEFAULT_MAX_FRAME_SIZE, decode_frame, encode_frame_with_max, frame_body_len};
+use crate::server::ServerOptions;
 use crate::{
     BoxMessageStream, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse,
     RpcStreamFrame, RpcStreamFrameKind, Status,
@@ -15,6 +16,123 @@ use crate::{
 
 const CANCELLED_STREAM_CODE: u32 = 1;
 const FRAME_READ_CHUNK_LEN: usize = 32 * 1024;
+const FRAME_HEADER_LEN: u64 = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportLimits {
+    pub stream_receive_window: u64,
+    pub connection_receive_window: u64,
+    pub max_concurrent_bidi_streams: Option<u64>,
+    pub max_concurrent_uni_streams: Option<u64>,
+}
+
+#[must_use]
+pub fn transport_limits_from_server_options(
+    options: &ServerOptions,
+    allow_incoming_uni_streams: bool,
+) -> TransportLimits {
+    let stream_receive_window = frame_receive_window(options.max_frame_size());
+
+    TransportLimits {
+        stream_receive_window,
+        connection_receive_window: connection_receive_window(options, stream_receive_window),
+        max_concurrent_bidi_streams: options
+            .max_concurrent_streams_per_connection()
+            // Keep one extra stream available so over-limit RPCs can receive a TrevRPC status.
+            .map(|max_streams| saturating_usize_to_u64(max_streams).saturating_add(1)),
+        max_concurrent_uni_streams: if allow_incoming_uni_streams {
+            None
+        } else {
+            Some(0)
+        },
+    }
+}
+
+#[must_use]
+pub fn client_transport_limits(
+    max_frame_size: usize,
+    allow_incoming_uni_streams: bool,
+) -> TransportLimits {
+    let stream_receive_window = frame_receive_window(max_frame_size);
+
+    TransportLimits {
+        stream_receive_window,
+        connection_receive_window: stream_receive_window,
+        max_concurrent_bidi_streams: Some(0),
+        max_concurrent_uni_streams: if allow_incoming_uni_streams {
+            None
+        } else {
+            Some(0)
+        },
+    }
+}
+
+pub fn configure_server_config(
+    config: &mut quinn::ServerConfig,
+    options: &ServerOptions,
+    allow_incoming_uni_streams: bool,
+) {
+    let limits = transport_limits_from_server_options(options, allow_incoming_uni_streams);
+    if let Some(transport) = Arc::get_mut(&mut config.transport) {
+        apply_transport_limits(transport, limits);
+    } else {
+        let mut transport = quinn::TransportConfig::default();
+        apply_transport_limits(&mut transport, limits);
+        config.transport_config(Arc::new(transport));
+    }
+}
+
+pub fn configure_client_config(
+    config: &mut quinn::ClientConfig,
+    max_frame_size: usize,
+    allow_incoming_uni_streams: bool,
+) {
+    let limits = client_transport_limits(max_frame_size, allow_incoming_uni_streams);
+    let mut transport = quinn::TransportConfig::default();
+    apply_transport_limits(&mut transport, limits);
+    config.transport_config(Arc::new(transport));
+}
+
+pub fn apply_transport_limits(config: &mut quinn::TransportConfig, limits: TransportLimits) {
+    config.stream_receive_window(varint(limits.stream_receive_window));
+    config.receive_window(varint(limits.connection_receive_window));
+    if let Some(max_streams) = limits.max_concurrent_bidi_streams {
+        config.max_concurrent_bidi_streams(varint(max_streams));
+    }
+    if let Some(max_streams) = limits.max_concurrent_uni_streams {
+        config.max_concurrent_uni_streams(varint(max_streams));
+    }
+}
+
+fn frame_receive_window(max_frame_size: usize) -> u64 {
+    saturating_usize_to_u64(max_frame_size).saturating_add(FRAME_HEADER_LEN)
+}
+
+fn connection_receive_window(options: &ServerOptions, stream_receive_window: u64) -> u64 {
+    let mut connection_receive_window = stream_receive_window;
+    if let Some(max_streams) = options.max_concurrent_streams_per_connection()
+        && max_streams > 1
+    {
+        connection_receive_window =
+            stream_receive_window.saturating_mul(saturating_usize_to_u64(max_streams));
+    }
+
+    if let Some(max_body_size) = options.max_stream_body_size() {
+        let stream_body_window = saturating_usize_to_u64(max_body_size);
+        connection_receive_window = connection_receive_window.min(stream_body_window);
+        connection_receive_window = connection_receive_window.max(stream_receive_window);
+    }
+
+    connection_receive_window
+}
+
+fn saturating_usize_to_u64(value: usize) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
+}
+
+fn varint(value: u64) -> quinn::VarInt {
+    quinn::VarInt::from_u64(value).unwrap_or(quinn::VarInt::MAX)
+}
 
 #[derive(Clone)]
 pub struct Client {
@@ -953,5 +1071,65 @@ async fn drain_connection_tasks(connection_tasks: &mut JoinSet<()>, endpoint: &q
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::ServerOptions;
+
+    use super::{TransportLimits, client_transport_limits, transport_limits_from_server_options};
+
+    #[test]
+    fn server_transport_limits_align_with_trevrpc_limits() {
+        let options = ServerOptions::new()
+            .with_max_frame_size(1024)
+            .with_max_stream_body_size(Some(4096))
+            .with_max_concurrent_streams_per_connection(Some(10));
+
+        assert_eq!(
+            transport_limits_from_server_options(&options, false),
+            TransportLimits {
+                stream_receive_window: 1028,
+                connection_receive_window: 4096,
+                max_concurrent_bidi_streams: Some(11),
+                max_concurrent_uni_streams: Some(0),
+            }
+        );
+        assert_eq!(
+            transport_limits_from_server_options(&options, true).max_concurrent_uni_streams,
+            None
+        );
+    }
+
+    #[test]
+    fn client_transport_limits_reject_unused_peer_initiated_streams() {
+        assert_eq!(
+            client_transport_limits(2048, false),
+            TransportLimits {
+                stream_receive_window: 2052,
+                connection_receive_window: 2052,
+                max_concurrent_bidi_streams: Some(0),
+                max_concurrent_uni_streams: Some(0),
+            }
+        );
+        assert_eq!(
+            client_transport_limits(2048, true).max_concurrent_uni_streams,
+            None
+        );
+    }
+
+    #[test]
+    fn server_transport_limit_calculation_saturates() {
+        let options = ServerOptions::new()
+            .with_max_frame_size(usize::MAX)
+            .with_max_stream_body_size(None)
+            .with_max_concurrent_streams_per_connection(Some(usize::MAX));
+
+        let limits = transport_limits_from_server_options(&options, false);
+
+        assert_eq!(limits.stream_receive_window, u64::MAX);
+        assert_eq!(limits.connection_receive_window, u64::MAX);
+        assert_eq!(limits.max_concurrent_bidi_streams, Some(u64::MAX));
     }
 }

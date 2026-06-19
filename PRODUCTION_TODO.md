@@ -26,6 +26,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Slowloris-style partial-header, partial-body, and oversized-initial-frame tests exist where the transports expose those states.
 - Frame readers avoid allocating the full advertised body length before bytes arrive, with large partial-body coverage in Go, JavaScript, and Rust.
 - Go and Rust request permits are acquired only after the initial request frame completes, with native QUIC regression coverage for large partial initial bodies.
+- Go and Rust QUIC/WebTransport setup helpers align receive windows and incoming stream caps with TrevRPC frame, stream, and concurrency limits while preserving over-limit status responses.
 - Shutdown tests cover stuck handlers and long-running streams.
 
 ## Remaining Work
@@ -37,7 +38,6 @@ This repository is not production-ready yet. Track the remaining work here so ru
 
 ### 2. Initial Frame, Header, Body, and Resource Limits
 
-- Align QUIC/WebTransport transport flow-control limits with TrevRPC frame and stream limits.
 - Split request-body, response-body, streaming-message, and total-stream byte budgets further if real workloads need different limits.
 
 ### 3. Streaming Lifecycle and Error Propagation

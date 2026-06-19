@@ -93,15 +93,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	listener, err := quic.ListenAddr(listenAddr, tlsConfig, &quic.Config{
-		EnableDatagrams:                  true,
-		EnableStreamResetPartialDelivery: true,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer listener.Close()
-
 	server := trevrpc.NewServer()
 	server.SetAuthorizer(trevrpc.BearerAuthorizer(authToken))
 	options := server.Options()
@@ -109,6 +100,12 @@ func main() {
 	options.WebTransportCheckOrigin = allowBrowserExampleOrigin
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, greeterService{})
+
+	listener, err := quic.ListenAddr(listenAddr, tlsConfig, trevrpc.QUICServerConfig(server.Options(), nil))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer listener.Close()
 
 	log.Printf("greeter server listening on %s for native QUIC and WebTransport", listener.Addr())
 	log.Printf("WebTransport URL: https://%s/trevrpc", listener.Addr())

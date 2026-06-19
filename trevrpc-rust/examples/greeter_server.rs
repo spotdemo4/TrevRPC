@@ -99,17 +99,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let certificate_path = cert::certificate_path()?;
     write_certificate(&identity, &certificate_path)?;
 
-    let endpoint = make_endpoint(addr, &identity)?;
-
     let mut server = trevrpc::server::Server::new();
-    server.set_options(
-        trevrpc::server::ServerOptions::new()
-            .with_max_concurrent_connections(Some(512))
-            .with_max_concurrent_streams_per_connection(Some(64))
-            .with_max_concurrent_requests(Some(1024)),
-    );
+    let options = trevrpc::server::ServerOptions::new()
+        .with_max_concurrent_connections(Some(512))
+        .with_max_concurrent_streams_per_connection(Some(64))
+        .with_max_concurrent_requests(Some(1024));
+    server.set_options(options);
     server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     greeter::register_greeter(&mut server, GreeterService);
+
+    let endpoint = make_endpoint(addr, &identity, server.options())?;
 
     println!(
         "TrevRPC greeter native QUIC server listening on {}",
@@ -145,6 +144,7 @@ fn make_identity() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, Box<dyn Error 
 fn make_endpoint(
     addr: SocketAddr,
     identity: &rcgen::CertifiedKey<rcgen::KeyPair>,
+    options: &trevrpc::server::ServerOptions,
 ) -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {
     let cert_der = identity.cert.der().clone();
     let key_der = PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der());
@@ -157,8 +157,9 @@ fn make_endpoint(
         web_transport_quinn::ALPN.as_bytes().to_vec(),
     ];
 
-    let server_config =
+    let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+    trevrpc::quinn::configure_server_config(&mut server_config, options, true);
 
     Ok(quinn::Endpoint::server(server_config, addr)?)
 }
