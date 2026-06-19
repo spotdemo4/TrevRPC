@@ -32,7 +32,7 @@ const GRPC_SAY_HELLO_PATH: &str = "/example.greeter.Greeter/SayHello";
 const GRPC_LOTS_OF_REPLIES_PATH: &str = "/example.greeter.Greeter/LotsOfReplies";
 const GRPC_LOTS_OF_GREETINGS_PATH: &str = "/example.greeter.Greeter/LotsOfGreetings";
 const GRPC_BIDI_HELLO_PATH: &str = "/example.greeter.Greeter/BidiHello";
-const BENCHMARK_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+const BENCHMARK_QUIC_IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 const BENCHMARK_QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
