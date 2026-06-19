@@ -8,6 +8,12 @@ import { pathToFileURL } from "node:url";
 import { generate as generateBindings } from "../src/generator.js";
 import {
   Code,
+  FrameReader,
+  FrameTooLargeError,
+  MaxMetadataEntries,
+  MaxMetadataKeyLen,
+  MaxMetadataTotalSize,
+  MaxMetadataValueLen,
   RpcKind,
   RpcRequest,
   RpcResponse,
@@ -19,11 +25,13 @@ import {
   createRoot,
   decodeFrame,
   encodeFrame,
+  frameBodyLength,
   invalidArgument,
   marshalMessage,
   normalizeMetadata,
   serverStreaming,
   unary,
+  validateMetadata,
 } from "../src/index.js";
 
 test("frames round-trip TrevRPC requests", () => {
@@ -47,6 +55,94 @@ test("frames round-trip TrevRPC requests", () => {
   assert.deepEqual(
     decoded.metadata.authorization,
     new Uint8Array([66, 101, 97, 114, 101, 114, 32, 116, 111, 107, 101, 110]),
+  );
+});
+
+test("frame length boundary cases are stable", () => {
+  for (const length of [0, 1, 15, 16]) {
+    const header = new Uint8Array(4);
+    new DataView(header.buffer).setUint32(0, length, false);
+
+    assert.equal(frameBodyLength(header, 16), length);
+  }
+
+  for (const length of [17, 0xffffffff]) {
+    const header = new Uint8Array(4);
+    new DataView(header.buffer).setUint32(0, length, false);
+
+    assert.throws(() => frameBodyLength(header, 16), FrameTooLargeError);
+  }
+});
+
+test("frame reader maps malformed protobuf bodies to invalid argument", async () => {
+  for (const body of deterministicByteVectors()) {
+    const frame = new Uint8Array(4 + body.byteLength);
+    new DataView(frame.buffer).setUint32(0, body.byteLength, false);
+    frame.set(body, 4);
+    const reader = new FrameReader(fakeReaderFromChunks(chunkBytes(frame, 3)));
+
+    try {
+      await reader.readFrame(RpcRequest);
+    } catch (error) {
+      assert.equal(error.code, Code.InvalidArgument);
+    }
+  }
+});
+
+test("metadata validation boundary cases are stable", () => {
+  const maxEntries = {};
+  for (let index = 0; index < MaxMetadataEntries; index += 1) {
+    maxEntries[`key-${index}`] = new Uint8Array();
+  }
+  assert.doesNotThrow(() => validateMetadata(maxEntries));
+
+  const tooManyEntries = { ...maxEntries, overflow: new Uint8Array() };
+  assert.throws(
+    () => validateMetadata(tooManyEntries),
+    (error) => {
+      assert.equal(error.code, Code.InvalidArgument);
+      return true;
+    },
+  );
+
+  assert.doesNotThrow(() => validateMetadata({ ["a".repeat(MaxMetadataKeyLen)]: [] }));
+  assert.throws(
+    () => validateMetadata({ ["a".repeat(MaxMetadataKeyLen + 1)]: [] }),
+    (error) => {
+      assert.equal(error.code, Code.InvalidArgument);
+      return true;
+    },
+  );
+
+  assert.doesNotThrow(() => validateMetadata({ key: new Uint8Array(MaxMetadataValueLen) }));
+  assert.throws(
+    () => validateMetadata({ key: new Uint8Array(MaxMetadataValueLen + 1) }),
+    (error) => {
+      assert.equal(error.code, Code.InvalidArgument);
+      return true;
+    },
+  );
+
+  const exactTotal = {};
+  for (const key of ["a", "b", "c", "d", "e", "f", "g", "h"]) {
+    exactTotal[key] = new Uint8Array(8191);
+  }
+  assert.equal(
+    Object.entries(exactTotal).reduce(
+      (total, [key, value]) => total + key.length + value.length,
+      0,
+    ),
+    MaxMetadataTotalSize,
+  );
+  assert.doesNotThrow(() => validateMetadata(exactTotal));
+
+  exactTotal.i = new Uint8Array();
+  assert.throws(
+    () => validateMetadata(exactTotal),
+    (error) => {
+      assert.equal(error.code, Code.InvalidArgument);
+      return true;
+    },
   );
 });
 
@@ -117,6 +213,66 @@ test("unknown response stream frame kind maps to invalid argument", async () => 
     stream[Symbol.asyncIterator]().next(),
     (error) => error.code === Code.InvalidArgument,
   );
+});
+
+test("response stream limits map to resource exhausted at boundaries", async () => {
+  const root = createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const Hello = root.lookupType("hello.v1.Hello");
+  const first = Hello.encode({ value: "one" }).finish();
+  const second = Hello.encode({ value: "two" }).finish();
+  const transport = {
+    async streamingCall() {
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield RpcStreamFrame.create({ body: first });
+          yield RpcStreamFrame.create({ body: second });
+          yield RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok });
+        },
+      };
+    },
+  };
+
+  const messageLimited = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { maxResponseMessages: 1 },
+  );
+  const messageIterator = messageLimited[Symbol.asyncIterator]();
+  assert.equal((await messageIterator.next()).value.value, "one");
+  await assert.rejects(messageIterator.next(), (error) => error.code === Code.ResourceExhausted);
+
+  const bodyLimited = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { maxResponseStreamBodySize: first.byteLength },
+  );
+  const bodyIterator = bodyLimited[Symbol.asyncIterator]();
+  assert.equal((await bodyIterator.next()).value.value, "one");
+  await assert.rejects(bodyIterator.next(), (error) => error.code === Code.ResourceExhausted);
 });
 
 test("wire golden vectors stay stable", async () => {
@@ -751,6 +907,41 @@ async function readWireGoldenVectors() {
 
 function bytesToHex(bytes) {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function deterministicByteVectors() {
+  const vectors = [new Uint8Array(), new Uint8Array([0xff]), new Uint8Array([0xff, 0xff])];
+  let state = 0x12345678;
+  for (let length = 1; length <= 32; length += 1) {
+    const bytes = new Uint8Array(length);
+    for (let index = 0; index < length; index += 1) {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      bytes[index] = state & 0xff;
+    }
+    vectors.push(bytes);
+  }
+
+  return vectors;
+}
+
+function chunkBytes(bytes, chunkSize) {
+  const chunks = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+    chunks.push(bytes.subarray(offset, offset + chunkSize));
+  }
+  return chunks;
+}
+
+function fakeReaderFromChunks(chunks) {
+  const pending = [...chunks];
+  return {
+    read() {
+      const value = pending.shift();
+      return Promise.resolve(
+        value == null ? { done: true, value: undefined } : { done: false, value },
+      );
+    },
+  };
 }
 
 function fakeBidirectionalStream({

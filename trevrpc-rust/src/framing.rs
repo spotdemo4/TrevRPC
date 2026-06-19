@@ -63,7 +63,7 @@ pub fn frame_body_len(header: [u8; FRAME_HEADER_LEN], max_frame_size: usize) -> 
 
 #[cfg(test)]
 mod tests {
-    use crate::RpcRequest;
+    use crate::{Code, RpcRequest};
 
     use super::{decode_frame, encode_frame, frame_body_len};
 
@@ -80,5 +80,31 @@ mod tests {
         assert_eq!(decoded.method, request.method);
         assert_eq!(decoded.body, request.body);
         assert_eq!(decoded.metadata, request.metadata);
+    }
+
+    #[test]
+    fn frame_body_len_boundary_cases_are_stable() {
+        for length in [0_u32, 1, 15, 16] {
+            let decoded =
+                frame_body_len(length.to_be_bytes(), 16).expect("in-range length should decode");
+            assert_eq!(decoded, length as usize);
+        }
+
+        for length in [17_u32, u32::MAX] {
+            let error = frame_body_len(length.to_be_bytes(), 16)
+                .expect_err("oversized length should be rejected before body allocation");
+            assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+        }
+    }
+
+    #[test]
+    fn malformed_protobuf_frame_bodies_are_invalid_argument() {
+        for body in [&[0xff][..], &[0xff, 0xff], &[0x0a, 0xff]] {
+            let status = decode_frame::<RpcRequest>(body)
+                .expect_err("malformed protobuf should fail")
+                .into_status();
+
+            assert_eq!(status.code(), Code::InvalidArgument);
+        }
     }
 }

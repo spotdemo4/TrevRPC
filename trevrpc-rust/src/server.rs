@@ -1156,7 +1156,10 @@ mod tests {
 
     use crate::{Code, Error, MessageStream, RpcKind, RpcRequest, RpcStreamFrameKind, Status};
 
-    use super::{Authorizer, MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions};
+    use super::{
+        Authorizer, MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions,
+        StreamLimits, check_stream_limits,
+    };
 
     #[derive(Clone, Default)]
     struct TestMetrics {
@@ -1407,6 +1410,54 @@ mod tests {
             Some(Duration::from_secs(10))
         );
         assert_eq!(options.max_stream_body_size(), Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn stream_limit_boundary_cases_are_stable() {
+        let limits = StreamLimits {
+            max_messages: Some(1),
+            max_body_size: Some(3),
+            idle_timeout: None,
+            deadline: None,
+        };
+        let mut messages = 0;
+        let mut body_size = 0;
+        check_stream_limits("response", limits, &mut messages, &mut body_size, 3)
+            .expect("first message within limits should pass");
+        assert_eq!(messages, 1);
+        assert_eq!(body_size, 3);
+        let status = check_stream_limits("response", limits, &mut messages, &mut body_size, 0)
+            .expect_err("second message should exceed message limit")
+            .into_status();
+        assert_eq!(status.code(), Code::ResourceExhausted);
+
+        let limits = StreamLimits {
+            max_messages: None,
+            max_body_size: Some(3),
+            idle_timeout: None,
+            deadline: None,
+        };
+        let mut messages = 0;
+        let mut body_size = 0;
+        check_stream_limits("response", limits, &mut messages, &mut body_size, 3)
+            .expect("exact body size should pass");
+        let status = check_stream_limits("response", limits, &mut messages, &mut body_size, 1)
+            .expect_err("body size overflow should fail")
+            .into_status();
+        assert_eq!(status.code(), Code::ResourceExhausted);
+
+        let limits = StreamLimits {
+            max_messages: None,
+            max_body_size: None,
+            idle_timeout: None,
+            deadline: None,
+        };
+        let mut messages = usize::MAX;
+        let mut body_size = usize::MAX;
+        check_stream_limits("response", limits, &mut messages, &mut body_size, 1)
+            .expect("unbounded counters should saturate without panicking");
+        assert_eq!(messages, usize::MAX);
+        assert_eq!(body_size, usize::MAX);
     }
 
     #[tokio::test]

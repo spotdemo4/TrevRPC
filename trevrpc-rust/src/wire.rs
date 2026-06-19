@@ -299,6 +299,33 @@ mod tests {
     }
 
     #[test]
+    fn metadata_boundary_cases_are_stable() {
+        let mut max_entries = Metadata::new();
+        for index in 0..MAX_METADATA_ENTRIES {
+            max_entries.insert(format!("key-{index}"), Vec::new());
+        }
+        assert_eq!(validate_metadata(&max_entries), Ok(()));
+
+        let mut max_key = Metadata::new();
+        max_key.insert("a".repeat(super::MAX_METADATA_KEY_LEN), Vec::new());
+        assert_eq!(validate_metadata(&max_key), Ok(()));
+
+        let mut max_value = Metadata::new();
+        max_value.insert("key".to_owned(), vec![0; MAX_METADATA_VALUE_LEN]);
+        assert_eq!(validate_metadata(&max_value), Ok(()));
+
+        let mut exact_total = Metadata::new();
+        for key in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            exact_total.insert(key.to_owned(), vec![0; 8191]);
+        }
+        assert_eq!(validate_metadata(&exact_total), Ok(()));
+
+        exact_total.insert("i".to_owned(), Vec::new());
+        let status = validate_metadata(&exact_total).expect_err("total metadata size should fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[test]
     fn request_defaults_to_unary_kind() {
         let request = RpcRequest::new("service", "method", Vec::new());
 

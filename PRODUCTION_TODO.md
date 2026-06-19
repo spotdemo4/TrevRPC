@@ -15,6 +15,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Native QUIC ALPN confusion, WebTransport path, authority, and browser origin policy are tested.
 - Bearer and metadata-value authorizers use constant-time comparison where practical.
 - The wire schema, compatibility policy, rolling-upgrade policy, and shared golden vectors are documented and tested across Go, JavaScript, and Rust.
+- Initial dependency-free fuzz/property-style tests cover frame parsing, protobuf decode normalization, metadata limits, and stream-limit boundaries.
 - Go handlers, metrics callbacks, and server stream adapters recover panics and return stable statuses.
 - Rust handler task panics and metrics callback panics are isolated and returned as stable statuses.
 - Go and Rust shutdown cancellation reaches active native QUIC/WebTransport stream tasks.
@@ -45,7 +46,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 
 ### 4. Protocol and Security Validation
 
-- Add fuzz/property tests for frame parsing, metadata validation, stream limits, and protobuf wire compatibility.
+- Expand fuzz/property tests into longer-running CI jobs for frame parsing, metadata validation, stream limits, and protobuf wire compatibility.
 - Add cross-runtime integration tests beyond golden vectors so Go, JavaScript, and Rust clients/servers exchange real RPCs.
 
 ### 5. Shutdown, Panics, and Failure Isolation
