@@ -362,7 +362,9 @@ type rpcStream interface {
 func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore, stream rpcStream) {
 	request := &RpcRequest{}
 	if err := readInitialRequestFrame(ctx, server, stream, request); err != nil {
-		_ = WriteFrame(stream, requestFrameStatus(err).IntoResponse(nil), server.options.MaxFrameSize)
+		status := requestFrameStatus(err)
+		server.recordPreHandlerFailure(status)
+		_ = WriteFrame(stream, status.IntoResponse(nil), server.options.MaxFrameSize)
 		_ = stream.Close()
 		return
 	}

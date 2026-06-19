@@ -30,6 +30,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Go and Rust request permits are acquired only after the initial request frame completes, with native QUIC regression coverage for large partial initial bodies.
 - Go and Rust QUIC/WebTransport setup helpers align receive windows and incoming stream caps with TrevRPC frame, stream, and concurrency limits while preserving over-limit status responses.
 - Go and Rust accepted-RPC completion metrics have exact-once coverage for success, handler errors/panics, auth/protocol rejection, deadlines, streaming drops, and request-limit rejection.
+- Go and Rust pre-handler transport/protocol failures record start+finish metrics with empty service/method placeholders for malformed and timed-out initial frames.
 - Shutdown tests cover stuck handlers and long-running streams.
 
 ## Remaining Work
@@ -54,7 +55,6 @@ This repository is not production-ready yet. Track the remaining work here so ru
 ### 5. Shutdown, Panics, and Failure Isolation
 
 - Keep request/concurrency permits held until non-cooperative work is actually stopped or isolated.
-- Preserve completion metrics for transport failures before or while handlers are being constructed, and for malformed initial frames where no service/method is available.
 - Continue isolating Rust background task panics and JavaScript stream failures with explicit reporting where the runtime exposes enough information.
 
 ### 6. Browser and WebTransport Compatibility

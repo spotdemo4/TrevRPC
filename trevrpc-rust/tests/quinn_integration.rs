@@ -12,7 +12,9 @@ use quinn::rustls::server::WebPkiClientVerifier;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{CallOptions, RpcTransport};
-use trevrpc::server::{MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions};
+use trevrpc::server::{
+    MetadataValueAuthorizer, Metrics, RpcFinished, RpcStarted, Server, ServerOptions,
+};
 use trevrpc::{Code, MessageStream, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
 #[path = "../examples/shared/greeter.rs"]
@@ -251,11 +253,27 @@ impl Drop for RunningWebTransportServer {
 
 #[derive(Clone, Default)]
 struct RecordingMetrics {
+    started: Arc<Mutex<Vec<RpcStarted>>>,
+    finished: Arc<Mutex<Vec<RpcFinished>>>,
     codes: Arc<Mutex<Vec<Code>>>,
     notify: Arc<Notify>,
 }
 
 impl RecordingMetrics {
+    fn started(&self) -> Vec<RpcStarted> {
+        self.started
+            .lock()
+            .expect("metrics lock should not be poisoned")
+            .clone()
+    }
+
+    fn finished(&self) -> Vec<RpcFinished> {
+        self.finished
+            .lock()
+            .expect("metrics lock should not be poisoned")
+            .clone()
+    }
+
     fn codes(&self) -> Vec<Code> {
         self.codes
             .lock()
@@ -281,13 +299,39 @@ impl RecordingMetrics {
 }
 
 impl Metrics for RecordingMetrics {
+    fn rpc_started(&self, event: &RpcStarted) {
+        self.started
+            .lock()
+            .expect("metrics lock should not be poisoned")
+            .push(event.clone());
+    }
+
     fn rpc_finished(&self, event: &RpcFinished) {
+        self.finished
+            .lock()
+            .expect("metrics lock should not be poisoned")
+            .push(event.clone());
         self.codes
             .lock()
             .expect("metrics lock should not be poisoned")
             .push(event.code);
         self.notify.notify_waiters();
     }
+}
+
+fn assert_pre_handler_metrics(metrics: &RecordingMetrics, code: Code) {
+    let started = metrics.started();
+    let finished = metrics.finished();
+    assert_eq!(started.len(), 1, "started metrics: {started:#?}");
+    assert_eq!(finished.len(), 1, "finished metrics: {finished:#?}");
+    assert_eq!(started[0].service, "");
+    assert_eq!(started[0].method, "");
+    assert_eq!(started[0].request_body_len, 0);
+    assert_eq!(finished[0].service, "");
+    assert_eq!(finished[0].method, "");
+    assert_eq!(finished[0].request_body_len, 0);
+    assert_eq!(finished[0].response_body_len, 0);
+    assert_eq!(finished[0].code, code);
 }
 
 #[tokio::test]
@@ -1207,7 +1251,11 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
 
 #[tokio::test]
 async fn quinn_malformed_request_frames_return_invalid_argument_status() -> TestResult {
-    let server = spawn_greeter_server(|_| {})?;
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let server = spawn_greeter_server(|server| {
+        server.set_metrics(metrics);
+    })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
 
@@ -1222,8 +1270,38 @@ async fn quinn_malformed_request_frames_return_invalid_argument_status() -> Test
     .await?;
 
     assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+    observed_metrics.wait_for_code(Code::InvalidArgument).await;
+    assert_pre_handler_metrics(&observed_metrics, Code::InvalidArgument);
 
     close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_malformed_request_frames_return_invalid_argument_status() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_metrics(metrics);
+    })?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+
+    send.write_all(&2_u32.to_be_bytes()).await?;
+    send.write_all(&[0xff, 0xff]).await?;
+    send.finish()?;
+
+    let response = trevrpc::webtransport::read_frame::<RpcResponse>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+
+    assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+    observed_metrics.wait_for_code(Code::InvalidArgument).await;
+    assert_pre_handler_metrics(&observed_metrics, Code::InvalidArgument);
+
+    close_webtransport_client(client, session).await;
     server.shutdown().await
 }
 
@@ -1277,7 +1355,14 @@ async fn quinn_unknown_request_stream_frame_kind_returns_invalid_argument_status
 
 #[tokio::test]
 async fn quinn_initial_request_timeout_rejects_partial_header() -> TestResult {
-    let server = spawn_greeter_server_with_initial_request_timeout(Duration::from_millis(50))?;
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let server = spawn_greeter_server(|server| {
+        server.set_options(
+            fast_server_options().with_initial_request_timeout(Some(Duration::from_millis(50))),
+        );
+        server.set_metrics(metrics);
+    })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&[0, 0]).await?;
@@ -1285,13 +1370,22 @@ async fn quinn_initial_request_timeout_rejects_partial_header() -> TestResult {
     let response = read_raw_quinn_response(&mut recv).await?;
 
     assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    observed_metrics.wait_for_code(Code::DeadlineExceeded).await;
+    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded);
     close_client(endpoint, connection).await;
     server.shutdown().await
 }
 
 #[tokio::test]
 async fn quinn_initial_request_timeout_rejects_partial_body() -> TestResult {
-    let server = spawn_greeter_server_with_initial_request_timeout(Duration::from_millis(50))?;
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let server = spawn_greeter_server(|server| {
+        server.set_options(
+            fast_server_options().with_initial_request_timeout(Some(Duration::from_millis(50))),
+        );
+        server.set_metrics(metrics);
+    })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&8_u32.to_be_bytes()).await?;
@@ -1300,7 +1394,36 @@ async fn quinn_initial_request_timeout_rejects_partial_body() -> TestResult {
     let response = read_raw_quinn_response(&mut recv).await?;
 
     assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    observed_metrics.wait_for_code(Code::DeadlineExceeded).await;
+    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded);
     close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_initial_request_timeout_rejects_partial_header() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_options(
+            fast_server_options().with_initial_request_timeout(Some(Duration::from_millis(50))),
+        );
+        server.set_metrics(metrics);
+    })?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+    send.write_all(&[0, 0]).await?;
+
+    let response = trevrpc::webtransport::read_frame::<RpcResponse>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+
+    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    observed_metrics.wait_for_code(Code::DeadlineExceeded).await;
+    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded);
+    close_webtransport_client(client, session).await;
     server.shutdown().await
 }
 
@@ -1560,14 +1683,6 @@ fn register_accept_upload_route(server: &mut Server) {
         trevrpc::RpcKind::BidirectionalStreaming,
         |_body, _requests| async { Ok(trevrpc::stream::empty()) },
     );
-}
-
-fn spawn_greeter_server_with_initial_request_timeout(
-    timeout: Duration,
-) -> TestResult<RunningServer> {
-    spawn_greeter_server(|server| {
-        server.set_options(fast_server_options().with_initial_request_timeout(Some(timeout)));
-    })
 }
 
 fn spawn_greeter_server_with_endpoint(

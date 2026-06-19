@@ -357,6 +357,12 @@ func (s *Server) recordRejectedRequest(request *RpcRequest, status *Status) {
 	s.finishStreamingResponse(service, method, requestBodyLen, 0, startedAt, status.Code)
 }
 
+func (s *Server) recordPreHandlerFailure(status *Status) {
+	startedAt := time.Now()
+	recordRPCStarted(s.metrics, RPCStarted{})
+	s.finishStreamingResponse("", "", 0, 0, startedAt, status.Code)
+}
+
 func (s *Server) finishStreamingResponse(service, method string, requestBodyLen, responseBodyLen int, startedAt time.Time, code Code) {
 	recordRPCFinished(s.metrics, RPCFinished{
 		Service:         service,

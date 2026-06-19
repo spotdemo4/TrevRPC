@@ -795,6 +795,19 @@ impl Server {
             status.code(),
         );
     }
+
+    pub(crate) fn record_pre_handler_failure(&self, status: &Status) {
+        let started_at = Instant::now();
+        record_rpc_started(
+            self.metrics.as_ref(),
+            &RpcStarted {
+                service: String::new(),
+                method: String::new(),
+                request_body_len: 0,
+            },
+        );
+        self.finish_streaming_response("", "", 0, started_at, 0, status.code());
+    }
 }
 
 async fn with_deadline<T, F>(future: F, deadline: Option<Instant>) -> std::result::Result<T, Status>

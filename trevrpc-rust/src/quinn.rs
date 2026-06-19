@@ -799,7 +799,9 @@ async fn handle_stream(
         Ok(request) => request,
         Err(error) => {
             let _ = recv.stop(CANCELLED_STREAM_CODE.into());
-            write_status(send, error.into_status(), server.max_frame_size()).await;
+            let status = error.into_status();
+            server.record_pre_handler_failure(&status);
+            write_status(send, status, server.max_frame_size()).await;
             return;
         }
     };

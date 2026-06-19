@@ -947,6 +947,23 @@ func expectMetricCodeSnapshot(t *testing.T, metrics *recordingMetrics, codes ...
 	}
 }
 
+func expectPreHandlerMetrics(t *testing.T, metrics *recordingMetrics, code Code) {
+	t.Helper()
+	started, finished := metrics.snapshot()
+	if len(started) != 1 {
+		t.Fatalf("started metrics = %d, want 1 (%#v)", len(started), started)
+	}
+	if len(finished) != 1 {
+		t.Fatalf("finished metrics = %d, want 1 (%#v)", len(finished), finished)
+	}
+	if started[0].Service != "" || started[0].Method != "" || started[0].RequestBodyLen != 0 {
+		t.Fatalf("unexpected pre-handler started metric: %#v", started[0])
+	}
+	if finished[0].Service != "" || finished[0].Method != "" || finished[0].RequestBodyLen != 0 || finished[0].ResponseBodyLen != 0 || finished[0].Code != code {
+		t.Fatalf("unexpected pre-handler finished metric: %#v", finished[0])
+	}
+}
+
 func TestQUICServerConfigAlignsTransportLimits(t *testing.T) {
 	options := DefaultServerOptions()
 	options.MaxFrameSize = 1024
@@ -1478,12 +1495,15 @@ func TestQuicTerminalStatusClosesPendingRequestStream(t *testing.T) {
 }
 
 func TestQuicTerminalOKSurfacesLocalUploadError(t *testing.T) {
-	running := startTestQUICServer(t, registerAcceptUploadRoute)
+	uploadFailed := make(chan struct{})
+	running := startTestQUICServer(t, func(server *Server) {
+		registerAcceptAfterUploadErrorRoute(server, uploadFailed)
+	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed")}
+	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed"), onError: func() { close(uploadFailed) }}
 
-	replies, err := BidirectionalStreaming(context.Background(), NewQuicClient(conn), testServiceName, "AcceptUpload", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	replies, err := BidirectionalStreaming(context.Background(), NewQuicClient(conn), testServiceName, "AcceptAfterUploadError", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("start accepting bidi stream: %v", err)
 	}
@@ -1511,12 +1531,15 @@ func TestWebTransportTerminalStatusClosesPendingRequestStream(t *testing.T) {
 }
 
 func TestWebTransportTerminalOKSurfacesLocalUploadError(t *testing.T) {
-	running := startTestWebTransportServer(t, registerAcceptUploadRoute)
+	uploadFailed := make(chan struct{})
+	running := startTestWebTransportServer(t, func(server *Server) {
+		registerAcceptAfterUploadErrorRoute(server, uploadFailed)
+	})
 	transport := connectTestWebTransportClient(t, running)
 	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
-	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed")}
+	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed"), onError: func() { close(uploadFailed) }}
 
-	replies, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "AcceptUpload", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	replies, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "AcceptAfterUploadError", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("start accepting WebTransport bidi stream: %v", err)
 	}
@@ -1660,7 +1683,10 @@ func TestQuicMTLSRejectsClientsWithoutCertificates(t *testing.T) {
 }
 
 func TestQuicMalformedRequestFramesReturnInvalidArgumentStatus(t *testing.T) {
-	running := startTestQUICServer(t, func(*Server) {})
+	metrics := &recordingMetrics{}
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetMetrics(metrics)
+	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -1683,6 +1709,37 @@ func TestQuicMalformedRequestFramesReturnInvalidArgumentStatus(t *testing.T) {
 	if CodeFromUint32(response.Status) != CodeInvalidArgument {
 		t.Fatalf("expected invalid argument status, got %#v", response)
 	}
+	expectPreHandlerMetrics(t, metrics, CodeInvalidArgument)
+}
+
+func TestWebTransportMalformedRequestFramesReturnInvalidArgumentStatus(t *testing.T) {
+	metrics := &recordingMetrics{}
+	running := startTestWebTransportServer(t, func(server *Server) {
+		server.SetMetrics(metrics)
+	})
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	stream, err := transport.Session().OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open WebTransport stream: %v", err)
+	}
+	defer stream.CancelRead(cancelledWebTransportStreamCode)
+	defer stream.CancelWrite(cancelledWebTransportStreamCode)
+	if _, err := stream.Write([]byte{0, 0, 0, 2, 0xff, 0xff}); err != nil {
+		t.Fatalf("write malformed WebTransport frame: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close malformed WebTransport stream: %v", err)
+	}
+
+	response := readRawTestStreamResponse(t, stream)
+
+	if CodeFromUint32(response.Status) != CodeInvalidArgument {
+		t.Fatalf("expected invalid argument status, got %#v", response)
+	}
+	expectPreHandlerMetrics(t, metrics, CodeInvalidArgument)
 }
 
 func TestQuicMalformedRequestStreamMessageReturnsInvalidArgumentStatus(t *testing.T) {
@@ -1717,7 +1774,14 @@ func TestQuicMalformedRequestStreamMessageReturnsInvalidArgumentStatus(t *testin
 }
 
 func TestQuicInitialRequestTimeoutRejectsPartialHeader(t *testing.T) {
-	running := startTestQUICServerWithInitialRequestTimeout(t, 50*time.Millisecond)
+	metrics := &recordingMetrics{}
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.InitialRequestTimeout = 50 * time.Millisecond
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
+		server.SetMetrics(metrics)
+	})
 	stream := openRawTestQUICStream(t, running)
 	defer stream.CancelRead(cancelledStreamCode)
 	defer stream.CancelWrite(cancelledStreamCode)
@@ -1730,10 +1794,18 @@ func TestQuicInitialRequestTimeoutRejectsPartialHeader(t *testing.T) {
 	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded status, got %#v", response)
 	}
+	expectPreHandlerMetrics(t, metrics, CodeDeadlineExceeded)
 }
 
 func TestQuicInitialRequestTimeoutRejectsPartialBody(t *testing.T) {
-	running := startTestQUICServerWithInitialRequestTimeout(t, 50*time.Millisecond)
+	metrics := &recordingMetrics{}
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.InitialRequestTimeout = 50 * time.Millisecond
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
+		server.SetMetrics(metrics)
+	})
 	stream := openRawTestQUICStream(t, running)
 	defer stream.CancelRead(cancelledStreamCode)
 	defer stream.CancelWrite(cancelledStreamCode)
@@ -1748,6 +1820,38 @@ func TestQuicInitialRequestTimeoutRejectsPartialBody(t *testing.T) {
 	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded status, got %#v", response)
 	}
+	expectPreHandlerMetrics(t, metrics, CodeDeadlineExceeded)
+}
+
+func TestWebTransportInitialRequestTimeoutRejectsPartialHeader(t *testing.T) {
+	metrics := &recordingMetrics{}
+	running := startTestWebTransportServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.InitialRequestTimeout = 50 * time.Millisecond
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
+		server.SetMetrics(metrics)
+	})
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	stream, err := transport.Session().OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open partial WebTransport stream: %v", err)
+	}
+	defer stream.CancelRead(cancelledWebTransportStreamCode)
+	defer stream.CancelWrite(cancelledWebTransportStreamCode)
+	if _, err := stream.Write([]byte{0, 0}); err != nil {
+		t.Fatalf("write WebTransport partial header: %v", err)
+	}
+
+	response := readRawTestStreamResponse(t, stream)
+
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded status, got %#v", response)
+	}
+	expectPreHandlerMetrics(t, metrics, CodeDeadlineExceeded)
 }
 
 func TestQuicLargePartialInitialBodyDoesNotHoldRequestPermit(t *testing.T) {
@@ -2004,6 +2108,16 @@ func openRawTestQUICStream(t *testing.T, running *runningTestQUICServer) *quic.S
 
 func readRawTestQUICResponse(t *testing.T, stream *quic.Stream) *RpcResponse {
 	t.Helper()
+	return readRawTestStreamResponse(t, stream)
+}
+
+type rawTestResponseStream interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}
+
+func readRawTestStreamResponse(t *testing.T, stream rawTestResponseStream) *RpcResponse {
+	t.Helper()
 	if err := stream.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
 		t.Fatalf("set raw stream read deadline: %v", err)
 	}
@@ -2078,8 +2192,18 @@ func registerRejectUploadRoute(server *Server) {
 	})
 }
 
-func registerAcceptUploadRoute(server *Server) {
-	server.RouteStreaming(testServiceName, "AcceptUpload", RpcKindBidirectionalStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+func registerAcceptAfterUploadErrorRoute(server *Server, uploadFailed <-chan struct{}) {
+	server.RouteStreaming(testServiceName, "AcceptAfterUploadError", RpcKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		if _, err := requests.Recv(); err != nil {
+			return nil, err
+		}
+
+		select {
+		case <-uploadFailed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
 		return EmptyStream[[]byte](), nil
 	})
 }
@@ -2171,6 +2295,8 @@ type blockingTestMessages struct {
 type firstThenErrorTestMessages struct {
 	message *testMessage
 	err     error
+	onError func()
+	once    sync.Once
 	sent    bool
 }
 
@@ -2201,6 +2327,10 @@ func (s *firstThenErrorTestMessages) Recv() (*testMessage, error) {
 	if !s.sent {
 		s.sent = true
 		return s.message, nil
+	}
+
+	if s.onError != nil {
+		s.once.Do(s.onError)
 	}
 
 	return nil, s.err
