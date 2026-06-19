@@ -6,6 +6,7 @@ const FRAME_HEADER_LEN: usize = 4;
 
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
+/// Encodes a protobuf message with the default `TrevRPC` frame size limit.
 pub fn encode_frame<M>(message: &M) -> Result<Vec<u8>>
 where
     M: Message,
@@ -13,6 +14,7 @@ where
     encode_frame_with_max(message, DEFAULT_MAX_FRAME_SIZE)
 }
 
+/// Encodes a protobuf message into a length-prefixed `TrevRPC` frame.
 pub fn encode_frame_with_max<M>(message: &M, max_frame_size: usize) -> Result<Vec<u8>>
 where
     M: Message,
@@ -38,6 +40,7 @@ where
     Ok(frame)
 }
 
+/// Decodes a protobuf message from a `TrevRPC` frame body.
 pub fn decode_frame<M>(body: &[u8]) -> Result<M>
 where
     M: Message + Default,
@@ -45,6 +48,7 @@ where
     M::decode(body).map_err(Error::from)
 }
 
+/// Decodes and validates the body length stored in a `TrevRPC` frame header.
 pub fn frame_body_len(header: [u8; FRAME_HEADER_LEN], max_frame_size: usize) -> Result<usize> {
     let len = usize::try_from(u32::from_be_bytes(header)).map_err(|_| Error::FrameTooLarge {
         len: usize::MAX,

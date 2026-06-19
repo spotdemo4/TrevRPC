@@ -14,23 +14,31 @@ export interface HelloReply {
   message?: string;
 }
 
+/** Service descriptor for the Greeter service. */
 export declare const GreeterService: RpcServiceDescriptor;
 
+/** Client for the Greeter service. */
 export declare class GreeterClient {
+  /** Creates a client for the Greeter service. */
   constructor(transport: Transport, options?: CallOptions);
 
+  /** Calls the SayHello RPC. */
   sayHello(request: HelloRequest, options?: CallOptions): Promise<HelloReply>;
+  /** Calls the LotsOfReplies RPC. */
   lotsOfReplies(request: HelloRequest, options?: CallOptions): Promise<AsyncIterable<HelloReply>>;
+  /** Calls the LotsOfGreetings RPC. */
   lotsOfGreetings(
     requests: AsyncIterable<HelloRequest>,
     options?: CallOptions,
   ): Promise<HelloReply>;
+  /** Calls the BidiHello RPC. */
   bidiHello(
     requests: AsyncIterable<HelloRequest>,
     options?: CallOptions,
   ): Promise<AsyncIterable<HelloReply>>;
 }
 
+/** Creates a client for the Greeter service. */
 export declare function createGreeterClient(
   transport: Transport,
   options?: CallOptions,

@@ -34,59 +34,70 @@ impl Default for CallOptions {
 }
 
 impl CallOptions {
+    /// Creates call options with the default timeout, size, stream, and metadata settings.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns the per-call timeout, if one is configured.
     #[must_use]
     pub const fn timeout(&self) -> Option<Duration> {
         self.timeout
     }
 
+    /// Returns the maximum unary response body size in bytes.
     #[must_use]
     pub const fn max_response_body_size(&self) -> usize {
         self.max_response_body_size
     }
 
+    /// Returns the maximum number of response messages allowed on a stream.
     #[must_use]
     pub const fn max_response_messages(&self) -> Option<usize> {
         self.max_response_messages
     }
 
+    /// Returns the maximum response message body size allowed on a stream.
     #[must_use]
     pub const fn max_response_stream_body_size(&self) -> Option<usize> {
         self.max_response_stream_body_size
     }
 
+    /// Returns the maximum idle time allowed while waiting for the next stream message.
     #[must_use]
     pub const fn stream_idle_timeout(&self) -> Option<Duration> {
         self.stream_idle_timeout
     }
 
+    /// Returns the metadata sent with the request.
     #[must_use]
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
+    /// Sets the per-call timeout.
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
+    /// Clears the per-call timeout.
     #[must_use]
     pub const fn without_timeout(mut self) -> Self {
         self.timeout = None;
         self
     }
 
+    /// Sets the maximum unary response body size in bytes.
     #[must_use]
     pub const fn with_max_response_body_size(mut self, max_response_body_size: usize) -> Self {
         self.max_response_body_size = max_response_body_size;
         self
     }
 
+    /// Sets the maximum number of response messages allowed on a stream.
     #[must_use]
     pub const fn with_max_response_messages(
         mut self,
@@ -96,6 +107,7 @@ impl CallOptions {
         self
     }
 
+    /// Sets the maximum response message body size allowed on a stream.
     #[must_use]
     pub const fn with_max_response_stream_body_size(
         mut self,
@@ -105,12 +117,14 @@ impl CallOptions {
         self
     }
 
+    /// Sets the maximum idle time allowed while waiting for the next stream message.
     #[must_use]
     pub const fn with_stream_idle_timeout(mut self, stream_idle_timeout: Option<Duration>) -> Self {
         self.stream_idle_timeout = stream_idle_timeout;
         self
     }
 
+    /// Adds request metadata after normalizing the metadata key.
     #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         let key = key.into();
@@ -119,6 +133,7 @@ impl CallOptions {
         self
     }
 
+    /// Replaces the full metadata map sent with the request.
     #[must_use]
     pub fn with_metadata_map(mut self, metadata: Metadata) -> Self {
         self.metadata = metadata;
@@ -128,8 +143,10 @@ impl CallOptions {
 
 #[crate::async_trait]
 pub trait RpcTransport: Clone + Send + Sync + 'static {
+    /// Sends a unary `TrevRPC` request and returns its response.
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse>;
 
+    /// Sends a streaming `TrevRPC` request and returns response stream frames.
     async fn streaming_call(
         &self,
         _request: RpcRequest,
@@ -141,6 +158,7 @@ pub trait RpcTransport: Clone + Send + Sync + 'static {
     }
 }
 
+/// Calls a unary RPC and decodes the protobuf response.
 pub async fn unary<T, Req, Res>(
     transport: &T,
     service: &str,
@@ -192,6 +210,7 @@ where
     Res::decode(response.body.as_slice()).map_err(Error::from)
 }
 
+/// Calls a server-streaming RPC and returns a decoded response stream.
 pub async fn server_streaming<T, Req, Res>(
     transport: &T,
     service: &str,
@@ -231,6 +250,7 @@ where
     )))
 }
 
+/// Calls a client-streaming RPC and decodes the final protobuf response.
 pub async fn client_streaming<T, Req, Res>(
     transport: &T,
     service: &str,
@@ -276,6 +296,7 @@ where
     .await
 }
 
+/// Calls a bidirectional-streaming RPC and returns a decoded response stream.
 pub async fn bidirectional_streaming<T, Req, Res>(
     transport: &T,
     service: &str,

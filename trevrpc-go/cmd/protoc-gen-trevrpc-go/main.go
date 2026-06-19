@@ -235,16 +235,20 @@ func generateService(file *descriptor.FileDescriptorProto, service *descriptor.S
 	}
 
 	var buffer bytes.Buffer
+	fmt.Fprintf(&buffer, "// %sServer handles the %s service.\n", serviceName, serviceName)
 	fmt.Fprintf(&buffer, "type %sServer interface {\n", serviceName)
 	for _, method := range methods {
+		fmt.Fprintf(&buffer, "\t// %s handles the %s RPC.\n", method.name, method.protoName)
 		fmt.Fprintf(&buffer, "\t%s\n", method.serverSignature)
 	}
 	buffer.WriteString("}\n\n")
 
+	fmt.Fprintf(&buffer, "// %sClient calls the %s service.\n", serviceName, serviceName)
 	fmt.Fprintf(&buffer, "type %sClient struct {\n", serviceName)
 	buffer.WriteString("\ttransport trevrpc.Transport\n")
 	buffer.WriteString("\toptions []trevrpc.CallOption\n")
 	buffer.WriteString("}\n\n")
+	fmt.Fprintf(&buffer, "// New%sClient creates a client for the %s service.\n", serviceName, serviceName)
 	fmt.Fprintf(&buffer, "func New%sClient(transport trevrpc.Transport, options ...trevrpc.CallOption) *%sClient {\n", serviceName, serviceName)
 	fmt.Fprintf(&buffer, "\treturn &%sClient{transport: transport, options: options}\n", serviceName)
 	buffer.WriteString("}\n\n")
@@ -253,6 +257,7 @@ func generateService(file *descriptor.FileDescriptorProto, service *descriptor.S
 		generateClientMethod(&buffer, serviceName, fullServiceName, method)
 	}
 
+	fmt.Fprintf(&buffer, "// Register%sServer registers handlers for the %s service.\n", serviceName, serviceName)
 	fmt.Fprintf(&buffer, "func Register%sServer(server *trevrpc.Server, implementation %sServer) {\n", serviceName, serviceName)
 	for _, method := range methods {
 		generateServerRegistration(&buffer, fullServiceName, method)
@@ -306,6 +311,7 @@ func describeMethod(file *descriptor.FileDescriptorProto, method *descriptor.Met
 }
 
 func generateClientMethod(buffer *bytes.Buffer, serviceName, fullServiceName string, method methodInfo) {
+	fmt.Fprintf(buffer, "// %s calls the %s RPC.\n", method.name, method.protoName)
 	switch {
 	case method.clientStreaming && method.serverStreaming:
 		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, requests trevrpc.MessageStream[%s], options ...trevrpc.CallOption) (trevrpc.MessageStream[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)

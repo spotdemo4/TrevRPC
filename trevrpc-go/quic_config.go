@@ -5,12 +5,14 @@ import "github.com/quic-go/quic-go"
 const quicFrameHeaderSize = 4
 const maxInt64 = int64(^uint64(0) >> 1)
 
+// QUICTransportLimits contains transport-level QUIC flow-control and stream limits.
 type QUICTransportLimits struct {
 	StreamReceiveWindow     uint64
 	ConnectionReceiveWindow uint64
 	MaxIncomingStreams      int64
 }
 
+// QUICTransportLimitsFromServerOptions builds QUIC transport limits from server options.
 func QUICTransportLimitsFromServerOptions(options ServerOptions) QUICTransportLimits {
 	streamWindow := quicFrameReceiveWindow(options.MaxFrameSize)
 	return QUICTransportLimits{
@@ -20,6 +22,7 @@ func QUICTransportLimitsFromServerOptions(options ServerOptions) QUICTransportLi
 	}
 }
 
+// QUICServerConfig clones and caps a QUIC server config for TrevRPC traffic.
 func QUICServerConfig(options ServerOptions, base *quic.Config) *quic.Config {
 	config := cloneQUICConfig(base)
 	limits := QUICTransportLimitsFromServerOptions(options)
@@ -35,10 +38,12 @@ func QUICServerConfig(options ServerOptions, base *quic.Config) *quic.Config {
 	return config
 }
 
+// QUICClientConfig clones and caps a QUIC client config for TrevRPC traffic.
 func QUICClientConfig(maxFrameSize int, base *quic.Config) *quic.Config {
 	return quicClientConfig(maxFrameSize, base, false)
 }
 
+// WebTransportQUICClientConfig clones and configures a QUIC client config for WebTransport.
 func WebTransportQUICClientConfig(maxFrameSize int, base *quic.Config) *quic.Config {
 	config := quicClientConfig(maxFrameSize, base, true)
 	config.EnableDatagrams = true

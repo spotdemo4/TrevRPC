@@ -24,31 +24,46 @@ export const Code: Readonly<{
 
 export type StatusCode = (typeof Code)[keyof typeof Code];
 
+/** Error carrying a TrevRPC status code, message, and metadata. */
 export class TrevRpcError extends Error {
   code: StatusCode;
   statusMessage: string;
   metadata: Metadata;
 
+  /** Creates a TrevRPC status error. */
   constructor(code: number, message?: string, metadata?: Metadata);
 }
 
+/** Error reported when a frame exceeds the configured size limit. */
 export class FrameTooLargeError extends Error {
   length: number;
   max: number;
 
+  /** Creates a frame size error. */
   constructor(length: number, max: number);
 }
 
+/** Converts a number into a known status code, defaulting unknown values to Unknown. */
 export function codeFromNumber(code: number): StatusCode;
+/** Returns the canonical status code name. */
 export function codeName(code: number): string;
+/** Creates a TrevRPC status error. */
 export function statusError(code: number, message?: string, metadata?: Metadata): TrevRpcError;
+/** Builds a status error from an RPC response. */
 export function statusFromResponse(response?: RpcResponseMessage | null): TrevRpcError;
+/** Reports whether a status-like value is OK. */
 export function isOkStatus(status?: { code?: number } | null): boolean;
+/** Creates an internal error status. */
 export function internal(message: string): TrevRpcError;
+/** Creates an invalid-argument status. */
 export function invalidArgument(message: string): TrevRpcError;
+/** Creates a deadline-exceeded status. */
 export function deadlineExceeded(message: string): TrevRpcError;
+/** Creates an unavailable status. */
 export function unavailable(message: string): TrevRpcError;
+/** Creates a resource-exhausted status. */
 export function resourceExhausted(message: string): TrevRpcError;
+/** Creates a cancelled status. */
 export function cancelled(message: string): TrevRpcError;
 
 export const MaxMetadataEntries: 64;
@@ -61,9 +76,13 @@ export type MetadataValue = string | Uint8Array | ArrayBuffer | ArrayBufferView 
 export type MetadataInput = Record<string, MetadataValue> | ReadonlyMap<string, MetadataValue>;
 export type Metadata = Record<string, Uint8Array>;
 
+/** Converts a metadata value into bytes. */
 export function metadataValueToBytes(value: MetadataValue): Uint8Array;
+/** Normalizes a metadata key to lowercase ASCII. */
 export function normalizeMetadataKey(key: string): string;
+/** Normalizes metadata keys and converts metadata values to bytes. */
 export function normalizeMetadata(metadata?: MetadataInput): Metadata;
+/** Validates metadata key syntax, value sizes, and total metadata limits. */
 export function validateMetadata(metadata?: MetadataInput): void;
 
 export const WireVersion: 1;
@@ -132,48 +151,62 @@ export const RpcRequest: Type;
 export const RpcResponse: Type;
 export const RpcStreamFrame: Type;
 
+/** Creates a protobuf root from a JSON namespace definition. */
 export function createRoot(json: import("protobufjs").INamespace): Root;
+/** Creates a stream message frame carrying a protobuf body. */
 export function messageFrame(body: Uint8Array): RpcStreamFrameMessage;
 
 export const DefaultMaxFrameSize: number;
 
+/** Encodes a protobuf message body. */
 export function marshalMessage<TRequest extends object>(
   messageType: Type,
   message: TRequest,
 ): Uint8Array;
+/** Decodes a protobuf message body. */
 export function unmarshalMessage<TResponse = Message<Record<string, unknown>>>(
   messageType: Type,
   body: Uint8Array,
 ): TResponse;
+/** Encodes a protobuf message into a length-prefixed TrevRPC frame. */
 export function encodeFrame<TMessage extends object>(
   messageType: Type,
   message: TMessage,
   maxFrameSize?: number,
 ): Uint8Array;
+/** Decodes a protobuf message from a TrevRPC frame body. */
 export function decodeFrame<TMessage = Message<Record<string, unknown>>>(
   messageType: Type,
   body: Uint8Array,
 ): TMessage;
+/** Writes one length-prefixed protobuf frame. */
 export function writeFrame<TMessage extends object>(
   writer: WritableStreamDefaultWriter<Uint8Array>,
   messageType: Type,
   message: TMessage,
   maxFrameSize?: number,
 ): Promise<void>;
+/** Decodes and validates the body length stored in a TrevRPC frame header. */
 export function frameBodyLength(header: Uint8Array, maxFrameSize?: number): number;
 
+/** Reads length-prefixed protobuf frames from a byte stream reader. */
 export class FrameReader {
+  /** Creates a frame reader over a stream reader. */
   constructor(reader: ReadableStreamDefaultReader<Uint8Array>);
 
+  /** Reads and decodes one frame. */
   readFrame<TMessage = Message<Record<string, unknown>>>(
     messageType: Type,
     maxFrameSize?: number,
   ): Promise<TMessage>;
+  /** Reads and decodes one frame, or returns null when already at EOF. */
   readFrameOrEOF<TMessage = Message<Record<string, unknown>>>(
     messageType: Type,
     maxFrameSize?: number,
   ): Promise<TMessage | null>;
+  /** Reads exactly size bytes from the underlying reader. */
   readExact(size: number, allowEofAtStart: boolean): Promise<Uint8Array | null>;
+  /** Removes size bytes from the buffered data. */
   consume(size: number): Uint8Array;
 }
 
@@ -200,7 +233,9 @@ export interface ResolvedCallOptions {
 }
 
 export interface Transport {
+  /** Sends a unary RPC request and returns its response. */
   call(request: RpcRequestMessage, options?: ResolvedCallOptions): Promise<RpcResponseMessage>;
+  /** Sends a streaming RPC request and returns response frames. */
   streamingCall(
     request: RpcRequestMessage,
     requestBody: AsyncIterable<Uint8Array>,
@@ -213,8 +248,11 @@ export type ServiceClient = Record<
   (requestOrRequests: unknown, options?: CallOptions) => Promise<unknown>
 >;
 
+/** Returns the default client call options. */
 export function defaultCallOptions(): ResolvedCallOptions;
+/** Merges call options and normalizes metadata. */
 export function mergeCallOptions(base?: CallOptions, override?: CallOptions): ResolvedCallOptions;
+/** Calls a unary RPC and decodes the protobuf response. */
 export function unary<
   TRequest extends object = Record<string, unknown>,
   TResponse = Message<Record<string, unknown>>,
@@ -227,6 +265,7 @@ export function unary<
   request: TRequest,
   options?: CallOptions,
 ): Promise<TResponse>;
+/** Calls a server-streaming RPC and returns a decoded response stream. */
 export function serverStreaming<
   TRequest extends object = Record<string, unknown>,
   TResponse = Message<Record<string, unknown>>,
@@ -239,6 +278,7 @@ export function serverStreaming<
   request: TRequest,
   options?: CallOptions,
 ): Promise<AsyncIterable<TResponse>>;
+/** Calls a client-streaming RPC and decodes the final protobuf response. */
 export function clientStreaming<
   TRequest extends object = Record<string, unknown>,
   TResponse = Message<Record<string, unknown>>,
@@ -251,6 +291,7 @@ export function clientStreaming<
   requests: AsyncIterable<TRequest>,
   options?: CallOptions,
 ): Promise<TResponse>;
+/** Calls a bidirectional-streaming RPC and returns a decoded response stream. */
 export function bidirectionalStreaming<
   TRequest extends object = Record<string, unknown>,
   TResponse = Message<Record<string, unknown>>,
@@ -263,6 +304,7 @@ export function bidirectionalStreaming<
   requests: AsyncIterable<TRequest>,
   options?: CallOptions,
 ): Promise<AsyncIterable<TResponse>>;
+/** Creates a service client from a generated service descriptor. */
 export function createServiceClient<TClient extends ServiceClient = ServiceClient>(
   transport: Transport,
   service: RpcServiceDescriptor,
@@ -295,23 +337,31 @@ export interface WebTransportClientOptions extends CallOptions {
   webTransportOptions?: unknown;
 }
 
+/** Transport implementation for TrevRPC over WebTransport. */
 export class WebTransportClient implements Transport {
   session: WebTransportSessionLike;
   maxFrameSize: number;
 
+  /** Creates a client over an established WebTransport session. */
   constructor(session: WebTransportSessionLike, options?: WebTransportClientOptions);
 
+  /** Opens a WebTransport session and wraps it in a TrevRPC client. */
   static connect(
     url: string | URL,
     options?: WebTransportClientOptions,
   ): Promise<WebTransportClient>;
+  /** Waits for the underlying WebTransport session to become ready. */
   ready(): Promise<void>;
+  /** Closes the underlying WebTransport session. */
   close(closeInfo?: WebTransportCloseInfoLike): void;
+  /** Sends a unary RPC request over WebTransport and returns its response. */
   call(request: RpcRequestMessage, options?: ResolvedCallOptions): Promise<RpcResponseMessage>;
+  /** Sends a streaming RPC request over WebTransport and returns response frames. */
   streamingCall(
     request: RpcRequestMessage,
     requestBody: AsyncIterable<Uint8Array>,
     options?: ResolvedCallOptions,
   ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
+  /** Opens a bidirectional WebTransport stream. */
   openBidirectionalStream(): Promise<WebTransportBidirectionalStreamLike>;
 }

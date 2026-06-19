@@ -14,6 +14,7 @@ import {
 } from "./status.js";
 import { RpcKind, RpcStreamFrameKind, WireVersion } from "./wire.js";
 
+/** Returns the default client call options. */
 export function defaultCallOptions() {
   return {
     timeoutMs: undefined,
@@ -26,6 +27,7 @@ export function defaultCallOptions() {
   };
 }
 
+/** Merges call options and normalizes metadata. */
 export function mergeCallOptions(base = {}, override = {}) {
   const merged = { ...defaultCallOptions() };
   copyDefined(merged, base);
@@ -37,6 +39,7 @@ export function mergeCallOptions(base = {}, override = {}) {
   return merged;
 }
 
+/** Calls a unary RPC and decodes the protobuf response. */
 export async function unary(
   transport,
   service,
@@ -73,6 +76,7 @@ export async function unary(
   }
 }
 
+/** Calls a server-streaming RPC and returns a decoded response stream. */
 export async function serverStreaming(
   transport,
   service,
@@ -110,6 +114,7 @@ export async function serverStreaming(
   return responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope);
 }
 
+/** Calls a client-streaming RPC and decodes the final protobuf response. */
 export async function clientStreaming(
   transport,
   service,
@@ -152,6 +157,7 @@ export async function clientStreaming(
   );
 }
 
+/** Calls a bidirectional-streaming RPC and returns a decoded response stream. */
 export async function bidirectionalStreaming(
   transport,
   service,
@@ -192,6 +198,7 @@ export async function bidirectionalStreaming(
   return responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope);
 }
 
+/** Creates a service client from a generated service descriptor. */
 export function createServiceClient(transport, service, root, options = {}) {
   const client = {};
 

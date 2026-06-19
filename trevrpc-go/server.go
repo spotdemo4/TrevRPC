@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
+// UnaryHandler handles an encoded unary request body and returns an encoded response body.
 type UnaryHandler func(context.Context, []byte) ([]byte, error)
+
+// StreamingHandler handles encoded streaming request bodies and returns encoded response bodies.
 type StreamingHandler func(context.Context, []byte, ByteStream) (ByteStream, error)
 
 type route struct {
@@ -25,6 +28,7 @@ type methodKey struct {
 	method  string
 }
 
+// Server routes and handles TrevRPC requests.
 type Server struct {
 	routes     map[methodKey]route
 	options    ServerOptions
@@ -32,6 +36,7 @@ type Server struct {
 	metrics    Metrics
 }
 
+// ServerOptions configures server limits, timeouts, and WebTransport behavior.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -47,6 +52,7 @@ type ServerOptions struct {
 	WebTransportCheckOrigin           func(*http.Request) bool
 }
 
+// DefaultServerOptions returns the default server limits and timeouts.
 func DefaultServerOptions() ServerOptions {
 	return ServerOptions{
 		MaxFrameSize:                      DefaultMaxFrameSize,
@@ -62,23 +68,29 @@ func DefaultServerOptions() ServerOptions {
 	}
 }
 
+// Authorizer authorizes a request after metadata and protocol validation.
 type Authorizer interface {
+	// Authorize returns nil when the request is authorized.
 	Authorize(context.Context, *RpcRequest) error
 }
 
+// MetadataValueAuthorizer authorizes requests with an exact metadata value.
 type MetadataValueAuthorizer struct {
 	key   string
 	value []byte
 }
 
+// NewMetadataValueAuthorizer creates an authorizer for an exact metadata key/value pair.
 func NewMetadataValueAuthorizer(key string, value []byte) MetadataValueAuthorizer {
 	return MetadataValueAuthorizer{key: NormalizeMetadataKey(key), value: value}
 }
 
+// BearerAuthorizer creates an authorizer for the authorization bearer token metadata.
 func BearerAuthorizer(token string) MetadataValueAuthorizer {
 	return NewMetadataValueAuthorizer("authorization", []byte("Bearer "+token))
 }
 
+// Authorize checks whether request metadata contains the expected value.
 func (a MetadataValueAuthorizer) Authorize(_ context.Context, request *RpcRequest) error {
 	if subtle.ConstantTimeCompare(request.Metadata[a.key], a.value) == 1 {
 		return nil
@@ -87,22 +99,31 @@ func (a MetadataValueAuthorizer) Authorize(_ context.Context, request *RpcReques
 	return Unauthenticated("request is not authenticated")
 }
 
+// Metrics receives RPC lifecycle events.
 type Metrics interface {
+	// RPCStarted is called when an RPC starts.
 	RPCStarted(RPCStarted)
+	// RPCFinished is called when an RPC finishes.
 	RPCFinished(RPCFinished)
 }
 
+// NoopMetrics ignores all RPC lifecycle events.
 type NoopMetrics struct{}
 
-func (NoopMetrics) RPCStarted(RPCStarted)   {}
+// RPCStarted ignores an RPC start event.
+func (NoopMetrics) RPCStarted(RPCStarted) {}
+
+// RPCFinished ignores an RPC finish event.
 func (NoopMetrics) RPCFinished(RPCFinished) {}
 
+// RPCStarted describes an RPC start event.
 type RPCStarted struct {
 	Service        string
 	Method         string
 	RequestBodyLen int
 }
 
+// RPCFinished describes an RPC completion event.
 type RPCFinished struct {
 	Service         string
 	Method          string
@@ -112,6 +133,7 @@ type RPCFinished struct {
 	Elapsed         time.Duration
 }
 
+// NewServer creates an empty server with default options.
 func NewServer() *Server {
 	return &Server{
 		routes:  map[methodKey]route{},
@@ -120,22 +142,27 @@ func NewServer() *Server {
 	}
 }
 
+// SetOptions replaces all server options.
 func (s *Server) SetOptions(options ServerOptions) {
 	s.options = options
 }
 
+// Options returns a copy of the server options.
 func (s *Server) Options() ServerOptions {
 	return s.options
 }
 
+// SetAuthorizer installs an authorizer that runs before route lookup.
 func (s *Server) SetAuthorizer(authorizer Authorizer) {
 	s.authorizer = authorizer
 }
 
+// ClearAuthorizer removes the configured authorizer.
 func (s *Server) ClearAuthorizer() {
 	s.authorizer = nil
 }
 
+// SetMetrics installs metrics callbacks for RPC lifecycle events.
 func (s *Server) SetMetrics(metrics Metrics) {
 	if metrics == nil {
 		metrics = NoopMetrics{}
@@ -144,14 +171,17 @@ func (s *Server) SetMetrics(metrics Metrics) {
 	s.metrics = metrics
 }
 
+// Route registers a unary route handler for a service and method.
 func (s *Server) Route(service, method string, handler UnaryHandler) {
 	s.routes[methodKey{service: service, method: method}] = route{kind: RpcKindUnary, unaryHandler: handler}
 }
 
+// RouteStreaming registers a streaming route handler for a service, method, and RPC kind.
 func (s *Server) RouteStreaming(service, method string, kind RpcKind, handler StreamingHandler) {
 	s.routes[methodKey{service: service, method: method}] = route{kind: kind, streamingHandler: handler}
 }
 
+// RegisterUnary registers a typed unary protobuf handler on the server.
 func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (Res, error)) {
 	s.Route(service, method, func(ctx context.Context, body []byte) ([]byte, error) {
 		request := newRequest()
@@ -168,6 +198,7 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, service, metho
 	})
 }
 
+// HandleRequest handles a unary RPC request and returns a response.
 func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcResponse {
 	startedAt := time.Now()
 	service := request.Service
@@ -194,6 +225,7 @@ func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcRes
 	return s.finishResponse(service, method, requestBodyLen, startedAt, OKResponse(responseBody))
 }
 
+// HandleStreamingRequest handles a streaming RPC request and returns response frames.
 func (s *Server) HandleStreamingRequest(ctx context.Context, request *RpcRequest, requestBody ByteStream) FrameStream {
 	startedAt := time.Now()
 	service := request.Service

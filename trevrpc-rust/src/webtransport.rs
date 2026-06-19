@@ -25,6 +25,7 @@ pub struct Client {
 }
 
 impl Client {
+    /// Creates a `TrevRPC` client over an established `WebTransport` session.
     #[must_use]
     pub const fn new(session: web_transport_quinn::Session) -> Self {
         Self {
@@ -33,17 +34,20 @@ impl Client {
         }
     }
 
+    /// Sets the maximum `TrevRPC` frame size in bytes for this client.
     #[must_use]
     pub const fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
         self.max_frame_size = max_frame_size;
         self
     }
 
+    /// Returns the underlying `WebTransport` session.
     #[must_use]
     pub const fn session(&self) -> &web_transport_quinn::Session {
         &self.session
     }
 
+    /// Returns the maximum `TrevRPC` frame size in bytes for this client.
     #[must_use]
     pub const fn max_frame_size(&self) -> usize {
         self.max_frame_size
@@ -285,6 +289,7 @@ impl Drop for WebTransportResponseStream {
     }
 }
 
+/// Writes a length-prefixed protobuf frame to a `WebTransport` send stream.
 pub async fn write_frame<M>(
     send: &mut web_transport_quinn::SendStream,
     message: &M,
@@ -297,6 +302,7 @@ where
     send.write_all(&frame).await.map_err(Error::transport)
 }
 
+/// Reads and decodes one length-prefixed protobuf frame from a `WebTransport` receive stream.
 pub async fn read_frame<M>(
     recv: &mut web_transport_quinn::RecvStream,
     max_frame_size: usize,
@@ -411,11 +417,13 @@ async fn write_streaming_request(
 }
 
 impl crate::server::Server {
+    /// Serves `TrevRPC` over a `WebTransport` endpoint until the endpoint stops accepting requests.
     pub async fn serve_webtransport(self, endpoint: ServerEndpoint) -> Result<()> {
         self.serve_webtransport_with_shutdown(endpoint, pending::<()>())
             .await
     }
 
+    /// Serves `TrevRPC` over a `WebTransport` endpoint until the shutdown future completes.
     pub async fn serve_webtransport_with_shutdown<S>(
         self,
         mut endpoint: ServerEndpoint,

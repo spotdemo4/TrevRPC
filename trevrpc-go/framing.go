@@ -9,40 +9,50 @@ import (
 	"google.golang.org/protobuf/protoadapt"
 )
 
+// DefaultMaxFrameSize is the default maximum TrevRPC frame body size in bytes.
 const DefaultMaxFrameSize = 4 * 1024 * 1024
 const maxFrameReadChunkSize = 32 * 1024
 
+// ProtoMessage is the protobuf message interface accepted by the runtime.
 type ProtoMessage = protoadapt.MessageV1
 
+// FrameTooLargeError reports a frame whose body exceeds the configured limit.
 type FrameTooLargeError struct {
 	Len int
 	Max int
 }
 
+// FrameDecodeError wraps protobuf decode failures for RPC frames.
 type FrameDecodeError struct {
 	Err error
 }
 
+// Error returns a human-readable frame size error.
 func (e *FrameTooLargeError) Error() string {
 	return fmt.Sprintf("frame length %d exceeds maximum %d", e.Len, e.Max)
 }
 
+// Error returns a human-readable frame decode error.
 func (e *FrameDecodeError) Error() string {
 	return "failed to decode RPC frame: " + e.Err.Error()
 }
 
+// Unwrap returns the underlying protobuf decode error.
 func (e *FrameDecodeError) Unwrap() error {
 	return e.Err
 }
 
+// MarshalMessage encodes a protobuf message body.
 func MarshalMessage(message ProtoMessage) ([]byte, error) {
 	return proto.Marshal(protoadapt.MessageV2Of(message))
 }
 
+// UnmarshalMessage decodes a protobuf message body into message.
 func UnmarshalMessage(body []byte, message ProtoMessage) error {
 	return proto.Unmarshal(body, protoadapt.MessageV2Of(message))
 }
 
+// EncodeFrame encodes a protobuf message into a length-prefixed TrevRPC frame.
 func EncodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
 	body, err := MarshalMessage(message)
 	if err != nil {
@@ -60,6 +70,7 @@ func EncodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
 	return frame, nil
 }
 
+// DecodeFrame decodes a protobuf message from a TrevRPC frame body.
 func DecodeFrame(body []byte, message ProtoMessage) error {
 	if err := UnmarshalMessage(body, message); err != nil {
 		return &FrameDecodeError{Err: err}
@@ -68,6 +79,7 @@ func DecodeFrame(body []byte, message ProtoMessage) error {
 	return nil
 }
 
+// WriteFrame writes one length-prefixed protobuf frame.
 func WriteFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error {
 	frame, err := EncodeFrame(message, maxFrameSize)
 	if err != nil {
@@ -78,6 +90,7 @@ func WriteFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error 
 	return err
 }
 
+// ReadFrame reads and decodes one length-prefixed protobuf frame.
 func ReadFrame(reader io.Reader, message ProtoMessage, maxFrameSize int) error {
 	read, err := ReadFrameOrEOF(reader, message, maxFrameSize)
 	if err != nil {
@@ -91,6 +104,7 @@ func ReadFrame(reader io.Reader, message ProtoMessage, maxFrameSize int) error {
 	return nil
 }
 
+// ReadFrameOrEOF reads one frame and reports false when the stream is already at EOF.
 func ReadFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (bool, error) {
 	header := [4]byte{}
 	if _, err := io.ReadFull(reader, header[:]); err != nil {

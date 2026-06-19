@@ -8,11 +8,15 @@ import (
 	"time"
 )
 
+// Transport sends unary and streaming TrevRPC requests.
 type Transport interface {
+	// Call sends a unary RPC request and returns its response.
 	Call(context.Context, *RpcRequest) (*RpcResponse, error)
+	// StreamingCall sends a streaming RPC request and returns response frames.
 	StreamingCall(context.Context, *RpcRequest, ByteStream) (FrameStream, error)
 }
 
+// CallOptions controls client-side timeouts, response limits, and request metadata.
 type CallOptions struct {
 	Timeout                   time.Duration
 	HasTimeout                bool
@@ -23,8 +27,10 @@ type CallOptions struct {
 	Metadata                  Metadata
 }
 
+// CallOption mutates CallOptions for a single RPC call.
 type CallOption func(*CallOptions)
 
+// DefaultCallOptions returns the default client call options.
 func DefaultCallOptions() CallOptions {
 	return CallOptions{
 		MaxResponseBodySize:       DefaultMaxFrameSize,
@@ -35,6 +41,7 @@ func DefaultCallOptions() CallOptions {
 	}
 }
 
+// WithTimeout sets a deadline for the RPC call.
 func WithTimeout(timeout time.Duration) CallOption {
 	return func(options *CallOptions) {
 		options.Timeout = timeout
@@ -42,6 +49,7 @@ func WithTimeout(timeout time.Duration) CallOption {
 	}
 }
 
+// WithoutTimeout clears the RPC call deadline.
 func WithoutTimeout() CallOption {
 	return func(options *CallOptions) {
 		options.Timeout = 0
@@ -49,48 +57,56 @@ func WithoutTimeout() CallOption {
 	}
 }
 
+// WithMaxResponseBodySize sets the maximum unary response body size in bytes.
 func WithMaxResponseBodySize(max int) CallOption {
 	return func(options *CallOptions) {
 		options.MaxResponseBodySize = max
 	}
 }
 
+// WithMaxResponseMessages sets the maximum number of response messages allowed on a stream.
 func WithMaxResponseMessages(max int) CallOption {
 	return func(options *CallOptions) {
 		options.MaxResponseMessages = max
 	}
 }
 
+// WithoutMaxResponseMessages disables the response message count limit.
 func WithoutMaxResponseMessages() CallOption {
 	return func(options *CallOptions) {
 		options.MaxResponseMessages = -1
 	}
 }
 
+// WithMaxResponseStreamBodySize sets the maximum total response stream body size in bytes.
 func WithMaxResponseStreamBodySize(max int) CallOption {
 	return func(options *CallOptions) {
 		options.MaxResponseStreamBodySize = max
 	}
 }
 
+// WithoutMaxResponseStreamBodySize disables the response stream body size limit.
 func WithoutMaxResponseStreamBodySize() CallOption {
 	return func(options *CallOptions) {
 		options.MaxResponseStreamBodySize = -1
 	}
 }
 
+// WithStreamIdleTimeout sets the maximum idle time between response stream messages.
 func WithStreamIdleTimeout(timeout time.Duration) CallOption {
 	return func(options *CallOptions) {
 		options.StreamIdleTimeout = timeout
 	}
 }
 
+// WithoutStreamIdleTimeout disables the response stream idle timeout.
 func WithoutStreamIdleTimeout() CallOption {
 	return func(options *CallOptions) {
 		options.StreamIdleTimeout = 0
 	}
 }
 
+// WithMetadata adds request metadata after normalizing the metadata key.
 func WithMetadata(key string, value []byte) CallOption {
 	return func(options *CallOptions) {
 		if options.Metadata == nil {
@@ -101,12 +117,14 @@ func WithMetadata(key string, value []byte) CallOption {
 	}
 }
 
+// WithMetadataMap replaces the metadata map sent with the request.
 func WithMetadataMap(metadata Metadata) CallOption {
 	return func(options *CallOptions) {
 		options.Metadata = metadata
 	}
 }
 
+// Unary calls a unary RPC and decodes the protobuf response.
 func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (Res, error) {
 	callOptions := applyCallOptions(options)
 	if err := ValidateMetadata(callOptions.Metadata); err != nil {
@@ -149,6 +167,7 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 	return message, nil
 }
 
+// ServerStreaming calls a server-streaming RPC and returns a decoded response stream.
 func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
 	callOptions := applyCallOptions(options)
 	requestBody, err := MarshalMessage(request)
@@ -171,6 +190,7 @@ func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 	return newResponseMessageStream(response, newResponse, callOptions, ctx, cancel), nil
 }
 
+// ClientStreaming calls a client-streaming RPC and decodes the final protobuf response.
 func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (Res, error) {
 	callOptions := applyCallOptions(options)
 	rpcRequest, err := prepareClientRequest(service, method, RpcKindClientStreaming, nil, callOptions)
@@ -191,6 +211,7 @@ func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 	return readUnaryResponseFromStream(response, newResponse, callOptions, ctx)
 }
 
+// BidirectionalStreaming calls a bidirectional-streaming RPC and returns a decoded response stream.
 func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
 	callOptions := applyCallOptions(options)
 	rpcRequest, err := prepareClientRequest(service, method, RpcKindBidirectionalStreaming, nil, callOptions)

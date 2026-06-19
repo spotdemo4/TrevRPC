@@ -10,12 +10,15 @@ import {
 
 const CancelledStreamReason = new DOMException("TrevRPC stream cancelled", "AbortError");
 
+/** Transport implementation for TrevRPC over WebTransport. */
 export class WebTransportClient {
+  /** Creates a client over an established WebTransport session. */
   constructor(session, options = {}) {
     this.session = session;
     this.maxFrameSize = options.maxFrameSize ?? DefaultMaxFrameSize;
   }
 
+  /** Opens a WebTransport session and wraps it in a TrevRPC client. */
   static async connect(url, options = {}) {
     const WebTransportCtor = options.WebTransport ?? globalThis.WebTransport;
     if (typeof WebTransportCtor !== "function") {
@@ -27,16 +30,19 @@ export class WebTransportClient {
     return new WebTransportClient(session, options);
   }
 
+  /** Waits for the underlying WebTransport session to become ready. */
   async ready() {
     await this.session.ready;
   }
 
+  /** Closes the underlying WebTransport session. */
   close(closeInfo = {}) {
     if (typeof this.session.close === "function") {
       this.session.close(closeInfo);
     }
   }
 
+  /** Sends a unary RPC request over WebTransport and returns its response. */
   async call(request, options = {}) {
     let writer;
     let reader;
@@ -82,6 +88,7 @@ export class WebTransportClient {
     }
   }
 
+  /** Sends a streaming RPC request over WebTransport and returns response frames. */
   async streamingCall(request, requestBody, options = {}) {
     try {
       throwIfAborted(options.signal);
@@ -110,6 +117,7 @@ export class WebTransportClient {
     }
   }
 
+  /** Opens a bidirectional WebTransport stream. */
   async openBidirectionalStream() {
     if (typeof this.session.createBidirectionalStream !== "function") {
       throw unavailable("WebTransport session does not support bidirectional streams");

@@ -26,6 +26,7 @@ pub struct TransportLimits {
     pub max_concurrent_uni_streams: Option<u64>,
 }
 
+/// Builds QUIC transport limits from server options.
 #[must_use]
 pub fn transport_limits_from_server_options(
     options: &ServerOptions,
@@ -48,6 +49,7 @@ pub fn transport_limits_from_server_options(
     }
 }
 
+/// Builds QUIC transport limits for a client connection.
 #[must_use]
 pub fn client_transport_limits(
     max_frame_size: usize,
@@ -67,6 +69,7 @@ pub fn client_transport_limits(
     }
 }
 
+/// Applies `TrevRPC` transport limits to a `Quinn` server config.
 pub fn configure_server_config(
     config: &mut quinn::ServerConfig,
     options: &ServerOptions,
@@ -82,6 +85,7 @@ pub fn configure_server_config(
     }
 }
 
+/// Applies `TrevRPC` transport limits to a `Quinn` client config.
 pub fn configure_client_config(
     config: &mut quinn::ClientConfig,
     max_frame_size: usize,
@@ -93,6 +97,7 @@ pub fn configure_client_config(
     config.transport_config(Arc::new(transport));
 }
 
+/// Applies concrete transport limits to a `Quinn` transport config.
 pub fn apply_transport_limits(config: &mut quinn::TransportConfig, limits: TransportLimits) {
     config.stream_receive_window(varint(limits.stream_receive_window));
     config.receive_window(varint(limits.connection_receive_window));
@@ -141,6 +146,7 @@ pub struct Client {
 }
 
 impl Client {
+    /// Creates a `TrevRPC` client over an established `Quinn` connection.
     #[must_use]
     pub const fn new(connection: quinn::Connection) -> Self {
         Self {
@@ -149,17 +155,20 @@ impl Client {
         }
     }
 
+    /// Sets the maximum `TrevRPC` frame size in bytes for this client.
     #[must_use]
     pub const fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
         self.max_frame_size = max_frame_size;
         self
     }
 
+    /// Returns the underlying `Quinn` connection.
     #[must_use]
     pub const fn connection(&self) -> &quinn::Connection {
         &self.connection
     }
 
+    /// Returns the maximum `TrevRPC` frame size in bytes for this client.
     #[must_use]
     pub const fn max_frame_size(&self) -> usize {
         self.max_frame_size
@@ -401,6 +410,7 @@ impl Drop for QuinnResponseStream {
     }
 }
 
+/// Writes a length-prefixed protobuf frame to a `Quinn` send stream.
 pub async fn write_frame<M>(
     send: &mut quinn::SendStream,
     message: &M,
@@ -413,6 +423,7 @@ where
     send.write_all(&frame).await.map_err(Error::transport)
 }
 
+/// Reads and decodes one length-prefixed protobuf frame from a `Quinn` receive stream.
 pub async fn read_frame<M>(recv: &mut quinn::RecvStream, max_frame_size: usize) -> Result<M>
 where
     M: Message + Default,
@@ -521,11 +532,13 @@ async fn write_streaming_request(
 }
 
 impl crate::server::Server {
+    /// Serves `TrevRPC` over a `Quinn` endpoint until the endpoint stops accepting connections.
     pub async fn serve_quinn(self, endpoint: quinn::Endpoint) -> Result<()> {
         self.serve_quinn_with_shutdown(endpoint, pending::<()>())
             .await
     }
 
+    /// Serves `TrevRPC` over a `Quinn` endpoint until the shutdown future completes.
     pub async fn serve_quinn_with_shutdown<S>(
         self,
         endpoint: quinn::Endpoint,
@@ -597,12 +610,14 @@ impl crate::server::Server {
         Ok(())
     }
 
+    /// Serves `TrevRPC` over `Quinn` and `WebTransport` on the same endpoint.
     #[cfg(feature = "webtransport")]
     pub async fn serve_quinn_and_webtransport(self, endpoint: quinn::Endpoint) -> Result<()> {
         self.serve_quinn_and_webtransport_with_shutdown(endpoint, pending::<()>())
             .await
     }
 
+    /// Serves `TrevRPC` over `Quinn` and `WebTransport` until the shutdown future completes.
     #[cfg(feature = "webtransport")]
     pub async fn serve_quinn_and_webtransport_with_shutdown<S>(
         self,

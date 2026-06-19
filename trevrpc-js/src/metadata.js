@@ -8,10 +8,12 @@ export const ReservedMetadataPrefix = "trevrpc-";
 
 const textEncoder = new TextEncoder();
 
+/** Normalizes a metadata key to lowercase ASCII. */
 export function normalizeMetadataKey(key) {
   return String(key).toLowerCase();
 }
 
+/** Normalizes metadata keys and converts metadata values to bytes. */
 export function normalizeMetadata(metadata = {}) {
   const normalized = Object.create(null);
   const entries = metadata instanceof Map ? metadata.entries() : Object.entries(metadata);
@@ -24,6 +26,7 @@ export function normalizeMetadata(metadata = {}) {
   return normalized;
 }
 
+/** Converts a metadata value into bytes. */
 export function metadataValueToBytes(value) {
   if (value instanceof Uint8Array) {
     return value;
@@ -48,6 +51,7 @@ export function metadataValueToBytes(value) {
   throw invalidArgument("metadata values must be bytes or strings");
 }
 
+/** Validates metadata key syntax, value sizes, and total metadata limits. */
 export function validateMetadata(metadata = {}) {
   const entries = Object.entries(metadata);
   if (entries.length > MaxMetadataEntries) {

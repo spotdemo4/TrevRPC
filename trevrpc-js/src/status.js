@@ -38,7 +38,9 @@ const CODE_NAMES = Object.freeze([
   "Unauthenticated",
 ]);
 
+/** Error carrying a TrevRPC status code, message, and metadata. */
 export class TrevRpcError extends Error {
+  /** Creates a TrevRPC status error. */
   constructor(code, message = "", metadata = {}) {
     const normalizedCode = codeFromNumber(code);
     super(message === "" ? codeName(normalizedCode) : `${codeName(normalizedCode)}: ${message}`);
@@ -49,7 +51,9 @@ export class TrevRpcError extends Error {
   }
 }
 
+/** Error reported when a frame exceeds the configured size limit. */
 export class FrameTooLargeError extends Error {
+  /** Creates a frame size error. */
   constructor(length, max) {
     super(`frame length ${length} exceeds maximum ${max}`);
     this.name = "FrameTooLargeError";
@@ -58,18 +62,22 @@ export class FrameTooLargeError extends Error {
   }
 }
 
+/** Converts a number into a known status code, defaulting unknown values to Unknown. */
 export function codeFromNumber(code) {
   return Number.isInteger(code) && code >= 0 && code < CODE_NAMES.length ? code : Code.Unknown;
 }
 
+/** Returns the canonical status code name. */
 export function codeName(code) {
   return CODE_NAMES[codeFromNumber(code)];
 }
 
+/** Creates a TrevRPC status error. */
 export function statusError(code, message = "", metadata = {}) {
   return new TrevRpcError(code, message, metadata);
 }
 
+/** Builds a status error from an RPC response. */
 export function statusFromResponse(response) {
   if (response == null) {
     return statusError(Code.Internal, "missing RPC response");
@@ -78,34 +86,42 @@ export function statusFromResponse(response) {
   return statusError(response.status ?? Code.Ok, response.message ?? "", response.metadata ?? {});
 }
 
+/** Reports whether a status-like value is OK. */
 export function isOkStatus(status) {
   return status != null && codeFromNumber(status.code) === Code.Ok;
 }
 
+/** Creates an internal error status. */
 export function internal(message) {
   return statusError(Code.Internal, message);
 }
 
+/** Creates an invalid-argument status. */
 export function invalidArgument(message) {
   return statusError(Code.InvalidArgument, message);
 }
 
+/** Creates a deadline-exceeded status. */
 export function deadlineExceeded(message) {
   return statusError(Code.DeadlineExceeded, message);
 }
 
+/** Creates an unavailable status. */
 export function unavailable(message) {
   return statusError(Code.Unavailable, message);
 }
 
+/** Creates a resource-exhausted status. */
 export function resourceExhausted(message) {
   return statusError(Code.ResourceExhausted, message);
 }
 
+/** Creates a cancelled status. */
 export function cancelled(message) {
   return statusError(Code.Cancelled, message);
 }
 
+/** Converts a transport error into a TrevRPC status error. */
 export function statusFromTransportError(error) {
   if (error instanceof TrevRpcError) {
     return error;

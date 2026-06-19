@@ -19,6 +19,7 @@ const (
 	cancelledWebTransportSessionCode webtransport.SessionErrorCode = 1
 )
 
+// WebTransportDialOptions configures WebTransport client dialing.
 type WebTransportDialOptions struct {
 	TLSClientConfig         *tls.Config
 	QUICConfig              *quic.Config
@@ -27,11 +28,13 @@ type WebTransportDialOptions struct {
 	StreamReorderingTimeout time.Duration
 }
 
+// WebTransportClient sends TrevRPC calls over an established WebTransport session.
 type WebTransportClient struct {
 	session      *webtransport.Session
 	maxFrameSize int
 }
 
+// DialWebTransport dials a WebTransport session and wraps it in a TrevRPC client.
 func DialWebTransport(ctx context.Context, url string, options WebTransportDialOptions) (*WebTransportClient, error) {
 	dialer := &webtransport.Dialer{
 		TLSClientConfig:         options.TLSClientConfig,
@@ -48,19 +51,23 @@ func DialWebTransport(ctx context.Context, url string, options WebTransportDialO
 	return NewWebTransportClient(session), nil
 }
 
+// NewWebTransportClient creates a TrevRPC client over an established WebTransport session.
 func NewWebTransportClient(session *webtransport.Session) *WebTransportClient {
 	return &WebTransportClient{session: session, maxFrameSize: DefaultMaxFrameSize}
 }
 
+// WithMaxFrameSize sets the maximum TrevRPC frame size for the client.
 func (t *WebTransportClient) WithMaxFrameSize(maxFrameSize int) *WebTransportClient {
 	t.maxFrameSize = maxFrameSize
 	return t
 }
 
+// Session returns the underlying WebTransport session.
 func (t *WebTransportClient) Session() *webtransport.Session {
 	return t.session
 }
 
+// Call sends a unary RPC request over WebTransport and returns its response.
 func (t *WebTransportClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.session.OpenStreamSync(ctx)
 	if err != nil {
@@ -87,6 +94,7 @@ func (t *WebTransportClient) Call(ctx context.Context, request *RpcRequest) (*Rp
 	return response, nil
 }
 
+// StreamingCall sends a streaming RPC request over WebTransport and returns response frames.
 func (t *WebTransportClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := t.session.OpenStreamSync(streamCtx)

@@ -202,12 +202,14 @@ const RESERVED_WORDS = new Set([
   "yield",
 ]);
 
+/** Runs the TrevRPC JavaScript code generator for protoc plugin input. */
 export function runGenerator(input) {
   const request = CodeGeneratorRequest.decode(input);
   const response = generate(request);
   return CodeGeneratorResponse.encode(response).finish();
 }
 
+/** Generates a protoc code generator response. */
 export function generate(request) {
   try {
     const options = parseOptions(request.parameter ?? "");
@@ -239,6 +241,7 @@ export function generate(request) {
   }
 }
 
+/** Parses protoc plugin options for the JavaScript generator. */
 export function parseOptions(parameter) {
   const options = {
     runtimeImport: "trevrpc-js",
@@ -276,6 +279,7 @@ export function parseOptions(parameter) {
   return options;
 }
 
+/** Builds a protobuf.js JSON root from protobuf file descriptors. */
 export function buildProtobufJson(files) {
   const root = { nested: {} };
 
@@ -322,12 +326,12 @@ function generateService(_file, service) {
   const factoryName = `create${className}`;
   const methods = Object.entries(service.methods)
     .map(
-      ([jsName]) =>
-        `  ${jsName}(request, options = {}) {\n    return this._client.${jsName}(request, options);\n  }`,
+      ([jsName, method]) =>
+        `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request, options = {}) {\n    return this._client.${jsName}(request, options);\n  }`,
     )
     .join("\n\n");
 
-  return `export const ${service.exportName} = Object.freeze(${JSON.stringify(service, null, 2)});\n\nexport class ${className} {\n  constructor(transport, options = {}) {\n    this._client = createServiceClient(transport, ${service.exportName}, root, options);\n  }\n\n${methods}\n}\n\nexport function ${factoryName}(transport, options = {}) {\n  return new ${className}(transport, options);\n}\n`;
+  return `/** Service descriptor for the ${service.name} service. */\nexport const ${service.exportName} = Object.freeze(${JSON.stringify(service, null, 2)});\n\n/** Client for the ${service.name} service. */\nexport class ${className} {\n  /** Creates a client for the ${service.name} service. */\n  constructor(transport, options = {}) {\n    this._client = createServiceClient(transport, ${service.exportName}, root, options);\n  }\n\n${methods}\n}\n\n/** Creates a client for the ${service.name} service. */\nexport function ${factoryName}(transport, options = {}) {\n  return new ${className}(transport, options);\n}\n`;
 }
 
 function generateServiceDeclaration(service, typeNames) {
@@ -337,7 +341,7 @@ function generateServiceDeclaration(service, typeNames) {
     .map(([jsName, method]) => generateMethodDeclaration(jsName, method, typeNames))
     .join("\n");
 
-  return `export declare const ${service.exportName}: RpcServiceDescriptor;\n\nexport declare class ${className} {\n  constructor(transport: Transport, options?: CallOptions);\n\n${methods}\n}\n\nexport declare function ${factoryName}(transport: Transport, options?: CallOptions): ${className};`;
+  return `/** Service descriptor for the ${service.name} service. */\nexport declare const ${service.exportName}: RpcServiceDescriptor;\n\n/** Client for the ${service.name} service. */\nexport declare class ${className} {\n  /** Creates a client for the ${service.name} service. */\n  constructor(transport: Transport, options?: CallOptions);\n\n${methods}\n}\n\n/** Creates a client for the ${service.name} service. */\nexport declare function ${factoryName}(transport: Transport, options?: CallOptions): ${className};`;
 }
 
 function generateMethodDeclaration(jsName, method, typeNames) {
@@ -346,13 +350,13 @@ function generateMethodDeclaration(jsName, method, typeNames) {
 
   switch (method.kind) {
     case "unary":
-      return `  ${jsName}(request: ${inputType}, options?: CallOptions): Promise<${outputType}>;`;
+      return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request: ${inputType}, options?: CallOptions): Promise<${outputType}>;`;
     case "serverStreaming":
-      return `  ${jsName}(request: ${inputType}, options?: CallOptions): Promise<AsyncIterable<${outputType}>>;`;
+      return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request: ${inputType}, options?: CallOptions): Promise<AsyncIterable<${outputType}>>;`;
     case "clientStreaming":
-      return `  ${jsName}(requests: AsyncIterable<${inputType}>, options?: CallOptions): Promise<${outputType}>;`;
+      return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(requests: AsyncIterable<${inputType}>, options?: CallOptions): Promise<${outputType}>;`;
     case "bidirectionalStreaming":
-      return `  ${jsName}(requests: AsyncIterable<${inputType}>, options?: CallOptions): Promise<AsyncIterable<${outputType}>>;`;
+      return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(requests: AsyncIterable<${inputType}>, options?: CallOptions): Promise<AsyncIterable<${outputType}>>;`;
     default:
       throw new Error(`unsupported generated RPC kind ${JSON.stringify(method.kind)}`);
   }

@@ -2,16 +2,23 @@ package trevrpc
 
 import "io"
 
+// MessageStream yields messages until Recv returns io.EOF.
 type MessageStream[T any] interface {
+	// Recv returns the next message or io.EOF when the stream is complete.
 	Recv() (T, error)
+	// Close releases stream resources and cancels any pending work.
 	Close() error
 }
 
+// ByteStream is a stream of encoded protobuf message bodies.
 type ByteStream = MessageStream[[]byte]
+
+// FrameStream is a stream of TrevRPC stream frames.
 type FrameStream = MessageStream[*RpcStreamFrame]
 
 type emptyStream[T any] struct{}
 
+// EmptyStream returns a stream that immediately ends.
 func EmptyStream[T any]() MessageStream[T] {
 	return emptyStream[T]{}
 }
@@ -28,6 +35,7 @@ type sliceStream[T any] struct {
 	next  int
 }
 
+// FromSlice returns a stream that yields the provided items in order.
 func FromSlice[T any](items ...T) MessageStream[T] {
 	return &sliceStream[T]{items: items}
 }
@@ -53,6 +61,7 @@ type statusFrameStream struct {
 	done   bool
 }
 
+// StatusStream returns a frame stream containing a single terminal status frame.
 func StatusStream(status *Status) FrameStream {
 	return &statusFrameStream{status: status}
 }
@@ -75,6 +84,7 @@ type encodeStream[T ProtoMessage] struct {
 	inner MessageStream[T]
 }
 
+// EncodeStream wraps a protobuf message stream and yields encoded message bodies.
 func EncodeStream[T ProtoMessage](inner MessageStream[T]) ByteStream {
 	return &encodeStream[T]{inner: inner}
 }
@@ -97,6 +107,7 @@ type decodeStream[T ProtoMessage] struct {
 	newMessage func() T
 }
 
+// DecodeStream wraps a byte stream and yields decoded protobuf messages.
 func DecodeStream[T ProtoMessage](inner ByteStream, newMessage func() T) MessageStream[T] {
 	return &decodeStream[T]{inner: inner, newMessage: newMessage}
 }
@@ -121,6 +132,7 @@ func (s *decodeStream[T]) Close() error {
 	return closeMessageStream(s.inner)
 }
 
+// SingleMessageStream returns a byte stream containing one encoded protobuf message.
 func SingleMessageStream[T ProtoMessage](message T) ByteStream {
 	return EncodeStream(FromSlice(message))
 }

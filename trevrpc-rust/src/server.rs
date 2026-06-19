@@ -87,77 +87,92 @@ impl Default for ServerOptions {
 }
 
 impl ServerOptions {
+    /// Creates server options with the default limits and `WebTransport` settings.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns the maximum `TrevRPC` frame size in bytes.
     #[must_use]
     pub const fn max_frame_size(&self) -> usize {
         self.frame_size
     }
 
+    /// Returns the maximum number of concurrent transport connections.
     #[must_use]
     pub const fn max_concurrent_connections(&self) -> Option<usize> {
         self.connections
     }
 
+    /// Returns the maximum number of concurrent streams per connection.
     #[must_use]
     pub const fn max_concurrent_streams_per_connection(&self) -> Option<usize> {
         self.streams_per_connection
     }
 
+    /// Returns the maximum number of concurrent RPC requests.
     #[must_use]
     pub const fn max_concurrent_requests(&self) -> Option<usize> {
         self.requests
     }
 
+    /// Returns the timeout used while draining connections during graceful shutdown.
     #[must_use]
     pub const fn graceful_shutdown_timeout(&self) -> Option<Duration> {
         self.shutdown_timeout
     }
 
+    /// Returns the timeout allowed for receiving the initial request frame.
     #[must_use]
     pub const fn initial_request_timeout(&self) -> Option<Duration> {
         self.initial_request_timeout
     }
 
+    /// Returns the maximum number of messages allowed on a stream.
     #[must_use]
     pub const fn max_stream_messages(&self) -> Option<usize> {
         self.stream_messages
     }
 
+    /// Returns the maximum total body bytes allowed on a stream.
     #[must_use]
     pub const fn max_stream_body_size(&self) -> Option<usize> {
         self.stream_body_size
     }
 
+    /// Returns the maximum idle time allowed while waiting for the next stream message.
     #[must_use]
     pub const fn stream_idle_timeout(&self) -> Option<Duration> {
         self.stream_idle_timeout
     }
 
+    /// Returns the `WebTransport` request path accepted by the server.
     #[must_use]
     pub const fn webtransport_path(&self) -> &'static str {
         self.webtransport_path
     }
 
+    /// Returns the allowed `WebTransport` authorities, or an empty list to allow any authority.
     #[must_use]
     pub const fn webtransport_allowed_authorities(&self) -> &'static [&'static str] {
         self.webtransport_allowed_authorities
     }
 
+    /// Returns the allowed `WebTransport` origins, or an empty list to reject origin-bearing requests.
     #[must_use]
     pub const fn webtransport_allowed_origins(&self) -> &'static [&'static str] {
         self.webtransport_allowed_origins
     }
 
+    /// Sets the maximum `TrevRPC` frame size in bytes.
     #[must_use]
     pub const fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
         self.frame_size = max_frame_size;
         self
     }
 
+    /// Sets the maximum number of concurrent transport connections.
     #[must_use]
     pub const fn with_max_concurrent_connections(
         mut self,
@@ -167,6 +182,7 @@ impl ServerOptions {
         self
     }
 
+    /// Sets the maximum number of concurrent streams per connection.
     #[must_use]
     pub const fn with_max_concurrent_streams_per_connection(
         mut self,
@@ -176,6 +192,7 @@ impl ServerOptions {
         self
     }
 
+    /// Sets the maximum number of concurrent RPC requests.
     #[must_use]
     pub const fn with_max_concurrent_requests(
         mut self,
@@ -185,6 +202,7 @@ impl ServerOptions {
         self
     }
 
+    /// Sets the timeout used while draining connections during graceful shutdown.
     #[must_use]
     pub const fn with_graceful_shutdown_timeout(
         mut self,
@@ -194,6 +212,7 @@ impl ServerOptions {
         self
     }
 
+    /// Sets the timeout allowed for receiving the initial request frame.
     #[must_use]
     pub const fn with_initial_request_timeout(
         mut self,
@@ -203,30 +222,35 @@ impl ServerOptions {
         self
     }
 
+    /// Sets the maximum number of messages allowed on a stream.
     #[must_use]
     pub const fn with_max_stream_messages(mut self, max_stream_messages: Option<usize>) -> Self {
         self.stream_messages = max_stream_messages;
         self
     }
 
+    /// Sets the maximum total body bytes allowed on a stream.
     #[must_use]
     pub const fn with_max_stream_body_size(mut self, max_stream_body_size: Option<usize>) -> Self {
         self.stream_body_size = max_stream_body_size;
         self
     }
 
+    /// Sets the maximum idle time allowed while waiting for the next stream message.
     #[must_use]
     pub const fn with_stream_idle_timeout(mut self, stream_idle_timeout: Option<Duration>) -> Self {
         self.stream_idle_timeout = stream_idle_timeout;
         self
     }
 
+    /// Sets the `WebTransport` request path accepted by the server.
     #[must_use]
     pub const fn with_webtransport_path(mut self, webtransport_path: &'static str) -> Self {
         self.webtransport_path = webtransport_path;
         self
     }
 
+    /// Sets the `WebTransport` authorities allowed by the server.
     #[must_use]
     pub const fn with_webtransport_allowed_authorities(
         mut self,
@@ -236,6 +260,7 @@ impl ServerOptions {
         self
     }
 
+    /// Sets the `WebTransport` origins allowed by the server.
     #[must_use]
     pub const fn with_webtransport_allowed_origins(
         mut self,
@@ -260,6 +285,7 @@ pub struct MetadataValueAuthorizer {
 }
 
 impl MetadataValueAuthorizer {
+    /// Creates an authorizer that accepts requests containing an exact metadata value.
     #[must_use]
     pub fn new(key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         let key = key.into();
@@ -270,6 +296,7 @@ impl MetadataValueAuthorizer {
         }
     }
 
+    /// Creates an authorizer that checks the `authorization` metadata for a bearer token.
     #[must_use]
     pub fn bearer(token: impl AsRef<str>) -> Self {
         Self::new(
@@ -349,31 +376,37 @@ impl Default for Server {
 }
 
 impl Server {
+    /// Creates an empty server with default options.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns the maximum `TrevRPC` frame size in bytes.
     #[must_use]
     pub const fn max_frame_size(&self) -> usize {
         self.options.frame_size
     }
 
+    /// Returns the server options.
     #[must_use]
     pub const fn options(&self) -> &ServerOptions {
         &self.options
     }
 
+    /// Replaces all server options.
     pub fn set_options(&mut self, options: ServerOptions) -> &mut Self {
         self.options = options;
         self
     }
 
+    /// Sets the maximum `TrevRPC` frame size in bytes.
     pub fn set_max_frame_size(&mut self, max_frame_size: usize) -> &mut Self {
         self.options.frame_size = max_frame_size;
         self
     }
 
+    /// Sets the maximum number of concurrent transport connections.
     pub fn set_max_concurrent_connections(
         &mut self,
         max_concurrent_connections: Option<usize>,
@@ -382,6 +415,7 @@ impl Server {
         self
     }
 
+    /// Sets the maximum number of concurrent streams per connection.
     pub fn set_max_concurrent_streams_per_connection(
         &mut self,
         max_concurrent_streams_per_connection: Option<usize>,
@@ -390,6 +424,7 @@ impl Server {
         self
     }
 
+    /// Sets the maximum number of concurrent RPC requests.
     pub fn set_max_concurrent_requests(
         &mut self,
         max_concurrent_requests: Option<usize>,
@@ -398,6 +433,7 @@ impl Server {
         self
     }
 
+    /// Sets the timeout used while draining connections during graceful shutdown.
     pub fn set_graceful_shutdown_timeout(
         &mut self,
         graceful_shutdown_timeout: Option<Duration>,
@@ -406,6 +442,7 @@ impl Server {
         self
     }
 
+    /// Sets the timeout allowed for receiving the initial request frame.
     pub fn set_initial_request_timeout(
         &mut self,
         initial_request_timeout: Option<Duration>,
@@ -414,26 +451,31 @@ impl Server {
         self
     }
 
+    /// Sets the maximum number of messages allowed on a stream.
     pub fn set_max_stream_messages(&mut self, max_stream_messages: Option<usize>) -> &mut Self {
         self.options.stream_messages = max_stream_messages;
         self
     }
 
+    /// Sets the maximum total body bytes allowed on a stream.
     pub fn set_max_stream_body_size(&mut self, max_stream_body_size: Option<usize>) -> &mut Self {
         self.options.stream_body_size = max_stream_body_size;
         self
     }
 
+    /// Sets the maximum idle time allowed while waiting for the next stream message.
     pub fn set_stream_idle_timeout(&mut self, stream_idle_timeout: Option<Duration>) -> &mut Self {
         self.options.stream_idle_timeout = stream_idle_timeout;
         self
     }
 
+    /// Sets the `WebTransport` request path accepted by the server.
     pub fn set_webtransport_path(&mut self, webtransport_path: &'static str) -> &mut Self {
         self.options.webtransport_path = webtransport_path;
         self
     }
 
+    /// Sets the `WebTransport` authorities allowed by the server.
     pub fn set_webtransport_allowed_authorities(
         &mut self,
         webtransport_allowed_authorities: &'static [&'static str],
@@ -442,6 +484,7 @@ impl Server {
         self
     }
 
+    /// Sets the `WebTransport` origins allowed by the server.
     pub fn set_webtransport_allowed_origins(
         &mut self,
         webtransport_allowed_origins: &'static [&'static str],
@@ -450,6 +493,7 @@ impl Server {
         self
     }
 
+    /// Installs an authorizer that runs before route lookup.
     pub fn set_authorizer<A>(&mut self, authorizer: A) -> &mut Self
     where
         A: Authorizer,
@@ -458,11 +502,13 @@ impl Server {
         self
     }
 
+    /// Removes any configured authorizer.
     pub fn clear_authorizer(&mut self) -> &mut Self {
         self.authorizer = None;
         self
     }
 
+    /// Installs metrics callbacks for RPC lifecycle events.
     pub fn set_metrics<M>(&mut self, metrics: M) -> &mut Self
     where
         M: Metrics,
@@ -471,11 +517,13 @@ impl Server {
         self
     }
 
+    /// Returns the number of registered routes.
     #[must_use]
     pub fn route_count(&self) -> usize {
         self.routes.len()
     }
 
+    /// Registers a unary route handler for a service and method.
     pub fn route<F, Fut>(
         &mut self,
         service: impl Into<String>,
@@ -491,6 +539,7 @@ impl Server {
         );
     }
 
+    /// Registers a streaming route handler for a service, method, and RPC kind.
     pub fn route_streaming<F, Fut>(
         &mut self,
         service: impl Into<String>,
@@ -510,6 +559,7 @@ impl Server {
         );
     }
 
+    /// Handles a unary RPC request and returns a response.
     pub async fn handle_request(&self, request: RpcRequest) -> RpcResponse {
         let started_at = Instant::now();
         let service = request.service.clone();
@@ -574,6 +624,7 @@ impl Server {
         self.finish_response(&service, &method, request_body_len, started_at, response)
     }
 
+    /// Handles a streaming RPC request and returns response frames.
     pub async fn handle_streaming_request(
         &self,
         request: RpcRequest,

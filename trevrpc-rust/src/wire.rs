@@ -26,11 +26,13 @@ pub enum RpcStreamFrameKind {
     Status = 1,
 }
 
+/// Normalizes a metadata key to lowercase ASCII.
 #[must_use]
 pub fn normalize_metadata_key(key: &str) -> String {
     key.to_ascii_lowercase()
 }
 
+/// Validates metadata key syntax, value sizes, and total metadata limits.
 pub fn validate_metadata(metadata: &Metadata) -> std::result::Result<(), crate::Status> {
     if metadata.len() > MAX_METADATA_ENTRIES {
         return Err(crate::Status::invalid_argument(format!(
@@ -115,6 +117,7 @@ pub struct RpcRequest {
 }
 
 impl RpcRequest {
+    /// Creates a unary RPC request with the current wire version.
     #[must_use]
     pub fn new(service: impl Into<String>, method: impl Into<String>, body: Vec<u8>) -> Self {
         Self {
@@ -128,6 +131,7 @@ impl RpcRequest {
         }
     }
 
+    /// Validates the request wire version and RPC kind.
     pub fn validate_protocol(&self) -> std::result::Result<(), crate::Status> {
         if self.version != WIRE_VERSION {
             return Err(crate::Status::failed_precondition(format!(
@@ -146,23 +150,27 @@ impl RpcRequest {
         Ok(())
     }
 
+    /// Returns the decoded RPC kind, defaulting to unary for invalid values.
     #[must_use]
     pub fn rpc_kind(&self) -> RpcKind {
         RpcKind::try_from(self.kind).unwrap_or(RpcKind::Unary)
     }
 
+    /// Sets the RPC kind encoded in the request.
     #[must_use]
     pub const fn with_kind(mut self, kind: RpcKind) -> Self {
         self.kind = kind as i32;
         self
     }
 
+    /// Sets the timeout advertised by the request in nanoseconds.
     #[must_use]
     pub const fn with_timeout_nanos(mut self, timeout_nanos: u64) -> Self {
         self.timeout_nanos = timeout_nanos;
         self
     }
 
+    /// Replaces the request metadata.
     #[must_use]
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = metadata;
@@ -183,6 +191,7 @@ pub struct RpcResponse {
 }
 
 impl RpcResponse {
+    /// Creates a successful RPC response with the provided body.
     #[must_use]
     pub fn ok(body: Vec<u8>) -> Self {
         crate::Status::ok().into_response(body)
@@ -204,6 +213,7 @@ pub struct RpcStreamFrame {
 }
 
 impl RpcStreamFrame {
+    /// Creates a stream message frame carrying a protobuf body.
     #[must_use]
     pub fn message(body: Vec<u8>) -> Self {
         Self {
@@ -215,11 +225,13 @@ impl RpcStreamFrame {
         }
     }
 
+    /// Creates a terminal status frame without metadata.
     #[must_use]
     pub fn status(status: crate::Status) -> Self {
         Self::status_with_metadata(status, Metadata::new())
     }
 
+    /// Creates a terminal status frame with metadata.
     #[must_use]
     pub fn status_with_metadata(status: crate::Status, metadata: Metadata) -> Self {
         let (code, message) = status.into_parts();
@@ -233,11 +245,13 @@ impl RpcStreamFrame {
         }
     }
 
+    /// Returns the decoded stream frame kind.
     #[must_use]
     pub fn frame_kind(&self) -> Option<RpcStreamFrameKind> {
         RpcStreamFrameKind::try_from(self.kind).ok()
     }
 
+    /// Returns the status represented by this frame.
     #[must_use]
     pub fn status_value(&self) -> crate::Status {
         crate::Status::new(crate::Code::from_u32(self.status), self.message.clone())

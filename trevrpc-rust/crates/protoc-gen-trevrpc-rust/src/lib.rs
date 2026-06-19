@@ -30,6 +30,7 @@ impl Default for PluginOptions {
     }
 }
 
+/// Runs the `TrevRPC` Rust code generator using protoc plugin input and output streams.
 pub fn run_plugin<R, W>(mut reader: R, mut writer: W) -> io::Result<()>
 where
     R: Read,
@@ -318,6 +319,10 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
     ));
 
     for method in &service.methods {
+        buf.push_str(&format!(
+            "    /// Handles the `{}` RPC.\n",
+            method.proto_name
+        ));
         if method.client_streaming && method.server_streaming {
             buf.push_str(&format!(
                 "    async fn {}(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
@@ -353,7 +358,7 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
     ));
 
     buf.push_str(&format!(
-        "impl<T> {client_name}<T> {{\n    pub const SERVICE: &'static str = {service_name:?};\n\n    #[must_use]\n    pub fn new(transport: T) -> Self {{\n        Self {{ transport }}\n    }}\n\n    #[must_use]\n    pub const fn transport(&self) -> &T {{\n        &self.transport\n    }}\n\n    #[must_use]\n    pub fn into_transport(self) -> T {{\n        self.transport\n    }}\n}}\n\n"
+        "impl<T> {client_name}<T> {{\n    pub const SERVICE: &'static str = {service_name:?};\n\n    /// Creates a client backed by the provided transport.\n    #[must_use]\n    pub fn new(transport: T) -> Self {{\n        Self {{ transport }}\n    }}\n\n    /// Returns the underlying transport.\n    #[must_use]\n    pub const fn transport(&self) -> &T {{\n        &self.transport\n    }}\n\n    /// Consumes the client and returns the underlying transport.\n    #[must_use]\n    pub fn into_transport(self) -> T {{\n        self.transport\n    }}\n}}\n\n"
     ));
 
     buf.push_str(&format!(
@@ -368,6 +373,7 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
 }
 
 fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String) {
+    buf.push_str(&format!("    /// Calls the `{}` RPC.\n", method.proto_name));
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
             "    pub async fn {}(\n        &self,\n        requests: {runtime_path}::BoxMessageStream<{}>,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
@@ -408,7 +414,7 @@ fn generate_registration(runtime_path: &str, service: &Service, buf: &mut String
     let service_name = service_path(service);
 
     buf.push_str(&format!(
-        "pub fn {register_name}<S>(server: &mut {runtime_path}::server::Server, service: S)\nwhere\n    S: {},\n{{\n    let service = ::std::sync::Arc::new(service);\n",
+        "/// Registers routes for the `{service_name}` service.\npub fn {register_name}<S>(server: &mut {runtime_path}::server::Server, service: S)\nwhere\n    S: {},\n{{\n    let service = ::std::sync::Arc::new(service);\n",
         service.name
     ));
 

@@ -31,6 +31,7 @@ export const root = createRoot({
   },
 });
 
+/** Service descriptor for the Greeter service. */
 export const GreeterService = Object.freeze({
   name: "Greeter",
   fullName: "example.greeter.Greeter",
@@ -63,28 +64,35 @@ export const GreeterService = Object.freeze({
   },
 });
 
+/** Client for the Greeter service. */
 export class GreeterClient {
+  /** Creates a client for the Greeter service. */
   constructor(transport, options = {}) {
     this._client = createServiceClient(transport, GreeterService, root, options);
   }
 
+  /** Calls the SayHello RPC. */
   sayHello(request, options = {}) {
     return this._client.sayHello(request, options);
   }
 
+  /** Calls the LotsOfReplies RPC. */
   lotsOfReplies(request, options = {}) {
     return this._client.lotsOfReplies(request, options);
   }
 
+  /** Calls the LotsOfGreetings RPC. */
   lotsOfGreetings(request, options = {}) {
     return this._client.lotsOfGreetings(request, options);
   }
 
+  /** Calls the BidiHello RPC. */
   bidiHello(request, options = {}) {
     return this._client.bidiHello(request, options);
   }
 }
 
+/** Creates a client for the Greeter service. */
 export function createGreeterClient(transport, options = {}) {
   return new GreeterClient(transport, options);
 }

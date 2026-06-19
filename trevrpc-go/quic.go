@@ -14,24 +14,29 @@ import (
 
 const cancelledStreamCode quic.StreamErrorCode = 1
 
+// QuicClient sends TrevRPC calls over an established QUIC connection.
 type QuicClient struct {
 	conn         *quic.Conn
 	maxFrameSize int
 }
 
+// NewQuicClient creates a TrevRPC client over an established QUIC connection.
 func NewQuicClient(conn *quic.Conn) *QuicClient {
 	return &QuicClient{conn: conn, maxFrameSize: DefaultMaxFrameSize}
 }
 
+// WithMaxFrameSize sets the maximum TrevRPC frame size for the client.
 func (t *QuicClient) WithMaxFrameSize(maxFrameSize int) *QuicClient {
 	t.maxFrameSize = maxFrameSize
 	return t
 }
 
+// Conn returns the underlying QUIC connection.
 func (t *QuicClient) Conn() *quic.Conn {
 	return t.conn
 }
 
+// Call sends a unary RPC request over QUIC and returns its response.
 func (t *QuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -58,6 +63,7 @@ func (t *QuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcRespons
 	return response, nil
 }
 
+// StreamingCall sends a streaming RPC request over QUIC and returns response frames.
 func (t *QuicClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := t.conn.OpenStreamSync(streamCtx)
@@ -237,6 +243,7 @@ func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error
 	}
 }
 
+// ServeQUIC accepts QUIC connections and serves TrevRPC until ctx is cancelled.
 func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) error {
 	connectionLimit := newSemaphore(server.options.MaxConcurrentConnections)
 	requestLimit := newSemaphore(server.options.MaxConcurrentRequests)
@@ -308,6 +315,7 @@ func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) err
 	return nil
 }
 
+// HandleQUICConnection serves TrevRPC streams on an accepted QUIC connection.
 func HandleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, requestLimit semaphore) {
 	handleQUICConnection(ctx, conn, server, requestLimit, true)
 }

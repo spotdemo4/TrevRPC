@@ -16,11 +16,13 @@ pub enum Error {
 }
 
 impl Error {
+    /// Wraps a transport-layer error.
     #[must_use]
     pub fn transport(error: impl StdError + Send + Sync + 'static) -> Self {
         Self::Transport(Box::new(error))
     }
 
+    /// Converts the error into the RPC status that should be returned to callers.
     #[must_use]
     pub fn into_status(self) -> Status {
         match self {

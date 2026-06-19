@@ -71,10 +71,12 @@ export const RpcRequest = wireRoot.lookupType("trevrpc.RpcRequest");
 export const RpcResponse = wireRoot.lookupType("trevrpc.RpcResponse");
 export const RpcStreamFrame = wireRoot.lookupType("trevrpc.RpcStreamFrame");
 
+/** Creates a protobuf root from a JSON namespace definition. */
 export function createRoot(json) {
   return protobuf.Root.fromJSON(json);
 }
 
+/** Creates a stream message frame carrying a protobuf body. */
 export function messageFrame(body) {
   return {
     kind: RpcStreamFrameKind.Message,

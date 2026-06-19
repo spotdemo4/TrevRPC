@@ -6,6 +6,7 @@ use crate::{Error, Result};
 
 #[crate::async_trait]
 pub trait MessageStream<T>: Send {
+    /// Returns the next message from the stream, or `None` after the stream finishes.
     async fn next(&mut self) -> Option<Result<T>>;
 }
 
@@ -33,6 +34,7 @@ where
     }
 }
 
+/// Returns an empty boxed message stream.
 #[must_use]
 pub fn empty<T>() -> BoxMessageStream<T>
 where
@@ -46,6 +48,7 @@ pub struct IterStream<I> {
 }
 
 impl<I> IterStream<I> {
+    /// Creates a stream backed by an iterator.
     pub const fn new(iter: I) -> Self {
         Self { iter }
     }
@@ -62,6 +65,7 @@ where
     }
 }
 
+/// Returns a boxed message stream that yields items from an iterator.
 #[must_use]
 pub fn from_iter<T, I>(iter: I) -> BoxMessageStream<T>
 where
@@ -77,6 +81,7 @@ pub struct EncodeStream<T> {
 }
 
 impl<T> EncodeStream<T> {
+    /// Creates a stream that encodes protobuf messages into byte bodies.
     #[must_use]
     pub fn new(inner: BoxMessageStream<T>) -> Self {
         Self { inner }
@@ -97,6 +102,7 @@ where
     }
 }
 
+/// Wraps a message stream and encodes each protobuf message into bytes.
 #[must_use]
 pub fn encode<T>(inner: BoxMessageStream<T>) -> BoxMessageStream<Vec<u8>>
 where
@@ -111,6 +117,7 @@ pub struct DecodeStream<T> {
 }
 
 impl<T> DecodeStream<T> {
+    /// Creates a stream that decodes byte bodies into protobuf messages.
     #[must_use]
     pub fn new(inner: BoxMessageStream<Vec<u8>>) -> Self {
         Self {
@@ -134,6 +141,7 @@ where
     }
 }
 
+/// Wraps a byte stream and decodes each body into a protobuf message.
 #[must_use]
 pub fn decode<T>(inner: BoxMessageStream<Vec<u8>>) -> BoxMessageStream<T>
 where
