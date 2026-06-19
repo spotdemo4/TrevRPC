@@ -22,6 +22,7 @@ import {
   WebTransportClient,
   WireVersion,
   bidirectionalStreaming,
+  clientStreaming,
   createRoot,
   decodeFrame,
   encodeFrame,
@@ -435,6 +436,191 @@ test("unary timeout aborts transport signal", async () => {
   assert.equal(signal.aborted, true);
 });
 
+test("unary abort signal rejects when transport ignores cancellation", async () => {
+  const Hello = helloTestType();
+  let signal;
+  const transport = {
+    call(_request, options) {
+      signal = options.signal;
+      return new Promise(() => {});
+    },
+  };
+  const controller = new AbortController();
+
+  const call = unary(
+    transport,
+    "hello.v1.Greeter",
+    "SayHello",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { signal: controller.signal },
+  );
+  while (signal == null) {
+    await Promise.resolve();
+  }
+  controller.abort(new DOMException("user cancelled", "AbortError"));
+
+  await assert.rejects(call, (error) => error.code === Code.Cancelled);
+  assert.equal(signal.aborted, true);
+});
+
+test("server streaming abort signal rejects pending response read", async () => {
+  const Hello = helloTestType();
+  let returned = false;
+  const transport = {
+    async streamingCall() {
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              return new Promise(() => {});
+            },
+            return() {
+              returned = true;
+              return Promise.resolve({ done: true, value: undefined });
+            },
+          };
+        },
+      };
+    },
+  };
+  const controller = new AbortController();
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { signal: controller.signal, streamIdleTimeoutMs: undefined },
+  );
+
+  const next = stream[Symbol.asyncIterator]().next();
+  controller.abort(new DOMException("user cancelled", "AbortError"));
+
+  await assert.rejects(next, (error) => error.code === Code.Cancelled);
+  assert.equal(returned, true);
+});
+
+test("client streaming deadline cancels pending request upload", async () => {
+  const Hello = helloTestType();
+  let requestReturned = false;
+  let uploadDone;
+  const requests = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return new Promise(() => {});
+        },
+        return() {
+          requestReturned = true;
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
+  const transport = {
+    async streamingCall(_request, requestBody) {
+      uploadDone = (async () => {
+        try {
+          for await (const _body of requestBody) {
+            // The request stream intentionally never yields in this test.
+          }
+        } catch {
+          // The deadline cancels the upload side.
+        }
+      })();
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              return new Promise(() => {});
+            },
+            return() {
+              return Promise.resolve({ done: true, value: undefined });
+            },
+          };
+        },
+      };
+    },
+  };
+
+  await assert.rejects(
+    clientStreaming(transport, "hello.v1.Greeter", "LotsOfGreetings", Hello, Hello, requests, {
+      timeoutMs: 1,
+      streamIdleTimeoutMs: undefined,
+    }),
+    (error) => error.code === Code.DeadlineExceeded,
+  );
+  await uploadDone;
+  assert.equal(requestReturned, true);
+});
+
+test("bidirectional streaming abort signal cancels pending upload and response read", async () => {
+  const Hello = helloTestType();
+  let requestReturned = false;
+  let frameReturned = false;
+  let uploadDone;
+  const requests = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return new Promise(() => {});
+        },
+        return() {
+          requestReturned = true;
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
+  const transport = {
+    async streamingCall(_request, requestBody) {
+      uploadDone = (async () => {
+        try {
+          for await (const _body of requestBody) {
+            // The request stream intentionally never yields in this test.
+          }
+        } catch {
+          // The caller's abort signal cancels the upload side.
+        }
+      })();
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              return new Promise(() => {});
+            },
+            return() {
+              frameReturned = true;
+              return Promise.resolve({ done: true, value: undefined });
+            },
+          };
+        },
+      };
+    },
+  };
+  const controller = new AbortController();
+
+  const stream = await bidirectionalStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "BidiHello",
+    Hello,
+    Hello,
+    requests,
+    { signal: controller.signal, streamIdleTimeoutMs: undefined },
+  );
+  const next = stream[Symbol.asyncIterator]().next();
+  controller.abort(new DOMException("user cancelled", "AbortError"));
+
+  await assert.rejects(next, (error) => error.code === Code.Cancelled);
+  await uploadDone;
+  assert.equal(requestReturned, true);
+  assert.equal(frameReturned, true);
+});
+
 test("terminal streaming status cancels pending request iterable", async () => {
   const root = createRoot({
     nested: {
@@ -835,6 +1021,26 @@ test("checked-in greeter example binding targets the shared service", async () =
   assert.equal(example.root.lookupType("example.greeter.HelloRequest").fields.name.id, 1);
   assert.equal(example.root.lookupType("example.greeter.HelloReply").fields.message.id, 1);
 });
+
+function helloTestType() {
+  return createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  }).lookupType("hello.v1.Hello");
+}
 
 function greeterRequest(parameter = "") {
   return {

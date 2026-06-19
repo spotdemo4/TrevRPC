@@ -63,6 +63,7 @@ export async function unary(
       callOptions.timeoutMs,
       () => deadlineExceeded("RPC deadline exceeded"),
       abortScope.abort,
+      abortScope.options.signal,
     );
 
     validateResponse(response, callOptions.maxResponseBodySize);
@@ -99,6 +100,7 @@ export async function serverStreaming(
       callOptions.timeoutMs,
       () => deadlineExceeded("RPC deadline exceeded"),
       abortScope.abort,
+      abortScope.options.signal,
     );
   } catch (error) {
     abortScope.cleanup();
@@ -138,6 +140,7 @@ export async function clientStreaming(
       callOptions.timeoutMs,
       () => deadlineExceeded("RPC deadline exceeded"),
       abortScope.abort,
+      abortScope.options.signal,
     );
   } catch (error) {
     abortScope.cleanup();
@@ -179,6 +182,7 @@ export async function bidirectionalStreaming(
       callOptions.timeoutMs,
       () => deadlineExceeded("RPC deadline exceeded"),
       abortScope.abort,
+      abortScope.options.signal,
     );
   } catch (error) {
     abortScope.cleanup();
@@ -306,6 +310,7 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
         iterator,
         deadlineAt,
         options.streamIdleTimeoutMs,
+        options.signal,
         abortScope?.abort,
       );
       if (result.done) {
@@ -411,13 +416,13 @@ async function readUnaryResponseFromStream(stream) {
   throw internal("client-streaming RPC returned more than one response message");
 }
 
-async function nextFrameWithTimeout(iterator, deadlineAt, idleTimeoutMs, onTimeout) {
+async function nextFrameWithTimeout(iterator, deadlineAt, idleTimeoutMs, signal, onTimeout) {
   const timeout = nextTimeout(deadlineAt, idleTimeoutMs);
   if (timeout == null) {
-    return iterator.next();
+    return withTimeout(iterator.next(), null, null, null, signal);
   }
 
-  return withTimeout(iterator.next(), timeout.ms, () => timeout.error, onTimeout);
+  return withTimeout(iterator.next(), timeout.ms, () => timeout.error, onTimeout, signal);
 }
 
 function nextTimeout(deadlineAt, idleTimeoutMs) {
@@ -464,32 +469,64 @@ function localDeadline(timeoutMs) {
   return Date.now() + timeoutMs;
 }
 
-function withTimeout(promise, timeoutMs, makeError, onTimeout) {
-  if (timeoutMs == null) {
+function withTimeout(promise, timeoutMs, makeError, onTimeout, signal) {
+  if (timeoutMs == null && signal == null) {
     return promise;
   }
 
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+  if (timeoutMs != null && (!Number.isFinite(timeoutMs) || timeoutMs < 0)) {
     throw invalidArgument("RPC timeout must be a non-negative finite number of milliseconds");
   }
 
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      const error = makeError();
-      onTimeout?.(error);
-      reject(error);
-    }, timeoutMs);
+    let settled = false;
+    let timer;
+    const cleanup = () => {
+      if (timer != null) {
+        clearTimeout(timer);
+      }
+      signal?.removeEventListener?.("abort", onAbort);
+    };
+    const settle = (complete, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      complete(value);
+    };
+    const onAbort = () => settle(reject, signalAbortError(signal));
+
+    if (timeoutMs != null) {
+      timer = setTimeout(() => {
+        const error = makeError();
+        onTimeout?.(error);
+        settle(reject, error);
+      }, timeoutMs);
+    }
+
+    if (signal != null) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
     promise.then(
       (value) => {
-        clearTimeout(timer);
-        resolve(value);
+        settle(resolve, value);
       },
       (error) => {
-        clearTimeout(timer);
-        reject(error);
+        settle(reject, error);
       },
     );
   });
+}
+
+function signalAbortError(signal) {
+  const reason = signal?.reason;
+  return reason?.name === "TrevRpcError" ? reason : cancelled("RPC cancelled");
 }
 
 function callAbortScope(options) {

@@ -626,13 +626,15 @@ fn validate_response_metadata(response: &RpcResponse) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use crate::{Code, MessageStream, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
     use super::{
-        CallOptions, ResponseMessageStream, RpcTransport, read_unary_response_from_stream, unary,
+        CallOptions, ResponseMessageStream, RpcTransport, bidirectional_streaming,
+        client_streaming, read_unary_response_from_stream, server_streaming, unary,
     };
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -723,6 +725,155 @@ mod tests {
         assert_eq!(recorded.service, "example.Greeter");
         assert_eq!(recorded.method, "SayHello");
         assert_eq!(recorded.timeout_nanos, 5_000_000_000);
+    }
+
+    #[derive(Clone, Default)]
+    struct PendingTransport;
+
+    #[crate::async_trait]
+    impl RpcTransport for PendingTransport {
+        async fn call(&self, _request: RpcRequest) -> Result<RpcResponse> {
+            std::future::pending().await
+        }
+
+        async fn streaming_call(
+            &self,
+            _request: RpcRequest,
+            _request_body: crate::BoxMessageStream<Vec<u8>>,
+        ) -> Result<crate::BoxMessageStream<RpcStreamFrame>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_deadline_cancels_pending_transport() {
+        let error = unary::<_, _, TestMessage>(
+            &PendingTransport,
+            "example.Greeter",
+            "SayHello",
+            &TestMessage {
+                value: "request".to_owned(),
+            },
+            CallOptions::new().with_timeout(Duration::from_millis(1)),
+        )
+        .await
+        .expect_err("pending unary should hit deadline");
+
+        assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    }
+
+    #[tokio::test]
+    async fn server_streaming_deadline_cancels_pending_open() {
+        let Err(error) = server_streaming::<_, _, TestMessage>(
+            &PendingTransport,
+            "example.Greeter",
+            "LotsOfReplies",
+            &TestMessage {
+                value: "request".to_owned(),
+            },
+            CallOptions::new().with_timeout(Duration::from_millis(1)),
+        )
+        .await
+        else {
+            panic!("pending stream open should hit deadline");
+        };
+
+        assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    }
+
+    #[derive(Clone, Default)]
+    struct UploadWaitingTransport;
+
+    #[crate::async_trait]
+    impl RpcTransport for UploadWaitingTransport {
+        async fn call(&self, _request: RpcRequest) -> Result<RpcResponse> {
+            Err(crate::Error::from(Status::unimplemented(
+                "unary not implemented",
+            )))
+        }
+
+        async fn streaming_call(
+            &self,
+            _request: RpcRequest,
+            request_body: crate::BoxMessageStream<Vec<u8>>,
+        ) -> Result<crate::BoxMessageStream<RpcStreamFrame>> {
+            Ok(Box::new(UploadBlockedFrameStream { request_body }))
+        }
+    }
+
+    struct UploadBlockedFrameStream {
+        request_body: crate::BoxMessageStream<Vec<u8>>,
+    }
+
+    #[crate::async_trait]
+    impl MessageStream<RpcStreamFrame> for UploadBlockedFrameStream {
+        async fn next(&mut self) -> Option<Result<RpcStreamFrame>> {
+            self.request_body.next().await.map(|result| {
+                result.map(|_| RpcStreamFrame::status(Status::internal("unexpected request body")))
+            })
+        }
+    }
+
+    struct DropTrackedPendingStream {
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[crate::async_trait]
+    impl MessageStream<TestMessage> for DropTrackedPendingStream {
+        async fn next(&mut self) -> Option<Result<TestMessage>> {
+            std::future::pending().await
+        }
+    }
+
+    impl Drop for DropTrackedPendingStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_streaming_deadline_drops_pending_upload() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = client_streaming::<_, _, TestMessage>(
+            &UploadWaitingTransport,
+            "example.Greeter",
+            "LotsOfGreetings",
+            Box::new(DropTrackedPendingStream {
+                dropped: Arc::clone(&dropped),
+            }),
+            CallOptions::new().with_timeout(Duration::from_millis(1)),
+        )
+        .await
+        .expect_err("pending upload should hit deadline");
+
+        assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn bidirectional_streaming_deadline_cancels_pending_response_read() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut responses = bidirectional_streaming::<_, _, TestMessage>(
+            &UploadWaitingTransport,
+            "example.Greeter",
+            "BidiHello",
+            Box::new(DropTrackedPendingStream {
+                dropped: Arc::clone(&dropped),
+            }),
+            CallOptions::new().with_timeout(Duration::from_millis(1)),
+        )
+        .await
+        .expect("stream should open");
+
+        let error = responses
+            .next()
+            .await
+            .expect("deadline error should be emitted")
+            .expect_err("pending response should hit deadline");
+        assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+
+        drop(responses);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -92,7 +92,7 @@ func (t *WebTransportClient) StreamingCall(ctx context.Context, request *RpcRequ
 	stream, err := t.session.OpenStreamSync(streamCtx)
 	if err != nil {
 		cancel()
-		return nil, webTransportStatus(err)
+		return nil, webTransportOrContextStatus(streamCtx, err)
 	}
 
 	writerDone := make(chan error, 1)

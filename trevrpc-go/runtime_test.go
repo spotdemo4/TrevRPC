@@ -603,6 +603,54 @@ func TestClientResponseStreamDeadlineReturnsDeadlineExceeded(t *testing.T) {
 	}
 }
 
+func TestUnaryContextCancellationReturnsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := Unary(ctx, contextBlockingTransport{}, "example.Greeter", "SayHello", &testMessage{Value: "cancel"}, func() *testMessage { return &testMessage{} })
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled, got %v (%v)", code, err)
+	}
+}
+
+func TestServerStreamingContextCancellationReturnsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := ServerStreaming(ctx, contextBlockingTransport{}, "example.Greeter", "LotsOfReplies", &testMessage{Value: "cancel"}, func() *testMessage { return &testMessage{} }, WithoutStreamIdleTimeout())
+	if err != nil {
+		t.Fatalf("start server stream: %v", err)
+	}
+	cancel()
+
+	_, err = stream.Recv()
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled, got %v (%v)", code, err)
+	}
+}
+
+func TestClientStreamingDeadlineCancelsPendingUpload(t *testing.T) {
+	requests := newBlockingTestMessages()
+	defer requests.Close()
+
+	_, err := ClientStreaming(context.Background(), uploadWaitingTransport{}, "example.Greeter", "LotsOfGreetings", requests, func() *testMessage { return &testMessage{} }, WithTimeout(time.Millisecond), WithoutStreamIdleTimeout())
+	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
+	}
+}
+
+func TestBidirectionalStreamingContextCancellationReturnsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := BidirectionalStreaming(ctx, contextBlockingTransport{}, "example.Greeter", "BidiHello", EmptyStream[*testMessage](), func() *testMessage { return &testMessage{} }, WithoutStreamIdleTimeout())
+	if err != nil {
+		t.Fatalf("start bidi stream: %v", err)
+	}
+	cancel()
+
+	_, err = stream.Recv()
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled, got %v (%v)", code, err)
+	}
+}
+
 type echoTestMessages struct {
 	requests MessageStream[*testMessage]
 }
@@ -1549,6 +1597,54 @@ type closeErrorFrameStream struct {
 	err    error
 	closed int
 }
+
+type contextBlockingTransport struct{}
+
+func (contextBlockingTransport) Call(ctx context.Context, _ *RpcRequest) (*RpcResponse, error) {
+	<-ctx.Done()
+	return nil, statusFromContextError(ctx.Err())
+}
+
+func (contextBlockingTransport) StreamingCall(ctx context.Context, _ *RpcRequest, _ ByteStream) (FrameStream, error) {
+	return contextBlockingFrameStream{ctx: ctx}, nil
+}
+
+type contextBlockingFrameStream struct {
+	ctx context.Context
+}
+
+func (s contextBlockingFrameStream) Recv() (*RpcStreamFrame, error) {
+	<-s.ctx.Done()
+	return nil, statusFromContextError(s.ctx.Err())
+}
+
+func (contextBlockingFrameStream) Close() error { return nil }
+
+type uploadWaitingTransport struct{}
+
+func (uploadWaitingTransport) Call(context.Context, *RpcRequest) (*RpcResponse, error) {
+	return nil, Unimplemented("unary not implemented")
+}
+
+func (uploadWaitingTransport) StreamingCall(ctx context.Context, _ *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+	errors := make(chan error, 1)
+	go func() {
+		_, err := recvRequestBody(ctx, requestBody)
+		errors <- err
+	}()
+
+	return uploadErrorFrameStream{errors: errors}, nil
+}
+
+type uploadErrorFrameStream struct {
+	errors <-chan error
+}
+
+func (s uploadErrorFrameStream) Recv() (*RpcStreamFrame, error) {
+	return nil, <-s.errors
+}
+
+func (uploadErrorFrameStream) Close() error { return nil }
 
 func (s *closeErrorFrameStream) Recv() (*RpcStreamFrame, error) {
 	if len(s.frames) == 0 {

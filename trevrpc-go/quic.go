@@ -63,7 +63,7 @@ func (t *QuicClient) StreamingCall(ctx context.Context, request *RpcRequest, req
 	stream, err := t.conn.OpenStreamSync(streamCtx)
 	if err != nil {
 		cancel()
-		return nil, transportStatus(err)
+		return nil, transportOrContextStatus(streamCtx, err)
 	}
 
 	writerDone := make(chan error, 1)
