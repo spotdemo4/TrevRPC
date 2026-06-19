@@ -1033,6 +1033,142 @@ func TestWebTransportDroppedResponseStreamCancelsServerWork(t *testing.T) {
 	waitForMetricCode(t, metrics, CodeCancelled)
 }
 
+func TestQuicServerStreamingContextCancelWhileResponsePending(t *testing.T) {
+	metrics := &recordingMetrics{}
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetMetrics(metrics)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	replies, err := ServerStreaming(ctx, NewQuicClient(conn), testServiceName, "LotsOfReplies", &testMessage{Value: "cancel"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("start server stream: %v", err)
+	}
+	first, err := replies.Recv()
+	if err != nil {
+		t.Fatalf("first response failed: %v", err)
+	}
+	if first.Value != "first" {
+		t.Fatalf("unexpected first response: %q", first.Value)
+	}
+
+	cancel()
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled, got %v (%v)", code, err)
+	}
+	waitForMetricCode(t, metrics, CodeCancelled)
+}
+
+func TestWebTransportServerStreamingContextCancelWhileResponsePending(t *testing.T) {
+	metrics := &recordingMetrics{}
+	running := startTestWebTransportServer(t, func(server *Server) {
+		server.SetMetrics(metrics)
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	replies, err := ServerStreaming(ctx, transport, testServiceName, "LotsOfReplies", &testMessage{Value: "cancel"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("start WebTransport server stream: %v", err)
+	}
+	first, err := replies.Recv()
+	if err != nil {
+		t.Fatalf("first WebTransport response failed: %v", err)
+	}
+	if first.Value != "first" {
+		t.Fatalf("unexpected first WebTransport response: %q", first.Value)
+	}
+
+	cancel()
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled, got %v (%v)", code, err)
+	}
+	waitForMetricCode(t, metrics, CodeCancelled)
+}
+
+func TestQuicClientStreamingDeadlineWhileUploadPending(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	requests := newBlockingTestMessages()
+	defer requests.Close()
+
+	_, err := ClientStreaming(context.Background(), NewQuicClient(conn), testServiceName, "LotsOfGreetings", requests, func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond), WithMetadata("authorization", []byte("Bearer "+testAuthToken)))
+	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
+	}
+	requests.waitClosed(t)
+}
+
+func TestWebTransportClientStreamingDeadlineWhileUploadPending(t *testing.T) {
+	running := startTestWebTransportServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	requests := newBlockingTestMessages()
+	defer requests.Close()
+
+	_, err := ClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", requests, func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond), WithMetadata("authorization", []byte("Bearer "+testAuthToken)))
+	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
+	}
+	requests.waitClosed(t)
+}
+
+func TestQuicBidirectionalContextCancelWhileUploadAndResponsePending(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	requests := newBlockingTestMessages()
+	defer requests.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	replies, err := BidirectionalStreaming(ctx, NewQuicClient(conn), testServiceName, "BidiHello", requests, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("start bidi stream: %v", err)
+	}
+	cancel()
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled, got %v (%v)", code, err)
+	}
+	requests.waitClosed(t)
+}
+
+func TestWebTransportBidirectionalContextCancelWhileUploadAndResponsePending(t *testing.T) {
+	running := startTestWebTransportServer(t, func(server *Server) {
+		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+	})
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	requests := newBlockingTestMessages()
+	defer requests.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	replies, err := BidirectionalStreaming(ctx, transport, testServiceName, "BidiHello", requests, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("start WebTransport bidi stream: %v", err)
+	}
+	cancel()
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodeCancelled {
+		t.Fatalf("expected cancelled, got %v (%v)", code, err)
+	}
+	requests.waitClosed(t)
+}
+
 func TestQuicTerminalStatusClosesPendingRequestStream(t *testing.T) {
 	running := startTestQUICServer(t, registerRejectUploadRoute)
 	conn := connectTestQUICClient(t, running)

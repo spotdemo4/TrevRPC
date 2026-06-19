@@ -747,6 +747,168 @@ async fn webtransport_dropped_response_stream_cancels_server_work() -> TestResul
 }
 
 #[tokio::test]
+async fn quinn_server_streaming_deadline_while_response_pending() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let mut replies = client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "cancel".to_owned(),
+            },
+            short_authenticated_options(),
+        )
+        .await?;
+    let first = replies
+        .next()
+        .await
+        .expect("response stream should yield first item")?;
+    assert_eq!(first.message, "first");
+
+    let error = replies
+        .next()
+        .await
+        .expect("deadline error should be emitted")
+        .expect_err("pending response should hit deadline");
+    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_server_streaming_deadline_while_response_pending() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+
+    let mut replies = greeter_client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "cancel".to_owned(),
+            },
+            short_authenticated_options(),
+        )
+        .await?;
+    let first = replies
+        .next()
+        .await
+        .expect("response stream should yield first item")?;
+    assert_eq!(first.message, "first");
+
+    let error = replies
+        .next()
+        .await
+        .expect("deadline error should be emitted")
+        .expect_err("pending response should hit deadline");
+    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_client_streaming_deadline_drops_pending_upload() -> TestResult {
+    let dropped = DropSignal::default();
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let error = client
+        .lots_of_greetings(
+            Box::new(PendingGreeterRequests::new(dropped.clone())),
+            short_authenticated_options(),
+        )
+        .await
+        .expect_err("pending upload should hit deadline");
+    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    dropped.wait().await;
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_client_streaming_deadline_drops_pending_upload() -> TestResult {
+    let dropped = DropSignal::default();
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+
+    let error = greeter_client
+        .lots_of_greetings(
+            Box::new(PendingGreeterRequests::new(dropped.clone())),
+            short_authenticated_options(),
+        )
+        .await
+        .expect_err("pending upload should hit deadline");
+    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    dropped.wait().await;
+
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
+    let dropped = DropSignal::default();
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let mut replies = client
+        .bidi_hello(
+            Box::new(PendingGreeterRequests::new(dropped.clone())),
+            short_authenticated_options(),
+        )
+        .await?;
+    let error = replies
+        .next()
+        .await
+        .expect("deadline error should be emitted")
+        .expect_err("pending bidi response should hit deadline");
+    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    drop(replies);
+    dropped.wait().await;
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
+    let dropped = DropSignal::default();
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+
+    let mut replies = greeter_client
+        .bidi_hello(
+            Box::new(PendingGreeterRequests::new(dropped.clone())),
+            short_authenticated_options(),
+        )
+        .await?;
+    let error = replies
+        .next()
+        .await
+        .expect("deadline error should be emitted")
+        .expect_err("pending bidi response should hit deadline");
+    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    drop(replies);
+    dropped.wait().await;
+
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
     let dropped = DropSignal::default();
     let server = spawn_greeter_server(register_reject_upload_route)?;
@@ -1440,6 +1602,12 @@ async fn close_client(endpoint: quinn::Endpoint, connection: quinn::Connection) 
 fn authenticated_options() -> CallOptions {
     CallOptions::new()
         .with_timeout(TEST_TIMEOUT)
+        .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
+}
+
+fn short_authenticated_options() -> CallOptions {
+    CallOptions::new()
+        .with_timeout(Duration::from_millis(50))
         .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
 }
 
