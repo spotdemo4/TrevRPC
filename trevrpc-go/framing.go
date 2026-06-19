@@ -11,7 +11,6 @@ import (
 
 // DefaultMaxFrameSize is the default maximum TrevRPC frame body size in bytes.
 const DefaultMaxFrameSize = 4 * 1024 * 1024
-const maxFrameReadChunkSize = 32 * 1024
 
 // ProtoMessage is the protobuf message interface accepted by the runtime.
 type ProtoMessage = protoadapt.MessageV1
@@ -54,18 +53,23 @@ func UnmarshalMessage(body []byte, message ProtoMessage) error {
 
 // EncodeFrame encodes a protobuf message into a length-prefixed TrevRPC frame.
 func EncodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
-	body, err := MarshalMessage(message)
+	protoMessage := protoadapt.MessageV2Of(message)
+	size := proto.Size(protoMessage)
+	if size > maxFrameSize {
+		return nil, &FrameTooLargeError{Len: size, Max: maxFrameSize}
+	}
+
+	frame := make([]byte, 4, 4+size)
+	frame, err := proto.MarshalOptions{}.MarshalAppend(frame, protoMessage)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(body) > maxFrameSize {
-		return nil, &FrameTooLargeError{Len: len(body), Max: maxFrameSize}
+	bodyLen := len(frame) - 4
+	if bodyLen > maxFrameSize {
+		return nil, &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
 	}
-
-	frame := make([]byte, 4+len(body))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(body)))
-	copy(frame[4:], body)
+	binary.BigEndian.PutUint32(frame[:4], uint32(bodyLen))
 
 	return frame, nil
 }
@@ -133,29 +137,10 @@ func readFrameBody(reader io.Reader, length int) ([]byte, error) {
 		return []byte{}, nil
 	}
 
-	bufferSize := minInt(length, maxFrameReadChunkSize)
-	body := make([]byte, 0, bufferSize)
-	buffer := make([]byte, bufferSize)
-	remaining := length
-	for remaining > 0 {
-		readSize := minInt(remaining, len(buffer))
-		read, err := io.ReadFull(reader, buffer[:readSize])
-		if read > 0 {
-			body = append(body, buffer[:read]...)
-			remaining -= read
-		}
-		if err != nil {
-			return nil, err
-		}
+	body := make([]byte, length)
+	if _, err := io.ReadFull(reader, body); err != nil {
+		return nil, err
 	}
 
 	return body, nil
-}
-
-func minInt(left, right int) int {
-	if left < right {
-		return left
-	}
-
-	return right
 }

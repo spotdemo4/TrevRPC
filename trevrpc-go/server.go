@@ -569,6 +569,10 @@ func (s *serverResponseStream) Recv() (*RpcStreamFrame, error) {
 	return MessageFrame(body), nil
 }
 
+func (s *serverResponseStream) trevrpcNonBlockingStream() bool {
+	return s.limits.idleTimeout <= 0 && isNonBlockingStream(s.inner)
+}
+
 func (s *serverResponseStream) Close() error {
 	if !s.done {
 		s.finish(CodeCancelled)

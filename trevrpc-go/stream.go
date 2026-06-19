@@ -24,6 +24,10 @@ type nonBlockingStream interface {
 	trevrpcNonBlockingStream() bool
 }
 
+type contextCancelsRecvStream interface {
+	trevrpcContextCancelsRecv() bool
+}
+
 // MessagePipe is a sendable message stream.
 type MessagePipe[T any] struct {
 	ctx       context.Context
@@ -169,6 +173,8 @@ func (s *statusFrameStream) Recv() (*RpcStreamFrame, error) {
 	return StatusFrame(s.status), nil
 }
 
+func (s *statusFrameStream) trevrpcNonBlockingStream() bool { return true }
+
 func (s *statusFrameStream) Close() error {
 	s.done = true
 	return nil
@@ -230,12 +236,24 @@ func (s *decodeStream[T]) Close() error {
 	return closeMessageStream(s.inner)
 }
 
+func (s *decodeStream[T]) trevrpcNonBlockingStream() bool {
+	return isNonBlockingStream(s.inner)
+}
+
 func isNonBlockingStream(stream any) bool {
 	if stream == nil {
 		return false
 	}
 	nonBlocking, ok := stream.(nonBlockingStream)
 	return ok && nonBlocking.trevrpcNonBlockingStream()
+}
+
+func streamContextCancelsRecv(stream any) bool {
+	if stream == nil {
+		return false
+	}
+	cancellable, ok := stream.(contextCancelsRecvStream)
+	return ok && cancellable.trevrpcContextCancelsRecv()
 }
 
 // SingleMessageStream returns a byte stream containing one encoded protobuf message.

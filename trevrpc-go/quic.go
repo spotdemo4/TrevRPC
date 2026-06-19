@@ -73,20 +73,24 @@ func (t *QuicClient) StreamingCall(ctx context.Context, request *RpcRequest, req
 	}
 
 	writerDone := make(chan error, 1)
+	stopCancel := cancelQUICStreamOnContext(streamCtx, stream)
 	go func() {
 		writerDone <- writeStreamingRequest(streamCtx, stream, request, requestBody, t.maxFrameSize)
 	}()
 
-	return &quicResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, maxFrameSize: t.maxFrameSize}, nil
+	return &quicResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, stopCancel: stopCancel, maxFrameSize: t.maxFrameSize}, nil
 }
 
 type quicResponseStream struct {
 	stream       *quic.Stream
 	writerDone   <-chan error
 	cancel       context.CancelFunc
+	stopCancel   func()
 	maxFrameSize int
 	done         bool
 }
+
+func (s *quicResponseStream) trevrpcContextCancelsRecv() bool { return true }
 
 func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
 	if s.done {
@@ -131,15 +135,18 @@ func (s *quicResponseStream) Close() error {
 }
 
 func (s *quicResponseStream) finish(cancelRead bool) {
-	if s.cancel != nil {
-		s.cancel()
-	}
-
 	if s.done {
 		return
 	}
 
 	s.done = true
+	if s.stopCancel != nil {
+		s.stopCancel()
+		s.stopCancel = nil
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if cancelRead {
 		s.stream.CancelRead(cancelledStreamCode)
 	}
@@ -169,6 +176,7 @@ func (s *quicResponseStream) ignoreWriterError() {
 
 func cancelQUICStreamOnContext(ctx context.Context, stream *quic.Stream) func() {
 	done := make(chan struct{})
+	var closeOnce sync.Once
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -178,7 +186,7 @@ func cancelQUICStreamOnContext(ctx context.Context, stream *quic.Stream) func() 
 		}
 	}()
 
-	return func() { close(done) }
+	return func() { closeOnce.Do(func() { close(done) }) }
 }
 
 func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
@@ -395,8 +403,8 @@ func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore
 	defer release(requestLimit)
 
 	if request.RPCKind() == RpcKindUnary {
-		response, ok := handleUnaryQUICRequest(ctx, server, request)
-		if !ok {
+		response := server.HandleRequest(ctx, request)
+		if ctx.Err() != nil {
 			return
 		}
 		if err := WriteFrame(stream, response, server.options.MaxFrameSize); err == nil {
@@ -466,21 +474,21 @@ func isTimeoutError(err error) bool {
 	return errors.As(err, &netError) && netError.Timeout()
 }
 
-func handleUnaryQUICRequest(ctx context.Context, server *Server, request *RpcRequest) (*RpcResponse, bool) {
-	result := make(chan *RpcResponse, 1)
-	go func() {
-		result <- server.HandleRequest(ctx, request)
-	}()
-
-	select {
-	case response := <-result:
-		return response, true
-	case <-ctx.Done():
-		return nil, false
-	}
-}
-
 func recvResponseFrame(ctx context.Context, response FrameStream) (*RpcStreamFrame, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if isNonBlockingStream(response) {
+		frame, err := response.Recv()
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+		}
+
+		return frame, err
+	}
+
 	type recvResult struct {
 		frame *RpcStreamFrame
 		err   error

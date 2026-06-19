@@ -531,6 +531,16 @@ func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout t
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
+	if idleTimeout <= 0 && (isNonBlockingStream(stream) || streamContextCancelsRecv(stream)) {
+		frame, err := stream.Recv()
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, statusFromContextError(ctxErr)
+			}
+		}
+
+		return frame, err
+	}
 
 	type recvResult struct {
 		frame *RpcStreamFrame
