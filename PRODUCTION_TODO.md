@@ -31,7 +31,9 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Go and Rust QUIC/WebTransport setup helpers align receive windows and incoming stream caps with TrevRPC frame, stream, and concurrency limits while preserving over-limit status responses.
 - Go and Rust accepted-RPC completion metrics have exact-once coverage for success, handler errors/panics, auth/protocol rejection, deadlines, streaming drops, and request-limit rejection.
 - Go and Rust pre-handler transport/protocol failures record start+finish metrics with empty service/method placeholders for malformed and timed-out initial frames.
+- Go/Rust native QUIC cross-runtime smoke tests cover unary, all streaming modes, auth failure, and malformed initial-frame protocol errors in both directions.
 - Shutdown tests cover stuck handlers and long-running streams.
+- Browser WebTransport greeter examples document and enforce explicit path, authority, origin, certificate, and bearer-token policy.
 
 ## Remaining Work
 
@@ -50,7 +52,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 ### 4. Protocol and Security Validation
 
 - Expand fuzz/property tests into longer-running CI jobs for frame parsing, metadata validation, stream limits, and protobuf wire compatibility.
-- Add cross-runtime integration tests beyond golden vectors so Go, JavaScript, and Rust clients/servers exchange real RPCs.
+- Expand cross-runtime integration beyond Go/Rust native QUIC smoke tests to include JavaScript and WebTransport/browser paths.
 
 ### 5. Shutdown, Panics, and Failure Isolation
 
@@ -60,4 +62,3 @@ This repository is not production-ready yet. Track the remaining work here so ru
 ### 6. Browser and WebTransport Compatibility
 
 - Add browser/runtime compatibility tests for WebTransport behavior that Node-style unit tests cannot cover.
-- Add production examples documenting explicit WebTransport origin/path/authority policy.

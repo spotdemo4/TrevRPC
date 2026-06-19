@@ -13,6 +13,7 @@ mod cert;
 mod greeter;
 
 const DEFAULT_QUIC_ADDR: &str = "127.0.0.1:5000";
+const BROWSER_EXAMPLE_ORIGIN: &str = "http://127.0.0.1:8080";
 const AUTH_TOKEN: &str = "trevrpc-example-token";
 
 struct GreeterService;
@@ -98,12 +99,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let identity = make_identity()?;
     let certificate_path = cert::certificate_path()?;
     write_certificate(&identity, &certificate_path)?;
+    let webtransport_authorities = webtransport_authorities(addr);
 
     let mut server = trevrpc::server::Server::new();
     let options = trevrpc::server::ServerOptions::new()
         .with_max_concurrent_connections(Some(512))
         .with_max_concurrent_streams_per_connection(Some(64))
-        .with_max_concurrent_requests(Some(1024));
+        .with_max_concurrent_requests(Some(1024))
+        .with_webtransport_allowed_authorities(webtransport_authorities)
+        .with_webtransport_allowed_origins(&[BROWSER_EXAMPLE_ORIGIN]);
     server.set_options(options);
     server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     greeter::register_greeter(&mut server, GreeterService);
@@ -162,6 +166,11 @@ fn make_endpoint(
     trevrpc::quinn::configure_server_config(&mut server_config, options, true);
 
     Ok(quinn::Endpoint::server(server_config, addr)?)
+}
+
+fn webtransport_authorities(addr: SocketAddr) -> &'static [&'static str] {
+    let authority: &'static str = Box::leak(addr.to_string().into_boxed_str());
+    Box::leak(vec![authority].into_boxed_slice())
 }
 
 fn write_certificate(

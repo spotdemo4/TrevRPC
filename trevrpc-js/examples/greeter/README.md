@@ -29,6 +29,17 @@ https://127.0.0.1:5000/trevrpc   # Rust default in this example UI
 
 The URL path is only the WebTransport session path. TrevRPC service routing still happens inside the `RpcRequest` frame.
 
+## WebTransport Policy
+
+The example servers intentionally configure an explicit WebTransport policy instead of accepting every browser session:
+
+- Path: `/trevrpc`
+- Go authority: `127.0.0.1:50051` or `localhost:50051`
+- Rust authority: the listen address passed to `greeter_server`, defaulting to `127.0.0.1:5000`
+- Browser origin: `http://127.0.0.1:8080`
+
+Open the page through the exact local static-server URL above so the browser sends the allowed `Origin`. Native non-browser WebTransport clients may omit `Origin`, but the authority and path still need to match.
+
 ## Authentication
 
 The Go server, Rust server, Go client, Rust client, and JavaScript client examples all use the same bearer token:

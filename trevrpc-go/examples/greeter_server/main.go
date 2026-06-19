@@ -32,6 +32,11 @@ const (
 	authToken            = "trevrpc-example-token"
 )
 
+var webTransportAuthorities = map[string]struct{}{
+	listenAddr:        {},
+	"localhost:50051": {},
+}
+
 type greeterService struct{}
 
 func (greeterService) SayHello(_ context.Context, request *greeter.HelloRequest) (*greeter.HelloReply, error) {
@@ -117,6 +122,10 @@ func main() {
 }
 
 func allowBrowserExampleOrigin(r *http.Request) bool {
+	if _, ok := webTransportAuthorities[r.Host]; !ok {
+		return false
+	}
+
 	origin := r.Header.Get("Origin")
 	return origin == "" || origin == browserExampleOrigin
 }

@@ -268,6 +268,30 @@
             '';
           };
 
+          cross-runtime =
+            let
+              crossRuntimeGo = pkgs.buildGoModule (final: {
+                pname = "trevrpc-cross-runtime-go";
+                version = "0.1.0";
+
+                src = ./trevrpc-go;
+                vendorHash = "sha256-b1Qj4m2yyMpJr2z7pDYJYY2kOThR9FnAHVk5NZbvba8=";
+                subPackages = [ "cmd/trevrpc-xruntime-go" ];
+
+                meta.mainProgram = "trevrpc-xruntime-go";
+              });
+            in
+            self.packages.${system}.trevrpc-rust.overrideAttrs {
+              dontBuild = true;
+              TREVRPC_XRUNTIME_GO = "${crossRuntimeGo}/bin/trevrpc-xruntime-go";
+              checkPhase = ''
+                cargo test --test cross_runtime --offline -- --nocapture
+              '';
+              installPhase = ''
+                touch $out
+              '';
+            };
+
           nix = {
             root = ./.;
             filter = file: file.hasExt "nix";
