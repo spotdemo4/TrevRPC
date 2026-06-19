@@ -95,6 +95,7 @@
               cargo
               # go
               go
+              fix-hash
               # javascript
               nodejs_24
             ];
