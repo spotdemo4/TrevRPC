@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -468,6 +469,7 @@ type serverResponseStream struct {
 	messages        int
 	done            bool
 	cancel          context.CancelFunc
+	finishOnce      sync.Once
 }
 
 func (s *serverResponseStream) Recv() (*RpcStreamFrame, error) {
@@ -505,20 +507,18 @@ func (s *serverResponseStream) Close() error {
 }
 
 func (s *serverResponseStream) finish(code Code) {
-	if s.done {
-		return
-	}
-
-	s.done = true
-	s.cancel()
-	closeMessageStream(s.inner)
-	recordRPCFinished(s.metrics, RPCFinished{
-		Service:         s.service,
-		Method:          s.method,
-		RequestBodyLen:  s.requestBodyLen,
-		ResponseBodyLen: s.responseBodyLen,
-		Code:            code,
-		Elapsed:         time.Since(s.startedAt),
+	s.finishOnce.Do(func() {
+		s.done = true
+		s.cancel()
+		closeMessageStream(s.inner)
+		recordRPCFinished(s.metrics, RPCFinished{
+			Service:         s.service,
+			Method:          s.method,
+			RequestBodyLen:  s.requestBodyLen,
+			ResponseBodyLen: s.responseBodyLen,
+			Code:            code,
+			Elapsed:         time.Since(s.startedAt),
+		})
 	})
 }
 

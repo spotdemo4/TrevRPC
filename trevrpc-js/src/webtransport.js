@@ -172,7 +172,12 @@ class WebTransportResponseFrameStream {
         await abortWriter(this.writer);
         if (this.writerSettled) {
           await this.writerDone;
-          if (this.writerError != null && this.writerError.code !== Code.Cancelled) {
+          const statusCode = frame.status ?? Code.Ok;
+          if (
+            statusCode === Code.Ok &&
+            this.writerError != null &&
+            this.writerError.code !== Code.Cancelled
+          ) {
             throw this.writerError;
           }
         }

@@ -306,7 +306,9 @@ func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 
 		streamTasks.Go(func() {
 			defer release(streamLimit)
-			handleQUICStream(stream.Context(), server, requestLimit, stream)
+			streamCtx, cancel := contextWithAdditionalCancel(stream.Context(), ctx)
+			defer cancel()
+			handleQUICStream(streamCtx, server, requestLimit, stream)
 		})
 	}
 
@@ -355,6 +357,7 @@ func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore
 
 	requestBody := &rpcRequestStream{stream: stream, maxFrameSize: server.options.MaxFrameSize}
 	response := server.HandleStreamingRequest(ctx, request, requestBody)
+	defer closeMessageStream(response)
 	for {
 		frame, err := recvResponseFrame(ctx, response)
 		if err == io.EOF {

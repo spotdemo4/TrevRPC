@@ -967,6 +967,70 @@ func TestQuicShutdownClosesActiveConnections(t *testing.T) {
 	conn.CloseWithError(0, "test complete")
 }
 
+func TestQuicShutdownCancelsActiveUnaryHandler(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	running := startTestQUICServer(t, func(server *Server) {
+		server.Route(testServiceName, "ObserveCancel", func(ctx context.Context, _ []byte) ([]byte, error) {
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			return nil, ctx.Err()
+		})
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	done := make(chan error, 1)
+	go func() {
+		_, err := Unary(context.Background(), NewQuicClient(conn), testServiceName, "ObserveCancel", &testMessage{}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("handler did not start")
+	}
+	running.stop(t)
+	select {
+	case <-cancelled:
+	case <-time.After(testTimeout):
+		t.Fatal("handler did not observe shutdown cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("client call did not finish after shutdown")
+	}
+}
+
+func TestQuicRequestPermitReleasedAfterDeadline(t *testing.T) {
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.MaxConcurrentRequests = 1
+		server.SetOptions(options)
+		server.Route(testServiceName, "UntilCancelled", func(ctx context.Context, _ []byte) ([]byte, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	transport := NewQuicClient(conn)
+
+	_, err := Unary(context.Background(), transport, testServiceName, "UntilCancelled", &testMessage{}, func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond))
+	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
+	}
+	response, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "after deadline"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	if err != nil {
+		t.Fatalf("second RPC should acquire released request permit: %v", err)
+	}
+	if response.Value != "hello, after deadline" {
+		t.Fatalf("unexpected response after permit release: %q", response.Value)
+	}
+}
+
 func TestQuicLocalCloseMapsToCancelled(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)

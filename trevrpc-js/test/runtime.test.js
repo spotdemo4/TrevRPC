@@ -330,6 +330,69 @@ test("WebTransport terminal OK does not hide local upload error", async () => {
   );
 });
 
+test("WebTransport terminal error wins over local upload error", async () => {
+  const root = createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const Hello = root.lookupType("hello.v1.Hello");
+  const stream = fakeBidirectionalStream({
+    readableChunks: [
+      encodeFrame(
+        RpcStreamFrame,
+        RpcStreamFrame.create({
+          kind: RpcStreamFrameKind.Status,
+          status: Code.PermissionDenied,
+          message: "remote rejected upload",
+          metadata: {},
+        }),
+      ),
+    ],
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+  const requestBody = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return Promise.reject(invalidArgument("local upload failed"));
+        },
+      };
+    },
+  };
+
+  const responses = await bidirectionalStreaming(
+    client,
+    "hello.v1.Greeter",
+    "BidiHello",
+    Hello,
+    Hello,
+    requestBody,
+  );
+
+  await assert.rejects(
+    responses[Symbol.asyncIterator]().next(),
+    (error) => error.code === Code.PermissionDenied,
+  );
+});
+
 test("generator emits JavaScript service clients", () => {
   const response = generateBindings(greeterRequest());
   const generatedJavaScript = generatedFile(response, "hello/v1/greeter.trevrpc.js");

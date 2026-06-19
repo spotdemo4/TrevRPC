@@ -679,7 +679,7 @@ impl Server {
         let deadline = request_deadline(request)?;
 
         if let Some(authorizer) = &self.authorizer {
-            authorizer.authorize(request).await?;
+            with_deadline(authorizer.authorize(request), deadline).await??;
         }
 
         Ok(deadline)
@@ -1091,9 +1091,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::{Code, Error, MessageStream, RpcKind, RpcRequest, RpcStreamFrameKind};
+    use crate::{Code, Error, MessageStream, RpcKind, RpcRequest, RpcStreamFrameKind, Status};
 
-    use super::{MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions};
+    use super::{Authorizer, MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions};
 
     #[derive(Clone, Default)]
     struct TestMetrics {
@@ -1106,6 +1106,15 @@ mod tests {
                 .lock()
                 .expect("metrics lock should not be poisoned")
                 .push(event.code);
+        }
+    }
+
+    struct PendingAuthorizer;
+
+    #[crate::async_trait]
+    impl Authorizer for PendingAuthorizer {
+        async fn authorize(&self, _request: &RpcRequest) -> std::result::Result<(), Status> {
+            std::future::pending().await
         }
     }
 
@@ -1157,6 +1166,30 @@ mod tests {
 
         assert_eq!(Code::from_u32(response.status), Code::Unauthenticated);
         assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authorizer_is_bounded_by_rpc_timeout() {
+        let metrics = TestMetrics::default();
+        let finished = Arc::clone(&metrics.finished);
+        let mut server = Server::new();
+        server.set_authorizer(PendingAuthorizer);
+        server.set_metrics(metrics);
+        server.route("example.Greeter", "SayHello", |_| async {
+            Ok(b"hello".to_vec())
+        });
+        let request = RpcRequest::new("example.Greeter", "SayHello", Vec::new())
+            .with_timeout_nanos(1_000_000);
+
+        let response = server.handle_request(request).await;
+
+        assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+        assert_eq!(
+            *finished
+                .lock()
+                .expect("metrics lock should not be poisoned"),
+            vec![Code::DeadlineExceeded]
+        );
     }
 
     #[tokio::test]

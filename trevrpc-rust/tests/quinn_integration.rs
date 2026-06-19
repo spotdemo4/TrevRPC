@@ -794,6 +794,57 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
 }
 
 #[tokio::test]
+async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
+    let started = Arc::new(Notify::new());
+    let started_server = Arc::clone(&started);
+    let server = spawn_greeter_server(move |server| {
+        server.set_options(
+            fast_server_options().with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
+        );
+        server.route(
+            greeter::GreeterClient::<()>::SERVICE,
+            "Never",
+            move |_body| {
+                let started = Arc::clone(&started_server);
+                async move {
+                    started.notify_waiters();
+                    std::future::pending::<trevrpc::Result<Vec<u8>>>().await
+                }
+            },
+        );
+    })?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let call = tokio::spawn(async move {
+        trevrpc::client::unary::<_, _, greeter::HelloReply>(
+            &transport,
+            greeter::GreeterClient::<()>::SERVICE,
+            "Never",
+            &greeter::HelloRequest {
+                name: "shutdown".to_owned(),
+            },
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await
+    });
+
+    tokio::time::timeout(TEST_TIMEOUT, started.notified())
+        .await
+        .expect("pending unary handler should start");
+    server.shutdown().await?;
+    let result = tokio::time::timeout(TEST_TIMEOUT, call)
+        .await
+        .expect("pending client call should finish after shutdown")?;
+    let error = result.expect_err("shutdown should fail the pending RPC");
+    assert!(matches!(
+        error.into_status().code(),
+        Code::Cancelled | Code::Unavailable | Code::DeadlineExceeded
+    ));
+    close_client(endpoint, connection).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn quinn_local_close_maps_to_cancelled() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, client) = connect_client(&server).await?;
