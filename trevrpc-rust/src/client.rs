@@ -224,31 +224,16 @@ where
     Req: Message,
     Res: Message + Default + Send + 'static,
 {
-    let PreparedStreamingCall {
-        request,
-        deadline,
-        max_response_body_size,
-        max_response_messages,
-        max_response_stream_body_size,
-        stream_idle_timeout,
-    } = prepare_streaming_request(
+    let prepared = prepare_streaming_request(
         service,
         method,
         RpcKind::ServerStreaming,
         request.encode_to_vec(),
         options,
     )?;
-    let response =
-        streaming_call_with_deadline(transport, request, crate::stream::empty(), deadline).await?;
+    let response = open_response_stream(transport, prepared, crate::stream::empty()).await?;
 
-    Ok(Box::new(ResponseMessageStream::<Res>::new(
-        response,
-        max_response_body_size,
-        max_response_messages,
-        max_response_stream_body_size,
-        stream_idle_timeout,
-        deadline,
-    )))
+    Ok(Box::new(response))
 }
 
 /// Starts a client-streaming RPC and returns a sendable call object.
@@ -263,14 +248,7 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let PreparedStreamingCall {
-        request,
-        deadline,
-        max_response_body_size,
-        max_response_messages,
-        max_response_stream_body_size,
-        stream_idle_timeout,
-    } = prepare_streaming_request(
+    let prepared = prepare_streaming_request(
         service,
         method,
         RpcKind::ClientStreaming,
@@ -278,25 +256,40 @@ where
         options,
     )?;
     let (sender, receiver) = mpsc::channel(1);
-    let response = streaming_call_with_deadline(
+    let response = open_response_stream(
         transport,
-        request,
+        prepared,
         crate::stream::encode(Box::new(RequestMessageStream { receiver })),
-        deadline,
     )
     .await?;
 
-    Ok(ClientStreamingCall::new(
-        sender,
-        ResponseMessageStream::<Res>::new(
-            response,
-            max_response_body_size,
-            max_response_messages,
-            max_response_stream_body_size,
-            stream_idle_timeout,
-            deadline,
-        ),
-    ))
+    Ok(ClientStreamingCall::new(sender, response))
+}
+
+/// Calls a client-streaming RPC with a caller-provided request stream.
+pub async fn client_streaming_from_stream<T, Req, Res>(
+    transport: &T,
+    service: &str,
+    method: &str,
+    requests: BoxMessageStream<Req>,
+    options: CallOptions,
+) -> Result<Res>
+where
+    T: RpcTransport,
+    Req: Message + Send + 'static,
+    Res: Message + Default + Send + 'static,
+{
+    let prepared = prepare_streaming_request(
+        service,
+        method,
+        RpcKind::ClientStreaming,
+        Vec::new(),
+        options,
+    )?;
+    let mut response =
+        open_response_stream(transport, prepared, crate::stream::encode(requests)).await?;
+
+    read_unary_response_from_message_stream(&mut response).await
 }
 
 /// Starts a bidirectional-streaming RPC and returns a sendable call object.
@@ -311,14 +304,7 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let PreparedStreamingCall {
-        request,
-        deadline,
-        max_response_body_size,
-        max_response_messages,
-        max_response_stream_body_size,
-        stream_idle_timeout,
-    } = prepare_streaming_request(
+    let prepared = prepare_streaming_request(
         service,
         method,
         RpcKind::BidirectionalStreaming,
@@ -326,25 +312,40 @@ where
         options,
     )?;
     let (sender, receiver) = mpsc::channel(1);
-    let response = streaming_call_with_deadline(
+    let response = open_response_stream(
         transport,
-        request,
+        prepared,
         crate::stream::encode(Box::new(RequestMessageStream { receiver })),
-        deadline,
     )
     .await?;
 
-    Ok(BidirectionalStreamingCall::new(
-        sender,
-        ResponseMessageStream::<Res>::new(
-            response,
-            max_response_body_size,
-            max_response_messages,
-            max_response_stream_body_size,
-            stream_idle_timeout,
-            deadline,
-        ),
-    ))
+    Ok(BidirectionalStreamingCall::new(sender, response))
+}
+
+/// Starts a bidirectional-streaming RPC with a caller-provided request stream.
+pub async fn bidirectional_streaming_from_stream<T, Req, Res>(
+    transport: &T,
+    service: &str,
+    method: &str,
+    requests: BoxMessageStream<Req>,
+    options: CallOptions,
+) -> Result<BoxMessageStream<Res>>
+where
+    T: RpcTransport,
+    Req: Message + Send + 'static,
+    Res: Message + Default + Send + 'static,
+{
+    let prepared = prepare_streaming_request(
+        service,
+        method,
+        RpcKind::BidirectionalStreaming,
+        Vec::new(),
+        options,
+    )?;
+    let response =
+        open_response_stream(transport, prepared, crate::stream::encode(requests)).await?;
+
+    Ok(Box::new(response))
 }
 
 struct RequestMessageStream<T> {
@@ -517,6 +518,35 @@ where
         }
         None => transport.streaming_call(request, request_body).await,
     }
+}
+
+async fn open_response_stream<T, Res>(
+    transport: &T,
+    prepared: PreparedStreamingCall,
+    request_body: BoxMessageStream<Vec<u8>>,
+) -> Result<ResponseMessageStream<Res>>
+where
+    T: RpcTransport,
+    Res: Message + Default + Send + 'static,
+{
+    let PreparedStreamingCall {
+        request,
+        deadline,
+        max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
+    } = prepared;
+    let response = streaming_call_with_deadline(transport, request, request_body, deadline).await?;
+
+    Ok(ResponseMessageStream::<Res>::new(
+        response,
+        max_response_body_size,
+        max_response_messages,
+        max_response_stream_body_size,
+        stream_idle_timeout,
+        deadline,
+    ))
 }
 
 #[cfg(test)]
@@ -769,12 +799,14 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        Code, Error, MessageStream, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status,
+        Code, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame,
+        Status,
     };
 
     use super::{
         CallOptions, ResponseMessageStream, RpcTransport, bidirectional_streaming,
-        client_streaming, read_unary_response_from_stream, server_streaming, unary,
+        bidirectional_streaming_from_stream, client_streaming, client_streaming_from_stream,
+        read_unary_response_from_stream, server_streaming, unary,
     };
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -972,6 +1004,95 @@ mod tests {
             .expect_err("pending upload should hit deadline");
 
         assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    }
+
+    #[derive(Clone, Default)]
+    struct CollectingStreamingTransport;
+
+    #[crate::async_trait]
+    impl RpcTransport for CollectingStreamingTransport {
+        async fn call(&self, _request: RpcRequest) -> Result<RpcResponse> {
+            Err(crate::Error::from(Status::unimplemented(
+                "unary not implemented",
+            )))
+        }
+
+        async fn streaming_call(
+            &self,
+            request: RpcRequest,
+            mut request_body: crate::BoxMessageStream<Vec<u8>>,
+        ) -> Result<crate::BoxMessageStream<RpcStreamFrame>> {
+            let mut responses = Vec::new();
+
+            while let Some(body) = request_body.next().await {
+                let body = body?;
+                let message = <TestMessage as prost::Message>::decode(body.as_slice())?;
+                responses.push(RpcStreamFrame::message(prost::Message::encode_to_vec(
+                    &message,
+                )));
+            }
+
+            if request.rpc_kind() == RpcKind::ClientStreaming {
+                let response = TestMessage {
+                    value: responses.len().to_string(),
+                };
+                responses = vec![RpcStreamFrame::message(prost::Message::encode_to_vec(
+                    &response,
+                ))];
+            }
+
+            responses.push(RpcStreamFrame::status(Status::ok()));
+            Ok(crate::stream::from_iter(responses))
+        }
+    }
+
+    #[tokio::test]
+    async fn client_streaming_from_stream_sends_all_requests() {
+        let response = client_streaming_from_stream::<_, TestMessage, TestMessage>(
+            &CollectingStreamingTransport,
+            "example.Greeter",
+            "LotsOfGreetings",
+            crate::stream::from_iter([
+                TestMessage {
+                    value: "one".to_owned(),
+                },
+                TestMessage {
+                    value: "two".to_owned(),
+                },
+            ]),
+            CallOptions::new(),
+        )
+        .await
+        .expect("client-streaming call should succeed");
+
+        assert_eq!(response.value, "2");
+    }
+
+    #[tokio::test]
+    async fn bidirectional_streaming_from_stream_sends_all_requests() {
+        let mut response = bidirectional_streaming_from_stream::<_, TestMessage, TestMessage>(
+            &CollectingStreamingTransport,
+            "example.Greeter",
+            "BidiHello",
+            crate::stream::from_iter([
+                TestMessage {
+                    value: "one".to_owned(),
+                },
+                TestMessage {
+                    value: "two".to_owned(),
+                },
+            ]),
+            CallOptions::new(),
+        )
+        .await
+        .expect("bidi-streaming call should open");
+
+        let mut values = Vec::new();
+        while let Some(message) = response.next().await {
+            values.push(message.expect("response should decode").value);
+        }
+
+        assert_eq!(values, ["one", "two"]);
     }
 
     #[tokio::test]

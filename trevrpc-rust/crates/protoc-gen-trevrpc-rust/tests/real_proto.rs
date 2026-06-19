@@ -43,7 +43,9 @@ fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error
     assert!(content.contains("options: ::trevrpc::client::CallOptions"));
     assert!(content.contains("::trevrpc::client::server_streaming"));
     assert!(content.contains("::trevrpc::client::client_streaming"));
+    assert!(content.contains("::trevrpc::client::client_streaming_from_stream"));
     assert!(content.contains("::trevrpc::client::bidirectional_streaming"));
+    assert!(content.contains("::trevrpc::client::bidirectional_streaming_from_stream"));
     assert!(content.contains("server.route_streaming"));
     assert!(content.contains("::trevrpc::RpcKind::ServerStreaming"));
     assert!(content.contains("::trevrpc::RpcKind::ClientStreaming"));

@@ -879,15 +879,12 @@ async fn grpc_server_streaming_call(client: &mut GrpcGreeterClient<Channel>) -> 
 async fn trevrpc_client_streaming_call(
     client: &greeter::GreeterClient<trevrpc::quinn::Client>,
 ) -> BenchResult<usize> {
-    let mut call = client
-        .lots_of_greetings(trevrpc::client::CallOptions::new())
+    let response = client
+        .lots_of_greetings_from_stream(
+            trevrpc::stream::from_iter(benchmark_requests()),
+            trevrpc::client::CallOptions::new(),
+        )
         .await?;
-
-    for request in benchmark_requests() {
-        call.send(request).await?;
-    }
-
-    let response = call.close_and_recv().await?;
     parse_stream_count(&response.message)
 }
 
@@ -899,17 +896,15 @@ async fn grpc_client_streaming_call(client: &mut GrpcGreeterClient<Channel>) -> 
 async fn trevrpc_bidi_streaming_call(
     client: &greeter::GreeterClient<trevrpc::quinn::Client>,
 ) -> BenchResult<usize> {
-    let mut call = client
-        .bidi_hello(trevrpc::client::CallOptions::new())
+    let mut replies = client
+        .bidi_hello_from_stream(
+            trevrpc::stream::from_iter(benchmark_requests()),
+            trevrpc::client::CallOptions::new(),
+        )
         .await?;
 
-    for request in benchmark_requests() {
-        call.send(request).await?;
-    }
-    call.close_send()?;
-
     let mut count = 0;
-    while let Some(_reply) = call.recv().await? {
+    while let Some(_reply) = replies.next().await.transpose()? {
         count += 1;
     }
 
