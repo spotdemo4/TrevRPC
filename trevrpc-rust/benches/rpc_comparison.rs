@@ -32,6 +32,8 @@ const GRPC_SAY_HELLO_PATH: &str = "/example.greeter.Greeter/SayHello";
 const GRPC_LOTS_OF_REPLIES_PATH: &str = "/example.greeter.Greeter/LotsOfReplies";
 const GRPC_LOTS_OF_GREETINGS_PATH: &str = "/example.greeter.Greeter/LotsOfGreetings";
 const GRPC_BIDI_HELLO_PATH: &str = "/example.greeter.Greeter/BidiHello";
+const BENCHMARK_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+const BENCHMARK_QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -968,7 +970,9 @@ fn make_trevrpc_server_endpoint(
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    trevrpc::quinn::configure_server_config(&mut server_config, options, false);
+    server_config.transport_config(benchmark_transport_config(
+        trevrpc::quinn::transport_limits_from_server_options(options, false),
+    )?);
 
     Ok((
         quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?,
@@ -988,14 +992,23 @@ fn make_trevrpc_client_endpoint(cert_der: CertificateDer<'static>) -> BenchResul
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     let mut client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
-    trevrpc::quinn::configure_client_config(
-        &mut client_config,
-        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-        false,
-    );
+    client_config.transport_config(benchmark_transport_config(
+        trevrpc::quinn::client_transport_limits(trevrpc::framing::DEFAULT_MAX_FRAME_SIZE, false),
+    )?);
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
+}
+
+fn benchmark_transport_config(
+    limits: trevrpc::quinn::TransportLimits,
+) -> BenchResult<Arc<quinn::TransportConfig>> {
+    let mut transport = quinn::TransportConfig::default();
+    trevrpc::quinn::apply_transport_limits(&mut transport, limits);
+    transport.max_idle_timeout(Some(BENCHMARK_QUIC_IDLE_TIMEOUT.try_into()?));
+    transport.keep_alive_interval(Some(BENCHMARK_QUIC_KEEP_ALIVE_INTERVAL));
+
+    Ok(Arc::new(transport))
 }
 
 criterion_group!(benches, rpc_comparison);
