@@ -82,13 +82,13 @@ export class GreeterClient {
   }
 
   /** Calls the LotsOfGreetings RPC. */
-  lotsOfGreetings(request, options = {}) {
-    return this._client.lotsOfGreetings(request, options);
+  lotsOfGreetings(options = {}) {
+    return this._client.lotsOfGreetings(options);
   }
 
   /** Calls the BidiHello RPC. */
-  bidiHello(request, options = {}) {
-    return this._client.bidiHello(request, options);
+  bidiHello(options = {}) {
+    return this._client.bidiHello(options);
   }
 }
 

@@ -330,15 +330,15 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
   try {
     switch (scenario) {
       case "early-ok": {
-        const response = await clientStreaming(
+        const call = await clientStreaming(
           transport,
           service,
           "EarlyOk",
           Message,
           Message,
-          pendingRequests(),
           options,
         );
+        const response = await call.closeAndRecv();
         return { value: response.value };
       }
       case "early-error": {
@@ -348,11 +348,10 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
           "EarlyError",
           Message,
           Message,
-          pendingRequests(),
           options,
         );
         try {
-          await stream[Symbol.asyncIterator]().next();
+          await stream.recv();
         } catch (error) {
           return { code: error.code, message: error.statusMessage };
         }
@@ -416,9 +415,12 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
           "BidiEchoMany",
           Message,
           Message,
-          sequenceRequests("echo", 256),
           options,
         );
+        for await (const request of sequenceRequests("echo", 256)) {
+          await stream.send(request);
+        }
+        await stream.closeSend();
         const values = [];
         for await (const response of stream) {
           values.push(response.value);
@@ -450,21 +452,6 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
     }
   } finally {
     transport.close({ closeCode: 0, reason: "browser lifecycle scenario complete" });
-  }
-
-  function pendingRequests() {
-    return {
-      [Symbol.asyncIterator]() {
-        return {
-          next() {
-            return new Promise(() => {});
-          },
-          return() {
-            return Promise.resolve({ done: true, value: undefined });
-          },
-        };
-      },
-    };
   }
 
   function sequenceRequests(prefix, count) {

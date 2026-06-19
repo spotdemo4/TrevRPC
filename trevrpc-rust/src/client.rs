@@ -9,6 +9,7 @@ use crate::{
     RpcStreamFrameKind, Status,
 };
 use prost::Message;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {
@@ -250,14 +251,13 @@ where
     )))
 }
 
-/// Calls a client-streaming RPC and decodes the final protobuf response.
+/// Starts a client-streaming RPC and returns a sendable call object.
 pub async fn client_streaming<T, Req, Res>(
     transport: &T,
     service: &str,
     method: &str,
-    requests: BoxMessageStream<Req>,
     options: CallOptions,
-) -> Result<Res>
+) -> Result<ClientStreamingCall<Req, Res>>
 where
     T: RpcTransport,
     Req: Message + Send + 'static,
@@ -277,33 +277,35 @@ where
         Vec::new(),
         options,
     )?;
+    let (sender, receiver) = mpsc::channel(1);
     let response = streaming_call_with_deadline(
         transport,
         request,
-        crate::stream::encode(requests),
+        crate::stream::encode(Box::new(RequestMessageStream { receiver })),
         deadline,
     )
     .await?;
 
-    read_unary_response_from_stream(
-        response,
-        max_response_body_size,
-        max_response_messages,
-        max_response_stream_body_size,
-        stream_idle_timeout,
-        deadline,
-    )
-    .await
+    Ok(ClientStreamingCall::new(
+        sender,
+        ResponseMessageStream::<Res>::new(
+            response,
+            max_response_body_size,
+            max_response_messages,
+            max_response_stream_body_size,
+            stream_idle_timeout,
+            deadline,
+        ),
+    ))
 }
 
-/// Calls a bidirectional-streaming RPC and returns a decoded response stream.
+/// Starts a bidirectional-streaming RPC and returns a sendable call object.
 pub async fn bidirectional_streaming<T, Req, Res>(
     transport: &T,
     service: &str,
     method: &str,
-    requests: BoxMessageStream<Req>,
     options: CallOptions,
-) -> Result<BoxMessageStream<Res>>
+) -> Result<BidirectionalStreamingCall<Req, Res>>
 where
     T: RpcTransport,
     Req: Message + Send + 'static,
@@ -323,22 +325,128 @@ where
         Vec::new(),
         options,
     )?;
+    let (sender, receiver) = mpsc::channel(1);
     let response = streaming_call_with_deadline(
         transport,
         request,
-        crate::stream::encode(requests),
+        crate::stream::encode(Box::new(RequestMessageStream { receiver })),
         deadline,
     )
     .await?;
 
-    Ok(Box::new(ResponseMessageStream::<Res>::new(
-        response,
-        max_response_body_size,
-        max_response_messages,
-        max_response_stream_body_size,
-        stream_idle_timeout,
-        deadline,
-    )))
+    Ok(BidirectionalStreamingCall::new(
+        sender,
+        ResponseMessageStream::<Res>::new(
+            response,
+            max_response_body_size,
+            max_response_messages,
+            max_response_stream_body_size,
+            stream_idle_timeout,
+            deadline,
+        ),
+    ))
+}
+
+struct RequestMessageStream<T> {
+    receiver: mpsc::Receiver<T>,
+}
+
+#[crate::async_trait]
+impl<T> MessageStream<T> for RequestMessageStream<T>
+where
+    T: Send + 'static,
+{
+    async fn next(&mut self) -> Option<Result<T>> {
+        self.receiver.recv().await.map(Ok)
+    }
+}
+
+pub struct ClientStreamingCall<Req, Res> {
+    sender: Option<mpsc::Sender<Req>>,
+    response: ResponseMessageStream<Res>,
+}
+
+impl<Req, Res> ClientStreamingCall<Req, Res> {
+    const fn new(sender: mpsc::Sender<Req>, response: ResponseMessageStream<Res>) -> Self {
+        Self {
+            sender: Some(sender),
+            response,
+        }
+    }
+}
+
+impl<Req, Res> ClientStreamingCall<Req, Res>
+where
+    Req: Send + 'static,
+    Res: Message + Default + Send + 'static,
+{
+    pub async fn send(&mut self, request: Req) -> Result<()> {
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::from(Status::cancelled("request stream is closed")))?
+            .send(request)
+            .await
+            .map_err(|_| Error::from(Status::cancelled("request stream is closed")))
+    }
+
+    pub fn close_send(&mut self) -> Result<()> {
+        self.sender.take();
+        Ok(())
+    }
+
+    pub async fn close_and_recv(mut self) -> Result<Res> {
+        self.close_send()?;
+        read_unary_response_from_message_stream(&mut self.response).await
+    }
+}
+
+pub struct BidirectionalStreamingCall<Req, Res> {
+    sender: Option<mpsc::Sender<Req>>,
+    response: ResponseMessageStream<Res>,
+}
+
+impl<Req, Res> BidirectionalStreamingCall<Req, Res> {
+    const fn new(sender: mpsc::Sender<Req>, response: ResponseMessageStream<Res>) -> Self {
+        Self {
+            sender: Some(sender),
+            response,
+        }
+    }
+}
+
+impl<Req, Res> BidirectionalStreamingCall<Req, Res>
+where
+    Req: Send + 'static,
+    Res: Message + Default + Send + 'static,
+{
+    pub async fn send(&mut self, request: Req) -> Result<()> {
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::from(Status::cancelled("request stream is closed")))?
+            .send(request)
+            .await
+            .map_err(|_| Error::from(Status::cancelled("request stream is closed")))
+    }
+
+    pub async fn recv(&mut self) -> Result<Option<Res>> {
+        self.response.next().await.transpose()
+    }
+
+    pub fn close_send(&mut self) -> Result<()> {
+        self.sender.take();
+        Ok(())
+    }
+}
+
+#[crate::async_trait]
+impl<Req, Res> MessageStream<Res> for BidirectionalStreamingCall<Req, Res>
+where
+    Req: Send + 'static,
+    Res: Message + Default + Send + 'static,
+{
+    async fn next(&mut self) -> Option<Result<Res>> {
+        self.response.next().await
+    }
 }
 
 struct PreparedStreamingCall {
@@ -411,6 +519,7 @@ where
     }
 }
 
+#[cfg(test)]
 async fn read_unary_response_from_stream<Res>(
     response: BoxMessageStream<RpcStreamFrame>,
     max_response_body_size: usize,
@@ -430,6 +539,15 @@ where
         stream_idle_timeout,
         deadline,
     );
+    read_unary_response_from_message_stream(&mut response).await
+}
+
+async fn read_unary_response_from_message_stream<Res>(
+    response: &mut ResponseMessageStream<Res>,
+) -> Result<Res>
+where
+    Res: Message + Default + Send + 'static,
+{
     let Some(first) = response.next().await else {
         return Err(Error::from(Status::internal(
             "response stream ended without a response message",
@@ -647,7 +765,6 @@ fn validate_response_metadata(response: &RpcResponse) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -837,66 +954,43 @@ mod tests {
         }
     }
 
-    struct DropTrackedPendingStream {
-        dropped: Arc<AtomicBool>,
-    }
-
-    #[crate::async_trait]
-    impl MessageStream<TestMessage> for DropTrackedPendingStream {
-        async fn next(&mut self) -> Option<Result<TestMessage>> {
-            std::future::pending().await
-        }
-    }
-
-    impl Drop for DropTrackedPendingStream {
-        fn drop(&mut self) {
-            self.dropped.store(true, Ordering::SeqCst);
-        }
-    }
-
     #[tokio::test]
     async fn client_streaming_deadline_drops_pending_upload() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let error = client_streaming::<_, _, TestMessage>(
+        let call = client_streaming::<_, TestMessage, TestMessage>(
             &UploadWaitingTransport,
             "example.Greeter",
             "LotsOfGreetings",
-            Box::new(DropTrackedPendingStream {
-                dropped: Arc::clone(&dropped),
-            }),
-            CallOptions::new().with_timeout(Duration::from_millis(1)),
-        )
-        .await
-        .expect_err("pending upload should hit deadline");
-
-        assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
-        assert!(dropped.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn bidirectional_streaming_deadline_cancels_pending_response_read() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let mut responses = bidirectional_streaming::<_, _, TestMessage>(
-            &UploadWaitingTransport,
-            "example.Greeter",
-            "BidiHello",
-            Box::new(DropTrackedPendingStream {
-                dropped: Arc::clone(&dropped),
-            }),
             CallOptions::new().with_timeout(Duration::from_millis(1)),
         )
         .await
         .expect("stream should open");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let error = call
+            .close_and_recv()
+            .await
+            .expect_err("pending upload should hit deadline");
+
+        assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    }
+
+    #[tokio::test]
+    async fn bidirectional_streaming_deadline_cancels_pending_response_read() {
+        let mut responses = bidirectional_streaming::<_, TestMessage, TestMessage>(
+            &UploadWaitingTransport,
+            "example.Greeter",
+            "BidiHello",
+            CallOptions::new().with_timeout(Duration::from_millis(1)),
+        )
+        .await
+        .expect("stream should open");
+        tokio::time::sleep(Duration::from_millis(2)).await;
 
         let error = responses
-            .next()
+            .recv()
             .await
-            .expect("deadline error should be emitted")
             .expect_err("pending response should hit deadline");
         assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
-
-        drop(responses);
-        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

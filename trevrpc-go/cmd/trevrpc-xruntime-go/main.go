@@ -179,19 +179,30 @@ func runClient(addr, certPath, token string) error {
 		return err
 	}
 
-	summary, err := client.LotsOfGreetings(ctx, trevrpc.FromSlice(
-		&greeter.HelloRequest{Name: "left"},
-		&greeter.HelloRequest{Name: "right"},
-	))
+	greetings, err := client.LotsOfGreetings(ctx)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"left", "right"} {
+		if err := greetings.Send(&greeter.HelloRequest{Name: name}); err != nil {
+			return err
+		}
+	}
+	summary, err := greetings.CloseAndRecv()
 	if err != nil || summary.Message != "left,right" {
 		return fmt.Errorf("LotsOfGreetings = %#v, %v", summary, err)
 	}
 
-	bidi, err := client.BidiHello(ctx, trevrpc.FromSlice(
-		&greeter.HelloRequest{Name: "one"},
-		&greeter.HelloRequest{Name: "two"},
-	))
+	bidi, err := client.BidiHello(ctx)
 	if err != nil {
+		return err
+	}
+	for _, name := range []string{"one", "two"} {
+		if err := bidi.Send(&greeter.HelloRequest{Name: name}); err != nil {
+			return err
+		}
+	}
+	if err := bidi.CloseSend(); err != nil {
 		return err
 	}
 	if err := expectGoStream(bidi, []string{"echo, one", "echo, two"}); err != nil {

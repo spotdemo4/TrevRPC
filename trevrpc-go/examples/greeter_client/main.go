@@ -69,32 +69,47 @@ func main() {
 		log.Printf("LotsOfReplies: %s", reply.Message)
 	}
 
-	summary, err := client.LotsOfGreetings(ctx, trevrpc.FromSlice(
-		&greeter.HelloRequest{Name: name + " client stream 1"},
-		&greeter.HelloRequest{Name: name + " client stream 2"},
-	))
+	greetings, err := client.LotsOfGreetings(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, suffix := range []string{"client stream 1", "client stream 2"} {
+		if err := greetings.Send(&greeter.HelloRequest{Name: name + " " + suffix}); err != nil {
+			log.Fatal(err)
+		}
+	}
+	summary, err := greetings.CloseAndRecv()
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("LotsOfGreetings: %s", summary.Message)
 
-	bidiReplies, err := client.BidiHello(ctx, trevrpc.FromSlice(
-		&greeter.HelloRequest{Name: name + " bidi 1"},
-		&greeter.HelloRequest{Name: name + " bidi 2"},
-	))
+	bidi, err := client.BidiHello(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	for {
-		reply, err := bidiReplies.Recv()
-		if err == io.EOF {
-			break
+	defer bidi.Close()
+
+	for _, suffix := range []string{"bidi 1", "bidi 2"} {
+		if err := bidi.Send(&greeter.HelloRequest{Name: name + " " + suffix}); err != nil {
+			log.Fatal(err)
 		}
+
+		reply, err := bidi.Recv()
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		log.Printf("BidiHello: %s", reply.Message)
+	}
+	if err := bidi.CloseSend(); err != nil {
+		log.Fatal(err)
+	}
+	if reply, err := bidi.Recv(); err != io.EOF {
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Fatalf("unexpected extra BidiHello reply: %s", reply.Message)
 	}
 }
 

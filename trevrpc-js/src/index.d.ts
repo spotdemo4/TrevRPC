@@ -243,9 +243,34 @@ export interface Transport {
   ): Promise<AsyncIterable<RpcStreamFrameMessage>>;
 }
 
+export interface ClientStreamingCall<TRequest extends object, TResponse> {
+  /** Sends one request message. */
+  send(request: TRequest): Promise<void>;
+  /** Closes the request stream. */
+  closeSend(): Promise<void>;
+  /** Closes the request stream and returns the final response. */
+  closeAndRecv(): Promise<TResponse>;
+  /** Releases call resources without waiting for the response. */
+  close(): Promise<void>;
+}
+
+export interface BidirectionalStreamingCall<
+  TRequest extends object,
+  TResponse,
+> extends AsyncIterable<TResponse> {
+  /** Sends one request message. */
+  send(request: TRequest): Promise<void>;
+  /** Receives one response message, or undefined after the response stream completes. */
+  recv(): Promise<TResponse | undefined>;
+  /** Closes the request stream while keeping the response stream readable. */
+  closeSend(): Promise<void>;
+  /** Releases call resources without waiting for more responses. */
+  close(): Promise<void>;
+}
+
 export type ServiceClient = Record<
   string,
-  (requestOrRequests: unknown, options?: CallOptions) => Promise<unknown>
+  (requestOrOptions?: unknown, options?: CallOptions) => Promise<unknown>
 >;
 
 /** Returns the default client call options. */
@@ -278,7 +303,7 @@ export function serverStreaming<
   request: TRequest,
   options?: CallOptions,
 ): Promise<AsyncIterable<TResponse>>;
-/** Calls a client-streaming RPC and decodes the final protobuf response. */
+/** Calls a client-streaming RPC and returns a sendable call object. */
 export function clientStreaming<
   TRequest extends object = Record<string, unknown>,
   TResponse = Message<Record<string, unknown>>,
@@ -288,10 +313,9 @@ export function clientStreaming<
   method: string,
   requestType: Type,
   responseType: Type,
-  requests: AsyncIterable<TRequest>,
   options?: CallOptions,
-): Promise<TResponse>;
-/** Calls a bidirectional-streaming RPC and returns a decoded response stream. */
+): Promise<ClientStreamingCall<TRequest, TResponse>>;
+/** Calls a bidirectional-streaming RPC and returns a sendable call object. */
 export function bidirectionalStreaming<
   TRequest extends object = Record<string, unknown>,
   TResponse = Message<Record<string, unknown>>,
@@ -301,9 +325,8 @@ export function bidirectionalStreaming<
   method: string,
   requestType: Type,
   responseType: Type,
-  requests: AsyncIterable<TRequest>,
   options?: CallOptions,
-): Promise<AsyncIterable<TResponse>>;
+): Promise<BidirectionalStreamingCall<TRequest, TResponse>>;
 /** Creates a service client from a generated service descriptor. */
 export function createServiceClient<TClient extends ServiceClient = ServiceClient>(
   transport: Transport,

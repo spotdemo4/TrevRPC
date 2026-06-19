@@ -43,36 +43,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("server-streaming: {}", reply?.message);
     }
 
-    let summary = client
-        .lots_of_greetings(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: format!("{name} client stream 1"),
-                },
-                greeter::HelloRequest {
-                    name: format!("{name} client stream 2"),
-                },
-            ]),
-            call_options(),
-        )
-        .await?;
+    let mut greetings = client.lots_of_greetings(call_options()).await?;
+    for suffix in ["client stream 1", "client stream 2"] {
+        greetings
+            .send(greeter::HelloRequest {
+                name: format!("{name} {suffix}"),
+            })
+            .await?;
+    }
+    let summary = greetings.close_and_recv().await?;
     println!("client-streaming: {}", summary.message);
 
-    let mut replies = client
-        .bidi_hello(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: format!("{name} bidi 1"),
-                },
-                greeter::HelloRequest {
-                    name: format!("{name} bidi 2"),
-                },
-            ]),
-            call_options(),
-        )
-        .await?;
-    while let Some(reply) = replies.next().await {
-        println!("bidi: {}", reply?.message);
+    let mut replies = client.bidi_hello(call_options()).await?;
+    for suffix in ["bidi 1", "bidi 2"] {
+        replies
+            .send(greeter::HelloRequest {
+                name: format!("{name} {suffix}"),
+            })
+            .await?;
+
+        let reply = replies.recv().await?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "bidi stream ended early")
+        })?;
+        println!("bidi: {}", reply.message);
+    }
+    replies.close_send()?;
+    while let Some(reply) = replies.recv().await? {
+        println!("bidi: {}", reply.message);
     }
 
     connection.close(0_u32.into(), b"client done");

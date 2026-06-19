@@ -366,35 +366,33 @@ async fn exercise_rust_client(
         .await?;
     assert_stream(replies, ["hello, server", "goodbye, server"]).await?;
 
-    let summary = client
-        .lots_of_greetings(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: "left".to_owned(),
-                },
-                greeter::HelloRequest {
-                    name: "right".to_owned(),
-                },
-            ]),
-            call_options(),
-        )
-        .await?;
+    let mut greetings = client.lots_of_greetings(call_options()).await?;
+    for name in ["left", "right"] {
+        greetings
+            .send(greeter::HelloRequest {
+                name: name.to_owned(),
+            })
+            .await?;
+    }
+    let summary = greetings.close_and_recv().await?;
     assert_eq!(summary.message, "left,right");
 
-    let replies = client
-        .bidi_hello(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: "one".to_owned(),
-                },
-                greeter::HelloRequest {
-                    name: "two".to_owned(),
-                },
-            ]),
-            call_options(),
-        )
-        .await?;
-    assert_stream(replies, ["echo, one", "echo, two"]).await
+    let mut replies = client.bidi_hello(call_options()).await?;
+    for name in ["one", "two"] {
+        replies
+            .send(greeter::HelloRequest {
+                name: name.to_owned(),
+            })
+            .await?;
+        let reply = replies
+            .recv()
+            .await?
+            .expect("bidi stream should yield reply");
+        assert_eq!(reply.message, format!("echo, {name}"));
+    }
+    replies.close_send()?;
+    assert!(replies.recv().await?.is_none());
+    Ok(())
 }
 
 async fn assert_stream<const N: usize>(

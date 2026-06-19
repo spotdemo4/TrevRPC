@@ -376,7 +376,7 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
     buf.push_str(&format!("    /// Calls the `{}` RPC.\n", method.proto_name));
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
-            "    pub async fn {}(\n        &self,\n        requests: {runtime_path}::BoxMessageStream<{}>,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            "    pub async fn {}(\n        &self,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::client::BidirectionalStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n",
             method.name,
             method.input_type,
             method.output_type,
@@ -384,7 +384,7 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
         ));
     } else if method.client_streaming {
         buf.push_str(&format!(
-            "    pub async fn {}(\n        &self,\n        requests: {runtime_path}::BoxMessageStream<{}>,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            "    pub async fn {}(\n        &self,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n",
             method.name,
             method.input_type,
             method.output_type,
@@ -643,7 +643,15 @@ mod tests {
         assert!(generated.contains("BoxMessageStream<HelloReply>"));
         assert!(generated.contains("::trevrpc::client::server_streaming"));
         assert!(generated.contains("::trevrpc::client::client_streaming"));
+        assert!(
+            generated.contains("::trevrpc::client::ClientStreamingCall<HelloRequest, HelloReply>")
+        );
         assert!(generated.contains("::trevrpc::client::bidirectional_streaming"));
+        assert!(
+            generated.contains(
+                "::trevrpc::client::BidirectionalStreamingCall<HelloRequest, HelloReply>"
+            )
+        );
         assert!(generated.contains("server.route_streaming"));
         assert!(generated.contains("::trevrpc::RpcKind::ServerStreaming"));
         assert!(generated.contains("::trevrpc::RpcKind::ClientStreaming"));

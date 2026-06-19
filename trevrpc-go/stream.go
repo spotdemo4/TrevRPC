@@ -1,6 +1,10 @@
 package trevrpc
 
-import "io"
+import (
+	"context"
+	"io"
+	"sync"
+)
 
 // MessageStream yields messages until Recv returns io.EOF.
 type MessageStream[T any] interface {
@@ -15,6 +19,88 @@ type ByteStream = MessageStream[[]byte]
 
 // FrameStream is a stream of TrevRPC stream frames.
 type FrameStream = MessageStream[*RpcStreamFrame]
+
+// MessagePipe is a sendable message stream.
+type MessagePipe[T any] struct {
+	ctx       context.Context
+	messages  chan T
+	done      chan struct{}
+	closeOnce sync.Once
+	errMu     sync.Mutex
+	err       error
+}
+
+// NewMessagePipe returns a stream that yields messages sent with Send until closed.
+func NewMessagePipe[T any](ctx context.Context) *MessagePipe[T] {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	return &MessagePipe[T]{ctx: ctx, messages: make(chan T), done: make(chan struct{})}
+}
+
+// Send adds one message to the stream.
+func (s *MessagePipe[T]) Send(message T) error {
+	select {
+	case <-s.done:
+		return s.closedError()
+	default:
+	}
+
+	select {
+	case s.messages <- message:
+		return nil
+	case <-s.done:
+		return s.closedError()
+	case <-s.ctx.Done():
+		return statusFromContextError(s.ctx.Err())
+	}
+}
+
+func (s *MessagePipe[T]) Recv() (T, error) {
+	select {
+	case message := <-s.messages:
+		return message, nil
+	case <-s.done:
+		var zero T
+		if err := s.closeError(); err != nil {
+			return zero, err
+		}
+		return zero, io.EOF
+	case <-s.ctx.Done():
+		var zero T
+		return zero, statusFromContextError(s.ctx.Err())
+	}
+}
+
+// Close completes the stream successfully.
+func (s *MessagePipe[T]) Close() error {
+	return s.CloseWithError(nil)
+}
+
+// CloseWithError completes the stream with err.
+func (s *MessagePipe[T]) CloseWithError(err error) error {
+	s.closeOnce.Do(func() {
+		s.errMu.Lock()
+		s.err = err
+		s.errMu.Unlock()
+		close(s.done)
+	})
+	return nil
+}
+
+func (s *MessagePipe[T]) closeError() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.err
+}
+
+func (s *MessagePipe[T]) closedError() error {
+	if err := s.closeError(); err != nil {
+		return err
+	}
+	return io.ErrClosedPipe
+}
 
 type emptyStream[T any] struct{}
 

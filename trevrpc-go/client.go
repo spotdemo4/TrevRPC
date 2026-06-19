@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -14,6 +15,28 @@ type Transport interface {
 	Call(context.Context, *RpcRequest) (*RpcResponse, error)
 	// StreamingCall sends a streaming RPC request and returns response frames.
 	StreamingCall(context.Context, *RpcRequest, ByteStream) (FrameStream, error)
+}
+
+// ClientStreamingCall sends request messages and receives the final response.
+type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
+	// Send sends one request message.
+	Send(Req) error
+	// CloseAndRecv closes the request stream and returns the unary response.
+	CloseAndRecv() (Res, error)
+	// Close releases call resources without waiting for a response.
+	Close() error
+}
+
+// BidirectionalStreamingCall sends request messages and receives response messages.
+type BidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
+	// Send sends one request message.
+	Send(Req) error
+	// Recv receives one response message or io.EOF after the response stream completes.
+	Recv() (Res, error)
+	// CloseSend closes the request stream while keeping the response stream readable.
+	CloseSend() error
+	// Close releases call resources without waiting for more responses.
+	Close() error
 }
 
 // CallOptions controls client-side timeouts, response limits, and request metadata.
@@ -190,29 +213,32 @@ func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 	return newResponseMessageStream(response, newResponse, callOptions, ctx, cancel), nil
 }
 
-// ClientStreaming calls a client-streaming RPC and decodes the final protobuf response.
-func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (Res, error) {
+// ClientStreaming starts a client-streaming RPC.
+func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (ClientStreamingCall[Req, Res], error) {
 	callOptions := applyCallOptions(options)
 	rpcRequest, err := prepareClientRequest(service, method, RpcKindClientStreaming, nil, callOptions)
 	if err != nil {
-		var zero Res
-		return zero, err
+		return nil, err
 	}
 
 	ctx, cancel := callContext(ctx, callOptions)
-	defer cancel()
+	requests := NewMessagePipe[Req](ctx)
 
 	response, err := transport.StreamingCall(ctx, rpcRequest, EncodeStream(requests))
 	if err != nil {
-		var zero Res
-		return zero, err
+		cancel()
+		return nil, err
 	}
 
-	return readUnaryResponseFromStream(response, newResponse, callOptions, ctx)
+	return &clientStreamingCall[Req, Res]{
+		requests:  requests,
+		responses: newResponseMessageStream(response, newResponse, callOptions, ctx, cancel),
+		cancel:    cancel,
+	}, nil
 }
 
-// BidirectionalStreaming calls a bidirectional-streaming RPC and returns a decoded response stream.
-func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
+// BidirectionalStreaming starts a bidirectional-streaming RPC.
+func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (BidirectionalStreamingCall[Req, Res], error) {
 	callOptions := applyCallOptions(options)
 	rpcRequest, err := prepareClientRequest(service, method, RpcKindBidirectionalStreaming, nil, callOptions)
 	if err != nil {
@@ -220,13 +246,62 @@ func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Cont
 	}
 
 	ctx, cancel := callContext(ctx, callOptions)
+	requests := NewMessagePipe[Req](ctx)
 	response, err := transport.StreamingCall(ctx, rpcRequest, EncodeStream(requests))
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	return newResponseMessageStream(response, newResponse, callOptions, ctx, cancel), nil
+	return &bidirectionalStreamingCall[Req, Res]{
+		requests:  requests,
+		responses: newResponseMessageStream(response, newResponse, callOptions, ctx, cancel),
+	}, nil
+}
+
+type clientStreamingCall[Req ProtoMessage, Res ProtoMessage] struct {
+	requests  *MessagePipe[Req]
+	responses MessageStream[Res]
+	cancel    context.CancelFunc
+}
+
+func (c *clientStreamingCall[Req, Res]) Send(request Req) error {
+	return c.requests.Send(request)
+}
+
+func (c *clientStreamingCall[Req, Res]) CloseAndRecv() (Res, error) {
+	if err := c.requests.Close(); err != nil {
+		var zero Res
+		return zero, err
+	}
+
+	return readUnaryResponseFromMessageStream(c.responses)
+}
+
+func (c *clientStreamingCall[Req, Res]) Close() error {
+	c.cancel()
+	return errors.Join(c.requests.Close(), closeMessageStream(c.responses))
+}
+
+type bidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] struct {
+	requests  *MessagePipe[Req]
+	responses MessageStream[Res]
+}
+
+func (c *bidirectionalStreamingCall[Req, Res]) Send(request Req) error {
+	return c.requests.Send(request)
+}
+
+func (c *bidirectionalStreamingCall[Req, Res]) Recv() (Res, error) {
+	return c.responses.Recv()
+}
+
+func (c *bidirectionalStreamingCall[Req, Res]) CloseSend() error {
+	return c.requests.Close()
+}
+
+func (c *bidirectionalStreamingCall[Req, Res]) Close() error {
+	return errors.Join(c.requests.Close(), closeMessageStream(c.responses))
 }
 
 func applyCallOptions(options []CallOption) CallOptions {
@@ -455,8 +530,7 @@ func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout t
 	}
 }
 
-func readUnaryResponseFromStream[Res ProtoMessage](stream FrameStream, newResponse func() Res, options CallOptions, ctx context.Context) (Res, error) {
-	responses := newResponseMessageStream(stream, newResponse, options, ctx, func() {})
+func readUnaryResponseFromMessageStream[Res ProtoMessage](responses MessageStream[Res]) (Res, error) {
 	first, err := responses.Recv()
 	if err != nil {
 		var zero Res

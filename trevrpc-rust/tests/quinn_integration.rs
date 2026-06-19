@@ -2,7 +2,6 @@
 
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -110,78 +109,6 @@ impl MessageStream<greeter::HelloReply> for BidiReplies {
                 message: format!("echo, {}", request.name),
             })
         })
-    }
-}
-
-#[derive(Clone, Default)]
-struct DropSignal {
-    dropped: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-}
-
-impl DropSignal {
-    fn mark_dropped(&self) {
-        self.dropped.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self) {
-        if !self.dropped.load(Ordering::SeqCst) {
-            tokio::time::timeout(TEST_TIMEOUT, self.notify.notified())
-                .await
-                .expect("request stream should be dropped");
-        }
-
-        assert!(self.dropped.load(Ordering::SeqCst));
-    }
-}
-
-struct PendingGreeterRequests {
-    dropped: DropSignal,
-}
-
-impl PendingGreeterRequests {
-    const fn new(dropped: DropSignal) -> Self {
-        Self { dropped }
-    }
-}
-
-#[trevrpc::async_trait]
-impl MessageStream<greeter::HelloRequest> for PendingGreeterRequests {
-    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloRequest>> {
-        std::future::pending().await
-    }
-}
-
-impl Drop for PendingGreeterRequests {
-    fn drop(&mut self) {
-        self.dropped.mark_dropped();
-    }
-}
-
-struct FirstThenErrorGreeterRequests {
-    sent: bool,
-}
-
-impl FirstThenErrorGreeterRequests {
-    fn new() -> Self {
-        Self { sent: false }
-    }
-}
-
-#[trevrpc::async_trait]
-impl MessageStream<greeter::HelloRequest> for FirstThenErrorGreeterRequests {
-    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloRequest>> {
-        if !self.sent {
-            self.sent = true;
-            return Some(Ok(greeter::HelloRequest {
-                name: "uploaded".to_owned(),
-            }));
-        }
-
-        Some(Err(trevrpc::Error::from(Status::invalid_argument(
-            "local upload failed",
-        ))))
     }
 }
 
@@ -365,38 +292,10 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
     }
     assert_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
 
-    let summary = client
-        .lots_of_greetings(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: "one".to_owned(),
-                },
-                greeter::HelloRequest {
-                    name: "two".to_owned(),
-                },
-            ]),
-            authenticated_options(),
-        )
-        .await?;
+    let summary = run_client_greetings(&client, &["one", "two"], authenticated_options()).await?;
     assert_eq!(summary.message, "one,two");
 
-    let mut replies = client
-        .bidi_hello(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: "left".to_owned(),
-                },
-                greeter::HelloRequest {
-                    name: "right".to_owned(),
-                },
-            ]),
-            authenticated_options(),
-        )
-        .await?;
-    let mut messages = Vec::new();
-    while let Some(reply) = replies.next().await {
-        messages.push(reply?.message);
-    }
+    let messages = run_bidi_greetings(&client, &["left", "right"], authenticated_options()).await?;
     assert_eq!(messages, ["echo, left", "echo, right"]);
 
     close_client(endpoint, connection).await;
@@ -434,38 +333,10 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
     }
     assert_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
 
-    let summary = client
-        .lots_of_greetings(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: "one".to_owned(),
-                },
-                greeter::HelloRequest {
-                    name: "two".to_owned(),
-                },
-            ]),
-            authenticated_options(),
-        )
-        .await?;
+    let summary = run_client_greetings(&client, &["one", "two"], authenticated_options()).await?;
     assert_eq!(summary.message, "one,two");
 
-    let mut replies = client
-        .bidi_hello(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: "left".to_owned(),
-                },
-                greeter::HelloRequest {
-                    name: "right".to_owned(),
-                },
-            ]),
-            authenticated_options(),
-        )
-        .await?;
-    let mut messages = Vec::new();
-    while let Some(reply) = replies.next().await {
-        messages.push(reply?.message);
-    }
+    let messages = run_bidi_greetings(&client, &["left", "right"], authenticated_options()).await?;
     assert_eq!(messages, ["echo, left", "echo, right"]);
 
     close_webtransport_client(endpoint, connection).await;
@@ -599,18 +470,17 @@ async fn quinn_request_stream_limits_return_resource_exhausted() -> TestResult {
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
 
-    let error = client
-        .lots_of_greetings(
-            trevrpc::stream::from_iter([
-                greeter::HelloRequest {
-                    name: "one".to_owned(),
-                },
-                greeter::HelloRequest {
-                    name: "two".to_owned(),
-                },
-            ]),
-            authenticated_options(),
-        )
+    let mut call = client.lots_of_greetings(authenticated_options()).await?;
+    call.send(greeter::HelloRequest {
+        name: "one".to_owned(),
+    })
+    .await?;
+    call.send(greeter::HelloRequest {
+        name: "two".to_owned(),
+    })
+    .await?;
+    let error = call
+        .close_and_recv()
         .await
         .expect_err("request stream should exceed message limit");
 
@@ -889,21 +759,20 @@ async fn webtransport_server_streaming_deadline_while_response_pending() -> Test
 
 #[tokio::test]
 async fn quinn_client_streaming_deadline_drops_pending_upload() -> TestResult {
-    let dropped = DropSignal::default();
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
 
-    let error = client
-        .lots_of_greetings(
-            Box::new(PendingGreeterRequests::new(dropped.clone())),
-            short_authenticated_options(),
-        )
+    let call = client
+        .lots_of_greetings(short_authenticated_options())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let error = call
+        .close_and_recv()
         .await
         .expect_err("pending upload should hit deadline");
     assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
-    dropped.wait().await;
 
     close_client(endpoint, connection).await;
     server.shutdown().await
@@ -911,21 +780,20 @@ async fn quinn_client_streaming_deadline_drops_pending_upload() -> TestResult {
 
 #[tokio::test]
 async fn webtransport_client_streaming_deadline_drops_pending_upload() -> TestResult {
-    let dropped = DropSignal::default();
     let server = spawn_webtransport_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
 
-    let error = greeter_client
-        .lots_of_greetings(
-            Box::new(PendingGreeterRequests::new(dropped.clone())),
-            short_authenticated_options(),
-        )
+    let call = greeter_client
+        .lots_of_greetings(short_authenticated_options())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let error = call
+        .close_and_recv()
         .await
         .expect_err("pending upload should hit deadline");
     assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
-    dropped.wait().await;
 
     close_webtransport_client(client, session).await;
     server.shutdown().await
@@ -933,26 +801,18 @@ async fn webtransport_client_streaming_deadline_drops_pending_upload() -> TestRe
 
 #[tokio::test]
 async fn quinn_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
-    let dropped = DropSignal::default();
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
 
-    let mut replies = client
-        .bidi_hello(
-            Box::new(PendingGreeterRequests::new(dropped.clone())),
-            short_authenticated_options(),
-        )
-        .await?;
+    let mut replies = client.bidi_hello(short_authenticated_options()).await?;
+    tokio::time::sleep(Duration::from_millis(60)).await;
     let error = replies
-        .next()
+        .recv()
         .await
-        .expect("deadline error should be emitted")
         .expect_err("pending bidi response should hit deadline");
     assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
-    drop(replies);
-    dropped.wait().await;
 
     close_client(endpoint, connection).await;
     server.shutdown().await
@@ -960,26 +820,20 @@ async fn quinn_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
 
 #[tokio::test]
 async fn webtransport_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
-    let dropped = DropSignal::default();
     let server = spawn_webtransport_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
 
     let mut replies = greeter_client
-        .bidi_hello(
-            Box::new(PendingGreeterRequests::new(dropped.clone())),
-            short_authenticated_options(),
-        )
+        .bidi_hello(short_authenticated_options())
         .await?;
+    tokio::time::sleep(Duration::from_millis(60)).await;
     let error = replies
-        .next()
+        .recv()
         .await
-        .expect("deadline error should be emitted")
         .expect_err("pending bidi response should hit deadline");
     assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
-    drop(replies);
-    dropped.wait().await;
 
     close_webtransport_client(client, session).await;
     server.shutdown().await
@@ -987,56 +841,48 @@ async fn webtransport_bidi_deadline_drops_pending_upload_and_response() -> TestR
 
 #[tokio::test]
 async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
-    let dropped = DropSignal::default();
     let server = spawn_greeter_server(register_reject_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let transport = trevrpc::quinn::Client::new(connection.clone());
-    let requests = Box::new(PendingGreeterRequests::new(dropped.clone()));
-    let mut replies = trevrpc::client::bidirectional_streaming::<_, _, greeter::HelloReply>(
-        &transport,
-        greeter::GreeterClient::<()>::SERVICE,
-        "RejectUpload",
-        requests,
-        CallOptions::new().with_timeout(TEST_TIMEOUT),
-    )
-    .await?;
+    let mut replies =
+        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
+            &transport,
+            greeter::GreeterClient::<()>::SERVICE,
+            "RejectUpload",
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await?;
 
     let error = replies
-        .next()
+        .recv()
         .await
-        .expect("terminal status should be delivered")
         .expect_err("terminal status should reject the stream");
 
     assert_eq!(error.into_status().code(), Code::PermissionDenied);
-    dropped.wait().await;
     close_client(endpoint, connection).await;
     server.shutdown().await
 }
 
 #[tokio::test]
 async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResult {
-    let dropped = DropSignal::default();
     let server = spawn_webtransport_greeter_server(register_reject_upload_route)?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
     let transport = trevrpc::webtransport::Client::new(session.clone());
-    let requests = Box::new(PendingGreeterRequests::new(dropped.clone()));
-    let mut replies = trevrpc::client::bidirectional_streaming::<_, _, greeter::HelloReply>(
-        &transport,
-        greeter::GreeterClient::<()>::SERVICE,
-        "RejectUpload",
-        requests,
-        CallOptions::new().with_timeout(TEST_TIMEOUT),
-    )
-    .await?;
+    let mut replies =
+        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
+            &transport,
+            greeter::GreeterClient::<()>::SERVICE,
+            "RejectUpload",
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await?;
 
     let error = replies
-        .next()
+        .recv()
         .await
-        .expect("terminal status should be delivered")
         .expect_err("terminal status should reject the stream");
 
     assert_eq!(error.into_status().code(), Code::PermissionDenied);
-    dropped.wait().await;
     close_webtransport_client(client, session).await;
     server.shutdown().await
 }
@@ -1046,22 +892,23 @@ async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let server = spawn_greeter_server(register_accept_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let transport = trevrpc::quinn::Client::new(connection.clone());
-    let mut replies = trevrpc::client::bidirectional_streaming::<_, _, greeter::HelloReply>(
-        &transport,
-        greeter::GreeterClient::<()>::SERVICE,
-        "AcceptUpload",
-        Box::new(FirstThenErrorGreeterRequests::new()),
-        CallOptions::new().with_timeout(TEST_TIMEOUT),
-    )
-    .await?;
+    let mut replies =
+        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
+            &transport,
+            greeter::GreeterClient::<()>::SERVICE,
+            "AcceptUpload",
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await?;
 
-    let error = replies
-        .next()
-        .await
-        .expect("local upload error should be delivered")
-        .expect_err("terminal OK should not hide local upload error");
+    replies
+        .send(greeter::HelloRequest {
+            name: "uploaded".to_owned(),
+        })
+        .await?;
+    replies.close_send()?;
 
-    assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    assert!(replies.recv().await?.is_none());
     close_client(endpoint, connection).await;
     server.shutdown().await
 }
@@ -1071,22 +918,23 @@ async fn webtransport_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let server = spawn_webtransport_greeter_server(register_accept_upload_route)?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
     let transport = trevrpc::webtransport::Client::new(session.clone());
-    let mut replies = trevrpc::client::bidirectional_streaming::<_, _, greeter::HelloReply>(
-        &transport,
-        greeter::GreeterClient::<()>::SERVICE,
-        "AcceptUpload",
-        Box::new(FirstThenErrorGreeterRequests::new()),
-        CallOptions::new().with_timeout(TEST_TIMEOUT),
-    )
-    .await?;
+    let mut replies =
+        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
+            &transport,
+            greeter::GreeterClient::<()>::SERVICE,
+            "AcceptUpload",
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await?;
 
-    let error = replies
-        .next()
-        .await
-        .expect("local upload error should be delivered")
-        .expect_err("terminal OK should not hide local upload error");
+    replies
+        .send(greeter::HelloRequest {
+            name: "uploaded".to_owned(),
+        })
+        .await?;
+    replies.close_send()?;
 
-    assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    assert!(replies.recv().await?.is_none());
     close_webtransport_client(client, session).await;
     server.shutdown().await
 }
@@ -1590,44 +1438,34 @@ async fn run_mixed_call(
             assert_eq!(count, 2);
         }
         2 => {
-            let response = client
-                .lots_of_greetings(
-                    trevrpc::stream::from_iter([
-                        greeter::HelloRequest {
-                            name: format!("load-client-{index}-a"),
-                        },
-                        greeter::HelloRequest {
-                            name: format!("load-client-{index}-b"),
-                        },
-                    ]),
-                    authenticated_options(),
-                )
-                .await?;
+            let left = format!("load-client-{index}-a");
+            let right = format!("load-client-{index}-b");
+            let response = run_client_greetings(
+                &client,
+                &[left.as_str(), right.as_str()],
+                authenticated_options(),
+            )
+            .await?;
             assert_eq!(
                 response.message,
                 format!("load-client-{index}-a,load-client-{index}-b")
             );
         }
         _ => {
-            let mut responses = client
-                .bidi_hello(
-                    trevrpc::stream::from_iter([
-                        greeter::HelloRequest {
-                            name: format!("load-bidi-{index}-a"),
-                        },
-                        greeter::HelloRequest {
-                            name: format!("load-bidi-{index}-b"),
-                        },
-                    ]),
-                    authenticated_options(),
-                )
-                .await?;
-            let mut count = 0;
-            while let Some(response) = responses.next().await {
-                assert!(response?.message.starts_with("echo, load-bidi-"));
-                count += 1;
-            }
-            assert_eq!(count, 2);
+            let left = format!("load-bidi-{index}-a");
+            let right = format!("load-bidi-{index}-b");
+            let responses = run_bidi_greetings(
+                &client,
+                &[left.as_str(), right.as_str()],
+                authenticated_options(),
+            )
+            .await?;
+            assert_eq!(responses.len(), 2);
+            assert!(
+                responses
+                    .iter()
+                    .all(|message| message.starts_with("echo, load-bidi-"))
+            );
         }
     }
 
@@ -1860,6 +1698,48 @@ fn short_authenticated_options() -> CallOptions {
     CallOptions::new()
         .with_timeout(Duration::from_millis(50))
         .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
+}
+
+async fn run_client_greetings<T>(
+    client: &greeter::GreeterClient<T>,
+    names: &[&str],
+    options: CallOptions,
+) -> trevrpc::Result<greeter::HelloReply>
+where
+    T: RpcTransport,
+{
+    let mut call = client.lots_of_greetings(options).await?;
+    for name in names {
+        call.send(greeter::HelloRequest {
+            name: (*name).to_owned(),
+        })
+        .await?;
+    }
+    call.close_and_recv().await
+}
+
+async fn run_bidi_greetings<T>(
+    client: &greeter::GreeterClient<T>,
+    names: &[&str],
+    options: CallOptions,
+) -> trevrpc::Result<Vec<String>>
+where
+    T: RpcTransport,
+{
+    let mut call = client.bidi_hello(options).await?;
+    for name in names {
+        call.send(greeter::HelloRequest {
+            name: (*name).to_owned(),
+        })
+        .await?;
+    }
+    call.close_send()?;
+
+    let mut messages = Vec::new();
+    while let Some(reply) = call.recv().await? {
+        messages.push(reply.message);
+    }
+    Ok(messages)
 }
 
 fn make_server_endpoint(

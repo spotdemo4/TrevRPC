@@ -516,21 +516,7 @@ test("server streaming abort signal rejects pending response read", async () => 
 
 test("client streaming deadline cancels pending request upload", async () => {
   const Hello = helloTestType();
-  let requestReturned = false;
   let uploadDone;
-  const requests = {
-    [Symbol.asyncIterator]() {
-      return {
-        next() {
-          return new Promise(() => {});
-        },
-        return() {
-          requestReturned = true;
-          return Promise.resolve({ done: true, value: undefined });
-        },
-      };
-    },
-  };
   const transport = {
     async streamingCall(_request, requestBody) {
       uploadDone = (async () => {
@@ -557,35 +543,26 @@ test("client streaming deadline cancels pending request upload", async () => {
     },
   };
 
-  await assert.rejects(
-    clientStreaming(transport, "hello.v1.Greeter", "LotsOfGreetings", Hello, Hello, requests, {
+  const call = await clientStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfGreetings",
+    Hello,
+    Hello,
+    {
       timeoutMs: 1,
       streamIdleTimeoutMs: undefined,
-    }),
-    (error) => error.code === Code.DeadlineExceeded,
+    },
   );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await assert.rejects(call.closeAndRecv(), (error) => error.code === Code.DeadlineExceeded);
   await uploadDone;
-  assert.equal(requestReturned, true);
 });
 
 test("bidirectional streaming abort signal cancels pending upload and response read", async () => {
   const Hello = helloTestType();
-  let requestReturned = false;
   let frameReturned = false;
   let uploadDone;
-  const requests = {
-    [Symbol.asyncIterator]() {
-      return {
-        next() {
-          return new Promise(() => {});
-        },
-        return() {
-          requestReturned = true;
-          return Promise.resolve({ done: true, value: undefined });
-        },
-      };
-    },
-  };
   const transport = {
     async streamingCall(_request, requestBody) {
       uploadDone = (async () => {
@@ -620,19 +597,17 @@ test("bidirectional streaming abort signal cancels pending upload and response r
     "BidiHello",
     Hello,
     Hello,
-    requests,
     { signal: controller.signal, streamIdleTimeoutMs: undefined },
   );
-  const next = stream[Symbol.asyncIterator]().next();
+  const next = stream.recv();
   controller.abort(new DOMException("user cancelled", "AbortError"));
 
   await assert.rejects(next, (error) => error.code === Code.Cancelled);
   await uploadDone;
-  assert.equal(requestReturned, true);
   assert.equal(frameReturned, true);
 });
 
-test("terminal streaming status cancels pending request iterable", async () => {
+test("terminal streaming status cancels pending request upload", async () => {
   const root = createRoot({
     nested: {
       hello: {
@@ -651,21 +626,7 @@ test("terminal streaming status cancels pending request iterable", async () => {
     },
   });
   const Hello = root.lookupType("hello.v1.Hello");
-  let returned = false;
   let writerDone;
-  const requests = {
-    [Symbol.asyncIterator]() {
-      return {
-        next() {
-          return new Promise(() => {});
-        },
-        return() {
-          returned = true;
-          return Promise.resolve({ done: true, value: undefined });
-        },
-      };
-    },
-  };
   const transport = {
     async streamingCall(_request, requestBody) {
       writerDone = (async () => {
@@ -695,13 +656,11 @@ test("terminal streaming status cancels pending request iterable", async () => {
     "BidiHello",
     Hello,
     Hello,
-    requests,
   );
   const result = await stream[Symbol.asyncIterator]().next();
   await writerDone;
 
   assert.equal(result.done, true);
-  assert.equal(returned, true);
 });
 
 test("WebTransport timeout cleans up stream opened after abort", async () => {
@@ -767,24 +726,6 @@ test("WebTransport timeout cleans up stream opened after abort", async () => {
 });
 
 test("WebTransport terminal OK does not hide local upload error", async () => {
-  const root = createRoot({
-    nested: {
-      hello: {
-        nested: {
-          v1: {
-            nested: {
-              Hello: {
-                fields: {
-                  value: { type: "string", id: 1 },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-  });
-  const Hello = root.lookupType("hello.v1.Hello");
   const uploadError = invalidArgument("local upload failed");
   const stream = fakeBidirectionalStream({
     readableChunks: [
@@ -814,12 +755,15 @@ test("WebTransport terminal OK does not hide local upload error", async () => {
     },
   };
 
-  const responses = await bidirectionalStreaming(
-    client,
-    "hello.v1.Greeter",
-    "BidiHello",
-    Hello,
-    Hello,
+  const responses = await client.streamingCall(
+    RpcRequest.create({
+      service: "hello.v1.Greeter",
+      method: "BidiHello",
+      body: new Uint8Array(),
+      metadata: {},
+      kind: RpcKind.BidirectionalStreaming,
+      version: WireVersion,
+    }),
     requestBody,
   );
 
@@ -878,35 +822,13 @@ test("WebTransport terminal OK ignores browser upload cleanup transport closes",
       "BidiHello",
       Hello,
       Hello,
-      [],
     );
 
-    assert.deepEqual(await responses[Symbol.asyncIterator]().next(), {
-      done: true,
-      value: undefined,
-    });
+    assert.equal(await responses.recv(), undefined);
   }
 });
 
 test("WebTransport terminal error wins over local upload error", async () => {
-  const root = createRoot({
-    nested: {
-      hello: {
-        nested: {
-          v1: {
-            nested: {
-              Hello: {
-                fields: {
-                  value: { type: "string", id: 1 },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-  });
-  const Hello = root.lookupType("hello.v1.Hello");
   const stream = fakeBidirectionalStream({
     readableChunks: [
       encodeFrame(
@@ -936,19 +858,20 @@ test("WebTransport terminal error wins over local upload error", async () => {
     },
   };
 
-  const responses = await bidirectionalStreaming(
-    client,
-    "hello.v1.Greeter",
-    "BidiHello",
-    Hello,
-    Hello,
+  const responses = await client.streamingCall(
+    RpcRequest.create({
+      service: "hello.v1.Greeter",
+      method: "BidiHello",
+      body: new Uint8Array(),
+      metadata: {},
+      kind: RpcKind.BidirectionalStreaming,
+      version: WireVersion,
+    }),
     requestBody,
   );
 
-  await assert.rejects(
-    responses[Symbol.asyncIterator]().next(),
-    (error) => error.code === Code.PermissionDenied,
-  );
+  const result = await responses[Symbol.asyncIterator]().next();
+  assert.equal(result.value.status, Code.PermissionDenied);
 });
 
 test("WebTransport response stream return is idempotent after local upload error", async () => {
@@ -1015,8 +938,8 @@ test("generator emits JavaScript service clients", () => {
   assert.match(generatedJavaScript.content, /export class GreeterClient/);
   assert.match(generatedJavaScript.content, /sayHello\(request, options = \{\}\)/);
   assert.match(generatedJavaScript.content, /lotsOfReplies\(request, options = \{\}\)/);
-  assert.match(generatedJavaScript.content, /lotsOfGreetings\(request, options = \{\}\)/);
-  assert.match(generatedJavaScript.content, /bidiHello\(request, options = \{\}\)/);
+  assert.match(generatedJavaScript.content, /lotsOfGreetings\(options = \{\}\)/);
+  assert.match(generatedJavaScript.content, /bidiHello\(options = \{\}\)/);
   assert.match(generatedTypes.content, /export interface HelloRequest/);
   assert.match(generatedTypes.content, /name\?: string;/);
   assert.match(generatedTypes.content, /export interface HelloReply/);
@@ -1030,11 +953,11 @@ test("generator emits JavaScript service clients", () => {
   );
   assert.match(
     generatedTypes.content,
-    /lotsOfGreetings\(requests: AsyncIterable<HelloRequest>, options\?: CallOptions\): Promise<HelloReply>;/,
+    /lotsOfGreetings\(options\?: CallOptions\): Promise<ClientStreamingCall<HelloRequest, HelloReply>>;/,
   );
   assert.match(
     generatedTypes.content,
-    /bidiHello\(requests: AsyncIterable<HelloRequest>, options\?: CallOptions\): Promise<AsyncIterable<HelloReply>>;/,
+    /bidiHello\(options\?: CallOptions\): Promise<BidirectionalStreamingCall<HelloRequest, HelloReply>>;/,
   );
 });
 

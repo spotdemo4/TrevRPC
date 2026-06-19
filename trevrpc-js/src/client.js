@@ -114,18 +114,18 @@ export async function serverStreaming(
   return responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope);
 }
 
-/** Calls a client-streaming RPC and decodes the final protobuf response. */
+/** Calls a client-streaming RPC and returns a sendable call object. */
 export async function clientStreaming(
   transport,
   service,
   method,
   requestType,
   responseType,
-  requests,
   options = {},
 ) {
   const callOptions = mergeCallOptions(options);
   const abortScope = callAbortScope(callOptions);
+  const requests = new RequestQueue();
   const rpcRequest = prepareClientRequest(
     service,
     method,
@@ -149,26 +149,28 @@ export async function clientStreaming(
     );
   } catch (error) {
     abortScope.cleanup();
+    requests.close(error);
     throw error;
   }
 
-  return readUnaryResponseFromStream(
+  return new ClientStreamingCall(
+    requests,
     responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope),
   );
 }
 
-/** Calls a bidirectional-streaming RPC and returns a decoded response stream. */
+/** Calls a bidirectional-streaming RPC and returns a sendable call object. */
 export async function bidirectionalStreaming(
   transport,
   service,
   method,
   requestType,
   responseType,
-  requests,
   options = {},
 ) {
   const callOptions = mergeCallOptions(options);
   const abortScope = callAbortScope(callOptions);
+  const requests = new RequestQueue();
   const rpcRequest = prepareClientRequest(
     service,
     method,
@@ -192,10 +194,90 @@ export async function bidirectionalStreaming(
     );
   } catch (error) {
     abortScope.cleanup();
+    requests.close(error);
     throw error;
   }
 
-  return responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope);
+  return new BidirectionalStreamingCall(
+    requests,
+    responseMessageStream(frames, responseType, abortScope.options, deadlineAt, abortScope),
+  );
+}
+
+/** A client-streaming RPC call. */
+export class ClientStreamingCall {
+  constructor(requests, responses) {
+    this._requests = requests;
+    this._responses = responses;
+  }
+
+  /** Sends one request message. */
+  send(request) {
+    return this._requests.send(request);
+  }
+
+  /** Closes the request stream. */
+  closeSend() {
+    this._requests.close();
+    return Promise.resolve();
+  }
+
+  /** Closes the request stream and returns the final response. */
+  async closeAndRecv() {
+    this._requests.close();
+    return await readUnaryResponseFromStream(this._responses);
+  }
+
+  /** Releases call resources without waiting for the response. */
+  async close() {
+    this._requests.close(cancelled("request stream cancelled"));
+    const iterator = this._responses[Symbol.asyncIterator]();
+    await iterator.return?.();
+  }
+}
+
+/** A bidirectional-streaming RPC call. */
+export class BidirectionalStreamingCall {
+  constructor(requests, responses) {
+    this._requests = requests;
+    this._iterator = responses[Symbol.asyncIterator]();
+  }
+
+  /** Sends one request message. */
+  send(request) {
+    return this._requests.send(request);
+  }
+
+  /** Receives one response message, or undefined after the response stream completes. */
+  async recv() {
+    const result = await this._iterator.next();
+    return result.done ? undefined : result.value;
+  }
+
+  /** Closes the request stream while keeping the response stream readable. */
+  closeSend() {
+    this._requests.close();
+    return Promise.resolve();
+  }
+
+  /** Releases call resources without waiting for more responses. */
+  async close() {
+    this._requests.close(cancelled("request stream cancelled"));
+    await this._iterator.return?.();
+  }
+
+  [Symbol.asyncIterator]() {
+    return {
+      next: async () => {
+        const value = await this.recv();
+        return value === undefined ? { done: true, value: undefined } : { done: false, value };
+      },
+      return: async () => {
+        await this.close();
+        return { done: true, value: undefined };
+      },
+    };
+  }
 }
 
 /** Creates a service client from a generated service descriptor. */
@@ -233,26 +315,24 @@ export function createServiceClient(transport, service, root, options = {}) {
           );
         break;
       case "clientStreaming":
-        client[jsName] = (requests, override) =>
+        client[jsName] = (override) =>
           clientStreaming(
             transport,
             service.fullName,
             method.name,
             requestType,
             responseType,
-            requests,
             callOptions(override),
           );
         break;
       case "bidirectionalStreaming":
-        client[jsName] = (requests, override) =>
+        client[jsName] = (override) =>
           bidirectionalStreaming(
             transport,
             service.fullName,
             method.name,
             requestType,
             responseType,
-            requests,
             callOptions(override),
           );
         break;
@@ -448,7 +528,8 @@ function nextTimeout(deadlineAt, idleTimeoutMs) {
     return null;
   }
 
-  return timeouts.reduce((best, candidate) => (candidate.ms < best.ms ? candidate : best));
+  const timeout = timeouts.reduce((best, candidate) => (candidate.ms < best.ms ? candidate : best));
+  return { ...timeout, ms: Math.max(0, timeout.ms) };
 }
 
 function timeoutNanos(timeoutMs) {
@@ -561,6 +642,83 @@ function callAbortScope(options) {
       parentSignal?.removeEventListener?.("abort", onParentAbort);
     },
   };
+}
+
+class RequestQueue {
+  constructor() {
+    this._pending = [];
+    this._waiter = undefined;
+    this._closed = false;
+    this._error = undefined;
+  }
+
+  send(value) {
+    if (this._closed) {
+      return Promise.reject(this._error ?? cancelled("request stream is closed"));
+    }
+
+    return new Promise((resolve, reject) => {
+      if (this._waiter != null) {
+        const waiter = this._waiter;
+        this._waiter = undefined;
+        waiter.resolve({ done: false, value });
+        resolve();
+        return;
+      }
+
+      this._pending.push({ value, resolve, reject });
+    });
+  }
+
+  close(error) {
+    if (this._closed) {
+      return;
+    }
+
+    this._closed = true;
+    this._error = error;
+    if (error != null) {
+      for (const pending of this._pending.splice(0)) {
+        pending.reject(error);
+      }
+    }
+    if (this._waiter != null) {
+      const waiter = this._waiter;
+      this._waiter = undefined;
+      if (error == null) {
+        waiter.resolve({ done: true, value: undefined });
+      } else {
+        waiter.reject(error);
+      }
+    }
+  }
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+
+  next() {
+    if (this._pending.length > 0) {
+      const pending = this._pending.shift();
+      pending.resolve();
+      return Promise.resolve({ done: false, value: pending.value });
+    }
+    if (this._error != null) {
+      return Promise.reject(this._error);
+    }
+    if (this._closed) {
+      return Promise.resolve({ done: true, value: undefined });
+    }
+
+    return new Promise((resolve, reject) => {
+      this._waiter = { resolve, reject };
+    });
+  }
+
+  return() {
+    this.close(cancelled("request stream cancelled"));
+    return Promise.resolve({ done: true, value: undefined });
+  }
 }
 
 async function* encodeRequestStream(requestType, requests, signal) {

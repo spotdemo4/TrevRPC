@@ -87,9 +87,8 @@ impl<T> GreeterClient<T> {
 
     pub async fn lots_of_greetings(
         &self,
-        requests: trevrpc::BoxMessageStream<HelloRequest>,
         options: trevrpc::client::CallOptions,
-    ) -> trevrpc::Result<HelloReply>
+    ) -> trevrpc::Result<trevrpc::client::ClientStreamingCall<HelloRequest, HelloReply>>
     where
         T: trevrpc::client::RpcTransport,
     {
@@ -97,7 +96,6 @@ impl<T> GreeterClient<T> {
             &self.transport,
             Self::SERVICE,
             "LotsOfGreetings",
-            requests,
             options,
         )
         .await
@@ -105,9 +103,8 @@ impl<T> GreeterClient<T> {
 
     pub async fn bidi_hello(
         &self,
-        requests: trevrpc::BoxMessageStream<HelloRequest>,
         options: trevrpc::client::CallOptions,
-    ) -> trevrpc::Result<trevrpc::BoxMessageStream<HelloReply>>
+    ) -> trevrpc::Result<trevrpc::client::BidirectionalStreamingCall<HelloRequest, HelloReply>>
     where
         T: trevrpc::client::RpcTransport,
     {
@@ -115,7 +112,6 @@ impl<T> GreeterClient<T> {
             &self.transport,
             Self::SERVICE,
             "BidiHello",
-            requests,
             options,
         )
         .await

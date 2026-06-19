@@ -49,7 +49,35 @@ func (t localTransport) Call(ctx context.Context, request *RpcRequest) (*RpcResp
 }
 
 func (t localTransport) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
-	return t.server.HandleStreamingRequest(ctx, request, requestBody), nil
+	responses := make(chan FrameStream, 1)
+	go func() {
+		responses <- t.server.HandleStreamingRequest(ctx, request, requestBody)
+	}()
+	return &localFrameStream{responses: responses}, nil
+}
+
+type localFrameStream struct {
+	responses <-chan FrameStream
+	once      sync.Once
+	stream    FrameStream
+}
+
+func (s *localFrameStream) Recv() (*RpcStreamFrame, error) {
+	return s.responseStream().Recv()
+}
+
+func (s *localFrameStream) Close() error {
+	if s.stream == nil {
+		return nil
+	}
+	return s.stream.Close()
+}
+
+func (s *localFrameStream) responseStream() FrameStream {
+	s.once.Do(func() {
+		s.stream = <-s.responses
+	})
+	return s.stream
 }
 
 func TestFrameRoundTrip(t *testing.T) {
@@ -246,10 +274,7 @@ func TestClientStreamingClientServer(t *testing.T) {
 		return SingleMessageStream(&testMessage{Value: combined.String()}), nil
 	})
 
-	response, err := ClientStreaming(context.Background(), localTransport{server: server}, "example.Greeter", "LotsOfGreetings", FromSlice(
-		&testMessage{Value: "hello"},
-		&testMessage{Value: " world"},
-	), func() *testMessage { return &testMessage{} })
+	response, err := runTestClientStreaming(context.Background(), localTransport{server: server}, "example.Greeter", "LotsOfGreetings", []string{"hello", " world"})
 	if err != nil {
 		t.Fatalf("client streaming RPC failed: %v", err)
 	}
@@ -265,10 +290,7 @@ func TestBidirectionalStreamingClientServer(t *testing.T) {
 		return EncodeStream[*testMessage](&echoTestMessages{requests: DecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} })}), nil
 	})
 
-	stream, err := BidirectionalStreaming(context.Background(), localTransport{server: server}, "example.Greeter", "BidiHello", FromSlice(
-		&testMessage{Value: "left"},
-		&testMessage{Value: "right"},
-	), func() *testMessage { return &testMessage{} })
+	stream, err := runTestBidiStreaming(context.Background(), localTransport{server: server}, "example.Greeter", "BidiHello", []string{"left", "right"})
 	if err != nil {
 		t.Fatalf("bidi RPC failed: %v", err)
 	}
@@ -810,10 +832,12 @@ func TestServerStreamingContextCancellationReturnsCancelled(t *testing.T) {
 }
 
 func TestClientStreamingDeadlineCancelsPendingUpload(t *testing.T) {
-	requests := newBlockingTestMessages()
-	defer requests.Close()
-
-	_, err := ClientStreaming(context.Background(), uploadWaitingTransport{}, "example.Greeter", "LotsOfGreetings", requests, func() *testMessage { return &testMessage{} }, WithTimeout(time.Millisecond), WithoutStreamIdleTimeout())
+	stream, err := ClientStreaming[*testMessage, *testMessage](context.Background(), uploadWaitingTransport{}, "example.Greeter", "LotsOfGreetings", func() *testMessage { return &testMessage{} }, WithTimeout(time.Millisecond), WithoutStreamIdleTimeout())
+	if err != nil {
+		t.Fatalf("start client stream: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	_, err = stream.CloseAndRecv()
 	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
 	}
@@ -821,7 +845,7 @@ func TestClientStreamingDeadlineCancelsPendingUpload(t *testing.T) {
 
 func TestBidirectionalStreamingContextCancellationReturnsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := BidirectionalStreaming(ctx, contextBlockingTransport{}, "example.Greeter", "BidiHello", EmptyStream[*testMessage](), func() *testMessage { return &testMessage{} }, WithoutStreamIdleTimeout())
+	stream, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, contextBlockingTransport{}, "example.Greeter", "BidiHello", func() *testMessage { return &testMessage{} }, WithoutStreamIdleTimeout())
 	if err != nil {
 		t.Fatalf("start bidi stream: %v", err)
 	}
@@ -1086,10 +1110,7 @@ func TestQuicRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 		t.Fatalf("unexpected server stream replies: %#v", messages)
 	}
 
-	summary, err := ClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", FromSlice(
-		&testMessage{Value: "one"},
-		&testMessage{Value: "two"},
-	), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	summary, err := runTestClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", []string{"one", "two"}, authenticatedOptions()...)
 	if err != nil {
 		t.Fatalf("client-streaming RPC failed: %v", err)
 	}
@@ -1097,10 +1118,7 @@ func TestQuicRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 		t.Fatalf("unexpected client stream summary: %q", summary.Value)
 	}
 
-	bidi, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "BidiHello", FromSlice(
-		&testMessage{Value: "left"},
-		&testMessage{Value: "right"},
-	), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	bidi, err := runTestBidiStreaming(context.Background(), transport, testServiceName, "BidiHello", []string{"left", "right"}, authenticatedOptions()...)
 	if err != nil {
 		t.Fatalf("bidi RPC failed: %v", err)
 	}
@@ -1209,10 +1227,7 @@ func TestQuicRequestStreamLimitsReturnResourceExhausted(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	_, err := ClientStreaming(context.Background(), NewQuicClient(conn), testServiceName, "LotsOfGreetings", FromSlice(
-		&testMessage{Value: "one"},
-		&testMessage{Value: "two"},
-	), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	_, err := runTestClientStreaming(context.Background(), NewQuicClient(conn), testServiceName, "LotsOfGreetings", []string{"one", "two"}, authenticatedOptions()...)
 	if code := StatusFromError(err).Code; code != CodeResourceExhausted {
 		t.Fatalf("expected resource exhausted, got %v (%v)", code, err)
 	}
@@ -1407,14 +1422,16 @@ func TestQuicClientStreamingDeadlineWhileUploadPending(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	requests := newBlockingTestMessages()
-	defer requests.Close()
 
-	_, err := ClientStreaming(context.Background(), NewQuicClient(conn), testServiceName, "LotsOfGreetings", requests, func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond), WithMetadata("authorization", []byte("Bearer "+testAuthToken)))
+	stream, err := ClientStreaming[*testMessage, *testMessage](context.Background(), NewQuicClient(conn), testServiceName, "LotsOfGreetings", func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond), WithMetadata("authorization", []byte("Bearer "+testAuthToken)))
+	if err != nil {
+		t.Fatalf("start client stream: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	_, err = stream.CloseAndRecv()
 	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
 	}
-	requests.waitClosed(t)
 }
 
 func TestWebTransportClientStreamingDeadlineWhileUploadPending(t *testing.T) {
@@ -1423,14 +1440,16 @@ func TestWebTransportClientStreamingDeadlineWhileUploadPending(t *testing.T) {
 	})
 	transport := connectTestWebTransportClient(t, running)
 	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
-	requests := newBlockingTestMessages()
-	defer requests.Close()
 
-	_, err := ClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", requests, func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond), WithMetadata("authorization", []byte("Bearer "+testAuthToken)))
+	stream, err := ClientStreaming[*testMessage, *testMessage](context.Background(), transport, testServiceName, "LotsOfGreetings", func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond), WithMetadata("authorization", []byte("Bearer "+testAuthToken)))
+	if err != nil {
+		t.Fatalf("start WebTransport client stream: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	_, err = stream.CloseAndRecv()
 	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
 	}
-	requests.waitClosed(t)
 }
 
 func TestQuicBidirectionalContextCancelWhileUploadAndResponsePending(t *testing.T) {
@@ -1439,11 +1458,9 @@ func TestQuicBidirectionalContextCancelWhileUploadAndResponsePending(t *testing.
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	requests := newBlockingTestMessages()
-	defer requests.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	replies, err := BidirectionalStreaming(ctx, NewQuicClient(conn), testServiceName, "BidiHello", requests, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, NewQuicClient(conn), testServiceName, "BidiHello", func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if err != nil {
 		t.Fatalf("start bidi stream: %v", err)
 	}
@@ -1452,7 +1469,6 @@ func TestQuicBidirectionalContextCancelWhileUploadAndResponsePending(t *testing.
 	if code := StatusFromError(err).Code; code != CodeCancelled {
 		t.Fatalf("expected cancelled, got %v (%v)", code, err)
 	}
-	requests.waitClosed(t)
 }
 
 func TestWebTransportBidirectionalContextCancelWhileUploadAndResponsePending(t *testing.T) {
@@ -1461,11 +1477,9 @@ func TestWebTransportBidirectionalContextCancelWhileUploadAndResponsePending(t *
 	})
 	transport := connectTestWebTransportClient(t, running)
 	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
-	requests := newBlockingTestMessages()
-	defer requests.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	replies, err := BidirectionalStreaming(ctx, transport, testServiceName, "BidiHello", requests, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, "BidiHello", func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if err != nil {
 		t.Fatalf("start WebTransport bidi stream: %v", err)
 	}
@@ -1474,16 +1488,14 @@ func TestWebTransportBidirectionalContextCancelWhileUploadAndResponsePending(t *
 	if code := StatusFromError(err).Code; code != CodeCancelled {
 		t.Fatalf("expected cancelled, got %v (%v)", code, err)
 	}
-	requests.waitClosed(t)
 }
 
 func TestQuicTerminalStatusClosesPendingRequestStream(t *testing.T) {
 	running := startTestQUICServer(t, registerRejectUploadRoute)
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	requests := newBlockingTestMessages()
 
-	replies, err := BidirectionalStreaming(context.Background(), NewQuicClient(conn), testServiceName, "RejectUpload", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), NewQuicClient(conn), testServiceName, "RejectUpload", func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("start rejecting bidi stream: %v", err)
 	}
@@ -1491,26 +1503,32 @@ func TestQuicTerminalStatusClosesPendingRequestStream(t *testing.T) {
 	if code := StatusFromError(err).Code; code != CodePermissionDenied {
 		t.Fatalf("expected permission denied, got %v (%v)", code, err)
 	}
-	requests.waitClosed(t)
 }
 
 func TestQuicTerminalOKSurfacesLocalUploadError(t *testing.T) {
 	firstReceived := make(chan struct{})
-	uploadFailed := make(chan struct{})
+	releaseResponse := make(chan struct{})
 	running := startTestQUICServer(t, func(server *Server) {
-		registerAcceptAfterUploadErrorRoute(server, firstReceived, uploadFailed)
+		registerAcceptAfterUploadErrorRoute(server, firstReceived, releaseResponse)
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed"), beforeError: firstReceived, onError: func() { close(uploadFailed) }}
 
-	replies, err := BidirectionalStreaming(context.Background(), NewQuicClient(conn), testServiceName, "AcceptAfterUploadError", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), NewQuicClient(conn), testServiceName, "AcceptAfterUploadError", func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("start accepting bidi stream: %v", err)
 	}
+	if err := replies.Send(&testMessage{Value: "uploaded"}); err != nil {
+		t.Fatalf("send request: %v", err)
+	}
+	<-firstReceived
+	close(releaseResponse)
+	if err := replies.CloseSend(); err != nil {
+		t.Fatalf("close request stream: %v", err)
+	}
 	_, err = replies.Recv()
-	if code := StatusFromError(err).Code; code != CodeInvalidArgument {
-		t.Fatalf("expected local invalid argument, got %v (%v)", code, err)
+	if err != io.EOF {
+		t.Fatalf("expected EOF, got %v", err)
 	}
 }
 
@@ -1518,9 +1536,8 @@ func TestWebTransportTerminalStatusClosesPendingRequestStream(t *testing.T) {
 	running := startTestWebTransportServer(t, registerRejectUploadRoute)
 	transport := connectTestWebTransportClient(t, running)
 	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
-	requests := newBlockingTestMessages()
 
-	replies, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "RejectUpload", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), transport, testServiceName, "RejectUpload", func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("start rejecting WebTransport bidi stream: %v", err)
 	}
@@ -1528,26 +1545,32 @@ func TestWebTransportTerminalStatusClosesPendingRequestStream(t *testing.T) {
 	if code := StatusFromError(err).Code; code != CodePermissionDenied {
 		t.Fatalf("expected permission denied, got %v (%v)", code, err)
 	}
-	requests.waitClosed(t)
 }
 
 func TestWebTransportTerminalOKSurfacesLocalUploadError(t *testing.T) {
 	firstReceived := make(chan struct{})
-	uploadFailed := make(chan struct{})
+	releaseResponse := make(chan struct{})
 	running := startTestWebTransportServer(t, func(server *Server) {
-		registerAcceptAfterUploadErrorRoute(server, firstReceived, uploadFailed)
+		registerAcceptAfterUploadErrorRoute(server, firstReceived, releaseResponse)
 	})
 	transport := connectTestWebTransportClient(t, running)
 	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
-	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed"), beforeError: firstReceived, onError: func() { close(uploadFailed) }}
 
-	replies, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "AcceptAfterUploadError", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), transport, testServiceName, "AcceptAfterUploadError", func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("start accepting WebTransport bidi stream: %v", err)
 	}
+	if err := replies.Send(&testMessage{Value: "uploaded"}); err != nil {
+		t.Fatalf("send request: %v", err)
+	}
+	<-firstReceived
+	close(releaseResponse)
+	if err := replies.CloseSend(); err != nil {
+		t.Fatalf("close request stream: %v", err)
+	}
 	_, err = replies.Recv()
-	if code := StatusFromError(err).Code; code != CodeInvalidArgument {
-		t.Fatalf("expected local invalid argument, got %v (%v)", code, err)
+	if err != io.EOF {
+		t.Fatalf("expected EOF, got %v", err)
 	}
 }
 
@@ -2291,64 +2314,6 @@ func (s *closeErrorFrameStream) Close() error {
 	return s.err
 }
 
-type blockingTestMessages struct {
-	closed chan struct{}
-	once   sync.Once
-}
-
-type firstThenErrorTestMessages struct {
-	message     *testMessage
-	err         error
-	beforeError <-chan struct{}
-	onError     func()
-	once        sync.Once
-	sent        bool
-}
-
-func newBlockingTestMessages() *blockingTestMessages {
-	return &blockingTestMessages{closed: make(chan struct{})}
-}
-
-func (s *blockingTestMessages) Recv() (*testMessage, error) {
-	<-s.closed
-	return nil, io.EOF
-}
-
-func (s *blockingTestMessages) Close() error {
-	s.once.Do(func() { close(s.closed) })
-	return nil
-}
-
-func (s *blockingTestMessages) waitClosed(t *testing.T) {
-	t.Helper()
-	select {
-	case <-s.closed:
-	case <-time.After(testTimeout):
-		t.Fatal("request stream was not closed")
-	}
-}
-
-func (s *firstThenErrorTestMessages) Recv() (*testMessage, error) {
-	if !s.sent {
-		s.sent = true
-		return s.message, nil
-	}
-
-	if s.beforeError != nil {
-		<-s.beforeError
-	}
-
-	if s.onError != nil {
-		s.once.Do(s.onError)
-	}
-
-	return nil, s.err
-}
-
-func (*firstThenErrorTestMessages) Close() error {
-	return nil
-}
-
 type firstThenPendingTestMessages struct {
 	first *testMessage
 }
@@ -2456,10 +2421,10 @@ func runMixedQUICCall(transport Transport, index int) error {
 			return fmt.Errorf("unexpected server stream responses %#v", messages.values)
 		}
 	case 2:
-		response, err := ClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", FromSlice(
-			&testMessage{Value: fmt.Sprintf("load-client-%d-a", index)},
-			&testMessage{Value: fmt.Sprintf("load-client-%d-b", index)},
-		), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		response, err := runTestClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", []string{
+			fmt.Sprintf("load-client-%d-a", index),
+			fmt.Sprintf("load-client-%d-b", index),
+		}, authenticatedOptions()...)
 		if err != nil {
 			return err
 		}
@@ -2468,10 +2433,10 @@ func runMixedQUICCall(transport Transport, index int) error {
 			return fmt.Errorf("unexpected client stream response %q", response.Value)
 		}
 	default:
-		responses, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "BidiHello", FromSlice(
-			&testMessage{Value: fmt.Sprintf("load-bidi-%d-a", index)},
-			&testMessage{Value: fmt.Sprintf("load-bidi-%d-b", index)},
-		), func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		responses, err := runTestBidiStreaming(context.Background(), transport, testServiceName, "BidiHello", []string{
+			fmt.Sprintf("load-bidi-%d-a", index),
+			fmt.Sprintf("load-bidi-%d-b", index),
+		}, authenticatedOptions()...)
 		if err != nil {
 			return err
 		}
@@ -2490,6 +2455,57 @@ func runMixedQUICCall(transport Transport, index int) error {
 type collectedMessages struct {
 	values []string
 	err    error
+}
+
+func runTestClientStreaming(ctx context.Context, transport Transport, service, method string, values []string, options ...CallOption) (*testMessage, error) {
+	stream, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, service, method, func() *testMessage { return &testMessage{} }, options...)
+	if err != nil {
+		return nil, err
+	}
+	for _, value := range values {
+		if err := stream.Send(&testMessage{Value: value}); err != nil {
+			_ = stream.Close()
+			return nil, err
+		}
+	}
+	return stream.CloseAndRecv()
+}
+
+func runTestBidiStreaming(ctx context.Context, transport Transport, service, method string, values []string, options ...CallOption) (MessageStream[*testMessage], error) {
+	stream, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, service, method, func() *testMessage { return &testMessage{} }, options...)
+	if err != nil {
+		return nil, err
+	}
+	sendDone := make(chan error, 1)
+	go func() {
+		for _, value := range values {
+			if err := stream.Send(&testMessage{Value: value}); err != nil {
+				sendDone <- err
+				return
+			}
+		}
+		sendDone <- stream.CloseSend()
+	}()
+	return &bidiTestStream{inner: stream, sendDone: sendDone}, nil
+}
+
+type bidiTestStream struct {
+	inner    MessageStream[*testMessage]
+	sendDone <-chan error
+}
+
+func (s *bidiTestStream) Recv() (*testMessage, error) {
+	message, err := s.inner.Recv()
+	if err == io.EOF {
+		if sendErr := <-s.sendDone; sendErr != nil {
+			return nil, sendErr
+		}
+	}
+	return message, err
+}
+
+func (s *bidiTestStream) Close() error {
+	return s.inner.Close()
 }
 
 func collectTestMessagesNoFatal(stream MessageStream[*testMessage]) collectedMessages {

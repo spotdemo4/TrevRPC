@@ -2,7 +2,13 @@
 
 import type { Root } from "protobufjs";
 
-import type { CallOptions, RpcServiceDescriptor, Transport } from "../../src/index.js";
+import type {
+  BidirectionalStreamingCall,
+  CallOptions,
+  ClientStreamingCall,
+  RpcServiceDescriptor,
+  Transport,
+} from "../../src/index.js";
 
 export declare const root: Root;
 
@@ -27,15 +33,9 @@ export declare class GreeterClient {
   /** Calls the LotsOfReplies RPC. */
   lotsOfReplies(request: HelloRequest, options?: CallOptions): Promise<AsyncIterable<HelloReply>>;
   /** Calls the LotsOfGreetings RPC. */
-  lotsOfGreetings(
-    requests: AsyncIterable<HelloRequest>,
-    options?: CallOptions,
-  ): Promise<HelloReply>;
+  lotsOfGreetings(options?: CallOptions): Promise<ClientStreamingCall<HelloRequest, HelloReply>>;
   /** Calls the BidiHello RPC. */
-  bidiHello(
-    requests: AsyncIterable<HelloRequest>,
-    options?: CallOptions,
-  ): Promise<AsyncIterable<HelloReply>>;
+  bidiHello(options?: CallOptions): Promise<BidirectionalStreamingCall<HelloRequest, HelloReply>>;
 }
 
 /** Creates a client for the Greeter service. */

@@ -48,6 +48,8 @@ export {
   writeFrame,
 } from "./framing.js";
 export {
+  BidirectionalStreamingCall,
+  ClientStreamingCall,
   bidirectionalStreaming,
   clientStreaming,
   createServiceClient,

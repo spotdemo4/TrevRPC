@@ -46,18 +46,34 @@ async function runFromForm(data) {
       log(`LotsOfReplies: ${reply.message}`);
     }
 
-    const summary = await client.lotsOfGreetings([
-      { name: `${name} client stream 1` },
-      { name: `${name} client stream 2` },
-    ]);
+    const greetings = await client.lotsOfGreetings();
+    await greetings.send({ name: `${name} client stream 1` });
+    await greetings.send({ name: `${name} client stream 2` });
+    const summary = await greetings.closeAndRecv();
     log(`LotsOfGreetings: ${summary.message}`);
 
-    const bidiReplies = await client.bidiHello([
-      { name: `${name} bidi 1` },
-      { name: `${name} bidi 2` },
-    ]);
-    for await (const reply of bidiReplies) {
-      log(`BidiHello: ${reply.message}`);
+    const bidi = await client.bidiHello();
+    try {
+      for (const suffix of ["bidi 1", "bidi 2"]) {
+        await bidi.send({ name: `${name} ${suffix}` });
+
+        const reply = await bidi.recv();
+        if (reply == null) {
+          throw new Error("BidiHello response stream ended early");
+        }
+        log(`BidiHello: ${reply.message}`);
+      }
+      await bidi.closeSend();
+
+      for (;;) {
+        const reply = await bidi.recv();
+        if (reply == null) {
+          break;
+        }
+        log(`BidiHello: ${reply.message}`);
+      }
+    } finally {
+      await bidi.close();
     }
 
     log("complete");
