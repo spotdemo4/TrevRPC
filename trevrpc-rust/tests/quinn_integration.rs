@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -107,6 +108,52 @@ impl MessageStream<greeter::HelloReply> for BidiReplies {
                 message: format!("echo, {}", request.name),
             })
         })
+    }
+}
+
+#[derive(Clone, Default)]
+struct DropSignal {
+    dropped: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl DropSignal {
+    fn mark_dropped(&self) {
+        self.dropped.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        if !self.dropped.load(Ordering::SeqCst) {
+            tokio::time::timeout(TEST_TIMEOUT, self.notify.notified())
+                .await
+                .expect("request stream should be dropped");
+        }
+
+        assert!(self.dropped.load(Ordering::SeqCst));
+    }
+}
+
+struct PendingGreeterRequests {
+    dropped: DropSignal,
+}
+
+impl PendingGreeterRequests {
+    const fn new(dropped: DropSignal) -> Self {
+        Self { dropped }
+    }
+}
+
+#[trevrpc::async_trait]
+impl MessageStream<greeter::HelloRequest> for PendingGreeterRequests {
+    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloRequest>> {
+        std::future::pending().await
+    }
+}
+
+impl Drop for PendingGreeterRequests {
+    fn drop(&mut self) {
+        self.dropped.mark_dropped();
     }
 }
 
@@ -669,6 +716,62 @@ async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
 }
 
 #[tokio::test]
+async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
+    let dropped = DropSignal::default();
+    let server = spawn_greeter_server(register_reject_upload_route)?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let requests = Box::new(PendingGreeterRequests::new(dropped.clone()));
+    let mut replies = trevrpc::client::bidirectional_streaming::<_, _, greeter::HelloReply>(
+        &transport,
+        greeter::GreeterClient::<()>::SERVICE,
+        "RejectUpload",
+        requests,
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+    )
+    .await?;
+
+    let error = replies
+        .next()
+        .await
+        .expect("terminal status should be delivered")
+        .expect_err("terminal status should reject the stream");
+
+    assert_eq!(error.into_status().code(), Code::PermissionDenied);
+    dropped.wait().await;
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResult {
+    let dropped = DropSignal::default();
+    let server = spawn_webtransport_greeter_server(register_reject_upload_route)?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let requests = Box::new(PendingGreeterRequests::new(dropped.clone()));
+    let mut replies = trevrpc::client::bidirectional_streaming::<_, _, greeter::HelloReply>(
+        &transport,
+        greeter::GreeterClient::<()>::SERVICE,
+        "RejectUpload",
+        requests,
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+    )
+    .await?;
+
+    let error = replies
+        .next()
+        .await
+        .expect("terminal status should be delivered")
+        .expect_err("terminal status should reject the stream");
+
+    assert_eq!(error.into_status().code(), Code::PermissionDenied);
+    dropped.wait().await;
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_shutdown_closes_active_connections() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, client) = connect_client(&server).await?;
@@ -1023,6 +1126,20 @@ async fn hold_server_stream_open(
 
 fn spawn_greeter_server(configure: impl FnOnce(&mut Server)) -> TestResult<RunningServer> {
     spawn_greeter_server_with_endpoint(make_server_endpoint()?, configure)
+}
+
+fn register_reject_upload_route(server: &mut Server) {
+    server.route_streaming(
+        greeter::GreeterClient::<()>::SERVICE,
+        "RejectUpload",
+        trevrpc::RpcKind::BidirectionalStreaming,
+        |_body, _requests| async {
+            Err(trevrpc::Error::from(Status::new(
+                Code::PermissionDenied,
+                "upload rejected",
+            )))
+        },
+    );
 }
 
 fn spawn_greeter_server_with_initial_request_timeout(

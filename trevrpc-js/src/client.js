@@ -336,12 +336,23 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
           complete = true;
           validateResponseMetadata(frame.metadata ?? {});
           abortScope?.abort(cancelled("response stream completed"));
+          let cleanupError;
+          if (typeof iterator.return === "function") {
+            try {
+              await iterator.return();
+            } catch (error) {
+              cleanupError = error;
+            }
+          }
           const status = {
             code: frame.status ?? Code.Ok,
             statusMessage: frame.message ?? "",
             metadata: frame.metadata ?? {},
           };
           if (status.code === Code.Ok) {
+            if (cleanupError != null) {
+              throw cleanupError;
+            }
             return;
           }
 

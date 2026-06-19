@@ -350,14 +350,19 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 
 		return message, nil
 	case RpcStreamFrameKindStatus:
-		s.finish()
 		if err := ValidateMetadata(frame.Metadata); err != nil {
+			s.finish()
 			var zero T
 			return zero, Internal("invalid response metadata: " + err.Error())
 		}
+		cleanupErr := s.finish()
 
 		status := frame.StatusValue()
 		if status.IsOK() {
+			if cleanupErr != nil {
+				var zero T
+				return zero, cleanupErr
+			}
 			var zero T
 			return zero, io.EOF
 		}

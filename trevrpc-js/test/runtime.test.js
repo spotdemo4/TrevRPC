@@ -19,6 +19,7 @@ import {
   createRoot,
   decodeFrame,
   encodeFrame,
+  invalidArgument,
   normalizeMetadata,
   unary,
 } from "../src/index.js";
@@ -266,6 +267,69 @@ test("WebTransport timeout cleans up stream opened after abort", async () => {
   assert.equal(cancelReason?.name, "AbortError");
 });
 
+test("WebTransport terminal OK does not hide local upload error", async () => {
+  const root = createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const Hello = root.lookupType("hello.v1.Hello");
+  const uploadError = invalidArgument("local upload failed");
+  const stream = fakeBidirectionalStream({
+    readableChunks: [
+      encodeFrame(
+        RpcStreamFrame,
+        RpcStreamFrame.create({
+          kind: RpcStreamFrameKind.Status,
+          status: Code.Ok,
+          metadata: {},
+        }),
+      ),
+    ],
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+  const requestBody = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return Promise.reject(uploadError);
+        },
+      };
+    },
+  };
+
+  const responses = await bidirectionalStreaming(
+    client,
+    "hello.v1.Greeter",
+    "BidiHello",
+    Hello,
+    Hello,
+    requestBody,
+  );
+
+  await assert.rejects(
+    responses[Symbol.asyncIterator]().next(),
+    (error) => error.code === Code.InvalidArgument,
+  );
+});
+
 test("generator emits JavaScript service clients", () => {
   const response = generateBindings(greeterRequest());
   const generatedJavaScript = generatedFile(response, "hello/v1/greeter.trevrpc.js");
@@ -448,11 +512,22 @@ function importedTypeRequest() {
   };
 }
 
-function fakeBidirectionalStream({ onAbort = () => {}, onCancel = () => {} } = {}) {
+function fakeBidirectionalStream({
+  onAbort = () => {},
+  onCancel = () => {},
+  readableChunks = [],
+} = {}) {
+  const chunks = [...readableChunks];
   return {
     writable: {
       getWriter() {
         return {
+          write() {
+            return Promise.resolve();
+          },
+          close() {
+            return Promise.resolve();
+          },
           abort(reason) {
             onAbort(reason);
             return Promise.resolve();
@@ -464,6 +539,12 @@ function fakeBidirectionalStream({ onAbort = () => {}, onCancel = () => {} } = {
     readable: {
       getReader() {
         return {
+          read() {
+            const value = chunks.shift();
+            return Promise.resolve(
+              value == null ? { done: true, value: undefined } : { done: false, value },
+            );
+          },
           cancel(reason) {
             onCancel(reason);
             return Promise.resolve();

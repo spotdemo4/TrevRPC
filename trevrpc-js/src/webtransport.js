@@ -192,6 +192,10 @@ class WebTransportResponseFrameStream {
     releaseLock(this.reader);
     releaseLock(this.writer);
     this.cleanupAbort();
+    await this.writerDone;
+    if (this.writerError != null && this.writerError.code !== Code.Cancelled) {
+      throw this.writerError;
+    }
     return { done: true, value: undefined };
   }
 }

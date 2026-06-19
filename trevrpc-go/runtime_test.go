@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -287,6 +288,38 @@ func TestBidirectionalStreamingClientServer(t *testing.T) {
 
 	if first.Value != "echo, left" || second.Value != "echo, right" {
 		t.Fatalf("unexpected bidi responses: %q %q", first.Value, second.Value)
+	}
+}
+
+func TestResponseStreamTerminalOKDoesNotHideCloseError(t *testing.T) {
+	message := &testMessage{Value: "first"}
+	body, err := MarshalMessage(message)
+	if err != nil {
+		t.Fatalf("marshal message: %v", err)
+	}
+	closeErr := InvalidArgument("local upload failed")
+	stream := newResponseMessageStream[*testMessage](
+		&closeErrorFrameStream{
+			frames: []*RpcStreamFrame{MessageFrame(body), StatusFrame(OK())},
+			err:    closeErr,
+		},
+		func() *testMessage { return &testMessage{} },
+		DefaultCallOptions(),
+		context.Background(),
+		func() {},
+	)
+
+	first, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("first response failed: %v", err)
+	}
+	if first.Value != message.Value {
+		t.Fatalf("unexpected first response: %q", first.Value)
+	}
+
+	_, err = stream.Recv()
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("expected close error %v, got %v", closeErr, err)
 	}
 }
 
@@ -887,6 +920,40 @@ func TestWebTransportDroppedResponseStreamCancelsServerWork(t *testing.T) {
 	waitForMetricCode(t, metrics, CodeCancelled)
 }
 
+func TestQuicTerminalStatusClosesPendingRequestStream(t *testing.T) {
+	running := startTestQUICServer(t, registerRejectUploadRoute)
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	requests := newBlockingTestMessages()
+
+	replies, err := BidirectionalStreaming(context.Background(), NewQuicClient(conn), testServiceName, "RejectUpload", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	if err != nil {
+		t.Fatalf("start rejecting bidi stream: %v", err)
+	}
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodePermissionDenied {
+		t.Fatalf("expected permission denied, got %v (%v)", code, err)
+	}
+	requests.waitClosed(t)
+}
+
+func TestWebTransportTerminalStatusClosesPendingRequestStream(t *testing.T) {
+	running := startTestWebTransportServer(t, registerRejectUploadRoute)
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	requests := newBlockingTestMessages()
+
+	replies, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "RejectUpload", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	if err != nil {
+		t.Fatalf("start rejecting WebTransport bidi stream: %v", err)
+	}
+	_, err = replies.Recv()
+	if code := StatusFromError(err).Code; code != CodePermissionDenied {
+		t.Fatalf("expected permission denied, got %v (%v)", code, err)
+	}
+	requests.waitClosed(t)
+}
+
 func TestQuicShutdownClosesActiveConnections(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
@@ -1309,6 +1376,59 @@ func registerTestGreeter(server *Server) {
 	server.RouteStreaming(testServiceName, "BidiHello", RpcKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
 		return EncodeStream[*testMessage](&echoTestMessages{requests: DecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} })}), nil
 	})
+}
+
+func registerRejectUploadRoute(server *Server) {
+	server.RouteStreaming(testServiceName, "RejectUpload", RpcKindBidirectionalStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return nil, NewStatus(CodePermissionDenied, "upload rejected")
+	})
+}
+
+type closeErrorFrameStream struct {
+	frames []*RpcStreamFrame
+	err    error
+}
+
+func (s *closeErrorFrameStream) Recv() (*RpcStreamFrame, error) {
+	if len(s.frames) == 0 {
+		return nil, io.EOF
+	}
+
+	frame := s.frames[0]
+	s.frames = s.frames[1:]
+	return frame, nil
+}
+
+func (s *closeErrorFrameStream) Close() error {
+	return s.err
+}
+
+type blockingTestMessages struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBlockingTestMessages() *blockingTestMessages {
+	return &blockingTestMessages{closed: make(chan struct{})}
+}
+
+func (s *blockingTestMessages) Recv() (*testMessage, error) {
+	<-s.closed
+	return nil, io.EOF
+}
+
+func (s *blockingTestMessages) Close() error {
+	s.once.Do(func() { close(s.closed) })
+	return nil
+}
+
+func (s *blockingTestMessages) waitClosed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.closed:
+	case <-time.After(testTimeout):
+		t.Fatal("request stream was not closed")
+	}
 }
 
 type firstThenPendingTestMessages struct {
