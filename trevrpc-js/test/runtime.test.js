@@ -695,6 +695,60 @@ test("WebTransport terminal error wins over local upload error", async () => {
   );
 });
 
+test("WebTransport response stream return is idempotent after local upload error", async () => {
+  const uploadError = invalidArgument("local upload failed");
+  let aborts = 0;
+  let cancels = 0;
+  const stream = fakeBidirectionalStream({
+    onAbort() {
+      aborts += 1;
+    },
+    onCancel() {
+      cancels += 1;
+    },
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+  const requestBody = {
+    [Symbol.asyncIterator]() {
+      let first = true;
+      return {
+        next() {
+          if (first) {
+            first = false;
+            return Promise.resolve({ done: false, value: new Uint8Array([1]) });
+          }
+          return Promise.reject(uploadError);
+        },
+      };
+    },
+  };
+
+  const responses = await client.streamingCall(
+    RpcRequest.create({
+      service: "hello.v1.Greeter",
+      method: "BidiHello",
+      body: new Uint8Array(),
+      metadata: {},
+      kind: RpcKind.BidirectionalStreaming,
+      version: WireVersion,
+    }),
+    requestBody,
+  );
+
+  await assert.rejects(responses.return(), (error) => error.code === Code.InvalidArgument);
+  const abortsAfterFirstReturn = aborts;
+  const cancelsAfterFirstReturn = cancels;
+
+  assert.deepEqual(await responses.return(), { done: true, value: undefined });
+  assert.equal(aborts, abortsAfterFirstReturn);
+  assert.equal(cancels, cancelsAfterFirstReturn);
+});
+
 test("generator emits JavaScript service clients", () => {
   const response = generateBindings(greeterRequest());
   const generatedJavaScript = generatedFile(response, "hello/v1/greeter.trevrpc.js");

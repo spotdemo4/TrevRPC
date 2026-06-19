@@ -716,6 +716,37 @@ async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
 }
 
 #[tokio::test]
+async fn webtransport_dropped_response_stream_cancels_server_work() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let server_metrics = metrics.clone();
+    let server = spawn_webtransport_greeter_server(move |server| {
+        server.set_metrics(server_metrics);
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+
+    let mut replies = greeter_client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "cancel".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    let first = replies
+        .next()
+        .await
+        .expect("response stream should yield first item")?;
+    assert_eq!(first.message, "first");
+
+    drop(replies);
+    metrics.wait_for_code(Code::Cancelled).await;
+
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
     let dropped = DropSignal::default();
     let server = spawn_greeter_server(register_reject_upload_route)?;

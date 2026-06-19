@@ -134,6 +134,8 @@ class WebTransportResponseFrameStream {
     this.done = false;
     this.writerError = null;
     this.writerSettled = false;
+    this.returnDone = null;
+    this.returnErrorReported = false;
     this.cleanupAbort = cleanupAbort;
     this.writerDone = writerTask
       .catch((error) => {
@@ -191,14 +193,25 @@ class WebTransportResponseFrameStream {
   }
 
   async return() {
-    this.done = true;
-    await cancelReader(this.reader);
-    await abortWriter(this.writer);
-    releaseLock(this.reader);
-    releaseLock(this.writer);
-    this.cleanupAbort();
-    await this.writerDone;
-    if (this.writerError != null && this.writerError.code !== Code.Cancelled) {
+    if (this.returnDone == null) {
+      this.done = true;
+      this.returnDone = (async () => {
+        await cancelReader(this.reader);
+        await abortWriter(this.writer);
+        releaseLock(this.reader);
+        releaseLock(this.writer);
+        this.cleanupAbort();
+        await this.writerDone;
+      })();
+    }
+
+    await this.returnDone;
+    if (
+      !this.returnErrorReported &&
+      this.writerError != null &&
+      this.writerError.code !== Code.Cancelled
+    ) {
+      this.returnErrorReported = true;
       throw this.writerError;
     }
     return { done: true, value: undefined };

@@ -20,6 +20,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Rust handler task panics and metrics callback panics are isolated and returned as stable statuses.
 - Go and Rust shutdown cancellation reaches active native QUIC/WebTransport stream tasks.
 - Streaming terminal-status, early-close, upload-writer, and request-iterable cleanup paths have targeted coverage.
+- Public response-stream close/drop/return semantics are documented and covered for Go, JavaScript, and Rust transports.
 - Slowloris-style partial-header, partial-body, and oversized-initial-frame tests exist where the transports expose those states.
 - Shutdown tests cover stuck handlers and long-running streams.
 
@@ -40,8 +41,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 
 ### 3. Streaming Lifecycle and Error Propagation
 
-- Give public response-stream APIs an explicit close/cancel contract and document whether close drains, aborts, or waits.
-- Verify terminal status handling cancels or drains receive sides consistently across Go, JavaScript, and Rust.
+- Add more close/drop/return race tests against terminal statuses, local cancellation, and local upload failures.
 - Finish cross-runtime coverage for local encode/write failures racing successful remote responses.
 
 ### 4. Protocol and Security Validation

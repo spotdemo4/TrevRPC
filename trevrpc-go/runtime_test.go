@@ -308,6 +308,35 @@ func TestResponseStreamTerminalOKDoesNotHideCloseError(t *testing.T) {
 	}
 }
 
+func TestResponseStreamCloseIsIdempotentAndSurfacesCloseError(t *testing.T) {
+	closeErr := InvalidArgument("local close failed")
+	inner := &closeErrorFrameStream{err: closeErr}
+	cancels := 0
+	stream := newResponseMessageStream[*testMessage](
+		inner,
+		func() *testMessage { return &testMessage{} },
+		DefaultCallOptions(),
+		context.Background(),
+		func() { cancels++ },
+	)
+
+	if err := stream.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("expected first close error %v, got %v", closeErr, err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("second close should be idempotent, got %v", err)
+	}
+	if inner.closed != 1 {
+		t.Fatalf("underlying stream closed %d times, want 1", inner.closed)
+	}
+	if cancels != 1 {
+		t.Fatalf("cancel called %d times, want 1", cancels)
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("closed response stream Recv() = %v, want EOF", err)
+	}
+}
+
 func TestServerRejectsUnsupportedWireVersionBeforeRouteLookup(t *testing.T) {
 	server := NewServer()
 	request := NewRpcRequest("example.Greeter", "Missing", nil)
@@ -1518,6 +1547,7 @@ func registerRejectUploadRoute(server *Server) {
 type closeErrorFrameStream struct {
 	frames []*RpcStreamFrame
 	err    error
+	closed int
 }
 
 func (s *closeErrorFrameStream) Recv() (*RpcStreamFrame, error) {
@@ -1531,6 +1561,7 @@ func (s *closeErrorFrameStream) Recv() (*RpcStreamFrame, error) {
 }
 
 func (s *closeErrorFrameStream) Close() error {
+	s.closed++
 	return s.err
 }
 
