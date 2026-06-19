@@ -258,6 +258,7 @@ func (s *Server) HandleStreamingRequest(ctx context.Context, request *RpcRequest
 		cancel()
 		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, StatusFromError(err))
 	}
+	responseBody = closeStreamOnContext(ctx, responseBody)
 
 	return &serverResponseStream{
 		inner:          responseBody,
@@ -417,17 +418,23 @@ func streamLimitsFromOptions(options ServerOptions) streamLimits {
 }
 
 type limitedByteStream struct {
-	inner     ByteStream
-	ctx       context.Context
-	limits    streamLimits
-	direction string
-	messages  int
-	bodySize  int
-	done      bool
+	inner          ByteStream
+	ctx            context.Context
+	limits         streamLimits
+	direction      string
+	messages       int
+	bodySize       int
+	stopCancelRead func()
+	done           bool
 }
 
 func limitByteStream(ctx context.Context, inner ByteStream, limits streamLimits, direction string) ByteStream {
-	return &limitedByteStream{inner: inner, ctx: ctx, limits: limits, direction: direction}
+	stream := &limitedByteStream{inner: inner, ctx: ctx, limits: limits, direction: direction}
+	if cancellable, ok := inner.(contextCancelReadStream); ok {
+		stream.stopCancelRead = cancellable.trevrpcCancelReadOnContext(ctx)
+	}
+
+	return stream
 }
 
 func (s *limitedByteStream) Recv() ([]byte, error) {
@@ -437,12 +444,12 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 
 	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, s.direction)
 	if err != nil {
-		s.done = true
+		s.finish()
 		return nil, err
 	}
 
 	if err := checkStreamLimits(s.direction, s.limits, &s.messages, &s.bodySize, len(body)); err != nil {
-		s.done = true
+		s.finish()
 		return nil, err
 	}
 
@@ -451,18 +458,30 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 
 func (s *limitedByteStream) Close() error {
 	if !s.done {
-		s.done = true
+		s.finish()
 		closeMessageStream(s.inner)
 	}
 
 	return nil
 }
 
+func (s *limitedByteStream) trevrpcContextCancelsRecv() bool {
+	return s.limits.idleTimeout <= 0 && streamContextCancelsRecv(s.inner)
+}
+
+func (s *limitedByteStream) finish() {
+	s.done = true
+	if s.stopCancelRead != nil {
+		s.stopCancelRead()
+		s.stopCancelRead = nil
+	}
+}
+
 func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout time.Duration, direction string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
-	if idleTimeout <= 0 && isNonBlockingStream(stream) {
+	if idleTimeout <= 0 && (isNonBlockingStream(stream) || streamContextCancelsRecv(stream)) {
 		body, err := recvByte(stream, direction)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -569,8 +588,40 @@ func (s *serverResponseStream) Recv() (*RpcStreamFrame, error) {
 	return MessageFrame(body), nil
 }
 
+func (s *serverResponseStream) trevrpcWriteNextFrame(ctx context.Context, writer io.Writer, maxFrameSize int) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
+	if s.done {
+		return true, nil
+	}
+
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response")
+	if err == io.EOF {
+		s.finish(CodeOK)
+		return true, WriteFrame(writer, StatusFrame(OK()), maxFrameSize)
+	}
+	if err != nil {
+		status := StatusFromError(err)
+		s.finish(status.Code)
+		return true, WriteFrame(writer, StatusFrame(status), maxFrameSize)
+	}
+
+	if err := checkStreamLimits("response", s.limits, &s.messages, &s.responseBodyLen, len(body)); err != nil {
+		status := StatusFromError(err)
+		s.finish(status.Code)
+		return true, WriteFrame(writer, StatusFrame(status), maxFrameSize)
+	}
+
+	return false, writeMessageStreamFrame(writer, body, maxFrameSize)
+}
+
 func (s *serverResponseStream) trevrpcNonBlockingStream() bool {
 	return s.limits.idleTimeout <= 0 && isNonBlockingStream(s.inner)
+}
+
+func (s *serverResponseStream) trevrpcContextCancelsRecv() bool {
+	return s.limits.idleTimeout <= 0 && streamContextCancelsRecv(s.inner)
 }
 
 func (s *serverResponseStream) Close() error {

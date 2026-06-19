@@ -28,6 +28,10 @@ type contextCancelsRecvStream interface {
 	trevrpcContextCancelsRecv() bool
 }
 
+type contextCancelReadStream interface {
+	trevrpcCancelReadOnContext(context.Context) func()
+}
+
 // MessagePipe is a sendable message stream.
 type MessagePipe[T any] struct {
 	ctx       context.Context
@@ -193,6 +197,10 @@ func (s *encodeStream[T]) trevrpcNonBlockingStream() bool {
 	return isNonBlockingStream(s.inner)
 }
 
+func (s *encodeStream[T]) trevrpcContextCancelsRecv() bool {
+	return streamContextCancelsRecv(s.inner)
+}
+
 func (s *encodeStream[T]) Recv() ([]byte, error) {
 	message, err := s.inner.Recv()
 	if err != nil {
@@ -238,6 +246,48 @@ func (s *decodeStream[T]) Close() error {
 
 func (s *decodeStream[T]) trevrpcNonBlockingStream() bool {
 	return isNonBlockingStream(s.inner)
+}
+
+func (s *decodeStream[T]) trevrpcContextCancelsRecv() bool {
+	return streamContextCancelsRecv(s.inner)
+}
+
+type contextCloseStream[T any] struct {
+	inner     MessageStream[T]
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func closeStreamOnContext[T any](ctx context.Context, inner MessageStream[T]) MessageStream[T] {
+	if inner == nil || isNonBlockingStream(inner) || streamContextCancelsRecv(inner) {
+		return inner
+	}
+
+	stream := &contextCloseStream[T]{inner: inner, done: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = stream.Close()
+		case <-stream.done:
+		}
+	}()
+
+	return stream
+}
+
+func (s *contextCloseStream[T]) trevrpcContextCancelsRecv() bool { return true }
+
+func (s *contextCloseStream[T]) Recv() (T, error) {
+	return s.inner.Recv()
+}
+
+func (s *contextCloseStream[T]) Close() error {
+	var err error
+	s.closeOnce.Do(func() {
+		close(s.done)
+		err = closeMessageStream(s.inner)
+	})
+	return err
 }
 
 func isNonBlockingStream(stream any) bool {

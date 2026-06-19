@@ -120,33 +120,41 @@ type webTransportResponseStream struct {
 }
 
 func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
-	if s.done {
-		return nil, io.EOF
+	frame, err := s.trevrpcRecvStreamFrameFields()
+	if err != nil {
+		return nil, err
 	}
 
-	frame := &RpcStreamFrame{}
-	read, err := ReadFrameOrEOF(s.stream, frame, s.maxFrameSize)
+	return frame.rpcStreamFrame(), nil
+}
+
+func (s *webTransportResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, error) {
+	if s.done {
+		return streamFrameFields{}, io.EOF
+	}
+
+	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
 	if err != nil {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return nil, writerErr
+			return streamFrameFields{}, writerErr
 		}
-		return nil, webTransportStatus(err)
+		return streamFrameFields{}, webTransportStatus(err)
 	}
 
 	if !read {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return nil, writerErr
+			return streamFrameFields{}, writerErr
 		}
-		return nil, io.EOF
+		return streamFrameFields{}, io.EOF
 	}
 
-	if frame.Kind == RpcStreamFrameKindStatus {
+	if frame.kind == RpcStreamFrameKindStatus {
 		s.finish(false)
-		if frame.StatusValue().IsOK() {
+		if frame.statusValue().IsOK() {
 			if err := s.writerError(true); err != nil {
-				return nil, err
+				return streamFrameFields{}, err
 			}
 		} else {
 			s.ignoreWriterError()
@@ -231,7 +239,7 @@ func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport
 			return webTransportOrContextStatus(ctx, err)
 		}
 
-		if err := WriteFrame(stream, MessageFrame(body), maxFrameSize); err != nil {
+		if err := writeMessageStreamFrame(stream, body, maxFrameSize); err != nil {
 			stream.CancelWrite(cancelledWebTransportStreamCode)
 			return webTransportOrContextStatus(ctx, err)
 		}
@@ -325,13 +333,47 @@ func handleWebTransportSession(ctx context.Context, session *webtransport.Sessio
 			defer release(streamLimit)
 			streamCtx, cancel := contextWithAdditionalCancel(stream.Context(), ctx)
 			defer cancel()
-			handleRPCStream(streamCtx, server, requestLimit, stream)
+			handleRPCStream(streamCtx, server, requestLimit, webTransportRPCStream{stream: stream})
 		})
 	}
 
 	waitForWaitGroup(&streamTasks, server.options.GracefulShutdownTimeout, func() {
 		_ = session.CloseWithError(cancelledWebTransportSessionCode, "server WebTransport stream drain timed out")
 	})
+}
+
+type webTransportRPCStream struct {
+	stream *webtransport.Stream
+}
+
+func (s webTransportRPCStream) Read(data []byte) (int, error) {
+	return s.stream.Read(data)
+}
+
+func (s webTransportRPCStream) Write(data []byte) (int, error) {
+	return s.stream.Write(data)
+}
+
+func (s webTransportRPCStream) Close() error {
+	return s.stream.Close()
+}
+
+func (s webTransportRPCStream) SetReadDeadline(ttl time.Time) error {
+	return s.stream.SetReadDeadline(ttl)
+}
+
+func (s webTransportRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.stream.CancelRead(cancelledWebTransportStreamCode)
+		case <-done:
+		}
+	}()
+
+	return func() { closeOnce.Do(func() { close(done) }) }
 }
 
 func contextWithAdditionalCancel(ctx context.Context, cancelOn context.Context) (context.Context, context.CancelFunc) {

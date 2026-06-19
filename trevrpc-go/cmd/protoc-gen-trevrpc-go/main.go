@@ -67,7 +67,7 @@ func run(reader io.Reader, writer io.Writer) error {
 func generate(request *plugin.CodeGeneratorRequest) *plugin.CodeGeneratorResponse {
 	options, err := parseOptions(request.GetParameter())
 	if err != nil {
-		return &plugin.CodeGeneratorResponse{Error: proto.String(err.Error())}
+		return &plugin.CodeGeneratorResponse{Error: new(err.Error())}
 	}
 
 	filesToGenerate := map[string]bool{}
@@ -84,12 +84,12 @@ func generate(request *plugin.CodeGeneratorRequest) *plugin.CodeGeneratorRespons
 
 		content, err := generateFile(file, request.ProtoFile, index, options)
 		if err != nil {
-			return &plugin.CodeGeneratorResponse{Error: proto.String(err.Error())}
+			return &plugin.CodeGeneratorResponse{Error: new(err.Error())}
 		}
 
 		response.File = append(response.File, &plugin.CodeGeneratorResponse_File{
-			Name:    proto.String(outputFileName(file.GetName(), options.fileSuffix)),
-			Content: proto.String(content),
+			Name:    new(outputFileName(file.GetName(), options.fileSuffix)),
+			Content: new(content),
 		})
 	}
 

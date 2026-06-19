@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"google.golang.org/protobuf/proto"
 	descriptor "google.golang.org/protobuf/types/descriptorpb"
 	plugin "google.golang.org/protobuf/types/pluginpb"
 )
@@ -153,40 +152,40 @@ func greeterRequest() *plugin.CodeGeneratorRequest {
 		FileToGenerate: []string{"hello/v1/greeter.proto"},
 		ProtoFile: []*descriptor.FileDescriptorProto{
 			{
-				Name:    proto.String("hello/v1/greeter.proto"),
-				Package: proto.String("hello.v1"),
-				Options: &descriptor.FileOptions{GoPackage: proto.String("example.com/hello/v1;hellov1")},
+				Name:    new("hello/v1/greeter.proto"),
+				Package: new("hello.v1"),
+				Options: &descriptor.FileOptions{GoPackage: new("example.com/hello/v1;hellov1")},
 				MessageType: []*descriptor.DescriptorProto{
-					{Name: proto.String("HelloRequest")},
-					{Name: proto.String("HelloReply")},
+					{Name: new("HelloRequest")},
+					{Name: new("HelloReply")},
 				},
 				Service: []*descriptor.ServiceDescriptorProto{
 					{
-						Name: proto.String("Greeter"),
+						Name: new("Greeter"),
 						Method: []*descriptor.MethodDescriptorProto{
 							{
-								Name:       proto.String("SayHello"),
-								InputType:  proto.String(".hello.v1.HelloRequest"),
-								OutputType: proto.String(".hello.v1.HelloReply"),
+								Name:       new("SayHello"),
+								InputType:  new(".hello.v1.HelloRequest"),
+								OutputType: new(".hello.v1.HelloReply"),
 							},
 							{
-								Name:            proto.String("LotsOfReplies"),
-								InputType:       proto.String(".hello.v1.HelloRequest"),
-								OutputType:      proto.String(".hello.v1.HelloReply"),
-								ServerStreaming: proto.Bool(true),
+								Name:            new("LotsOfReplies"),
+								InputType:       new(".hello.v1.HelloRequest"),
+								OutputType:      new(".hello.v1.HelloReply"),
+								ServerStreaming: new(true),
 							},
 							{
-								Name:            proto.String("LotsOfGreetings"),
-								InputType:       proto.String(".hello.v1.HelloRequest"),
-								OutputType:      proto.String(".hello.v1.HelloReply"),
-								ClientStreaming: proto.Bool(true),
+								Name:            new("LotsOfGreetings"),
+								InputType:       new(".hello.v1.HelloRequest"),
+								OutputType:      new(".hello.v1.HelloReply"),
+								ClientStreaming: new(true),
 							},
 							{
-								Name:            proto.String("BidiHello"),
-								InputType:       proto.String(".hello.v1.HelloRequest"),
-								OutputType:      proto.String(".hello.v1.HelloReply"),
-								ClientStreaming: proto.Bool(true),
-								ServerStreaming: proto.Bool(true),
+								Name:            new("BidiHello"),
+								InputType:       new(".hello.v1.HelloRequest"),
+								OutputType:      new(".hello.v1.HelloReply"),
+								ClientStreaming: new(true),
+								ServerStreaming: new(true),
 							},
 						},
 					},
@@ -204,7 +203,7 @@ func writeFile(t *testing.T, path string, content string) {
 }
 
 func TestRejectsUnknownOption(t *testing.T) {
-	response := generate(&plugin.CodeGeneratorRequest{Parameter: proto.String("bogus=1")})
+	response := generate(&plugin.CodeGeneratorRequest{Parameter: new("bogus=1")})
 	if !strings.Contains(response.GetError(), "unknown trevrpc-go option") {
 		t.Fatalf("unexpected error: %q", response.GetError())
 	}

@@ -93,40 +93,48 @@ type quicResponseStream struct {
 func (s *quicResponseStream) trevrpcContextCancelsRecv() bool { return true }
 
 func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
-	if s.done {
-		return nil, io.EOF
+	frame, err := s.trevrpcRecvStreamFrameFields()
+	if err != nil {
+		return nil, err
 	}
 
-	frame := &RpcStreamFrame{}
-	read, err := ReadFrameOrEOF(s.stream, frame, s.maxFrameSize)
+	return frame.rpcStreamFrame(), nil
+}
+
+func (s *quicResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, error) {
+	if s.done {
+		return streamFrameFields{}, io.EOF
+	}
+
+	fields, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
 	if err != nil {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return nil, writerErr
+			return streamFrameFields{}, writerErr
 		}
-		return nil, transportStatus(err)
+		return streamFrameFields{}, transportStatus(err)
 	}
 
 	if !read {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return nil, writerErr
+			return streamFrameFields{}, writerErr
 		}
-		return nil, io.EOF
+		return streamFrameFields{}, io.EOF
 	}
 
-	if frame.Kind == RpcStreamFrameKindStatus {
+	if fields.kind == RpcStreamFrameKindStatus {
 		s.finish(false)
-		if frame.StatusValue().IsOK() {
+		if fields.statusValue().IsOK() {
 			if err := s.writerError(true); err != nil {
-				return nil, err
+				return streamFrameFields{}, err
 			}
 		} else {
 			s.ignoreWriterError()
 		}
 	}
 
-	return frame, nil
+	return fields, nil
 }
 
 func (s *quicResponseStream) Close() error {
@@ -208,7 +216,7 @@ func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *Rp
 			return transportOrContextStatus(ctx, err)
 		}
 
-		if err := WriteFrame(stream, MessageFrame(body), maxFrameSize); err != nil {
+		if err := writeMessageStreamFrame(stream, body, maxFrameSize); err != nil {
 			stream.CancelWrite(cancelledStreamCode)
 			return transportOrContextStatus(ctx, err)
 		}
@@ -376,13 +384,51 @@ func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 }
 
 func handleQUICStream(ctx context.Context, server *Server, requestLimit semaphore, stream *quic.Stream) {
-	handleRPCStream(ctx, server, requestLimit, stream)
+	handleRPCStream(ctx, server, requestLimit, quicRPCStream{stream: stream})
+}
+
+type quicRPCStream struct {
+	stream *quic.Stream
+}
+
+func (s quicRPCStream) Read(data []byte) (int, error) {
+	return s.stream.Read(data)
+}
+
+func (s quicRPCStream) Write(data []byte) (int, error) {
+	return s.stream.Write(data)
+}
+
+func (s quicRPCStream) Close() error {
+	return s.stream.Close()
+}
+
+func (s quicRPCStream) SetReadDeadline(ttl time.Time) error {
+	return s.stream.SetReadDeadline(ttl)
+}
+
+func (s quicRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.stream.CancelRead(cancelledStreamCode)
+		case <-done:
+		}
+	}()
+
+	return func() { closeOnce.Do(func() { close(done) }) }
 }
 
 type rpcStream interface {
 	io.Reader
 	io.Writer
 	Close() error
+}
+
+type transportResponseFrameWriter interface {
+	trevrpcWriteNextFrame(context.Context, io.Writer, int) (bool, error)
 }
 
 func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore, stream rpcStream) {
@@ -414,8 +460,31 @@ func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore
 	}
 
 	requestBody := &rpcRequestStream{stream: stream, maxFrameSize: server.options.MaxFrameSize}
+	if request.RPCKind() == RpcKindClientStreaming || request.RPCKind() == RpcKindBidirectionalStreaming {
+		if cancellable, ok := stream.(contextCancelReadStream); ok {
+			requestBody.cancelReadOnContext = cancellable.trevrpcCancelReadOnContext
+		}
+	}
 	response := server.HandleStreamingRequest(ctx, request, requestBody)
 	defer closeMessageStream(response)
+	if frameWriter, ok := response.(transportResponseFrameWriter); ok {
+		for {
+			done, err := frameWriter.trevrpcWriteNextFrame(ctx, stream, server.options.MaxFrameSize)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeMessageStream(response)
+				return
+			}
+			if err != nil {
+				return
+			}
+			if done {
+				break
+			}
+		}
+
+		_ = stream.Close()
+		return
+	}
 	for {
 		frame, err := recvResponseFrame(ctx, response)
 		if err == io.EOF {
@@ -478,7 +547,7 @@ func recvResponseFrame(ctx context.Context, response FrameStream) (*RpcStreamFra
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if isNonBlockingStream(response) {
+	if isNonBlockingStream(response) || streamContextCancelsRecv(response) {
 		frame, err := response.Recv()
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -574,9 +643,22 @@ func writeRPCStatus(stream rpcStream, request *RpcRequest, status *Status, maxFr
 }
 
 type rpcRequestStream struct {
-	stream       io.Reader
-	maxFrameSize int
-	done         bool
+	stream              io.Reader
+	maxFrameSize        int
+	cancelReadOnContext func(context.Context) func()
+	done                bool
+}
+
+func (s *rpcRequestStream) trevrpcContextCancelsRecv() bool {
+	return s.cancelReadOnContext != nil
+}
+
+func (s *rpcRequestStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+	if s.cancelReadOnContext == nil {
+		return func() {}
+	}
+
+	return s.cancelReadOnContext(ctx)
 }
 
 func (s *rpcRequestStream) Recv() ([]byte, error) {
@@ -584,8 +666,7 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	frame := &RpcStreamFrame{}
-	read, err := ReadFrameOrEOF(s.stream, frame, s.maxFrameSize)
+	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
 	if err != nil {
 		s.done = true
 		return nil, transportStatus(err)
@@ -596,15 +677,9 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	frameKind, ok := frame.FrameKind()
-	if !ok {
+	if frame.kind == RpcStreamFrameKindStatus {
 		s.done = true
-		return nil, InvalidArgument("request stream contained an unknown frame kind")
-	}
-
-	if frameKind == RpcStreamFrameKindStatus {
-		s.done = true
-		status := frame.StatusValue()
+		status := frame.statusValue()
 		if status.IsOK() {
 			return nil, io.EOF
 		}
@@ -612,7 +687,7 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 		return nil, status
 	}
 
-	return frame.Body, nil
+	return frame.body, nil
 }
 
 func (s *rpcRequestStream) Close() error {
