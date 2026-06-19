@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -100,6 +101,53 @@ func registerLifecycleRoutes(server *trevrpc.Server) {
 	server.RouteStreaming(serviceName, "FirstThenPending", trevrpc.RpcKindServerStreaming, func(ctx context.Context, _ []byte, _ trevrpc.ByteStream) (trevrpc.ByteStream, error) {
 		return &firstThenPendingStream{ctx: ctx, first: encodeValue("first"), event: "EVENT response_stream_closed"}, nil
 	})
+	server.RouteStreaming(serviceName, "LongReplies", trevrpc.RpcKindServerStreaming, func(_ context.Context, _ []byte, _ trevrpc.ByteStream) (trevrpc.ByteStream, error) {
+		return &sequenceStream{prefix: "reply", count: 256}, nil
+	})
+	server.RouteStreaming(serviceName, "BidiEchoMany", trevrpc.RpcKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests trevrpc.ByteStream) (trevrpc.ByteStream, error) {
+		return &echoByteStream{requests: requests}, nil
+	})
+	server.RouteStreaming(serviceName, "ErrorAfterMessages", trevrpc.RpcKindServerStreaming, func(_ context.Context, _ []byte, _ trevrpc.ByteStream) (trevrpc.ByteStream, error) {
+		return &sequenceStream{prefix: "before-error", count: 32, finalErr: trevrpc.NewStatus(trevrpc.CodePermissionDenied, "stream failed after messages")}, nil
+	})
+}
+
+type sequenceStream struct {
+	prefix   string
+	count    int
+	next     int
+	finalErr error
+}
+
+func (s *sequenceStream) Recv() ([]byte, error) {
+	if s.next >= s.count {
+		if s.finalErr != nil {
+			return nil, s.finalErr
+		}
+
+		return nil, io.EOF
+	}
+
+	value := fmt.Sprintf("%s-%03d", s.prefix, s.next)
+	s.next++
+	return encodeValue(value), nil
+}
+
+func (s *sequenceStream) Close() error {
+	s.next = s.count
+	return nil
+}
+
+type echoByteStream struct {
+	requests trevrpc.ByteStream
+}
+
+func (s *echoByteStream) Recv() ([]byte, error) {
+	return s.requests.Recv()
+}
+
+func (s *echoByteStream) Close() error {
+	return s.requests.Close()
 }
 
 type pendingStream struct {

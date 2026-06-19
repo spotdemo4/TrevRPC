@@ -130,6 +130,47 @@ test(
   },
 );
 
+test(
+  "browser WebTransport long server stream preserves count and order",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleScenario({
+      scenario: "long-server-stream",
+      assertResult(result) {
+        assert.deepEqual(result.values, expectedSequence("reply", 256));
+      },
+    });
+  },
+);
+
+test(
+  "browser WebTransport long bidi stream preserves count and order",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleScenario({
+      scenario: "long-bidi",
+      assertResult(result) {
+        assert.deepEqual(result.values, expectedSequence("echo", 256));
+      },
+    });
+  },
+);
+
+test(
+  "browser WebTransport surfaces terminal error after streamed messages",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleScenario({
+      scenario: "error-after-messages",
+      assertResult(result) {
+        assert.deepEqual(result.values, expectedSequence("before-error", 32));
+        assert.equal(result.code, 7);
+        assert.equal(result.message, "stream failed after messages");
+      },
+    });
+  },
+);
+
 const servers = {
   go: {
     readyPattern: /WebTransport URL: https:\/\/[^\s]+\/trevrpc/,
@@ -352,6 +393,58 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
         await iterator.return();
         return { first: first.value.value };
       }
+      case "long-server-stream": {
+        const stream = await serverStreaming(
+          transport,
+          service,
+          "LongReplies",
+          Message,
+          Message,
+          {},
+          options,
+        );
+        const values = [];
+        for await (const response of stream) {
+          values.push(response.value);
+        }
+        return { values };
+      }
+      case "long-bidi": {
+        const stream = await bidirectionalStreaming(
+          transport,
+          service,
+          "BidiEchoMany",
+          Message,
+          Message,
+          sequenceRequests("echo", 256),
+          options,
+        );
+        const values = [];
+        for await (const response of stream) {
+          values.push(response.value);
+        }
+        return { values };
+      }
+      case "error-after-messages": {
+        const stream = await serverStreaming(
+          transport,
+          service,
+          "ErrorAfterMessages",
+          Message,
+          Message,
+          {},
+          options,
+        );
+        const values = [];
+        try {
+          for await (const response of stream) {
+            values.push(response.value);
+          }
+        } catch (error) {
+          return { code: error.code, message: error.statusMessage, values };
+        }
+        throw new Error("expected terminal error after streamed messages");
+      }
       default:
         throw new Error(`unknown lifecycle scenario ${scenario}`);
     }
@@ -372,6 +465,14 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
         };
       },
     };
+  }
+
+  function sequenceRequests(prefix, count) {
+    return Array.from({ length: count }, (_, index) => ({ value: sequenceValue(prefix, index) }));
+  }
+
+  function sequenceValue(prefix, index) {
+    return `${prefix}-${String(index).padStart(3, "0")}`;
   }
 
   async function webTransportOptions() {
@@ -395,6 +496,10 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
     }
     return bytes;
   }
+}
+
+function expectedSequence(prefix, count) {
+  return Array.from({ length: count }, (_, index) => `${prefix}-${String(index).padStart(3, "0")}`);
 }
 
 async function runBrowserGreeterScenario({

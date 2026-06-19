@@ -36,6 +36,7 @@ This repository is not production-ready yet. Track the remaining work here so ru
 - Browser WebTransport greeter examples document and enforce explicit path, authority, origin, certificate, and bearer-token policy.
 - Playwright Chromium coverage exercises the JavaScript browser WebTransport client against Go and Rust greeter servers across unary, server-streaming, client-streaming, and bidirectional-streaming RPCs with certificate-hash trust, bearer auth, and negative path/origin/authority policy cases.
 - Playwright Chromium lifecycle coverage exercises terminal OK/error while uploads are pending, local abort while a response read is pending, and early response-stream return cancelling server work.
+- Playwright Chromium long-stream coverage exercises bounded server-streaming count/order, bidirectional count/order, and terminal error propagation after streamed messages through real browser WebTransport.
 
 ## Remaining Work
 
@@ -49,12 +50,12 @@ This repository is not production-ready yet. Track the remaining work here so ru
 
 ### 3. Streaming Lifecycle and Error Propagation
 
-- Continue expanding browser/runtime WebTransport lifecycle tests into longer-lived streams and failure cases that Node-style mocks cannot prove.
+- Continue expanding browser/runtime WebTransport lifecycle tests into broader failure cases that Node-style mocks cannot prove.
 
 ### 4. Protocol and Security Validation
 
 - Expand fuzz/property tests into longer-running CI jobs for frame parsing, metadata validation, stream limits, and protobuf wire compatibility.
-- Expand cross-runtime integration beyond Go/Rust native QUIC and JS-browser WebTransport smoke tests to include broader browser matrices and longer-lived streaming sessions.
+- Expand cross-runtime integration beyond Go/Rust native QUIC and JS-browser WebTransport smoke tests to include broader browser matrices and long-running streaming soak sessions.
 
 ### 5. Shutdown, Panics, and Failure Isolation
 

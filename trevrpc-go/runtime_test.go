@@ -1495,13 +1495,14 @@ func TestQuicTerminalStatusClosesPendingRequestStream(t *testing.T) {
 }
 
 func TestQuicTerminalOKSurfacesLocalUploadError(t *testing.T) {
+	firstReceived := make(chan struct{})
 	uploadFailed := make(chan struct{})
 	running := startTestQUICServer(t, func(server *Server) {
-		registerAcceptAfterUploadErrorRoute(server, uploadFailed)
+		registerAcceptAfterUploadErrorRoute(server, firstReceived, uploadFailed)
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed"), onError: func() { close(uploadFailed) }}
+	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed"), beforeError: firstReceived, onError: func() { close(uploadFailed) }}
 
 	replies, err := BidirectionalStreaming(context.Background(), NewQuicClient(conn), testServiceName, "AcceptAfterUploadError", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
@@ -1531,13 +1532,14 @@ func TestWebTransportTerminalStatusClosesPendingRequestStream(t *testing.T) {
 }
 
 func TestWebTransportTerminalOKSurfacesLocalUploadError(t *testing.T) {
+	firstReceived := make(chan struct{})
 	uploadFailed := make(chan struct{})
 	running := startTestWebTransportServer(t, func(server *Server) {
-		registerAcceptAfterUploadErrorRoute(server, uploadFailed)
+		registerAcceptAfterUploadErrorRoute(server, firstReceived, uploadFailed)
 	})
 	transport := connectTestWebTransportClient(t, running)
 	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
-	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed"), onError: func() { close(uploadFailed) }}
+	requests := &firstThenErrorTestMessages{message: &testMessage{Value: "uploaded"}, err: InvalidArgument("local upload failed"), beforeError: firstReceived, onError: func() { close(uploadFailed) }}
 
 	replies, err := BidirectionalStreaming(context.Background(), transport, testServiceName, "AcceptAfterUploadError", requests, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
@@ -1554,6 +1556,11 @@ func TestQuicShutdownClosesActiveConnections(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	transport := NewQuicClient(conn)
 	running.stop(t)
+	select {
+	case <-conn.Context().Done():
+	case <-time.After(testTimeout):
+		t.Fatal("client did not observe server shutdown")
+	}
 
 	_, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "after shutdown"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
 	if code := StatusFromError(err).Code; code != CodeUnavailable {
@@ -2192,18 +2199,15 @@ func registerRejectUploadRoute(server *Server) {
 	})
 }
 
-func registerAcceptAfterUploadErrorRoute(server *Server, uploadFailed <-chan struct{}) {
-	server.RouteStreaming(testServiceName, "AcceptAfterUploadError", RpcKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+func registerAcceptAfterUploadErrorRoute(server *Server, firstReceived chan<- struct{}, uploadFailed <-chan struct{}) {
+	server.RouteStreaming(testServiceName, "AcceptAfterUploadError", RpcKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
 		if _, err := requests.Recv(); err != nil {
+			close(firstReceived)
 			return nil, err
 		}
 
-		select {
-		case <-uploadFailed:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-
+		close(firstReceived)
+		<-uploadFailed
 		return EmptyStream[[]byte](), nil
 	})
 }
@@ -2293,11 +2297,12 @@ type blockingTestMessages struct {
 }
 
 type firstThenErrorTestMessages struct {
-	message *testMessage
-	err     error
-	onError func()
-	once    sync.Once
-	sent    bool
+	message     *testMessage
+	err         error
+	beforeError <-chan struct{}
+	onError     func()
+	once        sync.Once
+	sent        bool
 }
 
 func newBlockingTestMessages() *blockingTestMessages {
@@ -2327,6 +2332,10 @@ func (s *firstThenErrorTestMessages) Recv() (*testMessage, error) {
 	if !s.sent {
 		s.sent = true
 		return s.message, nil
+	}
+
+	if s.beforeError != nil {
+		<-s.beforeError
 	}
 
 	if s.onError != nil {
