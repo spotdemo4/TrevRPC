@@ -608,13 +608,9 @@ async fn handle_stream(
     };
 
     let Some(_request_permit) = try_acquire_permit(request_limit.as_ref()) else {
-        write_rpc_status(
-            send,
-            &request,
-            Status::unavailable("too many concurrent RPCs"),
-            server.max_frame_size(),
-        )
-        .await;
+        let status = Status::unavailable("too many concurrent RPCs");
+        server.record_rejected_request(&request, &status);
+        write_rpc_status(send, &request, status, server.max_frame_size()).await;
         return;
     };
 

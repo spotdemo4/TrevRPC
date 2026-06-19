@@ -339,7 +339,9 @@ func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore
 		return
 	}
 	if !tryAcquire(requestLimit) {
-		writeRPCStatus(stream, request, Unavailable("too many concurrent RPCs"), server.options.MaxFrameSize)
+		status := Unavailable("too many concurrent RPCs")
+		server.recordRejectedRequest(request, status)
+		writeRPCStatus(stream, request, status, server.options.MaxFrameSize)
 		return
 	}
 	defer release(requestLimit)

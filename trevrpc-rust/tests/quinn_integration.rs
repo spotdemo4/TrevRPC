@@ -230,15 +230,17 @@ struct RecordingMetrics {
 }
 
 impl RecordingMetrics {
+    fn codes(&self) -> Vec<Code> {
+        self.codes
+            .lock()
+            .expect("metrics lock should not be poisoned")
+            .clone()
+    }
+
     async fn wait_for_code(&self, code: Code) {
         let wait = async {
             loop {
-                if self
-                    .codes
-                    .lock()
-                    .expect("metrics lock should not be poisoned")
-                    .contains(&code)
-                {
+                if self.codes().contains(&code) {
                     return;
                 }
 
@@ -612,12 +614,15 @@ async fn quinn_stream_concurrency_limit_returns_unavailable() -> TestResult {
 
 #[tokio::test]
 async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
     let server = spawn_greeter_server(|server| {
         server.set_options(
             fast_server_options()
                 .with_max_concurrent_requests(Some(1))
                 .with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
         );
+        server.set_metrics(metrics);
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
@@ -634,6 +639,8 @@ async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
         .expect_err("second request should exceed global request concurrency limit");
 
     assert_eq!(error.into_status().code(), Code::Unavailable);
+    observed_metrics.wait_for_code(Code::Unavailable).await;
+    assert_eq!(observed_metrics.codes(), vec![Code::Unavailable]);
 
     drop(hanging);
     close_client(endpoint, connection).await;

@@ -423,6 +423,107 @@ func TestServerMetricsPanicDoesNotFailRequest(t *testing.T) {
 	}
 }
 
+func TestServerUnaryCompletionMetricsForTerminalStatuses(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		metrics := &recordingMetrics{}
+		server := NewServer()
+		server.SetMetrics(metrics)
+		server.Route("example.Greeter", "SayHello", func(context.Context, []byte) ([]byte, error) {
+			return []byte("hello"), nil
+		})
+
+		response := server.HandleRequest(context.Background(), NewRpcRequest("example.Greeter", "SayHello", nil))
+
+		if CodeFromUint32(response.Status) != CodeOK {
+			t.Fatalf("expected ok status, got %#v", response)
+		}
+		expectMetrics(t, metrics, CodeOK)
+	})
+
+	t.Run("handler error", func(t *testing.T) {
+		metrics := &recordingMetrics{}
+		server := NewServer()
+		server.SetMetrics(metrics)
+		server.Route("example.Greeter", "Denied", func(context.Context, []byte) ([]byte, error) {
+			return nil, NewStatus(CodePermissionDenied, "denied")
+		})
+
+		response := server.HandleRequest(context.Background(), NewRpcRequest("example.Greeter", "Denied", nil))
+
+		if CodeFromUint32(response.Status) != CodePermissionDenied {
+			t.Fatalf("expected permission denied status, got %#v", response)
+		}
+		expectMetrics(t, metrics, CodePermissionDenied)
+	})
+
+	t.Run("panic", func(t *testing.T) {
+		metrics := &recordingMetrics{}
+		server := NewServer()
+		server.SetMetrics(metrics)
+		server.Route("example.Greeter", "Panic", func(context.Context, []byte) ([]byte, error) {
+			panic("boom")
+		})
+
+		response := server.HandleRequest(context.Background(), NewRpcRequest("example.Greeter", "Panic", nil))
+
+		if CodeFromUint32(response.Status) != CodeInternal {
+			t.Fatalf("expected internal status, got %#v", response)
+		}
+		expectMetrics(t, metrics, CodeInternal)
+	})
+
+	t.Run("malformed body", func(t *testing.T) {
+		metrics := &recordingMetrics{}
+		server := NewServer()
+		server.SetMetrics(metrics)
+		RegisterUnary(server, "example.Greeter", "Decode", func() *testMessage { return &testMessage{} }, func(context.Context, *testMessage) (*testMessage, error) {
+			return &testMessage{}, nil
+		})
+
+		response := server.HandleRequest(context.Background(), NewRpcRequest("example.Greeter", "Decode", []byte{0xff}))
+
+		if CodeFromUint32(response.Status) != CodeInvalidArgument {
+			t.Fatalf("expected invalid argument status, got %#v", response)
+		}
+		expectMetrics(t, metrics, CodeInvalidArgument)
+	})
+
+	t.Run("auth rejection", func(t *testing.T) {
+		metrics := &recordingMetrics{}
+		server := NewServer()
+		server.SetMetrics(metrics)
+		server.SetAuthorizer(BearerAuthorizer("token"))
+		server.Route("example.Greeter", "SayHello", func(context.Context, []byte) ([]byte, error) {
+			return []byte("hello"), nil
+		})
+
+		response := server.HandleRequest(context.Background(), NewRpcRequest("example.Greeter", "SayHello", nil))
+
+		if CodeFromUint32(response.Status) != CodeUnauthenticated {
+			t.Fatalf("expected unauthenticated status, got %#v", response)
+		}
+		expectMetrics(t, metrics, CodeUnauthenticated)
+	})
+
+	t.Run("deadline", func(t *testing.T) {
+		metrics := &recordingMetrics{}
+		server := NewServer()
+		server.SetMetrics(metrics)
+		server.Route("example.Greeter", "Slow", func(context.Context, []byte) ([]byte, error) {
+			select {}
+		})
+		request := NewRpcRequest("example.Greeter", "Slow", nil)
+		request.TimeoutNanos = uint64(time.Millisecond)
+
+		response := server.HandleRequest(context.Background(), request)
+
+		if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+			t.Fatalf("expected deadline exceeded status, got %#v", response)
+		}
+		expectMetrics(t, metrics, CodeDeadlineExceeded)
+	})
+}
+
 func TestServerRequestStreamPanicReturnsInternal(t *testing.T) {
 	server := NewServer()
 	server.RouteStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
@@ -581,10 +682,9 @@ func TestResponseStreamCloseRecordsCancelled(t *testing.T) {
 	request.Kind = RpcKindServerStreaming
 	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
 	closeMessageStream(response)
+	closeMessageStream(response)
 
-	if !metrics.hasCode(CodeCancelled) {
-		t.Fatalf("expected cancelled metric, got %#v", metrics.codes)
-	}
+	expectMetrics(t, metrics, CodeCancelled)
 }
 
 func TestClientResponseStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
@@ -709,8 +809,10 @@ func (panickingByteStream) Close() error {
 }
 
 type recordingMetrics struct {
-	mu    sync.Mutex
-	codes []Code
+	mu       sync.Mutex
+	started  []RPCStarted
+	finished []RPCFinished
+	codes    []Code
 }
 
 type panickingMetrics struct{}
@@ -723,11 +825,16 @@ func (panickingMetrics) RPCFinished(RPCFinished) {
 	panic("finished")
 }
 
-func (m *recordingMetrics) RPCStarted(RPCStarted) {}
+func (m *recordingMetrics) RPCStarted(event RPCStarted) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.started = append(m.started, event)
+}
 
 func (m *recordingMetrics) RPCFinished(event RPCFinished) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.finished = append(m.finished, event)
 	m.codes = append(m.codes, event.Code)
 }
 
@@ -735,6 +842,41 @@ func (m *recordingMetrics) hasCode(code Code) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return slices.Contains(m.codes, code)
+}
+
+func (m *recordingMetrics) snapshot() ([]RPCStarted, []RPCFinished) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.started), slices.Clone(m.finished)
+}
+
+func expectMetrics(t *testing.T, metrics *recordingMetrics, codes ...Code) {
+	t.Helper()
+	started, finished := metrics.snapshot()
+	if len(started) != len(codes) {
+		t.Fatalf("started metrics = %d, want %d (%#v)", len(started), len(codes), started)
+	}
+	if len(finished) != len(codes) {
+		t.Fatalf("finished metrics = %d, want %d (%#v)", len(finished), len(codes), finished)
+	}
+	for index, code := range codes {
+		if finished[index].Code != code {
+			t.Fatalf("finished metric %d code = %v, want %v; all=%#v", index, finished[index].Code, code, finished)
+		}
+	}
+}
+
+func expectMetricCodeSnapshot(t *testing.T, metrics *recordingMetrics, codes ...Code) {
+	t.Helper()
+	_, finished := metrics.snapshot()
+	if len(finished) != len(codes) {
+		t.Fatalf("finished metrics = %d, want %d (%#v)", len(finished), len(codes), finished)
+	}
+	for index, code := range codes {
+		if finished[index].Code != code {
+			t.Fatalf("finished metric %d code = %v, want %v; all=%#v", index, finished[index].Code, code, finished)
+		}
+	}
 }
 
 func TestQUICServerConfigAlignsTransportLimits(t *testing.T) {
@@ -1036,11 +1178,13 @@ func TestQuicStreamConcurrencyLimitReturnsUnavailable(t *testing.T) {
 }
 
 func TestQuicRequestConcurrencyLimitReturnsUnavailable(t *testing.T) {
+	metrics := &recordingMetrics{}
 	running := startTestQUICServer(t, func(server *Server) {
 		options := DefaultServerOptions()
 		options.MaxConcurrentRequests = 1
 		options.GracefulShutdownTimeout = 50 * time.Millisecond
 		server.SetOptions(options)
+		server.SetMetrics(metrics)
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
 	conn := connectTestQUICClient(t, running)
@@ -1053,6 +1197,8 @@ func TestQuicRequestConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	if code := StatusFromError(err).Code; code != CodeUnavailable {
 		t.Fatalf("expected unavailable, got %v (%v)", code, err)
 	}
+	waitForMetricCode(t, metrics, CodeUnavailable)
+	expectMetricCodeSnapshot(t, metrics, CodeUnavailable)
 }
 
 func TestQuicConnectionLimitRefusesNewConnections(t *testing.T) {

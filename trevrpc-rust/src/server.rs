@@ -775,6 +775,26 @@ impl Server {
         );
         status_stream(status)
     }
+
+    pub(crate) fn record_rejected_request(&self, request: &RpcRequest, status: &Status) {
+        let started_at = Instant::now();
+        record_rpc_started(
+            self.metrics.as_ref(),
+            &RpcStarted {
+                service: request.service.clone(),
+                method: request.method.clone(),
+                request_body_len: request.body.len(),
+            },
+        );
+        self.finish_streaming_response(
+            &request.service,
+            &request.method,
+            request.body.len(),
+            started_at,
+            0,
+            status.code(),
+        );
+    }
 }
 
 async fn with_deadline<T, F>(future: F, deadline: Option<Instant>) -> std::result::Result<T, Status>
@@ -1163,15 +1183,39 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct TestMetrics {
+        started: Arc<Mutex<usize>>,
         finished: Arc<Mutex<Vec<Code>>>,
     }
 
     impl Metrics for TestMetrics {
+        fn rpc_started(&self, _event: &super::RpcStarted) {
+            *self
+                .started
+                .lock()
+                .expect("metrics lock should not be poisoned") += 1;
+        }
+
         fn rpc_finished(&self, event: &RpcFinished) {
             self.finished
                 .lock()
                 .expect("metrics lock should not be poisoned")
                 .push(event.code);
+        }
+    }
+
+    impl TestMetrics {
+        fn started_count(&self) -> usize {
+            *self
+                .started
+                .lock()
+                .expect("metrics lock should not be poisoned")
+        }
+
+        fn finished_codes(&self) -> Vec<Code> {
+            self.finished
+                .lock()
+                .expect("metrics lock should not be poisoned")
+                .clone()
         }
     }
 
@@ -1260,6 +1304,98 @@ mod tests {
 
         assert_eq!(Code::from_u32(response.status), Code::Ok);
         assert_eq!(response.body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn unary_completion_metrics_are_exactly_once_for_terminal_statuses() {
+        expect_unary_completion(
+            |server| {
+                server.route("example.Greeter", "SayHello", |_| async {
+                    Ok(b"hello".to_vec())
+                });
+            },
+            RpcRequest::new("example.Greeter", "SayHello", Vec::new()),
+            Code::Ok,
+        )
+        .await;
+
+        expect_unary_completion(
+            |server| {
+                server.route("example.Greeter", "Denied", |_| async {
+                    Err(Error::from(Status::new(Code::PermissionDenied, "denied")))
+                });
+            },
+            RpcRequest::new("example.Greeter", "Denied", Vec::new()),
+            Code::PermissionDenied,
+        )
+        .await;
+
+        expect_unary_completion(
+            |server| {
+                server.route("example.Greeter", "Panic", |_| async {
+                    panic!("boom");
+                });
+            },
+            RpcRequest::new("example.Greeter", "Panic", Vec::new()),
+            Code::Internal,
+        )
+        .await;
+
+        expect_unary_completion(
+            |server| {
+                server.set_authorizer(MetadataValueAuthorizer::bearer("token"));
+                server.route("example.Greeter", "SayHello", |_| async {
+                    Ok(b"hello".to_vec())
+                });
+            },
+            RpcRequest::new("example.Greeter", "SayHello", Vec::new()),
+            Code::Unauthenticated,
+        )
+        .await;
+
+        expect_unary_completion(
+            |server| {
+                server.route("example.Greeter", "Slow", |_| async {
+                    std::future::pending::<crate::Result<Vec<u8>>>().await
+                });
+            },
+            RpcRequest::new("example.Greeter", "Slow", Vec::new()).with_timeout_nanos(1_000_000),
+            Code::DeadlineExceeded,
+        )
+        .await;
+
+        let mut invalid_metadata = RpcRequest::new("example.Greeter", "SayHello", Vec::new());
+        invalid_metadata
+            .metadata
+            .insert("Authorization".to_owned(), b"ok".to_vec());
+        expect_unary_completion(
+            |server| {
+                server.route("example.Greeter", "SayHello", |_| async {
+                    Ok(b"hello".to_vec())
+                });
+            },
+            invalid_metadata,
+            Code::InvalidArgument,
+        )
+        .await;
+    }
+
+    async fn expect_unary_completion(
+        configure: impl FnOnce(&mut Server),
+        request: RpcRequest,
+        expected: Code,
+    ) {
+        let metrics = TestMetrics::default();
+        let observed = metrics.clone();
+        let mut server = Server::new();
+        server.set_metrics(metrics);
+        configure(&mut server);
+
+        let response = server.handle_request(request).await;
+
+        assert_eq!(Code::from_u32(response.status), expected);
+        assert_eq!(observed.started_count(), 1);
+        assert_eq!(observed.finished_codes(), vec![expected]);
     }
 
     #[tokio::test]
@@ -1523,6 +1659,33 @@ mod tests {
                 .expect("metrics lock should not be poisoned"),
             vec![Code::Ok]
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_streaming_response_records_cancelled_once() {
+        let metrics = TestMetrics::default();
+        let observed = metrics.clone();
+        let mut server = Server::new();
+        server.set_metrics(metrics);
+        server.route_streaming(
+            "example.Greeter",
+            "Download",
+            RpcKind::ServerStreaming,
+            |_body, _requests| async move {
+                Ok(Box::new(PendingStream) as crate::BoxMessageStream<Vec<u8>>)
+            },
+        );
+
+        let request = RpcRequest::new("example.Greeter", "Download", Vec::new())
+            .with_kind(RpcKind::ServerStreaming);
+        let response = server
+            .handle_streaming_request(request, crate::stream::empty())
+            .await;
+
+        drop(response);
+
+        assert_eq!(observed.started_count(), 1);
+        assert_eq!(observed.finished_codes(), vec![Code::Cancelled]);
     }
 
     #[tokio::test]
