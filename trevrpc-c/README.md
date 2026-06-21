@@ -106,7 +106,7 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 | Low-level WebTransport wrapper                   | Yes        | Yes                                                   |
 | Server runtime policy options                    | Yes        | Yes                                                   |
 | Server runtime policy enforcement                | Yes        | Partial: stream limits and overload handling          |
-| Graceful shutdown timeout                        | Yes        | Partial                                               |
+| Graceful shutdown timeout                        | Yes        | Yes                                                   |
 | Metrics callbacks                                | Yes        | No                                                    |
 | First-class status helpers                       | Yes        | Yes                                                   |
 | Generated typed C protobuf helpers               | No         | Partial generator support, runtime helpers incomplete |

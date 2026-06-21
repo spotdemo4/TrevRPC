@@ -4,8 +4,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Runtime Policy
 
-- Add graceful shutdown behavior that stops accepting new work, waits for active work, then force-closes remaining sessions after timeout.
-
 ## Authorization And Metadata Policy
 
 - Add a server authorizer callback that runs after protocol validation and before route dispatch.

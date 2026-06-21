@@ -160,6 +160,26 @@ static int trevrpc_clock_now(struct timespec* out_now) {
     return 0;
 }
 
+static int trevrpc_realtime_deadline(uint64_t timeout_nanos, struct timespec* out_deadline) {
+    if (clock_gettime(CLOCK_REALTIME, out_deadline) != 0) {
+        return -errno;
+    }
+
+    uint64_t seconds = timeout_nanos / TREVRPC_NANOS_PER_SEC;
+    uint64_t nanos = timeout_nanos % TREVRPC_NANOS_PER_SEC;
+    if (seconds > (uint64_t)(INT64_MAX - out_deadline->tv_sec)) {
+        return -EOVERFLOW;
+    }
+
+    out_deadline->tv_sec += (time_t)seconds;
+    out_deadline->tv_nsec += (long)nanos;
+    if (out_deadline->tv_nsec >= (long)TREVRPC_NANOS_PER_SEC) {
+        out_deadline->tv_sec++;
+        out_deadline->tv_nsec -= (long)TREVRPC_NANOS_PER_SEC;
+    }
+    return 0;
+}
+
 static int trevrpc_timespec_compare(const struct timespec* lhs, const struct timespec* rhs) {
     if (lhs->tv_sec < rhs->tv_sec) {
         return -1;
@@ -968,6 +988,41 @@ static trevrpc_server_options trevrpc_server_options_snapshot(trevrpc_server* se
     return options;
 }
 
+static void trevrpc_server_shutdown_connections(trevrpc_server* server) {
+    pthread_mutex_lock(&server->mutex);
+    for (trevrpc_server_conn_ref* ref = server->conns; ref != NULL; ref = ref->next) {
+        trevrpc_msquic_conn_shutdown(ref->conn);
+    }
+    pthread_mutex_unlock(&server->mutex);
+}
+
+static bool trevrpc_server_wait_for_tasks(trevrpc_server* server, uint64_t timeout_nanos) {
+    if (timeout_nanos == 0) {
+        pthread_mutex_lock(&server->mutex);
+        while (server->active_tasks > 0) {
+            pthread_cond_wait(&server->cond, &server->mutex);
+        }
+        pthread_mutex_unlock(&server->mutex);
+        return true;
+    }
+
+    struct timespec deadline = {0};
+    if (trevrpc_realtime_deadline(timeout_nanos, &deadline) != 0) {
+        return false;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    while (server->active_tasks > 0) {
+        int err = pthread_cond_timedwait(&server->cond, &server->mutex, &deadline);
+        if (err == ETIMEDOUT) {
+            pthread_mutex_unlock(&server->mutex);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return true;
+}
+
 static int trevrpc_server_conn_add(
     trevrpc_server* server, trevrpc_msquic_conn* conn, trevrpc_server_conn_ref** out_ref) {
     *out_ref = NULL;
@@ -1429,12 +1484,10 @@ void trevrpc_server_shutdown(trevrpc_server* server) {
 
     pthread_mutex_lock(&server->mutex);
     server->shutting_down = true;
-    for (trevrpc_server_conn_ref* ref = server->conns; ref != NULL; ref = ref->next) {
-        trevrpc_msquic_conn_shutdown(ref->conn);
-    }
     pthread_cond_broadcast(&server->cond);
     pthread_mutex_unlock(&server->mutex);
 
+    trevrpc_server_shutdown_connections(server);
     trevrpc_msquic_listener_shutdown(server->listener);
 }
 
@@ -1444,11 +1497,11 @@ void trevrpc_server_close(trevrpc_server* server) {
     }
 
     trevrpc_server_shutdown(server);
-    pthread_mutex_lock(&server->mutex);
-    while (server->active_tasks > 0) {
-        pthread_cond_wait(&server->cond, &server->mutex);
+    trevrpc_server_options options = trevrpc_server_options_snapshot(server);
+    if (!trevrpc_server_wait_for_tasks(server, options.graceful_shutdown_timeout_nanos)) {
+        trevrpc_server_shutdown_connections(server);
+        (void)trevrpc_server_wait_for_tasks(server, 0);
     }
-    pthread_mutex_unlock(&server->mutex);
 
     trevrpc_msquic_listener_close(server->listener);
     trevrpc_method* method = server->methods;
