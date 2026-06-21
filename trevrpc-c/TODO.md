@@ -6,8 +6,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Authorization And Metadata Policy
 
-- Add tests for unauthenticated, permission-denied, and authorizer failure paths.
-
 ## Metrics And Observability
 
 - Add metrics callbacks equivalent to Go `RPCStarted` and `RPCFinished`.

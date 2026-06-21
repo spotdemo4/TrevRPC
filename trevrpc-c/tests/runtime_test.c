@@ -378,6 +378,24 @@ cleanup:
     return result;
 }
 
+static int test_authorizer_failure_variants(void) {
+    int result = 1;
+    trevrpc_request request = {0};
+    trevrpc_status status = trevrpc_status_ok();
+
+    CHECK_GOTO(trevrpc_authorize_metadata_value(NULL, NULL, &request, &status) == -EINVAL);
+
+    status = trevrpc_status_permission_denied("permission denied", strlen("permission denied"));
+    CHECK_GOTO(status.code == TREVRPC_STATUS_PERMISSION_DENIED);
+    CHECK_GOTO(status.message_len == strlen("permission denied"));
+
+    result = 0;
+
+cleanup:
+    trevrpc_request_reset(&request);
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -416,6 +434,9 @@ int main(void) {
         return 1;
     }
     if (test_bearer_authorizer() != 0) {
+        return 1;
+    }
+    if (test_authorizer_failure_variants() != 0) {
         return 1;
     }
     return 0;
