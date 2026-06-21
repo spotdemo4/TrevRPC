@@ -128,12 +128,21 @@ Blocking APIs include `trevrpc_client_connect`, `trevrpc_client_call_unary`, `tr
 
 `trevrpc_server_shutdown` may be called from another thread while `trevrpc_server_serve` is running. It stops listener acceptance and asks active connections to shut down. `trevrpc_server_close` should be called after serving has stopped and no other thread is using the server.
 
-To serve native QUIC and WebTransport from one handler registry, create a server with either listener and attach the other before serving:
+To serve native QUIC and WebTransport from one handler registry on separate UDP ports, create a server with either listener and attach the other before serving:
 
 ```c
 trevrpc_server* server = NULL;
 trevrpc_server_listen("127.0.0.1", 5000, &config, &server);
 trevrpc_server_add_webtransport_listener(server, &wt_config);
+trevrpc_server_register_unary(server, "svc", "method", handler, NULL);
+trevrpc_server_serve(server);
+```
+
+To serve both transports on one UDP port, create a shared listener. The server routes accepted connections by negotiated ALPN: `trevrpc/1` for native TrevRPC and `h3` for WebTransport.
+
+```c
+trevrpc_server* server = NULL;
+trevrpc_server_listen_shared("127.0.0.1", 5000, &wt_config, &config, &server);
 trevrpc_server_register_unary(server, "svc", "method", handler, NULL);
 trevrpc_server_serve(server);
 ```
@@ -166,7 +175,7 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 
 ## WebTransport Implementation
 
-The C WebTransport transport uses an internal MsQuic-backed HTTP/3/WebTransport implementation. It supports the TrevRPC runtime path for unary and streaming RPCs, plus the low-level `trevrpc_wt_*` listener, session, and bidirectional stream APIs. The implementation intentionally covers the TrevRPC subset first; browser-grade HTTP/3 coverage, datagrams, and malformed-peer hardening remain follow-up work tracked in `WEBTRANSPORT_MIGRATION.md`.
+The C WebTransport transport uses an internal MsQuic-backed HTTP/3/WebTransport implementation. It supports the TrevRPC runtime path for unary and streaming RPCs, shared native/WebTransport listeners, plus the low-level `trevrpc_wt_*` listener, session, and bidirectional stream APIs. The implementation intentionally covers the TrevRPC subset first; browser-grade HTTP/3 coverage and datagrams remain follow-up work outside the first-cut migration.
 
 ## Typed Protobuf Boundary
 
@@ -183,6 +192,7 @@ The C runtime owns transport, framing, metadata, status, stream limits, and gene
 | Request timeout/deadline enforcement             | Yes        | Yes, cooperative                                      |
 | High-level MsQuic client/server RPC              | Yes        | Yes                                                   |
 | High-level WebTransport client/server RPC        | Yes        | Yes                                                   |
+| Shared native QUIC/WebTransport server listener  | No         | Yes                                                   |
 | Low-level WebTransport wrapper                   | Yes        | Yes                                                   |
 | Server runtime policy options                    | Yes        | Yes                                                   |
 | Server runtime policy enforcement                | Yes        | Partial: stream limits and overload handling          |

@@ -59,6 +59,8 @@ struct trevrpc_msquic_conn {
     HQUIC handle;
     HQUIC registration;
     HQUIC configuration;
+    uint8_t negotiated_alpn[UINT8_MAX];
+    uint8_t negotiated_alpn_len;
     bool owns_endpoint;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -303,8 +305,55 @@ static uint8_t* trevrpc_msquic_append_varint(uint8_t* out, size_t value) {
     return out;
 }
 
-static int trevrpc_msquic_configure_endpoint(
-    const trevrpc_msquic_config* config, bool server, HQUIC* registration, HQUIC* configuration) {
+static int trevrpc_msquic_build_alpn_buffers(const trevrpc_msquic_config* config,
+    const trevrpc_msquic_alpn* alpns,
+    size_t alpns_len,
+    QUIC_BUFFER** out_buffers,
+    uint32_t* out_count) {
+    *out_buffers = NULL;
+    *out_count = 0;
+
+    size_t count = alpns_len;
+    if (alpns == NULL || alpns_len == 0) {
+        if (config == NULL || config->alpn == NULL || config->alpn_len == 0) {
+            return EINVAL;
+        }
+        count = 1;
+    }
+    if (count > UINT32_MAX) {
+        return EINVAL;
+    }
+
+    QUIC_BUFFER* buffers = calloc(count, sizeof(*buffers));
+    if (buffers == NULL) {
+        return ENOMEM;
+    }
+
+    if (alpns == NULL || alpns_len == 0) {
+        buffers[0].Buffer = (uint8_t*)config->alpn;
+        buffers[0].Length = config->alpn_len;
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            if (alpns[i].alpn == NULL || alpns[i].alpn_len == 0) {
+                free(buffers);
+                return EINVAL;
+            }
+            buffers[i].Buffer = (uint8_t*)alpns[i].alpn;
+            buffers[i].Length = alpns[i].alpn_len;
+        }
+    }
+
+    *out_buffers = buffers;
+    *out_count = (uint32_t)count;
+    return 0;
+}
+
+static int trevrpc_msquic_configure_endpoint_with_alpns(const trevrpc_msquic_config* config,
+    const trevrpc_msquic_alpn* alpns,
+    size_t alpns_len,
+    bool server,
+    HQUIC* registration,
+    HQUIC* configuration) {
     int err = trevrpc_msquic_open_api();
     if (err != 0) {
         return err;
@@ -319,9 +368,14 @@ static int trevrpc_msquic_configure_endpoint(
         return (int)status;
     }
 
-    QUIC_BUFFER alpn = {0};
-    alpn.Buffer = (uint8_t*)config->alpn;
-    alpn.Length = config->alpn_len;
+    QUIC_BUFFER* alpn_buffers = NULL;
+    uint32_t alpn_count = 0;
+    err = trevrpc_msquic_build_alpn_buffers(config, alpns, alpns_len, &alpn_buffers, &alpn_count);
+    if (err != 0) {
+        TrevMsQuic->RegistrationClose(*registration);
+        *registration = NULL;
+        return err;
+    }
 
     QUIC_SETTINGS settings = {0};
     if (config->max_idle_timeout_ms > 0) {
@@ -349,7 +403,9 @@ static int trevrpc_msquic_configure_endpoint(
     settings.IsSet.DatagramReceiveEnabled = TRUE;
     settings.DatagramReceiveEnabled = FALSE;
 
-    status = TrevMsQuic->ConfigurationOpen(*registration, &alpn, 1, &settings, sizeof(settings), NULL, configuration);
+    status = TrevMsQuic->ConfigurationOpen(
+        *registration, alpn_buffers, alpn_count, &settings, sizeof(settings), NULL, configuration);
+    free(alpn_buffers);
     if (QUIC_FAILED(status)) {
         TrevMsQuic->RegistrationClose(*registration);
         *registration = NULL;
@@ -381,6 +437,11 @@ static int trevrpc_msquic_configure_endpoint(
     return 0;
 }
 
+static int trevrpc_msquic_configure_endpoint(
+    const trevrpc_msquic_config* config, bool server, HQUIC* registration, HQUIC* configuration) {
+    return trevrpc_msquic_configure_endpoint_with_alpns(config, NULL, 0, server, registration, configuration);
+}
+
 static int trevrpc_msquic_addr(const char* host, uint16_t port, QUIC_ADDR* addr) {
     memset(addr, 0, sizeof(*addr));
     if (strchr(host, ':') != NULL) {
@@ -403,6 +464,18 @@ static int trevrpc_msquic_addr(const char* host, uint16_t port, QUIC_ADDR* addr)
 
 int trevrpc_msquic_listen(
     const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** out_listener) {
+    return trevrpc_msquic_listen_alpns(host, port, config, NULL, 0, out_listener);
+}
+
+int trevrpc_msquic_listen_alpns(const char* host,
+    uint16_t port,
+    const trevrpc_msquic_config* config,
+    const trevrpc_msquic_alpn* alpns,
+    size_t alpns_len,
+    trevrpc_msquic_listener** out_listener) {
+    if (host == NULL || config == NULL || out_listener == NULL) {
+        return EINVAL;
+    }
     *out_listener = NULL;
     trevrpc_msquic_listener* listener = calloc(1, sizeof(*listener));
     if (listener == NULL) {
@@ -412,7 +485,8 @@ int trevrpc_msquic_listen(
     pthread_mutex_init(&listener->mutex, NULL);
     pthread_cond_init(&listener->cond, NULL);
 
-    int err = trevrpc_msquic_configure_endpoint(config, true, &listener->registration, &listener->configuration);
+    int err = trevrpc_msquic_configure_endpoint_with_alpns(
+        config, alpns, alpns_len, true, &listener->registration, &listener->configuration);
     if (err != 0) {
         trevrpc_msquic_listener_close(listener);
         return err;
@@ -432,10 +506,15 @@ int trevrpc_msquic_listen(
         return err;
     }
 
-    QUIC_BUFFER alpn = {0};
-    alpn.Buffer = (uint8_t*)config->alpn;
-    alpn.Length = config->alpn_len;
-    status = TrevMsQuic->ListenerStart(listener->listener, &alpn, 1, &addr);
+    QUIC_BUFFER* alpn_buffers = NULL;
+    uint32_t alpn_count = 0;
+    err = trevrpc_msquic_build_alpn_buffers(config, alpns, alpns_len, &alpn_buffers, &alpn_count);
+    if (err != 0) {
+        trevrpc_msquic_listener_close(listener);
+        return err;
+    }
+    status = TrevMsQuic->ListenerStart(listener->listener, alpn_buffers, alpn_count, &addr);
+    free(alpn_buffers);
     if (QUIC_FAILED(status)) {
         trevrpc_msquic_listener_close(listener);
         return (int)status;
@@ -578,6 +657,18 @@ int trevrpc_msquic_dial(
     }
 
     *out_conn = conn;
+    return 0;
+}
+
+int trevrpc_msquic_conn_negotiated_alpn(trevrpc_msquic_conn* conn, const uint8_t** alpn, size_t* alpn_len) {
+    if (conn == NULL || alpn == NULL || alpn_len == NULL) {
+        return EINVAL;
+    }
+    if (conn->negotiated_alpn_len == 0) {
+        return EINVAL;
+    }
+    *alpn = conn->negotiated_alpn;
+    *alpn_len = conn->negotiated_alpn_len;
     return 0;
 }
 
@@ -1002,6 +1093,10 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     trevrpc_msquic_conn* conn = trevrpc_msquic_conn_alloc(event->NEW_CONNECTION.Connection);
     if (conn == NULL) {
         return QUIC_STATUS_OUT_OF_MEMORY;
+    }
+    if (event->NEW_CONNECTION.Info != NULL && event->NEW_CONNECTION.Info->NegotiatedAlpnLength > 0) {
+        conn->negotiated_alpn_len = event->NEW_CONNECTION.Info->NegotiatedAlpnLength;
+        memcpy(conn->negotiated_alpn, event->NEW_CONNECTION.Info->NegotiatedAlpn, conn->negotiated_alpn_len);
     }
     conn->configuration = listener->configuration;
     conn->registration = listener->registration;

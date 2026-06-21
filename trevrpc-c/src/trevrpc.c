@@ -17,6 +17,7 @@
 #define TREVRPC_NANOS_PER_SEC 1000000000ull
 
 #define TREVRPC_STREAM_LIMIT_DISABLED (-1)
+#define TREVRPC_H3_ALPN "h3"
 
 typedef struct trevrpc_method trevrpc_method;
 typedef struct trevrpc_server_conn_ref trevrpc_server_conn_ref;
@@ -78,6 +79,8 @@ struct trevrpc_server_conn_ref {
 struct trevrpc_server {
     trevrpc_msquic_listener* listener;
     trevrpc_wt_listener* wt_listener;
+    trevrpc_msquic_listener* shared_listener;
+    trevrpc_wt_config shared_wt_config;
     size_t max_frame_size;
     trevrpc_server_options options;
     pthread_mutex_t mutex;
@@ -155,6 +158,35 @@ static trevrpc_msquic_config trevrpc_make_msquic_config(const trevrpc_config* co
     msquic_config.max_stateless_operations = config->max_stateless_operations;
     msquic_config.max_binding_stateless_operations = config->max_binding_stateless_operations;
     return msquic_config;
+}
+
+static trevrpc_msquic_config trevrpc_make_shared_msquic_config(
+    const trevrpc_config* config, const trevrpc_wt_config* wt_config) {
+    trevrpc_msquic_config msquic_config = trevrpc_make_msquic_config(config);
+    if (wt_config != NULL) {
+        if (msquic_config.cert_file == NULL) {
+            msquic_config.cert_file = wt_config->cert_file;
+        }
+        if (msquic_config.key_file == NULL) {
+            msquic_config.key_file = wt_config->key_file;
+        }
+        if (msquic_config.max_idle_timeout_ms == 0) {
+            msquic_config.max_idle_timeout_ms = wt_config->idle_timeout_ms;
+        }
+        uint32_t wt_stream_count = wt_config->max_streams_per_session;
+        if (wt_stream_count > UINT16_MAX) {
+            wt_stream_count = UINT16_MAX;
+        }
+        if (wt_stream_count > msquic_config.peer_bidi_stream_count) {
+            msquic_config.peer_bidi_stream_count = (uint16_t)wt_stream_count;
+        }
+    }
+    return msquic_config;
+}
+
+static bool trevrpc_alpn_equals(const uint8_t* alpn, size_t alpn_len, const char* expected) {
+    size_t expected_len = strlen(expected);
+    return alpn_len == expected_len && memcmp(alpn, expected, expected_len) == 0;
 }
 
 trevrpc_config trevrpc_default_config(void) {
@@ -995,7 +1027,7 @@ int trevrpc_server_add_msquic_listener(
     if (server == NULL || host == NULL) {
         return -EINVAL;
     }
-    if (server->listener != NULL) {
+    if (server->listener != NULL || server->shared_listener != NULL) {
         return -EEXIST;
     }
 
@@ -1007,7 +1039,7 @@ int trevrpc_server_add_webtransport_listener(trevrpc_server* server, const trevr
     if (server == NULL || wt_config == NULL) {
         return -EINVAL;
     }
-    if (server->wt_listener != NULL) {
+    if (server->wt_listener != NULL || server->shared_listener != NULL) {
         return -EEXIST;
     }
 
@@ -1057,6 +1089,43 @@ int trevrpc_server_listen_webtransport(
     return 0;
 }
 
+int trevrpc_server_listen_shared(const char* host,
+    uint16_t port,
+    const trevrpc_wt_config* wt_config,
+    const trevrpc_config* config,
+    trevrpc_server** out_server) {
+    if (host == NULL || wt_config == NULL || out_server == NULL) {
+        return -EINVAL;
+    }
+    *out_server = NULL;
+
+    trevrpc_server* server = NULL;
+    int err = trevrpc_server_new(config, &server);
+    if (err != 0) {
+        return err;
+    }
+
+    trevrpc_msquic_config msquic_config = trevrpc_make_shared_msquic_config(config, wt_config);
+    if (msquic_config.cert_file == NULL || msquic_config.key_file == NULL) {
+        trevrpc_server_close(server);
+        return -EINVAL;
+    }
+    const trevrpc_msquic_alpn alpns[] = {
+        {.alpn = TREVRPC_ALPN, .alpn_len = (uint32_t)(sizeof(TREVRPC_ALPN) - 1)},
+        {.alpn = TREVRPC_H3_ALPN, .alpn_len = (uint32_t)(sizeof(TREVRPC_H3_ALPN) - 1)},
+    };
+    err = trevrpc_msquic_listen_alpns(
+        host, port, &msquic_config, alpns, sizeof(alpns) / sizeof(alpns[0]), &server->shared_listener);
+    if (err != 0) {
+        trevrpc_server_close(server);
+        return err;
+    }
+    server->shared_wt_config = *wt_config;
+
+    *out_server = server;
+    return 0;
+}
+
 #ifdef TREVRPC_TESTING
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server) {
     if (out_server == NULL) {
@@ -1098,26 +1167,12 @@ trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_client* cli
     return client->wt_session;
 }
 
-trevrpc_wt_stream* trevrpc_test_stream_webtransport_stream(trevrpc_stream* stream) {
-    if (stream == NULL || stream->transport != TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
-        return NULL;
-    }
-    return stream->wt_stream;
-}
-
-void trevrpc_test_stream_close_webtransport_raw(trevrpc_stream* stream) {
-    if (stream == NULL || stream->transport != TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
-        return;
-    }
-    (void)trevrpc_wt_stream_abort(stream->wt_stream, 1);
-    trevrpc_wt_stream_close(stream->wt_stream);
-    stream->wt_stream = NULL;
-    stream->owns_stream = false;
-}
-
 int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port) {
-    if (server == NULL || port == NULL || server->wt_listener == NULL) {
+    if (server == NULL || port == NULL || (server->wt_listener == NULL && server->shared_listener == NULL)) {
         return -EINVAL;
+    }
+    if (server->shared_listener != NULL) {
+        return trevrpc_msquic_listener_port(server->shared_listener, port);
     }
     return trevrpc_wt_listener_port(server->wt_listener, port);
 }
@@ -2274,6 +2329,69 @@ static void* trevrpc_conn_thread(void* arg) {
     return NULL;
 }
 
+static int trevrpc_server_start_connection_task(
+    trevrpc_server* server, trevrpc_msquic_conn* conn, trevrpc_wt_session* wt_session) {
+    if (!trevrpc_server_connection_try_start(server)) {
+        trevrpc_transport_record_event(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, 0, "too many concurrent connections");
+        if (conn != NULL) {
+            trevrpc_msquic_conn_close(conn);
+        } else {
+            trevrpc_wt_session_close(wt_session);
+        }
+        return 0;
+    }
+
+    if (!trevrpc_server_task_start(server)) {
+        trevrpc_server_connection_finish(server);
+        if (conn != NULL) {
+            trevrpc_msquic_conn_close(conn);
+        } else {
+            trevrpc_wt_session_close(wt_session);
+        }
+        return 0;
+    }
+
+    trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_OPEN, 0, NULL);
+
+    trevrpc_conn_task* task = malloc(sizeof(*task));
+    if (task == NULL) {
+        trevrpc_transport_record_event(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, -ENOMEM, "failed to allocate connection task");
+        trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, 0, NULL);
+        if (conn != NULL) {
+            trevrpc_msquic_conn_close(conn);
+        } else {
+            trevrpc_wt_session_close(wt_session);
+        }
+        trevrpc_server_connection_finish(server);
+        trevrpc_server_task_finish(server);
+        return -ENOMEM;
+    }
+    task->server = server;
+    task->conn = conn;
+    task->wt_session = wt_session;
+
+    pthread_t thread;
+    int err = pthread_create(&thread, NULL, trevrpc_conn_thread, task);
+    if (err != 0) {
+        trevrpc_transport_record_event(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, -err, "failed to start connection thread");
+        trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, 0, NULL);
+        free(task);
+        if (conn != NULL) {
+            trevrpc_msquic_conn_close(conn);
+        } else {
+            trevrpc_wt_session_close(wt_session);
+        }
+        trevrpc_server_connection_finish(server);
+        trevrpc_server_task_finish(server);
+        return -err;
+    }
+    pthread_detach(thread);
+    return 0;
+}
+
 static int trevrpc_server_serve_transport(trevrpc_server* server, uint32_t transport) {
     int result = 0;
     for (;;) {
@@ -2290,66 +2408,70 @@ static int trevrpc_server_serve_transport(trevrpc_server* server, uint32_t trans
             result = trevrpc_server_is_shutting_down(server) ? 0 : err;
             break;
         }
-        if (!trevrpc_server_connection_try_start(server)) {
-            trevrpc_transport_record_event(
-                server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, 0, "too many concurrent connections");
-            if (conn != NULL) {
-                trevrpc_msquic_conn_close(conn);
-            } else {
-                trevrpc_wt_session_close(wt_session);
-            }
-            continue;
-        }
-
-        if (!trevrpc_server_task_start(server)) {
-            trevrpc_server_connection_finish(server);
-            if (conn != NULL) {
-                trevrpc_msquic_conn_close(conn);
-            } else {
-                trevrpc_wt_session_close(wt_session);
-            }
-            continue;
-        }
-
-        trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_OPEN, 0, NULL);
-
-        trevrpc_conn_task* task = malloc(sizeof(*task));
-        if (task == NULL) {
-            trevrpc_transport_record_event(
-                server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, -ENOMEM, "failed to allocate connection task");
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, 0, NULL);
-            if (conn != NULL) {
-                trevrpc_msquic_conn_close(conn);
-            } else {
-                trevrpc_wt_session_close(wt_session);
-            }
-            trevrpc_server_connection_finish(server);
-            trevrpc_server_task_finish(server);
-            result = -ENOMEM;
+        err = trevrpc_server_start_connection_task(server, conn, wt_session);
+        if (err != 0) {
+            result = err;
             break;
         }
-        task->server = server;
-        task->conn = conn;
-        task->wt_session = wt_session;
+    }
 
-        pthread_t thread;
-        err = pthread_create(&thread, NULL, trevrpc_conn_thread, task);
+    return result;
+}
+
+static int trevrpc_server_serve_shared_transport(trevrpc_server* server) {
+    int result = 0;
+    for (;;) {
+        trevrpc_msquic_conn* conn = NULL;
+        int err = trevrpc_msquic_listener_accept(server->shared_listener, &conn);
+        if (err != 0) {
+            if (!trevrpc_server_is_shutting_down(server)) {
+                trevrpc_transport_record_event(
+                    server, TREVRPC_TRANSPORT_EVENT_LISTENER_ERROR, err, "failed to accept connection");
+            }
+            result = trevrpc_server_is_shutting_down(server) ? 0 : err;
+            break;
+        }
+
+        const uint8_t* alpn = NULL;
+        size_t alpn_len = 0;
+        err = trevrpc_msquic_conn_negotiated_alpn(conn, &alpn, &alpn_len);
         if (err != 0) {
             trevrpc_transport_record_event(
-                server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, -err, "failed to start connection thread");
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, 0, NULL);
-            free(task);
-            if (conn != NULL) {
-                trevrpc_msquic_conn_close(conn);
-            } else {
-                trevrpc_wt_session_close(wt_session);
-            }
-            trevrpc_server_connection_finish(server);
-            trevrpc_server_task_finish(server);
-            result = -err;
-            break;
+                server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, err, "missing negotiated ALPN");
+            trevrpc_msquic_conn_close(conn);
+            continue;
         }
-        pthread_detach(thread);
+
+        if (trevrpc_alpn_equals(alpn, alpn_len, TREVRPC_ALPN)) {
+            err = trevrpc_server_start_connection_task(server, conn, NULL);
+            if (err != 0) {
+                result = err;
+                break;
+            }
+            continue;
+        }
+
+        if (trevrpc_alpn_equals(alpn, alpn_len, TREVRPC_H3_ALPN)) {
+            trevrpc_wt_session* wt_session = NULL;
+            err = trevrpc_wt_accept_session_from_msquic(conn, &server->shared_wt_config, &wt_session);
+            conn = NULL;
+            if (err != 0) {
+                if (!trevrpc_server_is_shutting_down(server)) {
+                    trevrpc_transport_record_event(
+                        server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, err, "failed to accept WebTransport session");
+                }
+                continue;
+            }
+            err = trevrpc_server_start_connection_task(server, NULL, wt_session);
+            if (err != 0) {
+                result = err;
+                break;
+            }
+            continue;
+        }
+
+        trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, 0, "unsupported ALPN");
+        trevrpc_msquic_conn_close(conn);
     }
 
     return result;
@@ -2365,7 +2487,7 @@ int trevrpc_server_serve(trevrpc_server* server) {
     if (server == NULL) {
         return -EINVAL;
     }
-    if (server->listener == NULL && server->wt_listener == NULL) {
+    if (server->listener == NULL && server->wt_listener == NULL && server->shared_listener == NULL) {
         return -EINVAL;
     }
     if (!trevrpc_server_task_start(server)) {
@@ -2375,7 +2497,9 @@ int trevrpc_server_serve(trevrpc_server* server) {
     trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_LISTENER_OPEN, 0, NULL);
 
     int result = 0;
-    if (server->listener != NULL && server->wt_listener != NULL) {
+    if (server->shared_listener != NULL) {
+        result = trevrpc_server_serve_shared_transport(server);
+    } else if (server->listener != NULL && server->wt_listener != NULL) {
         trevrpc_accept_task wt_task = {
             .server = server,
             .transport = TREVRPC_TRANSPORT_KIND_WEBTRANSPORT,
@@ -2420,6 +2544,9 @@ void trevrpc_server_shutdown(trevrpc_server* server) {
     if (server->wt_listener != NULL) {
         trevrpc_wt_listener_shutdown(server->wt_listener);
     }
+    if (server->shared_listener != NULL) {
+        trevrpc_msquic_listener_shutdown(server->shared_listener);
+    }
 }
 
 void trevrpc_server_close(trevrpc_server* server) {
@@ -2439,6 +2566,9 @@ void trevrpc_server_close(trevrpc_server* server) {
     }
     if (server->wt_listener != NULL) {
         trevrpc_wt_listener_close(server->wt_listener);
+    }
+    if (server->shared_listener != NULL) {
+        trevrpc_msquic_listener_close(server->shared_listener);
     }
     trevrpc_method* method = server->methods;
     while (method != NULL) {

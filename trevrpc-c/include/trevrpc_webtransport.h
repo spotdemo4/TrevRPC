@@ -11,6 +11,7 @@ extern "C" {
 typedef struct trevrpc_wt_listener trevrpc_wt_listener;
 typedef struct trevrpc_wt_session trevrpc_wt_session;
 typedef struct trevrpc_wt_stream trevrpc_wt_stream;
+typedef struct trevrpc_msquic_conn trevrpc_msquic_conn;
 
 #define TREV_WT_ERR_CLOSED -3001
 #define TREV_WT_ERR_FRAME_TOO_LARGE -3002
@@ -42,6 +43,8 @@ void trevrpc_wt_listener_shutdown(trevrpc_wt_listener* listener);
 void trevrpc_wt_listener_close(trevrpc_wt_listener* listener);
 
 int trevrpc_wt_dial(const trevrpc_wt_config* config, trevrpc_wt_session** session);
+int trevrpc_wt_accept_session_from_msquic(
+    trevrpc_msquic_conn* conn, const trevrpc_wt_config* config, trevrpc_wt_session** session);
 int trevrpc_wt_session_accept_stream(trevrpc_wt_session* session, trevrpc_wt_stream** stream);
 int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_stream** stream);
 void trevrpc_wt_session_shutdown(trevrpc_wt_session* session);

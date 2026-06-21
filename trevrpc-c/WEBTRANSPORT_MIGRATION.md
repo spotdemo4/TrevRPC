@@ -6,7 +6,7 @@ This tracks replacing the `libwtf` dependency with an internal WebTransport impl
 
 - Remove the external `libwtf` dependency from `trevrpc-c`.
 - Keep the public `trevrpc_wt_*` API stable while internals are replaced.
-- Serve native QUIC and WebTransport from one logical `trevrpc_server` and, eventually, one shared MsQuic listener where practical.
+- Serve native QUIC and WebTransport from one logical `trevrpc_server` and, where desired, one shared MsQuic listener.
 - Support high-level unary and streaming RPCs over WebTransport with the same wire frames and runtime policy as native QUIC.
 
 ## Non-Goals For The First Cut
@@ -40,19 +40,21 @@ This tracks replacing the `libwtf` dependency with an internal WebTransport impl
   - Open bidirectional WebTransport streams.
 - Added integration coverage for native WebTransport unary, server-streaming, client-streaming, bidirectional streaming, and low-level shutdown/close unblock behavior.
 - Added malformed-peer coverage for HTTP/3 control stream type, missing/malformed SETTINGS, malformed QPACK blocks, and invalid CONNECT pseudo-headers.
-- Added high-level WebTransport partial request and stream reset failure coverage.
+- Added high-level WebTransport partial request close failure coverage.
+- Added shared MsQuic listener support that routes native TrevRPC and WebTransport connections by negotiated ALPN.
 - Removed obsolete libwtf-specific documentation and draft workaround text.
 
 ## Current Status
 
 - Multi-listener high-level `trevrpc_server` support exists.
 - `trevrpc_wt_*` is backed by the internal MsQuic/HTTP3/WebTransport implementation.
-- High-level WebTransport RPC CTests cover unary, all streaming shapes, partial requests, and reset/close failure paths.
+- `trevrpc_server_listen_shared` can serve native QUIC and WebTransport on one UDP port.
+- High-level WebTransport RPC CTests cover unary, all streaming shapes, partial requests, and close failure paths.
 - Low-level WebTransport CTests cover session establishment, stream I/O, malformed handshakes, path rejection, and shutdown/close unblock behavior.
 
 ## Remaining Work
 
-- Investigate serving native QUIC and WebTransport from one shared underlying MsQuic listener.
+- None for the first-cut native WebTransport migration.
 
 ## Risks
 

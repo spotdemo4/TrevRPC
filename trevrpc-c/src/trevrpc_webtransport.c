@@ -600,18 +600,32 @@ int trevrpc_wt_listener_accept_session(trevrpc_wt_listener* listener, trevrpc_wt
         return trevrpc_wt_map_msquic_error(err);
     }
 
+    trevrpc_wt_config config = {
+        .path = listener->path,
+        .origin = listener->origin,
+    };
+    return trevrpc_wt_accept_session_from_msquic(conn, &config, out_session);
+}
+
+int trevrpc_wt_accept_session_from_msquic(
+    trevrpc_msquic_conn* conn, const trevrpc_wt_config* config, trevrpc_wt_session** out_session) {
+    if (conn == NULL || config == NULL || out_session == NULL) {
+        return -EINVAL;
+    }
+    *out_session = NULL;
+
     trevrpc_wt_session* session = calloc(1, sizeof(*session));
     if (session == NULL) {
         trevrpc_msquic_conn_close(conn);
         return -ENOMEM;
     }
     session->msquic_conn = conn;
-    err = trevrpc_wt_h3_handshake(session);
+    int err = trevrpc_wt_h3_handshake(session);
     if (err != 0) {
         trevrpc_wt_session_close(session);
         return err;
     }
-    err = trevrpc_wt_accept_connect_stream(session, listener->path, listener->origin);
+    err = trevrpc_wt_accept_connect_stream(session, config->path, config->origin);
     if (err != 0) {
         trevrpc_wt_session_close(session);
         return err;

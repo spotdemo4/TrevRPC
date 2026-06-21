@@ -16,8 +16,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## WebTransport Integration
 
-- Investigate sharing one underlying MsQuic listener between native QUIC and WebTransport.
-
 ## Transport And Packaging
 
 ## Testing

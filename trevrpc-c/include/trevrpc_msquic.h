@@ -12,6 +12,11 @@ typedef struct trevrpc_msquic_listener trevrpc_msquic_listener;
 typedef struct trevrpc_msquic_conn trevrpc_msquic_conn;
 typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 
+typedef struct trevrpc_msquic_alpn {
+    const char* alpn;
+    uint32_t alpn_len;
+} trevrpc_msquic_alpn;
+
 #define TREV_MSQUIC_ERR_CLOSED -1001
 #define TREV_MSQUIC_ERR_FRAME_TOO_LARGE -1002
 #define TREV_MSQUIC_ERR_TIMEOUT -1003
@@ -30,6 +35,12 @@ typedef struct trevrpc_msquic_config {
 
 int trevrpc_msquic_listen(
     const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** listener);
+int trevrpc_msquic_listen_alpns(const char* host,
+    uint16_t port,
+    const trevrpc_msquic_config* config,
+    const trevrpc_msquic_alpn* alpns,
+    size_t alpns_len,
+    trevrpc_msquic_listener** listener);
 int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* port);
 int trevrpc_msquic_listener_accept(trevrpc_msquic_listener* listener, trevrpc_msquic_conn** conn);
 void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener);
@@ -37,6 +48,7 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener);
 
 int trevrpc_msquic_dial(
     const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_conn** conn);
+int trevrpc_msquic_conn_negotiated_alpn(trevrpc_msquic_conn* conn, const uint8_t** alpn, size_t* alpn_len);
 int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
 int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
 void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn);

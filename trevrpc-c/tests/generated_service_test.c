@@ -27,8 +27,6 @@ int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_s
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_stream* stream);
 trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_client* client);
-trevrpc_wt_stream* trevrpc_test_stream_webtransport_stream(trevrpc_stream* stream);
-void trevrpc_test_stream_close_webtransport_raw(trevrpc_stream* stream);
 int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port);
 size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
@@ -599,35 +597,81 @@ cleanup:
     return result;
 }
 
-static int test_webtransport_stream_reset_unblocks_client_receive(void) {
+static int test_shared_listener_native_and_webtransport_unary(void) {
     int result = 1;
-    wt_serve_fixture fixture = {0};
-    trevrpc_config config = {0};
-    trevrpc_stream* stream = NULL;
-    trevrpc_wt_stream* wt_stream = NULL;
-    Hello__V1__HelloReply* reply = NULL;
-    uint32_t status = TREVRPC_STATUS_OK;
+    trevrpc_server* server = NULL;
+    trevrpc_client* native_client = NULL;
+    trevrpc_client* wt_client = NULL;
+    Hello__V1__HelloReply* native_response = NULL;
+    Hello__V1__HelloReply* wt_response = NULL;
+    serve_args args = {0};
+    pthread_t thread = {0};
+    bool thread_started = false;
+    trevrpc_config server_config = {
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_idle_timeout_ms = 1000,
+        .peer_bidi_stream_count = 8,
+    };
+    trevrpc_wt_config wt_server_config = {
+        .path = "/trevrpc",
+        .max_streams_per_session = 8,
+        .idle_timeout_ms = 1000,
+    };
     Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    request.name = "Trev";
+    request.name = "shared";
 
-    CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(hello_v1_greeter_lots_of_replies(fixture.client, &request, &stream) == 0);
-    wt_stream = trevrpc_test_stream_webtransport_stream(stream);
-    CHECK_GOTO(wt_stream != NULL);
-    trevrpc_test_stream_close_webtransport_raw(stream);
-    int recv_err = hello_v1_greeter_recv_hello_v1_hello_reply(stream, &reply, &status);
-    CHECK_GOTO(recv_err == TREV_WT_ERR_CLOSED || recv_err == -EINVAL || recv_err == -ECANCELED);
-    CHECK_GOTO(reply == NULL);
-    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
+    CHECK_GOTO(trevrpc_server_listen_shared("127.0.0.1", 0, &wt_server_config, &server_config, &server) == 0);
+    CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
+    args.server = server;
+    CHECK_GOTO(pthread_create(&thread, NULL, serve_thread, &args) == 0);
+    thread_started = true;
+
+    uint16_t port = 0;
+    CHECK_GOTO(trevrpc_test_server_webtransport_port(server, &port) == 0);
+    trevrpc_config client_config = {0};
+    CHECK_GOTO(trevrpc_client_connect("127.0.0.1", port, &client_config, &native_client) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(native_client, &request, &native_response) == 0);
+    CHECK_GOTO(
+        native_response != NULL && native_response->message != NULL && strcmp(native_response->message, "shared") == 0);
+
+    trevrpc_wt_config wt_client_config = {
+        .host = "127.0.0.1",
+        .port = port,
+        .path = "/trevrpc",
+        .skip_certificate_validation = 1,
+        .max_streams_per_session = 8,
+        .idle_timeout_ms = 1000,
+    };
+    CHECK_GOTO(trevrpc_client_connect_webtransport(&wt_client_config, &client_config, &wt_client) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(wt_client, &request, &wt_response) == 0);
+    CHECK_GOTO(wt_response != NULL && wt_response->message != NULL && strcmp(wt_response->message, "shared") == 0);
+
+    trevrpc_client_close(native_client);
+    native_client = NULL;
+    trevrpc_client_close(wt_client);
+    wt_client = NULL;
+    trevrpc_server_shutdown(server);
+    CHECK_GOTO(pthread_join(thread, NULL) == 0);
+    thread_started = false;
+    CHECK_GOTO(args.result == 0);
 
     result = 0;
 
 cleanup:
-    if (reply != NULL) {
-        hello__v1__hello_reply__free_unpacked(reply, NULL);
+    if (native_response != NULL) {
+        hello__v1__hello_reply__free_unpacked(native_response, NULL);
     }
-    trevrpc_stream_close(stream);
-    close_wt_serve_fixture(&fixture);
+    if (wt_response != NULL) {
+        hello__v1__hello_reply__free_unpacked(wt_response, NULL);
+    }
+    trevrpc_client_close(native_client);
+    trevrpc_client_close(wt_client);
+    if (thread_started) {
+        trevrpc_server_shutdown(server);
+        (void)pthread_join(thread, NULL);
+    }
+    trevrpc_server_close(server);
     return result;
 }
 
@@ -690,7 +734,7 @@ int main(void) {
     if (test_webtransport_serve_loop_partial_request_close() != 0) {
         return 1;
     }
-    if (test_webtransport_stream_reset_unblocks_client_receive() != 0) {
+    if (test_shared_listener_native_and_webtransport_unary() != 0) {
         return 1;
     }
     return 0;

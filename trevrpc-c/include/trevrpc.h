@@ -291,6 +291,11 @@ void trevrpc_request_reset(trevrpc_request* request);
 int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** server);
 int trevrpc_server_listen_webtransport(
     const trevrpc_wt_config* wt_config, const trevrpc_config* config, trevrpc_server** server);
+int trevrpc_server_listen_shared(const char* host,
+    uint16_t port,
+    const trevrpc_wt_config* wt_config,
+    const trevrpc_config* config,
+    trevrpc_server** server);
 int trevrpc_server_add_msquic_listener(
     trevrpc_server* server, const char* host, uint16_t port, const trevrpc_config* config);
 int trevrpc_server_add_webtransport_listener(trevrpc_server* server, const trevrpc_wt_config* wt_config);
