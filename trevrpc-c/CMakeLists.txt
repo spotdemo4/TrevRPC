@@ -73,9 +73,6 @@ if(TREVRPC_BUILD_MSQUIC)
 endif()
 
 if(TREVRPC_BUILD_WEBTRANSPORT)
-    find_path(WTF_INCLUDE_DIR NAMES wtf.h REQUIRED)
-    find_library(WTF_LIBRARY NAMES wtf REQUIRED)
-
     add_library(trevrpc_webtransport STATIC
         src/trevrpc_webtransport.c
     )
@@ -83,9 +80,8 @@ if(TREVRPC_BUILD_WEBTRANSPORT)
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE ${WTF_INCLUDE_DIR}
     )
-    target_link_libraries(trevrpc_webtransport PUBLIC Threads::Threads PRIVATE ${WTF_LIBRARY})
+    target_link_libraries(trevrpc_webtransport PUBLIC Threads::Threads)
     trevrpc_c_warnings(trevrpc_webtransport)
     trevrpc_c_sanitizers(trevrpc_webtransport)
     list(APPEND trevrpc_install_targets trevrpc_webtransport)

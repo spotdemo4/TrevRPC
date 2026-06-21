@@ -6,12 +6,12 @@
 
 The CMake build creates these static libraries by default:
 
-| Library                | Purpose                                                              | Public header            |
-| ---------------------- | -------------------------------------------------------------------- | ------------------------ |
-| `trevrpc_core`         | Wire encoding/decoding and owned value helpers                       | `trevrpc.h`              |
-| `trevrpc_msquic`       | Low-level MsQuic listener, connection, and stream wrappers           | `trevrpc_msquic.h`       |
-| `trevrpc_webtransport` | Low-level libwtf WebTransport listener, session, and stream wrappers | `trevrpc_webtransport.h` |
-| `trevrpc`              | High-level RPC client/server runtime over MsQuic and WebTransport    | `trevrpc.h`              |
+| Library                | Purpose                                                           | Public header            |
+| ---------------------- | ----------------------------------------------------------------- | ------------------------ |
+| `trevrpc_core`         | Wire encoding/decoding and owned value helpers                    | `trevrpc.h`              |
+| `trevrpc_msquic`       | Low-level MsQuic listener, connection, and stream wrappers        | `trevrpc_msquic.h`       |
+| `trevrpc_webtransport` | Native WebTransport listener, session, and stream wrappers        | `trevrpc_webtransport.h` |
+| `trevrpc`              | High-level RPC client/server runtime over MsQuic and WebTransport | `trevrpc.h`              |
 
 `trevrpc.h` is the stable high-level API surface. `trevrpc_msquic.h` and `trevrpc_webtransport.h` expose transport-specific advanced APIs. High-level clients can use MsQuic with `trevrpc_client_connect` or WebTransport with `trevrpc_client_connect_webtransport`; high-level servers can listen on either or both transports.
 
@@ -164,9 +164,9 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 
 `TREVRPC_ERR_FRAME_TOO_LARGE` is the transport-agnostic wire/runtime error used when TrevRPC framing exceeds the configured maximum before bytes are handed to a transport. Transport wrappers keep their own frame-too-large error codes, such as `TREV_MSQUIC_ERR_FRAME_TOO_LARGE` and `TREV_WT_ERR_FRAME_TOO_LARGE`. The high-level runtime normalizes all of these to `TREVRPC_STATUS_RESOURCE_EXHAUSTED` responses.
 
-## WebTransport Draft Workaround
+## WebTransport Implementation
 
-The native WebTransport wrapper pins libwtf to draft-07 because draft-15 currently regresses stream credit on sequential streams. The workaround is centralized in `src/trevrpc_webtransport.c` as `TREV_WT_DRAFT`; remove that pin and retest native WebTransport round trips once libwtf draft-15 stream-credit behavior is fixed.
+The C WebTransport transport is being migrated from `libwtf` to an internal implementation over MsQuic. The public `trevrpc_wt_*` API remains in place during the migration, but WebTransport operations currently return `TREV_WT_ERR_REJECTED` until the internal HTTP/3/WebTransport stack is filled in. See `WEBTRANSPORT_MIGRATION.md` for the staged plan.
 
 ## Typed Protobuf Boundary
 

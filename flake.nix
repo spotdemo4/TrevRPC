@@ -53,7 +53,6 @@
               pkg-config
               protobufc
               libmsquic
-              libwtf
 
               # javascript
               nodejs_24
@@ -157,7 +156,6 @@
             ];
             buildInputs = with pkgs; [
               libmsquic
-              libwtf
               protobufc
             ];
             buildPhase = ''
@@ -178,8 +176,7 @@
                 -Itrevrpc-c/include \
                 -Itrevrpc-c/src \
                 -Ibuild/generated-service-test \
-                -isystem ${pkgs.libmsquic}/include \
-                -isystem ${pkgs.libwtf}/include
+                -isystem ${pkgs.libmsquic}/include
               ctest --test-dir build --output-on-failure
               runHook postCheck
             '';
