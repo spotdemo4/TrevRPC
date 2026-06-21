@@ -1,5 +1,5 @@
-#ifndef TREVRPC_WIRE_H
-#define TREVRPC_WIRE_H
+#ifndef TREVRPC_WIRE_INTERNAL_H
+#define TREVRPC_WIRE_INTERNAL_H
 
 #include "trevrpc.h"
 

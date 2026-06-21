@@ -102,7 +102,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## API Cleanup
 
-- Consider renaming `src/trevrpc_wire.h` to `src/trevrpc_wire_internal.h` to make the internal boundary clear.
 - Review whether `trevrpc_msquic.h` and `trevrpc_webtransport.h` should stay public or move behind an advanced/transport-specific include path.
 - Replace raw numeric `kind` and `status` parameters with typed enums if that improves C API clarity without hurting ABI predictability.
 - Add explicit close vs shutdown naming consistency across MsQuic, WebTransport, client, server, and stream APIs.

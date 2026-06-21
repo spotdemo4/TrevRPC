@@ -1,4 +1,4 @@
-#include "trevrpc_wire.h"
+#include "trevrpc_wire_internal.h"
 
 #include <errno.h>
 #include <stdbool.h>
