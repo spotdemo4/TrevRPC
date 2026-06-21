@@ -516,8 +516,22 @@ cleanup:
     return result;
 }
 
+static int run_metrics_case_with_config(const trevrpc_config* config,
+    const uint8_t* request_body,
+    size_t request_body_len,
+    trevrpc_unary_handler handler,
+    metric_counts* counts);
+
 static int run_metrics_case(
     const uint8_t* request_body, size_t request_body_len, trevrpc_unary_handler handler, metric_counts* counts) {
+    return run_metrics_case_with_config(NULL, request_body, request_body_len, handler, counts);
+}
+
+static int run_metrics_case_with_config(const trevrpc_config* config,
+    const uint8_t* request_body,
+    size_t request_body_len,
+    trevrpc_unary_handler handler,
+    metric_counts* counts) {
     int result = 1;
     trevrpc_server* server = NULL;
     trevrpc_msquic_stream stream = {0};
@@ -528,7 +542,7 @@ static int run_metrics_case(
         .user_data = counts,
     };
 
-    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_test_server_new(config, &server) == 0);
     CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
     if (handler != NULL) {
         CHECK_GOTO(trevrpc_server_register_unary(server, "svc", "method", handler, NULL) == 0);
@@ -734,6 +748,75 @@ cleanup:
     return result;
 }
 
+static int test_error_status_runtime_paths(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    metric_counts counts = {0};
+    const uint8_t invalid_frame[] = {0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0xff};
+    trevrpc_config small_frame_config = trevrpc_default_config();
+
+    CHECK_GOTO(run_metrics_case(invalid_frame, sizeof(invalid_frame), success_handler, &counts) == 0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INVALID_ARGUMENT);
+
+    memset(&counts, 0, sizeof(counts));
+    CHECK_GOTO(trevrpc_wire_encode_request("svc", "method", 99, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(run_metrics_case(frame, frame_len, success_handler, &counts) == 0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INVALID_ARGUMENT);
+    free(frame);
+    frame = NULL;
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    bool version_field_found = false;
+    for (size_t i = 4; i + 1 < frame_len; i++) {
+        if (frame[i] == 0x30) {
+            frame[i + 1] = 2;
+            version_field_found = true;
+            break;
+        }
+    }
+    CHECK_GOTO(version_field_found);
+    memset(&counts, 0, sizeof(counts));
+    CHECK_GOTO(run_metrics_case(frame, frame_len, success_handler, &counts) == 0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_FAILED_PRECONDITION);
+    free(frame);
+    frame = NULL;
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    small_frame_config.max_frame_size = 8;
+    memset(&counts, 0, sizeof(counts));
+    CHECK_GOTO(run_metrics_case_with_config(&small_frame_config, frame, frame_len, success_handler, &counts) == 0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    free(frame);
+    frame = NULL;
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    memset(&counts, 0, sizeof(counts));
+    CHECK_GOTO(run_metrics_case(frame, frame_len, failing_handler, &counts) == 0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL);
+    free(frame);
+    frame = NULL;
+
+    memset(&counts, 0, sizeof(counts));
+    CHECK_GOTO(run_transport_error_case(TREV_MSQUIC_ERR_CLOSED, &counts) == 0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_CANCELLED);
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 1, 4096, &frame, &frame_len) == 0);
+    memset(&counts, 0, sizeof(counts));
+    CHECK_GOTO(run_metrics_case(frame, frame_len, success_handler, &counts) == 0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_DEADLINE_EXCEEDED);
+
+    result = 0;
+
+cleanup:
+    free(frame);
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -793,6 +876,9 @@ int main(void) {
         return 1;
     }
     if (test_transport_status_from_error_is_predictable() != 0) {
+        return 1;
+    }
+    if (test_error_status_runtime_paths() != 0) {
         return 1;
     }
     return 0;
