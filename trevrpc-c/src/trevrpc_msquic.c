@@ -198,8 +198,7 @@ static void trevrpc_msquic_send_release(trevrpc_msquic_stream* stream, trevrpc_m
     }
 
     pthread_mutex_lock(&stream->mutex);
-    bool keep = !stream->closed &&
-                send->capacity <= TREV_MSQUIC_SEND_POOL_MAX_CAPACITY &&
+    bool keep = !stream->closed && send->capacity <= TREV_MSQUIC_SEND_POOL_MAX_CAPACITY &&
                 stream->send_pool_count < TREV_MSQUIC_SEND_POOL_LIMIT;
     if (keep) {
         send->next = stream->send_pool;
@@ -224,7 +223,8 @@ static intptr_t trevrpc_msquic_error_result(int err) {
     return -(intptr_t)err;
 }
 
-static intptr_t trevrpc_msquic_stream_send_buffer(trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len) {
+static intptr_t trevrpc_msquic_stream_send_buffer(
+    trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len) {
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
     bool send_closed = stream->send_closed;
@@ -264,10 +264,7 @@ static uint8_t* trevrpc_msquic_append_varint(uint8_t* out, size_t value) {
 }
 
 static int trevrpc_msquic_configure_endpoint(
-    const trevrpc_msquic_config* config,
-    bool server,
-    HQUIC* registration,
-    HQUIC* configuration) {
+    const trevrpc_msquic_config* config, bool server, HQUIC* registration, HQUIC* configuration) {
     int err = trevrpc_msquic_open_api();
     if (err != 0) {
         return err;
@@ -365,10 +362,7 @@ static int trevrpc_msquic_addr(const char* host, uint16_t port, QUIC_ADDR* addr)
 }
 
 int trevrpc_msquic_listen(
-    const char* host,
-    uint16_t port,
-    const trevrpc_msquic_config* config,
-    trevrpc_msquic_listener** out_listener) {
+    const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** out_listener) {
     *out_listener = NULL;
     trevrpc_msquic_listener* listener = calloc(1, sizeof(*listener));
     if (listener == NULL) {
@@ -384,7 +378,8 @@ int trevrpc_msquic_listen(
         return err;
     }
 
-    QUIC_STATUS status = TrevMsQuic->ListenerOpen(listener->registration, trevrpc_msquic_listener_callback, listener, &listener->listener);
+    QUIC_STATUS status = TrevMsQuic->ListenerOpen(
+        listener->registration, trevrpc_msquic_listener_callback, listener, &listener->listener);
     if (QUIC_FAILED(status)) {
         trevrpc_msquic_listener_close(listener);
         return (int)status;
@@ -440,7 +435,6 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
         return;
     }
 
-
     trevrpc_msquic_listener_shutdown(listener);
 
     if (listener->listener != NULL) {
@@ -484,10 +478,7 @@ void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener) {
 }
 
 int trevrpc_msquic_dial(
-    const char* host,
-    uint16_t port,
-    const trevrpc_msquic_config* config,
-    trevrpc_msquic_conn** out_conn) {
+    const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_conn** out_conn) {
     *out_conn = NULL;
     HQUIC registration = NULL;
     HQUIC configuration = NULL;
@@ -567,7 +558,8 @@ int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_st
         return ENOMEM;
     }
 
-    QUIC_STATUS status = TrevMsQuic->StreamOpen(conn->handle, QUIC_STREAM_OPEN_FLAG_NONE, trevrpc_msquic_stream_callback, stream, &stream->handle);
+    QUIC_STATUS status = TrevMsQuic->StreamOpen(
+        conn->handle, QUIC_STREAM_OPEN_FLAG_NONE, trevrpc_msquic_stream_callback, stream, &stream->handle);
     if (QUIC_FAILED(status)) {
         trevrpc_msquic_stream_close(stream);
         return (int)status;
@@ -698,11 +690,7 @@ static intptr_t trevrpc_msquic_stream_read_exact_locked(trevrpc_msquic_stream* s
     return (intptr_t)copied;
 }
 
-intptr_t trevrpc_msquic_stream_read_frame(
-    trevrpc_msquic_stream* stream,
-    uint8_t** body,
-    size_t* len,
-    size_t max_len) {
+intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
     *body = NULL;
     *len = 0;
 
@@ -714,10 +702,8 @@ intptr_t trevrpc_msquic_stream_read_frame(
         return read;
     }
 
-    size_t body_len = ((size_t)header[0] << 24) |
-                      ((size_t)header[1] << 16) |
-                      ((size_t)header[2] << 8) |
-                      (size_t)header[3];
+    size_t body_len =
+        ((size_t)header[0] << 24) | ((size_t)header[1] << 16) | ((size_t)header[2] << 8) | (size_t)header[3];
     if (body_len > max_len) {
         *len = body_len;
         pthread_mutex_unlock(&stream->mutex);
@@ -762,10 +748,7 @@ intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_
 }
 
 intptr_t trevrpc_msquic_stream_write_message_frame(
-    trevrpc_msquic_stream* stream,
-    const uint8_t* body,
-    size_t body_len,
-    size_t max_len) {
+    trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len) {
     size_t frame_body_len = 0;
     if (body_len > 0) {
         size_t varint_len = trevrpc_msquic_varint_len(body_len);
@@ -799,11 +782,7 @@ intptr_t trevrpc_msquic_stream_write_message_frame(
 }
 
 intptr_t trevrpc_msquic_stream_write_message_frames(
-    trevrpc_msquic_stream* stream,
-    const uint8_t* bodies,
-    const size_t* body_lens,
-    size_t count,
-    size_t max_len) {
+    trevrpc_msquic_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count, size_t max_len) {
     if (count == 0) {
         return 0;
     }
@@ -931,7 +910,8 @@ const char* trevrpc_msquic_error(int code) {
     }
 }
 
-static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(HQUIC listener_handle, void* context, QUIC_LISTENER_EVENT* event) {
+static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
+    HQUIC listener_handle, void* context, QUIC_LISTENER_EVENT* event) {
     (void)listener_handle;
     trevrpc_msquic_listener* listener = context;
     if (event->Type != QUIC_LISTENER_EVENT_NEW_CONNECTION) {
@@ -946,7 +926,8 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(HQUIC listener_hand
     conn->registration = listener->registration;
     TrevMsQuic->SetCallbackHandler(event->NEW_CONNECTION.Connection, (void*)trevrpc_msquic_conn_callback, conn);
 
-    QUIC_STATUS status = TrevMsQuic->ConnectionSetConfiguration(event->NEW_CONNECTION.Connection, listener->configuration);
+    QUIC_STATUS status =
+        TrevMsQuic->ConnectionSetConfiguration(event->NEW_CONNECTION.Connection, listener->configuration);
     if (QUIC_FAILED(status)) {
         trevrpc_msquic_conn_close(conn);
         return status;
@@ -973,7 +954,8 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(HQUIC listener_hand
     return QUIC_STATUS_SUCCESS;
 }
 
-static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(HQUIC connection_handle, void* context, QUIC_CONNECTION_EVENT* event) {
+static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(
+    HQUIC connection_handle, void* context, QUIC_CONNECTION_EVENT* event) {
     trevrpc_msquic_conn* conn = context;
     switch (event->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED:
@@ -987,7 +969,8 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(HQUIC connection_handle
         if (stream == NULL) {
             return QUIC_STATUS_OUT_OF_MEMORY;
         }
-        TrevMsQuic->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream, (void*)trevrpc_msquic_stream_callback, stream);
+        TrevMsQuic->SetCallbackHandler(
+            event->PEER_STREAM_STARTED.Stream, (void*)trevrpc_msquic_stream_callback, stream);
         trevrpc_msquic_stream_node* node = malloc(sizeof(*node));
         if (node == NULL) {
             trevrpc_msquic_stream_close(stream);
@@ -1028,7 +1011,8 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(HQUIC connection_handle
     }
 }
 
-static QUIC_STATUS QUIC_API trevrpc_msquic_stream_callback(HQUIC stream_handle, void* context, QUIC_STREAM_EVENT* event) {
+static QUIC_STATUS QUIC_API trevrpc_msquic_stream_callback(
+    HQUIC stream_handle, void* context, QUIC_STREAM_EVENT* event) {
     trevrpc_msquic_stream* stream = context;
     switch (event->Type) {
     case QUIC_STREAM_EVENT_RECEIVE: {

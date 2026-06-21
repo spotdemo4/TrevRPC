@@ -46,11 +46,7 @@ int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_strea
 void trevrpc_wt_session_close(trevrpc_wt_session* session);
 
 intptr_t trevrpc_wt_stream_read(trevrpc_wt_stream* stream, uint8_t* data, size_t len);
-intptr_t trevrpc_wt_stream_read_frame(
-    trevrpc_wt_stream* stream,
-    uint8_t** body,
-    size_t* len,
-    size_t max_len);
+intptr_t trevrpc_wt_stream_read_frame(trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len);
 intptr_t trevrpc_wt_stream_write(trevrpc_wt_stream* stream, const uint8_t* data, size_t len);
 int trevrpc_wt_stream_shutdown_send(trevrpc_wt_stream* stream);
 int trevrpc_wt_stream_abort(trevrpc_wt_stream* stream, uint32_t error_code);

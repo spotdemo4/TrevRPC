@@ -28,42 +28,25 @@ typedef struct trevrpc_msquic_config {
 } trevrpc_msquic_config;
 
 int trevrpc_msquic_listen(
-    const char* host,
-    uint16_t port,
-    const trevrpc_msquic_config* config,
-    trevrpc_msquic_listener** listener);
+    const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** listener);
 int trevrpc_msquic_listener_accept(trevrpc_msquic_listener* listener, trevrpc_msquic_conn** conn);
 void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener);
 void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener);
 
 int trevrpc_msquic_dial(
-    const char* host,
-    uint16_t port,
-    const trevrpc_msquic_config* config,
-    trevrpc_msquic_conn** conn);
+    const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_conn** conn);
 int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
 int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
 void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn);
 void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn);
 
 intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
-intptr_t trevrpc_msquic_stream_read_frame(
-    trevrpc_msquic_stream* stream,
-    uint8_t** body,
-    size_t* len,
-    size_t max_len);
+intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
 intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_write_message_frame(
-    trevrpc_msquic_stream* stream,
-    const uint8_t* body,
-    size_t body_len,
-    size_t max_len);
+    trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);
 intptr_t trevrpc_msquic_stream_write_message_frames(
-    trevrpc_msquic_stream* stream,
-    const uint8_t* bodies,
-    const size_t* body_lens,
-    size_t count,
-    size_t max_len);
+    trevrpc_msquic_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count, size_t max_len);
 int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream);
 int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream);
 void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream);

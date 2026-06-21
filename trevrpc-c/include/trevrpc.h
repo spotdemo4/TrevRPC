@@ -93,15 +93,13 @@ typedef int (*trevrpc_stream_handler)(void* user_data, const trevrpc_request* re
 trevrpc_config trevrpc_default_config(void);
 
 int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_client** client);
-int trevrpc_client_call_unary(
-    trevrpc_client* client,
+int trevrpc_client_call_unary(trevrpc_client* client,
     const char* service,
     const char* method,
     const uint8_t* body,
     size_t body_len,
     trevrpc_response** response);
-int trevrpc_client_start_stream(
-    trevrpc_client* client,
+int trevrpc_client_start_stream(trevrpc_client* client,
     const char* service,
     const char* method,
     uint32_t kind,
@@ -112,13 +110,8 @@ void trevrpc_client_close(trevrpc_client* client);
 
 int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** server);
 int trevrpc_server_register_unary(
-    trevrpc_server* server,
-    const char* service,
-    const char* method,
-    trevrpc_unary_handler handler,
-    void* user_data);
-int trevrpc_server_register_streaming(
-    trevrpc_server* server,
+    trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data);
+int trevrpc_server_register_streaming(trevrpc_server* server,
     const char* service,
     const char* method,
     uint32_t kind,

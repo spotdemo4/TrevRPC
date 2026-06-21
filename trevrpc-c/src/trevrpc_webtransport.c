@@ -84,12 +84,7 @@ static void trevrpc_wt_client_session_callback(const wtf_session_event_t* event)
 static void trevrpc_wt_stream_callback(const wtf_stream_event_t* event);
 
 static void trevrpc_wt_log_callback(
-    wtf_log_level_t level,
-    const char* component,
-    const char* file,
-    int line,
-    const char* message,
-    void* user_context) {
+    wtf_log_level_t level, const char* component, const char* file, int line, const char* message, void* user_context) {
     (void)user_context;
     fprintf(stderr, "libwtf[%d] %s %s:%d: %s\n", (int)level, component, file, line, message);
 }
@@ -125,6 +120,17 @@ static int trevrpc_wt_result(wtf_result_t result) {
     default:
         return -(4000 + (int)result);
     }
+}
+
+static intptr_t trevrpc_wt_error_result(int err) {
+    if (err == 0) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    if (err < 0) {
+        return err;
+    }
+
+    return -(intptr_t)err;
 }
 
 static char* trevrpc_wt_strdup(const char* value) {
@@ -175,10 +181,7 @@ static void trevrpc_wt_stream_free_chunks(trevrpc_wt_stream* stream) {
     stream->recv_tail = NULL;
 }
 
-static int trevrpc_wt_stream_queue_data(
-    trevrpc_wt_stream* stream,
-    const wtf_buffer_t* buffers,
-    uint32_t buffer_count) {
+static int trevrpc_wt_stream_queue_data(trevrpc_wt_stream* stream, const wtf_buffer_t* buffers, uint32_t buffer_count) {
     size_t total = 0;
     for (uint32_t i = 0; i < buffer_count; i++) {
         if (total > SIZE_MAX - buffers[i].length) {
@@ -279,9 +282,7 @@ static void trevrpc_wt_listener_queue_session(trevrpc_wt_listener* listener, wtf
 }
 
 static wtf_connection_decision_t trevrpc_wt_validate_connection(
-    const wtf_connection_request_t* request,
-    wtf_connection_response_t* response,
-    void* user_context) {
+    const wtf_connection_request_t* request, wtf_connection_response_t* response, void* user_context) {
     (void)response;
     trevrpc_wt_listener* listener = user_context;
     if (listener == NULL) {
@@ -427,7 +428,8 @@ static void trevrpc_wt_stream_callback(const wtf_stream_event_t* event) {
 
     switch (event->type) {
     case WTF_STREAM_EVENT_DATA_RECEIVED:
-        if (trevrpc_wt_stream_queue_data(stream, event->data_received.buffers, event->data_received.buffer_count) != 0) {
+        if (trevrpc_wt_stream_queue_data(stream, event->data_received.buffers, event->data_received.buffer_count) !=
+            0) {
             (void)wtf_stream_abort(event->stream, 1);
         }
         return;
@@ -768,7 +770,7 @@ intptr_t trevrpc_wt_stream_read(trevrpc_wt_stream* stream, uint8_t* data, size_t
         pthread_cond_wait(&stream->cond, &stream->mutex);
     }
     if (stream->recv_head == NULL) {
-        intptr_t result = stream->err != 0 ? stream->err : 0;
+        intptr_t result = stream->err != 0 ? trevrpc_wt_error_result(stream->err) : 0;
         pthread_mutex_unlock(&stream->mutex);
         return result;
     }
@@ -797,7 +799,7 @@ static intptr_t trevrpc_wt_stream_read_exact_locked(trevrpc_wt_stream* stream, u
         }
         if (stream->recv_head == NULL) {
             if (stream->err != 0) {
-                return stream->err;
+                return trevrpc_wt_error_result(stream->err);
             }
             return copied == 0 ? 0 : TREV_WT_ERR_CLOSED;
         }
@@ -820,11 +822,7 @@ static intptr_t trevrpc_wt_stream_read_exact_locked(trevrpc_wt_stream* stream, u
     return (intptr_t)copied;
 }
 
-intptr_t trevrpc_wt_stream_read_frame(
-    trevrpc_wt_stream* stream,
-    uint8_t** body,
-    size_t* len,
-    size_t max_len) {
+intptr_t trevrpc_wt_stream_read_frame(trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
     if (stream == NULL || body == NULL || len == NULL) {
         return -EINVAL;
     }
@@ -839,10 +837,8 @@ intptr_t trevrpc_wt_stream_read_frame(
         return read;
     }
 
-    size_t body_len = ((size_t)header[0] << 24) |
-                      ((size_t)header[1] << 16) |
-                      ((size_t)header[2] << 8) |
-                      (size_t)header[3];
+    size_t body_len =
+        ((size_t)header[0] << 24) | ((size_t)header[1] << 16) | ((size_t)header[2] << 8) | (size_t)header[3];
     if (body_len > max_len) {
         *len = body_len;
         pthread_mutex_unlock(&stream->mutex);

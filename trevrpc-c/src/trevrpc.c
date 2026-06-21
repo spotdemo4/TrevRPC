@@ -294,8 +294,7 @@ static int trevrpc_wire_alloc_frame(size_t body_len, size_t max_frame_size, uint
     return 0;
 }
 
-static int trevrpc_wire_encode_request(
-    const char* service,
+static int trevrpc_wire_encode_request(const char* service,
     const char* method,
     uint32_t kind,
     const uint8_t* body,
@@ -309,10 +308,8 @@ static int trevrpc_wire_encode_request(
 
     size_t service_len = strlen(service);
     size_t method_len = strlen(method);
-    size_t body_frame_len = trevrpc_wire_bytes_field_len(1, service_len) +
-                            trevrpc_wire_bytes_field_len(2, method_len) +
-                            trevrpc_wire_bytes_field_len(3, body_len) +
-                            trevrpc_wire_varint_field_len(5, kind) +
+    size_t body_frame_len = trevrpc_wire_bytes_field_len(1, service_len) + trevrpc_wire_bytes_field_len(2, method_len) +
+                            trevrpc_wire_bytes_field_len(3, body_len) + trevrpc_wire_varint_field_len(5, kind) +
                             trevrpc_wire_varint_field_len(6, TREVRPC_WIRE_VERSION);
     int err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
     if (err != 0) {
@@ -329,7 +326,8 @@ static int trevrpc_wire_encode_request(
     return 0;
 }
 
-static int trevrpc_wire_encode_response(const trevrpc_response* response, size_t max_frame_size, uint8_t** frame, size_t* frame_len) {
+static int trevrpc_wire_encode_response(
+    const trevrpc_response* response, size_t max_frame_size, uint8_t** frame, size_t* frame_len) {
     if (response == NULL) {
         return -EINVAL;
     }
@@ -350,8 +348,7 @@ static int trevrpc_wire_encode_response(const trevrpc_response* response, size_t
     return 0;
 }
 
-static int trevrpc_wire_encode_stream_frame(
-    uint32_t kind,
+static int trevrpc_wire_encode_stream_frame(uint32_t kind,
     uint32_t status,
     const char* message,
     size_t message_len,
@@ -364,10 +361,8 @@ static int trevrpc_wire_encode_stream_frame(
         return -EINVAL;
     }
 
-    size_t body_frame_len = trevrpc_wire_varint_field_len(1, kind) +
-                            trevrpc_wire_varint_field_len(2, status) +
-                            trevrpc_wire_bytes_field_len(3, message_len) +
-                            trevrpc_wire_bytes_field_len(4, body_len);
+    size_t body_frame_len = trevrpc_wire_varint_field_len(1, kind) + trevrpc_wire_varint_field_len(2, status) +
+                            trevrpc_wire_bytes_field_len(3, message_len) + trevrpc_wire_bytes_field_len(4, body_len);
     int err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
     if (err != 0) {
         return err;
@@ -402,11 +397,7 @@ static bool trevrpc_wire_consume_varint(const uint8_t* data, size_t len, size_t*
 }
 
 static bool trevrpc_wire_consume_bytes(
-    const uint8_t* data,
-    size_t len,
-    size_t* offset,
-    const uint8_t** value,
-    size_t* value_len) {
+    const uint8_t* data, size_t len, size_t* offset, const uint8_t** value, size_t* value_len) {
     uint64_t parsed_len = 0;
     if (!trevrpc_wire_consume_varint(data, len, offset, &parsed_len) || parsed_len > len - *offset) {
         return false;
@@ -689,7 +680,8 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
         return -EINVAL;
     }
 
-    intptr_t written = trevrpc_msquic_stream_write_message_frame(stream->stream, body, body_len, stream->max_frame_size);
+    intptr_t written =
+        trevrpc_msquic_stream_write_message_frame(stream->stream, body, body_len, stream->max_frame_size);
     return written < 0 ? (int)written : 0;
 }
 
@@ -700,8 +692,7 @@ int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const ch
 
     uint8_t* frame = NULL;
     size_t frame_len = 0;
-    int err = trevrpc_wire_encode_stream_frame(
-        TREVRPC_STREAM_FRAME_KIND_STATUS,
+    int err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_STATUS,
         status,
         message,
         message_len,
@@ -783,8 +774,7 @@ int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config
     return 0;
 }
 
-int trevrpc_client_call_unary(
-    trevrpc_client* client,
+int trevrpc_client_call_unary(trevrpc_client* client,
     const char* service,
     const char* method,
     const uint8_t* body,
@@ -803,7 +793,8 @@ int trevrpc_client_call_unary(
 
     uint8_t* frame = NULL;
     size_t frame_len = 0;
-    err = trevrpc_wire_encode_request(service, method, TREVRPC_RPC_KIND_UNARY, body, body_len, client->max_frame_size, &frame, &frame_len);
+    err = trevrpc_wire_encode_request(
+        service, method, TREVRPC_RPC_KIND_UNARY, body, body_len, client->max_frame_size, &frame, &frame_len);
     if (err == 0) {
         err = trevrpc_write_frame(stream, frame, frame_len);
     }
@@ -815,7 +806,8 @@ int trevrpc_client_call_unary(
     uint8_t* response_body = NULL;
     size_t response_body_len = 0;
     if (err == 0) {
-        intptr_t read = trevrpc_msquic_stream_read_frame(stream, &response_body, &response_body_len, client->max_frame_size);
+        intptr_t read =
+            trevrpc_msquic_stream_read_frame(stream, &response_body, &response_body_len, client->max_frame_size);
         if (read < 0) {
             err = (int)read;
         } else if (read == 0) {
@@ -831,8 +823,7 @@ int trevrpc_client_call_unary(
     return err;
 }
 
-int trevrpc_client_start_stream(
-    trevrpc_client* client,
+int trevrpc_client_start_stream(trevrpc_client* client,
     const char* service,
     const char* method,
     uint32_t kind,
@@ -855,7 +846,8 @@ int trevrpc_client_start_stream(
 
     uint8_t* frame = NULL;
     size_t frame_len = 0;
-    err = trevrpc_wire_encode_request(service, method, kind, body, body_len, client->max_frame_size, &frame, &frame_len);
+    err =
+        trevrpc_wire_encode_request(service, method, kind, body, body_len, client->max_frame_size, &frame, &frame_len);
     if (err == 0) {
         err = trevrpc_write_frame(raw_stream, frame, frame_len);
     }
@@ -884,11 +876,10 @@ void trevrpc_client_close(trevrpc_client* client) {
     free(client);
 }
 
-static bool trevrpc_method_matches(const trevrpc_method* method, const char* service, size_t service_len, const char* name, size_t name_len) {
-    return method->service_len == service_len &&
-           method->method_len == name_len &&
-           memcmp(method->service, service, service_len) == 0 &&
-           memcmp(method->method, name, name_len) == 0;
+static bool trevrpc_method_matches(
+    const trevrpc_method* method, const char* service, size_t service_len, const char* name, size_t name_len) {
+    return method->service_len == service_len && method->method_len == name_len &&
+           memcmp(method->service, service, service_len) == 0 && memcmp(method->method, name, name_len) == 0;
 }
 
 int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** out_server) {
@@ -917,11 +908,7 @@ int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config*
 }
 
 int trevrpc_server_register_unary(
-    trevrpc_server* server,
-    const char* service,
-    const char* method,
-    trevrpc_unary_handler handler,
-    void* user_data) {
+    trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data) {
     if (server == NULL || service == NULL || method == NULL || handler == NULL) {
         return -EINVAL;
     }
@@ -975,8 +962,7 @@ int trevrpc_server_register_unary(
     return 0;
 }
 
-int trevrpc_server_register_streaming(
-    trevrpc_server* server,
+int trevrpc_server_register_streaming(trevrpc_server* server,
     const char* service,
     const char* method,
     uint32_t kind,
@@ -1064,7 +1050,8 @@ static bool trevrpc_server_is_shutting_down(trevrpc_server* server) {
     return shutting_down;
 }
 
-static int trevrpc_server_conn_add(trevrpc_server* server, trevrpc_msquic_conn* conn, trevrpc_server_conn_ref** out_ref) {
+static int trevrpc_server_conn_add(
+    trevrpc_server* server, trevrpc_msquic_conn* conn, trevrpc_server_conn_ref** out_ref) {
     *out_ref = NULL;
     trevrpc_server_conn_ref* ref = malloc(sizeof(*ref));
     if (ref == NULL) {
@@ -1103,7 +1090,8 @@ static void trevrpc_server_conn_remove(trevrpc_server* server, trevrpc_server_co
 static trevrpc_method* trevrpc_server_find_method(trevrpc_server* server, const trevrpc_request* request) {
     pthread_mutex_lock(&server->mutex);
     for (trevrpc_method* method = server->methods; method != NULL; method = method->next) {
-        if (trevrpc_method_matches(method, request->service, request->service_len, request->method, request->method_len)) {
+        if (trevrpc_method_matches(
+                method, request->service, request->service_len, request->method, request->method_len)) {
             pthread_mutex_unlock(&server->mutex);
             return method;
         }
@@ -1119,7 +1107,8 @@ static void trevrpc_set_status(trevrpc_response* response, uint32_t status, cons
     }
 }
 
-static void trevrpc_server_write_response(trevrpc_msquic_stream* stream, size_t max_frame_size, trevrpc_response* response) {
+static void trevrpc_server_write_response(
+    trevrpc_msquic_stream* stream, size_t max_frame_size, trevrpc_response* response) {
     uint8_t* frame = NULL;
     size_t frame_len = 0;
     int err = trevrpc_wire_encode_response(response, max_frame_size, &frame, &frame_len);
@@ -1135,14 +1124,16 @@ static void trevrpc_server_write_response(trevrpc_msquic_stream* stream, size_t 
     (void)trevrpc_msquic_stream_shutdown_send(stream);
 }
 
-static void trevrpc_server_write_status(trevrpc_msquic_stream* stream, size_t max_frame_size, uint32_t status, const char* message) {
+static void trevrpc_server_write_status(
+    trevrpc_msquic_stream* stream, size_t max_frame_size, uint32_t status, const char* message) {
     trevrpc_response response = {0};
     trevrpc_set_status(&response, status, message);
     trevrpc_server_write_response(stream, max_frame_size, &response);
     trevrpc_response_reset(&response);
 }
 
-static void trevrpc_server_write_stream_status(trevrpc_msquic_stream* stream, size_t max_frame_size, uint32_t status, const char* message) {
+static void trevrpc_server_write_stream_status(
+    trevrpc_msquic_stream* stream, size_t max_frame_size, uint32_t status, const char* message) {
     trevrpc_stream rpc_stream = {
         .stream = stream,
         .max_frame_size = max_frame_size,
@@ -1156,8 +1147,10 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     size_t body_len = 0;
     intptr_t read = trevrpc_msquic_stream_read_frame(stream, &body, &body_len, server->max_frame_size);
     if (read < 0) {
-        uint32_t status = read == TREV_MSQUIC_ERR_FRAME_TOO_LARGE ? TREVRPC_STATUS_RESOURCE_EXHAUSTED : TREVRPC_STATUS_UNAVAILABLE;
-        const char* message = read == TREV_MSQUIC_ERR_FRAME_TOO_LARGE ? "request frame exceeded maximum size" : "failed to read request frame";
+        uint32_t status =
+            read == TREV_MSQUIC_ERR_FRAME_TOO_LARGE ? TREVRPC_STATUS_RESOURCE_EXHAUSTED : TREVRPC_STATUS_UNAVAILABLE;
+        const char* message = read == TREV_MSQUIC_ERR_FRAME_TOO_LARGE ? "request frame exceeded maximum size"
+                                                                      : "failed to read request frame";
         trevrpc_server_write_status(stream, server->max_frame_size, status, message);
         return;
     }
@@ -1168,12 +1161,14 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     trevrpc_request request;
     int err = trevrpc_wire_decode_request(body, body_len, &request);
     if (err == TREVRPC_ERR_INVALID_FRAME) {
-        trevrpc_server_write_status(stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "invalid request frame");
+        trevrpc_server_write_status(
+            stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "invalid request frame");
         trevrpc_msquic_free(body);
         return;
     }
     if (err == TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION) {
-        trevrpc_server_write_status(stream, server->max_frame_size, TREVRPC_STATUS_FAILED_PRECONDITION, "unsupported TrevRPC wire version");
+        trevrpc_server_write_status(
+            stream, server->max_frame_size, TREVRPC_STATUS_FAILED_PRECONDITION, "unsupported TrevRPC wire version");
         trevrpc_msquic_free(body);
         return;
     }
@@ -1185,18 +1180,22 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     trevrpc_method* method = trevrpc_server_find_method(server, &request);
     if (method == NULL) {
         if (request.kind == TREVRPC_RPC_KIND_UNARY) {
-            trevrpc_server_write_status(stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method is not implemented");
+            trevrpc_server_write_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method is not implemented");
         } else {
-            trevrpc_server_write_stream_status(stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method is not implemented");
+            trevrpc_server_write_stream_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method is not implemented");
         }
         trevrpc_msquic_free(body);
         return;
     }
     if (method->kind != request.kind) {
         if (request.kind == TREVRPC_RPC_KIND_UNARY) {
-            trevrpc_server_write_status(stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method RPC kind mismatch");
+            trevrpc_server_write_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method RPC kind mismatch");
         } else {
-            trevrpc_server_write_stream_status(stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method RPC kind mismatch");
+            trevrpc_server_write_stream_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method RPC kind mismatch");
         }
         trevrpc_msquic_free(body);
         return;
@@ -1209,7 +1208,8 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         };
         err = method->stream_handler(method->user_data, &request, &rpc_stream);
         if (err != 0 && !rpc_stream.sent_status) {
-            (void)trevrpc_stream_send_status(&rpc_stream, TREVRPC_STATUS_INTERNAL, "handler failed", strlen("handler failed"));
+            (void)trevrpc_stream_send_status(
+                &rpc_stream, TREVRPC_STATUS_INTERNAL, "handler failed", strlen("handler failed"));
         } else if (!rpc_stream.sent_status) {
             (void)trevrpc_stream_send_status(&rpc_stream, TREVRPC_STATUS_OK, NULL, 0);
         }

@@ -14,6 +14,11 @@ includes = ["*.go"]
 command = "nixfmt"
 includes = ["*.nix"]
 
+[formatter.clang-format]
+command = "clang-format"
+options = ["-i"]
+includes = ["*.c", "*.h"]
+
 [formatter.oxfmt]
 command = "oxfmt"
 options = ["--write"]
