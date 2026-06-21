@@ -353,6 +353,83 @@ void trevrpc_metadata_reset(trevrpc_metadata* metadata) {
     metadata->entries_len = 0;
 }
 
+static int trevrpc_status_copy_message(trevrpc_status* status, uint32_t code, const char* message) {
+    if (status == NULL) {
+        return -EINVAL;
+    }
+
+    *status = trevrpc_status_new(code, message, message == NULL ? 0 : strlen(message));
+    return 0;
+}
+
+static int trevrpc_metadata_contains_value(
+    const trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len) {
+    if (metadata == NULL || key == NULL || key_len == 0 || (value == NULL && value_len > 0)) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < metadata->entries_len; i++) {
+        const trevrpc_metadata_entry* entry = &metadata->entries[i];
+        if (entry->key_len == key_len && entry->value_len == value_len && memcmp(entry->key, key, key_len) == 0 &&
+            (value_len == 0 || memcmp(entry->value, value, value_len) == 0)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+int trevrpc_authorize_metadata_value(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status) {
+    (void)context;
+    const trevrpc_metadata_value_authorizer* authorizer = user_data;
+    if (authorizer == NULL || request == NULL || status == NULL || authorizer->key == NULL ||
+        authorizer->key_len == 0 || (authorizer->value == NULL && authorizer->value_len > 0)) {
+        return -EINVAL;
+    }
+
+    if (trevrpc_metadata_contains_value(
+            &request->metadata, authorizer->key, authorizer->key_len, authorizer->value, authorizer->value_len)) {
+        *status = trevrpc_status_ok();
+        return 0;
+    }
+
+    return trevrpc_status_copy_message(status, TREVRPC_STATUS_UNAUTHENTICATED, "request is not authenticated");
+}
+
+int trevrpc_authorize_bearer_token(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status) {
+    (void)context;
+    const trevrpc_bearer_authorizer* authorizer = user_data;
+    if (authorizer == NULL || request == NULL || status == NULL || authorizer->token == NULL) {
+        return -EINVAL;
+    }
+
+    const char prefix[] = "Bearer ";
+    if (authorizer->token_len > SIZE_MAX - (sizeof(prefix) - 1)) {
+        return -EINVAL;
+    }
+
+    size_t expected_len = sizeof(prefix) - 1 + authorizer->token_len;
+    uint8_t* expected = malloc(expected_len == 0 ? 1 : expected_len);
+    if (expected == NULL) {
+        return -ENOMEM;
+    }
+    memcpy(expected, prefix, sizeof(prefix) - 1);
+    memcpy(expected + sizeof(prefix) - 1, authorizer->token, authorizer->token_len);
+
+    const char key[] = "authorization";
+    trevrpc_metadata_value_authorizer metadata_authorizer = {
+        .key = key,
+        .key_len = sizeof(key) - 1,
+        .value = expected,
+        .value_len = expected_len,
+    };
+    int err = trevrpc_authorize_metadata_value(&metadata_authorizer, context, request, status);
+    free(expected);
+    return err;
+}
+
 void trevrpc_request_reset(trevrpc_request* request) {
     if (request == NULL) {
         return;

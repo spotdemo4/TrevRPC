@@ -6,9 +6,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Authorization And Metadata Policy
 
-- Add a server authorizer callback that runs after protocol validation and before route dispatch.
-- Add helpers equivalent to Go metadata-value and bearer-token authorizers.
-- Decide whether authorizers receive decoded metadata only or the full `trevrpc_request`.
 - Add tests for unauthenticated, permission-denied, and authorizer failure paths.
 
 ## Metrics And Observability

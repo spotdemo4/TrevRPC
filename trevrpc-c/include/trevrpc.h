@@ -133,6 +133,20 @@ typedef int (*trevrpc_unary_handler)(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response);
 typedef int (*trevrpc_stream_handler)(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream);
+typedef int (*trevrpc_authorizer)(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status);
+
+typedef struct trevrpc_metadata_value_authorizer {
+    const char* key;
+    size_t key_len;
+    const uint8_t* value;
+    size_t value_len;
+} trevrpc_metadata_value_authorizer;
+
+typedef struct trevrpc_bearer_authorizer {
+    const char* token;
+    size_t token_len;
+} trevrpc_bearer_authorizer;
 
 trevrpc_config trevrpc_default_config(void);
 trevrpc_server_options trevrpc_default_server_options(void);
@@ -167,6 +181,10 @@ int trevrpc_metadata_set(
     trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
 int trevrpc_metadata_validate(const trevrpc_metadata* metadata);
 void trevrpc_metadata_reset(trevrpc_metadata* metadata);
+int trevrpc_authorize_metadata_value(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status);
+int trevrpc_authorize_bearer_token(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status);
 
 int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_client** client);
 int trevrpc_client_call_unary(trevrpc_client* client,
@@ -189,6 +207,8 @@ void trevrpc_request_reset(trevrpc_request* request);
 int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** server);
 int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_options* options);
 int trevrpc_server_get_options(trevrpc_server* server, trevrpc_server_options* options);
+int trevrpc_server_set_authorizer(trevrpc_server* server, trevrpc_authorizer authorizer, void* user_data);
+void trevrpc_server_clear_authorizer(trevrpc_server* server);
 int trevrpc_server_register_unary(
     trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data);
 int trevrpc_server_register_streaming(trevrpc_server* server,

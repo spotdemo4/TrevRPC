@@ -99,7 +99,7 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 | Wire request/response/stream-frame encode/decode | Yes        | Yes                                                   |
 | Shared wire golden vectors                       | Yes        | Yes                                                   |
 | Metadata encode/decode and validation            | Yes        | Yes                                                   |
-| Metadata-value and bearer authorizers            | Yes        | No                                                    |
+| Metadata-value and bearer authorizers            | Yes        | Yes                                                   |
 | Request timeout/deadline enforcement             | Yes        | Yes, cooperative                                      |
 | High-level MsQuic client/server RPC              | Yes        | Yes                                                   |
 | High-level WebTransport client/server RPC        | Yes        | No                                                    |

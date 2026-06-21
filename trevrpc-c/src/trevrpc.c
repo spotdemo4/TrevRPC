@@ -76,6 +76,8 @@ struct trevrpc_server {
     pthread_cond_t cond;
     trevrpc_method* methods;
     trevrpc_server_conn_ref* conns;
+    trevrpc_authorizer authorizer;
+    void* authorizer_user_data;
     size_t active_tasks;
     size_t active_connections;
     size_t active_requests;
@@ -743,6 +745,29 @@ int trevrpc_server_get_options(trevrpc_server* server, trevrpc_server_options* o
     return 0;
 }
 
+int trevrpc_server_set_authorizer(trevrpc_server* server, trevrpc_authorizer authorizer, void* user_data) {
+    if (server == NULL || authorizer == NULL) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    server->authorizer = authorizer;
+    server->authorizer_user_data = user_data;
+    pthread_mutex_unlock(&server->mutex);
+    return 0;
+}
+
+void trevrpc_server_clear_authorizer(trevrpc_server* server) {
+    if (server == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    server->authorizer = NULL;
+    server->authorizer_user_data = NULL;
+    pthread_mutex_unlock(&server->mutex);
+}
+
 int trevrpc_server_register_unary(
     trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data) {
     if (server == NULL || service == NULL || method == NULL || handler == NULL) {
@@ -988,6 +1013,14 @@ static trevrpc_server_options trevrpc_server_options_snapshot(trevrpc_server* se
     return options;
 }
 
+static trevrpc_authorizer trevrpc_server_authorizer_snapshot(trevrpc_server* server, void** out_user_data) {
+    pthread_mutex_lock(&server->mutex);
+    trevrpc_authorizer authorizer = server->authorizer;
+    *out_user_data = server->authorizer_user_data;
+    pthread_mutex_unlock(&server->mutex);
+    return authorizer;
+}
+
 static void trevrpc_server_shutdown_connections(trevrpc_server* server) {
     pthread_mutex_lock(&server->mutex);
     for (trevrpc_server_conn_ref* ref = server->conns; ref != NULL; ref = ref->next) {
@@ -1229,6 +1262,29 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
+    }
+
+    void* authorizer_user_data = NULL;
+    trevrpc_authorizer authorizer = trevrpc_server_authorizer_snapshot(server, &authorizer_user_data);
+    if (authorizer != NULL) {
+        trevrpc_status status = trevrpc_status_ok();
+        err = authorizer(authorizer_user_data, &context, &request, &status);
+        if (err != 0) {
+            status = trevrpc_status_internal("authorizer failed", strlen("authorizer failed"));
+        }
+        if (status.code != TREVRPC_STATUS_OK) {
+            if (request.kind == TREVRPC_RPC_KIND_UNARY) {
+                trevrpc_response response = {0};
+                (void)trevrpc_response_set_status(&response, status);
+                trevrpc_server_write_response(stream, server->max_frame_size, &response);
+                trevrpc_response_reset(&response);
+            } else {
+                trevrpc_server_write_stream_status(stream, server->max_frame_size, status.code, status.message);
+            }
+            trevrpc_request_reset(&request);
+            trevrpc_msquic_free(body);
+            return;
+        }
     }
 
     if (!trevrpc_server_request_try_start(server)) {

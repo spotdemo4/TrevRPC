@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #define NANOS_PER_SEC 1000000000ull
@@ -320,6 +321,63 @@ cleanup:
     return result;
 }
 
+static int test_metadata_value_authorizer(void) {
+    int result = 1;
+    const uint8_t value[] = {'s', 'e', 'c', 'r', 'e', 't'};
+    const uint8_t wrong_value[] = {'w', 'r', 'o', 'n', 'g'};
+    trevrpc_request request = {0};
+    trevrpc_metadata_value_authorizer authorizer = {
+        .key = "authorization",
+        .key_len = strlen("authorization"),
+        .value = value,
+        .value_len = sizeof(value),
+    };
+    trevrpc_status status = trevrpc_status_ok();
+
+    CHECK_GOTO(
+        trevrpc_metadata_set(&request.metadata, "authorization", strlen("authorization"), value, sizeof(value)) == 0);
+    CHECK_GOTO(trevrpc_authorize_metadata_value(&authorizer, NULL, &request, &status) == 0);
+    CHECK_GOTO(status.code == TREVRPC_STATUS_OK);
+
+    authorizer.value = wrong_value;
+    authorizer.value_len = sizeof(wrong_value);
+    CHECK_GOTO(trevrpc_authorize_metadata_value(&authorizer, NULL, &request, &status) == 0);
+    CHECK_GOTO(status.code == TREVRPC_STATUS_UNAUTHENTICATED);
+
+    result = 0;
+
+cleanup:
+    trevrpc_request_reset(&request);
+    return result;
+}
+
+static int test_bearer_authorizer(void) {
+    int result = 1;
+    const uint8_t value[] = {'B', 'e', 'a', 'r', 'e', 'r', ' ', 's', 'e', 'c', 'r', 'e', 't'};
+    trevrpc_request request = {0};
+    trevrpc_bearer_authorizer authorizer = {
+        .token = "secret",
+        .token_len = strlen("secret"),
+    };
+    trevrpc_status status = trevrpc_status_ok();
+
+    CHECK_GOTO(
+        trevrpc_metadata_set(&request.metadata, "authorization", strlen("authorization"), value, sizeof(value)) == 0);
+    CHECK_GOTO(trevrpc_authorize_bearer_token(&authorizer, NULL, &request, &status) == 0);
+    CHECK_GOTO(status.code == TREVRPC_STATUS_OK);
+
+    authorizer.token = "wrong";
+    authorizer.token_len = strlen("wrong");
+    CHECK_GOTO(trevrpc_authorize_bearer_token(&authorizer, NULL, &request, &status) == 0);
+    CHECK_GOTO(status.code == TREVRPC_STATUS_UNAUTHENTICATED);
+
+    result = 0;
+
+cleanup:
+    trevrpc_request_reset(&request);
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -352,6 +410,12 @@ int main(void) {
         return 1;
     }
     if (test_response_stream_idle_timeout() != 0) {
+        return 1;
+    }
+    if (test_metadata_value_authorizer() != 0) {
+        return 1;
+    }
+    if (test_bearer_authorizer() != 0) {
         return 1;
     }
     return 0;
