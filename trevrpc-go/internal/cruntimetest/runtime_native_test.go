@@ -1,6 +1,6 @@
 //go:build trevrpc_msquic_native && cgo
 
-package trevrpc
+package cruntimetest
 
 import (
 	"bytes"
@@ -19,9 +19,9 @@ import (
 	"time"
 )
 
-func TestCRuntimeNativeMsQuicUnaryRoundTrip(t *testing.T) {
-	certFile, keyFile := cRuntimeNativeMsQuicCertificateFiles(t)
-	host, portText, err := net.SplitHostPort(cRuntimeNativeMsQuicUDPAddr(t))
+func TestCRuntimeNativeMsQuicUnaryAndStreamingRoundTrip(t *testing.T) {
+	certFile, keyFile := certificateFiles(t)
+	host, portText, err := net.SplitHostPort(udpAddr(t))
 	if err != nil {
 		t.Fatalf("split C runtime native MsQuic address: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestCRuntimeNativeMsQuicUnaryRoundTrip(t *testing.T) {
 		t.Fatalf("parse C runtime native MsQuic port: %v", err)
 	}
 
-	server, err := startCRuntimeNativeEchoServer(host, certFile, keyFile, uint16(port))
+	server, err := startEchoServer(host, certFile, keyFile, uint16(port))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,19 +41,35 @@ func TestCRuntimeNativeMsQuicUnaryRoundTrip(t *testing.T) {
 	}()
 
 	body := []byte("hello from trevrpc-c")
-	got, status, err := cRuntimeNativeCallUnary(host, uint16(port), "test.EchoService", "Echo", body)
+	got, status, err := callUnary(host, uint16(port), "test.EchoService", "Echo", body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status != uint32(CodeOK) {
+	if status != statusOK {
 		t.Fatalf("C runtime response status = %d, want OK", status)
 	}
 	if !bytes.Equal(got, body) {
 		t.Fatalf("C runtime response body = %q, want %q", got, body)
 	}
+
+	streamMessages, streamStatus, err := callServerStream(host, uint16(port), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamStatus != statusOK {
+		t.Fatalf("C runtime stream status = %d, want OK", streamStatus)
+	}
+	if len(streamMessages) != 2 {
+		t.Fatalf("C runtime stream message count = %d, want 2", len(streamMessages))
+	}
+	for i, message := range streamMessages {
+		if !bytes.Equal(message, body) {
+			t.Fatalf("C runtime stream message %d = %q, want %q", i, message, body)
+		}
+	}
 }
 
-func cRuntimeNativeMsQuicCertificateFiles(t *testing.T) (string, string) {
+func certificateFiles(t *testing.T) (string, string) {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -94,7 +110,7 @@ func cRuntimeNativeMsQuicCertificateFiles(t *testing.T) (string, string) {
 	return certFile, keyFile
 }
 
-func cRuntimeNativeMsQuicUDPAddr(t *testing.T) string {
+func udpAddr(t *testing.T) string {
 	t.Helper()
 
 	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")

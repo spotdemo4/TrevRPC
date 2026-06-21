@@ -45,6 +45,13 @@
               gotools
               protobuf
 
+              # c
+              cmake
+              gcc
+              openssl
+              pkg-config
+              protobufc
+
               # javascript
               nodejs_24
 
@@ -166,7 +173,10 @@
 
               src = ./trevrpc-go;
               vendorHash = "sha256-iE1MhGE0XVsNR1bh5ETnKNEdiQafriz1eI9gAZN5uHk=";
-              subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
+              subPackages = [
+                "cmd/protoc-gen-trevrpc-c"
+                "cmd/protoc-gen-trevrpc-go"
+              ];
 
               nativeCheckInputs = with pkgs; [
                 go-tools
