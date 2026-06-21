@@ -318,13 +318,59 @@ Generated: $generated_at
 | CMake | \`$(cmake --version 2>/dev/null | head -n 1 || true)\` |
 
 ## Results
-
-| Language | Shape | Implementation | Measurements | Median latency us/op | Latency min..max us/op | Median throughput ops/s | Iterations/Samples per measurement | B/op | Allocs/op | Source |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 EOF
 
-        awk -F, 'NR > 1 {
-            printf "| `%s` | `%s` | `%s` | %s | %.3f | %.3f..%.3f | %.0f | %s | %s | %s | `%s` |\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, ($11 == "" ? "" : $11), ($12 == "" ? "" : $12), $13
+        awk -F, '
+        function compare_throughput(i1, v1, i2, v2) {
+            if (throughput[v1] > throughput[v2]) {
+                return -1
+            }
+            if (throughput[v1] < throughput[v2]) {
+                return 1
+            }
+            return row_order[v1] < row_order[v2] ? -1 : 1
+        }
+        function append(values, value) {
+            return values == "" ? value : values " " value
+        }
+        function print_table_header(shape) {
+            printf "\n### `%s`\n\n", shape
+            print "| Language | Implementation | Measurements | Median latency us/op | Latency min..max us/op | Median throughput ops/s | Iterations/Samples per measurement | B/op | Allocs/op | Source |"
+            print "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+        }
+        NR > 1 {
+            id = NR - 1
+            row_order[id] = id
+            language[id] = $1
+            shape[id] = $2
+            implementation[id] = $3
+            measurements[id] = $4
+            latency[id] = $5
+            latency_min[id] = $6
+            latency_max[id] = $7
+            throughput[id] = $8 + 0
+            iteration_count[id] = $9
+            bytes[id] = $11
+            allocs[id] = $12
+            source[id] = $13
+
+            if (!(shape[id] in seen_shape)) {
+                seen_shape[shape[id]] = 1
+                shape_order[++shape_count] = shape[id]
+            }
+            shape_rows[shape[id]] = append(shape_rows[shape[id]], id)
+        }
+        END {
+            for (shape_index = 1; shape_index <= shape_count; shape_index++) {
+                current_shape = shape_order[shape_index]
+                row_count = split(shape_rows[current_shape], rows, " ")
+                asort(rows, sorted_rows, "compare_throughput")
+                print_table_header(current_shape)
+                for (row_index = 1; row_index <= row_count; row_index++) {
+                    id = sorted_rows[row_index]
+                    printf "| `%s` | `%s` | %s | %.3f | %.3f..%.3f | %.0f | %s | %s | %s | `%s` |\n", language[id], implementation[id], measurements[id], latency[id], latency_min[id], latency_max[id], throughput[id], iteration_count[id], bytes[id], allocs[id], source[id]
+                }
+            }
         }' "$CSV"
 
         cat <<EOF
@@ -334,6 +380,8 @@ EOF
 These rows use the same four RPC shapes: unary, server streaming with 16 response messages, client streaming with 16 request messages, and bidirectional streaming with 16 request/response messages.
 
 Reported latency is the median across measurements. The min..max column shows the observed latency range across repeated measurements. Rust measurements also include Criterion sampling within each repeated command.
+
+Result tables are split by RPC shape and sorted by median throughput descending.
 
 Compare rows with the same shape first. Transport implementations differ: C uses native MsQuic and WebTransport, Go uses quic-go plus native-CGO MsQuic by default, and Rust uses Quinn. gRPC rows are included as language-local baselines, not identical transports.
 
