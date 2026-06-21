@@ -149,6 +149,10 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 
 `TREVRPC_ERR_FRAME_TOO_LARGE` is the transport-agnostic wire/runtime error used when TrevRPC framing exceeds the configured maximum before bytes are handed to a transport. Transport wrappers keep their own frame-too-large error codes, such as `TREV_MSQUIC_ERR_FRAME_TOO_LARGE` and `TREV_WT_ERR_FRAME_TOO_LARGE`. The high-level runtime normalizes all of these to `TREVRPC_STATUS_RESOURCE_EXHAUSTED` responses.
 
+## WebTransport Draft Workaround
+
+The native WebTransport wrapper pins libwtf to draft-07 because draft-15 currently regresses stream credit on sequential streams. The workaround is centralized in `src/trevrpc_webtransport.c` as `TREV_WT_DRAFT`; remove that pin and retest native WebTransport round trips once libwtf draft-15 stream-credit behavior is fixed.
+
 ## Typed Protobuf Boundary
 
 The C runtime owns transport, framing, metadata, status, stream limits, and generic byte-oriented RPC dispatch. Generated C service code owns protobuf-c packing/unpacking, typed client function names, typed stream send/receive wrappers, and server adapter callbacks that translate between protobuf-c messages and runtime byte bodies. This keeps `trevrpc.h` independent from any generated protobuf schema while still letting generated code provide type-safe service APIs.

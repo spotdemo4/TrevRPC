@@ -19,7 +19,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 - Add high-level `trevrpc_server` support over `trevrpc_wt_*`, not only low-level WebTransport session and stream wrappers.
 - Add WebTransport C server accept/serve integration equivalent to `trevrpc_server_serve`.
 - Add CTest or integration tests for native WebTransport RPC round trips when libwtf is available.
-- Track and remove the draft-07 workaround once libwtf draft-15 stream-credit behavior is fixed.
 
 ## Transport And Packaging
 
