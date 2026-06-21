@@ -3,9 +3,8 @@
 package trevrpc
 
 /*
-#cgo pkg-config: wtf
 #cgo CFLAGS: -I${SRCDIR}/../trevrpc-c/include -I${SRCDIR}/../trevrpc-c/src
-#cgo LDFLAGS: -lpthread
+#cgo LDFLAGS: -lwtf -lmsquic -lpthread -lm -lrt -lcrypto
 #include <stdlib.h>
 #include "trevrpc_webtransport.c"
 */
