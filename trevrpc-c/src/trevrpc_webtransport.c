@@ -12,15 +12,20 @@
 #define TREV_WT_DEFAULT_STREAMS 256
 #define TREV_WT_H3_STREAM_TYPE_CONTROL 0x00
 #define TREV_WT_H3_FRAME_SETTINGS 0x04
+#define TREV_WT_H3_FRAME_HEADERS 0x01
+#define TREV_WT_CONNECT_STATUS_OK 200
 
 struct trevrpc_wt_listener {
     trevrpc_msquic_listener* msquic_listener;
+    const char* path;
+    const char* origin;
 };
 
 struct trevrpc_wt_session {
     trevrpc_msquic_conn* msquic_conn;
     trevrpc_msquic_stream* local_control;
     trevrpc_msquic_stream* peer_control;
+    trevrpc_msquic_stream* connect_stream;
 };
 
 struct trevrpc_wt_stream {
@@ -31,6 +36,26 @@ typedef struct trevrpc_wt_h3_frame {
     uint64_t type;
     uint64_t len;
 } trevrpc_wt_h3_frame;
+
+typedef struct trevrpc_wt_headers {
+    bool method_connect;
+    bool protocol_webtransport;
+    bool scheme_https;
+    bool status_200;
+    const uint8_t* path;
+    size_t path_len;
+    const uint8_t* authority;
+    size_t authority_len;
+    const uint8_t* origin;
+    size_t origin_len;
+} trevrpc_wt_headers;
+
+typedef int (*trevrpc_wt_headers_validate_fn)(const trevrpc_wt_headers* headers, void* context);
+
+typedef struct trevrpc_wt_accept_connect_context {
+    const char* expected_path;
+    const char* expected_origin;
+} trevrpc_wt_accept_connect_context;
 
 static int trevrpc_wt_unsupported(void) {
     return TREV_WT_ERR_REJECTED;
@@ -144,6 +169,26 @@ static int trevrpc_wt_read_varint(trevrpc_msquic_stream* stream, uint64_t* value
     return 0;
 }
 
+static int trevrpc_wt_varint_read_buffer(const uint8_t* data, size_t len, size_t* offset, uint64_t* value) {
+    if (*offset >= len) {
+        return TREV_WT_ERR_REJECTED;
+    }
+
+    uint8_t first = data[*offset];
+    size_t varint_len = (size_t)1 << (first >> 6);
+    if (len - *offset < varint_len) {
+        return TREV_WT_ERR_REJECTED;
+    }
+
+    uint64_t result = first & 0x3f;
+    for (size_t i = 1; i < varint_len; i++) {
+        result = (result << 8) | data[*offset + i];
+    }
+    *offset += varint_len;
+    *value = result;
+    return 0;
+}
+
 static int trevrpc_wt_write_varints(trevrpc_msquic_stream* stream, const uint64_t* values, size_t count) {
     uint8_t buffer[64];
     size_t offset = 0;
@@ -161,6 +206,262 @@ static int trevrpc_wt_write_varints(trevrpc_msquic_stream* stream, const uint64_
         return trevrpc_wt_map_msquic_error((int)n);
     }
     return n == (intptr_t)offset ? 0 : TREV_WT_ERR_CLOSED;
+}
+
+static int trevrpc_wt_write_all(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
+    intptr_t n = trevrpc_msquic_stream_write(stream, data, len);
+    if (n < 0) {
+        return trevrpc_wt_map_msquic_error((int)n);
+    }
+    return n == (intptr_t)len ? 0 : TREV_WT_ERR_CLOSED;
+}
+
+static int trevrpc_wt_header_block_put_literal(
+    uint8_t* out, size_t out_len, size_t* offset, const char* name, const char* value) {
+    size_t name_len = strlen(name);
+    size_t value_len = strlen(value);
+    size_t written = 0;
+    if (*offset >= out_len) {
+        return -ENOBUFS;
+    }
+    out[(*offset)++] = 0x20;
+    int err = trevrpc_wt_varint_write(out + *offset, out_len - *offset, name_len, &written);
+    if (err != 0) {
+        return err;
+    }
+    *offset += written;
+    if (out_len - *offset < name_len) {
+        return -ENOBUFS;
+    }
+    memcpy(out + *offset, name, name_len);
+    *offset += name_len;
+
+    err = trevrpc_wt_varint_write(out + *offset, out_len - *offset, value_len, &written);
+    if (err != 0) {
+        return err;
+    }
+    *offset += written;
+    if (out_len - *offset < value_len) {
+        return -ENOBUFS;
+    }
+    memcpy(out + *offset, value, value_len);
+    *offset += value_len;
+    return 0;
+}
+
+static int trevrpc_wt_header_block_decode(const uint8_t* data, size_t len, trevrpc_wt_headers* headers) {
+    size_t offset = 0;
+    uint64_t required_insert_count = 0;
+    uint64_t base = 0;
+    int err = trevrpc_wt_varint_read_buffer(data, len, &offset, &required_insert_count);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_wt_varint_read_buffer(data, len, &offset, &base);
+    if (err != 0) {
+        return err;
+    }
+    if (required_insert_count != 0 || base != 0) {
+        return TREV_WT_ERR_REJECTED;
+    }
+
+    while (offset < len) {
+        uint8_t prefix = data[offset++];
+        if ((prefix & 0xe0) != 0x20) {
+            return TREV_WT_ERR_REJECTED;
+        }
+        uint64_t name_len = 0;
+        uint64_t value_len = 0;
+        err = trevrpc_wt_varint_read_buffer(data, len, &offset, &name_len);
+        if (err != 0 || name_len > SIZE_MAX || len - offset < (size_t)name_len) {
+            return TREV_WT_ERR_REJECTED;
+        }
+        const uint8_t* name = data + offset;
+        offset += (size_t)name_len;
+        err = trevrpc_wt_varint_read_buffer(data, len, &offset, &value_len);
+        if (err != 0 || value_len > SIZE_MAX || len - offset < (size_t)value_len) {
+            return TREV_WT_ERR_REJECTED;
+        }
+        const uint8_t* value = data + offset;
+        offset += (size_t)value_len;
+
+        if (name_len == 7 && memcmp(name, ":method", 7) == 0 && value_len == 7 && memcmp(value, "CONNECT", 7) == 0) {
+            headers->method_connect = true;
+        } else if (name_len == 9 && memcmp(name, ":protocol", 9) == 0 && value_len == 12 &&
+                   memcmp(value, "webtransport", 12) == 0) {
+            headers->protocol_webtransport = true;
+        } else if (name_len == 7 && memcmp(name, ":scheme", 7) == 0 && value_len == 5 &&
+                   memcmp(value, "https", 5) == 0) {
+            headers->scheme_https = true;
+        } else if (name_len == 5 && memcmp(name, ":path", 5) == 0) {
+            headers->path = value;
+            headers->path_len = (size_t)value_len;
+        } else if (name_len == 10 && memcmp(name, ":authority", 10) == 0) {
+            headers->authority = value;
+            headers->authority_len = (size_t)value_len;
+        } else if (name_len == 6 && memcmp(name, "origin", 6) == 0) {
+            headers->origin = value;
+            headers->origin_len = (size_t)value_len;
+        } else if (name_len == 7 && memcmp(name, ":status", 7) == 0 && value_len == 3 && memcmp(value, "200", 3) == 0) {
+            headers->status_200 = true;
+        }
+    }
+    return 0;
+}
+
+static int trevrpc_wt_write_headers_frame(trevrpc_msquic_stream* stream, const uint8_t* block, size_t block_len) {
+    uint8_t prefix[16];
+    size_t offset = 0;
+    size_t written = 0;
+    int err = trevrpc_wt_varint_write(prefix + offset, sizeof(prefix) - offset, TREV_WT_H3_FRAME_HEADERS, &written);
+    if (err != 0) {
+        return err;
+    }
+    offset += written;
+    err = trevrpc_wt_varint_write(prefix + offset, sizeof(prefix) - offset, block_len, &written);
+    if (err != 0) {
+        return err;
+    }
+    offset += written;
+
+    err = trevrpc_wt_write_all(stream, prefix, offset);
+    if (err != 0) {
+        return err;
+    }
+    return trevrpc_wt_write_all(stream, block, block_len);
+}
+
+static int trevrpc_wt_read_headers_frame(
+    trevrpc_msquic_stream* stream, trevrpc_wt_headers_validate_fn validate, void* context) {
+    uint64_t frame_type = 0;
+    uint64_t frame_len = 0;
+    int err = trevrpc_wt_read_varint(stream, &frame_type);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_wt_read_varint(stream, &frame_len);
+    if (err != 0) {
+        return err;
+    }
+    if (frame_type != TREV_WT_H3_FRAME_HEADERS || frame_len > 4096) {
+        return TREV_WT_ERR_REJECTED;
+    }
+
+    uint8_t* block = malloc((size_t)frame_len);
+    if (block == NULL && frame_len > 0) {
+        return -ENOMEM;
+    }
+    trevrpc_wt_headers headers = {0};
+    err = trevrpc_wt_read_exact(stream, block, (size_t)frame_len);
+    if (err == 0) {
+        err = trevrpc_wt_header_block_decode(block, (size_t)frame_len, &headers);
+    }
+    if (err == 0 && validate != NULL) {
+        err = validate(&headers, context);
+    }
+    free(block);
+    return err;
+}
+
+static int trevrpc_wt_validate_connect_response(const trevrpc_wt_headers* headers, void* context) {
+    (void)context;
+    return headers->status_200 ? 0 : TREV_WT_ERR_REJECTED;
+}
+
+static int trevrpc_wt_validate_connect_request(const trevrpc_wt_headers* headers, void* context) {
+    trevrpc_wt_accept_connect_context* accept_context = context;
+    if (!headers->method_connect || !headers->protocol_webtransport || !headers->scheme_https ||
+        headers->path == NULL || headers->authority == NULL) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    if (accept_context->expected_path != NULL &&
+        (strlen(accept_context->expected_path) != headers->path_len ||
+            memcmp(accept_context->expected_path, headers->path, headers->path_len) != 0)) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    if (accept_context->expected_origin != NULL &&
+        (strlen(accept_context->expected_origin) != headers->origin_len ||
+            memcmp(accept_context->expected_origin, headers->origin, headers->origin_len) != 0)) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    return 0;
+}
+
+static int trevrpc_wt_open_connect_stream(trevrpc_wt_session* session, const trevrpc_wt_config* config) {
+    trevrpc_msquic_stream* stream = NULL;
+    int err = trevrpc_msquic_conn_open_stream(session->msquic_conn, &stream);
+    if (err != 0) {
+        return trevrpc_wt_map_msquic_error(err);
+    }
+
+    const char* path = config->path != NULL ? config->path : "/";
+    const char* authority = config->url != NULL ? config->url : config->host;
+    uint8_t block[1024];
+    size_t offset = 0;
+    block[offset++] = 0;
+    block[offset++] = 0;
+    err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":method", "CONNECT");
+    if (err == 0) {
+        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":protocol", "webtransport");
+    }
+    if (err == 0) {
+        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":scheme", "https");
+    }
+    if (err == 0) {
+        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":authority", authority);
+    }
+    if (err == 0) {
+        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":path", path);
+    }
+    if (err == 0 && config->origin != NULL) {
+        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, "origin", config->origin);
+    }
+    if (err == 0) {
+        err = trevrpc_wt_write_headers_frame(stream, block, offset);
+    }
+    if (err == 0) {
+        err = trevrpc_wt_read_headers_frame(stream, trevrpc_wt_validate_connect_response, NULL);
+    }
+    if (err != 0) {
+        trevrpc_msquic_stream_close(stream);
+        return err;
+    }
+
+    session->connect_stream = stream;
+    return 0;
+}
+
+static int trevrpc_wt_accept_connect_stream(
+    trevrpc_wt_session* session, const char* expected_path, const char* expected_origin) {
+    trevrpc_msquic_stream* stream = NULL;
+    int err = trevrpc_msquic_conn_accept_stream(session->msquic_conn, &stream);
+    if (err != 0) {
+        return trevrpc_wt_map_msquic_error(err);
+    }
+
+    trevrpc_wt_accept_connect_context context = {
+        .expected_path = expected_path,
+        .expected_origin = expected_origin,
+    };
+    err = trevrpc_wt_read_headers_frame(stream, trevrpc_wt_validate_connect_request, &context);
+
+    uint8_t block[64];
+    size_t offset = 0;
+    block[offset++] = 0;
+    block[offset++] = 0;
+    if (err == 0) {
+        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":status", "200");
+    }
+    if (err == 0) {
+        err = trevrpc_wt_write_headers_frame(stream, block, offset);
+    }
+    if (err != 0) {
+        trevrpc_msquic_stream_close(stream);
+        return err;
+    }
+
+    session->connect_stream = stream;
+    return 0;
 }
 
 static int trevrpc_wt_write_control_settings(trevrpc_wt_session* session) {
@@ -237,6 +538,8 @@ int trevrpc_wt_listen(const trevrpc_wt_config* config, trevrpc_wt_listener** out
         free(listener);
         return trevrpc_wt_map_msquic_error(err);
     }
+    listener->path = config->path;
+    listener->origin = config->origin;
 
     *out_listener = listener;
     return 0;
@@ -261,6 +564,11 @@ int trevrpc_wt_listener_accept_session(trevrpc_wt_listener* listener, trevrpc_wt
     }
     session->msquic_conn = conn;
     err = trevrpc_wt_h3_handshake(session);
+    if (err != 0) {
+        trevrpc_wt_session_close(session);
+        return err;
+    }
+    err = trevrpc_wt_accept_connect_stream(session, listener->path, listener->origin);
     if (err != 0) {
         trevrpc_wt_session_close(session);
         return err;
@@ -313,6 +621,12 @@ int trevrpc_wt_dial(const trevrpc_wt_config* config, trevrpc_wt_session** out_se
         return err;
     }
 
+    err = trevrpc_wt_open_connect_stream(session, config);
+    if (err != 0) {
+        trevrpc_wt_session_close(session);
+        return err;
+    }
+
     *out_session = session;
     return 0;
 }
@@ -335,6 +649,7 @@ int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_strea
 
 void trevrpc_wt_session_close(trevrpc_wt_session* session) {
     if (session != NULL) {
+        trevrpc_msquic_stream_close(session->connect_stream);
         trevrpc_msquic_stream_close(session->peer_control);
         trevrpc_msquic_stream_close(session->local_control);
         trevrpc_msquic_conn_close(session->msquic_conn);
