@@ -7,3 +7,13 @@
 Protobuf over QUIC & WebTransport
 
 Full documentation is available in the [TrevRPC wiki](https://trev.zip/llc/TrevRPC/wiki)
+
+## Benchmarks
+
+Run the cross-language RPC comparison from a dev shell:
+
+```sh
+nix develop -c bench/run_rpc_comparison.sh
+```
+
+The runner writes normalized CSV and Markdown reports under `target/rpc-comparison/` and keeps raw C, Go, and Rust benchmark output for auditability.
