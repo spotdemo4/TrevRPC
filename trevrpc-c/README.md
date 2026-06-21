@@ -66,6 +66,7 @@ CMake options:
 | `TREVRPC_BUILD_WEBTRANSPORT`       | `ON`    | Build the low-level WebTransport transport library.                                  |
 | `TREVRPC_BUILD_RUNTIME`            | `ON`    | Build the high-level runtime. This currently requires MsQuic.                        |
 | `TREVRPC_INSTALL_INTERNAL_HEADERS` | `OFF`   | Install internal headers under `include/trevrpc/internal` for tests and development. |
+| `TREVRPC_ENABLE_SANITIZERS`        | `OFF`   | Build C targets with ASan and UBSan when using Clang or GCC.                         |
 
 ## Ownership
 

@@ -28,6 +28,10 @@ typedef struct trevrpc_msquic_chunk {
 
 typedef struct trevrpc_msquic_send trevrpc_msquic_send;
 
+struct trevrpc_msquic_send {
+    trevrpc_msquic_send* next;
+};
+
 struct trevrpc_msquic_stream {
     void* handle;
     pthread_mutex_t mutex;
@@ -90,6 +94,12 @@ static void reset_raw_stream(trevrpc_msquic_stream* stream) {
         trevrpc_msquic_chunk* next = chunk->next;
         free(chunk);
         chunk = next;
+    }
+    trevrpc_msquic_send* send = stream->send_pool;
+    while (send != NULL) {
+        trevrpc_msquic_send* next = send->next;
+        free(send);
+        send = next;
     }
     pthread_cond_destroy(&stream->cond);
     pthread_mutex_destroy(&stream->mutex);

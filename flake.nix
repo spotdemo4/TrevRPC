@@ -324,6 +324,18 @@
             '';
           };
 
+          c-sanitizers = self.packages.${system}.trevrpc-c.overrideAttrs {
+            configurePhase = ''
+              runHook preConfigure
+              export PATH=${self.packages.${system}.trevrpc-go}/bin:$PATH
+              cmake -S trevrpc-c -B build -DTREVRPC_BUILD_TESTS=ON -DTREVRPC_ENABLE_SANITIZERS=ON
+              runHook postConfigure
+            '';
+            installPhase = ''
+              touch $out
+            '';
+          };
+
           rust = self.packages.${system}.trevrpc-rust.overrideAttrs {
             dontBuild = true;
             installPhase = ''
