@@ -30,7 +30,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 - Add C integration tests for MsQuic unary and all streaming modes.
 - Add C integration tests for server shutdown, client close, stream reset, and partial stream failure.
 - Add tests for concurrent streams and concurrent connections under configured limits.
-- Add tests for large frames near the max-frame-size boundary.
 - Add sanitizers in an optional CMake/Nix check: ASan, UBSan, and potentially TSan for queue/close paths.
 - Add leak checks for every CTest executable.
 

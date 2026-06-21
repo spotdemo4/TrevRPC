@@ -274,6 +274,121 @@ cleanup:
     return result;
 }
 
+static int test_encode_accepts_exact_max_frame_size(void) {
+    int result = 1;
+    uint8_t body[256];
+    uint8_t* frame = NULL;
+    uint8_t* exact_frame = NULL;
+    size_t frame_len = 0;
+    size_t exact_frame_len = 0;
+    trevrpc_response response = {0};
+
+    for (size_t i = 0; i < sizeof(body); i++) {
+        body[i] = (uint8_t)i;
+    }
+
+    int err = trevrpc_wire_encode_request(
+        "svc", "method", TREVRPC_RPC_KIND_UNARY, body, sizeof(body), NULL, 0, 4096, &frame, &frame_len);
+    CHECK_GOTO(err == 0);
+    CHECK_GOTO(frame_len > 4);
+    size_t max_body_len = frame_len - 4;
+
+    err = trevrpc_wire_encode_request("svc",
+        "method",
+        TREVRPC_RPC_KIND_UNARY,
+        body,
+        sizeof(body),
+        NULL,
+        0,
+        max_body_len,
+        &exact_frame,
+        &exact_frame_len);
+    CHECK_GOTO(err == 0);
+    CHECK_GOTO(exact_frame_len == frame_len);
+    free(exact_frame);
+    exact_frame = NULL;
+    exact_frame_len = 0;
+
+    err = trevrpc_wire_encode_request("svc",
+        "method",
+        TREVRPC_RPC_KIND_UNARY,
+        body,
+        sizeof(body),
+        NULL,
+        0,
+        max_body_len - 1,
+        &exact_frame,
+        &exact_frame_len);
+    CHECK_GOTO(err == TREVRPC_ERR_FRAME_TOO_LARGE);
+    CHECK_GOTO(exact_frame == NULL);
+    free(frame);
+    frame = NULL;
+
+    CHECK_GOTO(trevrpc_response_set_body(&response, body, sizeof(body)) == 0);
+    err = trevrpc_wire_encode_response(&response, 4096, &frame, &frame_len);
+    CHECK_GOTO(err == 0);
+    max_body_len = frame_len - 4;
+    err = trevrpc_wire_encode_response(&response, max_body_len, &exact_frame, &exact_frame_len);
+    CHECK_GOTO(err == 0);
+    CHECK_GOTO(exact_frame_len == frame_len);
+    free(exact_frame);
+    exact_frame = NULL;
+    exact_frame_len = 0;
+    err = trevrpc_wire_encode_response(&response, max_body_len - 1, &exact_frame, &exact_frame_len);
+    CHECK_GOTO(err == TREVRPC_ERR_FRAME_TOO_LARGE);
+    CHECK_GOTO(exact_frame == NULL);
+    free(frame);
+    frame = NULL;
+
+    err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+        TREVRPC_STATUS_OK,
+        NULL,
+        0,
+        body,
+        sizeof(body),
+        NULL,
+        4096,
+        &frame,
+        &frame_len);
+    CHECK_GOTO(err == 0);
+    max_body_len = frame_len - 4;
+    err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+        TREVRPC_STATUS_OK,
+        NULL,
+        0,
+        body,
+        sizeof(body),
+        NULL,
+        max_body_len,
+        &exact_frame,
+        &exact_frame_len);
+    CHECK_GOTO(err == 0);
+    CHECK_GOTO(exact_frame_len == frame_len);
+    free(exact_frame);
+    exact_frame = NULL;
+    exact_frame_len = 0;
+    err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+        TREVRPC_STATUS_OK,
+        NULL,
+        0,
+        body,
+        sizeof(body),
+        NULL,
+        max_body_len - 1,
+        &exact_frame,
+        &exact_frame_len);
+    CHECK_GOTO(err == TREVRPC_ERR_FRAME_TOO_LARGE);
+    CHECK_GOTO(exact_frame == NULL);
+
+    result = 0;
+
+cleanup:
+    trevrpc_response_reset(&response);
+    free(frame);
+    free(exact_frame);
+    return result;
+}
+
 static int test_decode_invalid_frame_corpus(void) {
     int result = 1;
     const uint8_t invalid_varint[] = {0x80};
@@ -1052,6 +1167,9 @@ int main(void) {
         return 1;
     }
     if (test_encode_rejects_oversized_frames() != 0) {
+        return 1;
+    }
+    if (test_encode_accepts_exact_max_frame_size() != 0) {
         return 1;
     }
     if (test_decode_invalid_frame_corpus() != 0) {
