@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <time.h>
 
+#define NANOS_PER_SEC 1000000000ull
+
 struct trevrpc_call_context {
     trevrpc_server* server;
     bool has_deadline;
@@ -107,6 +109,25 @@ cleanup:
     return result;
 }
 
+static int test_default_server_options(void) {
+    int result = 1;
+    trevrpc_server_options options = trevrpc_default_server_options();
+
+    CHECK_GOTO(options.max_concurrent_connections == 256);
+    CHECK_GOTO(options.max_concurrent_streams_per_connection == 64);
+    CHECK_GOTO(options.max_concurrent_requests == 1024);
+    CHECK_GOTO(options.graceful_shutdown_timeout_nanos == 30ull * NANOS_PER_SEC);
+    CHECK_GOTO(options.initial_request_timeout_nanos == 10ull * NANOS_PER_SEC);
+    CHECK_GOTO(options.max_stream_messages == 4096);
+    CHECK_GOTO(options.max_stream_body_size == 16 * 1024 * 1024);
+    CHECK_GOTO(options.stream_idle_timeout_nanos == 30ull * NANOS_PER_SEC);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -118,6 +139,9 @@ int main(void) {
         return 1;
     }
     if (test_expired_deadline() != 0) {
+        return 1;
+    }
+    if (test_default_server_options() != 0) {
         return 1;
     }
     return 0;

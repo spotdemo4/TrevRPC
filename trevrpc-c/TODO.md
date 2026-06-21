@@ -4,7 +4,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Runtime Policy
 
-- Add C server options equivalent to Go `ServerOptions`: max concurrent connections, max concurrent streams per connection, max concurrent requests, graceful shutdown timeout, initial request timeout, max stream messages, max stream body size, and stream idle timeout.
 - Enforce max stream message count for request and response streams.
 - Enforce max total stream body size for request and response streams.
 - Enforce stream idle timeout while receiving request streams and while sending response streams.

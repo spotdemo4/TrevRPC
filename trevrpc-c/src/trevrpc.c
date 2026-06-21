@@ -57,6 +57,7 @@ struct trevrpc_server_conn_ref {
 struct trevrpc_server {
     trevrpc_msquic_listener* listener;
     size_t max_frame_size;
+    trevrpc_server_options options;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     trevrpc_method* methods;
@@ -111,6 +112,19 @@ trevrpc_config trevrpc_default_config(void) {
     config.peer_bidi_stream_count = 100;
     config.max_frame_size = TREVRPC_DEFAULT_MAX_FRAME_SIZE;
     return config;
+}
+
+trevrpc_server_options trevrpc_default_server_options(void) {
+    trevrpc_server_options options = {0};
+    options.max_concurrent_connections = 256;
+    options.max_concurrent_streams_per_connection = 64;
+    options.max_concurrent_requests = 1024;
+    options.graceful_shutdown_timeout_nanos = 30ull * TREVRPC_NANOS_PER_SEC;
+    options.initial_request_timeout_nanos = 10ull * TREVRPC_NANOS_PER_SEC;
+    options.max_stream_messages = 4096;
+    options.max_stream_body_size = 16 * 1024 * 1024;
+    options.stream_idle_timeout_nanos = 30ull * TREVRPC_NANOS_PER_SEC;
+    return options;
 }
 
 static int trevrpc_clock_now(struct timespec* out_now) {
@@ -508,6 +522,7 @@ int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config*
         return -ENOMEM;
     }
     server->max_frame_size = trevrpc_effective_max_frame_size(config);
+    server->options = trevrpc_default_server_options();
     pthread_mutex_init(&server->mutex, NULL);
     pthread_cond_init(&server->cond, NULL);
 
@@ -519,6 +534,28 @@ int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config*
     }
 
     *out_server = server;
+    return 0;
+}
+
+int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_options* options) {
+    if (server == NULL || options == NULL) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    server->options = *options;
+    pthread_mutex_unlock(&server->mutex);
+    return 0;
+}
+
+int trevrpc_server_get_options(trevrpc_server* server, trevrpc_server_options* options) {
+    if (server == NULL || options == NULL) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    *options = server->options;
+    pthread_mutex_unlock(&server->mutex);
     return 0;
 }
 

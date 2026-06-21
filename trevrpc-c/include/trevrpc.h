@@ -66,6 +66,17 @@ typedef struct trevrpc_config {
     size_t max_frame_size;
 } trevrpc_config;
 
+typedef struct trevrpc_server_options {
+    int64_t max_concurrent_connections;
+    int64_t max_concurrent_streams_per_connection;
+    int64_t max_concurrent_requests;
+    uint64_t graceful_shutdown_timeout_nanos;
+    uint64_t initial_request_timeout_nanos;
+    int64_t max_stream_messages;
+    int64_t max_stream_body_size;
+    uint64_t stream_idle_timeout_nanos;
+} trevrpc_server_options;
+
 typedef struct trevrpc_metadata_entry {
     char* key;
     size_t key_len;
@@ -122,6 +133,7 @@ typedef int (*trevrpc_stream_handler)(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream);
 
 trevrpc_config trevrpc_default_config(void);
+trevrpc_server_options trevrpc_default_server_options(void);
 
 int trevrpc_call_context_has_deadline(const trevrpc_call_context* context);
 int trevrpc_call_context_deadline_expired(const trevrpc_call_context* context);
@@ -173,6 +185,8 @@ void trevrpc_client_close(trevrpc_client* client);
 void trevrpc_request_reset(trevrpc_request* request);
 
 int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** server);
+int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_options* options);
+int trevrpc_server_get_options(trevrpc_server* server, trevrpc_server_options* options);
 int trevrpc_server_register_unary(
     trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data);
 int trevrpc_server_register_streaming(trevrpc_server* server,
