@@ -12,10 +12,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Handler Safety
 
-- Ensure every handler path sends exactly one terminal status for streaming RPCs.
-- Add tests for handlers returning errors before and after partial streaming responses.
-- Add tests for handlers that omit response bodies, status messages, or stream terminal status.
-
 ## Typed Protobuf Runtime
 
 - Decide the boundary between generated service code and runtime-owned typed helpers.

@@ -83,6 +83,10 @@ struct trevrpc_server {
     trevrpc_metrics metrics;
     trevrpc_transport_observer transport_observer;
     trevrpc_logger logger;
+#ifdef TREVRPC_TESTING
+    uint32_t test_last_stream_status;
+    size_t test_stream_status_count;
+#endif
     size_t active_tasks;
     size_t active_connections;
     size_t active_requests;
@@ -323,6 +327,18 @@ static int trevrpc_write_frame(trevrpc_msquic_stream* stream, const uint8_t* fra
     return 0;
 }
 
+#ifdef TREVRPC_TESTING
+static trevrpc_server* trevrpc_test_current_server;
+
+static void trevrpc_test_record_stream_status(uint32_t status) {
+    if (trevrpc_test_current_server == NULL) {
+        return;
+    }
+    trevrpc_test_current_server->test_last_stream_status = trevrpc_status_code_from_uint32(status);
+    trevrpc_test_current_server->test_stream_status_count++;
+}
+#endif
+
 static trevrpc_stream* trevrpc_stream_alloc(trevrpc_msquic_stream* stream, size_t max_frame_size, bool owns_stream) {
     trevrpc_stream* rpc_stream = calloc(1, sizeof(*rpc_stream));
     if (rpc_stream == NULL) {
@@ -501,13 +517,14 @@ int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const ch
         &frame,
         &frame_len);
     if (err == 0) {
+        stream->sent_status = true;
+        stream->terminal_status = trevrpc_status_code_from_uint32(status);
+#ifdef TREVRPC_TESTING
+        trevrpc_test_record_stream_status(status);
+#endif
         err = trevrpc_write_frame(stream->stream, frame, frame_len);
     }
     free(frame);
-    if (err == 0) {
-        stream->sent_status = true;
-        stream->terminal_status = trevrpc_status_code_from_uint32(status);
-    }
     return err;
 }
 
@@ -759,7 +776,9 @@ int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_s
 }
 
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream) {
+    trevrpc_test_current_server = server;
     trevrpc_handle_stream(server, stream);
+    trevrpc_test_current_server = NULL;
 }
 
 uint32_t trevrpc_test_status_from_error(int err, const char** message) {
@@ -768,6 +787,14 @@ uint32_t trevrpc_test_status_from_error(int err, const char** message) {
 
 uint32_t trevrpc_test_transport_status_from_error(int err, const char** message) {
     return trevrpc_transport_status_from_error(err, message);
+}
+
+size_t trevrpc_test_server_stream_status_count(trevrpc_server* server) {
+    return server == NULL ? 0 : server->test_stream_status_count;
+}
+
+uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server) {
+    return server == NULL ? TREVRPC_STATUS_UNKNOWN : server->test_last_stream_status;
 }
 #endif
 

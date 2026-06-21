@@ -28,6 +28,8 @@ int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_s
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 uint32_t trevrpc_test_status_from_error(int err, const char** message);
 uint32_t trevrpc_test_transport_status_from_error(int err, const char** message);
+size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
+uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
 
 struct trevrpc_stream {
     trevrpc_msquic_stream* stream;
@@ -126,6 +128,15 @@ static int success_handler(
     return trevrpc_response_set_body(response, body, sizeof(body));
 }
 
+static int empty_response_handler(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+    (void)response;
+    return 0;
+}
+
 static int failing_handler(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
     (void)user_data;
@@ -143,6 +154,42 @@ static int invalid_response_handler(
     response->body = NULL;
     response->body_len = 1;
     return 0;
+}
+
+static int stream_error_handler(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+    (void)stream;
+    return -EIO;
+}
+
+static int stream_message_then_error_handler(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+    const uint8_t body[] = {1};
+    (void)trevrpc_stream_send_message(stream, body, sizeof(body));
+    return -EIO;
+}
+
+static int stream_omit_terminal_handler(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+    (void)stream;
+    return 0;
+}
+
+static int stream_explicit_status_handler(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+    return trevrpc_stream_send_status(stream, TREVRPC_STATUS_PERMISSION_DENIED, NULL, 0);
 }
 
 static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data, size_t data_len) {
@@ -592,6 +639,45 @@ cleanup:
     return result;
 }
 
+static int run_stream_case(
+    trevrpc_stream_handler handler, metric_counts* counts, size_t* status_count, uint32_t* last_status) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    trevrpc_server* server = NULL;
+    trevrpc_msquic_stream stream = {0};
+    bool stream_initialized = false;
+    trevrpc_metrics metrics = {
+        .rpc_started = record_started,
+        .rpc_finished = record_finished,
+        .user_data = counts,
+    };
+
+    CHECK_GOTO(
+        trevrpc_wire_encode_request(
+            "svc", "method", TREVRPC_RPC_KIND_SERVER_STREAMING, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
+    CHECK_GOTO(trevrpc_server_register_streaming(
+                   server, "svc", "method", TREVRPC_RPC_KIND_SERVER_STREAMING, handler, NULL) == 0);
+    CHECK_GOTO(init_raw_stream(&stream, frame, frame_len) == 0);
+    stream_initialized = true;
+
+    trevrpc_test_server_handle_stream(server, &stream);
+    *status_count = trevrpc_test_server_stream_status_count(server);
+    *last_status = trevrpc_test_server_last_stream_status(server);
+
+    result = 0;
+
+cleanup:
+    if (stream_initialized) {
+        reset_raw_stream(&stream);
+    }
+    trevrpc_server_close(server);
+    free(frame);
+    return result;
+}
+
 static int test_metrics_exactly_once_success(void) {
     int result = 1;
     uint8_t* frame = NULL;
@@ -867,6 +953,68 @@ cleanup:
     return result;
 }
 
+static int test_unary_handler_may_omit_response_body(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    metric_counts counts = {0};
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(run_metrics_case(frame, frame_len, empty_response_handler, &counts) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(counts.response_body_len == 0);
+
+    result = 0;
+
+cleanup:
+    free(frame);
+    return result;
+}
+
+static int test_streaming_handlers_send_exactly_one_terminal_status(void) {
+    int result = 1;
+    metric_counts counts = {0};
+    size_t status_count = 0;
+    uint32_t last_status = TREVRPC_STATUS_UNKNOWN;
+
+    CHECK_GOTO(run_stream_case(stream_error_handler, &counts, &status_count, &last_status) == 0);
+    CHECK_GOTO(status_count == 1);
+    CHECK_GOTO(last_status == TREVRPC_STATUS_INTERNAL);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL);
+
+    memset(&counts, 0, sizeof(counts));
+    status_count = 0;
+    last_status = TREVRPC_STATUS_UNKNOWN;
+    CHECK_GOTO(run_stream_case(stream_message_then_error_handler, &counts, &status_count, &last_status) == 0);
+    CHECK_GOTO(status_count == 1);
+    CHECK_GOTO(last_status == TREVRPC_STATUS_INTERNAL);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL);
+
+    memset(&counts, 0, sizeof(counts));
+    status_count = 0;
+    last_status = TREVRPC_STATUS_UNKNOWN;
+    CHECK_GOTO(run_stream_case(stream_omit_terminal_handler, &counts, &status_count, &last_status) == 0);
+    CHECK_GOTO(status_count == 1);
+    CHECK_GOTO(last_status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+
+    memset(&counts, 0, sizeof(counts));
+    status_count = 0;
+    last_status = TREVRPC_STATUS_UNKNOWN;
+    CHECK_GOTO(run_stream_case(stream_explicit_status_handler, &counts, &status_count, &last_status) == 0);
+    CHECK_GOTO(status_count == 1);
+    CHECK_GOTO(last_status == TREVRPC_STATUS_PERMISSION_DENIED);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_PERMISSION_DENIED);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -935,6 +1083,12 @@ int main(void) {
         return 1;
     }
     if (test_invalid_unary_handler_response_is_internal() != 0) {
+        return 1;
+    }
+    if (test_unary_handler_may_omit_response_body() != 0) {
+        return 1;
+    }
+    if (test_streaming_handlers_send_exactly_one_terminal_status() != 0) {
         return 1;
     }
     return 0;
