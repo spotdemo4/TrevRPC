@@ -1,13 +1,19 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "trevrpc.h"
 
 #include "trevrpc_msquic.h"
 #include "trevrpc_wire_internal.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#define TREVRPC_NANOS_PER_SEC 1000000000ull
 
 typedef struct trevrpc_method trevrpc_method;
 typedef struct trevrpc_server_conn_ref trevrpc_server_conn_ref;
@@ -15,6 +21,12 @@ typedef struct trevrpc_server_conn_ref trevrpc_server_conn_ref;
 struct trevrpc_client {
     trevrpc_msquic_conn* conn;
     size_t max_frame_size;
+};
+
+struct trevrpc_call_context {
+    trevrpc_server* server;
+    bool has_deadline;
+    struct timespec deadline;
 };
 
 struct trevrpc_method {
@@ -31,6 +43,7 @@ struct trevrpc_method {
 
 struct trevrpc_stream {
     trevrpc_msquic_stream* stream;
+    const trevrpc_call_context* context;
     size_t max_frame_size;
     bool owns_stream;
     bool sent_status;
@@ -61,6 +74,8 @@ typedef struct trevrpc_stream_task {
     trevrpc_server* server;
     trevrpc_msquic_stream* stream;
 } trevrpc_stream_task;
+
+static bool trevrpc_server_is_shutting_down(trevrpc_server* server);
 
 static size_t trevrpc_effective_max_frame_size(const trevrpc_config* config) {
     if (config != NULL && config->max_frame_size > 0) {
@@ -98,6 +113,137 @@ trevrpc_config trevrpc_default_config(void) {
     return config;
 }
 
+static int trevrpc_clock_now(struct timespec* out_now) {
+    if (out_now == NULL) {
+        return -EINVAL;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, out_now) != 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+static int trevrpc_timespec_compare(const struct timespec* lhs, const struct timespec* rhs) {
+    if (lhs->tv_sec < rhs->tv_sec) {
+        return -1;
+    }
+    if (lhs->tv_sec > rhs->tv_sec) {
+        return 1;
+    }
+    if (lhs->tv_nsec < rhs->tv_nsec) {
+        return -1;
+    }
+    if (lhs->tv_nsec > rhs->tv_nsec) {
+        return 1;
+    }
+    return 0;
+}
+
+static uint64_t trevrpc_timespec_diff_nanos(const struct timespec* end, const struct timespec* start) {
+    if (trevrpc_timespec_compare(end, start) <= 0) {
+        return 0;
+    }
+
+    uint64_t seconds = (uint64_t)(end->tv_sec - start->tv_sec);
+    uint64_t nanos = 0;
+    if (end->tv_nsec >= start->tv_nsec) {
+        nanos = (uint64_t)(end->tv_nsec - start->tv_nsec);
+    } else {
+        seconds--;
+        nanos = TREVRPC_NANOS_PER_SEC + (uint64_t)end->tv_nsec - (uint64_t)start->tv_nsec;
+    }
+    if (seconds > (UINT64_MAX - nanos) / TREVRPC_NANOS_PER_SEC) {
+        return UINT64_MAX;
+    }
+    return seconds * TREVRPC_NANOS_PER_SEC + nanos;
+}
+
+static int trevrpc_call_context_init(
+    trevrpc_call_context* context, trevrpc_server* server, const trevrpc_request* request) {
+    if (context == NULL || request == NULL) {
+        return -EINVAL;
+    }
+
+    context->server = server;
+    context->has_deadline = false;
+    context->deadline = (struct timespec){0};
+    if (request->timeout_nanos == 0) {
+        return 0;
+    }
+    if (request->timeout_nanos > INT64_MAX) {
+        return -ERANGE;
+    }
+
+    struct timespec now = {0};
+    int err = trevrpc_clock_now(&now);
+    if (err != 0) {
+        return err;
+    }
+
+    uint64_t seconds = request->timeout_nanos / TREVRPC_NANOS_PER_SEC;
+    uint64_t nanos = request->timeout_nanos % TREVRPC_NANOS_PER_SEC;
+    if (seconds > (uint64_t)(INT64_MAX - now.tv_sec)) {
+        return -EOVERFLOW;
+    }
+
+    context->deadline.tv_sec = now.tv_sec + (time_t)seconds;
+    context->deadline.tv_nsec = now.tv_nsec + (long)nanos;
+    if (context->deadline.tv_nsec >= (long)TREVRPC_NANOS_PER_SEC) {
+        context->deadline.tv_sec++;
+        context->deadline.tv_nsec -= (long)TREVRPC_NANOS_PER_SEC;
+    }
+    if (context->deadline.tv_sec < now.tv_sec) {
+        return -EOVERFLOW;
+    }
+
+    context->has_deadline = true;
+    return 0;
+}
+
+int trevrpc_call_context_has_deadline(const trevrpc_call_context* context) {
+    return context != NULL && context->has_deadline;
+}
+
+int trevrpc_call_context_deadline_expired(const trevrpc_call_context* context) {
+    if (context == NULL || !context->has_deadline) {
+        return 0;
+    }
+
+    struct timespec now = {0};
+    if (trevrpc_clock_now(&now) != 0) {
+        return 0;
+    }
+    return trevrpc_timespec_compare(&now, &context->deadline) >= 0;
+}
+
+int trevrpc_call_context_cancelled(const trevrpc_call_context* context) {
+    if (context == NULL) {
+        return 1;
+    }
+    if (trevrpc_call_context_deadline_expired(context)) {
+        return 1;
+    }
+    return context->server != NULL && trevrpc_server_is_shutting_down(context->server);
+}
+
+int trevrpc_call_context_time_remaining_nanos(const trevrpc_call_context* context, uint64_t* remaining_nanos) {
+    if (remaining_nanos == NULL) {
+        return -EINVAL;
+    }
+    *remaining_nanos = 0;
+    if (context == NULL || !context->has_deadline) {
+        return 0;
+    }
+
+    struct timespec now = {0};
+    int err = trevrpc_clock_now(&now);
+    if (err != 0) {
+        return err;
+    }
+    *remaining_nanos = trevrpc_timespec_diff_nanos(&context->deadline, &now);
+    return 1;
+}
+
 static int trevrpc_write_frame(trevrpc_msquic_stream* stream, const uint8_t* frame, size_t frame_len) {
     intptr_t written = trevrpc_msquic_stream_write(stream, frame, frame_len);
     if (written < 0) {
@@ -122,9 +268,26 @@ static trevrpc_stream* trevrpc_stream_alloc(trevrpc_msquic_stream* stream, size_
     return rpc_stream;
 }
 
+static int trevrpc_stream_context_error(const trevrpc_stream* stream) {
+    if (stream == NULL || stream->context == NULL) {
+        return 0;
+    }
+    if (trevrpc_call_context_deadline_expired(stream->context)) {
+        return -ETIMEDOUT;
+    }
+    if (trevrpc_call_context_cancelled(stream->context)) {
+        return -ECANCELED;
+    }
+    return 0;
+}
+
 int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
     if (stream == NULL || stream->stream == NULL || (body == NULL && body_len > 0)) {
         return -EINVAL;
+    }
+    int err = trevrpc_stream_context_error(stream);
+    if (err != 0) {
+        return err;
     }
 
     intptr_t written =
@@ -164,6 +327,10 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
         return -EINVAL;
     }
     *out_frame = NULL;
+    int err = trevrpc_stream_context_error(stream);
+    if (err != 0) {
+        return err;
+    }
 
     uint8_t* body = NULL;
     size_t body_len = 0;
@@ -175,7 +342,7 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
         return 0;
     }
 
-    int err = trevrpc_wire_decode_stream_frame(body, body_len, out_frame);
+    err = trevrpc_wire_decode_stream_frame(body, body_len, out_frame);
     trevrpc_msquic_free(body);
     return err;
 }
@@ -492,6 +659,10 @@ static void trevrpc_server_task_finish(trevrpc_server* server) {
 }
 
 static bool trevrpc_server_is_shutting_down(trevrpc_server* server) {
+    if (server == NULL) {
+        return false;
+    }
+
     pthread_mutex_lock(&server->mutex);
     bool shutting_down = server->shutting_down;
     pthread_mutex_unlock(&server->mutex);
@@ -625,6 +796,51 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         trevrpc_msquic_free(body);
         return;
     }
+    trevrpc_call_context context;
+    err = trevrpc_call_context_init(&context, server, &request);
+    if (err == -ERANGE) {
+        if (request.kind == TREVRPC_RPC_KIND_UNARY) {
+            trevrpc_server_write_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "RPC timeout is too large");
+        } else {
+            trevrpc_server_write_stream_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "RPC timeout is too large");
+        }
+        trevrpc_request_reset(&request);
+        trevrpc_msquic_free(body);
+        return;
+    }
+    if (err == -EOVERFLOW) {
+        if (request.kind == TREVRPC_RPC_KIND_UNARY) {
+            trevrpc_server_write_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "RPC timeout overflowed");
+        } else {
+            trevrpc_server_write_stream_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "RPC timeout overflowed");
+        }
+        trevrpc_request_reset(&request);
+        trevrpc_msquic_free(body);
+        return;
+    }
+    if (err != 0) {
+        trevrpc_server_write_status(
+            stream, server->max_frame_size, TREVRPC_STATUS_INTERNAL, "failed to prepare request");
+        trevrpc_request_reset(&request);
+        trevrpc_msquic_free(body);
+        return;
+    }
+    if (trevrpc_call_context_deadline_expired(&context)) {
+        if (request.kind == TREVRPC_RPC_KIND_UNARY) {
+            trevrpc_server_write_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_DEADLINE_EXCEEDED, "RPC deadline exceeded");
+        } else {
+            trevrpc_server_write_stream_status(
+                stream, server->max_frame_size, TREVRPC_STATUS_DEADLINE_EXCEEDED, "RPC deadline exceeded");
+        }
+        trevrpc_request_reset(&request);
+        trevrpc_msquic_free(body);
+        return;
+    }
     trevrpc_method* method = trevrpc_server_find_method(server, &request);
     if (method == NULL) {
         if (request.kind == TREVRPC_RPC_KIND_UNARY) {
@@ -654,13 +870,22 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     if (request.kind != TREVRPC_RPC_KIND_UNARY) {
         trevrpc_stream rpc_stream = {
             .stream = stream,
+            .context = &context,
             .max_frame_size = server->max_frame_size,
         };
-        err = method->stream_handler(method->user_data, &request, &rpc_stream);
-        if (err != 0 && !rpc_stream.sent_status) {
+        err = method->stream_handler(method->user_data, &context, &request, &rpc_stream);
+        if (trevrpc_call_context_deadline_expired(&context) && !rpc_stream.sent_status) {
+            rpc_stream.context = NULL;
+            (void)trevrpc_stream_send_status(&rpc_stream,
+                TREVRPC_STATUS_DEADLINE_EXCEEDED,
+                "RPC deadline exceeded",
+                strlen("RPC deadline exceeded"));
+        } else if (err != 0 && !rpc_stream.sent_status) {
+            rpc_stream.context = NULL;
             (void)trevrpc_stream_send_status(
                 &rpc_stream, TREVRPC_STATUS_INTERNAL, "handler failed", strlen("handler failed"));
         } else if (!rpc_stream.sent_status) {
+            rpc_stream.context = NULL;
             (void)trevrpc_stream_send_status(&rpc_stream, TREVRPC_STATUS_OK, NULL, 0);
         }
         (void)trevrpc_stream_finish_send(&rpc_stream);
@@ -670,8 +895,11 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     }
 
     trevrpc_response response = {0};
-    err = method->handler(method->user_data, &request, &response);
-    if (err != 0) {
+    err = method->handler(method->user_data, &context, &request, &response);
+    if (trevrpc_call_context_deadline_expired(&context)) {
+        trevrpc_response_reset(&response);
+        trevrpc_set_status(&response, TREVRPC_STATUS_DEADLINE_EXCEEDED, "RPC deadline exceeded");
+    } else if (err != 0) {
         trevrpc_response_reset(&response);
         trevrpc_set_status(&response, TREVRPC_STATUS_INTERNAL, "handler failed");
     }

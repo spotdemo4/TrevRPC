@@ -50,6 +50,7 @@ All setters that accept message/body/metadata bytes copy their inputs. Callers m
 | `trevrpc_client_call_unary`      | On success, `*response` is owned by the caller and must be freed with `trevrpc_response_free`.                        |
 | `trevrpc_client_start_stream`    | On success, `*stream` is owned by the caller and must be closed with `trevrpc_stream_close`.                          |
 | `trevrpc_server_listen`          | On success, `*server` is owned by the caller and must be closed with `trevrpc_server_close`.                          |
+| Handler `trevrpc_call_context*`  | Borrowed for the duration of the handler call. Poll it for deadlines/cancellation; do not retain it after return.     |
 | Handler `const trevrpc_request*` | Borrowed for the duration of the handler call. Do not free fields or retain field pointers after the handler returns. |
 | Handler `trevrpc_response*`      | Borrowed output. The handler may fill it with response helpers, but must not free it.                                 |
 | `trevrpc_stream_recv`            | On success with a non-null frame, `*frame` is owned by the caller and must be freed with `trevrpc_stream_frame_free`. |
@@ -87,6 +88,10 @@ C handlers run in-process. A handler crash, invalid memory access, abort, or unc
 
 Handlers should return `0` after filling a successful response or streaming status. Non-zero handler returns are converted to internal-error responses by the current high-level runtime.
 
+Request `timeout_nanos` is enforced cooperatively. The runtime rejects timeouts larger than `INT64_MAX`, turns already-expired or post-handler deadlines into `DEADLINE_EXCEEDED`, and passes a `trevrpc_call_context` into every handler. Long-running handlers should poll `trevrpc_call_context_cancelled`, `trevrpc_call_context_deadline_expired`, or `trevrpc_call_context_time_remaining_nanos`; the runtime does not preempt C handler code.
+
+High-level stream send/receive calls return `-ETIMEDOUT` after the request deadline expires and `-ECANCELED` after server shutdown cancellation is observed. Terminal stream statuses are still emitted by the server runtime when a handler exits without sending one.
+
 ## Compatibility Matrix
 
 | Feature                                          | Go runtime | C runtime                                             |
@@ -95,7 +100,7 @@ Handlers should return `0` after filling a successful response or streaming stat
 | Shared wire golden vectors                       | Yes        | Yes                                                   |
 | Metadata encode/decode and validation            | Yes        | Yes                                                   |
 | Metadata-value and bearer authorizers            | Yes        | No                                                    |
-| Request timeout/deadline enforcement             | Yes        | No                                                    |
+| Request timeout/deadline enforcement             | Yes        | Yes, cooperative                                      |
 | High-level MsQuic client/server RPC              | Yes        | Yes                                                   |
 | High-level WebTransport client/server RPC        | Yes        | No                                                    |
 | Low-level WebTransport wrapper                   | Yes        | Yes                                                   |

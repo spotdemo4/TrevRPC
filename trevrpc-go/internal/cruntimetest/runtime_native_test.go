@@ -67,6 +67,27 @@ func TestCRuntimeNativeMsQuicUnaryAndStreamingRoundTrip(t *testing.T) {
 			t.Fatalf("C runtime stream message %d = %q, want %q", i, message, body)
 		}
 	}
+
+	deadlineBody, deadlineStatus, err := callUnaryWithTimeout(
+		host, uint16(port), "test.EchoService", "Deadline", body, uint64(time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadlineStatus != statusDeadlineExceeded {
+		t.Fatalf("C runtime deadline status = %d, want DEADLINE_EXCEEDED", deadlineStatus)
+	}
+	if len(deadlineBody) != 0 {
+		t.Fatalf("C runtime deadline body = %q, want empty body", deadlineBody)
+	}
+
+	_, invalidStatus, err := callUnaryWithTimeout(
+		host, uint16(port), "test.EchoService", "Echo", body, ^uint64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invalidStatus != statusInvalidArgument {
+		t.Fatalf("C runtime oversized timeout status = %d, want INVALID_ARGUMENT", invalidStatus)
+	}
 }
 
 func certificateFiles(t *testing.T) (string, string) {

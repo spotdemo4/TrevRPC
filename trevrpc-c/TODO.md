@@ -2,10 +2,6 @@
 
 This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature parity with `trevrpc-go` and make it suitable as the primary native runtime.
 
-## Protocol Parity
-
-- Add explicit timeout/deadline handling for request `timeout_nanos` instead of only preserving the field.
-
 ## Runtime Policy
 
 - Add C server options equivalent to Go `ServerOptions`: max concurrent connections, max concurrent streams per connection, max concurrent requests, graceful shutdown timeout, initial request timeout, max stream messages, max stream body size, and stream idle timeout.

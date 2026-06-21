@@ -29,10 +29,10 @@ func TestGenerateGreeterCService(t *testing.T) {
 	headerContent := header.GetContent()
 	for _, want := range []string{
 		"typedef struct hello_v1_greeter_server",
-		"int (*say_hello)(void* user_data, const Hello__V1__HelloRequest* request, Hello__V1__HelloReply** response);",
-		"int (*lots_of_replies)(void* user_data, const Hello__V1__HelloRequest* request, trevrpc_stream* stream);",
-		"int (*lots_of_greetings)(void* user_data, trevrpc_stream* stream, Hello__V1__HelloReply** response);",
-		"int (*bidi_hello)(void* user_data, trevrpc_stream* stream);",
+		"int (*say_hello)(void* user_data, const trevrpc_call_context* context, const Hello__V1__HelloRequest* request, Hello__V1__HelloReply** response);",
+		"int (*lots_of_replies)(void* user_data, const trevrpc_call_context* context, const Hello__V1__HelloRequest* request, trevrpc_stream* stream);",
+		"int (*lots_of_greetings)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream, Hello__V1__HelloReply** response);",
+		"int (*bidi_hello)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream);",
 		"int hello_v1_greeter_send_hello_v1_hello_request",
 		"int hello_v1_greeter_recv_hello_v1_hello_reply",
 		"int hello_v1_greeter_say_hello",

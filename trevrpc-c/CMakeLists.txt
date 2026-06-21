@@ -105,4 +105,12 @@ if(TREVRPC_BUILD_TESTS)
     trevrpc_c_warnings(trevrpc_wire_test)
 
     add_test(NAME trevrpc_wire COMMAND trevrpc_wire_test)
+
+    if(TREVRPC_BUILD_RUNTIME)
+        add_executable(trevrpc_runtime_test tests/runtime_test.c)
+        target_link_libraries(trevrpc_runtime_test PRIVATE trevrpc)
+        trevrpc_c_warnings(trevrpc_runtime_test)
+
+        add_test(NAME trevrpc_runtime COMMAND trevrpc_runtime_test)
+    endif()
 endif()

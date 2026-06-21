@@ -53,6 +53,7 @@ extern "C" {
 typedef struct trevrpc_client trevrpc_client;
 typedef struct trevrpc_server trevrpc_server;
 typedef struct trevrpc_stream trevrpc_stream;
+typedef struct trevrpc_call_context trevrpc_call_context;
 
 typedef struct trevrpc_config {
     const char* cert_file;
@@ -115,10 +116,17 @@ typedef struct trevrpc_stream_frame {
     trevrpc_metadata metadata;
 } trevrpc_stream_frame;
 
-typedef int (*trevrpc_unary_handler)(void* user_data, const trevrpc_request* request, trevrpc_response* response);
-typedef int (*trevrpc_stream_handler)(void* user_data, const trevrpc_request* request, trevrpc_stream* stream);
+typedef int (*trevrpc_unary_handler)(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response);
+typedef int (*trevrpc_stream_handler)(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream);
 
 trevrpc_config trevrpc_default_config(void);
+
+int trevrpc_call_context_has_deadline(const trevrpc_call_context* context);
+int trevrpc_call_context_deadline_expired(const trevrpc_call_context* context);
+int trevrpc_call_context_cancelled(const trevrpc_call_context* context);
+int trevrpc_call_context_time_remaining_nanos(const trevrpc_call_context* context, uint64_t* remaining_nanos);
 
 uint32_t trevrpc_status_code_from_uint32(uint32_t code);
 const char* trevrpc_status_code_string(uint32_t code);

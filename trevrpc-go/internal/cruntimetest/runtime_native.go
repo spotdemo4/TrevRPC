@@ -5,6 +5,7 @@ package cruntimetest
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../../trevrpc-c/include -I${SRCDIR}/../../../trevrpc-c/src
 #cgo LDFLAGS: -lmsquic -lpthread
+#define _POSIX_C_SOURCE 200809L
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -13,13 +14,24 @@ package cruntimetest
 #include "trevrpc_wire.c"
 #include "trevrpc.c"
 
-static int trevrpc_c_echo_handler(void* user_data, const trevrpc_request* request, trevrpc_response* response) {
+static int trevrpc_c_echo_handler(void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
     (void)user_data;
+    (void)context;
     return trevrpc_response_set_body(response, request->body, request->body_len);
 }
 
-static int trevrpc_c_server_stream_handler(void* user_data, const trevrpc_request* request, trevrpc_stream* stream) {
+static int trevrpc_c_deadline_handler(void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
     (void)user_data;
+    if (!trevrpc_call_context_has_deadline(context)) {
+        return -EINVAL;
+    }
+    while (!trevrpc_call_context_deadline_expired(context)) {}
+    return trevrpc_response_set_body(response, request->body, request->body_len);
+}
+
+static int trevrpc_c_server_stream_handler(void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {
+    (void)user_data;
+    (void)context;
     int err = trevrpc_stream_send_message(stream, request->body, request->body_len);
     if (err != 0) {
         return err;
@@ -29,6 +41,10 @@ static int trevrpc_c_server_stream_handler(void* user_data, const trevrpc_reques
 
 static int trevrpc_c_register_echo(trevrpc_server* server) {
     int err = trevrpc_server_register_unary(server, "test.EchoService", "Echo", trevrpc_c_echo_handler, NULL);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_server_register_unary(server, "test.EchoService", "Deadline", trevrpc_c_deadline_handler, NULL);
     if (err != 0) {
         return err;
     }
@@ -53,6 +69,48 @@ static int trevrpc_c_server_join(pthread_t thread) {
     }
     return (int)(intptr_t)value;
 }
+
+static int trevrpc_c_call_unary_with_timeout(trevrpc_client* client, const char* service, const char* method, const uint8_t* body, size_t body_len, uint64_t timeout_nanos, trevrpc_response** out_response) {
+    if (client == NULL || out_response == NULL || (body == NULL && body_len > 0)) {
+        return -EINVAL;
+    }
+    *out_response = NULL;
+
+    trevrpc_msquic_stream* stream = NULL;
+    int err = trevrpc_msquic_conn_open_stream(client->conn, &stream);
+    if (err != 0) {
+        return err;
+    }
+
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    err = trevrpc_wire_encode_request(service, method, TREVRPC_RPC_KIND_UNARY, body, body_len, NULL, timeout_nanos, client->max_frame_size, &frame, &frame_len);
+    if (err == 0) {
+        err = trevrpc_write_frame(stream, frame, frame_len);
+    }
+    free(frame);
+    if (err == 0) {
+        err = trevrpc_msquic_stream_shutdown_send(stream);
+    }
+
+    uint8_t* response_body = NULL;
+    size_t response_body_len = 0;
+    if (err == 0) {
+        intptr_t read = trevrpc_msquic_stream_read_frame(stream, &response_body, &response_body_len, client->max_frame_size);
+        if (read < 0) {
+            err = (int)read;
+        } else if (read == 0) {
+            err = TREV_MSQUIC_ERR_CLOSED;
+        }
+    }
+    if (err == 0) {
+        err = trevrpc_wire_decode_response(response_body, response_body_len, out_response);
+    }
+
+    trevrpc_msquic_free(response_body);
+    trevrpc_msquic_stream_close(stream);
+    return err;
+}
 */
 import "C"
 
@@ -62,6 +120,8 @@ import (
 )
 
 const statusOK = 0
+const statusInvalidArgument = 3
+const statusDeadlineExceeded = 4
 const statusUnavailable = 14
 
 type runtimeServer struct {
@@ -149,6 +209,47 @@ func callUnary(host string, port uint16, service, method string, body []byte) ([
 		&response,
 	); code != 0 {
 		return nil, 0, runtimeError("call unary", code)
+	}
+	defer C.trevrpc_response_free(response)
+
+	var responseBody []byte
+	if response.body_len > 0 {
+		responseBody = C.GoBytes(unsafe.Pointer(response.body), C.int(response.body_len))
+	}
+	return responseBody, uint32(response.status), nil
+}
+
+func callUnaryWithTimeout(host string, port uint16, service, method string, body []byte, timeoutNanos uint64) ([]byte, uint32, error) {
+	cHost := C.CString(host)
+	defer C.free(unsafe.Pointer(cHost))
+	cService := C.CString(service)
+	defer C.free(unsafe.Pointer(cService))
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+
+	clientConfig := C.trevrpc_default_config()
+	var client *C.trevrpc_client
+	if code := C.trevrpc_client_connect(cHost, C.uint16_t(port), &clientConfig, &client); code != 0 {
+		return nil, 0, runtimeError("connect timeout client", code)
+	}
+	defer C.trevrpc_client_close(client)
+
+	var bodyPtr *C.uint8_t
+	if len(body) > 0 {
+		bodyPtr = (*C.uint8_t)(unsafe.Pointer(&body[0]))
+	}
+
+	var response *C.trevrpc_response
+	if code := C.trevrpc_c_call_unary_with_timeout(
+		client,
+		cService,
+		cMethod,
+		bodyPtr,
+		C.size_t(len(body)),
+		C.uint64_t(timeoutNanos),
+		&response,
+	); code != 0 {
+		return nil, 0, runtimeError("call unary with timeout", code)
 	}
 	defer C.trevrpc_response_free(response)
 

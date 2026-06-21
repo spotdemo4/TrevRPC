@@ -264,13 +264,13 @@ func generateHeaderService(buffer *bytes.Buffer, service serviceInfo) {
 	for _, method := range service.methods {
 		switch {
 		case !method.clientStreaming && !method.serverStreaming:
-			fmt.Fprintf(buffer, "    int (*%s)(void* user_data, const %s* request, %s** response);\n", method.cName, method.input.cType, method.output.cType)
+			fmt.Fprintf(buffer, "    int (*%s)(void* user_data, const trevrpc_call_context* context, const %s* request, %s** response);\n", method.cName, method.input.cType, method.output.cType)
 		case method.clientStreaming && !method.serverStreaming:
-			fmt.Fprintf(buffer, "    int (*%s)(void* user_data, trevrpc_stream* stream, %s** response);\n", method.cName, method.output.cType)
+			fmt.Fprintf(buffer, "    int (*%s)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream, %s** response);\n", method.cName, method.output.cType)
 		case !method.clientStreaming && method.serverStreaming:
-			fmt.Fprintf(buffer, "    int (*%s)(void* user_data, const %s* request, trevrpc_stream* stream);\n", method.cName, method.input.cType)
+			fmt.Fprintf(buffer, "    int (*%s)(void* user_data, const trevrpc_call_context* context, const %s* request, trevrpc_stream* stream);\n", method.cName, method.input.cType)
 		default:
-			fmt.Fprintf(buffer, "    int (*%s)(void* user_data, trevrpc_stream* stream);\n", method.cName)
+			fmt.Fprintf(buffer, "    int (*%s)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream);\n", method.cName)
 		}
 	}
 	fmt.Fprintf(buffer, "} %s;\n\n", service.typeName)
@@ -404,12 +404,12 @@ func writePackRequest(buffer *bytes.Buffer, message typeRef, name string) {
 func generateServerCallback(buffer *bytes.Buffer, service serviceInfo, method methodInfo) {
 	callbackName := fmt.Sprintf("%s_%s_callback", service.cName, method.cName)
 	if !method.clientStreaming && !method.serverStreaming {
-		fmt.Fprintf(buffer, "static int %s(void* user_data, const trevrpc_request* request, trevrpc_response* response) {\n", callbackName)
+		fmt.Fprintf(buffer, "static int %s(void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {\n", callbackName)
 		fmt.Fprintf(buffer, "    const %s* implementation = (const %s*)user_data;\n", service.typeName, service.typeName)
 		fmt.Fprintf(buffer, "    %s* decoded = %s__unpack(NULL, request->body_len, request->body);\n", method.input.cType, method.input.cPrefix)
 		buffer.WriteString("    if (decoded == NULL) { return TREVRPC_ERR_INVALID_FRAME; }\n")
 		fmt.Fprintf(buffer, "    %s* reply = NULL;\n", method.output.cType)
-		fmt.Fprintf(buffer, "    int err = implementation->%s(implementation->user_data, decoded, &reply);\n", method.cName)
+		fmt.Fprintf(buffer, "    int err = implementation->%s(implementation->user_data, context, decoded, &reply);\n", method.cName)
 		fmt.Fprintf(buffer, "    %s__free_unpacked(decoded, NULL);\n", method.input.cPrefix)
 		buffer.WriteString("    if (err != 0) { return err; }\n")
 		buffer.WriteString("    if (reply == NULL) { return TREVRPC_ERR_HANDLER_FAILED; }\n")
@@ -421,14 +421,16 @@ func generateServerCallback(buffer *bytes.Buffer, service serviceInfo, method me
 		return
 	}
 
-	fmt.Fprintf(buffer, "static int %s(void* user_data, const trevrpc_request* request, trevrpc_stream* stream) {\n", callbackName)
+	fmt.Fprintf(buffer, "static int %s(void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {\n", callbackName)
 	fmt.Fprintf(buffer, "    const %s* implementation = (const %s*)user_data;\n", service.typeName, service.typeName)
 	switch {
 	case method.clientStreaming && method.serverStreaming:
-		fmt.Fprintf(buffer, "    return implementation->%s(implementation->user_data, stream);\n", method.cName)
+		fmt.Fprintf(buffer, "    (void)request;\n")
+		fmt.Fprintf(buffer, "    return implementation->%s(implementation->user_data, context, stream);\n", method.cName)
 	case method.clientStreaming:
 		fmt.Fprintf(buffer, "    %s* reply = NULL;\n", method.output.cType)
-		fmt.Fprintf(buffer, "    int err = implementation->%s(implementation->user_data, stream, &reply);\n", method.cName)
+		fmt.Fprintf(buffer, "    (void)request;\n")
+		fmt.Fprintf(buffer, "    int err = implementation->%s(implementation->user_data, context, stream, &reply);\n", method.cName)
 		buffer.WriteString("    if (err != 0) { return err; }\n")
 		buffer.WriteString("    if (reply == NULL) { return TREVRPC_ERR_HANDLER_FAILED; }\n")
 		writePackRequest(buffer, method.output, "reply")
@@ -438,7 +440,7 @@ func generateServerCallback(buffer *bytes.Buffer, service serviceInfo, method me
 	case method.serverStreaming:
 		fmt.Fprintf(buffer, "    %s* decoded = %s__unpack(NULL, request->body_len, request->body);\n", method.input.cType, method.input.cPrefix)
 		buffer.WriteString("    if (decoded == NULL) { return TREVRPC_ERR_INVALID_FRAME; }\n")
-		fmt.Fprintf(buffer, "    int err = implementation->%s(implementation->user_data, decoded, stream);\n", method.cName)
+		fmt.Fprintf(buffer, "    int err = implementation->%s(implementation->user_data, context, decoded, stream);\n", method.cName)
 		fmt.Fprintf(buffer, "    %s__free_unpacked(decoded, NULL);\n", method.input.cPrefix)
 		buffer.WriteString("    return err;\n")
 	}
