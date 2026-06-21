@@ -39,6 +39,7 @@ This tracks replacing the `libwtf` dependency with an internal WebTransport impl
   - Send CONNECT request for configured URL/path/origin.
   - Open bidirectional WebTransport streams.
 - Added integration coverage for native WebTransport unary, server-streaming, client-streaming, bidirectional streaming, and low-level shutdown/close unblock behavior.
+- Added malformed-peer coverage for HTTP/3 control stream type, missing/malformed SETTINGS, malformed QPACK blocks, and invalid CONNECT pseudo-headers.
 - Removed obsolete libwtf-specific documentation and draft workaround text.
 
 ## Current Status
@@ -46,11 +47,10 @@ This tracks replacing the `libwtf` dependency with an internal WebTransport impl
 - Multi-listener high-level `trevrpc_server` support exists.
 - `trevrpc_wt_*` is backed by the internal MsQuic/HTTP3/WebTransport implementation.
 - High-level WebTransport RPC CTests cover unary and all streaming shapes.
-- Low-level WebTransport CTests cover session establishment, stream I/O, path rejection, and shutdown/close unblock behavior.
+- Low-level WebTransport CTests cover session establishment, stream I/O, malformed handshakes, path rejection, and shutdown/close unblock behavior.
 
 ## Remaining Work
 
-- Harden malformed peer handling for HTTP/3 control streams, SETTINGS, QPACK blocks, and CONNECT headers.
 - Add WebTransport reset/partial-stream high-level RPC failure coverage.
 - Investigate serving native QUIC and WebTransport from one shared underlying MsQuic listener.
 

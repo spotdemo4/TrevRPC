@@ -13,6 +13,7 @@
 #define TREV_WT_H3_STREAM_TYPE_CONTROL 0x00
 #define TREV_WT_H3_FRAME_SETTINGS 0x04
 #define TREV_WT_H3_FRAME_HEADERS 0x01
+#define TREV_WT_H3_SETTINGS_WEBTRANSPORT 0x2b603742
 #define TREV_WT_CONNECT_STATUS_OK 200
 #define TREV_WT_STREAM_TYPE_BIDI 0x41
 #define TREV_WT_STREAM_TYPE_BIDI_LEN 2
@@ -472,10 +473,45 @@ static int trevrpc_wt_write_control_settings(trevrpc_wt_session* session) {
         return trevrpc_wt_map_msquic_error(err);
     }
 
-    const uint64_t fields[] = {TREV_WT_H3_STREAM_TYPE_CONTROL, TREV_WT_H3_FRAME_SETTINGS, 0};
+    const uint64_t fields[] = {
+        TREV_WT_H3_STREAM_TYPE_CONTROL,
+        TREV_WT_H3_FRAME_SETTINGS,
+        5,
+        TREV_WT_H3_SETTINGS_WEBTRANSPORT,
+        1,
+    };
     err = trevrpc_wt_write_varints(control, fields, sizeof(fields) / sizeof(fields[0]));
     session->local_control = control;
     return err;
+}
+
+static int trevrpc_wt_read_settings_payload(trevrpc_msquic_stream* control, uint64_t len) {
+    uint8_t payload[4096];
+    size_t payload_len = (size_t)len;
+    size_t offset = 0;
+    bool has_webtransport = false;
+    int err = trevrpc_wt_read_exact(control, payload, payload_len);
+    if (err != 0) {
+        return err;
+    }
+
+    while (offset < payload_len) {
+        uint64_t id = 0;
+        uint64_t value = 0;
+        err = trevrpc_wt_varint_read_buffer(payload, payload_len, &offset, &id);
+        if (err != 0) {
+            return TREV_WT_ERR_REJECTED;
+        }
+        err = trevrpc_wt_varint_read_buffer(payload, payload_len, &offset, &value);
+        if (err != 0) {
+            return TREV_WT_ERR_REJECTED;
+        }
+        if (id == TREV_WT_H3_SETTINGS_WEBTRANSPORT && value == 1) {
+            has_webtransport = true;
+        }
+    }
+
+    return has_webtransport ? 0 : TREV_WT_ERR_REJECTED;
 }
 
 static int trevrpc_wt_read_peer_control_settings(trevrpc_wt_session* session) {
@@ -502,11 +538,8 @@ static int trevrpc_wt_read_peer_control_settings(trevrpc_wt_session* session) {
         err = TREV_WT_ERR_REJECTED;
     }
 
-    uint8_t scratch[256];
-    while (err == 0 && frame.len > 0) {
-        size_t chunk = frame.len < sizeof(scratch) ? (size_t)frame.len : sizeof(scratch);
-        err = trevrpc_wt_read_exact(control, scratch, chunk);
-        frame.len -= chunk;
+    if (err == 0) {
+        err = trevrpc_wt_read_settings_payload(control, frame.len);
     }
 
     session->peer_control = control;
