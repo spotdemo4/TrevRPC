@@ -14,7 +14,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 - Enforce stream idle timeout while receiving request streams and while sending response streams.
 - Add overload behavior matching Go, including accepting enough streams to return an explicit resource-exhausted status where possible.
 - Add graceful shutdown behavior that stops accepting new work, waits for active work, then force-closes remaining sessions after timeout.
-- Define and document which C APIs are blocking, which are cancel-safe, and which can be called concurrently.
 
 ## Authorization And Metadata Policy
 
@@ -40,7 +39,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Handler Safety
 
-- Document that C handler crashes are process crashes unless the caller isolates them.
 - Add defensive checks around handler return values and response ownership.
 - Ensure every handler path sends exactly one terminal status for streaming RPCs.
 - Add tests for handlers returning errors before and after partial streaming responses.
@@ -84,12 +82,7 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Documentation
 
-- Document the public C API ownership model for every pointer returned by the runtime.
-- Document thread-safety guarantees for client, server, stream, listener, connection, and WebTransport objects.
-- Document the difference between `trevrpc-c` high-level RPC APIs and low-level `trevrpc_msquic_*` / `trevrpc_wt_*` transport APIs.
 - Add C examples for unary, server-streaming, client-streaming, and bidi streaming.
-- Add build instructions for CMake, Nix, and downstream consumers.
-- Add a compatibility matrix showing which Go runtime features exist in C.
 
 ## Performance
 
