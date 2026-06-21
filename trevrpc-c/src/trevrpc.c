@@ -81,6 +81,7 @@ struct trevrpc_server {
     void* authorizer_user_data;
     trevrpc_metrics metrics;
     trevrpc_transport_observer transport_observer;
+    trevrpc_logger logger;
     size_t active_tasks;
     size_t active_connections;
     size_t active_requests;
@@ -814,6 +815,27 @@ void trevrpc_server_clear_transport_observer(trevrpc_server* server) {
     pthread_mutex_unlock(&server->mutex);
 }
 
+int trevrpc_server_set_logger(trevrpc_server* server, const trevrpc_logger* logger) {
+    if (server == NULL || logger == NULL) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    server->logger = *logger;
+    pthread_mutex_unlock(&server->mutex);
+    return 0;
+}
+
+void trevrpc_server_clear_logger(trevrpc_server* server) {
+    if (server == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    server->logger = (trevrpc_logger){0};
+    pthread_mutex_unlock(&server->mutex);
+}
+
 int trevrpc_server_register_unary(
     trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data) {
     if (server == NULL || service == NULL || method == NULL || handler == NULL) {
@@ -1081,7 +1103,45 @@ static trevrpc_transport_observer trevrpc_server_transport_observer_snapshot(tre
     return observer;
 }
 
+static trevrpc_logger trevrpc_server_logger_snapshot(trevrpc_server* server) {
+    pthread_mutex_lock(&server->mutex);
+    trevrpc_logger logger = server->logger;
+    pthread_mutex_unlock(&server->mutex);
+    return logger;
+}
+
+static void trevrpc_log(trevrpc_server* server,
+    uint32_t level,
+    const char* event_name,
+    const char* message,
+    const trevrpc_request* request,
+    int error_code) {
+    trevrpc_logger logger = trevrpc_server_logger_snapshot(server);
+    if (logger.log == NULL) {
+        return;
+    }
+
+    trevrpc_log_event event = {
+        .level = level,
+        .event = event_name,
+        .event_len = event_name == NULL ? 0 : strlen(event_name),
+        .message = message,
+        .message_len = message == NULL ? 0 : strlen(message),
+        .service = request == NULL ? NULL : request->service,
+        .service_len = request == NULL ? 0 : request->service_len,
+        .method = request == NULL ? NULL : request->method,
+        .method_len = request == NULL ? 0 : request->method_len,
+        .error_code = error_code,
+    };
+    logger.log(logger.user_data, &event);
+}
+
 static void trevrpc_transport_record_event(trevrpc_server* server, uint32_t kind, int error_code, const char* message) {
+    if (kind == TREVRPC_TRANSPORT_EVENT_LISTENER_ERROR || kind == TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR ||
+        kind == TREVRPC_TRANSPORT_EVENT_STREAM_ERROR) {
+        trevrpc_log(server, TREVRPC_LOG_LEVEL_ERROR, "transport.error", message, NULL, error_code);
+    }
+
     trevrpc_transport_observer observer = trevrpc_server_transport_observer_snapshot(server);
     if (observer.transport_event == NULL) {
         return;
@@ -1324,18 +1384,21 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     trevrpc_request request;
     int err = trevrpc_wire_decode_request(body, body_len, &request);
     if (err == TREVRPC_ERR_INVALID_FRAME) {
+        trevrpc_log(server, TREVRPC_LOG_LEVEL_WARN, "rpc.decode_failed", "invalid request frame", NULL, err);
         trevrpc_server_write_status(
             stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "invalid request frame");
         trevrpc_msquic_free(body);
         return;
     }
     if (err == TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION) {
+        trevrpc_log(server, TREVRPC_LOG_LEVEL_WARN, "rpc.decode_failed", "unsupported TrevRPC wire version", NULL, err);
         trevrpc_server_write_status(
             stream, server->max_frame_size, TREVRPC_STATUS_FAILED_PRECONDITION, "unsupported TrevRPC wire version");
         trevrpc_msquic_free(body);
         return;
     }
     if (err != 0) {
+        trevrpc_log(server, TREVRPC_LOG_LEVEL_WARN, "rpc.decode_failed", "invalid request", NULL, err);
         trevrpc_server_write_status(stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "invalid request");
         trevrpc_msquic_free(body);
         return;
@@ -1401,9 +1464,16 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         trevrpc_status status = trevrpc_status_ok();
         err = authorizer(authorizer_user_data, &context, &request, &status);
         if (err != 0) {
+            trevrpc_log(server, TREVRPC_LOG_LEVEL_ERROR, "rpc.authorizer_failed", "authorizer failed", &request, err);
             status = trevrpc_status_internal("authorizer failed", strlen("authorizer failed"));
         }
         if (status.code != TREVRPC_STATUS_OK) {
+            trevrpc_log(server,
+                status.code == TREVRPC_STATUS_INTERNAL ? TREVRPC_LOG_LEVEL_ERROR : TREVRPC_LOG_LEVEL_WARN,
+                "rpc.authorization_denied",
+                status.message,
+                &request,
+                (int)status.code);
             if (request.kind == TREVRPC_RPC_KIND_UNARY) {
                 trevrpc_response response = {0};
                 (void)trevrpc_response_set_status(&response, status);
@@ -1420,6 +1490,12 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     }
 
     if (!trevrpc_server_request_try_start(server)) {
+        trevrpc_log(server,
+            TREVRPC_LOG_LEVEL_WARN,
+            "rpc.overloaded",
+            "too many concurrent RPCs",
+            &request,
+            TREVRPC_STATUS_RESOURCE_EXHAUSTED);
         if (request.kind == TREVRPC_RPC_KIND_UNARY) {
             trevrpc_server_write_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "too many concurrent RPCs");
@@ -1435,6 +1511,12 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
 
     trevrpc_method* method = trevrpc_server_find_method(server, &request);
     if (method == NULL) {
+        trevrpc_log(server,
+            TREVRPC_LOG_LEVEL_WARN,
+            "rpc.route_not_found",
+            "method is not implemented",
+            &request,
+            TREVRPC_STATUS_UNIMPLEMENTED);
         if (request.kind == TREVRPC_RPC_KIND_UNARY) {
             trevrpc_server_write_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method is not implemented");
@@ -1449,6 +1531,12 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         return;
     }
     if (method->kind != request.kind) {
+        trevrpc_log(server,
+            TREVRPC_LOG_LEVEL_WARN,
+            "rpc.kind_mismatch",
+            "method RPC kind mismatch",
+            &request,
+            TREVRPC_STATUS_UNIMPLEMENTED);
         if (request.kind == TREVRPC_RPC_KIND_UNARY) {
             trevrpc_server_write_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method RPC kind mismatch");
@@ -1495,6 +1583,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             rpc_stream.context = NULL;
             const char* message = NULL;
             final_status = trevrpc_status_from_error(err, &message);
+            trevrpc_log(server, TREVRPC_LOG_LEVEL_ERROR, "rpc.handler_failed", message, &request, err);
             (void)trevrpc_stream_send_status(&rpc_stream, final_status, message, message == NULL ? 0 : strlen(message));
         } else if (!rpc_stream.sent_status) {
             rpc_stream.context = NULL;
@@ -1517,6 +1606,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         trevrpc_response_reset(&response);
         trevrpc_set_status(&response, TREVRPC_STATUS_DEADLINE_EXCEEDED, "RPC deadline exceeded");
     } else if (err != 0) {
+        trevrpc_log(server, TREVRPC_LOG_LEVEL_ERROR, "rpc.handler_failed", "handler failed", &request, err);
         trevrpc_response_reset(&response);
         trevrpc_set_status(&response, TREVRPC_STATUS_INTERNAL, "handler failed");
     }

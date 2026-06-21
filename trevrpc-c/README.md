@@ -109,6 +109,7 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 | Graceful shutdown timeout                        | Yes        | Yes                                                   |
 | Metrics callbacks                                | Yes        | Yes                                                   |
 | Transport lifecycle callbacks                    | Yes        | MsQuic high-level server                              |
+| Structured log callbacks                         | Yes        | Yes                                                   |
 | First-class status helpers                       | Yes        | Yes                                                   |
 | Generated typed C protobuf helpers               | No         | Partial generator support, runtime helpers incomplete |
 | CMake installable libraries                      | N/A        | Yes                                                   |

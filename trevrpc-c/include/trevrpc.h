@@ -57,6 +57,11 @@ extern "C" {
 #define TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE 7u
 #define TREVRPC_TRANSPORT_EVENT_STREAM_ERROR 8u
 
+#define TREVRPC_LOG_LEVEL_DEBUG 0u
+#define TREVRPC_LOG_LEVEL_INFO 1u
+#define TREVRPC_LOG_LEVEL_WARN 2u
+#define TREVRPC_LOG_LEVEL_ERROR 3u
+
 #define TREVRPC_ERR_INVALID_FRAME -2001
 #define TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION -2002
 #define TREVRPC_ERR_UNSUPPORTED_RPC_KIND -2003
@@ -204,6 +209,26 @@ typedef struct trevrpc_transport_observer {
     void* user_data;
 } trevrpc_transport_observer;
 
+typedef struct trevrpc_log_event {
+    uint32_t level;
+    const char* event;
+    size_t event_len;
+    const char* message;
+    size_t message_len;
+    const char* service;
+    size_t service_len;
+    const char* method;
+    size_t method_len;
+    int error_code;
+} trevrpc_log_event;
+
+typedef void (*trevrpc_log_callback)(void* user_data, const trevrpc_log_event* event);
+
+typedef struct trevrpc_logger {
+    trevrpc_log_callback log;
+    void* user_data;
+} trevrpc_logger;
+
 trevrpc_config trevrpc_default_config(void);
 trevrpc_server_options trevrpc_default_server_options(void);
 
@@ -269,6 +294,8 @@ int trevrpc_server_set_metrics(trevrpc_server* server, const trevrpc_metrics* me
 void trevrpc_server_clear_metrics(trevrpc_server* server);
 int trevrpc_server_set_transport_observer(trevrpc_server* server, const trevrpc_transport_observer* observer);
 void trevrpc_server_clear_transport_observer(trevrpc_server* server);
+int trevrpc_server_set_logger(trevrpc_server* server, const trevrpc_logger* logger);
+void trevrpc_server_clear_logger(trevrpc_server* server);
 int trevrpc_server_register_unary(
     trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data);
 int trevrpc_server_register_streaming(trevrpc_server* server,
