@@ -108,6 +108,8 @@ if(TREVRPC_BUILD_TESTS)
 
     if(TREVRPC_BUILD_RUNTIME)
         add_executable(trevrpc_runtime_test tests/runtime_test.c)
+        target_include_directories(trevrpc_runtime_test PRIVATE src)
+        target_compile_definitions(trevrpc PRIVATE TREVRPC_TESTING)
         target_link_libraries(trevrpc_runtime_test PRIVATE trevrpc)
         trevrpc_c_warnings(trevrpc_runtime_test)
 

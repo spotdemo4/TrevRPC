@@ -1,8 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc.h"
+#include "trevrpc_wire_internal.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,6 +21,9 @@ struct trevrpc_call_context {
 };
 
 typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
+
+int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server);
+void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 
 struct trevrpc_stream {
     trevrpc_msquic_stream* stream;
@@ -72,6 +77,102 @@ struct trevrpc_msquic_stream {
             goto cleanup;                                                                                              \
         }                                                                                                              \
     } while (0)
+
+typedef struct metric_counts {
+    int started;
+    int finished;
+    uint32_t status;
+    size_t request_body_len;
+    size_t response_body_len;
+    char service[32];
+    char method[32];
+} metric_counts;
+
+static void record_started(void* user_data, const trevrpc_rpc_started_event* event) {
+    metric_counts* counts = user_data;
+    counts->started++;
+    counts->request_body_len = event->request_body_len;
+    size_t service_len =
+        event->service_len < sizeof(counts->service) - 1 ? event->service_len : sizeof(counts->service) - 1;
+    size_t method_len = event->method_len < sizeof(counts->method) - 1 ? event->method_len : sizeof(counts->method) - 1;
+    if (event->service != NULL) {
+        memcpy(counts->service, event->service, service_len);
+    }
+    if (event->method != NULL) {
+        memcpy(counts->method, event->method, method_len);
+    }
+    counts->service[service_len] = '\0';
+    counts->method[method_len] = '\0';
+}
+
+static void record_finished(void* user_data, const trevrpc_rpc_finished_event* event) {
+    metric_counts* counts = user_data;
+    counts->finished++;
+    counts->status = event->status;
+    counts->request_body_len = event->request_body_len;
+    counts->response_body_len = event->response_body_len;
+}
+
+static int success_handler(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+    static const uint8_t body[] = {'o', 'k'};
+    return trevrpc_response_set_body(response, body, sizeof(body));
+}
+
+static int failing_handler(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+    (void)response;
+    return -EIO;
+}
+
+static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data, size_t data_len) {
+    trevrpc_msquic_chunk* chunk = malloc(sizeof(*chunk) + data_len);
+    if (chunk == NULL) {
+        return -ENOMEM;
+    }
+    chunk->next = NULL;
+    chunk->len = data_len;
+    chunk->offset = 0;
+    memcpy(chunk->data, data, data_len);
+    stream->recv_head = chunk;
+    stream->recv_tail = chunk;
+    return 0;
+}
+
+static void reset_raw_stream(trevrpc_msquic_stream* stream) {
+    trevrpc_msquic_chunk* chunk = stream->recv_head;
+    while (chunk != NULL) {
+        trevrpc_msquic_chunk* next = chunk->next;
+        free(chunk);
+        chunk = next;
+    }
+    pthread_cond_destroy(&stream->cond);
+    pthread_mutex_destroy(&stream->mutex);
+}
+
+static int init_raw_stream(trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len) {
+    memset(stream, 0, sizeof(*stream));
+    int err = pthread_mutex_init(&stream->mutex, NULL);
+    if (err != 0) {
+        return -err;
+    }
+    err = pthread_cond_init(&stream->cond, NULL);
+    if (err != 0) {
+        pthread_mutex_destroy(&stream->mutex);
+        return -err;
+    }
+    err = append_recv_bytes(stream, body, body_len);
+    if (err != 0) {
+        reset_raw_stream(stream);
+    }
+    return err;
+}
 
 static int now(struct timespec* out) {
     if (clock_gettime(CLOCK_MONOTONIC, out) != 0) {
@@ -397,6 +498,124 @@ cleanup:
     return result;
 }
 
+static int run_metrics_case(
+    const uint8_t* request_body, size_t request_body_len, trevrpc_unary_handler handler, metric_counts* counts) {
+    int result = 1;
+    trevrpc_server* server = NULL;
+    trevrpc_msquic_stream stream = {0};
+    bool stream_initialized = false;
+    trevrpc_metrics metrics = {
+        .rpc_started = record_started,
+        .rpc_finished = record_finished,
+        .user_data = counts,
+    };
+
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
+    if (handler != NULL) {
+        CHECK_GOTO(trevrpc_server_register_unary(server, "svc", "method", handler, NULL) == 0);
+    }
+    CHECK_GOTO(init_raw_stream(&stream, request_body, request_body_len) == 0);
+    stream_initialized = true;
+
+    trevrpc_test_server_handle_stream(server, &stream);
+
+    result = 0;
+
+cleanup:
+    if (stream_initialized) {
+        reset_raw_stream(&stream);
+    }
+    trevrpc_server_close(server);
+    return result;
+}
+
+static int test_metrics_exactly_once_success(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    metric_counts counts = {0};
+    const uint8_t body[] = {'h', 'i'};
+
+    CHECK_GOTO(
+        trevrpc_wire_encode_request(
+            "svc", "method", TREVRPC_RPC_KIND_UNARY, body, sizeof(body), NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(run_metrics_case(frame, frame_len, success_handler, &counts) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(counts.request_body_len == sizeof(body));
+    CHECK_GOTO(counts.response_body_len == 2);
+    CHECK_GOTO(strcmp(counts.service, "svc") == 0);
+    CHECK_GOTO(strcmp(counts.method, "method") == 0);
+
+    result = 0;
+
+cleanup:
+    free(frame);
+    return result;
+}
+
+static int test_metrics_exactly_once_handler_failure(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    metric_counts counts = {0};
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(run_metrics_case(frame, frame_len, failing_handler, &counts) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL);
+
+    result = 0;
+
+cleanup:
+    free(frame);
+    return result;
+}
+
+static int test_metrics_exactly_once_cancellation(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    metric_counts counts = {0};
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 1, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(run_metrics_case(frame, frame_len, success_handler, &counts) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_DEADLINE_EXCEEDED);
+
+    result = 0;
+
+cleanup:
+    free(frame);
+    return result;
+}
+
+static int test_metrics_exactly_once_decode_error(void) {
+    int result = 1;
+    metric_counts counts = {0};
+    const uint8_t invalid_frame[] = {0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0xff};
+
+    CHECK_GOTO(run_metrics_case(invalid_frame, sizeof(invalid_frame), success_handler, &counts) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INVALID_ARGUMENT);
+    CHECK_GOTO(counts.request_body_len == 0);
+    CHECK_GOTO(counts.response_body_len == 0);
+    CHECK_GOTO(counts.service[0] == '\0');
+    CHECK_GOTO(counts.method[0] == '\0');
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -438,6 +657,18 @@ int main(void) {
         return 1;
     }
     if (test_authorizer_failure_variants() != 0) {
+        return 1;
+    }
+    if (test_metrics_exactly_once_success() != 0) {
+        return 1;
+    }
+    if (test_metrics_exactly_once_handler_failure() != 0) {
+        return 1;
+    }
+    if (test_metrics_exactly_once_cancellation() != 0) {
+        return 1;
+    }
+    if (test_metrics_exactly_once_decode_error() != 0) {
         return 1;
     }
     return 0;

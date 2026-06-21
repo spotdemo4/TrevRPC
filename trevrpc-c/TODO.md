@@ -8,8 +8,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Metrics And Observability
 
-- Add tests proving metrics fire exactly once on success, handler failure, cancellation, and decode errors.
-
 ## Error And Status Mapping
 
 - Audit C status/error mapping against Go `StatusFromError` behavior.

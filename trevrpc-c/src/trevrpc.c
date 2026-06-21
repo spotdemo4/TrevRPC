@@ -106,6 +106,7 @@ typedef struct trevrpc_stream_task {
 } trevrpc_stream_task;
 
 static bool trevrpc_server_is_shutting_down(trevrpc_server* server);
+static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 
 static size_t trevrpc_effective_max_frame_size(const trevrpc_config* config) {
     if (config != NULL && config->max_frame_size > 0) {
@@ -728,6 +729,31 @@ int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config*
     return 0;
 }
 
+#ifdef TREVRPC_TESTING
+int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server) {
+    if (out_server == NULL) {
+        return -EINVAL;
+    }
+    *out_server = NULL;
+
+    trevrpc_server* server = calloc(1, sizeof(*server));
+    if (server == NULL) {
+        return -ENOMEM;
+    }
+    server->max_frame_size = trevrpc_effective_max_frame_size(config);
+    server->options = trevrpc_default_server_options();
+    pthread_mutex_init(&server->mutex, NULL);
+    pthread_cond_init(&server->cond, NULL);
+
+    *out_server = server;
+    return 0;
+}
+
+void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream) {
+    trevrpc_handle_stream(server, stream);
+}
+#endif
+
 int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_options* options) {
     if (server == NULL || options == NULL) {
         return -EINVAL;
@@ -1202,6 +1228,14 @@ static void trevrpc_metrics_record_finished(trevrpc_server* server,
     metrics.rpc_finished(metrics.user_data, &event);
 }
 
+static void trevrpc_metrics_record_pre_handler(trevrpc_server* server, uint32_t status) {
+    trevrpc_request request = {0};
+    struct timespec started_at = {0};
+    (void)trevrpc_clock_now(&started_at);
+    trevrpc_metrics_record_started(server, &request);
+    trevrpc_metrics_record_finished(server, &request, 0, status, &started_at);
+}
+
 static void trevrpc_server_shutdown_connections(trevrpc_server* server) {
     pthread_mutex_lock(&server->mutex);
     for (trevrpc_server_conn_ref* ref = server->conns; ref != NULL; ref = ref->next) {
@@ -1298,13 +1332,13 @@ static void trevrpc_server_write_response(
     trevrpc_msquic_stream* stream, size_t max_frame_size, trevrpc_response* response) {
     uint8_t* frame = NULL;
     size_t frame_len = 0;
-    int err = trevrpc_wire_encode_response(response, max_frame_size, &frame, &frame_len);
-    if (err != 0 && response->status == TREVRPC_STATUS_OK) {
+    int encode_err = trevrpc_wire_encode_response(response, max_frame_size, &frame, &frame_len);
+    if (encode_err != 0 && response->status == TREVRPC_STATUS_OK) {
         trevrpc_response_reset(response);
         trevrpc_set_status(response, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "response frame exceeded maximum size");
-        err = trevrpc_wire_encode_response(response, max_frame_size, &frame, &frame_len);
+        encode_err = trevrpc_wire_encode_response(response, max_frame_size, &frame, &frame_len);
     }
-    if (err == 0) {
+    if (encode_err == 0) {
         (void)trevrpc_write_frame(stream, frame, frame_len);
     }
     free(frame);
@@ -1375,6 +1409,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
                                                                       : "failed to read request frame";
         trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, (int)read, message);
         trevrpc_server_write_status(stream, server->max_frame_size, status, message);
+        trevrpc_metrics_record_pre_handler(server, status);
         return;
     }
     if (read == 0) {
@@ -1387,6 +1422,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         trevrpc_log(server, TREVRPC_LOG_LEVEL_WARN, "rpc.decode_failed", "invalid request frame", NULL, err);
         trevrpc_server_write_status(
             stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "invalid request frame");
+        trevrpc_metrics_record_pre_handler(server, TREVRPC_STATUS_INVALID_ARGUMENT);
         trevrpc_msquic_free(body);
         return;
     }
@@ -1394,12 +1430,14 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         trevrpc_log(server, TREVRPC_LOG_LEVEL_WARN, "rpc.decode_failed", "unsupported TrevRPC wire version", NULL, err);
         trevrpc_server_write_status(
             stream, server->max_frame_size, TREVRPC_STATUS_FAILED_PRECONDITION, "unsupported TrevRPC wire version");
+        trevrpc_metrics_record_pre_handler(server, TREVRPC_STATUS_FAILED_PRECONDITION);
         trevrpc_msquic_free(body);
         return;
     }
     if (err != 0) {
         trevrpc_log(server, TREVRPC_LOG_LEVEL_WARN, "rpc.decode_failed", "invalid request", NULL, err);
         trevrpc_server_write_status(stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "invalid request");
+        trevrpc_metrics_record_pre_handler(server, TREVRPC_STATUS_INVALID_ARGUMENT);
         trevrpc_msquic_free(body);
         return;
     }
