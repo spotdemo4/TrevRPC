@@ -4,7 +4,7 @@ package trevrpc
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../trevrpc-c/include -I${SRCDIR}/../trevrpc-c/src
-#cgo LDFLAGS: -lwtf -lmsquic -lpthread -lm -lrt -lcrypto
+#cgo LDFLAGS: -lwtf -lpthread -lm -lrt -lcrypto
 #include <stdlib.h>
 #include "trevrpc_webtransport.c"
 */

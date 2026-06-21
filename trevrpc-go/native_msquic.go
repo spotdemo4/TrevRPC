@@ -3,9 +3,8 @@
 package trevrpc
 
 /*
-#cgo pkg-config: msquic
 #cgo CFLAGS: -I${SRCDIR}/../trevrpc-c/include -I${SRCDIR}/../trevrpc-c/src
-#cgo LDFLAGS: -lpthread
+#cgo LDFLAGS: -lmsquic -lpthread
 #include <stdlib.h>
 #include "trevrpc_msquic.c"
 */

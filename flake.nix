@@ -52,6 +52,7 @@
               openssl
               pkg-config
               protobufc
+              libmsquic
               libwtf
 
               # javascript
@@ -293,6 +294,7 @@
             ];
             packages = with pkgs; [
               clang-tools
+              libmsquic
               libwtf
             ];
             script = ''
@@ -302,6 +304,7 @@
                 -std=c11 \
                 -Itrevrpc-c/include \
                 -Itrevrpc-c/src \
+                -isystem ${pkgs.libmsquic}/include \
                 -isystem ${pkgs.libwtf}/include
             '';
           };
