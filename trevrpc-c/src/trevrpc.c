@@ -687,6 +687,9 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
             trevrpc_stream_record_failure(stream, TREVRPC_STATUS_UNAVAILABLE, "request stream idle timeout");
             return TREVRPC_ERR_STREAM_IDLE_TIMEOUT;
         }
+        if (read == TREV_MSQUIC_ERR_CLOSED || read == TREV_WT_ERR_CLOSED || read == -ECANCELED) {
+            trevrpc_stream_record_failure(stream, TREVRPC_STATUS_CANCELLED, "transport closed");
+        }
         return (int)read;
     }
     if (read == 0) {
@@ -1086,6 +1089,30 @@ void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_str
     trevrpc_stream rpc_stream = trevrpc_stream_ref_webtransport(stream, server->max_frame_size);
     trevrpc_handle_stream(server, &rpc_stream);
     trevrpc_test_current_server = NULL;
+}
+
+trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_client* client) {
+    if (client == NULL || client->transport != TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
+        return NULL;
+    }
+    return client->wt_session;
+}
+
+trevrpc_wt_stream* trevrpc_test_stream_webtransport_stream(trevrpc_stream* stream) {
+    if (stream == NULL || stream->transport != TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
+        return NULL;
+    }
+    return stream->wt_stream;
+}
+
+void trevrpc_test_stream_close_webtransport_raw(trevrpc_stream* stream) {
+    if (stream == NULL || stream->transport != TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
+        return;
+    }
+    (void)trevrpc_wt_stream_abort(stream->wt_stream, 1);
+    trevrpc_wt_stream_close(stream->wt_stream);
+    stream->wt_stream = NULL;
+    stream->owns_stream = false;
 }
 
 int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port) {
@@ -1829,6 +1856,20 @@ static uint32_t trevrpc_transport_status_from_error(int err, const char** messag
     }
 }
 
+static bool trevrpc_error_is_transport_failure(int err) {
+    switch (err) {
+    case TREV_MSQUIC_ERR_CLOSED:
+    case TREV_WT_ERR_CLOSED:
+    case TREV_WT_ERR_REJECTED:
+    case TREV_MSQUIC_ERR_TIMEOUT:
+    case -ECANCELED:
+    case -ETIMEDOUT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint32_t trevrpc_transport_event_transport(trevrpc_server* server) {
     if (server == NULL || server->wt_listener == NULL) {
         return TREVRPC_TRANSPORT_KIND_MSQUIC;
@@ -2041,7 +2082,8 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_stream* stream
         } else if (err != 0 && !rpc_stream.sent_status) {
             rpc_stream.context = NULL;
             const char* message = NULL;
-            final_status = trevrpc_status_from_error(err, &message);
+            final_status = trevrpc_error_is_transport_failure(err) ? trevrpc_transport_status_from_error(err, &message)
+                                                                   : trevrpc_status_from_error(err, &message);
             trevrpc_log(server, TREVRPC_LOG_LEVEL_ERROR, "rpc.handler_failed", message, &request, err);
             (void)trevrpc_stream_send_status(&rpc_stream, final_status, message, message == NULL ? 0 : strlen(message));
         } else if (!rpc_stream.sent_status) {

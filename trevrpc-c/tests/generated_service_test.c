@@ -26,6 +26,9 @@ typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server);
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_stream* stream);
+trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_client* client);
+trevrpc_wt_stream* trevrpc_test_stream_webtransport_stream(trevrpc_stream* stream);
+void trevrpc_test_stream_close_webtransport_raw(trevrpc_stream* stream);
 int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port);
 size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
@@ -570,6 +573,64 @@ cleanup:
     return result;
 }
 
+static int test_webtransport_serve_loop_partial_request_close(void) {
+    int result = 1;
+    wt_serve_fixture fixture = {0};
+    trevrpc_config config = {0};
+    trevrpc_wt_session* session = NULL;
+    trevrpc_wt_stream* stream = NULL;
+    const uint8_t partial_frame[] = {0x40, 0x10};
+
+    CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
+    session = trevrpc_test_client_webtransport_session(fixture.client);
+    CHECK_GOTO(session != NULL);
+    CHECK_GOTO(trevrpc_wt_session_open_stream(session, &stream) == 0);
+    CHECK_GOTO(
+        trevrpc_wt_stream_write(stream, partial_frame, sizeof(partial_frame)) == (intptr_t)sizeof(partial_frame));
+    trevrpc_wt_stream_close(stream);
+    stream = NULL;
+    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
+
+    result = 0;
+
+cleanup:
+    trevrpc_wt_stream_close(stream);
+    close_wt_serve_fixture(&fixture);
+    return result;
+}
+
+static int test_webtransport_stream_reset_unblocks_client_receive(void) {
+    int result = 1;
+    wt_serve_fixture fixture = {0};
+    trevrpc_config config = {0};
+    trevrpc_stream* stream = NULL;
+    trevrpc_wt_stream* wt_stream = NULL;
+    Hello__V1__HelloReply* reply = NULL;
+    uint32_t status = TREVRPC_STATUS_OK;
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    request.name = "Trev";
+
+    CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
+    CHECK_GOTO(hello_v1_greeter_lots_of_replies(fixture.client, &request, &stream) == 0);
+    wt_stream = trevrpc_test_stream_webtransport_stream(stream);
+    CHECK_GOTO(wt_stream != NULL);
+    trevrpc_test_stream_close_webtransport_raw(stream);
+    int recv_err = hello_v1_greeter_recv_hello_v1_hello_reply(stream, &reply, &status);
+    CHECK_GOTO(recv_err == TREV_WT_ERR_CLOSED || recv_err == -EINVAL || recv_err == -ECANCELED);
+    CHECK_GOTO(reply == NULL);
+    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
+
+    result = 0;
+
+cleanup:
+    if (reply != NULL) {
+        hello__v1__hello_reply__free_unpacked(reply, NULL);
+    }
+    trevrpc_stream_close(stream);
+    close_wt_serve_fixture(&fixture);
+    return result;
+}
+
 static int test_generated_services_all_rpc_shapes(void) {
     int result = 1;
     Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
@@ -587,15 +648,18 @@ static int test_generated_services_all_rpc_shapes(void) {
 
     memset(&counts, 0, sizeof(counts));
     CHECK_GOTO(run_generated_case("LotsOfReplies", TREVRPC_RPC_KIND_SERVER_STREAMING, body, body_len, &counts) == 0);
-    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL || counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_CANCELLED || counts.status == TREVRPC_STATUS_INTERNAL ||
+               counts.status == TREVRPC_STATUS_OK);
 
     memset(&counts, 0, sizeof(counts));
     CHECK_GOTO(run_generated_case("LotsOfGreetings", TREVRPC_RPC_KIND_CLIENT_STREAMING, NULL, 0, &counts) == 0);
-    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL || counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_CANCELLED || counts.status == TREVRPC_STATUS_INTERNAL ||
+               counts.status == TREVRPC_STATUS_OK);
 
     memset(&counts, 0, sizeof(counts));
     CHECK_GOTO(run_generated_case("BidiHello", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, &counts) == 0);
-    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL || counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_CANCELLED || counts.status == TREVRPC_STATUS_INTERNAL ||
+               counts.status == TREVRPC_STATUS_OK);
 
     result = 0;
 
@@ -621,6 +685,12 @@ int main(void) {
         return 1;
     }
     if (test_webtransport_serve_loop_bidi_streaming() != 0) {
+        return 1;
+    }
+    if (test_webtransport_serve_loop_partial_request_close() != 0) {
+        return 1;
+    }
+    if (test_webtransport_stream_reset_unblocks_client_receive() != 0) {
         return 1;
     }
     return 0;
