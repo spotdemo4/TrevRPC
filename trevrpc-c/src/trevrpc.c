@@ -456,6 +456,9 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
     if (stream == NULL || stream->stream == NULL || (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
+    if (stream->sent_status) {
+        return -EPIPE;
+    }
     int err = trevrpc_stream_context_error(stream);
     if (err != 0) {
         return err;
@@ -480,6 +483,9 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
 int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len) {
     if (stream == NULL || stream->stream == NULL || (message == NULL && message_len > 0)) {
         return -EINVAL;
+    }
+    if (stream->sent_status) {
+        return -EPIPE;
     }
 
     uint8_t* frame = NULL;
@@ -1339,6 +1345,11 @@ static void trevrpc_set_status(trevrpc_response* response, uint32_t status, cons
     }
 }
 
+static bool trevrpc_response_fields_valid(const trevrpc_response* response) {
+    return response != NULL && (response->message != NULL || response->message_len == 0) &&
+           (response->body != NULL || response->body_len == 0) && trevrpc_metadata_validate(&response->metadata) == 0;
+}
+
 static void trevrpc_server_write_response(
     trevrpc_msquic_stream* stream, size_t max_frame_size, trevrpc_response* response) {
     uint8_t* frame = NULL;
@@ -1686,6 +1697,15 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         trevrpc_log(server, TREVRPC_LOG_LEVEL_ERROR, "rpc.handler_failed", "handler failed", &request, err);
         trevrpc_response_reset(&response);
         trevrpc_set_status(&response, TREVRPC_STATUS_INTERNAL, "handler failed");
+    } else if (!trevrpc_response_fields_valid(&response)) {
+        trevrpc_log(server,
+            TREVRPC_LOG_LEVEL_ERROR,
+            "rpc.handler_invalid_response",
+            "handler produced invalid response",
+            &request,
+            -EINVAL);
+        trevrpc_response_reset(&response);
+        trevrpc_set_status(&response, TREVRPC_STATUS_INTERNAL, "handler produced invalid response");
     }
 
     trevrpc_server_write_response(stream, server->max_frame_size, &response);

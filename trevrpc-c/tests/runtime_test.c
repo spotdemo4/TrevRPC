@@ -135,6 +135,16 @@ static int failing_handler(
     return -EIO;
 }
 
+static int invalid_response_handler(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+    response->body = NULL;
+    response->body_len = 1;
+    return 0;
+}
+
 static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data, size_t data_len) {
     trevrpc_msquic_chunk* chunk = malloc(sizeof(*chunk) + data_len);
     if (chunk == NULL) {
@@ -434,6 +444,26 @@ static int test_response_stream_idle_timeout(void) {
     CHECK_GOTO(trevrpc_stream_send_message(&stream, body, sizeof(body)) == TREVRPC_ERR_STREAM_IDLE_TIMEOUT);
     CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_UNAVAILABLE);
     CHECK_GOTO(stream.failure_message != NULL);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
+static int test_stream_rejects_writes_after_terminal_status(void) {
+    int result = 1;
+    trevrpc_stream stream = {
+        .stream = (trevrpc_msquic_stream*)1,
+        .sent_status = true,
+        .max_stream_messages = -1,
+        .max_stream_body_size = -1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    const uint8_t body[] = {1};
+
+    CHECK_GOTO(trevrpc_stream_send_message(&stream, body, sizeof(body)) == -EPIPE);
+    CHECK_GOTO(trevrpc_stream_send_status(&stream, TREVRPC_STATUS_OK, NULL, 0) == -EPIPE);
 
     result = 0;
 
@@ -817,6 +847,26 @@ cleanup:
     return result;
 }
 
+static int test_invalid_unary_handler_response_is_internal(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    metric_counts counts = {0};
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(run_metrics_case(frame, frame_len, invalid_response_handler, &counts) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL);
+
+    result = 0;
+
+cleanup:
+    free(frame);
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -851,6 +901,9 @@ int main(void) {
     if (test_response_stream_idle_timeout() != 0) {
         return 1;
     }
+    if (test_stream_rejects_writes_after_terminal_status() != 0) {
+        return 1;
+    }
     if (test_metadata_value_authorizer() != 0) {
         return 1;
     }
@@ -879,6 +932,9 @@ int main(void) {
         return 1;
     }
     if (test_error_status_runtime_paths() != 0) {
+        return 1;
+    }
+    if (test_invalid_unary_handler_response_is_internal() != 0) {
         return 1;
     }
     return 0;
