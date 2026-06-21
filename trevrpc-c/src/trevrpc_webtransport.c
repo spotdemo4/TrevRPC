@@ -3,10 +3,15 @@
 #include "trevrpc_msquic.h"
 
 #include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define TREV_WT_H3_ALPN "h3"
 #define TREV_WT_DEFAULT_STREAMS 256
+#define TREV_WT_H3_STREAM_TYPE_CONTROL 0x00
+#define TREV_WT_H3_FRAME_SETTINGS 0x04
 
 struct trevrpc_wt_listener {
     trevrpc_msquic_listener* msquic_listener;
@@ -14,11 +19,18 @@ struct trevrpc_wt_listener {
 
 struct trevrpc_wt_session {
     trevrpc_msquic_conn* msquic_conn;
+    trevrpc_msquic_stream* local_control;
+    trevrpc_msquic_stream* peer_control;
 };
 
 struct trevrpc_wt_stream {
     int closed;
 };
+
+typedef struct trevrpc_wt_h3_frame {
+    uint64_t type;
+    uint64_t len;
+} trevrpc_wt_h3_frame;
 
 static int trevrpc_wt_unsupported(void) {
     return TREV_WT_ERR_REJECTED;
@@ -45,6 +57,166 @@ static int trevrpc_wt_map_msquic_error(int err) {
     default:
         return err;
     }
+}
+
+static size_t trevrpc_wt_varint_len(uint64_t value) {
+    if (value <= 0x3f) {
+        return 1;
+    }
+    if (value <= 0x3fff) {
+        return 2;
+    }
+    if (value <= 0x3fffffff) {
+        return 4;
+    }
+    return 8;
+}
+
+static int trevrpc_wt_varint_write(uint8_t* out, size_t out_len, uint64_t value, size_t* written) {
+    size_t len = trevrpc_wt_varint_len(value);
+    if (out_len < len) {
+        return -ENOBUFS;
+    }
+
+    switch (len) {
+    case 1:
+        out[0] = (uint8_t)value;
+        break;
+    case 2:
+        out[0] = (uint8_t)(0x40 | (value >> 8));
+        out[1] = (uint8_t)value;
+        break;
+    case 4:
+        out[0] = (uint8_t)(0x80 | (value >> 24));
+        out[1] = (uint8_t)(value >> 16);
+        out[2] = (uint8_t)(value >> 8);
+        out[3] = (uint8_t)value;
+        break;
+    case 8:
+        out[0] = (uint8_t)(0xc0 | (value >> 56));
+        out[1] = (uint8_t)(value >> 48);
+        out[2] = (uint8_t)(value >> 40);
+        out[3] = (uint8_t)(value >> 32);
+        out[4] = (uint8_t)(value >> 24);
+        out[5] = (uint8_t)(value >> 16);
+        out[6] = (uint8_t)(value >> 8);
+        out[7] = (uint8_t)value;
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    *written = len;
+    return 0;
+}
+
+static int trevrpc_wt_read_exact(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        intptr_t n = trevrpc_msquic_stream_read(stream, data + offset, len - offset);
+        if (n <= 0) {
+            return trevrpc_wt_map_msquic_error((int)n);
+        }
+        offset += (size_t)n;
+    }
+    return 0;
+}
+
+static int trevrpc_wt_read_varint(trevrpc_msquic_stream* stream, uint64_t* value) {
+    uint8_t first = 0;
+    int err = trevrpc_wt_read_exact(stream, &first, 1);
+    if (err != 0) {
+        return err;
+    }
+
+    size_t len = (size_t)1 << (first >> 6);
+    uint64_t result = first & 0x3f;
+    for (size_t i = 1; i < len; i++) {
+        uint8_t byte = 0;
+        err = trevrpc_wt_read_exact(stream, &byte, 1);
+        if (err != 0) {
+            return err;
+        }
+        result = (result << 8) | byte;
+    }
+
+    *value = result;
+    return 0;
+}
+
+static int trevrpc_wt_write_varints(trevrpc_msquic_stream* stream, const uint64_t* values, size_t count) {
+    uint8_t buffer[64];
+    size_t offset = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t written = 0;
+        int err = trevrpc_wt_varint_write(buffer + offset, sizeof(buffer) - offset, values[i], &written);
+        if (err != 0) {
+            return err;
+        }
+        offset += written;
+    }
+
+    intptr_t n = trevrpc_msquic_stream_write(stream, buffer, offset);
+    if (n < 0) {
+        return trevrpc_wt_map_msquic_error((int)n);
+    }
+    return n == (intptr_t)offset ? 0 : TREV_WT_ERR_CLOSED;
+}
+
+static int trevrpc_wt_write_control_settings(trevrpc_wt_session* session) {
+    trevrpc_msquic_stream* control = NULL;
+    int err = trevrpc_msquic_conn_open_stream(session->msquic_conn, &control);
+    if (err != 0) {
+        return trevrpc_wt_map_msquic_error(err);
+    }
+
+    const uint64_t fields[] = {TREV_WT_H3_STREAM_TYPE_CONTROL, TREV_WT_H3_FRAME_SETTINGS, 0};
+    err = trevrpc_wt_write_varints(control, fields, sizeof(fields) / sizeof(fields[0]));
+    session->local_control = control;
+    return err;
+}
+
+static int trevrpc_wt_read_peer_control_settings(trevrpc_wt_session* session) {
+    trevrpc_msquic_stream* control = NULL;
+    int err = trevrpc_msquic_conn_accept_stream(session->msquic_conn, &control);
+    if (err != 0) {
+        return trevrpc_wt_map_msquic_error(err);
+    }
+
+    uint64_t stream_type = 0;
+    err = trevrpc_wt_read_varint(control, &stream_type);
+    if (err == 0 && stream_type != TREV_WT_H3_STREAM_TYPE_CONTROL) {
+        err = TREV_WT_ERR_REJECTED;
+    }
+
+    trevrpc_wt_h3_frame frame = {0};
+    if (err == 0) {
+        err = trevrpc_wt_read_varint(control, &frame.type);
+    }
+    if (err == 0) {
+        err = trevrpc_wt_read_varint(control, &frame.len);
+    }
+    if (err == 0 && (frame.type != TREV_WT_H3_FRAME_SETTINGS || frame.len > 4096)) {
+        err = TREV_WT_ERR_REJECTED;
+    }
+
+    uint8_t scratch[256];
+    while (err == 0 && frame.len > 0) {
+        size_t chunk = frame.len < sizeof(scratch) ? (size_t)frame.len : sizeof(scratch);
+        err = trevrpc_wt_read_exact(control, scratch, chunk);
+        frame.len -= chunk;
+    }
+
+    session->peer_control = control;
+    return err;
+}
+
+static int trevrpc_wt_h3_handshake(trevrpc_wt_session* session) {
+    int err = trevrpc_wt_write_control_settings(session);
+    if (err != 0) {
+        return err;
+    }
+    return trevrpc_wt_read_peer_control_settings(session);
 }
 
 int trevrpc_wt_listen(const trevrpc_wt_config* config, trevrpc_wt_listener** out_listener) {
@@ -88,6 +260,11 @@ int trevrpc_wt_listener_accept_session(trevrpc_wt_listener* listener, trevrpc_wt
         return -ENOMEM;
     }
     session->msquic_conn = conn;
+    err = trevrpc_wt_h3_handshake(session);
+    if (err != 0) {
+        trevrpc_wt_session_close(session);
+        return err;
+    }
     *out_session = session;
     return 0;
 }
@@ -130,6 +307,12 @@ int trevrpc_wt_dial(const trevrpc_wt_config* config, trevrpc_wt_session** out_se
         return trevrpc_wt_map_msquic_error(err);
     }
 
+    err = trevrpc_wt_h3_handshake(session);
+    if (err != 0) {
+        trevrpc_wt_session_close(session);
+        return err;
+    }
+
     *out_session = session;
     return 0;
 }
@@ -152,6 +335,8 @@ int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_strea
 
 void trevrpc_wt_session_close(trevrpc_wt_session* session) {
     if (session != NULL) {
+        trevrpc_msquic_stream_close(session->peer_control);
+        trevrpc_msquic_stream_close(session->local_control);
         trevrpc_msquic_conn_close(session->msquic_conn);
         free(session);
     }

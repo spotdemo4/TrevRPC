@@ -25,6 +25,24 @@
         }                                                                                                              \
     } while (0)
 
+#define CHECK_EQ_GOTO(actual, expected)                                                                                \
+    do {                                                                                                               \
+        int actual_value = (actual);                                                                                   \
+        int expected_value = (expected);                                                                               \
+        if (actual_value != expected_value) {                                                                          \
+            fprintf(stderr,                                                                                            \
+                "%s:%d: check failed: %s == %s (actual=%d expected=%d)\n",                                             \
+                __FILE__,                                                                                              \
+                __LINE__,                                                                                              \
+                #actual,                                                                                               \
+                #expected,                                                                                             \
+                actual_value,                                                                                          \
+                expected_value);                                                                                       \
+            result = 1;                                                                                                \
+            goto cleanup;                                                                                              \
+        }                                                                                                              \
+    } while (0)
+
 typedef struct accept_args {
     trevrpc_msquic_listener* listener;
     trevrpc_msquic_conn* conn;
@@ -225,7 +243,7 @@ static int test_webtransport_connects_h3_quic_session(void) {
         .skip_certificate_validation = 1,
         .max_streams_per_session = 8,
     };
-    CHECK_GOTO(trevrpc_wt_dial(&client_config, &client_session) == 0);
+    CHECK_EQ_GOTO(trevrpc_wt_dial(&client_config, &client_session), 0);
     CHECK_GOTO(pthread_join(thread, NULL) == 0);
     thread_started = false;
     CHECK_GOTO(args.result == 0);
