@@ -3,6 +3,7 @@
 #include "trevrpc.h"
 
 #include "trevrpc_msquic.h"
+#include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
 
 #include <errno.h>
@@ -108,6 +109,7 @@ typedef struct trevrpc_stream_task {
 static bool trevrpc_server_is_shutting_down(trevrpc_server* server);
 static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 static uint32_t trevrpc_status_from_error(int err, const char** message);
+static uint32_t trevrpc_transport_status_from_error(int err, const char** message);
 
 static size_t trevrpc_effective_max_frame_size(const trevrpc_config* config) {
     if (config != NULL && config->max_frame_size > 0) {
@@ -757,6 +759,10 @@ void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_st
 uint32_t trevrpc_test_status_from_error(int err, const char** message) {
     return trevrpc_status_from_error(err, message);
 }
+
+uint32_t trevrpc_test_transport_status_from_error(int err, const char** message) {
+    return trevrpc_transport_status_from_error(err, message);
+}
 #endif
 
 int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_options* options) {
@@ -1403,15 +1409,43 @@ static uint32_t trevrpc_status_from_error(int err, const char** message) {
     }
 }
 
+static uint32_t trevrpc_transport_status_from_error(int err, const char** message) {
+    switch (err) {
+    case TREVRPC_ERR_INVALID_FRAME:
+    case TREVRPC_ERR_UNSUPPORTED_RPC_KIND:
+        *message = "invalid request";
+        return TREVRPC_STATUS_INVALID_ARGUMENT;
+    case TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION:
+        *message = "unsupported TrevRPC wire version";
+        return TREVRPC_STATUS_FAILED_PRECONDITION;
+    case TREVRPC_ERR_FRAME_TOO_LARGE:
+    case TREV_MSQUIC_ERR_FRAME_TOO_LARGE:
+    case TREV_WT_ERR_FRAME_TOO_LARGE:
+        *message = "request frame exceeded maximum size";
+        return TREVRPC_STATUS_RESOURCE_EXHAUSTED;
+    case TREV_MSQUIC_ERR_CLOSED:
+    case TREV_WT_ERR_CLOSED:
+    case TREV_WT_ERR_REJECTED:
+    case -ECANCELED:
+        *message = "transport closed";
+        return TREVRPC_STATUS_CANCELLED;
+    case TREV_MSQUIC_ERR_TIMEOUT:
+    case -ETIMEDOUT:
+        *message = "transport deadline exceeded";
+        return TREVRPC_STATUS_DEADLINE_EXCEEDED;
+    default:
+        *message = "transport unavailable";
+        return TREVRPC_STATUS_UNAVAILABLE;
+    }
+}
+
 static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream) {
     uint8_t* body = NULL;
     size_t body_len = 0;
     intptr_t read = trevrpc_msquic_stream_read_frame(stream, &body, &body_len, server->max_frame_size);
     if (read < 0) {
-        uint32_t status =
-            read == TREV_MSQUIC_ERR_FRAME_TOO_LARGE ? TREVRPC_STATUS_RESOURCE_EXHAUSTED : TREVRPC_STATUS_UNAVAILABLE;
-        const char* message = read == TREV_MSQUIC_ERR_FRAME_TOO_LARGE ? "request frame exceeded maximum size"
-                                                                      : "failed to read request frame";
+        const char* message = NULL;
+        uint32_t status = trevrpc_transport_status_from_error((int)read, &message);
         trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, (int)read, message);
         trevrpc_server_write_status(stream, server->max_frame_size, status, message);
         trevrpc_metrics_record_pre_handler(server, status);

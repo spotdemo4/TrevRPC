@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc.h"
+#include "trevrpc_msquic.h"
+#include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
 
 #include <errno.h>
@@ -25,6 +27,7 @@ typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server);
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 uint32_t trevrpc_test_status_from_error(int err, const char** message);
+uint32_t trevrpc_test_transport_status_from_error(int err, const char** message);
 
 struct trevrpc_stream {
     trevrpc_msquic_stream* stream;
@@ -173,6 +176,20 @@ static int init_raw_stream(trevrpc_msquic_stream* stream, const uint8_t* body, s
         reset_raw_stream(stream);
     }
     return err;
+}
+
+static int init_empty_raw_stream(trevrpc_msquic_stream* stream) {
+    memset(stream, 0, sizeof(*stream));
+    int err = pthread_mutex_init(&stream->mutex, NULL);
+    if (err != 0) {
+        return -err;
+    }
+    err = pthread_cond_init(&stream->cond, NULL);
+    if (err != 0) {
+        pthread_mutex_destroy(&stream->mutex);
+        return -err;
+    }
+    return 0;
 }
 
 static int now(struct timespec* out) {
@@ -651,6 +668,72 @@ cleanup:
     return result;
 }
 
+static int run_transport_error_case(int err, metric_counts* counts) {
+    int result = 1;
+    trevrpc_server* server = NULL;
+    trevrpc_msquic_stream stream = {0};
+    bool stream_initialized = false;
+    trevrpc_metrics metrics = {
+        .rpc_started = record_started,
+        .rpc_finished = record_finished,
+        .user_data = counts,
+    };
+
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
+    CHECK_GOTO(init_empty_raw_stream(&stream) == 0);
+    stream_initialized = true;
+    stream.err = err;
+
+    trevrpc_test_server_handle_stream(server, &stream);
+
+    result = 0;
+
+cleanup:
+    if (stream_initialized) {
+        reset_raw_stream(&stream);
+    }
+    trevrpc_server_close(server);
+    return result;
+}
+
+static int test_transport_status_from_error_is_predictable(void) {
+    int result = 1;
+    const char* message = NULL;
+    metric_counts counts = {0};
+
+    CHECK_GOTO(trevrpc_test_transport_status_from_error(TREV_MSQUIC_ERR_FRAME_TOO_LARGE, &message) ==
+               TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_transport_status_from_error(TREV_MSQUIC_ERR_CLOSED, &message) == TREVRPC_STATUS_CANCELLED);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_transport_status_from_error(TREV_MSQUIC_ERR_TIMEOUT, &message) ==
+               TREVRPC_STATUS_DEADLINE_EXCEEDED);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_transport_status_from_error(TREV_WT_ERR_CLOSED, &message) == TREVRPC_STATUS_CANCELLED);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_transport_status_from_error(TREV_WT_ERR_FRAME_TOO_LARGE, &message) ==
+               TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_transport_status_from_error(-EIO, &message) == TREVRPC_STATUS_UNAVAILABLE);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(run_transport_error_case(TREV_MSQUIC_ERR_CLOSED, &counts) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_CANCELLED);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -707,6 +790,9 @@ int main(void) {
         return 1;
     }
     if (test_status_from_error_matches_go_policy() != 0) {
+        return 1;
+    }
+    if (test_transport_status_from_error_is_predictable() != 0) {
         return 1;
     }
     return 0;
