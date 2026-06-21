@@ -15,6 +15,8 @@ The CMake build creates these static libraries by default:
 
 `trevrpc.h` is the stable high-level API surface. `trevrpc_msquic.h` and `trevrpc_webtransport.h` expose transport-specific advanced APIs and do not provide high-level RPC dispatch by themselves.
 
+The supported C artifacts are static libraries. Shared library builds and symbol export annotations are intentionally deferred until the C ABI policy is finalized; do not rely on default compiler symbol visibility as a stable ABI contract.
+
 ## Build
 
 ```sh

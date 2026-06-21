@@ -25,7 +25,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Transport And Packaging
 
-- Decide static vs shared library support and symbol visibility rules.
 - Add ABI/versioning policy for public C headers.
 
 ## Testing
