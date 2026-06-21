@@ -709,6 +709,7 @@ int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_strea
 
 void trevrpc_wt_session_close(trevrpc_wt_session* session) {
     if (session != NULL) {
+        trevrpc_msquic_conn_shutdown(session->msquic_conn);
         trevrpc_msquic_stream_close(session->connect_stream);
         trevrpc_msquic_stream_close(session->peer_control);
         trevrpc_msquic_stream_close(session->local_control);

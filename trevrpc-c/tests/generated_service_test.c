@@ -2,6 +2,7 @@
 
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
+#include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
 
 #include <errno.h>
@@ -12,10 +13,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef TREVRPC_MSQUIC_TEST_CERT
+#define TREVRPC_MSQUIC_TEST_CERT ""
+#endif
+
+#ifndef TREVRPC_MSQUIC_TEST_KEY
+#define TREVRPC_MSQUIC_TEST_KEY ""
+#endif
+
 typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server);
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
+void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_stream* stream);
 size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
 
@@ -61,6 +71,12 @@ typedef struct metric_counts {
     int finished;
     uint32_t status;
 } metric_counts;
+
+typedef struct wt_rpc_server_args {
+    trevrpc_wt_listener* listener;
+    trevrpc_server* server;
+    int result;
+} wt_rpc_server_args;
 
 static void record_started(void* user_data, const trevrpc_rpc_started_event* event) {
     (void)event;
@@ -211,6 +227,33 @@ static int bidi_hello(void* user_data, const trevrpc_call_context* context, trev
     return err == 0 ? 0 : err;
 }
 
+static void* wt_unary_server_thread(void* arg) {
+    wt_rpc_server_args* args = arg;
+    trevrpc_wt_session* session = NULL;
+    trevrpc_wt_stream* stream = NULL;
+    args->result = trevrpc_wt_listener_accept_session(args->listener, &session);
+    if (args->result == 0) {
+        args->result = trevrpc_wt_session_accept_stream(session, &stream);
+    }
+    if (args->result == 0) {
+        trevrpc_test_server_handle_wt_stream(args->server, stream);
+    }
+    trevrpc_wt_stream_close(stream);
+    trevrpc_wt_session_close(session);
+    return NULL;
+}
+
+static hello_v1_greeter_server greeter_implementation(void) {
+    hello_v1_greeter_server implementation = {
+        .user_data = NULL,
+        .say_hello = say_hello,
+        .lots_of_replies = lots_of_replies,
+        .lots_of_greetings = lots_of_greetings,
+        .bidi_hello = bidi_hello,
+    };
+    return implementation;
+}
+
 static int run_generated_case(
     const char* method, uint32_t kind, const uint8_t* request_body, size_t request_body_len, metric_counts* counts) {
     int result = 1;
@@ -224,13 +267,7 @@ static int run_generated_case(
         .rpc_finished = record_finished,
         .user_data = counts,
     };
-    hello_v1_greeter_server implementation = {
-        .user_data = NULL,
-        .say_hello = say_hello,
-        .lots_of_replies = lots_of_replies,
-        .lots_of_greetings = lots_of_greetings,
-        .bidi_hello = bidi_hello,
-    };
+    hello_v1_greeter_server implementation = greeter_implementation();
 
     CHECK_GOTO(
         trevrpc_wire_encode_request(
@@ -252,6 +289,73 @@ cleanup:
     }
     trevrpc_server_close(server);
     free(frame);
+    return result;
+}
+
+static int test_webtransport_unary_round_trip(void) {
+    int result = 1;
+    trevrpc_server* server = NULL;
+    trevrpc_client* client = NULL;
+    trevrpc_wt_listener* listener = NULL;
+    Hello__V1__HelloReply* response = NULL;
+    pthread_t thread = {0};
+    bool thread_started = false;
+    wt_rpc_server_args args = {0};
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .path = "/trevrpc",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+        .idle_timeout_ms = 1000,
+    };
+    trevrpc_config config = {0};
+    hello_v1_greeter_server implementation = greeter_implementation();
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    request.name = "Trev";
+
+    CHECK_GOTO(trevrpc_test_server_new(&config, &server) == 0);
+    CHECK_GOTO(hello_v1_greeter_register(server, &implementation) == 0);
+    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
+    args.server = server;
+    args.listener = listener;
+    CHECK_GOTO(pthread_create(&thread, NULL, wt_unary_server_thread, &args) == 0);
+    thread_started = true;
+
+    uint16_t port = 0;
+    CHECK_GOTO(trevrpc_wt_listener_port(listener, &port) == 0);
+    trevrpc_wt_config client_config = {
+        .host = "127.0.0.1",
+        .port = port,
+        .path = "/trevrpc",
+        .skip_certificate_validation = 1,
+        .max_streams_per_session = 8,
+        .idle_timeout_ms = 1000,
+    };
+    CHECK_GOTO(trevrpc_client_connect_webtransport(&client_config, &config, &client) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(client, &request, &response) == 0);
+    CHECK_GOTO(response != NULL);
+    CHECK_GOTO(response->message != NULL);
+    CHECK_GOTO(strcmp(response->message, "Trev") == 0);
+    trevrpc_client_close(client);
+    client = NULL;
+    CHECK_GOTO(pthread_join(thread, NULL) == 0);
+    thread_started = false;
+    CHECK_GOTO(args.result == 0);
+
+    result = 0;
+
+cleanup:
+    if (response != NULL) {
+        hello__v1__hello_reply__free_unpacked(response, NULL);
+    }
+    trevrpc_client_close(client);
+    if (thread_started) {
+        trevrpc_wt_listener_shutdown(listener);
+        (void)pthread_join(thread, NULL);
+    }
+    trevrpc_wt_listener_close(listener);
+    trevrpc_server_close(server);
     return result;
 }
 
@@ -291,6 +395,9 @@ cleanup:
 
 int main(void) {
     if (test_generated_services_all_rpc_shapes() != 0) {
+        return 1;
+    }
+    if (test_webtransport_unary_round_trip() != 0) {
         return 1;
     }
     return 0;

@@ -254,6 +254,11 @@ if(TREVRPC_BUILD_TESTS)
             "${trevrpc_generated_pb_c}"
             "${trevrpc_generated_trevrpc_c}"
         )
+        add_dependencies(trevrpc_generated_service_test trevrpc_msquic_test_certificates)
+        target_compile_definitions(trevrpc_generated_service_test PRIVATE
+            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
+            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
+        )
         target_include_directories(trevrpc_generated_service_test PRIVATE src "${trevrpc_generated_test_dir}")
         target_link_libraries(trevrpc_generated_service_test PRIVATE trevrpc protobuf-c)
         trevrpc_c_warnings(trevrpc_generated_service_test)

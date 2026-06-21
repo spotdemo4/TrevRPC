@@ -1081,6 +1081,13 @@ void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_st
     trevrpc_test_current_server = NULL;
 }
 
+void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_stream* stream) {
+    trevrpc_test_current_server = server;
+    trevrpc_stream rpc_stream = trevrpc_stream_ref_webtransport(stream, server->max_frame_size);
+    trevrpc_handle_stream(server, &rpc_stream);
+    trevrpc_test_current_server = NULL;
+}
+
 uint32_t trevrpc_test_status_from_error(int err, const char** message) {
     return trevrpc_status_from_error(err, message);
 }
