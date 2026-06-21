@@ -284,53 +284,27 @@
             '';
           };
 
-          c =
-            let
-              clangFormatConfig = pkgs.writeText "trevrpc-c-clang-format" ''
-                BasedOnStyle: LLVM
-                ColumnLimit: 120
-                IndentWidth: 4
-                ContinuationIndentWidth: 4
-                PointerAlignment: Left
-                DerivePointerAlignment: false
-                AlignAfterOpenBracket: DontAlign
-                BinPackArguments: false
-                BinPackParameters: false
-                AllowShortFunctionsOnASingleLine: None
-                AllowShortIfStatementsOnASingleLine: Never
-                BreakBeforeBraces: Attach
-                SortIncludes: false
-                IncludeBlocks: Preserve
-              '';
-              clangTidyConfig = pkgs.writeText "trevrpc-c-clang-tidy" ''
-                Checks: >
-                  -*,
-                  clang-diagnostic-*,
-                  clang-analyzer-*,
-                  -clang-analyzer-optin.core.EnumCastOutOfRange,
-                  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
-                WarningsAsErrors: '*'
-                HeaderFilterRegex: '.*trevrpc-c/(include|src)/.*'
-                FormatStyle: file
-              '';
-            in
-            {
-              root = ./.;
-              filter = file: file.hasExt "c" || file.hasExt "h";
-              packages = with pkgs; [
-                clang-tools
-                libwtf
-              ];
-              script = ''
-                clang-format --dry-run --Werror --style=file:${clangFormatConfig} "$file"
-                clang-tidy --quiet --config-file=${clangTidyConfig} "$file" -- \
-                  -x c \
-                  -std=c11 \
-                  -Itrevrpc-c/include \
-                  -Itrevrpc-c/src \
-                  -isystem ${pkgs.libwtf}/include
-              '';
-            };
+          c = {
+            root = ./.;
+            filter = file: file.hasExt "c" || file.hasExt "h";
+            include = [
+              ./.clang-format
+              ./.clang-tidy
+            ];
+            packages = with pkgs; [
+              clang-tools
+              libwtf
+            ];
+            script = ''
+              clang-format --dry-run --Werror $(find trevrpc-c -name '*.c' -o -name '*.h')
+              clang-tidy --quiet $(find trevrpc-c -name '*.c') -- \
+                -x c \
+                -std=c11 \
+                -Itrevrpc-c/include \
+                -Itrevrpc-c/src \
+                -isystem ${pkgs.libwtf}/include
+            '';
+          };
 
           cross-runtime =
             let
