@@ -24,6 +24,13 @@ ctest --test-dir build --output-on-failure
 cmake --install build --prefix /usr/local
 ```
 
+Installed CMake packages expose imported targets with the `trevrpc::` namespace:
+
+```cmake
+find_package(trevrpc CONFIG REQUIRED)
+target_link_libraries(app PRIVATE trevrpc::trevrpc)
+```
+
 The same build is exercised by Nix:
 
 ```sh

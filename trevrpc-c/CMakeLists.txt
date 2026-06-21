@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(trevrpc-c LANGUAGES C)
+project(trevrpc-c VERSION 0.1.0 LANGUAGES C)
 
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -21,7 +22,9 @@ add_library(trevrpc_core STATIC
     src/trevrpc_wire.c
 )
 target_include_directories(trevrpc_core
-    PUBLIC include
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE src
 )
 
@@ -43,7 +46,9 @@ if(TREVRPC_BUILD_MSQUIC)
         src/trevrpc_msquic.c
     )
     target_include_directories(trevrpc_msquic
-        PUBLIC include
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE ${MSQUIC_INCLUDE_DIR}
     )
     target_link_libraries(trevrpc_msquic PUBLIC Threads::Threads PRIVATE ${MSQUIC_LIBRARY})
@@ -59,7 +64,9 @@ if(TREVRPC_BUILD_WEBTRANSPORT)
         src/trevrpc_webtransport.c
     )
     target_include_directories(trevrpc_webtransport
-        PUBLIC include
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE ${WTF_INCLUDE_DIR}
     )
     target_link_libraries(trevrpc_webtransport PUBLIC Threads::Threads PRIVATE ${WTF_LIBRARY})
@@ -76,7 +83,9 @@ if(TREVRPC_BUILD_RUNTIME)
         src/trevrpc.c
     )
     target_include_directories(trevrpc
-        PUBLIC include
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE src
     )
     target_link_libraries(trevrpc PUBLIC trevrpc_core trevrpc_msquic Threads::Threads)
@@ -85,9 +94,29 @@ if(TREVRPC_BUILD_RUNTIME)
 endif()
 
 install(TARGETS ${trevrpc_install_targets}
+    EXPORT trevrpcTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+install(EXPORT trevrpcTargets
+    NAMESPACE trevrpc::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc
+)
+configure_package_config_file(
+    cmake/trevrpcConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc
 )
 install(FILES
     include/trevrpc.h
