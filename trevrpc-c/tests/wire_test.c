@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef TREVRPC_WIRE_GOLDEN_VECTORS
+#define TREVRPC_WIRE_GOLDEN_VECTORS "../testdata/wire-golden-vectors.txt"
+#endif
+
 #define CHECK_GOTO(condition)                                                                                          \
     do {                                                                                                               \
         if (!(condition)) {                                                                                            \
@@ -38,6 +42,146 @@ static int metadata_value_equal(
         }
     }
     return 0;
+}
+
+static const char* trim_left(const char* value) {
+    while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') {
+        value++;
+    }
+    return value;
+}
+
+static void trim_right(char* value) {
+    size_t len = strlen(value);
+    while (len > 0 &&
+           (value[len - 1] == ' ' || value[len - 1] == '\t' || value[len - 1] == '\r' || value[len - 1] == '\n')) {
+        value[len - 1] = '\0';
+        len--;
+    }
+}
+
+static int hex_value(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+static int decode_hex(const char* encoded, uint8_t** out, size_t* out_len) {
+    *out = NULL;
+    *out_len = 0;
+    size_t encoded_len = strlen(encoded);
+    if (encoded_len % 2 != 0) {
+        return -EINVAL;
+    }
+
+    size_t decoded_len = encoded_len / 2;
+    uint8_t* decoded = NULL;
+    if (decoded_len > 0) {
+        decoded = malloc(decoded_len);
+        if (decoded == NULL) {
+            return -ENOMEM;
+        }
+    }
+
+    for (size_t i = 0; i < decoded_len; i++) {
+        int high = hex_value(encoded[i * 2]);
+        int low = hex_value(encoded[i * 2 + 1]);
+        if (high < 0 || low < 0) {
+            free(decoded);
+            return -EINVAL;
+        }
+        decoded[i] = (uint8_t)((high << 4) | low);
+    }
+
+    *out = decoded;
+    *out_len = decoded_len;
+    return 0;
+}
+
+static int assert_golden_vector(const char* name, const uint8_t* actual, size_t actual_len) {
+    FILE* file = fopen(TREVRPC_WIRE_GOLDEN_VECTORS, "r");
+    if (file == NULL) {
+        fprintf(stderr, "failed to open %s\n", TREVRPC_WIRE_GOLDEN_VECTORS);
+        return 1;
+    }
+
+    int result = 1;
+    char line[1024];
+    for (size_t line_number = 1; fgets(line, sizeof(line), file) != NULL; line_number++) {
+        trim_right(line);
+        char* key = (char*)trim_left(line);
+        if (key[0] == '\0' || key[0] == '#') {
+            continue;
+        }
+
+        char* equals = strchr(key, '=');
+        if (equals == NULL) {
+            fprintf(stderr, "%s:%zu: invalid golden vector line\n", TREVRPC_WIRE_GOLDEN_VECTORS, line_number);
+            goto cleanup;
+        }
+        *equals = '\0';
+        trim_right(key);
+
+        char* encoded = (char*)trim_left(equals + 1);
+        trim_right(encoded);
+        if (strcmp(key, name) != 0) {
+            continue;
+        }
+
+        uint8_t* expected = NULL;
+        size_t expected_len = 0;
+        int err = decode_hex(encoded, &expected, &expected_len);
+        if (err != 0) {
+            fprintf(
+                stderr, "%s:%zu: invalid golden vector hex for %s\n", TREVRPC_WIRE_GOLDEN_VECTORS, line_number, name);
+            goto cleanup;
+        }
+
+        if (!bytes_equal(actual, actual_len, expected, expected_len)) {
+            fprintf(stderr, "unexpected golden vector %s\n", name);
+            free(expected);
+            goto cleanup;
+        }
+
+        free(expected);
+        result = 0;
+        goto cleanup;
+    }
+
+    fprintf(stderr, "missing golden vector %s\n", name);
+
+cleanup:
+    fclose(file);
+    return result;
+}
+
+static int assert_golden_message(const char* name, const uint8_t* frame, size_t frame_len) {
+    if (frame_len < 4) {
+        fprintf(stderr, "%s encoded frame is shorter than the frame header\n", name);
+        return 1;
+    }
+
+    char vector_name[128];
+    int written = snprintf(vector_name, sizeof(vector_name), "%s.body", name);
+    if (written < 0 || (size_t)written >= sizeof(vector_name)) {
+        return 1;
+    }
+    if (assert_golden_vector(vector_name, frame + 4, frame_len - 4) != 0) {
+        return 1;
+    }
+
+    written = snprintf(vector_name, sizeof(vector_name), "%s.frame", name);
+    if (written < 0 || (size_t)written >= sizeof(vector_name)) {
+        return 1;
+    }
+    return assert_golden_vector(vector_name, frame, frame_len);
 }
 
 static int test_request_round_trip(void) {
@@ -305,6 +449,54 @@ cleanup:
     return result;
 }
 
+static int test_response_and_stream_frame_helpers(void) {
+    int result = 1;
+    trevrpc_response response = {0};
+    trevrpc_stream_frame frame = {0};
+    uint8_t first_body[] = {0x01, 0x02};
+    uint8_t second_body[] = {0x03, 0x04, 0x05};
+
+    CHECK_GOTO(trevrpc_response_set_message(&response, "first", strlen("first")) == 0);
+    CHECK_GOTO(chars_equal(response.message, response.message_len, "first"));
+    CHECK_GOTO(trevrpc_response_set_message(&response, "second", strlen("second")) == 0);
+    CHECK_GOTO(chars_equal(response.message, response.message_len, "second"));
+    CHECK_GOTO(trevrpc_response_set_body(&response, first_body, sizeof(first_body)) == 0);
+    CHECK_GOTO(bytes_equal(response.body, response.body_len, first_body, sizeof(first_body)));
+    CHECK_GOTO(trevrpc_response_set_body(&response, second_body, sizeof(second_body)) == 0);
+    CHECK_GOTO(bytes_equal(response.body, response.body_len, second_body, sizeof(second_body)));
+    CHECK_GOTO(trevrpc_response_set_body(&response, NULL, 0) == 0);
+    CHECK_GOTO(response.body == NULL);
+    CHECK_GOTO(response.body_len == 0);
+    trevrpc_response_reset(&response);
+    CHECK_GOTO(response.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(response.message == NULL);
+    CHECK_GOTO(response.body == NULL);
+    trevrpc_response_free(NULL);
+
+    CHECK_GOTO(trevrpc_stream_frame_set_message(&frame, "status", strlen("status")) == 0);
+    CHECK_GOTO(chars_equal(frame.message, frame.message_len, "status"));
+    CHECK_GOTO(trevrpc_stream_frame_set_body(&frame, first_body, sizeof(first_body)) == 0);
+    CHECK_GOTO(bytes_equal(frame.body, frame.body_len, first_body, sizeof(first_body)));
+    CHECK_GOTO(trevrpc_stream_frame_set_body(&frame, NULL, 0) == 0);
+    CHECK_GOTO(frame.body == NULL);
+    CHECK_GOTO(frame.body_len == 0);
+    frame.kind = TREVRPC_STREAM_FRAME_KIND_STATUS;
+    frame.status = TREVRPC_STATUS_UNAVAILABLE;
+    trevrpc_stream_frame_reset(&frame);
+    CHECK_GOTO(frame.kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
+    CHECK_GOTO(frame.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(frame.message == NULL);
+    CHECK_GOTO(frame.body == NULL);
+    trevrpc_stream_frame_free(NULL);
+
+    result = 0;
+
+cleanup:
+    trevrpc_response_reset(&response);
+    trevrpc_stream_frame_reset(&frame);
+    return result;
+}
+
 static int test_response_metadata_round_trip(void) {
     int result = 1;
     trevrpc_response response = {0};
@@ -519,22 +711,13 @@ cleanup:
     return result;
 }
 
-static int test_wire_golden_vectors(void) {
+static int test_metadata_decode_skips_unknown_entry_fields(void) {
     int result = 1;
-    uint8_t body[] = {'h', 'i'};
-    uint8_t metadata_value[] = {'o', 'k'};
+    trevrpc_request request = {0};
+    uint8_t value[] = {'o', 'k'};
     uint8_t* frame = NULL;
     size_t frame_len = 0;
-    trevrpc_metadata metadata = {0};
-    trevrpc_response response = {0};
-
-    uint8_t request_unary[] = {
-        0x00, 0x00, 0x00, 0x0e, 0x0a, 0x03, 's', 'v', 'c', 0x12, 0x01, 'm', 0x1a, 0x02, 'h', 'i', 0x30, 0x01};
-    uint8_t request_timeout[] = {0x00,
-        0x00,
-        0x00,
-        0x12,
-        0x0a,
+    uint8_t metadata_with_unknown[] = {0x0a,
         0x03,
         's',
         'v',
@@ -542,20 +725,35 @@ static int test_wire_golden_vectors(void) {
         0x12,
         0x01,
         'm',
-        0x1a,
-        0x02,
+        0x22,
+        0x15,
+        0x0a,
+        0x0d,
+        'a',
+        'u',
+        't',
         'h',
+        'o',
+        'r',
         'i',
+        'z',
+        'a',
+        't',
+        'i',
+        'o',
+        'n',
+        0x12,
+        0x02,
+        'o',
+        'k',
+        0x48,
+        0x07,
         0x30,
-        0x01,
-        0x38,
-        0xc0,
-        0xc4,
-        0x07};
-    uint8_t request_metadata[] = {0x00,
+        0x01};
+    uint8_t expected_reencoded[] = {0x00,
         0x00,
         0x00,
-        0x23,
+        0x1f,
         0x0a,
         0x03,
         's',
@@ -564,10 +762,6 @@ static int test_wire_golden_vectors(void) {
         0x12,
         0x01,
         'm',
-        0x1a,
-        0x02,
-        'h',
-        'i',
         0x22,
         0x13,
         0x0a,
@@ -591,22 +785,45 @@ static int test_wire_golden_vectors(void) {
         'k',
         0x30,
         0x01};
-    uint8_t stream_message[] = {0x00, 0x00, 0x00, 0x04, 0x22, 0x02, 'h', 'i'};
-    uint8_t stream_status[] = {0x00, 0x00, 0x00, 0x0a, 0x08, 0x01, 0x10, 0x0e, 0x1a, 0x04, 'd', 'o', 'w', 'n'};
-    uint8_t response_ok_body[] = {0x00, 0x00, 0x00, 0x04, 0x1a, 0x02, 'h', 'i'};
-    uint8_t response_unavailable[] = {0x00, 0x00, 0x00, 0x08, 0x08, 0x0e, 0x12, 0x04, 'd', 'o', 'w', 'n'};
+
+    int err = trevrpc_wire_decode_request(metadata_with_unknown, sizeof(metadata_with_unknown), &request);
+    CHECK_GOTO(err == 0);
+    CHECK_GOTO(request.metadata.entries_len == 1);
+    CHECK_GOTO(metadata_value_equal(&request.metadata, "authorization", value, sizeof(value)));
+
+    err = trevrpc_wire_encode_request(
+        "svc", "m", TREVRPC_RPC_KIND_UNARY, NULL, 0, &request.metadata, 0, 1024, &frame, &frame_len);
+    CHECK_GOTO(err == 0);
+    CHECK_GOTO(bytes_equal(frame, frame_len, expected_reencoded, sizeof(expected_reencoded)));
+
+    result = 0;
+
+cleanup:
+    trevrpc_request_reset(&request);
+    free(frame);
+    return result;
+}
+
+static int test_wire_golden_vectors(void) {
+    int result = 1;
+    uint8_t body[] = {'h', 'i'};
+    uint8_t metadata_value[] = {'o', 'k'};
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    trevrpc_metadata metadata = {0};
+    trevrpc_response response = {0};
 
     int err = trevrpc_wire_encode_request(
         "svc", "m", TREVRPC_RPC_KIND_UNARY, body, sizeof(body), NULL, 0, 1024, &frame, &frame_len);
     CHECK_GOTO(err == 0);
-    CHECK_GOTO(bytes_equal(frame, frame_len, request_unary, sizeof(request_unary)));
+    CHECK_GOTO(assert_golden_message("rpc_request.unary", frame, frame_len) == 0);
     free(frame);
     frame = NULL;
 
     err = trevrpc_wire_encode_request(
         "svc", "m", TREVRPC_RPC_KIND_UNARY, body, sizeof(body), NULL, 123456, 1024, &frame, &frame_len);
     CHECK_GOTO(err == 0);
-    CHECK_GOTO(bytes_equal(frame, frame_len, request_timeout, sizeof(request_timeout)));
+    CHECK_GOTO(assert_golden_message("rpc_request.timeout", frame, frame_len) == 0);
     free(frame);
     frame = NULL;
 
@@ -615,7 +832,7 @@ static int test_wire_golden_vectors(void) {
     err = trevrpc_wire_encode_request(
         "svc", "m", TREVRPC_RPC_KIND_UNARY, body, sizeof(body), &metadata, 0, 1024, &frame, &frame_len);
     CHECK_GOTO(err == 0);
-    CHECK_GOTO(bytes_equal(frame, frame_len, request_metadata, sizeof(request_metadata)));
+    CHECK_GOTO(assert_golden_message("rpc_request.metadata", frame, frame_len) == 0);
     free(frame);
     frame = NULL;
 
@@ -630,7 +847,7 @@ static int test_wire_golden_vectors(void) {
         &frame,
         &frame_len);
     CHECK_GOTO(err == 0);
-    CHECK_GOTO(bytes_equal(frame, frame_len, stream_message, sizeof(stream_message)));
+    CHECK_GOTO(assert_golden_message("rpc_stream_frame.message", frame, frame_len) == 0);
     free(frame);
     frame = NULL;
 
@@ -645,14 +862,14 @@ static int test_wire_golden_vectors(void) {
         &frame,
         &frame_len);
     CHECK_GOTO(err == 0);
-    CHECK_GOTO(bytes_equal(frame, frame_len, stream_status, sizeof(stream_status)));
+    CHECK_GOTO(assert_golden_message("rpc_stream_frame.status", frame, frame_len) == 0);
     free(frame);
     frame = NULL;
 
     CHECK_GOTO(trevrpc_response_set_body(&response, body, sizeof(body)) == 0);
     err = trevrpc_wire_encode_response(&response, 1024, &frame, &frame_len);
     CHECK_GOTO(err == 0);
-    CHECK_GOTO(bytes_equal(frame, frame_len, response_ok_body, sizeof(response_ok_body)));
+    CHECK_GOTO(assert_golden_message("rpc_response.ok_body", frame, frame_len) == 0);
     free(frame);
     frame = NULL;
     trevrpc_response_reset(&response);
@@ -661,7 +878,7 @@ static int test_wire_golden_vectors(void) {
     CHECK_GOTO(trevrpc_response_set_message(&response, "down", strlen("down")) == 0);
     err = trevrpc_wire_encode_response(&response, 1024, &frame, &frame_len);
     CHECK_GOTO(err == 0);
-    CHECK_GOTO(bytes_equal(frame, frame_len, response_unavailable, sizeof(response_unavailable)));
+    CHECK_GOTO(assert_golden_message("rpc_response.unavailable", frame, frame_len) == 0);
 
     result = 0;
 
@@ -691,6 +908,9 @@ int main(void) {
     if (test_response_round_trip() != 0) {
         return 1;
     }
+    if (test_response_and_stream_frame_helpers() != 0) {
+        return 1;
+    }
     if (test_response_metadata_round_trip() != 0) {
         return 1;
     }
@@ -704,6 +924,9 @@ int main(void) {
         return 1;
     }
     if (test_metadata_decode_uses_last_duplicate_key() != 0) {
+        return 1;
+    }
+    if (test_metadata_decode_skips_unknown_entry_fields() != 0) {
         return 1;
     }
     if (test_wire_golden_vectors() != 0) {

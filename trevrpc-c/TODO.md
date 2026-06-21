@@ -4,7 +4,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Protocol Parity
 
-- Decide unknown-field preservation behavior for metadata map entries and add CTest coverage for that decision.
 - Add explicit timeout/deadline handling for request `timeout_nanos` instead of only preserving the field.
 
 ## Runtime Policy
@@ -68,10 +67,7 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Transport And Packaging
 
-- Build and install a complete C runtime library, not only `libtrevrpc_core.a`.
-- Split installable libraries deliberately: core wire/value library, MsQuic transport library, WebTransport transport library, and optional high-level runtime library.
 - Install internal headers only when explicitly requested for tests or development; keep public headers stable.
-- Add CMake options for MsQuic and WebTransport transport builds.
 - Add CMake package config files so external C projects can use `find_package(trevrpc)`.
 - Add pkg-config files for installed C libraries.
 - Decide static vs shared library support and symbol visibility rules.
@@ -79,8 +75,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Testing
 
-- Expand CTest coverage for response helpers and stream-frame ownership helpers.
-- Add C wire golden-vector tests shared with Go and Rust.
 - Add invalid-frame corpus tests and fuzz-style tests for C decode paths.
 - Add C integration tests for MsQuic unary and all streaming modes.
 - Add C integration tests for server shutdown, client close, stream reset, and partial stream failure.

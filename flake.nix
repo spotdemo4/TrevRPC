@@ -178,8 +178,7 @@
 
             installPhase = ''
               runHook preInstall
-              install -Dm644 build/libtrevrpc_core.a $out/lib/libtrevrpc_core.a
-              install -Dm644 trevrpc-c/include/*.h -t $out/include
+              cmake --install build --prefix $out
               runHook postInstall
             '';
           };
