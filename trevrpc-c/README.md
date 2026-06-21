@@ -1,6 +1,6 @@
 # TrevRPC C Runtime
 
-`trevrpc-c` provides the C wire/value runtime, transport wrappers, and the current high-level MsQuic-backed RPC client/server runtime.
+`trevrpc-c` provides the C wire/value runtime, transport wrappers, and the high-level RPC client/server runtime.
 
 ## Libraries
 
@@ -11,9 +11,9 @@ The CMake build creates these static libraries by default:
 | `trevrpc_core`         | Wire encoding/decoding and owned value helpers                       | `trevrpc.h`              |
 | `trevrpc_msquic`       | Low-level MsQuic listener, connection, and stream wrappers           | `trevrpc_msquic.h`       |
 | `trevrpc_webtransport` | Low-level libwtf WebTransport listener, session, and stream wrappers | `trevrpc_webtransport.h` |
-| `trevrpc`              | High-level RPC client/server runtime over MsQuic                     | `trevrpc.h`              |
+| `trevrpc`              | High-level RPC client/server runtime over MsQuic and WebTransport    | `trevrpc.h`              |
 
-`trevrpc.h` is the stable high-level API surface. `trevrpc_msquic.h` and `trevrpc_webtransport.h` expose transport-specific advanced APIs. High-level clients can use MsQuic with `trevrpc_client_connect` or WebTransport with `trevrpc_client_connect_webtransport`; server dispatch is still MsQuic-backed until WebTransport serving is wired through the same transport abstraction.
+`trevrpc.h` is the stable high-level API surface. `trevrpc_msquic.h` and `trevrpc_webtransport.h` expose transport-specific advanced APIs. High-level clients can use MsQuic with `trevrpc_client_connect` or WebTransport with `trevrpc_client_connect_webtransport`; high-level servers can listen on either or both transports.
 
 The supported C artifacts are static libraries. Shared library builds and symbol export annotations are intentionally deferred until the C ABI policy is finalized; do not rely on default compiler symbol visibility as a stable ABI contract.
 
@@ -107,6 +107,7 @@ All setters that accept message/body/metadata bytes copy their inputs. Callers m
 | `trevrpc_client_call_unary`      | On success, `*response` is owned by the caller and must be freed with `trevrpc_response_free`.                        |
 | `trevrpc_client_start_stream`    | On success, `*stream` is owned by the caller and must be closed with `trevrpc_stream_close`.                          |
 | `trevrpc_server_listen`          | On success, `*server` is owned by the caller and must be closed with `trevrpc_server_close`.                          |
+| `trevrpc_server_add_*_listener`  | Attaches an additional listener to an existing server; handlers/options remain shared by all listeners.               |
 | Handler `trevrpc_call_context*`  | Borrowed for the duration of the handler call. Poll it for deadlines/cancellation; do not retain it after return.     |
 | Handler `const trevrpc_request*` | Borrowed for the duration of the handler call. Do not free fields or retain field pointers after the handler returns. |
 | Handler `trevrpc_response*`      | Borrowed output. The handler may fill it with response helpers, but must not free it.                                 |
@@ -126,6 +127,16 @@ The C runtime is synchronous. Functions that perform network I/O can block until
 Blocking APIs include `trevrpc_client_connect`, `trevrpc_client_call_unary`, `trevrpc_client_start_stream`, `trevrpc_stream_send_message`, `trevrpc_stream_send_status`, `trevrpc_stream_recv`, `trevrpc_stream_finish_send`, `trevrpc_server_serve`, low-level listener/session/connection accept calls, and low-level stream read/write calls.
 
 `trevrpc_server_shutdown` may be called from another thread while `trevrpc_server_serve` is running. It stops listener acceptance and asks active connections to shut down. `trevrpc_server_close` should be called after serving has stopped and no other thread is using the server.
+
+To serve native QUIC and WebTransport from one handler registry, create a server with either listener and attach the other before serving:
+
+```c
+trevrpc_server* server = NULL;
+trevrpc_server_listen("127.0.0.1", 5000, &config, &server);
+trevrpc_server_add_webtransport_listener(server, &wt_config);
+trevrpc_server_register_unary(server, "svc", "method", handler, NULL);
+trevrpc_server_serve(server);
+```
 
 Public C APIs are not POSIX thread-cancellation-safe and are not async-signal-safe. Do not use `pthread_cancel` to abort runtime calls. Prefer object-specific shutdown or close APIs from another thread.
 
@@ -171,13 +182,13 @@ The C runtime owns transport, framing, metadata, status, stream limits, and gene
 | Metadata-value and bearer authorizers            | Yes        | Yes                                                   |
 | Request timeout/deadline enforcement             | Yes        | Yes, cooperative                                      |
 | High-level MsQuic client/server RPC              | Yes        | Yes                                                   |
-| High-level WebTransport client/server RPC        | Yes        | Client unary/streaming only                           |
+| High-level WebTransport client/server RPC        | Yes        | Yes                                                   |
 | Low-level WebTransport wrapper                   | Yes        | Yes                                                   |
 | Server runtime policy options                    | Yes        | Yes                                                   |
 | Server runtime policy enforcement                | Yes        | Partial: stream limits and overload handling          |
 | Graceful shutdown timeout                        | Yes        | Yes                                                   |
 | Metrics callbacks                                | Yes        | Yes                                                   |
-| Transport lifecycle callbacks                    | Yes        | MsQuic high-level server                              |
+| Transport lifecycle callbacks                    | Yes        | High-level server                                     |
 | Structured log callbacks                         | Yes        | Yes                                                   |
 | First-class status helpers                       | Yes        | Yes                                                   |
 | Generated typed C protobuf helpers               | No         | Partial generator support, runtime helpers incomplete |

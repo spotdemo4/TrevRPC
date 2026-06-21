@@ -76,7 +76,6 @@ struct trevrpc_server_conn_ref {
 };
 
 struct trevrpc_server {
-    uint32_t transport;
     trevrpc_msquic_listener* listener;
     trevrpc_wt_listener* wt_listener;
     size_t max_frame_size;
@@ -111,6 +110,12 @@ typedef struct trevrpc_conn_task {
     trevrpc_msquic_conn* conn;
     trevrpc_wt_session* wt_session;
 } trevrpc_conn_task;
+
+typedef struct trevrpc_accept_task {
+    trevrpc_server* server;
+    uint32_t transport;
+    int result;
+} trevrpc_accept_task;
 
 typedef struct trevrpc_stream_task {
     trevrpc_server* server;
@@ -964,8 +969,8 @@ static bool trevrpc_method_matches(
            memcmp(method->service, service, service_len) == 0 && memcmp(method->method, name, name_len) == 0;
 }
 
-int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** out_server) {
-    if (host == NULL || out_server == NULL) {
+static int trevrpc_server_new(const trevrpc_config* config, trevrpc_server** out_server) {
+    if (out_server == NULL) {
         return -EINVAL;
     }
     *out_server = NULL;
@@ -976,12 +981,48 @@ int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config*
     }
     server->max_frame_size = trevrpc_effective_max_frame_size(config);
     server->options = trevrpc_default_server_options();
-    server->transport = TREVRPC_TRANSPORT_KIND_MSQUIC;
     pthread_mutex_init(&server->mutex, NULL);
     pthread_cond_init(&server->cond, NULL);
+    *out_server = server;
+    return 0;
+}
+
+int trevrpc_server_add_msquic_listener(
+    trevrpc_server* server, const char* host, uint16_t port, const trevrpc_config* config) {
+    if (server == NULL || host == NULL) {
+        return -EINVAL;
+    }
+    if (server->listener != NULL) {
+        return -EEXIST;
+    }
 
     trevrpc_msquic_config msquic_config = trevrpc_make_msquic_config(config);
-    int err = trevrpc_msquic_listen(host, port, &msquic_config, &server->listener);
+    return trevrpc_msquic_listen(host, port, &msquic_config, &server->listener);
+}
+
+int trevrpc_server_add_webtransport_listener(trevrpc_server* server, const trevrpc_wt_config* wt_config) {
+    if (server == NULL || wt_config == NULL) {
+        return -EINVAL;
+    }
+    if (server->wt_listener != NULL) {
+        return -EEXIST;
+    }
+
+    return trevrpc_wt_listen(wt_config, &server->wt_listener);
+}
+
+int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** out_server) {
+    if (host == NULL || out_server == NULL) {
+        return -EINVAL;
+    }
+    *out_server = NULL;
+
+    trevrpc_server* server = NULL;
+    int err = trevrpc_server_new(config, &server);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_server_add_msquic_listener(server, host, port, config);
     if (err != 0) {
         trevrpc_server_close(server);
         return err;
@@ -998,17 +1039,12 @@ int trevrpc_server_listen_webtransport(
     }
     *out_server = NULL;
 
-    trevrpc_server* server = calloc(1, sizeof(*server));
-    if (server == NULL) {
-        return -ENOMEM;
+    trevrpc_server* server = NULL;
+    int err = trevrpc_server_new(config, &server);
+    if (err != 0) {
+        return err;
     }
-    server->transport = TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
-    server->max_frame_size = trevrpc_effective_max_frame_size(config);
-    server->options = trevrpc_default_server_options();
-    pthread_mutex_init(&server->mutex, NULL);
-    pthread_cond_init(&server->cond, NULL);
-
-    int err = trevrpc_wt_listen(wt_config, &server->wt_listener);
+    err = trevrpc_server_add_webtransport_listener(server, wt_config);
     if (err != 0) {
         trevrpc_server_close(server);
         return err;
@@ -1031,7 +1067,6 @@ int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_s
     }
     server->max_frame_size = trevrpc_effective_max_frame_size(config);
     server->options = trevrpc_default_server_options();
-    server->transport = TREVRPC_TRANSPORT_KIND_MSQUIC;
     pthread_mutex_init(&server->mutex, NULL);
     pthread_cond_init(&server->cond, NULL);
 
@@ -1781,7 +1816,13 @@ static uint32_t trevrpc_transport_status_from_error(int err, const char** messag
 }
 
 static uint32_t trevrpc_transport_event_transport(trevrpc_server* server) {
-    return server == NULL || server->transport == 0 ? TREVRPC_TRANSPORT_KIND_MSQUIC : server->transport;
+    if (server == NULL || server->wt_listener == NULL) {
+        return TREVRPC_TRANSPORT_KIND_MSQUIC;
+    }
+    if (server->listener == NULL) {
+        return TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
+    }
+    return TREVRPC_TRANSPORT_KIND_MSQUIC;
 }
 
 static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_stream* stream) {
@@ -2177,21 +2218,12 @@ static void* trevrpc_conn_thread(void* arg) {
     return NULL;
 }
 
-int trevrpc_server_serve(trevrpc_server* server) {
-    if (server == NULL) {
-        return -EINVAL;
-    }
-    if (!trevrpc_server_task_start(server)) {
-        return TREV_MSQUIC_ERR_CLOSED;
-    }
-
-    trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_LISTENER_OPEN, 0, NULL);
-
+static int trevrpc_server_serve_transport(trevrpc_server* server, uint32_t transport) {
     int result = 0;
     for (;;) {
         trevrpc_msquic_conn* conn = NULL;
         trevrpc_wt_session* wt_session = NULL;
-        int err = server->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT
+        int err = transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT
                       ? trevrpc_wt_listener_accept_session(server->wt_listener, &wt_session)
                       : trevrpc_msquic_listener_accept(server->listener, &conn);
         if (err != 0) {
@@ -2265,6 +2297,52 @@ int trevrpc_server_serve(trevrpc_server* server) {
         pthread_detach(thread);
     }
 
+    return result;
+}
+
+static void* trevrpc_accept_thread(void* arg) {
+    trevrpc_accept_task* task = arg;
+    task->result = trevrpc_server_serve_transport(task->server, task->transport);
+    return NULL;
+}
+
+int trevrpc_server_serve(trevrpc_server* server) {
+    if (server == NULL) {
+        return -EINVAL;
+    }
+    if (server->listener == NULL && server->wt_listener == NULL) {
+        return -EINVAL;
+    }
+    if (!trevrpc_server_task_start(server)) {
+        return TREV_MSQUIC_ERR_CLOSED;
+    }
+
+    trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_LISTENER_OPEN, 0, NULL);
+
+    int result = 0;
+    if (server->listener != NULL && server->wt_listener != NULL) {
+        trevrpc_accept_task wt_task = {
+            .server = server,
+            .transport = TREVRPC_TRANSPORT_KIND_WEBTRANSPORT,
+        };
+        pthread_t wt_thread;
+        int err = pthread_create(&wt_thread, NULL, trevrpc_accept_thread, &wt_task);
+        if (err != 0) {
+            result = -err;
+        } else {
+            result = trevrpc_server_serve_transport(server, TREVRPC_TRANSPORT_KIND_MSQUIC);
+            trevrpc_wt_listener_shutdown(server->wt_listener);
+            (void)pthread_join(wt_thread, NULL);
+            if (result == 0 && wt_task.result != 0) {
+                result = wt_task.result;
+            }
+        }
+    } else if (server->wt_listener != NULL) {
+        result = trevrpc_server_serve_transport(server, TREVRPC_TRANSPORT_KIND_WEBTRANSPORT);
+    } else {
+        result = trevrpc_server_serve_transport(server, TREVRPC_TRANSPORT_KIND_MSQUIC);
+    }
+
     trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_LISTENER_CLOSE, result, NULL);
     trevrpc_server_task_finish(server);
     return result;
@@ -2281,10 +2359,11 @@ void trevrpc_server_shutdown(trevrpc_server* server) {
     pthread_mutex_unlock(&server->mutex);
 
     trevrpc_server_shutdown_connections(server);
-    if (server->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
-        trevrpc_wt_listener_shutdown(server->wt_listener);
-    } else {
+    if (server->listener != NULL) {
         trevrpc_msquic_listener_shutdown(server->listener);
+    }
+    if (server->wt_listener != NULL) {
+        trevrpc_wt_listener_shutdown(server->wt_listener);
     }
 }
 
@@ -2300,10 +2379,11 @@ void trevrpc_server_close(trevrpc_server* server) {
         (void)trevrpc_server_wait_for_tasks(server, 0);
     }
 
-    if (server->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
-        trevrpc_wt_listener_close(server->wt_listener);
-    } else {
+    if (server->listener != NULL) {
         trevrpc_msquic_listener_close(server->listener);
+    }
+    if (server->wt_listener != NULL) {
+        trevrpc_wt_listener_close(server->wt_listener);
     }
     trevrpc_method* method = server->methods;
     while (method != NULL) {
