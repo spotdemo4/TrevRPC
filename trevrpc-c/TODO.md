@@ -14,9 +14,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Typed Protobuf Runtime
 
-- Add generated C helpers for unary, server-streaming, client-streaming, and bidi client calls.
-- Add generated C server registration helpers that decode protobuf-c messages and encode protobuf-c responses.
-- Add generated C stream wrappers that expose typed `send` and `recv` functions around `trevrpc_stream`.
 - Add tests for generated C services using protobuf-c messages across all RPC shapes.
 - Add examples showing C client and C server usage with generated code.
 
