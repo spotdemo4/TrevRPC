@@ -673,7 +673,7 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
     int wait_err = trevrpc_msquic_stream_wait_recv_locked(stream, NULL);
     if (wait_err != 0) {
         pthread_mutex_unlock(&stream->mutex);
-        return wait_err;
+        return wait_err < 0 ? wait_err : -wait_err;
     }
 
     if (stream->recv_head == NULL) {
@@ -705,7 +705,7 @@ static intptr_t trevrpc_msquic_stream_read_exact_locked(
     while (copied < len) {
         int wait_err = trevrpc_msquic_stream_wait_recv_locked(stream, deadline);
         if (wait_err != 0) {
-            return wait_err;
+            return wait_err < 0 ? wait_err : -wait_err;
         }
 
         if (stream->recv_head == NULL) {
