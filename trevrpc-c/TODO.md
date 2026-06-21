@@ -14,8 +14,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Typed Protobuf Runtime
 
-- Add examples showing C client and C server usage with generated code.
-
 ## WebTransport Integration
 
 - Add high-level `trevrpc_client` and `trevrpc_server` support over `trevrpc_wt_*`, not only low-level WebTransport session and stream wrappers.
