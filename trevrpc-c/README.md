@@ -107,7 +107,6 @@ All setters that accept message/body/metadata bytes copy their inputs. Callers m
 | `trevrpc_client_call_unary`      | On success, `*response` is owned by the caller and must be freed with `trevrpc_response_free`.                        |
 | `trevrpc_client_start_stream`    | On success, `*stream` is owned by the caller and must be closed with `trevrpc_stream_close`.                          |
 | `trevrpc_server_listen`          | On success, `*server` is owned by the caller and must be closed with `trevrpc_server_close`.                          |
-| `trevrpc_server_add_*_listener`  | Attaches an additional listener to an existing server; handlers/options remain shared by all listeners.               |
 | Handler `trevrpc_call_context*`  | Borrowed for the duration of the handler call. Poll it for deadlines/cancellation; do not retain it after return.     |
 | Handler `const trevrpc_request*` | Borrowed for the duration of the handler call. Do not free fields or retain field pointers after the handler returns. |
 | Handler `trevrpc_response*`      | Borrowed output. The handler may fill it with response helpers, but must not free it.                                 |
@@ -128,21 +127,11 @@ Blocking APIs include `trevrpc_client_connect`, `trevrpc_client_call_unary`, `tr
 
 `trevrpc_server_shutdown` may be called from another thread while `trevrpc_server_serve` is running. It stops listener acceptance and asks active connections to shut down. `trevrpc_server_close` should be called after serving has stopped and no other thread is using the server.
 
-To serve native QUIC and WebTransport from one handler registry on separate UDP ports, create a server with either listener and attach the other before serving:
+To serve native QUIC and WebTransport from one handler registry on one UDP port, create a shared listener. The server routes accepted connections by negotiated ALPN: `trevrpc/1` for native TrevRPC and `h3` for WebTransport.
 
 ```c
 trevrpc_server* server = NULL;
-trevrpc_server_listen("127.0.0.1", 5000, &config, &server);
-trevrpc_server_add_webtransport_listener(server, &wt_config);
-trevrpc_server_register_unary(server, "svc", "method", handler, NULL);
-trevrpc_server_serve(server);
-```
-
-To serve both transports on one UDP port, create a shared listener. The server routes accepted connections by negotiated ALPN: `trevrpc/1` for native TrevRPC and `h3` for WebTransport.
-
-```c
-trevrpc_server* server = NULL;
-trevrpc_server_listen_shared("127.0.0.1", 5000, &wt_config, &config, &server);
+trevrpc_server_listen("127.0.0.1", 5000, &wt_config, &config, &server);
 trevrpc_server_register_unary(server, "svc", "method", handler, NULL);
 trevrpc_server_serve(server);
 ```

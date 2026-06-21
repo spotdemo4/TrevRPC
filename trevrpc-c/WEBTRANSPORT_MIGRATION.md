@@ -48,7 +48,7 @@ This tracks replacing the `libwtf` dependency with an internal WebTransport impl
 
 - Multi-listener high-level `trevrpc_server` support exists.
 - `trevrpc_wt_*` is backed by the internal MsQuic/HTTP3/WebTransport implementation.
-- `trevrpc_server_listen_shared` can serve native QUIC and WebTransport on one UDP port.
+- `trevrpc_server_listen` serves native QUIC and WebTransport on one UDP port.
 - High-level WebTransport RPC CTests cover unary, all streaming shapes, partial requests, and close failure paths.
 - Low-level WebTransport CTests cover session establishment, stream I/O, malformed handshakes, path rejection, and shutdown/close unblock behavior.
 

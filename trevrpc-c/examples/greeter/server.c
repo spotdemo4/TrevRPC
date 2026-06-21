@@ -1,5 +1,6 @@
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
+#include "trevrpc_webtransport.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -130,8 +131,13 @@ int main(int argc, char** argv) {
     uint16_t port = argc > 2 ? (uint16_t)atoi(argv[2]) : 50051;
 
     trevrpc_config config = trevrpc_default_config();
+    trevrpc_wt_config wt_config = {
+        .path = "/trevrpc",
+        .cert_file = config.cert_file,
+        .key_file = config.key_file,
+    };
     trevrpc_server* server = NULL;
-    int rc = trevrpc_server_listen(host, port, &config, &server);
+    int rc = trevrpc_server_listen(host, port, &wt_config, &config, &server);
     if (rc != 0) {
         fprintf(stderr, "listen failed: %s\n", trevrpc_error(rc));
         return 1;

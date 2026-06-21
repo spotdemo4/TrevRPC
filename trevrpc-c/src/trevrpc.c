@@ -1022,74 +1022,7 @@ static int trevrpc_server_new(const trevrpc_config* config, trevrpc_server** out
     return 0;
 }
 
-int trevrpc_server_add_msquic_listener(
-    trevrpc_server* server, const char* host, uint16_t port, const trevrpc_config* config) {
-    if (server == NULL || host == NULL) {
-        return -EINVAL;
-    }
-    if (server->listener != NULL || server->shared_listener != NULL) {
-        return -EEXIST;
-    }
-
-    trevrpc_msquic_config msquic_config = trevrpc_make_msquic_config(config);
-    return trevrpc_msquic_listen(host, port, &msquic_config, &server->listener);
-}
-
-int trevrpc_server_add_webtransport_listener(trevrpc_server* server, const trevrpc_wt_config* wt_config) {
-    if (server == NULL || wt_config == NULL) {
-        return -EINVAL;
-    }
-    if (server->wt_listener != NULL || server->shared_listener != NULL) {
-        return -EEXIST;
-    }
-
-    return trevrpc_wt_listen(wt_config, &server->wt_listener);
-}
-
-int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** out_server) {
-    if (host == NULL || out_server == NULL) {
-        return -EINVAL;
-    }
-    *out_server = NULL;
-
-    trevrpc_server* server = NULL;
-    int err = trevrpc_server_new(config, &server);
-    if (err != 0) {
-        return err;
-    }
-    err = trevrpc_server_add_msquic_listener(server, host, port, config);
-    if (err != 0) {
-        trevrpc_server_close(server);
-        return err;
-    }
-
-    *out_server = server;
-    return 0;
-}
-
-int trevrpc_server_listen_webtransport(
-    const trevrpc_wt_config* wt_config, const trevrpc_config* config, trevrpc_server** out_server) {
-    if (wt_config == NULL || out_server == NULL) {
-        return -EINVAL;
-    }
-    *out_server = NULL;
-
-    trevrpc_server* server = NULL;
-    int err = trevrpc_server_new(config, &server);
-    if (err != 0) {
-        return err;
-    }
-    err = trevrpc_server_add_webtransport_listener(server, wt_config);
-    if (err != 0) {
-        trevrpc_server_close(server);
-        return err;
-    }
-
-    *out_server = server;
-    return 0;
-}
-
-int trevrpc_server_listen_shared(const char* host,
+int trevrpc_server_listen(const char* host,
     uint16_t port,
     const trevrpc_wt_config* wt_config,
     const trevrpc_config* config,

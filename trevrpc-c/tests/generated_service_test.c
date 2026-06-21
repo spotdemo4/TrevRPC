@@ -282,7 +282,7 @@ static int start_wt_serve_fixture(wt_serve_fixture* fixture, const trevrpc_confi
         .max_streams_per_session = 8,
         .idle_timeout_ms = 1000,
     };
-    int err = trevrpc_server_listen_webtransport(&server_config, config, &fixture->server);
+    int err = trevrpc_server_listen("127.0.0.1", 0, &server_config, config, &fixture->server);
     if (err != 0) {
         return err;
     }
@@ -621,7 +621,7 @@ static int test_shared_listener_native_and_webtransport_unary(void) {
     Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
     request.name = "shared";
 
-    CHECK_GOTO(trevrpc_server_listen_shared("127.0.0.1", 0, &wt_server_config, &server_config, &server) == 0);
+    CHECK_GOTO(trevrpc_server_listen("127.0.0.1", 0, &wt_server_config, &server_config, &server) == 0);
     CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
     args.server = server;
     CHECK_GOTO(pthread_create(&thread, NULL, serve_thread, &args) == 0);

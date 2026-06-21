@@ -141,9 +141,14 @@ func startEchoServer(host, certFile, keyFile string, port uint16) (*runtimeServe
 	serverConfig := C.trevrpc_default_config()
 	serverConfig.cert_file = cCertFile
 	serverConfig.key_file = cKeyFile
+	wtConfig := C.trevrpc_wt_config{}
+	wtConfig.path = C.CString("/trevrpc")
+	defer C.free(unsafe.Pointer(wtConfig.path))
+	wtConfig.cert_file = cCertFile
+	wtConfig.key_file = cKeyFile
 
 	var server *C.trevrpc_server
-	if code := C.trevrpc_server_listen(cHost, C.uint16_t(port), &serverConfig, &server); code != 0 {
+	if code := C.trevrpc_server_listen(cHost, C.uint16_t(port), &wtConfig, &serverConfig, &server); code != 0 {
 		return nil, runtimeError("listen", code)
 	}
 
