@@ -136,6 +136,54 @@
 
         # nix build [#...]
         packages = {
+          trevrpc-c = pkgs.stdenv.mkDerivation {
+            pname = "trevrpc-c";
+            version = "0.1.0";
+            src = ./.;
+
+            configurePhase = ''
+              runHook preConfigure
+              cmake -S trevrpc-c -B build -DTREVRPC_BUILD_TESTS=ON
+              runHook postConfigure
+            '';
+
+            nativeBuildInputs = with pkgs; [
+              clang-tools
+              cmake
+            ];
+            buildInputs = with pkgs; [
+              libmsquic
+              libwtf
+            ];
+            buildPhase = ''
+              runHook preBuild
+              cmake --build build
+              runHook postBuild
+            '';
+
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              clang-format --dry-run --Werror $(find trevrpc-c -name '*.c' -o -name '*.h')
+              clang-tidy --quiet $(find trevrpc-c -name '*.c') -- \
+                -x c \
+                -std=c11 \
+                -Itrevrpc-c/include \
+                -Itrevrpc-c/src \
+                -isystem ${pkgs.libmsquic}/include \
+                -isystem ${pkgs.libwtf}/include
+              ctest --test-dir build --output-on-failure
+              runHook postCheck
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              install -Dm644 build/libtrevrpc_core.a $out/lib/libtrevrpc_core.a
+              install -Dm644 trevrpc-c/include/*.h -t $out/include
+              runHook postInstall
+            '';
+          };
+
           trevrpc-rust = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
               pname = "trevrpc-rust";
@@ -264,6 +312,12 @@
 
         # nix flake check
         checks = pkgs.mkChecks {
+          c = self.packages.${system}.trevrpc-c.overrideAttrs {
+            installPhase = ''
+              touch $out
+            '';
+          };
+
           rust = self.packages.${system}.trevrpc-rust.overrideAttrs {
             dontBuild = true;
             installPhase = ''
@@ -282,53 +336,6 @@
             dontBuild = true;
             installPhase = ''
               touch $out
-            '';
-          };
-
-          c = {
-            root = ./.;
-            filter = file: file.hasExt "c" || file.hasExt "h";
-            include = [
-              ./.clang-format
-              ./.clang-tidy
-            ];
-            packages = with pkgs; [
-              clang-tools
-              libmsquic
-              libwtf
-            ];
-            script = ''
-              clang-format --dry-run --Werror $(find trevrpc-c -name '*.c' -o -name '*.h')
-              clang-tidy --quiet $(find trevrpc-c -name '*.c') -- \
-                -x c \
-                -std=c11 \
-                -Itrevrpc-c/include \
-                -Itrevrpc-c/src \
-                -isystem ${pkgs.libmsquic}/include \
-                -isystem ${pkgs.libwtf}/include
-            '';
-          };
-
-          c-tests = pkgs.stdenv.mkDerivation {
-            pname = "trevrpc-c-tests";
-            version = "0.1.0";
-            src = ./trevrpc-c;
-            nativeBuildInputs = with pkgs; [
-              cmake
-            ];
-            cmakeFlags = [
-              "-DTREVRPC_BUILD_TESTS=ON"
-            ];
-            doCheck = true;
-            checkPhase = ''
-              runHook preCheck
-              ctest --output-on-failure
-              runHook postCheck
-            '';
-            installPhase = ''
-              runHook preInstall
-              touch $out
-              runHook postInstall
             '';
           };
 
