@@ -24,7 +24,7 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Testing
 
-- Add full transport integration tests for client close, stream reset, concurrent streams, and concurrent connections under configured limits.
+- Add native transport integration tests for client close and stream reset behavior.
 
 ## Documentation
 

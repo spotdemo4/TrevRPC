@@ -32,6 +32,12 @@ size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
 bool trevrpc_test_server_request_try_start(trevrpc_server* server);
 void trevrpc_test_server_request_finish(trevrpc_server* server);
+bool trevrpc_test_server_connection_try_start(trevrpc_server* server);
+void trevrpc_test_server_connection_finish(trevrpc_server* server);
+int trevrpc_test_conn_stream_limiter_init(void* limiter);
+bool trevrpc_test_conn_stream_try_start(void* limiter, int64_t limit);
+void trevrpc_test_conn_stream_finish(void* limiter);
+void trevrpc_test_conn_stream_limiter_destroy(void* limiter);
 
 struct trevrpc_stream {
     uint32_t transport;
@@ -82,6 +88,12 @@ struct trevrpc_msquic_stream {
     trevrpc_msquic_send* send_pool;
     size_t send_pool_count;
 };
+
+typedef struct trevrpc_conn_stream_limiter_for_test {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    size_t active_streams;
+} trevrpc_conn_stream_limiter_for_test;
 
 #define CHECK_GOTO(condition)                                                                                          \
     do {                                                                                                               \
@@ -1175,6 +1187,49 @@ cleanup:
     return result;
 }
 
+static int test_concurrent_connection_limit_rejects_overload(void) {
+    int result = 1;
+    trevrpc_server* server = NULL;
+    trevrpc_server_options options = trevrpc_default_server_options();
+    options.max_concurrent_connections = 1;
+
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_options(server, &options) == 0);
+    CHECK_GOTO(trevrpc_test_server_connection_try_start(server));
+    CHECK_GOTO(!trevrpc_test_server_connection_try_start(server));
+    trevrpc_test_server_connection_finish(server);
+    CHECK_GOTO(trevrpc_test_server_connection_try_start(server));
+    trevrpc_test_server_connection_finish(server);
+
+    result = 0;
+
+cleanup:
+    trevrpc_server_close(server);
+    return result;
+}
+
+static int test_concurrent_stream_limit_rejects_overload(void) {
+    int result = 1;
+    trevrpc_conn_stream_limiter_for_test limiter = {0};
+    bool limiter_initialized = false;
+
+    CHECK_GOTO(trevrpc_test_conn_stream_limiter_init(&limiter) == 0);
+    limiter_initialized = true;
+    CHECK_GOTO(trevrpc_test_conn_stream_try_start(&limiter, 1));
+    CHECK_GOTO(!trevrpc_test_conn_stream_try_start(&limiter, 1));
+    trevrpc_test_conn_stream_finish(&limiter);
+    CHECK_GOTO(trevrpc_test_conn_stream_try_start(&limiter, 1));
+    trevrpc_test_conn_stream_finish(&limiter);
+
+    result = 0;
+
+cleanup:
+    if (limiter_initialized) {
+        trevrpc_test_conn_stream_limiter_destroy(&limiter);
+    }
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -1261,6 +1316,12 @@ int main(void) {
         return 1;
     }
     if (test_concurrent_request_limit_rejects_overload() != 0) {
+        return 1;
+    }
+    if (test_concurrent_connection_limit_rejects_overload() != 0) {
+        return 1;
+    }
+    if (test_concurrent_stream_limit_rejects_overload() != 0) {
         return 1;
     }
     return 0;

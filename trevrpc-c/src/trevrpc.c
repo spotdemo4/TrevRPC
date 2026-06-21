@@ -1318,6 +1318,14 @@ bool trevrpc_test_server_request_try_start(trevrpc_server* server) {
 void trevrpc_test_server_request_finish(trevrpc_server* server) {
     trevrpc_server_request_finish(server);
 }
+
+bool trevrpc_test_server_connection_try_start(trevrpc_server* server) {
+    return trevrpc_server_connection_try_start(server);
+}
+
+void trevrpc_test_server_connection_finish(trevrpc_server* server) {
+    trevrpc_server_connection_finish(server);
+}
 #endif
 
 static int trevrpc_conn_stream_limiter_init(trevrpc_conn_stream_limiter* limiter) {
@@ -1362,6 +1370,24 @@ static void trevrpc_conn_stream_limiter_destroy(trevrpc_conn_stream_limiter* lim
     pthread_cond_destroy(&limiter->cond);
     pthread_mutex_destroy(&limiter->mutex);
 }
+
+#ifdef TREVRPC_TESTING
+int trevrpc_test_conn_stream_limiter_init(trevrpc_conn_stream_limiter* limiter) {
+    return trevrpc_conn_stream_limiter_init(limiter);
+}
+
+bool trevrpc_test_conn_stream_try_start(trevrpc_conn_stream_limiter* limiter, int64_t limit) {
+    return trevrpc_conn_stream_try_start(limiter, limit);
+}
+
+void trevrpc_test_conn_stream_finish(trevrpc_conn_stream_limiter* limiter) {
+    trevrpc_conn_stream_finish(limiter);
+}
+
+void trevrpc_test_conn_stream_limiter_destroy(trevrpc_conn_stream_limiter* limiter) {
+    trevrpc_conn_stream_limiter_destroy(limiter);
+}
+#endif
 
 static bool trevrpc_server_is_shutting_down(trevrpc_server* server) {
     if (server == NULL) {
