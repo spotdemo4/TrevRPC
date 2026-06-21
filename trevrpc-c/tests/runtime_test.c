@@ -658,8 +658,8 @@ cleanup:
     return result;
 }
 
-static int run_stream_case(
-    trevrpc_stream_handler handler, metric_counts* counts, size_t* status_count, uint32_t* last_status) {
+static int run_stream_case_kind(
+    uint32_t kind, trevrpc_stream_handler handler, metric_counts* counts, size_t* status_count, uint32_t* last_status) {
     int result = 1;
     uint8_t* frame = NULL;
     size_t frame_len = 0;
@@ -672,13 +672,10 @@ static int run_stream_case(
         .user_data = counts,
     };
 
-    CHECK_GOTO(
-        trevrpc_wire_encode_request(
-            "svc", "method", TREVRPC_RPC_KIND_SERVER_STREAMING, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(trevrpc_wire_encode_request("svc", "method", kind, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
     CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
     CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
-    CHECK_GOTO(trevrpc_server_register_streaming(
-                   server, "svc", "method", TREVRPC_RPC_KIND_SERVER_STREAMING, handler, NULL) == 0);
+    CHECK_GOTO(trevrpc_server_register_streaming(server, "svc", "method", kind, handler, NULL) == 0);
     CHECK_GOTO(init_raw_stream(&stream, frame, frame_len) == 0);
     stream_initialized = true;
 
@@ -695,6 +692,11 @@ cleanup:
     trevrpc_server_close(server);
     free(frame);
     return result;
+}
+
+static int run_stream_case(
+    trevrpc_stream_handler handler, metric_counts* counts, size_t* status_count, uint32_t* last_status) {
+    return run_stream_case_kind(TREVRPC_RPC_KIND_SERVER_STREAMING, handler, counts, status_count, last_status);
 }
 
 static int test_metrics_exactly_once_success(void) {
@@ -1034,6 +1036,62 @@ cleanup:
     return result;
 }
 
+static int test_inprocess_msquic_runtime_all_rpc_shapes(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    metric_counts counts = {0};
+    size_t status_count = 0;
+    uint32_t last_status = TREVRPC_STATUS_UNKNOWN;
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(run_metrics_case(frame, frame_len, success_handler, &counts) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+    free(frame);
+    frame = NULL;
+
+    memset(&counts, 0, sizeof(counts));
+    CHECK_GOTO(
+        run_stream_case_kind(
+            TREVRPC_RPC_KIND_SERVER_STREAMING, stream_omit_terminal_handler, &counts, &status_count, &last_status) ==
+        0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(status_count == 1);
+    CHECK_GOTO(last_status == TREVRPC_STATUS_OK);
+
+    memset(&counts, 0, sizeof(counts));
+    status_count = 0;
+    last_status = TREVRPC_STATUS_UNKNOWN;
+    CHECK_GOTO(
+        run_stream_case_kind(
+            TREVRPC_RPC_KIND_CLIENT_STREAMING, stream_omit_terminal_handler, &counts, &status_count, &last_status) ==
+        0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(status_count == 1);
+    CHECK_GOTO(last_status == TREVRPC_STATUS_OK);
+
+    memset(&counts, 0, sizeof(counts));
+    status_count = 0;
+    last_status = TREVRPC_STATUS_UNKNOWN;
+    CHECK_GOTO(run_stream_case_kind(TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
+                   stream_omit_terminal_handler,
+                   &counts,
+                   &status_count,
+                   &last_status) == 0);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(status_count == 1);
+    CHECK_GOTO(last_status == TREVRPC_STATUS_OK);
+
+    result = 0;
+
+cleanup:
+    free(frame);
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -1108,6 +1166,9 @@ int main(void) {
         return 1;
     }
     if (test_streaming_handlers_send_exactly_one_terminal_status() != 0) {
+        return 1;
+    }
+    if (test_inprocess_msquic_runtime_all_rpc_shapes() != 0) {
         return 1;
     }
     return 0;
