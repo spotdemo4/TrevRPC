@@ -77,6 +77,12 @@ typedef struct trevrpc_metadata {
     size_t entries_len;
 } trevrpc_metadata;
 
+typedef struct trevrpc_status {
+    uint32_t code;
+    const char* message;
+    size_t message_len;
+} trevrpc_status;
+
 typedef struct trevrpc_request {
     const char* service;
     size_t service_len;
@@ -113,6 +119,27 @@ typedef int (*trevrpc_unary_handler)(void* user_data, const trevrpc_request* req
 typedef int (*trevrpc_stream_handler)(void* user_data, const trevrpc_request* request, trevrpc_stream* stream);
 
 trevrpc_config trevrpc_default_config(void);
+
+uint32_t trevrpc_status_code_from_uint32(uint32_t code);
+const char* trevrpc_status_code_string(uint32_t code);
+trevrpc_status trevrpc_status_new(uint32_t code, const char* message, size_t message_len);
+trevrpc_status trevrpc_status_ok(void);
+trevrpc_status trevrpc_status_cancelled(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_unknown(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_invalid_argument(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_deadline_exceeded(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_not_found(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_already_exists(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_permission_denied(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_resource_exhausted(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_failed_precondition(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_aborted(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_out_of_range(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_unimplemented(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_internal(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_unavailable(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_data_loss(const char* message, size_t message_len);
+trevrpc_status trevrpc_status_unauthenticated(const char* message, size_t message_len);
 
 int trevrpc_metadata_set(
     trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
@@ -152,6 +179,7 @@ void trevrpc_server_close(trevrpc_server* server);
 
 int trevrpc_response_set_message(trevrpc_response* response, const char* message, size_t message_len);
 int trevrpc_response_set_body(trevrpc_response* response, const uint8_t* body, size_t body_len);
+int trevrpc_response_set_status(trevrpc_response* response, trevrpc_status status);
 void trevrpc_response_reset(trevrpc_response* response);
 void trevrpc_response_free(trevrpc_response* response);
 
@@ -163,6 +191,7 @@ void trevrpc_stream_close(trevrpc_stream* stream);
 
 int trevrpc_stream_frame_set_message(trevrpc_stream_frame* frame, const char* message, size_t message_len);
 int trevrpc_stream_frame_set_body(trevrpc_stream_frame* frame, const uint8_t* body, size_t body_len);
+int trevrpc_stream_frame_set_status(trevrpc_stream_frame* frame, trevrpc_status status);
 void trevrpc_stream_frame_reset(trevrpc_stream_frame* frame);
 void trevrpc_stream_frame_free(trevrpc_stream_frame* frame);
 

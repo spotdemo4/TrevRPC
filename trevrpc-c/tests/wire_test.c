@@ -497,6 +497,50 @@ cleanup:
     return result;
 }
 
+static int test_status_helpers(void) {
+    int result = 1;
+    trevrpc_response response = {0};
+    trevrpc_stream_frame frame = {0};
+    uint8_t body[] = {0x01};
+
+    CHECK_GOTO(trevrpc_status_code_from_uint32(TREVRPC_STATUS_OK) == TREVRPC_STATUS_OK);
+    CHECK_GOTO(trevrpc_status_code_from_uint32(TREVRPC_STATUS_UNAUTHENTICATED) == TREVRPC_STATUS_UNAUTHENTICATED);
+    CHECK_GOTO(trevrpc_status_code_from_uint32(999) == TREVRPC_STATUS_UNKNOWN);
+    CHECK_GOTO(strcmp(trevrpc_status_code_string(TREVRPC_STATUS_DEADLINE_EXCEEDED), "DeadlineExceeded") == 0);
+    CHECK_GOTO(strcmp(trevrpc_status_code_string(999), "Unknown") == 0);
+
+    trevrpc_status ok = trevrpc_status_ok();
+    CHECK_GOTO(ok.code == TREVRPC_STATUS_OK);
+    CHECK_GOTO(ok.message == NULL);
+    CHECK_GOTO(ok.message_len == 0);
+
+    trevrpc_status status = trevrpc_status_permission_denied("no", strlen("no"));
+    CHECK_GOTO(status.code == TREVRPC_STATUS_PERMISSION_DENIED);
+    CHECK_GOTO(status.message_len == strlen("no"));
+
+    CHECK_GOTO(trevrpc_response_set_status(&response, trevrpc_status_unavailable("down", strlen("down"))) == 0);
+    CHECK_GOTO(response.status == TREVRPC_STATUS_UNAVAILABLE);
+    CHECK_GOTO(chars_equal(response.message, response.message_len, "down"));
+    CHECK_GOTO(trevrpc_response_set_status(&response, trevrpc_status_new(999, "odd", strlen("odd"))) == 0);
+    CHECK_GOTO(response.status == TREVRPC_STATUS_UNKNOWN);
+    CHECK_GOTO(chars_equal(response.message, response.message_len, "odd"));
+
+    CHECK_GOTO(trevrpc_stream_frame_set_body(&frame, body, sizeof(body)) == 0);
+    CHECK_GOTO(trevrpc_stream_frame_set_status(&frame, trevrpc_status_internal("boom", strlen("boom"))) == 0);
+    CHECK_GOTO(frame.kind == TREVRPC_STREAM_FRAME_KIND_STATUS);
+    CHECK_GOTO(frame.status == TREVRPC_STATUS_INTERNAL);
+    CHECK_GOTO(chars_equal(frame.message, frame.message_len, "boom"));
+    CHECK_GOTO(frame.body == NULL);
+    CHECK_GOTO(frame.body_len == 0);
+
+    result = 0;
+
+cleanup:
+    trevrpc_response_reset(&response);
+    trevrpc_stream_frame_reset(&frame);
+    return result;
+}
+
 static int test_response_metadata_round_trip(void) {
     int result = 1;
     trevrpc_response response = {0};
@@ -909,6 +953,9 @@ int main(void) {
         return 1;
     }
     if (test_response_and_stream_frame_helpers() != 0) {
+        return 1;
+    }
+    if (test_status_helpers() != 0) {
         return 1;
     }
     if (test_response_metadata_round_trip() != 0) {

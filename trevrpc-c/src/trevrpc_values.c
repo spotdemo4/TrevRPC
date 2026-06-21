@@ -70,6 +70,147 @@ static int trevrpc_copy_bytes(uint8_t** dst, size_t* dst_len, const uint8_t* src
     return 0;
 }
 
+uint32_t trevrpc_status_code_from_uint32(uint32_t code) {
+    switch (code) {
+    case TREVRPC_STATUS_OK:
+    case TREVRPC_STATUS_CANCELLED:
+    case TREVRPC_STATUS_UNKNOWN:
+    case TREVRPC_STATUS_INVALID_ARGUMENT:
+    case TREVRPC_STATUS_DEADLINE_EXCEEDED:
+    case TREVRPC_STATUS_NOT_FOUND:
+    case TREVRPC_STATUS_ALREADY_EXISTS:
+    case TREVRPC_STATUS_PERMISSION_DENIED:
+    case TREVRPC_STATUS_RESOURCE_EXHAUSTED:
+    case TREVRPC_STATUS_FAILED_PRECONDITION:
+    case TREVRPC_STATUS_ABORTED:
+    case TREVRPC_STATUS_OUT_OF_RANGE:
+    case TREVRPC_STATUS_UNIMPLEMENTED:
+    case TREVRPC_STATUS_INTERNAL:
+    case TREVRPC_STATUS_UNAVAILABLE:
+    case TREVRPC_STATUS_DATA_LOSS:
+    case TREVRPC_STATUS_UNAUTHENTICATED:
+        return code;
+    default:
+        return TREVRPC_STATUS_UNKNOWN;
+    }
+}
+
+const char* trevrpc_status_code_string(uint32_t code) {
+    switch (trevrpc_status_code_from_uint32(code)) {
+    case TREVRPC_STATUS_OK:
+        return "Ok";
+    case TREVRPC_STATUS_CANCELLED:
+        return "Cancelled";
+    case TREVRPC_STATUS_INVALID_ARGUMENT:
+        return "InvalidArgument";
+    case TREVRPC_STATUS_DEADLINE_EXCEEDED:
+        return "DeadlineExceeded";
+    case TREVRPC_STATUS_NOT_FOUND:
+        return "NotFound";
+    case TREVRPC_STATUS_ALREADY_EXISTS:
+        return "AlreadyExists";
+    case TREVRPC_STATUS_PERMISSION_DENIED:
+        return "PermissionDenied";
+    case TREVRPC_STATUS_RESOURCE_EXHAUSTED:
+        return "ResourceExhausted";
+    case TREVRPC_STATUS_FAILED_PRECONDITION:
+        return "FailedPrecondition";
+    case TREVRPC_STATUS_ABORTED:
+        return "Aborted";
+    case TREVRPC_STATUS_OUT_OF_RANGE:
+        return "OutOfRange";
+    case TREVRPC_STATUS_UNIMPLEMENTED:
+        return "Unimplemented";
+    case TREVRPC_STATUS_INTERNAL:
+        return "Internal";
+    case TREVRPC_STATUS_UNAVAILABLE:
+        return "Unavailable";
+    case TREVRPC_STATUS_DATA_LOSS:
+        return "DataLoss";
+    case TREVRPC_STATUS_UNAUTHENTICATED:
+        return "Unauthenticated";
+    case TREVRPC_STATUS_UNKNOWN:
+    default:
+        return "Unknown";
+    }
+}
+
+trevrpc_status trevrpc_status_new(uint32_t code, const char* message, size_t message_len) {
+    return (trevrpc_status){
+        .code = trevrpc_status_code_from_uint32(code),
+        .message = message,
+        .message_len = message == NULL ? 0 : message_len,
+    };
+}
+
+trevrpc_status trevrpc_status_ok(void) {
+    return trevrpc_status_new(TREVRPC_STATUS_OK, NULL, 0);
+}
+
+trevrpc_status trevrpc_status_cancelled(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_CANCELLED, message, message_len);
+}
+
+trevrpc_status trevrpc_status_unknown(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_UNKNOWN, message, message_len);
+}
+
+trevrpc_status trevrpc_status_invalid_argument(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_INVALID_ARGUMENT, message, message_len);
+}
+
+trevrpc_status trevrpc_status_deadline_exceeded(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_DEADLINE_EXCEEDED, message, message_len);
+}
+
+trevrpc_status trevrpc_status_not_found(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_NOT_FOUND, message, message_len);
+}
+
+trevrpc_status trevrpc_status_already_exists(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_ALREADY_EXISTS, message, message_len);
+}
+
+trevrpc_status trevrpc_status_permission_denied(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_PERMISSION_DENIED, message, message_len);
+}
+
+trevrpc_status trevrpc_status_resource_exhausted(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_RESOURCE_EXHAUSTED, message, message_len);
+}
+
+trevrpc_status trevrpc_status_failed_precondition(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_FAILED_PRECONDITION, message, message_len);
+}
+
+trevrpc_status trevrpc_status_aborted(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_ABORTED, message, message_len);
+}
+
+trevrpc_status trevrpc_status_out_of_range(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_OUT_OF_RANGE, message, message_len);
+}
+
+trevrpc_status trevrpc_status_unimplemented(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_UNIMPLEMENTED, message, message_len);
+}
+
+trevrpc_status trevrpc_status_internal(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_INTERNAL, message, message_len);
+}
+
+trevrpc_status trevrpc_status_unavailable(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_UNAVAILABLE, message, message_len);
+}
+
+trevrpc_status trevrpc_status_data_loss(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_DATA_LOSS, message, message_len);
+}
+
+trevrpc_status trevrpc_status_unauthenticated(const char* message, size_t message_len) {
+    return trevrpc_status_new(TREVRPC_STATUS_UNAUTHENTICATED, message, message_len);
+}
+
 int trevrpc_metadata_set(
     trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len) {
     if (metadata == NULL || key == NULL || key_len == 0 || (value == NULL && value_len > 0)) {
@@ -237,6 +378,19 @@ int trevrpc_response_set_body(trevrpc_response* response, const uint8_t* body, s
     return trevrpc_copy_bytes(&response->body, &response->body_len, body, body_len);
 }
 
+int trevrpc_response_set_status(trevrpc_response* response, trevrpc_status status) {
+    if (response == NULL) {
+        return -EINVAL;
+    }
+
+    int err = trevrpc_response_set_message(response, status.message, status.message_len);
+    if (err != 0) {
+        return err;
+    }
+    response->status = trevrpc_status_code_from_uint32(status.code);
+    return 0;
+}
+
 void trevrpc_response_reset(trevrpc_response* response) {
     if (response == NULL) {
         return;
@@ -275,6 +429,24 @@ int trevrpc_stream_frame_set_body(trevrpc_stream_frame* frame, const uint8_t* bo
     }
 
     return trevrpc_copy_bytes(&frame->body, &frame->body_len, body, body_len);
+}
+
+int trevrpc_stream_frame_set_status(trevrpc_stream_frame* frame, trevrpc_status status) {
+    if (frame == NULL) {
+        return -EINVAL;
+    }
+
+    int err = trevrpc_stream_frame_set_message(frame, status.message, status.message_len);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_stream_frame_set_body(frame, NULL, 0);
+    if (err != 0) {
+        return err;
+    }
+    frame->kind = TREVRPC_STREAM_FRAME_KIND_STATUS;
+    frame->status = trevrpc_status_code_from_uint32(status.code);
+    return 0;
 }
 
 void trevrpc_stream_frame_reset(trevrpc_stream_frame* frame) {

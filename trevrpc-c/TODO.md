@@ -34,7 +34,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 ## Error And Status Mapping
 
 - Audit C status/error mapping against Go `StatusFromError` behavior.
-- Add first-class helpers for creating common statuses in C, not only numeric constants.
 - Normalize transport errors from MsQuic and WebTransport into predictable TrevRPC status responses.
 - Add tests for invalid frame, unsupported wire version, unsupported RPC kind, frame too large, handler failure, transport close, and cancellation paths.
 - Decide whether `TREVRPC_ERR_FRAME_TOO_LARGE` should remain a TrevRPC error or map directly to transport-specific frame-too-large codes internally.
