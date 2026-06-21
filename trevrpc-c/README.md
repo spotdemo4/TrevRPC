@@ -93,6 +93,10 @@ The current C runtime keeps ownership explicit and mostly allocates at API bound
 
 Additional pooling is intentionally limited to the MsQuic send pool for now. Reusing decode/request buffers would couple ownership to callback lifetimes and concurrency; add pools only where lifetime and thread ownership are explicit.
 
+Zero-copy decode is intentionally not exposed in the public API yet. Current decode helpers return owned request, response, metadata, and stream-frame values so handlers can safely retain data for the duration of a callback without depending on transport buffer lifetime. A future zero-copy path should be a separate API with explicit borrowed lifetimes, not a silent behavior change to existing decode helpers.
+
+Send batching is currently transport-local. The low-level MsQuic wrapper has `trevrpc_msquic_stream_write_message_frames` for callers that already own a batch and can provide stable buffers. The high-level runtime still sends one framed message per API call to keep ordering, error reporting, and stream-status behavior predictable across MsQuic and WebTransport. Add high-level batching only after both transports expose equivalent completion semantics.
+
 ## Ownership
 
 All setters that accept message/body/metadata bytes copy their inputs. Callers may release or mutate their input buffers immediately after a successful setter call.

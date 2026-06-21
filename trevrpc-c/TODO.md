@@ -32,7 +32,4 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Performance
 
-- Add zero-copy decode paths where ownership can be made explicit and safe.
-- Add send batching decisions equivalent to Go's non-blocking stream batching.
-
 ## API Cleanup
