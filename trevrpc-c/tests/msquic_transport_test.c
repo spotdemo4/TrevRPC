@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifndef TREVRPC_MSQUIC_TEST_CERT
 #define TREVRPC_MSQUIC_TEST_CERT ""
@@ -61,6 +62,12 @@ typedef struct wt_accept_args {
     int result;
 } wt_accept_args;
 
+typedef struct wt_stream_args {
+    trevrpc_wt_session* session;
+    trevrpc_wt_stream* stream;
+    int result;
+} wt_stream_args;
+
 static const trevrpc_msquic_config test_config = {
     .alpn = "trevrpc",
     .alpn_len = 7,
@@ -84,6 +91,12 @@ static void* accept_stream_thread(void* arg) {
 static void* accept_wt_session_thread(void* arg) {
     wt_accept_args* args = arg;
     args->result = trevrpc_wt_listener_accept_session(args->listener, &args->session);
+    return NULL;
+}
+
+static void* accept_wt_stream_thread(void* arg) {
+    wt_stream_args* args = arg;
+    args->result = trevrpc_wt_session_accept_stream(args->session, &args->stream);
     return NULL;
 }
 
@@ -220,9 +233,17 @@ static int test_webtransport_connects_h3_quic_session(void) {
     trevrpc_wt_listener* listener = NULL;
     trevrpc_wt_session* client_session = NULL;
     wt_accept_args args = {0};
+    wt_stream_args stream_args = {0};
     pthread_t thread = {0};
+    pthread_t stream_thread = {0};
     bool thread_started = false;
+    bool stream_thread_started = false;
+    trevrpc_wt_stream* client_stream = NULL;
+    uint8_t* body = NULL;
+    size_t body_len = 0;
     uint16_t port = 0;
+    const uint8_t request[] = {0, 0, 0, 7, 0x22, 5, 'h', 'e', 'l', 'l', 'o'};
+    const uint8_t response[] = {0, 0, 0, 7, 0x22, 5, 'w', 'o', 'r', 'l', 'd'};
     trevrpc_wt_config server_config = {
         .host = "127.0.0.1",
         .path = "/trevrpc",
@@ -253,13 +274,42 @@ static int test_webtransport_connects_h3_quic_session(void) {
     CHECK_GOTO(args.result == 0);
     CHECK_GOTO(args.session != NULL);
 
-    trevrpc_wt_stream* stream = NULL;
-    CHECK_GOTO(trevrpc_wt_session_open_stream(client_session, &stream) == TREV_WT_ERR_REJECTED);
-    CHECK_GOTO(stream == NULL);
+    stream_args.session = args.session;
+    CHECK_GOTO(pthread_create(&stream_thread, NULL, accept_wt_stream_thread, &stream_args) == 0);
+    stream_thread_started = true;
+    CHECK_EQ_GOTO(trevrpc_wt_session_open_stream(client_session, &client_stream), 0);
+    CHECK_GOTO(pthread_join(stream_thread, NULL) == 0);
+    stream_thread_started = false;
+    CHECK_EQ_GOTO(stream_args.result, 0);
+    CHECK_GOTO(stream_args.stream != NULL);
+
+    CHECK_EQ_GOTO(trevrpc_wt_stream_write(client_stream, request, sizeof(request)), (int)sizeof(request));
+    CHECK_EQ_GOTO(trevrpc_wt_stream_read_frame(stream_args.stream, &body, &body_len, 1024), 1);
+    CHECK_GOTO(body_len == 7);
+    CHECK_GOTO(body[0] == 0x22);
+    CHECK_GOTO(body[1] == 5);
+    CHECK_GOTO(memcmp(body + 2, "hello", 5) == 0);
+    trevrpc_wt_free(body);
+    body = NULL;
+    body_len = 0;
+
+    CHECK_EQ_GOTO(trevrpc_wt_stream_write(stream_args.stream, response, sizeof(response)), (int)sizeof(response));
+    CHECK_EQ_GOTO(trevrpc_wt_stream_read_frame(client_stream, &body, &body_len, 1024), 1);
+    CHECK_GOTO(body_len == 7);
+    CHECK_GOTO(body[0] == 0x22);
+    CHECK_GOTO(body[1] == 5);
+    CHECK_GOTO(memcmp(body + 2, "world", 5) == 0);
 
     result = 0;
 
 cleanup:
+    trevrpc_wt_free(body);
+    if (stream_thread_started) {
+        trevrpc_wt_session_close(args.session);
+        (void)pthread_join(stream_thread, NULL);
+    }
+    trevrpc_wt_stream_close(stream_args.stream);
+    trevrpc_wt_stream_close(client_stream);
     if (thread_started) {
         trevrpc_wt_listener_shutdown(listener);
         (void)pthread_join(thread, NULL);
