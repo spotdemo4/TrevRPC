@@ -31,49 +31,100 @@
 
         # nix develop [#...]
         devShells = {
-          default = pkgs.mkShell {
-            RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
-            shellHook = pkgs.shellhook.ref;
-            packages = with pkgs; [
-              # rust
-              rustc
-              cargo
+          default =
+            let
+              libwtf = pkgs.stdenv.mkDerivation {
+                pname = "libwtf";
+                version = "0.0.0-unstable-2026-06-14";
 
-              # go
-              go
-              gopls
-              gotools
-              protobuf
+                src = pkgs.fetchgit {
+                  url = "https://github.com/andrewmd5/libwtf";
+                  rev = "d5bad1c31256b292d7f7c9f932b4afc761e096f6";
+                  fetchSubmodules = true;
+                  hash = "sha256-KJ/XrM7TSvHzEpICB2utFUNY0dHbSCkSswgvhfJ+d5Q=";
+                };
 
-              # c
-              cmake
-              gcc
-              openssl
-              pkg-config
-              protobufc
+                nativeBuildInputs = with pkgs; [
+                  cmake
+                  perl
+                  pkg-config
+                ];
+                buildInputs = with pkgs; [
+                  openssl
+                ];
 
-              # javascript
-              nodejs_24
+                postPatch = ''
+                  patchShebangs msquic/submodules/openssl msquic/submodules/quictls
+                '';
 
-              # lint
-              clippy
-              cargo-audit
-              go-tools
-              oxlint
-              nixd
-              nil
+                cmakeFlags = [
+                  "-DWTF_BUILD_TESTS=OFF"
+                  "-DWTF_BUILD_SAMPLES=OFF"
+                  "-DWTF_APPLY_BUNDLED_MSQUIC_PATCHES=OFF"
+                  "-DBUILD_SHARED_LIBS=ON"
+                ];
 
-              # format
-              rustfmt
-              nixfmt
-              oxfmt
-              treefmt
+                postInstall = ''
+                  mkdir -p $out/lib/pkgconfig
+                  cp output/libmsquic.so* $out/lib/ 2>/dev/null || true
+                  cat > $out/lib/pkgconfig/wtf.pc <<EOF
+                  prefix=$out
+                  libdir=$out/lib
+                  includedir=$out/include
 
-              # util
-              bumper
-              fix-hash
-            ];
-          };
+                  Name: wtf
+                  Description: WebTransport over HTTP/3 built on MsQuic
+                  Version: 0.0.0
+                  Cflags: -I$out/include
+                  Libs: -L$out/lib -lwtf -lmsquic -lpthread -lm -lrt -lcrypto
+                  EOF
+                '';
+              };
+            in
+            pkgs.mkShell {
+              RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
+              shellHook = pkgs.shellhook.ref;
+              packages = with pkgs; [
+                # rust
+                rustc
+                cargo
+
+                # go
+                go
+                gopls
+                gotools
+                protobuf
+
+                # c
+                cmake
+                gcc
+                openssl
+                pkg-config
+                protobufc
+                libwtf
+
+                # javascript
+                nodejs_24
+
+                # lint
+                clippy
+                cargo-audit
+                go-tools
+                oxlint
+                nixd
+                nil
+
+                # format
+                rustfmt
+                nixfmt
+                oxfmt
+                treefmt
+
+                # util
+                bumper
+                fix-hash
+              ];
+            };
 
           bump = pkgs.mkShell {
             packages = with pkgs; [
