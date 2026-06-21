@@ -127,7 +127,8 @@ static int streaming_handler(
     return trevrpc_stream_send_status(stream, TREVRPC_STATUS_OK, NULL, 0);
 }
 
-static int run_bench_case(trevrpc_server* server, const uint8_t* frame, size_t frame_len, size_t iterations) {
+static int run_bench_case(
+    trevrpc_server* server, const char* name, const uint8_t* frame, size_t frame_len, size_t iterations) {
     uint64_t start = monotonic_nanos();
     for (size_t i = 0; i < iterations; i++) {
         trevrpc_msquic_stream stream;
@@ -136,7 +137,7 @@ static int run_bench_case(trevrpc_server* server, const uint8_t* frame, size_t f
         trevrpc_test_server_handle_stream(server, &stream);
         reset_raw_stream(&stream);
     }
-    print_rate("runtime dispatch", iterations, monotonic_nanos() - start);
+    print_rate(name, iterations, monotonic_nanos() - start);
     return 0;
 }
 
@@ -165,7 +166,7 @@ int main(int argc, char** argv) {
               TREVRPC_DEFAULT_MAX_FRAME_SIZE,
               &frame,
               &frame_len) == 0);
-    CHECK(run_bench_case(server, frame, frame_len, iterations) == 0);
+    CHECK(run_bench_case(server, "runtime unary dispatch", frame, frame_len, iterations) == 0);
     free(frame);
 
     CHECK(trevrpc_wire_encode_request("bench.Service",
@@ -178,7 +179,7 @@ int main(int argc, char** argv) {
               TREVRPC_DEFAULT_MAX_FRAME_SIZE,
               &frame,
               &frame_len) == 0);
-    CHECK(run_bench_case(server, frame, frame_len, iterations) == 0);
+    CHECK(run_bench_case(server, "runtime server-stream dispatch", frame, frame_len, iterations) == 0);
 
     free(frame);
     trevrpc_server_close(server);
