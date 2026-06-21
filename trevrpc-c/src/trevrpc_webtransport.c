@@ -1,14 +1,19 @@
 #include "trevrpc_webtransport.h"
 
+#include "trevrpc_msquic.h"
+
 #include <errno.h>
 #include <stdlib.h>
 
+#define TREV_WT_H3_ALPN "h3"
+#define TREV_WT_DEFAULT_STREAMS 256
+
 struct trevrpc_wt_listener {
-    int closed;
+    trevrpc_msquic_listener* msquic_listener;
 };
 
 struct trevrpc_wt_session {
-    int closed;
+    trevrpc_msquic_conn* msquic_conn;
 };
 
 struct trevrpc_wt_stream {
@@ -19,12 +24,50 @@ static int trevrpc_wt_unsupported(void) {
     return TREV_WT_ERR_REJECTED;
 }
 
+static trevrpc_msquic_config trevrpc_wt_msquic_config(const trevrpc_wt_config* config) {
+    trevrpc_msquic_config msquic_config = {0};
+    msquic_config.alpn = TREV_WT_H3_ALPN;
+    msquic_config.alpn_len = sizeof(TREV_WT_H3_ALPN) - 1;
+    msquic_config.cert_file = config->cert_file;
+    msquic_config.key_file = config->key_file;
+    msquic_config.max_idle_timeout_ms = config->idle_timeout_ms;
+    msquic_config.peer_bidi_stream_count =
+        config->max_streams_per_session > 0 ? (uint16_t)config->max_streams_per_session : TREV_WT_DEFAULT_STREAMS;
+    return msquic_config;
+}
+
+static int trevrpc_wt_map_msquic_error(int err) {
+    switch (err) {
+    case TREV_MSQUIC_ERR_CLOSED:
+        return TREV_WT_ERR_CLOSED;
+    case TREV_MSQUIC_ERR_FRAME_TOO_LARGE:
+        return TREV_WT_ERR_FRAME_TOO_LARGE;
+    default:
+        return err;
+    }
+}
+
 int trevrpc_wt_listen(const trevrpc_wt_config* config, trevrpc_wt_listener** out_listener) {
-    if (config == NULL || out_listener == NULL) {
+    if (config == NULL || out_listener == NULL || config->host == NULL || config->cert_file == NULL ||
+        config->key_file == NULL) {
         return -EINVAL;
     }
     *out_listener = NULL;
-    return trevrpc_wt_unsupported();
+
+    trevrpc_wt_listener* listener = calloc(1, sizeof(*listener));
+    if (listener == NULL) {
+        return -ENOMEM;
+    }
+
+    trevrpc_msquic_config msquic_config = trevrpc_wt_msquic_config(config);
+    int err = trevrpc_msquic_listen(config->host, config->port, &msquic_config, &listener->msquic_listener);
+    if (err != 0) {
+        free(listener);
+        return trevrpc_wt_map_msquic_error(err);
+    }
+
+    *out_listener = listener;
+    return 0;
 }
 
 int trevrpc_wt_listener_accept_session(trevrpc_wt_listener* listener, trevrpc_wt_session** out_session) {
@@ -32,25 +75,63 @@ int trevrpc_wt_listener_accept_session(trevrpc_wt_listener* listener, trevrpc_wt
         return -EINVAL;
     }
     *out_session = NULL;
-    return listener->closed ? TREV_WT_ERR_CLOSED : trevrpc_wt_unsupported();
+
+    trevrpc_msquic_conn* conn = NULL;
+    int err = trevrpc_msquic_listener_accept(listener->msquic_listener, &conn);
+    if (err != 0) {
+        return trevrpc_wt_map_msquic_error(err);
+    }
+
+    trevrpc_wt_session* session = calloc(1, sizeof(*session));
+    if (session == NULL) {
+        trevrpc_msquic_conn_close(conn);
+        return -ENOMEM;
+    }
+    session->msquic_conn = conn;
+    *out_session = session;
+    return 0;
+}
+
+int trevrpc_wt_listener_port(trevrpc_wt_listener* listener, uint16_t* out_port) {
+    if (listener == NULL || out_port == NULL) {
+        return -EINVAL;
+    }
+    return trevrpc_wt_map_msquic_error(trevrpc_msquic_listener_port(listener->msquic_listener, out_port));
 }
 
 void trevrpc_wt_listener_shutdown(trevrpc_wt_listener* listener) {
     if (listener != NULL) {
-        listener->closed = 1;
+        trevrpc_msquic_listener_shutdown(listener->msquic_listener);
     }
 }
 
 void trevrpc_wt_listener_close(trevrpc_wt_listener* listener) {
+    if (listener != NULL) {
+        trevrpc_msquic_listener_close(listener->msquic_listener);
+    }
     free(listener);
 }
 
 int trevrpc_wt_dial(const trevrpc_wt_config* config, trevrpc_wt_session** out_session) {
-    if (config == NULL || out_session == NULL) {
+    if (config == NULL || out_session == NULL || config->host == NULL) {
         return -EINVAL;
     }
     *out_session = NULL;
-    return trevrpc_wt_unsupported();
+
+    trevrpc_wt_session* session = calloc(1, sizeof(*session));
+    if (session == NULL) {
+        return -ENOMEM;
+    }
+
+    trevrpc_msquic_config msquic_config = trevrpc_wt_msquic_config(config);
+    int err = trevrpc_msquic_dial(config->host, config->port, &msquic_config, &session->msquic_conn);
+    if (err != 0) {
+        free(session);
+        return trevrpc_wt_map_msquic_error(err);
+    }
+
+    *out_session = session;
+    return 0;
 }
 
 int trevrpc_wt_session_accept_stream(trevrpc_wt_session* session, trevrpc_wt_stream** out_stream) {
@@ -58,7 +139,7 @@ int trevrpc_wt_session_accept_stream(trevrpc_wt_session* session, trevrpc_wt_str
         return -EINVAL;
     }
     *out_stream = NULL;
-    return session->closed ? TREV_WT_ERR_CLOSED : trevrpc_wt_unsupported();
+    return session->msquic_conn == NULL ? TREV_WT_ERR_CLOSED : trevrpc_wt_unsupported();
 }
 
 int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_stream** out_stream) {
@@ -66,12 +147,12 @@ int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_strea
         return -EINVAL;
     }
     *out_stream = NULL;
-    return session->closed ? TREV_WT_ERR_CLOSED : trevrpc_wt_unsupported();
+    return session->msquic_conn == NULL ? TREV_WT_ERR_CLOSED : trevrpc_wt_unsupported();
 }
 
 void trevrpc_wt_session_close(trevrpc_wt_session* session) {
     if (session != NULL) {
-        session->closed = 1;
+        trevrpc_msquic_conn_close(session->msquic_conn);
         free(session);
     }
 }

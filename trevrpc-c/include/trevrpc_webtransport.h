@@ -36,6 +36,7 @@ typedef struct trevrpc_wt_config {
 } trevrpc_wt_config;
 
 int trevrpc_wt_listen(const trevrpc_wt_config* config, trevrpc_wt_listener** listener);
+int trevrpc_wt_listener_port(trevrpc_wt_listener* listener, uint16_t* port);
 int trevrpc_wt_listener_accept_session(trevrpc_wt_listener* listener, trevrpc_wt_session** session);
 void trevrpc_wt_listener_shutdown(trevrpc_wt_listener* listener);
 void trevrpc_wt_listener_close(trevrpc_wt_listener* listener);

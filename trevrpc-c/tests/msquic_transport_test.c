@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc_msquic.h"
+#include "trevrpc_webtransport.h"
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -36,6 +37,12 @@ typedef struct stream_args {
     int result;
 } stream_args;
 
+typedef struct wt_accept_args {
+    trevrpc_wt_listener* listener;
+    trevrpc_wt_session* session;
+    int result;
+} wt_accept_args;
+
 static const trevrpc_msquic_config test_config = {
     .alpn = "trevrpc",
     .alpn_len = 7,
@@ -53,6 +60,12 @@ static void* accept_conn_thread(void* arg) {
 static void* accept_stream_thread(void* arg) {
     stream_args* args = arg;
     args->result = trevrpc_msquic_conn_accept_stream(args->conn, &args->stream);
+    return NULL;
+}
+
+static void* accept_wt_session_thread(void* arg) {
+    wt_accept_args* args = arg;
+    args->result = trevrpc_wt_listener_accept_session(args->listener, &args->session);
     return NULL;
 }
 
@@ -184,11 +197,65 @@ cleanup:
     return result;
 }
 
+static int test_webtransport_connects_h3_quic_session(void) {
+    int result = 1;
+    trevrpc_wt_listener* listener = NULL;
+    trevrpc_wt_session* client_session = NULL;
+    wt_accept_args args = {0};
+    pthread_t thread = {0};
+    bool thread_started = false;
+    uint16_t port = 0;
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+    };
+
+    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
+    CHECK_GOTO(trevrpc_wt_listener_port(listener, &port) == 0);
+    CHECK_GOTO(port != 0);
+    args.listener = listener;
+    CHECK_GOTO(pthread_create(&thread, NULL, accept_wt_session_thread, &args) == 0);
+    thread_started = true;
+
+    trevrpc_wt_config client_config = {
+        .host = "127.0.0.1",
+        .port = port,
+        .skip_certificate_validation = 1,
+        .max_streams_per_session = 8,
+    };
+    CHECK_GOTO(trevrpc_wt_dial(&client_config, &client_session) == 0);
+    CHECK_GOTO(pthread_join(thread, NULL) == 0);
+    thread_started = false;
+    CHECK_GOTO(args.result == 0);
+    CHECK_GOTO(args.session != NULL);
+
+    trevrpc_wt_stream* stream = NULL;
+    CHECK_GOTO(trevrpc_wt_session_open_stream(client_session, &stream) == TREV_WT_ERR_REJECTED);
+    CHECK_GOTO(stream == NULL);
+
+    result = 0;
+
+cleanup:
+    if (thread_started) {
+        trevrpc_wt_listener_shutdown(listener);
+        (void)pthread_join(thread, NULL);
+    }
+    trevrpc_wt_session_close(args.session);
+    trevrpc_wt_session_close(client_session);
+    trevrpc_wt_listener_close(listener);
+    return result;
+}
+
 int main(void) {
     if (test_stream_reset_unblocks_peer_read() != 0) {
         return 1;
     }
     if (test_client_close_unblocks_server_accept_stream() != 0) {
+        return 1;
+    }
+    if (test_webtransport_connects_h3_quic_session() != 0) {
         return 1;
     }
     return 0;

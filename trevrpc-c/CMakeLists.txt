@@ -243,7 +243,7 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
-        target_link_libraries(trevrpc_msquic_transport_test PRIVATE trevrpc_msquic)
+        target_link_libraries(trevrpc_msquic_transport_test PRIVATE trevrpc_msquic trevrpc_webtransport)
         trevrpc_c_warnings(trevrpc_msquic_transport_test)
         trevrpc_c_sanitizers(trevrpc_msquic_transport_test)
 
