@@ -25,16 +25,16 @@ func BenchmarkRPCComparisonNativeMsQuic(b *testing.B) {
 	client := startTrevRPCNativeMsQuicComparisonClient(b)
 	warmTrevRPCNativeMsQuicComparisonClient(b, client)
 
-	b.Run("unary_round_trip/trevrpc_msquic_native", func(b *testing.B) {
+	b.Run("unary_round_trip/trevrpc_msquic", func(b *testing.B) {
 		benchmarkTrevRPCUnary(b, client)
 	})
-	b.Run("server_stream_16_messages/trevrpc_msquic_native", func(b *testing.B) {
+	b.Run("server_stream_16_messages/trevrpc_msquic", func(b *testing.B) {
 		benchmarkTrevRPCServerStreaming(b, client)
 	})
-	b.Run("client_stream_16_messages/trevrpc_msquic_native", func(b *testing.B) {
+	b.Run("client_stream_16_messages/trevrpc_msquic", func(b *testing.B) {
 		benchmarkTrevRPCClientStreaming(b, client)
 	})
-	b.Run("bidi_stream_16_messages/trevrpc_msquic_native", func(b *testing.B) {
+	b.Run("bidi_stream_16_messages/trevrpc_msquic", func(b *testing.B) {
 		benchmarkTrevRPCBidiStreaming(b, client)
 	})
 }

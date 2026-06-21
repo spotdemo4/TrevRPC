@@ -21,7 +21,7 @@ CMAKE_BUILD_DIR=${CMAKE_BUILD_DIR:-"$OUT_DIR/c-build"}
 
 RUN_C=${RUN_C:-1}
 RUN_GO=${RUN_GO:-1}
-RUN_GO_NATIVE_MSQUIC=${RUN_GO_NATIVE_MSQUIC:-0}
+RUN_GO_NATIVE_MSQUIC=${RUN_GO_NATIVE_MSQUIC:-1}
 RUN_RUST=${RUN_RUST:-1}
 
 usage() {
@@ -42,14 +42,14 @@ Environment knobs:
   RUST_MEASUREMENT_TIME   Criterion measurement seconds. Default: 10
   CMAKE_BUILD_TYPE        CMake build type for C benchmarks. Default: Release
   RUN_C                   Run C benchmark. Default: 1
-  RUN_GO                  Run Go quic-go/local/grpc benchmark. Default: 1
-  RUN_GO_NATIVE_MSQUIC    Run Go native-CGO MsQuic benchmark. Default: 0
+  RUN_GO                  Run Go quic-go/grpc benchmark. Default: 1
+  RUN_GO_NATIVE_MSQUIC    Run Go native-CGO MsQuic benchmark. Default: 1
   RUN_RUST                Run Rust Criterion benchmark. Default: 1
 
 Examples:
   bench/run_rpc_comparison.sh
   RPC_ITERATIONS=1000 RUST_SAMPLE_SIZE=20 RUST_MEASUREMENT_TIME=3 bench/run_rpc_comparison.sh
-  RUN_GO_NATIVE_MSQUIC=1 bench/run_rpc_comparison.sh
+  RUN_GO_NATIVE_MSQUIC=0 bench/run_rpc_comparison.sh
 EOF
 }
 
@@ -231,7 +231,7 @@ EOF
 
 These rows use the same four RPC shapes: unary, server streaming with 16 response messages, client streaming with 16 request messages, and bidirectional streaming with 16 request/response messages.
 
-Compare rows with the same shape first. Transport implementations differ: C uses native MsQuic and WebTransport, Go uses quic-go plus optional native-CGO MsQuic, and Rust uses Quinn. gRPC rows are included as language-local baselines, not identical transports.
+Compare rows with the same shape first. Transport implementations differ: C uses native MsQuic and WebTransport, Go uses quic-go plus native-CGO MsQuic by default, and Rust uses Quinn. gRPC rows are included as language-local baselines, not identical transports.
 
 Raw command output is saved under \`$RAW_DIR\`. The exact commands are saved in \`$COMMAND_LOG\`.
 EOF
