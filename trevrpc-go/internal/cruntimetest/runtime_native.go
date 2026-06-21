@@ -9,6 +9,8 @@ package cruntimetest
 #include <stdint.h>
 #include <stdlib.h>
 #include "trevrpc_msquic.c"
+#include "trevrpc_values.c"
+#include "trevrpc_wire.c"
 #include "trevrpc.c"
 
 static int trevrpc_c_echo_handler(void* user_data, const trevrpc_request* request, trevrpc_response* response) {

@@ -309,6 +309,29 @@
             '';
           };
 
+          c-tests = pkgs.stdenv.mkDerivation {
+            pname = "trevrpc-c-tests";
+            version = "0.1.0";
+            src = ./trevrpc-c;
+            nativeBuildInputs = with pkgs; [
+              cmake
+            ];
+            cmakeFlags = [
+              "-DTREVRPC_BUILD_TESTS=ON"
+            ];
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              ctest --output-on-failure
+              runHook postCheck
+            '';
+            installPhase = ''
+              runHook preInstall
+              touch $out
+              runHook postInstall
+            '';
+          };
+
           cross-runtime =
             let
               crossRuntimeGo = pkgs.buildGoModule (final: {

@@ -42,6 +42,7 @@ extern "C" {
 #define TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION -2002
 #define TREVRPC_ERR_UNSUPPORTED_RPC_KIND -2003
 #define TREVRPC_ERR_HANDLER_FAILED -2004
+#define TREVRPC_ERR_FRAME_TOO_LARGE -2005
 
 typedef struct trevrpc_client trevrpc_client;
 typedef struct trevrpc_server trevrpc_server;
