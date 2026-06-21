@@ -7,9 +7,11 @@ OUT_DIR=${OUT_DIR:-"$ROOT/target/rpc-comparison"}
 RAW_DIR="$OUT_DIR/raw"
 COMMAND_LOG="$OUT_DIR/commands.txt"
 CSV="$OUT_DIR/rpc-comparison.csv"
+SAMPLES_CSV="$OUT_DIR/rpc-comparison-samples.csv"
 MARKDOWN="$OUT_DIR/rpc-comparison.md"
 
 RPC_ITERATIONS=${RPC_ITERATIONS:-10000}
+RPC_RUNS=${RPC_RUNS:-3}
 C_ITERATIONS=${C_ITERATIONS:-$RPC_ITERATIONS}
 GO_BENCHTIME=${GO_BENCHTIME:-${RPC_ITERATIONS}x}
 GO_COUNT=${GO_COUNT:-1}
@@ -34,9 +36,10 @@ and writes normalized CSV/Markdown reports.
 Environment knobs:
   OUT_DIR                 Output directory. Default: target/rpc-comparison
   RPC_ITERATIONS          Shared fixed iteration count for C and Go. Default: 10000
+  RPC_RUNS                Measurement command repetitions. Default: 3
   C_ITERATIONS            C benchmark iterations. Default: RPC_ITERATIONS
   GO_BENCHTIME            Go -benchtime value. Default: ${RPC_ITERATIONS}x
-  GO_COUNT                Go -count value. Default: 1
+  GO_COUNT                Go -count value per RPC_RUNS repetition. Default: 1
   RUST_SAMPLE_SIZE        Criterion sample size. Default: 100
   RUST_WARM_UP_TIME       Criterion warm-up seconds. Default: 3
   RUST_MEASUREMENT_TIME   Criterion measurement seconds. Default: 10
@@ -48,7 +51,7 @@ Environment knobs:
 
 Examples:
   bench/run_rpc_comparison.sh
-  RPC_ITERATIONS=1000 RUST_SAMPLE_SIZE=20 RUST_MEASUREMENT_TIME=3 bench/run_rpc_comparison.sh
+  RPC_ITERATIONS=1000 RPC_RUNS=1 RUST_SAMPLE_SIZE=20 RUST_MEASUREMENT_TIME=3 bench/run_rpc_comparison.sh
   RUN_GO_NATIVE_MSQUIC=0 bench/run_rpc_comparison.sh
 EOF
 }
@@ -60,7 +63,19 @@ fi
 
 mkdir -p "$RAW_DIR"
 : >"$COMMAND_LOG"
-printf 'language,shape,implementation,latency_us,throughput_ops_s,iterations_or_samples,elapsed_s,alloc_bytes_per_op,allocs_per_op,source\n' >"$CSV"
+rm -f "$RAW_DIR"/*.txt
+printf 'run,language,shape,implementation,latency_us,throughput_ops_s,iterations_or_samples,elapsed_s,alloc_bytes_per_op,allocs_per_op,source\n' >"$SAMPLES_CSV"
+
+require_positive_integer() {
+    local name=$1
+    local value=$2
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s must be a positive integer, got %q\n' "$name" "$value" >&2
+        exit 2
+    fi
+}
+
+require_positive_integer RPC_RUNS "$RPC_RUNS"
 
 quote_command() {
     printf '%q ' "$@"
@@ -82,7 +97,8 @@ run_and_capture() {
 
 append_c_csv() {
     local raw_file=$1
-    awk -v source="c-custom" -F '' '
+    local run=$2
+    awk -v source="c-custom" -v run="$run" -F '' '
         match($0, /^([^:]+):[[:space:]]+([0-9.]+) ops\/s \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
             split(m[1], name, "/")
             if (length(name) != 2) {
@@ -90,14 +106,15 @@ append_c_csv() {
             }
             ops = m[2] + 0
             latency_us = ops > 0 ? 1000000.0 / ops : 0
-            printf "c,%s,%s,%.3f,%.3f,%s,%s,,,%s\n", name[1], name[2], latency_us, ops, m[3], m[4], source
+            printf "%s,c,%s,%s,%.3f,%.3f,%s,%s,,,%s\n", run, name[1], name[2], latency_us, ops, m[3], m[4], source
         }
-    ' "$raw_file" >>"$CSV"
+    ' "$raw_file" >>"$SAMPLES_CSV"
 }
 
 append_go_csv() {
     local raw_file=$1
-    awk -v source="go-testing" '
+    local run=$2
+    awk -v source="go-testing" -v run="$run" '
         /^BenchmarkRPCComparison/ {
             benchmark = $1
             sub(/^BenchmarkRPCComparisonNativeMsQuic\//, "", benchmark)
@@ -127,14 +144,15 @@ append_go_csv() {
             }
             latency_us = ns / 1000.0
             ops = 1000000000.0 / ns
-            printf "go,%s,%s,%.3f,%.3f,%s,,%s,%s,%s\n", name[1], name[2], latency_us, ops, $2, bytes, allocs, source
+            printf "%s,go,%s,%s,%.3f,%.3f,%s,,%s,%s,%s\n", run, name[1], name[2], latency_us, ops, $2, bytes, allocs, source
         }
-    ' "$raw_file" >>"$CSV"
+    ' "$raw_file" >>"$SAMPLES_CSV"
 }
 
 append_rust_csv() {
     local raw_file=$1
-    awk -v source="criterion" -v samples="$RUST_SAMPLE_SIZE" '
+    local run=$2
+    awk -v source="criterion" -v samples="$RUST_SAMPLE_SIZE" -v run="$run" '
         function clean(value) {
             gsub(/[\[\]]/, "", value)
             return value
@@ -173,10 +191,93 @@ append_rust_csv() {
                 next
             }
             ops = 1000000.0 / latency_us
-            printf "rust,%s,%s,%.3f,%.3f,%s,,,,%s\n", name[1], name[2], latency_us, ops, samples, source
+            printf "%s,rust,%s,%s,%.3f,%.3f,%s,,,,%s\n", run, name[1], name[2], latency_us, ops, samples, source
             current = ""
         }
-    ' "$raw_file" >>"$CSV"
+    ' "$raw_file" >>"$SAMPLES_CSV"
+}
+
+aggregate_samples_csv() {
+    awk -F, '
+        function append(values, value) {
+            return values == "" ? value : values " " value
+        }
+        function median(values,    a, n) {
+            if (values == "") {
+                return ""
+            }
+            n = split(values, a, " ")
+            asort(a)
+            if (n % 2 == 1) {
+                return a[(n + 1) / 2] + 0
+            }
+            return (a[n / 2] + a[n / 2 + 1]) / 2
+        }
+        function format_optional_integer(value) {
+            return value == "" ? "" : sprintf("%.0f", value + 0)
+        }
+        BEGIN {
+            print "language,shape,implementation,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_ops_s,iterations_or_samples_per_measurement,elapsed_s_total,alloc_bytes_per_op_median,allocs_per_op_median,source"
+        }
+        NR == 1 {
+            next
+        }
+        {
+            key = $2 SUBSEP $3 SUBSEP $4
+            if (!(key in seen)) {
+                seen[key] = 1
+                order[++order_count] = key
+                language[key] = $2
+                shape[key] = $3
+                implementation[key] = $4
+                source[key] = $11
+            }
+
+            measurements[key]++
+            latencies[key] = append(latencies[key], $5)
+            iterations[key] = append(iterations[key], $7)
+
+            if (!(key in latency_min) || $5 + 0 < latency_min[key]) {
+                latency_min[key] = $5 + 0
+            }
+            if (!(key in latency_max) || $5 + 0 > latency_max[key]) {
+                latency_max[key] = $5 + 0
+            }
+            if ($8 != "") {
+                elapsed_seen[key] = 1
+                elapsed_total[key] += $8
+            }
+            if ($9 != "") {
+                bytes[key] = append(bytes[key], $9)
+            }
+            if ($10 != "") {
+                allocs[key] = append(allocs[key], $10)
+            }
+        }
+        END {
+            for (i = 1; i <= order_count; i++) {
+                key = order[i]
+                latency = median(latencies[key])
+                throughput = latency > 0 ? 1000000.0 / latency : 0
+                iteration_count = median(iterations[key])
+                elapsed = (key in elapsed_seen) ? sprintf("%.3f", elapsed_total[key]) : ""
+                printf "%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.0f,%s,%s,%s,%s\n", \
+                    language[key], \
+                    shape[key], \
+                    implementation[key], \
+                    measurements[key], \
+                    latency, \
+                    latency_min[key], \
+                    latency_max[key], \
+                    throughput, \
+                    iteration_count, \
+                    elapsed, \
+                    format_optional_integer(median(bytes[key])), \
+                    format_optional_integer(median(allocs[key])), \
+                    source[key]
+            }
+        }
+    ' "$SAMPLES_CSV" >"$CSV"
 }
 
 write_markdown_report() {
@@ -195,6 +296,7 @@ Generated: $generated_at
 | --- | --- |
 | Output directory | \`$OUT_DIR\` |
 | C iterations | \`$C_ITERATIONS\` |
+| RPC runs | \`$RPC_RUNS\` |
 | Go benchtime | \`$GO_BENCHTIME\` |
 | Go count | \`$GO_COUNT\` |
 | Rust sample size | \`$RUST_SAMPLE_SIZE\` |
@@ -217,12 +319,12 @@ Generated: $generated_at
 
 ## Results
 
-| Language | Shape | Implementation | Latency us/op | Throughput ops/s | Iterations/Samples | B/op | Allocs/op | Source |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Language | Shape | Implementation | Measurements | Median latency us/op | Latency min..max us/op | Median throughput ops/s | Iterations/Samples per measurement | B/op | Allocs/op | Source |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 EOF
 
         awk -F, 'NR > 1 {
-            printf "| `%s` | `%s` | `%s` | %.3f | %.0f | %s | %s | %s | `%s` |\n", $1, $2, $3, $4, $5, $6, ($8 == "" ? "" : $8), ($9 == "" ? "" : $9), $10
+            printf "| `%s` | `%s` | `%s` | %s | %.3f | %.3f..%.3f | %.0f | %s | %s | %s | `%s` |\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, ($11 == "" ? "" : $11), ($12 == "" ? "" : $12), $13
         }' "$CSV"
 
         cat <<EOF
@@ -231,9 +333,11 @@ EOF
 
 These rows use the same four RPC shapes: unary, server streaming with 16 response messages, client streaming with 16 request messages, and bidirectional streaming with 16 request/response messages.
 
+Reported latency is the median across measurements. The min..max column shows the observed latency range across repeated measurements. Rust measurements also include Criterion sampling within each repeated command.
+
 Compare rows with the same shape first. Transport implementations differ: C uses native MsQuic and WebTransport, Go uses quic-go plus native-CGO MsQuic by default, and Rust uses Quinn. gRPC rows are included as language-local baselines, not identical transports.
 
-Raw command output is saved under \`$RAW_DIR\`. The exact commands are saved in \`$COMMAND_LOG\`.
+Raw command output is saved under \`$RAW_DIR\`. Per-measurement normalized rows are saved in \`$SAMPLES_CSV\`. The exact commands are saved in \`$COMMAND_LOG\`.
 EOF
     } >"$MARKDOWN"
 }
@@ -243,27 +347,37 @@ cd "$ROOT"
 if [[ "$RUN_C" == "1" ]]; then
     run_and_capture c-configure cmake -S trevrpc-c -B "$CMAKE_BUILD_DIR" -DTREVRPC_BUILD_TESTS=OFF -DTREVRPC_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
     run_and_capture c-build cmake --build "$CMAKE_BUILD_DIR" --target trevrpc_rpc_comparison_bench
-    run_and_capture c-rpc-comparison "$CMAKE_BUILD_DIR/trevrpc_rpc_comparison_bench" "$C_ITERATIONS"
-    append_c_csv "$RAW_DIR/c-rpc-comparison.txt"
+    for ((run = 1; run <= RPC_RUNS; run++)); do
+        run_and_capture "c-rpc-comparison-run-$run" "$CMAKE_BUILD_DIR/trevrpc_rpc_comparison_bench" "$C_ITERATIONS"
+        append_c_csv "$RAW_DIR/c-rpc-comparison-run-$run.txt" "$run"
+    done
 fi
 
 if [[ "$RUN_GO" == "1" ]]; then
-    run_and_capture go-rpc-comparison go test -C trevrpc-go -run '^$' -bench '^BenchmarkRPCComparison$' -benchmem -count="$GO_COUNT" -benchtime="$GO_BENCHTIME"
-    append_go_csv "$RAW_DIR/go-rpc-comparison.txt"
+    for ((run = 1; run <= RPC_RUNS; run++)); do
+        run_and_capture "go-rpc-comparison-run-$run" go test -C trevrpc-go -run '^$' -bench '^BenchmarkRPCComparison$' -benchmem -count="$GO_COUNT" -benchtime="$GO_BENCHTIME"
+        append_go_csv "$RAW_DIR/go-rpc-comparison-run-$run.txt" "$run"
+    done
 fi
 
 if [[ "$RUN_GO_NATIVE_MSQUIC" == "1" ]]; then
-    run_and_capture go-native-msquic-rpc-comparison go test -C trevrpc-go -tags trevrpc_msquic_native -run '^$' -bench '^BenchmarkRPCComparisonNativeMsQuic$' -benchmem -count="$GO_COUNT" -benchtime="$GO_BENCHTIME"
-    append_go_csv "$RAW_DIR/go-native-msquic-rpc-comparison.txt"
+    for ((run = 1; run <= RPC_RUNS; run++)); do
+        run_and_capture "go-native-msquic-rpc-comparison-run-$run" go test -C trevrpc-go -tags trevrpc_msquic_native -run '^$' -bench '^BenchmarkRPCComparisonNativeMsQuic$' -benchmem -count="$GO_COUNT" -benchtime="$GO_BENCHTIME"
+        append_go_csv "$RAW_DIR/go-native-msquic-rpc-comparison-run-$run.txt" "$run"
+    done
 fi
 
 if [[ "$RUN_RUST" == "1" ]]; then
-    run_and_capture rust-rpc-comparison cargo bench --manifest-path trevrpc-rust/Cargo.toml --bench rpc_comparison -- --sample-size "$RUST_SAMPLE_SIZE" --warm-up-time "$RUST_WARM_UP_TIME" --measurement-time "$RUST_MEASUREMENT_TIME"
-    append_rust_csv "$RAW_DIR/rust-rpc-comparison.txt"
+    for ((run = 1; run <= RPC_RUNS; run++)); do
+        run_and_capture "rust-rpc-comparison-run-$run" cargo bench --manifest-path trevrpc-rust/Cargo.toml --bench rpc_comparison -- --sample-size "$RUST_SAMPLE_SIZE" --warm-up-time "$RUST_WARM_UP_TIME" --measurement-time "$RUST_MEASUREMENT_TIME"
+        append_rust_csv "$RAW_DIR/rust-rpc-comparison-run-$run.txt" "$run"
+    done
 fi
 
+aggregate_samples_csv
 write_markdown_report
 
 printf '\nWrote normalized CSV: %s\n' "$CSV"
+printf 'Wrote per-measurement CSV: %s\n' "$SAMPLES_CSV"
 printf 'Wrote Markdown report: %s\n' "$MARKDOWN"
 printf 'Wrote raw outputs: %s\n' "$RAW_DIR"
