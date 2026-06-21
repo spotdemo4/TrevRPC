@@ -274,6 +274,117 @@ cleanup:
     return result;
 }
 
+static int test_decode_invalid_frame_corpus(void) {
+    int result = 1;
+    const uint8_t invalid_varint[] = {0x80};
+    const uint8_t zero_tag[] = {0x00};
+    const uint8_t truncated_string[] = {0x0a, 0x02, 0x61};
+    const uint8_t truncated_nested[] = {0x22, 0x04, 0x0a, 0x03, 0x61};
+    const struct {
+        const char* name;
+        const uint8_t* data;
+        size_t len;
+    } corpus[] = {
+        {"invalid_varint", invalid_varint, sizeof(invalid_varint)},
+        {"zero_tag", zero_tag, sizeof(zero_tag)},
+        {"truncated_string", truncated_string, sizeof(truncated_string)},
+        {"truncated_nested", truncated_nested, sizeof(truncated_nested)},
+    };
+
+    for (size_t i = 0; i < sizeof(corpus) / sizeof(corpus[0]); i++) {
+        trevrpc_request request = {0};
+        trevrpc_response* response = NULL;
+        trevrpc_stream_frame* stream_frame = NULL;
+
+        int err = trevrpc_wire_decode_request(corpus[i].data, corpus[i].len, &request);
+        CHECK_GOTO(err == TREVRPC_ERR_INVALID_FRAME || err == TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION ||
+                   err == TREVRPC_ERR_UNSUPPORTED_RPC_KIND);
+        trevrpc_request_reset(&request);
+
+        err = trevrpc_wire_decode_response(corpus[i].data, corpus[i].len, &response);
+        CHECK_GOTO(err == TREVRPC_ERR_INVALID_FRAME);
+        CHECK_GOTO(response == NULL);
+
+        err = trevrpc_wire_decode_stream_frame(corpus[i].data, corpus[i].len, &stream_frame);
+        CHECK_GOTO(err == TREVRPC_ERR_INVALID_FRAME);
+        CHECK_GOTO(stream_frame == NULL);
+    }
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
+static int test_decode_rejects_truncated_valid_frames(void) {
+    int result = 1;
+    uint8_t* request_frame = NULL;
+    uint8_t* response_frame = NULL;
+    uint8_t* stream_frame = NULL;
+    size_t request_frame_len = 0;
+    size_t response_frame_len = 0;
+    size_t stream_frame_len = 0;
+    uint8_t body[] = {0x01, 0x02, 0x03};
+    trevrpc_response response = {0};
+
+    int err = trevrpc_wire_encode_request(
+        "svc", "method", TREVRPC_RPC_KIND_UNARY, body, sizeof(body), NULL, 0, 1024, &request_frame, &request_frame_len);
+    CHECK_GOTO(err == 0);
+    CHECK_GOTO(trevrpc_response_set_body(&response, body, sizeof(body)) == 0);
+    err = trevrpc_wire_encode_response(&response, 1024, &response_frame, &response_frame_len);
+    CHECK_GOTO(err == 0);
+    err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+        TREVRPC_STATUS_OK,
+        NULL,
+        0,
+        body,
+        sizeof(body),
+        NULL,
+        1024,
+        &stream_frame,
+        &stream_frame_len);
+    CHECK_GOTO(err == 0);
+
+    for (size_t len = 0; len + 1 < request_frame_len - 4; len++) {
+        trevrpc_request decoded = {0};
+        err = trevrpc_wire_decode_request(request_frame + 4, len, &decoded);
+        CHECK_GOTO(err == TREVRPC_ERR_INVALID_FRAME || err == TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION ||
+                   err == TREVRPC_ERR_UNSUPPORTED_RPC_KIND);
+        trevrpc_request_reset(&decoded);
+    }
+
+    for (size_t len = 0; len + 1 < response_frame_len - 4; len++) {
+        trevrpc_response* decoded = NULL;
+        err = trevrpc_wire_decode_response(response_frame + 4, len, &decoded);
+        if (err == 0) {
+            trevrpc_response_free(decoded);
+            continue;
+        }
+        CHECK_GOTO(err != 0);
+        CHECK_GOTO(decoded == NULL);
+    }
+
+    for (size_t len = 0; len + 1 < stream_frame_len - 4; len++) {
+        trevrpc_stream_frame* decoded = NULL;
+        err = trevrpc_wire_decode_stream_frame(stream_frame + 4, len, &decoded);
+        if (err == 0) {
+            trevrpc_stream_frame_free(decoded);
+            continue;
+        }
+        CHECK_GOTO(err != 0);
+        CHECK_GOTO(decoded == NULL);
+    }
+
+    result = 0;
+
+cleanup:
+    trevrpc_response_reset(&response);
+    free(request_frame);
+    free(response_frame);
+    free(stream_frame);
+    return result;
+}
+
 static int test_metadata_validation(void) {
     int result = 1;
     trevrpc_metadata metadata = {0};
@@ -941,6 +1052,12 @@ int main(void) {
         return 1;
     }
     if (test_encode_rejects_oversized_frames() != 0) {
+        return 1;
+    }
+    if (test_decode_invalid_frame_corpus() != 0) {
+        return 1;
+    }
+    if (test_decode_rejects_truncated_valid_frames() != 0) {
         return 1;
     }
     if (test_metadata_validation() != 0) {
