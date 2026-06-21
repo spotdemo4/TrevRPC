@@ -16,10 +16,9 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## WebTransport Integration
 
-- Add high-level `trevrpc_server` support over `trevrpc_wt_*`, not only low-level WebTransport session and stream wrappers.
-- Add WebTransport C server accept/serve integration equivalent to `trevrpc_server_serve`.
-- Replace temporary WebTransport unsupported stubs with internal HTTP/3/WebTransport over MsQuic.
-- Add CTest or integration tests for native WebTransport RPC round trips when the internal implementation is available.
+- Add malformed peer tests for HTTP/3 control streams, SETTINGS, QPACK blocks, and CONNECT headers.
+- Add high-level WebTransport reset and partial-stream failure tests.
+- Investigate sharing one underlying MsQuic listener between native QUIC and WebTransport.
 
 ## Transport And Packaging
 

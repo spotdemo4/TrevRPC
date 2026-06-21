@@ -368,6 +368,179 @@ cleanup:
     return result;
 }
 
+static int test_webtransport_listener_shutdown_unblocks_accept(void) {
+    int result = 1;
+    trevrpc_wt_listener* listener = NULL;
+    wt_accept_args args = {0};
+    pthread_t thread = {0};
+    bool thread_started = false;
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .path = "/trevrpc",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+    };
+
+    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
+    args.listener = listener;
+    CHECK_GOTO(pthread_create(&thread, NULL, accept_wt_session_thread, &args) == 0);
+    thread_started = true;
+    trevrpc_wt_listener_shutdown(listener);
+    CHECK_GOTO(pthread_join(thread, NULL) == 0);
+    thread_started = false;
+    CHECK_GOTO(args.result == TREV_WT_ERR_CLOSED);
+    CHECK_GOTO(args.session == NULL);
+
+    result = 0;
+
+cleanup:
+    if (thread_started) {
+        trevrpc_wt_listener_shutdown(listener);
+        (void)pthread_join(thread, NULL);
+    }
+    trevrpc_wt_session_close(args.session);
+    trevrpc_wt_listener_close(listener);
+    return result;
+}
+
+static int test_webtransport_session_shutdown_unblocks_accept_stream(void) {
+    int result = 1;
+    trevrpc_wt_listener* listener = NULL;
+    trevrpc_wt_session* client_session = NULL;
+    wt_accept_args accept_args = {0};
+    wt_stream_args stream_args = {0};
+    pthread_t accept_thread = {0};
+    pthread_t stream_thread = {0};
+    bool accept_thread_started = false;
+    bool stream_thread_started = false;
+    uint16_t port = 0;
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .path = "/trevrpc",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+    };
+
+    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
+    CHECK_GOTO(trevrpc_wt_listener_port(listener, &port) == 0);
+    accept_args.listener = listener;
+    CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_wt_session_thread, &accept_args) == 0);
+    accept_thread_started = true;
+
+    trevrpc_wt_config client_config = {
+        .host = "127.0.0.1",
+        .port = port,
+        .path = "/trevrpc",
+        .skip_certificate_validation = 1,
+        .max_streams_per_session = 8,
+    };
+    CHECK_EQ_GOTO(trevrpc_wt_dial(&client_config, &client_session), 0);
+    CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
+    accept_thread_started = false;
+    CHECK_EQ_GOTO(accept_args.result, 0);
+    CHECK_GOTO(accept_args.session != NULL);
+
+    stream_args.session = accept_args.session;
+    CHECK_GOTO(pthread_create(&stream_thread, NULL, accept_wt_stream_thread, &stream_args) == 0);
+    stream_thread_started = true;
+    trevrpc_wt_session_shutdown(accept_args.session);
+    CHECK_GOTO(pthread_join(stream_thread, NULL) == 0);
+    stream_thread_started = false;
+    CHECK_EQ_GOTO(stream_args.result, TREV_WT_ERR_CLOSED);
+    CHECK_GOTO(stream_args.stream == NULL);
+
+    result = 0;
+
+cleanup:
+    if (stream_thread_started) {
+        trevrpc_wt_session_shutdown(accept_args.session);
+        (void)pthread_join(stream_thread, NULL);
+    }
+    if (accept_thread_started) {
+        trevrpc_wt_listener_shutdown(listener);
+        (void)pthread_join(accept_thread, NULL);
+    }
+    trevrpc_wt_stream_close(stream_args.stream);
+    trevrpc_wt_session_close(accept_args.session);
+    trevrpc_wt_session_close(client_session);
+    trevrpc_wt_listener_close(listener);
+    return result;
+}
+
+static int test_webtransport_stream_close_unblocks_peer_read(void) {
+    int result = 1;
+    trevrpc_wt_listener* listener = NULL;
+    trevrpc_wt_session* client_session = NULL;
+    trevrpc_wt_stream* client_stream = NULL;
+    wt_accept_args accept_args = {0};
+    wt_stream_args stream_args = {0};
+    pthread_t accept_thread = {0};
+    pthread_t stream_thread = {0};
+    bool accept_thread_started = false;
+    bool stream_thread_started = false;
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    uint16_t port = 0;
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .path = "/trevrpc",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+    };
+
+    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
+    CHECK_GOTO(trevrpc_wt_listener_port(listener, &port) == 0);
+    accept_args.listener = listener;
+    CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_wt_session_thread, &accept_args) == 0);
+    accept_thread_started = true;
+
+    trevrpc_wt_config client_config = {
+        .host = "127.0.0.1",
+        .port = port,
+        .path = "/trevrpc",
+        .skip_certificate_validation = 1,
+        .max_streams_per_session = 8,
+    };
+    CHECK_EQ_GOTO(trevrpc_wt_dial(&client_config, &client_session), 0);
+    CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
+    accept_thread_started = false;
+    CHECK_EQ_GOTO(accept_args.result, 0);
+
+    stream_args.session = accept_args.session;
+    CHECK_GOTO(pthread_create(&stream_thread, NULL, accept_wt_stream_thread, &stream_args) == 0);
+    stream_thread_started = true;
+    CHECK_EQ_GOTO(trevrpc_wt_session_open_stream(client_session, &client_stream), 0);
+    CHECK_GOTO(pthread_join(stream_thread, NULL) == 0);
+    stream_thread_started = false;
+    CHECK_EQ_GOTO(stream_args.result, 0);
+
+    trevrpc_wt_stream_close(client_stream);
+    client_stream = NULL;
+    CHECK_EQ_GOTO(trevrpc_wt_stream_read_frame(stream_args.stream, &body, &body_len, 1024), TREV_WT_ERR_CLOSED);
+
+    result = 0;
+
+cleanup:
+    trevrpc_wt_free(body);
+    if (stream_thread_started) {
+        trevrpc_wt_session_shutdown(accept_args.session);
+        (void)pthread_join(stream_thread, NULL);
+    }
+    if (accept_thread_started) {
+        trevrpc_wt_listener_shutdown(listener);
+        (void)pthread_join(accept_thread, NULL);
+    }
+    trevrpc_wt_stream_close(stream_args.stream);
+    trevrpc_wt_stream_close(client_stream);
+    trevrpc_wt_session_close(accept_args.session);
+    trevrpc_wt_session_close(client_session);
+    trevrpc_wt_listener_close(listener);
+    return result;
+}
+
 int main(void) {
     if (test_stream_reset_unblocks_peer_read() != 0) {
         return 1;
@@ -379,6 +552,15 @@ int main(void) {
         return 1;
     }
     if (test_webtransport_rejects_path_mismatch() != 0) {
+        return 1;
+    }
+    if (test_webtransport_listener_shutdown_unblocks_accept() != 0) {
+        return 1;
+    }
+    if (test_webtransport_session_shutdown_unblocks_accept_stream() != 0) {
+        return 1;
+    }
+    if (test_webtransport_stream_close_unblocks_peer_read() != 0) {
         return 1;
     }
     return 0;

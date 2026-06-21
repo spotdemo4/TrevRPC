@@ -17,39 +17,42 @@ This tracks replacing the `libwtf` dependency with an internal WebTransport impl
 - Draft-15 support before draft-07 parity is stable.
 - Replacing MsQuic itself.
 
-## Implementation Plan
+## Completed Work
 
-1. Remove the `libwtf` build dependency.
-2. Replace `src/trevrpc_webtransport.c` with an internal implementation skeleton that preserves all exported `trevrpc_wt_*` symbols.
-3. Keep unsupported paths explicit with stable `TREV_WT_ERR_*` errors while functionality is rebuilt.
-4. Add a minimal HTTP/3 layer over MsQuic:
-   - ALPN `h3`.
-   - Control stream setup.
-   - SETTINGS encode/decode for WebTransport support.
-   - Minimal QPACK/HEADERS support for CONNECT requests and responses.
-5. Add server-side WebTransport session handling:
-   - Validate path/origin from `trevrpc_wt_config`.
-   - Accept CONNECT `:protocol = webtransport`.
-   - Queue accepted sessions through `trevrpc_wt_listener_accept_session`.
-6. Add WebTransport bidirectional stream handling:
-   - Map accepted bidirectional WebTransport streams to `trevrpc_wt_stream`.
-   - Preserve existing blocking read/write/frame APIs.
-   - Propagate resets/close as `TREV_WT_ERR_CLOSED`.
-7. Add client-side WebTransport support:
-   - Open HTTP/3 connection with `h3` ALPN.
-   - Send CONNECT request for configured URL/path/origin.
-   - Open bidirectional WebTransport streams.
-8. Add integration coverage:
-   - Native WebTransport unary CTest.
-   - Server-streaming, client-streaming, and bidirectional streaming CTests.
-   - Shutdown/reset/partial stream failure cases.
-9. Remove obsolete libwtf-specific documentation and draft workaround text.
+- Removed the `libwtf` build dependency.
+- Replaced `src/trevrpc_webtransport.c` with an internal MsQuic-backed implementation while preserving the exported `trevrpc_wt_*` API shape.
+- Added the TrevRPC-focused HTTP/3 subset over MsQuic:
+  - ALPN `h3`.
+  - Control stream setup.
+  - SETTINGS encode/decode for WebTransport support.
+  - Minimal literal-only QPACK/HEADERS support for CONNECT requests and responses.
+- Added server-side WebTransport session handling:
+  - Validate path/origin from `trevrpc_wt_config`.
+  - Accept CONNECT `:protocol = webtransport`.
+  - Queue accepted sessions through `trevrpc_wt_listener_accept_session`.
+- Added WebTransport bidirectional stream handling:
+  - Map accepted bidirectional WebTransport streams to `trevrpc_wt_stream`.
+  - Preserve existing blocking read/write/frame APIs.
+  - Propagate resets/close as `TREV_WT_ERR_CLOSED`.
+- Added client-side WebTransport support:
+  - Open HTTP/3 connection with `h3` ALPN.
+  - Send CONNECT request for configured URL/path/origin.
+  - Open bidirectional WebTransport streams.
+- Added integration coverage for native WebTransport unary, server-streaming, client-streaming, bidirectional streaming, and low-level shutdown/close unblock behavior.
+- Removed obsolete libwtf-specific documentation and draft workaround text.
 
 ## Current Status
 
 - Multi-listener high-level `trevrpc_server` support exists.
-- `trevrpc_wt_*` is still backed by `libwtf` until this migration is completed.
-- Native WebTransport round-trip CTests are blocked on the internal implementation.
+- `trevrpc_wt_*` is backed by the internal MsQuic/HTTP3/WebTransport implementation.
+- High-level WebTransport RPC CTests cover unary and all streaming shapes.
+- Low-level WebTransport CTests cover session establishment, stream I/O, path rejection, and shutdown/close unblock behavior.
+
+## Remaining Work
+
+- Harden malformed peer handling for HTTP/3 control streams, SETTINGS, QPACK blocks, and CONNECT headers.
+- Add WebTransport reset/partial-stream high-level RPC failure coverage.
+- Investigate serving native QUIC and WebTransport from one shared underlying MsQuic listener.
 
 ## Risks
 
