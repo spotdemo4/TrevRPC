@@ -47,5 +47,3 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 - Pool reusable buffers only where lifetime and concurrency are unambiguous.
 
 ## API Cleanup
-
-- Replace raw numeric `kind` and `status` parameters with typed enums if that improves C API clarity without hurting ABI predictability.
