@@ -1015,6 +1015,7 @@ size_t trevrpc_test_server_stream_status_count(trevrpc_server* server) {
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server) {
     return server == NULL ? TREVRPC_STATUS_UNKNOWN : server->test_last_stream_status;
 }
+
 #endif
 
 int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_options* options) {
@@ -1308,6 +1309,16 @@ static void trevrpc_server_request_finish(trevrpc_server* server) {
     pthread_cond_broadcast(&server->cond);
     pthread_mutex_unlock(&server->mutex);
 }
+
+#ifdef TREVRPC_TESTING
+bool trevrpc_test_server_request_try_start(trevrpc_server* server) {
+    return trevrpc_server_request_try_start(server);
+}
+
+void trevrpc_test_server_request_finish(trevrpc_server* server) {
+    trevrpc_server_request_finish(server);
+}
+#endif
 
 static int trevrpc_conn_stream_limiter_init(trevrpc_conn_stream_limiter* limiter) {
     int err = pthread_mutex_init(&limiter->mutex, NULL);

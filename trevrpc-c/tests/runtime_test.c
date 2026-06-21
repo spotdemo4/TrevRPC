@@ -30,6 +30,8 @@ uint32_t trevrpc_test_status_from_error(int err, const char** message);
 uint32_t trevrpc_test_transport_status_from_error(int err, const char** message);
 size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
+bool trevrpc_test_server_request_try_start(trevrpc_server* server);
+void trevrpc_test_server_request_finish(trevrpc_server* server);
 
 struct trevrpc_stream {
     uint32_t transport;
@@ -1092,6 +1094,87 @@ cleanup:
     return result;
 }
 
+static int test_server_shutdown_rejects_new_work(void) {
+    int result = 1;
+    trevrpc_server* server = NULL;
+
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_test_server_request_try_start(server));
+    trevrpc_server_shutdown(server);
+    CHECK_GOTO(!trevrpc_test_server_request_try_start(server));
+    trevrpc_test_server_request_finish(server);
+
+    result = 0;
+
+cleanup:
+    trevrpc_server_close(server);
+    return result;
+}
+
+static int test_partial_stream_failure_reports_terminal_status(void) {
+    int result = 1;
+    metric_counts counts = {0};
+    size_t status_count = 0;
+    uint32_t last_status = TREVRPC_STATUS_UNKNOWN;
+
+    CHECK_GOTO(run_stream_case(stream_message_then_error_handler, &counts, &status_count, &last_status) == 0);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_INTERNAL);
+    CHECK_GOTO(status_count == 1);
+    CHECK_GOTO(last_status == TREVRPC_STATUS_INTERNAL);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
+static int test_concurrent_request_limit_rejects_overload(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    trevrpc_server* server = NULL;
+    trevrpc_msquic_stream stream = {0};
+    bool stream_initialized = false;
+    metric_counts counts = {0};
+    trevrpc_metrics metrics = {
+        .rpc_started = record_started,
+        .rpc_finished = record_finished,
+        .user_data = &counts,
+    };
+    trevrpc_server_options options = trevrpc_default_server_options();
+    options.max_concurrent_requests = 1;
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_options(server, &options) == 0);
+    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
+    CHECK_GOTO(trevrpc_server_register_unary(server, "svc", "method", success_handler, NULL) == 0);
+    CHECK_GOTO(trevrpc_test_server_request_try_start(server));
+    CHECK_GOTO(init_raw_stream(&stream, frame, frame_len) == 0);
+    stream_initialized = true;
+
+    trevrpc_test_server_handle_stream(server, &stream);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+
+    result = 0;
+
+cleanup:
+    if (server != NULL) {
+        trevrpc_test_server_request_finish(server);
+    }
+    if (stream_initialized) {
+        reset_raw_stream(&stream);
+    }
+    trevrpc_server_close(server);
+    free(frame);
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -1169,6 +1252,15 @@ int main(void) {
         return 1;
     }
     if (test_inprocess_msquic_runtime_all_rpc_shapes() != 0) {
+        return 1;
+    }
+    if (test_server_shutdown_rejects_new_work() != 0) {
+        return 1;
+    }
+    if (test_partial_stream_failure_reports_terminal_status() != 0) {
+        return 1;
+    }
+    if (test_concurrent_request_limit_rejects_overload() != 0) {
         return 1;
     }
     return 0;
