@@ -10,8 +10,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Error And Status Mapping
 
-- Decide whether `TREVRPC_ERR_FRAME_TOO_LARGE` should remain a TrevRPC error or map directly to transport-specific frame-too-large codes internally.
-
 ## Handler Safety
 
 - Add defensive checks around handler return values and response ownership.

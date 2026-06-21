@@ -92,6 +92,10 @@ Request `timeout_nanos` is enforced cooperatively. The runtime rejects timeouts 
 
 High-level stream send/receive calls return `-ETIMEDOUT` after the request deadline expires and `-ECANCELED` after server shutdown cancellation is observed. Terminal stream statuses are still emitted by the server runtime when a handler exits without sending one.
 
+## Error Boundaries
+
+`TREVRPC_ERR_FRAME_TOO_LARGE` is the transport-agnostic wire/runtime error used when TrevRPC framing exceeds the configured maximum before bytes are handed to a transport. Transport wrappers keep their own frame-too-large error codes, such as `TREV_MSQUIC_ERR_FRAME_TOO_LARGE` and `TREV_WT_ERR_FRAME_TOO_LARGE`. The high-level runtime normalizes all of these to `TREVRPC_STATUS_RESOURCE_EXHAUSTED` responses.
+
 ## Compatibility Matrix
 
 | Feature                                          | Go runtime | C runtime                                             |
