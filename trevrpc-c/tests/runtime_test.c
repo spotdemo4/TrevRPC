@@ -24,6 +24,7 @@ typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server);
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
+uint32_t trevrpc_test_status_from_error(int err, const char** message);
 
 struct trevrpc_stream {
     trevrpc_msquic_stream* stream;
@@ -616,6 +617,40 @@ cleanup:
     return result;
 }
 
+static int test_status_from_error_matches_go_policy(void) {
+    int result = 1;
+    const char* message = NULL;
+
+    CHECK_GOTO(
+        trevrpc_test_status_from_error(TREVRPC_ERR_FRAME_TOO_LARGE, &message) == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_status_from_error(TREVRPC_ERR_INVALID_FRAME, &message) == TREVRPC_STATUS_INVALID_ARGUMENT);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(
+        trevrpc_test_status_from_error(TREVRPC_ERR_UNSUPPORTED_RPC_KIND, &message) == TREVRPC_STATUS_INVALID_ARGUMENT);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_status_from_error(TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION, &message) ==
+               TREVRPC_STATUS_FAILED_PRECONDITION);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_status_from_error(-ETIMEDOUT, &message) == TREVRPC_STATUS_DEADLINE_EXCEEDED);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_status_from_error(-ECANCELED, &message) == TREVRPC_STATUS_CANCELLED);
+    CHECK_GOTO(message != NULL);
+
+    CHECK_GOTO(trevrpc_test_status_from_error(-EIO, &message) == TREVRPC_STATUS_INTERNAL);
+    CHECK_GOTO(message != NULL);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -669,6 +704,9 @@ int main(void) {
         return 1;
     }
     if (test_metrics_exactly_once_decode_error() != 0) {
+        return 1;
+    }
+    if (test_status_from_error_matches_go_policy() != 0) {
         return 1;
     }
     return 0;

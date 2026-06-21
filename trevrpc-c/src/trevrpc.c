@@ -107,6 +107,7 @@ typedef struct trevrpc_stream_task {
 
 static bool trevrpc_server_is_shutting_down(trevrpc_server* server);
 static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
+static uint32_t trevrpc_status_from_error(int err, const char** message);
 
 static size_t trevrpc_effective_max_frame_size(const trevrpc_config* config) {
     if (config != NULL && config->max_frame_size > 0) {
@@ -751,6 +752,10 @@ int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_s
 
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream) {
     trevrpc_handle_stream(server, stream);
+}
+
+uint32_t trevrpc_test_status_from_error(int err, const char** message) {
+    return trevrpc_status_from_error(err, message);
 }
 #endif
 
