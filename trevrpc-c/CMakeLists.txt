@@ -37,6 +37,9 @@ endfunction()
 trevrpc_c_warnings(trevrpc_core)
 
 set(trevrpc_install_targets trevrpc_core)
+set(trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_core.pc")
+
+configure_file(cmake/trevrpc_core.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_core.pc" @ONLY)
 
 if(TREVRPC_BUILD_MSQUIC)
     find_path(MSQUIC_INCLUDE_DIR NAMES msquic.h inc/msquic.h REQUIRED)
@@ -54,6 +57,8 @@ if(TREVRPC_BUILD_MSQUIC)
     target_link_libraries(trevrpc_msquic PUBLIC Threads::Threads PRIVATE ${MSQUIC_LIBRARY})
     trevrpc_c_warnings(trevrpc_msquic)
     list(APPEND trevrpc_install_targets trevrpc_msquic)
+    list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_msquic.pc")
+    configure_file(cmake/trevrpc_msquic.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_msquic.pc" @ONLY)
 endif()
 
 if(TREVRPC_BUILD_WEBTRANSPORT)
@@ -72,6 +77,8 @@ if(TREVRPC_BUILD_WEBTRANSPORT)
     target_link_libraries(trevrpc_webtransport PUBLIC Threads::Threads PRIVATE ${WTF_LIBRARY})
     trevrpc_c_warnings(trevrpc_webtransport)
     list(APPEND trevrpc_install_targets trevrpc_webtransport)
+    list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_webtransport.pc")
+    configure_file(cmake/trevrpc_webtransport.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_webtransport.pc" @ONLY)
 endif()
 
 if(TREVRPC_BUILD_RUNTIME)
@@ -91,6 +98,8 @@ if(TREVRPC_BUILD_RUNTIME)
     target_link_libraries(trevrpc PUBLIC trevrpc_core trevrpc_msquic Threads::Threads)
     trevrpc_c_warnings(trevrpc)
     list(APPEND trevrpc_install_targets trevrpc)
+    list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc.pc")
+    configure_file(cmake/trevrpc.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc.pc" @ONLY)
 endif()
 
 install(TARGETS ${trevrpc_install_targets}
@@ -117,6 +126,9 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc
+)
+install(FILES ${trevrpc_pkg_config_files}
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
 install(FILES
     include/trevrpc.h

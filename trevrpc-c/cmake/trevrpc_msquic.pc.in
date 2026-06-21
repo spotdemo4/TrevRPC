@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${pcfiledir}/..
+includedir=${prefix}/include
+
+Name: trevrpc_msquic
+Description: TrevRPC C low-level MsQuic transport wrapper
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ltrevrpc_msquic
+Libs.private: -lmsquic
+Cflags: -I${includedir}

@@ -1,0 +1,10 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${pcfiledir}/..
+includedir=${prefix}/include
+
+Name: trevrpc_core
+Description: TrevRPC C wire and value runtime
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ltrevrpc_core
+Cflags: -I${includedir}

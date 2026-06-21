@@ -31,6 +31,13 @@ find_package(trevrpc CONFIG REQUIRED)
 target_link_libraries(app PRIVATE trevrpc::trevrpc)
 ```
 
+The install also includes pkg-config files for each installed library:
+
+```sh
+pkg-config --cflags --libs trevrpc
+pkg-config --cflags --libs trevrpc_core trevrpc_msquic trevrpc_webtransport
+```
+
 The same build is exercised by Nix:
 
 ```sh
