@@ -25,7 +25,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Transport And Packaging
 
-- Install internal headers only when explicitly requested for tests or development; keep public headers stable.
 - Add CMake package config files so external C projects can use `find_package(trevrpc)`.
 - Add pkg-config files for installed C libraries.
 - Decide static vs shared library support and symbol visibility rules.

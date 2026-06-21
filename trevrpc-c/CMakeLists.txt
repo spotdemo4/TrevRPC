@@ -12,6 +12,7 @@ option(TREVRPC_BUILD_TESTS "Build trevrpc-c tests" ON)
 option(TREVRPC_BUILD_MSQUIC "Build trevrpc-c MsQuic transport" ON)
 option(TREVRPC_BUILD_WEBTRANSPORT "Build trevrpc-c WebTransport transport" ON)
 option(TREVRPC_BUILD_RUNTIME "Build trevrpc-c high-level runtime" ON)
+option(TREVRPC_INSTALL_INTERNAL_HEADERS "Install trevrpc-c internal headers for tests and development" OFF)
 
 find_package(Threads REQUIRED)
 
@@ -94,6 +95,12 @@ install(FILES
     include/trevrpc_webtransport.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+if(TREVRPC_INSTALL_INTERNAL_HEADERS)
+    install(FILES
+        src/trevrpc_wire_internal.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/trevrpc/internal
+    )
+endif()
 
 if(TREVRPC_BUILD_TESTS)
     enable_testing()

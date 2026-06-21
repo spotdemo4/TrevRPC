@@ -33,12 +33,13 @@ nix flake check
 
 CMake options:
 
-| Option                       | Default | Meaning                                                       |
-| ---------------------------- | ------- | ------------------------------------------------------------- |
-| `TREVRPC_BUILD_TESTS`        | `ON`    | Build CTest executables.                                      |
-| `TREVRPC_BUILD_MSQUIC`       | `ON`    | Build the low-level MsQuic transport library.                 |
-| `TREVRPC_BUILD_WEBTRANSPORT` | `ON`    | Build the low-level WebTransport transport library.           |
-| `TREVRPC_BUILD_RUNTIME`      | `ON`    | Build the high-level runtime. This currently requires MsQuic. |
+| Option                             | Default | Meaning                                                                              |
+| ---------------------------------- | ------- | ------------------------------------------------------------------------------------ |
+| `TREVRPC_BUILD_TESTS`              | `ON`    | Build CTest executables.                                                             |
+| `TREVRPC_BUILD_MSQUIC`             | `ON`    | Build the low-level MsQuic transport library.                                        |
+| `TREVRPC_BUILD_WEBTRANSPORT`       | `ON`    | Build the low-level WebTransport transport library.                                  |
+| `TREVRPC_BUILD_RUNTIME`            | `ON`    | Build the high-level runtime. This currently requires MsQuic.                        |
+| `TREVRPC_INSTALL_INTERNAL_HEADERS` | `OFF`   | Install internal headers under `include/trevrpc/internal` for tests and development. |
 
 ## Ownership
 
