@@ -114,6 +114,51 @@ if(TREVRPC_BUILD_RUNTIME)
     configure_file(cmake/trevrpc.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc.pc" @ONLY)
 endif()
 
+if(TREVRPC_BUILD_RUNTIME AND (TREVRPC_BUILD_TESTS OR TREVRPC_BUILD_BENCHMARKS))
+    find_program(PROTOC_EXECUTABLE protoc REQUIRED)
+    find_program(PROTOC_C_EXECUTABLE protoc-c REQUIRED)
+    find_program(TREVRPC_C_GENERATOR_EXECUTABLE protoc-gen-trevrpc-c)
+    find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
+
+    set(trevrpc_generated_test_dir "${CMAKE_CURRENT_BINARY_DIR}/generated-service-test")
+    set(trevrpc_generated_proto "${CMAKE_CURRENT_SOURCE_DIR}/tests/proto/greeter.proto")
+    set(trevrpc_generated_pb_c "${trevrpc_generated_test_dir}/greeter.pb-c.c")
+    set(trevrpc_generated_trevrpc_c "${trevrpc_generated_test_dir}/greeter.trevrpc.c")
+
+    if(NOT TREVRPC_C_GENERATOR_EXECUTABLE)
+        find_program(GO_EXECUTABLE go REQUIRED)
+        set(TREVRPC_C_GENERATOR_EXECUTABLE "${trevrpc_generated_test_dir}/protoc-gen-trevrpc-c")
+        add_custom_command(
+            OUTPUT "${TREVRPC_C_GENERATOR_EXECUTABLE}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${trevrpc_generated_test_dir}"
+            COMMAND "${CMAKE_COMMAND}" -E chdir "${CMAKE_CURRENT_SOURCE_DIR}/../trevrpc-go" "${GO_EXECUTABLE}" build -o "${TREVRPC_C_GENERATOR_EXECUTABLE}" ./cmd/protoc-gen-trevrpc-c
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../trevrpc-go/cmd/protoc-gen-trevrpc-c/main.go"
+            VERBATIM
+        )
+    endif()
+    add_custom_command(
+        OUTPUT
+            "${trevrpc_generated_test_dir}/greeter.pb-c.c"
+            "${trevrpc_generated_test_dir}/greeter.pb-c.h"
+            "${trevrpc_generated_test_dir}/greeter.trevrpc.c"
+            "${trevrpc_generated_test_dir}/greeter.trevrpc.h"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${trevrpc_generated_test_dir}"
+        COMMAND "${PROTOC_C_EXECUTABLE}" --c_out=${trevrpc_generated_test_dir} -I "${CMAKE_CURRENT_SOURCE_DIR}/tests/proto" "${trevrpc_generated_proto}"
+        COMMAND "${PROTOC_EXECUTABLE}" --plugin=protoc-gen-trevrpc-c=${TREVRPC_C_GENERATOR_EXECUTABLE} --trevrpc-c_out=${trevrpc_generated_test_dir} -I "${CMAKE_CURRENT_SOURCE_DIR}/tests/proto" "${trevrpc_generated_proto}"
+        DEPENDS "${trevrpc_generated_proto}" "${TREVRPC_C_GENERATOR_EXECUTABLE}"
+        VERBATIM
+    )
+
+    set(trevrpc_msquic_test_cert "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-cert.pem")
+    set(trevrpc_msquic_test_key "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-key.pem")
+    add_custom_command(
+        OUTPUT "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}"
+        COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -keyout "${trevrpc_msquic_test_key}" -out "${trevrpc_msquic_test_cert}"
+        VERBATIM
+    )
+    add_custom_target(trevrpc_msquic_test_certificates DEPENDS "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}")
+endif()
+
 if(TREVRPC_BUILD_BENCHMARKS)
     add_executable(trevrpc_wire_bench bench/wire_bench.c)
     target_include_directories(trevrpc_wire_bench PRIVATE src)
@@ -128,6 +173,21 @@ if(TREVRPC_BUILD_BENCHMARKS)
         target_link_libraries(trevrpc_runtime_bench PRIVATE trevrpc)
         trevrpc_c_warnings(trevrpc_runtime_bench)
         trevrpc_c_sanitizers(trevrpc_runtime_bench)
+
+        add_executable(trevrpc_rpc_comparison_bench
+            bench/rpc_comparison_bench.c
+            "${trevrpc_generated_pb_c}"
+            "${trevrpc_generated_trevrpc_c}"
+        )
+        add_dependencies(trevrpc_rpc_comparison_bench trevrpc_msquic_test_certificates)
+        target_compile_definitions(trevrpc_rpc_comparison_bench PRIVATE
+            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
+            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
+        )
+        target_include_directories(trevrpc_rpc_comparison_bench PRIVATE src "${trevrpc_generated_test_dir}")
+        target_link_libraries(trevrpc_rpc_comparison_bench PRIVATE trevrpc protobuf-c)
+        trevrpc_c_warnings(trevrpc_rpc_comparison_bench)
+        trevrpc_c_sanitizers(trevrpc_rpc_comparison_bench)
     endif()
 endif()
 
@@ -174,7 +234,6 @@ endif()
 
 if(TREVRPC_BUILD_TESTS)
     enable_testing()
-    find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
 
     add_executable(trevrpc_wire_test tests/wire_test.c)
     target_include_directories(trevrpc_wire_test PRIVATE src)
@@ -186,39 +245,6 @@ if(TREVRPC_BUILD_TESTS)
     add_test(NAME trevrpc_wire COMMAND trevrpc_wire_test)
 
     if(TREVRPC_BUILD_RUNTIME)
-        find_program(PROTOC_EXECUTABLE protoc REQUIRED)
-        find_program(PROTOC_C_EXECUTABLE protoc-c REQUIRED)
-        find_program(TREVRPC_C_GENERATOR_EXECUTABLE protoc-gen-trevrpc-c)
-
-        set(trevrpc_generated_test_dir "${CMAKE_CURRENT_BINARY_DIR}/generated-service-test")
-        set(trevrpc_generated_proto "${CMAKE_CURRENT_SOURCE_DIR}/tests/proto/greeter.proto")
-        set(trevrpc_generated_pb_c "${trevrpc_generated_test_dir}/greeter.pb-c.c")
-        set(trevrpc_generated_trevrpc_c "${trevrpc_generated_test_dir}/greeter.trevrpc.c")
-
-        if(NOT TREVRPC_C_GENERATOR_EXECUTABLE)
-            find_program(GO_EXECUTABLE go REQUIRED)
-            set(TREVRPC_C_GENERATOR_EXECUTABLE "${trevrpc_generated_test_dir}/protoc-gen-trevrpc-c")
-            add_custom_command(
-                OUTPUT "${TREVRPC_C_GENERATOR_EXECUTABLE}"
-                COMMAND "${CMAKE_COMMAND}" -E make_directory "${trevrpc_generated_test_dir}"
-                COMMAND "${CMAKE_COMMAND}" -E chdir "${CMAKE_CURRENT_SOURCE_DIR}/../trevrpc-go" "${GO_EXECUTABLE}" build -o "${TREVRPC_C_GENERATOR_EXECUTABLE}" ./cmd/protoc-gen-trevrpc-c
-                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../trevrpc-go/cmd/protoc-gen-trevrpc-c/main.go"
-                VERBATIM
-            )
-        endif()
-        add_custom_command(
-            OUTPUT
-                "${trevrpc_generated_test_dir}/greeter.pb-c.c"
-                "${trevrpc_generated_test_dir}/greeter.pb-c.h"
-                "${trevrpc_generated_test_dir}/greeter.trevrpc.c"
-                "${trevrpc_generated_test_dir}/greeter.trevrpc.h"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${trevrpc_generated_test_dir}"
-            COMMAND "${PROTOC_C_EXECUTABLE}" --c_out=${trevrpc_generated_test_dir} -I "${CMAKE_CURRENT_SOURCE_DIR}/tests/proto" "${trevrpc_generated_proto}"
-            COMMAND "${PROTOC_EXECUTABLE}" --plugin=protoc-gen-trevrpc-c=${TREVRPC_C_GENERATOR_EXECUTABLE} --trevrpc-c_out=${trevrpc_generated_test_dir} -I "${CMAKE_CURRENT_SOURCE_DIR}/tests/proto" "${trevrpc_generated_proto}"
-            DEPENDS "${trevrpc_generated_proto}" "${TREVRPC_C_GENERATOR_EXECUTABLE}"
-            VERBATIM
-        )
-
         add_executable(trevrpc_runtime_test tests/runtime_test.c)
         target_include_directories(trevrpc_runtime_test PRIVATE src)
         target_compile_definitions(trevrpc PRIVATE TREVRPC_TESTING)
@@ -227,15 +253,6 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_sanitizers(trevrpc_runtime_test)
 
         add_test(NAME trevrpc_runtime COMMAND trevrpc_runtime_test)
-
-        set(trevrpc_msquic_test_cert "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-cert.pem")
-        set(trevrpc_msquic_test_key "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-key.pem")
-        add_custom_command(
-            OUTPUT "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}"
-            COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -keyout "${trevrpc_msquic_test_key}" -out "${trevrpc_msquic_test_cert}"
-            VERBATIM
-        )
-        add_custom_target(trevrpc_msquic_test_certificates DEPENDS "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}")
 
         add_executable(trevrpc_msquic_transport_test tests/msquic_transport_test.c)
         add_dependencies(trevrpc_msquic_transport_test trevrpc_msquic_test_certificates)

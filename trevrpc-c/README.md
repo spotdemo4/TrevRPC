@@ -76,6 +76,7 @@ Opt-in benchmark targets are available when configuring with `-DTREVRPC_BUILD_BE
 ```sh
 ./build/trevrpc_wire_bench 100000
 ./build/trevrpc_runtime_bench 10000
+./build/trevrpc_rpc_comparison_bench 1000
 ```
 
 ## Allocation Notes
