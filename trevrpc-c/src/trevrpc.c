@@ -145,6 +145,7 @@ int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const ch
         message_len,
         NULL,
         0,
+        NULL,
         stream->max_frame_size,
         &frame,
         &frame_len);
@@ -241,7 +242,7 @@ int trevrpc_client_call_unary(trevrpc_client* client,
     uint8_t* frame = NULL;
     size_t frame_len = 0;
     err = trevrpc_wire_encode_request(
-        service, method, TREVRPC_RPC_KIND_UNARY, body, body_len, client->max_frame_size, &frame, &frame_len);
+        service, method, TREVRPC_RPC_KIND_UNARY, body, body_len, NULL, 0, client->max_frame_size, &frame, &frame_len);
     if (err == 0) {
         err = trevrpc_write_frame(stream, frame, frame_len);
     }
@@ -293,8 +294,8 @@ int trevrpc_client_start_stream(trevrpc_client* client,
 
     uint8_t* frame = NULL;
     size_t frame_len = 0;
-    err =
-        trevrpc_wire_encode_request(service, method, kind, body, body_len, client->max_frame_size, &frame, &frame_len);
+    err = trevrpc_wire_encode_request(
+        service, method, kind, body, body_len, NULL, 0, client->max_frame_size, &frame, &frame_len);
     if (err == 0) {
         err = trevrpc_write_frame(raw_stream, frame, frame_len);
     }
@@ -633,6 +634,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             trevrpc_server_write_stream_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method is not implemented");
         }
+        trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
     }
@@ -644,6 +646,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             trevrpc_server_write_stream_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method RPC kind mismatch");
         }
+        trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
     }
@@ -661,6 +664,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             (void)trevrpc_stream_send_status(&rpc_stream, TREVRPC_STATUS_OK, NULL, 0);
         }
         (void)trevrpc_stream_finish_send(&rpc_stream);
+        trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
     }
@@ -674,6 +678,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
 
     trevrpc_server_write_response(stream, server->max_frame_size, &response);
     trevrpc_response_reset(&response);
+    trevrpc_request_reset(&request);
     trevrpc_msquic_free(body);
 }
 

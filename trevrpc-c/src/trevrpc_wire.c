@@ -59,6 +59,41 @@ static uint8_t* trevrpc_wire_append_varint_field(uint8_t* out, uint32_t field_nu
     return trevrpc_wire_append_varint(out, value);
 }
 
+static size_t trevrpc_wire_metadata_entry_len(const trevrpc_metadata_entry* entry) {
+    return trevrpc_wire_bytes_field_len(1, entry->key_len) + trevrpc_wire_bytes_field_len(2, entry->value_len);
+}
+
+static size_t trevrpc_wire_metadata_field_len(uint32_t field_number, const trevrpc_metadata* metadata) {
+    if (metadata == NULL) {
+        return 0;
+    }
+
+    size_t len = 0;
+    for (size_t i = 0; i < metadata->entries_len; i++) {
+        size_t entry_len = trevrpc_wire_metadata_entry_len(&metadata->entries[i]);
+        len += trevrpc_wire_varint_len((uint64_t)(field_number << 3u | 2u)) +
+               trevrpc_wire_varint_len((uint64_t)entry_len) + entry_len;
+    }
+    return len;
+}
+
+static uint8_t* trevrpc_wire_append_metadata_field(
+    uint8_t* out, uint32_t field_number, const trevrpc_metadata* metadata) {
+    if (metadata == NULL) {
+        return out;
+    }
+
+    for (size_t i = 0; i < metadata->entries_len; i++) {
+        const trevrpc_metadata_entry* entry = &metadata->entries[i];
+        size_t entry_len = trevrpc_wire_metadata_entry_len(entry);
+        out = trevrpc_wire_append_varint(out, (uint64_t)(field_number << 3u | 2u));
+        out = trevrpc_wire_append_varint(out, (uint64_t)entry_len);
+        out = trevrpc_wire_append_bytes_field(out, 1, (const uint8_t*)entry->key, entry->key_len);
+        out = trevrpc_wire_append_bytes_field(out, 2, entry->value, entry->value_len);
+    }
+    return out;
+}
+
 static int trevrpc_wire_alloc_frame(size_t body_len, size_t max_frame_size, uint8_t** frame, size_t* frame_len) {
     *frame = NULL;
     *frame_len = 0;
@@ -88,19 +123,27 @@ int trevrpc_wire_encode_request(const char* service,
     uint32_t kind,
     const uint8_t* body,
     size_t body_len,
+    const trevrpc_metadata* metadata,
+    uint64_t timeout_nanos,
     size_t max_frame_size,
     uint8_t** frame,
     size_t* frame_len) {
     if (service == NULL || method == NULL || (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
+    int err = trevrpc_metadata_validate(metadata);
+    if (err != 0) {
+        return err;
+    }
 
     size_t service_len = strlen(service);
     size_t method_len = strlen(method);
     size_t body_frame_len = trevrpc_wire_bytes_field_len(1, service_len) + trevrpc_wire_bytes_field_len(2, method_len) +
-                            trevrpc_wire_bytes_field_len(3, body_len) + trevrpc_wire_varint_field_len(5, kind) +
-                            trevrpc_wire_varint_field_len(6, TREVRPC_WIRE_VERSION);
-    int err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
+                            trevrpc_wire_bytes_field_len(3, body_len) + trevrpc_wire_metadata_field_len(4, metadata) +
+                            trevrpc_wire_varint_field_len(5, kind) +
+                            trevrpc_wire_varint_field_len(6, TREVRPC_WIRE_VERSION) +
+                            trevrpc_wire_varint_field_len(7, timeout_nanos);
+    err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
     if (err != 0) {
         return err;
     }
@@ -109,8 +152,10 @@ int trevrpc_wire_encode_request(const char* service,
     out = trevrpc_wire_append_bytes_field(out, 1, (const uint8_t*)service, service_len);
     out = trevrpc_wire_append_bytes_field(out, 2, (const uint8_t*)method, method_len);
     out = trevrpc_wire_append_bytes_field(out, 3, body, body_len);
+    out = trevrpc_wire_append_metadata_field(out, 4, metadata);
     out = trevrpc_wire_append_varint_field(out, 5, kind);
     out = trevrpc_wire_append_varint_field(out, 6, TREVRPC_WIRE_VERSION);
+    out = trevrpc_wire_append_varint_field(out, 7, timeout_nanos);
     (void)out;
     return 0;
 }
@@ -120,11 +165,15 @@ int trevrpc_wire_encode_response(
     if (response == NULL) {
         return -EINVAL;
     }
+    int err = trevrpc_metadata_validate(&response->metadata);
+    if (err != 0) {
+        return err;
+    }
 
-    size_t body_frame_len = trevrpc_wire_varint_field_len(1, response->status) +
-                            trevrpc_wire_bytes_field_len(2, response->message_len) +
-                            trevrpc_wire_bytes_field_len(3, response->body_len);
-    int err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
+    size_t body_frame_len =
+        trevrpc_wire_varint_field_len(1, response->status) + trevrpc_wire_bytes_field_len(2, response->message_len) +
+        trevrpc_wire_bytes_field_len(3, response->body_len) + trevrpc_wire_metadata_field_len(4, &response->metadata);
+    err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
     if (err != 0) {
         return err;
     }
@@ -133,6 +182,7 @@ int trevrpc_wire_encode_response(
     out = trevrpc_wire_append_varint_field(out, 1, response->status);
     out = trevrpc_wire_append_bytes_field(out, 2, (const uint8_t*)response->message, response->message_len);
     out = trevrpc_wire_append_bytes_field(out, 3, response->body, response->body_len);
+    out = trevrpc_wire_append_metadata_field(out, 4, &response->metadata);
     (void)out;
     return 0;
 }
@@ -143,16 +193,22 @@ int trevrpc_wire_encode_stream_frame(uint32_t kind,
     size_t message_len,
     const uint8_t* body,
     size_t body_len,
+    const trevrpc_metadata* metadata,
     size_t max_frame_size,
     uint8_t** frame,
     size_t* frame_len) {
     if ((message == NULL && message_len > 0) || (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
+    int err = trevrpc_metadata_validate(metadata);
+    if (err != 0) {
+        return err;
+    }
 
     size_t body_frame_len = trevrpc_wire_varint_field_len(1, kind) + trevrpc_wire_varint_field_len(2, status) +
-                            trevrpc_wire_bytes_field_len(3, message_len) + trevrpc_wire_bytes_field_len(4, body_len);
-    int err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
+                            trevrpc_wire_bytes_field_len(3, message_len) + trevrpc_wire_bytes_field_len(4, body_len) +
+                            trevrpc_wire_metadata_field_len(5, metadata);
+    err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
     if (err != 0) {
         return err;
     }
@@ -162,6 +218,7 @@ int trevrpc_wire_encode_stream_frame(uint32_t kind,
     out = trevrpc_wire_append_varint_field(out, 2, status);
     out = trevrpc_wire_append_bytes_field(out, 3, (const uint8_t*)message, message_len);
     out = trevrpc_wire_append_bytes_field(out, 4, body, body_len);
+    out = trevrpc_wire_append_metadata_field(out, 5, metadata);
     (void)out;
     return 0;
 }
@@ -225,9 +282,11 @@ static bool trevrpc_wire_skip_field(const uint8_t* data, size_t len, size_t* off
     }
 }
 
-int trevrpc_wire_decode_request(const uint8_t* data, size_t len, trevrpc_request* request) {
-    memset(request, 0, sizeof(*request));
-    request->kind = TREVRPC_RPC_KIND_UNARY;
+static int trevrpc_wire_parse_metadata_entry(const uint8_t* data, size_t len, trevrpc_metadata* metadata) {
+    const uint8_t* key = NULL;
+    size_t key_len = 0;
+    const uint8_t* value = NULL;
+    size_t value_len = 0;
 
     for (size_t offset = 0; offset < len;) {
         uint64_t tag = 0;
@@ -237,48 +296,16 @@ int trevrpc_wire_decode_request(const uint8_t* data, size_t len, trevrpc_request
 
         uint64_t field = tag >> 3;
         uint64_t wire_type = tag & 0x7;
-        uint64_t varint = 0;
-        const uint8_t* value = NULL;
-        size_t value_len = 0;
         switch (field) {
         case 1:
-            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
+            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &key, &key_len)) {
                 return TREVRPC_ERR_INVALID_FRAME;
             }
-            request->service = (const char*)value;
-            request->service_len = value_len;
             break;
         case 2:
             if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
                 return TREVRPC_ERR_INVALID_FRAME;
             }
-            request->method = (const char*)value;
-            request->method_len = value_len;
-            break;
-        case 3:
-            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
-                return TREVRPC_ERR_INVALID_FRAME;
-            }
-            request->body = value;
-            request->body_len = value_len;
-            break;
-        case 5:
-            if (wire_type != 0 || !trevrpc_wire_consume_varint(data, len, &offset, &varint)) {
-                return TREVRPC_ERR_INVALID_FRAME;
-            }
-            request->kind = (uint32_t)varint;
-            break;
-        case 6:
-            if (wire_type != 0 || !trevrpc_wire_consume_varint(data, len, &offset, &varint)) {
-                return TREVRPC_ERR_INVALID_FRAME;
-            }
-            request->version = (uint32_t)varint;
-            break;
-        case 7:
-            if (wire_type != 0 || !trevrpc_wire_consume_varint(data, len, &offset, &varint)) {
-                return TREVRPC_ERR_INVALID_FRAME;
-            }
-            request->timeout_nanos = varint;
             break;
         default:
             if (!trevrpc_wire_skip_field(data, len, &offset, wire_type)) {
@@ -288,20 +315,111 @@ int trevrpc_wire_decode_request(const uint8_t* data, size_t len, trevrpc_request
         }
     }
 
+    int err = trevrpc_metadata_set(metadata, (const char*)key, key_len, value, value_len);
+    return err == 0 ? 0 : TREVRPC_ERR_INVALID_FRAME;
+}
+
+static int trevrpc_wire_request_decode_error(trevrpc_request* request, int err) {
+    trevrpc_request_reset(request);
+    return err;
+}
+
+int trevrpc_wire_decode_request(const uint8_t* data, size_t len, trevrpc_request* request) {
+    if (request == NULL || (data == NULL && len > 0)) {
+        return -EINVAL;
+    }
+    memset(request, 0, sizeof(*request));
+    request->kind = TREVRPC_RPC_KIND_UNARY;
+
+    for (size_t offset = 0; offset < len;) {
+        uint64_t tag = 0;
+        if (!trevrpc_wire_consume_varint(data, len, &offset, &tag) || tag == 0) {
+            return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+        }
+
+        uint64_t field = tag >> 3;
+        uint64_t wire_type = tag & 0x7;
+        uint64_t varint = 0;
+        const uint8_t* value = NULL;
+        size_t value_len = 0;
+        int err = 0;
+        switch (field) {
+        case 1:
+            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
+                return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+            }
+            request->service = (const char*)value;
+            request->service_len = value_len;
+            break;
+        case 2:
+            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
+                return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+            }
+            request->method = (const char*)value;
+            request->method_len = value_len;
+            break;
+        case 3:
+            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
+                return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+            }
+            request->body = value;
+            request->body_len = value_len;
+            break;
+        case 4:
+            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
+                return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+            }
+            err = trevrpc_wire_parse_metadata_entry(value, value_len, &request->metadata);
+            if (err != 0) {
+                return trevrpc_wire_request_decode_error(request, err);
+            }
+            break;
+        case 5:
+            if (wire_type != 0 || !trevrpc_wire_consume_varint(data, len, &offset, &varint)) {
+                return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+            }
+            request->kind = (uint32_t)varint;
+            break;
+        case 6:
+            if (wire_type != 0 || !trevrpc_wire_consume_varint(data, len, &offset, &varint)) {
+                return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+            }
+            request->version = (uint32_t)varint;
+            break;
+        case 7:
+            if (wire_type != 0 || !trevrpc_wire_consume_varint(data, len, &offset, &varint)) {
+                return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+            }
+            request->timeout_nanos = varint;
+            break;
+        default:
+            if (!trevrpc_wire_skip_field(data, len, &offset, wire_type)) {
+                return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+            }
+            break;
+        }
+    }
+
+    if (trevrpc_metadata_validate(&request->metadata) != 0) {
+        return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
+    }
     if (request->version != TREVRPC_WIRE_VERSION) {
-        return TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION;
+        return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION);
     }
     if (request->service_len == 0 || request->method_len == 0) {
-        return TREVRPC_ERR_INVALID_FRAME;
+        return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
     }
     if (request->kind > TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
-        return TREVRPC_ERR_UNSUPPORTED_RPC_KIND;
+        return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_UNSUPPORTED_RPC_KIND);
     }
 
     return 0;
 }
 
 int trevrpc_wire_decode_response(const uint8_t* data, size_t len, trevrpc_response** out_response) {
+    if (out_response == NULL || (data == NULL && len > 0)) {
+        return -EINVAL;
+    }
     *out_response = NULL;
     trevrpc_response* response = calloc(1, sizeof(*response));
     if (response == NULL) {
@@ -351,6 +469,17 @@ int trevrpc_wire_decode_response(const uint8_t* data, size_t len, trevrpc_respon
                 return err;
             }
             break;
+        case 4:
+            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
+                trevrpc_response_free(response);
+                return TREVRPC_ERR_INVALID_FRAME;
+            }
+            err = trevrpc_wire_parse_metadata_entry(value, value_len, &response->metadata);
+            if (err != 0) {
+                trevrpc_response_free(response);
+                return err;
+            }
+            break;
         default:
             if (!trevrpc_wire_skip_field(data, len, &offset, wire_type)) {
                 trevrpc_response_free(response);
@@ -360,11 +489,19 @@ int trevrpc_wire_decode_response(const uint8_t* data, size_t len, trevrpc_respon
         }
     }
 
+    if (trevrpc_metadata_validate(&response->metadata) != 0) {
+        trevrpc_response_free(response);
+        return TREVRPC_ERR_INVALID_FRAME;
+    }
+
     *out_response = response;
     return 0;
 }
 
 int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_stream_frame** out_frame) {
+    if (out_frame == NULL || (data == NULL && len > 0)) {
+        return -EINVAL;
+    }
     *out_frame = NULL;
     trevrpc_stream_frame* frame = calloc(1, sizeof(*frame));
     if (frame == NULL) {
@@ -422,6 +559,17 @@ int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_st
                 return err;
             }
             break;
+        case 5:
+            if (wire_type != 2 || !trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
+                trevrpc_stream_frame_free(frame);
+                return TREVRPC_ERR_INVALID_FRAME;
+            }
+            err = trevrpc_wire_parse_metadata_entry(value, value_len, &frame->metadata);
+            if (err != 0) {
+                trevrpc_stream_frame_free(frame);
+                return err;
+            }
+            break;
         default:
             if (!trevrpc_wire_skip_field(data, len, &offset, wire_type)) {
                 trevrpc_stream_frame_free(frame);
@@ -429,6 +577,11 @@ int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_st
             }
             break;
         }
+    }
+
+    if (trevrpc_metadata_validate(&frame->metadata) != 0) {
+        trevrpc_stream_frame_free(frame);
+        return TREVRPC_ERR_INVALID_FRAME;
     }
 
     if (frame->kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE && frame->kind != TREVRPC_STREAM_FRAME_KIND_STATUS) {

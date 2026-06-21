@@ -12,6 +12,12 @@ extern "C" {
 #define TREVRPC_WIRE_VERSION 1u
 #define TREVRPC_DEFAULT_MAX_FRAME_SIZE (4u * 1024u * 1024u)
 
+#define TREVRPC_MAX_METADATA_ENTRIES 64u
+#define TREVRPC_MAX_METADATA_KEY_LEN 128u
+#define TREVRPC_MAX_METADATA_VALUE_LEN (8u * 1024u)
+#define TREVRPC_MAX_METADATA_TOTAL_SIZE (64u * 1024u)
+#define TREVRPC_RESERVED_METADATA_PREFIX "trevrpc-"
+
 #define TREVRPC_STATUS_OK 0u
 #define TREVRPC_STATUS_CANCELLED 1u
 #define TREVRPC_STATUS_UNKNOWN 2u
@@ -59,6 +65,18 @@ typedef struct trevrpc_config {
     size_t max_frame_size;
 } trevrpc_config;
 
+typedef struct trevrpc_metadata_entry {
+    char* key;
+    size_t key_len;
+    uint8_t* value;
+    size_t value_len;
+} trevrpc_metadata_entry;
+
+typedef struct trevrpc_metadata {
+    trevrpc_metadata_entry* entries;
+    size_t entries_len;
+} trevrpc_metadata;
+
 typedef struct trevrpc_request {
     const char* service;
     size_t service_len;
@@ -66,6 +84,7 @@ typedef struct trevrpc_request {
     size_t method_len;
     const uint8_t* body;
     size_t body_len;
+    trevrpc_metadata metadata;
     uint32_t kind;
     uint32_t version;
     uint64_t timeout_nanos;
@@ -77,6 +96,7 @@ typedef struct trevrpc_response {
     size_t message_len;
     uint8_t* body;
     size_t body_len;
+    trevrpc_metadata metadata;
 } trevrpc_response;
 
 typedef struct trevrpc_stream_frame {
@@ -86,12 +106,18 @@ typedef struct trevrpc_stream_frame {
     size_t message_len;
     uint8_t* body;
     size_t body_len;
+    trevrpc_metadata metadata;
 } trevrpc_stream_frame;
 
 typedef int (*trevrpc_unary_handler)(void* user_data, const trevrpc_request* request, trevrpc_response* response);
 typedef int (*trevrpc_stream_handler)(void* user_data, const trevrpc_request* request, trevrpc_stream* stream);
 
 trevrpc_config trevrpc_default_config(void);
+
+int trevrpc_metadata_set(
+    trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
+int trevrpc_metadata_validate(const trevrpc_metadata* metadata);
+void trevrpc_metadata_reset(trevrpc_metadata* metadata);
 
 int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_client** client);
 int trevrpc_client_call_unary(trevrpc_client* client,
@@ -108,6 +134,8 @@ int trevrpc_client_start_stream(trevrpc_client* client,
     size_t body_len,
     trevrpc_stream** stream);
 void trevrpc_client_close(trevrpc_client* client);
+
+void trevrpc_request_reset(trevrpc_request* request);
 
 int trevrpc_server_listen(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_server** server);
 int trevrpc_server_register_unary(

@@ -4,13 +4,8 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Protocol Parity
 
-- Add metadata support to `trevrpc_request`, `trevrpc_response`, and `trevrpc_stream_frame`.
-- Encode and decode request metadata field 4, response metadata field 4, and stream-frame metadata field 5.
-- Add metadata validation equivalent to Go: entry count, key length, value length, total size, lowercase key syntax, and reserved `trevrpc-` prefix rejection.
-- Add metadata ownership helpers for allocating, resetting, and freeing decoded metadata.
-- Add CTest coverage for metadata round trips, invalid metadata, duplicate keys, and unknown-field preservation behavior decisions.
+- Decide unknown-field preservation behavior for metadata map entries and add CTest coverage for that decision.
 - Add explicit timeout/deadline handling for request `timeout_nanos` instead of only preserving the field.
-- Keep Go and C golden wire tests aligned for request, response, and stream frame encoding.
 
 ## Runtime Policy
 
