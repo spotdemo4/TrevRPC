@@ -2248,7 +2248,6 @@ static int trevrpc_server_serve_transport(trevrpc_server* server, uint32_t trans
             result = trevrpc_server_is_shutting_down(server) ? 0 : err;
             break;
         }
-
         if (!trevrpc_server_connection_try_start(server)) {
             trevrpc_transport_record_event(
                 server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, 0, "too many concurrent connections");
