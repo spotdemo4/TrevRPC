@@ -15,6 +15,8 @@
 
 #define TREVRPC_NANOS_PER_SEC 1000000000ull
 
+#define TREVRPC_STREAM_LIMIT_DISABLED (-1)
+
 typedef struct trevrpc_method trevrpc_method;
 typedef struct trevrpc_server_conn_ref trevrpc_server_conn_ref;
 
@@ -47,6 +49,11 @@ struct trevrpc_stream {
     size_t max_frame_size;
     bool owns_stream;
     bool sent_status;
+    int64_t max_stream_messages;
+    int64_t request_message_count;
+    int64_t response_message_count;
+    uint32_t failure_status;
+    const char* failure_message;
 };
 
 struct trevrpc_server_conn_ref {
@@ -279,7 +286,42 @@ static trevrpc_stream* trevrpc_stream_alloc(trevrpc_msquic_stream* stream, size_
     rpc_stream->stream = stream;
     rpc_stream->max_frame_size = max_frame_size;
     rpc_stream->owns_stream = owns_stream;
+    rpc_stream->max_stream_messages = TREVRPC_STREAM_LIMIT_DISABLED;
+    rpc_stream->failure_status = TREVRPC_STATUS_OK;
     return rpc_stream;
+}
+
+static void trevrpc_stream_record_failure(trevrpc_stream* stream, uint32_t status, const char* message) {
+    if (stream == NULL || stream->sent_status || stream->failure_status != TREVRPC_STATUS_OK) {
+        return;
+    }
+
+    stream->failure_status = status;
+    stream->failure_message = message;
+}
+
+static int trevrpc_stream_check_message_limit(trevrpc_stream* stream, int64_t* count, const char* direction) {
+    if (stream->max_stream_messages >= 0 && *count >= stream->max_stream_messages) {
+        const char* message = strcmp(direction, "request") == 0 ? "request stream exceeded maximum message count"
+                                                                : "response stream exceeded maximum message count";
+        trevrpc_stream_record_failure(stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, message);
+        return TREVRPC_ERR_STREAM_LIMIT_EXCEEDED;
+    }
+
+    *count += 1;
+    return 0;
+}
+
+static int trevrpc_stream_check_exhausted_message_limit(
+    trevrpc_stream* stream, const int64_t* count, const char* direction) {
+    if (stream->max_stream_messages < 0 || *count < stream->max_stream_messages) {
+        return 0;
+    }
+
+    const char* message = strcmp(direction, "request") == 0 ? "request stream exceeded maximum message count"
+                                                            : "response stream exceeded maximum message count";
+    trevrpc_stream_record_failure(stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, message);
+    return TREVRPC_ERR_STREAM_LIMIT_EXCEEDED;
 }
 
 static int trevrpc_stream_context_error(const trevrpc_stream* stream) {
@@ -300,6 +342,10 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
         return -EINVAL;
     }
     int err = trevrpc_stream_context_error(stream);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_stream_check_message_limit(stream, &stream->response_message_count, "response");
     if (err != 0) {
         return err;
     }
@@ -345,6 +391,10 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
     if (err != 0) {
         return err;
     }
+    err = trevrpc_stream_check_exhausted_message_limit(stream, &stream->request_message_count, "request");
+    if (err != 0) {
+        return err;
+    }
 
     uint8_t* body = NULL;
     size_t body_len = 0;
@@ -358,6 +408,13 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
 
     err = trevrpc_wire_decode_stream_frame(body, body_len, out_frame);
     trevrpc_msquic_free(body);
+    if (err == 0 && *out_frame != NULL && (*out_frame)->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+        err = trevrpc_stream_check_message_limit(stream, &stream->request_message_count, "request");
+        if (err != 0) {
+            trevrpc_stream_frame_free(*out_frame);
+            *out_frame = NULL;
+        }
+    }
     return err;
 }
 
@@ -706,6 +763,13 @@ static bool trevrpc_server_is_shutting_down(trevrpc_server* server) {
     return shutting_down;
 }
 
+static trevrpc_server_options trevrpc_server_options_snapshot(trevrpc_server* server) {
+    pthread_mutex_lock(&server->mutex);
+    trevrpc_server_options options = server->options;
+    pthread_mutex_unlock(&server->mutex);
+    return options;
+}
+
 static int trevrpc_server_conn_add(
     trevrpc_server* server, trevrpc_msquic_conn* conn, trevrpc_server_conn_ref** out_ref) {
     *out_ref = NULL;
@@ -793,9 +857,39 @@ static void trevrpc_server_write_stream_status(
     trevrpc_stream rpc_stream = {
         .stream = stream,
         .max_frame_size = max_frame_size,
+        .max_stream_messages = TREVRPC_STREAM_LIMIT_DISABLED,
+        .failure_status = TREVRPC_STATUS_OK,
     };
     (void)trevrpc_stream_send_status(&rpc_stream, status, message, message == NULL ? 0 : strlen(message));
     (void)trevrpc_msquic_stream_shutdown_send(stream);
+}
+
+static uint32_t trevrpc_status_from_error(int err, const char** message) {
+    switch (err) {
+    case TREVRPC_ERR_STREAM_LIMIT_EXCEEDED:
+        *message = "stream limit exceeded";
+        return TREVRPC_STATUS_RESOURCE_EXHAUSTED;
+    case TREVRPC_ERR_FRAME_TOO_LARGE:
+    case TREV_MSQUIC_ERR_FRAME_TOO_LARGE:
+        *message = "frame exceeded maximum size";
+        return TREVRPC_STATUS_RESOURCE_EXHAUSTED;
+    case TREVRPC_ERR_INVALID_FRAME:
+    case TREVRPC_ERR_UNSUPPORTED_RPC_KIND:
+        *message = "invalid request";
+        return TREVRPC_STATUS_INVALID_ARGUMENT;
+    case TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION:
+        *message = "unsupported TrevRPC wire version";
+        return TREVRPC_STATUS_FAILED_PRECONDITION;
+    case -ETIMEDOUT:
+        *message = "RPC deadline exceeded";
+        return TREVRPC_STATUS_DEADLINE_EXCEEDED;
+    case -ECANCELED:
+        *message = "RPC cancelled";
+        return TREVRPC_STATUS_CANCELLED;
+    default:
+        *message = "handler failed";
+        return TREVRPC_STATUS_INTERNAL;
+    }
 }
 
 static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream) {
@@ -905,10 +999,13 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     }
 
     if (request.kind != TREVRPC_RPC_KIND_UNARY) {
+        trevrpc_server_options options = trevrpc_server_options_snapshot(server);
         trevrpc_stream rpc_stream = {
             .stream = stream,
             .context = &context,
             .max_frame_size = server->max_frame_size,
+            .max_stream_messages = options.max_stream_messages,
+            .failure_status = TREVRPC_STATUS_OK,
         };
         err = method->stream_handler(method->user_data, &context, &request, &rpc_stream);
         if (trevrpc_call_context_deadline_expired(&context) && !rpc_stream.sent_status) {
@@ -917,10 +1014,17 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
                 TREVRPC_STATUS_DEADLINE_EXCEEDED,
                 "RPC deadline exceeded",
                 strlen("RPC deadline exceeded"));
+        } else if (rpc_stream.failure_status != TREVRPC_STATUS_OK && !rpc_stream.sent_status) {
+            rpc_stream.context = NULL;
+            (void)trevrpc_stream_send_status(&rpc_stream,
+                rpc_stream.failure_status,
+                rpc_stream.failure_message,
+                rpc_stream.failure_message == NULL ? 0 : strlen(rpc_stream.failure_message));
         } else if (err != 0 && !rpc_stream.sent_status) {
             rpc_stream.context = NULL;
-            (void)trevrpc_stream_send_status(
-                &rpc_stream, TREVRPC_STATUS_INTERNAL, "handler failed", strlen("handler failed"));
+            const char* message = NULL;
+            uint32_t status = trevrpc_status_from_error(err, &message);
+            (void)trevrpc_stream_send_status(&rpc_stream, status, message, message == NULL ? 0 : strlen(message));
         } else if (!rpc_stream.sent_status) {
             rpc_stream.context = NULL;
             (void)trevrpc_stream_send_status(&rpc_stream, TREVRPC_STATUS_OK, NULL, 0);
@@ -1111,6 +1215,8 @@ const char* trevrpc_error(int code) {
         return "RPC handler failed";
     case TREVRPC_ERR_FRAME_TOO_LARGE:
         return "frame too large";
+    case TREVRPC_ERR_STREAM_LIMIT_EXCEEDED:
+        return "stream limit exceeded";
     case -ENOMEM:
     case ENOMEM:
         return "out of memory";

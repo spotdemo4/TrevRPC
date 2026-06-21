@@ -4,7 +4,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Runtime Policy
 
-- Enforce max stream message count for request and response streams.
 - Enforce max total stream body size for request and response streams.
 - Enforce stream idle timeout while receiving request streams and while sending response streams.
 - Add overload behavior matching Go, including accepting enough streams to return an explicit resource-exhausted status where possible.

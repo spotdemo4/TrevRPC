@@ -16,6 +16,21 @@ struct trevrpc_call_context {
     struct timespec deadline;
 };
 
+typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
+
+struct trevrpc_stream {
+    trevrpc_msquic_stream* stream;
+    const trevrpc_call_context* context;
+    size_t max_frame_size;
+    bool owns_stream;
+    bool sent_status;
+    int64_t max_stream_messages;
+    int64_t request_message_count;
+    int64_t response_message_count;
+    uint32_t failure_status;
+    const char* failure_message;
+};
+
 #define CHECK_GOTO(condition)                                                                                          \
     do {                                                                                                               \
         if (!(condition)) {                                                                                            \
@@ -128,6 +143,46 @@ cleanup:
     return result;
 }
 
+static int test_request_stream_message_limit(void) {
+    int result = 1;
+    trevrpc_stream stream = {
+        .stream = (trevrpc_msquic_stream*)1,
+        .max_stream_messages = 0,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    trevrpc_stream_frame* frame = (trevrpc_stream_frame*)1;
+
+    CHECK_GOTO(trevrpc_stream_recv(&stream, &frame) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
+    CHECK_GOTO(frame == NULL);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(stream.failure_message != NULL);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
+static int test_response_stream_message_limit(void) {
+    int result = 1;
+    trevrpc_stream stream = {
+        .stream = (trevrpc_msquic_stream*)1,
+        .max_stream_messages = 0,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    const uint8_t body[] = {1};
+
+    CHECK_GOTO(trevrpc_stream_send_message(&stream, body, sizeof(body)) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
+    CHECK_GOTO(stream.response_message_count == 0);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(stream.failure_message != NULL);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -142,6 +197,12 @@ int main(void) {
         return 1;
     }
     if (test_default_server_options() != 0) {
+        return 1;
+    }
+    if (test_request_stream_message_limit() != 0) {
+        return 1;
+    }
+    if (test_response_stream_message_limit() != 0) {
         return 1;
     }
     return 0;
