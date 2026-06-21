@@ -105,7 +105,7 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 | High-level WebTransport client/server RPC        | Yes        | No                                                    |
 | Low-level WebTransport wrapper                   | Yes        | Yes                                                   |
 | Server runtime policy options                    | Yes        | Yes                                                   |
-| Server runtime policy enforcement                | Yes        | Partial: stream message/body/idle limits              |
+| Server runtime policy enforcement                | Yes        | Partial: stream limits and overload handling          |
 | Graceful shutdown timeout                        | Yes        | Partial                                               |
 | Metrics callbacks                                | Yes        | No                                                    |
 | First-class status helpers                       | Yes        | Yes                                                   |
