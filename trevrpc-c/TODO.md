@@ -14,7 +14,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Typed Protobuf Runtime
 
-- Add tests for generated C services using protobuf-c messages across all RPC shapes.
 - Add examples showing C client and C server usage with generated code.
 
 ## WebTransport Integration

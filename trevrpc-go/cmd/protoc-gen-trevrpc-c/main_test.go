@@ -34,6 +34,8 @@ func TestGenerateGreeterCService(t *testing.T) {
 		"int (*lots_of_greetings)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream, Hello__V1__HelloReply** response);",
 		"int (*bidi_hello)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream);",
 		"int hello_v1_greeter_send_hello_v1_hello_request",
+		"int hello_v1_greeter_recv_hello_v1_hello_request",
+		"int hello_v1_greeter_send_hello_v1_hello_reply",
 		"int hello_v1_greeter_recv_hello_v1_hello_reply",
 		"int hello_v1_greeter_say_hello",
 		"int hello_v1_greeter_lots_of_replies",

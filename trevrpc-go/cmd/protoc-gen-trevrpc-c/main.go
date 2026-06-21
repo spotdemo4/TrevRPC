@@ -275,11 +275,9 @@ func generateHeaderService(buffer *bytes.Buffer, service serviceInfo) {
 	}
 	fmt.Fprintf(buffer, "} %s;\n\n", service.typeName)
 
-	for _, input := range service.inputs {
-		fmt.Fprintf(buffer, "int %s_send_%s(trevrpc_stream* stream, const %s* message);\n", service.cName, typeHelperName(input), input.cType)
-	}
-	for _, output := range service.outputs {
-		fmt.Fprintf(buffer, "int %s_recv_%s(trevrpc_stream* stream, %s** message, uint32_t* status);\n", service.cName, typeHelperName(output), output.cType)
+	for _, message := range serviceMessageTypes(service) {
+		fmt.Fprintf(buffer, "int %s_send_%s(trevrpc_stream* stream, const %s* message);\n", service.cName, typeHelperName(message), message.cType)
+		fmt.Fprintf(buffer, "int %s_recv_%s(trevrpc_stream* stream, %s** message, uint32_t* status);\n", service.cName, typeHelperName(message), message.cType)
 	}
 	buffer.WriteByte('\n')
 
@@ -310,17 +308,31 @@ func generateSource(file *descriptor.FileDescriptorProto, services []serviceInfo
 }
 
 func generateSourceService(buffer *bytes.Buffer, service serviceInfo) {
-	for _, input := range service.inputs {
-		generateSendHelper(buffer, service, input)
-	}
-	for _, output := range service.outputs {
-		generateRecvHelper(buffer, service, output)
+	for _, message := range serviceMessageTypes(service) {
+		generateSendHelper(buffer, service, message)
+		generateRecvHelper(buffer, service, message)
 	}
 	for _, method := range service.methods {
 		generateClientWrapper(buffer, service, method)
 		generateServerCallback(buffer, service, method)
 	}
 	generateRegisterFunction(buffer, service)
+}
+
+func serviceMessageTypes(service serviceInfo) []typeRef {
+	seen := map[string]typeRef{}
+	for _, input := range service.inputs {
+		seen[input.protoName] = input
+	}
+	for _, output := range service.outputs {
+		seen[output.protoName] = output
+	}
+	types := make([]typeRef, 0, len(seen))
+	for _, ref := range seen {
+		types = append(types, ref)
+	}
+	sort.Slice(types, func(i, j int) bool { return types[i].cType < types[j].cType })
+	return types
 }
 
 func generatePackCall(message typeRef, value string) string {

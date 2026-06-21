@@ -143,6 +143,7 @@
 
             configurePhase = ''
               runHook preConfigure
+              export PATH=${self.packages.${system}.trevrpc-go}/bin:$PATH
               cmake -S trevrpc-c -B build -DTREVRPC_BUILD_TESTS=ON
               runHook postConfigure
             '';
@@ -150,13 +151,18 @@
             nativeBuildInputs = with pkgs; [
               clang-tools
               cmake
+              protobuf
+              protobufc
             ];
             buildInputs = with pkgs; [
               libmsquic
               libwtf
+              protobufc
             ];
             buildPhase = ''
               runHook preBuild
+              export GOCACHE=$TMPDIR/go-cache
+              export GOMODCACHE=$TMPDIR/go-mod-cache
               cmake --build build
               runHook postBuild
             '';
@@ -170,6 +176,7 @@
                 -std=c11 \
                 -Itrevrpc-c/include \
                 -Itrevrpc-c/src \
+                -Ibuild/generated-service-test \
                 -isystem ${pkgs.libmsquic}/include \
                 -isystem ${pkgs.libwtf}/include
               ctest --test-dir build --output-on-failure
