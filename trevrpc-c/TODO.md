@@ -37,7 +37,5 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 - Add zero-copy decode paths where ownership can be made explicit and safe.
 - Add send batching decisions equivalent to Go's non-blocking stream batching.
-- Audit allocation counts for request/response/stream frame decode paths.
-- Pool reusable buffers only where lifetime and concurrency are unambiguous.
 
 ## API Cleanup

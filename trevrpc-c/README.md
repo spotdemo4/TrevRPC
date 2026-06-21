@@ -78,6 +78,21 @@ Opt-in benchmark targets are available when configuring with `-DTREVRPC_BUILD_BE
 ./build/trevrpc_runtime_bench 10000
 ```
 
+## Allocation Notes
+
+The current C runtime keeps ownership explicit and mostly allocates at API boundaries:
+
+| Path                                      | Expected dynamic allocations                                                                             |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Wire encode request/response/stream frame | One contiguous frame buffer per encode.                                                                  |
+| Wire decode request                       | Metadata/message/body copies only when those fields are present; request storage itself is caller-owned. |
+| Wire decode response/stream frame         | One result object plus metadata/message/body copies when present.                                        |
+| High-level unary dispatch                 | One request decode path, one response encode path, and handler-owned response body copies.               |
+| High-level streaming dispatch             | One stream wrapper per accepted stream plus one frame allocation per received stream frame.              |
+| MsQuic send path                          | Frame buffers are reused through a bounded per-stream send pool when ownership is unambiguous.           |
+
+Additional pooling is intentionally limited to the MsQuic send pool for now. Reusing decode/request buffers would couple ownership to callback lifetimes and concurrency; add pools only where lifetime and thread ownership are explicit.
+
 ## Ownership
 
 All setters that accept message/body/metadata bytes copy their inputs. Callers may release or mutate their input buffers immediately after a successful setter call.
