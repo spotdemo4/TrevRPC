@@ -470,6 +470,21 @@ int trevrpc_msquic_listener_accept(trevrpc_msquic_listener* listener, trevrpc_ms
     return 0;
 }
 
+int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* out_port) {
+    if (listener == NULL || out_port == NULL) {
+        return EINVAL;
+    }
+
+    QUIC_ADDR addr = {0};
+    uint32_t addr_len = sizeof(addr);
+    QUIC_STATUS status = TrevMsQuic->GetParam(listener->listener, QUIC_PARAM_LISTENER_LOCAL_ADDRESS, &addr_len, &addr);
+    if (QUIC_FAILED(status)) {
+        return (int)status;
+    }
+    *out_port = ntohs(addr.Ipv4.sin_port);
+    return 0;
+}
+
 void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
     if (listener == NULL) {
         return;

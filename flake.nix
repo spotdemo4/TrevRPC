@@ -151,6 +151,7 @@
             nativeBuildInputs = with pkgs; [
               clang-tools
               cmake
+              openssl
               protobuf
               protobufc
             ];

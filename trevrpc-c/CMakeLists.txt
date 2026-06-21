@@ -178,6 +178,7 @@ endif()
 
 if(TREVRPC_BUILD_TESTS)
     enable_testing()
+    find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
 
     add_executable(trevrpc_wire_test tests/wire_test.c)
     target_include_directories(trevrpc_wire_test PRIVATE src)
@@ -230,6 +231,27 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_sanitizers(trevrpc_runtime_test)
 
         add_test(NAME trevrpc_runtime COMMAND trevrpc_runtime_test)
+
+        set(trevrpc_msquic_test_cert "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-cert.pem")
+        set(trevrpc_msquic_test_key "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-key.pem")
+        add_custom_command(
+            OUTPUT "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}"
+            COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -keyout "${trevrpc_msquic_test_key}" -out "${trevrpc_msquic_test_cert}"
+            VERBATIM
+        )
+        add_custom_target(trevrpc_msquic_test_certificates DEPENDS "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}")
+
+        add_executable(trevrpc_msquic_transport_test tests/msquic_transport_test.c)
+        add_dependencies(trevrpc_msquic_transport_test trevrpc_msquic_test_certificates)
+        target_compile_definitions(trevrpc_msquic_transport_test PRIVATE
+            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
+            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
+        )
+        target_link_libraries(trevrpc_msquic_transport_test PRIVATE trevrpc_msquic)
+        trevrpc_c_warnings(trevrpc_msquic_transport_test)
+        trevrpc_c_sanitizers(trevrpc_msquic_transport_test)
+
+        add_test(NAME trevrpc_msquic_transport COMMAND trevrpc_msquic_transport_test)
 
         add_executable(trevrpc_generated_service_test
             tests/generated_service_test.c

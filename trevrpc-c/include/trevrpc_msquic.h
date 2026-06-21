@@ -30,6 +30,7 @@ typedef struct trevrpc_msquic_config {
 
 int trevrpc_msquic_listen(
     const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** listener);
+int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* port);
 int trevrpc_msquic_listener_accept(trevrpc_msquic_listener* listener, trevrpc_msquic_conn** conn);
 void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener);
 void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener);
