@@ -1088,6 +1088,13 @@ void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_str
     trevrpc_test_current_server = NULL;
 }
 
+int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port) {
+    if (server == NULL || port == NULL || server->wt_listener == NULL) {
+        return -EINVAL;
+    }
+    return trevrpc_wt_listener_port(server->wt_listener, port);
+}
+
 uint32_t trevrpc_test_status_from_error(int err, const char** message) {
     return trevrpc_status_from_error(err, message);
 }
@@ -1630,7 +1637,7 @@ static void trevrpc_server_shutdown_connections(trevrpc_server* server) {
         if (ref->conn != NULL) {
             trevrpc_msquic_conn_shutdown(ref->conn);
         } else if (ref->wt_session != NULL) {
-            trevrpc_wt_session_close(ref->wt_session);
+            trevrpc_wt_session_shutdown(ref->wt_session);
         }
     }
     pthread_mutex_unlock(&server->mutex);

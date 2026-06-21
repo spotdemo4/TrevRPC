@@ -44,6 +44,7 @@ void trevrpc_wt_listener_close(trevrpc_wt_listener* listener);
 int trevrpc_wt_dial(const trevrpc_wt_config* config, trevrpc_wt_session** session);
 int trevrpc_wt_session_accept_stream(trevrpc_wt_session* session, trevrpc_wt_stream** stream);
 int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_stream** stream);
+void trevrpc_wt_session_shutdown(trevrpc_wt_session* session);
 void trevrpc_wt_session_close(trevrpc_wt_session* session);
 
 intptr_t trevrpc_wt_stream_read(trevrpc_wt_stream* stream, uint8_t* data, size_t len);

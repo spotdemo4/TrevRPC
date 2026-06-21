@@ -26,6 +26,7 @@ typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server);
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_stream* stream);
+int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port);
 size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
 
@@ -77,6 +78,11 @@ typedef struct wt_rpc_server_args {
     trevrpc_server* server;
     int result;
 } wt_rpc_server_args;
+
+typedef struct serve_args {
+    trevrpc_server* server;
+    int result;
+} serve_args;
 
 static void record_started(void* user_data, const trevrpc_rpc_started_event* event) {
     (void)event;
@@ -243,6 +249,12 @@ static void* wt_unary_server_thread(void* arg) {
     return NULL;
 }
 
+static void* serve_thread(void* arg) {
+    serve_args* args = arg;
+    args->result = trevrpc_server_serve(args->server);
+    return NULL;
+}
+
 static hello_v1_greeter_server greeter_implementation(void) {
     hello_v1_greeter_server implementation = {
         .user_data = NULL,
@@ -359,6 +371,68 @@ cleanup:
     return result;
 }
 
+static int test_webtransport_serve_loop_unary_shutdown(void) {
+    int result = 1;
+    trevrpc_server* server = NULL;
+    trevrpc_client* client = NULL;
+    Hello__V1__HelloReply* response = NULL;
+    pthread_t thread = {0};
+    bool thread_started = false;
+    serve_args args = {0};
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .path = "/trevrpc",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+        .idle_timeout_ms = 1000,
+    };
+    trevrpc_config config = {0};
+    hello_v1_greeter_server implementation = greeter_implementation();
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    request.name = "Trev";
+
+    CHECK_GOTO(trevrpc_server_listen_webtransport(&server_config, &config, &server) == 0);
+    CHECK_GOTO(hello_v1_greeter_register(server, &implementation) == 0);
+    args.server = server;
+    CHECK_GOTO(pthread_create(&thread, NULL, serve_thread, &args) == 0);
+    thread_started = true;
+
+    uint16_t port = 0;
+    CHECK_GOTO(trevrpc_test_server_webtransport_port(server, &port) == 0);
+    trevrpc_wt_config client_config = {
+        .host = "127.0.0.1",
+        .port = port,
+        .path = "/trevrpc",
+        .skip_certificate_validation = 1,
+        .max_streams_per_session = 8,
+        .idle_timeout_ms = 1000,
+    };
+    CHECK_GOTO(trevrpc_client_connect_webtransport(&client_config, &config, &client) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(client, &request, &response) == 0);
+    CHECK_GOTO(response != NULL && response->message != NULL && strcmp(response->message, "Trev") == 0);
+    trevrpc_client_close(client);
+    client = NULL;
+    trevrpc_server_shutdown(server);
+    CHECK_GOTO(pthread_join(thread, NULL) == 0);
+    thread_started = false;
+    CHECK_GOTO(args.result == 0);
+
+    result = 0;
+
+cleanup:
+    if (response != NULL) {
+        hello__v1__hello_reply__free_unpacked(response, NULL);
+    }
+    trevrpc_client_close(client);
+    trevrpc_server_shutdown(server);
+    if (thread_started) {
+        (void)pthread_join(thread, NULL);
+    }
+    trevrpc_server_close(server);
+    return result;
+}
+
 static int test_generated_services_all_rpc_shapes(void) {
     int result = 1;
     Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
@@ -398,6 +472,9 @@ int main(void) {
         return 1;
     }
     if (test_webtransport_unary_round_trip() != 0) {
+        return 1;
+    }
+    if (test_webtransport_serve_loop_unary_shutdown() != 0) {
         return 1;
     }
     return 0;
