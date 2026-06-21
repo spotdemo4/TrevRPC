@@ -17,6 +17,14 @@ The CMake build creates these static libraries by default:
 
 The supported C artifacts are static libraries. Shared library builds and symbol export annotations are intentionally deferred until the C ABI policy is finalized; do not rely on default compiler symbol visibility as a stable ABI contract.
 
+## ABI Policy
+
+The public C API is source-compatible across patch releases for declarations in installed public headers. Breaking public header changes require a minor-version bump while TrevRPC remains pre-1.0; after 1.0 they require a major-version bump. Structs that are exposed by value may grow only in a minor-version bump and only when callers construct them through documented initializers such as `trevrpc_default_config` or zero-initialization where explicitly allowed. Numeric constants, status codes, and enum-compatible macro values are append-only once documented.
+
+`trevrpc_msquic.h` and `trevrpc_webtransport.h` remain public advanced transport headers. They are versioned with the rest of the C package, but only `trevrpc.h` is the stable high-level RPC API. New high-level transport support should be exposed through explicit transport constructors or options rather than hiding transport choice behind the existing MsQuic-specific constructors.
+
+Current close/shutdown naming is intentional: `close` releases caller-owned objects, while server `shutdown` asks serving loops and active work to stop before final close. `trevrpc_stream_close` releases the stream handle and aborts further local use; callers that need an orderly streaming half-close must call `trevrpc_stream_finish_send` first.
+
 ## Build
 
 ```sh

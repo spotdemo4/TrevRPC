@@ -25,8 +25,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Transport And Packaging
 
-- Add ABI/versioning policy for public C headers.
-
 ## Testing
 
 - Add invalid-frame corpus tests and fuzz-style tests for C decode paths.
@@ -50,7 +48,4 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## API Cleanup
 
-- Review whether `trevrpc_msquic.h` and `trevrpc_webtransport.h` should stay public or move behind an advanced/transport-specific include path.
 - Replace raw numeric `kind` and `status` parameters with typed enums if that improves C API clarity without hurting ABI predictability.
-- Add explicit close vs shutdown naming consistency across MsQuic, WebTransport, client, server, and stream APIs.
-- Decide whether `trevrpc_stream_close` should always abort receive, finish send, or only release resources based on ownership flags.
