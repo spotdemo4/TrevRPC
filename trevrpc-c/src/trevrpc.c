@@ -50,8 +50,11 @@ struct trevrpc_stream {
     bool owns_stream;
     bool sent_status;
     int64_t max_stream_messages;
+    int64_t max_stream_body_size;
     int64_t request_message_count;
     int64_t response_message_count;
+    uint64_t request_body_size;
+    uint64_t response_body_size;
     uint32_t failure_status;
     const char* failure_message;
 };
@@ -287,6 +290,7 @@ static trevrpc_stream* trevrpc_stream_alloc(trevrpc_msquic_stream* stream, size_
     rpc_stream->max_frame_size = max_frame_size;
     rpc_stream->owns_stream = owns_stream;
     rpc_stream->max_stream_messages = TREVRPC_STREAM_LIMIT_DISABLED;
+    rpc_stream->max_stream_body_size = TREVRPC_STREAM_LIMIT_DISABLED;
     rpc_stream->failure_status = TREVRPC_STATUS_OK;
     return rpc_stream;
 }
@@ -312,6 +316,27 @@ static int trevrpc_stream_check_message_limit(trevrpc_stream* stream, int64_t* c
     return 0;
 }
 
+static uint64_t trevrpc_saturating_add_size(uint64_t total, size_t size) {
+    if ((uint64_t)size > UINT64_MAX - total) {
+        return UINT64_MAX;
+    }
+
+    return total + (uint64_t)size;
+}
+
+static int trevrpc_stream_check_body_size_limit(
+    trevrpc_stream* stream, uint64_t* total_body_size, size_t body_len, const char* direction) {
+    *total_body_size = trevrpc_saturating_add_size(*total_body_size, body_len);
+    if (stream->max_stream_body_size < 0 || *total_body_size <= (uint64_t)stream->max_stream_body_size) {
+        return 0;
+    }
+
+    const char* message = strcmp(direction, "request") == 0 ? "request stream exceeded maximum body size"
+                                                            : "response stream exceeded maximum body size";
+    trevrpc_stream_record_failure(stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, message);
+    return TREVRPC_ERR_STREAM_LIMIT_EXCEEDED;
+}
+
 static int trevrpc_stream_check_exhausted_message_limit(
     trevrpc_stream* stream, const int64_t* count, const char* direction) {
     if (stream->max_stream_messages < 0 || *count < stream->max_stream_messages) {
@@ -320,6 +345,18 @@ static int trevrpc_stream_check_exhausted_message_limit(
 
     const char* message = strcmp(direction, "request") == 0 ? "request stream exceeded maximum message count"
                                                             : "response stream exceeded maximum message count";
+    trevrpc_stream_record_failure(stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, message);
+    return TREVRPC_ERR_STREAM_LIMIT_EXCEEDED;
+}
+
+static int trevrpc_stream_check_exhausted_body_size_limit(
+    trevrpc_stream* stream, const uint64_t* total_body_size, const char* direction) {
+    if (stream->max_stream_body_size < 0 || *total_body_size <= (uint64_t)stream->max_stream_body_size) {
+        return 0;
+    }
+
+    const char* message = strcmp(direction, "request") == 0 ? "request stream exceeded maximum body size"
+                                                            : "response stream exceeded maximum body size";
     trevrpc_stream_record_failure(stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, message);
     return TREVRPC_ERR_STREAM_LIMIT_EXCEEDED;
 }
@@ -346,6 +383,9 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
         return err;
     }
     err = trevrpc_stream_check_message_limit(stream, &stream->response_message_count, "response");
+    if (err == 0) {
+        err = trevrpc_stream_check_body_size_limit(stream, &stream->response_body_size, body_len, "response");
+    }
     if (err != 0) {
         return err;
     }
@@ -392,6 +432,9 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
         return err;
     }
     err = trevrpc_stream_check_exhausted_message_limit(stream, &stream->request_message_count, "request");
+    if (err == 0) {
+        err = trevrpc_stream_check_exhausted_body_size_limit(stream, &stream->request_body_size, "request");
+    }
     if (err != 0) {
         return err;
     }
@@ -410,6 +453,10 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
     trevrpc_msquic_free(body);
     if (err == 0 && *out_frame != NULL && (*out_frame)->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
         err = trevrpc_stream_check_message_limit(stream, &stream->request_message_count, "request");
+        if (err == 0) {
+            err = trevrpc_stream_check_body_size_limit(
+                stream, &stream->request_body_size, (*out_frame)->body_len, "request");
+        }
         if (err != 0) {
             trevrpc_stream_frame_free(*out_frame);
             *out_frame = NULL;
@@ -858,6 +905,7 @@ static void trevrpc_server_write_stream_status(
         .stream = stream,
         .max_frame_size = max_frame_size,
         .max_stream_messages = TREVRPC_STREAM_LIMIT_DISABLED,
+        .max_stream_body_size = TREVRPC_STREAM_LIMIT_DISABLED,
         .failure_status = TREVRPC_STATUS_OK,
     };
     (void)trevrpc_stream_send_status(&rpc_stream, status, message, message == NULL ? 0 : strlen(message));
@@ -1005,6 +1053,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             .context = &context,
             .max_frame_size = server->max_frame_size,
             .max_stream_messages = options.max_stream_messages,
+            .max_stream_body_size = options.max_stream_body_size,
             .failure_status = TREVRPC_STATUS_OK,
         };
         err = method->stream_handler(method->user_data, &context, &request, &rpc_stream);
