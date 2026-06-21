@@ -1,7 +1,10 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "trevrpc_msquic.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #if __has_include(<msquic.h>)
 #include <msquic.h>
 #else
@@ -11,8 +14,10 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define TREV_MSQUIC_ERR_EOF 0
+#define TREV_MSQUIC_NANOS_PER_SEC 1000000000ull
 #define TREV_MSQUIC_SEND_POOL_LIMIT 64
 #define TREV_MSQUIC_SEND_POOL_MAX_CAPACITY 65536
 
@@ -221,6 +226,41 @@ static intptr_t trevrpc_msquic_error_result(int err) {
     }
 
     return -(intptr_t)err;
+}
+
+static int trevrpc_msquic_realtime_deadline(uint64_t timeout_nanos, struct timespec* out_deadline) {
+    if (clock_gettime(CLOCK_REALTIME, out_deadline) != 0) {
+        return -errno;
+    }
+
+    uint64_t seconds = timeout_nanos / TREV_MSQUIC_NANOS_PER_SEC;
+    uint64_t nanos = timeout_nanos % TREV_MSQUIC_NANOS_PER_SEC;
+    if (seconds > (uint64_t)(INT64_MAX - out_deadline->tv_sec)) {
+        return -EOVERFLOW;
+    }
+
+    out_deadline->tv_sec += (time_t)seconds;
+    out_deadline->tv_nsec += (long)nanos;
+    if (out_deadline->tv_nsec >= (long)TREV_MSQUIC_NANOS_PER_SEC) {
+        out_deadline->tv_sec++;
+        out_deadline->tv_nsec -= (long)TREV_MSQUIC_NANOS_PER_SEC;
+    }
+    return 0;
+}
+
+static int trevrpc_msquic_stream_wait_recv_locked(trevrpc_msquic_stream* stream, const struct timespec* deadline) {
+    while (stream->recv_head == NULL && !stream->recv_fin && !stream->closed && stream->err == 0) {
+        int err = deadline == NULL ? pthread_cond_wait(&stream->cond, &stream->mutex)
+                                   : pthread_cond_timedwait(&stream->cond, &stream->mutex, deadline);
+        if (err == ETIMEDOUT) {
+            return TREV_MSQUIC_ERR_TIMEOUT;
+        }
+        if (err != 0) {
+            return -err;
+        }
+    }
+
+    return 0;
 }
 
 static intptr_t trevrpc_msquic_stream_send_buffer(
@@ -630,8 +670,10 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
     }
 
     pthread_mutex_lock(&stream->mutex);
-    while (stream->recv_head == NULL && !stream->recv_fin && !stream->closed && stream->err == 0) {
-        pthread_cond_wait(&stream->cond, &stream->mutex);
+    int wait_err = trevrpc_msquic_stream_wait_recv_locked(stream, NULL);
+    if (wait_err != 0) {
+        pthread_mutex_unlock(&stream->mutex);
+        return wait_err;
     }
 
     if (stream->recv_head == NULL) {
@@ -657,11 +699,13 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
     return (intptr_t)copied;
 }
 
-static intptr_t trevrpc_msquic_stream_read_exact_locked(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
+static intptr_t trevrpc_msquic_stream_read_exact_locked(
+    trevrpc_msquic_stream* stream, uint8_t* data, size_t len, const struct timespec* deadline) {
     size_t copied = 0;
     while (copied < len) {
-        while (stream->recv_head == NULL && !stream->recv_fin && !stream->closed && stream->err == 0) {
-            pthread_cond_wait(&stream->cond, &stream->mutex);
+        int wait_err = trevrpc_msquic_stream_wait_recv_locked(stream, deadline);
+        if (wait_err != 0) {
+            return wait_err;
         }
 
         if (stream->recv_head == NULL) {
@@ -690,13 +734,14 @@ static intptr_t trevrpc_msquic_stream_read_exact_locked(trevrpc_msquic_stream* s
     return (intptr_t)copied;
 }
 
-intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
+static intptr_t trevrpc_msquic_stream_read_frame_until(
+    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, const struct timespec* deadline) {
     *body = NULL;
     *len = 0;
 
     uint8_t header[4];
     pthread_mutex_lock(&stream->mutex);
-    intptr_t read = trevrpc_msquic_stream_read_exact_locked(stream, header, sizeof(header));
+    intptr_t read = trevrpc_msquic_stream_read_exact_locked(stream, header, sizeof(header), deadline);
     if (read <= 0) {
         pthread_mutex_unlock(&stream->mutex);
         return read;
@@ -721,7 +766,7 @@ intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t
         return -ENOMEM;
     }
 
-    read = trevrpc_msquic_stream_read_exact_locked(stream, buffer, body_len);
+    read = trevrpc_msquic_stream_read_exact_locked(stream, buffer, body_len, deadline);
     pthread_mutex_unlock(&stream->mutex);
     if (read <= 0) {
         free(buffer);
@@ -731,6 +776,25 @@ intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t
     *body = buffer;
     *len = body_len;
     return 1;
+}
+
+intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
+    return trevrpc_msquic_stream_read_frame_until(stream, body, len, max_len, NULL);
+}
+
+intptr_t trevrpc_msquic_stream_read_frame_timeout(
+    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos) {
+    if (timeout_nanos == 0) {
+        return trevrpc_msquic_stream_read_frame(stream, body, len, max_len);
+    }
+
+    struct timespec deadline = {0};
+    int err = trevrpc_msquic_realtime_deadline(timeout_nanos, &deadline);
+    if (err != 0) {
+        return err;
+    }
+
+    return trevrpc_msquic_stream_read_frame_until(stream, body, len, max_len, &deadline);
 }
 
 intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
@@ -899,6 +963,8 @@ const char* trevrpc_msquic_error(int code) {
         return "closed";
     case TREV_MSQUIC_ERR_FRAME_TOO_LARGE:
         return "frame too large";
+    case TREV_MSQUIC_ERR_TIMEOUT:
+        return "timed out";
     case ENOMEM:
     case -ENOMEM:
         return "out of memory";

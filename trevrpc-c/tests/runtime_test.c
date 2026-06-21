@@ -3,6 +3,7 @@
 #include "trevrpc.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,12 +27,39 @@ struct trevrpc_stream {
     bool sent_status;
     int64_t max_stream_messages;
     int64_t max_stream_body_size;
+    uint64_t stream_idle_timeout_nanos;
     int64_t request_message_count;
     int64_t response_message_count;
     uint64_t request_body_size;
     uint64_t response_body_size;
+    bool response_idle_started;
+    struct timespec response_last_activity;
     uint32_t failure_status;
     const char* failure_message;
+};
+
+typedef struct trevrpc_msquic_chunk {
+    struct trevrpc_msquic_chunk* next;
+    size_t len;
+    size_t offset;
+    uint8_t data[];
+} trevrpc_msquic_chunk;
+
+typedef struct trevrpc_msquic_send trevrpc_msquic_send;
+
+struct trevrpc_msquic_stream {
+    void* handle;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    trevrpc_msquic_chunk* recv_head;
+    trevrpc_msquic_chunk* recv_tail;
+    bool recv_fin;
+    bool send_closed;
+    bool shutdown_complete;
+    bool closed;
+    int err;
+    trevrpc_msquic_send* send_pool;
+    size_t send_pool_count;
 };
 
 #define CHECK_GOTO(condition)                                                                                          \
@@ -231,6 +259,67 @@ cleanup:
     return result;
 }
 
+static int test_request_stream_idle_timeout(void) {
+    int result = 1;
+    bool mutex_initialized = false;
+    bool cond_initialized = false;
+    trevrpc_msquic_stream raw_stream = {0};
+    trevrpc_stream stream = {
+        .stream = &raw_stream,
+        .max_stream_messages = -1,
+        .max_stream_body_size = -1,
+        .stream_idle_timeout_nanos = 1000000ull,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    trevrpc_stream_frame* frame = (trevrpc_stream_frame*)1;
+
+    CHECK_GOTO(pthread_mutex_init(&raw_stream.mutex, NULL) == 0);
+    mutex_initialized = true;
+    CHECK_GOTO(pthread_cond_init(&raw_stream.cond, NULL) == 0);
+    cond_initialized = true;
+
+    CHECK_GOTO(trevrpc_stream_recv(&stream, &frame) == TREVRPC_ERR_STREAM_IDLE_TIMEOUT);
+    CHECK_GOTO(frame == NULL);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_UNAVAILABLE);
+    CHECK_GOTO(stream.failure_message != NULL);
+
+    result = 0;
+
+cleanup:
+    if (cond_initialized) {
+        pthread_cond_destroy(&raw_stream.cond);
+    }
+    if (mutex_initialized) {
+        pthread_mutex_destroy(&raw_stream.mutex);
+    }
+    return result;
+}
+
+static int test_response_stream_idle_timeout(void) {
+    int result = 1;
+    trevrpc_stream stream = {
+        .stream = (trevrpc_msquic_stream*)1,
+        .max_stream_messages = -1,
+        .max_stream_body_size = -1,
+        .stream_idle_timeout_nanos = 1,
+        .response_idle_started = true,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    const uint8_t body[] = {1};
+
+    CHECK_GOTO(now(&stream.response_last_activity) == 0);
+    stream.response_last_activity.tv_sec--;
+
+    CHECK_GOTO(trevrpc_stream_send_message(&stream, body, sizeof(body)) == TREVRPC_ERR_STREAM_IDLE_TIMEOUT);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_UNAVAILABLE);
+    CHECK_GOTO(stream.failure_message != NULL);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -257,6 +346,12 @@ int main(void) {
         return 1;
     }
     if (test_response_stream_body_size_limit() != 0) {
+        return 1;
+    }
+    if (test_request_stream_idle_timeout() != 0) {
+        return 1;
+    }
+    if (test_response_stream_idle_timeout() != 0) {
         return 1;
     }
     return 0;

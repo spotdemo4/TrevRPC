@@ -51,10 +51,13 @@ struct trevrpc_stream {
     bool sent_status;
     int64_t max_stream_messages;
     int64_t max_stream_body_size;
+    uint64_t stream_idle_timeout_nanos;
     int64_t request_message_count;
     int64_t response_message_count;
     uint64_t request_body_size;
     uint64_t response_body_size;
+    bool response_idle_started;
+    struct timespec response_last_activity;
     uint32_t failure_status;
     const char* failure_message;
 };
@@ -361,6 +364,41 @@ static int trevrpc_stream_check_exhausted_body_size_limit(
     return TREVRPC_ERR_STREAM_LIMIT_EXCEEDED;
 }
 
+static int trevrpc_stream_start_response_idle_timer(trevrpc_stream* stream) {
+    if (stream == NULL || stream->stream_idle_timeout_nanos == 0) {
+        return 0;
+    }
+
+    int err = trevrpc_clock_now(&stream->response_last_activity);
+    if (err != 0) {
+        return err;
+    }
+    stream->response_idle_started = true;
+    return 0;
+}
+
+static int trevrpc_stream_check_response_idle_timeout(trevrpc_stream* stream) {
+    if (stream->stream_idle_timeout_nanos == 0) {
+        return 0;
+    }
+    if (!stream->response_idle_started) {
+        return trevrpc_stream_start_response_idle_timer(stream);
+    }
+
+    struct timespec now = {0};
+    int err = trevrpc_clock_now(&now);
+    if (err != 0) {
+        return err;
+    }
+    if (trevrpc_timespec_diff_nanos(&now, &stream->response_last_activity) > stream->stream_idle_timeout_nanos) {
+        trevrpc_stream_record_failure(stream, TREVRPC_STATUS_UNAVAILABLE, "response stream idle timeout");
+        return TREVRPC_ERR_STREAM_IDLE_TIMEOUT;
+    }
+
+    stream->response_last_activity = now;
+    return 0;
+}
+
 static int trevrpc_stream_context_error(const trevrpc_stream* stream) {
     if (stream == NULL || stream->context == NULL) {
         return 0;
@@ -379,6 +417,10 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
         return -EINVAL;
     }
     int err = trevrpc_stream_context_error(stream);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_stream_check_response_idle_timeout(stream);
     if (err != 0) {
         return err;
     }
@@ -441,8 +483,16 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
 
     uint8_t* body = NULL;
     size_t body_len = 0;
-    intptr_t read = trevrpc_msquic_stream_read_frame(stream->stream, &body, &body_len, stream->max_frame_size);
+    intptr_t read =
+        stream->stream_idle_timeout_nanos == 0
+            ? trevrpc_msquic_stream_read_frame(stream->stream, &body, &body_len, stream->max_frame_size)
+            : trevrpc_msquic_stream_read_frame_timeout(
+                  stream->stream, &body, &body_len, stream->max_frame_size, stream->stream_idle_timeout_nanos);
     if (read < 0) {
+        if (read == TREV_MSQUIC_ERR_TIMEOUT) {
+            trevrpc_stream_record_failure(stream, TREVRPC_STATUS_UNAVAILABLE, "request stream idle timeout");
+            return TREVRPC_ERR_STREAM_IDLE_TIMEOUT;
+        }
         return (int)read;
     }
     if (read == 0) {
@@ -917,6 +967,10 @@ static uint32_t trevrpc_status_from_error(int err, const char** message) {
     case TREVRPC_ERR_STREAM_LIMIT_EXCEEDED:
         *message = "stream limit exceeded";
         return TREVRPC_STATUS_RESOURCE_EXHAUSTED;
+    case TREVRPC_ERR_STREAM_IDLE_TIMEOUT:
+    case TREV_MSQUIC_ERR_TIMEOUT:
+        *message = "stream idle timeout";
+        return TREVRPC_STATUS_UNAVAILABLE;
     case TREVRPC_ERR_FRAME_TOO_LARGE:
     case TREV_MSQUIC_ERR_FRAME_TOO_LARGE:
         *message = "frame exceeded maximum size";
@@ -1054,8 +1108,10 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             .max_frame_size = server->max_frame_size,
             .max_stream_messages = options.max_stream_messages,
             .max_stream_body_size = options.max_stream_body_size,
+            .stream_idle_timeout_nanos = options.stream_idle_timeout_nanos,
             .failure_status = TREVRPC_STATUS_OK,
         };
+        (void)trevrpc_stream_start_response_idle_timer(&rpc_stream);
         err = method->stream_handler(method->user_data, &context, &request, &rpc_stream);
         if (trevrpc_call_context_deadline_expired(&context) && !rpc_stream.sent_status) {
             rpc_stream.context = NULL;
@@ -1266,6 +1322,8 @@ const char* trevrpc_error(int code) {
         return "frame too large";
     case TREVRPC_ERR_STREAM_LIMIT_EXCEEDED:
         return "stream limit exceeded";
+    case TREVRPC_ERR_STREAM_IDLE_TIMEOUT:
+        return "stream idle timeout";
     case -ENOMEM:
     case ENOMEM:
         return "out of memory";

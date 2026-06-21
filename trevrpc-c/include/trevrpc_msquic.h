@@ -14,6 +14,7 @@ typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 
 #define TREV_MSQUIC_ERR_CLOSED -1001
 #define TREV_MSQUIC_ERR_FRAME_TOO_LARGE -1002
+#define TREV_MSQUIC_ERR_TIMEOUT -1003
 
 typedef struct trevrpc_msquic_config {
     const char* alpn;
@@ -42,6 +43,8 @@ void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn);
 
 intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
+intptr_t trevrpc_msquic_stream_read_frame_timeout(
+    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos);
 intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_write_message_frame(
     trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);

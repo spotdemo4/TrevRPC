@@ -50,6 +50,7 @@ extern "C" {
 #define TREVRPC_ERR_HANDLER_FAILED -2004
 #define TREVRPC_ERR_FRAME_TOO_LARGE -2005
 #define TREVRPC_ERR_STREAM_LIMIT_EXCEEDED -2006
+#define TREVRPC_ERR_STREAM_IDLE_TIMEOUT -2007
 
 typedef struct trevrpc_client trevrpc_client;
 typedef struct trevrpc_server trevrpc_server;
