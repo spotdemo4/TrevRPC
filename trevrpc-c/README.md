@@ -107,7 +107,7 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 | Server runtime policy options                    | Yes        | Yes                                                   |
 | Server runtime policy enforcement                | Yes        | Partial: stream limits and overload handling          |
 | Graceful shutdown timeout                        | Yes        | Yes                                                   |
-| Metrics callbacks                                | Yes        | No                                                    |
+| Metrics callbacks                                | Yes        | Yes                                                   |
 | First-class status helpers                       | Yes        | Yes                                                   |
 | Generated typed C protobuf helpers               | No         | Partial generator support, runtime helpers incomplete |
 | CMake installable libraries                      | N/A        | Yes                                                   |

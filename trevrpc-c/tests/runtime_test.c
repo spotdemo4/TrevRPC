@@ -26,6 +26,7 @@ struct trevrpc_stream {
     size_t max_frame_size;
     bool owns_stream;
     bool sent_status;
+    uint32_t terminal_status;
     int64_t max_stream_messages;
     int64_t max_stream_body_size;
     uint64_t stream_idle_timeout_nanos;

@@ -8,8 +8,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Metrics And Observability
 
-- Add metrics callbacks equivalent to Go `RPCStarted` and `RPCFinished`.
-- Include service, method, request body length, response body length, status code, and elapsed time in metrics events.
 - Add transport lifecycle callbacks for listener/session/connection/stream open, close, and error events.
 - Add optional structured log callback support for the C runtime, not only the libwtf wrapper.
 - Add tests proving metrics fire exactly once on success, handler failure, cancellation, and decode errors.

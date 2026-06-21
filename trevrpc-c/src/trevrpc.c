@@ -50,6 +50,7 @@ struct trevrpc_stream {
     size_t max_frame_size;
     bool owns_stream;
     bool sent_status;
+    uint32_t terminal_status;
     int64_t max_stream_messages;
     int64_t max_stream_body_size;
     uint64_t stream_idle_timeout_nanos;
@@ -78,6 +79,7 @@ struct trevrpc_server {
     trevrpc_server_conn_ref* conns;
     trevrpc_authorizer authorizer;
     void* authorizer_user_data;
+    trevrpc_metrics metrics;
     size_t active_tasks;
     size_t active_connections;
     size_t active_requests;
@@ -492,6 +494,7 @@ int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const ch
     free(frame);
     if (err == 0) {
         stream->sent_status = true;
+        stream->terminal_status = trevrpc_status_code_from_uint32(status);
     }
     return err;
 }
@@ -768,6 +771,27 @@ void trevrpc_server_clear_authorizer(trevrpc_server* server) {
     pthread_mutex_unlock(&server->mutex);
 }
 
+int trevrpc_server_set_metrics(trevrpc_server* server, const trevrpc_metrics* metrics) {
+    if (server == NULL || metrics == NULL) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    server->metrics = *metrics;
+    pthread_mutex_unlock(&server->mutex);
+    return 0;
+}
+
+void trevrpc_server_clear_metrics(trevrpc_server* server) {
+    if (server == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    server->metrics = (trevrpc_metrics){0};
+    pthread_mutex_unlock(&server->mutex);
+}
+
 int trevrpc_server_register_unary(
     trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data) {
     if (server == NULL || service == NULL || method == NULL || handler == NULL) {
@@ -1021,6 +1045,58 @@ static trevrpc_authorizer trevrpc_server_authorizer_snapshot(trevrpc_server* ser
     return authorizer;
 }
 
+static trevrpc_metrics trevrpc_server_metrics_snapshot(trevrpc_server* server) {
+    pthread_mutex_lock(&server->mutex);
+    trevrpc_metrics metrics = server->metrics;
+    pthread_mutex_unlock(&server->mutex);
+    return metrics;
+}
+
+static void trevrpc_metrics_record_started(trevrpc_server* server, const trevrpc_request* request) {
+    trevrpc_metrics metrics = trevrpc_server_metrics_snapshot(server);
+    if (metrics.rpc_started == NULL) {
+        return;
+    }
+
+    trevrpc_rpc_started_event event = {
+        .service = request->service,
+        .service_len = request->service_len,
+        .method = request->method,
+        .method_len = request->method_len,
+        .request_body_len = request->body_len,
+    };
+    metrics.rpc_started(metrics.user_data, &event);
+}
+
+static void trevrpc_metrics_record_finished(trevrpc_server* server,
+    const trevrpc_request* request,
+    size_t response_body_len,
+    uint32_t status,
+    const struct timespec* started_at) {
+    trevrpc_metrics metrics = trevrpc_server_metrics_snapshot(server);
+    if (metrics.rpc_finished == NULL) {
+        return;
+    }
+
+    struct timespec finished_at = {0};
+    uint64_t elapsed_nanos = 0;
+    if (started_at != NULL && trevrpc_clock_now(&finished_at) == 0) {
+        elapsed_nanos = trevrpc_timespec_diff_nanos(&finished_at, started_at);
+    }
+
+    trevrpc_rpc_finished_event event = {
+        .service = request->service,
+        .service_len = request->service_len,
+        .method = request->method,
+        .method_len = request->method_len,
+        .request_body_len = request->body_len,
+        .response_body_len = response_body_len,
+        .status = trevrpc_status_code_from_uint32(status),
+        .elapsed_nanos = elapsed_nanos,
+    };
+    metrics.rpc_finished(metrics.user_data, &event);
+}
+
 static void trevrpc_server_shutdown_connections(trevrpc_server* server) {
     pthread_mutex_lock(&server->mutex);
     for (trevrpc_server_conn_ref* ref = server->conns; ref != NULL; ref = ref->next) {
@@ -1218,6 +1294,11 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         trevrpc_msquic_free(body);
         return;
     }
+
+    struct timespec rpc_started_at = {0};
+    (void)trevrpc_clock_now(&rpc_started_at);
+    trevrpc_metrics_record_started(server, &request);
+
     trevrpc_call_context context;
     err = trevrpc_call_context_init(&context, server, &request);
     if (err == -ERANGE) {
@@ -1228,6 +1309,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             trevrpc_server_write_stream_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "RPC timeout is too large");
         }
+        trevrpc_metrics_record_finished(server, &request, 0, TREVRPC_STATUS_INVALID_ARGUMENT, &rpc_started_at);
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
@@ -1240,6 +1322,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             trevrpc_server_write_stream_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_INVALID_ARGUMENT, "RPC timeout overflowed");
         }
+        trevrpc_metrics_record_finished(server, &request, 0, TREVRPC_STATUS_INVALID_ARGUMENT, &rpc_started_at);
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
@@ -1247,6 +1330,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     if (err != 0) {
         trevrpc_server_write_status(
             stream, server->max_frame_size, TREVRPC_STATUS_INTERNAL, "failed to prepare request");
+        trevrpc_metrics_record_finished(server, &request, 0, TREVRPC_STATUS_INTERNAL, &rpc_started_at);
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
@@ -1259,6 +1343,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             trevrpc_server_write_stream_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_DEADLINE_EXCEEDED, "RPC deadline exceeded");
         }
+        trevrpc_metrics_record_finished(server, &request, 0, TREVRPC_STATUS_DEADLINE_EXCEEDED, &rpc_started_at);
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
@@ -1281,6 +1366,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             } else {
                 trevrpc_server_write_stream_status(stream, server->max_frame_size, status.code, status.message);
             }
+            trevrpc_metrics_record_finished(server, &request, 0, status.code, &rpc_started_at);
             trevrpc_request_reset(&request);
             trevrpc_msquic_free(body);
             return;
@@ -1295,6 +1381,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             trevrpc_server_write_stream_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "too many concurrent RPCs");
         }
+        trevrpc_metrics_record_finished(server, &request, 0, TREVRPC_STATUS_RESOURCE_EXHAUSTED, &rpc_started_at);
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
         return;
@@ -1309,6 +1396,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             trevrpc_server_write_stream_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method is not implemented");
         }
+        trevrpc_metrics_record_finished(server, &request, 0, TREVRPC_STATUS_UNIMPLEMENTED, &rpc_started_at);
         trevrpc_server_request_finish(server);
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
@@ -1322,6 +1410,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
             trevrpc_server_write_stream_status(
                 stream, server->max_frame_size, TREVRPC_STATUS_UNIMPLEMENTED, "method RPC kind mismatch");
         }
+        trevrpc_metrics_record_finished(server, &request, 0, TREVRPC_STATUS_UNIMPLEMENTED, &rpc_started_at);
         trevrpc_server_request_finish(server);
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
@@ -1341,14 +1430,17 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         };
         (void)trevrpc_stream_start_response_idle_timer(&rpc_stream);
         err = method->stream_handler(method->user_data, &context, &request, &rpc_stream);
+        uint32_t final_status = TREVRPC_STATUS_OK;
         if (trevrpc_call_context_deadline_expired(&context) && !rpc_stream.sent_status) {
             rpc_stream.context = NULL;
+            final_status = TREVRPC_STATUS_DEADLINE_EXCEEDED;
             (void)trevrpc_stream_send_status(&rpc_stream,
                 TREVRPC_STATUS_DEADLINE_EXCEEDED,
                 "RPC deadline exceeded",
                 strlen("RPC deadline exceeded"));
         } else if (rpc_stream.failure_status != TREVRPC_STATUS_OK && !rpc_stream.sent_status) {
             rpc_stream.context = NULL;
+            final_status = rpc_stream.failure_status;
             (void)trevrpc_stream_send_status(&rpc_stream,
                 rpc_stream.failure_status,
                 rpc_stream.failure_message,
@@ -1356,13 +1448,17 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
         } else if (err != 0 && !rpc_stream.sent_status) {
             rpc_stream.context = NULL;
             const char* message = NULL;
-            uint32_t status = trevrpc_status_from_error(err, &message);
-            (void)trevrpc_stream_send_status(&rpc_stream, status, message, message == NULL ? 0 : strlen(message));
+            final_status = trevrpc_status_from_error(err, &message);
+            (void)trevrpc_stream_send_status(&rpc_stream, final_status, message, message == NULL ? 0 : strlen(message));
         } else if (!rpc_stream.sent_status) {
             rpc_stream.context = NULL;
             (void)trevrpc_stream_send_status(&rpc_stream, TREVRPC_STATUS_OK, NULL, 0);
+        } else {
+            final_status = rpc_stream.terminal_status;
         }
         (void)trevrpc_stream_finish_send(&rpc_stream);
+        trevrpc_metrics_record_finished(
+            server, &request, (size_t)rpc_stream.response_body_size, final_status, &rpc_started_at);
         trevrpc_server_request_finish(server);
         trevrpc_request_reset(&request);
         trevrpc_msquic_free(body);
@@ -1380,6 +1476,7 @@ static void trevrpc_handle_stream(trevrpc_server* server, trevrpc_msquic_stream*
     }
 
     trevrpc_server_write_response(stream, server->max_frame_size, &response);
+    trevrpc_metrics_record_finished(server, &request, response.body_len, response.status, &rpc_started_at);
     trevrpc_response_reset(&response);
     trevrpc_server_request_finish(server);
     trevrpc_request_reset(&request);

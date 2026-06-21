@@ -148,6 +148,34 @@ typedef struct trevrpc_bearer_authorizer {
     size_t token_len;
 } trevrpc_bearer_authorizer;
 
+typedef struct trevrpc_rpc_started_event {
+    const char* service;
+    size_t service_len;
+    const char* method;
+    size_t method_len;
+    size_t request_body_len;
+} trevrpc_rpc_started_event;
+
+typedef struct trevrpc_rpc_finished_event {
+    const char* service;
+    size_t service_len;
+    const char* method;
+    size_t method_len;
+    size_t request_body_len;
+    size_t response_body_len;
+    uint32_t status;
+    uint64_t elapsed_nanos;
+} trevrpc_rpc_finished_event;
+
+typedef void (*trevrpc_rpc_started_callback)(void* user_data, const trevrpc_rpc_started_event* event);
+typedef void (*trevrpc_rpc_finished_callback)(void* user_data, const trevrpc_rpc_finished_event* event);
+
+typedef struct trevrpc_metrics {
+    trevrpc_rpc_started_callback rpc_started;
+    trevrpc_rpc_finished_callback rpc_finished;
+    void* user_data;
+} trevrpc_metrics;
+
 trevrpc_config trevrpc_default_config(void);
 trevrpc_server_options trevrpc_default_server_options(void);
 
@@ -209,6 +237,8 @@ int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_opti
 int trevrpc_server_get_options(trevrpc_server* server, trevrpc_server_options* options);
 int trevrpc_server_set_authorizer(trevrpc_server* server, trevrpc_authorizer authorizer, void* user_data);
 void trevrpc_server_clear_authorizer(trevrpc_server* server);
+int trevrpc_server_set_metrics(trevrpc_server* server, const trevrpc_metrics* metrics);
+void trevrpc_server_clear_metrics(trevrpc_server* server);
 int trevrpc_server_register_unary(
     trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data);
 int trevrpc_server_register_streaming(trevrpc_server* server,
