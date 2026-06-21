@@ -43,8 +43,6 @@ This tracks missing C runtime work needed to bring `trevrpc-c` closer to feature
 
 ## Documentation
 
-- Add C examples for unary, server-streaming, client-streaming, and bidi streaming.
-
 ## Performance
 
 - Benchmark C wire encode/decode directly.
