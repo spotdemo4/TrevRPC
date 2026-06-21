@@ -58,6 +58,12 @@ intptr_t trevrpc_msquic_stream_write_message_frame(
     const uint8_t* body,
     size_t body_len,
     size_t max_len);
+intptr_t trevrpc_msquic_stream_write_message_frames(
+    trevrpc_msquic_stream* stream,
+    const uint8_t* bodies,
+    const size_t* body_lens,
+    size_t count,
+    size_t max_len);
 int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream);
 int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream);
 void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream);

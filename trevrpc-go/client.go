@@ -40,7 +40,7 @@ type BidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 }
 
 type responseStreamFrameFieldsReceiver interface {
-	trevrpcRecvStreamFrameFields() (streamFrameFields, error)
+	trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error)
 }
 
 // CallOptions controls client-side timeouts, response limits, and request metadata.
@@ -171,7 +171,7 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 		return zero, err
 	}
 
-	ctx, cancel := callContext(ctx, callOptions)
+	ctx, cancel := callContextWithoutLocalCancel(ctx, callOptions)
 	defer cancel()
 
 	response, err := transport.Call(ctx, rpcRequest)
@@ -207,7 +207,7 @@ func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 		return nil, err
 	}
 
-	ctx, cancel := callContext(ctx, callOptions)
+	ctx, cancel := callContextWithoutLocalCancel(ctx, callOptions)
 	response, err := transport.StreamingCall(ctx, rpcRequest, EmptyStream[[]byte]())
 	if err != nil {
 		cancel()
@@ -294,7 +294,7 @@ func startRequestStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Conte
 		return nil, func() {}, err
 	}
 
-	ctx, cancel := callContext(ctx, callOptions)
+	ctx, cancel := callContextForRequestStream(ctx, callOptions, requests)
 	response, err := transport.StreamingCall(ctx, rpcRequest, EncodeStream(requests))
 	if err != nil {
 		cancel()
@@ -400,6 +400,22 @@ func callContext(ctx context.Context, options CallOptions) (context.Context, con
 	return context.WithCancel(ctx)
 }
 
+func callContextWithoutLocalCancel(ctx context.Context, options CallOptions) (context.Context, context.CancelFunc) {
+	if options.HasTimeout || ctx.Done() != nil {
+		return callContext(ctx, options)
+	}
+
+	return ctx, func() {}
+}
+
+func callContextForRequestStream[Req ProtoMessage](ctx context.Context, options CallOptions, requests MessageStream[Req]) (context.Context, context.CancelFunc) {
+	if isNonBlockingStream(requests) {
+		return callContextWithoutLocalCancel(ctx, options)
+	}
+
+	return callContext(ctx, options)
+}
+
 func validateResponse(response *RpcResponse, maxBodySize int) error {
 	if response == nil {
 		return Internal("missing RPC response")
@@ -442,7 +458,10 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		return zero, io.EOF
 	}
 
-	frame, err := recvFrameFieldsWithTimeout(s.ctx, s.inner, s.options.StreamIdleTimeout)
+	frame, release, err := recvFrameFieldsWithTimeout(s.ctx, s.inner, s.options.StreamIdleTimeout)
+	if release != nil {
+		defer release()
+	}
 	if err != nil {
 		s.finish()
 		var zero T
@@ -578,14 +597,14 @@ func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout t
 	}
 }
 
-func recvFrameFieldsWithTimeout(ctx context.Context, stream FrameStream, idleTimeout time.Duration) (streamFrameFields, error) {
+func recvFrameFieldsWithTimeout(ctx context.Context, stream FrameStream, idleTimeout time.Duration) (streamFrameFields, func(), error) {
 	if fieldsReceiver, ok := stream.(responseStreamFrameFieldsReceiver); ok {
 		return recvOptimizedFrameFieldsWithTimeout(ctx, fieldsReceiver, idleTimeout, streamContextCancelsRecv(stream))
 	}
 
 	frame, err := recvFrameWithTimeout(ctx, stream, idleTimeout)
 	if err != nil {
-		return streamFrameFields{}, err
+		return streamFrameFields{}, nil, err
 	}
 
 	return streamFrameFields{
@@ -594,33 +613,37 @@ func recvFrameFieldsWithTimeout(ctx context.Context, stream FrameStream, idleTim
 		message:  frame.Message,
 		body:     frame.Body,
 		metadata: frame.Metadata,
-	}, nil
+	}, nil, nil
 }
 
-func recvOptimizedFrameFieldsWithTimeout(ctx context.Context, stream responseStreamFrameFieldsReceiver, idleTimeout time.Duration, contextCancelsRecv bool) (streamFrameFields, error) {
+func recvOptimizedFrameFieldsWithTimeout(ctx context.Context, stream responseStreamFrameFieldsReceiver, idleTimeout time.Duration, contextCancelsRecv bool) (streamFrameFields, func(), error) {
 	if err := ctx.Err(); err != nil {
-		return streamFrameFields{}, statusFromContextError(err)
+		return streamFrameFields{}, nil, statusFromContextError(err)
 	}
 	if idleTimeout <= 0 && contextCancelsRecv {
-		frame, err := stream.trevrpcRecvStreamFrameFields()
+		frame, release, err := stream.trevrpcRecvStreamFrameFields()
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return streamFrameFields{}, statusFromContextError(ctxErr)
+				if release != nil {
+					release()
+				}
+				return streamFrameFields{}, nil, statusFromContextError(ctxErr)
 			}
 		}
 
-		return frame, err
+		return frame, release, err
 	}
 
 	type recvResult struct {
-		frame streamFrameFields
-		err   error
+		frame   streamFrameFields
+		release func()
+		err     error
 	}
 
 	results := make(chan recvResult, 1)
 	go func() {
-		frame, err := stream.trevrpcRecvStreamFrameFields()
-		results <- recvResult{frame: frame, err: err}
+		frame, release, err := stream.trevrpcRecvStreamFrameFields()
+		results <- recvResult{frame: frame, release: release, err: err}
 	}()
 
 	var idle <-chan time.Time
@@ -635,19 +658,22 @@ func recvOptimizedFrameFieldsWithTimeout(ctx context.Context, stream responseStr
 	case result := <-results:
 		if result.err != nil {
 			if err := ctx.Err(); err != nil {
-				return streamFrameFields{}, statusFromContextError(err)
+				if result.release != nil {
+					result.release()
+				}
+				return streamFrameFields{}, nil, statusFromContextError(err)
 			}
 		}
 
-		return result.frame, result.err
+		return result.frame, result.release, result.err
 	case <-ctx.Done():
-		return streamFrameFields{}, statusFromContextError(ctx.Err())
+		return streamFrameFields{}, nil, statusFromContextError(ctx.Err())
 	case <-idle:
 		if err := ctx.Err(); err != nil {
-			return streamFrameFields{}, statusFromContextError(err)
+			return streamFrameFields{}, nil, statusFromContextError(err)
 		}
 
-		return streamFrameFields{}, Unavailable("response stream idle timeout")
+		return streamFrameFields{}, nil, Unavailable("response stream idle timeout")
 	}
 }
 

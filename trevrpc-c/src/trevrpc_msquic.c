@@ -798,6 +798,64 @@ intptr_t trevrpc_msquic_stream_write_message_frame(
     return trevrpc_msquic_stream_send_buffer(stream, send, frame_len);
 }
 
+intptr_t trevrpc_msquic_stream_write_message_frames(
+    trevrpc_msquic_stream* stream,
+    const uint8_t* bodies,
+    const size_t* body_lens,
+    size_t count,
+    size_t max_len) {
+    if (count == 0) {
+        return 0;
+    }
+
+    size_t frame_len = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t frame_body_len = 0;
+        if (body_lens[i] > 0) {
+            size_t varint_len = trevrpc_msquic_varint_len(body_lens[i]);
+            if (body_lens[i] > SIZE_MAX - 1 - varint_len) {
+                return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+            }
+            frame_body_len = 1 + varint_len + body_lens[i];
+        }
+        if (frame_body_len > max_len || frame_body_len > UINT32_MAX - 4) {
+            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+        }
+        if (frame_len > SIZE_MAX - 4 - frame_body_len) {
+            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+        }
+        frame_len += 4 + frame_body_len;
+    }
+
+    trevrpc_msquic_send* send = trevrpc_msquic_send_acquire(stream, frame_len);
+    if (send == NULL) {
+        return -ENOMEM;
+    }
+
+    uint8_t* out = send->data;
+    size_t body_offset = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t frame_body_len = 0;
+        if (body_lens[i] > 0) {
+            frame_body_len = 1 + trevrpc_msquic_varint_len(body_lens[i]) + body_lens[i];
+        }
+
+        *out++ = (uint8_t)(frame_body_len >> 24);
+        *out++ = (uint8_t)(frame_body_len >> 16);
+        *out++ = (uint8_t)(frame_body_len >> 8);
+        *out++ = (uint8_t)frame_body_len;
+        if (body_lens[i] > 0) {
+            *out++ = 0x22;
+            out = trevrpc_msquic_append_varint(out, body_lens[i]);
+            memcpy(out, bodies + body_offset, body_lens[i]);
+            out += body_lens[i];
+            body_offset += body_lens[i];
+        }
+    }
+
+    return trevrpc_msquic_stream_send_buffer(stream, send, frame_len);
+}
+
 int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream) {
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;

@@ -114,12 +114,12 @@ func comparisonNativeMsQuicConfig(options trevrpc.ServerOptions) trevrpc.NativeM
 	}
 }
 
-func comparisonNativeMsQuicCertificateFiles(b *testing.B) (string, string) {
-	b.Helper()
+func comparisonNativeMsQuicCertificateFiles(tb testing.TB) (string, string) {
+	tb.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		b.Fatalf("generate native MsQuic TLS key: %v", err)
+		tb.Fatalf("generate native MsQuic TLS key: %v", err)
 	}
 	notBefore := time.Now().Add(-time.Hour)
 	template := &x509.Certificate{
@@ -135,36 +135,36 @@ func comparisonNativeMsQuicCertificateFiles(b *testing.B) (string, string) {
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
-		b.Fatalf("create native MsQuic TLS certificate: %v", err)
+		tb.Fatalf("create native MsQuic TLS certificate: %v", err)
 	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		b.Fatalf("marshal native MsQuic TLS key: %v", err)
+		tb.Fatalf("marshal native MsQuic TLS key: %v", err)
 	}
 
-	dir := b.TempDir()
+	dir := tb.TempDir()
 	certFile := filepath.Join(dir, "server.cert")
 	keyFile := filepath.Join(dir, "server.key")
 	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0o600); err != nil {
-		b.Fatalf("write native MsQuic TLS certificate: %v", err)
+		tb.Fatalf("write native MsQuic TLS certificate: %v", err)
 	}
 	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
-		b.Fatalf("write native MsQuic TLS key: %v", err)
+		tb.Fatalf("write native MsQuic TLS key: %v", err)
 	}
 
 	return certFile, keyFile
 }
 
-func freeNativeMsQuicUDPAddr(b *testing.B) string {
-	b.Helper()
+func freeNativeMsQuicUDPAddr(tb testing.TB) string {
+	tb.Helper()
 
 	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
-		b.Fatalf("reserve UDP benchmark address: %v", err)
+		tb.Fatalf("reserve UDP benchmark address: %v", err)
 	}
 	addr := packetConn.LocalAddr().String()
 	if err := packetConn.Close(); err != nil {
-		b.Fatalf("release UDP benchmark address: %v", err)
+		tb.Fatalf("release UDP benchmark address: %v", err)
 	}
 
 	return addr

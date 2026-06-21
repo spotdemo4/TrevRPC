@@ -120,7 +120,7 @@ type webTransportResponseStream struct {
 }
 
 func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
-	frame, err := s.trevrpcRecvStreamFrameFields()
+	frame, _, err := s.trevrpcRecvStreamFrameFields()
 	if err != nil {
 		return nil, err
 	}
@@ -128,40 +128,40 @@ func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
 	return frame.rpcStreamFrame(), nil
 }
 
-func (s *webTransportResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, error) {
+func (s *webTransportResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
 	if s.done {
-		return streamFrameFields{}, io.EOF
+		return streamFrameFields{}, nil, io.EOF
 	}
 
 	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
 	if err != nil {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, writerErr
+			return streamFrameFields{}, nil, writerErr
 		}
-		return streamFrameFields{}, webTransportStatus(err)
+		return streamFrameFields{}, nil, webTransportStatus(err)
 	}
 
 	if !read {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, writerErr
+			return streamFrameFields{}, nil, writerErr
 		}
-		return streamFrameFields{}, io.EOF
+		return streamFrameFields{}, nil, io.EOF
 	}
 
 	if frame.kind == RpcStreamFrameKindStatus {
 		s.finish(false)
 		if frame.statusValue().IsOK() {
 			if err := s.writerError(true); err != nil {
-				return streamFrameFields{}, err
+				return streamFrameFields{}, nil, err
 			}
 		} else {
 			s.ignoreWriterError()
 		}
 	}
 
-	return frame, nil
+	return frame, nil, nil
 }
 
 func (s *webTransportResponseStream) Close() error {
@@ -207,6 +207,10 @@ func (s *webTransportResponseStream) ignoreWriterError() {
 }
 
 func cancelWebTransportStreamOnContext(ctx context.Context, stream *webtransport.Stream) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -228,21 +232,9 @@ func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport
 		return webTransportOrContextStatus(ctx, err)
 	}
 
-	for {
-		body, err := recvRequestBody(ctx, requestBody)
-		if err == io.EOF {
-			break
-		}
-
-		if err != nil {
-			stream.CancelWrite(cancelledWebTransportStreamCode)
-			return webTransportOrContextStatus(ctx, err)
-		}
-
-		if err := writeMessageStreamFrame(stream, body, maxFrameSize); err != nil {
-			stream.CancelWrite(cancelledWebTransportStreamCode)
-			return webTransportOrContextStatus(ctx, err)
-		}
+	if err := writeRequestBodyFrames(ctx, stream, requestBody, maxFrameSize); err != nil {
+		stream.CancelWrite(cancelledWebTransportStreamCode)
+		return webTransportOrContextStatus(ctx, err)
 	}
 
 	if err := stream.Close(); err != nil {
@@ -363,6 +355,10 @@ func (s webTransportRPCStream) SetReadDeadline(ttl time.Time) error {
 }
 
 func (s webTransportRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+
 	done := make(chan struct{})
 	var closeOnce sync.Once
 	go func() {
@@ -377,6 +373,10 @@ func (s webTransportRPCStream) trevrpcCancelReadOnContext(ctx context.Context) f
 }
 
 func contextWithAdditionalCancel(ctx context.Context, cancelOn context.Context) (context.Context, context.CancelFunc) {
+	if cancelOn.Done() == nil {
+		return ctx, func() {}
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		select {

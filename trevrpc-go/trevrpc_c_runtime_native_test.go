@@ -1,0 +1,110 @@
+//go:build trevrpc_msquic_native && cgo
+
+package trevrpc
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+	"time"
+)
+
+func TestCRuntimeNativeMsQuicUnaryRoundTrip(t *testing.T) {
+	certFile, keyFile := cRuntimeNativeMsQuicCertificateFiles(t)
+	host, portText, err := net.SplitHostPort(cRuntimeNativeMsQuicUDPAddr(t))
+	if err != nil {
+		t.Fatalf("split C runtime native MsQuic address: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse C runtime native MsQuic port: %v", err)
+	}
+
+	server, err := startCRuntimeNativeEchoServer(host, certFile, keyFile, uint16(port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := server.close(); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	body := []byte("hello from trevrpc-c")
+	got, status, err := cRuntimeNativeCallUnary(host, uint16(port), "test.EchoService", "Echo", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != uint32(CodeOK) {
+		t.Fatalf("C runtime response status = %d, want OK", status)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("C runtime response body = %q, want %q", got, body)
+	}
+}
+
+func cRuntimeNativeMsQuicCertificateFiles(t *testing.T) (string, string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate C runtime native MsQuic TLS key: %v", err)
+	}
+	notBefore := time.Now().Add(-time.Hour)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create C runtime native MsQuic TLS certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal C runtime native MsQuic TLS key: %v", err)
+	}
+
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.cert")
+	keyFile := filepath.Join(dir, "server.key")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0o600); err != nil {
+		t.Fatalf("write C runtime native MsQuic TLS certificate: %v", err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("write C runtime native MsQuic TLS key: %v", err)
+	}
+
+	return certFile, keyFile
+}
+
+func cRuntimeNativeMsQuicUDPAddr(t *testing.T) string {
+	t.Helper()
+
+	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve C runtime native MsQuic UDP address: %v", err)
+	}
+	addr := packetConn.LocalAddr().String()
+	if err := packetConn.Close(); err != nil {
+		t.Fatalf("release C runtime native MsQuic UDP address: %v", err)
+	}
+
+	return addr
+}

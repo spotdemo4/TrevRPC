@@ -14,6 +14,8 @@ import (
 
 const cancelledStreamCode quic.StreamErrorCode = 1
 
+const maxMessageFrameBatch = 16
+
 // QuicClient sends TrevRPC calls over an established QUIC connection.
 type QuicClient struct {
 	conn         *quic.Conn
@@ -93,7 +95,7 @@ type quicResponseStream struct {
 func (s *quicResponseStream) trevrpcContextCancelsRecv() bool { return true }
 
 func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
-	frame, err := s.trevrpcRecvStreamFrameFields()
+	frame, _, err := s.trevrpcRecvStreamFrameFields()
 	if err != nil {
 		return nil, err
 	}
@@ -101,40 +103,40 @@ func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
 	return frame.rpcStreamFrame(), nil
 }
 
-func (s *quicResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, error) {
+func (s *quicResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
 	if s.done {
-		return streamFrameFields{}, io.EOF
+		return streamFrameFields{}, nil, io.EOF
 	}
 
 	fields, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
 	if err != nil {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, writerErr
+			return streamFrameFields{}, nil, writerErr
 		}
-		return streamFrameFields{}, transportStatus(err)
+		return streamFrameFields{}, nil, transportStatus(err)
 	}
 
 	if !read {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, writerErr
+			return streamFrameFields{}, nil, writerErr
 		}
-		return streamFrameFields{}, io.EOF
+		return streamFrameFields{}, nil, io.EOF
 	}
 
 	if fields.kind == RpcStreamFrameKindStatus {
 		s.finish(false)
 		if fields.statusValue().IsOK() {
 			if err := s.writerError(true); err != nil {
-				return streamFrameFields{}, err
+				return streamFrameFields{}, nil, err
 			}
 		} else {
 			s.ignoreWriterError()
 		}
 	}
 
-	return fields, nil
+	return fields, nil, nil
 }
 
 func (s *quicResponseStream) Close() error {
@@ -183,6 +185,10 @@ func (s *quicResponseStream) ignoreWriterError() {
 }
 
 func cancelQUICStreamOnContext(ctx context.Context, stream *quic.Stream) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+
 	done := make(chan struct{})
 	var closeOnce sync.Once
 	go func() {
@@ -205,21 +211,9 @@ func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *Rp
 		return transportOrContextStatus(ctx, err)
 	}
 
-	for {
-		body, err := recvRequestBody(ctx, requestBody)
-		if err == io.EOF {
-			break
-		}
-
-		if err != nil {
-			stream.CancelWrite(cancelledStreamCode)
-			return transportOrContextStatus(ctx, err)
-		}
-
-		if err := writeMessageStreamFrame(stream, body, maxFrameSize); err != nil {
-			stream.CancelWrite(cancelledStreamCode)
-			return transportOrContextStatus(ctx, err)
-		}
+	if err := writeRequestBodyFrames(ctx, stream, requestBody, maxFrameSize); err != nil {
+		stream.CancelWrite(cancelledStreamCode)
+		return transportOrContextStatus(ctx, err)
 	}
 
 	if err := stream.Close(); err != nil {
@@ -227,6 +221,41 @@ func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *Rp
 	}
 
 	return nil
+}
+
+func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody ByteStream, maxFrameSize int) error {
+	nonBlocking := isNonBlockingStream(requestBody)
+	var batch [maxMessageFrameBatch][]byte
+	for {
+		count := 0
+		done := false
+		for count < len(batch) {
+			body, err := recvRequestBody(ctx, requestBody)
+			if err == io.EOF {
+				done = true
+				break
+			}
+			if err != nil {
+				return err
+			}
+
+			batch[count] = body
+			count++
+			if !nonBlocking {
+				break
+			}
+		}
+
+		if count > 0 {
+			if err := writeMessageStreamFrames(writer, batch[:count], maxFrameSize); err != nil {
+				return err
+			}
+			clear(batch[:count])
+		}
+		if done {
+			return nil
+		}
+	}
 }
 
 func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error) {
@@ -408,6 +437,10 @@ func (s quicRPCStream) SetReadDeadline(ttl time.Time) error {
 }
 
 func (s quicRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+
 	done := make(chan struct{})
 	var closeOnce sync.Once
 	go func() {
@@ -662,32 +695,58 @@ func (s *rpcRequestStream) trevrpcCancelReadOnContext(ctx context.Context) func(
 }
 
 func (s *rpcRequestStream) Recv() ([]byte, error) {
+	body, _, err := s.recv(false)
+	return body, err
+}
+
+func (s *rpcRequestStream) trevrpcRecvBytes() ([]byte, func(), error) {
+	return s.recv(true)
+}
+
+func (s *rpcRequestStream) recv(releasable bool) ([]byte, func(), error) {
 	if s.done {
-		return nil, io.EOF
+		return nil, nil, io.EOF
 	}
 
-	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
+	frame, release, read, err := s.readFrame(releasable)
 	if err != nil {
 		s.done = true
-		return nil, transportStatus(err)
+		if release != nil {
+			release()
+		}
+		return nil, nil, transportStatus(err)
 	}
 
 	if !read {
 		s.done = true
-		return nil, io.EOF
+		return nil, nil, io.EOF
 	}
 
 	if frame.kind == RpcStreamFrameKindStatus {
 		s.done = true
+		if release != nil {
+			release()
+		}
 		status := frame.statusValue()
 		if status.IsOK() {
-			return nil, io.EOF
+			return nil, nil, io.EOF
 		}
 
-		return nil, status
+		return nil, nil, status
 	}
 
-	return frame.body, nil
+	return frame.body, release, nil
+}
+
+func (s *rpcRequestStream) readFrame(releasable bool) (streamFrameFields, func(), bool, error) {
+	if releasable {
+		if reader, ok := s.stream.(optimizedReleasableStreamFrameReader); ok {
+			return reader.trevrpcReadStreamFrameReleasable(s.maxFrameSize)
+		}
+	}
+
+	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
+	return frame, nil, read, err
 }
 
 func (s *rpcRequestStream) Close() error {

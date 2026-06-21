@@ -316,7 +316,7 @@ type nativeMsQuicResponseStream struct {
 func (s *nativeMsQuicResponseStream) trevrpcContextCancelsRecv() bool { return true }
 
 func (s *nativeMsQuicResponseStream) Recv() (*RpcStreamFrame, error) {
-	frame, err := s.trevrpcRecvStreamFrameFields()
+	frame, _, err := s.recvStreamFrameFields(true)
 	if err != nil {
 		return nil, err
 	}
@@ -324,40 +324,50 @@ func (s *nativeMsQuicResponseStream) Recv() (*RpcStreamFrame, error) {
 	return frame.rpcStreamFrame(), nil
 }
 
-func (s *nativeMsQuicResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, error) {
+func (s *nativeMsQuicResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
+	return s.recvStreamFrameFields(false)
+}
+
+func (s *nativeMsQuicResponseStream) recvStreamFrameFields(copyBytes bool) (streamFrameFields, func(), error) {
 	if s.done {
-		return streamFrameFields{}, io.EOF
+		return streamFrameFields{}, nil, io.EOF
 	}
 
-	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
+	frame, release, read, err := s.stream.trevrpcReadStreamFrameWithCopy(s.maxFrameSize, copyBytes)
 	if err != nil {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, writerErr
+			if release != nil {
+				release()
+			}
+			return streamFrameFields{}, nil, writerErr
 		}
-		return streamFrameFields{}, nativeMsQuicErrorFromErr(err)
+		return streamFrameFields{}, release, nativeMsQuicErrorFromErr(err)
 	}
 
 	if !read {
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, writerErr
+			return streamFrameFields{}, nil, writerErr
 		}
-		return streamFrameFields{}, io.EOF
+		return streamFrameFields{}, nil, io.EOF
 	}
 
 	if frame.kind == RpcStreamFrameKindStatus {
 		s.finish(false)
 		if frame.statusValue().IsOK() {
 			if err := s.writerError(true); err != nil {
-				return streamFrameFields{}, err
+				if release != nil {
+					release()
+				}
+				return streamFrameFields{}, nil, err
 			}
 		} else {
 			s.ignoreWriterError()
 		}
 	}
 
-	return frame, nil
+	return frame, release, nil
 }
 
 func (s *nativeMsQuicResponseStream) Close() error {
@@ -412,19 +422,8 @@ func writeNativeMsQuicStreamingRequest(ctx context.Context, stream *nativeMsQuic
 		return nativeMsQuicOrContextErr(ctx, err)
 	}
 
-	for {
-		body, err := recvRequestBody(ctx, requestBody)
-		if err == io.EOF {
-			break
-		}
-
-		if err != nil {
-			return nativeMsQuicOrContextErr(ctx, err)
-		}
-
-		if err := writeMessageStreamFrame(stream, body, maxFrameSize); err != nil {
-			return nativeMsQuicOrContextErr(ctx, err)
-		}
+	if err := writeRequestBodyFrames(ctx, stream, requestBody, maxFrameSize); err != nil {
+		return nativeMsQuicOrContextErr(ctx, err)
 	}
 
 	return stream.Close()
@@ -587,33 +586,55 @@ func (s *nativeMsQuicStream) trevrpcReadFrame(message ProtoMessage, maxFrameSize
 }
 
 func (s *nativeMsQuicStream) trevrpcReadStreamFrame(maxFrameSize int) (streamFrameFields, bool, error) {
+	fields, release, read, err := s.trevrpcReadStreamFrameWithCopy(maxFrameSize, true)
+	if release != nil {
+		release()
+	}
+	return fields, read, err
+}
+
+func (s *nativeMsQuicStream) trevrpcReadStreamFrameReleasable(maxFrameSize int) (streamFrameFields, func(), bool, error) {
+	return s.trevrpcReadStreamFrameWithCopy(maxFrameSize, false)
+}
+
+func (s *nativeMsQuicStream) trevrpcReadStreamFrameWithCopy(maxFrameSize int, copyBytes bool) (streamFrameFields, func(), bool, error) {
 	ptr := s.cptr()
 	if ptr == nil {
-		return streamFrameFields{}, false, nil
+		return streamFrameFields{}, nil, false, nil
 	}
 
 	var body *C.uint8_t
 	var bodyLen C.size_t
 	result := C.trevrpc_msquic_stream_read_frame(ptr, &body, &bodyLen, C.size_t(maxFrameSize))
 	if result == 0 {
-		return streamFrameFields{}, false, nil
+		return streamFrameFields{}, nil, false, nil
 	}
 	if result < 0 {
 		if result == C.TREV_MSQUIC_ERR_FRAME_TOO_LARGE {
-			return streamFrameFields{}, false, &FrameTooLargeError{Len: int(bodyLen), Max: maxFrameSize}
+			return streamFrameFields{}, nil, false, &FrameTooLargeError{Len: int(bodyLen), Max: maxFrameSize}
 		}
-		return streamFrameFields{}, false, nativeMsQuicError(C.int(result))
+		return streamFrameFields{}, nil, false, nativeMsQuicError(C.int(result))
 	}
+	release := func() {}
 	if body != nil {
-		defer C.trevrpc_msquic_free(unsafe.Pointer(body))
+		release = func() { C.trevrpc_msquic_free(unsafe.Pointer(body)) }
 	}
 
 	var frameBody []byte
 	if bodyLen > 0 {
 		frameBody = unsafe.Slice((*byte)(unsafe.Pointer(body)), int(bodyLen))
 	}
-	fields, err := parseStreamFrameFields(frameBody, true)
-	return fields, true, err
+	fields, err := parseStreamFrameFields(frameBody, copyBytes)
+	if err != nil {
+		release()
+		return streamFrameFields{}, nil, false, err
+	}
+	if copyBytes {
+		release()
+		return fields, nil, true, nil
+	}
+
+	return fields, release, true, nil
 }
 
 func (s *nativeMsQuicStream) trevrpcWriteFrame(message ProtoMessage, maxFrameSize int) error {
@@ -647,6 +668,61 @@ func (s *nativeMsQuicStream) trevrpcWriteMessageStreamFrame(body []byte, maxFram
 	}
 	if result == C.TREV_MSQUIC_ERR_FRAME_TOO_LARGE {
 		return &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
+	}
+
+	return nativeMsQuicError(C.int(result))
+}
+
+func (s *nativeMsQuicStream) trevrpcWriteMessageStreamFrames(bodies [][]byte, maxFrameSize int) error {
+	if len(bodies) == 0 {
+		return nil
+	}
+	if len(bodies) == 1 {
+		return s.trevrpcWriteMessageStreamFrame(bodies[0], maxFrameSize)
+	}
+
+	ptr := s.cptr()
+	if ptr == nil {
+		return io.ErrClosedPipe
+	}
+
+	var lengths [maxMessageFrameBatch]C.size_t
+	totalBodyLen := 0
+	for i, body := range bodies {
+		if i >= len(lengths) {
+			if err := s.trevrpcWriteMessageStreamFrames(bodies[:i], maxFrameSize); err != nil {
+				return err
+			}
+			return s.trevrpcWriteMessageStreamFrames(bodies[i:], maxFrameSize)
+		}
+
+		bodyLen := messageStreamFrameBodyLen(body)
+		if bodyLen > maxFrameSize {
+			return &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
+		}
+		lengths[i] = C.size_t(len(body))
+		totalBodyLen += len(body)
+	}
+
+	var stack [256]byte
+	packed := stack[:0]
+	if totalBodyLen > len(stack) {
+		packed = make([]byte, 0, totalBodyLen)
+	}
+	for _, body := range bodies {
+		packed = append(packed, body...)
+	}
+
+	var bodyPtr *C.uint8_t
+	if len(packed) > 0 {
+		bodyPtr = (*C.uint8_t)(unsafe.Pointer(&packed[0]))
+	}
+	result := C.trevrpc_msquic_stream_write_message_frames(ptr, bodyPtr, &lengths[0], C.size_t(len(bodies)), C.size_t(maxFrameSize))
+	if result >= 0 {
+		return nil
+	}
+	if result == C.TREV_MSQUIC_ERR_FRAME_TOO_LARGE {
+		return &FrameTooLargeError{Len: maxFrameSize + 1, Max: maxFrameSize}
 	}
 
 	return nativeMsQuicError(C.int(result))
@@ -703,6 +779,10 @@ func (s *nativeMsQuicStream) takePtr() *C.trevrpc_msquic_stream {
 }
 
 func (s *nativeMsQuicStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+
 	done := make(chan struct{})
 	var closeOnce sync.Once
 	go func() {
