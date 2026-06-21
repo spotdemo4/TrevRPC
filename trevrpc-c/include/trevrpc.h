@@ -74,6 +74,7 @@ typedef struct trevrpc_client trevrpc_client;
 typedef struct trevrpc_server trevrpc_server;
 typedef struct trevrpc_stream trevrpc_stream;
 typedef struct trevrpc_call_context trevrpc_call_context;
+typedef struct trevrpc_wt_config trevrpc_wt_config;
 
 typedef struct trevrpc_config {
     const char* cert_file;
@@ -268,6 +269,8 @@ int trevrpc_authorize_bearer_token(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status);
 
 int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_client** client);
+int trevrpc_client_connect_webtransport(
+    const trevrpc_wt_config* wt_config, const trevrpc_config* config, trevrpc_client** client);
 int trevrpc_client_call_unary(trevrpc_client* client,
     const char* service,
     const char* method,

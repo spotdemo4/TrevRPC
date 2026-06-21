@@ -32,7 +32,9 @@ size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
 
 struct trevrpc_stream {
-    trevrpc_msquic_stream* stream;
+    uint32_t transport;
+    trevrpc_msquic_stream* msquic_stream;
+    void* wt_stream;
     const trevrpc_call_context* context;
     size_t max_frame_size;
     bool owns_stream;
@@ -365,7 +367,8 @@ cleanup:
 static int test_request_stream_message_limit(void) {
     int result = 1;
     trevrpc_stream stream = {
-        .stream = (trevrpc_msquic_stream*)1,
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
         .max_stream_messages = 0,
         .max_stream_body_size = -1,
         .failure_status = TREVRPC_STATUS_OK,
@@ -386,7 +389,8 @@ cleanup:
 static int test_response_stream_message_limit(void) {
     int result = 1;
     trevrpc_stream stream = {
-        .stream = (trevrpc_msquic_stream*)1,
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
         .max_stream_messages = 0,
         .max_stream_body_size = -1,
         .failure_status = TREVRPC_STATUS_OK,
@@ -407,7 +411,8 @@ cleanup:
 static int test_request_stream_body_size_limit(void) {
     int result = 1;
     trevrpc_stream stream = {
-        .stream = (trevrpc_msquic_stream*)1,
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
         .max_stream_messages = -1,
         .max_stream_body_size = 0,
         .request_body_size = 1,
@@ -429,7 +434,8 @@ cleanup:
 static int test_response_stream_body_size_limit(void) {
     int result = 1;
     trevrpc_stream stream = {
-        .stream = (trevrpc_msquic_stream*)1,
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
         .max_stream_messages = -1,
         .max_stream_body_size = 0,
         .failure_status = TREVRPC_STATUS_OK,
@@ -453,7 +459,8 @@ static int test_request_stream_idle_timeout(void) {
     bool cond_initialized = false;
     trevrpc_msquic_stream raw_stream = {0};
     trevrpc_stream stream = {
-        .stream = &raw_stream,
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = &raw_stream,
         .max_stream_messages = -1,
         .max_stream_body_size = -1,
         .stream_idle_timeout_nanos = 1000000ull,
@@ -486,7 +493,8 @@ cleanup:
 static int test_response_stream_idle_timeout(void) {
     int result = 1;
     trevrpc_stream stream = {
-        .stream = (trevrpc_msquic_stream*)1,
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
         .max_stream_messages = -1,
         .max_stream_body_size = -1,
         .stream_idle_timeout_nanos = 1,
@@ -511,7 +519,8 @@ cleanup:
 static int test_stream_rejects_writes_after_terminal_status(void) {
     int result = 1;
     trevrpc_stream stream = {
-        .stream = (trevrpc_msquic_stream*)1,
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
         .sent_status = true,
         .max_stream_messages = -1,
         .max_stream_body_size = -1,

@@ -13,7 +13,7 @@ The CMake build creates these static libraries by default:
 | `trevrpc_webtransport` | Low-level libwtf WebTransport listener, session, and stream wrappers | `trevrpc_webtransport.h` |
 | `trevrpc`              | High-level RPC client/server runtime over MsQuic                     | `trevrpc.h`              |
 
-`trevrpc.h` is the stable high-level API surface. `trevrpc_msquic.h` and `trevrpc_webtransport.h` expose transport-specific advanced APIs and do not provide high-level RPC dispatch by themselves.
+`trevrpc.h` is the stable high-level API surface. `trevrpc_msquic.h` and `trevrpc_webtransport.h` expose transport-specific advanced APIs. High-level clients can use MsQuic with `trevrpc_client_connect` or WebTransport with `trevrpc_client_connect_webtransport`; server dispatch is still MsQuic-backed until WebTransport serving is wired through the same transport abstraction.
 
 The supported C artifacts are static libraries. Shared library builds and symbol export annotations are intentionally deferred until the C ABI policy is finalized; do not rely on default compiler symbol visibility as a stable ABI contract.
 
@@ -23,7 +23,7 @@ The public C API is source-compatible across patch releases for declarations in 
 
 Status, RPC kind, stream-frame kind, transport kind, transport event, and log-level values intentionally remain `uint32_t` macro constants in public structs and function parameters. This keeps the ABI predictable across C compilers, preserves wire-width clarity, and avoids enum underlying-size differences. Helper validators such as `trevrpc_status_code_from_uint32` normalize untrusted numeric input at API boundaries.
 
-`trevrpc_msquic.h` and `trevrpc_webtransport.h` remain public advanced transport headers. They are versioned with the rest of the C package, but only `trevrpc.h` is the stable high-level RPC API. New high-level transport support should be exposed through explicit transport constructors or options rather than hiding transport choice behind the existing MsQuic-specific constructors.
+`trevrpc_msquic.h` and `trevrpc_webtransport.h` remain public advanced transport headers. They are versioned with the rest of the C package, but only `trevrpc.h` is the stable high-level RPC API. High-level transport support uses explicit transport constructors instead of hiding transport choice behind the existing MsQuic-specific constructors.
 
 Current close/shutdown naming is intentional: `close` releases caller-owned objects, while server `shutdown` asks serving loops and active work to stop before final close. `trevrpc_stream_close` releases the stream handle and aborts further local use; callers that need an orderly streaming half-close must call `trevrpc_stream_finish_send` first.
 
@@ -65,7 +65,7 @@ CMake options:
 | `TREVRPC_BUILD_BENCHMARKS`         | `OFF`   | Build opt-in benchmark executables.                                                  |
 | `TREVRPC_BUILD_MSQUIC`             | `ON`    | Build the low-level MsQuic transport library.                                        |
 | `TREVRPC_BUILD_WEBTRANSPORT`       | `ON`    | Build the low-level WebTransport transport library.                                  |
-| `TREVRPC_BUILD_RUNTIME`            | `ON`    | Build the high-level runtime. This currently requires MsQuic.                        |
+| `TREVRPC_BUILD_RUNTIME`            | `ON`    | Build the high-level runtime. This currently requires MsQuic and WebTransport.       |
 | `TREVRPC_INSTALL_INTERNAL_HEADERS` | `OFF`   | Install internal headers under `include/trevrpc/internal` for tests and development. |
 | `TREVRPC_ENABLE_SANITIZERS`        | `OFF`   | Build C targets with ASan and UBSan when using Clang or GCC.                         |
 
@@ -163,7 +163,7 @@ The C runtime owns transport, framing, metadata, status, stream limits, and gene
 | Metadata-value and bearer authorizers            | Yes        | Yes                                                   |
 | Request timeout/deadline enforcement             | Yes        | Yes, cooperative                                      |
 | High-level MsQuic client/server RPC              | Yes        | Yes                                                   |
-| High-level WebTransport client/server RPC        | Yes        | No                                                    |
+| High-level WebTransport client/server RPC        | Yes        | Client unary/streaming only                           |
 | Low-level WebTransport wrapper                   | Yes        | Yes                                                   |
 | Server runtime policy options                    | Yes        | Yes                                                   |
 | Server runtime policy enforcement                | Yes        | Partial: stream limits and overload handling          |

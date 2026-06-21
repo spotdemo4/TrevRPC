@@ -95,7 +95,10 @@ endif()
 
 if(TREVRPC_BUILD_RUNTIME)
     if(NOT TREVRPC_BUILD_MSQUIC)
-        message(FATAL_ERROR "TREVRPC_BUILD_RUNTIME requires TREVRPC_BUILD_MSQUIC because the high-level runtime is currently MsQuic-backed")
+        message(FATAL_ERROR "TREVRPC_BUILD_RUNTIME requires TREVRPC_BUILD_MSQUIC")
+    endif()
+    if(NOT TREVRPC_BUILD_WEBTRANSPORT)
+        message(FATAL_ERROR "TREVRPC_BUILD_RUNTIME requires TREVRPC_BUILD_WEBTRANSPORT")
     endif()
 
     add_library(trevrpc STATIC
@@ -107,7 +110,7 @@ if(TREVRPC_BUILD_RUNTIME)
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE src
     )
-    target_link_libraries(trevrpc PUBLIC trevrpc_core trevrpc_msquic Threads::Threads)
+    target_link_libraries(trevrpc PUBLIC trevrpc_core trevrpc_msquic trevrpc_webtransport Threads::Threads)
     trevrpc_c_warnings(trevrpc)
     trevrpc_c_sanitizers(trevrpc)
     list(APPEND trevrpc_install_targets trevrpc)

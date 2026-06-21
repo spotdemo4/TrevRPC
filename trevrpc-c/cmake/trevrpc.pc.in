@@ -6,6 +6,6 @@ includedir=${prefix}/include
 Name: trevrpc
 Description: High-level TrevRPC C runtime over MsQuic
 Version: @PROJECT_VERSION@
-Requires.private: trevrpc_core trevrpc_msquic
+Requires.private: trevrpc_core trevrpc_msquic trevrpc_webtransport
 Libs: -L${libdir} -ltrevrpc
 Cflags: -I${includedir}
