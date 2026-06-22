@@ -73,8 +73,11 @@ extern "C" {
 typedef struct trevrpc_client trevrpc_client;
 typedef struct trevrpc_server trevrpc_server;
 typedef struct trevrpc_stream trevrpc_stream;
+typedef struct trevrpc_call trevrpc_call;
 typedef struct trevrpc_call_context trevrpc_call_context;
 typedef struct trevrpc_wt_config trevrpc_wt_config;
+
+#define TREVRPC_CALL_DEFERRED 1
 
 typedef struct trevrpc_config {
     const char* cert_file;
@@ -152,6 +155,13 @@ typedef int (*trevrpc_unary_handler)(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response);
 typedef int (*trevrpc_stream_handler)(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream);
+/*
+ * Binding-oriented handler surface. Handlers must complete the call with
+ * trevrpc_call_respond, trevrpc_call_finish_stream, or trevrpc_call_close.
+ * Return TREVRPC_CALL_DEFERRED or call trevrpc_call_defer before handing the
+ * call to another runtime thread.
+ */
+typedef int (*trevrpc_call_handler)(void* user_data, trevrpc_call* call);
 typedef int (*trevrpc_authorizer)(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status);
 
@@ -312,9 +322,24 @@ int trevrpc_server_register_streaming(trevrpc_server* server,
     uint32_t kind,
     trevrpc_stream_handler handler,
     void* user_data);
+int trevrpc_server_register_call(trevrpc_server* server,
+    const char* service,
+    const char* method,
+    uint32_t kind,
+    trevrpc_call_handler handler,
+    void* user_data);
 int trevrpc_server_serve(trevrpc_server* server);
 void trevrpc_server_shutdown(trevrpc_server* server);
 void trevrpc_server_close(trevrpc_server* server);
+
+const trevrpc_request* trevrpc_call_request(const trevrpc_call* call);
+const trevrpc_call_context* trevrpc_call_get_context(const trevrpc_call* call);
+trevrpc_stream* trevrpc_call_stream(trevrpc_call* call);
+/* Keeps call alive after the handler returns; completion APIs release it. */
+int trevrpc_call_defer(trevrpc_call* call);
+int trevrpc_call_respond(trevrpc_call* call, trevrpc_response* response);
+int trevrpc_call_finish_stream(trevrpc_call* call, uint32_t status, const char* message, size_t message_len);
+void trevrpc_call_close(trevrpc_call* call);
 
 int trevrpc_response_set_message(trevrpc_response* response, const char* message, size_t message_len);
 int trevrpc_response_set_body(trevrpc_response* response, const uint8_t* body, size_t body_len);

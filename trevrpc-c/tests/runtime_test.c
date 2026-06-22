@@ -212,6 +212,50 @@ static int stream_explicit_status_handler(
     return trevrpc_stream_send_status(stream, TREVRPC_STATUS_PERMISSION_DENIED, NULL, 0);
 }
 
+typedef struct raw_call_state {
+    trevrpc_call* call;
+    int called;
+    size_t request_body_len;
+    bool saw_context;
+    bool saw_stream;
+} raw_call_state;
+
+static int raw_unary_immediate_handler(void* user_data, trevrpc_call* call) {
+    raw_call_state* state = user_data;
+    const trevrpc_request* request = trevrpc_call_request(call);
+    state->called++;
+    state->request_body_len = request == NULL ? 0 : request->body_len;
+    state->saw_context = trevrpc_call_get_context(call) != NULL;
+
+    const uint8_t body[] = {'r', 'a', 'w'};
+    trevrpc_response response = {0};
+    int err = trevrpc_response_set_body(&response, body, sizeof(body));
+    if (err == 0) {
+        err = trevrpc_call_respond(call, &response);
+    }
+    trevrpc_response_reset(&response);
+    return err;
+}
+
+static int raw_unary_deferred_handler(void* user_data, trevrpc_call* call) {
+    raw_call_state* state = user_data;
+    const trevrpc_request* request = trevrpc_call_request(call);
+    state->called++;
+    state->call = call;
+    state->request_body_len = request == NULL ? 0 : request->body_len;
+    state->saw_context = trevrpc_call_get_context(call) != NULL;
+    return TREVRPC_CALL_DEFERRED;
+}
+
+static int raw_stream_deferred_handler(void* user_data, trevrpc_call* call) {
+    raw_call_state* state = user_data;
+    state->called++;
+    state->call = call;
+    state->saw_context = trevrpc_call_get_context(call) != NULL;
+    state->saw_stream = trevrpc_call_stream(call) != NULL;
+    return trevrpc_call_defer(call);
+}
+
 static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data, size_t data_len) {
     trevrpc_msquic_chunk* chunk = malloc(sizeof(*chunk) + data_len);
     if (chunk == NULL) {
@@ -1009,6 +1053,170 @@ cleanup:
     return result;
 }
 
+static int test_raw_unary_call_handler_responds(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    trevrpc_server* server = NULL;
+    trevrpc_msquic_stream stream = {0};
+    bool stream_initialized = false;
+    metric_counts counts = {0};
+    raw_call_state state = {0};
+    const uint8_t body[] = {'h', 'i'};
+    trevrpc_metrics metrics = {
+        .rpc_started = record_started,
+        .rpc_finished = record_finished,
+        .user_data = &counts,
+    };
+
+    CHECK_GOTO(
+        trevrpc_wire_encode_request(
+            "svc", "method", TREVRPC_RPC_KIND_UNARY, body, sizeof(body), NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
+    CHECK_GOTO(trevrpc_server_register_call(
+                   server, "svc", "method", TREVRPC_RPC_KIND_UNARY, raw_unary_immediate_handler, &state) == 0);
+    CHECK_GOTO(init_raw_stream(&stream, frame, frame_len) == 0);
+    stream_initialized = true;
+
+    trevrpc_test_server_handle_stream(server, &stream);
+    CHECK_GOTO(state.called == 1);
+    CHECK_GOTO(state.request_body_len == sizeof(body));
+    CHECK_GOTO(state.saw_context);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(counts.response_body_len == 3);
+
+    result = 0;
+
+cleanup:
+    if (stream_initialized) {
+        reset_raw_stream(&stream);
+    }
+    trevrpc_server_close(server);
+    free(frame);
+    return result;
+}
+
+static int test_raw_unary_call_handler_defers(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    trevrpc_server* server = NULL;
+    trevrpc_msquic_stream stream = {0};
+    bool stream_initialized = false;
+    metric_counts counts = {0};
+    raw_call_state state = {0};
+    const uint8_t request_body[] = {'h', 'i'};
+    const uint8_t response_body[] = {'l', 'a', 't', 'e', 'r'};
+    trevrpc_response response = {0};
+    trevrpc_metrics metrics = {
+        .rpc_started = record_started,
+        .rpc_finished = record_finished,
+        .user_data = &counts,
+    };
+
+    CHECK_GOTO(trevrpc_wire_encode_request("svc",
+                   "method",
+                   TREVRPC_RPC_KIND_UNARY,
+                   request_body,
+                   sizeof(request_body),
+                   NULL,
+                   0,
+                   4096,
+                   &frame,
+                   &frame_len) == 0);
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
+    CHECK_GOTO(trevrpc_server_register_call(
+                   server, "svc", "method", TREVRPC_RPC_KIND_UNARY, raw_unary_deferred_handler, &state) == 0);
+    CHECK_GOTO(init_raw_stream(&stream, frame, frame_len) == 0);
+    stream_initialized = true;
+
+    trevrpc_test_server_handle_stream(server, &stream);
+    CHECK_GOTO(state.called == 1);
+    CHECK_GOTO(state.call != NULL);
+    CHECK_GOTO(state.request_body_len == sizeof(request_body));
+    CHECK_GOTO(state.saw_context);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 0);
+
+    CHECK_GOTO(trevrpc_response_set_body(&response, response_body, sizeof(response_body)) == 0);
+    CHECK_GOTO(trevrpc_call_respond(state.call, &response) == 0);
+    state.call = NULL;
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(counts.response_body_len == sizeof(response_body));
+
+    result = 0;
+
+cleanup:
+    trevrpc_response_reset(&response);
+    if (state.call != NULL) {
+        trevrpc_call_close(state.call);
+    }
+    if (stream_initialized) {
+        reset_raw_stream(&stream);
+    }
+    trevrpc_server_close(server);
+    free(frame);
+    return result;
+}
+
+static int test_raw_stream_call_handler_defers(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    trevrpc_server* server = NULL;
+    trevrpc_msquic_stream stream = {0};
+    bool stream_initialized = false;
+    metric_counts counts = {0};
+    raw_call_state state = {0};
+    trevrpc_metrics metrics = {
+        .rpc_started = record_started,
+        .rpc_finished = record_finished,
+        .user_data = &counts,
+    };
+
+    CHECK_GOTO(
+        trevrpc_wire_encode_request(
+            "svc", "method", TREVRPC_RPC_KIND_SERVER_STREAMING, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
+    CHECK_GOTO(
+        trevrpc_server_register_call(
+            server, "svc", "method", TREVRPC_RPC_KIND_SERVER_STREAMING, raw_stream_deferred_handler, &state) == 0);
+    CHECK_GOTO(init_raw_stream(&stream, frame, frame_len) == 0);
+    stream_initialized = true;
+
+    trevrpc_test_server_handle_stream(server, &stream);
+    CHECK_GOTO(state.called == 1);
+    CHECK_GOTO(state.call != NULL);
+    CHECK_GOTO(state.saw_context);
+    CHECK_GOTO(state.saw_stream);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 0);
+
+    CHECK_GOTO(trevrpc_call_finish_stream(state.call, TREVRPC_STATUS_PERMISSION_DENIED, NULL, 0) == 0);
+    state.call = NULL;
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_PERMISSION_DENIED);
+
+    result = 0;
+
+cleanup:
+    if (state.call != NULL) {
+        trevrpc_call_close(state.call);
+    }
+    if (stream_initialized) {
+        reset_raw_stream(&stream);
+    }
+    trevrpc_server_close(server);
+    free(frame);
+    return result;
+}
+
 static int test_streaming_handlers_send_exactly_one_terminal_status(void) {
     int result = 1;
     metric_counts counts = {0};
@@ -1301,6 +1509,15 @@ int main(void) {
         return 1;
     }
     if (test_unary_handler_may_omit_response_body() != 0) {
+        return 1;
+    }
+    if (test_raw_unary_call_handler_responds() != 0) {
+        return 1;
+    }
+    if (test_raw_unary_call_handler_defers() != 0) {
+        return 1;
+    }
+    if (test_raw_stream_call_handler_defers() != 0) {
         return 1;
     }
     if (test_streaming_handlers_send_exactly_one_terminal_status() != 0) {
