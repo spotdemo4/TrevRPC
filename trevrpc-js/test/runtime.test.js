@@ -71,7 +71,7 @@ test("Node native transport subpath exports without loading the addon", async ()
   assert.equal(typeof NodeTransport, "function");
   assert.equal(typeof NodeTransport.connectWebTransport, "function");
   assert.equal(typeof NodeServer, "function");
-  assert.equal(typeof NodeServer.listenWebTransport, "function");
+  assert.equal(typeof NodeServer.listen, "function");
   assert.equal(typeof NodeServerCall, "function");
 });
 

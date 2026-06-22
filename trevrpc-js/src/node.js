@@ -20,7 +20,7 @@ export class NodeTransport {
   /** Opens a WebTransport TrevRPC client backed by the native C runtime. */
   static async connectWebTransport(urlOrOptions, options = {}) {
     const native = loadNative();
-    const connectOptions = normalizeWebTransportOptions(urlOrOptions, options);
+    const connectOptions = normalizeNodeTransportOptions(urlOrOptions, options);
     const nativeClient = await native.connectWebTransport(connectOptions);
     return new NodeTransport(nativeClient, connectOptions);
   }
@@ -57,10 +57,10 @@ export class NodeServer {
     this.closed = null;
   }
 
-  /** Creates a WebTransport TrevRPC server backed by the native C runtime. */
-  static async listenWebTransport(urlOrOptions, options = {}) {
+  /** Creates a native QUIC and WebTransport TrevRPC server backed by trevrpc-c. */
+  static async listen(urlOrOptions, options = {}) {
     const native = loadNative();
-    const listenOptions = normalizeWebTransportOptions(urlOrOptions, options);
+    const listenOptions = normalizeNodeTransportOptions(urlOrOptions, options);
     const nativeServer = await native.listenWebTransport(listenOptions);
     return new NodeServer(nativeServer, listenOptions);
   }
@@ -306,7 +306,7 @@ function isAsyncIterable(value) {
   return value != null && typeof value[Symbol.asyncIterator] === "function";
 }
 
-function normalizeWebTransportOptions(urlOrOptions, options) {
+function normalizeNodeTransportOptions(urlOrOptions, options) {
   if (typeof urlOrOptions === "string" || urlOrOptions instanceof URL) {
     const url = new URL(urlOrOptions);
     const path = `${url.pathname || "/"}${url.search}`;
@@ -320,7 +320,7 @@ function normalizeWebTransportOptions(urlOrOptions, options) {
   }
 
   if (urlOrOptions == null || typeof urlOrOptions !== "object") {
-    throw new TypeError("connectWebTransport requires a URL or options object");
+    throw new TypeError("native transport requires a URL or options object");
   }
   return { ...urlOrOptions, ...options };
 }

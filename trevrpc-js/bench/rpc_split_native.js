@@ -97,7 +97,7 @@ async function runClient(host, port, iterations) {
 }
 
 async function runServer(certFile, keyFile) {
-  const server = await NodeServer.listenWebTransport({
+  const server = await NodeServer.listen({
     host: "127.0.0.1",
     port: 0,
     path: "/trevrpc",

@@ -30,7 +30,7 @@ const client = new GreeterClient(transport);
 
 Node.js clients can pass native transport options such as `skipCertificateValidation` as the second argument. The explicit `WebTransportClient` and `NodeTransport` classes remain available when callers need direct transport-class access.
 
-Node.js servers can use the native server wrapper from the same subpath:
+Node.js servers can use the native server wrapper from the same subpath. The listener accepts both native TrevRPC QUIC clients and WebTransport clients:
 
 ```js
 import { NodeServer } from "trevrpc-js/node";
@@ -39,7 +39,7 @@ import { GreeterService, root } from "./hello/v1/greeter.trevrpc.js";
 const HelloRequest = root.lookupType("hello.v1.HelloRequest");
 const HelloReply = root.lookupType("hello.v1.HelloReply");
 
-const server = await NodeServer.listenWebTransport({
+const server = await NodeServer.listen({
   host: "127.0.0.1",
   port: 50051,
   path: "/trevrpc",

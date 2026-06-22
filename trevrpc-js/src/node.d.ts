@@ -10,6 +10,8 @@ import type {
 
 export interface NodeWebTransportOptions extends RuntimeNodeWebTransportOptions {}
 
+export interface NodeListenOptions extends RuntimeNodeWebTransportOptions {}
+
 /** Native Node transport backed by trevrpc-c and MsQuic. */
 export class NodeTransport implements Transport {
   maxFrameSize?: number;
@@ -86,10 +88,10 @@ export class NodeServer {
   maxFrameSize?: number;
   closed: Promise<void> | null;
 
-  /** Creates a WebTransport TrevRPC server backed by the native C runtime. */
-  static listenWebTransport(
-    urlOrOptions: string | URL | NodeWebTransportOptions,
-    options?: NodeWebTransportOptions,
+  /** Creates a native QUIC and WebTransport TrevRPC server backed by trevrpc-c. */
+  static listen(
+    urlOrOptions: string | URL | NodeListenOptions,
+    options?: NodeListenOptions,
   ): Promise<NodeServer>;
 
   /** Registers one raw RPC handler. */
