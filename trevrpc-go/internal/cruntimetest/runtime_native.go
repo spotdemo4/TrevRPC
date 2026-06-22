@@ -1,4 +1,4 @@
-//go:build trevrpc_msquic_native && cgo
+//go:build trevrpc_msquic && cgo
 
 package cruntimetest
 

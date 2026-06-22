@@ -399,7 +399,7 @@ static int start_fixture(benchmark_fixture* fixture) {
         return err;
     }
 
-    err = warm_client("trevrpc_msquic_native", fixture->native_client);
+    err = warm_client("trevrpc_msquic", fixture->native_client);
     if (err == 0) {
         err = warm_client("trevrpc_webtransport", fixture->webtransport_client);
     }
@@ -528,7 +528,7 @@ int main(int argc, char** argv) {
     }
 
     err = run_benchmark_case(
-        "unary_round_trip/trevrpc_msquic_native", fixture.native_client, benchmark_unary_round_trip, iterations);
+        "unary_round_trip/trevrpc_msquic", fixture.native_client, benchmark_unary_round_trip, iterations);
     if (err == 0) {
         err = run_benchmark_case("unary_round_trip/trevrpc_webtransport",
             fixture.webtransport_client,
@@ -536,10 +536,8 @@ int main(int argc, char** argv) {
             iterations);
     }
     if (err == 0) {
-        err = run_benchmark_case("server_stream_16_messages/trevrpc_msquic_native",
-            fixture.native_client,
-            benchmark_server_streaming,
-            iterations);
+        err = run_benchmark_case(
+            "server_stream_16_messages/trevrpc_msquic", fixture.native_client, benchmark_server_streaming, iterations);
     }
     if (err == 0) {
         err = run_benchmark_case("server_stream_16_messages/trevrpc_webtransport",
@@ -548,10 +546,8 @@ int main(int argc, char** argv) {
             iterations);
     }
     if (err == 0) {
-        err = run_benchmark_case("client_stream_16_messages/trevrpc_msquic_native",
-            fixture.native_client,
-            benchmark_client_streaming,
-            iterations);
+        err = run_benchmark_case(
+            "client_stream_16_messages/trevrpc_msquic", fixture.native_client, benchmark_client_streaming, iterations);
     }
     if (err == 0) {
         err = run_benchmark_case("client_stream_16_messages/trevrpc_webtransport",
@@ -560,10 +556,8 @@ int main(int argc, char** argv) {
             iterations);
     }
     if (err == 0) {
-        err = run_benchmark_case("bidi_stream_16_messages/trevrpc_msquic_native",
-            fixture.native_client,
-            benchmark_bidi_streaming,
-            iterations);
+        err = run_benchmark_case(
+            "bidi_stream_16_messages/trevrpc_msquic", fixture.native_client, benchmark_bidi_streaming, iterations);
     }
     if (err == 0) {
         err = run_benchmark_case("bidi_stream_16_messages/trevrpc_webtransport",

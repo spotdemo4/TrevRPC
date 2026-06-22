@@ -1,4 +1,4 @@
-//go:build trevrpc_msquic_native && cgo
+//go:build trevrpc_msquic && cgo
 
 package trevrpc_test
 
@@ -21,9 +21,9 @@ import (
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
 )
 
-func BenchmarkRPCComparisonNativeMsQuic(b *testing.B) {
-	client := startTrevRPCNativeMsQuicComparisonClient(b)
-	warmTrevRPCNativeMsQuicComparisonClient(b, client)
+func BenchmarkRPCComparisonMsQuic(b *testing.B) {
+	client := startTrevRPCMsQuicComparisonClient(b)
+	warmTrevRPCMsQuicComparisonClient(b, client)
 
 	b.Run("unary_round_trip/trevrpc_msquic", func(b *testing.B) {
 		benchmarkTrevRPCUnary(b, client)
@@ -39,22 +39,22 @@ func BenchmarkRPCComparisonNativeMsQuic(b *testing.B) {
 	})
 }
 
-func startTrevRPCNativeMsQuicComparisonClient(b *testing.B) *greeter.GreeterClient {
+func startTrevRPCMsQuicComparisonClient(b *testing.B) *greeter.GreeterClient {
 	b.Helper()
 
 	server := newComparisonTrevRPCServer()
-	certFile, keyFile := comparisonNativeMsQuicCertificateFiles(b)
-	addr := freeNativeMsQuicUDPAddr(b)
-	serverConfig := comparisonNativeMsQuicConfig(server.Options())
+	certFile, keyFile := comparisonMsQuicCertificateFiles(b)
+	addr := freeMsQuicUDPAddr(b)
+	serverConfig := comparisonMsQuicConfig(server.Options())
 	serverConfig.CertFile = certFile
 	serverConfig.KeyFile = keyFile
 
 	listener, err := trevrpc.Listen(addr, server, trevrpc.ListenOptions{
-		Kind:         trevrpc.TransportNativeMsQuic,
-		NativeMsQuic: serverConfig,
+		Kind:   trevrpc.TransportMsQuic,
+		MsQuic: serverConfig,
 	})
 	if err != nil {
-		b.Fatalf("listen TrevRPC native MsQuic: %v", err)
+		b.Fatalf("listen TrevRPC MsQuic: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -64,13 +64,13 @@ func startTrevRPCNativeMsQuicComparisonClient(b *testing.B) *greeter.GreeterClie
 	}()
 
 	transport, err := trevrpc.Dial(ctx, addr, trevrpc.DialOptions{
-		Kind:         trevrpc.TransportNativeMsQuic,
-		NativeMsQuic: comparisonNativeMsQuicConfig(server.Options()),
+		Kind:   trevrpc.TransportMsQuic,
+		MsQuic: comparisonMsQuicConfig(server.Options()),
 	})
 	if err != nil {
 		cancel()
 		_ = listener.Close()
-		b.Fatalf("dial TrevRPC native MsQuic: %v", err)
+		b.Fatalf("dial TrevRPC MsQuic: %v", err)
 	}
 
 	b.Cleanup(func() {
@@ -80,49 +80,49 @@ func startTrevRPCNativeMsQuicComparisonClient(b *testing.B) *greeter.GreeterClie
 		select {
 		case err := <-serveDone:
 			if err != nil {
-				b.Logf("TrevRPC native MsQuic server stopped with error: %v", err)
+				b.Logf("TrevRPC MsQuic server stopped with error: %v", err)
 			}
 		case <-time.After(2 * time.Second):
-			b.Log("timed out waiting for TrevRPC native MsQuic server shutdown")
+			b.Log("timed out waiting for TrevRPC MsQuic server shutdown")
 		}
 	})
 
 	return greeter.NewGreeterClient(transport, trevrpc.WithoutStreamIdleTimeout())
 }
 
-func warmTrevRPCNativeMsQuicComparisonClient(b *testing.B, client *greeter.GreeterClient) {
+func warmTrevRPCMsQuicComparisonClient(b *testing.B, client *greeter.GreeterClient) {
 	b.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if _, err := client.SayHello(ctx, comparisonRequests[0]); err != nil {
-		b.Fatalf("warm TrevRPC native MsQuic unary: %v", err)
+		b.Fatalf("warm TrevRPC MsQuic unary: %v", err)
 	}
 	if _, err := trevrpcServerStreamingCall(ctx, client); err != nil {
-		b.Fatalf("warm TrevRPC native MsQuic server streaming: %v", err)
+		b.Fatalf("warm TrevRPC MsQuic server streaming: %v", err)
 	}
 	if _, err := trevrpcClientStreamingCall(ctx, client); err != nil {
-		b.Fatalf("warm TrevRPC native MsQuic client streaming: %v", err)
+		b.Fatalf("warm TrevRPC MsQuic client streaming: %v", err)
 	}
 	if _, err := trevrpcBidiStreamingCall(ctx, client); err != nil {
-		b.Fatalf("warm TrevRPC native MsQuic bidi streaming: %v", err)
+		b.Fatalf("warm TrevRPC MsQuic bidi streaming: %v", err)
 	}
 }
 
-func comparisonNativeMsQuicConfig(options trevrpc.ServerOptions) trevrpc.NativeMsQuicConfig {
-	config := trevrpc.NativeMsQuicConfigFromServerOptions(options)
+func comparisonMsQuicConfig(options trevrpc.ServerOptions) trevrpc.MsQuicConfig {
+	config := trevrpc.MsQuicConfigFromServerOptions(options)
 	config.MaxIdleTimeout = comparisonQUICIdleTimeout
 	config.KeepAlive = comparisonQUICKeepAlive
 	return config
 }
 
-func comparisonNativeMsQuicCertificateFiles(tb testing.TB) (string, string) {
+func comparisonMsQuicCertificateFiles(tb testing.TB) (string, string) {
 	tb.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		tb.Fatalf("generate native MsQuic TLS key: %v", err)
+		tb.Fatalf("generate MsQuic TLS key: %v", err)
 	}
 	notBefore := time.Now().Add(-time.Hour)
 	template := &x509.Certificate{
@@ -138,27 +138,27 @@ func comparisonNativeMsQuicCertificateFiles(tb testing.TB) (string, string) {
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
-		tb.Fatalf("create native MsQuic TLS certificate: %v", err)
+		tb.Fatalf("create MsQuic TLS certificate: %v", err)
 	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		tb.Fatalf("marshal native MsQuic TLS key: %v", err)
+		tb.Fatalf("marshal MsQuic TLS key: %v", err)
 	}
 
 	dir := tb.TempDir()
 	certFile := filepath.Join(dir, "server.cert")
 	keyFile := filepath.Join(dir, "server.key")
 	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0o600); err != nil {
-		tb.Fatalf("write native MsQuic TLS certificate: %v", err)
+		tb.Fatalf("write MsQuic TLS certificate: %v", err)
 	}
 	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
-		tb.Fatalf("write native MsQuic TLS key: %v", err)
+		tb.Fatalf("write MsQuic TLS key: %v", err)
 	}
 
 	return certFile, keyFile
 }
 
-func freeNativeMsQuicUDPAddr(tb testing.TB) string {
+func freeMsQuicUDPAddr(tb testing.TB) string {
 	tb.Helper()
 
 	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")

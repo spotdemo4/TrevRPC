@@ -1,4 +1,4 @@
-//go:build trevrpc_msquic_native && cgo
+//go:build trevrpc_msquic && cgo
 
 package cruntimetest
 
@@ -19,15 +19,15 @@ import (
 	"time"
 )
 
-func TestCRuntimeNativeMsQuicUnaryAndStreamingRoundTrip(t *testing.T) {
+func TestCRuntimeMsQuicUnaryAndStreamingRoundTrip(t *testing.T) {
 	certFile, keyFile := certificateFiles(t)
 	host, portText, err := net.SplitHostPort(udpAddr(t))
 	if err != nil {
-		t.Fatalf("split C runtime native MsQuic address: %v", err)
+		t.Fatalf("split C runtime MsQuic address: %v", err)
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil {
-		t.Fatalf("parse C runtime native MsQuic port: %v", err)
+		t.Fatalf("parse C runtime MsQuic port: %v", err)
 	}
 
 	server, err := startEchoServer(host, certFile, keyFile, uint16(port))
@@ -95,7 +95,7 @@ func certificateFiles(t *testing.T) (string, string) {
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("generate C runtime native MsQuic TLS key: %v", err)
+		t.Fatalf("generate C runtime MsQuic TLS key: %v", err)
 	}
 	notBefore := time.Now().Add(-time.Hour)
 	template := &x509.Certificate{
@@ -111,21 +111,21 @@ func certificateFiles(t *testing.T) (string, string) {
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
-		t.Fatalf("create C runtime native MsQuic TLS certificate: %v", err)
+		t.Fatalf("create C runtime MsQuic TLS certificate: %v", err)
 	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		t.Fatalf("marshal C runtime native MsQuic TLS key: %v", err)
+		t.Fatalf("marshal C runtime MsQuic TLS key: %v", err)
 	}
 
 	dir := t.TempDir()
 	certFile := filepath.Join(dir, "server.cert")
 	keyFile := filepath.Join(dir, "server.key")
 	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0o600); err != nil {
-		t.Fatalf("write C runtime native MsQuic TLS certificate: %v", err)
+		t.Fatalf("write C runtime MsQuic TLS certificate: %v", err)
 	}
 	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
-		t.Fatalf("write C runtime native MsQuic TLS key: %v", err)
+		t.Fatalf("write C runtime MsQuic TLS key: %v", err)
 	}
 
 	return certFile, keyFile
@@ -136,11 +136,11 @@ func udpAddr(t *testing.T) string {
 
 	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve C runtime native MsQuic UDP address: %v", err)
+		t.Fatalf("reserve C runtime MsQuic UDP address: %v", err)
 	}
 	addr := packetConn.LocalAddr().String()
 	if err := packetConn.Close(); err != nil {
-		t.Fatalf("release C runtime native MsQuic UDP address: %v", err)
+		t.Fatalf("release C runtime MsQuic UDP address: %v", err)
 	}
 
 	return addr

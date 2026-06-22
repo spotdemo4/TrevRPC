@@ -6,12 +6,12 @@ Go runtime support for TrevRPC clients and servers.
 
 Use `quic-go` by default. It is the normal Go path, requires no cgo, and works with `go test ./...` and standard Go cross-compilation.
 
-Use native MsQuic when you explicitly want the C/MsQuic transport path, for example to benchmark against `trevrpc-c`, deploy with MsQuic, or compare behavior with other native TrevRPC runtimes. It requires cgo, `libmsquic`, and the `trevrpc_msquic_native` build tag.
+Use MsQuic when you explicitly want the C/MsQuic transport path, for example to benchmark against `trevrpc-c`, deploy with MsQuic, or compare behavior with other native TrevRPC runtimes. It requires cgo, `libmsquic`, and the `trevrpc_msquic` build tag.
 
-| Transport     | Build                         | Best For                                                          |
-| ------------- | ----------------------------- | ----------------------------------------------------------------- |
-| `quic-go`     | default                       | Portable Go services, easiest builds, default tests               |
-| native MsQuic | `-tags trevrpc_msquic_native` | Native MsQuic deployments, C-runtime parity, transport benchmarks |
+| Transport | Build                  | Best For                                                   |
+| --------- | ---------------------- | ---------------------------------------------------------- |
+| `quic-go` | default                | Portable Go services, easiest builds, default tests        |
+| MsQuic    | `-tags trevrpc_msquic` | MsQuic deployments, C-runtime parity, transport benchmarks |
 
 Generated TrevRPC clients are transport-agnostic. Use `Listen` and `Dial` for a common setup API, then pass the returned client transport to the generated service client.
 
@@ -48,12 +48,12 @@ defer transport.Close()
 client := greeter.NewGreeterClient(transport)
 ```
 
-## Native MsQuic
+## MsQuic
 
-Build and test native MsQuic code with:
+Build and test MsQuic code with:
 
 ```sh
-go test -tags trevrpc_msquic_native ./...
+go test -tags trevrpc_msquic ./...
 ```
 
 The native path links against `libmsquic` and embeds the `trevrpc-c` MsQuic wrapper through cgo.
@@ -63,8 +63,8 @@ Server setup:
 ```go
 server := trevrpc.NewServer()
 listener, err := trevrpc.Listen("127.0.0.1:50051", server, trevrpc.ListenOptions{
-    Kind: trevrpc.TransportNativeMsQuic,
-    NativeMsQuic: trevrpc.NativeMsQuicConfig{
+    Kind: trevrpc.TransportMsQuic,
+    MsQuic: trevrpc.MsQuicConfig{
         CertFile: "localhost-cert.pem",
         KeyFile:  "localhost-key.pem",
     },
@@ -81,7 +81,7 @@ Client setup:
 
 ```go
 transport, err := trevrpc.Dial(ctx, "127.0.0.1:50051", trevrpc.DialOptions{
-    Kind: trevrpc.TransportNativeMsQuic,
+    Kind: trevrpc.TransportMsQuic,
 })
 if err != nil {
     return err
@@ -91,4 +91,4 @@ defer transport.Close()
 client := greeter.NewGreeterClient(transport)
 ```
 
-The unified native MsQuic listener derives transport limits from `server.Options()` and then applies non-zero fields from `ListenOptions.NativeMsQuic`. Low-level APIs like `ServeQUIC`, `ListenNativeMsQuic`, and `DialNativeMsQuic` remain available when direct access to transport-specific objects is needed.
+The unified MsQuic listener derives transport limits from `server.Options()` and then applies non-zero fields from `ListenOptions.MsQuic`. Low-level APIs like `ServeQUIC`, `ListenMsQuic`, and `DialMsQuic` remain available when direct access to transport-specific objects is needed.

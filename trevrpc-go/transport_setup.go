@@ -15,8 +15,8 @@ type TransportKind uint8
 const (
 	// TransportQUICGo uses the pure Go quic-go backend.
 	TransportQUICGo TransportKind = iota
-	// TransportNativeMsQuic uses the native trevrpc-c MsQuic backend.
-	TransportNativeMsQuic
+	// TransportMsQuic uses the native trevrpc-c MsQuic backend.
+	TransportMsQuic
 )
 
 // ClientTransport is a TrevRPC client transport that can release its underlying connection.
@@ -34,10 +34,10 @@ type ServerListener interface {
 
 // ListenOptions configures Listen.
 type ListenOptions struct {
-	Kind         TransportKind
-	TLSConfig    *tls.Config
-	QUICConfig   *quic.Config
-	NativeMsQuic NativeMsQuicConfig
+	Kind       TransportKind
+	TLSConfig  *tls.Config
+	QUICConfig *quic.Config
+	MsQuic     MsQuicConfig
 }
 
 // DialOptions configures Dial.
@@ -45,7 +45,7 @@ type DialOptions struct {
 	Kind         TransportKind
 	TLSConfig    *tls.Config
 	QUICConfig   *quic.Config
-	NativeMsQuic NativeMsQuicConfig
+	MsQuic       MsQuicConfig
 	MaxFrameSize int
 }
 
@@ -65,8 +65,8 @@ func Listen(addr string, server *Server, options ListenOptions) (ServerListener,
 			return nil, transportStatus(err)
 		}
 		return &quicServerListener{listener: listener, server: server}, nil
-	case TransportNativeMsQuic:
-		return listenNativeMsQuic(addr, server, options)
+	case TransportMsQuic:
+		return listenMsQuic(addr, server, options)
 	default:
 		return nil, InvalidArgument(fmt.Sprintf("unsupported transport kind %d", options.Kind))
 	}
@@ -92,8 +92,8 @@ func Dial(ctx context.Context, addr string, options DialOptions) (ClientTranspor
 			return nil, transportOrContextStatus(ctx, err)
 		}
 		return NewQuicClient(conn).WithMaxFrameSize(maxFrameSize), nil
-	case TransportNativeMsQuic:
-		return dialNativeMsQuic(ctx, addr, options, maxFrameSize)
+	case TransportMsQuic:
+		return dialMsQuic(ctx, addr, options, maxFrameSize)
 	default:
 		return nil, InvalidArgument(fmt.Sprintf("unsupported transport kind %d", options.Kind))
 	}

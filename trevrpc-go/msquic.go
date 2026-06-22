@@ -1,4 +1,4 @@
-//go:build trevrpc_msquic_native && cgo
+//go:build trevrpc_msquic && cgo
 
 package trevrpc
 
@@ -22,30 +22,30 @@ import (
 	"unsafe"
 )
 
-// NativeMsQuicListener accepts native MsQuic connections from trevrpc-c.
-type NativeMsQuicListener struct {
+// MsQuicListener accepts MsQuic connections from trevrpc-c.
+type MsQuicListener struct {
 	mu        sync.Mutex
 	ptr       *C.trevrpc_msquic_listener
 	addr      net.Addr
 	closeOnce sync.Once
 }
 
-// NativeMsQuicConn is an accepted or dialed native MsQuic connection.
-type NativeMsQuicConn struct {
+// MsQuicConn is an accepted or dialed MsQuic connection.
+type MsQuicConn struct {
 	mu        sync.Mutex
 	ptr       *C.trevrpc_msquic_conn
 	closeOnce sync.Once
 }
 
-// NativeMsQuicClient sends TrevRPC calls over an established native MsQuic connection.
-type NativeMsQuicClient struct {
-	conn         *NativeMsQuicConn
+// MsQuicClient sends TrevRPC calls over an established MsQuic connection.
+type MsQuicClient struct {
+	conn         *MsQuicConn
 	maxFrameSize int
 }
 
-// ListenNativeMsQuic starts a native MsQuic listener.
-func ListenNativeMsQuic(addr string, config NativeMsQuicConfig) (*NativeMsQuicListener, error) {
-	host, port, err := splitNativeMsQuicAddr(addr)
+// ListenMsQuic starts a MsQuic listener.
+func ListenMsQuic(addr string, config MsQuicConfig) (*MsQuicListener, error) {
+	host, port, err := splitMsQuicAddr(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -53,10 +53,10 @@ func ListenNativeMsQuic(addr string, config NativeMsQuicConfig) (*NativeMsQuicLi
 	defer C.free(unsafe.Pointer(cHost))
 
 	var listener *C.trevrpc_msquic_listener
-	err = withNativeMsQuicConfig(config, func(cConfig *C.trevrpc_msquic_config) error {
+	err = withMsQuicConfig(config, func(cConfig *C.trevrpc_msquic_config) error {
 		code := C.trevrpc_msquic_listen(cHost, port, cConfig, &listener)
 		if code != 0 {
-			return nativeMsQuicError(code)
+			return msQuicError(code)
 		}
 		return nil
 	})
@@ -64,16 +64,16 @@ func ListenNativeMsQuic(addr string, config NativeMsQuicConfig) (*NativeMsQuicLi
 		return nil, err
 	}
 
-	return &NativeMsQuicListener{ptr: listener, addr: nativeMsQuicListenerAddr(host, port, listener)}, nil
+	return &MsQuicListener{ptr: listener, addr: msQuicListenerAddr(host, port, listener)}, nil
 }
 
-// DialNativeMsQuic dials a native MsQuic connection.
-func DialNativeMsQuic(ctx context.Context, addr string, config NativeMsQuicConfig) (*NativeMsQuicConn, error) {
+// DialMsQuic dials a MsQuic connection.
+func DialMsQuic(ctx context.Context, addr string, config MsQuicConfig) (*MsQuicConn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
 
-	host, port, err := splitNativeMsQuicAddr(addr)
+	host, port, err := splitMsQuicAddr(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -81,10 +81,10 @@ func DialNativeMsQuic(ctx context.Context, addr string, config NativeMsQuicConfi
 	defer C.free(unsafe.Pointer(cHost))
 
 	var conn *C.trevrpc_msquic_conn
-	err = withNativeMsQuicConfig(config, func(cConfig *C.trevrpc_msquic_config) error {
+	err = withMsQuicConfig(config, func(cConfig *C.trevrpc_msquic_config) error {
 		code := C.trevrpc_msquic_dial(cHost, port, cConfig, &conn)
 		if code != 0 {
-			return nativeMsQuicOrContextStatus(ctx, code)
+			return msQuicOrContextStatus(ctx, code)
 		}
 		return nil
 	})
@@ -92,27 +92,27 @@ func DialNativeMsQuic(ctx context.Context, addr string, config NativeMsQuicConfi
 		return nil, err
 	}
 
-	return &NativeMsQuicConn{ptr: conn}, nil
+	return &MsQuicConn{ptr: conn}, nil
 }
 
-// Accept accepts one native MsQuic connection.
-func (l *NativeMsQuicListener) Accept() (*NativeMsQuicConn, error) {
+// Accept accepts one MsQuic connection.
+func (l *MsQuicListener) Accept() (*MsQuicConn, error) {
 	ptr := l.cptr()
 	if ptr == nil {
-		return nil, Cancelled("native MsQuic listener closed")
+		return nil, Cancelled("MsQuic listener closed")
 	}
 
 	var conn *C.trevrpc_msquic_conn
 	code := C.trevrpc_msquic_listener_accept(ptr, &conn)
 	if code != 0 {
-		return nil, nativeMsQuicError(code)
+		return nil, msQuicError(code)
 	}
 
-	return &NativeMsQuicConn{ptr: conn}, nil
+	return &MsQuicConn{ptr: conn}, nil
 }
 
 // Addr returns the listener's local network address.
-func (l *NativeMsQuicListener) Addr() net.Addr {
+func (l *MsQuicListener) Addr() net.Addr {
 	if l == nil {
 		return nil
 	}
@@ -120,7 +120,7 @@ func (l *NativeMsQuicListener) Addr() net.Addr {
 }
 
 // Close stops the listener and releases native resources.
-func (l *NativeMsQuicListener) Close() error {
+func (l *MsQuicListener) Close() error {
 	if l == nil {
 		return nil
 	}
@@ -133,7 +133,7 @@ func (l *NativeMsQuicListener) Close() error {
 	return nil
 }
 
-func (l *NativeMsQuicListener) shutdown() {
+func (l *MsQuicListener) shutdown() {
 	if l == nil {
 		return
 	}
@@ -143,13 +143,13 @@ func (l *NativeMsQuicListener) shutdown() {
 	}
 }
 
-func (l *NativeMsQuicListener) cptr() *C.trevrpc_msquic_listener {
+func (l *MsQuicListener) cptr() *C.trevrpc_msquic_listener {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.ptr
 }
 
-func (l *NativeMsQuicListener) takePtr() *C.trevrpc_msquic_listener {
+func (l *MsQuicListener) takePtr() *C.trevrpc_msquic_listener {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	ptr := l.ptr
@@ -157,61 +157,61 @@ func (l *NativeMsQuicListener) takePtr() *C.trevrpc_msquic_listener {
 	return ptr
 }
 
-// NewNativeMsQuicClient creates a TrevRPC client over an established native MsQuic connection.
-func NewNativeMsQuicClient(conn *NativeMsQuicConn) *NativeMsQuicClient {
-	return &NativeMsQuicClient{conn: conn, maxFrameSize: DefaultMaxFrameSize}
+// NewMsQuicClient creates a TrevRPC client over an established MsQuic connection.
+func NewMsQuicClient(conn *MsQuicConn) *MsQuicClient {
+	return &MsQuicClient{conn: conn, maxFrameSize: DefaultMaxFrameSize}
 }
 
 // WithMaxFrameSize sets the maximum TrevRPC frame size for the client.
-func (t *NativeMsQuicClient) WithMaxFrameSize(maxFrameSize int) *NativeMsQuicClient {
+func (t *MsQuicClient) WithMaxFrameSize(maxFrameSize int) *MsQuicClient {
 	t.maxFrameSize = maxFrameSize
 	return t
 }
 
-// Conn returns the underlying native MsQuic connection.
-func (t *NativeMsQuicClient) Conn() *NativeMsQuicConn {
+// Conn returns the underlying MsQuic connection.
+func (t *MsQuicClient) Conn() *MsQuicConn {
 	return t.conn
 }
 
-// Close closes the underlying native MsQuic connection.
-func (t *NativeMsQuicClient) Close() error {
+// Close closes the underlying MsQuic connection.
+func (t *MsQuicClient) Close() error {
 	if t == nil || t.conn == nil {
 		return nil
 	}
 	return t.conn.Close()
 }
 
-// Call sends a unary RPC request over native MsQuic and returns its response.
-func (t *NativeMsQuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+// Call sends a unary RPC request over MsQuic and returns its response.
+func (t *MsQuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
 
 	stream, err := t.conn.OpenStream(ctx)
 	if err != nil {
-		return nil, Unavailable("native MsQuic open stream: " + err.Error())
+		return nil, Unavailable("MsQuic open stream: " + err.Error())
 	}
 	defer stream.destroy()
 	stopCancel := stream.trevrpcCancelReadOnContext(ctx)
 	defer stopCancel()
 
 	if err := WriteFrame(stream, request, t.maxFrameSize); err != nil {
-		return nil, Unavailable("native MsQuic write request: " + nativeMsQuicOrContextErr(ctx, err).Error())
+		return nil, Unavailable("MsQuic write request: " + msQuicOrContextErr(ctx, err).Error())
 	}
 	if err := stream.Close(); err != nil {
-		return nil, Unavailable("native MsQuic close request send: " + nativeMsQuicOrContextErr(ctx, err).Error())
+		return nil, Unavailable("MsQuic close request send: " + msQuicOrContextErr(ctx, err).Error())
 	}
 
 	response := &RpcResponse{}
 	if err := ReadFrame(stream, response, t.maxFrameSize); err != nil {
-		return nil, Unavailable("native MsQuic read response: " + nativeMsQuicOrContextErr(ctx, err).Error())
+		return nil, Unavailable("MsQuic read response: " + msQuicOrContextErr(ctx, err).Error())
 	}
 
 	return response, nil
 }
 
-// StreamingCall sends a streaming RPC request over native MsQuic and returns response frames.
-func (t *NativeMsQuicClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+// StreamingCall sends a streaming RPC request over MsQuic and returns response frames.
+func (t *MsQuicClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	if err := streamCtx.Err(); err != nil {
 		cancel()
@@ -227,52 +227,52 @@ func (t *NativeMsQuicClient) StreamingCall(ctx context.Context, request *RpcRequ
 	writerDone := make(chan error, 1)
 	stopCancel := stream.trevrpcCancelReadOnContext(streamCtx)
 	go func() {
-		writerDone <- writeNativeMsQuicStreamingRequest(streamCtx, stream, request, requestBody, t.maxFrameSize)
+		writerDone <- writeMsQuicStreamingRequest(streamCtx, stream, request, requestBody, t.maxFrameSize)
 	}()
 
-	return &nativeMsQuicResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, stopCancel: stopCancel, maxFrameSize: t.maxFrameSize}, nil
+	return &msQuicResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, stopCancel: stopCancel, maxFrameSize: t.maxFrameSize}, nil
 }
 
-func (c *NativeMsQuicConn) OpenStream(ctx context.Context) (*nativeMsQuicStream, error) {
+func (c *MsQuicConn) OpenStream(ctx context.Context) (*msQuicStream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
 
 	ptr := c.cptr()
 	if ptr == nil {
-		return nil, Cancelled("native MsQuic connection closed")
+		return nil, Cancelled("MsQuic connection closed")
 	}
 
 	var stream *C.trevrpc_msquic_stream
 	code := C.trevrpc_msquic_conn_open_stream(ptr, &stream)
 	if code != 0 {
-		return nil, nativeMsQuicOrContextStatus(ctx, code)
+		return nil, msQuicOrContextStatus(ctx, code)
 	}
 
-	return &nativeMsQuicStream{ptr: stream}, nil
+	return &msQuicStream{ptr: stream}, nil
 }
 
-func (c *NativeMsQuicConn) AcceptStream(ctx context.Context) (*nativeMsQuicStream, error) {
+func (c *MsQuicConn) AcceptStream(ctx context.Context) (*msQuicStream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
 
 	ptr := c.cptr()
 	if ptr == nil {
-		return nil, Cancelled("native MsQuic connection closed")
+		return nil, Cancelled("MsQuic connection closed")
 	}
 
 	var stream *C.trevrpc_msquic_stream
 	code := C.trevrpc_msquic_conn_accept_stream(ptr, &stream)
 	if code != 0 {
-		return nil, nativeMsQuicOrContextStatus(ctx, code)
+		return nil, msQuicOrContextStatus(ctx, code)
 	}
 
-	return &nativeMsQuicStream{ptr: stream}, nil
+	return &msQuicStream{ptr: stream}, nil
 }
 
-// Close closes the native MsQuic connection.
-func (c *NativeMsQuicConn) Close() error {
+// Close closes the MsQuic connection.
+func (c *MsQuicConn) Close() error {
 	if c == nil {
 		return nil
 	}
@@ -285,7 +285,7 @@ func (c *NativeMsQuicConn) Close() error {
 	return nil
 }
 
-func (c *NativeMsQuicConn) shutdown() {
+func (c *MsQuicConn) shutdown() {
 	if c == nil {
 		return
 	}
@@ -295,13 +295,13 @@ func (c *NativeMsQuicConn) shutdown() {
 	}
 }
 
-func (c *NativeMsQuicConn) cptr() *C.trevrpc_msquic_conn {
+func (c *MsQuicConn) cptr() *C.trevrpc_msquic_conn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ptr
 }
 
-func (c *NativeMsQuicConn) takePtr() *C.trevrpc_msquic_conn {
+func (c *MsQuicConn) takePtr() *C.trevrpc_msquic_conn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ptr := c.ptr
@@ -309,8 +309,8 @@ func (c *NativeMsQuicConn) takePtr() *C.trevrpc_msquic_conn {
 	return ptr
 }
 
-type nativeMsQuicResponseStream struct {
-	stream       *nativeMsQuicStream
+type msQuicResponseStream struct {
+	stream       *msQuicStream
 	writerDone   <-chan error
 	cancel       context.CancelFunc
 	stopCancel   func()
@@ -318,9 +318,9 @@ type nativeMsQuicResponseStream struct {
 	done         bool
 }
 
-func (s *nativeMsQuicResponseStream) trevrpcContextCancelsRecv() bool { return true }
+func (s *msQuicResponseStream) trevrpcContextCancelsRecv() bool { return true }
 
-func (s *nativeMsQuicResponseStream) Recv() (*RpcStreamFrame, error) {
+func (s *msQuicResponseStream) Recv() (*RpcStreamFrame, error) {
 	frame, _, err := s.recvStreamFrameFields(true)
 	if err != nil {
 		return nil, err
@@ -329,11 +329,11 @@ func (s *nativeMsQuicResponseStream) Recv() (*RpcStreamFrame, error) {
 	return frame.rpcStreamFrame(), nil
 }
 
-func (s *nativeMsQuicResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
+func (s *msQuicResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
 	return s.recvStreamFrameFields(false)
 }
 
-func (s *nativeMsQuicResponseStream) recvStreamFrameFields(copyBytes bool) (streamFrameFields, func(), error) {
+func (s *msQuicResponseStream) recvStreamFrameFields(copyBytes bool) (streamFrameFields, func(), error) {
 	if s.done {
 		return streamFrameFields{}, nil, io.EOF
 	}
@@ -347,7 +347,7 @@ func (s *nativeMsQuicResponseStream) recvStreamFrameFields(copyBytes bool) (stre
 			}
 			return streamFrameFields{}, nil, writerErr
 		}
-		return streamFrameFields{}, release, nativeMsQuicErrorFromErr(err)
+		return streamFrameFields{}, release, msQuicErrorFromErr(err)
 	}
 
 	if !read {
@@ -375,12 +375,12 @@ func (s *nativeMsQuicResponseStream) recvStreamFrameFields(copyBytes bool) (stre
 	return frame, release, nil
 }
 
-func (s *nativeMsQuicResponseStream) Close() error {
+func (s *msQuicResponseStream) Close() error {
 	s.finish(true)
 	return s.writerError(true)
 }
 
-func (s *nativeMsQuicResponseStream) finish(abortRead bool) {
+func (s *msQuicResponseStream) finish(abortRead bool) {
 	if s.done {
 		return
 	}
@@ -399,7 +399,7 @@ func (s *nativeMsQuicResponseStream) finish(abortRead bool) {
 	s.stream.destroy()
 }
 
-func (s *nativeMsQuicResponseStream) writerError(ignoreCancelled bool) error {
+func (s *msQuicResponseStream) writerError(ignoreCancelled bool) error {
 	if s.writerDone == nil {
 		return nil
 	}
@@ -416,26 +416,26 @@ func (s *nativeMsQuicResponseStream) writerError(ignoreCancelled bool) error {
 	return err
 }
 
-func (s *nativeMsQuicResponseStream) ignoreWriterError() {
+func (s *msQuicResponseStream) ignoreWriterError() {
 	s.writerDone = nil
 }
 
-func writeNativeMsQuicStreamingRequest(ctx context.Context, stream *nativeMsQuicStream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
+func writeMsQuicStreamingRequest(ctx context.Context, stream *msQuicStream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
 	defer closeMessageStream(requestBody)
 
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
-		return nativeMsQuicOrContextErr(ctx, err)
+		return msQuicOrContextErr(ctx, err)
 	}
 
 	if err := writeRequestBodyFrames(ctx, stream, requestBody, maxFrameSize); err != nil {
-		return nativeMsQuicOrContextErr(ctx, err)
+		return msQuicOrContextErr(ctx, err)
 	}
 
 	return stream.Close()
 }
 
-// ServeNativeMsQuic accepts native MsQuic connections and serves TrevRPC until ctx is cancelled.
-func ServeNativeMsQuic(ctx context.Context, listener *NativeMsQuicListener, server *Server) error {
+// ServeMsQuic accepts MsQuic connections and serves TrevRPC until ctx is cancelled.
+func ServeMsQuic(ctx context.Context, listener *MsQuicListener, server *Server) error {
 	connectionLimit := newSemaphore(server.options.MaxConcurrentConnections)
 	requestLimit := newSemaphore(server.options.MaxConcurrentRequests)
 	connectionsCtx, stopConnections := context.WithCancel(context.Background())
@@ -468,7 +468,7 @@ func ServeNativeMsQuic(ctx context.Context, listener *NativeMsQuicListener, serv
 
 		connectionTasks.Go(func() {
 			defer release(connectionLimit)
-			handleNativeMsQuicConnection(connectionsCtx, conn, server, requestLimit, true)
+			handleMsQuicConnection(connectionsCtx, conn, server, requestLimit, true)
 		})
 	}
 
@@ -478,7 +478,7 @@ func ServeNativeMsQuic(ctx context.Context, listener *NativeMsQuicListener, serv
 	return nil
 }
 
-func handleNativeMsQuicConnection(ctx context.Context, conn *NativeMsQuicConn, server *Server, requestLimit semaphore, closeOnShutdown bool) {
+func handleMsQuicConnection(ctx context.Context, conn *MsQuicConn, server *Server, requestLimit semaphore, closeOnShutdown bool) {
 	streamLimit := newSemaphore(server.options.MaxConcurrentStreamsPerConnection)
 	var streamTasks sync.WaitGroup
 
@@ -517,14 +517,14 @@ func handleNativeMsQuicConnection(ctx context.Context, conn *NativeMsQuicConn, s
 	}
 }
 
-type nativeMsQuicStream struct {
+type msQuicStream struct {
 	mu          sync.Mutex
 	ptr         *C.trevrpc_msquic_stream
 	closeOnce   sync.Once
 	destroyOnce sync.Once
 }
 
-func (s *nativeMsQuicStream) Read(data []byte) (int, error) {
+func (s *msQuicStream) Read(data []byte) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -541,10 +541,10 @@ func (s *nativeMsQuicStream) Read(data []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	return 0, nativeMsQuicError(C.int(n))
+	return 0, msQuicError(C.int(n))
 }
 
-func (s *nativeMsQuicStream) Write(data []byte) (int, error) {
+func (s *msQuicStream) Write(data []byte) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -558,10 +558,10 @@ func (s *nativeMsQuicStream) Write(data []byte) (int, error) {
 		return int(n), nil
 	}
 
-	return 0, nativeMsQuicError(C.int(n))
+	return 0, msQuicError(C.int(n))
 }
 
-func (s *nativeMsQuicStream) trevrpcReadFrame(message ProtoMessage, maxFrameSize int) (bool, error) {
+func (s *msQuicStream) trevrpcReadFrame(message ProtoMessage, maxFrameSize int) (bool, error) {
 	ptr := s.cptr()
 	if ptr == nil {
 		return false, nil
@@ -577,7 +577,7 @@ func (s *nativeMsQuicStream) trevrpcReadFrame(message ProtoMessage, maxFrameSize
 		if result == C.TREV_MSQUIC_ERR_FRAME_TOO_LARGE {
 			return false, &FrameTooLargeError{Len: int(bodyLen), Max: maxFrameSize}
 		}
-		return false, nativeMsQuicError(C.int(result))
+		return false, msQuicError(C.int(result))
 	}
 	if body != nil {
 		defer C.trevrpc_msquic_free(unsafe.Pointer(body))
@@ -590,7 +590,7 @@ func (s *nativeMsQuicStream) trevrpcReadFrame(message ProtoMessage, maxFrameSize
 	return true, DecodeFrame(frameBody, message)
 }
 
-func (s *nativeMsQuicStream) trevrpcReadStreamFrame(maxFrameSize int) (streamFrameFields, bool, error) {
+func (s *msQuicStream) trevrpcReadStreamFrame(maxFrameSize int) (streamFrameFields, bool, error) {
 	fields, release, read, err := s.trevrpcReadStreamFrameWithCopy(maxFrameSize, true)
 	if release != nil {
 		release()
@@ -598,11 +598,11 @@ func (s *nativeMsQuicStream) trevrpcReadStreamFrame(maxFrameSize int) (streamFra
 	return fields, read, err
 }
 
-func (s *nativeMsQuicStream) trevrpcReadStreamFrameReleasable(maxFrameSize int) (streamFrameFields, func(), bool, error) {
+func (s *msQuicStream) trevrpcReadStreamFrameReleasable(maxFrameSize int) (streamFrameFields, func(), bool, error) {
 	return s.trevrpcReadStreamFrameWithCopy(maxFrameSize, false)
 }
 
-func (s *nativeMsQuicStream) trevrpcReadStreamFrameWithCopy(maxFrameSize int, copyBytes bool) (streamFrameFields, func(), bool, error) {
+func (s *msQuicStream) trevrpcReadStreamFrameWithCopy(maxFrameSize int, copyBytes bool) (streamFrameFields, func(), bool, error) {
 	ptr := s.cptr()
 	if ptr == nil {
 		return streamFrameFields{}, nil, false, nil
@@ -618,7 +618,7 @@ func (s *nativeMsQuicStream) trevrpcReadStreamFrameWithCopy(maxFrameSize int, co
 		if result == C.TREV_MSQUIC_ERR_FRAME_TOO_LARGE {
 			return streamFrameFields{}, nil, false, &FrameTooLargeError{Len: int(bodyLen), Max: maxFrameSize}
 		}
-		return streamFrameFields{}, nil, false, nativeMsQuicError(C.int(result))
+		return streamFrameFields{}, nil, false, msQuicError(C.int(result))
 	}
 	release := func() {}
 	if body != nil {
@@ -642,7 +642,7 @@ func (s *nativeMsQuicStream) trevrpcReadStreamFrameWithCopy(maxFrameSize int, co
 	return fields, release, true, nil
 }
 
-func (s *nativeMsQuicStream) trevrpcWriteFrame(message ProtoMessage, maxFrameSize int) error {
+func (s *msQuicStream) trevrpcWriteFrame(message ProtoMessage, maxFrameSize int) error {
 	frame, err := EncodeFrame(message, maxFrameSize)
 	if err != nil {
 		return err
@@ -652,7 +652,7 @@ func (s *nativeMsQuicStream) trevrpcWriteFrame(message ProtoMessage, maxFrameSiz
 	return err
 }
 
-func (s *nativeMsQuicStream) trevrpcWriteMessageStreamFrame(body []byte, maxFrameSize int) error {
+func (s *msQuicStream) trevrpcWriteMessageStreamFrame(body []byte, maxFrameSize int) error {
 	bodyLen := messageStreamFrameBodyLen(body)
 	if bodyLen > maxFrameSize {
 		return &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
@@ -675,10 +675,10 @@ func (s *nativeMsQuicStream) trevrpcWriteMessageStreamFrame(body []byte, maxFram
 		return &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
 	}
 
-	return nativeMsQuicError(C.int(result))
+	return msQuicError(C.int(result))
 }
 
-func (s *nativeMsQuicStream) trevrpcWriteMessageStreamFrames(bodies [][]byte, maxFrameSize int) error {
+func (s *msQuicStream) trevrpcWriteMessageStreamFrames(bodies [][]byte, maxFrameSize int) error {
 	if len(bodies) == 0 {
 		return nil
 	}
@@ -730,10 +730,10 @@ func (s *nativeMsQuicStream) trevrpcWriteMessageStreamFrames(bodies [][]byte, ma
 		return &FrameTooLargeError{Len: maxFrameSize + 1, Max: maxFrameSize}
 	}
 
-	return nativeMsQuicError(C.int(result))
+	return msQuicError(C.int(result))
 }
 
-func (s *nativeMsQuicStream) Close() error {
+func (s *msQuicStream) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		ptr := s.cptr()
@@ -742,25 +742,25 @@ func (s *nativeMsQuicStream) Close() error {
 		}
 		code := C.trevrpc_msquic_stream_shutdown_send(ptr)
 		if code != 0 {
-			err = nativeMsQuicError(code)
+			err = msQuicError(code)
 		}
 	})
 	return err
 }
 
-func (s *nativeMsQuicStream) abortRead() error {
+func (s *msQuicStream) abortRead() error {
 	ptr := s.cptr()
 	if ptr == nil {
 		return nil
 	}
 	code := C.trevrpc_msquic_stream_abort_receive(ptr)
 	if code != 0 {
-		return nativeMsQuicError(code)
+		return msQuicError(code)
 	}
 	return nil
 }
 
-func (s *nativeMsQuicStream) destroy() {
+func (s *msQuicStream) destroy() {
 	s.destroyOnce.Do(func() {
 		ptr := s.takePtr()
 		if ptr != nil {
@@ -769,13 +769,13 @@ func (s *nativeMsQuicStream) destroy() {
 	})
 }
 
-func (s *nativeMsQuicStream) cptr() *C.trevrpc_msquic_stream {
+func (s *msQuicStream) cptr() *C.trevrpc_msquic_stream {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ptr
 }
 
-func (s *nativeMsQuicStream) takePtr() *C.trevrpc_msquic_stream {
+func (s *msQuicStream) takePtr() *C.trevrpc_msquic_stream {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ptr := s.ptr
@@ -783,7 +783,7 @@ func (s *nativeMsQuicStream) takePtr() *C.trevrpc_msquic_stream {
 	return ptr
 }
 
-func (s *nativeMsQuicStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+func (s *msQuicStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
 	if ctx.Done() == nil {
 		return func() {}
 	}
@@ -801,41 +801,41 @@ func (s *nativeMsQuicStream) trevrpcCancelReadOnContext(ctx context.Context) fun
 	return func() { closeOnce.Do(func() { close(done) }) }
 }
 
-type nativeMsQuicServerListener struct {
-	listener *NativeMsQuicListener
+type msQuicServerListener struct {
+	listener *MsQuicListener
 	server   *Server
 }
 
-func listenNativeMsQuic(addr string, server *Server, options ListenOptions) (ServerListener, error) {
-	config := mergeNativeMsQuicConfig(NativeMsQuicConfigFromServerOptions(server.Options()), options.NativeMsQuic)
-	listener, err := ListenNativeMsQuic(addr, config)
+func listenMsQuic(addr string, server *Server, options ListenOptions) (ServerListener, error) {
+	config := mergeMsQuicConfig(MsQuicConfigFromServerOptions(server.Options()), options.MsQuic)
+	listener, err := ListenMsQuic(addr, config)
 	if err != nil {
 		return nil, err
 	}
-	return &nativeMsQuicServerListener{listener: listener, server: server}, nil
+	return &msQuicServerListener{listener: listener, server: server}, nil
 }
 
-func dialNativeMsQuic(ctx context.Context, addr string, options DialOptions, maxFrameSize int) (ClientTransport, error) {
-	conn, err := DialNativeMsQuic(ctx, addr, options.NativeMsQuic)
+func dialMsQuic(ctx context.Context, addr string, options DialOptions, maxFrameSize int) (ClientTransport, error) {
+	conn, err := DialMsQuic(ctx, addr, options.MsQuic)
 	if err != nil {
 		return nil, err
 	}
-	return NewNativeMsQuicClient(conn).WithMaxFrameSize(maxFrameSize), nil
+	return NewMsQuicClient(conn).WithMaxFrameSize(maxFrameSize), nil
 }
 
-func (l *nativeMsQuicServerListener) Addr() net.Addr {
+func (l *msQuicServerListener) Addr() net.Addr {
 	return l.listener.Addr()
 }
 
-func (l *nativeMsQuicServerListener) Serve(ctx context.Context) error {
-	return ServeNativeMsQuic(ctx, l.listener, l.server)
+func (l *msQuicServerListener) Serve(ctx context.Context) error {
+	return ServeMsQuic(ctx, l.listener, l.server)
 }
 
-func (l *nativeMsQuicServerListener) Close() error {
+func (l *msQuicServerListener) Close() error {
 	return l.listener.Close()
 }
 
-func mergeNativeMsQuicConfig(base, override NativeMsQuicConfig) NativeMsQuicConfig {
+func mergeMsQuicConfig(base, override MsQuicConfig) MsQuicConfig {
 	if override.CertFile != "" {
 		base.CertFile = override.CertFile
 	}
@@ -860,7 +860,7 @@ func mergeNativeMsQuicConfig(base, override NativeMsQuicConfig) NativeMsQuicConf
 	return base
 }
 
-func withNativeMsQuicConfig(config NativeMsQuicConfig, fn func(*C.trevrpc_msquic_config) error) error {
+func withMsQuicConfig(config MsQuicConfig, fn func(*C.trevrpc_msquic_config) error) error {
 	alpn := C.CString(ALPN)
 	defer C.free(unsafe.Pointer(alpn))
 
@@ -874,19 +874,19 @@ func withNativeMsQuicConfig(config NativeMsQuicConfig, fn func(*C.trevrpc_msquic
 		keyFile = C.CString(config.KeyFile)
 		defer C.free(unsafe.Pointer(keyFile))
 	}
-	keepAliveMs, err := nativeMsQuicDurationMillis32("keep alive", config.KeepAlive)
+	keepAliveMs, err := msQuicDurationMillis32("keep alive", config.KeepAlive)
 	if err != nil {
 		return err
 	}
-	peerBidiStreamCount, err := nativeMsQuicUint16("peer bidi stream count", config.PeerBidiStreamCount)
+	peerBidiStreamCount, err := msQuicUint16("peer bidi stream count", config.PeerBidiStreamCount)
 	if err != nil {
 		return err
 	}
-	maxStatelessOperations, err := nativeMsQuicUint32("max stateless operations", config.MaxStatelessOperations)
+	maxStatelessOperations, err := msQuicUint32("max stateless operations", config.MaxStatelessOperations)
 	if err != nil {
 		return err
 	}
-	maxBindingStatelessOperations, err := nativeMsQuicUint16("max binding stateless operations", config.MaxBindingStatelessOperations)
+	maxBindingStatelessOperations, err := msQuicUint16("max binding stateless operations", config.MaxBindingStatelessOperations)
 	if err != nil {
 		return err
 	}
@@ -906,35 +906,35 @@ func withNativeMsQuicConfig(config NativeMsQuicConfig, fn func(*C.trevrpc_msquic
 	return fn(&cConfig)
 }
 
-func nativeMsQuicUint16(name string, value int) (C.uint16_t, error) {
+func msQuicUint16(name string, value int) (C.uint16_t, error) {
 	if value <= 0 {
 		return 0, nil
 	}
-	if int64(value) > nativeMsQuicMaxUint16 {
-		return 0, InvalidArgument(fmt.Sprintf("native MsQuic %s exceeds %d", name, nativeMsQuicMaxUint16))
+	if int64(value) > msQuicMaxUint16 {
+		return 0, InvalidArgument(fmt.Sprintf("MsQuic %s exceeds %d", name, msQuicMaxUint16))
 	}
 	return C.uint16_t(value), nil
 }
 
-func nativeMsQuicUint32(name string, value int) (C.uint32_t, error) {
+func msQuicUint32(name string, value int) (C.uint32_t, error) {
 	if value <= 0 {
 		return 0, nil
 	}
-	if int64(value) > nativeMsQuicMaxUint32 {
-		return 0, InvalidArgument(fmt.Sprintf("native MsQuic %s exceeds %d", name, nativeMsQuicMaxUint32))
+	if int64(value) > msQuicMaxUint32 {
+		return 0, InvalidArgument(fmt.Sprintf("MsQuic %s exceeds %d", name, msQuicMaxUint32))
 	}
 	return C.uint32_t(value), nil
 }
 
-func nativeMsQuicDurationMillis32(name string, duration time.Duration) (C.uint32_t, error) {
+func msQuicDurationMillis32(name string, duration time.Duration) (C.uint32_t, error) {
 	millis := durationMillis(duration)
-	if millis > uint64(nativeMsQuicMaxUint32) {
-		return 0, InvalidArgument(fmt.Sprintf("native MsQuic %s exceeds %dms", name, nativeMsQuicMaxUint32))
+	if millis > uint64(msQuicMaxUint32) {
+		return 0, InvalidArgument(fmt.Sprintf("MsQuic %s exceeds %dms", name, msQuicMaxUint32))
 	}
 	return C.uint32_t(millis), nil
 }
 
-func splitNativeMsQuicAddr(addr string) (string, C.uint16_t, error) {
+func splitMsQuicAddr(addr string) (string, C.uint16_t, error) {
 	host, portText, err := net.SplitHostPort(addr)
 	if err != nil {
 		return "", 0, err
@@ -944,7 +944,7 @@ func splitNativeMsQuicAddr(addr string) (string, C.uint16_t, error) {
 		return "", 0, err
 	}
 	if port < 0 || port > 65535 {
-		return "", 0, InvalidArgument("native MsQuic address port is out of range")
+		return "", 0, InvalidArgument("MsQuic address port is out of range")
 	}
 	if host == "" {
 		host = "0.0.0.0"
@@ -962,7 +962,7 @@ func (a transportAddr) Network() string { return a.network }
 
 func (a transportAddr) String() string { return a.address }
 
-func nativeMsQuicListenerAddr(host string, port C.uint16_t, listener *C.trevrpc_msquic_listener) net.Addr {
+func msQuicListenerAddr(host string, port C.uint16_t, listener *C.trevrpc_msquic_listener) net.Addr {
 	var boundPort C.uint16_t
 	if C.trevrpc_msquic_listener_port(listener, &boundPort) == 0 {
 		port = boundPort
@@ -977,34 +977,34 @@ func durationMillis(duration time.Duration) uint64 {
 	return uint64(duration / time.Millisecond)
 }
 
-func nativeMsQuicError(code C.int) error {
+func msQuicError(code C.int) error {
 	message := C.GoString(C.trevrpc_msquic_error(code))
 	if message == "closed" {
-		return Cancelled("native MsQuic closed")
+		return Cancelled("MsQuic closed")
 	}
-	return Unavailable(fmt.Sprintf("native MsQuic transport unavailable: %s (%d)", message, int(code)))
+	return Unavailable(fmt.Sprintf("MsQuic transport unavailable: %s (%d)", message, int(code)))
 }
 
-func nativeMsQuicErrorFromErr(err error) error {
+func msQuicErrorFromErr(err error) error {
 	if err == nil {
 		return nil
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return Unavailable("native MsQuic transport unavailable: " + err.Error())
+		return Unavailable("MsQuic transport unavailable: " + err.Error())
 	}
 	return transportStatus(err)
 }
 
-func nativeMsQuicOrContextStatus(ctx context.Context, code C.int) error {
+func msQuicOrContextStatus(ctx context.Context, code C.int) error {
 	if err := ctx.Err(); err != nil {
 		return statusFromContextError(err)
 	}
-	return nativeMsQuicError(code)
+	return msQuicError(code)
 }
 
-func nativeMsQuicOrContextErr(ctx context.Context, err error) error {
+func msQuicOrContextErr(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return statusFromContextError(ctx.Err())
 	}
-	return nativeMsQuicErrorFromErr(err)
+	return msQuicErrorFromErr(err)
 }
