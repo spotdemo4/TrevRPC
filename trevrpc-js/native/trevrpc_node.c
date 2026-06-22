@@ -16,6 +16,9 @@
 
 typedef struct native_client native_client;
 typedef struct native_stream native_stream;
+typedef struct native_server native_server;
+typedef struct native_call native_call;
+typedef struct server_route server_route;
 
 struct native_client {
     trevrpc_client* client;
@@ -33,6 +36,39 @@ struct native_stream {
     bool closing;
     bool js_alive;
     bool owner_released;
+};
+
+struct server_route {
+    server_route* next;
+    native_server* server;
+    napi_ref handler_ref;
+    char* service;
+    char* method;
+    uint32_t kind;
+};
+
+struct native_server {
+    trevrpc_server* server;
+    pthread_mutex_t mutex;
+    server_route* routes;
+    napi_env env;
+    napi_threadsafe_function call_tsfn;
+    char* path;
+    char* origin;
+    char* cert_file;
+    char* key_file;
+    uint16_t port;
+    bool closing;
+    bool serving;
+    bool js_alive;
+};
+
+struct native_call {
+    trevrpc_call* call;
+    pthread_mutex_t mutex;
+    size_t refs;
+    bool completing;
+    bool js_alive;
 };
 
 typedef struct base_work {
@@ -104,11 +140,72 @@ typedef struct stream_recv_work {
     trevrpc_stream_frame* frame;
 } stream_recv_work;
 
+typedef struct listen_work {
+    base_work base;
+    trevrpc_server* server;
+    char* host;
+    char* path;
+    char* origin;
+    char* cert_file;
+    char* key_file;
+    uint16_t port;
+    uint32_t max_sessions_per_connection;
+    uint32_t max_streams_per_session;
+    uint32_t idle_timeout_ms;
+    size_t max_frame_size;
+    uint16_t bound_port;
+} listen_work;
+
+typedef struct serve_work {
+    base_work base;
+    native_server* server;
+} serve_work;
+
+typedef struct call_response_work {
+    base_work base;
+    native_call* call;
+    bool acquired;
+    trevrpc_response response;
+} call_response_work;
+
+typedef struct call_body_work {
+    base_work base;
+    native_call* call;
+    bool acquired;
+    uint8_t* body;
+    size_t body_len;
+} call_body_work;
+
+typedef struct call_finish_work {
+    base_work base;
+    native_call* call;
+    bool acquired;
+    uint32_t status;
+    char* message;
+    size_t message_len;
+} call_finish_work;
+
+typedef struct call_recv_work {
+    base_work base;
+    native_call* call;
+    bool acquired;
+    trevrpc_stream_frame* frame;
+} call_recv_work;
+
+typedef struct server_call_event {
+    server_route* route;
+    native_call* call;
+} server_call_event;
+
 static napi_ref NativeClientConstructor;
 static napi_ref NativeStreamConstructor;
+static napi_ref NativeServerConstructor;
+static napi_ref NativeCallConstructor;
 
 static void native_client_release(native_client* client);
 static void native_stream_close_request(native_stream* stream);
+static void native_server_close_request(native_server* server);
+static void native_call_close_request(native_call* call);
 
 static void clear_pending_exception(napi_env env) {
     bool pending = false;
@@ -138,6 +235,21 @@ static void reject_native_error(napi_env env, napi_deferred deferred, int err, c
     napi_create_int32(env, err, &native_code);
     napi_set_named_property(env, error, "nativeCode", native_code);
     napi_reject_deferred(env, deferred, error);
+}
+
+static void throw_native_error(napi_env env, int err, const char* operation) {
+    char message[256];
+    const char* detail = err == TREV_NODE_ERR_CLOSED ? "native object is closed" : trevrpc_error(err);
+    snprintf(message, sizeof(message), "%s failed: %s", operation, detail != NULL ? detail : "native operation failed");
+
+    napi_value message_value = NULL;
+    napi_value error = NULL;
+    napi_value native_code = NULL;
+    napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &message_value);
+    napi_create_error(env, NULL, message_value, &error);
+    napi_create_int32(env, err, &native_code);
+    napi_set_named_property(env, error, "nativeCode", native_code);
+    napi_throw(env, error);
 }
 
 static bool get_bool_property(napi_env env, napi_value object, const char* name, bool default_value) {
@@ -320,6 +432,122 @@ static napi_value metadata_to_js(napi_env env, const trevrpc_metadata* metadata)
     return object;
 }
 
+static int metadata_from_js(napi_env env, napi_value value, trevrpc_metadata* metadata) {
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, value, &type);
+    if (type == napi_undefined || type == napi_null) {
+        return 0;
+    }
+    if (type != napi_object) {
+        return -EINVAL;
+    }
+
+    napi_value names = NULL;
+    uint32_t length = 0;
+    if (napi_get_property_names(env, value, &names) != napi_ok ||
+        napi_get_array_length(env, names, &length) != napi_ok) {
+        return -EINVAL;
+    }
+    for (uint32_t i = 0; i < length; i++) {
+        napi_value key_value = NULL;
+        napi_value entry_value = NULL;
+        char* key = NULL;
+        uint8_t* bytes = NULL;
+        size_t bytes_len = 0;
+        int err = 0;
+        if (napi_get_element(env, names, i, &key_value) != napi_ok ||
+            napi_get_property(env, value, key_value, &entry_value) != napi_ok) {
+            return -EINVAL;
+        }
+        key = copy_string_value(env, key_value);
+        if (key == NULL) {
+            return -ENOMEM;
+        }
+        err = copy_bytes_arg(env, entry_value, &bytes, &bytes_len);
+        if (err == 0) {
+            err = trevrpc_metadata_set(metadata, key, strlen(key), bytes, bytes_len);
+        }
+        free(key);
+        free(bytes);
+        if (err != 0) {
+            return err;
+        }
+    }
+    return 0;
+}
+
+static napi_value request_to_js(napi_env env, const trevrpc_request* request) {
+    napi_value object = NULL;
+    napi_create_object(env, &object);
+    if (request == NULL) {
+        return object;
+    }
+    set_string_bytes(env, object, "service", request->service, request->service_len);
+    set_string_bytes(env, object, "method", request->method, request->method_len);
+    set_bytes(env, object, "body", request->body, request->body_len);
+    set_uint32(env, object, "kind", request->kind);
+    set_uint32(env, object, "version", request->version);
+    napi_value metadata = metadata_to_js(env, &request->metadata);
+    napi_set_named_property(env, object, "metadata", metadata);
+    return object;
+}
+
+static int response_from_js(napi_env env, napi_value value, trevrpc_response* response) {
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, value, &type);
+    if (type == napi_undefined || type == napi_null) {
+        return 0;
+    }
+    if (type != napi_object) {
+        return -EINVAL;
+    }
+
+    response->status = get_uint32_property(env, value, "status", TREVRPC_STATUS_OK);
+
+    bool has_property = false;
+    napi_has_named_property(env, value, "message", &has_property);
+    if (has_property) {
+        napi_value message = NULL;
+        napi_get_named_property(env, value, "message", &message);
+        char* copied = copy_string_value(env, message);
+        if (copied == NULL) {
+            return -ENOMEM;
+        }
+        int err = trevrpc_response_set_message(response, copied, strlen(copied));
+        free(copied);
+        if (err != 0) {
+            return err;
+        }
+    }
+
+    napi_has_named_property(env, value, "body", &has_property);
+    if (has_property) {
+        napi_value body = NULL;
+        uint8_t* bytes = NULL;
+        size_t bytes_len = 0;
+        napi_get_named_property(env, value, "body", &body);
+        int err = copy_bytes_arg(env, body, &bytes, &bytes_len);
+        if (err == 0) {
+            err = trevrpc_response_set_body(response, bytes, bytes_len);
+        }
+        free(bytes);
+        if (err != 0) {
+            return err;
+        }
+    }
+
+    napi_has_named_property(env, value, "metadata", &has_property);
+    if (has_property) {
+        napi_value metadata = NULL;
+        napi_get_named_property(env, value, "metadata", &metadata);
+        int err = metadata_from_js(env, metadata, &response->metadata);
+        if (err != 0) {
+            return err;
+        }
+    }
+    return 0;
+}
+
 static napi_value response_to_js(napi_env env, const trevrpc_response* response) {
     napi_value object = NULL;
     napi_create_object(env, &object);
@@ -360,6 +588,24 @@ static bool unwrap_native_stream(napi_env env, napi_value receiver, native_strea
     *out_stream = NULL;
     if (napi_unwrap(env, receiver, (void**)out_stream) != napi_ok || *out_stream == NULL) {
         napi_throw_type_error(env, NULL, "invalid native stream receiver");
+        return false;
+    }
+    return true;
+}
+
+static bool unwrap_native_server(napi_env env, napi_value receiver, native_server** out_server) {
+    *out_server = NULL;
+    if (napi_unwrap(env, receiver, (void**)out_server) != napi_ok || *out_server == NULL) {
+        napi_throw_type_error(env, NULL, "invalid native server receiver");
+        return false;
+    }
+    return true;
+}
+
+static bool unwrap_native_call(napi_env env, napi_value receiver, native_call** out_call) {
+    *out_call = NULL;
+    if (napi_unwrap(env, receiver, (void**)out_call) != napi_ok || *out_call == NULL) {
+        napi_throw_type_error(env, NULL, "invalid native call receiver");
         return false;
     }
     return true;
@@ -522,6 +768,168 @@ static void native_stream_close_request(native_stream* stream) {
     native_stream_maybe_destroy(stream);
 }
 
+static int native_call_acquire(native_call* call, trevrpc_call** out_call) {
+    if (call == NULL) {
+        return TREV_NODE_ERR_CLOSED;
+    }
+    pthread_mutex_lock(&call->mutex);
+    if (call->call == NULL || call->completing) {
+        pthread_mutex_unlock(&call->mutex);
+        return TREV_NODE_ERR_CLOSED;
+    }
+    call->refs++;
+    *out_call = call->call;
+    pthread_mutex_unlock(&call->mutex);
+    return 0;
+}
+
+static int native_call_acquire_completion(native_call* call, trevrpc_call** out_call) {
+    if (call == NULL) {
+        return TREV_NODE_ERR_CLOSED;
+    }
+    pthread_mutex_lock(&call->mutex);
+    if (call->call == NULL || call->completing) {
+        pthread_mutex_unlock(&call->mutex);
+        return TREV_NODE_ERR_CLOSED;
+    }
+    call->completing = true;
+    call->refs++;
+    *out_call = call->call;
+    pthread_mutex_unlock(&call->mutex);
+    return 0;
+}
+
+static void native_call_maybe_destroy(native_call* call) {
+    bool destroy = false;
+    pthread_mutex_lock(&call->mutex);
+    destroy = !call->js_alive && call->refs == 0 && call->call == NULL;
+    pthread_mutex_unlock(&call->mutex);
+    if (destroy) {
+        pthread_mutex_destroy(&call->mutex);
+        free(call);
+    }
+}
+
+static void native_call_release(native_call* call) {
+    trevrpc_call* close_call = NULL;
+    bool destroy = false;
+    pthread_mutex_lock(&call->mutex);
+    if (call->refs > 0) {
+        call->refs--;
+    }
+    if (!call->js_alive && call->completing && call->refs == 0 && call->call != NULL) {
+        close_call = call->call;
+        call->call = NULL;
+    }
+    destroy = !call->js_alive && call->refs == 0 && call->call == NULL;
+    pthread_mutex_unlock(&call->mutex);
+
+    trevrpc_call_close(close_call);
+    if (destroy) {
+        pthread_mutex_destroy(&call->mutex);
+        free(call);
+    }
+}
+
+static void native_call_complete(native_call* call) {
+    bool destroy = false;
+    pthread_mutex_lock(&call->mutex);
+    call->call = NULL;
+    if (call->refs > 0) {
+        call->refs--;
+    }
+    destroy = !call->js_alive && call->refs == 0;
+    pthread_mutex_unlock(&call->mutex);
+    if (destroy) {
+        pthread_mutex_destroy(&call->mutex);
+        free(call);
+    }
+}
+
+static void native_call_close_request(native_call* call) {
+    if (call == NULL) {
+        return;
+    }
+    trevrpc_call* close_call = NULL;
+    pthread_mutex_lock(&call->mutex);
+    call->completing = true;
+    if (call->refs == 0 && call->call != NULL) {
+        close_call = call->call;
+        call->call = NULL;
+    }
+    pthread_mutex_unlock(&call->mutex);
+
+    trevrpc_call_close(close_call);
+    native_call_maybe_destroy(call);
+}
+
+static void free_server_routes(napi_env env, server_route* route) {
+    while (route != NULL) {
+        server_route* next = route->next;
+        if (route->handler_ref != NULL) {
+            napi_delete_reference(env, route->handler_ref);
+        }
+        free(route->service);
+        free(route->method);
+        free(route);
+        route = next;
+    }
+}
+
+static void native_server_close_request(native_server* server) {
+    if (server == NULL) {
+        return;
+    }
+    trevrpc_server* close_server = NULL;
+    trevrpc_server* shutdown_server = NULL;
+    pthread_mutex_lock(&server->mutex);
+    server->closing = true;
+    if (!server->serving && server->server != NULL) {
+        close_server = server->server;
+        server->server = NULL;
+    } else {
+        shutdown_server = server->server;
+    }
+    pthread_mutex_unlock(&server->mutex);
+
+    trevrpc_server_shutdown(shutdown_server);
+    trevrpc_server_close(close_server);
+    if (close_server != NULL) {
+        free_server_routes(server->env, server->routes);
+        server->routes = NULL;
+        napi_threadsafe_function tsfn = NULL;
+        pthread_mutex_lock(&server->mutex);
+        tsfn = server->call_tsfn;
+        server->call_tsfn = NULL;
+        pthread_mutex_unlock(&server->mutex);
+        if (tsfn != NULL) {
+            napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
+        }
+    }
+}
+
+static void native_server_close_after_serve(native_server* server) {
+    trevrpc_server* close_server = NULL;
+    napi_threadsafe_function tsfn = NULL;
+    pthread_mutex_lock(&server->mutex);
+    server->serving = false;
+    if (server->closing && server->server != NULL) {
+        close_server = server->server;
+        server->server = NULL;
+        tsfn = server->call_tsfn;
+        server->call_tsfn = NULL;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    trevrpc_server_close(close_server);
+    if (tsfn != NULL) {
+        napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
+    }
+    if (close_server != NULL) {
+        free_server_routes(server->env, server->routes);
+        server->routes = NULL;
+    }
+}
+
 static napi_value queue_work(napi_env env,
     base_work* work,
     const char* name,
@@ -557,6 +965,36 @@ static void native_stream_finalize(napi_env env, void* data, void* hint) {
     stream->js_alive = false;
     pthread_mutex_unlock(&stream->mutex);
     native_stream_close_request(stream);
+}
+
+static void native_server_finalize(napi_env env, void* data, void* hint) {
+    (void)hint;
+    native_server* server = data;
+    pthread_mutex_lock(&server->mutex);
+    server->js_alive = false;
+    pthread_mutex_unlock(&server->mutex);
+    native_server_close_request(server);
+    if (server->call_tsfn != NULL) {
+        napi_release_threadsafe_function(server->call_tsfn, napi_tsfn_abort);
+        server->call_tsfn = NULL;
+    }
+    free_server_routes(env, server->routes);
+    free(server->path);
+    free(server->origin);
+    free(server->cert_file);
+    free(server->key_file);
+    pthread_mutex_destroy(&server->mutex);
+    free(server);
+}
+
+static void native_call_finalize(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    native_call* call = data;
+    pthread_mutex_lock(&call->mutex);
+    call->js_alive = false;
+    pthread_mutex_unlock(&call->mutex);
+    native_call_close_request(call);
 }
 
 static napi_value native_client_constructor(napi_env env, napi_callback_info info) {
@@ -603,10 +1041,164 @@ static napi_value native_stream_constructor(napi_env env, napi_callback_info inf
     return this_arg;
 }
 
+static napi_value native_server_constructor(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_value this_arg = NULL;
+    if (napi_get_cb_info(env, info, &argc, args, &this_arg, NULL) != napi_ok) {
+        return NULL;
+    }
+
+    native_server* server = NULL;
+    if (argc != 1 || napi_get_value_external(env, args[0], (void**)&server) != napi_ok || server == NULL) {
+        napi_throw_type_error(env, NULL, "native servers cannot be constructed directly");
+        return NULL;
+    }
+
+    if (napi_wrap(env, this_arg, server, native_server_finalize, NULL, NULL) != napi_ok) {
+        throw_if_no_pending_exception(env, "failed to wrap native server");
+        return NULL;
+    }
+    server->js_alive = true;
+
+    napi_value port = NULL;
+    napi_create_uint32(env, server->port, &port);
+    napi_set_named_property(env, this_arg, "port", port);
+    return this_arg;
+}
+
+static napi_value native_call_constructor(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_value this_arg = NULL;
+    if (napi_get_cb_info(env, info, &argc, args, &this_arg, NULL) != napi_ok) {
+        return NULL;
+    }
+
+    native_call* call = NULL;
+    if (argc != 1 || napi_get_value_external(env, args[0], (void**)&call) != napi_ok || call == NULL) {
+        napi_throw_type_error(env, NULL, "native calls cannot be constructed directly");
+        return NULL;
+    }
+
+    if (napi_wrap(env, this_arg, call, native_call_finalize, NULL, NULL) != napi_ok) {
+        throw_if_no_pending_exception(env, "failed to wrap native call");
+        return NULL;
+    }
+    call->js_alive = true;
+
+    trevrpc_call* c_call = NULL;
+    if (native_call_acquire(call, &c_call) == 0) {
+        napi_value request = request_to_js(env, trevrpc_call_request(c_call));
+        napi_set_named_property(env, this_arg, "request", request);
+        native_call_release(call);
+    }
+    return this_arg;
+}
+
+static void server_call_event_close(server_call_event* event) {
+    if (event == NULL) {
+        return;
+    }
+    native_call_close_request(event->call);
+    free(event);
+}
+
+static void server_call_js(napi_env env, napi_value js_callback, void* context, void* data) {
+    (void)js_callback;
+    (void)context;
+    server_call_event* event = data;
+    if (env == NULL || event == NULL) {
+        server_call_event_close(event);
+        return;
+    }
+
+    napi_value handler = NULL;
+    napi_value ctor = NULL;
+    napi_value external = NULL;
+    napi_value call_object = NULL;
+    napi_value global = NULL;
+    napi_status status = napi_get_reference_value(env, event->route->handler_ref, &handler);
+    if (status == napi_ok) {
+        status = napi_get_reference_value(env, NativeCallConstructor, &ctor);
+    }
+    if (status == napi_ok) {
+        status = napi_create_external(env, event->call, NULL, NULL, &external);
+    }
+    if (status == napi_ok) {
+        status = napi_new_instance(env, ctor, 1, &external, &call_object);
+    }
+    if (status == napi_ok) {
+        status = napi_get_global(env, &global);
+    }
+    if (status == napi_ok) {
+        napi_value ignored = NULL;
+        status = napi_call_function(env, global, handler, 1, &call_object, &ignored);
+    }
+    if (status != napi_ok) {
+        clear_pending_exception(env);
+        native_call_close_request(event->call);
+    }
+    free(event);
+}
+
+static int native_server_call_handler(void* user_data, trevrpc_call* call) {
+    server_route* route = user_data;
+    if (route == NULL || route->server == NULL || call == NULL) {
+        return -EINVAL;
+    }
+    int err = trevrpc_call_defer(call);
+    if (err != 0) {
+        return err;
+    }
+
+    native_call* native = calloc(1, sizeof(*native));
+    server_call_event* event = calloc(1, sizeof(*event));
+    if (native == NULL || event == NULL) {
+        free(native);
+        free(event);
+        trevrpc_call_close(call);
+        return TREVRPC_CALL_DEFERRED;
+    }
+    pthread_mutex_init(&native->mutex, NULL);
+    native->call = call;
+    event->route = route;
+    event->call = native;
+
+    pthread_mutex_lock(&route->server->mutex);
+    napi_threadsafe_function tsfn = route->server->call_tsfn;
+    pthread_mutex_unlock(&route->server->mutex);
+    if (tsfn == NULL) {
+        native_call_close_request(native);
+        free(event);
+        return TREVRPC_CALL_DEFERRED;
+    }
+
+    napi_status status = napi_acquire_threadsafe_function(tsfn);
+    if (status == napi_ok) {
+        status = napi_call_threadsafe_function(tsfn, event, napi_tsfn_nonblocking);
+        napi_release_threadsafe_function(tsfn, napi_tsfn_release);
+    }
+    if (status != napi_ok) {
+        native_call_close_request(native);
+        free(event);
+    }
+    return TREVRPC_CALL_DEFERRED;
+}
+
+static napi_value noop_js_callback(napi_env env, napi_callback_info info) {
+    (void)info;
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
 static void connect_execute(napi_env env, void* data) {
     (void)env;
     connect_work* work = data;
     trevrpc_config config = trevrpc_default_config();
+    config.max_stateless_operations = 1024;
+    config.max_binding_stateless_operations = 256;
     if (work->max_frame_size > 0) {
         config.max_frame_size = work->max_frame_size;
     }
@@ -711,6 +1303,293 @@ static napi_value connect_webtransport(napi_env env, napi_callback_info info) {
     }
 
     return queue_work(env, &work->base, "connectWebTransport", connect_execute, connect_complete);
+}
+
+static void listen_execute(napi_env env, void* data) {
+    (void)env;
+    listen_work* work = data;
+    trevrpc_config config = trevrpc_default_config();
+    config.cert_file = work->cert_file;
+    config.key_file = work->key_file;
+    config.keep_alive_ms = 15000;
+    config.peer_bidi_stream_count = 128;
+    config.max_stateless_operations = 1024;
+    config.max_binding_stateless_operations = 256;
+    if (work->max_frame_size > 0) {
+        config.max_frame_size = work->max_frame_size;
+    }
+    trevrpc_wt_config wt_config = {
+        .path = work->path,
+        .origin = work->origin,
+        .cert_file = work->cert_file,
+        .key_file = work->key_file,
+        .max_sessions_per_connection = work->max_sessions_per_connection,
+        .max_streams_per_session = work->max_streams_per_session,
+        .idle_timeout_ms = work->idle_timeout_ms,
+    };
+    work->base.err = trevrpc_server_listen(work->host, work->port, &wt_config, &config, &work->server);
+    if (work->base.err == 0) {
+        work->base.err = trevrpc_server_port(work->server, &work->bound_port);
+    }
+}
+
+static void listen_complete(napi_env env, napi_status status, void* data) {
+    listen_work* work = data;
+    if (status != napi_ok) {
+        reject_native_error(env, work->base.deferred, -ECANCELED, "listenWebTransport");
+    } else if (work->base.err != 0) {
+        trevrpc_server_close(work->server);
+        reject_native_error(env, work->base.deferred, work->base.err, "listenWebTransport");
+    } else {
+        native_server* server = calloc(1, sizeof(*server));
+        if (server == NULL) {
+            trevrpc_server_close(work->server);
+            reject_native_error(env, work->base.deferred, -ENOMEM, "listenWebTransport");
+        } else {
+            pthread_mutex_init(&server->mutex, NULL);
+            server->server = work->server;
+            server->env = env;
+            server->port = work->bound_port;
+            server->path = work->path;
+            server->origin = work->origin;
+            server->cert_file = work->cert_file;
+            server->key_file = work->key_file;
+            work->path = NULL;
+            work->origin = NULL;
+            work->cert_file = NULL;
+            work->key_file = NULL;
+
+            napi_value callback = NULL;
+            napi_value resource_name = NULL;
+            napi_status wrap_status =
+                napi_create_function(env, "serverCall", NAPI_AUTO_LENGTH, noop_js_callback, NULL, &callback);
+            if (wrap_status == napi_ok) {
+                wrap_status = napi_create_string_utf8(env, "TrevRpcServerCall", NAPI_AUTO_LENGTH, &resource_name);
+            }
+            if (wrap_status == napi_ok) {
+                wrap_status = napi_create_threadsafe_function(
+                    env, callback, NULL, resource_name, 0, 1, NULL, NULL, NULL, server_call_js, &server->call_tsfn);
+            }
+
+            napi_value ctor = NULL;
+            napi_value external = NULL;
+            napi_value instance = NULL;
+            if (wrap_status == napi_ok) {
+                wrap_status = napi_get_reference_value(env, NativeServerConstructor, &ctor);
+            }
+            if (wrap_status == napi_ok) {
+                wrap_status = napi_create_external(env, server, NULL, NULL, &external);
+            }
+            if (wrap_status == napi_ok) {
+                wrap_status = napi_new_instance(env, ctor, 1, &external, &instance);
+            }
+            if (wrap_status != napi_ok) {
+                clear_pending_exception(env);
+                if (server->call_tsfn != NULL) {
+                    napi_release_threadsafe_function(server->call_tsfn, napi_tsfn_abort);
+                }
+                trevrpc_server_close(work->server);
+                free(server->path);
+                free(server->origin);
+                free(server->cert_file);
+                free(server->key_file);
+                pthread_mutex_destroy(&server->mutex);
+                free(server);
+                reject_native_error(env, work->base.deferred, -ENOMEM, "listenWebTransport");
+            } else {
+                napi_resolve_deferred(env, work->base.deferred, instance);
+            }
+        }
+    }
+
+    free(work->host);
+    free(work->path);
+    free(work->origin);
+    free(work->cert_file);
+    free(work->key_file);
+    napi_delete_async_work(env, work->base.work);
+    free(work);
+}
+
+static napi_value listen_webtransport(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+    if (argc != 1) {
+        napi_throw_type_error(env, NULL, "listenWebTransport requires an options object");
+        return NULL;
+    }
+
+    listen_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate listen work");
+        return NULL;
+    }
+    work->host = get_string_property(env, args[0], "host");
+    work->path = get_string_property(env, args[0], "path");
+    work->origin = get_string_property(env, args[0], "origin");
+    work->cert_file = get_string_property(env, args[0], "certFile");
+    work->key_file = get_string_property(env, args[0], "keyFile");
+    work->port = (uint16_t)get_uint32_property(env, args[0], "port", 0);
+    work->max_sessions_per_connection = get_uint32_property(env, args[0], "maxSessionsPerConnection", 16);
+    work->max_streams_per_session = get_uint32_property(env, args[0], "maxStreamsPerSession", 128);
+    work->idle_timeout_ms = get_uint32_property(env, args[0], "idleTimeoutMs", 30000);
+    get_size_property(env, args[0], "maxFrameSize", &work->max_frame_size);
+
+    if (work->host == NULL || work->cert_file == NULL || work->key_file == NULL) {
+        free(work->host);
+        free(work->path);
+        free(work->origin);
+        free(work->cert_file);
+        free(work->key_file);
+        free(work);
+        napi_throw_type_error(env, NULL, "listenWebTransport requires host, certFile, and keyFile");
+        return NULL;
+    }
+
+    return queue_work(env, &work->base, "listenWebTransport", listen_execute, listen_complete);
+}
+
+static napi_value native_server_register(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value args[4];
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
+    if (argc != 4) {
+        napi_throw_type_error(env, NULL, "register requires service, method, kind, and handler");
+        return NULL;
+    }
+
+    native_server* server = NULL;
+    if (!unwrap_native_server(env, this_arg, &server)) {
+        return NULL;
+    }
+    server_route* route = calloc(1, sizeof(*route));
+    if (route == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate server route");
+        return NULL;
+    }
+    int err = copy_string_arg(env, args[0], &route->service);
+    if (err == 0) {
+        err = copy_string_arg(env, args[1], &route->method);
+    }
+    if (err == 0 && napi_get_value_uint32(env, args[2], &route->kind) != napi_ok) {
+        err = -EINVAL;
+    }
+    napi_valuetype handler_type = napi_undefined;
+    if (err == 0) {
+        napi_typeof(env, args[3], &handler_type);
+        if (handler_type != napi_function) {
+            err = -EINVAL;
+        }
+    }
+    if (err == 0 && napi_create_reference(env, args[3], 1, &route->handler_ref) != napi_ok) {
+        err = -ENOMEM;
+    }
+    if (err == 0) {
+        route->server = server;
+        pthread_mutex_lock(&server->mutex);
+        trevrpc_server* c_server = server->server;
+        bool closing = server->closing || c_server == NULL;
+        pthread_mutex_unlock(&server->mutex);
+        err = closing ? TREV_NODE_ERR_CLOSED
+                      : trevrpc_server_register_call(
+                            c_server, route->service, route->method, route->kind, native_server_call_handler, route);
+    }
+    if (err != 0) {
+        if (route->handler_ref != NULL) {
+            napi_delete_reference(env, route->handler_ref);
+        }
+        free(route->service);
+        free(route->method);
+        free(route);
+        throw_native_error(env, err, "register");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    route->next = server->routes;
+    server->routes = route;
+    pthread_mutex_unlock(&server->mutex);
+
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static void serve_execute(napi_env env, void* data) {
+    (void)env;
+    serve_work* work = data;
+    native_server* server = work->server;
+    trevrpc_server* c_server = NULL;
+    pthread_mutex_lock(&server->mutex);
+    c_server = server->server;
+    pthread_mutex_unlock(&server->mutex);
+    work->base.err = c_server == NULL ? TREV_NODE_ERR_CLOSED : trevrpc_server_serve(c_server);
+}
+
+static void serve_complete(napi_env env, napi_status status, void* data) {
+    serve_work* work = data;
+    native_server_close_after_serve(work->server);
+    if (status != napi_ok) {
+        reject_native_error(env, work->base.deferred, -ECANCELED, "serve");
+    } else if (work->base.err != 0) {
+        reject_native_error(env, work->base.deferred, work->base.err, "serve");
+    } else {
+        napi_value undefined = NULL;
+        napi_get_undefined(env, &undefined);
+        napi_resolve_deferred(env, work->base.deferred, undefined);
+    }
+    if (work->base.receiver_ref != NULL) {
+        napi_delete_reference(env, work->base.receiver_ref);
+    }
+    napi_delete_async_work(env, work->base.work);
+    free(work);
+}
+
+static napi_value native_server_serve(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    native_server* server = NULL;
+    if (!unwrap_native_server(env, this_arg, &server)) {
+        return NULL;
+    }
+    serve_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate serve work");
+        return NULL;
+    }
+    if (!create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
+        free(work);
+        return NULL;
+    }
+    pthread_mutex_lock(&server->mutex);
+    bool can_start = !server->closing && !server->serving && server->server != NULL;
+    if (can_start) {
+        server->serving = true;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    if (!can_start) {
+        napi_delete_reference(env, work->base.receiver_ref);
+        free(work);
+        napi_throw_error(env, NULL, "server is closed or already serving");
+        return NULL;
+    }
+    work->server = server;
+    return queue_work(env, &work->base, "serve", serve_execute, serve_complete);
+}
+
+static napi_value native_server_close(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    native_server* server = NULL;
+    if (!unwrap_native_server(env, this_arg, &server)) {
+        return NULL;
+    }
+    native_server_close_request(server);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
 }
 
 static void call_execute(napi_env env, void* data) {
@@ -1078,6 +1957,269 @@ static napi_value native_stream_close(napi_env env, napi_callback_info info) {
     return undefined;
 }
 
+static void call_respond_execute(napi_env env, void* data) {
+    (void)env;
+    call_response_work* work = data;
+    trevrpc_call* call = NULL;
+    work->base.err = native_call_acquire_completion(work->call, &call);
+    if (work->base.err != 0) {
+        return;
+    }
+    work->acquired = true;
+    work->base.err = trevrpc_call_respond(call, &work->response);
+    if (work->base.err != 0) {
+        trevrpc_call_close(call);
+    }
+}
+
+static void call_respond_complete(napi_env env, napi_status status, void* data) {
+    call_response_work* work = data;
+    if (status == napi_ok && work->base.err == 0) {
+        napi_value undefined = NULL;
+        napi_get_undefined(env, &undefined);
+        napi_resolve_deferred(env, work->base.deferred, undefined);
+    } else {
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "respond");
+    }
+    if (work->acquired) {
+        native_call_complete(work->call);
+    }
+    if (work->base.receiver_ref != NULL) {
+        napi_delete_reference(env, work->base.receiver_ref);
+    }
+    napi_delete_async_work(env, work->base.work);
+    trevrpc_response_reset(&work->response);
+    free(work);
+}
+
+static napi_value native_call_respond(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
+    if (argc != 1) {
+        napi_throw_type_error(env, NULL, "respond requires a response object");
+        return NULL;
+    }
+    call_response_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate respond work");
+        return NULL;
+    }
+    if (!unwrap_native_call(env, this_arg, &work->call) ||
+        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
+        free(work);
+        return NULL;
+    }
+    int err = response_from_js(env, args[0], &work->response);
+    if (err != 0) {
+        napi_delete_reference(env, work->base.receiver_ref);
+        trevrpc_response_reset(&work->response);
+        free(work);
+        napi_throw_type_error(env, NULL, "invalid response object");
+        return NULL;
+    }
+    return queue_work(env, &work->base, "respond", call_respond_execute, call_respond_complete);
+}
+
+static void call_send_execute(napi_env env, void* data) {
+    (void)env;
+    call_body_work* work = data;
+    trevrpc_call* call = NULL;
+    work->base.err = native_call_acquire(work->call, &call);
+    if (work->base.err != 0) {
+        return;
+    }
+    work->acquired = true;
+    trevrpc_stream* stream = trevrpc_call_stream(call);
+    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
+                                    : trevrpc_stream_send_message(stream, work->body, work->body_len);
+}
+
+static void call_send_complete(napi_env env, napi_status status, void* data) {
+    call_body_work* work = data;
+    if (status == napi_ok && work->base.err == 0) {
+        napi_value undefined = NULL;
+        napi_get_undefined(env, &undefined);
+        napi_resolve_deferred(env, work->base.deferred, undefined);
+    } else {
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessage");
+    }
+    if (work->acquired) {
+        native_call_release(work->call);
+    }
+    if (work->base.receiver_ref != NULL) {
+        napi_delete_reference(env, work->base.receiver_ref);
+    }
+    napi_delete_async_work(env, work->base.work);
+    free(work->body);
+    free(work);
+}
+
+static napi_value native_call_send_message(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
+    if (argc != 1) {
+        napi_throw_type_error(env, NULL, "sendMessage requires a body");
+        return NULL;
+    }
+    call_body_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate sendMessage work");
+        return NULL;
+    }
+    if (!unwrap_native_call(env, this_arg, &work->call) ||
+        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
+        free(work);
+        return NULL;
+    }
+    if (copy_bytes_arg(env, args[0], &work->body, &work->body_len) != 0) {
+        napi_delete_reference(env, work->base.receiver_ref);
+        free(work);
+        napi_throw_type_error(env, NULL, "invalid sendMessage body");
+        return NULL;
+    }
+    return queue_work(env, &work->base, "sendMessage", call_send_execute, call_send_complete);
+}
+
+static void call_finish_execute(napi_env env, void* data) {
+    (void)env;
+    call_finish_work* work = data;
+    trevrpc_call* call = NULL;
+    work->base.err = native_call_acquire_completion(work->call, &call);
+    if (work->base.err != 0) {
+        return;
+    }
+    work->acquired = true;
+    work->base.err = trevrpc_call_finish_stream(call, work->status, work->message, work->message_len);
+    if (work->base.err != 0) {
+        trevrpc_call_close(call);
+    }
+}
+
+static void call_finish_complete(napi_env env, napi_status status, void* data) {
+    call_finish_work* work = data;
+    if (status == napi_ok && work->base.err == 0) {
+        napi_value undefined = NULL;
+        napi_get_undefined(env, &undefined);
+        napi_resolve_deferred(env, work->base.deferred, undefined);
+    } else {
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "finishStream");
+    }
+    if (work->acquired) {
+        native_call_complete(work->call);
+    }
+    if (work->base.receiver_ref != NULL) {
+        napi_delete_reference(env, work->base.receiver_ref);
+    }
+    napi_delete_async_work(env, work->base.work);
+    free(work->message);
+    free(work);
+}
+
+static napi_value native_call_finish_stream(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2];
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
+    call_finish_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate finishStream work");
+        return NULL;
+    }
+    if (!unwrap_native_call(env, this_arg, &work->call) ||
+        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
+        free(work);
+        return NULL;
+    }
+    work->status = TREVRPC_STATUS_OK;
+    if (argc > 0 && napi_get_value_uint32(env, args[0], &work->status) != napi_ok) {
+        napi_delete_reference(env, work->base.receiver_ref);
+        free(work);
+        napi_throw_type_error(env, NULL, "invalid finishStream status");
+        return NULL;
+    }
+    if (argc > 1) {
+        work->message = copy_string_value(env, args[1]);
+        if (work->message == NULL) {
+            napi_delete_reference(env, work->base.receiver_ref);
+            free(work);
+            napi_throw_type_error(env, NULL, "invalid finishStream message");
+            return NULL;
+        }
+        work->message_len = strlen(work->message);
+    }
+    return queue_work(env, &work->base, "finishStream", call_finish_execute, call_finish_complete);
+}
+
+static void call_recv_execute(napi_env env, void* data) {
+    (void)env;
+    call_recv_work* work = data;
+    trevrpc_call* call = NULL;
+    work->base.err = native_call_acquire(work->call, &call);
+    if (work->base.err != 0) {
+        return;
+    }
+    work->acquired = true;
+    trevrpc_stream* stream = trevrpc_call_stream(call);
+    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND : trevrpc_stream_recv(stream, &work->frame);
+}
+
+static void call_recv_complete(napi_env env, napi_status status, void* data) {
+    call_recv_work* work = data;
+    if (status == napi_ok && work->base.err == 0) {
+        napi_value value = NULL;
+        if (work->frame == NULL) {
+            napi_get_null(env, &value);
+        } else {
+            value = stream_frame_to_js(env, work->frame);
+        }
+        napi_resolve_deferred(env, work->base.deferred, value);
+    } else {
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recv");
+    }
+    trevrpc_stream_frame_free(work->frame);
+    if (work->acquired) {
+        native_call_release(work->call);
+    }
+    if (work->base.receiver_ref != NULL) {
+        napi_delete_reference(env, work->base.receiver_ref);
+    }
+    napi_delete_async_work(env, work->base.work);
+    free(work);
+}
+
+static napi_value native_call_recv(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    call_recv_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate recv work");
+        return NULL;
+    }
+    if (!unwrap_native_call(env, this_arg, &work->call) ||
+        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
+        free(work);
+        return NULL;
+    }
+    return queue_work(env, &work->base, "recv", call_recv_execute, call_recv_complete);
+}
+
+static napi_value native_call_close(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    native_call* call = NULL;
+    if (!unwrap_native_call(env, this_arg, &call)) {
+        return NULL;
+    }
+    native_call_close_request(call);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
 static napi_value init(napi_env env, napi_value exports) {
     napi_property_descriptor client_methods[] = {
         {"call", NULL, native_client_call, NULL, NULL, NULL, napi_default, NULL},
@@ -1112,8 +2254,43 @@ static napi_value init(napi_env env, napi_value exports) {
         &stream_ctor);
     napi_create_reference(env, stream_ctor, 1, &NativeStreamConstructor);
 
+    napi_property_descriptor server_methods[] = {
+        {"register", NULL, native_server_register, NULL, NULL, NULL, napi_default, NULL},
+        {"serve", NULL, native_server_serve, NULL, NULL, NULL, napi_default, NULL},
+        {"close", NULL, native_server_close, NULL, NULL, NULL, napi_default, NULL},
+    };
+    napi_value server_ctor = NULL;
+    napi_define_class(env,
+        "NativeServer",
+        NAPI_AUTO_LENGTH,
+        native_server_constructor,
+        NULL,
+        sizeof(server_methods) / sizeof(server_methods[0]),
+        server_methods,
+        &server_ctor);
+    napi_create_reference(env, server_ctor, 1, &NativeServerConstructor);
+
+    napi_property_descriptor call_methods[] = {
+        {"respond", NULL, native_call_respond, NULL, NULL, NULL, napi_default, NULL},
+        {"sendMessage", NULL, native_call_send_message, NULL, NULL, NULL, napi_default, NULL},
+        {"finishStream", NULL, native_call_finish_stream, NULL, NULL, NULL, napi_default, NULL},
+        {"recv", NULL, native_call_recv, NULL, NULL, NULL, napi_default, NULL},
+        {"close", NULL, native_call_close, NULL, NULL, NULL, napi_default, NULL},
+    };
+    napi_value call_ctor = NULL;
+    napi_define_class(env,
+        "NativeCall",
+        NAPI_AUTO_LENGTH,
+        native_call_constructor,
+        NULL,
+        sizeof(call_methods) / sizeof(call_methods[0]),
+        call_methods,
+        &call_ctor);
+    napi_create_reference(env, call_ctor, 1, &NativeCallConstructor);
+
     napi_property_descriptor exports_desc[] = {
         {"connectWebTransport", NULL, connect_webtransport, NULL, NULL, NULL, napi_default, NULL},
+        {"listenWebTransport", NULL, listen_webtransport, NULL, NULL, NULL, napi_default, NULL},
     };
     napi_define_properties(env, exports, sizeof(exports_desc) / sizeof(exports_desc[0]), exports_desc);
     return exports;

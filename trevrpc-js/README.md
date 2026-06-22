@@ -28,6 +28,33 @@ const transport = await NodeTransport.connectWebTransport("https://127.0.0.1:500
 const client = new GreeterClient(transport);
 ```
 
+Node.js servers can use the native server wrapper from the same subpath:
+
+```js
+import { NodeServer } from "trevrpc-js/node";
+import { GreeterService, root } from "./hello/v1/greeter.trevrpc.js";
+
+const HelloRequest = root.lookupType("hello.v1.HelloRequest");
+const HelloReply = root.lookupType("hello.v1.HelloReply");
+
+const server = await NodeServer.listenWebTransport({
+  host: "127.0.0.1",
+  port: 50051,
+  path: "/trevrpc",
+  certFile: "localhost-cert.pem",
+  keyFile: "localhost-key.pem",
+});
+
+server.registerService(GreeterService, {
+  sayHello(call) {
+    const request = HelloRequest.decode(call.request.body);
+    return HelloReply.encode({ message: `Hello ${request.name}` }).finish();
+  },
+});
+
+void server.serve();
+```
+
 Build the native addon from a repository checkout with `npm run build:native`. Set `TREVRPC_JS_NATIVE=/path/to/trevrpc_native.node` to load an explicit addon build.
 
 Streaming methods use async iterables:

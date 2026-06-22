@@ -1106,6 +1106,22 @@ int trevrpc_server_listen(const char* host,
     return 0;
 }
 
+int trevrpc_server_port(trevrpc_server* server, uint16_t* port) {
+    if (server == NULL || port == NULL) {
+        return -EINVAL;
+    }
+    if (server->shared_listener != NULL) {
+        return trevrpc_msquic_listener_port(server->shared_listener, port);
+    }
+    if (server->listener != NULL) {
+        return trevrpc_msquic_listener_port(server->listener, port);
+    }
+    if (server->wt_listener != NULL) {
+        return trevrpc_wt_listener_port(server->wt_listener, port);
+    }
+    return -EINVAL;
+}
+
 #ifdef TREVRPC_TESTING
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server) {
     if (out_server == NULL) {

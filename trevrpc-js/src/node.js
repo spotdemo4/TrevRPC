@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { Code } from "./status.js";
 import { RpcKind, RpcStreamFrameKind } from "./wire.js";
 
 const require = createRequire(import.meta.url);
@@ -44,6 +45,115 @@ export class NodeTransport {
   /** Closes the underlying native client. */
   close() {
     this.nativeClient.close();
+  }
+}
+
+/** Native Node server backed by trevrpc-c and MsQuic. */
+export class NodeServer {
+  constructor(nativeServer, options = {}) {
+    this.nativeServer = nativeServer;
+    this.port = nativeServer.port;
+    this.maxFrameSize = options.maxFrameSize;
+    this.closed = null;
+  }
+
+  /** Creates a WebTransport TrevRPC server backed by the native C runtime. */
+  static async listenWebTransport(urlOrOptions, options = {}) {
+    const native = loadNative();
+    const listenOptions = normalizeWebTransportOptions(urlOrOptions, options);
+    const nativeServer = await native.listenWebTransport(listenOptions);
+    return new NodeServer(nativeServer, listenOptions);
+  }
+
+  /** Registers one raw RPC handler. */
+  register(service, method, kind, handler) {
+    if (typeof handler !== "function") {
+      throw new TypeError("register requires a handler function");
+    }
+    this.nativeServer.register(service, method, rpcKindNumber(kind), (nativeCall) => {
+      void this.#dispatch(handler, nativeCall);
+    });
+    return this;
+  }
+
+  /** Registers handlers for a generated service descriptor. */
+  registerService(service, handlers) {
+    for (const [jsName, method] of Object.entries(service.methods)) {
+      const handler = handlers[jsName] ?? handlers[method.name];
+      if (handler != null) {
+        this.register(service.fullName, method.name, method.kind, handler);
+      }
+    }
+    return this;
+  }
+
+  /** Starts accepting RPCs. The returned promise resolves after close. */
+  serve() {
+    this.closed ??= this.nativeServer.serve();
+    return this.closed;
+  }
+
+  /** Requests server shutdown. */
+  close() {
+    this.nativeServer.close();
+  }
+
+  async #dispatch(handler, nativeCall) {
+    const call = new NodeServerCall(nativeCall);
+    try {
+      const result = await handler(call);
+      if (!call.completed && !call.deferred) {
+        await completeDefault(call, result);
+      }
+    } catch (error) {
+      if (!call.completed) {
+        await completeWithError(call, error);
+      }
+    }
+  }
+}
+
+/** Raw server call passed to NodeServer handlers. */
+export class NodeServerCall {
+  constructor(nativeCall) {
+    this.nativeCall = nativeCall;
+    this.request = nativeCall.request;
+    this.completed = false;
+    this.deferred = false;
+  }
+
+  /** Keeps the call open after the handler returns. */
+  defer() {
+    this.deferred = true;
+    return this;
+  }
+
+  /** Sends a unary response and completes the call. */
+  async respond(response = {}) {
+    await this.nativeCall.respond(responseObject(response));
+    this.completed = true;
+  }
+
+  /** Sends one streaming response message. */
+  sendMessage(body) {
+    return this.nativeCall.sendMessage(byteBody(body));
+  }
+
+  /** Receives one streaming request frame, or null after EOF. */
+  recv() {
+    return this.nativeCall.recv();
+  }
+
+  /** Sends the terminal streaming status and completes the call. */
+  async finishStream(status = Code.Ok, message = "") {
+    await this.nativeCall.finishStream(status, message);
+    this.completed = true;
+  }
+
+  /** Cancels and closes the call. */
+  close() {
+    this.completed = true;
+    this.nativeCall.close();
   }
 }
 
@@ -127,6 +237,73 @@ async function writeRequestStream(stream, requestBody) {
     stream.close();
     throw error;
   }
+}
+
+async function completeDefault(call, result) {
+  if (call.request.kind === RpcKind.Unary) {
+    await call.respond(result ?? {});
+    return;
+  }
+
+  if (isAsyncIterable(result)) {
+    for await (const body of result) {
+      await call.sendMessage(body);
+    }
+  }
+  await call.finishStream(Code.Ok);
+}
+
+async function completeWithError(call, error) {
+  const status = Number.isInteger(error?.code) ? error.code : Code.Internal;
+  const message = error?.statusMessage ?? error?.message ?? "handler failed";
+  try {
+    if (call.request.kind === RpcKind.Unary) {
+      await call.respond({ status, message });
+    } else {
+      await call.finishStream(status, message);
+    }
+  } catch {
+    call.close();
+  }
+}
+
+function responseObject(response) {
+  if (response == null) {
+    return {};
+  }
+  if (
+    response instanceof Uint8Array ||
+    ArrayBuffer.isView(response) ||
+    response instanceof ArrayBuffer
+  ) {
+    return { body: byteBody(response) };
+  }
+  return {
+    ...response,
+    body: byteBody(response.body),
+  };
+}
+
+function rpcKindNumber(kind) {
+  if (typeof kind === "number") {
+    return kind;
+  }
+  switch (kind) {
+    case "unary":
+      return RpcKind.Unary;
+    case "clientStreaming":
+      return RpcKind.ClientStreaming;
+    case "serverStreaming":
+      return RpcKind.ServerStreaming;
+    case "bidirectionalStreaming":
+      return RpcKind.BidirectionalStreaming;
+    default:
+      throw new TypeError(`unsupported RPC kind ${JSON.stringify(kind)}`);
+  }
+}
+
+function isAsyncIterable(value) {
+  return value != null && typeof value[Symbol.asyncIterator] === "function";
 }
 
 function normalizeWebTransportOptions(urlOrOptions, options) {

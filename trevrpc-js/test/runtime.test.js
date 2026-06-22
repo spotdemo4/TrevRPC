@@ -65,16 +65,20 @@ test("frames round-trip TrevRPC requests", () => {
 });
 
 test("Node native transport subpath exports without loading the addon", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { NodeServer, NodeServerCall, NodeTransport } = await import("../src/node.js");
 
   assert.equal(typeof NodeTransport, "function");
   assert.equal(typeof NodeTransport.connectWebTransport, "function");
+  assert.equal(typeof NodeServer, "function");
+  assert.equal(typeof NodeServer.listenWebTransport, "function");
+  assert.equal(typeof NodeServerCall, "function");
 });
 
 test("Node native addon loads when built", { skip: !existsSync(nativeAddonPath) }, () => {
   const native = require(nativeAddonPath);
 
   assert.equal(typeof native.connectWebTransport, "function");
+  assert.equal(typeof native.listenWebTransport, "function");
 });
 
 test("frame length boundary cases are stable", () => {
