@@ -2,8 +2,11 @@ Checks: >
   -*,
   clang-diagnostic-*,
   clang-analyzer-*,
+  misc-include-cleaner,
   -clang-analyzer-optin.core.EnumCastOutOfRange,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*trevrpc-c/(include|src)/.*'
 FormatStyle: file
+CheckOptions:
+  misc-include-cleaner.MissingIncludes: false

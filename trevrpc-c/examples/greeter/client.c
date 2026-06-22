@@ -1,7 +1,6 @@
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
 
-#include <protobuf-c/protobuf-c.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

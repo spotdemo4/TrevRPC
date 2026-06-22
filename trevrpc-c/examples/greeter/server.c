@@ -1,7 +1,5 @@
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
-#include "trevrpc_webtransport.h"
-
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
