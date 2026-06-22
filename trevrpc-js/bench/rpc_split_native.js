@@ -79,7 +79,7 @@ if (mode === "client") {
 }
 
 async function runClient(host, port, iterations) {
-  const transport = await NodeTransport.connectWebTransport(`https://${host}:${port}/trevrpc`, {
+  const transport = await NodeTransport.connect(`https://${host}:${port}/trevrpc`, {
     skipCertificateValidation: true,
     maxStreamsPerSession: 128,
     idleTimeoutMs: IdleTimeoutMs,

@@ -78,7 +78,7 @@ server.stderr.on("data", (chunk) => process.stderr.write(chunk));
 let transport;
 try {
   const port = await waitForServerPort(server);
-  transport = await NodeTransport.connectWebTransport(`https://127.0.0.1:${port}/trevrpc`, {
+  transport = await NodeTransport.connect(`https://127.0.0.1:${port}/trevrpc`, {
     skipCertificateValidation: true,
     maxStreamsPerSession: 128,
     idleTimeoutMs: 600_000,

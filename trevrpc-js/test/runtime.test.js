@@ -25,7 +25,7 @@ import {
   WireVersion,
   bidirectionalStreaming,
   clientStreaming,
-  connectWebTransport,
+  connect,
   createRoot,
   decodeFrame,
   encodeFrame,
@@ -69,13 +69,13 @@ test("Node native transport subpath exports without loading the addon", async ()
   const { NodeServer, NodeServerCall, NodeTransport } = await import("../src/node.js");
 
   assert.equal(typeof NodeTransport, "function");
-  assert.equal(typeof NodeTransport.connectWebTransport, "function");
+  assert.equal(typeof NodeTransport.connect, "function");
   assert.equal(typeof NodeServer, "function");
   assert.equal(typeof NodeServer.listen, "function");
   assert.equal(typeof NodeServerCall, "function");
 });
 
-test("browser root connectWebTransport flattens browser WebTransport options", async () => {
+test("browser root connect flattens browser WebTransport options", async () => {
   let observed;
   const certificateHash = { algorithm: "sha-256", value: new Uint8Array([1]) };
   class FakeWebTransport {
@@ -89,7 +89,7 @@ test("browser root connectWebTransport flattens browser WebTransport options", a
     }
   }
 
-  const transport = await connectWebTransport("https://example.test/trevrpc", {
+  const transport = await connect("https://example.test/trevrpc", {
     WebTransport: FakeWebTransport,
     allowPooling: true,
     serverCertificateHashes: [certificateHash],
@@ -109,7 +109,7 @@ test("browser root connectWebTransport flattens browser WebTransport options", a
   assert.deepEqual(observed.closeInfo, { closeCode: 0, reason: "done" });
 });
 
-test("package root connectWebTransport uses native transport under Node", async () => {
+test("package root connect uses native transport under Node", async () => {
   const directory = await mkdtemp(join(tmpdir(), "trevrpc-js-native-"));
   const fakeNativePath = join(directory, "fake-native.cjs");
   const previousNativePath = process.env.TREVRPC_JS_NATIVE;
@@ -138,10 +138,9 @@ test("package root connectWebTransport uses native transport under Node", async 
   try {
     process.env.TREVRPC_JS_NATIVE = fakeNativePath;
     const runtime = await import("trevrpc-js");
-    const transport = await runtime.connectWebTransport(
-      "https://example.test:444/trevrpc?mode=test",
-      { skipCertificateValidation: true },
-    );
+    const transport = await runtime.connect("https://example.test:444/trevrpc?mode=test", {
+      skipCertificateValidation: true,
+    });
 
     assert.equal(transport.constructor.name, "NodeTransport");
     assert.equal(transport.nativeClient.options.host, "example.test");

@@ -1,3 +1,3 @@
 export * from "./runtime.js";
-export { connectWebTransport } from "./connect.js";
+export { connect } from "./connect.js";
 export { WebTransportClient } from "./webtransport.js";

@@ -293,13 +293,8 @@ async function runBrowserLifecycleScenario({ assertResult, eventPattern, scenari
 }
 
 async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
-  const {
-    bidirectionalStreaming,
-    clientStreaming,
-    connectWebTransport,
-    createRoot,
-    serverStreaming,
-  } = await import("/src/index.js");
+  const { bidirectionalStreaming, clientStreaming, connect, createRoot, serverStreaming } =
+    await import("/src/index.js");
   const service = "browser.lifecycle.Lifecycle";
   const Message = createRoot({
     nested: {
@@ -318,7 +313,7 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
       },
     },
   }).lookupType("browser.lifecycle.Message");
-  const transport = await connectWebTransport(webTransportURL, await webTransportOptions());
+  const transport = await connect(webTransportURL, await webTransportOptions());
   const options = {
     metadata: { authorization: "Bearer trevrpc-example-token" },
     streamIdleTimeoutMs: 10_000,

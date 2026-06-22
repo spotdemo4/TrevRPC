@@ -17,8 +17,8 @@ export class NodeTransport {
     this.maxFrameSize = options.maxFrameSize;
   }
 
-  /** Opens a WebTransport TrevRPC client backed by the native C runtime. */
-  static async connectWebTransport(urlOrOptions, options = {}) {
+  /** Opens a TrevRPC client backed by the native C runtime. */
+  static async connect(urlOrOptions, options = {}) {
     const native = loadNative();
     const connectOptions = normalizeNodeTransportOptions(urlOrOptions, options);
     const nativeClient = await native.connectWebTransport(connectOptions);

@@ -4,13 +4,13 @@ JavaScript WebTransport client runtime and `protoc`/buf plugin for TrevRPC.
 
 ## Runtime
 
-Clients can use the unified WebTransport connector. It uses the native `trevrpc-c`-backed transport in Node.js and the browser `WebTransport` API in browsers:
+Clients can use the unified connector. It uses the native `trevrpc-c`-backed transport in Node.js and the browser `WebTransport` API in browsers:
 
 ```js
-import { connectWebTransport } from "trevrpc-js";
+import { connect } from "trevrpc-js";
 import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
 
-const transport = await connectWebTransport("https://localhost:50051/trevrpc");
+const transport = await connect("https://localhost:50051/trevrpc");
 const client = new GreeterClient(transport, { timeoutMs: 5000 });
 
 const reply = await client.sayHello({ name: "Trev" });
@@ -19,10 +19,10 @@ const reply = await client.sayHello({ name: "Trev" });
 Browser clients can pass native `WebTransport` constructor options directly:
 
 ```js
-import { connectWebTransport } from "trevrpc-js";
+import { connect } from "trevrpc-js";
 import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
 
-const transport = await connectWebTransport("https://localhost:50051/trevrpc", {
+const transport = await connect("https://localhost:50051/trevrpc", {
   serverCertificateHashes: [certificateHash],
 });
 const client = new GreeterClient(transport);

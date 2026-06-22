@@ -1,5 +1,5 @@
 import type {
-  NodeWebTransportOptions as RuntimeNodeWebTransportOptions,
+  NodeConnectOptions as RuntimeNodeConnectOptions,
   RpcKindValue,
   RpcMethodKind,
   RpcResponseMessage,
@@ -8,18 +8,18 @@ import type {
   Transport,
 } from "./index.js";
 
-export interface NodeWebTransportOptions extends RuntimeNodeWebTransportOptions {}
+export interface NodeConnectOptions extends RuntimeNodeConnectOptions {}
 
-export interface NodeListenOptions extends RuntimeNodeWebTransportOptions {}
+export interface NodeListenOptions extends RuntimeNodeConnectOptions {}
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */
 export class NodeTransport implements Transport {
   maxFrameSize?: number;
 
-  /** Opens a WebTransport TrevRPC client backed by the native C runtime. */
-  static connectWebTransport(
-    urlOrOptions: string | URL | NodeWebTransportOptions,
-    options?: NodeWebTransportOptions,
+  /** Opens a TrevRPC client backed by the native C runtime. */
+  static connect(
+    urlOrOptions: string | URL | NodeConnectOptions,
+    options?: NodeConnectOptions,
   ): Promise<NodeTransport>;
 
   /** Sends a unary RPC request and returns its response. */

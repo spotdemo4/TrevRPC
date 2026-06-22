@@ -1,10 +1,4 @@
-import {
-  Code,
-  connectWebTransport,
-  createRoot,
-  normalizeMetadata,
-  unary,
-} from "../../src/index.js";
+import { Code, connect, createRoot, normalizeMetadata, unary } from "../../src/index.js";
 import type {
   RpcRequestMessage,
   RpcResponseMessage,
@@ -60,7 +54,7 @@ const reply = await unary<HelloMessage, HelloMessage>(
 
 reply.value?.toUpperCase();
 
-const connected = await connectWebTransport("https://localhost:50051/trevrpc", {
+const connected = await connect("https://localhost:50051/trevrpc", {
   serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(32) }],
   skipCertificateValidation: true,
 });

@@ -1,4 +1,4 @@
-import { TrevRpcError, connectWebTransport } from "../../src/index.js";
+import { TrevRpcError, connect } from "../../src/index.js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
 const form = document.querySelector("#client-form");
@@ -30,7 +30,7 @@ async function runFromForm(data) {
   let transport;
   try {
     log(`connecting to ${url}`);
-    transport = await connectWebTransport(url, webTransportOptions(certificateHash));
+    transport = await connect(url, webTransportOptions(certificateHash));
     const client = new GreeterClient(transport, {
       timeoutMs: 5_000,
       metadata: token === "" ? {} : { authorization: `Bearer ${token}` },

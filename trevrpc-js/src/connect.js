@@ -1,6 +1,6 @@
 import { WebTransportClient } from "./webtransport.js";
 
-/** Opens a WebTransport TrevRPC client for the current JavaScript runtime. */
-export async function connectWebTransport(url, options = {}) {
+/** Opens a TrevRPC client for the current JavaScript runtime. */
+export async function connect(url, options = {}) {
   return await WebTransportClient.connect(url, options);
 }
