@@ -177,6 +177,7 @@
                 -Itrevrpc-c/include \
                 -Itrevrpc-c/src \
                 -Ibuild/generated-service-test \
+                -Ibuild/generated-greeter-example \
                 -isystem ${pkgs.libmsquic}/include
               ctest --test-dir build --output-on-failure
               runHook postCheck

@@ -2,6 +2,13 @@
 
 This example shows the shape of a C client and server built with generated protobuf-c TrevRPC bindings.
 
+The repository CMake build generates the bindings and builds both example executables:
+
+```sh
+cmake -S trevrpc-c -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build build --target trevrpc_greeter_server trevrpc_greeter_client
+```
+
 Generate the protobuf-c and TrevRPC C files:
 
 ```sh

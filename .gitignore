@@ -8,6 +8,7 @@
 .codex/
 
 # nix
+/build/
 /result*
 /.direnv/
 

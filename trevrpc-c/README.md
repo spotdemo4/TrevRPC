@@ -59,15 +59,16 @@ nix flake check
 
 CMake options:
 
-| Option                             | Default | Meaning                                                                              |
-| ---------------------------------- | ------- | ------------------------------------------------------------------------------------ |
-| `TREVRPC_BUILD_TESTS`              | `ON`    | Build CTest executables.                                                             |
-| `TREVRPC_BUILD_BENCHMARKS`         | `OFF`   | Build opt-in benchmark executables.                                                  |
-| `TREVRPC_BUILD_MSQUIC`             | `ON`    | Build the low-level MsQuic transport library.                                        |
-| `TREVRPC_BUILD_WEBTRANSPORT`       | `ON`    | Build the low-level WebTransport transport library.                                  |
-| `TREVRPC_BUILD_RUNTIME`            | `ON`    | Build the high-level runtime. This currently requires MsQuic and WebTransport.       |
-| `TREVRPC_INSTALL_INTERNAL_HEADERS` | `OFF`   | Install internal headers under `include/trevrpc/internal` for tests and development. |
-| `TREVRPC_ENABLE_SANITIZERS`        | `OFF`   | Build C targets with ASan and UBSan when using Clang or GCC.                         |
+| Option                             | Default               | Meaning                                                                              |
+| ---------------------------------- | --------------------- | ------------------------------------------------------------------------------------ |
+| `TREVRPC_BUILD_TESTS`              | `ON`                  | Build CTest executables.                                                             |
+| `TREVRPC_BUILD_BENCHMARKS`         | `OFF`                 | Build opt-in benchmark executables.                                                  |
+| `TREVRPC_BUILD_EXAMPLES`           | `TREVRPC_BUILD_TESTS` | Build generated C example executables.                                               |
+| `TREVRPC_BUILD_MSQUIC`             | `ON`                  | Build the low-level MsQuic transport library.                                        |
+| `TREVRPC_BUILD_WEBTRANSPORT`       | `ON`                  | Build the low-level WebTransport transport library.                                  |
+| `TREVRPC_BUILD_RUNTIME`            | `ON`                  | Build the high-level runtime. This currently requires MsQuic and WebTransport.       |
+| `TREVRPC_INSTALL_INTERNAL_HEADERS` | `OFF`                 | Install internal headers under `include/trevrpc/internal` for tests and development. |
+| `TREVRPC_ENABLE_SANITIZERS`        | `OFF`                 | Build C targets with ASan and UBSan when using Clang or GCC.                         |
 
 The Nix `checks.x86_64-linux.c-sanitizers` check runs every CTest executable under ASan/UBSan. On Linux this includes LeakSanitizer coverage from ASan, so CTest leaks fail the sanitizer check.
 

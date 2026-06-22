@@ -2,3 +2,7 @@
 -std=c11
 -Iinclude
 -Isrc
+-I../build/generated-service-test
+-I../build/generated-greeter-example
+-Ibuild/generated-service-test
+-Ibuild/generated-greeter-example
