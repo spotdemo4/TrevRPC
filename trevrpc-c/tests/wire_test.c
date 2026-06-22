@@ -1,7 +1,7 @@
 #include "trevrpc.h"
 #include "trevrpc_wire_internal.h"
 
-#include <errno.h>
+#include <errno.h> // IWYU pragma: keep
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

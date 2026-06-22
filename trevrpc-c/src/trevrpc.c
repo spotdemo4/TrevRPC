@@ -6,7 +6,7 @@
 #include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
 
-#include <errno.h>
+#include <errno.h> // IWYU pragma: keep
 #include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>

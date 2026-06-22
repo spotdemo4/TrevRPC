@@ -3,7 +3,7 @@
 #include "trevrpc.h"
 #include "trevrpc_webtransport.h"
 
-#include <errno.h>
+#include <errno.h> // IWYU pragma: keep
 #include <node_api.h>
 #include <pthread.h>
 #include <stdbool.h>

@@ -3,7 +3,7 @@
 #include "trevrpc_msquic.h"
 
 #include <arpa/inet.h>
-#include <errno.h>
+#include <errno.h> // IWYU pragma: keep
 #include <limits.h>
 #if __has_include(<msquic.h>)
 #include <msquic.h>
