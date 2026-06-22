@@ -35,6 +35,7 @@ type ServerListener interface {
 // ListenOptions configures Listen.
 type ListenOptions struct {
 	Kind       TransportKind
+	Transport  TransportConfig
 	TLSConfig  *tls.Config
 	QUICConfig *quic.Config
 	MsQuic     MsQuicConfig
@@ -43,6 +44,7 @@ type ListenOptions struct {
 // DialOptions configures Dial.
 type DialOptions struct {
 	Kind         TransportKind
+	Transport    TransportConfig
 	TLSConfig    *tls.Config
 	QUICConfig   *quic.Config
 	MsQuic       MsQuicConfig
@@ -60,7 +62,10 @@ func Listen(addr string, server *Server, options ListenOptions) (ServerListener,
 		if options.TLSConfig == nil {
 			return nil, InvalidArgument("quic-go listener requires TLSConfig")
 		}
-		listener, err := quic.ListenAddr(addr, options.TLSConfig, QUICServerConfig(server.Options(), options.QUICConfig))
+		serverOptions := server.Options()
+		config := QUICServerConfig(serverOptions, options.QUICConfig)
+		applyDefaultQUICTransportConfig(config, mergeTransportConfig(transportConfigFromServerOptions(serverOptions), options.Transport))
+		listener, err := quic.ListenAddr(addr, options.TLSConfig, config)
 		if err != nil {
 			return nil, transportStatus(err)
 		}
@@ -87,7 +92,9 @@ func Dial(ctx context.Context, addr string, options DialOptions) (ClientTranspor
 		if options.TLSConfig == nil {
 			return nil, InvalidArgument("quic-go dial requires TLSConfig")
 		}
-		conn, err := quic.DialAddr(ctx, addr, options.TLSConfig, QUICClientConfig(maxFrameSize, options.QUICConfig))
+		config := QUICClientConfig(maxFrameSize, options.QUICConfig)
+		applyDefaultQUICTransportConfig(config, options.Transport)
+		conn, err := quic.DialAddr(ctx, addr, options.TLSConfig, config)
 		if err != nil {
 			return nil, transportOrContextStatus(ctx, err)
 		}

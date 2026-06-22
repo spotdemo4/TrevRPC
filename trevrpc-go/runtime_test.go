@@ -1064,6 +1064,40 @@ func expectPreHandlerMetrics(t *testing.T, metrics *recordingMetrics, code Code)
 	}
 }
 
+func TestTransportLimitsFromServerOptions(t *testing.T) {
+	options := DefaultServerOptions()
+	options.MaxFrameSize = 1024
+	options.MaxStreamBodySize = 4096
+	options.MaxConcurrentStreamsPerConnection = 10
+	options.MaxConcurrentRequests = 123
+	options.MaxConcurrentConnections = 7
+	options.StreamIdleTimeout = 20 * time.Second
+
+	limits := transportLimitsFromServerOptions(options)
+
+	if limits.StreamReceiveWindow != 1028 {
+		t.Fatalf("stream receive window should match one TrevRPC frame, got %d", limits.StreamReceiveWindow)
+	}
+	if limits.ConnectionReceiveWindow != 4096 {
+		t.Fatalf("connection receive window should match bounded stream budget, got %d", limits.ConnectionReceiveWindow)
+	}
+	if limits.IncomingBidiStreams != 11 {
+		t.Fatalf("incoming bidi streams should include one rejection slot, got %d", limits.IncomingBidiStreams)
+	}
+	if limits.MaxIdleTimeout != 20*time.Second || limits.KeepAlive != 10*time.Second {
+		t.Fatalf("transport idle defaults should derive from stream idle timeout, got idle=%s keepalive=%s", limits.MaxIdleTimeout, limits.KeepAlive)
+	}
+	if limits.MaxStatelessOperations != 123 || limits.MaxBindingStatelessOperations != 7 {
+		t.Fatalf("stateless operation limits should derive from server concurrency, got max=%d binding=%d", limits.MaxStatelessOperations, limits.MaxBindingStatelessOperations)
+	}
+
+	options.StreamIdleTimeout = -time.Second
+	limits = transportLimitsFromServerOptions(options)
+	if limits.MaxIdleTimeout != 0 || limits.KeepAlive != 0 {
+		t.Fatalf("non-positive idle timeout should disable transport idle defaults, got idle=%s keepalive=%s", limits.MaxIdleTimeout, limits.KeepAlive)
+	}
+}
+
 func TestQUICServerConfigAlignsTransportLimits(t *testing.T) {
 	options := DefaultServerOptions()
 	options.MaxFrameSize = 1024
@@ -1124,6 +1158,40 @@ func TestQUICClientConfigAlignsTransportLimits(t *testing.T) {
 	}
 	if config.MaxIncomingStreams != -1 || config.MaxIncomingUniStreams != 0 {
 		t.Fatalf("WebTransport client should reject peer-initiated bidi streams while leaving HTTP/3 uni defaults, got bidi=%d uni=%d", config.MaxIncomingStreams, config.MaxIncomingUniStreams)
+	}
+}
+
+func TestQUICTransportConfigDefaultsPreserveExplicitBackendConfig(t *testing.T) {
+	config := &quic.Config{}
+	applyDefaultQUICTransportConfig(config, TransportConfig{MaxIdleTimeout: 20 * time.Second, KeepAlive: 10 * time.Second})
+	if config.MaxIdleTimeout != 20*time.Second || config.KeepAlivePeriod != 10*time.Second {
+		t.Fatalf("transport config should fill empty quic-go idle settings, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlivePeriod)
+	}
+
+	config = &quic.Config{MaxIdleTimeout: 5 * time.Second, KeepAlivePeriod: 2 * time.Second}
+	applyDefaultQUICTransportConfig(config, TransportConfig{MaxIdleTimeout: 20 * time.Second, KeepAlive: 10 * time.Second})
+	if config.MaxIdleTimeout != 5*time.Second || config.KeepAlivePeriod != 2*time.Second {
+		t.Fatalf("explicit quic-go idle settings should win, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlivePeriod)
+	}
+}
+
+func TestMsQuicConfigFromServerOptionsAlignsTransportLimits(t *testing.T) {
+	options := DefaultServerOptions()
+	options.StreamIdleTimeout = 20 * time.Second
+	options.MaxConcurrentStreamsPerConnection = 10
+	options.MaxConcurrentRequests = 123
+	options.MaxConcurrentConnections = 7
+
+	config := MsQuicConfigFromServerOptions(options)
+
+	if config.MaxIdleTimeout != 20*time.Second || config.KeepAlive != 10*time.Second {
+		t.Fatalf("MsQuic idle defaults should derive from transport limits, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlive)
+	}
+	if config.PeerBidiStreamCount != 11 {
+		t.Fatalf("MsQuic peer bidi streams should include one rejection slot, got %d", config.PeerBidiStreamCount)
+	}
+	if config.MaxStatelessOperations != 123 || config.MaxBindingStatelessOperations != 7 {
+		t.Fatalf("MsQuic stateless operation limits should derive from server concurrency, got max=%d binding=%d", config.MaxStatelessOperations, config.MaxBindingStatelessOperations)
 	}
 }
 

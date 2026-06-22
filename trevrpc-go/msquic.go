@@ -807,7 +807,9 @@ type msQuicServerListener struct {
 }
 
 func listenMsQuic(addr string, server *Server, options ListenOptions) (ServerListener, error) {
-	config := mergeMsQuicConfig(MsQuicConfigFromServerOptions(server.Options()), options.MsQuic)
+	config := MsQuicConfigFromServerOptions(server.Options())
+	config = mergeMsQuicConfig(config, msQuicConfigFromTransportConfig(options.Transport))
+	config = mergeMsQuicConfig(config, options.MsQuic)
 	listener, err := ListenMsQuic(addr, config)
 	if err != nil {
 		return nil, err
@@ -816,7 +818,8 @@ func listenMsQuic(addr string, server *Server, options ListenOptions) (ServerLis
 }
 
 func dialMsQuic(ctx context.Context, addr string, options DialOptions, maxFrameSize int) (ClientTransport, error) {
-	conn, err := DialMsQuic(ctx, addr, options.MsQuic)
+	config := mergeMsQuicConfig(msQuicConfigFromTransportConfig(options.Transport), options.MsQuic)
+	conn, err := DialMsQuic(ctx, addr, config)
 	if err != nil {
 		return nil, err
 	}
@@ -858,6 +861,10 @@ func mergeMsQuicConfig(base, override MsQuicConfig) MsQuicConfig {
 		base.MaxBindingStatelessOperations = override.MaxBindingStatelessOperations
 	}
 	return base
+}
+
+func msQuicConfigFromTransportConfig(config TransportConfig) MsQuicConfig {
+	return MsQuicConfig{MaxIdleTimeout: config.MaxIdleTimeout, KeepAlive: config.KeepAlive}
 }
 
 func withMsQuicConfig(config MsQuicConfig, fn func(*C.trevrpc_msquic_config) error) error {

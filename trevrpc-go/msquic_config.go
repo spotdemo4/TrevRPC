@@ -20,22 +20,15 @@ type MsQuicConfig struct {
 
 // MsQuicConfigFromServerOptions derives MsQuic transport limits from server options.
 func MsQuicConfigFromServerOptions(options ServerOptions) MsQuicConfig {
-	maxIdleTimeout := max(options.StreamIdleTimeout, 0)
+	limits := transportLimitsFromServerOptions(options)
 
 	return MsQuicConfig{
-		MaxIdleTimeout:                maxIdleTimeout,
-		KeepAlive:                     msQuicKeepAlive(maxIdleTimeout),
-		PeerBidiStreamCount:           capMsQuicPositiveInt64(quicIncomingStreamLimit(options.MaxConcurrentStreamsPerConnection), msQuicMaxUint16),
-		MaxStatelessOperations:        capMsQuicPositiveInt64(int64(options.MaxConcurrentRequests), msQuicMaxUint32),
-		MaxBindingStatelessOperations: capMsQuicPositiveInt64(int64(options.MaxConcurrentConnections), msQuicMaxUint16),
+		MaxIdleTimeout:                limits.MaxIdleTimeout,
+		KeepAlive:                     limits.KeepAlive,
+		PeerBidiStreamCount:           capMsQuicPositiveInt64(limits.IncomingBidiStreams, msQuicMaxUint16),
+		MaxStatelessOperations:        capMsQuicPositiveInt64(limits.MaxStatelessOperations, msQuicMaxUint32),
+		MaxBindingStatelessOperations: capMsQuicPositiveInt64(limits.MaxBindingStatelessOperations, msQuicMaxUint16),
 	}
-}
-
-func msQuicKeepAlive(maxIdleTimeout time.Duration) time.Duration {
-	if maxIdleTimeout <= 0 {
-		return 0
-	}
-	return maxIdleTimeout / 2
 }
 
 func capMsQuicPositiveInt64(value, max int64) int {

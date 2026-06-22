@@ -13,7 +13,7 @@ Use MsQuic when you explicitly want the C/MsQuic transport path, for example to 
 | `quic-go` | default                | Portable Go services, easiest builds, default tests        |
 | MsQuic    | `-tags trevrpc_msquic` | MsQuic deployments, C-runtime parity, transport benchmarks |
 
-Generated TrevRPC clients are transport-agnostic. Use `Listen` and `Dial` for a common setup API, then pass the returned client transport to the generated service client.
+Generated TrevRPC clients are transport-agnostic. Use `Listen` and `Dial` for a common setup API, then pass the returned client transport to the generated service client. Backend-independent QUIC idle and keepalive settings go in `ListenOptions.Transport` or `DialOptions.Transport`; use `QUICConfig` and `MsQuic` for backend-specific knobs.
 
 ## quic-go
 
