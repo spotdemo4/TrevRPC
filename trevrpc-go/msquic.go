@@ -396,16 +396,17 @@ func (s *msQuicResponseStream) finish(abortRead bool) {
 	if abortRead {
 		_ = s.stream.abortRead()
 	}
-	s.stream.destroy()
 }
 
 func (s *msQuicResponseStream) writerError(ignoreCancelled bool) error {
 	if s.writerDone == nil {
+		s.stream.destroy()
 		return nil
 	}
 
 	err := <-s.writerDone
 	s.writerDone = nil
+	s.stream.destroy()
 	if err == nil {
 		return nil
 	}
@@ -417,7 +418,7 @@ func (s *msQuicResponseStream) writerError(ignoreCancelled bool) error {
 }
 
 func (s *msQuicResponseStream) ignoreWriterError() {
-	s.writerDone = nil
+	_ = s.writerError(true)
 }
 
 func writeMsQuicStreamingRequest(ctx context.Context, stream *msQuicStream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {

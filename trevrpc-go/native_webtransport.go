@@ -299,15 +299,16 @@ func (s *nativeWebTransportResponseStream) finish(abortRead bool) {
 	if abortRead {
 		_ = s.stream.abort()
 	}
-	s.stream.destroy()
 }
 
 func (s *nativeWebTransportResponseStream) writerError(ignoreCancelled bool) error {
 	if s.writerDone == nil {
+		s.stream.destroy()
 		return nil
 	}
 	err := <-s.writerDone
 	s.writerDone = nil
+	s.stream.destroy()
 	if err == nil {
 		return nil
 	}
@@ -317,7 +318,7 @@ func (s *nativeWebTransportResponseStream) writerError(ignoreCancelled bool) err
 	return err
 }
 
-func (s *nativeWebTransportResponseStream) ignoreWriterError() { s.writerDone = nil }
+func (s *nativeWebTransportResponseStream) ignoreWriterError() { _ = s.writerError(true) }
 
 func (s *NativeWebTransportSession) OpenStream(ctx context.Context) (*nativeWebTransportStream, error) {
 	if err := ctx.Err(); err != nil {
