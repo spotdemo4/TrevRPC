@@ -333,6 +333,113 @@ test("unknown response stream frame kind maps to invalid argument", async () => 
   );
 });
 
+test("response streams consume transport frame batches", async () => {
+  const Hello = helloTestType();
+  let returned = false;
+  const transport = {
+    async streamingCall() {
+      return batchedFrameStream(
+        [
+          [
+            RpcStreamFrame.create({ body: Hello.encode({ value: "one" }).finish() }),
+            RpcStreamFrame.create({ body: Hello.encode({ value: "two" }).finish() }),
+            RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok }),
+          ],
+        ],
+        () => {
+          returned = true;
+        },
+      );
+    },
+  };
+
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { streamIdleTimeoutMs: undefined },
+  );
+  const values = [];
+  for await (const reply of stream) {
+    values.push(reply.value);
+  }
+
+  assert.deepEqual(values, ["one", "two"]);
+  assert.equal(returned, true);
+});
+
+test("batched response stream reports EOF before final status after queued messages", async () => {
+  const Hello = helloTestType();
+  let returned = false;
+  const transport = {
+    async streamingCall() {
+      return batchedFrameStream(
+        [[RpcStreamFrame.create({ body: Hello.encode({ value: "one" }).finish() }), null]],
+        () => {
+          returned = true;
+        },
+      );
+    },
+  };
+
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { streamIdleTimeoutMs: undefined },
+  );
+  const iterator = stream[Symbol.asyncIterator]();
+
+  assert.equal((await iterator.next()).value.value, "one");
+  await assert.rejects(iterator.next(), (error) => error.code === Code.Internal);
+  assert.equal(returned, true);
+});
+
+test("batched response stream reports terminal error after queued messages", async () => {
+  const Hello = helloTestType();
+  let returned = false;
+  const transport = {
+    async streamingCall() {
+      return batchedFrameStream(
+        [
+          [
+            RpcStreamFrame.create({ body: Hello.encode({ value: "one" }).finish() }),
+            RpcStreamFrame.create({
+              kind: RpcStreamFrameKind.Status,
+              status: Code.Unavailable,
+              message: "down",
+            }),
+          ],
+        ],
+        () => {
+          returned = true;
+        },
+      );
+    },
+  };
+
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { streamIdleTimeoutMs: undefined },
+  );
+  const iterator = stream[Symbol.asyncIterator]();
+
+  assert.equal((await iterator.next()).value.value, "one");
+  await assert.rejects(iterator.next(), (error) => error.code === Code.Unavailable);
+  assert.equal(returned, true);
+});
+
 test("response stream limits map to resource exhausted at boundaries", async () => {
   const root = createRoot({
     nested: {
@@ -1139,6 +1246,29 @@ function helloTestType() {
       },
     },
   }).lookupType("hello.v1.Hello");
+}
+
+function batchedFrameStream(batches, onReturn) {
+  let index = 0;
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          throw new Error("single-frame next should not be used for batched streams");
+        },
+        nextBatch() {
+          if (index >= batches.length) {
+            return Promise.resolve({ done: true, value: undefined });
+          }
+          return Promise.resolve({ done: false, value: batches[index++] });
+        },
+        return() {
+          onReturn?.();
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
 }
 
 function greeterRequest(parameter = "") {

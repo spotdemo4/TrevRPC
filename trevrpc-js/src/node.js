@@ -211,44 +211,37 @@ class NativeResponseFrameStream {
       return { done: true, value: undefined };
     }
 
-    while (this.recvQueue.length === 0) {
-      this.recvTask ??= this.#startRecv();
-      const result = await this.recvTask;
-      this.recvTask = null;
-      if (result.error != null) {
-        this.done = true;
-        throw result.error;
-      }
-      this.recvQueue.push(...result.frames);
-      if (this.recvQueue.length > 0 && !hasTerminalFrame(this.recvQueue)) {
-        this.recvTask = this.#startRecv();
-      }
-    }
+    await this.#fillRecvQueue();
     const frame = this.recvQueue.shift();
     if (frame == null) {
-      this.done = true;
-      this.recvQueue.length = 0;
-      await this.writerDone;
-      if (this.writerError != null) {
-        throw this.writerError;
-      }
-      return { done: true, value: undefined };
+      return await this.#finishEof();
     }
 
     if (frame.kind === RpcStreamFrameKind.Status) {
-      this.done = true;
-      this.recvQueue.length = 0;
-      this.stream.close();
-      if (this.writerSettled) {
-        await this.writerDone;
-        if ((frame.status ?? RpcStatusOk) === RpcStatusOk && this.writerError != null) {
-          throw this.writerError;
-        }
-      } else {
-        this.suppressReturnWriterError = true;
-      }
+      await this.#finishStatus(frame);
     }
     return { done: false, value: frame };
+  }
+
+  async nextBatch() {
+    if (this.done) {
+      return { done: true, value: undefined };
+    }
+
+    await this.#fillRecvQueue();
+    const terminalIndex = this.recvQueue.findIndex(isTerminalFrame);
+    if (terminalIndex === 0) {
+      const frame = this.recvQueue.shift();
+      if (frame == null) {
+        return await this.#finishEof();
+      }
+      await this.#finishStatus(frame);
+      return { done: false, value: [frame] };
+    }
+
+    const count = terminalIndex < 0 ? this.recvQueue.length : terminalIndex;
+    const frames = this.recvQueue.splice(0, count);
+    return { done: false, value: frames };
   }
 
   async return() {
@@ -280,10 +273,54 @@ class NativeResponseFrameStream {
       (error) => ({ error }),
     );
   }
+
+  async #fillRecvQueue() {
+    while (this.recvQueue.length === 0) {
+      this.recvTask ??= this.#startRecv();
+      const result = await this.recvTask;
+      this.recvTask = null;
+      if (result.error != null) {
+        this.done = true;
+        throw result.error;
+      }
+      this.recvQueue.push(...result.frames);
+      if (this.recvQueue.length > 0 && !hasTerminalFrame(this.recvQueue)) {
+        this.recvTask = this.#startRecv();
+      }
+    }
+  }
+
+  async #finishEof() {
+    this.done = true;
+    this.recvQueue.length = 0;
+    await this.writerDone;
+    if (this.writerError != null) {
+      throw this.writerError;
+    }
+    return { done: true, value: undefined };
+  }
+
+  async #finishStatus(frame) {
+    this.done = true;
+    this.recvQueue.length = 0;
+    this.stream.close();
+    if (this.writerSettled) {
+      await this.writerDone;
+      if ((frame.status ?? RpcStatusOk) === RpcStatusOk && this.writerError != null) {
+        throw this.writerError;
+      }
+    } else {
+      this.suppressReturnWriterError = true;
+    }
+  }
 }
 
 function hasTerminalFrame(frames) {
-  return frames.some((frame) => frame == null || frame.kind === RpcStreamFrameKind.Status);
+  return frames.some(isTerminalFrame);
+}
+
+function isTerminalFrame(frame) {
+  return frame == null || frame.kind === RpcStreamFrameKind.Status;
 }
 
 async function writeRequestStream(stream, requestBody) {

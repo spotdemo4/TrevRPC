@@ -393,7 +393,7 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
 
   try {
     for (;;) {
-      const result = await nextFrameWithTimeout(
+      const result = await nextFrameBatchWithTimeout(
         iterator,
         deadlineAt,
         options.streamIdleTimeoutMs,
@@ -404,66 +404,71 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
         throw internal("response stream ended before final status");
       }
 
-      const frame = result.value;
-      switch (frame.kind) {
-        case RpcStreamFrameKind.Message: {
-          const body = frame.body ?? new Uint8Array(0);
-          if (options.maxResponseMessages >= 0 && messages >= options.maxResponseMessages) {
-            throw resourceExhausted(
-              `response stream exceeded maximum of ${options.maxResponseMessages} messages`,
-            );
-          }
-
-          if (body.byteLength > options.maxResponseBodySize) {
-            throw new FrameTooLargeError(body.byteLength, options.maxResponseBodySize);
-          }
-
-          messages += 1;
-          streamBodySize = saturatingAdd(streamBodySize, body.byteLength);
-          if (
-            options.maxResponseStreamBodySize >= 0 &&
-            streamBodySize > options.maxResponseStreamBodySize
-          ) {
-            throw resourceExhausted(
-              `response stream exceeded maximum body size of ${options.maxResponseStreamBodySize} bytes`,
-            );
-          }
-
-          yield unmarshalMessage(responseType, body);
-          break;
+      for (const frame of result.value) {
+        if (frame == null) {
+          throw internal("response stream ended before final status");
         }
-        case RpcStreamFrameKind.Status: {
-          complete = true;
-          validateResponseMetadata(frame.metadata ?? {});
-          abortScope?.abort(cancelled("response stream completed"));
-          let cleanupError;
-          if (typeof iterator.return === "function") {
-            try {
-              await iterator.return();
-            } catch (error) {
-              cleanupError = error;
-            }
-          }
-          const status = {
-            code: frame.status ?? Code.Ok,
-            statusMessage: frame.message ?? "",
-            metadata: frame.metadata ?? {},
-          };
-          if (status.code === Code.Ok) {
-            if (cleanupError != null) {
-              throw cleanupError;
-            }
-            return;
-          }
 
-          throw statusFromResponse({
-            status: status.code,
-            message: status.statusMessage,
-            metadata: status.metadata,
-          });
+        switch (frame.kind) {
+          case RpcStreamFrameKind.Message: {
+            const body = frame.body ?? new Uint8Array(0);
+            if (options.maxResponseMessages >= 0 && messages >= options.maxResponseMessages) {
+              throw resourceExhausted(
+                `response stream exceeded maximum of ${options.maxResponseMessages} messages`,
+              );
+            }
+
+            if (body.byteLength > options.maxResponseBodySize) {
+              throw new FrameTooLargeError(body.byteLength, options.maxResponseBodySize);
+            }
+
+            messages += 1;
+            streamBodySize = saturatingAdd(streamBodySize, body.byteLength);
+            if (
+              options.maxResponseStreamBodySize >= 0 &&
+              streamBodySize > options.maxResponseStreamBodySize
+            ) {
+              throw resourceExhausted(
+                `response stream exceeded maximum body size of ${options.maxResponseStreamBodySize} bytes`,
+              );
+            }
+
+            yield unmarshalMessage(responseType, body);
+            break;
+          }
+          case RpcStreamFrameKind.Status: {
+            complete = true;
+            validateResponseMetadata(frame.metadata ?? {});
+            abortScope?.abort(cancelled("response stream completed"));
+            let cleanupError;
+            if (typeof iterator.return === "function") {
+              try {
+                await iterator.return();
+              } catch (error) {
+                cleanupError = error;
+              }
+            }
+            const status = {
+              code: frame.status ?? Code.Ok,
+              statusMessage: frame.message ?? "",
+              metadata: frame.metadata ?? {},
+            };
+            if (status.code === Code.Ok) {
+              if (cleanupError != null) {
+                throw cleanupError;
+              }
+              return;
+            }
+
+            throw statusFromResponse({
+              status: status.code,
+              message: status.statusMessage,
+              metadata: status.metadata,
+            });
+          }
+          default:
+            throw invalidArgument("response stream contained an unknown frame kind");
         }
-        default:
-          throw invalidArgument("response stream contained an unknown frame kind");
       }
     }
   } finally {
@@ -475,6 +480,20 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
     }
     abortScope?.cleanup();
   }
+}
+
+async function nextFrameBatchWithTimeout(iterator, deadlineAt, idleTimeoutMs, signal, onTimeout) {
+  const timeout = nextTimeout(deadlineAt, idleTimeoutMs);
+  const promise = typeof iterator.nextBatch === "function" ? iterator.nextBatch() : iterator.next();
+  const result =
+    timeout == null
+      ? await withTimeout(promise, null, null, null, signal)
+      : await withTimeout(promise, timeout.ms, () => timeout.error, onTimeout, signal);
+
+  if (typeof iterator.nextBatch === "function" || result.done) {
+    return result;
+  }
+  return { done: false, value: [result.value] };
 }
 
 function validateResponseMetadata(metadata) {
@@ -501,15 +520,6 @@ async function readUnaryResponseFromStream(stream) {
     await iterator.return();
   }
   throw internal("client-streaming RPC returned more than one response message");
-}
-
-async function nextFrameWithTimeout(iterator, deadlineAt, idleTimeoutMs, signal, onTimeout) {
-  const timeout = nextTimeout(deadlineAt, idleTimeoutMs);
-  if (timeout == null) {
-    return withTimeout(iterator.next(), null, null, null, signal);
-  }
-
-  return withTimeout(iterator.next(), timeout.ms, () => timeout.error, onTimeout, signal);
 }
 
 function nextTimeout(deadlineAt, idleTimeoutMs) {
