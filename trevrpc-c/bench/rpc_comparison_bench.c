@@ -48,6 +48,8 @@ typedef int (*benchmark_case)(trevrpc_client* client);
 static volatile size_t benchmark_count_sink;
 static volatile size_t benchmark_bytes_sink;
 
+static int start_benchmark_server(benchmark_fixture* fixture);
+
 #define CHECK(condition)                                                                                               \
     do {                                                                                                               \
         if (!(condition)) {                                                                                            \
@@ -364,6 +366,51 @@ static int warm_client(const char* name, trevrpc_client* client) {
 static int start_fixture(benchmark_fixture* fixture) {
     memset(fixture, 0, sizeof(*fixture));
 
+    int err = start_benchmark_server(fixture);
+    if (err != 0) {
+        return err;
+    }
+
+    uint16_t port = 0;
+    err = trevrpc_test_server_webtransport_port(fixture->server, &port);
+    if (err != 0) {
+        return err;
+    }
+
+    trevrpc_config client_config = trevrpc_default_config();
+    client_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
+    client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
+    client_config.peer_bidi_stream_count = 128;
+    err = trevrpc_client_connect("127.0.0.1", port, &client_config, &fixture->native_client);
+    if (err != 0) {
+        return err;
+    }
+
+    trevrpc_wt_config wt_client_config = {
+        .host = "127.0.0.1",
+        .port = port,
+        .path = "/trevrpc",
+        .skip_certificate_validation = 1,
+        .max_streams_per_session = 128,
+        .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
+    };
+    err = trevrpc_client_connect_webtransport(&wt_client_config, &client_config, &fixture->webtransport_client);
+    if (err != 0) {
+        return err;
+    }
+
+    err = warm_client("trevrpc_msquic_native", fixture->native_client);
+    if (err == 0) {
+        err = warm_client("trevrpc_webtransport", fixture->webtransport_client);
+    }
+    return err;
+}
+
+static int start_benchmark_server(benchmark_fixture* fixture) {
+    if (fixture == NULL) {
+        return -EINVAL;
+    }
+
     trevrpc_config server_config = trevrpc_default_config();
     server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
     server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
@@ -402,40 +449,7 @@ static int start_fixture(benchmark_fixture* fixture) {
         return -err;
     }
     fixture->thread_started = true;
-
-    uint16_t port = 0;
-    err = trevrpc_test_server_webtransport_port(fixture->server, &port);
-    if (err != 0) {
-        return err;
-    }
-
-    trevrpc_config client_config = trevrpc_default_config();
-    client_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
-    client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
-    client_config.peer_bidi_stream_count = 128;
-    err = trevrpc_client_connect("127.0.0.1", port, &client_config, &fixture->native_client);
-    if (err != 0) {
-        return err;
-    }
-
-    trevrpc_wt_config wt_client_config = {
-        .host = "127.0.0.1",
-        .port = port,
-        .path = "/trevrpc",
-        .skip_certificate_validation = 1,
-        .max_streams_per_session = 128,
-        .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
-    };
-    err = trevrpc_client_connect_webtransport(&wt_client_config, &client_config, &fixture->webtransport_client);
-    if (err != 0) {
-        return err;
-    }
-
-    err = warm_client("trevrpc_msquic_native", fixture->native_client);
-    if (err == 0) {
-        err = warm_client("trevrpc_webtransport", fixture->webtransport_client);
-    }
-    return err;
+    return 0;
 }
 
 static int stop_fixture(benchmark_fixture* fixture) {
@@ -468,7 +482,42 @@ static void close_fixture(benchmark_fixture* fixture) {
     fixture->server = NULL;
 }
 
+static int run_server_mode(void) {
+    benchmark_fixture fixture = {0};
+    int err = start_benchmark_server(&fixture);
+    if (err != 0) {
+        fprintf(stderr, "start benchmark server failed: %s (%d)\n", trevrpc_error(err), err);
+        close_fixture(&fixture);
+        return 1;
+    }
+
+    uint16_t port = 0;
+    err = trevrpc_test_server_webtransport_port(fixture.server, &port);
+    if (err != 0) {
+        fprintf(stderr, "read benchmark server port failed: %s (%d)\n", trevrpc_error(err), err);
+        close_fixture(&fixture);
+        return 1;
+    }
+
+    printf("PORT %u\n", port);
+    fflush(stdout);
+    while (getchar() != EOF) {
+    }
+
+    int stop_err = stop_fixture(&fixture);
+    close_fixture(&fixture);
+    if (stop_err != 0) {
+        fprintf(stderr, "stop benchmark server failed: %s (%d)\n", trevrpc_error(stop_err), stop_err);
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && strcmp(argv[1], "--serve") == 0) {
+        return run_server_mode();
+    }
+
     size_t iterations = argc > 1 ? (size_t)strtoull(argv[1], NULL, 10) : 1000;
     CHECK(iterations > 0);
 

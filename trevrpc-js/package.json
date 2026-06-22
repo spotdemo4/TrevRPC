@@ -7,6 +7,7 @@
     "protoc-gen-trevrpc-js": "./bin/protoc-gen-trevrpc-js.js"
   },
   "files": [
+    "bench",
     "bin",
     "examples",
     "native",
@@ -27,6 +28,7 @@
     }
   },
   "scripts": {
+    "bench:native": "node bench/rpc_comparison_native.js",
     "build:native": "cmake -S native -B build/native ${TREVRPC_C_ROOT:+-DTREVRPC_C_ROOT=$TREVRPC_C_ROOT} ${NODE_INCLUDE_DIR:+-DNODE_INCLUDE_DIR=$NODE_INCLUDE_DIR} && cmake --build build/native",
     "check": "npm run lint && npm run typecheck && npm test",
     "example:greeter": "node examples/greeter/static-server.js",
