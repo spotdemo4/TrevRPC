@@ -773,6 +773,22 @@ static int trevrpc_stream_context_error(const trevrpc_stream* stream) {
     return 0;
 }
 
+static int trevrpc_stream_check_message_batch_limits(
+    trevrpc_stream* stream, const size_t* body_lens, size_t count, int64_t* next_count, uint64_t* next_body_size) {
+    *next_count = stream->response_message_count;
+    *next_body_size = stream->response_body_size;
+    for (size_t i = 0; i < count; i++) {
+        int err = trevrpc_stream_check_message_limit(stream, next_count, "response");
+        if (err == 0) {
+            err = trevrpc_stream_check_body_size_limit(stream, next_body_size, body_lens[i], "response");
+        }
+        if (err != 0) {
+            return err;
+        }
+    }
+    return 0;
+}
+
 int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
     if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) ||
         (body == NULL && body_len > 0)) {
@@ -798,6 +814,65 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
     }
 
     intptr_t written = trevrpc_stream_write_message_frame(stream, body, body_len);
+    return written < 0 ? (int)written : 0;
+}
+
+int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count) {
+    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) ||
+        (body_lens == NULL && count > 0)) {
+        return -EINVAL;
+    }
+
+    size_t total_body_len = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (body_lens[i] > SIZE_MAX - total_body_len) {
+            return -EOVERFLOW;
+        }
+        total_body_len += body_lens[i];
+    }
+    if (bodies == NULL && total_body_len > 0) {
+        return -EINVAL;
+    }
+    if (count == 0) {
+        return 0;
+    }
+
+    if (stream->transport != TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        size_t body_offset = 0;
+        for (size_t i = 0; i < count; i++) {
+            int err =
+                trevrpc_stream_send_message(stream, body_lens[i] == 0 ? NULL : bodies + body_offset, body_lens[i]);
+            if (err != 0) {
+                return err;
+            }
+            body_offset += body_lens[i];
+        }
+        return 0;
+    }
+
+    if (stream->sent_status) {
+        return -EPIPE;
+    }
+    int err = trevrpc_stream_context_error(stream);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_stream_check_response_idle_timeout(stream);
+    if (err != 0) {
+        return err;
+    }
+
+    int64_t next_count = 0;
+    uint64_t next_body_size = 0;
+    err = trevrpc_stream_check_message_batch_limits(stream, body_lens, count, &next_count, &next_body_size);
+    stream->response_message_count = next_count;
+    stream->response_body_size = next_body_size;
+    if (err != 0) {
+        return err;
+    }
+
+    intptr_t written = trevrpc_msquic_stream_write_message_frames(
+        stream->msquic_stream, bodies, body_lens, count, stream->max_frame_size);
     return written < 0 ? (int)written : 0;
 }
 

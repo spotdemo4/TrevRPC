@@ -202,14 +202,14 @@ try {
     await stream.finishSend();
     await drainNativeStream(stream, 1);
   });
-  await runProfileCase("node.native_client_stream_batch_await", iterations, async () => {
+  await runProfileCase("node.native_client_stream_batch", iterations, async () => {
     const stream = await nativeClient.startStream(
       service,
       "LotsOfGreetings",
       RpcKind.ClientStreaming,
       new Uint8Array(0),
     );
-    await sendNativeMessagesBatchAwait(stream);
+    await sendNativeMessagesBatch(stream);
     await stream.finishSend();
     await drainNativeStream(stream, 1);
   });
@@ -252,14 +252,14 @@ try {
     await stream.finishSend();
     await drainNativeStream(stream, StreamMessageCount);
   });
-  await runProfileCase("node.native_bidi_stream_batch_await", iterations, async () => {
+  await runProfileCase("node.native_bidi_stream_batch", iterations, async () => {
     const stream = await nativeClient.startStream(
       service,
       "BidiHello",
       RpcKind.BidirectionalStreaming,
       new Uint8Array(0),
     );
-    await sendNativeMessagesBatchAwait(stream);
+    await sendNativeMessagesBatch(stream);
     await stream.finishSend();
     await drainNativeStream(stream, StreamMessageCount);
   });
@@ -372,7 +372,12 @@ async function sendNativeMessages(stream) {
   }
 }
 
-async function sendNativeMessagesBatchAwait(stream) {
+async function sendNativeMessagesBatch(stream) {
+  if (typeof stream.sendMessages === "function") {
+    await stream.sendMessages(Array.from({ length: StreamMessageCount }, () => requestBody));
+    return;
+  }
+
   const sends = [];
   for (let i = 0; i < StreamMessageCount; i++) {
     sends.push(stream.sendMessage(requestBody));

@@ -367,6 +367,7 @@ void trevrpc_response_reset(trevrpc_response* response);
 void trevrpc_response_free(trevrpc_response* response);
 
 int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len);
+int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count);
 int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len);
 int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** frame);
 int trevrpc_stream_recv_ready(trevrpc_stream* stream, trevrpc_stream_frame** frame, int* ready);

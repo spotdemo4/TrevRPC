@@ -14,6 +14,8 @@ import {
 } from "./status.js";
 import { RpcKind, RpcStreamFrameKind, WireVersion } from "./wire.js";
 
+const RequestStreamBatchSize = 16;
+
 /** Returns the default client call options. */
 export function defaultCallOptions() {
   return {
@@ -670,9 +672,15 @@ class RequestQueue {
     return new Promise((resolve, reject) => {
       if (this._waiter != null) {
         const waiter = this._waiter;
-        this._waiter = undefined;
-        waiter.resolve({ done: false, value });
-        resolve();
+        if (waiter.batch) {
+          this._pending.push({ value, resolve, reject });
+          this._waiter = undefined;
+          queueMicrotask(() => this._resolveBatchWaiter(waiter));
+        } else {
+          this._waiter = undefined;
+          waiter.resolve({ done: false, value });
+          resolve();
+        }
         return;
       }
 
@@ -725,28 +733,93 @@ class RequestQueue {
     });
   }
 
+  nextBatch(max = RequestStreamBatchSize) {
+    if (this._pending.length > 0) {
+      return Promise.resolve({ done: false, value: this._takePendingBatch(max) });
+    }
+    if (this._error != null) {
+      return Promise.reject(this._error);
+    }
+    if (this._closed) {
+      return Promise.resolve({ done: true, value: undefined });
+    }
+
+    return new Promise((resolve, reject) => {
+      this._waiter = { resolve, reject, batch: true, max };
+    });
+  }
+
   return() {
     this.close(cancelled("request stream cancelled"));
     return Promise.resolve({ done: true, value: undefined });
   }
-}
 
-async function* encodeRequestStream(requestType, requests, signal) {
-  const iterator = requestIterator(requests);
-  try {
-    for (;;) {
-      const result = await nextRequest(iterator, signal);
-      if (result.done) {
-        return;
-      }
-
-      yield marshalMessage(requestType, result.value);
+  _takePendingBatch(max) {
+    const count = Math.min(Math.max(1, max), this._pending.length);
+    const values = Array.from({ length: count });
+    for (let i = 0; i < count; i++) {
+      const pending = this._pending.shift();
+      pending.resolve();
+      values[i] = pending.value;
     }
-  } finally {
-    if (signal?.aborted && typeof iterator.return === "function") {
-      await iterator.return();
+    return values;
+  }
+
+  _resolveBatchWaiter(waiter) {
+    if (this._pending.length > 0) {
+      waiter.resolve({ done: false, value: this._takePendingBatch(waiter.max) });
+    } else if (this._error != null) {
+      waiter.reject(this._error);
+    } else if (this._closed) {
+      waiter.resolve({ done: true, value: undefined });
+    } else {
+      this._waiter = waiter;
     }
   }
+}
+
+function encodeRequestStream(requestType, requests, signal) {
+  const iterator = requestIterator(requests);
+  let done = false;
+  return {
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    async next() {
+      if (done) {
+        return { done: true, value: undefined };
+      }
+      const result = await nextRequest(iterator, signal);
+      if (result.done) {
+        done = true;
+        return { done: true, value: undefined };
+      }
+
+      return { done: false, value: marshalMessage(requestType, result.value) };
+    },
+    async nextBatch(max = RequestStreamBatchSize) {
+      if (done) {
+        return { done: true, value: undefined };
+      }
+      const result = await nextRequestBatch(iterator, signal, max);
+      if (result.done) {
+        done = true;
+        return { done: true, value: undefined };
+      }
+
+      return {
+        done: false,
+        value: result.value.map((value) => marshalMessage(requestType, value)),
+      };
+    },
+    async return() {
+      done = true;
+      if (signal?.aborted && typeof iterator.return === "function") {
+        await iterator.return();
+      }
+      return { done: true, value: undefined };
+    },
+  };
 }
 
 function requestIterator(requests) {
@@ -774,17 +847,30 @@ function requestIterator(requests) {
 }
 
 function nextRequest(iterator, signal) {
+  return nextRequestResult(() => iterator.next(), signal);
+}
+
+async function nextRequestBatch(iterator, signal, max) {
+  if (typeof iterator.nextBatch === "function") {
+    return await nextRequestResult(() => iterator.nextBatch(max), signal);
+  }
+
+  const result = await nextRequest(iterator, signal);
+  return result.done ? result : { done: false, value: [result.value] };
+}
+
+function nextRequestResult(next, signal) {
   if (signal?.aborted) {
     return Promise.reject(signal.reason ?? cancelled("request stream cancelled"));
   }
   if (signal == null) {
-    return iterator.next();
+    return next();
   }
 
   return new Promise((resolve, reject) => {
     const onAbort = () => reject(signal.reason ?? cancelled("request stream cancelled"));
     signal.addEventListener("abort", onAbort, { once: true });
-    iterator.next().then(
+    next().then(
       (value) => {
         signal.removeEventListener("abort", onAbort);
         resolve(value);

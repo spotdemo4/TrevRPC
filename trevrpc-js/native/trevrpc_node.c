@@ -408,6 +408,85 @@ static int bytes_arg_view(napi_env env, napi_value value, const uint8_t** out, s
     return -EINVAL;
 }
 
+static int copy_bytes_array_arg(napi_env env, napi_value value, uint8_t** out, size_t** out_lens, size_t* out_count) {
+    *out = NULL;
+    *out_lens = NULL;
+    *out_count = 0;
+
+    bool is_array = false;
+    if (napi_is_array(env, value, &is_array) != napi_ok || !is_array) {
+        return -EINVAL;
+    }
+
+    uint32_t length = 0;
+    if (napi_get_array_length(env, value, &length) != napi_ok) {
+        return -EINVAL;
+    }
+    if (length == 0) {
+        return 0;
+    }
+
+    size_t* lens = calloc(length, sizeof(*lens));
+    if (lens == NULL) {
+        return -ENOMEM;
+    }
+
+    size_t total_len = 0;
+    for (uint32_t i = 0; i < length; i++) {
+        napi_value element = NULL;
+        const uint8_t* body = NULL;
+        size_t body_len = 0;
+        if (napi_get_element(env, value, i, &element) != napi_ok ||
+            bytes_arg_view(env, element, &body, &body_len) != 0) {
+            free(lens);
+            return -EINVAL;
+        }
+        if (body_len > SIZE_MAX - total_len) {
+            free(lens);
+            return -EOVERFLOW;
+        }
+        lens[i] = body_len;
+        total_len += body_len;
+    }
+
+    uint8_t* bodies = NULL;
+    if (total_len > 0) {
+        bodies = malloc(total_len);
+        if (bodies == NULL) {
+            free(lens);
+            return -ENOMEM;
+        }
+    }
+
+    size_t offset = 0;
+    for (uint32_t i = 0; i < length; i++) {
+        if (lens[i] == 0) {
+            continue;
+        }
+        napi_value element = NULL;
+        const uint8_t* body = NULL;
+        size_t body_len = 0;
+        if (napi_get_element(env, value, i, &element) != napi_ok ||
+            bytes_arg_view(env, element, &body, &body_len) != 0 || body_len != lens[i]) {
+            free(bodies);
+            free(lens);
+            return -EINVAL;
+        }
+        if (bodies == NULL || body == NULL) {
+            free(bodies);
+            free(lens);
+            return -EINVAL;
+        }
+        memcpy(bodies + offset, body, body_len);
+        offset += body_len;
+    }
+
+    *out = bodies;
+    *out_lens = lens;
+    *out_count = length;
+    return 0;
+}
+
 static napi_value promise_from_void_result(napi_env env, int err, const char* operation) {
     napi_value promise = NULL;
     napi_deferred deferred = NULL;
@@ -1917,6 +1996,44 @@ static napi_value native_stream_send_message(napi_env env, napi_callback_info in
     return promise_from_void_result(env, err, "sendMessage");
 }
 
+static napi_value native_stream_send_messages(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
+    if (argc != 1) {
+        napi_throw_type_error(env, NULL, "sendMessages requires an array of bodies");
+        return NULL;
+    }
+    native_stream* stream = NULL;
+    if (!unwrap_native_stream(env, this_arg, &stream)) {
+        return NULL;
+    }
+
+    uint8_t* bodies = NULL;
+    size_t* body_lens = NULL;
+    size_t count = 0;
+    int err = copy_bytes_array_arg(env, args[0], &bodies, &body_lens, &count);
+    if (err != 0) {
+        if (err == -ENOMEM) {
+            napi_throw_error(env, NULL, "failed to allocate sendMessages bodies");
+        } else {
+            napi_throw_type_error(env, NULL, "invalid sendMessages bodies");
+        }
+        return NULL;
+    }
+
+    trevrpc_stream* c_stream = NULL;
+    err = native_stream_acquire(stream, &c_stream);
+    if (err == 0) {
+        err = trevrpc_stream_send_messages(c_stream, bodies, body_lens, count);
+        native_stream_release(stream);
+    }
+    free(bodies);
+    free(body_lens);
+    return promise_from_void_result(env, err, "sendMessages");
+}
+
 static napi_value native_stream_finish_send(napi_env env, napi_callback_info info) {
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
@@ -2352,6 +2469,7 @@ static napi_value init(napi_env env, napi_value exports) {
 
     napi_property_descriptor stream_methods[] = {
         {"sendMessage", NULL, native_stream_send_message, NULL, NULL, NULL, napi_default, NULL},
+        {"sendMessages", NULL, native_stream_send_messages, NULL, NULL, NULL, napi_default, NULL},
         {"finishSend", NULL, native_stream_finish_send, NULL, NULL, NULL, napi_default, NULL},
         {"recv", NULL, native_stream_recv, NULL, NULL, NULL, napi_default, NULL},
         {"recvMany", NULL, native_stream_recv_many, NULL, NULL, NULL, napi_default, NULL},

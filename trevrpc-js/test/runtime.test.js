@@ -371,6 +371,92 @@ test("response streams consume transport frame batches", async () => {
   assert.equal(returned, true);
 });
 
+test("request streams expose queued request batches", async () => {
+  const Hello = helloTestType();
+  let batchPromise;
+  let requestIterator;
+  const transport = {
+    async streamingCall(_request, requestBody) {
+      requestIterator = requestBody[Symbol.asyncIterator]();
+      batchPromise = requestIterator.nextBatch(16);
+      return batchedFrameStream([
+        [
+          RpcStreamFrame.create({ body: Hello.encode({ value: "done" }).finish() }),
+          RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok }),
+        ],
+      ]);
+    },
+  };
+
+  const call = await clientStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfGreetings",
+    Hello,
+    Hello,
+    { streamIdleTimeoutMs: undefined },
+  );
+  const sends = [call.send({ value: "one" }), call.send({ value: "two" })];
+  const batch = await batchPromise;
+  await Promise.all(sends);
+  await call.closeSend();
+  const done = await requestIterator.nextBatch(16);
+  const reply = await call.closeAndRecv();
+
+  assert.equal(batch.done, false);
+  assert.deepEqual(
+    batch.value.map((body) => Hello.decode(body).value),
+    ["one", "two"],
+  );
+  assert.equal(reply.value, "done");
+  assert.equal(done.done, true);
+});
+
+test("Node transport writes request body batches with native sendMessages", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  const sentBatches = [];
+  let finishSend;
+  const finishDone = new Promise((resolve) => {
+    finishSend = resolve;
+  });
+  const nativeClient = {
+    async startStream() {
+      return {
+        async sendMessage() {
+          throw new Error("single-message send should not be used for request batches");
+        },
+        async sendMessages(bodies) {
+          sentBatches.push(bodies.map((body) => Array.from(body)));
+        },
+        async finishSend() {
+          finishSend();
+        },
+        async recvMany() {
+          await finishDone;
+          return [RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok })];
+        },
+        close() {},
+      };
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+
+  const responses = await transport.streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "LotsOfGreetings",
+      kind: RpcKind.ClientStreaming,
+      body: new Uint8Array(),
+    },
+    batchedFrameStream([[new Uint8Array([1]), new Uint8Array([2])]]),
+  );
+  const result = await responses[Symbol.asyncIterator]().next();
+
+  assert.equal(result.done, false);
+  assert.equal(result.value.kind, RpcStreamFrameKind.Status);
+  assert.deepEqual(sentBatches, [[[1], [2]]]);
+});
+
 test("batched response stream reports EOF before final status after queued messages", async () => {
   const Hello = helloTestType();
   let returned = false;

@@ -517,6 +517,97 @@ cleanup:
     return result;
 }
 
+static int test_response_stream_empty_message_batch_is_noop(void) {
+    int result = 1;
+    trevrpc_stream stream = {
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
+        .max_stream_messages = -1,
+        .max_stream_body_size = -1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+
+    CHECK_GOTO(trevrpc_stream_send_messages(&stream, NULL, NULL, 0) == 0);
+    CHECK_GOTO(stream.response_message_count == 0);
+    CHECK_GOTO(stream.response_body_size == 0);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_OK);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
+static int test_response_stream_message_batch_limit(void) {
+    int result = 1;
+    trevrpc_stream stream = {
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
+        .max_stream_messages = 1,
+        .max_stream_body_size = -1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    const uint8_t bodies[] = {1, 2};
+    const size_t body_lens[] = {1, 1};
+
+    CHECK_GOTO(trevrpc_stream_send_messages(&stream, bodies, body_lens, 2) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
+    CHECK_GOTO(stream.response_message_count == 1);
+    CHECK_GOTO(stream.response_body_size == 1);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(stream.failure_message != NULL);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
+static int test_response_stream_message_batch_body_size_limit(void) {
+    int result = 1;
+    trevrpc_stream stream = {
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
+        .max_stream_messages = -1,
+        .max_stream_body_size = 1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    const uint8_t bodies[] = {1, 2};
+    const size_t body_lens[] = {1, 1};
+
+    CHECK_GOTO(trevrpc_stream_send_messages(&stream, bodies, body_lens, 2) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
+    CHECK_GOTO(stream.response_message_count == 2);
+    CHECK_GOTO(stream.response_body_size == 2);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(stream.failure_message != NULL);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
+static int test_response_stream_message_batch_rejects_missing_body_bytes(void) {
+    int result = 1;
+    trevrpc_stream stream = {
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = (trevrpc_msquic_stream*)1,
+        .max_stream_messages = -1,
+        .max_stream_body_size = -1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    const size_t body_lens[] = {1};
+
+    CHECK_GOTO(trevrpc_stream_send_messages(&stream, NULL, body_lens, 1) == -EINVAL);
+    CHECK_GOTO(stream.response_message_count == 0);
+    CHECK_GOTO(stream.response_body_size == 0);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_OK);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
 static int test_request_stream_idle_timeout(void) {
     int result = 1;
     bool mutex_initialized = false;
@@ -1470,6 +1561,18 @@ int main(void) {
         return 1;
     }
     if (test_response_stream_body_size_limit() != 0) {
+        return 1;
+    }
+    if (test_response_stream_empty_message_batch_is_noop() != 0) {
+        return 1;
+    }
+    if (test_response_stream_message_batch_limit() != 0) {
+        return 1;
+    }
+    if (test_response_stream_message_batch_body_size_limit() != 0) {
+        return 1;
+    }
+    if (test_response_stream_message_batch_rejects_missing_body_bytes() != 0) {
         return 1;
     }
     if (test_request_stream_idle_timeout() != 0) {

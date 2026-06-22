@@ -10,6 +10,7 @@ const moduleDir = dirname(fileURLToPath(import.meta.url));
 const EmptyBody = new Uint8Array(0);
 const RpcStatusOk = 0;
 const RecvManyBatchSize = 32;
+const SendManyBatchSize = 16;
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */
 export class NodeTransport {
@@ -324,15 +325,40 @@ function isTerminalFrame(frame) {
 }
 
 async function writeRequestStream(stream, requestBody) {
+  const iterator = requestBody[Symbol.asyncIterator]();
   try {
-    for await (const body of requestBody) {
-      await stream.sendMessage(byteBody(body));
+    for (;;) {
+      const result = await nextRequestBodyBatch(iterator);
+      if (result.done) {
+        break;
+      }
+      const bodies = result.value.map(byteBody);
+      if (bodies.length === 1 || typeof stream.sendMessages !== "function") {
+        for (const body of bodies) {
+          await stream.sendMessage(body);
+        }
+      } else if (bodies.length > 1) {
+        await stream.sendMessages(bodies);
+      }
     }
     await stream.finishSend();
   } catch (error) {
+    try {
+      await iterator.return?.();
+    } catch {
+      // Preserve the upload error; closing the native stream releases resources.
+    }
     stream.close();
     throw error;
   }
+}
+
+async function nextRequestBodyBatch(iterator) {
+  if (typeof iterator.nextBatch === "function") {
+    return await iterator.nextBatch(SendManyBatchSize);
+  }
+  const result = await iterator.next();
+  return result.done ? result : { done: false, value: [result.value] };
 }
 
 async function completeDefault(call, result) {
