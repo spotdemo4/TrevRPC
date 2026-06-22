@@ -38,6 +38,14 @@ func (t *QuicClient) Conn() *quic.Conn {
 	return t.conn
 }
 
+// Close closes the underlying QUIC connection.
+func (t *QuicClient) Close() error {
+	if t == nil || t.conn == nil {
+		return nil
+	}
+	return t.conn.CloseWithError(0, "client closed")
+}
+
 // Call sends a unary RPC request over QUIC and returns its response.
 func (t *QuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.conn.OpenStreamSync(ctx)

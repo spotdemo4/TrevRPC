@@ -49,7 +49,10 @@ func startTrevRPCNativeMsQuicComparisonClient(b *testing.B) *greeter.GreeterClie
 	serverConfig.CertFile = certFile
 	serverConfig.KeyFile = keyFile
 
-	listener, err := trevrpc.ListenNativeMsQuic(addr, serverConfig)
+	listener, err := trevrpc.Listen(addr, server, trevrpc.ListenOptions{
+		Kind:         trevrpc.TransportNativeMsQuic,
+		NativeMsQuic: serverConfig,
+	})
 	if err != nil {
 		b.Fatalf("listen TrevRPC native MsQuic: %v", err)
 	}
@@ -57,10 +60,13 @@ func startTrevRPCNativeMsQuicComparisonClient(b *testing.B) *greeter.GreeterClie
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- trevrpc.ServeNativeMsQuic(ctx, listener, server)
+		serveDone <- listener.Serve(ctx)
 	}()
 
-	conn, err := trevrpc.DialNativeMsQuic(ctx, addr, comparisonNativeMsQuicConfig(server.Options()))
+	transport, err := trevrpc.Dial(ctx, addr, trevrpc.DialOptions{
+		Kind:         trevrpc.TransportNativeMsQuic,
+		NativeMsQuic: comparisonNativeMsQuicConfig(server.Options()),
+	})
 	if err != nil {
 		cancel()
 		_ = listener.Close()
@@ -68,7 +74,7 @@ func startTrevRPCNativeMsQuicComparisonClient(b *testing.B) *greeter.GreeterClie
 	}
 
 	b.Cleanup(func() {
-		_ = conn.Close()
+		_ = transport.Close()
 		cancel()
 		_ = listener.Close()
 		select {
@@ -81,7 +87,7 @@ func startTrevRPCNativeMsQuicComparisonClient(b *testing.B) *greeter.GreeterClie
 		}
 	})
 
-	return greeter.NewGreeterClient(trevrpc.NewNativeMsQuicClient(conn), trevrpc.WithoutStreamIdleTimeout())
+	return greeter.NewGreeterClient(transport, trevrpc.WithoutStreamIdleTimeout())
 }
 
 func warmTrevRPCNativeMsQuicComparisonClient(b *testing.B, client *greeter.GreeterClient) {
@@ -105,13 +111,10 @@ func warmTrevRPCNativeMsQuicComparisonClient(b *testing.B, client *greeter.Greet
 }
 
 func comparisonNativeMsQuicConfig(options trevrpc.ServerOptions) trevrpc.NativeMsQuicConfig {
-	return trevrpc.NativeMsQuicConfig{
-		MaxIdleTimeout:                comparisonQUICIdleTimeout,
-		KeepAlive:                     comparisonQUICKeepAlive,
-		PeerBidiStreamCount:           options.MaxConcurrentStreamsPerConnection,
-		MaxStatelessOperations:        options.MaxConcurrentRequests,
-		MaxBindingStatelessOperations: options.MaxConcurrentConnections,
-	}
+	config := trevrpc.NativeMsQuicConfigFromServerOptions(options)
+	config.MaxIdleTimeout = comparisonQUICIdleTimeout
+	config.KeepAlive = comparisonQUICKeepAlive
+	return config
 }
 
 func comparisonNativeMsQuicCertificateFiles(tb testing.TB) (string, string) {

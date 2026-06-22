@@ -22,21 +22,11 @@ import (
 	"unsafe"
 )
 
-// NativeMsQuicConfig configures the experimental C MsQuic backend.
-type NativeMsQuicConfig struct {
-	CertFile                      string
-	KeyFile                       string
-	MaxIdleTimeout                time.Duration
-	KeepAlive                     time.Duration
-	PeerBidiStreamCount           int
-	MaxStatelessOperations        int
-	MaxBindingStatelessOperations int
-}
-
 // NativeMsQuicListener accepts native MsQuic connections from trevrpc-c.
 type NativeMsQuicListener struct {
 	mu        sync.Mutex
 	ptr       *C.trevrpc_msquic_listener
+	addr      net.Addr
 	closeOnce sync.Once
 }
 
@@ -74,7 +64,7 @@ func ListenNativeMsQuic(addr string, config NativeMsQuicConfig) (*NativeMsQuicLi
 		return nil, err
 	}
 
-	return &NativeMsQuicListener{ptr: listener}, nil
+	return &NativeMsQuicListener{ptr: listener, addr: nativeMsQuicListenerAddr(host, port, listener)}, nil
 }
 
 // DialNativeMsQuic dials a native MsQuic connection.
@@ -119,6 +109,14 @@ func (l *NativeMsQuicListener) Accept() (*NativeMsQuicConn, error) {
 	}
 
 	return &NativeMsQuicConn{ptr: conn}, nil
+}
+
+// Addr returns the listener's local network address.
+func (l *NativeMsQuicListener) Addr() net.Addr {
+	if l == nil {
+		return nil
+	}
+	return l.addr
 }
 
 // Close stops the listener and releases native resources.
@@ -173,6 +171,14 @@ func (t *NativeMsQuicClient) WithMaxFrameSize(maxFrameSize int) *NativeMsQuicCli
 // Conn returns the underlying native MsQuic connection.
 func (t *NativeMsQuicClient) Conn() *NativeMsQuicConn {
 	return t.conn
+}
+
+// Close closes the underlying native MsQuic connection.
+func (t *NativeMsQuicClient) Close() error {
+	if t == nil || t.conn == nil {
+		return nil
+	}
+	return t.conn.Close()
 }
 
 // Call sends a unary RPC request over native MsQuic and returns its response.
@@ -795,6 +801,65 @@ func (s *nativeMsQuicStream) trevrpcCancelReadOnContext(ctx context.Context) fun
 	return func() { closeOnce.Do(func() { close(done) }) }
 }
 
+type nativeMsQuicServerListener struct {
+	listener *NativeMsQuicListener
+	server   *Server
+}
+
+func listenNativeMsQuic(addr string, server *Server, options ListenOptions) (ServerListener, error) {
+	config := mergeNativeMsQuicConfig(NativeMsQuicConfigFromServerOptions(server.Options()), options.NativeMsQuic)
+	listener, err := ListenNativeMsQuic(addr, config)
+	if err != nil {
+		return nil, err
+	}
+	return &nativeMsQuicServerListener{listener: listener, server: server}, nil
+}
+
+func dialNativeMsQuic(ctx context.Context, addr string, options DialOptions, maxFrameSize int) (ClientTransport, error) {
+	conn, err := DialNativeMsQuic(ctx, addr, options.NativeMsQuic)
+	if err != nil {
+		return nil, err
+	}
+	return NewNativeMsQuicClient(conn).WithMaxFrameSize(maxFrameSize), nil
+}
+
+func (l *nativeMsQuicServerListener) Addr() net.Addr {
+	return l.listener.Addr()
+}
+
+func (l *nativeMsQuicServerListener) Serve(ctx context.Context) error {
+	return ServeNativeMsQuic(ctx, l.listener, l.server)
+}
+
+func (l *nativeMsQuicServerListener) Close() error {
+	return l.listener.Close()
+}
+
+func mergeNativeMsQuicConfig(base, override NativeMsQuicConfig) NativeMsQuicConfig {
+	if override.CertFile != "" {
+		base.CertFile = override.CertFile
+	}
+	if override.KeyFile != "" {
+		base.KeyFile = override.KeyFile
+	}
+	if override.MaxIdleTimeout > 0 {
+		base.MaxIdleTimeout = override.MaxIdleTimeout
+	}
+	if override.KeepAlive > 0 {
+		base.KeepAlive = override.KeepAlive
+	}
+	if override.PeerBidiStreamCount > 0 {
+		base.PeerBidiStreamCount = override.PeerBidiStreamCount
+	}
+	if override.MaxStatelessOperations > 0 {
+		base.MaxStatelessOperations = override.MaxStatelessOperations
+	}
+	if override.MaxBindingStatelessOperations > 0 {
+		base.MaxBindingStatelessOperations = override.MaxBindingStatelessOperations
+	}
+	return base
+}
+
 func withNativeMsQuicConfig(config NativeMsQuicConfig, fn func(*C.trevrpc_msquic_config) error) error {
 	alpn := C.CString(ALPN)
 	defer C.free(unsafe.Pointer(alpn))
@@ -809,6 +874,22 @@ func withNativeMsQuicConfig(config NativeMsQuicConfig, fn func(*C.trevrpc_msquic
 		keyFile = C.CString(config.KeyFile)
 		defer C.free(unsafe.Pointer(keyFile))
 	}
+	keepAliveMs, err := nativeMsQuicDurationMillis32("keep alive", config.KeepAlive)
+	if err != nil {
+		return err
+	}
+	peerBidiStreamCount, err := nativeMsQuicUint16("peer bidi stream count", config.PeerBidiStreamCount)
+	if err != nil {
+		return err
+	}
+	maxStatelessOperations, err := nativeMsQuicUint32("max stateless operations", config.MaxStatelessOperations)
+	if err != nil {
+		return err
+	}
+	maxBindingStatelessOperations, err := nativeMsQuicUint16("max binding stateless operations", config.MaxBindingStatelessOperations)
+	if err != nil {
+		return err
+	}
 
 	cConfig := C.trevrpc_msquic_config{
 		alpn:                             alpn,
@@ -816,13 +897,41 @@ func withNativeMsQuicConfig(config NativeMsQuicConfig, fn func(*C.trevrpc_msquic
 		cert_file:                        certFile,
 		key_file:                         keyFile,
 		max_idle_timeout_ms:              C.uint64_t(durationMillis(config.MaxIdleTimeout)),
-		keep_alive_ms:                    C.uint32_t(durationMillis(config.KeepAlive)),
-		peer_bidi_stream_count:           C.uint16_t(config.PeerBidiStreamCount),
-		max_stateless_operations:         C.uint32_t(config.MaxStatelessOperations),
-		max_binding_stateless_operations: C.uint16_t(config.MaxBindingStatelessOperations),
+		keep_alive_ms:                    keepAliveMs,
+		peer_bidi_stream_count:           peerBidiStreamCount,
+		max_stateless_operations:         maxStatelessOperations,
+		max_binding_stateless_operations: maxBindingStatelessOperations,
 	}
 
 	return fn(&cConfig)
+}
+
+func nativeMsQuicUint16(name string, value int) (C.uint16_t, error) {
+	if value <= 0 {
+		return 0, nil
+	}
+	if int64(value) > nativeMsQuicMaxUint16 {
+		return 0, InvalidArgument(fmt.Sprintf("native MsQuic %s exceeds %d", name, nativeMsQuicMaxUint16))
+	}
+	return C.uint16_t(value), nil
+}
+
+func nativeMsQuicUint32(name string, value int) (C.uint32_t, error) {
+	if value <= 0 {
+		return 0, nil
+	}
+	if int64(value) > nativeMsQuicMaxUint32 {
+		return 0, InvalidArgument(fmt.Sprintf("native MsQuic %s exceeds %d", name, nativeMsQuicMaxUint32))
+	}
+	return C.uint32_t(value), nil
+}
+
+func nativeMsQuicDurationMillis32(name string, duration time.Duration) (C.uint32_t, error) {
+	millis := durationMillis(duration)
+	if millis > uint64(nativeMsQuicMaxUint32) {
+		return 0, InvalidArgument(fmt.Sprintf("native MsQuic %s exceeds %dms", name, nativeMsQuicMaxUint32))
+	}
+	return C.uint32_t(millis), nil
 }
 
 func splitNativeMsQuicAddr(addr string) (string, C.uint16_t, error) {
@@ -842,6 +951,23 @@ func splitNativeMsQuicAddr(addr string) (string, C.uint16_t, error) {
 	}
 
 	return host, C.uint16_t(port), nil
+}
+
+type transportAddr struct {
+	network string
+	address string
+}
+
+func (a transportAddr) Network() string { return a.network }
+
+func (a transportAddr) String() string { return a.address }
+
+func nativeMsQuicListenerAddr(host string, port C.uint16_t, listener *C.trevrpc_msquic_listener) net.Addr {
+	var boundPort C.uint16_t
+	if C.trevrpc_msquic_listener_port(listener, &boundPort) == 0 {
+		port = boundPort
+	}
+	return transportAddr{network: "udp", address: net.JoinHostPort(host, strconv.Itoa(int(port)))}
 }
 
 func durationMillis(duration time.Duration) uint64 {

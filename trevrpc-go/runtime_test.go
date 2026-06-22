@@ -1134,7 +1134,7 @@ func TestQuicClientUnary(t *testing.T) {
 	})
 
 	serverTLS, clientTLS := testTLSConfig(t)
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICServerConfig(server.Options(), nil))
+	listener, err := Listen("127.0.0.1:0", server, ListenOptions{TLSConfig: serverTLS})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -1143,16 +1143,16 @@ func TestQuicClientUnary(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go func() {
-		_ = ServeQUIC(ctx, listener, server)
+		_ = listener.Serve(ctx)
 	}()
 
-	conn, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, QUICClientConfig(DefaultMaxFrameSize, nil))
+	transport, err := Dial(ctx, listener.Addr().String(), DialOptions{TLSConfig: clientTLS})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.CloseWithError(0, "test complete")
+	defer transport.Close()
 
-	response, err := Unary(ctx, NewQuicClient(conn), "example.Greeter", "SayHello", &testMessage{Value: "QUIC"}, func() *testMessage { return &testMessage{} })
+	response, err := Unary(ctx, transport, "example.Greeter", "SayHello", &testMessage{Value: "QUIC"}, func() *testMessage { return &testMessage{} })
 	if err != nil {
 		t.Fatalf("quic unary RPC failed: %v", err)
 	}
