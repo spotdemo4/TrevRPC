@@ -12,6 +12,7 @@ package cruntimetest
 #include "trevrpc_msquic.c"
 #include "trevrpc_values.c"
 #include "trevrpc_wire.c"
+#include "trevrpc_webtransport.c"
 #include "trevrpc.c"
 
 static int trevrpc_c_echo_handler(void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
@@ -77,7 +78,7 @@ static int trevrpc_c_call_unary_with_timeout(trevrpc_client* client, const char*
     *out_response = NULL;
 
     trevrpc_msquic_stream* stream = NULL;
-    int err = trevrpc_msquic_conn_open_stream(client->conn, &stream);
+    int err = trevrpc_msquic_conn_open_stream(client->msquic_conn, &stream);
     if (err != 0) {
         return err;
     }
@@ -86,7 +87,12 @@ static int trevrpc_c_call_unary_with_timeout(trevrpc_client* client, const char*
     size_t frame_len = 0;
     err = trevrpc_wire_encode_request(service, method, TREVRPC_RPC_KIND_UNARY, body, body_len, NULL, timeout_nanos, client->max_frame_size, &frame, &frame_len);
     if (err == 0) {
-        err = trevrpc_write_frame(stream, frame, frame_len);
+        intptr_t written = trevrpc_msquic_stream_write(stream, frame, frame_len);
+        if (written < 0) {
+            err = (int)written;
+        } else if ((size_t)written != frame_len) {
+            err = TREV_MSQUIC_ERR_CLOSED;
+        }
     }
     free(frame);
     if (err == 0) {
@@ -138,17 +144,16 @@ func startEchoServer(host, certFile, keyFile string, port uint16) (*runtimeServe
 	cKeyFile := C.CString(keyFile)
 	defer C.free(unsafe.Pointer(cKeyFile))
 
-	serverConfig := C.trevrpc_default_config()
+	serverConfig := C.trevrpc_default_server_config()
+	serverConfig.host = cHost
+	serverConfig.port = C.uint16_t(port)
 	serverConfig.cert_file = cCertFile
 	serverConfig.key_file = cKeyFile
-	wtConfig := C.trevrpc_wt_config{}
-	wtConfig.path = C.CString("/trevrpc")
-	defer C.free(unsafe.Pointer(wtConfig.path))
-	wtConfig.cert_file = cCertFile
-	wtConfig.key_file = cKeyFile
+	serverConfig.webtransport_path = C.CString("/trevrpc")
+	defer C.free(unsafe.Pointer(serverConfig.webtransport_path))
 
 	var server *C.trevrpc_server
-	if code := C.trevrpc_server_listen(cHost, C.uint16_t(port), &wtConfig, &serverConfig, &server); code != 0 {
+	if code := C.trevrpc_server_listen(&serverConfig, &server); code != 0 {
 		return nil, runtimeError("listen", code)
 	}
 

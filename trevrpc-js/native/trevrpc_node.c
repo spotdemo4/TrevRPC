@@ -53,10 +53,6 @@ struct native_server {
     server_route* routes;
     napi_env env;
     napi_threadsafe_function call_tsfn;
-    char* path;
-    char* origin;
-    char* cert_file;
-    char* key_file;
     uint16_t port;
     bool closing;
     bool serving;
@@ -979,10 +975,6 @@ static void native_server_finalize(napi_env env, void* data, void* hint) {
         server->call_tsfn = NULL;
     }
     free_server_routes(env, server->routes);
-    free(server->path);
-    free(server->origin);
-    free(server->cert_file);
-    free(server->key_file);
     pthread_mutex_destroy(&server->mutex);
     free(server);
 }
@@ -1308,26 +1300,24 @@ static napi_value connect_webtransport(napi_env env, napi_callback_info info) {
 static void listen_execute(napi_env env, void* data) {
     (void)env;
     listen_work* work = data;
-    trevrpc_config config = trevrpc_default_config();
+    trevrpc_server_config config = trevrpc_default_server_config();
+    config.host = work->host;
+    config.port = work->port;
     config.cert_file = work->cert_file;
     config.key_file = work->key_file;
     config.keep_alive_ms = 15000;
     config.peer_bidi_stream_count = 128;
     config.max_stateless_operations = 1024;
     config.max_binding_stateless_operations = 256;
+    config.webtransport_path = work->path;
+    config.webtransport_origin = work->origin;
+    config.max_sessions_per_connection = work->max_sessions_per_connection;
+    config.max_streams_per_session = work->max_streams_per_session;
+    config.max_idle_timeout_ms = work->idle_timeout_ms;
     if (work->max_frame_size > 0) {
         config.max_frame_size = work->max_frame_size;
     }
-    trevrpc_wt_config wt_config = {
-        .path = work->path,
-        .origin = work->origin,
-        .cert_file = work->cert_file,
-        .key_file = work->key_file,
-        .max_sessions_per_connection = work->max_sessions_per_connection,
-        .max_streams_per_session = work->max_streams_per_session,
-        .idle_timeout_ms = work->idle_timeout_ms,
-    };
-    work->base.err = trevrpc_server_listen(work->host, work->port, &wt_config, &config, &work->server);
+    work->base.err = trevrpc_server_listen(&config, &work->server);
     if (work->base.err == 0) {
         work->base.err = trevrpc_server_port(work->server, &work->bound_port);
     }
@@ -1350,14 +1340,6 @@ static void listen_complete(napi_env env, napi_status status, void* data) {
             server->server = work->server;
             server->env = env;
             server->port = work->bound_port;
-            server->path = work->path;
-            server->origin = work->origin;
-            server->cert_file = work->cert_file;
-            server->key_file = work->key_file;
-            work->path = NULL;
-            work->origin = NULL;
-            work->cert_file = NULL;
-            work->key_file = NULL;
 
             napi_value callback = NULL;
             napi_value resource_name = NULL;
@@ -1389,10 +1371,6 @@ static void listen_complete(napi_env env, napi_status status, void* data) {
                     napi_release_threadsafe_function(server->call_tsfn, napi_tsfn_abort);
                 }
                 trevrpc_server_close(work->server);
-                free(server->path);
-                free(server->origin);
-                free(server->cert_file);
-                free(server->key_file);
                 pthread_mutex_destroy(&server->mutex);
                 free(server);
                 reject_native_error(env, work->base.deferred, -ENOMEM, "listenWebTransport");

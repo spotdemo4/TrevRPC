@@ -130,14 +130,11 @@ int main(int argc, char** argv) {
     const char* host = argc > 1 ? argv[1] : "127.0.0.1";
     uint16_t port = argc > 2 ? (uint16_t)atoi(argv[2]) : 50051;
 
-    trevrpc_config config = trevrpc_default_config();
-    trevrpc_wt_config wt_config = {
-        .path = "/trevrpc",
-        .cert_file = config.cert_file,
-        .key_file = config.key_file,
-    };
+    trevrpc_server_config config = trevrpc_default_server_config();
+    config.host = host;
+    config.port = port;
     trevrpc_server* server = NULL;
-    int rc = trevrpc_server_listen(host, port, &wt_config, &config, &server);
+    int rc = trevrpc_server_listen(&config, &server);
     if (rc != 0) {
         fprintf(stderr, "listen failed: %s\n", trevrpc_error(rc));
         return 1;

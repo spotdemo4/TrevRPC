@@ -131,8 +131,13 @@ Blocking APIs include `trevrpc_client_connect`, `trevrpc_client_call_unary`, `tr
 To serve native QUIC and WebTransport from one handler registry on one UDP port, create a shared listener. The server routes accepted connections by negotiated ALPN: `trevrpc/1` for native TrevRPC and `h3` for WebTransport.
 
 ```c
+trevrpc_server_config config = trevrpc_default_server_config();
+config.host = "127.0.0.1";
+config.port = 5000;
+config.cert_file = "localhost-cert.pem";
+config.key_file = "localhost-key.pem";
 trevrpc_server* server = NULL;
-trevrpc_server_listen("127.0.0.1", 5000, &wt_config, &config, &server);
+trevrpc_server_listen(&config, &server);
 trevrpc_server_register_unary(server, "svc", "method", handler, NULL);
 trevrpc_server_serve(server);
 ```

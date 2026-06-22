@@ -90,6 +90,27 @@ typedef struct trevrpc_config {
     size_t max_frame_size;
 } trevrpc_config;
 
+typedef struct trevrpc_server_config {
+    const char* host;
+    uint16_t port;
+    const char* cert_file;
+    const char* key_file;
+    const char* webtransport_path;
+    const char* webtransport_origin;
+    uint64_t max_idle_timeout_ms;
+    uint32_t keep_alive_ms;
+    uint16_t peer_bidi_stream_count;
+    uint32_t max_stateless_operations;
+    uint16_t max_binding_stateless_operations;
+    uint32_t max_sessions_per_connection;
+    uint32_t max_streams_per_session;
+    uint64_t max_data_per_session;
+    uint32_t stream_recv_window;
+    uint32_t conn_flow_control_window;
+    uint32_t handshake_timeout_ms;
+    size_t max_frame_size;
+} trevrpc_server_config;
+
 typedef struct trevrpc_server_options {
     int64_t max_concurrent_connections;
     int64_t max_concurrent_streams_per_connection;
@@ -241,6 +262,7 @@ typedef struct trevrpc_logger {
 } trevrpc_logger;
 
 trevrpc_config trevrpc_default_config(void);
+trevrpc_server_config trevrpc_default_server_config(void);
 trevrpc_server_options trevrpc_default_server_options(void);
 
 int trevrpc_call_context_has_deadline(const trevrpc_call_context* context);
@@ -299,11 +321,7 @@ void trevrpc_client_close(trevrpc_client* client);
 
 void trevrpc_request_reset(trevrpc_request* request);
 
-int trevrpc_server_listen(const char* host,
-    uint16_t port,
-    const trevrpc_wt_config* wt_config,
-    const trevrpc_config* config,
-    trevrpc_server** server);
+int trevrpc_server_listen(const trevrpc_server_config* config, trevrpc_server** server);
 int trevrpc_server_port(trevrpc_server* server, uint16_t* port);
 int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_options* options);
 int trevrpc_server_get_options(trevrpc_server* server, trevrpc_server_options* options);

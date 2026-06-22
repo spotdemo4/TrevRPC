@@ -411,7 +411,9 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
         return -EINVAL;
     }
 
-    trevrpc_config server_config = trevrpc_default_config();
+    trevrpc_server_config server_config = trevrpc_default_server_config();
+    server_config.host = "127.0.0.1";
+    server_config.port = 0;
     server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
     server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
     server_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
@@ -419,15 +421,11 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
     server_config.peer_bidi_stream_count = 128;
     server_config.max_stateless_operations = 1024;
     server_config.max_binding_stateless_operations = 256;
+    server_config.webtransport_path = "/trevrpc";
+    server_config.max_sessions_per_connection = 16;
+    server_config.max_streams_per_session = 128;
 
-    trevrpc_wt_config wt_server_config = {
-        .path = "/trevrpc",
-        .max_sessions_per_connection = 16,
-        .max_streams_per_session = 128,
-        .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
-    };
-
-    int err = trevrpc_server_listen("127.0.0.1", 0, &wt_server_config, &server_config, &fixture->server);
+    int err = trevrpc_server_listen(&server_config, &fixture->server);
     if (err != 0) {
         return err;
     }

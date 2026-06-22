@@ -101,6 +101,8 @@ struct trevrpc_server {
     trevrpc_wt_listener* wt_listener;
     trevrpc_msquic_listener* shared_listener;
     trevrpc_wt_config shared_wt_config;
+    char* shared_wt_path;
+    char* shared_wt_origin;
     size_t max_frame_size;
     trevrpc_server_options options;
     pthread_mutex_t mutex;
@@ -156,12 +158,16 @@ static uint32_t trevrpc_status_from_error(int err, const char** message);
 static uint32_t trevrpc_transport_status_from_error(int err, const char** message);
 static uint32_t trevrpc_transport_event_transport(trevrpc_server* server);
 
-static size_t trevrpc_effective_max_frame_size(const trevrpc_config* config) {
-    if (config != NULL && config->max_frame_size > 0) {
-        return config->max_frame_size;
+static size_t trevrpc_effective_max_frame_size(size_t max_frame_size) {
+    if (max_frame_size > 0) {
+        return max_frame_size;
     }
 
     return TREVRPC_DEFAULT_MAX_FRAME_SIZE;
+}
+
+static size_t trevrpc_config_max_frame_size(const trevrpc_config* config) {
+    return trevrpc_effective_max_frame_size(config == NULL ? 0 : config->max_frame_size);
 }
 
 static trevrpc_msquic_config trevrpc_make_msquic_config(const trevrpc_config* config) {
@@ -183,28 +189,114 @@ static trevrpc_msquic_config trevrpc_make_msquic_config(const trevrpc_config* co
     return msquic_config;
 }
 
-static trevrpc_msquic_config trevrpc_make_shared_msquic_config(
-    const trevrpc_config* config, const trevrpc_wt_config* wt_config) {
-    trevrpc_msquic_config msquic_config = trevrpc_make_msquic_config(config);
-    if (wt_config != NULL) {
-        if (msquic_config.cert_file == NULL) {
-            msquic_config.cert_file = wt_config->cert_file;
-        }
-        if (msquic_config.key_file == NULL) {
-            msquic_config.key_file = wt_config->key_file;
-        }
-        if (msquic_config.max_idle_timeout_ms == 0) {
-            msquic_config.max_idle_timeout_ms = wt_config->idle_timeout_ms;
-        }
-        uint32_t wt_stream_count = wt_config->max_streams_per_session;
-        if (wt_stream_count > UINT16_MAX) {
-            wt_stream_count = UINT16_MAX;
-        }
-        if (wt_stream_count > msquic_config.peer_bidi_stream_count) {
-            msquic_config.peer_bidi_stream_count = (uint16_t)wt_stream_count;
-        }
+static trevrpc_server_config trevrpc_effective_server_config(const trevrpc_server_config* config) {
+    trevrpc_server_config effective = trevrpc_default_server_config();
+    if (config == NULL) {
+        return effective;
+    }
+
+    if (config->host != NULL) {
+        effective.host = config->host;
+    }
+    if (config->port != 0) {
+        effective.port = config->port;
+    }
+    if (config->cert_file != NULL) {
+        effective.cert_file = config->cert_file;
+    }
+    if (config->key_file != NULL) {
+        effective.key_file = config->key_file;
+    }
+    if (config->webtransport_path != NULL) {
+        effective.webtransport_path = config->webtransport_path;
+    }
+    if (config->webtransport_origin != NULL) {
+        effective.webtransport_origin = config->webtransport_origin;
+    }
+    if (config->max_idle_timeout_ms != 0) {
+        effective.max_idle_timeout_ms = config->max_idle_timeout_ms;
+    }
+    if (config->keep_alive_ms != 0) {
+        effective.keep_alive_ms = config->keep_alive_ms;
+    }
+    if (config->peer_bidi_stream_count != 0) {
+        effective.peer_bidi_stream_count = config->peer_bidi_stream_count;
+    }
+    if (config->max_stateless_operations != 0) {
+        effective.max_stateless_operations = config->max_stateless_operations;
+    }
+    if (config->max_binding_stateless_operations != 0) {
+        effective.max_binding_stateless_operations = config->max_binding_stateless_operations;
+    }
+    if (config->max_sessions_per_connection != 0) {
+        effective.max_sessions_per_connection = config->max_sessions_per_connection;
+    }
+    if (config->max_streams_per_session != 0) {
+        effective.max_streams_per_session = config->max_streams_per_session;
+    }
+    if (config->max_data_per_session != 0) {
+        effective.max_data_per_session = config->max_data_per_session;
+    }
+    if (config->stream_recv_window != 0) {
+        effective.stream_recv_window = config->stream_recv_window;
+    }
+    if (config->conn_flow_control_window != 0) {
+        effective.conn_flow_control_window = config->conn_flow_control_window;
+    }
+    if (config->handshake_timeout_ms != 0) {
+        effective.handshake_timeout_ms = config->handshake_timeout_ms;
+    }
+    if (config->max_frame_size != 0) {
+        effective.max_frame_size = config->max_frame_size;
+    }
+    return effective;
+}
+
+static trevrpc_msquic_config trevrpc_make_server_msquic_config(const trevrpc_server_config* config) {
+    trevrpc_msquic_config msquic_config = {
+        .cert_file = config->cert_file,
+        .key_file = config->key_file,
+        .max_idle_timeout_ms = config->max_idle_timeout_ms,
+        .keep_alive_ms = config->keep_alive_ms,
+        .peer_bidi_stream_count = config->peer_bidi_stream_count,
+        .max_stateless_operations = config->max_stateless_operations,
+        .max_binding_stateless_operations = config->max_binding_stateless_operations,
+    };
+    uint32_t wt_stream_count = config->max_streams_per_session;
+    if (wt_stream_count > UINT16_MAX) {
+        wt_stream_count = UINT16_MAX;
+    }
+    if (wt_stream_count > msquic_config.peer_bidi_stream_count) {
+        msquic_config.peer_bidi_stream_count = (uint16_t)wt_stream_count;
     }
     return msquic_config;
+}
+
+static trevrpc_wt_config trevrpc_make_server_wt_config(const trevrpc_server_config* config) {
+    return (trevrpc_wt_config){
+        .path = config->webtransport_path,
+        .origin = config->webtransport_origin,
+        .max_sessions_per_connection = config->max_sessions_per_connection,
+        .max_streams_per_session = config->max_streams_per_session,
+        .max_data_per_session = config->max_data_per_session,
+        .stream_recv_window = config->stream_recv_window,
+        .conn_flow_control_window = config->conn_flow_control_window,
+        .idle_timeout_ms = (uint32_t)config->max_idle_timeout_ms,
+        .handshake_timeout_ms = config->handshake_timeout_ms,
+    };
+}
+
+static char* trevrpc_copy_cstring(const char* value) {
+    if (value == NULL) {
+        return NULL;
+    }
+    size_t len = strlen(value);
+    char* copy = malloc(len + 1);
+    if (copy == NULL) {
+        return NULL;
+    }
+    memcpy(copy, value, len + 1);
+    return copy;
 }
 
 static bool trevrpc_alpn_equals(const uint8_t* alpn, size_t alpn_len, const char* expected) {
@@ -217,6 +309,21 @@ trevrpc_config trevrpc_default_config(void) {
     config.max_idle_timeout_ms = 30000;
     config.keep_alive_ms = 15000;
     config.peer_bidi_stream_count = 100;
+    config.max_frame_size = TREVRPC_DEFAULT_MAX_FRAME_SIZE;
+    return config;
+}
+
+trevrpc_server_config trevrpc_default_server_config(void) {
+    trevrpc_server_config config = {0};
+    config.host = "127.0.0.1";
+    config.webtransport_path = "/trevrpc";
+    config.max_idle_timeout_ms = 30000;
+    config.keep_alive_ms = 15000;
+    config.peer_bidi_stream_count = 128;
+    config.max_stateless_operations = 1024;
+    config.max_binding_stateless_operations = 256;
+    config.max_sessions_per_connection = 16;
+    config.max_streams_per_session = 128;
     config.max_frame_size = TREVRPC_DEFAULT_MAX_FRAME_SIZE;
     return config;
 }
@@ -808,7 +915,7 @@ int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config
     if (client == NULL) {
         return -ENOMEM;
     }
-    client->max_frame_size = trevrpc_effective_max_frame_size(config);
+    client->max_frame_size = trevrpc_config_max_frame_size(config);
     client->transport = TREVRPC_TRANSPORT_KIND_MSQUIC;
 
     trevrpc_msquic_config msquic_config = trevrpc_make_msquic_config(config);
@@ -834,7 +941,7 @@ int trevrpc_client_connect_webtransport(
         return -ENOMEM;
     }
     client->transport = TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
-    client->max_frame_size = trevrpc_effective_max_frame_size(config);
+    client->max_frame_size = trevrpc_config_max_frame_size(config);
 
     int err = trevrpc_wt_dial(wt_config, &client->wt_session);
     if (err != 0) {
@@ -1051,7 +1158,7 @@ static bool trevrpc_method_matches(
            memcmp(method->service, service, service_len) == 0 && memcmp(method->method, name, name_len) == 0;
 }
 
-static int trevrpc_server_new(const trevrpc_config* config, trevrpc_server** out_server) {
+static int trevrpc_server_new(size_t max_frame_size, trevrpc_server** out_server) {
     if (out_server == NULL) {
         return -EINVAL;
     }
@@ -1061,7 +1168,7 @@ static int trevrpc_server_new(const trevrpc_config* config, trevrpc_server** out
     if (server == NULL) {
         return -ENOMEM;
     }
-    server->max_frame_size = trevrpc_effective_max_frame_size(config);
+    server->max_frame_size = trevrpc_effective_max_frame_size(max_frame_size);
     server->options = trevrpc_default_server_options();
     pthread_mutex_init(&server->mutex, NULL);
     pthread_cond_init(&server->cond, NULL);
@@ -1069,23 +1176,37 @@ static int trevrpc_server_new(const trevrpc_config* config, trevrpc_server** out
     return 0;
 }
 
-int trevrpc_server_listen(const char* host,
-    uint16_t port,
-    const trevrpc_wt_config* wt_config,
-    const trevrpc_config* config,
-    trevrpc_server** out_server) {
-    if (host == NULL || wt_config == NULL || out_server == NULL) {
+int trevrpc_server_listen(const trevrpc_server_config* config, trevrpc_server** out_server) {
+    if (config == NULL || out_server == NULL) {
         return -EINVAL;
     }
     *out_server = NULL;
 
+    trevrpc_server_config effective = trevrpc_effective_server_config(config);
+    if (effective.host == NULL || effective.cert_file == NULL || effective.key_file == NULL ||
+        effective.max_idle_timeout_ms > UINT32_MAX) {
+        return -EINVAL;
+    }
+
     trevrpc_server* server = NULL;
-    int err = trevrpc_server_new(config, &server);
+    int err = trevrpc_server_new(effective.max_frame_size, &server);
     if (err != 0) {
         return err;
     }
 
-    trevrpc_msquic_config msquic_config = trevrpc_make_shared_msquic_config(config, wt_config);
+    trevrpc_wt_config wt_config = trevrpc_make_server_wt_config(&effective);
+    server->shared_wt_path = trevrpc_copy_cstring(effective.webtransport_path);
+    server->shared_wt_origin = trevrpc_copy_cstring(effective.webtransport_origin);
+    if ((effective.webtransport_path != NULL && server->shared_wt_path == NULL) ||
+        (effective.webtransport_origin != NULL && server->shared_wt_origin == NULL)) {
+        trevrpc_server_close(server);
+        return -ENOMEM;
+    }
+    wt_config.path = server->shared_wt_path;
+    wt_config.origin = server->shared_wt_origin;
+    server->shared_wt_config = wt_config;
+
+    trevrpc_msquic_config msquic_config = trevrpc_make_server_msquic_config(&effective);
     if (msquic_config.cert_file == NULL || msquic_config.key_file == NULL) {
         trevrpc_server_close(server);
         return -EINVAL;
@@ -1094,13 +1215,16 @@ int trevrpc_server_listen(const char* host,
         {.alpn = TREVRPC_ALPN, .alpn_len = (uint32_t)(sizeof(TREVRPC_ALPN) - 1)},
         {.alpn = TREVRPC_H3_ALPN, .alpn_len = (uint32_t)(sizeof(TREVRPC_H3_ALPN) - 1)},
     };
-    err = trevrpc_msquic_listen_alpns(
-        host, port, &msquic_config, alpns, sizeof(alpns) / sizeof(alpns[0]), &server->shared_listener);
+    err = trevrpc_msquic_listen_alpns(effective.host,
+        effective.port,
+        &msquic_config,
+        alpns,
+        sizeof(alpns) / sizeof(alpns[0]),
+        &server->shared_listener);
     if (err != 0) {
         trevrpc_server_close(server);
         return err;
     }
-    server->shared_wt_config = *wt_config;
 
     *out_server = server;
     return 0;
@@ -1129,17 +1253,7 @@ int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_s
     }
     *out_server = NULL;
 
-    trevrpc_server* server = calloc(1, sizeof(*server));
-    if (server == NULL) {
-        return -ENOMEM;
-    }
-    server->max_frame_size = trevrpc_effective_max_frame_size(config);
-    server->options = trevrpc_default_server_options();
-    pthread_mutex_init(&server->mutex, NULL);
-    pthread_cond_init(&server->cond, NULL);
-
-    *out_server = server;
-    return 0;
+    return trevrpc_server_new(config == NULL ? 0 : config->max_frame_size, out_server);
 }
 
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream) {
@@ -2957,6 +3071,8 @@ void trevrpc_server_close(trevrpc_server* server) {
     if (server->shared_listener != NULL) {
         trevrpc_msquic_listener_close(server->shared_listener);
     }
+    free(server->shared_wt_path);
+    free(server->shared_wt_origin);
     trevrpc_method* method = server->methods;
     while (method != NULL) {
         trevrpc_method* next = method->next;
