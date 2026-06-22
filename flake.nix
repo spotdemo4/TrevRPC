@@ -138,12 +138,14 @@
           trevrpc-c = pkgs.stdenv.mkDerivation {
             pname = "trevrpc-c";
             version = "0.1.0";
-            src = ./.;
+            src = ./trevrpc-c;
 
             configurePhase = ''
               runHook preConfigure
               export PATH=${self.packages.${system}.trevrpc-go}/bin:$PATH
-              cmake -S trevrpc-c -B build -DTREVRPC_BUILD_TESTS=ON
+              mkdir -p ../testdata
+              cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
+              cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON
               runHook postConfigure
             '';
 
@@ -170,12 +172,12 @@
             checkPhase = ''
               runHook preCheck
               export HOME=$TMPDIR
-              clang-format --dry-run --Werror $(find trevrpc-c -name '*.c' -o -name '*.h')
-              clang-tidy --quiet $(find trevrpc-c -name '*.c') -- \
+              clang-format --dry-run --Werror $(find bench examples include src tests \( -name '*.c' -o -name '*.h' \))
+              clang-tidy --quiet $(find bench examples src tests -name '*.c') -- \
                 -x c \
                 -std=c11 \
-                -Itrevrpc-c/include \
-                -Itrevrpc-c/src \
+                -Iinclude \
+                -Isrc \
                 -Ibuild/generated-service-test \
                 -Ibuild/generated-greeter-example \
                 -isystem ${pkgs.libmsquic}/include
@@ -339,7 +341,9 @@
             configurePhase = ''
               runHook preConfigure
               export PATH=${self.packages.${system}.trevrpc-go}/bin:$PATH
-              cmake -S trevrpc-c -B build -DTREVRPC_BUILD_TESTS=ON -DTREVRPC_ENABLE_SANITIZERS=ON
+              mkdir -p ../testdata
+              cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
+              cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON -DTREVRPC_ENABLE_SANITIZERS=ON
               runHook postConfigure
             '';
             installPhase = ''
