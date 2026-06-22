@@ -135,60 +135,72 @@
 
         # nix build [#...]
         packages = {
-          trevrpc-c = pkgs.stdenv.mkDerivation {
-            pname = "trevrpc-c";
-            version = "0.1.0";
-            src = ./trevrpc-c;
+          trevrpc-c = pkgs.stdenv.mkDerivation (
+            final: with pkgs.lib; {
+              pname = "trevrpc-c";
+              version = "0.1.0";
+              src = ./trevrpc-c;
 
-            configurePhase = ''
-              runHook preConfigure
-              mkdir -p ../testdata
-              cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
-              cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON
-              runHook postConfigure
-            '';
+              configurePhase = ''
+                runHook preConfigure
+                mkdir -p ../testdata
+                cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
+                cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON
+                runHook postConfigure
+              '';
 
-            nativeBuildInputs = with pkgs; [
-              clang-tools
-              cmake
-              openssl
-              protobuf
-              protobufc
-            ];
-            buildInputs = with pkgs; [
-              libmsquic
-              protobufc
-            ];
-            buildPhase = ''
-              runHook preBuild
-              cmake --build build
-              runHook postBuild
-            '';
+              nativeBuildInputs = with pkgs; [
+                clang-tools
+                cmake
+                openssl
+                protobuf
+                protobufc
+              ];
+              buildInputs = with pkgs; [
+                libmsquic
+                protobufc
+              ];
+              buildPhase = ''
+                runHook preBuild
+                cmake --build build
+                runHook postBuild
+              '';
 
-            doCheck = true;
-            checkPhase = ''
-              runHook preCheck
-              export HOME=$TMPDIR
-              clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' \))
-              clang-tidy --quiet $(find bench examples src tests tools -name '*.c') -- \
-                -x c \
-                -std=c11 \
-                -Iinclude \
-                -Isrc \
-                -Ibuild/protoc-gen-trevrpc-c-protos \
-                -Ibuild/generated-service-test \
-                -Ibuild/generated-greeter-example \
-                -isystem ${pkgs.libmsquic}/include
-              ctest --test-dir build --output-on-failure
-              runHook postCheck
-            '';
+              doCheck = true;
+              checkPhase = ''
+                runHook preCheck
+                export HOME=$TMPDIR
+                clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' \))
+                clang-tidy --quiet $(find bench examples src tests tools -name '*.c') -- \
+                  -x c \
+                  -std=c11 \
+                  -Iinclude \
+                  -Isrc \
+                  -Ibuild/protoc-gen-trevrpc-c-protos \
+                  -Ibuild/generated-service-test \
+                  -Ibuild/generated-greeter-example \
+                  -isystem ${pkgs.libmsquic}/include
+                ctest --test-dir build --output-on-failure
+                runHook postCheck
+              '';
 
-            installPhase = ''
-              runHook preInstall
-              cmake --install build --prefix $out
-              runHook postInstall
-            '';
-          };
+              installPhase = ''
+                runHook preInstall
+                cmake --install build --prefix $out
+                runHook postInstall
+              '';
+
+              meta = {
+                mainProgram = "protoc-gen-trevrpc-c";
+                description = "C runtime and code generator for TrevRPC";
+                license = licenses.mit;
+                platforms = platforms.all;
+                homepage = "https://trev.zip/llc/TrevRPC";
+                changelog = "https://trev.zip/llc/TrevRPC/releases";
+                downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+              };
+            }
+          );
 
           trevrpc-rust = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
