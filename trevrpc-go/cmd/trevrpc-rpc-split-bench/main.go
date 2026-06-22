@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
 )
@@ -34,9 +36,11 @@ var (
 
 type splitGreeter struct{}
 
+type grpcSplitGreeter struct{}
+
 func main() {
 	mode := flag.String("mode", "", "client or server")
-	transport := flag.String("transport", "quic", "quic or msquic")
+	transport := flag.String("transport", "quic", "quic, msquic, or grpc")
 	addr := flag.String("addr", "127.0.0.1:0", "listen or dial address")
 	cert := flag.String("cert", "", "PEM certificate path")
 	key := flag.String("key", "", "PEM private key path")
@@ -62,6 +66,10 @@ func runClient(transportName, addr, certFile string, iterations int) error {
 	if iterations <= 0 {
 		return fmt.Errorf("iterations must be positive")
 	}
+	if transportName == "grpc" {
+		return runGRPCClient(addr, iterations)
+	}
+
 	ctx := context.Background()
 	transport, err := dialTransport(ctx, transportName, addr, certFile)
 	if err != nil {
@@ -98,6 +106,10 @@ func runClient(transportName, addr, certFile string, iterations int) error {
 }
 
 func runServer(transportName, addr, certFile, keyFile string) error {
+	if transportName == "grpc" {
+		return runGRPCServer(addr)
+	}
+
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.GracefulShutdownTimeout = time.Second
@@ -125,6 +137,81 @@ func runServer(transportName, addr, certFile, keyFile string) error {
 		return err
 	}
 	return nil
+}
+
+func runGRPCClient(addr string, iterations int) error {
+	ctx := context.Background()
+	conn, err := grpc.NewClient("passthrough:///"+addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := warmGRPCClient(ctx, conn); err != nil {
+		return err
+	}
+	if err := runCase("unary_round_trip", iterations, func() error {
+		_, err := grpcUnary(ctx, conn)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := runCase("server_stream_16_messages", iterations, func() error {
+		_, err := grpcServerStreaming(ctx, conn)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := runCase("client_stream_16_messages", iterations, func() error {
+		_, err := grpcClientStreaming(ctx, conn)
+		return err
+	}); err != nil {
+		return err
+	}
+	return runCase("bidi_stream_16_messages", iterations, func() error {
+		_, err := grpcBidiStreaming(ctx, conn)
+		return err
+	})
+}
+
+func runGRPCServer(addr string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	server := grpc.NewServer()
+	registerGRPCGreeterServer(server, grpcSplitGreeter{})
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Printf("PORT %d\n", portFromAddr(listener.Addr()))
+
+	select {
+	case err := <-serveDone:
+		if errors.Is(err, grpc.ErrServerStopped) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
+
+	server.Stop()
+	select {
+	case err := <-serveDone:
+		if errors.Is(err, grpc.ErrServerStopped) {
+			return nil
+		}
+		return err
+	case <-time.After(shutdownTimeout):
+		return errors.New("timed out waiting for gRPC server shutdown")
+	}
 }
 
 func dialTransport(ctx context.Context, transportName, addr, certFile string) (trevrpc.ClientTransport, error) {
@@ -311,6 +398,178 @@ func bidiStreaming(ctx context.Context, client *greeter.GreeterClient) (int, err
 	}
 }
 
+func warmGRPCClient(ctx context.Context, conn *grpc.ClientConn) error {
+	if _, err := grpcUnary(ctx, conn); err != nil {
+		return err
+	}
+	if _, err := grpcServerStreaming(ctx, conn); err != nil {
+		return err
+	}
+	if _, err := grpcClientStreaming(ctx, conn); err != nil {
+		return err
+	}
+	_, err := grpcBidiStreaming(ctx, conn)
+	return err
+}
+
+func grpcUnary(ctx context.Context, conn *grpc.ClientConn) (string, error) {
+	response := &greeter.HelloReply{}
+	if err := conn.Invoke(ctx, grpcFullMethod(greeter.MethodSayHello), request, response); err != nil {
+		return "", err
+	}
+	if response.Message != requestName {
+		return "", fmt.Errorf("grpc unary response = %q, want %q", response.Message, requestName)
+	}
+	return response.Message, nil
+}
+
+func grpcServerStreaming(ctx context.Context, conn *grpc.ClientConn) (int, error) {
+	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodLotsOfReplies, false, true), grpcFullMethod(greeter.MethodLotsOfReplies))
+	if err != nil {
+		return 0, err
+	}
+	if err := stream.SendMsg(request); err != nil {
+		return 0, err
+	}
+	if err := stream.CloseSend(); err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for {
+		response := &greeter.HelloReply{}
+		err := stream.RecvMsg(response)
+		if err == io.EOF {
+			if count != streamMessageCount {
+				return 0, fmt.Errorf("grpc server stream count = %d, want %d", count, streamMessageCount)
+			}
+			return count, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		count++
+	}
+}
+
+func grpcClientStreaming(ctx context.Context, conn *grpc.ClientConn) (string, error) {
+	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodLotsOfGreetings, true, false), grpcFullMethod(greeter.MethodLotsOfGreetings))
+	if err != nil {
+		return "", err
+	}
+	for _, request := range requests {
+		if err := stream.SendMsg(request); err != nil {
+			return "", err
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		return "", err
+	}
+
+	response := &greeter.HelloReply{}
+	if err := stream.RecvMsg(response); err != nil {
+		return "", err
+	}
+	if response.Message != fmt.Sprintf("streamed %d greetings", streamMessageCount) {
+		return "", fmt.Errorf("grpc client stream response = %q", response.Message)
+	}
+	return response.Message, nil
+}
+
+func grpcBidiStreaming(ctx context.Context, conn *grpc.ClientConn) (int, error) {
+	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodBidiHello, true, true), grpcFullMethod(greeter.MethodBidiHello))
+	if err != nil {
+		return 0, err
+	}
+	for _, request := range requests {
+		if err := stream.SendMsg(request); err != nil {
+			return 0, err
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for {
+		response := &greeter.HelloReply{}
+		err := stream.RecvMsg(response)
+		if err == io.EOF {
+			if count != streamMessageCount {
+				return 0, fmt.Errorf("grpc bidi stream count = %d, want %d", count, streamMessageCount)
+			}
+			return count, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		count++
+	}
+}
+
+type grpcGreeterServer interface {
+	SayHello(context.Context, *greeter.HelloRequest) (*greeter.HelloReply, error)
+	LotsOfReplies(*greeter.HelloRequest, grpc.ServerStream) error
+	LotsOfGreetings(grpc.ServerStream) error
+	BidiHello(grpc.ServerStream) error
+}
+
+func registerGRPCGreeterServer(server *grpc.Server, implementation grpcGreeterServer) {
+	server.RegisterService(&grpc.ServiceDesc{
+		ServiceName: greeter.ServiceName,
+		HandlerType: (*grpcGreeterServer)(nil),
+		Methods: []grpc.MethodDesc{
+			{MethodName: greeter.MethodSayHello, Handler: grpcSayHelloHandler},
+		},
+		Streams: []grpc.StreamDesc{
+			{StreamName: greeter.MethodLotsOfReplies, Handler: grpcLotsOfRepliesHandler, ServerStreams: true},
+			{StreamName: greeter.MethodLotsOfGreetings, Handler: grpcLotsOfGreetingsHandler, ClientStreams: true},
+			{StreamName: greeter.MethodBidiHello, Handler: grpcBidiHelloHandler, ServerStreams: true, ClientStreams: true},
+		},
+		Metadata: "benchmark.greeter.proto",
+	}, implementation)
+}
+
+func grpcSayHelloHandler(srv any, ctx context.Context, decode func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+	request := &greeter.HelloRequest{}
+	if err := decode(request); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(grpcGreeterServer).SayHello(ctx, request)
+	}
+
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: grpcFullMethod(greeter.MethodSayHello)}
+	handler := func(ctx context.Context, request any) (any, error) {
+		return srv.(grpcGreeterServer).SayHello(ctx, request.(*greeter.HelloRequest))
+	}
+	return interceptor(ctx, request, info, handler)
+}
+
+func grpcLotsOfRepliesHandler(srv any, stream grpc.ServerStream) error {
+	request := &greeter.HelloRequest{}
+	if err := stream.RecvMsg(request); err != nil {
+		return err
+	}
+	return srv.(grpcGreeterServer).LotsOfReplies(request, stream)
+}
+
+func grpcLotsOfGreetingsHandler(srv any, stream grpc.ServerStream) error {
+	return srv.(grpcGreeterServer).LotsOfGreetings(stream)
+}
+
+func grpcBidiHelloHandler(srv any, stream grpc.ServerStream) error {
+	return srv.(grpcGreeterServer).BidiHello(stream)
+}
+
+func grpcFullMethod(method string) string {
+	return "/" + greeter.ServiceName + "/" + method
+}
+
+func grpcStreamDesc(method string, clientStreams, serverStreams bool) *grpc.StreamDesc {
+	return &grpc.StreamDesc{StreamName: method, ClientStreams: clientStreams, ServerStreams: serverStreams}
+}
+
 func makeRequests() []*greeter.HelloRequest {
 	requests := make([]*greeter.HelloRequest, streamMessageCount)
 	for i := range requests {
@@ -364,3 +623,49 @@ func (s *bidiReplies) Recv() (*greeter.HelloReply, error) {
 func (s *bidiReplies) Close() error {
 	return s.requests.Close()
 }
+
+func (grpcSplitGreeter) SayHello(_ context.Context, request *greeter.HelloRequest) (*greeter.HelloReply, error) {
+	return &greeter.HelloReply{Message: request.Name}, nil
+}
+
+func (grpcSplitGreeter) LotsOfReplies(_ *greeter.HelloRequest, stream grpc.ServerStream) error {
+	for range streamMessageCount {
+		if err := stream.SendMsg(&greeter.HelloReply{Message: "server stream"}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (grpcSplitGreeter) LotsOfGreetings(stream grpc.ServerStream) error {
+	count := 0
+	for {
+		request := &greeter.HelloRequest{}
+		err := stream.RecvMsg(request)
+		if err == io.EOF {
+			return stream.SendMsg(&greeter.HelloReply{Message: fmt.Sprintf("streamed %d greetings", count)})
+		}
+		if err != nil {
+			return err
+		}
+		count++
+	}
+}
+
+func (grpcSplitGreeter) BidiHello(stream grpc.ServerStream) error {
+	for {
+		request := &greeter.HelloRequest{}
+		err := stream.RecvMsg(request)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := stream.SendMsg(&greeter.HelloReply{Message: request.Name}); err != nil {
+			return err
+		}
+	}
+}
+
+var _ grpcGreeterServer = grpcSplitGreeter{}

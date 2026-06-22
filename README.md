@@ -18,10 +18,10 @@ nix develop -c bench/run_rpc_comparison.sh
 
 The runner writes normalized CSV and Markdown reports under `target/rpc-comparison/` and keeps raw C, Go, JavaScript, and Rust benchmark output for auditability.
 
-To split client and server measurements for TrevRPC transports, run:
+To split client and server measurements for TrevRPC transports and include the Go gRPC baseline, run:
 
 ```sh
 nix develop -c bench/run_rpc_split.sh
 ```
 
-The split runner writes reports under `target/rpc-split/` with separate `client` and `server` axes. gRPC is intentionally left to the paired comparison until it has a matching split harness.
+The split runner writes reports under `target/rpc-split/` with separate `client`, `server`, and Go gRPC baseline axes.

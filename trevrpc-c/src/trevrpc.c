@@ -1114,6 +1114,13 @@ int trevrpc_client_start_stream(trevrpc_client* client,
         trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
         return err;
     }
+    if (kind == TREVRPC_RPC_KIND_SERVER_STREAMING) {
+        err = trevrpc_client_shutdown_send(client, msquic_stream, wt_stream);
+        if (err != 0) {
+            trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
+            return err;
+        }
+    }
 
     trevrpc_stream* stream = client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC
                                  ? trevrpc_stream_alloc_msquic(msquic_stream, client->max_frame_size, true)
