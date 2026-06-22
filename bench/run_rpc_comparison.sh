@@ -358,8 +358,8 @@ EOF
         }
         function print_table_header(shape) {
             printf "\n### `%s`\n\n", shape
-            print "| Language | Implementation | Measurements | Median latency us/op | Latency min..max us/op | Median throughput ops/s | Iterations/Samples per measurement | Source |"
-            print "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"
+            print "| Language | Implementation | Median latency us/op | Latency min..max us/op | Median throughput ops/s | Source |"
+            print "| --- | --- | ---: | ---: | ---: | --- |"
         }
         NR > 1 {
             id = NR - 1
@@ -367,12 +367,10 @@ EOF
             language[id] = $1
             shape[id] = $2
             implementation[id] = $3
-            measurements[id] = $4
             latency[id] = $5
             latency_min[id] = $6
             latency_max[id] = $7
             throughput[id] = $8 + 0
-            iteration_count[id] = $9
             bytes[id] = $11
             allocs[id] = $12
             source[id] = $13
@@ -391,7 +389,7 @@ EOF
                 print_table_header(current_shape)
                 for (row_index = 1; row_index <= row_count; row_index++) {
                     id = sorted_rows[row_index]
-                    printf "| `%s` | `%s` | %s | %.3f | %.3f..%.3f | %.0f | %s | `%s` |\n", language[id], implementation[id], measurements[id], latency[id], latency_min[id], latency_max[id], throughput[id], iteration_count[id], source[id]
+                    printf "| `%s` | `%s` | %.3f | %.3f..%.3f | %.0f | `%s` |\n", language[id], implementation[id], latency[id], latency_min[id], latency_max[id], throughput[id], source[id]
                 }
             }
         }' "$CSV"

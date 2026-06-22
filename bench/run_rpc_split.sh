@@ -265,8 +265,8 @@ EOF
         }
         function print_table_header(axis, shape) {
             printf "\n### `%s` / `%s`\n\n", axis, shape
-            print "| Client | Server | Measurements | Median latency us/op | Latency min..max us/op | Median throughput ops/s | Iterations per measurement | Source |"
-            print "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"
+            print "| Client | Server | Median latency us/op | Latency min..max us/op | Median throughput ops/s | Source |"
+            print "| --- | --- | ---: | ---: | ---: | --- |"
         }
         NR > 1 {
             id = NR - 1
@@ -275,12 +275,10 @@ EOF
             client[id] = $2
             server[id] = $3
             shape[id] = $4
-            measurements[id] = $5
             latency[id] = $6 + 0
             latency_min[id] = $7
             latency_max[id] = $8
             throughput[id] = $9
-            iterations[id] = $10
             source[id] = $12
             group_key = axis[id] SUBSEP shape[id]
             if (!(group_key in seen_group)) {
@@ -299,7 +297,7 @@ EOF
                 print_table_header(group_axis[group_key], group_shape[group_key])
                 for (row_index = 1; row_index <= row_count; row_index++) {
                     id = sorted_rows[row_index]
-                    printf "| `%s` | `%s` | %s | %.3f | %.3f..%.3f | %.0f | %s | `%s` |\n", client[id], server[id], measurements[id], latency[id], latency_min[id], latency_max[id], throughput[id], iterations[id], source[id]
+                    printf "| `%s` | `%s` | %.3f | %.3f..%.3f | %.0f | `%s` |\n", client[id], server[id], latency[id], latency_min[id], latency_max[id], throughput[id], source[id]
                 }
             }
         }' "$CSV"
