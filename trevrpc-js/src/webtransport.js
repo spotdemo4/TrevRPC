@@ -9,6 +9,12 @@ import {
 } from "./wire.js";
 
 const CancelledStreamReason = new DOMException("TrevRPC stream cancelled", "AbortError");
+const BrowserWebTransportOptionKeys = [
+  "allowPooling",
+  "congestionControl",
+  "requireUnreliable",
+  "serverCertificateHashes",
+];
 
 /** Transport implementation for TrevRPC over WebTransport. */
 export class WebTransportClient {
@@ -25,7 +31,7 @@ export class WebTransportClient {
       throw unavailable("WebTransport is not available in this JavaScript runtime");
     }
 
-    const session = new WebTransportCtor(url, options.webTransportOptions ?? {});
+    const session = new WebTransportCtor(url, webTransportOptions(options));
     await session.ready;
     return new WebTransportClient(session, options);
   }
@@ -125,6 +131,24 @@ export class WebTransportClient {
 
     return this.session.createBidirectionalStream();
   }
+}
+
+function webTransportOptions(options) {
+  const constructorOptions = {};
+  for (const key of BrowserWebTransportOptionKeys) {
+    if (Object.hasOwn(options, key) && options[key] !== undefined) {
+      constructorOptions[key] = options[key];
+    }
+  }
+
+  const nested = options.webTransportOptions;
+  if (nested == null) {
+    return constructorOptions;
+  }
+  if (typeof nested === "object") {
+    return { ...constructorOptions, ...nested };
+  }
+  return nested;
 }
 
 class WebTransportResponseFrameStream {

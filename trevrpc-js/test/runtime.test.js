@@ -75,8 +75,9 @@ test("Node native transport subpath exports without loading the addon", async ()
   assert.equal(typeof NodeServerCall, "function");
 });
 
-test("browser root connectWebTransport creates WebTransport client", async () => {
+test("browser root connectWebTransport flattens browser WebTransport options", async () => {
   let observed;
+  const certificateHash = { algorithm: "sha-256", value: new Uint8Array([1]) };
   class FakeWebTransport {
     constructor(url, options) {
       observed = { url, options };
@@ -90,12 +91,18 @@ test("browser root connectWebTransport creates WebTransport client", async () =>
 
   const transport = await connectWebTransport("https://example.test/trevrpc", {
     WebTransport: FakeWebTransport,
-    webTransportOptions: { allowPooling: false },
+    allowPooling: true,
+    serverCertificateHashes: [certificateHash],
+    webTransportOptions: { allowPooling: false, requireUnreliable: true },
   });
 
   assert.ok(transport instanceof WebTransportClient);
   assert.equal(observed.url, "https://example.test/trevrpc");
-  assert.deepEqual(observed.options, { allowPooling: false });
+  assert.deepEqual(observed.options, {
+    allowPooling: false,
+    requireUnreliable: true,
+    serverCertificateHashes: [certificateHash],
+  });
 
   transport.close({ closeCode: 0, reason: "done" });
 

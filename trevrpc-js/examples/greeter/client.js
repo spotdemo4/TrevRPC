@@ -30,9 +30,7 @@ async function runFromForm(data) {
   let transport;
   try {
     log(`connecting to ${url}`);
-    transport = await connectWebTransport(url, {
-      webTransportOptions: webTransportOptions(certificateHash),
-    });
+    transport = await connectWebTransport(url, webTransportOptions(certificateHash));
     const client = new GreeterClient(transport, {
       timeoutMs: 5_000,
       metadata: token === "" ? {} : { authorization: `Bearer ${token}` },

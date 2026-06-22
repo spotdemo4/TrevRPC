@@ -61,6 +61,7 @@ const reply = await unary<HelloMessage, HelloMessage>(
 reply.value?.toUpperCase();
 
 const connected = await connectWebTransport("https://localhost:50051/trevrpc", {
+  serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(32) }],
   skipCertificateValidation: true,
 });
 connected.close();

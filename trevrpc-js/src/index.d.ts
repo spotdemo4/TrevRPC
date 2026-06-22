@@ -355,7 +355,19 @@ export interface WebTransportConstructorLike {
   new (url: string | URL, options?: unknown): WebTransportSessionLike;
 }
 
-export interface WebTransportClientOptions extends CallOptions {
+export interface WebTransportCertificateHash {
+  algorithm: string;
+  value: BufferSource;
+}
+
+export interface BrowserWebTransportOptions {
+  allowPooling?: boolean;
+  congestionControl?: "default" | "low-latency" | "throughput";
+  requireUnreliable?: boolean;
+  serverCertificateHashes?: readonly WebTransportCertificateHash[];
+}
+
+export interface WebTransportClientOptions extends CallOptions, BrowserWebTransportOptions {
   WebTransport?: WebTransportConstructorLike;
   webTransportOptions?: unknown;
 }

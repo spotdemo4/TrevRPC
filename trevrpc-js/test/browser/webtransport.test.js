@@ -318,9 +318,7 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
       },
     },
   }).lookupType("browser.lifecycle.Message");
-  const transport = await connectWebTransport(webTransportURL, {
-    webTransportOptions: await webTransportOptions(),
-  });
+  const transport = await connectWebTransport(webTransportURL, await webTransportOptions());
   const options = {
     metadata: { authorization: "Bearer trevrpc-example-token" },
     streamIdleTimeoutMs: 10_000,

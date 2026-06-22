@@ -16,16 +16,14 @@ const client = new GreeterClient(transport, { timeoutMs: 5000 });
 const reply = await client.sayHello({ name: "Trev" });
 ```
 
-Browser clients can pass native `WebTransport` constructor options through `webTransportOptions`:
+Browser clients can pass native `WebTransport` constructor options directly:
 
 ```js
 import { connectWebTransport } from "trevrpc-js";
 import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
 
 const transport = await connectWebTransport("https://localhost:50051/trevrpc", {
-  webTransportOptions: {
-    serverCertificateHashes: [certificateHash],
-  },
+  serverCertificateHashes: [certificateHash],
 });
 const client = new GreeterClient(transport);
 ```
