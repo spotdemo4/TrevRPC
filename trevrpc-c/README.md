@@ -165,7 +165,7 @@ High-level stream send/receive calls return `-ETIMEDOUT` after the request deadl
 
 ## WebTransport Implementation
 
-The C WebTransport transport uses an internal MsQuic-backed HTTP/3/WebTransport implementation. It supports the TrevRPC runtime path for unary and streaming RPCs, shared native/WebTransport listeners, plus the low-level `trevrpc_wt_*` listener, session, and bidirectional stream APIs. The implementation intentionally covers the TrevRPC subset first; browser-grade HTTP/3 coverage and datagrams remain follow-up work outside the first-cut migration.
+The C WebTransport transport uses an internal MsQuic-backed HTTP/3/WebTransport implementation. It supports automatic WebTransport draft-15, draft-07, and draft-02 negotiation, the TrevRPC runtime path for unary and streaming RPCs, shared native/WebTransport listeners, plus the low-level `trevrpc_wt_*` listener, session, and bidirectional stream APIs. The implementation intentionally covers the TrevRPC subset first; browser-grade HTTP/3 coverage and datagrams remain follow-up work outside the first-cut migration.
 
 ## Typed Protobuf Boundary
 

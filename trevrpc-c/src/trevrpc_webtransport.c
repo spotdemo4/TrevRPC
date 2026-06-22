@@ -13,10 +13,48 @@
 #define TREV_WT_H3_STREAM_TYPE_CONTROL 0x00
 #define TREV_WT_H3_FRAME_SETTINGS 0x04
 #define TREV_WT_H3_FRAME_HEADERS 0x01
-#define TREV_WT_H3_SETTINGS_WEBTRANSPORT 0x2b603742
+#define TREV_WT_H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY 0x01
+#define TREV_WT_H3_SETTINGS_MAX_FIELD_SECTION_SIZE 0x06
+#define TREV_WT_H3_SETTINGS_QPACK_BLOCKED_STREAMS 0x07
+#define TREV_WT_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL 0x08
+#define TREV_WT_H3_SETTINGS_H3_DATAGRAM 0x33
+#define TREV_WT_H3_SETTINGS_H3_DRAFT04_DATAGRAM 0xffd277
+#define TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_DATA 0x2b61
+#define TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI 0x2b64
+#define TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI 0x2b65
+#define TREV_WT_H3_SETTINGS_WEBTRANSPORT_DRAFT02 0x2b603742
+#define TREV_WT_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07 0xc671706a
+#define TREV_WT_H3_SETTINGS_WT_ENABLED_DRAFT15 0x2c7cf000
+#define TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS 0x14e9cd29
 #define TREV_WT_CONNECT_STATUS_OK 200
 #define TREV_WT_STREAM_TYPE_BIDI 0x41
 #define TREV_WT_STREAM_TYPE_BIDI_LEN 2
+
+typedef enum trevrpc_wt_role {
+    TREV_WT_ROLE_SERVER = 0,
+    TREV_WT_ROLE_CLIENT = 1,
+} trevrpc_wt_role;
+
+typedef enum trevrpc_wt_draft {
+    TREV_WT_DRAFT_NONE = 0,
+    TREV_WT_DRAFT_02 = 2,
+    TREV_WT_DRAFT_07 = 7,
+    TREV_WT_DRAFT_15 = 15,
+} trevrpc_wt_draft;
+
+typedef struct trevrpc_wt_setting_pair {
+    uint64_t id;
+    uint64_t value;
+} trevrpc_wt_setting_pair;
+
+typedef struct trevrpc_wt_peer_settings {
+    bool enable_connect_protocol;
+    bool enable_webtransport_draft02;
+    bool enable_webtransport_draft07;
+    bool enable_webtransport_draft15;
+    bool h3_datagram_rfc;
+    bool h3_datagram_draft04;
+} trevrpc_wt_peer_settings;
 
 struct trevrpc_wt_listener {
     trevrpc_msquic_listener* msquic_listener;
@@ -29,6 +67,8 @@ struct trevrpc_wt_session {
     trevrpc_msquic_stream* local_control;
     trevrpc_msquic_stream* peer_control;
     trevrpc_msquic_stream* connect_stream;
+    uint64_t connect_stream_id;
+    trevrpc_wt_draft draft;
 };
 
 struct trevrpc_wt_stream {
@@ -43,8 +83,11 @@ typedef struct trevrpc_wt_h3_frame {
 typedef struct trevrpc_wt_headers {
     bool method_connect;
     bool protocol_webtransport;
+    bool protocol_webtransport_h3;
     bool scheme_https;
     bool status_200;
+    bool draft02_request;
+    bool draft02_response;
     const uint8_t* path;
     size_t path_len;
     const uint8_t* authority;
@@ -58,7 +101,12 @@ typedef int (*trevrpc_wt_headers_validate_fn)(const trevrpc_wt_headers* headers,
 typedef struct trevrpc_wt_accept_connect_context {
     const char* expected_path;
     const char* expected_origin;
+    trevrpc_wt_draft draft;
 } trevrpc_wt_accept_connect_context;
+
+typedef struct trevrpc_wt_connect_response_context {
+    trevrpc_wt_draft draft;
+} trevrpc_wt_connect_response_context;
 
 static trevrpc_msquic_config trevrpc_wt_msquic_config(const trevrpc_wt_config* config) {
     trevrpc_msquic_config msquic_config = {0};
@@ -210,6 +258,83 @@ static int trevrpc_wt_write_varints(trevrpc_msquic_stream* stream, const uint64_
     return n == (intptr_t)offset ? 0 : TREV_WT_ERR_CLOSED;
 }
 
+static uint64_t trevrpc_wt_configured_session_limit(const trevrpc_wt_config* config) {
+    if (config != NULL && config->max_sessions_per_connection > 0) {
+        return config->max_sessions_per_connection;
+    }
+    return 1;
+}
+
+static bool trevrpc_wt_bool_setting_valid(uint64_t value) {
+    return value <= 1;
+}
+
+static bool trevrpc_wt_valid_session_id(uint64_t stream_id) {
+    return (stream_id & 0x03u) == 0;
+}
+
+static int trevrpc_wt_capture_connect_stream_id(trevrpc_wt_session* session, trevrpc_msquic_stream* stream) {
+    uint64_t stream_id = 0;
+    int err = trevrpc_msquic_stream_id(stream, &stream_id);
+    if (err != 0) {
+        return trevrpc_wt_map_msquic_error(err);
+    }
+    if (!trevrpc_wt_valid_session_id(stream_id)) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    session->connect_stream_id = stream_id;
+    return 0;
+}
+
+static trevrpc_wt_draft trevrpc_wt_select_draft(trevrpc_wt_role role, const trevrpc_wt_peer_settings* settings) {
+    if (settings == NULL) {
+        return TREV_WT_DRAFT_NONE;
+    }
+
+    bool server_peer_can_attempt_draft15 = role == TREV_WT_ROLE_SERVER && settings->h3_datagram_rfc &&
+                                           !settings->enable_webtransport_draft02 &&
+                                           !settings->enable_webtransport_draft07;
+    if (settings->enable_webtransport_draft15 || server_peer_can_attempt_draft15) {
+        return TREV_WT_DRAFT_15;
+    }
+    if (settings->enable_webtransport_draft07) {
+        return TREV_WT_DRAFT_07;
+    }
+    if (settings->enable_webtransport_draft02) {
+        return TREV_WT_DRAFT_02;
+    }
+    return TREV_WT_DRAFT_NONE;
+}
+
+static int trevrpc_wt_validate_settings_for_draft(
+    trevrpc_wt_role role, trevrpc_wt_draft draft, const trevrpc_wt_peer_settings* settings) {
+    if (settings == NULL) {
+        return TREV_WT_ERR_REJECTED;
+    }
+
+    switch (draft) {
+    case TREV_WT_DRAFT_15:
+        if (role == TREV_WT_ROLE_CLIENT && !settings->enable_connect_protocol) {
+            return TREV_WT_ERR_REJECTED;
+        }
+        return settings->h3_datagram_rfc ? 0 : TREV_WT_ERR_REJECTED;
+    case TREV_WT_DRAFT_07:
+        if (role == TREV_WT_ROLE_CLIENT && !settings->enable_connect_protocol) {
+            return TREV_WT_ERR_REJECTED;
+        }
+        return settings->h3_datagram_rfc ? 0 : TREV_WT_ERR_REJECTED;
+    case TREV_WT_DRAFT_02:
+        return (settings->h3_datagram_rfc || settings->h3_datagram_draft04) ? 0 : TREV_WT_ERR_REJECTED;
+    case TREV_WT_DRAFT_NONE:
+    default:
+        return TREV_WT_ERR_REJECTED;
+    }
+}
+
+static const char* trevrpc_wt_protocol_for_draft(trevrpc_wt_draft draft) {
+    return draft == TREV_WT_DRAFT_15 ? "webtransport-h3" : "webtransport";
+}
+
 static int trevrpc_wt_write_all(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
     intptr_t n = trevrpc_msquic_stream_write(stream, data, len);
     if (n < 0) {
@@ -292,6 +417,9 @@ static int trevrpc_wt_header_block_decode(const uint8_t* data, size_t len, trevr
         } else if (name_len == 9 && memcmp(name, ":protocol", 9) == 0 && value_len == 12 &&
                    memcmp(value, "webtransport", 12) == 0) {
             headers->protocol_webtransport = true;
+        } else if (name_len == 9 && memcmp(name, ":protocol", 9) == 0 && value_len == 15 &&
+                   memcmp(value, "webtransport-h3", 15) == 0) {
+            headers->protocol_webtransport_h3 = true;
         } else if (name_len == 7 && memcmp(name, ":scheme", 7) == 0 && value_len == 5 &&
                    memcmp(value, "https", 5) == 0) {
             headers->scheme_https = true;
@@ -306,6 +434,12 @@ static int trevrpc_wt_header_block_decode(const uint8_t* data, size_t len, trevr
             headers->origin_len = (size_t)value_len;
         } else if (name_len == 7 && memcmp(name, ":status", 7) == 0 && value_len == 3 && memcmp(value, "200", 3) == 0) {
             headers->status_200 = true;
+        } else if (name_len == 30 && memcmp(name, "sec-webtransport-http3-draft02", 30) == 0 && value_len == 1 &&
+                   memcmp(value, "1", 1) == 0) {
+            headers->draft02_request = true;
+        } else if (name_len == 28 && memcmp(name, "sec-webtransport-http3-draft", 28) == 0 && value_len == 7 &&
+                   memcmp(value, "draft02", 7) == 0) {
+            headers->draft02_response = true;
         }
     }
     return 0;
@@ -366,14 +500,36 @@ static int trevrpc_wt_read_headers_frame(
 }
 
 static int trevrpc_wt_validate_connect_response(const trevrpc_wt_headers* headers, void* context) {
-    (void)context;
-    return headers->status_200 ? 0 : TREV_WT_ERR_REJECTED;
+    trevrpc_wt_connect_response_context* response_context = context;
+    if (!headers->status_200) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    if (response_context != NULL && response_context->draft == TREV_WT_DRAFT_02 && !headers->draft02_response) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    return 0;
+}
+
+static bool trevrpc_wt_connect_protocol_matches(const trevrpc_wt_headers* headers, trevrpc_wt_draft draft) {
+    switch (draft) {
+    case TREV_WT_DRAFT_15:
+        return headers->protocol_webtransport_h3 || headers->protocol_webtransport;
+    case TREV_WT_DRAFT_07:
+    case TREV_WT_DRAFT_02:
+        return headers->protocol_webtransport;
+    case TREV_WT_DRAFT_NONE:
+    default:
+        return false;
+    }
 }
 
 static int trevrpc_wt_validate_connect_request(const trevrpc_wt_headers* headers, void* context) {
     trevrpc_wt_accept_connect_context* accept_context = context;
-    if (!headers->method_connect || !headers->protocol_webtransport || !headers->scheme_https ||
-        headers->path == NULL || headers->authority == NULL) {
+    if (!headers->method_connect || !trevrpc_wt_connect_protocol_matches(headers, accept_context->draft) ||
+        !headers->scheme_https || headers->path == NULL || headers->authority == NULL) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    if (accept_context->draft == TREV_WT_DRAFT_02 && !headers->draft02_request) {
         return TREV_WT_ERR_REJECTED;
     }
     if (accept_context->expected_path != NULL &&
@@ -395,16 +551,22 @@ static int trevrpc_wt_open_connect_stream(trevrpc_wt_session* session, const tre
     if (err != 0) {
         return trevrpc_wt_map_msquic_error(err);
     }
+    err = trevrpc_wt_capture_connect_stream_id(session, stream);
+    if (err != 0) {
+        trevrpc_msquic_stream_close(stream);
+        return err;
+    }
 
     const char* path = config->path != NULL ? config->path : "/";
     const char* authority = config->url != NULL ? config->url : config->host;
+    const char* protocol = trevrpc_wt_protocol_for_draft(session->draft);
     uint8_t block[1024];
     size_t offset = 0;
     block[offset++] = 0;
     block[offset++] = 0;
     err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":method", "CONNECT");
     if (err == 0) {
-        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":protocol", "webtransport");
+        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":protocol", protocol);
     }
     if (err == 0) {
         err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":scheme", "https");
@@ -418,11 +580,17 @@ static int trevrpc_wt_open_connect_stream(trevrpc_wt_session* session, const tre
     if (err == 0 && config->origin != NULL) {
         err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, "origin", config->origin);
     }
+    if (err == 0 && session->draft == TREV_WT_DRAFT_02) {
+        err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, "sec-webtransport-http3-draft02", "1");
+    }
     if (err == 0) {
         err = trevrpc_wt_write_headers_frame(stream, block, offset);
     }
     if (err == 0) {
-        err = trevrpc_wt_read_headers_frame(stream, trevrpc_wt_validate_connect_response, NULL);
+        trevrpc_wt_connect_response_context context = {
+            .draft = session->draft,
+        };
+        err = trevrpc_wt_read_headers_frame(stream, trevrpc_wt_validate_connect_response, &context);
     }
     if (err != 0) {
         trevrpc_msquic_stream_close(stream);
@@ -440,10 +608,16 @@ static int trevrpc_wt_accept_connect_stream(
     if (err != 0) {
         return trevrpc_wt_map_msquic_error(err);
     }
+    err = trevrpc_wt_capture_connect_stream_id(session, stream);
+    if (err != 0) {
+        trevrpc_msquic_stream_close(stream);
+        return err;
+    }
 
     trevrpc_wt_accept_connect_context context = {
         .expected_path = expected_path,
         .expected_origin = expected_origin,
+        .draft = session->draft,
     };
     err = trevrpc_wt_read_headers_frame(stream, trevrpc_wt_validate_connect_request, &context);
 
@@ -453,6 +627,10 @@ static int trevrpc_wt_accept_connect_stream(
     block[offset++] = 0;
     if (err == 0) {
         err = trevrpc_wt_header_block_put_literal(block, sizeof(block), &offset, ":status", "200");
+    }
+    if (err == 0 && session->draft == TREV_WT_DRAFT_02) {
+        err = trevrpc_wt_header_block_put_literal(
+            block, sizeof(block), &offset, "sec-webtransport-http3-draft", "draft02");
     }
     if (err == 0) {
         err = trevrpc_wt_write_headers_frame(stream, block, offset);
@@ -466,30 +644,71 @@ static int trevrpc_wt_accept_connect_stream(
     return 0;
 }
 
-static int trevrpc_wt_write_control_settings(trevrpc_wt_session* session) {
+static int trevrpc_wt_write_control_settings(trevrpc_wt_session* session, const trevrpc_wt_config* config) {
     trevrpc_msquic_stream* control = NULL;
     int err = trevrpc_msquic_conn_open_stream(session->msquic_conn, &control);
     if (err != 0) {
         return trevrpc_wt_map_msquic_error(err);
     }
 
-    const uint64_t fields[] = {
-        TREV_WT_H3_STREAM_TYPE_CONTROL,
-        TREV_WT_H3_FRAME_SETTINGS,
-        5,
-        TREV_WT_H3_SETTINGS_WEBTRANSPORT,
-        1,
+    uint64_t session_limit = trevrpc_wt_configured_session_limit(config);
+    const trevrpc_wt_setting_pair settings[] = {
+        {TREV_WT_H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0},
+        {TREV_WT_H3_SETTINGS_QPACK_BLOCKED_STREAMS, 0},
+        {TREV_WT_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1},
+        {TREV_WT_H3_SETTINGS_WT_ENABLED_DRAFT15, 1},
+        {TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS, session_limit},
+        {TREV_WT_H3_SETTINGS_WEBTRANSPORT_DRAFT02, 1},
+        {TREV_WT_H3_SETTINGS_H3_DATAGRAM, 1},
+        {TREV_WT_H3_SETTINGS_H3_DRAFT04_DATAGRAM, 1},
+        {TREV_WT_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, session_limit},
+        {TREV_WT_H3_SETTINGS_MAX_FIELD_SECTION_SIZE, 4096},
     };
-    err = trevrpc_wt_write_varints(control, fields, sizeof(fields) / sizeof(fields[0]));
+
+    size_t payload_len = 0;
+    for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
+        payload_len += trevrpc_wt_varint_len(settings[i].id) + trevrpc_wt_varint_len(settings[i].value);
+    }
+
+    uint8_t buffer[256];
+    size_t offset = 0;
+    size_t written = 0;
+    err = trevrpc_wt_varint_write(buffer + offset, sizeof(buffer) - offset, TREV_WT_H3_STREAM_TYPE_CONTROL, &written);
+    if (err == 0) {
+        offset += written;
+        err = trevrpc_wt_varint_write(buffer + offset, sizeof(buffer) - offset, TREV_WT_H3_FRAME_SETTINGS, &written);
+    }
+    if (err == 0) {
+        offset += written;
+        err = trevrpc_wt_varint_write(buffer + offset, sizeof(buffer) - offset, payload_len, &written);
+    }
+    if (err == 0) {
+        offset += written;
+        for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
+            err = trevrpc_wt_varint_write(buffer + offset, sizeof(buffer) - offset, settings[i].id, &written);
+            if (err != 0) {
+                break;
+            }
+            offset += written;
+            err = trevrpc_wt_varint_write(buffer + offset, sizeof(buffer) - offset, settings[i].value, &written);
+            if (err != 0) {
+                break;
+            }
+            offset += written;
+        }
+    }
+    if (err == 0) {
+        err = trevrpc_wt_write_all(control, buffer, offset);
+    }
     session->local_control = control;
     return err;
 }
 
-static int trevrpc_wt_read_settings_payload(trevrpc_msquic_stream* control, uint64_t len) {
+static int trevrpc_wt_read_settings_payload(
+    trevrpc_msquic_stream* control, uint64_t len, trevrpc_wt_peer_settings* settings) {
     uint8_t payload[4096];
     size_t payload_len = (size_t)len;
     size_t offset = 0;
-    bool has_webtransport = false;
     int err = trevrpc_wt_read_exact(control, payload, payload_len);
     if (err != 0) {
         return err;
@@ -506,15 +725,50 @@ static int trevrpc_wt_read_settings_payload(trevrpc_msquic_stream* control, uint
         if (err != 0) {
             return TREV_WT_ERR_REJECTED;
         }
-        if (id == TREV_WT_H3_SETTINGS_WEBTRANSPORT && value == 1) {
-            has_webtransport = true;
+        switch (id) {
+        case TREV_WT_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL:
+            if (!trevrpc_wt_bool_setting_valid(value)) {
+                return TREV_WT_ERR_REJECTED;
+            }
+            settings->enable_connect_protocol = value == 1;
+            break;
+        case TREV_WT_H3_SETTINGS_WEBTRANSPORT_DRAFT02:
+            if (!trevrpc_wt_bool_setting_valid(value)) {
+                return TREV_WT_ERR_REJECTED;
+            }
+            settings->enable_webtransport_draft02 = value == 1;
+            break;
+        case TREV_WT_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07:
+            settings->enable_webtransport_draft07 = value != 0;
+            break;
+        case TREV_WT_H3_SETTINGS_WT_ENABLED_DRAFT15:
+            settings->enable_webtransport_draft15 = value != 0;
+            break;
+        case TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS:
+            settings->enable_webtransport_draft15 = value != 0;
+            break;
+        case TREV_WT_H3_SETTINGS_H3_DATAGRAM:
+            if (!trevrpc_wt_bool_setting_valid(value)) {
+                return TREV_WT_ERR_REJECTED;
+            }
+            settings->h3_datagram_rfc = value == 1;
+            break;
+        case TREV_WT_H3_SETTINGS_H3_DRAFT04_DATAGRAM:
+            if (!trevrpc_wt_bool_setting_valid(value)) {
+                return TREV_WT_ERR_REJECTED;
+            }
+            settings->h3_datagram_draft04 = value == 1;
+            break;
+        default:
+            break;
         }
     }
 
-    return has_webtransport ? 0 : TREV_WT_ERR_REJECTED;
+    return 0;
 }
 
-static int trevrpc_wt_read_peer_control_settings(trevrpc_wt_session* session) {
+static int trevrpc_wt_read_peer_control_settings(
+    trevrpc_wt_session* session, trevrpc_wt_role role, trevrpc_wt_peer_settings* settings) {
     trevrpc_msquic_stream* control = NULL;
     int err = trevrpc_msquic_conn_accept_stream(session->msquic_conn, &control);
     if (err != 0) {
@@ -539,19 +793,25 @@ static int trevrpc_wt_read_peer_control_settings(trevrpc_wt_session* session) {
     }
 
     if (err == 0) {
-        err = trevrpc_wt_read_settings_payload(control, frame.len);
+        err = trevrpc_wt_read_settings_payload(control, frame.len, settings);
+    }
+    if (err == 0) {
+        session->draft = trevrpc_wt_select_draft(role, settings);
+        err = trevrpc_wt_validate_settings_for_draft(role, session->draft, settings);
     }
 
     session->peer_control = control;
     return err;
 }
 
-static int trevrpc_wt_h3_handshake(trevrpc_wt_session* session) {
-    int err = trevrpc_wt_write_control_settings(session);
+static int trevrpc_wt_h3_handshake(trevrpc_wt_session* session, const trevrpc_wt_config* config, trevrpc_wt_role role) {
+    int err = trevrpc_wt_write_control_settings(session, config);
     if (err != 0) {
         return err;
     }
-    return trevrpc_wt_read_peer_control_settings(session);
+    trevrpc_wt_peer_settings peer_settings = {0};
+    err = trevrpc_wt_read_peer_control_settings(session, role, &peer_settings);
+    return err;
 }
 
 static trevrpc_wt_stream* trevrpc_wt_stream_alloc(trevrpc_msquic_stream* msquic_stream) {
@@ -620,7 +880,7 @@ int trevrpc_wt_accept_session_from_msquic(
         return -ENOMEM;
     }
     session->msquic_conn = conn;
-    int err = trevrpc_wt_h3_handshake(session);
+    int err = trevrpc_wt_h3_handshake(session, config, TREV_WT_ROLE_SERVER);
     if (err != 0) {
         trevrpc_wt_session_close(session);
         return err;
@@ -672,7 +932,7 @@ int trevrpc_wt_dial(const trevrpc_wt_config* config, trevrpc_wt_session** out_se
         return trevrpc_wt_map_msquic_error(err);
     }
 
-    err = trevrpc_wt_h3_handshake(session);
+    err = trevrpc_wt_h3_handshake(session, config, TREV_WT_ROLE_CLIENT);
     if (err != 0) {
         trevrpc_wt_session_close(session);
         return err;
@@ -713,6 +973,16 @@ int trevrpc_wt_session_accept_stream(trevrpc_wt_session* session, trevrpc_wt_str
         trevrpc_msquic_stream_close(msquic_stream);
         return TREV_WT_ERR_REJECTED;
     }
+    uint64_t session_id = 0;
+    err = trevrpc_wt_read_varint(msquic_stream, &session_id);
+    if (err != 0) {
+        trevrpc_msquic_stream_close(msquic_stream);
+        return err;
+    }
+    if (session_id != session->connect_stream_id || !trevrpc_wt_valid_session_id(session_id)) {
+        trevrpc_msquic_stream_close(msquic_stream);
+        return TREV_WT_ERR_REJECTED;
+    }
 
     trevrpc_wt_stream* stream = trevrpc_wt_stream_alloc(msquic_stream);
     if (stream == NULL) {
@@ -738,8 +1008,8 @@ int trevrpc_wt_session_open_stream(trevrpc_wt_session* session, trevrpc_wt_strea
         return trevrpc_wt_map_msquic_error(err);
     }
 
-    const uint64_t stream_type[] = {TREV_WT_STREAM_TYPE_BIDI};
-    err = trevrpc_wt_write_varints(msquic_stream, stream_type, 1);
+    const uint64_t stream_header[] = {TREV_WT_STREAM_TYPE_BIDI, session->connect_stream_id};
+    err = trevrpc_wt_write_varints(msquic_stream, stream_header, sizeof(stream_header) / sizeof(stream_header[0]));
     if (err != 0) {
         trevrpc_msquic_stream_close(msquic_stream);
         return err;
@@ -847,7 +1117,7 @@ const char* trevrpc_wt_error(int code) {
     case TREV_WT_ERR_FRAME_TOO_LARGE:
         return "frame too large";
     case TREV_WT_ERR_REJECTED:
-        return "WebTransport support is not implemented";
+        return "WebTransport negotiation rejected";
     case -ENOMEM:
     case ENOMEM:
         return "out of memory";

@@ -75,6 +75,11 @@ typedef struct malformed_wt_peer_case {
     size_t headers_len;
 } malformed_wt_peer_case;
 
+typedef struct wt_setting_pair {
+    uint64_t id;
+    uint64_t value;
+} wt_setting_pair;
+
 static const trevrpc_msquic_config test_config = {
     .alpn = "trevrpc",
     .alpn_len = 7,
@@ -90,6 +95,14 @@ static const trevrpc_msquic_config test_h3_config = {
     .key_file = TREVRPC_MSQUIC_TEST_KEY,
     .peer_bidi_stream_count = 8,
 };
+
+#define TEST_WT_SETTINGS_ENABLE_CONNECT_PROTOCOL 0x08
+#define TEST_WT_SETTINGS_H3_DATAGRAM 0x33
+#define TEST_WT_SETTINGS_H3_DRAFT04_DATAGRAM 0xffd277
+#define TEST_WT_SETTINGS_WEBTRANSPORT_DRAFT02 0x2b603742
+#define TEST_WT_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07 0xc671706a
+#define TEST_WT_SETTINGS_WT_ENABLED_DRAFT15 0x2c7cf000
+#define TEST_WT_SETTINGS_WT_MAX_SESSIONS 0x14e9cd29
 
 static void* accept_conn_thread(void* arg) {
     accept_args* args = arg;
@@ -237,6 +250,56 @@ static int test_varint_write(uint8_t* out, size_t out_len, size_t* offset, uint6
     return 0;
 }
 
+static int test_build_control_settings(
+    uint8_t* out, size_t out_len, size_t* out_written, const wt_setting_pair* settings, size_t settings_len) {
+    uint8_t payload[256];
+    size_t payload_offset = 0;
+    size_t offset = 0;
+
+    for (size_t i = 0; i < settings_len; i++) {
+        if (test_varint_write(payload, sizeof(payload), &payload_offset, settings[i].id) != 0 ||
+            test_varint_write(payload, sizeof(payload), &payload_offset, settings[i].value) != 0) {
+            return -1;
+        }
+    }
+
+    if (test_varint_write(out, out_len, &offset, 0x00) != 0 || test_varint_write(out, out_len, &offset, 0x04) != 0 ||
+        test_varint_write(out, out_len, &offset, payload_offset) != 0 || out_len - offset < payload_offset) {
+        return -1;
+    }
+    memcpy(out + offset, payload, payload_offset);
+    offset += payload_offset;
+    *out_written = offset;
+    return 0;
+}
+
+static int test_build_draft02_control_settings(uint8_t* out, size_t out_len, size_t* out_written) {
+    const wt_setting_pair settings[] = {
+        {TEST_WT_SETTINGS_WEBTRANSPORT_DRAFT02, 1},
+        {TEST_WT_SETTINGS_H3_DRAFT04_DATAGRAM, 1},
+    };
+    return test_build_control_settings(out, out_len, out_written, settings, sizeof(settings) / sizeof(settings[0]));
+}
+
+static int test_build_draft07_control_settings(uint8_t* out, size_t out_len, size_t* out_written) {
+    const wt_setting_pair settings[] = {
+        {TEST_WT_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1},
+        {TEST_WT_SETTINGS_H3_DATAGRAM, 1},
+        {TEST_WT_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1},
+    };
+    return test_build_control_settings(out, out_len, out_written, settings, sizeof(settings) / sizeof(settings[0]));
+}
+
+static int test_build_draft15_control_settings(uint8_t* out, size_t out_len, size_t* out_written) {
+    const wt_setting_pair settings[] = {
+        {TEST_WT_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1},
+        {TEST_WT_SETTINGS_H3_DATAGRAM, 1},
+        {TEST_WT_SETTINGS_WT_ENABLED_DRAFT15, 1},
+        {TEST_WT_SETTINGS_WT_MAX_SESSIONS, 1},
+    };
+    return test_build_control_settings(out, out_len, out_written, settings, sizeof(settings) / sizeof(settings[0]));
+}
+
 static int test_header_block_put_literal(
     uint8_t* out, size_t out_len, size_t* offset, const char* name, const char* value) {
     size_t name_len = strlen(name);
@@ -265,7 +328,8 @@ static int test_build_connect_headers(uint8_t* out,
     const char* protocol,
     const char* scheme,
     const char* path,
-    const char* authority) {
+    const char* authority,
+    bool draft02_request) {
     size_t block_offset = 0;
     size_t offset = 0;
     uint8_t block[512];
@@ -286,6 +350,10 @@ static int test_build_connect_headers(uint8_t* out,
         return -1;
     }
     if (path != NULL && test_header_block_put_literal(block, sizeof(block), &block_offset, ":path", path) != 0) {
+        return -1;
+    }
+    if (draft02_request && test_header_block_put_literal(
+                               block, sizeof(block), &block_offset, "sec-webtransport-http3-draft02", "1") != 0) {
         return -1;
     }
 
@@ -550,6 +618,101 @@ cleanup:
     return result;
 }
 
+static int run_wt_accepts_raw_peer_case(
+    const uint8_t* control, size_t control_len, const char* protocol, bool draft02_request) {
+    int result = 1;
+    trevrpc_wt_listener* listener = NULL;
+    trevrpc_msquic_conn* client_conn = NULL;
+    trevrpc_msquic_stream* local_control = NULL;
+    trevrpc_msquic_stream* peer_control = NULL;
+    trevrpc_msquic_stream* connect_stream = NULL;
+    wt_accept_args accept_args = {0};
+    pthread_t accept_thread = {0};
+    bool accept_thread_started = false;
+    uint8_t server_control[128];
+    uint8_t headers[512];
+    size_t headers_len = 0;
+    uint16_t port = 0;
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .path = "/trevrpc",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+    };
+
+    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
+    CHECK_GOTO(trevrpc_wt_listener_port(listener, &port) == 0);
+    accept_args.listener = listener;
+    CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_wt_session_thread, &accept_args) == 0);
+    accept_thread_started = true;
+    CHECK_GOTO(trevrpc_msquic_dial("127.0.0.1", port, &test_h3_config, &client_conn) == 0);
+
+    CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &local_control) == 0);
+    CHECK_GOTO(trevrpc_msquic_stream_write(local_control, control, control_len) == (intptr_t)control_len);
+    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &peer_control) == 0);
+    CHECK_GOTO(trevrpc_msquic_stream_read(peer_control, server_control, sizeof(server_control)) > 0);
+
+    CHECK_GOTO(test_build_connect_headers(headers,
+                   sizeof(headers),
+                   &headers_len,
+                   "CONNECT",
+                   protocol,
+                   "https",
+                   "/trevrpc",
+                   "127.0.0.1",
+                   draft02_request) == 0);
+    CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &connect_stream) == 0);
+    CHECK_GOTO(trevrpc_msquic_stream_write(connect_stream, headers, headers_len) == (intptr_t)headers_len);
+
+    CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
+    accept_thread_started = false;
+    CHECK_EQ_GOTO(accept_args.result, 0);
+    CHECK_GOTO(accept_args.session != NULL);
+
+    result = 0;
+
+cleanup:
+    if (accept_thread_started) {
+        trevrpc_wt_listener_shutdown(listener);
+        (void)pthread_join(accept_thread, NULL);
+    }
+    trevrpc_msquic_stream_close(connect_stream);
+    trevrpc_msquic_stream_close(peer_control);
+    trevrpc_msquic_stream_close(local_control);
+    trevrpc_msquic_conn_close(client_conn);
+    trevrpc_wt_session_close(accept_args.session);
+    trevrpc_wt_listener_close(listener);
+    return result;
+}
+
+static int test_webtransport_accepts_draft02_peer(void) {
+    uint8_t control[64];
+    size_t control_len = 0;
+    if (test_build_draft02_control_settings(control, sizeof(control), &control_len) != 0) {
+        return 1;
+    }
+    return run_wt_accepts_raw_peer_case(control, control_len, "webtransport", true);
+}
+
+static int test_webtransport_accepts_draft07_peer(void) {
+    uint8_t control[64];
+    size_t control_len = 0;
+    if (test_build_draft07_control_settings(control, sizeof(control), &control_len) != 0) {
+        return 1;
+    }
+    return run_wt_accepts_raw_peer_case(control, control_len, "webtransport", false);
+}
+
+static int test_webtransport_accepts_draft15_peer(void) {
+    uint8_t control[64];
+    size_t control_len = 0;
+    if (test_build_draft15_control_settings(control, sizeof(control), &control_len) != 0) {
+        return 1;
+    }
+    return run_wt_accepts_raw_peer_case(control, control_len, "webtransport-h3", false);
+}
+
 static int test_webtransport_rejects_malformed_control_stream_type(void) {
     const uint8_t control[] = {0x01, 0x04, 0x00};
     const malformed_wt_peer_case test_case = {
@@ -578,11 +741,15 @@ static int test_webtransport_rejects_malformed_settings_payload(void) {
 }
 
 static int test_webtransport_rejects_malformed_qpack_block(void) {
-    const uint8_t control[] = {0x00, 0x04, 0x05, 0xab, 0x60, 0x37, 0x42, 0x01};
+    uint8_t control[64];
+    size_t control_len = 0;
     const uint8_t headers[] = {0x01, 0x03, 0x00, 0x00, 0x80};
+    if (test_build_draft02_control_settings(control, sizeof(control), &control_len) != 0) {
+        return 1;
+    }
     const malformed_wt_peer_case test_case = {
         .control = control,
-        .control_len = sizeof(control),
+        .control_len = control_len,
         .headers = headers,
         .headers_len = sizeof(headers),
     };
@@ -591,15 +758,18 @@ static int test_webtransport_rejects_malformed_qpack_block(void) {
 
 static int test_webtransport_rejects_missing_connect_pseudo_header(void) {
     int result = 1;
+    uint8_t control[64];
+    size_t control_len = 0;
     uint8_t headers[512];
     size_t headers_len = 0;
-    const uint8_t control[] = {0x00, 0x04, 0x05, 0xab, 0x60, 0x37, 0x42, 0x01};
 
-    CHECK_GOTO(test_build_connect_headers(
-                   headers, sizeof(headers), &headers_len, "CONNECT", "webtransport", "https", NULL, "127.0.0.1") == 0);
+    CHECK_GOTO(test_build_draft02_control_settings(control, sizeof(control), &control_len) == 0);
+    CHECK_GOTO(
+        test_build_connect_headers(
+            headers, sizeof(headers), &headers_len, "CONNECT", "webtransport", "https", NULL, "127.0.0.1", false) == 0);
     const malformed_wt_peer_case test_case = {
         .control = control,
-        .control_len = sizeof(control),
+        .control_len = control_len,
         .headers = headers,
         .headers_len = headers_len,
     };
@@ -612,16 +782,19 @@ cleanup:
 
 static int test_webtransport_rejects_invalid_connect_method(void) {
     int result = 1;
+    uint8_t control[64];
+    size_t control_len = 0;
     uint8_t headers[512];
     size_t headers_len = 0;
-    const uint8_t control[] = {0x00, 0x04, 0x05, 0xab, 0x60, 0x37, 0x42, 0x01};
 
+    CHECK_GOTO(test_build_draft02_control_settings(control, sizeof(control), &control_len) == 0);
     CHECK_GOTO(
         test_build_connect_headers(
-            headers, sizeof(headers), &headers_len, "GET", "webtransport", "https", "/trevrpc", "127.0.0.1") == 0);
+            headers, sizeof(headers), &headers_len, "GET", "webtransport", "https", "/trevrpc", "127.0.0.1", false) ==
+        0);
     const malformed_wt_peer_case test_case = {
         .control = control,
-        .control_len = sizeof(control),
+        .control_len = control_len,
         .headers = headers,
         .headers_len = headers_len,
     };
@@ -816,6 +989,15 @@ int main(void) {
         return 1;
     }
     if (test_webtransport_rejects_path_mismatch() != 0) {
+        return 1;
+    }
+    if (test_webtransport_accepts_draft02_peer() != 0) {
+        return 1;
+    }
+    if (test_webtransport_accepts_draft07_peer() != 0) {
+        return 1;
+    }
+    if (test_webtransport_accepts_draft15_peer() != 0) {
         return 1;
     }
     if (test_webtransport_rejects_malformed_control_stream_type() != 0) {

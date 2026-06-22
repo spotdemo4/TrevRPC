@@ -169,6 +169,7 @@
             doCheck = true;
             checkPhase = ''
               runHook preCheck
+              export HOME=$TMPDIR
               clang-format --dry-run --Werror $(find trevrpc-c -name '*.c' -o -name '*.h')
               clang-tidy --quiet $(find trevrpc-c -name '*.c') -- \
                 -x c \

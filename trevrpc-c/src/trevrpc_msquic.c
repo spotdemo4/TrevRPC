@@ -721,6 +721,24 @@ int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_st
     return 0;
 }
 
+int trevrpc_msquic_stream_id(trevrpc_msquic_stream* stream, uint64_t* out_stream_id) {
+    if (stream == NULL || out_stream_id == NULL) {
+        return EINVAL;
+    }
+
+    pthread_mutex_lock(&stream->mutex);
+    HQUIC handle = stream->handle;
+    if (handle == NULL) {
+        pthread_mutex_unlock(&stream->mutex);
+        return TREV_MSQUIC_ERR_CLOSED;
+    }
+    pthread_mutex_unlock(&stream->mutex);
+
+    uint32_t stream_id_len = sizeof(*out_stream_id);
+    QUIC_STATUS status = TrevMsQuic->GetParam(handle, QUIC_PARAM_STREAM_ID, &stream_id_len, out_stream_id);
+    return QUIC_FAILED(status) ? (int)status : 0;
+}
+
 void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn) {
     if (conn == NULL) {
         return;

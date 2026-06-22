@@ -54,6 +54,7 @@ int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_st
 void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn);
 void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn);
 
+int trevrpc_msquic_stream_id(trevrpc_msquic_stream* stream, uint64_t* stream_id);
 intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
 intptr_t trevrpc_msquic_stream_read_frame_timeout(
