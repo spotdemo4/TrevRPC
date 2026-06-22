@@ -142,7 +142,6 @@
 
             configurePhase = ''
               runHook preConfigure
-              export PATH=${self.packages.${system}.trevrpc-go}/bin:$PATH
               mkdir -p ../testdata
               cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
               cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON
@@ -162,8 +161,6 @@
             ];
             buildPhase = ''
               runHook preBuild
-              export GOCACHE=$TMPDIR/go-cache
-              export GOMODCACHE=$TMPDIR/go-mod-cache
               cmake --build build
               runHook postBuild
             '';
@@ -172,12 +169,13 @@
             checkPhase = ''
               runHook preCheck
               export HOME=$TMPDIR
-              clang-format --dry-run --Werror $(find bench examples include src tests \( -name '*.c' -o -name '*.h' \))
-              clang-tidy --quiet $(find bench examples src tests -name '*.c') -- \
+              clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' \))
+              clang-tidy --quiet $(find bench examples src tests tools -name '*.c') -- \
                 -x c \
                 -std=c11 \
                 -Iinclude \
                 -Isrc \
+                -Ibuild/protoc-gen-trevrpc-c-protos \
                 -Ibuild/generated-service-test \
                 -Ibuild/generated-greeter-example \
                 -isystem ${pkgs.libmsquic}/include
@@ -233,7 +231,6 @@
               src = ./trevrpc-go;
               vendorHash = "sha256-iE1MhGE0XVsNR1bh5ETnKNEdiQafriz1eI9gAZN5uHk=";
               subPackages = [
-                "cmd/protoc-gen-trevrpc-c"
                 "cmd/protoc-gen-trevrpc-go"
               ];
 
@@ -340,7 +337,6 @@
           c-sanitizers = self.packages.${system}.trevrpc-c.overrideAttrs {
             configurePhase = ''
               runHook preConfigure
-              export PATH=${self.packages.${system}.trevrpc-go}/bin:$PATH
               mkdir -p ../testdata
               cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
               cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON -DTREVRPC_ENABLE_SANITIZERS=ON

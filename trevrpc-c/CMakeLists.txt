@@ -9,12 +9,19 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(trevrpc_default_build_codegen ON)
+else()
+    set(trevrpc_default_build_codegen OFF)
+endif()
+
 option(TREVRPC_BUILD_TESTS "Build trevrpc-c tests" ON)
 option(TREVRPC_BUILD_BENCHMARKS "Build trevrpc-c benchmark executables" OFF)
 option(TREVRPC_BUILD_EXAMPLES "Build trevrpc-c example executables" "${TREVRPC_BUILD_TESTS}")
 option(TREVRPC_BUILD_MSQUIC "Build trevrpc-c MsQuic transport" ON)
 option(TREVRPC_BUILD_WEBTRANSPORT "Build trevrpc-c WebTransport transport" ON)
 option(TREVRPC_BUILD_RUNTIME "Build trevrpc-c high-level runtime" ON)
+option(TREVRPC_BUILD_CODEGEN "Build protoc-gen-trevrpc-c" "${trevrpc_default_build_codegen}")
 option(TREVRPC_INSTALL_INTERNAL_HEADERS "Install trevrpc-c internal headers for tests and development" OFF)
 option(TREVRPC_ENABLE_SANITIZERS "Build trevrpc-c with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
@@ -115,23 +122,65 @@ if(TREVRPC_BUILD_RUNTIME)
     configure_file(cmake/trevrpc.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc.pc" @ONLY)
 endif()
 
+set(trevrpc_needs_generated_bindings OFF)
 if(TREVRPC_BUILD_RUNTIME AND (TREVRPC_BUILD_TESTS OR TREVRPC_BUILD_BENCHMARKS OR TREVRPC_BUILD_EXAMPLES))
-    find_program(PROTOC_EXECUTABLE protoc REQUIRED)
+    set(trevrpc_needs_generated_bindings ON)
+endif()
+
+set(TREVRPC_C_GENERATOR_EXECUTABLE "" CACHE FILEPATH "Path to a build-machine protoc-gen-trevrpc-c executable")
+set(trevrpc_c_generator_dependency)
+if(TREVRPC_BUILD_CODEGEN OR trevrpc_needs_generated_bindings)
     find_program(PROTOC_C_EXECUTABLE protoc-c REQUIRED)
-    find_program(TREVRPC_C_GENERATOR_EXECUTABLE protoc-gen-trevrpc-c)
 
     if(NOT TREVRPC_C_GENERATOR_EXECUTABLE)
-        set(trevrpc_generator_build_dir "${CMAKE_CURRENT_BINARY_DIR}/protoc-gen-trevrpc-c-build")
-        find_program(GO_EXECUTABLE go REQUIRED)
-        set(TREVRPC_C_GENERATOR_EXECUTABLE "${trevrpc_generator_build_dir}/protoc-gen-trevrpc-c")
-        add_custom_command(
-            OUTPUT "${TREVRPC_C_GENERATOR_EXECUTABLE}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${trevrpc_generator_build_dir}"
-            COMMAND "${CMAKE_COMMAND}" -E chdir "${CMAKE_CURRENT_SOURCE_DIR}/../trevrpc-go" "${GO_EXECUTABLE}" build -o "${TREVRPC_C_GENERATOR_EXECUTABLE}" ./cmd/protoc-gen-trevrpc-c
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../trevrpc-go/cmd/protoc-gen-trevrpc-c/main.go"
-            VERBATIM
-        )
+        if(CMAKE_CROSSCOMPILING)
+            find_program(TREVRPC_C_GENERATOR_EXECUTABLE protoc-gen-trevrpc-c REQUIRED)
+        else()
+            find_path(PROTOBUF_PROTO_INCLUDE_DIR NAMES google/protobuf/descriptor.proto REQUIRED)
+            set(trevrpc_codegen_proto_dir "${CMAKE_CURRENT_BINARY_DIR}/protoc-gen-trevrpc-c-protos")
+            set(trevrpc_descriptor_proto_c "${trevrpc_codegen_proto_dir}/google/protobuf/descriptor.pb-c.c")
+            set(trevrpc_descriptor_proto_h "${trevrpc_codegen_proto_dir}/google/protobuf/descriptor.pb-c.h")
+            set(trevrpc_plugin_proto_c "${trevrpc_codegen_proto_dir}/google/protobuf/compiler/plugin.pb-c.c")
+            set(trevrpc_plugin_proto_h "${trevrpc_codegen_proto_dir}/google/protobuf/compiler/plugin.pb-c.h")
+
+            add_custom_command(
+                OUTPUT "${trevrpc_descriptor_proto_c}" "${trevrpc_descriptor_proto_h}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${trevrpc_codegen_proto_dir}"
+                COMMAND "${PROTOC_C_EXECUTABLE}" -I "${PROTOBUF_PROTO_INCLUDE_DIR}" --c_out=${trevrpc_codegen_proto_dir} google/protobuf/descriptor.proto
+                DEPENDS "${PROTOBUF_PROTO_INCLUDE_DIR}/google/protobuf/descriptor.proto"
+                VERBATIM
+            )
+            add_custom_command(
+                OUTPUT "${trevrpc_plugin_proto_c}" "${trevrpc_plugin_proto_h}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${trevrpc_codegen_proto_dir}"
+                COMMAND "${PROTOC_C_EXECUTABLE}" -I "${PROTOBUF_PROTO_INCLUDE_DIR}" --c_out=${trevrpc_codegen_proto_dir} google/protobuf/compiler/plugin.proto
+                DEPENDS
+                    "${PROTOBUF_PROTO_INCLUDE_DIR}/google/protobuf/compiler/plugin.proto"
+                    "${trevrpc_descriptor_proto_h}"
+                VERBATIM
+            )
+
+            add_executable(protoc-gen-trevrpc-c
+                tools/protoc-gen-trevrpc-c/main.c
+                "${trevrpc_descriptor_proto_c}"
+                "${trevrpc_plugin_proto_c}"
+            )
+            target_include_directories(protoc-gen-trevrpc-c PRIVATE "${trevrpc_codegen_proto_dir}")
+            target_link_libraries(protoc-gen-trevrpc-c PRIVATE protobuf-c)
+            trevrpc_c_warnings(protoc-gen-trevrpc-c)
+            set(TREVRPC_C_GENERATOR_EXECUTABLE "$<TARGET_FILE:protoc-gen-trevrpc-c>")
+            set(trevrpc_c_generator_dependency protoc-gen-trevrpc-c)
+        endif()
     endif()
+
+    if(NOT TREVRPC_C_GENERATOR_EXECUTABLE)
+        message(FATAL_ERROR "TREVRPC_C_GENERATOR_EXECUTABLE was not set")
+    endif()
+endif()
+
+if(trevrpc_needs_generated_bindings)
+    find_program(PROTOC_EXECUTABLE protoc REQUIRED)
+
     function(trevrpc_generate_c_service_bindings output_dir proto_file proto_include_dir output_base out_pb_c out_trevrpc_c)
         set(pb_c "${output_dir}/${output_base}.pb-c.c")
         set(trevrpc_c "${output_dir}/${output_base}.trevrpc.c")
@@ -144,7 +193,7 @@ if(TREVRPC_BUILD_RUNTIME AND (TREVRPC_BUILD_TESTS OR TREVRPC_BUILD_BENCHMARKS OR
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${output_dir}"
             COMMAND "${PROTOC_C_EXECUTABLE}" --c_out=${output_dir} -I "${proto_include_dir}" "${proto_file}"
             COMMAND "${PROTOC_EXECUTABLE}" --plugin=protoc-gen-trevrpc-c=${TREVRPC_C_GENERATOR_EXECUTABLE} --trevrpc-c_out=${output_dir} -I "${proto_include_dir}" "${proto_file}"
-            DEPENDS "${proto_file}" "${TREVRPC_C_GENERATOR_EXECUTABLE}"
+            DEPENDS "${proto_file}" ${trevrpc_c_generator_dependency}
             VERBATIM
         )
         set(${out_pb_c} "${pb_c}" PARENT_SCOPE)
@@ -244,6 +293,11 @@ install(TARGETS ${trevrpc_install_targets}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+if(TARGET protoc-gen-trevrpc-c)
+    install(TARGETS protoc-gen-trevrpc-c
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
 install(EXPORT trevrpcTargets
     NAMESPACE trevrpc::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc
