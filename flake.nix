@@ -139,6 +139,7 @@
             final: with pkgs.lib; {
               pname = "trevrpc-c";
               version = "0.1.0";
+
               src = ./trevrpc-c;
 
               configurePhase = ''
@@ -166,7 +167,6 @@
                 runHook postBuild
               '';
 
-              doCheck = true;
               checkPhase = ''
                 runHook preCheck
                 export HOME=$TMPDIR
@@ -294,12 +294,13 @@
               nativeBuildInputs = with pkgs; [
                 cmake
               ];
+              buildInputs = with pkgs; [
+                libmsquic
+              ];
+
               nativeCheckInputs = with pkgs; [
                 oxfmt
                 oxlint
-              ];
-              buildInputs = with pkgs; [
-                libmsquic
               ];
               checkPhase = ''
                 mkdir -p ../testdata
