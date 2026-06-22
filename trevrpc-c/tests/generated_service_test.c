@@ -50,6 +50,7 @@ struct trevrpc_msquic_stream {
     pthread_cond_t cond;
     trevrpc_msquic_chunk* recv_head;
     trevrpc_msquic_chunk* recv_tail;
+    size_t recv_buffered;
     bool recv_fin;
     bool send_closed;
     bool shutdown_complete;
@@ -114,8 +115,13 @@ static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data,
     chunk->len = data_len;
     chunk->offset = 0;
     memcpy(chunk->data, data, data_len);
-    stream->recv_head = chunk;
+    if (stream->recv_tail != NULL) {
+        stream->recv_tail->next = chunk;
+    } else {
+        stream->recv_head = chunk;
+    }
     stream->recv_tail = chunk;
+    stream->recv_buffered += data_len;
     return 0;
 }
 

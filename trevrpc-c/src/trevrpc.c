@@ -555,6 +555,13 @@ static intptr_t trevrpc_stream_read_frame_body(trevrpc_stream* stream, uint8_t**
     return -EINVAL;
 }
 
+static intptr_t trevrpc_stream_read_frame_body_ready(trevrpc_stream* stream, uint8_t** body, size_t* body_len) {
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        return trevrpc_msquic_stream_read_frame_ready(stream->msquic_stream, body, body_len, stream->max_frame_size);
+    }
+    return TREV_MSQUIC_ERR_TIMEOUT;
+}
+
 static void trevrpc_stream_free_body(trevrpc_stream* stream, uint8_t* body) {
     if (stream != NULL && stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         trevrpc_wt_free(body);
@@ -852,6 +859,58 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
             trevrpc_stream_record_failure(stream, TREVRPC_STATUS_UNAVAILABLE, "request stream idle timeout");
             return TREVRPC_ERR_STREAM_IDLE_TIMEOUT;
         }
+        if (read == TREV_MSQUIC_ERR_CLOSED || read == TREV_WT_ERR_CLOSED || read == -ECANCELED) {
+            trevrpc_stream_record_failure(stream, TREVRPC_STATUS_CANCELLED, "transport closed");
+        }
+        return (int)read;
+    }
+    if (read == 0) {
+        return 0;
+    }
+
+    err = trevrpc_wire_decode_stream_frame(body, body_len, out_frame);
+    trevrpc_stream_free_body(stream, body);
+    if (err == 0 && *out_frame != NULL && (*out_frame)->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+        err = trevrpc_stream_check_message_limit(stream, &stream->request_message_count, "request");
+        if (err == 0) {
+            err = trevrpc_stream_check_body_size_limit(
+                stream, &stream->request_body_size, (*out_frame)->body_len, "request");
+        }
+        if (err != 0) {
+            trevrpc_stream_frame_free(*out_frame);
+            *out_frame = NULL;
+        }
+    }
+    return err;
+}
+
+int trevrpc_stream_recv_ready(trevrpc_stream* stream, trevrpc_stream_frame** out_frame, int* ready) {
+    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) || out_frame == NULL ||
+        ready == NULL) {
+        return -EINVAL;
+    }
+    *out_frame = NULL;
+    *ready = 0;
+    int err = trevrpc_stream_context_error(stream);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_stream_check_exhausted_message_limit(stream, &stream->request_message_count, "request");
+    if (err == 0) {
+        err = trevrpc_stream_check_exhausted_body_size_limit(stream, &stream->request_body_size, "request");
+    }
+    if (err != 0) {
+        return err;
+    }
+
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    intptr_t read = trevrpc_stream_read_frame_body_ready(stream, &body, &body_len);
+    if (read == TREV_MSQUIC_ERR_TIMEOUT) {
+        return 0;
+    }
+    *ready = 1;
+    if (read < 0) {
         if (read == TREV_MSQUIC_ERR_CLOSED || read == TREV_WT_ERR_CLOSED || read == -ECANCELED) {
             trevrpc_stream_record_failure(stream, TREVRPC_STATUS_CANCELLED, "transport closed");
         }

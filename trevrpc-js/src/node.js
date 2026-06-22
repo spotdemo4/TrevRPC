@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const EmptyBody = new Uint8Array(0);
 const RpcStatusOk = 0;
+const RecvManyBatchSize = 32;
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */
 export class NodeTransport {
@@ -120,6 +121,8 @@ export class NodeServerCall {
     this.request = nativeCall.request;
     this.completed = false;
     this.deferred = false;
+    this.recvDone = false;
+    this.recvQueue = [];
   }
 
   /** Keeps the call open after the handler returns. */
@@ -140,8 +143,21 @@ export class NodeServerCall {
   }
 
   /** Receives one streaming request frame, or null after EOF. */
-  recv() {
-    return this.nativeCall.recv();
+  async recv() {
+    if (this.recvDone) {
+      return null;
+    }
+    while (this.recvQueue.length === 0) {
+      const frames = await this.#recvMany();
+      this.recvQueue.push(...frames);
+    }
+    const frame = this.recvQueue.shift();
+    if (frame == null) {
+      this.recvDone = true;
+      this.recvQueue.length = 0;
+      return null;
+    }
+    return frame;
   }
 
   /** Sends the terminal streaming status and completes the call. */
@@ -153,7 +169,16 @@ export class NodeServerCall {
   /** Cancels and closes the call. */
   close() {
     this.completed = true;
+    this.recvDone = true;
+    this.recvQueue.length = 0;
     this.nativeCall.close();
+  }
+
+  async #recvMany() {
+    if (typeof this.nativeCall.recvMany === "function") {
+      return await this.nativeCall.recvMany(RecvManyBatchSize);
+    }
+    return [await this.nativeCall.recv()];
   }
 }
 
@@ -166,6 +191,7 @@ class NativeResponseFrameStream {
     this.returnDone = null;
     this.returnErrorReported = false;
     this.suppressReturnWriterError = false;
+    this.recvQueue = [];
     this.recvTask = null;
     this.writerDone = writerTask
       .catch((error) => {
@@ -185,15 +211,23 @@ class NativeResponseFrameStream {
       return { done: true, value: undefined };
     }
 
-    this.recvTask ??= this.#startRecv();
-    const result = await this.recvTask;
-    if (result.error != null) {
-      this.done = true;
-      throw result.error;
+    while (this.recvQueue.length === 0) {
+      this.recvTask ??= this.#startRecv();
+      const result = await this.recvTask;
+      this.recvTask = null;
+      if (result.error != null) {
+        this.done = true;
+        throw result.error;
+      }
+      this.recvQueue.push(...result.frames);
+      if (this.recvQueue.length > 0 && !hasTerminalFrame(this.recvQueue)) {
+        this.recvTask = this.#startRecv();
+      }
     }
-    const frame = result.frame;
+    const frame = this.recvQueue.shift();
     if (frame == null) {
       this.done = true;
+      this.recvQueue.length = 0;
       await this.writerDone;
       if (this.writerError != null) {
         throw this.writerError;
@@ -203,6 +237,7 @@ class NativeResponseFrameStream {
 
     if (frame.kind === RpcStreamFrameKind.Status) {
       this.done = true;
+      this.recvQueue.length = 0;
       this.stream.close();
       if (this.writerSettled) {
         await this.writerDone;
@@ -213,9 +248,6 @@ class NativeResponseFrameStream {
         this.suppressReturnWriterError = true;
       }
     }
-    if (!this.done) {
-      this.recvTask = this.#startRecv();
-    }
     return { done: false, value: frame };
   }
 
@@ -223,6 +255,7 @@ class NativeResponseFrameStream {
     if (this.returnDone == null) {
       this.done = true;
       this.returnDone = (async () => {
+        this.recvQueue.length = 0;
         this.stream.close();
         await this.recvTask;
         await this.writerDone;
@@ -238,11 +271,19 @@ class NativeResponseFrameStream {
   }
 
   #startRecv() {
-    return this.stream.recv().then(
-      (frame) => ({ frame }),
+    const recv =
+      typeof this.stream.recvMany === "function"
+        ? this.stream.recvMany(RecvManyBatchSize)
+        : this.stream.recv().then((frame) => [frame]);
+    return recv.then(
+      (frames) => ({ frames }),
       (error) => ({ error }),
     );
   }
+}
+
+function hasTerminalFrame(frames) {
+  return frames.some((frame) => frame == null || frame.kind === RpcStreamFrameKind.Status);
 }
 
 async function writeRequestStream(stream, requestBody) {

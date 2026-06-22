@@ -46,6 +46,7 @@ struct trevrpc_msquic_stream {
     pthread_cond_t cond;
     trevrpc_msquic_chunk* recv_head;
     trevrpc_msquic_chunk* recv_tail;
+    size_t recv_buffered;
     bool recv_fin;
     bool send_closed;
     bool shutdown_complete;
@@ -146,6 +147,7 @@ static void trevrpc_msquic_free_chunks(trevrpc_msquic_stream* stream) {
     }
     stream->recv_head = NULL;
     stream->recv_tail = NULL;
+    stream->recv_buffered = 0;
 }
 
 static void trevrpc_msquic_free_send_pool(trevrpc_msquic_stream* stream) {
@@ -811,6 +813,7 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
     size_t copied = available < len ? available : len;
     memcpy(data, chunk->data + chunk->offset, copied);
     chunk->offset += copied;
+    stream->recv_buffered -= copied;
     if (chunk->offset == chunk->len) {
         stream->recv_head = chunk->next;
         if (stream->recv_head == NULL) {
@@ -846,6 +849,7 @@ static intptr_t trevrpc_msquic_stream_read_exact_locked(
         memcpy(data + copied, chunk->data + chunk->offset, chunk_copied);
         copied += chunk_copied;
         chunk->offset += chunk_copied;
+        stream->recv_buffered -= chunk_copied;
         if (chunk->offset == chunk->len) {
             stream->recv_head = chunk->next;
             if (stream->recv_head == NULL) {
@@ -858,12 +862,34 @@ static intptr_t trevrpc_msquic_stream_read_exact_locked(
     return (intptr_t)copied;
 }
 
+static bool trevrpc_msquic_stream_peek_locked(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
+    size_t copied = 0;
+    for (trevrpc_msquic_chunk* chunk = stream->recv_head; copied < len && chunk != NULL; chunk = chunk->next) {
+        size_t available = chunk->len - chunk->offset;
+        size_t remaining = len - copied;
+        size_t chunk_copied = available < remaining ? available : remaining;
+        memcpy(data + copied, chunk->data + chunk->offset, chunk_copied);
+        copied += chunk_copied;
+    }
+    return copied == len;
+}
+
+static intptr_t trevrpc_msquic_stream_not_ready_locked(trevrpc_msquic_stream* stream) {
+    if (stream->err != 0) {
+        return trevrpc_msquic_error_result(stream->err);
+    }
+    if (stream->recv_fin || stream->closed) {
+        return stream->recv_buffered == 0 ? TREV_MSQUIC_ERR_EOF : TREV_MSQUIC_ERR_CLOSED;
+    }
+    return TREV_MSQUIC_ERR_TIMEOUT;
+}
+
 static intptr_t trevrpc_msquic_stream_read_frame_until(
     trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, const struct timespec* deadline) {
     *body = NULL;
     *len = 0;
 
-    uint8_t header[4];
+    uint8_t header[4] = {0};
     pthread_mutex_lock(&stream->mutex);
     intptr_t read = trevrpc_msquic_stream_read_exact_locked(stream, header, sizeof(header), deadline);
     if (read <= 0) {
@@ -919,6 +945,63 @@ intptr_t trevrpc_msquic_stream_read_frame_timeout(
     }
 
     return trevrpc_msquic_stream_read_frame_until(stream, body, len, max_len, &deadline);
+}
+
+intptr_t trevrpc_msquic_stream_read_frame_ready(
+    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
+    *body = NULL;
+    *len = 0;
+
+    uint8_t header[4];
+    pthread_mutex_lock(&stream->mutex);
+    if (stream->recv_buffered < sizeof(header)) {
+        intptr_t result = trevrpc_msquic_stream_not_ready_locked(stream);
+        pthread_mutex_unlock(&stream->mutex);
+        return result;
+    }
+
+    if (!trevrpc_msquic_stream_peek_locked(stream, header, sizeof(header))) {
+        pthread_mutex_unlock(&stream->mutex);
+        return TREV_MSQUIC_ERR_CLOSED;
+    }
+    size_t body_len =
+        ((size_t)header[0] << 24) | ((size_t)header[1] << 16) | ((size_t)header[2] << 8) | (size_t)header[3];
+    if (body_len > max_len) {
+        *len = body_len;
+        pthread_mutex_unlock(&stream->mutex);
+        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+    }
+    if (body_len > SIZE_MAX - sizeof(header) || stream->recv_buffered < sizeof(header) + body_len) {
+        intptr_t result = trevrpc_msquic_stream_not_ready_locked(stream);
+        pthread_mutex_unlock(&stream->mutex);
+        return result == TREV_MSQUIC_ERR_EOF ? TREV_MSQUIC_ERR_CLOSED : result;
+    }
+
+    intptr_t read = trevrpc_msquic_stream_read_exact_locked(stream, header, sizeof(header), NULL);
+    if (read <= 0) {
+        pthread_mutex_unlock(&stream->mutex);
+        return read;
+    }
+    if (body_len == 0) {
+        pthread_mutex_unlock(&stream->mutex);
+        return 1;
+    }
+
+    uint8_t* buffer = malloc(body_len);
+    if (buffer == NULL) {
+        pthread_mutex_unlock(&stream->mutex);
+        return -ENOMEM;
+    }
+    read = trevrpc_msquic_stream_read_exact_locked(stream, buffer, body_len, NULL);
+    pthread_mutex_unlock(&stream->mutex);
+    if (read <= 0) {
+        free(buffer);
+        return read == 0 ? TREV_MSQUIC_ERR_CLOSED : read;
+    }
+
+    *body = buffer;
+    *len = body_len;
+    return 1;
 }
 
 intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
@@ -1246,6 +1329,7 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_stream_callback(
                 stream->recv_head = chunk;
             }
             stream->recv_tail = chunk;
+            stream->recv_buffered += chunk->len;
             pthread_mutex_unlock(&stream->mutex);
         }
 

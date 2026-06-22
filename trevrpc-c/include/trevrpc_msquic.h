@@ -59,6 +59,8 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
 intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
 intptr_t trevrpc_msquic_stream_read_frame_timeout(
     trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos);
+intptr_t trevrpc_msquic_stream_read_frame_ready(
+    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
 intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_write_message_frame(
     trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);
