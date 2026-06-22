@@ -1,0 +1,366 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/quic-go/quic-go"
+	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
+	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
+)
+
+const (
+	streamMessageCount = 16
+	requestName        = "TrevRPC benchmark"
+	idleTimeout        = 10 * time.Minute
+	keepAlive          = 5 * time.Second
+	shutdownTimeout    = 2 * time.Second
+)
+
+var (
+	request  = &greeter.HelloRequest{Name: requestName}
+	requests = makeRequests()
+)
+
+type splitGreeter struct{}
+
+func main() {
+	mode := flag.String("mode", "", "client or server")
+	transport := flag.String("transport", "quic", "quic or msquic")
+	addr := flag.String("addr", "127.0.0.1:0", "listen or dial address")
+	cert := flag.String("cert", "", "PEM certificate path")
+	key := flag.String("key", "", "PEM private key path")
+	iterations := flag.Int("iterations", 1000, "benchmark iterations")
+	flag.Parse()
+
+	var err error
+	switch *mode {
+	case "client":
+		err = runClient(*transport, *addr, *cert, *iterations)
+	case "server":
+		err = runServer(*transport, *addr, *cert, *key)
+	default:
+		err = fmt.Errorf("unsupported mode %q", *mode)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func runClient(transportName, addr, certFile string, iterations int) error {
+	if iterations <= 0 {
+		return fmt.Errorf("iterations must be positive")
+	}
+	ctx := context.Background()
+	transport, err := dialTransport(ctx, transportName, addr, certFile)
+	if err != nil {
+		return err
+	}
+	defer transport.Close()
+
+	client := greeter.NewGreeterClient(transport, trevrpc.WithoutStreamIdleTimeout())
+	if err := warmClient(ctx, client); err != nil {
+		return err
+	}
+	if err := runCase("unary_round_trip", iterations, func() error {
+		_, err := unary(ctx, client)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := runCase("server_stream_16_messages", iterations, func() error {
+		_, err := serverStreaming(ctx, client)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := runCase("client_stream_16_messages", iterations, func() error {
+		_, err := clientStreaming(ctx, client)
+		return err
+	}); err != nil {
+		return err
+	}
+	return runCase("bidi_stream_16_messages", iterations, func() error {
+		_, err := bidiStreaming(ctx, client)
+		return err
+	})
+}
+
+func runServer(transportName, addr, certFile, keyFile string) error {
+	server := trevrpc.NewServer()
+	options := server.Options()
+	options.GracefulShutdownTimeout = time.Second
+	options.StreamIdleTimeout = 0
+	server.SetOptions(options)
+	greeter.RegisterGreeterServer(server, splitGreeter{})
+
+	listener, err := listenTransport(transportName, addr, certFile, keyFile, server)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- listener.Serve(ctx)
+	}()
+	fmt.Printf("PORT %d\n", portFromAddr(listener.Addr()))
+	if certFile != "" {
+		fmt.Printf("CERT %s\n", certFile)
+	}
+	if err := waitForShutdown(ctx, serveDone); err != nil {
+		return err
+	}
+	return nil
+}
+
+func dialTransport(ctx context.Context, transportName, addr, certFile string) (trevrpc.ClientTransport, error) {
+	switch transportName {
+	case "quic":
+		return trevrpc.Dial(ctx, addr, trevrpc.DialOptions{
+			Kind:       trevrpc.TransportQUICGo,
+			TLSConfig:  clientTLSConfig(certFile),
+			QUICConfig: quicConfig(),
+		})
+	case "msquic":
+		return trevrpc.Dial(ctx, addr, trevrpc.DialOptions{
+			Kind: trevrpc.TransportMsQuic,
+			MsQuic: trevrpc.MsQuicConfig{
+				MaxIdleTimeout:      idleTimeout,
+				KeepAlive:           keepAlive,
+				PeerBidiStreamCount: 128,
+			},
+		})
+	default:
+		return nil, fmt.Errorf("unsupported transport %q", transportName)
+	}
+}
+
+func listenTransport(transportName, addr, certFile, keyFile string, server *trevrpc.Server) (trevrpc.ServerListener, error) {
+	switch transportName {
+	case "quic":
+		if certFile == "" || keyFile == "" {
+			return nil, errors.New("quic server requires -cert and -key")
+		}
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, err
+		}
+		return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
+			Kind:       trevrpc.TransportQUICGo,
+			TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN}},
+			QUICConfig: quicConfig(),
+		})
+	case "msquic":
+		return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
+			Kind: trevrpc.TransportMsQuic,
+			MsQuic: trevrpc.MsQuicConfig{
+				CertFile:            certFile,
+				KeyFile:             keyFile,
+				MaxIdleTimeout:      idleTimeout,
+				KeepAlive:           keepAlive,
+				PeerBidiStreamCount: 128,
+			},
+		})
+	default:
+		return nil, fmt.Errorf("unsupported transport %q", transportName)
+	}
+}
+
+func clientTLSConfig(certFile string) *tls.Config {
+	_ = certFile
+	return &tls.Config{ServerName: "localhost", NextProtos: []string{trevrpc.ALPN}, InsecureSkipVerify: true}
+}
+
+func quicConfig() *quic.Config {
+	return &quic.Config{MaxIdleTimeout: idleTimeout, KeepAlivePeriod: keepAlive}
+}
+
+func waitForShutdown(ctx context.Context, serveDone <-chan error) error {
+	select {
+	case err := <-serveDone:
+		return err
+	case <-ctx.Done():
+	}
+
+	select {
+	case err := <-serveDone:
+		return err
+	case <-time.After(shutdownTimeout):
+		return errors.New("timed out waiting for server shutdown")
+	}
+}
+
+func portFromAddr(addr net.Addr) int {
+	_, portText, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return 0
+	}
+	return port
+}
+
+func warmClient(ctx context.Context, client *greeter.GreeterClient) error {
+	if _, err := unary(ctx, client); err != nil {
+		return err
+	}
+	if _, err := serverStreaming(ctx, client); err != nil {
+		return err
+	}
+	if _, err := clientStreaming(ctx, client); err != nil {
+		return err
+	}
+	_, err := bidiStreaming(ctx, client)
+	return err
+}
+
+func runCase(name string, iterations int, fn func() error) error {
+	start := time.Now()
+	for range iterations {
+		if err := fn(); err != nil {
+			return fmt.Errorf("%s failed: %w", name, err)
+		}
+	}
+	elapsed := time.Since(start)
+	ops := float64(iterations) / elapsed.Seconds()
+	fmt.Printf("%s: %.0f ops/s (%d iterations in %.3fs)\n", name, ops, iterations, elapsed.Seconds())
+	return nil
+}
+
+func unary(ctx context.Context, client *greeter.GreeterClient) (string, error) {
+	response, err := client.SayHello(ctx, request)
+	if err != nil {
+		return "", err
+	}
+	if response.Message != requestName {
+		return "", fmt.Errorf("unary response = %q, want %q", response.Message, requestName)
+	}
+	return response.Message, nil
+}
+
+func serverStreaming(ctx context.Context, client *greeter.GreeterClient) (int, error) {
+	replies, err := client.LotsOfReplies(ctx, request)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for {
+		_, err := replies.Recv()
+		if err == io.EOF {
+			if count != streamMessageCount {
+				_ = replies.Close()
+				return 0, fmt.Errorf("server stream count = %d, want %d", count, streamMessageCount)
+			}
+			return count, replies.Close()
+		}
+		if err != nil {
+			_ = replies.Close()
+			return 0, err
+		}
+		count++
+	}
+}
+
+func clientStreaming(ctx context.Context, client *greeter.GreeterClient) (string, error) {
+	response, err := client.LotsOfGreetingsFromStream(ctx, trevrpc.FromSlice(requests...))
+	if err != nil {
+		return "", err
+	}
+	if response.Message != fmt.Sprintf("streamed %d greetings", streamMessageCount) {
+		return "", fmt.Errorf("client stream response = %q", response.Message)
+	}
+	return response.Message, nil
+}
+
+func bidiStreaming(ctx context.Context, client *greeter.GreeterClient) (int, error) {
+	stream, err := client.BidiHelloFromStream(ctx, trevrpc.FromSlice(requests...))
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for {
+		_, err := stream.Recv()
+		if err == io.EOF {
+			if count != streamMessageCount {
+				_ = stream.Close()
+				return 0, fmt.Errorf("bidi stream count = %d, want %d", count, streamMessageCount)
+			}
+			return count, stream.Close()
+		}
+		if err != nil {
+			_ = stream.Close()
+			return 0, err
+		}
+		count++
+	}
+}
+
+func makeRequests() []*greeter.HelloRequest {
+	requests := make([]*greeter.HelloRequest, streamMessageCount)
+	for i := range requests {
+		requests[i] = &greeter.HelloRequest{Name: requestName}
+	}
+	return requests
+}
+
+func (splitGreeter) SayHello(_ context.Context, request *greeter.HelloRequest) (*greeter.HelloReply, error) {
+	return &greeter.HelloReply{Message: request.Name}, nil
+}
+
+func (splitGreeter) LotsOfReplies(context.Context, *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
+	replies := make([]*greeter.HelloReply, streamMessageCount)
+	for i := range replies {
+		replies[i] = &greeter.HelloReply{Message: "server stream"}
+	}
+	return trevrpc.FromSlice(replies...), nil
+}
+
+func (splitGreeter) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*greeter.HelloReply, error) {
+	count := 0
+	for {
+		_, err := requests.Recv()
+		if err == io.EOF {
+			return &greeter.HelloReply{Message: fmt.Sprintf("streamed %d greetings", count)}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		count++
+	}
+}
+
+func (splitGreeter) BidiHello(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (trevrpc.MessageStream[*greeter.HelloReply], error) {
+	return &bidiReplies{requests: requests}, nil
+}
+
+type bidiReplies struct {
+	requests trevrpc.MessageStream[*greeter.HelloRequest]
+}
+
+func (s *bidiReplies) Recv() (*greeter.HelloReply, error) {
+	request, err := s.requests.Recv()
+	if err != nil {
+		return nil, err
+	}
+	return &greeter.HelloReply{Message: request.Name}, nil
+}
+
+func (s *bidiReplies) Close() error {
+	return s.requests.Close()
+}

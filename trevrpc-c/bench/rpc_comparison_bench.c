@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,6 +27,11 @@
 #define BENCHMARK_IDLE_TIMEOUT_MS 600000u
 #define BENCHMARK_KEEP_ALIVE_MS 5000u
 #define BENCHMARK_GRACEFUL_SHUTDOWN_NANOS 1000000000ull
+#define BENCHMARK_SPLIT_SERVICE "example.greeter.Greeter"
+#define BENCHMARK_METHOD_SAY_HELLO "SayHello"
+#define BENCHMARK_METHOD_LOTS_OF_REPLIES "LotsOfReplies"
+#define BENCHMARK_METHOD_LOTS_OF_GREETINGS "LotsOfGreetings"
+#define BENCHMARK_METHOD_BIDI_HELLO "BidiHello"
 
 int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port);
 
@@ -47,8 +53,10 @@ typedef int (*benchmark_case)(trevrpc_client* client);
 
 static volatile size_t benchmark_count_sink;
 static volatile size_t benchmark_bytes_sink;
+static volatile sig_atomic_t split_server_stop_requested;
 
 static int start_benchmark_server(benchmark_fixture* fixture);
+static Hello__V1__HelloRequest benchmark_request(void);
 
 #define CHECK(condition)                                                                                               \
     do {                                                                                                               \
@@ -93,6 +101,214 @@ static Hello__V1__HelloReply* make_count_reply(size_t count) {
 static void consume_reply(Hello__V1__HelloReply* reply) {
     if (reply != NULL && reply->message != NULL) {
         benchmark_bytes_sink += strlen(reply->message);
+    }
+}
+
+static int pack_message(const ProtobufCMessage* message, uint8_t** out_body, size_t* out_body_len) {
+    if (message == NULL || out_body == NULL || out_body_len == NULL) {
+        return -EINVAL;
+    }
+    *out_body = NULL;
+    *out_body_len = protobuf_c_message_get_packed_size(message);
+    if (*out_body_len == 0) {
+        return 0;
+    }
+
+    *out_body = malloc(*out_body_len);
+    if (*out_body == NULL) {
+        return -ENOMEM;
+    }
+    protobuf_c_message_pack(message, *out_body);
+    return 0;
+}
+
+static int benchmark_request_body(uint8_t** out_body, size_t* out_body_len) {
+    Hello__V1__HelloRequest request = benchmark_request();
+    return pack_message((const ProtobufCMessage*)&request, out_body, out_body_len);
+}
+
+static int split_response_set_reply(trevrpc_response* response, const char* message) {
+    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
+    reply.message = (char*)message;
+
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    int err = pack_message((const ProtobufCMessage*)&reply, &body, &body_len);
+    if (err == 0) {
+        err = trevrpc_response_set_body(response, body, body_len);
+    }
+    free(body);
+    return err;
+}
+
+static int split_stream_send_reply(trevrpc_stream* stream, const char* message) {
+    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
+    reply.message = (char*)message;
+
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    int err = pack_message((const ProtobufCMessage*)&reply, &body, &body_len);
+    if (err == 0) {
+        err = trevrpc_stream_send_message(stream, body, body_len);
+    }
+    free(body);
+    return err;
+}
+
+static int split_decode_request(const uint8_t* body, size_t body_len, Hello__V1__HelloRequest** out_request) {
+    if (out_request == NULL) {
+        return -EINVAL;
+    }
+    *out_request = hello__v1__hello_request__unpack(NULL, body_len, body);
+    return *out_request == NULL ? -EINVAL : 0;
+}
+
+static int split_recv_request_frame(trevrpc_stream* stream, bool* done) {
+    trevrpc_stream_frame* frame = NULL;
+    int err = trevrpc_stream_recv(stream, &frame);
+    if (err != 0) {
+        return err;
+    }
+    if (done == NULL) {
+        trevrpc_stream_frame_free(frame);
+        return -EINVAL;
+    }
+    if (frame == NULL) {
+        *done = true;
+        return 0;
+    }
+
+    if (frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+        *done = true;
+        err = frame->status == TREVRPC_STATUS_OK ? 0 : -EINVAL;
+        trevrpc_stream_frame_free(frame);
+        return err;
+    }
+    if (frame->kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+        trevrpc_stream_frame_free(frame);
+        return -EINVAL;
+    }
+
+    Hello__V1__HelloRequest* request = NULL;
+    err = split_decode_request(frame->body, frame->body_len, &request);
+    if (request != NULL) {
+        hello__v1__hello_request__free_unpacked(request, NULL);
+    }
+    trevrpc_stream_frame_free(frame);
+    *done = false;
+    return err;
+}
+
+static int split_say_hello(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response) {
+    (void)user_data;
+    (void)context;
+    if (request == NULL || response == NULL) {
+        return -EINVAL;
+    }
+
+    Hello__V1__HelloRequest* decoded = NULL;
+    int err = split_decode_request(request->body, request->body_len, &decoded);
+    if (err == 0) {
+        err = split_response_set_reply(response, decoded->name == NULL ? "" : decoded->name);
+    }
+    if (decoded != NULL) {
+        hello__v1__hello_request__free_unpacked(decoded, NULL);
+    }
+    return err;
+}
+
+static int split_lots_of_replies(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {
+    (void)user_data;
+    (void)context;
+    if (request == NULL) {
+        return -EINVAL;
+    }
+
+    Hello__V1__HelloRequest* decoded = NULL;
+    int err = split_decode_request(request->body, request->body_len, &decoded);
+    if (decoded != NULL) {
+        hello__v1__hello_request__free_unpacked(decoded, NULL);
+    }
+    if (err != 0) {
+        return err;
+    }
+
+    for (size_t i = 0; i < BENCHMARK_STREAM_MESSAGE_COUNT; i++) {
+        err = split_stream_send_reply(stream, "server stream");
+        if (err != 0) {
+            return err;
+        }
+    }
+    return 0;
+}
+
+static int split_lots_of_greetings(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+
+    size_t count = 0;
+    for (;;) {
+        bool done = false;
+        int err = split_recv_request_frame(stream, &done);
+        if (err != 0) {
+            return err;
+        }
+        if (done) {
+            break;
+        }
+        count++;
+    }
+
+    Hello__V1__HelloReply* reply = make_count_reply(count);
+    if (reply == NULL) {
+        return -ENOMEM;
+    }
+    int err = split_stream_send_reply(stream, reply->message);
+    hello__v1__hello_reply__free_unpacked(reply, NULL);
+    return err;
+}
+
+static int split_bidi_hello(
+    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream) {
+    (void)user_data;
+    (void)context;
+    (void)request;
+
+    for (;;) {
+        trevrpc_stream_frame* frame = NULL;
+        int err = trevrpc_stream_recv(stream, &frame);
+        if (err != 0) {
+            return err;
+        }
+        if (frame == NULL) {
+            return 0;
+        }
+        if (frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+            err = frame->status == TREVRPC_STATUS_OK ? 0 : -EINVAL;
+            trevrpc_stream_frame_free(frame);
+            return err;
+        }
+        if (frame->kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+            trevrpc_stream_frame_free(frame);
+            return -EINVAL;
+        }
+
+        Hello__V1__HelloRequest* decoded = NULL;
+        err = split_decode_request(frame->body, frame->body_len, &decoded);
+        if (err == 0) {
+            err = split_stream_send_reply(stream, decoded->name == NULL ? "" : decoded->name);
+        }
+        if (decoded != NULL) {
+            hello__v1__hello_request__free_unpacked(decoded, NULL);
+        }
+        trevrpc_stream_frame_free(frame);
+        if (err != 0) {
+            return err;
+        }
     }
 }
 
@@ -190,6 +406,38 @@ static const hello_v1_greeter_server BenchmarkGreeterImplementation = {
     .lots_of_greetings = bench_lots_of_greetings,
     .bidi_hello = bench_bidi_hello,
 };
+
+static int register_split_benchmark_service(trevrpc_server* server) {
+    int err = trevrpc_server_register_unary(
+        server, BENCHMARK_SPLIT_SERVICE, BENCHMARK_METHOD_SAY_HELLO, split_say_hello, NULL);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_server_register_streaming(server,
+        BENCHMARK_SPLIT_SERVICE,
+        BENCHMARK_METHOD_LOTS_OF_REPLIES,
+        TREVRPC_RPC_KIND_SERVER_STREAMING,
+        split_lots_of_replies,
+        NULL);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_server_register_streaming(server,
+        BENCHMARK_SPLIT_SERVICE,
+        BENCHMARK_METHOD_LOTS_OF_GREETINGS,
+        TREVRPC_RPC_KIND_CLIENT_STREAMING,
+        split_lots_of_greetings,
+        NULL);
+    if (err != 0) {
+        return err;
+    }
+    return trevrpc_server_register_streaming(server,
+        BENCHMARK_SPLIT_SERVICE,
+        BENCHMARK_METHOD_BIDI_HELLO,
+        TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
+        split_bidi_hello,
+        NULL);
+}
 
 static void* serve_thread(void* arg) {
     serve_args* args = arg;
@@ -333,6 +581,190 @@ static int benchmark_bidi_streaming(trevrpc_client* client) {
     return err;
 }
 
+static int split_decode_reply(const uint8_t* body, size_t body_len, Hello__V1__HelloReply** out_reply) {
+    if (out_reply == NULL) {
+        return -EINVAL;
+    }
+    *out_reply = hello__v1__hello_reply__unpack(NULL, body_len, body);
+    return *out_reply == NULL ? -EINVAL : 0;
+}
+
+static int split_recv_reply_frame(trevrpc_stream* stream, bool* done) {
+    trevrpc_stream_frame* frame = NULL;
+    int err = trevrpc_stream_recv(stream, &frame);
+    if (err != 0) {
+        return err;
+    }
+    if (done == NULL) {
+        trevrpc_stream_frame_free(frame);
+        return -EINVAL;
+    }
+    if (frame == NULL) {
+        *done = true;
+        return 0;
+    }
+
+    if (frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+        *done = true;
+        err = frame->status == TREVRPC_STATUS_OK ? 0 : -EINVAL;
+        trevrpc_stream_frame_free(frame);
+        return err;
+    }
+    if (frame->kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+        trevrpc_stream_frame_free(frame);
+        return -EINVAL;
+    }
+
+    Hello__V1__HelloReply* reply = NULL;
+    err = split_decode_reply(frame->body, frame->body_len, &reply);
+    consume_reply(reply);
+    if (reply != NULL) {
+        hello__v1__hello_reply__free_unpacked(reply, NULL);
+    }
+    trevrpc_stream_frame_free(frame);
+    *done = false;
+    return err;
+}
+
+static int split_send_benchmark_requests(trevrpc_stream* stream) {
+    for (size_t i = 0; i < BENCHMARK_STREAM_MESSAGE_COUNT; i++) {
+        uint8_t* body = NULL;
+        size_t body_len = 0;
+        int err = benchmark_request_body(&body, &body_len);
+        if (err == 0) {
+            err = trevrpc_stream_send_message(stream, body, body_len);
+        }
+        free(body);
+        if (err != 0) {
+            return err;
+        }
+    }
+    return trevrpc_stream_finish_send(stream);
+}
+
+static int split_benchmark_unary_round_trip(trevrpc_client* client) {
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    trevrpc_response* response = NULL;
+    int err = benchmark_request_body(&body, &body_len);
+    if (err == 0) {
+        err = trevrpc_client_call_unary(
+            client, BENCHMARK_SPLIT_SERVICE, BENCHMARK_METHOD_SAY_HELLO, body, body_len, &response);
+    }
+    free(body);
+    if (err == 0 && (response == NULL || response->status != TREVRPC_STATUS_OK)) {
+        err = -EINVAL;
+    }
+    Hello__V1__HelloReply* reply = NULL;
+    if (err == 0) {
+        err = split_decode_reply(response->body, response->body_len, &reply);
+    }
+    if (err == 0 && (reply == NULL || reply->message == NULL || strcmp(reply->message, BENCHMARK_REQUEST_NAME) != 0)) {
+        err = -EINVAL;
+    }
+    consume_reply(reply);
+    if (reply != NULL) {
+        hello__v1__hello_reply__free_unpacked(reply, NULL);
+    }
+    trevrpc_response_free(response);
+    return err;
+}
+
+static int split_benchmark_server_streaming(trevrpc_client* client) {
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    trevrpc_stream* stream = NULL;
+    int err = benchmark_request_body(&body, &body_len);
+    if (err == 0) {
+        err = trevrpc_client_start_stream(client,
+            BENCHMARK_SPLIT_SERVICE,
+            BENCHMARK_METHOD_LOTS_OF_REPLIES,
+            TREVRPC_RPC_KIND_SERVER_STREAMING,
+            body,
+            body_len,
+            &stream);
+    }
+    free(body);
+    if (err != 0) {
+        return err;
+    }
+
+    size_t count = 0;
+    for (;;) {
+        bool done = false;
+        err = split_recv_reply_frame(stream, &done);
+        if (err != 0 || done) {
+            break;
+        }
+        count++;
+    }
+    if (err == 0 && count != BENCHMARK_STREAM_MESSAGE_COUNT) {
+        err = -EINVAL;
+    }
+    benchmark_count_sink += count;
+    trevrpc_stream_close(stream);
+    return err;
+}
+
+static int split_benchmark_client_streaming(trevrpc_client* client) {
+    trevrpc_stream* stream = NULL;
+    int err = trevrpc_client_start_stream(client,
+        BENCHMARK_SPLIT_SERVICE,
+        BENCHMARK_METHOD_LOTS_OF_GREETINGS,
+        TREVRPC_RPC_KIND_CLIENT_STREAMING,
+        NULL,
+        0,
+        &stream);
+    if (err == 0) {
+        err = split_send_benchmark_requests(stream);
+    }
+
+    size_t count = 0;
+    while (err == 0) {
+        bool done = false;
+        err = split_recv_reply_frame(stream, &done);
+        if (err != 0 || done) {
+            break;
+        }
+        count++;
+    }
+    if (err == 0 && count != 1) {
+        err = -EINVAL;
+    }
+    trevrpc_stream_close(stream);
+    return err;
+}
+
+static int split_benchmark_bidi_streaming(trevrpc_client* client) {
+    trevrpc_stream* stream = NULL;
+    int err = trevrpc_client_start_stream(client,
+        BENCHMARK_SPLIT_SERVICE,
+        BENCHMARK_METHOD_BIDI_HELLO,
+        TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
+        NULL,
+        0,
+        &stream);
+    if (err == 0) {
+        err = split_send_benchmark_requests(stream);
+    }
+
+    size_t count = 0;
+    while (err == 0) {
+        bool done = false;
+        err = split_recv_reply_frame(stream, &done);
+        if (err != 0 || done) {
+            break;
+        }
+        count++;
+    }
+    if (err == 0 && count != BENCHMARK_STREAM_MESSAGE_COUNT) {
+        err = -EINVAL;
+    }
+    benchmark_count_sink += count;
+    trevrpc_stream_close(stream);
+    return err;
+}
+
 static int run_benchmark_case(const char* name, trevrpc_client* client, benchmark_case fn, size_t iterations) {
     uint64_t start = monotonic_nanos();
     for (size_t i = 0; i < iterations; i++) {
@@ -361,6 +793,80 @@ static int warm_client(const char* name, trevrpc_client* client) {
         fprintf(stderr, "warm %s failed: %s (%d)\n", name, trevrpc_error(err), err);
     }
     return err;
+}
+
+static int warm_split_client(const char* name, trevrpc_client* client) {
+    int err = split_benchmark_unary_round_trip(client);
+    if (err == 0) {
+        err = split_benchmark_server_streaming(client);
+    } else {
+        fprintf(stderr, "warm %s unary failed: %s (%d)\n", name, trevrpc_error(err), err);
+        return err;
+    }
+    if (err == 0) {
+        err = split_benchmark_client_streaming(client);
+    } else {
+        fprintf(stderr, "warm %s server streaming failed: %s (%d)\n", name, trevrpc_error(err), err);
+        return err;
+    }
+    if (err == 0) {
+        err = split_benchmark_bidi_streaming(client);
+    } else {
+        fprintf(stderr, "warm %s client streaming failed: %s (%d)\n", name, trevrpc_error(err), err);
+        return err;
+    }
+    if (err != 0) {
+        fprintf(stderr, "warm %s bidi streaming failed: %s (%d)\n", name, trevrpc_error(err), err);
+    }
+    return err;
+}
+
+static int connect_split_client(const char* transport, const char* host, uint16_t port, trevrpc_client** out_client) {
+    trevrpc_config client_config = trevrpc_default_config();
+    client_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
+    client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
+    client_config.peer_bidi_stream_count = 128;
+    if (strcmp(transport, "msquic") == 0) {
+        return trevrpc_client_connect(host, port, &client_config, out_client);
+    }
+    if (strcmp(transport, "webtransport") == 0) {
+        trevrpc_wt_config wt_client_config = {
+            .host = host,
+            .port = port,
+            .path = "/trevrpc",
+            .skip_certificate_validation = 1,
+            .max_streams_per_session = 128,
+            .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
+        };
+        return trevrpc_client_connect_webtransport(&wt_client_config, &client_config, out_client);
+    }
+    return -EINVAL;
+}
+
+static int run_split_client_mode(const char* transport, const char* host, uint16_t port, size_t iterations) {
+    trevrpc_client* client = NULL;
+    int err = connect_split_client(transport, host, port, &client);
+    if (err != 0) {
+        fprintf(stderr, "connect split %s client failed: %s (%d)\n", transport, trevrpc_error(err), err);
+        return 1;
+    }
+
+    err = warm_split_client(transport, client);
+    if (err == 0) {
+        err = run_benchmark_case("unary_round_trip", client, split_benchmark_unary_round_trip, iterations);
+    }
+    if (err == 0) {
+        err = run_benchmark_case("server_stream_16_messages", client, split_benchmark_server_streaming, iterations);
+    }
+    if (err == 0) {
+        err = run_benchmark_case("client_stream_16_messages", client, split_benchmark_client_streaming, iterations);
+    }
+    if (err == 0) {
+        err = run_benchmark_case("bidi_stream_16_messages", client, split_benchmark_bidi_streaming, iterations);
+    }
+
+    trevrpc_client_close(client);
+    return err == 0 ? 0 : 1;
 }
 
 static int start_fixture(benchmark_fixture* fixture) {
@@ -437,6 +943,9 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
     if (err == 0) {
         err = hello_v1_greeter_register(fixture->server, &BenchmarkGreeterImplementation);
     }
+    if (err == 0) {
+        err = register_split_benchmark_service(fixture->server);
+    }
     if (err != 0) {
         return err;
     }
@@ -480,7 +989,12 @@ static void close_fixture(benchmark_fixture* fixture) {
     fixture->server = NULL;
 }
 
-static int run_server_mode(void) {
+static void split_server_signal(int signal_number) {
+    (void)signal_number;
+    split_server_stop_requested = 1;
+}
+
+static int run_server_mode(bool split_mode) {
     benchmark_fixture fixture = {0};
     int err = start_benchmark_server(&fixture);
     if (err != 0) {
@@ -498,8 +1012,18 @@ static int run_server_mode(void) {
     }
 
     printf("PORT %u\n", port);
+    printf("CERT %s\n", TREVRPC_MSQUIC_TEST_CERT);
     fflush(stdout);
-    while (getchar() != EOF) {
+    if (split_mode) {
+        signal(SIGTERM, split_server_signal);
+        signal(SIGINT, split_server_signal);
+        while (!split_server_stop_requested) {
+            struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000L};
+            nanosleep(&delay, NULL);
+        }
+    } else {
+        while (getchar() != EOF) {
+        }
     }
 
     int stop_err = stop_fixture(&fixture);
@@ -513,7 +1037,24 @@ static int run_server_mode(void) {
 
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "--serve") == 0) {
-        return run_server_mode();
+        return run_server_mode(false);
+    }
+    if (argc > 1 && strcmp(argv[1], "--split-serve") == 0) {
+        return run_server_mode(true);
+    }
+    if (argc > 1 && strcmp(argv[1], "--split-client") == 0) {
+        if (argc != 6) {
+            fprintf(stderr, "usage: %s --split-client msquic|webtransport <host> <port> <iterations>\n", argv[0]);
+            return 2;
+        }
+        unsigned long port = strtoul(argv[4], NULL, 10);
+        if (port == 0 || port > UINT16_MAX) {
+            fprintf(stderr, "invalid split client port: %s\n", argv[4]);
+            return 2;
+        }
+        size_t iterations = (size_t)strtoull(argv[5], NULL, 10);
+        CHECK(iterations > 0);
+        return run_split_client_mode(argv[2], argv[3], (uint16_t)port, iterations);
     }
 
     size_t iterations = argc > 1 ? (size_t)strtoull(argv[1], NULL, 10) : 1000;
