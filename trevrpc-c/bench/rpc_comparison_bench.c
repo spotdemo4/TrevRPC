@@ -43,7 +43,6 @@ typedef struct serve_args {
 typedef struct benchmark_fixture {
     trevrpc_server* server;
     trevrpc_client* native_client;
-    trevrpc_client* webtransport_client;
     pthread_t thread;
     bool thread_started;
     serve_args args;
@@ -916,24 +915,7 @@ static int start_fixture(benchmark_fixture* fixture) {
         return err;
     }
 
-    trevrpc_wt_config wt_client_config = {
-        .host = "127.0.0.1",
-        .port = port,
-        .path = "/trevrpc",
-        .skip_certificate_validation = 1,
-        .max_streams_per_session = 128,
-        .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
-    };
-    err = trevrpc_client_connect_webtransport(&wt_client_config, &client_config, &fixture->webtransport_client);
-    if (err != 0) {
-        return err;
-    }
-
-    err = warm_client("trevrpc_msquic", fixture->native_client);
-    if (err == 0) {
-        err = warm_client("trevrpc_webtransport", fixture->webtransport_client);
-    }
-    return err;
+    return warm_client("trevrpc_msquic", fixture->native_client);
 }
 
 static int start_benchmark_server(benchmark_fixture* fixture) {
@@ -986,8 +968,6 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
 static int stop_fixture(benchmark_fixture* fixture) {
     trevrpc_client_close(fixture->native_client);
     fixture->native_client = NULL;
-    trevrpc_client_close(fixture->webtransport_client);
-    fixture->webtransport_client = NULL;
     trevrpc_server_shutdown(fixture->server);
     if (fixture->thread_started) {
         int err = pthread_join(fixture->thread, NULL);
@@ -1002,8 +982,6 @@ static int stop_fixture(benchmark_fixture* fixture) {
 static void close_fixture(benchmark_fixture* fixture) {
     trevrpc_client_close(fixture->native_client);
     fixture->native_client = NULL;
-    trevrpc_client_close(fixture->webtransport_client);
-    fixture->webtransport_client = NULL;
     trevrpc_server_shutdown(fixture->server);
     if (fixture->thread_started) {
         (void)pthread_join(fixture->thread, NULL);
@@ -1097,40 +1075,16 @@ int main(int argc, char** argv) {
     err = run_benchmark_case(
         "unary_round_trip/trevrpc_msquic", fixture.native_client, benchmark_unary_round_trip, iterations);
     if (err == 0) {
-        err = run_benchmark_case("unary_round_trip/trevrpc_webtransport",
-            fixture.webtransport_client,
-            benchmark_unary_round_trip,
-            iterations);
-    }
-    if (err == 0) {
         err = run_benchmark_case(
             "server_stream_16_messages/trevrpc_msquic", fixture.native_client, benchmark_server_streaming, iterations);
-    }
-    if (err == 0) {
-        err = run_benchmark_case("server_stream_16_messages/trevrpc_webtransport",
-            fixture.webtransport_client,
-            benchmark_server_streaming,
-            iterations);
     }
     if (err == 0) {
         err = run_benchmark_case(
             "client_stream_16_messages/trevrpc_msquic", fixture.native_client, benchmark_client_streaming, iterations);
     }
     if (err == 0) {
-        err = run_benchmark_case("client_stream_16_messages/trevrpc_webtransport",
-            fixture.webtransport_client,
-            benchmark_client_streaming,
-            iterations);
-    }
-    if (err == 0) {
         err = run_benchmark_case(
             "bidi_stream_16_messages/trevrpc_msquic", fixture.native_client, benchmark_bidi_streaming, iterations);
-    }
-    if (err == 0) {
-        err = run_benchmark_case("bidi_stream_16_messages/trevrpc_webtransport",
-            fixture.webtransport_client,
-            benchmark_bidi_streaming,
-            iterations);
     }
 
     int stop_err = stop_fixture(&fixture);

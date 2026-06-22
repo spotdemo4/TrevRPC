@@ -21,7 +21,7 @@ export class NodeTransport {
   static async connect(urlOrOptions, options = {}) {
     const native = loadNative();
     const connectOptions = normalizeNodeTransportOptions(urlOrOptions, options);
-    const nativeClient = await native.connectWebTransport(connectOptions);
+    const nativeClient = await native.connectMsQuic(connectOptions);
     return new NodeTransport(nativeClient, connectOptions);
   }
 
@@ -57,11 +57,11 @@ export class NodeServer {
     this.closed = null;
   }
 
-  /** Creates a native QUIC and WebTransport TrevRPC server backed by trevrpc-c. */
+  /** Creates a native QUIC TrevRPC server backed by trevrpc-c. */
   static async listen(urlOrOptions, options = {}) {
     const native = loadNative();
     const listenOptions = normalizeNodeTransportOptions(urlOrOptions, options);
-    const nativeServer = await native.listenWebTransport(listenOptions);
+    const nativeServer = await native.listenMsQuic(listenOptions);
     return new NodeServer(nativeServer, listenOptions);
   }
 

@@ -29,7 +29,6 @@ SERVER_STARTUP_TIMEOUT_SECONDS=${SERVER_STARTUP_TIMEOUT_SECONDS:-15}
 RUN_CLIENT_AXIS=${RUN_CLIENT_AXIS:-1}
 RUN_SERVER_AXIS=${RUN_SERVER_AXIS:-1}
 RUN_C_MSQUIC=${RUN_C_MSQUIC:-1}
-RUN_C_WEBTRANSPORT=${RUN_C_WEBTRANSPORT:-1}
 RUN_GO_QUIC=${RUN_GO_QUIC:-1}
 RUN_GO_MSQUIC=${RUN_GO_MSQUIC:-1}
 RUN_GO_GRPC=${RUN_GO_GRPC:-1}
@@ -59,11 +58,10 @@ Environment knobs:
   RUN_CLIENT_AXIS         Benchmark clients against reference C servers. Default: 1
   RUN_SERVER_AXIS         Benchmark servers with reference C clients. Default: 1
   RUN_C_MSQUIC            Include C MsQuic transport. Default: 1
-  RUN_C_WEBTRANSPORT      Include C WebTransport transport. Default: 1
   RUN_GO_QUIC             Include Go quic-go transport. Default: 1
   RUN_GO_MSQUIC           Include Go MsQuic transport. Default: 1
   RUN_GO_GRPC             Include Go gRPC TCP baseline. Default: 1
-  RUN_JS_NATIVE           Include native JS WebTransport transport. Default: 1
+  RUN_JS_NATIVE           Include native JS MsQuic transport. Default: 1
   RUN_RUST_QUINN          Include Rust Quinn transport. Default: 1
 
 Examples:
@@ -333,7 +331,7 @@ EOF
 
 ## Notes
 
-The client axis benchmarks each TrevRPC client transport against a reference C server for the matching wire protocol. Raw QUIC transports use the C MsQuic listener; WebTransport transports use the C WebTransport listener.
+The client axis benchmarks each TrevRPC client transport against a reference C MsQuic server.
 
 The server axis benchmarks each TrevRPC server transport using a reference C client for the matching wire protocol.
 
@@ -441,9 +439,6 @@ run_client_axis() {
         if [[ "$RUN_C_MSQUIC" == "1" ]]; then
             run_split_sample "client-c-msquic-run-$run" "$run" client c_msquic c_msquic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         fi
-        if [[ "$RUN_C_WEBTRANSPORT" == "1" ]]; then
-            run_split_sample "client-c-webtransport-run-$run" "$run" client c_webtransport c_webtransport c-custom "$c_bench" --split-client webtransport 127.0.0.1 "$port" "$C_ITERATIONS"
-        fi
         if [[ "$RUN_GO_QUIC" == "1" ]]; then
             run_split_sample "client-go-quic-run-$run" "$run" client go_quic c_msquic go-custom "$GO_SPLIT_BENCH" -mode client -transport quic -addr "127.0.0.1:$port" -cert "$cert_file" -iterations "$GO_ITERATIONS"
         fi
@@ -451,7 +446,7 @@ run_client_axis() {
             run_split_sample "client-go-msquic-run-$run" "$run" client go_msquic c_msquic go-custom "$GO_SPLIT_BENCH" -mode client -transport msquic -addr "127.0.0.1:$port" -iterations "$GO_ITERATIONS"
         fi
         if [[ "$RUN_JS_NATIVE" == "1" ]]; then
-            run_split_sample "client-js-native-run-$run" "$run" client js_native_webtransport c_webtransport js-custom node trevrpc-js/bench/rpc_split_native.js client 127.0.0.1 "$port" "$JS_ITERATIONS"
+            run_split_sample "client-js-native-run-$run" "$run" client js_msquic c_msquic js-custom node trevrpc-js/bench/rpc_split_native.js client 127.0.0.1 "$port" "$JS_ITERATIONS"
         fi
         if [[ "$RUN_RUST_QUINN" == "1" ]]; then
             run_split_sample "client-rust-quinn-run-$run" "$run" client rust_quinn c_msquic rust-custom "$RUST_SPLIT_BENCH" client "127.0.0.1:$port" "$cert_file" "$RUST_ITERATIONS"
@@ -468,16 +463,11 @@ run_server_axis() {
     local port
     local run
 
-    if [[ "$RUN_C_MSQUIC" == "1" || "$RUN_C_WEBTRANSPORT" == "1" ]]; then
+    if [[ "$RUN_C_MSQUIC" == "1" ]]; then
         start_server server-axis-c-server "$c_bench" --split-serve
         port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            if [[ "$RUN_C_MSQUIC" == "1" ]]; then
-                run_split_sample "server-c-msquic-run-$run" "$run" server c_msquic c_msquic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
-            fi
-            if [[ "$RUN_C_WEBTRANSPORT" == "1" ]]; then
-                run_split_sample "server-c-webtransport-run-$run" "$run" server c_webtransport c_webtransport c-custom "$c_bench" --split-client webtransport 127.0.0.1 "$port" "$C_ITERATIONS"
-            fi
+            run_split_sample "server-c-msquic-run-$run" "$run" server c_msquic c_msquic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         done
         stop_servers
     fi
@@ -513,7 +503,7 @@ run_server_axis() {
         start_server server-axis-js-native node trevrpc-js/bench/rpc_split_native.js server "$cert_file" "$key_file"
         port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "server-js-native-run-$run" "$run" server c_webtransport js_native_webtransport c-custom "$c_bench" --split-client webtransport 127.0.0.1 "$port" "$C_ITERATIONS"
+            run_split_sample "server-js-native-run-$run" "$run" server c_msquic js_msquic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         done
         stop_servers
     fi

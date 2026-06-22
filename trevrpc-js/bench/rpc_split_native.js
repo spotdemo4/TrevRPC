@@ -79,8 +79,9 @@ if (mode === "client") {
 }
 
 async function runClient(host, port, iterations) {
-  const transport = await NodeTransport.connect(`https://${host}:${port}/trevrpc`, {
-    skipCertificateValidation: true,
+  const transport = await NodeTransport.connect({
+    host,
+    port,
     maxStreamsPerSession: 128,
     idleTimeoutMs: IdleTimeoutMs,
   });
@@ -100,7 +101,6 @@ async function runServer(certFile, keyFile) {
   const server = await NodeServer.listen({
     host: "127.0.0.1",
     port: 0,
-    path: "/trevrpc",
     certFile,
     keyFile,
     maxSessionsPerConnection: 16,

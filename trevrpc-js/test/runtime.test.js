@@ -117,7 +117,7 @@ test("package root connect uses native transport under Node", async () => {
   await writeFile(
     fakeNativePath,
     `module.exports = {
-  async connectWebTransport(options) {
+  async connectMsQuic(options) {
     return {
       options,
       async call() {
@@ -161,8 +161,8 @@ test("package root connect uses native transport under Node", async () => {
 test("Node native addon loads when built", { skip: !existsSync(nativeAddonPath) }, () => {
   const native = require(nativeAddonPath);
 
-  assert.equal(typeof native.connectWebTransport, "function");
-  assert.equal(typeof native.listenWebTransport, "function");
+  assert.equal(typeof native.connectMsQuic, "function");
+  assert.equal(typeof native.listenMsQuic, "function");
 });
 
 test("frame length boundary cases are stable", () => {

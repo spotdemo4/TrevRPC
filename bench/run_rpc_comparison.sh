@@ -406,7 +406,7 @@ Reported latency is the median across measurements. The min..max column shows th
 
 Result tables are split by RPC shape and sorted by median throughput descending.
 
-Compare rows with the same shape first. Transport implementations differ: C uses MsQuic and WebTransport, JavaScript native uses Node-API over trevrpc-c WebTransport, Go uses quic-go plus MsQuic when enabled, and Rust uses Quinn. gRPC rows are included as language-local baselines, not identical transports.
+Compare rows with the same shape first. Transport implementations differ: C uses MsQuic, JavaScript native uses Node-API over trevrpc-c MsQuic, Go uses quic-go plus MsQuic when enabled, and Rust uses Quinn. gRPC rows are included as language-local baselines, not identical transports.
 
 Raw command output is saved under \`$RAW_DIR\`. Per-measurement normalized rows are saved in \`$SAMPLES_CSV\`. The exact commands are saved in \`$COMMAND_LOG\`.
 EOF

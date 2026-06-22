@@ -28,9 +28,9 @@ const transport = await connect("https://localhost:50051/trevrpc", {
 const client = new GreeterClient(transport);
 ```
 
-Node.js clients can pass native transport options such as `skipCertificateValidation` as the second argument. The explicit `WebTransportClient` and `NodeTransport` classes remain available when callers need direct transport-class access.
+Node.js clients can pass native transport options such as `maxStreamsPerSession` as the second argument. The explicit `WebTransportClient` and `NodeTransport` classes remain available when callers need direct transport-class access.
 
-Node.js servers can use the native server wrapper from the same subpath. The listener accepts both native TrevRPC QUIC clients and WebTransport clients:
+Node.js servers can use the native MsQuic server wrapper from the same subpath:
 
 ```js
 import { NodeServer } from "trevrpc-js/node";
@@ -42,7 +42,6 @@ const HelloReply = root.lookupType("hello.v1.HelloReply");
 const server = await NodeServer.listen({
   host: "127.0.0.1",
   port: 50051,
-  path: "/trevrpc",
   certFile: "localhost-cert.pem",
   keyFile: "localhost-key.pem",
 });

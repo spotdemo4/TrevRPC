@@ -78,24 +78,25 @@ server.stderr.on("data", (chunk) => process.stderr.write(chunk));
 let transport;
 try {
   const port = await waitForServerPort(server);
-  transport = await NodeTransport.connect(`https://127.0.0.1:${port}/trevrpc`, {
-    skipCertificateValidation: true,
+  transport = await NodeTransport.connect({
+    host: "127.0.0.1",
+    port,
     maxStreamsPerSession: 128,
     idleTimeoutMs: 600_000,
   });
   const client = createServiceClient(transport, GreeterService, root);
 
   await warmClient(client);
-  await runBenchmarkCase("unary_round_trip/trevrpc_js_native", iterations, () =>
+  await runBenchmarkCase("unary_round_trip/trevrpc_js_msquic", iterations, () =>
     unaryRoundTrip(client),
   );
-  await runBenchmarkCase("server_stream_16_messages/trevrpc_js_native", iterations, () =>
+  await runBenchmarkCase("server_stream_16_messages/trevrpc_js_msquic", iterations, () =>
     serverStreaming(client),
   );
-  await runBenchmarkCase("client_stream_16_messages/trevrpc_js_native", iterations, () =>
+  await runBenchmarkCase("client_stream_16_messages/trevrpc_js_msquic", iterations, () =>
     clientStreaming(client),
   );
-  await runBenchmarkCase("bidi_stream_16_messages/trevrpc_js_native", iterations, () =>
+  await runBenchmarkCase("bidi_stream_16_messages/trevrpc_js_msquic", iterations, () =>
     bidiStreaming(client),
   );
 } finally {
