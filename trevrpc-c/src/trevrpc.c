@@ -597,6 +597,9 @@ static int trevrpc_stream_shutdown_send_raw(trevrpc_stream* stream) {
 
 static void trevrpc_stream_close_raw(trevrpc_stream* stream) {
     if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        if (stream->owns_stream) {
+            (void)trevrpc_msquic_stream_abort(stream->msquic_stream);
+        }
         trevrpc_msquic_stream_close(stream->msquic_stream);
     } else if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         trevrpc_wt_stream_close(stream->wt_stream);
@@ -888,7 +891,7 @@ void trevrpc_stream_cancel(trevrpc_stream* stream) {
     }
 
     if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
-        (void)trevrpc_msquic_stream_abort_receive(stream->msquic_stream);
+        (void)trevrpc_msquic_stream_abort(stream->msquic_stream);
     } else if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         (void)trevrpc_wt_stream_abort(stream->wt_stream, 0);
     }

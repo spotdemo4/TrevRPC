@@ -51,6 +51,11 @@ typedef struct benchmark_fixture {
 
 typedef int (*benchmark_case)(trevrpc_client* client);
 
+typedef struct split_benchmark_case {
+    const char* name;
+    benchmark_case fn;
+} split_benchmark_case;
+
 static volatile size_t benchmark_count_sink;
 static volatile size_t benchmark_bytes_sink;
 static volatile sig_atomic_t split_server_stop_requested;
@@ -795,30 +800,46 @@ static int warm_client(const char* name, trevrpc_client* client) {
     return err;
 }
 
-static int warm_split_client(const char* name, trevrpc_client* client) {
-    int err = split_benchmark_unary_round_trip(client);
-    if (err == 0) {
-        err = split_benchmark_server_streaming(client);
-    } else {
-        fprintf(stderr, "warm %s unary failed: %s (%d)\n", name, trevrpc_error(err), err);
+static const split_benchmark_case split_benchmark_cases[] = {
+    {"unary_round_trip", split_benchmark_unary_round_trip},
+    {"server_stream_16_messages", split_benchmark_server_streaming},
+    {"client_stream_16_messages", split_benchmark_client_streaming},
+    {"bidi_stream_16_messages", split_benchmark_bidi_streaming},
+};
+
+static const split_benchmark_case* find_split_benchmark_case(const char* shape) {
+    if (shape == NULL || strcmp(shape, "all") == 0) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < sizeof(split_benchmark_cases) / sizeof(split_benchmark_cases[0]); i++) {
+        if (strcmp(shape, split_benchmark_cases[i].name) == 0) {
+            return &split_benchmark_cases[i];
+        }
+    }
+
+    return NULL;
+}
+
+static int warm_split_client(const char* name, trevrpc_client* client, const split_benchmark_case* only_case) {
+    if (only_case != NULL) {
+        int err = only_case->fn(client);
+        if (err != 0) {
+            fprintf(stderr, "warm %s %s failed: %s (%d)\n", name, only_case->name, trevrpc_error(err), err);
+        }
         return err;
     }
-    if (err == 0) {
-        err = split_benchmark_client_streaming(client);
-    } else {
-        fprintf(stderr, "warm %s server streaming failed: %s (%d)\n", name, trevrpc_error(err), err);
-        return err;
+
+    for (size_t i = 0; i < sizeof(split_benchmark_cases) / sizeof(split_benchmark_cases[0]); i++) {
+        int err = split_benchmark_cases[i].fn(client);
+        if (err != 0) {
+            fprintf(
+                stderr, "warm %s %s failed: %s (%d)\n", name, split_benchmark_cases[i].name, trevrpc_error(err), err);
+            return err;
+        }
     }
-    if (err == 0) {
-        err = split_benchmark_bidi_streaming(client);
-    } else {
-        fprintf(stderr, "warm %s client streaming failed: %s (%d)\n", name, trevrpc_error(err), err);
-        return err;
-    }
-    if (err != 0) {
-        fprintf(stderr, "warm %s bidi streaming failed: %s (%d)\n", name, trevrpc_error(err), err);
-    }
-    return err;
+
+    return 0;
 }
 
 static int connect_split_client(const char* transport, const char* host, uint16_t port, trevrpc_client** out_client) {
@@ -843,7 +864,14 @@ static int connect_split_client(const char* transport, const char* host, uint16_
     return -EINVAL;
 }
 
-static int run_split_client_mode(const char* transport, const char* host, uint16_t port, size_t iterations) {
+static int run_split_client_mode(
+    const char* transport, const char* host, uint16_t port, size_t iterations, const char* shape) {
+    const split_benchmark_case* only_case = find_split_benchmark_case(shape);
+    if (shape != NULL && strcmp(shape, "all") != 0 && only_case == NULL) {
+        fprintf(stderr, "unknown split benchmark shape: %s\n", shape);
+        return 2;
+    }
+
     trevrpc_client* client = NULL;
     int err = connect_split_client(transport, host, port, &client);
     if (err != 0) {
@@ -851,18 +879,14 @@ static int run_split_client_mode(const char* transport, const char* host, uint16
         return 1;
     }
 
-    err = warm_split_client(transport, client);
-    if (err == 0) {
-        err = run_benchmark_case("unary_round_trip", client, split_benchmark_unary_round_trip, iterations);
+    err = warm_split_client(transport, client, only_case);
+    if (err == 0 && only_case != NULL) {
+        err = run_benchmark_case(only_case->name, client, only_case->fn, iterations);
     }
-    if (err == 0) {
-        err = run_benchmark_case("server_stream_16_messages", client, split_benchmark_server_streaming, iterations);
-    }
-    if (err == 0) {
-        err = run_benchmark_case("client_stream_16_messages", client, split_benchmark_client_streaming, iterations);
-    }
-    if (err == 0) {
-        err = run_benchmark_case("bidi_stream_16_messages", client, split_benchmark_bidi_streaming, iterations);
+    for (size_t i = 0;
+        err == 0 && only_case == NULL && i < sizeof(split_benchmark_cases) / sizeof(split_benchmark_cases[0]);
+        i++) {
+        err = run_benchmark_case(split_benchmark_cases[i].name, client, split_benchmark_cases[i].fn, iterations);
     }
 
     trevrpc_client_close(client);
@@ -1043,8 +1067,10 @@ int main(int argc, char** argv) {
         return run_server_mode(true);
     }
     if (argc > 1 && strcmp(argv[1], "--split-client") == 0) {
-        if (argc != 6) {
-            fprintf(stderr, "usage: %s --split-client msquic|webtransport <host> <port> <iterations>\n", argv[0]);
+        if (argc != 6 && argc != 7) {
+            fprintf(stderr,
+                "usage: %s --split-client msquic|webtransport <host> <port> <iterations> [shape|all]\n",
+                argv[0]);
             return 2;
         }
         unsigned long port = strtoul(argv[4], NULL, 10);
@@ -1054,7 +1080,7 @@ int main(int argc, char** argv) {
         }
         size_t iterations = (size_t)strtoull(argv[5], NULL, 10);
         CHECK(iterations > 0);
-        return run_split_client_mode(argv[2], argv[3], (uint16_t)port, iterations);
+        return run_split_client_mode(argv[2], argv[3], (uint16_t)port, iterations, argc == 7 ? argv[6] : NULL);
     }
 
     size_t iterations = argc > 1 ? (size_t)strtoull(argv[1], NULL, 10) : 1000;

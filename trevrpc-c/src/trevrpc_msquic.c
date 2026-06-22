@@ -1037,6 +1037,18 @@ int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream) {
     return QUIC_FAILED(status) ? (int)status : 0;
 }
 
+int trevrpc_msquic_stream_abort(trevrpc_msquic_stream* stream) {
+    pthread_mutex_lock(&stream->mutex);
+    HQUIC handle = stream->handle;
+    pthread_mutex_unlock(&stream->mutex);
+    if (handle == NULL) {
+        return 0;
+    }
+
+    QUIC_STATUS status = TrevMsQuic->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    return QUIC_FAILED(status) ? (int)status : 0;
+}
+
 int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream) {
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
