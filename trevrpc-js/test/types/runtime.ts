@@ -1,4 +1,10 @@
-import { Code, createRoot, normalizeMetadata, unary } from "../../src/index.js";
+import {
+  Code,
+  connectWebTransport,
+  createRoot,
+  normalizeMetadata,
+  unary,
+} from "../../src/index.js";
 import type {
   RpcRequestMessage,
   RpcResponseMessage,
@@ -53,5 +59,10 @@ const reply = await unary<HelloMessage, HelloMessage>(
 );
 
 reply.value?.toUpperCase();
+
+const connected = await connectWebTransport("https://localhost:50051/trevrpc", {
+  skipCertificateValidation: true,
+});
+connected.close();
 
 async function* emptyFrames(): AsyncIterable<RpcStreamFrameMessage> {}

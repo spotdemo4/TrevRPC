@@ -4,29 +4,33 @@ JavaScript WebTransport client runtime and `protoc`/buf plugin for TrevRPC.
 
 ## Runtime
 
-Browser/WebTransport clients can use the pure JavaScript transport:
+Clients can use the unified WebTransport connector. It uses the native `trevrpc-c`-backed transport in Node.js and the browser `WebTransport` API in browsers:
 
 ```js
-import { WebTransportClient } from "trevrpc-js";
+import { connectWebTransport } from "trevrpc-js";
 import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
 
-const transport = await WebTransportClient.connect("https://localhost:50051/trevrpc");
+const transport = await connectWebTransport("https://localhost:50051/trevrpc");
 const client = new GreeterClient(transport, { timeoutMs: 5000 });
 
 const reply = await client.sayHello({ name: "Trev" });
 ```
 
-Node.js clients can use the native Node-API transport backed by `trevrpc-c` and MsQuic:
+Browser clients can pass native `WebTransport` constructor options through `webTransportOptions`:
 
 ```js
-import { NodeTransport } from "trevrpc-js/node";
+import { connectWebTransport } from "trevrpc-js";
 import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
 
-const transport = await NodeTransport.connectWebTransport("https://127.0.0.1:50051/trevrpc", {
-  skipCertificateValidation: true,
+const transport = await connectWebTransport("https://localhost:50051/trevrpc", {
+  webTransportOptions: {
+    serverCertificateHashes: [certificateHash],
+  },
 });
 const client = new GreeterClient(transport);
 ```
+
+Node.js clients can pass native transport options such as `skipCertificateValidation` as the second argument. The explicit `WebTransportClient` and `NodeTransport` classes remain available when callers need direct transport-class access.
 
 Node.js servers can use the native server wrapper from the same subpath:
 

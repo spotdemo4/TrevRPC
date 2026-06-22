@@ -294,9 +294,9 @@ async function runBrowserLifecycleScenario({ assertResult, eventPattern, scenari
 
 async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
   const {
-    WebTransportClient,
     bidirectionalStreaming,
     clientStreaming,
+    connectWebTransport,
     createRoot,
     serverStreaming,
   } = await import("/src/index.js");
@@ -318,7 +318,7 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
       },
     },
   }).lookupType("browser.lifecycle.Message");
-  const transport = await WebTransportClient.connect(webTransportURL, {
+  const transport = await connectWebTransport(webTransportURL, {
     webTransportOptions: await webTransportOptions(),
   });
   const options = {

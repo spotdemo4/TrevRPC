@@ -360,6 +360,35 @@ export interface WebTransportClientOptions extends CallOptions {
   webTransportOptions?: unknown;
 }
 
+export interface NodeWebTransportOptions {
+  host?: string;
+  port?: number;
+  path?: string;
+  origin?: string;
+  certFile?: string;
+  keyFile?: string;
+  caCertFile?: string;
+  skipCertificateValidation?: boolean;
+  maxSessionsPerConnection?: number;
+  maxStreamsPerSession?: number;
+  idleTimeoutMs?: number;
+  maxFrameSize?: number;
+}
+
+export interface ConnectWebTransportOptions
+  extends WebTransportClientOptions, NodeWebTransportOptions {}
+
+export interface ConnectedWebTransport extends Transport {
+  /** Closes the underlying WebTransport session or native client. */
+  close(closeInfo?: WebTransportCloseInfoLike): void;
+}
+
+/** Opens a WebTransport TrevRPC client for the current JavaScript runtime. */
+export function connectWebTransport(
+  url: string | URL,
+  options?: ConnectWebTransportOptions,
+): Promise<ConnectedWebTransport>;
+
 /** Transport implementation for TrevRPC over WebTransport. */
 export class WebTransportClient implements Transport {
   session: WebTransportSessionLike;

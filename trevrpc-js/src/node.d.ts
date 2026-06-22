@@ -1,4 +1,5 @@
 import type {
+  NodeWebTransportOptions as RuntimeNodeWebTransportOptions,
   RpcKindValue,
   RpcMethodKind,
   RpcResponseMessage,
@@ -7,20 +8,7 @@ import type {
   Transport,
 } from "./index.js";
 
-export interface NodeWebTransportOptions {
-  host?: string;
-  port?: number;
-  path?: string;
-  origin?: string;
-  certFile?: string;
-  keyFile?: string;
-  caCertFile?: string;
-  skipCertificateValidation?: boolean;
-  maxSessionsPerConnection?: number;
-  maxStreamsPerSession?: number;
-  idleTimeoutMs?: number;
-  maxFrameSize?: number;
-}
+export interface NodeWebTransportOptions extends RuntimeNodeWebTransportOptions {}
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */
 export class NodeTransport implements Transport {

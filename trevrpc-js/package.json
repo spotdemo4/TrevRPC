@@ -20,6 +20,8 @@
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
+      "node": "./src/index.node.js",
+      "browser": "./src/index.js",
       "import": "./src/index.js"
     },
     "./node": {
