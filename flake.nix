@@ -299,6 +299,7 @@
               ];
 
               nativeCheckInputs = with pkgs; [
+                clang-tools
                 oxfmt
                 oxlint
               ];
@@ -310,6 +311,8 @@
                 oxlint --deny-warnings
                 npm run typecheck
                 npm run build:native
+                clang-format --dry-run --Werror native/trevrpc_node.c
+                clang-tidy -p build/native native/trevrpc_node.c
                 npm test
               '';
 
