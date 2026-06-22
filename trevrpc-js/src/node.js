@@ -166,6 +166,7 @@ class NativeResponseFrameStream {
     this.returnDone = null;
     this.returnErrorReported = false;
     this.suppressReturnWriterError = false;
+    this.recvTask = null;
     this.writerDone = writerTask
       .catch((error) => {
         this.writerError = error;
@@ -184,7 +185,13 @@ class NativeResponseFrameStream {
       return { done: true, value: undefined };
     }
 
-    const frame = await this.stream.recv();
+    this.recvTask ??= this.#startRecv();
+    const result = await this.recvTask;
+    if (result.error != null) {
+      this.done = true;
+      throw result.error;
+    }
+    const frame = result.frame;
     if (frame == null) {
       this.done = true;
       await this.writerDone;
@@ -206,6 +213,9 @@ class NativeResponseFrameStream {
         this.suppressReturnWriterError = true;
       }
     }
+    if (!this.done) {
+      this.recvTask = this.#startRecv();
+    }
     return { done: false, value: frame };
   }
 
@@ -214,6 +224,7 @@ class NativeResponseFrameStream {
       this.done = true;
       this.returnDone = (async () => {
         this.stream.close();
+        await this.recvTask;
         await this.writerDone;
       })();
     }
@@ -224,6 +235,13 @@ class NativeResponseFrameStream {
       throw this.writerError;
     }
     return { done: true, value: undefined };
+  }
+
+  #startRecv() {
+    return this.stream.recv().then(
+      (frame) => ({ frame }),
+      (error) => ({ error }),
+    );
   }
 }
 

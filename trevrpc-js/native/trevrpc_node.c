@@ -102,32 +102,6 @@ typedef struct call_work {
   trevrpc_response *response;
 } call_work;
 
-typedef struct start_stream_work {
-  base_work base;
-  native_client *client;
-  bool acquired;
-  char *service;
-  char *method;
-  uint8_t *body;
-  size_t body_len;
-  uint32_t kind;
-  trevrpc_stream *stream;
-} start_stream_work;
-
-typedef struct stream_body_work {
-  base_work base;
-  native_stream *stream;
-  bool acquired;
-  uint8_t *body;
-  size_t body_len;
-} stream_body_work;
-
-typedef struct stream_simple_work {
-  base_work base;
-  native_stream *stream;
-  bool acquired;
-} stream_simple_work;
-
 typedef struct stream_recv_work {
   base_work base;
   native_stream *stream;
@@ -162,14 +136,6 @@ typedef struct call_response_work {
   bool acquired;
   trevrpc_response response;
 } call_response_work;
-
-typedef struct call_body_work {
-  base_work base;
-  native_call *call;
-  bool acquired;
-  uint8_t *body;
-  size_t body_len;
-} call_body_work;
 
 typedef struct call_finish_work {
   base_work base;
@@ -391,6 +357,60 @@ static int copy_bytes_arg(napi_env env, napi_value value, uint8_t **out,
   }
 
   return -EINVAL;
+}
+
+static int bytes_arg_view(napi_env env, napi_value value, const uint8_t **out,
+                          size_t *out_len) {
+  *out = NULL;
+  *out_len = 0;
+
+  bool is_typedarray = false;
+  napi_is_typedarray(env, value, &is_typedarray);
+  if (is_typedarray) {
+    napi_typedarray_type type = napi_uint8_array;
+    size_t len = 0;
+    void *data = NULL;
+    napi_value arraybuffer = NULL;
+    size_t byte_offset = 0;
+    if (napi_get_typedarray_info(env, value, &type, &len, &data, &arraybuffer,
+                                 &byte_offset) != napi_ok ||
+        type != napi_uint8_array) {
+      return -EINVAL;
+    }
+    *out = data;
+    *out_len = len;
+    return 0;
+  }
+
+  bool is_arraybuffer = false;
+  napi_is_arraybuffer(env, value, &is_arraybuffer);
+  if (is_arraybuffer) {
+    void *data = NULL;
+    size_t len = 0;
+    if (napi_get_arraybuffer_info(env, value, &data, &len) != napi_ok) {
+      return -EINVAL;
+    }
+    *out = data;
+    *out_len = len;
+    return 0;
+  }
+
+  return -EINVAL;
+}
+
+static napi_value promise_from_void_result(napi_env env, int err,
+                                           const char *operation) {
+  napi_value promise = NULL;
+  napi_deferred deferred = NULL;
+  napi_create_promise(env, &deferred, &promise);
+  if (err == 0) {
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    napi_resolve_deferred(env, deferred, undefined);
+  } else {
+    reject_native_error(env, deferred, err, operation);
+  }
+  return promise;
 }
 
 static napi_value make_uint8_array(napi_env env, const uint8_t *data,
@@ -1730,73 +1750,6 @@ static napi_value native_client_call(napi_env env, napi_callback_info info) {
   return queue_work(env, &work->base, "call", call_execute, call_complete);
 }
 
-static void start_stream_execute(napi_env env, void *data) {
-  (void)env;
-  start_stream_work *work = data;
-  trevrpc_client *client = NULL;
-  work->base.err = native_client_acquire(work->client, &client);
-  if (work->base.err != 0) {
-    return;
-  }
-  work->acquired = true;
-  work->base.err = trevrpc_client_start_stream(
-      client, work->service, work->method, work->kind, work->body,
-      work->body_len, &work->stream);
-}
-
-static void start_stream_complete(napi_env env, napi_status status,
-                                  void *data) {
-  start_stream_work *work = data;
-  if (work->base.err == 0 && status == napi_ok) {
-    native_stream *stream = calloc(1, sizeof(*stream));
-    if (stream == NULL) {
-      trevrpc_stream_close(work->stream);
-      if (work->acquired) {
-        native_client_release(work->client);
-        work->acquired = false;
-      }
-      reject_native_error(env, work->base.deferred, -ENOMEM, "startStream");
-    } else {
-      pthread_mutex_init(&stream->mutex, NULL);
-      stream->stream = work->stream;
-      stream->owner = work->client;
-      napi_value ctor = NULL;
-      napi_value external = NULL;
-      napi_value instance = NULL;
-      napi_status wrap_status =
-          napi_get_reference_value(env, NativeStreamConstructor, &ctor);
-      if (wrap_status == napi_ok) {
-        wrap_status = napi_create_external(env, stream, NULL, NULL, &external);
-      }
-      if (wrap_status == napi_ok) {
-        wrap_status = napi_new_instance(env, ctor, 1, &external, &instance);
-      }
-      if (wrap_status != napi_ok) {
-        clear_pending_exception(env);
-        native_stream_close_request(stream);
-        reject_native_error(env, work->base.deferred, -ENOMEM, "startStream");
-      } else {
-        napi_resolve_deferred(env, work->base.deferred, instance);
-      }
-    }
-  } else {
-    if (work->acquired) {
-      native_client_release(work->client);
-    }
-    reject_native_error(env, work->base.deferred,
-                        status == napi_ok ? work->base.err : -ECANCELED,
-                        "startStream");
-  }
-  if (work->base.receiver_ref != NULL) {
-    napi_delete_reference(env, work->base.receiver_ref);
-  }
-  napi_delete_async_work(env, work->base.work);
-  free(work->service);
-  free(work->method);
-  free(work->body);
-  free(work);
-}
-
 static napi_value native_client_start_stream(napi_env env,
                                              napi_callback_info info) {
   size_t argc = 4;
@@ -1809,37 +1762,85 @@ static napi_value native_client_start_stream(napi_env env,
     return NULL;
   }
 
-  start_stream_work *work = calloc(1, sizeof(*work));
-  if (work == NULL) {
-    napi_throw_error(env, NULL, "failed to allocate startStream work");
+  native_client *client = NULL;
+  if (!unwrap_native_client(env, this_arg, &client)) {
     return NULL;
   }
-  if (!unwrap_native_client(env, this_arg, &work->client) ||
-      !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-    free(work);
-    return NULL;
-  }
-  int err = copy_string_arg(env, args[0], &work->service);
+  char *service = NULL;
+  char *method = NULL;
+  const uint8_t *body = NULL;
+  size_t body_len = 0;
+  uint32_t kind = 0;
+  int err = copy_string_arg(env, args[0], &service);
   if (err == 0) {
-    err = copy_string_arg(env, args[1], &work->method);
+    err = copy_string_arg(env, args[1], &method);
   }
-  if (err == 0 && napi_get_value_uint32(env, args[2], &work->kind) != napi_ok) {
+  if (err == 0 && napi_get_value_uint32(env, args[2], &kind) != napi_ok) {
     err = -EINVAL;
   }
   if (err == 0) {
-    err = copy_bytes_arg(env, args[3], &work->body, &work->body_len);
+    err = bytes_arg_view(env, args[3], &body, &body_len);
   }
   if (err != 0) {
-    napi_delete_reference(env, work->base.receiver_ref);
-    free(work->service);
-    free(work->method);
-    free(work->body);
-    free(work);
+    free(service);
+    free(method);
     napi_throw_type_error(env, NULL, "invalid startStream arguments");
     return NULL;
   }
-  return queue_work(env, &work->base, "startStream", start_stream_execute,
-                    start_stream_complete);
+
+  napi_value promise = NULL;
+  napi_deferred deferred = NULL;
+  napi_create_promise(env, &deferred, &promise);
+
+  trevrpc_client *c_client = NULL;
+  trevrpc_stream *c_stream = NULL;
+  err = native_client_acquire(client, &c_client);
+  bool acquired = err == 0;
+  if (err == 0) {
+    err = trevrpc_client_start_stream(c_client, service, method, kind, body,
+                                      body_len, &c_stream);
+  }
+  free(service);
+  free(method);
+
+  if (err != 0) {
+    if (acquired) {
+      native_client_release(client);
+    }
+    reject_native_error(env, deferred, err, "startStream");
+    return promise;
+  }
+
+  native_stream *stream = calloc(1, sizeof(*stream));
+  if (stream == NULL) {
+    trevrpc_stream_close(c_stream);
+    native_client_release(client);
+    reject_native_error(env, deferred, -ENOMEM, "startStream");
+    return promise;
+  }
+  pthread_mutex_init(&stream->mutex, NULL);
+  stream->stream = c_stream;
+  stream->owner = client;
+
+  napi_value ctor = NULL;
+  napi_value external = NULL;
+  napi_value instance = NULL;
+  napi_status wrap_status =
+      napi_get_reference_value(env, NativeStreamConstructor, &ctor);
+  if (wrap_status == napi_ok) {
+    wrap_status = napi_create_external(env, stream, NULL, NULL, &external);
+  }
+  if (wrap_status == napi_ok) {
+    wrap_status = napi_new_instance(env, ctor, 1, &external, &instance);
+  }
+  if (wrap_status != napi_ok) {
+    clear_pending_exception(env);
+    native_stream_close_request(stream);
+    reject_native_error(env, deferred, -ENOMEM, "startStream");
+  } else {
+    napi_resolve_deferred(env, deferred, instance);
+  }
+  return promise;
 }
 
 static napi_value native_client_close(napi_env env, napi_callback_info info) {
@@ -1855,41 +1856,6 @@ static napi_value native_client_close(napi_env env, napi_callback_info info) {
   return undefined;
 }
 
-static void stream_send_execute(napi_env env, void *data) {
-  (void)env;
-  stream_body_work *work = data;
-  trevrpc_stream *stream = NULL;
-  work->base.err = native_stream_acquire(work->stream, &stream);
-  if (work->base.err != 0) {
-    return;
-  }
-  work->acquired = true;
-  work->base.err =
-      trevrpc_stream_send_message(stream, work->body, work->body_len);
-}
-
-static void stream_send_complete(napi_env env, napi_status status, void *data) {
-  stream_body_work *work = data;
-  if (work->base.err == 0 && status == napi_ok) {
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    napi_resolve_deferred(env, work->base.deferred, undefined);
-  } else {
-    reject_native_error(env, work->base.deferred,
-                        status == napi_ok ? work->base.err : -ECANCELED,
-                        "sendMessage");
-  }
-  if (work->acquired) {
-    native_stream_release(work->stream);
-  }
-  if (work->base.receiver_ref != NULL) {
-    napi_delete_reference(env, work->base.receiver_ref);
-  }
-  napi_delete_async_work(env, work->base.work);
-  free(work->body);
-  free(work);
-}
-
 static napi_value native_stream_send_message(napi_env env,
                                              napi_callback_info info) {
   size_t argc = 1;
@@ -1900,76 +1866,42 @@ static napi_value native_stream_send_message(napi_env env,
     napi_throw_type_error(env, NULL, "sendMessage requires a body");
     return NULL;
   }
-  stream_body_work *work = calloc(1, sizeof(*work));
-  if (work == NULL) {
-    napi_throw_error(env, NULL, "failed to allocate sendMessage work");
+  native_stream *stream = NULL;
+  if (!unwrap_native_stream(env, this_arg, &stream)) {
     return NULL;
   }
-  if (!unwrap_native_stream(env, this_arg, &work->stream) ||
-      !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-    free(work);
-    return NULL;
-  }
-  if (copy_bytes_arg(env, args[0], &work->body, &work->body_len) != 0) {
-    napi_delete_reference(env, work->base.receiver_ref);
-    free(work);
+  const uint8_t *body = NULL;
+  size_t body_len = 0;
+  if (bytes_arg_view(env, args[0], &body, &body_len) != 0) {
     napi_throw_type_error(env, NULL, "invalid sendMessage body");
     return NULL;
   }
-  return queue_work(env, &work->base, "sendMessage", stream_send_execute,
-                    stream_send_complete);
-}
 
-static void stream_finish_execute(napi_env env, void *data) {
-  (void)env;
-  stream_simple_work *work = data;
-  trevrpc_stream *stream = NULL;
-  work->base.err = native_stream_acquire(work->stream, &stream);
-  if (work->base.err != 0) {
-    return;
+  trevrpc_stream *c_stream = NULL;
+  int err = native_stream_acquire(stream, &c_stream);
+  if (err == 0) {
+    err = trevrpc_stream_send_message(c_stream, body, body_len);
+    native_stream_release(stream);
   }
-  work->acquired = true;
-  work->base.err = trevrpc_stream_finish_send(stream);
-}
-
-static void stream_finish_complete(napi_env env, napi_status status,
-                                   void *data) {
-  stream_simple_work *work = data;
-  if (status != napi_ok) {
-    reject_native_error(env, work->base.deferred, -ECANCELED, "finishSend");
-  } else if (work->base.err != 0) {
-    reject_native_error(env, work->base.deferred, work->base.err, "finishSend");
-  } else {
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    napi_resolve_deferred(env, work->base.deferred, undefined);
-  }
-  if (work->acquired) {
-    native_stream_release(work->stream);
-  }
-  if (work->base.receiver_ref != NULL) {
-    napi_delete_reference(env, work->base.receiver_ref);
-  }
-  napi_delete_async_work(env, work->base.work);
-  free(work);
+  return promise_from_void_result(env, err, "sendMessage");
 }
 
 static napi_value native_stream_finish_send(napi_env env,
                                             napi_callback_info info) {
   napi_value this_arg = NULL;
   napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-  stream_simple_work *work = calloc(1, sizeof(*work));
-  if (work == NULL) {
-    napi_throw_error(env, NULL, "failed to allocate finishSend work");
+  native_stream *stream = NULL;
+  if (!unwrap_native_stream(env, this_arg, &stream)) {
     return NULL;
   }
-  if (!unwrap_native_stream(env, this_arg, &work->stream) ||
-      !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-    free(work);
-    return NULL;
+
+  trevrpc_stream *c_stream = NULL;
+  int err = native_stream_acquire(stream, &c_stream);
+  if (err == 0) {
+    err = trevrpc_stream_finish_send(c_stream);
+    native_stream_release(stream);
   }
-  return queue_work(env, &work->base, "finishSend", stream_finish_execute,
-                    stream_finish_complete);
+  return promise_from_void_result(env, err, "finishSend");
 }
 
 static void stream_recv_execute(napi_env env, void *data) {
@@ -2109,44 +2041,6 @@ static napi_value native_call_respond(napi_env env, napi_callback_info info) {
                     call_respond_complete);
 }
 
-static void call_send_execute(napi_env env, void *data) {
-  (void)env;
-  call_body_work *work = data;
-  trevrpc_call *call = NULL;
-  work->base.err = native_call_acquire(work->call, &call);
-  if (work->base.err != 0) {
-    return;
-  }
-  work->acquired = true;
-  trevrpc_stream *stream = trevrpc_call_stream(call);
-  work->base.err =
-      stream == NULL
-          ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
-          : trevrpc_stream_send_message(stream, work->body, work->body_len);
-}
-
-static void call_send_complete(napi_env env, napi_status status, void *data) {
-  call_body_work *work = data;
-  if (status == napi_ok && work->base.err == 0) {
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    napi_resolve_deferred(env, work->base.deferred, undefined);
-  } else {
-    reject_native_error(env, work->base.deferred,
-                        status == napi_ok ? work->base.err : -ECANCELED,
-                        "sendMessage");
-  }
-  if (work->acquired) {
-    native_call_release(work->call);
-  }
-  if (work->base.receiver_ref != NULL) {
-    napi_delete_reference(env, work->base.receiver_ref);
-  }
-  napi_delete_async_work(env, work->base.work);
-  free(work->body);
-  free(work);
-}
-
 static napi_value native_call_send_message(napi_env env,
                                            napi_callback_info info) {
   size_t argc = 1;
@@ -2157,24 +2051,26 @@ static napi_value native_call_send_message(napi_env env,
     napi_throw_type_error(env, NULL, "sendMessage requires a body");
     return NULL;
   }
-  call_body_work *work = calloc(1, sizeof(*work));
-  if (work == NULL) {
-    napi_throw_error(env, NULL, "failed to allocate sendMessage work");
+  native_call *call = NULL;
+  if (!unwrap_native_call(env, this_arg, &call)) {
     return NULL;
   }
-  if (!unwrap_native_call(env, this_arg, &work->call) ||
-      !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-    free(work);
-    return NULL;
-  }
-  if (copy_bytes_arg(env, args[0], &work->body, &work->body_len) != 0) {
-    napi_delete_reference(env, work->base.receiver_ref);
-    free(work);
+  const uint8_t *body = NULL;
+  size_t body_len = 0;
+  if (bytes_arg_view(env, args[0], &body, &body_len) != 0) {
     napi_throw_type_error(env, NULL, "invalid sendMessage body");
     return NULL;
   }
-  return queue_work(env, &work->base, "sendMessage", call_send_execute,
-                    call_send_complete);
+
+  trevrpc_call *c_call = NULL;
+  int err = native_call_acquire(call, &c_call);
+  if (err == 0) {
+    trevrpc_stream *stream = trevrpc_call_stream(c_call);
+    err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
+                         : trevrpc_stream_send_message(stream, body, body_len);
+    native_call_release(call);
+  }
+  return promise_from_void_result(env, err, "sendMessage");
 }
 
 static void call_finish_execute(napi_env env, void *data) {
