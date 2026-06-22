@@ -752,6 +752,18 @@ int trevrpc_stream_finish_send(trevrpc_stream* stream) {
     return trevrpc_stream_shutdown_send_raw(stream);
 }
 
+void trevrpc_stream_cancel(trevrpc_stream* stream) {
+    if (stream == NULL) {
+        return;
+    }
+
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        (void)trevrpc_msquic_stream_abort_receive(stream->msquic_stream);
+    } else if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
+        (void)trevrpc_wt_stream_abort(stream->wt_stream, 0);
+    }
+}
+
 void trevrpc_stream_close(trevrpc_stream* stream) {
     if (stream == NULL) {
         return;
@@ -983,6 +995,18 @@ int trevrpc_client_start_stream(trevrpc_client* client,
 
     *out_stream = stream;
     return 0;
+}
+
+void trevrpc_client_shutdown(trevrpc_client* client) {
+    if (client == NULL) {
+        return;
+    }
+
+    if (client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        trevrpc_msquic_conn_shutdown(client->msquic_conn);
+    } else if (client->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
+        trevrpc_wt_session_shutdown(client->wt_session);
+    }
 }
 
 void trevrpc_client_close(trevrpc_client* client) {

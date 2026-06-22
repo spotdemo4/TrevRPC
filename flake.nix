@@ -273,19 +273,30 @@
                 npmRoot = final.src;
               };
 
-              dontNpmBuild = true;
+              npmBuildScript = "build:native";
+              dontUseCmakeConfigure = true;
+              TREVRPC_C_ROOT = ./trevrpc-c;
+              NODE_INCLUDE_DIR = "${pkgs.nodejs_24}/include/node";
               PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
+              nativeBuildInputs = with pkgs; [
+                cmake
+              ];
               nativeCheckInputs = with pkgs; [
                 oxfmt
                 oxlint
               ];
+              buildInputs = with pkgs; [
+                libmsquic
+              ];
               checkPhase = ''
                 mkdir -p ../testdata
                 cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
+                rm -rf build
                 oxfmt --check
                 oxlint --deny-warnings
                 npm run typecheck
+                npm run build:native
                 npm test
               '';
 

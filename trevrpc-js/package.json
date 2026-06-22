@@ -9,6 +9,8 @@
   "files": [
     "bin",
     "examples",
+    "native",
+    "build/native/*.node",
     "src"
   ],
   "type": "module",
@@ -18,9 +20,14 @@
     ".": {
       "types": "./src/index.d.ts",
       "import": "./src/index.js"
+    },
+    "./node": {
+      "types": "./src/node.d.ts",
+      "import": "./src/node.js"
     }
   },
   "scripts": {
+    "build:native": "cmake -S native -B build/native ${TREVRPC_C_ROOT:+-DTREVRPC_C_ROOT=$TREVRPC_C_ROOT} ${NODE_INCLUDE_DIR:+-DNODE_INCLUDE_DIR=$NODE_INCLUDE_DIR} && cmake --build build/native",
     "check": "npm run lint && npm run typecheck && npm test",
     "example:greeter": "node examples/greeter/static-server.js",
     "format": "oxfmt --write",

@@ -4,6 +4,8 @@ JavaScript WebTransport client runtime and `protoc`/buf plugin for TrevRPC.
 
 ## Runtime
 
+Browser/WebTransport clients can use the pure JavaScript transport:
+
 ```js
 import { WebTransportClient } from "trevrpc-js";
 import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
@@ -13,6 +15,20 @@ const client = new GreeterClient(transport, { timeoutMs: 5000 });
 
 const reply = await client.sayHello({ name: "Trev" });
 ```
+
+Node.js clients can use the native Node-API transport backed by `trevrpc-c` and MsQuic:
+
+```js
+import { NodeTransport } from "trevrpc-js/node";
+import { GreeterClient } from "./hello/v1/greeter.trevrpc.js";
+
+const transport = await NodeTransport.connectWebTransport("https://127.0.0.1:50051/trevrpc", {
+  skipCertificateValidation: true,
+});
+const client = new GreeterClient(transport);
+```
+
+Build the native addon from a repository checkout with `npm run build:native`. Set `TREVRPC_JS_NATIVE=/path/to/trevrpc_native.node` to load an explicit addon build.
 
 Streaming methods use async iterables:
 

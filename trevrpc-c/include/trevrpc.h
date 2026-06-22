@@ -284,6 +284,7 @@ int trevrpc_client_start_stream(trevrpc_client* client,
     const uint8_t* body,
     size_t body_len,
     trevrpc_stream** stream);
+void trevrpc_client_shutdown(trevrpc_client* client);
 void trevrpc_client_close(trevrpc_client* client);
 
 void trevrpc_request_reset(trevrpc_request* request);
@@ -325,6 +326,7 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
 int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len);
 int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** frame);
 int trevrpc_stream_finish_send(trevrpc_stream* stream);
+void trevrpc_stream_cancel(trevrpc_stream* stream);
 void trevrpc_stream_close(trevrpc_stream* stream);
 
 int trevrpc_stream_frame_set_message(trevrpc_stream_frame* frame, const char* message, size_t message_len);

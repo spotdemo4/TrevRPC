@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -35,6 +37,9 @@ import {
   validateMetadata,
 } from "../src/index.js";
 
+const require = createRequire(import.meta.url);
+const nativeAddonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
+
 test("frames round-trip TrevRPC requests", () => {
   const frame = encodeFrame(RpcRequest, {
     service: "hello.v1.Greeter",
@@ -57,6 +62,19 @@ test("frames round-trip TrevRPC requests", () => {
     decoded.metadata.authorization,
     new Uint8Array([66, 101, 97, 114, 101, 114, 32, 116, 111, 107, 101, 110]),
   );
+});
+
+test("Node native transport subpath exports without loading the addon", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+
+  assert.equal(typeof NodeTransport, "function");
+  assert.equal(typeof NodeTransport.connectWebTransport, "function");
+});
+
+test("Node native addon loads when built", { skip: !existsSync(nativeAddonPath) }, () => {
+  const native = require(nativeAddonPath);
+
+  assert.equal(typeof native.connectWebTransport, "function");
 });
 
 test("frame length boundary cases are stable", () => {
