@@ -15,7 +15,7 @@ RPC_RUNS=${RPC_RUNS:-3}
 C_ITERATIONS=${C_ITERATIONS:-$RPC_ITERATIONS}
 GO_BENCHTIME=${GO_BENCHTIME:-${RPC_ITERATIONS}x}
 GO_COUNT=${GO_COUNT:-1}
-RUST_SAMPLE_SIZE=${RUST_SAMPLE_SIZE:-100}
+RUST_SAMPLE_SIZE=${RUST_SAMPLE_SIZE:-10000}
 RUST_WARM_UP_TIME=${RUST_WARM_UP_TIME:-3}
 RUST_MEASUREMENT_TIME=${RUST_MEASUREMENT_TIME:-10}
 JS_ITERATIONS=${JS_ITERATIONS:-$RPC_ITERATIONS}
@@ -42,7 +42,7 @@ Environment knobs:
   C_ITERATIONS            C benchmark iterations. Default: RPC_ITERATIONS
   GO_BENCHTIME            Go -benchtime value. Default: ${RPC_ITERATIONS}x
   GO_COUNT                Go -count value per RPC_RUNS repetition. Default: 1
-  RUST_SAMPLE_SIZE        Criterion sample size. Default: 100
+  RUST_SAMPLE_SIZE        Criterion sample size. Default: 10000
   RUST_WARM_UP_TIME       Criterion warm-up seconds. Default: 3
   RUST_MEASUREMENT_TIME   Criterion measurement seconds. Default: 10
   JS_ITERATIONS           Native Node.js benchmark iterations. Default: RPC_ITERATIONS
