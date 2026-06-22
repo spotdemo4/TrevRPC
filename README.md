@@ -7,21 +7,3 @@
 Protobuf over QUIC & WebTransport
 
 Full documentation is available in the [TrevRPC wiki](https://trev.zip/llc/TrevRPC/wiki)
-
-## Benchmarks
-
-Run the cross-language RPC comparison from a dev shell:
-
-```sh
-nix develop -c bench/run_rpc_comparison.sh
-```
-
-The runner writes normalized CSV and Markdown reports under `target/rpc-comparison/` and keeps raw C, Go, JavaScript, and Rust benchmark output for auditability.
-
-To split client and server measurements for TrevRPC transports and include the Go gRPC baseline, run:
-
-```sh
-nix develop -c bench/run_rpc_split.sh
-```
-
-The split runner writes reports under `target/rpc-split/` with separate `client`, `server`, and Go gRPC baseline axes.
