@@ -1114,33 +1114,35 @@ int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream) {
         return 0;
     }
     stream->send_closed = true;
+    QUIC_STATUS status = TrevMsQuic->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
     pthread_mutex_unlock(&stream->mutex);
 
-    QUIC_STATUS status = TrevMsQuic->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
     return QUIC_FAILED(status) ? (int)status : 0;
 }
 
 int trevrpc_msquic_stream_abort(trevrpc_msquic_stream* stream) {
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
-    pthread_mutex_unlock(&stream->mutex);
     if (handle == NULL) {
+        pthread_mutex_unlock(&stream->mutex);
         return 0;
     }
 
     QUIC_STATUS status = TrevMsQuic->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    pthread_mutex_unlock(&stream->mutex);
     return QUIC_FAILED(status) ? (int)status : 0;
 }
 
 int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream) {
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
-    pthread_mutex_unlock(&stream->mutex);
     if (handle == NULL) {
+        pthread_mutex_unlock(&stream->mutex);
         return 0;
     }
 
     QUIC_STATUS status = TrevMsQuic->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, 0);
+    pthread_mutex_unlock(&stream->mutex);
     return QUIC_FAILED(status) ? (int)status : 0;
 }
 
@@ -1152,12 +1154,9 @@ void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
     bool graceful = stream->send_closed;
-    pthread_mutex_unlock(&stream->mutex);
     if (handle != NULL && !graceful) {
         TrevMsQuic->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     }
-
-    pthread_mutex_lock(&stream->mutex);
     while (stream->handle != NULL && !stream->shutdown_complete) {
         pthread_cond_wait(&stream->cond, &stream->mutex);
     }
