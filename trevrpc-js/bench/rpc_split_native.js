@@ -103,8 +103,10 @@ async function runServer(certFile, keyFile) {
     port: 0,
     certFile,
     keyFile,
+    path: "/trevrpc",
+    origin: process.env.TREVRPC_WEBTRANSPORT_ORIGIN,
     maxSessionsPerConnection: 16,
-    maxStreamsPerSession: 128,
+    maxStreamsPerSession: 65_535,
     idleTimeoutMs: IdleTimeoutMs,
   });
   server.registerService(GreeterService, {

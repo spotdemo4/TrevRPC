@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
@@ -40,7 +42,7 @@ type grpcSplitGreeter struct{}
 
 func main() {
 	mode := flag.String("mode", "", "client or server")
-	transport := flag.String("transport", "quic", "quic, msquic, or grpc")
+	transport := flag.String("transport", "quic", "quic, msquic, webtransport, or grpc")
 	addr := flag.String("addr", "127.0.0.1:0", "listen or dial address")
 	cert := flag.String("cert", "", "PEM certificate path")
 	key := flag.String("key", "", "PEM private key path")
@@ -114,6 +116,11 @@ func runServer(transportName, addr, certFile, keyFile string) error {
 	options := server.Options()
 	options.GracefulShutdownTimeout = time.Second
 	options.StreamIdleTimeout = 0
+	if transportName == "webtransport" {
+		options.EnableWebTransport = true
+		options.MaxConcurrentStreamsPerConnection = 65535
+		options.WebTransportCheckOrigin = func(*http.Request) bool { return true }
+	}
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, splitGreeter{})
 
@@ -261,6 +268,19 @@ func listenTransport(transportName, addr, certFile, keyFile string, server *trev
 				KeepAlive:           keepAlive,
 				PeerBidiStreamCount: 128,
 			},
+		})
+	case "webtransport":
+		if certFile == "" || keyFile == "" {
+			return nil, errors.New("webtransport server requires -cert and -key")
+		}
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, err
+		}
+		return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
+			Kind:       trevrpc.TransportQUICGo,
+			TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN, http3.NextProtoH3}},
+			QUICConfig: quicConfig(),
 		})
 	default:
 		return nil, fmt.Errorf("unsupported transport %q", transportName)

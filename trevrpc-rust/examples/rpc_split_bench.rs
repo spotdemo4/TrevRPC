@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fs;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::Path;
@@ -39,7 +40,16 @@ async fn main() -> BenchResult {
                 .parse::<SocketAddr>()?;
             run_server(addr).await
         }
-        _ => Err("usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr]".into()),
+        Some("webtransport-server") => {
+            let addr = required_arg(&mut args, "addr")?.parse::<SocketAddr>()?;
+            let cert = required_arg(&mut args, "cert")?;
+            let origin = required_arg(&mut args, "origin")?;
+            run_webtransport_server(addr, Path::new(&cert), origin).await
+        }
+        _ => Err(
+            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin>"
+                .into(),
+        ),
     }
 }
 
@@ -84,6 +94,25 @@ async fn run_server(addr: SocketAddr) -> BenchResult {
     println!("PORT {}", local_addr.port());
     server
         .serve_quinn_with_shutdown(endpoint, shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+async fn run_webtransport_server(
+    addr: SocketAddr,
+    cert_path: &Path,
+    origin: String,
+) -> BenchResult {
+    let mut server = trevrpc::server::Server::new();
+    server.set_options(benchmark_webtransport_server_options(origin));
+    greeter::register_greeter(&mut server, SplitGreeter);
+    let endpoint = make_webtransport_server_endpoint(addr, server.options(), cert_path)?;
+    let local_addr = endpoint.local_addr()?;
+
+    println!("PORT {}", local_addr.port());
+    println!("CERT {}", cert_path.display());
+    server
+        .serve_quinn_and_webtransport_with_shutdown(endpoint, shutdown_signal())
         .await?;
     Ok(())
 }
@@ -266,10 +295,48 @@ fn benchmark_server_options() -> trevrpc::server::ServerOptions {
         .with_max_concurrent_requests(Some(1024))
 }
 
+fn benchmark_webtransport_server_options(origin: String) -> trevrpc::server::ServerOptions {
+    let origin: &'static str = Box::leak(origin.into_boxed_str());
+    let origins: &'static [&'static str] = Box::leak(vec![origin].into_boxed_slice());
+    benchmark_server_options()
+        .with_max_concurrent_streams_per_connection(Some(65_535))
+        .with_webtransport_allowed_origins(origins)
+}
+
 fn make_server_endpoint(
     addr: SocketAddr,
     options: &trevrpc::server::ServerOptions,
 ) -> BenchResult<quinn::Endpoint> {
+    let identity = make_identity()?;
+    make_server_endpoint_with_identity(
+        addr,
+        options,
+        &identity,
+        vec![trevrpc::ALPN.to_vec()],
+        false,
+    )
+}
+
+fn make_webtransport_server_endpoint(
+    addr: SocketAddr,
+    options: &trevrpc::server::ServerOptions,
+    cert_path: &Path,
+) -> BenchResult<quinn::Endpoint> {
+    let identity = make_identity()?;
+    write_certificate(&identity, cert_path)?;
+    make_server_endpoint_with_identity(
+        addr,
+        options,
+        &identity,
+        vec![
+            trevrpc::ALPN.to_vec(),
+            web_transport_quinn::ALPN.as_bytes().to_vec(),
+        ],
+        true,
+    )
+}
+
+fn make_identity() -> BenchResult<rcgen::CertifiedKey<rcgen::KeyPair>> {
     let signing_key = rcgen::KeyPair::generate()?;
     let not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
     let mut params =
@@ -277,17 +344,39 @@ fn make_server_endpoint(
     params.not_before = not_before;
     params.not_after = not_before + time::Duration::hours(25);
     let cert = params.self_signed(&signing_key)?;
-    let key_der = PrivatePkcs8KeyDer::from(signing_key.serialize_der());
+
+    Ok(rcgen::CertifiedKey { cert, signing_key })
+}
+
+fn make_server_endpoint_with_identity(
+    addr: SocketAddr,
+    options: &trevrpc::server::ServerOptions,
+    identity: &rcgen::CertifiedKey<rcgen::KeyPair>,
+    alpn_protocols: Vec<Vec<u8>>,
+    enable_webtransport: bool,
+) -> BenchResult<quinn::Endpoint> {
+    let key_der = PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der());
 
     let mut server_crypto = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert.der().clone()], PrivateKeyDer::from(key_der))?;
-    server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+        .with_single_cert(
+            vec![identity.cert.der().clone()],
+            PrivateKeyDer::from(key_der),
+        )?;
+    server_crypto.alpn_protocols = alpn_protocols;
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    trevrpc::quinn::configure_server_config(&mut server_config, options, false);
+    trevrpc::quinn::configure_server_config(&mut server_config, options, enable_webtransport);
     Ok(quinn::Endpoint::server(server_config, addr)?)
+}
+
+fn write_certificate(identity: &rcgen::CertifiedKey<rcgen::KeyPair>, path: &Path) -> BenchResult {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, identity.cert.pem())?;
+    Ok(())
 }
 
 fn make_client_endpoint(cert_path: &Path) -> BenchResult<quinn::Endpoint> {

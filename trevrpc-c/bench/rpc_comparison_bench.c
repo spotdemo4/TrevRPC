@@ -935,7 +935,7 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
     server_config.max_binding_stateless_operations = 256;
     server_config.webtransport_path = "/trevrpc";
     server_config.max_sessions_per_connection = 16;
-    server_config.max_streams_per_session = 128;
+    server_config.max_streams_per_session = 65535;
 
     int err = trevrpc_server_listen(&server_config, &fixture->server);
     if (err != 0) {

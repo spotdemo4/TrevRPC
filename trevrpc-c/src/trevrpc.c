@@ -2092,7 +2092,7 @@ static int trevrpc_server_conn_add(trevrpc_server* server,
         if (conn != NULL) {
             trevrpc_msquic_conn_shutdown(conn);
         } else if (wt_session != NULL) {
-            trevrpc_wt_session_close(wt_session);
+            trevrpc_wt_session_shutdown(wt_session);
         }
     }
 
