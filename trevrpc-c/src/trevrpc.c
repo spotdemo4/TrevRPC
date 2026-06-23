@@ -57,6 +57,7 @@ struct trevrpc_stream {
     size_t max_frame_size;
     bool owns_stream;
     bool sent_status;
+    bool status_queued;
     uint32_t terminal_status;
     int64_t max_stream_messages;
     int64_t max_stream_body_size;
@@ -904,6 +905,7 @@ int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const ch
         trevrpc_test_record_stream_status(status);
 #endif
         err = trevrpc_stream_write_frame(stream, frame, frame_len);
+        stream->status_queued = err == 0;
     }
     free(frame);
     return err;
@@ -2146,11 +2148,10 @@ static void trevrpc_server_write_response(trevrpc_stream* stream, trevrpc_respon
         trevrpc_set_status(response, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "response frame exceeded maximum size");
         encode_err = trevrpc_wire_encode_response(response, stream->max_frame_size, &frame, &frame_len);
     }
-    if (encode_err == 0) {
-        (void)trevrpc_stream_write_frame(stream, frame, frame_len);
+    if (encode_err == 0 && trevrpc_stream_write_frame(stream, frame, frame_len) == 0) {
+        (void)trevrpc_stream_shutdown_send_raw(stream);
     }
     free(frame);
-    (void)trevrpc_stream_shutdown_send_raw(stream);
 }
 
 static void trevrpc_server_write_status(trevrpc_stream* stream, uint32_t status, const char* message) {
@@ -2161,8 +2162,10 @@ static void trevrpc_server_write_status(trevrpc_stream* stream, uint32_t status,
 }
 
 static void trevrpc_server_write_stream_status(trevrpc_stream* stream, uint32_t status, const char* message) {
-    (void)trevrpc_stream_send_status(stream, status, message, message == NULL ? 0 : strlen(message));
-    (void)trevrpc_stream_shutdown_send_raw(stream);
+    if (trevrpc_stream_send_status(stream, status, message, message == NULL ? 0 : strlen(message)) == 0 &&
+        stream->status_queued) {
+        (void)trevrpc_stream_shutdown_send_raw(stream);
+    }
 }
 
 static uint32_t trevrpc_status_from_error(int err, const char** message) {
@@ -2448,7 +2451,9 @@ static void trevrpc_call_write_stream_finish(
         call->final_status = call->stream.terminal_status;
     }
     call->response_body_len = (size_t)call->stream.response_body_size;
-    (void)trevrpc_stream_finish_send(&call->stream);
+    if (call->stream.status_queued) {
+        (void)trevrpc_stream_finish_send(&call->stream);
+    }
 }
 
 int trevrpc_call_finish_stream(trevrpc_call* call, uint32_t status, const char* message, size_t message_len) {
@@ -2480,7 +2485,9 @@ void trevrpc_call_close(trevrpc_call* call) {
         call->stream.context = NULL;
         (void)trevrpc_stream_send_status(
             &call->stream, TREVRPC_STATUS_CANCELLED, "RPC cancelled", strlen("RPC cancelled"));
-        (void)trevrpc_stream_finish_send(&call->stream);
+        if (call->stream.status_queued) {
+            (void)trevrpc_stream_finish_send(&call->stream);
+        }
     }
     call->final_status = TREVRPC_STATUS_CANCELLED;
     call->response_body_len = (size_t)call->stream.response_body_size;
@@ -2787,7 +2794,9 @@ static bool trevrpc_handle_stream(trevrpc_server* server,
         } else {
             final_status = rpc_stream.terminal_status;
         }
-        (void)trevrpc_stream_finish_send(&rpc_stream);
+        if (rpc_stream.status_queued) {
+            (void)trevrpc_stream_finish_send(&rpc_stream);
+        }
         trevrpc_metrics_record_finished(
             server, &request, (size_t)rpc_stream.response_body_size, final_status, &rpc_started_at);
         trevrpc_server_request_finish(server);
