@@ -392,6 +392,10 @@ static int trevrpc_msquic_configure_endpoint_with_alpns(const trevrpc_msquic_con
         settings.IsSet.PeerBidiStreamCount = TRUE;
         settings.PeerBidiStreamCount = config->peer_bidi_stream_count;
     }
+    if (config->peer_unidi_stream_count > 0) {
+        settings.IsSet.PeerUnidiStreamCount = TRUE;
+        settings.PeerUnidiStreamCount = config->peer_unidi_stream_count;
+    }
     if (config->max_stateless_operations > 0) {
         settings.IsSet.MaxStatelessOperations = TRUE;
         settings.MaxStatelessOperations = config->max_stateless_operations;
@@ -403,7 +407,7 @@ static int trevrpc_msquic_configure_endpoint_with_alpns(const trevrpc_msquic_con
     settings.IsSet.SendBufferingEnabled = TRUE;
     settings.SendBufferingEnabled = FALSE;
     settings.IsSet.DatagramReceiveEnabled = TRUE;
-    settings.DatagramReceiveEnabled = FALSE;
+    settings.DatagramReceiveEnabled = TRUE;
 
     status = TrevMsQuic->ConfigurationOpen(
         *registration, alpn_buffers, alpn_count, &settings, sizeof(settings), NULL, configuration);
@@ -546,8 +550,23 @@ int trevrpc_msquic_listener_accept(trevrpc_msquic_listener* listener, trevrpc_ms
     }
     pthread_mutex_unlock(&listener->mutex);
 
-    *out_conn = node->conn;
+    trevrpc_msquic_conn* conn = node->conn;
     free(node);
+
+    pthread_mutex_lock(&conn->mutex);
+    while (!conn->connected && !conn->shutdown_complete && conn->err == 0) {
+        pthread_cond_wait(&conn->cond, &conn->mutex);
+    }
+    int err = conn->err;
+    bool connected = conn->connected;
+    pthread_mutex_unlock(&conn->mutex);
+
+    if (!connected) {
+        trevrpc_msquic_conn_close(conn);
+        return err != 0 ? err : TREV_MSQUIC_ERR_CLOSED;
+    }
+
+    *out_conn = conn;
     return 0;
 }
 
@@ -699,15 +718,16 @@ int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_
     return 0;
 }
 
-int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
+static int trevrpc_msquic_conn_open_stream_with_flags(
+    trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream, QUIC_STREAM_OPEN_FLAGS flags) {
     *out_stream = NULL;
     trevrpc_msquic_stream* stream = trevrpc_msquic_stream_alloc(NULL);
     if (stream == NULL) {
         return ENOMEM;
     }
 
-    QUIC_STATUS status = TrevMsQuic->StreamOpen(
-        conn->handle, QUIC_STREAM_OPEN_FLAG_NONE, trevrpc_msquic_stream_callback, stream, &stream->handle);
+    QUIC_STATUS status =
+        TrevMsQuic->StreamOpen(conn->handle, flags, trevrpc_msquic_stream_callback, stream, &stream->handle);
     if (QUIC_FAILED(status)) {
         trevrpc_msquic_stream_close(stream);
         return (int)status;
@@ -721,6 +741,14 @@ int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_st
 
     *out_stream = stream;
     return 0;
+}
+
+int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
+    return trevrpc_msquic_conn_open_stream_with_flags(conn, out_stream, QUIC_STREAM_OPEN_FLAG_NONE);
+}
+
+int trevrpc_msquic_conn_open_uni_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
+    return trevrpc_msquic_conn_open_stream_with_flags(conn, out_stream, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL);
 }
 
 int trevrpc_msquic_stream_id(trevrpc_msquic_stream* stream, uint64_t* out_stream_id) {

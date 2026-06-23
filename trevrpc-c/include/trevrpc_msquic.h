@@ -29,6 +29,7 @@ typedef struct trevrpc_msquic_config {
     uint64_t max_idle_timeout_ms;
     uint32_t keep_alive_ms;
     uint16_t peer_bidi_stream_count;
+    uint16_t peer_unidi_stream_count;
     uint32_t max_stateless_operations;
     uint16_t max_binding_stateless_operations;
 } trevrpc_msquic_config;
@@ -51,6 +52,7 @@ int trevrpc_msquic_dial(
 int trevrpc_msquic_conn_negotiated_alpn(trevrpc_msquic_conn* conn, const uint8_t** alpn, size_t* alpn_len);
 int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
 int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
+int trevrpc_msquic_conn_open_uni_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
 void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn);
 void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn);
 

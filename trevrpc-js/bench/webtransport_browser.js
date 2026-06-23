@@ -276,6 +276,12 @@ async function launchBrowser() {
     chromiumSandbox: false,
     dumpio: process.env.TREVRPC_BROWSER_DUMPIO === "1",
   };
+  if (process.env.TREVRPC_BROWSER_NETLOG != null && process.argv[2] !== "--browser-version") {
+    launchOptions.args.push(`--log-net-log=${process.env.TREVRPC_BROWSER_NETLOG}`);
+  }
+  if (process.env.TREVRPC_BROWSER_ARGS != null) {
+    launchOptions.args.push(...process.env.TREVRPC_BROWSER_ARGS.split(/\s+/).filter(Boolean));
+  }
   if (process.env.TREVRPC_BROWSER_CHROMIUM != null) {
     launchOptions.executablePath = process.env.TREVRPC_BROWSER_CHROMIUM;
   }

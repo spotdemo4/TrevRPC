@@ -94,6 +94,7 @@ static const trevrpc_msquic_config test_h3_config = {
     .cert_file = TREVRPC_MSQUIC_TEST_CERT,
     .key_file = TREVRPC_MSQUIC_TEST_KEY,
     .peer_bidi_stream_count = 8,
+    .peer_unidi_stream_count = 8,
 };
 
 #define TEST_WT_SETTINGS_ENABLE_CONNECT_PROTOCOL 0x08
@@ -250,6 +251,34 @@ static int test_varint_write(uint8_t* out, size_t out_len, size_t* offset, uint6
     return 0;
 }
 
+static int test_qpack_varint_write(
+    uint8_t* out, size_t out_len, size_t* offset, uint8_t prefix_bits, uint8_t flags, uint64_t value) {
+    if (prefix_bits == 0 || prefix_bits > 8 || *offset >= out_len) {
+        return -1;
+    }
+
+    uint64_t prefix_max = ((uint64_t)1 << prefix_bits) - 1;
+    if (value < prefix_max) {
+        out[(*offset)++] = (uint8_t)(flags | value);
+        return 0;
+    }
+
+    out[(*offset)++] = (uint8_t)(flags | prefix_max);
+    value -= prefix_max;
+    while (value >= 128) {
+        if (*offset >= out_len) {
+            return -1;
+        }
+        out[(*offset)++] = (uint8_t)(0x80 | (value & 0x7f));
+        value >>= 7;
+    }
+    if (*offset >= out_len) {
+        return -1;
+    }
+    out[(*offset)++] = (uint8_t)value;
+    return 0;
+}
+
 static int test_build_control_settings(
     uint8_t* out, size_t out_len, size_t* out_written, const wt_setting_pair* settings, size_t settings_len) {
     uint8_t payload[256];
@@ -304,16 +333,12 @@ static int test_header_block_put_literal(
     uint8_t* out, size_t out_len, size_t* offset, const char* name, const char* value) {
     size_t name_len = strlen(name);
     size_t value_len = strlen(value);
-    if (out_len - *offset < 1) {
-        return -1;
-    }
-    out[(*offset)++] = 0x20;
-    if (test_varint_write(out, out_len, offset, name_len) != 0 || out_len - *offset < name_len) {
+    if (test_qpack_varint_write(out, out_len, offset, 3, 0x20, name_len) != 0 || out_len - *offset < name_len) {
         return -1;
     }
     memcpy(out + *offset, name, name_len);
     *offset += name_len;
-    if (test_varint_write(out, out_len, offset, value_len) != 0 || out_len - *offset < value_len) {
+    if (test_qpack_varint_write(out, out_len, offset, 7, 0, value_len) != 0 || out_len - *offset < value_len) {
         return -1;
     }
     memcpy(out + *offset, value, value_len);
@@ -585,13 +610,14 @@ static int run_malformed_wt_peer_case(const malformed_wt_peer_case* test_case) {
     accept_thread_started = true;
     CHECK_GOTO(trevrpc_msquic_dial("127.0.0.1", port, &test_h3_config, &client_conn) == 0);
 
+    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &peer_control) == 0);
+    CHECK_GOTO(trevrpc_msquic_stream_read(peer_control, server_control, sizeof(server_control)) > 0);
+
     CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &local_control) == 0);
     CHECK_GOTO(trevrpc_msquic_stream_write(local_control, test_case->control, test_case->control_len) ==
                (intptr_t)test_case->control_len);
 
     if (test_case->headers != NULL) {
-        CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &peer_control) == 0);
-        CHECK_GOTO(trevrpc_msquic_stream_read(peer_control, server_control, sizeof(server_control)) > 0);
         CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &connect_stream) == 0);
         CHECK_GOTO(trevrpc_msquic_stream_write(connect_stream, test_case->headers, test_case->headers_len) ==
                    (intptr_t)test_case->headers_len);
@@ -606,6 +632,7 @@ static int run_malformed_wt_peer_case(const malformed_wt_peer_case* test_case) {
 
 cleanup:
     if (accept_thread_started) {
+        trevrpc_msquic_conn_shutdown(client_conn);
         trevrpc_wt_listener_shutdown(listener);
         (void)pthread_join(accept_thread, NULL);
     }

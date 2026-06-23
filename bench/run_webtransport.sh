@@ -448,7 +448,7 @@ build_prerequisites() {
         run_and_capture go-split-build go build -C trevrpc-go -o "$GO_SPLIT_BENCH" ./cmd/trevrpc-rpc-split-bench
     fi
     if [[ "$RUN_GO_MSQUIC" == "1" ]]; then
-        run_and_capture go-split-msquic-build go build -C trevrpc-go -tags "trevrpc_msquic trevrpc_webtransport_native" -o "$GO_SPLIT_BENCH_MSQUIC" ./cmd/trevrpc-rpc-split-bench
+        run_and_capture go-split-msquic-build go build -C trevrpc-go -a -tags "trevrpc_msquic trevrpc_webtransport_native" -o "$GO_SPLIT_BENCH_MSQUIC" ./cmd/trevrpc-rpc-split-bench
     fi
     if [[ "$RUN_RUST" == "1" ]]; then
         run_and_capture rust-split-build cargo build --manifest-path trevrpc-rust/Cargo.toml --example rpc_split_bench --release

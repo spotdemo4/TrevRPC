@@ -18,6 +18,7 @@
 
 #define TREVRPC_STREAM_LIMIT_DISABLED (-1)
 #define TREVRPC_H3_ALPN "h3"
+#define TREVRPC_H3_DEFAULT_UNIDI_STREAMS 16
 
 typedef struct trevrpc_method trevrpc_method;
 typedef struct trevrpc_server_conn_ref trevrpc_server_conn_ref;
@@ -269,6 +270,9 @@ static trevrpc_msquic_config trevrpc_make_server_msquic_config(const trevrpc_ser
     }
     if (wt_stream_count > msquic_config.peer_bidi_stream_count) {
         msquic_config.peer_bidi_stream_count = (uint16_t)wt_stream_count;
+    }
+    if (config->webtransport_path != NULL) {
+        msquic_config.peer_unidi_stream_count = TREVRPC_H3_DEFAULT_UNIDI_STREAMS;
     }
     return msquic_config;
 }
