@@ -495,6 +495,7 @@ func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore
 			return
 		}
 		if err := WriteFrame(stream, response, server.options.MaxFrameSize); err == nil {
+			_ = drainUnaryRequestEnd(ctx, server, stream)
 			_ = stream.Close()
 		}
 		return
@@ -666,6 +667,29 @@ func readDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) 
 	}
 
 	return deadline, ok
+}
+
+func drainUnaryRequestEnd(ctx context.Context, server *Server, stream rpcStream) error {
+	if deadline, ok := readDeadline(ctx, server.options.InitialRequestTimeout); ok {
+		if deadlineStream, ok := stream.(readDeadlineStream); ok {
+			_ = deadlineStream.SetReadDeadline(deadline)
+			defer deadlineStream.SetReadDeadline(time.Time{})
+		}
+	}
+
+	var buf [1024]byte
+	for {
+		read, err := stream.Read(buf[:])
+		if read > 0 {
+			return InvalidArgument("unary request stream contained data after the initial request frame")
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return transportOrContextStatus(ctx, err)
+		}
+	}
 }
 
 func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {

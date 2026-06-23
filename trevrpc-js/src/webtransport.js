@@ -54,6 +54,7 @@ export class WebTransportClient {
     let reader;
     let complete = false;
     let cleanupAbort = () => {};
+    let writerReleaseInCloseTask = false;
 
     try {
       throwIfAborted(options.signal);
@@ -74,7 +75,8 @@ export class WebTransportClient {
         writeFrame(writer, RpcRequest, request, options.maxFrameSize ?? this.maxFrameSize),
         options.signal,
       );
-      await abortable(writer.close(), options.signal);
+      closeUnaryRequestWriter(writer);
+      writerReleaseInCloseTask = true;
       const response = await abortable(
         frameReader.readFrame(RpcResponse, options.maxFrameSize ?? this.maxFrameSize),
         options.signal,
@@ -88,7 +90,9 @@ export class WebTransportClient {
         await abortWriter(writer);
         await cancelReader(reader);
       }
-      releaseLock(writer);
+      if (!writerReleaseInCloseTask) {
+        releaseLock(writer);
+      }
       releaseLock(reader);
       cleanupAbort();
     }
@@ -264,6 +268,19 @@ function isTerminalCleanupWriterError(error) {
     error?.code === Code.Unavailable &&
     /(?:stream canceled with error code 0|received stop_sending)/i.test(message)
   );
+}
+
+function closeUnaryRequestWriter(writer) {
+  void (async () => {
+    try {
+      await writer.close();
+    } catch {
+      // Unary reads do not require waiting for the browser's upload close
+      // acknowledgement. Response validation still reports server-side status.
+    } finally {
+      releaseLock(writer);
+    }
+  })();
 }
 
 function throwIfAborted(signal) {

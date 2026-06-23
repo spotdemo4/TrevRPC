@@ -821,16 +821,6 @@ async fn handle_stream(
         }
     };
 
-    if request.rpc_kind() == RpcKind::Unary
-        && let Err(error) = read_unary_request_end(&server, &mut recv).await
-    {
-        let _ = recv.stop(CANCELLED_STREAM_CODE.into());
-        let status = error.into_status();
-        server.record_rejected_request(&request, &status);
-        write_rpc_status(send, &request, status, server.max_frame_size()).await;
-        return;
-    }
-
     let Some(_request_permit) = try_acquire_permit(request_limit.as_ref()) else {
         let status = Status::unavailable("too many concurrent RPCs");
         server.record_rejected_request(&request, &status);
@@ -858,6 +848,12 @@ async fn handle_stream(
         .await
         .is_ok()
     {
+        if let Err(error) = read_unary_request_end(&server, &mut recv).await {
+            let _ = &error;
+            let _ = recv.stop(CANCELLED_STREAM_CODE.into());
+            #[cfg(feature = "tracing")]
+            tracing::debug!(%error, "failed to drain unary request stream");
+        }
         let _ = send.finish();
     }
 }

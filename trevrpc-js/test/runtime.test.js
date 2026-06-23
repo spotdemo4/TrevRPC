@@ -289,6 +289,50 @@ test("WebTransport malformed protobuf response frame maps to invalid argument", 
   );
 });
 
+test("WebTransport unary reads response before upload close settles", async () => {
+  let closeCalled = false;
+  let resolveClose;
+  const closePromise = new Promise((resolve) => {
+    resolveClose = resolve;
+  });
+  const stream = fakeBidirectionalStream({
+    closePromise,
+    onClose() {
+      closeCalled = true;
+    },
+    readableChunks: [
+      encodeFrame(
+        RpcResponse,
+        RpcResponse.create({
+          status: Code.Ok,
+          body: new Uint8Array([1, 2, 3]),
+          metadata: {},
+        }),
+      ),
+    ],
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+
+  const response = await client.call(
+    RpcRequest.create({
+      service: "hello.v1.Greeter",
+      method: "SayHello",
+      body: new Uint8Array(),
+      metadata: {},
+      version: WireVersion,
+    }),
+  );
+
+  assert.equal(closeCalled, true);
+  assert.deepEqual(response.body, new Uint8Array([1, 2, 3]));
+  resolveClose();
+});
+
 test("unknown response stream frame kind maps to invalid argument", async () => {
   const root = createRoot({
     nested: {
@@ -1521,8 +1565,10 @@ function fakeReaderFromChunks(chunks) {
 
 function fakeBidirectionalStream({
   closeError = null,
+  closePromise = null,
   onAbort = () => {},
   onCancel = () => {},
+  onClose = () => {},
   readableChunks = [],
 } = {}) {
   const chunks = [...readableChunks];
@@ -1534,6 +1580,10 @@ function fakeBidirectionalStream({
             return Promise.resolve();
           },
           close() {
+            onClose();
+            if (closePromise != null) {
+              return closePromise;
+            }
             return closeError == null ? Promise.resolve() : Promise.reject(closeError);
           },
           abort(reason) {
