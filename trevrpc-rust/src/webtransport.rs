@@ -629,6 +629,16 @@ async fn handle_stream(
         }
     };
 
+    if request.rpc_kind() == RpcKind::Unary
+        && let Err(error) = read_unary_request_end(&server, &mut recv).await
+    {
+        let _ = recv.stop(cancelled_stream_code());
+        let status = error.into_status();
+        server.record_rejected_request(&request, &status);
+        write_rpc_status(send, &request, status, server.max_frame_size()).await;
+        return;
+    }
+
     let Some(_request_permit) = try_acquire_permit(request_limit.as_ref()) else {
         let status = Status::unavailable("too many concurrent RPCs");
         server.record_rejected_request(&request, &status);
@@ -671,6 +681,37 @@ async fn read_initial_request(
             .map_err(|_| Error::from(Status::deadline_exceeded("initial request frame timeout")))?
     } else {
         read.await
+    }
+}
+
+async fn read_unary_request_end(
+    server: &crate::server::Server,
+    recv: &mut web_transport_quinn::RecvStream,
+) -> Result<()> {
+    let read = drain_unary_request_end(recv);
+    if let Some(timeout) = server.options().initial_request_timeout() {
+        tokio::time::timeout(timeout, read).await.map_err(|_| {
+            Error::from(Status::deadline_exceeded(
+                "unary request stream finish timeout",
+            ))
+        })?
+    } else {
+        read.await
+    }
+}
+
+async fn drain_unary_request_end(recv: &mut web_transport_quinn::RecvStream) -> Result<()> {
+    let mut buf = [0; 1024];
+    loop {
+        match recv.read(&mut buf).await.map_err(Error::transport)? {
+            Some(0) => {}
+            Some(_) => {
+                return Err(Error::from(Status::invalid_argument(
+                    "unary request stream contained data after the initial request frame",
+                )));
+            }
+            None => return Ok(()),
+        }
     }
 }
 
