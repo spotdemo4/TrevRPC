@@ -43,6 +43,7 @@ type NativeWebTransportConfig struct {
 type NativeWebTransportListener struct {
 	mu        sync.Mutex
 	ptr       *C.trevrpc_wt_listener
+	addr      net.Addr
 	closeOnce sync.Once
 }
 
@@ -76,7 +77,7 @@ func ListenNativeWebTransport(addr string, config NativeWebTransportConfig) (*Na
 	if err != nil {
 		return nil, err
 	}
-	return &NativeWebTransportListener{ptr: listener}, nil
+	return &NativeWebTransportListener{ptr: listener, addr: nativeWebTransportListenerAddr(host, port, listener)}, nil
 }
 
 // DialNativeWebTransport dials a native WebTransport session backed by libwtf.
@@ -119,7 +120,10 @@ func (l *NativeWebTransportListener) Close() error {
 		return nil
 	}
 	l.closeOnce.Do(func() {
-		ptr := l.takePtr()
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		ptr := l.ptr
+		l.ptr = nil
 		if ptr != nil {
 			C.trevrpc_wt_listener_close(ptr)
 		}
@@ -127,11 +131,21 @@ func (l *NativeWebTransportListener) Close() error {
 	return nil
 }
 
+// Addr returns the listener's local network address.
+func (l *NativeWebTransportListener) Addr() net.Addr {
+	if l == nil {
+		return nil
+	}
+	return l.addr
+}
+
 func (l *NativeWebTransportListener) shutdown() {
 	if l == nil {
 		return
 	}
-	ptr := l.cptr()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ptr := l.ptr
 	if ptr != nil {
 		C.trevrpc_wt_listener_shutdown(ptr)
 	}
@@ -721,6 +735,23 @@ func splitNativeWebTransportAddr(addr string) (string, C.uint16_t, error) {
 		host = "0.0.0.0"
 	}
 	return host, C.uint16_t(port), nil
+}
+
+type nativeWebTransportAddr struct {
+	network string
+	address string
+}
+
+func (a nativeWebTransportAddr) Network() string { return a.network }
+
+func (a nativeWebTransportAddr) String() string { return a.address }
+
+func nativeWebTransportListenerAddr(host string, port C.uint16_t, listener *C.trevrpc_wt_listener) net.Addr {
+	var boundPort C.uint16_t
+	if C.trevrpc_wt_listener_port(listener, &boundPort) == 0 {
+		port = boundPort
+	}
+	return nativeWebTransportAddr{network: "udp", address: net.JoinHostPort(host, strconv.Itoa(int(port)))}
 }
 
 func nativeWebTransportError(code C.int) error {

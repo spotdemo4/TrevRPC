@@ -42,10 +42,11 @@ type grpcSplitGreeter struct{}
 
 func main() {
 	mode := flag.String("mode", "", "client or server")
-	transport := flag.String("transport", "quic", "quic, msquic, webtransport, or grpc")
+	transport := flag.String("transport", "quic", "quic, msquic, webtransport, webtransport-msquic, or grpc")
 	addr := flag.String("addr", "127.0.0.1:0", "listen or dial address")
 	cert := flag.String("cert", "", "PEM certificate path")
 	key := flag.String("key", "", "PEM private key path")
+	origin := flag.String("origin", "", "allowed WebTransport origin")
 	iterations := flag.Int("iterations", 1000, "benchmark iterations")
 	flag.Parse()
 
@@ -54,7 +55,7 @@ func main() {
 	case "client":
 		err = runClient(*transport, *addr, *cert, *iterations)
 	case "server":
-		err = runServer(*transport, *addr, *cert, *key)
+		err = runServer(*transport, *addr, *cert, *key, *origin)
 	default:
 		err = fmt.Errorf("unsupported mode %q", *mode)
 	}
@@ -107,9 +108,12 @@ func runClient(transportName, addr, certFile string, iterations int) error {
 	})
 }
 
-func runServer(transportName, addr, certFile, keyFile string) error {
+func runServer(transportName, addr, certFile, keyFile, origin string) error {
 	if transportName == "grpc" {
 		return runGRPCServer(addr)
+	}
+	if transportName == "webtransport-msquic" {
+		return runNativeWebTransportServer(addr, certFile, keyFile, origin)
 	}
 
 	server := trevrpc.NewServer()
