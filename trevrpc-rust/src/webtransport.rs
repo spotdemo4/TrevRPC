@@ -7,14 +7,17 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client::RpcTransport;
-use crate::framing::{DEFAULT_MAX_FRAME_SIZE, decode_frame, encode_frame_with_max, frame_body_len};
+use crate::framing::{
+    DEFAULT_MAX_FRAME_SIZE, decode_frame, decode_stream_frame_body, encode_frame_with_max,
+    encode_message_stream_frame, encode_message_stream_frames, frame_body_len,
+};
 use crate::{
     BoxMessageStream, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse,
     RpcStreamFrame, RpcStreamFrameKind, Status,
 };
 
 const CANCELLED_STREAM_CODE: u32 = 1;
-const FRAME_READ_CHUNK_LEN: usize = 32 * 1024;
+const MESSAGE_FRAME_BATCH: usize = 32;
 
 type ServerEndpoint = web_transport_quinn::Server;
 
@@ -208,7 +211,7 @@ impl MessageStream<RpcStreamFrame> for WebTransportResponseStream {
         }
 
         let max_frame_size = self.max_frame_size;
-        match read_frame_or_eof::<RpcStreamFrame>(self.recv_mut(), max_frame_size).await {
+        match read_stream_frame_or_eof(self.recv_mut(), max_frame_size).await {
             Ok(Some(frame)) => {
                 if frame.frame_kind() == Some(RpcStreamFrameKind::Status) {
                     self.complete = true;
@@ -302,6 +305,43 @@ where
     send.write_all(&frame).await.map_err(Error::transport)
 }
 
+async fn write_message_stream_frame(
+    send: &mut web_transport_quinn::SendStream,
+    body: &[u8],
+    max_frame_size: usize,
+) -> Result<()> {
+    let frame = encode_message_stream_frame(body, max_frame_size)?;
+    send.write_all(&frame).await.map_err(Error::transport)
+}
+
+async fn write_message_stream_frames(
+    send: &mut web_transport_quinn::SendStream,
+    bodies: &[Vec<u8>],
+    max_frame_size: usize,
+) -> Result<()> {
+    let frames = encode_message_stream_frames(bodies, max_frame_size)?;
+    send.write_all(&frames).await.map_err(Error::transport)
+}
+
+async fn write_stream_frame(
+    send: &mut web_transport_quinn::SendStream,
+    frame: &RpcStreamFrame,
+    max_frame_size: usize,
+) -> Result<()> {
+    if is_plain_message_frame(frame) {
+        write_message_stream_frame(send, &frame.body, max_frame_size).await
+    } else {
+        write_frame(send, frame, max_frame_size).await
+    }
+}
+
+fn is_plain_message_frame(frame: &RpcStreamFrame) -> bool {
+    frame.frame_kind() == Some(RpcStreamFrameKind::Message)
+        && frame.status == crate::Code::Ok.as_u32()
+        && frame.message.is_empty()
+        && frame.metadata.is_empty()
+}
+
 /// Reads and decodes one length-prefixed protobuf frame from a `WebTransport` receive stream.
 pub async fn read_frame<M>(
     recv: &mut web_transport_quinn::RecvStream,
@@ -321,13 +361,10 @@ where
     decode_frame(&body)
 }
 
-async fn read_frame_or_eof<M>(
+async fn read_stream_frame_or_eof(
     recv: &mut web_transport_quinn::RecvStream,
     max_frame_size: usize,
-) -> Result<Option<M>>
-where
-    M: Message + Default,
-{
+) -> Result<Option<RpcStreamFrame>> {
     let mut header = [0; 4];
     if !read_exact_or_eof(recv, &mut header).await? {
         return Ok(None);
@@ -336,7 +373,7 @@ where
     let len = frame_body_len(header, max_frame_size)?;
     let body = read_body(recv, len).await?;
 
-    decode_frame(&body).map(Some)
+    decode_stream_frame_body(&body).map(Some)
 }
 
 async fn read_body(recv: &mut web_transport_quinn::RecvStream, len: usize) -> Result<Vec<u8>> {
@@ -344,18 +381,16 @@ async fn read_body(recv: &mut web_transport_quinn::RecvStream, len: usize) -> Re
         return Ok(Vec::new());
     }
 
-    let mut body = Vec::with_capacity(len.min(FRAME_READ_CHUNK_LEN));
-    let mut chunk = vec![0; len.min(FRAME_READ_CHUNK_LEN)];
-    while body.len() < len {
-        let remaining = len - body.len();
-        let read_len = remaining.min(chunk.len());
+    let mut body = vec![0; len];
+    let mut offset = 0;
+    while offset < len {
         match recv
-            .read(&mut chunk[..read_len])
+            .read(&mut body[offset..])
             .await
             .map_err(Error::transport)?
         {
             Some(0) => {}
-            Some(read) => body.extend_from_slice(&chunk[..read]),
+            Some(read) => offset += read,
             None => return Err(unexpected_eof()),
         }
     }
@@ -401,19 +436,40 @@ async fn write_streaming_request(
     let mut send = CancellableSendStream::new(send);
     write_frame(send.send_mut(), &request, max_frame_size).await?;
 
-    while let Some(body) = request_body.next().await.transpose()? {
-        write_frame(
-            send.send_mut(),
-            &RpcStreamFrame::message(body),
-            max_frame_size,
-        )
-        .await?;
-    }
+    write_request_body_frames(send.send_mut(), &mut request_body, max_frame_size).await?;
 
     send.send_mut().finish().map_err(Error::transport)?;
     send.complete();
 
     Ok(())
+}
+
+async fn write_request_body_frames(
+    send: &mut web_transport_quinn::SendStream,
+    request_body: &mut BoxMessageStream<Vec<u8>>,
+    max_frame_size: usize,
+) -> Result<()> {
+    if !request_body.is_non_blocking() {
+        while let Some(body) = request_body.next().await.transpose()? {
+            write_message_stream_frame(send, &body, max_frame_size).await?;
+        }
+        return Ok(());
+    }
+
+    let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
+    loop {
+        batch.clear();
+        while batch.len() < MESSAGE_FRAME_BATCH {
+            let Some(body) = request_body.next().await.transpose()? else {
+                if !batch.is_empty() {
+                    write_message_stream_frames(send, &batch, max_frame_size).await?;
+                }
+                return Ok(());
+            };
+            batch.push(body);
+        }
+        write_message_stream_frames(send, &batch, max_frame_size).await?;
+    }
 }
 
 impl crate::server::Server {
@@ -730,6 +786,8 @@ async fn handle_streaming_rpc(
         }
     };
 
+    let response_is_non_blocking = response.is_non_blocking();
+    let mut message_batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     loop {
         let frame = tokio::select! {
             biased;
@@ -750,9 +808,54 @@ async fn handle_streaming_rpc(
             Ok(frame) => frame,
             Err(error) => RpcStreamFrame::status(error.into_status()),
         };
+
+        if response_is_non_blocking && is_plain_message_frame(&frame) {
+            message_batch.push(frame.body);
+            let mut next_frame = None;
+            while message_batch.len() < MESSAGE_FRAME_BATCH {
+                match response.next().await {
+                    Some(Ok(frame)) if is_plain_message_frame(&frame) => {
+                        message_batch.push(frame.body);
+                    }
+                    Some(Ok(frame)) => {
+                        next_frame = Some(frame);
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        next_frame = Some(RpcStreamFrame::status(error.into_status()));
+                        break;
+                    }
+                    None => break,
+                }
+            }
+
+            if write_message_stream_frames(&mut send, &message_batch, max_frame_size)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            message_batch.clear();
+
+            let Some(frame) = next_frame else {
+                continue;
+            };
+            let is_status = frame.frame_kind() == Some(RpcStreamFrameKind::Status);
+            if write_stream_frame(&mut send, &frame, max_frame_size)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if is_status {
+                break;
+            }
+            continue;
+        }
+
         let is_status = frame.frame_kind() == Some(RpcStreamFrameKind::Status);
 
-        if write_frame(&mut send, &frame, max_frame_size)
+        if write_stream_frame(&mut send, &frame, max_frame_size)
             .await
             .is_err()
         {
@@ -815,7 +918,7 @@ impl MessageStream<Vec<u8>> for WebTransportRequestStream {
             return None;
         }
 
-        match read_frame_or_eof::<RpcStreamFrame>(&mut self.recv, self.max_frame_size).await {
+        match read_stream_frame_or_eof(&mut self.recv, self.max_frame_size).await {
             Ok(Some(frame)) => match frame.frame_kind() {
                 Some(RpcStreamFrameKind::Message) => Some(Ok(frame.body)),
                 Some(RpcStreamFrameKind::Status) => {

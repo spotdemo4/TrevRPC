@@ -8,6 +8,14 @@ use crate::{Error, Result};
 pub trait MessageStream<T>: Send {
     /// Returns the next message from the stream, or `None` after the stream finishes.
     async fn next(&mut self) -> Option<Result<T>>;
+
+    /// Returns true when calling `next` is expected to complete immediately.
+    ///
+    /// Transports use this to batch ready stream items without adding latency to
+    /// streams backed by asynchronous producers.
+    fn is_non_blocking(&self) -> bool {
+        false
+    }
 }
 
 pub type BoxMessageStream<T> = Box<dyn MessageStream<T> + Send + 'static>;
@@ -31,6 +39,10 @@ where
 {
     async fn next(&mut self) -> Option<Result<T>> {
         None
+    }
+
+    fn is_non_blocking(&self) -> bool {
+        true
     }
 }
 
@@ -62,6 +74,10 @@ where
 {
     async fn next(&mut self) -> Option<Result<T>> {
         self.iter.next().map(Ok)
+    }
+
+    fn is_non_blocking(&self) -> bool {
+        true
     }
 }
 
@@ -99,6 +115,10 @@ where
             Some(Err(error)) => Some(Err(error)),
             None => None,
         }
+    }
+
+    fn is_non_blocking(&self) -> bool {
+        self.inner.is_non_blocking()
     }
 }
 
@@ -138,6 +158,10 @@ where
             Some(Err(error)) => Some(Err(error)),
             None => None,
         }
+    }
+
+    fn is_non_blocking(&self) -> bool {
+        self.inner.is_non_blocking()
     }
 }
 

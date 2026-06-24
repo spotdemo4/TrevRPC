@@ -1013,6 +1013,10 @@ impl MessageStream<Vec<u8>> for LimitedStream {
 
         Some(Ok(body))
     }
+
+    fn is_non_blocking(&self) -> bool {
+        self.inner.is_non_blocking()
+    }
 }
 
 async fn next_limited_item(
@@ -1173,6 +1177,10 @@ impl MessageStream<RpcStreamFrame> for ServerResponseStream {
                 Some(Ok(RpcStreamFrame::status(Status::ok())))
             }
         }
+    }
+
+    fn is_non_blocking(&self) -> bool {
+        self.inner.is_non_blocking()
     }
 }
 
