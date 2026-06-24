@@ -290,14 +290,44 @@ EOF
         function append(values, value) {
             return values == "" ? value : values " " value
         }
+        function label_language(value) {
+            if (value == "grpc_go") {
+                return "go"
+            }
+            split(value, parts, "_")
+            return parts[1]
+        }
+        function label_implementation(value) {
+            if (value == "grpc_go") {
+                return "grpc"
+            }
+            split(value, parts, "_")
+            return substr(value, length(parts[1]) + 2)
+        }
         function print_table_header(axis, shape) {
             printf "\n### `%s` / `%s`\n\n", axis, shape
             if (is_throughput_shape(shape)) {
-                print "| Client | Server | Median throughput messages/s | Throughput min..max messages/s | Source |"
-                print "| --- | --- | ---: | ---: | --- |"
+                if (axis == "client") {
+                    print "| Client language | Client implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
+                    print "| --- | --- | ---: | ---: | --- |"
+                } else if (axis == "server") {
+                    print "| Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
+                    print "| --- | --- | ---: | ---: | --- |"
+                } else {
+                    print "| Client language | Client implementation | Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
+                    print "| --- | --- | --- | --- | ---: | ---: | --- |"
+                }
             } else {
-                print "| Client | Server | Median latency us/op | Latency min..max us/op | Source |"
-                print "| --- | --- | ---: | ---: | --- |"
+                if (axis == "client") {
+                    print "| Client language | Client implementation | Median latency us/op | Latency min..max us/op | Source |"
+                    print "| --- | --- | ---: | ---: | --- |"
+                } else if (axis == "server") {
+                    print "| Server language | Server implementation | Median latency us/op | Latency min..max us/op | Source |"
+                    print "| --- | --- | ---: | ---: | --- |"
+                } else {
+                    print "| Client language | Client implementation | Server language | Server implementation | Median latency us/op | Latency min..max us/op | Source |"
+                    print "| --- | --- | --- | --- | ---: | ---: | --- |"
+                }
             }
         }
         NR > 1 {
@@ -332,9 +362,21 @@ EOF
                 for (row_index = 1; row_index <= row_count; row_index++) {
                     id = sorted_rows[row_index]
                     if (is_throughput_shape(group_shape[group_key])) {
-                        printf "| `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", client[id], server[id], throughput[id], throughput_min[id], throughput_max[id], source[id]
+                        if (group_axis[group_key] == "client") {
+                            printf "| `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", label_language(client[id]), label_implementation(client[id]), throughput[id], throughput_min[id], throughput_max[id], source[id]
+                        } else if (group_axis[group_key] == "server") {
+                            printf "| `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id], source[id]
+                        } else {
+                            printf "| `%s` | `%s` | `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", label_language(client[id]), label_implementation(client[id]), label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id], source[id]
+                        }
                     } else {
-                        printf "| `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", client[id], server[id], latency[id], latency_min[id], latency_max[id], source[id]
+                        if (group_axis[group_key] == "client") {
+                            printf "| `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", label_language(client[id]), label_implementation(client[id]), latency[id], latency_min[id], latency_max[id], source[id]
+                        } else if (group_axis[group_key] == "server") {
+                            printf "| `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id], source[id]
+                        } else {
+                            printf "| `%s` | `%s` | `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", label_language(client[id]), label_implementation(client[id]), label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id], source[id]
+                        }
                     }
                 }
             }
@@ -349,17 +391,31 @@ EOF
 
 Failed or timed-out samples are omitted from the aggregate result tables above.
 
-| Axis | Run | Client | Server | Status | Raw output |
-| --- | ---: | --- | --- | ---: | --- |
+| Axis | Run | Client language | Client implementation | Server language | Server implementation | Status | Raw output |
+| --- | ---: | --- | --- | --- | --- | ---: | --- |
 EOF
 
             awk -F, -v root_prefix="$ROOT/" '
+            function label_language(value) {
+                if (value == "grpc_go") {
+                    return "go"
+                }
+                split(value, parts, "_")
+                return parts[1]
+            }
+            function label_implementation(value) {
+                if (value == "grpc_go") {
+                    return "grpc"
+                }
+                split(value, parts, "_")
+                return substr(value, length(parts[1]) + 2)
+            }
             NR > 1 {
                 raw_file = $7
                 if (index(raw_file, root_prefix) == 1) {
                     raw_file = substr(raw_file, length(root_prefix) + 1)
                 }
-                printf "| `%s` | %s | `%s` | `%s` | %s | `%s` |\n", $1, $2, $3, $4, $6, raw_file
+                printf "| `%s` | %s | `%s` | `%s` | `%s` | `%s` | %s | `%s` |\n", $1, $2, label_language($3), label_implementation($3), label_language($4), label_implementation($4), $6, raw_file
             }' "$FAILURES_CSV"
         fi
 

@@ -277,14 +277,46 @@ EOF
         function append(values, value) {
             return values == "" ? value : values " " value
         }
+        function display_browser(value) {
+            sub(/_webtransport$/, "", value)
+            return value
+        }
+        function display_server(value) {
+            if (value == "go_webtransport") {
+                return "go_quic"
+            }
+            if (value == "go_webtransport_msquic") {
+                return "go_msquic"
+            }
+            if (value == "rust_webtransport") {
+                return "rust_quinn"
+            }
+            if (value == "c_webtransport") {
+                return "c_msquic"
+            }
+            if (value == "js_webtransport") {
+                return "js_msquic"
+            }
+            return value
+        }
+        function label_language(value) {
+            value = display_server(value)
+            split(value, parts, "_")
+            return parts[1]
+        }
+        function label_implementation(value) {
+            value = display_server(value)
+            split(value, parts, "_")
+            return substr(value, length(parts[1]) + 2)
+        }
         function print_table_header(shape) {
             printf "\n### `%s`\n\n", shape
             if (is_throughput_shape(shape)) {
-                print "| Browser client | Server | Median throughput messages/s | Throughput min..max messages/s | Source |"
-                print "| --- | --- | ---: | ---: | --- |"
+                print "| Browser | Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
+                print "| --- | --- | --- | ---: | ---: | --- |"
             } else {
-                print "| Browser client | Server | Median latency us/op | Latency min..max us/op | Source |"
-                print "| --- | --- | ---: | ---: | --- |"
+                print "| Browser | Server language | Server implementation | Median latency us/op | Latency min..max us/op | Source |"
+                print "| --- | --- | --- | ---: | ---: | --- |"
             }
         }
         NR > 1 {
@@ -315,9 +347,9 @@ EOF
                 for (row_index = 1; row_index <= row_count; row_index++) {
                     id = sorted_rows[row_index]
                     if (is_throughput_shape(current_shape)) {
-                        printf "| `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", browser[id], server[id], throughput[id], throughput_min[id], throughput_max[id], source[id]
+                        printf "| `%s` | `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", display_browser(browser[id]), label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id], source[id]
                     } else {
-                        printf "| `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", browser[id], server[id], latency[id], latency_min[id], latency_max[id], source[id]
+                        printf "| `%s` | `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", display_browser(browser[id]), label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id], source[id]
                     }
                 }
             }
@@ -332,17 +364,49 @@ EOF
 
 Failed or timed-out samples are omitted from the aggregate result tables above.
 
-| Run | Browser client | Server | Status | Raw output |
-| ---: | --- | --- | ---: | --- |
+| Run | Browser | Server language | Server implementation | Status | Raw output |
+| ---: | --- | --- | --- | ---: | --- |
 EOF
 
             awk -F, -v root_prefix="$ROOT/" '
+            function display_browser(value) {
+                sub(/_webtransport$/, "", value)
+                return value
+            }
+            function display_server(value) {
+                if (value == "go_webtransport") {
+                    return "go_quic"
+                }
+                if (value == "go_webtransport_msquic") {
+                    return "go_msquic"
+                }
+                if (value == "rust_webtransport") {
+                    return "rust_quinn"
+                }
+                if (value == "c_webtransport") {
+                    return "c_msquic"
+                }
+                if (value == "js_webtransport") {
+                    return "js_msquic"
+                }
+                return value
+            }
+            function label_language(value) {
+                value = display_server(value)
+                split(value, parts, "_")
+                return parts[1]
+            }
+            function label_implementation(value) {
+                value = display_server(value)
+                split(value, parts, "_")
+                return substr(value, length(parts[1]) + 2)
+            }
             NR > 1 {
                 raw_file = $6
                 if (index(raw_file, root_prefix) == 1) {
                     raw_file = substr(raw_file, length(root_prefix) + 1)
                 }
-                printf "| %s | `%s` | `%s` | %s | `%s` |\n", $1, $2, $3, $5, raw_file
+                printf "| %s | `%s` | `%s` | `%s` | %s | `%s` |\n", $1, display_browser($2), label_language($3), label_implementation($3), $5, raw_file
             }' "$FAILURES_CSV"
         fi
 
@@ -354,7 +418,7 @@ The WebTransport category benchmarks server implementations with a real Chromium
 
 Each sample uses one browser WebTransport session per server. Latency rows measure one RPC operation. Stream latency rows use one request and one response message. Stream throughput rows measure messages per second over one open WebTransport stream.
 
-\`go_webtransport\` is the quic-go HTTP/3 WebTransport server path. \`go_webtransport_msquic\`, \`c_webtransport\`, and \`js_webtransport\` use the native MsQuic-backed WebTransport stack and are reported separately because browser interoperability can differ from the quic-go path.
+Within the WebTransport tables, \`go_quic\` is the quic-go HTTP/3 WebTransport server path. \`go_msquic\`, \`c_msquic\`, and \`js_msquic\` use the native MsQuic-backed WebTransport stack and are reported separately because browser interoperability can differ from the quic-go path.
 
 Latency tables are sorted by median latency ascending. Throughput tables are sorted by median message throughput descending.
 
@@ -505,7 +569,7 @@ run_browser_against_server() {
     local cert_file=$4
     local run
     for ((run = 1; run <= WEBTRANSPORT_RUNS; run++)); do
-        run_webtransport_sample "webtransport-$raw_prefix-run-$run" "$run" chrome_webtransport "$server" playwright-chromium node trevrpc-js/bench/webtransport_browser.js "$STATIC_URL" "https://127.0.0.1:$port/trevrpc" "$cert_file" "$WEBTRANSPORT_ITERATIONS"
+        run_webtransport_sample "webtransport-$raw_prefix-run-$run" "$run" chrome "$server" playwright-chromium node trevrpc-js/bench/webtransport_browser.js "$STATIC_URL" "https://127.0.0.1:$port/trevrpc" "$cert_file" "$WEBTRANSPORT_ITERATIONS"
     done
 }
 
@@ -520,14 +584,14 @@ run_webtransport_benchmarks() {
     if [[ "$RUN_GO" == "1" ]]; then
         start_server webtransport-go-server "$GO_SPLIT_BENCH" -mode server -transport webtransport -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
         port=$START_SERVER_PORT
-        run_browser_against_server go go_webtransport "$port" "$cert_file"
+        run_browser_against_server go go_quic "$port" "$cert_file"
         stop_rpc_servers
     fi
 
     if [[ "$RUN_GO_MSQUIC" == "1" ]]; then
         start_server webtransport-go-msquic-server "$GO_SPLIT_BENCH_MSQUIC" -mode server -transport webtransport-msquic -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file" -origin "$STATIC_ORIGIN"
         port=$START_SERVER_PORT
-        run_browser_against_server go-msquic go_webtransport_msquic "$port" "$cert_file"
+        run_browser_against_server go-msquic go_msquic "$port" "$cert_file"
         stop_rpc_servers
     fi
 
@@ -536,21 +600,21 @@ run_webtransport_benchmarks() {
         rm -f "$rust_cert"
         start_server webtransport-rust-server "$RUST_SPLIT_BENCH" webtransport-server 127.0.0.1:0 "$rust_cert" "$STATIC_ORIGIN"
         port=$START_SERVER_PORT
-        run_browser_against_server rust rust_webtransport "$port" "$rust_cert"
+        run_browser_against_server rust rust_quinn "$port" "$rust_cert"
         stop_rpc_servers
     fi
 
     if [[ "$RUN_C" == "1" ]]; then
         start_server webtransport-c-server "$c_bench" --split-serve
         port=$START_SERVER_PORT
-        run_browser_against_server c c_webtransport "$port" "$cert_file"
+        run_browser_against_server c c_msquic "$port" "$cert_file"
         stop_rpc_servers
     fi
 
     if [[ "$RUN_JS" == "1" ]]; then
         start_server webtransport-js-server env "TREVRPC_WEBTRANSPORT_ORIGIN=$STATIC_ORIGIN" node trevrpc-js/bench/rpc_split_native.js server "$cert_file" "$key_file"
         port=$START_SERVER_PORT
-        run_browser_against_server js js_webtransport "$port" "$cert_file"
+        run_browser_against_server js js_msquic "$port" "$cert_file"
         stop_rpc_servers
     fi
 }
