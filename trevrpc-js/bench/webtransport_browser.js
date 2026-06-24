@@ -13,13 +13,17 @@ if (process.argv[2] === "--browser-version") {
   process.exit(0);
 }
 
-const pageURL = requiredArg(2, "page-url");
-const webTransportURL = requiredArg(3, "webtransport-url");
-const certFile = requiredArg(4, "cert-file");
-const iterations = positiveInteger(
-  process.argv[5] ?? process.env.WEBTRANSPORT_ITERATIONS ?? "1000",
+const connectMode = process.argv[2] === "--connect";
+const pageURL = requiredArg(connectMode ? 3 : 2, "page-url");
+const endpointURL = requiredArg(
+  connectMode ? 4 : 3,
+  connectMode ? "connect-url" : "webtransport-url",
 );
-const certificateSha256Base64 = await certificateHash(certFile);
+const certFile = connectMode ? null : requiredArg(4, "cert-file");
+const iterations = positiveInteger(
+  process.argv[connectMode ? 5 : 5] ?? process.env.WEBTRANSPORT_ITERATIONS ?? "1000",
+);
+const certificateSha256Base64 = certFile == null ? null : await certificateHash(certFile);
 
 let browser;
 let page;
@@ -52,21 +56,27 @@ try {
   });
 
   await page.goto(pageURL, { waitUntil: "domcontentloaded" });
-  const results = await page.evaluate(runBrowserBenchmarks, {
-    certificateSha256Base64,
-    iterations,
-    webTransportURL,
-  });
+  const results = connectMode
+    ? await page.evaluate(runConnectBenchmarks, { connectURL: endpointURL, iterations })
+    : await page.evaluate(runBrowserBenchmarks, {
+        certificateSha256Base64,
+        iterations,
+        webTransportURL: endpointURL,
+      });
   if (pageErrors.length > 0) {
     throw new Error(pageErrors.join("\n"));
   }
 
   for (const result of results) {
-    console.log(
-      result.metric === "throughput"
-        ? `${result.name}: ${result.value.toFixed(0)} messages/s (${result.iterations} messages in ${result.elapsedSeconds.toFixed(3)}s)`
-        : `${result.name}: ${result.value.toFixed(3)} us/op (${result.iterations} iterations in ${result.elapsedSeconds.toFixed(3)}s)`,
-    );
+    if (result.unsupported) {
+      console.log(`${result.name}: N/A (unsupported)`);
+    } else {
+      console.log(
+        result.metric === "throughput"
+          ? `${result.name}: ${result.value.toFixed(0)} messages/s (${result.iterations} messages in ${result.elapsedSeconds.toFixed(3)}s)`
+          : `${result.name}: ${result.value.toFixed(3)} us/op (${result.iterations} iterations in ${result.elapsedSeconds.toFixed(3)}s)`,
+      );
+    }
   }
 } finally {
   if (browser != null) {
@@ -281,6 +291,226 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
   }
 }
 
+async function runConnectBenchmarks({ connectURL, iterations }) {
+  const RequestName = "TrevRPC benchmark";
+  const { createRoot } = await import("/src/index.js");
+  const root = createRoot({
+    nested: {
+      example: {
+        nested: {
+          greeter: {
+            nested: {
+              HelloRequest: {
+                fields: {
+                  name: { type: "string", id: 1 },
+                },
+              },
+              HelloReply: {
+                fields: {
+                  message: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const HelloRequest = root.lookupType("example.greeter.HelloRequest");
+  const HelloReply = root.lookupType("example.greeter.HelloReply");
+  const baseURL = connectURL.replace(/\/+$/, "");
+
+  await warmClient();
+  return [
+    await runLatencyCase("unary_latency", iterations, unary),
+    await runLatencyCase("server_stream_latency", iterations, () => serverStreaming(1)),
+    await runThroughputCase("server_stream_throughput", iterations, () =>
+      serverStreaming(iterations),
+    ),
+    unsupportedCase("client_stream_latency", iterations, "latency"),
+    unsupportedCase("client_stream_throughput", iterations, "throughput"),
+    unsupportedCase("bidi_stream_latency", iterations, "latency"),
+    unsupportedCase("bidi_stream_throughput", iterations, "throughput"),
+  ];
+
+  async function warmClient() {
+    await unary();
+    await serverStreaming(1);
+  }
+
+  async function runLatencyCase(name, count, fn) {
+    const start = performance.now();
+    for (let index = 0; index < count; index += 1) {
+      await fn();
+    }
+    const elapsedSeconds = (performance.now() - start) / 1000;
+    return {
+      elapsedSeconds,
+      iterations: count,
+      metric: "latency",
+      name,
+      value: (elapsedSeconds * 1_000_000) / count,
+    };
+  }
+
+  async function runThroughputCase(name, count, fn) {
+    const start = performance.now();
+    await fn();
+    const elapsedSeconds = (performance.now() - start) / 1000;
+    return {
+      elapsedSeconds,
+      iterations: count,
+      metric: "throughput",
+      name,
+      value: elapsedSeconds > 0 ? count / elapsedSeconds : 0,
+    };
+  }
+
+  function unsupportedCase(name, count, metric) {
+    return {
+      elapsedSeconds: 0,
+      iterations: count,
+      metric,
+      name,
+      unsupported: true,
+      value: null,
+    };
+  }
+
+  async function unary() {
+    const response = await fetch(`${baseURL}/example.greeter.Greeter/SayHello`, {
+      body: encodeMessage(HelloRequest, { name: RequestName }),
+      headers: {
+        "Connect-Protocol-Version": "1",
+        "Content-Type": "application/proto",
+      },
+      method: "POST",
+    });
+    await assertOK(response);
+    const reply = HelloReply.decode(new Uint8Array(await response.arrayBuffer()));
+    if (reply.message !== RequestName) {
+      throw new Error(`unexpected Connect unary response: ${JSON.stringify(reply)}`);
+    }
+  }
+
+  async function serverStreaming(messageCount) {
+    const response = await fetch(`${baseURL}/example.greeter.Greeter/LotsOfReplies`, {
+      body: encodeEnvelope(encodeMessage(HelloRequest, { name: String(messageCount) })),
+      headers: {
+        "Connect-Protocol-Version": "1",
+        "Content-Type": "application/connect+proto",
+      },
+      method: "POST",
+    });
+    await assertOK(response);
+
+    let count = 0;
+    for await (const body of connectEnvelopeBodies(response.body)) {
+      const reply = HelloReply.decode(body);
+      if (reply.message !== "server stream") {
+        throw new Error(`unexpected Connect server-stream response: ${JSON.stringify(reply)}`);
+      }
+      count += 1;
+    }
+    if (count !== messageCount) {
+      throw new Error(`expected ${messageCount} Connect server-stream responses, got ${count}`);
+    }
+  }
+
+  function encodeMessage(messageType, message) {
+    return messageType.encode(messageType.fromObject(message)).finish();
+  }
+
+  function encodeEnvelope(body) {
+    const frame = new Uint8Array(5 + body.byteLength);
+    const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    view.setUint8(0, 0);
+    view.setUint32(1, body.byteLength, false);
+    frame.set(body, 5);
+    return frame;
+  }
+
+  async function assertOK(response) {
+    if (!response.ok) {
+      throw new Error(`Connect request failed with ${response.status}: ${await response.text()}`);
+    }
+  }
+
+  async function* connectEnvelopeBodies(stream) {
+    if (stream == null) {
+      throw new Error("Connect response did not include a body stream");
+    }
+    const reader = stream.getReader();
+    const chunks = [];
+    let buffered = 0;
+    try {
+      for (;;) {
+        while (buffered < 5) {
+          const chunk = await readChunk(reader);
+          if (chunk == null) {
+            if (buffered === 0) {
+              return;
+            }
+            throw new Error("truncated Connect envelope header");
+          }
+          chunks.push(chunk);
+          buffered += chunk.byteLength;
+        }
+        const header = take(5);
+        buffered -= 5;
+        const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+        const flags = view.getUint8(0);
+        const length = view.getUint32(1, false);
+        while (buffered < length) {
+          const chunk = await readChunk(reader);
+          if (chunk == null) {
+            throw new Error("truncated Connect envelope body");
+          }
+          chunks.push(chunk);
+          buffered += chunk.byteLength;
+        }
+        const body = take(length);
+        buffered -= length;
+        if ((flags & 0x02) !== 0) {
+          continue;
+        }
+        if (flags !== 0) {
+          throw new Error(`unsupported Connect envelope flags ${flags}`);
+        }
+        yield body;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    function take(size) {
+      const output = new Uint8Array(size);
+      let offset = 0;
+      while (offset < size) {
+        const chunk = chunks.shift();
+        const needed = size - offset;
+        if (chunk.byteLength <= needed) {
+          output.set(chunk, offset);
+          offset += chunk.byteLength;
+        } else {
+          output.set(chunk.subarray(0, needed), offset);
+          chunks.unshift(chunk.subarray(needed));
+          offset += needed;
+        }
+      }
+      return output;
+    }
+  }
+
+  async function readChunk(reader) {
+    const { value, done } = await reader.read();
+    if (done) {
+      return null;
+    }
+    return value;
+  }
+}
+
 async function certificateHash(certFile) {
   const certificate = await readFile(certFile);
   return createHash("sha256").update(certificateDer(certificate)).digest("base64");
@@ -308,7 +538,7 @@ function requiredArg(index, name) {
   const value = process.argv[index];
   if (value == null || value === "") {
     throw new Error(
-      `usage: node trevrpc-js/bench/webtransport_browser.js <page-url> <webtransport-url> <cert-file> <iterations>; missing ${name}`,
+      `usage: node trevrpc-js/bench/webtransport_browser.js [--connect] <page-url> <endpoint-url> [cert-file] <iterations>; missing ${name}`,
     );
   }
   return value;

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"google.golang.org/grpc"
@@ -41,7 +42,7 @@ type grpcSplitGreeter struct{}
 
 func main() {
 	mode := flag.String("mode", "", "client or server")
-	transport := flag.String("transport", "quic", "quic, msquic, webtransport, webtransport-msquic, or grpc")
+	transport := flag.String("transport", "quic", "quic, msquic, webtransport, webtransport-msquic, grpc, or connect")
 	addr := flag.String("addr", "127.0.0.1:0", "listen or dial address")
 	cert := flag.String("cert", "", "PEM certificate path")
 	key := flag.String("key", "", "PEM private key path")
@@ -129,6 +130,9 @@ func runServer(transportName, addr, certFile, keyFile, origin string) error {
 	if transportName == "grpc" {
 		return runGRPCServer(addr)
 	}
+	if transportName == "connect" {
+		return runConnectServer(addr, origin)
+	}
 	if transportName == "webtransport-msquic" {
 		return runNativeWebTransportServer(addr, certFile, keyFile, origin)
 	}
@@ -166,6 +170,117 @@ func runServer(transportName, addr, certFile, keyFile, origin string) error {
 		return err
 	}
 	return nil
+}
+
+func runConnectServer(addr, origin string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	mux := http.NewServeMux()
+	codec := connect.WithCodec(trevRPCProtoCodec{})
+	mux.Handle(grpcFullMethod(greeter.MethodSayHello), withBenchmarkCORS(connect.NewUnaryHandler(
+		grpcFullMethod(greeter.MethodSayHello),
+		func(_ context.Context, req *connect.Request[greeter.HelloRequest]) (*connect.Response[greeter.HelloReply], error) {
+			return connect.NewResponse(&greeter.HelloReply{Message: req.Msg.Name}), nil
+		},
+		codec,
+	), origin))
+	mux.Handle(grpcFullMethod(greeter.MethodLotsOfReplies), withBenchmarkCORS(connect.NewServerStreamHandler(
+		grpcFullMethod(greeter.MethodLotsOfReplies),
+		func(_ context.Context, req *connect.Request[greeter.HelloRequest], stream *connect.ServerStream[greeter.HelloReply]) error {
+			for range messageCountFromName(req.Msg.Name) {
+				if err := stream.Send(&greeter.HelloReply{Message: "server stream"}); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		codec,
+	), origin))
+
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Printf("PORT %d\n", portFromAddr(listener.Addr()))
+
+	select {
+	case err := <-serveDone:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return err
+	}
+	select {
+	case err := <-serveDone:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-time.After(shutdownTimeout):
+		return errors.New("timed out waiting for Connect server shutdown")
+	}
+}
+
+type trevRPCProtoCodec struct{}
+
+func (trevRPCProtoCodec) Name() string {
+	return "proto"
+}
+
+func (trevRPCProtoCodec) Marshal(msg any) ([]byte, error) {
+	message, ok := msg.(trevrpc.ProtoMessage)
+	if !ok {
+		return nil, fmt.Errorf("unsupported Connect message type %T", msg)
+	}
+	return trevrpc.MarshalMessage(message)
+}
+
+func (trevRPCProtoCodec) Unmarshal(data []byte, msg any) error {
+	message, ok := msg.(trevrpc.ProtoMessage)
+	if !ok {
+		return fmt.Errorf("unsupported Connect message type %T", msg)
+	}
+	return trevrpc.UnmarshalMessage(data, message)
+}
+
+func withBenchmarkCORS(handler http.Handler, origin string) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if origin == "" {
+			response.Header().Set("Access-Control-Allow-Origin", "*")
+		} else {
+			response.Header().Set("Access-Control-Allow-Origin", origin)
+			response.Header().Add("Vary", "Origin")
+		}
+		response.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		response.Header().Set(
+			"Access-Control-Allow-Headers",
+			"Content-Type, Connect-Protocol-Version, Connect-Timeout-Ms, X-User-Agent",
+		)
+		response.Header().Set(
+			"Access-Control-Expose-Headers",
+			"Connect-Content-Encoding, Connect-Accept-Encoding, Grpc-Status, Grpc-Message",
+		)
+		if request.Method == http.MethodOptions {
+			response.WriteHeader(http.StatusNoContent)
+			return
+		}
+		handler.ServeHTTP(response, request)
+	})
 }
 
 func runGRPCClient(addr string, iterations int) error {
