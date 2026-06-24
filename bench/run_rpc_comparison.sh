@@ -398,7 +398,7 @@ EOF
 
 ## Notes
 
-These rows use the same four RPC shapes: unary, server streaming with 16 response messages, client streaming with 16 request messages, and bidirectional streaming with 16 request/response messages.
+These rows use unary, server streaming with 16 response messages, client streaming with 16 request messages, bidirectional streaming with 16 request/response messages, and a long-lived bidirectional stream that measures request/response message throughput over one open stream.
 
 Reported latency is the median across measurements. The min..max column shows the observed latency range across repeated measurements. Rust measurements also include Criterion sampling within each repeated command.
 

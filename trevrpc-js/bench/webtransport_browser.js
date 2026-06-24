@@ -73,7 +73,9 @@ try {
 }
 
 async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTransportURL }) {
+  const ConcurrentUnaryCount = 16;
   const StreamMessageCount = 16;
+  const LongLivedStreamOptions = Object.freeze({ maxResponseMessages: iterations });
   const RequestName = "TrevRPC benchmark";
   const { connect, createRoot, createServiceClient } = await import("/src/index.js");
   const root = createRoot({
@@ -147,9 +149,18 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
     await warmClient(client);
     return [
       await runCase("unary_round_trip", iterations, () => unary(client)),
+      await runConcurrentCase(
+        "unary_round_trip_concurrent_16",
+        iterations,
+        ConcurrentUnaryCount,
+        () => unary(client),
+      ),
       await runCase("server_stream_16_messages", iterations, () => serverStreaming(client)),
       await runCase("client_stream_16_messages", iterations, () => clientStreaming(client)),
       await runCase("bidi_stream_16_messages", iterations, () => bidiStreaming(client)),
+      await runLongLivedStreamCase("bidi_stream_long_lived_messages", iterations, () =>
+        bidiLongLived(client, iterations),
+      ),
     ];
   } finally {
     transport.close({ closeCode: 0, reason: "browser WebTransport benchmark complete" });
@@ -176,6 +187,35 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
     for (let index = 0; index < count; index += 1) {
       await fn();
     }
+    const elapsedSeconds = (performance.now() - start) / 1000;
+    const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
+    return { elapsedSeconds, iterations: count, name, opsPerSecond };
+  }
+
+  async function runConcurrentCase(name, count, concurrency, fn) {
+    let next = 0;
+    const workerCount = Math.min(count, concurrency);
+    const start = performance.now();
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        for (;;) {
+          const index = next;
+          next += 1;
+          if (index >= count) {
+            return;
+          }
+          await fn();
+        }
+      }),
+    );
+    const elapsedSeconds = (performance.now() - start) / 1000;
+    const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
+    return { elapsedSeconds, iterations: count, name, opsPerSecond };
+  }
+
+  async function runLongLivedStreamCase(name, count, fn) {
+    const start = performance.now();
+    await fn();
     const elapsedSeconds = (performance.now() - start) / 1000;
     const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
     return { elapsedSeconds, iterations: count, name, opsPerSecond };
@@ -233,6 +273,35 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
     }
     if (count !== StreamMessageCount) {
       throw new Error(`expected ${StreamMessageCount} bidi responses, got ${count}`);
+    }
+  }
+
+  async function bidiLongLived(client, messageCount) {
+    const call = await client.bidiHello(LongLivedStreamOptions);
+    let received = 0;
+    await Promise.all([sendMessages(), recvMessages()]);
+
+    async function sendMessages() {
+      for (let index = 0; index < messageCount; index += 1) {
+        await call.send({ name: RequestName });
+      }
+      await call.closeSend();
+    }
+
+    async function recvMessages() {
+      for (;;) {
+        const reply = await call.recv();
+        if (reply === undefined) {
+          break;
+        }
+        if (reply.message !== RequestName) {
+          throw new Error(`unexpected long-lived bidi response: ${JSON.stringify(reply)}`);
+        }
+        received += 1;
+      }
+      if (received !== messageCount) {
+        throw new Error(`expected ${messageCount} long-lived bidi responses, got ${received}`);
+      }
     }
   }
 }

@@ -134,8 +134,10 @@ typedef struct listen_work {
     uint32_t max_sessions_per_connection;
     uint32_t max_streams_per_session;
     uint32_t idle_timeout_ms;
+    int64_t max_stream_messages;
     size_t max_frame_size;
     uint16_t bound_port;
+    bool has_max_stream_messages;
 } listen_work;
 
 typedef struct serve_work {
@@ -263,6 +265,18 @@ static uint32_t get_uint32_property(napi_env env, napi_value object, const char*
     uint32_t result = default_value;
     napi_get_value_uint32(env, value, &result);
     return result;
+}
+
+static bool get_int64_property(napi_env env, napi_value object, const char* name, int64_t* out_value) {
+    bool has_property = false;
+    napi_has_named_property(env, object, name, &has_property);
+    if (!has_property) {
+        return false;
+    }
+
+    napi_value value = NULL;
+    napi_get_named_property(env, object, name, &value);
+    return napi_get_value_int64(env, value, out_value) == napi_ok;
 }
 
 static bool get_size_property(napi_env env, napi_value object, const char* name, size_t* out_value) {
@@ -1542,6 +1556,11 @@ static void listen_execute(napi_env env, void* data) {
     if (work->base.err == 0) {
         work->base.err = trevrpc_server_port(work->server, &work->bound_port);
     }
+    if (work->base.err == 0 && work->has_max_stream_messages) {
+        trevrpc_server_options options = trevrpc_default_server_options();
+        options.max_stream_messages = work->max_stream_messages;
+        work->base.err = trevrpc_server_set_options(work->server, &options);
+    }
 }
 
 static void listen_complete(napi_env env, napi_status status, void* data) {
@@ -1633,6 +1652,7 @@ static napi_value listen_msquic(napi_env env, napi_callback_info info) {
     work->max_sessions_per_connection = get_uint32_property(env, args[0], "maxSessionsPerConnection", 16);
     work->max_streams_per_session = get_uint32_property(env, args[0], "maxStreamsPerSession", 128);
     work->idle_timeout_ms = get_uint32_property(env, args[0], "idleTimeoutMs", 30000);
+    work->has_max_stream_messages = get_int64_property(env, args[0], "maxStreamMessages", &work->max_stream_messages);
     get_size_property(env, args[0], "maxFrameSize", &work->max_frame_size);
 
     if (work->host == NULL || work->cert_file == NULL || work->key_file == NULL) {

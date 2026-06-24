@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -75,6 +76,15 @@ func BenchmarkRPCComparison(b *testing.B) {
 		})
 		b.Run("grpc_go", func(b *testing.B) {
 			benchmarkGRPCBidiStreaming(b, env.grpcConn)
+		})
+	})
+
+	b.Run("bidi_stream_long_lived_messages", func(b *testing.B) {
+		b.Run("trevrpc_quic", func(b *testing.B) {
+			benchmarkTrevRPCBidiLongLived(b, env.trevrpcQUICClient)
+		})
+		b.Run("grpc_go", func(b *testing.B) {
+			benchmarkGRPCBidiLongLived(b, env.grpcConn)
 		})
 	})
 }
@@ -183,6 +193,28 @@ func benchmarkGRPCBidiStreaming(b *testing.B, conn *grpc.ClientConn) {
 	}
 }
 
+func benchmarkTrevRPCBidiLongLived(b *testing.B, client *greeter.GreeterClient) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	count, err := trevrpcBidiLongLivedCall(context.Background(), client, b.N)
+	if err != nil {
+		b.Fatal(err)
+	}
+	comparisonCountSink = count
+}
+
+func benchmarkGRPCBidiLongLived(b *testing.B, conn *grpc.ClientConn) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	count, err := grpcBidiLongLivedCall(context.Background(), conn, b.N)
+	if err != nil {
+		b.Fatal(err)
+	}
+	comparisonCountSink = count
+}
+
 type rpcComparisonEnvironment struct {
 	trevrpcQUICClient *greeter.GreeterClient
 	grpcConn          *grpc.ClientConn
@@ -275,6 +307,7 @@ func newComparisonTrevRPCServer() *trevrpc.Server {
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.GracefulShutdownTimeout = time.Second
+	options.MaxStreamMessages = -1
 	options.StreamIdleTimeout = 0
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, comparisonGreeter{})
@@ -373,6 +406,35 @@ func trevrpcBidiStreamingCall(ctx context.Context, client *greeter.GreeterClient
 	}
 }
 
+func trevrpcBidiLongLivedCall(ctx context.Context, client *greeter.GreeterClient, messageCount int) (int, error) {
+	stream, err := client.BidiHelloFromStream(ctx,
+		&countedComparisonRequests{remaining: messageCount},
+		trevrpc.WithMaxResponseMessages(messageCount),
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for {
+		_, err := stream.Recv()
+		if err == io.EOF {
+			if err := stream.Close(); err != nil {
+				return 0, err
+			}
+			if count != messageCount {
+				return 0, fmt.Errorf("long-lived bidi stream count = %d, want %d", count, messageCount)
+			}
+			return count, nil
+		}
+		if err != nil {
+			_ = stream.Close()
+			return 0, err
+		}
+		count++
+	}
+}
+
 func grpcUnaryCall(ctx context.Context, conn *grpc.ClientConn) (string, error) {
 	response := &greeter.HelloReply{}
 	if err := conn.Invoke(ctx, grpcFullMethod(greeter.MethodSayHello), comparisonRequests[0], response); err != nil {
@@ -447,6 +509,42 @@ func grpcBidiStreamingCall(ctx context.Context, conn *grpc.ClientConn) (int, err
 		response := &greeter.HelloReply{}
 		err := stream.RecvMsg(response)
 		if err == io.EOF {
+			return count, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		count++
+	}
+}
+
+func grpcBidiLongLivedCall(ctx context.Context, conn *grpc.ClientConn, messageCount int) (int, error) {
+	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodBidiHello, true, true), grpcFullMethod(greeter.MethodBidiHello))
+	if err != nil {
+		return 0, err
+	}
+	sendErr := make(chan error, 1)
+	go func() {
+		for range messageCount {
+			if err := stream.SendMsg(comparisonRequests[0]); err != nil {
+				sendErr <- err
+				return
+			}
+		}
+		sendErr <- stream.CloseSend()
+	}()
+
+	count := 0
+	for {
+		response := &greeter.HelloReply{}
+		err := stream.RecvMsg(response)
+		if err == io.EOF {
+			if sendErr := <-sendErr; sendErr != nil {
+				return 0, sendErr
+			}
+			if count != messageCount {
+				return 0, fmt.Errorf("grpc long-lived bidi stream count = %d, want %d", count, messageCount)
+			}
 			return count, nil
 		}
 		if err != nil {
@@ -666,6 +764,23 @@ func makeComparisonRequests() []*greeter.HelloRequest {
 		requests[index] = &greeter.HelloRequest{Name: comparisonRequestName}
 	}
 	return requests
+}
+
+type countedComparisonRequests struct {
+	remaining int
+}
+
+func (s *countedComparisonRequests) Recv() (*greeter.HelloRequest, error) {
+	if s.remaining <= 0 {
+		return nil, io.EOF
+	}
+	s.remaining--
+	return comparisonRequests[0], nil
+}
+
+func (s *countedComparisonRequests) Close() error {
+	s.remaining = 0
+	return nil
 }
 
 func makeComparisonReplies(prefix string) []*greeter.HelloReply {

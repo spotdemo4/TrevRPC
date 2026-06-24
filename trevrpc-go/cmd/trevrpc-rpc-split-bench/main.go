@@ -102,8 +102,14 @@ func runClient(transportName, addr, certFile string, iterations int) error {
 	}); err != nil {
 		return err
 	}
-	return runCase("bidi_stream_16_messages", iterations, func() error {
+	if err := runCase("bidi_stream_16_messages", iterations, func() error {
 		_, err := bidiStreaming(ctx, client)
+		return err
+	}); err != nil {
+		return err
+	}
+	return runLongLivedStreamCase("bidi_stream_long_lived_messages", iterations, func() error {
+		_, err := bidiLongLived(ctx, client, iterations)
 		return err
 	})
 }
@@ -119,6 +125,7 @@ func runServer(transportName, addr, certFile, keyFile, origin string) error {
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.GracefulShutdownTimeout = time.Second
+	options.MaxStreamMessages = -1
 	options.StreamIdleTimeout = 0
 	if transportName == "webtransport" {
 		options.EnableWebTransport = true
@@ -179,8 +186,14 @@ func runGRPCClient(addr string, iterations int) error {
 	}); err != nil {
 		return err
 	}
-	return runCase("bidi_stream_16_messages", iterations, func() error {
+	if err := runCase("bidi_stream_16_messages", iterations, func() error {
 		_, err := grpcBidiStreaming(ctx, conn)
+		return err
+	}); err != nil {
+		return err
+	}
+	return runLongLivedStreamCase("bidi_stream_long_lived_messages", iterations, func() error {
+		_, err := grpcBidiLongLived(ctx, conn, iterations)
 		return err
 	})
 }
@@ -354,6 +367,17 @@ func runCase(name string, iterations int, fn func() error) error {
 	return nil
 }
 
+func runLongLivedStreamCase(name string, iterations int, fn func() error) error {
+	start := time.Now()
+	if err := fn(); err != nil {
+		return fmt.Errorf("%s failed: %w", name, err)
+	}
+	elapsed := time.Since(start)
+	ops := float64(iterations) / elapsed.Seconds()
+	fmt.Printf("%s: %.0f ops/s (%d iterations in %.3fs)\n", name, ops, iterations, elapsed.Seconds())
+	return nil
+}
+
 func unary(ctx context.Context, client *greeter.GreeterClient) (string, error) {
 	response, err := client.SayHello(ctx, request)
 	if err != nil {
@@ -417,6 +441,37 @@ func bidiStreaming(ctx context.Context, client *greeter.GreeterClient) (int, err
 		if err != nil {
 			_ = stream.Close()
 			return 0, err
+		}
+		count++
+	}
+}
+
+func bidiLongLived(ctx context.Context, client *greeter.GreeterClient, messageCount int) (int, error) {
+	stream, err := client.BidiHelloFromStream(ctx,
+		&countedBenchmarkRequests{remaining: messageCount},
+		trevrpc.WithMaxResponseMessages(messageCount),
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for {
+		response, err := stream.Recv()
+		if err == io.EOF {
+			if count != messageCount {
+				_ = stream.Close()
+				return 0, fmt.Errorf("long-lived bidi stream count = %d, want %d", count, messageCount)
+			}
+			return count, stream.Close()
+		}
+		if err != nil {
+			_ = stream.Close()
+			return 0, err
+		}
+		if response.Message != requestName {
+			_ = stream.Close()
+			return 0, fmt.Errorf("long-lived bidi response = %q, want %q", response.Message, requestName)
 		}
 		count++
 	}
@@ -531,6 +586,45 @@ func grpcBidiStreaming(ctx context.Context, conn *grpc.ClientConn) (int, error) 
 	}
 }
 
+func grpcBidiLongLived(ctx context.Context, conn *grpc.ClientConn, messageCount int) (int, error) {
+	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodBidiHello, true, true), grpcFullMethod(greeter.MethodBidiHello))
+	if err != nil {
+		return 0, err
+	}
+	sendErr := make(chan error, 1)
+	go func() {
+		for range messageCount {
+			if err := stream.SendMsg(request); err != nil {
+				sendErr <- err
+				return
+			}
+		}
+		sendErr <- stream.CloseSend()
+	}()
+
+	count := 0
+	for {
+		response := &greeter.HelloReply{}
+		err := stream.RecvMsg(response)
+		if err == io.EOF {
+			if sendErr := <-sendErr; sendErr != nil {
+				return 0, sendErr
+			}
+			if count != messageCount {
+				return 0, fmt.Errorf("grpc long-lived bidi stream count = %d, want %d", count, messageCount)
+			}
+			return count, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		if response.Message != requestName {
+			return 0, fmt.Errorf("grpc long-lived bidi response = %q, want %q", response.Message, requestName)
+		}
+		count++
+	}
+}
+
 type grpcGreeterServer interface {
 	SayHello(context.Context, *greeter.HelloRequest) (*greeter.HelloReply, error)
 	LotsOfReplies(*greeter.HelloRequest, grpc.ServerStream) error
@@ -600,6 +694,23 @@ func makeRequests() []*greeter.HelloRequest {
 		requests[i] = &greeter.HelloRequest{Name: requestName}
 	}
 	return requests
+}
+
+type countedBenchmarkRequests struct {
+	remaining int
+}
+
+func (s *countedBenchmarkRequests) Recv() (*greeter.HelloRequest, error) {
+	if s.remaining <= 0 {
+		return nil, io.EOF
+	}
+	s.remaining--
+	return request, nil
+}
+
+func (s *countedBenchmarkRequests) Close() error {
+	s.remaining = 0
+	return nil
 }
 
 func (splitGreeter) SayHello(_ context.Context, request *greeter.HelloRequest) (*greeter.HelloReply, error) {

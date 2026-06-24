@@ -333,6 +333,8 @@ The client axis benchmarks each TrevRPC client transport against a reference C M
 
 The server axis benchmarks each TrevRPC server transport using a reference C client for the matching wire protocol.
 
+The \`bidi_stream_long_lived_messages\` shape measures request/response message throughput over one open bidirectional stream. Other streaming shapes open one RPC stream per iteration.
+
 The \`grpc\` axis benchmarks a Go gRPC client and Go gRPC server split into separate processes over TCP. It is a baseline only and is not transport-compatible with the TrevRPC transport rows.
 
 Raw command output is saved under \`$RAW_DIR\`. Per-measurement normalized rows are saved in \`$SAMPLES_CSV\`. The exact commands are saved in \`$COMMAND_LOG\`.

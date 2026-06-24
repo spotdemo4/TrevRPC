@@ -78,6 +78,11 @@ async fn run_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> Benc
         trevrpc_bidi_streaming_call(&client)
     })
     .await?;
+    let long_lived_message_count = usize::try_from(iterations)?;
+    run_long_lived_stream_case("bidi_stream_long_lived_messages", iterations, || {
+        trevrpc_bidi_long_lived_call(&client, long_lived_message_count)
+    })
+    .await?;
 
     connection.close(0_u32.into(), b"split benchmark complete");
     endpoint.wait_idle().await;
@@ -134,6 +139,22 @@ where
     for _ in 0..iterations {
         call().await?;
     }
+    let elapsed = start.elapsed();
+    let ops = f64::from(iterations) / elapsed.as_secs_f64();
+    println!(
+        "{name}: {ops:.0} ops/s ({iterations} iterations in {:.3}s)",
+        elapsed.as_secs_f64()
+    );
+    Ok(())
+}
+
+async fn run_long_lived_stream_case<F, Fut>(name: &str, iterations: u32, mut call: F) -> BenchResult
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = BenchResult>,
+{
+    let start = Instant::now();
+    call().await?;
     let elapsed = start.elapsed();
     let ops = f64::from(iterations) / elapsed.as_secs_f64();
     println!(
@@ -222,8 +243,40 @@ async fn trevrpc_bidi_streaming_call(
     Ok(())
 }
 
+async fn trevrpc_bidi_long_lived_call(
+    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    message_count: usize,
+) -> BenchResult {
+    let mut replies = client
+        .bidi_hello_from_stream(
+            trevrpc::stream::from_iter(long_lived_benchmark_requests(message_count)),
+            trevrpc::client::CallOptions::new().with_max_response_messages(Some(message_count)),
+        )
+        .await?;
+
+    let mut count = 0;
+    while let Some(reply) = replies.next().await.transpose()? {
+        if reply.message != REQUEST_NAME {
+            return Err("unexpected long-lived bidi response".into());
+        }
+        count += 1;
+    }
+    if count != message_count {
+        return Err(format!("long-lived bidi stream count = {count}, want {message_count}").into());
+    }
+    Ok(())
+}
+
 fn benchmark_requests() -> impl Iterator<Item = greeter::HelloRequest> {
     (0..STREAM_MESSAGE_COUNT).map(|_| greeter::HelloRequest {
+        name: REQUEST_NAME.to_owned(),
+    })
+}
+
+fn long_lived_benchmark_requests(
+    message_count: usize,
+) -> impl Iterator<Item = greeter::HelloRequest> {
+    (0..message_count).map(|_| greeter::HelloRequest {
         name: REQUEST_NAME.to_owned(),
     })
 }
@@ -293,6 +346,7 @@ fn benchmark_server_options() -> trevrpc::server::ServerOptions {
         .with_max_concurrent_connections(Some(512))
         .with_max_concurrent_streams_per_connection(Some(128))
         .with_max_concurrent_requests(Some(1024))
+        .with_max_stream_messages(None)
 }
 
 fn benchmark_webtransport_server_options(origin: String) -> trevrpc::server::ServerOptions {

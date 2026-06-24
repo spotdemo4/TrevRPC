@@ -23,6 +23,7 @@ func runNativeWebTransportServer(addr, certFile, keyFile, origin string) error {
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.GracefulShutdownTimeout = time.Second
+	options.MaxStreamMessages = -1
 	options.StreamIdleTimeout = 0
 	options.MaxConcurrentStreamsPerConnection = 65535
 	server.SetOptions(options)

@@ -37,6 +37,9 @@ func BenchmarkRPCComparisonMsQuic(b *testing.B) {
 	b.Run("bidi_stream_16_messages/trevrpc_msquic", func(b *testing.B) {
 		benchmarkTrevRPCBidiStreaming(b, client)
 	})
+	b.Run("bidi_stream_long_lived_messages/trevrpc_msquic", func(b *testing.B) {
+		benchmarkTrevRPCBidiLongLived(b, client)
+	})
 }
 
 func startTrevRPCMsQuicComparisonClient(b *testing.B) *greeter.GreeterClient {

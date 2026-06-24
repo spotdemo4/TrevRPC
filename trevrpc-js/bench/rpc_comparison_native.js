@@ -99,6 +99,11 @@ try {
   await runBenchmarkCase("bidi_stream_16_messages/trevrpc_js_msquic", iterations, () =>
     bidiStreaming(client),
   );
+  await runLongLivedStreamBenchmarkCase(
+    "bidi_stream_long_lived_messages/trevrpc_js_msquic",
+    iterations,
+    () => bidiLongLived(client, iterations),
+  );
 } finally {
   transport?.close();
   await stopServer(server);
@@ -183,6 +188,16 @@ async function runBenchmarkCase(name, count, fn) {
   );
 }
 
+async function runLongLivedStreamBenchmarkCase(name, count, fn) {
+  const start = process.hrtime.bigint();
+  await fn();
+  const elapsedSeconds = Number(process.hrtime.bigint() - start) / 1_000_000_000;
+  const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
+  console.log(
+    `${name}: ${opsPerSecond.toFixed(0)} ops/s (${count} iterations in ${elapsedSeconds.toFixed(3)}s)`,
+  );
+}
+
 async function unaryRoundTrip(client) {
   const reply = await client.sayHello(BenchmarkRequest);
   if (reply.message !== BenchmarkRequest.name) {
@@ -237,5 +252,34 @@ async function bidiStreaming(client) {
   }
   if (count !== BenchmarkStreamMessageCount) {
     throw new Error(`expected ${BenchmarkStreamMessageCount} bidi responses, got ${count}`);
+  }
+}
+
+async function bidiLongLived(client, messageCount) {
+  const call = await client.bidiHello({ maxResponseMessages: messageCount });
+  let received = 0;
+  await Promise.all([sendMessages(), recvMessages()]);
+
+  async function sendMessages() {
+    for (let i = 0; i < messageCount; i++) {
+      await call.send(BenchmarkRequest);
+    }
+    await call.closeSend();
+  }
+
+  async function recvMessages() {
+    for (;;) {
+      const reply = await call.recv();
+      if (reply === undefined) {
+        break;
+      }
+      if (reply.message !== BenchmarkRequest.name) {
+        throw new Error(`unexpected long-lived bidi response: ${JSON.stringify(reply)}`);
+      }
+      received++;
+    }
+    if (received !== messageCount) {
+      throw new Error(`expected ${messageCount} long-lived bidi responses, got ${received}`);
+    }
   }
 }

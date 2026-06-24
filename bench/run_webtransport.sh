@@ -314,7 +314,7 @@ EOF
 
 The WebTransport category benchmarks server implementations with a real Chromium WebTransport client driven by Playwright.
 
-Each sample uses one browser WebTransport session per server and runs the same four split benchmark RPC shapes: unary, server streaming with 16 response messages, client streaming with 16 request messages, and bidirectional streaming with 16 request/response messages.
+Each sample uses one browser WebTransport session per server. The sequential shapes are unary, server streaming with 16 response messages, client streaming with 16 request messages, and bidirectional streaming with 16 request/response messages. The concurrent unary shape runs independent unary RPCs over separate WebTransport streams on the same session to show throughput without making one stream-open round trip the whole measurement. The long-lived bidirectional shape measures request/response message throughput over one open WebTransport stream.
 
 \`go_webtransport\` is the quic-go HTTP/3 WebTransport server path. \`go_webtransport_msquic\`, \`c_webtransport\`, and \`js_webtransport\` use the native MsQuic-backed WebTransport stack and are reported separately because browser interoperability can differ from the quic-go path.
 

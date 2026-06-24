@@ -92,6 +92,9 @@ async function runClient(host, port, iterations) {
     await runCase("server_stream_16_messages", iterations, () => serverStreaming(client));
     await runCase("client_stream_16_messages", iterations, () => clientStreaming(client));
     await runCase("bidi_stream_16_messages", iterations, () => bidiStreaming(client));
+    await runLongLivedStreamCase("bidi_stream_long_lived_messages", iterations, () =>
+      bidiLongLived(client, iterations),
+    );
   } finally {
     transport.close();
   }
@@ -107,6 +110,7 @@ async function runServer(certFile, keyFile) {
     origin: process.env.TREVRPC_WEBTRANSPORT_ORIGIN,
     maxSessionsPerConnection: 16,
     maxStreamsPerSession: 65_535,
+    maxStreamMessages: -1,
     idleTimeoutMs: IdleTimeoutMs,
   });
   server.registerService(GreeterService, {
@@ -140,6 +144,16 @@ async function runCase(name, iterations, fn) {
   for (let i = 0; i < iterations; i++) {
     await fn();
   }
+  const elapsedSeconds = Number(process.hrtime.bigint() - start) / 1_000_000_000;
+  const opsPerSecond = elapsedSeconds > 0 ? iterations / elapsedSeconds : 0;
+  console.log(
+    `${name}: ${opsPerSecond.toFixed(0)} ops/s (${iterations} iterations in ${elapsedSeconds.toFixed(3)}s)`,
+  );
+}
+
+async function runLongLivedStreamCase(name, iterations, fn) {
+  const start = process.hrtime.bigint();
+  await fn();
   const elapsedSeconds = Number(process.hrtime.bigint() - start) / 1_000_000_000;
   const opsPerSecond = elapsedSeconds > 0 ? iterations / elapsedSeconds : 0;
   console.log(
@@ -199,6 +213,35 @@ async function bidiStreaming(client) {
   }
   if (count !== StreamMessageCount) {
     throw new Error(`expected ${StreamMessageCount} bidi responses, got ${count}`);
+  }
+}
+
+async function bidiLongLived(client, messageCount) {
+  const call = await client.bidiHello({ maxResponseMessages: messageCount });
+  let received = 0;
+  await Promise.all([sendMessages(), recvMessages()]);
+
+  async function sendMessages() {
+    for (let i = 0; i < messageCount; i++) {
+      await call.send({ name: RequestName });
+    }
+    await call.closeSend();
+  }
+
+  async function recvMessages() {
+    for (;;) {
+      const reply = await call.recv();
+      if (reply === undefined) {
+        break;
+      }
+      if (reply.message !== RequestName) {
+        throw new Error(`unexpected long-lived bidi response: ${JSON.stringify(reply)}`);
+      }
+      received++;
+    }
+    if (received !== messageCount) {
+      throw new Error(`expected ${messageCount} long-lived bidi responses, got ${received}`);
+    }
   }
 }
 

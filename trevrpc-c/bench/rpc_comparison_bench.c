@@ -49,11 +49,21 @@ typedef struct benchmark_fixture {
 } benchmark_fixture;
 
 typedef int (*benchmark_case)(trevrpc_client* client);
+typedef int (*long_lived_benchmark_case)(trevrpc_client* client, size_t iterations);
+typedef int (*stream_send_request_fn)(trevrpc_stream* stream);
 
 typedef struct split_benchmark_case {
     const char* name;
     benchmark_case fn;
+    long_lived_benchmark_case long_lived_fn;
 } split_benchmark_case;
+
+typedef struct long_lived_sender_args {
+    trevrpc_stream* stream;
+    size_t count;
+    stream_send_request_fn send_request;
+    int result;
+} long_lived_sender_args;
 
 static volatile size_t benchmark_count_sink;
 static volatile size_t benchmark_bytes_sink;
@@ -502,10 +512,14 @@ static int benchmark_server_streaming(trevrpc_client* client) {
     return err;
 }
 
-static int send_benchmark_requests(trevrpc_stream* stream) {
+static int send_benchmark_request(trevrpc_stream* stream) {
     Hello__V1__HelloRequest request = benchmark_request();
+    return hello_v1_greeter_send_hello_v1_hello_request(stream, &request);
+}
+
+static int send_benchmark_requests(trevrpc_stream* stream) {
     for (size_t i = 0; i < BENCHMARK_STREAM_MESSAGE_COUNT; i++) {
-        int err = hello_v1_greeter_send_hello_v1_hello_request(stream, &request);
+        int err = send_benchmark_request(stream);
         if (err != 0) {
             return err;
         }
@@ -585,6 +599,73 @@ static int benchmark_bidi_streaming(trevrpc_client* client) {
     return err;
 }
 
+static void* long_lived_sender_thread(void* arg) {
+    long_lived_sender_args* args = arg;
+    args->result = 0;
+    for (size_t i = 0; i < args->count; i++) {
+        args->result = args->send_request(args->stream);
+        if (args->result != 0) {
+            return NULL;
+        }
+    }
+    args->result = trevrpc_stream_finish_send(args->stream);
+    return NULL;
+}
+
+static int benchmark_recv_bidi_replies(trevrpc_stream* stream, size_t expected_count) {
+    size_t count = 0;
+    int err = 0;
+    while (err == 0) {
+        Hello__V1__HelloReply* reply = NULL;
+        uint32_t status = TREVRPC_STATUS_OK;
+        err = hello_v1_greeter_recv_hello_v1_hello_reply(stream, &reply, &status);
+        if (err != 0) {
+            break;
+        }
+        if (reply == NULL) {
+            err = status == TREVRPC_STATUS_OK ? 0 : -EINVAL;
+            break;
+        }
+        consume_reply(reply);
+        hello__v1__hello_reply__free_unpacked(reply, NULL);
+        count++;
+    }
+
+    if (err == 0 && count != expected_count) {
+        err = -EINVAL;
+    }
+    benchmark_count_sink += count;
+    return err;
+}
+
+static int benchmark_bidi_long_lived(trevrpc_client* client, size_t message_count) {
+    trevrpc_stream* stream = NULL;
+    int err = hello_v1_greeter_bidi_hello_start(client, &stream);
+    if (err != 0) {
+        return err;
+    }
+
+    long_lived_sender_args args = {
+        .stream = stream,
+        .count = message_count,
+        .send_request = send_benchmark_request,
+    };
+    pthread_t sender;
+    err = pthread_create(&sender, NULL, long_lived_sender_thread, &args);
+    if (err == 0) {
+        err = benchmark_recv_bidi_replies(stream, message_count);
+        int join_err = pthread_join(sender, NULL);
+        if (err == 0) {
+            err = join_err == 0 ? args.result : -join_err;
+        }
+    } else {
+        err = -err;
+    }
+
+    trevrpc_stream_close(stream);
+    return err;
+}
+
 static int split_decode_reply(const uint8_t* body, size_t body_len, Hello__V1__HelloReply** out_reply) {
     if (out_reply == NULL) {
         return -EINVAL;
@@ -630,15 +711,20 @@ static int split_recv_reply_frame(trevrpc_stream* stream, bool* done) {
     return err;
 }
 
+static int split_send_benchmark_request(trevrpc_stream* stream) {
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    int err = benchmark_request_body(&body, &body_len);
+    if (err == 0) {
+        err = trevrpc_stream_send_message(stream, body, body_len);
+    }
+    free(body);
+    return err;
+}
+
 static int split_send_benchmark_requests(trevrpc_stream* stream) {
     for (size_t i = 0; i < BENCHMARK_STREAM_MESSAGE_COUNT; i++) {
-        uint8_t* body = NULL;
-        size_t body_len = 0;
-        int err = benchmark_request_body(&body, &body_len);
-        if (err == 0) {
-            err = trevrpc_stream_send_message(stream, body, body_len);
-        }
-        free(body);
+        int err = split_send_benchmark_request(stream);
         if (err != 0) {
             return err;
         }
@@ -769,6 +855,58 @@ static int split_benchmark_bidi_streaming(trevrpc_client* client) {
     return err;
 }
 
+static int split_recv_bidi_replies(trevrpc_stream* stream, size_t expected_count) {
+    size_t count = 0;
+    int err = 0;
+    while (err == 0) {
+        bool done = false;
+        err = split_recv_reply_frame(stream, &done);
+        if (err != 0 || done) {
+            break;
+        }
+        count++;
+    }
+    if (err == 0 && count != expected_count) {
+        err = -EINVAL;
+    }
+    benchmark_count_sink += count;
+    return err;
+}
+
+static int split_benchmark_bidi_long_lived(trevrpc_client* client, size_t message_count) {
+    trevrpc_stream* stream = NULL;
+    int err = trevrpc_client_start_stream(client,
+        BENCHMARK_SPLIT_SERVICE,
+        BENCHMARK_METHOD_BIDI_HELLO,
+        TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
+        NULL,
+        0,
+        &stream);
+    if (err != 0) {
+        return err;
+    }
+
+    long_lived_sender_args args = {
+        .stream = stream,
+        .count = message_count,
+        .send_request = split_send_benchmark_request,
+    };
+    pthread_t sender;
+    err = pthread_create(&sender, NULL, long_lived_sender_thread, &args);
+    if (err == 0) {
+        err = split_recv_bidi_replies(stream, message_count);
+        int join_err = pthread_join(sender, NULL);
+        if (err == 0) {
+            err = join_err == 0 ? args.result : -join_err;
+        }
+    } else {
+        err = -err;
+    }
+
+    trevrpc_stream_close(stream);
+    return err;
+}
+
 static int run_benchmark_case(const char* name, trevrpc_client* client, benchmark_case fn, size_t iterations) {
     uint64_t start = monotonic_nanos();
     for (size_t i = 0; i < iterations; i++) {
@@ -777,6 +915,18 @@ static int run_benchmark_case(const char* name, trevrpc_client* client, benchmar
             fprintf(stderr, "%s failed: %s (%d)\n", name, trevrpc_error(err), err);
             return err;
         }
+    }
+    print_rate(name, iterations, monotonic_nanos() - start);
+    return 0;
+}
+
+static int run_long_lived_benchmark_case(
+    const char* name, trevrpc_client* client, long_lived_benchmark_case fn, size_t iterations) {
+    uint64_t start = monotonic_nanos();
+    int err = fn(client, iterations);
+    if (err != 0) {
+        fprintf(stderr, "%s failed: %s (%d)\n", name, trevrpc_error(err), err);
+        return err;
     }
     print_rate(name, iterations, monotonic_nanos() - start);
     return 0;
@@ -800,11 +950,26 @@ static int warm_client(const char* name, trevrpc_client* client) {
 }
 
 static const split_benchmark_case split_benchmark_cases[] = {
-    {"unary_round_trip", split_benchmark_unary_round_trip},
-    {"server_stream_16_messages", split_benchmark_server_streaming},
-    {"client_stream_16_messages", split_benchmark_client_streaming},
-    {"bidi_stream_16_messages", split_benchmark_bidi_streaming},
+    {"unary_round_trip", split_benchmark_unary_round_trip, NULL},
+    {"server_stream_16_messages", split_benchmark_server_streaming, NULL},
+    {"client_stream_16_messages", split_benchmark_client_streaming, NULL},
+    {"bidi_stream_16_messages", split_benchmark_bidi_streaming, NULL},
+    {"bidi_stream_long_lived_messages", NULL, split_benchmark_bidi_long_lived},
 };
+
+static int run_split_benchmark_case(const split_benchmark_case* benchmark, trevrpc_client* client, size_t iterations) {
+    if (benchmark->long_lived_fn != NULL) {
+        return run_long_lived_benchmark_case(benchmark->name, client, benchmark->long_lived_fn, iterations);
+    }
+    return run_benchmark_case(benchmark->name, client, benchmark->fn, iterations);
+}
+
+static int warm_split_benchmark_case(const split_benchmark_case* benchmark, trevrpc_client* client) {
+    if (benchmark->long_lived_fn != NULL) {
+        return benchmark->long_lived_fn(client, BENCHMARK_STREAM_MESSAGE_COUNT);
+    }
+    return benchmark->fn(client);
+}
 
 static const split_benchmark_case* find_split_benchmark_case(const char* shape) {
     if (shape == NULL || strcmp(shape, "all") == 0) {
@@ -822,7 +987,7 @@ static const split_benchmark_case* find_split_benchmark_case(const char* shape) 
 
 static int warm_split_client(const char* name, trevrpc_client* client, const split_benchmark_case* only_case) {
     if (only_case != NULL) {
-        int err = only_case->fn(client);
+        int err = warm_split_benchmark_case(only_case, client);
         if (err != 0) {
             fprintf(stderr, "warm %s %s failed: %s (%d)\n", name, only_case->name, trevrpc_error(err), err);
         }
@@ -830,7 +995,7 @@ static int warm_split_client(const char* name, trevrpc_client* client, const spl
     }
 
     for (size_t i = 0; i < sizeof(split_benchmark_cases) / sizeof(split_benchmark_cases[0]); i++) {
-        int err = split_benchmark_cases[i].fn(client);
+        int err = warm_split_benchmark_case(&split_benchmark_cases[i], client);
         if (err != 0) {
             fprintf(
                 stderr, "warm %s %s failed: %s (%d)\n", name, split_benchmark_cases[i].name, trevrpc_error(err), err);
@@ -880,12 +1045,12 @@ static int run_split_client_mode(
 
     err = warm_split_client(transport, client, only_case);
     if (err == 0 && only_case != NULL) {
-        err = run_benchmark_case(only_case->name, client, only_case->fn, iterations);
+        err = run_split_benchmark_case(only_case, client, iterations);
     }
     for (size_t i = 0;
         err == 0 && only_case == NULL && i < sizeof(split_benchmark_cases) / sizeof(split_benchmark_cases[0]);
         i++) {
-        err = run_benchmark_case(split_benchmark_cases[i].name, client, split_benchmark_cases[i].fn, iterations);
+        err = run_split_benchmark_case(&split_benchmark_cases[i], client, iterations);
     }
 
     trevrpc_client_close(client);
@@ -944,6 +1109,7 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
 
     trevrpc_server_options options = trevrpc_default_server_options();
     options.graceful_shutdown_timeout_nanos = BENCHMARK_GRACEFUL_SHUTDOWN_NANOS;
+    options.max_stream_messages = -1;
     options.stream_idle_timeout_nanos = 0;
     err = trevrpc_server_set_options(fixture->server, &options);
     if (err == 0) {
@@ -1085,6 +1251,12 @@ int main(int argc, char** argv) {
     if (err == 0) {
         err = run_benchmark_case(
             "bidi_stream_16_messages/trevrpc_msquic", fixture.native_client, benchmark_bidi_streaming, iterations);
+    }
+    if (err == 0) {
+        err = run_long_lived_benchmark_case("bidi_stream_long_lived_messages/trevrpc_msquic",
+            fixture.native_client,
+            benchmark_bidi_long_lived,
+            iterations);
     }
 
     int stop_err = stop_fixture(&fixture);

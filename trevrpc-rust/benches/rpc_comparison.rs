@@ -475,6 +475,29 @@ where
             .await
             .map(tonic::Response::into_inner)
     }
+
+    async fn bidi_hello_with_message_count(
+        &mut self,
+        message_count: usize,
+    ) -> Result<tonic::Streaming<greeter::HelloReply>, tonic::Status> {
+        self.inner.ready().await.map_err(|error| {
+            tonic::Status::unknown(format!("gRPC service was not ready: {}", error.into()))
+        })?;
+
+        let mut request = tonic::Request::new(tokio_stream::iter(long_lived_benchmark_requests(
+            message_count,
+        )));
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new(GRPC_SERVICE, "BidiHello"));
+
+        let path = http::uri::PathAndQuery::from_static(GRPC_BIDI_HELLO_PATH);
+        let codec = tonic_prost::ProstCodec::default();
+        self.inner
+            .streaming(request, path, codec)
+            .await
+            .map(tonic::Response::into_inner)
+    }
 }
 
 struct BenchmarkState {
@@ -812,6 +835,42 @@ fn rpc_comparison(c: &mut Criterion) {
     });
 
     group.finish();
+
+    let mut group = c.benchmark_group("bidi_stream_long_lived_messages");
+
+    group.bench_function("trevrpc_quinn", |b| {
+        let client = trevrpc_client.clone();
+        b.to_async(&runtime).iter_custom(move |iters| {
+            let client = client.clone();
+            async move {
+                let start = Instant::now();
+                black_box(
+                    trevrpc_bidi_long_lived_call(&client, iters)
+                        .await
+                        .expect("TrevRPC long-lived bidi-streaming call"),
+                );
+                start.elapsed()
+            }
+        });
+    });
+
+    group.bench_function("grpc_tonic", |b| {
+        let client = grpc_client.clone();
+        b.to_async(&runtime).iter_custom(move |iters| {
+            let mut client = client.clone();
+            async move {
+                let start = Instant::now();
+                black_box(
+                    grpc_bidi_long_lived_call(&mut client, iters)
+                        .await
+                        .expect("gRPC long-lived bidi-streaming call"),
+                );
+                start.elapsed()
+            }
+        });
+    });
+
+    group.finish();
     runtime
         .block_on(state.shutdown())
         .expect("benchmark servers should shut down cleanly");
@@ -911,6 +970,30 @@ async fn trevrpc_bidi_streaming_call(
     Ok(count)
 }
 
+async fn trevrpc_bidi_long_lived_call(
+    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    message_count: u64,
+) -> BenchResult<usize> {
+    let message_count = usize::try_from(message_count)?;
+    let mut replies = client
+        .bidi_hello_from_stream(
+            trevrpc::stream::from_iter(long_lived_benchmark_requests(message_count)),
+            trevrpc::client::CallOptions::new().with_max_response_messages(Some(message_count)),
+        )
+        .await?;
+
+    let mut count = 0;
+    while let Some(_reply) = replies.next().await.transpose()? {
+        count += 1;
+    }
+
+    if count != message_count {
+        return Err(format!("long-lived bidi stream count = {count}, want {message_count}").into());
+    }
+
+    Ok(count)
+}
+
 async fn grpc_bidi_streaming_call(client: &mut GrpcGreeterClient<Channel>) -> BenchResult<usize> {
     let mut replies = client.bidi_hello().await?;
     let mut count = 0;
@@ -922,8 +1005,37 @@ async fn grpc_bidi_streaming_call(client: &mut GrpcGreeterClient<Channel>) -> Be
     Ok(count)
 }
 
+async fn grpc_bidi_long_lived_call(
+    client: &mut GrpcGreeterClient<Channel>,
+    message_count: u64,
+) -> BenchResult<usize> {
+    let message_count = usize::try_from(message_count)?;
+    let mut replies = client.bidi_hello_with_message_count(message_count).await?;
+    let mut count = 0;
+
+    while let Some(_reply) = replies.message().await? {
+        count += 1;
+    }
+
+    if count != message_count {
+        return Err(
+            format!("grpc long-lived bidi stream count = {count}, want {message_count}").into(),
+        );
+    }
+
+    Ok(count)
+}
+
 fn benchmark_requests() -> impl Iterator<Item = greeter::HelloRequest> {
     (0..STREAM_MESSAGE_COUNT).map(|index| greeter::HelloRequest {
+        name: format!("{BENCH_REQUEST_NAME}-{index}"),
+    })
+}
+
+fn long_lived_benchmark_requests(
+    message_count: usize,
+) -> impl Iterator<Item = greeter::HelloRequest> {
+    (0..message_count).map(|index| greeter::HelloRequest {
         name: format!("{BENCH_REQUEST_NAME}-{index}"),
     })
 }
@@ -949,6 +1061,7 @@ fn benchmark_server_options() -> trevrpc::server::ServerOptions {
         .with_graceful_shutdown_timeout(Some(Duration::from_millis(200)))
         .with_max_concurrent_streams_per_connection(Some(512))
         .with_max_concurrent_requests(Some(1024))
+        .with_max_stream_messages(None)
 }
 
 fn make_trevrpc_server_endpoint(
