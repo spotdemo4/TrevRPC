@@ -6,6 +6,6 @@ includedir=${prefix}/include
 Name: trevrpc_webtransport
 Description: TrevRPC C low-level WebTransport wrapper
 Version: @PROJECT_VERSION@
+Requires.private: trevrpc_msquic
 Libs: -L${libdir} -ltrevrpc_webtransport
-Libs.private: -lwtf
 Cflags: -I${includedir}

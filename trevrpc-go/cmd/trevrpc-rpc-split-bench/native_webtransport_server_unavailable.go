@@ -1,4 +1,4 @@
-//go:build !trevrpc_webtransport_native || !cgo
+//go:build !trevrpc_msquic || !trevrpc_webtransport_native || !cgo
 
 package main
 

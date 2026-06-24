@@ -53,7 +53,6 @@
               pkg-config
               protobufc
               libmsquic
-              libwtf
 
               # javascript
               nodejs_24

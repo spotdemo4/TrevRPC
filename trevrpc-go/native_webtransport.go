@@ -1,10 +1,10 @@
-//go:build trevrpc_webtransport_native && cgo
+//go:build trevrpc_msquic && trevrpc_webtransport_native && cgo
 
 package trevrpc
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../trevrpc-c/include -I${SRCDIR}/../trevrpc-c/src
-#cgo LDFLAGS: -lwtf -lpthread -lm -lrt -lcrypto
+#cgo LDFLAGS: -lmsquic -lpthread
 #include <stdlib.h>
 #include "trevrpc_webtransport.c"
 */
@@ -16,13 +16,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	urlpkg "net/url"
 	"strconv"
 	"sync"
 	"time"
 	"unsafe"
 )
 
-// NativeWebTransportConfig configures the experimental C libwtf WebTransport backend.
+// NativeWebTransportConfig configures the experimental native C WebTransport backend.
 type NativeWebTransportConfig struct {
 	Path                        string
 	Origin                      string
@@ -39,7 +40,7 @@ type NativeWebTransportConfig struct {
 	HandshakeTimeout            time.Duration
 }
 
-// NativeWebTransportListener accepts WebTransport sessions from trevrpc-c/libwtf.
+// NativeWebTransportListener accepts WebTransport sessions from trevrpc-c's native backend.
 type NativeWebTransportListener struct {
 	mu        sync.Mutex
 	ptr       *C.trevrpc_wt_listener
@@ -60,7 +61,7 @@ type NativeWebTransportClient struct {
 	maxFrameSize int
 }
 
-// ListenNativeWebTransport starts a native WebTransport listener backed by libwtf.
+// ListenNativeWebTransport starts a native WebTransport listener backed by trevrpc-c.
 func ListenNativeWebTransport(addr string, config NativeWebTransportConfig) (*NativeWebTransportListener, error) {
 	host, port, err := splitNativeWebTransportAddr(addr)
 	if err != nil {
@@ -80,14 +81,19 @@ func ListenNativeWebTransport(addr string, config NativeWebTransportConfig) (*Na
 	return &NativeWebTransportListener{ptr: listener, addr: nativeWebTransportListenerAddr(host, port, listener)}, nil
 }
 
-// DialNativeWebTransport dials a native WebTransport session backed by libwtf.
-func DialNativeWebTransport(ctx context.Context, url string, config NativeWebTransportConfig) (*NativeWebTransportSession, error) {
+// DialNativeWebTransport dials a native WebTransport session backed by trevrpc-c.
+func DialNativeWebTransport(ctx context.Context, rawURL string, config NativeWebTransportConfig) (*NativeWebTransportSession, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
+	host, authority, path, port, err := parseNativeWebTransportURL(rawURL, config)
+	if err != nil {
+		return nil, err
+	}
+	config.Path = path
 
 	var session *C.trevrpc_wt_session
-	err := withNativeWebTransportConfig(config, "", url, 0, func(cConfig *C.trevrpc_wt_config) error {
+	err = withNativeWebTransportConfig(config, host, authority, port, func(cConfig *C.trevrpc_wt_config) error {
 		code := C.trevrpc_wt_dial(cConfig, &session)
 		if code != 0 {
 			return nativeWebTransportOrContextStatus(ctx, code)
@@ -650,16 +656,16 @@ func (s *nativeWebTransportStream) trevrpcCancelReadOnContext(ctx context.Contex
 	return func() { closeOnce.Do(func() { close(done) }) }
 }
 
-func withNativeWebTransportConfig(config NativeWebTransportConfig, host, url string, port C.uint16_t, fn func(*C.trevrpc_wt_config) error) error {
+func withNativeWebTransportConfig(config NativeWebTransportConfig, host, authority string, port C.uint16_t, fn func(*C.trevrpc_wt_config) error) error {
 	var cHost *C.char
 	if host != "" {
 		cHost = C.CString(host)
 		defer C.free(unsafe.Pointer(cHost))
 	}
-	var cURL *C.char
-	if url != "" {
-		cURL = C.CString(url)
-		defer C.free(unsafe.Pointer(cURL))
+	var cAuthority *C.char
+	if authority != "" {
+		cAuthority = C.CString(authority)
+		defer C.free(unsafe.Pointer(cAuthority))
 	}
 	path := config.Path
 	if path == "" {
@@ -694,7 +700,7 @@ func withNativeWebTransportConfig(config NativeWebTransportConfig, host, url str
 	cConfig := C.trevrpc_wt_config{
 		host:                        cHost,
 		port:                        port,
-		url:                         cURL,
+		url:                         cAuthority,
 		path:                        cPath,
 		origin:                      cOrigin,
 		cert_file:                   cCertFile,
@@ -710,6 +716,38 @@ func withNativeWebTransportConfig(config NativeWebTransportConfig, host, url str
 		handshake_timeout_ms:        C.uint32_t(nativeWebTransportDurationMillis(config.HandshakeTimeout)),
 	}
 	return fn(&cConfig)
+}
+
+func parseNativeWebTransportURL(rawURL string, config NativeWebTransportConfig) (string, string, string, C.uint16_t, error) {
+	parsed, err := urlpkg.Parse(rawURL)
+	if err != nil {
+		return "", "", "", 0, InvalidArgument("native WebTransport URL is invalid")
+	}
+	if parsed.Scheme != "https" {
+		return "", "", "", 0, InvalidArgument("native WebTransport URL must use https")
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", "", "", 0, InvalidArgument("native WebTransport URL host is required")
+	}
+
+	port := 443
+	if portText := parsed.Port(); portText != "" {
+		parsedPort, err := strconv.Atoi(portText)
+		if err != nil || parsedPort < 0 || parsedPort > 65535 {
+			return "", "", "", 0, InvalidArgument("native WebTransport URL port is out of range")
+		}
+		port = parsedPort
+	}
+
+	path := config.Path
+	if path == "" {
+		path = parsed.EscapedPath()
+		if path == "" {
+			path = "/trevrpc"
+		}
+	}
+	return host, parsed.Host, path, C.uint16_t(port), nil
 }
 
 func nativeWebTransportDurationMillis(duration time.Duration) uint64 {

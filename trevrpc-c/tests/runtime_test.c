@@ -85,7 +85,10 @@ struct trevrpc_msquic_stream {
     bool recv_fin;
     bool send_closed;
     bool shutdown_complete;
+    bool close_pending;
     bool closed;
+    bool api_ref_acquired;
+    size_t active_handle_ops;
     int err;
     trevrpc_msquic_send* send_pool;
     size_t send_pool_count;

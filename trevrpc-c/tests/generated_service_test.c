@@ -54,7 +54,10 @@ struct trevrpc_msquic_stream {
     bool recv_fin;
     bool send_closed;
     bool shutdown_complete;
+    bool close_pending;
     bool closed;
+    bool api_ref_acquired;
+    size_t active_handle_ops;
     int err;
     trevrpc_msquic_send* send_pool;
     size_t send_pool_count;
@@ -717,29 +720,34 @@ cleanup:
 }
 
 int main(void) {
+    int result = 1;
+
     if (test_generated_services_all_rpc_shapes() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_serve_loop_unary_shutdown() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_unary_round_trip() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_serve_loop_server_streaming() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_serve_loop_client_streaming() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_serve_loop_bidi_streaming() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_serve_loop_partial_request_close() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_shared_listener_native_and_webtransport_unary() != 0) {
-        return 1;
+        goto cleanup;
     }
-    return 0;
+    result = 0;
+
+cleanup:
+    return result;
 }

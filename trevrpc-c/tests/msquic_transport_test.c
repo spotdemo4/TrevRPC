@@ -1006,53 +1006,58 @@ cleanup:
 }
 
 int main(void) {
+    int result = 1;
+
     if (test_stream_reset_unblocks_peer_read() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_client_close_unblocks_server_accept_stream() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_connects_h3_quic_session() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_rejects_path_mismatch() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_accepts_draft02_peer() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_accepts_draft07_peer() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_accepts_draft15_peer() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_rejects_malformed_control_stream_type() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_rejects_missing_webtransport_setting() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_rejects_malformed_settings_payload() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_rejects_malformed_qpack_block() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_rejects_missing_connect_pseudo_header() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_rejects_invalid_connect_method() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_listener_shutdown_unblocks_accept() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_session_shutdown_unblocks_accept_stream() != 0) {
-        return 1;
+        goto cleanup;
     }
     if (test_webtransport_stream_close_unblocks_peer_read() != 0) {
-        return 1;
+        goto cleanup;
     }
-    return 0;
+    result = 0;
+
+cleanup:
+    return result;
 }

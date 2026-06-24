@@ -46,8 +46,17 @@ endfunction()
 
 function(trevrpc_c_sanitizers target)
     if(TREVRPC_ENABLE_SANITIZERS AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_definitions(${target} PRIVATE TREVRPC_SANITIZER_BUILD)
         target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    endif()
+endfunction()
+
+function(trevrpc_c_lsan_suppressions test_name)
+    if(TREVRPC_ENABLE_SANITIZERS)
+        set_tests_properties(${test_name} PROPERTIES ENVIRONMENT
+            "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan.supp"
+        )
     endif()
 endfunction()
 
@@ -81,6 +90,10 @@ if(TREVRPC_BUILD_MSQUIC)
 endif()
 
 if(TREVRPC_BUILD_WEBTRANSPORT)
+    if(NOT TREVRPC_BUILD_MSQUIC)
+        message(FATAL_ERROR "TREVRPC_BUILD_WEBTRANSPORT requires TREVRPC_BUILD_MSQUIC")
+    endif()
+
     add_library(trevrpc_webtransport STATIC
         src/trevrpc_webtransport.c
     )
@@ -89,7 +102,7 @@ if(TREVRPC_BUILD_WEBTRANSPORT)
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
-    target_link_libraries(trevrpc_webtransport PUBLIC Threads::Threads)
+    target_link_libraries(trevrpc_webtransport PUBLIC trevrpc_msquic Threads::Threads)
     trevrpc_c_warnings(trevrpc_webtransport)
     trevrpc_c_sanitizers(trevrpc_webtransport)
     list(APPEND trevrpc_install_targets trevrpc_webtransport)
@@ -366,6 +379,7 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_sanitizers(trevrpc_msquic_transport_test)
 
         add_test(NAME trevrpc_msquic_transport COMMAND trevrpc_msquic_transport_test)
+        trevrpc_c_lsan_suppressions(trevrpc_msquic_transport)
 
         add_executable(trevrpc_generated_service_test
             tests/generated_service_test.c
@@ -383,5 +397,6 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_sanitizers(trevrpc_generated_service_test)
 
         add_test(NAME trevrpc_generated_service COMMAND trevrpc_generated_service_test)
+        trevrpc_c_lsan_suppressions(trevrpc_generated_service)
     endif()
 endif()
