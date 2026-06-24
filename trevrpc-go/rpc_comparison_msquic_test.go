@@ -25,20 +25,26 @@ func BenchmarkRPCComparisonMsQuic(b *testing.B) {
 	client := startTrevRPCMsQuicComparisonClient(b)
 	warmTrevRPCMsQuicComparisonClient(b, client)
 
-	b.Run("unary_round_trip/trevrpc_msquic", func(b *testing.B) {
+	b.Run("unary_latency/trevrpc_msquic", func(b *testing.B) {
 		benchmarkTrevRPCUnary(b, client)
 	})
-	b.Run("server_stream_16_messages/trevrpc_msquic", func(b *testing.B) {
-		benchmarkTrevRPCServerStreaming(b, client)
+	b.Run("server_stream_latency/trevrpc_msquic", func(b *testing.B) {
+		benchmarkTrevRPCServerStreamLatency(b, client)
 	})
-	b.Run("client_stream_16_messages/trevrpc_msquic", func(b *testing.B) {
-		benchmarkTrevRPCClientStreaming(b, client)
+	b.Run("server_stream_throughput/trevrpc_msquic", func(b *testing.B) {
+		benchmarkTrevRPCServerStreamThroughput(b, client)
 	})
-	b.Run("bidi_stream_16_messages/trevrpc_msquic", func(b *testing.B) {
-		benchmarkTrevRPCBidiStreaming(b, client)
+	b.Run("client_stream_latency/trevrpc_msquic", func(b *testing.B) {
+		benchmarkTrevRPCClientStreamLatency(b, client)
 	})
-	b.Run("bidi_stream_long_lived_messages/trevrpc_msquic", func(b *testing.B) {
-		benchmarkTrevRPCBidiLongLived(b, client)
+	b.Run("client_stream_throughput/trevrpc_msquic", func(b *testing.B) {
+		benchmarkTrevRPCClientStreamThroughput(b, client)
+	})
+	b.Run("bidi_stream_latency/trevrpc_msquic", func(b *testing.B) {
+		benchmarkTrevRPCBidiStreamLatency(b, client)
+	})
+	b.Run("bidi_stream_throughput/trevrpc_msquic", func(b *testing.B) {
+		benchmarkTrevRPCBidiStreamThroughput(b, client)
 	})
 }
 
@@ -102,13 +108,13 @@ func warmTrevRPCMsQuicComparisonClient(b *testing.B, client *greeter.GreeterClie
 	if _, err := client.SayHello(ctx, comparisonRequests[0]); err != nil {
 		b.Fatalf("warm TrevRPC MsQuic unary: %v", err)
 	}
-	if _, err := trevrpcServerStreamingCall(ctx, client); err != nil {
+	if _, err := trevrpcServerStreamingCall(ctx, client, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm TrevRPC MsQuic server streaming: %v", err)
 	}
-	if _, err := trevrpcClientStreamingCall(ctx, client); err != nil {
+	if _, err := trevrpcClientStreamingCall(ctx, client, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm TrevRPC MsQuic client streaming: %v", err)
 	}
-	if _, err := trevrpcBidiStreamingCall(ctx, client); err != nil {
+	if _, err := trevrpcBidiStreamingCall(ctx, client, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm TrevRPC MsQuic bidi streaming: %v", err)
 	}
 }

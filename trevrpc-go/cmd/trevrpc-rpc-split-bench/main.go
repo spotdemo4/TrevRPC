@@ -24,16 +24,15 @@ import (
 )
 
 const (
-	streamMessageCount = 16
-	requestName        = "TrevRPC benchmark"
-	idleTimeout        = 10 * time.Minute
-	keepAlive          = 5 * time.Second
-	shutdownTimeout    = 2 * time.Second
+	latencyStreamMessageCount = 1
+	requestName               = "TrevRPC benchmark"
+	idleTimeout               = 10 * time.Minute
+	keepAlive                 = 5 * time.Second
+	shutdownTimeout           = 2 * time.Second
 )
 
 var (
-	request  = &greeter.HelloRequest{Name: requestName}
-	requests = makeRequests()
+	request = &greeter.HelloRequest{Name: requestName}
 )
 
 type splitGreeter struct{}
@@ -84,32 +83,44 @@ func runClient(transportName, addr, certFile string, iterations int) error {
 	if err := warmClient(ctx, client); err != nil {
 		return err
 	}
-	if err := runCase("unary_round_trip", iterations, func() error {
+	if err := runLatencyCase("unary_latency", iterations, func() error {
 		_, err := unary(ctx, client)
 		return err
 	}); err != nil {
 		return err
 	}
-	if err := runCase("server_stream_16_messages", iterations, func() error {
-		_, err := serverStreaming(ctx, client)
+	if err := runLatencyCase("server_stream_latency", iterations, func() error {
+		_, err := serverStreaming(ctx, client, latencyStreamMessageCount)
 		return err
 	}); err != nil {
 		return err
 	}
-	if err := runCase("client_stream_16_messages", iterations, func() error {
-		_, err := clientStreaming(ctx, client)
+	if err := runMessageThroughputCase("server_stream_throughput", iterations, func() error {
+		_, err := serverStreaming(ctx, client, iterations)
 		return err
 	}); err != nil {
 		return err
 	}
-	if err := runCase("bidi_stream_16_messages", iterations, func() error {
-		_, err := bidiStreaming(ctx, client)
+	if err := runLatencyCase("client_stream_latency", iterations, func() error {
+		_, err := clientStreaming(ctx, client, latencyStreamMessageCount)
 		return err
 	}); err != nil {
 		return err
 	}
-	return runLongLivedStreamCase("bidi_stream_long_lived_messages", iterations, func() error {
-		_, err := bidiLongLived(ctx, client, iterations)
+	if err := runMessageThroughputCase("client_stream_throughput", iterations, func() error {
+		_, err := clientStreaming(ctx, client, iterations)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := runLatencyCase("bidi_stream_latency", iterations, func() error {
+		_, err := bidiStreaming(ctx, client, latencyStreamMessageCount)
+		return err
+	}); err != nil {
+		return err
+	}
+	return runMessageThroughputCase("bidi_stream_throughput", iterations, func() error {
+		_, err := bidiStreaming(ctx, client, iterations)
 		return err
 	})
 }
@@ -168,32 +179,44 @@ func runGRPCClient(addr string, iterations int) error {
 	if err := warmGRPCClient(ctx, conn); err != nil {
 		return err
 	}
-	if err := runCase("unary_round_trip", iterations, func() error {
+	if err := runLatencyCase("unary_latency", iterations, func() error {
 		_, err := grpcUnary(ctx, conn)
 		return err
 	}); err != nil {
 		return err
 	}
-	if err := runCase("server_stream_16_messages", iterations, func() error {
-		_, err := grpcServerStreaming(ctx, conn)
+	if err := runLatencyCase("server_stream_latency", iterations, func() error {
+		_, err := grpcServerStreaming(ctx, conn, latencyStreamMessageCount)
 		return err
 	}); err != nil {
 		return err
 	}
-	if err := runCase("client_stream_16_messages", iterations, func() error {
-		_, err := grpcClientStreaming(ctx, conn)
+	if err := runMessageThroughputCase("server_stream_throughput", iterations, func() error {
+		_, err := grpcServerStreaming(ctx, conn, iterations)
 		return err
 	}); err != nil {
 		return err
 	}
-	if err := runCase("bidi_stream_16_messages", iterations, func() error {
-		_, err := grpcBidiStreaming(ctx, conn)
+	if err := runLatencyCase("client_stream_latency", iterations, func() error {
+		_, err := grpcClientStreaming(ctx, conn, latencyStreamMessageCount)
 		return err
 	}); err != nil {
 		return err
 	}
-	return runLongLivedStreamCase("bidi_stream_long_lived_messages", iterations, func() error {
-		_, err := grpcBidiLongLived(ctx, conn, iterations)
+	if err := runMessageThroughputCase("client_stream_throughput", iterations, func() error {
+		_, err := grpcClientStreaming(ctx, conn, iterations)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := runLatencyCase("bidi_stream_latency", iterations, func() error {
+		_, err := grpcBidiStreaming(ctx, conn, latencyStreamMessageCount)
+		return err
+	}); err != nil {
+		return err
+	}
+	return runMessageThroughputCase("bidi_stream_throughput", iterations, func() error {
+		_, err := grpcBidiStreaming(ctx, conn, iterations)
 		return err
 	})
 }
@@ -344,17 +367,17 @@ func warmClient(ctx context.Context, client *greeter.GreeterClient) error {
 	if _, err := unary(ctx, client); err != nil {
 		return err
 	}
-	if _, err := serverStreaming(ctx, client); err != nil {
+	if _, err := serverStreaming(ctx, client, latencyStreamMessageCount); err != nil {
 		return err
 	}
-	if _, err := clientStreaming(ctx, client); err != nil {
+	if _, err := clientStreaming(ctx, client, latencyStreamMessageCount); err != nil {
 		return err
 	}
-	_, err := bidiStreaming(ctx, client)
+	_, err := bidiStreaming(ctx, client, latencyStreamMessageCount)
 	return err
 }
 
-func runCase(name string, iterations int, fn func() error) error {
+func runLatencyCase(name string, iterations int, fn func() error) error {
 	start := time.Now()
 	for range iterations {
 		if err := fn(); err != nil {
@@ -362,19 +385,19 @@ func runCase(name string, iterations int, fn func() error) error {
 		}
 	}
 	elapsed := time.Since(start)
-	ops := float64(iterations) / elapsed.Seconds()
-	fmt.Printf("%s: %.0f ops/s (%d iterations in %.3fs)\n", name, ops, iterations, elapsed.Seconds())
+	latencyUs := float64(elapsed.Nanoseconds()) / 1000 / float64(iterations)
+	fmt.Printf("%s: %.3f us/op (%d iterations in %.3fs)\n", name, latencyUs, iterations, elapsed.Seconds())
 	return nil
 }
 
-func runLongLivedStreamCase(name string, iterations int, fn func() error) error {
+func runMessageThroughputCase(name string, messages int, fn func() error) error {
 	start := time.Now()
 	if err := fn(); err != nil {
 		return fmt.Errorf("%s failed: %w", name, err)
 	}
 	elapsed := time.Since(start)
-	ops := float64(iterations) / elapsed.Seconds()
-	fmt.Printf("%s: %.0f ops/s (%d iterations in %.3fs)\n", name, ops, iterations, elapsed.Seconds())
+	messagesPerSecond := float64(messages) / elapsed.Seconds()
+	fmt.Printf("%s: %.0f messages/s (%d messages in %.3fs)\n", name, messagesPerSecond, messages, elapsed.Seconds())
 	return nil
 }
 
@@ -389,8 +412,11 @@ func unary(ctx context.Context, client *greeter.GreeterClient) (string, error) {
 	return response.Message, nil
 }
 
-func serverStreaming(ctx context.Context, client *greeter.GreeterClient) (int, error) {
-	replies, err := client.LotsOfReplies(ctx, request)
+func serverStreaming(ctx context.Context, client *greeter.GreeterClient, messageCount int) (int, error) {
+	replies, err := client.LotsOfReplies(ctx,
+		&greeter.HelloRequest{Name: strconv.Itoa(messageCount)},
+		trevrpc.WithMaxResponseMessages(messageCount),
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -398,9 +424,9 @@ func serverStreaming(ctx context.Context, client *greeter.GreeterClient) (int, e
 	for {
 		_, err := replies.Recv()
 		if err == io.EOF {
-			if count != streamMessageCount {
+			if count != messageCount {
 				_ = replies.Close()
-				return 0, fmt.Errorf("server stream count = %d, want %d", count, streamMessageCount)
+				return 0, fmt.Errorf("server stream count = %d, want %d", count, messageCount)
 			}
 			return count, replies.Close()
 		}
@@ -412,41 +438,18 @@ func serverStreaming(ctx context.Context, client *greeter.GreeterClient) (int, e
 	}
 }
 
-func clientStreaming(ctx context.Context, client *greeter.GreeterClient) (string, error) {
-	response, err := client.LotsOfGreetingsFromStream(ctx, trevrpc.FromSlice(requests...))
+func clientStreaming(ctx context.Context, client *greeter.GreeterClient, messageCount int) (string, error) {
+	response, err := client.LotsOfGreetingsFromStream(ctx, &countedBenchmarkRequests{remaining: messageCount})
 	if err != nil {
 		return "", err
 	}
-	if response.Message != fmt.Sprintf("streamed %d greetings", streamMessageCount) {
+	if response.Message != fmt.Sprintf("streamed %d greetings", messageCount) {
 		return "", fmt.Errorf("client stream response = %q", response.Message)
 	}
 	return response.Message, nil
 }
 
-func bidiStreaming(ctx context.Context, client *greeter.GreeterClient) (int, error) {
-	stream, err := client.BidiHelloFromStream(ctx, trevrpc.FromSlice(requests...))
-	if err != nil {
-		return 0, err
-	}
-	count := 0
-	for {
-		_, err := stream.Recv()
-		if err == io.EOF {
-			if count != streamMessageCount {
-				_ = stream.Close()
-				return 0, fmt.Errorf("bidi stream count = %d, want %d", count, streamMessageCount)
-			}
-			return count, stream.Close()
-		}
-		if err != nil {
-			_ = stream.Close()
-			return 0, err
-		}
-		count++
-	}
-}
-
-func bidiLongLived(ctx context.Context, client *greeter.GreeterClient, messageCount int) (int, error) {
+func bidiStreaming(ctx context.Context, client *greeter.GreeterClient, messageCount int) (int, error) {
 	stream, err := client.BidiHelloFromStream(ctx,
 		&countedBenchmarkRequests{remaining: messageCount},
 		trevrpc.WithMaxResponseMessages(messageCount),
@@ -454,24 +457,19 @@ func bidiLongLived(ctx context.Context, client *greeter.GreeterClient, messageCo
 	if err != nil {
 		return 0, err
 	}
-
 	count := 0
 	for {
-		response, err := stream.Recv()
+		_, err := stream.Recv()
 		if err == io.EOF {
 			if count != messageCount {
 				_ = stream.Close()
-				return 0, fmt.Errorf("long-lived bidi stream count = %d, want %d", count, messageCount)
+				return 0, fmt.Errorf("bidi stream count = %d, want %d", count, messageCount)
 			}
 			return count, stream.Close()
 		}
 		if err != nil {
 			_ = stream.Close()
 			return 0, err
-		}
-		if response.Message != requestName {
-			_ = stream.Close()
-			return 0, fmt.Errorf("long-lived bidi response = %q, want %q", response.Message, requestName)
 		}
 		count++
 	}
@@ -481,13 +479,13 @@ func warmGRPCClient(ctx context.Context, conn *grpc.ClientConn) error {
 	if _, err := grpcUnary(ctx, conn); err != nil {
 		return err
 	}
-	if _, err := grpcServerStreaming(ctx, conn); err != nil {
+	if _, err := grpcServerStreaming(ctx, conn, latencyStreamMessageCount); err != nil {
 		return err
 	}
-	if _, err := grpcClientStreaming(ctx, conn); err != nil {
+	if _, err := grpcClientStreaming(ctx, conn, latencyStreamMessageCount); err != nil {
 		return err
 	}
-	_, err := grpcBidiStreaming(ctx, conn)
+	_, err := grpcBidiStreaming(ctx, conn, latencyStreamMessageCount)
 	return err
 }
 
@@ -502,12 +500,12 @@ func grpcUnary(ctx context.Context, conn *grpc.ClientConn) (string, error) {
 	return response.Message, nil
 }
 
-func grpcServerStreaming(ctx context.Context, conn *grpc.ClientConn) (int, error) {
+func grpcServerStreaming(ctx context.Context, conn *grpc.ClientConn, messageCount int) (int, error) {
 	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodLotsOfReplies, false, true), grpcFullMethod(greeter.MethodLotsOfReplies))
 	if err != nil {
 		return 0, err
 	}
-	if err := stream.SendMsg(request); err != nil {
+	if err := stream.SendMsg(&greeter.HelloRequest{Name: strconv.Itoa(messageCount)}); err != nil {
 		return 0, err
 	}
 	if err := stream.CloseSend(); err != nil {
@@ -519,8 +517,8 @@ func grpcServerStreaming(ctx context.Context, conn *grpc.ClientConn) (int, error
 		response := &greeter.HelloReply{}
 		err := stream.RecvMsg(response)
 		if err == io.EOF {
-			if count != streamMessageCount {
-				return 0, fmt.Errorf("grpc server stream count = %d, want %d", count, streamMessageCount)
+			if count != messageCount {
+				return 0, fmt.Errorf("grpc server stream count = %d, want %d", count, messageCount)
 			}
 			return count, nil
 		}
@@ -531,12 +529,12 @@ func grpcServerStreaming(ctx context.Context, conn *grpc.ClientConn) (int, error
 	}
 }
 
-func grpcClientStreaming(ctx context.Context, conn *grpc.ClientConn) (string, error) {
+func grpcClientStreaming(ctx context.Context, conn *grpc.ClientConn, messageCount int) (string, error) {
 	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodLotsOfGreetings, true, false), grpcFullMethod(greeter.MethodLotsOfGreetings))
 	if err != nil {
 		return "", err
 	}
-	for _, request := range requests {
+	for range messageCount {
 		if err := stream.SendMsg(request); err != nil {
 			return "", err
 		}
@@ -549,44 +547,13 @@ func grpcClientStreaming(ctx context.Context, conn *grpc.ClientConn) (string, er
 	if err := stream.RecvMsg(response); err != nil {
 		return "", err
 	}
-	if response.Message != fmt.Sprintf("streamed %d greetings", streamMessageCount) {
+	if response.Message != fmt.Sprintf("streamed %d greetings", messageCount) {
 		return "", fmt.Errorf("grpc client stream response = %q", response.Message)
 	}
 	return response.Message, nil
 }
 
-func grpcBidiStreaming(ctx context.Context, conn *grpc.ClientConn) (int, error) {
-	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodBidiHello, true, true), grpcFullMethod(greeter.MethodBidiHello))
-	if err != nil {
-		return 0, err
-	}
-	for _, request := range requests {
-		if err := stream.SendMsg(request); err != nil {
-			return 0, err
-		}
-	}
-	if err := stream.CloseSend(); err != nil {
-		return 0, err
-	}
-
-	count := 0
-	for {
-		response := &greeter.HelloReply{}
-		err := stream.RecvMsg(response)
-		if err == io.EOF {
-			if count != streamMessageCount {
-				return 0, fmt.Errorf("grpc bidi stream count = %d, want %d", count, streamMessageCount)
-			}
-			return count, nil
-		}
-		if err != nil {
-			return 0, err
-		}
-		count++
-	}
-}
-
-func grpcBidiLongLived(ctx context.Context, conn *grpc.ClientConn, messageCount int) (int, error) {
+func grpcBidiStreaming(ctx context.Context, conn *grpc.ClientConn, messageCount int) (int, error) {
 	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodBidiHello, true, true), grpcFullMethod(greeter.MethodBidiHello))
 	if err != nil {
 		return 0, err
@@ -611,15 +578,12 @@ func grpcBidiLongLived(ctx context.Context, conn *grpc.ClientConn, messageCount 
 				return 0, sendErr
 			}
 			if count != messageCount {
-				return 0, fmt.Errorf("grpc long-lived bidi stream count = %d, want %d", count, messageCount)
+				return 0, fmt.Errorf("grpc bidi stream count = %d, want %d", count, messageCount)
 			}
 			return count, nil
 		}
 		if err != nil {
 			return 0, err
-		}
-		if response.Message != requestName {
-			return 0, fmt.Errorf("grpc long-lived bidi response = %q, want %q", response.Message, requestName)
 		}
 		count++
 	}
@@ -688,14 +652,6 @@ func grpcStreamDesc(method string, clientStreams, serverStreams bool) *grpc.Stre
 	return &grpc.StreamDesc{StreamName: method, ClientStreams: clientStreams, ServerStreams: serverStreams}
 }
 
-func makeRequests() []*greeter.HelloRequest {
-	requests := make([]*greeter.HelloRequest, streamMessageCount)
-	for i := range requests {
-		requests[i] = &greeter.HelloRequest{Name: requestName}
-	}
-	return requests
-}
-
 type countedBenchmarkRequests struct {
 	remaining int
 }
@@ -717,8 +673,16 @@ func (splitGreeter) SayHello(_ context.Context, request *greeter.HelloRequest) (
 	return &greeter.HelloReply{Message: request.Name}, nil
 }
 
-func (splitGreeter) LotsOfReplies(context.Context, *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
-	replies := make([]*greeter.HelloReply, streamMessageCount)
+func messageCountFromName(name string) int {
+	count, err := strconv.Atoi(name)
+	if err != nil || count <= 0 {
+		return latencyStreamMessageCount
+	}
+	return count
+}
+
+func (splitGreeter) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
+	replies := make([]*greeter.HelloReply, messageCountFromName(request.Name))
 	for i := range replies {
 		replies[i] = &greeter.HelloReply{Message: "server stream"}
 	}
@@ -763,8 +727,8 @@ func (grpcSplitGreeter) SayHello(_ context.Context, request *greeter.HelloReques
 	return &greeter.HelloReply{Message: request.Name}, nil
 }
 
-func (grpcSplitGreeter) LotsOfReplies(_ *greeter.HelloRequest, stream grpc.ServerStream) error {
-	for range streamMessageCount {
+func (grpcSplitGreeter) LotsOfReplies(request *greeter.HelloRequest, stream grpc.ServerStream) error {
+	for range messageCountFromName(request.Name) {
 		if err := stream.SendMsg(&greeter.HelloReply{Message: "server stream"}); err != nil {
 			return err
 		}

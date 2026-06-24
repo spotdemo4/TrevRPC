@@ -17,7 +17,7 @@ use quinn::rustls::pki_types::{
 mod greeter;
 
 const REQUEST_NAME: &str = "TrevRPC benchmark";
-const STREAM_MESSAGE_COUNT: usize = 16;
+const LATENCY_STREAM_MESSAGE_COUNT: usize = 1;
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -62,25 +62,29 @@ async fn run_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> Benc
     let client = greeter::GreeterClient::new(trevrpc::quinn::Client::new(connection.clone()));
 
     warm_client(&client).await?;
-    run_case("unary_round_trip", iterations, || {
-        trevrpc_unary_call(&client)
+    run_latency_case("unary_latency", iterations, || trevrpc_unary_call(&client)).await?;
+    run_latency_case("server_stream_latency", iterations, || {
+        trevrpc_server_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
     })
     .await?;
-    run_case("server_stream_16_messages", iterations, || {
-        trevrpc_server_streaming_call(&client)
+    run_message_throughput_case("server_stream_throughput", iterations, || {
+        trevrpc_server_streaming_call(&client, usize::try_from(iterations).unwrap())
     })
     .await?;
-    run_case("client_stream_16_messages", iterations, || {
-        trevrpc_client_streaming_call(&client)
+    run_latency_case("client_stream_latency", iterations, || {
+        trevrpc_client_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
     })
     .await?;
-    run_case("bidi_stream_16_messages", iterations, || {
-        trevrpc_bidi_streaming_call(&client)
+    run_message_throughput_case("client_stream_throughput", iterations, || {
+        trevrpc_client_streaming_call(&client, usize::try_from(iterations).unwrap())
     })
     .await?;
-    let long_lived_message_count = usize::try_from(iterations)?;
-    run_long_lived_stream_case("bidi_stream_long_lived_messages", iterations, || {
-        trevrpc_bidi_long_lived_call(&client, long_lived_message_count)
+    run_latency_case("bidi_stream_latency", iterations, || {
+        trevrpc_bidi_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
+    })
+    .await?;
+    run_message_throughput_case("bidi_stream_throughput", iterations, || {
+        trevrpc_bidi_streaming_call(&client, usize::try_from(iterations).unwrap())
     })
     .await?;
 
@@ -124,13 +128,13 @@ async fn run_webtransport_server(
 
 async fn warm_client(client: &greeter::GreeterClient<trevrpc::quinn::Client>) -> BenchResult {
     trevrpc_unary_call(client).await?;
-    trevrpc_server_streaming_call(client).await?;
-    trevrpc_client_streaming_call(client).await?;
-    trevrpc_bidi_streaming_call(client).await?;
+    trevrpc_server_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
+    trevrpc_client_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
+    trevrpc_bidi_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
     Ok(())
 }
 
-async fn run_case<F, Fut>(name: &str, iterations: u32, mut call: F) -> BenchResult
+async fn run_latency_case<F, Fut>(name: &str, iterations: u32, mut call: F) -> BenchResult
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = BenchResult>,
@@ -140,15 +144,15 @@ where
         call().await?;
     }
     let elapsed = start.elapsed();
-    let ops = f64::from(iterations) / elapsed.as_secs_f64();
+    let latency_us = elapsed.as_secs_f64() * 1_000_000.0 / f64::from(iterations);
     println!(
-        "{name}: {ops:.0} ops/s ({iterations} iterations in {:.3}s)",
+        "{name}: {latency_us:.3} us/op ({iterations} iterations in {:.3}s)",
         elapsed.as_secs_f64()
     );
     Ok(())
 }
 
-async fn run_long_lived_stream_case<F, Fut>(name: &str, iterations: u32, mut call: F) -> BenchResult
+async fn run_message_throughput_case<F, Fut>(name: &str, messages: u32, mut call: F) -> BenchResult
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = BenchResult>,
@@ -156,9 +160,9 @@ where
     let start = Instant::now();
     call().await?;
     let elapsed = start.elapsed();
-    let ops = f64::from(iterations) / elapsed.as_secs_f64();
+    let messages_per_second = f64::from(messages) / elapsed.as_secs_f64();
     println!(
-        "{name}: {ops:.0} ops/s ({iterations} iterations in {:.3}s)",
+        "{name}: {messages_per_second:.0} messages/s ({messages} messages in {:.3}s)",
         elapsed.as_secs_f64()
     );
     Ok(())
@@ -183,13 +187,14 @@ async fn trevrpc_unary_call(
 
 async fn trevrpc_server_streaming_call(
     client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    message_count: usize,
 ) -> BenchResult {
     let mut replies = client
         .lots_of_replies(
             greeter::HelloRequest {
-                name: REQUEST_NAME.to_owned(),
+                name: message_count.to_string(),
             },
-            trevrpc::client::CallOptions::new(),
+            trevrpc::client::CallOptions::new().with_max_response_messages(Some(message_count)),
         )
         .await?;
     let mut count = 0;
@@ -199,22 +204,23 @@ async fn trevrpc_server_streaming_call(
         }
         count += 1;
     }
-    if count != STREAM_MESSAGE_COUNT {
-        return Err(format!("server stream count = {count}").into());
+    if count != message_count {
+        return Err(format!("server stream count = {count}, want {message_count}").into());
     }
     Ok(())
 }
 
 async fn trevrpc_client_streaming_call(
     client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    message_count: usize,
 ) -> BenchResult {
     let response = client
         .lots_of_greetings_from_stream(
-            trevrpc::stream::from_iter(benchmark_requests()),
+            trevrpc::stream::from_iter(benchmark_requests(message_count)),
             trevrpc::client::CallOptions::new(),
         )
         .await?;
-    let expected = format!("streamed {STREAM_MESSAGE_COUNT} greetings");
+    let expected = format!("streamed {message_count} greetings");
     if response.message != expected {
         return Err(format!("client stream response = {:?}", response.message).into());
     }
@@ -223,11 +229,12 @@ async fn trevrpc_client_streaming_call(
 
 async fn trevrpc_bidi_streaming_call(
     client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    message_count: usize,
 ) -> BenchResult {
     let mut replies = client
         .bidi_hello_from_stream(
-            trevrpc::stream::from_iter(benchmark_requests()),
-            trevrpc::client::CallOptions::new(),
+            trevrpc::stream::from_iter(benchmark_requests(message_count)),
+            trevrpc::client::CallOptions::new().with_max_response_messages(Some(message_count)),
         )
         .await?;
     let mut count = 0;
@@ -237,45 +244,13 @@ async fn trevrpc_bidi_streaming_call(
         }
         count += 1;
     }
-    if count != STREAM_MESSAGE_COUNT {
-        return Err(format!("bidi stream count = {count}").into());
-    }
-    Ok(())
-}
-
-async fn trevrpc_bidi_long_lived_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
-    message_count: usize,
-) -> BenchResult {
-    let mut replies = client
-        .bidi_hello_from_stream(
-            trevrpc::stream::from_iter(long_lived_benchmark_requests(message_count)),
-            trevrpc::client::CallOptions::new().with_max_response_messages(Some(message_count)),
-        )
-        .await?;
-
-    let mut count = 0;
-    while let Some(reply) = replies.next().await.transpose()? {
-        if reply.message != REQUEST_NAME {
-            return Err("unexpected long-lived bidi response".into());
-        }
-        count += 1;
-    }
     if count != message_count {
-        return Err(format!("long-lived bidi stream count = {count}, want {message_count}").into());
+        return Err(format!("bidi stream count = {count}, want {message_count}").into());
     }
     Ok(())
 }
 
-fn benchmark_requests() -> impl Iterator<Item = greeter::HelloRequest> {
-    (0..STREAM_MESSAGE_COUNT).map(|_| greeter::HelloRequest {
-        name: REQUEST_NAME.to_owned(),
-    })
-}
-
-fn long_lived_benchmark_requests(
-    message_count: usize,
-) -> impl Iterator<Item = greeter::HelloRequest> {
+fn benchmark_requests(message_count: usize) -> impl Iterator<Item = greeter::HelloRequest> {
     (0..message_count).map(|_| greeter::HelloRequest {
         name: REQUEST_NAME.to_owned(),
     })
@@ -294,13 +269,14 @@ impl greeter::Greeter for SplitGreeter {
 
     async fn lots_of_replies(
         &self,
-        _request: greeter::HelloRequest,
+        request: greeter::HelloRequest,
     ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
-        Ok(trevrpc::stream::from_iter((0..STREAM_MESSAGE_COUNT).map(
-            |_| greeter::HelloReply {
+        let count = message_count_from_name(&request.name);
+        Ok(trevrpc::stream::from_iter((0..count).map(|_| {
+            greeter::HelloReply {
                 message: "server stream".to_owned(),
-            },
-        )))
+            }
+        })))
     }
 
     async fn lots_of_greetings(
@@ -325,6 +301,13 @@ impl greeter::Greeter for SplitGreeter {
     }
 }
 
+fn message_count_from_name(name: &str) -> usize {
+    name.parse::<usize>()
+        .ok()
+        .filter(|count| *count > 0)
+        .unwrap_or(LATENCY_STREAM_MESSAGE_COUNT)
+}
+
 struct BidiReplies {
     requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
 }
@@ -347,6 +330,7 @@ fn benchmark_server_options() -> trevrpc::server::ServerOptions {
         .with_max_concurrent_streams_per_connection(Some(128))
         .with_max_concurrent_requests(Some(1024))
         .with_max_stream_messages(None)
+        .with_max_stream_body_size(None)
 }
 
 fn benchmark_webtransport_server_options(origin: String) -> trevrpc::server::ServerOptions {

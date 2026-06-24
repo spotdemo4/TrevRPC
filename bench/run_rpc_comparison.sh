@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-OUT_DIR=${OUT_DIR:-"$ROOT/target/rpc-comparison"}
+OUT_DIR=${OUT_DIR:-target/rpc-comparison}
 RAW_DIR="$OUT_DIR/raw"
 COMMAND_LOG="$OUT_DIR/commands.txt"
 CSV="$OUT_DIR/rpc-comparison.csv"
@@ -68,7 +68,7 @@ fi
 mkdir -p "$RAW_DIR"
 : >"$COMMAND_LOG"
 rm -f "$RAW_DIR"/*.txt
-printf 'run,language,shape,implementation,latency_us,throughput_ops_s,iterations_or_samples,elapsed_s,alloc_bytes_per_op,allocs_per_op,source\n' >"$SAMPLES_CSV"
+printf 'run,language,shape,implementation,latency_us,throughput_per_s,iterations_or_samples,elapsed_s,alloc_bytes_per_op,allocs_per_op,source\n' >"$SAMPLES_CSV"
 
 require_positive_integer() {
     local name=$1
@@ -103,14 +103,22 @@ append_c_csv() {
     local raw_file=$1
     local run=$2
     awk -v source="c-custom" -v run="$run" -F '' '
-        match($0, /^([^:]+):[[:space:]]+([0-9.]+) ops\/s \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
-            split(m[1], name, "/")
+        function emit(label, latency_us, throughput, iterations, elapsed) {
+            split(label, name, "/")
             if (length(name) != 2) {
-                next
+                return
             }
-            ops = m[2] + 0
-            latency_us = ops > 0 ? 1000000.0 / ops : 0
-            printf "%s,c,%s,%s,%.3f,%.3f,%s,%s,,,%s\n", run, name[1], name[2], latency_us, ops, m[3], m[4], source
+            printf "%s,c,%s,%s,%.3f,%.3f,%s,%s,,,%s\n", run, name[1], name[2], latency_us, throughput, iterations, elapsed, source
+        }
+        match($0, /^([^:]+):[[:space:]]+([0-9.]+) us\/op \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
+            latency_us = m[2] + 0
+            throughput = latency_us > 0 ? 1000000.0 / latency_us : 0
+            emit(m[1], latency_us, throughput, m[3], m[4])
+        }
+        match($0, /^([^:]+):[[:space:]]+([0-9.]+) (ops\/s|messages\/s) \(([0-9]+) (iterations|messages) in ([0-9.]+)s\)/, m) {
+            throughput = m[2] + 0
+            latency_us = throughput > 0 ? 1000000.0 / throughput : 0
+            emit(m[1], latency_us, throughput, m[4], m[6])
         }
     ' "$raw_file" >>"$SAMPLES_CSV"
 }
@@ -119,14 +127,22 @@ append_js_csv() {
     local raw_file=$1
     local run=$2
     awk -v source="js-custom" -v run="$run" -F '' '
-        match($0, /^([^:]+):[[:space:]]+([0-9.]+) ops\/s \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
-            split(m[1], name, "/")
+        function emit(label, latency_us, throughput, iterations, elapsed) {
+            split(label, name, "/")
             if (length(name) != 2) {
-                next
+                return
             }
-            ops = m[2] + 0
-            latency_us = ops > 0 ? 1000000.0 / ops : 0
-            printf "%s,js,%s,%s,%.3f,%.3f,%s,%s,,,%s\n", run, name[1], name[2], latency_us, ops, m[3], m[4], source
+            printf "%s,js,%s,%s,%.3f,%.3f,%s,%s,,,%s\n", run, name[1], name[2], latency_us, throughput, iterations, elapsed, source
+        }
+        match($0, /^([^:]+):[[:space:]]+([0-9.]+) us\/op \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
+            latency_us = m[2] + 0
+            throughput = latency_us > 0 ? 1000000.0 / latency_us : 0
+            emit(m[1], latency_us, throughput, m[3], m[4])
+        }
+        match($0, /^([^:]+):[[:space:]]+([0-9.]+) (ops\/s|messages\/s) \(([0-9]+) (iterations|messages) in ([0-9.]+)s\)/, m) {
+            throughput = m[2] + 0
+            latency_us = throughput > 0 ? 1000000.0 / throughput : 0
+            emit(m[1], latency_us, throughput, m[4], m[6])
         }
     ' "$raw_file" >>"$SAMPLES_CSV"
 }
@@ -237,7 +253,7 @@ aggregate_samples_csv() {
             return value == "" ? "" : sprintf("%.0f", value + 0)
         }
         BEGIN {
-            print "language,shape,implementation,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_ops_s,iterations_or_samples_per_measurement,elapsed_s_total,alloc_bytes_per_op_median,allocs_per_op_median,source"
+            print "language,shape,implementation,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_or_samples_per_measurement,elapsed_s_total,alloc_bytes_per_op_median,allocs_per_op_median,source"
         }
         NR == 1 {
             next
@@ -255,6 +271,7 @@ aggregate_samples_csv() {
 
             measurements[key]++
             latencies[key] = append(latencies[key], $5)
+            throughputs[key] = append(throughputs[key], $6)
             iterations[key] = append(iterations[key], $7)
 
             if (!(key in latency_min) || $5 + 0 < latency_min[key]) {
@@ -267,6 +284,12 @@ aggregate_samples_csv() {
                 elapsed_seen[key] = 1
                 elapsed_total[key] += $8
             }
+            if (!(key in throughput_min) || $6 + 0 < throughput_min[key]) {
+                throughput_min[key] = $6 + 0
+            }
+            if (!(key in throughput_max) || $6 + 0 > throughput_max[key]) {
+                throughput_max[key] = $6 + 0
+            }
             if ($9 != "") {
                 bytes[key] = append(bytes[key], $9)
             }
@@ -278,10 +301,10 @@ aggregate_samples_csv() {
             for (i = 1; i <= order_count; i++) {
                 key = order[i]
                 latency = median(latencies[key])
-                throughput = latency > 0 ? 1000000.0 / latency : 0
+                throughput = median(throughputs[key])
                 iteration_count = median(iterations[key])
                 elapsed = (key in elapsed_seen) ? sprintf("%.3f", elapsed_total[key]) : ""
-                printf "%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.0f,%s,%s,%s,%s\n", \
+                printf "%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%s,%s,%s,%s\n", \
                     language[key], \
                     shape[key], \
                     implementation[key], \
@@ -290,6 +313,8 @@ aggregate_samples_csv() {
                     latency_min[key], \
                     latency_max[key], \
                     throughput, \
+                    throughput_min[key], \
+                    throughput_max[key], \
                     iteration_count, \
                     elapsed, \
                     format_optional_integer(median(bytes[key])), \
@@ -344,11 +369,23 @@ Generated by \`bench/run_rpc_comparison.sh\`: $generated_at
 EOF
 
         awk -F, '
-        function compare_throughput(i1, v1, i2, v2) {
-            if (throughput[v1] > throughput[v2]) {
+        function is_throughput_shape(value) {
+            return value ~ /_throughput$/
+        }
+        function compare_metric(i1, v1, i2, v2) {
+            if (is_throughput_shape(shape[v1])) {
+                if (throughput[v1] > throughput[v2]) {
+                    return -1
+                }
+                if (throughput[v1] < throughput[v2]) {
+                    return 1
+                }
+                return row_order[v1] < row_order[v2] ? -1 : 1
+            }
+            if (latency[v1] < latency[v2]) {
                 return -1
             }
-            if (throughput[v1] < throughput[v2]) {
+            if (latency[v1] > latency[v2]) {
                 return 1
             }
             return row_order[v1] < row_order[v2] ? -1 : 1
@@ -358,8 +395,13 @@ EOF
         }
         function print_table_header(shape) {
             printf "\n### `%s`\n\n", shape
-            print "| Language | Implementation | Median latency us/op | Latency min..max us/op | Median throughput ops/s | Source |"
-            print "| --- | --- | ---: | ---: | ---: | --- |"
+            if (is_throughput_shape(shape)) {
+                print "| Language | Implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
+                print "| --- | --- | ---: | ---: | --- |"
+            } else {
+                print "| Language | Implementation | Median latency us/op | Latency min..max us/op | Source |"
+                print "| --- | --- | ---: | ---: | --- |"
+            }
         }
         NR > 1 {
             id = NR - 1
@@ -371,9 +413,11 @@ EOF
             latency_min[id] = $6
             latency_max[id] = $7
             throughput[id] = $8 + 0
-            bytes[id] = $11
-            allocs[id] = $12
-            source[id] = $13
+            throughput_min[id] = $9 + 0
+            throughput_max[id] = $10 + 0
+            bytes[id] = $13
+            allocs[id] = $14
+            source[id] = $15
 
             if (!(shape[id] in seen_shape)) {
                 seen_shape[shape[id]] = 1
@@ -385,11 +429,15 @@ EOF
             for (shape_index = 1; shape_index <= shape_count; shape_index++) {
                 current_shape = shape_order[shape_index]
                 row_count = split(shape_rows[current_shape], rows, " ")
-                asort(rows, sorted_rows, "compare_throughput")
+                asort(rows, sorted_rows, "compare_metric")
                 print_table_header(current_shape)
                 for (row_index = 1; row_index <= row_count; row_index++) {
                     id = sorted_rows[row_index]
-                    printf "| `%s` | `%s` | %.3f | %.3f..%.3f | %.0f | `%s` |\n", language[id], implementation[id], latency[id], latency_min[id], latency_max[id], throughput[id], source[id]
+                    if (is_throughput_shape(current_shape)) {
+                        printf "| `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", language[id], implementation[id], throughput[id], throughput_min[id], throughput_max[id], source[id]
+                    } else {
+                        printf "| `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", language[id], implementation[id], latency[id], latency_min[id], latency_max[id], source[id]
+                    }
                 }
             }
         }' "$CSV"
@@ -398,11 +446,11 @@ EOF
 
 ## Notes
 
-These rows use unary, server streaming with 16 response messages, client streaming with 16 request messages, bidirectional streaming with 16 request/response messages, and a long-lived bidirectional stream that measures request/response message throughput over one open stream.
+Latency rows measure one RPC operation. Stream latency rows use one request and one response message. Stream throughput rows measure messages per second over one open stream.
 
 Reported latency is the median across measurements. The min..max column shows the observed latency range across repeated measurements. Rust measurements also include Criterion sampling within each repeated command.
 
-Result tables are split by RPC shape and sorted by median throughput descending.
+Latency tables are sorted by median latency ascending. Throughput tables are sorted by median message throughput descending.
 
 Compare rows with the same shape first. Transport implementations differ: C uses MsQuic, JavaScript native uses Node-API over trevrpc-c MsQuic, Go uses quic-go plus MsQuic when enabled, and Rust uses Quinn. gRPC rows are included as language-local baselines, not identical transports.
 

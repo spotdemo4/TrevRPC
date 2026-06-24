@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { createRoot, createServiceClient } from "../src/index.js";
 import { NodeTransport } from "../src/node.js";
 
-const BenchmarkStreamMessageCount = 16;
+const LatencyStreamMessageCount = 1;
 const BenchmarkRequest = Object.freeze({ name: "TrevRPC benchmark" });
 const ServerStartupTimeoutMs = 10_000;
 const ServerShutdownTimeoutMs = 5_000;
@@ -87,22 +87,24 @@ try {
   const client = createServiceClient(transport, GreeterService, root);
 
   await warmClient(client);
-  await runBenchmarkCase("unary_round_trip/trevrpc_js_msquic", iterations, () =>
-    unaryRoundTrip(client),
+  await runLatencyCase("unary_latency/trevrpc_js_msquic", iterations, () => unaryRoundTrip(client));
+  await runLatencyCase("server_stream_latency/trevrpc_js_msquic", iterations, () =>
+    serverStreaming(client, LatencyStreamMessageCount),
   );
-  await runBenchmarkCase("server_stream_16_messages/trevrpc_js_msquic", iterations, () =>
-    serverStreaming(client),
+  await runMessageThroughputCase("server_stream_throughput/trevrpc_js_msquic", iterations, () =>
+    serverStreaming(client, iterations),
   );
-  await runBenchmarkCase("client_stream_16_messages/trevrpc_js_msquic", iterations, () =>
-    clientStreaming(client),
+  await runLatencyCase("client_stream_latency/trevrpc_js_msquic", iterations, () =>
+    clientStreaming(client, LatencyStreamMessageCount),
   );
-  await runBenchmarkCase("bidi_stream_16_messages/trevrpc_js_msquic", iterations, () =>
-    bidiStreaming(client),
+  await runMessageThroughputCase("client_stream_throughput/trevrpc_js_msquic", iterations, () =>
+    clientStreaming(client, iterations),
   );
-  await runLongLivedStreamBenchmarkCase(
-    "bidi_stream_long_lived_messages/trevrpc_js_msquic",
-    iterations,
-    () => bidiLongLived(client, iterations),
+  await runLatencyCase("bidi_stream_latency/trevrpc_js_msquic", iterations, () =>
+    bidiStreaming(client, LatencyStreamMessageCount),
+  );
+  await runMessageThroughputCase("bidi_stream_throughput/trevrpc_js_msquic", iterations, () =>
+    bidiStreaming(client, iterations),
   );
 } finally {
   transport?.close();
@@ -171,30 +173,30 @@ async function stopServer(serverProcess) {
 
 async function warmClient(client) {
   await unaryRoundTrip(client);
-  await serverStreaming(client);
-  await clientStreaming(client);
-  await bidiStreaming(client);
+  await serverStreaming(client, LatencyStreamMessageCount);
+  await clientStreaming(client, LatencyStreamMessageCount);
+  await bidiStreaming(client, LatencyStreamMessageCount);
 }
 
-async function runBenchmarkCase(name, count, fn) {
+async function runLatencyCase(name, count, fn) {
   const start = process.hrtime.bigint();
   for (let i = 0; i < count; i++) {
     await fn();
   }
   const elapsedSeconds = Number(process.hrtime.bigint() - start) / 1_000_000_000;
-  const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
+  const latencyUs = (elapsedSeconds * 1_000_000) / count;
   console.log(
-    `${name}: ${opsPerSecond.toFixed(0)} ops/s (${count} iterations in ${elapsedSeconds.toFixed(3)}s)`,
+    `${name}: ${latencyUs.toFixed(3)} us/op (${count} iterations in ${elapsedSeconds.toFixed(3)}s)`,
   );
 }
 
-async function runLongLivedStreamBenchmarkCase(name, count, fn) {
+async function runMessageThroughputCase(name, count, fn) {
   const start = process.hrtime.bigint();
   await fn();
   const elapsedSeconds = Number(process.hrtime.bigint() - start) / 1_000_000_000;
-  const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
+  const messagesPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
   console.log(
-    `${name}: ${opsPerSecond.toFixed(0)} ops/s (${count} iterations in ${elapsedSeconds.toFixed(3)}s)`,
+    `${name}: ${messagesPerSecond.toFixed(0)} messages/s (${count} messages in ${elapsedSeconds.toFixed(3)}s)`,
   );
 }
 
@@ -205,8 +207,11 @@ async function unaryRoundTrip(client) {
   }
 }
 
-async function serverStreaming(client) {
-  const replies = await client.lotsOfReplies(BenchmarkRequest);
+async function serverStreaming(client, messageCount) {
+  const replies = await client.lotsOfReplies(
+    { name: String(messageCount) },
+    { maxResponseMessages: messageCount },
+  );
   let count = 0;
   for await (const reply of replies) {
     if (reply.message !== "server stream") {
@@ -214,48 +219,23 @@ async function serverStreaming(client) {
     }
     count++;
   }
-  if (count !== BenchmarkStreamMessageCount) {
-    throw new Error(
-      `expected ${BenchmarkStreamMessageCount} server-stream responses, got ${count}`,
-    );
+  if (count !== messageCount) {
+    throw new Error(`expected ${messageCount} server-stream responses, got ${count}`);
   }
 }
 
-async function clientStreaming(client) {
+async function clientStreaming(client, messageCount) {
   const call = await client.lotsOfGreetings();
-  for (let i = 0; i < BenchmarkStreamMessageCount; i++) {
+  for (let i = 0; i < messageCount; i++) {
     await call.send(BenchmarkRequest);
   }
   const reply = await call.closeAndRecv();
-  if (reply.message !== `streamed ${BenchmarkStreamMessageCount} greetings`) {
+  if (reply.message !== `streamed ${messageCount} greetings`) {
     throw new Error(`unexpected client-stream response: ${JSON.stringify(reply)}`);
   }
 }
 
-async function bidiStreaming(client) {
-  const call = await client.bidiHello();
-  for (let i = 0; i < BenchmarkStreamMessageCount; i++) {
-    await call.send(BenchmarkRequest);
-  }
-  await call.closeSend();
-
-  let count = 0;
-  for (;;) {
-    const reply = await call.recv();
-    if (reply === undefined) {
-      break;
-    }
-    if (reply.message !== BenchmarkRequest.name) {
-      throw new Error(`unexpected bidi response: ${JSON.stringify(reply)}`);
-    }
-    count++;
-  }
-  if (count !== BenchmarkStreamMessageCount) {
-    throw new Error(`expected ${BenchmarkStreamMessageCount} bidi responses, got ${count}`);
-  }
-}
-
-async function bidiLongLived(client, messageCount) {
+async function bidiStreaming(client, messageCount) {
   const call = await client.bidiHello({ maxResponseMessages: messageCount });
   let received = 0;
   await Promise.all([sendMessages(), recvMessages()]);
@@ -274,12 +254,12 @@ async function bidiLongLived(client, messageCount) {
         break;
       }
       if (reply.message !== BenchmarkRequest.name) {
-        throw new Error(`unexpected long-lived bidi response: ${JSON.stringify(reply)}`);
+        throw new Error(`unexpected bidi response: ${JSON.stringify(reply)}`);
       }
       received++;
     }
     if (received !== messageCount) {
-      throw new Error(`expected ${messageCount} long-lived bidi responses, got ${received}`);
+      throw new Error(`expected ${messageCount} bidi responses, got ${received}`);
     }
   }
 }

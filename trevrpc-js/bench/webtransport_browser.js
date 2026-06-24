@@ -63,7 +63,9 @@ try {
 
   for (const result of results) {
     console.log(
-      `${result.name}: ${result.opsPerSecond.toFixed(0)} ops/s (${result.iterations} iterations in ${result.elapsedSeconds.toFixed(3)}s)`,
+      result.metric === "throughput"
+        ? `${result.name}: ${result.value.toFixed(0)} messages/s (${result.iterations} messages in ${result.elapsedSeconds.toFixed(3)}s)`
+        : `${result.name}: ${result.value.toFixed(3)} us/op (${result.iterations} iterations in ${result.elapsedSeconds.toFixed(3)}s)`,
     );
   }
 } finally {
@@ -73,9 +75,7 @@ try {
 }
 
 async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTransportURL }) {
-  const ConcurrentUnaryCount = 16;
-  const StreamMessageCount = 16;
-  const LongLivedStreamOptions = Object.freeze({ maxResponseMessages: iterations });
+  const LatencyStreamMessageCount = 1;
   const RequestName = "TrevRPC benchmark";
   const { connect, createRoot, createServiceClient } = await import("/src/index.js");
   const root = createRoot({
@@ -148,18 +148,24 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
   try {
     await warmClient(client);
     return [
-      await runCase("unary_round_trip", iterations, () => unary(client)),
-      await runConcurrentCase(
-        "unary_round_trip_concurrent_16",
-        iterations,
-        ConcurrentUnaryCount,
-        () => unary(client),
+      await runLatencyCase("unary_latency", iterations, () => unary(client)),
+      await runLatencyCase("server_stream_latency", iterations, () =>
+        serverStreaming(client, LatencyStreamMessageCount),
       ),
-      await runCase("server_stream_16_messages", iterations, () => serverStreaming(client)),
-      await runCase("client_stream_16_messages", iterations, () => clientStreaming(client)),
-      await runCase("bidi_stream_16_messages", iterations, () => bidiStreaming(client)),
-      await runLongLivedStreamCase("bidi_stream_long_lived_messages", iterations, () =>
-        bidiLongLived(client, iterations),
+      await runThroughputCase("server_stream_throughput", iterations, () =>
+        serverStreaming(client, iterations),
+      ),
+      await runLatencyCase("client_stream_latency", iterations, () =>
+        clientStreaming(client, LatencyStreamMessageCount),
+      ),
+      await runThroughputCase("client_stream_throughput", iterations, () =>
+        clientStreaming(client, iterations),
+      ),
+      await runLatencyCase("bidi_stream_latency", iterations, () =>
+        bidiStreaming(client, LatencyStreamMessageCount),
+      ),
+      await runThroughputCase("bidi_stream_throughput", iterations, () =>
+        bidiStreaming(client, iterations),
       ),
     ];
   } finally {
@@ -177,48 +183,37 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
 
   async function warmClient(client) {
     await unary(client);
-    await serverStreaming(client);
-    await clientStreaming(client);
-    await bidiStreaming(client);
+    await serverStreaming(client, LatencyStreamMessageCount);
+    await clientStreaming(client, LatencyStreamMessageCount);
+    await bidiStreaming(client, LatencyStreamMessageCount);
   }
 
-  async function runCase(name, count, fn) {
+  async function runLatencyCase(name, count, fn) {
     const start = performance.now();
     for (let index = 0; index < count; index += 1) {
       await fn();
     }
     const elapsedSeconds = (performance.now() - start) / 1000;
-    const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
-    return { elapsedSeconds, iterations: count, name, opsPerSecond };
+    return {
+      elapsedSeconds,
+      iterations: count,
+      metric: "latency",
+      name,
+      value: (elapsedSeconds * 1_000_000) / count,
+    };
   }
 
-  async function runConcurrentCase(name, count, concurrency, fn) {
-    let next = 0;
-    const workerCount = Math.min(count, concurrency);
-    const start = performance.now();
-    await Promise.all(
-      Array.from({ length: workerCount }, async () => {
-        for (;;) {
-          const index = next;
-          next += 1;
-          if (index >= count) {
-            return;
-          }
-          await fn();
-        }
-      }),
-    );
-    const elapsedSeconds = (performance.now() - start) / 1000;
-    const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
-    return { elapsedSeconds, iterations: count, name, opsPerSecond };
-  }
-
-  async function runLongLivedStreamCase(name, count, fn) {
+  async function runThroughputCase(name, count, fn) {
     const start = performance.now();
     await fn();
     const elapsedSeconds = (performance.now() - start) / 1000;
-    const opsPerSecond = elapsedSeconds > 0 ? count / elapsedSeconds : 0;
-    return { elapsedSeconds, iterations: count, name, opsPerSecond };
+    return {
+      elapsedSeconds,
+      iterations: count,
+      metric: "throughput",
+      name,
+      value: elapsedSeconds > 0 ? count / elapsedSeconds : 0,
+    };
   }
 
   async function unary(client) {
@@ -228,8 +223,11 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
     }
   }
 
-  async function serverStreaming(client) {
-    const replies = await client.lotsOfReplies({ name: RequestName });
+  async function serverStreaming(client, messageCount) {
+    const replies = await client.lotsOfReplies(
+      { name: String(messageCount) },
+      { maxResponseMessages: messageCount },
+    );
     let count = 0;
     for await (const reply of replies) {
       if (reply.message !== "server stream") {
@@ -237,47 +235,24 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
       }
       count += 1;
     }
-    if (count !== StreamMessageCount) {
-      throw new Error(`expected ${StreamMessageCount} server-stream responses, got ${count}`);
+    if (count !== messageCount) {
+      throw new Error(`expected ${messageCount} server-stream responses, got ${count}`);
     }
   }
 
-  async function clientStreaming(client) {
+  async function clientStreaming(client, messageCount) {
     const call = await client.lotsOfGreetings();
-    for (let index = 0; index < StreamMessageCount; index += 1) {
+    for (let index = 0; index < messageCount; index += 1) {
       await call.send({ name: RequestName });
     }
     const reply = await call.closeAndRecv();
-    if (reply.message !== `streamed ${StreamMessageCount} greetings`) {
+    if (reply.message !== `streamed ${messageCount} greetings`) {
       throw new Error(`unexpected client-stream response: ${JSON.stringify(reply)}`);
     }
   }
 
-  async function bidiStreaming(client) {
-    const call = await client.bidiHello();
-    for (let index = 0; index < StreamMessageCount; index += 1) {
-      await call.send({ name: RequestName });
-    }
-    await call.closeSend();
-
-    let count = 0;
-    for (;;) {
-      const reply = await call.recv();
-      if (reply === undefined) {
-        break;
-      }
-      if (reply.message !== RequestName) {
-        throw new Error(`unexpected bidi response: ${JSON.stringify(reply)}`);
-      }
-      count += 1;
-    }
-    if (count !== StreamMessageCount) {
-      throw new Error(`expected ${StreamMessageCount} bidi responses, got ${count}`);
-    }
-  }
-
-  async function bidiLongLived(client, messageCount) {
-    const call = await client.bidiHello(LongLivedStreamOptions);
+  async function bidiStreaming(client, messageCount) {
+    const call = await client.bidiHello({ maxResponseMessages: messageCount });
     let received = 0;
     await Promise.all([sendMessages(), recvMessages()]);
 
@@ -295,12 +270,12 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
           break;
         }
         if (reply.message !== RequestName) {
-          throw new Error(`unexpected long-lived bidi response: ${JSON.stringify(reply)}`);
+          throw new Error(`unexpected bidi response: ${JSON.stringify(reply)}`);
         }
         received += 1;
       }
       if (received !== messageCount) {
-        throw new Error(`expected ${messageCount} long-lived bidi responses, got ${received}`);
+        throw new Error(`expected ${messageCount} bidi responses, got ${received}`);
       }
     }
   }

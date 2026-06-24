@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -24,26 +25,23 @@ import (
 )
 
 const (
-	comparisonRequestName        = "TrevRPC benchmark"
-	comparisonStreamMessageCount = 16
-	comparisonQUICIdleTimeout    = 10 * time.Minute
-	comparisonQUICKeepAlive      = 5 * time.Second
+	comparisonRequestName         = "TrevRPC benchmark"
+	comparisonLatencyMessageCount = 1
+	comparisonQUICIdleTimeout     = 10 * time.Minute
+	comparisonQUICKeepAlive       = 5 * time.Second
 )
 
 var (
-	comparisonUnaryReply    = &greeter.HelloReply{Message: "hello TrevRPC benchmark"}
-	comparisonSummaryReply  = &greeter.HelloReply{Message: "streamed 16 greetings"}
-	comparisonRequests      = makeComparisonRequests()
-	comparisonServerReplies = makeComparisonReplies("server stream")
-	comparisonBidiReplies   = makeComparisonReplies("bidi stream")
-	comparisonStringSink    string
-	comparisonCountSink     int
+	comparisonUnaryReply = &greeter.HelloReply{Message: "hello TrevRPC benchmark"}
+	comparisonRequests   = makeComparisonRequests(comparisonLatencyMessageCount)
+	comparisonStringSink string
+	comparisonCountSink  int
 )
 
 func BenchmarkRPCComparison(b *testing.B) {
 	env := startRPCComparisonEnvironment(b)
 
-	b.Run("unary_round_trip", func(b *testing.B) {
+	b.Run("unary_latency", func(b *testing.B) {
 		b.Run("trevrpc_quic", func(b *testing.B) {
 			benchmarkTrevRPCUnary(b, env.trevrpcQUICClient)
 		})
@@ -52,39 +50,57 @@ func BenchmarkRPCComparison(b *testing.B) {
 		})
 	})
 
-	b.Run("server_stream_16_messages", func(b *testing.B) {
+	b.Run("server_stream_latency", func(b *testing.B) {
 		b.Run("trevrpc_quic", func(b *testing.B) {
-			benchmarkTrevRPCServerStreaming(b, env.trevrpcQUICClient)
+			benchmarkTrevRPCServerStreamLatency(b, env.trevrpcQUICClient)
 		})
 		b.Run("grpc_go", func(b *testing.B) {
-			benchmarkGRPCServerStreaming(b, env.grpcConn)
+			benchmarkGRPCServerStreamLatency(b, env.grpcConn)
 		})
 	})
 
-	b.Run("client_stream_16_messages", func(b *testing.B) {
+	b.Run("server_stream_throughput", func(b *testing.B) {
 		b.Run("trevrpc_quic", func(b *testing.B) {
-			benchmarkTrevRPCClientStreaming(b, env.trevrpcQUICClient)
+			benchmarkTrevRPCServerStreamThroughput(b, env.trevrpcQUICClient)
 		})
 		b.Run("grpc_go", func(b *testing.B) {
-			benchmarkGRPCClientStreaming(b, env.grpcConn)
+			benchmarkGRPCServerStreamThroughput(b, env.grpcConn)
 		})
 	})
 
-	b.Run("bidi_stream_16_messages", func(b *testing.B) {
+	b.Run("client_stream_latency", func(b *testing.B) {
 		b.Run("trevrpc_quic", func(b *testing.B) {
-			benchmarkTrevRPCBidiStreaming(b, env.trevrpcQUICClient)
+			benchmarkTrevRPCClientStreamLatency(b, env.trevrpcQUICClient)
 		})
 		b.Run("grpc_go", func(b *testing.B) {
-			benchmarkGRPCBidiStreaming(b, env.grpcConn)
+			benchmarkGRPCClientStreamLatency(b, env.grpcConn)
 		})
 	})
 
-	b.Run("bidi_stream_long_lived_messages", func(b *testing.B) {
+	b.Run("client_stream_throughput", func(b *testing.B) {
 		b.Run("trevrpc_quic", func(b *testing.B) {
-			benchmarkTrevRPCBidiLongLived(b, env.trevrpcQUICClient)
+			benchmarkTrevRPCClientStreamThroughput(b, env.trevrpcQUICClient)
 		})
 		b.Run("grpc_go", func(b *testing.B) {
-			benchmarkGRPCBidiLongLived(b, env.grpcConn)
+			benchmarkGRPCClientStreamThroughput(b, env.grpcConn)
+		})
+	})
+
+	b.Run("bidi_stream_latency", func(b *testing.B) {
+		b.Run("trevrpc_quic", func(b *testing.B) {
+			benchmarkTrevRPCBidiStreamLatency(b, env.trevrpcQUICClient)
+		})
+		b.Run("grpc_go", func(b *testing.B) {
+			benchmarkGRPCBidiStreamLatency(b, env.grpcConn)
+		})
+	})
+
+	b.Run("bidi_stream_throughput", func(b *testing.B) {
+		b.Run("trevrpc_quic", func(b *testing.B) {
+			benchmarkTrevRPCBidiStreamThroughput(b, env.trevrpcQUICClient)
+		})
+		b.Run("grpc_go", func(b *testing.B) {
+			benchmarkGRPCBidiStreamThroughput(b, env.grpcConn)
 		})
 	})
 }
@@ -115,12 +131,12 @@ func benchmarkGRPCUnary(b *testing.B, conn *grpc.ClientConn) {
 	}
 }
 
-func benchmarkTrevRPCServerStreaming(b *testing.B, client *greeter.GreeterClient) {
+func benchmarkTrevRPCServerStreamLatency(b *testing.B, client *greeter.GreeterClient) {
 	b.Helper()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		count, err := trevrpcServerStreamingCall(context.Background(), client)
+		count, err := trevrpcServerStreamingCall(context.Background(), client, comparisonLatencyMessageCount)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -128,12 +144,12 @@ func benchmarkTrevRPCServerStreaming(b *testing.B, client *greeter.GreeterClient
 	}
 }
 
-func benchmarkGRPCServerStreaming(b *testing.B, conn *grpc.ClientConn) {
+func benchmarkGRPCServerStreamLatency(b *testing.B, conn *grpc.ClientConn) {
 	b.Helper()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		count, err := grpcServerStreamingCall(context.Background(), conn)
+		count, err := grpcServerStreamingCall(context.Background(), conn, comparisonLatencyMessageCount)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -141,74 +157,118 @@ func benchmarkGRPCServerStreaming(b *testing.B, conn *grpc.ClientConn) {
 	}
 }
 
-func benchmarkTrevRPCClientStreaming(b *testing.B, client *greeter.GreeterClient) {
+func benchmarkTrevRPCServerStreamThroughput(b *testing.B, client *greeter.GreeterClient) {
 	b.Helper()
 	b.ReportAllocs()
 	b.ResetTimer()
-	for range b.N {
-		message, err := trevrpcClientStreamingCall(context.Background(), client)
-		if err != nil {
-			b.Fatal(err)
-		}
-		comparisonStringSink = message
-	}
-}
-
-func benchmarkGRPCClientStreaming(b *testing.B, conn *grpc.ClientConn) {
-	b.Helper()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		message, err := grpcClientStreamingCall(context.Background(), conn)
-		if err != nil {
-			b.Fatal(err)
-		}
-		comparisonStringSink = message
-	}
-}
-
-func benchmarkTrevRPCBidiStreaming(b *testing.B, client *greeter.GreeterClient) {
-	b.Helper()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		count, err := trevrpcBidiStreamingCall(context.Background(), client)
-		if err != nil {
-			b.Fatal(err)
-		}
-		comparisonCountSink = count
-	}
-}
-
-func benchmarkGRPCBidiStreaming(b *testing.B, conn *grpc.ClientConn) {
-	b.Helper()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		count, err := grpcBidiStreamingCall(context.Background(), conn)
-		if err != nil {
-			b.Fatal(err)
-		}
-		comparisonCountSink = count
-	}
-}
-
-func benchmarkTrevRPCBidiLongLived(b *testing.B, client *greeter.GreeterClient) {
-	b.Helper()
-	b.ReportAllocs()
-	b.ResetTimer()
-	count, err := trevrpcBidiLongLivedCall(context.Background(), client, b.N)
+	count, err := trevrpcServerStreamingCall(context.Background(), client, b.N)
 	if err != nil {
 		b.Fatal(err)
 	}
 	comparisonCountSink = count
 }
 
-func benchmarkGRPCBidiLongLived(b *testing.B, conn *grpc.ClientConn) {
+func benchmarkGRPCServerStreamThroughput(b *testing.B, conn *grpc.ClientConn) {
 	b.Helper()
 	b.ReportAllocs()
 	b.ResetTimer()
-	count, err := grpcBidiLongLivedCall(context.Background(), conn, b.N)
+	count, err := grpcServerStreamingCall(context.Background(), conn, b.N)
+	if err != nil {
+		b.Fatal(err)
+	}
+	comparisonCountSink = count
+}
+
+func benchmarkTrevRPCClientStreamLatency(b *testing.B, client *greeter.GreeterClient) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		message, err := trevrpcClientStreamingCall(context.Background(), client, comparisonLatencyMessageCount)
+		if err != nil {
+			b.Fatal(err)
+		}
+		comparisonStringSink = message
+	}
+}
+
+func benchmarkGRPCClientStreamLatency(b *testing.B, conn *grpc.ClientConn) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		message, err := grpcClientStreamingCall(context.Background(), conn, comparisonLatencyMessageCount)
+		if err != nil {
+			b.Fatal(err)
+		}
+		comparisonStringSink = message
+	}
+}
+
+func benchmarkTrevRPCClientStreamThroughput(b *testing.B, client *greeter.GreeterClient) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	message, err := trevrpcClientStreamingCall(context.Background(), client, b.N)
+	if err != nil {
+		b.Fatal(err)
+	}
+	comparisonStringSink = message
+}
+
+func benchmarkGRPCClientStreamThroughput(b *testing.B, conn *grpc.ClientConn) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	message, err := grpcClientStreamingCall(context.Background(), conn, b.N)
+	if err != nil {
+		b.Fatal(err)
+	}
+	comparisonStringSink = message
+}
+
+func benchmarkTrevRPCBidiStreamLatency(b *testing.B, client *greeter.GreeterClient) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		count, err := trevrpcBidiStreamingCall(context.Background(), client, comparisonLatencyMessageCount)
+		if err != nil {
+			b.Fatal(err)
+		}
+		comparisonCountSink = count
+	}
+}
+
+func benchmarkGRPCBidiStreamLatency(b *testing.B, conn *grpc.ClientConn) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		count, err := grpcBidiStreamingCall(context.Background(), conn, comparisonLatencyMessageCount)
+		if err != nil {
+			b.Fatal(err)
+		}
+		comparisonCountSink = count
+	}
+}
+
+func benchmarkTrevRPCBidiStreamThroughput(b *testing.B, client *greeter.GreeterClient) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	count, err := trevrpcBidiStreamingCall(context.Background(), client, b.N)
+	if err != nil {
+		b.Fatal(err)
+	}
+	comparisonCountSink = count
+}
+
+func benchmarkGRPCBidiStreamThroughput(b *testing.B, conn *grpc.ClientConn) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	count, err := grpcBidiStreamingCall(context.Background(), conn, b.N)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -242,22 +302,22 @@ func warmRPCComparisonEnvironment(b *testing.B, env *rpcComparisonEnvironment) {
 	if _, err := grpcUnaryCall(ctx, env.grpcConn); err != nil {
 		b.Fatalf("warm grpc unary: %v", err)
 	}
-	if _, err := trevrpcServerStreamingCall(ctx, env.trevrpcQUICClient); err != nil {
+	if _, err := trevrpcServerStreamingCall(ctx, env.trevrpcQUICClient, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm TrevRPC server streaming: %v", err)
 	}
-	if _, err := grpcServerStreamingCall(ctx, env.grpcConn); err != nil {
+	if _, err := grpcServerStreamingCall(ctx, env.grpcConn, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm grpc server streaming: %v", err)
 	}
-	if _, err := trevrpcClientStreamingCall(ctx, env.trevrpcQUICClient); err != nil {
+	if _, err := trevrpcClientStreamingCall(ctx, env.trevrpcQUICClient, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm TrevRPC client streaming: %v", err)
 	}
-	if _, err := grpcClientStreamingCall(ctx, env.grpcConn); err != nil {
+	if _, err := grpcClientStreamingCall(ctx, env.grpcConn, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm grpc client streaming: %v", err)
 	}
-	if _, err := trevrpcBidiStreamingCall(ctx, env.trevrpcQUICClient); err != nil {
+	if _, err := trevrpcBidiStreamingCall(ctx, env.trevrpcQUICClient, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm TrevRPC bidi streaming: %v", err)
 	}
-	if _, err := grpcBidiStreamingCall(ctx, env.grpcConn); err != nil {
+	if _, err := grpcBidiStreamingCall(ctx, env.grpcConn, comparisonLatencyMessageCount); err != nil {
 		b.Fatalf("warm grpc bidi streaming: %v", err)
 	}
 }
@@ -352,8 +412,11 @@ func startGRPCComparisonClient(b *testing.B) *grpc.ClientConn {
 	return conn
 }
 
-func trevrpcServerStreamingCall(ctx context.Context, client *greeter.GreeterClient) (int, error) {
-	replies, err := client.LotsOfReplies(ctx, comparisonRequests[0])
+func trevrpcServerStreamingCall(ctx context.Context, client *greeter.GreeterClient, messageCount int) (int, error) {
+	replies, err := client.LotsOfReplies(ctx,
+		comparisonRequestWithCount(messageCount),
+		trevrpc.WithMaxResponseMessages(messageCount),
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -365,6 +428,9 @@ func trevrpcServerStreamingCall(ctx context.Context, client *greeter.GreeterClie
 			if err := replies.Close(); err != nil {
 				return 0, err
 			}
+			if count != messageCount {
+				return 0, fmt.Errorf("server stream count = %d, want %d", count, messageCount)
+			}
 			return count, nil
 		}
 		if err != nil {
@@ -375,38 +441,18 @@ func trevrpcServerStreamingCall(ctx context.Context, client *greeter.GreeterClie
 	}
 }
 
-func trevrpcClientStreamingCall(ctx context.Context, client *greeter.GreeterClient) (string, error) {
-	response, err := client.LotsOfGreetingsFromStream(ctx, trevrpc.FromSlice(comparisonRequests...))
+func trevrpcClientStreamingCall(ctx context.Context, client *greeter.GreeterClient, messageCount int) (string, error) {
+	response, err := client.LotsOfGreetingsFromStream(ctx, &countedComparisonRequests{remaining: messageCount})
 	if err != nil {
 		return "", err
+	}
+	if response.Message != strconv.Itoa(messageCount) {
+		return "", fmt.Errorf("client stream response = %q, want %d", response.Message, messageCount)
 	}
 	return response.Message, nil
 }
 
-func trevrpcBidiStreamingCall(ctx context.Context, client *greeter.GreeterClient) (int, error) {
-	stream, err := client.BidiHelloFromStream(ctx, trevrpc.FromSlice(comparisonRequests...))
-	if err != nil {
-		return 0, err
-	}
-
-	count := 0
-	for {
-		_, err := stream.Recv()
-		if err == io.EOF {
-			if err := stream.Close(); err != nil {
-				return 0, err
-			}
-			return count, nil
-		}
-		if err != nil {
-			_ = stream.Close()
-			return 0, err
-		}
-		count++
-	}
-}
-
-func trevrpcBidiLongLivedCall(ctx context.Context, client *greeter.GreeterClient, messageCount int) (int, error) {
+func trevrpcBidiStreamingCall(ctx context.Context, client *greeter.GreeterClient, messageCount int) (int, error) {
 	stream, err := client.BidiHelloFromStream(ctx,
 		&countedComparisonRequests{remaining: messageCount},
 		trevrpc.WithMaxResponseMessages(messageCount),
@@ -423,7 +469,7 @@ func trevrpcBidiLongLivedCall(ctx context.Context, client *greeter.GreeterClient
 				return 0, err
 			}
 			if count != messageCount {
-				return 0, fmt.Errorf("long-lived bidi stream count = %d, want %d", count, messageCount)
+				return 0, fmt.Errorf("bidi stream count = %d, want %d", count, messageCount)
 			}
 			return count, nil
 		}
@@ -443,12 +489,12 @@ func grpcUnaryCall(ctx context.Context, conn *grpc.ClientConn) (string, error) {
 	return response.Message, nil
 }
 
-func grpcServerStreamingCall(ctx context.Context, conn *grpc.ClientConn) (int, error) {
+func grpcServerStreamingCall(ctx context.Context, conn *grpc.ClientConn, messageCount int) (int, error) {
 	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodLotsOfReplies, false, true), grpcFullMethod(greeter.MethodLotsOfReplies))
 	if err != nil {
 		return 0, err
 	}
-	if err := stream.SendMsg(comparisonRequests[0]); err != nil {
+	if err := stream.SendMsg(comparisonRequestWithCount(messageCount)); err != nil {
 		return 0, err
 	}
 	if err := stream.CloseSend(); err != nil {
@@ -460,6 +506,9 @@ func grpcServerStreamingCall(ctx context.Context, conn *grpc.ClientConn) (int, e
 		response := &greeter.HelloReply{}
 		err := stream.RecvMsg(response)
 		if err == io.EOF {
+			if count != messageCount {
+				return 0, fmt.Errorf("grpc server stream count = %d, want %d", count, messageCount)
+			}
 			return count, nil
 		}
 		if err != nil {
@@ -469,13 +518,13 @@ func grpcServerStreamingCall(ctx context.Context, conn *grpc.ClientConn) (int, e
 	}
 }
 
-func grpcClientStreamingCall(ctx context.Context, conn *grpc.ClientConn) (string, error) {
+func grpcClientStreamingCall(ctx context.Context, conn *grpc.ClientConn, messageCount int) (string, error) {
 	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodLotsOfGreetings, true, false), grpcFullMethod(greeter.MethodLotsOfGreetings))
 	if err != nil {
 		return "", err
 	}
-	for _, request := range comparisonRequests {
-		if err := stream.SendMsg(request); err != nil {
+	for range messageCount {
+		if err := stream.SendMsg(comparisonRequests[0]); err != nil {
 			return "", err
 		}
 	}
@@ -487,38 +536,13 @@ func grpcClientStreamingCall(ctx context.Context, conn *grpc.ClientConn) (string
 	if err := stream.RecvMsg(response); err != nil {
 		return "", err
 	}
+	if response.Message != strconv.Itoa(messageCount) {
+		return "", fmt.Errorf("grpc client stream response = %q, want %d", response.Message, messageCount)
+	}
 	return response.Message, nil
 }
 
-func grpcBidiStreamingCall(ctx context.Context, conn *grpc.ClientConn) (int, error) {
-	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodBidiHello, true, true), grpcFullMethod(greeter.MethodBidiHello))
-	if err != nil {
-		return 0, err
-	}
-	for _, request := range comparisonRequests {
-		if err := stream.SendMsg(request); err != nil {
-			return 0, err
-		}
-	}
-	if err := stream.CloseSend(); err != nil {
-		return 0, err
-	}
-
-	count := 0
-	for {
-		response := &greeter.HelloReply{}
-		err := stream.RecvMsg(response)
-		if err == io.EOF {
-			return count, nil
-		}
-		if err != nil {
-			return 0, err
-		}
-		count++
-	}
-}
-
-func grpcBidiLongLivedCall(ctx context.Context, conn *grpc.ClientConn, messageCount int) (int, error) {
+func grpcBidiStreamingCall(ctx context.Context, conn *grpc.ClientConn, messageCount int) (int, error) {
 	stream, err := conn.NewStream(ctx, grpcStreamDesc(greeter.MethodBidiHello, true, true), grpcFullMethod(greeter.MethodBidiHello))
 	if err != nil {
 		return 0, err
@@ -543,7 +567,7 @@ func grpcBidiLongLivedCall(ctx context.Context, conn *grpc.ClientConn, messageCo
 				return 0, sendErr
 			}
 			if count != messageCount {
-				return 0, fmt.Errorf("grpc long-lived bidi stream count = %d, want %d", count, messageCount)
+				return 0, fmt.Errorf("grpc bidi stream count = %d, want %d", count, messageCount)
 			}
 			return count, nil
 		}
@@ -560,19 +584,21 @@ func (comparisonGreeter) SayHello(context.Context, *greeter.HelloRequest) (*gree
 	return comparisonUnaryReply, nil
 }
 
-func (comparisonGreeter) LotsOfReplies(context.Context, *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
-	return trevrpc.FromSlice(comparisonServerReplies...), nil
+func (comparisonGreeter) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
+	return trevrpc.FromSlice(makeComparisonReplies("server stream", comparisonMessageCount(request.Name))...), nil
 }
 
 func (comparisonGreeter) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*greeter.HelloReply, error) {
+	count := 0
 	for {
 		_, err := requests.Recv()
 		if err == io.EOF {
-			return comparisonSummaryReply, nil
+			return &greeter.HelloReply{Message: strconv.Itoa(count)}, nil
 		}
 		if err != nil {
 			return nil, err
 		}
+		count++
 	}
 }
 
@@ -591,7 +617,7 @@ func (s *comparisonBidiStream) Recv() (*greeter.HelloReply, error) {
 		return nil, err
 	}
 
-	reply := comparisonBidiReplies[s.next%len(comparisonBidiReplies)]
+	reply := &greeter.HelloReply{Message: strconv.Itoa(s.next)}
 	s.next++
 	return reply, nil
 }
@@ -661,9 +687,9 @@ func (grpcComparisonGreeter) SayHello(context.Context, *greeter.HelloRequest) (*
 	return comparisonUnaryReply, nil
 }
 
-func (grpcComparisonGreeter) LotsOfReplies(_ *greeter.HelloRequest, stream grpc.ServerStream) error {
-	for _, reply := range comparisonServerReplies {
-		if err := stream.SendMsg(reply); err != nil {
+func (grpcComparisonGreeter) LotsOfReplies(request *greeter.HelloRequest, stream grpc.ServerStream) error {
+	for range comparisonMessageCount(request.Name) {
+		if err := stream.SendMsg(&greeter.HelloReply{Message: "server stream"}); err != nil {
 			return err
 		}
 	}
@@ -671,20 +697,21 @@ func (grpcComparisonGreeter) LotsOfReplies(_ *greeter.HelloRequest, stream grpc.
 }
 
 func (grpcComparisonGreeter) LotsOfGreetings(stream grpc.ServerStream) error {
+	count := 0
 	for {
 		request := &greeter.HelloRequest{}
 		err := stream.RecvMsg(request)
 		if err == io.EOF {
-			return stream.SendMsg(comparisonSummaryReply)
+			return stream.SendMsg(&greeter.HelloReply{Message: strconv.Itoa(count)})
 		}
 		if err != nil {
 			return err
 		}
+		count++
 	}
 }
 
 func (grpcComparisonGreeter) BidiHello(stream grpc.ServerStream) error {
-	next := 0
 	for {
 		request := &greeter.HelloRequest{}
 		err := stream.RecvMsg(request)
@@ -695,10 +722,9 @@ func (grpcComparisonGreeter) BidiHello(stream grpc.ServerStream) error {
 			return err
 		}
 
-		if err := stream.SendMsg(comparisonBidiReplies[next%len(comparisonBidiReplies)]); err != nil {
+		if err := stream.SendMsg(&greeter.HelloReply{Message: request.Name}); err != nil {
 			return err
 		}
-		next++
 	}
 }
 
@@ -758,8 +784,8 @@ func comparisonTLSConfig(b *testing.B) (*tls.Config, *tls.Config) {
 	return serverTLS, clientTLS
 }
 
-func makeComparisonRequests() []*greeter.HelloRequest {
-	requests := make([]*greeter.HelloRequest, comparisonStreamMessageCount)
+func makeComparisonRequests(count int) []*greeter.HelloRequest {
+	requests := make([]*greeter.HelloRequest, count)
 	for index := range requests {
 		requests[index] = &greeter.HelloRequest{Name: comparisonRequestName}
 	}
@@ -783,8 +809,20 @@ func (s *countedComparisonRequests) Close() error {
 	return nil
 }
 
-func makeComparisonReplies(prefix string) []*greeter.HelloReply {
-	replies := make([]*greeter.HelloReply, comparisonStreamMessageCount)
+func comparisonRequestWithCount(count int) *greeter.HelloRequest {
+	return &greeter.HelloRequest{Name: strconv.Itoa(count)}
+}
+
+func comparisonMessageCount(name string) int {
+	count, err := strconv.Atoi(name)
+	if err != nil || count <= 0 {
+		return comparisonLatencyMessageCount
+	}
+	return count
+}
+
+func makeComparisonReplies(prefix string, count int) []*greeter.HelloReply {
+	replies := make([]*greeter.HelloReply, count)
 	for index := range replies {
 		replies[index] = &greeter.HelloReply{Message: prefix}
 	}
