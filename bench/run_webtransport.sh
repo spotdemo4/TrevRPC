@@ -306,17 +306,20 @@ EOF
         }
         function label_implementation(value) {
             value = display_server(value)
+            if (value == "go_quic") {
+                return "quic-go"
+            }
             split(value, parts, "_")
             return substr(value, length(parts[1]) + 2)
         }
         function print_table_header(shape) {
             printf "\n### `%s`\n\n", shape
             if (is_throughput_shape(shape)) {
-                print "| Browser | Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
-                print "| --- | --- | --- | ---: | ---: | --- |"
+                print "| Framework | Browser | Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s |"
+                print "| --- | --- | --- | --- | ---: | ---: |"
             } else {
-                print "| Browser | Server language | Server implementation | Median latency us/op | Latency min..max us/op | Source |"
-                print "| --- | --- | --- | ---: | ---: | --- |"
+                print "| Framework | Browser | Server language | Server implementation | Median latency us/op | Latency min..max us/op |"
+                print "| --- | --- | --- | --- | ---: | ---: |"
             }
         }
         NR > 1 {
@@ -331,7 +334,6 @@ EOF
             throughput[id] = $8 + 0
             throughput_min[id] = $9 + 0
             throughput_max[id] = $10 + 0
-            source[id] = $13
             if (!(shape[id] in seen_shape)) {
                 seen_shape[shape[id]] = 1
                 shape_order[++shape_count] = shape[id]
@@ -347,9 +349,9 @@ EOF
                 for (row_index = 1; row_index <= row_count; row_index++) {
                     id = sorted_rows[row_index]
                     if (is_throughput_shape(current_shape)) {
-                        printf "| `%s` | `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", display_browser(browser[id]), label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id], source[id]
+                        printf "| `trevRPC` | `%s` | `%s` | `%s` | %.0f | %.0f..%.0f |\n", display_browser(browser[id]), label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id]
                     } else {
-                        printf "| `%s` | `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", display_browser(browser[id]), label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id], source[id]
+                        printf "| `trevRPC` | `%s` | `%s` | `%s` | %.3f | %.3f..%.3f |\n", display_browser(browser[id]), label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id]
                     }
                 }
             }
@@ -364,8 +366,8 @@ EOF
 
 Failed or timed-out samples are omitted from the aggregate result tables above.
 
-| Run | Browser | Server language | Server implementation | Status | Raw output |
-| ---: | --- | --- | --- | ---: | --- |
+| Framework | Run | Browser | Server language | Server implementation | Status | Raw output |
+| --- | ---: | --- | --- | --- | ---: | --- |
 EOF
 
             awk -F, -v root_prefix="$ROOT/" '
@@ -398,6 +400,9 @@ EOF
             }
             function label_implementation(value) {
                 value = display_server(value)
+                if (value == "go_quic") {
+                    return "quic-go"
+                }
                 split(value, parts, "_")
                 return substr(value, length(parts[1]) + 2)
             }
@@ -406,7 +411,7 @@ EOF
                 if (index(raw_file, root_prefix) == 1) {
                     raw_file = substr(raw_file, length(root_prefix) + 1)
                 }
-                printf "| %s | `%s` | `%s` | `%s` | %s | `%s` |\n", $1, display_browser($2), label_language($3), label_implementation($3), $5, raw_file
+                printf "| `trevRPC` | %s | `%s` | `%s` | `%s` | %s | `%s` |\n", $1, display_browser($2), label_language($3), label_implementation($3), $5, raw_file
             }' "$FAILURES_CSV"
         fi
 
@@ -418,7 +423,7 @@ The WebTransport category benchmarks server implementations with a real Chromium
 
 Each sample uses one browser WebTransport session per server. Latency rows measure one RPC operation. Stream latency rows use one request and one response message. Stream throughput rows measure messages per second over one open WebTransport stream.
 
-Within the WebTransport tables, \`go_quic\` is the quic-go HTTP/3 WebTransport server path. \`go_msquic\`, \`c_msquic\`, and \`js_msquic\` use the native MsQuic-backed WebTransport stack and are reported separately because browser interoperability can differ from the quic-go path.
+Within the WebTransport tables, Go / \`quic-go\` is the quic-go HTTP/3 WebTransport server path. Go / \`msquic\`, C / \`msquic\`, and JS / \`msquic\` use the native MsQuic-backed WebTransport stack and are reported separately because browser interoperability can differ from the quic-go path.
 
 Latency tables are sorted by median latency ascending. Throughput tables are sorted by median message throughput descending.
 

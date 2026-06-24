@@ -290,6 +290,9 @@ EOF
         function append(values, value) {
             return values == "" ? value : values " " value
         }
+        function framework(value) {
+            return value == "grpc" ? "gRPC" : "trevRPC"
+        }
         function label_language(value) {
             if (value == "grpc_go") {
                 return "go"
@@ -301,32 +304,45 @@ EOF
             if (value == "grpc_go") {
                 return "grpc"
             }
+            if (value == "go_quic") {
+                return "quic-go"
+            }
             split(value, parts, "_")
             return substr(value, length(parts[1]) + 2)
+        }
+        function add_row_to_group(table_axis, id,    group_key) {
+            group_key = table_axis SUBSEP shape[id]
+            if (!(group_key in seen_group)) {
+                seen_group[group_key] = 1
+                groups[++group_count] = group_key
+                group_axis[group_key] = table_axis
+                group_shape[group_key] = shape[id]
+            }
+            group_rows[group_key] = append(group_rows[group_key], id)
         }
         function print_table_header(axis, shape) {
             printf "\n### `%s` / `%s`\n\n", axis, shape
             if (is_throughput_shape(shape)) {
                 if (axis == "client") {
-                    print "| Client language | Client implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
-                    print "| --- | --- | ---: | ---: | --- |"
+                    print "| Framework | Client language | Client implementation | Median throughput messages/s | Throughput min..max messages/s |"
+                    print "| --- | --- | --- | ---: | ---: |"
                 } else if (axis == "server") {
-                    print "| Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
-                    print "| --- | --- | ---: | ---: | --- |"
+                    print "| Framework | Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s |"
+                    print "| --- | --- | --- | ---: | ---: |"
                 } else {
-                    print "| Client language | Client implementation | Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s | Source |"
-                    print "| --- | --- | --- | --- | ---: | ---: | --- |"
+                    print "| Framework | Client language | Client implementation | Server language | Server implementation | Median throughput messages/s | Throughput min..max messages/s |"
+                    print "| --- | --- | --- | --- | --- | ---: | ---: |"
                 }
             } else {
                 if (axis == "client") {
-                    print "| Client language | Client implementation | Median latency us/op | Latency min..max us/op | Source |"
-                    print "| --- | --- | ---: | ---: | --- |"
+                    print "| Framework | Client language | Client implementation | Median latency us/op | Latency min..max us/op |"
+                    print "| --- | --- | --- | ---: | ---: |"
                 } else if (axis == "server") {
-                    print "| Server language | Server implementation | Median latency us/op | Latency min..max us/op | Source |"
-                    print "| --- | --- | ---: | ---: | --- |"
+                    print "| Framework | Server language | Server implementation | Median latency us/op | Latency min..max us/op |"
+                    print "| --- | --- | --- | ---: | ---: |"
                 } else {
-                    print "| Client language | Client implementation | Server language | Server implementation | Median latency us/op | Latency min..max us/op | Source |"
-                    print "| --- | --- | --- | --- | ---: | ---: | --- |"
+                    print "| Framework | Client language | Client implementation | Server language | Server implementation | Median latency us/op | Latency min..max us/op |"
+                    print "| --- | --- | --- | --- | --- | ---: | ---: |"
                 }
             }
         }
@@ -343,15 +359,12 @@ EOF
             throughput[id] = $9 + 0
             throughput_min[id] = $10 + 0
             throughput_max[id] = $11 + 0
-            source[id] = $14
-            group_key = axis[id] SUBSEP shape[id]
-            if (!(group_key in seen_group)) {
-                seen_group[group_key] = 1
-                groups[++group_count] = group_key
-                group_axis[group_key] = axis[id]
-                group_shape[group_key] = shape[id]
+            if (axis[id] == "grpc") {
+                add_row_to_group("client", id)
+                add_row_to_group("server", id)
+            } else {
+                add_row_to_group(axis[id], id)
             }
-            group_rows[group_key] = append(group_rows[group_key], id)
         }
         END {
             for (group_index = 1; group_index <= group_count; group_index++) {
@@ -363,19 +376,19 @@ EOF
                     id = sorted_rows[row_index]
                     if (is_throughput_shape(group_shape[group_key])) {
                         if (group_axis[group_key] == "client") {
-                            printf "| `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", label_language(client[id]), label_implementation(client[id]), throughput[id], throughput_min[id], throughput_max[id], source[id]
+                            printf "| `%s` | `%s` | `%s` | %.0f | %.0f..%.0f |\n", framework(axis[id]), label_language(client[id]), label_implementation(client[id]), throughput[id], throughput_min[id], throughput_max[id]
                         } else if (group_axis[group_key] == "server") {
-                            printf "| `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id], source[id]
+                            printf "| `%s` | `%s` | `%s` | %.0f | %.0f..%.0f |\n", framework(axis[id]), label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id]
                         } else {
-                            printf "| `%s` | `%s` | `%s` | `%s` | %.0f | %.0f..%.0f | `%s` |\n", label_language(client[id]), label_implementation(client[id]), label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id], source[id]
+                            printf "| `%s` | `%s` | `%s` | `%s` | `%s` | %.0f | %.0f..%.0f |\n", framework(axis[id]), label_language(client[id]), label_implementation(client[id]), label_language(server[id]), label_implementation(server[id]), throughput[id], throughput_min[id], throughput_max[id]
                         }
                     } else {
                         if (group_axis[group_key] == "client") {
-                            printf "| `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", label_language(client[id]), label_implementation(client[id]), latency[id], latency_min[id], latency_max[id], source[id]
+                            printf "| `%s` | `%s` | `%s` | %.3f | %.3f..%.3f |\n", framework(axis[id]), label_language(client[id]), label_implementation(client[id]), latency[id], latency_min[id], latency_max[id]
                         } else if (group_axis[group_key] == "server") {
-                            printf "| `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id], source[id]
+                            printf "| `%s` | `%s` | `%s` | %.3f | %.3f..%.3f |\n", framework(axis[id]), label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id]
                         } else {
-                            printf "| `%s` | `%s` | `%s` | `%s` | %.3f | %.3f..%.3f | `%s` |\n", label_language(client[id]), label_implementation(client[id]), label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id], source[id]
+                            printf "| `%s` | `%s` | `%s` | `%s` | `%s` | %.3f | %.3f..%.3f |\n", framework(axis[id]), label_language(client[id]), label_implementation(client[id]), label_language(server[id]), label_implementation(server[id]), latency[id], latency_min[id], latency_max[id]
                         }
                     }
                 }
@@ -391,11 +404,14 @@ EOF
 
 Failed or timed-out samples are omitted from the aggregate result tables above.
 
-| Axis | Run | Client language | Client implementation | Server language | Server implementation | Status | Raw output |
-| --- | ---: | --- | --- | --- | --- | ---: | --- |
+| Axis | Framework | Run | Client language | Client implementation | Server language | Server implementation | Status | Raw output |
+| --- | --- | ---: | --- | --- | --- | --- | ---: | --- |
 EOF
 
             awk -F, -v root_prefix="$ROOT/" '
+            function framework(value) {
+                return value == "grpc" ? "gRPC" : "trevRPC"
+            }
             function label_language(value) {
                 if (value == "grpc_go") {
                     return "go"
@@ -407,6 +423,9 @@ EOF
                 if (value == "grpc_go") {
                     return "grpc"
                 }
+                if (value == "go_quic") {
+                    return "quic-go"
+                }
                 split(value, parts, "_")
                 return substr(value, length(parts[1]) + 2)
             }
@@ -415,7 +434,7 @@ EOF
                 if (index(raw_file, root_prefix) == 1) {
                     raw_file = substr(raw_file, length(root_prefix) + 1)
                 }
-                printf "| `%s` | %s | `%s` | `%s` | `%s` | `%s` | %s | `%s` |\n", $1, $2, label_language($3), label_implementation($3), label_language($4), label_implementation($4), $6, raw_file
+                printf "| `%s` | `%s` | %s | `%s` | `%s` | `%s` | `%s` | %s | `%s` |\n", $1, framework($1), $2, label_language($3), label_implementation($3), label_language($4), label_implementation($4), $6, raw_file
             }' "$FAILURES_CSV"
         fi
 
@@ -431,7 +450,7 @@ Latency rows measure one RPC operation. Stream latency rows use one request and 
 
 Latency tables are sorted by median latency ascending. Throughput tables are sorted by median message throughput descending.
 
-The \`grpc\` axis benchmarks a Go gRPC client and Go gRPC server split into separate processes over TCP. It is a baseline only and is not transport-compatible with the TrevRPC transport rows.
+Rows with framework \`gRPC\` benchmark a Go gRPC client and Go gRPC server split into separate processes over TCP. They are included in both client and server tables as a baseline only and are not transport-compatible with the TrevRPC transport rows.
 
 Raw command output is saved under \`$RAW_DIR\`. Per-measurement normalized rows are saved in \`$SAMPLES_CSV\`. The exact commands are saved in \`$COMMAND_LOG\`.
 EOF
