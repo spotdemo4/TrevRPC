@@ -399,21 +399,43 @@ function validateResponse(response, maxBodySize) {
 
 async function* responseMessageStream(frameStream, responseType, options, deadlineAt, abortScope) {
   const iterator = frameStream[Symbol.asyncIterator]();
-  let messages = 0;
-  let streamBodySize = 0;
+  const useBodyBatches = typeof iterator.nextBodyBatch === "function";
+  const counters = { messages: 0, streamBodySize: 0 };
   let complete = false;
 
   try {
     for (;;) {
-      const result = await nextFrameBatchWithTimeout(
-        iterator,
-        deadlineAt,
-        options.streamIdleTimeoutMs,
-        options.signal,
-        abortScope?.abort,
-      );
+      const result = useBodyBatches
+        ? await nextBodyBatchWithTimeout(
+            iterator,
+            deadlineAt,
+            options.streamIdleTimeoutMs,
+            options.signal,
+            abortScope?.abort,
+          )
+        : await nextFrameBatchWithTimeout(
+            iterator,
+            deadlineAt,
+            options.streamIdleTimeoutMs,
+            options.signal,
+            abortScope?.abort,
+          );
       if (result.done) {
         throw internal("response stream ended before final status");
+      }
+
+      if (useBodyBatches) {
+        const batch = result.value;
+        for (const body of batch.bodies) {
+          validateResponseMessageBody(body, options, counters);
+          yield unmarshalMessage(responseType, body);
+        }
+        if (batch.status != null) {
+          complete = true;
+          await finishResponseStatus(iterator, batch.status, abortScope);
+          return;
+        }
+        continue;
       }
 
       for (const frame of result.value) {
@@ -424,59 +446,14 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
         switch (frame.kind) {
           case RpcStreamFrameKind.Message: {
             const body = frame.body ?? new Uint8Array(0);
-            if (options.maxResponseMessages >= 0 && messages >= options.maxResponseMessages) {
-              throw resourceExhausted(
-                `response stream exceeded maximum of ${options.maxResponseMessages} messages`,
-              );
-            }
-
-            if (body.byteLength > options.maxResponseBodySize) {
-              throw new FrameTooLargeError(body.byteLength, options.maxResponseBodySize);
-            }
-
-            messages += 1;
-            streamBodySize = saturatingAdd(streamBodySize, body.byteLength);
-            if (
-              options.maxResponseStreamBodySize >= 0 &&
-              streamBodySize > options.maxResponseStreamBodySize
-            ) {
-              throw resourceExhausted(
-                `response stream exceeded maximum body size of ${options.maxResponseStreamBodySize} bytes`,
-              );
-            }
-
+            validateResponseMessageBody(body, options, counters);
             yield unmarshalMessage(responseType, body);
             break;
           }
           case RpcStreamFrameKind.Status: {
             complete = true;
-            validateResponseMetadata(frame.metadata ?? {});
-            abortScope?.abort(cancelled("response stream completed"));
-            let cleanupError;
-            if (typeof iterator.return === "function") {
-              try {
-                await iterator.return();
-              } catch (error) {
-                cleanupError = error;
-              }
-            }
-            const status = {
-              code: frame.status ?? Code.Ok,
-              statusMessage: frame.message ?? "",
-              metadata: frame.metadata ?? {},
-            };
-            if (status.code === Code.Ok) {
-              if (cleanupError != null) {
-                throw cleanupError;
-              }
-              return;
-            }
-
-            throw statusFromResponse({
-              status: status.code,
-              message: status.statusMessage,
-              metadata: status.metadata,
-            });
+            await finishResponseStatus(iterator, frame, abortScope);
+            return;
           }
           default:
             throw invalidArgument("response stream contained an unknown frame kind");
@@ -492,6 +469,67 @@ async function* responseMessageStream(frameStream, responseType, options, deadli
     }
     abortScope?.cleanup();
   }
+}
+
+function validateResponseMessageBody(body, options, counters) {
+  if (options.maxResponseMessages >= 0 && counters.messages >= options.maxResponseMessages) {
+    throw resourceExhausted(
+      `response stream exceeded maximum of ${options.maxResponseMessages} messages`,
+    );
+  }
+
+  if (body.byteLength > options.maxResponseBodySize) {
+    throw new FrameTooLargeError(body.byteLength, options.maxResponseBodySize);
+  }
+
+  counters.messages += 1;
+  counters.streamBodySize = saturatingAdd(counters.streamBodySize, body.byteLength);
+  if (
+    options.maxResponseStreamBodySize >= 0 &&
+    counters.streamBodySize > options.maxResponseStreamBodySize
+  ) {
+    throw resourceExhausted(
+      `response stream exceeded maximum body size of ${options.maxResponseStreamBodySize} bytes`,
+    );
+  }
+}
+
+async function finishResponseStatus(iterator, frame, abortScope) {
+  validateResponseMetadata(frame.metadata ?? {});
+  abortScope?.abort(cancelled("response stream completed"));
+  let cleanupError;
+  if (typeof iterator.return === "function") {
+    try {
+      await iterator.return();
+    } catch (error) {
+      cleanupError = error;
+    }
+  }
+  const status = {
+    code: frame.status ?? Code.Ok,
+    statusMessage: frame.message ?? "",
+    metadata: frame.metadata ?? {},
+  };
+  if (status.code === Code.Ok) {
+    if (cleanupError != null) {
+      throw cleanupError;
+    }
+    return;
+  }
+
+  throw statusFromResponse({
+    status: status.code,
+    message: status.statusMessage,
+    metadata: status.metadata,
+  });
+}
+
+async function nextBodyBatchWithTimeout(iterator, deadlineAt, idleTimeoutMs, signal, onTimeout) {
+  const timeout = nextTimeout(deadlineAt, idleTimeoutMs);
+  const promise = iterator.nextBodyBatch();
+  return timeout == null
+    ? await withTimeout(promise, null, null, null, signal)
+    : await withTimeout(promise, timeout.ms, () => timeout.error, onTimeout, signal);
 }
 
 async function nextFrameBatchWithTimeout(iterator, deadlineAt, idleTimeoutMs, signal, onTimeout) {

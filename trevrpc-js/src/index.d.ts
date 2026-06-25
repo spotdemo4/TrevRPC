@@ -226,6 +226,13 @@ export class FrameReader {
     maxBatch?: number,
     maxFrameSize?: number,
   ): Promise<RpcStreamFrameMessage[] | null>;
+  /** Reads stream message body batches, with at most one terminal status. */
+  readStreamMessageBodyBatchOrEOF(
+    maxBatch?: number,
+    maxFrameSize?: number,
+  ): Promise<{ bodies: Uint8Array[]; status: RpcStreamFrameMessage | null } | null>;
+  /** Reads one raw frame body, or returns null when already at EOF. */
+  readRawFrameBodyOrEOF(maxFrameSize?: number): Promise<Uint8Array | null>;
   /** Reads exactly size bytes from the underlying reader. */
   readExact(size: number, allowEofAtStart: boolean): Promise<Uint8Array | null>;
   /** Reads a complete buffered frame body without waiting, or undefined. */

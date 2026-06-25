@@ -216,6 +216,53 @@ test("frame reader drains buffered stream frame batches", async () => {
   );
 });
 
+test("frame reader reads stream message body batches without frame objects", async () => {
+  const bodies = [new Uint8Array([1]), new Uint8Array([2]), new Uint8Array([3])];
+  const status = encodeFrame(
+    RpcStreamFrame,
+    RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok, metadata: {} }),
+  );
+  const wire = concatBytes([encodeMessageStreamFrames(bodies), status]);
+  const reader = new FrameReader(fakeReaderFromChunks([wire]));
+
+  const batch = await reader.readStreamMessageBodyBatchOrEOF(8);
+
+  assert.deepEqual(
+    batch.bodies.map((body) => Array.from(body)),
+    [[1], [2], [3]],
+  );
+  assert.equal(batch.status.kind, RpcStreamFrameKind.Status);
+  assert.equal(batch.status.status, Code.Ok);
+});
+
+test("frame reader body batches handle split chunks", async () => {
+  const bodies = [new Uint8Array([1]), new Uint8Array([2, 3]), new Uint8Array([4])];
+  const reader = new FrameReader(
+    fakeReaderFromChunks(chunkBytes(encodeMessageStreamFrames(bodies), 2)),
+  );
+  const decoded = [];
+
+  for (;;) {
+    const batch = await reader.readStreamMessageBodyBatchOrEOF(8);
+    if (batch == null) {
+      break;
+    }
+    decoded.push(...batch.bodies.map((body) => Array.from(body)));
+  }
+
+  assert.deepEqual(decoded, [[1], [2, 3], [4]]);
+});
+
+test("frame reader body batch keeps contiguous message bodies as subarrays", async () => {
+  const frame = encodeMessageStreamFrame(new Uint8Array([1, 2, 3]));
+  const reader = new FrameReader(fakeReaderFromChunks([frame]));
+
+  const batch = await reader.readStreamMessageBodyBatchOrEOF(1);
+
+  assert.equal(batch.bodies[0].buffer, frame.buffer);
+  assert.deepEqual(batch.bodies[0], new Uint8Array([1, 2, 3]));
+});
+
 test("frame reader maps malformed protobuf bodies to invalid argument", async () => {
   for (const body of deterministicByteVectors()) {
     const frame = new Uint8Array(4 + body.byteLength);
@@ -481,6 +528,65 @@ test("response streams consume transport frame batches", async () => {
           returned = true;
         },
       );
+    },
+  };
+
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { streamIdleTimeoutMs: undefined },
+  );
+  const values = [];
+  for await (const reply of stream) {
+    values.push(reply.value);
+  }
+
+  assert.deepEqual(values, ["one", "two"]);
+  assert.equal(returned, true);
+});
+
+test("response streams consume transport body batches", async () => {
+  const Hello = helloTestType();
+  let returned = false;
+  let index = 0;
+  const batches = [
+    {
+      bodies: [marshalMessage(Hello, { value: "one" }), marshalMessage(Hello, { value: "two" })],
+      status: null,
+    },
+    {
+      bodies: [],
+      status: RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok }),
+    },
+  ];
+  const transport = {
+    async streamingCall() {
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              throw new Error("frame next should not be used for body-batched streams");
+            },
+            nextBatch() {
+              throw new Error("frame batches should not be used for body-batched streams");
+            },
+            nextBodyBatch() {
+              if (index >= batches.length) {
+                return Promise.resolve({ done: true, value: undefined });
+              }
+              return Promise.resolve({ done: false, value: batches[index++] });
+            },
+            return() {
+              returned = true;
+              return Promise.resolve({ done: true, value: undefined });
+            },
+          };
+        },
+      };
     },
   };
 

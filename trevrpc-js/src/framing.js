@@ -5,6 +5,7 @@ export const DefaultMaxFrameSize = 4 * 1024 * 1024;
 
 const FrameHeaderLength = 4;
 const StreamFrameBodyTag = (4 << 3) | 2;
+const EmptyBytes = new Uint8Array(0);
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 /** Encodes a protobuf message body. */
@@ -71,6 +72,11 @@ export function encodeMessageStreamFrames(bodies, maxFrameSize = DefaultMaxFrame
   return frames;
 }
 
+/** Encodes each streaming message frame separately for vectored writers. */
+export function encodeMessageStreamFrameParts(bodies, maxFrameSize = DefaultMaxFrameSize) {
+  return Array.from(bodies, (body) => encodeMessageStreamFrame(body, maxFrameSize));
+}
+
 /** Decodes a protobuf message from a TrevRPC frame body. */
 export function decodeFrame(messageType, body) {
   return unmarshalMessage(messageType, body);
@@ -80,7 +86,7 @@ export function decodeFrame(messageType, body) {
 export function decodeStreamFrameBody(body) {
   const bytes = byteView(body);
   if (bytes.byteLength === 0) {
-    return streamFrameMessage(new Uint8Array(0));
+    return streamFrameMessage(EmptyBytes);
   }
 
   const cursor = { offset: 0 };
@@ -136,6 +142,11 @@ export async function writeFrame(writer, messageType, message, maxFrameSize = De
 
 /** Writes multiple streaming message frames in one write. */
 export async function writeMessageStreamFrames(writer, bodies, maxFrameSize = DefaultMaxFrameSize) {
+  if (typeof writer.writev === "function") {
+    await writer.writev(encodeMessageStreamFrameParts(bodies, maxFrameSize));
+    return;
+  }
+
   await writer.write(encodeMessageStreamFrames(bodies, maxFrameSize));
 }
 
@@ -199,6 +210,37 @@ export class FrameReader {
     return frames;
   }
 
+  /** Reads stream message body batches, with at most one terminal status. */
+  async readStreamMessageBodyBatchOrEOF(maxBatch = 32, maxFrameSize = DefaultMaxFrameSize) {
+    const body = await this.readRawFrameBodyOrEOF(maxFrameSize);
+    if (body == null) {
+      return null;
+    }
+
+    const limit = Math.max(1, Math.floor(maxBatch));
+    const result = { bodies: [], status: null };
+    pushStreamBodyOrStatus(result, body);
+    while (result.status == null && result.bodies.length < limit) {
+      const nextBody = this.tryReadFrameBody(maxFrameSize);
+      if (nextBody === undefined) {
+        break;
+      }
+      pushStreamBodyOrStatus(result, nextBody);
+    }
+
+    return result;
+  }
+
+  /** Reads one raw frame body, or returns null when already at EOF. */
+  async readRawFrameBodyOrEOF(maxFrameSize = DefaultMaxFrameSize) {
+    const header = await this.readExact(FrameHeaderLength, true);
+    if (header == null) {
+      return null;
+    }
+
+    return this.readExact(frameBodyLength(header, maxFrameSize), false);
+  }
+
   /** Reads a complete buffered frame body without waiting, or undefined. */
   tryReadFrameBody(maxFrameSize = DefaultMaxFrameSize) {
     if (this.buffered < FrameHeaderLength) {
@@ -218,7 +260,7 @@ export class FrameReader {
   /** Reads exactly size bytes from the underlying reader. */
   async readExact(size, allowEofAtStart) {
     if (size === 0) {
-      return new Uint8Array(0);
+      return EmptyBytes;
     }
 
     while (this.buffered < size) {
@@ -245,6 +287,22 @@ export class FrameReader {
 
   /** Removes size bytes from the buffered data. */
   consume(size) {
+    if (size === 0) {
+      return EmptyBytes;
+    }
+
+    const first = this.chunks[0];
+    if (first != null && first.byteLength >= size) {
+      const result = first.subarray(0, size);
+      if (first.byteLength === size) {
+        this.chunks.shift();
+      } else {
+        this.chunks[0] = first.subarray(size);
+      }
+      this.buffered -= size;
+      return result;
+    }
+
     const result = new Uint8Array(size);
     let offset = 0;
 
@@ -268,6 +326,15 @@ export class FrameReader {
 
   /** Copies size bytes from the buffered data without removing them. */
   peek(size) {
+    if (size === 0) {
+      return EmptyBytes;
+    }
+
+    const first = this.chunks[0];
+    if (first != null && first.byteLength >= size) {
+      return first.subarray(0, size);
+    }
+
     const result = new Uint8Array(size);
     let offset = 0;
 
@@ -282,6 +349,45 @@ export class FrameReader {
 
     return result;
   }
+}
+
+function pushStreamBodyOrStatus(result, body) {
+  const messageBody = tryDecodeStreamMessageBody(body);
+  if (messageBody !== undefined) {
+    result.bodies.push(messageBody);
+    return;
+  }
+
+  const frame = decodeStreamFrameBody(body);
+  switch (frame.kind) {
+    case RpcStreamFrameKind.Message:
+      result.bodies.push(frame.body ?? EmptyBytes);
+      break;
+    case RpcStreamFrameKind.Status:
+      result.status = frame;
+      break;
+    default:
+      throw invalidArgument("stream frame contained an unknown frame kind");
+  }
+}
+
+function tryDecodeStreamMessageBody(body) {
+  const bytes = byteView(body);
+  if (bytes.byteLength === 0) {
+    return EmptyBytes;
+  }
+
+  if (bytes[0] !== StreamFrameBodyTag) {
+    return undefined;
+  }
+
+  const cursor = { offset: 1 };
+  const length = consumeVarint(bytes, cursor, "invalid stream frame body");
+  const end = cursor.offset + length;
+  if (end !== bytes.byteLength) {
+    return undefined;
+  }
+  return bytes.subarray(cursor.offset, end);
 }
 
 /** Decodes and validates the body length stored in a TrevRPC frame header. */

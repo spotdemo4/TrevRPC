@@ -1,8 +1,8 @@
 import {
   DefaultMaxFrameSize,
   FrameReader,
-  encodeMessageStreamFrames,
   writeFrame,
+  writeMessageStreamFrames,
 } from "./framing.js";
 import { Code, statusFromTransportError, unavailable } from "./status.js";
 import { RpcRequest, RpcResponse, RpcStreamFrameKind } from "./wire.js";
@@ -185,6 +185,7 @@ class WebTransportResponseFrameStream {
     this.maxFrameSize = maxFrameSize;
     this.readBatchMaxMessages = readBatchMaxMessages;
     this.frameQueue = [];
+    this.pendingStatus = null;
     this.done = false;
     this.writerError = null;
     this.writerSettled = false;
@@ -253,11 +254,43 @@ class WebTransportResponseFrameStream {
     }
   }
 
+  async nextBodyBatch(max = this.readBatchMaxMessages) {
+    if (this.done) {
+      return { done: true, value: undefined };
+    }
+
+    try {
+      if (this.pendingStatus != null) {
+        const status = this.pendingStatus;
+        this.pendingStatus = null;
+        await this.finishStatus(status);
+        return { done: false, value: { bodies: [], status } };
+      }
+
+      const batch = await this.frameReader.readStreamMessageBodyBatchOrEOF(max, this.maxFrameSize);
+      if (batch == null) {
+        return await this.finishEof();
+      }
+      if (batch.status != null && batch.bodies.length > 0) {
+        this.pendingStatus = batch.status;
+        return { done: false, value: { bodies: batch.bodies, status: null } };
+      }
+      if (batch.status != null) {
+        await this.finishStatus(batch.status);
+      }
+      return { done: false, value: batch };
+    } catch (error) {
+      this.done = true;
+      throw statusFromTransportError(error);
+    }
+  }
+
   async return() {
     if (this.returnDone == null) {
       this.done = true;
       this.returnDone = (async () => {
         this.frameQueue.length = 0;
+        this.pendingStatus = null;
         await cancelReader(this.reader);
         await abortWriter(this.writer);
         releaseLock(this.reader);
@@ -446,7 +479,7 @@ async function writeStreamingRequest(
         break;
       }
       for (const bodies of splitBodyBatches(result.value, batchMaxBytes)) {
-        await writer.write(encodeMessageStreamFrames(bodies, maxFrameSize));
+        await writeMessageStreamFrames(writer, bodies, maxFrameSize);
       }
     }
     await writer.close();
