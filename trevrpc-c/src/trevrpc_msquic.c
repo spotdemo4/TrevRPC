@@ -852,7 +852,14 @@ static int trevrpc_msquic_configure_endpoint_with_alpns(const trevrpc_msquic_con
         credential.Flags = QUIC_CREDENTIAL_FLAG_NONE;
     } else {
         credential.Type = QUIC_CREDENTIAL_TYPE_NONE;
-        credential.Flags = QUIC_CREDENTIAL_FLAG_CLIENT | QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
+        credential.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
+        if (config->skip_certificate_validation) {
+            credential.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
+        }
+        if (config->ca_cert_file != NULL) {
+            credential.Flags |= QUIC_CREDENTIAL_FLAG_SET_CA_CERTIFICATE_FILE;
+            credential.CaCertificateFile = config->ca_cert_file;
+        }
     }
 
     status = TrevMsQuic->ConfigurationLoadCredential(*configuration, &credential);

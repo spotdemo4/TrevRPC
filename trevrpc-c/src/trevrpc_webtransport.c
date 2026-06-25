@@ -63,6 +63,8 @@ struct trevrpc_wt_listener {
     trevrpc_msquic_listener* msquic_listener;
     char* path;
     char* origin;
+    trevrpc_webtransport_admission admission;
+    void* admission_user_data;
 };
 
 struct trevrpc_wt_session {
@@ -103,10 +105,15 @@ typedef struct trevrpc_wt_headers {
 typedef int (*trevrpc_wt_headers_validate_fn)(const trevrpc_wt_headers* headers, void* context);
 
 typedef struct trevrpc_wt_accept_connect_context {
-    const char* expected_path;
-    const char* expected_origin;
+    trevrpc_webtransport_admission admission;
+    void* admission_user_data;
     trevrpc_wt_draft draft;
 } trevrpc_wt_accept_connect_context;
+
+typedef struct trevrpc_wt_path_origin_policy {
+    const char* path;
+    const char* origin;
+} trevrpc_wt_path_origin_policy;
 
 typedef struct trevrpc_wt_connect_response_context {
     trevrpc_wt_draft draft;
@@ -118,6 +125,8 @@ static trevrpc_msquic_config trevrpc_wt_msquic_config(const trevrpc_wt_config* c
     msquic_config.alpn_len = sizeof(TREV_WT_H3_ALPN) - 1;
     msquic_config.cert_file = config->cert_file;
     msquic_config.key_file = config->key_file;
+    msquic_config.ca_cert_file = config->ca_cert_file;
+    msquic_config.skip_certificate_validation = config->skip_certificate_validation;
     msquic_config.max_idle_timeout_ms = config->idle_timeout_ms;
     msquic_config.peer_bidi_stream_count =
         config->max_streams_per_session > 0 ? (uint16_t)config->max_streams_per_session : TREV_WT_DEFAULT_STREAMS;
@@ -1375,6 +1384,22 @@ static bool trevrpc_wt_connect_protocol_matches(const trevrpc_wt_headers* header
     }
 }
 
+static int trevrpc_wt_path_origin_admission(void* user_data, const trevrpc_webtransport_admission_request* request) {
+    const trevrpc_wt_path_origin_policy* policy = user_data;
+    if (policy == NULL || request == NULL) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    if (policy->path != NULL &&
+        (strlen(policy->path) != request->path_len || memcmp(policy->path, request->path, request->path_len) != 0)) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    if (policy->origin != NULL && (request->origin == NULL || strlen(policy->origin) != request->origin_len ||
+                                      memcmp(policy->origin, request->origin, request->origin_len) != 0)) {
+        return TREV_WT_ERR_REJECTED;
+    }
+    return 0;
+}
+
 static int trevrpc_wt_validate_connect_request(const trevrpc_wt_headers* headers, void* context) {
     trevrpc_wt_accept_connect_context* accept_context = context;
     if (!headers->method_connect || !trevrpc_wt_connect_protocol_matches(headers, accept_context->draft) ||
@@ -1384,14 +1409,17 @@ static int trevrpc_wt_validate_connect_request(const trevrpc_wt_headers* headers
     if (accept_context->draft == TREV_WT_DRAFT_02 && !headers->draft02_request) {
         return TREV_WT_ERR_REJECTED;
     }
-    if (accept_context->expected_path != NULL &&
-        (strlen(accept_context->expected_path) != headers->path_len ||
-            memcmp(accept_context->expected_path, headers->path, headers->path_len) != 0)) {
-        return TREV_WT_ERR_REJECTED;
-    }
-    if (accept_context->expected_origin != NULL &&
-        (strlen(accept_context->expected_origin) != headers->origin_len ||
-            memcmp(accept_context->expected_origin, headers->origin, headers->origin_len) != 0)) {
+    trevrpc_webtransport_admission_request request = {
+        .path = (const char*)headers->path,
+        .path_len = headers->path_len,
+        .authority = (const char*)headers->authority,
+        .authority_len = headers->authority_len,
+        .origin = (const char*)headers->origin,
+        .origin_len = headers->origin_len,
+        .secure = 1,
+    };
+    if (accept_context->admission != NULL &&
+        accept_context->admission(accept_context->admission_user_data, &request) != 0) {
         return TREV_WT_ERR_REJECTED;
     }
     return 0;
@@ -1457,8 +1485,7 @@ static int trevrpc_wt_open_connect_stream(trevrpc_wt_session* session, const tre
     return 0;
 }
 
-static int trevrpc_wt_accept_connect_stream(
-    trevrpc_wt_session* session, const char* expected_path, const char* expected_origin) {
+static int trevrpc_wt_accept_connect_stream(trevrpc_wt_session* session, const trevrpc_wt_config* config) {
     trevrpc_msquic_stream* stream = NULL;
     int err = trevrpc_wt_accept_peer_bidirectional_stream(session, &stream);
     if (err != 0) {
@@ -1470,9 +1497,14 @@ static int trevrpc_wt_accept_connect_stream(
         return err;
     }
 
+    trevrpc_wt_path_origin_policy path_origin_policy = {
+        .path = config == NULL ? NULL : config->path,
+        .origin = config == NULL ? NULL : config->origin,
+    };
     trevrpc_wt_accept_connect_context context = {
-        .expected_path = expected_path,
-        .expected_origin = expected_origin,
+        .admission = config != NULL && config->admission != NULL ? config->admission : trevrpc_wt_path_origin_admission,
+        .admission_user_data =
+            config != NULL && config->admission != NULL ? config->admission_user_data : &path_origin_policy,
         .draft = session->draft,
     };
     err = trevrpc_wt_read_headers_frame(stream, trevrpc_wt_validate_connect_request, &context);
@@ -1704,6 +1736,8 @@ int trevrpc_wt_listen(const trevrpc_wt_config* config, trevrpc_wt_listener** out
         free(listener);
         return -ENOMEM;
     }
+    listener->admission = config->admission;
+    listener->admission_user_data = config->admission_user_data;
 
     trevrpc_msquic_config msquic_config = trevrpc_wt_msquic_config(config);
     int err = trevrpc_msquic_listen(config->host, config->port, &msquic_config, &listener->msquic_listener);
@@ -1733,6 +1767,8 @@ int trevrpc_wt_listener_accept_session(trevrpc_wt_listener* listener, trevrpc_wt
     trevrpc_wt_config config = {
         .path = listener->path,
         .origin = listener->origin,
+        .admission = listener->admission,
+        .admission_user_data = listener->admission_user_data,
     };
     return trevrpc_wt_accept_session_from_msquic(conn, &config, out_session);
 }
@@ -1755,7 +1791,7 @@ int trevrpc_wt_accept_session_from_msquic(
         trevrpc_wt_session_close(session);
         return err;
     }
-    err = trevrpc_wt_accept_connect_stream(session, config->path, config->origin);
+    err = trevrpc_wt_accept_connect_stream(session, config);
     if (err != 0) {
         trevrpc_wt_session_close(session);
         return err;
@@ -1937,6 +1973,20 @@ intptr_t trevrpc_wt_stream_read_frame(trevrpc_wt_stream* stream, uint8_t** body,
         return TREV_WT_ERR_CLOSED;
     }
     intptr_t n = trevrpc_msquic_stream_read_frame(stream->msquic_stream, body, len, max_len);
+    return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
+}
+
+intptr_t trevrpc_wt_stream_read_frame_timeout(
+    trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos) {
+    if (stream == NULL || body == NULL || len == NULL) {
+        return -EINVAL;
+    }
+    *body = NULL;
+    *len = 0;
+    if (stream->msquic_stream == NULL) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    intptr_t n = trevrpc_msquic_stream_read_frame_timeout(stream->msquic_stream, body, len, max_len, timeout_nanos);
     return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
 }
 

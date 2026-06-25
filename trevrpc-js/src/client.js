@@ -51,6 +51,21 @@ export async function unary(
   request,
   options = {},
 ) {
+  return (
+    await unaryWithResponse(transport, service, method, requestType, responseType, request, options)
+  ).message;
+}
+
+/** Calls a unary RPC and returns the decoded response envelope. */
+export async function unaryWithResponse(
+  transport,
+  service,
+  method,
+  requestType,
+  responseType,
+  request,
+  options = {},
+) {
   const callOptions = mergeCallOptions(options);
   const abortScope = callAbortScope(callOptions);
   const requestBody = marshalMessage(requestType, request);
@@ -72,7 +87,10 @@ export async function unary(
     );
 
     validateResponse(response, callOptions.maxResponseBodySize);
-    return unmarshalMessage(responseType, response.body ?? new Uint8Array(0));
+    return {
+      message: unmarshalMessage(responseType, response.body ?? new Uint8Array(0)),
+      metadata: response.metadata ?? {},
+    };
   } finally {
     abortScope.cleanup();
   }
@@ -235,6 +253,12 @@ export class ClientStreamingCall {
     return await readUnaryResponseFromStream(this._responses);
   }
 
+  /** Closes the request stream and returns the final response envelope. */
+  async closeAndRecvWithResponse() {
+    this._requests.close();
+    return await readUnaryResponseEnvelopeFromStream(this._responses);
+  }
+
   /** Releases call resources without waiting for the response. */
   async close() {
     this._requests.close(cancelled("request stream cancelled"));
@@ -247,6 +271,7 @@ export class ClientStreamingCall {
 export class BidirectionalStreamingCall {
   constructor(requests, responses) {
     this._requests = requests;
+    this.status = responses.status;
     this._iterator = responses[Symbol.asyncIterator]();
   }
 
@@ -305,6 +330,16 @@ export function createServiceClient(transport, service, root, options = {}) {
       case "unary":
         client[jsName] = (request, override) =>
           unary(
+            transport,
+            service.fullName,
+            method.name,
+            requestType,
+            responseType,
+            request,
+            callOptions(override),
+          );
+        client[`${jsName}WithResponse`] = (request, override) =>
+          unaryWithResponse(
             transport,
             service.fullName,
             method.name,
@@ -397,78 +432,96 @@ function validateResponse(response, maxBodySize) {
   }
 }
 
-async function* responseMessageStream(frameStream, responseType, options, deadlineAt, abortScope) {
+function responseMessageStream(frameStream, responseType, options, deadlineAt, abortScope) {
   const iterator = frameStream[Symbol.asyncIterator]();
   const useBodyBatches = typeof iterator.nextBodyBatch === "function";
-  const counters = { messages: 0, streamBodySize: 0 };
-  let complete = false;
+  let resolveStatus;
+  let rejectStatus;
+  const status = new Promise((resolve, reject) => {
+    resolveStatus = resolve;
+    rejectStatus = reject;
+  });
+  status.catch(() => {});
 
-  try {
-    for (;;) {
-      const result = useBodyBatches
-        ? await nextBodyBatchWithTimeout(
-            iterator,
-            deadlineAt,
-            options.streamIdleTimeoutMs,
-            options.signal,
-            abortScope?.abort,
-          )
-        : await nextFrameBatchWithTimeout(
-            iterator,
-            deadlineAt,
-            options.streamIdleTimeoutMs,
-            options.signal,
-            abortScope?.abort,
-          );
-      if (result.done) {
-        throw internal("response stream ended before final status");
-      }
+  async function* run() {
+    const counters = { messages: 0, streamBodySize: 0 };
+    let complete = false;
 
-      if (useBodyBatches) {
-        const batch = result.value;
-        for (const body of batch.bodies) {
-          validateResponseMessageBody(body, options, counters);
-          yield unmarshalMessage(responseType, body);
-        }
-        if (batch.status != null) {
-          complete = true;
-          await finishResponseStatus(iterator, batch.status, abortScope);
-          return;
-        }
-        continue;
-      }
-
-      for (const frame of result.value) {
-        if (frame == null) {
+    try {
+      for (;;) {
+        const result = useBodyBatches
+          ? await nextBodyBatchWithTimeout(
+              iterator,
+              deadlineAt,
+              options.streamIdleTimeoutMs,
+              options.signal,
+              abortScope?.abort,
+            )
+          : await nextFrameBatchWithTimeout(
+              iterator,
+              deadlineAt,
+              options.streamIdleTimeoutMs,
+              options.signal,
+              abortScope?.abort,
+            );
+        if (result.done) {
           throw internal("response stream ended before final status");
         }
 
-        switch (frame.kind) {
-          case RpcStreamFrameKind.Message: {
-            const body = frame.body ?? new Uint8Array(0);
+        if (useBodyBatches) {
+          const batch = result.value;
+          for (const body of batch.bodies) {
             validateResponseMessageBody(body, options, counters);
             yield unmarshalMessage(responseType, body);
-            break;
           }
-          case RpcStreamFrameKind.Status: {
+          if (batch.status != null) {
             complete = true;
-            await finishResponseStatus(iterator, frame, abortScope);
+            resolveStatus(await finishResponseStatus(iterator, batch.status, abortScope));
             return;
           }
-          default:
-            throw invalidArgument("response stream contained an unknown frame kind");
+          continue;
+        }
+
+        for (const frame of result.value) {
+          if (frame == null) {
+            throw internal("response stream ended before final status");
+          }
+
+          switch (frame.kind) {
+            case RpcStreamFrameKind.Message: {
+              const body = frame.body ?? new Uint8Array(0);
+              validateResponseMessageBody(body, options, counters);
+              yield unmarshalMessage(responseType, body);
+              break;
+            }
+            case RpcStreamFrameKind.Status: {
+              complete = true;
+              resolveStatus(await finishResponseStatus(iterator, frame, abortScope));
+              return;
+            }
+            default:
+              throw invalidArgument("response stream contained an unknown frame kind");
+          }
         }
       }
+    } catch (error) {
+      rejectStatus(error);
+      throw error;
+    } finally {
+      if (!complete) {
+        rejectStatus(cancelled("response stream cancelled"));
+        abortScope?.abort(cancelled("response stream cancelled"));
+      }
+      if (!complete && typeof iterator.return === "function") {
+        await iterator.return();
+      }
+      abortScope?.cleanup();
     }
-  } finally {
-    if (!complete) {
-      abortScope?.abort(cancelled("response stream cancelled"));
-    }
-    if (!complete && typeof iterator.return === "function") {
-      await iterator.return();
-    }
-    abortScope?.cleanup();
   }
+
+  const stream = run();
+  stream.status = status;
+  return stream;
 }
 
 function validateResponseMessageBody(body, options, counters) {
@@ -514,7 +567,7 @@ async function finishResponseStatus(iterator, frame, abortScope) {
     if (cleanupError != null) {
       throw cleanupError;
     }
-    return;
+    return status;
   }
 
   throw statusFromResponse({
@@ -555,6 +608,10 @@ function validateResponseMetadata(metadata) {
 }
 
 async function readUnaryResponseFromStream(stream) {
+  return (await readUnaryResponseEnvelopeFromStream(stream)).message;
+}
+
+async function readUnaryResponseEnvelopeFromStream(stream) {
   const iterator = stream[Symbol.asyncIterator]();
   const first = await iterator.next();
   if (first.done) {
@@ -563,7 +620,8 @@ async function readUnaryResponseFromStream(stream) {
 
   const second = await iterator.next();
   if (second.done) {
-    return first.value;
+    const status = stream.status == null ? { metadata: {} } : await stream.status;
+    return { message: first.value, metadata: status.metadata ?? {} };
   }
 
   if (typeof iterator.return === "function") {

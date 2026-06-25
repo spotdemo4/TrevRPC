@@ -26,6 +26,8 @@ typedef struct trevrpc_msquic_config {
     uint32_t alpn_len;
     const char* cert_file;
     const char* key_file;
+    const char* ca_cert_file;
+    int skip_certificate_validation;
     uint64_t max_idle_timeout_ms;
     uint32_t keep_alive_ms;
     uint16_t peer_bidi_stream_count;

@@ -59,6 +59,7 @@ fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn compile_generated_service(content: &str) -> Result<(), Box<dyn Error>> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.join("../..").canonicalize()?;
@@ -108,6 +109,7 @@ struct Service;
 impl Greeter for Service {
     async fn say_hello(
         &self,
+        _context: trevrpc::server::RequestContext,
         request: HelloRequest,
     ) -> core::result::Result<HelloReply, trevrpc::Status> {
         Ok(HelloReply { message: request.name })
@@ -115,6 +117,7 @@ impl Greeter for Service {
 
     async fn lots_of_replies(
         &self,
+        _context: trevrpc::server::RequestContext,
         request: HelloRequest,
     ) -> core::result::Result<trevrpc::BoxMessageStream<HelloReply>, trevrpc::Status> {
         Ok(trevrpc::stream::from_iter([HelloReply { message: request.name }]))
@@ -122,6 +125,7 @@ impl Greeter for Service {
 
     async fn lots_of_greetings(
         &self,
+        _context: trevrpc::server::RequestContext,
         mut requests: trevrpc::BoxMessageStream<HelloRequest>,
     ) -> core::result::Result<HelloReply, trevrpc::Status> {
         let mut names = Vec::new();
@@ -135,6 +139,7 @@ impl Greeter for Service {
 
     async fn bidi_hello(
         &self,
+        _context: trevrpc::server::RequestContext,
         requests: trevrpc::BoxMessageStream<HelloRequest>,
     ) -> core::result::Result<trevrpc::BoxMessageStream<HelloReply>, trevrpc::Status> {
         Ok(Box::new(BidiReplies { requests }))

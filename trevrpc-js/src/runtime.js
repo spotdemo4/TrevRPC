@@ -61,4 +61,5 @@ export {
   mergeCallOptions,
   serverStreaming,
   unary,
+  unaryWithResponse,
 } from "./client.js";

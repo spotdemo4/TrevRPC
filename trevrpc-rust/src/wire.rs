@@ -228,7 +228,8 @@ impl RpcStreamFrame {
     /// Creates a terminal status frame without metadata.
     #[must_use]
     pub fn status(status: crate::Status) -> Self {
-        Self::status_with_metadata(status, Metadata::new())
+        let metadata = status.metadata().clone();
+        Self::status_with_metadata(status, metadata)
     }
 
     /// Creates a terminal status frame with metadata.
@@ -255,6 +256,7 @@ impl RpcStreamFrame {
     #[must_use]
     pub fn status_value(&self) -> crate::Status {
         crate::Status::new(crate::Code::from_u32(self.status), self.message.clone())
+            .with_metadata(self.metadata.clone())
     }
 }
 

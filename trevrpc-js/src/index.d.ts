@@ -276,6 +276,21 @@ export interface Transport {
   ): Promise<AsyncIterable<RpcStreamFrameMessage>>;
 }
 
+export interface UnaryResponse<TResponse> {
+  message: TResponse;
+  metadata: Metadata;
+}
+
+export interface StreamStatus {
+  code: StatusCode;
+  message: string;
+  metadata: Metadata;
+}
+
+export interface ResponseAsyncIterable<TResponse> extends AsyncIterable<TResponse> {
+  status: Promise<StreamStatus>;
+}
+
 export interface ClientStreamingCall<TRequest extends object, TResponse> {
   /** Sends one request message. */
   send(request: TRequest): Promise<void>;
@@ -285,6 +300,8 @@ export interface ClientStreamingCall<TRequest extends object, TResponse> {
   closeSend(): Promise<void>;
   /** Closes the request stream and returns the final response. */
   closeAndRecv(): Promise<TResponse>;
+  /** Closes the request stream and returns the final response envelope. */
+  closeAndRecvWithResponse(): Promise<UnaryResponse<TResponse>>;
   /** Releases call resources without waiting for the response. */
   close(): Promise<void>;
 }
@@ -293,6 +310,8 @@ export interface BidirectionalStreamingCall<
   TRequest extends object,
   TResponse,
 > extends AsyncIterable<TResponse> {
+  /** Resolves to the terminal stream status after completion. */
+  status: Promise<StreamStatus>;
   /** Sends one request message. */
   send(request: TRequest): Promise<void>;
   /** Sends multiple request messages. */
@@ -327,6 +346,19 @@ export function unary<
   request: TRequest,
   options?: CallOptions,
 ): Promise<TResponse>;
+/** Calls a unary RPC and returns the decoded response envelope. */
+export function unaryWithResponse<
+  TRequest extends object = Record<string, unknown>,
+  TResponse = Message<Record<string, unknown>>,
+>(
+  transport: Transport,
+  service: string,
+  method: string,
+  requestType: Type,
+  responseType: Type,
+  request: TRequest,
+  options?: CallOptions,
+): Promise<UnaryResponse<TResponse>>;
 /** Calls a server-streaming RPC and returns a decoded response stream. */
 export function serverStreaming<
   TRequest extends object = Record<string, unknown>,
@@ -339,7 +371,7 @@ export function serverStreaming<
   responseType: Type,
   request: TRequest,
   options?: CallOptions,
-): Promise<AsyncIterable<TResponse>>;
+): Promise<ResponseAsyncIterable<TResponse>>;
 /** Calls a client-streaming RPC and returns a sendable call object. */
 export function clientStreaming<
   TRequest extends object = Record<string, unknown>,

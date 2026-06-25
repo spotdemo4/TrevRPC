@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::RpcResponse;
+use crate::{Metadata, RpcResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Code {
@@ -77,6 +77,7 @@ impl Code {
 pub struct Status {
     code: Code,
     message: String,
+    metadata: Metadata,
 }
 
 impl Status {
@@ -86,6 +87,7 @@ impl Status {
         Self {
             code,
             message: message.into(),
+            metadata: Metadata::new(),
         }
     }
 
@@ -167,6 +169,19 @@ impl Status {
         &self.message
     }
 
+    /// Returns terminal or response metadata carried by this status.
+    #[must_use]
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Attaches metadata to this status.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
     /// Splits the status into its code and message.
     #[must_use]
     pub fn into_parts(self) -> (Code, String) {
@@ -182,7 +197,8 @@ impl Status {
     /// Converts the status and response body into an RPC response.
     #[must_use]
     pub fn into_response(self, body: Vec<u8>) -> RpcResponse {
-        self.into_response_with_metadata(body, crate::Metadata::new())
+        let metadata = self.metadata.clone();
+        self.into_response_with_metadata(body, metadata)
     }
 
     /// Converts the status, response body, and metadata into an RPC response.
@@ -200,10 +216,11 @@ impl Status {
         }
     }
 
-    /// Builds a status from an RPC response status code and message.
+    /// Builds a status from an RPC response status code, message, and metadata.
     #[must_use]
     pub fn from_response(response: &RpcResponse) -> Self {
         Self::new(Code::from_u32(response.status), response.message.clone())
+            .with_metadata(response.metadata.clone())
     }
 }
 

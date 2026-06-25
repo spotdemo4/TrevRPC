@@ -17,6 +17,12 @@ type Transport interface {
 	StreamingCall(context.Context, *RpcRequest, ByteStream) (FrameStream, error)
 }
 
+// ResponseStream yields decoded messages and exposes the terminal stream status.
+type ResponseStream[T ProtoMessage] interface {
+	MessageStream[T]
+	TerminalStatus() (*Status, bool)
+}
+
 // ClientStreamingCall sends request messages and receives the final response.
 type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	// Send sends one request message.
@@ -153,22 +159,30 @@ func WithMetadataMap(metadata Metadata) CallOption {
 
 // Unary calls a unary RPC and decodes the protobuf response.
 func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (Res, error) {
-	callOptions := applyCallOptions(options)
-	if err := ValidateMetadata(callOptions.Metadata); err != nil {
+	response, err := UnaryResponse(ctx, transport, service, method, request, newResponse, options...)
+	if err != nil {
 		var zero Res
 		return zero, err
+	}
+
+	return response.Message, nil
+}
+
+// UnaryResponse calls a unary RPC and returns the decoded response envelope.
+func UnaryResponse[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (*Response[Res], error) {
+	callOptions := applyCallOptions(options)
+	if err := ValidateMetadata(callOptions.Metadata); err != nil {
+		return nil, err
 	}
 
 	requestBody, err := MarshalMessage(request)
 	if err != nil {
-		var zero Res
-		return zero, err
+		return nil, err
 	}
 
 	rpcRequest, err := prepareClientRequest(service, method, RpcKindUnary, requestBody, callOptions)
 	if err != nil {
-		var zero Res
-		return zero, err
+		return nil, err
 	}
 
 	ctx, cancel := callContextWithoutLocalCancel(ctx, callOptions)
@@ -176,26 +190,28 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 
 	response, err := transport.Call(ctx, rpcRequest)
 	if err != nil {
-		var zero Res
-		return zero, err
+		return nil, err
 	}
 
 	if err := validateResponse(response, callOptions.MaxResponseBodySize); err != nil {
-		var zero Res
-		return zero, err
+		return nil, err
 	}
 
 	message := newResponse()
 	if err := UnmarshalMessage(response.Body, message); err != nil {
-		var zero Res
-		return zero, err
+		return nil, err
 	}
 
-	return message, nil
+	return &Response[Res]{Message: message, Metadata: cloneMetadata(response.Metadata)}, nil
 }
 
 // ServerStreaming calls a server-streaming RPC and returns a decoded response stream.
 func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
+	return ServerStreamingResponse(ctx, transport, service, method, request, newResponse, options...)
+}
+
+// ServerStreamingResponse calls a server-streaming RPC and returns an envelope-aware response stream.
+func ServerStreamingResponse[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (ResponseStream[Res], error) {
 	callOptions := applyCallOptions(options)
 	requestBody, err := MarshalMessage(request)
 	if err != nil {
@@ -446,9 +462,10 @@ type responseMessageStream[T ProtoMessage] struct {
 	messages       int
 	streamBodySize int
 	done           bool
+	terminalStatus *Status
 }
 
-func newResponseMessageStream[T ProtoMessage](inner FrameStream, newMessage func() T, options CallOptions, ctx context.Context, cancel context.CancelFunc) MessageStream[T] {
+func newResponseMessageStream[T ProtoMessage](inner FrameStream, newMessage func() T, options CallOptions, ctx context.Context, cancel context.CancelFunc) *responseMessageStream[T] {
 	return &responseMessageStream[T]{inner: inner, newMessage: newMessage, options: options, ctx: ctx, cancel: cancel}
 }
 
@@ -511,6 +528,7 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		cleanupErr := s.finish()
 
 		status := frame.statusValue()
+		s.terminalStatus = status
 		if status.IsOK() {
 			if cleanupErr != nil {
 				var zero T
@@ -527,6 +545,14 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		var zero T
 		return zero, InvalidArgument("response stream contained an unknown frame kind")
 	}
+}
+
+func (s *responseMessageStream[T]) TerminalStatus() (*Status, bool) {
+	if s.terminalStatus == nil {
+		return nil, false
+	}
+
+	return s.terminalStatus, true
 }
 
 func (s *responseMessageStream[T]) finish() error {

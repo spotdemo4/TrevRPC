@@ -443,7 +443,7 @@ func (f streamFrameFields) rpcStreamFrame() *RpcStreamFrame {
 }
 
 func (f streamFrameFields) statusValue() *Status {
-	return NewStatus(CodeFromUint32(f.status), f.message)
+	return NewStatus(CodeFromUint32(f.status), f.message).WithMetadata(f.metadata)
 }
 
 func parseStreamFrameFields(data []byte, copyBytes bool) (streamFrameFields, error) {

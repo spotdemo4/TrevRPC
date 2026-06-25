@@ -5,8 +5,8 @@ use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::stream::MessageStream;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
-    BoxMessageStream, Error, Metadata, Result, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame,
-    RpcStreamFrameKind, Status,
+    BoxMessageStream, Error, Metadata, ResponseEnvelope, Result, RpcKind, RpcRequest, RpcResponse,
+    RpcStreamFrame, RpcStreamFrameKind, Status,
 };
 use prost::Message;
 use tokio::sync::mpsc;
@@ -27,7 +27,7 @@ impl Default for CallOptions {
             timeout: None,
             max_response_body_size: DEFAULT_MAX_FRAME_SIZE,
             max_response_messages: Some(4096),
-            max_response_stream_body_size: Some(64 * 1024 * 1024),
+            max_response_stream_body_size: Some(16 * 1024 * 1024),
             stream_idle_timeout: Some(Duration::from_secs(30)),
             metadata: Metadata::new(),
         }
@@ -172,6 +172,25 @@ where
     Req: Message,
     Res: Message + Default,
 {
+    Ok(unary_envelope(transport, service, method, request, options)
+        .await?
+        .into_parts()
+        .0)
+}
+
+/// Calls a unary RPC and returns the decoded response envelope.
+pub async fn unary_envelope<T, Req, Res>(
+    transport: &T,
+    service: &str,
+    method: &str,
+    request: &Req,
+    options: CallOptions,
+) -> Result<ResponseEnvelope<Res>>
+where
+    T: RpcTransport,
+    Req: Message,
+    Res: Message + Default,
+{
     let CallOptions {
         timeout,
         max_response_body_size,
@@ -208,7 +227,8 @@ where
         return Err(Error::from(status));
     }
 
-    Res::decode(response.body.as_slice()).map_err(Error::from)
+    let message = Res::decode(response.body.as_slice()).map_err(Error::from)?;
+    Ok(ResponseEnvelope::new(message).with_metadata(response.metadata))
 }
 
 /// Calls a server-streaming RPC and returns a decoded response stream.
@@ -399,6 +419,11 @@ where
         self.close_send()?;
         read_unary_response_from_message_stream(&mut self.response).await
     }
+
+    pub async fn close_and_recv_envelope(mut self) -> Result<ResponseEnvelope<Res>> {
+        self.close_send()?;
+        read_unary_response_envelope_from_message_stream(&mut self.response).await
+    }
 }
 
 pub struct BidirectionalStreamingCall<Req, Res> {
@@ -436,6 +461,11 @@ where
     pub fn close_send(&mut self) -> Result<()> {
         self.sender.take();
         Ok(())
+    }
+
+    #[must_use]
+    pub fn terminal_status(&self) -> Option<&Status> {
+        self.response.terminal_status()
     }
 }
 
@@ -578,6 +608,18 @@ async fn read_unary_response_from_message_stream<Res>(
 where
     Res: Message + Default + Send + 'static,
 {
+    Ok(read_unary_response_envelope_from_message_stream(response)
+        .await?
+        .into_parts()
+        .0)
+}
+
+async fn read_unary_response_envelope_from_message_stream<Res>(
+    response: &mut ResponseMessageStream<Res>,
+) -> Result<ResponseEnvelope<Res>>
+where
+    Res: Message + Default + Send + 'static,
+{
     let Some(first) = response.next().await else {
         return Err(Error::from(Status::internal(
             "response stream ended without a response message",
@@ -590,7 +632,11 @@ where
             "client-streaming RPC returned more than one response message",
         ))),
         Some(Err(error)) => Err(error),
-        None => Ok(first),
+        None => Ok(ResponseEnvelope::new(first).with_metadata(
+            response
+                .terminal_status()
+                .map_or_else(Metadata::new, |status| status.metadata().clone()),
+        )),
     }
 }
 
@@ -604,6 +650,7 @@ struct ResponseMessageStream<T> {
     stream_body_size: usize,
     deadline: Option<Instant>,
     done: bool,
+    terminal_status: Option<Status>,
     _marker: PhantomData<T>,
 }
 
@@ -626,8 +673,14 @@ impl<T> ResponseMessageStream<T> {
             stream_body_size: 0,
             deadline,
             done: false,
+            terminal_status: None,
             _marker: PhantomData,
         }
+    }
+
+    #[must_use]
+    pub fn terminal_status(&self) -> Option<&Status> {
+        self.terminal_status.as_ref()
     }
 }
 
@@ -704,6 +757,7 @@ where
                 }
 
                 let status = frame.status_value();
+                self.terminal_status = Some(status.clone());
                 if status.is_ok() {
                     None
                 } else {

@@ -1102,14 +1102,32 @@ static void generate_header_service(string_builder* buffer, const service_info* 
                 method->c_name,
                 method->input->c_type,
                 method->output->c_type);
+            string_builder_appendf(buffer,
+                "int %s_%s_with_options(trevrpc_client* client, const %s* request, "
+                "const trevrpc_call_options* options, %s** response);\n",
+                service->c_name,
+                method->c_name,
+                method->input->c_type,
+                method->output->c_type);
         } else if (method->client_streaming) {
             string_builder_appendf(buffer,
                 "int %s_%s_start(trevrpc_client* client, trevrpc_stream** stream);\n",
                 service->c_name,
                 method->c_name);
+            string_builder_appendf(buffer,
+                "int %s_%s_start_with_options(trevrpc_client* client, const trevrpc_call_options* options, "
+                "trevrpc_stream** stream);\n",
+                service->c_name,
+                method->c_name);
         } else if (method->server_streaming) {
             string_builder_appendf(buffer,
                 "int %s_%s(trevrpc_client* client, const %s* request, trevrpc_stream** stream);\n",
+                service->c_name,
+                method->c_name,
+                method->input->c_type);
+            string_builder_appendf(buffer,
+                "int %s_%s_with_options(trevrpc_client* client, const %s* request, "
+                "const trevrpc_call_options* options, trevrpc_stream** stream);\n",
                 service->c_name,
                 method->c_name,
                 method->input->c_type);
@@ -1256,12 +1274,25 @@ static void generate_client_wrapper(string_builder* buffer, const service_info* 
             method->c_name,
             method->input->c_type,
             method->output->c_type);
+        string_builder_appendf(buffer,
+            "    return %s_%s_with_options(client, request, NULL, response);\n",
+            service->c_name,
+            method->c_name);
+        string_builder_append(buffer, "}\n\n");
+        string_builder_appendf(buffer,
+            "int %s_%s_with_options(trevrpc_client* client, const %s* request, const trevrpc_call_options* "
+            "options, %s** response) {\n",
+            service->c_name,
+            method->c_name,
+            method->input->c_type,
+            method->output->c_type);
         string_builder_append(buffer, "    if (request == NULL || response == NULL) { return -22; }\n");
         string_builder_append(buffer, "    *response = NULL;\n");
         write_pack_request(buffer, method->input, "request");
         string_builder_appendf(buffer,
-            "    trevrpc_response* rpc_response = NULL;\n    int err = trevrpc_client_call_unary(client, %s, %s, body, "
-            "body_len, &rpc_response);\n",
+            "    trevrpc_response* rpc_response = NULL;\n    int err = trevrpc_client_call_unary_with_options(client, "
+            "%s, %s, body, "
+            "body_len, options, &rpc_response);\n",
             service_name,
             method_name);
         write_free_packed_body(buffer);
@@ -1280,8 +1311,16 @@ static void generate_client_wrapper(string_builder* buffer, const service_info* 
             "int %s_%s_start(trevrpc_client* client, trevrpc_stream** stream) {\n",
             service->c_name,
             method->c_name);
+        string_builder_appendf(
+            buffer, "    return %s_%s_start_with_options(client, NULL, stream);\n", service->c_name, method->c_name);
+        string_builder_append(buffer, "}\n\n");
         string_builder_appendf(buffer,
-            "    return trevrpc_client_start_stream(client, %s, %s, %s, NULL, 0, stream);\n",
+            "int %s_%s_start_with_options(trevrpc_client* client, const trevrpc_call_options* options, "
+            "trevrpc_stream** stream) {\n",
+            service->c_name,
+            method->c_name);
+        string_builder_appendf(buffer,
+            "    return trevrpc_client_start_stream_with_options(client, %s, %s, %s, NULL, 0, options, stream);\n",
             service_name,
             method_name,
             rpc_kind_for_method(method));
@@ -1292,11 +1331,21 @@ static void generate_client_wrapper(string_builder* buffer, const service_info* 
             service->c_name,
             method->c_name,
             method->input->c_type);
+        string_builder_appendf(
+            buffer, "    return %s_%s_with_options(client, request, NULL, stream);\n", service->c_name, method->c_name);
+        string_builder_append(buffer, "}\n\n");
+        string_builder_appendf(buffer,
+            "int %s_%s_with_options(trevrpc_client* client, const %s* request, const trevrpc_call_options* "
+            "options, trevrpc_stream** stream) {\n",
+            service->c_name,
+            method->c_name,
+            method->input->c_type);
         string_builder_append(buffer, "    if (request == NULL || stream == NULL) { return -22; }\n");
         write_pack_request(buffer, method->input, "request");
         string_builder_appendf(buffer,
-            "    int err = trevrpc_client_start_stream(client, %s, %s, TREVRPC_RPC_KIND_SERVER_STREAMING, body, "
-            "body_len, stream);\n",
+            "    int err = trevrpc_client_start_stream_with_options(client, %s, %s, TREVRPC_RPC_KIND_SERVER_STREAMING, "
+            "body, "
+            "body_len, options, stream);\n",
             service_name,
             method_name);
         write_free_packed_body(buffer);

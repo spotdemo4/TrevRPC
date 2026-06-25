@@ -70,6 +70,9 @@ struct trevrpc_stream {
     uint32_t terminal_status;
     int64_t max_stream_messages;
     int64_t max_stream_body_size;
+    bool has_recv_limits;
+    int64_t max_recv_stream_messages;
+    int64_t max_recv_stream_body_size;
     uint64_t stream_idle_timeout_nanos;
     int64_t request_message_count;
     int64_t response_message_count;
@@ -167,6 +170,8 @@ static bool trevrpc_handle_stream(trevrpc_server* server,
 static uint32_t trevrpc_status_from_error(int err, const char** message);
 static uint32_t trevrpc_transport_status_from_error(int err, const char** message);
 static uint32_t trevrpc_transport_event_transport(trevrpc_server* server);
+static void trevrpc_transport_record_event_for_transport(
+    trevrpc_server* server, uint32_t kind, uint32_t transport, int error_code, const char* message);
 
 static size_t trevrpc_effective_max_frame_size(size_t max_frame_size) {
     if (max_frame_size > 0) {
@@ -191,6 +196,8 @@ static trevrpc_msquic_config trevrpc_make_msquic_config(const trevrpc_config* co
     msquic_config.alpn_len = (uint32_t)(sizeof(TREVRPC_ALPN) - 1);
     msquic_config.cert_file = config->cert_file;
     msquic_config.key_file = config->key_file;
+    msquic_config.ca_cert_file = config->ca_cert_file;
+    msquic_config.skip_certificate_validation = config->skip_certificate_validation;
     msquic_config.max_idle_timeout_ms = config->max_idle_timeout_ms;
     msquic_config.keep_alive_ms = config->keep_alive_ms;
     msquic_config.peer_bidi_stream_count = config->peer_bidi_stream_count;
@@ -222,6 +229,10 @@ static trevrpc_server_config trevrpc_effective_server_config(const trevrpc_serve
     }
     if (config->webtransport_origin != NULL) {
         effective.webtransport_origin = config->webtransport_origin;
+    }
+    if (config->webtransport_admission != NULL) {
+        effective.webtransport_admission = config->webtransport_admission;
+        effective.webtransport_admission_user_data = config->webtransport_admission_user_data;
     }
     if (config->max_idle_timeout_ms != 0) {
         effective.max_idle_timeout_ms = config->max_idle_timeout_ms;
@@ -289,6 +300,8 @@ static trevrpc_wt_config trevrpc_make_server_wt_config(const trevrpc_server_conf
     return (trevrpc_wt_config){
         .path = config->webtransport_path,
         .origin = config->webtransport_origin,
+        .admission = config->webtransport_admission,
+        .admission_user_data = config->webtransport_admission_user_data,
         .max_sessions_per_connection = config->max_sessions_per_connection,
         .max_streams_per_session = config->max_streams_per_session,
         .max_data_per_session = config->max_data_per_session,
@@ -351,6 +364,14 @@ trevrpc_server_options trevrpc_default_server_options(void) {
     options.max_stream_messages = 4096;
     options.max_stream_body_size = 16 * 1024 * 1024;
     options.stream_idle_timeout_nanos = 30ull * TREVRPC_NANOS_PER_SEC;
+    return options;
+}
+
+trevrpc_call_options trevrpc_default_call_options(void) {
+    trevrpc_call_options options = {0};
+    options.max_response_body_size = TREVRPC_DEFAULT_MAX_FRAME_SIZE;
+    options.max_response_messages = 4096;
+    options.max_response_stream_body_size = 16 * 1024 * 1024;
     return options;
 }
 
@@ -545,8 +566,10 @@ static intptr_t trevrpc_stream_read_frame_body(trevrpc_stream* stream, uint8_t**
                          stream->stream_idle_timeout_nanos);
     }
     if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
-        (void)stream->stream_idle_timeout_nanos;
-        return trevrpc_wt_stream_read_frame(stream->wt_stream, body, body_len, stream->max_frame_size);
+        return stream->stream_idle_timeout_nanos == 0
+                   ? trevrpc_wt_stream_read_frame(stream->wt_stream, body, body_len, stream->max_frame_size)
+                   : trevrpc_wt_stream_read_frame_timeout(
+                         stream->wt_stream, body, body_len, stream->max_frame_size, stream->stream_idle_timeout_nanos);
     }
     return -EINVAL;
 }
@@ -664,8 +687,27 @@ static void trevrpc_stream_record_failure(trevrpc_stream* stream, uint32_t statu
     stream->failure_message = message;
 }
 
+static bool trevrpc_stream_direction_is_recv(const char* direction) {
+    return strcmp(direction, "request") == 0;
+}
+
+static int64_t trevrpc_stream_message_limit(const trevrpc_stream* stream, const char* direction) {
+    if (stream->has_recv_limits && trevrpc_stream_direction_is_recv(direction)) {
+        return stream->max_recv_stream_messages;
+    }
+    return stream->max_stream_messages;
+}
+
+static int64_t trevrpc_stream_body_size_limit(const trevrpc_stream* stream, const char* direction) {
+    if (stream->has_recv_limits && trevrpc_stream_direction_is_recv(direction)) {
+        return stream->max_recv_stream_body_size;
+    }
+    return stream->max_stream_body_size;
+}
+
 static int trevrpc_stream_check_message_limit(trevrpc_stream* stream, int64_t* count, const char* direction) {
-    if (stream->max_stream_messages >= 0 && *count >= stream->max_stream_messages) {
+    int64_t limit = trevrpc_stream_message_limit(stream, direction);
+    if (limit >= 0 && *count >= limit) {
         const char* message = strcmp(direction, "request") == 0 ? "request stream exceeded maximum message count"
                                                                 : "response stream exceeded maximum message count";
         trevrpc_stream_record_failure(stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, message);
@@ -687,7 +729,8 @@ static uint64_t trevrpc_saturating_add_size(uint64_t total, size_t size) {
 static int trevrpc_stream_check_body_size_limit(
     trevrpc_stream* stream, uint64_t* total_body_size, size_t body_len, const char* direction) {
     *total_body_size = trevrpc_saturating_add_size(*total_body_size, body_len);
-    if (stream->max_stream_body_size < 0 || *total_body_size <= (uint64_t)stream->max_stream_body_size) {
+    int64_t limit = trevrpc_stream_body_size_limit(stream, direction);
+    if (limit < 0 || *total_body_size <= (uint64_t)limit) {
         return 0;
     }
 
@@ -699,7 +742,8 @@ static int trevrpc_stream_check_body_size_limit(
 
 static int trevrpc_stream_check_exhausted_message_limit(
     trevrpc_stream* stream, const int64_t* count, const char* direction) {
-    if (stream->max_stream_messages < 0 || *count < stream->max_stream_messages) {
+    int64_t limit = trevrpc_stream_message_limit(stream, direction);
+    if (limit < 0 || *count < limit) {
         return 0;
     }
 
@@ -711,7 +755,8 @@ static int trevrpc_stream_check_exhausted_message_limit(
 
 static int trevrpc_stream_check_exhausted_body_size_limit(
     trevrpc_stream* stream, const uint64_t* total_body_size, const char* direction) {
-    if (stream->max_stream_body_size < 0 || *total_body_size <= (uint64_t)stream->max_stream_body_size) {
+    int64_t limit = trevrpc_stream_body_size_limit(stream, direction);
+    if (limit < 0 || *total_body_size <= (uint64_t)limit) {
         return 0;
     }
 
@@ -876,7 +921,11 @@ int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, 
     return written < 0 ? (int)written : 0;
 }
 
-int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len) {
+int trevrpc_stream_send_status_with_metadata(trevrpc_stream* stream,
+    uint32_t status,
+    const char* message,
+    size_t message_len,
+    const trevrpc_metadata* metadata) {
     if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) ||
         (message == NULL && message_len > 0)) {
         return -EINVAL;
@@ -893,7 +942,7 @@ int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const ch
         message_len,
         NULL,
         0,
-        NULL,
+        metadata,
         stream->max_frame_size,
         &frame,
         &frame_len);
@@ -908,6 +957,10 @@ int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const ch
     }
     free(frame);
     return err;
+}
+
+int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len) {
+    return trevrpc_stream_send_status_with_metadata(stream, status, message, message_len, NULL);
 }
 
 int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame) {
@@ -1293,6 +1346,60 @@ static void trevrpc_cancellation_unbind_raw_stream(
     pthread_mutex_unlock(&cancellation->mutex);
 }
 
+static trevrpc_call_options trevrpc_resolve_call_options(const trevrpc_call_options* options) {
+    trevrpc_call_options resolved = trevrpc_default_call_options();
+    if (options == NULL) {
+        return resolved;
+    }
+
+    resolved = *options;
+    trevrpc_call_options defaults = trevrpc_default_call_options();
+    if (resolved.max_response_body_size == 0) {
+        resolved.max_response_body_size = defaults.max_response_body_size;
+    }
+    if (resolved.max_response_messages == 0) {
+        resolved.max_response_messages = defaults.max_response_messages;
+    }
+    if (resolved.max_response_stream_body_size == 0) {
+        resolved.max_response_stream_body_size = defaults.max_response_stream_body_size;
+    }
+    return resolved;
+}
+
+static const trevrpc_request* trevrpc_apply_call_options_to_request(
+    const trevrpc_request* request, const trevrpc_call_options* options, trevrpc_request* scratch) {
+    if (options == NULL || request == NULL || (options->metadata == NULL && options->timeout_nanos == 0)) {
+        return request;
+    }
+
+    *scratch = *request;
+    if (options->metadata != NULL) {
+        scratch->metadata = *options->metadata;
+    }
+    if (options->timeout_nanos != 0) {
+        scratch->timeout_nanos = options->timeout_nanos;
+    }
+    return scratch;
+}
+
+static int trevrpc_check_unary_response_limits(const trevrpc_response* response, const trevrpc_call_options* options) {
+    if (response == NULL || options == NULL || options->max_response_body_size < 0) {
+        return 0;
+    }
+    return response->body_len <= (uint64_t)options->max_response_body_size ? 0 : TREVRPC_ERR_FRAME_TOO_LARGE;
+}
+
+static void trevrpc_stream_apply_recv_call_options(trevrpc_stream* stream, const trevrpc_call_options* options) {
+    if (stream == NULL || options == NULL) {
+        return;
+    }
+
+    stream->has_recv_limits = true;
+    stream->max_recv_stream_messages = options->max_response_messages;
+    stream->max_recv_stream_body_size = options->max_response_stream_body_size;
+    stream->stream_idle_timeout_nanos = options->response_idle_timeout_nanos;
+}
+
 int trevrpc_client_call_unary(trevrpc_client* client,
     const char* service,
     const char* method,
@@ -1312,14 +1419,36 @@ int trevrpc_client_call_unary(trevrpc_client* client,
     return trevrpc_client_call_request(client, &request, out_response);
 }
 
+int trevrpc_client_call_unary_with_options(trevrpc_client* client,
+    const char* service,
+    const char* method,
+    const uint8_t* body,
+    size_t body_len,
+    const trevrpc_call_options* options,
+    trevrpc_response** out_response) {
+    trevrpc_request request = {
+        .service = service,
+        .service_len = service != NULL ? strlen(service) : 0,
+        .method = method,
+        .method_len = method != NULL ? strlen(method) : 0,
+        .body = body,
+        .body_len = body_len,
+        .kind = TREVRPC_RPC_KIND_UNARY,
+        .version = TREVRPC_WIRE_VERSION,
+    };
+    return trevrpc_client_call_request_with_options(client, &request, options, out_response);
+}
+
 int trevrpc_client_call_request(
     trevrpc_client* client, const trevrpc_request* request, trevrpc_response** out_response) {
     return trevrpc_client_call_request_cancellable(client, request, NULL, out_response);
 }
 
-int trevrpc_client_call_request_cancellable(trevrpc_client* client,
+static int trevrpc_client_call_request_internal(trevrpc_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
+    const trevrpc_call_options* options,
+    bool apply_options,
     trevrpc_response** out_response) {
     if (client == NULL || out_response == NULL) {
         return -EINVAL;
@@ -1333,6 +1462,14 @@ int trevrpc_client_call_request_cancellable(trevrpc_client* client,
     }
     if (request->version != TREVRPC_WIRE_VERSION) {
         return TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION;
+    }
+
+    trevrpc_call_options resolved_options = {0};
+    trevrpc_request request_with_options = {0};
+    if (apply_options) {
+        resolved_options = trevrpc_resolve_call_options(options);
+        cancellation = resolved_options.cancellation;
+        request = trevrpc_apply_call_options_to_request(request, &resolved_options, &request_with_options);
     }
     if (trevrpc_cancellation_cancelled(cancellation)) {
         return -ECANCELED;
@@ -1383,6 +1520,13 @@ int trevrpc_client_call_request_cancellable(trevrpc_client* client,
     if (err == 0) {
         err = trevrpc_wire_decode_response(response_body, response_body_len, out_response);
     }
+    if (err == 0 && apply_options) {
+        err = trevrpc_check_unary_response_limits(*out_response, &resolved_options);
+        if (err != 0) {
+            trevrpc_response_free(*out_response);
+            *out_response = NULL;
+        }
+    }
 
     trevrpc_cancellation_unbind_raw_stream(cancellation, msquic_stream, wt_stream);
     trevrpc_client_free_body(client, response_body);
@@ -1393,6 +1537,20 @@ int trevrpc_client_call_request_cancellable(trevrpc_client* client,
         return -ECANCELED;
     }
     return err;
+}
+
+int trevrpc_client_call_request_cancellable(trevrpc_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_response** out_response) {
+    return trevrpc_client_call_request_internal(client, request, cancellation, NULL, false, out_response);
+}
+
+int trevrpc_client_call_request_with_options(trevrpc_client* client,
+    const trevrpc_request* request,
+    const trevrpc_call_options* options,
+    trevrpc_response** out_response) {
+    return trevrpc_client_call_request_internal(client, request, NULL, options, true, out_response);
 }
 
 int trevrpc_client_start_stream(trevrpc_client* client,
@@ -1415,14 +1573,37 @@ int trevrpc_client_start_stream(trevrpc_client* client,
     return trevrpc_client_start_stream_request(client, &request, out_stream);
 }
 
+int trevrpc_client_start_stream_with_options(trevrpc_client* client,
+    const char* service,
+    const char* method,
+    uint32_t kind,
+    const uint8_t* body,
+    size_t body_len,
+    const trevrpc_call_options* options,
+    trevrpc_stream** out_stream) {
+    trevrpc_request request = {
+        .service = service,
+        .service_len = service != NULL ? strlen(service) : 0,
+        .method = method,
+        .method_len = method != NULL ? strlen(method) : 0,
+        .body = body,
+        .body_len = body_len,
+        .kind = kind,
+        .version = TREVRPC_WIRE_VERSION,
+    };
+    return trevrpc_client_start_stream_request_with_options(client, &request, options, out_stream);
+}
+
 int trevrpc_client_start_stream_request(
     trevrpc_client* client, const trevrpc_request* request, trevrpc_stream** out_stream) {
     return trevrpc_client_start_stream_request_cancellable(client, request, NULL, out_stream);
 }
 
-int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
+static int trevrpc_client_start_stream_request_internal(trevrpc_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
+    const trevrpc_call_options* options,
+    bool apply_options,
     trevrpc_stream** out_stream) {
     if (client == NULL || out_stream == NULL) {
         return -EINVAL;
@@ -1436,6 +1617,14 @@ int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
     }
     if (request->version != TREVRPC_WIRE_VERSION) {
         return TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION;
+    }
+
+    trevrpc_call_options resolved_options = {0};
+    trevrpc_request request_with_options = {0};
+    if (apply_options) {
+        resolved_options = trevrpc_resolve_call_options(options);
+        cancellation = resolved_options.cancellation;
+        request = trevrpc_apply_call_options_to_request(request, &resolved_options, &request_with_options);
     }
     if (trevrpc_cancellation_cancelled(cancellation)) {
         return -ECANCELED;
@@ -1494,6 +1683,9 @@ int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
         trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
         return -ENOMEM;
     }
+    if (apply_options) {
+        trevrpc_stream_apply_recv_call_options(stream, &resolved_options);
+    }
 
     trevrpc_cancellation_unbind_raw_stream(cancellation, msquic_stream, wt_stream);
     if (trevrpc_cancellation_cancelled(cancellation)) {
@@ -1502,6 +1694,20 @@ int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
     }
     *out_stream = stream;
     return 0;
+}
+
+int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_stream** out_stream) {
+    return trevrpc_client_start_stream_request_internal(client, request, cancellation, NULL, false, out_stream);
+}
+
+int trevrpc_client_start_stream_request_with_options(trevrpc_client* client,
+    const trevrpc_request* request,
+    const trevrpc_call_options* options,
+    trevrpc_stream** out_stream) {
+    return trevrpc_client_start_stream_request_internal(client, request, NULL, options, true, out_stream);
 }
 
 void trevrpc_client_shutdown(trevrpc_client* client) {
@@ -2127,6 +2333,10 @@ static bool trevrpc_server_is_shutting_down(trevrpc_server* server) {
 }
 
 static trevrpc_server_options trevrpc_server_options_snapshot(trevrpc_server* server) {
+    if (server == NULL) {
+        return trevrpc_default_server_options();
+    }
+
     pthread_mutex_lock(&server->mutex);
     trevrpc_server_options options = server->options;
     pthread_mutex_unlock(&server->mutex);
@@ -2134,6 +2344,11 @@ static trevrpc_server_options trevrpc_server_options_snapshot(trevrpc_server* se
 }
 
 static trevrpc_authorizer trevrpc_server_authorizer_snapshot(trevrpc_server* server, void** out_user_data) {
+    if (server == NULL) {
+        *out_user_data = NULL;
+        return NULL;
+    }
+
     pthread_mutex_lock(&server->mutex);
     trevrpc_authorizer authorizer = server->authorizer;
     *out_user_data = server->authorizer_user_data;
@@ -2142,6 +2357,10 @@ static trevrpc_authorizer trevrpc_server_authorizer_snapshot(trevrpc_server* ser
 }
 
 static trevrpc_metrics trevrpc_server_metrics_snapshot(trevrpc_server* server) {
+    if (server == NULL) {
+        return (trevrpc_metrics){0};
+    }
+
     pthread_mutex_lock(&server->mutex);
     trevrpc_metrics metrics = server->metrics;
     pthread_mutex_unlock(&server->mutex);
@@ -2149,6 +2368,10 @@ static trevrpc_metrics trevrpc_server_metrics_snapshot(trevrpc_server* server) {
 }
 
 static trevrpc_transport_observer trevrpc_server_transport_observer_snapshot(trevrpc_server* server) {
+    if (server == NULL) {
+        return (trevrpc_transport_observer){0};
+    }
+
     pthread_mutex_lock(&server->mutex);
     trevrpc_transport_observer observer = server->transport_observer;
     pthread_mutex_unlock(&server->mutex);
@@ -2156,6 +2379,10 @@ static trevrpc_transport_observer trevrpc_server_transport_observer_snapshot(tre
 }
 
 static trevrpc_logger trevrpc_server_logger_snapshot(trevrpc_server* server) {
+    if (server == NULL) {
+        return (trevrpc_logger){0};
+    }
+
     pthread_mutex_lock(&server->mutex);
     trevrpc_logger logger = server->logger;
     pthread_mutex_unlock(&server->mutex);
@@ -2189,6 +2416,12 @@ static void trevrpc_log(trevrpc_server* server,
 }
 
 static void trevrpc_transport_record_event(trevrpc_server* server, uint32_t kind, int error_code, const char* message) {
+    trevrpc_transport_record_event_for_transport(
+        server, kind, trevrpc_transport_event_transport(server), error_code, message);
+}
+
+static void trevrpc_transport_record_event_for_transport(
+    trevrpc_server* server, uint32_t kind, uint32_t transport, int error_code, const char* message) {
     if (kind == TREVRPC_TRANSPORT_EVENT_LISTENER_ERROR || kind == TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR ||
         kind == TREVRPC_TRANSPORT_EVENT_STREAM_ERROR) {
         trevrpc_log(server, TREVRPC_LOG_LEVEL_ERROR, "transport.error", message, NULL, error_code);
@@ -2201,7 +2434,7 @@ static void trevrpc_transport_record_event(trevrpc_server* server, uint32_t kind
 
     trevrpc_transport_event event = {
         .kind = kind,
-        .transport = trevrpc_transport_event_transport(server),
+        .transport = transport,
         .error_code = error_code,
         .message = message,
         .message_len = message == NULL ? 0 : strlen(message),
@@ -2551,7 +2784,8 @@ static void trevrpc_call_cleanup(trevrpc_call* call) {
     trevrpc_request_reset(&call->request);
     trevrpc_stream_free_body(&call->stream, call->request_frame_body);
     if (call->close_stream_active) {
-        trevrpc_transport_record_event(call->server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, 0, NULL);
+        trevrpc_transport_record_event_for_transport(
+            call->server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, call->stream.transport, 0, NULL);
         trevrpc_stream_close_raw(&call->stream);
     }
     if (call->stream_limiter_active) {
@@ -2661,7 +2895,7 @@ int trevrpc_call_respond(trevrpc_call* call, trevrpc_response* response) {
 }
 
 static void trevrpc_call_write_stream_finish(
-    trevrpc_call* call, uint32_t status, const char* message, size_t message_len) {
+    trevrpc_call* call, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata) {
     if (trevrpc_call_context_deadline_expired(&call->context) && !call->stream.sent_status) {
         call->stream.context = NULL;
         call->final_status = TREVRPC_STATUS_DEADLINE_EXCEEDED;
@@ -2677,7 +2911,8 @@ static void trevrpc_call_write_stream_finish(
     } else if (!call->stream.sent_status) {
         call->stream.context = NULL;
         call->final_status = trevrpc_status_code_from_uint32(status);
-        (void)trevrpc_stream_send_status(&call->stream, call->final_status, message, message_len);
+        (void)trevrpc_stream_send_status_with_metadata(
+            &call->stream, call->final_status, message, message_len, metadata);
     } else {
         call->final_status = call->stream.terminal_status;
     }
@@ -2688,6 +2923,11 @@ static void trevrpc_call_write_stream_finish(
 }
 
 int trevrpc_call_finish_stream(trevrpc_call* call, uint32_t status, const char* message, size_t message_len) {
+    return trevrpc_call_finish_stream_with_metadata(call, status, message, message_len, NULL);
+}
+
+int trevrpc_call_finish_stream_with_metadata(
+    trevrpc_call* call, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata) {
     if (call == NULL || (message == NULL && message_len > 0)) {
         return -EINVAL;
     }
@@ -2698,7 +2938,7 @@ int trevrpc_call_finish_stream(trevrpc_call* call, uint32_t status, const char* 
         return -EALREADY;
     }
 
-    trevrpc_call_write_stream_finish(call, status, message, message_len);
+    trevrpc_call_write_stream_finish(call, status, message, message_len, metadata);
     if (trevrpc_call_should_release_after_complete(call)) {
         trevrpc_call_release(call);
     }
@@ -2763,7 +3003,7 @@ static void trevrpc_call_complete_handler_error(trevrpc_call* call, int err) {
         call->final_status = response.status;
         trevrpc_response_reset(&response);
     } else {
-        trevrpc_call_write_stream_finish(call, status, message, strlen(message));
+        trevrpc_call_write_stream_finish(call, status, message, strlen(message), NULL);
     }
 }
 
@@ -2783,11 +3023,15 @@ static bool trevrpc_handle_stream(trevrpc_server* server,
     bool server_task_active) {
     uint8_t* body = NULL;
     size_t body_len = 0;
+    uint64_t initial_timeout = server == NULL ? 0 : server->options.initial_request_timeout_nanos;
+    stream->stream_idle_timeout_nanos = initial_timeout;
     intptr_t read = trevrpc_stream_read_frame_body(stream, &body, &body_len);
+    stream->stream_idle_timeout_nanos = 0;
     if (read < 0) {
         const char* message = NULL;
         uint32_t status = trevrpc_transport_status_from_error((int)read, &message);
-        trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, (int)read, message);
+        trevrpc_transport_record_event_for_transport(
+            server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, stream->transport, (int)read, message);
         trevrpc_server_write_status(stream, status, message);
         trevrpc_metrics_record_pre_handler(server, status);
         return false;
@@ -2958,8 +3202,8 @@ static bool trevrpc_handle_stream(trevrpc_server* server,
         trevrpc_call* call = trevrpc_call_new(
             server, stream, &request, &context, &rpc_started_at, body, stream_limiter, server_task_active);
         if (call == NULL) {
-            trevrpc_transport_record_event(
-                server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, -ENOMEM, "failed to allocate call");
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, stream->transport, -ENOMEM, "failed to allocate call");
             if (request.kind == TREVRPC_RPC_KIND_UNARY) {
                 trevrpc_server_write_status(stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "failed to allocate call");
             } else {
@@ -3067,13 +3311,15 @@ static bool trevrpc_handle_stream(trevrpc_server* server,
 
 static void* trevrpc_stream_thread(void* arg) {
     trevrpc_stream_task* task = arg;
-    trevrpc_transport_record_event(task->server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, 0, NULL);
     trevrpc_stream stream = task->stream != NULL
                                 ? trevrpc_stream_ref_msquic(task->stream, task->server->max_frame_size)
                                 : trevrpc_stream_ref_webtransport(task->wt_stream, task->server->max_frame_size);
+    trevrpc_transport_record_event_for_transport(
+        task->server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, stream.transport, 0, NULL);
     bool cleanup_transferred = trevrpc_handle_stream(task->server, &stream, task->stream_limiter, true);
     if (!cleanup_transferred) {
-        trevrpc_transport_record_event(task->server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, 0, NULL);
+        trevrpc_transport_record_event_for_transport(
+            task->server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, stream.transport, 0, NULL);
         trevrpc_stream_close_raw(&stream);
         trevrpc_conn_stream_finish(task->stream_limiter);
         trevrpc_server_task_finish(task->server);
@@ -3087,12 +3333,13 @@ static void* trevrpc_conn_thread(void* arg) {
     trevrpc_server* server = task->server;
     trevrpc_msquic_conn* conn = task->conn;
     trevrpc_wt_session* wt_session = task->wt_session;
+    uint32_t transport = conn != NULL ? TREVRPC_TRANSPORT_KIND_MSQUIC : TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
     free(task);
 
     trevrpc_server_conn_ref* conn_ref = NULL;
     if (trevrpc_server_conn_add(server, conn, wt_session, &conn_ref) != 0) {
-        trevrpc_transport_record_event(
-            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, -ENOMEM, "failed to track connection");
+        trevrpc_transport_record_event_for_transport(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, transport, -ENOMEM, "failed to track connection");
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
@@ -3105,8 +3352,11 @@ static void* trevrpc_conn_thread(void* arg) {
 
     trevrpc_conn_stream_limiter stream_limiter = {0};
     if (trevrpc_conn_stream_limiter_init(&stream_limiter) != 0) {
-        trevrpc_transport_record_event(
-            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, -ENOMEM, "failed to initialize stream limiter");
+        trevrpc_transport_record_event_for_transport(server,
+            TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR,
+            transport,
+            -ENOMEM,
+            "failed to initialize stream limiter");
         trevrpc_server_conn_remove(server, conn_ref);
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
@@ -3125,31 +3375,39 @@ static void* trevrpc_conn_thread(void* arg) {
                                : trevrpc_wt_session_accept_stream(wt_session, &wt_stream);
         if (err != 0) {
             if (!trevrpc_server_is_shutting_down(server)) {
-                trevrpc_transport_record_event(
-                    server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, err, "failed to accept stream");
+                trevrpc_transport_record_event_for_transport(
+                    server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, transport, err, "failed to accept stream");
             }
             break;
         }
 
         trevrpc_server_options options = trevrpc_server_options_snapshot(server);
         if (!trevrpc_conn_stream_try_start(&stream_limiter, options.max_concurrent_streams_per_connection)) {
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, 0, NULL);
-            trevrpc_transport_record_event(
-                server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, 0, "too many concurrent streams on connection");
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, transport, 0, NULL);
+            trevrpc_transport_record_event_for_transport(server,
+                TREVRPC_TRANSPORT_EVENT_STREAM_ERROR,
+                transport,
+                0,
+                "too many concurrent streams on connection");
             trevrpc_stream rpc_stream = stream != NULL
                                             ? trevrpc_stream_ref_msquic(stream, server->max_frame_size)
                                             : trevrpc_stream_ref_webtransport(wt_stream, server->max_frame_size);
             trevrpc_server_write_status(
                 &rpc_stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "too many concurrent streams on connection");
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, 0, NULL);
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, transport, 0, NULL);
             trevrpc_stream_close_raw(&rpc_stream);
             continue;
         }
 
         if (!trevrpc_server_task_start(server)) {
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, 0, NULL);
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, 0, "server is shutting down");
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, 0, NULL);
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, transport, 0, NULL);
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, transport, 0, "server is shutting down");
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, transport, 0, NULL);
             trevrpc_conn_stream_finish(&stream_limiter);
             if (stream != NULL) {
                 trevrpc_msquic_stream_close(stream);
@@ -3161,15 +3419,17 @@ static void* trevrpc_conn_thread(void* arg) {
 
         trevrpc_stream_task* stream_task = malloc(sizeof(*stream_task));
         if (stream_task == NULL) {
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, 0, NULL);
-            trevrpc_transport_record_event(
-                server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, -ENOMEM, "failed to allocate stream task");
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, transport, 0, NULL);
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, transport, -ENOMEM, "failed to allocate stream task");
             trevrpc_stream rpc_stream = stream != NULL
                                             ? trevrpc_stream_ref_msquic(stream, server->max_frame_size)
                                             : trevrpc_stream_ref_webtransport(wt_stream, server->max_frame_size);
             trevrpc_server_write_status(
                 &rpc_stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "failed to allocate stream task");
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, 0, NULL);
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, transport, 0, NULL);
             trevrpc_conn_stream_finish(&stream_limiter);
             trevrpc_stream_close_raw(&rpc_stream);
             trevrpc_server_task_finish(server);
@@ -3183,13 +3443,15 @@ static void* trevrpc_conn_thread(void* arg) {
         pthread_t thread;
         err = pthread_create(&thread, NULL, trevrpc_stream_thread, stream_task);
         if (err != 0) {
-            trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, 0, "handling stream inline");
+            trevrpc_transport_record_event_for_transport(
+                server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, transport, 0, "handling stream inline");
             trevrpc_stream rpc_stream = stream != NULL
                                             ? trevrpc_stream_ref_msquic(stream, server->max_frame_size)
                                             : trevrpc_stream_ref_webtransport(wt_stream, server->max_frame_size);
             bool cleanup_transferred = trevrpc_handle_stream(server, &rpc_stream, &stream_limiter, true);
             if (!cleanup_transferred) {
-                trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, 0, NULL);
+                trevrpc_transport_record_event_for_transport(
+                    server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, transport, 0, NULL);
                 trevrpc_stream_close_raw(&rpc_stream);
                 trevrpc_conn_stream_finish(&stream_limiter);
                 trevrpc_server_task_finish(server);
@@ -3203,7 +3465,7 @@ static void* trevrpc_conn_thread(void* arg) {
     trevrpc_conn_stream_limiter_wait(&stream_limiter);
     trevrpc_conn_stream_limiter_destroy(&stream_limiter);
     trevrpc_server_conn_remove(server, conn_ref);
-    trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, 0, NULL);
+    trevrpc_transport_record_event_for_transport(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, transport, 0, NULL);
     if (conn != NULL) {
         trevrpc_msquic_conn_close(conn);
     } else {
@@ -3216,9 +3478,10 @@ static void* trevrpc_conn_thread(void* arg) {
 
 static int trevrpc_server_start_connection_task(
     trevrpc_server* server, trevrpc_msquic_conn* conn, trevrpc_wt_session* wt_session) {
+    uint32_t transport = conn != NULL ? TREVRPC_TRANSPORT_KIND_MSQUIC : TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
     if (!trevrpc_server_connection_try_start(server)) {
-        trevrpc_transport_record_event(
-            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, 0, "too many concurrent connections");
+        trevrpc_transport_record_event_for_transport(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, transport, 0, "too many concurrent connections");
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
@@ -3237,13 +3500,14 @@ static int trevrpc_server_start_connection_task(
         return 0;
     }
 
-    trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_OPEN, 0, NULL);
+    trevrpc_transport_record_event_for_transport(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_OPEN, transport, 0, NULL);
 
     trevrpc_conn_task* task = malloc(sizeof(*task));
     if (task == NULL) {
-        trevrpc_transport_record_event(
-            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, -ENOMEM, "failed to allocate connection task");
-        trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, 0, NULL);
+        trevrpc_transport_record_event_for_transport(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, transport, -ENOMEM, "failed to allocate connection task");
+        trevrpc_transport_record_event_for_transport(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, transport, 0, NULL);
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
@@ -3260,9 +3524,10 @@ static int trevrpc_server_start_connection_task(
     pthread_t thread;
     int err = pthread_create(&thread, NULL, trevrpc_conn_thread, task);
     if (err != 0) {
-        trevrpc_transport_record_event(
-            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, -err, "failed to start connection thread");
-        trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, 0, NULL);
+        trevrpc_transport_record_event_for_transport(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, transport, -err, "failed to start connection thread");
+        trevrpc_transport_record_event_for_transport(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_CLOSE, transport, 0, NULL);
         free(task);
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
@@ -3287,8 +3552,11 @@ static int trevrpc_server_serve_transport(trevrpc_server* server, uint32_t trans
                       : trevrpc_msquic_listener_accept(server->listener, &conn);
         if (err != 0) {
             if (!trevrpc_server_is_shutting_down(server)) {
-                trevrpc_transport_record_event(
-                    server, TREVRPC_TRANSPORT_EVENT_LISTENER_ERROR, err, "failed to accept connection/session");
+                trevrpc_transport_record_event_for_transport(server,
+                    TREVRPC_TRANSPORT_EVENT_LISTENER_ERROR,
+                    transport,
+                    err,
+                    "failed to accept connection/session");
             }
             result = trevrpc_server_is_shutting_down(server) ? 0 : err;
             break;
@@ -3321,8 +3589,11 @@ static int trevrpc_server_serve_shared_transport(trevrpc_server* server) {
         size_t alpn_len = 0;
         err = trevrpc_msquic_conn_negotiated_alpn(conn, &alpn, &alpn_len);
         if (err != 0) {
-            trevrpc_transport_record_event(
-                server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, err, "missing negotiated ALPN");
+            trevrpc_transport_record_event_for_transport(server,
+                TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR,
+                TREVRPC_TRANSPORT_KIND_MSQUIC,
+                err,
+                "missing negotiated ALPN");
             trevrpc_msquic_conn_close(conn);
             continue;
         }
@@ -3342,8 +3613,11 @@ static int trevrpc_server_serve_shared_transport(trevrpc_server* server) {
             conn = NULL;
             if (err != 0) {
                 if (!trevrpc_server_is_shutting_down(server)) {
-                    trevrpc_transport_record_event(
-                        server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, err, "failed to accept WebTransport session");
+                    trevrpc_transport_record_event_for_transport(server,
+                        TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR,
+                        TREVRPC_TRANSPORT_KIND_WEBTRANSPORT,
+                        err,
+                        "failed to accept WebTransport session");
                 }
                 continue;
             }
@@ -3355,7 +3629,8 @@ static int trevrpc_server_serve_shared_transport(trevrpc_server* server) {
             continue;
         }
 
-        trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, 0, "unsupported ALPN");
+        trevrpc_transport_record_event_for_transport(
+            server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, TREVRPC_TRANSPORT_KIND_MSQUIC, 0, "unsupported ALPN");
         trevrpc_msquic_conn_close(conn);
     }
 

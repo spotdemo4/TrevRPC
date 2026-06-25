@@ -667,7 +667,9 @@ static int test_shared_listener_native_and_webtransport_unary(void) {
 
     uint16_t port = 0;
     CHECK_GOTO(trevrpc_test_server_webtransport_port(server, &port) == 0);
-    trevrpc_config client_config = {0};
+    trevrpc_config client_config = {
+        .skip_certificate_validation = 1,
+    };
     CHECK_GOTO(trevrpc_client_connect("127.0.0.1", port, &client_config, &native_client) == 0);
     CHECK_GOTO(hello_v1_greeter_say_hello(native_client, &request, &native_response) == 0);
     CHECK_GOTO(

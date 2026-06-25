@@ -560,6 +560,22 @@ pub(crate) fn validate_request(
     request: &web_transport_quinn::Request,
 ) -> Option<web_transport_quinn::http::StatusCode> {
     let options = server.options();
+    if let Some(admission) = options.webtransport_admission() {
+        let origin = request
+            .headers
+            .get(web_transport_quinn::http::header::ORIGIN)
+            .and_then(|origin| origin.to_str().ok());
+        let admission_request = crate::server::WebTransportAdmissionRequest {
+            request,
+            path: request.url.path(),
+            authority: request.url.host_str(),
+            origin,
+            secure: request.url.scheme() == "https",
+        };
+        return (!admission(&admission_request))
+            .then_some(web_transport_quinn::http::StatusCode::FORBIDDEN);
+    }
+
     if request.url.path() != options.webtransport_path() {
         return Some(web_transport_quinn::http::StatusCode::NOT_FOUND);
     }

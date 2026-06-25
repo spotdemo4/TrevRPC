@@ -325,22 +325,22 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
         ));
         if method.client_streaming && method.server_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else if method.client_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else if method.server_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, request: {}) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else {
             buf.push_str(&format!(
-                "    async fn {}(&self, request: {}) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         }
@@ -354,11 +354,11 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
     let service_name = service_path(service);
 
     buf.push_str(&format!(
-        "#[derive(Clone)]\npub struct {client_name}<T> {{\n    transport: T,\n}}\n\n"
+        "#[derive(Clone)]\npub struct {client_name}<T> {{\n    transport: T,\n    default_options: {runtime_path}::client::CallOptions,\n}}\n\n"
     ));
 
     buf.push_str(&format!(
-        "impl<T> {client_name}<T> {{\n    pub const SERVICE: &'static str = {service_name:?};\n\n    /// Creates a client backed by the provided transport.\n    #[must_use]\n    pub fn new(transport: T) -> Self {{\n        Self {{ transport }}\n    }}\n\n    /// Returns the underlying transport.\n    #[must_use]\n    pub const fn transport(&self) -> &T {{\n        &self.transport\n    }}\n\n    /// Consumes the client and returns the underlying transport.\n    #[must_use]\n    pub fn into_transport(self) -> T {{\n        self.transport\n    }}\n}}\n\n"
+        "impl<T> {client_name}<T> {{\n    pub const SERVICE: &'static str = {service_name:?};\n\n    /// Creates a client backed by the provided transport.\n    #[must_use]\n    pub fn new(transport: T) -> Self {{\n        Self {{ transport, default_options: {runtime_path}::client::CallOptions::new() }}\n    }}\n\n    /// Creates a client with default call options applied to every RPC.\n    #[must_use]\n    pub fn with_default_call_options(transport: T, default_options: {runtime_path}::client::CallOptions) -> Self {{\n        Self {{ transport, default_options }}\n    }}\n\n    /// Returns the default call options.\n    #[must_use]\n    pub const fn default_call_options(&self) -> &{runtime_path}::client::CallOptions {{\n        &self.default_options\n    }}\n\n    /// Returns the underlying transport.\n    #[must_use]\n    pub const fn transport(&self) -> &T {{\n        &self.transport\n    }}\n\n    /// Consumes the client and returns the underlying transport.\n    #[must_use]\n    pub fn into_transport(self) -> T {{\n        self.transport\n    }}\n}}\n\n"
     ));
 
     buf.push_str(&format!(
@@ -376,11 +376,21 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
     buf.push_str(&format!("    /// Calls the `{}` RPC.\n", method.proto_name));
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
-            "    pub async fn {}(\n        &self,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::client::BidirectionalStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(\n        &self,\n        requests: {runtime_path}::BoxMessageStream<{}>,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming_from_stream(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::BidirectionalStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::BidirectionalStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxMessageStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming_from_stream(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.name,
+            method.proto_name,
             method.name,
             method.input_type,
             method.output_type,
             method.proto_name,
+            method.proto_name,
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.name,
             method.proto_name,
             method.name,
             method.input_type,
@@ -389,11 +399,21 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
         ));
     } else if method.client_streaming {
         buf.push_str(&format!(
-            "    pub async fn {}(\n        &self,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(\n        &self,\n        requests: {runtime_path}::BoxMessageStream<{}>,\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming_from_stream(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxMessageStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming_from_stream(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.name,
+            method.proto_name,
             method.name,
             method.input_type,
             method.output_type,
             method.proto_name,
+            method.proto_name,
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.name,
             method.proto_name,
             method.name,
             method.input_type,
@@ -402,7 +422,12 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
         ));
     } else if method.server_streaming {
         buf.push_str(&format!(
-            "    pub async fn {}(\n        &self,\n        request: {},\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::server_streaming(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
+            "    pub async fn {}(&self, request: {}) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        self.{}_with_options(request, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, request: {}, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::server_streaming(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.name,
+            method.proto_name,
             method.name,
             method.input_type,
             method.output_type,
@@ -410,7 +435,22 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
         ));
     } else {
         buf.push_str(&format!(
-            "    pub async fn {}(\n        &self,\n        request: {},\n        options: {runtime_path}::client::CallOptions,\n    ) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::unary(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
+            "    pub async fn {}(&self, request: {}) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        self.{}_with_options(request, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, request: {}, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::unary(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n    /// Calls the `{}` RPC and returns response metadata.\n    pub async fn {}_envelope(&self, request: {}) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Error> {{\n        self.{}_envelope_with_options(request, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options and returns response metadata.\n    pub async fn {}_envelope_with_options(&self, request: {}, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::unary_envelope(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.name,
+            method.proto_name,
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.proto_name,
+            method.proto_name,
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.name,
+            method.proto_name,
             method.name,
             method.input_type,
             method.output_type,
@@ -443,22 +483,22 @@ fn generate_registration_method(
 ) {
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming({service_name:?}, {:?}, {runtime_path}::RpcKind::BidirectionalStreaming, move |_body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let responses = service.{}(requests).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::BidirectionalStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let responses = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
             method.proto_name, method.input_type, method.name
         ));
     } else if method.client_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming({service_name:?}, {:?}, {runtime_path}::RpcKind::ClientStreaming, move |_body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let response = service.{}(requests).await?;\n                Ok({runtime_path}::stream::encode({runtime_path}::stream::from_iter([response])))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::ClientStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let response = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode({runtime_path}::stream::from_iter([response])))\n            }}\n        }});\n    }}\n",
             method.proto_name, method.input_type, method.name
         ));
     } else if method.server_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming({service_name:?}, {:?}, {runtime_path}::RpcKind::ServerStreaming, move |body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let responses = service.{}(request).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::ServerStreaming, move |context, body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let responses = service.{}(context, request).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
             method.proto_name, method.input_type, method.name
         ));
     } else {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route({service_name:?}, {:?}, move |body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(request).await?;\n                Ok(::prost::Message::encode_to_vec(&response))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_with_context({service_name:?}, {:?}, move |context, body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(context, request).await?;\n                Ok(::prost::Message::encode_to_vec(&response))\n            }}\n        }});\n    }}\n",
             method.proto_name, method.input_type, method.name
         ));
     }

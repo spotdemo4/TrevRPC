@@ -152,7 +152,11 @@ func MessageFrame(body []byte) *RpcStreamFrame {
 
 // StatusFrame creates a terminal status frame without metadata.
 func StatusFrame(status *Status) *RpcStreamFrame {
-	return StatusFrameWithMetadata(status, Metadata{})
+	if status == nil || len(status.Metadata) == 0 {
+		return StatusFrameWithMetadata(status, Metadata{})
+	}
+
+	return StatusFrameWithMetadata(status, status.Metadata)
 }
 
 // StatusFrameWithMetadata creates a terminal status frame with metadata.
@@ -190,7 +194,7 @@ func (m *RpcStreamFrame) FrameKind() (RpcStreamFrameKind, bool) {
 
 // StatusValue returns the status represented by the frame status fields.
 func (m *RpcStreamFrame) StatusValue() *Status {
-	return NewStatus(CodeFromUint32(m.Status), m.Message)
+	return NewStatus(CodeFromUint32(m.Status), m.Message).WithMetadata(m.Metadata)
 }
 
 // NormalizeMetadataKey normalizes a metadata key to lowercase ASCII.

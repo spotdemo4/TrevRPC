@@ -51,6 +51,9 @@ struct trevrpc_stream {
     uint32_t terminal_status;
     int64_t max_stream_messages;
     int64_t max_stream_body_size;
+    bool has_recv_limits;
+    int64_t max_recv_stream_messages;
+    int64_t max_recv_stream_body_size;
     uint64_t stream_idle_timeout_nanos;
     int64_t request_message_count;
     int64_t response_message_count;
@@ -477,6 +480,24 @@ static int test_default_server_options(void) {
     CHECK_GOTO(options.max_stream_messages == 4096);
     CHECK_GOTO(options.max_stream_body_size == 16 * 1024 * 1024);
     CHECK_GOTO(options.stream_idle_timeout_nanos == 30ull * NANOS_PER_SEC);
+
+    result = 0;
+
+cleanup:
+    return result;
+}
+
+static int test_default_call_options(void) {
+    int result = 1;
+    trevrpc_call_options options = trevrpc_default_call_options();
+
+    CHECK_GOTO(options.metadata == NULL);
+    CHECK_GOTO(options.timeout_nanos == 0);
+    CHECK_GOTO(options.cancellation == NULL);
+    CHECK_GOTO(options.max_response_body_size == TREVRPC_DEFAULT_MAX_FRAME_SIZE);
+    CHECK_GOTO(options.max_response_messages == 4096);
+    CHECK_GOTO(options.max_response_stream_body_size == 16 * 1024 * 1024);
+    CHECK_GOTO(options.response_idle_timeout_nanos == 0);
 
     result = 0;
 
@@ -1608,6 +1629,9 @@ int main(void) {
         return 1;
     }
     if (test_default_server_options() != 0) {
+        return 1;
+    }
+    if (test_default_call_options() != 0) {
         return 1;
     }
     if (test_request_stream_message_limit() != 0) {

@@ -39,15 +39,25 @@ func CodeFromUint32(code uint32) Code {
 	}
 }
 
-// Status is an RPC status with a code and message.
+// Status is an RPC status with a code, message, and optional metadata.
 type Status struct {
-	Code    Code
-	Message string
+	Code     Code
+	Message  string
+	Metadata Metadata
 }
 
 // NewStatus creates a status from a code and message.
 func NewStatus(code Code, message string) *Status {
-	return &Status{Code: code, Message: message}
+	return &Status{Code: code, Message: message, Metadata: Metadata{}}
+}
+
+// WithMetadata returns a copy of the status carrying terminal metadata.
+func (s *Status) WithMetadata(metadata Metadata) *Status {
+	if s == nil {
+		s = OK()
+	}
+
+	return &Status{Code: s.Code, Message: s.Message, Metadata: cloneMetadata(metadata)}
 }
 
 // OK creates an OK status.
@@ -112,7 +122,11 @@ func (s *Status) IsOK() bool {
 
 // IntoResponse converts the status and response body into an RPC response.
 func (s *Status) IntoResponse(body []byte) *RpcResponse {
-	return s.IntoResponseWithMetadata(body, Metadata{})
+	if s == nil || len(s.Metadata) == 0 {
+		return s.IntoResponseWithMetadata(body, Metadata{})
+	}
+
+	return s.IntoResponseWithMetadata(body, s.Metadata)
 }
 
 // IntoResponseWithMetadata converts the status, response body, and metadata into an RPC response.
@@ -135,7 +149,7 @@ func StatusFromResponse(response *RpcResponse) *Status {
 		return Internal("missing RPC response")
 	}
 
-	return NewStatus(CodeFromUint32(response.Status), response.Message)
+	return NewStatus(CodeFromUint32(response.Status), response.Message).WithMetadata(response.Metadata)
 }
 
 // StatusFromError converts an error into the status returned to RPC callers.

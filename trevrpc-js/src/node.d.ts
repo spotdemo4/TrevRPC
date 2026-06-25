@@ -1,5 +1,6 @@
 import type {
   NodeConnectOptions as RuntimeNodeConnectOptions,
+  MetadataInput,
   RpcKindValue,
   RpcMethodKind,
   RpcResponseMessage,
@@ -10,7 +11,64 @@ import type {
 
 export interface NodeConnectOptions extends RuntimeNodeConnectOptions {}
 
-export interface NodeListenOptions extends RuntimeNodeConnectOptions {}
+export interface NodeRpcStartedEvent {
+  service: string;
+  method: string;
+  requestBodyLength: number;
+  kind: RpcKindValue;
+}
+
+export interface NodeRpcFinishedEvent extends NodeRpcStartedEvent {
+  responseBodyLength: number;
+  status: number;
+  elapsedMs?: number;
+}
+
+export interface NodeLogEvent {
+  level: "debug" | "info" | "warn" | "error" | string;
+  event: string;
+  message?: string;
+  service?: string;
+  method?: string;
+  status?: number;
+}
+
+export interface NodeServerMetrics {
+  rpcStarted?(event: NodeRpcStartedEvent): void;
+  rpcFinished?(event: NodeRpcFinishedEvent): void;
+  started?(event: NodeRpcStartedEvent): void;
+  finished?(event: NodeRpcFinishedEvent): void;
+}
+
+export interface NodeServerLogger {
+  log?(event: NodeLogEvent): void;
+  debug?(event: NodeLogEvent): void;
+  info?(event: NodeLogEvent): void;
+  warn?(event: NodeLogEvent): void;
+  error?(event: NodeLogEvent): void;
+}
+
+export type NodeServerAuthorizationResult =
+  | void
+  | boolean
+  | {
+      code?: number;
+      status?: number;
+      message?: string;
+      statusMessage?: string;
+      metadata?: MetadataInput;
+    };
+
+export type NodeServerAuthorizer = (
+  call: NodeServerCall,
+) => NodeServerAuthorizationResult | Promise<NodeServerAuthorizationResult>;
+
+export interface NodeListenOptions extends RuntimeNodeConnectOptions {
+  authorizer?: NodeServerAuthorizer;
+  metrics?: NodeServerMetrics;
+  logger?: NodeServerLogger | ((event: NodeLogEvent) => void);
+  maxStreamMessages?: number;
+}
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */
 export class NodeTransport implements Transport {
@@ -70,6 +128,10 @@ export class NodeServerCall {
   };
   completed: boolean;
   deferred: boolean;
+  responseBodyLength: number;
+  finalStatus: number;
+  startedAt: number;
+  completedAt: number | null;
 
   /** Keeps the call open after the handler returns. */
   defer(): this;
@@ -82,7 +144,7 @@ export class NodeServerCall {
   /** Receives one streaming request frame, or null after EOF. */
   recv(): Promise<RpcStreamFrameMessage | null>;
   /** Sends the terminal streaming status and completes the call. */
-  finishStream(status?: number, message?: string): Promise<void>;
+  finishStream(status?: number, message?: string, metadata?: MetadataInput): Promise<void>;
   /** Cancels and closes the call. */
   close(): void;
 }
@@ -110,8 +172,30 @@ export class NodeServer {
   /** Registers handlers for a generated service descriptor. */
   registerService(service: RpcServiceDescriptor, handlers: Record<string, NodeServerHandler>): this;
 
+  /** Sets an async authorizer that runs before registered handlers. */
+  setAuthorizer(authorizer?: NodeServerAuthorizer | null): this;
+  /** Clears the server authorizer. */
+  clearAuthorizer(): this;
+  /** Sets metrics callbacks. */
+  setMetrics(metrics?: NodeServerMetrics | null): this;
+  /** Clears metrics callbacks. */
+  clearMetrics(): this;
+  /** Sets a logger function or logger object. */
+  setLogger(logger?: NodeServerLogger | ((event: NodeLogEvent) => void) | null): this;
+  /** Clears the logger. */
+  clearLogger(): this;
+
   /** Starts accepting RPCs. The returned promise resolves after close. */
   serve(): Promise<void>;
   /** Requests server shutdown. */
   close(): void;
 }
+
+/** Creates an authorizer requiring one metadata key/value pair. */
+export function metadataValueAuthorizer(
+  key: string,
+  value: string | Uint8Array | ArrayBuffer | ArrayBufferView | readonly number[],
+): NodeServerAuthorizer;
+
+/** Creates an authorizer requiring an Authorization: Bearer token metadata value. */
+export function bearerAuthorizer(token: string): NodeServerAuthorizer;

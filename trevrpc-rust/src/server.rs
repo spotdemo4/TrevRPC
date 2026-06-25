@@ -8,16 +8,20 @@ use std::time::{Duration, Instant};
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
-    BoxMessageStream, Code, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse,
-    RpcStreamFrame, Status,
+    BoxMessageStream, Code, Error, MessageStream, Metadata, Result, RpcKind, RpcRequest,
+    RpcResponse, RpcStreamFrame, Status,
 };
 
 type UnaryHandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
-type UnaryHandler = Arc<dyn Fn(Vec<u8>) -> UnaryHandlerFuture + Send + Sync + 'static>;
+type UnaryHandler =
+    Arc<dyn Fn(RequestContext, Vec<u8>) -> UnaryHandlerFuture + Send + Sync + 'static>;
 type StreamingHandlerFuture =
     Pin<Box<dyn Future<Output = Result<BoxMessageStream<Vec<u8>>>> + Send + 'static>>;
-type StreamingHandler =
-    Arc<dyn Fn(Vec<u8>, BoxMessageStream<Vec<u8>>) -> StreamingHandlerFuture + Send + Sync>;
+type StreamingHandler = Arc<
+    dyn Fn(RequestContext, Vec<u8>, BoxMessageStream<Vec<u8>>) -> StreamingHandlerFuture
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 enum Route {
@@ -51,7 +55,82 @@ pub struct Server {
     metrics: Arc<dyn Metrics>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestContext {
+    service: String,
+    method: String,
+    kind: RpcKind,
+    metadata: Metadata,
+    deadline: Option<Instant>,
+}
+
+impl RequestContext {
+    #[must_use]
+    pub fn new(request: &RpcRequest, deadline: Option<Instant>) -> Self {
+        Self {
+            service: request.service.clone(),
+            method: request.method.clone(),
+            kind: request.rpc_kind(),
+            metadata: request.metadata.clone(),
+            deadline,
+        }
+    }
+
+    #[must_use]
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    #[must_use]
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RpcKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    #[must_use]
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    #[must_use]
+    pub fn time_remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    #[must_use]
+    pub fn deadline_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    #[must_use]
+    pub fn cancelled(&self) -> bool {
+        self.deadline_expired()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct WebTransportAdmissionRequest<'a> {
+    pub request: &'a web_transport_quinn::Request,
+    pub path: &'a str,
+    pub authority: Option<&'a str>,
+    pub origin: Option<&'a str>,
+    pub secure: bool,
+}
+
+pub type WebTransportAdmission = for<'a> fn(&WebTransportAdmissionRequest<'a>) -> bool;
+
+#[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {
     frame_size: usize,
     connections: Option<usize>,
@@ -65,6 +144,7 @@ pub struct ServerOptions {
     webtransport_path: &'static str,
     webtransport_allowed_authorities: &'static [&'static str],
     webtransport_allowed_origins: &'static [&'static str],
+    webtransport_admission: Option<WebTransportAdmission>,
 }
 
 impl Default for ServerOptions {
@@ -82,6 +162,7 @@ impl Default for ServerOptions {
             webtransport_path: "/trevrpc",
             webtransport_allowed_authorities: &[],
             webtransport_allowed_origins: &[],
+            webtransport_admission: None,
         }
     }
 }
@@ -163,6 +244,12 @@ impl ServerOptions {
     #[must_use]
     pub const fn webtransport_allowed_origins(&self) -> &'static [&'static str] {
         self.webtransport_allowed_origins
+    }
+
+    /// Returns the `WebTransport` admission callback, if configured.
+    #[must_use]
+    pub const fn webtransport_admission(&self) -> Option<WebTransportAdmission> {
+        self.webtransport_admission
     }
 
     /// Sets the maximum `TrevRPC` frame size in bytes.
@@ -267,6 +354,16 @@ impl ServerOptions {
         webtransport_allowed_origins: &'static [&'static str],
     ) -> Self {
         self.webtransport_allowed_origins = webtransport_allowed_origins;
+        self
+    }
+
+    /// Sets the `WebTransport` admission callback.
+    #[must_use]
+    pub const fn with_webtransport_admission(
+        mut self,
+        webtransport_admission: Option<WebTransportAdmission>,
+    ) -> Self {
+        self.webtransport_admission = webtransport_admission;
         self
     }
 }
@@ -493,6 +590,15 @@ impl Server {
         self
     }
 
+    /// Sets the `WebTransport` admission callback.
+    pub fn set_webtransport_admission(
+        &mut self,
+        webtransport_admission: Option<WebTransportAdmission>,
+    ) -> &mut Self {
+        self.options.webtransport_admission = webtransport_admission;
+        self
+    }
+
     /// Installs an authorizer that runs before route lookup.
     pub fn set_authorizer<A>(&mut self, authorizer: A) -> &mut Self
     where
@@ -533,9 +639,24 @@ impl Server {
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
+        self.route_with_context(service, method, move |_context, body| handler(body));
+    }
+
+    /// Registers a unary route handler that receives request context.
+    pub fn route_with_context<F, Fut>(
+        &mut self,
+        service: impl Into<String>,
+        method: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
+    {
         Arc::make_mut(&mut self.routes).insert(
             MethodKey::new(service, method),
-            Route::Unary(Arc::new(move |body| Box::pin(handler(body)))),
+            Route::Unary(Arc::new(move |context, body| {
+                Box::pin(handler(context, body))
+            })),
         );
     }
 
@@ -550,11 +671,29 @@ impl Server {
         F: Fn(Vec<u8>, BoxMessageStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<BoxMessageStream<Vec<u8>>>> + Send + 'static,
     {
+        self.route_streaming_with_context(service, method, kind, move |_context, body, stream| {
+            handler(body, stream)
+        });
+    }
+
+    /// Registers a streaming route handler that receives request context.
+    pub fn route_streaming_with_context<F, Fut>(
+        &mut self,
+        service: impl Into<String>,
+        method: impl Into<String>,
+        kind: RpcKind,
+        handler: F,
+    ) where
+        F: Fn(RequestContext, Vec<u8>, BoxMessageStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BoxMessageStream<Vec<u8>>>> + Send + 'static,
+    {
         Arc::make_mut(&mut self.routes).insert(
             MethodKey::new(service, method),
             Route::Streaming {
                 kind,
-                handler: Arc::new(move |body, stream| Box::pin(handler(body, stream))),
+                handler: Arc::new(move |context, body, stream| {
+                    Box::pin(handler(context, body, stream))
+                }),
             },
         );
     }
@@ -611,8 +750,9 @@ impl Server {
                 .into_response(Vec::new()),
             );
         };
+        let context = RequestContext::new(&request, deadline);
 
-        let response = match invoke_unary_handler(&handler, request.body) {
+        let response = match invoke_unary_handler(&handler, context, request.body) {
             Ok(future) => match run_handler_with_deadline(future, deadline).await {
                 Ok(Ok(body)) => RpcResponse::ok(body),
                 Ok(Err(error)) => error.into_status().into_response(Vec::new()),
@@ -625,6 +765,7 @@ impl Server {
     }
 
     /// Handles a streaming RPC request and returns response frames.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_streaming_request(
         &self,
         request: RpcRequest,
@@ -701,10 +842,12 @@ impl Server {
             );
         }
 
-        let handler_result = match invoke_streaming_handler(&handler, request.body, request_body) {
-            Ok(future) => run_handler_with_deadline(future, deadline).await,
-            Err(status) => Err(status),
-        };
+        let context = RequestContext::new(&request, deadline);
+        let handler_result =
+            match invoke_streaming_handler(&handler, context, request.body, request_body) {
+                Ok(future) => run_handler_with_deadline(future, deadline).await,
+                Err(status) => Err(status),
+            };
 
         match handler_result {
             Err(status) => self.finish_streaming_status(
@@ -875,18 +1018,20 @@ where
 
 fn invoke_unary_handler(
     handler: &UnaryHandler,
+    context: RequestContext,
     body: Vec<u8>,
 ) -> std::result::Result<UnaryHandlerFuture, Status> {
-    catch_unwind(AssertUnwindSafe(|| handler(body)))
+    catch_unwind(AssertUnwindSafe(|| handler(context, body)))
         .map_err(|_| Status::internal("RPC handler panicked"))
 }
 
 fn invoke_streaming_handler(
     handler: &StreamingHandler,
+    context: RequestContext,
     body: Vec<u8>,
     request_body: BoxMessageStream<Vec<u8>>,
 ) -> std::result::Result<StreamingHandlerFuture, Status> {
-    catch_unwind(AssertUnwindSafe(|| handler(body, request_body)))
+    catch_unwind(AssertUnwindSafe(|| handler(context, body, request_body)))
         .map_err(|_| Status::internal("RPC handler panicked"))
 }
 
@@ -1618,6 +1763,18 @@ mod tests {
             Some(Duration::from_secs(10))
         );
         assert_eq!(options.max_stream_body_size(), Some(16 * 1024 * 1024));
+    }
+
+    fn allow_any_webtransport(_request: &super::WebTransportAdmissionRequest<'_>) -> bool {
+        true
+    }
+
+    #[test]
+    fn webtransport_admission_callback_is_configurable() {
+        let options =
+            ServerOptions::new().with_webtransport_admission(Some(allow_any_webtransport));
+
+        assert!(options.webtransport_admission().is_some());
     }
 
     #[test]

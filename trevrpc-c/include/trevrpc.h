@@ -78,11 +78,28 @@ typedef struct trevrpc_call_context trevrpc_call_context;
 typedef struct trevrpc_cancellation trevrpc_cancellation;
 typedef struct trevrpc_wt_config trevrpc_wt_config;
 
+#ifndef TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
+#define TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
+typedef struct trevrpc_webtransport_admission_request {
+    const char* path;
+    size_t path_len;
+    const char* authority;
+    size_t authority_len;
+    const char* origin;
+    size_t origin_len;
+    int secure;
+} trevrpc_webtransport_admission_request;
+
+typedef int (*trevrpc_webtransport_admission)(void* user_data, const trevrpc_webtransport_admission_request* request);
+#endif
+
 #define TREVRPC_CALL_DEFERRED 1
 
 typedef struct trevrpc_config {
     const char* cert_file;
     const char* key_file;
+    const char* ca_cert_file;
+    int skip_certificate_validation;
     uint64_t max_idle_timeout_ms;
     uint32_t keep_alive_ms;
     uint16_t peer_bidi_stream_count;
@@ -98,6 +115,8 @@ typedef struct trevrpc_server_config {
     const char* key_file;
     const char* webtransport_path;
     const char* webtransport_origin;
+    trevrpc_webtransport_admission webtransport_admission;
+    void* webtransport_admission_user_data;
     uint64_t max_idle_timeout_ms;
     uint32_t keep_alive_ms;
     uint16_t peer_bidi_stream_count;
@@ -153,6 +172,16 @@ typedef struct trevrpc_request {
     uint32_t version;
     uint64_t timeout_nanos;
 } trevrpc_request;
+
+typedef struct trevrpc_call_options {
+    const trevrpc_metadata* metadata;
+    uint64_t timeout_nanos;
+    trevrpc_cancellation* cancellation;
+    int64_t max_response_body_size;
+    int64_t max_response_messages;
+    int64_t max_response_stream_body_size;
+    uint64_t response_idle_timeout_nanos;
+} trevrpc_call_options;
 
 typedef struct trevrpc_response {
     uint32_t status;
@@ -266,6 +295,7 @@ typedef struct trevrpc_logger {
 trevrpc_config trevrpc_default_config(void);
 trevrpc_server_config trevrpc_default_server_config(void);
 trevrpc_server_options trevrpc_default_server_options(void);
+trevrpc_call_options trevrpc_default_call_options(void);
 
 int trevrpc_call_context_has_deadline(const trevrpc_call_context* context);
 int trevrpc_call_context_deadline_expired(const trevrpc_call_context* context);
@@ -295,6 +325,8 @@ trevrpc_status trevrpc_status_unauthenticated(const char* message, size_t messag
 
 int trevrpc_metadata_set(
     trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
+int trevrpc_metadata_set_normalized(
+    trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
 int trevrpc_metadata_validate(const trevrpc_metadata* metadata);
 void trevrpc_metadata_reset(trevrpc_metadata* metadata);
 int trevrpc_authorize_metadata_value(
@@ -311,10 +343,21 @@ int trevrpc_client_call_unary(trevrpc_client* client,
     const uint8_t* body,
     size_t body_len,
     trevrpc_response** response);
+int trevrpc_client_call_unary_with_options(trevrpc_client* client,
+    const char* service,
+    const char* method,
+    const uint8_t* body,
+    size_t body_len,
+    const trevrpc_call_options* options,
+    trevrpc_response** response);
 int trevrpc_client_call_request(trevrpc_client* client, const trevrpc_request* request, trevrpc_response** response);
 int trevrpc_client_call_request_cancellable(trevrpc_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
+    trevrpc_response** response);
+int trevrpc_client_call_request_with_options(trevrpc_client* client,
+    const trevrpc_request* request,
+    const trevrpc_call_options* options,
     trevrpc_response** response);
 int trevrpc_client_start_stream(trevrpc_client* client,
     const char* service,
@@ -323,11 +366,23 @@ int trevrpc_client_start_stream(trevrpc_client* client,
     const uint8_t* body,
     size_t body_len,
     trevrpc_stream** stream);
+int trevrpc_client_start_stream_with_options(trevrpc_client* client,
+    const char* service,
+    const char* method,
+    uint32_t kind,
+    const uint8_t* body,
+    size_t body_len,
+    const trevrpc_call_options* options,
+    trevrpc_stream** stream);
 int trevrpc_client_start_stream_request(
     trevrpc_client* client, const trevrpc_request* request, trevrpc_stream** stream);
 int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
+    trevrpc_stream** stream);
+int trevrpc_client_start_stream_request_with_options(trevrpc_client* client,
+    const trevrpc_request* request,
+    const trevrpc_call_options* options,
     trevrpc_stream** stream);
 void trevrpc_client_shutdown(trevrpc_client* client);
 void trevrpc_client_close(trevrpc_client* client);
@@ -376,6 +431,8 @@ trevrpc_stream* trevrpc_call_stream(trevrpc_call* call);
 int trevrpc_call_defer(trevrpc_call* call);
 int trevrpc_call_respond(trevrpc_call* call, trevrpc_response* response);
 int trevrpc_call_finish_stream(trevrpc_call* call, uint32_t status, const char* message, size_t message_len);
+int trevrpc_call_finish_stream_with_metadata(
+    trevrpc_call* call, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata);
 void trevrpc_call_close(trevrpc_call* call);
 
 int trevrpc_response_set_message(trevrpc_response* response, const char* message, size_t message_len);
@@ -387,6 +444,8 @@ void trevrpc_response_free(trevrpc_response* response);
 int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len);
 int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count);
 int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len);
+int trevrpc_stream_send_status_with_metadata(
+    trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata);
 int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** frame);
 int trevrpc_stream_recv_ready(trevrpc_stream* stream, trevrpc_stream_frame** frame, int* ready);
 int trevrpc_stream_finish_send(trevrpc_stream* stream);

@@ -180,6 +180,7 @@ typedef struct call_finish_work {
     uint32_t status;
     char* message;
     size_t message_len;
+    trevrpc_metadata metadata;
 } call_finish_work;
 
 typedef struct call_recv_work {
@@ -1725,6 +1726,8 @@ static void connect_execute(napi_env env, void* data) {
     if (work->max_frame_size > 0) {
         config.max_frame_size = work->max_frame_size;
     }
+    config.ca_cert_file = work->ca_cert_file;
+    config.skip_certificate_validation = work->skip_certificate_validation;
     work->base.err = trevrpc_client_connect(work->host, work->port, &config, &work->client);
 }
 
@@ -2680,7 +2683,8 @@ static void call_finish_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    work->base.err = trevrpc_call_finish_stream(call, work->status, work->message, work->message_len);
+    work->base.err =
+        trevrpc_call_finish_stream_with_metadata(call, work->status, work->message, work->message_len, &work->metadata);
     if (work->base.err != 0) {
         trevrpc_call_close(call);
     }
@@ -2702,13 +2706,14 @@ static void call_finish_complete(napi_env env, napi_status status, void* data) {
         napi_delete_reference(env, work->base.receiver_ref);
     }
     napi_delete_async_work(env, work->base.work);
+    trevrpc_metadata_reset(&work->metadata);
     free(work->message);
     free(work);
 }
 
 static napi_value native_call_finish_stream(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
+    size_t argc = 3;
+    napi_value args[3];
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
     call_finish_work* work = calloc(1, sizeof(*work));
@@ -2737,6 +2742,17 @@ static napi_value native_call_finish_stream(napi_env env, napi_callback_info inf
             return NULL;
         }
         work->message_len = strlen(work->message);
+    }
+    if (argc > 2) {
+        int err = metadata_from_js(env, args[2], &work->metadata);
+        if (err != 0) {
+            napi_delete_reference(env, work->base.receiver_ref);
+            trevrpc_metadata_reset(&work->metadata);
+            free(work->message);
+            free(work);
+            napi_throw_type_error(env, NULL, "invalid finishStream metadata");
+            return NULL;
+        }
     }
     return queue_work(env, &work->base, "finishStream", call_finish_execute, call_finish_complete);
 }

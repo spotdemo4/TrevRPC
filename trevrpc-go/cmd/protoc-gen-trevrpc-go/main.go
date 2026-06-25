@@ -330,9 +330,17 @@ func generateClientMethod(buffer *bytes.Buffer, serviceName, fullServiceName str
 	case method.serverStreaming:
 		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, request %s, options ...trevrpc.CallOption) (trevrpc.MessageStream[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
 		fmt.Fprintf(buffer, "\treturn trevrpc.ServerStreaming[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
+		buffer.WriteString("}\n\n")
+		fmt.Fprintf(buffer, "// %sResponse calls the %s RPC and returns a response stream with terminal metadata.\n", method.name, method.protoName)
+		fmt.Fprintf(buffer, "func (c *%sClient) %sResponse(ctx context.Context, request %s, options ...trevrpc.CallOption) (trevrpc.ResponseStream[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
+		fmt.Fprintf(buffer, "\treturn trevrpc.ServerStreamingResponse[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
 	default:
 		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, request %s, options ...trevrpc.CallOption) (%s, error) {\n", serviceName, method.name, method.inputType, method.outputType)
 		fmt.Fprintf(buffer, "\treturn trevrpc.Unary[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
+		buffer.WriteString("}\n\n")
+		fmt.Fprintf(buffer, "// %sResponse calls the %s RPC and returns response metadata.\n", method.name, method.protoName)
+		fmt.Fprintf(buffer, "func (c *%sClient) %sResponse(ctx context.Context, request %s, options ...trevrpc.CallOption) (*trevrpc.Response[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
+		fmt.Fprintf(buffer, "\treturn trevrpc.UnaryResponse[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
 	}
 	buffer.WriteString("}\n\n")
 }

@@ -14,12 +14,16 @@ import (
 // UnaryHandler handles an encoded unary request body and returns an encoded response body.
 type UnaryHandler func(context.Context, []byte) ([]byte, error)
 
+// UnaryResponseHandler handles an encoded unary request and returns a full response envelope.
+type UnaryResponseHandler func(context.Context, []byte) (*RpcResponse, error)
+
 // StreamingHandler handles encoded streaming request bodies and returns encoded response bodies.
 type StreamingHandler func(context.Context, []byte, ByteStream) (ByteStream, error)
 
 type route struct {
 	kind             RpcKind
 	unaryHandler     UnaryHandler
+	unaryResponse    UnaryResponseHandler
 	streamingHandler StreamingHandler
 }
 
@@ -50,7 +54,20 @@ type ServerOptions struct {
 	EnableWebTransport                bool
 	WebTransportPath                  string
 	WebTransportCheckOrigin           func(*http.Request) bool
+	WebTransportAdmission             WebTransportAdmission
 }
+
+// WebTransportAdmissionRequest contains HTTP/3 CONNECT information available before accepting a WebTransport session.
+type WebTransportAdmissionRequest struct {
+	Request   *http.Request
+	Path      string
+	Authority string
+	Origin    string
+	Secure    bool
+}
+
+// WebTransportAdmission decides whether to accept a WebTransport session.
+type WebTransportAdmission func(WebTransportAdmissionRequest) bool
 
 // DefaultServerOptions returns the default server limits and timeouts.
 func DefaultServerOptions() ServerOptions {
@@ -176,6 +193,11 @@ func (s *Server) Route(service, method string, handler UnaryHandler) {
 	s.routes[methodKey{service: service, method: method}] = route{kind: RpcKindUnary, unaryHandler: handler}
 }
 
+// RouteResponse registers a unary route handler that can return response metadata.
+func (s *Server) RouteResponse(service, method string, handler UnaryResponseHandler) {
+	s.routes[methodKey{service: service, method: method}] = route{kind: RpcKindUnary, unaryResponse: handler}
+}
+
 // RouteStreaming registers a streaming route handler for a service, method, and RPC kind.
 func (s *Server) RouteStreaming(service, method string, kind RpcKind, handler StreamingHandler) {
 	s.routes[methodKey{service: service, method: method}] = route{kind: kind, streamingHandler: handler}
@@ -198,6 +220,30 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, service, metho
 	})
 }
 
+// RegisterUnaryResponse registers a typed unary protobuf handler that can return response metadata.
+func RegisterUnaryResponse[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (*Response[Res], error)) {
+	s.RouteResponse(service, method, func(ctx context.Context, body []byte) (*RpcResponse, error) {
+		request := newRequest()
+		if err := UnmarshalMessage(body, request); err != nil {
+			return nil, InvalidArgument("failed to decode request: " + err.Error())
+		}
+
+		response, err := handler(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		if response == nil {
+			return nil, Internal("handler returned nil response")
+		}
+
+		responseBody, err := MarshalMessage(response.Message)
+		if err != nil {
+			return nil, err
+		}
+		return OK().IntoResponseWithMetadata(responseBody, response.Metadata), nil
+	})
+}
+
 // HandleRequest handles a unary RPC request and returns a response.
 func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcResponse {
 	startedAt := time.Now()
@@ -213,8 +259,21 @@ func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcRes
 	defer cancel()
 
 	route, ok := s.routes[methodKey{service: request.Service, method: request.Method}]
-	if !ok || route.unaryHandler == nil {
+	if !ok || (route.unaryHandler == nil && route.unaryResponse == nil) {
 		return s.finishResponse(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown RPC method %s/%s", request.Service, request.Method)).IntoResponse(nil))
+	}
+	if route.unaryResponse != nil {
+		response, err := invokeUnaryResponseHandler(ctx, route.unaryResponse, request.Body)
+		if err != nil {
+			return s.finishResponse(service, method, requestBodyLen, startedAt, StatusFromError(err).IntoResponse(nil))
+		}
+		if response == nil {
+			return s.finishResponse(service, method, requestBodyLen, startedAt, Internal("handler returned nil response").IntoResponse(nil))
+		}
+		if err := ValidateMetadata(response.Metadata); err != nil {
+			return s.finishResponse(service, method, requestBodyLen, startedAt, Internal("invalid response metadata: "+err.Error()).IntoResponse(nil))
+		}
+		return s.finishResponse(service, method, requestBodyLen, startedAt, response)
 	}
 
 	responseBody, err := invokeUnaryHandler(ctx, route.unaryHandler, request.Body)
@@ -223,6 +282,36 @@ func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcRes
 	}
 
 	return s.finishResponse(service, method, requestBodyLen, startedAt, OKResponse(responseBody))
+}
+
+func invokeUnaryResponseHandler(ctx context.Context, handler UnaryResponseHandler, body []byte) (*RpcResponse, error) {
+	result := make(chan struct {
+		response *RpcResponse
+		err      error
+	}, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				result <- struct {
+					response *RpcResponse
+					err      error
+				}{err: Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))}
+			}
+		}()
+
+		response, err := handler(ctx, body)
+		result <- struct {
+			response *RpcResponse
+			err      error
+		}{response: response, err: err}
+	}()
+
+	select {
+	case result := <-result:
+		return result.response, result.err
+	case <-ctx.Done():
+		return nil, statusFromContextError(ctx.Err())
+	}
 }
 
 // HandleStreamingRequest handles a streaming RPC request and returns response frames.
@@ -352,7 +441,7 @@ func (s *Server) prepareRequest(ctx context.Context, request *RpcRequest) (conte
 func requestContext(ctx context.Context, request *RpcRequest) (context.Context, context.CancelFunc, error) {
 	if request.TimeoutNanos == 0 {
 		ctx, cancel := context.WithCancel(ctx)
-		return ctx, cancel, nil
+		return contextWithHandlerContext(ctx, request), cancel, nil
 	}
 
 	if request.TimeoutNanos > math.MaxInt64 {
@@ -360,7 +449,7 @@ func requestContext(ctx context.Context, request *RpcRequest) (context.Context, 
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(request.TimeoutNanos))
-	return ctx, cancel, nil
+	return contextWithHandlerContext(ctx, request), cancel, nil
 }
 
 func (s *Server) finishResponse(service, method string, requestBodyLen int, startedAt time.Time, response *RpcResponse) *RpcResponse {

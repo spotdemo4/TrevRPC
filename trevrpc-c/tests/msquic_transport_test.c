@@ -85,6 +85,7 @@ static const trevrpc_msquic_config test_config = {
     .alpn_len = 7,
     .cert_file = TREVRPC_MSQUIC_TEST_CERT,
     .key_file = TREVRPC_MSQUIC_TEST_KEY,
+    .skip_certificate_validation = 1,
     .peer_bidi_stream_count = 8,
 };
 
@@ -93,6 +94,7 @@ static const trevrpc_msquic_config test_h3_config = {
     .alpn_len = 2,
     .cert_file = TREVRPC_MSQUIC_TEST_CERT,
     .key_file = TREVRPC_MSQUIC_TEST_KEY,
+    .skip_certificate_validation = 1,
     .peer_bidi_stream_count = 8,
     .peer_unidi_stream_count = 8,
 };

@@ -307,6 +307,30 @@ int trevrpc_metadata_set(
     return 0;
 }
 
+int trevrpc_metadata_set_normalized(
+    trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len) {
+    if (metadata == NULL || key == NULL || key_len == 0 || (value == NULL && value_len > 0)) {
+        return -EINVAL;
+    }
+    if (key_len == SIZE_MAX) {
+        return -EINVAL;
+    }
+
+    char* normalized_key = malloc(key_len + 1);
+    if (normalized_key == NULL) {
+        return -ENOMEM;
+    }
+    for (size_t i = 0; i < key_len; i++) {
+        char ch = key[i];
+        normalized_key[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
+    }
+    normalized_key[key_len] = '\0';
+
+    int err = trevrpc_metadata_set(metadata, normalized_key, key_len, value, value_len);
+    free(normalized_key);
+    return err;
+}
+
 int trevrpc_metadata_validate(const trevrpc_metadata* metadata) {
     if (metadata == NULL) {
         return 0;

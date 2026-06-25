@@ -255,16 +255,11 @@ func handleWebTransportConnection(ctx context.Context, conn *quic.Conn, server *
 	var sessionTasks sync.WaitGroup
 	var wtServer *webtransport.Server
 	wtServer = &webtransport.Server{
-		CheckOrigin: server.options.WebTransportCheckOrigin,
+		CheckOrigin: func(*http.Request) bool { return true },
 		H3: &http3.Server{
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != server.options.WebTransportPath {
-					http.NotFound(w, r)
-					return
-				}
-
-				if server.options.WebTransportCheckOrigin == nil {
-					http.Error(w, "WebTransport origin policy is not configured", http.StatusForbidden)
+				if !webTransportAdmitted(server.options, r) {
+					http.Error(w, "WebTransport admission denied", http.StatusForbidden)
 					return
 				}
 
@@ -296,6 +291,25 @@ func handleWebTransportConnection(ctx context.Context, conn *quic.Conn, server *
 	if closeOnShutdown && ctx.Err() != nil {
 		conn.CloseWithError(0, "server drained WebTransport connection")
 	}
+}
+
+func webTransportAdmitted(options ServerOptions, r *http.Request) bool {
+	if options.WebTransportAdmission != nil {
+		return options.WebTransportAdmission(WebTransportAdmissionRequest{
+			Request:   r,
+			Path:      r.URL.Path,
+			Authority: r.Host,
+			Origin:    r.Header.Get("Origin"),
+			Secure:    r.TLS != nil,
+		})
+	}
+	if r.URL.Path != options.WebTransportPath {
+		return false
+	}
+	if options.WebTransportCheckOrigin == nil {
+		return false
+	}
+	return options.WebTransportCheckOrigin(r)
 }
 
 func handleWebTransportSession(ctx context.Context, session *webtransport.Session, server *Server, requestLimit semaphore) {

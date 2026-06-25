@@ -17,6 +17,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -1311,6 +1312,30 @@ func TestWebTransportCheckOriginAllowsBrowserOrigin(t *testing.T) {
 	_, err = Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "origin"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if err != nil {
 		t.Fatalf("unary call failed: %v", err)
+	}
+}
+
+func TestWebTransportAdmissionReceivesRequestFields(t *testing.T) {
+	options := DefaultServerOptions()
+	var seen WebTransportAdmissionRequest
+	options.WebTransportAdmission = func(request WebTransportAdmissionRequest) bool {
+		seen = request
+		return request.Path == "/trevrpc" && request.Origin == "https://origin.test" && request.Request != nil
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://example.test/trevrpc", nil)
+	request.Header.Set("Origin", "https://origin.test")
+	if !webTransportAdmitted(options, request) {
+		t.Fatal("expected admission callback to accept matching request")
+	}
+	if seen.Authority == "" {
+		t.Fatal("expected admission callback to receive authority")
+	}
+
+	wrongPath := httptest.NewRequest(http.MethodGet, "https://example.test/wrong", nil)
+	wrongPath.Header.Set("Origin", "https://origin.test")
+	if webTransportAdmitted(options, wrongPath) {
+		t.Fatal("expected admission callback to reject unexpected path")
 	}
 }
 

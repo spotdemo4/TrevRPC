@@ -3,6 +3,7 @@
 
 pub mod error;
 pub mod framing;
+pub mod response;
 pub mod status;
 pub mod stream;
 pub mod wire;
@@ -23,6 +24,7 @@ pub mod webtransport;
 
 pub use async_trait::async_trait;
 pub use error::{Error, Result};
+pub use response::ResponseEnvelope;
 pub use status::{Code, Status};
 pub use stream::{BoxMessageStream, MessageStream};
 pub use wire::{Metadata, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, RpcStreamFrameKind};

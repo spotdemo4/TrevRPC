@@ -13,6 +13,21 @@ typedef struct trevrpc_wt_session trevrpc_wt_session;
 typedef struct trevrpc_wt_stream trevrpc_wt_stream;
 typedef struct trevrpc_msquic_conn trevrpc_msquic_conn;
 
+#ifndef TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
+#define TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
+typedef struct trevrpc_webtransport_admission_request {
+    const char* path;
+    size_t path_len;
+    const char* authority;
+    size_t authority_len;
+    const char* origin;
+    size_t origin_len;
+    int secure;
+} trevrpc_webtransport_admission_request;
+
+typedef int (*trevrpc_webtransport_admission)(void* user_data, const trevrpc_webtransport_admission_request* request);
+#endif
+
 #define TREV_WT_ERR_CLOSED -3001
 #define TREV_WT_ERR_FRAME_TOO_LARGE -3002
 #define TREV_WT_ERR_REJECTED -3003
@@ -27,6 +42,8 @@ typedef struct trevrpc_wt_config {
     const char* key_file;
     const char* ca_cert_file;
     int skip_certificate_validation;
+    trevrpc_webtransport_admission admission;
+    void* admission_user_data;
     uint32_t max_sessions_per_connection;
     uint32_t max_streams_per_session;
     uint64_t max_data_per_session;
@@ -52,6 +69,8 @@ void trevrpc_wt_session_close(trevrpc_wt_session* session);
 
 intptr_t trevrpc_wt_stream_read(trevrpc_wt_stream* stream, uint8_t* data, size_t len);
 intptr_t trevrpc_wt_stream_read_frame(trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len);
+intptr_t trevrpc_wt_stream_read_frame_timeout(
+    trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos);
 intptr_t trevrpc_wt_stream_write(trevrpc_wt_stream* stream, const uint8_t* data, size_t len);
 intptr_t trevrpc_wt_stream_write_message_frame(
     trevrpc_wt_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);

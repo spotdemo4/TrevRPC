@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Code, cancelled } from "./status.js";
+import { Code, cancelled, codeFromNumber } from "./status.js";
 import { RpcKind, RpcStreamFrameKind } from "./wire.js";
 
 const require = createRequire(import.meta.url);
@@ -91,6 +91,9 @@ export class NodeServer {
     this.port = nativeServer.port;
     this.maxFrameSize = options.maxFrameSize;
     this.closed = null;
+    this.authorizer = options.authorizer ?? null;
+    this.metrics = options.metrics ?? null;
+    this.logger = options.logger ?? null;
   }
 
   /** Creates a native QUIC TrevRPC server backed by trevrpc-c. */
@@ -123,6 +126,51 @@ export class NodeServer {
     return this;
   }
 
+  /** Sets an async authorizer that runs before registered handlers. */
+  setAuthorizer(authorizer) {
+    if (authorizer != null && typeof authorizer !== "function") {
+      throw new TypeError("authorizer must be a function");
+    }
+    this.authorizer = authorizer ?? null;
+    return this;
+  }
+
+  /** Clears the server authorizer. */
+  clearAuthorizer() {
+    this.authorizer = null;
+    return this;
+  }
+
+  /** Sets metrics callbacks. */
+  setMetrics(metrics) {
+    if (metrics != null && typeof metrics !== "object") {
+      throw new TypeError("metrics must be an object");
+    }
+    this.metrics = metrics ?? null;
+    return this;
+  }
+
+  /** Clears metrics callbacks. */
+  clearMetrics() {
+    this.metrics = null;
+    return this;
+  }
+
+  /** Sets a logger function or logger object. */
+  setLogger(logger) {
+    if (logger != null && typeof logger !== "function" && typeof logger !== "object") {
+      throw new TypeError("logger must be a function or object");
+    }
+    this.logger = logger ?? null;
+    return this;
+  }
+
+  /** Clears the logger. */
+  clearLogger() {
+    this.logger = null;
+    return this;
+  }
+
   /** Starts accepting RPCs. The returned promise resolves after close. */
   serve() {
     this.closed ??= this.nativeServer.serve();
@@ -135,30 +183,125 @@ export class NodeServer {
   }
 
   async #dispatch(handler, nativeCall) {
-    const call = new NodeServerCall(nativeCall);
+    const call = new NodeServerCall(nativeCall, (completedCall) =>
+      this.#recordFinished(completedCall),
+    );
+    this.#recordStarted(call);
     try {
+      const authorization = await this.#authorize(call);
+      if (authorization != null) {
+        this.#log(
+          "warn",
+          "rpc.authorization_denied",
+          authorization.message,
+          call,
+          authorization.code,
+        );
+        await completeWithStatus(call, authorization);
+        return;
+      }
       const result = await handler(call);
       if (!call.completed && !call.deferred) {
         await completeDefault(call, result);
       }
     } catch (error) {
+      this.#log(
+        "error",
+        "rpc.handler_failed",
+        error?.message ?? "handler failed",
+        call,
+        error?.code,
+      );
       if (!call.completed) {
         await completeWithError(call, error);
       }
+    }
+  }
+
+  async #authorize(call) {
+    if (this.authorizer == null) {
+      return null;
+    }
+    try {
+      return authorizationStatus(await this.authorizer(call));
+    } catch (error) {
+      this.#log(
+        "error",
+        "rpc.authorization_failed",
+        error?.message ?? "authorizer failed",
+        call,
+        error?.code,
+      );
+      return {
+        code: Code.Internal,
+        message: error?.statusMessage ?? error?.message ?? "authorizer failed",
+        metadata: error?.metadata ?? {},
+      };
+    }
+  }
+
+  #recordStarted(call) {
+    const event = rpcStartedEvent(call);
+    try {
+      this.metrics?.rpcStarted?.(event);
+      this.metrics?.started?.(event);
+    } catch (error) {
+      this.#log(
+        "error",
+        "metrics.rpc_started_failed",
+        error?.message ?? "metrics callback failed",
+        call,
+      );
+    }
+  }
+
+  #recordFinished(call) {
+    const event = rpcFinishedEvent(call);
+    try {
+      this.metrics?.rpcFinished?.(event);
+      this.metrics?.finished?.(event);
+    } catch (error) {
+      this.#log(
+        "error",
+        "metrics.rpc_finished_failed",
+        error?.message ?? "metrics callback failed",
+        call,
+      );
+    }
+  }
+
+  #log(level, event, message, call, status = undefined) {
+    const entry = logEvent(level, event, message, call, status);
+    try {
+      if (typeof this.logger === "function") {
+        this.logger(entry);
+      } else {
+        this.logger?.log?.(entry);
+        this.logger?.[level]?.(entry);
+      }
+    } catch {
+      // Logger failures must not affect RPC handling.
     }
   }
 }
 
 /** Raw server call passed to NodeServer handlers. */
 export class NodeServerCall {
-  constructor(nativeCall) {
+  constructor(nativeCall, onComplete = () => {}) {
     this.nativeCall = nativeCall;
     this.request = nativeCall.request;
     this.completed = false;
     this.deferred = false;
     this.recvDone = false;
     this.recvQueue = [];
+    this.responseBodyLength = 0;
+    this.finalStatus = Code.Ok;
+    this.startedAt = Date.now();
+    this.completedAt = null;
+    this.#onComplete = onComplete;
   }
+
+  #onComplete;
 
   /** Keeps the call open after the handler returns. */
   defer() {
@@ -168,13 +311,19 @@ export class NodeServerCall {
 
   /** Sends a unary response and completes the call. */
   async respond(response = {}) {
-    await this.nativeCall.respond(responseObject(response));
+    const rpcResponse = responseObject(response);
+    await this.nativeCall.respond(rpcResponse);
     this.completed = true;
+    this.responseBodyLength = rpcResponse.body?.byteLength ?? 0;
+    this.finalStatus = codeFromNumber(rpcResponse.status ?? rpcResponse.code ?? Code.Ok);
+    this.#completeMetrics();
   }
 
   /** Sends one streaming response message. */
   sendMessage(body) {
-    return this.nativeCall.sendMessage(byteBody(body));
+    const bytes = byteBody(body);
+    this.responseBodyLength += bytes.byteLength;
+    return this.nativeCall.sendMessage(bytes);
   }
 
   /** Receives one streaming request frame, or null after EOF. */
@@ -196,9 +345,11 @@ export class NodeServerCall {
   }
 
   /** Sends the terminal streaming status and completes the call. */
-  async finishStream(status = Code.Ok, message = "") {
-    await this.nativeCall.finishStream(status, message);
+  async finishStream(status = Code.Ok, message = "", metadata = {}) {
+    await this.nativeCall.finishStream(status, message, metadata);
     this.completed = true;
+    this.finalStatus = codeFromNumber(status);
+    this.#completeMetrics();
   }
 
   /** Cancels and closes the call. */
@@ -207,6 +358,16 @@ export class NodeServerCall {
     this.recvDone = true;
     this.recvQueue.length = 0;
     this.nativeCall.close();
+    this.finalStatus = Code.Cancelled;
+    this.#completeMetrics();
+  }
+
+  #completeMetrics() {
+    if (this.completedAt != null) {
+      return;
+    }
+    this.completedAt = Date.now();
+    this.#onComplete(this);
   }
 
   async #recvMany() {
@@ -215,6 +376,25 @@ export class NodeServerCall {
     }
     return [await this.nativeCall.recv()];
   }
+}
+
+/** Creates an authorizer requiring one metadata key/value pair. */
+export function metadataValueAuthorizer(key, value) {
+  const normalizedKey = String(key).toLowerCase();
+  const expected = metadataBytes(value);
+  return (call) => {
+    const actual = metadataValue(call.request.metadata, normalizedKey);
+    if (actual != null && bytesEqual(actual, expected)) {
+      return true;
+    }
+    return { code: Code.Unauthenticated, message: "request is not authenticated" };
+  };
+}
+
+/** Creates an authorizer requiring an Authorization: Bearer token metadata value. */
+export function bearerAuthorizer(token) {
+  const expected = new TextEncoder().encode(`Bearer ${token}`);
+  return metadataValueAuthorizer("authorization", expected);
 }
 
 class NativeResponseFrameStream {
@@ -421,15 +601,77 @@ async function completeDefault(call, result) {
 async function completeWithError(call, error) {
   const status = Number.isInteger(error?.code) ? error.code : Code.Internal;
   const message = error?.statusMessage ?? error?.message ?? "handler failed";
+  const metadata = error?.metadata ?? {};
   try {
     if (call.request.kind === RpcKind.Unary) {
-      await call.respond({ status, message });
+      await call.respond({ status, message, metadata });
     } else {
-      await call.finishStream(status, message);
+      await call.finishStream(status, message, metadata);
     }
   } catch {
     call.close();
   }
+}
+
+async function completeWithStatus(call, status) {
+  if (call.request.kind === RpcKind.Unary) {
+    await call.respond({ status: status.code, message: status.message, metadata: status.metadata });
+  } else {
+    await call.finishStream(status.code, status.message, status.metadata);
+  }
+}
+
+function authorizationStatus(result) {
+  if (result == null || result === true) {
+    return null;
+  }
+  if (result === false) {
+    return { code: Code.PermissionDenied, message: "request denied", metadata: {} };
+  }
+  if (typeof result === "object") {
+    const code = codeFromNumber(result.code ?? result.status ?? Code.PermissionDenied);
+    if (code === Code.Ok) {
+      return null;
+    }
+    return {
+      code,
+      message: result.message ?? result.statusMessage ?? "request denied",
+      metadata: result.metadata ?? {},
+    };
+  }
+  return null;
+}
+
+function rpcStartedEvent(call) {
+  return {
+    service: call.request.service,
+    method: call.request.method,
+    requestBodyLength: call.request.body?.byteLength ?? 0,
+    kind: call.request.kind,
+  };
+}
+
+function rpcFinishedEvent(call) {
+  return {
+    ...rpcStartedEvent(call),
+    responseBodyLength: call.responseBodyLength,
+    status: call.finalStatus,
+    elapsedMs:
+      call.completedAt == null
+        ? undefined
+        : call.completedAt - (call.startedAt ?? call.completedAt),
+  };
+}
+
+function logEvent(level, event, message, call, status) {
+  return {
+    level,
+    event,
+    message,
+    service: call?.request?.service,
+    method: call?.request?.method,
+    status: status == null ? undefined : codeFromNumber(status),
+  };
 }
 
 function responseObject(response) {
@@ -443,8 +685,10 @@ function responseObject(response) {
   ) {
     return { body: byteBody(response) };
   }
+  const status = response.status ?? response.code;
   return {
     ...response,
+    status,
     body: byteBody(response.body),
   };
 }
@@ -564,6 +808,32 @@ function byteBody(body) {
     return new Uint8Array(body);
   }
   return Uint8Array.from(body);
+}
+
+function metadataBytes(value) {
+  if (typeof value === "string") {
+    return new TextEncoder().encode(value);
+  }
+  return byteBody(value);
+}
+
+function metadataValue(metadata, key) {
+  if (metadata == null) {
+    return null;
+  }
+  return metadata[key] ?? metadata[String(key).toLowerCase()] ?? null;
+}
+
+function bytesEqual(left, right) {
+  if (left.byteLength !== right.byteLength) {
+    return false;
+  }
+  for (let i = 0; i < left.byteLength; i += 1) {
+    if (left[i] !== right[i]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function loadNative() {
