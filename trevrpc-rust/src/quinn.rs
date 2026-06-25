@@ -904,13 +904,13 @@ async fn handle_stream(
         .await
         .is_ok()
     {
+        let _ = send.finish();
         if let Err(error) = read_unary_request_end(&server, &mut recv).await {
             let _ = &error;
             let _ = recv.stop(CANCELLED_STREAM_CODE.into());
             #[cfg(feature = "tracing")]
             tracing::debug!(%error, "failed to drain unary request stream");
         }
-        let _ = send.finish();
     }
 }
 

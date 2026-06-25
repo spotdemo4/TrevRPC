@@ -1126,6 +1126,29 @@ static int trevrpc_client_write_frame(trevrpc_client* client,
 }
 
 static int trevrpc_client_shutdown_send(
+    trevrpc_client* client, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream);
+
+static int trevrpc_client_write_final_frame(trevrpc_client* client,
+    trevrpc_msquic_stream* msquic_stream,
+    trevrpc_wt_stream* wt_stream,
+    const uint8_t* frame,
+    size_t frame_len) {
+    intptr_t written = 0;
+    if (client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        written = trevrpc_msquic_stream_write_fin(msquic_stream, frame, frame_len);
+        if (written < 0) {
+            return (int)written;
+        }
+        return (size_t)written == frame_len ? 0 : TREV_MSQUIC_ERR_CLOSED;
+    }
+    int err = trevrpc_client_write_frame(client, msquic_stream, wt_stream, frame, frame_len);
+    if (err != 0) {
+        return err;
+    }
+    return trevrpc_client_shutdown_send(client, msquic_stream, wt_stream);
+}
+
+static int trevrpc_client_shutdown_send(
     trevrpc_client* client, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream) {
     if (client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
         return trevrpc_msquic_stream_shutdown_send(msquic_stream);
@@ -1190,12 +1213,9 @@ int trevrpc_client_call_unary(trevrpc_client* client,
     err = trevrpc_wire_encode_request(
         service, method, TREVRPC_RPC_KIND_UNARY, body, body_len, NULL, 0, client->max_frame_size, &frame, &frame_len);
     if (err == 0) {
-        err = trevrpc_client_write_frame(client, msquic_stream, wt_stream, frame, frame_len);
+        err = trevrpc_client_write_final_frame(client, msquic_stream, wt_stream, frame, frame_len);
     }
     free(frame);
-    if (err == 0) {
-        err = trevrpc_client_shutdown_send(client, msquic_stream, wt_stream);
-    }
 
     uint8_t* response_body = NULL;
     size_t response_body_len = 0;

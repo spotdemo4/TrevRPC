@@ -668,12 +668,16 @@ static trevrpc_msquic_frame* trevrpc_msquic_stream_pop_frame_locked(trevrpc_msqu
     return frame;
 }
 
-static intptr_t trevrpc_msquic_stream_send_buffer(
-    trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len) {
+static intptr_t trevrpc_msquic_stream_send_buffer_with_flags(
+    trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len, QUIC_SEND_FLAGS flags) {
+    bool finish_send = (flags & QUIC_SEND_FLAG_FIN) != 0;
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
     bool send_closed = stream->send_closed;
     if (handle != NULL && !send_closed && !stream->close_pending) {
+        if (finish_send) {
+            stream->send_closed = true;
+        }
         stream->active_handle_ops++;
     } else {
         handle = NULL;
@@ -686,14 +690,24 @@ static intptr_t trevrpc_msquic_stream_send_buffer(
 
     send->buffer.Buffer = send->data;
     send->buffer.Length = (uint32_t)len;
-    QUIC_STATUS status = TrevMsQuic->StreamSend(handle, &send->buffer, 1, QUIC_SEND_FLAG_NONE, send);
+    QUIC_STATUS status = TrevMsQuic->StreamSend(handle, &send->buffer, 1, flags, send);
     trevrpc_msquic_stream_handle_release(stream);
     if (QUIC_FAILED(status)) {
+        if (finish_send) {
+            pthread_mutex_lock(&stream->mutex);
+            stream->send_closed = false;
+            pthread_mutex_unlock(&stream->mutex);
+        }
         trevrpc_msquic_send_release(stream, send);
         return trevrpc_msquic_error_result((int)status);
     }
 
     return (intptr_t)len;
+}
+
+static intptr_t trevrpc_msquic_stream_send_buffer(
+    trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len) {
+    return trevrpc_msquic_stream_send_buffer_with_flags(stream, send, len, QUIC_SEND_FLAG_NONE);
 }
 
 static size_t trevrpc_msquic_varint_len(size_t value) {
@@ -1426,6 +1440,20 @@ intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_
     memcpy(send->data, data, len);
 
     return trevrpc_msquic_stream_send_buffer(stream, send, len);
+}
+
+intptr_t trevrpc_msquic_stream_write_fin(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
+    if (len == 0) {
+        return trevrpc_msquic_stream_shutdown_send(stream);
+    }
+
+    trevrpc_msquic_send* send = trevrpc_msquic_send_alloc(len, false);
+    if (send == NULL) {
+        return -ENOMEM;
+    }
+    memcpy(send->data, data, len);
+
+    return trevrpc_msquic_stream_send_buffer_with_flags(stream, send, len, QUIC_SEND_FLAG_FIN);
 }
 
 intptr_t trevrpc_msquic_stream_write_message_frame(

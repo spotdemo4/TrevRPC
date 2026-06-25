@@ -21,7 +21,7 @@ GO_ITERATIONS=${GO_ITERATIONS:-$SPLIT_ITERATIONS}
 JS_ITERATIONS=${JS_ITERATIONS:-$SPLIT_ITERATIONS}
 RUST_ITERATIONS=${RUST_ITERATIONS:-$SPLIT_ITERATIONS}
 SPLIT_RUNS=${SPLIT_RUNS:-3}
-SAMPLE_TIMEOUT_SECONDS=${SAMPLE_TIMEOUT_SECONDS:-300}
+SAMPLE_TIMEOUT_SECONDS=${SAMPLE_TIMEOUT_SECONDS:-900}
 CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release}
 CMAKE_BUILD_DIR=${CMAKE_BUILD_DIR:-"$OUT_DIR/c-build"}
 SERVER_STARTUP_TIMEOUT_SECONDS=${SERVER_STARTUP_TIMEOUT_SECONDS:-15}
@@ -50,7 +50,7 @@ Environment knobs:
   OUT_DIR                 Output directory. Default: target/rpc-split
   SPLIT_ITERATIONS        Shared fixed iteration count. Default: 10000
   SPLIT_RUNS              Measurement command repetitions. Default: 3
-  SAMPLE_TIMEOUT_SECONDS  Per-sample timeout. Default: 300
+  SAMPLE_TIMEOUT_SECONDS  Per-sample timeout. Default: 900
   C_ITERATIONS            C client iteration count. Default: SPLIT_ITERATIONS
   GO_ITERATIONS           Go client iteration count. Default: SPLIT_ITERATIONS
   JS_ITERATIONS           JavaScript client iteration count. Default: SPLIT_ITERATIONS
