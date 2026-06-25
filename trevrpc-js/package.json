@@ -43,7 +43,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "protobufjs": "^7.6.4"
+    "protobufjs": "^8.6.5"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
