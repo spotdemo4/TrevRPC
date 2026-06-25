@@ -1951,6 +1951,30 @@ intptr_t trevrpc_wt_stream_write(trevrpc_wt_stream* stream, const uint8_t* data,
     return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
 }
 
+intptr_t trevrpc_wt_stream_write_message_frame(
+    trevrpc_wt_stream* stream, const uint8_t* body, size_t body_len, size_t max_len) {
+    if (stream == NULL) {
+        return -EINVAL;
+    }
+    if (stream->msquic_stream == NULL) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    intptr_t n = trevrpc_msquic_stream_write_message_frame(stream->msquic_stream, body, body_len, max_len);
+    return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
+}
+
+intptr_t trevrpc_wt_stream_write_message_frames(
+    trevrpc_wt_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count, size_t max_len) {
+    if (stream == NULL) {
+        return -EINVAL;
+    }
+    if (stream->msquic_stream == NULL) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    intptr_t n = trevrpc_msquic_stream_write_message_frames(stream->msquic_stream, bodies, body_lens, count, max_len);
+    return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
+}
+
 int trevrpc_wt_stream_shutdown_send(trevrpc_wt_stream* stream) {
     if (stream == NULL) {
         return -EINVAL;

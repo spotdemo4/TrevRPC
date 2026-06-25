@@ -505,6 +505,12 @@ int trevrpc_stream_frame_set_body(trevrpc_stream_frame* frame, const uint8_t* bo
         return -EINVAL;
     }
 
+    if (frame->_body_owner != NULL) {
+        free(frame->_body_owner);
+        frame->_body_owner = NULL;
+        frame->body = NULL;
+        frame->body_len = 0;
+    }
     return trevrpc_copy_bytes(&frame->body, &frame->body_len, body, body_len);
 }
 
@@ -532,7 +538,11 @@ void trevrpc_stream_frame_reset(trevrpc_stream_frame* frame) {
     }
 
     free(frame->message);
-    free(frame->body);
+    if (frame->_body_owner != NULL) {
+        free(frame->_body_owner);
+    } else {
+        free(frame->body);
+    }
     trevrpc_metadata_reset(&frame->metadata);
     frame->kind = TREVRPC_STREAM_FRAME_KIND_MESSAGE;
     frame->status = TREVRPC_STATUS_OK;
@@ -540,6 +550,7 @@ void trevrpc_stream_frame_reset(trevrpc_stream_frame* frame) {
     frame->message_len = 0;
     frame->body = NULL;
     frame->body_len = 0;
+    frame->_body_owner = NULL;
 }
 
 void trevrpc_stream_frame_free(trevrpc_stream_frame* frame) {

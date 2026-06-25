@@ -22,6 +22,12 @@
 #define TREV_MSQUIC_SEND_POOL_MAX_CAPACITY 65536
 
 typedef struct trevrpc_msquic_send trevrpc_msquic_send;
+typedef struct trevrpc_msquic_frame trevrpc_msquic_frame;
+
+typedef enum trevrpc_msquic_recv_mode {
+    TREV_MSQUIC_RECV_BYTES = 0,
+    TREV_MSQUIC_RECV_FRAMES = 1,
+} trevrpc_msquic_recv_mode;
 
 typedef struct trevrpc_msquic_chunk {
     struct trevrpc_msquic_chunk* next;
@@ -29,6 +35,13 @@ typedef struct trevrpc_msquic_chunk {
     size_t offset;
     uint8_t data[];
 } trevrpc_msquic_chunk;
+
+struct trevrpc_msquic_frame {
+    trevrpc_msquic_frame* next;
+    uint8_t* body;
+    size_t len;
+    intptr_t err;
+};
 
 typedef struct trevrpc_msquic_stream_node {
     struct trevrpc_msquic_stream_node* next;
@@ -44,9 +57,19 @@ struct trevrpc_msquic_stream {
     HQUIC handle;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    trevrpc_msquic_recv_mode recv_mode;
     trevrpc_msquic_chunk* recv_head;
     trevrpc_msquic_chunk* recv_tail;
     size_t recv_buffered;
+    trevrpc_msquic_frame* frame_head;
+    trevrpc_msquic_frame* frame_tail;
+    size_t frame_max_len;
+    uint8_t frame_header[4];
+    size_t frame_header_len;
+    size_t frame_body_len;
+    size_t frame_body_offset;
+    uint8_t* frame_body;
+    size_t frame_skip_remaining;
     bool recv_fin;
     bool send_closed;
     bool shutdown_complete;
@@ -322,6 +345,24 @@ static void trevrpc_msquic_free_chunks(trevrpc_msquic_stream* stream) {
     stream->recv_buffered = 0;
 }
 
+static void trevrpc_msquic_free_frames(trevrpc_msquic_stream* stream) {
+    trevrpc_msquic_frame* frame = stream->frame_head;
+    while (frame != NULL) {
+        trevrpc_msquic_frame* next = frame->next;
+        free(frame->body);
+        free(frame);
+        frame = next;
+    }
+    stream->frame_head = NULL;
+    stream->frame_tail = NULL;
+    free(stream->frame_body);
+    stream->frame_body = NULL;
+    stream->frame_header_len = 0;
+    stream->frame_body_len = 0;
+    stream->frame_body_offset = 0;
+    stream->frame_skip_remaining = 0;
+}
+
 static void trevrpc_msquic_free_send_pool(trevrpc_msquic_stream* stream) {
     trevrpc_msquic_send* send = stream->send_pool;
     while (send != NULL) {
@@ -437,6 +478,194 @@ static int trevrpc_msquic_stream_wait_recv_locked(trevrpc_msquic_stream* stream,
     }
 
     return 0;
+}
+
+static int trevrpc_msquic_frame_enqueue_locked(trevrpc_msquic_stream* stream, uint8_t* body, size_t len, intptr_t err) {
+    trevrpc_msquic_frame* frame = malloc(sizeof(*frame));
+    if (frame == NULL) {
+        free(body);
+        return -ENOMEM;
+    }
+    frame->next = NULL;
+    frame->body = body;
+    frame->len = len;
+    frame->err = err;
+
+    if (stream->frame_tail != NULL) {
+        stream->frame_tail->next = frame;
+    } else {
+        stream->frame_head = frame;
+    }
+    stream->frame_tail = frame;
+    return 0;
+}
+
+static void trevrpc_msquic_frame_parser_reset_body(trevrpc_msquic_stream* stream) {
+    stream->frame_header_len = 0;
+    stream->frame_body_len = 0;
+    stream->frame_body_offset = 0;
+    stream->frame_body = NULL;
+}
+
+static bool trevrpc_msquic_frame_parser_active(const trevrpc_msquic_stream* stream) {
+    return stream->frame_header_len > 0 || stream->frame_body != NULL || stream->frame_skip_remaining > 0;
+}
+
+static size_t trevrpc_msquic_frame_header_len(const uint8_t header[4]) {
+    return ((size_t)header[0] << 24) | ((size_t)header[1] << 16) | ((size_t)header[2] << 8) | (size_t)header[3];
+}
+
+static int trevrpc_msquic_frame_parser_start_body_locked(trevrpc_msquic_stream* stream) {
+    size_t body_len = trevrpc_msquic_frame_header_len(stream->frame_header);
+    stream->frame_body_len = body_len;
+    stream->frame_body_offset = 0;
+
+    if (body_len > stream->frame_max_len) {
+        int err = trevrpc_msquic_frame_enqueue_locked(stream, NULL, body_len, TREV_MSQUIC_ERR_FRAME_TOO_LARGE);
+        if (err != 0) {
+            return err;
+        }
+        stream->frame_skip_remaining = body_len;
+        stream->frame_header_len = 0;
+        stream->frame_body_len = 0;
+        return 0;
+    }
+
+    if (body_len == 0) {
+        stream->frame_header_len = 0;
+        stream->frame_body_len = 0;
+        return trevrpc_msquic_frame_enqueue_locked(stream, NULL, 0, 0);
+    }
+
+    stream->frame_body = malloc(body_len);
+    if (stream->frame_body == NULL) {
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+static int trevrpc_msquic_stream_append_frame_bytes_locked(
+    trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        if (stream->frame_skip_remaining > 0) {
+            size_t remaining = len - offset;
+            size_t skipped = remaining < stream->frame_skip_remaining ? remaining : stream->frame_skip_remaining;
+            stream->frame_skip_remaining -= skipped;
+            offset += skipped;
+            continue;
+        }
+
+        if (stream->frame_header_len < sizeof(stream->frame_header)) {
+            size_t remaining = len - offset;
+            size_t header_remaining = sizeof(stream->frame_header) - stream->frame_header_len;
+            size_t copied = remaining < header_remaining ? remaining : header_remaining;
+            memcpy(stream->frame_header + stream->frame_header_len, data + offset, copied);
+            stream->frame_header_len += copied;
+            offset += copied;
+            if (stream->frame_header_len < sizeof(stream->frame_header)) {
+                continue;
+            }
+            int err = trevrpc_msquic_frame_parser_start_body_locked(stream);
+            if (err != 0) {
+                return err;
+            }
+            continue;
+        }
+
+        size_t remaining = len - offset;
+        size_t body_remaining = stream->frame_body_len - stream->frame_body_offset;
+        size_t copied = remaining < body_remaining ? remaining : body_remaining;
+        memcpy(stream->frame_body + stream->frame_body_offset, data + offset, copied);
+        stream->frame_body_offset += copied;
+        offset += copied;
+
+        if (stream->frame_body_offset == stream->frame_body_len) {
+            uint8_t* body = stream->frame_body;
+            size_t body_len = stream->frame_body_len;
+            trevrpc_msquic_frame_parser_reset_body(stream);
+            int err = trevrpc_msquic_frame_enqueue_locked(stream, body, body_len, 0);
+            if (err != 0) {
+                return err;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int trevrpc_msquic_stream_enable_frame_mode_locked(trevrpc_msquic_stream* stream, size_t max_len) {
+    if (stream->recv_mode == TREV_MSQUIC_RECV_FRAMES) {
+        stream->frame_max_len = max_len;
+        return 0;
+    }
+
+    stream->recv_mode = TREV_MSQUIC_RECV_FRAMES;
+    stream->frame_max_len = max_len;
+    while (stream->recv_head != NULL) {
+        trevrpc_msquic_chunk* chunk = stream->recv_head;
+        stream->recv_head = chunk->next;
+        if (stream->recv_head == NULL) {
+            stream->recv_tail = NULL;
+        }
+        size_t available = chunk->len - chunk->offset;
+        stream->recv_buffered -= available;
+        int err = trevrpc_msquic_stream_append_frame_bytes_locked(stream, chunk->data + chunk->offset, available);
+        free(chunk);
+        if (err != 0) {
+            stream->err = -err;
+            return err;
+        }
+    }
+    stream->recv_buffered = 0;
+    return 0;
+}
+
+static intptr_t trevrpc_msquic_stream_wait_frame_locked(
+    trevrpc_msquic_stream* stream, const struct timespec* deadline) {
+    while (stream->frame_head == NULL && !stream->recv_fin && !stream->closed && stream->err == 0) {
+        int err = deadline == NULL ? pthread_cond_wait(&stream->cond, &stream->mutex)
+                                   : pthread_cond_timedwait(&stream->cond, &stream->mutex, deadline);
+        if (err == ETIMEDOUT) {
+            return TREV_MSQUIC_ERR_TIMEOUT;
+        }
+        if (err != 0) {
+            return -err;
+        }
+    }
+
+    if (stream->frame_head != NULL) {
+        return 0;
+    }
+    if (stream->err != 0) {
+        return trevrpc_msquic_error_result(stream->err);
+    }
+    return trevrpc_msquic_frame_parser_active(stream) ? TREV_MSQUIC_ERR_CLOSED : TREV_MSQUIC_ERR_EOF;
+}
+
+static intptr_t trevrpc_msquic_stream_frame_not_ready_locked(trevrpc_msquic_stream* stream) {
+    if (stream->frame_head != NULL) {
+        return 0;
+    }
+    if (stream->err != 0) {
+        return trevrpc_msquic_error_result(stream->err);
+    }
+    if (stream->recv_fin || stream->closed) {
+        return trevrpc_msquic_frame_parser_active(stream) ? TREV_MSQUIC_ERR_CLOSED : TREV_MSQUIC_ERR_EOF;
+    }
+    return TREV_MSQUIC_ERR_TIMEOUT;
+}
+
+static trevrpc_msquic_frame* trevrpc_msquic_stream_pop_frame_locked(trevrpc_msquic_stream* stream) {
+    trevrpc_msquic_frame* frame = stream->frame_head;
+    if (frame != NULL) {
+        stream->frame_head = frame->next;
+        if (stream->frame_head == NULL) {
+            stream->frame_tail = NULL;
+        }
+        frame->next = NULL;
+    }
+    return frame;
 }
 
 static intptr_t trevrpc_msquic_stream_send_buffer(
@@ -1052,6 +1281,10 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
     }
 
     pthread_mutex_lock(&stream->mutex);
+    if (stream->recv_mode == TREV_MSQUIC_RECV_FRAMES) {
+        pthread_mutex_unlock(&stream->mutex);
+        return TREV_MSQUIC_ERR_CLOSED;
+    }
     int wait_err = trevrpc_msquic_stream_wait_recv_locked(stream, NULL);
     if (wait_err != 0) {
         pthread_mutex_unlock(&stream->mutex);
@@ -1082,105 +1315,43 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
     return (intptr_t)copied;
 }
 
-static intptr_t trevrpc_msquic_stream_read_exact_locked(
-    trevrpc_msquic_stream* stream, uint8_t* data, size_t len, const struct timespec* deadline) {
-    size_t copied = 0;
-    while (copied < len) {
-        int wait_err = trevrpc_msquic_stream_wait_recv_locked(stream, deadline);
-        if (wait_err != 0) {
-            return wait_err < 0 ? wait_err : -wait_err;
-        }
-
-        if (stream->recv_head == NULL) {
-            if (stream->err != 0) {
-                return trevrpc_msquic_error_result(stream->err);
-            }
-            return copied == 0 ? TREV_MSQUIC_ERR_EOF : TREV_MSQUIC_ERR_CLOSED;
-        }
-
-        trevrpc_msquic_chunk* chunk = stream->recv_head;
-        size_t available = chunk->len - chunk->offset;
-        size_t remaining = len - copied;
-        size_t chunk_copied = available < remaining ? available : remaining;
-        memcpy(data + copied, chunk->data + chunk->offset, chunk_copied);
-        copied += chunk_copied;
-        chunk->offset += chunk_copied;
-        stream->recv_buffered -= chunk_copied;
-        if (chunk->offset == chunk->len) {
-            stream->recv_head = chunk->next;
-            if (stream->recv_head == NULL) {
-                stream->recv_tail = NULL;
-            }
-            free(chunk);
-        }
-    }
-
-    return (intptr_t)copied;
-}
-
-static bool trevrpc_msquic_stream_peek_locked(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
-    size_t copied = 0;
-    for (trevrpc_msquic_chunk* chunk = stream->recv_head; copied < len && chunk != NULL; chunk = chunk->next) {
-        size_t available = chunk->len - chunk->offset;
-        size_t remaining = len - copied;
-        size_t chunk_copied = available < remaining ? available : remaining;
-        memcpy(data + copied, chunk->data + chunk->offset, chunk_copied);
-        copied += chunk_copied;
-    }
-    return copied == len;
-}
-
-static intptr_t trevrpc_msquic_stream_not_ready_locked(trevrpc_msquic_stream* stream) {
-    if (stream->err != 0) {
-        return trevrpc_msquic_error_result(stream->err);
-    }
-    if (stream->recv_fin || stream->closed) {
-        return stream->recv_buffered == 0 ? TREV_MSQUIC_ERR_EOF : TREV_MSQUIC_ERR_CLOSED;
-    }
-    return TREV_MSQUIC_ERR_TIMEOUT;
-}
-
 static intptr_t trevrpc_msquic_stream_read_frame_until(
     trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, const struct timespec* deadline) {
     *body = NULL;
     *len = 0;
 
-    uint8_t header[4] = {0};
     pthread_mutex_lock(&stream->mutex);
-    intptr_t read = trevrpc_msquic_stream_read_exact_locked(stream, header, sizeof(header), deadline);
-    if (read <= 0) {
+    int err = trevrpc_msquic_stream_enable_frame_mode_locked(stream, max_len);
+    if (err != 0) {
         pthread_mutex_unlock(&stream->mutex);
-        return read;
+        return err;
+    }
+    intptr_t ready = trevrpc_msquic_stream_wait_frame_locked(stream, deadline);
+    if (ready != 0) {
+        pthread_mutex_unlock(&stream->mutex);
+        return ready;
+    }
+    if (stream->frame_head == NULL) {
+        pthread_mutex_unlock(&stream->mutex);
+        return TREV_MSQUIC_ERR_EOF;
     }
 
-    size_t body_len =
-        ((size_t)header[0] << 24) | ((size_t)header[1] << 16) | ((size_t)header[2] << 8) | (size_t)header[3];
-    if (body_len > max_len) {
-        *len = body_len;
-        pthread_mutex_unlock(&stream->mutex);
+    trevrpc_msquic_frame* frame = trevrpc_msquic_stream_pop_frame_locked(stream);
+    pthread_mutex_unlock(&stream->mutex);
+    *len = frame->len;
+    if (frame->err != 0) {
+        intptr_t result = frame->err;
+        free(frame->body);
+        free(frame);
+        return result;
+    }
+    if (frame->len > max_len) {
+        free(frame->body);
+        free(frame);
         return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
     }
-
-    if (body_len == 0) {
-        pthread_mutex_unlock(&stream->mutex);
-        return 1;
-    }
-
-    uint8_t* buffer = malloc(body_len);
-    if (buffer == NULL) {
-        pthread_mutex_unlock(&stream->mutex);
-        return -ENOMEM;
-    }
-
-    read = trevrpc_msquic_stream_read_exact_locked(stream, buffer, body_len, deadline);
-    pthread_mutex_unlock(&stream->mutex);
-    if (read <= 0) {
-        free(buffer);
-        return read == 0 ? TREV_MSQUIC_ERR_CLOSED : read;
-    }
-
-    *body = buffer;
-    *len = body_len;
+    *body = frame->body;
+    free(frame);
     return 1;
 }
 
@@ -1208,55 +1379,38 @@ intptr_t trevrpc_msquic_stream_read_frame_ready(
     *body = NULL;
     *len = 0;
 
-    uint8_t header[4];
     pthread_mutex_lock(&stream->mutex);
-    if (stream->recv_buffered < sizeof(header)) {
-        intptr_t result = trevrpc_msquic_stream_not_ready_locked(stream);
+    int err = trevrpc_msquic_stream_enable_frame_mode_locked(stream, max_len);
+    if (err != 0) {
         pthread_mutex_unlock(&stream->mutex);
+        return err;
+    }
+    intptr_t ready = trevrpc_msquic_stream_frame_not_ready_locked(stream);
+    if (ready != 0) {
+        pthread_mutex_unlock(&stream->mutex);
+        return ready;
+    }
+    if (stream->frame_head == NULL) {
+        pthread_mutex_unlock(&stream->mutex);
+        return TREV_MSQUIC_ERR_EOF;
+    }
+
+    trevrpc_msquic_frame* frame = trevrpc_msquic_stream_pop_frame_locked(stream);
+    pthread_mutex_unlock(&stream->mutex);
+    *len = frame->len;
+    if (frame->err != 0) {
+        intptr_t result = frame->err;
+        free(frame->body);
+        free(frame);
         return result;
     }
-
-    if (!trevrpc_msquic_stream_peek_locked(stream, header, sizeof(header))) {
-        pthread_mutex_unlock(&stream->mutex);
-        return TREV_MSQUIC_ERR_CLOSED;
-    }
-    size_t body_len =
-        ((size_t)header[0] << 24) | ((size_t)header[1] << 16) | ((size_t)header[2] << 8) | (size_t)header[3];
-    if (body_len > max_len) {
-        *len = body_len;
-        pthread_mutex_unlock(&stream->mutex);
+    if (frame->len > max_len) {
+        free(frame->body);
+        free(frame);
         return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
     }
-    if (body_len > SIZE_MAX - sizeof(header) || stream->recv_buffered < sizeof(header) + body_len) {
-        intptr_t result = trevrpc_msquic_stream_not_ready_locked(stream);
-        pthread_mutex_unlock(&stream->mutex);
-        return result == TREV_MSQUIC_ERR_EOF ? TREV_MSQUIC_ERR_CLOSED : result;
-    }
-
-    intptr_t read = trevrpc_msquic_stream_read_exact_locked(stream, header, sizeof(header), NULL);
-    if (read <= 0) {
-        pthread_mutex_unlock(&stream->mutex);
-        return read;
-    }
-    if (body_len == 0) {
-        pthread_mutex_unlock(&stream->mutex);
-        return 1;
-    }
-
-    uint8_t* buffer = malloc(body_len);
-    if (buffer == NULL) {
-        pthread_mutex_unlock(&stream->mutex);
-        return -ENOMEM;
-    }
-    read = trevrpc_msquic_stream_read_exact_locked(stream, buffer, body_len, NULL);
-    pthread_mutex_unlock(&stream->mutex);
-    if (read <= 0) {
-        free(buffer);
-        return read == 0 ? TREV_MSQUIC_ERR_CLOSED : read;
-    }
-
-    *body = buffer;
-    *len = body_len;
+    *body = frame->body;
+    free(frame);
     return 1;
 }
 
@@ -1428,6 +1582,7 @@ void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
         pthread_cond_wait(&stream->cond, &stream->mutex);
     }
     trevrpc_msquic_free_chunks(stream);
+    trevrpc_msquic_free_frames(stream);
     trevrpc_msquic_free_send_pool(stream);
     pthread_mutex_unlock(&stream->mutex);
 
@@ -1596,30 +1751,49 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_stream_callback(
     switch (event->Type) {
     case QUIC_STREAM_EVENT_RECEIVE: {
         if (event->RECEIVE.TotalBufferLength > 0) {
-            if (event->RECEIVE.TotalBufferLength > SIZE_MAX - sizeof(trevrpc_msquic_chunk)) {
-                return QUIC_STATUS_OUT_OF_MEMORY;
-            }
-            trevrpc_msquic_chunk* chunk = malloc(sizeof(*chunk) + (size_t)event->RECEIVE.TotalBufferLength);
-            if (chunk == NULL) {
-                return QUIC_STATUS_OUT_OF_MEMORY;
-            }
-            chunk->next = NULL;
-            chunk->len = (size_t)event->RECEIVE.TotalBufferLength;
-            chunk->offset = 0;
-            size_t offset = 0;
-            for (uint32_t i = 0; i < event->RECEIVE.BufferCount; i++) {
-                memcpy(chunk->data + offset, event->RECEIVE.Buffers[i].Buffer, event->RECEIVE.Buffers[i].Length);
-                offset += event->RECEIVE.Buffers[i].Length;
-            }
-
             pthread_mutex_lock(&stream->mutex);
-            if (stream->recv_tail != NULL) {
-                stream->recv_tail->next = chunk;
+            if (stream->recv_mode == TREV_MSQUIC_RECV_FRAMES) {
+                int err = 0;
+                for (uint32_t i = 0; i < event->RECEIVE.BufferCount; i++) {
+                    err = trevrpc_msquic_stream_append_frame_bytes_locked(
+                        stream, event->RECEIVE.Buffers[i].Buffer, event->RECEIVE.Buffers[i].Length);
+                    if (err != 0) {
+                        break;
+                    }
+                }
+                if (err != 0) {
+                    stream->err = -err;
+                    pthread_cond_broadcast(&stream->cond);
+                    pthread_mutex_unlock(&stream->mutex);
+                    return QUIC_STATUS_OUT_OF_MEMORY;
+                }
             } else {
-                stream->recv_head = chunk;
+                if (event->RECEIVE.TotalBufferLength > SIZE_MAX - sizeof(trevrpc_msquic_chunk)) {
+                    pthread_mutex_unlock(&stream->mutex);
+                    return QUIC_STATUS_OUT_OF_MEMORY;
+                }
+                trevrpc_msquic_chunk* chunk = malloc(sizeof(*chunk) + (size_t)event->RECEIVE.TotalBufferLength);
+                if (chunk == NULL) {
+                    pthread_mutex_unlock(&stream->mutex);
+                    return QUIC_STATUS_OUT_OF_MEMORY;
+                }
+                chunk->next = NULL;
+                chunk->len = (size_t)event->RECEIVE.TotalBufferLength;
+                chunk->offset = 0;
+                size_t offset = 0;
+                for (uint32_t i = 0; i < event->RECEIVE.BufferCount; i++) {
+                    memcpy(chunk->data + offset, event->RECEIVE.Buffers[i].Buffer, event->RECEIVE.Buffers[i].Length);
+                    offset += event->RECEIVE.Buffers[i].Length;
+                }
+
+                if (stream->recv_tail != NULL) {
+                    stream->recv_tail->next = chunk;
+                } else {
+                    stream->recv_head = chunk;
+                }
+                stream->recv_tail = chunk;
+                stream->recv_buffered += chunk->len;
             }
-            stream->recv_tail = chunk;
-            stream->recv_buffered += chunk->len;
             pthread_mutex_unlock(&stream->mutex);
         }
 

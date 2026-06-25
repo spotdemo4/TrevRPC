@@ -3,6 +3,7 @@
 
 #include "trevrpc.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -32,5 +33,6 @@ int trevrpc_wire_encode_stream_frame(uint32_t kind,
 int trevrpc_wire_decode_request(const uint8_t* data, size_t len, trevrpc_request* request);
 int trevrpc_wire_decode_response(const uint8_t* data, size_t len, trevrpc_response** out_response);
 int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_stream_frame** out_frame);
+int trevrpc_wire_decode_stream_frame_take(uint8_t* data, size_t len, trevrpc_stream_frame** out_frame, bool* took_body);
 
 #endif

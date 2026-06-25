@@ -282,6 +282,59 @@ static bool trevrpc_wire_skip_field(const uint8_t* data, size_t len, size_t* off
     }
 }
 
+static trevrpc_stream_frame* trevrpc_wire_alloc_stream_frame(void) {
+    trevrpc_stream_frame* frame = calloc(1, sizeof(*frame));
+    if (frame != NULL) {
+        frame->kind = TREVRPC_STREAM_FRAME_KIND_MESSAGE;
+        frame->status = TREVRPC_STATUS_OK;
+    }
+    return frame;
+}
+
+static int trevrpc_wire_try_decode_message_stream_frame_take(
+    uint8_t* data, size_t len, trevrpc_stream_frame** out_frame, bool* matched) {
+    *matched = false;
+    if (len == 0) {
+        trevrpc_stream_frame* frame = trevrpc_wire_alloc_stream_frame();
+        if (frame == NULL) {
+            return -ENOMEM;
+        }
+        frame->_body_owner = data;
+        *out_frame = frame;
+        *matched = true;
+        return 0;
+    }
+
+    size_t offset = 0;
+    uint64_t tag = 0;
+    if (!trevrpc_wire_consume_varint(data, len, &offset, &tag)) {
+        return 0;
+    }
+    if (tag != 0x22) {
+        return 0;
+    }
+
+    const uint8_t* value = NULL;
+    size_t value_len = 0;
+    if (!trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
+        return TREVRPC_ERR_INVALID_FRAME;
+    }
+    if (offset != len) {
+        return 0;
+    }
+
+    trevrpc_stream_frame* frame = trevrpc_wire_alloc_stream_frame();
+    if (frame == NULL) {
+        return -ENOMEM;
+    }
+    frame->body = value_len == 0 ? NULL : (uint8_t*)value;
+    frame->body_len = value_len;
+    frame->_body_owner = data;
+    *out_frame = frame;
+    *matched = true;
+    return 0;
+}
+
 static int trevrpc_wire_parse_metadata_entry(const uint8_t* data, size_t len, trevrpc_metadata* metadata) {
     const uint8_t* key = NULL;
     size_t key_len = 0;
@@ -503,11 +556,10 @@ int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_st
         return -EINVAL;
     }
     *out_frame = NULL;
-    trevrpc_stream_frame* frame = calloc(1, sizeof(*frame));
+    trevrpc_stream_frame* frame = trevrpc_wire_alloc_stream_frame();
     if (frame == NULL) {
         return -ENOMEM;
     }
-    frame->kind = TREVRPC_STREAM_FRAME_KIND_MESSAGE;
 
     for (size_t offset = 0; offset < len;) {
         uint64_t tag = 0;
@@ -591,4 +643,24 @@ int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_st
 
     *out_frame = frame;
     return 0;
+}
+
+int trevrpc_wire_decode_stream_frame_take(
+    uint8_t* data, size_t len, trevrpc_stream_frame** out_frame, bool* took_body) {
+    if (took_body == NULL) {
+        return -EINVAL;
+    }
+    *took_body = false;
+
+    bool matched = false;
+    int err = trevrpc_wire_try_decode_message_stream_frame_take(data, len, out_frame, &matched);
+    if (err != 0) {
+        return err;
+    }
+    if (matched) {
+        *took_body = true;
+        return 0;
+    }
+
+    return trevrpc_wire_decode_stream_frame(data, len, out_frame);
 }

@@ -2,6 +2,7 @@
 #include "trevrpc_wire_internal.h"
 
 #include <errno.h> // IWYU pragma: keep
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -834,6 +835,51 @@ cleanup:
     return result;
 }
 
+static int test_stream_message_frame_take_avoids_body_copy(void) {
+    int result = 1;
+    trevrpc_stream_frame* decoded = NULL;
+    uint8_t* frame = NULL;
+    uint8_t* owner = NULL;
+    size_t frame_len = 0;
+    uint8_t payload[] = {'h', 'e', 'l', 'l', 'o'};
+
+    int err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+        TREVRPC_STATUS_OK,
+        NULL,
+        0,
+        payload,
+        sizeof(payload),
+        NULL,
+        1024,
+        &frame,
+        &frame_len);
+    CHECK_GOTO(err == 0);
+
+    size_t body_len = frame_len - 4;
+    owner = malloc(body_len);
+    CHECK_GOTO(owner != NULL);
+    memcpy(owner, frame + 4, body_len);
+
+    bool took_body = false;
+    err = trevrpc_wire_decode_stream_frame_take(owner, body_len, &decoded, &took_body);
+    CHECK_GOTO(err == 0);
+    CHECK_GOTO(took_body);
+    CHECK_GOTO(decoded != NULL);
+    CHECK_GOTO(decoded->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
+    CHECK_GOTO(bytes_equal(decoded->body, decoded->body_len, payload, sizeof(payload)));
+    CHECK_GOTO(decoded->_body_owner == owner);
+    CHECK_GOTO(decoded->body > owner && decoded->body < owner + body_len);
+    owner = NULL;
+
+    result = 0;
+
+cleanup:
+    trevrpc_stream_frame_free(decoded);
+    free(owner);
+    free(frame);
+    return result;
+}
+
 static int test_stream_frame_metadata_round_trip(void) {
     int result = 1;
     trevrpc_stream_frame* decoded = NULL;
@@ -1197,6 +1243,9 @@ int main(void) {
         return 1;
     }
     if (test_stream_frame_round_trip() != 0) {
+        return 1;
+    }
+    if (test_stream_message_frame_take_avoids_body_copy() != 0) {
         return 1;
     }
     if (test_stream_frame_metadata_round_trip() != 0) {

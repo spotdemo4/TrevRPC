@@ -1161,9 +1161,16 @@ static char* generate_header(
 
 static void write_pack_request(string_builder* buffer, const type_ref* message, const char* name) {
     string_builder_appendf(buffer, "    size_t body_len = %s__get_packed_size(%s);\n", message->c_prefix, name);
-    string_builder_append(buffer, "    uint8_t* body = body_len == 0 ? NULL : malloc(body_len);\n");
+    string_builder_append(buffer, "    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];\n");
+    string_builder_append(buffer,
+        "    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : "
+        "malloc(body_len));\n");
     string_builder_append(buffer, "    if (body_len > 0 && body == NULL) { return -12; }\n");
     string_builder_appendf(buffer, "    %s__pack(%s, body);\n", message->c_prefix, name);
+}
+
+static void write_free_packed_body(string_builder* buffer) {
+    string_builder_append(buffer, "    if (body != stack_body) { free(body); }\n");
 }
 
 static void generate_send_helper(string_builder* buffer, const service_info* service, const type_ref* message) {
@@ -1179,11 +1186,14 @@ static void generate_send_helper(string_builder* buffer, const service_info* ser
         message->c_type);
     string_builder_append(buffer, "    if (message == NULL) { return -22; }\n");
     string_builder_appendf(buffer, "    size_t body_len = %s__get_packed_size(message);\n", message->c_prefix);
-    string_builder_append(buffer, "    uint8_t* body = body_len == 0 ? NULL : malloc(body_len);\n");
+    string_builder_append(buffer, "    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];\n");
+    string_builder_append(buffer,
+        "    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : "
+        "malloc(body_len));\n");
     string_builder_append(buffer, "    if (body_len > 0 && body == NULL) { return -12; }\n");
     string_builder_appendf(buffer, "    %s__pack(message, body);\n", message->c_prefix);
     string_builder_append(buffer, "    int err = trevrpc_stream_send_message(stream, body, body_len);\n");
-    string_builder_append(buffer, "    free(body);\n");
+    write_free_packed_body(buffer);
     string_builder_append(buffer, "    return err;\n");
     string_builder_append(buffer, "}\n\n");
     free(helper);
@@ -1254,7 +1264,7 @@ static void generate_client_wrapper(string_builder* buffer, const service_info* 
             "body_len, &rpc_response);\n",
             service_name,
             method_name);
-        string_builder_append(buffer, "    free(body);\n");
+        write_free_packed_body(buffer);
         string_builder_append(buffer, "    if (err != 0) { return err; }\n");
         string_builder_append(buffer,
             "    if (rpc_response->status != TREVRPC_STATUS_OK) { err = (int)rpc_response->status; "
@@ -1289,7 +1299,7 @@ static void generate_client_wrapper(string_builder* buffer, const service_info* 
             "body_len, stream);\n",
             service_name,
             method_name);
-        string_builder_append(buffer, "    free(body);\n");
+        write_free_packed_body(buffer);
         string_builder_append(buffer, "    if (err == 0) { err = trevrpc_stream_finish_send(*stream); }\n");
         string_builder_append(buffer, "    return err;\n");
         string_builder_append(buffer, "}\n\n");
@@ -1326,14 +1336,17 @@ static void generate_server_callback(string_builder* buffer, const service_info*
         string_builder_append(buffer, "    if (err != 0) { return err; }\n");
         string_builder_append(buffer, "    if (reply == NULL) { return TREVRPC_ERR_HANDLER_FAILED; }\n");
         string_builder_appendf(buffer, "    size_t body_len = %s__get_packed_size(reply);\n", method->output->c_prefix);
-        string_builder_append(buffer, "    uint8_t* body = body_len == 0 ? NULL : malloc(body_len);\n");
+        string_builder_append(buffer, "    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];\n");
+        string_builder_append(buffer,
+            "    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : "
+            "malloc(body_len));\n");
         string_builder_appendf(buffer,
             "    if (body_len > 0 && body == NULL) { %s__free_unpacked(reply, NULL); return -12; }\n",
             method->output->c_prefix);
         string_builder_appendf(buffer, "    %s__pack(reply, body);\n", method->output->c_prefix);
         string_builder_appendf(buffer, "    %s__free_unpacked(reply, NULL);\n", method->output->c_prefix);
         string_builder_append(buffer, "    err = trevrpc_response_set_body(response, body, body_len);\n");
-        string_builder_append(buffer, "    free(body);\n");
+        write_free_packed_body(buffer);
         string_builder_append(buffer, "    return err;\n");
         string_builder_append(buffer, "}\n\n");
         free(callback_name);
@@ -1359,14 +1372,17 @@ static void generate_server_callback(string_builder* buffer, const service_info*
         string_builder_append(buffer, "    if (err != 0) { return err; }\n");
         string_builder_append(buffer, "    if (reply == NULL) { return TREVRPC_ERR_HANDLER_FAILED; }\n");
         string_builder_appendf(buffer, "    size_t body_len = %s__get_packed_size(reply);\n", method->output->c_prefix);
-        string_builder_append(buffer, "    uint8_t* body = body_len == 0 ? NULL : malloc(body_len);\n");
+        string_builder_append(buffer, "    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];\n");
+        string_builder_append(buffer,
+            "    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : "
+            "malloc(body_len));\n");
         string_builder_appendf(buffer,
             "    if (body_len > 0 && body == NULL) { %s__free_unpacked(reply, NULL); return -12; }\n",
             method->output->c_prefix);
         string_builder_appendf(buffer, "    %s__pack(reply, body);\n", method->output->c_prefix);
         string_builder_appendf(buffer, "    %s__free_unpacked(reply, NULL);\n", method->output->c_prefix);
         string_builder_append(buffer, "    err = trevrpc_stream_send_message(stream, body, body_len);\n");
-        string_builder_append(buffer, "    free(body);\n");
+        write_free_packed_body(buffer);
         string_builder_append(buffer, "    return err;\n");
     } else if (method->server_streaming) {
         string_builder_appendf(buffer,
@@ -1469,6 +1485,7 @@ static char* generate_source(
     string_builder_append(&buffer, "#include <stdlib.h>\n");
     string_builder_append(&buffer, "#include <string.h>\n");
     string_builder_appendf(&buffer, "#include %s\n\n", header_include);
+    string_builder_append(&buffer, "#define TREVRPC_C_STACK_BODY_LEN 512u\n\n");
     for (size_t i = 0; i < services->len; i++) {
         generate_source_service(&buffer, &services->items[i]);
     }

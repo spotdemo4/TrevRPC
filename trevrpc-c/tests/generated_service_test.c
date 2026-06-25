@@ -39,18 +39,41 @@ typedef struct trevrpc_msquic_chunk {
 } trevrpc_msquic_chunk;
 
 typedef struct trevrpc_msquic_send trevrpc_msquic_send;
+typedef struct trevrpc_msquic_frame trevrpc_msquic_frame;
+
+typedef enum trevrpc_msquic_recv_mode {
+    TREV_MSQUIC_RECV_BYTES = 0,
+    TREV_MSQUIC_RECV_FRAMES = 1,
+} trevrpc_msquic_recv_mode;
 
 struct trevrpc_msquic_send {
     trevrpc_msquic_send* next;
+};
+
+struct trevrpc_msquic_frame {
+    trevrpc_msquic_frame* next;
+    uint8_t* body;
+    size_t len;
+    intptr_t err;
 };
 
 struct trevrpc_msquic_stream {
     void* handle;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    trevrpc_msquic_recv_mode recv_mode;
     trevrpc_msquic_chunk* recv_head;
     trevrpc_msquic_chunk* recv_tail;
     size_t recv_buffered;
+    trevrpc_msquic_frame* frame_head;
+    trevrpc_msquic_frame* frame_tail;
+    size_t frame_max_len;
+    uint8_t frame_header[4];
+    size_t frame_header_len;
+    size_t frame_body_len;
+    size_t frame_body_offset;
+    uint8_t* frame_body;
+    size_t frame_skip_remaining;
     bool recv_fin;
     bool send_closed;
     bool shutdown_complete;
@@ -135,6 +158,14 @@ static void reset_raw_stream(trevrpc_msquic_stream* stream) {
         free(chunk);
         chunk = next;
     }
+    trevrpc_msquic_frame* frame = stream->frame_head;
+    while (frame != NULL) {
+        trevrpc_msquic_frame* next = frame->next;
+        free(frame->body);
+        free(frame);
+        frame = next;
+    }
+    free(stream->frame_body);
     trevrpc_msquic_send* send = stream->send_pool;
     while (send != NULL) {
         trevrpc_msquic_send* next = send->next;

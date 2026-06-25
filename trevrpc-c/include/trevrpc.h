@@ -170,6 +170,7 @@ typedef struct trevrpc_stream_frame {
     uint8_t* body;
     size_t body_len;
     trevrpc_metadata metadata;
+    uint8_t* _body_owner;
 } trevrpc_stream_frame;
 
 typedef int (*trevrpc_unary_handler)(
