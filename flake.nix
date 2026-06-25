@@ -33,7 +33,14 @@
         devShells = {
           default = pkgs.mkShell {
             RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
-            shellHook = pkgs.shellhook.ref;
+            PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+            shellHook = ''
+              ${pkgs.shellhook.ref}
+              for chromium in "$PLAYWRIGHT_BROWSERS_PATH"/chromium-*/chrome-linux*/chrome; do
+                export TREVRPC_BROWSER_CHROMIUM="$chromium"
+                break
+              done
+            '';
             packages = with pkgs; [
               # rust
               rustc
@@ -56,6 +63,7 @@
 
               # javascript
               nodejs_24
+              playwright-driver.browsers
 
               # lint
               clippy
