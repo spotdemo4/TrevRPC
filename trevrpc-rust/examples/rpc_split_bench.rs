@@ -439,10 +439,10 @@ impl greeter::Greeter for SplitGreeter {
         &self,
         request: greeter::HelloRequest,
     ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
-        let count = message_count_from_name(&request.name);
-        Ok(trevrpc::stream::from_iter((0..count).map(|_| {
+        let (count, message) = server_stream_spec_from_name(&request.name);
+        Ok(trevrpc::stream::from_iter((0..count).map(move |_| {
             greeter::HelloReply {
-                message: "server stream".to_owned(),
+                message: message.clone(),
             }
         })))
     }
@@ -474,6 +474,19 @@ fn message_count_from_name(name: &str) -> usize {
         .ok()
         .filter(|count| *count > 0)
         .unwrap_or(LATENCY_STREAM_MESSAGE_COUNT)
+}
+
+fn server_stream_spec_from_name(name: &str) -> (usize, String) {
+    let Some((count, payload_bytes)) = name.split_once(':') else {
+        return (message_count_from_name(name), "server stream".to_owned());
+    };
+    let payload_bytes = payload_bytes.parse::<usize>().unwrap_or(0);
+    let message = if payload_bytes > 0 {
+        "x".repeat(payload_bytes)
+    } else {
+        "server stream".to_owned()
+    };
+    (message_count_from_name(count), message)
 }
 
 struct BidiReplies {
@@ -537,10 +550,10 @@ impl GrpcGreeter for SplitGreeter {
         &self,
         request: tonic::Request<greeter::HelloRequest>,
     ) -> Result<tonic::Response<Self::LotsOfRepliesStream>, tonic::Status> {
-        let count = message_count_from_name(&request.into_inner().name);
-        let replies = (0..count).map(|_| {
+        let (count, message) = server_stream_spec_from_name(&request.into_inner().name);
+        let replies = (0..count).map(move |_| {
             Ok::<_, tonic::Status>(greeter::HelloReply {
-                message: "server stream".to_owned(),
+                message: message.clone(),
             })
         });
         Ok(tonic::Response::new(Box::pin(tokio_stream::iter(replies))))

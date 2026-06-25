@@ -41,11 +41,15 @@ export {
   DefaultMaxFrameSize,
   FrameReader,
   decodeFrame,
+  decodeStreamFrameBody,
   encodeFrame,
+  encodeMessageStreamFrame,
+  encodeMessageStreamFrames,
   frameBodyLength,
   marshalMessage,
   unmarshalMessage,
   writeFrame,
+  writeMessageStreamFrames,
 } from "./framing.js";
 export {
   BidirectionalStreamingCall,

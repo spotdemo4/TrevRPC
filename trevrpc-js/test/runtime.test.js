@@ -28,7 +28,10 @@ import {
   connect,
   createRoot,
   decodeFrame,
+  decodeStreamFrameBody,
   encodeFrame,
+  encodeMessageStreamFrame,
+  encodeMessageStreamFrames,
   frameBodyLength,
   invalidArgument,
   marshalMessage,
@@ -179,6 +182,38 @@ test("frame length boundary cases are stable", () => {
 
     assert.throws(() => frameBodyLength(header, 16), FrameTooLargeError);
   }
+});
+
+test("stream message fast path matches protobuf encoding", () => {
+  const body = new Uint8Array([1, 2, 3]);
+  const fast = encodeMessageStreamFrame(body);
+  const generic = encodeFrame(RpcStreamFrame, RpcStreamFrame.create({ body }));
+
+  assert.deepEqual(fast, generic);
+  const decoded = decodeStreamFrameBody(fast.subarray(4));
+  assert.equal(decoded.kind, RpcStreamFrameKind.Message);
+  assert.equal(decoded.status, Code.Ok);
+  assert.deepEqual(decoded.body, body);
+});
+
+test("batched stream message fast path concatenates frames", () => {
+  const bodies = [new Uint8Array([1]), new Uint8Array([2, 3])];
+  const batched = encodeMessageStreamFrames(bodies);
+  const expected = concatBytes(bodies.map((body) => encodeMessageStreamFrame(body)));
+
+  assert.deepEqual(batched, expected);
+});
+
+test("frame reader drains buffered stream frame batches", async () => {
+  const bodies = [new Uint8Array([1]), new Uint8Array([2]), new Uint8Array([3])];
+  const reader = new FrameReader(fakeReaderFromChunks([encodeMessageStreamFrames(bodies)]));
+
+  const batch = await reader.readStreamFrameBatchOrEOF(8);
+
+  assert.deepEqual(
+    batch.map((frame) => Array.from(frame.body)),
+    [[1], [2], [3]],
+  );
 });
 
 test("frame reader maps malformed protobuf bodies to invalid argument", async () => {
@@ -333,6 +368,58 @@ test("WebTransport unary reads response before upload close settles", async () =
   resolveClose();
 });
 
+test("WebTransport writes request body batches", async () => {
+  const writes = [];
+  const bodies = [new Uint8Array([1]), new Uint8Array([2, 3])];
+  const stream = fakeBidirectionalStream({
+    onWrite(chunk) {
+      writes.push(chunk);
+    },
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+  const requestBody = {
+    [Symbol.asyncIterator]() {
+      let sent = false;
+      return {
+        next() {
+          throw new Error("single request body reads should not be used");
+        },
+        nextBatch() {
+          if (sent) {
+            return Promise.resolve({ done: true, value: undefined });
+          }
+          sent = true;
+          return Promise.resolve({ done: false, value: bodies });
+        },
+      };
+    },
+  };
+
+  const responses = await client.streamingCall(
+    RpcRequest.create({
+      service: "hello.v1.Greeter",
+      method: "LotsOfGreetings",
+      body: new Uint8Array(),
+      metadata: {},
+      kind: RpcKind.ClientStreaming,
+      version: WireVersion,
+    }),
+    requestBody,
+  );
+  for (let attempt = 0; attempt < 10 && writes.length < 2; attempt += 1) {
+    await Promise.resolve();
+  }
+
+  assert.equal(writes.length, 2);
+  assert.deepEqual(writes[1], encodeMessageStreamFrames(bodies));
+  await responses[Symbol.asyncIterator]().return();
+});
+
 test("unknown response stream frame kind maps to invalid argument", async () => {
   const root = createRoot({
     nested: {
@@ -443,6 +530,47 @@ test("request streams expose queued request batches", async () => {
   const sends = [call.send({ value: "one" }), call.send({ value: "two" })];
   const batch = await batchPromise;
   await Promise.all(sends);
+  await call.closeSend();
+  const done = await requestIterator.nextBatch(16);
+  const reply = await call.closeAndRecv();
+
+  assert.equal(batch.done, false);
+  assert.deepEqual(
+    batch.value.map((body) => Hello.decode(body).value),
+    ["one", "two"],
+  );
+  assert.equal(reply.value, "done");
+  assert.equal(done.done, true);
+});
+
+test("request streams expose sendMany batches", async () => {
+  const Hello = helloTestType();
+  let batchPromise;
+  let requestIterator;
+  const transport = {
+    async streamingCall(_request, requestBody) {
+      requestIterator = requestBody[Symbol.asyncIterator]();
+      batchPromise = requestIterator.nextBatch(16);
+      return batchedFrameStream([
+        [
+          RpcStreamFrame.create({ body: Hello.encode({ value: "done" }).finish() }),
+          RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok }),
+        ],
+      ]);
+    },
+  };
+
+  const call = await clientStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfGreetings",
+    Hello,
+    Hello,
+    { streamIdleTimeoutMs: undefined },
+  );
+  const sent = call.sendMany([{ value: "one" }, { value: "two" }]);
+  const batch = await batchPromise;
+  await sent;
   await call.closeSend();
   const done = await requestIterator.nextBatch(16);
   const reply = await call.closeAndRecv();
@@ -1543,6 +1671,17 @@ function deterministicByteVectors() {
   return vectors;
 }
 
+function concatBytes(parts) {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
+}
+
 function chunkBytes(bytes, chunkSize) {
   const chunks = [];
   for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
@@ -1569,6 +1708,7 @@ function fakeBidirectionalStream({
   onAbort = () => {},
   onCancel = () => {},
   onClose = () => {},
+  onWrite = () => {},
   readableChunks = [],
 } = {}) {
   const chunks = [...readableChunks];
@@ -1576,7 +1716,8 @@ function fakeBidirectionalStream({
     writable: {
       getWriter() {
         return {
-          write() {
+          write(chunk) {
+            onWrite(chunk);
             return Promise.resolve();
           },
           close() {

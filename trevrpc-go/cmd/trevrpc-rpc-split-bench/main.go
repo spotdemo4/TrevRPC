@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -191,8 +192,9 @@ func runConnectServer(addr, origin string) error {
 	mux.Handle(grpcFullMethod(greeter.MethodLotsOfReplies), withBenchmarkCORS(connect.NewServerStreamHandler(
 		grpcFullMethod(greeter.MethodLotsOfReplies),
 		func(_ context.Context, req *connect.Request[greeter.HelloRequest], stream *connect.ServerStream[greeter.HelloReply]) error {
-			for range messageCountFromName(req.Msg.Name) {
-				if err := stream.Send(&greeter.HelloReply{Message: "server stream"}); err != nil {
+			count, message := serverStreamSpecFromName(req.Msg.Name)
+			for range count {
+				if err := stream.Send(&greeter.HelloReply{Message: message}); err != nil {
 					return err
 				}
 			}
@@ -796,10 +798,23 @@ func messageCountFromName(name string) int {
 	return count
 }
 
+func serverStreamSpecFromName(name string) (int, string) {
+	countText, payloadText, ok := strings.Cut(name, ":")
+	if !ok {
+		return messageCountFromName(name), "server stream"
+	}
+	payloadBytes, err := strconv.Atoi(payloadText)
+	if err != nil || payloadBytes <= 0 {
+		return messageCountFromName(countText), "server stream"
+	}
+	return messageCountFromName(countText), strings.Repeat("x", payloadBytes)
+}
+
 func (splitGreeter) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
-	replies := make([]*greeter.HelloReply, messageCountFromName(request.Name))
+	count, message := serverStreamSpecFromName(request.Name)
+	replies := make([]*greeter.HelloReply, count)
 	for i := range replies {
-		replies[i] = &greeter.HelloReply{Message: "server stream"}
+		replies[i] = &greeter.HelloReply{Message: message}
 	}
 	return trevrpc.FromSlice(replies...), nil
 }
@@ -843,8 +858,9 @@ func (grpcSplitGreeter) SayHello(_ context.Context, request *greeter.HelloReques
 }
 
 func (grpcSplitGreeter) LotsOfReplies(request *greeter.HelloRequest, stream grpc.ServerStream) error {
-	for range messageCountFromName(request.Name) {
-		if err := stream.SendMsg(&greeter.HelloReply{Message: "server stream"}); err != nil {
+	count, message := serverStreamSpecFromName(request.Name)
+	for range count {
+		if err := stream.SendMsg(&greeter.HelloReply{Message: message}); err != nil {
 			return err
 		}
 	}

@@ -174,16 +174,31 @@ export function encodeFrame<TMessage extends object>(
   message: TMessage,
   maxFrameSize?: number,
 ): Uint8Array;
+/** Encodes one streaming message frame carrying an already-encoded protobuf body. */
+export function encodeMessageStreamFrame(body: Uint8Array, maxFrameSize?: number): Uint8Array;
+/** Encodes multiple streaming message frames into one contiguous write buffer. */
+export function encodeMessageStreamFrames(
+  bodies: Iterable<Uint8Array>,
+  maxFrameSize?: number,
+): Uint8Array;
 /** Decodes a protobuf message from a TrevRPC frame body. */
 export function decodeFrame<TMessage = Message<Record<string, unknown>>>(
   messageType: Type,
   body: Uint8Array,
 ): TMessage;
+/** Decodes a streaming RPC frame body. */
+export function decodeStreamFrameBody(body: Uint8Array): RpcStreamFrameMessage;
 /** Writes one length-prefixed protobuf frame. */
 export function writeFrame<TMessage extends object>(
   writer: WritableStreamDefaultWriter<Uint8Array>,
   messageType: Type,
   message: TMessage,
+  maxFrameSize?: number,
+): Promise<void>;
+/** Writes multiple streaming message frames in one write. */
+export function writeMessageStreamFrames(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  bodies: Iterable<Uint8Array>,
   maxFrameSize?: number,
 ): Promise<void>;
 /** Decodes and validates the body length stored in a TrevRPC frame header. */
@@ -204,10 +219,21 @@ export class FrameReader {
     messageType: Type,
     maxFrameSize?: number,
   ): Promise<TMessage | null>;
+  /** Reads and decodes one streaming RPC frame, or returns null when already at EOF. */
+  readStreamFrameOrEOF(maxFrameSize?: number): Promise<RpcStreamFrameMessage | null>;
+  /** Reads one streaming RPC frame, then drains complete frames already buffered. */
+  readStreamFrameBatchOrEOF(
+    maxBatch?: number,
+    maxFrameSize?: number,
+  ): Promise<RpcStreamFrameMessage[] | null>;
   /** Reads exactly size bytes from the underlying reader. */
   readExact(size: number, allowEofAtStart: boolean): Promise<Uint8Array | null>;
+  /** Reads a complete buffered frame body without waiting, or undefined. */
+  tryReadFrameBody(maxFrameSize?: number): Uint8Array | undefined;
   /** Removes size bytes from the buffered data. */
   consume(size: number): Uint8Array;
+  /** Copies size bytes from the buffered data without removing them. */
+  peek(size: number): Uint8Array;
 }
 
 export interface CallOptions {
@@ -246,6 +272,8 @@ export interface Transport {
 export interface ClientStreamingCall<TRequest extends object, TResponse> {
   /** Sends one request message. */
   send(request: TRequest): Promise<void>;
+  /** Sends multiple request messages. */
+  sendMany(requests: Iterable<TRequest>): Promise<void>;
   /** Closes the request stream. */
   closeSend(): Promise<void>;
   /** Closes the request stream and returns the final response. */
@@ -260,6 +288,8 @@ export interface BidirectionalStreamingCall<
 > extends AsyncIterable<TResponse> {
   /** Sends one request message. */
   send(request: TRequest): Promise<void>;
+  /** Sends multiple request messages. */
+  sendMany(requests: Iterable<TRequest>): Promise<void>;
   /** Receives one response message, or undefined after the response stream completes. */
   recv(): Promise<TResponse | undefined>;
   /** Closes the request stream while keeping the response stream readable. */
@@ -370,6 +400,9 @@ export interface BrowserWebTransportOptions {
 export interface WebTransportClientOptions extends CallOptions, BrowserWebTransportOptions {
   WebTransport?: WebTransportConstructorLike;
   webTransportOptions?: unknown;
+  streamReadBatchMaxMessages?: number;
+  streamWriteBatchMaxMessages?: number;
+  streamWriteBatchMaxBytes?: number;
 }
 
 export interface NodeConnectOptions {

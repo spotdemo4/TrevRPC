@@ -23,7 +23,11 @@ const certFile = connectMode ? null : requiredArg(4, "cert-file");
 const iterations = positiveInteger(
   process.argv[connectMode ? 5 : 5] ?? process.env.WEBTRANSPORT_ITERATIONS ?? "1000",
 );
+const throughputMessages = positiveInteger(
+  process.env.WEBTRANSPORT_THROUGHPUT_MESSAGES ?? String(iterations),
+);
 const certificateSha256Base64 = certFile == null ? null : await certificateHash(certFile);
+const benchmarkConfig = benchmarkConfigFromEnv();
 
 let browser;
 let page;
@@ -59,8 +63,10 @@ try {
   const results = connectMode
     ? await page.evaluate(runConnectBenchmarks, { connectURL: endpointURL, iterations })
     : await page.evaluate(runBrowserBenchmarks, {
+        benchmarkConfig,
         certificateSha256Base64,
         iterations,
+        throughputMessages,
         webTransportURL: endpointURL,
       });
   if (pageErrors.length > 0) {
@@ -84,9 +90,15 @@ try {
   }
 }
 
-async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTransportURL }) {
+async function runBrowserBenchmarks({
+  benchmarkConfig,
+  certificateSha256Base64,
+  iterations,
+  throughputMessages,
+  webTransportURL,
+}) {
   const LatencyStreamMessageCount = 1;
-  const RequestName = "TrevRPC benchmark";
+  const RequestName = payloadName(benchmarkConfig.payloadBytes);
   const { connect, createRoot, createServiceClient } = await import("/src/index.js");
   const root = createRoot({
     nested: {
@@ -142,18 +154,41 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
     },
   });
 
-  const transport = await connect(webTransportURL, {
+  const connectOptions = {
     serverCertificateHashes: [
       {
         algorithm: "sha-256",
         value: base64Bytes(certificateSha256Base64),
       },
     ],
-  });
-  const client = createServiceClient(transport, GreeterService, root, {
-    streamIdleTimeoutMs: 600_000,
-    timeoutMs: 600_000,
-  });
+  };
+  if (benchmarkConfig.congestionControl != null) {
+    connectOptions.congestionControl = benchmarkConfig.congestionControl;
+  }
+  copyPositive(
+    connectOptions,
+    "streamReadBatchMaxMessages",
+    benchmarkConfig.streamReadBatchMaxMessages,
+  );
+  copyPositive(
+    connectOptions,
+    "streamWriteBatchMaxMessages",
+    benchmarkConfig.streamWriteBatchMaxMessages,
+  );
+  copyPositive(
+    connectOptions,
+    "streamWriteBatchMaxBytes",
+    benchmarkConfig.streamWriteBatchMaxBytes,
+  );
+
+  const transport = await connect(webTransportURL, connectOptions);
+  const callOptions = benchmarkConfig.disableStreamTimeouts
+    ? { streamIdleTimeoutMs: 0 }
+    : { streamIdleTimeoutMs: 600_000, timeoutMs: 600_000 };
+  if (benchmarkConfig.payloadBytes > 0) {
+    callOptions.maxResponseStreamBodySize = -1;
+  }
+  const client = createServiceClient(transport, GreeterService, root, callOptions);
 
   try {
     await warmClient(client);
@@ -162,21 +197,49 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
       await runLatencyCase("server_stream_latency", iterations, () =>
         serverStreaming(client, LatencyStreamMessageCount),
       ),
-      await runThroughputCase("server_stream_throughput", iterations, () =>
-        serverStreaming(client, iterations),
+      await runThroughputCase("server_stream_throughput", throughputMessages, () =>
+        serverStreaming(client, throughputMessages),
       ),
       await runLatencyCase("client_stream_latency", iterations, () =>
         clientStreaming(client, LatencyStreamMessageCount),
       ),
-      await runThroughputCase("client_stream_throughput", iterations, () =>
-        clientStreaming(client, iterations),
+      await runThroughputCase("client_stream_throughput", throughputMessages, () =>
+        clientStreaming(client, throughputMessages),
       ),
       await runLatencyCase("bidi_stream_latency", iterations, () =>
         bidiStreaming(client, LatencyStreamMessageCount),
       ),
-      await runThroughputCase("bidi_stream_throughput", iterations, () =>
-        bidiStreaming(client, iterations),
+      await runThroughputCase("bidi_stream_throughput", throughputMessages, () =>
+        bidiStreaming(client, throughputMessages),
       ),
+      ...(benchmarkConfig.concurrentStreams > 1
+        ? [
+            await runThroughputCase(
+              `server_stream_concurrent_${benchmarkConfig.concurrentStreams}_throughput`,
+              throughputMessages * benchmarkConfig.concurrentStreams,
+              () =>
+                runConcurrent(benchmarkConfig.concurrentStreams, () =>
+                  serverStreaming(client, throughputMessages),
+                ),
+            ),
+            await runThroughputCase(
+              `client_stream_concurrent_${benchmarkConfig.concurrentStreams}_throughput`,
+              throughputMessages * benchmarkConfig.concurrentStreams,
+              () =>
+                runConcurrent(benchmarkConfig.concurrentStreams, () =>
+                  clientStreaming(client, throughputMessages),
+                ),
+            ),
+            await runThroughputCase(
+              `bidi_stream_concurrent_${benchmarkConfig.concurrentStreams}_throughput`,
+              throughputMessages * benchmarkConfig.concurrentStreams,
+              () =>
+                runConcurrent(benchmarkConfig.concurrentStreams, () =>
+                  bidiStreaming(client, throughputMessages),
+                ),
+            ),
+          ]
+        : []),
     ];
   } finally {
     transport.close({ closeCode: 0, reason: "browser WebTransport benchmark complete" });
@@ -189,6 +252,33 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
       bytes[index] = binary.charCodeAt(index);
     }
     return bytes;
+  }
+
+  function copyPositive(target, key, value) {
+    if (value > 0) {
+      target[key] = value;
+    }
+  }
+
+  function payloadName(size) {
+    if (size <= 0) {
+      return "TrevRPC benchmark";
+    }
+    return "x".repeat(size);
+  }
+
+  function serverStreamRequestName(messageCount) {
+    return benchmarkConfig.payloadBytes > 0
+      ? `${messageCount}:${benchmarkConfig.payloadBytes}`
+      : String(messageCount);
+  }
+
+  function expectedServerStreamMessage() {
+    return benchmarkConfig.payloadBytes > 0 ? RequestName : "server stream";
+  }
+
+  async function runConcurrent(count, fn) {
+    await Promise.all(Array.from({ length: count }, () => fn()));
   }
 
   async function warmClient(client) {
@@ -235,12 +325,13 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
 
   async function serverStreaming(client, messageCount) {
     const replies = await client.lotsOfReplies(
-      { name: String(messageCount) },
+      { name: serverStreamRequestName(messageCount) },
       { maxResponseMessages: messageCount },
     );
     let count = 0;
+    const expected = expectedServerStreamMessage();
     for await (const reply of replies) {
-      if (reply.message !== "server stream") {
+      if (reply.message !== expected) {
         throw new Error(`unexpected server-stream response: ${JSON.stringify(reply)}`);
       }
       count += 1;
@@ -252,9 +343,7 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
 
   async function clientStreaming(client, messageCount) {
     const call = await client.lotsOfGreetings();
-    for (let index = 0; index < messageCount; index += 1) {
-      await call.send({ name: RequestName });
-    }
+    await sendRequests(call, messageCount);
     const reply = await call.closeAndRecv();
     if (reply.message !== `streamed ${messageCount} greetings`) {
       throw new Error(`unexpected client-stream response: ${JSON.stringify(reply)}`);
@@ -267,9 +356,7 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
     await Promise.all([sendMessages(), recvMessages()]);
 
     async function sendMessages() {
-      for (let index = 0; index < messageCount; index += 1) {
-        await call.send({ name: RequestName });
-      }
+      await sendRequests(call, messageCount);
       await call.closeSend();
     }
 
@@ -287,6 +374,21 @@ async function runBrowserBenchmarks({ certificateSha256Base64, iterations, webTr
       if (received !== messageCount) {
         throw new Error(`expected ${messageCount} bidi responses, got ${received}`);
       }
+    }
+  }
+
+  async function sendRequests(call, messageCount) {
+    const batchSize = benchmarkConfig.sendManyBatchSize;
+    if (batchSize <= 1 || typeof call.sendMany !== "function") {
+      for (let index = 0; index < messageCount; index += 1) {
+        await call.send({ name: RequestName });
+      }
+      return;
+    }
+
+    for (let start = 0; start < messageCount; start += batchSize) {
+      const count = Math.min(batchSize, messageCount - start);
+      await call.sendMany(Array.from({ length: count }, () => ({ name: RequestName })));
     }
   }
 }
@@ -532,6 +634,50 @@ function positiveInteger(value) {
     throw new Error(`iterations must be a positive integer, got ${JSON.stringify(value)}`);
   }
   return Number(value);
+}
+
+function nonNegativeInteger(value, name) {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${name} must be a non-negative integer, got ${JSON.stringify(value)}`);
+  }
+  return Number(value);
+}
+
+function optionalPositiveInteger(name, defaultValue) {
+  const value = process.env[name];
+  return value == null || value === "" ? defaultValue : positiveInteger(value);
+}
+
+function optionalNonNegativeInteger(name, defaultValue) {
+  const value = process.env[name];
+  return value == null || value === "" ? defaultValue : nonNegativeInteger(value, name);
+}
+
+function envFlag(name) {
+  return process.env[name] === "1" || process.env[name] === "true";
+}
+
+function benchmarkConfigFromEnv() {
+  const congestionControl = process.env.WEBTRANSPORT_CONGESTION_CONTROL || null;
+  if (
+    congestionControl != null &&
+    !["default", "low-latency", "throughput"].includes(congestionControl)
+  ) {
+    throw new Error(
+      `unsupported WEBTRANSPORT_CONGESTION_CONTROL ${JSON.stringify(congestionControl)}`,
+    );
+  }
+
+  return {
+    concurrentStreams: optionalPositiveInteger("WEBTRANSPORT_CONCURRENT_STREAMS", 1),
+    congestionControl,
+    disableStreamTimeouts: envFlag("WEBTRANSPORT_DISABLE_STREAM_TIMEOUTS"),
+    payloadBytes: optionalNonNegativeInteger("WEBTRANSPORT_PAYLOAD_BYTES", 0),
+    sendManyBatchSize: optionalPositiveInteger("WEBTRANSPORT_SEND_MANY_BATCH", 1),
+    streamReadBatchMaxMessages: optionalPositiveInteger("WEBTRANSPORT_STREAM_READ_BATCH", 0),
+    streamWriteBatchMaxBytes: optionalPositiveInteger("WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES", 0),
+    streamWriteBatchMaxMessages: optionalPositiveInteger("WEBTRANSPORT_STREAM_WRITE_BATCH", 0),
+  };
 }
 
 function requiredArg(index, name) {

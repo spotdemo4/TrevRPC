@@ -1,6 +1,11 @@
 import { FrameTooLargeError, invalidArgument, unavailable } from "./status.js";
+import { RpcStreamFrame, RpcStreamFrameKind } from "./wire.js";
 
 export const DefaultMaxFrameSize = 4 * 1024 * 1024;
+
+const FrameHeaderLength = 4;
+const StreamFrameBodyTag = (4 << 3) | 2;
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 /** Encodes a protobuf message body. */
 export function marshalMessage(messageType, message) {
@@ -24,11 +29,46 @@ export function encodeFrame(messageType, message, maxFrameSize = DefaultMaxFrame
     throw new FrameTooLargeError(body.byteLength, maxFrameSize);
   }
 
-  const frame = new Uint8Array(4 + body.byteLength);
+  const frame = new Uint8Array(FrameHeaderLength + body.byteLength);
   const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
   view.setUint32(0, body.byteLength, false);
-  frame.set(body, 4);
+  frame.set(body, FrameHeaderLength);
   return frame;
+}
+
+/** Encodes one streaming message frame carrying an already-encoded protobuf body. */
+export function encodeMessageStreamFrame(body, maxFrameSize = DefaultMaxFrameSize) {
+  return encodeMessageStreamFrames([body], maxFrameSize);
+}
+
+/** Encodes multiple streaming message frames into one contiguous write buffer. */
+export function encodeMessageStreamFrames(bodies, maxFrameSize = DefaultMaxFrameSize) {
+  let totalLength = 0;
+  const byteBodies = Array.from(bodies, byteView);
+  for (const body of byteBodies) {
+    const bodyLength = messageStreamFrameBodyLength(body.byteLength);
+    if (bodyLength > maxFrameSize) {
+      throw new FrameTooLargeError(bodyLength, maxFrameSize);
+    }
+    totalLength += FrameHeaderLength + bodyLength;
+  }
+
+  const frames = new Uint8Array(totalLength);
+  const view = new DataView(frames.buffer, frames.byteOffset, frames.byteLength);
+  let offset = 0;
+  for (const body of byteBodies) {
+    const bodyLength = messageStreamFrameBodyLength(body.byteLength);
+    view.setUint32(offset, bodyLength, false);
+    offset += FrameHeaderLength;
+    if (body.byteLength > 0) {
+      frames[offset++] = StreamFrameBodyTag;
+      offset = appendVarint(frames, offset, body.byteLength);
+      frames.set(body, offset);
+      offset += body.byteLength;
+    }
+  }
+
+  return frames;
 }
 
 /** Decodes a protobuf message from a TrevRPC frame body. */
@@ -36,9 +76,67 @@ export function decodeFrame(messageType, body) {
   return unmarshalMessage(messageType, body);
 }
 
+/** Decodes a streaming RPC frame body using a fast path for common message frames. */
+export function decodeStreamFrameBody(body) {
+  const bytes = byteView(body);
+  if (bytes.byteLength === 0) {
+    return streamFrameMessage(new Uint8Array(0));
+  }
+
+  const cursor = { offset: 0 };
+  let kind = RpcStreamFrameKind.Message;
+  let status = 0;
+  let message = "";
+  let frameBody = new Uint8Array(0);
+
+  while (cursor.offset < bytes.byteLength) {
+    const tag = consumeVarint(bytes, cursor, "invalid stream frame field tag");
+    if (tag === 0) {
+      throw invalidArgument("invalid stream frame field tag");
+    }
+
+    const field = Math.floor(tag / 8);
+    const wireType = tag % 8;
+    switch (field) {
+      case 1:
+        requireWireType(wireType, 0, "invalid stream frame kind wire type");
+        kind = consumeVarint(bytes, cursor, "truncated stream frame kind");
+        break;
+      case 2:
+        requireWireType(wireType, 0, "invalid stream frame status wire type");
+        status = consumeVarint(bytes, cursor, "truncated stream frame status");
+        break;
+      case 3:
+        requireWireType(wireType, 2, "invalid stream frame message wire type");
+        message = decodeUtf8(consumeLengthDelimited(bytes, cursor, "invalid stream frame message"));
+        break;
+      case 4:
+        requireWireType(wireType, 2, "invalid stream frame body wire type");
+        frameBody = consumeLengthDelimited(bytes, cursor, "invalid stream frame body");
+        break;
+      case 5:
+        return decodeFrame(RpcStreamFrame, bytes);
+      default:
+        skipProtoField(bytes, cursor, wireType);
+        break;
+    }
+  }
+
+  if (kind !== RpcStreamFrameKind.Message && kind !== RpcStreamFrameKind.Status) {
+    throw invalidArgument("stream frame contained an unknown frame kind");
+  }
+
+  return { kind, status, message, body: frameBody, metadata: {} };
+}
+
 /** Writes one length-prefixed protobuf frame. */
 export async function writeFrame(writer, messageType, message, maxFrameSize = DefaultMaxFrameSize) {
   await writer.write(encodeFrame(messageType, message, maxFrameSize));
+}
+
+/** Writes multiple streaming message frames in one write. */
+export async function writeMessageStreamFrames(writer, bodies, maxFrameSize = DefaultMaxFrameSize) {
+  await writer.write(encodeMessageStreamFrames(bodies, maxFrameSize));
 }
 
 /** Reads length-prefixed protobuf frames from a byte stream reader. */
@@ -52,7 +150,7 @@ export class FrameReader {
 
   /** Reads and decodes one frame. */
   async readFrame(messageType, maxFrameSize = DefaultMaxFrameSize) {
-    const header = await this.readExact(4, false);
+    const header = await this.readExact(FrameHeaderLength, false);
     const length = frameBodyLength(header, maxFrameSize);
     const body = await this.readExact(length, false);
     return decodeFrame(messageType, body);
@@ -60,7 +158,7 @@ export class FrameReader {
 
   /** Reads and decodes one frame, or returns null when already at EOF. */
   async readFrameOrEOF(messageType, maxFrameSize = DefaultMaxFrameSize) {
-    const header = await this.readExact(4, true);
+    const header = await this.readExact(FrameHeaderLength, true);
     if (header == null) {
       return null;
     }
@@ -68,6 +166,53 @@ export class FrameReader {
     const length = frameBodyLength(header, maxFrameSize);
     const body = await this.readExact(length, false);
     return decodeFrame(messageType, body);
+  }
+
+  /** Reads and decodes one streaming RPC frame, or returns null when already at EOF. */
+  async readStreamFrameOrEOF(maxFrameSize = DefaultMaxFrameSize) {
+    const header = await this.readExact(FrameHeaderLength, true);
+    if (header == null) {
+      return null;
+    }
+
+    const length = frameBodyLength(header, maxFrameSize);
+    const body = await this.readExact(length, false);
+    return decodeStreamFrameBody(body);
+  }
+
+  /** Reads one streaming RPC frame, then drains complete frames already buffered. */
+  async readStreamFrameBatchOrEOF(maxBatch = 32, maxFrameSize = DefaultMaxFrameSize) {
+    const first = await this.readStreamFrameOrEOF(maxFrameSize);
+    if (first == null) {
+      return null;
+    }
+
+    const limit = Math.max(1, Math.floor(maxBatch));
+    const frames = [first];
+    while (frames.length < limit) {
+      const body = this.tryReadFrameBody(maxFrameSize);
+      if (body === undefined) {
+        break;
+      }
+      frames.push(decodeStreamFrameBody(body));
+    }
+    return frames;
+  }
+
+  /** Reads a complete buffered frame body without waiting, or undefined. */
+  tryReadFrameBody(maxFrameSize = DefaultMaxFrameSize) {
+    if (this.buffered < FrameHeaderLength) {
+      return undefined;
+    }
+
+    const header = this.peek(FrameHeaderLength);
+    const length = frameBodyLength(header, maxFrameSize);
+    if (this.buffered < FrameHeaderLength + length) {
+      return undefined;
+    }
+
+    this.consume(FrameHeaderLength);
+    return this.consume(length);
   }
 
   /** Reads exactly size bytes from the underlying reader. */
@@ -120,6 +265,23 @@ export class FrameReader {
     this.buffered -= size;
     return result;
   }
+
+  /** Copies size bytes from the buffered data without removing them. */
+  peek(size) {
+    const result = new Uint8Array(size);
+    let offset = 0;
+
+    for (const chunk of this.chunks) {
+      if (offset >= size) {
+        break;
+      }
+      const count = Math.min(chunk.byteLength, size - offset);
+      result.set(chunk.subarray(0, count), offset);
+      offset += count;
+    }
+
+    return result;
+  }
 }
 
 /** Decodes and validates the body length stored in a TrevRPC frame header. */
@@ -142,4 +304,117 @@ function prepareMessage(messageType, message) {
   }
 
   return prepared;
+}
+
+function streamFrameMessage(body) {
+  return {
+    kind: RpcStreamFrameKind.Message,
+    status: 0,
+    message: "",
+    body,
+    metadata: {},
+  };
+}
+
+function byteView(value) {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return new Uint8Array(value ?? 0);
+}
+
+function messageStreamFrameBodyLength(bodyLength) {
+  return bodyLength === 0 ? 0 : 1 + varintLength(bodyLength) + bodyLength;
+}
+
+function appendVarint(output, offset, value) {
+  let remaining = value;
+  while (remaining >= 0x80) {
+    output[offset++] = (remaining % 0x80) | 0x80;
+    remaining = Math.floor(remaining / 0x80);
+  }
+  output[offset++] = remaining;
+  return offset;
+}
+
+function varintLength(value) {
+  let remaining = value;
+  let length = 1;
+  while (remaining >= 0x80) {
+    remaining = Math.floor(remaining / 0x80);
+    length += 1;
+  }
+  return length;
+}
+
+function consumeVarint(data, cursor, message) {
+  let value = 0;
+  let multiplier = 1;
+  for (let index = 0; index < 10; index += 1) {
+    if (cursor.offset >= data.byteLength) {
+      throw invalidArgument(message);
+    }
+    const byte = data[cursor.offset++];
+    value += (byte & 0x7f) * multiplier;
+    if (byte < 0x80) {
+      return value;
+    }
+    multiplier *= 0x80;
+  }
+  throw invalidArgument("stream frame varint exceeded 64 bits");
+}
+
+function requireWireType(actual, expected, message) {
+  if (actual !== expected) {
+    throw invalidArgument(message);
+  }
+}
+
+function consumeLengthDelimited(data, cursor, message) {
+  const length = consumeVarint(data, cursor, message);
+  const end = cursor.offset + length;
+  if (!Number.isSafeInteger(end) || end > data.byteLength) {
+    throw invalidArgument(message);
+  }
+  const value = data.subarray(cursor.offset, end);
+  cursor.offset = end;
+  return value;
+}
+
+function skipProtoField(data, cursor, wireType) {
+  switch (wireType) {
+    case 0:
+      consumeVarint(data, cursor, "truncated stream frame varint");
+      return;
+    case 1:
+      skipFixed(data, cursor, 8);
+      return;
+    case 2:
+      consumeLengthDelimited(data, cursor, "truncated stream frame field");
+      return;
+    case 5:
+      skipFixed(data, cursor, 4);
+      return;
+    default:
+      throw invalidArgument("stream frame contained an unsupported wire type");
+  }
+}
+
+function skipFixed(data, cursor, length) {
+  const end = cursor.offset + length;
+  if (end > data.byteLength) {
+    throw invalidArgument("truncated stream frame fixed field");
+  }
+  cursor.offset = end;
+}
+
+function decodeUtf8(bytes) {
+  try {
+    return utf8Decoder.decode(bytes);
+  } catch (error) {
+    throw invalidArgument(`stream frame message was not valid UTF-8: ${error.message}`);
+  }
 }

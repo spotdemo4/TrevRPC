@@ -1,14 +1,16 @@
-import { DefaultMaxFrameSize, FrameReader, writeFrame } from "./framing.js";
-import { Code, statusFromTransportError, unavailable } from "./status.js";
 import {
-  RpcRequest,
-  RpcResponse,
-  RpcStreamFrame,
-  RpcStreamFrameKind,
-  messageFrame,
-} from "./wire.js";
+  DefaultMaxFrameSize,
+  FrameReader,
+  encodeMessageStreamFrames,
+  writeFrame,
+} from "./framing.js";
+import { Code, statusFromTransportError, unavailable } from "./status.js";
+import { RpcRequest, RpcResponse, RpcStreamFrameKind } from "./wire.js";
 
 const CancelledStreamReason = new DOMException("TrevRPC stream cancelled", "AbortError");
+const RequestBodyBatchMaxMessages = 64;
+const RequestBodyBatchMaxBytes = 64 * 1024;
+const ResponseFrameBatchMaxMessages = 64;
 const BrowserWebTransportOptionKeys = [
   "allowPooling",
   "congestionControl",
@@ -22,6 +24,11 @@ export class WebTransportClient {
   constructor(session, options = {}) {
     this.session = session;
     this.maxFrameSize = options.maxFrameSize ?? DefaultMaxFrameSize;
+    this.streamWriteBatchMaxMessages =
+      options.streamWriteBatchMaxMessages ?? RequestBodyBatchMaxMessages;
+    this.streamWriteBatchMaxBytes = options.streamWriteBatchMaxBytes ?? RequestBodyBatchMaxBytes;
+    this.streamReadBatchMaxMessages =
+      options.streamReadBatchMaxMessages ?? ResponseFrameBatchMaxMessages;
   }
 
   /** Opens a WebTransport session and wraps it in a TrevRPC client. */
@@ -114,13 +121,21 @@ export class WebTransportClient {
         void abortWriter(writer);
         void cancelReader(reader);
       });
-      const writerTask = writeStreamingRequest(writer, request, requestBody, maxFrameSize);
+      const writerTask = writeStreamingRequest(
+        writer,
+        request,
+        requestBody,
+        maxFrameSize,
+        this.streamWriteBatchMaxMessages,
+        this.streamWriteBatchMaxBytes,
+      );
       return new WebTransportResponseFrameStream(
         reader,
         writer,
         writerTask,
         maxFrameSize,
         cleanupAbort,
+        this.streamReadBatchMaxMessages,
       );
     } catch (error) {
       throw statusFromTransportError(error);
@@ -162,11 +177,14 @@ class WebTransportResponseFrameStream {
     writerTask,
     maxFrameSize = DefaultMaxFrameSize,
     cleanupAbort = () => {},
+    readBatchMaxMessages = ResponseFrameBatchMaxMessages,
   ) {
     this.reader = reader;
     this.writer = writer;
     this.frameReader = new FrameReader(reader);
     this.maxFrameSize = maxFrameSize;
+    this.readBatchMaxMessages = readBatchMaxMessages;
+    this.frameQueue = [];
     this.done = false;
     this.writerError = null;
     this.writerSettled = false;
@@ -193,38 +211,42 @@ class WebTransportResponseFrameStream {
     }
 
     try {
-      const frame = await this.frameReader.readFrameOrEOF(RpcStreamFrame, this.maxFrameSize);
+      await this.fillFrameQueue();
+      const frame = this.frameQueue.shift();
       if (frame == null) {
-        this.done = true;
-        releaseLock(this.reader);
-        await this.writerDone;
-        if (this.writerError != null) {
-          throw this.writerError;
-        }
-        return { done: true, value: undefined };
+        return await this.finishEof();
       }
 
       if (frame.kind === RpcStreamFrameKind.Status) {
-        this.done = true;
-        releaseLock(this.reader);
-        this.cleanupAbort();
-        await abortWriter(this.writer);
-        if (this.writerSettled) {
-          await this.writerDone;
-          const statusCode = frame.status ?? Code.Ok;
-          if (
-            statusCode === Code.Ok &&
-            this.writerError != null &&
-            !isTerminalCleanupWriterError(this.writerError)
-          ) {
-            throw this.writerError;
-          }
-        } else {
-          this.suppressReturnWriterError = true;
-        }
+        await this.finishStatus(frame);
       }
 
       return { done: false, value: frame };
+    } catch (error) {
+      this.done = true;
+      throw statusFromTransportError(error);
+    }
+  }
+
+  async nextBatch(max = this.readBatchMaxMessages) {
+    if (this.done) {
+      return { done: true, value: undefined };
+    }
+
+    try {
+      await this.fillFrameQueue(max);
+      const terminalIndex = this.frameQueue.findIndex(isTerminalFrame);
+      if (terminalIndex === 0) {
+        const frame = this.frameQueue.shift();
+        if (frame == null) {
+          return await this.finishEof();
+        }
+        await this.finishStatus(frame);
+        return { done: false, value: [frame] };
+      }
+
+      const count = terminalIndex < 0 ? this.frameQueue.length : terminalIndex;
+      return { done: false, value: this.frameQueue.splice(0, count) };
     } catch (error) {
       this.done = true;
       throw statusFromTransportError(error);
@@ -235,6 +257,7 @@ class WebTransportResponseFrameStream {
     if (this.returnDone == null) {
       this.done = true;
       this.returnDone = (async () => {
+        this.frameQueue.length = 0;
         await cancelReader(this.reader);
         await abortWriter(this.writer);
         releaseLock(this.reader);
@@ -256,6 +279,55 @@ class WebTransportResponseFrameStream {
     }
     return { done: true, value: undefined };
   }
+
+  async fillFrameQueue(max = this.readBatchMaxMessages) {
+    if (this.frameQueue.length > 0) {
+      return;
+    }
+
+    const batch = await this.frameReader.readStreamFrameBatchOrEOF(max, this.maxFrameSize);
+    if (batch == null) {
+      this.frameQueue.push(null);
+    } else {
+      this.frameQueue.push(...batch);
+    }
+  }
+
+  async finishEof() {
+    this.done = true;
+    this.frameQueue.length = 0;
+    releaseLock(this.reader);
+    await this.writerDone;
+    if (this.writerError != null) {
+      throw this.writerError;
+    }
+    return { done: true, value: undefined };
+  }
+
+  async finishStatus(frame) {
+    this.done = true;
+    this.frameQueue.length = 0;
+    releaseLock(this.reader);
+    this.cleanupAbort();
+    await abortWriter(this.writer);
+    if (this.writerSettled) {
+      await this.writerDone;
+      const statusCode = frame.status ?? Code.Ok;
+      if (
+        statusCode === Code.Ok &&
+        this.writerError != null &&
+        !isTerminalCleanupWriterError(this.writerError)
+      ) {
+        throw this.writerError;
+      }
+    } else {
+      this.suppressReturnWriterError = true;
+    }
+  }
+}
+
+function isTerminalFrame(frame) {
+  return frame == null || frame.kind === RpcStreamFrameKind.Status;
 }
 
 function isTerminalCleanupWriterError(error) {
@@ -357,18 +429,68 @@ function onAbort(signal, abort) {
   return () => signal.removeEventListener("abort", abort);
 }
 
-async function writeStreamingRequest(writer, request, requestBody, maxFrameSize) {
+async function writeStreamingRequest(
+  writer,
+  request,
+  requestBody,
+  maxFrameSize,
+  batchMaxMessages,
+  batchMaxBytes,
+) {
+  const iterator = requestBody[Symbol.asyncIterator]();
   try {
     await writeFrame(writer, RpcRequest, request, maxFrameSize);
-    for await (const body of requestBody) {
-      await writeFrame(writer, RpcStreamFrame, messageFrame(body), maxFrameSize);
+    for (;;) {
+      const result = await nextRequestBodyBatch(iterator, batchMaxMessages);
+      if (result.done) {
+        break;
+      }
+      for (const bodies of splitBodyBatches(result.value, batchMaxBytes)) {
+        await writer.write(encodeMessageStreamFrames(bodies, maxFrameSize));
+      }
     }
     await writer.close();
   } catch (error) {
+    try {
+      await iterator.return?.();
+    } catch {
+      // Preserve the upload error; aborting the writer releases stream resources.
+    }
     await abortWriter(writer);
     throw error;
   } finally {
     releaseLock(writer);
+  }
+}
+
+async function nextRequestBodyBatch(iterator, maxMessages) {
+  if (typeof iterator.nextBatch === "function") {
+    return await iterator.nextBatch(maxMessages);
+  }
+  const result = await iterator.next();
+  return result.done ? result : { done: false, value: [result.value] };
+}
+
+function* splitBodyBatches(bodies, maxBytes) {
+  const limit = Math.max(0, maxBytes ?? 0);
+  if (limit === 0) {
+    yield bodies;
+    return;
+  }
+
+  let start = 0;
+  let bytes = 0;
+  for (let index = 0; index < bodies.length; index += 1) {
+    const bodyBytes = bodies[index]?.byteLength ?? 0;
+    if (index > start && bytes + bodyBytes > limit) {
+      yield bodies.slice(start, index);
+      start = index;
+      bytes = 0;
+    }
+    bytes += bodyBytes;
+  }
+  if (start < bodies.length) {
+    yield bodies.slice(start);
   }
 }
 

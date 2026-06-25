@@ -218,6 +218,11 @@ export class ClientStreamingCall {
     return this._requests.send(request);
   }
 
+  /** Sends multiple request messages. */
+  sendMany(requests) {
+    return this._requests.sendMany(requests);
+  }
+
   /** Closes the request stream. */
   closeSend() {
     this._requests.close();
@@ -248,6 +253,11 @@ export class BidirectionalStreamingCall {
   /** Sends one request message. */
   send(request) {
     return this._requests.send(request);
+  }
+
+  /** Sends multiple request messages. */
+  sendMany(requests) {
+    return this._requests.sendMany(requests);
   }
 
   /** Receives one response message, or undefined after the response stream completes. */
@@ -665,26 +675,31 @@ class RequestQueue {
   }
 
   send(value) {
+    return this.sendMany([value]);
+  }
+
+  sendMany(values) {
     if (this._closed) {
       return Promise.reject(this._error ?? cancelled("request stream is closed"));
     }
 
+    const batch = Array.from(values);
+    if (batch.length === 0) {
+      return Promise.resolve();
+    }
+
     return new Promise((resolve, reject) => {
-      if (this._waiter != null) {
-        const waiter = this._waiter;
-        if (waiter.batch) {
-          this._pending.push({ value, resolve, reject });
-          this._waiter = undefined;
-          queueMicrotask(() => this._resolveBatchWaiter(waiter));
-        } else {
-          this._waiter = undefined;
-          waiter.resolve({ done: false, value });
+      let remaining = batch.length;
+      const resolveOne = () => {
+        remaining -= 1;
+        if (remaining === 0) {
           resolve();
         }
-        return;
+      };
+      for (const value of batch) {
+        this._pending.push({ value, resolve: resolveOne, reject });
       }
-
-      this._pending.push({ value, resolve, reject });
+      this._wakeWaiter();
     });
   }
 
@@ -763,6 +778,23 @@ class RequestQueue {
       values[i] = pending.value;
     }
     return values;
+  }
+
+  _wakeWaiter() {
+    if (this._waiter == null || this._pending.length === 0) {
+      return;
+    }
+
+    const waiter = this._waiter;
+    this._waiter = undefined;
+    if (waiter.batch) {
+      queueMicrotask(() => this._resolveBatchWaiter(waiter));
+      return;
+    }
+
+    const pending = this._pending.shift();
+    pending.resolve();
+    waiter.resolve({ done: false, value: pending.value });
   }
 
   _resolveBatchWaiter(waiter) {
