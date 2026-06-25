@@ -131,17 +131,46 @@ int trevrpc_wire_encode_request(const char* service,
     if (service == NULL || method == NULL || (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
+
+    return trevrpc_wire_encode_request_view(service,
+        strlen(service),
+        method,
+        strlen(method),
+        kind,
+        TREVRPC_WIRE_VERSION,
+        body,
+        body_len,
+        metadata,
+        timeout_nanos,
+        max_frame_size,
+        frame,
+        frame_len);
+}
+
+int trevrpc_wire_encode_request_view(const char* service,
+    size_t service_len,
+    const char* method,
+    size_t method_len,
+    uint32_t kind,
+    uint32_t version,
+    const uint8_t* body,
+    size_t body_len,
+    const trevrpc_metadata* metadata,
+    uint64_t timeout_nanos,
+    size_t max_frame_size,
+    uint8_t** frame,
+    size_t* frame_len) {
+    if (service == NULL || method == NULL || service_len == 0 || method_len == 0 || (body == NULL && body_len > 0)) {
+        return -EINVAL;
+    }
     int err = trevrpc_metadata_validate(metadata);
     if (err != 0) {
         return err;
     }
 
-    size_t service_len = strlen(service);
-    size_t method_len = strlen(method);
     size_t body_frame_len = trevrpc_wire_bytes_field_len(1, service_len) + trevrpc_wire_bytes_field_len(2, method_len) +
                             trevrpc_wire_bytes_field_len(3, body_len) + trevrpc_wire_metadata_field_len(4, metadata) +
-                            trevrpc_wire_varint_field_len(5, kind) +
-                            trevrpc_wire_varint_field_len(6, TREVRPC_WIRE_VERSION) +
+                            trevrpc_wire_varint_field_len(5, kind) + trevrpc_wire_varint_field_len(6, version) +
                             trevrpc_wire_varint_field_len(7, timeout_nanos);
     err = trevrpc_wire_alloc_frame(body_frame_len, max_frame_size, frame, frame_len);
     if (err != 0) {
@@ -154,7 +183,7 @@ int trevrpc_wire_encode_request(const char* service,
     out = trevrpc_wire_append_bytes_field(out, 3, body, body_len);
     out = trevrpc_wire_append_metadata_field(out, 4, metadata);
     out = trevrpc_wire_append_varint_field(out, 5, kind);
-    out = trevrpc_wire_append_varint_field(out, 6, TREVRPC_WIRE_VERSION);
+    out = trevrpc_wire_append_varint_field(out, 6, version);
     out = trevrpc_wire_append_varint_field(out, 7, timeout_nanos);
     (void)out;
     return 0;

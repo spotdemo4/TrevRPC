@@ -75,6 +75,7 @@ typedef struct trevrpc_server trevrpc_server;
 typedef struct trevrpc_stream trevrpc_stream;
 typedef struct trevrpc_call trevrpc_call;
 typedef struct trevrpc_call_context trevrpc_call_context;
+typedef struct trevrpc_cancellation trevrpc_cancellation;
 typedef struct trevrpc_wt_config trevrpc_wt_config;
 
 #define TREVRPC_CALL_DEFERRED 1
@@ -310,6 +311,11 @@ int trevrpc_client_call_unary(trevrpc_client* client,
     const uint8_t* body,
     size_t body_len,
     trevrpc_response** response);
+int trevrpc_client_call_request(trevrpc_client* client, const trevrpc_request* request, trevrpc_response** response);
+int trevrpc_client_call_request_cancellable(trevrpc_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_response** response);
 int trevrpc_client_start_stream(trevrpc_client* client,
     const char* service,
     const char* method,
@@ -317,8 +323,19 @@ int trevrpc_client_start_stream(trevrpc_client* client,
     const uint8_t* body,
     size_t body_len,
     trevrpc_stream** stream);
+int trevrpc_client_start_stream_request(
+    trevrpc_client* client, const trevrpc_request* request, trevrpc_stream** stream);
+int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_stream** stream);
 void trevrpc_client_shutdown(trevrpc_client* client);
 void trevrpc_client_close(trevrpc_client* client);
+
+trevrpc_cancellation* trevrpc_cancellation_new(void);
+void trevrpc_cancellation_cancel(trevrpc_cancellation* cancellation);
+int trevrpc_cancellation_cancelled(trevrpc_cancellation* cancellation);
+void trevrpc_cancellation_free(trevrpc_cancellation* cancellation);
 
 void trevrpc_request_reset(trevrpc_request* request);
 

@@ -161,6 +161,217 @@ test("package root connect uses native transport under Node", async () => {
   }
 });
 
+test("Node transport forwards metadata, version, and timeout to native client", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  const metadata = { authorization: new Uint8Array([1, 2, 3]) };
+  let unaryRequest;
+  let streamRequest;
+  let finishedSend = false;
+  let finishSend;
+  const finishSendDone = new Promise((resolve) => {
+    finishSend = resolve;
+  });
+  const nativeClient = {
+    async call(request) {
+      unaryRequest = request;
+      return { status: Code.Ok, body: new Uint8Array([9]), metadata: {} };
+    },
+    async startStream(request) {
+      streamRequest = request;
+      return {
+        async sendMessage() {
+          throw new Error("server-streaming request should not send body messages");
+        },
+        async finishSend() {
+          finishedSend = true;
+          finishSend();
+        },
+        async recvMany() {
+          await finishSendDone;
+          return [RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok })];
+        },
+        close() {},
+      };
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+
+  const unaryResponse = await transport.call({
+    service: "hello.v1.Greeter",
+    method: "SayHello",
+    body: new Uint8Array([4]),
+    metadata,
+    version: WireVersion,
+    timeoutNanos: "123000000",
+  });
+  const stream = await transport.streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "LotsOfReplies",
+      kind: RpcKind.ServerStreaming,
+      body: new Uint8Array([5]),
+      metadata,
+      version: WireVersion,
+      timeoutNanos: "456000000",
+    },
+    emptyAsyncIterable(),
+  );
+  const firstFrame = await stream[Symbol.asyncIterator]().next();
+
+  assert.equal(unaryResponse.status, Code.Ok);
+  assert.equal(unaryRequest.service, "hello.v1.Greeter");
+  assert.equal(unaryRequest.method, "SayHello");
+  assert.deepEqual(unaryRequest.body, new Uint8Array([4]));
+  assert.deepEqual(unaryRequest.metadata, metadata);
+  assert.equal(unaryRequest.version, WireVersion);
+  assert.equal(unaryRequest.timeoutNanos, "123000000");
+  assert.equal(streamRequest.kind, RpcKind.ServerStreaming);
+  assert.deepEqual(streamRequest.metadata, metadata);
+  assert.equal(streamRequest.version, WireVersion);
+  assert.equal(streamRequest.timeoutNanos, "456000000");
+  assert.equal(firstFrame.done, false);
+  assert.equal(firstFrame.value.kind, RpcStreamFrameKind.Status);
+  assert.equal(finishedSend, true);
+});
+
+test("Node transport aborts native unary calls without closing the client", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  let cancellation;
+  let clientClosed = false;
+  let callCancellation;
+  const nativeClient = {
+    createCancellation() {
+      cancellation = {
+        cancelled: false,
+        cancel() {
+          this.cancelled = true;
+        },
+      };
+      return cancellation;
+    },
+    async call(_request, observedCancellation) {
+      callCancellation = observedCancellation;
+      while (!observedCancellation.cancelled) {
+        await Promise.resolve();
+      }
+      throw new Error("native call cancelled");
+    },
+    close() {
+      clientClosed = true;
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+  const controller = new AbortController();
+  const call = transport.call(
+    {
+      service: "hello.v1.Greeter",
+      method: "SayHello",
+      body: new Uint8Array(),
+      metadata: {},
+      version: WireVersion,
+    },
+    { signal: controller.signal },
+  );
+
+  await Promise.resolve();
+  controller.abort();
+
+  await assert.rejects(call, (error) => error.code === Code.Cancelled);
+  assert.equal(cancellation.cancelled, true);
+  assert.equal(callCancellation, cancellation);
+  assert.equal(clientClosed, false);
+});
+
+test("Node transport aborts native stream setup and established streams", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  let setupCancellation;
+  let nativeStream;
+  let setupCancelled;
+  const setupCancelledDone = new Promise((resolve) => {
+    setupCancelled = resolve;
+  });
+  const nativeClient = {
+    createCancellation() {
+      setupCancellation = {
+        cancelled: false,
+        cancel() {
+          this.cancelled = true;
+          setupCancelled();
+        },
+      };
+      return setupCancellation;
+    },
+    async startStream(_request, cancellation) {
+      await setupCancelledDone;
+      if (cancellation.cancelled) {
+        throw new Error("stream setup cancelled");
+      }
+      throw new Error("unexpected setup completion");
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+  const setupController = new AbortController();
+  const setup = transport.streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "LotsOfReplies",
+      kind: RpcKind.ServerStreaming,
+      body: new Uint8Array(),
+      metadata: {},
+      version: WireVersion,
+    },
+    emptyAsyncIterable(),
+    { signal: setupController.signal },
+  );
+
+  await Promise.resolve();
+  setupController.abort();
+  await assert.rejects(setup, (error) => error.code === Code.Cancelled);
+  assert.equal(setupCancellation.cancelled, true);
+
+  const streamController = new AbortController();
+  const establishedClient = {
+    createCancellation() {
+      return { cancel() {} };
+    },
+    async startStream() {
+      nativeStream = {
+        closed: false,
+        async finishSend() {},
+        async recvMany() {
+          while (!this.closed) {
+            await Promise.resolve();
+          }
+          throw new Error("stream closed");
+        },
+        close() {
+          this.closed = true;
+        },
+      };
+      return nativeStream;
+    },
+  };
+  const established = await new NodeTransport(establishedClient).streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "LotsOfReplies",
+      kind: RpcKind.ServerStreaming,
+      body: new Uint8Array(),
+      metadata: {},
+      version: WireVersion,
+    },
+    emptyAsyncIterable(),
+    { signal: streamController.signal },
+  );
+  const next = established[Symbol.asyncIterator]().next();
+
+  await Promise.resolve();
+  streamController.abort();
+
+  await assert.rejects(next, (error) => error.code === Code.Cancelled);
+  assert.equal(nativeStream.closed, true);
+});
+
 test("Node native addon loads when built", { skip: !existsSync(nativeAddonPath) }, () => {
   const native = require(nativeAddonPath);
 
@@ -1634,6 +1845,8 @@ function batchedFrameStream(batches, onReturn) {
     },
   };
 }
+
+async function* emptyAsyncIterable() {}
 
 function greeterRequest(parameter = "") {
   return {

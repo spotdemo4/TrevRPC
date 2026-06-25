@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Code } from "./status.js";
+import { Code, cancelled } from "./status.js";
 import { RpcKind, RpcStreamFrameKind } from "./wire.js";
 
 const require = createRequire(import.meta.url);
@@ -28,20 +28,54 @@ export class NodeTransport {
   }
 
   /** Sends a unary RPC request and returns its response. */
-  async call(request) {
-    return await this.nativeClient.call(request.service, request.method, byteBody(request.body));
+  async call(request, options = {}) {
+    throwIfAborted(options.signal);
+    const cancellation = createNativeCancellation(this.nativeClient);
+    const cleanupAbort = onAbort(options.signal, () => cancellation?.cancel());
+    try {
+      const response = await nativeCall(
+        this.nativeClient,
+        nativeRequest(request, RpcKind.Unary),
+        cancellation,
+      );
+      throwIfAborted(options.signal);
+      return response;
+    } catch (error) {
+      if (options.signal?.aborted) {
+        throw signalAbortError(options.signal);
+      }
+      throw error;
+    } finally {
+      cleanupAbort();
+    }
   }
 
   /** Starts a streaming RPC and returns native response frames. */
-  async streamingCall(request, requestBody) {
-    const stream = await this.nativeClient.startStream(
-      request.service,
-      request.method,
-      request.kind ?? RpcKind.ServerStreaming,
-      byteBody(request.body),
-    );
+  async streamingCall(request, requestBody, options = {}) {
+    throwIfAborted(options.signal);
+    const cancellation = createNativeCancellation(this.nativeClient);
+    const cleanupStartAbort = onAbort(options.signal, () => cancellation?.cancel());
+    let stream;
+    try {
+      stream = await nativeStartStream(
+        this.nativeClient,
+        nativeRequest(request, RpcKind.ServerStreaming),
+        cancellation,
+      );
+      cleanupStartAbort();
+      throwIfAborted(options.signal);
+    } catch (error) {
+      cleanupStartAbort();
+      stream?.close();
+      if (options.signal?.aborted) {
+        throw signalAbortError(options.signal);
+      }
+      throw error;
+    }
+
+    const cleanupStreamAbort = onAbort(options.signal, () => stream.close());
     const writerTask = writeRequestStream(stream, requestBody);
-    return new NativeResponseFrameStream(stream, writerTask);
+    return new NativeResponseFrameStream(stream, writerTask, cleanupStreamAbort, options.signal);
   }
 
   /** Closes the underlying native client. */
@@ -184,9 +218,11 @@ export class NodeServerCall {
 }
 
 class NativeResponseFrameStream {
-  constructor(stream, writerTask) {
+  constructor(stream, writerTask, cleanupAbort = () => {}, signal = undefined) {
     this.stream = stream;
     this.done = false;
+    this.cleanupAbort = cleanupAbort;
+    this.signal = signal;
     this.writerError = null;
     this.writerSettled = false;
     this.returnDone = null;
@@ -249,6 +285,7 @@ class NativeResponseFrameStream {
     if (this.returnDone == null) {
       this.done = true;
       this.returnDone = (async () => {
+        this.cleanupAbort();
         this.recvQueue.length = 0;
         this.stream.close();
         await this.recvTask;
@@ -282,6 +319,10 @@ class NativeResponseFrameStream {
       this.recvTask = null;
       if (result.error != null) {
         this.done = true;
+        this.cleanupAbort();
+        if (this.signal?.aborted) {
+          throw signalAbortError(this.signal);
+        }
         throw result.error;
       }
       this.recvQueue.push(...result.frames);
@@ -293,6 +334,7 @@ class NativeResponseFrameStream {
 
   async #finishEof() {
     this.done = true;
+    this.cleanupAbort();
     this.recvQueue.length = 0;
     await this.writerDone;
     if (this.writerError != null) {
@@ -303,6 +345,7 @@ class NativeResponseFrameStream {
 
   async #finishStatus(frame) {
     this.done = true;
+    this.cleanupAbort();
     this.recvQueue.length = 0;
     this.stream.close();
     if (this.writerSettled) {
@@ -445,6 +488,66 @@ function normalizeNodeTransportOptions(urlOrOptions, options) {
     throw new TypeError("native transport requires a URL or options object");
   }
   return { ...urlOrOptions, ...options };
+}
+
+function createNativeCancellation(nativeClient) {
+  return typeof nativeClient.createCancellation === "function"
+    ? nativeClient.createCancellation()
+    : undefined;
+}
+
+function nativeCall(nativeClient, request, cancellation) {
+  return cancellation == null
+    ? nativeClient.call(request)
+    : nativeClient.call(request, cancellation);
+}
+
+function nativeStartStream(nativeClient, request, cancellation) {
+  return cancellation == null
+    ? nativeClient.startStream(request)
+    : nativeClient.startStream(request, cancellation);
+}
+
+function onAbort(signal, callback) {
+  if (signal == null) {
+    return () => {};
+  }
+  if (signal.aborted) {
+    callback();
+    return () => {};
+  }
+  signal.addEventListener("abort", callback, { once: true });
+  return () => signal.removeEventListener("abort", callback);
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signalAbortError(signal);
+  }
+}
+
+function signalAbortError(signal) {
+  const reason = signal?.reason;
+  return reason?.name === "TrevRpcError" ? reason : cancelled("RPC cancelled");
+}
+
+function nativeRequest(request, defaultKind) {
+  const native = {
+    service: request.service,
+    method: request.method,
+    body: byteBody(request.body),
+    metadata: request.metadata ?? {},
+  };
+  if (request.kind != null || defaultKind !== RpcKind.Unary) {
+    native.kind = request.kind ?? defaultKind;
+  }
+  if (request.version != null) {
+    native.version = request.version;
+  }
+  if (request.timeoutNanos != null) {
+    native.timeoutNanos = request.timeoutNanos;
+  }
+  return native;
 }
 
 function byteBody(body) {

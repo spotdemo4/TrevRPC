@@ -23,12 +23,16 @@ export class NodeTransport implements Transport {
   ): Promise<NodeTransport>;
 
   /** Sends a unary RPC request and returns its response. */
-  call(request: Parameters<Transport["call"]>[0]): Promise<RpcResponseMessage>;
+  call(
+    request: Parameters<Transport["call"]>[0],
+    options?: Parameters<Transport["call"]>[1],
+  ): Promise<RpcResponseMessage>;
 
   /** Starts a streaming RPC and returns native response frames. */
   streamingCall(
     request: Parameters<Transport["streamingCall"]>[0],
     requestBody: AsyncIterable<Uint8Array>,
+    options?: Parameters<Transport["streamingCall"]>[2],
   ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
 
   /** Closes the underlying native client. */
@@ -62,6 +66,7 @@ export class NodeServerCall {
     metadata: Record<string, Uint8Array>;
     kind: RpcKindValue;
     version: number;
+    timeoutNanos?: string;
   };
   completed: boolean;
   deferred: boolean;

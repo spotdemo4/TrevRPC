@@ -17,6 +17,19 @@ int trevrpc_wire_encode_request(const char* service,
     size_t max_frame_size,
     uint8_t** frame,
     size_t* frame_len);
+int trevrpc_wire_encode_request_view(const char* service,
+    size_t service_len,
+    const char* method,
+    size_t method_len,
+    uint32_t kind,
+    uint32_t version,
+    const uint8_t* body,
+    size_t body_len,
+    const trevrpc_metadata* metadata,
+    uint64_t timeout_nanos,
+    size_t max_frame_size,
+    uint8_t** frame,
+    size_t* frame_len);
 int trevrpc_wire_encode_response(
     const trevrpc_response* response, size_t max_frame_size, uint8_t** frame, size_t* frame_len);
 int trevrpc_wire_encode_stream_frame(uint32_t kind,

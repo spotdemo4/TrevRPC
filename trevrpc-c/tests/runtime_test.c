@@ -444,6 +444,27 @@ cleanup:
     return result;
 }
 
+static int test_cancellation_token_lifecycle(void) {
+    int result = 1;
+    trevrpc_cancellation* cancellation = trevrpc_cancellation_new();
+
+    CHECK_GOTO(cancellation != NULL);
+    CHECK_GOTO(trevrpc_cancellation_cancelled(cancellation) == 0);
+
+    trevrpc_cancellation_cancel(cancellation);
+    CHECK_GOTO(trevrpc_cancellation_cancelled(cancellation) == 1);
+
+    trevrpc_cancellation_cancel(NULL);
+    CHECK_GOTO(trevrpc_cancellation_cancelled(NULL) == 0);
+    trevrpc_cancellation_free(NULL);
+
+    result = 0;
+
+cleanup:
+    trevrpc_cancellation_free(cancellation);
+    return result;
+}
+
 static int test_default_server_options(void) {
     int result = 1;
     trevrpc_server_options options = trevrpc_default_server_options();
@@ -1581,6 +1602,9 @@ int main(void) {
         return 1;
     }
     if (test_expired_deadline() != 0) {
+        return 1;
+    }
+    if (test_cancellation_token_lifecycle() != 0) {
         return 1;
     }
     if (test_default_server_options() != 0) {
