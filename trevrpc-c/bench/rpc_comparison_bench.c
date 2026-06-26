@@ -1166,6 +1166,7 @@ static int warm_split_client(const char* name, trevrpc_client* client, const spl
 
 static int connect_split_client(const char* transport, const char* host, uint16_t port, trevrpc_client** out_client) {
     trevrpc_config client_config = trevrpc_default_config();
+    client_config.skip_certificate_validation = 1;
     client_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
     client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
     client_config.peer_bidi_stream_count = 128;
@@ -1230,6 +1231,7 @@ static int start_fixture(benchmark_fixture* fixture) {
     }
 
     trevrpc_config client_config = trevrpc_default_config();
+    client_config.skip_certificate_validation = 1;
     client_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
     client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
     client_config.peer_bidi_stream_count = 128;

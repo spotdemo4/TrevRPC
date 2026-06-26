@@ -263,7 +263,7 @@ func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcRes
 		return s.finishResponse(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown RPC method %s/%s", request.Service, request.Method)).IntoResponse(nil))
 	}
 	if route.unaryResponse != nil {
-		response, err := invokeUnaryResponseHandler(ctx, route.unaryResponse, request.Body)
+		response, err := invokeUnaryResponseHandler(ctx, route.unaryResponse, request.Body, handlerNeedsDeadlineRace(ctx))
 		if err != nil {
 			return s.finishResponse(service, method, requestBodyLen, startedAt, StatusFromError(err).IntoResponse(nil))
 		}
@@ -276,7 +276,7 @@ func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcRes
 		return s.finishResponse(service, method, requestBodyLen, startedAt, response)
 	}
 
-	responseBody, err := invokeUnaryHandler(ctx, route.unaryHandler, request.Body)
+	responseBody, err := invokeUnaryHandler(ctx, route.unaryHandler, request.Body, handlerNeedsDeadlineRace(ctx))
 	if err != nil {
 		return s.finishResponse(service, method, requestBodyLen, startedAt, StatusFromError(err).IntoResponse(nil))
 	}
@@ -284,7 +284,22 @@ func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcRes
 	return s.finishResponse(service, method, requestBodyLen, startedAt, OKResponse(responseBody))
 }
 
-func invokeUnaryResponseHandler(ctx context.Context, handler UnaryResponseHandler, body []byte) (*RpcResponse, error) {
+func invokeUnaryResponseHandler(
+	ctx context.Context,
+	handler UnaryResponseHandler,
+	body []byte,
+	raceContext bool,
+) (response *RpcResponse, err error) {
+	if !raceContext {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				response = nil
+				err = Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))
+			}
+		}()
+		return handler(ctx, body)
+	}
+
 	result := make(chan struct {
 		response *RpcResponse
 		err      error
@@ -342,7 +357,13 @@ func (s *Server) HandleStreamingRequest(ctx context.Context, request *RpcRequest
 		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s/%s: expected %d, got %d", request.Service, request.Method, route.kind, request.RPCKind())))
 	}
 
-	responseBody, err := invokeStreamingHandler(ctx, route.streamingHandler, request.Body, requestBody)
+	responseBody, err := invokeStreamingHandler(
+		ctx,
+		route.streamingHandler,
+		request.Body,
+		requestBody,
+		handlerNeedsDeadlineRace(ctx),
+	)
 	if err != nil {
 		cancel()
 		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, StatusFromError(err))
@@ -367,7 +388,17 @@ type unaryHandlerResult struct {
 	err  error
 }
 
-func invokeUnaryHandler(ctx context.Context, handler UnaryHandler, body []byte) ([]byte, error) {
+func invokeUnaryHandler(ctx context.Context, handler UnaryHandler, body []byte, raceContext bool) (bodyOut []byte, err error) {
+	if !raceContext {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				bodyOut = nil
+				err = Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))
+			}
+		}()
+		return handler(ctx, body)
+	}
+
 	result := make(chan unaryHandlerResult, 1)
 	go func() {
 		defer func() {
@@ -393,7 +424,23 @@ type streamingHandlerResult struct {
 	err    error
 }
 
-func invokeStreamingHandler(ctx context.Context, handler StreamingHandler, body []byte, requestBody ByteStream) (ByteStream, error) {
+func invokeStreamingHandler(
+	ctx context.Context,
+	handler StreamingHandler,
+	body []byte,
+	requestBody ByteStream,
+	raceContext bool,
+) (stream ByteStream, err error) {
+	if !raceContext {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				stream = nil
+				err = Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))
+			}
+		}()
+		return handler(ctx, body, requestBody)
+	}
+
 	result := make(chan streamingHandlerResult, 1)
 	go func() {
 		defer func() {
@@ -412,6 +459,14 @@ func invokeStreamingHandler(ctx context.Context, handler StreamingHandler, body 
 	case <-ctx.Done():
 		return nil, statusFromContextError(ctx.Err())
 	}
+}
+
+func handlerNeedsDeadlineRace(ctx context.Context) bool {
+	// Deadlines must become terminal statuses even if a handler blocks. Cancellation
+	// without an RPC deadline is still delivered through ctx, but stays cooperative
+	// to avoid a goroutine per no-timeout handler invocation.
+	_, ok := ctx.Deadline()
+	return ok
 }
 
 func (s *Server) prepareRequest(ctx context.Context, request *RpcRequest) (context.Context, context.CancelFunc, error) {

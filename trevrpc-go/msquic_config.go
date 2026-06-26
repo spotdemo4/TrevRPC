@@ -11,6 +11,8 @@ const (
 type MsQuicConfig struct {
 	CertFile                      string
 	KeyFile                       string
+	CACertFile                    string
+	SkipCertificateValidation     bool
 	MaxIdleTimeout                time.Duration
 	KeepAlive                     time.Duration
 	PeerBidiStreamCount           int

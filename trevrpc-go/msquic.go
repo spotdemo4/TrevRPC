@@ -846,6 +846,12 @@ func mergeMsQuicConfig(base, override MsQuicConfig) MsQuicConfig {
 	if override.KeyFile != "" {
 		base.KeyFile = override.KeyFile
 	}
+	if override.CACertFile != "" {
+		base.CACertFile = override.CACertFile
+	}
+	if override.SkipCertificateValidation {
+		base.SkipCertificateValidation = true
+	}
 	if override.MaxIdleTimeout > 0 {
 		base.MaxIdleTimeout = override.MaxIdleTimeout
 	}
@@ -882,6 +888,15 @@ func withMsQuicConfig(config MsQuicConfig, fn func(*C.trevrpc_msquic_config) err
 		keyFile = C.CString(config.KeyFile)
 		defer C.free(unsafe.Pointer(keyFile))
 	}
+	var caCertFile *C.char
+	if config.CACertFile != "" {
+		caCertFile = C.CString(config.CACertFile)
+		defer C.free(unsafe.Pointer(caCertFile))
+	}
+	skipCertificateValidation := C.int(0)
+	if config.SkipCertificateValidation {
+		skipCertificateValidation = 1
+	}
 	keepAliveMs, err := msQuicDurationMillis32("keep alive", config.KeepAlive)
 	if err != nil {
 		return err
@@ -904,6 +919,8 @@ func withMsQuicConfig(config MsQuicConfig, fn func(*C.trevrpc_msquic_config) err
 		alpn_len:                         C.uint32_t(len(ALPN)),
 		cert_file:                        certFile,
 		key_file:                         keyFile,
+		ca_cert_file:                     caCertFile,
+		skip_certificate_validation:      skipCertificateValidation,
 		max_idle_timeout_ms:              C.uint64_t(durationMillis(config.MaxIdleTimeout)),
 		keep_alive_ms:                    keepAliveMs,
 		peer_bidi_stream_count:           peerBidiStreamCount,

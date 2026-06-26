@@ -82,6 +82,7 @@ async function runClient(host, port, iterations) {
   const transport = await NodeTransport.connect({
     host,
     port,
+    skipCertificateValidation: true,
     maxStreamsPerSession: 128,
     idleTimeoutMs: IdleTimeoutMs,
   });

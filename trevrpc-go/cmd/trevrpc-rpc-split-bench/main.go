@@ -390,9 +390,10 @@ func dialTransport(ctx context.Context, transportName, addr, certFile string) (t
 		return trevrpc.Dial(ctx, addr, trevrpc.DialOptions{
 			Kind: trevrpc.TransportMsQuic,
 			MsQuic: trevrpc.MsQuicConfig{
-				MaxIdleTimeout:      idleTimeout,
-				KeepAlive:           keepAlive,
-				PeerBidiStreamCount: 128,
+				MaxIdleTimeout:            idleTimeout,
+				KeepAlive:                 keepAlive,
+				PeerBidiStreamCount:       128,
+				SkipCertificateValidation: true,
 			},
 		})
 	default:
