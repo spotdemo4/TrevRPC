@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Code, cancelled, codeFromNumber } from "./status.js";
+import { Code, cancelled, codeFromNumber, invalidArgument } from "./status.js";
 import { RpcKind, RpcStreamFrameKind } from "./wire.js";
 
 const require = createRequire(import.meta.url);
@@ -38,7 +38,8 @@ export class NodeTransport {
   /** Sends a unary RPC request and returns its response. */
   async call(request, options = {}) {
     throwIfAborted(options.signal);
-    const cancellation = createNativeCancellation(this.nativeClient);
+    const cancellation =
+      options.signal == null ? undefined : createNativeCancellation(this.nativeClient);
     const cleanupAbort = onAbort(options.signal, () => cancellation?.cancel());
     try {
       const response = await nativeCall(
@@ -61,7 +62,8 @@ export class NodeTransport {
   /** Starts a streaming RPC and returns native response frames. */
   async streamingCall(request, requestBody, options = {}) {
     throwIfAborted(options.signal);
-    const cancellation = createNativeCancellation(this.nativeClient);
+    const cancellation =
+      options.signal == null ? undefined : createNativeCancellation(this.nativeClient);
     const cleanupStartAbort = onAbort(options.signal, () => cancellation?.cancel());
     let stream;
     try {
@@ -463,6 +465,9 @@ class NativeResponseFrameStream {
     this.suppressReturnWriterError = false;
     this.recvQueue = [];
     this.recvTask = null;
+    this.pendingBodyStatus = null;
+    this.pendingBodyError = null;
+    this.pendingBodyEof = false;
     this.readBatchMaxMessages = readBatchMaxMessages;
     this.writerDone = writerTask
       .catch((error) => {
@@ -515,12 +520,82 @@ class NativeResponseFrameStream {
     return { done: false, value: frames };
   }
 
+  async nextBodyBatch(max = this.readBatchMaxMessages) {
+    if (this.done) {
+      return { done: true, value: undefined };
+    }
+
+    if (typeof this.stream.recvBodyBatch !== "function") {
+      return await this.#nextBodyBatchFromFrames(max);
+    }
+
+    try {
+      if (this.pendingBodyStatus != null) {
+        const status = this.pendingBodyStatus;
+        this.pendingBodyStatus = null;
+        await this.#finishStatus(status);
+        return { done: false, value: { bodies: [], status } };
+      }
+      if (this.pendingBodyError != null) {
+        const error = this.pendingBodyError;
+        this.pendingBodyError = null;
+        throw error;
+      }
+      if (this.pendingBodyEof) {
+        this.pendingBodyEof = false;
+        return await this.#finishEof();
+      }
+
+      const batch = await this.stream.recvBodyBatch(max);
+      if (batch == null) {
+        return await this.#finishEof();
+      }
+
+      const bodies = batch.bodies ?? [];
+      if (batch.unknownFrameKind != null) {
+        const error = invalidArgument("response stream contained an unknown frame kind");
+        if (bodies.length > 0) {
+          this.pendingBodyError = error;
+          return { done: false, value: { bodies, status: null } };
+        }
+        throw error;
+      }
+
+      const status = batch.status ?? null;
+      if (status != null && bodies.length > 0) {
+        this.pendingBodyStatus = status;
+        return { done: false, value: { bodies, status: null } };
+      }
+      if (batch.eof && bodies.length === 0) {
+        return await this.#finishEof();
+      }
+      if (batch.eof && bodies.length > 0) {
+        this.pendingBodyEof = true;
+        return { done: false, value: { bodies, status: null } };
+      }
+      if (status != null) {
+        await this.#finishStatus(status);
+      }
+      return { done: false, value: { bodies, status } };
+    } catch (error) {
+      this.done = true;
+      this.cleanupAbort();
+      if (this.signal?.aborted) {
+        throw signalAbortError(this.signal);
+      }
+      throw error;
+    }
+  }
+
   async return() {
     if (this.returnDone == null) {
       this.done = true;
       this.returnDone = (async () => {
         this.cleanupAbort();
         this.recvQueue.length = 0;
+        this.pendingBodyStatus = null;
+        this.pendingBodyError = null;
+        this.pendingBodyEof = false;
         this.stream.close();
         await this.recvTask;
         await this.writerDone;
@@ -563,6 +638,44 @@ class NativeResponseFrameStream {
       if (this.recvQueue.length > 0 && !hasTerminalFrame(this.recvQueue)) {
         this.recvTask = this.#startRecv();
       }
+    }
+  }
+
+  async #nextBodyBatchFromFrames(max) {
+    try {
+      await this.#fillRecvQueue();
+      const frame = this.recvQueue[0];
+      if (frame == null) {
+        this.recvQueue.shift();
+        return await this.#finishEof();
+      }
+      if (frame.kind === RpcStreamFrameKind.Status) {
+        this.recvQueue.shift();
+        await this.#finishStatus(frame);
+        return { done: false, value: { bodies: [], status: frame } };
+      }
+      if (frame.kind !== RpcStreamFrameKind.Message) {
+        throw invalidArgument("response stream contained an unknown frame kind");
+      }
+
+      const limit = Math.max(1, Math.floor(max));
+      const bodies = [];
+      while (bodies.length < limit && this.recvQueue.length > 0) {
+        const queued = this.recvQueue[0];
+        if (isTerminalFrame(queued) || queued.kind !== RpcStreamFrameKind.Message) {
+          break;
+        }
+        this.recvQueue.shift();
+        bodies.push(queued.body ?? EmptyBody);
+      }
+      return { done: false, value: { bodies, status: null } };
+    } catch (error) {
+      this.done = true;
+      this.cleanupAbort();
+      if (this.signal?.aborted) {
+        throw signalAbortError(this.signal);
+      }
+      throw error;
     }
   }
 

@@ -3,7 +3,7 @@ use prost::Message;
 use crate::{Code, Error, Metadata, Result, RpcStreamFrame, RpcStreamFrameKind, Status};
 
 const FRAME_HEADER_LEN: usize = 4;
-const STREAM_FRAME_BODY_TAG: u8 = 4 << 3 | 2;
+pub(crate) const STREAM_FRAME_BODY_TAG: u8 = 4 << 3 | 2;
 
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
@@ -51,6 +51,24 @@ pub fn encode_message_stream_frame(body: &[u8], max_frame_size: usize) -> Result
     append_message_stream_frame_body(&mut frame, body);
 
     Ok(frame)
+}
+
+pub(crate) fn encode_message_stream_frame_prefix(
+    body_len: usize,
+    max_frame_size: usize,
+    frame: &mut Vec<u8>,
+) -> Result<()> {
+    let frame_body_len = message_stream_frame_body_len(body_len);
+    check_frame_body_len(frame_body_len, max_frame_size)?;
+
+    frame.clear();
+    frame.extend_from_slice(&frame_len(frame_body_len, max_frame_size)?.to_be_bytes());
+    if body_len != 0 {
+        frame.push(STREAM_FRAME_BODY_TAG);
+        append_varint_usize(frame, body_len);
+    }
+
+    Ok(())
 }
 
 /// Encodes multiple stream message frames into one contiguous write buffer.
@@ -135,6 +153,39 @@ pub fn decode_stream_frame_body(body: &[u8]) -> Result<RpcStreamFrame> {
         body: frame_body,
         metadata,
     })
+}
+
+/// Decodes an owned streaming RPC frame body, retaining the existing allocation
+/// for the common message-frame payload when the frame contains only field 4.
+pub fn decode_stream_frame_body_owned(mut body: Vec<u8>) -> Result<RpcStreamFrame> {
+    if body.is_empty() {
+        return Ok(RpcStreamFrame::message(Vec::new()));
+    }
+
+    if let Some(payload_start) = plain_message_payload_start(&body)? {
+        body.drain(..payload_start);
+        return Ok(RpcStreamFrame::message(body));
+    }
+
+    decode_stream_frame_body(&body)
+}
+
+fn plain_message_payload_start(body: &[u8]) -> Result<Option<usize>> {
+    if body.first() != Some(&STREAM_FRAME_BODY_TAG) {
+        return Ok(None);
+    }
+
+    let mut offset = 1;
+    let len = usize::try_from(consume_varint(body, &mut offset)?)
+        .map_err(|_| invalid_stream_frame("stream frame field length exceeded supported range"))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| invalid_stream_frame("stream frame field length overflowed"))?;
+    if end > body.len() {
+        return Err(invalid_stream_frame("truncated stream frame field"));
+    }
+
+    Ok((end == body.len()).then_some(offset))
 }
 
 /// Decodes a protobuf message from a `TrevRPC` frame body.
@@ -293,8 +344,8 @@ mod tests {
     use crate::{Code, RpcRequest, RpcStreamFrame, Status};
 
     use super::{
-        decode_frame, decode_stream_frame_body, encode_frame, encode_message_stream_frame,
-        encode_message_stream_frames, frame_body_len,
+        decode_frame, decode_stream_frame_body, decode_stream_frame_body_owned, encode_frame,
+        encode_message_stream_frame, encode_message_stream_frames, frame_body_len,
     };
 
     #[test]
@@ -353,6 +404,10 @@ mod tests {
             Some(crate::RpcStreamFrameKind::Message)
         );
         assert_eq!(decoded.body, body);
+
+        let decoded =
+            decode_stream_frame_body_owned(fast[4..].to_vec()).expect("owned frame should decode");
+        assert_eq!(decoded.body, body);
     }
 
     #[test]
@@ -391,6 +446,12 @@ mod tests {
         let encoded = encode_frame(&frame).expect("status should encode");
         let decoded = decode_stream_frame_body(&encoded[4..]).expect("status should decode");
 
+        assert_eq!(decoded.frame_kind(), frame.frame_kind());
+        assert_eq!(decoded.status, frame.status);
+        assert_eq!(decoded.message, frame.message);
+
+        let decoded = decode_stream_frame_body_owned(encoded[4..].to_vec())
+            .expect("owned status should decode");
         assert_eq!(decoded.frame_kind(), frame.frame_kind());
         assert_eq!(decoded.status, frame.status);
         assert_eq!(decoded.message, frame.message);

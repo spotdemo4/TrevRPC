@@ -15,6 +15,8 @@ import {
 import { RpcKind, RpcStreamFrameKind, WireVersion } from "./wire.js";
 
 const RequestStreamBatchSize = 16;
+const PreparedCallOptions = Symbol("trevrpc.preparedCallOptions");
+const EmptyMetadata = Object.freeze(Object.create(null));
 
 /** Returns the default client call options. */
 export function defaultCallOptions() {
@@ -31,14 +33,19 @@ export function defaultCallOptions() {
 
 /** Merges call options and normalizes metadata. */
 export function mergeCallOptions(base = {}, override = {}) {
+  if (isPreparedCallOptions(base) && !hasDefinedOptions(override)) {
+    return base;
+  }
+
   const merged = { ...defaultCallOptions() };
   copyDefined(merged, base);
   copyDefined(merged, override);
-  merged.metadata = {
-    ...normalizeMetadata(base.metadata ?? {}),
-    ...normalizeMetadata(override.metadata ?? {}),
-  };
-  return merged;
+  merged.metadata = mergeMetadata(base, override);
+  return markPreparedCallOptions(merged);
+}
+
+function preparedCallOptions(options = {}) {
+  return isPreparedCallOptions(options) ? options : mergeCallOptions(options);
 }
 
 /** Calls a unary RPC and decodes the protobuf response. */
@@ -66,7 +73,7 @@ export async function unaryWithResponse(
   request,
   options = {},
 ) {
-  const callOptions = mergeCallOptions(options);
+  const callOptions = preparedCallOptions(options);
   const abortScope = callAbortScope(callOptions);
   const requestBody = marshalMessage(requestType, request);
   const rpcRequest = prepareClientRequest(
@@ -106,7 +113,7 @@ export async function serverStreaming(
   request,
   options = {},
 ) {
-  const callOptions = mergeCallOptions(options);
+  const callOptions = preparedCallOptions(options);
   const abortScope = callAbortScope(callOptions);
   const requestBody = marshalMessage(requestType, request);
   const rpcRequest = prepareClientRequest(
@@ -143,8 +150,8 @@ export async function clientStreaming(
   responseType,
   options = {},
 ) {
-  const callOptions = mergeCallOptions(options);
-  const abortScope = callAbortScope(callOptions);
+  const callOptions = preparedCallOptions(options);
+  const abortScope = callAbortScope(callOptions, { requestCancellation: true });
   const requests = new RequestQueue();
   const rpcRequest = prepareClientRequest(
     service,
@@ -159,7 +166,7 @@ export async function clientStreaming(
     frames = await withTimeout(
       transport.streamingCall(
         rpcRequest,
-        encodeRequestStream(requestType, requests, abortScope.options.signal),
+        encodeRequestStream(requestType, requests, abortScope.signal),
         abortScope.options,
       ),
       callOptions.timeoutMs,
@@ -188,8 +195,8 @@ export async function bidirectionalStreaming(
   responseType,
   options = {},
 ) {
-  const callOptions = mergeCallOptions(options);
-  const abortScope = callAbortScope(callOptions);
+  const callOptions = preparedCallOptions(options);
+  const abortScope = callAbortScope(callOptions, { requestCancellation: true });
   const requests = new RequestQueue();
   const rpcRequest = prepareClientRequest(
     service,
@@ -204,7 +211,7 @@ export async function bidirectionalStreaming(
     frames = await withTimeout(
       transport.streamingCall(
         rpcRequest,
-        encodeRequestStream(requestType, requests, abortScope.options.signal),
+        encodeRequestStream(requestType, requests, abortScope.signal),
         abortScope.options,
       ),
       callOptions.timeoutMs,
@@ -320,11 +327,12 @@ export class BidirectionalStreamingCall {
 /** Creates a service client from a generated service descriptor. */
 export function createServiceClient(transport, service, root, options = {}) {
   const client = {};
+  const baseOptions = mergeCallOptions(options);
 
   for (const [jsName, method] of Object.entries(service.methods)) {
     const requestType = root.lookupType(method.inputType);
     const responseType = root.lookupType(method.outputType);
-    const callOptions = (override) => mergeCallOptions(options, override ?? {});
+    const callOptions = (override) => mergeCallOptions(baseOptions, override ?? {});
 
     switch (method.kind) {
       case "unary":
@@ -392,8 +400,9 @@ export function createServiceClient(transport, service, root, options = {}) {
 }
 
 function prepareClientRequest(service, method, kind, body, options) {
-  const metadata = normalizeMetadata(options.metadata ?? {});
-  validateMetadata(metadata);
+  const metadata = isPreparedCallOptions(options)
+    ? (options.metadata ?? EmptyMetadata)
+    : normalizeMetadata(options.metadata ?? {});
   const request = {
     service,
     method,
@@ -735,7 +744,17 @@ function signalAbortError(signal) {
   return reason?.name === "TrevRpcError" ? reason : cancelled("RPC cancelled");
 }
 
-function callAbortScope(options) {
+function callAbortScope(options, { requestCancellation = false } = {}) {
+  const needsTransportSignal = options.signal != null || options.timeoutMs != null;
+  if (!needsTransportSignal && !requestCancellation) {
+    return {
+      options,
+      signal: undefined,
+      abort() {},
+      cleanup() {},
+    };
+  }
+
   const controller = new AbortController();
   const parentSignal = options.signal;
   const abort = (reason) => {
@@ -753,8 +772,12 @@ function callAbortScope(options) {
     }
   }
 
+  const scopedOptions = needsTransportSignal
+    ? markPreparedCallOptions({ ...options, signal: controller.signal })
+    : options;
   return {
-    options: { ...options, signal: controller.signal },
+    options: scopedOptions,
+    signal: controller.signal,
     abort,
     cleanup() {
       parentSignal?.removeEventListener?.("abort", onParentAbort);
@@ -1019,6 +1042,70 @@ function copyDefined(target, source) {
       target[key] = value;
     }
   }
+}
+
+function mergeMetadata(base, override) {
+  const baseHasMetadata = hasMetadataEntries(base?.metadata);
+  const overrideHasMetadata = hasMetadataEntries(override?.metadata);
+
+  if (!baseHasMetadata && !overrideHasMetadata) {
+    return EmptyMetadata;
+  }
+
+  if (!overrideHasMetadata) {
+    return isPreparedCallOptions(base)
+      ? (base.metadata ?? EmptyMetadata)
+      : normalizeMetadata(base.metadata);
+  }
+
+  if (!baseHasMetadata) {
+    return isPreparedCallOptions(override)
+      ? (override.metadata ?? EmptyMetadata)
+      : normalizeMetadata(override.metadata);
+  }
+
+  const metadata = Object.assign(
+    Object.create(null),
+    isPreparedCallOptions(base) ? base.metadata : normalizeMetadata(base.metadata),
+    isPreparedCallOptions(override) ? override.metadata : normalizeMetadata(override.metadata),
+  );
+  validateMetadata(metadata);
+  return metadata;
+}
+
+function hasMetadataEntries(metadata) {
+  if (metadata == null) {
+    return false;
+  }
+  if (metadata instanceof Map) {
+    return metadata.size > 0;
+  }
+  for (const _key in metadata) {
+    return true;
+  }
+  return false;
+}
+
+function hasDefinedOptions(options) {
+  for (const [key, value] of Object.entries(options ?? {})) {
+    if (key === "metadata") {
+      if (hasMetadataEntries(value)) {
+        return true;
+      }
+    } else if (value !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function markPreparedCallOptions(options) {
+  Object.defineProperty(options, PreparedCallOptions, { value: true });
+  return options;
+}
+
+function isPreparedCallOptions(options) {
+  return options?.[PreparedCallOptions] === true;
 }
 
 function saturatingAdd(left, right) {

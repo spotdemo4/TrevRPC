@@ -119,7 +119,7 @@ type RpcResponse struct {
 
 // OKResponse creates a successful RPC response with the provided body.
 func OKResponse(body []byte) *RpcResponse {
-	return OK().IntoResponse(body)
+	return &RpcResponse{Status: uint32(CodeOK), Body: body, Metadata: Metadata{}}
 }
 
 // Reset clears the response for protobuf compatibility.

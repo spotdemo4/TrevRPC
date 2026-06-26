@@ -5,7 +5,7 @@ use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,12 @@ const GRPC_SAY_HELLO_PATH: &str = "/example.greeter.Greeter/SayHello";
 const GRPC_LOTS_OF_REPLIES_PATH: &str = "/example.greeter.Greeter/LotsOfReplies";
 const GRPC_LOTS_OF_GREETINGS_PATH: &str = "/example.greeter.Greeter/LotsOfGreetings";
 const GRPC_BIDI_HELLO_PATH: &str = "/example.greeter.Greeter/BidiHello";
+const STREAM_IDLE_TIMEOUT_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT";
+const QUINN_MAX_IDLE_TIMEOUT_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_MAX_IDLE_TIMEOUT_MS";
+const QUINN_KEEP_ALIVE_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS";
+const QUINN_SEND_WINDOW_BYTES_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES";
+const QUINN_ACK_THRESHOLD_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD";
+const QUINN_ACK_DELAY_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS";
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 type GrpcReplyStream =
@@ -76,7 +82,7 @@ async fn main() -> BenchResult {
             run_grpc_server(addr).await
         }
         _ => Err(
-            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <iterations> | grpc-server [addr]"
+            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <iterations> | grpc-server [addr]\nset TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT=default to keep production stream idle timers in TrevRPC split rows"
                 .into(),
         ),
     }
@@ -124,7 +130,7 @@ async fn run_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> Benc
 
 async fn run_server(addr: SocketAddr) -> BenchResult {
     let mut server = trevrpc::server::Server::new();
-    server.set_options(benchmark_server_options());
+    server.set_options(split_benchmark_server_options());
     greeter::register_greeter(&mut server, SplitGreeter);
     let endpoint = make_server_endpoint(addr, server.options())?;
     let local_addr = endpoint.local_addr()?;
@@ -280,7 +286,7 @@ async fn trevrpc_unary_call(
             greeter::HelloRequest {
                 name: REQUEST_NAME.to_owned(),
             },
-            trevrpc::client::CallOptions::new(),
+            split_benchmark_call_options(),
         )
         .await?;
     if response.message != REQUEST_NAME {
@@ -298,7 +304,7 @@ async fn trevrpc_server_streaming_call(
             greeter::HelloRequest {
                 name: message_count.to_string(),
             },
-            trevrpc::client::CallOptions::new().with_max_response_messages(Some(message_count)),
+            split_benchmark_call_options().with_max_response_messages(Some(message_count)),
         )
         .await?;
     let mut count = 0;
@@ -321,7 +327,7 @@ async fn trevrpc_client_streaming_call(
     let response = client
         .lots_of_greetings_from_stream(
             trevrpc::stream::from_iter(benchmark_requests(message_count)),
-            trevrpc::client::CallOptions::new(),
+            split_benchmark_call_options(),
         )
         .await?;
     let expected = format!("streamed {message_count} greetings");
@@ -338,7 +344,7 @@ async fn trevrpc_bidi_streaming_call(
     let mut replies = client
         .bidi_hello_from_stream(
             trevrpc::stream::from_iter(benchmark_requests(message_count)),
-            trevrpc::client::CallOptions::new().with_max_response_messages(Some(message_count)),
+            split_benchmark_call_options().with_max_response_messages(Some(message_count)),
         )
         .await?;
     let mut count = 0;
@@ -890,6 +896,27 @@ fn benchmark_server_options() -> trevrpc::server::ServerOptions {
         .with_max_stream_body_size(None)
 }
 
+fn split_benchmark_server_options() -> trevrpc::server::ServerOptions {
+    benchmark_server_options().with_stream_idle_timeout(split_benchmark_stream_idle_timeout())
+}
+
+fn split_benchmark_call_options() -> trevrpc::client::CallOptions {
+    trevrpc::client::CallOptions::new()
+        .with_stream_idle_timeout(split_benchmark_stream_idle_timeout())
+}
+
+fn split_benchmark_stream_idle_timeout() -> Option<Duration> {
+    static STREAM_IDLE_TIMEOUT: OnceLock<Option<Duration>> = OnceLock::new();
+
+    *STREAM_IDLE_TIMEOUT.get_or_init(|| match std::env::var(STREAM_IDLE_TIMEOUT_ENV) {
+        Ok(value) if matches!(value.as_str(), "default" | "production" | "on" | "1") => {
+            trevrpc::server::ServerOptions::new().stream_idle_timeout()
+        }
+        Ok(value) if matches!(value.as_str(), "disabled" | "none" | "off" | "0") => None,
+        Ok(_) | Err(_) => None,
+    })
+}
+
 fn benchmark_webtransport_server_options(origin: String) -> trevrpc::server::ServerOptions {
     let origin: &'static str = Box::leak(origin.into_boxed_str());
     let origins: &'static [&'static str] = Box::leak(vec![origin].into_boxed_slice());
@@ -963,7 +990,47 @@ fn make_server_endpoint_with_identity(
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     trevrpc::quinn::configure_server_config(&mut server_config, options, enable_webtransport);
+    apply_quinn_benchmark_tuning(&mut server_config)?;
     Ok(quinn::Endpoint::server(server_config, addr)?)
+}
+
+fn apply_quinn_benchmark_tuning(config: &mut quinn::ServerConfig) -> BenchResult {
+    let Some(transport) = Arc::get_mut(&mut config.transport) else {
+        return Ok(());
+    };
+
+    if let Some(value) = env_u64(QUINN_MAX_IDLE_TIMEOUT_MS_ENV)? {
+        transport.max_idle_timeout(Some(Duration::from_millis(value).try_into()?));
+    }
+    if let Some(value) = env_u64(QUINN_KEEP_ALIVE_MS_ENV)? {
+        transport.keep_alive_interval(Some(Duration::from_millis(value)));
+    }
+    if let Some(value) = env_u64(QUINN_SEND_WINDOW_BYTES_ENV)? {
+        transport.send_window(value);
+    }
+
+    let ack_threshold = env_u64(QUINN_ACK_THRESHOLD_ENV)?;
+    let ack_delay = env_u64(QUINN_ACK_DELAY_MS_ENV)?;
+    if ack_threshold.is_some() || ack_delay.is_some() {
+        let mut ack = quinn::AckFrequencyConfig::default();
+        if let Some(value) = ack_threshold {
+            ack.ack_eliciting_threshold(quinn::VarInt::from_u64(value)?);
+        }
+        ack.max_ack_delay(ack_delay.map(Duration::from_millis));
+        transport.ack_frequency_config(Some(ack));
+    }
+
+    Ok(())
+}
+
+fn env_u64(name: &str) -> BenchResult<Option<u64>> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value.parse()?))
 }
 
 fn write_certificate(identity: &rcgen::CertifiedKey<rcgen::KeyPair>, path: &Path) -> BenchResult {

@@ -448,6 +448,12 @@ int trevrpc_stream_send_status_with_metadata(
     trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata);
 int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** frame);
 int trevrpc_stream_recv_ready(trevrpc_stream* stream, trevrpc_stream_frame** frame, int* ready);
+/*
+ * Receives up to capacity frames. The first receive may block like trevrpc_stream_recv;
+ * following receives only drain already-ready frames. Returned frames are owned by the caller.
+ */
+int trevrpc_stream_recv_batch(
+    trevrpc_stream* stream, trevrpc_stream_frame** frames, size_t capacity, size_t* count, int* eof);
 int trevrpc_stream_finish_send(trevrpc_stream* stream);
 void trevrpc_stream_cancel(trevrpc_stream* stream);
 void trevrpc_stream_close(trevrpc_stream* stream);

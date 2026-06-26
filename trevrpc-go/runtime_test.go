@@ -854,6 +854,182 @@ func TestResponseStreamCloseRecordsCancelled(t *testing.T) {
 	expectMetrics(t, metrics, CodeCancelled)
 }
 
+func TestServerResponseBatchWriterBatchesNonBlockingMessages(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamMessages = -1
+	options.StreamIdleTimeout = 0
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return FromSlice([]byte("one"), []byte("two"), []byte("three")), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	var input bytes.Buffer
+	if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
+		t.Fatalf("write request frame: %v", err)
+	}
+	stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
+
+	handleRPCStream(context.Background(), server, nil, stream)
+
+	if stream.writeCount != 2 {
+		t.Fatalf("expected one message batch write and one status write, got %d", stream.writeCount)
+	}
+	if !stream.closed {
+		t.Fatal("expected stream to close gracefully")
+	}
+	frames := readStreamFramesFromBytes(t, stream.written.Bytes(), DefaultMaxFrameSize)
+	if len(frames) != 4 {
+		t.Fatalf("expected three messages and status, got %d frames", len(frames))
+	}
+	for index, want := range [][]byte{[]byte("one"), []byte("two"), []byte("three")} {
+		if frames[index].Kind != RpcStreamFrameKindMessage || !bytes.Equal(frames[index].Body, want) {
+			t.Fatalf("unexpected message frame %d: %#v", index, frames[index])
+		}
+	}
+	if frames[3].Kind != RpcStreamFrameKindStatus || CodeFromUint32(frames[3].Status) != CodeOK {
+		t.Fatalf("expected terminal OK status, got %#v", frames[3])
+	}
+}
+
+func TestServerResponseBatchWriterSplitsOnByteCap(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamMessages = -1
+	options.StreamIdleTimeout = 0
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return FromSlice([]byte("abcd"), []byte("efgh"), []byte("ijkl")), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	defer closeMessageStream(response)
+	frameWriter, ok := response.(transportResponseFramesWriter)
+	if !ok {
+		t.Fatal("server response stream should expose batched frame writer")
+	}
+	writer := &countingWriter{}
+
+	done, err := frameWriter.trevrpcWriteNextFrames(context.Background(), writer, 16)
+	if err != nil {
+		t.Fatalf("write first batch: %v", err)
+	}
+	if done {
+		t.Fatal("first capped batch should not be terminal")
+	}
+	if writer.writeCount != 1 {
+		t.Fatalf("expected one write for first capped batch, got %d", writer.writeCount)
+	}
+	frames := readStreamFramesFromBytes(t, writer.Bytes(), 16)
+	if len(frames) != 1 || frames[0].Kind != RpcStreamFrameKindMessage || !bytes.Equal(frames[0].Body, []byte("abcd")) {
+		t.Fatalf("expected only first message in capped batch, got %#v", frames)
+	}
+
+	writer.Reset()
+	writer.writeCount = 0
+	done, err = frameWriter.trevrpcWriteNextFrames(context.Background(), writer, 16)
+	if err != nil {
+		t.Fatalf("write second batch: %v", err)
+	}
+	if done {
+		t.Fatal("second capped batch should not be terminal")
+	}
+	frames = readStreamFramesFromBytes(t, writer.Bytes(), 16)
+	if len(frames) != 1 || frames[0].Kind != RpcStreamFrameKindMessage || !bytes.Equal(frames[0].Body, []byte("efgh")) {
+		t.Fatalf("expected pending second message in next batch, got %#v", frames)
+	}
+}
+
+func TestServerResponseBatchWriterFallsBackWithIdleTimeout(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamMessages = -1
+	options.StreamIdleTimeout = testTimeout
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return FromSlice([]byte("one"), []byte("two")), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	defer closeMessageStream(response)
+	frameWriter, ok := response.(transportResponseFramesWriter)
+	if !ok {
+		t.Fatal("server response stream should expose batched frame writer")
+	}
+	writer := &countingWriter{}
+
+	done, err := frameWriter.trevrpcWriteNextFrames(context.Background(), writer, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatalf("write first frame: %v", err)
+	}
+	if done {
+		t.Fatal("first message frame should not be terminal")
+	}
+	frames := readStreamFramesFromBytes(t, writer.Bytes(), DefaultMaxFrameSize)
+	if len(frames) != 1 || frames[0].Kind != RpcStreamFrameKindMessage || !bytes.Equal(frames[0].Body, []byte("one")) {
+		t.Fatalf("idle timeout should fall back to one message per write, got %#v", frames)
+	}
+}
+
+func TestServerResponseBatchWriterPreservesTerminalStatusAfterBatch(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamBodySize = 3
+	options.StreamIdleTimeout = 0
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return FromSlice([]byte("ok"), []byte("too")), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	defer closeMessageStream(response)
+	frameWriter, ok := response.(transportResponseFramesWriter)
+	if !ok {
+		t.Fatal("server response stream should expose batched frame writer")
+	}
+	writer := &countingWriter{}
+
+	done, err := frameWriter.trevrpcWriteNextFrames(context.Background(), writer, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatalf("write message batch: %v", err)
+	}
+	if done {
+		t.Fatal("message batch should be followed by terminal status")
+	}
+	frames := readStreamFramesFromBytes(t, writer.Bytes(), DefaultMaxFrameSize)
+	if len(frames) != 1 || frames[0].Kind != RpcStreamFrameKindMessage || !bytes.Equal(frames[0].Body, []byte("ok")) {
+		t.Fatalf("expected valid message before terminal status, got %#v", frames)
+	}
+
+	writer.Reset()
+	done, err = frameWriter.trevrpcWriteNextFrames(context.Background(), writer, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatalf("write terminal status: %v", err)
+	}
+	if !done {
+		t.Fatal("terminal status should complete the stream")
+	}
+	frames = readStreamFramesFromBytes(t, writer.Bytes(), DefaultMaxFrameSize)
+	if len(frames) != 1 || frames[0].Kind != RpcStreamFrameKindStatus || CodeFromUint32(frames[0].Status) != CodeResourceExhausted {
+		t.Fatalf("expected resource exhausted terminal status, got %#v", frames)
+	}
+}
+
+func TestWebTransportResponseStreamAdvertisesContextCancellation(t *testing.T) {
+	stream := &webTransportResponseStream{}
+	if !streamContextCancelsRecv(stream) {
+		t.Fatal("webtransport response stream should cancel pending receives from context")
+	}
+}
+
 func TestClientResponseStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
 	options := DefaultCallOptions()
 	options.StreamIdleTimeout = time.Millisecond
@@ -2408,6 +2584,54 @@ type closeErrorFrameStream struct {
 	frames []*RpcStreamFrame
 	err    error
 	closed int
+}
+
+type countingWriter struct {
+	bytes.Buffer
+	writeCount int
+}
+
+func (w *countingWriter) Write(data []byte) (int, error) {
+	w.writeCount++
+	return w.Buffer.Write(data)
+}
+
+type countingRPCStream struct {
+	reader     *bytes.Reader
+	written    bytes.Buffer
+	writeCount int
+	closed     bool
+}
+
+func (s *countingRPCStream) Read(data []byte) (int, error) {
+	return s.reader.Read(data)
+}
+
+func (s *countingRPCStream) Write(data []byte) (int, error) {
+	s.writeCount++
+	return s.written.Write(data)
+}
+
+func (s *countingRPCStream) Close() error {
+	s.closed = true
+	return nil
+}
+
+func readStreamFramesFromBytes(t *testing.T, data []byte, maxFrameSize int) []*RpcStreamFrame {
+	t.Helper()
+	reader := bytes.NewReader(data)
+	var frames []*RpcStreamFrame
+	for {
+		frame := &RpcStreamFrame{}
+		read, err := ReadFrameOrEOF(reader, frame, maxFrameSize)
+		if err != nil {
+			t.Fatalf("read stream frame %d: %v", len(frames), err)
+		}
+		if !read {
+			return frames
+		}
+		frames = append(frames, frame)
+	}
 }
 
 type contextBlockingTransport struct{}

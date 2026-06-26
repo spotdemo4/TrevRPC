@@ -545,6 +545,25 @@ static int trevrpc_stream_write_frame(trevrpc_stream* stream, const uint8_t* fra
     return -EINVAL;
 }
 
+static int trevrpc_stream_write_final_frame(trevrpc_stream* stream, const uint8_t* frame, size_t frame_len) {
+    intptr_t written = 0;
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        written = trevrpc_msquic_stream_write_fin(stream->msquic_stream, frame, frame_len);
+        if (written < 0) {
+            return (int)written;
+        }
+        return (size_t)written == frame_len ? 0 : TREV_MSQUIC_ERR_CLOSED;
+    }
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
+        int err = trevrpc_stream_write_frame(stream, frame, frame_len);
+        if (err != 0) {
+            return err;
+        }
+        return trevrpc_wt_stream_shutdown_send(stream->wt_stream);
+    }
+    return -EINVAL;
+}
+
 static intptr_t trevrpc_stream_write_message_frame(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
     if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
         return trevrpc_msquic_stream_write_message_frame(stream->msquic_stream, body, body_len, stream->max_frame_size);
@@ -623,9 +642,6 @@ static int trevrpc_stream_shutdown_send_raw(trevrpc_stream* stream) {
 
 static void trevrpc_stream_close_raw(trevrpc_stream* stream) {
     if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
-        if (stream->owns_stream) {
-            (void)trevrpc_msquic_stream_abort(stream->msquic_stream);
-        }
         trevrpc_msquic_stream_close(stream->msquic_stream);
     } else if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         trevrpc_wt_stream_close(stream->wt_stream);
@@ -921,11 +937,12 @@ int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, 
     return written < 0 ? (int)written : 0;
 }
 
-int trevrpc_stream_send_status_with_metadata(trevrpc_stream* stream,
+static int trevrpc_stream_send_status_with_metadata_internal(trevrpc_stream* stream,
     uint32_t status,
     const char* message,
     size_t message_len,
-    const trevrpc_metadata* metadata) {
+    const trevrpc_metadata* metadata,
+    bool finish_send) {
     if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) ||
         (message == NULL && message_len > 0)) {
         return -EINVAL;
@@ -952,11 +969,28 @@ int trevrpc_stream_send_status_with_metadata(trevrpc_stream* stream,
 #ifdef TREVRPC_TESTING
         trevrpc_test_record_stream_status(status);
 #endif
-        err = trevrpc_stream_write_frame(stream, frame, frame_len);
+        err = finish_send ? trevrpc_stream_write_final_frame(stream, frame, frame_len)
+                          : trevrpc_stream_write_frame(stream, frame, frame_len);
         stream->status_queued = err == 0;
     }
     free(frame);
     return err;
+}
+
+int trevrpc_stream_send_status_with_metadata(trevrpc_stream* stream,
+    uint32_t status,
+    const char* message,
+    size_t message_len,
+    const trevrpc_metadata* metadata) {
+    return trevrpc_stream_send_status_with_metadata_internal(stream, status, message, message_len, metadata, false);
+}
+
+static int trevrpc_stream_send_final_status_with_metadata(trevrpc_stream* stream,
+    uint32_t status,
+    const char* message,
+    size_t message_len,
+    const trevrpc_metadata* metadata) {
+    return trevrpc_stream_send_status_with_metadata_internal(stream, status, message, message_len, metadata, true);
 }
 
 int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len) {
@@ -1069,6 +1103,53 @@ int trevrpc_stream_recv_ready(trevrpc_stream* stream, trevrpc_stream_frame** out
         }
     }
     return err;
+}
+
+int trevrpc_stream_recv_batch(
+    trevrpc_stream* stream, trevrpc_stream_frame** frames, size_t capacity, size_t* count, int* eof) {
+    if (stream == NULL || frames == NULL || capacity == 0 || count == NULL || eof == NULL) {
+        return -EINVAL;
+    }
+
+    *count = 0;
+    *eof = 0;
+    for (size_t i = 0; i < capacity; i++) {
+        frames[i] = NULL;
+    }
+
+    trevrpc_stream_frame* frame = NULL;
+    int err = trevrpc_stream_recv(stream, &frame);
+    if (err != 0) {
+        return err;
+    }
+    if (frame == NULL) {
+        *eof = 1;
+        return 0;
+    }
+
+    frames[(*count)++] = frame;
+    if (frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+        return 0;
+    }
+
+    while (*count < capacity) {
+        int ready = 0;
+        frame = NULL;
+        err = trevrpc_stream_recv_ready(stream, &frame, &ready);
+        if (err != 0 || !ready) {
+            return err;
+        }
+        if (frame == NULL) {
+            *eof = 1;
+            return 0;
+        }
+        frames[(*count)++] = frame;
+        if (frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+            return 0;
+        }
+    }
+
+    return 0;
 }
 
 int trevrpc_stream_finish_send(trevrpc_stream* stream) {
@@ -2612,8 +2693,8 @@ static void trevrpc_server_write_response(trevrpc_stream* stream, trevrpc_respon
         trevrpc_set_status(response, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "response frame exceeded maximum size");
         encode_err = trevrpc_wire_encode_response(response, stream->max_frame_size, &frame, &frame_len);
     }
-    if (encode_err == 0 && trevrpc_stream_write_frame(stream, frame, frame_len) == 0) {
-        (void)trevrpc_stream_shutdown_send_raw(stream);
+    if (encode_err == 0) {
+        (void)trevrpc_stream_write_final_frame(stream, frame, frame_len);
     }
     free(frame);
 }
@@ -2626,10 +2707,8 @@ static void trevrpc_server_write_status(trevrpc_stream* stream, uint32_t status,
 }
 
 static void trevrpc_server_write_stream_status(trevrpc_stream* stream, uint32_t status, const char* message) {
-    if (trevrpc_stream_send_status(stream, status, message, message == NULL ? 0 : strlen(message)) == 0 &&
-        stream->status_queued) {
-        (void)trevrpc_stream_shutdown_send_raw(stream);
-    }
+    (void)trevrpc_stream_send_final_status_with_metadata(
+        stream, status, message, message == NULL ? 0 : strlen(message), NULL);
 }
 
 static uint32_t trevrpc_status_from_error(int err, const char** message) {
@@ -2896,28 +2975,33 @@ int trevrpc_call_respond(trevrpc_call* call, trevrpc_response* response) {
 
 static void trevrpc_call_write_stream_finish(
     trevrpc_call* call, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata) {
+    bool status_was_sent = call->stream.sent_status;
     if (trevrpc_call_context_deadline_expired(&call->context) && !call->stream.sent_status) {
         call->stream.context = NULL;
         call->final_status = TREVRPC_STATUS_DEADLINE_EXCEEDED;
-        (void)trevrpc_stream_send_status(
-            &call->stream, TREVRPC_STATUS_DEADLINE_EXCEEDED, "RPC deadline exceeded", strlen("RPC deadline exceeded"));
+        (void)trevrpc_stream_send_final_status_with_metadata(&call->stream,
+            TREVRPC_STATUS_DEADLINE_EXCEEDED,
+            "RPC deadline exceeded",
+            strlen("RPC deadline exceeded"),
+            NULL);
     } else if (call->stream.failure_status != TREVRPC_STATUS_OK && !call->stream.sent_status) {
         call->stream.context = NULL;
         call->final_status = call->stream.failure_status;
-        (void)trevrpc_stream_send_status(&call->stream,
+        (void)trevrpc_stream_send_final_status_with_metadata(&call->stream,
             call->stream.failure_status,
             call->stream.failure_message,
-            call->stream.failure_message == NULL ? 0 : strlen(call->stream.failure_message));
+            call->stream.failure_message == NULL ? 0 : strlen(call->stream.failure_message),
+            NULL);
     } else if (!call->stream.sent_status) {
         call->stream.context = NULL;
         call->final_status = trevrpc_status_code_from_uint32(status);
-        (void)trevrpc_stream_send_status_with_metadata(
+        (void)trevrpc_stream_send_final_status_with_metadata(
             &call->stream, call->final_status, message, message_len, metadata);
     } else {
         call->final_status = call->stream.terminal_status;
     }
     call->response_body_len = (size_t)call->stream.response_body_size;
-    if (call->stream.status_queued) {
+    if (status_was_sent && call->stream.status_queued) {
         (void)trevrpc_stream_finish_send(&call->stream);
     }
 }

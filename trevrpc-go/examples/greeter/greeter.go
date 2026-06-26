@@ -127,6 +127,12 @@ func RegisterGreeterServer(server *trevrpc.Server, implementation GreeterServer)
 }
 
 func mergeOptions(base []trevrpc.CallOption, override []trevrpc.CallOption) []trevrpc.CallOption {
+	if len(base) == 0 {
+		return override
+	}
+	if len(override) == 0 {
+		return base
+	}
 	merged := make([]trevrpc.CallOption, 0, len(base)+len(override))
 	merged = append(merged, base...)
 	merged = append(merged, override...)

@@ -27,6 +27,7 @@ import {
   clientStreaming,
   connect,
   createRoot,
+  createServiceClient,
   decodeFrame,
   decodeStreamFrameBody,
   encodeFrame,
@@ -678,6 +679,104 @@ test("WebTransport writes request body batches", async () => {
   await responses[Symbol.asyncIterator]().return();
 });
 
+test("WebTransport splits request body batches by byte limit", async () => {
+  const writes = [];
+  const bodies = [new Uint8Array([1, 2]), new Uint8Array([3]), new Uint8Array([4, 5, 6])];
+  const stream = fakeBidirectionalStream({
+    onWrite(chunk) {
+      writes.push(chunk);
+    },
+  });
+  const client = new WebTransportClient(
+    {
+      ready: Promise.resolve(),
+      createBidirectionalStream() {
+        return Promise.resolve(stream);
+      },
+    },
+    { streamWriteBatchMaxBytes: 3 },
+  );
+  const requestBody = {
+    [Symbol.asyncIterator]() {
+      let sent = false;
+      return {
+        nextBatch() {
+          if (sent) {
+            return Promise.resolve({ done: true, value: undefined });
+          }
+          sent = true;
+          return Promise.resolve({ done: false, value: bodies });
+        },
+      };
+    },
+  };
+
+  const responses = await client.streamingCall(
+    RpcRequest.create({
+      service: "hello.v1.Greeter",
+      method: "LotsOfGreetings",
+      body: new Uint8Array(),
+      metadata: {},
+      kind: RpcKind.ClientStreaming,
+      version: WireVersion,
+    }),
+    requestBody,
+  );
+  for (let attempt = 0; attempt < 10 && writes.length < 3; attempt += 1) {
+    await Promise.resolve();
+  }
+
+  assert.equal(writes.length, 3);
+  assert.deepEqual(writes[1], encodeMessageStreamFrames(bodies.slice(0, 2)));
+  assert.deepEqual(writes[2], encodeMessageStreamFrames(bodies.slice(2)));
+  await responses[Symbol.asyncIterator]().return();
+});
+
+test("WebTransport response frame queue drains messages before terminal status", async () => {
+  const bodies = [new Uint8Array([1]), new Uint8Array([2])];
+  const status = RpcStreamFrame.create({
+    kind: RpcStreamFrameKind.Status,
+    status: Code.Ok,
+    metadata: {},
+  });
+  const stream = fakeBidirectionalStream({
+    readableChunks: [
+      concatBytes([encodeMessageStreamFrames(bodies), encodeFrame(RpcStreamFrame, status)]),
+    ],
+  });
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+
+  const responses = await client.streamingCall(
+    RpcRequest.create({
+      service: "hello.v1.Greeter",
+      method: "LotsOfReplies",
+      body: new Uint8Array(),
+      metadata: {},
+      kind: RpcKind.ServerStreaming,
+      version: WireVersion,
+    }),
+    emptyAsyncIterable(),
+  );
+  const iterator = responses[Symbol.asyncIterator]();
+  const first = await iterator.nextBatch(8);
+  const second = await iterator.nextBatch(8);
+
+  assert.equal(first.done, false);
+  assert.deepEqual(
+    first.value.map((frame) => Array.from(frame.body)),
+    [[1], [2]],
+  );
+  assert.equal(second.done, false);
+  assert.equal(second.value.length, 1);
+  assert.equal(second.value[0].kind, RpcStreamFrameKind.Status);
+  assert.equal(second.value[0].status, Code.Ok);
+});
+
 test("unknown response stream frame kind maps to invalid argument", async () => {
   const root = createRoot({
     nested: {
@@ -946,6 +1045,114 @@ test("Node transport writes request body batches with native sendMessages", asyn
   assert.deepEqual(sentBatches, [[[1], [2]]]);
 });
 
+test("Node transport reads native response body batches and delays terminal status", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  const status = RpcStreamFrame.create({
+    kind: RpcStreamFrameKind.Status,
+    status: Code.Ok,
+    metadata: { trailer: new Uint8Array([7]) },
+  });
+  let closed = false;
+  let observedMax;
+  let recvBodyBatchCalls = 0;
+  const nativeClient = {
+    async startStream() {
+      return {
+        async sendMessage() {
+          throw new Error("server-streaming request should not send body messages");
+        },
+        async finishSend() {},
+        async recv() {
+          throw new Error("single-frame recv should not be used for native body batches");
+        },
+        async recvMany() {
+          throw new Error("frame batches should not be used for native body batches");
+        },
+        async recvBodyBatch(max) {
+          observedMax = max;
+          recvBodyBatchCalls += 1;
+          return {
+            bodies: [new Uint8Array([1]), new Uint8Array([2, 3])],
+            status,
+          };
+        },
+        close() {
+          closed = true;
+        },
+      };
+    },
+  };
+  const transport = new NodeTransport(nativeClient, { streamReadBatchMaxMessages: 7 });
+
+  const responses = await transport.streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "LotsOfReplies",
+      kind: RpcKind.ServerStreaming,
+      body: new Uint8Array(),
+    },
+    emptyAsyncIterable(),
+  );
+  const iterator = responses[Symbol.asyncIterator]();
+  const first = await iterator.nextBodyBatch();
+
+  assert.equal(first.done, false);
+  assert.deepEqual(
+    first.value.bodies.map((body) => Array.from(body)),
+    [[1], [2, 3]],
+  );
+  assert.equal(first.value.status, null);
+  assert.equal(closed, false);
+
+  const second = await iterator.nextBodyBatch();
+
+  assert.equal(second.done, false);
+  assert.deepEqual(second.value.bodies, []);
+  assert.equal(second.value.status.status, Code.Ok);
+  assert.deepEqual(second.value.status.metadata.trailer, new Uint8Array([7]));
+  assert.equal(closed, true);
+  assert.equal(observedMax, 7);
+  assert.equal(recvBodyBatchCalls, 1);
+});
+
+test("Node transport native response body batches delay EOF until queued bodies drain", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  const Hello = helloTestType();
+  let recvBodyBatchCalls = 0;
+  const nativeClient = {
+    async startStream() {
+      return {
+        async finishSend() {},
+        async recvBodyBatch() {
+          recvBodyBatchCalls += 1;
+          return {
+            bodies: [marshalMessage(Hello, { value: "one" })],
+            status: null,
+            eof: true,
+          };
+        },
+        close() {},
+      };
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { streamIdleTimeoutMs: undefined },
+  );
+  const iterator = stream[Symbol.asyncIterator]();
+
+  assert.equal((await iterator.next()).value.value, "one");
+  await assert.rejects(iterator.next(), (error) => error.code === Code.Internal);
+  assert.equal(recvBodyBatchCalls, 1);
+});
+
 test("batched response stream reports EOF before final status after queued messages", async () => {
   const Hello = helloTestType();
   let returned = false;
@@ -1186,6 +1393,90 @@ test("unary decodes protobuf.js response bodies", async () => {
   });
 
   assert.equal(response.value, "hello Trev");
+});
+
+test("unary without signal or deadline leaves transport abort signal unset", async () => {
+  const Hello = helloTestType();
+  let observedOptions;
+  let observedRequest;
+  const transport = {
+    async call(request, options) {
+      observedRequest = request;
+      observedOptions = options;
+      return RpcResponse.create({
+        status: Code.Ok,
+        body: marshalMessage(Hello, { value: "ok" }),
+        metadata: {},
+      });
+    },
+  };
+
+  const response = await unary(transport, "hello.v1.Greeter", "SayHello", Hello, Hello, {
+    value: "Trev",
+  });
+
+  assert.equal(response.value, "ok");
+  assert.equal(observedOptions.signal, undefined);
+  assert.equal(observedRequest.timeoutNanos, undefined);
+});
+
+test("Node transport skips native cancellation without signal", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  let cancellationCalls = 0;
+  let callArgumentCount = 0;
+  let startStreamArgumentCount = 0;
+  let finishSend;
+  const finishDone = new Promise((resolve) => {
+    finishSend = resolve;
+  });
+  const nativeClient = {
+    createCancellation() {
+      cancellationCalls += 1;
+      return { cancel() {} };
+    },
+    async call(...args) {
+      callArgumentCount = args.length;
+      return { status: Code.Ok, body: new Uint8Array(), metadata: {} };
+    },
+    async startStream(...args) {
+      startStreamArgumentCount = args.length;
+      return {
+        async finishSend() {
+          finishSend();
+        },
+        async recvMany() {
+          await finishDone;
+          return [RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok })];
+        },
+        close() {},
+      };
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+
+  await transport.call({
+    service: "hello.v1.Greeter",
+    method: "SayHello",
+    body: new Uint8Array(),
+    metadata: {},
+    version: WireVersion,
+  });
+  const stream = await transport.streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "LotsOfReplies",
+      kind: RpcKind.ServerStreaming,
+      body: new Uint8Array(),
+      metadata: {},
+      version: WireVersion,
+    },
+    emptyAsyncIterable(),
+  );
+  await stream[Symbol.asyncIterator]().next();
+
+  assert.equal(cancellationCalls, 0);
+  assert.equal(callArgumentCount, 1);
+  assert.equal(startStreamArgumentCount, 1);
 });
 
 test("unary timeout aborts transport signal", async () => {
@@ -1778,6 +2069,73 @@ test("generated JavaScript clients call the runtime", async () => {
   const reply = await client.sayHello({ name: "Trev" });
 
   assert.equal(reply.message, "hello Trev");
+});
+
+test("service clients merge static and override metadata", async () => {
+  const root = createRoot({
+    nested: {
+      hello: {
+        nested: {
+          v1: {
+            nested: {
+              Hello: {
+                fields: {
+                  value: { type: "string", id: 1 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const Hello = root.lookupType("hello.v1.Hello");
+  const service = {
+    fullName: "hello.v1.Greeter",
+    methods: {
+      sayHello: {
+        name: "SayHello",
+        inputType: "hello.v1.Hello",
+        outputType: "hello.v1.Hello",
+        kind: "unary",
+      },
+    },
+  };
+  let observedRequest;
+  const transport = {
+    async call(request) {
+      observedRequest = request;
+      return RpcResponse.create({
+        status: Code.Ok,
+        body: marshalMessage(Hello, { value: "ok" }),
+        metadata: {},
+      });
+    },
+  };
+  const client = createServiceClient(transport, service, root, {
+    metadata: { Authorization: "base", trace: new Uint8Array([1]) },
+  });
+
+  const response = await client.sayHello(
+    { value: "Trev" },
+    {
+      metadata: new Map([
+        ["authorization", "override"],
+        ["request-id", "abc"],
+      ]),
+    },
+  );
+
+  assert.equal(response.value, "ok");
+  assert.deepEqual(observedRequest.metadata.authorization, new TextEncoder().encode("override"));
+  assert.deepEqual(observedRequest.metadata.trace, new Uint8Array([1]));
+  assert.deepEqual(observedRequest.metadata["request-id"], new TextEncoder().encode("abc"));
+  await assert.rejects(
+    async () => {
+      await client.sayHello({ value: "Trev" }, { metadata: { "trevrpc-reserved": "no" } });
+    },
+    (error) => error.code === Code.InvalidArgument,
+  );
 });
 
 test("generated TypeScript declarations include imported message types", () => {

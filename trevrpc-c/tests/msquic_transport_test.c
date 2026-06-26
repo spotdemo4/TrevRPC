@@ -423,6 +423,45 @@ cleanup:
     return result;
 }
 
+static int test_stream_write_fin_close_preserves_peer_eof(void) {
+    int result = 1;
+    trevrpc_msquic_listener* listener = NULL;
+    trevrpc_msquic_conn* client = NULL;
+    trevrpc_msquic_conn* server = NULL;
+    trevrpc_msquic_stream* client_stream = NULL;
+    trevrpc_msquic_stream* server_stream = NULL;
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    const uint8_t frame[] = {0, 0, 0, 7, 0x22, 5, 'h', 'e', 'l', 'l', 'o'};
+
+    CHECK_GOTO(connect_pair(&listener, &client, &server) == 0);
+    CHECK_GOTO(open_stream_pair(client, server, &client_stream, &server_stream) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write_fin(client_stream, frame, sizeof(frame)), (int)sizeof(frame));
+    trevrpc_msquic_stream_close(client_stream);
+    client_stream = NULL;
+
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_read_frame_timeout(server_stream, &body, &body_len, 4096, 1000000000ull), 1);
+    CHECK_GOTO(body_len == 7);
+    CHECK_GOTO(body[0] == 0x22);
+    CHECK_GOTO(body[1] == 5);
+    CHECK_GOTO(memcmp(body + 2, "hello", 5) == 0);
+    trevrpc_msquic_free(body);
+    body = NULL;
+    body_len = 0;
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_read_frame_timeout(server_stream, &body, &body_len, 4096, 1000000000ull), 0);
+
+    result = 0;
+
+cleanup:
+    trevrpc_msquic_free(body);
+    trevrpc_msquic_stream_close(server_stream);
+    trevrpc_msquic_stream_close(client_stream);
+    trevrpc_msquic_conn_close(server);
+    trevrpc_msquic_conn_close(client);
+    trevrpc_msquic_listener_close(listener);
+    return result;
+}
+
 static int test_client_close_unblocks_server_accept_stream(void) {
     int result = 1;
     trevrpc_msquic_listener* listener = NULL;
@@ -1011,6 +1050,9 @@ int main(void) {
     int result = 1;
 
     if (test_stream_reset_unblocks_peer_read() != 0) {
+        goto cleanup;
+    }
+    if (test_stream_write_fin_close_preserves_peer_eof() != 0) {
         goto cleanup;
     }
     if (test_client_close_unblocks_server_accept_stream() != 0) {

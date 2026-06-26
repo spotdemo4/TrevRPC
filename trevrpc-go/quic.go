@@ -473,6 +473,10 @@ type transportResponseFrameWriter interface {
 	trevrpcWriteNextFrame(context.Context, io.Writer, int) (bool, error)
 }
 
+type transportResponseFramesWriter interface {
+	trevrpcWriteNextFrames(context.Context, io.Writer, int) (bool, error)
+}
+
 func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore, stream rpcStream) {
 	request := &RpcRequest{}
 	if err := readInitialRequestFrame(ctx, server, stream, request); err != nil {
@@ -510,6 +514,24 @@ func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore
 	}
 	response := server.HandleStreamingRequest(ctx, request, requestBody)
 	defer closeMessageStream(response)
+	if frameWriter, ok := response.(transportResponseFramesWriter); ok {
+		for {
+			done, err := frameWriter.trevrpcWriteNextFrames(ctx, stream, server.options.MaxFrameSize)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeMessageStream(response)
+				return
+			}
+			if err != nil {
+				return
+			}
+			if done {
+				break
+			}
+		}
+
+		_ = stream.Close()
+		return
+	}
 	if frameWriter, ok := response.(transportResponseFrameWriter); ok {
 		for {
 			done, err := frameWriter.trevrpcWriteNextFrame(ctx, stream, server.options.MaxFrameSize)

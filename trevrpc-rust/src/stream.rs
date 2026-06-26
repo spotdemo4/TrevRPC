@@ -55,6 +55,45 @@ where
     Box::new(EmptyStream::default())
 }
 
+pub(crate) struct PrefixedStream<T> {
+    first: Option<Result<T>>,
+    inner: BoxMessageStream<T>,
+}
+
+impl<T> PrefixedStream<T> {
+    pub(crate) fn new(first: Result<T>, inner: BoxMessageStream<T>) -> Self {
+        Self {
+            first: Some(first),
+            inner,
+        }
+    }
+}
+
+#[crate::async_trait]
+impl<T> MessageStream<T> for PrefixedStream<T>
+where
+    T: Send + 'static,
+{
+    async fn next(&mut self) -> Option<Result<T>> {
+        if let Some(first) = self.first.take() {
+            return Some(first);
+        }
+
+        self.inner.next().await
+    }
+
+    fn is_non_blocking(&self) -> bool {
+        self.first.is_some() || self.inner.is_non_blocking()
+    }
+}
+
+pub(crate) fn prefixed<T>(first: Result<T>, inner: BoxMessageStream<T>) -> BoxMessageStream<T>
+where
+    T: Send + 'static,
+{
+    Box::new(PrefixedStream::new(first, inner))
+}
+
 pub struct IterStream<I> {
     iter: I,
 }

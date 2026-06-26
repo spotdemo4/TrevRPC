@@ -556,6 +556,12 @@ static napi_status set_uint32(napi_env env, napi_value object, const char* name,
     return napi_set_named_property(env, object, name, js_value);
 }
 
+static napi_status set_bool(napi_env env, napi_value object, const char* name, bool value) {
+    napi_value js_value = NULL;
+    napi_get_boolean(env, value, &js_value);
+    return napi_set_named_property(env, object, name, js_value);
+}
+
 static napi_status set_uint64_string(napi_env env, napi_value object, const char* name, uint64_t value) {
     char buffer[32];
     snprintf(buffer, sizeof(buffer), "%llu", (unsigned long long)value);
@@ -1011,18 +1017,71 @@ static napi_value stream_frame_list_to_js(napi_env env, trevrpc_stream_frame** f
     return array;
 }
 
-static bool recv_many_max_arg(napi_env env, size_t argc, napi_value* args, size_t* max_frames) {
+static napi_value stream_body_batch_to_js(napi_env env, trevrpc_stream_frame** frames, size_t frames_len, bool eof) {
+    if (frames_len == 0 && eof) {
+        napi_value null_value = NULL;
+        napi_get_null(env, &null_value);
+        return null_value;
+    }
+
+    size_t body_count = 0;
+    trevrpc_stream_frame* terminal = NULL;
+    for (size_t i = 0; i < frames_len; i++) {
+        trevrpc_stream_frame* frame = frames[i];
+        if (frame->kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+            terminal = frame;
+            break;
+        }
+        body_count++;
+    }
+
+    napi_value object = NULL;
+    napi_value bodies = NULL;
+    napi_create_object(env, &object);
+    napi_create_array_with_length(env, body_count, &bodies);
+    for (size_t i = 0; i < body_count; i++) {
+        napi_value body = make_uint8_array(env, frames[i]->body, frames[i]->body_len);
+        napi_set_element(env, bodies, (uint32_t)i, body);
+    }
+    napi_set_named_property(env, object, "bodies", bodies);
+
+    if (terminal != NULL && terminal->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+        napi_value status = stream_frame_to_js(env, terminal);
+        napi_set_named_property(env, object, "status", status);
+    } else {
+        napi_value null_value = NULL;
+        napi_get_null(env, &null_value);
+        napi_set_named_property(env, object, "status", null_value);
+    }
+    if (terminal != NULL && terminal->kind != TREVRPC_STREAM_FRAME_KIND_STATUS) {
+        set_uint32(env, object, "unknownFrameKind", terminal->kind);
+    }
+    set_bool(env, object, "eof", eof);
+    return object;
+}
+
+static bool recv_batch_max_arg(napi_env env, size_t argc, napi_value* args, size_t* max_frames, const char* operation) {
     *max_frames = TREV_NODE_RECV_MANY_DEFAULT;
     if (argc == 0) {
         return true;
     }
     uint32_t value = 0;
     if (napi_get_value_uint32(env, args[0], &value) != napi_ok || value == 0) {
-        napi_throw_type_error(env, NULL, "recvMany requires a positive frame count");
+        char message[96];
+        snprintf(message, sizeof(message), "%s requires a positive frame count", operation);
+        napi_throw_type_error(env, NULL, message);
         return false;
     }
     *max_frames = value > TREV_NODE_RECV_MANY_LIMIT ? TREV_NODE_RECV_MANY_LIMIT : value;
     return true;
+}
+
+static bool recv_many_max_arg(napi_env env, size_t argc, napi_value* args, size_t* max_frames) {
+    return recv_batch_max_arg(env, argc, args, max_frames, "recvMany");
+}
+
+static bool recv_body_batch_max_arg(napi_env env, size_t argc, napi_value* args, size_t* max_frames) {
+    return recv_batch_max_arg(env, argc, args, max_frames, "recvBodyBatch");
 }
 
 static bool unwrap_native_client(napi_env env, napi_value receiver, native_client** out_client) {
@@ -2566,6 +2625,44 @@ static napi_value native_stream_recv_many(napi_env env, napi_callback_info info)
     return queue_work(env, &work->base, "recvMany", stream_recv_many_execute, stream_recv_many_complete);
 }
 
+static void stream_recv_body_batch_complete(napi_env env, napi_status status, void* data) {
+    stream_recv_many_work* work = data;
+    if (work->base.err == 0 && status == napi_ok) {
+        napi_value batch = stream_body_batch_to_js(env, work->frames, work->frames_len, work->eof);
+        napi_resolve_deferred(env, work->base.deferred, batch);
+    } else {
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recvBodyBatch");
+    }
+    stream_frame_list_reset(work->frames, work->frames_len);
+    if (work->acquired) {
+        native_stream_release(work->stream);
+    }
+    if (work->base.receiver_ref != NULL) {
+        napi_delete_reference(env, work->base.receiver_ref);
+    }
+    napi_delete_async_work(env, work->base.work);
+    free(work);
+}
+
+static napi_value native_stream_recv_body_batch(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
+    stream_recv_many_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate recvBodyBatch work");
+        return NULL;
+    }
+    if (!recv_body_batch_max_arg(env, argc, args, &work->max_frames) ||
+        !unwrap_native_stream(env, this_arg, &work->stream) ||
+        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
+        free(work);
+        return NULL;
+    }
+    return queue_work(env, &work->base, "recvBodyBatch", stream_recv_many_execute, stream_recv_body_batch_complete);
+}
+
 static napi_value native_stream_close(napi_env env, napi_callback_info info) {
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
@@ -2940,6 +3037,7 @@ static napi_value init(napi_env env, napi_value exports) {
         {"finishSend", NULL, native_stream_finish_send, NULL, NULL, NULL, napi_default, NULL},
         {"recv", NULL, native_stream_recv, NULL, NULL, NULL, napi_default, NULL},
         {"recvMany", NULL, native_stream_recv_many, NULL, NULL, NULL, napi_default, NULL},
+        {"recvBodyBatch", NULL, native_stream_recv_body_batch, NULL, NULL, NULL, napi_default, NULL},
         {"close", NULL, native_stream_close, NULL, NULL, NULL, napi_default, NULL},
     };
     napi_value stream_ctor = NULL;

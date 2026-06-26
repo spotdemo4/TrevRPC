@@ -43,10 +43,18 @@ export function encodeMessageStreamFrame(body, maxFrameSize = DefaultMaxFrameSiz
 }
 
 /** Encodes multiple streaming message frames into one contiguous write buffer. */
-export function encodeMessageStreamFrames(bodies, maxFrameSize = DefaultMaxFrameSize) {
+export function encodeMessageStreamFrames(
+  bodies,
+  maxFrameSize = DefaultMaxFrameSize,
+  start = 0,
+  end = undefined,
+) {
+  const range = bodyRange(bodies, start, end);
   let totalLength = 0;
-  const byteBodies = Array.from(bodies, byteView);
-  for (const body of byteBodies) {
+  const byteBodies = Array.from({ length: range.end - range.start });
+  for (let index = range.start; index < range.end; index += 1) {
+    const body = byteView(range.bodies[index]);
+    byteBodies[index - range.start] = body;
     const bodyLength = messageStreamFrameBodyLength(body.byteLength);
     if (bodyLength > maxFrameSize) {
       throw new FrameTooLargeError(bodyLength, maxFrameSize);
@@ -73,8 +81,18 @@ export function encodeMessageStreamFrames(bodies, maxFrameSize = DefaultMaxFrame
 }
 
 /** Encodes each streaming message frame separately for vectored writers. */
-export function encodeMessageStreamFrameParts(bodies, maxFrameSize = DefaultMaxFrameSize) {
-  return Array.from(bodies, (body) => encodeMessageStreamFrame(body, maxFrameSize));
+export function encodeMessageStreamFrameParts(
+  bodies,
+  maxFrameSize = DefaultMaxFrameSize,
+  start = 0,
+  end = undefined,
+) {
+  const range = bodyRange(bodies, start, end);
+  const frames = Array.from({ length: range.end - range.start });
+  for (let index = range.start; index < range.end; index += 1) {
+    frames[index - range.start] = encodeMessageStreamFrame(range.bodies[index], maxFrameSize);
+  }
+  return frames;
 }
 
 /** Decodes a protobuf message from a TrevRPC frame body. */
@@ -141,13 +159,19 @@ export async function writeFrame(writer, messageType, message, maxFrameSize = De
 }
 
 /** Writes multiple streaming message frames in one write. */
-export async function writeMessageStreamFrames(writer, bodies, maxFrameSize = DefaultMaxFrameSize) {
+export async function writeMessageStreamFrames(
+  writer,
+  bodies,
+  maxFrameSize = DefaultMaxFrameSize,
+  start = 0,
+  end = undefined,
+) {
   if (typeof writer.writev === "function") {
-    await writer.writev(encodeMessageStreamFrameParts(bodies, maxFrameSize));
+    await writer.writev(encodeMessageStreamFrameParts(bodies, maxFrameSize, start, end));
     return;
   }
 
-  await writer.write(encodeMessageStreamFrames(bodies, maxFrameSize));
+  await writer.write(encodeMessageStreamFrames(bodies, maxFrameSize, start, end));
 }
 
 /** Reads length-prefixed protobuf frames from a byte stream reader. */
@@ -156,6 +180,7 @@ export class FrameReader {
   constructor(reader) {
     this.reader = reader;
     this.chunks = [];
+    this.chunkHead = 0;
     this.buffered = 0;
   }
 
@@ -291,13 +316,14 @@ export class FrameReader {
       return EmptyBytes;
     }
 
-    const first = this.chunks[0];
+    const first = this.chunks[this.chunkHead];
     if (first != null && first.byteLength >= size) {
       const result = first.subarray(0, size);
       if (first.byteLength === size) {
-        this.chunks.shift();
+        this.chunkHead += 1;
+        this.compactChunks();
       } else {
-        this.chunks[0] = first.subarray(size);
+        this.chunks[this.chunkHead] = first.subarray(size);
       }
       this.buffered -= size;
       return result;
@@ -307,20 +333,21 @@ export class FrameReader {
     let offset = 0;
 
     while (offset < size) {
-      const chunk = this.chunks[0];
+      const chunk = this.chunks[this.chunkHead];
       const needed = size - offset;
       if (chunk.byteLength <= needed) {
         result.set(chunk, offset);
         offset += chunk.byteLength;
-        this.chunks.shift();
+        this.chunkHead += 1;
       } else {
         result.set(chunk.subarray(0, needed), offset);
-        this.chunks[0] = chunk.subarray(needed);
+        this.chunks[this.chunkHead] = chunk.subarray(needed);
         offset += needed;
       }
     }
 
     this.buffered -= size;
+    this.compactChunks();
     return result;
   }
 
@@ -330,7 +357,7 @@ export class FrameReader {
       return EmptyBytes;
     }
 
-    const first = this.chunks[0];
+    const first = this.chunks[this.chunkHead];
     if (first != null && first.byteLength >= size) {
       return first.subarray(0, size);
     }
@@ -338,7 +365,8 @@ export class FrameReader {
     const result = new Uint8Array(size);
     let offset = 0;
 
-    for (const chunk of this.chunks) {
+    for (let index = this.chunkHead; index < this.chunks.length; index += 1) {
+      const chunk = this.chunks[index];
       if (offset >= size) {
         break;
       }
@@ -348,6 +376,21 @@ export class FrameReader {
     }
 
     return result;
+  }
+
+  compactChunks() {
+    if (this.chunkHead === 0) {
+      return;
+    }
+    if (this.chunkHead === this.chunks.length) {
+      this.chunks.length = 0;
+      this.chunkHead = 0;
+      return;
+    }
+    if (this.chunkHead >= 32 && this.chunkHead * 2 >= this.chunks.length) {
+      this.chunks.splice(0, this.chunkHead);
+      this.chunkHead = 0;
+    }
   }
 }
 
@@ -430,6 +473,20 @@ function byteView(value) {
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   }
   return new Uint8Array(value ?? 0);
+}
+
+function bodyRange(bodies, start, end) {
+  const source = Array.isArray(bodies) ? bodies : Array.from(bodies);
+  const from = clampRangeIndex(start, source.length);
+  const to = Math.max(from, clampRangeIndex(end ?? source.length, source.length));
+  return { bodies: source, start: from, end: to };
+}
+
+function clampRangeIndex(value, length) {
+  if (!Number.isFinite(value)) {
+    return length;
+  }
+  return Math.min(length, Math.max(0, Math.floor(value)));
 }
 
 function messageStreamFrameBodyLength(bodyLength) {

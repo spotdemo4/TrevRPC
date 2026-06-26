@@ -76,9 +76,10 @@ Opt-in benchmark targets are available when configuring with `-DTREVRPC_BUILD_BE
 
 ```sh
 ./build/trevrpc_wire_bench 100000
-./build/trevrpc_runtime_bench 10000
 ./build/trevrpc_rpc_comparison_bench 1000
 ```
+
+The old `trevrpc_runtime_bench` target was removed because it depended on a duplicated private MsQuic stream layout and produced undefined results. Use `trevrpc_rpc_comparison_bench` for runtime measurements until a stable loopback benchmark seam exists.
 
 ## Allocation Notes
 

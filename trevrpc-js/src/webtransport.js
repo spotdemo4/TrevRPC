@@ -185,6 +185,7 @@ class WebTransportResponseFrameStream {
     this.maxFrameSize = maxFrameSize;
     this.readBatchMaxMessages = readBatchMaxMessages;
     this.frameQueue = [];
+    this.frameQueueHead = 0;
     this.pendingStatus = null;
     this.done = false;
     this.writerError = null;
@@ -213,7 +214,7 @@ class WebTransportResponseFrameStream {
 
     try {
       await this.fillFrameQueue();
-      const frame = this.frameQueue.shift();
+      const frame = this.takeQueuedFrame();
       if (frame == null) {
         return await this.finishEof();
       }
@@ -236,9 +237,9 @@ class WebTransportResponseFrameStream {
 
     try {
       await this.fillFrameQueue(max);
-      const terminalIndex = this.frameQueue.findIndex(isTerminalFrame);
-      if (terminalIndex === 0) {
-        const frame = this.frameQueue.shift();
+      const terminalOffset = this.findQueuedTerminalOffset();
+      if (terminalOffset === 0) {
+        const frame = this.takeQueuedFrame();
         if (frame == null) {
           return await this.finishEof();
         }
@@ -246,8 +247,8 @@ class WebTransportResponseFrameStream {
         return { done: false, value: [frame] };
       }
 
-      const count = terminalIndex < 0 ? this.frameQueue.length : terminalIndex;
-      return { done: false, value: this.frameQueue.splice(0, count) };
+      const count = terminalOffset < 0 ? this.queuedFrameCount() : terminalOffset;
+      return { done: false, value: this.takeQueuedFrames(count) };
     } catch (error) {
       this.done = true;
       throw statusFromTransportError(error);
@@ -289,7 +290,7 @@ class WebTransportResponseFrameStream {
     if (this.returnDone == null) {
       this.done = true;
       this.returnDone = (async () => {
-        this.frameQueue.length = 0;
+        this.clearFrameQueue();
         this.pendingStatus = null;
         await cancelReader(this.reader);
         await abortWriter(this.writer);
@@ -314,21 +315,22 @@ class WebTransportResponseFrameStream {
   }
 
   async fillFrameQueue(max = this.readBatchMaxMessages) {
-    if (this.frameQueue.length > 0) {
+    if (this.queuedFrameCount() > 0) {
       return;
     }
 
     const batch = await this.frameReader.readStreamFrameBatchOrEOF(max, this.maxFrameSize);
     if (batch == null) {
-      this.frameQueue.push(null);
+      this.frameQueue = [null];
     } else {
-      this.frameQueue.push(...batch);
+      this.frameQueue = batch;
     }
+    this.frameQueueHead = 0;
   }
 
   async finishEof() {
     this.done = true;
-    this.frameQueue.length = 0;
+    this.clearFrameQueue();
     releaseLock(this.reader);
     await this.writerDone;
     if (this.writerError != null) {
@@ -339,7 +341,7 @@ class WebTransportResponseFrameStream {
 
   async finishStatus(frame) {
     this.done = true;
-    this.frameQueue.length = 0;
+    this.clearFrameQueue();
     releaseLock(this.reader);
     this.cleanupAbort();
     await abortWriter(this.writer);
@@ -355,6 +357,64 @@ class WebTransportResponseFrameStream {
       }
     } else {
       this.suppressReturnWriterError = true;
+    }
+  }
+
+  queuedFrameCount() {
+    return this.frameQueue.length - this.frameQueueHead;
+  }
+
+  takeQueuedFrame() {
+    const frame = this.frameQueue[this.frameQueueHead];
+    this.frameQueueHead += 1;
+    this.compactFrameQueue();
+    return frame;
+  }
+
+  takeQueuedFrames(count) {
+    if (count <= 0) {
+      return [];
+    }
+    const start = this.frameQueueHead;
+    const end = start + count;
+    if (start === 0 && end === this.frameQueue.length) {
+      const frames = this.frameQueue;
+      this.frameQueue = [];
+      this.frameQueueHead = 0;
+      return frames;
+    }
+
+    const frames = this.frameQueue.slice(start, end);
+    this.frameQueueHead = end;
+    this.compactFrameQueue();
+    return frames;
+  }
+
+  findQueuedTerminalOffset() {
+    for (let index = this.frameQueueHead; index < this.frameQueue.length; index += 1) {
+      if (isTerminalFrame(this.frameQueue[index])) {
+        return index - this.frameQueueHead;
+      }
+    }
+    return -1;
+  }
+
+  clearFrameQueue() {
+    this.frameQueue.length = 0;
+    this.frameQueueHead = 0;
+  }
+
+  compactFrameQueue() {
+    if (this.frameQueueHead === 0) {
+      return;
+    }
+    if (this.frameQueueHead === this.frameQueue.length) {
+      this.clearFrameQueue();
+      return;
+    }
+    if (this.frameQueueHead >= 32 && this.frameQueueHead * 2 >= this.frameQueue.length) {
+      this.frameQueue.splice(0, this.frameQueueHead);
+      this.frameQueueHead = 0;
     }
   }
 }
@@ -478,9 +538,7 @@ async function writeStreamingRequest(
       if (result.done) {
         break;
       }
-      for (const bodies of splitBodyBatches(result.value, batchMaxBytes)) {
-        await writeMessageStreamFrames(writer, bodies, maxFrameSize);
-      }
+      await writeBodyBatches(writer, result.value, maxFrameSize, batchMaxBytes);
     }
     await writer.close();
   } catch (error) {
@@ -504,10 +562,10 @@ async function nextRequestBodyBatch(iterator, maxMessages) {
   return result.done ? result : { done: false, value: [result.value] };
 }
 
-function* splitBodyBatches(bodies, maxBytes) {
+async function writeBodyBatches(writer, bodies, maxFrameSize, maxBytes) {
   const limit = Math.max(0, maxBytes ?? 0);
   if (limit === 0) {
-    yield bodies;
+    await writeMessageStreamFrames(writer, bodies, maxFrameSize);
     return;
   }
 
@@ -516,14 +574,14 @@ function* splitBodyBatches(bodies, maxBytes) {
   for (let index = 0; index < bodies.length; index += 1) {
     const bodyBytes = bodies[index]?.byteLength ?? 0;
     if (index > start && bytes + bodyBytes > limit) {
-      yield bodies.slice(start, index);
+      await writeMessageStreamFrames(writer, bodies, maxFrameSize, start, index);
       start = index;
       bytes = 0;
     }
     bytes += bodyBytes;
   }
   if (start < bodies.length) {
-    yield bodies.slice(start);
+    await writeMessageStreamFrames(writer, bodies, maxFrameSize, start, bodies.length);
   }
 }
 

@@ -445,9 +445,8 @@ func validateResponse(response *RpcResponse, maxBodySize int) error {
 		return &FrameTooLargeError{Len: len(response.Body), Max: maxBodySize}
 	}
 
-	status := StatusFromResponse(response)
-	if !status.IsOK() {
-		return status
+	if CodeFromUint32(response.Status) != CodeOK {
+		return StatusFromResponse(response)
 	}
 
 	return nil

@@ -276,12 +276,7 @@ if(TREVRPC_BUILD_BENCHMARKS)
     trevrpc_c_sanitizers(trevrpc_wire_bench)
 
     if(TREVRPC_BUILD_RUNTIME)
-        add_executable(trevrpc_runtime_bench bench/runtime_bench.c)
-        target_include_directories(trevrpc_runtime_bench PRIVATE src)
         target_compile_definitions(trevrpc PRIVATE TREVRPC_TESTING)
-        target_link_libraries(trevrpc_runtime_bench PRIVATE trevrpc)
-        trevrpc_c_warnings(trevrpc_runtime_bench)
-        trevrpc_c_sanitizers(trevrpc_runtime_bench)
 
         add_executable(trevrpc_rpc_comparison_bench
             bench/rpc_comparison_bench.c

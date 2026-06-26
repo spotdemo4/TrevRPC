@@ -701,9 +701,17 @@ type serverResponseStream struct {
 	ctx             context.Context
 	limits          streamLimits
 	messages        int
+	pendingBody     []byte
+	hasPendingBody  bool
+	pendingStatus   *Status
 	done            bool
 	cancel          context.CancelFunc
 	finishOnce      sync.Once
+}
+
+type responseStreamItem struct {
+	body   []byte
+	status *Status
 }
 
 func (s *serverResponseStream) Recv() (*RpcStreamFrame, error) {
@@ -739,25 +747,85 @@ func (s *serverResponseStream) trevrpcWriteNextFrame(ctx context.Context, writer
 	if s.done {
 		return true, nil
 	}
-
-	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response")
-	if err == io.EOF {
-		s.finish(CodeOK)
-		return true, WriteFrame(writer, StatusFrame(OK()), maxFrameSize)
-	}
-	if err != nil {
-		status := StatusFromError(err)
-		s.finish(status.Code)
-		return true, WriteFrame(writer, StatusFrame(status), maxFrameSize)
+	if s.pendingStatus != nil {
+		return s.writeResponseStatusFrame(writer, maxFrameSize, s.pendingStatus)
 	}
 
-	if err := checkStreamLimits("response", s.limits, &s.messages, &s.responseBodyLen, len(body)); err != nil {
-		status := StatusFromError(err)
-		s.finish(status.Code)
-		return true, WriteFrame(writer, StatusFrame(status), maxFrameSize)
+	item := s.readNextResponseItem()
+	if item.status != nil {
+		return s.writeResponseStatusFrame(writer, maxFrameSize, item.status)
+	}
+	if status := s.acceptResponseBody(item.body); status != nil {
+		return s.writeResponseStatusFrame(writer, maxFrameSize, status)
 	}
 
-	return false, writeMessageStreamFrame(writer, body, maxFrameSize)
+	return false, writeMessageStreamFrame(writer, item.body, maxFrameSize)
+}
+
+func (s *serverResponseStream) trevrpcWriteNextFrames(ctx context.Context, writer io.Writer, maxFrameSize int) (bool, error) {
+	if !s.trevrpcNonBlockingStream() {
+		return s.trevrpcWriteNextFrame(ctx, writer, maxFrameSize)
+	}
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
+	if s.done {
+		return true, nil
+	}
+	if s.pendingStatus != nil {
+		return s.writeResponseStatusFrame(writer, maxFrameSize, s.pendingStatus)
+	}
+
+	var batch [maxMessageFrameBatch][]byte
+	batchBytes := 0
+	batchByteLimit := responseFrameBatchByteLimit(maxFrameSize)
+	count := 0
+	for count < len(batch) {
+		if count > 0 {
+			if err := ctx.Err(); err != nil {
+				break
+			}
+		}
+
+		item := s.readNextResponseItem()
+		if item.status != nil {
+			if count == 0 {
+				return s.writeResponseStatusFrame(writer, maxFrameSize, item.status)
+			}
+			s.pendingStatus = item.status
+			break
+		}
+
+		encodedLen := encodedMessageStreamFrameLen(item.body)
+		if count > 0 && batchByteLimit > 0 && saturatingAdd(batchBytes, encodedLen) > batchByteLimit {
+			s.pendingBody = item.body
+			s.hasPendingBody = true
+			break
+		}
+
+		if status := s.acceptResponseBody(item.body); status != nil {
+			if count == 0 {
+				return s.writeResponseStatusFrame(writer, maxFrameSize, status)
+			}
+			s.pendingStatus = status
+			break
+		}
+
+		batch[count] = item.body
+		count++
+		batchBytes = saturatingAdd(batchBytes, encodedLen)
+		if responseBatchReachedStreamLimit(s.limits, s.messages, s.responseBodyLen) || (batchByteLimit > 0 && batchBytes >= batchByteLimit) {
+			break
+		}
+	}
+
+	if count == 0 {
+		return false, nil
+	}
+
+	err := writeMessageStreamFrames(writer, batch[:count], maxFrameSize)
+	clear(batch[:count])
+	return false, err
 }
 
 func (s *serverResponseStream) trevrpcNonBlockingStream() bool {
@@ -790,6 +858,62 @@ func (s *serverResponseStream) finish(code Code) {
 			Elapsed:         time.Since(s.startedAt),
 		})
 	})
+}
+
+func (s *serverResponseStream) readNextResponseItem() responseStreamItem {
+	if s.hasPendingBody {
+		body := s.pendingBody
+		s.pendingBody = nil
+		s.hasPendingBody = false
+		return responseStreamItem{body: body}
+	}
+
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response")
+	if err == io.EOF {
+		return responseStreamItem{status: OK()}
+	}
+	if err != nil {
+		return responseStreamItem{status: StatusFromError(err)}
+	}
+
+	return responseStreamItem{body: body}
+}
+
+func (s *serverResponseStream) acceptResponseBody(body []byte) *Status {
+	if err := checkStreamLimits("response", s.limits, &s.messages, &s.responseBodyLen, len(body)); err != nil {
+		return StatusFromError(err)
+	}
+
+	return nil
+}
+
+func (s *serverResponseStream) writeResponseStatusFrame(writer io.Writer, maxFrameSize int, status *Status) (bool, error) {
+	s.pendingStatus = nil
+	s.finish(status.Code)
+	return true, WriteFrame(writer, StatusFrame(status), maxFrameSize)
+}
+
+func responseFrameBatchByteLimit(maxFrameSize int) int {
+	if maxFrameSize <= 0 {
+		return 0
+	}
+
+	return maxFrameSize
+}
+
+func encodedMessageStreamFrameLen(body []byte) int {
+	return saturatingAdd(4, messageStreamFrameBodyLen(body))
+}
+
+func responseBatchReachedStreamLimit(limits streamLimits, messages, bodySize int) bool {
+	if limits.maxMessages >= 0 && messages >= limits.maxMessages {
+		return true
+	}
+	if limits.maxBodySize >= 0 && bodySize >= limits.maxBodySize {
+		return true
+	}
+
+	return false
 }
 
 func recordRPCStarted(metrics Metrics, event RPCStarted) {

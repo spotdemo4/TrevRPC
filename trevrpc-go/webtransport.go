@@ -104,20 +104,24 @@ func (t *WebTransportClient) StreamingCall(ctx context.Context, request *RpcRequ
 	}
 
 	writerDone := make(chan error, 1)
+	stopCancel := cancelWebTransportStreamOnContext(streamCtx, stream)
 	go func() {
 		writerDone <- writeWebTransportStreamingRequest(streamCtx, stream, request, requestBody, t.maxFrameSize)
 	}()
 
-	return &webTransportResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, maxFrameSize: t.maxFrameSize}, nil
+	return &webTransportResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, stopCancel: stopCancel, maxFrameSize: t.maxFrameSize}, nil
 }
 
 type webTransportResponseStream struct {
 	stream       *webtransport.Stream
 	writerDone   <-chan error
 	cancel       context.CancelFunc
+	stopCancel   func()
 	maxFrameSize int
 	done         bool
 }
+
+func (s *webTransportResponseStream) trevrpcContextCancelsRecv() bool { return true }
 
 func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
 	frame, _, err := s.trevrpcRecvStreamFrameFields()
@@ -170,15 +174,18 @@ func (s *webTransportResponseStream) Close() error {
 }
 
 func (s *webTransportResponseStream) finish(cancelRead bool) {
-	if s.cancel != nil {
-		s.cancel()
-	}
-
 	if s.done {
 		return
 	}
 
 	s.done = true
+	if s.stopCancel != nil {
+		s.stopCancel()
+		s.stopCancel = nil
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if cancelRead {
 		s.stream.CancelRead(cancelledWebTransportStreamCode)
 	}
@@ -212,6 +219,7 @@ func cancelWebTransportStreamOnContext(ctx context.Context, stream *webtransport
 	}
 
 	done := make(chan struct{})
+	var closeOnce sync.Once
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -221,7 +229,7 @@ func cancelWebTransportStreamOnContext(ctx context.Context, stream *webtransport
 		}
 	}()
 
-	return func() { close(done) }
+	return func() { closeOnce.Do(func() { close(done) }) }
 }
 
 func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
