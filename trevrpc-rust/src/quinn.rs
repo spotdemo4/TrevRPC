@@ -905,12 +905,6 @@ async fn handle_stream(
         .is_ok()
     {
         let _ = send.finish();
-        if let Err(error) = read_unary_request_end(&server, &mut recv).await {
-            let _ = &error;
-            let _ = recv.stop(CANCELLED_STREAM_CODE.into());
-            #[cfg(feature = "tracing")]
-            tracing::debug!(%error, "failed to drain unary request stream");
-        }
     }
 }
 
@@ -925,37 +919,6 @@ async fn read_initial_request(
             .map_err(|_| Error::from(Status::deadline_exceeded("initial request frame timeout")))?
     } else {
         read.await
-    }
-}
-
-async fn read_unary_request_end(
-    server: &crate::server::Server,
-    recv: &mut quinn::RecvStream,
-) -> Result<()> {
-    let read = drain_unary_request_end(recv);
-    if let Some(timeout) = server.options().initial_request_timeout() {
-        tokio::time::timeout(timeout, read).await.map_err(|_| {
-            Error::from(Status::deadline_exceeded(
-                "unary request stream finish timeout",
-            ))
-        })?
-    } else {
-        read.await
-    }
-}
-
-async fn drain_unary_request_end(recv: &mut quinn::RecvStream) -> Result<()> {
-    let mut buf = [0; 1024];
-    loop {
-        match recv.read(&mut buf).await.map_err(Error::transport)? {
-            Some(0) => {}
-            Some(_) => {
-                return Err(Error::from(Status::invalid_argument(
-                    "unary request stream contained data after the initial request frame",
-                )));
-            }
-            None => return Ok(()),
-        }
     }
 }
 
