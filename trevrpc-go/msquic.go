@@ -422,6 +422,7 @@ func (s *msQuicResponseStream) ignoreWriterError() {
 }
 
 func writeMsQuicStreamingRequest(ctx context.Context, stream *msQuicStream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
+	requestBody = closeStreamOnContext(ctx, requestBody)
 	defer closeMessageStream(requestBody)
 
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {

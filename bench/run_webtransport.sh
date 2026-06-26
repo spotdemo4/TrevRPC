@@ -649,7 +649,7 @@ build_prerequisites() {
         run_and_capture rust-split-build cargo build --manifest-path trevrpc-rust/Cargo.toml --example rpc_split_bench --release
     fi
     if [[ "$RUN_JS" == "1" ]]; then
-        run_and_capture js-build npm --prefix trevrpc-js run build:native
+        run_and_capture js-build env "CMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE" npm --prefix trevrpc-js run build:native
     fi
 }
 

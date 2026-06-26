@@ -228,6 +228,7 @@ func (t *NativeWebTransportClient) StreamingCall(ctx context.Context, request *R
 }
 
 func writeNativeWebTransportStreamingRequest(ctx context.Context, stream *nativeWebTransportStream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
+	requestBody = closeStreamOnContext(ctx, requestBody)
 	defer closeMessageStream(requestBody)
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
 		return nativeWebTransportOrContextErr(ctx, err)

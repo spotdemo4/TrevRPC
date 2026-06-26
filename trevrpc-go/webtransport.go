@@ -225,6 +225,7 @@ func cancelWebTransportStreamOnContext(ctx context.Context, stream *webtransport
 }
 
 func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
+	requestBody = closeStreamOnContext(ctx, requestBody)
 	defer closeMessageStream(requestBody)
 
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {

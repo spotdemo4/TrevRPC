@@ -964,7 +964,9 @@ static int split_benchmark_bidi_stream_latency(trevrpc_client* client) {
     if (err == 0) {
         err = split_send_benchmark_request(stream);
     }
-
+    if (err == 0) {
+        err = trevrpc_stream_finish_send(stream);
+    }
     size_t count = 0;
     while (err == 0) {
         bool done = false;
@@ -973,10 +975,6 @@ static int split_benchmark_bidi_stream_latency(trevrpc_client* client) {
             break;
         }
         count++;
-        err = trevrpc_stream_finish_send(stream);
-        if (err != 0) {
-            break;
-        }
     }
     if (err == 0 && count != BENCHMARK_LATENCY_MESSAGE_COUNT) {
         err = -EINVAL;

@@ -539,7 +539,7 @@ build_prerequisites() {
         run_and_capture go-split-build "${go_build[@]}" ./cmd/trevrpc-rpc-split-bench
     fi
     if [[ "$RUN_JS_NATIVE" == "1" ]]; then
-        run_and_capture js-native-build npm --prefix trevrpc-js run build:native
+        run_and_capture js-native-build env "CMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE" npm --prefix trevrpc-js run build:native
     fi
     if [[ "$RUN_RUST_QUINN" == "1" || "$RUN_RUST_GRPC" == "1" ]]; then
         run_and_capture rust-split-build cargo build --manifest-path trevrpc-rust/Cargo.toml --example rpc_split_bench --release

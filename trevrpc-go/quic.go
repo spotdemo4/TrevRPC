@@ -212,6 +212,7 @@ func cancelQUICStreamOnContext(ctx context.Context, stream *quic.Stream) func() 
 }
 
 func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
+	requestBody = closeStreamOnContext(ctx, requestBody)
 	defer closeMessageStream(requestBody)
 
 	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
@@ -270,7 +271,7 @@ func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
-	if isNonBlockingStream(requestBody) {
+	if isNonBlockingStream(requestBody) || streamContextCancelsRecv(requestBody) {
 		body, err := requestBody.Recv()
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {

@@ -32,7 +32,7 @@
   "scripts": {
     "bench:native": "node bench/rpc_comparison_native.js",
     "profile:native": "node bench/rpc_profile_native.js",
-    "build:native": "cmake -S native -B build/native ${TREVRPC_C_ROOT:+-DTREVRPC_C_ROOT=$TREVRPC_C_ROOT} ${NODE_INCLUDE_DIR:+-DNODE_INCLUDE_DIR=$NODE_INCLUDE_DIR} && cmake --build build/native",
+    "build:native": "cmake -S native -B build/native -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release} ${TREVRPC_C_ROOT:+-DTREVRPC_C_ROOT=$TREVRPC_C_ROOT} ${NODE_INCLUDE_DIR:+-DNODE_INCLUDE_DIR=$NODE_INCLUDE_DIR} && cmake --build build/native --config ${CMAKE_BUILD_TYPE:-Release}",
     "check": "npm run lint && npm run typecheck && npm test",
     "example:greeter": "node examples/greeter/static-server.js",
     "format": "oxfmt --write",
