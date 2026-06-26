@@ -457,6 +457,8 @@ export interface NodeConnectOptions {
   maxStreamsPerSession?: number;
   idleTimeoutMs?: number;
   maxFrameSize?: number;
+  streamReadBatchMaxMessages?: number;
+  streamWriteBatchMaxMessages?: number;
 }
 
 export interface ConnectOptions extends WebTransportClientOptions, NodeConnectOptions {}

@@ -374,11 +374,37 @@ function typedUnaryResponse(response, responseType) {
 
 async function writeTypedResponseStream(call, response, responseType) {
   const messages = response != null && typeof response === "object" && "messages" in response ? response.messages : response;
-  for await (const message of messages ?? []) {
-    await call.sendMessage(marshalMessage(responseType, message));
-  }
+  await writeTypedResponseMessages(call, messages ?? [], responseType);
   const status = response?.status ?? {};
   await call.finishStream(status.code ?? Code.Ok, status.message ?? "", status.metadata ?? response?.metadata ?? {});
+}
+
+async function writeTypedResponseMessages(call, messages, responseType) {
+  const iterator = messages[Symbol.asyncIterator]?.() ?? messages[Symbol.iterator]();
+  try {
+    for (;;) {
+      const result = await nextTypedResponseBatch(iterator, call.writeBatchMaxMessages ?? 16);
+      if (result.done) {
+        return;
+      }
+      await call.sendMany(result.value.map((message) => marshalMessage(responseType, message)));
+    }
+  } catch (error) {
+    try {
+      await iterator.return?.();
+    } catch {
+      // Preserve the send or iterator error, matching for-await cleanup behavior.
+    }
+    throw error;
+  }
+}
+
+async function nextTypedResponseBatch(iterator, maxMessages) {
+  if (typeof iterator.nextBatch === "function") {
+    return await iterator.nextBatch(maxMessages);
+  }
+  const result = await iterator.next();
+  return result.done ? result : { done: false, value: [result.value] };
 }
 
 async function* decodeTypedNodeRequests(call, requestType) {

@@ -2674,6 +2674,46 @@ static napi_value native_call_send_message(napi_env env, napi_callback_info info
     return promise_from_void_result(env, err, "sendMessage");
 }
 
+static napi_value native_call_send_messages(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
+    if (argc != 1) {
+        napi_throw_type_error(env, NULL, "sendMessages requires an array of bodies");
+        return NULL;
+    }
+    native_call* call = NULL;
+    if (!unwrap_native_call(env, this_arg, &call)) {
+        return NULL;
+    }
+
+    uint8_t* bodies = NULL;
+    size_t* body_lens = NULL;
+    size_t count = 0;
+    int err = copy_bytes_array_arg(env, args[0], &bodies, &body_lens, &count);
+    if (err != 0) {
+        if (err == -ENOMEM) {
+            napi_throw_error(env, NULL, "failed to allocate sendMessages bodies");
+        } else {
+            napi_throw_type_error(env, NULL, "invalid sendMessages bodies");
+        }
+        return NULL;
+    }
+
+    trevrpc_call* c_call = NULL;
+    err = native_call_acquire(call, &c_call);
+    if (err == 0) {
+        trevrpc_stream* stream = trevrpc_call_stream(c_call);
+        err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
+                             : trevrpc_stream_send_messages(stream, bodies, body_lens, count);
+        native_call_release(call);
+    }
+    free(bodies);
+    free(body_lens);
+    return promise_from_void_result(env, err, "sendMessages");
+}
+
 static void call_finish_execute(napi_env env, void* data) {
     (void)env;
     call_finish_work* work = data;
@@ -2932,6 +2972,7 @@ static napi_value init(napi_env env, napi_value exports) {
     napi_property_descriptor call_methods[] = {
         {"respond", NULL, native_call_respond, NULL, NULL, NULL, napi_default, NULL},
         {"sendMessage", NULL, native_call_send_message, NULL, NULL, NULL, napi_default, NULL},
+        {"sendMessages", NULL, native_call_send_messages, NULL, NULL, NULL, napi_default, NULL},
         {"finishStream", NULL, native_call_finish_stream, NULL, NULL, NULL, napi_default, NULL},
         {"recv", NULL, native_call_recv, NULL, NULL, NULL, napi_default, NULL},
         {"recvMany", NULL, native_call_recv_many, NULL, NULL, NULL, napi_default, NULL},

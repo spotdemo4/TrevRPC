@@ -17,6 +17,14 @@ export class NodeTransport {
   constructor(nativeClient, options = {}) {
     this.nativeClient = nativeClient;
     this.maxFrameSize = options.maxFrameSize;
+    this.streamReadBatchMaxMessages = batchMaxMessages(
+      options.streamReadBatchMaxMessages,
+      RecvManyBatchSize,
+    );
+    this.streamWriteBatchMaxMessages = batchMaxMessages(
+      options.streamWriteBatchMaxMessages,
+      SendManyBatchSize,
+    );
   }
 
   /** Opens a TrevRPC client backed by the native C runtime. */
@@ -74,8 +82,14 @@ export class NodeTransport {
     }
 
     const cleanupStreamAbort = onAbort(options.signal, () => stream.close());
-    const writerTask = writeRequestStream(stream, requestBody);
-    return new NativeResponseFrameStream(stream, writerTask, cleanupStreamAbort, options.signal);
+    const writerTask = writeRequestStream(stream, requestBody, this.streamWriteBatchMaxMessages);
+    return new NativeResponseFrameStream(
+      stream,
+      writerTask,
+      cleanupStreamAbort,
+      options.signal,
+      this.streamReadBatchMaxMessages,
+    );
   }
 
   /** Closes the underlying native client. */
@@ -94,6 +108,14 @@ export class NodeServer {
     this.authorizer = options.authorizer ?? null;
     this.metrics = options.metrics ?? null;
     this.logger = options.logger ?? null;
+    this.streamReadBatchMaxMessages = batchMaxMessages(
+      options.streamReadBatchMaxMessages,
+      RecvManyBatchSize,
+    );
+    this.streamWriteBatchMaxMessages = batchMaxMessages(
+      options.streamWriteBatchMaxMessages,
+      SendManyBatchSize,
+    );
   }
 
   /** Creates a native QUIC TrevRPC server backed by trevrpc-c. */
@@ -183,8 +205,13 @@ export class NodeServer {
   }
 
   async #dispatch(handler, nativeCall) {
-    const call = new NodeServerCall(nativeCall, (completedCall) =>
-      this.#recordFinished(completedCall),
+    const call = new NodeServerCall(
+      nativeCall,
+      (completedCall) => this.#recordFinished(completedCall),
+      {
+        readBatchMaxMessages: this.streamReadBatchMaxMessages,
+        writeBatchMaxMessages: this.streamWriteBatchMaxMessages,
+      },
     );
     this.#recordStarted(call);
     try {
@@ -287,7 +314,7 @@ export class NodeServer {
 
 /** Raw server call passed to NodeServer handlers. */
 export class NodeServerCall {
-  constructor(nativeCall, onComplete = () => {}) {
+  constructor(nativeCall, onComplete = () => {}, options = {}) {
     this.nativeCall = nativeCall;
     this.request = nativeCall.request;
     this.completed = false;
@@ -298,6 +325,8 @@ export class NodeServerCall {
     this.finalStatus = Code.Ok;
     this.startedAt = Date.now();
     this.completedAt = null;
+    this.readBatchMaxMessages = batchMaxMessages(options.readBatchMaxMessages, RecvManyBatchSize);
+    this.writeBatchMaxMessages = batchMaxMessages(options.writeBatchMaxMessages, SendManyBatchSize);
     this.#onComplete = onComplete;
   }
 
@@ -324,6 +353,24 @@ export class NodeServerCall {
     const bytes = byteBody(body);
     this.responseBodyLength += bytes.byteLength;
     return this.nativeCall.sendMessage(bytes);
+  }
+
+  /** Sends multiple streaming response messages. */
+  sendMany(bodies) {
+    const batch = Array.from(bodies, byteBody);
+    if (batch.length === 0) {
+      return Promise.resolve();
+    }
+    if (batch.length === 1 || typeof this.nativeCall.sendMessages !== "function") {
+      return sendManyIndividually(this, batch);
+    }
+
+    let bodyLength = 0;
+    for (const body of batch) {
+      bodyLength += body.byteLength;
+    }
+    this.responseBodyLength += bodyLength;
+    return this.nativeCall.sendMessages(batch);
   }
 
   /** Receives one streaming request frame, or null after EOF. */
@@ -372,7 +419,7 @@ export class NodeServerCall {
 
   async #recvMany() {
     if (typeof this.nativeCall.recvMany === "function") {
-      return await this.nativeCall.recvMany(RecvManyBatchSize);
+      return await this.nativeCall.recvMany(this.readBatchMaxMessages);
     }
     return [await this.nativeCall.recv()];
   }
@@ -398,7 +445,13 @@ export function bearerAuthorizer(token) {
 }
 
 class NativeResponseFrameStream {
-  constructor(stream, writerTask, cleanupAbort = () => {}, signal = undefined) {
+  constructor(
+    stream,
+    writerTask,
+    cleanupAbort = () => {},
+    signal = undefined,
+    readBatchMaxMessages = RecvManyBatchSize,
+  ) {
     this.stream = stream;
     this.done = false;
     this.cleanupAbort = cleanupAbort;
@@ -410,6 +463,7 @@ class NativeResponseFrameStream {
     this.suppressReturnWriterError = false;
     this.recvQueue = [];
     this.recvTask = null;
+    this.readBatchMaxMessages = readBatchMaxMessages;
     this.writerDone = writerTask
       .catch((error) => {
         this.writerError = error;
@@ -484,7 +538,7 @@ class NativeResponseFrameStream {
   #startRecv() {
     const recv =
       typeof this.stream.recvMany === "function"
-        ? this.stream.recvMany(RecvManyBatchSize)
+        ? this.stream.recvMany(this.readBatchMaxMessages)
         : this.stream.recv().then((frame) => [frame]);
     return recv.then(
       (frames) => ({ frames }),
@@ -547,11 +601,11 @@ function isTerminalFrame(frame) {
   return frame == null || frame.kind === RpcStreamFrameKind.Status;
 }
 
-async function writeRequestStream(stream, requestBody) {
+async function writeRequestStream(stream, requestBody, batchMaxMessages = SendManyBatchSize) {
   const iterator = requestBody[Symbol.asyncIterator]();
   try {
     for (;;) {
-      const result = await nextRequestBodyBatch(iterator);
+      const result = await nextRequestBodyBatch(iterator, batchMaxMessages);
       if (result.done) {
         break;
       }
@@ -576,9 +630,9 @@ async function writeRequestStream(stream, requestBody) {
   }
 }
 
-async function nextRequestBodyBatch(iterator) {
+async function nextRequestBodyBatch(iterator, maxMessages) {
   if (typeof iterator.nextBatch === "function") {
-    return await iterator.nextBatch(SendManyBatchSize);
+    return await iterator.nextBatch(maxMessages);
   }
   const result = await iterator.next();
   return result.done ? result : { done: false, value: [result.value] };
@@ -591,11 +645,43 @@ async function completeDefault(call, result) {
   }
 
   if (isAsyncIterable(result)) {
-    for await (const body of result) {
-      await call.sendMessage(body);
-    }
+    await sendResponseMessages(call, result);
   }
   await call.finishStream(Code.Ok);
+}
+
+async function sendResponseMessages(call, messages) {
+  const iterator = messages[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const result = await nextResponseBodyBatch(iterator, call.writeBatchMaxMessages);
+      if (result.done) {
+        return;
+      }
+      await call.sendMany(result.value);
+    }
+  } catch (error) {
+    try {
+      await iterator.return?.();
+    } catch {
+      // Preserve the send or iterator error, matching for-await cleanup behavior.
+    }
+    throw error;
+  }
+}
+
+async function nextResponseBodyBatch(iterator, maxMessages) {
+  if (typeof iterator.nextBatch === "function") {
+    return await iterator.nextBatch(maxMessages);
+  }
+  const result = await iterator.next();
+  return result.done ? result : { done: false, value: [result.value] };
+}
+
+async function sendManyIndividually(call, bodies) {
+  for (const body of bodies) {
+    await call.sendMessage(body);
+  }
 }
 
 async function completeWithError(call, error) {
@@ -713,6 +799,10 @@ function rpcKindNumber(kind) {
 
 function isAsyncIterable(value) {
   return value != null && typeof value[Symbol.asyncIterator] === "function";
+}
+
+function batchMaxMessages(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
 function normalizeNodeTransportOptions(urlOrOptions, options) {

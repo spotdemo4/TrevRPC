@@ -43,28 +43,6 @@ Use these rules for every implementation task below.
 
 These tasks should happen before or alongside runtime changes because they affect how wins are interpreted.
 
-### P0.1 Build JS Native Addon In Release Mode
-
-Files:
-
-| File                        | Current issue                                                                               |
-| --------------------------- | ------------------------------------------------------------------------------------------- |
-| `trevrpc-js/package.json`   | `build:native` does not pass `-DCMAKE_BUILD_TYPE=Release`.                                  |
-| `bench/run_rpc_split.sh`    | JS native build invokes `npm --prefix trevrpc-js run build:native` without forcing Release. |
-| `bench/run_webtransport.sh` | Same Release-mode gap for JS WebTransport benchmark builds.                                 |
-
-Plan:
-
-| Step            | Detail                                                                                                      |
-| --------------- | ----------------------------------------------------------------------------------------------------------- |
-| Change          | Make JS native builds default to Release, while preserving an explicit debug override.                      |
-| Verify          | Confirm `trevrpc-js/build/native/CMakeCache.txt` has `CMAKE_BUILD_TYPE:STRING=Release` after a clean build. |
-| Benchmark       | Focus JS-only split and WebTransport rows before other JS optimizations.                                    |
-| Expected impact | Very high if current JS rows include an unoptimized native addon and embedded `trevrpc-c`.                  |
-| Risk            | Low. Watch for hidden debug-only assumptions.                                                               |
-
-Status 2026-06-26: implemented. `trevrpc-js/package.json` now defaults `build:native` to `-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release}`, and both split benchmark wrappers pass their `CMAKE_BUILD_TYPE` through to the JS native build. Local verification confirmed `trevrpc-js/build/native/CMakeCache.txt` contained `CMAKE_BUILD_TYPE:STRING=Release`. A focused split rerun on `bench` did not show a material JS improvement, so remaining JS gaps should be treated as JS/native boundary, batching, and allocation work rather than a Debug-addon artifact.
-
 ### P0.2 Separate Transport Cost From Generated/Protobuf Cost
 
 Files:
@@ -274,27 +252,7 @@ Plan:
 
 ## Go Track
 
-Current strength: best server latency in several split rows. Main opportunities are removing goroutine/channel overhead and batching server streaming paths.
-
-### G1 Remove Per-Message Goroutine/Channel In Request Streaming
-
-References:
-
-| File                   | Functions                                                            |
-| ---------------------- | -------------------------------------------------------------------- |
-| `trevrpc-go/quic.go`   | `writeRequestBodyFrames`, `recvRequestBody`                          |
-| `trevrpc-go/server.go` | `recvByteWithTimeout`, `limitedByteStream.trevrpcContextCancelsRecv` |
-
-Plan:
-
-| Item            | Detail                                                                                                                                                                 |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Change          | Direct-read when the stream advertises context-cancellable `Recv`, not only when it is nonblocking. Make `MessagePipe` and internal wrappers advertise that correctly. |
-| Expected impact | High for client-stream and bidi throughput across quic-go, MsQuic, and WebTransport.                                                                                   |
-| Risk            | Treating arbitrary user streams as cancellable can leak goroutines or block shutdown.                                                                                  |
-| Verify          | Go split client-stream and bidi rows, `go test -bench . -benchmem`, cancellation/deadline tests.                                                                       |
-
-Status 2026-06-26: implemented with a narrower safety shape than the original note. Request-body writers wrap streams once with `closeStreamOnContext`, then `recvRequestBody` direct-reads streams that are nonblocking or advertise context-cancellable `Recv`. This avoids the per-message goroutine/channel fallback for generated request streams without trusting arbitrary user streams as cancellable. Focused split results showed large client-stream and bidi throughput gains for both Go `quic-go` and Go/MsQuic; see `wiki/Benchmarks.md`.
+Current strength: best server latency in several split rows. Main opportunities are batching server streaming paths, reducing timeout goroutine overhead, and reducing small-message allocations.
 
 ### G2 Fix WebTransport Response Stream Cancellation Fast Path
 
@@ -413,13 +371,7 @@ Plan:
 
 ## JS Track
 
-Current weakness: largest gaps in both split and WebTransport throughput. Prioritize native build mode, JS/native boundary cost, and streaming batch APIs.
-
-### J1 Build Native Addon In Release Mode
-
-This is the same task as `P0.1` and should be completed first for JS. Re-baseline JS before judging other JS work.
-
-Status 2026-06-26: complete via `P0.1`. Focused JS split rows were re-run with a Release addon; no material improvement was observed, so continue with `J3`, `J5`, or `J6` before drawing further conclusions about JS runtime ceilings.
+Current weakness: largest gaps in WebTransport throughput and remaining native JS receive/object overhead. Remaining work should focus on body-batch receive, cancellation allocation, copy reduction, browser batching, and the long-term native completion path.
 
 ### J2 Avoid Unconditional AbortController And Native Cancellation Allocation
 
@@ -479,44 +431,6 @@ Plan:
 | Expected impact | High for payload throughput, medium for tiny messages.                                                                                                                                 |
 | Risk            | Native memory ownership bugs and Buffer aliasing surprises.                                                                                                                            |
 | Verify          | Buffer alias tests, ASAN where possible, payload sweep.                                                                                                                                |
-
-### J5 Batch Node Server Sends And Receives
-
-References:
-
-| File                               | Functions                                                              |
-| ---------------------------------- | ---------------------------------------------------------------------- |
-| `trevrpc-js/src/node.js`           | `NodeServerCall.sendMessage`, `completeDefault`, `NodeServerCall.recv` |
-| `trevrpc-js/native/trevrpc_node.c` | native call send/recv functions                                        |
-| `trevrpc-c/include/trevrpc.h`      | C batch send APIs                                                      |
-
-Plan:
-
-| Item            | Detail                                                                                                                                                                                   |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Change          | Add `NativeCall.sendMessages`, `NodeServerCall.sendMany`, and optionally `recvMany`/body-batch helpers. Update generated server helpers to use batches for nonblocking iterable results. |
-| Expected impact | Very high for JS server-axis and WebTransport JS-server throughput.                                                                                                                      |
-| Risk            | Backpressure and memory growth if batch sizes are too large.                                                                                                                             |
-| Verify          | JS server split rows and WebTransport JS server rows.                                                                                                                                    |
-
-### J6 Expose Batch Knobs And Fix Benchmark Send Paths
-
-References:
-
-| File                                        | Functions                                                     |
-| ------------------------------------------- | ------------------------------------------------------------- |
-| `trevrpc-js/src/node.js`                    | fixed `RecvManyBatchSize` and `SendManyBatchSize`             |
-| `trevrpc-js/bench/rpc_split_native.js`      | client-stream and bidi send loops await single `send()` calls |
-| `trevrpc-js/bench/rpc_comparison_native.js` | same pattern in native comparison benchmark                   |
-
-Plan:
-
-| Item            | Detail                                                                                                                               |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Change          | Add options mirroring WebTransport batch knobs. Use `sendMany` in throughput benchmark paths while keeping single-send latency rows. |
-| Expected impact | High for JS client-stream and bidi throughput.                                                                                       |
-| Risk            | Benchmark comparability. Report single-send and batched variants separately if needed.                                               |
-| Verify          | `client_stream_throughput`, `bidi_stream_throughput`, and latency rows to catch batching-induced latency regressions.                |
 
 ### J7 Reduce Option And Metadata Normalization Work
 
@@ -585,20 +499,18 @@ References:
 | `trevrpc-rust/src/quinn.rs`                | `handle_streaming_rpc`, `QuinnRequestStream`                                |
 | `trevrpc-rust/examples/rpc_split_bench.rs` | `BidiReplies::next`                                                         |
 
-Hypothesis: the C client sends one bidi request, waits for the reply, then half-closes and waits for terminal status. The Rust server cannot emit terminal OK until `QuinnRequestStream` observes request EOF. The 26.5 ms timing looks like delayed ACK/FIN timing.
+Current state: benchmark half-close timing alone did not fix the outlier. Prior final-message-with-FIN and global zero-length-FIN experiments were unstable or unsafe and were reverted. Treat the remaining work as a trace-driven transport investigation, not another speculative close-path change.
 
 Plan:
 
-| Item             | Detail                                                                                                                                                                                                              |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Experiment       | Change only benchmark shape in a scratch branch: half-close immediately after the single request before reading the reply. Compare Rust server-axis bidi latency.                                                   |
-| Transport tuning | Test Quinn `ack_frequency_config` or lower max ACK delay if available in the pinned Quinn version.                                                                                                                  |
-| Runtime fix      | If the issue is request EOF waiting, consider permitting bidi handlers to emit terminal status when response stream completes and request stream has been explicitly cancelled/drained according to protocol rules. |
-| Expected impact  | Very high for the outlier; should move near other Rust stream latency rows if hypothesis is correct.                                                                                                                |
-| Risk             | Benchmark semantics and bidi correctness. Do not hide real half-close requirements.                                                                                                                                 |
-| Verify           | Rust-only server-axis split run and qlog/packet trace if the result remains ambiguous.                                                                                                                              |
-
-Status 2026-06-26: investigated, not fixed. The split C benchmark was changed to half-close immediately after sending the single request, before reading the reply. A focused 10000-iteration Rust server-axis rerun still reported `bidi_stream_latency` around 26.46 ms, so benchmark half-close timing alone is not the root cause. Two C/MsQuic FIN experiments were tested and reverted: a final-message-with-FIN path was fast at 1000 iterations but unstable at 10000 iterations, and a global zero-length-FIN graceful shutdown path caused failures and did not fix the outlier. Remaining follow-up: capture qlog/packet traces and design a robust C-side final-write-with-FIN path or transport ACK/FIN tuning that preserves graceful shutdown and stream reset semantics.
+| Item             | Detail                                                                                                                                                                                                                                                                        |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Evidence first   | Capture qlog/packet traces for C MsQuic client to Rust Quinn server `bidi_stream_latency`, including request frame, response frame, request FIN, terminal status, stream FIN, ACK timing, and any reset/stop-sending frames.                                                  |
+| Transport tuning | Test Quinn `ack_frequency_config` or lower max ACK delay if available in the pinned Quinn version, but only with before/after traces showing the delayed event being targeted.                                                                                                |
+| Runtime fix      | If traces prove terminal status is blocked on request EOF or FIN/ACK behavior, design the smallest safe transport or benchmark change. Candidate fixes must preserve graceful shutdown, stream resets, terminal status precedence, cancellation, and partial stream behavior. |
+| Expected impact  | Very high for the outlier; should move near other Rust stream latency rows if the trace confirms the delayed-ACK/FIN hypothesis.                                                                                                                                              |
+| Risk             | Benchmark semantics and bidi correctness. Do not hide real half-close requirements or reintroduce unsafe global FIN behavior.                                                                                                                                                 |
+| Verify           | Rust-only server-axis split run, qlog/packet trace comparison, and correctness tests for close/status/reset behavior before any transport close-path change is kept.                                                                                                          |
 
 ### R2 Remove Per-Handler `tokio::spawn` On Server Hot Path
 
@@ -779,17 +691,16 @@ Plan:
 
 ## Suggested Implementation Order
 
-| Order | Work                                                        | Reason                                                                                  |
-| ----: | ----------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-|     1 | `P0.1` / `J1` JS Release native build                       | Low risk and may materially change JS baseline.                                         |
-|     2 | `R1` Rust bidi latency anomaly                              | Current 26.5 ms row is too large to ignore and may be a benchmark-shape or ACK issue.   |
-|     3 | `G1`, `G3`, `J3`, `J5` stream batching/scheduler fast paths | Directly targets biggest non-C throughput gaps.                                         |
-|     4 | `R2`, `R4`, `R5`, `R9` Rust async/copy/timer hot paths      | Improves Rust split rows while protecting its WebTransport strengths.                   |
-|     5 | `C1`, `C2`, `C3`, `C4`, `C5` C hot-path improvements        | C already leads; these are deeper changes that should be done carefully with profiling. |
-|     6 | `P0.2`, `G7`, `R7`, `C8` concurrency/window/profile sweeps  | Needed for predictable performance under load, beyond single-stream benchmarks.         |
-|     7 | `R3`, `J4`, `J9`, `C6` API/lifetime-heavy improvements      | High ceiling but higher risk and larger API impact.                                     |
-
-Status 2026-06-26: order 1 is complete; order 2 has been investigated but remains open for a transport-level follow-up; `G1` from order 3 is complete. Recommended next work is `J3`/`J5`/`J6` for JS streaming throughput or a trace-driven R1 follow-up, rather than more speculative Rust runtime changes.
+| Order | Work                                                     | Reason                                                                                  |
+| ----: | -------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+|     1 | `J3` native JS body-batch receive                        | Highest remaining JS streaming throughput opportunity after native send batching.       |
+|     2 | trace-driven `R1` Rust bidi latency anomaly              | Current 26.5 ms row is too large to ignore, but any fix needs packet/qlog evidence.     |
+|     3 | `G3` Go server response batching                         | Directly targets a remaining non-C stream throughput gap.                               |
+|     4 | `J2`, `J7`, `J8` JS allocation and browser batching work | Reduces JS latency/allocation overhead and addresses weak WebTransport throughput rows. |
+|     5 | `R2`, `R4`, `R5`, `R9` Rust async/copy/timer hot paths   | Improves Rust split rows while protecting its WebTransport strengths.                   |
+|     6 | `C1`, `C2`, `C3`, `C4`, `C5` C hot-path improvements     | C already leads; these are deeper changes that should be done carefully with profiling. |
+|     7 | `P0.2`, `P0.3`, `G7`, `R7`, `C8` benchmark/window sweeps | Needed for predictable performance under load and reliable benchmark interpretation.    |
+|     8 | `R3`, `J4`, `J9`, `C6` API/lifetime-heavy improvements   | High ceiling but higher risk and larger API impact.                                     |
 
 ## Focused Verification Commands
 

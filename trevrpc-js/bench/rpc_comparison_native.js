@@ -8,6 +8,7 @@ const LatencyStreamMessageCount = 1;
 const BenchmarkRequest = Object.freeze({ name: "TrevRPC benchmark" });
 const ServerStartupTimeoutMs = 10_000;
 const ServerShutdownTimeoutMs = 5_000;
+const SendManyBatchSize = positiveInteger(process.env.TREVRPC_JS_SEND_MANY_BATCH ?? "16");
 
 const root = createRoot({
   nested: {
@@ -83,6 +84,7 @@ try {
     port,
     maxStreamsPerSession: 128,
     idleTimeoutMs: 600_000,
+    streamWriteBatchMaxMessages: SendManyBatchSize,
   });
   const client = createServiceClient(transport, GreeterService, root);
 
@@ -226,9 +228,7 @@ async function serverStreaming(client, messageCount) {
 
 async function clientStreaming(client, messageCount) {
   const call = await client.lotsOfGreetings();
-  for (let i = 0; i < messageCount; i++) {
-    await call.send(BenchmarkRequest);
-  }
+  await sendRequestMessages(call, messageCount);
   const reply = await call.closeAndRecv();
   if (reply.message !== `streamed ${messageCount} greetings`) {
     throw new Error(`unexpected client-stream response: ${JSON.stringify(reply)}`);
@@ -241,9 +241,7 @@ async function bidiStreaming(client, messageCount) {
   await Promise.all([sendMessages(), recvMessages()]);
 
   async function sendMessages() {
-    for (let i = 0; i < messageCount; i++) {
-      await call.send(BenchmarkRequest);
-    }
+    await sendRequestMessages(call, messageCount);
     await call.closeSend();
   }
 
@@ -261,5 +259,24 @@ async function bidiStreaming(client, messageCount) {
     if (received !== messageCount) {
       throw new Error(`expected ${messageCount} bidi responses, got ${received}`);
     }
+  }
+}
+
+async function sendRequestMessages(call, messageCount) {
+  if (messageCount <= 0) {
+    return;
+  }
+  if (messageCount === 1 || typeof call.sendMany !== "function" || SendManyBatchSize <= 1) {
+    for (let i = 0; i < messageCount; i++) {
+      await call.send(BenchmarkRequest);
+    }
+    return;
+  }
+
+  let remaining = messageCount;
+  while (remaining > 0) {
+    const count = Math.min(remaining, SendManyBatchSize);
+    await call.sendMany(Array.from({ length: count }, () => BenchmarkRequest));
+    remaining -= count;
   }
 }

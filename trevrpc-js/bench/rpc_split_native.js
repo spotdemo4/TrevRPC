@@ -4,6 +4,7 @@ import { NodeServer, NodeTransport } from "../src/node.js";
 const LatencyStreamMessageCount = 1;
 const RequestName = "TrevRPC benchmark";
 const IdleTimeoutMs = 600_000;
+const SendManyBatchSize = positiveInteger(process.env.TREVRPC_JS_SEND_MANY_BATCH ?? "16");
 
 const root = createRoot({
   nested: {
@@ -85,6 +86,7 @@ async function runClient(host, port, iterations) {
     skipCertificateValidation: true,
     maxStreamsPerSession: 128,
     idleTimeoutMs: IdleTimeoutMs,
+    streamWriteBatchMaxMessages: SendManyBatchSize,
   });
   try {
     const client = createServiceClient(transport, GreeterService, root);
@@ -125,6 +127,7 @@ async function runServer(certFile, keyFile) {
     maxStreamsPerSession: 65_535,
     maxStreamMessages: -1,
     idleTimeoutMs: IdleTimeoutMs,
+    streamWriteBatchMaxMessages: SendManyBatchSize,
   });
   server.registerService(GreeterService, {
     sayHello: (call) => encodeReply(decodeRequest(call.request.body).name),
@@ -200,9 +203,7 @@ async function serverStreaming(client, messageCount) {
 
 async function clientStreaming(client, messageCount) {
   const call = await client.lotsOfGreetings();
-  for (let i = 0; i < messageCount; i++) {
-    await call.send({ name: RequestName });
-  }
+  await sendRequestMessages(call, messageCount);
   const reply = await call.closeAndRecv();
   if (reply.message !== `streamed ${messageCount} greetings`) {
     throw new Error(`unexpected client-stream response: ${JSON.stringify(reply)}`);
@@ -215,9 +216,7 @@ async function bidiStreaming(client, messageCount) {
   await Promise.all([sendMessages(), recvMessages()]);
 
   async function sendMessages() {
-    for (let i = 0; i < messageCount; i++) {
-      await call.send({ name: RequestName });
-    }
+    await sendRequestMessages(call, messageCount);
     await call.closeSend();
   }
 
@@ -238,11 +237,9 @@ async function bidiStreaming(client, messageCount) {
   }
 }
 
-async function* serverStreamReplies(call) {
+function serverStreamReplies(call) {
   const count = messageCountFromName(decodeRequest(call.request.body).name);
-  for (let i = 0; i < count; i++) {
-    yield encodeReply("server stream");
-  }
+  return repeatedReplies(count, "server stream");
 }
 
 async function* clientStreamReply(call) {
@@ -270,6 +267,52 @@ async function* bidiReplies(call) {
 
 function encodeReply(message) {
   return HelloReply.encode({ message }).finish();
+}
+
+async function sendRequestMessages(call, messageCount) {
+  if (messageCount <= 0) {
+    return;
+  }
+  if (messageCount === 1 || typeof call.sendMany !== "function" || SendManyBatchSize <= 1) {
+    for (let i = 0; i < messageCount; i++) {
+      await call.send({ name: RequestName });
+    }
+    return;
+  }
+
+  let remaining = messageCount;
+  while (remaining > 0) {
+    const count = Math.min(remaining, SendManyBatchSize);
+    await call.sendMany(Array.from({ length: count }, () => ({ name: RequestName })));
+    remaining -= count;
+  }
+}
+
+function repeatedReplies(count, message) {
+  let sent = 0;
+  return {
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    next() {
+      if (sent >= count) {
+        return Promise.resolve({ done: true, value: undefined });
+      }
+      sent++;
+      return Promise.resolve({ done: false, value: encodeReply(message) });
+    },
+    nextBatch(max = SendManyBatchSize) {
+      if (sent >= count) {
+        return Promise.resolve({ done: true, value: undefined });
+      }
+      const batchCount = Math.min(count - sent, Math.max(1, max));
+      const batch = Array.from({ length: batchCount }, () => {
+        sent++;
+        return encodeReply(message);
+      });
+      return Promise.resolve({ done: false, value: batch });
+    },
+  };
 }
 
 function decodeRequest(body) {

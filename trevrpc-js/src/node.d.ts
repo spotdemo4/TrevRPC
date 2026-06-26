@@ -141,6 +141,10 @@ export class NodeServerCall {
   ): Promise<void>;
   /** Sends one streaming response message. */
   sendMessage(body: Uint8Array | ArrayBuffer | ArrayBufferView | readonly number[]): Promise<void>;
+  /** Sends multiple streaming response messages. */
+  sendMany(
+    bodies: Iterable<Uint8Array | ArrayBuffer | ArrayBufferView | readonly number[]>,
+  ): Promise<void>;
   /** Receives one streaming request frame, or null after EOF. */
   recv(): Promise<RpcStreamFrameMessage | null>;
   /** Sends the terminal streaming status and completes the call. */
