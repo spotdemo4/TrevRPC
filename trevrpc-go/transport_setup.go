@@ -3,20 +3,9 @@ package trevrpc
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"net"
 
 	"github.com/quic-go/quic-go"
-)
-
-// TransportKind selects the QUIC transport backend for Listen and Dial.
-type TransportKind uint8
-
-const (
-	// TransportQUICGo uses the pure Go quic-go backend.
-	TransportQUICGo TransportKind = iota
-	// TransportMsQuic uses the native trevrpc-c MsQuic backend.
-	TransportMsQuic
 )
 
 // ClientTransport is a TrevRPC client transport that can release its underlying connection.
@@ -34,20 +23,16 @@ type ServerListener interface {
 
 // ListenOptions configures Listen.
 type ListenOptions struct {
-	Kind       TransportKind
 	Transport  TransportConfig
 	TLSConfig  *tls.Config
 	QUICConfig *quic.Config
-	MsQuic     MsQuicConfig
 }
 
 // DialOptions configures Dial.
 type DialOptions struct {
-	Kind         TransportKind
 	Transport    TransportConfig
 	TLSConfig    *tls.Config
 	QUICConfig   *quic.Config
-	MsQuic       MsQuicConfig
 	MaxFrameSize int
 }
 
@@ -56,25 +41,17 @@ func Listen(addr string, server *Server, options ListenOptions) (ServerListener,
 	if server == nil {
 		return nil, InvalidArgument("server is nil")
 	}
-
-	switch options.Kind {
-	case TransportQUICGo:
-		if options.TLSConfig == nil {
-			return nil, InvalidArgument("quic-go listener requires TLSConfig")
-		}
-		serverOptions := server.Options()
-		config := QUICServerConfig(serverOptions, options.QUICConfig)
-		applyDefaultQUICTransportConfig(config, mergeTransportConfig(transportConfigFromServerOptions(serverOptions), options.Transport))
-		listener, err := quic.ListenAddr(addr, options.TLSConfig, config)
-		if err != nil {
-			return nil, transportStatus(err)
-		}
-		return &quicServerListener{listener: listener, server: server}, nil
-	case TransportMsQuic:
-		return listenMsQuic(addr, server, options)
-	default:
-		return nil, InvalidArgument(fmt.Sprintf("unsupported transport kind %d", options.Kind))
+	if options.TLSConfig == nil {
+		return nil, InvalidArgument("quic-go listener requires TLSConfig")
 	}
+	serverOptions := server.Options()
+	config := QUICServerConfig(serverOptions, options.QUICConfig)
+	applyDefaultQUICTransportConfig(config, mergeTransportConfig(transportConfigFromServerOptions(serverOptions), options.Transport))
+	listener, err := quic.ListenAddr(addr, options.TLSConfig, config)
+	if err != nil {
+		return nil, transportStatus(err)
+	}
+	return &quicServerListener{listener: listener, server: server}, nil
 }
 
 // Dial connects to addr and returns a TrevRPC client transport.
@@ -87,23 +64,16 @@ func Dial(ctx context.Context, addr string, options DialOptions) (ClientTranspor
 		maxFrameSize = DefaultMaxFrameSize
 	}
 
-	switch options.Kind {
-	case TransportQUICGo:
-		if options.TLSConfig == nil {
-			return nil, InvalidArgument("quic-go dial requires TLSConfig")
-		}
-		config := QUICClientConfig(maxFrameSize, options.QUICConfig)
-		applyDefaultQUICTransportConfig(config, options.Transport)
-		conn, err := quic.DialAddr(ctx, addr, options.TLSConfig, config)
-		if err != nil {
-			return nil, transportOrContextStatus(ctx, err)
-		}
-		return NewQuicClient(conn).WithMaxFrameSize(maxFrameSize), nil
-	case TransportMsQuic:
-		return dialMsQuic(ctx, addr, options, maxFrameSize)
-	default:
-		return nil, InvalidArgument(fmt.Sprintf("unsupported transport kind %d", options.Kind))
+	if options.TLSConfig == nil {
+		return nil, InvalidArgument("quic-go dial requires TLSConfig")
 	}
+	config := QUICClientConfig(maxFrameSize, options.QUICConfig)
+	applyDefaultQUICTransportConfig(config, options.Transport)
+	conn, err := quic.DialAddr(ctx, addr, options.TLSConfig, config)
+	if err != nil {
+		return nil, transportOrContextStatus(ctx, err)
+	}
+	return NewQuicClient(conn).WithMaxFrameSize(maxFrameSize), nil
 }
 
 type quicServerListener struct {

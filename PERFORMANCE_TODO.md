@@ -85,12 +85,6 @@ Current state: transport deadlines exist for some initial request/drain reads, b
 
 Concrete blocker: a safe replacement must preserve precedence between context deadline, stream idle timeout, cancellation, and terminal status, and must include MsQuic/native timed-read behavior.
 
-### G6 Optimize MsQuic Cgo Write/Batch Path
-
-Blocked on cgo pointer and async-send lifetime rules.
-
-Concrete blocker: current Go/MsQuic batching packs bodies into a Go buffer before C copies into an MsQuic send buffer. A vector/scatter API must satisfy cgo pointer rules and keep memory alive until send completion.
-
 ### G7 Tune QUIC Flow-Control Windows For Concurrency
 
 Blocked on public memory-budget API design.

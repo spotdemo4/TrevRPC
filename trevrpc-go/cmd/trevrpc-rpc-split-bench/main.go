@@ -43,7 +43,7 @@ type grpcSplitGreeter struct{}
 
 func main() {
 	mode := flag.String("mode", "", "client or server")
-	transport := flag.String("transport", "quic", "quic, msquic, webtransport, webtransport-msquic, grpc, or connect")
+	transport := flag.String("transport", "quic", "quic, webtransport, grpc, or connect")
 	addr := flag.String("addr", "127.0.0.1:0", "listen or dial address")
 	cert := flag.String("cert", "", "PEM certificate path")
 	key := flag.String("key", "", "PEM private key path")
@@ -134,10 +134,6 @@ func runServer(transportName, addr, certFile, keyFile, origin string) error {
 	if transportName == "connect" {
 		return runConnectServer(addr, origin)
 	}
-	if transportName == "webtransport-msquic" {
-		return runNativeWebTransportServer(addr, certFile, keyFile, origin)
-	}
-
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.GracefulShutdownTimeout = time.Second
@@ -382,19 +378,8 @@ func dialTransport(ctx context.Context, transportName, addr, certFile string) (t
 	switch transportName {
 	case "quic":
 		return trevrpc.Dial(ctx, addr, trevrpc.DialOptions{
-			Kind:       trevrpc.TransportQUICGo,
 			TLSConfig:  clientTLSConfig(certFile),
 			QUICConfig: quicConfig(),
-		})
-	case "msquic":
-		return trevrpc.Dial(ctx, addr, trevrpc.DialOptions{
-			Kind: trevrpc.TransportMsQuic,
-			MsQuic: trevrpc.MsQuicConfig{
-				MaxIdleTimeout:            idleTimeout,
-				KeepAlive:                 keepAlive,
-				PeerBidiStreamCount:       128,
-				SkipCertificateValidation: true,
-			},
 		})
 	default:
 		return nil, fmt.Errorf("unsupported transport %q", transportName)
@@ -412,20 +397,8 @@ func listenTransport(transportName, addr, certFile, keyFile string, server *trev
 			return nil, err
 		}
 		return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
-			Kind:       trevrpc.TransportQUICGo,
 			TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN}},
 			QUICConfig: quicConfig(),
-		})
-	case "msquic":
-		return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
-			Kind: trevrpc.TransportMsQuic,
-			MsQuic: trevrpc.MsQuicConfig{
-				CertFile:            certFile,
-				KeyFile:             keyFile,
-				MaxIdleTimeout:      idleTimeout,
-				KeepAlive:           keepAlive,
-				PeerBidiStreamCount: 128,
-			},
 		})
 	case "webtransport":
 		if certFile == "" || keyFile == "" {
@@ -436,7 +409,6 @@ func listenTransport(transportName, addr, certFile, keyFile string, server *trev
 			return nil, err
 		}
 		return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
-			Kind:       trevrpc.TransportQUICGo,
 			TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN, http3.NextProtoH3}},
 			QUICConfig: quicConfig(),
 		})

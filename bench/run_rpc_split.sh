@@ -30,7 +30,6 @@ RUN_CLIENT_AXIS=${RUN_CLIENT_AXIS:-1}
 RUN_SERVER_AXIS=${RUN_SERVER_AXIS:-1}
 RUN_C_MSQUIC=${RUN_C_MSQUIC:-1}
 RUN_GO_QUIC=${RUN_GO_QUIC:-1}
-RUN_GO_MSQUIC=${RUN_GO_MSQUIC:-1}
 RUN_GO_GRPC=${RUN_GO_GRPC:-1}
 RUN_JS_NATIVE=${RUN_JS_NATIVE:-1}
 RUN_RUST_QUINN=${RUN_RUST_QUINN:-1}
@@ -60,7 +59,6 @@ Environment knobs:
   RUN_SERVER_AXIS         Benchmark servers with reference C clients. Default: 1
   RUN_C_MSQUIC            Include C MsQuic transport. Default: 1
   RUN_GO_QUIC             Include Go quic-go transport. Default: 1
-  RUN_GO_MSQUIC           Include Go MsQuic transport. Default: 1
   RUN_GO_GRPC             Include Go gRPC TCP baseline. Default: 1
   RUN_JS_NATIVE           Include native JS MsQuic transport. Default: 1
   RUN_RUST_QUINN          Include Rust Quinn transport. Default: 1
@@ -531,12 +529,8 @@ build_prerequisites() {
     run_and_capture c-configure cmake -S trevrpc-c -B "$CMAKE_BUILD_DIR" -DTREVRPC_BUILD_TESTS=OFF -DTREVRPC_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
     run_and_capture c-build cmake --build "$CMAKE_BUILD_DIR" --target trevrpc_rpc_comparison_bench
 
-    if [[ "$RUN_GO_QUIC" == "1" || "$RUN_GO_MSQUIC" == "1" || "$RUN_GO_GRPC" == "1" ]]; then
-        local go_build=(go build -C trevrpc-go -o "$GO_SPLIT_BENCH")
-        if [[ "$RUN_GO_MSQUIC" == "1" ]]; then
-            go_build=(go build -C trevrpc-go -tags trevrpc_msquic -o "$GO_SPLIT_BENCH")
-        fi
-        run_and_capture go-split-build "${go_build[@]}" ./cmd/trevrpc-rpc-split-bench
+    if [[ "$RUN_GO_QUIC" == "1" || "$RUN_GO_GRPC" == "1" ]]; then
+        run_and_capture go-split-build go build -C trevrpc-go -o "$GO_SPLIT_BENCH" ./cmd/trevrpc-rpc-split-bench
     fi
     if [[ "$RUN_JS_NATIVE" == "1" ]]; then
         run_and_capture js-native-build env "CMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE" npm --prefix trevrpc-js run build:native
@@ -559,9 +553,6 @@ run_client_axis() {
         fi
         if [[ "$RUN_GO_QUIC" == "1" ]]; then
             run_split_sample "client-go-quic-run-$run" "$run" client go_quic c_msquic go-custom "$GO_SPLIT_BENCH" -mode client -transport quic -addr "127.0.0.1:$port" -cert "$cert_file" -iterations "$GO_ITERATIONS"
-        fi
-        if [[ "$RUN_GO_MSQUIC" == "1" ]]; then
-            run_split_sample "client-go-msquic-run-$run" "$run" client go_msquic c_msquic go-custom "$GO_SPLIT_BENCH" -mode client -transport msquic -addr "127.0.0.1:$port" -iterations "$GO_ITERATIONS"
         fi
         if [[ "$RUN_JS_NATIVE" == "1" ]]; then
             run_split_sample "client-js-native-run-$run" "$run" client js_msquic c_msquic js-custom node trevrpc-js/bench/rpc_split_native.js client 127.0.0.1 "$port" "$JS_ITERATIONS"
@@ -595,15 +586,6 @@ run_server_axis() {
         port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
             run_split_sample "server-go-quic-run-$run" "$run" server c_msquic go_quic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
-        done
-        stop_servers
-    fi
-
-    if [[ "$RUN_GO_MSQUIC" == "1" ]]; then
-        start_server server-axis-go-msquic "$GO_SPLIT_BENCH" -mode server -transport msquic -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
-        port=$START_SERVER_PORT
-        for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "server-go-msquic-run-$run" "$run" server c_msquic go_msquic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         done
         stop_servers
     fi

@@ -1352,26 +1352,6 @@ func TestQUICTransportConfigDefaultsPreserveExplicitBackendConfig(t *testing.T) 
 	}
 }
 
-func TestMsQuicConfigFromServerOptionsAlignsTransportLimits(t *testing.T) {
-	options := DefaultServerOptions()
-	options.StreamIdleTimeout = 20 * time.Second
-	options.MaxConcurrentStreamsPerConnection = 10
-	options.MaxConcurrentRequests = 123
-	options.MaxConcurrentConnections = 7
-
-	config := MsQuicConfigFromServerOptions(options)
-
-	if config.MaxIdleTimeout != 20*time.Second || config.KeepAlive != 10*time.Second {
-		t.Fatalf("MsQuic idle defaults should derive from transport limits, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlive)
-	}
-	if config.PeerBidiStreamCount != 11 {
-		t.Fatalf("MsQuic peer bidi streams should include one rejection slot, got %d", config.PeerBidiStreamCount)
-	}
-	if config.MaxStatelessOperations != 123 || config.MaxBindingStatelessOperations != 7 {
-		t.Fatalf("MsQuic stateless operation limits should derive from server concurrency, got max=%d binding=%d", config.MaxStatelessOperations, config.MaxBindingStatelessOperations)
-	}
-}
-
 func TestQuicClientUnary(t *testing.T) {
 	server := NewServer()
 	RegisterUnary(server, "example.Greeter", "SayHello", func() *testMessage { return &testMessage{} }, func(_ context.Context, request *testMessage) (*testMessage, error) {
