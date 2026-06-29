@@ -28,6 +28,21 @@ RUN_GO_CONNECT=${RUN_GO_CONNECT:-1}
 RUN_RUST=${RUN_RUST:-1}
 RUN_JS=${RUN_JS:-${RUN_JS_NATIVE:-1}}
 
+PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-}
+METADATA_PROFILE=${METADATA_PROFILE:-none}
+HANDSHAKE_INCLUSION_MODE=${HANDSHAKE_INCLUSION_MODE:-steady-state-warmed}
+WEBTRANSPORT_BATCHING_SETTINGS=${WEBTRANSPORT_BATCHING_SETTINGS:-send-many-batch=${WEBTRANSPORT_SEND_MANY_BATCH:-1};stream-read-batch=${WEBTRANSPORT_STREAM_READ_BATCH:-default};stream-write-batch=${WEBTRANSPORT_STREAM_WRITE_BATCH:-default};stream-write-batch-bytes=${WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES:-default};concurrent-streams=${WEBTRANSPORT_CONCURRENT_STREAMS:-1}}
+SERIALIZATION_MODE=per-message-serialized
+if [[ "${WEBTRANSPORT_PAYLOAD_BYTES:-0}" == "0" ]]; then
+    PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-tiny}
+    ENCODED_REQUEST_BYTES=${ENCODED_REQUEST_BYTES:-19}
+    ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-19}
+else
+    PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-custom-string-bytes}
+    ENCODED_REQUEST_BYTES=${ENCODED_REQUEST_BYTES:-$((WEBTRANSPORT_PAYLOAD_BYTES + 2))}
+    ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-$((WEBTRANSPORT_PAYLOAD_BYTES + 2))}
+fi
+
 GO_SPLIT_BENCH="$OUT_DIR_ABS/trevrpc-go-rpc-split-bench"
 RUST_SPLIT_BENCH="$ROOT/trevrpc-rust/target/release/examples/rpc_split_bench"
 
@@ -64,9 +79,11 @@ Environment knobs:
   CMAKE_BUILD_TYPE           CMake build type for C benchmarks/certificates. Default: Release
   RUN_C                      Include trevrpc-c WebTransport server. Default: 1
   RUN_GO                     Include Go WebTransport server. Default: 1
-  RUN_GO_CONNECT             Include Go ConnectRPC HTTP baseline. Default: 1
+  RUN_GO_CONNECT             Include Go ConnectRPC Fetch baseline. Default: 1
   RUN_RUST                   Include Rust WebTransport server. Default: 1
   RUN_JS                     Include JS WebTransport server. Default: 1
+  PAYLOAD_PROFILE            Reported payload profile. Default: tiny, or custom-string-bytes when WEBTRANSPORT_PAYLOAD_BYTES > 0
+  METADATA_PROFILE           Reported metadata profile. Default: none
   TREVRPC_BROWSER_CHROMIUM   Optional Chromium executable path for Playwright.
 
 Examples:
@@ -96,7 +113,7 @@ initialize_output() {
     mkdir -p "$RAW_DIR"
     : >"$COMMAND_LOG"
     rm -f "$RAW_DIR"/*.txt
-    printf 'run,browser,server,shape,latency_us,throughput_per_s,iterations,elapsed_s,source\n' >"$SAMPLES_CSV"
+    printf 'run,browser,server,shape,latency_us,throughput_per_s,iterations,elapsed_s,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels\n' >"$SAMPLES_CSV"
     printf 'run,browser,server,source,status,raw_file\n' >"$FAILURES_CSV"
 }
 
@@ -147,12 +164,44 @@ append_webtransport_csv() {
     local browser=$3
     local server=$4
     local source=$5
-    awk -v run="$run" -v browser="$browser" -v server="$server" -v source="$source" -F '' '
+    awk -v run="$run" -v browser="$browser" -v server="$server" -v source="$source" \
+        -v payload_profile="$PAYLOAD_PROFILE" \
+        -v encoded_request_bytes="$ENCODED_REQUEST_BYTES" \
+        -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
+        -v metadata_profile="$METADATA_PROFILE" \
+        -v handshake_inclusion_mode="$HANDSHAKE_INCLUSION_MODE" \
+        -v batching_settings="$WEBTRANSPORT_BATCHING_SETTINGS" -F '' '
+        function transport_security_mode() {
+            return "encrypted"
+        }
+        function certificate_verification_mode() {
+            if (server == "go_connect") {
+                return "tls-skip-verify"
+            }
+            return "tls-pinned-server-certificate-hash"
+        }
+        function serialization_mode(shape) {
+            shape = shape
+            return "per-message-serialized"
+        }
+        function labels(shape,    security, cert, serialization) {
+            security = transport_security_mode()
+            cert = certificate_verification_mode()
+            serialization = serialization_mode(shape)
+            return security ";" cert ";" payload_profile ";" serialization ";" metadata_profile ";" handshake_inclusion_mode
+        }
         function emit(shape, latency_us, throughput, iterations, elapsed) {
-            printf "%s,%s,%s,%s,%.3f,%.3f,%s,%s,%s\n", run, browser, server, shape, latency_us, throughput, iterations, elapsed, source
+            serialization = serialization_mode(shape)
+            printf "%s,%s,%s,%s,%.3f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                run, browser, server, shape, latency_us, throughput, iterations, elapsed, source, \
+                transport_security_mode(), certificate_verification_mode(), payload_profile, encoded_request_bytes, encoded_response_bytes, \
+                serialization, metadata_profile, handshake_inclusion_mode, batching_settings, labels(shape)
         }
         function emit_unsupported(shape) {
-            printf "%s,%s,%s,%s,N/A,N/A,N/A,N/A,%s\n", run, browser, server, shape, source
+            serialization = serialization_mode(shape)
+            printf "%s,%s,%s,%s,N/A,N/A,N/A,N/A,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                run, browser, server, shape, source, transport_security_mode(), certificate_verification_mode(), payload_profile, \
+                encoded_request_bytes, encoded_response_bytes, serialization, metadata_profile, handshake_inclusion_mode, batching_settings, labels(shape)
         }
         match($0, /^([^:]+):[[:space:]]+([0-9.]+) us\/op \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
             latency_us = m[2] + 0
@@ -187,7 +236,7 @@ aggregate_samples_csv() {
             return (a[n / 2] + a[n / 2 + 1]) / 2
         }
         BEGIN {
-            print "browser,server,shape,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_per_measurement,elapsed_s_total,source"
+            print "browser,server,shape,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_per_measurement,elapsed_s_total,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels"
         }
         NR == 1 {
             next
@@ -201,6 +250,16 @@ aggregate_samples_csv() {
                 server[key] = $3
                 shape[key] = $4
                 source[key] = $9
+                transport_security_mode[key] = $10
+                certificate_verification_mode[key] = $11
+                payload_profile[key] = $12
+                encoded_request_bytes[key] = $13
+                encoded_response_bytes[key] = $14
+                serialization_mode[key] = $15
+                metadata_profile[key] = $16
+                handshake_inclusion_mode[key] = $17
+                batching_settings[key] = $18
+                labels[key] = $19
             }
             measurements[key]++
             if ($5 == "N/A" || $6 == "N/A") {
@@ -228,17 +287,26 @@ aggregate_samples_csv() {
             for (i = 1; i <= order_count; i++) {
                 key = order[i]
                 if (unsupported[key] && latencies[key] == "") {
-                    printf "%s,%s,%s,%d,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,%s\n", \
-                        browser[key], server[key], shape[key], measurements[key], source[key]
+                    printf "%s,%s,%s,%d,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                        browser[key], server[key], shape[key], measurements[key], source[key], \
+                        transport_security_mode[key], certificate_verification_mode[key], payload_profile[key], encoded_request_bytes[key], encoded_response_bytes[key], serialization_mode[key], metadata_profile[key], handshake_inclusion_mode[key], batching_settings[key], labels[key]
                     continue
                 }
                 latency = median(latencies[key])
                 throughput = median(throughputs[key])
-                printf "%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.3f,%s\n", \
-                    browser[key], server[key], shape[key], measurements[key], latency, latency_min[key], latency_max[key], throughput, throughput_min[key], throughput_max[key], median(iterations[key]), elapsed_total[key], source[key]
+                printf "%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                    browser[key], server[key], shape[key], measurements[key], latency, latency_min[key], latency_max[key], throughput, throughput_min[key], throughput_max[key], median(iterations[key]), elapsed_total[key], source[key], \
+                    transport_security_mode[key], certificate_verification_mode[key], payload_profile[key], encoded_request_bytes[key], encoded_response_bytes[key], serialization_mode[key], metadata_profile[key], handshake_inclusion_mode[key], batching_settings[key], labels[key]
             }
         }
     ' "$SAMPLES_CSV" >"$CSV"
+}
+
+assert_no_plaintext_rows() {
+    if awk -F, 'NR > 1 && $14 == "plaintext" { found = 1; exit } END { exit found ? 0 : 1 }' "$CSV"; then
+        printf 'WebTransport comparison emitted plaintext rows in %s\n' "$CSV" >&2
+        exit 2
+    fi
 }
 
 write_markdown_report() {
@@ -274,6 +342,26 @@ Generated by \`bench/run_webtransport.sh\`: $generated_at
 | Go ConnectRPC included | \`$RUN_GO_CONNECT\` |
 | Rust server included | \`$RUN_RUST\` |
 | JS server included | \`$RUN_JS\` |
+| ConnectRPC scheme | \`https\` |
+| Payload profile | \`$PAYLOAD_PROFILE\` |
+| Approx encoded request bytes | \`$ENCODED_REQUEST_BYTES\` |
+| Approx encoded response bytes | \`$ENCODED_RESPONSE_BYTES\` |
+| Serialization mode | \`$SERIALIZATION_MODE\` |
+| Metadata profile | \`$METADATA_PROFILE\` |
+| Handshake inclusion mode | \`$HANDSHAKE_INCLUSION_MODE\` |
+| Batching settings | \`$WEBTRANSPORT_BATCHING_SETTINGS\` |
+
+## Security and payload model
+
+| Field | Value |
+| --- | --- |
+| Transport security mode | WebTransport rows and ConnectRPC baseline rows are encrypted |
+| Certificate verification mode | WebTransport rows pin the generated server certificate hash through browser WebTransport APIs; HTTPS ConnectRPC rows use a benchmark-only browser context with certificate verification skipped and are labeled \`tls-skip-verify\` |
+| Payload profile | \`$PAYLOAD_PROFILE\`; default request/reply text is \`TrevRPC benchmark\` |
+| Serialization mode | \`$SERIALIZATION_MODE\`; rows serialize and deserialize protobuf messages per operation/message |
+| Metadata profile | \`$METADATA_PROFILE\` |
+| Handshake inclusion mode | \`$HANDSHAKE_INCLUSION_MODE\`; clients connect and warm before timed samples |
+| Batching settings | \`$WEBTRANSPORT_BATCHING_SETTINGS\` |
 
 ## Environment
 
@@ -499,7 +587,7 @@ Each sample uses one browser WebTransport session per server. Latency rows measu
 
 Within the WebTransport tables, Go / \`quic-go\` is the quic-go HTTP/3 WebTransport server path. C / \`msquic\` and JS / \`msquic\` use the native MsQuic-backed WebTransport stack and are reported separately because browser interoperability can differ from the quic-go path.
 
-Rows with framework \`connectRPC\` benchmark browser Fetch over HTTP against the Go ConnectRPC server. ConnectRPC does not support client-streaming or bidirectional-streaming RPCs from browsers, so those rows are reported as \`N/A\`.
+Rows with framework \`connectRPC\` benchmark browser Fetch over HTTPS against the Go ConnectRPC server. ConnectRPC does not support client-streaming or bidirectional-streaming RPCs from browsers, so those rows are reported as \`N/A\`.
 
 Latency tables are sorted by median latency ascending. Throughput tables are sorted by median message throughput descending.
 
@@ -623,7 +711,7 @@ run_webtransport_sample() {
 }
 
 build_prerequisites() {
-    if [[ "$RUN_C" == "1" || "$RUN_GO" == "1" || "$RUN_JS" == "1" ]]; then
+    if [[ "$RUN_C" == "1" || "$RUN_GO" == "1" || "$RUN_JS" == "1" || "$RUN_GO_CONNECT" == "1" ]]; then
         # Browser WebTransport rejects expired certificate hashes; force a fresh short-lived cert.
         rm -f "$CMAKE_BUILD_DIR/msquic-test-cert.pem" "$CMAKE_BUILD_DIR/msquic-test-key.pem"
         run_and_capture c-configure cmake -S trevrpc-c -B "$CMAKE_BUILD_DIR" -DTREVRPC_BUILD_TESTS=OFF -DTREVRPC_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
@@ -657,7 +745,7 @@ run_browser_against_connect_server() {
     local port=$3
     local run
     for ((run = 1; run <= WEBTRANSPORT_RUNS; run++)); do
-        run_webtransport_sample "connect-$raw_prefix-run-$run" "$run" chrome "$server" playwright-chromium node trevrpc-js/bench/webtransport_browser.js --connect "$STATIC_URL" "http://127.0.0.1:$port" "$WEBTRANSPORT_ITERATIONS"
+        run_webtransport_sample "connect-$raw_prefix-run-$run" "$run" chrome "$server" playwright-chromium env TREVRPC_CONNECT_INSECURE_SKIP_VERIFY=1 node trevrpc-js/bench/webtransport_browser.js --connect "$STATIC_URL" "https://127.0.0.1:$port" "$WEBTRANSPORT_ITERATIONS"
     done
 }
 
@@ -700,7 +788,7 @@ run_webtransport_benchmarks() {
     fi
 
     if [[ "$RUN_GO_CONNECT" == "1" ]]; then
-        start_server connect-go-server "$GO_SPLIT_BENCH" -mode server -transport connect -addr 127.0.0.1:0 -origin "$STATIC_ORIGIN"
+        start_server connect-go-server "$GO_SPLIT_BENCH" -mode server -transport connect -addr 127.0.0.1:0 -origin "$STATIC_ORIGIN" -cert "$cert_file" -key "$key_file"
         port=$START_SERVER_PORT
         run_browser_against_connect_server go-connect go_connect "$port"
         stop_rpc_servers
@@ -716,6 +804,7 @@ if [[ "$REPORT_ONLY" == "0" ]]; then
 fi
 
 aggregate_samples_csv
+assert_no_plaintext_rows
 write_markdown_report
 
 printf '\nWrote WebTransport CSV: %s\n' "$CSV"

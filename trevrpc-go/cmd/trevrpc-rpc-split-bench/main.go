@@ -20,7 +20,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
 )
@@ -71,7 +71,7 @@ func runClient(transportName, addr, certFile string, iterations int) error {
 		return fmt.Errorf("iterations must be positive")
 	}
 	if transportName == "grpc" {
-		return runGRPCClient(addr, iterations)
+		return runGRPCClient(addr, certFile, iterations)
 	}
 
 	ctx := context.Background()
@@ -129,10 +129,10 @@ func runClient(transportName, addr, certFile string, iterations int) error {
 
 func runServer(transportName, addr, certFile, keyFile, origin string) error {
 	if transportName == "grpc" {
-		return runGRPCServer(addr)
+		return runGRPCServer(addr, certFile, keyFile)
 	}
 	if transportName == "connect" {
-		return runConnectServer(addr, origin)
+		return runConnectServer(addr, origin, certFile, keyFile)
 	}
 	server := trevrpc.NewServer()
 	options := server.Options()
@@ -169,12 +169,15 @@ func runServer(transportName, addr, certFile, keyFile, origin string) error {
 	return nil
 }
 
-func runConnectServer(addr, origin string) error {
+func runConnectServer(addr, origin, certFile, keyFile string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
+	if certFile == "" || keyFile == "" {
+		return errors.New("connect server requires -cert and -key")
+	}
 
 	mux := http.NewServeMux()
 	codec := connect.WithCodec(trevRPCProtoCodec{})
@@ -202,12 +205,15 @@ func runConnectServer(addr, origin string) error {
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- server.Serve(listener)
+		serveDone <- server.ServeTLS(listener, certFile, keyFile)
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	fmt.Printf("PORT %d\n", portFromAddr(listener.Addr()))
+	if certFile != "" {
+		fmt.Printf("CERT %s\n", certFile)
+	}
 
 	select {
 	case err := <-serveDone:
@@ -281,9 +287,13 @@ func withBenchmarkCORS(handler http.Handler, origin string) http.Handler {
 	})
 }
 
-func runGRPCClient(addr string, iterations int) error {
+func runGRPCClient(addr, certFile string, iterations int) error {
 	ctx := context.Background()
-	conn, err := grpc.NewClient("passthrough:///"+addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	transportCredentials, err := grpcClientTransportCredentials(certFile)
+	if err != nil {
+		return err
+	}
+	conn, err := grpc.NewClient("passthrough:///"+addr, grpc.WithTransportCredentials(transportCredentials))
 	if err != nil {
 		return err
 	}
@@ -334,14 +344,21 @@ func runGRPCClient(addr string, iterations int) error {
 	})
 }
 
-func runGRPCServer(addr string) error {
+func runGRPCServer(addr, certFile, keyFile string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
+	if certFile == "" || keyFile == "" {
+		return errors.New("gRPC server requires -cert and -key")
+	}
 
-	server := grpc.NewServer()
+	transportCredentials, err := credentials.NewServerTLSFromFile(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	server := grpc.NewServer(grpc.Creds(transportCredentials))
 	registerGRPCGreeterServer(server, grpcSplitGreeter{})
 
 	serveDone := make(chan error, 1)
@@ -352,6 +369,9 @@ func runGRPCServer(addr string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	fmt.Printf("PORT %d\n", portFromAddr(listener.Addr()))
+	if certFile != "" {
+		fmt.Printf("CERT %s\n", certFile)
+	}
 
 	select {
 	case err := <-serveDone:
@@ -372,6 +392,13 @@ func runGRPCServer(addr string) error {
 	case <-time.After(shutdownTimeout):
 		return errors.New("timed out waiting for gRPC server shutdown")
 	}
+}
+
+func grpcClientTransportCredentials(certFile string) (credentials.TransportCredentials, error) {
+	if certFile == "" {
+		return nil, errors.New("gRPC client requires -cert")
+	}
+	return credentials.NewClientTLSFromFile(certFile, "localhost")
 }
 
 func dialTransport(ctx context.Context, transportName, addr, certFile string) (trevrpc.ClientTransport, error) {

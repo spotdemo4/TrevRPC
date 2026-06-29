@@ -35,6 +35,14 @@ RUN_JS_NATIVE=${RUN_JS_NATIVE:-1}
 RUN_RUST_QUINN=${RUN_RUST_QUINN:-1}
 RUN_RUST_GRPC=${RUN_RUST_GRPC:-1}
 
+PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-tiny}
+ENCODED_REQUEST_BYTES=${ENCODED_REQUEST_BYTES:-19}
+ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-19}
+METADATA_PROFILE=${METADATA_PROFILE:-none}
+HANDSHAKE_INCLUSION_MODE=${HANDSHAKE_INCLUSION_MODE:-steady-state-warmed}
+SPLIT_BATCHING_SETTINGS=${SPLIT_BATCHING_SETTINGS:-js-send-many-batch=${TREVRPC_JS_SEND_MANY_BATCH:-16};grpc-batching=library-default}
+SERIALIZATION_MODE=per-message-serialized
+
 GO_SPLIT_BENCH="$OUT_DIR_ABS/trevrpc-go-rpc-split-bench"
 RUST_SPLIT_BENCH="$ROOT/trevrpc-rust/target/release/examples/rpc_split_bench"
 
@@ -63,6 +71,8 @@ Environment knobs:
   RUN_JS_NATIVE           Include native JS MsQuic transport. Default: 1
   RUN_RUST_QUINN          Include Rust Quinn transport. Default: 1
   RUN_RUST_GRPC           Include Rust tonic gRPC TCP baseline. Default: 1
+  PAYLOAD_PROFILE         Reported payload profile. Default: tiny
+  METADATA_PROFILE        Reported metadata profile. Default: none
 
 Examples:
   bench/run_rpc_split.sh
@@ -92,7 +102,7 @@ initialize_output() {
     mkdir -p "$RAW_DIR"
     : >"$COMMAND_LOG"
     rm -f "$RAW_DIR"/*.txt
-    printf 'axis,run,client,server,shape,latency_us,throughput_per_s,iterations,elapsed_s,source\n' >"$SAMPLES_CSV"
+    printf 'axis,run,client,server,shape,latency_us,throughput_per_s,iterations,elapsed_s,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels\n' >"$SAMPLES_CSV"
     printf 'axis,run,client,server,source,status,raw_file\n' >"$FAILURES_CSV"
 }
 
@@ -143,9 +153,38 @@ append_split_csv() {
     local client=$4
     local server=$5
     local source=$6
-    awk -v axis="$axis" -v run="$run" -v client="$client" -v server="$server" -v source="$source" -F '' '
+    awk -v axis="$axis" -v run="$run" -v client="$client" -v server="$server" -v source="$source" \
+        -v payload_profile="$PAYLOAD_PROFILE" \
+        -v encoded_request_bytes="$ENCODED_REQUEST_BYTES" \
+        -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
+        -v metadata_profile="$METADATA_PROFILE" \
+        -v handshake_inclusion_mode="$HANDSHAKE_INCLUSION_MODE" \
+        -v batching_settings="$SPLIT_BATCHING_SETTINGS" -F '' '
+        function transport_security_mode() {
+            return "encrypted"
+        }
+        function certificate_verification_mode() {
+            if (axis == "grpc") {
+                return "tls-pinned"
+            }
+            return "tls-skip-verify"
+        }
+        function serialization_mode(shape) {
+            shape = shape
+            return "per-message-serialized"
+        }
+        function labels(shape,    security, cert, serialization) {
+            security = transport_security_mode()
+            cert = certificate_verification_mode()
+            serialization = serialization_mode(shape)
+            return security ";" cert ";" payload_profile ";" serialization ";" metadata_profile ";" handshake_inclusion_mode
+        }
         function emit(shape, latency_us, throughput, iterations, elapsed) {
-            printf "%s,%s,%s,%s,%s,%.3f,%.3f,%s,%s,%s\n", axis, run, client, server, shape, latency_us, throughput, iterations, elapsed, source
+            serialization = serialization_mode(shape)
+            printf "%s,%s,%s,%s,%s,%.3f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                axis, run, client, server, shape, latency_us, throughput, iterations, elapsed, source, \
+                transport_security_mode(), certificate_verification_mode(), payload_profile, encoded_request_bytes, encoded_response_bytes, \
+                serialization, metadata_profile, handshake_inclusion_mode, batching_settings, labels(shape)
         }
         match($0, /^([^:]+):[[:space:]]+([0-9.]+) us\/op \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
             latency_us = m[2] + 0
@@ -177,7 +216,7 @@ aggregate_samples_csv() {
             return (a[n / 2] + a[n / 2 + 1]) / 2
         }
         BEGIN {
-            print "axis,client,server,shape,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_per_measurement,elapsed_s_total,source"
+            print "axis,client,server,shape,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_per_measurement,elapsed_s_total,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels"
         }
         NR == 1 {
             next
@@ -192,6 +231,16 @@ aggregate_samples_csv() {
                 server[key] = $4
                 shape[key] = $5
                 source[key] = $10
+                transport_security_mode[key] = $11
+                certificate_verification_mode[key] = $12
+                payload_profile[key] = $13
+                encoded_request_bytes[key] = $14
+                encoded_response_bytes[key] = $15
+                serialization_mode[key] = $16
+                metadata_profile[key] = $17
+                handshake_inclusion_mode[key] = $18
+                batching_settings[key] = $19
+                labels[key] = $20
             }
             measurements[key]++
             latencies[key] = append(latencies[key], $6)
@@ -216,11 +265,19 @@ aggregate_samples_csv() {
                 key = order[i]
                 latency = median(latencies[key])
                 throughput = median(throughputs[key])
-                printf "%s,%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.3f,%s\n", \
-                    axis[key], client[key], server[key], shape[key], measurements[key], latency, latency_min[key], latency_max[key], throughput, throughput_min[key], throughput_max[key], median(iterations[key]), elapsed_total[key], source[key]
+                printf "%s,%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                    axis[key], client[key], server[key], shape[key], measurements[key], latency, latency_min[key], latency_max[key], throughput, throughput_min[key], throughput_max[key], median(iterations[key]), elapsed_total[key], source[key], \
+                    transport_security_mode[key], certificate_verification_mode[key], payload_profile[key], encoded_request_bytes[key], encoded_response_bytes[key], serialization_mode[key], metadata_profile[key], handshake_inclusion_mode[key], batching_settings[key], labels[key]
             }
         }
     ' "$SAMPLES_CSV" >"$CSV"
+}
+
+assert_no_plaintext_rows() {
+    if awk -F, 'NR > 1 && $15 == "plaintext" { found = 1; exit } END { exit found ? 0 : 1 }' "$CSV"; then
+        printf 'split comparison emitted plaintext rows in %s\n' "$CSV" >&2
+        exit 2
+    fi
 }
 
 write_markdown_report() {
@@ -249,6 +306,27 @@ Generated by \`bench/run_rpc_split.sh\`: $generated_at
 | Server axis included | \`$RUN_SERVER_AXIS\` |
 | Go gRPC included | \`$RUN_GO_GRPC\` |
 | Rust gRPC included | \`$RUN_RUST_GRPC\` |
+| Go gRPC TLS | \`enabled\` |
+| Rust tonic TLS | \`enabled\` |
+| Payload profile | \`$PAYLOAD_PROFILE\` |
+| Approx encoded request bytes | \`$ENCODED_REQUEST_BYTES\` |
+| Approx encoded response bytes | \`$ENCODED_RESPONSE_BYTES\` |
+| Serialization mode | \`$SERIALIZATION_MODE\` |
+| Metadata profile | \`$METADATA_PROFILE\` |
+| Handshake inclusion mode | \`$HANDSHAKE_INCLUSION_MODE\` |
+| Batching settings | \`$SPLIT_BATCHING_SETTINGS\` |
+
+## Security and payload model
+
+| Field | Value |
+| --- | --- |
+| Transport security mode | trevRPC QUIC rows and gRPC baseline rows are encrypted |
+| Certificate verification mode | gRPC TLS rows use the generated local certificate as a pinned trust root with hostname verification; trevRPC QUIC split rows use local self-signed certificates with certificate verification skipped in the benchmark clients |
+| Payload profile | \`$PAYLOAD_PROFILE\` protobuf message with one string field; default request/reply text is \`TrevRPC benchmark\` |
+| Serialization mode | \`$SERIALIZATION_MODE\`; rows serialize and deserialize protobuf messages per operation/message |
+| Metadata profile | \`$METADATA_PROFILE\` |
+| Handshake inclusion mode | \`$HANDSHAKE_INCLUSION_MODE\`; clients connect and warm before timed samples |
+| Batching settings | \`$SPLIT_BATCHING_SETTINGS\` |
 
 ## Environment
 
@@ -451,7 +529,7 @@ Latency rows measure one RPC operation. Stream latency rows use one request and 
 
 Latency tables are sorted by median latency ascending. Throughput tables are sorted by median message throughput descending.
 
-Rows with framework \`gRPC\` benchmark gRPC clients and servers split into separate processes over TCP. They are included in both client and server tables as baselines only and are not transport-compatible with the TrevRPC transport rows.
+Rows with framework \`gRPC\` benchmark gRPC clients and servers split into separate processes over TCP with TLS when the corresponding TLS setting is enabled. They are included in both client and server tables as baselines only and are not transport-compatible with the TrevRPC transport rows.
 
 Raw command output is saved under \`$RAW_DIR\`. Per-measurement normalized rows are saved in \`$SAMPLES_CSV\`. The exact commands are saved in \`$COMMAND_LOG\`.
 EOF
@@ -526,6 +604,7 @@ run_split_sample() {
 }
 
 build_prerequisites() {
+    rm -f "$CMAKE_BUILD_DIR/msquic-test-cert.pem" "$CMAKE_BUILD_DIR/msquic-test-key.pem"
     run_and_capture c-configure cmake -S trevrpc-c -B "$CMAKE_BUILD_DIR" -DTREVRPC_BUILD_TESTS=OFF -DTREVRPC_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
     run_and_capture c-build cmake --build "$CMAKE_BUILD_DIR" --target trevrpc_rpc_comparison_bench
 
@@ -611,21 +690,23 @@ run_server_axis() {
 
 run_grpc_axis() {
     local run
+    local cert_file="$CMAKE_BUILD_DIR/msquic-test-cert.pem"
+    local key_file="$CMAKE_BUILD_DIR/msquic-test-key.pem"
 
     if [[ "$RUN_GO_GRPC" == "1" ]]; then
-        start_server grpc-go-server "$GO_SPLIT_BENCH" -mode server -transport grpc -addr 127.0.0.1:0
+        start_server grpc-go-server "$GO_SPLIT_BENCH" -mode server -transport grpc -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
         local port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "grpc-go-run-$run" "$run" grpc grpc_go grpc_go go-custom "$GO_SPLIT_BENCH" -mode client -transport grpc -addr "127.0.0.1:$port" -iterations "$GO_ITERATIONS"
+            run_split_sample "grpc-go-run-$run" "$run" grpc grpc_go grpc_go go-custom "$GO_SPLIT_BENCH" -mode client -transport grpc -cert "$cert_file" -addr "127.0.0.1:$port" -iterations "$GO_ITERATIONS"
         done
         stop_servers
     fi
 
     if [[ "$RUN_RUST_GRPC" == "1" ]]; then
-        start_server grpc-rust-tonic-server "$RUST_SPLIT_BENCH" grpc-server 127.0.0.1:0
+        start_server grpc-rust-tonic-server "$RUST_SPLIT_BENCH" grpc-server 127.0.0.1:0 "$cert_file" "$key_file"
         local port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "grpc-rust-tonic-run-$run" "$run" grpc rust_tonic rust_tonic rust-custom "$RUST_SPLIT_BENCH" grpc-client "127.0.0.1:$port" "$RUST_ITERATIONS"
+            run_split_sample "grpc-rust-tonic-run-$run" "$run" grpc rust_tonic rust_tonic rust-custom "$RUST_SPLIT_BENCH" grpc-client "127.0.0.1:$port" "$cert_file" "$RUST_ITERATIONS"
         done
         stop_servers
     fi
@@ -648,6 +729,7 @@ if [[ "$REPORT_ONLY" == "0" ]]; then
 fi
 
 aggregate_samples_csv
+assert_no_plaintext_rows
 write_markdown_report
 
 printf '\nWrote split CSV: %s\n' "$CSV"

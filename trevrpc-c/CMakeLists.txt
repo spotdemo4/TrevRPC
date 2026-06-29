@@ -230,7 +230,7 @@ if(trevrpc_needs_generated_bindings)
         set(trevrpc_msquic_test_key "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-key.pem")
         add_custom_command(
             OUTPUT "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}"
-            COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -keyout "${trevrpc_msquic_test_key}" -out "${trevrpc_msquic_test_cert}"
+            COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=critical,digitalSignature" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" -keyout "${trevrpc_msquic_test_key}" -out "${trevrpc_msquic_test_cert}"
             VERBATIM
         )
         add_custom_target(trevrpc_msquic_test_certificates DEPENDS "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}")

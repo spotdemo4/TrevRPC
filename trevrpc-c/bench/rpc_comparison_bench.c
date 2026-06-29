@@ -32,7 +32,6 @@
 #define BENCHMARK_METHOD_LOTS_OF_REPLIES "LotsOfReplies"
 #define BENCHMARK_METHOD_LOTS_OF_GREETINGS "LotsOfGreetings"
 #define BENCHMARK_METHOD_BIDI_HELLO "BidiHello"
-#define BENCHMARK_MESSAGE_BATCH 32u
 
 int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port);
 
@@ -61,8 +60,7 @@ typedef struct split_benchmark_case {
 typedef struct long_lived_sender_args {
     trevrpc_stream* stream;
     size_t count;
-    const uint8_t* body;
-    size_t body_len;
+    bool split_mode;
     int result;
 } long_lived_sender_args;
 
@@ -72,6 +70,8 @@ static volatile sig_atomic_t split_server_stop_requested;
 
 static int start_benchmark_server(benchmark_fixture* fixture);
 static Hello__V1__HelloRequest benchmark_request(void);
+static int split_stream_send_reply(trevrpc_stream* stream, const char* message);
+static int split_send_benchmark_request_messages(trevrpc_stream* stream, size_t count);
 
 #define CHECK(condition)                                                                                               \
     do {                                                                                                               \
@@ -177,49 +177,14 @@ static int benchmark_count_request_body(size_t count, uint8_t** out_body, size_t
     return pack_message((const ProtobufCMessage*)&request, out_body, out_body_len);
 }
 
-static int send_repeated_body_batches(trevrpc_stream* stream, const uint8_t* body, size_t body_len, size_t count) {
-    if (count == 0) {
-        return 0;
-    }
-
-    size_t batch_count = count < BENCHMARK_MESSAGE_BATCH ? count : BENCHMARK_MESSAGE_BATCH;
-    if (body_len > 0 && batch_count > SIZE_MAX / body_len) {
-        return -EOVERFLOW;
-    }
-
-    size_t body_lens[BENCHMARK_MESSAGE_BATCH];
-    uint8_t* bodies = NULL;
-    if (body_len > 0) {
-        bodies = malloc(body_len * batch_count);
-        if (bodies == NULL) {
-            return -ENOMEM;
-        }
-        for (size_t i = 0; i < batch_count; i++) {
-            memcpy(bodies + i * body_len, body, body_len);
-            body_lens[i] = body_len;
-        }
-    } else {
-        for (size_t i = 0; i < batch_count; i++) {
-            body_lens[i] = 0;
-        }
-    }
-
-    int err = 0;
-    size_t sent = 0;
-    while (sent < count) {
-        size_t n = count - sent;
-        if (n > batch_count) {
-            n = batch_count;
-        }
-        err = trevrpc_stream_send_messages(stream, bodies, body_lens, n);
+static int split_stream_send_reply_messages(trevrpc_stream* stream, const char* message, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int err = split_stream_send_reply(stream, message);
         if (err != 0) {
-            break;
+            return err;
         }
-        sent += n;
     }
-
-    free(bodies);
-    return err;
+    return 0;
 }
 
 static int split_response_set_reply(trevrpc_response* response, const char* message) {
@@ -251,17 +216,7 @@ static int split_stream_send_reply(trevrpc_stream* stream, const char* message) 
 }
 
 static int split_stream_send_replies(trevrpc_stream* stream, const char* message, size_t count) {
-    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
-    reply.message = (char*)message;
-
-    uint8_t* body = NULL;
-    size_t body_len = 0;
-    int err = pack_message((const ProtobufCMessage*)&reply, &body, &body_len);
-    if (err == 0) {
-        err = send_repeated_body_batches(stream, body, body_len, count);
-    }
-    free(body);
-    return err;
+    return split_stream_send_reply_messages(stream, message, count);
 }
 
 static int split_decode_request(const uint8_t* body, size_t body_len, Hello__V1__HelloRequest** out_request) {
@@ -440,14 +395,13 @@ static int bench_lots_of_replies(void* user_data,
     size_t count = benchmark_message_count_from_name(request == NULL ? NULL : request->name);
     Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
     reply.message = "server stream";
-    uint8_t* body = NULL;
-    size_t body_len = 0;
-    int err = pack_message((const ProtobufCMessage*)&reply, &body, &body_len);
-    if (err == 0) {
-        err = send_repeated_body_batches(stream, body, body_len, count);
+    for (size_t i = 0; i < count; i++) {
+        int err = hello_v1_greeter_send_hello_v1_hello_reply(stream, &reply);
+        if (err != 0) {
+            return err;
+        }
     }
-    free(body);
-    return err;
+    return 0;
 }
 
 static int bench_lots_of_greetings(
@@ -610,14 +564,18 @@ static int send_benchmark_request(trevrpc_stream* stream) {
     return hello_v1_greeter_send_hello_v1_hello_request(stream, &request);
 }
 
-static int send_benchmark_requests(trevrpc_stream* stream, size_t count) {
-    uint8_t* body = NULL;
-    size_t body_len = 0;
-    int err = benchmark_request_body(&body, &body_len);
-    if (err == 0) {
-        err = send_repeated_body_batches(stream, body, body_len, count);
+static int send_benchmark_request_messages(trevrpc_stream* stream, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int err = send_benchmark_request(stream);
+        if (err != 0) {
+            return err;
+        }
     }
-    free(body);
+    return 0;
+}
+
+static int send_benchmark_requests(trevrpc_stream* stream, size_t count) {
+    int err = send_benchmark_request_messages(stream, count);
     if (err != 0) {
         return err;
     }
@@ -702,7 +660,8 @@ static int benchmark_bidi_stream_latency(trevrpc_client* client) {
 
 static void* long_lived_sender_thread(void* arg) {
     long_lived_sender_args* args = arg;
-    args->result = send_repeated_body_batches(args->stream, args->body, args->body_len, args->count);
+    args->result = args->split_mode ? split_send_benchmark_request_messages(args->stream, args->count)
+                                    : send_benchmark_request_messages(args->stream, args->count);
     if (args->result != 0) {
         return NULL;
     }
@@ -743,15 +702,7 @@ static int benchmark_bidi_long_lived(trevrpc_client* client, size_t message_coun
         return err;
     }
 
-    uint8_t* body = NULL;
-    size_t body_len = 0;
-    err = benchmark_request_body(&body, &body_len);
-    if (err != 0) {
-        trevrpc_stream_close(stream);
-        return err;
-    }
-
-    long_lived_sender_args args = {.stream = stream, .count = message_count, .body = body, .body_len = body_len};
+    long_lived_sender_args args = {.stream = stream, .count = message_count, .split_mode = false};
     pthread_t sender;
     err = pthread_create(&sender, NULL, long_lived_sender_thread, &args);
     if (err == 0) {
@@ -764,7 +715,6 @@ static int benchmark_bidi_long_lived(trevrpc_client* client, size_t message_coun
         err = -err;
     }
 
-    free(body);
     trevrpc_stream_close(stream);
     return err;
 }
@@ -845,14 +795,18 @@ static int split_send_benchmark_request(trevrpc_stream* stream) {
     return err;
 }
 
-static int split_send_benchmark_requests(trevrpc_stream* stream, size_t count) {
-    uint8_t* body = NULL;
-    size_t body_len = 0;
-    int err = benchmark_request_body(&body, &body_len);
-    if (err == 0) {
-        err = send_repeated_body_batches(stream, body, body_len, count);
+static int split_send_benchmark_request_messages(trevrpc_stream* stream, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int err = split_send_benchmark_request(stream);
+        if (err != 0) {
+            return err;
+        }
     }
-    free(body);
+    return 0;
+}
+
+static int split_send_benchmark_requests(trevrpc_stream* stream, size_t count) {
+    int err = split_send_benchmark_request_messages(stream, count);
     if (err != 0) {
         return err;
     }
@@ -1015,15 +969,7 @@ static int split_benchmark_bidi_long_lived(trevrpc_client* client, size_t messag
         return err;
     }
 
-    uint8_t* body = NULL;
-    size_t body_len = 0;
-    err = benchmark_request_body(&body, &body_len);
-    if (err != 0) {
-        trevrpc_stream_close(stream);
-        return err;
-    }
-
-    long_lived_sender_args args = {.stream = stream, .count = message_count, .body = body, .body_len = body_len};
+    long_lived_sender_args args = {.stream = stream, .count = message_count, .split_mode = true};
     pthread_t sender;
     err = pthread_create(&sender, NULL, long_lived_sender_thread, &args);
     if (err == 0) {
@@ -1036,7 +982,6 @@ static int split_benchmark_bidi_long_lived(trevrpc_client* client, size_t messag
         err = -err;
     }
 
-    free(body);
     trevrpc_stream_close(stream);
     return err;
 }

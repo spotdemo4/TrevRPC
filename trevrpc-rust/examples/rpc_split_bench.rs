@@ -20,7 +20,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::body::Body as TonicBody;
 use tonic::codegen::{Body, BoxFuture, Bytes, Service, StdError, http};
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Channel, Endpoint, Server as GrpcServer};
+use tonic::transport::{
+    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server as GrpcServer,
+    ServerTlsConfig,
+};
 
 #[allow(dead_code)]
 #[path = "shared/greeter.rs"]
@@ -71,18 +74,18 @@ async fn main() -> BenchResult {
         }
         Some("grpc-client") => {
             let addr = required_arg(&mut args, "addr")?.parse::<SocketAddr>()?;
+            let cert = required_arg(&mut args, "cert")?;
             let iterations = required_arg(&mut args, "iterations")?.parse::<u32>()?;
-            run_grpc_client(addr, iterations).await
+            run_grpc_client(addr, Path::new(&cert), iterations).await
         }
         Some("grpc-server") => {
-            let addr = args
-                .next()
-                .unwrap_or_else(|| "127.0.0.1:0".to_owned())
-                .parse::<SocketAddr>()?;
-            run_grpc_server(addr).await
+            let addr = required_arg(&mut args, "addr")?.parse::<SocketAddr>()?;
+            let cert = required_arg(&mut args, "cert")?;
+            let key = required_arg(&mut args, "key")?;
+            run_grpc_server(addr, Path::new(&cert), Path::new(&key)).await
         }
         _ => Err(
-            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <iterations> | grpc-server [addr]\nset TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT=default to keep production stream idle timers in TrevRPC split rows"
+            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <cert> <iterations> | grpc-server <addr> <cert> <key>\nset TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT=default to keep production stream idle timers in TrevRPC split rows"
                 .into(),
         ),
     }
@@ -161,11 +164,11 @@ async fn run_webtransport_server(
     Ok(())
 }
 
-async fn run_grpc_client(addr: SocketAddr, iterations: u32) -> BenchResult {
+async fn run_grpc_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> BenchResult {
     if iterations == 0 {
         return Err("iterations must be positive".into());
     }
-    let mut client = GrpcGreeterClient::connect(addr).await?;
+    let mut client = GrpcGreeterClient::connect(addr, cert_path).await?;
 
     warm_grpc_client(&mut client).await?;
     let throughput_messages = usize::try_from(iterations)?;
@@ -209,11 +212,16 @@ async fn run_grpc_client(addr: SocketAddr, iterations: u32) -> BenchResult {
     Ok(())
 }
 
-async fn run_grpc_server(addr: SocketAddr) -> BenchResult {
+async fn run_grpc_server(addr: SocketAddr, cert_path: &Path, key_path: &Path) -> BenchResult {
+    let cert = fs::read(cert_path)?;
+    let key = fs::read(key_path)?;
+    let tls = ServerTlsConfig::new().identity(Identity::from_pem(cert, key));
     let incoming = TcpIncoming::bind(addr)?.with_nodelay(Some(true));
     let local_addr = incoming.local_addr()?;
     println!("PORT {}", local_addr.port());
+    println!("CERT {}", cert_path.display());
     GrpcServer::builder()
+        .tls_config(tls)?
         .add_service(GrpcGreeterServer::new(SplitGreeter))
         .serve_with_incoming_shutdown(incoming, shutdown_signal())
         .await?;
@@ -788,8 +796,14 @@ struct GrpcGreeterClient<T> {
 }
 
 impl GrpcGreeterClient<Channel> {
-    async fn connect(addr: SocketAddr) -> Result<Self, tonic::transport::Error> {
-        let endpoint = Endpoint::from_shared(format!("http://{addr}"))?.tcp_nodelay(true);
+    async fn connect(addr: SocketAddr, cert_path: &Path) -> BenchResult<Self> {
+        let cert = fs::read(cert_path)?;
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(cert))
+            .domain_name("localhost");
+        let endpoint = Endpoint::from_shared(format!("https://{addr}"))?
+            .tcp_nodelay(true)
+            .tls_config(tls)?;
         Ok(Self::new(endpoint.connect().await?))
     }
 }

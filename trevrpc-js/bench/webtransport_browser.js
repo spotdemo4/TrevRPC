@@ -19,6 +19,9 @@ const endpointURL = requiredArg(
   connectMode ? 4 : 3,
   connectMode ? "connect-url" : "webtransport-url",
 );
+if (connectMode && !endpointURL.startsWith("https://")) {
+  throw new Error("ConnectRPC benchmark endpoint must use https://");
+}
 const certFile = connectMode ? null : requiredArg(4, "cert-file");
 const iterations = positiveInteger(
   process.argv[connectMode ? 5 : 5] ?? process.env.WEBTRANSPORT_ITERATIONS ?? "1000",
@@ -30,6 +33,7 @@ const certificateSha256Base64 = certFile == null ? null : await certificateHash(
 const benchmarkConfig = benchmarkConfigFromEnv();
 
 let browser;
+let context;
 let page;
 const pageErrors = [];
 let shuttingDown = false;
@@ -51,7 +55,13 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 
 try {
   browser = await launchBrowser();
-  page = await browser.newPage();
+  context = await browser.newContext({
+    ignoreHTTPSErrors:
+      connectMode &&
+      endpointURL.startsWith("https://") &&
+      envFlag("TREVRPC_CONNECT_INSECURE_SKIP_VERIFY"),
+  });
+  page = await context.newPage();
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => {
     if (message.type() === "error") {
