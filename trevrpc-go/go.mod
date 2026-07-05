@@ -5,7 +5,7 @@ go 1.26
 require (
 	connectrpc.com/connect v1.20.0
 	github.com/quic-go/quic-go v0.60.0
-	github.com/quic-go/webtransport-go v0.11.0
+	github.com/quic-go/webtransport-go v0.11.1
 	google.golang.org/grpc v1.82.0
 	google.golang.org/protobuf v1.36.11
 )
