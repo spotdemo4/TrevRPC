@@ -123,6 +123,10 @@ type webTransportResponseStream struct {
 
 func (s *webTransportResponseStream) trevrpcContextCancelsRecv() bool { return true }
 
+func (s *webTransportResponseStream) SetReadDeadline(deadline time.Time) error {
+	return s.stream.SetReadDeadline(deadline)
+}
+
 func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
 	frame, _, err := s.trevrpcRecvStreamFrameFields()
 	if err != nil {

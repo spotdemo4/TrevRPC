@@ -1,9 +1,46 @@
 #include "trevrpc_wire_internal.h"
 
 #include <errno.h> // IWYU pragma: keep
+#include <stdatomic.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static atomic_int trevrpc_wire_trace_state = ATOMIC_VAR_INIT(0);
+
+static bool trevrpc_wire_trace_env_enabled(void) {
+    const char* value = getenv("TREVRPC_C_FRAME_TRACE");
+    return value != NULL && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+                                strcmp(value, "yes") == 0 || strcmp(value, "on") == 0);
+}
+
+static bool trevrpc_wire_should_trace(void) {
+    int state = atomic_load_explicit(&trevrpc_wire_trace_state, memory_order_acquire);
+    if (state == 0) {
+        int initialized = trevrpc_wire_trace_env_enabled() ? 2 : 1;
+        int expected = 0;
+        (void)atomic_compare_exchange_strong_explicit(
+            &trevrpc_wire_trace_state, &expected, initialized, memory_order_release, memory_order_relaxed);
+        state = atomic_load_explicit(&trevrpc_wire_trace_state, memory_order_acquire);
+    }
+    return state == 2;
+}
+
+static void trevrpc_wire_trace_frame(
+    const char* direction, const char* frame, uint32_t kind, uint32_t status, size_t body_len, size_t encoded_len) {
+    if (!trevrpc_wire_should_trace()) {
+        return;
+    }
+    (void)fprintf(stderr,
+        "trevrpc-c-frame direction=%s frame=%s kind=%u status=%u body_len=%zu encoded_len=%zu\n",
+        direction,
+        frame,
+        kind,
+        status,
+        body_len,
+        encoded_len);
+}
 
 static size_t trevrpc_wire_varint_len(uint64_t value) {
     size_t len = 1;
@@ -186,6 +223,7 @@ int trevrpc_wire_encode_request_view(const char* service,
     out = trevrpc_wire_append_varint_field(out, 6, version);
     out = trevrpc_wire_append_varint_field(out, 7, timeout_nanos);
     (void)out;
+    trevrpc_wire_trace_frame("tx", "RpcRequest", kind, TREVRPC_STATUS_OK, body_len, body_frame_len);
     return 0;
 }
 
@@ -213,6 +251,7 @@ int trevrpc_wire_encode_response(
     out = trevrpc_wire_append_bytes_field(out, 3, response->body, response->body_len);
     out = trevrpc_wire_append_metadata_field(out, 4, &response->metadata);
     (void)out;
+    trevrpc_wire_trace_frame("tx", "RpcResponse", 0, response->status, response->body_len, body_frame_len);
     return 0;
 }
 
@@ -249,6 +288,7 @@ int trevrpc_wire_encode_stream_frame(uint32_t kind,
     out = trevrpc_wire_append_bytes_field(out, 4, body, body_len);
     out = trevrpc_wire_append_metadata_field(out, 5, metadata);
     (void)out;
+    trevrpc_wire_trace_frame("tx", "RpcStreamFrame", kind, status, body_len, body_frame_len);
     return 0;
 }
 
@@ -495,6 +535,7 @@ int trevrpc_wire_decode_request(const uint8_t* data, size_t len, trevrpc_request
         return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_UNSUPPORTED_RPC_KIND);
     }
 
+    trevrpc_wire_trace_frame("rx", "RpcRequest", request->kind, TREVRPC_STATUS_OK, request->body_len, len);
     return 0;
 }
 
@@ -577,6 +618,7 @@ int trevrpc_wire_decode_response(const uint8_t* data, size_t len, trevrpc_respon
     }
 
     *out_response = response;
+    trevrpc_wire_trace_frame("rx", "RpcResponse", 0, response->status, response->body_len, len);
     return 0;
 }
 
@@ -671,6 +713,7 @@ int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_st
     }
 
     *out_frame = frame;
+    trevrpc_wire_trace_frame("rx", "RpcStreamFrame", frame->kind, frame->status, frame->body_len, len);
     return 0;
 }
 
@@ -688,6 +731,8 @@ int trevrpc_wire_decode_stream_frame_take(
     }
     if (matched) {
         *took_body = true;
+        trevrpc_wire_trace_frame(
+            "rx", "RpcStreamFrame", (*out_frame)->kind, (*out_frame)->status, (*out_frame)->body_len, len);
         return 0;
     }
 

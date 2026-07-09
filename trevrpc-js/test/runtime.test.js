@@ -113,6 +113,22 @@ test("browser root connect flattens browser WebTransport options", async () => {
   assert.deepEqual(observed.closeInfo, { closeCode: 0, reason: "done" });
 });
 
+test("browser WebTransport connect reports unsupported runtime", async () => {
+  await assert.rejects(
+    WebTransportClient.connect("https://example.test/trevrpc", { WebTransport: {} }),
+    (error) => error.code === Code.Unavailable,
+  );
+});
+
+test("browser WebTransport stream open reports unsupported bidirectional streams", async () => {
+  const client = new WebTransportClient({ ready: Promise.resolve() });
+
+  await assert.rejects(
+    client.openBidirectionalStream(),
+    (error) => error.code === Code.Unavailable,
+  );
+});
+
 test("package root connect uses native transport under Node", async () => {
   const directory = await mkdtemp(join(tmpdir(), "trevrpc-js-native-"));
   const fakeNativePath = join(directory, "fake-native.cjs");

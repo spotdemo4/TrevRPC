@@ -1,6 +1,7 @@
+use std::fmt;
 use std::future::{Future, pending};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use prost::Message;
@@ -21,6 +22,104 @@ use crate::{
 const CANCELLED_STREAM_CODE: u32 = 1;
 const MESSAGE_FRAME_BATCH: usize = 32;
 const FRAME_HEADER_LEN: u64 = 4;
+
+fn trace_quinn_event(event: &'static str, detail: &'static str) {
+    trace_quinn_frame_line(format_args!("event={event} detail={detail}"));
+    #[cfg(feature = "tracing")]
+    tracing::trace!(target: "trevrpc::quinn::frames", event, detail);
+}
+
+fn trace_tx_frame<M: Message>(encoded_len: usize) {
+    trace_quinn_frame_line(format_args!(
+        "direction=tx frame={} encoded_len={encoded_len}",
+        std::any::type_name::<M>()
+    ));
+    #[cfg(feature = "tracing")]
+    tracing::trace!(
+        target: "trevrpc::quinn::frames",
+        direction = "tx",
+        frame = std::any::type_name::<M>(),
+        encoded_len,
+    );
+}
+
+fn trace_rx_frame<M: Message>(encoded_len: usize) {
+    trace_quinn_frame_line(format_args!(
+        "direction=rx frame={} encoded_len={encoded_len}",
+        std::any::type_name::<M>()
+    ));
+    #[cfg(feature = "tracing")]
+    tracing::trace!(
+        target: "trevrpc::quinn::frames",
+        direction = "rx",
+        frame = std::any::type_name::<M>(),
+        encoded_len,
+    );
+}
+
+fn trace_tx_stream_message_frame(body_len: usize, batch_len: usize) {
+    trace_quinn_frame_line(format_args!(
+        "direction=tx frame=RpcStreamFrame kind=message body_len={body_len} batch_len={batch_len}"
+    ));
+    #[cfg(feature = "tracing")]
+    tracing::trace!(
+        target: "trevrpc::quinn::frames",
+        direction = "tx",
+        frame = "RpcStreamFrame",
+        kind = "message",
+        body_len,
+        batch_len,
+    );
+}
+
+fn trace_tx_stream_frame(frame: &RpcStreamFrame, encoded_len: usize) {
+    let frame_kind = frame.frame_kind();
+    let status = frame.status;
+    let body_len = frame.body.len();
+    trace_quinn_frame_line(format_args!(
+        "direction=tx frame=RpcStreamFrame kind={frame_kind:?} status={status} body_len={body_len} encoded_len={encoded_len}"
+    ));
+    #[cfg(feature = "tracing")]
+    tracing::trace!(
+        target: "trevrpc::quinn::frames",
+        direction = "tx",
+        frame = "RpcStreamFrame",
+        ?frame_kind,
+        status,
+        body_len,
+        encoded_len,
+    );
+}
+
+fn trace_rx_stream_frame(frame: &RpcStreamFrame, encoded_len: usize) {
+    let frame_kind = frame.frame_kind();
+    let status = frame.status;
+    let body_len = frame.body.len();
+    trace_quinn_frame_line(format_args!(
+        "direction=rx frame=RpcStreamFrame kind={frame_kind:?} status={status} body_len={body_len} encoded_len={encoded_len}"
+    ));
+    #[cfg(feature = "tracing")]
+    tracing::trace!(
+        target: "trevrpc::quinn::frames",
+        direction = "rx",
+        frame = "RpcStreamFrame",
+        ?frame_kind,
+        status,
+        body_len,
+        encoded_len,
+    );
+}
+
+fn trace_quinn_frame_line(args: fmt::Arguments<'_>) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("TREVRPC_RUST_QUINN_FRAME_TRACE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+    });
+    if enabled {
+        eprintln!("trevrpc-quinn-frame {args}");
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportLimits {
@@ -187,6 +286,7 @@ impl RpcTransport for Client {
 
         write_frame(streams.send_mut(), &request, self.max_frame_size).await?;
         streams.send_mut().finish().map_err(Error::transport)?;
+        trace_quinn_event("tx_fin", "client_unary_request");
 
         let response = read_frame(streams.recv_mut(), self.max_frame_size).await?;
         streams.complete();
@@ -269,10 +369,12 @@ impl Drop for CancellableBiStream {
         }
 
         if let Some(send) = &mut self.send {
+            trace_quinn_event("tx_reset", "cancellable_bistream_drop");
             let _ = send.reset(CANCELLED_STREAM_CODE.into());
         }
 
         if let Some(recv) = &mut self.recv {
+            trace_quinn_event("tx_stop_sending", "cancellable_bistream_drop");
             let _ = recv.stop(CANCELLED_STREAM_CODE.into());
         }
     }
@@ -309,6 +411,7 @@ impl Drop for CancellableSendStream {
         }
 
         if let Some(send) = &mut self.send {
+            trace_quinn_event("tx_reset", "cancellable_send_stream_drop");
             let _ = send.reset(CANCELLED_STREAM_CODE.into());
         }
     }
@@ -422,6 +525,7 @@ impl Drop for QuinnResponseStream {
         if !self.complete
             && let Some(recv) = &mut self.recv
         {
+            trace_quinn_event("tx_stop_sending", "response_stream_drop");
             let _ = recv.stop(CANCELLED_STREAM_CODE.into());
         }
 
@@ -441,6 +545,7 @@ where
     M: Message,
 {
     let frame = encode_frame_with_max(message, max_frame_size)?;
+    trace_tx_frame::<M>(frame.len());
     send.write_all(&frame).await.map_err(Error::transport)
 }
 
@@ -451,6 +556,7 @@ async fn write_message_stream_frame(
 ) -> Result<()> {
     let mut prefix = Vec::new();
     encode_message_stream_frame_prefix(body.len(), max_frame_size, &mut prefix)?;
+    trace_tx_stream_message_frame(body.len(), 1);
     if body.is_empty() {
         return send.write_all(&prefix).await.map_err(Error::transport);
     }
@@ -467,8 +573,10 @@ async fn write_message_stream_frames(
 ) -> Result<()> {
     let mut chunks = Vec::with_capacity(bodies.len().saturating_mul(2));
     let mut prefix = Vec::new();
+    let batch_len = bodies.len();
     for body in bodies.drain(..) {
         encode_message_stream_frame_prefix(body.len(), max_frame_size, &mut prefix)?;
+        trace_tx_stream_message_frame(body.len(), batch_len);
         chunks.push(Bytes::copy_from_slice(&prefix));
         if !body.is_empty() {
             chunks.push(Bytes::from(body));
@@ -488,6 +596,7 @@ async fn write_stream_frame(
     if is_plain_message_frame(&frame) {
         write_message_stream_frame(send, frame.body, max_frame_size).await
     } else {
+        trace_tx_stream_frame(&frame, frame.encoded_len());
         write_frame(send, &frame, max_frame_size).await
     }
 }
@@ -511,6 +620,7 @@ where
 
     let len = frame_body_len(header, max_frame_size)?;
     let body = read_body(recv, len).await?;
+    trace_rx_frame::<M>(len);
 
     decode_frame(&body)
 }
@@ -521,19 +631,24 @@ async fn read_stream_frame_or_eof(
 ) -> Result<Option<RpcStreamFrame>> {
     let mut header = [0; 4];
     if !read_exact_or_eof(recv, &mut header).await? {
+        trace_quinn_event("rx_fin", "stream_frame_header");
         return Ok(None);
     }
 
     let len = frame_body_len(header, max_frame_size)?;
     if len == 0 {
-        return Ok(Some(RpcStreamFrame::message(Vec::new())));
+        let frame = RpcStreamFrame::message(Vec::new());
+        trace_rx_stream_frame(&frame, len);
+        return Ok(Some(frame));
     }
 
     let mut prefix = [0_u8; 11];
     read_exact_body(recv, &mut prefix[..1]).await?;
     if prefix[0] != STREAM_FRAME_BODY_TAG {
         let body = read_body_with_prefix(recv, len, &prefix[..1]).await?;
-        return decode_stream_frame_body_owned(body).map(Some);
+        let frame = decode_stream_frame_body_owned(body)?;
+        trace_rx_stream_frame(&frame, len);
+        return Ok(Some(frame));
     }
 
     let mut value = 0_u64;
@@ -555,19 +670,22 @@ async fn read_stream_frame_or_eof(
                 ))
             })?;
             if prefix_len.checked_add(body_len) == Some(len) {
-                return read_body(recv, body_len)
-                    .await
-                    .map(RpcStreamFrame::message)
-                    .map(Some);
+                let frame = RpcStreamFrame::message(read_body(recv, body_len).await?);
+                trace_rx_stream_frame(&frame, len);
+                return Ok(Some(frame));
             }
 
             let body = read_body_with_prefix(recv, len, &prefix[..prefix_len]).await?;
-            return decode_stream_frame_body_owned(body).map(Some);
+            let frame = decode_stream_frame_body_owned(body)?;
+            trace_rx_stream_frame(&frame, len);
+            return Ok(Some(frame));
         }
     }
 
     let body = read_body_with_prefix(recv, len, &prefix[..prefix_len]).await?;
-    decode_stream_frame_body_owned(body).map(Some)
+    let frame = decode_stream_frame_body_owned(body)?;
+    trace_rx_stream_frame(&frame, len);
+    Ok(Some(frame))
 }
 
 async fn read_body(recv: &mut quinn::RecvStream, len: usize) -> Result<Vec<u8>> {
@@ -654,6 +772,7 @@ async fn write_streaming_request(
     write_request_body_frames(send.send_mut(), &mut request_body, max_frame_size).await?;
 
     send.send_mut().finish().map_err(Error::transport)?;
+    trace_quinn_event("tx_fin", "streaming_request");
     send.complete();
 
     Ok(())
@@ -668,6 +787,7 @@ async fn write_empty_streaming_request(
     write_frame(send.send_mut(), &request, max_frame_size).await?;
 
     send.send_mut().finish().map_err(Error::transport)?;
+    trace_quinn_event("tx_fin", "empty_streaming_request");
     send.complete();
 
     Ok(())
@@ -688,16 +808,27 @@ async fn write_request_body_frames(
     let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     loop {
         batch.clear();
+        let mut done = false;
         while batch.len() < MESSAGE_FRAME_BATCH {
+            if request_body.drain_ready(MESSAGE_FRAME_BATCH, &mut batch)? {
+                done = true;
+                break;
+            }
+            if batch.len() >= MESSAGE_FRAME_BATCH {
+                break;
+            }
             let Some(body) = request_body.next().await.transpose()? else {
-                if !batch.is_empty() {
-                    write_message_stream_frames(send, &mut batch, max_frame_size).await?;
-                }
-                return Ok(());
+                done = true;
+                break;
             };
             batch.push(body);
         }
-        write_message_stream_frames(send, &mut batch, max_frame_size).await?;
+        if !batch.is_empty() {
+            write_message_stream_frames(send, &mut batch, max_frame_size).await?;
+        }
+        if done {
+            return Ok(());
+        }
     }
 }
 
@@ -1019,6 +1150,7 @@ async fn handle_stream(
         .is_ok()
     {
         let _ = send.finish();
+        trace_quinn_event("tx_fin", "server_unary_response");
     }
 }
 
@@ -1136,6 +1268,7 @@ async fn handle_streaming_rpc(
     }
 
     let _ = send.finish();
+    trace_quinn_event("tx_fin", "server_streaming_response");
 }
 
 async fn write_rpc_status(
@@ -1152,6 +1285,7 @@ async fn write_rpc_status(
 
     if result.is_ok() {
         let _ = send.finish();
+        trace_quinn_event("tx_fin", "server_rpc_status");
     }
 }
 
@@ -1174,6 +1308,7 @@ impl QuinnRequestStream {
 impl Drop for QuinnRequestStream {
     fn drop(&mut self) {
         if !self.done {
+            trace_quinn_event("tx_stop_sending", "request_stream_drop");
             let _ = self.recv.stop(CANCELLED_STREAM_CODE.into());
         }
     }
@@ -1238,6 +1373,7 @@ async fn write_status(mut send: quinn::SendStream, status: Status, max_frame_siz
         .is_ok()
     {
         let _ = send.finish();
+        trace_quinn_event("tx_fin", "server_status");
     }
 }
 

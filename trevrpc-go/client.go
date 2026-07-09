@@ -572,6 +572,22 @@ func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout t
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
+	deadline, source, hasDeadline := responseReadDeadline(ctx, idleTimeout)
+	if deadlineStream, ok := stream.(readDeadlineStream); ok && (hasDeadline || streamContextCancelsRecv(stream)) {
+		if hasDeadline {
+			_ = deadlineStream.SetReadDeadline(deadline)
+			defer deadlineStream.SetReadDeadline(time.Time{})
+		}
+
+		frame, err := stream.Recv()
+		if err != nil {
+			if deadlineErr := responseReadDeadlineError(ctx, source, err); deadlineErr != nil {
+				return nil, deadlineErr
+			}
+		}
+
+		return frame, err
+	}
 	if idleTimeout <= 0 && (isNonBlockingStream(stream) || streamContextCancelsRecv(stream)) {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -645,6 +661,25 @@ func recvOptimizedFrameFieldsWithTimeout(ctx context.Context, stream responseStr
 	if err := ctx.Err(); err != nil {
 		return streamFrameFields{}, nil, statusFromContextError(err)
 	}
+	deadline, source, hasDeadline := responseReadDeadline(ctx, idleTimeout)
+	if deadlineStream, ok := stream.(readDeadlineStream); ok && (hasDeadline || contextCancelsRecv) {
+		if hasDeadline {
+			_ = deadlineStream.SetReadDeadline(deadline)
+			defer deadlineStream.SetReadDeadline(time.Time{})
+		}
+
+		frame, release, err := stream.trevrpcRecvStreamFrameFields()
+		if err != nil {
+			if deadlineErr := responseReadDeadlineError(ctx, source, err); deadlineErr != nil {
+				if release != nil {
+					release()
+				}
+				return streamFrameFields{}, nil, deadlineErr
+			}
+		}
+
+		return frame, release, err
+	}
 	if idleTimeout <= 0 && contextCancelsRecv {
 		frame, release, err := stream.trevrpcRecvStreamFrameFields()
 		if err != nil {
@@ -699,6 +734,49 @@ func recvOptimizedFrameFieldsWithTimeout(ctx context.Context, stream responseStr
 		}
 
 		return streamFrameFields{}, nil, Unavailable("response stream idle timeout")
+	}
+}
+
+type responseReadDeadlineSource uint8
+
+const (
+	responseReadDeadlineNone responseReadDeadlineSource = iota
+	responseReadDeadlineContext
+	responseReadDeadlineIdle
+)
+
+func responseReadDeadline(ctx context.Context, idleTimeout time.Duration) (time.Time, responseReadDeadlineSource, bool) {
+	var deadline time.Time
+	source := responseReadDeadlineNone
+	if contextDeadline, ok := ctx.Deadline(); ok {
+		deadline = contextDeadline
+		source = responseReadDeadlineContext
+	}
+	if idleTimeout > 0 {
+		idleDeadline := time.Now().Add(idleTimeout)
+		if source == responseReadDeadlineNone || idleDeadline.Before(deadline) {
+			deadline = idleDeadline
+			source = responseReadDeadlineIdle
+		}
+	}
+
+	return deadline, source, source != responseReadDeadlineNone
+}
+
+func responseReadDeadlineError(ctx context.Context, source responseReadDeadlineSource, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return statusFromContextError(ctxErr)
+	}
+	if !isTimeoutError(err) {
+		return nil
+	}
+	switch source {
+	case responseReadDeadlineContext:
+		return statusFromContextError(context.DeadlineExceeded)
+	case responseReadDeadlineIdle:
+		return Unavailable("response stream idle timeout")
+	default:
+		return nil
 	}
 }
 

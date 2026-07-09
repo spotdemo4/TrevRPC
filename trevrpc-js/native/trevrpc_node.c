@@ -1362,7 +1362,7 @@ static void native_call_release(native_call* call) {
     if (call->refs > 0) {
         call->refs--;
     }
-    if (!call->js_alive && call->completing && call->refs == 0 && call->call != NULL) {
+    if (call->completing && call->refs == 0 && call->call != NULL) {
         close_call = call->call;
         call->call = NULL;
     }

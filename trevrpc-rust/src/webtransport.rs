@@ -573,16 +573,27 @@ async fn write_request_body_frames(
     let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     loop {
         batch.clear();
+        let mut done = false;
         while batch.len() < MESSAGE_FRAME_BATCH {
+            if request_body.drain_ready(MESSAGE_FRAME_BATCH, &mut batch)? {
+                done = true;
+                break;
+            }
+            if batch.len() >= MESSAGE_FRAME_BATCH {
+                break;
+            }
             let Some(body) = request_body.next().await.transpose()? else {
-                if !batch.is_empty() {
-                    write_message_stream_frames(send, &mut batch, max_frame_size).await?;
-                }
-                return Ok(());
+                done = true;
+                break;
             };
             batch.push(body);
         }
-        write_message_stream_frames(send, &mut batch, max_frame_size).await?;
+        if !batch.is_empty() {
+            write_message_stream_frames(send, &mut batch, max_frame_size).await?;
+        }
+        if done {
+            return Ok(());
+        }
     }
 }
 

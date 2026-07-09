@@ -16,6 +16,16 @@ pub trait MessageStream<T>: Send {
     fn is_non_blocking(&self) -> bool {
         false
     }
+
+    /// Drains immediately ready items into `out` without awaiting one future per item.
+    ///
+    /// Returns `Ok(true)` when the stream is exhausted. The default implementation
+    /// drains nothing, preserving compatibility for streams backed by async work.
+    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
+        let _ = limit;
+        let _ = out;
+        Ok(false)
+    }
 }
 
 pub type BoxMessageStream<T> = Box<dyn MessageStream<T> + Send + 'static>;
@@ -43,6 +53,12 @@ where
 
     fn is_non_blocking(&self) -> bool {
         true
+    }
+
+    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
+        let _ = limit;
+        let _ = out;
+        Ok(true)
     }
 }
 
@@ -85,6 +101,19 @@ where
     fn is_non_blocking(&self) -> bool {
         self.first.is_some() || self.inner.is_non_blocking()
     }
+
+    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
+        if out.len() >= limit {
+            return Ok(false);
+        }
+        if let Some(first) = self.first.take() {
+            out.push(first?);
+        }
+        if out.len() >= limit {
+            return Ok(false);
+        }
+        self.inner.drain_ready(limit, out)
+    }
 }
 
 pub(crate) fn prefixed<T>(first: Result<T>, inner: BoxMessageStream<T>) -> BoxMessageStream<T>
@@ -117,6 +146,16 @@ where
 
     fn is_non_blocking(&self) -> bool {
         true
+    }
+
+    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
+        while out.len() < limit {
+            let Some(item) = self.iter.next() else {
+                return Ok(true);
+            };
+            out.push(item);
+        }
+        Ok(false)
     }
 }
 
@@ -158,6 +197,17 @@ where
 
     fn is_non_blocking(&self) -> bool {
         self.inner.is_non_blocking()
+    }
+
+    fn drain_ready(&mut self, limit: usize, out: &mut Vec<Vec<u8>>) -> Result<bool> {
+        let remaining = limit.saturating_sub(out.len());
+        if remaining == 0 {
+            return Ok(false);
+        }
+        let mut messages = Vec::with_capacity(remaining);
+        let done = self.inner.drain_ready(remaining, &mut messages)?;
+        out.extend(messages.into_iter().map(|message| message.encode_to_vec()));
+        Ok(done)
     }
 }
 
@@ -202,6 +252,19 @@ where
     fn is_non_blocking(&self) -> bool {
         self.inner.is_non_blocking()
     }
+
+    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
+        let remaining = limit.saturating_sub(out.len());
+        if remaining == 0 {
+            return Ok(false);
+        }
+        let mut bodies = Vec::with_capacity(remaining);
+        let done = self.inner.drain_ready(remaining, &mut bodies)?;
+        for body in bodies {
+            out.push(T::decode(body.as_slice()).map_err(Error::from)?);
+        }
+        Ok(done)
+    }
 }
 
 /// Wraps a byte stream and decodes each body into a protobuf message.
@@ -238,5 +301,28 @@ mod tests {
             }
         );
         assert!(decoded.next().await.is_none());
+    }
+
+    #[test]
+    fn ready_drain_encodes_and_decodes_nonblocking_streams() {
+        let messages = from_iter([
+            TestMessage {
+                value: "one".to_owned(),
+            },
+            TestMessage {
+                value: "two".to_owned(),
+            },
+        ]);
+        let mut encoded = encode(messages);
+        let mut bodies = Vec::new();
+
+        assert!(encoded.drain_ready(8, &mut bodies).unwrap());
+        assert_eq!(bodies.len(), 2);
+
+        let mut decoded = decode::<TestMessage>(from_iter(bodies));
+        let mut drained = Vec::new();
+        assert!(decoded.drain_ready(8, &mut drained).unwrap());
+        assert_eq!(drained[0].value, "one");
+        assert_eq!(drained[1].value, "two");
     }
 }

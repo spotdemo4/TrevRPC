@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -1060,6 +1061,44 @@ func TestClientResponseStreamDeadlineReturnsDeadlineExceeded(t *testing.T) {
 	}
 }
 
+func TestClientFrameReceiveUsesTransportDeadlineForIdleTimeout(t *testing.T) {
+	stream := &deadlineFrameStream{err: os.ErrDeadlineExceeded}
+
+	_, err := recvFrameWithTimeout(context.Background(), stream, time.Minute)
+	if code := StatusFromError(err).Code; code != CodeUnavailable {
+		t.Fatalf("expected unavailable idle timeout, got %v (%v)", code, err)
+	}
+	if len(stream.deadlines) != 2 {
+		t.Fatalf("expected set and clear deadlines, got %d", len(stream.deadlines))
+	}
+	if stream.deadlines[0].IsZero() || !stream.deadlines[1].IsZero() {
+		t.Fatalf("deadline was not set then cleared: %#v", stream.deadlines)
+	}
+}
+
+func TestClientFrameReceiveMapsTransportDeadlineToContextDeadline(t *testing.T) {
+	stream := &deadlineFrameStream{err: os.ErrDeadlineExceeded}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Hour))
+	defer cancel()
+
+	_, err := recvFrameWithTimeout(ctx, stream, 0)
+	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
+		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
+	}
+}
+
+func TestClientOptimizedFrameReceiveUsesTransportDeadline(t *testing.T) {
+	stream := &deadlineFieldsStream{deadlineFrameStream: deadlineFrameStream{err: os.ErrDeadlineExceeded}}
+
+	_, _, err := recvOptimizedFrameFieldsWithTimeout(context.Background(), stream, time.Minute, true)
+	if code := StatusFromError(err).Code; code != CodeUnavailable {
+		t.Fatalf("expected unavailable idle timeout, got %v (%v)", code, err)
+	}
+	if len(stream.deadlines) != 2 {
+		t.Fatalf("expected set and clear deadlines, got %d", len(stream.deadlines))
+	}
+}
+
 func TestUnaryContextCancellationReturnsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1142,6 +1181,30 @@ func (pendingFrameStream) Recv() (*RpcStreamFrame, error) {
 }
 
 func (pendingFrameStream) Close() error { return nil }
+
+type deadlineFrameStream struct {
+	deadlines []time.Time
+	err       error
+}
+
+func (s *deadlineFrameStream) Recv() (*RpcStreamFrame, error) {
+	return nil, s.err
+}
+
+func (s *deadlineFrameStream) Close() error { return nil }
+
+func (s *deadlineFrameStream) SetReadDeadline(deadline time.Time) error {
+	s.deadlines = append(s.deadlines, deadline)
+	return nil
+}
+
+type deadlineFieldsStream struct {
+	deadlineFrameStream
+}
+
+func (s *deadlineFieldsStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
+	return streamFrameFields{}, nil, s.err
+}
 
 type panickingByteStream struct{}
 

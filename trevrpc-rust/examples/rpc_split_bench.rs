@@ -44,6 +44,7 @@ const QUINN_KEEP_ALIVE_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE
 const QUINN_SEND_WINDOW_BYTES_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES";
 const QUINN_ACK_THRESHOLD_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD";
 const QUINN_ACK_DELAY_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS";
+const SHAPES_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_SHAPES";
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 type GrpcReplyStream =
@@ -87,7 +88,7 @@ async fn main() -> BenchResult {
             run_grpc_server(addr, Path::new(&cert), Path::new(&key)).await
         }
         _ => Err(
-            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <cert> <iterations> | grpc-server <addr> <cert> <key>\nset TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT=default to keep production stream idle timers in TrevRPC split rows"
+            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <cert> <iterations> | grpc-server <addr> <cert> <key>\nset TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT=default to keep production stream idle timers in TrevRPC split rows; set TREVRPC_RUST_SPLIT_BENCH_SHAPES=client_stream_latency,bidi_stream_latency and TREVRPC_RUST_QUINN_FRAME_TRACE=1 for focused frame diagnostics; set SSLKEYLOGFILE for TLS key logging"
                 .into(),
         ),
     }
@@ -102,38 +103,62 @@ async fn run_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> Benc
     let client = greeter::GreeterClient::new(trevrpc::quinn::Client::new(connection.clone()));
 
     warm_client(&client).await?;
-    run_latency_case("unary_latency", iterations, |index| {
-        trevrpc_unary_call(&client, usize::try_from(index).unwrap())
-    })
-    .await?;
-    run_latency_case("server_stream_latency", iterations, |_| {
-        trevrpc_server_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
-    })
-    .await?;
-    run_message_throughput_case("server_stream_throughput", iterations, || {
-        trevrpc_server_streaming_call(&client, usize::try_from(iterations).unwrap())
-    })
-    .await?;
-    run_latency_case("client_stream_latency", iterations, |_| {
-        trevrpc_client_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
-    })
-    .await?;
-    run_message_throughput_case("client_stream_throughput", iterations, || {
-        trevrpc_client_streaming_call(&client, usize::try_from(iterations).unwrap())
-    })
-    .await?;
-    run_latency_case("bidi_stream_latency", iterations, |_| {
-        trevrpc_bidi_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
-    })
-    .await?;
-    run_message_throughput_case("bidi_stream_throughput", iterations, || {
-        trevrpc_bidi_streaming_call(&client, usize::try_from(iterations).unwrap())
-    })
-    .await?;
+    if should_run_shape("unary_latency") {
+        run_latency_case("unary_latency", iterations, |index| {
+            trevrpc_unary_call(&client, usize::try_from(index).unwrap())
+        })
+        .await?;
+    }
+    if should_run_shape("server_stream_latency") {
+        run_latency_case("server_stream_latency", iterations, |_| {
+            trevrpc_server_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
+        })
+        .await?;
+    }
+    if should_run_shape("server_stream_throughput") {
+        run_message_throughput_case("server_stream_throughput", iterations, || {
+            trevrpc_server_streaming_call(&client, usize::try_from(iterations).unwrap())
+        })
+        .await?;
+    }
+    if should_run_shape("client_stream_latency") {
+        run_latency_case("client_stream_latency", iterations, |_| {
+            trevrpc_client_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
+        })
+        .await?;
+    }
+    if should_run_shape("client_stream_throughput") {
+        run_message_throughput_case("client_stream_throughput", iterations, || {
+            trevrpc_client_streaming_call(&client, usize::try_from(iterations).unwrap())
+        })
+        .await?;
+    }
+    if should_run_shape("bidi_stream_latency") {
+        run_latency_case("bidi_stream_latency", iterations, |_| {
+            trevrpc_bidi_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
+        })
+        .await?;
+    }
+    if should_run_shape("bidi_stream_throughput") {
+        run_message_throughput_case("bidi_stream_throughput", iterations, || {
+            trevrpc_bidi_streaming_call(&client, usize::try_from(iterations).unwrap())
+        })
+        .await?;
+    }
 
     connection.close(0_u32.into(), b"split benchmark complete");
     endpoint.wait_idle().await;
     Ok(())
+}
+
+fn should_run_shape(name: &str) -> bool {
+    let Ok(shapes) = std::env::var(SHAPES_ENV) else {
+        return true;
+    };
+    if shapes.trim().is_empty() {
+        return true;
+    }
+    shapes.split(',').any(|shape| shape.trim() == name)
 }
 
 async fn run_server(addr: SocketAddr) -> BenchResult {
@@ -1141,6 +1166,7 @@ fn make_server_endpoint_with_identity(
             PrivateKeyDer::from(key_der),
         )?;
     server_crypto.alpn_protocols = alpn_protocols;
+    server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
@@ -1203,6 +1229,7 @@ fn make_client_endpoint(cert_path: &Path) -> BenchResult<quinn::Endpoint> {
         .with_custom_certificate_verifier(SkipServerVerification::new())
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+    client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
 
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
     let mut client_config =

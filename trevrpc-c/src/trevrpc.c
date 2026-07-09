@@ -9,6 +9,7 @@
 #include <errno.h> // IWYU pragma: keep
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,6 +135,7 @@ struct trevrpc_server {
     size_t active_tasks;
     size_t active_connections;
     size_t active_requests;
+    atomic_bool routes_frozen;
     bool shutting_down;
 };
 
@@ -163,6 +165,7 @@ typedef struct trevrpc_stream_task {
 } trevrpc_stream_task;
 
 static bool trevrpc_server_is_shutting_down(trevrpc_server* server);
+static void trevrpc_server_freeze_routes(trevrpc_server* server);
 static bool trevrpc_handle_stream(trevrpc_server* server,
     trevrpc_stream* stream,
     trevrpc_conn_stream_limiter* stream_limiter,
@@ -1927,6 +1930,10 @@ void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_st
     trevrpc_test_current_server = NULL;
 }
 
+void trevrpc_test_server_freeze_routes(trevrpc_server* server) {
+    trevrpc_server_freeze_routes(server);
+}
+
 void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_stream* stream) {
     trevrpc_test_current_server = server;
     trevrpc_stream rpc_stream = trevrpc_stream_ref_webtransport(stream, server->max_frame_size);
@@ -2117,6 +2124,13 @@ int trevrpc_server_register_unary(
         free(registered);
         return TREV_MSQUIC_ERR_CLOSED;
     }
+    if (atomic_load_explicit(&server->routes_frozen, memory_order_acquire)) {
+        pthread_mutex_unlock(&server->mutex);
+        free(registered->service);
+        free(registered->method);
+        free(registered);
+        return -EALREADY;
+    }
     for (trevrpc_method* existing = server->methods; existing != NULL; existing = existing->next) {
         if (trevrpc_method_matches(existing, service, service_len, method, method_len)) {
             pthread_mutex_unlock(&server->mutex);
@@ -2179,6 +2193,13 @@ int trevrpc_server_register_streaming(trevrpc_server* server,
         free(registered);
         return TREV_MSQUIC_ERR_CLOSED;
     }
+    if (atomic_load_explicit(&server->routes_frozen, memory_order_acquire)) {
+        pthread_mutex_unlock(&server->mutex);
+        free(registered->service);
+        free(registered->method);
+        free(registered);
+        return -EALREADY;
+    }
     for (trevrpc_method* existing = server->methods; existing != NULL; existing = existing->next) {
         if (trevrpc_method_matches(existing, service, service_len, method, method_len)) {
             pthread_mutex_unlock(&server->mutex);
@@ -2240,6 +2261,13 @@ int trevrpc_server_register_call(trevrpc_server* server,
         free(registered->method);
         free(registered);
         return TREV_MSQUIC_ERR_CLOSED;
+    }
+    if (atomic_load_explicit(&server->routes_frozen, memory_order_acquire)) {
+        pthread_mutex_unlock(&server->mutex);
+        free(registered->service);
+        free(registered->method);
+        free(registered);
+        return -EALREADY;
     }
     for (trevrpc_method* existing = server->methods; existing != NULL; existing = existing->next) {
         if (trevrpc_method_matches(existing, service, service_len, method, method_len)) {
@@ -2660,6 +2688,16 @@ static void trevrpc_server_conn_remove(trevrpc_server* server, trevrpc_server_co
 }
 
 static trevrpc_method* trevrpc_server_find_method(trevrpc_server* server, const trevrpc_request* request) {
+    if (atomic_load_explicit(&server->routes_frozen, memory_order_acquire)) {
+        for (trevrpc_method* method = server->methods; method != NULL; method = method->next) {
+            if (trevrpc_method_matches(
+                    method, request->service, request->service_len, request->method, request->method_len)) {
+                return method;
+            }
+        }
+        return NULL;
+    }
+
     pthread_mutex_lock(&server->mutex);
     for (trevrpc_method* method = server->methods; method != NULL; method = method->next) {
         if (trevrpc_method_matches(
@@ -2670,6 +2708,12 @@ static trevrpc_method* trevrpc_server_find_method(trevrpc_server* server, const 
     }
     pthread_mutex_unlock(&server->mutex);
     return NULL;
+}
+
+static void trevrpc_server_freeze_routes(trevrpc_server* server) {
+    pthread_mutex_lock(&server->mutex);
+    atomic_store_explicit(&server->routes_frozen, true, memory_order_release);
+    pthread_mutex_unlock(&server->mutex);
 }
 
 static void trevrpc_set_status(trevrpc_response* response, uint32_t status, const char* message) {
@@ -3737,6 +3781,7 @@ int trevrpc_server_serve(trevrpc_server* server) {
     if (!trevrpc_server_task_start(server)) {
         return TREV_MSQUIC_ERR_CLOSED;
     }
+    trevrpc_server_freeze_routes(server);
 
     trevrpc_transport_record_event(server, TREVRPC_TRANSPORT_EVENT_LISTENER_OPEN, 0, NULL);
 

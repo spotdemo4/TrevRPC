@@ -26,6 +26,7 @@ typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server);
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
+void trevrpc_test_server_freeze_routes(trevrpc_server* server);
 uint32_t trevrpc_test_status_from_error(int err, const char** message);
 uint32_t trevrpc_test_transport_status_from_error(int err, const char** message);
 size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
@@ -1612,6 +1613,52 @@ cleanup:
     return result;
 }
 
+static int test_route_registration_freezes_before_serving(void) {
+    int result = 1;
+    uint8_t* frame = NULL;
+    size_t frame_len = 0;
+    trevrpc_server* server = NULL;
+    trevrpc_msquic_stream stream = {0};
+    bool stream_initialized = false;
+    metric_counts counts = {0};
+    trevrpc_metrics metrics = {
+        .rpc_started = record_started,
+        .rpc_finished = record_finished,
+        .user_data = &counts,
+    };
+
+    CHECK_GOTO(trevrpc_wire_encode_request(
+                   "svc", "method", TREVRPC_RPC_KIND_UNARY, NULL, 0, NULL, 0, 4096, &frame, &frame_len) == 0);
+    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
+    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
+    CHECK_GOTO(trevrpc_server_register_unary(server, "svc", "method", success_handler, NULL) == 0);
+    trevrpc_test_server_freeze_routes(server);
+
+    CHECK_GOTO(trevrpc_server_register_unary(server, "svc", "late", success_handler, NULL) == -EALREADY);
+    CHECK_GOTO(
+        trevrpc_server_register_streaming(
+            server, "svc", "late-stream", TREVRPC_RPC_KIND_SERVER_STREAMING, stream_error_handler, NULL) == -EALREADY);
+    CHECK_GOTO(trevrpc_server_register_call(
+                   server, "svc", "late-call", TREVRPC_RPC_KIND_UNARY, raw_unary_immediate_handler, NULL) == -EALREADY);
+
+    CHECK_GOTO(init_raw_stream(&stream, frame, frame_len) == 0);
+    stream_initialized = true;
+    trevrpc_test_server_handle_stream(server, &stream);
+    CHECK_GOTO(counts.started == 1);
+    CHECK_GOTO(counts.finished == 1);
+    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
+
+    result = 0;
+
+cleanup:
+    if (stream_initialized) {
+        reset_raw_stream(&stream);
+    }
+    trevrpc_server_close(server);
+    free(frame);
+    return result;
+}
+
 int main(void) {
     if (test_null_context() != 0) {
         return 1;
@@ -1731,6 +1778,9 @@ int main(void) {
         return 1;
     }
     if (test_concurrent_stream_limit_rejects_overload() != 0) {
+        return 1;
+    }
+    if (test_route_registration_freezes_before_serving() != 0) {
         return 1;
     }
     return 0;

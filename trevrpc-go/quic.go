@@ -102,6 +102,10 @@ type quicResponseStream struct {
 
 func (s *quicResponseStream) trevrpcContextCancelsRecv() bool { return true }
 
+func (s *quicResponseStream) SetReadDeadline(deadline time.Time) error {
+	return s.stream.SetReadDeadline(deadline)
+}
+
 func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
 	frame, _, err := s.trevrpcRecvStreamFrameFields()
 	if err != nil {
