@@ -3,6 +3,9 @@ import { NodeServer, NodeTransport } from "../src/node.js";
 
 const LatencyStreamMessageCount = 1;
 const RequestName = "TrevRPC benchmark";
+const PayloadValues = loadPayloadProfile();
+const Metadata = loadMetadataProfile();
+const ResponseMetadata = Object.keys(Metadata).length === 0 ? {} : { "benchmark-response": "ok" };
 const IdleTimeoutMs = 600_000;
 const SendManyBatchSize = positiveInteger(process.env.TREVRPC_JS_SEND_MANY_BATCH ?? "16");
 
@@ -89,7 +92,7 @@ async function runClient(host, port, iterations) {
     streamWriteBatchMaxMessages: SendManyBatchSize,
   });
   try {
-    const client = createServiceClient(transport, GreeterService, root);
+    const client = createServiceClient(transport, GreeterService, root, callOptions());
     await warmClient(client);
     await runLatencyCase("unary_latency", iterations, () => unary(client));
     await runLatencyCase("server_stream_latency", iterations, () =>
@@ -130,7 +133,13 @@ async function runServer(certFile, keyFile) {
     streamWriteBatchMaxMessages: SendManyBatchSize,
   });
   server.registerService(GreeterService, {
-    sayHello: (call) => encodeReply(decodeRequest(call.request.body).name),
+    sayHello: (call) => {
+      validateMetadata(call.request.metadata);
+      return {
+        body: encodeReply(decodeRequest(call.request.body).name),
+        metadata: ResponseMetadata,
+      };
+    },
     lotsOfReplies: serverStreamReplies,
     lotsOfGreetings: clientStreamReply,
     bidiHello: bidiReplies,
@@ -178,8 +187,9 @@ async function runMessageThroughputCase(name, iterations, fn) {
 }
 
 async function unary(client) {
-  const reply = await client.sayHello({ name: RequestName });
-  if (reply.message !== RequestName) {
+  const expected = payloadForIndex(0);
+  const reply = await client.sayHello({ name: expected });
+  if (reply.message !== expected) {
     throw new Error(`unexpected unary response: ${JSON.stringify(reply)}`);
   }
 }
@@ -191,7 +201,7 @@ async function serverStreaming(client, messageCount) {
   );
   let count = 0;
   for await (const reply of replies) {
-    if (reply.message !== "server stream") {
+    if (reply.message !== payloadForIndex(count)) {
       throw new Error(`unexpected server-stream response: ${JSON.stringify(reply)}`);
     }
     count++;
@@ -226,7 +236,7 @@ async function bidiStreaming(client, messageCount) {
       if (reply === undefined) {
         break;
       }
-      if (reply.message !== RequestName) {
+      if (reply.message !== payloadForIndex(received)) {
         throw new Error(`unexpected bidi response: ${JSON.stringify(reply)}`);
       }
       received++;
@@ -238,11 +248,13 @@ async function bidiStreaming(client, messageCount) {
 }
 
 function serverStreamReplies(call) {
+  validateMetadata(call.request.metadata);
   const count = messageCountFromName(decodeRequest(call.request.body).name);
-  return repeatedReplies(count, "server stream");
+  return repeatedReplies(count);
 }
 
 async function* clientStreamReply(call) {
+  validateMetadata(call.request.metadata);
   let count = 0;
   for (;;) {
     const frame = await call.recv();
@@ -256,6 +268,7 @@ async function* clientStreamReply(call) {
 }
 
 async function* bidiReplies(call) {
+  validateMetadata(call.request.metadata);
   for (;;) {
     const frame = await call.recv();
     if (frame == null) {
@@ -269,13 +282,19 @@ function encodeReply(message) {
   return HelloReply.encode({ message }).finish();
 }
 
+function callOptions() {
+  return Object.keys(Metadata).length === 0
+    ? { streamIdleTimeoutMs: 0 }
+    : { metadata: Metadata, streamIdleTimeoutMs: IdleTimeoutMs, timeoutMs: IdleTimeoutMs };
+}
+
 async function sendRequestMessages(call, messageCount) {
   if (messageCount <= 0) {
     return;
   }
   if (messageCount === 1 || typeof call.sendMany !== "function" || SendManyBatchSize <= 1) {
     for (let i = 0; i < messageCount; i++) {
-      await call.send({ name: RequestName });
+      await call.send({ name: payloadForIndex(i) });
     }
     return;
   }
@@ -283,12 +302,16 @@ async function sendRequestMessages(call, messageCount) {
   let remaining = messageCount;
   while (remaining > 0) {
     const count = Math.min(remaining, SendManyBatchSize);
-    await call.sendMany(Array.from({ length: count }, () => ({ name: RequestName })));
+    await call.sendMany(
+      Array.from({ length: count }, (_, offset) => ({
+        name: payloadForIndex(messageCount - remaining + offset),
+      })),
+    );
     remaining -= count;
   }
 }
 
-function repeatedReplies(count, message) {
+function repeatedReplies(count) {
   let sent = 0;
   return {
     [Symbol.asyncIterator]() {
@@ -298,8 +321,9 @@ function repeatedReplies(count, message) {
       if (sent >= count) {
         return Promise.resolve({ done: true, value: undefined });
       }
+      const reply = encodeReply(payloadForIndex(sent));
       sent++;
-      return Promise.resolve({ done: false, value: encodeReply(message) });
+      return Promise.resolve({ done: false, value: reply });
     },
     nextBatch(max = SendManyBatchSize) {
       if (sent >= count) {
@@ -307,8 +331,9 @@ function repeatedReplies(count, message) {
       }
       const batchCount = Math.min(count - sent, Math.max(1, max));
       const batch = Array.from({ length: batchCount }, () => {
+        const reply = encodeReply(payloadForIndex(sent));
         sent++;
-        return encodeReply(message);
+        return reply;
       });
       return Promise.resolve({ done: false, value: batch });
     },
@@ -317,6 +342,59 @@ function repeatedReplies(count, message) {
 
 function decodeRequest(body) {
   return HelloRequest.decode(body);
+}
+
+function loadPayloadProfile() {
+  switch (process.env.TREVRPC_BENCH_PAYLOAD_PROFILE ?? "tiny") {
+    case "tiny":
+      return [RequestName];
+    case "small":
+      return ["x".repeat(253)];
+    case "medium":
+      return ["x".repeat(4093)];
+    case "large":
+      return ["x".repeat(65_532)];
+    case "mixed":
+      return [RequestName, "x".repeat(253), "x".repeat(4093), "x".repeat(65_532)];
+    default:
+      throw new Error(
+        `unsupported TREVRPC_BENCH_PAYLOAD_PROFILE ${JSON.stringify(process.env.TREVRPC_BENCH_PAYLOAD_PROFILE)}`,
+      );
+  }
+}
+
+function payloadForIndex(index) {
+  return PayloadValues[index % PayloadValues.length];
+}
+
+function loadMetadataProfile() {
+  switch (process.env.TREVRPC_BENCH_METADATA_PROFILE ?? "none") {
+    case "none":
+      return {};
+    case "production":
+      return {
+        "benchmark-client": "trevrpc-bench",
+        "benchmark-profile": "production",
+        "benchmark-trace-id": "trevrpc-benchmark",
+      };
+    default:
+      throw new Error(
+        `unsupported TREVRPC_BENCH_METADATA_PROFILE ${JSON.stringify(process.env.TREVRPC_BENCH_METADATA_PROFILE)}`,
+      );
+  }
+}
+
+function validateMetadata(actual = {}) {
+  for (const [key, expected] of Object.entries(Metadata)) {
+    const value = actual[key] ?? actual[key.toLowerCase()];
+    const text =
+      value instanceof Uint8Array ? new TextDecoder().decode(value) : String(value ?? "");
+    if (text !== expected) {
+      throw new Error(
+        `metadata ${JSON.stringify(key)} = ${JSON.stringify(text)}, want ${JSON.stringify(expected)}`,
+      );
+    }
+  }
 }
 
 function messageCountFromName(name) {

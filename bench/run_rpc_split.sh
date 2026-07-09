@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+OUT_DIR_WAS_SET=${OUT_DIR+x}
+CMAKE_BUILD_DIR_WAS_SET=${CMAKE_BUILD_DIR+x}
 OUT_DIR=${OUT_DIR:-target/rpc-split}
 case "$OUT_DIR" in
 /*) OUT_DIR_ABS="$OUT_DIR" ;;
@@ -36,8 +38,6 @@ RUN_RUST_QUINN=${RUN_RUST_QUINN:-1}
 RUN_RUST_GRPC=${RUN_RUST_GRPC:-1}
 
 PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-tiny}
-ENCODED_REQUEST_BYTES=${ENCODED_REQUEST_BYTES:-19}
-ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-19}
 METADATA_PROFILE=${METADATA_PROFILE:-none}
 HANDSHAKE_INCLUSION_MODE=${HANDSHAKE_INCLUSION_MODE:-steady-state-warmed}
 SPLIT_BATCHING_SETTINGS=${SPLIT_BATCHING_SETTINGS:-js-send-many-batch=${TREVRPC_JS_SEND_MANY_BATCH:-16};grpc-batching=library-default}
@@ -50,6 +50,7 @@ usage() {
     cat <<'EOF'
 Usage: bench/run_rpc_split.sh
        bench/run_rpc_split.sh --report-only
+       bench/run_rpc_split.sh --smoke
 
 Runs split TrevRPC client/server benchmarks plus Go and Rust gRPC baselines, and writes CSV/Markdown reports.
 
@@ -71,18 +72,20 @@ Environment knobs:
   RUN_JS_NATIVE           Include native JS MsQuic transport. Default: 1
   RUN_RUST_QUINN          Include Rust Quinn transport. Default: 1
   RUN_RUST_GRPC           Include Rust tonic gRPC TCP baseline. Default: 1
-  PAYLOAD_PROFILE         Reported payload profile. Default: tiny
-  METADATA_PROFILE        Reported metadata profile. Default: none
+  PAYLOAD_PROFILE         Payload profile: tiny, small, medium, large, or mixed. Default: tiny
+  METADATA_PROFILE        Metadata profile: none or production. Default: none
 
 Examples:
   bench/run_rpc_split.sh
   bench/run_rpc_split.sh --report-only
+  bench/run_rpc_split.sh --smoke
   SPLIT_ITERATIONS=1000 SPLIT_RUNS=1 bench/run_rpc_split.sh
   RUN_SERVER_AXIS=0 bench/run_rpc_split.sh
 EOF
 }
 
 REPORT_ONLY=0
+SMOKE=0
 case "${1:-}" in
 "-h" | "--help")
     usage
@@ -91,12 +94,68 @@ case "${1:-}" in
 "--report-only")
     REPORT_ONLY=1
     ;;
+"--smoke")
+    SMOKE=1
+    ;;
 "") ;;
 *)
     usage >&2
     exit 2
     ;;
 esac
+
+if [[ "$SMOKE" == "1" ]]; then
+    SPLIT_ITERATIONS=10
+    C_ITERATIONS=10
+    GO_ITERATIONS=10
+    JS_ITERATIONS=10
+    RUST_ITERATIONS=10
+    SPLIT_RUNS=1
+    if [[ -z "$OUT_DIR_WAS_SET" ]]; then
+        OUT_DIR=target/rpc-split-smoke
+    fi
+fi
+
+case "$OUT_DIR" in
+/*) OUT_DIR_ABS="$OUT_DIR" ;;
+*) OUT_DIR_ABS="$ROOT/$OUT_DIR" ;;
+esac
+RAW_DIR="$OUT_DIR/raw"
+COMMAND_LOG="$OUT_DIR/commands.txt"
+CSV="$OUT_DIR/rpc-split.csv"
+SAMPLES_CSV="$OUT_DIR/rpc-split-samples.csv"
+FAILURES_CSV="$OUT_DIR/rpc-split-failures.csv"
+MARKDOWN="$OUT_DIR/rpc-split.md"
+GO_SPLIT_BENCH="$OUT_DIR_ABS/trevrpc-go-rpc-split-bench"
+if [[ -z "$CMAKE_BUILD_DIR_WAS_SET" ]]; then
+    CMAKE_BUILD_DIR="$OUT_DIR/c-build"
+fi
+
+profile_encoded_bytes() {
+    case "$1" in
+    tiny) printf '19' ;;
+    small) printf '256' ;;
+    medium) printf '4096' ;;
+    large) printf '65536' ;;
+    mixed) printf '19/256/4096/65536' ;;
+    *)
+        printf 'unsupported PAYLOAD_PROFILE %q\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+}
+
+case "$METADATA_PROFILE" in
+none | production) ;;
+*)
+    printf 'unsupported METADATA_PROFILE %q\n' "$METADATA_PROFILE" >&2
+    exit 2
+    ;;
+esac
+
+ENCODED_REQUEST_BYTES=${ENCODED_REQUEST_BYTES:-$(profile_encoded_bytes "$PAYLOAD_PROFILE")}
+ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-$(profile_encoded_bytes "$PAYLOAD_PROFILE")}
+BENCH_ENV=("TREVRPC_BENCH_PAYLOAD_PROFILE=$PAYLOAD_PROFILE" "TREVRPC_BENCH_METADATA_PROFILE=$METADATA_PROFILE")
 
 initialize_output() {
     mkdir -p "$RAW_DIR"
@@ -278,6 +337,38 @@ assert_no_plaintext_rows() {
         printf 'split comparison emitted plaintext rows in %s\n' "$CSV" >&2
         exit 2
     fi
+}
+
+assert_benchmark_labels() {
+    awk -F, -v payload_profile="$PAYLOAD_PROFILE" -v metadata_profile="$METADATA_PROFILE" \
+        -v serialization_mode="$SERIALIZATION_MODE" -v handshake_mode="$HANDSHAKE_INCLUSION_MODE" '
+        NR == 1 { next }
+        $15 != "encrypted" {
+            printf "row %d has false security label %q\n", NR, $15 > "/dev/stderr"
+            bad = 1
+        }
+        $16 != "tls-pinned" && $16 != "tls-skip-verify" {
+            printf "row %d has unexpected certificate verification label %q\n", NR, $16 > "/dev/stderr"
+            bad = 1
+        }
+        $17 != payload_profile {
+            printf "row %d payload profile %q does not match selected %q\n", NR, $17, payload_profile > "/dev/stderr"
+            bad = 1
+        }
+        $20 != serialization_mode {
+            printf "row %d serialization mode %q does not match selected %q\n", NR, $20, serialization_mode > "/dev/stderr"
+            bad = 1
+        }
+        $21 != metadata_profile {
+            printf "row %d metadata profile %q does not match selected %q\n", NR, $21, metadata_profile > "/dev/stderr"
+            bad = 1
+        }
+        $22 != handshake_mode {
+            printf "row %d handshake mode %q does not match selected %q\n", NR, $22, handshake_mode > "/dev/stderr"
+            bad = 1
+        }
+        END { exit bad ? 1 : 0 }
+    ' "$CSV"
 }
 
 write_markdown_report() {
@@ -623,21 +714,21 @@ run_client_axis() {
     local c_bench="$CMAKE_BUILD_DIR/trevrpc_rpc_comparison_bench"
     local cert_file="$CMAKE_BUILD_DIR/msquic-test-cert.pem"
     local port
-    start_server client-axis-c-server "$c_bench" --split-serve
+    start_server client-axis-c-server env "${BENCH_ENV[@]}" "$c_bench" --split-serve
     port=$START_SERVER_PORT
 
     for ((run = 1; run <= SPLIT_RUNS; run++)); do
         if [[ "$RUN_C_MSQUIC" == "1" ]]; then
-            run_split_sample "client-c-msquic-run-$run" "$run" client c_msquic c_msquic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
+            run_split_sample "client-c-msquic-run-$run" "$run" client c_msquic c_msquic c-custom env "${BENCH_ENV[@]}" "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         fi
         if [[ "$RUN_GO_QUIC" == "1" ]]; then
-            run_split_sample "client-go-quic-run-$run" "$run" client go_quic c_msquic go-custom "$GO_SPLIT_BENCH" -mode client -transport quic -addr "127.0.0.1:$port" -cert "$cert_file" -iterations "$GO_ITERATIONS"
+            run_split_sample "client-go-quic-run-$run" "$run" client go_quic c_msquic go-custom env "${BENCH_ENV[@]}" "$GO_SPLIT_BENCH" -mode client -transport quic -addr "127.0.0.1:$port" -cert "$cert_file" -iterations "$GO_ITERATIONS"
         fi
         if [[ "$RUN_JS_NATIVE" == "1" ]]; then
-            run_split_sample "client-js-native-run-$run" "$run" client js_msquic c_msquic js-custom node trevrpc-js/bench/rpc_split_native.js client 127.0.0.1 "$port" "$JS_ITERATIONS"
+            run_split_sample "client-js-native-run-$run" "$run" client js_msquic c_msquic js-custom env "${BENCH_ENV[@]}" node trevrpc-js/bench/rpc_split_native.js client 127.0.0.1 "$port" "$JS_ITERATIONS"
         fi
         if [[ "$RUN_RUST_QUINN" == "1" ]]; then
-            run_split_sample "client-rust-quinn-run-$run" "$run" client rust_quinn c_msquic rust-custom "$RUST_SPLIT_BENCH" client "127.0.0.1:$port" "$cert_file" "$RUST_ITERATIONS"
+            run_split_sample "client-rust-quinn-run-$run" "$run" client rust_quinn c_msquic rust-custom env "${BENCH_ENV[@]}" "$RUST_SPLIT_BENCH" client "127.0.0.1:$port" "$cert_file" "$RUST_ITERATIONS"
         fi
     done
 
@@ -652,37 +743,37 @@ run_server_axis() {
     local run
 
     if [[ "$RUN_C_MSQUIC" == "1" ]]; then
-        start_server server-axis-c-server "$c_bench" --split-serve
+        start_server server-axis-c-server env "${BENCH_ENV[@]}" "$c_bench" --split-serve
         port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "server-c-msquic-run-$run" "$run" server c_msquic c_msquic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
+            run_split_sample "server-c-msquic-run-$run" "$run" server c_msquic c_msquic c-custom env "${BENCH_ENV[@]}" "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         done
         stop_servers
     fi
 
     if [[ "$RUN_GO_QUIC" == "1" ]]; then
-        start_server server-axis-go-quic "$GO_SPLIT_BENCH" -mode server -transport quic -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
+        start_server server-axis-go-quic env "${BENCH_ENV[@]}" "$GO_SPLIT_BENCH" -mode server -transport quic -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
         port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "server-go-quic-run-$run" "$run" server c_msquic go_quic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
+            run_split_sample "server-go-quic-run-$run" "$run" server c_msquic go_quic c-custom env "${BENCH_ENV[@]}" "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         done
         stop_servers
     fi
 
     if [[ "$RUN_RUST_QUINN" == "1" ]]; then
-        start_server server-axis-rust-quinn "$RUST_SPLIT_BENCH" server 127.0.0.1:0
+        start_server server-axis-rust-quinn env "${BENCH_ENV[@]}" "$RUST_SPLIT_BENCH" server 127.0.0.1:0
         port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "server-rust-quinn-run-$run" "$run" server c_msquic rust_quinn c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
+            run_split_sample "server-rust-quinn-run-$run" "$run" server c_msquic rust_quinn c-custom env "${BENCH_ENV[@]}" "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         done
         stop_servers
     fi
 
     if [[ "$RUN_JS_NATIVE" == "1" ]]; then
-        start_server server-axis-js-native node trevrpc-js/bench/rpc_split_native.js server "$cert_file" "$key_file"
+        start_server server-axis-js-native env "${BENCH_ENV[@]}" node trevrpc-js/bench/rpc_split_native.js server "$cert_file" "$key_file"
         port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "server-js-native-run-$run" "$run" server c_msquic js_msquic c-custom "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
+            run_split_sample "server-js-native-run-$run" "$run" server c_msquic js_msquic c-custom env "${BENCH_ENV[@]}" "$c_bench" --split-client msquic 127.0.0.1 "$port" "$C_ITERATIONS"
         done
         stop_servers
     fi
@@ -694,19 +785,19 @@ run_grpc_axis() {
     local key_file="$CMAKE_BUILD_DIR/msquic-test-key.pem"
 
     if [[ "$RUN_GO_GRPC" == "1" ]]; then
-        start_server grpc-go-server "$GO_SPLIT_BENCH" -mode server -transport grpc -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
+        start_server grpc-go-server env "${BENCH_ENV[@]}" "$GO_SPLIT_BENCH" -mode server -transport grpc -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
         local port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "grpc-go-run-$run" "$run" grpc grpc_go grpc_go go-custom "$GO_SPLIT_BENCH" -mode client -transport grpc -cert "$cert_file" -addr "127.0.0.1:$port" -iterations "$GO_ITERATIONS"
+            run_split_sample "grpc-go-run-$run" "$run" grpc grpc_go grpc_go go-custom env "${BENCH_ENV[@]}" "$GO_SPLIT_BENCH" -mode client -transport grpc -cert "$cert_file" -addr "127.0.0.1:$port" -iterations "$GO_ITERATIONS"
         done
         stop_servers
     fi
 
     if [[ "$RUN_RUST_GRPC" == "1" ]]; then
-        start_server grpc-rust-tonic-server "$RUST_SPLIT_BENCH" grpc-server 127.0.0.1:0 "$cert_file" "$key_file"
+        start_server grpc-rust-tonic-server env "${BENCH_ENV[@]}" "$RUST_SPLIT_BENCH" grpc-server 127.0.0.1:0 "$cert_file" "$key_file"
         local port=$START_SERVER_PORT
         for ((run = 1; run <= SPLIT_RUNS; run++)); do
-            run_split_sample "grpc-rust-tonic-run-$run" "$run" grpc rust_tonic rust_tonic rust-custom "$RUST_SPLIT_BENCH" grpc-client "127.0.0.1:$port" "$cert_file" "$RUST_ITERATIONS"
+            run_split_sample "grpc-rust-tonic-run-$run" "$run" grpc rust_tonic rust_tonic rust-custom env "${BENCH_ENV[@]}" "$RUST_SPLIT_BENCH" grpc-client "127.0.0.1:$port" "$cert_file" "$RUST_ITERATIONS"
         done
         stop_servers
     fi
@@ -730,6 +821,7 @@ fi
 
 aggregate_samples_csv
 assert_no_plaintext_rows
+assert_benchmark_labels
 write_markdown_report
 
 printf '\nWrote split CSV: %s\n' "$CSV"

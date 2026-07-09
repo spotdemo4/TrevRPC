@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+OUT_DIR_WAS_SET=${OUT_DIR+x}
+CMAKE_BUILD_DIR_WAS_SET=${CMAKE_BUILD_DIR+x}
 OUT_DIR=${OUT_DIR:-target/webtransport}
 case "$OUT_DIR" in
 /*) OUT_DIR_ABS="$OUT_DIR" ;;
@@ -28,20 +30,11 @@ RUN_GO_CONNECT=${RUN_GO_CONNECT:-1}
 RUN_RUST=${RUN_RUST:-1}
 RUN_JS=${RUN_JS:-${RUN_JS_NATIVE:-1}}
 
-PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-}
+PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-tiny}
 METADATA_PROFILE=${METADATA_PROFILE:-none}
 HANDSHAKE_INCLUSION_MODE=${HANDSHAKE_INCLUSION_MODE:-steady-state-warmed}
 WEBTRANSPORT_BATCHING_SETTINGS=${WEBTRANSPORT_BATCHING_SETTINGS:-send-many-batch=${WEBTRANSPORT_SEND_MANY_BATCH:-1};stream-read-batch=${WEBTRANSPORT_STREAM_READ_BATCH:-default};stream-write-batch=${WEBTRANSPORT_STREAM_WRITE_BATCH:-default};stream-write-batch-bytes=${WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES:-default};concurrent-streams=${WEBTRANSPORT_CONCURRENT_STREAMS:-1}}
 SERIALIZATION_MODE=per-message-serialized
-if [[ "${WEBTRANSPORT_PAYLOAD_BYTES:-0}" == "0" ]]; then
-    PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-tiny}
-    ENCODED_REQUEST_BYTES=${ENCODED_REQUEST_BYTES:-19}
-    ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-19}
-else
-    PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-custom-string-bytes}
-    ENCODED_REQUEST_BYTES=${ENCODED_REQUEST_BYTES:-$((WEBTRANSPORT_PAYLOAD_BYTES + 2))}
-    ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-$((WEBTRANSPORT_PAYLOAD_BYTES + 2))}
-fi
 
 GO_SPLIT_BENCH="$OUT_DIR_ABS/trevrpc-go-rpc-split-bench"
 RUST_SPLIT_BENCH="$ROOT/trevrpc-rust/target/release/examples/rpc_split_bench"
@@ -50,6 +43,7 @@ usage() {
     cat <<'EOF'
 Usage: bench/run_webtransport.sh
        bench/run_webtransport.sh --report-only
+       bench/run_webtransport.sh --smoke
 
 Runs browser WebTransport benchmarks with a Chromium client driven by Playwright,
 then writes normalized CSV/Markdown reports.
@@ -64,7 +58,7 @@ Environment knobs:
                              Set to 1 to disable browser stream/deadline timers in TrevRPC calls.
   WEBTRANSPORT_CONGESTION_CONTROL
                              Browser WebTransport congestionControl option: default, low-latency, or throughput.
-  WEBTRANSPORT_PAYLOAD_BYTES Request/response payload string size for TrevRPC stream throughput experiments.
+  PAYLOAD_PROFILE            Payload profile: tiny, small, medium, large, or mixed. Default: tiny
   WEBTRANSPORT_SEND_MANY_BATCH
                              sendMany batch size for browser client-stream and bidi throughput.
   WEBTRANSPORT_STREAM_READ_BATCH
@@ -82,18 +76,19 @@ Environment knobs:
   RUN_GO_CONNECT             Include Go ConnectRPC Fetch baseline. Default: 1
   RUN_RUST                   Include Rust WebTransport server. Default: 1
   RUN_JS                     Include JS WebTransport server. Default: 1
-  PAYLOAD_PROFILE            Reported payload profile. Default: tiny, or custom-string-bytes when WEBTRANSPORT_PAYLOAD_BYTES > 0
-  METADATA_PROFILE           Reported metadata profile. Default: none
+  METADATA_PROFILE           Metadata profile: none or production. Default: none
   TREVRPC_BROWSER_CHROMIUM   Optional Chromium executable path for Playwright.
 
 Examples:
   bench/run_webtransport.sh
+  bench/run_webtransport.sh --smoke
   WEBTRANSPORT_ITERATIONS=1000 WEBTRANSPORT_RUNS=1 bench/run_webtransport.sh
   RUN_RUST=0 bench/run_webtransport.sh
 EOF
 }
 
 REPORT_ONLY=0
+SMOKE=0
 case "${1:-}" in
 "-h" | "--help")
     usage
@@ -102,12 +97,64 @@ case "${1:-}" in
 "--report-only")
     REPORT_ONLY=1
     ;;
+"--smoke")
+    SMOKE=1
+    ;;
 "") ;;
 *)
     usage >&2
     exit 2
     ;;
 esac
+
+if [[ "$SMOKE" == "1" ]]; then
+    WEBTRANSPORT_ITERATIONS=10
+    WEBTRANSPORT_RUNS=1
+    if [[ -z "$OUT_DIR_WAS_SET" ]]; then
+        OUT_DIR=target/webtransport-smoke
+    fi
+fi
+
+case "$OUT_DIR" in
+/*) OUT_DIR_ABS="$OUT_DIR" ;;
+*) OUT_DIR_ABS="$ROOT/$OUT_DIR" ;;
+esac
+RAW_DIR="$OUT_DIR/raw"
+COMMAND_LOG="$OUT_DIR/commands.txt"
+CSV="$OUT_DIR/webtransport.csv"
+SAMPLES_CSV="$OUT_DIR/webtransport-samples.csv"
+FAILURES_CSV="$OUT_DIR/webtransport-failures.csv"
+MARKDOWN="$OUT_DIR/webtransport.md"
+GO_SPLIT_BENCH="$OUT_DIR_ABS/trevrpc-go-rpc-split-bench"
+if [[ -z "$CMAKE_BUILD_DIR_WAS_SET" ]]; then
+    CMAKE_BUILD_DIR="$OUT_DIR/c-build"
+fi
+
+profile_encoded_bytes() {
+    case "$1" in
+    tiny) printf '19' ;;
+    small) printf '256' ;;
+    medium) printf '4096' ;;
+    large) printf '65536' ;;
+    mixed) printf '19/256/4096/65536' ;;
+    *)
+        printf 'unsupported PAYLOAD_PROFILE %q\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+}
+
+case "$METADATA_PROFILE" in
+none | production) ;;
+*)
+    printf 'unsupported METADATA_PROFILE %q\n' "$METADATA_PROFILE" >&2
+    exit 2
+    ;;
+esac
+
+ENCODED_REQUEST_BYTES=${ENCODED_REQUEST_BYTES:-$(profile_encoded_bytes "$PAYLOAD_PROFILE")}
+ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-$(profile_encoded_bytes "$PAYLOAD_PROFILE")}
+BENCH_ENV=("TREVRPC_BENCH_PAYLOAD_PROFILE=$PAYLOAD_PROFILE" "TREVRPC_BENCH_METADATA_PROFILE=$METADATA_PROFILE")
 
 initialize_output() {
     mkdir -p "$RAW_DIR"
@@ -309,6 +356,38 @@ assert_no_plaintext_rows() {
     fi
 }
 
+assert_benchmark_labels() {
+    awk -F, -v payload_profile="$PAYLOAD_PROFILE" -v metadata_profile="$METADATA_PROFILE" \
+        -v serialization_mode="$SERIALIZATION_MODE" -v handshake_mode="$HANDSHAKE_INCLUSION_MODE" '
+        NR == 1 { next }
+        $14 != "encrypted" {
+            printf "row %d has false security label %q\n", NR, $14 > "/dev/stderr"
+            bad = 1
+        }
+        $15 != "tls-pinned-server-certificate-hash" && $15 != "tls-skip-verify" {
+            printf "row %d has unexpected certificate verification label %q\n", NR, $15 > "/dev/stderr"
+            bad = 1
+        }
+        $16 != payload_profile {
+            printf "row %d payload profile %q does not match selected %q\n", NR, $16, payload_profile > "/dev/stderr"
+            bad = 1
+        }
+        $19 != serialization_mode {
+            printf "row %d serialization mode %q does not match selected %q\n", NR, $19, serialization_mode > "/dev/stderr"
+            bad = 1
+        }
+        $20 != metadata_profile {
+            printf "row %d metadata profile %q does not match selected %q\n", NR, $20, metadata_profile > "/dev/stderr"
+            bad = 1
+        }
+        $21 != handshake_mode {
+            printf "row %d handshake mode %q does not match selected %q\n", NR, $21, handshake_mode > "/dev/stderr"
+            bad = 1
+        }
+        END { exit bad ? 1 : 0 }
+    ' "$CSV"
+}
+
 write_markdown_report() {
     local generated_at
     generated_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
@@ -330,7 +409,6 @@ Generated by \`bench/run_webtransport.sh\`: $generated_at
 | Browser throughput messages | \`${WEBTRANSPORT_THROUGHPUT_MESSAGES:-$WEBTRANSPORT_ITERATIONS}\` |
 | Browser stream timers disabled | \`${WEBTRANSPORT_DISABLE_STREAM_TIMEOUTS:-0}\` |
 | Browser congestion control | \`${WEBTRANSPORT_CONGESTION_CONTROL:-default}\` |
-| Browser request payload bytes | \`${WEBTRANSPORT_PAYLOAD_BYTES:-0}\` |
 | Browser sendMany batch | \`${WEBTRANSPORT_SEND_MANY_BATCH:-1}\` |
 | Browser stream read batch | \`${WEBTRANSPORT_STREAM_READ_BATCH:-default}\` |
 | Browser stream write batch | \`${WEBTRANSPORT_STREAM_WRITE_BATCH:-default}\` |
@@ -735,7 +813,7 @@ run_browser_against_server() {
     local cert_file=$4
     local run
     for ((run = 1; run <= WEBTRANSPORT_RUNS; run++)); do
-        run_webtransport_sample "webtransport-$raw_prefix-run-$run" "$run" chrome "$server" playwright-chromium node trevrpc-js/bench/webtransport_browser.js "$STATIC_URL" "https://127.0.0.1:$port/trevrpc" "$cert_file" "$WEBTRANSPORT_ITERATIONS"
+        run_webtransport_sample "webtransport-$raw_prefix-run-$run" "$run" chrome "$server" playwright-chromium env "${BENCH_ENV[@]}" node trevrpc-js/bench/webtransport_browser.js "$STATIC_URL" "https://127.0.0.1:$port/trevrpc" "$cert_file" "$WEBTRANSPORT_ITERATIONS"
     done
 }
 
@@ -745,7 +823,7 @@ run_browser_against_connect_server() {
     local port=$3
     local run
     for ((run = 1; run <= WEBTRANSPORT_RUNS; run++)); do
-        run_webtransport_sample "connect-$raw_prefix-run-$run" "$run" chrome "$server" playwright-chromium env TREVRPC_CONNECT_INSECURE_SKIP_VERIFY=1 node trevrpc-js/bench/webtransport_browser.js --connect "$STATIC_URL" "https://127.0.0.1:$port" "$WEBTRANSPORT_ITERATIONS"
+        run_webtransport_sample "connect-$raw_prefix-run-$run" "$run" chrome "$server" playwright-chromium env TREVRPC_CONNECT_INSECURE_SKIP_VERIFY=1 "${BENCH_ENV[@]}" node trevrpc-js/bench/webtransport_browser.js --connect "$STATIC_URL" "https://127.0.0.1:$port" "$WEBTRANSPORT_ITERATIONS"
     done
 }
 
@@ -758,7 +836,7 @@ run_webtransport_benchmarks() {
     start_static_server "$cert_file"
 
     if [[ "$RUN_GO" == "1" ]]; then
-        start_server webtransport-go-server "$GO_SPLIT_BENCH" -mode server -transport webtransport -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
+        start_server webtransport-go-server env "${BENCH_ENV[@]}" "$GO_SPLIT_BENCH" -mode server -transport webtransport -addr 127.0.0.1:0 -cert "$cert_file" -key "$key_file"
         port=$START_SERVER_PORT
         run_browser_against_server go go_quic "$port" "$cert_file"
         stop_rpc_servers
@@ -767,28 +845,28 @@ run_webtransport_benchmarks() {
     if [[ "$RUN_RUST" == "1" ]]; then
         local rust_cert="$OUT_DIR_ABS/rust-webtransport-cert.pem"
         rm -f "$rust_cert"
-        start_server webtransport-rust-server "$RUST_SPLIT_BENCH" webtransport-server 127.0.0.1:0 "$rust_cert" "$STATIC_ORIGIN"
+        start_server webtransport-rust-server env "${BENCH_ENV[@]}" "$RUST_SPLIT_BENCH" webtransport-server 127.0.0.1:0 "$rust_cert" "$STATIC_ORIGIN"
         port=$START_SERVER_PORT
         run_browser_against_server rust rust_quinn "$port" "$rust_cert"
         stop_rpc_servers
     fi
 
     if [[ "$RUN_C" == "1" ]]; then
-        start_server webtransport-c-server "$c_bench" --split-serve
+        start_server webtransport-c-server env "${BENCH_ENV[@]}" "$c_bench" --split-serve
         port=$START_SERVER_PORT
         run_browser_against_server c c_msquic "$port" "$cert_file"
         stop_rpc_servers
     fi
 
     if [[ "$RUN_JS" == "1" ]]; then
-        start_server webtransport-js-server env "TREVRPC_WEBTRANSPORT_ORIGIN=$STATIC_ORIGIN" node trevrpc-js/bench/rpc_split_native.js server "$cert_file" "$key_file"
+        start_server webtransport-js-server env "TREVRPC_WEBTRANSPORT_ORIGIN=$STATIC_ORIGIN" "${BENCH_ENV[@]}" node trevrpc-js/bench/rpc_split_native.js server "$cert_file" "$key_file"
         port=$START_SERVER_PORT
         run_browser_against_server js js_msquic "$port" "$cert_file"
         stop_rpc_servers
     fi
 
     if [[ "$RUN_GO_CONNECT" == "1" ]]; then
-        start_server connect-go-server "$GO_SPLIT_BENCH" -mode server -transport connect -addr 127.0.0.1:0 -origin "$STATIC_ORIGIN" -cert "$cert_file" -key "$key_file"
+        start_server connect-go-server env "${BENCH_ENV[@]}" "$GO_SPLIT_BENCH" -mode server -transport connect -addr 127.0.0.1:0 -origin "$STATIC_ORIGIN" -cert "$cert_file" -key "$key_file"
         port=$START_SERVER_PORT
         run_browser_against_connect_server go-connect go_connect "$port"
         stop_rpc_servers
@@ -805,6 +883,7 @@ fi
 
 aggregate_samples_csv
 assert_no_plaintext_rows
+assert_benchmark_labels
 write_markdown_report
 
 printf '\nWrote WebTransport CSV: %s\n' "$CSV"

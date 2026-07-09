@@ -30,6 +30,8 @@ use tonic::transport::{
 mod greeter;
 
 const REQUEST_NAME: &str = "TrevRPC benchmark";
+const PAYLOAD_PROFILE_ENV: &str = "TREVRPC_BENCH_PAYLOAD_PROFILE";
+const METADATA_PROFILE_ENV: &str = "TREVRPC_BENCH_METADATA_PROFILE";
 const LATENCY_STREAM_MESSAGE_COUNT: usize = 1;
 const GRPC_SERVICE: &str = "example.greeter.Greeter";
 const GRPC_SAY_HELLO_PATH: &str = "/example.greeter.Greeter/SayHello";
@@ -100,8 +102,11 @@ async fn run_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> Benc
     let client = greeter::GreeterClient::new(trevrpc::quinn::Client::new(connection.clone()));
 
     warm_client(&client).await?;
-    run_latency_case("unary_latency", iterations, || trevrpc_unary_call(&client)).await?;
-    run_latency_case("server_stream_latency", iterations, || {
+    run_latency_case("unary_latency", iterations, |index| {
+        trevrpc_unary_call(&client, usize::try_from(index).unwrap())
+    })
+    .await?;
+    run_latency_case("server_stream_latency", iterations, |_| {
         trevrpc_server_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
     })
     .await?;
@@ -109,7 +114,7 @@ async fn run_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> Benc
         trevrpc_server_streaming_call(&client, usize::try_from(iterations).unwrap())
     })
     .await?;
-    run_latency_case("client_stream_latency", iterations, || {
+    run_latency_case("client_stream_latency", iterations, |_| {
         trevrpc_client_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
     })
     .await?;
@@ -117,7 +122,7 @@ async fn run_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> Benc
         trevrpc_client_streaming_call(&client, usize::try_from(iterations).unwrap())
     })
     .await?;
-    run_latency_case("bidi_stream_latency", iterations, || {
+    run_latency_case("bidi_stream_latency", iterations, |_| {
         trevrpc_bidi_streaming_call(&client, LATENCY_STREAM_MESSAGE_COUNT)
     })
     .await?;
@@ -174,8 +179,8 @@ async fn run_grpc_client(addr: SocketAddr, cert_path: &Path, iterations: u32) ->
     let throughput_messages = usize::try_from(iterations)?;
 
     let start = Instant::now();
-    for _ in 0..iterations {
-        grpc_unary_call(&mut client).await?;
+    for index in 0..iterations {
+        grpc_unary_call(&mut client, usize::try_from(index)?).await?;
     }
     print_latency_result("unary_latency", iterations, start.elapsed());
 
@@ -229,7 +234,7 @@ async fn run_grpc_server(addr: SocketAddr, cert_path: &Path, key_path: &Path) ->
 }
 
 async fn warm_client(client: &greeter::GreeterClient<trevrpc::quinn::Client>) -> BenchResult {
-    trevrpc_unary_call(client).await?;
+    trevrpc_unary_call(client, 0).await?;
     trevrpc_server_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
     trevrpc_client_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
     trevrpc_bidi_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
@@ -237,7 +242,7 @@ async fn warm_client(client: &greeter::GreeterClient<trevrpc::quinn::Client>) ->
 }
 
 async fn warm_grpc_client(client: &mut GrpcGreeterClient<Channel>) -> BenchResult {
-    grpc_unary_call(client).await?;
+    grpc_unary_call(client, 0).await?;
     grpc_server_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
     grpc_client_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
     grpc_bidi_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
@@ -246,12 +251,12 @@ async fn warm_grpc_client(client: &mut GrpcGreeterClient<Channel>) -> BenchResul
 
 async fn run_latency_case<F, Fut>(name: &str, iterations: u32, mut call: F) -> BenchResult
 where
-    F: FnMut() -> Fut,
+    F: FnMut(u32) -> Fut,
     Fut: Future<Output = BenchResult>,
 {
     let start = Instant::now();
-    for _ in 0..iterations {
-        call().await?;
+    for index in 0..iterations {
+        call(index).await?;
     }
     let elapsed = start.elapsed();
     print_latency_result(name, iterations, elapsed);
@@ -286,18 +291,148 @@ fn print_message_throughput_result(name: &str, messages: u32, elapsed: Duration)
     );
 }
 
+fn payload_values() -> &'static [String] {
+    static VALUES: OnceLock<Vec<String>> = OnceLock::new();
+    VALUES.get_or_init(|| match std::env::var(PAYLOAD_PROFILE_ENV).as_deref() {
+        Ok("" | "tiny") | Err(_) => vec![REQUEST_NAME.to_owned()],
+        Ok("small") => vec!["x".repeat(253)],
+        Ok("medium") => vec!["x".repeat(4093)],
+        Ok("large") => vec!["x".repeat(65_532)],
+        Ok("mixed") => vec![
+            REQUEST_NAME.to_owned(),
+            "x".repeat(253),
+            "x".repeat(4093),
+            "x".repeat(65_532),
+        ],
+        Ok(profile) => {
+            eprintln!("unsupported {PAYLOAD_PROFILE_ENV}: {profile}");
+            std::process::exit(2);
+        }
+    })
+}
+
+fn benchmark_payload(index: usize) -> String {
+    let values = payload_values();
+    values[index % values.len()].clone()
+}
+
+fn benchmark_request(index: usize) -> greeter::HelloRequest {
+    greeter::HelloRequest {
+        name: benchmark_payload(index),
+    }
+}
+
+fn benchmark_metadata_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var(METADATA_PROFILE_ENV).as_deref() {
+        Ok("" | "none") | Err(_) => false,
+        Ok("production") => true,
+        Ok(profile) => {
+            eprintln!("unsupported {METADATA_PROFILE_ENV}: {profile}");
+            std::process::exit(2);
+        }
+    })
+}
+
+fn benchmark_metadata() -> trevrpc::Metadata {
+    if !benchmark_metadata_enabled() {
+        return trevrpc::Metadata::new();
+    }
+    trevrpc::Metadata::from([
+        ("benchmark-client".to_owned(), b"trevrpc-bench".to_vec()),
+        ("benchmark-profile".to_owned(), b"production".to_vec()),
+        (
+            "benchmark-trace-id".to_owned(),
+            b"trevrpc-benchmark".to_vec(),
+        ),
+    ])
+}
+
+fn apply_tonic_metadata<T>(request: &mut tonic::Request<T>) {
+    if !benchmark_metadata_enabled() {
+        return;
+    }
+    let metadata = request.metadata_mut();
+    metadata.insert(
+        "benchmark-client",
+        tonic::metadata::MetadataValue::from_static("trevrpc-bench"),
+    );
+    metadata.insert(
+        "benchmark-profile",
+        tonic::metadata::MetadataValue::from_static("production"),
+    );
+    metadata.insert(
+        "benchmark-trace-id",
+        tonic::metadata::MetadataValue::from_static("trevrpc-benchmark"),
+    );
+}
+
+fn validate_tonic_metadata<T>(request: &tonic::Request<T>) -> Result<(), tonic::Status> {
+    if !benchmark_metadata_enabled() {
+        return Ok(());
+    }
+    for (key, expected) in [
+        ("benchmark-client", "trevrpc-bench"),
+        ("benchmark-profile", "production"),
+        ("benchmark-trace-id", "trevrpc-benchmark"),
+    ] {
+        let Some(actual) = request
+            .metadata()
+            .get(key)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Err(tonic::Status::invalid_argument(format!(
+                "missing metadata {key:?}"
+            )));
+        };
+        if actual != expected {
+            return Err(tonic::Status::invalid_argument(format!(
+                "metadata {key:?} = {actual:?}, want {expected:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn set_tonic_response_metadata<T>(response: &mut tonic::Response<T>) {
+    if benchmark_metadata_enabled() {
+        response.metadata_mut().insert(
+            "benchmark-response",
+            tonic::metadata::MetadataValue::from_static("ok"),
+        );
+    }
+}
+
+fn validate_tonic_response_metadata<T>(response: tonic::Response<T>) -> Result<T, tonic::Status> {
+    if benchmark_metadata_enabled() {
+        let Some(actual) = response
+            .metadata()
+            .get("benchmark-response")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Err(tonic::Status::internal(
+                "missing benchmark-response metadata",
+            ));
+        };
+        if actual != "ok" {
+            return Err(tonic::Status::internal(format!(
+                "benchmark-response metadata = {actual:?}, want \"ok\""
+            )));
+        }
+    }
+    Ok(response.into_inner())
+}
+
 async fn trevrpc_unary_call(
     client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    index: usize,
 ) -> BenchResult {
+    let request = benchmark_request(index);
+    let expected = request.name.clone();
     let response = client
-        .say_hello(
-            greeter::HelloRequest {
-                name: REQUEST_NAME.to_owned(),
-            },
-            split_benchmark_call_options(),
-        )
+        .say_hello(request, split_benchmark_call_options())
         .await?;
-    if response.message != REQUEST_NAME {
+    if response.message != expected {
         return Err(format!("unary response = {:?}", response.message).into());
     }
     Ok(())
@@ -317,7 +452,7 @@ async fn trevrpc_server_streaming_call(
         .await?;
     let mut count = 0;
     while let Some(reply) = replies.next().await {
-        if reply?.message != "server stream" {
+        if reply?.message != benchmark_payload(count) {
             return Err("unexpected server-stream response".into());
         }
         count += 1;
@@ -357,7 +492,7 @@ async fn trevrpc_bidi_streaming_call(
         .await?;
     let mut count = 0;
     while let Some(reply) = replies.next().await.transpose()? {
-        if reply.message != REQUEST_NAME {
+        if reply.message != benchmark_payload(count) {
             return Err("unexpected bidi response".into());
         }
         count += 1;
@@ -368,13 +503,11 @@ async fn trevrpc_bidi_streaming_call(
     Ok(())
 }
 
-async fn grpc_unary_call(client: &mut GrpcGreeterClient<Channel>) -> BenchResult {
-    let response = client
-        .say_hello(greeter::HelloRequest {
-            name: REQUEST_NAME.to_owned(),
-        })
-        .await?;
-    if response.message != REQUEST_NAME {
+async fn grpc_unary_call(client: &mut GrpcGreeterClient<Channel>, index: usize) -> BenchResult {
+    let request = benchmark_request(index);
+    let expected = request.name.clone();
+    let response = client.say_hello(request).await?;
+    if response.message != expected {
         return Err(format!("gRPC unary response = {:?}", response.message).into());
     }
     Ok(())
@@ -391,7 +524,7 @@ async fn grpc_server_streaming_call(
         .await?;
     let mut count = 0;
     while let Some(reply) = replies.message().await? {
-        if reply.message != "server stream" {
+        if reply.message != benchmark_payload(count) {
             return Err("unexpected gRPC server-stream response".into());
         }
         count += 1;
@@ -421,7 +554,7 @@ async fn grpc_bidi_streaming_call(
     let mut replies = client.bidi_hello(message_count).await?;
     let mut count = 0;
     while let Some(reply) = replies.message().await? {
-        if reply.message != REQUEST_NAME {
+        if reply.message != benchmark_payload(count) {
             return Err("unexpected gRPC bidi response".into());
         }
         count += 1;
@@ -433,9 +566,7 @@ async fn grpc_bidi_streaming_call(
 }
 
 fn benchmark_requests(message_count: usize) -> impl Iterator<Item = greeter::HelloRequest> {
-    (0..message_count).map(|_| greeter::HelloRequest {
-        name: REQUEST_NAME.to_owned(),
-    })
+    (0..message_count).map(benchmark_request)
 }
 
 #[trevrpc::async_trait]
@@ -453,10 +584,10 @@ impl greeter::Greeter for SplitGreeter {
         &self,
         request: greeter::HelloRequest,
     ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
-        let (count, message) = server_stream_spec_from_name(&request.name);
-        Ok(trevrpc::stream::from_iter((0..count).map(move |_| {
+        let count = message_count_from_name(&request.name);
+        Ok(trevrpc::stream::from_iter((0..count).map(|index| {
             greeter::HelloReply {
-                message: message.clone(),
+                message: benchmark_payload(index),
             }
         })))
     }
@@ -488,19 +619,6 @@ fn message_count_from_name(name: &str) -> usize {
         .ok()
         .filter(|count| *count > 0)
         .unwrap_or(LATENCY_STREAM_MESSAGE_COUNT)
-}
-
-fn server_stream_spec_from_name(name: &str) -> (usize, String) {
-    let Some((count, payload_bytes)) = name.split_once(':') else {
-        return (message_count_from_name(name), "server stream".to_owned());
-    };
-    let payload_bytes = payload_bytes.parse::<usize>().unwrap_or(0);
-    let message = if payload_bytes > 0 {
-        "x".repeat(payload_bytes)
-    } else {
-        "server stream".to_owned()
-    };
-    (message_count_from_name(count), message)
 }
 
 struct BidiReplies {
@@ -555,42 +673,53 @@ impl GrpcGreeter for SplitGreeter {
         &self,
         request: tonic::Request<greeter::HelloRequest>,
     ) -> Result<tonic::Response<greeter::HelloReply>, tonic::Status> {
-        Ok(tonic::Response::new(greeter::HelloReply {
+        validate_tonic_metadata(&request)?;
+        let mut response = tonic::Response::new(greeter::HelloReply {
             message: request.into_inner().name,
-        }))
+        });
+        set_tonic_response_metadata(&mut response);
+        Ok(response)
     }
 
     async fn lots_of_replies(
         &self,
         request: tonic::Request<greeter::HelloRequest>,
     ) -> Result<tonic::Response<Self::LotsOfRepliesStream>, tonic::Status> {
-        let (count, message) = server_stream_spec_from_name(&request.into_inner().name);
-        let replies = (0..count).map(move |_| {
+        validate_tonic_metadata(&request)?;
+        let count = message_count_from_name(&request.into_inner().name);
+        let replies = (0..count).map(|index| {
             Ok::<_, tonic::Status>(greeter::HelloReply {
-                message: message.clone(),
+                message: benchmark_payload(index),
             })
         });
-        Ok(tonic::Response::new(Box::pin(tokio_stream::iter(replies))))
+        let replies: GrpcReplyStream = Box::pin(tokio_stream::iter(replies));
+        let mut response = tonic::Response::new(replies);
+        set_tonic_response_metadata(&mut response);
+        Ok(response)
     }
 
     async fn lots_of_greetings(
         &self,
         request: tonic::Request<tonic::Streaming<greeter::HelloRequest>>,
     ) -> Result<tonic::Response<greeter::HelloReply>, tonic::Status> {
+        validate_tonic_metadata(&request)?;
         let mut requests = request.into_inner();
         let mut count = 0;
         while let Some(_request) = requests.message().await? {
             count += 1;
         }
-        Ok(tonic::Response::new(greeter::HelloReply {
+        let mut response = tonic::Response::new(greeter::HelloReply {
             message: format!("streamed {count} greetings"),
-        }))
+        });
+        set_tonic_response_metadata(&mut response);
+        Ok(response)
     }
 
     async fn bidi_hello(
         &self,
         request: tonic::Request<tonic::Streaming<greeter::HelloRequest>>,
     ) -> Result<tonic::Response<Self::BidiHelloStream>, tonic::Status> {
+        validate_tonic_metadata(&request)?;
         let mut requests = request.into_inner();
         let (sender, receiver) = mpsc::channel(1);
         tokio::spawn(async move {
@@ -615,9 +744,10 @@ impl GrpcGreeter for SplitGreeter {
                 }
             }
         });
-        Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
-            receiver,
-        ))))
+        let replies: GrpcReplyStream = Box::pin(ReceiverStream::new(receiver));
+        let mut response = tonic::Response::new(replies);
+        set_tonic_response_metadata(&mut response);
+        Ok(response)
     }
 }
 
@@ -829,6 +959,7 @@ where
             tonic::Status::unknown(format!("gRPC service was not ready: {}", error.into()))
         })?;
         let mut request = tonic::Request::new(request);
+        apply_tonic_metadata(&mut request);
         request
             .extensions_mut()
             .insert(tonic::GrpcMethod::new(GRPC_SERVICE, "SayHello"));
@@ -837,7 +968,7 @@ where
         self.inner
             .unary(request, path, codec)
             .await
-            .map(tonic::Response::into_inner)
+            .and_then(validate_tonic_response_metadata)
     }
 
     async fn lots_of_replies(
@@ -848,6 +979,7 @@ where
             tonic::Status::unknown(format!("gRPC service was not ready: {}", error.into()))
         })?;
         let mut request = tonic::Request::new(request);
+        apply_tonic_metadata(&mut request);
         request
             .extensions_mut()
             .insert(tonic::GrpcMethod::new(GRPC_SERVICE, "LotsOfReplies"));
@@ -856,7 +988,7 @@ where
         self.inner
             .server_streaming(request, path, codec)
             .await
-            .map(tonic::Response::into_inner)
+            .and_then(validate_tonic_response_metadata)
     }
 
     async fn lots_of_greetings(
@@ -868,6 +1000,7 @@ where
         })?;
         let mut request =
             tonic::Request::new(tokio_stream::iter(benchmark_requests(message_count)));
+        apply_tonic_metadata(&mut request);
         request
             .extensions_mut()
             .insert(tonic::GrpcMethod::new(GRPC_SERVICE, "LotsOfGreetings"));
@@ -876,7 +1009,7 @@ where
         self.inner
             .client_streaming(request, path, codec)
             .await
-            .map(tonic::Response::into_inner)
+            .and_then(validate_tonic_response_metadata)
     }
 
     async fn bidi_hello(
@@ -888,6 +1021,7 @@ where
         })?;
         let mut request =
             tonic::Request::new(tokio_stream::iter(benchmark_requests(message_count)));
+        apply_tonic_metadata(&mut request);
         request
             .extensions_mut()
             .insert(tonic::GrpcMethod::new(GRPC_SERVICE, "BidiHello"));
@@ -896,7 +1030,7 @@ where
         self.inner
             .streaming(request, path, codec)
             .await
-            .map(tonic::Response::into_inner)
+            .and_then(validate_tonic_response_metadata)
     }
 }
 
@@ -915,8 +1049,15 @@ fn split_benchmark_server_options() -> trevrpc::server::ServerOptions {
 }
 
 fn split_benchmark_call_options() -> trevrpc::client::CallOptions {
-    trevrpc::client::CallOptions::new()
-        .with_stream_idle_timeout(split_benchmark_stream_idle_timeout())
+    let options = trevrpc::client::CallOptions::new()
+        .with_stream_idle_timeout(split_benchmark_stream_idle_timeout());
+    if benchmark_metadata_enabled() {
+        options
+            .with_timeout(Duration::from_mins(10))
+            .with_metadata_map(benchmark_metadata())
+    } else {
+        options
+    }
 }
 
 fn split_benchmark_stream_idle_timeout() -> Option<Duration> {

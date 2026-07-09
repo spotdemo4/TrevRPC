@@ -71,7 +71,11 @@ try {
 
   await page.goto(pageURL, { waitUntil: "domcontentloaded" });
   const results = connectMode
-    ? await page.evaluate(runConnectBenchmarks, { connectURL: endpointURL, iterations })
+    ? await page.evaluate(runConnectBenchmarks, {
+        benchmarkConfig,
+        connectURL: endpointURL,
+        iterations,
+      })
     : await page.evaluate(runBrowserBenchmarks, {
         benchmarkConfig,
         certificateSha256Base64,
@@ -108,7 +112,8 @@ async function runBrowserBenchmarks({
   webTransportURL,
 }) {
   const LatencyStreamMessageCount = 1;
-  const RequestName = payloadName(benchmarkConfig.payloadBytes);
+  const PayloadValues = payloadValues(benchmarkConfig.payloadProfile);
+  const RequestName = payloadForIndex(0);
   const { connect, createRoot, createServiceClient } = await import("/src/index.js");
   const root = createRoot({
     nested: {
@@ -195,9 +200,10 @@ async function runBrowserBenchmarks({
   const callOptions = benchmarkConfig.disableStreamTimeouts
     ? { streamIdleTimeoutMs: 0 }
     : { streamIdleTimeoutMs: 600_000, timeoutMs: 600_000 };
-  if (benchmarkConfig.payloadBytes > 0) {
-    callOptions.maxResponseStreamBodySize = -1;
+  if (Object.keys(benchmarkConfig.metadata).length > 0) {
+    callOptions.metadata = benchmarkConfig.metadata;
   }
+  callOptions.maxResponseStreamBodySize = -1;
   const client = createServiceClient(transport, GreeterService, root, callOptions);
 
   try {
@@ -270,21 +276,8 @@ async function runBrowserBenchmarks({
     }
   }
 
-  function payloadName(size) {
-    if (size <= 0) {
-      return "TrevRPC benchmark";
-    }
-    return "x".repeat(size);
-  }
-
   function serverStreamRequestName(messageCount) {
-    return benchmarkConfig.payloadBytes > 0
-      ? `${messageCount}:${benchmarkConfig.payloadBytes}`
-      : String(messageCount);
-  }
-
-  function expectedServerStreamMessage() {
-    return benchmarkConfig.payloadBytes > 0 ? RequestName : "server stream";
+    return String(messageCount);
   }
 
   async function runConcurrent(count, fn) {
@@ -339,9 +332,8 @@ async function runBrowserBenchmarks({
       { maxResponseMessages: messageCount },
     );
     let count = 0;
-    const expected = expectedServerStreamMessage();
     for await (const reply of replies) {
-      if (reply.message !== expected) {
+      if (reply.message !== payloadForIndex(count)) {
         throw new Error(`unexpected server-stream response: ${JSON.stringify(reply)}`);
       }
       count += 1;
@@ -376,7 +368,7 @@ async function runBrowserBenchmarks({
         if (reply === undefined) {
           break;
         }
-        if (reply.message !== RequestName) {
+        if (reply.message !== payloadForIndex(received)) {
           throw new Error(`unexpected bidi response: ${JSON.stringify(reply)}`);
         }
         received += 1;
@@ -391,20 +383,44 @@ async function runBrowserBenchmarks({
     const batchSize = benchmarkConfig.sendManyBatchSize;
     if (batchSize <= 1 || typeof call.sendMany !== "function") {
       for (let index = 0; index < messageCount; index += 1) {
-        await call.send({ name: RequestName });
+        await call.send({ name: payloadForIndex(index) });
       }
       return;
     }
 
     for (let start = 0; start < messageCount; start += batchSize) {
       const count = Math.min(batchSize, messageCount - start);
-      await call.sendMany(Array.from({ length: count }, () => ({ name: RequestName })));
+      await call.sendMany(
+        Array.from({ length: count }, (_, offset) => ({ name: payloadForIndex(start + offset) })),
+      );
     }
+  }
+
+  function payloadValues(profile) {
+    switch (profile) {
+      case "tiny":
+        return ["TrevRPC benchmark"];
+      case "small":
+        return ["x".repeat(253)];
+      case "medium":
+        return ["x".repeat(4093)];
+      case "large":
+        return ["x".repeat(65_532)];
+      case "mixed":
+        return ["TrevRPC benchmark", "x".repeat(253), "x".repeat(4093), "x".repeat(65_532)];
+      default:
+        throw new Error(`unsupported payload profile ${JSON.stringify(profile)}`);
+    }
+  }
+
+  function payloadForIndex(index) {
+    return PayloadValues[index % PayloadValues.length];
   }
 }
 
-async function runConnectBenchmarks({ connectURL, iterations }) {
-  const RequestName = "TrevRPC benchmark";
+async function runConnectBenchmarks({ benchmarkConfig, connectURL, iterations }) {
+  const PayloadValues = payloadValues(benchmarkConfig.payloadProfile);
+  const RequestName = payloadForIndex(0);
   const { createRoot } = await import("/src/index.js");
   const root = createRoot({
     nested: {
@@ -492,13 +508,11 @@ async function runConnectBenchmarks({ connectURL, iterations }) {
   async function unary() {
     const response = await fetch(`${baseURL}/example.greeter.Greeter/SayHello`, {
       body: encodeMessage(HelloRequest, { name: RequestName }),
-      headers: {
-        "Connect-Protocol-Version": "1",
-        "Content-Type": "application/proto",
-      },
+      headers: connectHeaders("application/proto"),
       method: "POST",
     });
     await assertOK(response);
+    assertConnectResponseMetadata(response);
     const reply = HelloReply.decode(new Uint8Array(await response.arrayBuffer()));
     if (reply.message !== RequestName) {
       throw new Error(`unexpected Connect unary response: ${JSON.stringify(reply)}`);
@@ -508,18 +522,16 @@ async function runConnectBenchmarks({ connectURL, iterations }) {
   async function serverStreaming(messageCount) {
     const response = await fetch(`${baseURL}/example.greeter.Greeter/LotsOfReplies`, {
       body: encodeEnvelope(encodeMessage(HelloRequest, { name: String(messageCount) })),
-      headers: {
-        "Connect-Protocol-Version": "1",
-        "Content-Type": "application/connect+proto",
-      },
+      headers: connectHeaders("application/connect+proto"),
       method: "POST",
     });
     await assertOK(response);
+    assertConnectResponseMetadata(response);
 
     let count = 0;
     for await (const body of connectEnvelopeBodies(response.body)) {
       const reply = HelloReply.decode(body);
-      if (reply.message !== "server stream") {
+      if (reply.message !== payloadForIndex(count)) {
         throw new Error(`unexpected Connect server-stream response: ${JSON.stringify(reply)}`);
       }
       count += 1;
@@ -531,6 +543,37 @@ async function runConnectBenchmarks({ connectURL, iterations }) {
 
   function encodeMessage(messageType, message) {
     return messageType.encode(messageType.fromObject(message)).finish();
+  }
+
+  function connectHeaders(contentType) {
+    const headers = {
+      "Connect-Protocol-Version": "1",
+      "Connect-Timeout-Ms": "600000",
+      "Content-Type": contentType,
+      ...benchmarkConfig.metadata,
+    };
+    return headers;
+  }
+
+  function payloadValues(profile) {
+    switch (profile) {
+      case "tiny":
+        return ["TrevRPC benchmark"];
+      case "small":
+        return ["x".repeat(253)];
+      case "medium":
+        return ["x".repeat(4093)];
+      case "large":
+        return ["x".repeat(65_532)];
+      case "mixed":
+        return ["TrevRPC benchmark", "x".repeat(253), "x".repeat(4093), "x".repeat(65_532)];
+      default:
+        throw new Error(`unsupported payload profile ${JSON.stringify(profile)}`);
+    }
+  }
+
+  function payloadForIndex(index) {
+    return PayloadValues[index % PayloadValues.length];
   }
 
   function encodeEnvelope(body) {
@@ -545,6 +588,16 @@ async function runConnectBenchmarks({ connectURL, iterations }) {
   async function assertOK(response) {
     if (!response.ok) {
       throw new Error(`Connect request failed with ${response.status}: ${await response.text()}`);
+    }
+  }
+
+  function assertConnectResponseMetadata(response) {
+    if (Object.keys(benchmarkConfig.metadata).length === 0) {
+      return;
+    }
+    const value = response.headers.get("benchmark-response");
+    if (value !== "ok") {
+      throw new Error(`Connect response metadata benchmark-response = ${JSON.stringify(value)}`);
     }
   }
 
@@ -646,21 +699,9 @@ function positiveInteger(value) {
   return Number(value);
 }
 
-function nonNegativeInteger(value, name) {
-  if (!/^[0-9]+$/.test(value)) {
-    throw new Error(`${name} must be a non-negative integer, got ${JSON.stringify(value)}`);
-  }
-  return Number(value);
-}
-
 function optionalPositiveInteger(name, defaultValue) {
   const value = process.env[name];
   return value == null || value === "" ? defaultValue : positiveInteger(value);
-}
-
-function optionalNonNegativeInteger(name, defaultValue) {
-  const value = process.env[name];
-  return value == null || value === "" ? defaultValue : nonNegativeInteger(value, name);
 }
 
 function envFlag(name) {
@@ -682,12 +723,35 @@ function benchmarkConfigFromEnv() {
     concurrentStreams: optionalPositiveInteger("WEBTRANSPORT_CONCURRENT_STREAMS", 1),
     congestionControl,
     disableStreamTimeouts: envFlag("WEBTRANSPORT_DISABLE_STREAM_TIMEOUTS"),
-    payloadBytes: optionalNonNegativeInteger("WEBTRANSPORT_PAYLOAD_BYTES", 0),
+    metadata: metadataProfile(process.env.TREVRPC_BENCH_METADATA_PROFILE ?? "none"),
+    payloadProfile: payloadProfile(process.env.TREVRPC_BENCH_PAYLOAD_PROFILE ?? "tiny"),
     sendManyBatchSize: optionalPositiveInteger("WEBTRANSPORT_SEND_MANY_BATCH", 1),
     streamReadBatchMaxMessages: optionalPositiveInteger("WEBTRANSPORT_STREAM_READ_BATCH", 0),
     streamWriteBatchMaxBytes: optionalPositiveInteger("WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES", 0),
     streamWriteBatchMaxMessages: optionalPositiveInteger("WEBTRANSPORT_STREAM_WRITE_BATCH", 0),
   };
+}
+
+function payloadProfile(profile) {
+  if (["tiny", "small", "medium", "large", "mixed"].includes(profile)) {
+    return profile;
+  }
+  throw new Error(`unsupported TREVRPC_BENCH_PAYLOAD_PROFILE ${JSON.stringify(profile)}`);
+}
+
+function metadataProfile(profile) {
+  switch (profile) {
+    case "none":
+      return {};
+    case "production":
+      return {
+        "benchmark-client": "trevrpc-bench",
+        "benchmark-profile": "production",
+        "benchmark-trace-id": "trevrpc-benchmark",
+      };
+    default:
+      throw new Error(`unsupported TREVRPC_BENCH_METADATA_PROFILE ${JSON.stringify(profile)}`);
+  }
 }
 
 function requiredArg(index, name) {
