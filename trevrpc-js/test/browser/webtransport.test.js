@@ -75,40 +75,122 @@ test("browser WebTransport rejects an unexpected authority", { timeout: 120_000 
   });
 });
 
+const lifecycleCases = [
+  {
+    name: "terminal OK completes while upload is pending",
+    scenario: "early-ok",
+    assertResult(result) {
+      assert.deepEqual(result, { value: "early ok" });
+    },
+  },
+  {
+    name: "terminal error wins over pending upload",
+    scenario: "early-error",
+    assertResult(result) {
+      assert.equal(result.code, 7);
+      assert.equal(result.message, "remote rejected upload");
+    },
+  },
+  {
+    name: "local abort cancels pending response read",
+    eventPattern: /EVENT pending_cancelled/,
+    scenario: "local-abort",
+    assertResult(result) {
+      assert.equal(result.code, 1);
+    },
+  },
+  {
+    name: "response stream return cancels server work",
+    eventPattern: /EVENT response_stream_closed/,
+    scenario: "early-return",
+    assertResult(result) {
+      assert.deepEqual(result, { first: "first" });
+    },
+  },
+  {
+    name: "long server stream preserves count and order",
+    scenario: "long-server-stream",
+    assertResult(result) {
+      assert.deepEqual(result.values, expectedSequence("reply", 256));
+    },
+  },
+  {
+    name: "long bidi stream preserves count and order",
+    scenario: "long-bidi",
+    assertResult(result) {
+      assert.deepEqual(result.values, expectedSequence("echo", 256));
+    },
+  },
+  {
+    name: "surfaces terminal error after streamed messages",
+    scenario: "error-after-messages",
+    assertResult(result) {
+      assert.deepEqual(result.values, expectedSequence("before-error", 32));
+      assert.equal(result.code, 7);
+      assert.equal(result.message, "stream failed after messages");
+    },
+  },
+];
+
+for (const lifecycleCase of lifecycleCases) {
+  test(`browser WebTransport ${lifecycleCase.name}`, { timeout: 120_000 }, async () => {
+    await runBrowserLifecycleScenario(lifecycleCase);
+  });
+}
+
 test(
-  "browser WebTransport terminal OK completes while upload is pending",
+  "browser WebTransport Rust lifecycle server matches Go lifecycle scenarios",
   { timeout: 120_000 },
   async () => {
-    await runBrowserLifecycleScenario({
-      scenario: "early-ok",
-      assertResult(result) {
-        assert.deepEqual(result, { value: "early ok" });
+    await runBrowserLifecycleSuite({
+      cases: lifecycleCases,
+      server: servers.lifecycleRust,
+    });
+  },
+);
+
+test(
+  "browser WebTransport page close cancels open response stream",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleTeardownScenario({
+      action: async ({ page }) => {
+        await page.close();
       },
     });
   },
 );
 
 test(
-  "browser WebTransport terminal error wins over pending upload",
+  "browser WebTransport navigation cancels open response stream",
   { timeout: 120_000 },
   async () => {
-    await runBrowserLifecycleScenario({
-      scenario: "early-error",
-      assertResult(result) {
-        assert.equal(result.code, 7);
-        assert.equal(result.message, "remote rejected upload");
+    await runBrowserLifecycleTeardownScenario({
+      action: async ({ page }) => {
+        await page.goto("about:blank", { waitUntil: "domcontentloaded" });
       },
     });
   },
 );
 
 test(
-  "browser WebTransport local abort cancels pending response read",
+  "browser WebTransport context close cancels open response stream",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserLifecycleTeardownScenario({
+      action: async ({ page }) => {
+        await page.context().close();
+      },
+    });
+  },
+);
+
+test(
+  "browser WebTransport stream-open abort cancels pending stream creation",
   { timeout: 120_000 },
   async () => {
     await runBrowserLifecycleScenario({
-      eventPattern: /EVENT pending_cancelled/,
-      scenario: "local-abort",
+      scenario: "stream-open-abort",
       assertResult(result) {
         assert.equal(result.code, 1);
       },
@@ -117,57 +199,18 @@ test(
 );
 
 test(
-  "browser WebTransport response stream return cancels server work",
+  "browser WebTransport Go server shutdown mid-stream fails active response stream",
   { timeout: 120_000 },
   async () => {
-    await runBrowserLifecycleScenario({
-      eventPattern: /EVENT response_stream_closed/,
-      scenario: "early-return",
-      assertResult(result) {
-        assert.deepEqual(result, { first: "first" });
-      },
-    });
+    await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycle });
   },
 );
 
 test(
-  "browser WebTransport long server stream preserves count and order",
+  "browser WebTransport Rust server shutdown mid-stream fails active response stream",
   { timeout: 120_000 },
   async () => {
-    await runBrowserLifecycleScenario({
-      scenario: "long-server-stream",
-      assertResult(result) {
-        assert.deepEqual(result.values, expectedSequence("reply", 256));
-      },
-    });
-  },
-);
-
-test(
-  "browser WebTransport long bidi stream preserves count and order",
-  { timeout: 120_000 },
-  async () => {
-    await runBrowserLifecycleScenario({
-      scenario: "long-bidi",
-      assertResult(result) {
-        assert.deepEqual(result.values, expectedSequence("echo", 256));
-      },
-    });
-  },
-);
-
-test(
-  "browser WebTransport surfaces terminal error after streamed messages",
-  { timeout: 120_000 },
-  async () => {
-    await runBrowserLifecycleScenario({
-      scenario: "error-after-messages",
-      assertResult(result) {
-        assert.deepEqual(result.values, expectedSequence("before-error", 32));
-        assert.equal(result.code, 7);
-        assert.equal(result.message, "stream failed after messages");
-      },
-    });
+    await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycleRust });
   },
 );
 
@@ -211,11 +254,11 @@ const servers = {
   lifecycle: {
     readyPattern: /READY https:\/\/[^\s]+\/trevrpc/,
     certificatePattern: /certificate written to/,
-    spawn({ addr, authorities, origin, certPath }) {
+    spawn({ addr, authorities, origin, certPath, maxStreams }) {
       const serverPath = process.env.TREVRPC_BROWSER_LIFECYCLE_GO_SERVER;
       const options = {
         cwd: serverPath == null || serverPath === "" ? goRoot : repoRoot,
-        env: serverEnv({ addr, authorities, origin, certPath }),
+        env: serverEnv({ addr, authorities, origin, certPath, maxStreams }),
       };
       if (serverPath != null && serverPath !== "") {
         return spawnManaged(serverPath, [], options);
@@ -224,9 +267,91 @@ const servers = {
       return spawnManaged("go", ["run", "./cmd/trevrpc-browser-lifecycle-go"], options);
     },
   },
+  lifecycleRust: {
+    readyPattern: /READY https:\/\/[^\s]+\/trevrpc/,
+    certificatePattern: /certificate written to/,
+    spawn({ addr, authorities, origin, certPath, maxStreams }) {
+      const serverPath = process.env.TREVRPC_BROWSER_LIFECYCLE_RUST_SERVER;
+      const options = {
+        cwd: serverPath == null || serverPath === "" ? rustRoot : repoRoot,
+        env: serverEnv({ addr, authorities, origin, certPath, maxStreams }),
+      };
+      if (serverPath != null && serverPath !== "") {
+        return spawnManaged(serverPath, [addr], options);
+      }
+
+      return spawnManaged(
+        "cargo",
+        ["run", "--quiet", "--example", "browser_lifecycle_server", "--", addr],
+        options,
+      );
+    },
+  },
 };
 
-async function runBrowserLifecycleScenario({ assertResult, eventPattern, scenario }) {
+async function runBrowserLifecycleScenario({
+  assertResult,
+  eventPattern,
+  scenario,
+  server = servers.lifecycle,
+  serverOptions,
+}) {
+  await runBrowserLifecycleSuite({
+    cases: [{ assertResult, eventPattern, scenario }],
+    server,
+    serverOptions,
+  });
+}
+
+async function runBrowserLifecycleSuite({ cases, server = servers.lifecycle, serverOptions }) {
+  await withBrowserLifecycleEnvironment(
+    { server, serverOptions },
+    async ({ page, rpcServer, webTransportURL }) => {
+      for (const lifecycleCase of cases) {
+        const result = await page.evaluate(runLifecycleBrowserScenario, {
+          scenario: lifecycleCase.scenario,
+          webTransportURL,
+        });
+        lifecycleCase.assertResult(result);
+        if (lifecycleCase.eventPattern != null) {
+          await waitForOutput(rpcServer, lifecycleCase.eventPattern, 10_000);
+        }
+      }
+    },
+  );
+}
+
+async function runBrowserLifecycleTeardownScenario({ action, server = servers.lifecycle }) {
+  await withBrowserLifecycleEnvironment(
+    { server },
+    async ({ browser, page, rpcServer, webTransportURL }) => {
+      const result = await page.evaluate(runLifecycleBrowserScenario, {
+        scenario: "hold-first-then-pending",
+        webTransportURL,
+      });
+      assert.deepEqual(result, { first: "first" });
+
+      await action({ browser, page });
+      await waitForOutput(rpcServer, /EVENT response_stream_closed/, 10_000);
+    },
+  );
+}
+
+async function runBrowserLifecycleServerShutdownScenario({ server }) {
+  await runBrowserLifecycleScenario({
+    scenario: "server-shutdown-after-first",
+    server,
+    assertResult(result) {
+      assert.equal(result.first, "first");
+      assertShutdownStatus(result);
+    },
+  });
+}
+
+async function withBrowserLifecycleEnvironment(
+  { server = servers.lifecycle, serverOptions = {} },
+  run,
+) {
   const tempDir = await mkdtemp(join(tmpdir(), "trevrpc-browser-"));
   const serverPort = await freePort();
   const staticPort = await freePort();
@@ -240,14 +365,15 @@ async function runBrowserLifecycleScenario({ assertResult, eventPattern, scenari
   let pageErrors = [];
 
   try {
-    const rpcServer = servers.lifecycle.spawn({
+    const rpcServer = server.spawn({
       addr: `127.0.0.1:${serverPort}`,
       origin: staticOrigin,
       certPath,
+      ...serverOptions,
     });
     children.push(rpcServer);
-    await waitForOutput(rpcServer, servers.lifecycle.readyPattern, 60_000);
-    await waitForOutput(rpcServer, servers.lifecycle.certificatePattern, 10_000);
+    await waitForOutput(rpcServer, server.readyPattern, 60_000);
+    await waitForOutput(rpcServer, server.certificatePattern, 10_000);
 
     const staticServer = spawnManaged(process.execPath, ["examples/greeter/static-server.js"], {
       cwd: jsRoot,
@@ -270,11 +396,7 @@ async function runBrowserLifecycleScenario({ assertResult, eventPattern, scenari
     });
 
     await page.goto(staticURL, { waitUntil: "domcontentloaded" });
-    const result = await page.evaluate(runLifecycleBrowserScenario, { scenario, webTransportURL });
-    assertResult(result);
-    if (eventPattern != null) {
-      await waitForOutput(rpcServer, eventPattern, 10_000);
-    }
+    await run({ browser, page, rpcServer, webTransportURL });
     assert.deepEqual(pageErrors, []);
   } catch (error) {
     console.error(error?.stack ?? error);
@@ -319,6 +441,7 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
     streamIdleTimeoutMs: 10_000,
     timeoutMs: 10_000,
   };
+  let closeTransport = true;
 
   try {
     switch (scenario) {
@@ -385,6 +508,26 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
         await iterator.return();
         return { first: first.value.value };
       }
+      case "hold-first-then-pending": {
+        const stream = await serverStreaming(
+          transport,
+          service,
+          "FirstThenPending",
+          Message,
+          Message,
+          {},
+          options,
+        );
+        const iterator = stream[Symbol.asyncIterator]();
+        const first = await iterator.next();
+        if (first.done) {
+          throw new Error("expected first response before holding stream");
+        }
+
+        globalThis.__trevrpcLifecycleHold = { iterator, transport };
+        closeTransport = false;
+        return { first: first.value.value };
+      }
       case "long-server-stream": {
         const stream = await serverStreaming(
           transport,
@@ -440,11 +583,58 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
         }
         throw new Error("expected terminal error after streamed messages");
       }
+      case "server-shutdown-after-first": {
+        const values = [];
+        try {
+          const stream = await serverStreaming(
+            transport,
+            service,
+            "ShutdownAfterFirst",
+            Message,
+            Message,
+            {},
+            options,
+          );
+          for await (const response of stream) {
+            values.push(response.value);
+          }
+        } catch (error) {
+          return { code: error.code, first: values[0], message: error.statusMessage };
+        }
+        throw new Error("expected server shutdown to fail the stream");
+      }
+      case "stream-open-abort": {
+        const originalOpen = transport.openBidirectionalStream.bind(transport);
+        transport.openBidirectionalStream = async () => {
+          const stream = await originalOpen();
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+          return stream;
+        };
+        const controller = new AbortController();
+        const stream = serverStreaming(
+          transport,
+          service,
+          "Pending",
+          Message,
+          Message,
+          {},
+          { ...options, signal: controller.signal },
+        );
+        setTimeout(() => controller.abort(new DOMException("user cancelled", "AbortError")), 50);
+        try {
+          await stream;
+        } catch (error) {
+          return { code: error.code, message: error.statusMessage };
+        }
+        throw new Error("expected pending stream open to be cancelled");
+      }
       default:
         throw new Error(`unknown lifecycle scenario ${scenario}`);
     }
   } finally {
-    transport.close({ closeCode: 0, reason: "browser lifecycle scenario complete" });
+    if (closeTransport) {
+      transport.close({ closeCode: 0, reason: "browser lifecycle scenario complete" });
+    }
   }
 
   function sequenceRequests(prefix, count) {
@@ -480,6 +670,13 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
 
 function expectedSequence(prefix, count) {
   return Array.from({ length: count }, (_, index) => `${prefix}-${String(index).padStart(3, "0")}`);
+}
+
+function assertShutdownStatus(result) {
+  assert.ok(
+    result.code === 1 || result.code === 14,
+    `expected shutdown to surface Cancelled or Unavailable, got ${JSON.stringify(result)}`,
+  );
 }
 
 async function runBrowserGreeterScenario({
@@ -606,7 +803,7 @@ async function closeBrowser(browser) {
   }
 }
 
-function serverEnv({ addr, authorities, origin, certPath }) {
+function serverEnv({ addr, authorities, origin, certPath, maxStreams }) {
   const env = {
     TREVRPC_EXAMPLE_ADDR: addr,
     TREVRPC_EXAMPLE_ORIGIN: origin,
@@ -614,6 +811,9 @@ function serverEnv({ addr, authorities, origin, certPath }) {
   };
   if (authorities != null) {
     env.TREVRPC_EXAMPLE_AUTHORITIES = authorities.join(",");
+  }
+  if (maxStreams != null) {
+    env.TREVRPC_EXAMPLE_MAX_STREAMS = String(maxStreams);
   }
   return env;
 }

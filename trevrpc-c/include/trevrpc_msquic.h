@@ -20,6 +20,10 @@ typedef struct trevrpc_msquic_alpn {
 #define TREV_MSQUIC_ERR_CLOSED -1001
 #define TREV_MSQUIC_ERR_FRAME_TOO_LARGE -1002
 #define TREV_MSQUIC_ERR_TIMEOUT -1003
+#define TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED -1004
+
+#define TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES (64u * 1024u * 1024u)
+#define TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT 1024u
 
 typedef struct trevrpc_msquic_config {
     const char* alpn;
@@ -34,6 +38,8 @@ typedef struct trevrpc_msquic_config {
     uint16_t peer_unidi_stream_count;
     uint32_t max_stateless_operations;
     uint16_t max_binding_stateless_operations;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
 } trevrpc_msquic_config;
 
 int trevrpc_msquic_listen(

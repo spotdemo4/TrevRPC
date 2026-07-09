@@ -2,6 +2,7 @@
 
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
+#include "trevrpc_msquic.h"
 #include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
 
@@ -81,6 +82,11 @@ struct trevrpc_msquic_stream {
     bool closed;
     bool api_ref_acquired;
     size_t active_handle_ops;
+    size_t active_send_completions;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
+    size_t pending_send_bytes;
+    size_t pending_send_count;
     int err;
     trevrpc_msquic_send* send_pool;
     size_t send_pool_count;
@@ -715,6 +721,61 @@ cleanup:
     return result;
 }
 
+static int test_generated_native_helper_pending_send_resource_exhausted(void) {
+    int result = 1;
+    trevrpc_server* server = NULL;
+    trevrpc_client* client = NULL;
+    serve_args args = {0};
+    pthread_t thread = {0};
+    bool thread_started = false;
+    trevrpc_server_config server_config = trevrpc_default_server_config();
+    server_config.host = "127.0.0.1";
+    server_config.port = 0;
+    server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
+    server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
+    server_config.max_idle_timeout_ms = 1000;
+    server_config.peer_bidi_stream_count = 8;
+    trevrpc_config client_config = trevrpc_default_config();
+    client_config.skip_certificate_validation = 1;
+    client_config.max_pending_send_bytes = 4;
+    client_config.max_pending_send_count = 1;
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    Hello__V1__HelloReply* response = NULL;
+    request.name = "tiny-budget";
+
+    CHECK_GOTO(trevrpc_server_listen(&server_config, &server) == 0);
+    CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
+    args.server = server;
+    CHECK_GOTO(pthread_create(&thread, NULL, serve_thread, &args) == 0);
+    thread_started = true;
+
+    uint16_t port = 0;
+    CHECK_GOTO(trevrpc_server_port(server, &port) == 0);
+    CHECK_GOTO(trevrpc_client_connect("127.0.0.1", port, &client_config, &client) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(client, &request, &response) == TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(response == NULL);
+
+    trevrpc_client_close(client);
+    client = NULL;
+    trevrpc_server_shutdown(server);
+    CHECK_GOTO(pthread_join(thread, NULL) == 0);
+    thread_started = false;
+
+    result = 0;
+
+cleanup:
+    if (response != NULL) {
+        hello__v1__hello_reply__free_unpacked(response, NULL);
+    }
+    trevrpc_client_close(client);
+    if (thread_started) {
+        trevrpc_server_shutdown(server);
+        (void)pthread_join(thread, NULL);
+    }
+    trevrpc_server_close(server);
+    return result;
+}
+
 static int test_generated_services_all_rpc_shapes(void) {
     int result = 1;
     Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
@@ -777,6 +838,9 @@ int main(void) {
         goto cleanup;
     }
     if (test_shared_listener_native_and_webtransport_unary() != 0) {
+        goto cleanup;
+    }
+    if (test_generated_native_helper_pending_send_resource_exhausted() != 0) {
         goto cleanup;
     }
     result = 0;

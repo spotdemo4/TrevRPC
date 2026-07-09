@@ -105,6 +105,8 @@ typedef struct trevrpc_config {
     uint16_t peer_bidi_stream_count;
     uint32_t max_stateless_operations;
     uint16_t max_binding_stateless_operations;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
     size_t max_frame_size;
 } trevrpc_config;
 
@@ -122,6 +124,8 @@ typedef struct trevrpc_server_config {
     uint16_t peer_bidi_stream_count;
     uint32_t max_stateless_operations;
     uint16_t max_binding_stateless_operations;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
     uint32_t max_sessions_per_connection;
     uint32_t max_streams_per_session;
     uint64_t max_data_per_session;
@@ -135,6 +139,8 @@ typedef struct trevrpc_server_options {
     int64_t max_concurrent_connections;
     int64_t max_concurrent_streams_per_connection;
     int64_t max_concurrent_requests;
+    int64_t worker_count;
+    int64_t worker_queue_capacity;
     uint64_t graceful_shutdown_timeout_nanos;
     uint64_t initial_request_timeout_nanos;
     int64_t max_stream_messages;

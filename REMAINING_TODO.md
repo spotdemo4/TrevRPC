@@ -13,23 +13,17 @@ This file now tracks the work that remains after the 2026-07-09 implementation p
 - C route registration now freezes when serving starts; post-freeze registration returns `-EALREADY`, and route lookup avoids the server mutex once routes are frozen. Runtime tests cover late registration rejection and frozen-route lookup.
 - Go client response receives use transport read deadlines for deadline-capable QUIC/WebTransport response streams, preserving context-deadline versus stream-idle-timeout precedence and keeping the goroutine fallback for generic streams.
 - Rust `MessageStream` now has an optional object-safe `drain_ready` hook. In-memory encode/decode streams implement it, and Quinn/WebTransport request-body batching uses it without changing generated service APIs.
+- C servers now dispatch accepted streams through a server-owned bounded worker pool with public worker-count and queue-capacity options, heap/refcounted connection stream limiter ownership, queue-full `ResourceExhausted` rejection, queue-wait-aware initial request timeout handling, and runtime coverage for saturation, shutdown, reset, and deferred raw call cleanup.
+- C MsQuic streams now enforce per-stream pending-send byte/count budgets around `StreamSend`; sends reserve before submission, roll back on synchronous failure, decrement on every send completion including canceled completions, and keep stream send state alive until completions drain while send buffering stays disabled by default.
+- Rust Quinn terminal streaming statuses now drain the following transport FIN before completing, avoiding implicit Quinn `RecvStream` drop `STOP_SENDING(0)` after accepted terminal statuses without waiting for ACKs.
 - JavaScript browser WebTransport now has unit coverage for unsupported runtime and missing bidirectional stream APIs returning `Code.Unavailable`.
+- Browser WebTransport lifecycle coverage now exercises real Chromium page close, navigation, browser-context close, stream-open abort, server shutdown mid-stream, and Go/Rust lifecycle server parity in the Playwright fast path.
+- Go and Rust WebTransport lifecycle tests now cover shutdown behavior for active sessions/connections.
 - JavaScript native server call close now closes the underlying C call once pending refs drain, even if the JS wrapper is still alive.
 - Operational docs now include receive-memory budget guidance, benchmark diagnostics, non-cooperative cancellation boundaries, WebTransport browser limitations, and current unsafe zero-copy/buffering boundaries.
 - Scheduled/manual protocol fuzz workflows were added for bounded Go fuzz targets covering frame decode, frame length parsing, and metadata validation outside normal fast checks.
 
 ## Deferred With Guardrails
-
-### C Bounded Worker Pool
-
-Deferred. Accepted streams still use detached per-stream pthreads. The safe boundary is documented in `wiki/Current-Limitations.md`; existing runtime tests still cover shutdown, overload, stream reset, rejected streams, and deferred call cleanup. Implementing a pool must first preserve stack-owned connection limiter lifetime or convert it to heap/refcounted ownership.
-
-Required before implementation:
-
-- Queue saturation tests for unary and streaming RPCs.
-- Shutdown while queued and active work exists.
-- Deferred raw calls holding limiter/task ownership until completion.
-- Reset/rejected-stream race and leak coverage.
 
 ### C Native Frame Mode At Stream Construction
 
@@ -51,19 +45,19 @@ Required before implementation:
 - Generated C helper tests with stack and heap protobuf buffers.
 - Clear rule that frame/header/body memory remains alive until MsQuic `SEND_COMPLETE`.
 
-### C Pending-Send Accounting And Larger Buffering Profiles
+### C Larger Buffering Profiles
 
-Deferred. Larger MsQuic receive windows, ACK/congestion tuning, or send-buffering profiles remain blocked on bounded pending-send accounting and slow-reader evidence.
+Deferred. Per-stream pending-send accounting is implemented and MsQuic send buffering remains disabled by default. Larger MsQuic receive windows, ACK/congestion tuning, or explicit send-buffering profiles still require separate workload-specific evidence and tests before becoming public profiles.
 
 Required before implementation:
 
-- Per-stream or per-connection pending send byte/count limits.
-- Decrement coverage on send success, failure, reset, and close.
-- Slow-reader and overload tests proving memory remains bounded.
+- Slow-reader and overload tests for each proposed profile proving total memory remains bounded.
+- Documentation that clearly separates safe defaults from opt-in diagnostic or throughput profiles.
+- Cross-runtime benchmark evidence recorded in `wiki/Benchmarks.md` for any profile intended for published rows.
 
-### Rust Quinn/MsQuic ACK Or Close-Path Tuning
+### Rust Quinn/MsQuic ACK Tuning
 
-Deferred. ACK tuning is not baked into published rows. The new Rust/C tracing and keylog hooks must be used to capture request frame, request FIN, response frame, terminal status, response FIN, reset/STOP_SENDING, and ACK timing evidence first.
+Deferred. ACK tuning is not baked into published rows. The Rust/C tracing and keylog hooks must be used to capture request frame, request FIN, response frame, terminal status, response FIN, reset/STOP_SENDING, and ACK timing evidence first. The Rust Quinn close-path change is limited to draining FIN after terminal status based on Quinn `RecvStream` drop semantics and integration tests.
 
 Required before implementation:
 
@@ -102,13 +96,13 @@ Required before implementation:
 
 ### Broader Browser And Cross-Runtime Matrix
 
-Deferred. Chromium browser WebTransport coverage remains the fast normal path. Unsupported-browser behavior now has unit coverage, but page close/navigation, browser context close, stream-open abort in a real browser, server shutdown mid-stream, Rust lifecycle parity, and broader browser/runtime matrices remain future work.
+Deferred. Chromium browser WebTransport coverage remains the fast normal path and now includes lifecycle shutdown/teardown parity. Non-Chromium browsers, long-running soak, and broader cross-runtime matrices remain scheduled/manual until stable and low-cost enough for normal checks.
 
 Required before implementation:
 
-- Real-browser lifecycle tests beyond mocks.
-- Rust and Go WebTransport lifecycle parity.
+- Non-Chromium browser WebTransport coverage once browser support is stable enough.
 - Long-running WebTransport soak outside normal `nix flake check`.
+- Additional cross-runtime lifecycle stress beyond the current Chromium fast path.
 
 ### Additional Resource Budget APIs
 

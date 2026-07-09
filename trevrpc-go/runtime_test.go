@@ -1980,6 +1980,23 @@ func TestQuicShutdownClosesActiveConnections(t *testing.T) {
 	conn.CloseWithError(0, "test complete")
 }
 
+func TestWebTransportShutdownClosesActiveSessions(t *testing.T) {
+	running := startTestWebTransportServer(t, func(*Server) {})
+	transport := connectTestWebTransportClient(t, running)
+	running.stop(t)
+	select {
+	case <-transport.Session().Context().Done():
+	case <-time.After(testTimeout):
+		t.Fatal("client did not observe WebTransport server shutdown")
+	}
+
+	_, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "after shutdown"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
+	if code := StatusFromError(err).Code; code != CodeUnavailable && code != CodeCancelled {
+		t.Fatalf("expected unavailable or cancelled, got %v (%v)", code, err)
+	}
+	transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+}
+
 func TestQuicShutdownCancelsActiveUnaryHandler(t *testing.T) {
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
@@ -2014,6 +2031,49 @@ func TestQuicShutdownCancelsActiveUnaryHandler(t *testing.T) {
 	case <-done:
 	case <-time.After(testTimeout):
 		t.Fatal("client call did not finish after shutdown")
+	}
+}
+
+func TestWebTransportShutdownCancelsActiveUnaryHandler(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	running := startTestWebTransportServer(t, func(server *Server) {
+		options := server.Options()
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
+		server.Route(testServiceName, "ObserveCancel", func(ctx context.Context, _ []byte) ([]byte, error) {
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			return nil, ctx.Err()
+		})
+	})
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	done := make(chan error, 1)
+	go func() {
+		_, err := Unary(context.Background(), transport, testServiceName, "ObserveCancel", &testMessage{}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("WebTransport handler did not start")
+	}
+	running.stop(t)
+	select {
+	case <-cancelled:
+	case <-time.After(testTimeout):
+		t.Fatal("WebTransport handler did not observe shutdown cancellation")
+	}
+	select {
+	case err := <-done:
+		if code := StatusFromError(err).Code; code != CodeCancelled && code != CodeUnavailable && code != CodeDeadlineExceeded {
+			t.Fatalf("expected cancelled, unavailable, or deadline exceeded, got %v (%v)", code, err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("WebTransport client call did not finish after shutdown")
 	}
 }
 

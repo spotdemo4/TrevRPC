@@ -77,6 +77,11 @@ struct trevrpc_msquic_stream {
     bool closed;
     bool api_ref_acquired;
     size_t active_handle_ops;
+    size_t active_send_completions;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
+    size_t pending_send_bytes;
+    size_t pending_send_count;
     int err;
     trevrpc_msquic_send* send_pool;
     size_t send_pool_count;
@@ -88,6 +93,8 @@ struct trevrpc_msquic_conn {
     HQUIC configuration;
     uint8_t negotiated_alpn[UINT8_MAX];
     uint8_t negotiated_alpn_len;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
     bool owns_endpoint;
     bool api_ref_acquired;
     pthread_mutex_t mutex;
@@ -106,6 +113,8 @@ struct trevrpc_msquic_listener {
     HQUIC registration;
     HQUIC configuration;
     HQUIC listener;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
     bool api_ref_acquired;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -120,7 +129,9 @@ struct trevrpc_msquic_send {
     trevrpc_msquic_send* next;
     QUIC_BUFFER buffer;
     size_t capacity;
+    size_t pending_len;
     bool poolable;
+    bool pending_accounted;
     uint8_t data[];
 };
 
@@ -177,6 +188,24 @@ static void trevrpc_msquic_listener_callback_finish(trevrpc_msquic_listener* lis
     pthread_mutex_unlock(&listener->mutex);
 }
 
+static size_t trevrpc_msquic_effective_max_pending_send_bytes(size_t configured) {
+    return configured == 0 ? TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES : configured;
+}
+
+static size_t trevrpc_msquic_effective_max_pending_send_count(size_t configured) {
+    return configured == 0 ? TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT : configured;
+}
+
+static HQUIC trevrpc_msquic_stream_close_handle_if_ready_locked(trevrpc_msquic_stream* stream) {
+    if (stream->active_handle_ops == 0 && stream->pending_send_count == 0 && stream->close_pending &&
+        stream->handle != NULL) {
+        HQUIC handle = stream->handle;
+        stream->handle = NULL;
+        return handle;
+    }
+    return NULL;
+}
+
 static void trevrpc_msquic_stream_complete_close(trevrpc_msquic_stream* stream, HQUIC handle) {
     TrevMsQuic->StreamClose(handle);
 
@@ -206,10 +235,7 @@ static void trevrpc_msquic_stream_handle_release(trevrpc_msquic_stream* stream) 
     if (stream->active_handle_ops > 0) {
         stream->active_handle_ops--;
     }
-    if (stream->active_handle_ops == 0 && stream->close_pending && stream->handle != NULL) {
-        close_handle = stream->handle;
-        stream->handle = NULL;
-    }
+    close_handle = trevrpc_msquic_stream_close_handle_if_ready_locked(stream);
     pthread_mutex_unlock(&stream->mutex);
 
     if (close_handle != NULL) {
@@ -218,23 +244,17 @@ static void trevrpc_msquic_stream_handle_release(trevrpc_msquic_stream* stream) 
 }
 
 static void trevrpc_msquic_stream_shutdown_complete(trevrpc_msquic_stream* stream, HQUIC stream_handle) {
-    bool close_now = false;
+    (void)stream_handle;
+    HQUIC close_handle = NULL;
     pthread_mutex_lock(&stream->mutex);
     stream->closed = true;
-    if (stream->active_handle_ops == 0) {
-        if (stream->handle == stream_handle) {
-            stream->handle = NULL;
-        }
-        stream->close_pending = true;
-        close_now = true;
-    } else {
-        stream->close_pending = true;
-    }
+    stream->close_pending = true;
+    close_handle = trevrpc_msquic_stream_close_handle_if_ready_locked(stream);
     pthread_cond_broadcast(&stream->cond);
     pthread_mutex_unlock(&stream->mutex);
 
-    if (close_now) {
-        trevrpc_msquic_stream_complete_close(stream, stream_handle);
+    if (close_handle != NULL) {
+        trevrpc_msquic_stream_complete_close(stream, close_handle);
     }
 }
 
@@ -299,7 +319,8 @@ static void trevrpc_msquic_conn_shutdown_complete(trevrpc_msquic_conn* conn, HQU
     }
 }
 
-static trevrpc_msquic_stream* trevrpc_msquic_stream_alloc(HQUIC handle) {
+static trevrpc_msquic_stream* trevrpc_msquic_stream_alloc(
+    HQUIC handle, size_t max_pending_send_bytes, size_t max_pending_send_count) {
     trevrpc_msquic_stream* stream = calloc(1, sizeof(*stream));
     if (stream == NULL) {
         return NULL;
@@ -311,6 +332,8 @@ static trevrpc_msquic_stream* trevrpc_msquic_stream_alloc(HQUIC handle) {
     stream->api_ref_acquired = true;
 
     stream->handle = handle;
+    stream->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(max_pending_send_bytes);
+    stream->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(max_pending_send_count);
     pthread_mutex_init(&stream->mutex, NULL);
     pthread_cond_init(&stream->cond, NULL);
     return stream;
@@ -328,6 +351,8 @@ static trevrpc_msquic_conn* trevrpc_msquic_conn_alloc(HQUIC handle) {
     conn->api_ref_acquired = true;
 
     conn->handle = handle;
+    conn->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(0);
+    conn->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(0);
     pthread_mutex_init(&conn->mutex, NULL);
     pthread_cond_init(&conn->cond, NULL);
     return conn;
@@ -385,7 +410,9 @@ static trevrpc_msquic_send* trevrpc_msquic_send_alloc(size_t len, bool poolable)
     }
     send->next = NULL;
     send->capacity = len;
+    send->pending_len = 0;
     send->poolable = poolable;
+    send->pending_accounted = false;
     return send;
 }
 
@@ -404,6 +431,8 @@ static trevrpc_msquic_send* trevrpc_msquic_send_acquire(trevrpc_msquic_stream* s
             pthread_mutex_unlock(&stream->mutex);
             send->next = NULL;
             send->poolable = true;
+            send->pending_len = 0;
+            send->pending_accounted = false;
             return send;
         }
         link = &send->next;
@@ -413,7 +442,41 @@ static trevrpc_msquic_send* trevrpc_msquic_send_acquire(trevrpc_msquic_stream* s
     return trevrpc_msquic_send_alloc(len, true);
 }
 
+static int trevrpc_msquic_stream_pending_send_reserve_locked(
+    trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len) {
+    if (stream->pending_send_count >= stream->max_pending_send_count ||
+        stream->pending_send_bytes > stream->max_pending_send_bytes ||
+        len > stream->max_pending_send_bytes - stream->pending_send_bytes) {
+        return TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED;
+    }
+
+    stream->pending_send_count++;
+    stream->pending_send_bytes += len;
+    send->pending_len = len;
+    send->pending_accounted = true;
+    return 0;
+}
+
+static HQUIC trevrpc_msquic_stream_pending_send_complete_locked(
+    trevrpc_msquic_stream* stream, trevrpc_msquic_send* send) {
+    if (send->pending_accounted) {
+        if (stream->pending_send_count > 0) {
+            stream->pending_send_count--;
+        }
+        if (stream->pending_send_bytes >= send->pending_len) {
+            stream->pending_send_bytes -= send->pending_len;
+        } else {
+            stream->pending_send_bytes = 0;
+        }
+        send->pending_len = 0;
+        send->pending_accounted = false;
+    }
+    return trevrpc_msquic_stream_close_handle_if_ready_locked(stream);
+}
+
 static void trevrpc_msquic_send_release(trevrpc_msquic_stream* stream, trevrpc_msquic_send* send) {
+    send->pending_len = 0;
+    send->pending_accounted = false;
     if (!send->poolable) {
         free(send);
         return;
@@ -432,6 +495,38 @@ static void trevrpc_msquic_send_release(trevrpc_msquic_stream* stream, trevrpc_m
     if (!keep) {
         free(send);
     }
+}
+
+static void trevrpc_msquic_stream_send_complete_begin(trevrpc_msquic_stream* stream) {
+    pthread_mutex_lock(&stream->mutex);
+    stream->active_send_completions++;
+    pthread_mutex_unlock(&stream->mutex);
+}
+
+static void trevrpc_msquic_stream_send_complete_end(trevrpc_msquic_stream* stream) {
+    pthread_mutex_lock(&stream->mutex);
+    if (stream->active_send_completions > 0) {
+        stream->active_send_completions--;
+    }
+    pthread_cond_broadcast(&stream->cond);
+    pthread_mutex_unlock(&stream->mutex);
+}
+
+static void trevrpc_msquic_stream_send_complete(trevrpc_msquic_stream* stream, trevrpc_msquic_send* send) {
+    HQUIC close_handle = NULL;
+    trevrpc_msquic_stream_send_complete_begin(stream);
+
+    pthread_mutex_lock(&stream->mutex);
+    close_handle = trevrpc_msquic_stream_pending_send_complete_locked(stream, send);
+    pthread_cond_broadcast(&stream->cond);
+    pthread_mutex_unlock(&stream->mutex);
+
+    trevrpc_msquic_send_release(stream, send);
+    if (close_handle != NULL) {
+        trevrpc_msquic_stream_complete_close(stream, close_handle);
+    }
+
+    trevrpc_msquic_stream_send_complete_end(stream);
 }
 
 static intptr_t trevrpc_msquic_error_result(int err) {
@@ -671,21 +766,27 @@ static trevrpc_msquic_frame* trevrpc_msquic_stream_pop_frame_locked(trevrpc_msqu
 static intptr_t trevrpc_msquic_stream_send_buffer_with_flags(
     trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len, QUIC_SEND_FLAGS flags) {
     bool finish_send = (flags & QUIC_SEND_FLAG_FIN) != 0;
+    int reserve_err = 0;
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
     bool send_closed = stream->send_closed;
     if (handle != NULL && !send_closed && !stream->close_pending) {
-        if (finish_send) {
-            stream->send_closed = true;
+        reserve_err = trevrpc_msquic_stream_pending_send_reserve_locked(stream, send, len);
+        if (reserve_err == 0) {
+            if (finish_send) {
+                stream->send_closed = true;
+            }
+            stream->active_handle_ops++;
+        } else {
+            handle = NULL;
         }
-        stream->active_handle_ops++;
     } else {
         handle = NULL;
     }
     pthread_mutex_unlock(&stream->mutex);
-    if (handle == NULL || send_closed) {
+    if (handle == NULL || send_closed || reserve_err != 0) {
         trevrpc_msquic_send_release(stream, send);
-        return TREV_MSQUIC_ERR_CLOSED;
+        return reserve_err != 0 ? reserve_err : TREV_MSQUIC_ERR_CLOSED;
     }
 
     send->buffer.Buffer = send->data;
@@ -693,12 +794,18 @@ static intptr_t trevrpc_msquic_stream_send_buffer_with_flags(
     QUIC_STATUS status = TrevMsQuic->StreamSend(handle, &send->buffer, 1, flags, send);
     trevrpc_msquic_stream_handle_release(stream);
     if (QUIC_FAILED(status)) {
+        HQUIC close_handle = NULL;
+        pthread_mutex_lock(&stream->mutex);
         if (finish_send) {
-            pthread_mutex_lock(&stream->mutex);
             stream->send_closed = false;
-            pthread_mutex_unlock(&stream->mutex);
         }
+        close_handle = trevrpc_msquic_stream_pending_send_complete_locked(stream, send);
+        pthread_cond_broadcast(&stream->cond);
+        pthread_mutex_unlock(&stream->mutex);
         trevrpc_msquic_send_release(stream, send);
+        if (close_handle != NULL) {
+            trevrpc_msquic_stream_complete_close(stream, close_handle);
+        }
         return trevrpc_msquic_error_result((int)status);
     }
 
@@ -922,6 +1029,8 @@ int trevrpc_msquic_listen_alpns(const char* host,
 
     pthread_mutex_init(&listener->mutex, NULL);
     pthread_cond_init(&listener->cond, NULL);
+    listener->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(config->max_pending_send_bytes);
+    listener->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(config->max_pending_send_count);
 
     int err = trevrpc_msquic_configure_endpoint_with_alpns(
         config, alpns, alpns_len, true, &listener->registration, &listener->configuration);
@@ -1098,6 +1207,8 @@ int trevrpc_msquic_dial(
     conn->registration = registration;
     conn->configuration = configuration;
     conn->owns_endpoint = true;
+    conn->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(config->max_pending_send_bytes);
+    conn->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(config->max_pending_send_count);
 
     QUIC_STATUS status = TrevMsQuic->ConnectionOpen(registration, trevrpc_msquic_conn_callback, conn, &conn->handle);
     if (QUIC_FAILED(status)) {
@@ -1174,7 +1285,8 @@ int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_
 static int trevrpc_msquic_conn_open_stream_with_flags(
     trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream, QUIC_STREAM_OPEN_FLAGS flags) {
     *out_stream = NULL;
-    trevrpc_msquic_stream* stream = trevrpc_msquic_stream_alloc(NULL);
+    trevrpc_msquic_stream* stream =
+        trevrpc_msquic_stream_alloc(NULL, conn->max_pending_send_bytes, conn->max_pending_send_count);
     if (stream == NULL) {
         return ENOMEM;
     }
@@ -1613,7 +1725,8 @@ void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
         trevrpc_msquic_stream_handle_release(stream);
         pthread_mutex_lock(&stream->mutex);
     }
-    while (stream->handle != NULL || stream->close_pending) {
+    while (stream->handle != NULL || stream->close_pending || stream->pending_send_count > 0 ||
+           stream->active_send_completions > 0) {
         pthread_cond_wait(&stream->cond, &stream->mutex);
     }
     trevrpc_msquic_free_chunks(stream);
@@ -1643,6 +1756,8 @@ const char* trevrpc_msquic_error(int code) {
         return "frame too large";
     case TREV_MSQUIC_ERR_TIMEOUT:
         return "timed out";
+    case TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED:
+        return "resource exhausted";
     case ENOMEM:
     case -ENOMEM:
         return "out of memory";
@@ -1670,6 +1785,8 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     listener->active_callbacks++;
     HQUIC configuration = listener->configuration;
     HQUIC registration = listener->registration;
+    size_t max_pending_send_bytes = listener->max_pending_send_bytes;
+    size_t max_pending_send_count = listener->max_pending_send_count;
     pthread_mutex_unlock(&listener->mutex);
 
     trevrpc_msquic_conn* conn = trevrpc_msquic_conn_alloc(event->NEW_CONNECTION.Connection);
@@ -1683,6 +1800,8 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     }
     conn->configuration = configuration;
     conn->registration = registration;
+    conn->max_pending_send_bytes = max_pending_send_bytes;
+    conn->max_pending_send_count = max_pending_send_count;
     HQUIC connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
     if (connection_handle == NULL) {
         trevrpc_msquic_conn_close(conn);
@@ -1740,7 +1859,8 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(
         pthread_mutex_unlock(&conn->mutex);
         return QUIC_STATUS_SUCCESS;
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
-        trevrpc_msquic_stream* stream = trevrpc_msquic_stream_alloc(event->PEER_STREAM_STARTED.Stream);
+        trevrpc_msquic_stream* stream = trevrpc_msquic_stream_alloc(
+            event->PEER_STREAM_STARTED.Stream, conn->max_pending_send_bytes, conn->max_pending_send_count);
         if (stream == NULL) {
             return QUIC_STATUS_OUT_OF_MEMORY;
         }
@@ -1841,7 +1961,7 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_stream_callback(
         return QUIC_STATUS_SUCCESS;
     }
     case QUIC_STREAM_EVENT_SEND_COMPLETE:
-        trevrpc_msquic_send_release(stream, event->SEND_COMPLETE.ClientContext);
+        trevrpc_msquic_stream_send_complete(stream, event->SEND_COMPLETE.ClientContext);
         return QUIC_STATUS_SUCCESS;
     case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
         pthread_mutex_lock(&stream->mutex);

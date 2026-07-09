@@ -888,6 +888,113 @@ async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResu
 }
 
 #[tokio::test]
+async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> TestResult {
+    let (server_endpoint, cert_der) = make_server_endpoint(&fast_server_options())?;
+    let server_addr = server_endpoint.local_addr()?;
+    let (stopped_tx, stopped_rx) = oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let incoming = tokio::time::timeout(TEST_TIMEOUT, server_endpoint.accept())
+            .await?
+            .ok_or_else(|| std::io::Error::other("server endpoint closed before accept"))?;
+        let connection = incoming.await?;
+        let (mut send, mut recv) = connection.accept_bi().await?;
+
+        let _request = trevrpc::quinn::read_frame::<RpcRequest>(
+            &mut recv,
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        )
+        .await?;
+        read_quinn_fin(&mut recv).await?;
+
+        trevrpc::quinn::write_frame(
+            &mut send,
+            &RpcStreamFrame::status(Status::ok()),
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        send.finish()?;
+        let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+        let _ = stopped_tx.send(stopped);
+        connection.close(0_u32.into(), b"test complete");
+
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    });
+    let endpoint = make_client_endpoint(cert_der)?;
+    let connection = endpoint.connect(server_addr, "localhost")?.await?;
+    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let mut response = transport
+        .streaming_call(
+            RpcRequest::new("example.greeter.Greeter", "StatusOnly", Vec::new())
+                .with_kind(RpcKind::ServerStreaming),
+            trevrpc::stream::empty(),
+        )
+        .await?;
+
+    let frame = tokio::time::timeout(TEST_TIMEOUT, response.next())
+        .await?
+        .expect("response status should arrive")?;
+
+    assert_eq!(
+        frame.frame_kind(),
+        Some(trevrpc::RpcStreamFrameKind::Status)
+    );
+    assert!(frame.status_value().is_ok());
+    drop(response);
+    assert_eq!(stopped_rx.await?, None);
+
+    close_client(endpoint, connection).await;
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> TestResult {
+    let server = spawn_greeter_server(register_status_upload_route)?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "StatusUpload",
+        Vec::new(),
+    )
+    .with_kind(RpcKind::ClientStreaming);
+
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &RpcStreamFrame::status(Status::ok()),
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    send.finish()?;
+
+    let frame = trevrpc::quinn::read_frame::<RpcStreamFrame>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    assert_eq!(
+        frame.frame_kind(),
+        Some(trevrpc::RpcStreamFrameKind::Status)
+    );
+    assert!(frame.status_value().is_ok());
+    read_quinn_fin(&mut recv).await?;
+
+    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    assert_eq!(stopped, None);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let server = spawn_greeter_server(register_accept_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
@@ -962,6 +1069,34 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
 }
 
 #[tokio::test]
+async fn webtransport_shutdown_closes_active_sessions() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|_| {})?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+
+    server.shutdown().await?;
+    tokio::time::timeout(TEST_TIMEOUT, session.closed())
+        .await
+        .expect("client should observe WebTransport server shutdown");
+
+    let error = greeter_client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "after shutdown".to_owned(),
+            },
+            CallOptions::new().with_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("RPC on drained WebTransport session should fail");
+    assert!(matches!(
+        error.into_status().code(),
+        Code::Cancelled | Code::Unavailable
+    ));
+
+    close_webtransport_client(client, session).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
     let started = Arc::new(Notify::new());
     let started_server = Arc::clone(&started);
@@ -1009,6 +1144,58 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
         Code::Cancelled | Code::Unavailable | Code::DeadlineExceeded
     ));
     close_client(endpoint, connection).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
+    let started = Arc::new(Notify::new());
+    let started_server = Arc::clone(&started);
+    let server = spawn_webtransport_greeter_server(move |server| {
+        server.set_options(
+            fast_server_options().with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
+        );
+        server.route(
+            greeter::GreeterClient::<()>::SERVICE,
+            "Never",
+            move |_body| {
+                let started = Arc::clone(&started_server);
+                async move {
+                    started.notify_waiters();
+                    std::future::pending::<trevrpc::Result<Vec<u8>>>().await
+                }
+            },
+        );
+    })?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let call = tokio::spawn(async move {
+        trevrpc::client::unary::<_, _, greeter::HelloReply>(
+            &transport,
+            greeter::GreeterClient::<()>::SERVICE,
+            "Never",
+            &greeter::HelloRequest {
+                name: "shutdown".to_owned(),
+            },
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await
+    });
+
+    tokio::time::timeout(TEST_TIMEOUT, started.notified())
+        .await
+        .expect("pending WebTransport unary handler should start");
+    server.shutdown().await?;
+    let result = tokio::time::timeout(TEST_TIMEOUT, call)
+        .await
+        .expect("pending WebTransport client call should finish after shutdown")?;
+    let error = result.expect_err("shutdown should fail the pending WebTransport RPC");
+    assert!(matches!(
+        error.into_status().code(),
+        Code::Cancelled | Code::Unavailable | Code::DeadlineExceeded
+    ));
+
+    close_webtransport_client(client, session).await;
     Ok(())
 }
 
@@ -1523,6 +1710,23 @@ fn register_accept_upload_route(server: &mut Server) {
     );
 }
 
+fn register_status_upload_route(server: &mut Server) {
+    server.route_streaming(
+        greeter::GreeterClient::<()>::SERVICE,
+        "StatusUpload",
+        trevrpc::RpcKind::ClientStreaming,
+        |_body, mut requests| async move {
+            match requests.next().await {
+                None => Ok(trevrpc::stream::empty()),
+                Some(Ok(_)) => Err(trevrpc::Error::from(Status::invalid_argument(
+                    "unexpected request message after status",
+                ))),
+                Some(Err(error)) => Err(error),
+            }
+        },
+    );
+}
+
 fn spawn_greeter_server_with_endpoint(
     (endpoint, cert_der): (quinn::Endpoint, CertificateDer<'static>),
     configure: impl FnOnce(&mut Server),
@@ -1596,6 +1800,13 @@ async fn read_raw_quinn_response(recv: &mut quinn::RecvStream) -> TestResult<Rpc
         trevrpc::quinn::read_frame::<RpcResponse>(recv, trevrpc::framing::DEFAULT_MAX_FRAME_SIZE),
     )
     .await??)
+}
+
+async fn read_quinn_fin(recv: &mut quinn::RecvStream) -> TestResult {
+    let mut scratch = [0_u8; 1];
+    let read = tokio::time::timeout(TEST_TIMEOUT, recv.read(&mut scratch)).await??;
+    assert_eq!(read, None, "stream should end without trailing data");
+    Ok(())
 }
 
 async fn connect_client(

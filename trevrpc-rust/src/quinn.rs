@@ -457,12 +457,22 @@ impl MessageStream<RpcStreamFrame> for QuinnResponseStream {
             Ok(Some(frame)) => {
                 if frame.frame_kind() == Some(RpcStreamFrameKind::Status) {
                     self.complete = true;
-                    if frame.status_value().is_ok() {
+                    let status = frame.status_value();
+                    if status.is_ok() {
                         if let Err(error) = self.stop_writer(true).await {
                             return Some(Err(error));
                         }
                     } else {
                         self.ignore_writer_error();
+                    }
+                    if let Err(error) = drain_fin_after_terminal_status(
+                        self.recv_mut(),
+                        max_frame_size,
+                        "response stream",
+                    )
+                    .await
+                    {
+                        return Some(Err(error));
                     }
                 }
                 Some(Ok(frame))
@@ -686,6 +696,23 @@ async fn read_stream_frame_or_eof(
     let frame = decode_stream_frame_body_owned(body)?;
     trace_rx_stream_frame(&frame, len);
     Ok(Some(frame))
+}
+
+async fn drain_fin_after_terminal_status(
+    recv: &mut quinn::RecvStream,
+    max_frame_size: usize,
+    stream_name: &'static str,
+) -> Result<()> {
+    if read_stream_frame_or_eof(recv, max_frame_size)
+        .await?
+        .is_some()
+    {
+        return Err(Error::from(Status::invalid_argument(format!(
+            "{stream_name} continued after terminal status"
+        ))));
+    }
+
+    Ok(())
 }
 
 async fn read_body(recv: &mut quinn::RecvStream, len: usize) -> Result<Vec<u8>> {
@@ -1327,6 +1354,15 @@ impl MessageStream<Vec<u8>> for QuinnRequestStream {
                 Some(RpcStreamFrameKind::Status) => {
                     self.done = true;
                     let status = frame.status_value();
+                    if let Err(error) = drain_fin_after_terminal_status(
+                        &mut self.recv,
+                        self.max_frame_size,
+                        "request stream",
+                    )
+                    .await
+                    {
+                        return Some(Err(error));
+                    }
                     if status.is_ok() {
                         None
                     } else {

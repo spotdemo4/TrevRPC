@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -62,6 +63,11 @@ func run() error {
 	server.SetAuthorizer(trevrpc.BearerAuthorizer(token))
 	options := server.Options()
 	options.EnableWebTransport = true
+	if maxStreams, ok, err := envInt("TREVRPC_EXAMPLE_MAX_STREAMS"); err != nil {
+		return err
+	} else if ok {
+		options.MaxConcurrentStreamsPerConnection = maxStreams
+	}
 	authorities := allowedAuthorities(addr)
 	options.WebTransportCheckOrigin = func(r *http.Request) bool {
 		if _, ok := authorities[r.Host]; !ok {
@@ -72,7 +78,9 @@ func run() error {
 		return requestOrigin == "" || requestOrigin == origin
 	}
 	server.SetOptions(options)
-	registerLifecycleRoutes(server)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	registerLifecycleRoutes(server, stop)
 
 	listener, err := quic.ListenAddr(addr, tlsConfig, trevrpc.QUICServerConfig(server.Options(), nil))
 	if err != nil {
@@ -80,15 +88,13 @@ func run() error {
 	}
 	defer listener.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	fmt.Printf("READY https://%s/trevrpc\n", listener.Addr())
 	fmt.Printf("certificate written to %s\n", certPath)
 
 	return trevrpc.ServeQUIC(ctx, listener, server)
 }
 
-func registerLifecycleRoutes(server *trevrpc.Server) {
+func registerLifecycleRoutes(server *trevrpc.Server, shutdown context.CancelFunc) {
 	server.RouteStreaming(serviceName, "EarlyOk", trevrpc.RpcKindClientStreaming, func(_ context.Context, _ []byte, _ trevrpc.ByteStream) (trevrpc.ByteStream, error) {
 		return trevrpc.FromSlice(encodeValue("early ok")), nil
 	})
@@ -109,6 +115,9 @@ func registerLifecycleRoutes(server *trevrpc.Server) {
 	})
 	server.RouteStreaming(serviceName, "ErrorAfterMessages", trevrpc.RpcKindServerStreaming, func(_ context.Context, _ []byte, _ trevrpc.ByteStream) (trevrpc.ByteStream, error) {
 		return &sequenceStream{prefix: "before-error", count: 32, finalErr: trevrpc.NewStatus(trevrpc.CodePermissionDenied, "stream failed after messages")}, nil
+	})
+	server.RouteStreaming(serviceName, "ShutdownAfterFirst", trevrpc.RpcKindServerStreaming, func(_ context.Context, _ []byte, _ trevrpc.ByteStream) (trevrpc.ByteStream, error) {
+		return &firstThenShutdownStream{first: encodeValue("first"), event: "EVENT server_shutdown_mid_stream", shutdown: shutdown}, nil
 	})
 }
 
@@ -199,6 +208,35 @@ func (s *firstThenPendingStream) logEvent() {
 	s.once.Do(func() { fmt.Println(s.event) })
 }
 
+type firstThenShutdownStream struct {
+	first    []byte
+	event    string
+	sent     bool
+	once     sync.Once
+	shutdown context.CancelFunc
+}
+
+func (s *firstThenShutdownStream) Recv() ([]byte, error) {
+	if !s.sent {
+		s.sent = true
+		return s.first, nil
+	}
+
+	s.once.Do(func() {
+		fmt.Println(s.event)
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			s.shutdown()
+		}()
+	})
+	return nil, trevrpc.NewStatus(trevrpc.CodeCancelled, "server shutdown")
+}
+
+func (s *firstThenShutdownStream) Close() error {
+	s.once.Do(func() { fmt.Println(s.event) })
+	return nil
+}
+
 func encodeValue(value string) []byte {
 	if len(value) > 127 {
 		panic("test value is too long for single-byte protobuf length")
@@ -216,6 +254,23 @@ func envOr(name, fallback string) string {
 	}
 
 	return fallback
+}
+
+func envInt(name string) (int, bool, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return 0, false, nil
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, false, fmt.Errorf("%s must be an integer: %w", name, err)
+	}
+	if parsed < 0 {
+		return 0, false, fmt.Errorf("%s must be non-negative", name)
+	}
+
+	return parsed, true, nil
 }
 
 func allowedAuthorities(addr string) map[string]struct{} {

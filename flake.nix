@@ -438,6 +438,27 @@
 
                 meta.mainProgram = "trevrpc-browser-lifecycle-go";
               });
+              browserLifecycleRustServer = pkgs.rustPlatform.buildRustPackage {
+                pname = "trevrpc-browser-lifecycle-rust-server";
+                version = "0.1.0";
+
+                src = ./trevrpc-rust;
+                cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
+                cargoBuildFlags = [
+                  "--example"
+                  "browser_lifecycle_server"
+                ];
+                doCheck = false;
+
+                installPhase = ''
+                  runHook preInstall
+                  server=$(find target -path '*/release/examples/browser_lifecycle_server' -type f -perm -0100 | head -n1)
+                  install -Dm755 "$server" $out/bin/trevrpc-browser-lifecycle-rust
+                  runHook postInstall
+                '';
+
+                meta.mainProgram = "trevrpc-browser-lifecycle-rust";
+              };
               browserRustServer = pkgs.rustPlatform.buildRustPackage {
                 pname = "trevrpc-browser-rust-server";
                 version = "0.1.0";
@@ -465,6 +486,7 @@
               PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
               TREVRPC_BROWSER_GO_SERVER = "${browserGoServer}/bin/greeter_server";
               TREVRPC_BROWSER_LIFECYCLE_GO_SERVER = "${browserLifecycleGoServer}/bin/trevrpc-browser-lifecycle-go";
+              TREVRPC_BROWSER_LIFECYCLE_RUST_SERVER = "${browserLifecycleRustServer}/bin/trevrpc-browser-lifecycle-rust";
               TREVRPC_BROWSER_RUST_SERVER = "${browserRustServer}/bin/greeter_server";
               checkPhase = ''
                 export HOME=$(mktemp -d)

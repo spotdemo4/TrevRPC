@@ -131,8 +131,10 @@ static void* accept_wt_stream_thread(void* arg) {
     return NULL;
 }
 
-static int connect_pair(
-    trevrpc_msquic_listener** out_listener, trevrpc_msquic_conn** out_client, trevrpc_msquic_conn** out_server) {
+static int connect_pair_with_config(const trevrpc_msquic_config* config,
+    trevrpc_msquic_listener** out_listener,
+    trevrpc_msquic_conn** out_client,
+    trevrpc_msquic_conn** out_server) {
     int result = 1;
     trevrpc_msquic_listener* listener = NULL;
     trevrpc_msquic_conn* client = NULL;
@@ -142,13 +144,13 @@ static int connect_pair(
     accept_args args = {0};
     uint16_t port = 0;
 
-    CHECK_GOTO(trevrpc_msquic_listen("127.0.0.1", 0, &test_config, &listener) == 0);
+    CHECK_GOTO(trevrpc_msquic_listen("127.0.0.1", 0, config, &listener) == 0);
     CHECK_GOTO(trevrpc_msquic_listener_port(listener, &port) == 0);
     CHECK_GOTO(port != 0);
     args.listener = listener;
     CHECK_GOTO(pthread_create(&thread, NULL, accept_conn_thread, &args) == 0);
     thread_started = true;
-    CHECK_GOTO(trevrpc_msquic_dial("127.0.0.1", port, &test_config, &client) == 0);
+    CHECK_GOTO(trevrpc_msquic_dial("127.0.0.1", port, config, &client) == 0);
     CHECK_GOTO(pthread_join(thread, NULL) == 0);
     thread_started = false;
     CHECK_GOTO(args.result == 0);
@@ -171,6 +173,11 @@ cleanup:
     trevrpc_msquic_conn_close(client);
     trevrpc_msquic_listener_close(listener);
     return result;
+}
+
+static int connect_pair(
+    trevrpc_msquic_listener** out_listener, trevrpc_msquic_conn** out_client, trevrpc_msquic_conn** out_server) {
+    return connect_pair_with_config(&test_config, out_listener, out_client, out_server);
 }
 
 static int open_stream_pair(trevrpc_msquic_conn* client,
@@ -454,6 +461,89 @@ static int test_stream_write_fin_close_preserves_peer_eof(void) {
 
 cleanup:
     trevrpc_msquic_free(body);
+    trevrpc_msquic_stream_close(server_stream);
+    trevrpc_msquic_stream_close(client_stream);
+    trevrpc_msquic_conn_close(server);
+    trevrpc_msquic_conn_close(client);
+    trevrpc_msquic_listener_close(listener);
+    return result;
+}
+
+static int test_pending_send_final_failure_rolls_back_send_closed(void) {
+    int result = 1;
+    trevrpc_msquic_config config = test_config;
+    config.max_pending_send_bytes = 4;
+    config.max_pending_send_count = 8;
+    trevrpc_msquic_listener* listener = NULL;
+    trevrpc_msquic_conn* client = NULL;
+    trevrpc_msquic_conn* server = NULL;
+    trevrpc_msquic_stream* client_stream = NULL;
+    trevrpc_msquic_stream* server_stream = NULL;
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    const uint8_t too_large_final_frame[] = {0, 0, 0, 1, 0};
+    const uint8_t empty_final_frame[] = {0, 0, 0, 0};
+
+    CHECK_GOTO(connect_pair_with_config(&config, &listener, &client, &server) == 0);
+    CHECK_GOTO(open_stream_pair(client, server, &client_stream, &server_stream) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write_fin(client_stream, too_large_final_frame, sizeof(too_large_final_frame)),
+        TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write_fin(client_stream, empty_final_frame, sizeof(empty_final_frame)),
+        (int)sizeof(empty_final_frame));
+
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_read_frame_timeout(server_stream, &body, &body_len, 4096, 1000000000ull), 1);
+    CHECK_GOTO(body_len == 0);
+    trevrpc_msquic_free(body);
+    body = NULL;
+    body_len = 0;
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_read_frame_timeout(server_stream, &body, &body_len, 4096, 1000000000ull), 0);
+
+    result = 0;
+
+cleanup:
+    trevrpc_msquic_free(body);
+    trevrpc_msquic_stream_close(server_stream);
+    trevrpc_msquic_stream_close(client_stream);
+    trevrpc_msquic_conn_close(server);
+    trevrpc_msquic_conn_close(client);
+    trevrpc_msquic_listener_close(listener);
+    return result;
+}
+
+static int test_pending_send_slow_reader_is_bounded_and_close_drains(void) {
+    int result = 1;
+    trevrpc_msquic_config config = test_config;
+    config.max_pending_send_bytes = 8 * 1024;
+    config.max_pending_send_count = 8;
+    trevrpc_msquic_listener* listener = NULL;
+    trevrpc_msquic_conn* client = NULL;
+    trevrpc_msquic_conn* server = NULL;
+    trevrpc_msquic_stream* client_stream = NULL;
+    trevrpc_msquic_stream* server_stream = NULL;
+    uint8_t payload[4096];
+    bool exhausted = false;
+
+    memset(payload, 0xa5, sizeof(payload));
+    CHECK_GOTO(connect_pair_with_config(&config, &listener, &client, &server) == 0);
+    CHECK_GOTO(open_stream_pair(client, server, &client_stream, &server_stream) == 0);
+
+    for (size_t i = 0; i < 4096; i++) {
+        intptr_t written = trevrpc_msquic_stream_write(client_stream, payload, sizeof(payload));
+        if (written == TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED) {
+            exhausted = true;
+            break;
+        }
+        CHECK_EQ_GOTO(written, (int)sizeof(payload));
+    }
+    CHECK_GOTO(exhausted);
+
+    trevrpc_msquic_stream_abort(client_stream);
+    trevrpc_msquic_stream_close(client_stream);
+    client_stream = NULL;
+
+    result = 0;
+
+cleanup:
     trevrpc_msquic_stream_close(server_stream);
     trevrpc_msquic_stream_close(client_stream);
     trevrpc_msquic_conn_close(server);
@@ -1053,6 +1143,12 @@ int main(void) {
         goto cleanup;
     }
     if (test_stream_write_fin_close_preserves_peer_eof() != 0) {
+        goto cleanup;
+    }
+    if (test_pending_send_final_failure_rolls_back_send_closed() != 0) {
+        goto cleanup;
+    }
+    if (test_pending_send_slow_reader_is_bounded_and_close_drains() != 0) {
         goto cleanup;
     }
     if (test_client_close_unblocks_server_accept_stream() != 0) {
