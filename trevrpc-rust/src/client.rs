@@ -924,6 +924,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct StaticResponseTransport {
+        response: RpcResponse,
+    }
+
+    #[crate::async_trait]
+    impl RpcTransport for StaticResponseTransport {
+        async fn call(&self, _request: RpcRequest) -> Result<RpcResponse> {
+            Ok(self.response.clone())
+        }
+    }
+
     #[tokio::test]
     async fn unary_calls_propagate_deadlines() {
         let transport = RecordingTransport::default();
@@ -951,6 +963,45 @@ mod tests {
         assert_eq!(recorded.service, "example.Greeter");
         assert_eq!(recorded.method, "SayHello");
         assert_eq!(recorded.timeout_nanos, 5_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn unary_response_body_limit_boundary_is_stable() {
+        let body = prost::Message::encode_to_vec(&TestMessage {
+            value: "response".to_owned(),
+        });
+        let transport = StaticResponseTransport {
+            response: RpcResponse::ok(body.clone()),
+        };
+        let request = TestMessage {
+            value: "request".to_owned(),
+        };
+
+        let decoded = unary::<_, _, TestMessage>(
+            &transport,
+            "example.Greeter",
+            "SayHello",
+            &request,
+            CallOptions::new().with_max_response_body_size(body.len()),
+        )
+        .await
+        .expect("exact response body limit should pass");
+        assert_eq!(decoded.value, "response");
+
+        let error = unary::<_, _, TestMessage>(
+            &transport,
+            "example.Greeter",
+            "SayHello",
+            &request,
+            CallOptions::new().with_max_response_body_size(body.len() - 1),
+        )
+        .await
+        .expect_err("one byte over response body limit should fail");
+
+        assert!(matches!(
+            error,
+            Error::FrameTooLarge { len, max } if len == body.len() && max == body.len() - 1
+        ));
     }
 
     #[derive(Clone, Default)]

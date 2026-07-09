@@ -196,6 +196,7 @@ typedef struct trevrpc_response {
     uint8_t* body;
     size_t body_len;
     trevrpc_metadata metadata;
+    uint8_t* _body_owner;
 } trevrpc_response;
 
 typedef struct trevrpc_stream_frame {
@@ -448,6 +449,12 @@ void trevrpc_response_reset(trevrpc_response* response);
 void trevrpc_response_free(trevrpc_response* response);
 
 int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len);
+/*
+ * Binding-oriented send path. The body is borrowed until this function returns.
+ * Native MsQuic streams wait for SEND_COMPLETE before returning; other
+ * transports may fall back to the normal copy-based send.
+ */
+int trevrpc_stream_send_message_borrowed_wait(trevrpc_stream* stream, const uint8_t* body, size_t body_len);
 int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count);
 int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len);
 int trevrpc_stream_send_status_with_metadata(

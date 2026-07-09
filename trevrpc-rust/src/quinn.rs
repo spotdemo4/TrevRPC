@@ -1,6 +1,5 @@
 use std::fmt;
 use std::future::{Future, pending};
-use std::io;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -9,10 +8,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client::RpcTransport;
-use crate::framing::{
-    DEFAULT_MAX_FRAME_SIZE, STREAM_FRAME_BODY_TAG, decode_frame, decode_stream_frame_body_owned,
-    encode_frame_with_max, encode_message_stream_frame_prefix, frame_body_len,
-};
+use crate::framed::{self, FrameRead, FrameTrace, FrameWrite, MESSAGE_FRAME_BATCH};
+use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::server::ServerOptions;
 use crate::{
     BoxMessageStream, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse,
@@ -20,7 +17,6 @@ use crate::{
 };
 
 const CANCELLED_STREAM_CODE: u32 = 1;
-const MESSAGE_FRAME_BATCH: usize = 32;
 const FRAME_HEADER_LEN: u64 = 4;
 
 fn trace_quinn_event(event: &'static str, detail: &'static str) {
@@ -118,6 +114,56 @@ fn trace_quinn_frame_line(args: fmt::Arguments<'_>) {
     });
     if enabled {
         eprintln!("trevrpc-quinn-frame {args}");
+    }
+}
+
+struct QuinnFrameTrace;
+
+impl FrameTrace for QuinnFrameTrace {
+    fn tx_frame<M: Message>(encoded_len: usize) {
+        trace_tx_frame::<M>(encoded_len);
+    }
+
+    fn tx_stream_message_frame(body_len: usize, batch_len: usize) {
+        trace_tx_stream_message_frame(body_len, batch_len);
+    }
+
+    fn tx_stream_frame(frame: &RpcStreamFrame, encoded_len: usize) {
+        trace_tx_stream_frame(frame, encoded_len);
+    }
+
+    fn rx_frame<M: Message>(encoded_len: usize) {
+        trace_rx_frame::<M>(encoded_len);
+    }
+
+    fn rx_stream_frame(frame: &RpcStreamFrame, encoded_len: usize) {
+        trace_rx_stream_frame(frame, encoded_len);
+    }
+
+    fn rx_fin(detail: &'static str) {
+        trace_quinn_event("rx_fin", detail);
+    }
+}
+
+impl FrameWrite for quinn::SendStream {
+    async fn write_frame_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.write_all(bytes).await.map_err(Error::transport)
+    }
+
+    async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
+        self.write_all_chunks(chunks)
+            .await
+            .map_err(Error::transport)
+    }
+}
+
+impl FrameRead for quinn::RecvStream {
+    async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+        self.read(bytes).await.map_err(Error::transport)
+    }
+
+    async fn read_exact_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<()> {
+        self.read_exact(bytes).await.map_err(Error::transport)
     }
 }
 
@@ -554,26 +600,7 @@ pub async fn write_frame<M>(
 where
     M: Message,
 {
-    let frame = encode_frame_with_max(message, max_frame_size)?;
-    trace_tx_frame::<M>(frame.len());
-    send.write_all(&frame).await.map_err(Error::transport)
-}
-
-async fn write_message_stream_frame(
-    send: &mut quinn::SendStream,
-    body: Vec<u8>,
-    max_frame_size: usize,
-) -> Result<()> {
-    let mut prefix = Vec::new();
-    encode_message_stream_frame_prefix(body.len(), max_frame_size, &mut prefix)?;
-    trace_tx_stream_message_frame(body.len(), 1);
-    if body.is_empty() {
-        return send.write_all(&prefix).await.map_err(Error::transport);
-    }
-
-    send.write_all_chunks(&mut [Bytes::from(prefix), Bytes::from(body)])
-        .await
-        .map_err(Error::transport)
+    framed::write_frame::<_, QuinnFrameTrace, M>(send, message, max_frame_size).await
 }
 
 async fn write_message_stream_frames(
@@ -581,21 +608,7 @@ async fn write_message_stream_frames(
     bodies: &mut Vec<Vec<u8>>,
     max_frame_size: usize,
 ) -> Result<()> {
-    let mut chunks = Vec::with_capacity(bodies.len().saturating_mul(2));
-    let mut prefix = Vec::new();
-    let batch_len = bodies.len();
-    for body in bodies.drain(..) {
-        encode_message_stream_frame_prefix(body.len(), max_frame_size, &mut prefix)?;
-        trace_tx_stream_message_frame(body.len(), batch_len);
-        chunks.push(Bytes::copy_from_slice(&prefix));
-        if !body.is_empty() {
-            chunks.push(Bytes::from(body));
-        }
-    }
-
-    send.write_all_chunks(&mut chunks)
-        .await
-        .map_err(Error::transport)
+    framed::write_message_stream_frames::<_, QuinnFrameTrace>(send, bodies, max_frame_size).await
 }
 
 async fn write_stream_frame(
@@ -603,19 +616,11 @@ async fn write_stream_frame(
     frame: RpcStreamFrame,
     max_frame_size: usize,
 ) -> Result<()> {
-    if is_plain_message_frame(&frame) {
-        write_message_stream_frame(send, frame.body, max_frame_size).await
-    } else {
-        trace_tx_stream_frame(&frame, frame.encoded_len());
-        write_frame(send, &frame, max_frame_size).await
-    }
+    framed::write_stream_frame::<_, QuinnFrameTrace>(send, frame, max_frame_size).await
 }
 
 fn is_plain_message_frame(frame: &RpcStreamFrame) -> bool {
-    frame.frame_kind() == Some(RpcStreamFrameKind::Message)
-        && frame.status == crate::Code::Ok.as_u32()
-        && frame.message.is_empty()
-        && frame.metadata.is_empty()
+    framed::is_plain_message_frame(frame)
 }
 
 /// Reads and decodes one length-prefixed protobuf frame from a `Quinn` receive stream.
@@ -623,79 +628,14 @@ pub async fn read_frame<M>(recv: &mut quinn::RecvStream, max_frame_size: usize) 
 where
     M: Message + Default,
 {
-    let mut header = [0; 4];
-    recv.read_exact(&mut header)
-        .await
-        .map_err(Error::transport)?;
-
-    let len = frame_body_len(header, max_frame_size)?;
-    let body = read_body(recv, len).await?;
-    trace_rx_frame::<M>(len);
-
-    decode_frame(&body)
+    framed::read_frame::<_, QuinnFrameTrace, M>(recv, max_frame_size).await
 }
 
 async fn read_stream_frame_or_eof(
     recv: &mut quinn::RecvStream,
     max_frame_size: usize,
 ) -> Result<Option<RpcStreamFrame>> {
-    let mut header = [0; 4];
-    if !read_exact_or_eof(recv, &mut header).await? {
-        trace_quinn_event("rx_fin", "stream_frame_header");
-        return Ok(None);
-    }
-
-    let len = frame_body_len(header, max_frame_size)?;
-    if len == 0 {
-        let frame = RpcStreamFrame::message(Vec::new());
-        trace_rx_stream_frame(&frame, len);
-        return Ok(Some(frame));
-    }
-
-    let mut prefix = [0_u8; 11];
-    read_exact_body(recv, &mut prefix[..1]).await?;
-    if prefix[0] != STREAM_FRAME_BODY_TAG {
-        let body = read_body_with_prefix(recv, len, &prefix[..1]).await?;
-        let frame = decode_stream_frame_body_owned(body)?;
-        trace_rx_stream_frame(&frame, len);
-        return Ok(Some(frame));
-    }
-
-    let mut value = 0_u64;
-    let mut prefix_len = 1;
-    for shift in (0..64).step_by(7) {
-        if prefix_len == len {
-            let body = prefix[..prefix_len].to_vec();
-            return decode_stream_frame_body_owned(body).map(Some);
-        }
-
-        read_exact_body(recv, &mut prefix[prefix_len..=prefix_len]).await?;
-        let byte = prefix[prefix_len];
-        prefix_len += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte < 0x80 {
-            let body_len = usize::try_from(value).map_err(|_| {
-                Error::from(Status::invalid_argument(
-                    "stream frame field length exceeded supported range",
-                ))
-            })?;
-            if prefix_len.checked_add(body_len) == Some(len) {
-                let frame = RpcStreamFrame::message(read_body(recv, body_len).await?);
-                trace_rx_stream_frame(&frame, len);
-                return Ok(Some(frame));
-            }
-
-            let body = read_body_with_prefix(recv, len, &prefix[..prefix_len]).await?;
-            let frame = decode_stream_frame_body_owned(body)?;
-            trace_rx_stream_frame(&frame, len);
-            return Ok(Some(frame));
-        }
-    }
-
-    let body = read_body_with_prefix(recv, len, &prefix[..prefix_len]).await?;
-    let frame = decode_stream_frame_body_owned(body)?;
-    trace_rx_stream_frame(&frame, len);
-    Ok(Some(frame))
+    framed::read_stream_frame_or_eof::<_, QuinnFrameTrace>(recv, max_frame_size).await
 }
 
 async fn drain_fin_after_terminal_status(
@@ -703,88 +643,8 @@ async fn drain_fin_after_terminal_status(
     max_frame_size: usize,
     stream_name: &'static str,
 ) -> Result<()> {
-    if read_stream_frame_or_eof(recv, max_frame_size)
-        .await?
-        .is_some()
-    {
-        return Err(Error::from(Status::invalid_argument(format!(
-            "{stream_name} continued after terminal status"
-        ))));
-    }
-
-    Ok(())
-}
-
-async fn read_body(recv: &mut quinn::RecvStream, len: usize) -> Result<Vec<u8>> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut body = vec![0; len];
-    read_exact_body(recv, &mut body).await?;
-
-    Ok(body)
-}
-
-async fn read_body_with_prefix(
-    recv: &mut quinn::RecvStream,
-    len: usize,
-    prefix: &[u8],
-) -> Result<Vec<u8>> {
-    let remaining = len.checked_sub(prefix.len()).ok_or_else(|| {
-        Error::from(Status::invalid_argument(
-            "stream frame prefix exceeded frame length",
-        ))
-    })?;
-    let mut body = Vec::with_capacity(len);
-    body.extend_from_slice(prefix);
-    body.resize(len, 0);
-    read_exact_body(recv, &mut body[prefix.len()..prefix.len() + remaining]).await?;
-
-    Ok(body)
-}
-
-async fn read_exact_body(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        match recv
-            .read(&mut buf[offset..])
-            .await
-            .map_err(Error::transport)?
-        {
-            Some(0) => {}
-            Some(read) => offset += read,
-            None => return Err(unexpected_eof()),
-        }
-    }
-
-    Ok(())
-}
-
-async fn read_exact_or_eof(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<bool> {
-    let mut offset = 0;
-
-    while offset < buf.len() {
-        match recv
-            .read(&mut buf[offset..])
-            .await
-            .map_err(Error::transport)?
-        {
-            Some(0) => {}
-            Some(read) => offset += read,
-            None if offset == 0 => return Ok(false),
-            None => return Err(unexpected_eof()),
-        }
-    }
-
-    Ok(true)
-}
-
-fn unexpected_eof() -> Error {
-    Error::transport(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "stream ended in the middle of a frame",
-    ))
+    framed::drain_fin_after_terminal_status::<_, QuinnFrameTrace>(recv, max_frame_size, stream_name)
+        .await
 }
 
 async fn write_streaming_request(
@@ -825,38 +685,8 @@ async fn write_request_body_frames(
     request_body: &mut BoxMessageStream<Vec<u8>>,
     max_frame_size: usize,
 ) -> Result<()> {
-    if !request_body.is_non_blocking() {
-        while let Some(body) = request_body.next().await.transpose()? {
-            write_message_stream_frame(send, body, max_frame_size).await?;
-        }
-        return Ok(());
-    }
-
-    let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
-    loop {
-        batch.clear();
-        let mut done = false;
-        while batch.len() < MESSAGE_FRAME_BATCH {
-            if request_body.drain_ready(MESSAGE_FRAME_BATCH, &mut batch)? {
-                done = true;
-                break;
-            }
-            if batch.len() >= MESSAGE_FRAME_BATCH {
-                break;
-            }
-            let Some(body) = request_body.next().await.transpose()? else {
-                done = true;
-                break;
-            };
-            batch.push(body);
-        }
-        if !batch.is_empty() {
-            write_message_stream_frames(send, &mut batch, max_frame_size).await?;
-        }
-        if done {
-            return Ok(());
-        }
-    }
+    framed::write_request_body_frames::<_, QuinnFrameTrace>(send, request_body, max_frame_size)
+        .await
 }
 
 impl crate::server::Server {

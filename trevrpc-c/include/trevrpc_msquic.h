@@ -12,6 +12,11 @@ typedef struct trevrpc_msquic_listener trevrpc_msquic_listener;
 typedef struct trevrpc_msquic_conn trevrpc_msquic_conn;
 typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 
+typedef struct trevrpc_msquic_frame_part {
+    const uint8_t* data;
+    size_t len;
+} trevrpc_msquic_frame_part;
+
 typedef struct trevrpc_msquic_alpn {
     const char* alpn;
     uint32_t alpn_len;
@@ -40,6 +45,7 @@ typedef struct trevrpc_msquic_config {
     uint16_t max_binding_stateless_operations;
     size_t max_pending_send_bytes;
     size_t max_pending_send_count;
+    size_t max_frame_size;
 } trevrpc_msquic_config;
 
 int trevrpc_msquic_listen(
@@ -73,10 +79,21 @@ intptr_t trevrpc_msquic_stream_read_frame_ready(
     trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
 intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_write_fin(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
+/*
+ * Sends one length-prefixed native frame from borrowed body parts. MsQuic owns
+ * none of the provided part memory: every non-empty part must remain valid
+ * until the stream reports SEND_COMPLETE. trevrpc_msquic_stream_close and
+ * trevrpc_msquic_stream_wait_pending_sends both drain those completions.
+ */
+intptr_t trevrpc_msquic_stream_write_frame_parts(
+    trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len);
+intptr_t trevrpc_msquic_stream_write_frame_parts_fin(
+    trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len);
 intptr_t trevrpc_msquic_stream_write_message_frame(
     trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);
 intptr_t trevrpc_msquic_stream_write_message_frames(
     trevrpc_msquic_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count, size_t max_len);
+int trevrpc_msquic_stream_wait_pending_sends(trevrpc_msquic_stream* stream);
 int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream);
 int trevrpc_msquic_stream_abort(trevrpc_msquic_stream* stream);
 int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream);

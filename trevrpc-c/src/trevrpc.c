@@ -232,6 +232,7 @@ static trevrpc_msquic_config trevrpc_make_msquic_config(const trevrpc_config* co
     msquic_config.max_binding_stateless_operations = config->max_binding_stateless_operations;
     msquic_config.max_pending_send_bytes = config->max_pending_send_bytes;
     msquic_config.max_pending_send_count = config->max_pending_send_count;
+    msquic_config.max_frame_size = config->max_frame_size;
     return msquic_config;
 }
 
@@ -319,6 +320,7 @@ static trevrpc_msquic_config trevrpc_make_server_msquic_config(const trevrpc_ser
         .max_binding_stateless_operations = config->max_binding_stateless_operations,
         .max_pending_send_bytes = config->max_pending_send_bytes,
         .max_pending_send_count = config->max_pending_send_count,
+        .max_frame_size = config->max_frame_size,
     };
     uint32_t wt_stream_count = config->max_streams_per_session;
     if (wt_stream_count > UINT16_MAX) {
@@ -653,6 +655,27 @@ static int trevrpc_stream_write_final_frame(trevrpc_stream* stream, const uint8_
     return -EINVAL;
 }
 
+static int trevrpc_stream_write_msquic_frame_parts(
+    trevrpc_stream* stream, const trevrpc_wire_frame_parts* parts, bool finish_send) {
+    trevrpc_msquic_frame_part msquic_parts[3] = {
+        {.data = parts->prefix, .len = parts->prefix_len},
+        {.data = parts->body, .len = parts->body_len},
+        {.data = parts->suffix, .len = parts->suffix_len},
+    };
+    intptr_t written = finish_send ? trevrpc_msquic_stream_write_frame_parts_fin(
+                                         stream->msquic_stream, msquic_parts, 3, stream->max_frame_size)
+                                   : trevrpc_msquic_stream_write_frame_parts(
+                                         stream->msquic_stream, msquic_parts, 3, stream->max_frame_size);
+    if (written < 0) {
+        return (int)written;
+    }
+    if ((size_t)written != 4 + parts->frame_body_len) {
+        return TREV_MSQUIC_ERR_CLOSED;
+    }
+
+    return trevrpc_msquic_stream_wait_pending_sends(stream->msquic_stream);
+}
+
 static intptr_t trevrpc_stream_write_message_frame(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
     if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
         return trevrpc_msquic_stream_write_message_frame(stream->msquic_stream, body, body_len, stream->max_frame_size);
@@ -935,7 +958,7 @@ static int trevrpc_stream_check_message_batch_limits(
     return 0;
 }
 
-int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
+static int trevrpc_stream_prepare_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
     if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) ||
         (body == NULL && body_len > 0)) {
         return -EINVAL;
@@ -958,9 +981,34 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
     if (err != 0) {
         return err;
     }
+    return 0;
+}
 
+int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
+    int err = trevrpc_stream_prepare_send_message(stream, body, body_len);
+    if (err != 0) {
+        return err;
+    }
     intptr_t written = trevrpc_stream_write_message_frame(stream, body, body_len);
     return written < 0 ? (int)written : 0;
+}
+
+int trevrpc_stream_send_message_borrowed_wait(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
+    if (stream == NULL || stream->transport != TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        return trevrpc_stream_send_message(stream, body, body_len);
+    }
+
+    int err = trevrpc_stream_prepare_send_message(stream, body, body_len);
+    if (err != 0) {
+        return err;
+    }
+    trevrpc_wire_frame_parts parts = {0};
+    err = trevrpc_wire_encode_stream_message_parts(body, body_len, stream->max_frame_size, &parts);
+    if (err == 0) {
+        err = trevrpc_stream_write_msquic_frame_parts(stream, &parts, false);
+    }
+    trevrpc_wire_frame_parts_reset(&parts);
+    return err;
 }
 
 int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count) {
@@ -1040,28 +1088,40 @@ static int trevrpc_stream_send_status_with_metadata_internal(trevrpc_stream* str
         return -EPIPE;
     }
 
+    int err = 0;
     uint8_t* frame = NULL;
     size_t frame_len = 0;
-    int err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_STATUS,
-        status,
-        message,
-        message_len,
-        NULL,
-        0,
-        metadata,
-        stream->max_frame_size,
-        &frame,
-        &frame_len);
+    trevrpc_wire_frame_parts parts = {0};
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        err = trevrpc_wire_encode_stream_status_parts(
+            status, message, message_len, metadata, stream->max_frame_size, &parts);
+    } else {
+        err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_STATUS,
+            status,
+            message,
+            message_len,
+            NULL,
+            0,
+            metadata,
+            stream->max_frame_size,
+            &frame,
+            &frame_len);
+    }
     if (err == 0) {
         stream->sent_status = true;
         stream->terminal_status = trevrpc_status_code_from_uint32(status);
 #ifdef TREVRPC_TESTING
         trevrpc_test_record_stream_status(status);
 #endif
-        err = finish_send ? trevrpc_stream_write_final_frame(stream, frame, frame_len)
-                          : trevrpc_stream_write_frame(stream, frame, frame_len);
+        if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+            err = trevrpc_stream_write_msquic_frame_parts(stream, &parts, finish_send);
+        } else {
+            err = finish_send ? trevrpc_stream_write_final_frame(stream, frame, frame_len)
+                              : trevrpc_stream_write_frame(stream, frame, frame_len);
+        }
         stream->status_queued = err == 0;
     }
+    trevrpc_wire_frame_parts_reset(&parts);
     free(frame);
     return err;
 }
@@ -1679,6 +1739,7 @@ static int trevrpc_client_call_request_internal(trevrpc_client* client,
 
     uint8_t* response_body = NULL;
     size_t response_body_len = 0;
+    bool response_body_taken = false;
     if (err == 0) {
         intptr_t read = trevrpc_client_read_frame(client, msquic_stream, wt_stream, &response_body, &response_body_len);
         if (read < 0) {
@@ -1688,7 +1749,7 @@ static int trevrpc_client_call_request_internal(trevrpc_client* client,
         }
     }
     if (err == 0) {
-        err = trevrpc_wire_decode_response(response_body, response_body_len, out_response);
+        err = trevrpc_wire_decode_response_take(response_body, response_body_len, out_response, &response_body_taken);
     }
     if (err == 0 && apply_options) {
         err = trevrpc_check_unary_response_limits(*out_response, &resolved_options);
@@ -1699,7 +1760,9 @@ static int trevrpc_client_call_request_internal(trevrpc_client* client,
     }
 
     trevrpc_cancellation_unbind_raw_stream(cancellation, msquic_stream, wt_stream);
-    trevrpc_client_free_body(client, response_body);
+    if (!response_body_taken) {
+        trevrpc_client_free_body(client, response_body);
+    }
     trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
     if (err == 0 && trevrpc_cancellation_cancelled(cancellation)) {
         trevrpc_response_free(*out_response);
@@ -2865,6 +2928,21 @@ static bool trevrpc_response_fields_valid(const trevrpc_response* response) {
 }
 
 static void trevrpc_server_write_response(trevrpc_stream* stream, trevrpc_response* response) {
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        trevrpc_wire_frame_parts parts = {0};
+        int encode_err = trevrpc_wire_encode_response_parts(response, stream->max_frame_size, &parts);
+        if (encode_err != 0 && response->status == TREVRPC_STATUS_OK) {
+            trevrpc_response_reset(response);
+            trevrpc_set_status(response, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "response frame exceeded maximum size");
+            encode_err = trevrpc_wire_encode_response_parts(response, stream->max_frame_size, &parts);
+        }
+        if (encode_err == 0) {
+            (void)trevrpc_stream_write_msquic_frame_parts(stream, &parts, true);
+        }
+        trevrpc_wire_frame_parts_reset(&parts);
+        return;
+    }
+
     uint8_t* frame = NULL;
     size_t frame_len = 0;
     int encode_err = trevrpc_wire_encode_response(response, stream->max_frame_size, &frame, &frame_len);

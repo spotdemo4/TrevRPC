@@ -16,100 +16,71 @@ This file now tracks the work that remains after the 2026-07-09 implementation p
 - C servers now dispatch accepted streams through a server-owned bounded worker pool with public worker-count and queue-capacity options, heap/refcounted connection stream limiter ownership, queue-full `ResourceExhausted` rejection, queue-wait-aware initial request timeout handling, and runtime coverage for saturation, shutdown, reset, and deferred raw call cleanup.
 - C MsQuic streams now enforce per-stream pending-send byte/count budgets around `StreamSend`; sends reserve before submission, roll back on synchronous failure, decrement on every send completion including canceled completions, and keep stream send state alive until completions drain while send buffering stays disabled by default.
 - Rust Quinn terminal streaming statuses now drain the following transport FIN before completing, avoiding implicit Quinn `RecvStream` drop `STOP_SENDING(0)` after accepted terminal statuses without waiting for ACKs.
+- Rust Quinn/WebTransport framed-stream length-prefix, stream-frame fast path, and request-body batching logic now share one internal Rust implementation while transport-specific reset/STOP_SENDING, terminal FIN drain, and WebTransport unary request drain behavior remain explicit in the transport modules.
 - JavaScript browser WebTransport now has unit coverage for unsupported runtime and missing bidirectional stream APIs returning `Code.Unavailable`.
 - Browser WebTransport lifecycle coverage now exercises real Chromium page close, navigation, browser-context close, stream-open abort, server shutdown mid-stream, and Go/Rust lifecycle server parity in the Playwright fast path.
 - Go and Rust WebTransport lifecycle tests now cover shutdown behavior for active sessions/connections.
 - JavaScript native server call close now closes the underlying C call once pending refs drain, even if the JS wrapper is still alive.
+- C native accepted TrevRPC streams now enter MsQuic frame mode when peer-started streams are constructed for the `trevrpc/1` ALPN, while H3 control, CONNECT, and WebTransport stream prelude paths remain byte-oriented.
+- C native unary responses and terminal streaming statuses now use direct MsQuic frame-part sends for native streams, borrowing response bodies only until `SEND_COMPLETE`, with explicit close/reset lifetime tests and generated-helper stack/heap protobuf coverage.
 - Operational docs now include receive-memory budget guidance, benchmark diagnostics, non-cooperative cancellation boundaries, WebTransport browser limitations, and current unsafe zero-copy/buffering boundaries.
 - Scheduled/manual protocol fuzz workflows were added for bounded Go fuzz targets covering frame decode, frame length parsing, and metadata validation outside normal fast checks.
+- Browser and cross-runtime matrix guardrails now keep Chromium WebTransport in the fast path, add scheduled/manual Chromium WebTransport soak and native Go/Rust lifecycle stress outside normal `nix flake check`, and keep Firefox/WebKit diagnostics manual-only until non-Chromium WebTransport support is stable enough.
+- C/Go/Rust/JavaScript resource-budget tests now cover exact-limit and one-unit-over behavior for the existing frame, unary-response, stream-message, cumulative-stream-body, and derived receive-window limits without adding unsupported public knobs.
+- JavaScript native inbound response bodies, stream frames, and stream body batches can transfer C owner allocations to external ArrayBuffer finalizers, with forced-GC tests covering bodies that point inside `_body_owner`. Internal borrowed outbound send paths retain JS buffers until native send completion returns, while public sends remain copy-based.
+- JavaScript native addon operations now use a binding-owned persistent native completion worker source and Node-API threadsafe-function delivery instead of `napi_async_work`, with debug/native coverage for pending close/GC, retained send refs, terminal-status precedence, partial-stream return cleanup, and send completion behavior.
 
 ## Deferred With Guardrails
 
-### C Native Frame Mode At Stream Construction
-
-Deferred. MsQuic streams still switch to native frame mode on first frame read. WebTransport/H3 control and CONNECT streams must remain byte-oriented, so this should be changed only with tests that prove early frame mode is applied only to native TrevRPC streams.
-
-Required before implementation:
-
-- Native accepted stream starts in frame mode before byte buffering.
-- Partial header/body, oversized-frame, and malformed-frame behavior remains unchanged.
-- WebTransport H3 control, CONNECT, and stream prelude paths remain byte-oriented.
-
-### C Direct/Scatter-Gather Unary And Status Sends
-
-Deferred. C streaming message sends already have direct pooled send paths; unary responses and terminal statuses still allocate complete frames. Scatter/gather or borrowed-buffer sends require explicit send-completion lifetime tests before handler-owned buffers can be referenced by MsQuic.
-
-Required before implementation:
-
-- Unary/status send-completion ownership tests under reset and close.
-- Generated C helper tests with stack and heap protobuf buffers.
-- Clear rule that frame/header/body memory remains alive until MsQuic `SEND_COMPLETE`.
-
 ### C Larger Buffering Profiles
 
-Deferred. Per-stream pending-send accounting is implemented and MsQuic send buffering remains disabled by default. Larger MsQuic receive windows, ACK/congestion tuning, or explicit send-buffering profiles still require separate workload-specific evidence and tests before becoming public profiles.
+Deferred and narrowed. Per-stream pending-send accounting is implemented, slow-reader close-drain coverage exists for the safe default, and MsQuic send buffering remains disabled by default. No larger C buffering profile was added because no workload-specific profile could be justified without A/B benchmark data and peak-memory evidence. A required remote evidence attempt was made against `ssh trev@192.168.0.160`, but the host was unreachable with `No route to host`, so benchmark collection for profile promotion is externally blocked.
 
 Required before implementation:
 
-- Slow-reader and overload tests for each proposed profile proving total memory remains bounded.
+- A reachable required benchmark host or equivalent approved measurement environment.
+- A concrete proposed profile with explicit receive-window, send-buffering, stream-concurrency, frame-size, and cumulative-body settings.
+- Slow-reader and overload tests for each proposed profile proving total memory remains bounded, including peak-memory measurements.
 - Documentation that clearly separates safe defaults from opt-in diagnostic or throughput profiles.
 - Cross-runtime benchmark evidence recorded in `wiki/Benchmarks.md` for any profile intended for published rows.
 
 ### Rust Quinn/MsQuic ACK Tuning
 
-Deferred. ACK tuning is not baked into published rows. The Rust/C tracing and keylog hooks must be used to capture request frame, request FIN, response frame, terminal status, response FIN, reset/STOP_SENDING, and ACK timing evidence first. The Rust Quinn close-path change is limited to draining FIN after terminal status based on Quinn `RecvStream` drop semantics and integration tests.
+Deferred and narrowed after exploratory diagnostics. ACK tuning is not baked into published rows. Focused C MsQuic client to Rust Quinn server diagnostics were run on `ssh trev@192.168.0.160` for `client_stream_latency` and `bidi_stream_latency` with `TREVRPC_RUST_QUINN_FRAME_TRACE=1`, `TREVRPC_C_FRAME_TRACE=1`, `SSLKEYLOGFILE`, and shape filters. The ACK-threshold/delay diagnostic run reduced traced outliers in a small sample, but packet-level ACK timing was not captured, the host was in `powersave`, and a follow-up packet-capture check was blocked when the benchmark host became unreachable. Results are recorded in `wiki/Benchmarks.md`.
 
 Required before implementation:
 
-- Focused C MsQuic client to Rust Quinn server trace for `bidi_stream_latency` and `client_stream_latency`.
-- Comparison of default and ACK-threshold/delay diagnostic runs.
-- Correctness tests that prove any close-path change preserves terminal status, reset, cancellation, and partial-stream semantics.
-
-### Rust Shared Framed-Stream Extraction
-
-Deferred. Quinn and WebTransport frame logic is still duplicated because close/reset semantics differ. The ready-drain optimization only touched request-body batching and did not extract shared transport logic.
-
-Required before implementation:
-
-- Transport-specific tests for finish, reset, cancellation, terminal status, partial initial body, oversized initial frame, and WebTransport interoperability.
-- Explicit preservation of WebTransport unary request drain behavior and Quinn reset/STOP_SENDING behavior.
+- Packet-level ACK timing evidence, such as qlog or decoded packet capture, for the same C MsQuic client to Rust Quinn server shapes.
+- Broader clean-host benchmark samples without frame tracing before changing published ACK defaults.
+- Correctness tests that prove any behavior change preserves terminal status, reset, cancellation, STOP_SENDING, and partial-stream semantics.
 
 ### JavaScript Zero-Copy Native Paths
 
-Deferred. Native JS still copies inbound and outbound buffers by default. This remains the safe ownership model until C helpers can transfer the correct owner allocation to external ArrayBuffer finalizers and outbound JS buffers can be retained until MsQuic send completion.
+Partially implemented. Native unary response bodies and native stream message bodies can now transfer their C owner allocation to external ArrayBuffer finalizers, including frames whose `body` points inside `_body_owner`. An internal single-message outbound path retains the JS body with a native reference until the borrowed MsQuic send waits through `SEND_COMPLETE`.
 
-Required before implementation:
+Remaining before public/default outbound zero-copy:
 
-- External ArrayBuffer finalizer tests for response bodies and stream frames whose body points inside `_body_owner`.
-- Forced-GC lifetime tests.
-- Native send-completion refs for outbound zero-copy.
-
-### JavaScript Evented Native Completion
-
-Deferred. The addon still uses `napi_async_work` around blocking C APIs. A persistent poller or native completion source needs separate design and correctness coverage before replacing the current blocking path.
-
-Required before implementation:
-
-- Close/GC behavior while operations are pending.
-- Cancellation and terminal-status precedence tests.
-- Partial-stream cleanup and send-completion tests.
-
-### Broader Browser And Cross-Runtime Matrix
-
-Deferred. Chromium browser WebTransport coverage remains the fast normal path and now includes lifecycle shutdown/teardown parity. Non-Chromium browsers, long-running soak, and broader cross-runtime matrices remain scheduled/manual until stable and low-cost enough for normal checks.
-
-Required before implementation:
-
-- Non-Chromium browser WebTransport coverage once browser support is stable enough.
-- Long-running WebTransport soak outside normal `nix flake check`.
-- Additional cross-runtime lifecycle stress beyond the current Chromium fast path.
+- Public API and generator/runtime policy for opting into zero-copy sends.
+- Borrowed batched stream-send and unary request-frame coverage.
+- A deeper C-level completion queue or exported nonblocking transport poll API if future profiling shows the binding-owned native completion workers are insufficient for high-concurrency workloads.
 
 ### Additional Resource Budget APIs
 
-Deferred. The docs now define the receive-memory budget model. Public APIs for splitting request-body, response-body, streaming-message, total-stream, and connection receive budgets should be added only when concrete workload requirements justify the extra knobs.
+Deferred and narrowed after the 2026-07-09 budget pass. The docs define the receive-memory budget model, and C/Go/Rust/JavaScript tests now cover exact-limit and over-limit behavior for the existing frame, unary-response, stream-message, cumulative-stream-body, and derived receive-window budgets. No public API fields were added because the repository does not yet contain concrete workload evidence showing that independent request-body, response-body, streaming-message, total-stream, or connection receive-budget knobs are needed beyond the current defaults and per-call/server stream limits.
+
+Current blockers:
+
+- Request-body and response-body split: existing frame and cumulative-stream-body limits bound both directions, and no test workload currently proves asymmetric request/response byte caps improve safety or performance.
+- Streaming-message split: existing stream message caps already protect both request and response streams, and no compatibility requirement currently justifies separate per-direction fields.
+- Total-stream budget: existing cumulative body caps cover total stream bytes; a separate total-stream field needs a workload showing message-count and body-byte caps are insufficient.
+- Connection receive budget: Go and Rust derive QUIC receive windows from frame size, stream-body size, and stream concurrency. C and Node native receive-window exposure remains blocked by the C larger-buffering profile requirements: slow-reader and overload memory evidence must come first.
 
 Required before implementation:
 
-- Compatibility tests for every new budget field.
-- Limit-boundary tests across C, Go, Rust, and JavaScript.
-- Slow-reader and overload tests before widening defaults.
+- One concrete workload or production requirement for each proposed new knob, including expected payload distributions and concurrency.
+- Compatibility tests for every new public budget field in every language that exposes it.
+- Limit-boundary tests across C, Go, Rust, and JavaScript showing exact-limit success and one-unit-over failure.
+- Slow-reader and overload tests proving bounded memory before widening defaults or exposing larger C/Node native receive-buffer profiles.
+- Benchmark evidence recorded in `wiki/Benchmarks.md` for any profile intended to change published performance rows.
+
+Next action: build a small overload/slow-reader harness that records peak memory while varying stream concurrency, frame size, and stream-body limit. Use that evidence to decide whether connection-level receive budgets should become explicit API fields or remain derived transport settings.

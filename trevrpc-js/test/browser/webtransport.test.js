@@ -7,51 +7,66 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { chromium } from "playwright";
+import { chromium, firefox, webkit } from "playwright";
 
 const jsRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const repoRoot = resolve(jsRoot, "..");
 const goRoot = join(repoRoot, "trevrpc-go");
 const rustRoot = join(repoRoot, "trevrpc-rust");
+const browserTypes = { chromium, firefox, webkit };
+const selectedBrowserName = (process.env.TREVRPC_BROWSER ?? "chromium").toLowerCase();
+const stableWebTransportBrowsers = new Set(["chromium"]);
+if (browserTypes[selectedBrowserName] == null) {
+  throw new Error(`unsupported TREVRPC_BROWSER ${JSON.stringify(selectedBrowserName)}`);
+}
+const browserSkipReason = browserCoverageSkipReason(selectedBrowserName);
 
-test("browser WebTransport client calls Go greeter example", { timeout: 120_000 }, async () => {
-  await runBrowserGreeterScenario({
-    server: servers.go,
-    name: "Go Playwright",
-    assertOutput(output) {
-      assert.match(output, /SayHello: hello Go Playwright/);
-      assert.match(output, /LotsOfReplies: hello Go Playwright/);
-      assert.match(output, /LotsOfReplies: welcome to TrevRPC over QUIC/);
-      assert.match(
-        output,
-        /LotsOfGreetings: hello, Go Playwright client stream 1, Go Playwright client stream 2/,
-      );
-      assert.match(output, /BidiHello: stream hello, Go Playwright bidi 1/);
-      assert.match(output, /BidiHello: stream hello, Go Playwright bidi 2/);
-    },
-  });
-});
+browserTest(
+  "browser WebTransport client calls Go greeter example",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserGreeterScenario({
+      server: servers.go,
+      name: "Go Playwright",
+      assertOutput(output) {
+        assert.match(output, /SayHello: hello Go Playwright/);
+        assert.match(output, /LotsOfReplies: hello Go Playwright/);
+        assert.match(output, /LotsOfReplies: welcome to TrevRPC over QUIC/);
+        assert.match(
+          output,
+          /LotsOfGreetings: hello, Go Playwright client stream 1, Go Playwright client stream 2/,
+        );
+        assert.match(output, /BidiHello: stream hello, Go Playwright bidi 1/);
+        assert.match(output, /BidiHello: stream hello, Go Playwright bidi 2/);
+      },
+    });
+  },
+);
 
-test("browser WebTransport client calls Rust greeter example", { timeout: 120_000 }, async () => {
-  await runBrowserGreeterScenario({
-    server: servers.rust,
-    name: "Rust Playwright",
-    assertOutput(output) {
-      assert.match(output, /SayHello: hello, Rust Playwright/);
-      assert.match(output, /LotsOfReplies: hello, Rust Playwright/);
-      assert.match(output, /LotsOfReplies: hello again, Rust Playwright/);
-      assert.match(output, /LotsOfReplies: goodbye, Rust Playwright/);
-      assert.match(
-        output,
-        /LotsOfGreetings: hello, Rust Playwright client stream 1, Rust Playwright client stream 2/,
-      );
-      assert.match(output, /BidiHello: stream hello, Rust Playwright bidi 1/);
-      assert.match(output, /BidiHello: stream hello, Rust Playwright bidi 2/);
-    },
-  });
-});
+browserTest(
+  "browser WebTransport client calls Rust greeter example",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserGreeterScenario({
+      server: servers.rust,
+      name: "Rust Playwright",
+      assertOutput(output) {
+        assert.match(output, /SayHello: hello, Rust Playwright/);
+        assert.match(output, /LotsOfReplies: hello, Rust Playwright/);
+        assert.match(output, /LotsOfReplies: hello again, Rust Playwright/);
+        assert.match(output, /LotsOfReplies: goodbye, Rust Playwright/);
+        assert.match(
+          output,
+          /LotsOfGreetings: hello, Rust Playwright client stream 1, Rust Playwright client stream 2/,
+        );
+        assert.match(output, /BidiHello: stream hello, Rust Playwright bidi 1/);
+        assert.match(output, /BidiHello: stream hello, Rust Playwright bidi 2/);
+      },
+    });
+  },
+);
 
-test("browser WebTransport rejects an unexpected path", { timeout: 120_000 }, async () => {
+browserTest("browser WebTransport rejects an unexpected path", { timeout: 120_000 }, async () => {
   await runBrowserGreeterScenario({
     server: servers.go,
     path: "/wrong",
@@ -59,7 +74,7 @@ test("browser WebTransport rejects an unexpected path", { timeout: 120_000 }, as
   });
 });
 
-test("browser WebTransport rejects an unexpected origin", { timeout: 120_000 }, async () => {
+browserTest("browser WebTransport rejects an unexpected origin", { timeout: 120_000 }, async () => {
   await runBrowserGreeterScenario({
     server: servers.go,
     allowedOrigin: "http://127.0.0.1:1",
@@ -67,13 +82,17 @@ test("browser WebTransport rejects an unexpected origin", { timeout: 120_000 }, 
   });
 });
 
-test("browser WebTransport rejects an unexpected authority", { timeout: 120_000 }, async () => {
-  await runBrowserGreeterScenario({
-    server: servers.rust,
-    authorities: ["expected.example"],
-    expectError: true,
-  });
-});
+browserTest(
+  "browser WebTransport rejects an unexpected authority",
+  { timeout: 120_000 },
+  async () => {
+    await runBrowserGreeterScenario({
+      server: servers.rust,
+      authorities: ["expected.example"],
+      expectError: true,
+    });
+  },
+);
 
 const lifecycleCases = [
   {
@@ -133,12 +152,12 @@ const lifecycleCases = [
 ];
 
 for (const lifecycleCase of lifecycleCases) {
-  test(`browser WebTransport ${lifecycleCase.name}`, { timeout: 120_000 }, async () => {
+  browserTest(`browser WebTransport ${lifecycleCase.name}`, { timeout: 120_000 }, async () => {
     await runBrowserLifecycleScenario(lifecycleCase);
   });
 }
 
-test(
+browserTest(
   "browser WebTransport Rust lifecycle server matches Go lifecycle scenarios",
   { timeout: 120_000 },
   async () => {
@@ -149,7 +168,7 @@ test(
   },
 );
 
-test(
+browserTest(
   "browser WebTransport page close cancels open response stream",
   { timeout: 120_000 },
   async () => {
@@ -161,7 +180,7 @@ test(
   },
 );
 
-test(
+browserTest(
   "browser WebTransport navigation cancels open response stream",
   { timeout: 120_000 },
   async () => {
@@ -173,7 +192,7 @@ test(
   },
 );
 
-test(
+browserTest(
   "browser WebTransport context close cancels open response stream",
   { timeout: 120_000 },
   async () => {
@@ -185,7 +204,7 @@ test(
   },
 );
 
-test(
+browserTest(
   "browser WebTransport stream-open abort cancels pending stream creation",
   { timeout: 120_000 },
   async () => {
@@ -198,7 +217,7 @@ test(
   },
 );
 
-test(
+browserTest(
   "browser WebTransport Go server shutdown mid-stream fails active response stream",
   { timeout: 120_000 },
   async () => {
@@ -206,13 +225,29 @@ test(
   },
 );
 
-test(
+browserTest(
   "browser WebTransport Rust server shutdown mid-stream fails active response stream",
   { timeout: 120_000 },
   async () => {
     await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycleRust });
   },
 );
+
+if (envFlag("TREVRPC_BROWSER_SOAK")) {
+  browserTest(
+    "browser WebTransport lifecycle soak across Go and Rust servers",
+    { timeout: positiveEnv("TREVRPC_BROWSER_SOAK_TIMEOUT_MS", 1_800_000) },
+    async () => {
+      const iterations = positiveEnv("TREVRPC_BROWSER_SOAK_ITERATIONS", 10);
+      for (let iteration = 0; iteration < iterations; iteration += 1) {
+        await runBrowserLifecycleSuite({ cases: lifecycleCases, server: servers.lifecycle });
+        await runBrowserLifecycleSuite({ cases: lifecycleCases, server: servers.lifecycleRust });
+        await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycle });
+        await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycleRust });
+      }
+    },
+  );
+}
 
 const servers = {
   go: {
@@ -780,17 +815,43 @@ async function runBrowserGreeterScenario({
   }
 }
 
-async function launchBrowser() {
-  const launchOptions = {
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-    chromiumSandbox: false,
-    dumpio: process.env.TREVRPC_BROWSER_DUMPIO === "1",
-  };
-  if (process.env.TREVRPC_BROWSER_CHROMIUM != null) {
-    launchOptions.executablePath = process.env.TREVRPC_BROWSER_CHROMIUM;
+function browserTest(name, options, fn) {
+  if (browserSkipReason == null) {
+    test(name, options, fn);
+    return;
   }
 
-  return chromium.launch(launchOptions);
+  test(name, { ...options, skip: browserSkipReason }, fn);
+}
+
+function browserCoverageSkipReason(browserName) {
+  if (stableWebTransportBrowsers.has(browserName) || envFlag("TREVRPC_BROWSER_ALLOW_UNSTABLE")) {
+    return null;
+  }
+
+  return `${browserName} WebTransport coverage is manual-only until non-Chromium browser support is stable enough`;
+}
+
+async function launchBrowser() {
+  const launchOptions = {
+    dumpio: process.env.TREVRPC_BROWSER_DUMPIO === "1",
+  };
+  if (selectedBrowserName === "chromium") {
+    launchOptions.args = [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+    ];
+    launchOptions.chromiumSandbox = false;
+  }
+
+  const executablePath = process.env[`TREVRPC_BROWSER_${selectedBrowserName.toUpperCase()}`];
+  if (executablePath != null && executablePath !== "") {
+    launchOptions.executablePath = executablePath;
+  }
+
+  return browserTypes[selectedBrowserName].launch(launchOptions);
 }
 
 async function closeBrowser(browser) {
@@ -906,4 +967,17 @@ function freePort() {
       });
     });
   });
+}
+
+function envFlag(name) {
+  const value = process.env[name];
+  return value === "1" || value === "true" || value === "TRUE" || value === "yes";
+}
+
+function positiveEnv(name, fallback) {
+  const value = process.env[name] ?? String(fallback);
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error(`${name} must be a positive integer, got ${JSON.stringify(value)}`);
+  }
+  return Number(value);
 }

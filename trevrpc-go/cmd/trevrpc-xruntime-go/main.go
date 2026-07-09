@@ -89,14 +89,20 @@ func run() error {
 	mode := flag.String("mode", "", "server or client")
 	addr := flag.String("addr", "127.0.0.1:0", "QUIC address")
 	certPath := flag.String("cert", "", "PEM certificate path")
+	iterations := flag.Int("iterations", 1, "client iteration count")
 	token := flag.String("token", "cross-runtime-token", "bearer token")
 	flag.Parse()
+	if *iterations < 1 {
+		return errors.New("-iterations must be positive")
+	}
 
 	switch *mode {
 	case "server":
 		return runServer(*addr, *certPath, *token)
 	case "client":
-		return runClient(*addr, *certPath, *token)
+		return runClient(*addr, *certPath, *token, *iterations)
+	case "lifecycle-client":
+		return runLifecycleClient(*addr, *certPath, *token, *iterations)
 	default:
 		return fmt.Errorf("unsupported -mode %q", *mode)
 	}
@@ -135,7 +141,17 @@ func runServer(addr, certPath, token string) error {
 	return trevrpc.ServeQUIC(ctx, listener, server)
 }
 
-func runClient(addr, certPath, token string) error {
+func runClient(addr, certPath, token string, iterations int) error {
+	for iteration := range iterations {
+		if err := runClientIteration(addr, certPath, token); err != nil {
+			return fmt.Errorf("client iteration %d: %w", iteration+1, err)
+		}
+	}
+
+	return nil
+}
+
+func runClientIteration(addr, certPath, token string) error {
 	if addr == "" {
 		return errors.New("-addr is required")
 	}
@@ -210,6 +226,91 @@ func runClient(addr, certPath, token string) error {
 	}
 
 	return expectGoProtocolError(ctx, conn)
+}
+
+func runLifecycleClient(addr, certPath, token string, iterations int) error {
+	for iteration := range iterations {
+		if err := runLifecycleClientIteration(addr, certPath, token); err != nil {
+			return fmt.Errorf("lifecycle client iteration %d: %w", iteration+1, err)
+		}
+	}
+
+	return nil
+}
+
+func runLifecycleClientIteration(addr, certPath, token string) error {
+	if addr == "" {
+		return errors.New("-addr is required")
+	}
+	if certPath == "" {
+		return errors.New("-cert is required")
+	}
+
+	tlsConfig, err := clientTLSConfig(certPath)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := quic.DialAddr(ctx, addr, tlsConfig, trevrpc.QUICClientConfig(trevrpc.DefaultMaxFrameSize, nil))
+	if err != nil {
+		return err
+	}
+	defer conn.CloseWithError(0, "lifecycle client complete")
+
+	transport := trevrpc.NewQuicClient(conn)
+	client := greeter.NewGreeterClient(
+		transport,
+		trevrpc.WithTimeout(5*time.Second),
+		trevrpc.WithMetadata("authorization", []byte("Bearer "+token)),
+	)
+
+	if response, err := client.SayHello(ctx, &greeter.HelloRequest{Name: "lifecycle-unary"}); err != nil || response.Message != "hello, lifecycle-unary" {
+		return fmt.Errorf("lifecycle SayHello = %#v, %v", response, err)
+	}
+
+	replies, err := client.LotsOfReplies(ctx, &greeter.HelloRequest{Name: "lifecycle-server-stream"})
+	if err != nil {
+		return err
+	}
+	if reply, err := replies.Recv(); err != nil || reply.Message != "hello, lifecycle-server-stream" {
+		_ = replies.Close()
+		return fmt.Errorf("lifecycle server stream first = %#v, %v", reply, err)
+	}
+	if err := replies.Close(); err != nil {
+		return err
+	}
+
+	greetings, err := client.LotsOfGreetings(ctx)
+	if err != nil {
+		return err
+	}
+	if err := greetings.Send(&greeter.HelloRequest{Name: "cancelled-client-stream"}); err != nil {
+		_ = greetings.Close()
+		return err
+	}
+	if err := greetings.Close(); err != nil {
+		return err
+	}
+
+	bidi, err := client.BidiHello(ctx)
+	if err != nil {
+		return err
+	}
+	if err := bidi.Send(&greeter.HelloRequest{Name: "cancelled-bidi"}); err != nil {
+		_ = bidi.Close()
+		return err
+	}
+	if reply, err := bidi.Recv(); err != nil || reply.Message != "echo, cancelled-bidi" {
+		_ = bidi.Close()
+		return fmt.Errorf("lifecycle bidi first = %#v, %v", reply, err)
+	}
+	if err := bidi.Close(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func expectGoStream(stream trevrpc.MessageStream[*greeter.HelloReply], expected []string) error {

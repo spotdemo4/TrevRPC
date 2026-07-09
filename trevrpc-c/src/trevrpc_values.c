@@ -476,6 +476,12 @@ int trevrpc_response_set_body(trevrpc_response* response, const uint8_t* body, s
         return -EINVAL;
     }
 
+    if (response->_body_owner != NULL) {
+        free(response->_body_owner);
+        response->_body_owner = NULL;
+        response->body = NULL;
+        response->body_len = 0;
+    }
     return trevrpc_copy_bytes(&response->body, &response->body_len, body, body_len);
 }
 
@@ -498,13 +504,18 @@ void trevrpc_response_reset(trevrpc_response* response) {
     }
 
     free(response->message);
-    free(response->body);
+    if (response->_body_owner != NULL) {
+        free(response->_body_owner);
+    } else {
+        free(response->body);
+    }
     trevrpc_metadata_reset(&response->metadata);
     response->status = TREVRPC_STATUS_OK;
     response->message = NULL;
     response->message_len = 0;
     response->body = NULL;
     response->body_len = 0;
+    response->_body_owner = NULL;
 }
 
 void trevrpc_response_free(trevrpc_response* response) {

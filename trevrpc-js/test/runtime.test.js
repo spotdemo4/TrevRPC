@@ -1131,6 +1131,149 @@ test("Node transport reads native response body batches and delays terminal stat
   assert.equal(recvBodyBatchCalls, 1);
 });
 
+test("Node transport terminal OK reports already-settled local upload errors", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  const uploadError = invalidArgument("local upload failed");
+  let sendAttempted;
+  const sendAttemptedDone = new Promise((resolve) => {
+    sendAttempted = resolve;
+  });
+  const nativeClient = {
+    async startStream() {
+      return {
+        sendMessage() {
+          sendAttempted();
+          return Promise.reject(uploadError);
+        },
+        async finishSend() {},
+        async recvMany() {
+          await sendAttemptedDone;
+          await Promise.resolve();
+          await Promise.resolve();
+          return [RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok })];
+        },
+        close() {},
+      };
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+  const responses = await transport.streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "BidiHello",
+      kind: RpcKind.BidirectionalStreaming,
+      body: new Uint8Array(),
+    },
+    batchedFrameStream([[new Uint8Array([1])]]),
+  );
+
+  await assert.rejects(
+    responses[Symbol.asyncIterator]().next(),
+    (error) => error.code === Code.InvalidArgument,
+  );
+});
+
+test("Node transport terminal error wins over local upload errors", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  const uploadError = invalidArgument("local upload failed");
+  let closeCalls = 0;
+  let closed = false;
+  let sendAttempted;
+  const sendAttemptedDone = new Promise((resolve) => {
+    sendAttempted = resolve;
+  });
+  const nativeClient = {
+    async startStream() {
+      return {
+        sendMessage() {
+          sendAttempted();
+          return Promise.reject(uploadError);
+        },
+        async finishSend() {},
+        async recvMany() {
+          await sendAttemptedDone;
+          return [
+            RpcStreamFrame.create({
+              kind: RpcStreamFrameKind.Status,
+              status: Code.PermissionDenied,
+              message: "remote rejected upload",
+            }),
+          ];
+        },
+        close() {
+          if (!closed) {
+            closed = true;
+            closeCalls += 1;
+          }
+        },
+      };
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+  const responses = await transport.streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "BidiHello",
+      kind: RpcKind.BidirectionalStreaming,
+      body: new Uint8Array(),
+    },
+    batchedFrameStream([[new Uint8Array([1])]]),
+  );
+  const result = await responses[Symbol.asyncIterator]().next();
+
+  assert.equal(result.done, false);
+  assert.equal(result.value.status, Code.PermissionDenied);
+  assert.equal(closeCalls, 1);
+});
+
+test("Node transport return cleans up partial streams with a pending native receive", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  let closeCalls = 0;
+  let resolvePendingRecv;
+  const nativeClient = {
+    async startStream() {
+      let recvCalls = 0;
+      return {
+        async finishSend() {},
+        recvMany() {
+          recvCalls += 1;
+          if (recvCalls === 1) {
+            return Promise.resolve([RpcStreamFrame.create({ body: new Uint8Array([1]) })]);
+          }
+          return new Promise((resolve) => {
+            resolvePendingRecv = resolve;
+          });
+        },
+        close() {
+          closeCalls += 1;
+          resolvePendingRecv?.([null]);
+        },
+      };
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+  const responses = await transport.streamingCall(
+    {
+      service: "hello.v1.Greeter",
+      method: "LotsOfReplies",
+      kind: RpcKind.ServerStreaming,
+      body: new Uint8Array(),
+    },
+    emptyAsyncIterable(),
+  );
+  const iterator = responses[Symbol.asyncIterator]();
+
+  assert.equal((await iterator.next()).value.body[0], 1);
+  const pendingNext = iterator.next();
+  await Promise.resolve();
+
+  assert.deepEqual(await iterator.return(), { done: true, value: undefined });
+  assert.deepEqual(await pendingNext, { done: true, value: undefined });
+  assert.equal(closeCalls, 1);
+  assert.deepEqual(await iterator.return(), { done: true, value: undefined });
+  assert.equal(closeCalls, 1);
+});
+
 test("Node transport native response body batches delay EOF until queued bodies drain", async () => {
   const { NodeTransport } = await import("../src/node.js");
   const Hello = helloTestType();
@@ -1296,6 +1439,43 @@ test("response stream limits map to resource exhausted at boundaries", async () 
   const bodyIterator = bodyLimited[Symbol.asyncIterator]();
   assert.equal((await bodyIterator.next()).value.value, "one");
   await assert.rejects(bodyIterator.next(), (error) => error.code === Code.ResourceExhausted);
+});
+
+test("unary response body limits are enforced at exact byte boundaries", async () => {
+  const Hello = helloTestType();
+  const body = Hello.encode({ value: "ok" }).finish();
+  const transport = {
+    async call() {
+      return { status: Code.Ok, body, metadata: {} };
+    },
+  };
+
+  const response = await unary(
+    transport,
+    "hello.v1.Greeter",
+    "SayHello",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { maxResponseBodySize: body.byteLength },
+  );
+  assert.equal(response.value, "ok");
+
+  await assert.rejects(
+    unary(
+      transport,
+      "hello.v1.Greeter",
+      "SayHello",
+      Hello,
+      Hello,
+      { value: "Trev" },
+      { maxResponseBodySize: body.byteLength - 1 },
+    ),
+    (error) =>
+      error instanceof FrameTooLargeError &&
+      error.length === body.byteLength &&
+      error.max === body.byteLength - 1,
+  );
 });
 
 test("wire golden vectors stay stable", async () => {

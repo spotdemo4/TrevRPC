@@ -764,6 +764,48 @@ func TestRequestStreamMessageLimitReturnsResourceExhausted(t *testing.T) {
 	}
 }
 
+func TestRequestStreamLimitBoundaries(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamMessages = 2
+	options.MaxStreamBodySize = 3
+	options.StreamIdleTimeout = 0
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		for {
+			_, err := requests.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return EmptyStream[[]byte](), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Upload", nil)
+	request.Kind = RpcKindClientStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, FromSlice([]byte("a"), []byte("bc")))
+	frame, err := response.Recv()
+	if err != nil {
+		t.Fatalf("read exact-limit status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeOK {
+		t.Fatalf("expected ok status at exact limit, got %#v", frame)
+	}
+
+	response = server.HandleStreamingRequest(context.Background(), request, FromSlice([]byte("abc"), []byte("d")))
+	frame, err = response.Recv()
+	if err != nil {
+		t.Fatalf("read over-limit status frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeResourceExhausted {
+		t.Fatalf("expected resource exhausted status over limit, got %#v", frame)
+	}
+}
+
 func TestRequestStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
 	server := NewServer()
 	options := DefaultServerOptions()
@@ -814,6 +856,73 @@ func TestResponseStreamBodyLimitReturnsResourceExhausted(t *testing.T) {
 	}
 	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeResourceExhausted {
 		t.Fatalf("expected resource exhausted status, got %#v", frame)
+	}
+}
+
+func TestResponseStreamLimitBoundaries(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxStreamMessages = 2
+	options.MaxStreamBodySize = 3
+	options.StreamIdleTimeout = 0
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return FromSlice([]byte("a"), []byte("bc")), nil
+	})
+
+	request := NewRpcRequest("example.Greeter", "Download", nil)
+	request.Kind = RpcKindServerStreaming
+	response := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	for _, expected := range [][]byte{[]byte("a"), []byte("bc")} {
+		frame, err := response.Recv()
+		if err != nil {
+			t.Fatalf("read exact-limit response frame: %v", err)
+		}
+		if frame.Kind != RpcStreamFrameKindMessage || !bytes.Equal(frame.Body, expected) {
+			t.Fatalf("expected exact-limit message %q, got %#v", expected, frame)
+		}
+	}
+	frame, err := response.Recv()
+	if err != nil {
+		t.Fatalf("read exact-limit terminal status: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeOK {
+		t.Fatalf("expected ok status at exact limit, got %#v", frame)
+	}
+
+	server = NewServer()
+	options.MaxStreamMessages = 1
+	options.MaxStreamBodySize = 3
+	server.SetOptions(options)
+	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+		return FromSlice([]byte("a"), []byte("bc")), nil
+	})
+	response = server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]())
+	frame, err = response.Recv()
+	if err != nil {
+		t.Fatalf("read first response frame: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindMessage || !bytes.Equal(frame.Body, []byte("a")) {
+		t.Fatalf("expected first message before message limit, got %#v", frame)
+	}
+	frame, err = response.Recv()
+	if err != nil {
+		t.Fatalf("read over-limit terminal status: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeResourceExhausted {
+		t.Fatalf("expected resource exhausted after message limit, got %#v", frame)
+	}
+}
+
+func TestUnaryResponseBodyLimitBoundary(t *testing.T) {
+	response := OKResponse([]byte("ok"))
+
+	if err := validateResponse(response, len(response.Body)); err != nil {
+		t.Fatalf("exact response body limit should pass: %v", err)
+	}
+	var frameTooLarge *FrameTooLargeError
+	if err := validateResponse(response, len(response.Body)-1); !errors.As(err, &frameTooLarge) {
+		t.Fatalf("expected frame-too-large error over response body limit, got %T %v", err, err)
 	}
 }
 

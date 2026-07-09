@@ -2,6 +2,8 @@
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
 pub mod error;
+#[cfg(any(feature = "quinn", feature = "webtransport"))]
+pub(crate) mod framed;
 pub mod framing;
 pub mod response;
 pub mod status;

@@ -188,8 +188,61 @@ async fn go_client_talks_to_rust_server_over_quic() -> TestResult {
     rust_server.shutdown().await
 }
 
+#[tokio::test]
+#[ignore = "scheduled/manual cross-runtime lifecycle stress"]
+async fn cross_runtime_lifecycle_stress() -> TestResult {
+    let Some(go_binary) = go_binary() else {
+        return Ok(());
+    };
+    let iterations = lifecycle_iterations()?;
+
+    let go_cert_path = temp_cert_path("go-lifecycle-server");
+    let go_server = spawn_go_server(&go_binary, &go_cert_path)?;
+    for iteration in 0..iterations {
+        let (endpoint, connection, client) = connect_rust_client(go_server.addr, &go_cert_path)
+            .await
+            .map_err(|error| {
+                format!(
+                    "rust client lifecycle iteration {} connect: {error}",
+                    iteration + 1
+                )
+            })?;
+        if let Err(error) = stress_rust_client_lifecycle(&client).await {
+            return Err(format!(
+                "rust client lifecycle iteration {} failed: {error}",
+                iteration + 1
+            )
+            .into());
+        }
+        connection.close(0_u32.into(), b"lifecycle iteration complete");
+        endpoint.wait_idle().await;
+    }
+    drop(go_server);
+    let _ = std::fs::remove_file(&go_cert_path);
+
+    let rust_cert_path = temp_cert_path("rust-lifecycle-server");
+    let rust_server = spawn_rust_server(&rust_cert_path)?;
+    let addr = rust_server.addr;
+    let result = run_go_lifecycle_client(go_binary, addr, rust_cert_path.clone(), iterations).await;
+    let shutdown = rust_server.shutdown().await;
+    let _ = std::fs::remove_file(rust_cert_path);
+    result?;
+    shutdown
+}
+
 fn go_binary() -> Option<PathBuf> {
     std::env::var_os("TREVRPC_XRUNTIME_GO").map(PathBuf::from)
+}
+
+fn lifecycle_iterations() -> TestResult<usize> {
+    let value =
+        std::env::var("TREVRPC_XRUNTIME_LIFECYCLE_ITERATIONS").unwrap_or_else(|_| "25".to_owned());
+    let iterations = value.parse::<usize>()?;
+    if iterations == 0 {
+        return Err("TREVRPC_XRUNTIME_LIFECYCLE_ITERATIONS must be positive".into());
+    }
+
+    Ok(iterations)
 }
 
 fn temp_cert_path(name: &str) -> PathBuf {
@@ -392,6 +445,94 @@ async fn exercise_rust_client(
     }
     replies.close_send()?;
     assert!(replies.recv().await?.is_none());
+    Ok(())
+}
+
+async fn stress_rust_client_lifecycle(
+    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+) -> TestResult {
+    let response = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "lifecycle-unary".to_owned(),
+            },
+            call_options(),
+        )
+        .await?;
+    assert_eq!(response.message, "hello, lifecycle-unary");
+
+    let mut replies = client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "lifecycle-server-stream".to_owned(),
+            },
+            call_options(),
+        )
+        .await?;
+    let reply = replies
+        .next()
+        .await
+        .expect("server stream should yield first response")?;
+    assert_eq!(reply.message, "hello, lifecycle-server-stream");
+    drop(replies);
+
+    let mut greetings = client.lots_of_greetings(call_options()).await?;
+    greetings
+        .send(greeter::HelloRequest {
+            name: "cancelled-client-stream".to_owned(),
+        })
+        .await?;
+    drop(greetings);
+
+    let mut replies = client.bidi_hello(call_options()).await?;
+    replies
+        .send(greeter::HelloRequest {
+            name: "cancelled-bidi".to_owned(),
+        })
+        .await?;
+    let reply = replies
+        .recv()
+        .await?
+        .expect("bidi stream should yield first response");
+    assert_eq!(reply.message, "echo, cancelled-bidi");
+    drop(replies);
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    Ok(())
+}
+
+async fn run_go_lifecycle_client(
+    go_binary: PathBuf,
+    addr: SocketAddr,
+    cert_path: PathBuf,
+    iterations: usize,
+) -> TestResult {
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(go_binary)
+            .arg("-mode")
+            .arg("lifecycle-client")
+            .arg("-addr")
+            .arg(addr.to_string())
+            .arg("-cert")
+            .arg(cert_path)
+            .arg("-token")
+            .arg(AUTH_TOKEN)
+            .arg("-iterations")
+            .arg(iterations.to_string())
+            .output()
+    })
+    .await??;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Go lifecycle client failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
     Ok(())
 }
 

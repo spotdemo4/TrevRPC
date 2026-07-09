@@ -137,6 +137,8 @@
 
         # nix run [#...]
         apps = pkgs.mkApps {
+          browser-webtransport-soak = "nix develop -c bash -c 'npm --prefix trevrpc-js ci && npm --prefix trevrpc-js run test:browser:soak'";
+          cross-runtime-lifecycle-stress = "nix develop -c bash -c 'mkdir -p target && go build -C trevrpc-go -o ../target/trevrpc-xruntime-go ./cmd/trevrpc-xruntime-go && TREVRPC_XRUNTIME_GO=$PWD/target/trevrpc-xruntime-go cargo test --manifest-path trevrpc-rust/Cargo.toml --test cross_runtime -- --ignored cross_runtime_lifecycle_stress --nocapture'";
           dev = "cargo run --manifest-path trevrpc-rust/Cargo.toml";
           test = "nix flake check";
         };
@@ -484,6 +486,7 @@
             self.packages.${system}.trevrpc-js.overrideAttrs {
               dontBuild = true;
               PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+              TREVRPC_BROWSER = "chromium";
               TREVRPC_BROWSER_GO_SERVER = "${browserGoServer}/bin/greeter_server";
               TREVRPC_BROWSER_LIFECYCLE_GO_SERVER = "${browserLifecycleGoServer}/bin/trevrpc-browser-lifecycle-go";
               TREVRPC_BROWSER_LIFECYCLE_RUST_SERVER = "${browserLifecycleRustServer}/bin/trevrpc-browser-lifecycle-rust";

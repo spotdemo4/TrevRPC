@@ -721,6 +721,75 @@ cleanup:
     return result;
 }
 
+static int test_generated_native_unary_stack_and_heap_protobuf_buffers(void) {
+    int result = 1;
+    trevrpc_server* server = NULL;
+    trevrpc_client* client = NULL;
+    Hello__V1__HelloReply* stack_response = NULL;
+    Hello__V1__HelloReply* heap_response = NULL;
+    serve_args args = {0};
+    pthread_t thread = {0};
+    bool thread_started = false;
+    trevrpc_server_config server_config = trevrpc_default_server_config();
+    server_config.host = "127.0.0.1";
+    server_config.port = 0;
+    server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
+    server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
+    server_config.max_idle_timeout_ms = 1000;
+    server_config.peer_bidi_stream_count = 8;
+    trevrpc_config client_config = {
+        .skip_certificate_validation = 1,
+    };
+    Hello__V1__HelloRequest stack_request = HELLO__V1__HELLO_REQUEST__INIT;
+    Hello__V1__HelloRequest heap_request = HELLO__V1__HELLO_REQUEST__INIT;
+    char heap_name[700];
+
+    memset(heap_name, 'h', sizeof(heap_name) - 1);
+    heap_name[sizeof(heap_name) - 1] = '\0';
+    stack_request.name = "stack-buffer";
+    heap_request.name = heap_name;
+
+    CHECK_GOTO(trevrpc_server_listen(&server_config, &server) == 0);
+    CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
+    args.server = server;
+    CHECK_GOTO(pthread_create(&thread, NULL, serve_thread, &args) == 0);
+    thread_started = true;
+
+    uint16_t port = 0;
+    CHECK_GOTO(trevrpc_server_port(server, &port) == 0);
+    CHECK_GOTO(trevrpc_client_connect("127.0.0.1", port, &client_config, &client) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(client, &stack_request, &stack_response) == 0);
+    CHECK_GOTO(stack_response != NULL && stack_response->message != NULL);
+    CHECK_GOTO(strcmp(stack_response->message, stack_request.name) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(client, &heap_request, &heap_response) == 0);
+    CHECK_GOTO(heap_response != NULL && heap_response->message != NULL);
+    CHECK_GOTO(strcmp(heap_response->message, heap_request.name) == 0);
+
+    trevrpc_client_close(client);
+    client = NULL;
+    trevrpc_server_shutdown(server);
+    CHECK_GOTO(pthread_join(thread, NULL) == 0);
+    thread_started = false;
+    CHECK_GOTO(args.result == 0);
+
+    result = 0;
+
+cleanup:
+    if (stack_response != NULL) {
+        hello__v1__hello_reply__free_unpacked(stack_response, NULL);
+    }
+    if (heap_response != NULL) {
+        hello__v1__hello_reply__free_unpacked(heap_response, NULL);
+    }
+    trevrpc_client_close(client);
+    if (thread_started) {
+        trevrpc_server_shutdown(server);
+        (void)pthread_join(thread, NULL);
+    }
+    trevrpc_server_close(server);
+    return result;
+}
+
 static int test_generated_native_helper_pending_send_resource_exhausted(void) {
     int result = 1;
     trevrpc_server* server = NULL;
@@ -838,6 +907,9 @@ int main(void) {
         goto cleanup;
     }
     if (test_shared_listener_native_and_webtransport_unary() != 0) {
+        goto cleanup;
+    }
+    if (test_generated_native_unary_stack_and_heap_protobuf_buffers() != 0) {
         goto cleanup;
     }
     if (test_generated_native_helper_pending_send_resource_exhausted() != 0) {

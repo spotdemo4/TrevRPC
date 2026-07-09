@@ -749,6 +749,75 @@ cleanup:
     return result;
 }
 
+static int test_request_stream_message_limit_boundary(void) {
+    int result = 1;
+    uint8_t* first_frame = NULL;
+    uint8_t* second_frame = NULL;
+    size_t first_frame_len = 0;
+    size_t second_frame_len = 0;
+    trevrpc_msquic_stream raw_stream = {0};
+    bool stream_initialized = false;
+    const uint8_t body[] = {1};
+    trevrpc_stream_frame* frame = NULL;
+
+    CHECK_GOTO(trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+                   TREVRPC_STATUS_OK,
+                   NULL,
+                   0,
+                   body,
+                   sizeof(body),
+                   NULL,
+                   4096,
+                   &first_frame,
+                   &first_frame_len) == 0);
+    CHECK_GOTO(trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+                   TREVRPC_STATUS_OK,
+                   NULL,
+                   0,
+                   body,
+                   sizeof(body),
+                   NULL,
+                   4096,
+                   &second_frame,
+                   &second_frame_len) == 0);
+    CHECK_GOTO(init_raw_stream(&raw_stream, first_frame, first_frame_len) == 0);
+    stream_initialized = true;
+    CHECK_GOTO(append_recv_bytes(&raw_stream, second_frame, second_frame_len) == 0);
+
+    trevrpc_stream stream = {
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = &raw_stream,
+        .max_frame_size = 4096,
+        .max_stream_messages = 1,
+        .max_stream_body_size = -1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+
+    CHECK_GOTO(trevrpc_stream_recv(&stream, &frame) == 0);
+    CHECK_GOTO(frame != NULL);
+    CHECK_GOTO(frame->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
+    CHECK_GOTO(stream.request_message_count == 1);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_OK);
+    trevrpc_stream_frame_free(frame);
+    frame = NULL;
+
+    CHECK_GOTO(trevrpc_stream_recv(&stream, &frame) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
+    CHECK_GOTO(frame == NULL);
+    CHECK_GOTO(stream.request_message_count == 1);
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+
+    result = 0;
+
+cleanup:
+    trevrpc_stream_frame_free(frame);
+    if (stream_initialized) {
+        reset_raw_stream(&raw_stream);
+    }
+    free(first_frame);
+    free(second_frame);
+    return result;
+}
+
 static int test_response_stream_message_limit(void) {
     int result = 1;
     trevrpc_stream stream = {
@@ -794,6 +863,75 @@ cleanup:
     return result;
 }
 
+static int test_request_stream_body_size_limit_boundary(void) {
+    int result = 1;
+    uint8_t* first_frame = NULL;
+    uint8_t* second_frame = NULL;
+    size_t first_frame_len = 0;
+    size_t second_frame_len = 0;
+    trevrpc_msquic_stream raw_stream = {0};
+    bool stream_initialized = false;
+    const uint8_t body[] = {1};
+    trevrpc_stream_frame* frame = NULL;
+
+    CHECK_GOTO(trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+                   TREVRPC_STATUS_OK,
+                   NULL,
+                   0,
+                   body,
+                   sizeof(body),
+                   NULL,
+                   4096,
+                   &first_frame,
+                   &first_frame_len) == 0);
+    CHECK_GOTO(trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+                   TREVRPC_STATUS_OK,
+                   NULL,
+                   0,
+                   body,
+                   sizeof(body),
+                   NULL,
+                   4096,
+                   &second_frame,
+                   &second_frame_len) == 0);
+    CHECK_GOTO(init_raw_stream(&raw_stream, first_frame, first_frame_len) == 0);
+    stream_initialized = true;
+    CHECK_GOTO(append_recv_bytes(&raw_stream, second_frame, second_frame_len) == 0);
+
+    trevrpc_stream stream = {
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = &raw_stream,
+        .max_frame_size = 4096,
+        .max_stream_messages = -1,
+        .max_stream_body_size = 1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+
+    CHECK_GOTO(trevrpc_stream_recv(&stream, &frame) == 0);
+    CHECK_GOTO(frame != NULL);
+    CHECK_GOTO(frame->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
+    CHECK_GOTO(stream.request_body_size == sizeof(body));
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_OK);
+    trevrpc_stream_frame_free(frame);
+    frame = NULL;
+
+    CHECK_GOTO(trevrpc_stream_recv(&stream, &frame) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
+    CHECK_GOTO(frame == NULL);
+    CHECK_GOTO(stream.request_body_size == 2 * sizeof(body));
+    CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+
+    result = 0;
+
+cleanup:
+    trevrpc_stream_frame_free(frame);
+    if (stream_initialized) {
+        reset_raw_stream(&raw_stream);
+    }
+    free(first_frame);
+    free(second_frame);
+    return result;
+}
+
 static int test_response_stream_body_size_limit(void) {
     int result = 1;
     trevrpc_stream stream = {
@@ -813,6 +951,57 @@ static int test_response_stream_body_size_limit(void) {
     result = 0;
 
 cleanup:
+    return result;
+}
+
+static int test_response_stream_limit_boundaries(void) {
+    int result = 1;
+    trevrpc_msquic_stream raw_stream = {0};
+    bool stream_initialized = false;
+    const uint8_t body[] = {1};
+
+    CHECK_GOTO(init_empty_raw_stream(&raw_stream) == 0);
+    stream_initialized = true;
+
+    trevrpc_stream message_limited = {
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = &raw_stream,
+        .max_frame_size = 4096,
+        .max_stream_messages = 1,
+        .max_stream_body_size = -1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    CHECK_GOTO(trevrpc_stream_send_message(&message_limited, body, sizeof(body)) == TREV_MSQUIC_ERR_CLOSED);
+    CHECK_GOTO(message_limited.response_message_count == 1);
+    CHECK_GOTO(message_limited.response_body_size == sizeof(body));
+    CHECK_GOTO(message_limited.failure_status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(trevrpc_stream_send_message(&message_limited, body, sizeof(body)) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
+    CHECK_GOTO(message_limited.response_message_count == 1);
+    CHECK_GOTO(message_limited.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+
+    trevrpc_stream body_limited = {
+        .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
+        .msquic_stream = &raw_stream,
+        .max_frame_size = 4096,
+        .max_stream_messages = -1,
+        .max_stream_body_size = 1,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+    CHECK_GOTO(trevrpc_stream_send_message(&body_limited, body, sizeof(body)) == TREV_MSQUIC_ERR_CLOSED);
+    CHECK_GOTO(body_limited.response_message_count == 1);
+    CHECK_GOTO(body_limited.response_body_size == sizeof(body));
+    CHECK_GOTO(body_limited.failure_status == TREVRPC_STATUS_OK);
+    CHECK_GOTO(trevrpc_stream_send_message(&body_limited, body, sizeof(body)) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
+    CHECK_GOTO(body_limited.response_message_count == 2);
+    CHECK_GOTO(body_limited.response_body_size == 2 * sizeof(body));
+    CHECK_GOTO(body_limited.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+
+    result = 0;
+
+cleanup:
+    if (stream_initialized) {
+        reset_raw_stream(&raw_stream);
+    }
     return result;
 }
 
@@ -2231,13 +2420,22 @@ int main(void) {
     if (test_request_stream_message_limit() != 0) {
         return 1;
     }
+    if (test_request_stream_message_limit_boundary() != 0) {
+        return 1;
+    }
     if (test_response_stream_message_limit() != 0) {
         return 1;
     }
     if (test_request_stream_body_size_limit() != 0) {
         return 1;
     }
+    if (test_request_stream_body_size_limit_boundary() != 0) {
+        return 1;
+    }
     if (test_response_stream_body_size_limit() != 0) {
+        return 1;
+    }
+    if (test_response_stream_limit_boundaries() != 0) {
         return 1;
     }
     if (test_response_stream_empty_message_batch_is_noop() != 0) {

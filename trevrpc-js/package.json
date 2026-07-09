@@ -40,6 +40,7 @@
     "lint": "oxlint --deny-warnings",
     "test": "node --test test/*.test.js",
     "test:browser": "node --test test/browser/*.test.js",
+    "test:browser:soak": "env TREVRPC_BROWSER_SOAK=1 node --test test/browser/*.test.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

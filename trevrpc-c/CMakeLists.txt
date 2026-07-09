@@ -365,11 +365,12 @@ if(TREVRPC_BUILD_TESTS)
 
         add_executable(trevrpc_msquic_transport_test tests/msquic_transport_test.c)
         add_dependencies(trevrpc_msquic_transport_test trevrpc_msquic_test_certificates)
+        target_include_directories(trevrpc_msquic_transport_test PRIVATE src)
         target_compile_definitions(trevrpc_msquic_transport_test PRIVATE
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
-        target_link_libraries(trevrpc_msquic_transport_test PRIVATE trevrpc_msquic trevrpc_webtransport)
+        target_link_libraries(trevrpc_msquic_transport_test PRIVATE trevrpc)
         trevrpc_c_warnings(trevrpc_msquic_transport_test)
         trevrpc_c_sanitizers(trevrpc_msquic_transport_test)
 

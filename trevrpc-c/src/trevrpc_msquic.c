@@ -20,6 +20,9 @@
 #define TREV_MSQUIC_NANOS_PER_SEC 1000000000ull
 #define TREV_MSQUIC_SEND_POOL_LIMIT 64
 #define TREV_MSQUIC_SEND_POOL_MAX_CAPACITY 65536
+#define TREV_MSQUIC_SEND_MAX_BUFFERS 4
+#define TREV_MSQUIC_TREVRPC_ALPN "trevrpc/1"
+#define TREV_MSQUIC_DEFAULT_MAX_FRAME_SIZE (4u * 1024u * 1024u)
 
 typedef struct trevrpc_msquic_send trevrpc_msquic_send;
 typedef struct trevrpc_msquic_frame trevrpc_msquic_frame;
@@ -93,6 +96,7 @@ struct trevrpc_msquic_conn {
     HQUIC configuration;
     uint8_t negotiated_alpn[UINT8_MAX];
     uint8_t negotiated_alpn_len;
+    size_t max_frame_size;
     size_t max_pending_send_bytes;
     size_t max_pending_send_count;
     bool owns_endpoint;
@@ -113,6 +117,7 @@ struct trevrpc_msquic_listener {
     HQUIC registration;
     HQUIC configuration;
     HQUIC listener;
+    size_t max_frame_size;
     size_t max_pending_send_bytes;
     size_t max_pending_send_count;
     bool api_ref_acquired;
@@ -127,7 +132,8 @@ struct trevrpc_msquic_listener {
 
 struct trevrpc_msquic_send {
     trevrpc_msquic_send* next;
-    QUIC_BUFFER buffer;
+    QUIC_BUFFER buffers[TREV_MSQUIC_SEND_MAX_BUFFERS];
+    uint32_t buffer_count;
     size_t capacity;
     size_t pending_len;
     bool poolable;
@@ -194,6 +200,20 @@ static size_t trevrpc_msquic_effective_max_pending_send_bytes(size_t configured)
 
 static size_t trevrpc_msquic_effective_max_pending_send_count(size_t configured) {
     return configured == 0 ? TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT : configured;
+}
+
+static size_t trevrpc_msquic_effective_max_frame_size(size_t configured) {
+    return configured == 0 ? TREV_MSQUIC_DEFAULT_MAX_FRAME_SIZE : configured;
+}
+
+static bool trevrpc_msquic_alpn_equals(const uint8_t* alpn, size_t alpn_len, const char* expected) {
+    size_t expected_len = strlen(expected);
+    return alpn_len == expected_len && memcmp(alpn, expected, expected_len) == 0;
+}
+
+static bool trevrpc_msquic_conn_uses_native_frames(const trevrpc_msquic_conn* conn) {
+    return conn != NULL &&
+           trevrpc_msquic_alpn_equals(conn->negotiated_alpn, conn->negotiated_alpn_len, TREV_MSQUIC_TREVRPC_ALPN);
 }
 
 static HQUIC trevrpc_msquic_stream_close_handle_if_ready_locked(trevrpc_msquic_stream* stream) {
@@ -320,7 +340,7 @@ static void trevrpc_msquic_conn_shutdown_complete(trevrpc_msquic_conn* conn, HQU
 }
 
 static trevrpc_msquic_stream* trevrpc_msquic_stream_alloc(
-    HQUIC handle, size_t max_pending_send_bytes, size_t max_pending_send_count) {
+    HQUIC handle, size_t max_pending_send_bytes, size_t max_pending_send_count, size_t initial_frame_max_len) {
     trevrpc_msquic_stream* stream = calloc(1, sizeof(*stream));
     if (stream == NULL) {
         return NULL;
@@ -334,6 +354,10 @@ static trevrpc_msquic_stream* trevrpc_msquic_stream_alloc(
     stream->handle = handle;
     stream->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(max_pending_send_bytes);
     stream->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(max_pending_send_count);
+    if (initial_frame_max_len > 0) {
+        stream->recv_mode = TREV_MSQUIC_RECV_FRAMES;
+        stream->frame_max_len = initial_frame_max_len;
+    }
     pthread_mutex_init(&stream->mutex, NULL);
     pthread_cond_init(&stream->cond, NULL);
     return stream;
@@ -351,6 +375,7 @@ static trevrpc_msquic_conn* trevrpc_msquic_conn_alloc(HQUIC handle) {
     conn->api_ref_acquired = true;
 
     conn->handle = handle;
+    conn->max_frame_size = TREV_MSQUIC_DEFAULT_MAX_FRAME_SIZE;
     conn->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(0);
     conn->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(0);
     pthread_mutex_init(&conn->mutex, NULL);
@@ -409,6 +434,7 @@ static trevrpc_msquic_send* trevrpc_msquic_send_alloc(size_t len, bool poolable)
         return NULL;
     }
     send->next = NULL;
+    send->buffer_count = 0;
     send->capacity = len;
     send->pending_len = 0;
     send->poolable = poolable;
@@ -431,6 +457,7 @@ static trevrpc_msquic_send* trevrpc_msquic_send_acquire(trevrpc_msquic_stream* s
             pthread_mutex_unlock(&stream->mutex);
             send->next = NULL;
             send->poolable = true;
+            send->buffer_count = 0;
             send->pending_len = 0;
             send->pending_accounted = false;
             return send;
@@ -475,6 +502,7 @@ static HQUIC trevrpc_msquic_stream_pending_send_complete_locked(
 }
 
 static void trevrpc_msquic_send_release(trevrpc_msquic_stream* stream, trevrpc_msquic_send* send) {
+    send->buffer_count = 0;
     send->pending_len = 0;
     send->pending_accounted = false;
     if (!send->poolable) {
@@ -763,8 +791,11 @@ static trevrpc_msquic_frame* trevrpc_msquic_stream_pop_frame_locked(trevrpc_msqu
     return frame;
 }
 
-static intptr_t trevrpc_msquic_stream_send_buffer_with_flags(
-    trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len, QUIC_SEND_FLAGS flags) {
+static intptr_t trevrpc_msquic_stream_send_buffers_with_flags(trevrpc_msquic_stream* stream,
+    trevrpc_msquic_send* send,
+    uint32_t buffer_count,
+    size_t len,
+    QUIC_SEND_FLAGS flags) {
     bool finish_send = (flags & QUIC_SEND_FLAG_FIN) != 0;
     int reserve_err = 0;
     pthread_mutex_lock(&stream->mutex);
@@ -789,9 +820,8 @@ static intptr_t trevrpc_msquic_stream_send_buffer_with_flags(
         return reserve_err != 0 ? reserve_err : TREV_MSQUIC_ERR_CLOSED;
     }
 
-    send->buffer.Buffer = send->data;
-    send->buffer.Length = (uint32_t)len;
-    QUIC_STATUS status = TrevMsQuic->StreamSend(handle, &send->buffer, 1, flags, send);
+    send->buffer_count = buffer_count;
+    QUIC_STATUS status = TrevMsQuic->StreamSend(handle, send->buffers, buffer_count, flags, send);
     trevrpc_msquic_stream_handle_release(stream);
     if (QUIC_FAILED(status)) {
         HQUIC close_handle = NULL;
@@ -810,6 +840,13 @@ static intptr_t trevrpc_msquic_stream_send_buffer_with_flags(
     }
 
     return (intptr_t)len;
+}
+
+static intptr_t trevrpc_msquic_stream_send_buffer_with_flags(
+    trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, size_t len, QUIC_SEND_FLAGS flags) {
+    send->buffers[0].Buffer = send->data;
+    send->buffers[0].Length = (uint32_t)len;
+    return trevrpc_msquic_stream_send_buffers_with_flags(stream, send, 1, len, flags);
 }
 
 static intptr_t trevrpc_msquic_stream_send_buffer(
@@ -1029,6 +1066,7 @@ int trevrpc_msquic_listen_alpns(const char* host,
 
     pthread_mutex_init(&listener->mutex, NULL);
     pthread_cond_init(&listener->cond, NULL);
+    listener->max_frame_size = trevrpc_msquic_effective_max_frame_size(config->max_frame_size);
     listener->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(config->max_pending_send_bytes);
     listener->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(config->max_pending_send_count);
 
@@ -1207,8 +1245,13 @@ int trevrpc_msquic_dial(
     conn->registration = registration;
     conn->configuration = configuration;
     conn->owns_endpoint = true;
+    conn->max_frame_size = trevrpc_msquic_effective_max_frame_size(config->max_frame_size);
     conn->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(config->max_pending_send_bytes);
     conn->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(config->max_pending_send_count);
+    if (config->alpn != NULL && config->alpn_len > 0 && config->alpn_len <= sizeof(conn->negotiated_alpn)) {
+        conn->negotiated_alpn_len = (uint8_t)config->alpn_len;
+        memcpy(conn->negotiated_alpn, config->alpn, conn->negotiated_alpn_len);
+    }
 
     QUIC_STATUS status = TrevMsQuic->ConnectionOpen(registration, trevrpc_msquic_conn_callback, conn, &conn->handle);
     if (QUIC_FAILED(status)) {
@@ -1286,7 +1329,7 @@ static int trevrpc_msquic_conn_open_stream_with_flags(
     trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream, QUIC_STREAM_OPEN_FLAGS flags) {
     *out_stream = NULL;
     trevrpc_msquic_stream* stream =
-        trevrpc_msquic_stream_alloc(NULL, conn->max_pending_send_bytes, conn->max_pending_send_count);
+        trevrpc_msquic_stream_alloc(NULL, conn->max_pending_send_bytes, conn->max_pending_send_count, 0);
     if (stream == NULL) {
         return ENOMEM;
     }
@@ -1575,6 +1618,76 @@ intptr_t trevrpc_msquic_stream_write_fin(trevrpc_msquic_stream* stream, const ui
     return trevrpc_msquic_stream_send_buffer_with_flags(stream, send, len, QUIC_SEND_FLAG_FIN);
 }
 
+static intptr_t trevrpc_msquic_stream_write_frame_parts_with_flags(trevrpc_msquic_stream* stream,
+    const trevrpc_msquic_frame_part* parts,
+    size_t parts_len,
+    size_t max_len,
+    QUIC_SEND_FLAGS flags) {
+    if (parts == NULL && parts_len > 0) {
+        return -EINVAL;
+    }
+    if (parts_len > TREV_MSQUIC_SEND_MAX_BUFFERS - 1) {
+        return -EINVAL;
+    }
+
+    size_t frame_body_len = 0;
+    uint32_t buffer_count = 1;
+    for (size_t i = 0; i < parts_len; i++) {
+        if (parts[i].data == NULL && parts[i].len > 0) {
+            return -EINVAL;
+        }
+        if (parts[i].len > UINT32_MAX) {
+            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+        }
+        if (frame_body_len > SIZE_MAX - parts[i].len) {
+            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+        }
+        frame_body_len += parts[i].len;
+        if (parts[i].len > 0) {
+            buffer_count++;
+        }
+    }
+    if (frame_body_len > max_len || frame_body_len > UINT32_MAX) {
+        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+    }
+    if (frame_body_len > SIZE_MAX - 4) {
+        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+    }
+
+    trevrpc_msquic_send* send = trevrpc_msquic_send_alloc(4, false);
+    if (send == NULL) {
+        return -ENOMEM;
+    }
+
+    send->data[0] = (uint8_t)(frame_body_len >> 24);
+    send->data[1] = (uint8_t)(frame_body_len >> 16);
+    send->data[2] = (uint8_t)(frame_body_len >> 8);
+    send->data[3] = (uint8_t)frame_body_len;
+    send->buffers[0].Buffer = send->data;
+    send->buffers[0].Length = 4;
+    uint32_t out = 1;
+    for (size_t i = 0; i < parts_len; i++) {
+        if (parts[i].len == 0) {
+            continue;
+        }
+        send->buffers[out].Buffer = (uint8_t*)parts[i].data;
+        send->buffers[out].Length = (uint32_t)parts[i].len;
+        out++;
+    }
+
+    return trevrpc_msquic_stream_send_buffers_with_flags(stream, send, buffer_count, 4 + frame_body_len, flags);
+}
+
+intptr_t trevrpc_msquic_stream_write_frame_parts(
+    trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len) {
+    return trevrpc_msquic_stream_write_frame_parts_with_flags(stream, parts, parts_len, max_len, QUIC_SEND_FLAG_NONE);
+}
+
+intptr_t trevrpc_msquic_stream_write_frame_parts_fin(
+    trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len) {
+    return trevrpc_msquic_stream_write_frame_parts_with_flags(stream, parts, parts_len, max_len, QUIC_SEND_FLAG_FIN);
+}
+
 intptr_t trevrpc_msquic_stream_write_message_frame(
     trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len) {
     size_t frame_body_len = 0;
@@ -1661,6 +1774,19 @@ intptr_t trevrpc_msquic_stream_write_message_frames(
     }
 
     return trevrpc_msquic_stream_send_buffer(stream, send, frame_len);
+}
+
+int trevrpc_msquic_stream_wait_pending_sends(trevrpc_msquic_stream* stream) {
+    if (stream == NULL) {
+        return EINVAL;
+    }
+
+    pthread_mutex_lock(&stream->mutex);
+    while (stream->pending_send_count > 0 || stream->active_send_completions > 0) {
+        pthread_cond_wait(&stream->cond, &stream->mutex);
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    return 0;
 }
 
 int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream) {
@@ -1785,6 +1911,7 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     listener->active_callbacks++;
     HQUIC configuration = listener->configuration;
     HQUIC registration = listener->registration;
+    size_t max_frame_size = listener->max_frame_size;
     size_t max_pending_send_bytes = listener->max_pending_send_bytes;
     size_t max_pending_send_count = listener->max_pending_send_count;
     pthread_mutex_unlock(&listener->mutex);
@@ -1800,6 +1927,7 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     }
     conn->configuration = configuration;
     conn->registration = registration;
+    conn->max_frame_size = max_frame_size;
     conn->max_pending_send_bytes = max_pending_send_bytes;
     conn->max_pending_send_count = max_pending_send_count;
     HQUIC connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
@@ -1859,8 +1987,11 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(
         pthread_mutex_unlock(&conn->mutex);
         return QUIC_STATUS_SUCCESS;
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
-        trevrpc_msquic_stream* stream = trevrpc_msquic_stream_alloc(
-            event->PEER_STREAM_STARTED.Stream, conn->max_pending_send_bytes, conn->max_pending_send_count);
+        size_t initial_frame_max_len = trevrpc_msquic_conn_uses_native_frames(conn) ? conn->max_frame_size : 0;
+        trevrpc_msquic_stream* stream = trevrpc_msquic_stream_alloc(event->PEER_STREAM_STARTED.Stream,
+            conn->max_pending_send_bytes,
+            conn->max_pending_send_count,
+            initial_frame_max_len);
         if (stream == NULL) {
             return QUIC_STATUS_OUT_OF_MEMORY;
         }
