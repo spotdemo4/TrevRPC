@@ -409,7 +409,6 @@ if(TREVRPC_BUILD_TESTS)
 
         set(trevrpc_buffering_fast_cases
             "safe-default|safe|slow-reader|4|4096|16384|262144|65536|1"
-            "receive-candidate|receive-1m|slow-reader|4|4096|16384|262144|65536|1"
             "throughput-slow-reader|throughput-1m|slow-reader|8|4096|32768|524288|131072|5"
             "throughput-stalled-handler|throughput-1m|stalled-handler|8|32768|4096|524288|0|10"
             "throughput-reset|throughput-1m|reset|8|32768|4096|262144|0|5"

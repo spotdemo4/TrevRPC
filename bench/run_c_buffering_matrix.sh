@@ -46,7 +46,7 @@ final | soak)
     ;;
 esac
 
-PROFILES=(safe receive-1m throughput-1m)
+PROFILES=(safe throughput-1m)
 RAW_DIR=$OUT_DIR/raw
 WARMUP_DIR=$OUT_DIR/warmup
 SAMPLES=$OUT_DIR/samples.csv

@@ -17,6 +17,19 @@ SAMPLES_CSV="$OUT_DIR/rpc-split-samples.csv"
 FAILURES_CSV="$OUT_DIR/rpc-split-failures.csv"
 MARKDOWN="$OUT_DIR/rpc-split.md"
 
+normalize_hook_boolean() {
+    local name=$1
+    local value=$2
+    case "$value" in
+    1 | true | TRUE | yes | on) printf 'enabled' ;;
+    "" | 0 | false | FALSE | no | off) printf 'disabled' ;;
+    *)
+        printf '%s must be one of 1, true, TRUE, yes, on, 0, false, FALSE, no, or off; got %q\n' "$name" "$value" >&2
+        exit 2
+        ;;
+    esac
+}
+
 SPLIT_ITERATIONS=${SPLIT_ITERATIONS:-10000}
 C_ITERATIONS=${C_ITERATIONS:-$SPLIT_ITERATIONS}
 GO_ITERATIONS=${GO_ITERATIONS:-$SPLIT_ITERATIONS}
@@ -48,18 +61,15 @@ RUST_QUINN_KEEP_ALIVE_MS=${TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS:-5000}
 RUST_QUINN_SEND_WINDOW_BYTES=${TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES:-bounded-default}
 RUST_QUINN_ACK_THRESHOLD=${TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD:-library-default}
 RUST_QUINN_ACK_DELAY_MS=${TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS:-library-default}
-C_FRAME_TRACE=${TREVRPC_C_FRAME_TRACE:-0}
-RUST_QUINN_FRAME_TRACE=${TREVRPC_RUST_QUINN_FRAME_TRACE:-0}
-RUST_QUINN_PROTOCOL_TRACE=${TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE:-0}
-C_FRAME_TRACE_STATE=disabled
-RUST_QUINN_FRAME_TRACE_STATE=disabled
+C_FRAME_TRACE=${TREVRPC_C_FRAME_TRACE-}
+RUST_QUINN_FRAME_TRACE=${TREVRPC_RUST_QUINN_FRAME_TRACE-}
+RUST_QUINN_PROTOCOL_TRACE=${TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE-}
+C_FRAME_TRACE_STATE=$(normalize_hook_boolean TREVRPC_C_FRAME_TRACE "$C_FRAME_TRACE")
+RUST_QUINN_FRAME_TRACE_STATE=$(normalize_hook_boolean TREVRPC_RUST_QUINN_FRAME_TRACE "$RUST_QUINN_FRAME_TRACE")
 RUST_QUINN_QLOG_STATE=disabled
-RUST_QUINN_PROTOCOL_TRACE_STATE=disabled
+RUST_QUINN_PROTOCOL_TRACE_STATE=$(normalize_hook_boolean TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE "$RUST_QUINN_PROTOCOL_TRACE")
 RUST_TLS_KEYLOG_STATE=disabled
-if [[ "$C_FRAME_TRACE" == "1" ]]; then C_FRAME_TRACE_STATE=enabled; fi
-if [[ "$RUST_QUINN_FRAME_TRACE" == "1" ]]; then RUST_QUINN_FRAME_TRACE_STATE=enabled; fi
 if [[ -n "${TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG:-}" ]]; then RUST_QUINN_QLOG_STATE=enabled; fi
-if [[ "$RUST_QUINN_PROTOCOL_TRACE" == "1" ]]; then RUST_QUINN_PROTOCOL_TRACE_STATE=enabled; fi
 if [[ -n "${SSLKEYLOGFILE:-}" ]]; then RUST_TLS_KEYLOG_STATE=enabled; fi
 RUST_QUINN_ACK_PROFILE=library-default
 INSTRUMENTATION_PROFILE=untraced
@@ -81,6 +91,9 @@ if [[ "$SPLIT_BATCHING_SETTINGS" != "profile=$BENCHMARK_PROFILE;"* ]]; then
     exit 2
 fi
 C_MSQUIC_PROFILE=${TREVRPC_C_MSQUIC_PROFILE:-safe}
+
+SAMPLES_HEADER='axis,run,client,server,shape,latency_us,throughput_per_s,iterations,elapsed_s,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,c_msquic_profile,c_msquic_profile_kind,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,rust_quinn_send_window_bytes'
+FAILURES_HEADER='axis,run,client,server,source,status,raw_file,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,c_msquic_profile,c_msquic_profile_kind,batching_settings,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,rust_quinn_send_window_bytes,encoded_request_bytes,encoded_response_bytes'
 
 GO_SPLIT_BENCH="$OUT_DIR_ABS/trevrpc-go-rpc-split-bench"
 RUST_SPLIT_BENCH="$ROOT/trevrpc-rust/target/release/examples/rpc_split_bench"
@@ -119,20 +132,26 @@ Environment knobs:
   METADATA_PROFILE        Metadata profile: none or production. Default: none
   BENCHMARK_PROFILE       Base profile label. ACK tuning or instrumentation forces a diagnostic label.
   TREVRPC_C_MSQUIC_PROFILE
-                          C MsQuic profile: safe, receive-1m, or throughput-1m. Default: safe
-  TREVRPC_C_FRAME_TRACE   Set to 1 to emit C wire frame trace lines on stderr.
+                          C MsQuic profile: safe or throughput-1m. Default: safe
+  TREVRPC_C_FRAME_TRACE   Enable with 1, true, TRUE, yes, or on; disable with 0, false, FALSE, no, off, or unset.
   TREVRPC_RUST_QUINN_FRAME_TRACE
-                          Set to 1 to emit Rust Quinn frame/FIN/reset trace lines on stderr.
+                          Uses the same enabled and disabled literals as TREVRPC_C_FRAME_TRACE.
   TREVRPC_RUST_SPLIT_BENCH_SHAPES
                           Comma-separated Rust client and C server-axis shapes for focused diagnostics.
   TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD
                           Diagnostic peer ACK-eliciting threshold or library-default. Default: library-default.
   TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS
                           Diagnostic peer ACK delay in ms or library-default. Default: library-default.
+  TREVRPC_RUST_SPLIT_BENCH_QUINN_MAX_IDLE_TIMEOUT_MS
+                          Rust Quinn idle timeout in ms. Default: 600000.
+  TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS
+                          Rust Quinn keepalive in ms. Default: 5000.
+  TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES
+                          Rust Quinn send window bytes or bounded-default. Default: bounded-default.
   TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG
                           Rust split server qlog output path for packet diagnostics.
   TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE
-                          Set to 1 to emit timestamped Quinn packet/frame protocol traces.
+                          Uses the same enabled and disabled literals as TREVRPC_C_FRAME_TRACE.
   SSLKEYLOGFILE           Rust split bench writes TLS secrets here when set.
 
 Examples:
@@ -221,13 +240,6 @@ safe)
     C_MSQUIC_SEND_BUFFERING=disabled
     C_MSQUIC_EXECUTION_PROFILE=low-latency
     ;;
-receive-1m)
-    C_MSQUIC_PROFILE_KIND=benchmark-only-receive-recipe
-    C_MSQUIC_STREAM_RECV_WINDOW=1048576
-    C_MSQUIC_CONN_FLOW_CONTROL_WINDOW=67108864
-    C_MSQUIC_SEND_BUFFERING=disabled
-    C_MSQUIC_EXECUTION_PROFILE=low-latency
-    ;;
 throughput-1m)
     C_MSQUIC_PROFILE_KIND=public-throughput-1m
     C_MSQUIC_STREAM_RECV_WINDOW=1048576
@@ -285,6 +297,8 @@ if [[ -n "${SSLKEYLOGFILE:-}" ]]; then
 fi
 if [[ "$RUST_QUINN_SEND_WINDOW_BYTES" != "bounded-default" ]]; then
     RUST_BENCH_ENV+=("TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES=$RUST_QUINN_SEND_WINDOW_BYTES")
+else
+    RUST_BENCH_ENV_UNSET+=("-u" "TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES")
 fi
 if [[ "$RUST_QUINN_ACK_THRESHOLD" != "library-default" ]]; then
     RUST_BENCH_ENV+=("TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD=$RUST_QUINN_ACK_THRESHOLD")
@@ -301,8 +315,8 @@ initialize_output() {
     mkdir -p "$RAW_DIR"
     : >"$COMMAND_LOG"
     rm -f "$RAW_DIR"/*.txt
-    printf 'axis,run,client,server,shape,latency_us,throughput_per_s,iterations,elapsed_s,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,c_msquic_profile,c_msquic_profile_kind,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog\n' >"$SAMPLES_CSV"
-    printf 'axis,run,client,server,source,status,raw_file,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,c_msquic_profile,c_msquic_profile_kind,batching_settings,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog\n' >"$FAILURES_CSV"
+    printf '%s\n' "$SAMPLES_HEADER" >"$SAMPLES_CSV"
+    printf '%s\n' "$FAILURES_HEADER" >"$FAILURES_CSV"
 }
 
 SERVER_PIDS=()
@@ -342,9 +356,6 @@ require_boolean RUN_GO_GRPC "$RUN_GO_GRPC"
 require_boolean RUN_JS_NATIVE "$RUN_JS_NATIVE"
 require_boolean RUN_RUST_QUINN "$RUN_RUST_QUINN"
 require_boolean RUN_RUST_GRPC "$RUN_RUST_GRPC"
-require_boolean TREVRPC_C_FRAME_TRACE "$C_FRAME_TRACE"
-require_boolean TREVRPC_RUST_QUINN_FRAME_TRACE "$RUST_QUINN_FRAME_TRACE"
-require_boolean TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE "$RUST_QUINN_PROTOCOL_TRACE"
 
 require_nonnegative_integer_or_library_default() {
     local name=$1
@@ -357,6 +368,21 @@ require_nonnegative_integer_or_library_default() {
 
 require_nonnegative_integer_or_library_default TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD "$RUST_QUINN_ACK_THRESHOLD"
 require_nonnegative_integer_or_library_default TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS "$RUST_QUINN_ACK_DELAY_MS"
+
+require_nonnegative_integer() {
+    local name=$1
+    local value=$2
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s must be a non-negative integer, got %q\n' "$name" "$value" >&2
+        exit 2
+    fi
+}
+
+require_nonnegative_integer TREVRPC_RUST_SPLIT_BENCH_QUINN_MAX_IDLE_TIMEOUT_MS "$RUST_QUINN_MAX_IDLE_TIMEOUT_MS"
+require_nonnegative_integer TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS "$RUST_QUINN_KEEP_ALIVE_MS"
+if [[ "$RUST_QUINN_SEND_WINDOW_BYTES" != "bounded-default" ]]; then
+    require_nonnegative_integer TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES "$RUST_QUINN_SEND_WINDOW_BYTES"
+fi
 
 quote_command() {
     printf '%q ' "$@"
@@ -401,6 +427,9 @@ append_split_csv() {
         -v rust_quinn_qlog="$RUST_QUINN_QLOG_STATE" \
         -v rust_quinn_protocol_trace="$RUST_QUINN_PROTOCOL_TRACE_STATE" \
         -v rust_tls_keylog="$RUST_TLS_KEYLOG_STATE" \
+        -v rust_quinn_max_idle_timeout_ms="$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" \
+        -v rust_quinn_keep_alive_ms="$RUST_QUINN_KEEP_ALIVE_MS" \
+        -v rust_quinn_send_window_bytes="$RUST_QUINN_SEND_WINDOW_BYTES" \
         -v batching_settings="$SPLIT_BATCHING_SETTINGS" -F '' '
         function transport_security_mode() {
             return "encrypted"
@@ -423,11 +452,12 @@ append_split_csv() {
         }
         function emit(shape, latency_us, throughput, iterations, elapsed) {
             serialization = serialization_mode(shape)
-            printf "%s,%s,%s,%s,%s,%.3f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+            printf "%s,%s,%s,%s,%s,%.3f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
                 axis, run, client, server, shape, latency_us, throughput, iterations, elapsed, source, \
                 transport_security_mode(), certificate_verification_mode(), payload_profile, encoded_request_bytes, encoded_response_bytes, \
                 serialization, metadata_profile, handshake_inclusion_mode, batching_settings, labels(shape), rust_quinn_ack_threshold, rust_quinn_ack_delay_ms, c_msquic_profile, c_msquic_profile_kind, \
-                c_frame_trace, rust_quinn_frame_trace, rust_quinn_qlog, rust_quinn_protocol_trace, rust_tls_keylog
+                c_frame_trace, rust_quinn_frame_trace, rust_quinn_qlog, rust_quinn_protocol_trace, rust_tls_keylog, rust_quinn_max_idle_timeout_ms, \
+                rust_quinn_keep_alive_ms, rust_quinn_send_window_bytes
         }
         match($0, /^([^:]+):[[:space:]]+([0-9.]+) us\/op \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
             latency_us = m[2] + 0
@@ -459,7 +489,7 @@ aggregate_samples_csv() {
             return (a[n / 2] + a[n / 2 + 1]) / 2
         }
         BEGIN {
-            print "axis,client,server,shape,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_per_measurement,elapsed_s_total,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,c_msquic_profile,c_msquic_profile_kind,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog"
+            print "axis,client,server,shape,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_per_measurement,elapsed_s_total,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,c_msquic_profile,c_msquic_profile_kind,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,rust_quinn_send_window_bytes"
         }
         NR == 1 {
             next
@@ -493,6 +523,9 @@ aggregate_samples_csv() {
                 rust_quinn_qlog[key] = $27
                 rust_quinn_protocol_trace[key] = $28
                 rust_tls_keylog[key] = $29
+                rust_quinn_max_idle_timeout_ms[key] = $30
+                rust_quinn_keep_alive_ms[key] = $31
+                rust_quinn_send_window_bytes[key] = $32
             }
             measurements[key]++
             latencies[key] = append(latencies[key], $6)
@@ -517,18 +550,57 @@ aggregate_samples_csv() {
                 key = order[i]
                 latency = median(latencies[key])
                 throughput = median(throughputs[key])
-                printf "%s,%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                printf "%s,%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
                     axis[key], client[key], server[key], shape[key], measurements[key], latency, latency_min[key], latency_max[key], throughput, throughput_min[key], throughput_max[key], median(iterations[key]), elapsed_total[key], source[key], \
                     transport_security_mode[key], certificate_verification_mode[key], payload_profile[key], encoded_request_bytes[key], encoded_response_bytes[key], serialization_mode[key], metadata_profile[key], handshake_inclusion_mode[key], batching_settings[key], labels[key], rust_quinn_ack_threshold[key], rust_quinn_ack_delay_ms[key], c_msquic_profile[key], c_msquic_profile_kind[key], \
-                    c_frame_trace[key], rust_quinn_frame_trace[key], rust_quinn_qlog[key], rust_quinn_protocol_trace[key], rust_tls_keylog[key]
+                    c_frame_trace[key], rust_quinn_frame_trace[key], rust_quinn_qlog[key], rust_quinn_protocol_trace[key], rust_tls_keylog[key], rust_quinn_max_idle_timeout_ms[key], \
+                    rust_quinn_keep_alive_ms[key], rust_quinn_send_window_bytes[key]
             }
         }
     ' "$SAMPLES_CSV" >"$CSV"
 }
 
+assert_immutable_csv_schema() {
+    local description=$1
+    local file=$2
+    local expected_header=$3
+    local expected_fields=$4
+    local actual_header
+
+    if [[ ! -f "$file" ]]; then
+        printf '%s CSV is missing at %s; report-only requires immutable recorded state\n' "$description" "$file" >&2
+        return 1
+    fi
+    if ! IFS= read -r actual_header <"$file"; then
+        printf '%s CSV is empty at %s; report-only requires immutable recorded state\n' "$description" "$file" >&2
+        return 1
+    fi
+    if [[ "$actual_header" != "$expected_header" ]]; then
+        printf '%s schema mismatch; legacy or missing transport/instrumentation state is never inferred\n' "$description" >&2
+        printf 'expected: %s\n' "$expected_header" >&2
+        printf 'found:    %s\n' "$actual_header" >&2
+        return 1
+    fi
+    awk -F, -v description="$description" -v expected_fields="$expected_fields" '
+        NR > 1 && NF != expected_fields {
+            printf "%s row %d has %d fields; immutable schema requires %d\n", description, NR, NF, expected_fields > "/dev/stderr"
+            bad = 1
+        }
+        END { exit bad ? 1 : 0 }
+    ' "$file"
+}
+
 assert_sample_profile_metadata() {
-    awk -F, -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" \
+    assert_immutable_csv_schema 'split sample' "$SAMPLES_CSV" "$SAMPLES_HEADER" 32
+    assert_immutable_csv_schema 'split failure' "$FAILURES_CSV" "$FAILURES_HEADER" 22
+
+    awk -F, -v encoded_request_bytes="$ENCODED_REQUEST_BYTES" \
+        -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
+        -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" \
         -v rust_quinn_ack_delay_ms="$RUST_QUINN_ACK_DELAY_MS" \
+        -v rust_quinn_max_idle_timeout_ms="$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" \
+        -v rust_quinn_keep_alive_ms="$RUST_QUINN_KEEP_ALIVE_MS" \
+        -v rust_quinn_send_window_bytes="$RUST_QUINN_SEND_WINDOW_BYTES" \
         -v c_msquic_profile="$C_MSQUIC_PROFILE" \
         -v c_msquic_profile_kind="$C_MSQUIC_PROFILE_KIND" \
         -v c_frame_trace="$C_FRAME_TRACE_STATE" \
@@ -539,7 +611,9 @@ assert_sample_profile_metadata() {
         -v batching_settings="$SPLIT_BATCHING_SETTINGS" '
         NR == 1 {
             transport_schema = $21 == "rust_quinn_ack_threshold" && $22 == "rust_quinn_ack_delay_ms" &&
-                $23 == "c_msquic_profile" && $24 == "c_msquic_profile_kind"
+                $23 == "c_msquic_profile" && $24 == "c_msquic_profile_kind" &&
+                $30 == "rust_quinn_max_idle_timeout_ms" && $31 == "rust_quinn_keep_alive_ms" &&
+                $32 == "rust_quinn_send_window_bytes"
             instrumentation_schema = $25 == "c_frame_trace" && $26 == "rust_quinn_frame_trace" &&
                 $27 == "rust_quinn_qlog" && $28 == "rust_quinn_protocol_trace" && $29 == "rust_tls_keylog"
             if (!transport_schema) {
@@ -552,6 +626,14 @@ assert_sample_profile_metadata() {
             }
             schema_ok = transport_schema && instrumentation_schema
             next
+        }
+        schema_ok && $14 != encoded_request_bytes {
+            printf "sample row %d encoded request bytes %s does not match selected %s\n", NR, $14, encoded_request_bytes > "/dev/stderr"
+            bad = 1
+        }
+        schema_ok && $15 != encoded_response_bytes {
+            printf "sample row %d encoded response bytes %s does not match selected %s\n", NR, $15, encoded_response_bytes > "/dev/stderr"
+            bad = 1
         }
         schema_ok && $21 != rust_quinn_ack_threshold {
             printf "sample row %d recorded Rust Quinn ACK threshold %s does not match selected %s\n", NR, $21, rust_quinn_ack_threshold > "/dev/stderr"
@@ -589,6 +671,18 @@ assert_sample_profile_metadata() {
             printf "sample row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $29, rust_tls_keylog > "/dev/stderr"
             bad = 1
         }
+        schema_ok && $30 != rust_quinn_max_idle_timeout_ms {
+            printf "sample row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $30, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
+            bad = 1
+        }
+        schema_ok && $31 != rust_quinn_keep_alive_ms {
+            printf "sample row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $31, rust_quinn_keep_alive_ms > "/dev/stderr"
+            bad = 1
+        }
+        schema_ok && $32 != rust_quinn_send_window_bytes {
+            printf "sample row %d recorded Rust Quinn send window %s does not match selected %s\n", NR, $32, rust_quinn_send_window_bytes > "/dev/stderr"
+            bad = 1
+        }
         schema_ok && $19 != batching_settings {
             printf "sample row %d batching/profile metadata %s does not match selected %s\n", NR, $19, batching_settings > "/dev/stderr"
             bad = 1
@@ -596,8 +690,13 @@ assert_sample_profile_metadata() {
         END { exit bad ? 1 : 0 }
     ' "$SAMPLES_CSV"
 
-    awk -F, -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" \
+    awk -F, -v encoded_request_bytes="$ENCODED_REQUEST_BYTES" \
+        -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
+        -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" \
         -v rust_quinn_ack_delay_ms="$RUST_QUINN_ACK_DELAY_MS" \
+        -v rust_quinn_max_idle_timeout_ms="$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" \
+        -v rust_quinn_keep_alive_ms="$RUST_QUINN_KEEP_ALIVE_MS" \
+        -v rust_quinn_send_window_bytes="$RUST_QUINN_SEND_WINDOW_BYTES" \
         -v c_msquic_profile="$C_MSQUIC_PROFILE" \
         -v c_msquic_profile_kind="$C_MSQUIC_PROFILE_KIND" \
         -v c_frame_trace="$C_FRAME_TRACE_STATE" \
@@ -608,7 +707,10 @@ assert_sample_profile_metadata() {
         -v batching_settings="$SPLIT_BATCHING_SETTINGS" '
         NR == 1 {
             transport_schema = $8 == "rust_quinn_ack_threshold" && $9 == "rust_quinn_ack_delay_ms" &&
-                $10 == "c_msquic_profile" && $11 == "c_msquic_profile_kind" && $12 == "batching_settings"
+                $10 == "c_msquic_profile" && $11 == "c_msquic_profile_kind" && $12 == "batching_settings" &&
+                $18 == "rust_quinn_max_idle_timeout_ms" && $19 == "rust_quinn_keep_alive_ms" &&
+                $20 == "rust_quinn_send_window_bytes" && $21 == "encoded_request_bytes" &&
+                $22 == "encoded_response_bytes"
             instrumentation_schema = $13 == "c_frame_trace" && $14 == "rust_quinn_frame_trace" &&
                 $15 == "rust_quinn_qlog" && $16 == "rust_quinn_protocol_trace" && $17 == "rust_tls_keylog"
             if (!transport_schema) {
@@ -662,6 +764,26 @@ assert_sample_profile_metadata() {
             printf "failure row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $17, rust_tls_keylog > "/dev/stderr"
             bad = 1
         }
+        schema_ok && $18 != rust_quinn_max_idle_timeout_ms {
+            printf "failure row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $18, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
+            bad = 1
+        }
+        schema_ok && $19 != rust_quinn_keep_alive_ms {
+            printf "failure row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $19, rust_quinn_keep_alive_ms > "/dev/stderr"
+            bad = 1
+        }
+        schema_ok && $20 != rust_quinn_send_window_bytes {
+            printf "failure row %d recorded Rust Quinn send window %s does not match selected %s\n", NR, $20, rust_quinn_send_window_bytes > "/dev/stderr"
+            bad = 1
+        }
+        schema_ok && $21 != encoded_request_bytes {
+            printf "failure row %d encoded request bytes %s does not match selected %s\n", NR, $21, encoded_request_bytes > "/dev/stderr"
+            bad = 1
+        }
+        schema_ok && $22 != encoded_response_bytes {
+            printf "failure row %d encoded response bytes %s does not match selected %s\n", NR, $22, encoded_response_bytes > "/dev/stderr"
+            bad = 1
+        }
         END { exit bad ? 1 : 0 }
     ' "$FAILURES_CSV"
 }
@@ -675,8 +797,11 @@ assert_no_plaintext_rows() {
 
 assert_benchmark_labels() {
     awk -F, -v payload_profile="$PAYLOAD_PROFILE" -v metadata_profile="$METADATA_PROFILE" \
+        -v encoded_request_bytes="$ENCODED_REQUEST_BYTES" -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
         -v serialization_mode="$SERIALIZATION_MODE" -v handshake_mode="$HANDSHAKE_INCLUSION_MODE" \
         -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" -v rust_quinn_ack_delay_ms="$RUST_QUINN_ACK_DELAY_MS" \
+        -v rust_quinn_max_idle_timeout_ms="$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" -v rust_quinn_keep_alive_ms="$RUST_QUINN_KEEP_ALIVE_MS" \
+        -v rust_quinn_send_window_bytes="$RUST_QUINN_SEND_WINDOW_BYTES" \
         -v c_frame_trace="$C_FRAME_TRACE_STATE" -v rust_quinn_frame_trace="$RUST_QUINN_FRAME_TRACE_STATE" \
         -v rust_quinn_qlog="$RUST_QUINN_QLOG_STATE" -v rust_quinn_protocol_trace="$RUST_QUINN_PROTOCOL_TRACE_STATE" \
         -v rust_tls_keylog="$RUST_TLS_KEYLOG_STATE" '
@@ -691,6 +816,14 @@ assert_benchmark_labels() {
         }
         $17 != payload_profile {
             printf "row %d payload profile %q does not match selected %q\n", NR, $17, payload_profile > "/dev/stderr"
+            bad = 1
+        }
+        $18 != encoded_request_bytes {
+            printf "row %d encoded request bytes %s does not match selected %s\n", NR, $18, encoded_request_bytes > "/dev/stderr"
+            bad = 1
+        }
+        $19 != encoded_response_bytes {
+            printf "row %d encoded response bytes %s does not match selected %s\n", NR, $19, encoded_response_bytes > "/dev/stderr"
             bad = 1
         }
         $20 != serialization_mode {
@@ -731,6 +864,18 @@ assert_benchmark_labels() {
         }
         $33 != rust_tls_keylog {
             printf "row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $33, rust_tls_keylog > "/dev/stderr"
+            bad = 1
+        }
+        $34 != rust_quinn_max_idle_timeout_ms {
+            printf "row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $34, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
+            bad = 1
+        }
+        $35 != rust_quinn_keep_alive_ms {
+            printf "row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $35, rust_quinn_keep_alive_ms > "/dev/stderr"
+            bad = 1
+        }
+        $36 != rust_quinn_send_window_bytes {
+            printf "row %d recorded Rust Quinn send window %s does not match selected %s\n", NR, $36, rust_quinn_send_window_bytes > "/dev/stderr"
             bad = 1
         }
         END { exit bad ? 1 : 0 }
@@ -830,7 +975,7 @@ Generated by \`bench/run_rpc_split.sh\`: $generated_at
 
 The sorted tables below are \`$HANDSHAKE_INCLUSION_MODE\` measurements. They exclude client construction, dial/connect, TLS/QUIC handshakes, first-RPC setup, and clean close. Any handshake-inclusive benchmark family must be emitted and published in separate tables.
 
-The \`production-representative\` profile requires structured protobuf messages, per-message serialization/deserialization, encryption, no raw/pre-encoded payload shortcuts, and all diagnostic instrumentation disabled. Throughput-oriented batching is reported in the batching settings; raw, pre-encoded, captured, keylogged, or traced rows must stay out of these tables.
+The \`production-representative\` profile requires structured protobuf messages, per-message serialization/deserialization, encryption, no raw/pre-encoded payload shortcuts, library-default Rust Quinn ACK behavior, and all diagnostic instrumentation disabled. Throughput-oriented batching is reported in the batching settings; raw, pre-encoded, captured, keylogged, or traced rows must stay out of these tables.
 
 ## Environment
 
@@ -1037,7 +1182,7 @@ Rows with framework \`gRPC\` benchmark gRPC clients and servers split into separ
 
 Raw command output is saved under \`$RAW_DIR\`. Per-measurement normalized rows are saved in \`$SAMPLES_CSV\`. The exact commands are saved in \`$COMMAND_LOG\`.
 
-Rust Quinn ACK settings, the C MsQuic profile, and normalized instrumentation states are stored on every success and failure row. \`--report-only\` requires the selected transport, instrumentation, and batching/profile settings to match that immutable row metadata and refuses to relabel mismatched samples. Schemas predating these fields are rejected; regenerate them with their recorded script snapshot or explicitly migrate every row instead of inferring missing state.
+Encoded request/response sizes, Rust Quinn idle timeout, keepalive, send window, ACK settings, the C MsQuic profile, and normalized instrumentation states are stored on every success and failure row and copied into aggregate rows. \`--report-only\` requires the selected transport, instrumentation, and batching/profile settings to match that immutable row metadata and refuses to relabel mismatched samples. Schemas predating these fields are rejected; regenerate them with their recorded script snapshot or explicitly migrate every row instead of inferring missing state.
 EOF
     } >"$MARKDOWN"
 }
@@ -1105,7 +1250,7 @@ run_split_sample() {
     else
         local status=$?
         printf 'sample %s failed with status %d; omitting from aggregate results\n' "$name" "$status" | tee -a "$RAW_DIR/$name.txt" >&2
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$axis" "$run" "$client" "$server" "$source" "$status" "$RAW_DIR/$name.txt" "$RUST_QUINN_ACK_THRESHOLD" "$RUST_QUINN_ACK_DELAY_MS" "$C_MSQUIC_PROFILE" "$C_MSQUIC_PROFILE_KIND" "$SPLIT_BATCHING_SETTINGS" "$C_FRAME_TRACE_STATE" "$RUST_QUINN_FRAME_TRACE_STATE" "$RUST_QUINN_QLOG_STATE" "$RUST_QUINN_PROTOCOL_TRACE_STATE" "$RUST_TLS_KEYLOG_STATE" >>"$FAILURES_CSV"
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$axis" "$run" "$client" "$server" "$source" "$status" "$RAW_DIR/$name.txt" "$RUST_QUINN_ACK_THRESHOLD" "$RUST_QUINN_ACK_DELAY_MS" "$C_MSQUIC_PROFILE" "$C_MSQUIC_PROFILE_KIND" "$SPLIT_BATCHING_SETTINGS" "$C_FRAME_TRACE_STATE" "$RUST_QUINN_FRAME_TRACE_STATE" "$RUST_QUINN_QLOG_STATE" "$RUST_QUINN_PROTOCOL_TRACE_STATE" "$RUST_TLS_KEYLOG_STATE" "$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" "$RUST_QUINN_KEEP_ALIVE_MS" "$RUST_QUINN_SEND_WINDOW_BYTES" "$ENCODED_REQUEST_BYTES" "$ENCODED_RESPONSE_BYTES" >>"$FAILURES_CSV"
     fi
 }
 

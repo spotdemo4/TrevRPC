@@ -54,7 +54,6 @@ typedef struct buffering_profile {
     uint32_t bound_model_conn_flow_control_window;
     trevrpc_msquic_execution_profile execution_profile;
     int send_buffering_enabled;
-    bool receive_only_recipe;
     trevrpc_msquic_tuning_profile public_profile;
 } buffering_profile;
 
@@ -111,18 +110,6 @@ static const buffering_profile Profiles[] = {
         .public_profile = TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT,
     },
     {
-        .name = "receive-1m",
-        .receive_window_basis = "benchmark-explicit-recipe",
-        .configured_stream_recv_window = TREVRPC_THROUGHPUT_1M_STREAM_RECV_WINDOW,
-        .configured_conn_flow_control_window = TREVRPC_THROUGHPUT_1M_CONN_FLOW_CONTROL_WINDOW,
-        .bound_model_stream_recv_window = TREVRPC_THROUGHPUT_1M_STREAM_RECV_WINDOW,
-        .bound_model_conn_flow_control_window = TREVRPC_THROUGHPUT_1M_CONN_FLOW_CONTROL_WINDOW,
-        .execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY,
-        .send_buffering_enabled = 0,
-        .receive_only_recipe = true,
-        .public_profile = TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT,
-    },
-    {
         .name = "throughput-1m",
         .receive_window_basis = "trevrpc-helper-explicit",
         .configured_stream_recv_window = TREVRPC_THROUGHPUT_1M_STREAM_RECV_WINDOW,
@@ -139,7 +126,7 @@ static void usage(const char* program) {
     fprintf(stderr,
         "usage: %s PROFILE SCENARIO CONCURRENCY REQUEST_FRAME RESPONSE_FRAME CUMULATIVE_BODY READER_PROGRESS "
         "HOLD_MS\n"
-        "  PROFILE: safe | receive-1m | throughput-1m\n"
+        "  PROFILE: safe | throughput-1m\n"
         "  SCENARIO: slow-reader | stalled-handler | reset | close | overload | body-limit\n"
         "  REQUEST_FRAME and RESPONSE_FRAME are TrevRPC message body bytes and may differ\n"
         "  READER_PROGRESS: submitted bytes per stream between high-level frame drains; 0 stalls the reader\n",
@@ -378,21 +365,11 @@ static void* serve_main(void* context) {
 }
 
 static int apply_client_profile(trevrpc_config* config, const buffering_profile* profile) {
-    int err = trevrpc_config_apply_msquic_tuning_profile(config, profile->public_profile);
-    if (err == 0 && profile->receive_only_recipe) {
-        config->stream_recv_window = profile->configured_stream_recv_window;
-        config->conn_flow_control_window = profile->configured_conn_flow_control_window;
-    }
-    return err;
+    return trevrpc_config_apply_msquic_tuning_profile(config, profile->public_profile);
 }
 
 static int apply_server_profile(trevrpc_server_config* config, const buffering_profile* profile) {
-    int err = trevrpc_server_config_apply_msquic_tuning_profile(config, profile->public_profile);
-    if (err == 0 && profile->receive_only_recipe) {
-        config->stream_recv_window = profile->configured_stream_recv_window;
-        config->conn_flow_control_window = profile->configured_conn_flow_control_window;
-    }
-    return err;
+    return trevrpc_server_config_apply_msquic_tuning_profile(config, profile->public_profile);
 }
 
 static int fixture_start(rpc_fixture* fixture,

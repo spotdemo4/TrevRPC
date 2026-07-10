@@ -115,22 +115,6 @@ static const benchmark_c_msquic_profile BenchmarkMsQuicProfiles[] = {
         .apply_receive_windows = false,
     },
     {
-        .name = "receive-1m",
-        .receive_window_basis = "benchmark-explicit-recipe",
-        .receive_window_reference_stream = BENCHMARK_CANDIDATE_STREAM_RECV_WINDOW,
-        .receive_window_reference_connection = BENCHMARK_CANDIDATE_CONN_FLOW_CONTROL_WINDOW,
-        .execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY,
-        .send_buffering_enabled = 0,
-        .peer_bidi_stream_count = 128,
-        .max_concurrent_streams_per_connection = 64,
-        .max_frame_size = TREVRPC_DEFAULT_MAX_FRAME_SIZE,
-        .max_stream_body_size = 16 * 1024 * 1024,
-        .max_pending_send_bytes = TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES,
-        .max_pending_send_count = TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT,
-        .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
-        .apply_receive_windows = true,
-    },
-    {
         .name = "throughput-1m",
         .receive_window_basis = "trevrpc-helper-explicit",
         .receive_window_reference_stream = BENCHMARK_CANDIDATE_STREAM_RECV_WINDOW,
@@ -163,11 +147,9 @@ static int init_benchmark_msquic_profile(void) {
     for (size_t i = 0; i < sizeof(BenchmarkMsQuicProfiles) / sizeof(BenchmarkMsQuicProfiles[0]); i++) {
         if (strcmp(name, BenchmarkMsQuicProfiles[i].name) == 0) {
             benchmark_msquic_profile = &BenchmarkMsQuicProfiles[i];
-            const char* profile_kind =
-                strcmp(benchmark_msquic_profile->name, "throughput-1m") == 0
-                    ? "public-throughput-1m"
-                    : (strcmp(benchmark_msquic_profile->name, "receive-1m") == 0 ? "benchmark-only-receive-recipe"
-                                                                                 : "public-default");
+            const char* profile_kind = strcmp(benchmark_msquic_profile->name, "throughput-1m") == 0
+                                           ? "public-throughput-1m"
+                                           : "public-default";
             fprintf(stderr,
                 "trevrpc-c-msquic-profile name=%s kind=%s receive_window_reference_stream=%u "
                 "receive_window_reference_connection=%u receive_window_basis=%s receive_windows_applied=%d "
@@ -209,10 +191,6 @@ static void apply_benchmark_client_msquic_profile(trevrpc_config* config) {
     } else {
         (void)trevrpc_config_apply_msquic_tuning_profile(config, TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT);
     }
-    if (benchmark_msquic_profile->apply_receive_windows && strcmp(benchmark_msquic_profile->name, "receive-1m") == 0) {
-        config->stream_recv_window = benchmark_msquic_profile->receive_window_reference_stream;
-        config->conn_flow_control_window = benchmark_msquic_profile->receive_window_reference_connection;
-    }
 }
 
 static void apply_benchmark_server_msquic_profile(trevrpc_server_config* config) {
@@ -225,10 +203,6 @@ static void apply_benchmark_server_msquic_profile(trevrpc_server_config* config)
         (void)trevrpc_server_config_apply_msquic_tuning_profile(config, TREVRPC_MSQUIC_TUNING_PROFILE_THROUGHPUT_1M);
     } else {
         (void)trevrpc_server_config_apply_msquic_tuning_profile(config, TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT);
-    }
-    if (benchmark_msquic_profile->apply_receive_windows && strcmp(benchmark_msquic_profile->name, "receive-1m") == 0) {
-        config->stream_recv_window = benchmark_msquic_profile->receive_window_reference_stream;
-        config->conn_flow_control_window = benchmark_msquic_profile->receive_window_reference_connection;
     }
 }
 

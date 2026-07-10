@@ -338,6 +338,7 @@ typedef struct call_send_many_borrowed_work {
     bool borrowed;
 } call_send_many_borrowed_work;
 
+#ifdef TREVRPC_NODE_TEST_HOOKS
 typedef struct debug_body_ref_work {
     base_work base;
     napi_ref body_ref;
@@ -360,16 +361,19 @@ typedef struct debug_pending_wait_work {
     bool acquired;
     uint32_t delay_ms;
 } debug_pending_wait_work;
+#endif
 
 typedef struct server_call_event {
     server_route* route;
     native_call* call;
 } server_call_event;
 
+#ifdef TREVRPC_NODE_TEST_HOOKS
 static atomic_uint_least64_t ExternalArrayBufferFinalizers = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t RetainedOutboundBodyRefs = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugPendingResourceCloses = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugPendingResourceFinalizers = ATOMIC_VAR_INIT(0);
+#endif
 
 static napi_value noop_js_callback(napi_env env, napi_callback_info info);
 static void native_client_release(native_client* client);
@@ -749,7 +753,9 @@ static void external_arraybuffer_finalize(napi_env env, void* data, void* hint) 
     (void)env;
     (void)data;
     free(hint);
+#ifdef TREVRPC_NODE_TEST_HOOKS
     atomic_fetch_add_explicit(&ExternalArrayBufferFinalizers, 1, memory_order_relaxed);
+#endif
 }
 
 static napi_value make_external_uint8_array(
@@ -1456,7 +1462,9 @@ static bool create_body_ref(
         napi_throw_error(env, NULL, "failed to hold zero-copy send body");
         return false;
     }
+#ifdef TREVRPC_NODE_TEST_HOOKS
     atomic_fetch_add_explicit(&RetainedOutboundBodyRefs, 1, memory_order_relaxed);
+#endif
     return true;
 }
 
@@ -1467,7 +1475,9 @@ static void delete_body_ref(napi_env env, napi_ref ref) {
     if (env != NULL) {
         napi_delete_reference(env, ref);
     }
+#ifdef TREVRPC_NODE_TEST_HOOKS
     atomic_fetch_sub_explicit(&RetainedOutboundBodyRefs, 1, memory_order_relaxed);
+#endif
 }
 
 static int create_body_refs_array(napi_env env,
@@ -2655,6 +2665,7 @@ static napi_value queue_work_managed(napi_env env,
     return promise;
 }
 
+#ifdef TREVRPC_NODE_TEST_HOOKS
 static napi_value queue_work_with_abandon(napi_env env,
     base_work* work,
     const char* name,
@@ -2663,6 +2674,7 @@ static napi_value queue_work_with_abandon(napi_env env,
     napi_async_complete_callback abandon) {
     return queue_work_managed(env, work, name, execute, complete, abandon, NULL);
 }
+#endif
 
 static napi_value queue_work(napi_env env,
     base_work* work,
@@ -4367,6 +4379,7 @@ static napi_value native_stream_close(napi_env env, napi_callback_info info) {
     return undefined;
 }
 
+#ifdef TREVRPC_NODE_TEST_HOOKS
 static napi_value native_stream_debug_operation_locked(napi_env env, napi_callback_info info) {
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
@@ -4386,6 +4399,7 @@ static napi_value native_stream_debug_operation_locked(napi_env env, napi_callba
     napi_get_boolean(env, locked, &result);
     return result;
 }
+#endif
 
 typedef struct native_call_work_prefix {
     base_work base;
@@ -5059,6 +5073,7 @@ static napi_value native_call_close(napi_env env, napi_callback_info info) {
     return undefined;
 }
 
+#ifdef TREVRPC_NODE_TEST_HOOKS
 static napi_value native_call_debug_operation_locked(napi_env env, napi_callback_info info) {
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
@@ -5480,6 +5495,7 @@ static napi_value debug_retain_body_until_async_complete(napi_env env, napi_call
         debug_body_ref_complete,
         debug_body_ref_complete);
 }
+#endif
 
 static napi_value init(napi_env env, napi_value exports) {
     native_completion_runtime* runtime = calloc(1, sizeof(*runtime));
@@ -5520,7 +5536,9 @@ static napi_value init(napi_env env, napi_value exports) {
         {"recvMany", NULL, native_stream_recv_many, NULL, NULL, NULL, napi_default, NULL},
         {"recvBodyBatch", NULL, native_stream_recv_body_batch, NULL, NULL, NULL, napi_default, NULL},
         {"close", NULL, native_stream_close, NULL, NULL, NULL, napi_default, NULL},
+#ifdef TREVRPC_NODE_TEST_HOOKS
         {"_debugOperationLocked", NULL, native_stream_debug_operation_locked, NULL, NULL, NULL, napi_default, NULL},
+#endif
     };
     napi_value stream_ctor = NULL;
     napi_define_class(env,
@@ -5560,7 +5578,9 @@ static napi_value init(napi_env env, napi_value exports) {
         {"recv", NULL, native_call_recv, NULL, NULL, NULL, napi_default, NULL},
         {"recvMany", NULL, native_call_recv_many, NULL, NULL, NULL, napi_default, NULL},
         {"close", NULL, native_call_close, NULL, NULL, NULL, napi_default, NULL},
+#ifdef TREVRPC_NODE_TEST_HOOKS
         {"_debugOperationLocked", NULL, native_call_debug_operation_locked, NULL, NULL, NULL, napi_default, NULL},
+#endif
     };
     napi_value call_ctor = NULL;
     napi_define_class(env,
@@ -5590,6 +5610,7 @@ static napi_value init(napi_env env, napi_value exports) {
     napi_property_descriptor exports_desc[] = {
         {"connectMsQuic", NULL, connect_msquic, NULL, NULL, NULL, napi_default, NULL},
         {"listenMsQuic", NULL, listen_msquic, NULL, NULL, NULL, napi_default, NULL},
+#ifdef TREVRPC_NODE_TEST_HOOKS
         {"_debugExternalArrayBufferFinalizers",
             NULL,
             debug_external_arraybuffer_finalizers,
@@ -5634,6 +5655,7 @@ static napi_value init(napi_env env, napi_value exports) {
             NULL,
             napi_default,
             NULL},
+#endif
     };
     napi_define_properties(env, exports, sizeof(exports_desc) / sizeof(exports_desc[0]), exports_desc);
     return exports;

@@ -49,3 +49,22 @@ server.registerService(GreeterService, {
 
 await server.serve();
 ```
+
+## Native Development
+
+`npm run build:native` creates the production addon without test-only debug hooks. Build the
+test addon before running the native tests:
+
+```sh
+npm run build:native:test
+npm test
+```
+
+The completion-worker profiler is manual and requires the benchmark server binary plus an
+explicit case, send mode, concurrency, iteration count, and payload size:
+
+```sh
+npm run profile:completion-worker:native -- \
+  <server-binary> <unary|bidi-duplex> <copy|zero-copy> \
+  <concurrency> <iterations> <payload-bytes>
+```

@@ -7,6 +7,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(TREVRPC_NODE_TEST_HOOKS "Build test-only Node addon debug hooks" OFF)
+
 if(NOT DEFINED TREVRPC_C_ROOT)
     get_filename_component(TREVRPC_C_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../trevrpc-c" ABSOLUTE)
 endif()
@@ -39,6 +41,9 @@ add_library(trevrpc_native MODULE
 )
 target_include_directories(trevrpc_native PRIVATE "${NODE_INCLUDE_DIR}")
 target_link_libraries(trevrpc_native PRIVATE trevrpc)
+if(TREVRPC_NODE_TEST_HOOKS)
+    target_compile_definitions(trevrpc_native PRIVATE TREVRPC_NODE_TEST_HOOKS=1)
+endif()
 set_target_properties(trevrpc_native PROPERTIES
     PREFIX ""
     SUFFIX ".node"

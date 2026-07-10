@@ -31,9 +31,12 @@
   },
   "scripts": {
     "bench:native": "node bench/rpc_comparison_native.js",
+    "profile:completion-worker:native": "node bench/completion_worker_profile_native.js",
     "profile:native": "node bench/rpc_profile_native.js",
-    "build:native": "cmake -S native -B build/native -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release} ${TREVRPC_C_ROOT:+-DTREVRPC_C_ROOT=$TREVRPC_C_ROOT} ${NODE_INCLUDE_DIR:+-DNODE_INCLUDE_DIR=$NODE_INCLUDE_DIR} && cmake --build build/native --config ${CMAKE_BUILD_TYPE:-Release}",
-    "check": "npm run lint && npm run typecheck && npm test",
+    "build:native": "TREVRPC_NODE_TEST_HOOKS=OFF npm run build:native:cmake",
+    "build:native:test": "TREVRPC_NODE_TEST_HOOKS=ON npm run build:native:cmake",
+    "build:native:cmake": "cmake -S native -B build/native -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release} -DTREVRPC_NODE_TEST_HOOKS=${TREVRPC_NODE_TEST_HOOKS:?} ${TREVRPC_C_ROOT:+-DTREVRPC_C_ROOT=$TREVRPC_C_ROOT} ${NODE_INCLUDE_DIR:+-DNODE_INCLUDE_DIR=$NODE_INCLUDE_DIR} && cmake --build build/native --config ${CMAKE_BUILD_TYPE:-Release}",
+    "check": "npm run lint && npm run typecheck && npm run build:native:test && npm test && npm run build:native && npm run verify:native:production",
     "example:greeter": "node examples/greeter/static-server.js",
     "format": "oxfmt --write",
     "format:check": "oxfmt --check",
@@ -41,7 +44,8 @@
     "test": "node --test test/*.test.js",
     "test:browser": "node --test test/browser/*.test.js",
     "test:browser:soak": "env TREVRPC_BROWSER_SOAK=1 node --test test/browser/*.test.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:native:production": "node -e 'const { readFileSync } = require(\"node:fs\"); const path = \"./build/native/trevrpc_native.node\"; const expectedExports = [\"connectMsQuic\", \"listenMsQuic\"]; const actualExports = Object.getOwnPropertyNames(require(path)).sort(); const exportsMatch = JSON.stringify(actualExports) === JSON.stringify(expectedExports); const embedsDebugNames = readFileSync(path).includes(Buffer.from(\"_debug\")); if (!exportsMatch || embedsDebugNames) throw new Error(`production addon exports ${JSON.stringify(actualExports)}; expected exactly ${JSON.stringify(expectedExports)}${embedsDebugNames ? \"; binary contains _debug\" : \"\"}`);'"
   },
   "dependencies": {
     "protobufjs": "^8.7.0"

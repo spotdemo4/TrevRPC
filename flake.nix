@@ -320,10 +320,12 @@
                 oxfmt --check
                 oxlint --deny-warnings
                 npm run typecheck
-                npm run build:native
+                npm run build:native:test
                 clang-format --dry-run --Werror native/trevrpc_node.c
                 clang-tidy -p build/native native/trevrpc_node.c
                 npm test
+                npm run build:native
+                npm run verify:native:production
               '';
 
               meta = {
