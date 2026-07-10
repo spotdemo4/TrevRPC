@@ -71,6 +71,7 @@ intptr_t trevrpc_wt_stream_read(trevrpc_wt_stream* stream, uint8_t* data, size_t
 intptr_t trevrpc_wt_stream_read_frame(trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len);
 intptr_t trevrpc_wt_stream_read_frame_timeout(
     trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos);
+intptr_t trevrpc_wt_stream_read_frame_ready(trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len);
 intptr_t trevrpc_wt_stream_write(trevrpc_wt_stream* stream, const uint8_t* data, size_t len);
 intptr_t trevrpc_wt_stream_write_message_frame(
     trevrpc_wt_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);

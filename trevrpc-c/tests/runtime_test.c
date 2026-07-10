@@ -67,6 +67,8 @@ struct trevrpc_stream {
     uint64_t response_body_size;
     bool response_idle_started;
     struct timespec response_last_activity;
+    bool request_poll_idle_started;
+    struct timespec request_poll_started_at;
     uint32_t failure_status;
     const char* failure_message;
 };
@@ -700,8 +702,16 @@ static int test_default_native_pending_send_limits(void) {
 
     CHECK_GOTO(client_config.max_pending_send_bytes == TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES);
     CHECK_GOTO(client_config.max_pending_send_count == TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT);
+    CHECK_GOTO(client_config.stream_recv_window == 0);
+    CHECK_GOTO(client_config.conn_flow_control_window == 0);
+    CHECK_GOTO(client_config.msquic_execution_profile == TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY);
+    CHECK_GOTO(client_config.msquic_send_buffering_enabled == 0);
     CHECK_GOTO(server_config.max_pending_send_bytes == TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES);
     CHECK_GOTO(server_config.max_pending_send_count == TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT);
+    CHECK_GOTO(server_config.stream_recv_window == 0);
+    CHECK_GOTO(server_config.conn_flow_control_window == 0);
+    CHECK_GOTO(server_config.msquic_execution_profile == TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY);
+    CHECK_GOTO(server_config.msquic_send_buffering_enabled == 0);
 
     result = 0;
 
@@ -944,7 +954,7 @@ static int test_response_stream_body_size_limit(void) {
     const uint8_t body[] = {1};
 
     CHECK_GOTO(trevrpc_stream_send_message(&stream, body, sizeof(body)) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
-    CHECK_GOTO(stream.response_body_size == sizeof(body));
+    CHECK_GOTO(stream.response_body_size == 0);
     CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
     CHECK_GOTO(stream.failure_message != NULL);
 
@@ -972,12 +982,12 @@ static int test_response_stream_limit_boundaries(void) {
         .failure_status = TREVRPC_STATUS_OK,
     };
     CHECK_GOTO(trevrpc_stream_send_message(&message_limited, body, sizeof(body)) == TREV_MSQUIC_ERR_CLOSED);
-    CHECK_GOTO(message_limited.response_message_count == 1);
-    CHECK_GOTO(message_limited.response_body_size == sizeof(body));
+    CHECK_GOTO(message_limited.response_message_count == 0);
+    CHECK_GOTO(message_limited.response_body_size == 0);
     CHECK_GOTO(message_limited.failure_status == TREVRPC_STATUS_OK);
-    CHECK_GOTO(trevrpc_stream_send_message(&message_limited, body, sizeof(body)) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
-    CHECK_GOTO(message_limited.response_message_count == 1);
-    CHECK_GOTO(message_limited.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(trevrpc_stream_send_message(&message_limited, body, sizeof(body)) == TREV_MSQUIC_ERR_CLOSED);
+    CHECK_GOTO(message_limited.response_message_count == 0);
+    CHECK_GOTO(message_limited.failure_status == TREVRPC_STATUS_OK);
 
     trevrpc_stream body_limited = {
         .transport = TREVRPC_TRANSPORT_KIND_MSQUIC,
@@ -988,13 +998,13 @@ static int test_response_stream_limit_boundaries(void) {
         .failure_status = TREVRPC_STATUS_OK,
     };
     CHECK_GOTO(trevrpc_stream_send_message(&body_limited, body, sizeof(body)) == TREV_MSQUIC_ERR_CLOSED);
-    CHECK_GOTO(body_limited.response_message_count == 1);
-    CHECK_GOTO(body_limited.response_body_size == sizeof(body));
+    CHECK_GOTO(body_limited.response_message_count == 0);
+    CHECK_GOTO(body_limited.response_body_size == 0);
     CHECK_GOTO(body_limited.failure_status == TREVRPC_STATUS_OK);
-    CHECK_GOTO(trevrpc_stream_send_message(&body_limited, body, sizeof(body)) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
-    CHECK_GOTO(body_limited.response_message_count == 2);
-    CHECK_GOTO(body_limited.response_body_size == 2 * sizeof(body));
-    CHECK_GOTO(body_limited.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(trevrpc_stream_send_message(&body_limited, body, sizeof(body)) == TREV_MSQUIC_ERR_CLOSED);
+    CHECK_GOTO(body_limited.response_message_count == 0);
+    CHECK_GOTO(body_limited.response_body_size == 0);
+    CHECK_GOTO(body_limited.failure_status == TREVRPC_STATUS_OK);
 
     result = 0;
 
@@ -1039,8 +1049,8 @@ static int test_response_stream_message_batch_limit(void) {
     const size_t body_lens[] = {1, 1};
 
     CHECK_GOTO(trevrpc_stream_send_messages(&stream, bodies, body_lens, 2) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
-    CHECK_GOTO(stream.response_message_count == 1);
-    CHECK_GOTO(stream.response_body_size == 1);
+    CHECK_GOTO(stream.response_message_count == 0);
+    CHECK_GOTO(stream.response_body_size == 0);
     CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
     CHECK_GOTO(stream.failure_message != NULL);
 
@@ -1063,8 +1073,8 @@ static int test_response_stream_message_batch_body_size_limit(void) {
     const size_t body_lens[] = {1, 1};
 
     CHECK_GOTO(trevrpc_stream_send_messages(&stream, bodies, body_lens, 2) == TREVRPC_ERR_STREAM_LIMIT_EXCEEDED);
-    CHECK_GOTO(stream.response_message_count == 2);
-    CHECK_GOTO(stream.response_body_size == 2);
+    CHECK_GOTO(stream.response_message_count == 0);
+    CHECK_GOTO(stream.response_body_size == 0);
     CHECK_GOTO(stream.failure_status == TREVRPC_STATUS_RESOURCE_EXHAUSTED);
     CHECK_GOTO(stream.failure_message != NULL);
 
@@ -1742,7 +1752,11 @@ static int test_raw_unary_call_handler_defers(void) {
     CHECK_GOTO(counts.finished == 0);
 
     CHECK_GOTO(trevrpc_response_set_body(&response, response_body, sizeof(response_body)) == 0);
-    CHECK_GOTO(trevrpc_call_respond(state.call, &response) == 0);
+    CHECK_GOTO(trevrpc_call_retain(state.call) == 0);
+    CHECK_GOTO(trevrpc_call_respond(state.call, &response) == TREV_MSQUIC_ERR_CLOSED);
+    CHECK_GOTO(counts.finished == 0);
+    CHECK_GOTO(trevrpc_call_request(state.call) != NULL);
+    trevrpc_call_release(state.call);
     state.call = NULL;
     CHECK_GOTO(counts.finished == 1);
     CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
@@ -1797,7 +1811,8 @@ static int test_raw_stream_call_handler_defers(void) {
     CHECK_GOTO(counts.started == 1);
     CHECK_GOTO(counts.finished == 0);
 
-    CHECK_GOTO(trevrpc_call_finish_stream(state.call, TREVRPC_STATUS_PERMISSION_DENIED, NULL, 0) == 0);
+    CHECK_GOTO(
+        trevrpc_call_finish_stream(state.call, TREVRPC_STATUS_PERMISSION_DENIED, NULL, 0) == TREV_MSQUIC_ERR_CLOSED);
     state.call = NULL;
     CHECK_GOTO(counts.finished == 1);
     CHECK_GOTO(counts.status == TREVRPC_STATUS_PERMISSION_DENIED);
@@ -2363,7 +2378,7 @@ static int test_worker_queue_deferred_raw_call_cleanup(void) {
     CHECK_GOTO(trevrpc_response_set_body(&response, response_body, sizeof(response_body)) == 0);
     call = deferred_signal_take_call(&deferred);
     CHECK_GOTO(call != NULL);
-    CHECK_GOTO(trevrpc_call_respond(call, &response) == 0);
+    CHECK_GOTO(trevrpc_call_respond(call, &response) == TREV_MSQUIC_ERR_CLOSED);
     call = NULL;
     CHECK_GOTO(trevrpc_test_server_wait_for_tasks(server, 2ull * NANOS_PER_SEC));
     CHECK_GOTO(counts.finished == 1);

@@ -1990,6 +1990,19 @@ intptr_t trevrpc_wt_stream_read_frame_timeout(
     return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
 }
 
+intptr_t trevrpc_wt_stream_read_frame_ready(trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
+    if (stream == NULL || body == NULL || len == NULL) {
+        return -EINVAL;
+    }
+    *body = NULL;
+    *len = 0;
+    if (stream->msquic_stream == NULL) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    intptr_t n = trevrpc_msquic_stream_read_frame_ready(stream->msquic_stream, body, len, max_len);
+    return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
+}
+
 intptr_t trevrpc_wt_stream_write(trevrpc_wt_stream* stream, const uint8_t* data, size_t len) {
     if (stream == NULL) {
         return -EINVAL;

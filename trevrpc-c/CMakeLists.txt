@@ -295,6 +295,29 @@ if(TREVRPC_BUILD_BENCHMARKS)
     endif()
 endif()
 
+if((TREVRPC_BUILD_TESTS OR TREVRPC_BUILD_BENCHMARKS) AND TREVRPC_BUILD_RUNTIME AND TREVRPC_BUILD_MSQUIC)
+    add_executable(trevrpc_buffering_memory_bench bench/buffering_memory_bench.c)
+    add_dependencies(trevrpc_buffering_memory_bench trevrpc_msquic_test_certificates)
+    target_compile_definitions(trevrpc_buffering_memory_bench PRIVATE
+        TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
+        TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
+    )
+    target_link_libraries(trevrpc_buffering_memory_bench PRIVATE trevrpc)
+    trevrpc_c_warnings(trevrpc_buffering_memory_bench)
+    trevrpc_c_sanitizers(trevrpc_buffering_memory_bench)
+
+    add_custom_target(trevrpc_buffering_soak
+        COMMAND ${CMAKE_COMMAND} -E env
+            "BINARY=$<TARGET_FILE:trevrpc_buffering_memory_bench>"
+            "OUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/buffering-soak"
+            "MATRIX=soak"
+            "RUNS=1"
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/../bench/run_c_buffering_matrix.sh"
+        DEPENDS trevrpc_buffering_memory_bench
+        USES_TERMINAL
+    )
+endif()
+
 install(TARGETS ${trevrpc_install_targets}
     EXPORT trevrpcTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -376,6 +399,35 @@ if(TREVRPC_BUILD_TESTS)
 
         add_test(NAME trevrpc_msquic_transport COMMAND trevrpc_msquic_transport_test)
         trevrpc_c_lsan_suppressions(trevrpc_msquic_transport)
+
+        add_executable(trevrpc_buffering_config_test tests/buffering_config_test.c)
+        target_link_libraries(trevrpc_buffering_config_test PRIVATE trevrpc)
+        trevrpc_c_warnings(trevrpc_buffering_config_test)
+        trevrpc_c_sanitizers(trevrpc_buffering_config_test)
+
+        add_test(NAME trevrpc_buffering_config COMMAND trevrpc_buffering_config_test)
+
+        set(trevrpc_buffering_fast_cases
+            "safe-default|safe|slow-reader|4|4096|16384|262144|65536|1"
+            "receive-candidate|receive-1m|slow-reader|4|4096|16384|262144|65536|1"
+            "throughput-slow-reader|throughput-1m|slow-reader|8|4096|32768|524288|131072|5"
+            "throughput-stalled-handler|throughput-1m|stalled-handler|8|32768|4096|524288|0|10"
+            "throughput-reset|throughput-1m|reset|8|32768|4096|262144|0|5"
+            "throughput-close|throughput-1m|close|8|32768|8192|262144|65536|5"
+            "throughput-overload|throughput-1m|overload|12|32768|4096|262144|0|10"
+            "throughput-body-limit|throughput-1m|body-limit|4|32768|4096|262144|0|5"
+        )
+        foreach(trevrpc_buffering_case IN LISTS trevrpc_buffering_fast_cases)
+            string(REPLACE "|" ";" trevrpc_buffering_args "${trevrpc_buffering_case}")
+            list(POP_FRONT trevrpc_buffering_args trevrpc_buffering_name)
+            add_test(NAME trevrpc_buffering_memory_${trevrpc_buffering_name}
+                COMMAND trevrpc_buffering_memory_bench ${trevrpc_buffering_args}
+            )
+            set_tests_properties(trevrpc_buffering_memory_${trevrpc_buffering_name}
+                PROPERTIES LABELS "buffering" TIMEOUT 30
+            )
+            trevrpc_c_lsan_suppressions(trevrpc_buffering_memory_${trevrpc_buffering_name})
+        endforeach()
 
         add_executable(trevrpc_generated_service_test
             tests/generated_service_test.c

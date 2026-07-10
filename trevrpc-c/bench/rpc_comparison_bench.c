@@ -2,6 +2,7 @@
 
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
+#include "trevrpc_msquic.h"
 #include "trevrpc_webtransport.h"
 
 #include <errno.h> // IWYU pragma: keep
@@ -32,6 +33,11 @@
 #define BENCHMARK_METHOD_LOTS_OF_REPLIES "LotsOfReplies"
 #define BENCHMARK_METHOD_LOTS_OF_GREETINGS "LotsOfGreetings"
 #define BENCHMARK_METHOD_BIDI_HELLO "BidiHello"
+#define MSQUIC_2_5_8_DOCUMENTED_DEFAULT_STREAM_RECV_WINDOW (64u * 1024u)
+#define MSQUIC_2_5_8_DOCUMENTED_DEFAULT_CONN_FLOW_CONTROL_WINDOW (16u * 1024u * 1024u)
+#define MSQUIC_2_5_8_DOCUMENTED_DEFAULTS_BASIS "msquic-2.5.8-documented-defaults-not-observed"
+#define BENCHMARK_CANDIDATE_STREAM_RECV_WINDOW (1024u * 1024u)
+#define BENCHMARK_CANDIDATE_CONN_FLOW_CONTROL_WINDOW (64u * 1024u * 1024u)
 
 int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port);
 
@@ -64,6 +70,23 @@ typedef struct long_lived_sender_args {
     int result;
 } long_lived_sender_args;
 
+typedef struct benchmark_c_msquic_profile {
+    const char* name;
+    const char* receive_window_basis;
+    uint32_t receive_window_reference_stream;
+    uint32_t receive_window_reference_connection;
+    uint32_t execution_profile;
+    int send_buffering_enabled;
+    uint16_t peer_bidi_stream_count;
+    int64_t max_concurrent_streams_per_connection;
+    size_t max_frame_size;
+    int64_t max_stream_body_size;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
+    uint64_t idle_timeout_ms;
+    bool apply_receive_windows;
+} benchmark_c_msquic_profile;
+
 static volatile size_t benchmark_count_sink;
 static volatile size_t benchmark_bytes_sink;
 static volatile sig_atomic_t split_server_stop_requested;
@@ -72,6 +95,58 @@ static size_t benchmark_payload_value_count;
 static size_t benchmark_operation_index;
 static trevrpc_metadata benchmark_metadata;
 static bool benchmark_metadata_enabled;
+static const benchmark_c_msquic_profile* benchmark_msquic_profile;
+
+static const benchmark_c_msquic_profile BenchmarkMsQuicProfiles[] = {
+    {
+        .name = "safe",
+        .receive_window_basis = MSQUIC_2_5_8_DOCUMENTED_DEFAULTS_BASIS,
+        .receive_window_reference_stream = MSQUIC_2_5_8_DOCUMENTED_DEFAULT_STREAM_RECV_WINDOW,
+        .receive_window_reference_connection = MSQUIC_2_5_8_DOCUMENTED_DEFAULT_CONN_FLOW_CONTROL_WINDOW,
+        .execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY,
+        .send_buffering_enabled = 0,
+        .peer_bidi_stream_count = 128,
+        .max_concurrent_streams_per_connection = 64,
+        .max_frame_size = TREVRPC_DEFAULT_MAX_FRAME_SIZE,
+        .max_stream_body_size = 16 * 1024 * 1024,
+        .max_pending_send_bytes = TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES,
+        .max_pending_send_count = TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT,
+        .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
+        .apply_receive_windows = false,
+    },
+    {
+        .name = "receive-1m",
+        .receive_window_basis = "benchmark-explicit-recipe",
+        .receive_window_reference_stream = BENCHMARK_CANDIDATE_STREAM_RECV_WINDOW,
+        .receive_window_reference_connection = BENCHMARK_CANDIDATE_CONN_FLOW_CONTROL_WINDOW,
+        .execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY,
+        .send_buffering_enabled = 0,
+        .peer_bidi_stream_count = 128,
+        .max_concurrent_streams_per_connection = 64,
+        .max_frame_size = TREVRPC_DEFAULT_MAX_FRAME_SIZE,
+        .max_stream_body_size = 16 * 1024 * 1024,
+        .max_pending_send_bytes = TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES,
+        .max_pending_send_count = TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT,
+        .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
+        .apply_receive_windows = true,
+    },
+    {
+        .name = "throughput-1m",
+        .receive_window_basis = "trevrpc-helper-explicit",
+        .receive_window_reference_stream = BENCHMARK_CANDIDATE_STREAM_RECV_WINDOW,
+        .receive_window_reference_connection = BENCHMARK_CANDIDATE_CONN_FLOW_CONTROL_WINDOW,
+        .execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_MAX_THROUGHPUT,
+        .send_buffering_enabled = 1,
+        .peer_bidi_stream_count = 128,
+        .max_concurrent_streams_per_connection = 64,
+        .max_frame_size = TREVRPC_DEFAULT_MAX_FRAME_SIZE,
+        .max_stream_body_size = 16 * 1024 * 1024,
+        .max_pending_send_bytes = TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES,
+        .max_pending_send_count = TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT,
+        .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
+        .apply_receive_windows = true,
+    },
+};
 
 static int start_benchmark_server(benchmark_fixture* fixture);
 static Hello__V1__HelloRequest benchmark_request(void);
@@ -79,6 +154,83 @@ static const char* benchmark_payload(size_t index);
 static int validate_benchmark_metadata(const trevrpc_metadata* metadata);
 static int split_stream_send_reply(trevrpc_stream* stream, const char* message);
 static int split_send_benchmark_request_messages(trevrpc_stream* stream, size_t count);
+
+static int init_benchmark_msquic_profile(void) {
+    const char* name = getenv("TREVRPC_C_MSQUIC_PROFILE");
+    if (name == NULL || name[0] == '\0') {
+        name = "safe";
+    }
+    for (size_t i = 0; i < sizeof(BenchmarkMsQuicProfiles) / sizeof(BenchmarkMsQuicProfiles[0]); i++) {
+        if (strcmp(name, BenchmarkMsQuicProfiles[i].name) == 0) {
+            benchmark_msquic_profile = &BenchmarkMsQuicProfiles[i];
+            const char* profile_kind =
+                strcmp(benchmark_msquic_profile->name, "throughput-1m") == 0
+                    ? "public-throughput-1m"
+                    : (strcmp(benchmark_msquic_profile->name, "receive-1m") == 0 ? "benchmark-only-receive-recipe"
+                                                                                 : "public-default");
+            fprintf(stderr,
+                "trevrpc-c-msquic-profile name=%s kind=%s receive_window_reference_stream=%u "
+                "receive_window_reference_connection=%u receive_window_basis=%s receive_windows_applied=%d "
+                "send_buffering=%d peer_bidi_streams=%u app_stream_concurrency=%lld max_frame_size=%zu "
+                "max_stream_body_size=%lld max_pending_send_bytes=%zu max_pending_send_count=%zu "
+                "idle_timeout_ms=%llu rpc_stream_idle_timeout_nanos=0 webtransport_streams_per_session=%u "
+                "webtransport_sessions_per_connection=16 execution_profile=%u\n",
+                benchmark_msquic_profile->name,
+                profile_kind,
+                benchmark_msquic_profile->receive_window_reference_stream,
+                benchmark_msquic_profile->receive_window_reference_connection,
+                benchmark_msquic_profile->receive_window_basis,
+                benchmark_msquic_profile->apply_receive_windows ? 1 : 0,
+                benchmark_msquic_profile->send_buffering_enabled,
+                benchmark_msquic_profile->peer_bidi_stream_count,
+                (long long)benchmark_msquic_profile->max_concurrent_streams_per_connection,
+                benchmark_msquic_profile->max_frame_size,
+                (long long)benchmark_msquic_profile->max_stream_body_size,
+                benchmark_msquic_profile->max_pending_send_bytes,
+                benchmark_msquic_profile->max_pending_send_count,
+                (unsigned long long)benchmark_msquic_profile->idle_timeout_ms,
+                benchmark_msquic_profile->peer_bidi_stream_count,
+                benchmark_msquic_profile->execution_profile);
+            return 0;
+        }
+    }
+    fprintf(stderr, "unsupported TREVRPC_C_MSQUIC_PROFILE: %s\n", name);
+    return -EINVAL;
+}
+
+static void apply_benchmark_client_msquic_profile(trevrpc_config* config) {
+    config->max_idle_timeout_ms = benchmark_msquic_profile->idle_timeout_ms;
+    config->peer_bidi_stream_count = benchmark_msquic_profile->peer_bidi_stream_count;
+    config->max_frame_size = benchmark_msquic_profile->max_frame_size;
+    config->max_pending_send_bytes = benchmark_msquic_profile->max_pending_send_bytes;
+    config->max_pending_send_count = benchmark_msquic_profile->max_pending_send_count;
+    if (strcmp(benchmark_msquic_profile->name, "throughput-1m") == 0) {
+        (void)trevrpc_config_apply_msquic_tuning_profile(config, TREVRPC_MSQUIC_TUNING_PROFILE_THROUGHPUT_1M);
+    } else {
+        (void)trevrpc_config_apply_msquic_tuning_profile(config, TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT);
+    }
+    if (benchmark_msquic_profile->apply_receive_windows && strcmp(benchmark_msquic_profile->name, "receive-1m") == 0) {
+        config->stream_recv_window = benchmark_msquic_profile->receive_window_reference_stream;
+        config->conn_flow_control_window = benchmark_msquic_profile->receive_window_reference_connection;
+    }
+}
+
+static void apply_benchmark_server_msquic_profile(trevrpc_server_config* config) {
+    config->max_idle_timeout_ms = benchmark_msquic_profile->idle_timeout_ms;
+    config->peer_bidi_stream_count = benchmark_msquic_profile->peer_bidi_stream_count;
+    config->max_frame_size = benchmark_msquic_profile->max_frame_size;
+    config->max_pending_send_bytes = benchmark_msquic_profile->max_pending_send_bytes;
+    config->max_pending_send_count = benchmark_msquic_profile->max_pending_send_count;
+    if (strcmp(benchmark_msquic_profile->name, "throughput-1m") == 0) {
+        (void)trevrpc_server_config_apply_msquic_tuning_profile(config, TREVRPC_MSQUIC_TUNING_PROFILE_THROUGHPUT_1M);
+    } else {
+        (void)trevrpc_server_config_apply_msquic_tuning_profile(config, TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT);
+    }
+    if (benchmark_msquic_profile->apply_receive_windows && strcmp(benchmark_msquic_profile->name, "receive-1m") == 0) {
+        config->stream_recv_window = benchmark_msquic_profile->receive_window_reference_stream;
+        config->conn_flow_control_window = benchmark_msquic_profile->receive_window_reference_connection;
+    }
+}
 
 #define CHECK(condition)                                                                                               \
     do {                                                                                                               \
@@ -1324,9 +1476,8 @@ static int warm_split_client(const char* name, trevrpc_client* client, const spl
 static int connect_split_client(const char* transport, const char* host, uint16_t port, trevrpc_client** out_client) {
     trevrpc_config client_config = trevrpc_default_config();
     client_config.skip_certificate_validation = 1;
-    client_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
     client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
-    client_config.peer_bidi_stream_count = 128;
+    apply_benchmark_client_msquic_profile(&client_config);
     if (strcmp(transport, "msquic") == 0) {
         return trevrpc_client_connect(host, port, &client_config, out_client);
     }
@@ -1389,9 +1540,8 @@ static int start_fixture(benchmark_fixture* fixture) {
 
     trevrpc_config client_config = trevrpc_default_config();
     client_config.skip_certificate_validation = 1;
-    client_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
     client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
-    client_config.peer_bidi_stream_count = 128;
+    apply_benchmark_client_msquic_profile(&client_config);
     err = trevrpc_client_connect("127.0.0.1", port, &client_config, &fixture->native_client);
     if (err != 0) {
         return err;
@@ -1410,14 +1560,13 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
     server_config.port = 0;
     server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
     server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
-    server_config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
     server_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
-    server_config.peer_bidi_stream_count = 128;
     server_config.max_stateless_operations = 1024;
     server_config.max_binding_stateless_operations = 256;
     server_config.webtransport_path = "/trevrpc";
     server_config.max_sessions_per_connection = 16;
-    server_config.max_streams_per_session = 65535;
+    server_config.max_streams_per_session = benchmark_msquic_profile->peer_bidi_stream_count;
+    apply_benchmark_server_msquic_profile(&server_config);
 
     int err = trevrpc_server_listen(&server_config, &fixture->server);
     if (err != 0) {
@@ -1426,7 +1575,9 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
 
     trevrpc_server_options options = trevrpc_default_server_options();
     options.graceful_shutdown_timeout_nanos = BENCHMARK_GRACEFUL_SHUTDOWN_NANOS;
+    options.max_concurrent_streams_per_connection = benchmark_msquic_profile->max_concurrent_streams_per_connection;
     options.max_stream_messages = -1;
+    options.max_stream_body_size = benchmark_msquic_profile->max_stream_body_size;
     options.stream_idle_timeout_nanos = 0;
     err = trevrpc_server_set_options(fixture->server, &options);
     if (err == 0) {
@@ -1521,7 +1672,11 @@ static int run_server_mode(bool split_mode) {
 }
 
 int main(int argc, char** argv) {
-    int profile_err = init_benchmark_payload_profile();
+    int profile_err = init_benchmark_msquic_profile();
+    if (profile_err != 0) {
+        return 2;
+    }
+    profile_err = init_benchmark_payload_profile();
     if (profile_err != 0) {
         return 2;
     }

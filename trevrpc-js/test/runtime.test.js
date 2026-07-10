@@ -30,6 +30,7 @@ import {
   createServiceClient,
   decodeFrame,
   decodeStreamFrameBody,
+  defaultCallOptions,
   encodeFrame,
   encodeMessageStreamFrame,
   encodeMessageStreamFrames,
@@ -77,6 +78,10 @@ test("Node native transport subpath exports without loading the addon", async ()
   assert.equal(typeof NodeServer, "function");
   assert.equal(typeof NodeServer.listen, "function");
   assert.equal(typeof NodeServerCall, "function");
+});
+
+test("outbound zero-copy remains opt-in by default", () => {
+  assert.equal(defaultCallOptions().outboundZeroCopy, false);
 });
 
 test("browser root connect flattens browser WebTransport options", async () => {
@@ -1059,6 +1064,89 @@ test("Node transport writes request body batches with native sendMessages", asyn
   assert.equal(result.done, false);
   assert.equal(result.value.kind, RpcStreamFrameKind.Status);
   assert.deepEqual(sentBatches, [[[1], [2]]]);
+});
+
+test("Node transport propagates outbound zero-copy policy to unary and stream sends", async () => {
+  const { NodeTransport } = await import("../src/node.js");
+  const used = [];
+  const makeStream = () => {
+    let finished = false;
+    return {
+      sendMessage() {
+        used.push("sendMessage");
+        return Promise.resolve();
+      },
+      _sendMessageZeroCopy() {
+        used.push("sendMessageZeroCopy");
+        return Promise.resolve();
+      },
+      sendMessages() {
+        used.push("sendMessages");
+        return Promise.resolve();
+      },
+      _sendMessagesZeroCopy() {
+        used.push("sendMessagesZeroCopy");
+        return Promise.resolve();
+      },
+      finishSend() {
+        finished = true;
+        return Promise.resolve();
+      },
+      async recvMany() {
+        while (!finished) {
+          await Promise.resolve();
+        }
+        return [RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok })];
+      },
+      close() {},
+    };
+  };
+  const nativeClient = {
+    call() {
+      used.push("call");
+      return Promise.resolve({ status: Code.Ok, body: new Uint8Array() });
+    },
+    _callZeroCopy() {
+      used.push("callZeroCopy");
+      return Promise.resolve({ status: Code.Ok, body: new Uint8Array() });
+    },
+    startStream() {
+      used.push("startStream");
+      return Promise.resolve(makeStream());
+    },
+    _startStreamZeroCopy() {
+      used.push("startStreamZeroCopy");
+      return Promise.resolve(makeStream());
+    },
+  };
+  const transport = new NodeTransport(nativeClient);
+
+  await transport.call({ service: "svc", method: "copy", body: new Uint8Array([1]) });
+  await transport.call(
+    { service: "svc", method: "borrow", body: new Uint8Array([2]) },
+    { outboundZeroCopy: true },
+  );
+  const single = await transport.streamingCall(
+    { service: "svc", method: "single", kind: RpcKind.BidirectionalStreaming },
+    batchedFrameStream([[new Uint8Array([3])]]),
+    { outboundZeroCopy: true },
+  );
+  await single.next();
+  const batch = await transport.streamingCall(
+    { service: "svc", method: "batch", kind: RpcKind.BidirectionalStreaming },
+    batchedFrameStream([[new Uint8Array([4]), new Uint8Array([5])]]),
+    { outboundZeroCopy: true },
+  );
+  await batch.next();
+
+  assert.deepEqual(used, [
+    "call",
+    "callZeroCopy",
+    "startStreamZeroCopy",
+    "sendMessageZeroCopy",
+    "startStreamZeroCopy",
+    "sendMessagesZeroCopy",
+  ]);
 });
 
 test("Node transport reads native response body batches and delays terminal status", async () => {
@@ -2211,6 +2299,7 @@ test("generator emits JavaScript service clients", () => {
   assert.equal(response.error, undefined);
   assert.equal(response.file.length, 2);
   assert.match(generatedJavaScript.content, /export class GreeterClient/);
+  assert.doesNotMatch(generatedJavaScript.content, /outboundZeroCopy: true/);
   assert.match(generatedJavaScript.content, /sayHello\(request, options = \{\}\)/);
   assert.match(generatedJavaScript.content, /lotsOfReplies\(request, options = \{\}\)/);
   assert.match(generatedJavaScript.content, /lotsOfGreetings\(options = \{\}\)/);
@@ -2234,6 +2323,49 @@ test("generator emits JavaScript service clients", () => {
     generatedTypes.content,
     /bidiHello\(options\?: CallOptions\): Promise<BidirectionalStreamingCall<HelloRequest, HelloReply>>;/,
   );
+});
+
+test("generator can opt generated clients into outbound zero-copy", async () => {
+  const runtimeImport = pathToFileURL(join(process.cwd(), "src", "index.js")).href;
+  const response = generateBindings(
+    greeterRequest(`runtime_import=${runtimeImport},outbound_zero_copy=true`),
+  );
+  assert.equal(response.error, undefined);
+  const generatedJavaScript = generatedFile(response, "hello/v1/greeter.trevrpc.js");
+  assert.match(
+    generatedJavaScript.content,
+    /createServiceClient\(transport, GreeterService, root, \{ outboundZeroCopy: true, \.\.\.options \}\)/,
+  );
+
+  const directory = await mkdtemp(join(tmpdir(), "trevrpc-js-zero-copy-generated-"));
+  const generatedPath = join(directory, "greeter.trevrpc.js");
+  await writeFile(generatedPath, generatedJavaScript.content);
+  try {
+    const generated = await import(pathToFileURL(generatedPath).href);
+    const observed = [];
+    const transport = {
+      async call(_request, options) {
+        observed.push(options.outboundZeroCopy);
+        const HelloReply = generated.root.lookupType("hello.v1.HelloReply");
+        return RpcResponse.create({
+          status: Code.Ok,
+          body: HelloReply.encode({ message: "ok" }).finish(),
+          metadata: {},
+        });
+      },
+    };
+    const client = new generated.GreeterClient(transport);
+    await client.sayHello({ name: "default" });
+    await client.sayHello({ name: "override" }, { outboundZeroCopy: false });
+    assert.deepEqual(observed, [true, false]);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("generator rejects invalid outbound zero-copy policy", () => {
+  const response = generateBindings(greeterRequest("outbound_zero_copy=enabled"));
+  assert.match(response.error, /outbound_zero_copy must be true or false/);
 });
 
 test("generated JavaScript clients call the runtime", async () => {

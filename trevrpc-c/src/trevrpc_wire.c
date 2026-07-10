@@ -236,6 +236,67 @@ int trevrpc_wire_encode_request_view(const char* service,
     return 0;
 }
 
+int trevrpc_wire_encode_request_parts(
+    const trevrpc_request* request, size_t max_frame_size, trevrpc_wire_frame_parts* parts) {
+    if (request == NULL || parts == NULL || request->service == NULL || request->method == NULL ||
+        request->service_len == 0 || request->method_len == 0 || (request->body == NULL && request->body_len > 0)) {
+        return -EINVAL;
+    }
+    memset(parts, 0, sizeof(*parts));
+    int err = trevrpc_metadata_validate(&request->metadata);
+    if (err != 0) {
+        return err;
+    }
+
+    size_t body_header_len = request->body_len == 0 ? 0
+                                                    : trevrpc_wire_varint_len((uint64_t)(3u << 3u | 2u)) +
+                                                          trevrpc_wire_varint_len((uint64_t)request->body_len);
+    size_t prefix_len = trevrpc_wire_bytes_field_len(1, request->service_len) +
+                        trevrpc_wire_bytes_field_len(2, request->method_len) + body_header_len;
+    size_t suffix_len =
+        trevrpc_wire_metadata_field_len(4, &request->metadata) + trevrpc_wire_varint_field_len(5, request->kind) +
+        trevrpc_wire_varint_field_len(6, request->version) + trevrpc_wire_varint_field_len(7, request->timeout_nanos);
+    if (prefix_len > SIZE_MAX - request->body_len || suffix_len > SIZE_MAX - prefix_len - request->body_len) {
+        return TREVRPC_ERR_FRAME_TOO_LARGE;
+    }
+    size_t body_frame_len = prefix_len + request->body_len + suffix_len;
+    if (body_frame_len > max_frame_size || body_frame_len > UINT32_MAX) {
+        return TREVRPC_ERR_FRAME_TOO_LARGE;
+    }
+
+    parts->prefix = malloc(prefix_len);
+    if (parts->prefix == NULL) {
+        return -ENOMEM;
+    }
+    uint8_t* out = parts->prefix;
+    out = trevrpc_wire_append_bytes_field(out, 1, (const uint8_t*)request->service, request->service_len);
+    out = trevrpc_wire_append_bytes_field(out, 2, (const uint8_t*)request->method, request->method_len);
+    out = trevrpc_wire_append_bytes_field_header(out, 3, request->body_len);
+    (void)out;
+
+    if (suffix_len > 0) {
+        parts->suffix = malloc(suffix_len);
+        if (parts->suffix == NULL) {
+            trevrpc_wire_frame_parts_reset(parts);
+            return -ENOMEM;
+        }
+        out = parts->suffix;
+        out = trevrpc_wire_append_metadata_field(out, 4, &request->metadata);
+        out = trevrpc_wire_append_varint_field(out, 5, request->kind);
+        out = trevrpc_wire_append_varint_field(out, 6, request->version);
+        out = trevrpc_wire_append_varint_field(out, 7, request->timeout_nanos);
+        (void)out;
+    }
+
+    parts->prefix_len = prefix_len;
+    parts->body = request->body;
+    parts->body_len = request->body_len;
+    parts->suffix_len = suffix_len;
+    parts->frame_body_len = body_frame_len;
+    trevrpc_wire_trace_frame("tx", "RpcRequest", request->kind, TREVRPC_STATUS_OK, request->body_len, body_frame_len);
+    return 0;
+}
+
 int trevrpc_wire_encode_response(
     const trevrpc_response* response, size_t max_frame_size, uint8_t** frame, size_t* frame_len) {
     if (response == NULL) {

@@ -643,6 +643,65 @@ cleanup:
     return result;
 }
 
+static int test_request_parts_match_owned_frame_with_metadata(void) {
+    int result = 1;
+    trevrpc_request request = {
+        .service = "svc",
+        .service_len = 3,
+        .method = "method",
+        .method_len = 6,
+        .body = (const uint8_t*)"payload",
+        .body_len = 7,
+        .kind = TREVRPC_RPC_KIND_SERVER_STREAMING,
+        .version = TREVRPC_WIRE_VERSION,
+        .timeout_nanos = 123456,
+    };
+    trevrpc_wire_frame_parts parts = {0};
+    uint8_t metadata_value[] = {0x01, 0x02, 0x03};
+    uint8_t* owned = NULL;
+    size_t owned_len = 0;
+    uint8_t* assembled = NULL;
+
+    CHECK_GOTO(
+        trevrpc_metadata_set(
+            &request.metadata, "authorization", strlen("authorization"), metadata_value, sizeof(metadata_value)) == 0);
+    CHECK_GOTO(trevrpc_wire_encode_request_view(request.service,
+                   request.service_len,
+                   request.method,
+                   request.method_len,
+                   request.kind,
+                   request.version,
+                   request.body,
+                   request.body_len,
+                   &request.metadata,
+                   request.timeout_nanos,
+                   1024,
+                   &owned,
+                   &owned_len) == 0);
+    CHECK_GOTO(trevrpc_wire_encode_request_parts(&request, 1024, &parts) == 0);
+    CHECK_GOTO(owned_len == 4 + parts.frame_body_len);
+
+    assembled = malloc(owned_len);
+    CHECK_GOTO(assembled != NULL);
+    assembled[0] = (uint8_t)(parts.frame_body_len >> 24);
+    assembled[1] = (uint8_t)(parts.frame_body_len >> 16);
+    assembled[2] = (uint8_t)(parts.frame_body_len >> 8);
+    assembled[3] = (uint8_t)parts.frame_body_len;
+    memcpy(assembled + 4, parts.prefix, parts.prefix_len);
+    memcpy(assembled + 4 + parts.prefix_len, parts.body, parts.body_len);
+    memcpy(assembled + 4 + parts.prefix_len + parts.body_len, parts.suffix, parts.suffix_len);
+    CHECK_GOTO(bytes_equal(assembled, owned_len, owned, owned_len));
+
+    result = 0;
+
+cleanup:
+    free(assembled);
+    free(owned);
+    trevrpc_wire_frame_parts_reset(&parts);
+    trevrpc_request_reset(&request);
+    return result;
+}
+
 static int test_response_round_trip(void) {
     int result = 1;
     trevrpc_response response = {0};
@@ -1228,6 +1287,9 @@ int main(void) {
         return 1;
     }
     if (test_request_metadata_round_trip() != 0) {
+        return 1;
+    }
+    if (test_request_parts_match_owned_frame_with_metadata() != 0) {
         return 1;
     }
     if (test_response_round_trip() != 0) {

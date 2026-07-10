@@ -1,6 +1,8 @@
 #ifndef TREVRPC_H
 #define TREVRPC_H
 
+#include "trevrpc_msquic.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -10,7 +12,10 @@ extern "C" {
 
 #define TREVRPC_ALPN "trevrpc/1"
 #define TREVRPC_WIRE_VERSION 1u
+#define TREVRPC_C_ABI_VERSION 2u
 #define TREVRPC_DEFAULT_MAX_FRAME_SIZE (4u * 1024u * 1024u)
+#define TREVRPC_THROUGHPUT_1M_STREAM_RECV_WINDOW (1024u * 1024u)
+#define TREVRPC_THROUGHPUT_1M_CONN_FLOW_CONTROL_WINDOW (64u * 1024u * 1024u)
 
 #define TREVRPC_MAX_METADATA_ENTRIES 64u
 #define TREVRPC_MAX_METADATA_KEY_LEN 128u
@@ -78,6 +83,11 @@ typedef struct trevrpc_call_context trevrpc_call_context;
 typedef struct trevrpc_cancellation trevrpc_cancellation;
 typedef struct trevrpc_wt_config trevrpc_wt_config;
 
+typedef enum trevrpc_msquic_tuning_profile {
+    TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT = 0,
+    TREVRPC_MSQUIC_TUNING_PROFILE_THROUGHPUT_1M = 1,
+} trevrpc_msquic_tuning_profile;
+
 #ifndef TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
 #define TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
 typedef struct trevrpc_webtransport_admission_request {
@@ -108,6 +118,10 @@ typedef struct trevrpc_config {
     size_t max_pending_send_bytes;
     size_t max_pending_send_count;
     size_t max_frame_size;
+    uint32_t stream_recv_window;
+    uint32_t conn_flow_control_window;
+    trevrpc_msquic_execution_profile msquic_execution_profile;
+    int msquic_send_buffering_enabled;
 } trevrpc_config;
 
 typedef struct trevrpc_server_config {
@@ -133,6 +147,8 @@ typedef struct trevrpc_server_config {
     uint32_t conn_flow_control_window;
     uint32_t handshake_timeout_ms;
     size_t max_frame_size;
+    trevrpc_msquic_execution_profile msquic_execution_profile;
+    int msquic_send_buffering_enabled;
 } trevrpc_server_config;
 
 typedef struct trevrpc_server_options {
@@ -303,6 +319,10 @@ trevrpc_config trevrpc_default_config(void);
 trevrpc_server_config trevrpc_default_server_config(void);
 trevrpc_server_options trevrpc_default_server_options(void);
 trevrpc_call_options trevrpc_default_call_options(void);
+uint32_t trevrpc_c_abi_version(void);
+int trevrpc_config_apply_msquic_tuning_profile(trevrpc_config* config, trevrpc_msquic_tuning_profile profile);
+int trevrpc_server_config_apply_msquic_tuning_profile(
+    trevrpc_server_config* config, trevrpc_msquic_tuning_profile profile);
 
 int trevrpc_call_context_has_deadline(const trevrpc_call_context* context);
 int trevrpc_call_context_deadline_expired(const trevrpc_call_context* context);
@@ -342,6 +362,11 @@ int trevrpc_authorize_bearer_token(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status);
 
 int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_client** client);
+int trevrpc_client_connect_cancellable(const char* host,
+    uint16_t port,
+    const trevrpc_config* config,
+    trevrpc_cancellation* cancellation,
+    trevrpc_client** client);
 int trevrpc_client_connect_webtransport(
     const trevrpc_wt_config* wt_config, const trevrpc_config* config, trevrpc_client** client);
 int trevrpc_client_call_unary(trevrpc_client* client,
@@ -359,6 +384,11 @@ int trevrpc_client_call_unary_with_options(trevrpc_client* client,
     trevrpc_response** response);
 int trevrpc_client_call_request(trevrpc_client* client, const trevrpc_request* request, trevrpc_response** response);
 int trevrpc_client_call_request_cancellable(trevrpc_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_response** response);
+/* Binding-oriented request path. The request body is borrowed until SEND_COMPLETE drains. */
+int trevrpc_client_call_request_borrowed_cancellable(trevrpc_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
     trevrpc_response** response);
@@ -384,6 +414,11 @@ int trevrpc_client_start_stream_with_options(trevrpc_client* client,
 int trevrpc_client_start_stream_request(
     trevrpc_client* client, const trevrpc_request* request, trevrpc_stream** stream);
 int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_stream** stream);
+/* Binding-oriented request path. The request body is borrowed until SEND_COMPLETE drains. */
+int trevrpc_client_start_stream_request_borrowed_cancellable(trevrpc_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
     trevrpc_stream** stream);
@@ -434,6 +469,11 @@ void trevrpc_server_close(trevrpc_server* server);
 const trevrpc_request* trevrpc_call_request(const trevrpc_call* call);
 const trevrpc_call_context* trevrpc_call_get_context(const trevrpc_call* call);
 trevrpc_stream* trevrpc_call_stream(trevrpc_call* call);
+/* Binding-oriented lifetime ownership for work that can overlap terminal completion. */
+int trevrpc_call_retain(trevrpc_call* call);
+void trevrpc_call_release(trevrpc_call* call);
+/* Aborts transport I/O without releasing call ownership. */
+void trevrpc_call_cancel(trevrpc_call* call);
 /* Keeps call alive after the handler returns; completion APIs release it. */
 int trevrpc_call_defer(trevrpc_call* call);
 int trevrpc_call_respond(trevrpc_call* call, trevrpc_response* response);
@@ -456,11 +496,19 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
  */
 int trevrpc_stream_send_message_borrowed_wait(trevrpc_stream* stream, const uint8_t* body, size_t body_len);
 int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count);
+/* Each body is borrowed until every send in this batch reports SEND_COMPLETE. */
+int trevrpc_stream_send_messages_borrowed_wait(
+    trevrpc_stream* stream, const uint8_t* const* bodies, const size_t* body_lens, size_t count);
 int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len);
 int trevrpc_stream_send_status_with_metadata(
     trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata);
 int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** frame);
 int trevrpc_stream_recv_ready(trevrpc_stream* stream, trevrpc_stream_frame** frame, int* ready);
+/* Binding-oriented readiness check whose idle budget includes time spent queued before the first poll. */
+int trevrpc_stream_recv_ready_since(
+    trevrpc_stream* stream, trevrpc_stream_frame** frame, int* ready, uint64_t wait_started_nanos);
+/* Returns 1 when an immutable stream idle budget has elapsed since the supplied monotonic timestamp. */
+int trevrpc_stream_wait_timeout_elapsed(const trevrpc_stream* stream, uint64_t wait_started_nanos);
 /*
  * Receives up to capacity frames. The first receive may block like trevrpc_stream_recv;
  * following receives only drain already-ready frames. Returned frames are owned by the caller.

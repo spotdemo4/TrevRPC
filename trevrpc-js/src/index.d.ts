@@ -252,6 +252,15 @@ export interface CallOptions {
   streamIdleTimeoutMs?: number;
   metadata?: MetadataInput;
   signal?: AbortSignal;
+  /**
+   * Borrows outbound buffers in the native Node transport until each send completes.
+   * The backing store must be attached when submitted. Do not mutate, detach,
+   * transfer, or resize it before the returned operation settles. Node-API can
+   * detect detachment but cannot natively identify resizable ArrayBuffers or pin
+   * backing stores against explicit transfer or resize.
+   * Other transports ignore this option. Defaults to false.
+   */
+  outboundZeroCopy?: boolean;
 }
 
 export interface ResolvedCallOptions {
@@ -263,6 +272,7 @@ export interface ResolvedCallOptions {
   streamIdleTimeoutMs: number;
   metadata: Metadata;
   signal?: AbortSignal;
+  outboundZeroCopy?: boolean;
 }
 
 export interface Transport {
@@ -457,6 +467,8 @@ export interface NodeConnectOptions {
   maxStreamsPerSession?: number;
   idleTimeoutMs?: number;
   maxFrameSize?: number;
+  maxPendingSendBytes?: number;
+  maxPendingSendCount?: number;
   streamReadBatchMaxMessages?: number;
   streamWriteBatchMaxMessages?: number;
 }

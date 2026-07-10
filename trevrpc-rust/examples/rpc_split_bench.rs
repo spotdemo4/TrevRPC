@@ -44,6 +44,8 @@ const QUINN_KEEP_ALIVE_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE
 const QUINN_SEND_WINDOW_BYTES_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES";
 const QUINN_ACK_THRESHOLD_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD";
 const QUINN_ACK_DELAY_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS";
+const QUINN_QLOG_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG";
+const QUINN_PROTO_TRACE_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE";
 const SHAPES_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_SHAPES";
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -54,6 +56,7 @@ struct SplitGreeter;
 
 #[tokio::main]
 async fn main() -> BenchResult {
+    init_quinn_proto_trace()?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("client") => {
@@ -88,7 +91,7 @@ async fn main() -> BenchResult {
             run_grpc_server(addr, Path::new(&cert), Path::new(&key)).await
         }
         _ => Err(
-            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <cert> <iterations> | grpc-server <addr> <cert> <key>\nset TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT=default to keep production stream idle timers in TrevRPC split rows; set TREVRPC_RUST_SPLIT_BENCH_SHAPES=client_stream_latency,bidi_stream_latency and TREVRPC_RUST_QUINN_FRAME_TRACE=1 for focused frame diagnostics; set SSLKEYLOGFILE for TLS key logging"
+            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <cert> <iterations> | grpc-server <addr> <cert> <key>\nset TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT=default to keep production stream idle timers in TrevRPC split rows; set TREVRPC_RUST_SPLIT_BENCH_SHAPES=client_stream_latency,bidi_stream_latency and TREVRPC_RUST_QUINN_FRAME_TRACE=1 for focused frame diagnostics; set TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG and TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE=1 for packet diagnostics; set SSLKEYLOGFILE for TLS key logging"
                 .into(),
         ),
     }
@@ -1201,7 +1204,47 @@ fn apply_quinn_benchmark_tuning(config: &mut quinn::ServerConfig) -> BenchResult
         transport.ack_frequency_config(Some(ack));
     }
 
+    if let Ok(path) = std::env::var(QUINN_QLOG_ENV)
+        && !path.is_empty()
+    {
+        let path = Path::new(&path);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut qlog = quinn::QlogConfig::default();
+        qlog.writer(Box::new(fs::File::create(path)?))
+            .title(Some(
+                "TrevRPC C MsQuic client to Rust Quinn server".to_owned(),
+            ))
+            .description(Some(
+                "Diagnostic-only split benchmark packet trace".to_owned(),
+            ));
+        let stream = qlog
+            .into_stream()
+            .ok_or_else(|| std::io::Error::other("failed to initialize Quinn qlog stream"))?;
+        transport.qlog_stream(Some(stream));
+    }
+
     Ok(())
+}
+
+fn init_quinn_proto_trace() -> BenchResult {
+    if !env_enabled(QUINN_PROTO_TRACE_ENV) {
+        return Ok(());
+    }
+
+    tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .with_ansi(false)
+        .try_init()?;
+    Ok(())
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
 fn env_u64(name: &str) -> BenchResult<Option<u64>> {

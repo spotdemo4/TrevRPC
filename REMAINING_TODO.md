@@ -2,7 +2,7 @@
 
 Updated: 2026-07-09
 
-This file now tracks the work that remains after the 2026-07-09 implementation pass. Items listed as completed were changed in this pass. Items listed as deferred are intentionally not implemented yet because they require additional evidence, ownership/lifetime tests, or broader design work before they can be made safely.
+This file records the completed 2026-07-09 implementation and evidence pass. All previously deferred sections have been resolved through implementation or an evidence-backed no-change decision. No item remains deferred.
 
 ## Completed In This Pass
 
@@ -30,57 +30,30 @@ This file now tracks the work that remains after the 2026-07-09 implementation p
 - JavaScript native inbound response bodies, stream frames, and stream body batches can transfer C owner allocations to external ArrayBuffer finalizers, with forced-GC tests covering bodies that point inside `_body_owner`. Internal borrowed outbound send paths retain JS buffers until native send completion returns, while public sends remain copy-based.
 - JavaScript native addon operations now use a binding-owned persistent native completion worker source and Node-API threadsafe-function delivery instead of `napi_async_work`, with debug/native coverage for pending close/GC, retained send refs, terminal-status precedence, partial-stream return cleanup, and send completion behavior.
 
-## Deferred With Guardrails
+## Resolved Remaining Items
 
 ### C Larger Buffering Profiles
 
-Deferred and narrowed. Per-stream pending-send accounting is implemented, slow-reader close-drain coverage exists for the safe default, and MsQuic send buffering remains disabled by default. No larger C buffering profile was added because no workload-specific profile could be justified without A/B benchmark data and peak-memory evidence. A required remote evidence attempt was made against `ssh trev@192.168.0.160`, but the host was unreachable with `No route to host`, so benchmark collection for profile promotion is externally blocked.
+Resolved with an opt-in profile and unchanged safe defaults. `TREVRPC_MSQUIC_TUNING_PROFILE_THROUGHPUT_1M` sets a 1 MiB stream receive window, a 64 MiB connection receive window, MsQuic send buffering, and the max-throughput execution profile. It does not widen the 4 MiB frame limit, 16 MiB cumulative stream-body limit, 64-stream application admission limit, 64 MiB/1024 pending-send limits, or idle timeouts. `TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT` restores the four safe transport settings.
 
-Required before implementation:
-
-- A reachable required benchmark host or equivalent approved measurement environment.
-- A concrete proposed profile with explicit receive-window, send-buffering, stream-concurrency, frame-size, and cumulative-body settings.
-- Slow-reader and overload tests for each proposed profile proving total memory remains bounded, including peak-memory measurements.
-- Documentation that clearly separates safe defaults from opt-in diagnostic or throughput profiles.
-- Cross-runtime benchmark evidence recorded in `wiki/Benchmarks.md` for any profile intended for published rows.
+The high-level C harness ran 54 isolated slow-reader, stalled-handler, reset, close, overload, and exact-body-limit samples across `safe`, rejected `receive-1m`, and `throughput-1m` profiles. Every sample passed its aggregate process peak/convergence bounds, exact byte/status invariants, and zero-send-failure checks. Three-sample cross-runtime A/B results support `throughput-1m` for measured large-stream workloads, including C-to-C client-stream throughput improving from median `5167` to `17992` messages/s and Rust-client-to-C from `4115` to `9755`; results were not universal and the host governor was `powersave`, so the profile remains experimental and opt-in. Full samples, failures, hashes, and commands are in `wiki/Benchmarks.md`.
 
 ### Rust Quinn/MsQuic ACK Tuning
 
-Deferred and narrowed after exploratory diagnostics. ACK tuning is not baked into published rows. Focused C MsQuic client to Rust Quinn server diagnostics were run on `ssh trev@192.168.0.160` for `client_stream_latency` and `bidi_stream_latency` with `TREVRPC_RUST_QUINN_FRAME_TRACE=1`, `TREVRPC_C_FRAME_TRACE=1`, `SSLKEYLOGFILE`, and shape filters. The ACK-threshold/delay diagnostic run reduced traced outliers in a small sample, but packet-level ACK timing was not captured, the host was in `powersave`, and a follow-up packet-capture check was blocked when the benchmark host became unreachable. Results are recorded in `wiki/Benchmarks.md`.
+Resolved as a diagnostic-only no-default-change decision. Quinn qlog and decoded protocol tracing captured the C MsQuic client to Rust Quinn server request/FIN, ACK, response, terminal status, response FIN, reset, and STOP_SENDING lifecycle. Low-overhead qlog found 351 library-default RTT updates from `25.216` to `25.571` ms; threshold `1` with requested delay `0ms` removed the repeated greater-than-5ms interaction. Ten clean samples per shape changed `client_stream_latency` from median `19736.019` to `78.501` us/op and `bidi_stream_latency` from `18517.809` to `81.371` us/op without failures.
 
-Required before implementation:
-
-- Packet-level ACK timing evidence, such as qlog or decoded packet capture, for the same C MsQuic client to Rust Quinn server shapes.
-- Broader clean-host benchmark samples without frame tracing before changing published ACK defaults.
-- Correctness tests that prove any behavior change preserves terminal status, reset, cancellation, STOP_SENDING, and partial-stream semantics.
+The interaction is specific to one MsQuic peer, tight-loop workload, host, and pacing pattern; full tracing itself suppressed it. Normal and published runs therefore retain Quinn/library ACK defaults. Threshold `1` and requested delay `0ms` remain an opt-in `diagnostic-interoperability` profile. Benchmark rows now persist ACK and instrumentation state, and traced/qlog/keylog runs cannot be regenerated as production rows. Quinn integration tests cover terminal FIN draining, cancellation/reset, expected STOP_SENDING, partial and oversized input, and frames after terminal status.
 
 ### JavaScript Zero-Copy Native Paths
 
-Partially implemented. Native unary response bodies and native stream message bodies can now transfer their C owner allocation to external ArrayBuffer finalizers, including frames whose `body` points inside `_body_owner`. An internal single-message outbound path retains the JS body with a native reference until the borrowed MsQuic send waits through `SEND_COMPLETE`.
+Resolved with compatibility-safe opt-in APIs. Copying remains the default. `outboundZeroCopy: true` enables borrowed native unary request/response bodies and single or batched stream messages for Node clients and servers; generated clients can opt in with `outbound_zero_copy=true`, while per-call `false` overrides that generated default.
 
-Remaining before public/default outbound zero-copy:
+JavaScript references are retained until every corresponding MsQuic `SEND_COMPLETE`, including canceled completions. Synchronous failure, pending-send exhaustion, reset, cancellation, stream/client/call close, terminal races, active connect cancellation, and environment shutdown release references exactly once. Same-stream and same-call outbound work uses an invocation-ordered FIFO over binding-owned completion workers; receives use nonblocking readiness retries outside that FIFO so duplex traffic progresses. Forced-GC and sanitizer coverage includes unary bodies, typed-array slices, ArrayBuffers, single/batched messages, metadata/native prefixes, overlapping send/finish/terminal work, close/reset, and worker shutdown. Borrowed backing stores must not be mutated, detached, transferred, or resized before the returned operation settles.
 
-- Public API and generator/runtime policy for opting into zero-copy sends.
-- Borrowed batched stream-send and unary request-frame coverage.
-- A deeper C-level completion queue or exported nonblocking transport poll API if future profiling shows the binding-owned native completion workers are insufficient for high-concurrency workloads.
+Remote profiling through concurrency 64 found no starvation after the scheduler changes, with copy and zero-copy unary throughput both near 33k operations/s. The binding-owned worker source plus monotonic retry scheduler is sufficient for the measured workload, so a deeper exported C completion queue or poll API is not justified.
 
 ### Additional Resource Budget APIs
 
-Deferred and narrowed after the 2026-07-09 budget pass. The docs define the receive-memory budget model, and C/Go/Rust/JavaScript tests now cover exact-limit and over-limit behavior for the existing frame, unary-response, stream-message, cumulative-stream-body, and derived receive-window budgets. No public API fields were added because the repository does not yet contain concrete workload evidence showing that independent request-body, response-body, streaming-message, total-stream, or connection receive-budget knobs are needed beyond the current defaults and per-call/server stream limits.
+Resolved with an evidence-backed no-new-fields decision. The corrected high-level matrix exercised asymmetric 4 KiB request/64 KiB response slow readers, 64 KiB request/4 KiB response stalled handlers, 4-256 KiB request messages, 4-64 KiB response messages, exact 1 MiB cumulative exhaustion, reset, cleanup, and 16-way overload against an admission limit of 8.
 
-Current blockers:
-
-- Request-body and response-body split: existing frame and cumulative-stream-body limits bound both directions, and no test workload currently proves asymmetric request/response byte caps improve safety or performance.
-- Streaming-message split: existing stream message caps already protect both request and response streams, and no compatibility requirement currently justifies separate per-direction fields.
-- Total-stream budget: existing cumulative body caps cover total stream bytes; a separate total-stream field needs a workload showing message-count and body-byte caps are insufficient.
-- Connection receive budget: Go and Rust derive QUIC receive windows from frame size, stream-body size, and stream concurrency. C and Node native receive-window exposure remains blocked by the C larger-buffering profile requirements: slow-reader and overload memory evidence must come first.
-
-Required before implementation:
-
-- One concrete workload or production requirement for each proposed new knob, including expected payload distributions and concurrency.
-- Compatibility tests for every new public budget field in every language that exposes it.
-- Limit-boundary tests across C, Go, Rust, and JavaScript showing exact-limit success and one-unit-over failure.
-- Slow-reader and overload tests proving bounded memory before widening defaults or exposing larger C/Node native receive-buffer profiles.
-- Benchmark evidence recorded in `wiki/Benchmarks.md` for any profile intended to change published performance rows.
-
-Next action: build a small overload/slow-reader harness that records peak memory while varying stream concurrency, frame size, and stream-body limit. Use that evidence to decide whether connection-level receive budgets should become explicit API fields or remain derived transport settings.
+Independent request-body, response-body, streaming-message, combined total-stream, and connection receive-byte fields were rejected as redundant or unsupported by a concrete workload. Existing frame, directional response, message-count, cumulative-body, stream/request admission, connection, deadline, and idle-timeout controls bounded every measured retained-data dimension. The C receive-window fields and throughput helper are transport flow-control tuning, not aggregate memory budgets, because accepted bytes are copied into application-owned queues. Wire compatibility and existing defaults remain unchanged.

@@ -985,6 +985,67 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
 }
 
 #[tokio::test]
+async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
+    let (server_endpoint, cert_der) = make_server_endpoint(&fast_server_options())?;
+    let server_addr = server_endpoint.local_addr()?;
+    let (done_tx, done_rx) = oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let incoming = tokio::time::timeout(TEST_TIMEOUT, server_endpoint.accept())
+            .await?
+            .ok_or_else(|| std::io::Error::other("server endpoint closed before accept"))?;
+        let connection = incoming.await?;
+        let (mut send, mut recv) = connection.accept_bi().await?;
+
+        let _request = trevrpc::quinn::read_frame::<RpcRequest>(
+            &mut recv,
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        )
+        .await?;
+        read_quinn_fin(&mut recv).await?;
+
+        trevrpc::quinn::write_frame(
+            &mut send,
+            &RpcStreamFrame::status(Status::ok()),
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        )
+        .await?;
+        trevrpc::quinn::write_frame(
+            &mut send,
+            &RpcStreamFrame::message(b"unexpected".to_vec()),
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        )
+        .await?;
+        send.finish()?;
+        let _ = done_rx.await;
+        connection.close(0_u32.into(), b"test complete");
+
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    });
+    let endpoint = make_client_endpoint(cert_der)?;
+    let connection = endpoint.connect(server_addr, "localhost")?.await?;
+    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let mut response = transport
+        .streaming_call(
+            RpcRequest::new("example.greeter.Greeter", "StatusThenMessage", Vec::new())
+                .with_kind(RpcKind::ServerStreaming),
+            trevrpc::stream::empty(),
+        )
+        .await?;
+
+    let error = tokio::time::timeout(TEST_TIMEOUT, response.next())
+        .await?
+        .expect("post-terminal frame should produce an error")
+        .expect_err("post-terminal frame should be rejected");
+    assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    drop(response);
+    let _ = done_tx.send(());
+
+    close_client(endpoint, connection).await;
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> TestResult {
     let server = spawn_greeter_server(register_status_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;

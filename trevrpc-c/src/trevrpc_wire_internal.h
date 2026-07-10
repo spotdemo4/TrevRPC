@@ -40,6 +40,8 @@ int trevrpc_wire_encode_request_view(const char* service,
     size_t max_frame_size,
     uint8_t** frame,
     size_t* frame_len);
+int trevrpc_wire_encode_request_parts(
+    const trevrpc_request* request, size_t max_frame_size, trevrpc_wire_frame_parts* parts);
 int trevrpc_wire_encode_response(
     const trevrpc_response* response, size_t max_frame_size, uint8_t** frame, size_t* frame_len);
 int trevrpc_wire_encode_response_parts(
