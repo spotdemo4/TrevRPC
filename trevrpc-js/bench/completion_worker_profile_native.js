@@ -9,10 +9,9 @@ const ServerShutdownTimeoutMs = 5_000;
 
 const serverBinary = requiredArg(2, "server binary");
 const profileCase = process.argv[3] ?? "unary";
-const sendMode = process.argv[4] ?? "copy";
-const concurrency = positiveInteger(process.argv[5] ?? "16");
-const iterations = positiveInteger(process.argv[6] ?? "100");
-const payloadBytes = positiveInteger(process.argv[7] ?? "64");
+const concurrency = positiveInteger(process.argv[4] ?? "16");
+const iterations = positiveInteger(process.argv[5] ?? "100");
+const payloadBytes = positiveInteger(process.argv[6] ?? "64");
 const warmupIterations = nonNegativeInteger(process.env.JS_COMPLETION_PROFILE_WARMUP ?? "0");
 const timeoutMs = positiveInteger(process.env.JS_COMPLETION_PROFILE_TIMEOUT_MS ?? "5000");
 const recvLeadMs = nonNegativeInteger(process.env.JS_COMPLETION_PROFILE_RECV_LEAD_MS ?? "25");
@@ -21,10 +20,6 @@ const sample = process.env.JS_COMPLETION_PROFILE_SAMPLE ?? "unspecified";
 if (profileCase !== "unary" && profileCase !== "bidi-duplex") {
   throw new Error(`unsupported profile case ${JSON.stringify(profileCase)}`);
 }
-if (sendMode !== "copy" && sendMode !== "zero-copy") {
-  throw new Error(`unsupported send mode ${JSON.stringify(sendMode)}`);
-}
-
 const root = createRoot({
   nested: {
     hello: {
@@ -57,11 +52,6 @@ const service = Object.freeze({
   },
 });
 const request = Object.freeze({ name: "x".repeat(payloadBytes) });
-const callOptions = Object.freeze({
-  outboundZeroCopy: sendMode === "zero-copy",
-  streamIdleTimeoutMs: undefined,
-});
-
 const server = spawn(serverBinary, ["--serve"], { stdio: ["pipe", "pipe", "pipe"] });
 server.stderr.on("data", (chunk) => process.stderr.write(chunk));
 
@@ -76,25 +66,33 @@ try {
     maxStreamsPerSession: Math.max(128, concurrency * 2),
     idleTimeoutMs: 600_000,
   });
-  const client = createServiceClient(transport, service, root, callOptions);
+  const client = createServiceClient(transport, service, root);
 
   if (warmupIterations > 0) {
-    await runUnary(client, 1, warmupIterations);
-    await runBidiDuplex(client, 1, warmupIterations, timeoutMs, 0);
+    if (profileCase === "unary") {
+      await runUnary(client, 1, warmupIterations);
+    } else {
+      await runBidiDuplex(client, 1, warmupIterations, timeoutMs, 0);
+    }
   }
 
+  const cpuStarted = process.cpuUsage();
+  const resourceStarted = process.resourceUsage();
+  const rssStartedBytes = process.memoryUsage.rss();
   const started = process.hrtime.bigint();
   const operations =
     profileCase === "unary"
       ? await runUnary(client, concurrency, iterations)
       : await runBidiDuplex(client, concurrency, iterations, timeoutMs, recvLeadMs);
   const elapsedSeconds = Number(process.hrtime.bigint() - started) / 1_000_000_000;
+  const cpu = process.cpuUsage(cpuStarted);
+  const resource = process.resourceUsage();
+  const cpuSeconds = (cpu.user + cpu.system) / 1_000_000;
 
   console.log(
     JSON.stringify({
       profileCase,
       sample,
-      sendMode,
       concurrency,
       iterations,
       operations,
@@ -105,6 +103,18 @@ try {
       elapsedSeconds,
       operationsPerSecond: operations / elapsedSeconds,
       averageLatencyMs: (elapsedSeconds * 1000 * concurrency) / operations,
+      cpuUserSeconds: cpu.user / 1_000_000,
+      cpuSystemSeconds: cpu.system / 1_000_000,
+      cpuSeconds,
+      cpuUtilization: cpuSeconds / elapsedSeconds,
+      cpuMicrosecondsPerOperation: (cpuSeconds * 1_000_000) / operations,
+      rssStartedBytes,
+      rssEndedBytes: process.memoryUsage.rss(),
+      maxRssBytes: resource.maxRSS * 1024,
+      voluntaryContextSwitches:
+        resource.voluntaryContextSwitches - resourceStarted.voluntaryContextSwitches,
+      involuntaryContextSwitches:
+        resource.involuntaryContextSwitches - resourceStarted.involuntaryContextSwitches,
       status: "ok",
     }),
   );
@@ -114,7 +124,6 @@ try {
     JSON.stringify({
       profileCase,
       sample,
-      sendMode,
       concurrency,
       iterations,
       payloadBytes,

@@ -1,12 +1,10 @@
 import { Code, connect, createRoot, normalizeMetadata, unary } from "../../src/index.js";
 import type {
-  CallOptions,
   RpcRequestMessage,
   RpcResponseMessage,
   RpcStreamFrameMessage,
   Transport,
 } from "../../src/index.js";
-import type { NodeListenOptions } from "../../src/node.js";
 
 interface HelloMessage {
   value?: string;
@@ -30,10 +28,6 @@ const root = createRoot({
   },
 });
 const Hello = root.lookupType("hello.v1.Hello");
-const zeroCopyCall: CallOptions = { outboundZeroCopy: true };
-const zeroCopyServer: NodeListenOptions = { outboundZeroCopy: true };
-void zeroCopyServer;
-
 const transport: Transport = {
   async call(request: RpcRequestMessage): Promise<RpcResponseMessage> {
     const decoded = Hello.decode(request.body) as HelloMessage;
@@ -55,7 +49,6 @@ const reply = await unary<HelloMessage, HelloMessage>(
   Hello,
   Hello,
   { value: "Trev" },
-  zeroCopyCall,
 );
 
 reply.value?.toUpperCase();

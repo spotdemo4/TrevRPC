@@ -232,7 +232,7 @@ test("NodeServerCall commits response byte metrics only after successful sends",
   assert.equal(call.responseBodyLength, 5);
 });
 
-test("NodeServerCall opts unary and batched responses into zero-copy native sends", async () => {
+test("NodeServerCall uses native unary and batched send methods", async () => {
   const used = [];
   const nativeCall = {
     request: { ...unaryRequest(), kind: RpcKind.ServerStreaming },
@@ -240,24 +240,12 @@ test("NodeServerCall opts unary and batched responses into zero-copy native send
       used.push("respond");
       return Promise.resolve();
     },
-    _respondZeroCopy() {
-      used.push("respondZeroCopy");
-      return Promise.resolve();
-    },
     sendMessage() {
       used.push("sendMessage");
       return Promise.resolve();
     },
-    _sendMessageZeroCopy() {
-      used.push("sendMessageZeroCopy");
-      return Promise.resolve();
-    },
     sendMessages() {
       used.push("sendMessages");
-      return Promise.resolve();
-    },
-    _sendMessagesZeroCopy() {
-      used.push("sendMessagesZeroCopy");
       return Promise.resolve();
     },
     finishStream() {
@@ -265,13 +253,13 @@ test("NodeServerCall opts unary and batched responses into zero-copy native send
     },
     close() {},
   };
-  const call = new NodeServerCall(nativeCall, () => {}, { outboundZeroCopy: true });
+  const call = new NodeServerCall(nativeCall);
 
   await call.respond({ body: new Uint8Array([1]) });
   await call.sendMessage(new Uint8Array([2]));
   await call.sendMany([new Uint8Array([3]), new Uint8Array([4])]);
 
-  assert.deepEqual(used, ["respondZeroCopy", "sendMessageZeroCopy", "sendMessagesZeroCopy"]);
+  assert.deepEqual(used, ["respond", "sendMessage", "sendMessages"]);
 });
 
 function batchedBodies(batches) {

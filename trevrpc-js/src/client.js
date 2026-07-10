@@ -28,7 +28,6 @@ export function defaultCallOptions() {
     streamIdleTimeoutMs: 30_000,
     metadata: {},
     signal: undefined,
-    outboundZeroCopy: false,
   };
 }
 

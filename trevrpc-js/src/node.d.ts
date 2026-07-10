@@ -69,11 +69,6 @@ export interface NodeListenOptions extends RuntimeNodeConnectOptions {
   logger?: NodeServerLogger | ((event: NodeLogEvent) => void);
   maxStreamMessages?: number;
   streamIdleTimeoutMs?: number;
-  /**
-   * Borrows native server response buffers until their sends complete.
-   * Do not mutate, detach, transfer, or resize them before settlement. Defaults to false.
-   */
-  outboundZeroCopy?: boolean;
 }
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */

@@ -176,8 +176,6 @@ typedef struct call_work {
     char* service;
     char* method;
     uint8_t* body;
-    napi_ref body_ref;
-    bool borrowed_body;
     trevrpc_response* response;
 } call_work;
 
@@ -192,8 +190,6 @@ typedef struct start_stream_work {
     char* service;
     char* method;
     uint8_t* body;
-    napi_ref body_ref;
-    bool borrowed_body;
     trevrpc_stream* stream;
 } start_stream_work;
 
@@ -215,28 +211,22 @@ typedef struct stream_recv_many_work {
     bool eof;
 } stream_recv_many_work;
 
-typedef struct stream_send_borrowed_work {
+typedef struct stream_send_work {
     base_work base;
     native_stream* stream;
     bool acquired;
-    napi_ref body_ref;
-    const uint8_t* body;
-    uint8_t* owned_body;
+    uint8_t* body;
     size_t body_len;
-    bool borrowed;
-} stream_send_borrowed_work;
+} stream_send_work;
 
-typedef struct stream_send_many_borrowed_work {
+typedef struct stream_send_many_work {
     base_work base;
     native_stream* stream;
     bool acquired;
-    napi_ref* body_refs;
-    const uint8_t** bodies;
-    uint8_t* copied_bodies;
+    uint8_t* bodies;
     size_t* body_lens;
     size_t count;
-    bool borrowed;
-} stream_send_many_borrowed_work;
+} stream_send_many_work;
 
 typedef struct stream_finish_work {
     base_work base;
@@ -276,8 +266,6 @@ typedef struct call_response_work {
     bool acquired;
     trevrpc_call* c_call;
     trevrpc_response response;
-    napi_ref body_ref;
-    bool borrowed_body;
     bool terminal_released;
 } call_response_work;
 
@@ -313,40 +301,26 @@ typedef struct call_recv_many_work {
     bool eof;
 } call_recv_many_work;
 
-typedef struct call_send_borrowed_work {
+typedef struct call_send_work {
     base_work base;
     native_call* call;
     bool acquired;
     trevrpc_call* c_call;
-    napi_ref body_ref;
-    const uint8_t* body;
-    uint8_t* owned_body;
+    uint8_t* body;
     size_t body_len;
-    bool borrowed;
-} call_send_borrowed_work;
+} call_send_work;
 
-typedef struct call_send_many_borrowed_work {
+typedef struct call_send_many_work {
     base_work base;
     native_call* call;
     bool acquired;
     trevrpc_call* c_call;
-    napi_ref* body_refs;
-    const uint8_t** bodies;
-    uint8_t* copied_bodies;
+    uint8_t* bodies;
     size_t* body_lens;
     size_t count;
-    bool borrowed;
-} call_send_many_borrowed_work;
+} call_send_many_work;
 
 #ifdef TREVRPC_NODE_TEST_HOOKS
-typedef struct debug_body_ref_work {
-    base_work base;
-    napi_ref body_ref;
-    const uint8_t* body;
-    size_t body_len;
-    uint64_t checksum;
-} debug_body_ref_work;
-
 typedef struct debug_pending_resource {
     pthread_mutex_t mutex;
     size_t refs;
@@ -370,7 +344,6 @@ typedef struct server_call_event {
 
 #ifdef TREVRPC_NODE_TEST_HOOKS
 static atomic_uint_least64_t ExternalArrayBufferFinalizers = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t RetainedOutboundBodyRefs = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugPendingResourceCloses = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugPendingResourceFinalizers = ATOMIC_VAR_INIT(0);
 #endif
@@ -382,9 +355,6 @@ static void native_server_close_request(native_server* server);
 static void native_call_close_request(native_call* call);
 static void native_call_release(native_call* call, trevrpc_call* acquired_call);
 static void native_call_release_keep_wrapper(native_call* call, trevrpc_call* acquired_call);
-static bool create_body_ref(
-    napi_env env, napi_value value, const uint8_t** out_body, size_t* out_body_len, napi_ref* out_ref);
-
 static void clear_pending_exception(napi_env env) {
     bool pending = false;
     if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
@@ -623,39 +593,6 @@ static int bytes_arg_view(napi_env env, napi_value value, const uint8_t** out, s
     }
 
     return -EINVAL;
-}
-
-static bool arraybuffer_is_borrowable(napi_env env, napi_value arraybuffer) {
-    bool is_arraybuffer = false;
-    bool detached = false;
-    if (napi_is_arraybuffer(env, arraybuffer, &is_arraybuffer) != napi_ok || !is_arraybuffer ||
-        napi_is_detached_arraybuffer(env, arraybuffer, &detached) != napi_ok || detached) {
-        return false;
-    }
-
-    return true;
-}
-
-static int borrowed_bytes_arg_view(napi_env env, napi_value value, const uint8_t** out, size_t* out_len) {
-    bool is_typedarray = false;
-    if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok) {
-        return -EINVAL;
-    }
-    napi_value arraybuffer = value;
-    if (is_typedarray) {
-        napi_typedarray_type type = napi_uint8_array;
-        size_t len = 0;
-        void* data = NULL;
-        size_t byte_offset = 0;
-        if (napi_get_typedarray_info(env, value, &type, &len, &data, &arraybuffer, &byte_offset) != napi_ok ||
-            type != napi_uint8_array) {
-            return -EINVAL;
-        }
-    }
-    if (!arraybuffer_is_borrowable(env, arraybuffer)) {
-        return -EINVAL;
-    }
-    return bytes_arg_view(env, value, out, out_len);
 }
 
 static int copy_bytes_array_arg(napi_env env, napi_value value, uint8_t** out, size_t** out_lens, size_t* out_count) {
@@ -950,8 +887,7 @@ static int copy_required_string_property(napi_env env, napi_value object, const 
     return *out == NULL ? -ENOMEM : 0;
 }
 
-static int request_body_from_js(
-    napi_env env, napi_value object, bool borrow_body, uint8_t** body, size_t* body_len, napi_ref* body_ref) {
+static int request_body_from_js(napi_env env, napi_value object, uint8_t** body, size_t* body_len) {
     bool has_property = false;
     napi_has_named_property(env, object, "body", &has_property);
     if (!has_property) {
@@ -961,14 +897,6 @@ static int request_body_from_js(
     }
     napi_value property = NULL;
     napi_get_named_property(env, object, "body", &property);
-    if (borrow_body) {
-        const uint8_t* body_view = NULL;
-        if (!create_body_ref(env, property, &body_view, body_len, body_ref)) {
-            return -EINVAL;
-        }
-        *body = (uint8_t*)body_view;
-        return 0;
-    }
     return copy_bytes_arg(env, property, body, body_len);
 }
 
@@ -998,12 +926,10 @@ static int request_timeout_from_js(napi_env env, napi_value object, uint64_t* ti
 static int client_request_from_js(napi_env env,
     napi_value value,
     uint32_t default_kind,
-    bool borrow_body,
     trevrpc_request* request,
     char** service,
     char** method,
-    uint8_t** body,
-    napi_ref* body_ref) {
+    uint8_t** body) {
     napi_valuetype type = napi_undefined;
     napi_typeof(env, value, &type);
     if (type != napi_object) {
@@ -1023,7 +949,7 @@ static int client_request_from_js(napi_env env,
     if (err == 0) {
         request->method = *method;
         request->method_len = strlen(*method);
-        err = request_body_from_js(env, value, borrow_body, body, &request->body_len, body_ref);
+        err = request_body_from_js(env, value, body, &request->body_len);
     }
     if (err == 0) {
         request->body = *body;
@@ -1088,8 +1014,7 @@ static napi_value request_to_js(napi_env env, const trevrpc_request* request) {
     return object;
 }
 
-static int response_from_js(
-    napi_env env, napi_value value, bool borrow_body, trevrpc_response* response, napi_ref* body_ref) {
+static int response_from_js(napi_env env, napi_value value, trevrpc_response* response) {
     napi_valuetype type = napi_undefined;
     napi_typeof(env, value, &type);
     if (type == napi_undefined || type == napi_null) {
@@ -1121,20 +1046,13 @@ static int response_from_js(
     if (has_property) {
         napi_value body = NULL;
         napi_get_named_property(env, value, "body", &body);
-        int err = 0;
-        if (borrow_body) {
-            const uint8_t* body_view = NULL;
-            err = create_body_ref(env, body, &body_view, &response->body_len, body_ref) ? 0 : -EINVAL;
-            response->body = (uint8_t*)body_view;
-        } else {
-            uint8_t* bytes = NULL;
-            size_t bytes_len = 0;
-            err = copy_bytes_arg(env, body, &bytes, &bytes_len);
-            if (err == 0) {
-                err = trevrpc_response_set_body(response, bytes, bytes_len);
-            }
-            free(bytes);
+        uint8_t* bytes = NULL;
+        size_t bytes_len = 0;
+        int err = copy_bytes_arg(env, body, &bytes, &bytes_len);
+        if (err == 0) {
+            err = trevrpc_response_set_body(response, bytes, bytes_len);
         }
+        free(bytes);
         if (err != 0) {
             return err;
         }
@@ -1449,102 +1367,6 @@ static bool create_receiver_ref(napi_env env, napi_value receiver, napi_ref* out
         return false;
     }
     return true;
-}
-
-static bool create_body_ref(
-    napi_env env, napi_value value, const uint8_t** out_body, size_t* out_body_len, napi_ref* out_ref) {
-    *out_ref = NULL;
-    if (borrowed_bytes_arg_view(env, value, out_body, out_body_len) != 0) {
-        napi_throw_type_error(env, NULL, "zero-copy bodies require an attached Uint8Array or ArrayBuffer");
-        return false;
-    }
-    if (napi_create_reference(env, value, 1, out_ref) != napi_ok) {
-        napi_throw_error(env, NULL, "failed to hold zero-copy send body");
-        return false;
-    }
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&RetainedOutboundBodyRefs, 1, memory_order_relaxed);
-#endif
-    return true;
-}
-
-static void delete_body_ref(napi_env env, napi_ref ref) {
-    if (ref == NULL) {
-        return;
-    }
-    if (env != NULL) {
-        napi_delete_reference(env, ref);
-    }
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_sub_explicit(&RetainedOutboundBodyRefs, 1, memory_order_relaxed);
-#endif
-}
-
-static int create_body_refs_array(napi_env env,
-    napi_value value,
-    napi_ref** out_refs,
-    const uint8_t*** out_bodies,
-    size_t** out_lens,
-    size_t* out_count) {
-    *out_refs = NULL;
-    *out_bodies = NULL;
-    *out_lens = NULL;
-    *out_count = 0;
-
-    bool is_array = false;
-    uint32_t length = 0;
-    if (napi_is_array(env, value, &is_array) != napi_ok || !is_array ||
-        napi_get_array_length(env, value, &length) != napi_ok) {
-        return -EINVAL;
-    }
-    if (length == 0) {
-        return 0;
-    }
-
-    napi_ref* refs = calloc(length, sizeof(*refs));
-    const uint8_t** bodies = calloc(length, sizeof(*bodies));
-    size_t* lens = calloc(length, sizeof(*lens));
-    if (refs == NULL || bodies == NULL || lens == NULL) {
-        free(refs);
-        free(bodies);
-        free(lens);
-        return -ENOMEM;
-    }
-
-    uint32_t initialized = 0;
-    for (; initialized < length; initialized++) {
-        napi_value body = NULL;
-        if (napi_get_element(env, value, initialized, &body) != napi_ok ||
-            !create_body_ref(env, body, &bodies[initialized], &lens[initialized], &refs[initialized])) {
-            break;
-        }
-    }
-    if (initialized != length) {
-        for (uint32_t i = 0; i < initialized; i++) {
-            delete_body_ref(env, refs[i]);
-        }
-        free(refs);
-        free(bodies);
-        free(lens);
-        return -EINVAL;
-    }
-
-    *out_refs = refs;
-    *out_bodies = bodies;
-    *out_lens = lens;
-    *out_count = length;
-    return 0;
-}
-
-static void delete_body_refs_array(napi_env env, napi_ref* refs, const uint8_t** bodies, size_t* lens, size_t count) {
-    for (size_t i = 0; i < count; i++) {
-        if (refs[i] != NULL) {
-            delete_body_ref(env, refs[i]);
-        }
-    }
-    free(refs);
-    free(bodies);
-    free(lens);
 }
 
 static void native_client_maybe_destroy(native_client* client) {
@@ -2665,17 +2487,6 @@ static napi_value queue_work_managed(napi_env env,
     return promise;
 }
 
-#ifdef TREVRPC_NODE_TEST_HOOKS
-static napi_value queue_work_with_abandon(napi_env env,
-    base_work* work,
-    const char* name,
-    napi_async_execute_callback execute,
-    napi_async_complete_callback complete,
-    napi_async_complete_callback abandon) {
-    return queue_work_managed(env, work, name, execute, complete, abandon, NULL);
-}
-#endif
-
 static napi_value queue_work(napi_env env,
     base_work* work,
     const char* name,
@@ -3477,10 +3288,7 @@ static void call_execute(napi_env env, void* data) {
     work->acquired = true;
     trevrpc_cancellation* cancellation =
         work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    work->base.err =
-        work->borrowed_body
-            ? trevrpc_client_call_request_borrowed_cancellable(client, &work->request, cancellation, &work->response)
-            : trevrpc_client_call_request_cancellable(client, &work->request, cancellation, &work->response);
+    work->base.err = trevrpc_client_call_request_cancellable(client, &work->request, cancellation, &work->response);
 }
 
 static void call_complete(napi_env env, napi_status status, void* data) {
@@ -3501,17 +3309,12 @@ static void call_complete(napi_env env, napi_status status, void* data) {
     if (env != NULL && work->cancellation_ref != NULL) {
         napi_delete_reference(env, work->cancellation_ref);
     }
-    if (work->body_ref != NULL) {
-        delete_body_ref(env, work->body_ref);
-    }
     trevrpc_cancellation_free(work->owned_cancellation);
     native_work_delete(work->base.work);
     trevrpc_metadata_reset(&work->request.metadata);
     free(work->service);
     free(work->method);
-    if (!work->borrowed_body) {
-        free(work->body);
-    }
+    free(work->body);
     free(work);
 }
 
@@ -3521,12 +3324,12 @@ static void call_work_cancel(void* data) {
         work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation);
 }
 
-static napi_value native_client_call_internal(napi_env env, napi_callback_info info, bool borrow_body) {
+static napi_value native_client_call(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value args[4];
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if ((borrow_body && argc != 1 && argc != 2) || (!borrow_body && argc != 1 && argc != 2 && argc != 3 && argc != 4)) {
+    if (argc != 1 && argc != 2 && argc != 3 && argc != 4) {
         napi_throw_type_error(env, NULL, "call requires a request object or service, method, and body");
         return NULL;
     }
@@ -3535,24 +3338,17 @@ static napi_value native_client_call_internal(napi_env env, napi_callback_info i
         napi_throw_error(env, NULL, "failed to allocate call work");
         return NULL;
     }
-    work->borrowed_body = borrow_body;
     if (!unwrap_native_client(env, this_arg, &work->client) ||
         !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
         free(work);
         return NULL;
     }
-    int err = argc <= 2
-                  ? client_request_from_js(env,
-                        args[0],
-                        TREVRPC_RPC_KIND_UNARY,
-                        borrow_body,
-                        &work->request,
-                        &work->service,
-                        &work->method,
-                        &work->body,
-                        &work->body_ref)
-                  : legacy_request_from_args(
-                        env, args, TREVRPC_RPC_KIND_UNARY, &work->request, &work->service, &work->method, &work->body);
+    int err =
+        argc <= 2
+            ? client_request_from_js(
+                  env, args[0], TREVRPC_RPC_KIND_UNARY, &work->request, &work->service, &work->method, &work->body)
+            : legacy_request_from_args(
+                  env, args, TREVRPC_RPC_KIND_UNARY, &work->request, &work->service, &work->method, &work->body);
     if (err == 0) {
         err =
             optional_cancellation_arg(env, argc, args, argc <= 2 ? 1 : 3, &work->cancellation, &work->cancellation_ref);
@@ -3568,36 +3364,17 @@ static napi_value native_client_call_internal(napi_env env, napi_callback_info i
         if (work->cancellation_ref != NULL) {
             napi_delete_reference(env, work->cancellation_ref);
         }
-        if (work->body_ref != NULL) {
-            delete_body_ref(env, work->body_ref);
-        }
         trevrpc_cancellation_free(work->owned_cancellation);
         trevrpc_metadata_reset(&work->request.metadata);
         free(work->service);
         free(work->method);
-        if (!work->borrowed_body) {
-            free(work->body);
-        }
+        free(work->body);
         free(work);
         napi_throw_type_error(env, NULL, "invalid call arguments");
         return NULL;
     }
     work->base.err = native_client_work_reserve(work->client, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        borrow_body ? "callZeroCopy" : "call",
-        call_execute,
-        call_complete,
-        call_complete,
-        call_work_cancel);
-}
-
-static napi_value native_client_call(napi_env env, napi_callback_info info) {
-    return native_client_call_internal(env, info, false);
-}
-
-static napi_value native_client_call_zero_copy(napi_env env, napi_callback_info info) {
-    return native_client_call_internal(env, info, true);
+    return queue_work_managed(env, &work->base, "call", call_execute, call_complete, call_complete, call_work_cancel);
 }
 
 static void start_stream_execute(napi_env env, void* data) {
@@ -3611,10 +3388,8 @@ static void start_stream_execute(napi_env env, void* data) {
     work->acquired = true;
     trevrpc_cancellation* cancellation =
         work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    work->base.err = work->borrowed_body ? trevrpc_client_start_stream_request_borrowed_cancellable(
-                                               client, &work->request, cancellation, &work->stream)
-                                         : trevrpc_client_start_stream_request_cancellable(
-                                               client, &work->request, cancellation, &work->stream);
+    work->base.err =
+        trevrpc_client_start_stream_request_cancellable(client, &work->request, cancellation, &work->stream);
 }
 
 static void start_stream_complete(napi_env env, napi_status status, void* data) {
@@ -3682,17 +3457,12 @@ static void start_stream_complete(napi_env env, napi_status status, void* data) 
     if (env != NULL && work->cancellation_ref != NULL) {
         napi_delete_reference(env, work->cancellation_ref);
     }
-    if (work->body_ref != NULL) {
-        delete_body_ref(env, work->body_ref);
-    }
     trevrpc_cancellation_free(work->owned_cancellation);
     native_work_delete(work->base.work);
     trevrpc_metadata_reset(&work->request.metadata);
     free(work->service);
     free(work->method);
-    if (!work->borrowed_body) {
-        free(work->body);
-    }
+    free(work->body);
     free(work);
 }
 
@@ -3702,12 +3472,12 @@ static void start_stream_work_cancel(void* data) {
         work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation);
 }
 
-static napi_value native_client_start_stream_internal(napi_env env, napi_callback_info info, bool borrow_body) {
+static napi_value native_client_start_stream(napi_env env, napi_callback_info info) {
     size_t argc = 5;
     napi_value args[5];
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if ((borrow_body && argc != 1 && argc != 2) || (!borrow_body && argc != 1 && argc != 2 && argc != 4 && argc != 5)) {
+    if (argc != 1 && argc != 2 && argc != 4 && argc != 5) {
         napi_throw_type_error(env, NULL, "startStream requires a request object or service, method, kind, and body");
         return NULL;
     }
@@ -3716,7 +3486,6 @@ static napi_value native_client_start_stream_internal(napi_env env, napi_callbac
         napi_throw_error(env, NULL, "failed to allocate startStream work");
         return NULL;
     }
-    work->borrowed_body = borrow_body;
     if (!unwrap_native_client(env, this_arg, &work->client) ||
         !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
         free(work);
@@ -3727,12 +3496,10 @@ static napi_value native_client_start_stream_internal(napi_env env, napi_callbac
         err = client_request_from_js(env,
             args[0],
             TREVRPC_RPC_KIND_SERVER_STREAMING,
-            borrow_body,
             &work->request,
             &work->service,
             &work->method,
-            &work->body,
-            &work->body_ref);
+            &work->body);
     } else {
         uint32_t kind = 0;
         if (napi_get_value_uint32(env, args[2], &kind) != napi_ok) {
@@ -3759,16 +3526,11 @@ static napi_value native_client_start_stream_internal(napi_env env, napi_callbac
         if (work->cancellation_ref != NULL) {
             napi_delete_reference(env, work->cancellation_ref);
         }
-        if (work->body_ref != NULL) {
-            delete_body_ref(env, work->body_ref);
-        }
         trevrpc_cancellation_free(work->owned_cancellation);
         trevrpc_metadata_reset(&work->request.metadata);
         free(work->service);
         free(work->method);
-        if (!work->borrowed_body) {
-            free(work->body);
-        }
+        free(work->body);
         free(work);
         napi_throw_type_error(env, NULL, "invalid startStream arguments");
         return NULL;
@@ -3776,19 +3538,11 @@ static napi_value native_client_start_stream_internal(napi_env env, napi_callbac
     work->base.err = native_client_work_reserve(work->client, &work->base);
     return queue_work_managed(env,
         &work->base,
-        borrow_body ? "startStreamZeroCopy" : "startStream",
+        "startStream",
         start_stream_execute,
         start_stream_complete,
         start_stream_complete,
         start_stream_work_cancel);
-}
-
-static napi_value native_client_start_stream(napi_env env, napi_callback_info info) {
-    return native_client_start_stream_internal(env, info, false);
-}
-
-static napi_value native_client_start_stream_zero_copy(napi_env env, napi_callback_info info) {
-    return native_client_start_stream_internal(env, info, true);
 }
 
 static napi_value native_client_close(napi_env env, napi_callback_info info) {
@@ -3824,10 +3578,10 @@ static bool native_stream_wait_timed_out(native_stream* stream, uint64_t wait_st
     return timed_out;
 }
 
-static void stream_send_borrowed_execute(napi_env env, void* data);
-static void stream_send_borrowed_complete(napi_env env, napi_status status, void* data);
-static void stream_send_many_borrowed_execute(napi_env env, void* data);
-static void stream_send_many_borrowed_complete(napi_env env, napi_status status, void* data);
+static void stream_send_execute(napi_env env, void* data);
+static void stream_send_complete(napi_env env, napi_status status, void* data);
+static void stream_send_many_execute(napi_env env, void* data);
+static void stream_send_many_complete(napi_env env, napi_status status, void* data);
 
 static napi_value native_stream_send_message(napi_env env, napi_callback_info info) {
     size_t argc = 1;
@@ -3838,7 +3592,7 @@ static napi_value native_stream_send_message(napi_env env, napi_callback_info in
         napi_throw_type_error(env, NULL, "sendMessage requires a body");
         return NULL;
     }
-    stream_send_borrowed_work* work = calloc(1, sizeof(*work));
+    stream_send_work* work = calloc(1, sizeof(*work));
     if (work == NULL) {
         napi_throw_error(env, NULL, "failed to allocate send work");
         return NULL;
@@ -3848,10 +3602,10 @@ static napi_value native_stream_send_message(napi_env env, napi_callback_info in
         free(work);
         return NULL;
     }
-    int err = copy_bytes_arg(env, args[0], &work->owned_body, &work->body_len);
+    int err = copy_bytes_arg(env, args[0], &work->body, &work->body_len);
     if (err != 0) {
         napi_delete_reference(env, work->base.receiver_ref);
-        free(work->owned_body);
+        free(work->body);
         free(work);
         if (err == -ENOMEM) {
             napi_throw_error(env, NULL, "failed to allocate sendMessage body");
@@ -3860,20 +3614,19 @@ static napi_value native_stream_send_message(napi_env env, napi_callback_info in
         }
         return NULL;
     }
-    work->body = work->owned_body;
     work->base.err = native_stream_outbound_work_reserve(work->stream, &work->base);
     return queue_work_managed(env,
         &work->base,
         "sendMessage",
-        stream_send_borrowed_execute,
-        stream_send_borrowed_complete,
-        stream_send_borrowed_complete,
+        stream_send_execute,
+        stream_send_complete,
+        stream_send_complete,
         native_stream_work_cancel);
 }
 
-static void stream_send_borrowed_execute(napi_env env, void* data) {
+static void stream_send_execute(napi_env env, void* data) {
     (void)env;
-    stream_send_borrowed_work* work = data;
+    stream_send_work* work = data;
     if (!native_stream_outbound_is_head(work->stream, &work->base)) {
         work->base.retry = true;
         return;
@@ -3890,75 +3643,31 @@ static void stream_send_borrowed_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    work->base.err = work->borrowed ? trevrpc_stream_send_message_borrowed_wait(stream, work->body, work->body_len)
-                                    : trevrpc_stream_send_message(stream, work->body, work->body_len);
+    work->base.err = trevrpc_stream_send_message(stream, work->body, work->body_len);
     native_stream_operation_release(work->stream);
     work->acquired = false;
     native_stream_outbound_finish(work->stream, &work->base);
 }
 
-static void stream_send_borrowed_complete(napi_env env, napi_status status, void* data) {
-    stream_send_borrowed_work* work = data;
+static void stream_send_complete(napi_env env, napi_status status, void* data) {
+    stream_send_work* work = data;
     if (env != NULL && status == napi_ok && work->base.err == 0) {
         napi_value undefined = NULL;
         napi_get_undefined(env, &undefined);
         napi_resolve_deferred(env, work->base.deferred, undefined);
     } else if (env != NULL) {
-        reject_native_error(env,
-            work->base.deferred,
-            status == napi_ok ? work->base.err : -ECANCELED,
-            work->borrowed ? "sendMessageZeroCopy" : "sendMessage");
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessage");
     }
     if (work->acquired) {
         native_stream_operation_release(work->stream);
     }
     native_stream_outbound_finish(work->stream, &work->base);
-    if (work->body_ref != NULL) {
-        delete_body_ref(env, work->body_ref);
-    }
-    free(work->owned_body);
+    free(work->body);
     if (env != NULL && work->base.receiver_ref != NULL) {
         napi_delete_reference(env, work->base.receiver_ref);
     }
     native_work_delete(work->base.work);
     free(work);
-}
-
-static napi_value native_stream_send_message_zero_copy(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "_sendMessageZeroCopy requires a body");
-        return NULL;
-    }
-    stream_send_borrowed_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate zero-copy send work");
-        return NULL;
-    }
-    if (!unwrap_native_stream(env, this_arg, &work->stream) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref) ||
-        !create_body_ref(env, args[0], &work->body, &work->body_len, &work->body_ref)) {
-        if (work->body_ref != NULL) {
-            delete_body_ref(env, work->body_ref);
-        }
-        if (work->base.receiver_ref != NULL) {
-            napi_delete_reference(env, work->base.receiver_ref);
-        }
-        free(work);
-        return NULL;
-    }
-    work->borrowed = true;
-    work->base.err = native_stream_outbound_work_reserve(work->stream, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "sendMessageZeroCopy",
-        stream_send_borrowed_execute,
-        stream_send_borrowed_complete,
-        stream_send_borrowed_complete,
-        native_stream_work_cancel);
 }
 
 static napi_value native_stream_send_messages(napi_env env, napi_callback_info info) {
@@ -3970,7 +3679,7 @@ static napi_value native_stream_send_messages(napi_env env, napi_callback_info i
         napi_throw_type_error(env, NULL, "sendMessages requires an array of bodies");
         return NULL;
     }
-    stream_send_many_borrowed_work* work = calloc(1, sizeof(*work));
+    stream_send_many_work* work = calloc(1, sizeof(*work));
     if (work == NULL) {
         napi_throw_error(env, NULL, "failed to allocate sendMessages work");
         return NULL;
@@ -3980,10 +3689,10 @@ static napi_value native_stream_send_messages(napi_env env, napi_callback_info i
         free(work);
         return NULL;
     }
-    int err = copy_bytes_array_arg(env, args[0], &work->copied_bodies, &work->body_lens, &work->count);
+    int err = copy_bytes_array_arg(env, args[0], &work->bodies, &work->body_lens, &work->count);
     if (err != 0) {
         napi_delete_reference(env, work->base.receiver_ref);
-        free(work->copied_bodies);
+        free(work->bodies);
         free(work->body_lens);
         free(work);
         if (err == -ENOMEM) {
@@ -3997,15 +3706,15 @@ static napi_value native_stream_send_messages(napi_env env, napi_callback_info i
     return queue_work_managed(env,
         &work->base,
         "sendMessages",
-        stream_send_many_borrowed_execute,
-        stream_send_many_borrowed_complete,
-        stream_send_many_borrowed_complete,
+        stream_send_many_execute,
+        stream_send_many_complete,
+        stream_send_many_complete,
         native_stream_work_cancel);
 }
 
-static void stream_send_many_borrowed_execute(napi_env env, void* data) {
+static void stream_send_many_execute(napi_env env, void* data) {
     (void)env;
-    stream_send_many_borrowed_work* work = data;
+    stream_send_many_work* work = data;
     if (!native_stream_outbound_is_head(work->stream, &work->base)) {
         work->base.retry = true;
         return;
@@ -4022,81 +3731,32 @@ static void stream_send_many_borrowed_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    work->base.err =
-        work->borrowed ? trevrpc_stream_send_messages_borrowed_wait(stream, work->bodies, work->body_lens, work->count)
-                       : trevrpc_stream_send_messages(stream, work->copied_bodies, work->body_lens, work->count);
+    work->base.err = trevrpc_stream_send_messages(stream, work->bodies, work->body_lens, work->count);
     native_stream_operation_release(work->stream);
     work->acquired = false;
     native_stream_outbound_finish(work->stream, &work->base);
 }
 
-static void stream_send_many_borrowed_complete(napi_env env, napi_status status, void* data) {
-    stream_send_many_borrowed_work* work = data;
+static void stream_send_many_complete(napi_env env, napi_status status, void* data) {
+    stream_send_many_work* work = data;
     if (env != NULL && status == napi_ok && work->base.err == 0) {
         napi_value undefined = NULL;
         napi_get_undefined(env, &undefined);
         napi_resolve_deferred(env, work->base.deferred, undefined);
     } else if (env != NULL) {
-        reject_native_error(env,
-            work->base.deferred,
-            status == napi_ok ? work->base.err : -ECANCELED,
-            work->borrowed ? "sendMessagesZeroCopy" : "sendMessages");
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessages");
     }
     if (work->acquired) {
         native_stream_operation_release(work->stream);
     }
     native_stream_outbound_finish(work->stream, &work->base);
-    if (work->borrowed) {
-        delete_body_refs_array(env, work->body_refs, work->bodies, work->body_lens, work->count);
-    } else {
-        free(work->copied_bodies);
-        free(work->body_lens);
-    }
+    free(work->bodies);
+    free(work->body_lens);
     if (env != NULL && work->base.receiver_ref != NULL) {
         napi_delete_reference(env, work->base.receiver_ref);
     }
     native_work_delete(work->base.work);
     free(work);
-}
-
-static napi_value native_stream_send_messages_zero_copy(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "_sendMessagesZeroCopy requires an array of bodies");
-        return NULL;
-    }
-
-    stream_send_many_borrowed_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate zero-copy batch send work");
-        return NULL;
-    }
-    int err = 0;
-    if (!unwrap_native_stream(env, this_arg, &work->stream) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    work->borrowed = true;
-    err = create_body_refs_array(env, args[0], &work->body_refs, &work->bodies, &work->body_lens, &work->count);
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        delete_body_refs_array(env, work->body_refs, work->bodies, work->body_lens, work->count);
-        free(work);
-        throw_if_no_pending_exception(env, "invalid zero-copy sendMessages bodies");
-        return NULL;
-    }
-    work->base.err = native_stream_outbound_work_reserve(work->stream, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "sendMessagesZeroCopy",
-        stream_send_many_borrowed_execute,
-        stream_send_many_borrowed_complete,
-        stream_send_many_borrowed_complete,
-        native_stream_work_cancel);
 }
 
 static void stream_finish_execute(napi_env env, void* data) {
@@ -4422,10 +4082,10 @@ static bool native_call_wait_timed_out(native_call* call, uint64_t wait_started_
     return timed_out;
 }
 
-static void call_send_borrowed_execute(napi_env env, void* data);
-static void call_send_borrowed_complete(napi_env env, napi_status status, void* data);
-static void call_send_many_borrowed_execute(napi_env env, void* data);
-static void call_send_many_borrowed_complete(napi_env env, napi_status status, void* data);
+static void call_send_execute(napi_env env, void* data);
+static void call_send_complete(napi_env env, napi_status status, void* data);
+static void call_send_many_execute(napi_env env, void* data);
+static void call_send_many_complete(napi_env env, napi_status status, void* data);
 
 static void call_respond_execute(napi_env env, void* data) {
     (void)env;
@@ -4468,22 +4128,15 @@ static void call_respond_complete(napi_env env, napi_status status, void* data) 
         native_call_terminal_abandon(work->call, &work->base);
     }
     native_call_outbound_finish(work->call, &work->base);
-    if (work->body_ref != NULL) {
-        delete_body_ref(env, work->body_ref);
-    }
     if (env != NULL && work->base.receiver_ref != NULL) {
         napi_delete_reference(env, work->base.receiver_ref);
     }
     native_work_delete(work->base.work);
-    if (work->borrowed_body) {
-        work->response.body = NULL;
-        work->response.body_len = 0;
-    }
     trevrpc_response_reset(&work->response);
     free(work);
 }
 
-static napi_value native_call_respond_internal(napi_env env, napi_callback_info info, bool borrow_body) {
+static napi_value native_call_respond(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
     napi_value this_arg = NULL;
@@ -4497,22 +4150,14 @@ static napi_value native_call_respond_internal(napi_env env, napi_callback_info 
         napi_throw_error(env, NULL, "failed to allocate respond work");
         return NULL;
     }
-    work->borrowed_body = borrow_body;
     if (!unwrap_native_call(env, this_arg, &work->call) ||
         !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
         free(work);
         return NULL;
     }
-    int err = response_from_js(env, args[0], borrow_body, &work->response, &work->body_ref);
+    int err = response_from_js(env, args[0], &work->response);
     if (err != 0) {
         napi_delete_reference(env, work->base.receiver_ref);
-        if (work->body_ref != NULL) {
-            delete_body_ref(env, work->body_ref);
-        }
-        if (work->borrowed_body) {
-            work->response.body = NULL;
-            work->response.body_len = 0;
-        }
         trevrpc_response_reset(&work->response);
         free(work);
         throw_if_no_pending_exception(env, "invalid response object");
@@ -4521,19 +4166,11 @@ static napi_value native_call_respond_internal(napi_env env, napi_callback_info 
     work->base.err = native_call_outbound_work_reserve(work->call, &work->base);
     return queue_work_managed(env,
         &work->base,
-        borrow_body ? "respondZeroCopy" : "respond",
+        "respond",
         call_respond_execute,
         call_respond_complete,
         call_respond_complete,
         native_call_work_cancel);
-}
-
-static napi_value native_call_respond(napi_env env, napi_callback_info info) {
-    return native_call_respond_internal(env, info, false);
-}
-
-static napi_value native_call_respond_zero_copy(napi_env env, napi_callback_info info) {
-    return native_call_respond_internal(env, info, true);
 }
 
 static napi_value native_call_send_message(napi_env env, napi_callback_info info) {
@@ -4545,7 +4182,7 @@ static napi_value native_call_send_message(napi_env env, napi_callback_info info
         napi_throw_type_error(env, NULL, "sendMessage requires a body");
         return NULL;
     }
-    call_send_borrowed_work* work = calloc(1, sizeof(*work));
+    call_send_work* work = calloc(1, sizeof(*work));
     if (work == NULL) {
         napi_throw_error(env, NULL, "failed to allocate send work");
         return NULL;
@@ -4555,10 +4192,10 @@ static napi_value native_call_send_message(napi_env env, napi_callback_info info
         free(work);
         return NULL;
     }
-    int err = copy_bytes_arg(env, args[0], &work->owned_body, &work->body_len);
+    int err = copy_bytes_arg(env, args[0], &work->body, &work->body_len);
     if (err != 0) {
         napi_delete_reference(env, work->base.receiver_ref);
-        free(work->owned_body);
+        free(work->body);
         free(work);
         if (err == -ENOMEM) {
             napi_throw_error(env, NULL, "failed to allocate sendMessage body");
@@ -4567,20 +4204,19 @@ static napi_value native_call_send_message(napi_env env, napi_callback_info info
         }
         return NULL;
     }
-    work->body = work->owned_body;
     work->base.err = native_call_outbound_work_reserve(work->call, &work->base);
     return queue_work_managed(env,
         &work->base,
         "sendMessage",
-        call_send_borrowed_execute,
-        call_send_borrowed_complete,
-        call_send_borrowed_complete,
+        call_send_execute,
+        call_send_complete,
+        call_send_complete,
         native_call_work_cancel);
 }
 
-static void call_send_borrowed_execute(napi_env env, void* data) {
+static void call_send_execute(napi_env env, void* data) {
     (void)env;
-    call_send_borrowed_work* work = data;
+    call_send_work* work = data;
     if (!native_call_outbound_is_head(work->call, &work->base)) {
         work->base.retry = true;
         return;
@@ -4595,77 +4231,33 @@ static void call_send_borrowed_execute(napi_env env, void* data) {
     }
     work->acquired = true;
     trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
-    work->base.err = stream == NULL   ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
-                     : work->borrowed ? trevrpc_stream_send_message_borrowed_wait(stream, work->body, work->body_len)
-                                      : trevrpc_stream_send_message(stream, work->body, work->body_len);
+    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
+                                    : trevrpc_stream_send_message(stream, work->body, work->body_len);
     native_call_work_operation_release(work->call, work->c_call);
     work->c_call = NULL;
     work->acquired = false;
     native_call_outbound_finish(work->call, &work->base);
 }
 
-static void call_send_borrowed_complete(napi_env env, napi_status status, void* data) {
-    call_send_borrowed_work* work = data;
+static void call_send_complete(napi_env env, napi_status status, void* data) {
+    call_send_work* work = data;
     if (env != NULL && status == napi_ok && work->base.err == 0) {
         napi_value undefined = NULL;
         napi_get_undefined(env, &undefined);
         napi_resolve_deferred(env, work->base.deferred, undefined);
     } else if (env != NULL) {
-        reject_native_error(env,
-            work->base.deferred,
-            status == napi_ok ? work->base.err : -ECANCELED,
-            work->borrowed ? "sendMessageZeroCopy" : "sendMessage");
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessage");
     }
     if (work->acquired) {
         native_call_work_operation_release(work->call, work->c_call);
     }
     native_call_outbound_finish(work->call, &work->base);
-    if (work->body_ref != NULL) {
-        delete_body_ref(env, work->body_ref);
-    }
-    free(work->owned_body);
+    free(work->body);
     if (env != NULL && work->base.receiver_ref != NULL) {
         napi_delete_reference(env, work->base.receiver_ref);
     }
     native_work_delete(work->base.work);
     free(work);
-}
-
-static napi_value native_call_send_message_zero_copy(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "_sendMessageZeroCopy requires a body");
-        return NULL;
-    }
-    call_send_borrowed_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate zero-copy send work");
-        return NULL;
-    }
-    if (!unwrap_native_call(env, this_arg, &work->call) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref) ||
-        !create_body_ref(env, args[0], &work->body, &work->body_len, &work->body_ref)) {
-        if (work->body_ref != NULL) {
-            delete_body_ref(env, work->body_ref);
-        }
-        if (work->base.receiver_ref != NULL) {
-            napi_delete_reference(env, work->base.receiver_ref);
-        }
-        free(work);
-        return NULL;
-    }
-    work->borrowed = true;
-    work->base.err = native_call_outbound_work_reserve(work->call, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "sendMessageZeroCopy",
-        call_send_borrowed_execute,
-        call_send_borrowed_complete,
-        call_send_borrowed_complete,
-        native_call_work_cancel);
 }
 
 static napi_value native_call_send_messages(napi_env env, napi_callback_info info) {
@@ -4677,7 +4269,7 @@ static napi_value native_call_send_messages(napi_env env, napi_callback_info inf
         napi_throw_type_error(env, NULL, "sendMessages requires an array of bodies");
         return NULL;
     }
-    call_send_many_borrowed_work* work = calloc(1, sizeof(*work));
+    call_send_many_work* work = calloc(1, sizeof(*work));
     if (work == NULL) {
         napi_throw_error(env, NULL, "failed to allocate sendMessages work");
         return NULL;
@@ -4687,10 +4279,10 @@ static napi_value native_call_send_messages(napi_env env, napi_callback_info inf
         free(work);
         return NULL;
     }
-    int err = copy_bytes_array_arg(env, args[0], &work->copied_bodies, &work->body_lens, &work->count);
+    int err = copy_bytes_array_arg(env, args[0], &work->bodies, &work->body_lens, &work->count);
     if (err != 0) {
         napi_delete_reference(env, work->base.receiver_ref);
-        free(work->copied_bodies);
+        free(work->bodies);
         free(work->body_lens);
         free(work);
         if (err == -ENOMEM) {
@@ -4704,15 +4296,15 @@ static napi_value native_call_send_messages(napi_env env, napi_callback_info inf
     return queue_work_managed(env,
         &work->base,
         "sendMessages",
-        call_send_many_borrowed_execute,
-        call_send_many_borrowed_complete,
-        call_send_many_borrowed_complete,
+        call_send_many_execute,
+        call_send_many_complete,
+        call_send_many_complete,
         native_call_work_cancel);
 }
 
-static void call_send_many_borrowed_execute(napi_env env, void* data) {
+static void call_send_many_execute(napi_env env, void* data) {
     (void)env;
-    call_send_many_borrowed_work* work = data;
+    call_send_many_work* work = data;
     if (!native_call_outbound_is_head(work->call, &work->base)) {
         work->base.retry = true;
         return;
@@ -4727,83 +4319,34 @@ static void call_send_many_borrowed_execute(napi_env env, void* data) {
     }
     work->acquired = true;
     trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
-    work->base.err =
-        stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
-        : work->borrowed
-            ? trevrpc_stream_send_messages_borrowed_wait(stream, work->bodies, work->body_lens, work->count)
-            : trevrpc_stream_send_messages(stream, work->copied_bodies, work->body_lens, work->count);
+    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
+                                    : trevrpc_stream_send_messages(stream, work->bodies, work->body_lens, work->count);
     native_call_work_operation_release(work->call, work->c_call);
     work->c_call = NULL;
     work->acquired = false;
     native_call_outbound_finish(work->call, &work->base);
 }
 
-static void call_send_many_borrowed_complete(napi_env env, napi_status status, void* data) {
-    call_send_many_borrowed_work* work = data;
+static void call_send_many_complete(napi_env env, napi_status status, void* data) {
+    call_send_many_work* work = data;
     if (env != NULL && status == napi_ok && work->base.err == 0) {
         napi_value undefined = NULL;
         napi_get_undefined(env, &undefined);
         napi_resolve_deferred(env, work->base.deferred, undefined);
     } else if (env != NULL) {
-        reject_native_error(env,
-            work->base.deferred,
-            status == napi_ok ? work->base.err : -ECANCELED,
-            work->borrowed ? "sendMessagesZeroCopy" : "sendMessages");
+        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessages");
     }
     if (work->acquired) {
         native_call_work_operation_release(work->call, work->c_call);
     }
     native_call_outbound_finish(work->call, &work->base);
-    if (work->borrowed) {
-        delete_body_refs_array(env, work->body_refs, work->bodies, work->body_lens, work->count);
-    } else {
-        free(work->copied_bodies);
-        free(work->body_lens);
-    }
+    free(work->bodies);
+    free(work->body_lens);
     if (env != NULL && work->base.receiver_ref != NULL) {
         napi_delete_reference(env, work->base.receiver_ref);
     }
     native_work_delete(work->base.work);
     free(work);
-}
-
-static napi_value native_call_send_messages_zero_copy(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "_sendMessagesZeroCopy requires an array of bodies");
-        return NULL;
-    }
-
-    call_send_many_borrowed_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate zero-copy batch send work");
-        return NULL;
-    }
-    if (!unwrap_native_call(env, this_arg, &work->call) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int err = create_body_refs_array(env, args[0], &work->body_refs, &work->bodies, &work->body_lens, &work->count);
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        delete_body_refs_array(env, work->body_refs, work->bodies, work->body_lens, work->count);
-        free(work);
-        throw_if_no_pending_exception(env, "invalid zero-copy sendMessages bodies");
-        return NULL;
-    }
-    work->borrowed = true;
-    work->base.err = native_call_outbound_work_reserve(work->call, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "sendMessagesZeroCopy",
-        call_send_many_borrowed_execute,
-        call_send_many_borrowed_complete,
-        call_send_many_borrowed_complete,
-        native_call_work_cancel);
 }
 
 static void call_finish_execute(napi_env env, void* data) {
@@ -5367,14 +4910,6 @@ static napi_value debug_external_arraybuffer_finalizers(napi_env env, napi_callb
     return value;
 }
 
-static napi_value debug_retained_outbound_body_refs(napi_env env, napi_callback_info info) {
-    (void)info;
-    uint64_t count = atomic_load_explicit(&RetainedOutboundBodyRefs, memory_order_relaxed);
-    napi_value value = NULL;
-    napi_create_double(env, (double)count, &value);
-    return value;
-}
-
 static napi_value debug_make_borrowed_response(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -5438,63 +4973,6 @@ static napi_value debug_make_borrowed_stream_body_batch(napi_env env, napi_callb
     return object;
 }
 
-static void debug_body_ref_execute(napi_env env, void* data) {
-    (void)env;
-    debug_body_ref_work* work = data;
-    struct timespec delay = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
-    (void)nanosleep(&delay, NULL);
-
-    uint64_t checksum = 0;
-    for (size_t i = 0; i < work->body_len; i++) {
-        checksum = (checksum * 131u) + work->body[i];
-    }
-    work->checksum = checksum;
-}
-
-static void debug_body_ref_complete(napi_env env, napi_status status, void* data) {
-    debug_body_ref_work* work = data;
-    if (env != NULL && status == napi_ok) {
-        napi_value checksum = NULL;
-        napi_create_double(env, (double)work->checksum, &checksum);
-        napi_resolve_deferred(env, work->base.deferred, checksum);
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, -ECANCELED, "_debugRetainBodyUntilAsyncComplete");
-    }
-    if (work->body_ref != NULL) {
-        delete_body_ref(env, work->body_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value debug_retain_body_until_async_complete(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "_debugRetainBodyUntilAsyncComplete requires a body");
-        return NULL;
-    }
-
-    debug_body_ref_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate debug body-ref work");
-        return NULL;
-    }
-    if (!create_body_ref(env, args[0], &work->body, &work->body_len, &work->body_ref)) {
-        if (work->body_ref != NULL) {
-            delete_body_ref(env, work->body_ref);
-        }
-        free(work);
-        return NULL;
-    }
-    return queue_work_with_abandon(env,
-        &work->base,
-        "_debugRetainBodyUntilAsyncComplete",
-        debug_body_ref_execute,
-        debug_body_ref_complete,
-        debug_body_ref_complete);
-}
 #endif
 
 static napi_value init(napi_env env, napi_value exports) {
@@ -5509,9 +4987,7 @@ static napi_value init(napi_env env, napi_value exports) {
 
     napi_property_descriptor client_methods[] = {
         {"call", NULL, native_client_call, NULL, NULL, NULL, napi_default, NULL},
-        {"_callZeroCopy", NULL, native_client_call_zero_copy, NULL, NULL, NULL, napi_default, NULL},
         {"startStream", NULL, native_client_start_stream, NULL, NULL, NULL, napi_default, NULL},
-        {"_startStreamZeroCopy", NULL, native_client_start_stream_zero_copy, NULL, NULL, NULL, napi_default, NULL},
         {"createCancellation", NULL, native_client_create_cancellation, NULL, NULL, NULL, napi_default, NULL},
         {"close", NULL, native_client_close, NULL, NULL, NULL, napi_default, NULL},
     };
@@ -5528,9 +5004,7 @@ static napi_value init(napi_env env, napi_value exports) {
 
     napi_property_descriptor stream_methods[] = {
         {"sendMessage", NULL, native_stream_send_message, NULL, NULL, NULL, napi_default, NULL},
-        {"_sendMessageZeroCopy", NULL, native_stream_send_message_zero_copy, NULL, NULL, NULL, napi_default, NULL},
         {"sendMessages", NULL, native_stream_send_messages, NULL, NULL, NULL, napi_default, NULL},
-        {"_sendMessagesZeroCopy", NULL, native_stream_send_messages_zero_copy, NULL, NULL, NULL, napi_default, NULL},
         {"finishSend", NULL, native_stream_finish_send, NULL, NULL, NULL, napi_default, NULL},
         {"recv", NULL, native_stream_recv, NULL, NULL, NULL, napi_default, NULL},
         {"recvMany", NULL, native_stream_recv_many, NULL, NULL, NULL, napi_default, NULL},
@@ -5569,11 +5043,8 @@ static napi_value init(napi_env env, napi_value exports) {
 
     napi_property_descriptor call_methods[] = {
         {"respond", NULL, native_call_respond, NULL, NULL, NULL, napi_default, NULL},
-        {"_respondZeroCopy", NULL, native_call_respond_zero_copy, NULL, NULL, NULL, napi_default, NULL},
         {"sendMessage", NULL, native_call_send_message, NULL, NULL, NULL, napi_default, NULL},
-        {"_sendMessageZeroCopy", NULL, native_call_send_message_zero_copy, NULL, NULL, NULL, napi_default, NULL},
         {"sendMessages", NULL, native_call_send_messages, NULL, NULL, NULL, napi_default, NULL},
-        {"_sendMessagesZeroCopy", NULL, native_call_send_messages_zero_copy, NULL, NULL, NULL, napi_default, NULL},
         {"finishStream", NULL, native_call_finish_stream, NULL, NULL, NULL, napi_default, NULL},
         {"recv", NULL, native_call_recv, NULL, NULL, NULL, napi_default, NULL},
         {"recvMany", NULL, native_call_recv_many, NULL, NULL, NULL, napi_default, NULL},
@@ -5619,27 +5090,11 @@ static napi_value init(napi_env env, napi_value exports) {
             NULL,
             napi_default,
             NULL},
-        {"_debugRetainedOutboundBodyRefs",
-            NULL,
-            debug_retained_outbound_body_refs,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
         {"_debugMakeBorrowedResponse", NULL, debug_make_borrowed_response, NULL, NULL, NULL, napi_default, NULL},
         {"_debugMakeBorrowedStreamFrame", NULL, debug_make_borrowed_stream_frame, NULL, NULL, NULL, napi_default, NULL},
         {"_debugMakeBorrowedStreamBodyBatch",
             NULL,
             debug_make_borrowed_stream_body_batch,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-        {"_debugRetainBodyUntilAsyncComplete",
-            NULL,
-            debug_retain_body_until_async_complete,
             NULL,
             NULL,
             NULL,

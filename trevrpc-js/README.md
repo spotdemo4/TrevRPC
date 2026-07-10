@@ -61,10 +61,11 @@ npm test
 ```
 
 The completion-worker profiler is manual and requires the benchmark server binary plus an
-explicit case, send mode, concurrency, iteration count, and payload size:
+explicit case, concurrency, iteration count, and payload size:
 
 ```sh
 npm run profile:completion-worker:native -- \
-  <server-binary> <unary|bidi-duplex> <copy|zero-copy> \
-  <concurrency> <iterations> <payload-bytes>
+  <server-binary> <unary|bidi-duplex> <concurrency> <iterations> <payload-bytes>
 ```
+
+The profiler reports wall throughput, Node CPU time per operation, RSS, and context switches.

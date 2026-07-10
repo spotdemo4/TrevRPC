@@ -46,7 +46,6 @@ export class NodeTransport {
         this.nativeClient,
         nativeRequest(request, RpcKind.Unary),
         cancellation,
-        options.outboundZeroCopy === true,
       );
       throwIfAborted(options.signal);
       return response;
@@ -72,7 +71,6 @@ export class NodeTransport {
         this.nativeClient,
         nativeRequest(request, RpcKind.ServerStreaming),
         cancellation,
-        options.outboundZeroCopy === true,
       );
       cleanupStartAbort();
       throwIfAborted(options.signal);
@@ -86,12 +84,7 @@ export class NodeTransport {
     }
 
     const cleanupStreamAbort = onAbort(options.signal, () => stream.close());
-    const writerTask = writeRequestStream(
-      stream,
-      requestBody,
-      this.streamWriteBatchMaxMessages,
-      options.outboundZeroCopy === true,
-    );
+    const writerTask = writeRequestStream(stream, requestBody, this.streamWriteBatchMaxMessages);
     return new NativeResponseFrameStream(
       stream,
       writerTask,
@@ -125,7 +118,6 @@ export class NodeServer {
       options.streamWriteBatchMaxMessages,
       SendManyBatchSize,
     );
-    this.outboundZeroCopy = options.outboundZeroCopy === true;
   }
 
   /** Creates a native QUIC TrevRPC server backed by trevrpc-c. */
@@ -221,7 +213,6 @@ export class NodeServer {
       {
         readBatchMaxMessages: this.streamReadBatchMaxMessages,
         writeBatchMaxMessages: this.streamWriteBatchMaxMessages,
-        outboundZeroCopy: this.outboundZeroCopy,
       },
     );
     this.#recordStarted(call);
@@ -338,7 +329,6 @@ export class NodeServerCall {
     this.completedAt = null;
     this.readBatchMaxMessages = batchMaxMessages(options.readBatchMaxMessages, RecvManyBatchSize);
     this.writeBatchMaxMessages = batchMaxMessages(options.writeBatchMaxMessages, SendManyBatchSize);
-    this.outboundZeroCopy = options.outboundZeroCopy === true;
     this.#onComplete = onComplete;
   }
 
@@ -353,11 +343,7 @@ export class NodeServerCall {
   /** Sends a unary response and completes the call. */
   async respond(response = {}) {
     const rpcResponse = responseObject(response);
-    const respond =
-      this.outboundZeroCopy && typeof this.nativeCall._respondZeroCopy === "function"
-        ? this.nativeCall._respondZeroCopy
-        : this.nativeCall.respond;
-    await respond.call(this.nativeCall, rpcResponse);
+    await this.nativeCall.respond(rpcResponse);
     this.completed = true;
     this.responseBodyLength = rpcResponse.body?.byteLength ?? 0;
     this.finalStatus = codeFromNumber(rpcResponse.status ?? rpcResponse.code ?? Code.Ok);
@@ -367,11 +353,7 @@ export class NodeServerCall {
   /** Sends one streaming response message. */
   sendMessage(body) {
     const bytes = byteBody(body);
-    const send =
-      this.outboundZeroCopy && typeof this.nativeCall._sendMessageZeroCopy === "function"
-        ? this.nativeCall._sendMessageZeroCopy
-        : this.nativeCall.sendMessage;
-    return Promise.resolve(send.call(this.nativeCall, bytes)).then(() => {
+    return Promise.resolve(this.nativeCall.sendMessage(bytes)).then(() => {
       this.responseBodyLength += bytes.byteLength;
     });
   }
@@ -390,11 +372,7 @@ export class NodeServerCall {
     for (const body of batch) {
       bodyLength += body.byteLength;
     }
-    const send =
-      this.outboundZeroCopy && typeof this.nativeCall._sendMessagesZeroCopy === "function"
-        ? this.nativeCall._sendMessagesZeroCopy
-        : this.nativeCall.sendMessages;
-    return Promise.resolve(send.call(this.nativeCall, batch)).then(() => {
+    return Promise.resolve(this.nativeCall.sendMessages(batch)).then(() => {
       this.responseBodyLength += bodyLength;
     });
   }
@@ -738,12 +716,7 @@ function isTerminalFrame(frame) {
   return frame == null || frame.kind === RpcStreamFrameKind.Status;
 }
 
-async function writeRequestStream(
-  stream,
-  requestBody,
-  batchMaxMessages = SendManyBatchSize,
-  outboundZeroCopy = false,
-) {
+async function writeRequestStream(stream, requestBody, batchMaxMessages = SendManyBatchSize) {
   const iterator = requestBody[Symbol.asyncIterator]();
   try {
     for (;;) {
@@ -754,18 +727,10 @@ async function writeRequestStream(
       const bodies = result.value.map(byteBody);
       if (bodies.length === 1 || typeof stream.sendMessages !== "function") {
         for (const body of bodies) {
-          const send =
-            outboundZeroCopy && typeof stream._sendMessageZeroCopy === "function"
-              ? stream._sendMessageZeroCopy
-              : stream.sendMessage;
-          await send.call(stream, body);
+          await stream.sendMessage(body);
         }
       } else if (bodies.length > 1) {
-        const send =
-          outboundZeroCopy && typeof stream._sendMessagesZeroCopy === "function"
-            ? stream._sendMessagesZeroCopy
-            : stream.sendMessages;
-        await send.call(stream, bodies);
+        await stream.sendMessages(bodies);
       }
     }
     await stream.finishSend();
@@ -980,24 +945,16 @@ function createNativeCancellation(nativeClient) {
     : undefined;
 }
 
-function nativeCall(nativeClient, request, cancellation, outboundZeroCopy) {
-  const call =
-    outboundZeroCopy && typeof nativeClient._callZeroCopy === "function"
-      ? nativeClient._callZeroCopy
-      : nativeClient.call;
+function nativeCall(nativeClient, request, cancellation) {
   return cancellation == null
-    ? call.call(nativeClient, request)
-    : call.call(nativeClient, request, cancellation);
+    ? nativeClient.call(request)
+    : nativeClient.call(request, cancellation);
 }
 
-function nativeStartStream(nativeClient, request, cancellation, outboundZeroCopy) {
-  const start =
-    outboundZeroCopy && typeof nativeClient._startStreamZeroCopy === "function"
-      ? nativeClient._startStreamZeroCopy
-      : nativeClient.startStream;
+function nativeStartStream(nativeClient, request, cancellation) {
   return cancellation == null
-    ? start.call(nativeClient, request)
-    : start.call(nativeClient, request, cancellation);
+    ? nativeClient.startStream(request)
+    : nativeClient.startStream(request, cancellation);
 }
 
 function onAbort(signal, callback) {

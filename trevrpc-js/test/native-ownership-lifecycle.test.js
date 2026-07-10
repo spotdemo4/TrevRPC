@@ -16,17 +16,17 @@ import { NodeServer, NodeTransport } from "../src/node.js";
 const require = createRequire(import.meta.url);
 const nativeAddonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
 const thisFile = fileURLToPath(import.meta.url);
-const gcChild = process.env.TREVRPC_NATIVE_ZERO_COPY_GC_CHILD === "1";
+const gcChild = process.env.TREVRPC_NATIVE_OWNERSHIP_LIFECYCLE_GC_CHILD === "1";
 let certificateDirectory;
 
 if (typeof global.gc !== "function" && !gcChild) {
   test(
-    "native zero-copy ownership tests run with forced GC",
+    "native ownership lifecycle tests run with forced GC",
     { skip: !existsSync(nativeAddonPath) },
     () => {
       const result = spawnSync(process.execPath, ["--expose-gc", "--test", thisFile], {
         encoding: "utf8",
-        env: { ...process.env, TREVRPC_NATIVE_ZERO_COPY_GC_CHILD: "1" },
+        env: { ...process.env, TREVRPC_NATIVE_OWNERSHIP_LIFECYCLE_GC_CHILD: "1" },
       });
 
       assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
@@ -114,80 +114,6 @@ if (typeof global.gc !== "function" && !gcChild) {
   );
 
   test(
-    "native outbound body refs survive forced GC until async completion",
-    {
-      skip: native == null || !hasGc,
-    },
-    async () => {
-      let body = new Uint8Array([17, 34, 51, 68]);
-      const expected = checksum(body);
-      const retained = native._debugRetainBodyUntilAsyncComplete(body);
-
-      body = null;
-      await forceGcCycles(5);
-
-      assert.equal(await retained, expected);
-      await waitForOutboundRefs(native, 0);
-    },
-  );
-
-  test(
-    "native zero-copy rejects detached stores without trusting resizable properties",
-    { skip: native == null },
-    async () => {
-      const detached = new ArrayBuffer(8);
-      structuredClone(detached, { transfer: [detached] });
-      assert.throws(() => native._debugRetainBodyUntilAsyncComplete(detached), /attached/u);
-
-      const spoofed = new ArrayBuffer(4);
-      new Uint8Array(spoofed).set([1, 2, 3, 4]);
-      Object.defineProperty(spoofed, "resizable", { value: true });
-      assert.equal(
-        await native._debugRetainBodyUntilAsyncComplete(spoofed),
-        checksum(new Uint8Array(spoofed)),
-      );
-
-      const resizable = new ArrayBuffer(8, { maxByteLength: 16 });
-      if (resizable.resizable === true) {
-        assert.equal(await native._debugRetainBodyUntilAsyncComplete(resizable), 0);
-      }
-    },
-  );
-
-  test(
-    "native completion worker releases retained bodies during environment shutdown",
-    { skip: native == null || !hasGc },
-    () => {
-      const script = `
-import { Worker } from "node:worker_threads";
-const worker = new Worker(
-  ${JSON.stringify(`
-const { parentPort } = require("node:worker_threads");
-const native = require(${JSON.stringify(nativeAddonPath)});
-native._debugRetainBodyUntilAsyncComplete(new Uint8Array(1024 * 1024));
-parentPort.postMessage("queued");
-`)},
-  { eval: true, execArgv: [] },
-);
-await new Promise((resolve, reject) => {
-  worker.once("message", resolve);
-  worker.once("error", reject);
-});
-await worker.terminate();
-`;
-      const result = spawnSync(
-        process.execPath,
-        ["--expose-gc", "--input-type=module", "-e", script],
-        {
-          encoding: "utf8",
-          timeout: 5_000,
-        },
-      );
-      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-    },
-  );
-
-  test(
     "Worker termination unblocks a live native serve operation",
     { skip: native == null, timeout: 10_000 },
     async () => {
@@ -248,7 +174,7 @@ parentPort.postMessage("connecting");
   );
 
   test(
-    "Worker termination cancels a real stalled zero-copy unary call",
+    "Worker termination cancels a real stalled unary call",
     { skip: native == null, timeout: 15_000 },
     async () => {
       let heldCall;
@@ -274,7 +200,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
     port: ${server.port},
     skipCertificateValidation: true,
   });
-  client._callZeroCopy({
+  client.call({
     service: "ownership",
     method: "WorkerUnary",
     kind: 0,
@@ -297,7 +223,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
-    "Worker termination cancels a pending real MsQuic zero-copy send",
+    "Worker termination cancels a pending real MsQuic send",
     { skip: native == null, timeout: 20_000 },
     async () => {
       let heldCall;
@@ -328,7 +254,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
     port: ${server.port},
     skipCertificateValidation: true,
   });
-  const stream = await client._startStreamZeroCopy({
+  const stream = await client.startStream({
     service: "ownership",
     method: "WorkerPendingSend",
     kind: 3,
@@ -336,16 +262,15 @@ const native = require(${JSON.stringify(nativeAddonPath)});
     body: new Uint8Array(),
   });
   const bodies = Array.from({ length: 12 }, () => new Uint8Array(3 * 1024 * 1024));
-  stream._sendMessagesZeroCopy(bodies).catch(() => {});
+  stream.sendMessages(bodies).catch(() => {});
   stream.sendMessage(new Uint8Array([1])).catch(() => {});
   stream.finishSend().catch(() => {});
-  parentPort.postMessage({ refs: native._debugRetainedOutboundBodyRefs() });
+  parentPort.postMessage("queued");
 })().catch((error) => { throw error; });
 `,
             { eval: true },
           );
-          const message = await waitForWorkerMessage(worker, (value) => value?.refs > 0);
-          assert.equal(message.refs, 12);
+          await waitForWorkerMessage(worker, (message) => message === "queued");
           await settlesWithin(callStartedPromise, 3_000);
           await settlesWithin(worker.terminate(), 5_000);
           heldCall?.close();
@@ -356,10 +281,9 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
-    "native zero-copy unary retains typed slices and ArrayBuffers with metadata prefixes",
-    { skip: native == null || !hasGc, timeout: 15_000 },
+    "native unary copies typed slices and ArrayBuffers with metadata prefixes",
+    { skip: native == null, timeout: 15_000 },
     async () => {
-      const baseline = outboundRefCount(native);
       let releaseUnary;
       const unaryReleased = new Promise((resolve) => {
         releaseUnary = resolve;
@@ -387,49 +311,36 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           });
         },
         async (client) => {
-          let storage = new Uint8Array([0xff, 1, 2, 3, 4, 0xff]);
-          let body = storage.subarray(1, 5);
-          let metadataBuffer = new Uint8Array([6, 7, 8]).buffer;
-          const responsePromise = client.call(
-            {
-              service: "ownership",
-              method: "Unary",
-              body,
-              metadata: { authorization: metadataBuffer },
-            },
-            { outboundZeroCopy: true },
-          );
+          const storage = new Uint8Array([0xff, 1, 2, 3, 4, 0xff]);
+          const body = storage.subarray(1, 5);
+          const metadataBuffer = new Uint8Array([6, 7, 8]).buffer;
+          const responsePromise = client.call({
+            service: "ownership",
+            method: "Unary",
+            body,
+            metadata: { authorization: metadataBuffer },
+          });
+          body.fill(99);
+          new Uint8Array(metadataBuffer).fill(99);
 
           await unaryStartedPromise;
-          body = null;
-          storage = null;
-          metadataBuffer = null;
-          await forceGcCycles(5);
-          assert.equal(outboundRefCount(native), baseline + 1);
 
           releaseUnary();
           const response = await responsePromise;
           assert.deepEqual(Array.from(response.body), [1, 2, 3, 4]);
           assert.deepEqual(Array.from(response.metadata.response), [9, 8, 7]);
-          await waitForOutboundRefs(native, baseline);
 
-          let arrayBuffer = new Uint8Array([10, 11, 12]).buffer;
-          const second = client.call(
-            {
-              service: "ownership",
-              method: "Unary",
-              body: arrayBuffer,
-              metadata: { authorization: new Uint8Array([6, 7, 8]) },
-            },
-            { outboundZeroCopy: true },
-          );
-          arrayBuffer = null;
-          await forceGcCycles(3);
+          const arrayBuffer = new Uint8Array([10, 11, 12]).buffer;
+          const second = client.call({
+            service: "ownership",
+            method: "Unary",
+            body: arrayBuffer,
+            metadata: { authorization: new Uint8Array([6, 7, 8]) },
+          });
+          new Uint8Array(arrayBuffer).fill(99);
           const secondResponse = await second;
           assert.deepEqual(Array.from(secondResponse.body), [10, 11, 12]);
-          await waitForOutboundRefs(native, baseline);
         },
-        () => ({ outboundZeroCopy: true }),
       );
 
       assert.deepEqual(observed, [
@@ -440,10 +351,9 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
-    "native zero-copy single and batched stream messages survive forced GC",
-    { skip: native == null || !hasGc, timeout: 15_000 },
+    "native single and batched stream messages preserve typed slices and ArrayBuffers",
+    { skip: native == null, timeout: 15_000 },
     async () => {
-      const baseline = outboundRefCount(native);
       await withNativePair(
         async (server) => {
           server.register("ownership", "Bidi", RpcKind.BidirectionalStreaming, async (call) => {
@@ -464,10 +374,10 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           });
         },
         async (client) => {
-          let sliceStorage = new Uint8Array([0xff, 1, 2, 0xff]);
-          let slice = sliceStorage.subarray(1, 3);
-          let arrayBuffer = new Uint8Array([3, 4, 5]).buffer;
-          let finalBody = new Uint8Array([6]);
+          const sliceStorage = new Uint8Array([0xff, 1, 2, 0xff]);
+          const slice = sliceStorage.subarray(1, 3);
+          const arrayBuffer = new Uint8Array([3, 4, 5]).buffer;
+          const finalBody = new Uint8Array([6]);
           const frames = await client.streamingCall(
             {
               service: "ownership",
@@ -477,13 +387,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
               metadata: { trace: new Uint8Array([42]) },
             },
             bodyBatchIterable([[slice], [arrayBuffer, finalBody]]),
-            { outboundZeroCopy: true },
           );
-          slice = null;
-          sliceStorage = null;
-          arrayBuffer = null;
-          finalBody = null;
-          await forceGcCycles(5);
 
           const received = [];
           for await (const frame of frames) {
@@ -492,18 +396,15 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             }
           }
           assert.deepEqual(received, [[1, 2], [3, 4, 5], [6]]);
-          await waitForOutboundRefs(native, baseline);
         },
-        () => ({ outboundZeroCopy: true }),
       );
     },
   );
 
   test(
-    "native zero-copy sync exhaustion and response failure release refs exactly once",
-    { skip: native == null || !hasGc, timeout: 15_000 },
+    "native synchronous exhaustion and response failure settle queued operations",
+    { skip: native == null, timeout: 15_000 },
     async () => {
-      const baseline = outboundRefCount(native);
       let responseFailure;
       const responseFailurePromise = new Promise((resolve) => {
         responseFailure = resolve;
@@ -526,29 +427,28 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             },
           );
           server.nativeServer.register("ownership", "ResponseFailure", RpcKind.Unary, (call) => {
-            call._respondZeroCopy({ body: new Uint8Array(1024) }).then(
+            call.respond({ body: new Uint8Array(1024) }).then(
               () => responseFailure(new Error("response unexpectedly succeeded")),
               (error) => responseFailure(error),
             );
           });
         },
         async (client) => {
-          const stream = await client.nativeClient._startStreamZeroCopy({
+          const stream = await client.nativeClient.startStream({
             service: "ownership",
             method: "Exhaust",
             kind: RpcKind.BidirectionalStreaming,
             body: new Uint8Array(),
           });
           await assert.rejects(
-            stream._sendMessageZeroCopy(new Uint8Array(1024)),
+            stream.sendMessage(new Uint8Array(1024)),
             (error) => error.nativeCode === -1004,
           );
           stream.close();
-          await waitForOutboundRefs(native, baseline);
           await exhaustClosedPromise;
 
           const failedResponseCall = client.nativeClient
-            ._callZeroCopy({
+            .call({
               service: "ownership",
               method: "ResponseFailure",
               kind: RpcKind.Unary,
@@ -558,11 +458,10 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             .catch((error) => error);
           const responseError = await settlesWithin(responseFailurePromise, 3_000);
           assert.equal(responseError.nativeCode, -1004);
-          await waitForOutboundRefs(native, baseline);
           client.close();
           await failedResponseCall;
         },
-        () => ({ outboundZeroCopy: true, maxPendingSendBytes: 128 }),
+        () => ({ maxPendingSendBytes: 128 }),
         () => ({ maxPendingSendBytes: 128 }),
       );
     },
@@ -570,9 +469,8 @@ const native = require(${JSON.stringify(nativeAddonPath)});
 
   test(
     "native call ownership coordinates overlapping sends, terminal completion, receive, and close",
-    { skip: native == null || !hasGc, timeout: 20_000 },
+    { skip: native == null, timeout: 20_000 },
     async () => {
-      const baseline = outboundRefCount(native);
       const outcomes = new Map();
       const outcomeWaiters = new Map();
       const outcome = (name) =>
@@ -592,8 +490,8 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             RpcKind.BidirectionalStreaming,
             (call) => {
               Promise.allSettled([
-                call._sendMessageZeroCopy(new Uint8Array([1])),
-                call._sendMessageZeroCopy(new Uint8Array([2])),
+                call.sendMessage(new Uint8Array([1])),
+                call.sendMessage(new Uint8Array([2])),
               ]).then(async (results) => {
                 const finish = await Promise.allSettled([call.finishStream(Code.Ok)]);
                 record("send-send", { results, finish });
@@ -606,7 +504,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             RpcKind.BidirectionalStreaming,
             (call) => {
               Promise.allSettled([
-                call._sendMessageZeroCopy(new Uint8Array(2 * 1024 * 1024)),
+                call.sendMessage(new Uint8Array(2 * 1024 * 1024)),
                 call.finishStream(Code.Ok),
               ]).then((results) => record("send-finish", results));
             },
@@ -626,10 +524,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             "Close",
             RpcKind.BidirectionalStreaming,
             (call) => {
-              const pending = [
-                call.recv(),
-                call._sendMessageZeroCopy(new Uint8Array(2 * 1024 * 1024)),
-              ];
+              const pending = [call.recv(), call.sendMessage(new Uint8Array(2 * 1024 * 1024))];
               call.close();
               Promise.allSettled(pending).then((results) => record("close", results));
             },
@@ -642,7 +537,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
                 offset === 0 ? letter.toLowerCase() : `-${letter.toLowerCase()}`,
               ),
             );
-            const stream = await client.nativeClient._startStreamZeroCopy({
+            const stream = await client.nativeClient.startStream({
               service: "ownership",
               method,
               kind: RpcKind.BidirectionalStreaming,
@@ -667,9 +562,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           assert.equal(outcomes.get("send-finish")[1].status, "fulfilled");
           assert.equal(outcomes.get("recv-finish")[1].status, "fulfilled");
           assert.equal(outcomes.get("close").length, 2);
-          await waitForOutboundRefs(native, baseline);
         },
-        () => ({ outboundZeroCopy: true }),
       );
     },
   );
@@ -689,7 +582,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             "DoubleTerminal",
             RpcKind.BidirectionalStreaming,
             (call) => {
-              const heldSend = call._sendMessageZeroCopy(new Uint8Array(3 * 1024 * 1024)).then(
+              const heldSend = call.sendMessage(new Uint8Array(3 * 1024 * 1024)).then(
                 () => ({ status: "fulfilled" }),
                 (error) => ({ status: "rejected", error }),
               );
@@ -746,252 +639,195 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           );
           stream.close();
         },
-        () => ({ outboundZeroCopy: true }),
       );
     },
   );
 
   test(
-    "outbound FIFO preserves copy and zero-copy body order before finish",
+    "outbound FIFO preserves body order before finish",
     { skip: native == null, timeout: 30_000 },
     async () => {
-      const baseline = outboundRefCount(native);
-      const states = new Map();
-      for (const mode of ["copy", "zero-copy"]) {
-        let requestQueued;
-        let requestResult;
-        let responseQueued;
-        let responseResult;
-        states.set(mode, {
-          requestQueued: new Promise((resolve) => {
-            requestQueued = resolve;
-          }),
-          requestQueuedResolve: requestQueued,
-          requestResult: new Promise((resolve) => {
-            requestResult = resolve;
-          }),
-          requestResultResolve: requestResult,
-          responseQueued: new Promise((resolve) => {
-            responseQueued = resolve;
-          }),
-          responseQueuedResolve: responseQueued,
-          responseResult: new Promise((resolve) => {
-            responseResult = resolve;
-          }),
-          responseResultResolve: responseResult,
-        });
-      }
+      let requestQueuedResolve;
+      const requestQueued = new Promise((resolve) => {
+        requestQueuedResolve = resolve;
+      });
+      let requestResultResolve;
+      const requestResult = new Promise((resolve) => {
+        requestResultResolve = resolve;
+      });
+      let responseQueuedResolve;
+      const responseQueued = new Promise((resolve) => {
+        responseQueuedResolve = resolve;
+      });
+      let responseResultResolve;
+      const responseResult = new Promise((resolve) => {
+        responseResultResolve = resolve;
+      });
 
       await withNativePair(
         async (server) => {
-          for (const mode of ["copy", "zero-copy"]) {
-            const state = states.get(mode);
-            const suffix = mode === "copy" ? "Copy" : "ZeroCopy";
-            server.nativeServer.register(
-              "ownership",
-              `RequestOrder${suffix}`,
-              RpcKind.BidirectionalStreaming,
-              (call) => {
-                void (async () => {
-                  await state.requestQueued;
-                  const received = [];
-                  for (;;) {
-                    const frame = await call.recv();
-                    if (frame == null) {
-                      break;
-                    }
-                    received.push({ first: frame.body[0], length: frame.body.byteLength });
+          server.nativeServer.register(
+            "ownership",
+            "RequestOrder",
+            RpcKind.BidirectionalStreaming,
+            (call) => {
+              void (async () => {
+                await requestQueued;
+                const received = [];
+                for (;;) {
+                  const frame = await call.recv();
+                  if (frame == null) {
+                    break;
                   }
-                  await call.finishStream(Code.Ok);
-                  state.requestResultResolve(received);
-                })().catch(state.requestResultResolve);
-              },
-            );
-            server.nativeServer.register(
-              "ownership",
-              `ResponseOrder${suffix}`,
-              RpcKind.BidirectionalStreaming,
-              (call) => {
-                const held = call._sendMessageZeroCopy(new Uint8Array(3 * 1024 * 1024).fill(9));
-                void (async () => {
-                  await waitForCondition(
-                    () => call._debugOperationLocked(),
-                    "response send never held the call operation mutex",
-                  );
-                  const later =
-                    mode === "copy"
-                      ? [
-                          call.sendMessage(new Uint8Array([1])),
-                          call.sendMessages([new Uint8Array([2]), new Uint8Array([3])]),
-                          call.finishStream(Code.Ok),
-                        ]
-                      : [
-                          call._sendMessageZeroCopy(new Uint8Array([1])),
-                          call._sendMessagesZeroCopy([new Uint8Array([2]), new Uint8Array([3])]),
-                          call.finishStream(Code.Ok),
-                        ];
-                  state.responseQueuedResolve();
-                  state.responseResultResolve(await Promise.allSettled([held, ...later]));
-                })().catch(state.responseResultResolve);
-              },
-            );
-          }
+                  received.push({ first: frame.body[0], length: frame.body.byteLength });
+                }
+                await call.finishStream(Code.Ok);
+                requestResultResolve(received);
+              })().catch(requestResultResolve);
+            },
+          );
+          server.nativeServer.register(
+            "ownership",
+            "ResponseOrder",
+            RpcKind.BidirectionalStreaming,
+            (call) => {
+              const held = call.sendMessage(new Uint8Array(3 * 1024 * 1024).fill(9));
+              void (async () => {
+                await waitForCondition(
+                  () => call._debugOperationLocked(),
+                  "response send never held the call operation mutex",
+                );
+                const later = [
+                  call.sendMessage(new Uint8Array([1])),
+                  call.sendMessages([new Uint8Array([2]), new Uint8Array([3])]),
+                  call.finishStream(Code.Ok),
+                ];
+                responseQueuedResolve();
+                responseResultResolve(await Promise.allSettled([held, ...later]));
+              })().catch(responseResultResolve);
+            },
+          );
         },
         async (client) => {
-          for (const mode of ["copy", "zero-copy"]) {
-            const state = states.get(mode);
-            const suffix = mode === "copy" ? "Copy" : "ZeroCopy";
-            const requestStream = await client.nativeClient.startStream({
-              service: "ownership",
-              method: `RequestOrder${suffix}`,
-              kind: RpcKind.BidirectionalStreaming,
-              body: new Uint8Array(),
-            });
-            const held = requestStream._sendMessageZeroCopy(
-              new Uint8Array(3 * 1024 * 1024).fill(9),
-            );
-            await waitForCondition(
-              () => requestStream._debugOperationLocked(),
-              "request send never held the stream operation mutex",
-            );
-            const later =
-              mode === "copy"
-                ? [
-                    requestStream.sendMessage(new Uint8Array([1])),
-                    requestStream.sendMessages([new Uint8Array([2]), new Uint8Array([3])]),
-                    requestStream.finishSend(),
-                  ]
-                : [
-                    requestStream._sendMessageZeroCopy(new Uint8Array([1])),
-                    requestStream._sendMessagesZeroCopy([new Uint8Array([2]), new Uint8Array([3])]),
-                    requestStream.finishSend(),
-                  ];
-            state.requestQueuedResolve();
-            const requestResults = await Promise.allSettled([held, ...later]);
-            assert.equal(
-              requestResults.filter((result) => result.status === "fulfilled").length,
-              requestResults.length,
-            );
-            assert.deepEqual(await settlesWithin(state.requestResult, 5_000), [
-              { first: 9, length: 3 * 1024 * 1024 },
-              { first: 1, length: 1 },
-              { first: 2, length: 1 },
-              { first: 3, length: 1 },
-            ]);
-            const requestStatus = await settlesWithin(requestStream.recv(), 5_000);
-            assert.equal(requestStatus.kind, RpcStreamFrameKind.Status);
-            requestStream.close();
+          const requestStream = await client.nativeClient.startStream({
+            service: "ownership",
+            method: "RequestOrder",
+            kind: RpcKind.BidirectionalStreaming,
+            body: new Uint8Array(),
+          });
+          const held = requestStream.sendMessage(new Uint8Array(3 * 1024 * 1024).fill(9));
+          await waitForCondition(
+            () => requestStream._debugOperationLocked(),
+            "request send never held the stream operation mutex",
+          );
+          const later = [
+            requestStream.sendMessage(new Uint8Array([1])),
+            requestStream.sendMessages([new Uint8Array([2]), new Uint8Array([3])]),
+            requestStream.finishSend(),
+          ];
+          requestQueuedResolve();
+          const requestResults = await Promise.allSettled([held, ...later]);
+          assert.equal(
+            requestResults.filter((result) => result.status === "fulfilled").length,
+            requestResults.length,
+          );
+          assert.deepEqual(await settlesWithin(requestResult, 5_000), [
+            { first: 9, length: 3 * 1024 * 1024 },
+            { first: 1, length: 1 },
+            { first: 2, length: 1 },
+            { first: 3, length: 1 },
+          ]);
+          const requestStatus = await settlesWithin(requestStream.recv(), 5_000);
+          assert.equal(requestStatus.kind, RpcStreamFrameKind.Status);
+          requestStream.close();
 
-            const responseStream = await client.nativeClient.startStream({
-              service: "ownership",
-              method: `ResponseOrder${suffix}`,
-              kind: RpcKind.BidirectionalStreaming,
-              body: new Uint8Array(),
-            });
-            await responseStream.finishSend();
-            await settlesWithin(state.responseQueued, 5_000);
-            const responseBodies = [];
-            let responseStatus = null;
-            for (;;) {
-              const frame = await settlesWithin(responseStream.recv(), 5_000);
-              if (frame == null) {
-                break;
-              }
-              if (frame.kind === RpcStreamFrameKind.Status) {
-                responseStatus = frame;
-                break;
-              }
-              responseBodies.push({ first: frame.body[0], length: frame.body.byteLength });
+          const responseStream = await client.nativeClient.startStream({
+            service: "ownership",
+            method: "ResponseOrder",
+            kind: RpcKind.BidirectionalStreaming,
+            body: new Uint8Array(),
+          });
+          await responseStream.finishSend();
+          await settlesWithin(responseQueued, 5_000);
+          const responseBodies = [];
+          let responseStatus = null;
+          for (;;) {
+            const frame = await settlesWithin(responseStream.recv(), 5_000);
+            if (frame == null) {
+              break;
             }
-            assert.deepEqual(responseBodies, [
-              { first: 9, length: 3 * 1024 * 1024 },
-              { first: 1, length: 1 },
-              { first: 2, length: 1 },
-              { first: 3, length: 1 },
-            ]);
-            assert.equal(responseStatus.status, Code.Ok);
-            const responseResults = await settlesWithin(state.responseResult, 5_000);
-            assert.equal(
-              responseResults.filter((result) => result.status === "fulfilled").length,
-              responseResults.length,
-            );
-            responseStream.close();
+            if (frame.kind === RpcStreamFrameKind.Status) {
+              responseStatus = frame;
+              break;
+            }
+            responseBodies.push({ first: frame.body[0], length: frame.body.byteLength });
           }
-          await waitForOutboundRefs(native, baseline);
+          assert.deepEqual(responseBodies, [
+            { first: 9, length: 3 * 1024 * 1024 },
+            { first: 1, length: 1 },
+            { first: 2, length: 1 },
+            { first: 3, length: 1 },
+          ]);
+          assert.equal(responseStatus.status, Code.Ok);
+          const responseResults = await settlesWithin(responseResult, 5_000);
+          assert.equal(
+            responseResults.filter((result) => result.status === "fulfilled").length,
+            responseResults.length,
+          );
+          responseStream.close();
         },
-        () => ({ outboundZeroCopy: true }),
       );
     },
   );
 
   test(
-    "outbound FIFO advances after copy and zero-copy submission failure",
+    "outbound FIFO advances after submission failure",
     { skip: native == null, timeout: 15_000 },
     async () => {
-      const received = new Map();
-      const waiters = new Map();
-      for (const mode of ["copy", "zero-copy"]) {
-        let resolve;
-        waiters.set(
-          mode,
-          new Promise((done) => {
-            resolve = done;
-          }),
-        );
-        received.set(mode, resolve);
-      }
+      let receivedResolve;
+      const received = new Promise((resolve) => {
+        receivedResolve = resolve;
+      });
       await withNativePair(
         async (server) => {
-          for (const mode of ["copy", "zero-copy"]) {
-            const suffix = mode === "copy" ? "Copy" : "ZeroCopy";
-            server.nativeServer.register(
-              "ownership",
-              `FailureOrder${suffix}`,
-              RpcKind.BidirectionalStreaming,
-              (call) => {
-                void (async () => {
-                  const bodies = [];
-                  for (;;) {
-                    const frame = await call.recv();
-                    if (frame == null) {
-                      break;
-                    }
-                    bodies.push(Array.from(frame.body));
+          server.nativeServer.register(
+            "ownership",
+            "FailureOrder",
+            RpcKind.BidirectionalStreaming,
+            (call) => {
+              void (async () => {
+                const bodies = [];
+                for (;;) {
+                  const frame = await call.recv();
+                  if (frame == null) {
+                    break;
                   }
-                  await call.finishStream(Code.Ok);
-                  received.get(mode)(bodies);
-                })().catch(received.get(mode));
-              },
-            );
-          }
+                  bodies.push(Array.from(frame.body));
+                }
+                await call.finishStream(Code.Ok);
+                receivedResolve(bodies);
+              })().catch(receivedResolve);
+            },
+          );
         },
         async (client) => {
-          for (const mode of ["copy", "zero-copy"]) {
-            const suffix = mode === "copy" ? "Copy" : "ZeroCopy";
-            const stream = await client.nativeClient.startStream({
-              service: "ownership",
-              method: `FailureOrder${suffix}`,
-              kind: RpcKind.BidirectionalStreaming,
-              body: new Uint8Array(),
-            });
-            const failed =
-              mode === "copy"
-                ? stream.sendMessage(new Uint8Array(1024))
-                : stream._sendMessageZeroCopy(new Uint8Array(1024));
-            const retry =
-              mode === "copy"
-                ? stream.sendMessage(new Uint8Array([7]))
-                : stream._sendMessageZeroCopy(new Uint8Array([7]));
-            const results = await Promise.allSettled([failed, retry, stream.finishSend()]);
-            assert.equal(results[0].status, "rejected");
-            assert.equal(results[0].reason.nativeCode, -1004);
-            assert.equal(results[1].status, "fulfilled");
-            assert.equal(results[2].status, "fulfilled");
-            assert.deepEqual(await settlesWithin(waiters.get(mode), 5_000), [[7]]);
-            const status = await settlesWithin(stream.recv(), 5_000);
-            assert.equal(status.kind, RpcStreamFrameKind.Status);
-            stream.close();
-          }
+          const stream = await client.nativeClient.startStream({
+            service: "ownership",
+            method: "FailureOrder",
+            kind: RpcKind.BidirectionalStreaming,
+            body: new Uint8Array(),
+          });
+          const failed = stream.sendMessage(new Uint8Array(1024));
+          const retry = stream.sendMessage(new Uint8Array([7]));
+          const results = await Promise.allSettled([failed, retry, stream.finishSend()]);
+          assert.equal(results[0].status, "rejected");
+          assert.equal(results[0].reason.nativeCode, -1004);
+          assert.equal(results[1].status, "fulfilled");
+          assert.equal(results[2].status, "fulfilled");
+          assert.deepEqual(await settlesWithin(received, 5_000), [[7]]);
+          const status = await settlesWithin(stream.recv(), 5_000);
+          assert.equal(status.kind, RpcStreamFrameKind.Status);
+          stream.close();
         },
         () => ({}),
         () => ({ maxPendingSendBytes: 128 }),
@@ -1000,10 +836,13 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
-    "native zero-copy batch releases every ref when a pending stream is reset",
-    { skip: native == null || !hasGc, timeout: 15_000 },
+    "native pending stream reset cancels a batched send",
+    { skip: native == null, timeout: 15_000 },
     async () => {
-      const baseline = outboundRefCount(native);
+      let resetStarted;
+      const resetStartedPromise = new Promise((resolve) => {
+        resetStarted = resolve;
+      });
       let resetFinished;
       const resetFinishedPromise = new Promise((resolve) => {
         resetFinished = resolve;
@@ -1011,33 +850,30 @@ const native = require(${JSON.stringify(nativeAddonPath)});
       await withNativePair(
         async (server) => {
           server.register("ownership", "Reset", RpcKind.BidirectionalStreaming, async (call) => {
+            resetStarted();
             await delay(250);
             call.close();
             resetFinished();
           });
         },
         async (client) => {
-          const stream = await client.nativeClient._startStreamZeroCopy({
+          const stream = await client.nativeClient.startStream({
             service: "ownership",
             method: "Reset",
             kind: RpcKind.BidirectionalStreaming,
             body: new Uint8Array(),
           });
-          let bodies = Array.from({ length: 6 }, (_, index) =>
+          const bodies = Array.from({ length: 6 }, (_, index) =>
             new Uint8Array(3 * 1024 * 1024).fill(index + 1),
           );
-          const sendResult = stream._sendMessagesZeroCopy(bodies).then(
+          const sendResult = stream.sendMessages(bodies).then(
             () => null,
             (error) => error,
           );
-          assert.equal(outboundRefCount(native), baseline + bodies.length);
-          bodies = null;
-          await setImmediate();
+          await resetStartedPromise;
           stream.close();
-          await forceGcCycles(5);
           const sendError = await settlesWithin(sendResult, 5_000);
-          assert.equal(sendError.nativeCode, -125);
-          await waitForOutboundRefs(native, baseline);
+          assert.equal(sendError.nativeCode, -1001);
           await resetFinishedPromise;
         },
       );
@@ -1046,9 +882,8 @@ const native = require(${JSON.stringify(nativeAddonPath)});
 
   test(
     "serialized native operations include queue wait in stream idle timeouts",
-    { skip: native == null || !hasGc, timeout: 15_000 },
+    { skip: native == null, timeout: 15_000 },
     async () => {
-      const baseline = outboundRefCount(native);
       let timeoutObserved;
       const timeoutObservedPromise = new Promise((resolve) => {
         timeoutObserved = resolve;
@@ -1061,9 +896,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             RpcKind.BidirectionalStreaming,
             (call) => {
               const pendingSend = call
-                ._sendMessagesZeroCopy(
-                  Array.from({ length: 12 }, () => new Uint8Array(3 * 1024 * 1024)),
-                )
+                .sendMessages(Array.from({ length: 12 }, () => new Uint8Array(3 * 1024 * 1024)))
                 .catch(() => {});
               setTimeout(async () => {
                 const started = performance.now();
@@ -1081,7 +914,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           );
         },
         async (client) => {
-          const stream = await client.nativeClient._startStreamZeroCopy({
+          const stream = await client.nativeClient.startStream({
             service: "ownership",
             method: "QueuedTimeout",
             kind: RpcKind.BidirectionalStreaming,
@@ -1092,18 +925,16 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           assert.ok(observed.elapsedMs >= 15, `timeout fired too early: ${observed.elapsedMs}ms`);
           assert.ok(observed.elapsedMs < 1_000, `timeout fired too late: ${observed.elapsedMs}ms`);
           stream.close();
-          await waitForOutboundRefs(native, baseline);
         },
-        () => ({ outboundZeroCopy: true, streamIdleTimeoutMs: 25 }),
+        () => ({ streamIdleTimeoutMs: 25 }),
       );
     },
   );
 
   test(
-    "native completion polling prevents duplex zero-copy worker starvation",
+    "native completion polling prevents duplex worker starvation",
     { skip: native == null, timeout: 10_000 },
     async () => {
-      const baseline = outboundRefCount(native);
       await withNativePair(
         async (server) => {
           server.register(
@@ -1123,7 +954,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           const concurrency = 64;
           const streams = await Promise.all(
             Array.from({ length: concurrency }, () =>
-              client.nativeClient._startStreamZeroCopy({
+              client.nativeClient.startStream({
                 service: "ownership",
                 method: "ConcurrentBidi",
                 kind: RpcKind.BidirectionalStreaming,
@@ -1136,9 +967,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             await delay(25);
             await settlesWithin(
               Promise.all(
-                streams.map((stream, index) =>
-                  stream._sendMessageZeroCopy(new Uint8Array([index + 1])),
-                ),
+                streams.map((stream, index) => stream.sendMessage(new Uint8Array([index + 1]))),
               ),
               5_000,
             );
@@ -1153,9 +982,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
               stream.close();
             }
           }
-          await waitForOutboundRefs(native, baseline);
         },
-        () => ({ outboundZeroCopy: true }),
       );
     },
   );
@@ -1232,11 +1059,14 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
-    "native connection close cancels an accepted zero-copy send and releases refs once",
-    { skip: native == null || !hasGc, timeout: 20_000 },
+    "native connection close cancels an accepted send",
+    { skip: native == null, timeout: 20_000 },
     async () => {
-      const baseline = outboundRefCount(native);
       let heldCall;
+      let callStarted;
+      const callStartedPromise = new Promise((resolve) => {
+        callStarted = resolve;
+      });
       await withNativePair(
         async (server) => {
           server.nativeServer.register(
@@ -1245,28 +1075,26 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             RpcKind.BidirectionalStreaming,
             (call) => {
               heldCall = call;
+              callStarted();
             },
           );
         },
         async (client) => {
-          const stream = await client.nativeClient._startStreamZeroCopy({
+          const stream = await client.nativeClient.startStream({
             service: "ownership",
             method: "ConnectionClose",
             kind: RpcKind.BidirectionalStreaming,
             body: new Uint8Array(),
           });
-          let bodies = Array.from({ length: 6 }, () => new Uint8Array(3 * 1024 * 1024));
-          const pending = stream._sendMessagesZeroCopy(bodies).then(
+          const bodies = Array.from({ length: 6 }, () => new Uint8Array(3 * 1024 * 1024));
+          const pending = stream.sendMessages(bodies).then(
             () => null,
             (error) => error,
           );
-          assert.equal(outboundRefCount(native), baseline + bodies.length);
-          bodies = null;
-          await delay(10);
+          await callStartedPromise;
           client.close();
           const sendError = await settlesWithin(pending, 5_000);
-          assert.equal(sendError.nativeCode, -125);
-          await waitForOutboundRefs(native, baseline);
+          assert.equal(sendError.nativeCode, -1001);
           heldCall?.close();
           heldCall = null;
         },
@@ -1329,10 +1157,6 @@ function resourceFinalizerCount(native) {
   return native._debugPendingResourceFinalizers();
 }
 
-function outboundRefCount(native) {
-  return native._debugRetainedOutboundBodyRefs();
-}
-
 async function forceGcCycles(cycles = 4) {
   for (let i = 0; i < cycles; i += 1) {
     global.gc();
@@ -1364,13 +1188,6 @@ async function waitForResourceFinalizers(native, target) {
   );
 }
 
-async function waitForOutboundRefs(native, target) {
-  await waitForCondition(
-    () => outboundRefCount(native) === target,
-    `expected ${target} retained outbound refs, saw ${outboundRefCount(native)}`,
-  );
-}
-
 async function waitForCondition(predicate, message) {
   for (let i = 0; i < 100; i += 1) {
     if (predicate()) {
@@ -1379,14 +1196,6 @@ async function waitForCondition(predicate, message) {
     await delay(1);
   }
   assert.fail(message);
-}
-
-function checksum(bytes) {
-  let value = 0;
-  for (const byte of bytes) {
-    value = value * 131 + byte;
-  }
-  return value;
 }
 
 function bodyBatchIterable(batches) {
@@ -1440,7 +1249,7 @@ async function withNativePair(
 
 async function testCertificate() {
   if (certificateDirectory == null) {
-    certificateDirectory = await mkdtemp(join(tmpdir(), "trevrpc-js-zero-copy-cert-"));
+    certificateDirectory = await mkdtemp(join(tmpdir(), "trevrpc-js-ownership-lifecycle-cert-"));
     const certFile = join(certificateDirectory, "cert.pem");
     const keyFile = join(certificateDirectory, "key.pem");
     const generated = spawnSync(
