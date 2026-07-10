@@ -38,12 +38,8 @@ const GRPC_SAY_HELLO_PATH: &str = "/example.greeter.Greeter/SayHello";
 const GRPC_LOTS_OF_REPLIES_PATH: &str = "/example.greeter.Greeter/LotsOfReplies";
 const GRPC_LOTS_OF_GREETINGS_PATH: &str = "/example.greeter.Greeter/LotsOfGreetings";
 const GRPC_BIDI_HELLO_PATH: &str = "/example.greeter.Greeter/BidiHello";
-const STREAM_IDLE_TIMEOUT_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT";
 const QUINN_MAX_IDLE_TIMEOUT_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_MAX_IDLE_TIMEOUT_MS";
 const QUINN_KEEP_ALIVE_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS";
-const QUINN_SEND_WINDOW_BYTES_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES";
-const QUINN_ACK_THRESHOLD_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD";
-const QUINN_ACK_DELAY_MS_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS";
 const QUINN_QLOG_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG";
 const QUINN_PROTO_TRACE_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE";
 const SHAPES_ENV: &str = "TREVRPC_RUST_SPLIT_BENCH_SHAPES";
@@ -91,7 +87,7 @@ async fn main() -> BenchResult {
             run_grpc_server(addr, Path::new(&cert), Path::new(&key)).await
         }
         _ => Err(
-            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <cert> <iterations> | grpc-server <addr> <cert> <key>\nset TREVRPC_RUST_SPLIT_BENCH_STREAM_IDLE_TIMEOUT=default to keep production stream idle timers in TrevRPC split rows; set TREVRPC_RUST_SPLIT_BENCH_SHAPES=client_stream_latency,bidi_stream_latency and TREVRPC_RUST_QUINN_FRAME_TRACE=1 for focused frame diagnostics; set TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG and TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE=1 for packet diagnostics; set SSLKEYLOGFILE for TLS key logging"
+            "usage: rpc_split_bench client <addr> <cert> <iterations> | server [addr] | webtransport-server <addr> <cert> <origin> | grpc-client <addr> <cert> <iterations> | grpc-server <addr> <cert> <key>\nset TREVRPC_RUST_SPLIT_BENCH_SHAPES=client_stream_latency,bidi_stream_latency to select workloads; set TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG and TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE=1 for packet diagnostics; set SSLKEYLOGFILE for TLS key logging"
                 .into(),
         ),
     }
@@ -1073,12 +1069,11 @@ fn benchmark_server_options() -> trevrpc::server::ServerOptions {
 }
 
 fn split_benchmark_server_options() -> trevrpc::server::ServerOptions {
-    benchmark_server_options().with_stream_idle_timeout(split_benchmark_stream_idle_timeout())
+    benchmark_server_options()
 }
 
 fn split_benchmark_call_options() -> trevrpc::client::CallOptions {
-    let options = trevrpc::client::CallOptions::new()
-        .with_stream_idle_timeout(split_benchmark_stream_idle_timeout());
+    let options = trevrpc::client::CallOptions::new();
     if benchmark_metadata_enabled() {
         options
             .with_timeout(Duration::from_mins(10))
@@ -1086,18 +1081,6 @@ fn split_benchmark_call_options() -> trevrpc::client::CallOptions {
     } else {
         options
     }
-}
-
-fn split_benchmark_stream_idle_timeout() -> Option<Duration> {
-    static STREAM_IDLE_TIMEOUT: OnceLock<Option<Duration>> = OnceLock::new();
-
-    *STREAM_IDLE_TIMEOUT.get_or_init(|| match std::env::var(STREAM_IDLE_TIMEOUT_ENV) {
-        Ok(value) if matches!(value.as_str(), "default" | "production" | "on" | "1") => {
-            trevrpc::server::ServerOptions::new().stream_idle_timeout()
-        }
-        Ok(value) if matches!(value.as_str(), "disabled" | "none" | "off" | "0") => None,
-        Ok(_) | Err(_) => None,
-    })
 }
 
 fn benchmark_webtransport_server_options(origin: String) -> trevrpc::server::ServerOptions {
@@ -1118,7 +1101,7 @@ fn make_server_endpoint(
         options,
         &identity,
         vec![trevrpc::ALPN.to_vec()],
-        false,
+        trevrpc::quinn::TransportMode::Native,
     )
 }
 
@@ -1137,7 +1120,7 @@ fn make_webtransport_server_endpoint(
             trevrpc::ALPN.to_vec(),
             web_transport_quinn::ALPN.as_bytes().to_vec(),
         ],
-        true,
+        trevrpc::quinn::TransportMode::WebTransport,
     )
 }
 
@@ -1158,7 +1141,7 @@ fn make_server_endpoint_with_identity(
     options: &trevrpc::server::ServerOptions,
     identity: &rcgen::CertifiedKey<rcgen::KeyPair>,
     alpn_protocols: Vec<Vec<u8>>,
-    enable_webtransport: bool,
+    mode: trevrpc::quinn::TransportMode,
 ) -> BenchResult<quinn::Endpoint> {
     let key_der = PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der());
 
@@ -1173,7 +1156,7 @@ fn make_server_endpoint_with_identity(
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    trevrpc::quinn::configure_server_config(&mut server_config, options, enable_webtransport);
+    trevrpc::quinn::configure_server_config(&mut server_config, options, mode);
     apply_quinn_benchmark_tuning(&mut server_config)?;
     Ok(quinn::Endpoint::server(server_config, addr)?)
 }
@@ -1189,21 +1172,6 @@ fn apply_quinn_benchmark_tuning(config: &mut quinn::ServerConfig) -> BenchResult
     if let Some(value) = env_u64(QUINN_KEEP_ALIVE_MS_ENV)? {
         transport.keep_alive_interval(Some(Duration::from_millis(value)));
     }
-    if let Some(value) = env_u64(QUINN_SEND_WINDOW_BYTES_ENV)? {
-        transport.send_window(value);
-    }
-
-    let ack_threshold = env_u64(QUINN_ACK_THRESHOLD_ENV)?;
-    let ack_delay = env_u64(QUINN_ACK_DELAY_MS_ENV)?;
-    if ack_threshold.is_some() || ack_delay.is_some() {
-        let mut ack = quinn::AckFrequencyConfig::default();
-        if let Some(value) = ack_threshold {
-            ack.ack_eliciting_threshold(quinn::VarInt::from_u64(value)?);
-        }
-        ack.max_ack_delay(ack_delay.map(Duration::from_millis));
-        transport.ack_frequency_config(Some(ack));
-    }
-
     if let Ok(path) = std::env::var(QUINN_QLOG_ENV)
         && !path.is_empty()
     {
@@ -1280,7 +1248,7 @@ fn make_client_endpoint(cert_path: &Path) -> BenchResult<quinn::Endpoint> {
     trevrpc::quinn::configure_client_config(
         &mut client_config,
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-        false,
+        trevrpc::quinn::TransportMode::Native,
     );
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)

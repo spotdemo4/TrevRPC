@@ -1,6 +1,5 @@
-use std::fmt;
 use std::future::{Future, pending};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use prost::Message;
@@ -20,16 +19,13 @@ const CANCELLED_STREAM_CODE: u32 = 1;
 const FRAME_HEADER_LEN: u64 = 4;
 
 fn trace_quinn_event(event: &'static str, detail: &'static str) {
-    trace_quinn_frame_line(format_args!("event={event} detail={detail}"));
     #[cfg(feature = "tracing")]
     tracing::trace!(target: "trevrpc::quinn::frames", event, detail);
+    #[cfg(not(feature = "tracing"))]
+    let _ = (event, detail);
 }
 
 fn trace_tx_frame<M: Message>(encoded_len: usize) {
-    trace_quinn_frame_line(format_args!(
-        "direction=tx frame={} encoded_len={encoded_len}",
-        std::any::type_name::<M>()
-    ));
     #[cfg(feature = "tracing")]
     tracing::trace!(
         target: "trevrpc::quinn::frames",
@@ -37,13 +33,11 @@ fn trace_tx_frame<M: Message>(encoded_len: usize) {
         frame = std::any::type_name::<M>(),
         encoded_len,
     );
+    #[cfg(not(feature = "tracing"))]
+    let _ = (encoded_len, std::marker::PhantomData::<M>);
 }
 
 fn trace_rx_frame<M: Message>(encoded_len: usize) {
-    trace_quinn_frame_line(format_args!(
-        "direction=rx frame={} encoded_len={encoded_len}",
-        std::any::type_name::<M>()
-    ));
     #[cfg(feature = "tracing")]
     tracing::trace!(
         target: "trevrpc::quinn::frames",
@@ -51,12 +45,11 @@ fn trace_rx_frame<M: Message>(encoded_len: usize) {
         frame = std::any::type_name::<M>(),
         encoded_len,
     );
+    #[cfg(not(feature = "tracing"))]
+    let _ = (encoded_len, std::marker::PhantomData::<M>);
 }
 
 fn trace_tx_stream_message_frame(body_len: usize, batch_len: usize) {
-    trace_quinn_frame_line(format_args!(
-        "direction=tx frame=RpcStreamFrame kind=message body_len={body_len} batch_len={batch_len}"
-    ));
     #[cfg(feature = "tracing")]
     tracing::trace!(
         target: "trevrpc::quinn::frames",
@@ -66,55 +59,48 @@ fn trace_tx_stream_message_frame(body_len: usize, batch_len: usize) {
         body_len,
         batch_len,
     );
+    #[cfg(not(feature = "tracing"))]
+    let _ = (body_len, batch_len);
 }
 
 fn trace_tx_stream_frame(frame: &RpcStreamFrame, encoded_len: usize) {
-    let frame_kind = frame.frame_kind();
-    let status = frame.status;
-    let body_len = frame.body.len();
-    trace_quinn_frame_line(format_args!(
-        "direction=tx frame=RpcStreamFrame kind={frame_kind:?} status={status} body_len={body_len} encoded_len={encoded_len}"
-    ));
     #[cfg(feature = "tracing")]
-    tracing::trace!(
-        target: "trevrpc::quinn::frames",
-        direction = "tx",
-        frame = "RpcStreamFrame",
-        ?frame_kind,
-        status,
-        body_len,
-        encoded_len,
-    );
+    {
+        let frame_kind = frame.frame_kind();
+        let status = frame.status;
+        let body_len = frame.body.len();
+        tracing::trace!(
+            target: "trevrpc::quinn::frames",
+            direction = "tx",
+            frame = "RpcStreamFrame",
+            ?frame_kind,
+            status,
+            body_len,
+            encoded_len,
+        );
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = (frame, encoded_len);
 }
 
 fn trace_rx_stream_frame(frame: &RpcStreamFrame, encoded_len: usize) {
-    let frame_kind = frame.frame_kind();
-    let status = frame.status;
-    let body_len = frame.body.len();
-    trace_quinn_frame_line(format_args!(
-        "direction=rx frame=RpcStreamFrame kind={frame_kind:?} status={status} body_len={body_len} encoded_len={encoded_len}"
-    ));
     #[cfg(feature = "tracing")]
-    tracing::trace!(
-        target: "trevrpc::quinn::frames",
-        direction = "rx",
-        frame = "RpcStreamFrame",
-        ?frame_kind,
-        status,
-        body_len,
-        encoded_len,
-    );
-}
-
-fn trace_quinn_frame_line(args: fmt::Arguments<'_>) {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("TREVRPC_RUST_QUINN_FRAME_TRACE")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-    });
-    if enabled {
-        eprintln!("trevrpc-quinn-frame {args}");
+    {
+        let frame_kind = frame.frame_kind();
+        let status = frame.status;
+        let body_len = frame.body.len();
+        tracing::trace!(
+            target: "trevrpc::quinn::frames",
+            direction = "rx",
+            frame = "RpcStreamFrame",
+            ?frame_kind,
+            status,
+            body_len,
+            encoded_len,
+        );
     }
+    #[cfg(not(feature = "tracing"))]
+    let _ = (frame, encoded_len);
 }
 
 struct QuinnFrameTrace;
@@ -175,11 +161,29 @@ pub struct TransportLimits {
     pub max_concurrent_uni_streams: Option<u64>,
 }
 
+/// Selects the QUIC stream behavior required by the protocol carried over a Quinn connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportMode {
+    /// Native `TrevRPC` uses bidirectional QUIC streams exclusively.
+    Native,
+    /// `WebTransport` requires peer-initiated unidirectional HTTP/3 streams.
+    WebTransport,
+}
+
+impl TransportMode {
+    const fn max_concurrent_uni_streams(self) -> Option<u64> {
+        match self {
+            Self::Native => Some(0),
+            Self::WebTransport => None,
+        }
+    }
+}
+
 /// Builds QUIC transport limits from server options.
 #[must_use]
 pub fn transport_limits_from_server_options(
     options: &ServerOptions,
-    allow_incoming_uni_streams: bool,
+    mode: TransportMode,
 ) -> TransportLimits {
     let stream_receive_window = frame_receive_window(options.max_frame_size());
 
@@ -190,31 +194,20 @@ pub fn transport_limits_from_server_options(
             .max_concurrent_streams_per_connection()
             // Keep one extra stream available so over-limit RPCs can receive a TrevRPC status.
             .map(|max_streams| saturating_usize_to_u64(max_streams).saturating_add(1)),
-        max_concurrent_uni_streams: if allow_incoming_uni_streams {
-            None
-        } else {
-            Some(0)
-        },
+        max_concurrent_uni_streams: mode.max_concurrent_uni_streams(),
     }
 }
 
 /// Builds QUIC transport limits for a client connection.
 #[must_use]
-pub fn client_transport_limits(
-    max_frame_size: usize,
-    allow_incoming_uni_streams: bool,
-) -> TransportLimits {
+pub fn client_transport_limits(max_frame_size: usize, mode: TransportMode) -> TransportLimits {
     let stream_receive_window = frame_receive_window(max_frame_size);
 
     TransportLimits {
         stream_receive_window,
         connection_receive_window: stream_receive_window,
         max_concurrent_bidi_streams: Some(0),
-        max_concurrent_uni_streams: if allow_incoming_uni_streams {
-            None
-        } else {
-            Some(0)
-        },
+        max_concurrent_uni_streams: mode.max_concurrent_uni_streams(),
     }
 }
 
@@ -222,9 +215,9 @@ pub fn client_transport_limits(
 pub fn configure_server_config(
     config: &mut quinn::ServerConfig,
     options: &ServerOptions,
-    allow_incoming_uni_streams: bool,
+    mode: TransportMode,
 ) {
-    let limits = transport_limits_from_server_options(options, allow_incoming_uni_streams);
+    let limits = transport_limits_from_server_options(options, mode);
     if let Some(transport) = Arc::get_mut(&mut config.transport) {
         apply_transport_limits(transport, limits);
     } else {
@@ -238,9 +231,9 @@ pub fn configure_server_config(
 pub fn configure_client_config(
     config: &mut quinn::ClientConfig,
     max_frame_size: usize,
-    allow_incoming_uni_streams: bool,
+    mode: TransportMode,
 ) {
-    let limits = client_transport_limits(max_frame_size, allow_incoming_uni_streams);
+    let limits = client_transport_limits(max_frame_size, mode);
     let mut transport = quinn::TransportConfig::default();
     apply_transport_limits(&mut transport, limits);
     config.transport_config(Arc::new(transport));
@@ -1321,7 +1314,10 @@ async fn drain_connection_tasks(connection_tasks: &mut JoinSet<()>, endpoint: &q
 mod tests {
     use crate::server::ServerOptions;
 
-    use super::{TransportLimits, client_transport_limits, transport_limits_from_server_options};
+    use super::{
+        TransportLimits, TransportMode, client_transport_limits,
+        transport_limits_from_server_options,
+    };
 
     #[test]
     fn server_transport_limits_align_with_trevrpc_limits() {
@@ -1331,7 +1327,7 @@ mod tests {
             .with_max_concurrent_streams_per_connection(Some(10));
 
         assert_eq!(
-            transport_limits_from_server_options(&options, false),
+            transport_limits_from_server_options(&options, TransportMode::Native),
             TransportLimits {
                 stream_receive_window: 1028,
                 connection_receive_window: 4096,
@@ -1340,7 +1336,8 @@ mod tests {
             }
         );
         assert_eq!(
-            transport_limits_from_server_options(&options, true).max_concurrent_uni_streams,
+            transport_limits_from_server_options(&options, TransportMode::WebTransport)
+                .max_concurrent_uni_streams,
             None
         );
     }
@@ -1348,7 +1345,7 @@ mod tests {
     #[test]
     fn client_transport_limits_reject_unused_peer_initiated_streams() {
         assert_eq!(
-            client_transport_limits(2048, false),
+            client_transport_limits(2048, TransportMode::Native),
             TransportLimits {
                 stream_receive_window: 2052,
                 connection_receive_window: 2052,
@@ -1357,7 +1354,7 @@ mod tests {
             }
         );
         assert_eq!(
-            client_transport_limits(2048, true).max_concurrent_uni_streams,
+            client_transport_limits(2048, TransportMode::WebTransport).max_concurrent_uni_streams,
             None
         );
     }
@@ -1369,7 +1366,7 @@ mod tests {
             .with_max_stream_body_size(None)
             .with_max_concurrent_streams_per_connection(Some(usize::MAX));
 
-        let limits = transport_limits_from_server_options(&options, false);
+        let limits = transport_limits_from_server_options(&options, TransportMode::Native);
 
         assert_eq!(limits.stream_receive_window, u64::MAX);
         assert_eq!(limits.connection_receive_window, u64::MAX);

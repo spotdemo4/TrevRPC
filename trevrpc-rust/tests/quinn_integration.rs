@@ -1945,7 +1945,7 @@ fn spawn_webtransport_greeter_server(
     configure(&mut server);
     let (endpoint, cert_der) = make_server_endpoint_with_alpns(
         &[trevrpc::ALPN, web_transport_quinn::ALPN.as_bytes()],
-        true,
+        trevrpc::quinn::TransportMode::WebTransport,
         server.options(),
     )?;
     let addr = endpoint.local_addr()?;
@@ -2146,12 +2146,16 @@ where
 fn make_server_endpoint(
     options: &ServerOptions,
 ) -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
-    make_server_endpoint_with_alpns(&[trevrpc::ALPN], false, options)
+    make_server_endpoint_with_alpns(
+        &[trevrpc::ALPN],
+        trevrpc::quinn::TransportMode::Native,
+        options,
+    )
 }
 
 fn make_server_endpoint_with_alpns(
     alpns: &[&[u8]],
-    allow_uni_streams: bool,
+    mode: trevrpc::quinn::TransportMode,
     options: &ServerOptions,
 ) -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
@@ -2165,7 +2169,7 @@ fn make_server_endpoint_with_alpns(
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    trevrpc::quinn::configure_server_config(&mut server_config, options, allow_uni_streams);
+    trevrpc::quinn::configure_server_config(&mut server_config, options, mode);
 
     Ok((
         quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?,
@@ -2188,7 +2192,11 @@ fn make_mtls_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'s
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    trevrpc::quinn::configure_server_config(&mut server_config, &ServerOptions::new(), false);
+    trevrpc::quinn::configure_server_config(
+        &mut server_config,
+        &ServerOptions::new(),
+        trevrpc::quinn::TransportMode::Native,
+    );
 
     Ok((
         quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?,
@@ -2218,7 +2226,7 @@ fn make_client_endpoint_with_alpn(
     trevrpc::quinn::configure_client_config(
         &mut client_config,
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-        false,
+        trevrpc::quinn::TransportMode::Native,
     );
     endpoint.set_default_client_config(client_config);
 

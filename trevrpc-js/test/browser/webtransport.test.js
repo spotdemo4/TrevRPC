@@ -470,7 +470,7 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
       },
     },
   }).lookupType("browser.lifecycle.Message");
-  const transport = await connect(webTransportURL, await webTransportOptions());
+  const transport = await connect(webTransportURL, await browserConnectOptions());
   const options = {
     metadata: { authorization: "Bearer trevrpc-example-token" },
     streamIdleTimeoutMs: 10_000,
@@ -680,7 +680,7 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
     return `${prefix}-${String(index).padStart(3, "0")}`;
   }
 
-  async function webTransportOptions() {
+  async function browserConnectOptions() {
     const response = await fetch("./certificate-hash.json", { cache: "no-store" });
     const config = await response.json();
     return {

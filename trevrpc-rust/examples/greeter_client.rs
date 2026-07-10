@@ -101,7 +101,7 @@ fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync
     trevrpc::quinn::configure_client_config(
         &mut client_config,
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-        false,
+        trevrpc::quinn::TransportMode::Native,
     );
     endpoint.set_default_client_config(client_config);
 

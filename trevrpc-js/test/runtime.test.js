@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -96,14 +96,14 @@ test("browser root connect flattens browser WebTransport options", async () => {
   const transport = await connect("https://example.test/trevrpc", {
     WebTransport: FakeWebTransport,
     allowPooling: true,
+    requireUnreliable: true,
     serverCertificateHashes: [certificateHash],
-    webTransportOptions: { allowPooling: false, requireUnreliable: true },
   });
 
   assert.ok(transport instanceof WebTransportClient);
   assert.equal(observed.url, "https://example.test/trevrpc");
   assert.deepEqual(observed.options, {
-    allowPooling: false,
+    allowPooling: true,
     requireUnreliable: true,
     serverCertificateHashes: [certificateHash],
   });
@@ -127,55 +127,6 @@ test("browser WebTransport stream open reports unsupported bidirectional streams
     client.openBidirectionalStream(),
     (error) => error.code === Code.Unavailable,
   );
-});
-
-test("package root connect uses native transport under Node", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "trevrpc-js-native-"));
-  const fakeNativePath = join(directory, "fake-native.cjs");
-  const previousNativePath = process.env.TREVRPC_JS_NATIVE;
-
-  await writeFile(
-    fakeNativePath,
-    `module.exports = {
-  async connectMsQuic(options) {
-    return {
-      options,
-      async call() {
-        return { status: 0, body: new Uint8Array(0) };
-      },
-      async startStream() {
-        throw new Error("unused");
-      },
-      close() {
-        this.closed = true;
-      },
-    };
-  },
-};
-`,
-  );
-
-  try {
-    process.env.TREVRPC_JS_NATIVE = fakeNativePath;
-    const runtime = await import("trevrpc-js");
-    const transport = await runtime.connect("https://example.test:444/trevrpc?mode=test", {
-      skipCertificateValidation: true,
-    });
-
-    assert.equal(transport.constructor.name, "NodeTransport");
-    assert.equal(transport.nativeClient.options.host, "example.test");
-    assert.equal(transport.nativeClient.options.port, 444);
-    assert.equal(transport.nativeClient.options.path, "/trevrpc?mode=test");
-    assert.equal(transport.nativeClient.options.origin, "https://example.test:444");
-    assert.equal(transport.nativeClient.options.skipCertificateValidation, true);
-  } finally {
-    if (previousNativePath == null) {
-      delete process.env.TREVRPC_JS_NATIVE;
-    } else {
-      process.env.TREVRPC_JS_NATIVE = previousNativePath;
-    }
-    await rm(directory, { force: true, recursive: true });
-  }
 });
 
 test("Node transport forwards metadata, version, and timeout to native client", async () => {
@@ -695,23 +646,20 @@ test("WebTransport writes request body batches", async () => {
   await responses[Symbol.asyncIterator]().return();
 });
 
-test("WebTransport splits request body batches by byte limit", async () => {
+test("WebTransport splits request body batches at the fixed byte limit", async () => {
   const writes = [];
-  const bodies = [new Uint8Array([1, 2]), new Uint8Array([3]), new Uint8Array([4, 5, 6])];
+  const bodies = [new Uint8Array(32 * 1024), new Uint8Array(32 * 1024), new Uint8Array([1])];
   const stream = fakeBidirectionalStream({
     onWrite(chunk) {
       writes.push(chunk);
     },
   });
-  const client = new WebTransportClient(
-    {
-      ready: Promise.resolve(),
-      createBidirectionalStream() {
-        return Promise.resolve(stream);
-      },
+  const client = new WebTransportClient({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
     },
-    { streamWriteBatchMaxBytes: 3 },
-  );
+  });
   const requestBody = {
     [Symbol.asyncIterator]() {
       let sent = false;
@@ -1160,7 +1108,7 @@ test("Node transport reads native response body batches and delays terminal stat
       };
     },
   };
-  const transport = new NodeTransport(nativeClient, { streamReadBatchMaxMessages: 7 });
+  const transport = new NodeTransport(nativeClient);
 
   const responses = await transport.streamingCall(
     {
@@ -1189,7 +1137,7 @@ test("Node transport reads native response body batches and delays terminal stat
   assert.equal(second.value.status.status, Code.Ok);
   assert.deepEqual(second.value.status.metadata.trailer, new Uint8Array([7]));
   assert.equal(closed, true);
-  assert.equal(observedMax, 7);
+  assert.equal(observedMax, 32);
   assert.equal(recvBodyBatchCalls, 1);
 });
 

@@ -52,8 +52,6 @@ type ServerOptions struct {
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
 	EnableWebTransport                bool
-	WebTransportPath                  string
-	WebTransportCheckOrigin           func(*http.Request) bool
 	WebTransportAdmission             WebTransportAdmission
 }
 
@@ -67,6 +65,7 @@ type WebTransportAdmissionRequest struct {
 }
 
 // WebTransportAdmission decides whether to accept a WebTransport session.
+// WebTransport sessions are rejected when it is nil.
 type WebTransportAdmission func(WebTransportAdmissionRequest) bool
 
 // DefaultServerOptions returns the default server limits and timeouts.
@@ -81,7 +80,6 @@ func DefaultServerOptions() ServerOptions {
 		MaxStreamMessages:                 4096,
 		MaxStreamBodySize:                 16 * 1024 * 1024,
 		StreamIdleTimeout:                 30 * time.Second,
-		WebTransportPath:                  "/trevrpc",
 	}
 }
 

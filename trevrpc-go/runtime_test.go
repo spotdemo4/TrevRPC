@@ -1614,14 +1614,11 @@ func TestWebTransportRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 	}
 }
 
-func TestWebTransportCheckOriginAllowsBrowserOrigin(t *testing.T) {
+func TestWebTransportAdmissionAllowsBrowserOrigin(t *testing.T) {
 	origin := "http://127.0.0.1:8080"
-	running := startTestWebTransportServer(t, func(server *Server) {
-		options := server.Options()
-		options.WebTransportCheckOrigin = func(r *http.Request) bool {
-			return r.Header.Get("Origin") == origin
-		}
-		server.SetOptions(options)
+	running := startTestWebTransportServerWithAdmission(t, func(request WebTransportAdmissionRequest) bool {
+		return request.Path == "/trevrpc" && request.Origin == origin
+	}, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
 
@@ -1664,6 +1661,31 @@ func TestWebTransportAdmissionReceivesRequestFields(t *testing.T) {
 	wrongPath.Header.Set("Origin", "https://origin.test")
 	if webTransportAdmitted(options, wrongPath) {
 		t.Fatal("expected admission callback to reject unexpected path")
+	}
+}
+
+func TestWebTransportAdmissionRequired(t *testing.T) {
+	options := DefaultServerOptions()
+	options.EnableWebTransport = true
+	request := httptest.NewRequest(http.MethodGet, "https://example.test/trevrpc", nil)
+
+	if webTransportAdmitted(options, request) {
+		t.Fatal("WebTransport without an admission callback should be rejected")
+	}
+}
+
+func TestWebTransportRejectsWithoutAdmission(t *testing.T) {
+	running := startTestWebTransportServerWithAdmission(t, nil, func(*Server) {})
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/trevrpc", WebTransportDialOptions{
+		TLSClientConfig: running.clientTLS.Clone(),
+		QUICConfig:      WebTransportQUICClientConfig(DefaultMaxFrameSize, nil),
+	})
+	if err == nil {
+		transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+		t.Fatal("WebTransport without an admission callback should be rejected")
 	}
 }
 
@@ -2611,6 +2633,13 @@ func startTestQUICServerWithTLS(t *testing.T, serverTLS, clientTLS *tls.Config, 
 
 func startTestWebTransportServer(t *testing.T, configure func(*Server)) *runningTestQUICServer {
 	t.Helper()
+	return startTestWebTransportServerWithAdmission(t, func(request WebTransportAdmissionRequest) bool {
+		return request.Path == "/trevrpc"
+	}, configure)
+}
+
+func startTestWebTransportServerWithAdmission(t *testing.T, admission WebTransportAdmission, configure func(*Server)) *runningTestQUICServer {
+	t.Helper()
 	serverTLS, clientTLS := testTLSConfig(t)
 	serverTLS.NextProtos = []string{http3.NextProtoH3}
 	clientTLS.NextProtos = []string{http3.NextProtoH3}
@@ -2620,9 +2649,7 @@ func startTestWebTransportServer(t *testing.T, configure func(*Server)) *running
 	configure(server)
 	options := server.Options()
 	options.EnableWebTransport = true
-	if options.WebTransportCheckOrigin == nil {
-		options.WebTransportCheckOrigin = func(*http.Request) bool { return true }
-	}
+	options.WebTransportAdmission = admission
 	server.SetOptions(options)
 
 	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICServerConfig(server.Options(), nil))

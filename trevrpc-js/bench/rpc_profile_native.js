@@ -146,7 +146,7 @@ try {
     }
   });
   await runProfileCase("node.native_unary", iterations, async () => {
-    const response = await nativeClient.call(service, "SayHello", requestBody);
+    const response = await nativeClient.call({ service, method: "SayHello", body: requestBody });
     validateUnaryResponse(response);
   });
   await runProfileCase("node.transport_unary", iterations, async () => {
@@ -155,12 +155,12 @@ try {
   });
   await runProfileCase("client.unary_full", iterations, () => unary(client));
   await runProfileCase("node.native_server_stream", iterations, async () => {
-    const stream = await nativeClient.startStream(
+    const stream = await nativeClient.startStream({
       service,
-      "LotsOfReplies",
-      RpcKind.ServerStreaming,
-      requestBody,
-    );
+      method: "LotsOfReplies",
+      kind: RpcKind.ServerStreaming,
+      body: requestBody,
+    });
     await drainNativeStream(stream, StreamMessageCount);
   });
   await runProfileCase("node.transport_server_stream", iterations, async () => {
@@ -192,23 +192,23 @@ try {
     serverStreaming(noIdleTimeoutClient),
   );
   await runProfileCase("node.native_client_stream", iterations, async () => {
-    const stream = await nativeClient.startStream(
+    const stream = await nativeClient.startStream({
       service,
-      "LotsOfGreetings",
-      RpcKind.ClientStreaming,
-      new Uint8Array(0),
-    );
+      method: "LotsOfGreetings",
+      kind: RpcKind.ClientStreaming,
+      body: new Uint8Array(0),
+    });
     await sendNativeMessages(stream);
     await stream.finishSend();
     await drainNativeStream(stream, 1);
   });
   await runProfileCase("node.native_client_stream_batch", iterations, async () => {
-    const stream = await nativeClient.startStream(
+    const stream = await nativeClient.startStream({
       service,
-      "LotsOfGreetings",
-      RpcKind.ClientStreaming,
-      new Uint8Array(0),
-    );
+      method: "LotsOfGreetings",
+      kind: RpcKind.ClientStreaming,
+      body: new Uint8Array(0),
+    });
     await sendNativeMessagesBatch(stream);
     await stream.finishSend();
     await drainNativeStream(stream, 1);
@@ -242,23 +242,23 @@ try {
     clientStreaming(noIdleTimeoutClient),
   );
   await runProfileCase("node.native_bidi_stream", iterations, async () => {
-    const stream = await nativeClient.startStream(
+    const stream = await nativeClient.startStream({
       service,
-      "BidiHello",
-      RpcKind.BidirectionalStreaming,
-      new Uint8Array(0),
-    );
+      method: "BidiHello",
+      kind: RpcKind.BidirectionalStreaming,
+      body: new Uint8Array(0),
+    });
     await sendNativeMessages(stream);
     await stream.finishSend();
     await drainNativeStream(stream, StreamMessageCount);
   });
   await runProfileCase("node.native_bidi_stream_batch", iterations, async () => {
-    const stream = await nativeClient.startStream(
+    const stream = await nativeClient.startStream({
       service,
-      "BidiHello",
-      RpcKind.BidirectionalStreaming,
-      new Uint8Array(0),
-    );
+      method: "BidiHello",
+      kind: RpcKind.BidirectionalStreaming,
+      body: new Uint8Array(0),
+    });
     await sendNativeMessagesBatch(stream);
     await stream.finishSend();
     await drainNativeStream(stream, StreamMessageCount);

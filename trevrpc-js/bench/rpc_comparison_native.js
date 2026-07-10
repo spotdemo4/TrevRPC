@@ -8,7 +8,7 @@ const LatencyStreamMessageCount = 1;
 const BenchmarkRequest = Object.freeze({ name: "TrevRPC benchmark" });
 const ServerStartupTimeoutMs = 10_000;
 const ServerShutdownTimeoutMs = 5_000;
-const SendManyBatchSize = positiveInteger(process.env.TREVRPC_JS_SEND_MANY_BATCH ?? "16");
+const SendManyBatchSize = 16;
 
 const root = createRoot({
   nested: {
@@ -84,7 +84,6 @@ try {
     port,
     maxStreamsPerSession: 128,
     idleTimeoutMs: 600_000,
-    streamWriteBatchMaxMessages: SendManyBatchSize,
   });
   const client = createServiceClient(transport, GreeterService, root);
 

@@ -297,9 +297,6 @@ static trevrpc_server_config trevrpc_effective_server_config(const trevrpc_serve
     if (config->max_streams_per_session != 0) {
         effective.max_streams_per_session = config->max_streams_per_session;
     }
-    if (config->max_data_per_session != 0) {
-        effective.max_data_per_session = config->max_data_per_session;
-    }
     if (config->stream_recv_window != 0) {
         effective.stream_recv_window = config->stream_recv_window;
     }
@@ -311,9 +308,6 @@ static trevrpc_server_config trevrpc_effective_server_config(const trevrpc_serve
     }
     if (config->msquic_send_buffering_enabled != 0) {
         effective.msquic_send_buffering_enabled = config->msquic_send_buffering_enabled;
-    }
-    if (config->handshake_timeout_ms != 0) {
-        effective.handshake_timeout_ms = config->handshake_timeout_ms;
     }
     if (config->max_frame_size != 0) {
         effective.max_frame_size = config->max_frame_size;
@@ -359,11 +353,7 @@ static trevrpc_wt_config trevrpc_make_server_wt_config(const trevrpc_server_conf
         .admission_user_data = config->webtransport_admission_user_data,
         .max_sessions_per_connection = config->max_sessions_per_connection,
         .max_streams_per_session = config->max_streams_per_session,
-        .max_data_per_session = config->max_data_per_session,
-        .stream_recv_window = config->stream_recv_window,
-        .conn_flow_control_window = config->conn_flow_control_window,
         .idle_timeout_ms = (uint32_t)config->max_idle_timeout_ms,
-        .handshake_timeout_ms = config->handshake_timeout_ms,
     };
 }
 
@@ -398,57 +388,6 @@ trevrpc_config trevrpc_default_config(void) {
 
 uint32_t trevrpc_c_abi_version(void) {
     return TREVRPC_C_ABI_VERSION;
-}
-
-static int trevrpc_apply_msquic_tuning_profile(uint32_t* stream_recv_window,
-    uint32_t* conn_flow_control_window,
-    trevrpc_msquic_execution_profile* execution_profile,
-    int* send_buffering_enabled,
-    trevrpc_msquic_tuning_profile profile) {
-    if (stream_recv_window == NULL || conn_flow_control_window == NULL || execution_profile == NULL ||
-        send_buffering_enabled == NULL) {
-        return -EINVAL;
-    }
-
-    switch (profile) {
-    case TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT:
-        *stream_recv_window = 0;
-        *conn_flow_control_window = 0;
-        *execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY;
-        *send_buffering_enabled = 0;
-        return 0;
-    case TREVRPC_MSQUIC_TUNING_PROFILE_THROUGHPUT_1M:
-        *stream_recv_window = TREVRPC_THROUGHPUT_1M_STREAM_RECV_WINDOW;
-        *conn_flow_control_window = TREVRPC_THROUGHPUT_1M_CONN_FLOW_CONTROL_WINDOW;
-        *execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_MAX_THROUGHPUT;
-        *send_buffering_enabled = 1;
-        return 0;
-    default:
-        return -EINVAL;
-    }
-}
-
-int trevrpc_config_apply_msquic_tuning_profile(trevrpc_config* config, trevrpc_msquic_tuning_profile profile) {
-    if (config == NULL) {
-        return -EINVAL;
-    }
-    return trevrpc_apply_msquic_tuning_profile(&config->stream_recv_window,
-        &config->conn_flow_control_window,
-        &config->msquic_execution_profile,
-        &config->msquic_send_buffering_enabled,
-        profile);
-}
-
-int trevrpc_server_config_apply_msquic_tuning_profile(
-    trevrpc_server_config* config, trevrpc_msquic_tuning_profile profile) {
-    if (config == NULL) {
-        return -EINVAL;
-    }
-    return trevrpc_apply_msquic_tuning_profile(&config->stream_recv_window,
-        &config->conn_flow_control_window,
-        &config->msquic_execution_profile,
-        &config->msquic_send_buffering_enabled,
-        profile);
 }
 
 trevrpc_server_config trevrpc_default_server_config(void) {

@@ -312,7 +312,7 @@ fn make_client_endpoint(cert_path: &Path) -> TestResult<quinn::Endpoint> {
     trevrpc::quinn::configure_client_config(
         &mut client_config,
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-        false,
+        trevrpc::quinn::TransportMode::Native,
     );
     endpoint.set_default_client_config(client_config);
 
@@ -382,7 +382,11 @@ fn make_server_endpoint(
     server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    trevrpc::quinn::configure_server_config(&mut server_config, options, false);
+    trevrpc::quinn::configure_server_config(
+        &mut server_config,
+        options,
+        trevrpc::quinn::TransportMode::Native,
+    );
 
     Ok(quinn::Endpoint::server(
         server_config,

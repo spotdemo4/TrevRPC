@@ -46,7 +46,6 @@ final | soak)
     ;;
 esac
 
-PROFILES=(safe throughput-1m)
 RAW_DIR=$OUT_DIR/raw
 WARMUP_DIR=$OUT_DIR/warmup
 SAMPLES=$OUT_DIR/samples.csv
@@ -57,8 +56,8 @@ PROVENANCE=$OUT_DIR/provenance.env
 
 mkdir -p "$RAW_DIR" "$WARMUP_DIR"
 : >"$COMMANDS"
-printf 'profile,scenario,run,status,raw_csv,stderr,source_sha256,binary_sha256\n' >"$MANIFEST"
-printf 'profile,scenario,run,status,raw_csv,stderr\n' >"$FAILURES"
+printf 'scenario,run,status,raw_csv,stderr,source_sha256,binary_sha256\n' >"$MANIFEST"
+printf 'scenario,run,status,raw_csv,stderr\n' >"$FAILURES"
 rm -f "$SAMPLES"
 
 SOURCE_SHA256=$(sha256sum "$SOURCE" | awk '{print $1}')
@@ -92,46 +91,42 @@ log_command() {
     } >>"$COMMANDS"
 }
 
-for profile in "${PROFILES[@]}"; do
-    warmup_csv=$WARMUP_DIR/$profile.csv
-    warmup_stderr=$WARMUP_DIR/$profile.stderr
-    command=(timeout --kill-after=5s 30s "$BINARY" "$profile" slow-reader 2 4096 8192 65536 16384 1)
-    log_command "${command[@]}"
-    if ! "${command[@]}" >"$warmup_csv" 2>"$warmup_stderr"; then
-        printf 'warmup failed for %s\n' "$profile" >&2
-        exit 1
-    fi
-done
+warmup_csv=$WARMUP_DIR/warmup.csv
+warmup_stderr=$WARMUP_DIR/warmup.stderr
+command=(timeout --kill-after=5s 30s "$BINARY" slow-reader 2 4096 8192 65536 16384 1)
+log_command "${command[@]}"
+if ! "${command[@]}" >"$warmup_csv" 2>"$warmup_stderr"; then
+    printf 'warmup failed\n' >&2
+    exit 1
+fi
 
 failures=0
 for run in $(seq 1 "$RUNS"); do
-    for profile in "${PROFILES[@]}"; do
-        for spec in "${SPECS[@]}"; do
-            IFS='|' read -r scenario concurrency request_frame response_frame cumulative reader_progress hold_ms <<<"$spec"
-            sample_id=$profile-$scenario-run$run
-            raw_csv=$RAW_DIR/$sample_id.csv
-            stderr_file=$RAW_DIR/$sample_id.stderr
-            command=(timeout --kill-after=5s "${SAMPLE_TIMEOUT_SECONDS}s" "$BINARY" "$profile" "$scenario" \
-                "$concurrency" "$request_frame" "$response_frame" "$cumulative" "$reader_progress" "$hold_ms")
-            log_command "${command[@]}"
-            "${command[@]}" >"$raw_csv" 2>"$stderr_file"
-            status=$?
-            if [[ ! -s "$SAMPLES" && -s "$raw_csv" ]]; then
-                printf 'run,' >"$SAMPLES"
-                awk 'NR == 1 { print; exit }' "$raw_csv" >>"$SAMPLES"
-            fi
-            if [[ -s "$raw_csv" ]]; then
-                printf '%s,' "$run" >>"$SAMPLES"
-                awk 'NR == 2 { print; exit }' "$raw_csv" >>"$SAMPLES"
-            fi
-            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$profile" "$scenario" "$run" "$status" \
-                "$raw_csv" "$stderr_file" "$SOURCE_SHA256" "$BINARY_SHA256" >>"$MANIFEST"
-            if [[ "$status" != 0 ]]; then
-                printf '%s,%s,%s,%s,%s,%s\n' \
-                    "$profile" "$scenario" "$run" "$status" "$raw_csv" "$stderr_file" >>"$FAILURES"
-                failures=$((failures + 1))
-            fi
-        done
+    for spec in "${SPECS[@]}"; do
+        IFS='|' read -r scenario concurrency request_frame response_frame cumulative reader_progress hold_ms <<<"$spec"
+        sample_id=$scenario-run$run
+        raw_csv=$RAW_DIR/$sample_id.csv
+        stderr_file=$RAW_DIR/$sample_id.stderr
+        command=(timeout --kill-after=5s "${SAMPLE_TIMEOUT_SECONDS}s" "$BINARY" "$scenario" \
+            "$concurrency" "$request_frame" "$response_frame" "$cumulative" "$reader_progress" "$hold_ms")
+        log_command "${command[@]}"
+        "${command[@]}" >"$raw_csv" 2>"$stderr_file"
+        status=$?
+        if [[ ! -s "$SAMPLES" && -s "$raw_csv" ]]; then
+            printf 'run,' >"$SAMPLES"
+            awk 'NR == 1 { print; exit }' "$raw_csv" >>"$SAMPLES"
+        fi
+        if [[ -s "$raw_csv" ]]; then
+            printf '%s,' "$run" >>"$SAMPLES"
+            awk 'NR == 2 { print; exit }' "$raw_csv" >>"$SAMPLES"
+        fi
+        printf '%s,%s,%s,%s,%s,%s,%s\n' "$scenario" "$run" "$status" \
+            "$raw_csv" "$stderr_file" "$SOURCE_SHA256" "$BINARY_SHA256" >>"$MANIFEST"
+        if [[ "$status" != 0 ]]; then
+            printf '%s,%s,%s,%s,%s\n' \
+                "$scenario" "$run" "$status" "$raw_csv" "$stderr_file" >>"$FAILURES"
+            failures=$((failures + 1))
+        fi
     done
 done
 

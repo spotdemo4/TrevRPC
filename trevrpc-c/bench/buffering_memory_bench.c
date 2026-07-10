@@ -54,7 +54,6 @@ typedef struct buffering_profile {
     uint32_t bound_model_conn_flow_control_window;
     trevrpc_msquic_execution_profile execution_profile;
     int send_buffering_enabled;
-    trevrpc_msquic_tuning_profile public_profile;
 } buffering_profile;
 
 typedef struct call_registry {
@@ -99,34 +98,19 @@ typedef struct scenario_metrics {
     int observed_reset_result;
 } scenario_metrics;
 
-static const buffering_profile Profiles[] = {
-    {
-        .name = "safe",
-        .receive_window_basis = MSQUIC_2_5_8_DOCUMENTED_DEFAULTS_BASIS,
-        .bound_model_stream_recv_window = MSQUIC_2_5_8_DOCUMENTED_DEFAULT_STREAM_RECV_WINDOW,
-        .bound_model_conn_flow_control_window = MSQUIC_2_5_8_DOCUMENTED_DEFAULT_CONN_FLOW_CONTROL_WINDOW,
-        .execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY,
-        .send_buffering_enabled = 0,
-        .public_profile = TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT,
-    },
-    {
-        .name = "throughput-1m",
-        .receive_window_basis = "trevrpc-helper-explicit",
-        .configured_stream_recv_window = TREVRPC_THROUGHPUT_1M_STREAM_RECV_WINDOW,
-        .configured_conn_flow_control_window = TREVRPC_THROUGHPUT_1M_CONN_FLOW_CONTROL_WINDOW,
-        .bound_model_stream_recv_window = TREVRPC_THROUGHPUT_1M_STREAM_RECV_WINDOW,
-        .bound_model_conn_flow_control_window = TREVRPC_THROUGHPUT_1M_CONN_FLOW_CONTROL_WINDOW,
-        .execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_MAX_THROUGHPUT,
-        .send_buffering_enabled = 1,
-        .public_profile = TREVRPC_MSQUIC_TUNING_PROFILE_THROUGHPUT_1M,
-    },
+static const buffering_profile SafeProfile = {
+    .name = "safe",
+    .receive_window_basis = MSQUIC_2_5_8_DOCUMENTED_DEFAULTS_BASIS,
+    .bound_model_stream_recv_window = MSQUIC_2_5_8_DOCUMENTED_DEFAULT_STREAM_RECV_WINDOW,
+    .bound_model_conn_flow_control_window = MSQUIC_2_5_8_DOCUMENTED_DEFAULT_CONN_FLOW_CONTROL_WINDOW,
+    .execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY,
+    .send_buffering_enabled = 0,
 };
 
 static void usage(const char* program) {
     fprintf(stderr,
-        "usage: %s PROFILE SCENARIO CONCURRENCY REQUEST_FRAME RESPONSE_FRAME CUMULATIVE_BODY READER_PROGRESS "
+        "usage: %s SCENARIO CONCURRENCY REQUEST_FRAME RESPONSE_FRAME CUMULATIVE_BODY READER_PROGRESS "
         "HOLD_MS\n"
-        "  PROFILE: safe | throughput-1m\n"
         "  SCENARIO: slow-reader | stalled-handler | reset | close | overload | body-limit\n"
         "  REQUEST_FRAME and RESPONSE_FRAME are TrevRPC message body bytes and may differ\n"
         "  READER_PROGRESS: submitted bytes per stream between high-level frame drains; 0 stalls the reader\n",
@@ -184,15 +168,6 @@ static size_t saturating_add(size_t left, size_t right) {
 
 static size_t saturating_multiply(size_t left, size_t right) {
     return left != 0 && right > SIZE_MAX / left ? SIZE_MAX : left * right;
-}
-
-static const buffering_profile* find_profile(const char* name) {
-    for (size_t i = 0; i < sizeof(Profiles) / sizeof(Profiles[0]); i++) {
-        if (strcmp(name, Profiles[i].name) == 0) {
-            return &Profiles[i];
-        }
-    }
-    return NULL;
 }
 
 static int parse_scenario(const char* name, scenario_kind* scenario) {
@@ -364,20 +339,8 @@ static void* serve_main(void* context) {
     return NULL;
 }
 
-static int apply_client_profile(trevrpc_config* config, const buffering_profile* profile) {
-    return trevrpc_config_apply_msquic_tuning_profile(config, profile->public_profile);
-}
-
-static int apply_server_profile(trevrpc_server_config* config, const buffering_profile* profile) {
-    return trevrpc_server_config_apply_msquic_tuning_profile(config, profile->public_profile);
-}
-
-static int fixture_start(rpc_fixture* fixture,
-    const buffering_profile* profile,
-    scenario_kind scenario,
-    size_t concurrency,
-    size_t cumulative_body,
-    size_t min_message_size) {
+static int fixture_start(
+    rpc_fixture* fixture, scenario_kind scenario, size_t concurrency, size_t cumulative_body, size_t min_message_size) {
     memset(fixture, 0, sizeof(*fixture));
     int err = registry_init(&fixture->registry, concurrency);
     if (err != 0) {
@@ -395,10 +358,6 @@ static int fixture_start(rpc_fixture* fixture,
     server_config.peer_bidi_stream_count = (uint16_t)concurrency;
     server_config.max_streams_per_session = (uint32_t)concurrency;
     server_config.max_frame_size = PROFILE_MAX_FRAME_SIZE;
-    err = apply_server_profile(&server_config, profile);
-    if (err != 0) {
-        return err;
-    }
     err = trevrpc_server_listen(&server_config, &fixture->server);
     if (err != 0) {
         return err;
@@ -450,10 +409,6 @@ static int fixture_start(rpc_fixture* fixture,
     client_config.keep_alive_ms = 15000;
     client_config.peer_bidi_stream_count = (uint16_t)concurrency;
     client_config.max_frame_size = PROFILE_MAX_FRAME_SIZE;
-    err = apply_client_profile(&client_config, profile);
-    if (err != 0) {
-        return err;
-    }
     return trevrpc_client_connect("127.0.0.1", port, &client_config, &fixture->client);
 }
 
@@ -982,12 +937,11 @@ static size_t convergence_rss(rpc_fixture* fixture, size_t baseline_rss_kib, siz
 }
 
 int main(int argc, char** argv) {
-    if (argc != 9) {
+    if (argc != 8) {
         usage(argv[0]);
         return 2;
     }
 
-    const buffering_profile* profile = find_profile(argv[1]);
     scenario_kind scenario;
     size_t concurrency = 0;
     size_t request_frame_size = 0;
@@ -995,10 +949,10 @@ int main(int argc, char** argv) {
     size_t cumulative_body = 0;
     size_t reader_progress = 0;
     size_t hold_ms = 0;
-    if (profile == NULL || parse_scenario(argv[2], &scenario) != 0 || parse_size(argv[3], &concurrency) != 0 ||
-        parse_size(argv[4], &request_frame_size) != 0 || parse_size(argv[5], &response_frame_size) != 0 ||
-        parse_size(argv[6], &cumulative_body) != 0 || parse_size(argv[7], &reader_progress) != 0 ||
-        parse_size(argv[8], &hold_ms) != 0 || concurrency == 0 || concurrency > PROFILE_MAX_CONCURRENCY ||
+    if (parse_scenario(argv[1], &scenario) != 0 || parse_size(argv[2], &concurrency) != 0 ||
+        parse_size(argv[3], &request_frame_size) != 0 || parse_size(argv[4], &response_frame_size) != 0 ||
+        parse_size(argv[5], &cumulative_body) != 0 || parse_size(argv[6], &reader_progress) != 0 ||
+        parse_size(argv[7], &hold_ms) != 0 || concurrency == 0 || concurrency > PROFILE_MAX_CONCURRENCY ||
         concurrency > UINT16_MAX || request_frame_size < sizeof(uint64_t) || response_frame_size == 0 ||
         request_frame_size > PROFILE_MAX_FRAME_SIZE - 1024 || response_frame_size > PROFILE_MAX_FRAME_SIZE - 1024 ||
         cumulative_body == 0 || cumulative_body > PROFILE_MAX_CUMULATIVE_BODY) {
@@ -1030,7 +984,7 @@ int main(int argc, char** argv) {
     memset(request_payload, 0xa5, request_frame_size);
     memset(response_payload, 0x5a, response_frame_size);
 
-    scenario_result = fixture_start(&fixture, profile, scenario, concurrency, cumulative_body, min_message_size);
+    scenario_result = fixture_start(&fixture, scenario, concurrency, cumulative_body, min_message_size);
     if (scenario_result != 0) {
         goto cleanup;
     }
@@ -1160,7 +1114,7 @@ cleanup:
     size_t per_stream_peak = saturating_add(saturating_multiply(cumulative_body, 2),
         saturating_multiply(saturating_add(request_frame_size, response_frame_size), 4));
     size_t peak_bound_bytes = saturating_add(
-        PEAK_FIXED_ALLOWANCE_BYTES, saturating_multiply((size_t)profile->bound_model_conn_flow_control_window, 2));
+        PEAK_FIXED_ALLOWANCE_BYTES, saturating_multiply((size_t)SafeProfile.bound_model_conn_flow_control_window, 2));
     peak_bound_bytes = saturating_add(peak_bound_bytes, saturating_multiply(concurrency, per_stream_peak));
     size_t convergence_bound_bytes = saturating_add(CONVERGENCE_FIXED_ALLOWANCE_BYTES,
         saturating_multiply(
@@ -1204,8 +1158,8 @@ cleanup:
     printf("%s,%s,%s,%zu,%zu,%zu,%zu,%zu,%zu,%u,%u,%u,%u,%s,%d,%u,%u,%zu,%zu,%zu,%u,%llu,%zu,%zu,%zu,%zu,"
            "%zu,%zu,"
            "%zu,%zu,%zu,%zu,%d,%d,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%d,%d,%zu,%zu,%.3f,%d\n",
-        profile == NULL ? argv[1] : profile->name,
-        argv[2],
+        SafeProfile.name,
+        argv[1],
         scenario_expected_outcome(scenario),
         concurrency,
         request_frame_size,
@@ -1213,13 +1167,13 @@ cleanup:
         cumulative_body,
         reader_progress,
         hold_ms,
-        profile == NULL ? 0 : profile->configured_stream_recv_window,
-        profile == NULL ? 0 : profile->configured_conn_flow_control_window,
-        profile == NULL ? 0 : profile->bound_model_stream_recv_window,
-        profile == NULL ? 0 : profile->bound_model_conn_flow_control_window,
-        profile == NULL ? "unknown" : profile->receive_window_basis,
-        profile == NULL ? 0 : profile->send_buffering_enabled,
-        profile == NULL ? 0 : (unsigned int)profile->execution_profile,
+        SafeProfile.configured_stream_recv_window,
+        SafeProfile.configured_conn_flow_control_window,
+        SafeProfile.bound_model_stream_recv_window,
+        SafeProfile.bound_model_conn_flow_control_window,
+        SafeProfile.receive_window_basis,
+        SafeProfile.send_buffering_enabled,
+        (unsigned int)SafeProfile.execution_profile,
         PROFILE_MAX_FRAME_SIZE,
         cumulative_body,
         concurrency,

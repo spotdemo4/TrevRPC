@@ -7,7 +7,7 @@ const PayloadValues = loadPayloadProfile();
 const Metadata = loadMetadataProfile();
 const ResponseMetadata = Object.keys(Metadata).length === 0 ? {} : { "benchmark-response": "ok" };
 const IdleTimeoutMs = 600_000;
-const SendManyBatchSize = positiveInteger(process.env.TREVRPC_JS_SEND_MANY_BATCH ?? "16");
+const SendManyBatchSize = 16;
 
 const root = createRoot({
   nested: {
@@ -89,7 +89,6 @@ async function runClient(host, port, iterations) {
     skipCertificateValidation: true,
     maxStreamsPerSession: 128,
     idleTimeoutMs: IdleTimeoutMs,
-    streamWriteBatchMaxMessages: SendManyBatchSize,
   });
   try {
     const client = createServiceClient(transport, GreeterService, root, callOptions());
@@ -130,7 +129,6 @@ async function runServer(certFile, keyFile) {
     maxStreamsPerSession: 65_535,
     maxStreamMessages: -1,
     idleTimeoutMs: IdleTimeoutMs,
-    streamWriteBatchMaxMessages: SendManyBatchSize,
   });
   server.registerService(GreeterService, {
     sayHello: (call) => {
@@ -283,9 +281,7 @@ function encodeReply(message) {
 }
 
 function callOptions() {
-  return Object.keys(Metadata).length === 0
-    ? { streamIdleTimeoutMs: 0 }
-    : { metadata: Metadata, streamIdleTimeoutMs: IdleTimeoutMs, timeoutMs: IdleTimeoutMs };
+  return Object.keys(Metadata).length === 0 ? {} : { metadata: Metadata, timeoutMs: IdleTimeoutMs };
 }
 
 async function sendRequestMessages(call, messageCount) {

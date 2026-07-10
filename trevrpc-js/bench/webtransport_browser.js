@@ -180,26 +180,9 @@ async function runBrowserBenchmarks({
   if (benchmarkConfig.congestionControl != null) {
     connectOptions.congestionControl = benchmarkConfig.congestionControl;
   }
-  copyPositive(
-    connectOptions,
-    "streamReadBatchMaxMessages",
-    benchmarkConfig.streamReadBatchMaxMessages,
-  );
-  copyPositive(
-    connectOptions,
-    "streamWriteBatchMaxMessages",
-    benchmarkConfig.streamWriteBatchMaxMessages,
-  );
-  copyPositive(
-    connectOptions,
-    "streamWriteBatchMaxBytes",
-    benchmarkConfig.streamWriteBatchMaxBytes,
-  );
 
   const transport = await connect(webTransportURL, connectOptions);
-  const callOptions = benchmarkConfig.disableStreamTimeouts
-    ? { streamIdleTimeoutMs: 0 }
-    : { streamIdleTimeoutMs: 600_000, timeoutMs: 600_000 };
+  const callOptions = {};
   if (Object.keys(benchmarkConfig.metadata).length > 0) {
     callOptions.metadata = benchmarkConfig.metadata;
   }
@@ -268,12 +251,6 @@ async function runBrowserBenchmarks({
       bytes[index] = binary.charCodeAt(index);
     }
     return bytes;
-  }
-
-  function copyPositive(target, key, value) {
-    if (value > 0) {
-      target[key] = value;
-    }
   }
 
   function serverStreamRequestName(messageCount) {
@@ -380,19 +357,8 @@ async function runBrowserBenchmarks({
   }
 
   async function sendRequests(call, messageCount) {
-    const batchSize = benchmarkConfig.sendManyBatchSize;
-    if (batchSize <= 1 || typeof call.sendMany !== "function") {
-      for (let index = 0; index < messageCount; index += 1) {
-        await call.send({ name: payloadForIndex(index) });
-      }
-      return;
-    }
-
-    for (let start = 0; start < messageCount; start += batchSize) {
-      const count = Math.min(batchSize, messageCount - start);
-      await call.sendMany(
-        Array.from({ length: count }, (_, offset) => ({ name: payloadForIndex(start + offset) })),
-      );
+    for (let index = 0; index < messageCount; index += 1) {
+      await call.send({ name: payloadForIndex(index) });
     }
   }
 
@@ -722,13 +688,8 @@ function benchmarkConfigFromEnv() {
   return {
     concurrentStreams: optionalPositiveInteger("WEBTRANSPORT_CONCURRENT_STREAMS", 1),
     congestionControl,
-    disableStreamTimeouts: envFlag("WEBTRANSPORT_DISABLE_STREAM_TIMEOUTS"),
     metadata: metadataProfile(process.env.TREVRPC_BENCH_METADATA_PROFILE ?? "none"),
     payloadProfile: payloadProfile(process.env.TREVRPC_BENCH_PAYLOAD_PROFILE ?? "tiny"),
-    sendManyBatchSize: optionalPositiveInteger("WEBTRANSPORT_SEND_MANY_BATCH", 1),
-    streamReadBatchMaxMessages: optionalPositiveInteger("WEBTRANSPORT_STREAM_READ_BATCH", 0),
-    streamWriteBatchMaxBytes: optionalPositiveInteger("WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES", 0),
-    streamWriteBatchMaxMessages: optionalPositiveInteger("WEBTRANSPORT_STREAM_WRITE_BATCH", 0),
   };
 }
 

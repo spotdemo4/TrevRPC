@@ -166,7 +166,11 @@ fn make_endpoint(
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    trevrpc::quinn::configure_server_config(&mut server_config, options, true);
+    trevrpc::quinn::configure_server_config(
+        &mut server_config,
+        options,
+        trevrpc::quinn::TransportMode::WebTransport,
+    );
 
     Ok(quinn::Endpoint::server(server_config, addr)?)
 }

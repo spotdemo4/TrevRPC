@@ -17,14 +17,6 @@ export class NodeTransport {
   constructor(nativeClient, options = {}) {
     this.nativeClient = nativeClient;
     this.maxFrameSize = options.maxFrameSize;
-    this.streamReadBatchMaxMessages = batchMaxMessages(
-      options.streamReadBatchMaxMessages,
-      RecvManyBatchSize,
-    );
-    this.streamWriteBatchMaxMessages = batchMaxMessages(
-      options.streamWriteBatchMaxMessages,
-      SendManyBatchSize,
-    );
   }
 
   /** Opens a TrevRPC client backed by the native C runtime. */
@@ -84,14 +76,8 @@ export class NodeTransport {
     }
 
     const cleanupStreamAbort = onAbort(options.signal, () => stream.close());
-    const writerTask = writeRequestStream(stream, requestBody, this.streamWriteBatchMaxMessages);
-    return new NativeResponseFrameStream(
-      stream,
-      writerTask,
-      cleanupStreamAbort,
-      options.signal,
-      this.streamReadBatchMaxMessages,
-    );
+    const writerTask = writeRequestStream(stream, requestBody);
+    return new NativeResponseFrameStream(stream, writerTask, cleanupStreamAbort, options.signal);
   }
 
   /** Closes the underlying native client. */
@@ -110,20 +96,12 @@ export class NodeServer {
     this.authorizer = options.authorizer ?? null;
     this.metrics = options.metrics ?? null;
     this.logger = options.logger ?? null;
-    this.streamReadBatchMaxMessages = batchMaxMessages(
-      options.streamReadBatchMaxMessages,
-      RecvManyBatchSize,
-    );
-    this.streamWriteBatchMaxMessages = batchMaxMessages(
-      options.streamWriteBatchMaxMessages,
-      SendManyBatchSize,
-    );
   }
 
   /** Creates a native QUIC TrevRPC server backed by trevrpc-c. */
   static async listen(urlOrOptions, options = {}) {
     const native = loadNative();
-    const listenOptions = normalizeNodeTransportOptions(urlOrOptions, options);
+    const listenOptions = normalizeNodeListenOptions(urlOrOptions, options);
     const nativeServer = await native.listenMsQuic(listenOptions);
     return new NodeServer(nativeServer, listenOptions);
   }
@@ -207,13 +185,8 @@ export class NodeServer {
   }
 
   async #dispatch(handler, nativeCall) {
-    const call = new NodeServerCall(
-      nativeCall,
-      (completedCall) => this.#recordFinished(completedCall),
-      {
-        readBatchMaxMessages: this.streamReadBatchMaxMessages,
-        writeBatchMaxMessages: this.streamWriteBatchMaxMessages,
-      },
+    const call = new NodeServerCall(nativeCall, (completedCall) =>
+      this.#recordFinished(completedCall),
     );
     this.#recordStarted(call);
     try {
@@ -316,7 +289,7 @@ export class NodeServer {
 
 /** Raw server call passed to NodeServer handlers. */
 export class NodeServerCall {
-  constructor(nativeCall, onComplete = () => {}, options = {}) {
+  constructor(nativeCall, onComplete = () => {}) {
     this.nativeCall = nativeCall;
     this.request = nativeCall.request;
     this.completed = false;
@@ -327,8 +300,8 @@ export class NodeServerCall {
     this.finalStatus = Code.Ok;
     this.startedAt = Date.now();
     this.completedAt = null;
-    this.readBatchMaxMessages = batchMaxMessages(options.readBatchMaxMessages, RecvManyBatchSize);
-    this.writeBatchMaxMessages = batchMaxMessages(options.writeBatchMaxMessages, SendManyBatchSize);
+    this.readBatchMaxMessages = RecvManyBatchSize;
+    this.writeBatchMaxMessages = SendManyBatchSize;
     this.#onComplete = onComplete;
   }
 
@@ -449,13 +422,7 @@ export function bearerAuthorizer(token) {
 }
 
 class NativeResponseFrameStream {
-  constructor(
-    stream,
-    writerTask,
-    cleanupAbort = () => {},
-    signal = undefined,
-    readBatchMaxMessages = RecvManyBatchSize,
-  ) {
+  constructor(stream, writerTask, cleanupAbort = () => {}, signal = undefined) {
     this.stream = stream;
     this.done = false;
     this.cleanupAbort = cleanupAbort;
@@ -470,7 +437,7 @@ class NativeResponseFrameStream {
     this.pendingBodyStatus = null;
     this.pendingBodyError = null;
     this.pendingBodyEof = false;
-    this.readBatchMaxMessages = readBatchMaxMessages;
+    this.readBatchMaxMessages = RecvManyBatchSize;
     this.writerDone = writerTask
       .catch((error) => {
         this.writerError = error;
@@ -716,11 +683,11 @@ function isTerminalFrame(frame) {
   return frame == null || frame.kind === RpcStreamFrameKind.Status;
 }
 
-async function writeRequestStream(stream, requestBody, batchMaxMessages = SendManyBatchSize) {
+async function writeRequestStream(stream, requestBody) {
   const iterator = requestBody[Symbol.asyncIterator]();
   try {
     for (;;) {
-      const result = await nextRequestBodyBatch(iterator, batchMaxMessages);
+      const result = await nextRequestBodyBatch(iterator, SendManyBatchSize);
       if (result.done) {
         break;
       }
@@ -916,25 +883,36 @@ function isAsyncIterable(value) {
   return value != null && typeof value[Symbol.asyncIterator] === "function";
 }
 
-function batchMaxMessages(value, fallback) {
-  return Number.isInteger(value) && value > 0 ? value : fallback;
-}
-
 function normalizeNodeTransportOptions(urlOrOptions, options) {
   if (typeof urlOrOptions === "string" || urlOrOptions instanceof URL) {
     const url = new URL(urlOrOptions);
-    const path = `${url.pathname || "/"}${url.search}`;
     return {
       ...options,
       host: url.hostname,
       port: Number(url.port || 443),
-      path,
-      origin: options.origin ?? url.origin,
     };
   }
 
   if (urlOrOptions == null || typeof urlOrOptions !== "object") {
     throw new TypeError("native transport requires a URL or options object");
+  }
+  return { ...urlOrOptions, ...options };
+}
+
+function normalizeNodeListenOptions(urlOrOptions, options) {
+  if (typeof urlOrOptions === "string" || urlOrOptions instanceof URL) {
+    const url = new URL(urlOrOptions);
+    return {
+      ...options,
+      host: url.hostname,
+      port: Number(url.port || 443),
+      path: `${url.pathname || "/"}${url.search}`,
+      origin: options.origin ?? url.origin,
+    };
+  }
+
+  if (urlOrOptions == null || typeof urlOrOptions !== "object") {
+    throw new TypeError("native server requires a URL or options object");
   }
   return { ...urlOrOptions, ...options };
 }
@@ -1042,10 +1020,5 @@ function bytesEqual(left, right) {
 }
 
 function loadNative() {
-  const explicitPath = process.env.TREVRPC_JS_NATIVE;
-  if (explicitPath != null && explicitPath !== "") {
-    return require(explicitPath);
-  }
-
   return require(join(moduleDir, "..", "build", "native", "trevrpc_native.node"));
 }

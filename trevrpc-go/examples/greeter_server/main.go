@@ -13,7 +13,6 @@ import (
 	"log"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,7 +103,7 @@ func main() {
 	server.SetAuthorizer(trevrpc.BearerAuthorizer(authToken))
 	options := server.Options()
 	options.EnableWebTransport = true
-	options.WebTransportCheckOrigin = allowBrowserExampleOrigin
+	options.WebTransportAdmission = allowBrowserExampleSession
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, greeterService{})
 
@@ -123,13 +122,15 @@ func main() {
 	}
 }
 
-func allowBrowserExampleOrigin(r *http.Request) bool {
-	if _, ok := webTransportAuthorities[r.Host]; !ok {
+func allowBrowserExampleSession(request trevrpc.WebTransportAdmissionRequest) bool {
+	if request.Path != "/trevrpc" {
+		return false
+	}
+	if _, ok := webTransportAuthorities[request.Authority]; !ok {
 		return false
 	}
 
-	origin := r.Header.Get("Origin")
-	return origin == "" || origin == browserExampleOrigin
+	return request.Origin == "" || request.Origin == browserExampleOrigin
 }
 
 func envOr(name, fallback string) string {

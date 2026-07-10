@@ -64,6 +64,11 @@ export type NodeServerAuthorizer = (
 ) => NodeServerAuthorizationResult | Promise<NodeServerAuthorizationResult>;
 
 export interface NodeListenOptions extends RuntimeNodeConnectOptions {
+  path?: string;
+  origin?: string;
+  certFile?: string;
+  keyFile?: string;
+  maxSessionsPerConnection?: number;
   authorizer?: NodeServerAuthorizer;
   metrics?: NodeServerMetrics;
   logger?: NodeServerLogger | ((event: NodeLogEvent) => void);

@@ -142,11 +142,12 @@ func runServer(transportName, addr, certFile, keyFile, origin string) error {
 	options := server.Options()
 	options.GracefulShutdownTimeout = time.Second
 	options.MaxStreamMessages = -1
-	options.StreamIdleTimeout = 0
 	if transportName == "webtransport" {
 		options.EnableWebTransport = true
 		options.MaxConcurrentStreamsPerConnection = 65535
-		options.WebTransportCheckOrigin = func(*http.Request) bool { return true }
+		options.WebTransportAdmission = func(request trevrpc.WebTransportAdmissionRequest) bool {
+			return request.Path == "/trevrpc"
+		}
 	}
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, splitGreeter{})
@@ -552,7 +553,7 @@ func benchmarkResponseMetadata() trevrpc.Metadata {
 }
 
 func trevrpcClientOptions() []trevrpc.CallOption {
-	options := []trevrpc.CallOption{trevrpc.WithoutStreamIdleTimeout()}
+	var options []trevrpc.CallOption
 	if len(metadataProfile) > 0 {
 		options = append(options, trevrpc.WithTimeout(idleTimeout), trevrpc.WithMetadataMap(metadataProfile))
 	}

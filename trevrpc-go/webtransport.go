@@ -307,22 +307,17 @@ func handleWebTransportConnection(ctx context.Context, conn *quic.Conn, server *
 }
 
 func webTransportAdmitted(options ServerOptions, r *http.Request) bool {
-	if options.WebTransportAdmission != nil {
-		return options.WebTransportAdmission(WebTransportAdmissionRequest{
-			Request:   r,
-			Path:      r.URL.Path,
-			Authority: r.Host,
-			Origin:    r.Header.Get("Origin"),
-			Secure:    r.TLS != nil,
-		})
-	}
-	if r.URL.Path != options.WebTransportPath {
+	if options.WebTransportAdmission == nil {
 		return false
 	}
-	if options.WebTransportCheckOrigin == nil {
-		return false
-	}
-	return options.WebTransportCheckOrigin(r)
+
+	return options.WebTransportAdmission(WebTransportAdmissionRequest{
+		Request:   r,
+		Path:      r.URL.Path,
+		Authority: r.Host,
+		Origin:    r.Header.Get("Origin"),
+		Secure:    r.TLS != nil,
+	})
 }
 
 func handleWebTransportSession(ctx context.Context, session *webtransport.Session, server *Server, requestLimit semaphore) {

@@ -13,7 +13,6 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -69,13 +68,15 @@ func run() error {
 		options.MaxConcurrentStreamsPerConnection = maxStreams
 	}
 	authorities := allowedAuthorities(addr)
-	options.WebTransportCheckOrigin = func(r *http.Request) bool {
-		if _, ok := authorities[r.Host]; !ok {
+	options.WebTransportAdmission = func(request trevrpc.WebTransportAdmissionRequest) bool {
+		if request.Path != "/trevrpc" {
+			return false
+		}
+		if _, ok := authorities[request.Authority]; !ok {
 			return false
 		}
 
-		requestOrigin := r.Header.Get("Origin")
-		return requestOrigin == "" || requestOrigin == origin
+		return request.Origin == "" || request.Origin == origin
 	}
 	server.SetOptions(options)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

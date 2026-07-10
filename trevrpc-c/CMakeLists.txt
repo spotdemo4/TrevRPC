@@ -60,6 +60,18 @@ function(trevrpc_c_lsan_suppressions test_name)
     endif()
 endfunction()
 
+function(trevrpc_c_configure_runtime target)
+    target_include_directories(${target}
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        PRIVATE src
+    )
+    target_link_libraries(${target} PUBLIC trevrpc_core trevrpc_msquic trevrpc_webtransport Threads::Threads)
+    trevrpc_c_warnings(${target})
+    trevrpc_c_sanitizers(${target})
+endfunction()
+
 trevrpc_c_warnings(trevrpc_core)
 trevrpc_c_sanitizers(trevrpc_core)
 
@@ -121,18 +133,18 @@ if(TREVRPC_BUILD_RUNTIME)
     add_library(trevrpc STATIC
         src/trevrpc.c
     )
-    target_include_directories(trevrpc
-        PUBLIC
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE src
-    )
-    target_link_libraries(trevrpc PUBLIC trevrpc_core trevrpc_msquic trevrpc_webtransport Threads::Threads)
-    trevrpc_c_warnings(trevrpc)
-    trevrpc_c_sanitizers(trevrpc)
+    trevrpc_c_configure_runtime(trevrpc)
     list(APPEND trevrpc_install_targets trevrpc)
     list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc.pc")
     configure_file(cmake/trevrpc.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc.pc" @ONLY)
+
+    if(TREVRPC_BUILD_TESTS)
+        add_library(trevrpc_testing STATIC
+            src/trevrpc.c
+        )
+        target_compile_definitions(trevrpc_testing PRIVATE TREVRPC_TESTING)
+        trevrpc_c_configure_runtime(trevrpc_testing)
+    endif()
 endif()
 
 set(trevrpc_needs_generated_bindings OFF)
@@ -276,8 +288,6 @@ if(TREVRPC_BUILD_BENCHMARKS)
     trevrpc_c_sanitizers(trevrpc_wire_bench)
 
     if(TREVRPC_BUILD_RUNTIME)
-        target_compile_definitions(trevrpc PRIVATE TREVRPC_TESTING)
-
         add_executable(trevrpc_rpc_comparison_bench
             bench/rpc_comparison_bench.c
             "${trevrpc_generated_pb_c}"
@@ -379,8 +389,7 @@ if(TREVRPC_BUILD_TESTS)
     if(TREVRPC_BUILD_RUNTIME)
         add_executable(trevrpc_runtime_test tests/runtime_test.c)
         target_include_directories(trevrpc_runtime_test PRIVATE src)
-        target_compile_definitions(trevrpc PRIVATE TREVRPC_TESTING)
-        target_link_libraries(trevrpc_runtime_test PRIVATE trevrpc)
+        target_link_libraries(trevrpc_runtime_test PRIVATE trevrpc_testing)
         trevrpc_c_warnings(trevrpc_runtime_test)
         trevrpc_c_sanitizers(trevrpc_runtime_test)
 
@@ -401,20 +410,19 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_lsan_suppressions(trevrpc_msquic_transport)
 
         add_executable(trevrpc_buffering_config_test tests/buffering_config_test.c)
-        target_link_libraries(trevrpc_buffering_config_test PRIVATE trevrpc)
+        target_link_libraries(trevrpc_buffering_config_test PRIVATE trevrpc_testing)
         trevrpc_c_warnings(trevrpc_buffering_config_test)
         trevrpc_c_sanitizers(trevrpc_buffering_config_test)
 
         add_test(NAME trevrpc_buffering_config COMMAND trevrpc_buffering_config_test)
 
         set(trevrpc_buffering_fast_cases
-            "safe-default|safe|slow-reader|4|4096|16384|262144|65536|1"
-            "throughput-slow-reader|throughput-1m|slow-reader|8|4096|32768|524288|131072|5"
-            "throughput-stalled-handler|throughput-1m|stalled-handler|8|32768|4096|524288|0|10"
-            "throughput-reset|throughput-1m|reset|8|32768|4096|262144|0|5"
-            "throughput-close|throughput-1m|close|8|32768|8192|262144|65536|5"
-            "throughput-overload|throughput-1m|overload|12|32768|4096|262144|0|10"
-            "throughput-body-limit|throughput-1m|body-limit|4|32768|4096|262144|0|5"
+            "safe-slow-reader|slow-reader|4|4096|16384|262144|65536|1"
+            "safe-stalled-handler|stalled-handler|8|32768|4096|524288|0|10"
+            "safe-reset|reset|8|32768|4096|262144|0|5"
+            "safe-close|close|8|32768|8192|262144|65536|5"
+            "safe-overload|overload|12|32768|4096|262144|0|10"
+            "safe-body-limit|body-limit|4|32768|4096|262144|0|5"
         )
         foreach(trevrpc_buffering_case IN LISTS trevrpc_buffering_fast_cases)
             string(REPLACE "|" ";" trevrpc_buffering_args "${trevrpc_buffering_case}")
@@ -439,7 +447,7 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
         target_include_directories(trevrpc_generated_service_test PRIVATE src "${trevrpc_generated_test_dir}")
-        target_link_libraries(trevrpc_generated_service_test PRIVATE trevrpc protobuf-c)
+        target_link_libraries(trevrpc_generated_service_test PRIVATE trevrpc_testing protobuf-c)
         trevrpc_c_warnings(trevrpc_generated_service_test)
         trevrpc_c_sanitizers(trevrpc_generated_service_test)
 

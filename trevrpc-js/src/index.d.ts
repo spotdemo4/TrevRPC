@@ -421,7 +421,7 @@ export interface WebTransportSessionLike {
 }
 
 export interface WebTransportConstructorLike {
-  new (url: string | URL, options?: unknown): WebTransportSessionLike;
+  new (url: string | URL, options?: BrowserWebTransportOptions): WebTransportSessionLike;
 }
 
 export interface WebTransportCertificateHash {
@@ -438,29 +438,18 @@ export interface BrowserWebTransportOptions {
 
 export interface WebTransportClientOptions extends CallOptions, BrowserWebTransportOptions {
   WebTransport?: WebTransportConstructorLike;
-  webTransportOptions?: unknown;
-  streamReadBatchMaxMessages?: number;
-  streamWriteBatchMaxMessages?: number;
-  streamWriteBatchMaxBytes?: number;
 }
 
 export interface NodeConnectOptions {
   host?: string;
   port?: number;
-  path?: string;
-  origin?: string;
-  certFile?: string;
-  keyFile?: string;
   caCertFile?: string;
   skipCertificateValidation?: boolean;
-  maxSessionsPerConnection?: number;
   maxStreamsPerSession?: number;
   idleTimeoutMs?: number;
   maxFrameSize?: number;
   maxPendingSendBytes?: number;
   maxPendingSendCount?: number;
-  streamReadBatchMaxMessages?: number;
-  streamWriteBatchMaxMessages?: number;
 }
 
 export interface ConnectOptions extends WebTransportClientOptions, NodeConnectOptions {}

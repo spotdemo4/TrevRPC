@@ -20,7 +20,16 @@ try {
 }
 ```
 
-Browsers can pass `serverCertificateHashes` to `connect`. Node.js uses the native transport when imported from the package entrypoint.
+Browsers pass WebTransport constructor options directly to `connect`:
+
+```js
+const transport = await connect("https://localhost:50051/trevrpc", {
+  congestionControl: "low-latency",
+  serverCertificateHashes: [{ algorithm: "sha-256", value: certificateHash }],
+});
+```
+
+Node.js uses the native transport when imported from the package entrypoint.
 
 ## Server
 

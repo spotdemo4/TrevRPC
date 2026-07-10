@@ -24,11 +24,6 @@ export class WebTransportClient {
   constructor(session, options = {}) {
     this.session = session;
     this.maxFrameSize = options.maxFrameSize ?? DefaultMaxFrameSize;
-    this.streamWriteBatchMaxMessages =
-      options.streamWriteBatchMaxMessages ?? RequestBodyBatchMaxMessages;
-    this.streamWriteBatchMaxBytes = options.streamWriteBatchMaxBytes ?? RequestBodyBatchMaxBytes;
-    this.streamReadBatchMaxMessages =
-      options.streamReadBatchMaxMessages ?? ResponseFrameBatchMaxMessages;
   }
 
   /** Opens a WebTransport session and wraps it in a TrevRPC client. */
@@ -38,7 +33,7 @@ export class WebTransportClient {
       throw unavailable("WebTransport is not available in this JavaScript runtime");
     }
 
-    const session = new WebTransportCtor(url, webTransportOptions(options));
+    const session = new WebTransportCtor(url, browserConstructorOptions(options));
     await session.ready;
     return new WebTransportClient(session, options);
   }
@@ -121,21 +116,13 @@ export class WebTransportClient {
         void abortWriter(writer);
         void cancelReader(reader);
       });
-      const writerTask = writeStreamingRequest(
-        writer,
-        request,
-        requestBody,
-        maxFrameSize,
-        this.streamWriteBatchMaxMessages,
-        this.streamWriteBatchMaxBytes,
-      );
+      const writerTask = writeStreamingRequest(writer, request, requestBody, maxFrameSize);
       return new WebTransportResponseFrameStream(
         reader,
         writer,
         writerTask,
         maxFrameSize,
         cleanupAbort,
-        this.streamReadBatchMaxMessages,
       );
     } catch (error) {
       throw statusFromTransportError(error);
@@ -152,7 +139,7 @@ export class WebTransportClient {
   }
 }
 
-function webTransportOptions(options) {
+function browserConstructorOptions(options) {
   const constructorOptions = {};
   for (const key of BrowserWebTransportOptionKeys) {
     if (Object.hasOwn(options, key) && options[key] !== undefined) {
@@ -160,14 +147,7 @@ function webTransportOptions(options) {
     }
   }
 
-  const nested = options.webTransportOptions;
-  if (nested == null) {
-    return constructorOptions;
-  }
-  if (typeof nested === "object") {
-    return { ...constructorOptions, ...nested };
-  }
-  return nested;
+  return constructorOptions;
 }
 
 class WebTransportResponseFrameStream {
@@ -177,13 +157,12 @@ class WebTransportResponseFrameStream {
     writerTask,
     maxFrameSize = DefaultMaxFrameSize,
     cleanupAbort = () => {},
-    readBatchMaxMessages = ResponseFrameBatchMaxMessages,
   ) {
     this.reader = reader;
     this.writer = writer;
     this.frameReader = new FrameReader(reader);
     this.maxFrameSize = maxFrameSize;
-    this.readBatchMaxMessages = readBatchMaxMessages;
+    this.readBatchMaxMessages = ResponseFrameBatchMaxMessages;
     this.frameQueue = [];
     this.frameQueueHead = 0;
     this.pendingStatus = null;
@@ -522,23 +501,16 @@ function onAbort(signal, abort) {
   return () => signal.removeEventListener("abort", abort);
 }
 
-async function writeStreamingRequest(
-  writer,
-  request,
-  requestBody,
-  maxFrameSize,
-  batchMaxMessages,
-  batchMaxBytes,
-) {
+async function writeStreamingRequest(writer, request, requestBody, maxFrameSize) {
   const iterator = requestBody[Symbol.asyncIterator]();
   try {
     await writeFrame(writer, RpcRequest, request, maxFrameSize);
     for (;;) {
-      const result = await nextRequestBodyBatch(iterator, batchMaxMessages);
+      const result = await nextRequestBodyBatch(iterator, RequestBodyBatchMaxMessages);
       if (result.done) {
         break;
       }
-      await writeBodyBatches(writer, result.value, maxFrameSize, batchMaxBytes);
+      await writeBodyBatches(writer, result.value, maxFrameSize, RequestBodyBatchMaxBytes);
     }
     await writer.close();
   } catch (error) {

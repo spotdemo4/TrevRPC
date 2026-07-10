@@ -46,11 +46,7 @@ typedef struct trevrpc_wt_config {
     void* admission_user_data;
     uint32_t max_sessions_per_connection;
     uint32_t max_streams_per_session;
-    uint64_t max_data_per_session;
-    uint32_t stream_recv_window;
-    uint32_t conn_flow_control_window;
     uint32_t idle_timeout_ms;
-    uint32_t handshake_timeout_ms;
 } trevrpc_wt_config;
 
 int trevrpc_wt_listen(const trevrpc_wt_config* config, trevrpc_wt_listener** listener);

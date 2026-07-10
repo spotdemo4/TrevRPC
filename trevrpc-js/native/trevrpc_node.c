@@ -150,14 +150,9 @@ typedef struct connect_work {
     trevrpc_client* client;
     trevrpc_cancellation* cancellation;
     char* host;
-    char* path;
-    char* origin;
-    char* cert_file;
-    char* key_file;
     char* ca_cert_file;
     uint16_t port;
     int skip_certificate_validation;
-    uint32_t max_sessions_per_connection;
     uint32_t max_streams_per_session;
     uint32_t idle_timeout_ms;
     size_t max_frame_size;
@@ -963,34 +958,6 @@ static int client_request_from_js(napi_env env,
     }
     if (err == 0) {
         err = request_timeout_from_js(env, value, &request->timeout_nanos);
-    }
-    return err;
-}
-
-static int legacy_request_from_args(napi_env env,
-    napi_value* args,
-    uint32_t kind,
-    trevrpc_request* request,
-    char** service,
-    char** method,
-    uint8_t** body) {
-    memset(request, 0, sizeof(*request));
-    request->kind = kind;
-    request->version = TREVRPC_WIRE_VERSION;
-
-    int err = copy_string_arg(env, args[0], service);
-    if (err == 0) {
-        request->service = *service;
-        request->service_len = strlen(*service);
-        err = copy_string_arg(env, args[1], method);
-    }
-    if (err == 0) {
-        request->method = *method;
-        request->method_len = strlen(*method);
-        err = copy_bytes_arg(env, args[2], body, &request->body_len);
-    }
-    if (err == 0) {
-        request->body = *body;
     }
     return err;
 }
@@ -2852,10 +2819,6 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
     }
 
     free(work->host);
-    free(work->path);
-    free(work->origin);
-    free(work->cert_file);
-    free(work->key_file);
     free(work->ca_cert_file);
     trevrpc_cancellation_free(work->cancellation);
     native_work_delete(work->base.work);
@@ -2877,14 +2840,9 @@ static napi_value connect_msquic(napi_env env, napi_callback_info info) {
         return NULL;
     }
     work->host = get_string_property(env, args[0], "host");
-    work->path = get_string_property(env, args[0], "path");
-    work->origin = get_string_property(env, args[0], "origin");
-    work->cert_file = get_string_property(env, args[0], "certFile");
-    work->key_file = get_string_property(env, args[0], "keyFile");
     work->ca_cert_file = get_string_property(env, args[0], "caCertFile");
     work->port = (uint16_t)get_uint32_property(env, args[0], "port", 0);
     work->skip_certificate_validation = get_bool_property(env, args[0], "skipCertificateValidation", false) ? 1 : 0;
-    work->max_sessions_per_connection = get_uint32_property(env, args[0], "maxSessionsPerConnection", 0);
     work->max_streams_per_session = get_uint32_property(env, args[0], "maxStreamsPerSession", 0);
     work->idle_timeout_ms = get_uint32_property(env, args[0], "idleTimeoutMs", 0);
     get_size_property(env, args[0], "maxFrameSize", &work->max_frame_size);
@@ -2895,10 +2853,6 @@ static napi_value connect_msquic(napi_env env, napi_callback_info info) {
     bool invalid_options = work->host == NULL || work->port == 0;
     if (invalid_options || work->cancellation == NULL) {
         free(work->host);
-        free(work->path);
-        free(work->origin);
-        free(work->cert_file);
-        free(work->key_file);
         free(work->ca_cert_file);
         trevrpc_cancellation_free(work->cancellation);
         free(work);
@@ -3325,12 +3279,12 @@ static void call_work_cancel(void* data) {
 }
 
 static napi_value native_client_call(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value args[4];
+    size_t argc = 2;
+    napi_value args[2];
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1 && argc != 2 && argc != 3 && argc != 4) {
-        napi_throw_type_error(env, NULL, "call requires a request object or service, method, and body");
+    if (argc != 1 && argc != 2) {
+        napi_throw_type_error(env, NULL, "call requires a request object and optional cancellation");
         return NULL;
     }
     call_work* work = calloc(1, sizeof(*work));
@@ -3343,15 +3297,10 @@ static napi_value native_client_call(napi_env env, napi_callback_info info) {
         free(work);
         return NULL;
     }
-    int err =
-        argc <= 2
-            ? client_request_from_js(
-                  env, args[0], TREVRPC_RPC_KIND_UNARY, &work->request, &work->service, &work->method, &work->body)
-            : legacy_request_from_args(
-                  env, args, TREVRPC_RPC_KIND_UNARY, &work->request, &work->service, &work->method, &work->body);
+    int err = client_request_from_js(
+        env, args[0], TREVRPC_RPC_KIND_UNARY, &work->request, &work->service, &work->method, &work->body);
     if (err == 0) {
-        err =
-            optional_cancellation_arg(env, argc, args, argc <= 2 ? 1 : 3, &work->cancellation, &work->cancellation_ref);
+        err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
     }
     if (err == 0 && work->cancellation == NULL) {
         work->owned_cancellation = trevrpc_cancellation_new();
@@ -3473,12 +3422,12 @@ static void start_stream_work_cancel(void* data) {
 }
 
 static napi_value native_client_start_stream(napi_env env, napi_callback_info info) {
-    size_t argc = 5;
-    napi_value args[5];
+    size_t argc = 2;
+    napi_value args[2];
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1 && argc != 2 && argc != 4 && argc != 5) {
-        napi_throw_type_error(env, NULL, "startStream requires a request object or service, method, kind, and body");
+    if (argc != 1 && argc != 2) {
+        napi_throw_type_error(env, NULL, "startStream requires a request object and optional cancellation");
         return NULL;
     }
     start_stream_work* work = calloc(1, sizeof(*work));
@@ -3491,29 +3440,10 @@ static napi_value native_client_start_stream(napi_env env, napi_callback_info in
         free(work);
         return NULL;
     }
-    int err = 0;
-    if (argc <= 2) {
-        err = client_request_from_js(env,
-            args[0],
-            TREVRPC_RPC_KIND_SERVER_STREAMING,
-            &work->request,
-            &work->service,
-            &work->method,
-            &work->body);
-    } else {
-        uint32_t kind = 0;
-        if (napi_get_value_uint32(env, args[2], &kind) != napi_ok) {
-            err = -EINVAL;
-        }
-        if (err == 0) {
-            napi_value legacy_args[3] = {args[0], args[1], args[3]};
-            err = legacy_request_from_args(
-                env, legacy_args, kind, &work->request, &work->service, &work->method, &work->body);
-        }
-    }
+    int err = client_request_from_js(
+        env, args[0], TREVRPC_RPC_KIND_SERVER_STREAMING, &work->request, &work->service, &work->method, &work->body);
     if (err == 0) {
-        err =
-            optional_cancellation_arg(env, argc, args, argc <= 2 ? 1 : 4, &work->cancellation, &work->cancellation_ref);
+        err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
     }
     if (err == 0 && work->cancellation == NULL) {
         work->owned_cancellation = trevrpc_cancellation_new();

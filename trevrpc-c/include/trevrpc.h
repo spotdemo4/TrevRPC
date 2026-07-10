@@ -12,10 +12,8 @@ extern "C" {
 
 #define TREVRPC_ALPN "trevrpc/1"
 #define TREVRPC_WIRE_VERSION 1u
-#define TREVRPC_C_ABI_VERSION 2u
+#define TREVRPC_C_ABI_VERSION 3u
 #define TREVRPC_DEFAULT_MAX_FRAME_SIZE (4u * 1024u * 1024u)
-#define TREVRPC_THROUGHPUT_1M_STREAM_RECV_WINDOW (1024u * 1024u)
-#define TREVRPC_THROUGHPUT_1M_CONN_FLOW_CONTROL_WINDOW (64u * 1024u * 1024u)
 
 #define TREVRPC_MAX_METADATA_ENTRIES 64u
 #define TREVRPC_MAX_METADATA_KEY_LEN 128u
@@ -83,11 +81,6 @@ typedef struct trevrpc_call_context trevrpc_call_context;
 typedef struct trevrpc_cancellation trevrpc_cancellation;
 typedef struct trevrpc_wt_config trevrpc_wt_config;
 
-typedef enum trevrpc_msquic_tuning_profile {
-    TREVRPC_MSQUIC_TUNING_PROFILE_DEFAULT = 0,
-    TREVRPC_MSQUIC_TUNING_PROFILE_THROUGHPUT_1M = 1,
-} trevrpc_msquic_tuning_profile;
-
 #ifndef TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
 #define TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
 typedef struct trevrpc_webtransport_admission_request {
@@ -142,10 +135,8 @@ typedef struct trevrpc_server_config {
     size_t max_pending_send_count;
     uint32_t max_sessions_per_connection;
     uint32_t max_streams_per_session;
-    uint64_t max_data_per_session;
     uint32_t stream_recv_window;
     uint32_t conn_flow_control_window;
-    uint32_t handshake_timeout_ms;
     size_t max_frame_size;
     trevrpc_msquic_execution_profile msquic_execution_profile;
     int msquic_send_buffering_enabled;
@@ -320,9 +311,6 @@ trevrpc_server_config trevrpc_default_server_config(void);
 trevrpc_server_options trevrpc_default_server_options(void);
 trevrpc_call_options trevrpc_default_call_options(void);
 uint32_t trevrpc_c_abi_version(void);
-int trevrpc_config_apply_msquic_tuning_profile(trevrpc_config* config, trevrpc_msquic_tuning_profile profile);
-int trevrpc_server_config_apply_msquic_tuning_profile(
-    trevrpc_server_config* config, trevrpc_msquic_tuning_profile profile);
 
 int trevrpc_call_context_has_deadline(const trevrpc_call_context* context);
 int trevrpc_call_context_deadline_expired(const trevrpc_call_context* context);

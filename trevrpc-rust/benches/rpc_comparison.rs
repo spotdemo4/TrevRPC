@@ -1129,7 +1129,10 @@ fn make_trevrpc_server_endpoint(
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     server_config.transport_config(benchmark_transport_config(
-        trevrpc::quinn::transport_limits_from_server_options(options, false),
+        trevrpc::quinn::transport_limits_from_server_options(
+            options,
+            trevrpc::quinn::TransportMode::Native,
+        ),
     )?);
 
     Ok((
@@ -1151,7 +1154,10 @@ fn make_trevrpc_client_endpoint(cert_der: CertificateDer<'static>) -> BenchResul
     let mut client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
     client_config.transport_config(benchmark_transport_config(
-        trevrpc::quinn::client_transport_limits(trevrpc::framing::DEFAULT_MAX_FRAME_SIZE, false),
+        trevrpc::quinn::client_transport_limits(
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+            trevrpc::quinn::TransportMode::Native,
+        ),
     )?);
     endpoint.set_default_client_config(client_config);
 

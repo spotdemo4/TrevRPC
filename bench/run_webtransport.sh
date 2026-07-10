@@ -47,32 +47,17 @@ PAYLOAD_PROFILE=${PAYLOAD_PROFILE:-tiny}
 METADATA_PROFILE=${METADATA_PROFILE:-none}
 HANDSHAKE_INCLUSION_MODE=${HANDSHAKE_INCLUSION_MODE:-steady-state-warmed}
 BENCHMARK_PROFILE=${BENCHMARK_PROFILE:-production-representative}
-WEBTRANSPORT_STREAM_READ_BATCH_EFFECTIVE=${WEBTRANSPORT_STREAM_READ_BATCH:-64}
-WEBTRANSPORT_STREAM_WRITE_BATCH_EFFECTIVE=${WEBTRANSPORT_STREAM_WRITE_BATCH:-64}
-WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES_EFFECTIVE=${WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES:-65536}
 SERIALIZATION_MODE=per-message-serialized
 RUST_QUINN_MAX_IDLE_TIMEOUT_MS=${TREVRPC_RUST_SPLIT_BENCH_QUINN_MAX_IDLE_TIMEOUT_MS:-600000}
 RUST_QUINN_KEEP_ALIVE_MS=${TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS:-5000}
-RUST_QUINN_SEND_WINDOW_BYTES=${TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES:-bounded-default}
-RUST_QUINN_ACK_THRESHOLD=${TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD:-library-default}
-RUST_QUINN_ACK_DELAY_MS=${TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS:-library-default}
-C_MSQUIC_PROFILE=safe
-C_MSQUIC_PROFILE_KIND=public-default
 C_FRAME_TRACE=${TREVRPC_C_FRAME_TRACE-}
-RUST_QUINN_FRAME_TRACE=${TREVRPC_RUST_QUINN_FRAME_TRACE-}
 RUST_QUINN_PROTOCOL_TRACE=${TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE-}
 C_FRAME_TRACE_STATE=$(normalize_hook_boolean TREVRPC_C_FRAME_TRACE "$C_FRAME_TRACE")
-RUST_QUINN_FRAME_TRACE_STATE=$(normalize_hook_boolean TREVRPC_RUST_QUINN_FRAME_TRACE "$RUST_QUINN_FRAME_TRACE")
 RUST_QUINN_QLOG_STATE=disabled
 RUST_QUINN_PROTOCOL_TRACE_STATE=$(normalize_hook_boolean TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE "$RUST_QUINN_PROTOCOL_TRACE")
 RUST_TLS_KEYLOG_STATE=disabled
 if [[ -n "${TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG:-}" ]]; then RUST_QUINN_QLOG_STATE=enabled; fi
 if [[ -n "${SSLKEYLOGFILE:-}" ]]; then RUST_TLS_KEYLOG_STATE=enabled; fi
-BROWSER_STREAM_TIMEOUT_DISABLE_VALUE=${WEBTRANSPORT_DISABLE_STREAM_TIMEOUTS-}
-BROWSER_STREAM_TIMEOUT_DISABLE_STATE=disabled
-if [[ "$BROWSER_STREAM_TIMEOUT_DISABLE_VALUE" == "1" || "$BROWSER_STREAM_TIMEOUT_DISABLE_VALUE" == "true" ]]; then
-    BROWSER_STREAM_TIMEOUT_DISABLE_STATE=enabled
-fi
 BROWSER_CONGESTION_CONTROL=${WEBTRANSPORT_CONGESTION_CONTROL:-default}
 case "$BROWSER_CONGESTION_CONTROL" in
 default | low-latency | throughput) ;;
@@ -81,28 +66,20 @@ default | low-latency | throughput) ;;
     exit 2
     ;;
 esac
-RUST_QUINN_ACK_PROFILE=library-default
 INSTRUMENTATION_PROFILE=untraced
-if [[ "$RUST_QUINN_ACK_THRESHOLD" != "library-default" || "$RUST_QUINN_ACK_DELAY_MS" != "library-default" ]]; then
-    RUST_QUINN_ACK_PROFILE=diagnostic-interoperability
-    BENCHMARK_PROFILE=diagnostic-interoperability
-fi
-if [[ "$C_FRAME_TRACE_STATE" == "enabled" || "$RUST_QUINN_FRAME_TRACE_STATE" == "enabled" || "$RUST_QUINN_QLOG_STATE" == "enabled" || "$RUST_QUINN_PROTOCOL_TRACE_STATE" == "enabled" || "$RUST_TLS_KEYLOG_STATE" == "enabled" ]]; then
+if [[ "$C_FRAME_TRACE_STATE" == "enabled" || "$RUST_QUINN_QLOG_STATE" == "enabled" || "$RUST_QUINN_PROTOCOL_TRACE_STATE" == "enabled" || "$RUST_TLS_KEYLOG_STATE" == "enabled" ]]; then
     INSTRUMENTATION_PROFILE=diagnostic-instrumented
-    if [[ "$RUST_QUINN_ACK_PROFILE" == "diagnostic-interoperability" ]]; then
-        BENCHMARK_PROFILE=diagnostic-interoperability-instrumented
-    else
-        BENCHMARK_PROFILE=diagnostic-instrumented
-    fi
+    BENCHMARK_PROFILE=diagnostic-instrumented
 fi
-WEBTRANSPORT_BATCHING_SETTINGS=${WEBTRANSPORT_BATCHING_SETTINGS:-profile=$BENCHMARK_PROFILE;send-many-batch=${WEBTRANSPORT_SEND_MANY_BATCH:-1};stream-read-batch=$WEBTRANSPORT_STREAM_READ_BATCH_EFFECTIVE;stream-write-batch=$WEBTRANSPORT_STREAM_WRITE_BATCH_EFFECTIVE;stream-write-batch-bytes=$WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES_EFFECTIVE;concurrent-streams=${WEBTRANSPORT_CONCURRENT_STREAMS:-1}}
+WEBTRANSPORT_BATCHING_SETTINGS=${WEBTRANSPORT_BATCHING_SETTINGS:-profile=$BENCHMARK_PROFILE;browser-stream-read-batch=64;browser-stream-write-batch=64;browser-stream-write-batch-bytes=65536;js-native-read-batch=32;js-native-write-batch=16;go-frame-batch=16;rust-frame-batch=32;concurrent-streams=${WEBTRANSPORT_CONCURRENT_STREAMS:-1}}
 if [[ "$WEBTRANSPORT_BATCHING_SETTINGS" != "profile=$BENCHMARK_PROFILE;"* ]]; then
     printf 'WEBTRANSPORT_BATCHING_SETTINGS must begin with profile=%s;\n' "$BENCHMARK_PROFILE" >&2
     exit 2
 fi
+RPC_STREAM_IDLE_TIMEOUT_MS=30000
 
-SAMPLES_HEADER='run,browser,server,shape,latency_us,throughput_per_s,iterations,elapsed_s,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,rust_quinn_send_window_bytes,browser_stream_timeout_disable,browser_congestion_control,c_msquic_profile,c_msquic_profile_kind'
-FAILURES_HEADER='run,browser,server,source,status,raw_file,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,batching_settings,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,encoded_request_bytes,encoded_response_bytes,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,rust_quinn_send_window_bytes,browser_stream_timeout_disable,browser_congestion_control,c_msquic_profile,c_msquic_profile_kind'
+SAMPLES_HEADER='run,browser,server,shape,latency_us,throughput_per_s,iterations,elapsed_s,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels,c_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,browser_congestion_control'
+FAILURES_HEADER='run,browser,server,source,status,raw_file,batching_settings,c_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,encoded_request_bytes,encoded_response_bytes,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,browser_congestion_control'
 
 GO_SPLIT_BENCH="$OUT_DIR_ABS/trevrpc-go-rpc-split-bench"
 RUST_SPLIT_BENCH="$ROOT/trevrpc-rust/target/release/examples/rpc_split_bench"
@@ -126,20 +103,10 @@ Environment knobs:
   WEBTRANSPORT_THROUGHPUT_MESSAGES
                              Message count for browser throughput samples. Default: WEBTRANSPORT_ITERATIONS
   WEBTRANSPORT_RUNS          Measurement command repetitions. Default: 3
-  WEBTRANSPORT_DISABLE_STREAM_TIMEOUTS
-                             Set to 1 or true to disable browser stream/deadline timers in TrevRPC calls.
   WEBTRANSPORT_CONGESTION_CONTROL
                              Browser WebTransport congestionControl option: default, low-latency, or throughput.
   PAYLOAD_PROFILE            Payload profile: tiny, small, medium, large, or mixed. Default: tiny
-  BENCHMARK_PROFILE          Base profile label. ACK tuning or instrumentation forces a diagnostic label.
-  WEBTRANSPORT_SEND_MANY_BATCH
-                             sendMany batch size for browser client-stream and bidi throughput.
-  WEBTRANSPORT_STREAM_READ_BATCH
-                             Browser transport response frame batch size override.
-  WEBTRANSPORT_STREAM_WRITE_BATCH
-                             Browser transport request frame batch size override.
-  WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES
-                             Browser transport request frame byte batch threshold override.
+  BENCHMARK_PROFILE          Base profile label. Instrumentation forces a diagnostic label.
   WEBTRANSPORT_CONCURRENT_STREAMS
                              Concurrent browser streams for additional aggregate throughput rows. Default: 1
   SAMPLE_TIMEOUT_SECONDS     Per-sample timeout. Default: 300
@@ -150,21 +117,12 @@ Environment knobs:
   RUN_RUST                   Include Rust WebTransport server. Default: 1
   RUN_JS                     Include JS WebTransport server. Default: 1
   METADATA_PROFILE           Metadata profile: none or production. Default: none
-  TREVRPC_C_MSQUIC_PROFILE   Ignored and overridden to safe for C and JS server rows.
   TREVRPC_BROWSER_CHROMIUM   Optional Chromium executable path for Playwright.
   TREVRPC_C_FRAME_TRACE      Enable with 1, true, TRUE, yes, or on; disable with 0, false, FALSE, no, off, or unset.
-  TREVRPC_RUST_QUINN_FRAME_TRACE
-                             Uses the same enabled and disabled literals as TREVRPC_C_FRAME_TRACE.
   TREVRPC_RUST_SPLIT_BENCH_QUINN_MAX_IDLE_TIMEOUT_MS
                              Rust Quinn idle timeout in ms. Default: 600000.
   TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS
                              Rust Quinn keepalive in ms. Default: 5000.
-  TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES
-                             Rust Quinn send window bytes or bounded-default. Default: bounded-default.
-  TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD
-                             Diagnostic peer ACK-eliciting threshold or library-default. Default: library-default.
-  TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS
-                             Diagnostic peer ACK delay in ms or library-default. Default: library-default.
   TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG
                              Rust WebTransport server qlog output path for packet diagnostics.
   TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE
@@ -250,7 +208,6 @@ ENCODED_RESPONSE_BYTES=${ENCODED_RESPONSE_BYTES:-$(profile_encoded_bytes "$PAYLO
 BENCH_ENV=(
     "TREVRPC_BENCH_PAYLOAD_PROFILE=$PAYLOAD_PROFILE"
     "TREVRPC_BENCH_METADATA_PROFILE=$METADATA_PROFILE"
-    "TREVRPC_C_MSQUIC_PROFILE=$C_MSQUIC_PROFILE"
 )
 if [[ -n "${TREVRPC_C_FRAME_TRACE:-}" ]]; then
     BENCH_ENV+=("TREVRPC_C_FRAME_TRACE=$TREVRPC_C_FRAME_TRACE")
@@ -260,10 +217,6 @@ RUST_BENCH_ENV=(
     "TREVRPC_RUST_SPLIT_BENCH_QUINN_MAX_IDLE_TIMEOUT_MS=$RUST_QUINN_MAX_IDLE_TIMEOUT_MS"
     "TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS=$RUST_QUINN_KEEP_ALIVE_MS"
 )
-RUST_BENCH_ENV_UNSET=()
-if [[ -n "${TREVRPC_RUST_QUINN_FRAME_TRACE:-}" ]]; then
-    RUST_BENCH_ENV+=("TREVRPC_RUST_QUINN_FRAME_TRACE=$TREVRPC_RUST_QUINN_FRAME_TRACE")
-fi
 if [[ -n "${TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG:-}" ]]; then
     RUST_BENCH_ENV+=("TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG=$TREVRPC_RUST_SPLIT_BENCH_QUINN_QLOG")
 fi
@@ -272,21 +225,6 @@ if [[ -n "${TREVRPC_RUST_SPLIT_BENCH_QUINN_PROTO_TRACE:-}" ]]; then
 fi
 if [[ -n "${SSLKEYLOGFILE:-}" ]]; then
     RUST_BENCH_ENV+=("SSLKEYLOGFILE=$SSLKEYLOGFILE")
-fi
-if [[ "$RUST_QUINN_SEND_WINDOW_BYTES" != "bounded-default" ]]; then
-    RUST_BENCH_ENV+=("TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES=$RUST_QUINN_SEND_WINDOW_BYTES")
-else
-    RUST_BENCH_ENV_UNSET+=("-u" "TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES")
-fi
-if [[ "$RUST_QUINN_ACK_THRESHOLD" != "library-default" ]]; then
-    RUST_BENCH_ENV+=("TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD=$RUST_QUINN_ACK_THRESHOLD")
-else
-    RUST_BENCH_ENV_UNSET+=("-u" "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD")
-fi
-if [[ "$RUST_QUINN_ACK_DELAY_MS" != "library-default" ]]; then
-    RUST_BENCH_ENV+=("TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS=$RUST_QUINN_ACK_DELAY_MS")
-else
-    RUST_BENCH_ENV_UNSET+=("-u" "TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS")
 fi
 
 initialize_output() {
@@ -317,18 +255,6 @@ require_positive_integer WEBTRANSPORT_ITERATIONS "$WEBTRANSPORT_ITERATIONS"
 require_positive_integer WEBTRANSPORT_RUNS "$WEBTRANSPORT_RUNS"
 require_positive_integer SAMPLE_TIMEOUT_SECONDS "$SAMPLE_TIMEOUT_SECONDS"
 
-require_nonnegative_integer_or_library_default() {
-    local name=$1
-    local value=$2
-    if [[ "$value" != "library-default" && ! "$value" =~ ^[0-9]+$ ]]; then
-        printf '%s must be a non-negative integer or library-default, got %q\n' "$name" "$value" >&2
-        exit 2
-    fi
-}
-
-require_nonnegative_integer_or_library_default TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_THRESHOLD "$RUST_QUINN_ACK_THRESHOLD"
-require_nonnegative_integer_or_library_default TREVRPC_RUST_SPLIT_BENCH_QUINN_ACK_DELAY_MS "$RUST_QUINN_ACK_DELAY_MS"
-
 require_nonnegative_integer() {
     local name=$1
     local value=$2
@@ -340,9 +266,6 @@ require_nonnegative_integer() {
 
 require_nonnegative_integer TREVRPC_RUST_SPLIT_BENCH_QUINN_MAX_IDLE_TIMEOUT_MS "$RUST_QUINN_MAX_IDLE_TIMEOUT_MS"
 require_nonnegative_integer TREVRPC_RUST_SPLIT_BENCH_QUINN_KEEP_ALIVE_MS "$RUST_QUINN_KEEP_ALIVE_MS"
-if [[ "$RUST_QUINN_SEND_WINDOW_BYTES" != "bounded-default" ]]; then
-    require_nonnegative_integer TREVRPC_RUST_SPLIT_BENCH_QUINN_SEND_WINDOW_BYTES "$RUST_QUINN_SEND_WINDOW_BYTES"
-fi
 
 quote_command() {
     printf '%q ' "$@"
@@ -377,20 +300,13 @@ append_webtransport_csv() {
         -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
         -v metadata_profile="$METADATA_PROFILE" \
         -v handshake_inclusion_mode="$HANDSHAKE_INCLUSION_MODE" \
-        -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" \
-        -v rust_quinn_ack_delay_ms="$RUST_QUINN_ACK_DELAY_MS" \
         -v c_frame_trace="$C_FRAME_TRACE_STATE" \
-        -v rust_quinn_frame_trace="$RUST_QUINN_FRAME_TRACE_STATE" \
         -v rust_quinn_qlog="$RUST_QUINN_QLOG_STATE" \
         -v rust_quinn_protocol_trace="$RUST_QUINN_PROTOCOL_TRACE_STATE" \
         -v rust_tls_keylog="$RUST_TLS_KEYLOG_STATE" \
         -v rust_quinn_max_idle_timeout_ms="$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" \
         -v rust_quinn_keep_alive_ms="$RUST_QUINN_KEEP_ALIVE_MS" \
-        -v rust_quinn_send_window_bytes="$RUST_QUINN_SEND_WINDOW_BYTES" \
-        -v browser_stream_timeout_disable="$BROWSER_STREAM_TIMEOUT_DISABLE_STATE" \
         -v browser_congestion_control="$BROWSER_CONGESTION_CONTROL" \
-        -v c_msquic_profile="$C_MSQUIC_PROFILE" \
-        -v c_msquic_profile_kind="$C_MSQUIC_PROFILE_KIND" \
         -v batching_settings="$WEBTRANSPORT_BATCHING_SETTINGS" -F '' '
         function transport_security_mode() {
             return "encrypted"
@@ -413,21 +329,19 @@ append_webtransport_csv() {
         }
         function emit(shape, latency_us, throughput, iterations, elapsed) {
             serialization = serialization_mode(shape)
-            printf "%s,%s,%s,%s,%.3f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+            printf "%s,%s,%s,%s,%.3f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
                 run, browser, server, shape, latency_us, throughput, iterations, elapsed, source, \
                 transport_security_mode(), certificate_verification_mode(), payload_profile, encoded_request_bytes, encoded_response_bytes, \
-                serialization, metadata_profile, handshake_inclusion_mode, batching_settings, labels(shape), rust_quinn_ack_threshold, rust_quinn_ack_delay_ms, \
-                c_frame_trace, rust_quinn_frame_trace, rust_quinn_qlog, rust_quinn_protocol_trace, rust_tls_keylog, rust_quinn_max_idle_timeout_ms, \
-                rust_quinn_keep_alive_ms, rust_quinn_send_window_bytes, browser_stream_timeout_disable, browser_congestion_control, c_msquic_profile, c_msquic_profile_kind
+                serialization, metadata_profile, handshake_inclusion_mode, batching_settings, labels(shape), c_frame_trace, rust_quinn_qlog, \
+                rust_quinn_protocol_trace, rust_tls_keylog, rust_quinn_max_idle_timeout_ms, rust_quinn_keep_alive_ms, browser_congestion_control
         }
         function emit_unsupported(shape) {
             serialization = serialization_mode(shape)
-            printf "%s,%s,%s,%s,N/A,N/A,N/A,N/A,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+            printf "%s,%s,%s,%s,N/A,N/A,N/A,N/A,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
                 run, browser, server, shape, source, transport_security_mode(), certificate_verification_mode(), payload_profile, \
                 encoded_request_bytes, encoded_response_bytes, serialization, metadata_profile, handshake_inclusion_mode, batching_settings, labels(shape), \
-                rust_quinn_ack_threshold, rust_quinn_ack_delay_ms, c_frame_trace, rust_quinn_frame_trace, rust_quinn_qlog, rust_quinn_protocol_trace, rust_tls_keylog, \
-                rust_quinn_max_idle_timeout_ms, rust_quinn_keep_alive_ms, rust_quinn_send_window_bytes, browser_stream_timeout_disable, browser_congestion_control, \
-                c_msquic_profile, c_msquic_profile_kind
+                c_frame_trace, rust_quinn_qlog, rust_quinn_protocol_trace, rust_tls_keylog, rust_quinn_max_idle_timeout_ms, rust_quinn_keep_alive_ms, \
+                browser_congestion_control
         }
         match($0, /^([^:]+):[[:space:]]+([0-9.]+) us\/op \(([0-9]+) iterations in ([0-9.]+)s\)/, m) {
             latency_us = m[2] + 0
@@ -462,7 +376,7 @@ aggregate_samples_csv() {
             return (a[n / 2] + a[n / 2 + 1]) / 2
         }
         BEGIN {
-            print "browser,server,shape,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_per_measurement,elapsed_s_total,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels,rust_quinn_ack_threshold,rust_quinn_ack_delay_ms,c_frame_trace,rust_quinn_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,rust_quinn_send_window_bytes,browser_stream_timeout_disable,browser_congestion_control,c_msquic_profile,c_msquic_profile_kind"
+            print "browser,server,shape,measurements,latency_us_median,latency_us_min,latency_us_max,throughput_per_s_median,throughput_per_s_min,throughput_per_s_max,iterations_per_measurement,elapsed_s_total,source,transport_security_mode,certificate_verification_mode,payload_profile,encoded_request_bytes,encoded_response_bytes,serialization_mode,metadata_profile,handshake_inclusion_mode,batching_settings,labels,c_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,browser_congestion_control"
         }
         NR == 1 {
             next
@@ -486,20 +400,13 @@ aggregate_samples_csv() {
                 handshake_inclusion_mode[key] = $17
                 batching_settings[key] = $18
                 labels[key] = $19
-                rust_quinn_ack_threshold[key] = $20
-                rust_quinn_ack_delay_ms[key] = $21
-                c_frame_trace[key] = $22
-                rust_quinn_frame_trace[key] = $23
-                rust_quinn_qlog[key] = $24
-                rust_quinn_protocol_trace[key] = $25
-                rust_tls_keylog[key] = $26
-                rust_quinn_max_idle_timeout_ms[key] = $27
-                rust_quinn_keep_alive_ms[key] = $28
-                rust_quinn_send_window_bytes[key] = $29
-                browser_stream_timeout_disable[key] = $30
-                browser_congestion_control[key] = $31
-                c_msquic_profile[key] = $32
-                c_msquic_profile_kind[key] = $33
+                c_frame_trace[key] = $20
+                rust_quinn_qlog[key] = $21
+                rust_quinn_protocol_trace[key] = $22
+                rust_tls_keylog[key] = $23
+                rust_quinn_max_idle_timeout_ms[key] = $24
+                rust_quinn_keep_alive_ms[key] = $25
+                browser_congestion_control[key] = $26
             }
             measurements[key]++
             if ($5 == "N/A" || $6 == "N/A") {
@@ -527,20 +434,20 @@ aggregate_samples_csv() {
             for (i = 1; i <= order_count; i++) {
                 key = order[i]
                 if (unsupported[key] && latencies[key] == "") {
-                    printf "%s,%s,%s,%d,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                    printf "%s,%s,%s,%d,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
                         browser[key], server[key], shape[key], measurements[key], source[key], \
                         transport_security_mode[key], certificate_verification_mode[key], payload_profile[key], encoded_request_bytes[key], encoded_response_bytes[key], serialization_mode[key], metadata_profile[key], handshake_inclusion_mode[key], batching_settings[key], labels[key], \
-                        rust_quinn_ack_threshold[key], rust_quinn_ack_delay_ms[key], c_frame_trace[key], rust_quinn_frame_trace[key], rust_quinn_qlog[key], rust_quinn_protocol_trace[key], rust_tls_keylog[key], \
-                        rust_quinn_max_idle_timeout_ms[key], rust_quinn_keep_alive_ms[key], rust_quinn_send_window_bytes[key], browser_stream_timeout_disable[key], browser_congestion_control[key], c_msquic_profile[key], c_msquic_profile_kind[key]
+                        c_frame_trace[key], rust_quinn_qlog[key], rust_quinn_protocol_trace[key], rust_tls_keylog[key], rust_quinn_max_idle_timeout_ms[key], \
+                        rust_quinn_keep_alive_ms[key], browser_congestion_control[key]
                     continue
                 }
                 latency = median(latencies[key])
                 throughput = median(throughputs[key])
-                printf "%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+                printf "%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
                     browser[key], server[key], shape[key], measurements[key], latency, latency_min[key], latency_max[key], throughput, throughput_min[key], throughput_max[key], median(iterations[key]), elapsed_total[key], source[key], \
                     transport_security_mode[key], certificate_verification_mode[key], payload_profile[key], encoded_request_bytes[key], encoded_response_bytes[key], serialization_mode[key], metadata_profile[key], handshake_inclusion_mode[key], batching_settings[key], labels[key], \
-                    rust_quinn_ack_threshold[key], rust_quinn_ack_delay_ms[key], c_frame_trace[key], rust_quinn_frame_trace[key], rust_quinn_qlog[key], rust_quinn_protocol_trace[key], rust_tls_keylog[key], \
-                    rust_quinn_max_idle_timeout_ms[key], rust_quinn_keep_alive_ms[key], rust_quinn_send_window_bytes[key], browser_stream_timeout_disable[key], browser_congestion_control[key], c_msquic_profile[key], c_msquic_profile_kind[key]
+                    c_frame_trace[key], rust_quinn_qlog[key], rust_quinn_protocol_trace[key], rust_tls_keylog[key], rust_quinn_max_idle_timeout_ms[key], \
+                    rust_quinn_keep_alive_ms[key], browser_congestion_control[key]
             }
         }
     ' "$SAMPLES_CSV" >"$CSV"
@@ -577,23 +484,16 @@ assert_immutable_csv_schema() {
 }
 
 assert_sample_profile_metadata() {
-    assert_immutable_csv_schema 'WebTransport sample' "$SAMPLES_CSV" "$SAMPLES_HEADER" 33
-    assert_immutable_csv_schema 'WebTransport failure' "$FAILURES_CSV" "$FAILURES_HEADER" 23
+    assert_immutable_csv_schema 'WebTransport sample' "$SAMPLES_CSV" "$SAMPLES_HEADER" 26
+    assert_immutable_csv_schema 'WebTransport failure' "$FAILURES_CSV" "$FAILURES_HEADER" 16
 
     awk -F, -v encoded_request_bytes="$ENCODED_REQUEST_BYTES" \
         -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
-        -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" \
-        -v rust_quinn_ack_delay_ms="$RUST_QUINN_ACK_DELAY_MS" \
         -v rust_quinn_max_idle_timeout_ms="$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" \
         -v rust_quinn_keep_alive_ms="$RUST_QUINN_KEEP_ALIVE_MS" \
-        -v rust_quinn_send_window_bytes="$RUST_QUINN_SEND_WINDOW_BYTES" \
-        -v browser_stream_timeout_disable="$BROWSER_STREAM_TIMEOUT_DISABLE_STATE" \
         -v browser_congestion_control="$BROWSER_CONGESTION_CONTROL" \
-        -v c_msquic_profile="$C_MSQUIC_PROFILE" \
-        -v c_msquic_profile_kind="$C_MSQUIC_PROFILE_KIND" \
         -v batching_settings="$WEBTRANSPORT_BATCHING_SETTINGS" \
         -v c_frame_trace="$C_FRAME_TRACE_STATE" \
-        -v rust_quinn_frame_trace="$RUST_QUINN_FRAME_TRACE_STATE" \
         -v rust_quinn_qlog="$RUST_QUINN_QLOG_STATE" \
         -v rust_quinn_protocol_trace="$RUST_QUINN_PROTOCOL_TRACE_STATE" \
         -v rust_tls_keylog="$RUST_TLS_KEYLOG_STATE" '
@@ -610,60 +510,32 @@ assert_sample_profile_metadata() {
             printf "sample row %d batching/profile metadata %s does not match selected %s\n", NR, $18, batching_settings > "/dev/stderr"
             bad = 1
         }
-        $20 != rust_quinn_ack_threshold {
-            printf "sample row %d recorded Rust Quinn ACK threshold %s does not match selected %s\n", NR, $20, rust_quinn_ack_threshold > "/dev/stderr"
+        $20 != c_frame_trace {
+            printf "sample row %d recorded C frame trace state %s does not match selected %s\n", NR, $20, c_frame_trace > "/dev/stderr"
             bad = 1
         }
-        $21 != rust_quinn_ack_delay_ms {
-            printf "sample row %d recorded Rust Quinn ACK delay %s does not match selected %s\n", NR, $21, rust_quinn_ack_delay_ms > "/dev/stderr"
+        $21 != rust_quinn_qlog {
+            printf "sample row %d recorded Rust Quinn qlog state %s does not match selected %s\n", NR, $21, rust_quinn_qlog > "/dev/stderr"
             bad = 1
         }
-        $22 != c_frame_trace {
-            printf "sample row %d recorded C frame trace state %s does not match selected %s\n", NR, $22, c_frame_trace > "/dev/stderr"
+        $22 != rust_quinn_protocol_trace {
+            printf "sample row %d recorded Rust Quinn protocol trace state %s does not match selected %s\n", NR, $22, rust_quinn_protocol_trace > "/dev/stderr"
             bad = 1
         }
-        $23 != rust_quinn_frame_trace {
-            printf "sample row %d recorded Rust Quinn frame trace state %s does not match selected %s\n", NR, $23, rust_quinn_frame_trace > "/dev/stderr"
+        $23 != rust_tls_keylog {
+            printf "sample row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $23, rust_tls_keylog > "/dev/stderr"
             bad = 1
         }
-        $24 != rust_quinn_qlog {
-            printf "sample row %d recorded Rust Quinn qlog state %s does not match selected %s\n", NR, $24, rust_quinn_qlog > "/dev/stderr"
+        $24 != rust_quinn_max_idle_timeout_ms {
+            printf "sample row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $24, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
             bad = 1
         }
-        $25 != rust_quinn_protocol_trace {
-            printf "sample row %d recorded Rust Quinn protocol trace state %s does not match selected %s\n", NR, $25, rust_quinn_protocol_trace > "/dev/stderr"
+        $25 != rust_quinn_keep_alive_ms {
+            printf "sample row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $25, rust_quinn_keep_alive_ms > "/dev/stderr"
             bad = 1
         }
-        $26 != rust_tls_keylog {
-            printf "sample row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $26, rust_tls_keylog > "/dev/stderr"
-            bad = 1
-        }
-        $27 != rust_quinn_max_idle_timeout_ms {
-            printf "sample row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $27, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
-            bad = 1
-        }
-        $28 != rust_quinn_keep_alive_ms {
-            printf "sample row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $28, rust_quinn_keep_alive_ms > "/dev/stderr"
-            bad = 1
-        }
-        $29 != rust_quinn_send_window_bytes {
-            printf "sample row %d recorded Rust Quinn send window %s does not match selected %s\n", NR, $29, rust_quinn_send_window_bytes > "/dev/stderr"
-            bad = 1
-        }
-        $30 != browser_stream_timeout_disable {
-            printf "sample row %d recorded browser stream-timeout disable state %s does not match selected %s\n", NR, $30, browser_stream_timeout_disable > "/dev/stderr"
-            bad = 1
-        }
-        $31 != browser_congestion_control {
-            printf "sample row %d recorded browser congestion control %s does not match selected %s\n", NR, $31, browser_congestion_control > "/dev/stderr"
-            bad = 1
-        }
-        $32 != c_msquic_profile {
-            printf "sample row %d recorded C MsQuic profile %s does not match pinned %s\n", NR, $32, c_msquic_profile > "/dev/stderr"
-            bad = 1
-        }
-        $33 != c_msquic_profile_kind {
-            printf "sample row %d recorded C MsQuic profile kind %s does not match pinned %s\n", NR, $33, c_msquic_profile_kind > "/dev/stderr"
+        $26 != browser_congestion_control {
+            printf "sample row %d recorded browser congestion control %s does not match selected %s\n", NR, $26, browser_congestion_control > "/dev/stderr"
             bad = 1
         }
         END { exit bad ? 1 : 0 }
@@ -671,88 +543,53 @@ assert_sample_profile_metadata() {
 
     awk -F, -v encoded_request_bytes="$ENCODED_REQUEST_BYTES" \
         -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
-        -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" \
-        -v rust_quinn_ack_delay_ms="$RUST_QUINN_ACK_DELAY_MS" \
         -v rust_quinn_max_idle_timeout_ms="$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" \
         -v rust_quinn_keep_alive_ms="$RUST_QUINN_KEEP_ALIVE_MS" \
-        -v rust_quinn_send_window_bytes="$RUST_QUINN_SEND_WINDOW_BYTES" \
-        -v browser_stream_timeout_disable="$BROWSER_STREAM_TIMEOUT_DISABLE_STATE" \
         -v browser_congestion_control="$BROWSER_CONGESTION_CONTROL" \
-        -v c_msquic_profile="$C_MSQUIC_PROFILE" \
-        -v c_msquic_profile_kind="$C_MSQUIC_PROFILE_KIND" \
         -v batching_settings="$WEBTRANSPORT_BATCHING_SETTINGS" \
         -v c_frame_trace="$C_FRAME_TRACE_STATE" \
-        -v rust_quinn_frame_trace="$RUST_QUINN_FRAME_TRACE_STATE" \
         -v rust_quinn_qlog="$RUST_QUINN_QLOG_STATE" \
         -v rust_quinn_protocol_trace="$RUST_QUINN_PROTOCOL_TRACE_STATE" \
         -v rust_tls_keylog="$RUST_TLS_KEYLOG_STATE" '
         NR == 1 { next }
-        $7 != rust_quinn_ack_threshold {
-            printf "failure row %d recorded Rust Quinn ACK threshold %s does not match selected %s\n", NR, $7, rust_quinn_ack_threshold > "/dev/stderr"
+        $7 != batching_settings {
+            printf "failure row %d batching/profile metadata %s does not match selected %s\n", NR, $7, batching_settings > "/dev/stderr"
             bad = 1
         }
-        $8 != rust_quinn_ack_delay_ms {
-            printf "failure row %d recorded Rust Quinn ACK delay %s does not match selected %s\n", NR, $8, rust_quinn_ack_delay_ms > "/dev/stderr"
+        $8 != c_frame_trace {
+            printf "failure row %d recorded C frame trace state %s does not match selected %s\n", NR, $8, c_frame_trace > "/dev/stderr"
             bad = 1
         }
-        $9 != batching_settings {
-            printf "failure row %d batching/profile metadata %s does not match selected %s\n", NR, $9, batching_settings > "/dev/stderr"
+        $9 != rust_quinn_qlog {
+            printf "failure row %d recorded Rust Quinn qlog state %s does not match selected %s\n", NR, $9, rust_quinn_qlog > "/dev/stderr"
             bad = 1
         }
-        $10 != c_frame_trace {
-            printf "failure row %d recorded C frame trace state %s does not match selected %s\n", NR, $10, c_frame_trace > "/dev/stderr"
+        $10 != rust_quinn_protocol_trace {
+            printf "failure row %d recorded Rust Quinn protocol trace state %s does not match selected %s\n", NR, $10, rust_quinn_protocol_trace > "/dev/stderr"
             bad = 1
         }
-        $11 != rust_quinn_frame_trace {
-            printf "failure row %d recorded Rust Quinn frame trace state %s does not match selected %s\n", NR, $11, rust_quinn_frame_trace > "/dev/stderr"
+        $11 != rust_tls_keylog {
+            printf "failure row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $11, rust_tls_keylog > "/dev/stderr"
             bad = 1
         }
-        $12 != rust_quinn_qlog {
-            printf "failure row %d recorded Rust Quinn qlog state %s does not match selected %s\n", NR, $12, rust_quinn_qlog > "/dev/stderr"
+        $12 != encoded_request_bytes {
+            printf "failure row %d encoded request bytes %s does not match selected %s\n", NR, $12, encoded_request_bytes > "/dev/stderr"
             bad = 1
         }
-        $13 != rust_quinn_protocol_trace {
-            printf "failure row %d recorded Rust Quinn protocol trace state %s does not match selected %s\n", NR, $13, rust_quinn_protocol_trace > "/dev/stderr"
+        $13 != encoded_response_bytes {
+            printf "failure row %d encoded response bytes %s does not match selected %s\n", NR, $13, encoded_response_bytes > "/dev/stderr"
             bad = 1
         }
-        $14 != rust_tls_keylog {
-            printf "failure row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $14, rust_tls_keylog > "/dev/stderr"
+        $14 != rust_quinn_max_idle_timeout_ms {
+            printf "failure row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $14, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
             bad = 1
         }
-        $15 != encoded_request_bytes {
-            printf "failure row %d encoded request bytes %s does not match selected %s\n", NR, $15, encoded_request_bytes > "/dev/stderr"
+        $15 != rust_quinn_keep_alive_ms {
+            printf "failure row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $15, rust_quinn_keep_alive_ms > "/dev/stderr"
             bad = 1
         }
-        $16 != encoded_response_bytes {
-            printf "failure row %d encoded response bytes %s does not match selected %s\n", NR, $16, encoded_response_bytes > "/dev/stderr"
-            bad = 1
-        }
-        $17 != rust_quinn_max_idle_timeout_ms {
-            printf "failure row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $17, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
-            bad = 1
-        }
-        $18 != rust_quinn_keep_alive_ms {
-            printf "failure row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $18, rust_quinn_keep_alive_ms > "/dev/stderr"
-            bad = 1
-        }
-        $19 != rust_quinn_send_window_bytes {
-            printf "failure row %d recorded Rust Quinn send window %s does not match selected %s\n", NR, $19, rust_quinn_send_window_bytes > "/dev/stderr"
-            bad = 1
-        }
-        $20 != browser_stream_timeout_disable {
-            printf "failure row %d recorded browser stream-timeout disable state %s does not match selected %s\n", NR, $20, browser_stream_timeout_disable > "/dev/stderr"
-            bad = 1
-        }
-        $21 != browser_congestion_control {
-            printf "failure row %d recorded browser congestion control %s does not match selected %s\n", NR, $21, browser_congestion_control > "/dev/stderr"
-            bad = 1
-        }
-        $22 != c_msquic_profile {
-            printf "failure row %d recorded C MsQuic profile %s does not match pinned %s\n", NR, $22, c_msquic_profile > "/dev/stderr"
-            bad = 1
-        }
-        $23 != c_msquic_profile_kind {
-            printf "failure row %d recorded C MsQuic profile kind %s does not match pinned %s\n", NR, $23, c_msquic_profile_kind > "/dev/stderr"
+        $16 != browser_congestion_control {
+            printf "failure row %d recorded browser congestion control %s does not match selected %s\n", NR, $16, browser_congestion_control > "/dev/stderr"
             bad = 1
         }
         END { exit bad ? 1 : 0 }
@@ -770,12 +607,9 @@ assert_benchmark_labels() {
     awk -F, -v payload_profile="$PAYLOAD_PROFILE" -v metadata_profile="$METADATA_PROFILE" \
         -v encoded_request_bytes="$ENCODED_REQUEST_BYTES" -v encoded_response_bytes="$ENCODED_RESPONSE_BYTES" \
         -v serialization_mode="$SERIALIZATION_MODE" -v handshake_mode="$HANDSHAKE_INCLUSION_MODE" \
-        -v rust_quinn_ack_threshold="$RUST_QUINN_ACK_THRESHOLD" -v rust_quinn_ack_delay_ms="$RUST_QUINN_ACK_DELAY_MS" \
         -v rust_quinn_max_idle_timeout_ms="$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" -v rust_quinn_keep_alive_ms="$RUST_QUINN_KEEP_ALIVE_MS" \
-        -v rust_quinn_send_window_bytes="$RUST_QUINN_SEND_WINDOW_BYTES" \
-        -v browser_stream_timeout_disable="$BROWSER_STREAM_TIMEOUT_DISABLE_STATE" -v browser_congestion_control="$BROWSER_CONGESTION_CONTROL" \
-        -v c_msquic_profile="$C_MSQUIC_PROFILE" -v c_msquic_profile_kind="$C_MSQUIC_PROFILE_KIND" \
-        -v c_frame_trace="$C_FRAME_TRACE_STATE" -v rust_quinn_frame_trace="$RUST_QUINN_FRAME_TRACE_STATE" \
+        -v browser_congestion_control="$BROWSER_CONGESTION_CONTROL" \
+        -v c_frame_trace="$C_FRAME_TRACE_STATE" \
         -v rust_quinn_qlog="$RUST_QUINN_QLOG_STATE" -v rust_quinn_protocol_trace="$RUST_QUINN_PROTOCOL_TRACE_STATE" \
         -v rust_tls_keylog="$RUST_TLS_KEYLOG_STATE" '
         NR == 1 { next }
@@ -811,60 +645,32 @@ assert_benchmark_labels() {
             printf "row %d handshake mode %q does not match selected %q\n", NR, $21, handshake_mode > "/dev/stderr"
             bad = 1
         }
-        $24 != rust_quinn_ack_threshold {
-            printf "row %d recorded Rust Quinn ACK threshold %s does not match selected %s\n", NR, $24, rust_quinn_ack_threshold > "/dev/stderr"
+        $24 != c_frame_trace {
+            printf "row %d recorded C frame trace state %s does not match selected %s\n", NR, $24, c_frame_trace > "/dev/stderr"
             bad = 1
         }
-        $25 != rust_quinn_ack_delay_ms {
-            printf "row %d recorded Rust Quinn ACK delay %s does not match selected %s\n", NR, $25, rust_quinn_ack_delay_ms > "/dev/stderr"
+        $25 != rust_quinn_qlog {
+            printf "row %d recorded Rust Quinn qlog state %s does not match selected %s\n", NR, $25, rust_quinn_qlog > "/dev/stderr"
             bad = 1
         }
-        $26 != c_frame_trace {
-            printf "row %d recorded C frame trace state %s does not match selected %s\n", NR, $26, c_frame_trace > "/dev/stderr"
+        $26 != rust_quinn_protocol_trace {
+            printf "row %d recorded Rust Quinn protocol trace state %s does not match selected %s\n", NR, $26, rust_quinn_protocol_trace > "/dev/stderr"
             bad = 1
         }
-        $27 != rust_quinn_frame_trace {
-            printf "row %d recorded Rust Quinn frame trace state %s does not match selected %s\n", NR, $27, rust_quinn_frame_trace > "/dev/stderr"
+        $27 != rust_tls_keylog {
+            printf "row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $27, rust_tls_keylog > "/dev/stderr"
             bad = 1
         }
-        $28 != rust_quinn_qlog {
-            printf "row %d recorded Rust Quinn qlog state %s does not match selected %s\n", NR, $28, rust_quinn_qlog > "/dev/stderr"
+        $28 != rust_quinn_max_idle_timeout_ms {
+            printf "row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $28, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
             bad = 1
         }
-        $29 != rust_quinn_protocol_trace {
-            printf "row %d recorded Rust Quinn protocol trace state %s does not match selected %s\n", NR, $29, rust_quinn_protocol_trace > "/dev/stderr"
+        $29 != rust_quinn_keep_alive_ms {
+            printf "row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $29, rust_quinn_keep_alive_ms > "/dev/stderr"
             bad = 1
         }
-        $30 != rust_tls_keylog {
-            printf "row %d recorded Rust TLS keylog state %s does not match selected %s\n", NR, $30, rust_tls_keylog > "/dev/stderr"
-            bad = 1
-        }
-        $31 != rust_quinn_max_idle_timeout_ms {
-            printf "row %d recorded Rust Quinn idle timeout %s does not match selected %s\n", NR, $31, rust_quinn_max_idle_timeout_ms > "/dev/stderr"
-            bad = 1
-        }
-        $32 != rust_quinn_keep_alive_ms {
-            printf "row %d recorded Rust Quinn keepalive %s does not match selected %s\n", NR, $32, rust_quinn_keep_alive_ms > "/dev/stderr"
-            bad = 1
-        }
-        $33 != rust_quinn_send_window_bytes {
-            printf "row %d recorded Rust Quinn send window %s does not match selected %s\n", NR, $33, rust_quinn_send_window_bytes > "/dev/stderr"
-            bad = 1
-        }
-        $34 != browser_stream_timeout_disable {
-            printf "row %d recorded browser stream-timeout disable state %s does not match selected %s\n", NR, $34, browser_stream_timeout_disable > "/dev/stderr"
-            bad = 1
-        }
-        $35 != browser_congestion_control {
-            printf "row %d recorded browser congestion control %s does not match selected %s\n", NR, $35, browser_congestion_control > "/dev/stderr"
-            bad = 1
-        }
-        $36 != c_msquic_profile {
-            printf "row %d recorded C MsQuic profile %s does not match pinned %s\n", NR, $36, c_msquic_profile > "/dev/stderr"
-            bad = 1
-        }
-        $37 != c_msquic_profile_kind {
-            printf "row %d recorded C MsQuic profile kind %s does not match pinned %s\n", NR, $37, c_msquic_profile_kind > "/dev/stderr"
+        $30 != browser_congestion_control {
+            printf "row %d recorded browser congestion control %s does not match selected %s\n", NR, $30, browser_congestion_control > "/dev/stderr"
             bad = 1
         }
         END { exit bad ? 1 : 0 }
@@ -890,12 +696,10 @@ Generated by \`bench/run_webtransport.sh\`: $generated_at
 | Sample timeout | \`$SAMPLE_TIMEOUT_SECONDS\` s |
 | Browser iterations | \`$WEBTRANSPORT_ITERATIONS\` |
 | Browser throughput messages | \`${WEBTRANSPORT_THROUGHPUT_MESSAGES:-$WEBTRANSPORT_ITERATIONS}\` |
-| Browser stream-timeout disable | \`$BROWSER_STREAM_TIMEOUT_DISABLE_STATE\` |
 | Browser congestion control | \`$BROWSER_CONGESTION_CONTROL\` |
-| Browser sendMany batch | \`${WEBTRANSPORT_SEND_MANY_BATCH:-1}\` |
-| Browser stream read batch | \`$WEBTRANSPORT_STREAM_READ_BATCH_EFFECTIVE\` |
-| Browser stream write batch | \`$WEBTRANSPORT_STREAM_WRITE_BATCH_EFFECTIVE\` |
-| Browser stream write batch bytes | \`$WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES_EFFECTIVE\` |
+| Browser stream read batch | \`64\` |
+| Browser stream write batch | \`64\` |
+| Browser stream write batch bytes | \`65536\` |
 | Browser concurrent streams | \`${WEBTRANSPORT_CONCURRENT_STREAMS:-1}\` |
 | CMake build type | \`$CMAKE_BUILD_TYPE\` |
 | C server included | \`$RUN_C\` |
@@ -904,10 +708,7 @@ Generated by \`bench/run_webtransport.sh\`: $generated_at
 | Rust server included | \`$RUN_RUST\` |
 | JS server included | \`$RUN_JS\` |
 | ConnectRPC scheme | \`https\` |
-| C MsQuic profile | \`$C_MSQUIC_PROFILE\` |
-| C MsQuic profile kind | \`$C_MSQUIC_PROFILE_KIND\` |
 | Benchmark profile | \`$BENCHMARK_PROFILE\` |
-| Rust Quinn ACK profile | \`$RUST_QUINN_ACK_PROFILE\` |
 | Instrumentation profile | \`$INSTRUMENTATION_PROFILE\` |
 | Payload profile | \`$PAYLOAD_PROFILE\` |
 | Approx encoded request bytes | \`$ENCODED_REQUEST_BYTES\` |
@@ -916,13 +717,10 @@ Generated by \`bench/run_webtransport.sh\`: $generated_at
 | Metadata profile | \`$METADATA_PROFILE\` |
 | Handshake inclusion mode | \`$HANDSHAKE_INCLUSION_MODE\` |
 | Batching settings | \`$WEBTRANSPORT_BATCHING_SETTINGS\` |
+| RPC stream idle timeout | production default (\`$RPC_STREAM_IDLE_TIMEOUT_MS\` ms) |
 | Rust Quinn idle timeout | \`${RUST_QUINN_MAX_IDLE_TIMEOUT_MS}\` ms |
 | Rust Quinn keepalive | \`${RUST_QUINN_KEEP_ALIVE_MS}\` ms |
-| Rust Quinn send window | \`${RUST_QUINN_SEND_WINDOW_BYTES}\` |
-| Rust Quinn ACK threshold | \`${RUST_QUINN_ACK_THRESHOLD}\` |
-| Rust Quinn ACK delay | \`${RUST_QUINN_ACK_DELAY_MS}\` |
 | C frame trace | \`$C_FRAME_TRACE_STATE\` |
-| Rust Quinn frame trace | \`$RUST_QUINN_FRAME_TRACE_STATE\` |
 | Rust Quinn qlog | \`$RUST_QUINN_QLOG_STATE\` |
 | Rust Quinn protocol trace | \`$RUST_QUINN_PROTOCOL_TRACE_STATE\` |
 | Rust TLS key log | \`$RUST_TLS_KEYLOG_STATE\` |
@@ -943,18 +741,18 @@ Generated by \`bench/run_webtransport.sh\`: $generated_at
 
 | Row family | Stream limits | Idle timeout and keepalive | Flow control and buffering | ACK and browser behavior | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Browser WebTransport client | browser-managed WebTransport session/stream limits; benchmark opens \`${WEBTRANSPORT_CONCURRENT_STREAMS:-1}\` concurrent stream(s) unless overridden | browser session timers are implementation-defined; TrevRPC browser stream-timeout disable state is \`$BROWSER_STREAM_TIMEOUT_DISABLE_STATE\` | response read batch \`$WEBTRANSPORT_STREAM_READ_BATCH_EFFECTIVE\`; request write batch \`$WEBTRANSPORT_STREAM_WRITE_BATCH_EFFECTIVE\`; request write batch bytes \`$WEBTRANSPORT_STREAM_WRITE_BATCH_BYTES_EFFECTIVE\`; congestion control \`$BROWSER_CONGESTION_CONTROL\` | browser QUIC ACK tuning, TCP_NODELAY, and low-level send buffering are not exposed to JavaScript | WebTransport rows pin the generated certificate hash with the browser API |
-| trevRPC C / MsQuic server | streams per session \`65535\`; sessions per connection \`16\`; max sessions per connection \`16\` | idle timeout \`600000ms\`; keepalive \`5000ms\`; split server RPC stream idle timeout disabled | pinned profile \`$C_MSQUIC_PROFILE\` (\`$C_MSQUIC_PROFILE_KIND\`); MsQuic low-latency execution profile; send buffering disabled; WebTransport H3 control and CONNECT streams stay byte-oriented | MsQuic ACK behavior is library default; not TCP | Inherited C profile settings are overridden for comparable C and JS rows |
-| trevRPC Go / quic-go WebTransport server | WebTransport split server max concurrent streams per connection \`65535\` | QUIC idle timeout \`10m\`; keepalive \`5s\`; RPC stream idle timeout disabled in benchmark server | receive windows are capped from max frame size, stream body size, and concurrency | quic-go ACK behavior is library default; not TCP | Uses quic-go HTTP/3 WebTransport path |
-| trevRPC Rust / Quinn WebTransport server | WebTransport split server max concurrent streams per connection \`65535\`; max concurrent connections \`512\` | Quinn idle timeout \`${RUST_QUINN_MAX_IDLE_TIMEOUT_MS}ms\`; keepalive \`${RUST_QUINN_KEEP_ALIVE_MS}ms\`; RPC stream idle timeout disabled by default | runtime-bounded windows; message frame batch \`32\`; send window \`${RUST_QUINN_SEND_WINDOW_BYTES}\` | ACK threshold \`${RUST_QUINN_ACK_THRESHOLD}\`; ACK delay \`${RUST_QUINN_ACK_DELAY_MS}\`; not TCP | Non-default ACK settings force a diagnostic profile and must not be published as production-representative rows |
-| trevRPC JavaScript / MsQuic server | streams per session \`65535\`; sessions per connection \`16\` | idle timeout \`600000ms\`; RPC stream idle timeout disabled in split path | pinned C transport profile \`$C_MSQUIC_PROFILE\` (\`$C_MSQUIC_PROFILE_KIND\`); native read batch \`32\`; write batch \`16\`; outbound JS buffers are copied into native-owned send buffers | MsQuic ACK behavior is library default; not TCP | Node native server path shares the C MsQuic transport stack |
+| Browser WebTransport client | browser-managed WebTransport session/stream limits; benchmark opens \`${WEBTRANSPORT_CONCURRENT_STREAMS:-1}\` concurrent stream(s) unless overridden | browser session timers are implementation-defined; RPC stream idle timeout uses the production default \`${RPC_STREAM_IDLE_TIMEOUT_MS}ms\` | fixed response read batch \`64\`; fixed request write batch \`64\`; fixed request write batch bytes \`65536\`; congestion control \`$BROWSER_CONGESTION_CONTROL\` | browser QUIC ACK tuning, TCP_NODELAY, and low-level send buffering are not exposed to JavaScript | WebTransport rows pin the generated certificate hash with the browser API |
+| trevRPC C / MsQuic server | streams per session \`65535\`; sessions per connection \`16\`; max sessions per connection \`16\` | idle timeout \`600000ms\`; keepalive \`5000ms\`; RPC stream idle timeout uses the production default \`${RPC_STREAM_IDLE_TIMEOUT_MS}ms\` | normal C transport defaults; WebTransport H3 control and CONNECT streams stay byte-oriented | MsQuic ACK behavior is library default; not TCP | C and JS rows use their normal transport defaults |
+| trevRPC Go / quic-go WebTransport server | WebTransport split server max concurrent streams per connection \`65535\` | QUIC idle timeout \`10m\`; keepalive \`5s\`; RPC stream idle timeout uses the production default \`${RPC_STREAM_IDLE_TIMEOUT_MS}ms\` | receive windows are capped from max frame size, stream body size, and concurrency; frame write batch \`16\` | quic-go ACK behavior is library default; not TCP | Uses quic-go HTTP/3 WebTransport path |
+| trevRPC Rust / Quinn WebTransport server | WebTransport split server max concurrent streams per connection \`65535\`; max concurrent connections \`512\` | Quinn idle timeout \`${RUST_QUINN_MAX_IDLE_TIMEOUT_MS}ms\`; keepalive \`${RUST_QUINN_KEEP_ALIVE_MS}ms\`; RPC stream idle timeout uses the production default \`${RPC_STREAM_IDLE_TIMEOUT_MS}ms\` | runtime-bounded windows; message frame batch \`32\` | Quinn ACK and flow-control behavior use normal library defaults; not TCP | Packet diagnostics force a diagnostic profile and must not be published as production-representative rows |
+| trevRPC JavaScript / MsQuic server | streams per session \`65535\`; sessions per connection \`16\` | idle timeout \`600000ms\`; RPC stream idle timeout uses the production default \`${RPC_STREAM_IDLE_TIMEOUT_MS}ms\` | normal C transport defaults; native read batch \`32\`; write batch \`16\`; outbound JS buffers are copied into native-owned send buffers | MsQuic ACK behavior is library default; not TCP | Node native server path shares the C MsQuic transport stack |
 | ConnectRPC Go / HTTPS baseline | browser Fetch/HTTP semantics; client-streaming and bidi are unsupported from browsers | HTTPS connection reuse within the browser sample | browser Fetch and HTTP/2 or HTTP/1.1 library defaults | browser TCP/ACK controls are not exposed | Baseline only; not transport-compatible with WebTransport rows |
 
 ## Benchmark profile boundary
 
 The sorted tables below are \`$HANDSHAKE_INCLUSION_MODE\` measurements. They exclude page setup, client construction, session connect, TLS/QUIC handshake, first-RPC setup, and clean close. Any handshake-inclusive benchmark family must be emitted and published in separate tables.
 
-The \`production-representative\` profile requires structured protobuf messages, per-message serialization/deserialization, encryption, no raw/pre-encoded payload shortcuts, library-default Rust Quinn ACK behavior, and all diagnostic instrumentation disabled. Throughput-oriented batching is reported in the batching settings; raw, pre-encoded, captured, keylogged, or traced rows must stay out of these tables.
+The \`production-representative\` profile requires structured protobuf messages, per-message serialization/deserialization, encryption, no raw/pre-encoded payload shortcuts, normal transport defaults, and all diagnostic instrumentation disabled. Fixed implementation batching is reported in the batching settings; raw, pre-encoded, captured, keylogged, or traced rows must stay out of these tables.
 
 ## Environment
 
@@ -1186,7 +984,7 @@ Latency tables are sorted by median latency ascending. Throughput tables are sor
 
 Raw command output is saved under \`$RAW_DIR\`. Per-measurement normalized rows are saved in \`$SAMPLES_CSV\`. The exact commands are saved in \`$COMMAND_LOG\`.
 
-Encoded payload sizes, Rust transport settings, browser timeout/congestion settings, the pinned C profile, ACK settings, and normalized instrumentation states are stored in immutable sample metadata; failure rows retain every value that is not already represented by a measured result, and aggregate rows copy the sample metadata. \`--report-only\` requires the selected settings to match every row and refuses to relabel mismatched samples. Schemas predating these fields are rejected; regenerate them with their recorded script snapshot or explicitly migrate every row instead of inferring missing state.
+Encoded payload sizes, Rust idle/keepalive settings, browser congestion settings, fixed batching defaults, and normalized instrumentation states are stored in immutable sample metadata; failure rows retain every value that is not already represented by a measured result, and aggregate rows copy the sample metadata. \`--report-only\` requires the selected settings to match every row and refuses to relabel mismatched samples. Other schemas are rejected; regenerate them with their recorded script snapshot rather than inferring missing or removed state.
 EOF
     } >"$MARKDOWN"
 }
@@ -1301,7 +1099,7 @@ run_webtransport_sample() {
     else
         local status=$?
         printf 'sample %s failed with status %d; omitting from aggregate results\n' "$name" "$status" | tee -a "$RAW_DIR/$name.txt" >&2
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$run" "$browser" "$server" "$source" "$status" "$RAW_DIR/$name.txt" "$RUST_QUINN_ACK_THRESHOLD" "$RUST_QUINN_ACK_DELAY_MS" "$WEBTRANSPORT_BATCHING_SETTINGS" "$C_FRAME_TRACE_STATE" "$RUST_QUINN_FRAME_TRACE_STATE" "$RUST_QUINN_QLOG_STATE" "$RUST_QUINN_PROTOCOL_TRACE_STATE" "$RUST_TLS_KEYLOG_STATE" "$ENCODED_REQUEST_BYTES" "$ENCODED_RESPONSE_BYTES" "$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" "$RUST_QUINN_KEEP_ALIVE_MS" "$RUST_QUINN_SEND_WINDOW_BYTES" "$BROWSER_STREAM_TIMEOUT_DISABLE_STATE" "$BROWSER_CONGESTION_CONTROL" "$C_MSQUIC_PROFILE" "$C_MSQUIC_PROFILE_KIND" >>"$FAILURES_CSV"
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$run" "$browser" "$server" "$source" "$status" "$RAW_DIR/$name.txt" "$WEBTRANSPORT_BATCHING_SETTINGS" "$C_FRAME_TRACE_STATE" "$RUST_QUINN_QLOG_STATE" "$RUST_QUINN_PROTOCOL_TRACE_STATE" "$RUST_TLS_KEYLOG_STATE" "$ENCODED_REQUEST_BYTES" "$ENCODED_RESPONSE_BYTES" "$RUST_QUINN_MAX_IDLE_TIMEOUT_MS" "$RUST_QUINN_KEEP_ALIVE_MS" "$BROWSER_CONGESTION_CONTROL" >>"$FAILURES_CSV"
     fi
 }
 
@@ -1362,7 +1160,7 @@ run_webtransport_benchmarks() {
     if [[ "$RUN_RUST" == "1" ]]; then
         local rust_cert="$OUT_DIR_ABS/rust-webtransport-cert.pem"
         rm -f "$rust_cert"
-        start_server webtransport-rust-server env "${RUST_BENCH_ENV_UNSET[@]}" "${RUST_BENCH_ENV[@]}" "$RUST_SPLIT_BENCH" webtransport-server 127.0.0.1:0 "$rust_cert" "$STATIC_ORIGIN"
+        start_server webtransport-rust-server env "${RUST_BENCH_ENV[@]}" "$RUST_SPLIT_BENCH" webtransport-server 127.0.0.1:0 "$rust_cert" "$STATIC_ORIGIN"
         port=$START_SERVER_PORT
         run_browser_against_server rust rust_quinn "$port" "$rust_cert"
         stop_rpc_servers
