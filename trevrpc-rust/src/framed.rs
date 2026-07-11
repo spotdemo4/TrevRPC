@@ -12,15 +12,27 @@ use crate::{BoxMessageStream, Error, Result, RpcStreamFrame, RpcStreamFrameKind,
 pub(crate) const MESSAGE_FRAME_BATCH: usize = 32;
 
 pub(crate) trait FrameWrite {
-    async fn write_frame_bytes(&mut self, bytes: &[u8]) -> Result<()>;
+    fn write_frame_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 
-    async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()>;
+    fn write_frame_chunks(
+        &mut self,
+        chunks: &mut [Bytes],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 pub(crate) trait FrameRead {
-    async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>>;
+    fn read_frame_bytes(
+        &mut self,
+        bytes: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<Option<usize>>> + Send;
 
-    async fn read_exact_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<()>;
+    fn read_exact_frame_bytes(
+        &mut self,
+        bytes: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 pub(crate) trait FrameTrace {

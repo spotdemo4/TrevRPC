@@ -49,6 +49,7 @@ struct trevrpc_stream {
     uint32_t transport;
     trevrpc_msquic_stream* msquic_stream;
     void* wt_stream;
+    void* h3_stream;
     const trevrpc_call_context* context;
     size_t max_frame_size;
     bool owns_stream;

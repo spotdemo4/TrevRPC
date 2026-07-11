@@ -366,8 +366,8 @@ func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) err
 				delete(active, conn)
 				activeMu.Unlock()
 			}()
-			if isWebTransportQUICConnection(conn, server.options) {
-				handleWebTransportConnection(connectionsCtx, conn, server, requestLimit, true)
+			if isHTTP3QUICConnection(conn, server.options) {
+				handleHTTP3Connection(connectionsCtx, conn, server, requestLimit, true)
 				return
 			}
 

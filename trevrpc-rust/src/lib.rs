@@ -11,12 +11,17 @@ pub mod stream;
 pub mod wire;
 
 pub const ALPN: &[u8] = b"trevrpc/1";
+#[cfg(feature = "http3")]
+pub const HTTP3_ALPN: &[u8] = b"h3";
 
 #[cfg(feature = "client")]
 pub mod client;
 
 #[cfg(feature = "quinn")]
 pub mod quinn;
+
+#[cfg(feature = "http3")]
+pub mod http3;
 
 #[cfg(feature = "server")]
 pub mod server;

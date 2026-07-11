@@ -68,6 +68,7 @@ struct trevrpc_stream {
     uint32_t transport;
     trevrpc_msquic_stream* msquic_stream;
     trevrpc_wt_stream* wt_stream;
+    trevrpc_h3_stream* h3_stream;
     const trevrpc_call_context* context;
     size_t max_frame_size;
     bool owns_stream;
@@ -115,6 +116,7 @@ struct trevrpc_server_conn_ref {
     trevrpc_server_conn_ref* next;
     trevrpc_msquic_conn* conn;
     trevrpc_wt_session* wt_session;
+    trevrpc_h3_conn* h3_conn;
 };
 
 struct trevrpc_server {
@@ -124,6 +126,10 @@ struct trevrpc_server {
     trevrpc_wt_config shared_wt_config;
     char* shared_wt_path;
     char* shared_wt_origin;
+    char* shared_h3_path;
+    int enable_http3;
+    trevrpc_http3_admission http3_admission;
+    void* http3_admission_user_data;
     size_t max_frame_size;
     trevrpc_server_options options;
     pthread_mutex_t mutex;
@@ -171,6 +177,7 @@ typedef struct trevrpc_conn_task {
     trevrpc_server* server;
     trevrpc_msquic_conn* conn;
     trevrpc_wt_session* wt_session;
+    trevrpc_h3_conn* h3_conn;
 } trevrpc_conn_task;
 
 typedef struct trevrpc_accept_task {
@@ -184,6 +191,8 @@ typedef struct trevrpc_stream_task {
     trevrpc_server* server;
     trevrpc_msquic_stream* stream;
     trevrpc_wt_stream* wt_stream;
+    trevrpc_h3_stream* h3_stream;
+    trevrpc_h3_conn* h3_conn;
     trevrpc_conn_stream_limiter* stream_limiter;
     struct timespec accepted_at;
 } trevrpc_stream_task;
@@ -270,6 +279,16 @@ static trevrpc_server_config trevrpc_effective_server_config(const trevrpc_serve
         effective.webtransport_admission = config->webtransport_admission;
         effective.webtransport_admission_user_data = config->webtransport_admission_user_data;
     }
+    if (config->enable_http3 != 0) {
+        effective.enable_http3 = 1;
+    }
+    if (config->http3_path != NULL) {
+        effective.http3_path = config->http3_path;
+    }
+    if (config->http3_admission != NULL) {
+        effective.http3_admission = config->http3_admission;
+        effective.http3_admission_user_data = config->http3_admission_user_data;
+    }
     if (config->max_idle_timeout_ms != 0) {
         effective.max_idle_timeout_ms = config->max_idle_timeout_ms;
     }
@@ -339,7 +358,7 @@ static trevrpc_msquic_config trevrpc_make_server_msquic_config(const trevrpc_ser
     if (wt_stream_count > msquic_config.peer_bidi_stream_count) {
         msquic_config.peer_bidi_stream_count = (uint16_t)wt_stream_count;
     }
-    if (config->webtransport_path != NULL) {
+    if (config->webtransport_path != NULL || config->enable_http3) {
         msquic_config.peer_unidi_stream_count = TREVRPC_H3_DEFAULT_UNIDI_STREAMS;
     }
     return msquic_config;
@@ -394,6 +413,7 @@ trevrpc_server_config trevrpc_default_server_config(void) {
     trevrpc_server_config config = {0};
     config.host = "127.0.0.1";
     config.webtransport_path = "/trevrpc";
+    config.http3_path = "/trevrpc";
     config.max_idle_timeout_ms = 30000;
     config.keep_alive_ms = 15000;
     config.peer_bidi_stream_count = 128;
@@ -643,6 +663,13 @@ static int trevrpc_stream_write_frame(trevrpc_stream* stream, const uint8_t* fra
         }
         return (size_t)written == frame_len ? 0 : TREV_WT_ERR_CLOSED;
     }
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
+        written = trevrpc_h3_stream_write(stream->h3_stream, frame, frame_len);
+        if (written < 0) {
+            return (int)written;
+        }
+        return (size_t)written == frame_len ? 0 : TREV_WT_ERR_CLOSED;
+    }
     return -EINVAL;
 }
 
@@ -661,6 +688,13 @@ static int trevrpc_stream_write_final_frame(trevrpc_stream* stream, const uint8_
             return err;
         }
         return trevrpc_wt_stream_shutdown_send(stream->wt_stream);
+    }
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
+        written = trevrpc_h3_stream_write_fin(stream->h3_stream, frame, frame_len);
+        if (written < 0) {
+            return (int)written;
+        }
+        return (size_t)written == frame_len ? 0 : TREV_WT_ERR_CLOSED;
     }
     return -EINVAL;
 }
@@ -713,6 +747,26 @@ static intptr_t trevrpc_stream_write_message_frame(trevrpc_stream* stream, const
     if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         return trevrpc_wt_stream_write_message_frame(stream->wt_stream, body, body_len, stream->max_frame_size);
     }
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
+        uint8_t* frame = NULL;
+        size_t frame_len = 0;
+        int err = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+            TREVRPC_STATUS_OK,
+            NULL,
+            0,
+            body,
+            body_len,
+            NULL,
+            stream->max_frame_size,
+            &frame,
+            &frame_len);
+        if (err != 0) {
+            return err;
+        }
+        intptr_t written = trevrpc_h3_stream_write(stream->h3_stream, frame, frame_len);
+        free(frame);
+        return written < 0 ? written : (intptr_t)body_len;
+    }
     return -EINVAL;
 }
 
@@ -732,6 +786,12 @@ static intptr_t trevrpc_stream_read_frame_body(trevrpc_stream* stream, uint8_t**
                    : trevrpc_wt_stream_read_frame_timeout(
                          stream->wt_stream, body, body_len, stream->max_frame_size, stream->stream_idle_timeout_nanos);
     }
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
+        return stream->stream_idle_timeout_nanos == 0
+                   ? trevrpc_h3_stream_read_frame(stream->h3_stream, body, body_len, stream->max_frame_size)
+                   : trevrpc_h3_stream_read_frame_timeout(
+                         stream->h3_stream, body, body_len, stream->max_frame_size, stream->stream_idle_timeout_nanos);
+    }
     return -EINVAL;
 }
 
@@ -742,11 +802,18 @@ static intptr_t trevrpc_stream_read_frame_body_ready(trevrpc_stream* stream, uin
     if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         return trevrpc_wt_stream_read_frame_ready(stream->wt_stream, body, body_len, stream->max_frame_size);
     }
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
+        return trevrpc_h3_stream_read_frame_ready(stream->h3_stream, body, body_len, stream->max_frame_size);
+    }
     return TREV_MSQUIC_ERR_TIMEOUT;
 }
 
 static void trevrpc_stream_free_body(trevrpc_stream* stream, uint8_t* body) {
     if (stream != NULL && stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
+        trevrpc_wt_free(body);
+        return;
+    }
+    if (stream != NULL && stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
         trevrpc_wt_free(body);
         return;
     }
@@ -775,12 +842,37 @@ static trevrpc_stream trevrpc_stream_ref_webtransport(trevrpc_wt_stream* stream,
     };
 }
 
+static trevrpc_stream trevrpc_stream_ref_http3(trevrpc_h3_stream* stream, size_t max_frame_size) {
+    return (trevrpc_stream){
+        .transport = TREVRPC_TRANSPORT_KIND_HTTP3,
+        .h3_stream = stream,
+        .max_frame_size = max_frame_size,
+        .max_stream_messages = TREVRPC_STREAM_LIMIT_DISABLED,
+        .max_stream_body_size = TREVRPC_STREAM_LIMIT_DISABLED,
+        .failure_status = TREVRPC_STATUS_OK,
+    };
+}
+
+static trevrpc_stream trevrpc_stream_ref_server(
+    trevrpc_msquic_stream* stream, trevrpc_wt_stream* wt_stream, trevrpc_h3_stream* h3_stream, size_t max_frame_size) {
+    if (stream != NULL) {
+        return trevrpc_stream_ref_msquic(stream, max_frame_size);
+    }
+    if (wt_stream != NULL) {
+        return trevrpc_stream_ref_webtransport(wt_stream, max_frame_size);
+    }
+    return trevrpc_stream_ref_http3(h3_stream, max_frame_size);
+}
+
 static int trevrpc_stream_shutdown_send_raw(trevrpc_stream* stream) {
     if (stream->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
         return trevrpc_msquic_stream_shutdown_send(stream->msquic_stream);
     }
     if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         return trevrpc_wt_stream_shutdown_send(stream->wt_stream);
+    }
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
+        return trevrpc_h3_stream_shutdown_send(stream->h3_stream);
     }
     return -EINVAL;
 }
@@ -790,6 +882,8 @@ static void trevrpc_stream_close_raw(trevrpc_stream* stream) {
         trevrpc_msquic_stream_close(stream->msquic_stream);
     } else if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         trevrpc_wt_stream_close(stream->wt_stream);
+    } else if (stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
+        trevrpc_h3_stream_close(stream->h3_stream);
     }
 }
 
@@ -992,7 +1086,7 @@ static int trevrpc_stream_check_message_batch_limits(
 }
 
 static int trevrpc_stream_prepare_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
-    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) ||
+    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL && stream->h3_stream == NULL) ||
         (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
@@ -1063,7 +1157,7 @@ int trevrpc_stream_send_message_borrowed_wait(trevrpc_stream* stream, const uint
 }
 
 int trevrpc_stream_send_messages(trevrpc_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count) {
-    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) ||
+    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL && stream->h3_stream == NULL) ||
         (body_lens == NULL && count > 0)) {
         return -EINVAL;
     }
@@ -1212,7 +1306,7 @@ static int trevrpc_stream_send_status_with_metadata_internal(trevrpc_stream* str
     size_t message_len,
     const trevrpc_metadata* metadata,
     bool finish_send) {
-    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) ||
+    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL && stream->h3_stream == NULL) ||
         (message == NULL && message_len > 0)) {
         return -EINVAL;
     }
@@ -1279,7 +1373,8 @@ int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const ch
 }
 
 int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame) {
-    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) || out_frame == NULL) {
+    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL && stream->h3_stream == NULL) ||
+        out_frame == NULL) {
         return -EINVAL;
     }
     *out_frame = NULL;
@@ -1334,8 +1429,8 @@ int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** out_frame
 
 static int trevrpc_stream_recv_ready_internal(
     trevrpc_stream* stream, trevrpc_stream_frame** out_frame, int* ready, const struct timespec* wait_started_at) {
-    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL) || out_frame == NULL ||
-        ready == NULL) {
+    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL && stream->h3_stream == NULL) ||
+        out_frame == NULL || ready == NULL) {
         return -EINVAL;
     }
     *out_frame = NULL;
@@ -1482,7 +1577,7 @@ int trevrpc_stream_recv_batch(
 }
 
 int trevrpc_stream_finish_send(trevrpc_stream* stream) {
-    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL)) {
+    if (stream == NULL || (stream->msquic_stream == NULL && stream->wt_stream == NULL && stream->h3_stream == NULL)) {
         return -EINVAL;
     }
 
@@ -1498,6 +1593,8 @@ void trevrpc_stream_cancel(trevrpc_stream* stream) {
         (void)trevrpc_msquic_stream_abort(stream->msquic_stream);
     } else if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         (void)trevrpc_wt_stream_abort(stream->wt_stream, 0);
+    } else if (stream->transport == TREVRPC_TRANSPORT_KIND_HTTP3) {
+        (void)trevrpc_h3_stream_abort(stream->h3_stream);
     }
 }
 
@@ -2216,7 +2313,8 @@ int trevrpc_server_listen(const trevrpc_server_config* config, trevrpc_server** 
 
     trevrpc_server_config effective = trevrpc_effective_server_config(config);
     if (effective.host == NULL || effective.cert_file == NULL || effective.key_file == NULL ||
-        effective.max_idle_timeout_ms > UINT32_MAX) {
+        effective.max_idle_timeout_ms > UINT32_MAX ||
+        (effective.enable_http3 && (effective.http3_path == NULL || effective.http3_path[0] != '/'))) {
         return -EINVAL;
     }
 
@@ -2229,14 +2327,19 @@ int trevrpc_server_listen(const trevrpc_server_config* config, trevrpc_server** 
     trevrpc_wt_config wt_config = trevrpc_make_server_wt_config(&effective);
     server->shared_wt_path = trevrpc_copy_cstring(effective.webtransport_path);
     server->shared_wt_origin = trevrpc_copy_cstring(effective.webtransport_origin);
+    server->shared_h3_path = trevrpc_copy_cstring(effective.http3_path);
     if ((effective.webtransport_path != NULL && server->shared_wt_path == NULL) ||
-        (effective.webtransport_origin != NULL && server->shared_wt_origin == NULL)) {
+        (effective.webtransport_origin != NULL && server->shared_wt_origin == NULL) ||
+        (effective.http3_path != NULL && server->shared_h3_path == NULL)) {
         trevrpc_server_close(server);
         return -ENOMEM;
     }
     wt_config.path = server->shared_wt_path;
     wt_config.origin = server->shared_wt_origin;
     server->shared_wt_config = wt_config;
+    server->enable_http3 = effective.enable_http3;
+    server->http3_admission = effective.http3_admission;
+    server->http3_admission_user_data = effective.http3_admission_user_data;
 
     trevrpc_msquic_config msquic_config = trevrpc_make_server_msquic_config(&effective);
     if (msquic_config.cert_file == NULL || msquic_config.key_file == NULL) {
@@ -3047,6 +3150,8 @@ static void trevrpc_server_shutdown_connections(trevrpc_server* server) {
             trevrpc_msquic_conn_shutdown(ref->conn);
         } else if (ref->wt_session != NULL) {
             trevrpc_wt_session_shutdown(ref->wt_session);
+        } else if (ref->h3_conn != NULL) {
+            trevrpc_h3_conn_shutdown(ref->h3_conn);
         }
     }
     pthread_mutex_unlock(&server->mutex);
@@ -3082,6 +3187,7 @@ static bool trevrpc_server_wait_for_tasks(trevrpc_server* server, uint64_t timeo
 static int trevrpc_server_conn_add(trevrpc_server* server,
     trevrpc_msquic_conn* conn,
     trevrpc_wt_session* wt_session,
+    trevrpc_h3_conn* h3_conn,
     trevrpc_server_conn_ref** out_ref) {
     *out_ref = NULL;
     trevrpc_server_conn_ref* ref = malloc(sizeof(*ref));
@@ -3090,6 +3196,7 @@ static int trevrpc_server_conn_add(trevrpc_server* server,
     }
     ref->conn = conn;
     ref->wt_session = wt_session;
+    ref->h3_conn = h3_conn;
 
     pthread_mutex_lock(&server->mutex);
     ref->next = server->conns;
@@ -3102,6 +3209,8 @@ static int trevrpc_server_conn_add(trevrpc_server* server,
             trevrpc_msquic_conn_shutdown(conn);
         } else if (wt_session != NULL) {
             trevrpc_wt_session_shutdown(wt_session);
+        } else if (h3_conn != NULL) {
+            trevrpc_h3_conn_shutdown(h3_conn);
         }
     }
 
@@ -3977,9 +4086,43 @@ static void trevrpc_stream_task_cleanup(trevrpc_stream_task* task, trevrpc_strea
 }
 
 static void trevrpc_stream_task_run(trevrpc_stream_task* task) {
-    trevrpc_stream stream = task->stream != NULL
-                                ? trevrpc_stream_ref_msquic(task->stream, task->server->max_frame_size)
-                                : trevrpc_stream_ref_webtransport(task->wt_stream, task->server->max_frame_size);
+    if (task->h3_conn != NULL) {
+        trevrpc_server_options options = trevrpc_server_options_snapshot(task->server);
+        bool expired = false;
+        uint64_t timeout =
+            trevrpc_initial_timeout_remaining(options.initial_request_timeout_nanos, &task->accepted_at, &expired);
+        trevrpc_wt_stream* wt_stream = NULL;
+        int resolution = TREV_H3_STREAM_RESOLVED_HANDLED;
+        int err =
+            trevrpc_h3_stream_resolve(task->h3_conn, task->h3_stream, expired ? 0 : timeout, &wt_stream, &resolution);
+        if (err != 0 || resolution == TREV_H3_STREAM_RESOLVED_HANDLED) {
+            trevrpc_transport_record_event_for_transport(
+                task->server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, TREVRPC_TRANSPORT_KIND_HTTP3, 0, NULL);
+            if (err != 0) {
+                trevrpc_transport_record_event_for_transport(task->server,
+                    TREVRPC_TRANSPORT_EVENT_STREAM_ERROR,
+                    TREVRPC_TRANSPORT_KIND_HTTP3,
+                    err,
+                    "failed to resolve HTTP/3 request stream");
+            }
+            trevrpc_transport_record_event_for_transport(
+                task->server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, TREVRPC_TRANSPORT_KIND_HTTP3, 0, NULL);
+            trevrpc_h3_stream_close(task->h3_stream);
+            trevrpc_conn_stream_finish(task->stream_limiter);
+            trevrpc_conn_stream_limiter_release(task->stream_limiter);
+            trevrpc_server_task_finish(task->server);
+            free(task);
+            return;
+        }
+        if (resolution == TREV_H3_STREAM_RESOLVED_WEBTRANSPORT) {
+            trevrpc_h3_stream_close(task->h3_stream);
+            task->h3_stream = NULL;
+            task->wt_stream = wt_stream;
+        }
+        task->h3_conn = NULL;
+    }
+    trevrpc_stream stream =
+        trevrpc_stream_ref_server(task->stream, task->wt_stream, task->h3_stream, task->server->max_frame_size);
     trevrpc_transport_record_event_for_transport(
         task->server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, stream.transport, 0, NULL);
     bool cleanup_transferred =
@@ -4127,18 +4270,23 @@ static int trevrpc_server_worker_pool_start(trevrpc_server* server) {
 static int trevrpc_server_submit_stream_task(trevrpc_server* server,
     trevrpc_msquic_stream* stream,
     trevrpc_wt_stream* wt_stream,
+    trevrpc_h3_stream* h3_stream,
+    trevrpc_h3_conn* h3_conn,
     trevrpc_conn_stream_limiter* stream_limiter,
     const struct timespec* accepted_at) {
-    uint32_t transport = stream != NULL ? TREVRPC_TRANSPORT_KIND_MSQUIC : TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
+    uint32_t transport = stream != NULL      ? TREVRPC_TRANSPORT_KIND_MSQUIC
+                         : wt_stream != NULL ? TREVRPC_TRANSPORT_KIND_WEBTRANSPORT
+                                             : TREVRPC_TRANSPORT_KIND_HTTP3;
     trevrpc_server_options options = trevrpc_server_options_snapshot(server);
     if (!trevrpc_conn_stream_try_start(stream_limiter, options.max_concurrent_streams_per_connection)) {
         trevrpc_transport_record_event_for_transport(server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, transport, 0, NULL);
         trevrpc_transport_record_event_for_transport(
             server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, transport, 0, "too many concurrent streams on connection");
-        trevrpc_stream rpc_stream = stream != NULL ? trevrpc_stream_ref_msquic(stream, server->max_frame_size)
-                                                   : trevrpc_stream_ref_webtransport(wt_stream, server->max_frame_size);
-        trevrpc_server_write_status(
-            &rpc_stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "too many concurrent streams on connection");
+        trevrpc_stream rpc_stream = trevrpc_stream_ref_server(stream, wt_stream, h3_stream, server->max_frame_size);
+        if (h3_conn == NULL) {
+            trevrpc_server_write_status(
+                &rpc_stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "too many concurrent streams on connection");
+        }
         trevrpc_transport_record_event_for_transport(server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, transport, 0, NULL);
         trevrpc_stream_close_raw(&rpc_stream);
         return 1;
@@ -4152,8 +4300,10 @@ static int trevrpc_server_submit_stream_task(trevrpc_server* server,
         trevrpc_conn_stream_finish(stream_limiter);
         if (stream != NULL) {
             trevrpc_msquic_stream_close(stream);
-        } else {
+        } else if (wt_stream != NULL) {
             trevrpc_wt_stream_close(wt_stream);
+        } else {
+            trevrpc_h3_stream_close(h3_stream);
         }
         return TREV_MSQUIC_ERR_CLOSED;
     }
@@ -4163,9 +4313,11 @@ static int trevrpc_server_submit_stream_task(trevrpc_server* server,
         trevrpc_transport_record_event_for_transport(server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, transport, 0, NULL);
         trevrpc_transport_record_event_for_transport(
             server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, transport, -ENOMEM, "failed to allocate stream task");
-        trevrpc_stream rpc_stream = stream != NULL ? trevrpc_stream_ref_msquic(stream, server->max_frame_size)
-                                                   : trevrpc_stream_ref_webtransport(wt_stream, server->max_frame_size);
-        trevrpc_server_write_status(&rpc_stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "failed to allocate stream task");
+        trevrpc_stream rpc_stream = trevrpc_stream_ref_server(stream, wt_stream, h3_stream, server->max_frame_size);
+        if (h3_conn == NULL) {
+            trevrpc_server_write_status(
+                &rpc_stream, TREVRPC_STATUS_RESOURCE_EXHAUSTED, "failed to allocate stream task");
+        }
         trevrpc_transport_record_event_for_transport(server, TREVRPC_TRANSPORT_EVENT_STREAM_CLOSE, transport, 0, NULL);
         trevrpc_conn_stream_finish(stream_limiter);
         trevrpc_stream_close_raw(&rpc_stream);
@@ -4176,6 +4328,8 @@ static int trevrpc_server_submit_stream_task(trevrpc_server* server,
     stream_task->server = server;
     stream_task->stream = stream;
     stream_task->wt_stream = wt_stream;
+    stream_task->h3_stream = h3_stream;
+    stream_task->h3_conn = h3_conn;
     stream_task->stream_limiter = stream_limiter;
     stream_task->accepted_at = accepted_at == NULL ? (struct timespec){0} : *accepted_at;
 
@@ -4184,13 +4338,14 @@ static int trevrpc_server_submit_stream_task(trevrpc_server* server,
         return 0;
     }
 
-    trevrpc_stream rpc_stream = stream != NULL ? trevrpc_stream_ref_msquic(stream, server->max_frame_size)
-                                               : trevrpc_stream_ref_webtransport(wt_stream, server->max_frame_size);
+    trevrpc_stream rpc_stream = trevrpc_stream_ref_server(stream, wt_stream, h3_stream, server->max_frame_size);
     trevrpc_transport_record_event_for_transport(server, TREVRPC_TRANSPORT_EVENT_STREAM_OPEN, transport, 0, NULL);
     if (queued == TREV_WORKER_QUEUE_FULL) {
         trevrpc_transport_record_event_for_transport(
             server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, transport, 0, "RPC worker queue is full");
-        (void)trevrpc_reject_stream_queue_full(server, &rpc_stream);
+        if (h3_conn == NULL) {
+            (void)trevrpc_reject_stream_queue_full(server, &rpc_stream);
+        }
     } else {
         trevrpc_transport_record_event_for_transport(
             server, TREVRPC_TRANSPORT_EVENT_STREAM_ERROR, transport, 0, "server is shutting down");
@@ -4212,7 +4367,7 @@ int trevrpc_test_server_queue_msquic_stream(
     trevrpc_server* server, trevrpc_msquic_stream* stream, trevrpc_conn_stream_limiter* stream_limiter) {
     struct timespec accepted_at = {0};
     (void)trevrpc_clock_now(&accepted_at);
-    return trevrpc_server_submit_stream_task(server, stream, NULL, stream_limiter, &accepted_at);
+    return trevrpc_server_submit_stream_task(server, stream, NULL, NULL, NULL, stream_limiter, &accepted_at);
 }
 
 bool trevrpc_test_server_wait_for_tasks(trevrpc_server* server, uint64_t timeout_nanos) {
@@ -4225,17 +4380,25 @@ static void* trevrpc_conn_thread(void* arg) {
     trevrpc_server* server = task->server;
     trevrpc_msquic_conn* conn = task->conn;
     trevrpc_wt_session* wt_session = task->wt_session;
-    uint32_t transport = conn != NULL ? TREVRPC_TRANSPORT_KIND_MSQUIC : TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
+    trevrpc_h3_conn* h3_conn = task->h3_conn;
+    uint32_t transport = conn != NULL           ? TREVRPC_TRANSPORT_KIND_MSQUIC
+                         : wt_session != NULL   ? TREVRPC_TRANSPORT_KIND_WEBTRANSPORT
+                         : server->enable_http3 ? TREVRPC_TRANSPORT_KIND_HTTP3
+                                                : TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
     free(task);
 
     trevrpc_server_conn_ref* conn_ref = NULL;
-    if (trevrpc_server_conn_add(server, conn, wt_session, &conn_ref) != 0) {
+    if (trevrpc_server_conn_add(server, conn, wt_session, h3_conn, &conn_ref) != 0) {
         trevrpc_transport_record_event_for_transport(
             server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, transport, -ENOMEM, "failed to track connection");
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
-            trevrpc_wt_session_close(wt_session);
+            if (wt_session != NULL) {
+                trevrpc_wt_session_close(wt_session);
+            } else {
+                trevrpc_h3_conn_close(h3_conn);
+            }
         }
         trevrpc_server_connection_finish(server);
         trevrpc_server_task_finish(server);
@@ -4253,7 +4416,11 @@ static void* trevrpc_conn_thread(void* arg) {
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
-            trevrpc_wt_session_close(wt_session);
+            if (wt_session != NULL) {
+                trevrpc_wt_session_close(wt_session);
+            } else {
+                trevrpc_h3_conn_close(h3_conn);
+            }
         }
         trevrpc_server_connection_finish(server);
         trevrpc_server_task_finish(server);
@@ -4263,9 +4430,11 @@ static void* trevrpc_conn_thread(void* arg) {
     while (!trevrpc_server_is_shutting_down(server)) {
         trevrpc_msquic_stream* stream = NULL;
         trevrpc_wt_stream* wt_stream = NULL;
+        trevrpc_h3_stream* h3_stream = NULL;
         struct timespec accepted_at = {0};
-        int err = conn != NULL ? trevrpc_msquic_conn_accept_stream(conn, &stream)
-                               : trevrpc_wt_session_accept_stream(wt_session, &wt_stream);
+        int err = conn != NULL         ? trevrpc_msquic_conn_accept_stream(conn, &stream)
+                  : wt_session != NULL ? trevrpc_wt_session_accept_stream(wt_session, &wt_stream)
+                                       : trevrpc_h3_conn_accept_stream(h3_conn, &h3_stream);
         if (err != 0) {
             if (!trevrpc_server_is_shutting_down(server)) {
                 trevrpc_transport_record_event_for_transport(
@@ -4275,7 +4444,8 @@ static void* trevrpc_conn_thread(void* arg) {
         }
 
         (void)trevrpc_clock_now(&accepted_at);
-        err = trevrpc_server_submit_stream_task(server, stream, wt_stream, stream_limiter, &accepted_at);
+        err = trevrpc_server_submit_stream_task(
+            server, stream, wt_stream, h3_stream, h3_conn, stream_limiter, &accepted_at);
         if (err == TREV_MSQUIC_ERR_CLOSED) {
             break;
         }
@@ -4288,7 +4458,11 @@ static void* trevrpc_conn_thread(void* arg) {
     if (conn != NULL) {
         trevrpc_msquic_conn_close(conn);
     } else {
-        trevrpc_wt_session_close(wt_session);
+        if (wt_session != NULL) {
+            trevrpc_wt_session_close(wt_session);
+        } else {
+            trevrpc_h3_conn_close(h3_conn);
+        }
     }
     trevrpc_server_connection_finish(server);
     trevrpc_server_task_finish(server);
@@ -4296,15 +4470,22 @@ static void* trevrpc_conn_thread(void* arg) {
 }
 
 static int trevrpc_server_start_connection_task(
-    trevrpc_server* server, trevrpc_msquic_conn* conn, trevrpc_wt_session* wt_session) {
-    uint32_t transport = conn != NULL ? TREVRPC_TRANSPORT_KIND_MSQUIC : TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
+    trevrpc_server* server, trevrpc_msquic_conn* conn, trevrpc_wt_session* wt_session, trevrpc_h3_conn* h3_conn) {
+    uint32_t transport = conn != NULL           ? TREVRPC_TRANSPORT_KIND_MSQUIC
+                         : wt_session != NULL   ? TREVRPC_TRANSPORT_KIND_WEBTRANSPORT
+                         : server->enable_http3 ? TREVRPC_TRANSPORT_KIND_HTTP3
+                                                : TREVRPC_TRANSPORT_KIND_WEBTRANSPORT;
     if (!trevrpc_server_connection_try_start(server)) {
         trevrpc_transport_record_event_for_transport(
             server, TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, transport, 0, "too many concurrent connections");
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
-            trevrpc_wt_session_close(wt_session);
+            if (wt_session != NULL) {
+                trevrpc_wt_session_close(wt_session);
+            } else {
+                trevrpc_h3_conn_close(h3_conn);
+            }
         }
         return 0;
     }
@@ -4314,7 +4495,11 @@ static int trevrpc_server_start_connection_task(
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
-            trevrpc_wt_session_close(wt_session);
+            if (wt_session != NULL) {
+                trevrpc_wt_session_close(wt_session);
+            } else {
+                trevrpc_h3_conn_close(h3_conn);
+            }
         }
         return 0;
     }
@@ -4330,7 +4515,11 @@ static int trevrpc_server_start_connection_task(
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
-            trevrpc_wt_session_close(wt_session);
+            if (wt_session != NULL) {
+                trevrpc_wt_session_close(wt_session);
+            } else {
+                trevrpc_h3_conn_close(h3_conn);
+            }
         }
         trevrpc_server_connection_finish(server);
         trevrpc_server_task_finish(server);
@@ -4339,6 +4528,7 @@ static int trevrpc_server_start_connection_task(
     task->server = server;
     task->conn = conn;
     task->wt_session = wt_session;
+    task->h3_conn = h3_conn;
 
     pthread_t thread;
     int err = pthread_create(&thread, NULL, trevrpc_conn_thread, task);
@@ -4351,7 +4541,11 @@ static int trevrpc_server_start_connection_task(
         if (conn != NULL) {
             trevrpc_msquic_conn_close(conn);
         } else {
-            trevrpc_wt_session_close(wt_session);
+            if (wt_session != NULL) {
+                trevrpc_wt_session_close(wt_session);
+            } else {
+                trevrpc_h3_conn_close(h3_conn);
+            }
         }
         trevrpc_server_connection_finish(server);
         trevrpc_server_task_finish(server);
@@ -4380,7 +4574,7 @@ static int trevrpc_server_serve_transport(trevrpc_server* server, uint32_t trans
             result = trevrpc_server_is_shutting_down(server) ? 0 : err;
             break;
         }
-        err = trevrpc_server_start_connection_task(server, conn, wt_session);
+        err = trevrpc_server_start_connection_task(server, conn, wt_session, NULL);
         if (err != 0) {
             result = err;
             break;
@@ -4418,7 +4612,7 @@ static int trevrpc_server_serve_shared_transport(trevrpc_server* server) {
         }
 
         if (trevrpc_alpn_equals(alpn, alpn_len, TREVRPC_ALPN)) {
-            err = trevrpc_server_start_connection_task(server, conn, NULL);
+            err = trevrpc_server_start_connection_task(server, conn, NULL, NULL);
             if (err != 0) {
                 result = err;
                 break;
@@ -4427,20 +4621,27 @@ static int trevrpc_server_serve_shared_transport(trevrpc_server* server) {
         }
 
         if (trevrpc_alpn_equals(alpn, alpn_len, TREVRPC_H3_ALPN)) {
-            trevrpc_wt_session* wt_session = NULL;
-            err = trevrpc_wt_accept_session_from_msquic(conn, &server->shared_wt_config, &wt_session);
+            trevrpc_h3_conn* h3_conn = NULL;
+            err = trevrpc_h3_accept_from_msquic(conn,
+                &server->shared_wt_config,
+                server->enable_http3,
+                server->shared_h3_path,
+                server->http3_admission,
+                server->http3_admission_user_data,
+                server->max_frame_size,
+                &h3_conn);
             conn = NULL;
             if (err != 0) {
                 if (!trevrpc_server_is_shutting_down(server)) {
                     trevrpc_transport_record_event_for_transport(server,
                         TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR,
-                        TREVRPC_TRANSPORT_KIND_WEBTRANSPORT,
+                        TREVRPC_TRANSPORT_KIND_HTTP3,
                         err,
-                        "failed to accept WebTransport session");
+                        "failed to initialize HTTP/3 connection");
                 }
                 continue;
             }
-            err = trevrpc_server_start_connection_task(server, NULL, wt_session);
+            err = trevrpc_server_start_connection_task(server, NULL, NULL, h3_conn);
             if (err != 0) {
                 result = err;
                 break;
@@ -4560,6 +4761,7 @@ void trevrpc_server_close(trevrpc_server* server) {
     }
     free(server->shared_wt_path);
     free(server->shared_wt_origin);
+    free(server->shared_h3_path);
     trevrpc_method* method = server->methods;
     while (method != NULL) {
         trevrpc_method* next = method->next;

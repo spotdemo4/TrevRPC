@@ -729,7 +729,8 @@ impl crate::server::Server {
                     connection_tasks.spawn(async move {
                         if let Ok(connection) = incoming.await {
                             if negotiated_protocol(&connection).as_deref() == Some(crate::ALPN) {
-                                handle_connection(server, connection, request_limit, connection_permit, shutdown).await;
+                                let _connection_permit = connection_permit;
+                                handle_connection(server, connection, request_limit, shutdown).await;
                             } else {
                                 connection.close(0_u32.into(), b"unsupported ALPN");
                             }
@@ -778,110 +779,9 @@ impl crate::server::Server {
     where
         S: Future<Output = ()> + Send,
     {
-        let connection_limit = self
-            .options()
-            .max_concurrent_connections()
-            .map(|limit| Arc::new(Semaphore::new(limit)));
-        let request_limit = self
-            .options()
-            .max_concurrent_requests()
-            .map(|limit| Arc::new(Semaphore::new(limit)));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut connection_tasks = JoinSet::new();
-
-        tokio::pin!(shutdown);
-
-        loop {
-            tokio::select! {
-                incoming = endpoint.accept() => {
-                    let Some(incoming) = incoming else {
-                        break;
-                    };
-
-                    let Some(connection_permit) = try_acquire_permit(connection_limit.as_ref()) else {
-                        incoming.refuse();
-                        continue;
-                    };
-
-                    let server = self.clone();
-                    let request_limit = request_limit.clone();
-                    let shutdown = shutdown_rx.clone();
-                    connection_tasks.spawn(async move {
-                        if let Ok(connection) = incoming.await {
-                            match negotiated_protocol(&connection).as_deref() {
-                                Some(crate::ALPN) => {
-                                    handle_connection(server, connection, request_limit, connection_permit, shutdown).await;
-                                }
-                                Some(protocol) if protocol == web_transport_quinn::ALPN.as_bytes() => {
-                                    let _connection_permit = connection_permit;
-                                    handle_webtransport_connection(server, connection, request_limit, shutdown).await;
-                                }
-                                _ => {
-                                    connection.close(0_u32.into(), b"unsupported ALPN");
-                                }
-                            }
-                        }
-                    });
-                }
-                () = &mut shutdown => {
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
-                result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
-                    if let Some(Err(error)) = result {
-                        let _ = &error;
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(%error, "connection task failed");
-                    }
-                }
-            }
-        }
-
-        let _ = shutdown_tx.send(true);
-        drain_connections(
-            &mut connection_tasks,
-            self.options().graceful_shutdown_timeout(),
-            &endpoint,
-        )
-        .await;
-
-        Ok(())
+        self.serve_quinn_and_http3_with_shutdown(endpoint, shutdown)
+            .await
     }
-}
-
-#[cfg(feature = "webtransport")]
-async fn handle_webtransport_connection(
-    server: crate::server::Server,
-    connection: quinn::Connection,
-    request_limit: Option<Arc<Semaphore>>,
-    shutdown: watch::Receiver<bool>,
-) {
-    let request = match web_transport_quinn::Request::accept(connection).await {
-        Ok(request) => request,
-        Err(error) => {
-            let _ = &error;
-            #[cfg(feature = "tracing")]
-            tracing::debug!(%error, "WebTransport request failed");
-            return;
-        }
-    };
-
-    if let Some(status) = crate::webtransport::validate_request(&server, &request) {
-        let _ = request.reject(status).await;
-        return;
-    }
-
-    let session = match request.ok().await {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = &error;
-            #[cfg(feature = "tracing")]
-            tracing::debug!(%error, "WebTransport response failed");
-            return;
-        }
-    };
-
-    crate::webtransport::handle_session(server, session, request_limit, shutdown).await;
 }
 
 fn negotiated_protocol(connection: &quinn::Connection) -> Option<Vec<u8>> {
@@ -891,11 +791,10 @@ fn negotiated_protocol(connection: &quinn::Connection) -> Option<Vec<u8>> {
         .and_then(|data| data.protocol)
 }
 
-async fn handle_connection(
+pub(crate) async fn handle_connection(
     server: crate::server::Server,
     connection: quinn::Connection,
     request_limit: Option<Arc<Semaphore>>,
-    _connection_permit: Permit,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let stream_limit = server

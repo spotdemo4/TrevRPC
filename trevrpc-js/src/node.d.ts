@@ -63,16 +63,35 @@ export type NodeServerAuthorizer = (
   call: NodeServerCall,
 ) => NodeServerAuthorizationResult | Promise<NodeServerAuthorizationResult>;
 
+export interface NodeHttp3AdmissionRequest {
+  path: string;
+  authority: string;
+  secure: boolean;
+}
+
+export type NodeHttp3Admission = (request: NodeHttp3AdmissionRequest) => boolean;
+
 export interface NodeListenOptions extends RuntimeNodeConnectOptions {
   path?: string;
   origin?: string;
   certFile?: string;
   keyFile?: string;
   maxSessionsPerConnection?: number;
+  /** Enables ordinary HTTP/3 POST requests. Disabled by default. */
+  enableHttp3?: boolean;
+  /** HTTP/3 POST path. Defaults to /trevrpc. */
+  http3Path?: string;
+  /**
+   * Synchronous request admission hook run before RPC framing is read. The
+   * native wait is bounded by initialRequestTimeoutMs.
+   */
+  http3Admission?: NodeHttp3Admission;
   authorizer?: NodeServerAuthorizer;
   metrics?: NodeServerMetrics;
   logger?: NodeServerLogger | ((event: NodeLogEvent) => void);
   maxStreamMessages?: number;
+  /** Initial HTTP/RPC request timeout. Defaults to 10000 ms. */
+  initialRequestTimeoutMs?: number;
   streamIdleTimeoutMs?: number;
 }
 

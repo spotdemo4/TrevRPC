@@ -80,6 +80,7 @@ int main(void) {
     trevrpc_server_config config = trevrpc_default_server_config();
     config.host = "127.0.0.1";
     config.port = 50051;
+    config.enable_http3 = 1;
 
     trevrpc_server* server = NULL;
     if (trevrpc_server_listen(&config, &server) != 0) {

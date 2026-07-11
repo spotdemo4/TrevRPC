@@ -5,6 +5,7 @@ import type {
   RpcStreamFrameMessage,
   Transport,
 } from "../../src/index.js";
+import type { NodeListenOptions } from "../../src/node.js";
 
 interface HelloMessage {
   value?: string;
@@ -58,5 +59,15 @@ const connected = await connect("https://localhost:50051/trevrpc", {
   skipCertificateValidation: true,
 });
 connected.close();
+
+const nodeListenOptions: NodeListenOptions = {
+  host: "127.0.0.1",
+  port: 0,
+  enableHttp3: true,
+  http3Path: "/rpc",
+  http3Admission: (request) => request.secure && request.path === "/rpc",
+  initialRequestTimeoutMs: 5_000,
+};
+void nodeListenOptions;
 
 async function* emptyFrames(): AsyncIterable<RpcStreamFrameMessage> {}

@@ -5,10 +5,12 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::{Buf, Bytes};
+use prost::Message;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use quinn::rustls::server::WebPkiClientVerifier;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{CallOptions, RpcTransport};
 use trevrpc::server::{
@@ -21,6 +23,22 @@ mod greeter;
 
 const AUTH_TOKEN: &str = "integration-token";
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn reject_http3_admission(request: &trevrpc::server::Http3AdmissionRequest<'_>) -> bool {
+    assert!(request.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("content-type")
+            && header.value.eq_ignore_ascii_case(b"application/trevrpc")
+    }));
+    false
+}
+
+fn require_webtransport_admission_header(
+    request: &trevrpc::server::WebTransportAdmissionRequest<'_>,
+) -> bool {
+    request.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("x-trevrpc-admission") && header.value == b"allowed"
+    })
+}
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -150,6 +168,154 @@ struct RunningWebTransportServer {
     cert_der: CertificateDer<'static>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<trevrpc::Result<()>>>,
+}
+
+type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+type H3RecvStream = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>;
+
+#[derive(Clone)]
+struct Http3Transport {
+    sender: Arc<AsyncMutex<H3SendRequest>>,
+    authority: String,
+}
+
+impl Http3Transport {
+    async fn open(
+        &self,
+        method: http::Method,
+        path: &str,
+        content_type: Option<&str>,
+    ) -> trevrpc::Result<h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> {
+        let content_types = content_type.map_or_else(Vec::new, |value| vec![value]);
+        self.open_with_content_types(method, path, &content_types)
+            .await
+    }
+
+    async fn open_with_content_types(
+        &self,
+        method: http::Method,
+        path: &str,
+        content_types: &[&str],
+    ) -> trevrpc::Result<h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> {
+        let uri = format!("https://{}{path}", self.authority);
+        let mut request = http::Request::builder().method(method).uri(uri);
+        for content_type in content_types {
+            request = request.header(http::header::CONTENT_TYPE, *content_type);
+        }
+        let request = request.body(()).map_err(trevrpc::Error::transport)?;
+        self.sender
+            .lock()
+            .await
+            .send_request(request)
+            .await
+            .map_err(trevrpc::Error::transport)
+    }
+}
+
+#[trevrpc::async_trait]
+impl RpcTransport for Http3Transport {
+    async fn call(&self, request: RpcRequest) -> trevrpc::Result<RpcResponse> {
+        let mut stream = self
+            .open(http::Method::POST, "/trevrpc", Some("application/trevrpc"))
+            .await?;
+        stream
+            .send_data(Bytes::from(trevrpc::framing::encode_frame(&request)?))
+            .await
+            .map_err(trevrpc::Error::transport)?;
+        stream.finish().await.map_err(trevrpc::Error::transport)?;
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(trevrpc::Error::transport)?;
+        validate_http3_response(&response)?;
+        let body = read_http3_body(&mut stream).await?;
+        decode_single_frame(&body)
+    }
+
+    async fn streaming_call(
+        &self,
+        request: RpcRequest,
+        mut request_body: trevrpc::BoxMessageStream<Vec<u8>>,
+    ) -> trevrpc::Result<trevrpc::BoxMessageStream<RpcStreamFrame>> {
+        let stream = self
+            .open(http::Method::POST, "/trevrpc", Some("application/trevrpc"))
+            .await?;
+        let (mut send, mut recv) = stream.split();
+        let write_task = tokio::spawn(async move {
+            send.send_data(Bytes::from(trevrpc::framing::encode_frame(&request)?))
+                .await
+                .map_err(trevrpc::Error::transport)?;
+            while let Some(body) = request_body.next().await.transpose()? {
+                let frame = trevrpc::framing::encode_message_stream_frame(
+                    &body,
+                    trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+                )?;
+                send.send_data(Bytes::from(frame))
+                    .await
+                    .map_err(trevrpc::Error::transport)?;
+            }
+            send.finish().await.map_err(trevrpc::Error::transport)
+        });
+        let response = recv
+            .recv_response()
+            .await
+            .map_err(trevrpc::Error::transport)?;
+        validate_http3_response(&response)?;
+        Ok(Box::new(Http3ResponseStream {
+            recv,
+            chunk: Bytes::new(),
+            write_task: Some(write_task),
+            done: false,
+        }))
+    }
+}
+
+struct Http3ResponseStream {
+    recv: H3RecvStream,
+    chunk: Bytes,
+    write_task: Option<JoinHandle<trevrpc::Result<()>>>,
+    done: bool,
+}
+
+#[trevrpc::async_trait]
+impl MessageStream<RpcStreamFrame> for Http3ResponseStream {
+    async fn next(&mut self) -> Option<trevrpc::Result<RpcStreamFrame>> {
+        if self.done {
+            return None;
+        }
+        let body = match read_http3_frame_body(&mut self.recv, &mut self.chunk).await {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                self.done = true;
+                return None;
+            }
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        };
+        let frame = match trevrpc::framing::decode_stream_frame_body(&body) {
+            Ok(frame) => frame,
+            Err(error) => return Some(Err(error)),
+        };
+        if frame.frame_kind() == Some(trevrpc::RpcStreamFrameKind::Status) {
+            self.done = true;
+            if let Some(write_task) = self.write_task.take()
+                && !write_task.is_finished()
+            {
+                write_task.abort();
+            }
+        }
+        Some(Ok(frame))
+    }
+}
+
+impl Drop for Http3ResponseStream {
+    fn drop(&mut self) {
+        if let Some(write_task) = &self.write_task {
+            write_task.abort();
+        }
+    }
 }
 
 impl RunningWebTransportServer {
@@ -344,8 +510,50 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
 }
 
 #[tokio::test]
+async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_http3_enabled(true);
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_http3_client(&server).await?;
+
+    let reply = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "unary".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, unary");
+
+    let mut replies = client
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "server stream".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    let mut messages = Vec::new();
+    while let Some(reply) = replies.next().await {
+        messages.push(reply?.message);
+    }
+    assert_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
+
+    let summary = run_client_greetings(&client, &["one", "two"], authenticated_options()).await?;
+    assert_eq!(summary.message, "one,two");
+    let messages = run_bidi_greetings(&client, &["left", "right"], authenticated_options()).await?;
+    assert_eq!(messages, ["echo, left", "echo, right"]);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
+        server.set_http3_enabled(true);
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
 
@@ -375,7 +583,264 @@ async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResul
         .await?;
     assert_eq!(webtransport_reply.message, "hello, webtransport");
 
+    let (http3_endpoint, http3_connection, http3_client) = connect_http3_client(&server).await?;
+    let http3_reply = http3_client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "http3".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(http3_reply.message, "hello, http3");
+
+    let webtransport_reply = greeter_client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "webtransport interleaved".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(
+        webtransport_reply.message,
+        "hello, webtransport interleaved"
+    );
+    let http3_reply = http3_client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "http3 interleaved".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(http3_reply.message, "hello, http3 interleaved");
+
+    close_client(http3_endpoint, http3_connection).await;
     close_webtransport_client(webtransport_client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn unified_h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_options(
+            fast_server_options()
+                .with_http3_enabled(true)
+                .with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
+        );
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (webtransport_client, session, webtransport_rpc) =
+        connect_webtransport_client(&server).await?;
+    let (http3_endpoint, http3_connection, http3_rpc) = connect_http3_client(&server).await?;
+
+    let mut webtransport_replies = webtransport_rpc
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "cancel".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    let mut http3_replies = http3_rpc
+        .lots_of_replies(
+            greeter::HelloRequest {
+                name: "cancel".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(
+        webtransport_replies
+            .next()
+            .await
+            .expect("WebTransport stream should yield first response")?
+            .message,
+        "first"
+    );
+    assert_eq!(
+        http3_replies
+            .next()
+            .await
+            .expect("HTTP/3 stream should yield first response")?
+            .message,
+        "first"
+    );
+
+    tokio::time::timeout(TEST_TIMEOUT, server.shutdown())
+        .await
+        .expect("unified h3 shutdown should be bounded")?;
+    tokio::time::timeout(TEST_TIMEOUT, session.closed())
+        .await
+        .expect("WebTransport session should close during shutdown");
+    tokio::time::timeout(TEST_TIMEOUT, http3_connection.closed())
+        .await
+        .expect("HTTP/3 connection should close during shutdown");
+
+    drop(webtransport_replies);
+    drop(http3_replies);
+    close_webtransport_client(webtransport_client, session).await;
+    http3_endpoint.close(0_u32.into(), b"test complete");
+    tokio::time::timeout(TEST_TIMEOUT, http3_endpoint.wait_idle())
+        .await
+        .expect("HTTP/3 endpoint should become idle");
+    Ok(())
+}
+
+#[tokio::test]
+async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_http3_enabled(true);
+        server.set_http3_admission(Some(reject_http3_admission));
+    })?;
+    let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
+
+    assert_eq!(
+        http3_status(
+            &transport,
+            http::Method::POST,
+            "/wrong",
+            Some("application/trevrpc")
+        )
+        .await?,
+        http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        http3_status(
+            &transport,
+            http::Method::GET,
+            "/trevrpc",
+            Some("application/trevrpc")
+        )
+        .await?,
+        http::StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        http3_status(
+            &transport,
+            http::Method::POST,
+            "/trevrpc",
+            Some("application/json")
+        )
+        .await?,
+        http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    assert_eq!(
+        http3_status(
+            &transport,
+            http::Method::POST,
+            "/trevrpc",
+            Some("Application/TrevRPC")
+        )
+        .await?,
+        http::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        http3_status(
+            &transport,
+            http::Method::POST,
+            "/trevrpc",
+            Some("application/trevrpc; charset=utf-8")
+        )
+        .await?,
+        http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    assert_eq!(
+        http3_status_with_content_types(
+            &transport,
+            http::Method::POST,
+            "/trevrpc",
+            &["application/trevrpc", "application/trevrpc"],
+        )
+        .await?,
+        http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn http3_enforces_stream_limits_and_detects_cancellation() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let server = spawn_webtransport_greeter_server(move |server| {
+        server.set_options(
+            fast_server_options()
+                .with_http3_enabled(true)
+                .with_max_stream_messages(Some(1)),
+        );
+        server.set_metrics(metrics);
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
+    let client = greeter::GreeterClient::new(transport.clone());
+
+    let mut call = client.lots_of_greetings(authenticated_options()).await?;
+    call.send(greeter::HelloRequest {
+        name: "one".to_owned(),
+    })
+    .await?;
+    call.send(greeter::HelloRequest {
+        name: "two".to_owned(),
+    })
+    .await?;
+    let error = call
+        .close_and_recv()
+        .await
+        .expect_err("HTTP/3 request stream should exceed message limit");
+    assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+
+    let mut request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "LotsOfReplies",
+        greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        }
+        .encode_to_vec(),
+    )
+    .with_kind(RpcKind::ServerStreaming)
+    .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
+    request.metadata.insert(
+        "authorization".to_owned(),
+        format!("Bearer {AUTH_TOKEN}").into_bytes(),
+    );
+    let raw = transport
+        .open(http::Method::POST, "/trevrpc", Some("application/trevrpc"))
+        .await?;
+    let (mut send, mut recv) = raw.split();
+    send.send_data(Bytes::from(trevrpc::framing::encode_frame(&request)?))
+        .await?;
+    validate_http3_response(&recv.recv_response().await?)?;
+    let mut chunk = Bytes::new();
+    let first = read_http3_frame_body(&mut recv, &mut chunk)
+        .await?
+        .expect("HTTP/3 response should contain the first message");
+    let first = trevrpc::framing::decode_stream_frame_body(&first)?;
+    assert_eq!(
+        greeter::HelloReply::decode(first.body.as_slice())?.message,
+        "first"
+    );
+    send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        observed_metrics.wait_for_code(Code::Cancelled),
+    )
+    .await
+    .expect("HTTP/3 request reset should promptly cancel the handler");
+
+    let reply = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "after cancellation".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, after cancellation");
+    drop(recv);
+    close_client(endpoint, connection).await;
     server.shutdown().await
 }
 
@@ -436,6 +901,42 @@ async fn webtransport_allows_configured_browser_origin() -> TestResult {
         .await?;
 
     assert_eq!(reply.message, "hello, origin");
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_admission_receives_generic_request_headers() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_webtransport_admission(Some(require_webtransport_admission_header));
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let client = make_webtransport_client(&server)?;
+    let denied =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?);
+    assert_webtransport_connect_rejected(
+        expect_webtransport_connect_error(&client, denied).await,
+        web_transport_quinn::http::StatusCode::FORBIDDEN,
+    );
+
+    let allowed =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?)
+            .with_header(
+                web_transport_quinn::http::HeaderName::from_static("x-trevrpc-admission"),
+                web_transport_quinn::http::HeaderValue::from_static("allowed"),
+            );
+    let session = client.connect(allowed).await?;
+    let rpc = greeter::GreeterClient::new(trevrpc::webtransport::Client::new(session.clone()));
+    let reply = rpc
+        .say_hello(
+            greeter::HelloRequest {
+                name: "admitted".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, admitted");
+
     close_webtransport_client(client, session).await;
     server.shutdown().await
 }
@@ -699,7 +1200,7 @@ async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
 }
 
 #[tokio::test]
-async fn webtransport_dropped_response_stream_cancels_server_work() -> TestResult {
+async fn webtransport_request_reset_cancels_only_one_rpc() -> TestResult {
     let metrics = RecordingMetrics::default();
     let server_metrics = metrics.clone();
     let server = spawn_webtransport_greeter_server(move |server| {
@@ -707,23 +1208,54 @@ async fn webtransport_dropped_response_stream_cancels_server_work() -> TestResul
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+    let mut request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "LotsOfReplies",
+        greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        }
+        .encode_to_vec(),
+    )
+    .with_kind(RpcKind::ServerStreaming)
+    .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
+    request.metadata.insert(
+        "authorization".to_owned(),
+        format!("Bearer {AUTH_TOKEN}").into_bytes(),
+    );
+    trevrpc::webtransport::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    let first = trevrpc::webtransport::read_frame::<RpcStreamFrame>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    assert_eq!(
+        greeter::HelloReply::decode(first.body.as_slice())?.message,
+        "first"
+    );
 
-    let mut replies = greeter_client
-        .lots_of_replies(
+    send.reset(1)?;
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        metrics.wait_for_code(Code::Cancelled),
+    )
+    .await
+    .expect("WebTransport request reset should promptly cancel the handler");
+    let reply = greeter_client
+        .say_hello(
             greeter::HelloRequest {
-                name: "cancel".to_owned(),
+                name: "after cancellation".to_owned(),
             },
             authenticated_options(),
         )
         .await?;
-    let first = replies
-        .next()
-        .await
-        .expect("response stream should yield first item")?;
-    assert_eq!(first.message, "first");
-
-    drop(replies);
-    metrics.wait_for_code(Code::Cancelled).await;
+    assert_eq!(reply.message, "hello, after cancellation");
+    drop(recv);
 
     close_webtransport_client(client, session).await;
     server.shutdown().await
@@ -2033,6 +2565,157 @@ async fn connect_webtransport_client(
     Ok((webtransport_client, session, greeter_client))
 }
 
+async fn connect_http3_client(
+    server: &RunningWebTransportServer,
+) -> TestResult<(
+    quinn::Endpoint,
+    quinn::Connection,
+    greeter::GreeterClient<Http3Transport>,
+)> {
+    let (endpoint, connection, transport) = connect_http3_transport(server).await?;
+    Ok((endpoint, connection, greeter::GreeterClient::new(transport)))
+}
+
+async fn connect_http3_transport(
+    server: &RunningWebTransportServer,
+) -> TestResult<(quinn::Endpoint, quinn::Connection, Http3Transport)> {
+    let endpoint = make_http3_client_endpoint(server.cert_der.clone())?;
+    let connection = endpoint.connect(server.addr, "localhost")?.await?;
+    let (mut driver, sender) =
+        h3::client::new(h3_quinn::Connection::new(connection.clone())).await?;
+    tokio::spawn(async move {
+        let _ = driver.wait_idle().await;
+    });
+    let transport = Http3Transport {
+        sender: Arc::new(AsyncMutex::new(sender)),
+        authority: format!("localhost:{}", server.addr.port()),
+    };
+    Ok((endpoint, connection, transport))
+}
+
+async fn http3_status(
+    transport: &Http3Transport,
+    method: http::Method,
+    path: &str,
+    content_type: Option<&str>,
+) -> TestResult<http::StatusCode> {
+    let mut stream = transport.open(method, path, content_type).await?;
+    stream.finish().await?;
+    Ok(stream.recv_response().await?.status())
+}
+
+async fn http3_status_with_content_types(
+    transport: &Http3Transport,
+    method: http::Method,
+    path: &str,
+    content_types: &[&str],
+) -> TestResult<http::StatusCode> {
+    let mut stream = transport
+        .open_with_content_types(method, path, content_types)
+        .await?;
+    stream.finish().await?;
+    Ok(stream.recv_response().await?.status())
+}
+
+fn validate_http3_response(response: &http::Response<()>) -> trevrpc::Result<()> {
+    if response.status() != http::StatusCode::OK
+        || response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            != Some("application/trevrpc")
+    {
+        return Err(trevrpc::Error::transport(std::io::Error::other(format!(
+            "unexpected HTTP/3 response: {response:?}"
+        ))));
+    }
+    Ok(())
+}
+
+async fn read_http3_body<S>(
+    stream: &mut h3::client::RequestStream<S, Bytes>,
+) -> trevrpc::Result<Vec<u8>>
+where
+    S: h3::quic::RecvStream,
+{
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .map_err(trevrpc::Error::transport)?
+    {
+        let len = chunk.remaining();
+        body.extend_from_slice(&chunk.copy_to_bytes(len));
+    }
+    Ok(body)
+}
+
+fn decode_single_frame<M>(frame: &[u8]) -> trevrpc::Result<M>
+where
+    M: Message + Default,
+{
+    if frame.len() < 4 {
+        return Err(trevrpc::Error::transport(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "HTTP/3 response ended before the TrevRPC frame header",
+        )));
+    }
+    let len = u32::from_be_bytes(frame[..4].try_into().expect("frame header is four bytes"));
+    if usize::try_from(len).ok() != Some(frame.len() - 4) {
+        return Err(trevrpc::Error::from(Status::invalid_argument(
+            "HTTP/3 response did not contain exactly one TrevRPC frame",
+        )));
+    }
+    M::decode(&frame[4..]).map_err(trevrpc::Error::from)
+}
+
+async fn read_http3_frame_body(
+    recv: &mut H3RecvStream,
+    chunk: &mut Bytes,
+) -> trevrpc::Result<Option<Vec<u8>>> {
+    let mut header = [0_u8; 4];
+    if !read_http3_exact(recv, chunk, &mut header, true).await? {
+        return Ok(None);
+    }
+    let len = usize::try_from(u32::from_be_bytes(header)).expect("u32 should fit usize");
+    if len > trevrpc::framing::DEFAULT_MAX_FRAME_SIZE {
+        return Err(trevrpc::Error::FrameTooLarge {
+            len,
+            max: trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        });
+    }
+    let mut body = vec![0_u8; len];
+    read_http3_exact(recv, chunk, &mut body, false).await?;
+    Ok(Some(body))
+}
+
+async fn read_http3_exact(
+    recv: &mut H3RecvStream,
+    chunk: &mut Bytes,
+    output: &mut [u8],
+    allow_clean_eof: bool,
+) -> trevrpc::Result<bool> {
+    let mut offset = 0;
+    while offset < output.len() {
+        while chunk.is_empty() {
+            let Some(mut next) = recv.recv_data().await.map_err(trevrpc::Error::transport)? else {
+                if allow_clean_eof && offset == 0 {
+                    return Ok(false);
+                }
+                return Err(trevrpc::Error::transport(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "HTTP/3 body ended in the middle of a TrevRPC frame",
+                )));
+            };
+            *chunk = next.copy_to_bytes(next.remaining());
+        }
+        let len = (output.len() - offset).min(chunk.len());
+        chunk.copy_to_slice(&mut output[offset..offset + len]);
+        offset += len;
+    }
+    Ok(true)
+}
+
 fn make_webtransport_client(
     server: &RunningWebTransportServer,
 ) -> TestResult<web_transport_quinn::Client> {
@@ -2206,6 +2889,26 @@ fn make_mtls_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'s
 
 fn make_client_endpoint(cert_der: CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
     make_client_endpoint_with_alpn(cert_der, trevrpc::ALPN)
+}
+
+fn make_http3_client_endpoint(cert_der: CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert_der)?;
+    let mut client_crypto = quinn::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![trevrpc::HTTP3_ALPN.to_vec()];
+
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
+    let mut client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
+    trevrpc::quinn::configure_client_config(
+        &mut client_config,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        trevrpc::quinn::TransportMode::WebTransport,
+    );
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
 }
 
 fn make_client_endpoint_with_alpn(

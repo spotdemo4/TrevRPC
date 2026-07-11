@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 	webtransport "github.com/quic-go/webtransport-go"
 )
 
@@ -255,55 +254,6 @@ func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport
 	}
 
 	return nil
-}
-
-func isWebTransportQUICConnection(conn *quic.Conn, options ServerOptions) bool {
-	return options.EnableWebTransport && conn.ConnectionState().TLS.NegotiatedProtocol == http3.NextProtoH3
-}
-
-func handleWebTransportConnection(ctx context.Context, conn *quic.Conn, server *Server, requestLimit semaphore, closeOnShutdown bool) {
-	sessionsCtx, stopSessions := context.WithCancel(ctx)
-	defer stopSessions()
-
-	var sessionTasks sync.WaitGroup
-	var wtServer *webtransport.Server
-	wtServer = &webtransport.Server{
-		CheckOrigin: func(*http.Request) bool { return true },
-		H3: &http3.Server{
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if !webTransportAdmitted(server.options, r) {
-					http.Error(w, "WebTransport admission denied", http.StatusForbidden)
-					return
-				}
-
-				session, err := wtServer.Upgrade(w, r)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-
-				sessionTasks.Go(func() {
-					handleWebTransportSession(sessionsCtx, session, server, requestLimit)
-				})
-			}),
-		},
-	}
-	webtransport.ConfigureHTTP3Server(wtServer.H3)
-
-	go func() {
-		<-ctx.Done()
-		_ = wtServer.Close()
-	}()
-
-	_ = wtServer.ServeQUICConn(conn)
-	stopSessions()
-	waitForWaitGroup(&sessionTasks, server.options.GracefulShutdownTimeout, func() {
-		conn.CloseWithError(0, "server WebTransport session drain timed out")
-	})
-
-	if closeOnShutdown && ctx.Err() != nil {
-		conn.CloseWithError(0, "server drained WebTransport connection")
-	}
 }
 
 func webTransportAdmitted(options ServerOptions, r *http.Request) bool {

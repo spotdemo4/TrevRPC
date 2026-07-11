@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_max_concurrent_connections(Some(512))
         .with_max_concurrent_streams_per_connection(Some(64))
         .with_max_concurrent_requests(Some(1024))
+        .with_http3_enabled(true)
         .with_webtransport_allowed_authorities(webtransport_authorities)
         .with_webtransport_allowed_origins(leak_slice([browser_example_origin]));
     server.set_options(options);
@@ -119,6 +120,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     println!(
         "TrevRPC greeter native QUIC server listening on {}",
+        endpoint.local_addr()?
+    );
+    println!(
+        "TrevRPC greeter HTTP/3 server listening on https://{}/trevrpc",
         endpoint.local_addr()?
     );
     println!(
@@ -159,10 +164,7 @@ fn make_endpoint(
     let mut server_crypto = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], PrivateKeyDer::from(key_der))?;
-    server_crypto.alpn_protocols = vec![
-        trevrpc::ALPN.to_vec(),
-        web_transport_quinn::ALPN.as_bytes().to_vec(),
-    ];
+    server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec(), trevrpc::HTTP3_ALPN.to_vec()];
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));

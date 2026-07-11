@@ -12,7 +12,7 @@ extern "C" {
 
 #define TREVRPC_ALPN "trevrpc/1"
 #define TREVRPC_WIRE_VERSION 1u
-#define TREVRPC_C_ABI_VERSION 3u
+#define TREVRPC_C_ABI_VERSION 4u
 #define TREVRPC_DEFAULT_MAX_FRAME_SIZE (4u * 1024u * 1024u)
 
 #define TREVRPC_MAX_METADATA_ENTRIES 64u
@@ -49,6 +49,7 @@ extern "C" {
 
 #define TREVRPC_TRANSPORT_KIND_MSQUIC 0u
 #define TREVRPC_TRANSPORT_KIND_WEBTRANSPORT 1u
+#define TREVRPC_TRANSPORT_KIND_HTTP3 2u
 
 #define TREVRPC_TRANSPORT_EVENT_LISTENER_OPEN 0u
 #define TREVRPC_TRANSPORT_EVENT_LISTENER_CLOSE 1u
@@ -96,6 +97,19 @@ typedef struct trevrpc_webtransport_admission_request {
 typedef int (*trevrpc_webtransport_admission)(void* user_data, const trevrpc_webtransport_admission_request* request);
 #endif
 
+#ifndef TREVRPC_HTTP3_ADMISSION_DEFINED
+#define TREVRPC_HTTP3_ADMISSION_DEFINED
+typedef struct trevrpc_http3_admission_request {
+    const char* path;
+    size_t path_len;
+    const char* authority;
+    size_t authority_len;
+    int secure;
+} trevrpc_http3_admission_request;
+
+typedef int (*trevrpc_http3_admission)(void* user_data, const trevrpc_http3_admission_request* request);
+#endif
+
 #define TREVRPC_CALL_DEFERRED 1
 
 typedef struct trevrpc_config {
@@ -126,6 +140,10 @@ typedef struct trevrpc_server_config {
     const char* webtransport_origin;
     trevrpc_webtransport_admission webtransport_admission;
     void* webtransport_admission_user_data;
+    int enable_http3;
+    const char* http3_path;
+    trevrpc_http3_admission http3_admission;
+    void* http3_admission_user_data;
     uint64_t max_idle_timeout_ms;
     uint32_t keep_alive_ms;
     uint16_t peer_bidi_stream_count;

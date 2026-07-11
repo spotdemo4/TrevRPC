@@ -1,5 +1,5 @@
 {
-  description = "Protobuf over QUIC & WebTransport";
+  description = "Protobuf over QUIC, HTTP/3 & WebTransport";
 
   nixConfig = {
     extra-substituters = [
@@ -235,7 +235,7 @@
 
               meta = {
                 mainProgram = "protoc-gen-trevrpc-rust";
-                description = "Protobuf over QUIC & WebTransport";
+                description = "Protobuf over QUIC, HTTP/3 & WebTransport";
                 license = licenses.mit;
                 platforms = platforms.all;
                 homepage = "https://trev.zip/llc/TrevRPC";

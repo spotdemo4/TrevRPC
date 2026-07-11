@@ -504,63 +504,81 @@ pub(crate) fn validate_request(
     server: &crate::server::Server,
     request: &web_transport_quinn::Request,
 ) -> Option<web_transport_quinn::http::StatusCode> {
+    let origin = request
+        .headers
+        .get(web_transport_quinn::http::header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok());
+    let authority = request.url.host_str().map(|host| {
+        request
+            .url
+            .port()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"))
+    });
+    let headers = request
+        .headers
+        .iter()
+        .map(|(name, value)| crate::server::AdmissionHeader {
+            name: name.as_str(),
+            value: value.as_bytes(),
+        })
+        .collect::<Vec<_>>();
+    validate_admission(
+        server,
+        request.url.path(),
+        authority.as_deref(),
+        origin,
+        request.url.scheme() == "https",
+        &headers,
+    )
+}
+
+pub(crate) fn validate_admission(
+    server: &crate::server::Server,
+    path: &str,
+    authority: Option<&str>,
+    origin: Option<&str>,
+    secure: bool,
+    headers: &[crate::server::AdmissionHeader<'_>],
+) -> Option<web_transport_quinn::http::StatusCode> {
     let options = server.options();
     if let Some(admission) = options.webtransport_admission() {
-        let origin = request
-            .headers
-            .get(web_transport_quinn::http::header::ORIGIN)
-            .and_then(|origin| origin.to_str().ok());
         let admission_request = crate::server::WebTransportAdmissionRequest {
-            request,
-            path: request.url.path(),
-            authority: request.url.host_str(),
+            path,
+            authority,
             origin,
-            secure: request.url.scheme() == "https",
+            secure,
+            headers,
         };
         return (!admission(&admission_request))
             .then_some(web_transport_quinn::http::StatusCode::FORBIDDEN);
     }
-
-    if request.url.path() != options.webtransport_path() {
+    if path != options.webtransport_path() {
         return Some(web_transport_quinn::http::StatusCode::NOT_FOUND);
     }
-
     let allowed_authorities = options.webtransport_allowed_authorities();
-    if !allowed_authorities.is_empty() && !authority_allowed(request, allowed_authorities) {
+    if !allowed_authorities.is_empty()
+        && !authority.is_some_and(|authority| {
+            allowed_authorities.contains(&authority)
+                || allowed_authorities.contains(&authority_host(authority))
+        })
+    {
         return Some(web_transport_quinn::http::StatusCode::FORBIDDEN);
     }
-
-    if let Some(origin) = request
-        .headers
-        .get(web_transport_quinn::http::header::ORIGIN)
-    {
-        let Ok(origin) = origin.to_str() else {
-            return Some(web_transport_quinn::http::StatusCode::FORBIDDEN);
-        };
-
-        if !options.webtransport_allowed_origins().contains(&origin) {
-            return Some(web_transport_quinn::http::StatusCode::FORBIDDEN);
-        }
+    if origin.is_some_and(|origin| !options.webtransport_allowed_origins().contains(&origin)) {
+        return Some(web_transport_quinn::http::StatusCode::FORBIDDEN);
     }
-
     None
 }
 
-fn authority_allowed(request: &web_transport_quinn::Request, allowed_authorities: &[&str]) -> bool {
-    let Some(host) = request.url.host_str() else {
-        return false;
-    };
-
-    if allowed_authorities.contains(&host) {
-        return true;
+fn authority_host(authority: &str) -> &str {
+    if let Some(authority) = authority.strip_prefix('[')
+        && let Some((host, _)) = authority.split_once(']')
+    {
+        return host;
     }
-
-    let Some(port) = request.url.port() else {
-        return false;
-    };
-    let authority = format!("{host}:{port}");
-
-    allowed_authorities.contains(&authority.as_str())
+    authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
 }
 
 pub(crate) async fn handle_session(

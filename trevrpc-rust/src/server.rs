@@ -107,15 +107,34 @@ impl RequestContext {
 }
 
 #[derive(Clone, Copy)]
+pub struct AdmissionHeader<'a> {
+    pub name: &'a str,
+    pub value: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
 pub struct WebTransportAdmissionRequest<'a> {
-    pub request: &'a web_transport_quinn::Request,
     pub path: &'a str,
     pub authority: Option<&'a str>,
     pub origin: Option<&'a str>,
     pub secure: bool,
+    pub headers: &'a [AdmissionHeader<'a>],
 }
 
 pub type WebTransportAdmission = for<'a> fn(&WebTransportAdmissionRequest<'a>) -> bool;
+
+#[cfg(feature = "http3")]
+#[derive(Clone, Copy)]
+pub struct Http3AdmissionRequest<'a> {
+    pub request: &'a http::Request<()>,
+    pub path: &'a str,
+    pub authority: Option<&'a str>,
+    pub secure: bool,
+    pub headers: &'a [AdmissionHeader<'a>],
+}
+
+#[cfg(feature = "http3")]
+pub type Http3Admission = for<'a> fn(&Http3AdmissionRequest<'a>) -> bool;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {
@@ -128,6 +147,12 @@ pub struct ServerOptions {
     stream_messages: Option<usize>,
     stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
+    #[cfg(feature = "http3")]
+    http3_enabled: bool,
+    #[cfg(feature = "http3")]
+    http3_path: &'static str,
+    #[cfg(feature = "http3")]
+    http3_admission: Option<Http3Admission>,
     webtransport_path: &'static str,
     webtransport_allowed_authorities: &'static [&'static str],
     webtransport_allowed_origins: &'static [&'static str],
@@ -146,6 +171,12 @@ impl Default for ServerOptions {
             stream_messages: Some(4096),
             stream_body_size: Some(16 * 1024 * 1024),
             stream_idle_timeout: Some(Duration::from_secs(30)),
+            #[cfg(feature = "http3")]
+            http3_enabled: false,
+            #[cfg(feature = "http3")]
+            http3_path: "/trevrpc",
+            #[cfg(feature = "http3")]
+            http3_admission: None,
             webtransport_path: "/trevrpc",
             webtransport_allowed_authorities: &[],
             webtransport_allowed_origins: &[],
@@ -213,6 +244,27 @@ impl ServerOptions {
     #[must_use]
     pub const fn stream_idle_timeout(&self) -> Option<Duration> {
         self.stream_idle_timeout
+    }
+
+    /// Returns whether ordinary HTTP/3 POST requests are accepted.
+    #[cfg(feature = "http3")]
+    #[must_use]
+    pub const fn http3_enabled(&self) -> bool {
+        self.http3_enabled
+    }
+
+    /// Returns the HTTP/3 POST path accepted by the server.
+    #[cfg(feature = "http3")]
+    #[must_use]
+    pub const fn http3_path(&self) -> &'static str {
+        self.http3_path
+    }
+
+    /// Returns the HTTP/3 POST admission callback, if configured.
+    #[cfg(feature = "http3")]
+    #[must_use]
+    pub const fn http3_admission(&self) -> Option<Http3Admission> {
+        self.http3_admission
     }
 
     /// Returns the `WebTransport` request path accepted by the server.
@@ -314,6 +366,30 @@ impl ServerOptions {
     #[must_use]
     pub const fn with_stream_idle_timeout(mut self, stream_idle_timeout: Option<Duration>) -> Self {
         self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    /// Enables or disables ordinary HTTP/3 POST requests.
+    #[cfg(feature = "http3")]
+    #[must_use]
+    pub const fn with_http3_enabled(mut self, http3_enabled: bool) -> Self {
+        self.http3_enabled = http3_enabled;
+        self
+    }
+
+    /// Sets the HTTP/3 POST request path accepted by the server.
+    #[cfg(feature = "http3")]
+    #[must_use]
+    pub const fn with_http3_path(mut self, http3_path: &'static str) -> Self {
+        self.http3_path = http3_path;
+        self
+    }
+
+    /// Sets the HTTP/3 POST admission callback.
+    #[cfg(feature = "http3")]
+    #[must_use]
+    pub const fn with_http3_admission(mut self, http3_admission: Option<Http3Admission>) -> Self {
+        self.http3_admission = http3_admission;
         self
     }
 
@@ -559,6 +635,27 @@ impl Server {
     /// Sets the maximum idle time allowed while waiting for the next stream message.
     pub fn set_stream_idle_timeout(&mut self, stream_idle_timeout: Option<Duration>) -> &mut Self {
         self.options.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    /// Enables or disables ordinary HTTP/3 POST requests.
+    #[cfg(feature = "http3")]
+    pub fn set_http3_enabled(&mut self, http3_enabled: bool) -> &mut Self {
+        self.options.http3_enabled = http3_enabled;
+        self
+    }
+
+    /// Sets the HTTP/3 POST request path accepted by the server.
+    #[cfg(feature = "http3")]
+    pub fn set_http3_path(&mut self, http3_path: &'static str) -> &mut Self {
+        self.options.http3_path = http3_path;
+        self
+    }
+
+    /// Sets the HTTP/3 POST admission callback.
+    #[cfg(feature = "http3")]
+    pub fn set_http3_admission(&mut self, http3_admission: Option<Http3Admission>) -> &mut Self {
+        self.options.http3_admission = http3_admission;
         self
     }
 
@@ -1842,6 +1939,12 @@ mod tests {
             Some(Duration::from_secs(10))
         );
         assert_eq!(options.max_stream_body_size(), Some(16 * 1024 * 1024));
+        #[cfg(feature = "http3")]
+        {
+            assert!(!options.http3_enabled());
+            assert_eq!(options.http3_path(), "/trevrpc");
+            assert!(options.http3_admission().is_none());
+        }
     }
 
     fn allow_any_webtransport(_request: &super::WebTransportAdmissionRequest<'_>) -> bool {

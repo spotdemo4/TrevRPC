@@ -40,7 +40,7 @@ type Server struct {
 	metrics    Metrics
 }
 
-// ServerOptions configures server limits, timeouts, and WebTransport behavior.
+// ServerOptions configures server limits, timeouts, and HTTP/3 behavior.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -51,9 +51,25 @@ type ServerOptions struct {
 	MaxStreamMessages                 int
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
+	EnableHTTP3                       bool
+	HTTP3Path                         string
+	HTTP3Admission                    HTTP3Admission
 	EnableWebTransport                bool
 	WebTransportAdmission             WebTransportAdmission
 }
+
+// HTTP3AdmissionRequest contains HTTP/3 request information available before accepting an RPC.
+type HTTP3AdmissionRequest struct {
+	Request   *http.Request
+	Path      string
+	Method    string
+	Authority string
+	Secure    bool
+}
+
+// HTTP3Admission decides whether to accept an otherwise valid HTTP/3 RPC request.
+// When it is nil, valid requests are accepted.
+type HTTP3Admission func(HTTP3AdmissionRequest) bool
 
 // WebTransportAdmissionRequest contains HTTP/3 CONNECT information available before accepting a WebTransport session.
 type WebTransportAdmissionRequest struct {
@@ -80,6 +96,7 @@ func DefaultServerOptions() ServerOptions {
 		MaxStreamMessages:                 4096,
 		MaxStreamBodySize:                 16 * 1024 * 1024,
 		StreamIdleTimeout:                 30 * time.Second,
+		HTTP3Path:                         DefaultHTTP3Path,
 	}
 }
 

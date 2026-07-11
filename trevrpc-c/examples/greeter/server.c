@@ -131,6 +131,7 @@ int main(int argc, char** argv) {
     trevrpc_server_config config = trevrpc_default_server_config();
     config.host = host;
     config.port = port;
+    config.enable_http3 = 1;
     trevrpc_server* server = NULL;
     int rc = trevrpc_server_listen(&config, &server);
     if (rc != 0) {
@@ -150,7 +151,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("serving on %s:%u\n", host, port);
+    printf("serving native QUIC, HTTP/3, and WebTransport on %s:%u\n", host, port);
     rc = trevrpc_server_serve(server);
     trevrpc_server_close(server);
     return rc == 0 ? 0 : 1;

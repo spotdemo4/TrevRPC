@@ -29,6 +29,10 @@ typedef struct native_server native_server;
 typedef struct native_call native_call;
 typedef struct native_cancellation native_cancellation;
 typedef struct server_route server_route;
+typedef struct node_http3_admission_state node_http3_admission_state;
+
+static void http3_admission_state_shutdown(node_http3_admission_state* state);
+static void http3_admission_state_release(node_http3_admission_state* state);
 
 struct native_client {
     trevrpc_client* client;
@@ -66,6 +70,7 @@ struct native_server {
     server_route* routes;
     napi_env env;
     napi_threadsafe_function call_tsfn;
+    node_http3_admission_state* http3_admission;
     uint16_t port;
     size_t refs;
     bool closing;
@@ -235,6 +240,7 @@ typedef struct listen_work {
     char* host;
     char* path;
     char* origin;
+    char* http3_path;
     char* cert_file;
     char* key_file;
     uint16_t port;
@@ -242,17 +248,21 @@ typedef struct listen_work {
     uint32_t max_streams_per_session;
     uint32_t idle_timeout_ms;
     uint32_t stream_idle_timeout_ms;
+    uint32_t initial_request_timeout_ms;
     int64_t max_stream_messages;
     size_t max_frame_size;
     size_t max_pending_send_bytes;
     size_t max_pending_send_count;
     uint16_t bound_port;
     bool has_max_stream_messages;
+    bool enable_http3;
+    node_http3_admission_state* http3_admission;
 } listen_work;
 
 typedef struct serve_work {
     base_work base;
     native_server* server;
+    bool server_closed;
 } serve_work;
 
 typedef struct call_response_work {
@@ -1872,7 +1882,7 @@ static void native_server_maybe_destroy(native_server* server) {
     bool destroy = false;
     pthread_mutex_lock(&server->mutex);
     destroy = !server->js_alive && server->refs == 0 && server->server == NULL && server->call_tsfn == NULL &&
-              server->routes == NULL;
+              server->http3_admission == NULL && server->routes == NULL;
     pthread_mutex_unlock(&server->mutex);
     if (destroy) {
         pthread_mutex_destroy(&server->mutex);
@@ -1898,6 +1908,7 @@ static void native_server_close_request(native_server* server) {
     napi_env env = NULL;
     pthread_mutex_lock(&server->mutex);
     server->closing = true;
+    node_http3_admission_state* admission = server->http3_admission;
     if (!server->serving && server->server != NULL) {
         close_server = server->server;
         server->server = NULL;
@@ -1907,40 +1918,51 @@ static void native_server_close_request(native_server* server) {
     env = server->env;
     pthread_mutex_unlock(&server->mutex);
 
+    http3_admission_state_shutdown(admission);
     trevrpc_server_shutdown(shutdown_server);
     trevrpc_server_close(close_server);
     if (close_server != NULL) {
         free_server_routes(env, server->routes);
         server->routes = NULL;
         napi_threadsafe_function tsfn = NULL;
+        node_http3_admission_state* admission_state = NULL;
         pthread_mutex_lock(&server->mutex);
         tsfn = server->call_tsfn;
         server->call_tsfn = NULL;
+        admission_state = server->http3_admission;
+        server->http3_admission = NULL;
         pthread_mutex_unlock(&server->mutex);
         if (tsfn != NULL) {
             napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
         }
+        http3_admission_state_release(admission_state);
     }
     native_server_maybe_destroy(server);
 }
 
-static void native_server_close_after_serve(native_server* server, napi_env env) {
+static void native_server_close_after_serve(native_server* server, napi_env env, bool server_closed) {
     trevrpc_server* close_server = NULL;
     napi_threadsafe_function tsfn = NULL;
+    node_http3_admission_state* admission_state = NULL;
     pthread_mutex_lock(&server->mutex);
     server->serving = false;
-    if (server->closing && server->server != NULL) {
+    if (!server_closed && server->closing && server->server != NULL) {
         close_server = server->server;
         server->server = NULL;
+    }
+    if (server_closed || close_server != NULL) {
         tsfn = server->call_tsfn;
         server->call_tsfn = NULL;
+        admission_state = server->http3_admission;
+        server->http3_admission = NULL;
     }
     pthread_mutex_unlock(&server->mutex);
     trevrpc_server_close(close_server);
     if (tsfn != NULL) {
         napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
     }
-    if (close_server != NULL) {
+    http3_admission_state_release(admission_state);
+    if (server_closed || close_server != NULL) {
         free_server_routes(env, server->routes);
         server->routes = NULL;
     }
@@ -2868,6 +2890,355 @@ static napi_value connect_msquic(napi_env env, napi_callback_info info) {
         env, &work->base, "connectMsQuic", connect_execute, connect_complete, connect_complete, connect_cancel);
 }
 
+typedef struct http3_admission_call {
+    struct http3_admission_call* next;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    atomic_size_t refs;
+    char* path;
+    size_t path_len;
+    char* authority;
+    size_t authority_len;
+    bool secure;
+    clockid_t clock_id;
+    bool completed;
+    bool admitted;
+    bool cancelled;
+} http3_admission_call;
+
+struct node_http3_admission_state {
+    pthread_mutex_t mutex;
+    http3_admission_call* active_calls;
+    napi_threadsafe_function tsfn;
+    uint64_t timeout_nanos;
+    bool shutting_down;
+};
+
+static void http3_admission_js(napi_env env, napi_value callback, void* context, void* data);
+
+static void http3_admission_call_release(http3_admission_call* call) {
+    if (atomic_fetch_sub_explicit(&call->refs, 1, memory_order_acq_rel) != 1) {
+        return;
+    }
+    pthread_cond_destroy(&call->cond);
+    pthread_mutex_destroy(&call->mutex);
+    free(call->authority);
+    free(call->path);
+    free(call);
+}
+
+static void http3_admission_state_finalize(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    node_http3_admission_state* state = data;
+    pthread_mutex_destroy(&state->mutex);
+    free(state);
+}
+
+static void http3_admission_state_shutdown(node_http3_admission_state* state) {
+    if (state == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&state->mutex);
+    state->shutting_down = true;
+    for (http3_admission_call* call = state->active_calls; call != NULL; call = call->next) {
+        pthread_mutex_lock(&call->mutex);
+        call->cancelled = true;
+        call->completed = true;
+        pthread_cond_signal(&call->cond);
+        pthread_mutex_unlock(&call->mutex);
+    }
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static void http3_admission_state_release(node_http3_admission_state* state) {
+    if (state != NULL) {
+        napi_release_threadsafe_function(state->tsfn, napi_tsfn_abort);
+    }
+}
+
+static napi_status http3_admission_state_create(napi_env env,
+    napi_value callback,
+    napi_value resource_name,
+    uint64_t timeout_nanos,
+    node_http3_admission_state** out_state) {
+    *out_state = NULL;
+    node_http3_admission_state* state = calloc(1, sizeof(*state));
+    if (state == NULL) {
+        return napi_generic_failure;
+    }
+    pthread_mutex_init(&state->mutex, NULL);
+    state->timeout_nanos = timeout_nanos == 0 ? 10000000000ull : timeout_nanos;
+    napi_status status = napi_create_threadsafe_function(env,
+        callback,
+        NULL,
+        resource_name,
+        0,
+        1,
+        state,
+        http3_admission_state_finalize,
+        NULL,
+        http3_admission_js,
+        &state->tsfn);
+    if (status != napi_ok) {
+        pthread_mutex_destroy(&state->mutex);
+        free(state);
+        return status;
+    }
+    *out_state = state;
+    return napi_ok;
+}
+
+static void http3_admission_js(napi_env env, napi_value callback, void* context, void* data) {
+    (void)context;
+    http3_admission_call* call = data;
+    bool admitted = false;
+    pthread_mutex_lock(&call->mutex);
+    bool cancelled = call->cancelled;
+    pthread_mutex_unlock(&call->mutex);
+    if (!cancelled && env != NULL && callback != NULL) {
+        napi_value request = NULL;
+        napi_value path = NULL;
+        napi_value authority = NULL;
+        napi_value secure = NULL;
+        napi_value global = NULL;
+        napi_value result = NULL;
+        napi_status status = napi_create_object(env, &request);
+        if (status == napi_ok) {
+            status = napi_create_string_utf8(env, call->path, call->path_len, &path);
+        }
+        if (status == napi_ok) {
+            status = napi_create_string_utf8(env, call->authority, call->authority_len, &authority);
+        }
+        if (status == napi_ok) {
+            status = napi_get_boolean(env, call->secure, &secure);
+        }
+        if (status == napi_ok) {
+            status = napi_set_named_property(env, request, "path", path);
+        }
+        if (status == napi_ok) {
+            status = napi_set_named_property(env, request, "authority", authority);
+        }
+        if (status == napi_ok) {
+            status = napi_set_named_property(env, request, "secure", secure);
+        }
+        if (status == napi_ok) {
+            status = napi_get_global(env, &global);
+        }
+        if (status == napi_ok) {
+            status = napi_call_function(env, global, callback, 1, &request, &result);
+        }
+        if (status == napi_ok) {
+            status = napi_get_value_bool(env, result, &admitted);
+        }
+        if (status != napi_ok) {
+            clear_pending_exception(env);
+            admitted = false;
+        }
+    }
+
+    pthread_mutex_lock(&call->mutex);
+    if (!call->cancelled) {
+        call->admitted = admitted;
+    }
+    call->completed = true;
+    pthread_cond_signal(&call->cond);
+    pthread_mutex_unlock(&call->mutex);
+    http3_admission_call_release(call);
+}
+
+static int node_http3_admission(void* user_data, const trevrpc_http3_admission_request* request) {
+    node_http3_admission_state* state = user_data;
+    if (state == NULL || request == NULL || request->path_len == SIZE_MAX || request->authority_len == SIZE_MAX) {
+        return -1;
+    }
+    http3_admission_call* call = calloc(1, sizeof(*call));
+    if (call == NULL) {
+        return -1;
+    }
+    call->path = malloc(request->path_len + 1);
+    call->authority = malloc(request->authority_len + 1);
+    if (call->path == NULL || call->authority == NULL) {
+        free(call->authority);
+        free(call->path);
+        free(call);
+        return -1;
+    }
+    memcpy(call->path, request->path, request->path_len);
+    call->path[request->path_len] = 0;
+    call->path_len = request->path_len;
+    memcpy(call->authority, request->authority, request->authority_len);
+    call->authority[request->authority_len] = 0;
+    call->authority_len = request->authority_len;
+    call->secure = request->secure != 0;
+    pthread_mutex_init(&call->mutex, NULL);
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    call->clock_id = pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC) == 0 ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+    pthread_cond_init(&call->cond, call->clock_id == CLOCK_MONOTONIC ? &cond_attr : NULL);
+    pthread_condattr_destroy(&cond_attr);
+    atomic_init(&call->refs, 2);
+
+    pthread_mutex_lock(&state->mutex);
+    if (state->shutting_down) {
+        pthread_mutex_unlock(&state->mutex);
+        http3_admission_call_release(call);
+        http3_admission_call_release(call);
+        return -1;
+    }
+    call->next = state->active_calls;
+    state->active_calls = call;
+    pthread_mutex_unlock(&state->mutex);
+
+    napi_status status = napi_call_threadsafe_function(state->tsfn, call, napi_tsfn_nonblocking);
+    if (status != napi_ok) {
+        http3_admission_call_release(call);
+        pthread_mutex_lock(&call->mutex);
+        call->completed = true;
+        call->cancelled = true;
+        pthread_mutex_unlock(&call->mutex);
+    }
+
+    struct timespec deadline = {0};
+    bool admitted = false;
+    if (clock_gettime(call->clock_id, &deadline) == 0) {
+        deadline.tv_sec += (time_t)(state->timeout_nanos / 1000000000ull);
+        deadline.tv_nsec += (long)(state->timeout_nanos % 1000000000ull);
+        if (deadline.tv_nsec >= 1000000000l) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000l;
+        }
+        pthread_mutex_lock(&call->mutex);
+        while (!call->completed) {
+            int err = pthread_cond_timedwait(&call->cond, &call->mutex, &deadline);
+            if (err == ETIMEDOUT) {
+                call->cancelled = true;
+                break;
+            }
+            if (err != 0) {
+                call->cancelled = true;
+                break;
+            }
+        }
+        admitted = call->completed && !call->cancelled && call->admitted;
+        pthread_mutex_unlock(&call->mutex);
+    } else {
+        pthread_mutex_lock(&call->mutex);
+        call->cancelled = true;
+        pthread_mutex_unlock(&call->mutex);
+    }
+
+    pthread_mutex_lock(&state->mutex);
+    http3_admission_call** link = &state->active_calls;
+    while (*link != NULL) {
+        if (*link == call) {
+            *link = call->next;
+            break;
+        }
+        link = &(*link)->next;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    http3_admission_call_release(call);
+    return admitted ? 0 : -1;
+}
+
+#ifdef TREVRPC_NODE_TEST_HOOKS
+typedef struct debug_http3_admission_work {
+    napi_async_work work;
+    napi_deferred deferred;
+    node_http3_admission_state* state;
+    bool shutdown_first;
+    int result;
+} debug_http3_admission_work;
+
+static void debug_http3_admission_execute(napi_env env, void* data) {
+    (void)env;
+    debug_http3_admission_work* work = data;
+    if (work->shutdown_first) {
+        http3_admission_state_shutdown(work->state);
+    }
+    const trevrpc_http3_admission_request request = {
+        .path = "/rpc",
+        .path_len = 4,
+        .authority = "localhost",
+        .authority_len = 9,
+        .secure = 1,
+    };
+    work->result = node_http3_admission(work->state, &request);
+}
+
+static void debug_http3_admission_complete(napi_env env, napi_status status, void* data) {
+    debug_http3_admission_work* work = data;
+    http3_admission_state_shutdown(work->state);
+    http3_admission_state_release(work->state);
+    if (status == napi_ok) {
+        napi_value admitted = NULL;
+        napi_get_boolean(env, work->result == 0, &admitted);
+        napi_resolve_deferred(env, work->deferred, admitted);
+    } else {
+        napi_value message = NULL;
+        napi_value error = NULL;
+        napi_create_string_utf8(env, "debug HTTP/3 admission work failed", NAPI_AUTO_LENGTH, &message);
+        napi_create_error(env, NULL, message, &error);
+        napi_reject_deferred(env, work->deferred, error);
+    }
+    napi_delete_async_work(env, work->work);
+    free(work);
+}
+
+static napi_value debug_http3_admission(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3];
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+    napi_valuetype callback_type = napi_undefined;
+    if (argc < 2 || napi_typeof(env, args[0], &callback_type) != napi_ok || callback_type != napi_function) {
+        napi_throw_type_error(env, NULL, "_debugHttp3Admission requires a callback and timeout");
+        return NULL;
+    }
+    uint32_t timeout_ms = 0;
+    bool shutdown_first = false;
+    if (napi_get_value_uint32(env, args[1], &timeout_ms) != napi_ok || timeout_ms == 0 ||
+        (argc > 2 && napi_get_value_bool(env, args[2], &shutdown_first) != napi_ok)) {
+        napi_throw_type_error(env, NULL, "_debugHttp3Admission requires a positive timeout");
+        return NULL;
+    }
+    debug_http3_admission_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate debug HTTP/3 admission work");
+        return NULL;
+    }
+    napi_value resource_name = NULL;
+    napi_value promise = NULL;
+    napi_status status = napi_create_string_utf8(env, "TrevRpcDebugHttp3Admission", NAPI_AUTO_LENGTH, &resource_name);
+    if (status == napi_ok) {
+        status =
+            http3_admission_state_create(env, args[0], resource_name, (uint64_t)timeout_ms * 1000000ull, &work->state);
+    }
+    if (status == napi_ok) {
+        status = napi_create_promise(env, &work->deferred, &promise);
+    }
+    if (status == napi_ok) {
+        status = napi_create_async_work(
+            env, NULL, resource_name, debug_http3_admission_execute, debug_http3_admission_complete, work, &work->work);
+    }
+    if (status == napi_ok) {
+        work->shutdown_first = shutdown_first;
+        status = napi_queue_async_work(env, work->work);
+    }
+    if (status != napi_ok) {
+        if (work->work != NULL) {
+            napi_delete_async_work(env, work->work);
+        }
+        http3_admission_state_shutdown(work->state);
+        http3_admission_state_release(work->state);
+        free(work);
+        napi_throw_error(env, NULL, "failed to queue debug HTTP/3 admission work");
+        return NULL;
+    }
+    return promise;
+}
+#endif
+
 static void listen_execute(napi_env env, void* data) {
     (void)env;
     listen_work* work = data;
@@ -2882,6 +3253,12 @@ static void listen_execute(napi_env env, void* data) {
     config.max_binding_stateless_operations = 256;
     config.webtransport_path = work->path;
     config.webtransport_origin = work->origin;
+    config.enable_http3 = work->enable_http3 ? 1 : 0;
+    config.http3_path = work->http3_path;
+    if (work->http3_admission != NULL) {
+        config.http3_admission = node_http3_admission;
+        config.http3_admission_user_data = work->http3_admission;
+    }
     config.max_sessions_per_connection = work->max_sessions_per_connection;
     config.max_streams_per_session = work->max_streams_per_session;
     config.max_idle_timeout_ms = work->idle_timeout_ms;
@@ -2898,13 +3275,17 @@ static void listen_execute(napi_env env, void* data) {
     if (work->base.err == 0) {
         work->base.err = trevrpc_server_port(work->server, &work->bound_port);
     }
-    if (work->base.err == 0 && (work->has_max_stream_messages || work->stream_idle_timeout_ms > 0)) {
+    if (work->base.err == 0 &&
+        (work->has_max_stream_messages || work->stream_idle_timeout_ms > 0 || work->initial_request_timeout_ms > 0)) {
         trevrpc_server_options options = trevrpc_default_server_options();
         if (work->has_max_stream_messages) {
             options.max_stream_messages = work->max_stream_messages;
         }
         if (work->stream_idle_timeout_ms > 0) {
             options.stream_idle_timeout_nanos = (uint64_t)work->stream_idle_timeout_ms * 1000000ull;
+        }
+        if (work->initial_request_timeout_ms > 0) {
+            options.initial_request_timeout_nanos = (uint64_t)work->initial_request_timeout_ms * 1000000ull;
         }
         work->base.err = trevrpc_server_set_options(work->server, &options);
     }
@@ -2929,6 +3310,8 @@ static void listen_complete(napi_env env, napi_status status, void* data) {
             server->server = work->server;
             server->env = env;
             server->port = work->bound_port;
+            server->http3_admission = work->http3_admission;
+            work->http3_admission = NULL;
 
             napi_value callback = NULL;
             napi_value resource_name = NULL;
@@ -2961,6 +3344,8 @@ static void listen_complete(napi_env env, napi_status status, void* data) {
                 if (server->call_tsfn != NULL) {
                     napi_release_threadsafe_function(server->call_tsfn, napi_tsfn_abort);
                 }
+                http3_admission_state_shutdown(server->http3_admission);
+                http3_admission_state_release(server->http3_admission);
                 trevrpc_server_close(work->server);
                 pthread_mutex_destroy(&server->mutex);
                 free(server);
@@ -2974,8 +3359,11 @@ static void listen_complete(napi_env env, napi_status status, void* data) {
     free(work->host);
     free(work->path);
     free(work->origin);
+    free(work->http3_path);
     free(work->cert_file);
     free(work->key_file);
+    http3_admission_state_shutdown(work->http3_admission);
+    http3_admission_state_release(work->http3_admission);
     native_work_delete(work->base.work);
     free(work);
 }
@@ -2997,6 +3385,7 @@ static napi_value listen_msquic(napi_env env, napi_callback_info info) {
     work->host = get_string_property(env, args[0], "host");
     work->path = get_string_property(env, args[0], "path");
     work->origin = get_string_property(env, args[0], "origin");
+    work->http3_path = get_string_property(env, args[0], "http3Path");
     work->cert_file = get_string_property(env, args[0], "certFile");
     work->key_file = get_string_property(env, args[0], "keyFile");
     work->port = (uint16_t)get_uint32_property(env, args[0], "port", 0);
@@ -3004,19 +3393,53 @@ static napi_value listen_msquic(napi_env env, napi_callback_info info) {
     work->max_streams_per_session = get_uint32_property(env, args[0], "maxStreamsPerSession", 128);
     work->idle_timeout_ms = get_uint32_property(env, args[0], "idleTimeoutMs", 30000);
     work->stream_idle_timeout_ms = get_uint32_property(env, args[0], "streamIdleTimeoutMs", 0);
+    work->initial_request_timeout_ms = get_uint32_property(env, args[0], "initialRequestTimeoutMs", 10000);
+    work->enable_http3 = get_bool_property(env, args[0], "enableHttp3", false);
     work->has_max_stream_messages = get_int64_property(env, args[0], "maxStreamMessages", &work->max_stream_messages);
     get_size_property(env, args[0], "maxFrameSize", &work->max_frame_size);
     get_size_property(env, args[0], "maxPendingSendBytes", &work->max_pending_send_bytes);
     get_size_property(env, args[0], "maxPendingSendCount", &work->max_pending_send_count);
 
-    if (work->host == NULL || work->cert_file == NULL || work->key_file == NULL) {
+    bool has_http3_admission = false;
+    napi_has_named_property(env, args[0], "http3Admission", &has_http3_admission);
+    bool invalid_http3_admission = false;
+    if (has_http3_admission) {
+        napi_value callback = NULL;
+        napi_value resource_name = NULL;
+        napi_valuetype callback_type = napi_undefined;
+        napi_status status = napi_get_named_property(env, args[0], "http3Admission", &callback);
+        if (status == napi_ok) {
+            status = napi_typeof(env, callback, &callback_type);
+        }
+        if (status == napi_ok && callback_type == napi_function) {
+            status = napi_create_string_utf8(env, "TrevRpcHttp3Admission", NAPI_AUTO_LENGTH, &resource_name);
+        } else {
+            invalid_http3_admission = true;
+        }
+        if (!invalid_http3_admission && status == napi_ok) {
+            status = http3_admission_state_create(env,
+                callback,
+                resource_name,
+                (uint64_t)work->initial_request_timeout_ms * 1000000ull,
+                &work->http3_admission);
+        }
+        invalid_http3_admission = invalid_http3_admission || status != napi_ok;
+    }
+
+    if (work->host == NULL || work->cert_file == NULL || work->key_file == NULL || invalid_http3_admission) {
         free(work->host);
         free(work->path);
         free(work->origin);
+        free(work->http3_path);
         free(work->cert_file);
         free(work->key_file);
+        http3_admission_state_shutdown(work->http3_admission);
+        http3_admission_state_release(work->http3_admission);
         free(work);
-        napi_throw_type_error(env, NULL, "listenMsQuic requires host, certFile, and keyFile");
+        napi_throw_type_error(env,
+            NULL,
+            invalid_http3_admission ? "http3Admission must be a function"
+                                    : "listenMsQuic requires host, certFile, and keyFile");
         return NULL;
     }
 
@@ -3099,11 +3522,21 @@ static void serve_execute(napi_env env, void* data) {
     c_server = server->server;
     pthread_mutex_unlock(&server->mutex);
     work->base.err = c_server == NULL ? TREV_NODE_ERR_CLOSED : trevrpc_server_serve(c_server);
+    trevrpc_server* close_server = NULL;
+    pthread_mutex_lock(&server->mutex);
+    if (server->closing && server->server == c_server) {
+        close_server = server->server;
+        server->server = NULL;
+    }
+    server->serving = false;
+    pthread_mutex_unlock(&server->mutex);
+    trevrpc_server_close(close_server);
+    work->server_closed = close_server != NULL;
 }
 
 static void serve_complete(napi_env env, napi_status status, void* data) {
     serve_work* work = data;
-    native_server_close_after_serve(work->server, env);
+    native_server_close_after_serve(work->server, env, work->server_closed);
     if (env != NULL && status != napi_ok) {
         reject_native_error(env, work->base.deferred, -ECANCELED, "serve");
     } else if (env != NULL && work->base.err != 0) {
@@ -5012,6 +5445,7 @@ static napi_value init(napi_env env, napi_value exports) {
         {"connectMsQuic", NULL, connect_msquic, NULL, NULL, NULL, napi_default, NULL},
         {"listenMsQuic", NULL, listen_msquic, NULL, NULL, NULL, napi_default, NULL},
 #ifdef TREVRPC_NODE_TEST_HOOKS
+        {"_debugHttp3Admission", NULL, debug_http3_admission, NULL, NULL, NULL, napi_default, NULL},
         {"_debugExternalArrayBufferFinalizers",
             NULL,
             debug_external_arraybuffer_finalizers,

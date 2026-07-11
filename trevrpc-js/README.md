@@ -47,6 +47,8 @@ const server = await NodeServer.listen({
   port: 50051,
   certFile: "localhost-cert.pem",
   keyFile: "localhost-key.pem",
+  enableHttp3: true,
+  http3Path: "/trevrpc",
 });
 
 server.registerService(GreeterService, {
@@ -58,6 +60,8 @@ server.registerService(GreeterService, {
 
 await server.serve();
 ```
+
+`enableHttp3` adds ordinary HTTP/3 POST serving to the same native MsQuic listener used by native QUIC and WebTransport. An optional synchronous `http3Admission` callback is bounded by `initialRequestTimeoutMs`.
 
 ## Native Development
 

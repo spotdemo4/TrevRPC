@@ -110,6 +110,8 @@ struct trevrpc_msquic_conn {
     bool close_pending;
     bool closed;
     size_t active_handle_ops;
+    uint64_t peer_close_error;
+    bool peer_close_error_set;
     int err;
 };
 
@@ -1433,6 +1435,17 @@ int trevrpc_msquic_conn_negotiated_alpn(trevrpc_msquic_conn* conn, const uint8_t
     return 0;
 }
 
+int trevrpc_msquic_conn_peer_close_error(trevrpc_msquic_conn* conn, uint64_t* error_code) {
+    if (conn == NULL || error_code == NULL) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&conn->mutex);
+    bool available = conn->peer_close_error_set;
+    *error_code = conn->peer_close_error;
+    pthread_mutex_unlock(&conn->mutex);
+    return available ? 0 : -EAGAIN;
+}
+
 int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
     *out_stream = NULL;
     pthread_mutex_lock(&conn->mutex);
@@ -1563,7 +1576,7 @@ void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn) {
     }
 }
 
-void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn) {
+void trevrpc_msquic_conn_shutdown_error(trevrpc_msquic_conn* conn, uint64_t error_code) {
     if (conn == NULL) {
         return;
     }
@@ -1579,12 +1592,20 @@ void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn) {
     pthread_cond_broadcast(&conn->cond);
     pthread_mutex_unlock(&conn->mutex);
     if (handle != NULL) {
-        TrevMsQuic->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        TrevMsQuic->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, error_code);
         trevrpc_msquic_conn_handle_release(conn);
     }
 }
 
-intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
+void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn) {
+    trevrpc_msquic_conn_shutdown_error(conn, 0);
+}
+
+static intptr_t trevrpc_msquic_stream_read_until(
+    trevrpc_msquic_stream* stream, uint8_t* data, size_t len, const struct timespec* deadline, bool ready_only) {
+    if (stream == NULL || (data == NULL && len > 0)) {
+        return -EINVAL;
+    }
     if (len == 0) {
         return 0;
     }
@@ -1594,7 +1615,12 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
         pthread_mutex_unlock(&stream->mutex);
         return TREV_MSQUIC_ERR_CLOSED;
     }
-    int wait_err = trevrpc_msquic_stream_wait_recv_locked(stream, NULL);
+    int wait_err = 0;
+    if (ready_only && stream->recv_head == NULL && !stream->recv_fin && !stream->closed && stream->err == 0) {
+        wait_err = TREV_MSQUIC_ERR_TIMEOUT;
+    } else {
+        wait_err = trevrpc_msquic_stream_wait_recv_locked(stream, deadline);
+    }
     if (wait_err != 0) {
         pthread_mutex_unlock(&stream->mutex);
         return wait_err < 0 ? wait_err : -wait_err;
@@ -1622,6 +1648,27 @@ intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data
     pthread_mutex_unlock(&stream->mutex);
 
     return (intptr_t)copied;
+}
+
+intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
+    return trevrpc_msquic_stream_read_until(stream, data, len, NULL, false);
+}
+
+intptr_t trevrpc_msquic_stream_read_timeout(
+    trevrpc_msquic_stream* stream, uint8_t* data, size_t len, uint64_t timeout_nanos) {
+    if (timeout_nanos == 0) {
+        return trevrpc_msquic_stream_read(stream, data, len);
+    }
+    struct timespec deadline = {0};
+    int err = trevrpc_msquic_realtime_deadline(timeout_nanos, &deadline);
+    if (err != 0) {
+        return err;
+    }
+    return trevrpc_msquic_stream_read_until(stream, data, len, &deadline, false);
+}
+
+intptr_t trevrpc_msquic_stream_read_ready(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
+    return trevrpc_msquic_stream_read_until(stream, data, len, NULL, true);
 }
 
 static intptr_t trevrpc_msquic_stream_read_frame_until(
@@ -2284,6 +2331,13 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
         pthread_mutex_lock(&conn->mutex);
         conn->err = (int)event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status;
+        pthread_cond_broadcast(&conn->cond);
+        pthread_mutex_unlock(&conn->mutex);
+        return QUIC_STATUS_SUCCESS;
+    case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+        pthread_mutex_lock(&conn->mutex);
+        conn->peer_close_error = event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode;
+        conn->peer_close_error_set = true;
         pthread_cond_broadcast(&conn->cond);
         pthread_mutex_unlock(&conn->mutex);
         return QUIC_STATUS_SUCCESS;

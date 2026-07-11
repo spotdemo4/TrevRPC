@@ -38,7 +38,7 @@ cc -I/usr/local/include -o greeter_client client.c greeter.pb-c.c greeter.trevrp
   -L/usr/local/lib -ltrevrpc -ltrevrpc_core -ltrevrpc_msquic -lprotobuf-c -lmsquic
 ```
 
-Run the server, then the client:
+The example server enables native QUIC, HTTP/3 POST, and WebTransport on the same UDP listener. Run the server, then the native QUIC client:
 
 ```sh
 ./greeter_server

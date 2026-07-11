@@ -28,7 +28,8 @@ func QUICServerConfig(options ServerOptions, base *quic.Config) *quic.Config {
 	if options.EnableWebTransport {
 		config.EnableDatagrams = true
 		config.EnableStreamResetPartialDelivery = true
-	} else {
+	}
+	if !options.EnableHTTP3 && !options.EnableWebTransport {
 		disableQUICIncomingUniStreams(config)
 	}
 

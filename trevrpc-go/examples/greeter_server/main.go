@@ -102,6 +102,7 @@ func main() {
 	server := trevrpc.NewServer()
 	server.SetAuthorizer(trevrpc.BearerAuthorizer(authToken))
 	options := server.Options()
+	options.EnableHTTP3 = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = allowBrowserExampleSession
 	server.SetOptions(options)
@@ -113,7 +114,8 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("greeter server listening on %s for native QUIC and WebTransport", listener.Addr())
+	log.Printf("greeter server listening on %s for native QUIC, HTTP/3, and WebTransport", listener.Addr())
+	log.Printf("HTTP/3 URL: https://%s/trevrpc", listener.Addr())
 	log.Printf("WebTransport URL: https://%s/trevrpc", listener.Addr())
 	log.Printf("bearer token: %s", authToken)
 	log.Printf("wrote client trust certificate to %s", certPath)

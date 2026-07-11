@@ -140,6 +140,70 @@ const native = require(${JSON.stringify(nativeAddonPath)});
     },
   );
 
+  test("native server accepts opt-in HTTP/3 options", { skip: native == null }, async () => {
+    const certificate = await testCertificate();
+    const server = await native.listenMsQuic({
+      host: "127.0.0.1",
+      port: 0,
+      certFile: certificate.certFile,
+      keyFile: certificate.keyFile,
+      enableHttp3: true,
+      http3Path: "/rpc",
+      http3Admission: ({ path, authority, secure }) =>
+        secure && path === "/rpc" && authority.length > 0,
+    });
+    server.close();
+
+    assert.throws(
+      () =>
+        native.listenMsQuic({
+          host: "127.0.0.1",
+          port: 0,
+          certFile: certificate.certFile,
+          keyFile: certificate.keyFile,
+          http3Admission: true,
+        }),
+      /http3Admission must be a function/u,
+    );
+  });
+
+  test(
+    "native HTTP/3 admission timeout owns queued callback data",
+    { skip: typeof native?._debugHttp3Admission !== "function" },
+    async () => {
+      let callbacks = 0;
+      const admission = native._debugHttp3Admission(() => {
+        callbacks += 1;
+        return true;
+      }, 20);
+      const blockedUntil = Date.now() + 100;
+      while (Date.now() < blockedUntil) {
+        // Keep the JS thread busy so the native admission wait expires first.
+      }
+      assert.equal(await admission, false);
+      await delay(20);
+      assert.equal(callbacks, 0);
+    },
+  );
+
+  test(
+    "native HTTP/3 admission shutdown wakes waiters",
+    { skip: typeof native?._debugHttp3Admission !== "function" },
+    async () => {
+      let callbacks = 0;
+      const admitted = await native._debugHttp3Admission(
+        () => {
+          callbacks += 1;
+          return true;
+        },
+        1_000,
+        true,
+      );
+      assert.equal(admitted, false);
+      assert.equal(callbacks, 0);
+    },
+  );
+
   test(
     "Worker termination interrupts an in-progress native connect",
     { skip: native == null, timeout: 10_000 },
