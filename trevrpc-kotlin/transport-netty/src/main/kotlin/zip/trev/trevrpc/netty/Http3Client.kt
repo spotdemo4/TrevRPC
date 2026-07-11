@@ -27,6 +27,8 @@ import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcStreamFrameKind
 import zip.trev.trevrpc.RpcTransport
+import zip.trev.trevrpc.RpcTransportConnection
+import zip.trev.trevrpc.RpcTransportLifecycle
 import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
@@ -38,6 +40,7 @@ class NettyHttp3RpcTransport private constructor(
     private val endpoint: ClientQuicEndpoint,
     private val config: NettyQuicClientConfig,
 ) : RpcTransport,
+    RpcTransportLifecycle,
     AutoCloseable {
     private val scope =
         CoroutineScope(
@@ -105,6 +108,12 @@ class NettyHttp3RpcTransport private constructor(
         endpoint.datagramChannel.close().awaitCompletion()
         endpoint.group.shutdownGracefully().awaitValue()
     }
+
+    override suspend fun awaitClosed() {
+        endpoint.quicChannel.closeFuture().awaitCompletion()
+    }
+
+    fun asManagedConnection(): RpcTransportConnection = RpcTransportConnection(this, this, ::shutdown)
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return

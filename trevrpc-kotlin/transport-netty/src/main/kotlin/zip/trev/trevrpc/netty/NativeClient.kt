@@ -32,6 +32,8 @@ import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcStreamFrameKind
 import zip.trev.trevrpc.RpcTransport
+import zip.trev.trevrpc.RpcTransportConnection
+import zip.trev.trevrpc.RpcTransportLifecycle
 import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.WireCodec
 import java.net.InetSocketAddress
@@ -46,6 +48,7 @@ class NettyQuicRpcTransport private constructor(
     private val options: NettyTransportOptions,
     private val dispatcher: CoroutineDispatcher,
 ) : RpcTransport,
+    RpcTransportLifecycle,
     AutoCloseable {
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val closed = AtomicBoolean(false)
@@ -103,6 +106,12 @@ class NettyQuicRpcTransport private constructor(
         datagramChannel.close().awaitCompletion()
         group.shutdownGracefully().awaitValue()
     }
+
+    override suspend fun awaitClosed() {
+        quicChannel.closeFuture().awaitCompletion()
+    }
+
+    fun asManagedConnection(): RpcTransportConnection = RpcTransportConnection(this, this, ::shutdown)
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
