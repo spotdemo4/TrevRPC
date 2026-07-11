@@ -11,6 +11,7 @@ SAMPLES_HEADER='axis,run,client,server,shape,latency_us,throughput_per_s,iterati
 FAILURES_HEADER='axis,run,client,server,source,status,raw_file,batching_settings,c_frame_trace,rust_quinn_qlog,rust_quinn_protocol_trace,rust_tls_keylog,rust_quinn_max_idle_timeout_ms,rust_quinn_keep_alive_ms,encoded_request_bytes,encoded_response_bytes'
 BATCHING='profile=production-representative;js-native-read-batch=32;js-native-write-batch=16;go-frame-batch=16;rust-frame-batch=32;grpc-batching=library-default'
 LABELS='encrypted;tls-skip-verify;tiny;per-message-serialized;none;steady-state-warmed'
+GRPC_LABELS='encrypted;tls-pinned;tiny;per-message-serialized;none;steady-state-warmed'
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -35,11 +36,55 @@ assert_not_contains() {
     fi
 }
 
+assert_section_contains() {
+    local file=$1
+    local heading=$2
+    local expected=$3
+    if ! awk -v heading="$heading" -v expected="$expected" '
+        $0 == heading { in_section = 1; next }
+        in_section && /^### / { exit }
+        in_section && index($0, expected) { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' "$file"; then
+        printf 'expected section %s in %s to contain: %s\n' "$heading" "$file" "$expected" >&2
+        return 1
+    fi
+}
+
+assert_section_not_contains() {
+    local file=$1
+    local heading=$2
+    local unexpected=$3
+    if ! awk -v heading="$heading" -v unexpected="$unexpected" '
+        $0 == heading { in_section = 1; found_heading = 1; next }
+        in_section && /^### / { exit }
+        in_section && index($0, unexpected) { found = 1 }
+        END { exit found_heading && !found ? 0 : 1 }
+    ' "$file"; then
+        printf 'expected section %s in %s not to contain: %s\n' "$heading" "$file" "$unexpected" >&2
+        return 1
+    fi
+}
+
+assert_count() {
+    local file=$1
+    local expected=$2
+    local value=$3
+    local actual
+    actual=$(grep -Fc -- "$value" "$file" || true)
+    if [[ "$actual" != "$expected" ]]; then
+        printf 'expected %s to contain %s occurrences of %s, found %s\n' "$file" "$expected" "$value" "$actual" >&2
+        return 1
+    fi
+}
+
 write_fixture() {
     local out_dir=$1
     mkdir -p "$out_dir"
     printf '%s\n' "$SAMPLES_HEADER" >"$out_dir/rpc-split-samples.csv"
+    printf 'client,1,rust_quinn,c_msquic,unary_latency,20.000,50000.000,10,0.200,rust-custom,encrypted,tls-skip-verify,tiny,19,19,per-message-serialized,none,steady-state-warmed,%s,%s,disabled,disabled,disabled,disabled,1234,234\n' "$BATCHING" "$LABELS" >>"$out_dir/rpc-split-samples.csv"
     printf 'server,1,c_msquic,rust_quinn,unary_latency,10.000,100000.000,10,0.100,c-custom,encrypted,tls-skip-verify,tiny,19,19,per-message-serialized,none,steady-state-warmed,%s,%s,disabled,disabled,disabled,disabled,1234,234\n' "$BATCHING" "$LABELS" >>"$out_dir/rpc-split-samples.csv"
+    printf 'grpc,1,rust_tonic,rust_tonic,unary_latency,30.000,33333.333,10,0.300,rust-custom,encrypted,tls-pinned,tiny,19,19,per-message-serialized,none,steady-state-warmed,%s,%s,disabled,disabled,disabled,disabled,1234,234\n' "$BATCHING" "$GRPC_LABELS" >>"$out_dir/rpc-split-samples.csv"
     printf '%s\n' "$FAILURES_HEADER" >"$out_dir/rpc-split-failures.csv"
     printf 'server,2,c_msquic,rust_quinn,c-custom,124,%s/raw/failure.txt,%s,disabled,disabled,disabled,disabled,1234,234,19,19\n' "$out_dir" "$BATCHING" >>"$out_dir/rpc-split-failures.csv"
 }
@@ -83,6 +128,12 @@ run_report "$valid_dir" >"$TMP_DIR/valid.stdout" 2>"$TMP_DIR/valid.stderr"
 assert_contains "$valid_dir/rpc-split.md" "| Rust Quinn idle timeout | \`1234\` ms |"
 assert_contains "$valid_dir/rpc-split.md" "| Rust Quinn keepalive | \`234\` ms |"
 assert_contains "$valid_dir/rpc-split.md" "| RPC stream idle timeout | production default (\`30000\` ms) |"
+grpc_row='| `gRPC` | `rust` | `tonic` | `rust` | `tonic` | 30.000 | 30.000..30.000 |'
+assert_section_not_contains "$valid_dir/rpc-split.md" '### `client` / `unary_latency`' '`gRPC`'
+assert_section_not_contains "$valid_dir/rpc-split.md" '### `server` / `unary_latency`' '`gRPC`'
+assert_section_contains "$valid_dir/rpc-split.md" '### `rust product-stack baseline` / `unary_latency`' "$grpc_row"
+assert_count "$valid_dir/rpc-split.md" 1 "$grpc_row"
+assert_contains "$valid_dir/rpc-split.md" 'cannot be attributed to either the client or server independently'
 awk -F, '
     NR == 1 && NF != 30 {
         printf "aggregate header has %d fields, expected 30\n", NF > "/dev/stderr"
@@ -93,8 +144,8 @@ awk -F, '
         bad = 1
     }
     END {
-        if (NR != 2) {
-            printf "aggregate has %d rows, expected 2\n", NR > "/dev/stderr"
+        if (NR != 4) {
+            printf "aggregate has %d rows, expected 4\n", NR > "/dev/stderr"
             bad = 1
         }
         exit bad ? 1 : 0

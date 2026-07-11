@@ -90,7 +90,7 @@ Usage: bench/run_rpc_split.sh
        bench/run_rpc_split.sh --report-only
        bench/run_rpc_split.sh --smoke
 
-Runs split TrevRPC client/server benchmarks plus Go and Rust gRPC baselines, and writes CSV/Markdown reports.
+Runs split TrevRPC client/server benchmarks plus same-language Go and Rust gRPC product-stack comparisons, and writes CSV/Markdown reports.
 
 Report-only requires immutable transport and instrumentation columns from this schema. Older outputs must use their recorded script snapshot or be explicitly migrated; missing state is never inferred.
 
@@ -110,10 +110,10 @@ Environment knobs:
   RUN_SERVER_AXIS         Benchmark servers with reference C clients. Default: 1
   RUN_C_MSQUIC            Include C MsQuic transport. Default: 1
   RUN_GO_QUIC             Include Go quic-go transport. Default: 1
-  RUN_GO_GRPC             Include Go gRPC TCP baseline. Default: 1
+  RUN_GO_GRPC             Include Go gRPC TCP product-stack comparison. Default: 1
   RUN_JS_NATIVE           Include native JS MsQuic transport. Default: 1
   RUN_RUST_QUINN          Include Rust Quinn transport. Default: 1
-  RUN_RUST_GRPC           Include Rust tonic gRPC TCP baseline. Default: 1
+  RUN_RUST_GRPC           Include Rust tonic gRPC TCP product-stack comparison. Default: 1
   PAYLOAD_PROFILE         Payload profile: tiny, small, medium, large, or mixed. Default: tiny
   METADATA_PROFILE        Metadata profile: none or production. Default: none
   BENCHMARK_PROFILE       Base profile label. Instrumentation forces a diagnostic label.
@@ -869,8 +869,7 @@ EOF
             throughput_min[id] = $10 + 0
             throughput_max[id] = $11 + 0
             if (axis[id] == "grpc") {
-                add_row_to_group("client", id)
-                add_row_to_group("server", id)
+                add_row_to_group(label_language(client[id]) " product-stack baseline", id)
             } else {
                 add_row_to_group(axis[id], id)
             }
@@ -959,7 +958,7 @@ Latency rows measure one RPC operation. Stream latency rows use one request and 
 
 Latency tables are sorted by median latency ascending. Throughput tables are sorted by median message throughput descending.
 
-Rows with framework \`gRPC\` benchmark gRPC clients and servers split into separate processes over TCP with TLS when the corresponding TLS setting is enabled. They are included in both client and server tables as baselines only and are not transport-compatible with the TrevRPC transport rows.
+Rows with framework \`gRPC\` benchmark complete same-language gRPC client/server product stacks split into separate processes over TCP with TLS when the corresponding TLS setting is enabled. They are reported in dedicated product-stack baseline sections because their results cannot be attributed to either the client or server independently, and they are not transport-compatible with the TrevRPC transport rows.
 
 Raw command output is saved under \`$RAW_DIR\`. Per-measurement normalized rows are saved in \`$SAMPLES_CSV\`. The exact commands are saved in \`$COMMAND_LOG\`.
 
