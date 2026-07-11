@@ -66,8 +66,8 @@
               playwright-driver.browsers
 
               # kotlin / android
-              jdk21
-              gradle
+              jdk25
+              gradle_9
               protobuf
               androidenv.androidPkgs.androidsdk
 
@@ -109,8 +109,8 @@
               # javascript
               nodejs_24
               # kotlin
-              jdk21
-              gradle
+              jdk25
+              gradle_9
             ];
           };
 
@@ -126,8 +126,8 @@
               # javascript
               nodejs_24
               # kotlin
-              jdk21
-              gradle
+              jdk25
+              gradle_9
             ];
           };
 
@@ -365,13 +365,13 @@
               '';
 
               nativeBuildInputs = with pkgs; [
-                gradle
-                jdk21
+                gradle_9
+                jdk25
                 makeWrapper
                 protobuf
               ];
 
-              mitmCache = pkgs.gradle.fetchDeps {
+              mitmCache = pkgs.gradle_9.fetchDeps {
                 pkg = final.finalPackage;
                 data = ./trevrpc-kotlin/gradle/deps.json;
                 bwrapFlags = ''--ro-bind "$PWD" "$PWD" --dir /bin --symlink ${pkgs.runtimeShell} /bin/sh'';
@@ -379,7 +379,7 @@
               __darwinAllowLocalNetworking = true;
 
               gradleFlags = [
-                "-Dorg.gradle.java.home=${pkgs.jdk21.home}"
+                "-Dorg.gradle.java.home=${pkgs.jdk25.home}"
               ];
               gradleBuildTask = [
                 "assemble"
@@ -401,13 +401,13 @@
                   $out/share/trevrpc-kotlin/protoc-gen-trevrpc-kotlin
                 makeWrapper $out/share/trevrpc-kotlin/bin/trevrpc-xruntime-kotlin \
                   $out/bin/trevrpc-xruntime-kotlin \
-                  --set JAVA_HOME ${pkgs.jdk21.home} \
-                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk21 ]}
+                  --set JAVA_HOME ${pkgs.jdk25.home} \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk25 ]}
                 makeWrapper \
                   $out/share/trevrpc-kotlin/protoc-gen-trevrpc-kotlin/bin/protoc-gen-trevrpc-kotlin \
                   $out/bin/protoc-gen-trevrpc-kotlin \
-                  --set JAVA_HOME ${pkgs.jdk21.home} \
-                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk21 ]}
+                  --set JAVA_HOME ${pkgs.jdk25.home} \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk25 ]}
                 runHook postInstall
               '';
 
@@ -506,7 +506,7 @@
               TREVRPC_XRUNTIME_GO = "${crossRuntimeGo}/bin/trevrpc-xruntime-go";
               TREVRPC_XRUNTIME_KOTLIN = "${self.packages.${system}.trevrpc-kotlin}/bin/trevrpc-xruntime-kotlin";
               checkPhase = ''
-                cargo test --test cross_runtime --offline -- --nocapture
+                cargo test --test cross_runtime --offline -- --nocapture --test-threads=1
               '';
               installPhase = ''
                 touch $out
