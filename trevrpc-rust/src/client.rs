@@ -11,6 +11,12 @@ use crate::{
 use prost::Message;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "quinn")]
+pub(crate) mod channel;
+
+#[cfg(feature = "quinn")]
+pub use channel::{Channel, ChannelConfig, ChannelEvent, ChannelPhase, ChannelState};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {
     timeout: Option<Duration>,

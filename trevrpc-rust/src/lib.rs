@@ -17,6 +17,9 @@ pub const HTTP3_ALPN: &[u8] = b"h3";
 #[cfg(feature = "client")]
 pub mod client;
 
+#[cfg(any(feature = "quinn", feature = "webtransport"))]
+pub mod advanced;
+
 #[cfg(feature = "quinn")]
 pub mod quinn;
 

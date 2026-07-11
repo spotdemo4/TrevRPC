@@ -7,11 +7,10 @@ use std::time::Duration;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::task::JoinHandle;
-use trevrpc::client::RpcTransport;
-use trevrpc::quinn::{
-    ManagedClient, ManagedClientConfig, ManagedClientEvent, ManagedClientPhase, ReconnectBackoff,
-    TransportMode,
-};
+use trevrpc::advanced::ChannelOperations;
+use trevrpc::advanced::{ChannelConfigOperations, ReconnectBackoff};
+use trevrpc::client::{Channel, ChannelConfig, ChannelEvent, ChannelPhase, RpcTransport};
+use trevrpc::quinn::TransportMode;
 use trevrpc::{Code, RpcRequest, RpcResponse, Status};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -136,18 +135,18 @@ fn make_client_endpoint(cert: CertificateDer<'static>) -> TestResult<quinn::Endp
     Ok(endpoint)
 }
 
-async fn connect_managed(server: &RawServer, delay: Duration) -> TestResult<ManagedClient> {
+async fn connect_channel(server: &RawServer, delay: Duration) -> TestResult<Channel> {
     let endpoint = make_client_endpoint(server.cert.clone())?;
-    Ok(ManagedClient::connect_with_config(
+    Ok(Channel::connect_with_config(
         endpoint,
         server.addr,
         "localhost",
-        ManagedClientConfig::new().with_reconnect_backoff(FixedBackoff(delay)),
+        ChannelConfig::new().with_reconnect_backoff(FixedBackoff(delay)),
     )
     .await?)
 }
 
-async fn wait_for_phase(client: &ManagedClient, phase: ManagedClientPhase) -> TestResult {
+async fn wait_for_phase(client: &Channel, phase: ChannelPhase) -> TestResult {
     let mut states = client.subscribe_state();
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
@@ -157,7 +156,7 @@ async fn wait_for_phase(client: &ManagedClient, phase: ManagedClientPhase) -> Te
             states
                 .changed()
                 .await
-                .expect("managed client state sender should remain open");
+                .expect("channel state sender should remain open");
         }
     })
     .await?;
@@ -176,7 +175,7 @@ fn assert_unavailable(error: trevrpc::Error) {
 #[tokio::test]
 async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResult {
     let server = RawServer::spawn(true)?;
-    let client = connect_managed(&server, Duration::from_millis(150)).await?;
+    let client = connect_channel(&server, Duration::from_millis(150)).await?;
     let mut events = client.subscribe_events();
     assert_eq!(client.state().generation(), 1);
 
@@ -185,7 +184,7 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
         .await
         .expect_err("the first generation should be closed in flight");
     assert_unavailable(first_error);
-    wait_for_phase(&client, ManagedClientPhase::Reconnecting).await?;
+    wait_for_phase(&client, ChannelPhase::Reconnecting).await?;
 
     let reconnecting_error = tokio::time::timeout(
         Duration::from_millis(20),
@@ -202,19 +201,16 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
     );
     assert_eq!(
         events.recv().await?,
-        ManagedClientEvent::ConnectionLost { generation: 1 }
+        ChannelEvent::ConnectionLost { generation: 1 }
     );
     assert_eq!(
         events.recv().await?,
-        ManagedClientEvent::ReconnectAttempt {
+        ChannelEvent::ReconnectAttempt {
             generation: 1,
             attempt: 1,
         }
     );
-    assert_eq!(
-        events.recv().await?,
-        ManagedClientEvent::Ready { generation: 2 }
-    );
+    assert_eq!(events.recv().await?, ChannelEvent::Ready { generation: 2 });
     tokio::time::sleep(Duration::from_millis(25)).await;
     assert_eq!(server.received_requests.load(Ordering::SeqCst), 1);
 
@@ -230,21 +226,18 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
 #[tokio::test]
 async fn close_stops_reconnect_and_rebind_preserves_generation() -> TestResult {
     let server = RawServer::spawn(false)?;
-    let client = connect_managed(&server, Duration::from_millis(40)).await?;
+    let client = connect_channel(&server, Duration::from_millis(40)).await?;
     let mut events = client.subscribe_events();
     let generation = client.state().generation();
     assert!(client.is_ready());
 
     let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    client.rebind(socket)?;
+    client.rebind_quinn(socket)?;
     assert_eq!(client.state().generation(), generation);
 
     client.close();
-    assert_eq!(
-        events.recv().await?,
-        ManagedClientEvent::Closed { generation }
-    );
-    assert_eq!(client.state().phase(), ManagedClientPhase::Closed);
+    assert_eq!(events.recv().await?, ChannelEvent::Closed { generation });
+    assert_eq!(client.state().phase(), ChannelPhase::Closed);
     assert_eq!(client.state().generation(), generation);
     assert_unavailable(
         client

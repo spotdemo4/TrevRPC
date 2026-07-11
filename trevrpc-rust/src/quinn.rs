@@ -6,20 +6,13 @@ use prost::Message;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::advanced::RawQuinnTransport;
 use crate::client::RpcTransport;
 use crate::framed::{self, FrameRead, FrameTrace, FrameWrite, MESSAGE_FRAME_BATCH};
-use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::server::ServerOptions;
 use crate::{
     BoxMessageStream, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse,
     RpcStreamFrame, RpcStreamFrameKind, Status,
-};
-
-mod managed;
-
-pub use managed::{
-    ExponentialBackoff, ManagedClient, ManagedClientConfig, ManagedClientEvent, ManagedClientPhase,
-    ManagedClientState, ReconnectBackoff,
 };
 
 const CANCELLED_STREAM_CODE: u32 = 1;
@@ -288,53 +281,21 @@ fn varint(value: u64) -> quinn::VarInt {
     quinn::VarInt::from_u64(value).unwrap_or(quinn::VarInt::MAX)
 }
 
-#[derive(Clone)]
-pub struct Client {
-    connection: quinn::Connection,
-    max_frame_size: usize,
-}
-
-impl Client {
-    /// Creates a `TrevRPC` client over an established `Quinn` connection.
-    #[must_use]
-    pub const fn new(connection: quinn::Connection) -> Self {
-        Self {
-            connection,
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-        }
-    }
-
-    /// Sets the maximum `TrevRPC` frame size in bytes for this client.
-    #[must_use]
-    pub const fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
-        self.max_frame_size = max_frame_size;
-        self
-    }
-
-    /// Returns the underlying `Quinn` connection.
-    #[must_use]
-    pub const fn connection(&self) -> &quinn::Connection {
-        &self.connection
-    }
-
-    /// Returns the maximum `TrevRPC` frame size in bytes for this client.
-    #[must_use]
-    pub const fn max_frame_size(&self) -> usize {
-        self.max_frame_size
-    }
-}
-
 #[crate::async_trait]
-impl RpcTransport for Client {
+impl RpcTransport for RawQuinnTransport {
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        let (send, recv) = self.connection.open_bi().await.map_err(Error::transport)?;
+        let (send, recv) = self
+            .connection()
+            .open_bi()
+            .await
+            .map_err(Error::transport)?;
         let mut streams = CancellableBiStream::new(send, recv);
 
-        write_frame(streams.send_mut(), &request, self.max_frame_size).await?;
+        write_frame(streams.send_mut(), &request, self.max_frame_size()).await?;
         streams.send_mut().finish().map_err(Error::transport)?;
         trace_quinn_event("tx_fin", "client_unary_request");
 
-        let response = read_frame(streams.recv_mut(), self.max_frame_size).await?;
+        let response = read_frame(streams.recv_mut(), self.max_frame_size()).await?;
         streams.complete();
 
         Ok(response)
@@ -345,8 +306,12 @@ impl RpcTransport for Client {
         request: RpcRequest,
         mut request_body: BoxMessageStream<Vec<u8>>,
     ) -> Result<BoxMessageStream<RpcStreamFrame>> {
-        let (send, recv) = self.connection.open_bi().await.map_err(Error::transport)?;
-        let max_frame_size = self.max_frame_size;
+        let (send, recv) = self
+            .connection()
+            .open_bi()
+            .await
+            .map_err(Error::transport)?;
+        let max_frame_size = self.max_frame_size();
 
         if request_body.is_non_blocking() {
             match request_body.next().await {
@@ -355,7 +320,7 @@ impl RpcTransport for Client {
                     return Ok(Box::new(QuinnResponseStream::new(
                         recv,
                         None,
-                        self.max_frame_size,
+                        self.max_frame_size(),
                     )));
                 }
                 Some(first) => {
@@ -371,7 +336,7 @@ impl RpcTransport for Client {
         Ok(Box::new(QuinnResponseStream::new(
             recv,
             Some(write_task),
-            self.max_frame_size,
+            self.max_frame_size(),
         )))
     }
 }

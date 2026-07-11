@@ -6,9 +6,9 @@ use prost::Message;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::advanced::RawWebTransport;
 use crate::client::RpcTransport;
 use crate::framed::{self, FrameRead, FrameWrite, MESSAGE_FRAME_BATCH, NoopFrameTrace};
-use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::{
     BoxMessageStream, Error, MessageStream, Result, RpcKind, RpcRequest, RpcResponse,
     RpcStreamFrame, RpcStreamFrameKind, Status,
@@ -40,52 +40,16 @@ impl FrameRead for web_transport_quinn::RecvStream {
     }
 }
 
-#[derive(Clone)]
-pub struct Client {
-    session: web_transport_quinn::Session,
-    max_frame_size: usize,
-}
-
-impl Client {
-    /// Creates a `TrevRPC` client over an established `WebTransport` session.
-    #[must_use]
-    pub const fn new(session: web_transport_quinn::Session) -> Self {
-        Self {
-            session,
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-        }
-    }
-
-    /// Sets the maximum `TrevRPC` frame size in bytes for this client.
-    #[must_use]
-    pub const fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
-        self.max_frame_size = max_frame_size;
-        self
-    }
-
-    /// Returns the underlying `WebTransport` session.
-    #[must_use]
-    pub const fn session(&self) -> &web_transport_quinn::Session {
-        &self.session
-    }
-
-    /// Returns the maximum `TrevRPC` frame size in bytes for this client.
-    #[must_use]
-    pub const fn max_frame_size(&self) -> usize {
-        self.max_frame_size
-    }
-}
-
 #[crate::async_trait]
-impl RpcTransport for Client {
+impl RpcTransport for RawWebTransport {
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        let (send, recv) = self.session.open_bi().await.map_err(Error::transport)?;
+        let (send, recv) = self.session().open_bi().await.map_err(Error::transport)?;
         let mut streams = CancellableBiStream::new(send, recv);
 
-        write_frame(streams.send_mut(), &request, self.max_frame_size).await?;
+        write_frame(streams.send_mut(), &request, self.max_frame_size()).await?;
         streams.send_mut().finish().map_err(Error::transport)?;
 
-        let response = read_frame(streams.recv_mut(), self.max_frame_size).await?;
+        let response = read_frame(streams.recv_mut(), self.max_frame_size()).await?;
         streams.complete();
 
         Ok(response)
@@ -96,8 +60,8 @@ impl RpcTransport for Client {
         request: RpcRequest,
         mut request_body: BoxMessageStream<Vec<u8>>,
     ) -> Result<BoxMessageStream<RpcStreamFrame>> {
-        let (send, recv) = self.session.open_bi().await.map_err(Error::transport)?;
-        let max_frame_size = self.max_frame_size;
+        let (send, recv) = self.session().open_bi().await.map_err(Error::transport)?;
+        let max_frame_size = self.max_frame_size();
 
         if request_body.is_non_blocking() {
             match request_body.next().await {
@@ -106,7 +70,7 @@ impl RpcTransport for Client {
                     return Ok(Box::new(WebTransportResponseStream::new(
                         recv,
                         None,
-                        self.max_frame_size,
+                        self.max_frame_size(),
                     )));
                 }
                 Some(first) => {
@@ -122,7 +86,7 @@ impl RpcTransport for Client {
         Ok(Box::new(WebTransportResponseStream::new(
             recv,
             Some(write_task),
-            self.max_frame_size,
+            self.max_frame_size(),
         )))
     }
 }

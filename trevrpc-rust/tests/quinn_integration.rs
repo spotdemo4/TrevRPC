@@ -510,6 +510,60 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
 }
 
 #[tokio::test]
+async fn managed_webtransport_channel_round_trips_unary() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let webtransport_client = make_webtransport_client(&server)?;
+    let origin = format!("https://127.0.0.1:{}", server.addr.port());
+    let channel =
+        trevrpc::client::Channel::connect_webtransport(webtransport_client, &origin).await?;
+    let client = greeter::GreeterClient::new(channel.clone());
+
+    let reply = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "channel WebTransport".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+
+    assert_eq!(reply.message, "hello, channel WebTransport");
+    assert!(channel.is_ready());
+
+    let mut states = channel.subscribe_state();
+    server.shutdown().await?;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if states.borrow_and_update().phase() == trevrpc::client::ChannelPhase::Reconnecting {
+                break;
+            }
+            states
+                .changed()
+                .await
+                .expect("channel state should remain open");
+        }
+    })
+    .await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(20),
+        client.say_hello(
+            greeter::HelloRequest {
+                name: "must fail fast".to_owned(),
+            },
+            authenticated_options(),
+        ),
+    )
+    .await?
+    .expect_err("WebTransport calls must fail while reconnecting");
+    assert_eq!(error.into_status().code(), Code::Unavailable);
+
+    channel.close();
+    Ok(())
+}
+
+#[tokio::test]
 async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
         server.set_http3_enabled(true);
@@ -559,7 +613,9 @@ async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResul
 
     let endpoint = make_client_endpoint(server.cert_der.clone())?;
     let connection = endpoint.connect(server.addr, "localhost")?.await?;
-    let quinn_client = greeter::GreeterClient::new(trevrpc::quinn::Client::new(connection.clone()));
+    let quinn_client = greeter::GreeterClient::new(trevrpc::advanced::RawQuinnTransport::new(
+        connection.clone(),
+    ));
     let quinn_reply = quinn_client
         .say_hello(
             greeter::HelloRequest {
@@ -888,7 +944,7 @@ async fn webtransport_allows_configured_browser_origin() -> TestResult {
                 web_transport_quinn::http::HeaderValue::from_static("https://example.invalid"),
             );
     let session = client.connect(request).await?;
-    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let transport = trevrpc::advanced::RawWebTransport::new(session.clone());
     let greeter_client = greeter::GreeterClient::new(transport);
 
     let reply = greeter_client
@@ -926,7 +982,7 @@ async fn webtransport_admission_receives_generic_request_headers() -> TestResult
                 web_transport_quinn::http::HeaderValue::from_static("allowed"),
             );
     let session = client.connect(allowed).await?;
-    let rpc = greeter::GreeterClient::new(trevrpc::webtransport::Client::new(session.clone()));
+    let rpc = greeter::GreeterClient::new(trevrpc::advanced::RawWebTransport::new(session.clone()));
     let reply = rpc
         .say_hello(
             greeter::HelloRequest {
@@ -983,7 +1039,7 @@ async fn quinn_auth_failures_return_status_errors() -> TestResult {
 async fn quinn_oversized_timeouts_are_rejected_over_the_wire() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
     let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "Missing", Vec::new())
         .with_timeout_nanos(u64::MAX);
 
@@ -1146,7 +1202,7 @@ async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
     .expect("second connection attempt should complete");
 
     if let Ok(connection) = connect {
-        let transport = trevrpc::quinn::Client::new(connection.clone());
+        let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
         let error = trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
             greeter::GreeterClient::<()>::SERVICE,
@@ -1411,7 +1467,7 @@ async fn webtransport_bidi_deadline_drops_pending_upload_and_response() -> TestR
 async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
     let server = spawn_greeter_server(register_reject_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
@@ -1435,7 +1491,7 @@ async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
 async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResult {
     let server = spawn_webtransport_greeter_server(register_reject_upload_route)?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let transport = trevrpc::advanced::RawWebTransport::new(session.clone());
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
@@ -1490,7 +1546,7 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
     });
     let endpoint = make_client_endpoint(cert_der)?;
     let connection = endpoint.connect(server_addr, "localhost")?.await?;
-    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
     let mut response = transport
         .streaming_call(
             RpcRequest::new("example.greeter.Greeter", "StatusOnly", Vec::new())
@@ -1555,7 +1611,7 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
     });
     let endpoint = make_client_endpoint(cert_der)?;
     let connection = endpoint.connect(server_addr, "localhost")?.await?;
-    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
     let mut response = transport
         .streaming_call(
             RpcRequest::new("example.greeter.Greeter", "StatusThenMessage", Vec::new())
@@ -1627,7 +1683,7 @@ async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> Test
 async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let server = spawn_greeter_server(register_accept_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
@@ -1653,7 +1709,7 @@ async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
 async fn webtransport_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let server = spawn_webtransport_greeter_server(register_accept_upload_route)?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let transport = trevrpc::advanced::RawWebTransport::new(session.clone());
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
@@ -1746,7 +1802,7 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
         );
     })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
     let call = tokio::spawn(async move {
         trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
@@ -1797,7 +1853,7 @@ async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestRe
         );
     })?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let transport = trevrpc::advanced::RawWebTransport::new(session.clone());
     let call = tokio::spawn(async move {
         trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
@@ -1892,7 +1948,7 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
         .expect("mTLS rejection handshake should complete");
 
     if let Ok(connection) = result {
-        let transport = trevrpc::quinn::Client::new(connection.clone());
+        let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
         let status = trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
             greeter::GreeterClient::<()>::SERVICE,
@@ -2304,7 +2360,7 @@ async fn run_mixed_workload(total_calls: usize, batch_size: usize) -> TestResult
 }
 
 async fn run_mixed_call(
-    client: greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     index: usize,
 ) -> trevrpc::Result<()> {
     match index % 4 {
@@ -2369,7 +2425,7 @@ async fn run_mixed_call(
 }
 
 async fn hold_server_stream_open(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
 ) -> TestResult<trevrpc::BoxMessageStream<greeter::HelloReply>> {
     let mut replies = client
         .lots_of_replies(
@@ -2536,11 +2592,11 @@ async fn connect_client(
 ) -> TestResult<(
     quinn::Endpoint,
     quinn::Connection,
-    greeter::GreeterClient<trevrpc::quinn::Client>,
+    greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
 )> {
     let endpoint = make_client_endpoint(server.cert_der.clone())?;
     let connection = endpoint.connect(server.addr, "localhost")?.await?;
-    let transport = trevrpc::quinn::Client::new(connection.clone());
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
     let client = greeter::GreeterClient::new(transport);
 
     Ok((endpoint, connection, client))
@@ -2551,7 +2607,7 @@ async fn connect_webtransport_client(
 ) -> TestResult<(
     web_transport_quinn::Client,
     web_transport_quinn::Session,
-    greeter::GreeterClient<trevrpc::webtransport::Client>,
+    greeter::GreeterClient<trevrpc::advanced::RawWebTransport>,
 )> {
     let webtransport_client = make_webtransport_client(server)?;
     let session = webtransport_client
@@ -2559,7 +2615,7 @@ async fn connect_webtransport_client(
             webtransport_url(server, "/trevrpc")?,
         ))
         .await?;
-    let transport = trevrpc::webtransport::Client::new(session.clone());
+    let transport = trevrpc::advanced::RawWebTransport::new(session.clone());
     let greeter_client = greeter::GreeterClient::new(transport);
 
     Ok((webtransport_client, session, greeter_client))

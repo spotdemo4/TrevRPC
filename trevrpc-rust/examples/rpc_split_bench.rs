@@ -99,7 +99,9 @@ async fn run_client(addr: SocketAddr, cert_path: &Path, iterations: u32) -> Benc
     }
     let endpoint = make_client_endpoint(cert_path)?;
     let connection = endpoint.connect(addr, "localhost")?.await?;
-    let client = greeter::GreeterClient::new(trevrpc::quinn::Client::new(connection.clone()));
+    let client = greeter::GreeterClient::new(trevrpc::advanced::RawQuinnTransport::new(
+        connection.clone(),
+    ));
 
     warm_client(&client).await?;
     if should_run_shape("unary_latency") {
@@ -257,7 +259,9 @@ async fn run_grpc_server(addr: SocketAddr, cert_path: &Path, key_path: &Path) ->
     Ok(())
 }
 
-async fn warm_client(client: &greeter::GreeterClient<trevrpc::quinn::Client>) -> BenchResult {
+async fn warm_client(
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
+) -> BenchResult {
     trevrpc_unary_call(client, 0).await?;
     trevrpc_server_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
     trevrpc_client_streaming_call(client, LATENCY_STREAM_MESSAGE_COUNT).await?;
@@ -448,7 +452,7 @@ fn validate_tonic_response_metadata<T>(response: tonic::Response<T>) -> Result<T
 }
 
 async fn trevrpc_unary_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     index: usize,
 ) -> BenchResult {
     let request = benchmark_request(index);
@@ -463,7 +467,7 @@ async fn trevrpc_unary_call(
 }
 
 async fn trevrpc_server_streaming_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     message_count: usize,
 ) -> BenchResult {
     let mut replies = client
@@ -488,7 +492,7 @@ async fn trevrpc_server_streaming_call(
 }
 
 async fn trevrpc_client_streaming_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     message_count: usize,
 ) -> BenchResult {
     let response = client
@@ -505,7 +509,7 @@ async fn trevrpc_client_streaming_call(
 }
 
 async fn trevrpc_bidi_streaming_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     message_count: usize,
 ) -> BenchResult {
     let mut replies = client

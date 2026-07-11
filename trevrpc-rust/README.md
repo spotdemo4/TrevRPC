@@ -6,56 +6,70 @@ server-streaming, client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-Create a generated client with a managed Quinn transport:
+Create a generated client with an application channel:
 
 ```rust
 let endpoint = make_client_endpoint()?;
-let transport = trevrpc::quinn::ManagedClient::connect(
+let channel = trevrpc::client::Channel::connect(
     endpoint.clone(),
     "127.0.0.1:5000".parse()?,
     "localhost",
 )
 .await?;
-let client = greeter::GreeterClient::new(transport.clone());
+let client = greeter::GreeterClient::new(channel.clone());
 let options = trevrpc::client::CallOptions::new();
 ```
 
 The Quinn endpoint must trust the server certificate and include `trevrpc::ALPN` in its ALPN
 protocols. The [complete client example](examples/greeter_client.rs) includes local TLS setup.
 
-`ManagedClient` owns and reuses the supplied Quinn endpoint across connection generations so rustls
+`Channel` owns and reuses the supplied Quinn endpoint across connection generations so rustls
 TLS session resumption state survives redial. Reconnection only serves future calls; it does not
 retry or replay any RPC. In-flight calls fail with their normal transport error when their
 generation dies, and new calls fail immediately with `Unavailable` while reconnecting.
 `wait_until_ready`, `state`, `subscribe_state`, and `subscribe_events` expose readiness and lifecycle
-changes. `close` permanently stops that managed client's reconnect loop.
+changes. `close` permanently stops that channel's reconnect loop.
 
-The managed client never enables Quinn 0-RTT. TLS session resumption may shorten a handshake, but
-RPC application data is sent only after the full handshake completes. `ManagedClient::rebind`
-changes the UDP socket for the entire shared Quinn endpoint and therefore affects every connection
-using an endpoint clone; a successful rebind alone does not change the managed generation.
+The channel never enables Quinn 0-RTT. TLS session resumption may shorten a handshake, but RPC
+application data is sent only after the full handshake completes. The initial `connect` future
+covers that complete handshake, so callers can bound or cancel it with their normal future, task,
+or request-context deadline semantics.
 
-Keep the separate transport and endpoint handles for orderly shutdown:
+The same application type manages WebTransport sessions at the conventional `/trevrpc` path:
 
 ```rust
-transport.close();
+let channel = trevrpc::client::Channel::connect_webtransport(
+    webtransport_client,
+    "https://example.com:443",
+)
+.await?;
+let client = greeter::GreeterClient::new(channel.clone());
+```
+
+Custom WebTransport CONNECT paths and headers are intentionally available only through
+`trevrpc::advanced::connect_webtransport_channel_with_request`.
+
+Keep the separate channel and endpoint handles for orderly shutdown:
+
+```rust
+channel.close();
 endpoint.wait_idle().await;
 ```
 
-Calling `transport.close()` stops reconnecting and closes its current connection. It deliberately
+Calling `channel.close()` stops reconnecting and closes its current connection. It deliberately
 does not close the shared Quinn endpoint. If the application owns the endpoint exclusively, drop it
 after `wait_idle`; if the endpoint is shared, keep it alive for its other connections.
 
 ### Advanced: low-level established connection
 
-Use `trevrpc::quinn::Client` when the application already manages an established Quinn connection
-and its lifecycle directly. This transport does not reconnect:
+Use `trevrpc::advanced::RawQuinnTransport` when the application already manages an established
+Quinn connection and its lifecycle directly. This transport does not reconnect:
 
 ```rust
 let connection = endpoint
     .connect("127.0.0.1:5000".parse()?, "localhost")?
     .await?;
-let transport = trevrpc::quinn::Client::new(connection.clone());
+let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
 let client = greeter::GreeterClient::new(transport);
 
 // After all calls and streams have finished:

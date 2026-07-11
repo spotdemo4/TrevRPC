@@ -539,7 +539,7 @@ impl BenchmarkState {
 struct RunningTrevRpc {
     endpoint: quinn::Endpoint,
     connection: quinn::Connection,
-    client: greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<trevrpc::Result<()>>>,
 }
@@ -563,7 +563,9 @@ impl RunningTrevRpc {
 
         let endpoint = make_trevrpc_client_endpoint(cert_der)?;
         let connection = endpoint.connect(addr, "localhost")?.await?;
-        let client = greeter::GreeterClient::new(trevrpc::quinn::Client::new(connection.clone()));
+        let client = greeter::GreeterClient::new(trevrpc::advanced::RawQuinnTransport::new(
+            connection.clone(),
+        ));
 
         Ok(Self {
             endpoint,
@@ -944,7 +946,7 @@ fn rpc_comparison(c: &mut Criterion) {
 }
 
 async fn trevrpc_unary_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
 ) -> BenchResult<String> {
     let response = client
         .say_hello(
@@ -967,7 +969,7 @@ async fn grpc_unary_call(client: &mut GrpcGreeterClient<Channel>) -> BenchResult
 }
 
 async fn trevrpc_server_streaming_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     message_count: usize,
 ) -> BenchResult<usize> {
     let mut replies = client
@@ -1015,7 +1017,7 @@ async fn grpc_server_streaming_call(
 }
 
 async fn trevrpc_client_streaming_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     message_count: usize,
 ) -> BenchResult<usize> {
     let response = client
@@ -1036,7 +1038,7 @@ async fn grpc_client_streaming_call(
 }
 
 async fn trevrpc_bidi_streaming_call(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
     message_count: usize,
 ) -> BenchResult<usize> {
     let mut replies = client

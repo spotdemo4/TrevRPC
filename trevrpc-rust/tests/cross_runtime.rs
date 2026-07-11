@@ -478,11 +478,13 @@ async fn connect_rust_client(
 ) -> TestResult<(
     quinn::Endpoint,
     quinn::Connection,
-    greeter::GreeterClient<trevrpc::quinn::Client>,
+    greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
 )> {
     let endpoint = make_client_endpoint(cert_path)?;
     let connection = endpoint.connect(addr, "localhost")?.await?;
-    let client = greeter::GreeterClient::new(trevrpc::quinn::Client::new(connection.clone()));
+    let client = greeter::GreeterClient::new(trevrpc::advanced::RawQuinnTransport::new(
+        connection.clone(),
+    ));
 
     Ok((endpoint, connection, client))
 }
@@ -592,7 +594,7 @@ fn call_options() -> CallOptions {
 }
 
 async fn exercise_rust_client(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
 ) -> TestResult {
     let response = client
         .say_hello(
@@ -644,7 +646,7 @@ async fn exercise_rust_client(
 }
 
 async fn stress_rust_client_lifecycle(
-    client: &greeter::GreeterClient<trevrpc::quinn::Client>,
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
 ) -> TestResult {
     let response = client
         .say_hello(
@@ -712,7 +714,9 @@ async fn assert_stream<const N: usize>(
     Ok(())
 }
 
-async fn expect_rust_auth_failure(client: &greeter::GreeterClient<trevrpc::quinn::Client>) {
+async fn expect_rust_auth_failure(
+    client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
+) {
     let error = client
         .say_hello(
             greeter::HelloRequest {

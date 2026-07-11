@@ -27,9 +27,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .parse::<SocketAddr>()?;
 
     let endpoint = make_client_endpoint()?;
-    let transport =
-        trevrpc::quinn::ManagedClient::connect(endpoint.clone(), addr, "localhost").await?;
-    let client = greeter::GreeterClient::new(transport.clone());
+    let channel = trevrpc::client::Channel::connect(endpoint.clone(), addr, "localhost").await?;
+    let client = greeter::GreeterClient::new(channel.clone());
 
     let reply = client
         .say_hello(greeter::HelloRequest { name: name.clone() }, call_options())
@@ -72,7 +71,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("bidi: {}", reply.message);
     }
 
-    transport.close();
+    channel.close();
     endpoint.wait_idle().await;
 
     Ok(())
