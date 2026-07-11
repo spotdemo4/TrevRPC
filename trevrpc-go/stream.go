@@ -3,6 +3,7 @@ package trevrpc
 import (
 	"context"
 	"io"
+	"iter"
 	"sync"
 )
 
@@ -12,6 +13,24 @@ type MessageStream[T any] interface {
 	Recv() (T, error)
 	// Close releases stream resources and cancels any pending work.
 	Close() error
+}
+
+// Messages returns a single-use iterator over stream. It closes stream when
+// iteration ends, including when the loop exits early. Close errors are not
+// yielded; use Recv and Close directly when close errors must be observed.
+func Messages[T any](stream MessageStream[T]) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		defer stream.Close()
+		for {
+			message, err := stream.Recv()
+			if err == io.EOF {
+				return
+			}
+			if !yield(message, err) || err != nil {
+				return
+			}
+		}
+	}
 }
 
 // ByteStream is a stream of encoded protobuf message bodies.

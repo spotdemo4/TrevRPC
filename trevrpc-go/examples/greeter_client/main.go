@@ -57,11 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	for {
-		reply, err := replies.Recv()
-		if err == io.EOF {
-			break
-		}
+	for reply, err := range trevrpc.Messages(replies) {
 		if err != nil {
 			log.Fatal(err)
 		}

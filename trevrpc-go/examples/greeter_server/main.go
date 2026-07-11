@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"io"
 	"log"
 	"math/big"
 	"net"
@@ -53,11 +52,7 @@ func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloReq
 
 func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*greeter.HelloReply, error) {
 	var names []string
-	for {
-		request, err := requests.Recv()
-		if err == io.EOF {
-			break
-		}
+	for request, err := range trevrpc.Messages(requests) {
 		if err != nil {
 			return nil, err
 		}
