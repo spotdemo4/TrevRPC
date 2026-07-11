@@ -1,4 +1,4 @@
-package zip.trev.trevrpc.netty
+package zip.trev.trevrpc.netty.advanced
 
 import io.netty.buffer.ByteBuf
 import io.netty.channel.Channel
@@ -27,20 +27,32 @@ import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcStreamFrameKind
 import zip.trev.trevrpc.RpcTransport
-import zip.trev.trevrpc.RpcTransportConnection
-import zip.trev.trevrpc.RpcTransportLifecycle
 import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
+import zip.trev.trevrpc.netty.HTTP3_ALPN
+import zip.trev.trevrpc.netty.HTTP3_PATH
+import zip.trev.trevrpc.netty.IncrementalFrameReader
+import zip.trev.trevrpc.netty.NettyQuicClientConfig
+import zip.trev.trevrpc.netty.NettyRpcChannel
+import zip.trev.trevrpc.netty.NettyTransportOptions
+import zip.trev.trevrpc.netty.TREV_RPC_MEDIA_TYPE
+import zip.trev.trevrpc.netty.TrevRpcFrameWriter
+import zip.trev.trevrpc.netty.awaitCompletion
+import zip.trev.trevrpc.netty.awaitValue
+import zip.trev.trevrpc.netty.cancelBoth
+import zip.trev.trevrpc.netty.closeApplication
+import zip.trev.trevrpc.netty.isTrevRpcMediaType
+import zip.trev.trevrpc.netty.transportException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.channels.Channel as CoroutineChannel
 
-class NettyHttp3RpcTransport private constructor(
+/** Advanced single-connection HTTP/3 transport. Prefer [NettyRpcChannel.http3]. */
+class RawNettyHttp3RpcTransport private constructor(
     private val endpoint: ClientQuicEndpoint,
     private val config: NettyQuicClientConfig,
 ) : RpcTransport,
-    RpcTransportLifecycle,
     AutoCloseable {
     private val scope =
         CoroutineScope(
@@ -109,11 +121,9 @@ class NettyHttp3RpcTransport private constructor(
         endpoint.group.shutdownGracefully().awaitValue()
     }
 
-    override suspend fun awaitClosed() {
+    internal suspend fun awaitClosed() {
         endpoint.quicChannel.closeFuture().awaitCompletion()
     }
-
-    fun asManagedConnection(): RpcTransportConnection = RpcTransportConnection(this, this, ::shutdown)
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
@@ -148,15 +158,15 @@ class NettyHttp3RpcTransport private constructor(
     }
 
     companion object {
-        suspend fun connect(config: NettyQuicClientConfig): NettyHttp3RpcTransport {
+        suspend fun connect(config: NettyQuicClientConfig): RawNettyHttp3RpcTransport {
             val endpoint = connectQuic(config, HTTP3_ALPN, Http3ClientConnectionHandler())
-            return NettyHttp3RpcTransport(endpoint, config)
+            return RawNettyHttp3RpcTransport(endpoint, config)
         }
 
         internal fun fromEndpoint(
             endpoint: ClientQuicEndpoint,
             config: NettyQuicClientConfig,
-        ): NettyHttp3RpcTransport = NettyHttp3RpcTransport(endpoint, config)
+        ): RawNettyHttp3RpcTransport = RawNettyHttp3RpcTransport(endpoint, config)
     }
 }
 

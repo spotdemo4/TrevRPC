@@ -1,4 +1,4 @@
-package zip.trev.trevrpc
+package zip.trev.trevrpc.netty
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -7,14 +7,43 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Test
+import zip.trev.trevrpc.Code
+import zip.trev.trevrpc.RpcChannelState
+import zip.trev.trevrpc.RpcRequest
+import zip.trev.trevrpc.RpcResponse
+import zip.trev.trevrpc.RpcStreamFrame
+import zip.trev.trevrpc.RpcTransport
+import zip.trev.trevrpc.RpcTransportStream
+import zip.trev.trevrpc.Status
+import zip.trev.trevrpc.TrevRpcException
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class ReconnectingRpcTransportTest {
+class RpcChannelTest {
+    @Test
+    fun `calls fail fast during initial connection`() =
+        runTest {
+            val generation = TestGeneration()
+            val allowConnect = CompletableDeferred<Unit>()
+            val channel =
+                createNettyRpcChannel(backgroundScope, backoff = noJitter()) {
+                    allowConnect.await()
+                    generation.connection()
+                }
+
+            runCurrent()
+            assertEquals(RpcChannelState.CONNECTING, channel.state.value)
+            assertUnavailable { channel.unary(REQUEST) }
+
+            allowConnect.complete(Unit)
+            runCurrent()
+            channel.awaitReady()
+            channel.close()
+        }
+
     @Test
     fun `failed call is not replayed on the next generation`() =
         runTest {
@@ -25,24 +54,24 @@ class ReconnectingRpcTransportTest {
                 throw TrevRpcException(Status.unavailable("connection lost"))
             }
             val connections = ArrayDeque(listOf(first, second))
-            val managed =
-                ReconnectingRpcTransport(
+            val channel =
+                createNettyRpcChannel(
                     backgroundScope,
                     connector = { connections.removeFirst().connection() },
                     backoff = noJitter(),
                 )
 
             runCurrent()
-            assertEquals(1, managed.waitUntilReady())
-            assertUnavailable { managed.unary(REQUEST) }
+            channel.awaitReady()
+            assertUnavailable { channel.unary(REQUEST) }
             runCurrent()
 
             assertEquals(1, first.unaryCalls.get())
             assertEquals(0, second.unaryCalls.get())
-            assertEquals(2, managed.waitUntilReady())
-            assertEquals("second", managed.unary(REQUEST).body.decodeToString())
+            channel.awaitReady()
+            assertEquals("second", channel.unary(REQUEST).body.decodeToString())
             assertEquals(1, second.unaryCalls.get())
-            managed.close()
+            channel.close()
         }
 
     @Test
@@ -52,8 +81,8 @@ class ReconnectingRpcTransportTest {
             val second = TestGeneration(response = "ready")
             val allowReconnect = CompletableDeferred<Unit>()
             var connects = 0
-            val managed =
-                ReconnectingRpcTransport(
+            val channel =
+                createNettyRpcChannel(
                     backgroundScope,
                     connector = {
                         connects++
@@ -70,14 +99,14 @@ class ReconnectingRpcTransportTest {
             runCurrent()
             first.closed.complete(Unit)
             runCurrent()
-            assertInstanceOf(ReconnectingRpcTransportState.Reconnecting::class.java, managed.state.value)
+            assertEquals(RpcChannelState.CONNECTING, channel.state.value)
 
-            assertUnavailable { managed.unary(REQUEST) }
+            assertUnavailable { channel.unary(REQUEST) }
             assertEquals(0, second.unaryCalls.get())
             allowReconnect.complete(Unit)
             runCurrent()
-            assertEquals(2, managed.waitUntilReady())
-            managed.close()
+            channel.awaitReady()
+            channel.close()
         }
 
     @Test
@@ -86,23 +115,26 @@ class ReconnectingRpcTransportTest {
             val first = TestGeneration(response = "first")
             val second = TestGeneration(response = "second")
             val connections = ArrayDeque(listOf(first, second))
-            val managed =
-                ReconnectingRpcTransport(
+            val channel =
+                createNettyRpcChannel(
                     backgroundScope,
                     connector = { connections.removeFirst().connection() },
                     backoff = noJitter(),
                 )
 
             runCurrent()
-            assertEquals("first", managed.unary(REQUEST).body.decodeToString())
+            assertEquals("first", channel.unary(REQUEST).body.decodeToString())
             first.closed.complete(Unit)
             runCurrent()
 
-            assertEquals(2, managed.waitUntilReady())
-            assertEquals(2, managed.generation)
+            assertEquals(1, connections.size)
+            advanceTimeBy(1.milliseconds)
+            runCurrent()
+            channel.awaitReady()
+            assertEquals(0, connections.size)
             assertEquals(1, first.closeCalls.get())
-            assertEquals("second", managed.unary(REQUEST).body.decodeToString())
-            managed.close()
+            assertEquals("second", channel.unary(REQUEST).body.decodeToString())
+            channel.close()
         }
 
     @Test
@@ -110,8 +142,8 @@ class ReconnectingRpcTransportTest {
         runTest {
             val generation = TestGeneration()
             var connects = 0
-            val managed =
-                ReconnectingRpcTransport(
+            val channel =
+                createNettyRpcChannel(
                     backgroundScope,
                     connector = {
                         connects++
@@ -121,15 +153,15 @@ class ReconnectingRpcTransportTest {
                 )
 
             runCurrent()
-            managed.close()
-            managed.close()
+            channel.close()
+            channel.close()
             runCurrent()
 
-            assertInstanceOf(ReconnectingRpcTransportState.Closed::class.java, managed.state.value)
+            assertEquals(RpcChannelState.CLOSED, channel.state.value)
             assertEquals(1, generation.closeCalls.get())
             assertEquals(1, connects)
-            assertUnavailable { managed.unary(REQUEST) }
-            assertUnavailable { managed.waitUntilReady() }
+            assertUnavailable { channel.unary(REQUEST) }
+            assertUnavailable { channel.awaitReady() }
         }
 
     @Test
@@ -137,8 +169,8 @@ class ReconnectingRpcTransportTest {
         runTest {
             val generation = TestGeneration()
             var connects = 0
-            val managed =
-                ReconnectingRpcTransport(
+            val channel =
+                createNettyRpcChannel(
                     backgroundScope,
                     connector = {
                         connects++
@@ -146,7 +178,7 @@ class ReconnectingRpcTransportTest {
                         generation.connection()
                     },
                     backoff =
-                        ReconnectBackoff(
+                        NettyChannelBackoff(
                             initialDelay = 100.milliseconds,
                             maxDelay = 250.milliseconds,
                             multiplier = 2.0,
@@ -156,17 +188,17 @@ class ReconnectingRpcTransportTest {
 
             runCurrent()
             assertEquals(1, connects)
-            assertRetry(1, 100, managed)
+            assertEquals(RpcChannelState.CONNECTING, channel.state.value)
 
             advanceTimeBy(100.milliseconds)
             runCurrent()
             assertEquals(2, connects)
-            assertRetry(2, 200, managed)
+            assertEquals(RpcChannelState.CONNECTING, channel.state.value)
 
             advanceTimeBy(200.milliseconds)
             runCurrent()
             assertEquals(3, connects)
-            assertRetry(3, 250, managed)
+            assertEquals(RpcChannelState.CONNECTING, channel.state.value)
 
             advanceTimeBy(249.milliseconds)
             runCurrent()
@@ -174,28 +206,18 @@ class ReconnectingRpcTransportTest {
             advanceTimeBy(1.milliseconds)
             runCurrent()
             assertEquals(4, connects)
-            assertEquals(1, managed.waitUntilReady())
+            channel.awaitReady()
 
             val jittered =
-                ReconnectBackoff(
+                NettyChannelBackoff(
                     initialDelay = 100.milliseconds,
                     maxDelay = 1.seconds,
                     jitterRatio = 0.2,
                     random = { 1.0 },
                 ).delayForAttempt(1)
             assertEquals(120.milliseconds, jittered)
-            managed.close()
+            channel.close()
         }
-
-    private fun assertRetry(
-        attempts: Int,
-        delayMillis: Int,
-        managed: ReconnectingRpcTransport,
-    ) {
-        val state = assertInstanceOf(ReconnectingRpcTransportState.Connecting::class.java, managed.state.value)
-        assertEquals(attempts, state.failedAttempts)
-        assertEquals(delayMillis.milliseconds, state.retryDelay)
-    }
 
     private suspend fun assertUnavailable(block: suspend () -> Unit) {
         val error =
@@ -208,8 +230,8 @@ class ReconnectingRpcTransportTest {
         assertEquals(Code.UNAVAILABLE, error.status.code)
     }
 
-    private fun noJitter(): ReconnectBackoff =
-        ReconnectBackoff(
+    private fun noJitter(): NettyChannelBackoff =
+        NettyChannelBackoff(
             initialDelay = 1.milliseconds,
             maxDelay = 1.milliseconds,
             jitterRatio = 0.0,
@@ -246,10 +268,10 @@ private class TestGeneration(
                 }
         }
 
-    fun connection(): RpcTransportConnection =
-        RpcTransportConnection(
+    fun connection(): NettyChannelConnection =
+        NettyChannelConnection(
             transport = transport,
-            lifecycle = RpcTransportLifecycle { closed.await() },
+            awaitClosed = { closed.await() },
             closeTransport = {
                 closeCalls.incrementAndGet()
                 closed.complete(Unit)

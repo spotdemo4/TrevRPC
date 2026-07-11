@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.Code
 import zip.trev.trevrpc.FrameDecoder
+import zip.trev.trevrpc.RpcChannelState
 import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
@@ -30,6 +31,21 @@ import java.nio.ByteBuffer
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class Http3RpcTransportTest {
+    @Test
+    fun `provider channel is ready until explicitly closed`() =
+        runTest {
+            val channel = CronetChannel(Http3RpcTransport(FakeFactory(), coroutineContext = coroutineContext))
+
+            assertEquals(RpcChannelState.READY, channel.state.value)
+            channel.awaitReady()
+            channel.close()
+            channel.close()
+
+            assertEquals(RpcChannelState.CLOSED, channel.state.value)
+            val error = runCatching { channel.awaitReady() }.exceptionOrNull()
+            assertEquals(Code.UNAVAILABLE, (error as TrevRpcException).status.code)
+        }
+
     @Test
     fun `unary writes one request and decodes one response`() =
         runTest {

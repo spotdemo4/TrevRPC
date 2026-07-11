@@ -27,15 +27,19 @@ class ConfigurableH3InstrumentedTest {
                 .newInstance() as CronetEngineSupplier
         val executor = Executors.newSingleThreadExecutor()
         try {
-            val transport = CronetRpcTransport(supplier.engine(), endpoint!!, executor)
+            val channel = CronetRpcChannel.create(supplier.engine(), endpoint!!, executor)
             runBlocking {
-                Client(transport).unary(
-                    arguments.getString("trevrpcService") ?: "trevrpc.test.Echo",
-                    arguments.getString("trevrpcMethod") ?: "Echo",
-                    byteArrayOf(),
-                    MessageCodec.BYTE_ARRAY,
-                    MessageCodec.BYTE_ARRAY,
-                )
+                try {
+                    Client(channel).unary(
+                        arguments.getString("trevrpcService") ?: "trevrpc.test.Echo",
+                        arguments.getString("trevrpcMethod") ?: "Echo",
+                        byteArrayOf(),
+                        MessageCodec.BYTE_ARRAY,
+                        MessageCodec.BYTE_ARRAY,
+                    )
+                } finally {
+                    channel.close()
+                }
             }
         } finally {
             executor.shutdownNow()

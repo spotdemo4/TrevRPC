@@ -10,7 +10,10 @@ examples/build/install/trevrpc-xruntime-kotlin/bin/trevrpc-xruntime-kotlin \
 
 Client modes are `client` and `lifecycle-client`. Select `-transport native` (the default) or `-transport http3`; `-iterations` repeats the complete operation. `browser-server` adds the browser lifecycle routes and emits `READY https://<address>/trevrpc`. Browser admission can be set with `-browser-origin` and `-browser-authority`, or `TREVRPC_EXAMPLE_ORIGIN` and `TREVRPC_EXAMPLE_AUTHORITIES` (comma separated). `-max-streams` or `TREVRPC_EXAMPLE_MAX_STREAMS` configures the per-connection limit used by lifecycle tests. Without overrides, only `http://localhost:8080`, `http://127.0.0.1:8080`, and loopback authorities on the bound port are admitted.
 
-The public Netty client transport does not expose raw QUIC streams, so the executable does not send the Go harness's malformed initial frame. `GreeterServiceTest` separately verifies malformed request decoding. Adding that executable probe requires a safe public raw-frame test API in `transport-netty`, which is outside this module's edit boundary.
+The cross-runtime executable uses the advanced single-connection Netty transports so each harness
+iteration has a deterministic connection lifetime. It does not send the Go harness's malformed
+initial frame because the raw RPC transports intentionally do not expose arbitrary QUIC stream
+writes. `GreeterServiceTest` separately verifies malformed request decoding.
 
 ## Protobuf generation
 
@@ -52,8 +55,14 @@ class PlayServicesCronetProvider : CronetEngineProvider {
 
 val engine = provider.create(applicationContext)
 val executor = Executors.newSingleThreadExecutor()
-val transport = CronetRpcTransport(engine, "https://localhost:7443", executor)
-val client = GreeterClient(transport, authenticatedOptions("cross-runtime-token"))
+val channel = CronetRpcChannel.create(engine, "https://localhost:7443", executor)
+val client = GreeterClient(channel, authenticatedOptions("cross-runtime-token"))
 ```
 
-The application owns and shuts down both `CronetEngine` and the callback executor. Chromium's embedded provider and Google Play services Cronet have different update/availability tradeoffs; select explicitly in dependency injection rather than letting RPC code construct an engine.
+`channel.close()` prevents future TrevRPC calls but does not shut down the injected engine or
+executor. Cronet's provider owns connection pooling and reconnection; TrevRPC does not present those
+pooled connections as channel generations. The channel is ready to submit calls immediately, so
+its readiness does not describe the provider's network pool. The application owns and shuts down
+both `CronetEngine` and the callback executor. Chromium's embedded provider and Google Play services
+Cronet have different update/availability tradeoffs; select explicitly in dependency injection
+rather than letting RPC code construct an engine.

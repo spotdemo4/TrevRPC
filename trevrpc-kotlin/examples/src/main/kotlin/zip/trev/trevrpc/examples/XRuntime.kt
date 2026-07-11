@@ -11,13 +11,13 @@ import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.examples.greeter.GreeterClient
 import zip.trev.trevrpc.netty.Http3Admission
 import zip.trev.trevrpc.netty.NettyClientTls
-import zip.trev.trevrpc.netty.NettyHttp3RpcTransport
 import zip.trev.trevrpc.netty.NettyQuicClientConfig
-import zip.trev.trevrpc.netty.NettyQuicRpcTransport
 import zip.trev.trevrpc.netty.NettyRpcServer
 import zip.trev.trevrpc.netty.NettyRpcServerConfig
 import zip.trev.trevrpc.netty.NettyServerTls
 import zip.trev.trevrpc.netty.WebTransportAdmission
+import zip.trev.trevrpc.netty.advanced.RawNettyHttp3RpcTransport
+import zip.trev.trevrpc.netty.advanced.RawNettyQuicRpcTransport
 import java.net.InetSocketAddress
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicBoolean
@@ -260,12 +260,12 @@ private suspend fun connect(options: CliOptions): ClientConnection {
         )
     return when (options.transport) {
         ClientTransport.NATIVE -> {
-            val transport = NettyQuicRpcTransport.connect(config)
+            val transport = RawNettyQuicRpcTransport.connect(config)
             ClientConnection(transport, transport::shutdown)
         }
 
         ClientTransport.HTTP3 -> {
-            val transport = NettyHttp3RpcTransport.connect(config)
+            val transport = RawNettyHttp3RpcTransport.connect(config)
             ClientConnection(transport, transport::shutdown)
         }
     }

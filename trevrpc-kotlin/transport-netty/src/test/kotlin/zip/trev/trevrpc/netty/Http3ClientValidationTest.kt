@@ -6,6 +6,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.TrevRpcException
+import zip.trev.trevrpc.netty.advanced.Http3FrameInbox
 
 class Http3ClientValidationTest {
     @Test

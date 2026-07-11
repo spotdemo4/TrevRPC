@@ -37,6 +37,10 @@ import zip.trev.trevrpc.ServerStreamingHandler
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.UnaryHandler
 import zip.trev.trevrpc.WireCodec
+import zip.trev.trevrpc.netty.advanced.RawFrameInbox
+import zip.trev.trevrpc.netty.advanced.RawNettyHttp3RpcTransport
+import zip.trev.trevrpc.netty.advanced.RawNettyQuicRpcTransport
+import zip.trev.trevrpc.netty.advanced.connectQuic
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
@@ -69,13 +73,13 @@ class NettyIntegrationTest {
                         remoteAddress = transportServer.localAddress,
                         tls = NettyClientTls("localhost", trustCertificates = listOf(certificate.cert())),
                     )
-                val native = NettyQuicRpcTransport.connect(config)
+                val native = RawNettyQuicRpcTransport.connect(config)
                 try {
                     exercise(native)
                 } finally {
                     native.shutdown()
                 }
-                val h3 = NettyHttp3RpcTransport.connect(config)
+                val h3 = RawNettyHttp3RpcTransport.connect(config)
                 try {
                     exercise(h3)
                 } finally {
@@ -221,7 +225,7 @@ class NettyIntegrationTest {
         assertEquals(listOf<Byte>(10, 1), rawResponse.body.toList())
         rawStream.close().awaitCompletion()
 
-        val concurrentHttp3 = NettyHttp3RpcTransport.fromEndpoint(endpoint, config)
+        val concurrentHttp3 = RawNettyHttp3RpcTransport.fromEndpoint(endpoint, config)
         try {
             val client = Client(concurrentHttp3)
             assertEquals(
@@ -305,8 +309,8 @@ class NettyIntegrationTest {
     private suspend fun connectNative(
         server: NettyRpcServer,
         certificate: SelfSignedCertificate,
-    ): NettyQuicRpcTransport =
-        NettyQuicRpcTransport.connect(
+    ): RawNettyQuicRpcTransport =
+        RawNettyQuicRpcTransport.connect(
             NettyQuicClientConfig(
                 remoteAddress = server.localAddress,
                 tls = NettyClientTls("localhost", trustCertificates = listOf(certificate.cert())),

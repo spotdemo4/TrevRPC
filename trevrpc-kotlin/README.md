@@ -1,20 +1,32 @@
 # trevrpc-kotlin
 
-TrevRPC's Kotlin implementation provides the core RPC runtime, Netty and Cronet transports, and a
-protobuf code generator. The examples below use the generated Greeter API from
+TrevRPC's Kotlin implementation provides the core RPC runtime, Netty and Cronet channel providers,
+and a protobuf code generator. The examples below use the generated Greeter API from
 [`examples/src/main/proto/greeter.proto`](examples/src/main/proto/greeter.proto), which defines
 unary, server-streaming, client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-Create a generated client from a connected `RpcTransport`:
+Create one application `RpcChannel`, wait for initial readiness, and pass it to generated clients:
 
 ```kotlin
 import kotlinx.coroutines.flow.flowOf
 import zip.trev.trevrpc.examples.greeter.GreeterClient
 import zip.trev.trevrpc.examples.greeter.HelloRequest
+import zip.trev.trevrpc.netty.NettyClientTls
+import zip.trev.trevrpc.netty.NettyQuicClientConfig
+import zip.trev.trevrpc.netty.NettyRpcChannel
+import java.net.InetSocketAddress
 
-val client = GreeterClient(transport)
+val channel =
+    NettyRpcChannel.nativeQuic(
+        NettyQuicClientConfig(
+            remoteAddress = InetSocketAddress("rpc.example.com", 7443),
+            tls = NettyClientTls("rpc.example.com"),
+        ),
+    )
+channel.awaitReady()
+val client = GreeterClient(channel)
 
 fun request(name: String): HelloRequest =
     HelloRequest
@@ -23,7 +35,18 @@ fun request(name: String): HelloRequest =
         .build()
 ```
 
-The [examples guide](examples/README.md) shows Netty and Android Cronet transport setup.
+Use `NettyRpcChannel.http3(config)` for ordinary HTTP/3. Netty channels reconnect future calls after
+a connection closes. Calls fail fast while the channel is connecting, and an interrupted call is
+never retried or replayed. Channels do not use 0-RTT. Observe `channel.state`, use `awaitReady()`
+when readiness is required, and call `channel.close()` when the application is done.
+
+`RpcTransport` remains the generated-client and test integration SPI. Applications should use an
+`RpcChannel` factory rather than assembling transport lifecycle components. Deterministic tests,
+benchmarks, and cross-runtime harnesses can explicitly own one connection with
+`RawNettyQuicRpcTransport` or `RawNettyHttp3RpcTransport` from
+`zip.trev.trevrpc.netty.advanced`, then call `shutdown()` when finished.
+
+The [examples guide](examples/README.md) also shows Android Cronet channel setup.
 
 ### Unary
 

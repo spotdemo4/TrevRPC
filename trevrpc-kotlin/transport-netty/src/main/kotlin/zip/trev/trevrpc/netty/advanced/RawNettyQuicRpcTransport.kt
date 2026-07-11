@@ -1,4 +1,4 @@
-package zip.trev.trevrpc.netty
+package zip.trev.trevrpc.netty.advanced
 
 import io.netty.bootstrap.Bootstrap
 import io.netty.buffer.ByteBuf
@@ -32,23 +32,34 @@ import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcStreamFrameKind
 import zip.trev.trevrpc.RpcTransport
-import zip.trev.trevrpc.RpcTransportConnection
-import zip.trev.trevrpc.RpcTransportLifecycle
 import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.WireCodec
+import zip.trev.trevrpc.netty.HTTP3_ALPN
+import zip.trev.trevrpc.netty.NettyQuicClientConfig
+import zip.trev.trevrpc.netty.NettyRpcChannel
+import zip.trev.trevrpc.netty.NettyTransportOptions
+import zip.trev.trevrpc.netty.TrevRpcFrameDecoder
+import zip.trev.trevrpc.netty.TrevRpcFrameWriter
+import zip.trev.trevrpc.netty.awaitChannel
+import zip.trev.trevrpc.netty.awaitCompletion
+import zip.trev.trevrpc.netty.awaitValue
+import zip.trev.trevrpc.netty.cancelBoth
+import zip.trev.trevrpc.netty.closeApplication
+import zip.trev.trevrpc.netty.copyReadableBytes
+import zip.trev.trevrpc.netty.transportException
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.channels.Channel as CoroutineChannel
 
-class NettyQuicRpcTransport private constructor(
+/** Advanced single-connection native QUIC transport. Prefer [NettyRpcChannel.nativeQuic]. */
+class RawNettyQuicRpcTransport private constructor(
     private val group: EventLoopGroup,
     private val datagramChannel: Channel,
     private val quicChannel: QuicChannel,
     private val options: NettyTransportOptions,
     private val dispatcher: CoroutineDispatcher,
 ) : RpcTransport,
-    RpcTransportLifecycle,
     AutoCloseable {
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val closed = AtomicBoolean(false)
@@ -107,11 +118,9 @@ class NettyQuicRpcTransport private constructor(
         group.shutdownGracefully().awaitValue()
     }
 
-    override suspend fun awaitClosed() {
+    internal suspend fun awaitClosed() {
         quicChannel.closeFuture().awaitCompletion()
     }
-
-    fun asManagedConnection(): RpcTransportConnection = RpcTransportConnection(this, this, ::shutdown)
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
@@ -136,10 +145,10 @@ class NettyQuicRpcTransport private constructor(
     }
 
     companion object {
-        suspend fun connect(config: NettyQuicClientConfig): NettyQuicRpcTransport {
+        suspend fun connect(config: NettyQuicClientConfig): RawNettyQuicRpcTransport {
             val dispatcher = Dispatchers.IO.limitedParallelism(config.options.workerParallelism)
             val endpoint = connectQuic(config, zip.trev.trevrpc.ALPN, ChannelInboundHandlerAdapter())
-            return NettyQuicRpcTransport(
+            return RawNettyQuicRpcTransport(
                 endpoint.group,
                 endpoint.datagramChannel,
                 endpoint.quicChannel,

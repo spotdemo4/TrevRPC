@@ -2,40 +2,78 @@ package zip.trev.trevrpc.cronet
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.chromium.net.BidirectionalStream
 import org.chromium.net.CronetEngine
 import org.chromium.net.CronetException
 import org.chromium.net.UrlResponseInfo
+import zip.trev.trevrpc.RpcChannel
+import zip.trev.trevrpc.RpcChannelState
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcTransport
 import zip.trev.trevrpc.RpcTransportStream
+import zip.trev.trevrpc.Status
+import zip.trev.trevrpc.TrevRpcException
 import java.net.URI
 import java.nio.ByteBuffer
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.CoroutineContext
 
-/** Android Cronet HTTP/3 transport. The caller owns both [engine] and [callbackExecutor]. */
-class CronetRpcTransport(
-    engine: CronetEngine,
-    origin: String,
-    callbackExecutor: Executor,
-    options: CronetTransportOptions = CronetTransportOptions(),
-    coroutineContext: CoroutineContext = Dispatchers.IO,
-) : RpcTransport {
-    private val delegate =
-        Http3RpcTransport(
-            CronetDuplexStreamFactory(engine, rpcUrl(origin), callbackExecutor),
-            options,
-            coroutineContext,
+/**
+ * Android Cronet channel factory. Cronet owns connection pooling and reconnection; the caller owns
+ * the engine and callback executor, including shutting them down.
+ */
+object CronetRpcChannel {
+    fun create(
+        engine: CronetEngine,
+        origin: String,
+        callbackExecutor: Executor,
+        options: CronetTransportOptions = CronetTransportOptions(),
+        coroutineContext: CoroutineContext = Dispatchers.IO,
+    ): RpcChannel =
+        CronetChannel(
+            Http3RpcTransport(
+                CronetDuplexStreamFactory(engine, rpcUrl(origin), callbackExecutor),
+                options,
+                coroutineContext,
+            ),
         )
+}
 
-    override suspend fun unary(request: RpcRequest): RpcResponse = delegate.unary(request)
+internal class CronetChannel(
+    private val delegate: RpcTransport,
+) : RpcChannel {
+    private val closed = AtomicBoolean(false)
+    private val mutableState = MutableStateFlow(RpcChannelState.READY)
+
+    override val state: StateFlow<RpcChannelState> = mutableState.asStateFlow()
+
+    override suspend fun unary(request: RpcRequest): RpcResponse {
+        checkOpen()
+        return delegate.unary(request)
+    }
 
     override suspend fun openStream(
         request: RpcRequest,
         requestBody: Flow<ByteArray>,
-    ): RpcTransportStream = delegate.openStream(request, requestBody)
+    ): RpcTransportStream {
+        checkOpen()
+        return delegate.openStream(request, requestBody)
+    }
+
+    override suspend fun awaitReady() = checkOpen()
+
+    override suspend fun close() {
+        if (closed.compareAndSet(false, true)) mutableState.value = RpcChannelState.CLOSED
+    }
+
+    private fun checkOpen() {
+        if (closed.get()) throw TrevRpcException(Status.unavailable("RPC channel is closed"))
+    }
 }
 
 private class CronetDuplexStreamFactory(
