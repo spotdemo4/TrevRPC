@@ -1,23 +1,17 @@
-import { unavailable } from "./status.js";
+import { cancelled, deadlineExceeded, unavailable } from "./status.js";
 
-const ReconnectOptionKeys = new Set([
-  "onStateChange",
-  "reconnectInitialDelayMs",
-  "reconnectJitter",
-  "reconnectMaxDelayMs",
-  "reconnectMultiplier",
-]);
+const ChannelOptionKeys = new Set(["onStateChange", "signal", "timeoutMs"]);
 
-const DefaultReconnectOptions = Object.freeze({
-  reconnectInitialDelayMs: 100,
-  reconnectMaxDelayMs: 30_000,
-  reconnectMultiplier: 2,
-  reconnectJitter: 0.2,
+const DefaultChannelOptions = Object.freeze({
+  initialDelayMs: 100,
+  maxDelayMs: 30_000,
+  multiplier: 2,
+  jitter: 0.2,
 });
 const MaxTimerDelayMs = 2_147_483_647;
 
-/** Shared state machine for managed transports. */
-export class ReconnectingTransport extends EventTarget {
+/** Shared state machine for reconnecting channels. */
+export class ChannelStateMachine extends EventTarget {
   #connect;
   #connectAbort = null;
   #generation = 0;
@@ -35,7 +29,7 @@ export class ReconnectingTransport extends EventTarget {
     this.#observeClosed = observeClosed;
     this.#isConnectionFailure = isConnectionFailure;
     this.#onStateChange = options.onStateChange;
-    this.#options = normalizeReconnectOptions(options);
+    this.#options = normalizeChannelOptions(options);
     queueMicrotask(() => this.#runConnectLoop(false));
   }
 
@@ -44,7 +38,7 @@ export class ReconnectingTransport extends EventTarget {
     return this.#state === "ready";
   }
 
-  /** Reports the managed connection lifecycle state. */
+  /** Reports the channel lifecycle state. */
   get state() {
     return this.#state;
   }
@@ -60,7 +54,7 @@ export class ReconnectingTransport extends EventTarget {
       return Promise.resolve();
     }
     if (this.#state === "closed") {
-      return Promise.reject(unavailable("managed transport is closed"));
+      return Promise.reject(unavailable("channel is closed"));
     }
 
     return new Promise((resolve, reject) => {
@@ -102,13 +96,13 @@ export class ReconnectingTransport extends EventTarget {
     this.#connectAbort?.abort();
     this.#connectAbort = null;
     this.#transition("closed");
-    this.#rejectWaiters(unavailable("managed transport is closed"));
+    this.#rejectWaiters(unavailable("channel is closed"));
     safeClose(transport, closeInfo);
   }
 
   #readyTransport() {
     if (!this.ready || this.#transport == null) {
-      throw unavailable(`managed transport is ${this.#state}`);
+      throw unavailable(`channel is ${this.#state}`);
     }
     return this.#transport;
   }
@@ -230,48 +224,79 @@ export class ReconnectingTransport extends EventTarget {
   }
 }
 
-/** Returns connection options with managed reconnect settings removed. */
-export function stripReconnectOptions(options = {}) {
-  return Object.fromEntries(
-    Object.entries(options).filter(([key]) => !ReconnectOptionKeys.has(key)),
-  );
+/** Returns transport options with channel lifecycle settings removed. */
+export function stripChannelOptions(options = {}) {
+  return Object.fromEntries(Object.entries(options).filter(([key]) => !ChannelOptionKeys.has(key)));
 }
 
-function normalizeReconnectOptions(options) {
-  const normalized = {
-    reconnectInitialDelayMs:
-      options.reconnectInitialDelayMs ?? DefaultReconnectOptions.reconnectInitialDelayMs,
-    reconnectMaxDelayMs: options.reconnectMaxDelayMs ?? DefaultReconnectOptions.reconnectMaxDelayMs,
-    reconnectMultiplier: options.reconnectMultiplier ?? DefaultReconnectOptions.reconnectMultiplier,
-    reconnectJitter: options.reconnectJitter ?? DefaultReconnectOptions.reconnectJitter,
-  };
+/** Waits for initial readiness with caller-controlled cancellation and deadline. */
+export async function waitForInitialReady(channel, options = {}) {
+  const timeoutMs = options.timeoutMs;
+  if (timeoutMs != null && (!Number.isFinite(timeoutMs) || timeoutMs < 0)) {
+    channel.close();
+    throw new TypeError("timeoutMs must be a non-negative finite number");
+  }
 
-  finiteNonnegative(normalized.reconnectInitialDelayMs, "reconnectInitialDelayMs");
-  finiteNonnegative(normalized.reconnectMaxDelayMs, "reconnectMaxDelayMs");
-  if (!Number.isFinite(normalized.reconnectMultiplier) || normalized.reconnectMultiplier < 1) {
-    throw new TypeError("reconnectMultiplier must be a finite number greater than or equal to one");
+  const signal = options.signal;
+  if (signal?.aborted) {
+    channel.close();
+    throw initialAbortError(signal);
   }
-  if (
-    !Number.isFinite(normalized.reconnectJitter) ||
-    normalized.reconnectJitter < 0 ||
-    normalized.reconnectJitter > 1
-  ) {
-    throw new TypeError("reconnectJitter must be a finite number between zero and one");
+  if (timeoutMs === 0) {
+    channel.close();
+    throw deadlineExceeded("initial connection deadline exceeded");
   }
-  return normalized;
+
+  const timeoutAbort = timeoutMs == null ? null : new AbortController();
+  let removeAbort = () => {};
+  try {
+    const waits = [channel.waitUntilReady()];
+    if (signal != null) {
+      waits.push(
+        new Promise((_, reject) => {
+          const rejectCancelled = () => reject(initialAbortError(signal));
+          if (signal.aborted) {
+            rejectCancelled();
+            return;
+          }
+          signal.addEventListener("abort", rejectCancelled, { once: true });
+          removeAbort = () => signal.removeEventListener("abort", rejectCancelled);
+        }),
+      );
+    }
+    if (timeoutMs != null) {
+      waits.push(
+        waitForDelay(timeoutMs, timeoutAbort.signal).then(() => {
+          throw deadlineExceeded("initial connection deadline exceeded");
+        }),
+      );
+    }
+    await Promise.race(waits);
+  } catch (error) {
+    channel.close();
+    throw error;
+  } finally {
+    timeoutAbort?.abort();
+    removeAbort();
+  }
 }
 
-function finiteNonnegative(value, name) {
-  if (!Number.isFinite(value) || value < 0) {
-    throw new TypeError(`${name} must be a non-negative finite number`);
-  }
+function normalizeChannelOptions(options) {
+  void options;
+  return DefaultChannelOptions;
+}
+
+function initialAbortError(signal) {
+  return signal.reason?.name === "TrevRpcError"
+    ? signal.reason
+    : cancelled("initial connection cancelled");
 }
 
 function reconnectDelay(options, exponent) {
-  const exponential = options.reconnectInitialDelayMs * options.reconnectMultiplier ** exponent;
-  const base = Math.min(options.reconnectMaxDelayMs, exponential);
-  const jitter = 1 + (Math.random() * 2 - 1) * options.reconnectJitter;
-  return Math.min(options.reconnectMaxDelayMs, Math.max(0, base * jitter));
+  const exponential = options.initialDelayMs * options.multiplier ** exponent;
+  const base = Math.min(options.maxDelayMs, exponential);
+  const jitter = 1 + (Math.random() * 2 - 1) * options.jitter;
+  return Math.min(options.maxDelayMs, Math.max(0, base * jitter));
 }
 
 async function waitForDelay(delayMs, signal) {

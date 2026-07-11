@@ -1,19 +1,16 @@
-import {
-  Code,
-  ReconnectingWebTransportClient,
-  connect,
-  createRoot,
-  normalizeMetadata,
-  unary,
-} from "../../src/index.js";
+import { Channel as RootNodeChannel, connect as connectNode } from "trevrpc-js";
+import { RawWebTransport } from "trevrpc-js/advanced";
+import { Channel as NodeChannel } from "trevrpc-js/node";
+import type { NodeListenOptions } from "trevrpc-js/node";
+import { RawNodeTransport } from "trevrpc-js/node/advanced";
+
+import { Channel, Code, connect, createRoot, normalizeMetadata, unary } from "../../src/index.js";
 import type {
   RpcRequestMessage,
   RpcResponseMessage,
   RpcStreamFrameMessage,
   Transport,
 } from "../../src/index.js";
-import type { NodeListenOptions } from "../../src/node.js";
-import { ReconnectingNodeTransport } from "../../src/node.js";
 
 interface HelloMessage {
   value?: string;
@@ -68,23 +65,33 @@ const connected = await connect("https://localhost:50051/trevrpc", {
 });
 connected.close();
 
-const reconnecting = new ReconnectingWebTransportClient("https://localhost:50051/trevrpc", {
-  reconnectMaxDelayMs: 5_000,
+const channel = new Channel("https://localhost:50051/trevrpc", {
   onStateChange(event) {
     event.state satisfies "connecting" | "ready" | "reconnecting" | "closed";
   },
 });
-await reconnecting.waitUntilReady();
-reconnecting.generation.toFixed();
-reconnecting.close();
+await channel.waitUntilReady();
+channel.generation.toFixed();
+channel.close();
 
-const reconnectingNode = new ReconnectingNodeTransport({
+const nodeChannel = new NodeChannel({
   host: "127.0.0.1",
   port: 50051,
-  reconnectJitter: 0,
 });
-reconnectingNode.ready satisfies boolean;
-reconnectingNode.close();
+nodeChannel.ready satisfies boolean;
+nodeChannel.close();
+
+const rootNodeChannel = await connectNode({
+  host: "127.0.0.1",
+  port: 50051,
+  timeoutMs: 5_000,
+});
+rootNodeChannel satisfies RootNodeChannel;
+rootNodeChannel.close();
+
+const rawBrowser = new RawWebTransport({ ready: Promise.resolve() });
+rawBrowser.close();
+void RawNodeTransport.connect;
 
 const nodeListenOptions: NodeListenOptions = {
   host: "127.0.0.1",

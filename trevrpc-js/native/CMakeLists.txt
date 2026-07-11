@@ -39,7 +39,7 @@ add_subdirectory("${TREVRPC_C_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/trevrpc-c" EXC
 add_library(trevrpc_native MODULE
     trevrpc_node.c
 )
-target_include_directories(trevrpc_native PRIVATE "${NODE_INCLUDE_DIR}")
+target_include_directories(trevrpc_native PRIVATE "${NODE_INCLUDE_DIR}" "${TREVRPC_C_ROOT}/src")
 target_link_libraries(trevrpc_native PRIVATE trevrpc)
 if(TREVRPC_NODE_TEST_HOOKS)
     target_compile_definitions(trevrpc_native PRIVATE TREVRPC_NODE_TEST_HOOKS=1)

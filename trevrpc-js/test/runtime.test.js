@@ -7,8 +7,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { RawWebTransport } from "trevrpc-js/advanced";
+
 import { generate as generateBindings } from "../src/generator.js";
 import {
+  Channel,
   Code,
   FrameReader,
   FrameTooLargeError,
@@ -21,7 +24,6 @@ import {
   RpcResponse,
   RpcStreamFrame,
   RpcStreamFrameKind,
-  WebTransportClient,
   WireVersion,
   bidirectionalStreaming,
   clientStreaming,
@@ -70,16 +72,34 @@ test("frames round-trip TrevRPC requests", () => {
 });
 
 test("Node native transport subpath exports without loading the addon", async () => {
-  const { NodeServer, NodeServerCall, NodeTransport, ReconnectingNodeTransport } =
-    await import("../src/node.js");
+  const node = await import("../src/node-index.js");
+  const advanced = await import("trevrpc-js/node/advanced");
 
-  assert.equal(typeof NodeTransport, "function");
-  assert.equal(typeof NodeTransport.connect, "function");
-  assert.equal(typeof ReconnectingNodeTransport, "function");
-  assert.equal(typeof ReconnectingNodeTransport.connect, "function");
-  assert.equal(typeof NodeServer, "function");
-  assert.equal(typeof NodeServer.listen, "function");
-  assert.equal(typeof NodeServerCall, "function");
+  assert.equal(typeof node.Channel, "function");
+  assert.equal(typeof node.Channel.connect, "function");
+  assert.equal(typeof node.NodeServer, "function");
+  assert.equal(typeof node.NodeServer.listen, "function");
+  assert.equal(typeof node.NodeServerCall, "function");
+  assert.equal(node.RawNodeTransport, undefined);
+  assert.equal(typeof advanced.RawNodeTransport, "function");
+  assert.equal(typeof advanced.RawNodeTransport.connect, "function");
+});
+
+test("package entry points separate channels and raw transports", async () => {
+  const root = await import("trevrpc-js");
+  const node = await import("trevrpc-js/node");
+  const browserAdvanced = await import("trevrpc-js/advanced");
+  const nodeAdvanced = await import("trevrpc-js/node/advanced");
+
+  assert.equal(typeof root.connect, "function");
+  assert.equal(typeof root.Channel, "function");
+  assert.equal(typeof node.Channel, "function");
+  assert.equal(root.Channel, node.Channel);
+  assert.equal(root.RawWebTransport, undefined);
+  assert.equal(root.RawNodeTransport, undefined);
+  assert.equal(node.RawNodeTransport, undefined);
+  assert.equal(typeof browserAdvanced.RawWebTransport, "function");
+  assert.equal(typeof nodeAdvanced.RawNodeTransport, "function");
 });
 
 test("browser root connect flattens browser WebTransport options", async () => {
@@ -103,7 +123,7 @@ test("browser root connect flattens browser WebTransport options", async () => {
     serverCertificateHashes: [certificateHash],
   });
 
-  assert.ok(transport instanceof WebTransportClient);
+  assert.ok(transport instanceof Channel);
   assert.equal(observed.url, "https://example.test/trevrpc");
   assert.deepEqual(observed.options, {
     allowPooling: true,
@@ -118,13 +138,13 @@ test("browser root connect flattens browser WebTransport options", async () => {
 
 test("browser WebTransport connect reports unsupported runtime", async () => {
   await assert.rejects(
-    WebTransportClient.connect("https://example.test/trevrpc", { WebTransport: {} }),
+    RawWebTransport.connect("https://example.test/trevrpc", { WebTransport: {} }),
     (error) => error.code === Code.Unavailable,
   );
 });
 
 test("browser WebTransport stream open reports unsupported bidirectional streams", async () => {
-  const client = new WebTransportClient({ ready: Promise.resolve() });
+  const client = new RawWebTransport({ ready: Promise.resolve() });
 
   await assert.rejects(
     client.openBidirectionalStream(),
@@ -133,7 +153,7 @@ test("browser WebTransport stream open reports unsupported bidirectional streams
 });
 
 test("Node transport forwards metadata, version, and timeout to native client", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   const metadata = { authorization: new Uint8Array([1, 2, 3]) };
   let unaryRequest;
   let streamRequest;
@@ -165,7 +185,7 @@ test("Node transport forwards metadata, version, and timeout to native client", 
       };
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
 
   const unaryResponse = await transport.call({
     service: "hello.v1.Greeter",
@@ -206,7 +226,7 @@ test("Node transport forwards metadata, version, and timeout to native client", 
 });
 
 test("Node transport aborts native unary calls without closing the client", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   let cancellation;
   let clientClosed = false;
   let callCancellation;
@@ -231,7 +251,7 @@ test("Node transport aborts native unary calls without closing the client", asyn
       clientClosed = true;
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
   const controller = new AbortController();
   const call = transport.call(
     {
@@ -254,7 +274,7 @@ test("Node transport aborts native unary calls without closing the client", asyn
 });
 
 test("Node transport aborts native stream setup and established streams", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   let setupCancellation;
   let nativeStream;
   let setupCancelled;
@@ -280,7 +300,7 @@ test("Node transport aborts native stream setup and established streams", async 
       throw new Error("unexpected setup completion");
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
   const setupController = new AbortController();
   const setup = transport.streamingCall(
     {
@@ -322,7 +342,7 @@ test("Node transport aborts native stream setup and established streams", async 
       return nativeStream;
     },
   };
-  const established = await new NodeTransport(establishedClient).streamingCall(
+  const established = await new RawNodeTransport(establishedClient).streamingCall(
     {
       service: "hello.v1.Greeter",
       method: "LotsOfReplies",
@@ -532,7 +552,7 @@ test("WebTransport malformed protobuf response frame maps to invalid argument", 
   const stream = fakeBidirectionalStream({
     readableChunks: [new Uint8Array([0, 0, 0, 2, 0xff, 0xff])],
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return Promise.resolve(stream);
@@ -575,7 +595,7 @@ test("WebTransport unary reads response before upload close settles", async () =
       ),
     ],
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return Promise.resolve(stream);
@@ -605,7 +625,7 @@ test("WebTransport writes request body batches", async () => {
       writes.push(chunk);
     },
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return Promise.resolve(stream);
@@ -657,7 +677,7 @@ test("WebTransport splits request body batches at the fixed byte limit", async (
       writes.push(chunk);
     },
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return Promise.resolve(stream);
@@ -711,7 +731,7 @@ test("WebTransport response frame queue drains messages before terminal status",
       concatBytes([encodeMessageStreamFrames(bodies), encodeFrame(RpcStreamFrame, status)]),
     ],
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return Promise.resolve(stream);
@@ -968,7 +988,7 @@ test("request streams expose sendMany batches", async () => {
 });
 
 test("Node transport writes request body batches with native sendMessages", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   const sentBatches = [];
   let finishSend;
   const finishDone = new Promise((resolve) => {
@@ -994,7 +1014,7 @@ test("Node transport writes request body batches with native sendMessages", asyn
       };
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
 
   const responses = await transport.streamingCall(
     {
@@ -1013,7 +1033,7 @@ test("Node transport writes request body batches with native sendMessages", asyn
 });
 
 test("Node transport uses native unary and stream send methods", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   const used = [];
   const makeStream = () => {
     let finished = false;
@@ -1049,7 +1069,7 @@ test("Node transport uses native unary and stream send methods", async () => {
       return Promise.resolve(makeStream());
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
 
   await transport.call({ service: "svc", method: "copy", body: new Uint8Array([1]) });
   await transport.call({ service: "svc", method: "second", body: new Uint8Array([2]) });
@@ -1075,7 +1095,7 @@ test("Node transport uses native unary and stream send methods", async () => {
 });
 
 test("Node transport reads native response body batches and delays terminal status", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   const status = RpcStreamFrame.create({
     kind: RpcStreamFrameKind.Status,
     status: Code.Ok,
@@ -1111,7 +1131,7 @@ test("Node transport reads native response body batches and delays terminal stat
       };
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
 
   const responses = await transport.streamingCall(
     {
@@ -1145,7 +1165,7 @@ test("Node transport reads native response body batches and delays terminal stat
 });
 
 test("Node transport terminal OK reports already-settled local upload errors", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   const uploadError = invalidArgument("local upload failed");
   let sendAttempted;
   const sendAttemptedDone = new Promise((resolve) => {
@@ -1169,7 +1189,7 @@ test("Node transport terminal OK reports already-settled local upload errors", a
       };
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
   const responses = await transport.streamingCall(
     {
       service: "hello.v1.Greeter",
@@ -1187,7 +1207,7 @@ test("Node transport terminal OK reports already-settled local upload errors", a
 });
 
 test("Node transport terminal error wins over local upload errors", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   const uploadError = invalidArgument("local upload failed");
   let closeCalls = 0;
   let closed = false;
@@ -1222,7 +1242,7 @@ test("Node transport terminal error wins over local upload errors", async () => 
       };
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
   const responses = await transport.streamingCall(
     {
       service: "hello.v1.Greeter",
@@ -1240,7 +1260,7 @@ test("Node transport terminal error wins over local upload errors", async () => 
 });
 
 test("Node transport return cleans up partial streams with a pending native receive", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   let closeCalls = 0;
   let resolvePendingRecv;
   const nativeClient = {
@@ -1264,7 +1284,7 @@ test("Node transport return cleans up partial streams with a pending native rece
       };
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
   const responses = await transport.streamingCall(
     {
       service: "hello.v1.Greeter",
@@ -1288,7 +1308,7 @@ test("Node transport return cleans up partial streams with a pending native rece
 });
 
 test("Node transport native response body batches delay EOF until queued bodies drain", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   const Hello = helloTestType();
   let recvBodyBatchCalls = 0;
   const nativeClient = {
@@ -1307,7 +1327,7 @@ test("Node transport native response body batches delay EOF until queued bodies 
       };
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
 
   const stream = await serverStreaming(
     transport,
@@ -1630,7 +1650,7 @@ test("unary without signal or deadline leaves transport abort signal unset", asy
 });
 
 test("Node transport skips native cancellation without signal", async () => {
-  const { NodeTransport } = await import("../src/node.js");
+  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   let cancellationCalls = 0;
   let callArgumentCount = 0;
   let startStreamArgumentCount = 0;
@@ -1661,7 +1681,7 @@ test("Node transport skips native cancellation without signal", async () => {
       };
     },
   };
-  const transport = new NodeTransport(nativeClient);
+  const transport = new RawNodeTransport(nativeClient);
 
   await transport.call({
     service: "hello.v1.Greeter",
@@ -1975,7 +1995,7 @@ test("WebTransport timeout cleans up stream opened after abort", async () => {
       cancelDone();
     },
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return new Promise((resolve) => {
@@ -2027,7 +2047,7 @@ test("WebTransport terminal OK does not hide local upload error", async () => {
       ),
     ],
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return Promise.resolve(stream);
@@ -2097,7 +2117,7 @@ test("WebTransport terminal OK ignores browser upload cleanup transport closes",
         ),
       ],
     });
-    const client = new WebTransportClient({
+    const client = new RawWebTransport({
       ready: Promise.resolve(),
       createBidirectionalStream() {
         return Promise.resolve(stream);
@@ -2130,7 +2150,7 @@ test("WebTransport terminal error wins over local upload error", async () => {
       ),
     ],
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return Promise.resolve(stream);
@@ -2174,7 +2194,7 @@ test("WebTransport response stream return is idempotent after local upload error
       cancels += 1;
     },
   });
-  const client = new WebTransportClient({
+  const client = new RawWebTransport({
     ready: Promise.resolve(),
     createBidirectionalStream() {
       return Promise.resolve(stream);

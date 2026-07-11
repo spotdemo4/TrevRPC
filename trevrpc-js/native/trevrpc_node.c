@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc.h"
+#include "trevrpc_runtime_internal.h"
 
 #include <errno.h> // IWYU pragma: keep
 #include <node_api.h>
@@ -24,6 +25,7 @@ typedef struct base_work base_work;
 typedef struct native_async_work native_async_work;
 typedef struct native_completion_runtime native_completion_runtime;
 typedef struct native_client native_client;
+typedef struct native_client_observer native_client_observer;
 typedef struct native_stream native_stream;
 typedef struct native_server native_server;
 typedef struct native_call native_call;
@@ -35,11 +37,21 @@ static void http3_admission_state_shutdown(node_http3_admission_state* state);
 static void http3_admission_state_release(node_http3_admission_state* state);
 
 struct native_client {
-    trevrpc_client* client;
+    trevrpc_raw_client* client;
+    native_client_observer* observer;
     pthread_mutex_t mutex;
     size_t refs;
     bool closing;
     bool js_alive;
+};
+
+struct native_client_observer {
+    napi_env env;
+    napi_deferred deferred;
+    napi_ref promise_ref;
+    napi_threadsafe_function tsfn;
+    atomic_bool notified;
+    int error_code;
 };
 
 struct native_stream {
@@ -152,10 +164,11 @@ struct native_completion_runtime {
 
 typedef struct connect_work {
     base_work base;
-    trevrpc_client* client;
+    trevrpc_raw_client* client;
     native_cancellation* cancellation;
     trevrpc_cancellation* owned_cancellation;
     napi_ref cancellation_ref;
+    native_client_observer* observer;
     char* host;
     char* ca_cert_file;
     uint16_t port;
@@ -1348,6 +1361,100 @@ static bool create_receiver_ref(napi_env env, napi_value receiver, napi_ref* out
     return true;
 }
 
+static void native_client_observer_finalize(napi_env env, void* data, void* hint) {
+    (void)hint;
+    native_client_observer* observer = data;
+    if (env != NULL && observer->promise_ref != NULL) {
+        napi_delete_reference(env, observer->promise_ref);
+    }
+    free(observer);
+}
+
+static void native_client_closed_js(napi_env env, napi_value callback, void* context, void* data) {
+    (void)callback;
+    (void)data;
+    native_client_observer* observer = context;
+    if (env == NULL || observer->deferred == NULL) {
+        return;
+    }
+
+    napi_value close_info = NULL;
+    napi_value native_code = NULL;
+    if (napi_create_object(env, &close_info) == napi_ok &&
+        napi_create_int32(env, observer->error_code, &native_code) == napi_ok &&
+        napi_set_named_property(env, close_info, "nativeCode", native_code) == napi_ok) {
+        napi_resolve_deferred(env, observer->deferred, close_info);
+        observer->deferred = NULL;
+    } else {
+        clear_pending_exception(env);
+    }
+}
+
+static native_client_observer* native_client_observer_create(napi_env env) {
+    native_client_observer* observer = calloc(1, sizeof(*observer));
+    if (observer == NULL) {
+        return NULL;
+    }
+    observer->env = env;
+    atomic_init(&observer->notified, false);
+
+    napi_value promise = NULL;
+    napi_value callback = NULL;
+    napi_value resource_name = NULL;
+    napi_status status = napi_create_promise(env, &observer->deferred, &promise);
+    if (status == napi_ok) {
+        status = napi_create_reference(env, promise, 1, &observer->promise_ref);
+    }
+    if (status == napi_ok) {
+        status = napi_create_function(env, "nativeClientClosed", NAPI_AUTO_LENGTH, noop_js_callback, NULL, &callback);
+    }
+    if (status == napi_ok) {
+        status = napi_create_string_utf8(env, "TrevRpcNativeClientClosed", NAPI_AUTO_LENGTH, &resource_name);
+    }
+    if (status == napi_ok) {
+        status = napi_create_threadsafe_function(env,
+            callback,
+            NULL,
+            resource_name,
+            0,
+            1,
+            observer,
+            native_client_observer_finalize,
+            observer,
+            native_client_closed_js,
+            &observer->tsfn);
+    }
+    if (status != napi_ok) {
+        if (observer->promise_ref != NULL) {
+            napi_delete_reference(env, observer->promise_ref);
+        }
+        free(observer);
+        return NULL;
+    }
+    (void)napi_unref_threadsafe_function(env, observer->tsfn);
+    return observer;
+}
+
+static void native_client_observer_notify(native_client_observer* observer, int error_code) {
+    if (observer == NULL || atomic_exchange_explicit(&observer->notified, true, memory_order_acq_rel)) {
+        return;
+    }
+    observer->error_code = error_code;
+    (void)napi_call_threadsafe_function(observer->tsfn, NULL, napi_tsfn_nonblocking);
+}
+
+static void native_client_observer_release(native_client_observer* observer) {
+    if (observer != NULL) {
+        (void)napi_release_threadsafe_function(observer->tsfn, napi_tsfn_release);
+    }
+}
+
+static void native_client_connection_event(void* context, const trevrpc_msquic_conn_event* event) {
+    if (event != NULL && event->kind == TREV_MSQUIC_CONN_EVENT_SHUTDOWN_COMPLETE) {
+        native_client_observer_notify(context, event->error_code);
+    }
+}
+
 static void native_client_maybe_destroy(native_client* client) {
     bool destroy = false;
     pthread_mutex_lock(&client->mutex);
@@ -1359,7 +1466,7 @@ static void native_client_maybe_destroy(native_client* client) {
     }
 }
 
-static int native_client_acquire(native_client* client, trevrpc_client** out_client) {
+static int native_client_acquire(native_client* client, trevrpc_raw_client** out_client) {
     if (client == NULL) {
         return TREV_NODE_ERR_CLOSED;
     }
@@ -1375,7 +1482,7 @@ static int native_client_acquire(native_client* client, trevrpc_client** out_cli
 }
 
 static void native_client_release(native_client* client) {
-    trevrpc_client* close_client = NULL;
+    trevrpc_raw_client* close_client = NULL;
     bool destroy = false;
     pthread_mutex_lock(&client->mutex);
     if (client->refs > 0) {
@@ -1388,7 +1495,7 @@ static void native_client_release(native_client* client) {
     destroy = !client->js_alive && client->refs == 0 && client->client == NULL;
     pthread_mutex_unlock(&client->mutex);
 
-    trevrpc_client_close(close_client);
+    trevrpc_raw_client_close(close_client);
     if (destroy) {
         pthread_mutex_destroy(&client->mutex);
         free(client);
@@ -1400,7 +1507,7 @@ static void native_client_work_release(void* owner) {
 }
 
 static int native_client_work_reserve(native_client* client, base_work* work) {
-    trevrpc_client* ignored = NULL;
+    trevrpc_raw_client* ignored = NULL;
     int err = native_client_acquire(client, &ignored);
     if (err == 0) {
         work->owner = client;
@@ -1413,10 +1520,13 @@ static void native_client_close_request(native_client* client) {
     if (client == NULL) {
         return;
     }
-    trevrpc_client* close_client = NULL;
-    trevrpc_client* shutdown_client = NULL;
+    trevrpc_raw_client* close_client = NULL;
+    trevrpc_raw_client* shutdown_client = NULL;
+    native_client_observer* observer = NULL;
     pthread_mutex_lock(&client->mutex);
     client->closing = true;
+    observer = client->observer;
+    client->observer = NULL;
     if (client->refs == 0 && client->client != NULL) {
         close_client = client->client;
         client->client = NULL;
@@ -1425,8 +1535,11 @@ static void native_client_close_request(native_client* client) {
     }
     pthread_mutex_unlock(&client->mutex);
 
-    trevrpc_client_shutdown(shutdown_client);
-    trevrpc_client_close(close_client);
+    trevrpc_raw_client_clear_observer(close_client != NULL ? close_client : shutdown_client);
+    native_client_observer_notify(observer, 0);
+    native_client_observer_release(observer);
+    trevrpc_raw_client_shutdown(shutdown_client);
+    trevrpc_raw_client_close(close_client);
     native_client_maybe_destroy(client);
 }
 
@@ -2769,6 +2882,13 @@ static napi_value noop_js_callback(napi_env env, napi_callback_info info) {
     return undefined;
 }
 
+static int connect_is_cancelled(void* data) {
+    connect_work* work = data;
+    trevrpc_cancellation* cancellation =
+        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
+    return trevrpc_cancellation_cancelled(cancellation);
+}
+
 static void connect_execute(napi_env env, void* data) {
     (void)env;
     connect_work* work = data;
@@ -2793,9 +2913,16 @@ static void connect_execute(napi_env env, void* data) {
     }
     config.ca_cert_file = work->ca_cert_file;
     config.skip_certificate_validation = work->skip_certificate_validation;
-    trevrpc_cancellation* cancellation =
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    work->base.err = trevrpc_client_connect_cancellable(work->host, work->port, &config, cancellation, &work->client);
+    work->base.err = trevrpc_raw_client_connect_observed(work->host,
+        work->port,
+        &config,
+        connect_is_cancelled,
+        work,
+        NULL,
+        0,
+        native_client_connection_event,
+        work->observer,
+        &work->client);
 }
 
 static void connect_cancel(void* data) {
@@ -2809,12 +2936,14 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
     trevrpc_cancellation* cancellation =
         work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
     if (work->base.err == 0 && trevrpc_cancellation_cancelled(cancellation)) {
-        trevrpc_client_close(work->client);
+        trevrpc_raw_client_clear_observer(work->client);
+        trevrpc_raw_client_close(work->client);
         work->client = NULL;
         work->base.err = -ECANCELED;
     }
     if (env == NULL) {
-        trevrpc_client_close(work->client);
+        trevrpc_raw_client_clear_observer(work->client);
+        trevrpc_raw_client_close(work->client);
     } else if (status != napi_ok) {
         reject_native_error(env, work->base.deferred, -ECANCELED, "connectMsQuic");
     } else if (work->base.err != 0) {
@@ -2822,11 +2951,14 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
     } else {
         native_client* client = calloc(1, sizeof(*client));
         if (client == NULL) {
-            trevrpc_client_close(work->client);
+            trevrpc_raw_client_clear_observer(work->client);
+            trevrpc_raw_client_close(work->client);
             reject_native_error(env, work->base.deferred, -ENOMEM, "connectMsQuic");
         } else {
             pthread_mutex_init(&client->mutex, NULL);
             client->client = work->client;
+            client->observer = work->observer;
+            work->observer = NULL;
 
             napi_value ctor = NULL;
             napi_value external = NULL;
@@ -2840,6 +2972,13 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
             }
             if (wrap_status == napi_ok) {
                 wrap_status = napi_new_instance(env, ctor, 1, &external, &instance);
+            }
+            napi_value closed = NULL;
+            if (wrap_status == napi_ok) {
+                wrap_status = napi_get_reference_value(env, client->observer->promise_ref, &closed);
+            }
+            if (wrap_status == napi_ok) {
+                wrap_status = napi_set_named_property(env, instance, "closed", closed);
             }
             if (wrap_status != napi_ok) {
                 clear_pending_exception(env);
@@ -2857,6 +2996,7 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
         napi_delete_reference(env, work->cancellation_ref);
     }
     trevrpc_cancellation_free(work->owned_cancellation);
+    native_client_observer_release(work->observer);
     native_work_delete(work->base.work);
     free(work);
 }
@@ -2873,6 +3013,12 @@ static napi_value connect_msquic(napi_env env, napi_callback_info info) {
     connect_work* work = calloc(1, sizeof(*work));
     if (work == NULL) {
         napi_throw_error(env, NULL, "failed to allocate connect work");
+        return NULL;
+    }
+    work->observer = native_client_observer_create(env);
+    if (work->observer == NULL) {
+        free(work);
+        napi_throw_error(env, NULL, "failed to create native client close observer");
         return NULL;
     }
     work->host = get_string_property(env, args[0], "host");
@@ -2900,6 +3046,7 @@ static napi_value connect_msquic(napi_env env, napi_callback_info info) {
             napi_delete_reference(env, work->cancellation_ref);
         }
         trevrpc_cancellation_free(work->owned_cancellation);
+        native_client_observer_release(work->observer);
         free(work);
         if (invalid_options) {
             napi_throw_type_error(env, NULL, "connectMsQuic requires host and port");
@@ -3698,7 +3845,7 @@ static napi_value native_cancellation_cancel(napi_env env, napi_callback_info in
 static void call_execute(napi_env env, void* data) {
     (void)env;
     call_work* work = data;
-    trevrpc_client* client = NULL;
+    trevrpc_raw_client* client = NULL;
     work->base.err = native_client_acquire(work->client, &client);
     if (work->base.err != 0) {
         return;
@@ -3706,7 +3853,7 @@ static void call_execute(napi_env env, void* data) {
     work->acquired = true;
     trevrpc_cancellation* cancellation =
         work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    work->base.err = trevrpc_client_call_request_cancellable(client, &work->request, cancellation, &work->response);
+    work->base.err = trevrpc_raw_client_call_request_cancellable(client, &work->request, cancellation, &work->response);
 }
 
 static void call_complete(napi_env env, napi_status status, void* data) {
@@ -3793,7 +3940,7 @@ static napi_value native_client_call(napi_env env, napi_callback_info info) {
 static void start_stream_execute(napi_env env, void* data) {
     (void)env;
     start_stream_work* work = data;
-    trevrpc_client* client = NULL;
+    trevrpc_raw_client* client = NULL;
     work->base.err = native_client_acquire(work->client, &client);
     if (work->base.err != 0) {
         return;
@@ -3802,7 +3949,7 @@ static void start_stream_execute(napi_env env, void* data) {
     trevrpc_cancellation* cancellation =
         work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
     work->base.err =
-        trevrpc_client_start_stream_request_cancellable(client, &work->request, cancellation, &work->stream);
+        trevrpc_raw_client_start_stream_request_cancellable(client, &work->request, cancellation, &work->stream);
 }
 
 static void start_stream_complete(napi_env env, napi_status status, void* data) {

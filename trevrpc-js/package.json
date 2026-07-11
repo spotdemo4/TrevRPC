@@ -19,14 +19,28 @@
   "types": "./src/index.d.ts",
   "exports": {
     ".": {
+      "node": {
+        "types": "./src/index.node.d.ts",
+        "import": "./src/index.node.js"
+      },
+      "browser": {
+        "types": "./src/index.d.ts",
+        "import": "./src/index.js"
+      },
       "types": "./src/index.d.ts",
-      "node": "./src/index.node.js",
-      "browser": "./src/index.js",
       "import": "./src/index.js"
     },
     "./node": {
       "types": "./src/node.d.ts",
-      "import": "./src/node.js"
+      "import": "./src/node-index.js"
+    },
+    "./advanced": {
+      "types": "./src/advanced.d.ts",
+      "import": "./src/advanced.js"
+    },
+    "./node/advanced": {
+      "types": "./src/node-advanced.d.ts",
+      "import": "./src/node-advanced.js"
     }
   },
   "scripts": {

@@ -437,48 +437,45 @@ export interface BrowserWebTransportOptions {
   serverCertificateHashes?: readonly WebTransportCertificateHash[];
 }
 
-export interface WebTransportClientOptions extends CallOptions, BrowserWebTransportOptions {
+export interface WebTransportOptions extends BrowserWebTransportOptions {
   WebTransport?: WebTransportConstructorLike;
+  maxFrameSize?: number;
 }
 
-export type ReconnectingTransportState = "connecting" | "ready" | "reconnecting" | "closed";
+export type ChannelState = "connecting" | "ready" | "reconnecting" | "closed";
 
-export interface ReconnectingTransportLifecycle {
-  state: ReconnectingTransportState;
-  previousState: ReconnectingTransportState;
+export interface ChannelLifecycle {
+  state: ChannelState;
+  previousState: ChannelState;
   generation: number;
   attempt?: number;
   delayMs?: number;
   error?: unknown;
 }
 
-export type ReconnectingTransportLifecycleEvent = Event & {
-  readonly detail: ReconnectingTransportLifecycle;
+export type ChannelLifecycleEvent = Event & {
+  readonly detail: ChannelLifecycle;
 };
 
-export interface ReconnectOptions {
-  /** Initial retry delay. Defaults to 100 ms. */
-  reconnectInitialDelayMs?: number;
-  /** Maximum retry delay, including jitter. Defaults to 10000 ms. */
-  reconnectMaxDelayMs?: number;
-  /** Exponential delay multiplier. Defaults to 2. */
-  reconnectMultiplier?: number;
-  /** Symmetric jitter ratio from zero to one. Defaults to 0.2. */
-  reconnectJitter?: number;
-  /** Receives managed transport lifecycle transitions. */
-  onStateChange?(event: ReconnectingTransportLifecycle): void;
+export interface ChannelLifecycleOptions {
+  /** Receives channel lifecycle transitions. */
+  onStateChange?(event: ChannelLifecycle): void;
 }
 
-export interface ManagedReconnectingTransport extends Transport, EventTarget {
+export interface RpcChannel extends Transport, EventTarget {
   readonly ready: boolean;
-  readonly state: ReconnectingTransportState;
+  readonly state: ChannelState;
   readonly generation: number;
   waitUntilReady(): Promise<void>;
   close(closeInfo?: WebTransportCloseInfoLike): void;
 }
 
-export interface ReconnectingWebTransportClientOptions
-  extends WebTransportClientOptions, ReconnectOptions {}
+export interface ChannelOptions extends WebTransportOptions, ChannelLifecycleOptions {
+  /** Bounds initial readiness only. Later reconnects continue until close(). */
+  timeoutMs?: number;
+  /** Cancels initial readiness only. Later reconnects continue until close(). */
+  signal?: AbortSignal;
+}
 
 export interface NodeConnectOptions {
   host?: string;
@@ -493,63 +490,23 @@ export interface NodeConnectOptions {
   signal?: AbortSignal;
 }
 
-export interface ConnectOptions extends WebTransportClientOptions, NodeConnectOptions {}
+export interface ConnectOptions extends ChannelOptions, NodeConnectOptions {}
 
-export interface ConnectedTransport extends Transport {
-  /** Closes the underlying WebTransport session or native client. */
-  close(closeInfo?: WebTransportCloseInfoLike): void;
-}
+/** Opens a channel for the current JavaScript runtime. */
+export function connect(url: string | URL, options?: ConnectOptions): Promise<Channel>;
 
-/** Opens a TrevRPC client for the current JavaScript runtime. */
-export function connect(url: string | URL, options?: ConnectOptions): Promise<ConnectedTransport>;
-
-/** Transport implementation for TrevRPC over WebTransport. */
-export class WebTransportClient implements Transport {
-  session: WebTransportSessionLike;
-  maxFrameSize: number;
-
-  /** Creates a client over an established WebTransport session. */
-  constructor(session: WebTransportSessionLike, options?: WebTransportClientOptions);
-
-  /** Opens a WebTransport session and wraps it in a TrevRPC client. */
-  static connect(
-    url: string | URL,
-    options?: WebTransportClientOptions,
-  ): Promise<WebTransportClient>;
-  /** Waits for the underlying WebTransport session to become ready. */
-  ready(): Promise<void>;
-  /** Closes the underlying WebTransport session. */
-  close(closeInfo?: WebTransportCloseInfoLike): void;
-  /** Sends a unary RPC request over WebTransport and returns its response. */
-  call(request: RpcRequestMessage, options?: ResolvedCallOptions): Promise<RpcResponseMessage>;
-  /** Sends a streaming RPC request over WebTransport and returns response frames. */
-  streamingCall(
-    request: RpcRequestMessage,
-    requestBody: AsyncIterable<Uint8Array>,
-    options?: ResolvedCallOptions,
-  ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
-  /** Opens a bidirectional WebTransport stream. */
-  openBidirectionalStream(): Promise<WebTransportBidirectionalStreamLike>;
-}
-
-/** Managed browser WebTransport client with background session reconnection. */
-export class ReconnectingWebTransportClient
-  extends EventTarget
-  implements ManagedReconnectingTransport
-{
+/** Application channel with background connection reconnection. */
+export class Channel extends EventTarget implements RpcChannel {
   readonly url: string | URL;
-  readonly options: Readonly<ReconnectingWebTransportClientOptions>;
+  readonly options: Readonly<ChannelOptions>;
   readonly ready: boolean;
-  readonly state: ReconnectingTransportState;
+  readonly state: ChannelState;
   readonly generation: number;
 
-  constructor(url: string | URL, options?: ReconnectingWebTransportClientOptions);
+  constructor(url: string | URL, options?: ChannelOptions);
 
-  /** Creates a managed client and waits for its first ready generation. */
-  static connect(
-    url: string | URL,
-    options?: ReconnectingWebTransportClientOptions,
-  ): Promise<ReconnectingWebTransportClient>;
+  /** Creates a channel and waits for its first ready generation. */
+  static connect(url: string | URL, options?: ChannelOptions): Promise<Channel>;
   /** Waits for the current or next connection generation to become ready. */
   waitUntilReady(): Promise<void>;
   /** Sends a unary call on the current generation without replaying it. */
@@ -563,13 +520,13 @@ export class ReconnectingWebTransportClient
   /** Stops reconnecting and closes the current generation. */
   close(closeInfo?: WebTransportCloseInfoLike): void;
   addEventListener(
-    type: "statechange" | ReconnectingTransportState,
-    callback: (event: ReconnectingTransportLifecycleEvent) => void,
+    type: "statechange" | ChannelState,
+    callback: (event: ChannelLifecycleEvent) => void,
     options?: boolean | AddEventListenerOptions,
   ): void;
   removeEventListener(
-    type: "statechange" | ReconnectingTransportState,
-    callback: (event: ReconnectingTransportLifecycleEvent) => void,
+    type: "statechange" | ChannelState,
+    callback: (event: ChannelLifecycleEvent) => void,
     options?: boolean | EventListenerOptions,
   ): void;
 }

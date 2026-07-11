@@ -10,8 +10,11 @@ import { setImmediate, setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
+import { connect } from "trevrpc-js";
+import { Channel, NodeServer } from "trevrpc-js/node";
+import { RawNodeTransport } from "trevrpc-js/node/advanced";
+
 import { Code, RpcKind, RpcStreamFrameKind } from "../src/index.js";
-import { NodeServer, NodeTransport, ReconnectingNodeTransport } from "../src/node.js";
 
 const require = createRequire(import.meta.url);
 const nativeAddonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
@@ -205,7 +208,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
-    "NodeTransport abort cancels a stalled native connect",
+    "RawNodeTransport abort cancels a stalled native connect",
     { skip: native == null, timeout: 10_000 },
     async () => {
       const { createSocket } = await import("node:dgram");
@@ -216,7 +219,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
       });
       try {
         const controller = new AbortController();
-        const connecting = NodeTransport.connect({
+        const connecting = RawNodeTransport.connect({
           host: "127.0.0.1",
           port: sink.address().port,
           skipCertificateValidation: true,
@@ -270,7 +273,7 @@ parentPort.postMessage("connecting");
   );
 
   test(
-    "managed Node reconnect only follows explicit native closed errors",
+    "Node channel reconnect only follows explicit native closed errors",
     { skip: native == null, timeout: 15_000 },
     async () => {
       const certificate = await testCertificate();
@@ -285,14 +288,11 @@ parentPort.postMessage("connecting");
         message: "remote unavailable",
       }));
       const serving = server.serve();
-      const client = await ReconnectingNodeTransport.connect({
+      const client = await Channel.connect({
         host: "127.0.0.1",
         port: server.port,
         skipCertificateValidation: true,
         maxPendingSendBytes: 128,
-        reconnectInitialDelayMs: 0,
-        reconnectMaxDelayMs: 0,
-        reconnectJitter: 0,
       });
       try {
         const unavailableResponse = await client.call({
@@ -320,6 +320,43 @@ parentPort.postMessage("connecting");
         );
         assert.equal(client.generation, 1);
         assert.equal(client.state, "ready");
+      } finally {
+        client.close();
+        server.close();
+        await serving;
+      }
+    },
+  );
+
+  test(
+    "Node channel observes an idle native connection shutdown",
+    { skip: native == null, timeout: 15_000 },
+    async () => {
+      const certificate = await testCertificate();
+      const server = await NodeServer.listen({
+        host: "127.0.0.1",
+        port: 0,
+        certFile: certificate.certFile,
+        keyFile: certificate.keyFile,
+      });
+      const serving = server.serve();
+      const client = await connect({
+        host: "127.0.0.1",
+        port: server.port,
+        skipCertificateValidation: true,
+      });
+      try {
+        assert.equal(client.state, "ready");
+        assert.equal(client.generation, 1);
+
+        server.close();
+        await serving;
+        await waitForCondition(
+          () => client.state === "reconnecting",
+          "idle channel did not observe native connection shutdown",
+        );
+
+        assert.equal(client.generation, 1);
       } finally {
         client.close();
         server.close();
@@ -1387,7 +1424,7 @@ async function withNativePair(
   });
   await register(server);
   const serving = server.serve();
-  const client = await NodeTransport.connect({
+  const client = await RawNodeTransport.connect({
     host: "127.0.0.1",
     port: server.port,
     skipCertificateValidation: true,

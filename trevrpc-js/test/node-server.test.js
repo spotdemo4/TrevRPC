@@ -7,7 +7,7 @@ import {
   NodeServerCall,
   bearerAuthorizer,
   metadataValueAuthorizer,
-} from "../src/node.js";
+} from "../src/node-index.js";
 
 class FakeNativeServer {
   constructor() {

@@ -1,15 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  Code,
-  ReconnectingWebTransportClient,
-  RpcKind,
-  RpcRequest,
-  WireVersion,
-} from "../src/index.js";
+import { Code, Channel, RpcKind, RpcRequest, WireVersion } from "../src/index.js";
 
-test("managed WebTransport reconnects after session.closed and exposes lifecycle state", async () => {
+test("WebTransport channel reconnects after session.closed and exposes lifecycle state", async () => {
   const sessions = [];
   const callbacks = [];
   const events = [];
@@ -31,12 +25,9 @@ test("managed WebTransport reconnects after session.closed and exposes lifecycle
     }
   }
 
-  const client = new ReconnectingWebTransportClient("https://example.test/trevrpc", {
+  const client = new Channel("https://example.test/trevrpc", {
     WebTransport: FakeWebTransport,
     allowPooling: true,
-    reconnectInitialDelayMs: 0,
-    reconnectMaxDelayMs: 0,
-    reconnectJitter: 0,
     onStateChange(event) {
       callbacks.push(event);
     },
@@ -52,7 +43,6 @@ test("managed WebTransport reconnects after session.closed and exposes lifecycle
   assert.equal(client.state, "ready");
   assert.equal(client.generation, 1);
   assert.equal(client.url, "https://example.test/trevrpc");
-  assert.equal(client.options.reconnectInitialDelayMs, 0);
 
   sessions[0].closedDeferred.resolve({ closeCode: 1, reason: "restart" });
   await waitFor(() => client.state === "reconnecting");
@@ -78,7 +68,7 @@ test("managed WebTransport reconnects after session.closed and exposes lifecycle
   await assert.rejects(client.waitUntilReady(), (error) => error.code === Code.Unavailable);
 });
 
-test("managed WebTransport bounds exponential reconnect delays", async () => {
+test("WebTransport channel uses bounded exponential reconnect delays", async () => {
   const sessions = [];
   const transitions = [];
 
@@ -93,28 +83,146 @@ test("managed WebTransport bounds exponential reconnect delays", async () => {
     close() {}
   }
 
-  const client = new ReconnectingWebTransportClient("https://example.test/trevrpc", {
+  const client = new Channel("https://example.test/trevrpc", {
     WebTransport: FakeWebTransport,
-    reconnectInitialDelayMs: 5,
-    reconnectMaxDelayMs: 6,
-    reconnectMultiplier: 2,
-    reconnectJitter: 0,
     onStateChange(event) {
       transitions.push(event);
     },
   });
 
   await waitFor(() => sessions.length === 3);
-  assert.deepEqual(
-    transitions
-      .filter((event) => event.state === "connecting" && event.attempt > 1)
-      .map((event) => event.delayMs),
-    [5, 6],
-  );
+  const delays = transitions
+    .filter((event) => event.state === "connecting" && event.attempt > 1)
+    .map((event) => event.delayMs);
+  assert.equal(delays.length, 2);
+  assert.ok(delays[0] >= 80 && delays[0] <= 120);
+  assert.ok(delays[1] >= 160 && delays[1] <= 240);
   client.close();
 });
 
-test("managed WebTransport does not infer connection loss or replay from a failed call", async () => {
+test("Channel.connect bounds and closes a stalled initial connection", async () => {
+  const sessions = [];
+  class FakeWebTransport {
+    constructor() {
+      this.ready = new Promise(() => {});
+      this.closed = new Promise(() => {});
+      this.closeCalls = 0;
+      sessions.push(this);
+    }
+
+    close() {
+      this.closeCalls += 1;
+    }
+  }
+
+  await assert.rejects(
+    Channel.connect("https://example.test/trevrpc", {
+      WebTransport: FakeWebTransport,
+      timeoutMs: 1,
+    }),
+    (error) => error.code === Code.DeadlineExceeded,
+  );
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].closeCalls, 1);
+});
+
+test("Channel.connect honors an initial AbortSignal", async () => {
+  const controller = new AbortController();
+  class FakeWebTransport {
+    constructor() {
+      this.ready = new Promise(() => {});
+      this.closed = new Promise(() => {});
+    }
+
+    close() {}
+  }
+
+  const connecting = Channel.connect("https://example.test/trevrpc", {
+    WebTransport: FakeWebTransport,
+    signal: controller.signal,
+  });
+  controller.abort();
+
+  await assert.rejects(connecting, (error) => error.code === Code.Cancelled);
+});
+
+test("Channel.connect does not start a pre-cancelled initial connection", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let sessions = 0;
+
+  class FakeWebTransport {
+    constructor() {
+      sessions += 1;
+      this.ready = new Promise(() => {});
+    }
+
+    close() {}
+  }
+
+  await assert.rejects(
+    Channel.connect("https://example.test/trevrpc", {
+      WebTransport: FakeWebTransport,
+      signal: controller.signal,
+    }),
+    (error) => error.code === Code.Cancelled,
+  );
+  await Promise.resolve();
+  assert.equal(sessions, 0);
+});
+
+test("Channel.connect treats a zero initial timeout as an immediate deadline", async () => {
+  let sessions = 0;
+
+  class FakeWebTransport {
+    constructor() {
+      sessions += 1;
+      this.ready = new Promise(() => {});
+    }
+
+    close() {}
+  }
+
+  await assert.rejects(
+    Channel.connect("https://example.test/trevrpc", {
+      WebTransport: FakeWebTransport,
+      timeoutMs: 0,
+    }),
+    (error) => error.code === Code.DeadlineExceeded,
+  );
+  await Promise.resolve();
+  assert.equal(sessions, 0);
+});
+
+test("Channel.connect supports initial timeouts above the platform timer limit", async () => {
+  const controller = new AbortController();
+  const sessions = [];
+
+  class FakeWebTransport {
+    constructor() {
+      this.ready = new Promise(() => {});
+      this.closeCalls = 0;
+      sessions.push(this);
+    }
+
+    close() {
+      this.closeCalls += 1;
+    }
+  }
+
+  const connecting = Channel.connect("https://example.test/trevrpc", {
+    WebTransport: FakeWebTransport,
+    signal: controller.signal,
+    timeoutMs: 2_147_483_648,
+  });
+  await waitFor(() => sessions.length === 1);
+  controller.abort();
+
+  await assert.rejects(connecting, (error) => error.code === Code.Cancelled);
+  assert.equal(sessions[0].closeCalls, 1);
+});
+
+test("WebTransport channel does not infer connection loss or replay from a failed call", async () => {
   const sessions = [];
 
   class FakeWebTransport {
@@ -134,11 +242,8 @@ test("managed WebTransport does not infer connection loss or replay from a faile
     close() {}
   }
 
-  const client = await ReconnectingWebTransportClient.connect("https://example.test/trevrpc", {
+  const client = await Channel.connect("https://example.test/trevrpc", {
     WebTransport: FakeWebTransport,
-    reconnectInitialDelayMs: 0,
-    reconnectMaxDelayMs: 0,
-    reconnectJitter: 0,
   });
 
   await assert.rejects(client.call(rpcRequest()), (error) => error.code === Code.Unavailable);
@@ -153,7 +258,7 @@ test("managed WebTransport does not infer connection loss or replay from a faile
   client.close();
 });
 
-test("managed WebTransport does not reconnect for a cancelled call", async () => {
+test("WebTransport channel does not reconnect for a cancelled call", async () => {
   const sessions = [];
   const pendingOpen = deferred();
 
@@ -171,7 +276,7 @@ test("managed WebTransport does not reconnect for a cancelled call", async () =>
     close() {}
   }
 
-  const client = await ReconnectingWebTransportClient.connect("https://example.test/trevrpc", {
+  const client = await Channel.connect("https://example.test/trevrpc", {
     WebTransport: FakeWebTransport,
   });
   const controller = new AbortController();
@@ -187,7 +292,7 @@ test("managed WebTransport does not reconnect for a cancelled call", async () =>
   client.close();
 });
 
-test("managed WebTransport keeps in-flight streams on their failed generation", async () => {
+test("WebTransport channel keeps in-flight streams on their failed generation", async () => {
   const sessions = [];
   const oldRead = deferred();
 
@@ -208,11 +313,8 @@ test("managed WebTransport keeps in-flight streams on their failed generation", 
     close() {}
   }
 
-  const client = await ReconnectingWebTransportClient.connect("https://example.test/trevrpc", {
+  const client = await Channel.connect("https://example.test/trevrpc", {
     WebTransport: FakeWebTransport,
-    reconnectInitialDelayMs: 0,
-    reconnectMaxDelayMs: 0,
-    reconnectJitter: 0,
   });
   const frames = await client.streamingCall(rpcRequest(RpcKind.ServerStreaming), emptyBody());
   const pendingFrame = frames.next();
@@ -286,7 +388,7 @@ function fakePendingStream(readPromise) {
 async function* emptyBody() {}
 
 async function waitFor(predicate) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     if (predicate()) {
       return;
     }

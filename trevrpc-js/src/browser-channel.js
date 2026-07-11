@@ -1,13 +1,13 @@
-import { ReconnectingTransport, stripReconnectOptions } from "./reconnecting.js";
+import { ChannelStateMachine, stripChannelOptions, waitForInitialReady } from "./channel.js";
 import { unavailable } from "./status.js";
-import { WebTransportClient, createWebTransportSession } from "./webtransport.js";
+import { RawWebTransport, createWebTransportSession } from "./webtransport.js";
 
-/** Managed browser WebTransport client with background session reconnection. */
-export class ReconnectingWebTransportClient extends ReconnectingTransport {
+/** Browser channel with background session reconnection. */
+export class Channel extends ChannelStateMachine {
   constructor(url, options = {}) {
     const retainedUrl = url instanceof URL ? url.href : url;
     const retainedOptions = Object.freeze({ ...options });
-    const transportOptions = stripReconnectOptions(retainedOptions);
+    const transportOptions = stripChannelOptions(retainedOptions);
     super(
       (signal) => connectWebTransport(retainedUrl, transportOptions, signal),
       retainedOptions,
@@ -17,11 +17,11 @@ export class ReconnectingWebTransportClient extends ReconnectingTransport {
     this.options = retainedOptions;
   }
 
-  /** Creates a managed client and waits for its first ready generation. */
+  /** Creates a channel and waits for its first ready generation. */
   static async connect(url, options = {}) {
-    const client = new ReconnectingWebTransportClient(url, options);
-    await client.waitUntilReady();
-    return client;
+    const channel = new Channel(url, options);
+    await waitForInitialReady(channel, options);
+    return channel;
   }
 }
 
@@ -33,9 +33,9 @@ async function connectWebTransport(url, options, signal) {
   try {
     await session.ready;
     if (signal.aborted) {
-      throw unavailable("managed transport is closed");
+      throw unavailable("channel is closed");
     }
-    return new WebTransportClient(session, options);
+    return new RawWebTransport(session, options);
   } catch (error) {
     session.close?.();
     throw error;

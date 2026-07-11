@@ -1,10 +1,10 @@
 import type {
-  ManagedReconnectingTransport,
+  ChannelLifecycleEvent,
+  ChannelLifecycleOptions,
+  ChannelState,
+  RpcChannel,
   MetadataInput,
   NodeConnectOptions as RuntimeNodeConnectOptions,
-  ReconnectOptions,
-  ReconnectingTransportLifecycleEvent,
-  ReconnectingTransportState,
   RpcKindValue,
   RpcMethodKind,
   RpcResponseMessage,
@@ -15,7 +15,10 @@ import type {
 
 export interface NodeConnectOptions extends RuntimeNodeConnectOptions {}
 
-export interface ReconnectingNodeTransportOptions extends NodeConnectOptions, ReconnectOptions {}
+export interface NodeChannelOptions extends NodeConnectOptions, ChannelLifecycleOptions {
+  /** Bounds initial readiness only. Later reconnects continue until close(). */
+  timeoutMs?: number;
+}
 
 export interface NodeRpcStartedEvent {
   service: string;
@@ -101,51 +104,21 @@ export interface NodeListenOptions extends RuntimeNodeConnectOptions {
   streamIdleTimeoutMs?: number;
 }
 
-/** Native Node transport backed by trevrpc-c and MsQuic. */
-export class NodeTransport implements Transport {
-  maxFrameSize?: number;
-
-  /** Opens a TrevRPC client backed by the native C runtime. */
-  static connect(
-    urlOrOptions: string | URL | NodeConnectOptions,
-    options?: NodeConnectOptions,
-  ): Promise<NodeTransport>;
-
-  /** Sends a unary RPC request and returns its response. */
-  call(
-    request: Parameters<Transport["call"]>[0],
-    options?: Parameters<Transport["call"]>[1],
-  ): Promise<RpcResponseMessage>;
-
-  /** Starts a streaming RPC and returns native response frames. */
-  streamingCall(
-    request: Parameters<Transport["streamingCall"]>[0],
-    requestBody: AsyncIterable<Uint8Array>,
-    options?: Parameters<Transport["streamingCall"]>[2],
-  ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
-
-  /** Closes the underlying native client. */
-  close(): void;
-}
-
-/** Managed native Node transport that reconnects after observed operation failures. */
-export class ReconnectingNodeTransport extends EventTarget implements ManagedReconnectingTransport {
-  readonly urlOrOptions: string | URL | Readonly<ReconnectingNodeTransportOptions>;
-  readonly options: Readonly<ReconnectingNodeTransportOptions>;
+/** Native Node channel with background connection reconnection. */
+export class Channel extends EventTarget implements RpcChannel {
+  readonly urlOrOptions: string | URL | Readonly<NodeChannelOptions>;
+  readonly options: Readonly<NodeChannelOptions>;
   readonly ready: boolean;
-  readonly state: ReconnectingTransportState;
+  readonly state: ChannelState;
   readonly generation: number;
 
-  constructor(
-    urlOrOptions: string | URL | ReconnectingNodeTransportOptions,
-    options?: ReconnectingNodeTransportOptions,
-  );
+  constructor(urlOrOptions: string | URL | NodeChannelOptions, options?: NodeChannelOptions);
 
-  /** Creates a managed native client and waits for its first ready generation. */
+  /** Creates a native channel and waits for its first ready generation. */
   static connect(
-    urlOrOptions: string | URL | ReconnectingNodeTransportOptions,
-    options?: ReconnectingNodeTransportOptions,
-  ): Promise<ReconnectingNodeTransport>;
+    urlOrOptions: string | URL | NodeChannelOptions,
+    options?: NodeChannelOptions,
+  ): Promise<Channel>;
   /** Waits for the current or next connection generation to become ready. */
   waitUntilReady(): Promise<void>;
   /** Sends a unary call on the current generation without replaying it. */
@@ -162,13 +135,13 @@ export class ReconnectingNodeTransport extends EventTarget implements ManagedRec
   /** Stops reconnecting and closes the current generation. */
   close(): void;
   addEventListener(
-    type: "statechange" | ReconnectingTransportState,
-    callback: (event: ReconnectingTransportLifecycleEvent) => void,
+    type: "statechange" | ChannelState,
+    callback: (event: ChannelLifecycleEvent) => void,
     options?: boolean | AddEventListenerOptions,
   ): void;
   removeEventListener(
-    type: "statechange" | ReconnectingTransportState,
-    callback: (event: ReconnectingTransportLifecycleEvent) => void,
+    type: "statechange" | ChannelState,
+    callback: (event: ChannelLifecycleEvent) => void,
     options?: boolean | EventListenerOptions,
   ): void;
 }

@@ -1,5 +1,7 @@
+import { RawNodeTransport } from "trevrpc-js/node/advanced";
+
 import { createRoot, createServiceClient } from "../src/index.js";
-import { NodeServer, NodeTransport } from "../src/node.js";
+import { NodeServer } from "../src/node-index.js";
 
 const LatencyStreamMessageCount = 1;
 const RequestName = "TrevRPC benchmark";
@@ -83,7 +85,7 @@ if (mode === "client") {
 }
 
 async function runClient(host, port, iterations) {
-  const transport = await NodeTransport.connect({
+  const transport = await RawNodeTransport.connect({
     host,
     port,
     skipCertificateValidation: true,

@@ -1,4 +1,4 @@
-import { ReconnectingWebTransportClient, TrevRpcError } from "../../src/index.js";
+import { TrevRpcError, connect } from "../../src/index.js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
 const form = document.querySelector("#client-form");
@@ -27,12 +27,14 @@ async function runFromForm(data) {
   const token = String(data.get("token") ?? "").trim();
   const certificateHash = String(data.get("certificate-hash") ?? "").trim();
 
-  let transport;
+  let channel;
   try {
     log(`connecting to ${url}`);
-    transport = new ReconnectingWebTransportClient(url, browserConnectOptions(certificateHash));
-    await waitUntilReady(transport, 10_000);
-    const client = new GreeterClient(transport, {
+    channel = await connect(url, {
+      ...browserConnectOptions(certificateHash),
+      timeoutMs: 10_000,
+    });
+    const client = new GreeterClient(channel, {
       timeoutMs: 5_000,
       metadata: token === "" ? {} : { authorization: `Bearer ${token}` },
     });
@@ -80,21 +82,7 @@ async function runFromForm(data) {
     logError(error);
   } finally {
     submit.disabled = false;
-    transport?.close({ closeCode: 0, reason: "example complete" });
-  }
-}
-
-async function waitUntilReady(transport, timeoutMs) {
-  let timeout;
-  try {
-    await Promise.race([
-      transport.waitUntilReady(),
-      new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error("initial connection timed out")), timeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timeout);
+    channel?.close({ closeCode: 0, reason: "example complete" });
   }
 }
 
@@ -170,7 +158,7 @@ function log(message) {
 
 function logError(error) {
   if (error instanceof TrevRpcError) {
-    log(`RPC error ${error.code}: ${error.statusMessage || error.message}`);
+    log(`RPC error: ${error.code}: ${error.statusMessage || error.message}`);
     return;
   }
 

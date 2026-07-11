@@ -547,6 +547,7 @@ async function withBrowserLifecycleEnvironment(
 async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
   const { bidirectionalStreaming, clientStreaming, connect, createRoot, serverStreaming } =
     await import("/src/index.js");
+  const { RawWebTransport } = await import("/src/advanced.js");
   const service = "browser.lifecycle.Lifecycle";
   const Message = createRoot({
     nested: {
@@ -565,7 +566,7 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
       },
     },
   }).lookupType("browser.lifecycle.Message");
-  const transport = await connect(webTransportURL, await browserConnectOptions());
+  let transport = await connect(webTransportURL, await browserConnectOptions());
   const options = {
     metadata: { authorization: "Bearer trevrpc-example-token" },
     streamIdleTimeoutMs: 10_000,
@@ -734,6 +735,8 @@ async function runLifecycleBrowserScenario({ scenario, webTransportURL }) {
         throw new Error("expected server shutdown to fail the stream");
       }
       case "stream-open-abort": {
+        transport.close();
+        transport = await RawWebTransport.connect(webTransportURL, await browserConnectOptions());
         const originalOpen = transport.openBidirectionalStream.bind(transport);
         transport.openBidirectionalStream = async () => {
           const stream = await originalOpen();

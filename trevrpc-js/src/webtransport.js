@@ -19,7 +19,7 @@ const BrowserWebTransportOptionKeys = [
 ];
 
 /** Transport implementation for TrevRPC over WebTransport. */
-export class WebTransportClient {
+export class RawWebTransport {
   /** Creates a client over an established WebTransport session. */
   constructor(session, options = {}) {
     this.session = session;
@@ -30,7 +30,7 @@ export class WebTransportClient {
   static async connect(url, options = {}) {
     const session = createWebTransportSession(url, options);
     await session.ready;
-    return new WebTransportClient(session, options);
+    return new RawWebTransport(session, options);
   }
 
   /** Waits for the underlying WebTransport session to become ready. */

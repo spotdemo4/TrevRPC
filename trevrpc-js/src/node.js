@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { ReconnectingTransport, stripReconnectOptions } from "./reconnecting.js";
+import { ChannelStateMachine, stripChannelOptions, waitForInitialReady } from "./channel.js";
 import { Code, cancelled, codeFromNumber, invalidArgument } from "./status.js";
 import { RpcKind, RpcStreamFrameKind } from "./wire.js";
 
@@ -15,7 +15,7 @@ const SendManyBatchSize = 16;
 const NativeTransportClosed = -1001;
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */
-export class NodeTransport {
+export class RawNodeTransport {
   constructor(nativeClient, options = {}) {
     this.nativeClient = nativeClient;
     this.maxFrameSize = options.maxFrameSize;
@@ -32,7 +32,7 @@ export class NodeTransport {
     try {
       nativeClient = await nativeConnect(native, connectOptions, cancellation);
       throwIfAborted(connectOptions.signal);
-      return new NodeTransport(nativeClient, connectOptions);
+      return new RawNodeTransport(nativeClient, connectOptions);
     } catch (error) {
       if (connectOptions.signal?.aborted) {
         nativeClient?.close();
@@ -101,10 +101,15 @@ export class NodeTransport {
   close() {
     this.nativeClient.close();
   }
+
+  /** Resolves when the underlying native connection closes. */
+  get closed() {
+    return this.nativeClient.closed;
+  }
 }
 
-/** Managed native Node transport that reconnects after observed operation failures. */
-export class ReconnectingNodeTransport extends ReconnectingTransport {
+/** Native Node channel with background connection reconnection. */
+export class Channel extends ChannelStateMachine {
   constructor(urlOrOptions, options = {}) {
     const retainedInput = retainNodeConnectInput(urlOrOptions);
     const retainedOptions = Object.freeze({ ...options });
@@ -114,24 +119,28 @@ export class ReconnectingNodeTransport extends ReconnectingTransport {
         : retainedOptions;
     const transportInput =
       retainedInput != null && typeof retainedInput === "object"
-        ? stripReconnectOptions(retainedInput)
+        ? stripChannelOptions(retainedInput)
         : retainedInput;
-    const transportOptions = stripReconnectOptions(retainedOptions);
+    const transportOptions = stripChannelOptions(retainedOptions);
     super(
-      (signal) => NodeTransport.connect(transportInput, { ...transportOptions, signal }),
+      (signal) => RawNodeTransport.connect(transportInput, { ...transportOptions, signal }),
       reconnectOptions,
-      null,
+      (transport) => transport.closed,
       (error) => error?.nativeCode === NativeTransportClosed,
     );
     this.urlOrOptions = retainedInput;
     this.options = retainedOptions;
   }
 
-  /** Creates a managed native client and waits for its first ready generation. */
+  /** Creates a native channel and waits for its first ready generation. */
   static async connect(urlOrOptions, options = {}) {
-    const client = new ReconnectingNodeTransport(urlOrOptions, options);
-    await client.waitUntilReady();
-    return client;
+    const channel = new Channel(urlOrOptions, options);
+    const connectOptions =
+      urlOrOptions != null && typeof urlOrOptions === "object" && !(urlOrOptions instanceof URL)
+        ? { ...urlOrOptions, ...options }
+        : options;
+    await waitForInitialReady(channel, connectOptions);
+    return channel;
   }
 }
 

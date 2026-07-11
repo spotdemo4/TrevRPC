@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { RawNodeTransport } from "trevrpc-js/node/advanced";
+
 import { createRoot, createServiceClient } from "../src/index.js";
-import { NodeTransport } from "../src/node.js";
 
 const LatencyStreamMessageCount = 1;
 const BenchmarkRequest = Object.freeze({ name: "TrevRPC benchmark" });
@@ -79,7 +80,7 @@ server.stderr.on("data", (chunk) => process.stderr.write(chunk));
 let transport;
 try {
   const port = await waitForServerPort(server);
-  transport = await NodeTransport.connect({
+  transport = await RawNodeTransport.connect({
     host: "127.0.0.1",
     port,
     maxStreamsPerSession: 128,
