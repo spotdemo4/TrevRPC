@@ -6,10 +6,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	webtransport "github.com/quic-go/webtransport-go"
 )
 
@@ -18,8 +20,8 @@ const (
 	cancelledWebTransportSessionCode webtransport.SessionErrorCode = 1
 )
 
-// WebTransportDialOptions configures WebTransport client dialing.
-type WebTransportDialOptions struct {
+// RawWebTransportDialOptions configures an advanced single-session WebTransport client.
+type RawWebTransportDialOptions struct {
 	TLSClientConfig         *tls.Config
 	QUICConfig              *quic.Config
 	RequestHeader           http.Header
@@ -27,47 +29,59 @@ type WebTransportDialOptions struct {
 	StreamReorderingTimeout time.Duration
 }
 
-// WebTransportClient sends TrevRPC calls over an established WebTransport session.
-type WebTransportClient struct {
+// RawWebTransportClient sends TrevRPC calls over one WebTransport session.
+// Construct one through Advanced.
+type RawWebTransportClient struct {
 	session      *webtransport.Session
 	maxFrameSize int
 }
 
-// DialWebTransport dials a WebTransport session and wraps it in a TrevRPC client.
-func DialWebTransport(ctx context.Context, url string, options WebTransportDialOptions) (*WebTransportClient, error) {
+var _ ClientTransport = (*RawWebTransportClient)(nil)
+
+func dialRawWebTransport(ctx context.Context, url string, options RawWebTransportDialOptions) (*RawWebTransportClient, error) {
 	dialer := &webtransport.Dialer{
 		TLSClientConfig:         options.TLSClientConfig,
 		QUICConfig:              options.QUICConfig,
 		ApplicationProtocols:    options.ApplicationProtocols,
 		StreamReorderingTimeout: options.StreamReorderingTimeout,
+		// webtransport-go otherwise defaults to DialAddrEarly and permits 0-RTT.
+		DialAddr: quic.DialAddr,
 	}
+	defer dialer.Close()
 
-	_, session, err := dialer.Dial(ctx, url, options.RequestHeader)
+	_, session, err := dialer.Dial(ctx, url, options.RequestHeader.Clone())
 	if err != nil {
 		return nil, webTransportStatus(err)
 	}
 
-	return NewWebTransportClient(session), nil
+	return newRawWebTransportClient(session), nil
 }
 
-// NewWebTransportClient creates a TrevRPC client over an established WebTransport session.
-func NewWebTransportClient(session *webtransport.Session) *WebTransportClient {
-	return &WebTransportClient{session: session, maxFrameSize: DefaultMaxFrameSize}
+func newRawWebTransportClient(session *webtransport.Session) *RawWebTransportClient {
+	return &RawWebTransportClient{session: session, maxFrameSize: DefaultMaxFrameSize}
 }
 
 // WithMaxFrameSize sets the maximum TrevRPC frame size for the client.
-func (t *WebTransportClient) WithMaxFrameSize(maxFrameSize int) *WebTransportClient {
+func (t *RawWebTransportClient) WithMaxFrameSize(maxFrameSize int) *RawWebTransportClient {
 	t.maxFrameSize = maxFrameSize
 	return t
 }
 
 // Session returns the underlying WebTransport session.
-func (t *WebTransportClient) Session() *webtransport.Session {
+func (t *RawWebTransportClient) Session() *webtransport.Session {
 	return t.session
 }
 
+// Close closes the underlying WebTransport session.
+func (t *RawWebTransportClient) Close() error {
+	if t == nil || t.session == nil {
+		return nil
+	}
+	return t.session.CloseWithError(cancelledWebTransportSessionCode, "client closed")
+}
+
 // Call sends a unary RPC request over WebTransport and returns its response.
-func (t *WebTransportClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (t *RawWebTransportClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.session.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, webTransportOrContextStatus(ctx, err)
@@ -94,7 +108,7 @@ func (t *WebTransportClient) Call(ctx context.Context, request *RpcRequest) (*Rp
 }
 
 // StreamingCall sends a streaming RPC request over WebTransport and returns response frames.
-func (t *WebTransportClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+func (t *RawWebTransportClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := t.session.OpenStreamSync(streamCtx)
 	if err != nil {
@@ -109,6 +123,95 @@ func (t *WebTransportClient) StreamingCall(ctx context.Context, request *RpcRequ
 	}()
 
 	return &webTransportResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, stopCancel: stopCancel, maxFrameSize: t.maxFrameSize}, nil
+}
+
+type webTransportChannelConnector struct {
+	url                     string
+	tlsConfig               *tls.Config
+	quicConfig              *quic.Config
+	requestHeader           http.Header
+	applicationProtocols    []string
+	streamReorderingTimeout time.Duration
+	maxFrameSize            int
+}
+
+func newWebTransportChannelConnector(url string, options DialOptions) (*webTransportChannelConnector, error) {
+	if options.TLSConfig == nil {
+		return nil, InvalidArgument("WebTransport dial requires TLSConfig")
+	}
+	maxFrameSize := options.MaxFrameSize
+	if maxFrameSize <= 0 {
+		maxFrameSize = DefaultMaxFrameSize
+	}
+	tlsConfig := options.TLSConfig.Clone()
+	tlsConfig.NextProtos = []string{http3.NextProtoH3}
+	if tlsConfig.ClientSessionCache == nil {
+		tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(defaultChannelSessionCache)
+	}
+	quicConfig := WebTransportQUICClientConfig(maxFrameSize, options.QUICConfig)
+	applyDefaultQUICTransportConfig(quicConfig, options.Transport)
+	if quicConfig.TokenStore == nil {
+		quicConfig.TokenStore = quic.NewLRUTokenStore(defaultChannelTokenOrigins, defaultChannelTokensPerOrigin)
+	}
+
+	return &webTransportChannelConnector{
+		url:                     url,
+		tlsConfig:               tlsConfig,
+		quicConfig:              quicConfig,
+		requestHeader:           options.WebTransport.RequestHeader.Clone(),
+		applicationProtocols:    slices.Clone(options.WebTransport.ApplicationProtocols),
+		streamReorderingTimeout: options.WebTransport.StreamReorderingTimeout,
+		maxFrameSize:            maxFrameSize,
+	}, nil
+}
+
+func (c *webTransportChannelConnector) Connect(ctx context.Context) (channelGeneration, error) {
+	dialer := &webtransport.Dialer{
+		TLSClientConfig:         c.tlsConfig,
+		QUICConfig:              c.quicConfig,
+		ApplicationProtocols:    c.applicationProtocols,
+		StreamReorderingTimeout: c.streamReorderingTimeout,
+		// webtransport-go otherwise defaults to DialAddrEarly and permits 0-RTT.
+		DialAddr: quic.DialAddr,
+	}
+	defer dialer.Close()
+	_, session, err := dialer.Dial(ctx, c.url, c.requestHeader.Clone())
+	if err != nil {
+		return nil, webTransportOrContextStatus(ctx, err)
+	}
+	return &webTransportGeneration{
+		client:  newRawWebTransportClient(session).WithMaxFrameSize(c.maxFrameSize),
+		session: session,
+	}, nil
+}
+
+type webTransportGeneration struct {
+	client  *RawWebTransportClient
+	session *webtransport.Session
+}
+
+func (g *webTransportGeneration) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+	return g.client.Call(ctx, request)
+}
+
+func (g *webTransportGeneration) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+	return g.client.StreamingCall(ctx, request, requestBody)
+}
+
+func (g *webTransportGeneration) Close() error {
+	return g.client.Close()
+}
+
+func (g *webTransportGeneration) Done() <-chan struct{} {
+	return g.session.Context().Done()
+}
+
+func (g *webTransportGeneration) Err() error {
+	return context.Cause(g.session.Context())
+}
+
+func (g *webTransportGeneration) RawWebTransportSession() *webtransport.Session {
+	return g.session
 }
 
 type webTransportResponseStream struct {

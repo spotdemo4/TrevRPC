@@ -6,47 +6,35 @@ client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-Create a generated client with a managed QUIC transport:
+Create a generated client with a reconnecting QUIC channel:
 
 ```go
-transport, err := trevrpc.DialManaged(
+channel, err := trevrpc.Dial(
 	ctx,
 	"127.0.0.1:50051",
-	trevrpc.ManagedDialOptions{
-		DialOptions: trevrpc.DialOptions{TLSConfig: tlsConfig},
-	},
+	trevrpc.DialOptions{TLSConfig: tlsConfig},
 )
 if err != nil {
 	return err
 }
-defer transport.Close()
+defer channel.Close()
 
-client := greeter.NewGreeterClient(transport)
+client := greeter.NewGreeterClient(channel)
 ```
 
-`DialManaged` returns a `ManagedQuicClient`. Reconnects serve future calls only; calls are never
-retried. `tlsConfig` must trust the server certificate and include `trevrpc.ALPN` in `NextProtos`. The
+`Dial` returns a `Channel`. Calls fail immediately while the channel is reconnecting; use
+`WaitUntilReady` when waiting is intentional. An in-flight call always stays on one connection and
+is never retried or replayed. For native QUIC,
+`tlsConfig` must trust the server certificate and include `trevrpc.ALPN` in `NextProtos`. The
 [complete client example](examples/greeter_client/main.go) includes local certificate setup.
 
-### Advanced: low-level QUIC connection
+Pass an `https://` target to the same `Dial` function to use a reconnecting WebTransport channel.
+WebTransport request headers and protocol negotiation settings are available on
+`DialOptions.WebTransport`.
 
-Use `quic.DialAddr` and `NewQuicClient` when the application needs to own the QUIC connection
-lifecycle directly:
-
-```go
-conn, err := quic.DialAddr(
-	ctx,
-	"127.0.0.1:50051",
-	tlsConfig,
-	trevrpc.QUICClientConfig(trevrpc.DefaultMaxFrameSize, nil),
-)
-if err != nil {
-	return err
-}
-defer conn.CloseWithError(0, "client done")
-
-client := greeter.NewGreeterClient(trevrpc.NewQuicClient(conn))
-```
+Low-level single-connection QUIC and WebTransport transports, along with explicit QUIC path
+migration, are available through `trevrpc.Advanced`. They are intended for transport tests,
+benchmarks, and integrations that manage connection lifecycles themselves.
 
 ### Unary
 

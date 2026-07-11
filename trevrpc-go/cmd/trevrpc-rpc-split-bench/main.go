@@ -418,10 +418,11 @@ func grpcClientTransportCredentials(certFile string) (credentials.TransportCrede
 func dialTransport(ctx context.Context, transportName, addr, certFile string) (trevrpc.ClientTransport, error) {
 	switch transportName {
 	case "quic":
-		return trevrpc.Dial(ctx, addr, trevrpc.DialOptions{
-			TLSConfig:  clientTLSConfig(certFile),
-			QUICConfig: quicConfig(),
-		})
+		conn, err := quic.DialAddr(ctx, addr, clientTLSConfig(certFile), trevrpc.QUICClientConfig(trevrpc.DefaultMaxFrameSize, quicConfig()))
+		if err != nil {
+			return nil, err
+		}
+		return trevrpc.Advanced.NewRawQUICClient(conn), nil
 	default:
 		return nil, fmt.Errorf("unsupported transport %q", transportName)
 	}

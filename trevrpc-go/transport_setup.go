@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"net/http"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
@@ -34,6 +36,15 @@ type DialOptions struct {
 	TLSConfig    *tls.Config
 	QUICConfig   *quic.Config
 	MaxFrameSize int
+	OnEvent      func(ChannelEvent)
+	WebTransport WebTransportOptions
+}
+
+// WebTransportOptions configures WebTransport targets passed to Dial.
+type WebTransportOptions struct {
+	RequestHeader           http.Header
+	ApplicationProtocols    []string
+	StreamReorderingTimeout time.Duration
 }
 
 // Listen creates a transport listener for server and binds it to addr.
@@ -52,28 +63,6 @@ func Listen(addr string, server *Server, options ListenOptions) (ServerListener,
 		return nil, transportStatus(err)
 	}
 	return &quicServerListener{listener: listener, server: server}, nil
-}
-
-// Dial connects to addr and returns a TrevRPC client transport.
-func Dial(ctx context.Context, addr string, options DialOptions) (ClientTransport, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, statusFromContextError(err)
-	}
-	maxFrameSize := options.MaxFrameSize
-	if maxFrameSize <= 0 {
-		maxFrameSize = DefaultMaxFrameSize
-	}
-
-	if options.TLSConfig == nil {
-		return nil, InvalidArgument("quic-go dial requires TLSConfig")
-	}
-	config := QUICClientConfig(maxFrameSize, options.QUICConfig)
-	applyDefaultQUICTransportConfig(config, options.Transport)
-	conn, err := quic.DialAddr(ctx, addr, options.TLSConfig, config)
-	if err != nil {
-		return nil, transportOrContextStatus(ctx, err)
-	}
-	return NewQuicClient(conn).WithMaxFrameSize(maxFrameSize), nil
 }
 
 type quicServerListener struct {

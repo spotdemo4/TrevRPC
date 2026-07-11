@@ -172,7 +172,7 @@ func runClientIteration(addr, certPath, token string) error {
 	}
 	defer conn.CloseWithError(0, "client complete")
 
-	transport := trevrpc.NewQuicClient(conn)
+	transport := trevrpc.Advanced.NewRawQUICClient(conn)
 	client := greeter.NewGreeterClient(
 		transport,
 		trevrpc.WithTimeout(5*time.Second),
@@ -259,7 +259,7 @@ func runLifecycleClientIteration(addr, certPath, token string) error {
 	}
 	defer conn.CloseWithError(0, "lifecycle client complete")
 
-	transport := trevrpc.NewQuicClient(conn)
+	transport := trevrpc.Advanced.NewRawQUICClient(conn)
 	client := greeter.NewGreeterClient(
 		transport,
 		trevrpc.WithTimeout(5*time.Second),

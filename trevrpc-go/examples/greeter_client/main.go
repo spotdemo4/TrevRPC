@@ -33,14 +33,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	transport, err := trevrpc.DialManaged(ctx, serverAddr, trevrpc.ManagedDialOptions{
-		DialOptions: trevrpc.DialOptions{TLSConfig: tlsConfig},
-	})
+	transport, err := trevrpc.Dial(ctx, serverAddr, trevrpc.DialOptions{TLSConfig: tlsConfig})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer transport.Close()
-	// Reconnects serve future calls only; calls are never retried.
+	// Calls fail fast during reconnects, and in-flight calls are never retried or replayed.
 
 	client := greeter.NewGreeterClient(
 		transport,

@@ -360,7 +360,7 @@ func startTrevRPCQUICComparisonClient(b *testing.B) *greeter.GreeterClient {
 		}
 	})
 
-	return greeter.NewGreeterClient(trevrpc.NewQuicClient(conn), trevrpc.WithoutStreamIdleTimeout())
+	return greeter.NewGreeterClient(trevrpc.Advanced.NewRawQUICClient(conn), trevrpc.WithoutStreamIdleTimeout())
 }
 
 func newComparisonTrevRPCServer() *trevrpc.Server {

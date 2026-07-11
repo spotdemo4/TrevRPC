@@ -1524,7 +1524,7 @@ func TestQUICTransportConfigDefaultsPreserveExplicitBackendConfig(t *testing.T) 
 	}
 }
 
-func TestQuicClientUnary(t *testing.T) {
+func TestChannelNativeUnary(t *testing.T) {
 	server := NewServer()
 	RegisterUnary(server, "example.Greeter", "SayHello", func() *testMessage { return &testMessage{} }, func(_ context.Context, request *testMessage) (*testMessage, error) {
 		return &testMessage{Value: "hello " + request.Value}, nil
@@ -1559,13 +1559,13 @@ func TestQuicClientUnary(t *testing.T) {
 	}
 }
 
-func TestQuicRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
+func TestRawQUICRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 	running := startTestQUICServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuicClient(conn)
+	transport := Advanced.NewRawQUICClient(conn)
 
 	reply, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "unary"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if err != nil {
@@ -1600,7 +1600,7 @@ func TestQuicRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 	}
 }
 
-func TestWebTransportRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
+func TestRawWebTransportRoundTripsUnaryAndAllStreamingModes(t *testing.T) {
 	running := startTestWebTransportServer(t, func(server *Server) {
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
@@ -1624,7 +1624,7 @@ func TestWebTransportAdmissionAllowsBrowserOrigin(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/trevrpc", WebTransportDialOptions{
+	transport, err := Advanced.DialRawWebTransport(ctx, "https://"+running.addr+"/trevrpc", RawWebTransportDialOptions{
 		TLSClientConfig: running.clientTLS.Clone(),
 		QUICConfig:      WebTransportQUICClientConfig(DefaultMaxFrameSize, nil),
 		RequestHeader:   http.Header{"Origin": []string{origin}},
@@ -1679,7 +1679,7 @@ func TestWebTransportRejectsWithoutAdmission(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/trevrpc", WebTransportDialOptions{
+	transport, err := Advanced.DialRawWebTransport(ctx, "https://"+running.addr+"/trevrpc", RawWebTransportDialOptions{
 		TLSClientConfig: running.clientTLS.Clone(),
 		QUICConfig:      WebTransportQUICClientConfig(DefaultMaxFrameSize, nil),
 	})
@@ -1696,7 +1696,7 @@ func TestWebTransportRejectsUnexpectedPath(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/wrong", WebTransportDialOptions{
+	transport, err := Advanced.DialRawWebTransport(ctx, "https://"+running.addr+"/wrong", RawWebTransportDialOptions{
 		TLSClientConfig: running.clientTLS.Clone(),
 		QUICConfig:      WebTransportQUICClientConfig(DefaultMaxFrameSize, nil),
 	})
@@ -1713,7 +1713,7 @@ func TestQuicAuthFailuresReturnStatusErrors(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	_, err := Unary(context.Background(), NewQuicClient(conn), testServiceName, "SayHello", &testMessage{Value: "missing auth"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	_, err := Unary(context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "SayHello", &testMessage{Value: "missing auth"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if code := StatusFromError(err).Code; code != CodeUnauthenticated {
 		t.Fatalf("expected unauthenticated, got %v (%v)", code, err)
 	}
@@ -1726,7 +1726,7 @@ func TestQuicOversizedTimeoutRejectedOverWire(t *testing.T) {
 	request := NewRpcRequest(testServiceName, "Missing", nil)
 	request.TimeoutNanos = math.MaxInt64 + 1
 
-	response, err := NewQuicClient(conn).Call(context.Background(), request)
+	response, err := Advanced.NewRawQUICClient(conn).Call(context.Background(), request)
 	if err != nil {
 		t.Fatalf("raw transport call failed: %v", err)
 	}
@@ -1746,7 +1746,7 @@ func TestQuicRequestStreamLimitsReturnResourceExhausted(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	_, err := runTestClientStreaming(context.Background(), NewQuicClient(conn), testServiceName, "LotsOfGreetings", []string{"one", "two"}, authenticatedOptions()...)
+	_, err := runTestClientStreaming(context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "LotsOfGreetings", []string{"one", "two"}, authenticatedOptions()...)
 	if code := StatusFromError(err).Code; code != CodeResourceExhausted {
 		t.Fatalf("expected resource exhausted, got %v (%v)", code, err)
 	}
@@ -1759,7 +1759,7 @@ func TestQuicResponseStreamLimitsReturnResourceExhausted(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	replies, err := ServerStreaming(context.Background(), NewQuicClient(conn), testServiceName, "LotsOfReplies", &testMessage{Value: "limited"}, func() *testMessage { return &testMessage{} }, append(authenticatedOptions(), WithMaxResponseMessages(1))...)
+	replies, err := ServerStreaming(context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "LotsOfReplies", &testMessage{Value: "limited"}, func() *testMessage { return &testMessage{} }, append(authenticatedOptions(), WithMaxResponseMessages(1))...)
 	if err != nil {
 		t.Fatalf("server-streaming RPC failed: %v", err)
 	}
@@ -1786,7 +1786,7 @@ func TestQuicStreamConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuicClient(conn)
+	transport := Advanced.NewRawQUICClient(conn)
 	hanging := holdServerStreamOpen(t, transport)
 	defer closeMessageStream(hanging)
 
@@ -1808,7 +1808,7 @@ func TestQuicRequestConcurrencyLimitReturnsUnavailable(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuicClient(conn)
+	transport := Advanced.NewRawQUICClient(conn)
 	hanging := holdServerStreamOpen(t, transport)
 	defer closeMessageStream(hanging)
 
@@ -1830,7 +1830,7 @@ func TestQuicConnectionLimitRefusesNewConnections(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	hanging := holdServerStreamOpen(t, NewQuicClient(conn))
+	hanging := holdServerStreamOpen(t, Advanced.NewRawQUICClient(conn))
 	defer closeMessageStream(hanging)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -1841,7 +1841,7 @@ func TestQuicConnectionLimitRefusesNewConnections(t *testing.T) {
 	}
 	defer secondConn.CloseWithError(0, "test complete")
 
-	_, err = Unary(context.Background(), NewQuicClient(secondConn), testServiceName, "SayHello", &testMessage{Value: "refused"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	_, err = Unary(context.Background(), Advanced.NewRawQUICClient(secondConn), testServiceName, "SayHello", &testMessage{Value: "refused"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if code := StatusFromError(err).Code; code != CodeUnavailable {
 		t.Fatalf("expected unavailable, got %v (%v)", code, err)
 	}
@@ -1855,7 +1855,7 @@ func TestQuicDroppedResponseStreamCancelsServerWork(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	replies := holdServerStreamOpen(t, NewQuicClient(conn))
+	replies := holdServerStreamOpen(t, Advanced.NewRawQUICClient(conn))
 
 	closeMessageStream(replies)
 	waitForMetricCode(t, metrics, CodeCancelled)
@@ -1885,7 +1885,7 @@ func TestQuicServerStreamingContextCancelWhileResponsePending(t *testing.T) {
 	defer conn.CloseWithError(0, "test complete")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	replies, err := ServerStreaming(ctx, NewQuicClient(conn), testServiceName, "LotsOfReplies", &testMessage{Value: "cancel"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	replies, err := ServerStreaming(ctx, Advanced.NewRawQUICClient(conn), testServiceName, "LotsOfReplies", &testMessage{Value: "cancel"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if err != nil {
 		t.Fatalf("start server stream: %v", err)
 	}
@@ -1942,7 +1942,7 @@ func TestQuicClientStreamingDeadlineWhileUploadPending(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	stream, err := ClientStreaming[*testMessage, *testMessage](context.Background(), NewQuicClient(conn), testServiceName, "LotsOfGreetings", func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond), WithMetadata("authorization", []byte("Bearer "+testAuthToken)))
+	stream, err := ClientStreaming[*testMessage, *testMessage](context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "LotsOfGreetings", func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond), WithMetadata("authorization", []byte("Bearer "+testAuthToken)))
 	if err != nil {
 		t.Fatalf("start client stream: %v", err)
 	}
@@ -1979,7 +1979,7 @@ func TestQuicBidirectionalContextCancelWhileUploadAndResponsePending(t *testing.
 	defer conn.CloseWithError(0, "test complete")
 	ctx, cancel := context.WithCancel(context.Background())
 
-	replies, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, NewQuicClient(conn), testServiceName, "BidiHello", func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, Advanced.NewRawQUICClient(conn), testServiceName, "BidiHello", func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
 	if err != nil {
 		t.Fatalf("start bidi stream: %v", err)
 	}
@@ -2014,7 +2014,7 @@ func TestQuicTerminalStatusClosesPendingRequestStream(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	replies, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), NewQuicClient(conn), testServiceName, "RejectUpload", func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "RejectUpload", func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("start rejecting bidi stream: %v", err)
 	}
@@ -2033,7 +2033,7 @@ func TestQuicTerminalOKSurfacesLocalUploadError(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
 
-	replies, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), NewQuicClient(conn), testServiceName, "AcceptAfterUploadError", func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	replies, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "AcceptAfterUploadError", func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("start accepting bidi stream: %v", err)
 	}
@@ -2096,7 +2096,7 @@ func TestWebTransportTerminalOKSurfacesLocalUploadError(t *testing.T) {
 func TestQuicShutdownClosesActiveConnections(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
-	transport := NewQuicClient(conn)
+	transport := Advanced.NewRawQUICClient(conn)
 	running.stop(t)
 	select {
 	case <-conn.Context().Done():
@@ -2143,7 +2143,7 @@ func TestQuicShutdownCancelsActiveUnaryHandler(t *testing.T) {
 	defer conn.CloseWithError(0, "test complete")
 	done := make(chan error, 1)
 	go func() {
-		_, err := Unary(context.Background(), NewQuicClient(conn), testServiceName, "ObserveCancel", &testMessage{}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+		_, err := Unary(context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "ObserveCancel", &testMessage{}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 		done <- err
 	}()
 
@@ -2220,7 +2220,7 @@ func TestQuicRequestPermitReleasedAfterDeadline(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuicClient(conn)
+	transport := Advanced.NewRawQUICClient(conn)
 
 	_, err := Unary(context.Background(), transport, testServiceName, "UntilCancelled", &testMessage{}, func() *testMessage { return &testMessage{} }, WithTimeout(50*time.Millisecond))
 	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
@@ -2240,7 +2240,7 @@ func TestQuicLocalCloseMapsToCancelled(t *testing.T) {
 	conn := connectTestQUICClient(t, running)
 	conn.CloseWithError(0, "client closed")
 
-	_, err := Unary(context.Background(), NewQuicClient(conn), testServiceName, "SayHello", &testMessage{Value: "after local close"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
+	_, err := Unary(context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "SayHello", &testMessage{Value: "after local close"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
 	if code := StatusFromError(err).Code; code != CodeCancelled {
 		t.Fatalf("expected cancelled, got %v (%v)", code, err)
 	}
@@ -2283,7 +2283,7 @@ func TestQuicMTLSRejectsClientsWithoutCertificates(t *testing.T) {
 	defer cancel()
 	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS, &quic.Config{})
 	if err == nil {
-		_, rpcErr := Unary(context.Background(), NewQuicClient(conn), testServiceName, "SayHello", &testMessage{Value: "anonymous"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
+		_, rpcErr := Unary(context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "SayHello", &testMessage{Value: "anonymous"}, func() *testMessage { return &testMessage{} }, WithTimeout(100*time.Millisecond))
 		conn.CloseWithError(0, "test complete")
 		if code := StatusFromError(rpcErr).Code; code != CodeUnavailable {
 			t.Fatalf("expected unavailable for anonymous mTLS client, got %v (%v)", code, rpcErr)
@@ -2488,7 +2488,7 @@ func TestQuicLargePartialInitialBodyDoesNotHoldRequestPermit(t *testing.T) {
 		t.Fatalf("write partial large body: %v", err)
 	}
 
-	response, err := Unary(context.Background(), NewQuicClient(conn), testServiceName, "SayHello", &testMessage{Value: "after partial"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	response, err := Unary(context.Background(), Advanced.NewRawQUICClient(conn), testServiceName, "SayHello", &testMessage{Value: "after partial"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
 	if err != nil {
 		t.Fatalf("request permit should not be held before initial frame completes: %v", err)
 	}
@@ -2521,7 +2521,7 @@ func TestQuicHandlesManyConcurrentUnaryCalls(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuicClient(conn)
+	transport := Advanced.NewRawQUICClient(conn)
 
 	var group sync.WaitGroup
 	errors := make(chan error, 64)
@@ -2557,7 +2557,7 @@ func TestQuicHandlesBoundedMixedLoad(t *testing.T) {
 	})
 	conn := connectTestQUICClient(t, running)
 	defer conn.CloseWithError(0, "test complete")
-	transport := NewQuicClient(conn)
+	transport := Advanced.NewRawQUICClient(conn)
 
 	var group sync.WaitGroup
 	errors := make(chan error, 64)
@@ -2744,12 +2744,12 @@ func readRawTestStreamResponse(t *testing.T, stream rawTestResponseStream) *RpcR
 	return response
 }
 
-func connectTestWebTransportClient(t *testing.T, running *runningTestQUICServer) *WebTransportClient {
+func connectTestWebTransportClient(t *testing.T, running *runningTestQUICServer) *RawWebTransportClient {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	transport, err := DialWebTransport(ctx, "https://"+running.addr+"/trevrpc", WebTransportDialOptions{
+	transport, err := Advanced.DialRawWebTransport(ctx, "https://"+running.addr+"/trevrpc", RawWebTransportDialOptions{
 		TLSClientConfig: running.clientTLS.Clone(),
 		QUICConfig:      WebTransportQUICClientConfig(DefaultMaxFrameSize, nil),
 	})
@@ -2961,7 +2961,6 @@ func (s *firstThenPendingTestMessages) Recv() (*testMessage, error) {
 }
 
 func (s *firstThenPendingTestMessages) Close() error {
-	s.first = nil
 	return nil
 }
 

@@ -16,30 +16,32 @@ const cancelledStreamCode quic.StreamErrorCode = 1
 
 const maxMessageFrameBatch = 16
 
-// QuicClient sends TrevRPC calls over an established QUIC connection.
-type QuicClient struct {
+// RawQUICClient sends TrevRPC calls over one caller-owned QUIC connection.
+// Construct one through Advanced.NewRawQUICClient.
+type RawQUICClient struct {
 	conn         *quic.Conn
 	maxFrameSize int
 }
 
-// NewQuicClient creates a TrevRPC client over an established QUIC connection.
-func NewQuicClient(conn *quic.Conn) *QuicClient {
-	return &QuicClient{conn: conn, maxFrameSize: DefaultMaxFrameSize}
+var _ ClientTransport = (*RawQUICClient)(nil)
+
+func newRawQUICClient(conn *quic.Conn) *RawQUICClient {
+	return &RawQUICClient{conn: conn, maxFrameSize: DefaultMaxFrameSize}
 }
 
 // WithMaxFrameSize sets the maximum TrevRPC frame size for the client.
-func (t *QuicClient) WithMaxFrameSize(maxFrameSize int) *QuicClient {
+func (t *RawQUICClient) WithMaxFrameSize(maxFrameSize int) *RawQUICClient {
 	t.maxFrameSize = maxFrameSize
 	return t
 }
 
 // Conn returns the underlying QUIC connection.
-func (t *QuicClient) Conn() *quic.Conn {
+func (t *RawQUICClient) Conn() *quic.Conn {
 	return t.conn
 }
 
 // Close closes the underlying QUIC connection.
-func (t *QuicClient) Close() error {
+func (t *RawQUICClient) Close() error {
 	if t == nil || t.conn == nil {
 		return nil
 	}
@@ -47,7 +49,7 @@ func (t *QuicClient) Close() error {
 }
 
 // Call sends a unary RPC request over QUIC and returns its response.
-func (t *QuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (t *RawQUICClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
 	stream, err := t.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, transportOrContextStatus(ctx, err)
@@ -74,7 +76,7 @@ func (t *QuicClient) Call(ctx context.Context, request *RpcRequest) (*RpcRespons
 }
 
 // StreamingCall sends a streaming RPC request over QUIC and returns response frames.
-func (t *QuicClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+func (t *RawQUICClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := t.conn.OpenStreamSync(streamCtx)
 	if err != nil {
