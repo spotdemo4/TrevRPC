@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package trevrpc.benchmark.v1;
+
+service BenchmarkService {
+  rpc TinyUnary(TinyRequest) returns (TinyResponse);
+}
+
+message TinyRequest {
+  string name = 1;
+}
+
+message TinyResponse {
+  string message = 1;
+}
+
+message Attribute {
+  string key = 1;
+  string value = 2;
+}
+
+message MetricSample {
+  int64 timestamp_ms = 1;
+  uint64 latency_ns = 2;
+  uint64 bytes = 3;
+}
+
+message TelemetryEvent {
+  uint64 id = 1;
+  string service = 2;
+  repeated string tags = 3;
+  repeated MetricSample samples = 4;
+  repeated Attribute attributes = 5;
+}
+
+message LineItem {
+  string sku = 1;
+  uint32 quantity = 2;
+  uint64 unit_price_cents = 3;
+  string warehouse_id = 4;
+  bool gift_wrap = 5;
+}
+
+message ShippingAddress {
+  string recipient = 1;
+  string line1 = 2;
+  string line2 = 3;
+  string city = 4;
+  string region = 5;
+  string postal_code = 6;
+  string country = 7;
+}
+
+message PaymentMethod {
+  string token = 1;
+  string network = 2;
+  string last_four = 3;
+  string billing_postal_code = 4;
+}
+
+message CheckoutRequest {
+  string request_id = 1;
+  string method = 2;
+  uint64 customer_id = 3;
+  string session_id = 4;
+  string currency = 5;
+  repeated LineItem items = 6;
+  ShippingAddress shipping_address = 7;
+  PaymentMethod payment_method = 8;
+  repeated string coupon_codes = 9;
+  repeated Attribute attributes = 10;
+}
+
+message Shipment {
+  string shipment_id = 1;
+  string carrier = 2;
+  string service_level = 3;
+  uint32 estimated_days = 4;
+  repeated string item_skus = 5;
+}
+
+message CheckoutResponse {
+  string request_id = 1;
+  string order_id = 2;
+  string status = 3;
+  uint64 subtotal_cents = 4;
+  uint64 discount_cents = 5;
+  uint64 tax_cents = 6;
+  uint64 shipping_cents = 7;
+  uint64 total_cents = 8;
+  repeated Shipment shipments = 9;
+  repeated Attribute attributes = 10;
+}
+
+message StreamControl {
+  uint32 message_count = 1;
+}

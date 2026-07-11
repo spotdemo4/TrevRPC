@@ -89,6 +89,7 @@
               # util
               bumper
               fix-hash
+              jq
             ];
           };
 
@@ -158,6 +159,32 @@
 
         # nix build [#...]
         packages = {
+          rust-matrix = pkgs.rustPlatform.buildRustPackage {
+            pname = "trevrpc-rust-matrix";
+            version = "0.1.0";
+
+            src = ./.;
+            cargoRoot = "bench/rust-matrix";
+            buildAndTestSubdir = "bench/rust-matrix";
+            cargoLock.lockFile = ./bench/rust-matrix/Cargo.lock;
+            nativeBuildInputs = with pkgs; [ protobuf ];
+
+            installPhase = ''
+              runHook preInstall
+              peer=$(find target -path '*/release/trevrpc-rust-matrix-peer' -type f -perm -0100 | head -n1)
+              reporter=$(find target -path '*/release/trevrpc-rust-matrix-report' -type f -perm -0100 | head -n1)
+              install -Dm755 "$peer" $out/bin/trevrpc-rust-matrix-peer
+              install -Dm755 "$reporter" $out/bin/trevrpc-rust-matrix-report
+              runHook postInstall
+            '';
+
+            meta = {
+              description = "Controlled Rust RPC benchmark matrix for TrevRPC";
+              license = pkgs.lib.licenses.mit;
+              platforms = pkgs.lib.platforms.linux;
+            };
+          };
+
           trevrpc-c = pkgs.stdenv.mkDerivation (
             final: with pkgs.lib; {
               pname = "trevrpc-c";
@@ -441,6 +468,28 @@
 
         # nix flake check
         checks = pkgs.mkChecks {
+          rust-matrix = self.packages.${system}.rust-matrix.overrideAttrs {
+            installPhase = ''
+              touch $out
+            '';
+          };
+
+          rust-matrix-harness =
+            pkgs.runCommand "trevrpc-rust-matrix-harness-check"
+              {
+                nativeBuildInputs = with pkgs; [
+                  jq
+                  openssl
+                ];
+              }
+              ''
+                PEER=${self.packages.${system}.rust-matrix}/bin/trevrpc-rust-matrix-peer \
+                  bash ${./bench/test_rust_matrix_peer.sh}
+                REPORTER=${self.packages.${system}.rust-matrix}/bin/trevrpc-rust-matrix-report \
+                  bash ${./bench/test_run_rust_matrix_report.sh}
+                touch $out
+              '';
+
           c = self.packages.${system}.trevrpc-c.overrideAttrs {
             installPhase = ''
               touch $out

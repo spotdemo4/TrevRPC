@@ -1,0 +1,48 @@
+[package]
+name = "trevrpc-rust-matrix"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+publish = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+default_trait_access = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+cast_precision_loss = "allow"
+
+[dependencies]
+hdrhistogram = "7.5.4"
+libc = "0.2.180"
+prost = "0.14.4"
+quinn = "0.11.9"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tokio = { version = "1.49.0", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tonic = { version = "0.14.2", features = ["transport", "tls-ring"] }
+tonic-prost = "0.14.2"
+trevrpc = { path = "../../trevrpc-rust", default-features = false, features = [
+  "client",
+  "server",
+  "quinn",
+] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"
+
+[[bin]]
+name = "trevrpc-rust-matrix-peer"
+path = "src/bin/peer.rs"
+
+[[bin]]
+name = "trevrpc-rust-matrix-report"
+path = "src/bin/report.rs"

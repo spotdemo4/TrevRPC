@@ -16,6 +16,7 @@
 # rust
 /target/
 /trevrpc-rust/target/
+/bench/rust-matrix/target/
 
 # go
 /trevrpc-go/bin/
