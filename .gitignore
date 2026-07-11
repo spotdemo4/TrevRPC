@@ -23,3 +23,9 @@
 # javascript
 /trevrpc-js/node_modules/
 /trevrpc-js/build/
+
+# kotlin
+/trevrpc-kotlin/.gradle/
+/trevrpc-kotlin/.kotlin/
+/trevrpc-kotlin/build/
+/trevrpc-kotlin/**/build/

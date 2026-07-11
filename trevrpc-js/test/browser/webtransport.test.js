@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,6 +14,17 @@ const jsRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const repoRoot = resolve(jsRoot, "..");
 const goRoot = join(repoRoot, "trevrpc-go");
 const rustRoot = join(repoRoot, "trevrpc-rust");
+const installedKotlinServer = join(
+  repoRoot,
+  "trevrpc-kotlin/examples/build/install/trevrpc-xruntime-kotlin/bin/trevrpc-xruntime-kotlin",
+);
+const configuredLifecycleKotlinServer = nonemptyEnv("TREVRPC_BROWSER_LIFECYCLE_KOTLIN_SERVER");
+const installedKotlinServerUsable =
+  existsSync(installedKotlinServer) &&
+  spawnSync("java", ["-version"], { stdio: "ignore" }).status === 0;
+const lifecycleKotlinServerPath =
+  configuredLifecycleKotlinServer ?? (installedKotlinServerUsable ? installedKotlinServer : null);
+const kotlinServerPath = lifecycleKotlinServerPath;
 const browserTypes = { chromium, firefox, webkit };
 const selectedBrowserName = (process.env.TREVRPC_BROWSER ?? "chromium").toLowerCase();
 const stableWebTransportBrowsers = new Set(["chromium"]);
@@ -61,6 +73,31 @@ browserTest(
         );
         assert.match(output, /BidiHello: stream hello, Rust Playwright bidi 1/);
         assert.match(output, /BidiHello: stream hello, Rust Playwright bidi 2/);
+      },
+    });
+  },
+);
+
+browserTest(
+  "browser WebTransport client calls Kotlin greeter example",
+  {
+    skip: kotlinServerPath == null ? kotlinServerSkipReason() : undefined,
+    timeout: 120_000,
+  },
+  async () => {
+    await runBrowserGreeterScenario({
+      server: servers.kotlin,
+      name: "Kotlin Playwright",
+      assertOutput(output) {
+        assert.match(output, /SayHello: hello, Kotlin Playwright/);
+        assert.match(output, /LotsOfReplies: hello, Kotlin Playwright/);
+        assert.match(output, /LotsOfReplies: goodbye, Kotlin Playwright/);
+        assert.match(
+          output,
+          /LotsOfGreetings: Kotlin Playwright client stream 1,Kotlin Playwright client stream 2/,
+        );
+        assert.match(output, /BidiHello: echo, Kotlin Playwright bidi 1/);
+        assert.match(output, /BidiHello: echo, Kotlin Playwright bidi 2/);
       },
     });
   },
@@ -169,6 +206,20 @@ browserTest(
 );
 
 browserTest(
+  "browser WebTransport Kotlin lifecycle server matches Go lifecycle scenarios",
+  {
+    skip: lifecycleKotlinServerPath == null ? kotlinServerSkipReason() : undefined,
+    timeout: 120_000,
+  },
+  async () => {
+    await runBrowserLifecycleSuite({
+      cases: lifecycleCases,
+      server: servers.lifecycleKotlin,
+    });
+  },
+);
+
+browserTest(
   "browser WebTransport page close cancels open response stream",
   { timeout: 120_000 },
   async () => {
@@ -233,9 +284,20 @@ browserTest(
   },
 );
 
+browserTest(
+  "browser WebTransport Kotlin server shutdown mid-stream fails active response stream",
+  {
+    skip: lifecycleKotlinServerPath == null ? kotlinServerSkipReason() : undefined,
+    timeout: 120_000,
+  },
+  async () => {
+    await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycleKotlin });
+  },
+);
+
 if (envFlag("TREVRPC_BROWSER_SOAK")) {
   browserTest(
-    "browser WebTransport lifecycle soak across Go and Rust servers",
+    "browser WebTransport lifecycle soak across configured servers",
     { timeout: positiveEnv("TREVRPC_BROWSER_SOAK_TIMEOUT_MS", 1_800_000) },
     async () => {
       const iterations = positiveEnv("TREVRPC_BROWSER_SOAK_ITERATIONS", 10);
@@ -244,6 +306,13 @@ if (envFlag("TREVRPC_BROWSER_SOAK")) {
         await runBrowserLifecycleSuite({ cases: lifecycleCases, server: servers.lifecycleRust });
         await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycle });
         await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycleRust });
+        if (lifecycleKotlinServerPath != null) {
+          await runBrowserLifecycleSuite({
+            cases: lifecycleCases,
+            server: servers.lifecycleKotlin,
+          });
+          await runBrowserLifecycleServerShutdownScenario({ server: servers.lifecycleKotlin });
+        }
       }
     },
   );
@@ -286,6 +355,19 @@ const servers = {
       );
     },
   },
+  kotlin: {
+    readyPattern: /READY https:\/\/[^\s]+\/trevrpc/,
+    certificatePattern: /certificate written to/,
+    spawn({ addr, authorities, origin, certPath }) {
+      if (kotlinServerPath == null) {
+        throw new Error(kotlinServerSkipReason());
+      }
+      return spawnManaged(kotlinServerPath, ["-mode", "browser-server"], {
+        cwd: repoRoot,
+        env: serverEnv({ addr, authorities, origin, certPath }),
+      });
+    },
+  },
   lifecycle: {
     readyPattern: /READY https:\/\/[^\s]+\/trevrpc/,
     certificatePattern: /certificate written to/,
@@ -320,6 +402,19 @@ const servers = {
         ["run", "--quiet", "--example", "browser_lifecycle_server", "--", addr],
         options,
       );
+    },
+  },
+  lifecycleKotlin: {
+    readyPattern: /READY https:\/\/[^\s]+\/trevrpc/,
+    certificatePattern: /certificate written to/,
+    spawn({ addr, authorities, origin, certPath, maxStreams }) {
+      if (lifecycleKotlinServerPath == null) {
+        throw new Error(kotlinServerSkipReason());
+      }
+      return spawnManaged(lifecycleKotlinServerPath, ["-mode", "browser-server"], {
+        cwd: repoRoot,
+        env: serverEnv({ addr, authorities, origin, certPath, maxStreams }),
+      });
     },
   },
 };
@@ -816,12 +911,17 @@ async function runBrowserGreeterScenario({
 }
 
 function browserTest(name, options, fn) {
-  if (browserSkipReason == null) {
+  const skipReason = browserSkipReason ?? options.skip;
+  if (skipReason == null) {
     test(name, options, fn);
     return;
   }
 
-  test(name, { ...options, skip: browserSkipReason }, fn);
+  test(name, { ...options, skip: skipReason }, fn);
+}
+
+function kotlinServerSkipReason() {
+  return "set TREVRPC_BROWSER_LIFECYCLE_KOTLIN_SERVER to a runnable binary or provide Java and a built Kotlin examples installDist";
 }
 
 function browserCoverageSkipReason(browserName) {
@@ -972,6 +1072,11 @@ function freePort() {
 function envFlag(name) {
   const value = process.env[name];
   return value === "1" || value === "true" || value === "TRUE" || value === "yes";
+}
+
+function nonemptyEnv(name) {
+  const value = process.env[name];
+  return value == null || value === "" ? null : value;
 }
 
 function positiveEnv(name, fallback) {

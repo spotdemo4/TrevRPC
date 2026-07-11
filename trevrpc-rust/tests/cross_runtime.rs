@@ -6,6 +6,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -89,15 +90,65 @@ impl MessageStream<greeter::HelloReply> for EchoReplies {
     }
 }
 
-struct GoServer {
-    child: Child,
-    addr: SocketAddr,
+#[derive(Clone, Copy)]
+enum ExternalRuntime {
+    Go,
+    Kotlin,
 }
 
-impl Drop for GoServer {
+impl ExternalRuntime {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Go => "Go",
+            Self::Kotlin => "Kotlin",
+        }
+    }
+
+    const fn writes_certificate_line(self) -> bool {
+        matches!(self, Self::Kotlin)
+    }
+
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Go => "go",
+            Self::Kotlin => "kotlin",
+        }
+    }
+}
+
+struct ProcessServer {
+    child: Child,
+    addr: SocketAddr,
+    stdout_drain: Option<ThreadJoinHandle<std::io::Result<u64>>>,
+    stopped: bool,
+}
+
+impl ProcessServer {
+    fn shutdown(mut self) -> TestResult {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> TestResult {
+        if self.stopped {
+            return Ok(());
+        }
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        self.child.wait()?;
+        if let Some(stdout_drain) = self.stdout_drain.take() {
+            stdout_drain
+                .join()
+                .map_err(|_| "server stdout drain thread panicked")??;
+        }
+        self.stopped = true;
+        Ok(())
+    }
+}
+
+impl Drop for ProcessServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.stop();
     }
 }
 
@@ -138,19 +189,7 @@ async fn rust_client_talks_to_go_server_over_quic() -> TestResult {
     let Some(go_binary) = go_binary() else {
         return Ok(());
     };
-    let cert_path = temp_cert_path("go-server");
-    let go_server = spawn_go_server(&go_binary, &cert_path)?;
-    let (endpoint, connection, client) = connect_rust_client(go_server.addr, &cert_path).await?;
-
-    exercise_rust_client(&client).await?;
-    expect_rust_auth_failure(&client).await;
-    expect_rust_protocol_error(&connection).await?;
-
-    connection.close(0_u32.into(), b"test complete");
-    endpoint.wait_idle().await;
-    drop(go_server);
-    let _ = std::fs::remove_file(cert_path);
-    Ok(())
+    rust_client_talks_to_external_server(go_binary, ExternalRuntime::Go).await
 }
 
 #[tokio::test]
@@ -158,26 +197,185 @@ async fn go_client_talks_to_rust_server_over_quic() -> TestResult {
     let Some(go_binary) = go_binary() else {
         return Ok(());
     };
-    let cert_path = temp_cert_path("rust-server");
+    external_client_talks_to_rust_server(go_binary, ExternalRuntime::Go).await
+}
+
+#[tokio::test]
+async fn rust_client_talks_to_kotlin_server_over_quic() -> TestResult {
+    let Some(kotlin_binary) = kotlin_binary() else {
+        return Ok(());
+    };
+    rust_client_talks_to_external_server(kotlin_binary, ExternalRuntime::Kotlin).await
+}
+
+#[tokio::test]
+async fn kotlin_client_talks_to_rust_server_over_quic() -> TestResult {
+    let Some(kotlin_binary) = kotlin_binary() else {
+        return Ok(());
+    };
+    external_client_talks_to_rust_server(kotlin_binary, ExternalRuntime::Kotlin).await
+}
+
+#[tokio::test]
+#[ignore = "scheduled/manual cross-runtime lifecycle stress"]
+async fn cross_runtime_lifecycle_stress() -> TestResult {
+    let binaries = [
+        (go_binary(), ExternalRuntime::Go),
+        (kotlin_binary(), ExternalRuntime::Kotlin),
+    ];
+    if binaries.iter().all(|(binary, _)| binary.is_none()) {
+        return Ok(());
+    }
+    let iterations = lifecycle_iterations()?;
+
+    for (binary, runtime) in binaries {
+        if let Some(binary) = binary {
+            stress_external_runtime_lifecycle(binary, runtime, iterations).await?;
+        }
+    }
+    Ok(())
+}
+
+fn go_binary() -> Option<PathBuf> {
+    std::env::var_os("TREVRPC_XRUNTIME_GO").map(PathBuf::from)
+}
+
+fn kotlin_binary() -> Option<PathBuf> {
+    std::env::var_os("TREVRPC_XRUNTIME_KOTLIN").map(PathBuf::from)
+}
+
+async fn rust_client_talks_to_external_server(
+    binary: PathBuf,
+    runtime: ExternalRuntime,
+) -> TestResult {
+    let cert_path = temp_cert_path(&format!("{}-server", runtime.slug()));
+    let server = spawn_external_server(&binary, &cert_path, runtime)?;
+    let result: TestResult = async {
+        let (endpoint, connection, client) = connect_rust_client(server.addr, &cert_path).await?;
+
+        exercise_rust_client(&client).await?;
+        expect_rust_auth_failure(&client).await;
+        expect_rust_protocol_error(&connection).await?;
+
+        connection.close(0_u32.into(), b"test complete");
+        endpoint.wait_idle().await;
+        Ok(())
+    }
+    .await;
+    let shutdown = server.shutdown();
+    let _ = std::fs::remove_file(cert_path);
+    result?;
+    shutdown
+}
+
+async fn external_client_talks_to_rust_server(
+    binary: PathBuf,
+    runtime: ExternalRuntime,
+) -> TestResult {
+    let cert_path = temp_cert_path(&format!("rust-server-for-{}", runtime.slug()));
     let rust_server = spawn_rust_server(&cert_path)?;
-    let addr = rust_server.addr;
+    let result = run_external_client(
+        binary,
+        runtime,
+        "client",
+        rust_server.addr,
+        &cert_path,
+        None,
+    )
+    .await;
+    let shutdown = rust_server.shutdown().await;
+    let _ = std::fs::remove_file(cert_path);
+    result?;
+    shutdown
+}
+
+async fn stress_external_runtime_lifecycle(
+    binary: PathBuf,
+    runtime: ExternalRuntime,
+    iterations: usize,
+) -> TestResult {
+    let external_cert_path = temp_cert_path(&format!("{}-lifecycle-server", runtime.slug()));
+    let external_server = spawn_external_server(&binary, &external_cert_path, runtime)?;
+    let rust_client_result: TestResult = async {
+        for iteration in 0..iterations {
+            let (endpoint, connection, client) =
+                connect_rust_client(external_server.addr, &external_cert_path)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "Rust client -> {} lifecycle iteration {} connect: {error}",
+                            runtime.name(),
+                            iteration + 1
+                        )
+                    })?;
+            stress_rust_client_lifecycle(&client)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Rust client -> {} lifecycle iteration {} failed: {error}",
+                        runtime.name(),
+                        iteration + 1
+                    )
+                })?;
+            connection.close(0_u32.into(), b"lifecycle iteration complete");
+            endpoint.wait_idle().await;
+        }
+        Ok(())
+    }
+    .await;
+    let external_shutdown = external_server.shutdown();
+    let _ = std::fs::remove_file(external_cert_path);
+    rust_client_result?;
+    external_shutdown?;
+
+    let rust_cert_path = temp_cert_path(&format!("rust-lifecycle-server-for-{}", runtime.slug()));
+    let rust_server = spawn_rust_server(&rust_cert_path)?;
+    let external_client_result = run_external_client(
+        binary,
+        runtime,
+        "lifecycle-client",
+        rust_server.addr,
+        &rust_cert_path,
+        Some(iterations),
+    )
+    .await;
+    let rust_shutdown = rust_server.shutdown().await;
+    let _ = std::fs::remove_file(rust_cert_path);
+    external_client_result?;
+    rust_shutdown
+}
+
+async fn run_external_client(
+    binary: PathBuf,
+    runtime: ExternalRuntime,
+    mode: &'static str,
+    addr: SocketAddr,
+    cert_path: &Path,
+    iterations: Option<usize>,
+) -> TestResult {
+    let cert_path = cert_path.to_owned();
     let output = tokio::task::spawn_blocking(move || {
-        Command::new(go_binary)
+        let mut command = Command::new(binary);
+        command
             .arg("-mode")
-            .arg("client")
+            .arg(mode)
             .arg("-addr")
             .arg(addr.to_string())
             .arg("-cert")
             .arg(cert_path)
             .arg("-token")
-            .arg(AUTH_TOKEN)
-            .output()
+            .arg(AUTH_TOKEN);
+        if let Some(iterations) = iterations {
+            command.arg("-iterations").arg(iterations.to_string());
+        }
+        command.output()
     })
     .await??;
 
     if !output.status.success() {
         return Err(format!(
-            "Go client failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            "{} {mode} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            runtime.name(),
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -185,53 +383,7 @@ async fn go_client_talks_to_rust_server_over_quic() -> TestResult {
         .into());
     }
 
-    rust_server.shutdown().await
-}
-
-#[tokio::test]
-#[ignore = "scheduled/manual cross-runtime lifecycle stress"]
-async fn cross_runtime_lifecycle_stress() -> TestResult {
-    let Some(go_binary) = go_binary() else {
-        return Ok(());
-    };
-    let iterations = lifecycle_iterations()?;
-
-    let go_cert_path = temp_cert_path("go-lifecycle-server");
-    let go_server = spawn_go_server(&go_binary, &go_cert_path)?;
-    for iteration in 0..iterations {
-        let (endpoint, connection, client) = connect_rust_client(go_server.addr, &go_cert_path)
-            .await
-            .map_err(|error| {
-                format!(
-                    "rust client lifecycle iteration {} connect: {error}",
-                    iteration + 1
-                )
-            })?;
-        if let Err(error) = stress_rust_client_lifecycle(&client).await {
-            return Err(format!(
-                "rust client lifecycle iteration {} failed: {error}",
-                iteration + 1
-            )
-            .into());
-        }
-        connection.close(0_u32.into(), b"lifecycle iteration complete");
-        endpoint.wait_idle().await;
-    }
-    drop(go_server);
-    let _ = std::fs::remove_file(&go_cert_path);
-
-    let rust_cert_path = temp_cert_path("rust-lifecycle-server");
-    let rust_server = spawn_rust_server(&rust_cert_path)?;
-    let addr = rust_server.addr;
-    let result = run_go_lifecycle_client(go_binary, addr, rust_cert_path.clone(), iterations).await;
-    let shutdown = rust_server.shutdown().await;
-    let _ = std::fs::remove_file(rust_cert_path);
-    result?;
-    shutdown
-}
-
-fn go_binary() -> Option<PathBuf> {
-    std::env::var_os("TREVRPC_XRUNTIME_GO").map(PathBuf::from)
+    Ok(())
 }
 
 fn lifecycle_iterations() -> TestResult<usize> {
@@ -253,8 +405,12 @@ fn temp_cert_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("trevrpc-cross-runtime-{name}-{unique}.pem"))
 }
 
-fn spawn_go_server(go_binary: &Path, cert_path: &Path) -> TestResult<GoServer> {
-    let mut child = Command::new(go_binary)
+fn spawn_external_server(
+    binary: &Path,
+    cert_path: &Path,
+    runtime: ExternalRuntime,
+) -> TestResult<ProcessServer> {
+    let mut child = Command::new(binary)
         .arg("-mode")
         .arg("server")
         .arg("-addr")
@@ -267,18 +423,53 @@ fn spawn_go_server(go_binary: &Path, cert_path: &Path) -> TestResult<GoServer> {
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("Go server stdout should be piped")?;
-    let mut ready = String::new();
-    BufReader::new(stdout).read_line(&mut ready)?;
-    let Some(addr) = ready.strip_prefix("READY ") else {
-        return Err(format!("unexpected Go server ready line: {ready:?}").into());
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("{} server stdout should be piped", runtime.name()).into());
     };
-    let addr = addr.trim().parse::<SocketAddr>()?;
+    let mut stdout = BufReader::new(stdout);
+    let startup = (|| -> TestResult<SocketAddr> {
+        let mut ready = String::new();
+        stdout.read_line(&mut ready)?;
+        let Some(addr) = ready.strip_prefix("READY ") else {
+            return Err(
+                format!("unexpected {} server ready line: {ready:?}", runtime.name()).into(),
+            );
+        };
+        let addr = addr.trim().parse::<SocketAddr>()?;
 
-    Ok(GoServer { child, addr })
+        if runtime.writes_certificate_line() {
+            let mut certificate = String::new();
+            stdout.read_line(&mut certificate)?;
+            let expected = format!("certificate written to {}", cert_path.display());
+            if certificate.trim() != expected {
+                return Err(format!(
+                    "unexpected {} server certificate line: {certificate:?}; expected {expected:?}",
+                    runtime.name()
+                )
+                .into());
+            }
+        }
+
+        Ok(addr)
+    })();
+    let addr = match startup {
+        Ok(addr) => addr,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let stdout_drain = std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
+
+    Ok(ProcessServer {
+        child,
+        addr,
+        stdout_drain: Some(stdout_drain),
+        stopped: false,
+    })
 }
 
 async fn connect_rust_client(
@@ -502,41 +693,6 @@ async fn stress_rust_client_lifecycle(
     drop(replies);
 
     tokio::time::sleep(Duration::from_millis(5)).await;
-    Ok(())
-}
-
-async fn run_go_lifecycle_client(
-    go_binary: PathBuf,
-    addr: SocketAddr,
-    cert_path: PathBuf,
-    iterations: usize,
-) -> TestResult {
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new(go_binary)
-            .arg("-mode")
-            .arg("lifecycle-client")
-            .arg("-addr")
-            .arg(addr.to_string())
-            .arg("-cert")
-            .arg(cert_path)
-            .arg("-token")
-            .arg(AUTH_TOKEN)
-            .arg("-iterations")
-            .arg(iterations.to_string())
-            .output()
-    })
-    .await??;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Go lifecycle client failed with status {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-
     Ok(())
 }
 

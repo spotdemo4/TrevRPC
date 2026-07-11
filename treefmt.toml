@@ -19,6 +19,12 @@ command = "clang-format"
 options = ["-i"]
 includes = ["*.c", "*.h"]
 
+[formatter.ktlint]
+command = "ktlint"
+options = ["--format"]
+includes = ["*.kt", "*.kts"]
+excludes = ["trevrpc-kotlin/examples/generated/**"]
+
 [formatter.oxfmt]
 command = "oxfmt"
 options = ["--write"]

@@ -1,0 +1,16 @@
+package zip.trev.trevrpc
+
+const val ALPN: String = "trevrpc/1"
+const val WIRE_VERSION: UInt = 1u
+const val DEFAULT_MAX_FRAME_SIZE: Int = 4 * 1024 * 1024
+const val MAX_METADATA_ENTRIES: Int = 64
+const val MAX_METADATA_KEY_LENGTH: Int = 128
+const val MAX_METADATA_VALUE_LENGTH: Int = 8 * 1024
+const val MAX_METADATA_TOTAL_SIZE: Int = 64 * 1024
+const val RESERVED_METADATA_PREFIX: String = "trevrpc-"
+const val DEFAULT_MAX_STREAM_MESSAGES: Int = 4096
+const val DEFAULT_MAX_STREAM_BODY_SIZE: Long = 16L * 1024 * 1024
+const val DEFAULT_MAX_CONCURRENT_CONNECTIONS: Int = 256
+const val DEFAULT_MAX_CONCURRENT_STREAMS_PER_CONNECTION: Int = 64
+const val DEFAULT_MAX_CONCURRENT_REQUESTS: Int = 1024
+const val DEFAULT_CALL_CHANNEL_CAPACITY: Int = 1

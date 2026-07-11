@@ -65,6 +65,12 @@
               nodejs_24
               playwright-driver.browsers
 
+              # kotlin / android
+              jdk21
+              gradle
+              protobuf
+              androidenv.androidPkgs.androidsdk
+
               # lint
               clippy
               cargo-audit
@@ -77,6 +83,7 @@
               rustfmt
               nixfmt
               oxfmt
+              ktlint
               treefmt
 
               # util
@@ -101,6 +108,9 @@
               go
               # javascript
               nodejs_24
+              # kotlin
+              jdk21
+              gradle
             ];
           };
 
@@ -115,6 +125,9 @@
               fix-hash
               # javascript
               nodejs_24
+              # kotlin
+              jdk21
+              gradle
             ];
           };
 
@@ -340,6 +353,77 @@
               };
             }
           );
+
+          trevrpc-kotlin = pkgs.stdenvNoCC.mkDerivation (
+            final: with pkgs.lib; {
+              pname = "trevrpc-kotlin";
+              version = "0.1.0";
+
+              src = ./.;
+              setSourceRoot = ''
+                sourceRoot=$(echo */trevrpc-kotlin)
+              '';
+
+              nativeBuildInputs = with pkgs; [
+                gradle
+                jdk21
+                makeWrapper
+                protobuf
+              ];
+
+              mitmCache = pkgs.gradle.fetchDeps {
+                pkg = final.finalPackage;
+                data = ./trevrpc-kotlin/gradle/deps.json;
+                bwrapFlags = ''--ro-bind "$PWD" "$PWD" --dir /bin --symlink ${pkgs.runtimeShell} /bin/sh'';
+              };
+              __darwinAllowLocalNetworking = true;
+
+              gradleFlags = [
+                "-Dorg.gradle.java.home=${pkgs.jdk21.home}"
+              ];
+              gradleBuildTask = [
+                "assemble"
+                ":examples:installDist"
+                ":protoc-gen-trevrpc-kotlin:installDist"
+              ];
+              gradleUpdateScript = ''
+                runHook preBuild
+                gradle build
+              '';
+              doCheck = true;
+              gradleCheckTask = "check";
+
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out/bin $out/share/trevrpc-kotlin
+                cp -R examples/build/install/trevrpc-xruntime-kotlin/* $out/share/trevrpc-kotlin/
+                cp -R protoc-gen-trevrpc-kotlin/build/install/protoc-gen-trevrpc-kotlin \
+                  $out/share/trevrpc-kotlin/protoc-gen-trevrpc-kotlin
+                makeWrapper $out/share/trevrpc-kotlin/bin/trevrpc-xruntime-kotlin \
+                  $out/bin/trevrpc-xruntime-kotlin \
+                  --set JAVA_HOME ${pkgs.jdk21.home} \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk21 ]}
+                makeWrapper \
+                  $out/share/trevrpc-kotlin/protoc-gen-trevrpc-kotlin/bin/protoc-gen-trevrpc-kotlin \
+                  $out/bin/protoc-gen-trevrpc-kotlin \
+                  --set JAVA_HOME ${pkgs.jdk21.home} \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk21 ]}
+                runHook postInstall
+              '';
+
+              meta = {
+                mainProgram = "protoc-gen-trevrpc-kotlin";
+                description = "Kotlin TrevRPC runtime, transports, and protobuf generator";
+                license = licenses.mit;
+                platforms = [ "x86_64-linux" ];
+                sourceProvenance = with sourceTypes; [
+                  fromSource
+                  binaryBytecode
+                ];
+                homepage = "https://trev.zip/llc/TrevRPC";
+              };
+            }
+          );
         };
 
         # nix fmt
@@ -351,6 +435,7 @@
             clang-tools
             nixfmt
             oxfmt
+            ktlint
           ];
         };
 
@@ -396,6 +481,13 @@
             '';
           };
 
+          kotlin = self.packages.${system}.trevrpc-kotlin.overrideAttrs {
+            dontBuild = true;
+            installPhase = ''
+              touch $out
+            '';
+          };
+
           cross-runtime =
             let
               crossRuntimeGo = pkgs.buildGoModule (final: {
@@ -412,6 +504,7 @@
             self.packages.${system}.trevrpc-rust.overrideAttrs {
               dontBuild = true;
               TREVRPC_XRUNTIME_GO = "${crossRuntimeGo}/bin/trevrpc-xruntime-go";
+              TREVRPC_XRUNTIME_KOTLIN = "${self.packages.${system}.trevrpc-kotlin}/bin/trevrpc-xruntime-kotlin";
               checkPhase = ''
                 cargo test --test cross_runtime --offline -- --nocapture
               '';
@@ -492,6 +585,9 @@
               TREVRPC_BROWSER_GO_SERVER = "${browserGoServer}/bin/greeter_server";
               TREVRPC_BROWSER_LIFECYCLE_GO_SERVER = "${browserLifecycleGoServer}/bin/trevrpc-browser-lifecycle-go";
               TREVRPC_BROWSER_LIFECYCLE_RUST_SERVER = "${browserLifecycleRustServer}/bin/trevrpc-browser-lifecycle-rust";
+              TREVRPC_BROWSER_LIFECYCLE_KOTLIN_SERVER = "${
+                self.packages.${system}.trevrpc-kotlin
+              }/bin/trevrpc-xruntime-kotlin";
               TREVRPC_BROWSER_RUST_SERVER = "${browserRustServer}/bin/greeter_server";
               checkPhase = ''
                 export HOME=$(mktemp -d)
