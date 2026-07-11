@@ -132,6 +132,7 @@ if(TREVRPC_BUILD_RUNTIME)
 
     add_library(trevrpc STATIC
         src/trevrpc.c
+        src/trevrpc_managed.c
     )
     trevrpc_c_configure_runtime(trevrpc)
     list(APPEND trevrpc_install_targets trevrpc)
@@ -141,6 +142,7 @@ if(TREVRPC_BUILD_RUNTIME)
     if(TREVRPC_BUILD_TESTS)
         add_library(trevrpc_testing STATIC
             src/trevrpc.c
+            src/trevrpc_managed.c
         )
         target_compile_definitions(trevrpc_testing PRIVATE TREVRPC_TESTING)
         trevrpc_c_configure_runtime(trevrpc_testing)
@@ -409,6 +411,20 @@ if(TREVRPC_BUILD_TESTS)
         add_test(NAME trevrpc_msquic_transport COMMAND trevrpc_msquic_transport_test)
         trevrpc_c_lsan_suppressions(trevrpc_msquic_transport)
 
+        add_executable(trevrpc_managed_client_test tests/managed_client_test.c)
+        add_dependencies(trevrpc_managed_client_test trevrpc_msquic_test_certificates)
+        target_compile_definitions(trevrpc_managed_client_test PRIVATE
+            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
+            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
+        )
+        target_link_libraries(trevrpc_managed_client_test PRIVATE trevrpc)
+        trevrpc_c_warnings(trevrpc_managed_client_test)
+        trevrpc_c_sanitizers(trevrpc_managed_client_test)
+
+        add_test(NAME trevrpc_managed_client COMMAND trevrpc_managed_client_test)
+        set_tests_properties(trevrpc_managed_client PROPERTIES TIMEOUT 30)
+        trevrpc_c_lsan_suppressions(trevrpc_managed_client)
+
         add_executable(trevrpc_buffering_config_test tests/buffering_config_test.c)
         target_link_libraries(trevrpc_buffering_config_test PRIVATE trevrpc_testing)
         trevrpc_c_warnings(trevrpc_buffering_config_test)
@@ -445,6 +461,8 @@ if(TREVRPC_BUILD_TESTS)
         target_compile_definitions(trevrpc_generated_service_test PRIVATE
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
+            TREVRPC_GENERATED_HEADER="${trevrpc_generated_test_dir}/greeter.trevrpc.h"
+            TREVRPC_GENERATED_SOURCE="${trevrpc_generated_test_dir}/greeter.trevrpc.c"
         )
         target_include_directories(trevrpc_generated_service_test PRIVATE src "${trevrpc_generated_test_dir}")
         target_link_libraries(trevrpc_generated_service_test PRIVATE trevrpc_testing protobuf-c)

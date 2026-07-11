@@ -75,6 +75,8 @@ extern "C" {
 #define TREVRPC_ERR_STREAM_IDLE_TIMEOUT -2007
 
 typedef struct trevrpc_client trevrpc_client;
+typedef struct trevrpc_managed_client trevrpc_managed_client;
+typedef struct trevrpc_managed_client_options trevrpc_managed_client_options;
 typedef struct trevrpc_server trevrpc_server;
 typedef struct trevrpc_stream trevrpc_stream;
 typedef struct trevrpc_call trevrpc_call;
@@ -324,6 +326,29 @@ typedef struct trevrpc_logger {
     void* user_data;
 } trevrpc_logger;
 
+#define TREVRPC_MANAGED_CLIENT_CONNECTING 0u
+#define TREVRPC_MANAGED_CLIENT_READY 1u
+#define TREVRPC_MANAGED_CLIENT_RECONNECTING 2u
+#define TREVRPC_MANAGED_CLIENT_CLOSED 3u
+
+#define TREVRPC_MANAGED_EVENT_STATE_CHANGED 0u
+#define TREVRPC_MANAGED_EVENT_CONNECT_FAILED 1u
+#define TREVRPC_MANAGED_EVENT_CONNECTION_SHUTDOWN 2u
+#define TREVRPC_MANAGED_EVENT_LOCAL_ADDRESS_CHANGED 3u
+#define TREVRPC_MANAGED_EVENT_PEER_ADDRESS_CHANGED 4u
+#define TREVRPC_MANAGED_EVENT_TLS_SESSION_RESUMED 5u
+#define TREVRPC_MANAGED_EVENT_RESUMPTION_TICKET_RECEIVED 6u
+#define TREVRPC_MANAGED_EVENT_RESUMPTION_TICKET_RETAIN_FAILED 7u
+
+typedef struct trevrpc_managed_client_event {
+    uint32_t kind;
+    uint32_t state;
+    uint64_t generation;
+    int error_code;
+} trevrpc_managed_client_event;
+
+typedef void (*trevrpc_managed_client_lifecycle_callback)(void* user_data, const trevrpc_managed_client_event* event);
+
 trevrpc_config trevrpc_default_config(void);
 trevrpc_server_config trevrpc_default_server_config(void);
 trevrpc_server_options trevrpc_default_server_options(void);
@@ -434,6 +459,93 @@ int trevrpc_client_start_stream_request_with_options(trevrpc_client* client,
     trevrpc_stream** stream);
 void trevrpc_client_shutdown(trevrpc_client* client);
 void trevrpc_client_close(trevrpc_client* client);
+
+trevrpc_managed_client_options* trevrpc_managed_client_options_new(void);
+int trevrpc_managed_client_options_set_backoff(trevrpc_managed_client_options* options,
+    uint64_t initial_backoff_ms,
+    uint64_t max_backoff_ms,
+    uint32_t jitter_percent);
+int trevrpc_managed_client_options_set_lifecycle_callback(
+    trevrpc_managed_client_options* options, trevrpc_managed_client_lifecycle_callback callback, void* user_data);
+void trevrpc_managed_client_options_free(trevrpc_managed_client_options* options);
+/* Starts an asynchronous native MsQuic connection and reconnect worker. */
+int trevrpc_managed_client_create(const char* host,
+    uint16_t port,
+    const trevrpc_config* config,
+    const trevrpc_managed_client_options* options,
+    trevrpc_managed_client** client);
+int trevrpc_managed_client_get_state(trevrpc_managed_client* client, uint32_t* state, uint64_t* generation);
+/* A zero timeout waits indefinitely. Calls made before readiness fail with TREV_MSQUIC_ERR_CLOSED. */
+int trevrpc_managed_client_wait_ready(
+    trevrpc_managed_client* client, uint64_t timeout_nanos, trevrpc_cancellation* cancellation, uint64_t* generation);
+int trevrpc_managed_client_call_unary(trevrpc_managed_client* client,
+    const char* service,
+    const char* method,
+    const uint8_t* body,
+    size_t body_len,
+    trevrpc_response** response);
+int trevrpc_managed_client_call_unary_with_options(trevrpc_managed_client* client,
+    const char* service,
+    const char* method,
+    const uint8_t* body,
+    size_t body_len,
+    const trevrpc_call_options* options,
+    trevrpc_response** response);
+int trevrpc_managed_client_call_request(
+    trevrpc_managed_client* client, const trevrpc_request* request, trevrpc_response** response);
+int trevrpc_managed_client_call_request_cancellable(trevrpc_managed_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_response** response);
+int trevrpc_managed_client_call_request_borrowed_cancellable(trevrpc_managed_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_response** response);
+int trevrpc_managed_client_call_request_with_options(trevrpc_managed_client* client,
+    const trevrpc_request* request,
+    const trevrpc_call_options* options,
+    trevrpc_response** response);
+int trevrpc_managed_client_start_stream(trevrpc_managed_client* client,
+    const char* service,
+    const char* method,
+    uint32_t kind,
+    const uint8_t* body,
+    size_t body_len,
+    trevrpc_stream** stream);
+int trevrpc_managed_client_start_stream_with_options(trevrpc_managed_client* client,
+    const char* service,
+    const char* method,
+    uint32_t kind,
+    const uint8_t* body,
+    size_t body_len,
+    const trevrpc_call_options* options,
+    trevrpc_stream** stream);
+int trevrpc_managed_client_start_stream_request(
+    trevrpc_managed_client* client, const trevrpc_request* request, trevrpc_stream** stream);
+int trevrpc_managed_client_start_stream_request_cancellable(trevrpc_managed_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_stream** stream);
+int trevrpc_managed_client_start_stream_request_borrowed_cancellable(trevrpc_managed_client* client,
+    const trevrpc_request* request,
+    trevrpc_cancellation* cancellation,
+    trevrpc_stream** stream);
+int trevrpc_managed_client_start_stream_request_with_options(trevrpc_managed_client* client,
+    const trevrpc_request* request,
+    const trevrpc_call_options* options,
+    trevrpc_stream** stream);
+/*
+ * Initiates idempotent shutdown without releasing the handle. Safe from lifecycle callbacks and
+ * concurrently entered managed-client operations. Lifecycle callbacks use a 64-record queue; when
+ * full, the newest queued event of the same kind is replaced, or a new unmatched event is dropped.
+ */
+void trevrpc_managed_client_close(trevrpc_managed_client* client);
+/*
+ * Completes shutdown, drains entered operations and callbacks, and releases the handle. The caller
+ * must prevent new managed-client API calls before release and must not call release from a lifecycle
+ * callback. Already-created calls and streams retain their underlying connection independently.
+ */
+void trevrpc_managed_client_release(trevrpc_managed_client* client);
 
 trevrpc_cancellation* trevrpc_cancellation_new(void);
 void trevrpc_cancellation_cancel(trevrpc_cancellation* cancellation);

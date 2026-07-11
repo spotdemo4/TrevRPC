@@ -2,6 +2,8 @@
 
 #include "trevrpc_msquic.h"
 
+#include "trevrpc_msquic_internal.h"
+
 #include <arpa/inet.h>
 #include <errno.h> // IWYU pragma: keep
 #include <limits.h>
@@ -110,6 +112,9 @@ struct trevrpc_msquic_conn {
     bool close_pending;
     bool closed;
     size_t active_handle_ops;
+    trevrpc_msquic_conn_observer observer;
+    void* observer_context;
+    size_t active_observer_callbacks;
     uint64_t peer_close_error;
     bool peer_close_error_set;
     int err;
@@ -203,6 +208,28 @@ static void trevrpc_msquic_listener_callback_finish(trevrpc_msquic_listener* lis
     }
     pthread_cond_broadcast(&listener->cond);
     pthread_mutex_unlock(&listener->mutex);
+}
+
+static void trevrpc_msquic_conn_notify(trevrpc_msquic_conn* conn, const trevrpc_msquic_conn_event* event) {
+    trevrpc_msquic_conn_observer observer = NULL;
+    void* observer_context = NULL;
+    pthread_mutex_lock(&conn->mutex);
+    observer = conn->observer;
+    observer_context = conn->observer_context;
+    if (observer != NULL) {
+        conn->active_observer_callbacks++;
+    }
+    pthread_mutex_unlock(&conn->mutex);
+
+    if (observer == NULL) {
+        return;
+    }
+    observer(observer_context, event);
+
+    pthread_mutex_lock(&conn->mutex);
+    conn->active_observer_callbacks--;
+    pthread_cond_broadcast(&conn->cond);
+    pthread_mutex_unlock(&conn->mutex);
 }
 
 static size_t trevrpc_msquic_effective_max_pending_send_bytes(size_t configured) {
@@ -1079,6 +1106,10 @@ static int trevrpc_msquic_configure_endpoint_with_alpns(const trevrpc_msquic_con
     settings.SendBufferingEnabled = config->send_buffering_enabled != 0;
     settings.IsSet.DatagramReceiveEnabled = TRUE;
     settings.DatagramReceiveEnabled = TRUE;
+    if (server) {
+        settings.IsSet.ServerResumptionLevel = TRUE;
+        settings.ServerResumptionLevel = QUIC_SERVER_RESUME_ONLY;
+    }
 
     status = TrevMsQuic->ConfigurationOpen(
         *registration, alpn_buffers, alpn_count, &settings, sizeof(settings), NULL, configuration);
@@ -1340,6 +1371,24 @@ int trevrpc_msquic_dial_cancellable(const char* host,
     trevrpc_msquic_cancelled_fn cancelled,
     void* cancellation_context,
     trevrpc_msquic_conn** out_conn) {
+    return trevrpc_msquic_dial_observed(
+        host, port, config, cancelled, cancellation_context, NULL, 0, NULL, NULL, out_conn);
+}
+
+int trevrpc_msquic_dial_observed(const char* host,
+    uint16_t port,
+    const trevrpc_msquic_config* config,
+    trevrpc_msquic_cancelled_fn cancelled,
+    void* cancellation_context,
+    const uint8_t* resumption_ticket,
+    size_t resumption_ticket_len,
+    trevrpc_msquic_conn_observer observer,
+    void* observer_context,
+    trevrpc_msquic_conn** out_conn) {
+    if (host == NULL || config == NULL || out_conn == NULL ||
+        (resumption_ticket == NULL && resumption_ticket_len != 0) || resumption_ticket_len > UINT32_MAX) {
+        return EINVAL;
+    }
     *out_conn = NULL;
     HQUIC registration = NULL;
     HQUIC configuration = NULL;
@@ -1358,6 +1407,8 @@ int trevrpc_msquic_dial_cancellable(const char* host,
     conn->registration = registration;
     conn->configuration = configuration;
     conn->owns_endpoint = true;
+    conn->observer = observer;
+    conn->observer_context = observer_context;
     conn->max_frame_size = trevrpc_msquic_effective_max_frame_size(config->max_frame_size);
     conn->max_pending_send_bytes = trevrpc_msquic_effective_max_pending_send_bytes(config->max_pending_send_bytes);
     conn->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(config->max_pending_send_count);
@@ -1370,6 +1421,15 @@ int trevrpc_msquic_dial_cancellable(const char* host,
     if (QUIC_FAILED(status)) {
         trevrpc_msquic_conn_close(conn);
         return (int)status;
+    }
+
+    if (resumption_ticket_len > 0) {
+        status = TrevMsQuic->SetParam(
+            conn->handle, QUIC_PARAM_CONN_RESUMPTION_TICKET, (uint32_t)resumption_ticket_len, resumption_ticket);
+        if (QUIC_FAILED(status)) {
+            trevrpc_msquic_conn_close(conn);
+            return (int)status;
+        }
     }
 
     HQUIC connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
@@ -1444,6 +1504,19 @@ int trevrpc_msquic_conn_peer_close_error(trevrpc_msquic_conn* conn, uint64_t* er
     *error_code = conn->peer_close_error;
     pthread_mutex_unlock(&conn->mutex);
     return available ? 0 : -EAGAIN;
+}
+
+void trevrpc_msquic_conn_clear_observer(trevrpc_msquic_conn* conn) {
+    if (conn == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&conn->mutex);
+    conn->observer = NULL;
+    conn->observer_context = NULL;
+    while (conn->active_observer_callbacks > 0) {
+        pthread_cond_wait(&conn->cond, &conn->mutex);
+    }
+    pthread_mutex_unlock(&conn->mutex);
 }
 
 int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
@@ -2293,10 +2366,19 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(
     trevrpc_msquic_conn* conn = context;
     switch (event->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED:
+        if (!conn->owns_endpoint && trevrpc_msquic_conn_uses_native_frames(conn)) {
+            (void)TrevMsQuic->ConnectionSendResumptionTicket(
+                connection_handle, QUIC_SEND_RESUMPTION_FLAG_NONE, 0, NULL);
+        }
         pthread_mutex_lock(&conn->mutex);
         conn->connected = true;
         pthread_cond_broadcast(&conn->cond);
         pthread_mutex_unlock(&conn->mutex);
+        trevrpc_msquic_conn_event connected_event = {
+            .kind = TREV_MSQUIC_CONN_EVENT_CONNECTED,
+            .session_resumed = event->CONNECTED.SessionResumed != FALSE,
+        };
+        trevrpc_msquic_conn_notify(conn, &connected_event);
         return QUIC_STATUS_SUCCESS;
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
         size_t initial_frame_max_len = trevrpc_msquic_conn_uses_native_frames(conn) ? conn->max_frame_size : 0;
@@ -2342,7 +2424,35 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(
         pthread_mutex_unlock(&conn->mutex);
         return QUIC_STATUS_SUCCESS;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
+        trevrpc_msquic_conn_event shutdown_event = {
+            .kind = TREV_MSQUIC_CONN_EVENT_SHUTDOWN_COMPLETE,
+            .error_code = conn->err,
+        };
+        trevrpc_msquic_conn_notify(conn, &shutdown_event);
         trevrpc_msquic_conn_shutdown_complete(conn, connection_handle);
+        return QUIC_STATUS_SUCCESS;
+    }
+    case QUIC_CONNECTION_EVENT_LOCAL_ADDRESS_CHANGED: {
+        trevrpc_msquic_conn_event address_event = {
+            .kind = TREV_MSQUIC_CONN_EVENT_LOCAL_ADDRESS_CHANGED,
+        };
+        trevrpc_msquic_conn_notify(conn, &address_event);
+        return QUIC_STATUS_SUCCESS;
+    }
+    case QUIC_CONNECTION_EVENT_PEER_ADDRESS_CHANGED: {
+        trevrpc_msquic_conn_event address_event = {
+            .kind = TREV_MSQUIC_CONN_EVENT_PEER_ADDRESS_CHANGED,
+        };
+        trevrpc_msquic_conn_notify(conn, &address_event);
+        return QUIC_STATUS_SUCCESS;
+    }
+    case QUIC_CONNECTION_EVENT_RESUMPTION_TICKET_RECEIVED: {
+        trevrpc_msquic_conn_event ticket_event = {
+            .kind = TREV_MSQUIC_CONN_EVENT_RESUMPTION_TICKET_RECEIVED,
+            .resumption_ticket = event->RESUMPTION_TICKET_RECEIVED.ResumptionTicket,
+            .resumption_ticket_len = event->RESUMPTION_TICKET_RECEIVED.ResumptionTicketLength,
+        };
+        trevrpc_msquic_conn_notify(conn, &ticket_event);
         return QUIC_STATUS_SUCCESS;
     }
     default:

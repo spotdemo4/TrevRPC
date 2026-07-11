@@ -27,6 +27,82 @@ request.name = "TrevRPC";
 
 Close the client with `trevrpc_client_close(client)` after all calls have completed.
 
+### Managed native client
+
+`trevrpc_client` remains the low-level, already-established client. For native MsQuic connections
+that should reconnect after transport loss, create an opaque `trevrpc_managed_client` instead:
+
+```c
+trevrpc_managed_client_options* options = trevrpc_managed_client_options_new();
+trevrpc_managed_client_options_set_backoff(options, 100, 30000, 20);
+
+trevrpc_config config = trevrpc_default_config();
+trevrpc_managed_client* managed_client = NULL;
+int rc = trevrpc_managed_client_create("127.0.0.1", 50051, &config, options, &managed_client);
+trevrpc_managed_client_options_free(options);
+if (rc == 0) {
+    rc = trevrpc_managed_client_wait_ready(managed_client, 5000000000ull, NULL, NULL);
+}
+
+Hello__V1__HelloRequest managed_request = HELLO__V1__HELLO_REQUEST__INIT;
+managed_request.name = "TrevRPC";
+Hello__V1__HelloReply* managed_reply = NULL;
+if (rc == 0) {
+    rc = hello_v1_greeter_say_hello_managed(managed_client, &managed_request, &managed_reply);
+}
+if (managed_reply != NULL) {
+    printf("%s\n", managed_reply->message);
+    hello__v1__hello_reply__free_unpacked(managed_reply, NULL);
+}
+
+trevrpc_managed_client_close(managed_client);
+trevrpc_managed_client_release(managed_client);
+```
+
+Creation is asynchronous. The managed client deep-copies the host and all pointer-backed fields in
+`trevrpc_config`; the caller may release or change them after creation. Backoff is bounded between
+the configured initial and maximum delays and applies jitter. A zero readiness timeout
+waits indefinitely. Readiness waits may also receive a `trevrpc_cancellation`.
+
+The `trevrpc_managed_client_call_*` and `trevrpc_managed_client_start_stream*` functions mirror the
+low-level request surface. Each new operation atomically selects exactly one ready generation. New
+operations return `TREV_MSQUIC_ERR_CLOSED` immediately while connecting, reconnecting, or closed.
+The runtime never queues, replays, or resumes an RPC. A stream stays attached to the generation on
+which it started and fails naturally if that connection is lost; only a later operation can use a
+new generation.
+
+Generated bindings expose managed helpers without changing the existing `trevrpc_client` helpers.
+Unary and server-streaming methods add `_managed` and `_managed_with_options` variants. Client- and
+bidirectional-streaming methods add `_managed_start` and `_managed_start_with_options` variants.
+
+`trevrpc_managed_client_get_state` reports `CONNECTING`, `READY`, `RECONNECTING`, or `CLOSED` and the
+latest successfully installed generation. `trevrpc_managed_client_options_set_lifecycle_callback`
+observes state changes, connect failures, actual MsQuic connection shutdown, local and peer path
+address changes, resumption-ticket receipt or retention failure, and successful TLS session
+resumption. Lifecycle callbacks run serially on a dedicated dispatcher thread and may reenter the
+managed API, including `trevrpc_managed_client_close`. The dispatcher queue is bounded at 64 complete
+event records. If full, a new event replaces the newest queued event of the same kind; an unmatched
+event is dropped. Callbacks therefore receive source-time state and generation snapshots, but slow
+callbacks may observe coalescing or dropped event kinds under sustained event load.
+
+Resumption tickets are copied into managed-client memory and applied to the next MsQuic connection.
+`RESUMPTION_TICKET_RECEIVED` is emitted only after a nonempty ticket is successfully retained;
+`RESUMPTION_TICKET_RETAIN_FAILED` reports `-ENOMEM` (or `-EINVAL` for an invalid transport record).
+Servers use resume-only tickets, and TrevRPC never passes `QUIC_SEND_FLAG_ALLOW_0_RTT`, so RPC data is
+not sent as 0-RTT. Tickets are not persisted to disk or shared between managed-client instances; if
+a ticket is absent, expired, or rejected, MsQuic performs a full handshake. Address-change events are
+currently observational and do not expose the platform-specific `QUIC_ADDR` value.
+
+`trevrpc_managed_client_close` is idempotent and initiates shutdown without releasing the handle. It
+is safe against concurrently entered managed operations and from lifecycle callbacks. After all
+threads that can begin managed API calls have stopped, call `trevrpc_managed_client_release`; release
+joins the reconnect worker and lifecycle dispatcher, drains entered operations, and frees the handle.
+Release must not run from a lifecycle callback and no new managed API call may begin concurrently
+with it. Already-started calls and streams safely retain their generation until they return or are
+closed.
+
+The managed API is additive and uses opaque types, so `TREVRPC_C_ABI_VERSION` remains 4.
+
 ### Unary
 
 The generated unary helper returns one decoded response:

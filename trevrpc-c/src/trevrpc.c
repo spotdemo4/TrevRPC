@@ -3,6 +3,7 @@
 #include "trevrpc.h"
 
 #include "trevrpc_msquic.h"
+#include "trevrpc_runtime_internal.h"
 #include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
 
@@ -91,6 +92,8 @@ struct trevrpc_stream {
     struct timespec request_poll_started_at;
     uint32_t failure_status;
     const char* failure_message;
+    void (*release)(void* context);
+    void* release_context;
 };
 
 struct trevrpc_call {
@@ -1606,7 +1609,18 @@ void trevrpc_stream_close(trevrpc_stream* stream) {
     if (stream->owns_stream) {
         trevrpc_stream_close_raw(stream);
     }
+    if (stream->release != NULL) {
+        stream->release(stream->release_context);
+    }
     free(stream);
+}
+
+void trevrpc_stream_set_release(trevrpc_stream* stream, void (*release)(void* context), void* context) {
+    if (stream == NULL) {
+        return;
+    }
+    stream->release = release;
+    stream->release_context = context;
 }
 
 int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_client** out_client) {
@@ -1622,6 +1636,28 @@ int trevrpc_client_connect_cancellable(const char* host,
     const trevrpc_config* config,
     trevrpc_cancellation* cancellation,
     trevrpc_client** out_client) {
+    return trevrpc_client_connect_observed(host,
+        port,
+        config,
+        cancellation == NULL ? NULL : trevrpc_connect_cancelled,
+        cancellation,
+        NULL,
+        0,
+        NULL,
+        NULL,
+        out_client);
+}
+
+int trevrpc_client_connect_observed(const char* host,
+    uint16_t port,
+    const trevrpc_config* config,
+    trevrpc_msquic_cancelled_fn cancelled,
+    void* cancellation_context,
+    const uint8_t* resumption_ticket,
+    size_t resumption_ticket_len,
+    trevrpc_msquic_conn_observer observer,
+    void* observer_context,
+    trevrpc_client** out_client) {
     if (host == NULL || out_client == NULL) {
         return -EINVAL;
     }
@@ -1635,11 +1671,15 @@ int trevrpc_client_connect_cancellable(const char* host,
     client->transport = TREVRPC_TRANSPORT_KIND_MSQUIC;
 
     trevrpc_msquic_config msquic_config = trevrpc_make_msquic_config(config);
-    int err = trevrpc_msquic_dial_cancellable(host,
+    int err = trevrpc_msquic_dial_observed(host,
         port,
         &msquic_config,
-        cancellation == NULL ? NULL : trevrpc_connect_cancelled,
-        cancellation,
+        cancelled,
+        cancellation_context,
+        resumption_ticket,
+        resumption_ticket_len,
+        observer,
+        observer_context,
         &client->msquic_conn);
     if (err != 0) {
         trevrpc_client_close(client);
@@ -1648,6 +1688,12 @@ int trevrpc_client_connect_cancellable(const char* host,
 
     *out_client = client;
     return 0;
+}
+
+void trevrpc_client_clear_observer(trevrpc_client* client) {
+    if (client != NULL && client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        trevrpc_msquic_conn_clear_observer(client->msquic_conn);
+    }
 }
 
 int trevrpc_client_connect_webtransport(
