@@ -15,6 +15,13 @@ use crate::{
     RpcStreamFrame, RpcStreamFrameKind, Status,
 };
 
+mod managed;
+
+pub use managed::{
+    ExponentialBackoff, ManagedClient, ManagedClientConfig, ManagedClientEvent, ManagedClientPhase,
+    ManagedClientState, ReconnectBackoff,
+};
+
 const CANCELLED_STREAM_CODE: u32 = 1;
 const FRAME_HEADER_LEN: u64 = 4;
 

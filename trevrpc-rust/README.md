@@ -20,6 +20,19 @@ let options = trevrpc::client::CallOptions::new();
 The Quinn endpoint must trust the server certificate and include `trevrpc::ALPN` in its ALPN
 protocols. The [complete client example](examples/greeter_client.rs) includes local TLS setup.
 
+For native QUIC clients that should recover future calls after connection loss, use
+`trevrpc::quinn::ManagedClient::connect`. It owns and reuses the supplied Quinn endpoint across
+connection generations so rustls TLS session resumption state survives redial. Each RPC snapshots
+one generation and is never replayed: in-flight calls fail with their normal transport error when
+that generation dies, and new calls fail immediately with `Unavailable` while reconnecting.
+`wait_until_ready`, `state`, `subscribe_state`, and `subscribe_events` expose readiness and lifecycle
+changes. `close` permanently stops that managed client's reconnect loop.
+
+The managed client never enables Quinn 0-RTT. TLS session resumption may shorten a handshake, but
+RPC application data is sent only after the full handshake completes. `ManagedClient::rebind`
+changes the UDP socket for the entire shared Quinn endpoint and therefore affects every connection
+using an endpoint clone; a successful rebind alone does not change the managed generation.
+
 ### Unary
 
 ```rust
