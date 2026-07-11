@@ -28,12 +28,7 @@ export class WebTransportClient {
 
   /** Opens a WebTransport session and wraps it in a TrevRPC client. */
   static async connect(url, options = {}) {
-    const WebTransportCtor = options.WebTransport ?? globalThis.WebTransport;
-    if (typeof WebTransportCtor !== "function") {
-      throw unavailable("WebTransport is not available in this JavaScript runtime");
-    }
-
-    const session = new WebTransportCtor(url, browserConstructorOptions(options));
+    const session = createWebTransportSession(url, options);
     await session.ready;
     return new WebTransportClient(session, options);
   }
@@ -137,6 +132,16 @@ export class WebTransportClient {
 
     return this.session.createBidirectionalStream();
   }
+}
+
+/** Creates a WebTransport session using only browser constructor options. */
+export function createWebTransportSession(url, options = {}) {
+  const WebTransportCtor = options.WebTransport ?? globalThis.WebTransport;
+  if (typeof WebTransportCtor !== "function") {
+    throw unavailable("WebTransport is not available in this JavaScript runtime");
+  }
+
+  return new WebTransportCtor(url, browserConstructorOptions(options));
 }
 
 function browserConstructorOptions(options) {

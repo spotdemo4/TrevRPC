@@ -1,6 +1,10 @@
 import type {
-  NodeConnectOptions as RuntimeNodeConnectOptions,
+  ManagedReconnectingTransport,
   MetadataInput,
+  NodeConnectOptions as RuntimeNodeConnectOptions,
+  ReconnectOptions,
+  ReconnectingTransportLifecycleEvent,
+  ReconnectingTransportState,
   RpcKindValue,
   RpcMethodKind,
   RpcResponseMessage,
@@ -10,6 +14,8 @@ import type {
 } from "./index.js";
 
 export interface NodeConnectOptions extends RuntimeNodeConnectOptions {}
+
+export interface ReconnectingNodeTransportOptions extends NodeConnectOptions, ReconnectOptions {}
 
 export interface NodeRpcStartedEvent {
   service: string;
@@ -120,6 +126,51 @@ export class NodeTransport implements Transport {
 
   /** Closes the underlying native client. */
   close(): void;
+}
+
+/** Managed native Node transport that reconnects after observed operation failures. */
+export class ReconnectingNodeTransport extends EventTarget implements ManagedReconnectingTransport {
+  readonly urlOrOptions: string | URL | Readonly<ReconnectingNodeTransportOptions>;
+  readonly options: Readonly<ReconnectingNodeTransportOptions>;
+  readonly ready: boolean;
+  readonly state: ReconnectingTransportState;
+  readonly generation: number;
+
+  constructor(
+    urlOrOptions: string | URL | ReconnectingNodeTransportOptions,
+    options?: ReconnectingNodeTransportOptions,
+  );
+
+  /** Creates a managed native client and waits for its first ready generation. */
+  static connect(
+    urlOrOptions: string | URL | ReconnectingNodeTransportOptions,
+    options?: ReconnectingNodeTransportOptions,
+  ): Promise<ReconnectingNodeTransport>;
+  /** Waits for the current or next connection generation to become ready. */
+  waitUntilReady(): Promise<void>;
+  /** Sends a unary call on the current generation without replaying it. */
+  call(
+    request: Parameters<Transport["call"]>[0],
+    options?: Parameters<Transport["call"]>[1],
+  ): Promise<RpcResponseMessage>;
+  /** Starts a streaming call on the current generation without resuming it later. */
+  streamingCall(
+    request: Parameters<Transport["streamingCall"]>[0],
+    requestBody: AsyncIterable<Uint8Array>,
+    options?: Parameters<Transport["streamingCall"]>[2],
+  ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
+  /** Stops reconnecting and closes the current generation. */
+  close(): void;
+  addEventListener(
+    type: "statechange" | ReconnectingTransportState,
+    callback: (event: ReconnectingTransportLifecycleEvent) => void,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
+  removeEventListener(
+    type: "statechange" | ReconnectingTransportState,
+    callback: (event: ReconnectingTransportLifecycleEvent) => void,
+    options?: boolean | EventListenerOptions,
+  ): void;
 }
 
 export type NodeServerUnaryResult =

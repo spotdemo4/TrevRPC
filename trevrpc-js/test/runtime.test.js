@@ -70,10 +70,13 @@ test("frames round-trip TrevRPC requests", () => {
 });
 
 test("Node native transport subpath exports without loading the addon", async () => {
-  const { NodeServer, NodeServerCall, NodeTransport } = await import("../src/node.js");
+  const { NodeServer, NodeServerCall, NodeTransport, ReconnectingNodeTransport } =
+    await import("../src/node.js");
 
   assert.equal(typeof NodeTransport, "function");
   assert.equal(typeof NodeTransport.connect, "function");
+  assert.equal(typeof ReconnectingNodeTransport, "function");
+  assert.equal(typeof ReconnectingNodeTransport.connect, "function");
   assert.equal(typeof NodeServer, "function");
   assert.equal(typeof NodeServer.listen, "function");
   assert.equal(typeof NodeServerCall, "function");

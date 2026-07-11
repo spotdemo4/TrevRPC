@@ -153,7 +153,9 @@ struct native_completion_runtime {
 typedef struct connect_work {
     base_work base;
     trevrpc_client* client;
-    trevrpc_cancellation* cancellation;
+    native_cancellation* cancellation;
+    trevrpc_cancellation* owned_cancellation;
+    napi_ref cancellation_ref;
     char* host;
     char* ca_cert_file;
     uint16_t port;
@@ -2791,17 +2793,26 @@ static void connect_execute(napi_env env, void* data) {
     }
     config.ca_cert_file = work->ca_cert_file;
     config.skip_certificate_validation = work->skip_certificate_validation;
-    work->base.err =
-        trevrpc_client_connect_cancellable(work->host, work->port, &config, work->cancellation, &work->client);
+    trevrpc_cancellation* cancellation =
+        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
+    work->base.err = trevrpc_client_connect_cancellable(work->host, work->port, &config, cancellation, &work->client);
 }
 
 static void connect_cancel(void* data) {
     connect_work* work = data;
-    trevrpc_cancellation_cancel(work->cancellation);
+    trevrpc_cancellation_cancel(
+        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation);
 }
 
 static void connect_complete(napi_env env, napi_status status, void* data) {
     connect_work* work = data;
+    trevrpc_cancellation* cancellation =
+        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
+    if (work->base.err == 0 && trevrpc_cancellation_cancelled(cancellation)) {
+        trevrpc_client_close(work->client);
+        work->client = NULL;
+        work->base.err = -ECANCELED;
+    }
     if (env == NULL) {
         trevrpc_client_close(work->client);
     } else if (status != napi_ok) {
@@ -2842,17 +2853,20 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
 
     free(work->host);
     free(work->ca_cert_file);
-    trevrpc_cancellation_free(work->cancellation);
+    if (env != NULL && work->cancellation_ref != NULL) {
+        napi_delete_reference(env, work->cancellation_ref);
+    }
+    trevrpc_cancellation_free(work->owned_cancellation);
     native_work_delete(work->base.work);
     free(work);
 }
 
 static napi_value connect_msquic(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
+    size_t argc = 2;
+    napi_value args[2];
     napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "connectMsQuic requires an options object");
+    if (argc != 1 && argc != 2) {
+        napi_throw_type_error(env, NULL, "connectMsQuic requires an options object and optional cancellation");
         return NULL;
     }
 
@@ -2870,17 +2884,26 @@ static napi_value connect_msquic(napi_env env, napi_callback_info info) {
     get_size_property(env, args[0], "maxFrameSize", &work->max_frame_size);
     get_size_property(env, args[0], "maxPendingSendBytes", &work->max_pending_send_bytes);
     get_size_property(env, args[0], "maxPendingSendCount", &work->max_pending_send_count);
-    work->cancellation = trevrpc_cancellation_new();
+    int cancellation_err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
+    if (cancellation_err == 0 && work->cancellation == NULL) {
+        work->owned_cancellation = trevrpc_cancellation_new();
+        if (work->owned_cancellation == NULL) {
+            cancellation_err = -ENOMEM;
+        }
+    }
 
     bool invalid_options = work->host == NULL || work->port == 0;
-    if (invalid_options || work->cancellation == NULL) {
+    if (invalid_options || cancellation_err != 0) {
         free(work->host);
         free(work->ca_cert_file);
-        trevrpc_cancellation_free(work->cancellation);
+        if (work->cancellation_ref != NULL) {
+            napi_delete_reference(env, work->cancellation_ref);
+        }
+        trevrpc_cancellation_free(work->owned_cancellation);
         free(work);
         if (invalid_options) {
             napi_throw_type_error(env, NULL, "connectMsQuic requires host and port");
-        } else {
+        } else if (cancellation_err == -ENOMEM) {
             napi_throw_error(env, NULL, "failed to allocate connect cancellation");
         }
         return NULL;
@@ -3609,14 +3632,7 @@ static napi_value native_server_close(napi_env env, napi_callback_info info) {
     return undefined;
 }
 
-static napi_value native_client_create_cancellation(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_client* client = NULL;
-    if (!unwrap_native_client(env, this_arg, &client)) {
-        return NULL;
-    }
-
+static napi_value create_native_cancellation(napi_env env) {
     native_cancellation* cancellation = calloc(1, sizeof(*cancellation));
     if (cancellation == NULL) {
         napi_throw_error(env, NULL, "failed to allocate cancellation");
@@ -3649,6 +3665,21 @@ static napi_value native_client_create_cancellation(napi_env env, napi_callback_
         return NULL;
     }
     return instance;
+}
+
+static napi_value native_create_cancellation(napi_env env, napi_callback_info info) {
+    (void)info;
+    return create_native_cancellation(env);
+}
+
+static napi_value native_client_create_cancellation(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    native_client* client = NULL;
+    if (!unwrap_native_client(env, this_arg, &client)) {
+        return NULL;
+    }
+    return create_native_cancellation(env);
 }
 
 static napi_value native_cancellation_cancel(napi_env env, napi_callback_info info) {
@@ -5442,6 +5473,7 @@ static napi_value init(napi_env env, napi_value exports) {
     napi_create_reference(env, cancellation_ctor, 1, &runtime->cancellation_constructor);
 
     napi_property_descriptor exports_desc[] = {
+        {"createCancellation", NULL, native_create_cancellation, NULL, NULL, NULL, napi_default, NULL},
         {"connectMsQuic", NULL, connect_msquic, NULL, NULL, NULL, napi_default, NULL},
         {"listenMsQuic", NULL, listen_msquic, NULL, NULL, NULL, napi_default, NULL},
 #ifdef TREVRPC_NODE_TEST_HOOKS

@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { ReconnectingTransport, stripReconnectOptions } from "./reconnecting.js";
 import { Code, cancelled, codeFromNumber, invalidArgument } from "./status.js";
 import { RpcKind, RpcStreamFrameKind } from "./wire.js";
 
@@ -11,6 +12,7 @@ const EmptyBody = new Uint8Array(0);
 const RpcStatusOk = 0;
 const RecvManyBatchSize = 32;
 const SendManyBatchSize = 16;
+const NativeTransportClosed = -1001;
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */
 export class NodeTransport {
@@ -21,10 +23,25 @@ export class NodeTransport {
 
   /** Opens a TrevRPC client backed by the native C runtime. */
   static async connect(urlOrOptions, options = {}) {
-    const native = loadNative();
     const connectOptions = normalizeNodeTransportOptions(urlOrOptions, options);
-    const nativeClient = await native.connectMsQuic(connectOptions);
-    return new NodeTransport(nativeClient, connectOptions);
+    throwIfAborted(connectOptions.signal);
+    const native = loadNative();
+    const cancellation = connectOptions.signal == null ? undefined : native.createCancellation();
+    const cleanupAbort = onAbort(connectOptions.signal, () => cancellation?.cancel());
+    let nativeClient;
+    try {
+      nativeClient = await nativeConnect(native, connectOptions, cancellation);
+      throwIfAborted(connectOptions.signal);
+      return new NodeTransport(nativeClient, connectOptions);
+    } catch (error) {
+      if (connectOptions.signal?.aborted) {
+        nativeClient?.close();
+        throw signalAbortError(connectOptions.signal);
+      }
+      throw error;
+    } finally {
+      cleanupAbort();
+    }
   }
 
   /** Sends a unary RPC request and returns its response. */
@@ -83,6 +100,38 @@ export class NodeTransport {
   /** Closes the underlying native client. */
   close() {
     this.nativeClient.close();
+  }
+}
+
+/** Managed native Node transport that reconnects after observed operation failures. */
+export class ReconnectingNodeTransport extends ReconnectingTransport {
+  constructor(urlOrOptions, options = {}) {
+    const retainedInput = retainNodeConnectInput(urlOrOptions);
+    const retainedOptions = Object.freeze({ ...options });
+    const reconnectOptions =
+      retainedInput != null && typeof retainedInput === "object"
+        ? { ...retainedInput, ...retainedOptions }
+        : retainedOptions;
+    const transportInput =
+      retainedInput != null && typeof retainedInput === "object"
+        ? stripReconnectOptions(retainedInput)
+        : retainedInput;
+    const transportOptions = stripReconnectOptions(retainedOptions);
+    super(
+      (signal) => NodeTransport.connect(transportInput, { ...transportOptions, signal }),
+      reconnectOptions,
+      null,
+      (error) => error?.nativeCode === NativeTransportClosed,
+    );
+    this.urlOrOptions = retainedInput;
+    this.options = retainedOptions;
+  }
+
+  /** Creates a managed native client and waits for its first ready generation. */
+  static async connect(urlOrOptions, options = {}) {
+    const client = new ReconnectingNodeTransport(urlOrOptions, options);
+    await client.waitUntilReady();
+    return client;
   }
 }
 
@@ -899,6 +948,16 @@ function normalizeNodeTransportOptions(urlOrOptions, options) {
   return { ...urlOrOptions, ...options };
 }
 
+function retainNodeConnectInput(urlOrOptions) {
+  if (urlOrOptions instanceof URL) {
+    return urlOrOptions.href;
+  }
+  if (urlOrOptions != null && typeof urlOrOptions === "object") {
+    return Object.freeze({ ...urlOrOptions });
+  }
+  return urlOrOptions;
+}
+
 function normalizeNodeListenOptions(urlOrOptions, options) {
   if (typeof urlOrOptions === "string" || urlOrOptions instanceof URL) {
     const url = new URL(urlOrOptions);
@@ -933,6 +992,12 @@ function nativeStartStream(nativeClient, request, cancellation) {
   return cancellation == null
     ? nativeClient.startStream(request)
     : nativeClient.startStream(request, cancellation);
+}
+
+function nativeConnect(native, options, cancellation) {
+  return cancellation == null
+    ? native.connectMsQuic(options)
+    : native.connectMsQuic(options, cancellation);
 }
 
 function onAbort(signal, callback) {

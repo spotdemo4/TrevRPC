@@ -416,6 +416,7 @@ export interface WebTransportBidirectionalStreamLike {
 
 export interface WebTransportSessionLike {
   ready: Promise<void>;
+  closed?: Promise<WebTransportCloseInfoLike>;
   close?(closeInfo?: WebTransportCloseInfoLike): void;
   createBidirectionalStream?(): Promise<WebTransportBidirectionalStreamLike>;
 }
@@ -440,6 +441,45 @@ export interface WebTransportClientOptions extends CallOptions, BrowserWebTransp
   WebTransport?: WebTransportConstructorLike;
 }
 
+export type ReconnectingTransportState = "connecting" | "ready" | "reconnecting" | "closed";
+
+export interface ReconnectingTransportLifecycle {
+  state: ReconnectingTransportState;
+  previousState: ReconnectingTransportState;
+  generation: number;
+  attempt?: number;
+  delayMs?: number;
+  error?: unknown;
+}
+
+export type ReconnectingTransportLifecycleEvent = Event & {
+  readonly detail: ReconnectingTransportLifecycle;
+};
+
+export interface ReconnectOptions {
+  /** Initial retry delay. Defaults to 100 ms. */
+  reconnectInitialDelayMs?: number;
+  /** Maximum retry delay, including jitter. Defaults to 10000 ms. */
+  reconnectMaxDelayMs?: number;
+  /** Exponential delay multiplier. Defaults to 2. */
+  reconnectMultiplier?: number;
+  /** Symmetric jitter ratio from zero to one. Defaults to 0.2. */
+  reconnectJitter?: number;
+  /** Receives managed transport lifecycle transitions. */
+  onStateChange?(event: ReconnectingTransportLifecycle): void;
+}
+
+export interface ManagedReconnectingTransport extends Transport, EventTarget {
+  readonly ready: boolean;
+  readonly state: ReconnectingTransportState;
+  readonly generation: number;
+  waitUntilReady(): Promise<void>;
+  close(closeInfo?: WebTransportCloseInfoLike): void;
+}
+
+export interface ReconnectingWebTransportClientOptions
+  extends WebTransportClientOptions, ReconnectOptions {}
+
 export interface NodeConnectOptions {
   host?: string;
   port?: number;
@@ -450,6 +490,7 @@ export interface NodeConnectOptions {
   maxFrameSize?: number;
   maxPendingSendBytes?: number;
   maxPendingSendCount?: number;
+  signal?: AbortSignal;
 }
 
 export interface ConnectOptions extends WebTransportClientOptions, NodeConnectOptions {}
@@ -489,4 +530,46 @@ export class WebTransportClient implements Transport {
   ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
   /** Opens a bidirectional WebTransport stream. */
   openBidirectionalStream(): Promise<WebTransportBidirectionalStreamLike>;
+}
+
+/** Managed browser WebTransport client with background session reconnection. */
+export class ReconnectingWebTransportClient
+  extends EventTarget
+  implements ManagedReconnectingTransport
+{
+  readonly url: string | URL;
+  readonly options: Readonly<ReconnectingWebTransportClientOptions>;
+  readonly ready: boolean;
+  readonly state: ReconnectingTransportState;
+  readonly generation: number;
+
+  constructor(url: string | URL, options?: ReconnectingWebTransportClientOptions);
+
+  /** Creates a managed client and waits for its first ready generation. */
+  static connect(
+    url: string | URL,
+    options?: ReconnectingWebTransportClientOptions,
+  ): Promise<ReconnectingWebTransportClient>;
+  /** Waits for the current or next connection generation to become ready. */
+  waitUntilReady(): Promise<void>;
+  /** Sends a unary call on the current generation without replaying it. */
+  call(request: RpcRequestMessage, options?: ResolvedCallOptions): Promise<RpcResponseMessage>;
+  /** Starts a streaming call on the current generation without resuming it later. */
+  streamingCall(
+    request: RpcRequestMessage,
+    requestBody: AsyncIterable<Uint8Array>,
+    options?: ResolvedCallOptions,
+  ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
+  /** Stops reconnecting and closes the current generation. */
+  close(closeInfo?: WebTransportCloseInfoLike): void;
+  addEventListener(
+    type: "statechange" | ReconnectingTransportState,
+    callback: (event: ReconnectingTransportLifecycleEvent) => void,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
+  removeEventListener(
+    type: "statechange" | ReconnectingTransportState,
+    callback: (event: ReconnectingTransportLifecycleEvent) => void,
+    options?: boolean | EventListenerOptions,
+  ): void;
 }

@@ -1,4 +1,11 @@
-import { Code, connect, createRoot, normalizeMetadata, unary } from "../../src/index.js";
+import {
+  Code,
+  ReconnectingWebTransportClient,
+  connect,
+  createRoot,
+  normalizeMetadata,
+  unary,
+} from "../../src/index.js";
 import type {
   RpcRequestMessage,
   RpcResponseMessage,
@@ -6,6 +13,7 @@ import type {
   Transport,
 } from "../../src/index.js";
 import type { NodeListenOptions } from "../../src/node.js";
+import { ReconnectingNodeTransport } from "../../src/node.js";
 
 interface HelloMessage {
   value?: string;
@@ -59,6 +67,24 @@ const connected = await connect("https://localhost:50051/trevrpc", {
   skipCertificateValidation: true,
 });
 connected.close();
+
+const reconnecting = new ReconnectingWebTransportClient("https://localhost:50051/trevrpc", {
+  reconnectMaxDelayMs: 5_000,
+  onStateChange(event) {
+    event.state satisfies "connecting" | "ready" | "reconnecting" | "closed";
+  },
+});
+await reconnecting.waitUntilReady();
+reconnecting.generation.toFixed();
+reconnecting.close();
+
+const reconnectingNode = new ReconnectingNodeTransport({
+  host: "127.0.0.1",
+  port: 50051,
+  reconnectJitter: 0,
+});
+reconnectingNode.ready satisfies boolean;
+reconnectingNode.close();
 
 const nodeListenOptions: NodeListenOptions = {
   host: "127.0.0.1",

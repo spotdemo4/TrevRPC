@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 import { Code, RpcKind, RpcStreamFrameKind } from "../src/index.js";
-import { NodeServer, NodeTransport } from "../src/node.js";
+import { NodeServer, NodeTransport, ReconnectingNodeTransport } from "../src/node.js";
 
 const require = createRequire(import.meta.url);
 const nativeAddonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
@@ -205,6 +205,38 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
+    "NodeTransport abort cancels a stalled native connect",
+    { skip: native == null, timeout: 10_000 },
+    async () => {
+      const { createSocket } = await import("node:dgram");
+      const sink = createSocket("udp4");
+      await new Promise((resolve, reject) => {
+        sink.once("error", reject);
+        sink.bind(0, "127.0.0.1", resolve);
+      });
+      try {
+        const controller = new AbortController();
+        const connecting = NodeTransport.connect({
+          host: "127.0.0.1",
+          port: sink.address().port,
+          skipCertificateValidation: true,
+          idleTimeoutMs: 600_000,
+          signal: controller.signal,
+        });
+        await setImmediate();
+        controller.abort();
+
+        await assert.rejects(
+          settlesWithin(connecting, 2_000),
+          (error) => error.code === Code.Cancelled,
+        );
+      } finally {
+        sink.close();
+      }
+    },
+  );
+
+  test(
     "Worker termination interrupts an in-progress native connect",
     { skip: native == null, timeout: 10_000 },
     async () => {
@@ -233,6 +265,65 @@ parentPort.postMessage("connecting");
         await settlesWithin(worker.terminate(), 2_000);
       } finally {
         sink.close();
+      }
+    },
+  );
+
+  test(
+    "managed Node reconnect only follows explicit native closed errors",
+    { skip: native == null, timeout: 15_000 },
+    async () => {
+      const certificate = await testCertificate();
+      const server = await NodeServer.listen({
+        host: "127.0.0.1",
+        port: 0,
+        certFile: certificate.certFile,
+        keyFile: certificate.keyFile,
+      });
+      server.register("ownership", "Unavailable", RpcKind.Unary, () => ({
+        status: Code.Unavailable,
+        message: "remote unavailable",
+      }));
+      const serving = server.serve();
+      const client = await ReconnectingNodeTransport.connect({
+        host: "127.0.0.1",
+        port: server.port,
+        skipCertificateValidation: true,
+        maxPendingSendBytes: 128,
+        reconnectInitialDelayMs: 0,
+        reconnectMaxDelayMs: 0,
+        reconnectJitter: 0,
+      });
+      try {
+        const unavailableResponse = await client.call({
+          service: "ownership",
+          method: "Unavailable",
+          kind: RpcKind.Unary,
+          version: 1,
+          body: new Uint8Array(),
+          metadata: {},
+        });
+        assert.equal(unavailableResponse.status, Code.Unavailable);
+        assert.equal(client.generation, 1);
+        assert.equal(client.state, "ready");
+
+        await assert.rejects(
+          client.call({
+            service: "ownership",
+            method: "Unavailable",
+            kind: RpcKind.Unary,
+            version: 1,
+            body: new Uint8Array(1024),
+            metadata: {},
+          }),
+          (error) => error.nativeCode === -1004,
+        );
+        assert.equal(client.generation, 1);
+        assert.equal(client.state, "ready");
+      } finally {
+        client.close();
+        server.close();
+        await serving;
       }
     },
   );
