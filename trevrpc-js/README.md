@@ -1,24 +1,91 @@
 # trevrpc-js
 
-Minimal unary Greeter flow using generated JavaScript bindings.
+The examples use JavaScript bindings generated from
+[`examples/greeter/greeter.proto`](examples/greeter/greeter.proto). Its Greeter service defines
+unary, server-streaming, client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-Create a transport with `connect`, create the generated client, and send a request:
+Create a transport and generated client once, then reuse them across calls:
 
 ```js
 import { connect } from "trevrpc-js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
 const transport = await connect("https://localhost:50051/trevrpc");
-try {
-  const client = new GreeterClient(transport, { timeoutMs: 5000 });
-  const reply = await client.sayHello({ name: "TrevRPC" });
+const client = new GreeterClient(transport, { timeoutMs: 5_000 });
+```
+
+Close the transport with `transport.close({ closeCode: 0, reason: "done" })` after all calls have
+completed.
+
+### Unary
+
+```js
+const reply = await client.sayHello({ name: "TrevRPC" });
+console.log(reply.message);
+```
+
+### Server streaming
+
+The generated method returns an async iterable. Completing the loop consumes the terminal RPC
+status:
+
+```js
+const replies = await client.lotsOfReplies({ name: "TrevRPC" });
+for await (const reply of replies) {
   console.log(reply.message);
-} finally {
-  transport.close({ closeCode: 0, reason: "done" });
 }
 ```
+
+### Client streaming
+
+```js
+const greetings = await client.lotsOfGreetings();
+await greetings.send({ name: "Alice" });
+await greetings.send({ name: "Bob" });
+
+const reply = await greetings.closeAndRecv();
+console.log(reply.message);
+```
+
+`closeAndRecv` half-closes the request side, receives the single response, validates the terminal
+status, and releases the call.
+
+### Bidirectional streaming
+
+Requests and responses may be interleaved. `closeSend` half-closes the request side; continue
+receiving until `recv` returns `undefined`:
+
+```js
+const stream = await client.bidiHello();
+try {
+  for (const name of ["Alice", "Bob"]) {
+    await stream.send({ name });
+    const reply = await stream.recv();
+    if (reply == null) {
+      throw new Error("BidiHello response stream ended early");
+    }
+    console.log(reply.message);
+  }
+
+  await stream.closeSend();
+  for (;;) {
+    const reply = await stream.recv();
+    if (reply == null) {
+      break;
+    }
+    console.log(reply.message);
+  }
+} finally {
+  await stream.close();
+}
+```
+
+Use independent sender and receiver tasks when a protocol must continuously read and write large
+bidi streams.
+
+### Browser transport options
 
 Browsers pass WebTransport constructor options directly to `connect`:
 
@@ -33,15 +100,88 @@ Node.js uses the native transport when imported from the package entrypoint.
 
 ## Server
 
-Create a Node server, register the generated service descriptor, decode the request body, and return an encoded reply:
+Register the generated service descriptor with `NodeServer`. Raw Node handlers decode request
+bodies and encode response messages with the generated protobuf root:
 
 ```js
+import { RpcStreamFrameKind } from "trevrpc-js";
 import { NodeServer } from "trevrpc-js/node";
 import { GreeterService, root } from "./greeter.trevrpc.js";
 
 const HelloRequest = root.lookupType("example.greeter.HelloRequest");
 const HelloReply = root.lookupType("example.greeter.HelloReply");
 
+function encodeReply(message) {
+  return HelloReply.encode({ message }).finish();
+}
+```
+
+### Unary
+
+```js
+function sayHello(call) {
+  const request = HelloRequest.decode(call.request.body);
+  return encodeReply(`Hello, ${request.name || "world"}`);
+}
+```
+
+### Server streaming
+
+Return an async iterable of encoded response messages:
+
+```js
+async function* lotsOfReplies(call) {
+  const request = HelloRequest.decode(call.request.body);
+  const name = request.name || "world";
+  yield encodeReply(`Hello, ${name}`);
+  yield encodeReply(`Goodbye, ${name}`);
+}
+```
+
+### Client streaming
+
+Receive request frames until EOF, then yield the single encoded response:
+
+```js
+async function* lotsOfGreetings(call) {
+  const names = [];
+  for (;;) {
+    const frame = await call.recv();
+    if (frame == null) {
+      break;
+    }
+    if (frame.kind === RpcStreamFrameKind.Message) {
+      names.push(HelloRequest.decode(frame.body).name);
+    }
+  }
+  yield encodeReply(`Hello, ${names.join(", ")}`);
+}
+```
+
+### Bidirectional streaming
+
+An async generator can consume request frames and emit encoded responses with natural
+backpressure:
+
+```js
+async function* bidiHello(call) {
+  for (;;) {
+    const frame = await call.recv();
+    if (frame == null) {
+      return;
+    }
+    if (frame.kind === RpcStreamFrameKind.Message) {
+      const request = HelloRequest.decode(frame.body);
+      yield encodeReply(`Stream hello, ${request.name}`);
+    }
+  }
+}
+```
+
+Create the native Node server and register all four handlers. `NodeServer` sends each message from
+the returned async iterables and appends an OK terminal status:
+
+```js
 const server = await NodeServer.listen({
   host: "127.0.0.1",
   port: 50051,
@@ -52,29 +192,33 @@ const server = await NodeServer.listen({
 });
 
 server.registerService(GreeterService, {
-  sayHello(call) {
-    const request = HelloRequest.decode(call.request.body);
-    return HelloReply.encode({ message: `Hello, ${request.name || "world"}` }).finish();
-  },
+  sayHello,
+  lotsOfReplies,
+  lotsOfGreetings,
+  bidiHello,
 });
 
 await server.serve();
 ```
 
-`enableHttp3` adds ordinary HTTP/3 POST serving to the same native MsQuic listener used by native QUIC and WebTransport. An optional synchronous `http3Admission` callback is bounded by `initialRequestTimeoutMs`.
+`enableHttp3` adds ordinary HTTP/3 POST serving to the same native MsQuic listener used by native
+QUIC and WebTransport. An optional synchronous `http3Admission` callback is bounded by
+`initialRequestTimeoutMs`.
+
+See [`examples/greeter/client.js`](examples/greeter/client.js) for a complete browser client.
 
 ## Native Development
 
-`npm run build:native` creates the production addon without test-only debug hooks. Build the
-test addon before running the native tests:
+`npm run build:native` creates the production addon without test-only debug hooks. Build the test
+addon before running the native tests:
 
 ```sh
 npm run build:native:test
 npm test
 ```
 
-The completion-worker profiler is manual and requires the benchmark server binary plus an
-explicit case, concurrency, iteration count, and payload size:
+The completion-worker profiler is manual and requires the benchmark server binary plus an explicit
+case, concurrency, iteration count, and payload size:
 
 ```sh
 npm run profile:completion-worker:native -- \
