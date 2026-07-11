@@ -6,18 +6,31 @@ unary, server-streaming, client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-Create a transport and generated client once, then reuse them across calls:
+### Browser application
+
+Create a reconnecting transport and generated client once, then reuse them across calls:
 
 ```js
-import { connect } from "trevrpc-js";
+import { ReconnectingWebTransportClient } from "trevrpc-js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
-const transport = await connect("https://localhost:50051/trevrpc");
-const client = new GreeterClient(transport, { timeoutMs: 5_000 });
+const transport = await ReconnectingWebTransportClient.connect("https://localhost:50051/trevrpc");
+try {
+  const client = new GreeterClient(transport, { timeoutMs: 5_000 });
+  const reply = await client.sayHello({ name: "TrevRPC" });
+} finally {
+  transport.close({ closeCode: 0, reason: "client shutdown" });
+}
 ```
 
 Close the transport with `transport.close({ closeCode: 0, reason: "done" })` after all calls have
-completed.
+completed, preferably from an application-level `finally` block. Managed transports own persistent
+reconnect loops and must be closed during shutdown.
+
+The static `connect` helpers wait indefinitely for the first ready generation while retrying failed
+initial connections. Applications that require bounded startup should construct the reconnecting
+transport directly, race `waitUntilReady()` against their startup deadline, and call `close()` when
+that deadline expires. The complete browser example demonstrates this pattern.
 
 ### Unary
 
@@ -87,16 +100,61 @@ bidi streams.
 
 ### Browser transport options
 
-Browsers pass WebTransport constructor options directly to `connect`:
+Browsers pass WebTransport constructor options directly to
+`ReconnectingWebTransportClient.connect`:
 
 ```js
-const transport = await connect("https://localhost:50051/trevrpc", {
+const transport = await ReconnectingWebTransportClient.connect("https://localhost:50051/trevrpc", {
   congestionControl: "low-latency",
   serverCertificateHashes: [{ algorithm: "sha-256", value: certificateHash }],
 });
+try {
+  const client = new GreeterClient(transport);
+  const reply = await client.sayHello({ name: "TrevRPC" });
+} finally {
+  transport.close({ closeCode: 0, reason: "client shutdown" });
+}
 ```
 
-Node.js uses the native transport when imported from the package entrypoint.
+### Node application
+
+Node applications use the reconnecting native QUIC transport:
+
+```js
+import { ReconnectingNodeTransport } from "trevrpc-js/node";
+import { GreeterClient } from "./greeter.trevrpc.js";
+
+const transport = await ReconnectingNodeTransport.connect("https://localhost:50051");
+try {
+  const client = new GreeterClient(transport, { timeoutMs: 5_000 });
+  const reply = await client.sayHello({ name: "TrevRPC" });
+} finally {
+  transport.close();
+}
+```
+
+Call `transport.close()` during application shutdown. The native low-level client does not expose an
+idle connection-closed signal, so an idle Node connection loss is first observed by the next RPC.
+That RPC fails without replay and starts background reconnection for later calls.
+
+### Low-level transports
+
+`WebTransportClient` wraps an established browser WebTransport session, while `NodeTransport`
+opens one native connection. These low-level paths do not reconnect automatically:
+
+```js
+import { WebTransportClient } from "trevrpc-js";
+
+const session = new WebTransport("https://localhost:50051/trevrpc");
+await session.ready;
+const browserTransport = new WebTransportClient(session);
+```
+
+```js
+import { NodeTransport } from "trevrpc-js/node";
+
+const nodeTransport = await NodeTransport.connect("https://localhost:50051");
+```
 
 ## Server
 

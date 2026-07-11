@@ -6,7 +6,32 @@ client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-Create a generated client from a connected QUIC transport:
+Create a generated client with a managed QUIC transport:
+
+```go
+transport, err := trevrpc.DialManaged(
+	ctx,
+	"127.0.0.1:50051",
+	trevrpc.ManagedDialOptions{
+		DialOptions: trevrpc.DialOptions{TLSConfig: tlsConfig},
+	},
+)
+if err != nil {
+	return err
+}
+defer transport.Close()
+
+client := greeter.NewGreeterClient(transport)
+```
+
+`DialManaged` returns a `ManagedQuicClient`. Reconnects serve future calls only; calls are never
+retried. `tlsConfig` must trust the server certificate and include `trevrpc.ALPN` in `NextProtos`. The
+[complete client example](examples/greeter_client/main.go) includes local certificate setup.
+
+### Advanced: low-level QUIC connection
+
+Use `quic.DialAddr` and `NewQuicClient` when the application needs to own the QUIC connection
+lifecycle directly:
 
 ```go
 conn, err := quic.DialAddr(
@@ -22,9 +47,6 @@ defer conn.CloseWithError(0, "client done")
 
 client := greeter.NewGreeterClient(trevrpc.NewQuicClient(conn))
 ```
-
-`tlsConfig` must trust the server certificate and include `trevrpc.ALPN` in `NextProtos`. The
-[complete client example](examples/greeter_client/main.go) includes local certificate setup.
 
 ### Unary
 

@@ -33,43 +33,51 @@ int main(int argc, char** argv) {
     uint16_t port = argc > 2 ? (uint16_t)atoi(argv[2]) : 50051;
     const char* name = argc > 3 ? argv[3] : "TrevRPC";
 
+    int exit_code = 1;
     trevrpc_config config = trevrpc_default_config();
-    trevrpc_client* client = NULL;
-    int rc = trevrpc_client_connect(host, port, &config, &client);
+    trevrpc_managed_client* client = NULL;
+    trevrpc_stream* stream = NULL;
+    Hello__V1__HelloReply* response = NULL;
+    int rc = trevrpc_managed_client_create(host, port, &config, NULL, &client);
     if (rc != 0) {
-        fprintf(stderr, "connect failed: %s\n", trevrpc_error(rc));
-        return 1;
+        fprintf(stderr, "client creation failed: %s\n", trevrpc_error(rc));
+        goto cleanup;
     }
+
+    rc = trevrpc_managed_client_wait_ready(client, 5000000000ull, NULL, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "client did not become ready: %s\n", trevrpc_error(rc));
+        goto cleanup;
+    }
+    /* Reconnects serve later calls; in-flight RPCs are never retried or replayed. */
 
     Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
     request.name = (char*)name;
 
-    Hello__V1__HelloReply* response = NULL;
-    rc = hello_v1_greeter_say_hello(client, &request, &response);
+    rc = hello_v1_greeter_say_hello_managed(client, &request, &response);
     if (rc != 0) {
         fprintf(stderr, "SayHello failed: %s\n", trevrpc_error(rc));
-        trevrpc_client_close(client);
-        return 1;
+        goto cleanup;
     }
 
     printf("unary: %s\n", response->message != NULL ? response->message : "");
     hello__v1__hello_reply__free_unpacked(response, NULL);
+    response = NULL;
 
-    trevrpc_stream* stream = NULL;
-    rc = hello_v1_greeter_lots_of_replies(client, &request, &stream);
+    rc = hello_v1_greeter_lots_of_replies_managed(client, &request, &stream);
     if (rc == 0) {
         printf("server streaming:\n");
         rc = print_replies(stream);
         trevrpc_stream_close(stream);
+        stream = NULL;
     }
     if (rc != 0) {
         fprintf(stderr, "LotsOfReplies failed: %s\n", trevrpc_error(rc));
-        trevrpc_client_close(client);
-        return 1;
+        goto cleanup;
     }
 
     stream = NULL;
-    rc = hello_v1_greeter_lots_of_greetings_start(client, &stream);
+    rc = hello_v1_greeter_lots_of_greetings_managed_start(client, &stream);
     if (rc == 0) {
         rc = send_name(stream, "Alice");
     }
@@ -85,19 +93,20 @@ int main(int argc, char** argv) {
         if (rc == 0 && response != NULL) {
             printf("client streaming: %s\n", response->message != NULL ? response->message : "");
             hello__v1__hello_reply__free_unpacked(response, NULL);
+            response = NULL;
         }
     }
     if (stream != NULL) {
         trevrpc_stream_close(stream);
+        stream = NULL;
     }
     if (rc != 0) {
         fprintf(stderr, "LotsOfGreetings failed: %s\n", trevrpc_error(rc));
-        trevrpc_client_close(client);
-        return 1;
+        goto cleanup;
     }
 
     stream = NULL;
-    rc = hello_v1_greeter_bidi_hello_start(client, &stream);
+    rc = hello_v1_greeter_bidi_hello_managed_start(client, &stream);
     if (rc == 0) {
         rc = send_name(stream, "Carol");
     }
@@ -113,13 +122,25 @@ int main(int argc, char** argv) {
     }
     if (stream != NULL) {
         trevrpc_stream_close(stream);
+        stream = NULL;
     }
     if (rc != 0) {
         fprintf(stderr, "BidiHello failed: %s\n", trevrpc_error(rc));
-        trevrpc_client_close(client);
-        return 1;
+        goto cleanup;
     }
 
-    trevrpc_client_close(client);
-    return 0;
+    exit_code = 0;
+
+cleanup:
+    if (response != NULL) {
+        hello__v1__hello_reply__free_unpacked(response, NULL);
+    }
+    if (stream != NULL) {
+        trevrpc_stream_close(stream);
+    }
+    if (client != NULL) {
+        trevrpc_managed_client_close(client);
+        trevrpc_managed_client_release(client);
+    }
+    return exit_code;
 }

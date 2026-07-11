@@ -6,7 +6,8 @@ unary, server-streaming, client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-Connect once and reuse the client across calls:
+For native QUIC, create a managed client, wait for its asynchronous connection to become ready, and
+reuse it across calls. Generated managed helpers are the default client path:
 
 ```c
 #include "greeter.pb-c.h"
@@ -16,60 +17,39 @@ Connect once and reuse the client across calls:
 #include <stdio.h>
 
 trevrpc_config config = trevrpc_default_config();
-trevrpc_client* client = NULL;
-if (trevrpc_client_connect("127.0.0.1", 50051, &config, &client) != 0) {
+trevrpc_managed_client* client = NULL;
+int rc = trevrpc_managed_client_create("127.0.0.1", 50051, &config, NULL, &client);
+if (rc != 0) {
     return 1;
 }
 
+rc = trevrpc_managed_client_wait_ready(client, 5000000000ull, NULL, NULL);
+
 Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
 request.name = "TrevRPC";
-```
-
-Close the client with `trevrpc_client_close(client)` after all calls have completed.
-
-### Managed native client
-
-`trevrpc_client` remains the low-level, already-established client. For native MsQuic connections
-that should reconnect after transport loss, create an opaque `trevrpc_managed_client` instead:
-
-```c
-trevrpc_managed_client_options* options = trevrpc_managed_client_options_new();
-trevrpc_managed_client_options_set_backoff(options, 100, 30000, 20);
-
-trevrpc_config config = trevrpc_default_config();
-trevrpc_managed_client* managed_client = NULL;
-int rc = trevrpc_managed_client_create("127.0.0.1", 50051, &config, options, &managed_client);
-trevrpc_managed_client_options_free(options);
+Hello__V1__HelloReply* reply = NULL;
 if (rc == 0) {
-    rc = trevrpc_managed_client_wait_ready(managed_client, 5000000000ull, NULL, NULL);
+    rc = hello_v1_greeter_say_hello_managed(client, &request, &reply);
+}
+if (reply != NULL) {
+    printf("%s\n", reply->message);
+    hello__v1__hello_reply__free_unpacked(reply, NULL);
 }
 
-Hello__V1__HelloRequest managed_request = HELLO__V1__HELLO_REQUEST__INIT;
-managed_request.name = "TrevRPC";
-Hello__V1__HelloReply* managed_reply = NULL;
-if (rc == 0) {
-    rc = hello_v1_greeter_say_hello_managed(managed_client, &managed_request, &managed_reply);
-}
-if (managed_reply != NULL) {
-    printf("%s\n", managed_reply->message);
-    hello__v1__hello_reply__free_unpacked(managed_reply, NULL);
-}
-
-trevrpc_managed_client_close(managed_client);
-trevrpc_managed_client_release(managed_client);
+trevrpc_managed_client_close(client);
+trevrpc_managed_client_release(client);
+return rc == 0 ? 0 : 1;
 ```
 
 Creation is asynchronous. The managed client deep-copies the host and all pointer-backed fields in
-`trevrpc_config`; the caller may release or change them after creation. Backoff is bounded between
-the configured initial and maximum delays and applies jitter. A zero readiness timeout
-waits indefinitely. Readiness waits may also receive a `trevrpc_cancellation`.
+`trevrpc_config`; the caller may release or change them after creation. A zero readiness timeout
+waits indefinitely, and readiness waits may also receive a `trevrpc_cancellation`.
 
-The `trevrpc_managed_client_call_*` and `trevrpc_managed_client_start_stream*` functions mirror the
-low-level request surface. Each new operation atomically selects exactly one ready generation. New
-operations return `TREV_MSQUIC_ERR_CLOSED` immediately while connecting, reconnecting, or closed.
-The runtime never queues, replays, or resumes an RPC. A stream stays attached to the generation on
-which it started and fails naturally if that connection is lost; only a later operation can use a
-new generation.
+`trevrpc_managed_client_wait_ready` gates initial calls, but it does not add retry semantics. Each new
+operation selects one ready connection generation; the runtime never queues, retries, replays, or
+resumes an RPC. A stream stays attached to the generation on which it started and fails naturally if
+that connection is lost. Reconnection only makes a later operation possible. New operations return
+`TREV_MSQUIC_ERR_CLOSED` immediately while connecting, reconnecting, or closed.
 
 Generated bindings expose managed helpers without changing the existing `trevrpc_client` helpers.
 Unary and server-streaming methods add `_managed` and `_managed_with_options` variants. Client- and
@@ -99,7 +79,7 @@ threads that can begin managed API calls have stopped, call `trevrpc_managed_cli
 joins the reconnect worker and lifecycle dispatcher, drains entered operations, and frees the handle.
 Release must not run from a lifecycle callback and no new managed API call may begin concurrently
 with it. Already-started calls and streams safely retain their generation until they return or are
-closed.
+closed. Every successful create must follow this close-then-release lifecycle, including error paths.
 
 The managed API is additive and uses opaque types, so `TREVRPC_C_ABI_VERSION` remains 4.
 
@@ -109,7 +89,7 @@ The generated unary helper returns one decoded response:
 
 ```c
 Hello__V1__HelloReply* reply = NULL;
-int rc = hello_v1_greeter_say_hello(client, &request, &reply);
+int rc = hello_v1_greeter_say_hello_managed(client, &request, &reply);
 if (rc == 0) {
     printf("%s\n", reply->message);
     hello__v1__hello_reply__free_unpacked(reply, NULL);
@@ -125,7 +105,7 @@ the terminal RPC status:
 
 ```c
 trevrpc_stream* stream = NULL;
-int rc = hello_v1_greeter_lots_of_replies(client, &request, &stream);
+int rc = hello_v1_greeter_lots_of_replies_managed(client, &request, &stream);
 while (rc == 0) {
     uint32_t status = TREVRPC_STATUS_OK;
     Hello__V1__HelloReply* reply = NULL;
@@ -151,7 +131,7 @@ the terminal status:
 
 ```c
 trevrpc_stream* stream = NULL;
-int rc = hello_v1_greeter_lots_of_greetings_start(client, &stream);
+int rc = hello_v1_greeter_lots_of_greetings_managed_start(client, &stream);
 
 Hello__V1__HelloRequest first = HELLO__V1__HELLO_REQUEST__INIT;
 first.name = "Alice";
@@ -196,7 +176,7 @@ before sending the next request:
 
 ```c
 trevrpc_stream* stream = NULL;
-int rc = hello_v1_greeter_bidi_hello_start(client, &stream);
+int rc = hello_v1_greeter_bidi_hello_managed_start(client, &stream);
 
 const char* names[] = {"Alice", "Bob"};
 for (size_t i = 0; rc == 0 && i < sizeof(names) / sizeof(names[0]); i++) {
@@ -237,6 +217,33 @@ trevrpc_stream_close(stream);
 
 Use independent send and receive threads when a protocol must continuously read and write large
 bidi streams.
+
+### Advanced: established-connection client
+
+Use `trevrpc_client` when the application explicitly wants a low-level, already-established
+connection without managed reconnection. The original generated helpers remain available without
+the `_managed` or `_managed_start` suffixes:
+
+```c
+trevrpc_config config = trevrpc_default_config();
+trevrpc_client* client = NULL;
+int rc = trevrpc_client_connect("127.0.0.1", 50051, &config, &client);
+if (rc != 0) {
+    return 1;
+}
+
+Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+request.name = "TrevRPC";
+Hello__V1__HelloReply* reply = NULL;
+rc = hello_v1_greeter_say_hello(client, &request, &reply);
+if (reply != NULL) {
+    printf("%s\n", reply->message);
+    hello__v1__hello_reply__free_unpacked(reply, NULL);
+}
+
+trevrpc_client_close(client);
+return rc == 0 ? 0 : 1;
+```
 
 ## Server
 

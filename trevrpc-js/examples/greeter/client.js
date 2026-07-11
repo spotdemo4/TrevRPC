@@ -1,4 +1,4 @@
-import { TrevRpcError, connect } from "../../src/index.js";
+import { ReconnectingWebTransportClient, TrevRpcError } from "../../src/index.js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
 const form = document.querySelector("#client-form");
@@ -30,7 +30,8 @@ async function runFromForm(data) {
   let transport;
   try {
     log(`connecting to ${url}`);
-    transport = await connect(url, browserConnectOptions(certificateHash));
+    transport = new ReconnectingWebTransportClient(url, browserConnectOptions(certificateHash));
+    await waitUntilReady(transport, 10_000);
     const client = new GreeterClient(transport, {
       timeoutMs: 5_000,
       metadata: token === "" ? {} : { authorization: `Bearer ${token}` },
@@ -80,6 +81,20 @@ async function runFromForm(data) {
   } finally {
     submit.disabled = false;
     transport?.close({ closeCode: 0, reason: "example complete" });
+  }
+}
+
+async function waitUntilReady(transport, timeoutMs) {
+  let timeout;
+  try {
+    await Promise.race([
+      transport.waitUntilReady(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("initial connection timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

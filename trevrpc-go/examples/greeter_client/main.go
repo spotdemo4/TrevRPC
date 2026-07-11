@@ -9,7 +9,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/internal/examplecert"
@@ -34,14 +33,17 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	conn, err := quic.DialAddr(ctx, serverAddr, tlsConfig, trevrpc.QUICClientConfig(trevrpc.DefaultMaxFrameSize, nil))
+	transport, err := trevrpc.DialManaged(ctx, serverAddr, trevrpc.ManagedDialOptions{
+		DialOptions: trevrpc.DialOptions{TLSConfig: tlsConfig},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.CloseWithError(0, "client done")
+	defer transport.Close()
+	// Reconnects serve future calls only; calls are never retried.
 
 	client := greeter.NewGreeterClient(
-		trevrpc.NewQuicClient(conn),
+		transport,
 		trevrpc.WithTimeout(5*time.Second),
 		trevrpc.WithMetadata("authorization", []byte("Bearer "+authToken)),
 	)

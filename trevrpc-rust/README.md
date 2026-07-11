@@ -6,25 +6,27 @@ server-streaming, client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-Create a generated client from a connected Quinn transport:
+Create a generated client with a managed Quinn transport:
 
 ```rust
-let connection = endpoint
-    .connect("127.0.0.1:5000".parse()?, "localhost")?
-    .await?;
-let transport = trevrpc::quinn::Client::new(connection);
-let client = greeter::GreeterClient::new(transport);
+let endpoint = make_client_endpoint()?;
+let transport = trevrpc::quinn::ManagedClient::connect(
+    endpoint.clone(),
+    "127.0.0.1:5000".parse()?,
+    "localhost",
+)
+.await?;
+let client = greeter::GreeterClient::new(transport.clone());
 let options = trevrpc::client::CallOptions::new();
 ```
 
 The Quinn endpoint must trust the server certificate and include `trevrpc::ALPN` in its ALPN
 protocols. The [complete client example](examples/greeter_client.rs) includes local TLS setup.
 
-For native QUIC clients that should recover future calls after connection loss, use
-`trevrpc::quinn::ManagedClient::connect`. It owns and reuses the supplied Quinn endpoint across
-connection generations so rustls TLS session resumption state survives redial. Each RPC snapshots
-one generation and is never replayed: in-flight calls fail with their normal transport error when
-that generation dies, and new calls fail immediately with `Unavailable` while reconnecting.
+`ManagedClient` owns and reuses the supplied Quinn endpoint across connection generations so rustls
+TLS session resumption state survives redial. Reconnection only serves future calls; it does not
+retry or replay any RPC. In-flight calls fail with their normal transport error when their
+generation dies, and new calls fail immediately with `Unavailable` while reconnecting.
 `wait_until_ready`, `state`, `subscribe_state`, and `subscribe_events` expose readiness and lifecycle
 changes. `close` permanently stops that managed client's reconnect loop.
 
@@ -32,6 +34,34 @@ The managed client never enables Quinn 0-RTT. TLS session resumption may shorten
 RPC application data is sent only after the full handshake completes. `ManagedClient::rebind`
 changes the UDP socket for the entire shared Quinn endpoint and therefore affects every connection
 using an endpoint clone; a successful rebind alone does not change the managed generation.
+
+Keep the separate transport and endpoint handles for orderly shutdown:
+
+```rust
+transport.close();
+endpoint.wait_idle().await;
+```
+
+Calling `transport.close()` stops reconnecting and closes its current connection. It deliberately
+does not close the shared Quinn endpoint. If the application owns the endpoint exclusively, drop it
+after `wait_idle`; if the endpoint is shared, keep it alive for its other connections.
+
+### Advanced: low-level established connection
+
+Use `trevrpc::quinn::Client` when the application already manages an established Quinn connection
+and its lifecycle directly. This transport does not reconnect:
+
+```rust
+let connection = endpoint
+    .connect("127.0.0.1:5000".parse()?, "localhost")?
+    .await?;
+let transport = trevrpc::quinn::Client::new(connection.clone());
+let client = greeter::GreeterClient::new(transport);
+
+// After all calls and streams have finished:
+connection.close(0_u32.into(), b"client done");
+endpoint.wait_idle().await;
+```
 
 ### Unary
 
