@@ -3,6 +3,7 @@
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
 #include "trevrpc_msquic.h"
+#include "trevrpc_raw.h"
 #include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
 
@@ -35,7 +36,7 @@ typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
 int trevrpc_test_server_new(const trevrpc_config* config, trevrpc_server** out_server);
 void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
 void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_stream* stream);
-trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_client* client);
+trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_raw_client* client);
 int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port);
 size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
 uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
@@ -128,19 +129,19 @@ typedef struct serve_args {
 
 typedef struct wt_serve_fixture {
     trevrpc_server* server;
-    trevrpc_client* client;
+    trevrpc_raw_client* client;
     pthread_t thread;
     bool thread_started;
     serve_args args;
 } wt_serve_fixture;
 
-typedef struct managed_serve_fixture {
+typedef struct channel_serve_fixture {
     trevrpc_server* server;
-    trevrpc_managed_client* client;
+    trevrpc_channel* channel;
     pthread_t thread;
     bool thread_started;
     serve_args args;
-} managed_serve_fixture;
+} channel_serve_fixture;
 
 static void record_started(void* user_data, const trevrpc_rpc_started_event* event) {
     (void)event;
@@ -351,23 +352,28 @@ static bool text_file_contains(const char* path, const char* needle) {
     return found;
 }
 
-static int test_generator_managed_output(void) {
+static int test_generator_channel_output(void) {
     int result = 1;
     const char* header_names[] = {
-        "hello_v1_greeter_say_hello_managed(",
-        "hello_v1_greeter_say_hello_managed_with_options(",
-        "hello_v1_greeter_lots_of_replies_managed(",
-        "hello_v1_greeter_lots_of_replies_managed_with_options(",
-        "hello_v1_greeter_lots_of_greetings_managed_start(",
-        "hello_v1_greeter_lots_of_greetings_managed_start_with_options(",
-        "hello_v1_greeter_bidi_hello_managed_start(",
-        "hello_v1_greeter_bidi_hello_managed_start_with_options(",
+        "hello_v1_greeter_say_hello(",
+        "hello_v1_greeter_say_hello_with_options(",
+        "hello_v1_greeter_lots_of_replies(",
+        "hello_v1_greeter_lots_of_replies_with_options(",
+        "hello_v1_greeter_lots_of_greetings_start(",
+        "hello_v1_greeter_lots_of_greetings_start_with_options(",
+        "hello_v1_greeter_bidi_hello_start(",
+        "hello_v1_greeter_bidi_hello_start_with_options(",
     };
     for (size_t i = 0; i < sizeof(header_names) / sizeof(header_names[0]); i++) {
         CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_HEADER, header_names[i]));
     }
-    CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_managed_client_call_unary_with_options("));
-    CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_managed_client_start_stream_with_options("));
+    CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_channel_call_unary_with_options("));
+    CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_channel_start_stream_with_options("));
+    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_HEADER, "_managed"));
+    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_SOURCE, "_managed"));
+    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_HEADER, "trevrpc_client"));
+    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_client"));
+    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_HEADER, "trevrpc_raw_client"));
     CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "hello_v1_greeter_say_hello_impl("));
     CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "hello_v1_greeter_lots_of_replies_impl("));
 
@@ -378,45 +384,26 @@ cleanup:
 }
 
 static int test_generated_helper_signatures(void) {
-    int (*unary)(trevrpc_client*, const Hello__V1__HelloRequest*, Hello__V1__HelloReply**) = hello_v1_greeter_say_hello;
+    int (*unary)(trevrpc_channel*, const Hello__V1__HelloRequest*, Hello__V1__HelloReply**) =
+        hello_v1_greeter_say_hello;
     int (*unary_options)(
-        trevrpc_client*, const Hello__V1__HelloRequest*, const trevrpc_call_options*, Hello__V1__HelloReply**) =
+        trevrpc_channel*, const Hello__V1__HelloRequest*, const trevrpc_call_options*, Hello__V1__HelloReply**) =
         hello_v1_greeter_say_hello_with_options;
-    int (*managed_unary)(trevrpc_managed_client*, const Hello__V1__HelloRequest*, Hello__V1__HelloReply**) =
-        hello_v1_greeter_say_hello_managed;
-    int (*managed_unary_options)(
-        trevrpc_managed_client*, const Hello__V1__HelloRequest*, const trevrpc_call_options*, Hello__V1__HelloReply**) =
-        hello_v1_greeter_say_hello_managed_with_options;
-    int (*server_stream)(trevrpc_client*, const Hello__V1__HelloRequest*, trevrpc_stream**) =
+    int (*server_stream)(trevrpc_channel*, const Hello__V1__HelloRequest*, trevrpc_stream**) =
         hello_v1_greeter_lots_of_replies;
     int (*server_stream_options)(
-        trevrpc_client*, const Hello__V1__HelloRequest*, const trevrpc_call_options*, trevrpc_stream**) =
+        trevrpc_channel*, const Hello__V1__HelloRequest*, const trevrpc_call_options*, trevrpc_stream**) =
         hello_v1_greeter_lots_of_replies_with_options;
-    int (*managed_server_stream)(trevrpc_managed_client*, const Hello__V1__HelloRequest*, trevrpc_stream**) =
-        hello_v1_greeter_lots_of_replies_managed;
-    int (*managed_server_stream_options)(
-        trevrpc_managed_client*, const Hello__V1__HelloRequest*, const trevrpc_call_options*, trevrpc_stream**) =
-        hello_v1_greeter_lots_of_replies_managed_with_options;
-    int (*client_stream)(trevrpc_client*, trevrpc_stream**) = hello_v1_greeter_lots_of_greetings_start;
-    int (*client_stream_options)(trevrpc_client*, const trevrpc_call_options*, trevrpc_stream**) =
+    int (*client_stream)(trevrpc_channel*, trevrpc_stream**) = hello_v1_greeter_lots_of_greetings_start;
+    int (*client_stream_options)(trevrpc_channel*, const trevrpc_call_options*, trevrpc_stream**) =
         hello_v1_greeter_lots_of_greetings_start_with_options;
-    int (*managed_client_stream)(trevrpc_managed_client*, trevrpc_stream**) =
-        hello_v1_greeter_lots_of_greetings_managed_start;
-    int (*managed_client_stream_options)(trevrpc_managed_client*, const trevrpc_call_options*, trevrpc_stream**) =
-        hello_v1_greeter_lots_of_greetings_managed_start_with_options;
-    int (*bidi_stream)(trevrpc_client*, trevrpc_stream**) = hello_v1_greeter_bidi_hello_start;
-    int (*bidi_stream_options)(trevrpc_client*, const trevrpc_call_options*, trevrpc_stream**) =
+    int (*bidi_stream)(trevrpc_channel*, trevrpc_stream**) = hello_v1_greeter_bidi_hello_start;
+    int (*bidi_stream_options)(trevrpc_channel*, const trevrpc_call_options*, trevrpc_stream**) =
         hello_v1_greeter_bidi_hello_start_with_options;
-    int (*managed_bidi_stream)(trevrpc_managed_client*, trevrpc_stream**) = hello_v1_greeter_bidi_hello_managed_start;
-    int (*managed_bidi_stream_options)(trevrpc_managed_client*, const trevrpc_call_options*, trevrpc_stream**) =
-        hello_v1_greeter_bidi_hello_managed_start_with_options;
 
-    return unary == NULL || unary_options == NULL || managed_unary == NULL || managed_unary_options == NULL ||
-           server_stream == NULL || server_stream_options == NULL || managed_server_stream == NULL ||
-           managed_server_stream_options == NULL || client_stream == NULL || client_stream_options == NULL ||
-           managed_client_stream == NULL || managed_client_stream_options == NULL || bidi_stream == NULL ||
-           bidi_stream_options == NULL || managed_bidi_stream == NULL || managed_bidi_stream_options == NULL ||
-           TREVRPC_C_ABI_VERSION != 4u;
+    return unary == NULL || unary_options == NULL || server_stream == NULL || server_stream_options == NULL ||
+           client_stream == NULL || client_stream_options == NULL || bidi_stream == NULL ||
+           bidi_stream_options == NULL || TREVRPC_C_ABI_VERSION != 5u;
 }
 
 static int start_wt_serve_fixture(wt_serve_fixture* fixture, const trevrpc_config* config) {
@@ -457,11 +444,11 @@ static int start_wt_serve_fixture(wt_serve_fixture* fixture, const trevrpc_confi
         .max_streams_per_session = 8,
         .idle_timeout_ms = 1000,
     };
-    return trevrpc_client_connect_webtransport(&client_config, config, &fixture->client);
+    return trevrpc_raw_client_connect_webtransport(&client_config, config, &fixture->client);
 }
 
 static int stop_wt_serve_fixture(wt_serve_fixture* fixture) {
-    trevrpc_client_close(fixture->client);
+    trevrpc_raw_client_close(fixture->client);
     fixture->client = NULL;
     trevrpc_server_shutdown(fixture->server);
     if (fixture->thread_started) {
@@ -475,7 +462,7 @@ static int stop_wt_serve_fixture(wt_serve_fixture* fixture) {
 }
 
 static void close_wt_serve_fixture(wt_serve_fixture* fixture) {
-    trevrpc_client_close(fixture->client);
+    trevrpc_raw_client_close(fixture->client);
     fixture->client = NULL;
     trevrpc_server_shutdown(fixture->server);
     if (fixture->thread_started) {
@@ -486,7 +473,7 @@ static void close_wt_serve_fixture(wt_serve_fixture* fixture) {
     fixture->server = NULL;
 }
 
-static int start_managed_serve_fixture(managed_serve_fixture* fixture) {
+static int start_channel_serve_fixture(channel_serve_fixture* fixture) {
     memset(fixture, 0, sizeof(*fixture));
     trevrpc_server_config server_config = trevrpc_default_server_config();
     server_config.host = "127.0.0.1";
@@ -517,17 +504,13 @@ static int start_managed_serve_fixture(managed_serve_fixture* fixture) {
     }
     trevrpc_config client_config = trevrpc_default_config();
     client_config.skip_certificate_validation = 1;
-    err = trevrpc_managed_client_create("127.0.0.1", port, &client_config, NULL, &fixture->client);
-    if (err != 0) {
-        return err;
-    }
-    return trevrpc_managed_client_wait_ready(fixture->client, 5000000000ull, NULL, NULL);
+    return trevrpc_channel_connect("127.0.0.1", port, &client_config, NULL, 5000000000ull, NULL, &fixture->channel);
 }
 
-static int stop_managed_serve_fixture(managed_serve_fixture* fixture) {
-    trevrpc_managed_client_close(fixture->client);
-    trevrpc_managed_client_release(fixture->client);
-    fixture->client = NULL;
+static int stop_channel_serve_fixture(channel_serve_fixture* fixture) {
+    trevrpc_channel_close(fixture->channel);
+    trevrpc_channel_release(fixture->channel);
+    fixture->channel = NULL;
     trevrpc_server_shutdown(fixture->server);
     if (fixture->thread_started) {
         int err = pthread_join(fixture->thread, NULL);
@@ -539,10 +522,10 @@ static int stop_managed_serve_fixture(managed_serve_fixture* fixture) {
     return fixture->args.result;
 }
 
-static void close_managed_serve_fixture(managed_serve_fixture* fixture) {
-    trevrpc_managed_client_close(fixture->client);
-    trevrpc_managed_client_release(fixture->client);
-    fixture->client = NULL;
+static void close_channel_serve_fixture(channel_serve_fixture* fixture) {
+    trevrpc_channel_close(fixture->channel);
+    trevrpc_channel_release(fixture->channel);
+    fixture->channel = NULL;
     trevrpc_server_shutdown(fixture->server);
     if (fixture->thread_started) {
         (void)pthread_join(fixture->thread, NULL);
@@ -577,7 +560,7 @@ cleanup:
     return result;
 }
 
-static int finish_managed_client_stream(trevrpc_stream* stream, const Hello__V1__HelloRequest* request) {
+static int finish_channel_client_stream(trevrpc_stream* stream, const Hello__V1__HelloRequest* request) {
     if (hello_v1_greeter_send_hello_v1_hello_request(stream, request) != 0 || trevrpc_stream_finish_send(stream) != 0) {
         trevrpc_stream_close(stream);
         return 1;
@@ -585,7 +568,7 @@ static int finish_managed_client_stream(trevrpc_stream* stream, const Hello__V1_
     return expect_single_stream_reply(stream, "client stream");
 }
 
-static int finish_managed_bidi_stream(trevrpc_stream* stream) {
+static int finish_channel_bidi_stream(trevrpc_stream* stream) {
     if (trevrpc_stream_finish_send(stream) != 0) {
         trevrpc_stream_close(stream);
         return 1;
@@ -593,55 +576,55 @@ static int finish_managed_bidi_stream(trevrpc_stream* stream) {
     return expect_single_stream_reply(stream, "bidi");
 }
 
-static int test_generated_managed_helpers_all_rpc_shapes(void) {
+static int test_generated_channel_helpers_all_rpc_shapes(void) {
     int result = 1;
-    managed_serve_fixture fixture = {0};
+    channel_serve_fixture fixture = {0};
     Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
     Hello__V1__HelloReply* response = NULL;
     trevrpc_stream* stream = NULL;
     trevrpc_call_options options = trevrpc_default_call_options();
     options.timeout_nanos = 5000000000ull;
-    request.name = "managed";
+    request.name = "channel";
 
-    CHECK_GOTO(start_managed_serve_fixture(&fixture) == 0);
+    CHECK_GOTO(start_channel_serve_fixture(&fixture) == 0);
 
-    CHECK_GOTO(hello_v1_greeter_say_hello_managed(fixture.client, &request, &response) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(fixture.channel, &request, &response) == 0);
     CHECK_GOTO(response != NULL && response->message != NULL && strcmp(response->message, request.name) == 0);
     hello__v1__hello_reply__free_unpacked(response, NULL);
     response = NULL;
-    CHECK_GOTO(hello_v1_greeter_say_hello_managed_with_options(fixture.client, &request, &options, &response) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello_with_options(fixture.channel, &request, &options, &response) == 0);
     CHECK_GOTO(response != NULL && response->message != NULL && strcmp(response->message, request.name) == 0);
     hello__v1__hello_reply__free_unpacked(response, NULL);
     response = NULL;
 
-    CHECK_GOTO(hello_v1_greeter_lots_of_replies_managed(fixture.client, &request, &stream) == 0);
+    CHECK_GOTO(hello_v1_greeter_lots_of_replies(fixture.channel, &request, &stream) == 0);
     int stream_result = expect_single_stream_reply(stream, "reply");
     stream = NULL;
     CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(hello_v1_greeter_lots_of_replies_managed_with_options(fixture.client, &request, &options, &stream) == 0);
+    CHECK_GOTO(hello_v1_greeter_lots_of_replies_with_options(fixture.channel, &request, &options, &stream) == 0);
     stream_result = expect_single_stream_reply(stream, "reply");
     stream = NULL;
     CHECK_GOTO(stream_result == 0);
 
-    CHECK_GOTO(hello_v1_greeter_lots_of_greetings_managed_start(fixture.client, &stream) == 0);
-    stream_result = finish_managed_client_stream(stream, &request);
+    CHECK_GOTO(hello_v1_greeter_lots_of_greetings_start(fixture.channel, &stream) == 0);
+    stream_result = finish_channel_client_stream(stream, &request);
     stream = NULL;
     CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(hello_v1_greeter_lots_of_greetings_managed_start_with_options(fixture.client, &options, &stream) == 0);
-    stream_result = finish_managed_client_stream(stream, &request);
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-
-    CHECK_GOTO(hello_v1_greeter_bidi_hello_managed_start(fixture.client, &stream) == 0);
-    stream_result = finish_managed_bidi_stream(stream);
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(hello_v1_greeter_bidi_hello_managed_start_with_options(fixture.client, &options, &stream) == 0);
-    stream_result = finish_managed_bidi_stream(stream);
+    CHECK_GOTO(hello_v1_greeter_lots_of_greetings_start_with_options(fixture.channel, &options, &stream) == 0);
+    stream_result = finish_channel_client_stream(stream, &request);
     stream = NULL;
     CHECK_GOTO(stream_result == 0);
 
-    CHECK_GOTO(stop_managed_serve_fixture(&fixture) == 0);
+    CHECK_GOTO(hello_v1_greeter_bidi_hello_start(fixture.channel, &stream) == 0);
+    stream_result = finish_channel_bidi_stream(stream);
+    stream = NULL;
+    CHECK_GOTO(stream_result == 0);
+    CHECK_GOTO(hello_v1_greeter_bidi_hello_start_with_options(fixture.channel, &options, &stream) == 0);
+    stream_result = finish_channel_bidi_stream(stream);
+    stream = NULL;
+    CHECK_GOTO(stream_result == 0);
+
+    CHECK_GOTO(stop_channel_serve_fixture(&fixture) == 0);
     result = 0;
 
 cleanup:
@@ -649,8 +632,57 @@ cleanup:
         hello__v1__hello_reply__free_unpacked(response, NULL);
     }
     trevrpc_stream_close(stream);
-    close_managed_serve_fixture(&fixture);
+    close_channel_serve_fixture(&fixture);
     return result;
+}
+
+static int raw_say_hello(
+    trevrpc_raw_client* client, const Hello__V1__HelloRequest* request, Hello__V1__HelloReply** response) {
+    *response = NULL;
+    size_t body_len = hello__v1__hello_request__get_packed_size(request);
+    uint8_t* body = body_len == 0 ? NULL : malloc(body_len);
+    if (body_len > 0 && body == NULL) {
+        return -ENOMEM;
+    }
+    hello__v1__hello_request__pack(request, body);
+    trevrpc_response* raw_response = NULL;
+    int err = trevrpc_raw_client_call_unary(client, "hello.v1.Greeter", "SayHello", body, body_len, &raw_response);
+    free(body);
+    if (err == 0 && raw_response->status != TREVRPC_STATUS_OK) {
+        err = (int)raw_response->status;
+    }
+    if (err == 0) {
+        *response = hello__v1__hello_reply__unpack(NULL, raw_response->body_len, raw_response->body);
+        if (*response == NULL) {
+            err = TREVRPC_ERR_INVALID_FRAME;
+        }
+    }
+    trevrpc_response_free(raw_response);
+    return err;
+}
+
+static int raw_lots_of_replies(
+    trevrpc_raw_client* client, const Hello__V1__HelloRequest* request, trevrpc_stream** stream) {
+    size_t body_len = hello__v1__hello_request__get_packed_size(request);
+    uint8_t* body = body_len == 0 ? NULL : malloc(body_len);
+    if (body_len > 0 && body == NULL) {
+        return -ENOMEM;
+    }
+    hello__v1__hello_request__pack(request, body);
+    int err = trevrpc_raw_client_start_stream(
+        client, "hello.v1.Greeter", "LotsOfReplies", TREVRPC_RPC_KIND_SERVER_STREAMING, body, body_len, stream);
+    free(body);
+    return err;
+}
+
+static int raw_lots_of_greetings_start(trevrpc_raw_client* client, trevrpc_stream** stream) {
+    return trevrpc_raw_client_start_stream(
+        client, "hello.v1.Greeter", "LotsOfGreetings", TREVRPC_RPC_KIND_CLIENT_STREAMING, NULL, 0, stream);
+}
+
+static int raw_bidi_hello_start(trevrpc_raw_client* client, trevrpc_stream** stream) {
+    return trevrpc_raw_client_start_stream(
+        client, "hello.v1.Greeter", "BidiHello", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, stream);
 }
 
 static int run_generated_case(
@@ -693,7 +725,7 @@ cleanup:
 static int test_webtransport_unary_round_trip(void) {
     int result = 1;
     trevrpc_server* server = NULL;
-    trevrpc_client* client = NULL;
+    trevrpc_raw_client* client = NULL;
     trevrpc_wt_listener* listener = NULL;
     Hello__V1__HelloReply* response = NULL;
     pthread_t thread = {0};
@@ -729,12 +761,12 @@ static int test_webtransport_unary_round_trip(void) {
         .max_streams_per_session = 8,
         .idle_timeout_ms = 1000,
     };
-    CHECK_GOTO(trevrpc_client_connect_webtransport(&client_config, &config, &client) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(client, &request, &response) == 0);
+    CHECK_GOTO(trevrpc_raw_client_connect_webtransport(&client_config, &config, &client) == 0);
+    CHECK_GOTO(raw_say_hello(client, &request, &response) == 0);
     CHECK_GOTO(response != NULL);
     CHECK_GOTO(response->message != NULL);
     CHECK_GOTO(strcmp(response->message, "Trev") == 0);
-    trevrpc_client_close(client);
+    trevrpc_raw_client_close(client);
     client = NULL;
     CHECK_GOTO(pthread_join(thread, NULL) == 0);
     thread_started = false;
@@ -746,7 +778,7 @@ cleanup:
     if (response != NULL) {
         hello__v1__hello_reply__free_unpacked(response, NULL);
     }
-    trevrpc_client_close(client);
+    trevrpc_raw_client_close(client);
     if (thread_started) {
         trevrpc_wt_listener_shutdown(listener);
         (void)pthread_join(thread, NULL);
@@ -765,7 +797,7 @@ static int test_webtransport_serve_loop_unary_shutdown(void) {
     request.name = "Trev";
 
     CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(fixture.client, &request, &response) == 0);
+    CHECK_GOTO(raw_say_hello(fixture.client, &request, &response) == 0);
     CHECK_GOTO(response != NULL && response->message != NULL && strcmp(response->message, "Trev") == 0);
     CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
 
@@ -790,7 +822,7 @@ static int test_webtransport_serve_loop_server_streaming(void) {
     request.name = "Trev";
 
     CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(hello_v1_greeter_lots_of_replies(fixture.client, &request, &stream) == 0);
+    CHECK_GOTO(raw_lots_of_replies(fixture.client, &request, &stream) == 0);
     CHECK_GOTO(hello_v1_greeter_recv_hello_v1_hello_reply(stream, &reply, &status) == 0);
     CHECK_GOTO(status == TREVRPC_STATUS_OK);
     CHECK_GOTO(reply != NULL && reply->message != NULL && strcmp(reply->message, "reply") == 0);
@@ -825,7 +857,7 @@ static int test_webtransport_serve_loop_client_streaming(void) {
     request.name = "Trev";
 
     CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(hello_v1_greeter_lots_of_greetings_start(fixture.client, &stream) == 0);
+    CHECK_GOTO(raw_lots_of_greetings_start(fixture.client, &stream) == 0);
     CHECK_GOTO(hello_v1_greeter_send_hello_v1_hello_request(stream, &request) == 0);
     CHECK_GOTO(trevrpc_stream_finish_send(stream) == 0);
     CHECK_GOTO(hello_v1_greeter_recv_hello_v1_hello_reply(stream, &reply, &status) == 0);
@@ -860,7 +892,7 @@ static int test_webtransport_serve_loop_bidi_streaming(void) {
     uint32_t status = TREVRPC_STATUS_OK;
 
     CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(hello_v1_greeter_bidi_hello_start(fixture.client, &stream) == 0);
+    CHECK_GOTO(raw_bidi_hello_start(fixture.client, &stream) == 0);
     CHECK_GOTO(trevrpc_stream_finish_send(stream) == 0);
     CHECK_GOTO(hello_v1_greeter_recv_hello_v1_hello_reply(stream, &reply, &status) == 0);
     CHECK_GOTO(status == TREVRPC_STATUS_OK);
@@ -914,8 +946,8 @@ cleanup:
 static int test_shared_listener_native_and_webtransport_unary(void) {
     int result = 1;
     trevrpc_server* server = NULL;
-    trevrpc_client* native_client = NULL;
-    trevrpc_client* wt_client = NULL;
+    trevrpc_raw_client* native_client = NULL;
+    trevrpc_raw_client* wt_client = NULL;
     Hello__V1__HelloReply* native_response = NULL;
     Hello__V1__HelloReply* wt_response = NULL;
     serve_args args = {0};
@@ -944,8 +976,8 @@ static int test_shared_listener_native_and_webtransport_unary(void) {
     trevrpc_config client_config = {
         .skip_certificate_validation = 1,
     };
-    CHECK_GOTO(trevrpc_client_connect("127.0.0.1", port, &client_config, &native_client) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(native_client, &request, &native_response) == 0);
+    CHECK_GOTO(trevrpc_raw_client_connect("127.0.0.1", port, &client_config, &native_client) == 0);
+    CHECK_GOTO(raw_say_hello(native_client, &request, &native_response) == 0);
     CHECK_GOTO(
         native_response != NULL && native_response->message != NULL && strcmp(native_response->message, "shared") == 0);
 
@@ -957,13 +989,13 @@ static int test_shared_listener_native_and_webtransport_unary(void) {
         .max_streams_per_session = 8,
         .idle_timeout_ms = 1000,
     };
-    CHECK_GOTO(trevrpc_client_connect_webtransport(&wt_client_config, &client_config, &wt_client) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(wt_client, &request, &wt_response) == 0);
+    CHECK_GOTO(trevrpc_raw_client_connect_webtransport(&wt_client_config, &client_config, &wt_client) == 0);
+    CHECK_GOTO(raw_say_hello(wt_client, &request, &wt_response) == 0);
     CHECK_GOTO(wt_response != NULL && wt_response->message != NULL && strcmp(wt_response->message, "shared") == 0);
 
-    trevrpc_client_close(native_client);
+    trevrpc_raw_client_close(native_client);
     native_client = NULL;
-    trevrpc_client_close(wt_client);
+    trevrpc_raw_client_close(wt_client);
     wt_client = NULL;
     trevrpc_server_shutdown(server);
     CHECK_GOTO(pthread_join(thread, NULL) == 0);
@@ -979,8 +1011,8 @@ cleanup:
     if (wt_response != NULL) {
         hello__v1__hello_reply__free_unpacked(wt_response, NULL);
     }
-    trevrpc_client_close(native_client);
-    trevrpc_client_close(wt_client);
+    trevrpc_raw_client_close(native_client);
+    trevrpc_raw_client_close(wt_client);
     if (thread_started) {
         trevrpc_server_shutdown(server);
         (void)pthread_join(thread, NULL);
@@ -992,7 +1024,7 @@ cleanup:
 static int test_generated_native_unary_stack_and_heap_protobuf_buffers(void) {
     int result = 1;
     trevrpc_server* server = NULL;
-    trevrpc_client* client = NULL;
+    trevrpc_channel* channel = NULL;
     Hello__V1__HelloReply* stack_response = NULL;
     Hello__V1__HelloReply* heap_response = NULL;
     serve_args args = {0};
@@ -1025,16 +1057,17 @@ static int test_generated_native_unary_stack_and_heap_protobuf_buffers(void) {
 
     uint16_t port = 0;
     CHECK_GOTO(trevrpc_server_port(server, &port) == 0);
-    CHECK_GOTO(trevrpc_client_connect("127.0.0.1", port, &client_config, &client) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(client, &stack_request, &stack_response) == 0);
+    CHECK_GOTO(trevrpc_channel_connect("127.0.0.1", port, &client_config, NULL, 5000000000ull, NULL, &channel) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(channel, &stack_request, &stack_response) == 0);
     CHECK_GOTO(stack_response != NULL && stack_response->message != NULL);
     CHECK_GOTO(strcmp(stack_response->message, stack_request.name) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(client, &heap_request, &heap_response) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(channel, &heap_request, &heap_response) == 0);
     CHECK_GOTO(heap_response != NULL && heap_response->message != NULL);
     CHECK_GOTO(strcmp(heap_response->message, heap_request.name) == 0);
 
-    trevrpc_client_close(client);
-    client = NULL;
+    trevrpc_channel_close(channel);
+    trevrpc_channel_release(channel);
+    channel = NULL;
     trevrpc_server_shutdown(server);
     CHECK_GOTO(pthread_join(thread, NULL) == 0);
     thread_started = false;
@@ -1049,7 +1082,8 @@ cleanup:
     if (heap_response != NULL) {
         hello__v1__hello_reply__free_unpacked(heap_response, NULL);
     }
-    trevrpc_client_close(client);
+    trevrpc_channel_close(channel);
+    trevrpc_channel_release(channel);
     if (thread_started) {
         trevrpc_server_shutdown(server);
         (void)pthread_join(thread, NULL);
@@ -1061,7 +1095,7 @@ cleanup:
 static int test_generated_native_helper_pending_send_resource_exhausted(void) {
     int result = 1;
     trevrpc_server* server = NULL;
-    trevrpc_client* client = NULL;
+    trevrpc_channel* channel = NULL;
     serve_args args = {0};
     pthread_t thread = {0};
     bool thread_started = false;
@@ -1088,12 +1122,13 @@ static int test_generated_native_helper_pending_send_resource_exhausted(void) {
 
     uint16_t port = 0;
     CHECK_GOTO(trevrpc_server_port(server, &port) == 0);
-    CHECK_GOTO(trevrpc_client_connect("127.0.0.1", port, &client_config, &client) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(client, &request, &response) == TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED);
+    CHECK_GOTO(trevrpc_channel_connect("127.0.0.1", port, &client_config, NULL, 5000000000ull, NULL, &channel) == 0);
+    CHECK_GOTO(hello_v1_greeter_say_hello(channel, &request, &response) == TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED);
     CHECK_GOTO(response == NULL);
 
-    trevrpc_client_close(client);
-    client = NULL;
+    trevrpc_channel_close(channel);
+    trevrpc_channel_release(channel);
+    channel = NULL;
     trevrpc_server_shutdown(server);
     CHECK_GOTO(pthread_join(thread, NULL) == 0);
     thread_started = false;
@@ -1104,7 +1139,8 @@ cleanup:
     if (response != NULL) {
         hello__v1__hello_reply__free_unpacked(response, NULL);
     }
-    trevrpc_client_close(client);
+    trevrpc_channel_close(channel);
+    trevrpc_channel_release(channel);
     if (thread_started) {
         trevrpc_server_shutdown(server);
         (void)pthread_join(thread, NULL);
@@ -1153,13 +1189,13 @@ cleanup:
 int main(void) {
     int result = 1;
 
-    if (test_generator_managed_output() != 0) {
+    if (test_generator_channel_output() != 0) {
         goto cleanup;
     }
     if (test_generated_helper_signatures() != 0) {
         goto cleanup;
     }
-    if (test_generated_managed_helpers_all_rpc_shapes() != 0) {
+    if (test_generated_channel_helpers_all_rpc_shapes() != 0) {
         goto cleanup;
     }
     if (test_generated_services_all_rpc_shapes() != 0) {

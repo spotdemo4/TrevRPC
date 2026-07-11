@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc.h"
+#include "trevrpc_raw.h"
 
 #include <errno.h>
 #if defined(__GLIBC__)
@@ -73,7 +74,7 @@ typedef struct serve_args {
 
 typedef struct rpc_fixture {
     trevrpc_server* server;
-    trevrpc_client* client;
+    trevrpc_raw_client* client;
     pthread_t serve_thread;
     bool serve_thread_started;
     serve_args serve;
@@ -409,7 +410,7 @@ static int fixture_start(
     client_config.keep_alive_ms = 15000;
     client_config.peer_bidi_stream_count = (uint16_t)concurrency;
     client_config.max_frame_size = PROFILE_MAX_FRAME_SIZE;
-    return trevrpc_client_connect("127.0.0.1", port, &client_config, &fixture->client);
+    return trevrpc_raw_client_connect("127.0.0.1", port, &client_config, &fixture->client);
 }
 
 static int fixture_stop(rpc_fixture* fixture) {
@@ -417,7 +418,7 @@ static int fixture_stop(rpc_fixture* fixture) {
         registry_destroy(&fixture->registry);
         fixture->registry_initialized = false;
     }
-    trevrpc_client_close(fixture->client);
+    trevrpc_raw_client_close(fixture->client);
     fixture->client = NULL;
     trevrpc_server_shutdown(fixture->server);
     int err = 0;
@@ -456,7 +457,7 @@ static int open_client_stream(rpc_fixture* fixture,
     options.max_response_messages = (int64_t)(cumulative_body / min_message_size + 4);
     options.max_response_stream_body_size = (int64_t)cumulative_body;
     options.response_idle_timeout_nanos = PROFILE_RPC_IDLE_TIMEOUT_NANOS;
-    return trevrpc_client_start_stream_with_options(fixture->client,
+    return trevrpc_raw_client_start_stream_with_options(fixture->client,
         SERVICE_NAME,
         METHOD_NAME,
         scenario_rpc_kind(scenario),

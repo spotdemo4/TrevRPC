@@ -132,7 +132,7 @@ if(TREVRPC_BUILD_RUNTIME)
 
     add_library(trevrpc STATIC
         src/trevrpc.c
-        src/trevrpc_managed.c
+        src/trevrpc_channel.c
     )
     trevrpc_c_configure_runtime(trevrpc)
     list(APPEND trevrpc_install_targets trevrpc)
@@ -142,7 +142,7 @@ if(TREVRPC_BUILD_RUNTIME)
     if(TREVRPC_BUILD_TESTS)
         add_library(trevrpc_testing STATIC
             src/trevrpc.c
-            src/trevrpc_managed.c
+            src/trevrpc_channel.c
         )
         target_compile_definitions(trevrpc_testing PRIVATE TREVRPC_TESTING)
         trevrpc_c_configure_runtime(trevrpc_testing)
@@ -366,6 +366,7 @@ install(FILES ${trevrpc_pkg_config_files}
 install(FILES
     include/trevrpc.h
     include/trevrpc_msquic.h
+    include/trevrpc_raw.h
     include/trevrpc_webtransport.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
@@ -389,6 +390,13 @@ if(TREVRPC_BUILD_TESTS)
     add_test(NAME trevrpc_wire COMMAND trevrpc_wire_test)
 
     if(TREVRPC_BUILD_RUNTIME)
+        add_executable(trevrpc_api_test tests/api_test.c)
+        target_link_libraries(trevrpc_api_test PRIVATE trevrpc)
+        trevrpc_c_warnings(trevrpc_api_test)
+        trevrpc_c_sanitizers(trevrpc_api_test)
+
+        add_test(NAME trevrpc_api COMMAND trevrpc_api_test)
+
         add_executable(trevrpc_runtime_test tests/runtime_test.c)
         target_include_directories(trevrpc_runtime_test PRIVATE src)
         target_link_libraries(trevrpc_runtime_test PRIVATE trevrpc_testing)
@@ -411,19 +419,19 @@ if(TREVRPC_BUILD_TESTS)
         add_test(NAME trevrpc_msquic_transport COMMAND trevrpc_msquic_transport_test)
         trevrpc_c_lsan_suppressions(trevrpc_msquic_transport)
 
-        add_executable(trevrpc_managed_client_test tests/managed_client_test.c)
-        add_dependencies(trevrpc_managed_client_test trevrpc_msquic_test_certificates)
-        target_compile_definitions(trevrpc_managed_client_test PRIVATE
+        add_executable(trevrpc_channel_test tests/channel_test.c)
+        add_dependencies(trevrpc_channel_test trevrpc_msquic_test_certificates)
+        target_compile_definitions(trevrpc_channel_test PRIVATE
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
-        target_link_libraries(trevrpc_managed_client_test PRIVATE trevrpc)
-        trevrpc_c_warnings(trevrpc_managed_client_test)
-        trevrpc_c_sanitizers(trevrpc_managed_client_test)
+        target_link_libraries(trevrpc_channel_test PRIVATE trevrpc)
+        trevrpc_c_warnings(trevrpc_channel_test)
+        trevrpc_c_sanitizers(trevrpc_channel_test)
 
-        add_test(NAME trevrpc_managed_client COMMAND trevrpc_managed_client_test)
-        set_tests_properties(trevrpc_managed_client PROPERTIES TIMEOUT 30)
-        trevrpc_c_lsan_suppressions(trevrpc_managed_client)
+        add_test(NAME trevrpc_channel COMMAND trevrpc_channel_test)
+        set_tests_properties(trevrpc_channel PROPERTIES TIMEOUT 30)
+        trevrpc_c_lsan_suppressions(trevrpc_channel)
 
         add_executable(trevrpc_buffering_config_test tests/buffering_config_test.c)
         target_link_libraries(trevrpc_buffering_config_test PRIVATE trevrpc_testing)

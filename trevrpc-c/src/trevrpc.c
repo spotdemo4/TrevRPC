@@ -3,6 +3,7 @@
 #include "trevrpc.h"
 
 #include "trevrpc_msquic.h"
+#include "trevrpc_raw.h"
 #include "trevrpc_runtime_internal.h"
 #include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
@@ -31,7 +32,7 @@ typedef struct trevrpc_server_conn_ref trevrpc_server_conn_ref;
 typedef struct trevrpc_conn_stream_limiter trevrpc_conn_stream_limiter;
 typedef struct trevrpc_stream_task trevrpc_stream_task;
 
-struct trevrpc_client {
+struct trevrpc_raw_client {
     uint32_t transport;
     trevrpc_msquic_conn* msquic_conn;
     trevrpc_wt_session* wt_session;
@@ -1623,20 +1624,21 @@ void trevrpc_stream_set_release(trevrpc_stream* stream, void (*release)(void* co
     stream->release_context = context;
 }
 
-int trevrpc_client_connect(const char* host, uint16_t port, const trevrpc_config* config, trevrpc_client** out_client) {
-    return trevrpc_client_connect_cancellable(host, port, config, NULL, out_client);
+int trevrpc_raw_client_connect(
+    const char* host, uint16_t port, const trevrpc_config* config, trevrpc_raw_client** out_client) {
+    return trevrpc_raw_client_connect_cancellable(host, port, config, NULL, out_client);
 }
 
 static int trevrpc_connect_cancelled(void* context) {
     return trevrpc_cancellation_cancelled(context);
 }
 
-int trevrpc_client_connect_cancellable(const char* host,
+int trevrpc_raw_client_connect_cancellable(const char* host,
     uint16_t port,
     const trevrpc_config* config,
     trevrpc_cancellation* cancellation,
-    trevrpc_client** out_client) {
-    return trevrpc_client_connect_observed(host,
+    trevrpc_raw_client** out_client) {
+    return trevrpc_raw_client_connect_observed(host,
         port,
         config,
         cancellation == NULL ? NULL : trevrpc_connect_cancelled,
@@ -1648,7 +1650,7 @@ int trevrpc_client_connect_cancellable(const char* host,
         out_client);
 }
 
-int trevrpc_client_connect_observed(const char* host,
+int trevrpc_raw_client_connect_observed(const char* host,
     uint16_t port,
     const trevrpc_config* config,
     trevrpc_msquic_cancelled_fn cancelled,
@@ -1657,13 +1659,13 @@ int trevrpc_client_connect_observed(const char* host,
     size_t resumption_ticket_len,
     trevrpc_msquic_conn_observer observer,
     void* observer_context,
-    trevrpc_client** out_client) {
+    trevrpc_raw_client** out_client) {
     if (host == NULL || out_client == NULL) {
         return -EINVAL;
     }
     *out_client = NULL;
 
-    trevrpc_client* client = calloc(1, sizeof(*client));
+    trevrpc_raw_client* client = calloc(1, sizeof(*client));
     if (client == NULL) {
         return -ENOMEM;
     }
@@ -1682,7 +1684,7 @@ int trevrpc_client_connect_observed(const char* host,
         observer_context,
         &client->msquic_conn);
     if (err != 0) {
-        trevrpc_client_close(client);
+        trevrpc_raw_client_close(client);
         return err;
     }
 
@@ -1690,20 +1692,20 @@ int trevrpc_client_connect_observed(const char* host,
     return 0;
 }
 
-void trevrpc_client_clear_observer(trevrpc_client* client) {
+void trevrpc_raw_client_clear_observer(trevrpc_raw_client* client) {
     if (client != NULL && client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
         trevrpc_msquic_conn_clear_observer(client->msquic_conn);
     }
 }
 
-int trevrpc_client_connect_webtransport(
-    const trevrpc_wt_config* wt_config, const trevrpc_config* config, trevrpc_client** out_client) {
+int trevrpc_raw_client_connect_webtransport(
+    const trevrpc_wt_config* wt_config, const trevrpc_config* config, trevrpc_raw_client** out_client) {
     if (wt_config == NULL || out_client == NULL) {
         return -EINVAL;
     }
     *out_client = NULL;
 
-    trevrpc_client* client = calloc(1, sizeof(*client));
+    trevrpc_raw_client* client = calloc(1, sizeof(*client));
     if (client == NULL) {
         return -ENOMEM;
     }
@@ -1712,7 +1714,7 @@ int trevrpc_client_connect_webtransport(
 
     int err = trevrpc_wt_dial(wt_config, &client->wt_session);
     if (err != 0) {
-        trevrpc_client_close(client);
+        trevrpc_raw_client_close(client);
         return err;
     }
 
@@ -1720,8 +1722,8 @@ int trevrpc_client_connect_webtransport(
     return 0;
 }
 
-static int trevrpc_client_open_stream(
-    trevrpc_client* client, trevrpc_msquic_stream** msquic_stream, trevrpc_wt_stream** wt_stream) {
+static int trevrpc_raw_client_open_stream(
+    trevrpc_raw_client* client, trevrpc_msquic_stream** msquic_stream, trevrpc_wt_stream** wt_stream) {
     *msquic_stream = NULL;
     *wt_stream = NULL;
     if (client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
@@ -1733,7 +1735,7 @@ static int trevrpc_client_open_stream(
     return -EINVAL;
 }
 
-static int trevrpc_client_write_frame(trevrpc_client* client,
+static int trevrpc_raw_client_write_frame(trevrpc_raw_client* client,
     trevrpc_msquic_stream* msquic_stream,
     trevrpc_wt_stream* wt_stream,
     const uint8_t* frame,
@@ -1756,10 +1758,10 @@ static int trevrpc_client_write_frame(trevrpc_client* client,
     return -EINVAL;
 }
 
-static int trevrpc_client_shutdown_send(
-    trevrpc_client* client, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream);
+static int trevrpc_raw_client_shutdown_send(
+    trevrpc_raw_client* client, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream);
 
-static int trevrpc_client_write_final_frame(trevrpc_client* client,
+static int trevrpc_raw_client_write_final_frame(trevrpc_raw_client* client,
     trevrpc_msquic_stream* msquic_stream,
     trevrpc_wt_stream* wt_stream,
     const uint8_t* frame,
@@ -1772,14 +1774,14 @@ static int trevrpc_client_write_final_frame(trevrpc_client* client,
         }
         return (size_t)written == frame_len ? 0 : TREV_MSQUIC_ERR_CLOSED;
     }
-    int err = trevrpc_client_write_frame(client, msquic_stream, wt_stream, frame, frame_len);
+    int err = trevrpc_raw_client_write_frame(client, msquic_stream, wt_stream, frame, frame_len);
     if (err != 0) {
         return err;
     }
-    return trevrpc_client_shutdown_send(client, msquic_stream, wt_stream);
+    return trevrpc_raw_client_shutdown_send(client, msquic_stream, wt_stream);
 }
 
-static int trevrpc_client_write_request(trevrpc_client* client,
+static int trevrpc_raw_client_write_request(trevrpc_raw_client* client,
     trevrpc_msquic_stream* msquic_stream,
     trevrpc_wt_stream* wt_stream,
     const trevrpc_request* request,
@@ -1811,15 +1813,15 @@ static int trevrpc_client_write_request(trevrpc_client* client,
         &frame,
         &frame_len);
     if (err == 0) {
-        err = finish_send ? trevrpc_client_write_final_frame(client, msquic_stream, wt_stream, frame, frame_len)
-                          : trevrpc_client_write_frame(client, msquic_stream, wt_stream, frame, frame_len);
+        err = finish_send ? trevrpc_raw_client_write_final_frame(client, msquic_stream, wt_stream, frame, frame_len)
+                          : trevrpc_raw_client_write_frame(client, msquic_stream, wt_stream, frame, frame_len);
     }
     free(frame);
     return err;
 }
 
-static int trevrpc_client_shutdown_send(
-    trevrpc_client* client, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream) {
+static int trevrpc_raw_client_shutdown_send(
+    trevrpc_raw_client* client, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream) {
     if (client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
         return trevrpc_msquic_stream_shutdown_send(msquic_stream);
     }
@@ -1829,7 +1831,7 @@ static int trevrpc_client_shutdown_send(
     return -EINVAL;
 }
 
-static intptr_t trevrpc_client_read_frame(trevrpc_client* client,
+static intptr_t trevrpc_raw_client_read_frame(trevrpc_raw_client* client,
     trevrpc_msquic_stream* msquic_stream,
     trevrpc_wt_stream* wt_stream,
     uint8_t** body,
@@ -1843,7 +1845,7 @@ static intptr_t trevrpc_client_read_frame(trevrpc_client* client,
     return -EINVAL;
 }
 
-static void trevrpc_client_free_body(trevrpc_client* client, uint8_t* body) {
+static void trevrpc_raw_client_free_body(trevrpc_raw_client* client, uint8_t* body) {
     if (client != NULL && client->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         trevrpc_wt_free(body);
         return;
@@ -1851,8 +1853,8 @@ static void trevrpc_client_free_body(trevrpc_client* client, uint8_t* body) {
     trevrpc_msquic_free(body);
 }
 
-static void trevrpc_client_close_raw_stream(
-    trevrpc_client* client, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream) {
+static void trevrpc_raw_client_close_raw_stream(
+    trevrpc_raw_client* client, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream) {
     if (client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
         trevrpc_msquic_stream_close(msquic_stream);
     } else if (client->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
@@ -1860,7 +1862,7 @@ static void trevrpc_client_close_raw_stream(
     }
 }
 
-static void trevrpc_client_abort_raw_stream(
+static void trevrpc_raw_client_abort_stream(
     uint32_t transport, trevrpc_msquic_stream* msquic_stream, trevrpc_wt_stream* wt_stream) {
     if (transport == TREVRPC_TRANSPORT_KIND_MSQUIC && msquic_stream != NULL) {
         (void)trevrpc_msquic_stream_abort(msquic_stream);
@@ -1893,7 +1895,7 @@ void trevrpc_cancellation_cancel(trevrpc_cancellation* cancellation) {
     wt_stream = cancellation->wt_stream;
     pthread_mutex_unlock(&cancellation->mutex);
 
-    trevrpc_client_abort_raw_stream(transport, msquic_stream, wt_stream);
+    trevrpc_raw_client_abort_stream(transport, msquic_stream, wt_stream);
 }
 
 int trevrpc_cancellation_cancelled(trevrpc_cancellation* cancellation) {
@@ -1934,7 +1936,7 @@ static int trevrpc_cancellation_bind_raw_stream(trevrpc_cancellation* cancellati
     pthread_mutex_unlock(&cancellation->mutex);
 
     if (cancelled) {
-        trevrpc_client_abort_raw_stream(transport, msquic_stream, wt_stream);
+        trevrpc_raw_client_abort_stream(transport, msquic_stream, wt_stream);
         return -ECANCELED;
     }
     return 0;
@@ -2009,7 +2011,7 @@ static void trevrpc_stream_apply_recv_call_options(trevrpc_stream* stream, const
     stream->stream_idle_timeout_nanos = options->response_idle_timeout_nanos;
 }
 
-int trevrpc_client_call_unary(trevrpc_client* client,
+int trevrpc_raw_client_call_unary(trevrpc_raw_client* client,
     const char* service,
     const char* method,
     const uint8_t* body,
@@ -2025,10 +2027,10 @@ int trevrpc_client_call_unary(trevrpc_client* client,
         .kind = TREVRPC_RPC_KIND_UNARY,
         .version = TREVRPC_WIRE_VERSION,
     };
-    return trevrpc_client_call_request(client, &request, out_response);
+    return trevrpc_raw_client_call_request(client, &request, out_response);
 }
 
-int trevrpc_client_call_unary_with_options(trevrpc_client* client,
+int trevrpc_raw_client_call_unary_with_options(trevrpc_raw_client* client,
     const char* service,
     const char* method,
     const uint8_t* body,
@@ -2045,15 +2047,15 @@ int trevrpc_client_call_unary_with_options(trevrpc_client* client,
         .kind = TREVRPC_RPC_KIND_UNARY,
         .version = TREVRPC_WIRE_VERSION,
     };
-    return trevrpc_client_call_request_with_options(client, &request, options, out_response);
+    return trevrpc_raw_client_call_request_with_options(client, &request, options, out_response);
 }
 
-int trevrpc_client_call_request(
-    trevrpc_client* client, const trevrpc_request* request, trevrpc_response** out_response) {
-    return trevrpc_client_call_request_cancellable(client, request, NULL, out_response);
+int trevrpc_raw_client_call_request(
+    trevrpc_raw_client* client, const trevrpc_request* request, trevrpc_response** out_response) {
+    return trevrpc_raw_client_call_request_cancellable(client, request, NULL, out_response);
 }
 
-static int trevrpc_client_call_request_internal(trevrpc_client* client,
+static int trevrpc_raw_client_call_request_internal(trevrpc_raw_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
     const trevrpc_call_options* options,
@@ -2087,23 +2089,24 @@ static int trevrpc_client_call_request_internal(trevrpc_client* client,
 
     trevrpc_msquic_stream* msquic_stream = NULL;
     trevrpc_wt_stream* wt_stream = NULL;
-    int err = trevrpc_client_open_stream(client, &msquic_stream, &wt_stream);
+    int err = trevrpc_raw_client_open_stream(client, &msquic_stream, &wt_stream);
     if (err != 0) {
         return err;
     }
     err = trevrpc_cancellation_bind_raw_stream(cancellation, client->transport, msquic_stream, wt_stream);
     if (err != 0) {
-        trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
+        trevrpc_raw_client_close_raw_stream(client, msquic_stream, wt_stream);
         return err;
     }
 
-    err = trevrpc_client_write_request(client, msquic_stream, wt_stream, request, true, borrow_request_body);
+    err = trevrpc_raw_client_write_request(client, msquic_stream, wt_stream, request, true, borrow_request_body);
 
     uint8_t* response_body = NULL;
     size_t response_body_len = 0;
     bool response_body_taken = false;
     if (err == 0) {
-        intptr_t read = trevrpc_client_read_frame(client, msquic_stream, wt_stream, &response_body, &response_body_len);
+        intptr_t read =
+            trevrpc_raw_client_read_frame(client, msquic_stream, wt_stream, &response_body, &response_body_len);
         if (read < 0) {
             err = (int)read;
         } else if (read == 0) {
@@ -2123,9 +2126,9 @@ static int trevrpc_client_call_request_internal(trevrpc_client* client,
 
     trevrpc_cancellation_unbind_raw_stream(cancellation, msquic_stream, wt_stream);
     if (!response_body_taken) {
-        trevrpc_client_free_body(client, response_body);
+        trevrpc_raw_client_free_body(client, response_body);
     }
-    trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
+    trevrpc_raw_client_close_raw_stream(client, msquic_stream, wt_stream);
     if (err == 0 && trevrpc_cancellation_cancelled(cancellation)) {
         trevrpc_response_free(*out_response);
         *out_response = NULL;
@@ -2134,28 +2137,28 @@ static int trevrpc_client_call_request_internal(trevrpc_client* client,
     return err;
 }
 
-int trevrpc_client_call_request_cancellable(trevrpc_client* client,
+int trevrpc_raw_client_call_request_cancellable(trevrpc_raw_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
     trevrpc_response** out_response) {
-    return trevrpc_client_call_request_internal(client, request, cancellation, NULL, false, false, out_response);
+    return trevrpc_raw_client_call_request_internal(client, request, cancellation, NULL, false, false, out_response);
 }
 
-int trevrpc_client_call_request_borrowed_cancellable(trevrpc_client* client,
+int trevrpc_raw_client_call_request_borrowed_cancellable(trevrpc_raw_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
     trevrpc_response** out_response) {
-    return trevrpc_client_call_request_internal(client, request, cancellation, NULL, false, true, out_response);
+    return trevrpc_raw_client_call_request_internal(client, request, cancellation, NULL, false, true, out_response);
 }
 
-int trevrpc_client_call_request_with_options(trevrpc_client* client,
+int trevrpc_raw_client_call_request_with_options(trevrpc_raw_client* client,
     const trevrpc_request* request,
     const trevrpc_call_options* options,
     trevrpc_response** out_response) {
-    return trevrpc_client_call_request_internal(client, request, NULL, options, true, false, out_response);
+    return trevrpc_raw_client_call_request_internal(client, request, NULL, options, true, false, out_response);
 }
 
-int trevrpc_client_start_stream(trevrpc_client* client,
+int trevrpc_raw_client_start_stream(trevrpc_raw_client* client,
     const char* service,
     const char* method,
     uint32_t kind,
@@ -2172,10 +2175,10 @@ int trevrpc_client_start_stream(trevrpc_client* client,
         .kind = kind,
         .version = TREVRPC_WIRE_VERSION,
     };
-    return trevrpc_client_start_stream_request(client, &request, out_stream);
+    return trevrpc_raw_client_start_stream_request(client, &request, out_stream);
 }
 
-int trevrpc_client_start_stream_with_options(trevrpc_client* client,
+int trevrpc_raw_client_start_stream_with_options(trevrpc_raw_client* client,
     const char* service,
     const char* method,
     uint32_t kind,
@@ -2193,15 +2196,15 @@ int trevrpc_client_start_stream_with_options(trevrpc_client* client,
         .kind = kind,
         .version = TREVRPC_WIRE_VERSION,
     };
-    return trevrpc_client_start_stream_request_with_options(client, &request, options, out_stream);
+    return trevrpc_raw_client_start_stream_request_with_options(client, &request, options, out_stream);
 }
 
-int trevrpc_client_start_stream_request(
-    trevrpc_client* client, const trevrpc_request* request, trevrpc_stream** out_stream) {
-    return trevrpc_client_start_stream_request_cancellable(client, request, NULL, out_stream);
+int trevrpc_raw_client_start_stream_request(
+    trevrpc_raw_client* client, const trevrpc_request* request, trevrpc_stream** out_stream) {
+    return trevrpc_raw_client_start_stream_request_cancellable(client, request, NULL, out_stream);
 }
 
-static int trevrpc_client_start_stream_request_internal(trevrpc_client* client,
+static int trevrpc_raw_client_start_stream_request_internal(trevrpc_raw_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
     const trevrpc_call_options* options,
@@ -2235,27 +2238,27 @@ static int trevrpc_client_start_stream_request_internal(trevrpc_client* client,
 
     trevrpc_msquic_stream* msquic_stream = NULL;
     trevrpc_wt_stream* wt_stream = NULL;
-    int err = trevrpc_client_open_stream(client, &msquic_stream, &wt_stream);
+    int err = trevrpc_raw_client_open_stream(client, &msquic_stream, &wt_stream);
     if (err != 0) {
         return err;
     }
     err = trevrpc_cancellation_bind_raw_stream(cancellation, client->transport, msquic_stream, wt_stream);
     if (err != 0) {
-        trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
+        trevrpc_raw_client_close_raw_stream(client, msquic_stream, wt_stream);
         return err;
     }
 
-    err = trevrpc_client_write_request(client, msquic_stream, wt_stream, request, false, borrow_request_body);
+    err = trevrpc_raw_client_write_request(client, msquic_stream, wt_stream, request, false, borrow_request_body);
     if (err != 0) {
         trevrpc_cancellation_unbind_raw_stream(cancellation, msquic_stream, wt_stream);
-        trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
+        trevrpc_raw_client_close_raw_stream(client, msquic_stream, wt_stream);
         return err;
     }
     if (request->kind == TREVRPC_RPC_KIND_SERVER_STREAMING) {
-        err = trevrpc_client_shutdown_send(client, msquic_stream, wt_stream);
+        err = trevrpc_raw_client_shutdown_send(client, msquic_stream, wt_stream);
         if (err != 0) {
             trevrpc_cancellation_unbind_raw_stream(cancellation, msquic_stream, wt_stream);
-            trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
+            trevrpc_raw_client_close_raw_stream(client, msquic_stream, wt_stream);
             return err;
         }
     }
@@ -2265,7 +2268,7 @@ static int trevrpc_client_start_stream_request_internal(trevrpc_client* client,
                                  : trevrpc_stream_alloc_webtransport(wt_stream, client->max_frame_size, true);
     if (stream == NULL) {
         trevrpc_cancellation_unbind_raw_stream(cancellation, msquic_stream, wt_stream);
-        trevrpc_client_close_raw_stream(client, msquic_stream, wt_stream);
+        trevrpc_raw_client_close_raw_stream(client, msquic_stream, wt_stream);
         return -ENOMEM;
     }
     if (apply_options) {
@@ -2281,28 +2284,30 @@ static int trevrpc_client_start_stream_request_internal(trevrpc_client* client,
     return 0;
 }
 
-int trevrpc_client_start_stream_request_cancellable(trevrpc_client* client,
+int trevrpc_raw_client_start_stream_request_cancellable(trevrpc_raw_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
     trevrpc_stream** out_stream) {
-    return trevrpc_client_start_stream_request_internal(client, request, cancellation, NULL, false, false, out_stream);
+    return trevrpc_raw_client_start_stream_request_internal(
+        client, request, cancellation, NULL, false, false, out_stream);
 }
 
-int trevrpc_client_start_stream_request_borrowed_cancellable(trevrpc_client* client,
+int trevrpc_raw_client_start_stream_request_borrowed_cancellable(trevrpc_raw_client* client,
     const trevrpc_request* request,
     trevrpc_cancellation* cancellation,
     trevrpc_stream** out_stream) {
-    return trevrpc_client_start_stream_request_internal(client, request, cancellation, NULL, false, true, out_stream);
+    return trevrpc_raw_client_start_stream_request_internal(
+        client, request, cancellation, NULL, false, true, out_stream);
 }
 
-int trevrpc_client_start_stream_request_with_options(trevrpc_client* client,
+int trevrpc_raw_client_start_stream_request_with_options(trevrpc_raw_client* client,
     const trevrpc_request* request,
     const trevrpc_call_options* options,
     trevrpc_stream** out_stream) {
-    return trevrpc_client_start_stream_request_internal(client, request, NULL, options, true, false, out_stream);
+    return trevrpc_raw_client_start_stream_request_internal(client, request, NULL, options, true, false, out_stream);
 }
 
-void trevrpc_client_shutdown(trevrpc_client* client) {
+void trevrpc_raw_client_shutdown(trevrpc_raw_client* client) {
     if (client == NULL) {
         return;
     }
@@ -2314,7 +2319,7 @@ void trevrpc_client_shutdown(trevrpc_client* client) {
     }
 }
 
-void trevrpc_client_close(trevrpc_client* client) {
+void trevrpc_raw_client_close(trevrpc_raw_client* client) {
     if (client == NULL) {
         return;
     }
@@ -2476,7 +2481,7 @@ void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_str
     trevrpc_test_current_server = NULL;
 }
 
-trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_client* client) {
+trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_raw_client* client) {
     if (client == NULL || client->transport != TREVRPC_TRANSPORT_KIND_WEBTRANSPORT) {
         return NULL;
     }

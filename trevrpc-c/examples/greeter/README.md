@@ -1,9 +1,9 @@
 # C Generated Greeter Example
 
 This example shows the shape of a C client and server built with generated protobuf-c TrevRPC bindings.
-The client uses `trevrpc_managed_client`, waits for readiness, and calls the generated managed helper
-variants. Managed reconnection enables later calls but never retries or replays an RPC; shutdown calls
-`trevrpc_managed_client_close` before `trevrpc_managed_client_release`.
+The client connects a ready `trevrpc_channel` and calls the ordinary generated helpers. Channel
+reconnection enables later calls but never retries or replays an RPC; shutdown calls
+`trevrpc_channel_close` before `trevrpc_channel_release`.
 
 The repository CMake build generates the bindings and builds both example executables:
 

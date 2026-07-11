@@ -3,6 +3,7 @@
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
 #include "trevrpc_msquic.h"
+#include "trevrpc_raw.h"
 #include "trevrpc_webtransport.h"
 
 #include <errno.h> // IWYU pragma: keep
@@ -44,19 +45,22 @@ typedef struct serve_args {
 
 typedef struct benchmark_fixture {
     trevrpc_server* server;
-    trevrpc_client* native_client;
+    /* Keep transport measurements on one established connection; reconnect is out of scope. */
+    trevrpc_raw_client* native_client;
     pthread_t thread;
     bool thread_started;
     serve_args args;
 } benchmark_fixture;
 
-typedef int (*benchmark_case)(trevrpc_client* client);
-typedef int (*long_lived_benchmark_case)(trevrpc_client* client, size_t iterations);
+typedef int (*benchmark_case)(trevrpc_raw_client* client);
+typedef int (*long_lived_benchmark_case)(trevrpc_raw_client* client, size_t iterations);
+typedef int (*split_benchmark_fn)(trevrpc_raw_client* client);
+typedef int (*split_long_lived_benchmark_fn)(trevrpc_raw_client* client, size_t iterations);
 
 typedef struct split_benchmark_case {
     const char* name;
-    benchmark_case fn;
-    long_lived_benchmark_case throughput_fn;
+    split_benchmark_fn fn;
+    split_long_lived_benchmark_fn throughput_fn;
 } split_benchmark_case;
 
 typedef struct long_lived_sender_args {
@@ -704,10 +708,49 @@ static Hello__V1__HelloRequest benchmark_request(void) {
     return request;
 }
 
-static int benchmark_unary_round_trip(trevrpc_client* client) {
+static int raw_say_hello(
+    trevrpc_raw_client* client, const Hello__V1__HelloRequest* request, Hello__V1__HelloReply** out_response) {
+    *out_response = NULL;
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    int err = pack_message((const ProtobufCMessage*)request, &body, &body_len);
+    trevrpc_response* response = NULL;
+    if (err == 0) {
+        err = trevrpc_raw_client_call_unary(client, "hello.v1.Greeter", "SayHello", body, body_len, &response);
+    }
+    free(body);
+    if (err == 0 && (response == NULL || response->status != TREVRPC_STATUS_OK)) {
+        err = -EINVAL;
+    }
+    if (err == 0) {
+        *out_response = hello__v1__hello_reply__unpack(NULL, response->body_len, response->body);
+        if (*out_response == NULL) {
+            err = -EINVAL;
+        }
+    }
+    trevrpc_response_free(response);
+    return err;
+}
+
+static int raw_start_stream(trevrpc_raw_client* client,
+    const char* method,
+    uint32_t kind,
+    const ProtobufCMessage* request,
+    trevrpc_stream** stream) {
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    int err = request == NULL ? 0 : pack_message(request, &body, &body_len);
+    if (err == 0) {
+        err = trevrpc_raw_client_start_stream(client, "hello.v1.Greeter", method, kind, body, body_len, stream);
+    }
+    free(body);
+    return err;
+}
+
+static int benchmark_unary_round_trip(trevrpc_raw_client* client) {
     Hello__V1__HelloRequest request = benchmark_request();
     Hello__V1__HelloReply* response = NULL;
-    int err = hello_v1_greeter_say_hello(client, &request, &response);
+    int err = raw_say_hello(client, &request, &response);
     if (err == 0 && (response == NULL || response->message == NULL || strcmp(response->message, request.name) != 0)) {
         err = -EINVAL;
     }
@@ -718,11 +761,12 @@ static int benchmark_unary_round_trip(trevrpc_client* client) {
     return err;
 }
 
-static int benchmark_server_streaming(trevrpc_client* client, size_t expected_count) {
+static int benchmark_server_streaming(trevrpc_raw_client* client, size_t expected_count) {
     char name[32];
     Hello__V1__HelloRequest request = benchmark_count_request(expected_count, name, sizeof(name));
     trevrpc_stream* stream = NULL;
-    int err = hello_v1_greeter_lots_of_replies(client, &request, &stream);
+    int err = raw_start_stream(
+        client, "LotsOfReplies", TREVRPC_RPC_KIND_SERVER_STREAMING, (const ProtobufCMessage*)&request, &stream);
     if (err != 0) {
         return err;
     }
@@ -796,9 +840,9 @@ static int recv_terminal_status(trevrpc_stream* stream) {
     return status == TREVRPC_STATUS_OK ? 0 : -EINVAL;
 }
 
-static int benchmark_client_streaming(trevrpc_client* client, size_t message_count) {
+static int benchmark_client_streaming(trevrpc_raw_client* client, size_t message_count) {
     trevrpc_stream* stream = NULL;
-    int err = hello_v1_greeter_lots_of_greetings_start(client, &stream);
+    int err = raw_start_stream(client, "LotsOfGreetings", TREVRPC_RPC_KIND_CLIENT_STREAMING, NULL, &stream);
     if (err == 0) {
         err = send_benchmark_requests(stream, message_count);
     }
@@ -822,9 +866,9 @@ static int benchmark_client_streaming(trevrpc_client* client, size_t message_cou
     return err;
 }
 
-static int benchmark_bidi_stream_latency(trevrpc_client* client) {
+static int benchmark_bidi_stream_latency(trevrpc_raw_client* client) {
     trevrpc_stream* stream = NULL;
-    int err = hello_v1_greeter_bidi_hello_start(client, &stream);
+    int err = raw_start_stream(client, "BidiHello", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, &stream);
     if (err == 0) {
         err = send_benchmark_request(stream);
     }
@@ -907,9 +951,9 @@ static int benchmark_recv_bidi_replies(trevrpc_stream* stream, size_t expected_c
     return err;
 }
 
-static int benchmark_bidi_long_lived(trevrpc_client* client, size_t message_count) {
+static int benchmark_bidi_long_lived(trevrpc_raw_client* client, size_t message_count) {
     trevrpc_stream* stream = NULL;
-    int err = hello_v1_greeter_bidi_hello_start(client, &stream);
+    int err = raw_start_stream(client, "BidiHello", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, &stream);
     if (err != 0) {
         return err;
     }
@@ -931,23 +975,23 @@ static int benchmark_bidi_long_lived(trevrpc_client* client, size_t message_coun
     return err;
 }
 
-static int benchmark_server_stream_latency(trevrpc_client* client) {
+static int benchmark_server_stream_latency(trevrpc_raw_client* client) {
     return benchmark_server_streaming(client, BENCHMARK_LATENCY_MESSAGE_COUNT);
 }
 
-static int benchmark_server_stream_throughput(trevrpc_client* client, size_t message_count) {
+static int benchmark_server_stream_throughput(trevrpc_raw_client* client, size_t message_count) {
     return benchmark_server_streaming(client, message_count);
 }
 
-static int benchmark_client_stream_latency(trevrpc_client* client) {
+static int benchmark_client_stream_latency(trevrpc_raw_client* client) {
     return benchmark_client_streaming(client, BENCHMARK_LATENCY_MESSAGE_COUNT);
 }
 
-static int benchmark_client_stream_throughput(trevrpc_client* client, size_t message_count) {
+static int benchmark_client_stream_throughput(trevrpc_raw_client* client, size_t message_count) {
     return benchmark_client_streaming(client, message_count);
 }
 
-static int benchmark_bidi_stream_throughput(trevrpc_client* client, size_t message_count) {
+static int benchmark_bidi_stream_throughput(trevrpc_raw_client* client, size_t message_count) {
     return benchmark_bidi_long_lived(client, message_count);
 }
 
@@ -1030,14 +1074,14 @@ static int split_send_benchmark_requests(trevrpc_stream* stream, size_t count) {
     return trevrpc_stream_finish_send(stream);
 }
 
-static int split_benchmark_unary_round_trip(trevrpc_client* client) {
+static int split_benchmark_unary_round_trip(trevrpc_raw_client* client) {
     uint8_t* body = NULL;
     size_t body_len = 0;
     trevrpc_response* response = NULL;
     int err = benchmark_request_body(&body, &body_len);
     trevrpc_call_options options = benchmark_call_options();
     if (err == 0) {
-        err = trevrpc_client_call_unary_with_options(
+        err = trevrpc_raw_client_call_unary_with_options(
             client, BENCHMARK_SPLIT_SERVICE, BENCHMARK_METHOD_SAY_HELLO, body, body_len, &options, &response);
     }
     free(body);
@@ -1063,14 +1107,14 @@ static int split_benchmark_unary_round_trip(trevrpc_client* client) {
     return err;
 }
 
-static int split_benchmark_server_streaming(trevrpc_client* client, size_t expected_count) {
+static int split_benchmark_server_streaming(trevrpc_raw_client* client, size_t expected_count) {
     uint8_t* body = NULL;
     size_t body_len = 0;
     trevrpc_stream* stream = NULL;
     int err = benchmark_count_request_body(expected_count, &body, &body_len);
     trevrpc_call_options options = benchmark_call_options();
     if (err == 0) {
-        err = trevrpc_client_start_stream_with_options(client,
+        err = trevrpc_raw_client_start_stream_with_options(client,
             BENCHMARK_SPLIT_SERVICE,
             BENCHMARK_METHOD_LOTS_OF_REPLIES,
             TREVRPC_RPC_KIND_SERVER_STREAMING,
@@ -1101,10 +1145,10 @@ static int split_benchmark_server_streaming(trevrpc_client* client, size_t expec
     return err;
 }
 
-static int split_benchmark_client_streaming(trevrpc_client* client, size_t message_count) {
+static int split_benchmark_client_streaming(trevrpc_raw_client* client, size_t message_count) {
     trevrpc_stream* stream = NULL;
     trevrpc_call_options options = benchmark_call_options();
-    int err = trevrpc_client_start_stream_with_options(client,
+    int err = trevrpc_raw_client_start_stream_with_options(client,
         BENCHMARK_SPLIT_SERVICE,
         BENCHMARK_METHOD_LOTS_OF_GREETINGS,
         TREVRPC_RPC_KIND_CLIENT_STREAMING,
@@ -1132,10 +1176,10 @@ static int split_benchmark_client_streaming(trevrpc_client* client, size_t messa
     return err;
 }
 
-static int split_benchmark_bidi_stream_latency(trevrpc_client* client) {
+static int split_benchmark_bidi_stream_latency(trevrpc_raw_client* client) {
     trevrpc_stream* stream = NULL;
     trevrpc_call_options options = benchmark_call_options();
-    int err = trevrpc_client_start_stream_with_options(client,
+    int err = trevrpc_raw_client_start_stream_with_options(client,
         BENCHMARK_SPLIT_SERVICE,
         BENCHMARK_METHOD_BIDI_HELLO,
         TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
@@ -1184,10 +1228,10 @@ static int split_recv_bidi_replies(trevrpc_stream* stream, size_t expected_count
     return err;
 }
 
-static int split_benchmark_bidi_long_lived(trevrpc_client* client, size_t message_count) {
+static int split_benchmark_bidi_long_lived(trevrpc_raw_client* client, size_t message_count) {
     trevrpc_stream* stream = NULL;
     trevrpc_call_options options = benchmark_call_options();
-    int err = trevrpc_client_start_stream_with_options(client,
+    int err = trevrpc_raw_client_start_stream_with_options(client,
         BENCHMARK_SPLIT_SERVICE,
         BENCHMARK_METHOD_BIDI_HELLO,
         TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
@@ -1216,27 +1260,27 @@ static int split_benchmark_bidi_long_lived(trevrpc_client* client, size_t messag
     return err;
 }
 
-static int split_benchmark_server_stream_latency(trevrpc_client* client) {
+static int split_benchmark_server_stream_latency(trevrpc_raw_client* client) {
     return split_benchmark_server_streaming(client, BENCHMARK_LATENCY_MESSAGE_COUNT);
 }
 
-static int split_benchmark_server_stream_throughput(trevrpc_client* client, size_t message_count) {
+static int split_benchmark_server_stream_throughput(trevrpc_raw_client* client, size_t message_count) {
     return split_benchmark_server_streaming(client, message_count);
 }
 
-static int split_benchmark_client_stream_latency(trevrpc_client* client) {
+static int split_benchmark_client_stream_latency(trevrpc_raw_client* client) {
     return split_benchmark_client_streaming(client, BENCHMARK_LATENCY_MESSAGE_COUNT);
 }
 
-static int split_benchmark_client_stream_throughput(trevrpc_client* client, size_t message_count) {
+static int split_benchmark_client_stream_throughput(trevrpc_raw_client* client, size_t message_count) {
     return split_benchmark_client_streaming(client, message_count);
 }
 
-static int split_benchmark_bidi_stream_throughput(trevrpc_client* client, size_t message_count) {
+static int split_benchmark_bidi_stream_throughput(trevrpc_raw_client* client, size_t message_count) {
     return split_benchmark_bidi_long_lived(client, message_count);
 }
 
-static int run_benchmark_case(const char* name, trevrpc_client* client, benchmark_case fn, size_t iterations) {
+static int run_benchmark_case(const char* name, trevrpc_raw_client* client, benchmark_case fn, size_t iterations) {
     uint64_t start = monotonic_nanos();
     for (size_t i = 0; i < iterations; i++) {
         benchmark_operation_index = i;
@@ -1251,7 +1295,7 @@ static int run_benchmark_case(const char* name, trevrpc_client* client, benchmar
 }
 
 static int run_message_throughput_benchmark_case(
-    const char* name, trevrpc_client* client, long_lived_benchmark_case fn, size_t message_count) {
+    const char* name, trevrpc_raw_client* client, long_lived_benchmark_case fn, size_t message_count) {
     uint64_t start = monotonic_nanos();
     int err = fn(client, message_count);
     if (err != 0) {
@@ -1262,7 +1306,7 @@ static int run_message_throughput_benchmark_case(
     return 0;
 }
 
-static int warm_client(const char* name, trevrpc_client* client) {
+static int warm_client(const char* name, trevrpc_raw_client* client) {
     int err = benchmark_unary_round_trip(client);
     if (err == 0) {
         err = benchmark_server_stream_latency(client);
@@ -1289,14 +1333,31 @@ static const split_benchmark_case split_benchmark_cases[] = {
     {"bidi_stream_throughput", NULL, split_benchmark_bidi_stream_throughput},
 };
 
-static int run_split_benchmark_case(const split_benchmark_case* benchmark, trevrpc_client* client, size_t iterations) {
+static int run_split_benchmark_case(
+    const split_benchmark_case* benchmark, trevrpc_raw_client* client, size_t iterations) {
+    uint64_t start = monotonic_nanos();
     if (benchmark->throughput_fn != NULL) {
-        return run_message_throughput_benchmark_case(benchmark->name, client, benchmark->throughput_fn, iterations);
+        int err = benchmark->throughput_fn(client, iterations);
+        if (err != 0) {
+            fprintf(stderr, "%s failed: %s (%d)\n", benchmark->name, trevrpc_error(err), err);
+            return err;
+        }
+        print_message_rate(benchmark->name, iterations, monotonic_nanos() - start);
+        return 0;
     }
-    return run_benchmark_case(benchmark->name, client, benchmark->fn, iterations);
+    for (size_t i = 0; i < iterations; i++) {
+        benchmark_operation_index = i;
+        int err = benchmark->fn(client);
+        if (err != 0) {
+            fprintf(stderr, "%s failed: %s (%d)\n", benchmark->name, trevrpc_error(err), err);
+            return err;
+        }
+    }
+    print_latency(benchmark->name, iterations, monotonic_nanos() - start);
+    return 0;
 }
 
-static int warm_split_benchmark_case(const split_benchmark_case* benchmark, trevrpc_client* client) {
+static int warm_split_benchmark_case(const split_benchmark_case* benchmark, trevrpc_raw_client* client) {
     if (benchmark->throughput_fn != NULL) {
         return benchmark->throughput_fn(client, BENCHMARK_LATENCY_MESSAGE_COUNT);
     }
@@ -1317,7 +1378,7 @@ static const split_benchmark_case* find_split_benchmark_case(const char* shape) 
     return NULL;
 }
 
-static int warm_split_client(const char* name, trevrpc_client* client, const split_benchmark_case* only_case) {
+static int warm_split_client(const char* name, trevrpc_raw_client* client, const split_benchmark_case* only_case) {
     if (only_case != NULL) {
         int err = warm_split_benchmark_case(only_case, client);
         if (err != 0) {
@@ -1338,13 +1399,14 @@ static int warm_split_client(const char* name, trevrpc_client* client, const spl
     return 0;
 }
 
-static int connect_split_client(const char* transport, const char* host, uint16_t port, trevrpc_client** out_client) {
+static int connect_split_client(
+    const char* transport, const char* host, uint16_t port, trevrpc_raw_client** out_client) {
     trevrpc_config client_config = trevrpc_default_config();
     client_config.skip_certificate_validation = 1;
     client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
     apply_benchmark_client_config(&client_config);
     if (strcmp(transport, "msquic") == 0) {
-        return trevrpc_client_connect(host, port, &client_config, out_client);
+        return trevrpc_raw_client_connect(host, port, &client_config, out_client);
     }
     if (strcmp(transport, "webtransport") == 0) {
         trevrpc_wt_config wt_client_config = {
@@ -1355,7 +1417,7 @@ static int connect_split_client(const char* transport, const char* host, uint16_
             .max_streams_per_session = 128,
             .idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS,
         };
-        return trevrpc_client_connect_webtransport(&wt_client_config, &client_config, out_client);
+        return trevrpc_raw_client_connect_webtransport(&wt_client_config, &client_config, out_client);
     }
     return -EINVAL;
 }
@@ -1368,7 +1430,7 @@ static int run_split_client_mode(
         return 2;
     }
 
-    trevrpc_client* client = NULL;
+    trevrpc_raw_client* client = NULL;
     int err = connect_split_client(transport, host, port, &client);
     if (err != 0) {
         fprintf(stderr, "connect split %s client failed: %s (%d)\n", transport, trevrpc_error(err), err);
@@ -1385,7 +1447,7 @@ static int run_split_client_mode(
         err = run_split_benchmark_case(&split_benchmark_cases[i], client, iterations);
     }
 
-    trevrpc_client_close(client);
+    trevrpc_raw_client_close(client);
     return err == 0 ? 0 : 1;
 }
 
@@ -1407,7 +1469,7 @@ static int start_fixture(benchmark_fixture* fixture) {
     client_config.skip_certificate_validation = 1;
     client_config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
     apply_benchmark_client_config(&client_config);
-    err = trevrpc_client_connect("127.0.0.1", port, &client_config, &fixture->native_client);
+    err = trevrpc_raw_client_connect("127.0.0.1", port, &client_config, &fixture->native_client);
     if (err != 0) {
         return err;
     }
@@ -1464,7 +1526,7 @@ static int start_benchmark_server(benchmark_fixture* fixture) {
 }
 
 static int stop_fixture(benchmark_fixture* fixture) {
-    trevrpc_client_close(fixture->native_client);
+    trevrpc_raw_client_close(fixture->native_client);
     fixture->native_client = NULL;
     trevrpc_server_shutdown(fixture->server);
     if (fixture->thread_started) {
@@ -1478,7 +1540,7 @@ static int stop_fixture(benchmark_fixture* fixture) {
 }
 
 static void close_fixture(benchmark_fixture* fixture) {
-    trevrpc_client_close(fixture->native_client);
+    trevrpc_raw_client_close(fixture->native_client);
     fixture->native_client = NULL;
     trevrpc_server_shutdown(fixture->server);
     if (fixture->thread_started) {

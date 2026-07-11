@@ -27,8 +27,8 @@ int main(void) {
     trevrpc_msquic_config server_msquic = {0};
     trevrpc_wt_config server_wt = {0};
 
-    CHECK(TREVRPC_C_ABI_VERSION == 4u);
-    CHECK(trevrpc_c_abi_version() == 4u);
+    CHECK(TREVRPC_C_ABI_VERSION == 5u);
+    CHECK(trevrpc_c_abi_version() == 5u);
     CHECK(defaults.enable_http3 == 0);
     CHECK(defaults.http3_path != NULL);
     client.stream_recv_window = 1024u * 1024u;

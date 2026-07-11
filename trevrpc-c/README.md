@@ -6,8 +6,8 @@ unary, server-streaming, client-streaming, and bidirectional-streaming methods.
 
 ## Client
 
-For native QUIC, create a managed client, wait for its asynchronous connection to become ready, and
-reuse it across calls. Generated managed helpers are the default client path:
+For native QUIC, connect a channel and reuse it across calls. `trevrpc_channel_connect` blocks until
+the initial connection is ready; generated methods accept the channel directly:
 
 ```c
 #include "greeter.pb-c.h"
@@ -17,71 +17,67 @@ reuse it across calls. Generated managed helpers are the default client path:
 #include <stdio.h>
 
 trevrpc_config config = trevrpc_default_config();
-trevrpc_managed_client* client = NULL;
-int rc = trevrpc_managed_client_create("127.0.0.1", 50051, &config, NULL, &client);
+trevrpc_channel* channel = NULL;
+int rc = trevrpc_channel_connect(
+    "127.0.0.1", 50051, &config, NULL, 5000000000ull, NULL, &channel);
 if (rc != 0) {
     return 1;
 }
 
-rc = trevrpc_managed_client_wait_ready(client, 5000000000ull, NULL, NULL);
-
 Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
 request.name = "TrevRPC";
 Hello__V1__HelloReply* reply = NULL;
-if (rc == 0) {
-    rc = hello_v1_greeter_say_hello_managed(client, &request, &reply);
-}
+rc = hello_v1_greeter_say_hello(channel, &request, &reply);
 if (reply != NULL) {
     printf("%s\n", reply->message);
     hello__v1__hello_reply__free_unpacked(reply, NULL);
 }
 
-trevrpc_managed_client_close(client);
-trevrpc_managed_client_release(client);
+trevrpc_channel_close(channel);
+trevrpc_channel_release(channel);
 return rc == 0 ? 0 : 1;
 ```
 
-Creation is asynchronous. The managed client deep-copies the host and all pointer-backed fields in
-`trevrpc_config`; the caller may release or change them after creation. A zero readiness timeout
-waits indefinitely, and readiness waits may also receive a `trevrpc_cancellation`.
+The channel deep-copies the host and all pointer-backed fields in `trevrpc_config`; the caller may
+release or change them after connect returns. A zero connect timeout waits indefinitely. Connect and
+later readiness waits accept an optional `trevrpc_cancellation`.
 
-`trevrpc_managed_client_wait_ready` gates initial calls, but it does not add retry semantics. Each new
-operation selects one ready connection generation; the runtime never queues, retries, replays, or
-resumes an RPC. A stream stays attached to the generation on which it started and fails naturally if
-that connection is lost. Reconnection only makes a later operation possible. New operations return
-`TREV_MSQUIC_ERR_CLOSED` immediately while connecting, reconnecting, or closed.
+Each new operation selects one ready connection generation; the runtime never queues, retries,
+replays, or resumes an RPC. A stream stays attached to the generation on which it started and fails
+naturally if that connection is lost. Reconnection only makes a later operation possible. New
+operations return `TREV_MSQUIC_ERR_CLOSED` immediately while reconnecting or closed.
 
-Generated bindings expose managed helpers without changing the existing `trevrpc_client` helpers.
-Unary and server-streaming methods add `_managed` and `_managed_with_options` variants. Client- and
-bidirectional-streaming methods add `_managed_start` and `_managed_start_with_options` variants.
+Generated bindings expose one client surface. Unary and server-streaming methods use the ordinary
+method name and `_with_options`; client- and bidirectional-streaming methods use `_start` and
+`_start_with_options`. Every generated client method accepts `trevrpc_channel*`.
 
-`trevrpc_managed_client_get_state` reports `CONNECTING`, `READY`, `RECONNECTING`, or `CLOSED` and the
-latest successfully installed generation. `trevrpc_managed_client_options_set_lifecycle_callback`
+`trevrpc_channel_get_state` reports `CONNECTING`, `READY`, `RECONNECTING`, or `CLOSED` and the latest
+successfully installed generation. `trevrpc_channel_options_set_lifecycle_callback`
 observes state changes, connect failures, actual MsQuic connection shutdown, local and peer path
 address changes, resumption-ticket receipt or retention failure, and successful TLS session
 resumption. Lifecycle callbacks run serially on a dedicated dispatcher thread and may reenter the
-managed API, including `trevrpc_managed_client_close`. The dispatcher queue is bounded at 64 complete
+channel API, including `trevrpc_channel_close`. The dispatcher queue is bounded at 64 complete
 event records. If full, a new event replaces the newest queued event of the same kind; an unmatched
 event is dropped. Callbacks therefore receive source-time state and generation snapshots, but slow
 callbacks may observe coalescing or dropped event kinds under sustained event load.
 
-Resumption tickets are copied into managed-client memory and applied to the next MsQuic connection.
+Resumption tickets are copied into channel memory and applied to the next MsQuic connection.
 `RESUMPTION_TICKET_RECEIVED` is emitted only after a nonempty ticket is successfully retained;
 `RESUMPTION_TICKET_RETAIN_FAILED` reports `-ENOMEM` (or `-EINVAL` for an invalid transport record).
 Servers use resume-only tickets, and TrevRPC never passes `QUIC_SEND_FLAG_ALLOW_0_RTT`, so RPC data is
-not sent as 0-RTT. Tickets are not persisted to disk or shared between managed-client instances; if
+not sent as 0-RTT. Tickets are not persisted to disk or shared between channel instances; if
 a ticket is absent, expired, or rejected, MsQuic performs a full handshake. Address-change events are
 currently observational and do not expose the platform-specific `QUIC_ADDR` value.
 
-`trevrpc_managed_client_close` is idempotent and initiates shutdown without releasing the handle. It
-is safe against concurrently entered managed operations and from lifecycle callbacks. After all
-threads that can begin managed API calls have stopped, call `trevrpc_managed_client_release`; release
+`trevrpc_channel_close` is idempotent and initiates shutdown without releasing the handle. It is safe
+against concurrently entered channel operations and from lifecycle callbacks. After all threads that
+can begin channel API calls have stopped, call `trevrpc_channel_release`; release
 joins the reconnect worker and lifecycle dispatcher, drains entered operations, and frees the handle.
-Release must not run from a lifecycle callback and no new managed API call may begin concurrently
+Release must not run from a lifecycle callback and no new channel API call may begin concurrently
 with it. Already-started calls and streams safely retain their generation until they return or are
-closed. Every successful create must follow this close-then-release lifecycle, including error paths.
+closed. Every successful connect must follow this close-then-release lifecycle, including error paths.
 
-The managed API is additive and uses opaque types, so `TREVRPC_C_ABI_VERSION` remains 4.
+This consolidation is C ABI version 5.
 
 ### Unary
 
@@ -89,7 +85,7 @@ The generated unary helper returns one decoded response:
 
 ```c
 Hello__V1__HelloReply* reply = NULL;
-int rc = hello_v1_greeter_say_hello_managed(client, &request, &reply);
+int rc = hello_v1_greeter_say_hello(channel, &request, &reply);
 if (rc == 0) {
     printf("%s\n", reply->message);
     hello__v1__hello_reply__free_unpacked(reply, NULL);
@@ -105,7 +101,7 @@ the terminal RPC status:
 
 ```c
 trevrpc_stream* stream = NULL;
-int rc = hello_v1_greeter_lots_of_replies_managed(client, &request, &stream);
+int rc = hello_v1_greeter_lots_of_replies(channel, &request, &stream);
 while (rc == 0) {
     uint32_t status = TREVRPC_STATUS_OK;
     Hello__V1__HelloReply* reply = NULL;
@@ -131,7 +127,7 @@ the terminal status:
 
 ```c
 trevrpc_stream* stream = NULL;
-int rc = hello_v1_greeter_lots_of_greetings_managed_start(client, &stream);
+int rc = hello_v1_greeter_lots_of_greetings_start(channel, &stream);
 
 Hello__V1__HelloRequest first = HELLO__V1__HELLO_REQUEST__INIT;
 first.name = "Alice";
@@ -176,7 +172,7 @@ before sending the next request:
 
 ```c
 trevrpc_stream* stream = NULL;
-int rc = hello_v1_greeter_bidi_hello_managed_start(client, &stream);
+int rc = hello_v1_greeter_bidi_hello_start(channel, &stream);
 
 const char* names[] = {"Alice", "Bob"};
 for (size_t i = 0; rc == 0 && i < sizeof(names) / sizeof(names[0]); i++) {
@@ -218,30 +214,34 @@ trevrpc_stream_close(stream);
 Use independent send and receive threads when a protocol must continuously read and write large
 bidi streams.
 
-### Advanced: established-connection client
+### Advanced: raw single-connection API
 
-Use `trevrpc_client` when the application explicitly wants a low-level, already-established
-connection without managed reconnection. The original generated helpers remain available without
-the `_managed` or `_managed_start` suffixes:
+Include `trevrpc_raw.h` only when code explicitly needs one established connection without channel
+reconnection. Generated bindings do not expose a parallel raw surface; advanced consumers pack the
+request body and use the generic raw primitives directly:
 
 ```c
+#include <trevrpc_raw.h>
+
 trevrpc_config config = trevrpc_default_config();
-trevrpc_client* client = NULL;
-int rc = trevrpc_client_connect("127.0.0.1", 50051, &config, &client);
+trevrpc_raw_client* client = NULL;
+int rc = trevrpc_raw_client_connect("127.0.0.1", 50051, &config, &client);
 if (rc != 0) {
     return 1;
 }
 
 Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
 request.name = "TrevRPC";
-Hello__V1__HelloReply* reply = NULL;
-rc = hello_v1_greeter_say_hello(client, &request, &reply);
-if (reply != NULL) {
-    printf("%s\n", reply->message);
-    hello__v1__hello_reply__free_unpacked(reply, NULL);
-}
+size_t body_len = hello__v1__hello_request__get_packed_size(&request);
+uint8_t* body = malloc(body_len);
+hello__v1__hello_request__pack(&request, body);
+trevrpc_response* response = NULL;
+rc = trevrpc_raw_client_call_unary(
+    client, "hello.v1.Greeter", "SayHello", body, body_len, &response);
+free(body);
+trevrpc_response_free(response);
 
-trevrpc_client_close(client);
+trevrpc_raw_client_close(client);
 return rc == 0 ? 0 : 1;
 ```
 

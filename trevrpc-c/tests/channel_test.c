@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include "trevrpc.h"
+#include "trevrpc_raw.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -53,23 +53,23 @@ typedef struct lifecycle_counts {
 } lifecycle_counts;
 
 typedef struct call_args {
-    trevrpc_managed_client* client;
+    trevrpc_channel* channel;
     int result;
 } call_args;
 
-typedef struct managed_wait_args {
-    trevrpc_managed_client* client;
+typedef struct channel_wait_args {
+    trevrpc_channel* channel;
     int result;
-} managed_wait_args;
+} channel_wait_args;
 
-typedef struct managed_race_args {
-    trevrpc_managed_client* client;
+typedef struct channel_race_args {
+    trevrpc_channel* channel;
     atomic_bool* stop;
     atomic_int* failures;
-} managed_race_args;
+} channel_race_args;
 
 typedef struct reentrant_lifecycle {
-    _Atomic(trevrpc_managed_client*) client;
+    _Atomic(trevrpc_channel*) channel;
     atomic_int ready_callbacks;
     atomic_int close_callbacks;
     atomic_int failures;
@@ -197,23 +197,23 @@ static int test_server_stop(test_server* fixture) {
     return result;
 }
 
-static void test_lifecycle(void* user_data, const trevrpc_managed_client_event* event) {
+static void test_lifecycle(void* user_data, const trevrpc_channel_event* event) {
     lifecycle_counts* counts = user_data;
-    if (event->kind == TREVRPC_MANAGED_EVENT_CONNECTION_SHUTDOWN) {
+    if (event->kind == TREVRPC_CHANNEL_EVENT_CONNECTION_SHUTDOWN) {
         atomic_fetch_add(&counts->shutdowns, 1);
-    } else if (event->kind == TREVRPC_MANAGED_EVENT_RESUMPTION_TICKET_RECEIVED) {
+    } else if (event->kind == TREVRPC_CHANNEL_EVENT_RESUMPTION_TICKET_RECEIVED) {
         atomic_fetch_add(&counts->tickets, 1);
-    } else if (event->kind == TREVRPC_MANAGED_EVENT_STATE_CHANGED && event->state == TREVRPC_MANAGED_CLIENT_READY) {
+    } else if (event->kind == TREVRPC_CHANNEL_EVENT_STATE_CHANGED && event->state == TREVRPC_CHANNEL_READY) {
         atomic_fetch_add(&counts->ready_states, 1);
     }
 }
 
-static int test_wait_state(trevrpc_managed_client* client, uint32_t expected, uint64_t timeout_ms) {
+static int test_wait_state(trevrpc_channel* channel, uint32_t expected, uint64_t timeout_ms) {
     uint64_t deadline = test_monotonic_nanos() + timeout_ms * 1000000ull;
     while (test_monotonic_nanos() < deadline) {
         uint32_t state = 0;
         uint64_t generation = 0;
-        int err = trevrpc_managed_client_get_state(client, &state, &generation);
+        int err = trevrpc_channel_get_state(channel, &state, &generation);
         if (err != 0) {
             return err;
         }
@@ -225,9 +225,9 @@ static int test_wait_state(trevrpc_managed_client* client, uint32_t expected, ui
     return TREV_MSQUIC_ERR_TIMEOUT;
 }
 
-static int test_call(trevrpc_managed_client* client, const char* method) {
+static int test_call(trevrpc_channel* channel, const char* method) {
     trevrpc_response* response = NULL;
-    int err = trevrpc_managed_client_call_unary(client, "test.Service", method, NULL, 0, &response);
+    int err = trevrpc_channel_call_unary(channel, "test.Service", method, NULL, 0, &response);
     if (err == 0 && (response == NULL || response->status != TREVRPC_STATUS_OK)) {
         err = -EIO;
     }
@@ -237,36 +237,36 @@ static int test_call(trevrpc_managed_client* client, const char* method) {
 
 static void* test_call_thread(void* context) {
     call_args* args = context;
-    args->result = test_call(args->client, "Block");
+    args->result = test_call(args->channel, "Block");
     return NULL;
 }
 
 static void* test_wait_thread(void* context) {
-    managed_wait_args* args = context;
-    args->result = trevrpc_managed_client_wait_ready(args->client, 0, NULL, NULL);
+    channel_wait_args* args = context;
+    args->result = trevrpc_channel_wait_ready(args->channel, 0, NULL, NULL);
     return NULL;
 }
 
 static void* test_api_race_thread(void* context) {
-    managed_race_args* args = context;
+    channel_race_args* args = context;
     while (!atomic_load(args->stop)) {
         uint32_t state = 0;
         uint64_t generation = 0;
-        if (trevrpc_managed_client_get_state(args->client, &state, &generation) != 0) {
+        if (trevrpc_channel_get_state(args->channel, &state, &generation) != 0) {
             atomic_fetch_add(args->failures, 1);
             break;
         }
 
         trevrpc_response* response = NULL;
-        int err = trevrpc_managed_client_call_unary(args->client, "test.Service", "Unary", NULL, 0, &response);
+        int err = trevrpc_channel_call_unary(args->channel, "test.Service", "Unary", NULL, 0, &response);
         if (err != TREV_MSQUIC_ERR_CLOSED) {
             atomic_fetch_add(args->failures, 1);
         }
         trevrpc_response_free(response);
 
         trevrpc_stream* stream = NULL;
-        err = trevrpc_managed_client_start_stream(
-            args->client, "test.Service", "Stream", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, &stream);
+        err = trevrpc_channel_start_stream(
+            args->channel, "test.Service", "Stream", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, &stream);
         if (err != TREV_MSQUIC_ERR_CLOSED) {
             atomic_fetch_add(args->failures, 1);
         }
@@ -275,28 +275,28 @@ static void* test_api_race_thread(void* context) {
     return NULL;
 }
 
-static void test_reentrant_lifecycle(void* user_data, const trevrpc_managed_client_event* event) {
+static void test_reentrant_lifecycle(void* user_data, const trevrpc_channel_event* event) {
     reentrant_lifecycle* lifecycle = user_data;
-    if (event->kind != TREVRPC_MANAGED_EVENT_STATE_CHANGED || event->state != TREVRPC_MANAGED_CLIENT_READY) {
+    if (event->kind != TREVRPC_CHANNEL_EVENT_STATE_CHANGED || event->state != TREVRPC_CHANNEL_READY) {
         return;
     }
     if (atomic_fetch_add(&lifecycle->ready_callbacks, 1) != 0) {
         return;
     }
-    trevrpc_managed_client* client = NULL;
-    while ((client = atomic_load(&lifecycle->client)) == NULL) {
+    trevrpc_channel* channel = NULL;
+    while ((channel = atomic_load(&lifecycle->channel)) == NULL) {
         sched_yield();
     }
     uint32_t state = 0;
     uint64_t generation = 0;
-    if (trevrpc_managed_client_get_state(client, &state, &generation) != 0 || generation == 0) {
+    if (trevrpc_channel_get_state(channel, &state, &generation) != 0 || generation == 0) {
         atomic_fetch_add(&lifecycle->failures, 1);
     }
-    trevrpc_managed_client_close(client);
+    trevrpc_channel_close(channel);
     atomic_fetch_add(&lifecycle->close_callbacks, 1);
 }
 
-static int test_managed_reconnect_and_ownership(void) {
+static int test_channel_reconnect_and_ownership(void) {
     int result = 1;
     atomic_int calls;
     atomic_init(&calls, 0);
@@ -305,8 +305,8 @@ static int test_managed_reconnect_and_ownership(void) {
     pthread_cond_init(&blocker.cond, NULL);
     lifecycle_counts lifecycle = {0};
     test_server server = {0};
-    trevrpc_managed_client_options* options = NULL;
-    trevrpc_managed_client* client = NULL;
+    trevrpc_channel_options* options = NULL;
+    trevrpc_channel* channel = NULL;
     trevrpc_stream* stream = NULL;
     trevrpc_cancellation* cancellation = NULL;
     pthread_t call_thread = {0};
@@ -316,50 +316,52 @@ static int test_managed_reconnect_and_ownership(void) {
 
     CHECK_GOTO(test_server_start(&server, 0, &calls, &blocker) == 0);
     port = server.port;
-    options = trevrpc_managed_client_options_new();
+    options = trevrpc_channel_options_new();
     CHECK_GOTO(options != NULL);
-    CHECK_GOTO(trevrpc_managed_client_options_set_backoff(options, 20, 100, 0) == 0);
-    CHECK_GOTO(trevrpc_managed_client_options_set_lifecycle_callback(options, test_lifecycle, &lifecycle) == 0);
+    CHECK_GOTO(trevrpc_channel_options_set_backoff(options, 20, 100, 0) == 0);
+    CHECK_GOTO(trevrpc_channel_options_set_lifecycle_callback(options, test_lifecycle, &lifecycle) == 0);
     trevrpc_config config = trevrpc_default_config();
     config.skip_certificate_validation = 1;
     char host[] = "127.0.0.1";
-    CHECK_GOTO(trevrpc_managed_client_create(host, port, &config, options, &client) == 0);
+    CHECK_GOTO(trevrpc_channel_connect(host, port, &config, options, 5000000000ull, NULL, &channel) == 0);
     memset(host, 'x', sizeof(host) - 1);
-    CHECK_GOTO(trevrpc_managed_client_wait_ready(client, 5000000000ull, NULL, &first_generation) == 0);
+    uint32_t initial_state = 0;
+    CHECK_GOTO(trevrpc_channel_get_state(channel, &initial_state, &first_generation) == 0);
+    CHECK_GOTO(initial_state == TREVRPC_CHANNEL_READY);
     CHECK_GOTO(first_generation == 1);
-    CHECK_GOTO(test_call(client, "Unary") == 0);
+    CHECK_GOTO(test_call(channel, "Unary") == 0);
     CHECK_GOTO(atomic_load(&calls) == 1);
 
     CHECK_GOTO(test_server_stop(&server) == 0);
-    CHECK_GOTO(test_wait_state(client, TREVRPC_MANAGED_CLIENT_RECONNECTING, 2000) == 0);
+    CHECK_GOTO(test_wait_state(channel, TREVRPC_CHANNEL_RECONNECTING, 2000) == 0);
     uint64_t fail_started = test_monotonic_nanos();
-    CHECK_GOTO(test_call(client, "Unary") == TREV_MSQUIC_ERR_CLOSED);
+    CHECK_GOTO(test_call(channel, "Unary") == TREV_MSQUIC_ERR_CLOSED);
     CHECK_GOTO(test_monotonic_nanos() - fail_started < 100000000ull);
     CHECK_GOTO(atomic_load(&calls) == 1);
 
     cancellation = trevrpc_cancellation_new();
     CHECK_GOTO(cancellation != NULL);
     trevrpc_cancellation_cancel(cancellation);
-    CHECK_GOTO(trevrpc_managed_client_wait_ready(client, 5000000000ull, cancellation, NULL) == -ECANCELED);
+    CHECK_GOTO(trevrpc_channel_wait_ready(channel, 5000000000ull, cancellation, NULL) == -ECANCELED);
     trevrpc_cancellation_free(cancellation);
     cancellation = NULL;
 
     CHECK_GOTO(test_server_start(&server, port, &calls, &blocker) == 0);
     uint64_t recovered_generation = 0;
-    CHECK_GOTO(trevrpc_managed_client_wait_ready(client, 5000000000ull, NULL, &recovered_generation) == 0);
+    CHECK_GOTO(trevrpc_channel_wait_ready(channel, 5000000000ull, NULL, &recovered_generation) == 0);
     CHECK_GOTO(recovered_generation > first_generation);
     test_sleep_ms(200);
     CHECK_GOTO(atomic_load(&calls) == 1);
-    CHECK_GOTO(test_call(client, "Unary") == 0);
+    CHECK_GOTO(test_call(channel, "Unary") == 0);
     CHECK_GOTO(atomic_load(&calls) == 2);
     CHECK_GOTO(atomic_load(&lifecycle.shutdowns) >= 1);
     CHECK_GOTO(atomic_load(&lifecycle.ready_states) >= 2);
     CHECK_GOTO(atomic_load(&lifecycle.tickets) >= 1);
 
-    CHECK_GOTO(trevrpc_managed_client_start_stream(
-                   client, "test.Service", "Stream", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, &stream) == 0);
+    CHECK_GOTO(trevrpc_channel_start_stream(
+                   channel, "test.Service", "Stream", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, &stream) == 0);
 
-    call_args args = {.client = client};
+    call_args args = {.channel = channel};
     CHECK_GOTO(pthread_create(&call_thread, NULL, test_call_thread, &args) == 0);
     call_thread_started = true;
     pthread_mutex_lock(&blocker.mutex);
@@ -369,7 +371,7 @@ static int test_managed_reconnect_and_ownership(void) {
     pthread_mutex_unlock(&blocker.mutex);
 
     uint64_t close_started = test_monotonic_nanos();
-    trevrpc_managed_client_close(client);
+    trevrpc_channel_close(channel);
     CHECK_GOTO(test_monotonic_nanos() - close_started < 2000000000ull);
     trevrpc_stream_close(stream);
     stream = NULL;
@@ -381,8 +383,8 @@ static int test_managed_reconnect_and_ownership(void) {
     CHECK_GOTO(pthread_join(call_thread, NULL) == 0);
     call_thread_started = false;
     CHECK_GOTO(args.result != 0);
-    trevrpc_managed_client_release(client);
-    client = NULL;
+    trevrpc_channel_release(channel);
+    channel = NULL;
 
     result = 0;
 
@@ -395,16 +397,16 @@ cleanup:
         (void)pthread_join(call_thread, NULL);
     }
     trevrpc_stream_close(stream);
-    trevrpc_managed_client_release(client);
+    trevrpc_channel_release(channel);
     trevrpc_cancellation_free(cancellation);
-    trevrpc_managed_client_options_free(options);
+    trevrpc_channel_options_free(options);
     (void)test_server_stop(&server);
     pthread_cond_destroy(&blocker.cond);
     pthread_mutex_destroy(&blocker.mutex);
     return result;
 }
 
-static int test_close_interrupts_reconnect(void) {
+static int test_initial_connect_failure_releases_channel(void) {
     int result = 1;
     atomic_int calls;
     atomic_init(&calls, 0);
@@ -412,29 +414,51 @@ static int test_close_interrupts_reconnect(void) {
     pthread_mutex_init(&blocker.mutex, NULL);
     pthread_cond_init(&blocker.cond, NULL);
     test_server server = {0};
-    trevrpc_managed_client_options* options = NULL;
-    trevrpc_managed_client* client = NULL;
+    trevrpc_channel_options* options = NULL;
+    trevrpc_channel* channel = NULL;
+    trevrpc_cancellation* cancellation = NULL;
 
     CHECK_GOTO(test_server_start(&server, 0, &calls, &blocker) == 0);
     uint16_t port = server.port;
-    (void)test_server_stop(&server);
-    options = trevrpc_managed_client_options_new();
-    CHECK_GOTO(options != NULL);
-    CHECK_GOTO(trevrpc_managed_client_options_set_backoff(options, 5000, 5000, 0) == 0);
+    cancellation = trevrpc_cancellation_new();
+    CHECK_GOTO(cancellation != NULL);
+    trevrpc_cancellation_cancel(cancellation);
+    uint64_t cancelled_started = test_monotonic_nanos();
     trevrpc_config config = trevrpc_default_config();
     config.skip_certificate_validation = 1;
-    CHECK_GOTO(trevrpc_managed_client_create("127.0.0.1", port, &config, options, &client) == 0);
-    test_sleep_ms(50);
-    uint64_t close_started = test_monotonic_nanos();
-    trevrpc_managed_client_close(client);
-    trevrpc_managed_client_release(client);
-    client = NULL;
-    CHECK_GOTO(test_monotonic_nanos() - close_started < 1000000000ull);
+    CHECK_GOTO(
+        trevrpc_channel_connect("127.0.0.1", port, &config, NULL, 5000000000ull, cancellation, &channel) == -ECANCELED);
+    CHECK_GOTO(channel == NULL);
+    CHECK_GOTO(test_monotonic_nanos() - cancelled_started < 1000000000ull);
+    trevrpc_cancellation_free(cancellation);
+    cancellation = NULL;
+
+    (void)test_server_stop(&server);
+    options = trevrpc_channel_options_new();
+    CHECK_GOTO(options != NULL);
+    CHECK_GOTO(trevrpc_channel_options_set_backoff(options, 5000, 5000, 0) == 0);
+    cancellation = trevrpc_cancellation_new();
+    CHECK_GOTO(cancellation != NULL);
+    trevrpc_cancellation_cancel(cancellation);
+    cancelled_started = test_monotonic_nanos();
+    CHECK_GOTO(trevrpc_channel_connect("127.0.0.1", port, &config, options, 5000000000ull, cancellation, &channel) ==
+               -ECANCELED);
+    CHECK_GOTO(channel == NULL);
+    CHECK_GOTO(test_monotonic_nanos() - cancelled_started < 1000000000ull);
+    trevrpc_cancellation_free(cancellation);
+    cancellation = NULL;
+
+    uint64_t connect_started = test_monotonic_nanos();
+    CHECK_GOTO(trevrpc_channel_connect("127.0.0.1", port, &config, options, 50000000ull, NULL, &channel) ==
+               TREV_MSQUIC_ERR_TIMEOUT);
+    CHECK_GOTO(channel == NULL);
+    CHECK_GOTO(test_monotonic_nanos() - connect_started < 1000000000ull);
     result = 0;
 
 cleanup:
-    trevrpc_managed_client_release(client);
-    trevrpc_managed_client_options_free(options);
+    trevrpc_channel_release(channel);
+    trevrpc_cancellation_free(cancellation);
+    trevrpc_channel_options_free(options);
     (void)test_server_stop(&server);
     pthread_cond_destroy(&blocker.cond);
     pthread_mutex_destroy(&blocker.mutex);
@@ -449,33 +473,35 @@ static int test_reconnect_without_lifecycle_callback(void) {
     pthread_mutex_init(&blocker.mutex, NULL);
     pthread_cond_init(&blocker.cond, NULL);
     test_server server = {0};
-    trevrpc_managed_client_options* options = NULL;
-    trevrpc_managed_client* client = NULL;
+    trevrpc_channel_options* options = NULL;
+    trevrpc_channel* channel = NULL;
 
     CHECK_GOTO(test_server_start(&server, 0, &calls, &blocker) == 0);
     uint16_t port = server.port;
-    options = trevrpc_managed_client_options_new();
+    options = trevrpc_channel_options_new();
     CHECK_GOTO(options != NULL);
-    CHECK_GOTO(trevrpc_managed_client_options_set_backoff(options, 20, 100, 0) == 0);
+    CHECK_GOTO(trevrpc_channel_options_set_backoff(options, 20, 100, 0) == 0);
     trevrpc_config config = trevrpc_default_config();
     config.skip_certificate_validation = 1;
-    CHECK_GOTO(trevrpc_managed_client_create("127.0.0.1", port, &config, options, &client) == 0);
+    CHECK_GOTO(trevrpc_channel_connect("127.0.0.1", port, &config, options, 5000000000ull, NULL, &channel) == 0);
 
     uint64_t first_generation = 0;
-    CHECK_GOTO(trevrpc_managed_client_wait_ready(client, 5000000000ull, NULL, &first_generation) == 0);
+    uint32_t first_state = 0;
+    CHECK_GOTO(trevrpc_channel_get_state(channel, &first_state, &first_generation) == 0);
+    CHECK_GOTO(first_state == TREVRPC_CHANNEL_READY);
     CHECK_GOTO(test_server_stop(&server) == 0);
-    CHECK_GOTO(test_wait_state(client, TREVRPC_MANAGED_CLIENT_RECONNECTING, 2000) == 0);
+    CHECK_GOTO(test_wait_state(channel, TREVRPC_CHANNEL_RECONNECTING, 2000) == 0);
     CHECK_GOTO(test_server_start(&server, port, &calls, &blocker) == 0);
 
     uint64_t recovered_generation = 0;
-    CHECK_GOTO(trevrpc_managed_client_wait_ready(client, 5000000000ull, NULL, &recovered_generation) == 0);
+    CHECK_GOTO(trevrpc_channel_wait_ready(channel, 5000000000ull, NULL, &recovered_generation) == 0);
     CHECK_GOTO(recovered_generation > first_generation);
     result = 0;
 
 cleanup:
-    trevrpc_managed_client_close(client);
-    trevrpc_managed_client_release(client);
-    trevrpc_managed_client_options_free(options);
+    trevrpc_channel_close(channel);
+    trevrpc_channel_release(channel);
+    trevrpc_channel_options_free(options);
     (void)test_server_stop(&server);
     pthread_cond_destroy(&blocker.cond);
     pthread_mutex_destroy(&blocker.mutex);
@@ -490,7 +516,7 @@ static int test_close_races_public_entry(void) {
     pthread_mutex_init(&blocker.mutex, NULL);
     pthread_cond_init(&blocker.cond, NULL);
     test_server server = {0};
-    trevrpc_managed_client* client = NULL;
+    trevrpc_channel* channel = NULL;
     pthread_t waiter = {0};
     bool waiter_started = false;
     enum { RACE_THREAD_COUNT = 4 };
@@ -503,16 +529,17 @@ static int test_close_races_public_entry(void) {
 
     CHECK_GOTO(test_server_start(&server, 0, &calls, &blocker) == 0);
     uint16_t port = server.port;
-    (void)test_server_stop(&server);
     trevrpc_config config = trevrpc_default_config();
     config.skip_certificate_validation = 1;
-    CHECK_GOTO(trevrpc_managed_client_create("127.0.0.1", port, &config, NULL, &client) == 0);
+    CHECK_GOTO(trevrpc_channel_connect("127.0.0.1", port, &config, NULL, 5000000000ull, NULL, &channel) == 0);
+    CHECK_GOTO(test_server_stop(&server) == 0);
+    CHECK_GOTO(test_wait_state(channel, TREVRPC_CHANNEL_RECONNECTING, 2000) == 0);
 
-    managed_wait_args wait_args = {.client = client};
+    channel_wait_args wait_args = {.channel = channel};
     CHECK_GOTO(pthread_create(&waiter, NULL, test_wait_thread, &wait_args) == 0);
     waiter_started = true;
-    managed_race_args race_args = {
-        .client = client,
+    channel_race_args race_args = {
+        .channel = channel,
         .stop = &stop,
         .failures = &failures,
     };
@@ -520,7 +547,7 @@ static int test_close_races_public_entry(void) {
         CHECK_GOTO(pthread_create(&race_threads[race_threads_started], NULL, test_api_race_thread, &race_args) == 0);
     }
     test_sleep_ms(25);
-    trevrpc_managed_client_close(client);
+    trevrpc_channel_close(channel);
     CHECK_GOTO(pthread_join(waiter, NULL) == 0);
     waiter_started = false;
     CHECK_GOTO(wait_args.result == TREV_MSQUIC_ERR_CLOSED);
@@ -531,12 +558,12 @@ static int test_close_races_public_entry(void) {
     }
     race_threads_started = 0;
     CHECK_GOTO(atomic_load(&failures) == 0);
-    trevrpc_managed_client_release(client);
-    client = NULL;
+    trevrpc_channel_release(channel);
+    channel = NULL;
     result = 0;
 
 cleanup:
-    trevrpc_managed_client_close(client);
+    trevrpc_channel_close(channel);
     atomic_store(&stop, true);
     if (waiter_started) {
         (void)pthread_join(waiter, NULL);
@@ -544,7 +571,7 @@ cleanup:
     for (size_t i = 0; i < race_threads_started; i++) {
         (void)pthread_join(race_threads[i], NULL);
     }
-    trevrpc_managed_client_release(client);
+    trevrpc_channel_release(channel);
     (void)test_server_stop(&server);
     pthread_cond_destroy(&blocker.cond);
     pthread_mutex_destroy(&blocker.mutex);
@@ -559,34 +586,33 @@ static int test_callback_close_and_reentry(void) {
     pthread_mutex_init(&blocker.mutex, NULL);
     pthread_cond_init(&blocker.cond, NULL);
     test_server server = {0};
-    trevrpc_managed_client_options* options = NULL;
-    trevrpc_managed_client* client = NULL;
+    trevrpc_channel_options* options = NULL;
+    trevrpc_channel* channel = NULL;
     reentrant_lifecycle lifecycle = {0};
 
     CHECK_GOTO(test_server_start(&server, 0, &calls, &blocker) == 0);
-    options = trevrpc_managed_client_options_new();
+    options = trevrpc_channel_options_new();
     CHECK_GOTO(options != NULL);
-    CHECK_GOTO(
-        trevrpc_managed_client_options_set_lifecycle_callback(options, test_reentrant_lifecycle, &lifecycle) == 0);
+    CHECK_GOTO(trevrpc_channel_options_set_lifecycle_callback(options, test_reentrant_lifecycle, &lifecycle) == 0);
     trevrpc_config config = trevrpc_default_config();
     config.skip_certificate_validation = 1;
-    CHECK_GOTO(trevrpc_managed_client_create("127.0.0.1", server.port, &config, options, &client) == 0);
-    atomic_store(&lifecycle.client, client);
+    CHECK_GOTO(trevrpc_channel_connect("127.0.0.1", server.port, &config, options, 5000000000ull, NULL, &channel) == 0);
+    atomic_store(&lifecycle.channel, channel);
     uint64_t deadline = test_monotonic_nanos() + 5000000000ull;
     while (atomic_load(&lifecycle.close_callbacks) == 0 && test_monotonic_nanos() < deadline) {
         test_sleep_ms(5);
     }
     CHECK_GOTO(atomic_load(&lifecycle.close_callbacks) == 1);
     CHECK_GOTO(atomic_load(&lifecycle.failures) == 0);
-    CHECK_GOTO(test_wait_state(client, TREVRPC_MANAGED_CLIENT_CLOSED, 2000) == 0);
-    trevrpc_managed_client_release(client);
-    client = NULL;
+    CHECK_GOTO(test_wait_state(channel, TREVRPC_CHANNEL_CLOSED, 2000) == 0);
+    trevrpc_channel_release(channel);
+    channel = NULL;
     result = 0;
 
 cleanup:
-    trevrpc_managed_client_close(client);
-    trevrpc_managed_client_release(client);
-    trevrpc_managed_client_options_free(options);
+    trevrpc_channel_close(channel);
+    trevrpc_channel_release(channel);
+    trevrpc_channel_options_free(options);
     (void)test_server_stop(&server);
     pthread_cond_destroy(&blocker.cond);
     pthread_mutex_destroy(&blocker.mutex);
@@ -594,10 +620,10 @@ cleanup:
 }
 
 int main(void) {
-    if (test_managed_reconnect_and_ownership() != 0) {
+    if (test_channel_reconnect_and_ownership() != 0) {
         return 1;
     }
-    if (test_close_interrupts_reconnect() != 0) {
+    if (test_initial_connect_failure_releases_channel() != 0) {
         return 1;
     }
     if (test_reconnect_without_lifecycle_callback() != 0) {

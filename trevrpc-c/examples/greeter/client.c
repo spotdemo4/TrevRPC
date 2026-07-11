@@ -35,18 +35,12 @@ int main(int argc, char** argv) {
 
     int exit_code = 1;
     trevrpc_config config = trevrpc_default_config();
-    trevrpc_managed_client* client = NULL;
+    trevrpc_channel* channel = NULL;
     trevrpc_stream* stream = NULL;
     Hello__V1__HelloReply* response = NULL;
-    int rc = trevrpc_managed_client_create(host, port, &config, NULL, &client);
+    int rc = trevrpc_channel_connect(host, port, &config, NULL, 5000000000ull, NULL, &channel);
     if (rc != 0) {
-        fprintf(stderr, "client creation failed: %s\n", trevrpc_error(rc));
-        goto cleanup;
-    }
-
-    rc = trevrpc_managed_client_wait_ready(client, 5000000000ull, NULL, NULL);
-    if (rc != 0) {
-        fprintf(stderr, "client did not become ready: %s\n", trevrpc_error(rc));
+        fprintf(stderr, "channel connection failed: %s\n", trevrpc_error(rc));
         goto cleanup;
     }
     /* Reconnects serve later calls; in-flight RPCs are never retried or replayed. */
@@ -54,7 +48,7 @@ int main(int argc, char** argv) {
     Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
     request.name = (char*)name;
 
-    rc = hello_v1_greeter_say_hello_managed(client, &request, &response);
+    rc = hello_v1_greeter_say_hello(channel, &request, &response);
     if (rc != 0) {
         fprintf(stderr, "SayHello failed: %s\n", trevrpc_error(rc));
         goto cleanup;
@@ -64,7 +58,7 @@ int main(int argc, char** argv) {
     hello__v1__hello_reply__free_unpacked(response, NULL);
     response = NULL;
 
-    rc = hello_v1_greeter_lots_of_replies_managed(client, &request, &stream);
+    rc = hello_v1_greeter_lots_of_replies(channel, &request, &stream);
     if (rc == 0) {
         printf("server streaming:\n");
         rc = print_replies(stream);
@@ -77,7 +71,7 @@ int main(int argc, char** argv) {
     }
 
     stream = NULL;
-    rc = hello_v1_greeter_lots_of_greetings_managed_start(client, &stream);
+    rc = hello_v1_greeter_lots_of_greetings_start(channel, &stream);
     if (rc == 0) {
         rc = send_name(stream, "Alice");
     }
@@ -106,7 +100,7 @@ int main(int argc, char** argv) {
     }
 
     stream = NULL;
-    rc = hello_v1_greeter_bidi_hello_managed_start(client, &stream);
+    rc = hello_v1_greeter_bidi_hello_start(channel, &stream);
     if (rc == 0) {
         rc = send_name(stream, "Carol");
     }
@@ -138,9 +132,9 @@ cleanup:
     if (stream != NULL) {
         trevrpc_stream_close(stream);
     }
-    if (client != NULL) {
-        trevrpc_managed_client_close(client);
-        trevrpc_managed_client_release(client);
+    if (channel != NULL) {
+        trevrpc_channel_close(channel);
+        trevrpc_channel_release(channel);
     }
     return exit_code;
 }
