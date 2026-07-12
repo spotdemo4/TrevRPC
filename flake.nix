@@ -27,7 +27,16 @@
       ...
     }:
     trevpkgs.libs.mkFlake (
-      system: pkgs: {
+      system: pkgs:
+      let
+        sourceWithWireVectors =
+          sources:
+          pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions (sources ++ [ ./testdata/wire-golden-vectors.txt ]);
+          };
+      in
+      {
 
         # nix develop [#...]
         devShells = {
@@ -159,13 +168,15 @@
 
         # nix build [#...]
         packages = {
-          rust-matrix = pkgs.rustPlatform.buildRustPackage {
+          rust-matrix = pkgs.rustPlatform.buildRustPackage (final: {
             pname = "trevrpc-rust-matrix";
             version = "0.1.0";
 
-            src = ./.;
-            cargoRoot = "bench/rust-matrix";
-            buildAndTestSubdir = "bench/rust-matrix";
+            src = sourceWithWireVectors [
+              ./bench/rust-matrix
+              ./trevrpc-rust
+            ];
+            sourceRoot = "${final.src.name}/bench/rust-matrix";
             cargoLock.lockFile = ./bench/rust-matrix/Cargo.lock;
             nativeBuildInputs = with pkgs; [ protobuf ];
 
@@ -183,19 +194,18 @@
               license = pkgs.lib.licenses.mit;
               platforms = pkgs.lib.platforms.linux;
             };
-          };
+          });
 
           trevrpc-c = pkgs.stdenv.mkDerivation (
             final: with pkgs.lib; {
               pname = "trevrpc-c";
               version = "0.1.0";
 
-              src = ./trevrpc-c;
+              src = sourceWithWireVectors [ ./trevrpc-c ];
+              sourceRoot = "${final.src.name}/trevrpc-c";
 
               configurePhase = ''
                 runHook preConfigure
-                mkdir -p ../testdata
-                cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
                 cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON
                 runHook postConfigure
               '';
@@ -257,7 +267,8 @@
               pname = "trevrpc-rust";
               version = "0.1.0";
 
-              src = ./trevrpc-rust;
+              src = sourceWithWireVectors [ ./trevrpc-rust ];
+              sourceRoot = "${final.src.name}/trevrpc-rust";
               cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
               cargoBuildFlags = [ "--workspace" ];
 
@@ -266,8 +277,6 @@
                 clippy
               ];
               checkPhase = ''
-                mkdir -p ../testdata
-                cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
                 cargo fmt --check
                 cargo test --workspace --offline
                 cargo clippy --workspace --all-targets --offline -- -D warnings
@@ -290,7 +299,8 @@
               pname = "trevrpc-go";
               version = "0.1.0";
 
-              src = ./trevrpc-go;
+              src = sourceWithWireVectors [ ./trevrpc-go ];
+              sourceRoot = "${final.src.name}/trevrpc-go";
               vendorHash = "sha256-fRQKsZlO4lK4uJ1KKvNLqTO2F+RvckLz8gV8bNVfaHg=";
               subPackages = [
                 "cmd/protoc-gen-trevrpc-go"
@@ -302,8 +312,6 @@
               ];
               checkPhase = ''
                 export HOME=$(mktemp -d)
-                mkdir -p ../testdata
-                cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
                 go test ./...
                 go vet ./...
                 staticcheck ./...
@@ -327,17 +335,20 @@
               pname = "trevrpc-js";
               version = "0.1.0";
 
-              src = ./trevrpc-js;
+              src = sourceWithWireVectors [
+                ./trevrpc-js
+                ./trevrpc-c
+              ];
+              sourceRoot = "${final.src.name}/trevrpc-js";
               nodejs = pkgs.nodejs_24;
 
               npmConfigHook = pkgs.importNpmLock.npmConfigHook;
               npmDeps = pkgs.importNpmLock {
-                npmRoot = final.src;
+                npmRoot = ./trevrpc-js;
               };
 
               npmBuildScript = "build:native";
               dontUseCmakeConfigure = true;
-              TREVRPC_C_ROOT = ./trevrpc-c;
               NODE_INCLUDE_DIR = "${pkgs.nodejs_24}/include/node";
               PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
@@ -354,8 +365,6 @@
                 oxlint
               ];
               checkPhase = ''
-                mkdir -p ../testdata
-                cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
                 rm -rf build
                 oxfmt --check
                 oxlint --deny-warnings
@@ -386,10 +395,11 @@
               pname = "trevrpc-kotlin";
               version = "0.1.0";
 
-              src = ./.;
-              setSourceRoot = ''
-                sourceRoot=$(echo */trevrpc-kotlin)
-              '';
+              src = sourceWithWireVectors [
+                ./trevrpc-kotlin
+                ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto
+              ];
+              sourceRoot = "${final.src.name}/trevrpc-kotlin";
 
               nativeBuildInputs = with pkgs; [
                 gradle_9
@@ -499,8 +509,6 @@
           c-sanitizers = self.packages.${system}.trevrpc-c.overrideAttrs {
             configurePhase = ''
               runHook preConfigure
-              mkdir -p ../testdata
-              cp ${./testdata/wire-golden-vectors.txt} ../testdata/wire-golden-vectors.txt
               cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON -DTREVRPC_ENABLE_SANITIZERS=ON
               runHook postConfigure
             '';
@@ -584,11 +592,12 @@
 
                 meta.mainProgram = "trevrpc-browser-lifecycle-go";
               });
-              browserLifecycleRustServer = pkgs.rustPlatform.buildRustPackage {
+              browserLifecycleRustServer = pkgs.rustPlatform.buildRustPackage (final: {
                 pname = "trevrpc-browser-lifecycle-rust-server";
                 version = "0.1.0";
 
-                src = ./trevrpc-rust;
+                src = sourceWithWireVectors [ ./trevrpc-rust ];
+                sourceRoot = "${final.src.name}/trevrpc-rust";
                 cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
                 cargoBuildFlags = [
                   "--example"
@@ -604,12 +613,13 @@
                 '';
 
                 meta.mainProgram = "trevrpc-browser-lifecycle-rust";
-              };
-              browserRustServer = pkgs.rustPlatform.buildRustPackage {
+              });
+              browserRustServer = pkgs.rustPlatform.buildRustPackage (final: {
                 pname = "trevrpc-browser-rust-server";
                 version = "0.1.0";
 
-                src = ./trevrpc-rust;
+                src = sourceWithWireVectors [ ./trevrpc-rust ];
+                sourceRoot = "${final.src.name}/trevrpc-rust";
                 cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
                 cargoBuildFlags = [
                   "--example"
@@ -625,7 +635,7 @@
                 '';
 
                 meta.mainProgram = "greeter_server";
-              };
+              });
             in
             self.packages.${system}.trevrpc-js.overrideAttrs {
               dontBuild = true;
