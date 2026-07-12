@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package trevrpc.cpp.test.v1;
+
+import "common.proto";
+
+option optimize_for = LITE_RUNTIME;
+
+message Outer {
+  message Request {
+    optional string name = 1;
+  }
+}
+
+service Fixture {
+  rpc Unary(Outer.Request) returns (trevrpc.cpp.test.common.ImportedReply);
+  rpc ServerStreaming(Outer.Request) returns (stream trevrpc.cpp.test.common.ImportedReply);
+  rpc ClientStreaming(stream Outer.Request) returns (trevrpc.cpp.test.common.ImportedReply);
+  rpc BidirectionalStreaming(stream Outer.Request) returns (stream trevrpc.cpp.test.common.ImportedReply);
+}

@@ -1,0 +1,21 @@
+Checks: >
+  -*,
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  modernize-use-equals-default,
+  modernize-use-nullptr,
+  modernize-use-override,
+  misc-include-cleaner,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  -bugprone-unchecked-optional-access,
+  -performance-enum-size,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(.*/)?trevrpc-cpp/(include|src)/.*'
+FormatStyle: file
+CheckOptions:
+  misc-include-cleaner.MissingIncludes: false
