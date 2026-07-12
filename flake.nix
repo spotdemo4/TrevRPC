@@ -265,6 +265,85 @@
             }
           );
 
+          trevrpc-cpp = pkgs.stdenv.mkDerivation (
+            final: with pkgs.lib; {
+              pname = "trevrpc-cpp";
+              version = "0.1.0";
+
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./trevrpc-c
+                  ./trevrpc-cpp
+                ];
+              };
+              sourceRoot = "${final.src.name}/trevrpc-cpp";
+
+              nativeBuildInputs = with pkgs; [
+                clang-tools
+                cmake
+                openssl
+                protobuf
+              ];
+              buildInputs = with pkgs; [
+                libmsquic
+                protobuf
+              ];
+              doCheck = true;
+
+              configurePhase = ''
+                runHook preConfigure
+                cmake -S . -B build \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                  -DTREVRPC_CPP_BUILD_TESTS=ON \
+                  -DTREVRPC_CPP_BUILD_EXAMPLES=ON
+                runHook postConfigure
+              '';
+              buildPhase = ''
+                runHook preBuild
+                cmake --build build
+                runHook postBuild
+              '';
+              checkPhase = ''
+                runHook preCheck
+                clang-format --dry-run --Werror $(find . \
+                  -path './build' -prune -o \
+                  \( -name '*.cpp' -o -name '*.hpp' \) -print)
+                clang-tidy --quiet -p build \
+                  src/trevrpc.cpp \
+                  tools/protoc-gen-trevrpc-cpp/generator.cpp \
+                  tools/protoc-gen-trevrpc-cpp/main.cpp \
+                  tests/codec_test.cpp \
+                  tests/generated_service_test.cpp \
+                  tests/generator_options_test.cpp \
+                  examples/greeter/client.cpp \
+                  examples/greeter/server.cpp
+                ctest --test-dir build --output-on-failure
+                cmake --install build --prefix "$TMPDIR/trevrpc-cpp"
+                cmake -S tests/consumer -B build/consumer \
+                  -DCMAKE_PREFIX_PATH="$TMPDIR/trevrpc-cpp"
+                cmake --build build/consumer
+                runHook postCheck
+              '';
+              installPhase = ''
+                runHook preInstall
+                cmake --install build --prefix $out
+                runHook postInstall
+              '';
+
+              meta = {
+                mainProgram = "protoc-gen-trevrpc-cpp";
+                description = "C++20 runtime and protobuf code generator for TrevRPC";
+                license = licenses.mit;
+                platforms = platforms.linux;
+                homepage = "https://trev.zip/llc/TrevRPC";
+                changelog = "https://trev.zip/llc/TrevRPC/releases";
+                downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+              };
+            }
+          );
+
           trevrpc-rust = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
               pname = "trevrpc-rust";
@@ -535,6 +614,12 @@
               cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON -DTREVRPC_ENABLE_SANITIZERS=ON
               runHook postConfigure
             '';
+            installPhase = ''
+              touch $out
+            '';
+          };
+
+          cpp = self.packages.${system}.trevrpc-cpp.overrideAttrs {
             installPhase = ''
               touch $out
             '';

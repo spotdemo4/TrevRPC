@@ -17,7 +17,7 @@ includes = ["*.nix"]
 [formatter.clang-format]
 command = "clang-format"
 options = ["-i"]
-includes = ["*.c", "*.h"]
+includes = ["*.c", "*.cc", "*.cpp", "*.h", "*.hpp"]
 
 [formatter.ktlint]
 command = "ktlint"
