@@ -27,16 +27,7 @@
       ...
     }:
     trevpkgs.libs.mkFlake (
-      system: pkgs:
-      let
-        sourceWithWireVectors =
-          sources:
-          pkgs.lib.fileset.toSource {
-            root = ./.;
-            fileset = pkgs.lib.fileset.unions (sources ++ [ ./testdata/wire-golden-vectors.txt ]);
-          };
-      in
-      {
+      system: pkgs: {
 
         # nix develop [#...]
         devShells = {
@@ -168,40 +159,52 @@
 
         # nix build [#...]
         packages = {
-          rust-matrix = pkgs.rustPlatform.buildRustPackage (final: {
-            pname = "trevrpc-rust-matrix";
-            version = "0.1.0";
+          rust-matrix = pkgs.rustPlatform.buildRustPackage (
+            final: with pkgs.lib; {
+              pname = "trevrpc-rust-matrix";
+              version = "0.1.0";
 
-            src = sourceWithWireVectors [
-              ./bench/rust-matrix
-              ./trevrpc-rust
-            ];
-            sourceRoot = "${final.src.name}/bench/rust-matrix";
-            cargoLock.lockFile = ./bench/rust-matrix/Cargo.lock;
-            nativeBuildInputs = with pkgs; [ protobuf ];
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./bench/rust-matrix
+                  ./testdata/wire-golden-vectors.txt
+                  ./trevrpc-rust
+                ];
+              };
+              sourceRoot = "${final.src.name}/bench/rust-matrix";
+              cargoLock.lockFile = ./bench/rust-matrix/Cargo.lock;
+              nativeBuildInputs = with pkgs; [ protobuf ];
 
-            installPhase = ''
-              runHook preInstall
-              peer=$(find target -path '*/release/trevrpc-rust-matrix-peer' -type f -perm -0100 | head -n1)
-              reporter=$(find target -path '*/release/trevrpc-rust-matrix-report' -type f -perm -0100 | head -n1)
-              install -Dm755 "$peer" $out/bin/trevrpc-rust-matrix-peer
-              install -Dm755 "$reporter" $out/bin/trevrpc-rust-matrix-report
-              runHook postInstall
-            '';
+              installPhase = ''
+                runHook preInstall
+                peer=$(find target -path '*/release/trevrpc-rust-matrix-peer' -type f -perm -0100 | head -n1)
+                reporter=$(find target -path '*/release/trevrpc-rust-matrix-report' -type f -perm -0100 | head -n1)
+                install -Dm755 "$peer" $out/bin/trevrpc-rust-matrix-peer
+                install -Dm755 "$reporter" $out/bin/trevrpc-rust-matrix-report
+                runHook postInstall
+              '';
 
-            meta = {
-              description = "Controlled Rust RPC benchmark matrix for TrevRPC";
-              license = pkgs.lib.licenses.mit;
-              platforms = pkgs.lib.platforms.linux;
-            };
-          });
+              meta = {
+                description = "Controlled Rust RPC benchmark matrix for TrevRPC";
+                license = licenses.mit;
+                platforms = platforms.linux;
+              };
+            }
+          );
 
           trevrpc-c = pkgs.stdenv.mkDerivation (
             final: with pkgs.lib; {
               pname = "trevrpc-c";
               version = "0.1.0";
 
-              src = sourceWithWireVectors [ ./trevrpc-c ];
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./testdata/wire-golden-vectors.txt
+                  ./trevrpc-c
+                ];
+              };
               sourceRoot = "${final.src.name}/trevrpc-c";
 
               configurePhase = ''
@@ -267,7 +270,13 @@
               pname = "trevrpc-rust";
               version = "0.1.0";
 
-              src = sourceWithWireVectors [ ./trevrpc-rust ];
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./testdata/wire-golden-vectors.txt
+                  ./trevrpc-rust
+                ];
+              };
               sourceRoot = "${final.src.name}/trevrpc-rust";
               cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
               cargoBuildFlags = [ "--workspace" ];
@@ -299,7 +308,13 @@
               pname = "trevrpc-go";
               version = "0.1.0";
 
-              src = sourceWithWireVectors [ ./trevrpc-go ];
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./testdata/wire-golden-vectors.txt
+                  ./trevrpc-go
+                ];
+              };
               sourceRoot = "${final.src.name}/trevrpc-go";
               vendorHash = "sha256-fRQKsZlO4lK4uJ1KKvNLqTO2F+RvckLz8gV8bNVfaHg=";
               subPackages = [
@@ -335,10 +350,14 @@
               pname = "trevrpc-js";
               version = "0.1.0";
 
-              src = sourceWithWireVectors [
-                ./trevrpc-js
-                ./trevrpc-c
-              ];
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./testdata/wire-golden-vectors.txt
+                  ./trevrpc-c
+                  ./trevrpc-js
+                ];
+              };
               sourceRoot = "${final.src.name}/trevrpc-js";
               nodejs = pkgs.nodejs_24;
 
@@ -395,10 +414,14 @@
               pname = "trevrpc-kotlin";
               version = "0.1.0";
 
-              src = sourceWithWireVectors [
-                ./trevrpc-kotlin
-                ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto
-              ];
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./testdata/wire-golden-vectors.txt
+                  ./trevrpc-kotlin
+                  ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto
+                ];
+              };
               sourceRoot = "${final.src.name}/trevrpc-kotlin";
 
               nativeBuildInputs = with pkgs; [
@@ -596,7 +619,13 @@
                 pname = "trevrpc-browser-lifecycle-rust-server";
                 version = "0.1.0";
 
-                src = sourceWithWireVectors [ ./trevrpc-rust ];
+                src = pkgs.lib.fileset.toSource {
+                  root = ./.;
+                  fileset = pkgs.lib.fileset.unions [
+                    ./testdata/wire-golden-vectors.txt
+                    ./trevrpc-rust
+                  ];
+                };
                 sourceRoot = "${final.src.name}/trevrpc-rust";
                 cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
                 cargoBuildFlags = [
@@ -618,7 +647,13 @@
                 pname = "trevrpc-browser-rust-server";
                 version = "0.1.0";
 
-                src = sourceWithWireVectors [ ./trevrpc-rust ];
+                src = pkgs.lib.fileset.toSource {
+                  root = ./.;
+                  fileset = pkgs.lib.fileset.unions [
+                    ./testdata/wire-golden-vectors.txt
+                    ./trevrpc-rust
+                  ];
+                };
                 sourceRoot = "${final.src.name}/trevrpc-rust";
                 cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
                 cargoBuildFlags = [
