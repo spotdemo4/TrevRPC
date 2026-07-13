@@ -28,7 +28,7 @@ abstract class VerifyGeneratedTrevrpc : DefaultTask() {
 plugins {
     application
     kotlin("jvm")
-    id("com.google.protobuf") version "0.10.0"
+    alias(libs.plugins.protobuf)
 }
 
 java {
@@ -57,15 +57,15 @@ application {
 dependencies {
     implementation(project(":core"))
     implementation(project(":transport-netty"))
-    implementation("com.google.protobuf:protobuf-java:4.35.1")
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.85")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    implementation(libs.protobuf.java)
+    implementation(libs.bouncycastle.bcpkix)
+    implementation(libs.coroutines.core)
 
-    runtimeOnly("io.netty:netty-codec-native-quic:4.2.16.Final:linux-x86_64")
+    runtimeOnly("io.netty:netty-codec-native-quic:${libs.versions.netty.get()}:linux-x86_64")
 
-    testImplementation(platform("org.junit:junit-bom:5.13.4"))
+    testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
+    testImplementation(libs.coroutines.test)
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
@@ -76,7 +76,10 @@ val trevrpcPlugin =
 
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:4.35.1"
+        artifact =
+            libs.protobuf.protoc
+                .get()
+                .toString()
     }
     plugins {
         id("trevrpc-kotlin") {

@@ -23,12 +23,12 @@ application {
 }
 
 dependencies {
-    implementation("com.google.protobuf:protobuf-java:4.35.1")
+    implementation(libs.protobuf.java)
 
     testImplementation(project(":core"))
-    testImplementation(platform("org.junit:junit-bom:5.13.4"))
+    testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")
-    testImplementation("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.4.0")
+    testImplementation(libs.kotlin.compiler.embeddable)
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 

@@ -1,5 +1,5 @@
 plugins {
-    kotlin("jvm") version "2.4.0" apply false
+    alias(libs.plugins.kotlin.jvm) apply false
 }
 
 allprojects {
@@ -13,7 +13,7 @@ allprojects {
                 requested.group == "org.jetbrains.kotlin" &&
                 listOf("alpha", "beta", "rc", "snapshot").any { requestedVersion.contains(it, ignoreCase = true) }
             ) {
-                useVersion("2.4.0")
+                useVersion(libs.versions.kotlin.get())
                 because("TrevRPC uses stable Kotlin releases only")
             }
         }

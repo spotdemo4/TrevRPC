@@ -81,12 +81,12 @@ val prepareCronetApi by
 
 dependencies {
     implementation(project(":core"))
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    implementation(libs.coroutines.core)
     compileOnly(files(cronetApiJar).builtBy(prepareCronetApi))
 
-    testImplementation(platform("org.junit:junit-bom:5.13.4"))
+    testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
+    testImplementation(libs.coroutines.test)
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 

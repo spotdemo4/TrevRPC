@@ -15,16 +15,16 @@ kotlin {
 
 dependencies {
     implementation(project(":core"))
-    implementation(platform("io.netty:netty-bom:4.2.16.Final"))
+    implementation(platform(libs.netty.bom))
     implementation("io.netty:netty-codec-classes-quic")
     implementation("io.netty:netty-codec-http3")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    implementation(libs.coroutines.core)
 
-    testImplementation(platform("org.junit:junit-bom:5.13.4"))
+    testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
-    testImplementation("org.bouncycastle:bcpkix-jdk18on:1.85")
-    testRuntimeOnly("io.netty:netty-codec-native-quic:4.2.16.Final:linux-x86_64")
+    testImplementation(libs.coroutines.test)
+    testImplementation(libs.bouncycastle.bcpkix)
+    testRuntimeOnly("io.netty:netty-codec-native-quic:${libs.versions.netty.get()}:linux-x86_64")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
