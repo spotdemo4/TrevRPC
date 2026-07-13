@@ -151,6 +151,7 @@
 
         # nix run [#...]
         apps = pkgs.mkApps {
+          benchmark = "${self.packages.${system}.trevrpc-bench}/bin/trevrpc-bench";
           browser-webtransport-soak = "nix develop -c bash -c 'npm --prefix trevrpc-js ci && npm --prefix trevrpc-js run test:browser:soak'";
           cross-runtime-lifecycle-stress = "nix develop -c bash -c 'mkdir -p target && go build -C trevrpc-go -o ../target/trevrpc-xruntime-go ./cmd/trevrpc-xruntime-go && TREVRPC_XRUNTIME_GO=$PWD/target/trevrpc-xruntime-go cargo test --manifest-path trevrpc-rust/Cargo.toml --test cross_runtime -- --ignored cross_runtime_lifecycle_stress --nocapture'";
           dev = "cargo run --manifest-path trevrpc-rust/Cargo.toml";
@@ -166,6 +167,41 @@
 
         # nix build [#...]
         packages = {
+          trevrpc-bench = pkgs.rustPlatform.buildRustPackage (
+            final: with pkgs.lib; {
+              pname = "trevrpc-bench";
+              version = "0.1.0";
+
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./bench/Cargo.lock
+                  ./bench/Cargo.toml
+                  ./bench/campaigns
+                  ./bench/peer-protocol-v1.md
+                  ./bench/proto
+                  ./bench/src
+                ];
+              };
+              sourceRoot = "${final.src.name}/bench";
+              cargoLock.lockFile = ./bench/Cargo.lock;
+              nativeBuildInputs = [ pkgs.makeWrapper ];
+              postInstall = ''
+                wrapProgram $out/bin/trevrpc-bench \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.openssl ]} \
+                  --set TREVRPC_BENCH_SOURCE_COMMIT ${self.rev or (self.dirtyRev or "unknown")} \
+                  --set TREVRPC_BENCH_SOURCE_DIRTY ${if self ? rev then "false" else "true"}
+              '';
+
+              meta = {
+                mainProgram = "trevrpc-bench";
+                description = "Cross-language TrevRPC benchmark controller and reporter";
+                license = licenses.mit;
+                platforms = platforms.linux;
+              };
+            }
+          );
+
           rust-matrix = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
               pname = "trevrpc-rust-matrix";
@@ -229,6 +265,7 @@
                   -DCMAKE_INSTALL_LIBEXECDIR="$lib/libexec" \
                   -DTREVRPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc" \
                   -DTREVRPC_INSTALL_PKGCONFIGDIR="$dev/lib/pkgconfig" \
+                  -DTREVRPC_BUILD_BENCHMARKS=ON \
                   -DTREVRPC_BUILD_TESTS=ON
                 runHook postConfigure
               '';
@@ -300,6 +337,7 @@
               src = fileset.toSource {
                 root = ./.;
                 fileset = fileset.unions [
+                  ./bench/proto
                   ./trevrpc-cpp
                 ];
               };
@@ -328,6 +366,7 @@
                   -DCMAKE_INSTALL_LIBEXECDIR="$lib/libexec" \
                   -DTREVRPC_CPP_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc-cpp" \
                   -DTREVRPC_CPP_TREVRPC_C_ROOT= \
+                  -DTREVRPC_CPP_BUILD_BENCHMARKS=ON \
                   -DTREVRPC_CPP_BUILD_TESTS=ON \
                   -DTREVRPC_CPP_BUILD_EXAMPLES=ON
                 runHook postConfigure
@@ -349,6 +388,7 @@
                   tests/codec_test.cpp \
                   tests/generated_service_test.cpp \
                   tests/generator_options_test.cpp \
+                  bench/trevrpc_bench_peer.cpp \
                   examples/greeter/client.cpp \
                   examples/greeter/server.cpp
                 ctest --test-dir build --output-on-failure
@@ -401,6 +441,14 @@
                 cargo test --workspace --offline
                 cargo clippy --workspace --all-targets --offline -- -D warnings
               '';
+              installPhase = ''
+                runHook preInstall
+                generator=$(find target -path '*/release/protoc-gen-trevrpc-rust' -type f -perm -0100 | head -n1)
+                peer=$(find target -path '*/release/trevrpc-bench-peer-rust' -type f -perm -0100 | head -n1)
+                install -Dm755 "$generator" $out/bin/protoc-gen-trevrpc-rust
+                install -Dm755 "$peer" $out/bin/trevrpc-bench-peer-rust
+                runHook postInstall
+              '';
 
               meta = {
                 mainProgram = "protoc-gen-trevrpc-rust";
@@ -430,7 +478,11 @@
               vendorHash = "sha256-fRQKsZlO4lK4uJ1KKvNLqTO2F+RvckLz8gV8bNVfaHg=";
               subPackages = [
                 "cmd/protoc-gen-trevrpc-go"
+                "cmd/trevrpc-bench-peer"
               ];
+              postInstall = ''
+                mv $out/bin/trevrpc-bench-peer $out/bin/trevrpc-bench-peer-go
+              '';
 
               nativeCheckInputs = with pkgs; [
                 go-tools
@@ -553,6 +605,7 @@
               ];
               gradleBuildTask = [
                 "assemble"
+                ":bench-peer:installDist"
                 ":examples:installDist"
                 ":protoc-gen-trevrpc-kotlin:installDist"
               ];
@@ -567,10 +620,17 @@
                 runHook preInstall
                 mkdir -p $out/bin $out/share/trevrpc-kotlin
                 cp -R examples/build/install/trevrpc-xruntime-kotlin/* $out/share/trevrpc-kotlin/
+                cp -R bench-peer/build/install/trevrpc-bench-peer-kotlin \
+                  $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin
                 cp -R protoc-gen-trevrpc-kotlin/build/install/protoc-gen-trevrpc-kotlin \
                   $out/share/trevrpc-kotlin/protoc-gen-trevrpc-kotlin
                 makeWrapper $out/share/trevrpc-kotlin/bin/trevrpc-xruntime-kotlin \
                   $out/bin/trevrpc-xruntime-kotlin \
+                  --set JAVA_HOME ${pkgs.jdk25.home} \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk25 ]}
+                makeWrapper \
+                  $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin/bin/trevrpc-bench-peer-kotlin \
+                  $out/bin/trevrpc-bench-peer-kotlin \
                   --set JAVA_HOME ${pkgs.jdk25.home} \
                   --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk25 ]}
                 makeWrapper \
@@ -594,6 +654,19 @@
               };
             }
           );
+
+          trevrpc-bench-suite = pkgs.symlinkJoin {
+            name = "trevrpc-bench-suite";
+            paths = [
+              self.packages.${system}.trevrpc-bench
+              self.packages.${system}.trevrpc-c
+              self.packages.${system}.trevrpc-cpp
+              self.packages.${system}.trevrpc-go
+              self.packages.${system}.trevrpc-js
+              self.packages.${system}.trevrpc-kotlin
+              self.packages.${system}.trevrpc-rust
+            ];
+          };
         };
 
         # nix fmt
@@ -611,6 +684,27 @@
 
         # nix flake check
         checks = pkgs.mkChecks {
+          benchmark-controller = self.packages.${system}.trevrpc-bench;
+
+          benchmark-peer-capabilities =
+            let
+              c = self.packages.${system}.trevrpc-c;
+              cpp = self.packages.${system}.trevrpc-cpp;
+              go = self.packages.${system}.trevrpc-go;
+              js = self.packages.${system}.trevrpc-js;
+              kotlin = self.packages.${system}.trevrpc-kotlin;
+              rust = self.packages.${system}.trevrpc-rust;
+            in
+            pkgs.runCommand "trevrpc-benchmark-peer-capabilities-check" { nativeBuildInputs = [ pkgs.jq ]; } ''
+              test "$(${c}/bin/trevrpc-bench-peer-c capabilities | jq -r .peer)" = c
+              test "$(${cpp}/bin/trevrpc-bench-peer-cpp capabilities | jq -r .peer)" = cpp
+              test "$(${go}/bin/trevrpc-bench-peer-go capabilities | jq -r .peer)" = go
+              test "$(${js}/bin/trevrpc-bench-peer-js capabilities | jq -r .peer)" = js
+              test "$(${kotlin}/bin/trevrpc-bench-peer-kotlin capabilities | jq -r .peer)" = kotlin
+              test "$(${rust}/bin/trevrpc-bench-peer-rust capabilities | jq -r .peer)" = rust
+              touch $out
+            '';
+
           rust-matrix = self.packages.${system}.rust-matrix.overrideAttrs {
             installPhase = ''
               touch $out
