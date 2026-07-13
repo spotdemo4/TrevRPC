@@ -675,6 +675,9 @@ type readDeadlineStream interface {
 }
 
 func readInitialRequestFrame(ctx context.Context, server *Server, stream rpcStream, request *RpcRequest) error {
+	stopCancelRead := cancelReadOnContext(ctx, stream)
+	defer stopCancelRead()
+
 	if deadline, ok := readDeadline(ctx, server.options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
@@ -682,7 +685,11 @@ func readInitialRequestFrame(ctx context.Context, server *Server, stream rpcStre
 		}
 	}
 
-	return ReadFrame(stream, request, server.options.MaxFrameSize)
+	err := ReadFrame(stream, request, server.options.MaxFrameSize)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 func readDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) {
@@ -699,6 +706,9 @@ func readDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) 
 }
 
 func drainUnaryRequestEnd(ctx context.Context, server *Server, stream rpcStream) error {
+	stopCancelRead := cancelReadOnContext(ctx, stream)
+	defer stopCancelRead()
+
 	if deadline, ok := readDeadline(ctx, server.options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
@@ -719,6 +729,13 @@ func drainUnaryRequestEnd(ctx context.Context, server *Server, stream rpcStream)
 			return transportOrContextStatus(ctx, err)
 		}
 	}
+}
+
+func cancelReadOnContext(ctx context.Context, stream rpcStream) func() {
+	if cancellable, ok := stream.(contextCancelReadStream); ok {
+		return cancellable.trevrpcCancelReadOnContext(ctx)
+	}
+	return func() {}
 }
 
 func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {
