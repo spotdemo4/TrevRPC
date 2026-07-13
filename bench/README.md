@@ -12,6 +12,9 @@ Build the controller and all six peers as one immutable suite:
 nix build .#trevrpc-bench-suite
 ```
 
+The complete suite currently targets `x86_64-linux` because the Kotlin peer
+packages Netty's Linux x86-64 native QUIC transport.
+
 The resulting `bin` directory contains `trevrpc-bench` and one
 `trevrpc-bench-peer-*` executable for C, C++, Go, JavaScript, Kotlin, and Rust.
 Peers live and build in their associated `trevrpc-*` directory. The canonical
@@ -65,8 +68,11 @@ trevrpc-bench report target/bench/native-quic
 Peers establish and validate their connection, run warmup, and arm all lanes
 before the controller starts process metrics and sends `START`. The client then
 runs closed-loop operations during a fixed admission window and drains work
-admitted before its deadline. Connection setup, warmup, histogram serialization,
-report generation, and shutdown are excluded.
+admitted before its deadline. Peak RSS is the highest 10 ms `VmRSS` sample in
+that interval rather than the process lifetime high-water mark. Connection
+setup, warmup, report generation, and shutdown are excluded; client process CPU
+includes encoding and writing the final histogram event before the controller
+can stop sampling.
 
 Latency is measured for a complete bounded RPC. A streaming RPC contains the
 configured `messages_per_stream`; message throughput is reported separately

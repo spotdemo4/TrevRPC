@@ -17,6 +17,8 @@ use crate::protocol::{
 };
 use crate::{BoxError, SCHEMA_VERSION, report};
 
+const MAX_CAPABILITY_OUTPUT_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SampleRecord {
     pub schema_version: u32,
@@ -72,7 +74,7 @@ struct Artifact {
 
 pub fn print_capabilities(campaign: &Campaign) -> Result<(), BoxError> {
     for peer in &campaign.peers {
-        let capabilities = capabilities(peer)?;
+        let capabilities = capabilities(peer, Duration::from_millis(campaign.startup_timeout_ms))?;
         capabilities.validate(&peer.id, &campaign.rpc_kinds)?;
         println!("{}", serde_json::to_string(&capabilities)?);
     }
@@ -90,7 +92,8 @@ pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(
     fs::create_dir_all(output.join("raw"))?;
     let certificates = certificate::generate(output)?;
     for peer in &campaign.peers {
-        capabilities(peer)?.validate(&peer.id, &campaign.rpc_kinds)?;
+        capabilities(peer, Duration::from_millis(campaign.startup_timeout_ms))?
+            .validate(&peer.id, &campaign.rpc_kinds)?;
     }
     write_manifest(campaign, campaign_path, output)?;
 
@@ -100,27 +103,34 @@ pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(
         .write(true)
         .open(&samples_path)?;
     for repetition in 1..=campaign.repetitions {
-        let mut cells = campaign.cells.iter().collect::<Vec<_>>();
+        let mut matrix = campaign
+            .concurrencies
+            .iter()
+            .flat_map(|&concurrency| {
+                campaign.rpc_kinds.iter().flat_map(move |&rpc_kind| {
+                    campaign
+                        .cells
+                        .iter()
+                        .map(move |cell| (concurrency, rpc_kind, cell))
+                })
+            })
+            .collect::<Vec<_>>();
         if repetition % 2 == 0 {
-            cells.reverse();
+            matrix.reverse();
         }
-        for &concurrency in &campaign.concurrencies {
-            for &rpc_kind in &campaign.rpc_kinds {
-                for cell in &cells {
-                    let sample = run_sample(
-                        campaign,
-                        cell,
-                        rpc_kind,
-                        concurrency,
-                        repetition,
-                        &certificates,
-                        output,
-                    )?;
-                    serde_json::to_writer(&mut samples, &sample)?;
-                    samples.write_all(b"\n")?;
-                    samples.flush()?;
-                }
-            }
+        for (concurrency, rpc_kind, cell) in matrix {
+            let sample = run_sample(
+                campaign,
+                cell,
+                rpc_kind,
+                concurrency,
+                repetition,
+                &certificates,
+                output,
+            )?;
+            serde_json::to_writer(&mut samples, &sample)?;
+            samples.write_all(b"\n")?;
+            samples.flush()?;
         }
     }
     report::generate(output)
@@ -210,8 +220,12 @@ fn run_sample(
         .saturating_add(1000);
     let sample_line = client.event(Duration::from_millis(result_timeout))?;
     let peer_sample: PeerSample = parse_expected(&sample_line, "sample")?;
-    let validated =
-        peer_sample.validate(&client_peer.id, rpc_kind, campaign.timing.measurement_ms)?;
+    let validated = peer_sample.validate(
+        &client_peer.id,
+        rpc_kind,
+        campaign.timing.measurement_ms,
+        campaign.workload.messages_per_stream,
+    )?;
     let client_metrics = client_monitor.finish(client.id());
     let server_metrics = server_monitor.finish(server.id());
 
@@ -286,18 +300,43 @@ fn record(
     }
 }
 
-fn capabilities(peer: &Peer) -> Result<Capabilities, BoxError> {
+fn capabilities(peer: &Peer, timeout: Duration) -> Result<Capabilities, BoxError> {
+    let capture = CapabilityCapture::new(peer)?;
     let mut command = peer_command(peer)?;
-    let output = command.arg("capabilities").output()?;
-    if !output.status.success() {
+    let mut child = command
+        .arg("capabilities")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(File::create(&capture.stdout)?))
+        .stderr(Stdio::from(File::create(&capture.stderr)?))
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if capture.output_too_large()? {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("peer {} capabilities exceeded output limit", peer.id).into());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("peer {} capabilities timed out", peer.id).into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = capture.read(&capture.stdout, &peer.id, "stdout")?;
+    let stderr = capture.read(&capture.stderr, &peer.id, "stderr")?;
+    if !status.success() {
         return Err(format!(
             "peer {} capabilities failed: {}",
             peer.id,
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&stderr).trim()
         )
         .into());
     }
-    let stdout = String::from_utf8(output.stdout)?;
+    let stdout = String::from_utf8(stdout)?;
     let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
     let line = lines
         .next()
@@ -306,6 +345,54 @@ fn capabilities(peer: &Peer) -> Result<Capabilities, BoxError> {
         return Err(format!("peer {} emitted extra capability output", peer.id).into());
     }
     Ok(serde_json::from_str(line)?)
+}
+
+struct CapabilityCapture {
+    directory: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl CapabilityCapture {
+    fn new(peer: &Peer) -> Result<Self, BoxError> {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "trevrpc-bench-capabilities-{}-{}-{nonce}",
+            std::process::id(),
+            peer.id
+        ));
+        fs::create_dir(&directory)?;
+        Ok(Self {
+            stdout: directory.join("stdout"),
+            stderr: directory.join("stderr"),
+            directory,
+        })
+    }
+
+    fn output_too_large(&self) -> Result<bool, BoxError> {
+        for path in [&self.stdout, &self.stderr] {
+            if path.metadata()?.len() > MAX_CAPABILITY_OUTPUT_BYTES as u64 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn read(&self, path: &Path, peer: &str, stream: &str) -> Result<Vec<u8>, BoxError> {
+        let output = fs::read(path)?;
+        if output.len() > MAX_CAPABILITY_OUTPUT_BYTES {
+            return Err(format!("peer {peer} capabilities {stream} exceeded output limit").into());
+        }
+        Ok(output)
+    }
+}
+
+impl Drop for CapabilityCapture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
 }
 
 fn peer_command(peer: &Peer) -> Result<Command, BoxError> {

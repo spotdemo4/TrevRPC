@@ -19,7 +19,7 @@ const (
 	rpcBidi                       rpcKind = "bidi"
 	maxBenchmarkPayloadBytes              = 64 * 1024 * 1024
 	maxBenchmarkFrameSize                 = maxBenchmarkPayloadBytes + 1024
-	maxBenchmarkConcurrency               = 4096
+	maxBenchmarkConcurrency               = 1024
 	maxBenchmarkMessagesPerStream         = 1_000_000
 )
 

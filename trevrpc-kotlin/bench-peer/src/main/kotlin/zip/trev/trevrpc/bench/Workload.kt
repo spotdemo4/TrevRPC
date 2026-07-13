@@ -265,8 +265,9 @@ private suspend fun runLane(
     var responseMessages = 0L
     val histogram = LogLinearHistogram()
     var failure: Throwable? = null
-    while (System.nanoTime() - window.startNanoseconds < window.durationNanoseconds) {
+    while (true) {
         val operationStart = System.nanoTime()
+        if (operationStart - window.startNanoseconds >= window.durationNanoseconds) break
         try {
             val counts = workload.runOperation()
             completed = Math.addExact(completed, 1L)

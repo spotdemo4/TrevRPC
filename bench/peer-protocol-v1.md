@@ -73,6 +73,11 @@ Required arguments:
 --messages-per-stream N
 ```
 
+Protocol V1 campaigns are limited to concurrency 1,024, request and response
+payloads of 64 MiB each, and 1,000,000 application messages per streaming RPC.
+Peers reject wire requests outside the payload and stream-message limits before
+allocating responses.
+
 The client establishes one verified connection, validates one RPC, runs the
 untimed warmup, creates all workload lanes, then prints:
 

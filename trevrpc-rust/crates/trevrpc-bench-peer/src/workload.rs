@@ -8,7 +8,9 @@ use trevrpc::advanced::RawQuinnTransport;
 use trevrpc::client::CallOptions;
 use trevrpc::server::RequestContext;
 
-use crate::config::RpcKind;
+use crate::config::{
+    MAX_APPLICATION_PAYLOAD_BYTES, MAX_ENCODED_FRAME_BYTES, MAX_MESSAGES_PER_STREAM, RpcKind,
+};
 use crate::proto::{
     BenchmarkRequest, BenchmarkResponse, BenchmarkService, BenchmarkServiceClient,
     BenchmarkSummary, StreamRequest,
@@ -175,7 +177,7 @@ impl Workload {
 
 fn call_options() -> CallOptions {
     CallOptions::new()
-        .with_max_response_body_size(usize::MAX)
+        .with_max_response_body_size(MAX_ENCODED_FRAME_BYTES)
         .with_max_response_messages(None)
         .with_max_response_stream_body_size(None)
 }
@@ -213,7 +215,7 @@ impl BenchmarkService for BenchmarkServiceImpl {
         _context: RequestContext,
         request: BenchmarkRequest,
     ) -> Result<BenchmarkResponse, trevrpc::Status> {
-        Ok(response_for(&request))
+        response_for(&request)
     }
 
     async fn client_stream(
@@ -228,6 +230,11 @@ impl BenchmarkService for BenchmarkServiceImpl {
             message_count = message_count
                 .checked_add(1)
                 .ok_or_else(|| trevrpc::Status::resource_exhausted("message count overflowed"))?;
+            if message_count > u64::from(MAX_MESSAGES_PER_STREAM) {
+                return Err(trevrpc::Status::resource_exhausted(
+                    "message count exceeded the benchmark peer limit",
+                ));
+            }
             payload_bytes = payload_bytes
                 .checked_add(u64::try_from(request.payload.len()).map_err(|_| {
                     trevrpc::Status::resource_exhausted("payload byte count overflowed")
@@ -247,11 +254,16 @@ impl BenchmarkService for BenchmarkServiceImpl {
         _context: RequestContext,
         request: StreamRequest,
     ) -> Result<trevrpc::BoxMessageStream<BenchmarkResponse>, trevrpc::Status> {
-        let response_bytes = request.response_bytes;
+        let response_bytes = checked_response_bytes(request.response_bytes)?;
+        if request.message_count == 0 || request.message_count > MAX_MESSAGES_PER_STREAM {
+            return Err(trevrpc::Status::invalid_argument(
+                "message_count is outside the benchmark peer limit",
+            ));
+        }
         Ok(trevrpc::stream::from_iter((0..request.message_count).map(
             move |sequence| BenchmarkResponse {
                 sequence: u64::from(sequence),
-                payload: vec![0; response_bytes as usize],
+                payload: vec![0; response_bytes],
             },
         )))
     }
@@ -261,27 +273,49 @@ impl BenchmarkService for BenchmarkServiceImpl {
         _context: RequestContext,
         requests: trevrpc::BoxMessageStream<BenchmarkRequest>,
     ) -> Result<trevrpc::BoxMessageStream<BenchmarkResponse>, trevrpc::Status> {
-        Ok(Box::new(BidiResponses { requests }))
+        Ok(Box::new(BidiResponses {
+            requests,
+            received: 0,
+        }))
     }
 }
 
 struct BidiResponses {
     requests: trevrpc::BoxMessageStream<BenchmarkRequest>,
+    received: u32,
 }
 
 #[trevrpc::async_trait]
 impl MessageStream<BenchmarkResponse> for BidiResponses {
     async fn next(&mut self) -> Option<trevrpc::Result<BenchmarkResponse>> {
-        self.requests
-            .next()
-            .await
-            .map(|request| request.map(|request| response_for(&request)))
+        let request = self.requests.next().await?;
+        self.received = match self.received.checked_add(1) {
+            Some(received) if received <= MAX_MESSAGES_PER_STREAM => received,
+            _ => {
+                return Some(Err(trevrpc::Status::resource_exhausted(
+                    "message count exceeded the benchmark peer limit",
+                )
+                .into()));
+            }
+        };
+        Some(request.and_then(|request| response_for(&request).map_err(Into::into)))
     }
 }
 
-fn response_for(request: &BenchmarkRequest) -> BenchmarkResponse {
-    BenchmarkResponse {
+fn response_for(request: &BenchmarkRequest) -> Result<BenchmarkResponse, trevrpc::Status> {
+    let response_bytes = checked_response_bytes(request.response_bytes)?;
+    Ok(BenchmarkResponse {
         sequence: request.sequence,
-        payload: vec![0; request.response_bytes as usize],
+        payload: vec![0; response_bytes],
+    })
+}
+
+fn checked_response_bytes(response_bytes: u32) -> Result<usize, trevrpc::Status> {
+    let response_bytes = response_bytes as usize;
+    if response_bytes > MAX_APPLICATION_PAYLOAD_BYTES {
+        return Err(trevrpc::Status::invalid_argument(
+            "response_bytes is outside the benchmark peer limit",
+        ));
     }
+    Ok(response_bytes)
 }

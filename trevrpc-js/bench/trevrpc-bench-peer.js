@@ -4,7 +4,12 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-import { createRoot, createServiceClient } from "../src/index.node.js";
+import {
+  createRoot,
+  createServiceClient,
+  invalidArgument,
+  resourceExhausted,
+} from "../src/index.node.js";
 import { RawNodeTransport } from "../src/node-advanced.js";
 import { NodeServer } from "../src/node-index.js";
 
@@ -13,7 +18,7 @@ const Peer = "js";
 const ServiceName = "trevrpc.benchmark.v1.BenchmarkService";
 const IdleTimeoutMs = 600_000;
 const StreamBatchSize = 16;
-const MaxConcurrency = 4096;
+const MaxConcurrency = 1024;
 const MaxPayloadBytes = 64 * 1024 * 1024;
 const MaxMessagesPerStream = 1_000_000;
 const MaxFrameSize = 128 * 1024 * 1024;
@@ -231,6 +236,7 @@ export function createBenchmarkHandlers() {
   return {
     unary(call) {
       const request = BenchmarkRequest.decode(call.request.body);
+      validateResponseBytes(request.responseBytes);
       return encodeResponse(request.sequence, request.responseBytes);
     },
 
@@ -248,22 +254,33 @@ export function createBenchmarkHandlers() {
         }
         const request = BenchmarkRequest.decode(frame.body);
         messageCount += 1n;
+        if (messageCount > BigInt(MaxMessagesPerStream)) {
+          throw resourceExhausted("message count exceeded the benchmark peer limit");
+        }
         payloadBytes += BigInt(request.payload.byteLength);
       }
     },
 
     serverStream(call) {
       const request = StreamRequest.decode(call.request.body);
+      validateMessageCount(request.messageCount);
+      validateResponseBytes(request.responseBytes);
       return encodedResponseStream(request.messageCount, request.responseBytes);
     },
 
     async *bidi(call) {
+      let messageCount = 0;
       for (;;) {
         const frame = await call.recv();
         if (frame == null) {
           return;
         }
+        messageCount += 1;
+        if (messageCount > MaxMessagesPerStream) {
+          throw resourceExhausted("message count exceeded the benchmark peer limit");
+        }
         const request = BenchmarkRequest.decode(frame.body);
+        validateResponseBytes(request.responseBytes);
         yield encodeResponse(request.sequence, request.responseBytes);
       }
     },
@@ -691,7 +708,11 @@ async function sendRequestMessages(call, config) {
       payload,
       responseBytes: config.responseBytes,
     }));
-    if (messages.length === 1 || typeof call.sendMany !== "function") {
+    if (typeof call.sendMany !== "function") {
+      for (const message of messages) {
+        await call.send(message);
+      }
+    } else if (messages.length === 1) {
       await call.send(messages[0]);
     } else {
       await call.sendMany(messages);
@@ -705,6 +726,18 @@ function encodeResponse(sequence, responseBytes) {
     sequence: uint64Text(sequence),
     payload: new Uint8Array(responseBytes),
   }).finish();
+}
+
+function validateResponseBytes(responseBytes) {
+  if (!Number.isInteger(responseBytes) || responseBytes < 0 || responseBytes > MaxPayloadBytes) {
+    throw invalidArgument("response_bytes is outside the benchmark peer limit");
+  }
+}
+
+function validateMessageCount(messageCount) {
+  if (!Number.isInteger(messageCount) || messageCount < 1 || messageCount > MaxMessagesPerStream) {
+    throw invalidArgument("message_count is outside the benchmark peer limit");
+  }
 }
 
 function encodedResponseStream(messageCount, responseBytes) {

@@ -577,6 +577,10 @@ static int service_client_stream(
             }
             break;
         }
+        if (count >= BENCHMARK_MAX_MESSAGES_PER_STREAM) {
+            trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
+            return -E2BIG;
+        }
         if (checked_add_u64(&payload_bytes, request->payload.len) != 0) {
             trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
             return -EINVAL;
@@ -617,6 +621,7 @@ static int service_server_stream(
 
 static int service_bidi(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream) {
     (void)user_data;
+    uint32_t count = 0;
     for (;;) {
         if (trevrpc_call_context_cancelled(context)) {
             return -ECANCELED;
@@ -630,10 +635,11 @@ static int service_bidi(void* user_data, const trevrpc_call_context* context, tr
         if (request == NULL) {
             return status == TREVRPC_STATUS_OK ? 0 : -EINVAL;
         }
-        if (request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES) {
+        if (count >= BENCHMARK_MAX_MESSAGES_PER_STREAM || request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES) {
             trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
             return -EINVAL;
         }
+        count++;
         BenchmarkResponse* response = new_response(request->sequence, request->response_bytes);
         trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
         if (response == NULL) {
@@ -1355,7 +1361,7 @@ static int run_server(int argc, char** argv) {
     runtime_options.worker_count = BENCHMARK_SERVER_WORKERS;
     runtime_options.worker_queue_capacity = BENCHMARK_SERVER_REQUESTS;
     runtime_options.graceful_shutdown_timeout_nanos = BENCHMARK_GRACEFUL_SHUTDOWN_NS;
-    runtime_options.max_stream_messages = -1;
+    runtime_options.max_stream_messages = BENCHMARK_MAX_MESSAGES_PER_STREAM;
     runtime_options.max_stream_body_size = -1;
     err = trevrpc_server_set_options(server, &runtime_options);
     if (err == 0) {

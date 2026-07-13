@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -13,12 +14,84 @@ import {
   prepareFixedAdmissionPhase,
   root,
 } from "../bench/trevrpc-bench-peer.js";
+import { protobuf } from "../src/index.node.js";
 
 const execFileAsync = promisify(execFile);
 const BenchmarkRequest = root.lookupType("trevrpc.benchmark.v1.BenchmarkRequest");
 const BenchmarkResponse = root.lookupType("trevrpc.benchmark.v1.BenchmarkResponse");
 const StreamRequest = root.lookupType("trevrpc.benchmark.v1.StreamRequest");
 const BenchmarkSummary = root.lookupType("trevrpc.benchmark.v1.BenchmarkSummary");
+
+test("benchmark peer schema matches the canonical proto", () => {
+  const canonical = protobuf.parse(
+    readFileSync(new URL("../../bench/proto/benchmark.proto", import.meta.url), "utf8"),
+  ).root;
+  for (const typeName of [
+    "BenchmarkRequest",
+    "BenchmarkResponse",
+    "StreamRequest",
+    "BenchmarkSummary",
+  ]) {
+    assert.deepEqual(
+      schemaFields(root.lookupType(`trevrpc.benchmark.v1.${typeName}`)),
+      schemaFields(canonical.lookupType(`trevrpc.benchmark.v1.${typeName}`)),
+    );
+  }
+  const service = canonical.lookupService("trevrpc.benchmark.v1.BenchmarkService");
+  assert.deepEqual(
+    Object.values(service.methods).map((method) => ({
+      name: method.name,
+      requestType: method.requestType,
+      responseType: method.responseType,
+      requestStream: method.requestStream ?? false,
+      responseStream: method.responseStream ?? false,
+    })),
+    [
+      {
+        name: "Unary",
+        requestType: "BenchmarkRequest",
+        responseType: "BenchmarkResponse",
+        requestStream: false,
+        responseStream: false,
+      },
+      {
+        name: "ClientStream",
+        requestType: "BenchmarkRequest",
+        responseType: "BenchmarkSummary",
+        requestStream: true,
+        responseStream: false,
+      },
+      {
+        name: "ServerStream",
+        requestType: "StreamRequest",
+        responseType: "BenchmarkResponse",
+        requestStream: false,
+        responseStream: true,
+      },
+      {
+        name: "Bidi",
+        requestType: "BenchmarkRequest",
+        responseType: "BenchmarkResponse",
+        requestStream: true,
+        responseStream: true,
+      },
+    ],
+  );
+});
+
+function schemaFields(type) {
+  return Object.fromEntries(
+    Object.entries(type.fields).map(([name, field]) => [
+      name,
+      {
+        id: field.id,
+        type: field.type,
+        repeated: field.repeated,
+        keyType: field.keyType,
+      },
+    ]),
+  );
+}
 
 test("benchmark peer capabilities use protocol v1", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
@@ -239,6 +312,31 @@ test("client operations validate and count all four RPC kinds", async () => {
     ["0", "1", "2"],
   );
 
+  const individuallySent = [];
+  const clientStreamWithoutBatching = createClientOperation(
+    {
+      async clientStream() {
+        return {
+          async send(message) {
+            individuallySent.push(message);
+          },
+          async closeAndRecv() {
+            return {
+              messageCount: individuallySent.length,
+              payloadBytes: individuallySent.reduce(
+                (total, request) => total + request.payload.byteLength,
+                0,
+              ),
+            };
+          },
+        };
+      },
+    },
+    { ...config, rpcKind: "client_stream" },
+  );
+  await clientStreamWithoutBatching({ laneIndex: 0, operationIndex: 0n });
+  assert.equal(individuallySent.length, config.messagesPerStream);
+
   const serverStream = createClientOperation(
     {
       async serverStream(request) {
@@ -340,6 +438,25 @@ test("server handlers implement all four benchmark RPCs", async () => {
     ["7", "8"],
   );
   assert.ok(bidiResponses.every((response) => response.payload.byteLength === 4));
+
+  assert.throws(
+    () =>
+      handlers.unary({
+        request: {
+          body: BenchmarkRequest.encode({ sequence: "1", responseBytes: 0xffffffff }).finish(),
+        },
+      }),
+    /response_bytes is outside the benchmark peer limit/u,
+  );
+  assert.throws(
+    () =>
+      handlers.serverStream({
+        request: {
+          body: StreamRequest.encode({ messageCount: 0xffffffff, responseBytes: 1 }).finish(),
+        },
+      }),
+    /message_count is outside the benchmark peer limit/u,
+  );
 });
 
 async function* responseMessages(count, responseBytes) {

@@ -28,6 +28,7 @@ import kotlin.time.Duration.Companion.seconds
 private const val DEFAULT_ADDR = "127.0.0.1:0"
 private const val DEFAULT_TOKEN = "cross-runtime-token"
 private const val DEFAULT_BROWSER_TOKEN = "trevrpc-example-token"
+private val CROSS_RUNTIME_CALL_TIMEOUT = 60.seconds
 
 internal enum class Mode {
     SERVER,
@@ -201,13 +202,17 @@ private suspend fun runClientIteration(
 ) {
     val connection = connect(options)
     try {
-        val unauthenticated = GreeterClient(connection.transport, CallOptions(timeout = 5.seconds))
+        val unauthenticated = GreeterClient(connection.transport, CallOptions(timeout = CROSS_RUNTIME_CALL_TIMEOUT))
         val authError = runCatching { unauthenticated.sayHello(request("unauthenticated")) }.exceptionOrNull()
         check(authError is TrevRpcException && authError.status.code == Code.UNAUTHENTICATED) {
             "client iteration $iteration: unauthenticated call returned $authError"
         }
 
-        val client = GreeterClient(connection.transport, authenticatedOptions(options.token))
+        val client =
+            GreeterClient(
+                connection.transport,
+                authenticatedOptions(options.token).copy(timeout = CROSS_RUNTIME_CALL_TIMEOUT),
+            )
         val actual = runReadableGreeterClient(client)
         val expected = listOf("hello, unary", "hello, server", "goodbye, server", "left,right", "echo, one", "echo, two")
         check(actual == expected) { "client iteration $iteration: Greeter results $actual, expected $expected" }
@@ -222,7 +227,11 @@ private suspend fun runLifecycleIteration(
 ) {
     val connection = connect(options)
     try {
-        val client = GreeterClient(connection.transport, authenticatedOptions(options.token))
+        val client =
+            GreeterClient(
+                connection.transport,
+                authenticatedOptions(options.token).copy(timeout = CROSS_RUNTIME_CALL_TIMEOUT),
+            )
         val unary = client.sayHello(request("lifecycle-unary"))
         check(unary.message == "hello, lifecycle-unary") { "lifecycle client iteration $iteration: unary failed" }
 

@@ -124,13 +124,12 @@ impl Snapshot {
         let rss_bytes = status_kib(&status, "VmRSS:")
             .unwrap_or(0)
             .saturating_mul(1024);
-        let peak_rss_bytes = status_kib(&status, "VmHWM:")
-            .unwrap_or(rss_bytes / 1024)
-            .saturating_mul(1024);
         Ok(Self {
             cpu_ns,
             rss_bytes,
-            peak_rss_bytes,
+            // VmHWM is the process lifetime high-water mark. Track sampled
+            // VmRSS instead so startup and warmup allocations stay excluded.
+            peak_rss_bytes: rss_bytes,
             voluntary_context_switches: status_count(&status, "voluntary_ctxt_switches:")
                 .unwrap_or(0),
             involuntary_context_switches: status_count(&status, "nonvoluntary_ctxt_switches:")

@@ -117,7 +117,7 @@ func newBenchmarkServer() *trevrpc.Server {
 	options.MaxConcurrentConnections = 16
 	options.MaxConcurrentStreamsPerConnection = maxBenchmarkConcurrency
 	options.MaxConcurrentRequests = maxBenchmarkConcurrency * 2
-	options.MaxStreamMessages = -1
+	options.MaxStreamMessages = maxBenchmarkMessagesPerStream
 	options.MaxStreamBodySize = -1
 	server.SetOptions(options)
 	benchmarkpb.RegisterBenchmarkServiceServer(server, benchmarkService{})

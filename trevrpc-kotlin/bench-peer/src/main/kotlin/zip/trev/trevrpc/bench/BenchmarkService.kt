@@ -89,7 +89,7 @@ internal fun createBenchmarkServer(): Server {
                 maxConcurrentConnections = 1,
                 maxConcurrentStreamsPerConnection = MAX_BENCHMARK_CONCURRENCY,
                 maxConcurrentRequests = MAX_BENCHMARK_CONCURRENCY,
-                maxStreamMessages = null,
+                maxStreamMessages = MAX_MESSAGES_PER_STREAM,
                 maxStreamBodySize = null,
             ),
         )

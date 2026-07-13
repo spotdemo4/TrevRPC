@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BoxError, SCHEMA_VERSION};
 
+pub const MAX_CONCURRENCY: usize = 1024;
+pub const MAX_PAYLOAD_BYTES: u32 = 64 * 1024 * 1024;
+pub const MAX_MESSAGES_PER_STREAM: u32 = 1_000_000;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Campaign {
@@ -111,8 +115,21 @@ impl Campaign {
         if self.timing.measurement_ms == 0 {
             return Err("measurement_ms must be positive".into());
         }
+        if self.timing.measurement_ms > u64::MAX / 1_000_000 {
+            return Err("measurement_ms is too large to represent in nanoseconds".into());
+        }
         if self.workload.messages_per_stream == 0 {
             return Err("messages_per_stream must be positive".into());
+        }
+        if self.workload.request_bytes > MAX_PAYLOAD_BYTES
+            || self.workload.response_bytes > MAX_PAYLOAD_BYTES
+        {
+            return Err(format!("payloads must not exceed {MAX_PAYLOAD_BYTES} bytes").into());
+        }
+        if self.workload.messages_per_stream > MAX_MESSAGES_PER_STREAM {
+            return Err(
+                format!("messages_per_stream must not exceed {MAX_MESSAGES_PER_STREAM}").into(),
+            );
         }
         if self.startup_timeout_ms == 0 || self.drain_timeout_ms == 0 {
             return Err("timeouts must be positive".into());
@@ -145,9 +162,16 @@ impl Campaign {
             return Err("rpc_kinds contains duplicates".into());
         }
         if self.concurrencies.contains(&0)
+            || self
+                .concurrencies
+                .iter()
+                .any(|&concurrency| concurrency > MAX_CONCURRENCY)
             || self.concurrencies.iter().collect::<BTreeSet<_>>().len() != self.concurrencies.len()
         {
-            return Err("concurrencies must be positive and unique".into());
+            return Err(format!(
+                "concurrencies must be positive, unique, and at most {MAX_CONCURRENCY}"
+            )
+            .into());
         }
         Ok(())
     }
@@ -174,7 +198,10 @@ fn validate_id(value: &str, name: &str) -> Result<(), BoxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Campaign, Cell, Peer, RpcKind, Timing, Workload};
+    use super::{
+        Campaign, Cell, MAX_CONCURRENCY, MAX_MESSAGES_PER_STREAM, MAX_PAYLOAD_BYTES, Peer, RpcKind,
+        Timing, Workload,
+    };
 
     fn campaign() -> Campaign {
         Campaign {
@@ -216,5 +243,20 @@ mod tests {
         let mut campaign = campaign();
         campaign.cells[0].server = "missing".to_owned();
         assert!(campaign.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_workloads_outside_protocol_limits() {
+        let mut excessive_concurrency = campaign();
+        excessive_concurrency.concurrencies = vec![MAX_CONCURRENCY + 1];
+        assert!(excessive_concurrency.validate().is_err());
+
+        let mut excessive_payload = campaign();
+        excessive_payload.workload.response_bytes = MAX_PAYLOAD_BYTES + 1;
+        assert!(excessive_payload.validate().is_err());
+
+        let mut excessive_stream = campaign();
+        excessive_stream.workload.messages_per_stream = MAX_MESSAGES_PER_STREAM + 1;
+        assert!(excessive_stream.validate().is_err());
     }
 }

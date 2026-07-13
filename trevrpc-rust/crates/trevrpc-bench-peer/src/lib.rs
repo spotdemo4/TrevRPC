@@ -22,7 +22,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Barrier, watch};
 use tokio::task::JoinHandle;
 
-use config::{ClientConfig, Command, ServerConfig};
+use config::{
+    ClientConfig, Command, MAX_ENCODED_FRAME_BYTES, MAX_MESSAGES_PER_STREAM, ServerConfig,
+};
 use histogram::{HistogramBucket, LogLinearHistogram};
 use workload::{BenchmarkServiceImpl, MessageCounts, Workload, WorkloadConfig};
 
@@ -98,10 +100,11 @@ async fn run_server(config: ServerConfig) -> PeerResult {
     let mut server = trevrpc::server::Server::new();
     server.set_options(
         trevrpc::server::ServerOptions::new()
+            .with_max_frame_size(MAX_ENCODED_FRAME_BYTES)
             .with_max_concurrent_connections(Some(8))
             .with_max_concurrent_streams_per_connection(Some(SERVER_MAX_STREAMS))
             .with_max_concurrent_requests(Some(SERVER_MAX_REQUESTS))
-            .with_max_stream_messages(None)
+            .with_max_stream_messages(Some(MAX_MESSAGES_PER_STREAM as usize))
             .with_max_stream_body_size(None),
     );
     proto::register_benchmark_service(&mut server, BenchmarkServiceImpl);
@@ -285,6 +288,13 @@ async fn run_client(config: ClientConfig) -> PeerResult {
             ),
         ));
     }
+    if measured.failed != 0 {
+        return Err(PeerError::new(
+            "measure",
+            "rpc_failed",
+            format!("measurement recorded {} failed operations", measured.failed),
+        ));
+    }
     let admission = Duration::from_millis(config.measurement_ms);
     emit(&SampleEvent {
         schema_version: SCHEMA_VERSION,
@@ -356,7 +366,7 @@ async fn connect_client(config: &ClientConfig) -> PeerResult<ConnectedClient> {
     trevrpc::quinn::apply_transport_limits(
         &mut client_transport,
         trevrpc::quinn::client_transport_limits(
-            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+            MAX_ENCODED_FRAME_BYTES,
             trevrpc::quinn::TransportMode::Native,
         ),
     );
@@ -369,7 +379,8 @@ async fn connect_client(config: &ClientConfig) -> PeerResult<ConnectedClient> {
         .await
         .map_err(|error| PeerError::wrap("connect", "tls_connect_failed", error))?;
     let workload = Workload::new(
-        trevrpc::advanced::RawQuinnTransport::new(connection.clone()),
+        trevrpc::advanced::RawQuinnTransport::new(connection.clone())
+            .with_max_frame_size(MAX_ENCODED_FRAME_BYTES),
         WorkloadConfig {
             rpc: config.rpc,
             request_bytes: config.request_bytes,
@@ -492,8 +503,11 @@ async fn run_lane(
 ) -> LaneResult {
     let deadline = phase_start + duration;
     let mut result = LaneResult::default();
-    while Instant::now() < deadline {
+    loop {
         let operation_start = Instant::now();
+        if operation_start >= deadline {
+            break;
+        }
         match workload.execute().await {
             Ok(messages) => {
                 result.completed = result.completed.saturating_add(1);

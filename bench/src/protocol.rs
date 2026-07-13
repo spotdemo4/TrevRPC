@@ -158,6 +158,7 @@ impl PeerSample {
         expected_peer: &str,
         expected_rpc: RpcKind,
         expected_admission_ms: u64,
+        messages_per_stream: u32,
     ) -> Result<ValidatedSample, BoxError> {
         validate_event(
             self.schema_version,
@@ -176,16 +177,20 @@ impl PeerSample {
         let failed = parse_u64(&self.failed, "failed")?;
         let request_messages = parse_u64(&self.request_messages, "request_messages")?;
         let response_messages = parse_u64(&self.response_messages, "response_messages")?;
-        let target_admission_ns = expected_admission_ms.saturating_mul(1_000_000);
-        let timing_tolerance_ns = target_admission_ns / 100 + 1_000_000;
-        if admission_ns.abs_diff(target_admission_ns) > timing_tolerance_ns
-            || elapsed_ns < admission_ns
-            || drain_ns != elapsed_ns.saturating_sub(admission_ns)
-        {
-            return Err(format!("peer {expected_peer} returned inconsistent timing").into());
-        }
+        validate_timing(admission_ns, elapsed_ns, drain_ns, expected_admission_ms).map_err(
+            |error| format!("peer {expected_peer} returned inconsistent timing: {error}"),
+        )?;
         if completed == 0 || failed != 0 {
             return Err(format!("peer {expected_peer} returned an empty or failed sample").into());
+        }
+        let expected_messages =
+            expected_message_counts(expected_rpc, completed, messages_per_stream)?;
+        if (request_messages, response_messages) != expected_messages {
+            return Err(format!(
+                "peer {expected_peer} returned {request_messages}/{response_messages} request/response messages; expected {}/{}",
+                expected_messages.0, expected_messages.1
+            )
+            .into());
         }
         let (histogram_count, latency_p50_ns, latency_p99_ns, latency_max_ns) =
             histogram_quantiles(&self.histogram)?;
@@ -208,6 +213,41 @@ impl PeerSample {
             latency_max_ns,
         })
     }
+}
+
+pub fn validate_timing(
+    admission_ns: u64,
+    elapsed_ns: u64,
+    drain_ns: u64,
+    expected_admission_ms: u64,
+) -> Result<(), BoxError> {
+    let target_admission_ns = expected_admission_ms
+        .checked_mul(1_000_000)
+        .ok_or("configured admission duration overflows nanoseconds")?;
+    if admission_ns == 0
+        || admission_ns != target_admission_ns
+        || elapsed_ns < admission_ns
+        || drain_ns != elapsed_ns - admission_ns
+    {
+        return Err("admission, elapsed, and drain durations disagree".into());
+    }
+    Ok(())
+}
+
+pub fn expected_message_counts(
+    rpc_kind: RpcKind,
+    completed: u64,
+    messages_per_stream: u32,
+) -> Result<(u64, u64), BoxError> {
+    let streamed = completed
+        .checked_mul(u64::from(messages_per_stream))
+        .ok_or("sample message count overflow")?;
+    Ok(match rpc_kind {
+        RpcKind::Unary => (completed, completed),
+        RpcKind::ClientStream => (streamed, completed),
+        RpcKind::ServerStream => (completed, streamed),
+        RpcKind::Bidi => (streamed, streamed),
+    })
 }
 
 pub fn parse_header(line: &str) -> Result<EventHeader, BoxError> {
@@ -284,7 +324,8 @@ fn quantile(buckets: &[(u64, u64)], total: u64, numerator: u64, denominator: u64
 
 #[cfg(test)]
 mod tests {
-    use super::{HistogramBucket, histogram_quantiles};
+    use super::{HistogramBucket, expected_message_counts, histogram_quantiles, validate_timing};
+    use crate::campaign::RpcKind;
 
     #[test]
     fn computes_quantiles_from_sparse_buckets() {
@@ -306,5 +347,34 @@ mod tests {
             histogram_quantiles(&buckets).expect("histogram"),
             (100, 10, 20, 30)
         );
+    }
+
+    #[test]
+    fn derives_message_counts_for_every_rpc_kind() {
+        assert_eq!(
+            expected_message_counts(RpcKind::Unary, 3, 4).unwrap(),
+            (3, 3)
+        );
+        assert_eq!(
+            expected_message_counts(RpcKind::ClientStream, 3, 4).unwrap(),
+            (12, 3)
+        );
+        assert_eq!(
+            expected_message_counts(RpcKind::ServerStream, 3, 4).unwrap(),
+            (3, 12)
+        );
+        assert_eq!(
+            expected_message_counts(RpcKind::Bidi, 3, 4).unwrap(),
+            (12, 12)
+        );
+        assert!(expected_message_counts(RpcKind::Bidi, u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn timing_requires_exact_positive_admission_and_consistent_drain() {
+        assert!(validate_timing(1_000_000, 1_000_100, 100, 1).is_ok());
+        assert!(validate_timing(0, 1_000_000, 1_000_000, 1).is_err());
+        assert!(validate_timing(999_999, 1_000_000, 1, 1).is_err());
+        assert!(validate_timing(1_000_000, 1_000_100, 99, 1).is_err());
     }
 }

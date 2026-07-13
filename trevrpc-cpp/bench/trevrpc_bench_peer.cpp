@@ -35,7 +35,10 @@ using Nanoseconds = std::chrono::nanoseconds;
 
 constexpr auto kConnectTimeout = std::chrono::seconds(10);
 constexpr std::size_t kMaximumControlLine = 1024;
-constexpr std::uint16_t kPeerStreamLimit = std::numeric_limits<std::uint16_t>::max();
+constexpr std::size_t kMaximumPayloadBytes = std::size_t{64} * 1024 * 1024;
+constexpr std::uint32_t kMaximumMessagesPerStream = 1'000'000;
+constexpr std::size_t kMaximumFrameSize = kMaximumPayloadBytes + 1024;
+constexpr std::uint16_t kPeerStreamLimit = 1024;
 
 volatile std::sig_atomic_t stop_requested = 0;
 
@@ -283,11 +286,10 @@ struct ClientConfig {
       config.measurement_ms > std::numeric_limits<std::uint64_t>::max() / 1'000'000) {
     throw PeerError("config", "invalid_argument", "benchmark duration is out of range");
   }
-  if (request_bytes > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
-      response_bytes > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
-    throw PeerError("config", "invalid_argument", "payload size exceeds the protobuf size limit");
+  if (request_bytes > kMaximumPayloadBytes || response_bytes > kMaximumPayloadBytes) {
+    throw PeerError("config", "invalid_argument", "payload size exceeds the benchmark peer limit");
   }
-  if (messages == 0 || messages > std::numeric_limits<std::uint32_t>::max()) {
+  if (messages == 0 || messages > kMaximumMessagesPerStream) {
     throw PeerError("config", "invalid_argument", "--messages-per-stream is out of range");
   }
   config.concurrency = static_cast<std::size_t>(concurrency);
@@ -310,6 +312,9 @@ class BenchmarkService final : public benchmark::BenchmarkServiceService {
 public:
   trevrpc::Result<benchmark::BenchmarkResponse>
   Unary(const trevrpc::CallContext&, const benchmark::BenchmarkRequest& request) override {
+    if (request.response_bytes() > kMaximumPayloadBytes) {
+      return trevrpc::Status::invalid_argument("response_bytes exceeds the benchmark peer limit");
+    }
     benchmark::BenchmarkResponse response;
     response.set_sequence(request.sequence());
     response.set_payload(make_payload(request.response_bytes(), request.sequence()));
@@ -330,8 +335,11 @@ public:
         break;
       }
       const std::size_t size = request.value()->payload().size();
-      if (message_count == std::numeric_limits<std::uint64_t>::max() ||
-          size > std::numeric_limits<std::uint64_t>::max() - payload_bytes) {
+      if (message_count >= kMaximumMessagesPerStream) {
+        return trevrpc::Status(trevrpc::StatusCode::ResourceExhausted,
+                               "message count exceeds the benchmark peer limit");
+      }
+      if (size > std::numeric_limits<std::uint64_t>::max() - payload_bytes) {
         return trevrpc::Status(trevrpc::StatusCode::OutOfRange, "stream summary overflow");
       }
       ++message_count;
@@ -346,6 +354,11 @@ public:
   trevrpc::Status
   ServerStream(const trevrpc::CallContext&, const benchmark::StreamRequest& request,
                trevrpc::ServerWriter<benchmark::BenchmarkResponse>& writer) override {
+    if (request.message_count() == 0 || request.message_count() > kMaximumMessagesPerStream ||
+        request.response_bytes() > kMaximumPayloadBytes) {
+      return trevrpc::Status::invalid_argument(
+          "stream response settings exceed the benchmark peer limits");
+    }
     for (std::uint32_t index = 0; index < request.message_count(); ++index) {
       benchmark::BenchmarkResponse response;
       response.set_sequence(index);
@@ -361,6 +374,7 @@ public:
   trevrpc::Status Bidi(const trevrpc::CallContext&,
                        trevrpc::ServerReaderWriter<benchmark::BenchmarkRequest,
                                                    benchmark::BenchmarkResponse>& stream) override {
+    std::uint32_t message_count = 0;
     for (;;) {
       auto request = stream.receive();
       if (!request) {
@@ -368,6 +382,14 @@ public:
       }
       if (!request.value().has_value()) {
         return trevrpc::Status::ok();
+      }
+      if (message_count >= kMaximumMessagesPerStream) {
+        return trevrpc::Status(trevrpc::StatusCode::ResourceExhausted,
+                               "message count exceeds the benchmark peer limit");
+      }
+      ++message_count;
+      if (request.value()->response_bytes() > kMaximumPayloadBytes) {
+        return trevrpc::Status::invalid_argument("response_bytes exceeds the benchmark peer limit");
       }
       benchmark::BenchmarkResponse response;
       response.set_sequence(request.value()->sequence());
@@ -467,7 +489,7 @@ int run_server(int argc, char** argv) {
   config.cert_file = certificate;
   config.key_file = private_key;
   config.peer_bidi_stream_count = kPeerStreamLimit;
-  config.max_frame_size = std::numeric_limits<std::size_t>::max();
+  config.max_frame_size = kMaximumFrameSize;
   auto listening = trevrpc::Server::listen(config);
   if (!listening) {
     throw PeerError("setup", "listen_failed", describe(listening.error()));
@@ -476,7 +498,7 @@ int run_server(int argc, char** argv) {
 
   trevrpc::ServerOptions options;
   options.worker_queue_capacity = std::numeric_limits<std::int64_t>::max();
-  options.max_stream_messages = std::numeric_limits<std::int64_t>::max();
+  options.max_stream_messages = kMaximumMessagesPerStream;
   options.max_stream_body_size = std::numeric_limits<std::int64_t>::max();
   auto configured = server.set_options(options);
   if (!configured) {
@@ -955,7 +977,7 @@ int run_client(int argc, char** argv) {
   trevrpc::ChannelConfig channel_config;
   channel_config.ca_cert_file = config.certificate;
   channel_config.skip_certificate_validation = false;
-  channel_config.max_frame_size = std::numeric_limits<std::size_t>::max();
+  channel_config.max_frame_size = kMaximumFrameSize;
   auto connected = trevrpc::Channel::connect(config.endpoint.host, config.endpoint.port,
                                              channel_config, kConnectTimeout);
   if (!connected) {

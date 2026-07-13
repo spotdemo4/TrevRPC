@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::campaign::Campaign;
-use crate::protocol::histogram_quantiles;
+use crate::protocol::{expected_message_counts, histogram_quantiles, validate_timing};
 use crate::runner::SampleRecord;
 use crate::{BoxError, SCHEMA_VERSION};
 
@@ -156,6 +156,30 @@ fn validate_samples(campaign: &Campaign, samples: &[SampleRecord]) -> Result<(),
             )
             .into());
         }
+        validate_timing(
+            sample.admission_ns,
+            sample.elapsed_ns,
+            sample.drain_ns,
+            campaign.timing.measurement_ms,
+        )
+        .map_err(|error| {
+            format!(
+                "sample {} has inconsistent timing: {error}",
+                sample.sample_id
+            )
+        })?;
+        let expected_messages = expected_message_counts(
+            sample.rpc_kind,
+            sample.completed,
+            sample.messages_per_stream,
+        )?;
+        if (sample.request_messages, sample.response_messages) != expected_messages {
+            return Err(format!(
+                "sample {} has inconsistent message counts",
+                sample.sample_id
+            )
+            .into());
+        }
         let histogram = histogram_quantiles(&sample.histogram)?;
         if histogram
             != (
@@ -171,12 +195,27 @@ fn validate_samples(campaign: &Campaign, samples: &[SampleRecord]) -> Result<(),
             )
             .into());
         }
-        let expected_throughput =
-            sample.completed as f64 * 1_000_000_000.0 / sample.admission_ns as f64;
-        let tolerance = expected_throughput.abs().max(1.0) * 1e-9;
-        if (sample.operations_per_second - expected_throughput).abs() > tolerance {
-            return Err(format!("sample {} has inconsistent throughput", sample.sample_id).into());
-        }
+        validate_rate(
+            sample.operations_per_second,
+            sample.completed,
+            sample.admission_ns,
+            &sample.sample_id,
+            "operation",
+        )?;
+        validate_rate(
+            sample.request_messages_per_second,
+            sample.request_messages,
+            sample.admission_ns,
+            &sample.sample_id,
+            "request-message",
+        )?;
+        validate_rate(
+            sample.response_messages_per_second,
+            sample.response_messages,
+            sample.admission_ns,
+            &sample.sample_id,
+            "response-message",
+        )?;
         if !cells.insert((
             sample.cell_id.as_str(),
             sample.rpc_kind,
@@ -185,6 +224,21 @@ fn validate_samples(campaign: &Campaign, samples: &[SampleRecord]) -> Result<(),
         )) {
             return Err(format!("duplicate matrix cell for sample {}", sample.sample_id).into());
         }
+    }
+    Ok(())
+}
+
+fn validate_rate(
+    actual: f64,
+    count: u64,
+    admission_ns: u64,
+    sample_id: &str,
+    name: &str,
+) -> Result<(), BoxError> {
+    let expected = count as f64 * 1_000_000_000.0 / admission_ns as f64;
+    let tolerance = expected.abs().max(1.0) * 1e-9;
+    if !actual.is_finite() || (actual - expected).abs() > tolerance {
+        return Err(format!("sample {sample_id} has inconsistent {name} throughput").into());
     }
     Ok(())
 }

@@ -7,7 +7,7 @@ import java.util.TreeMap
 internal const val PEER_NAME = "kotlin"
 internal const val MAX_APPLICATION_PAYLOAD_BYTES = 64 * 1024 * 1024
 internal const val MAX_ENCODED_MESSAGE_BYTES = MAX_APPLICATION_PAYLOAD_BYTES + 1024
-internal const val MAX_BENCHMARK_CONCURRENCY = 4096
+internal const val MAX_BENCHMARK_CONCURRENCY = 1024
 internal const val MAX_MESSAGES_PER_STREAM = 1_000_000
 
 internal sealed interface PeerCommand {

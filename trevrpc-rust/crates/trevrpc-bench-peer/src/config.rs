@@ -4,6 +4,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+pub(crate) const MAX_APPLICATION_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_ENCODED_FRAME_BYTES: usize = MAX_APPLICATION_PAYLOAD_BYTES + 1024;
+pub(crate) const MAX_BENCHMARK_CONCURRENCY: usize = 1024;
+pub(crate) const MAX_MESSAGES_PER_STREAM: u32 = 1_000_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RpcKind {
     Unary,
@@ -143,6 +148,23 @@ fn parse_client(mut options: BTreeMap<String, String>) -> Result<ClientConfig, C
         messages_per_stream: take_positive(&mut options, "--messages-per-stream")?,
     };
     reject_unknown(&options)?;
+    if config.concurrency > MAX_BENCHMARK_CONCURRENCY {
+        return Err(ConfigError(format!(
+            "--concurrency must not exceed {MAX_BENCHMARK_CONCURRENCY}"
+        )));
+    }
+    if config.request_bytes > MAX_APPLICATION_PAYLOAD_BYTES
+        || config.response_bytes as usize > MAX_APPLICATION_PAYLOAD_BYTES
+    {
+        return Err(ConfigError(format!(
+            "payload byte counts must not exceed {MAX_APPLICATION_PAYLOAD_BYTES}"
+        )));
+    }
+    if config.messages_per_stream > MAX_MESSAGES_PER_STREAM {
+        return Err(ConfigError(format!(
+            "--messages-per-stream must not exceed {MAX_MESSAGES_PER_STREAM}"
+        )));
+    }
     Ok(config)
 }
 
@@ -252,5 +274,15 @@ mod tests {
         unknown[8] = "1";
         unknown.extend(["--extra", "value"]);
         assert!(parse(unknown.into_iter().map(str::to_owned)).is_err());
+
+        let mut oversized_payload = base.to_vec();
+        oversized_payload[8] = "1";
+        oversized_payload[16] = "67108865";
+        assert!(parse(oversized_payload.into_iter().map(str::to_owned)).is_err());
+
+        let mut oversized_stream = base.to_vec();
+        oversized_stream[8] = "1";
+        oversized_stream[18] = "1000001";
+        assert!(parse(oversized_stream.into_iter().map(str::to_owned)).is_err());
     }
 }
