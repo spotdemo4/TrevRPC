@@ -10,7 +10,7 @@
   "allowedCommands": [
     "fix-hash .#trevrpc-go",
     "npm audit fix --prefix trevrpc-js",
-    "^nix run --option eval-cache false \\.#update-kotlin-deps$"
+    "nix run .#update-kotlin-deps"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
 
@@ -66,7 +66,7 @@
     {
       "matchManagers": ["gradle"],
       "postUpgradeTasks": {
-        "commands": ["nix run --option eval-cache false .#update-kotlin-deps"],
+        "commands": ["nix run .#update-kotlin-deps"],
         "fileFilters": ["trevrpc-kotlin/gradle/deps.json"],
         "executionMode": "branch"
       }
