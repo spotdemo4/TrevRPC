@@ -575,7 +575,8 @@ fn sha256_file(path: &Path) -> Result<String, BoxError> {
 }
 
 fn sha256(input: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(input))
+    let digest = Sha256::digest(input);
+    base16ct::lower::encode_string(digest.as_slice())
 }
 
 fn resolve_executable(executable: &str) -> PathBuf {
@@ -593,4 +594,17 @@ fn resolve_executable(executable: &str) -> PathBuf {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256;
+
+    #[test]
+    fn encodes_sha256_as_lowercase_hex() {
+        assert_eq!(
+            sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }
