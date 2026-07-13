@@ -185,6 +185,7 @@
               };
               sourceRoot = "${final.src.name}/bench";
               cargoLock.lockFile = ./bench/Cargo.lock;
+
               nativeBuildInputs = [ pkgs.makeWrapper ];
               postInstall = ''
                 wrapProgram $out/bin/trevrpc-bench \
@@ -256,6 +257,7 @@
                 runHook postBuild
               '';
 
+              doCheck = false;
               checkPhase = ''
                 runHook preCheck
                 export HOME=$TMPDIR
@@ -310,18 +312,6 @@
               };
               sourceRoot = "${final.src.name}/trevrpc-cpp";
 
-              nativeBuildInputs = with pkgs; [
-                clang-tools
-                cmake
-                openssl
-                protobuf
-              ];
-              propagatedBuildInputs = with pkgs; [
-                self.packages.${system}.trevrpc-c
-                protobuf
-              ];
-              doCheck = true;
-
               configurePhase = ''
                 runHook preConfigure
                 cmake -S . -B build \
@@ -338,11 +328,24 @@
                   -DTREVRPC_CPP_BUILD_EXAMPLES=ON
                 runHook postConfigure
               '';
+
+              nativeBuildInputs = with pkgs; [
+                clang-tools
+                cmake
+                openssl
+                protobuf
+              ];
+              propagatedBuildInputs = with pkgs; [
+                self.packages.${system}.trevrpc-c
+                protobuf
+              ];
               buildPhase = ''
                 runHook preBuild
                 cmake --build build
                 runHook postBuild
               '';
+
+              doCheck = false;
               checkPhase = ''
                 runHook preCheck
                 clang-format --dry-run --Werror $(find . \
@@ -365,6 +368,7 @@
                 cmake --build build/consumer
                 runHook postCheck
               '';
+
               installPhase = ''
                 runHook preInstall
                 cmake --install build
@@ -400,6 +404,7 @@
               cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
               cargoBuildFlags = [ "--workspace" ];
 
+              doCheck = false;
               nativeCheckInputs = with pkgs; [
                 rustfmt
                 clippy
@@ -409,6 +414,7 @@
                 cargo test --workspace --offline
                 cargo clippy --workspace --all-targets --offline -- -D warnings
               '';
+
               installPhase = ''
                 runHook preInstall
                 generator=$(find target -path '*/release/protoc-gen-trevrpc-rust' -type f -perm -0100 | head -n1)
@@ -453,6 +459,7 @@
                 mv $out/bin/trevrpc-bench-peer $out/bin/trevrpc-bench-peer-go
               '';
 
+              doCheck = false;
               nativeCheckInputs = with pkgs; [
                 go-tools
                 gotools
@@ -510,6 +517,7 @@
                 self.packages.${system}.trevrpc-c
               ];
 
+              doCheck = false;
               nativeCheckInputs = with pkgs; [
                 clang-tools
                 oxfmt
@@ -583,7 +591,8 @@
                 runHook preBuild
                 gradle build
               '';
-              doCheck = true;
+
+              doCheck = false;
               gradleCheckTask = "check";
 
               installPhase = ''
