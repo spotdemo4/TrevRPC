@@ -2,7 +2,7 @@
 bouncycastle = "1.85"
 coroutines = "1.11.0"
 cronet = "143.7445.0"
-junit = "5.13.4"
+junit = "5.14.4"
 kotlin = "2.4.0"
 netty = "4.2.16.Final"
 protobuf = "4.35.1"
