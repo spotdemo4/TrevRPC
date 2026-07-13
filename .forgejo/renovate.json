@@ -8,9 +8,10 @@
   "endpoint": "https://trev.zip/api/v1",
   "repositories": ["llc/TrevRPC"],
   "allowedCommands": [
-    "fix-hash .#trevrpc-go",
-    "npm audit fix --prefix trevrpc-js",
-    "nix run .#update-kotlin-deps"
+    "^fix-hash \\.#trevrpc-go$",
+    "^npm audit fix --prefix trevrpc-js$",
+    "^trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --write-verification-metadata sha256 build$",
+    "^nix run \\.#update-kotlin-deps$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
 
@@ -66,8 +67,14 @@
     {
       "matchManagers": ["gradle"],
       "postUpgradeTasks": {
-        "commands": ["nix run .#update-kotlin-deps"],
-        "fileFilters": ["trevrpc-kotlin/gradle/deps.json"],
+        "commands": [
+          "trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --write-verification-metadata sha256 build",
+          "nix run .#update-kotlin-deps"
+        ],
+        "fileFilters": [
+          "trevrpc-kotlin/gradle/verification-metadata.xml",
+          "trevrpc-kotlin/gradle/deps.json"
+        ],
         "executionMode": "branch"
       }
     },
