@@ -10,7 +10,7 @@
   "allowedCommands": [
     "^fix-hash \\.#trevrpc-go$",
     "^npm audit fix --prefix trevrpc-js$",
-    "^trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --write-verification-metadata sha256 build$",
+    "^trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --write-verification-metadata sha256 testClasses$",
     "^nix run \\.#update-kotlin-deps$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
@@ -68,7 +68,7 @@
       "matchManagers": ["gradle"],
       "postUpgradeTasks": {
         "commands": [
-          "trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --write-verification-metadata sha256 build",
+          "trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --write-verification-metadata sha256 testClasses",
           "nix run .#update-kotlin-deps"
         ],
         "fileFilters": [
