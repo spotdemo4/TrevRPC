@@ -159,7 +159,7 @@
           update-kotlin-deps = {
             packages = [ pkgs.oxfmt ];
             script = ''
-              ${self.packages.${system}.trevrpc-kotlin.mitmCache.updateScript}
+              USE_BWRAP=0 ${self.packages.${system}.trevrpc-kotlin.mitmCache.updateScript}
               oxfmt --write trevrpc-kotlin/gradle/deps.json
             '';
           };
