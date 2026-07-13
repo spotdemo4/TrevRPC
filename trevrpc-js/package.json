@@ -45,10 +45,7 @@
     }
   },
   "scripts": {
-    "bench:native": "node bench/rpc_comparison_native.js",
     "bench:peer": "node bench/trevrpc-bench-peer.js",
-    "profile:completion-worker:native": "node bench/completion_worker_profile_native.js",
-    "profile:native": "node bench/rpc_profile_native.js",
     "build:native": "TREVRPC_NODE_TEST_HOOKS=OFF npm run build:native:cmake",
     "build:native:test": "TREVRPC_NODE_TEST_HOOKS=ON npm run build:native:cmake",
     "build:native:cmake": "cmake -S native -B build/native -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release} -DTREVRPC_NODE_TEST_HOOKS=${TREVRPC_NODE_TEST_HOOKS:?} ${TREVRPC_C_ROOT:+-DTREVRPC_C_ROOT=$TREVRPC_C_ROOT} ${NODE_INCLUDE_DIR:+-DNODE_INCLUDE_DIR=$NODE_INCLUDE_DIR} && cmake --build build/native --config ${CMAKE_BUILD_TYPE:-Release}",

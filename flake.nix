@@ -202,40 +202,6 @@
             }
           );
 
-          rust-matrix = pkgs.rustPlatform.buildRustPackage (
-            final: with pkgs.lib; {
-              pname = "trevrpc-rust-matrix";
-              version = "0.1.0";
-
-              src = fileset.toSource {
-                root = ./.;
-                fileset = fileset.unions [
-                  ./bench/rust-matrix
-                  ./testdata/wire-golden-vectors.txt
-                  ./trevrpc-rust
-                ];
-              };
-              sourceRoot = "${final.src.name}/bench/rust-matrix";
-              cargoLock.lockFile = ./bench/rust-matrix/Cargo.lock;
-              nativeBuildInputs = with pkgs; [ protobuf ];
-
-              installPhase = ''
-                runHook preInstall
-                peer=$(find target -path '*/release/trevrpc-rust-matrix-peer' -type f -perm -0100 | head -n1)
-                reporter=$(find target -path '*/release/trevrpc-rust-matrix-report' -type f -perm -0100 | head -n1)
-                install -Dm755 "$peer" $out/bin/trevrpc-rust-matrix-peer
-                install -Dm755 "$reporter" $out/bin/trevrpc-rust-matrix-report
-                runHook postInstall
-              '';
-
-              meta = {
-                description = "Controlled Rust RPC benchmark matrix for TrevRPC";
-                license = licenses.mit;
-                platforms = platforms.linux;
-              };
-            }
-          );
-
           trevrpc-c = pkgs.stdenv.mkDerivation (
             final: with pkgs.lib; {
               pname = "trevrpc-c";
@@ -478,7 +444,7 @@
                 ];
               };
               sourceRoot = "${final.src.name}/trevrpc-go";
-              vendorHash = "sha256-fRQKsZlO4lK4uJ1KKvNLqTO2F+RvckLz8gV8bNVfaHg=";
+              vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
               subPackages = [
                 "cmd/protoc-gen-trevrpc-go"
                 "cmd/trevrpc-bench-peer"
@@ -750,28 +716,6 @@
               touch $out
             '';
 
-          rust-matrix = self.packages.${system}.rust-matrix.overrideAttrs {
-            installPhase = ''
-              touch $out
-            '';
-          };
-
-          rust-matrix-harness =
-            pkgs.runCommand "trevrpc-rust-matrix-harness-check"
-              {
-                nativeBuildInputs = with pkgs; [
-                  jq
-                  openssl
-                ];
-              }
-              ''
-                PEER=${self.packages.${system}.rust-matrix}/bin/trevrpc-rust-matrix-peer \
-                  bash ${./bench/test_rust_matrix_peer.sh}
-                REPORTER=${self.packages.${system}.rust-matrix}/bin/trevrpc-rust-matrix-report \
-                  bash ${./bench/test_run_rust_matrix_report.sh}
-                touch $out
-              '';
-
           c = self.packages.${system}.trevrpc-c.overrideAttrs {
             installPhase = ''
               mkdir -p "$out" "$dev" "$lib"
@@ -866,7 +810,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-fRQKsZlO4lK4uJ1KKvNLqTO2F+RvckLz8gV8bNVfaHg=";
+                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
                 subPackages = [ "cmd/trevrpc-xruntime-go" ];
 
                 meta.mainProgram = "trevrpc-xruntime-go";
@@ -891,7 +835,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-fRQKsZlO4lK4uJ1KKvNLqTO2F+RvckLz8gV8bNVfaHg=";
+                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
                 subPackages = [ "examples/greeter_server" ];
 
                 meta.mainProgram = "greeter_server";
@@ -901,7 +845,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-fRQKsZlO4lK4uJ1KKvNLqTO2F+RvckLz8gV8bNVfaHg=";
+                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
                 subPackages = [ "cmd/trevrpc-browser-lifecycle-go" ];
 
                 meta.mainProgram = "trevrpc-browser-lifecycle-go";

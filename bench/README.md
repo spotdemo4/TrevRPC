@@ -41,8 +41,9 @@ windows validate interoperability and the harness only; they are not suitable
 for performance comparisons.
 
 Compilation and dependency realization must happen before a publishable run.
-Run measurements on `ssh bench`, keep the host otherwise idle, and record the
-campaign and environment in `wiki/Benchmarks.md`.
+Run measurements on `ssh bench` and keep the host otherwise idle. Retain the
+complete output directory so its manifest, samples, raw peer logs, and generated
+reports remain reproducible.
 
 ## Artifacts
 

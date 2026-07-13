@@ -324,57 +324,13 @@ if(TREVRPC_BUILD_RUNTIME AND TREVRPC_BUILD_EXAMPLES)
 endif()
 
 if(TREVRPC_BUILD_BENCHMARKS)
-    add_executable(trevrpc_wire_bench bench/wire_bench.c)
-    target_include_directories(trevrpc_wire_bench PRIVATE src)
-    target_link_libraries(trevrpc_wire_bench PRIVATE trevrpc_core)
-    trevrpc_c_warnings(trevrpc_wire_bench)
-    trevrpc_c_sanitizers(trevrpc_wire_bench)
-
     if(TREVRPC_BUILD_RUNTIME)
         add_executable(trevrpc_bench_peer_c bench/trevrpc_bench_peer.c)
         set_target_properties(trevrpc_bench_peer_c PROPERTIES OUTPUT_NAME "trevrpc-bench-peer-c")
         target_link_libraries(trevrpc_bench_peer_c PRIVATE trevrpc_benchmark_generated)
         trevrpc_c_warnings(trevrpc_bench_peer_c)
         trevrpc_c_sanitizers(trevrpc_bench_peer_c)
-
-        add_executable(trevrpc_rpc_comparison_bench
-            bench/rpc_comparison_bench.c
-            "${trevrpc_generated_pb_c}"
-            "${trevrpc_generated_trevrpc_c}"
-        )
-        add_dependencies(trevrpc_rpc_comparison_bench trevrpc_msquic_test_certificates)
-        target_compile_definitions(trevrpc_rpc_comparison_bench PRIVATE
-            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
-            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
-        )
-        target_include_directories(trevrpc_rpc_comparison_bench PRIVATE src "${trevrpc_generated_test_dir}")
-        target_link_libraries(trevrpc_rpc_comparison_bench PRIVATE trevrpc protobuf-c)
-        trevrpc_c_warnings(trevrpc_rpc_comparison_bench)
-        trevrpc_c_sanitizers(trevrpc_rpc_comparison_bench)
     endif()
-endif()
-
-if((TREVRPC_BUILD_TESTS OR TREVRPC_BUILD_BENCHMARKS) AND TREVRPC_BUILD_RUNTIME AND TREVRPC_BUILD_MSQUIC)
-    add_executable(trevrpc_buffering_memory_bench bench/buffering_memory_bench.c)
-    add_dependencies(trevrpc_buffering_memory_bench trevrpc_msquic_test_certificates)
-    target_compile_definitions(trevrpc_buffering_memory_bench PRIVATE
-        TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
-        TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
-    )
-    target_link_libraries(trevrpc_buffering_memory_bench PRIVATE trevrpc)
-    trevrpc_c_warnings(trevrpc_buffering_memory_bench)
-    trevrpc_c_sanitizers(trevrpc_buffering_memory_bench)
-
-    add_custom_target(trevrpc_buffering_soak
-        COMMAND ${CMAKE_COMMAND} -E env
-            "BINARY=$<TARGET_FILE:trevrpc_buffering_memory_bench>"
-            "OUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/buffering-soak"
-            "MATRIX=soak"
-            "RUNS=1"
-            bash "${CMAKE_CURRENT_SOURCE_DIR}/../bench/run_c_buffering_matrix.sh"
-        DEPENDS trevrpc_buffering_memory_bench
-        USES_TERMINAL
-    )
 endif()
 
 install(TARGETS ${trevrpc_install_targets}
@@ -501,6 +457,16 @@ if(TREVRPC_BUILD_TESTS)
 
         add_test(NAME trevrpc_buffering_config COMMAND trevrpc_buffering_config_test)
 
+        add_executable(trevrpc_buffering_memory_test tests/buffering_memory_test.c)
+        add_dependencies(trevrpc_buffering_memory_test trevrpc_msquic_test_certificates)
+        target_compile_definitions(trevrpc_buffering_memory_test PRIVATE
+            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
+            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
+        )
+        target_link_libraries(trevrpc_buffering_memory_test PRIVATE trevrpc)
+        trevrpc_c_warnings(trevrpc_buffering_memory_test)
+        trevrpc_c_sanitizers(trevrpc_buffering_memory_test)
+
         set(trevrpc_buffering_fast_cases
             "safe-slow-reader|slow-reader|4|4096|16384|262144|65536|1"
             "safe-stalled-handler|stalled-handler|8|32768|4096|524288|0|10"
@@ -513,7 +479,7 @@ if(TREVRPC_BUILD_TESTS)
             string(REPLACE "|" ";" trevrpc_buffering_args "${trevrpc_buffering_case}")
             list(POP_FRONT trevrpc_buffering_args trevrpc_buffering_name)
             add_test(NAME trevrpc_buffering_memory_${trevrpc_buffering_name}
-                COMMAND trevrpc_buffering_memory_bench ${trevrpc_buffering_args}
+                COMMAND trevrpc_buffering_memory_test ${trevrpc_buffering_args}
             )
             set_tests_properties(trevrpc_buffering_memory_${trevrpc_buffering_name}
                 PROPERTIES LABELS "buffering" TIMEOUT 30

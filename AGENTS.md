@@ -5,12 +5,6 @@
 - `nix fmt` must be used for formatting.
 - `nix flake check` must pass before considering tasks completed. Intent-to-add (`git add -N`) new files so `nix flake check` can see them.
 
-## Benchmark Runs
-
-- Whenever you run a benchmark, incrementally update `wiki/Benchmarks.md` in the same change. Preserve existing benchmark history and only replace or append the sections that correspond to the benchmark that was run.
-- Record enough context for the result to be reproducible: command or script, timestamp, relevant settings, environment, result tables, failed samples, and notes about any anomalies.
-- If a benchmark run is intentionally exploratory and should not update the published benchmark table, still add a brief note explaining why the result was not recorded.
-
 ## Project Snapshot
 
 TrevRPC is a Remote Procedure Call (RPC) framework like gRPC, but uses QUIC as the transport protocol instead of HTTP/2.
