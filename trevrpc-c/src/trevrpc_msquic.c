@@ -133,6 +133,8 @@ struct trevrpc_msquic_listener {
     trevrpc_msquic_conn_node* conn_head;
     trevrpc_msquic_conn_node* conn_tail;
     size_t active_callbacks;
+    size_t shutdown_waiters;
+    bool shutdown_in_progress;
     bool closed;
     int err;
 };
@@ -1307,9 +1309,15 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
 
     trevrpc_msquic_listener_shutdown(listener);
 
-    if (listener->listener != NULL) {
-        TrevMsQuic->ListenerClose(listener->listener);
-        listener->listener = NULL;
+    pthread_mutex_lock(&listener->mutex);
+    while (listener->shutdown_waiters > 0) {
+        pthread_cond_wait(&listener->cond, &listener->mutex);
+    }
+    HQUIC handle = listener->listener;
+    listener->listener = NULL;
+    pthread_mutex_unlock(&listener->mutex);
+    if (handle != NULL) {
+        TrevMsQuic->ListenerClose(handle);
     }
 
     pthread_mutex_lock(&listener->mutex);
@@ -1350,13 +1358,29 @@ void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener) {
         return;
     }
 
+    HQUIC handle = NULL;
     pthread_mutex_lock(&listener->mutex);
-    listener->closed = true;
-    pthread_cond_broadcast(&listener->cond);
+    if (!listener->closed) {
+        listener->closed = true;
+        handle = listener->listener;
+        listener->shutdown_in_progress = handle != NULL;
+        pthread_cond_broadcast(&listener->cond);
+    } else if (listener->shutdown_in_progress) {
+        listener->shutdown_waiters++;
+        while (listener->shutdown_in_progress) {
+            pthread_cond_wait(&listener->cond, &listener->mutex);
+        }
+        listener->shutdown_waiters--;
+        pthread_cond_broadcast(&listener->cond);
+    }
     pthread_mutex_unlock(&listener->mutex);
 
-    if (listener->listener != NULL) {
-        TrevMsQuic->ListenerStop(listener->listener);
+    if (handle != NULL) {
+        TrevMsQuic->ListenerStop(handle);
+        pthread_mutex_lock(&listener->mutex);
+        listener->shutdown_in_progress = false;
+        pthread_cond_broadcast(&listener->cond);
+        pthread_mutex_unlock(&listener->mutex);
     }
 }
 

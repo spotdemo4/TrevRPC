@@ -55,6 +55,13 @@ typedef struct accept_args {
     int result;
 } accept_args;
 
+typedef struct listener_shutdown_args {
+    trevrpc_msquic_listener* listener;
+    pthread_mutex_t* mutex;
+    pthread_cond_t* cond;
+    bool* start;
+} listener_shutdown_args;
+
 typedef struct stream_args {
     trevrpc_msquic_conn* conn;
     trevrpc_msquic_stream* stream;
@@ -182,6 +189,17 @@ static void* accept_conn_thread(void* arg) {
     return NULL;
 }
 
+static void* listener_shutdown_thread(void* arg) {
+    listener_shutdown_args* args = arg;
+    pthread_mutex_lock(args->mutex);
+    while (!*args->start) {
+        pthread_cond_wait(args->cond, args->mutex);
+    }
+    pthread_mutex_unlock(args->mutex);
+    trevrpc_msquic_listener_shutdown(args->listener);
+    return NULL;
+}
+
 static void* accept_stream_thread(void* arg) {
     stream_args* args = arg;
     args->result = trevrpc_msquic_conn_accept_stream(args->conn, &args->stream);
@@ -290,6 +308,51 @@ cleanup:
 static int connect_pair(
     trevrpc_msquic_listener** out_listener, trevrpc_msquic_conn** out_client, trevrpc_msquic_conn** out_server) {
     return connect_pair_with_config(&test_config, out_listener, out_client, out_server);
+}
+
+static int test_listener_shutdown_is_concurrent_and_idempotent(void) {
+    enum { shutdown_thread_count = 16 };
+    int result = 1;
+    trevrpc_msquic_listener* listener = NULL;
+    pthread_t threads[shutdown_thread_count] = {0};
+    size_t threads_started = 0;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    bool start = false;
+    listener_shutdown_args args = {
+        .mutex = &mutex,
+        .cond = &cond,
+        .start = &start,
+    };
+
+    CHECK_GOTO(trevrpc_msquic_listen("127.0.0.1", 0, &test_config, &listener) == 0);
+    args.listener = listener;
+    for (; threads_started < shutdown_thread_count; threads_started++) {
+        CHECK_GOTO(pthread_create(&threads[threads_started], NULL, listener_shutdown_thread, &args) == 0);
+    }
+
+    pthread_mutex_lock(&mutex);
+    start = true;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&mutex);
+    for (size_t i = 0; i < threads_started; i++) {
+        CHECK_GOTO(pthread_join(threads[i], NULL) == 0);
+    }
+    threads_started = 0;
+    result = 0;
+
+cleanup:
+    pthread_mutex_lock(&mutex);
+    start = true;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&mutex);
+    for (size_t i = 0; i < threads_started; i++) {
+        (void)pthread_join(threads[i], NULL);
+    }
+    trevrpc_msquic_listener_close(listener);
+    pthread_cond_destroy(&cond);
+    pthread_mutex_destroy(&mutex);
+    return result;
 }
 
 static int open_stream_pair(trevrpc_msquic_conn* client,
@@ -2514,6 +2577,9 @@ cleanup:
 int main(void) {
     int result = 1;
 
+    if (test_listener_shutdown_is_concurrent_and_idempotent() != 0) {
+        goto cleanup;
+    }
     if (test_stream_reset_unblocks_peer_read() != 0) {
         goto cleanup;
     }
