@@ -2463,13 +2463,63 @@ func TestWebTransportInitialRequestTimeoutRejectsPartialHeader(t *testing.T) {
 	expectPreHandlerMetrics(t, metrics, CodeDeadlineExceeded)
 }
 
+func TestServerTransportReadsCancelWithContext(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.InitialRequestTimeout = time.Minute
+	server.SetOptions(options)
+
+	tests := []struct {
+		name string
+		read func(context.Context, rpcStream) error
+	}{
+		{
+			name: "initial request",
+			read: func(ctx context.Context, stream rpcStream) error {
+				return readInitialRequestFrame(ctx, server, stream, &RpcRequest{})
+			},
+		},
+		{
+			name: "unary request end",
+			read: func(ctx context.Context, stream rpcStream) error {
+				return drainUnaryRequestEnd(ctx, server, stream)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stream := newContextCancellableRPCStream()
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- test.read(ctx, stream) }()
+
+			select {
+			case <-stream.readStarted:
+			case <-time.After(testTimeout):
+				t.Fatal("transport read did not start")
+			}
+			cancel()
+
+			select {
+			case err := <-done:
+				if code := StatusFromError(err).Code; !errors.Is(err, context.Canceled) && code != CodeCancelled {
+					t.Fatalf("expected cancelled, got %v (%v)", code, err)
+				}
+			case <-time.After(testTimeout):
+				t.Fatal("transport read did not stop after context cancellation")
+			}
+		})
+	}
+}
+
 func TestQuicLargePartialInitialBodyDoesNotHoldRequestPermit(t *testing.T) {
 	const largeFrameSize = 1 << 30
 	running := startTestQUICServer(t, func(server *Server) {
 		options := DefaultServerOptions()
 		options.MaxFrameSize = largeFrameSize
 		options.MaxConcurrentRequests = 1
-		options.InitialRequestTimeout = testTimeout
+		options.InitialRequestTimeout = time.Minute
 		server.SetOptions(options)
 	})
 	conn := connectTestQUICClient(t, running)
@@ -2495,6 +2545,7 @@ func TestQuicLargePartialInitialBodyDoesNotHoldRequestPermit(t *testing.T) {
 	if response.Value != "hello, after partial" {
 		t.Fatalf("unexpected response after partial initial frame: %q", response.Value)
 	}
+	running.stop(t)
 }
 
 func TestQuicOversizedInitialFrameIsRejectedBeforeBody(t *testing.T) {
@@ -2894,6 +2945,43 @@ func (s contextBlockingFrameStream) Recv() (*RpcStreamFrame, error) {
 }
 
 func (contextBlockingFrameStream) Close() error { return nil }
+
+type contextCancellableRPCStream struct {
+	readStarted   chan struct{}
+	readCancelled chan struct{}
+	startOnce     sync.Once
+	cancelOnce    sync.Once
+}
+
+func newContextCancellableRPCStream() *contextCancellableRPCStream {
+	return &contextCancellableRPCStream{
+		readStarted:   make(chan struct{}),
+		readCancelled: make(chan struct{}),
+	}
+}
+
+func (s *contextCancellableRPCStream) Read([]byte) (int, error) {
+	s.startOnce.Do(func() { close(s.readStarted) })
+	<-s.readCancelled
+	return 0, errors.New("transport read cancelled")
+}
+
+func (*contextCancellableRPCStream) Write(data []byte) (int, error) { return len(data), nil }
+func (*contextCancellableRPCStream) Close() error                   { return nil }
+
+func (s *contextCancellableRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.cancelOnce.Do(func() { close(s.readCancelled) })
+		case <-done:
+		}
+	}()
+
+	var stopOnce sync.Once
+	return func() { stopOnce.Do(func() { close(done) }) }
+}
 
 type uploadWaitingTransport struct{}
 
