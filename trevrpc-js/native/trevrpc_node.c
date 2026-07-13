@@ -2314,6 +2314,7 @@ static void* native_completion_worker_main(void* data) {
         pthread_mutex_lock(&runtime->mutex);
         native_completion_active_remove_locked(runtime, work);
         bool stopping = runtime->stopping;
+        bool queued_for_retry = false;
         int retry_err = 0;
         if (work->base->retry && !stopping) {
             work->base->retry = false;
@@ -2326,9 +2327,10 @@ static void* native_completion_worker_main(void* data) {
             work->retry_due_nanos =
                 now > UINT64_MAX - work->retry_delay_nanos ? UINT64_MAX : now + work->retry_delay_nanos;
             retry_err = native_completion_retry_heap_push_locked(runtime, work);
+            queued_for_retry = retry_err == 0;
         }
         pthread_mutex_unlock(&runtime->mutex);
-        if (work->base->retry == false && retry_err == 0 && !stopping && work->retry_due_nanos != 0) {
+        if (queued_for_retry) {
             continue;
         }
         work->retry_due_nanos = 0;
