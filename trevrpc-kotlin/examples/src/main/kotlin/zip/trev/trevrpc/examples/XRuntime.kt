@@ -58,7 +58,7 @@ fun main(args: Array<String>) {
     try {
         runBlocking { run(parseCli(args)) }
     } catch (error: Throwable) {
-        System.err.println(error.message ?: error.javaClass.name)
+        error.printStackTrace()
         exitProcess(1)
     }
 }
@@ -204,8 +204,11 @@ private suspend fun runClientIteration(
     try {
         val unauthenticated = GreeterClient(connection.transport, CallOptions(timeout = CROSS_RUNTIME_CALL_TIMEOUT))
         val authError = runCatching { unauthenticated.sayHello(request("unauthenticated")) }.exceptionOrNull()
-        check(authError is TrevRpcException && authError.status.code == Code.UNAUTHENTICATED) {
-            "client iteration $iteration: unauthenticated call returned $authError"
+        if (authError !is TrevRpcException || authError.status.code != Code.UNAUTHENTICATED) {
+            throw IllegalStateException(
+                "client iteration $iteration: unauthenticated call returned $authError",
+                authError,
+            )
         }
 
         val client =
