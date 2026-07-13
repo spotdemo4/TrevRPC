@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "campaign_id": "native-quic-all-languages",
+  "repetitions": 5,
+  "peers": [
+    {
+      "id": "c",
+      "command": ["trevrpc-bench-peer-c"]
+    },
+    {
+      "id": "cpp",
+      "command": ["trevrpc-bench-peer-cpp"]
+    },
+    {
+      "id": "go",
+      "command": ["trevrpc-bench-peer-go"]
+    },
+    {
+      "id": "js",
+      "command": ["trevrpc-bench-peer-js"]
+    },
+    {
+      "id": "kotlin",
+      "command": ["trevrpc-bench-peer-kotlin"]
+    },
+    {
+      "id": "rust",
+      "command": ["trevrpc-bench-peer-rust"]
+    }
+  ],
+  "cells": [
+    {
+      "id": "c-c",
+      "client": "c",
+      "server": "c"
+    },
+    {
+      "id": "cpp-cpp",
+      "client": "cpp",
+      "server": "cpp"
+    },
+    {
+      "id": "go-go",
+      "client": "go",
+      "server": "go"
+    },
+    {
+      "id": "js-js",
+      "client": "js",
+      "server": "js"
+    },
+    {
+      "id": "kotlin-kotlin",
+      "client": "kotlin",
+      "server": "kotlin"
+    },
+    {
+      "id": "rust-rust",
+      "client": "rust",
+      "server": "rust"
+    }
+  ],
+  "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
+  "concurrencies": [1, 8, 32, 64],
+  "timing": {
+    "warmup_ms": 2000,
+    "measurement_ms": 10000
+  },
+  "workload": {
+    "request_bytes": 256,
+    "response_bytes": 256,
+    "messages_per_stream": 128
+  },
+  "startup_timeout_ms": 30000,
+  "drain_timeout_ms": 30000
+}

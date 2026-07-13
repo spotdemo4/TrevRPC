@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "campaign_id": "native-quic-smoke",
+  "repetitions": 1,
+  "peers": [
+    {
+      "id": "rust",
+      "command": ["trevrpc-bench-peer-rust"]
+    }
+  ],
+  "cells": [
+    {
+      "id": "rust-rust",
+      "client": "rust",
+      "server": "rust"
+    }
+  ],
+  "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
+  "concurrencies": [1],
+  "timing": {
+    "warmup_ms": 100,
+    "measurement_ms": 1000
+  },
+  "workload": {
+    "request_bytes": 16,
+    "response_bytes": 16,
+    "messages_per_stream": 8
+  },
+  "startup_timeout_ms": 30000,
+  "drain_timeout_ms": 30000
+}

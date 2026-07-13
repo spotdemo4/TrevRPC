@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "campaign_id": "native-quic-cross-language-smoke",
+  "repetitions": 1,
+  "peers": [
+    {
+      "id": "c",
+      "command": ["trevrpc-bench-peer-c"]
+    },
+    {
+      "id": "cpp",
+      "command": ["trevrpc-bench-peer-cpp"]
+    },
+    {
+      "id": "go",
+      "command": ["trevrpc-bench-peer-go"]
+    },
+    {
+      "id": "js",
+      "command": ["trevrpc-bench-peer-js"]
+    },
+    {
+      "id": "kotlin",
+      "command": ["trevrpc-bench-peer-kotlin"]
+    },
+    {
+      "id": "rust",
+      "command": ["trevrpc-bench-peer-rust"]
+    }
+  ],
+  "cells": [
+    {
+      "id": "c-stack",
+      "client": "c",
+      "server": "c"
+    },
+    {
+      "id": "cpp-client",
+      "client": "cpp",
+      "server": "c"
+    },
+    {
+      "id": "go-client",
+      "client": "go",
+      "server": "c"
+    },
+    {
+      "id": "js-client",
+      "client": "js",
+      "server": "c"
+    },
+    {
+      "id": "kotlin-client",
+      "client": "kotlin",
+      "server": "c"
+    },
+    {
+      "id": "rust-client",
+      "client": "rust",
+      "server": "c"
+    },
+    {
+      "id": "cpp-server",
+      "client": "c",
+      "server": "cpp"
+    },
+    {
+      "id": "go-server",
+      "client": "c",
+      "server": "go"
+    },
+    {
+      "id": "js-server",
+      "client": "c",
+      "server": "js"
+    },
+    {
+      "id": "kotlin-server",
+      "client": "c",
+      "server": "kotlin"
+    },
+    {
+      "id": "rust-server",
+      "client": "c",
+      "server": "rust"
+    }
+  ],
+  "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
+  "concurrencies": [1],
+  "timing": {
+    "warmup_ms": 50,
+    "measurement_ms": 250
+  },
+  "workload": {
+    "request_bytes": 16,
+    "response_bytes": 16,
+    "messages_per_stream": 4
+  },
+  "startup_timeout_ms": 30000,
+  "drain_timeout_ms": 30000
+}

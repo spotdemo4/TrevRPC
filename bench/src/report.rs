@@ -1,0 +1,370 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::fs;
+use std::path::Path;
+
+use serde::Deserialize;
+
+use crate::campaign::Campaign;
+use crate::protocol::histogram_quantiles;
+use crate::runner::SampleRecord;
+use crate::{BoxError, SCHEMA_VERSION};
+
+#[derive(Deserialize)]
+struct ReportManifest {
+    schema_version: u32,
+    campaign: Campaign,
+}
+
+#[derive(Debug)]
+struct Aggregate<'a> {
+    cell_id: String,
+    client_peer: String,
+    server_peer: String,
+    rpc_kind: String,
+    concurrency: usize,
+    samples: Vec<&'a SampleRecord>,
+}
+
+impl Aggregate<'_> {
+    fn runs(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn p50_ns(&self) -> u64 {
+        median_u64(self.samples.iter().map(|sample| sample.latency_p50_ns))
+    }
+
+    fn p99_ns(&self) -> u64 {
+        median_u64(self.samples.iter().map(|sample| sample.latency_p99_ns))
+    }
+
+    fn throughput(&self) -> f64 {
+        median_f64(
+            self.samples
+                .iter()
+                .map(|sample| sample.operations_per_second),
+        )
+    }
+
+    fn client_cpu_ns_per_op(&self) -> f64 {
+        median_f64(
+            self.samples
+                .iter()
+                .map(|sample| sample.client.cpu_ns as f64 / sample.completed as f64),
+        )
+    }
+
+    fn server_cpu_ns_per_op(&self) -> f64 {
+        median_f64(
+            self.samples
+                .iter()
+                .map(|sample| sample.server.cpu_ns as f64 / sample.completed as f64),
+        )
+    }
+
+    fn client_peak_rss(&self) -> u64 {
+        median_u64(
+            self.samples
+                .iter()
+                .map(|sample| sample.client.peak_rss_bytes),
+        )
+    }
+
+    fn server_peak_rss(&self) -> u64 {
+        median_u64(
+            self.samples
+                .iter()
+                .map(|sample| sample.server.peak_rss_bytes),
+        )
+    }
+
+    fn label(&self) -> String {
+        format!("{} {} c{}", self.cell_id, self.rpc_kind, self.concurrency)
+    }
+}
+
+pub fn generate(output: &Path) -> Result<(), BoxError> {
+    let manifest: ReportManifest =
+        serde_json::from_str(&fs::read_to_string(output.join("manifest.json"))?)?;
+    if manifest.schema_version != SCHEMA_VERSION {
+        return Err("unsupported benchmark manifest schema".into());
+    }
+    let samples = read_samples(&output.join("samples.jsonl"))?;
+    validate_samples(&manifest.campaign, &samples)?;
+    let aggregates = aggregate(&samples);
+    write_csv(&output.join("aggregate.csv"), &aggregates)?;
+    write_markdown(&output.join("report.md"), &aggregates)?;
+    write_html(&output.join("report.html"), &aggregates)?;
+    Ok(())
+}
+
+fn validate_samples(campaign: &Campaign, samples: &[SampleRecord]) -> Result<(), BoxError> {
+    campaign.validate()?;
+    let expected_count = usize::try_from(campaign.repetitions)?
+        .saturating_mul(campaign.cells.len())
+        .saturating_mul(campaign.rpc_kinds.len())
+        .saturating_mul(campaign.concurrencies.len());
+    if samples.len() != expected_count {
+        return Err(format!(
+            "recorded {} samples, expected {expected_count}",
+            samples.len()
+        )
+        .into());
+    }
+
+    let mut sample_ids = BTreeSet::new();
+    let mut cells = BTreeSet::new();
+    for sample in samples {
+        if sample.schema_version != SCHEMA_VERSION || sample.campaign_id != campaign.campaign_id {
+            return Err(format!(
+                "sample {} has inconsistent schema or campaign",
+                sample.sample_id
+            )
+            .into());
+        }
+        if !sample_ids.insert(sample.sample_id.as_str()) {
+            return Err(format!("duplicate sample id {}", sample.sample_id).into());
+        }
+        let cell = campaign
+            .cells
+            .iter()
+            .find(|cell| cell.id == sample.cell_id)
+            .ok_or_else(|| format!("sample {} references an unknown cell", sample.sample_id))?;
+        if sample.client_peer != cell.client
+            || sample.server_peer != cell.server
+            || !campaign.rpc_kinds.contains(&sample.rpc_kind)
+            || !campaign.concurrencies.contains(&sample.concurrency)
+            || sample.repetition == 0
+            || sample.repetition > campaign.repetitions
+        {
+            return Err(
+                format!("sample {} does not match its matrix cell", sample.sample_id).into(),
+            );
+        }
+        if sample.warmup_ms != campaign.timing.warmup_ms
+            || sample.measurement_ms != campaign.timing.measurement_ms
+            || sample.request_bytes != campaign.workload.request_bytes
+            || sample.response_bytes != campaign.workload.response_bytes
+            || sample.messages_per_stream != campaign.workload.messages_per_stream
+            || sample.completed == 0
+            || sample.failed != 0
+        {
+            return Err(format!(
+                "sample {} mixes immutable workload settings",
+                sample.sample_id
+            )
+            .into());
+        }
+        let histogram = histogram_quantiles(&sample.histogram)?;
+        if histogram
+            != (
+                sample.completed,
+                sample.latency_p50_ns,
+                sample.latency_p99_ns,
+                sample.latency_max_ns,
+            )
+        {
+            return Err(format!(
+                "sample {} has inconsistent histogram data",
+                sample.sample_id
+            )
+            .into());
+        }
+        let expected_throughput =
+            sample.completed as f64 * 1_000_000_000.0 / sample.admission_ns as f64;
+        let tolerance = expected_throughput.abs().max(1.0) * 1e-9;
+        if (sample.operations_per_second - expected_throughput).abs() > tolerance {
+            return Err(format!("sample {} has inconsistent throughput", sample.sample_id).into());
+        }
+        if !cells.insert((
+            sample.cell_id.as_str(),
+            sample.rpc_kind,
+            sample.concurrency,
+            sample.repetition,
+        )) {
+            return Err(format!("duplicate matrix cell for sample {}", sample.sample_id).into());
+        }
+    }
+    Ok(())
+}
+
+fn read_samples(path: &Path) -> Result<Vec<SampleRecord>, BoxError> {
+    let input = fs::read_to_string(path)?;
+    let mut samples = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let sample = serde_json::from_str(line)
+            .map_err(|error| format!("invalid sample line {}: {error}", index + 1))?;
+        samples.push(sample);
+    }
+    if samples.is_empty() {
+        return Err("samples file is empty".into());
+    }
+    Ok(samples)
+}
+
+fn aggregate(samples: &[SampleRecord]) -> Vec<Aggregate<'_>> {
+    let mut groups: BTreeMap<(String, String, String, String, usize), Vec<&SampleRecord>> =
+        BTreeMap::new();
+    for sample in samples {
+        groups
+            .entry((
+                sample.cell_id.clone(),
+                sample.client_peer.clone(),
+                sample.server_peer.clone(),
+                sample.rpc_kind.as_str().to_owned(),
+                sample.concurrency,
+            ))
+            .or_default()
+            .push(sample);
+    }
+    groups
+        .into_iter()
+        .map(
+            |((cell_id, client_peer, server_peer, rpc_kind, concurrency), samples)| Aggregate {
+                cell_id,
+                client_peer,
+                server_peer,
+                rpc_kind,
+                concurrency,
+                samples,
+            },
+        )
+        .collect()
+}
+
+fn write_csv(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError> {
+    let mut output = String::from(
+        "cell,client,server,rpc_kind,concurrency,runs,latency_p50_ns_median,latency_p99_ns_median,operations_per_second_median,client_cpu_ns_per_op_median,server_cpu_ns_per_op_median,client_peak_rss_bytes_median,server_peak_rss_bytes_median\n",
+    );
+    for aggregate in aggregates {
+        writeln!(
+            output,
+            "{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{}",
+            aggregate.cell_id,
+            aggregate.client_peer,
+            aggregate.server_peer,
+            aggregate.rpc_kind,
+            aggregate.concurrency,
+            aggregate.runs(),
+            aggregate.p50_ns(),
+            aggregate.p99_ns(),
+            aggregate.throughput(),
+            aggregate.client_cpu_ns_per_op(),
+            aggregate.server_cpu_ns_per_op(),
+            aggregate.client_peak_rss(),
+            aggregate.server_peak_rss(),
+        )?;
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn write_markdown(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError> {
+    let mut output = String::from(
+        "# TrevRPC Benchmark\n\n| Cell | Client | Server | RPC | Concurrency | Runs | p50 us | p99 us | ops/s | Client CPU us/op | Server CPU us/op | Client peak MiB | Server peak MiB |\n| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    for aggregate in aggregates {
+        writeln!(
+            output,
+            "| `{}` | `{}` | `{}` | `{}` | {} | {} | {:.3} | {:.3} | {:.0} | {:.3} | {:.3} | {:.2} | {:.2} |",
+            aggregate.cell_id,
+            aggregate.client_peer,
+            aggregate.server_peer,
+            aggregate.rpc_kind,
+            aggregate.concurrency,
+            aggregate.runs(),
+            aggregate.p50_ns() as f64 / 1000.0,
+            aggregate.p99_ns() as f64 / 1000.0,
+            aggregate.throughput(),
+            aggregate.client_cpu_ns_per_op() / 1000.0,
+            aggregate.server_cpu_ns_per_op() / 1000.0,
+            aggregate.client_peak_rss() as f64 / 1024.0 / 1024.0,
+            aggregate.server_peak_rss() as f64 / 1024.0 / 1024.0,
+        )?;
+    }
+    output.push_str("\nLatency is complete bounded-RPC latency under closed-loop load. Throughput uses the fixed admission window; connection setup and warmup are excluded. CPU and RSS cover the direct peer processes and are sampled externally through procfs.\n");
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn write_html(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError> {
+    let throughput_max = aggregates
+        .iter()
+        .map(Aggregate::throughput)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let p99_max = aggregates
+        .iter()
+        .map(|aggregate| aggregate.p99_ns() as f64 / 1000.0)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let height = 70 + aggregates.len() * 30;
+    let mut throughput_bars = String::new();
+    let mut latency_bars = String::new();
+    for (index, aggregate) in aggregates.iter().enumerate() {
+        let y = 35 + index * 30;
+        let throughput_width = aggregate.throughput() / throughput_max * 500.0;
+        let p99_us = aggregate.p99_ns() as f64 / 1000.0;
+        let latency_width = p99_us / p99_max * 500.0;
+        let label = html_escape(&aggregate.label());
+        writeln!(
+            throughput_bars,
+            "<text x=\"0\" y=\"{}\">{}</text><rect x=\"230\" y=\"{}\" width=\"{:.1}\" height=\"18\"/><text x=\"{:.1}\" y=\"{}\">{:.0}</text>",
+            y + 14,
+            label,
+            y,
+            throughput_width,
+            238.0 + throughput_width,
+            y + 14,
+            aggregate.throughput()
+        )?;
+        writeln!(
+            latency_bars,
+            "<text x=\"0\" y=\"{}\">{}</text><rect x=\"230\" y=\"{}\" width=\"{:.1}\" height=\"18\"/><text x=\"{:.1}\" y=\"{}\">{:.3} us</text>",
+            y + 14,
+            label,
+            y,
+            latency_width,
+            238.0 + latency_width,
+            y + 14,
+            p99_us
+        )?;
+    }
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>TrevRPC Benchmark</title><style>body{{font:14px system-ui,sans-serif;max-width:1000px;margin:40px auto;padding:0 20px;color:#18202b}}svg{{width:100%;overflow:visible}}rect{{fill:#176b87}}text{{font-size:12px;fill:#18202b}}h1,h2{{letter-spacing:-.02em}}</style></head><body><h1>TrevRPC Benchmark</h1><h2>Median throughput (operations/s)</h2><svg viewBox=\"0 0 850 {height}\">{throughput_bars}</svg><h2>Median p99 latency</h2><svg viewBox=\"0 0 850 {height}\">{latency_bars}</svg><p>See <code>aggregate.csv</code>, <code>samples.jsonl</code>, and <code>manifest.json</code> for canonical data and provenance.</p></body></html>"
+    );
+    fs::write(path, html)?;
+    Ok(())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn median_u64(values: impl Iterator<Item = u64>) -> u64 {
+    let mut values = values.collect::<Vec<_>>();
+    values.sort_unstable();
+    match values.len() {
+        0 => 0,
+        length if length % 2 == 1 => values[length / 2],
+        length => values[length / 2 - 1].saturating_add(values[length / 2]) / 2,
+    }
+}
+
+fn median_f64(values: impl Iterator<Item = f64>) -> f64 {
+    let mut values = values.collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+    match values.len() {
+        0 => 0.0,
+        length if length % 2 == 1 => values[length / 2],
+        length => f64::midpoint(values[length / 2 - 1], values[length / 2]),
+    }
+}
