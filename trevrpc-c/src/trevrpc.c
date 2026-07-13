@@ -1138,6 +1138,27 @@ int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, siz
     return 0;
 }
 
+int trevrpc_stream_send_message_copy_wait(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
+    if (stream == NULL || stream->transport != TREVRPC_TRANSPORT_KIND_MSQUIC) {
+        return trevrpc_stream_send_message(stream, body, body_len);
+    }
+
+    int64_t previous_count = stream->response_message_count;
+    uint64_t previous_body_size = stream->response_body_size;
+    int err = trevrpc_stream_prepare_send_message(stream, body, body_len);
+    if (err != 0) {
+        return err;
+    }
+    intptr_t written = trevrpc_msquic_stream_write_message_frame_wait_capacity(
+        stream->msquic_stream, body, body_len, stream->max_frame_size);
+    if (written < 0) {
+        stream->response_message_count = previous_count;
+        stream->response_body_size = previous_body_size;
+        return (int)written;
+    }
+    return 0;
+}
+
 int trevrpc_stream_send_message_borrowed_wait(trevrpc_stream* stream, const uint8_t* body, size_t body_len) {
     if (stream == NULL || stream->transport != TREVRPC_TRANSPORT_KIND_MSQUIC) {
         return trevrpc_stream_send_message(stream, body, body_len);

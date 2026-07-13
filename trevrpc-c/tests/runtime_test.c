@@ -119,12 +119,16 @@ struct trevrpc_msquic_stream {
     size_t frame_skip_remaining;
     bool recv_fin;
     bool send_closed;
+    bool send_aborted;
+    bool api_closing;
     bool shutdown_complete;
     bool close_pending;
     bool closed;
     bool api_ref_acquired;
+    size_t active_send_ops;
     size_t active_handle_ops;
     size_t active_send_completions;
+    size_t send_capacity_waiters;
     size_t max_pending_send_bytes;
     size_t max_pending_send_count;
     size_t pending_send_bytes;

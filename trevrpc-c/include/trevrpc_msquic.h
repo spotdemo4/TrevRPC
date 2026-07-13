@@ -101,6 +101,11 @@ intptr_t trevrpc_msquic_stream_read_frame_timeout(
     trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos);
 intptr_t trevrpc_msquic_stream_read_frame_ready(
     trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
+/*
+ * Callers must serialize close against starting new write/send calls. Close
+ * drains calls that have registered with the stream, then owns and destroys
+ * the stream before returning.
+ */
 intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_write_fin(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
 /*
@@ -114,11 +119,12 @@ intptr_t trevrpc_msquic_stream_write_frame_parts(
 intptr_t trevrpc_msquic_stream_write_frame_parts_fin(
     trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len);
 /*
- * Tracked variants return one completion for the submitted send. On a
- * synchronous failure, *completion remains NULL and no part memory is owned.
- * On success, every part remains borrowed until the completion is waited and
- * freed, including when the stream is canceled or reset. Waiting returns
- * -ECANCELED when MsQuic reports SEND_COMPLETE with Canceled set.
+ * Tracked variants wait for pending-send capacity and return one completion
+ * for the submitted send. On a synchronous failure, *completion remains NULL
+ * and no part memory is owned. On success, every part remains borrowed until
+ * the completion is waited and freed, including when the stream is canceled or
+ * reset. Waiting returns -ECANCELED when MsQuic reports SEND_COMPLETE with
+ * Canceled set.
  */
 intptr_t trevrpc_msquic_stream_write_frame_parts_with_completion(trevrpc_msquic_stream* stream,
     const trevrpc_msquic_frame_part* parts,
@@ -132,8 +138,12 @@ intptr_t trevrpc_msquic_stream_write_frame_parts_fin_with_completion(trevrpc_msq
     trevrpc_msquic_send_completion** completion);
 intptr_t trevrpc_msquic_stream_write_message_frame(
     trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);
+/* Copy-owning message send that waits when the pending-send budget is temporarily full. */
+intptr_t trevrpc_msquic_stream_write_message_frame_wait_capacity(
+    trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);
 intptr_t trevrpc_msquic_stream_write_message_frames(
     trevrpc_msquic_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count, size_t max_len);
+/* Waits for pending-send capacity and returns a completion owning all borrowed bodies. */
 intptr_t trevrpc_msquic_stream_write_message_frames_borrowed(trevrpc_msquic_stream* stream,
     const uint8_t* const* bodies,
     const size_t* body_lens,

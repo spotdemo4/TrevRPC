@@ -537,6 +537,11 @@ void trevrpc_response_free(trevrpc_response* response);
 
 int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len);
 /*
+ * Copy-owning send with backpressure. Native MsQuic streams wait for pending
+ * send capacity; other transports fall back to the normal copy-based send.
+ */
+int trevrpc_stream_send_message_copy_wait(trevrpc_stream* stream, const uint8_t* body, size_t body_len);
+/*
  * Binding-oriented send path. The body is borrowed until this function returns.
  * Native MsQuic streams wait for SEND_COMPLETE before returning; other
  * transports may fall back to the normal copy-based send.

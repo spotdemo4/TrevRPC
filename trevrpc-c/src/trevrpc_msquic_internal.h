@@ -31,4 +31,20 @@ int trevrpc_msquic_dial_observed(const char* host,
     trevrpc_msquic_conn** conn);
 void trevrpc_msquic_conn_clear_observer(trevrpc_msquic_conn* conn);
 
+typedef enum trevrpc_msquic_test_stream_event {
+    TREV_MSQUIC_TEST_STREAM_SEND_PREPARE = 0,
+    TREV_MSQUIC_TEST_STREAM_SEND_RESERVED = 1,
+    TREV_MSQUIC_TEST_STREAM_SEND_CAPACITY_WAIT = 2,
+    TREV_MSQUIC_TEST_STREAM_CLOSE_STARTED = 3,
+    TREV_MSQUIC_TEST_STREAM_SEND_TERMINAL = 4,
+    TREV_MSQUIC_TEST_STREAM_EVENT_COUNT = 5,
+} trevrpc_msquic_test_stream_event;
+
+typedef void (*trevrpc_msquic_test_stream_hook)(trevrpc_msquic_test_stream_event event, void* context);
+
+void trevrpc_msquic_test_set_stream_hook(trevrpc_msquic_test_stream_hook hook, void* context);
+void trevrpc_msquic_test_fail_next_stream_send(void);
+void trevrpc_msquic_test_fail_next_graceful_shutdown(void);
+void trevrpc_msquic_test_wait_stream_shutdown_complete(trevrpc_msquic_stream* stream);
+
 #endif
