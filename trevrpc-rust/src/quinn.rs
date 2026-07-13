@@ -783,12 +783,8 @@ pub(crate) async fn handle_connection(
                 };
 
                 let Some(stream_permit) = try_acquire_permit(stream_limit.as_ref()) else {
-                    write_status(
-                        send,
-                        Status::unavailable("too many concurrent streams on connection"),
-                        server.max_frame_size(),
-                    )
-                    .await;
+                    let server = server.clone();
+                    stream_tasks.spawn(reject_stream(server, send, recv));
                     continue;
                 };
 
@@ -826,6 +822,32 @@ pub(crate) async fn handle_connection(
     }
 }
 
+async fn reject_stream(
+    server: crate::server::Server,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) {
+    let request = match read_initial_request(&server, &mut recv).await {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = recv.stop(CANCELLED_STREAM_CODE.into());
+            let status = error.into_status();
+            server.record_pre_handler_failure(&status);
+            write_status(send, status, server.max_frame_size()).await;
+            return;
+        }
+    };
+    let status = Status::unavailable("too many concurrent streams on connection");
+    server.record_rejected_request(&request, &status);
+    if write_rpc_status(&mut send, &request, status, server.max_frame_size()).await {
+        if request.rpc_kind() == RpcKind::Unary {
+            drain_unary_request_end_or_stop(&server, &mut recv).await;
+        }
+        let _ = send.finish();
+        trace_quinn_event("tx_fin", "server_stream_status");
+    }
+}
+
 async fn handle_stream(
     server: crate::server::Server,
     request_limit: Option<Arc<Semaphore>>,
@@ -843,10 +865,16 @@ async fn handle_stream(
         }
     };
 
-    let Some(_request_permit) = try_acquire_permit(request_limit.as_ref()) else {
+    let Some(request_permit) = try_acquire_permit(request_limit.as_ref()) else {
         let status = Status::unavailable("too many concurrent RPCs");
         server.record_rejected_request(&request, &status);
-        write_rpc_status(send, &request, status, server.max_frame_size()).await;
+        if write_rpc_status(&mut send, &request, status, server.max_frame_size()).await {
+            if request.rpc_kind() == RpcKind::Unary {
+                drain_unary_request_end_or_stop(&server, &mut recv).await;
+            }
+            let _ = send.finish();
+            trace_quinn_event("tx_fin", "server_rpc_status");
+        }
         return;
     };
 
@@ -870,6 +898,8 @@ async fn handle_stream(
         .await
         .is_ok()
     {
+        drop(request_permit);
+        drain_unary_request_end_or_stop(&server, &mut recv).await;
         let _ = send.finish();
         trace_quinn_event("tx_fin", "server_unary_response");
     }
@@ -886,6 +916,34 @@ async fn read_initial_request(
             .map_err(|_| Error::from(Status::deadline_exceeded("initial request frame timeout")))?
     } else {
         read.await
+    }
+}
+
+async fn read_unary_request_end(
+    server: &crate::server::Server,
+    recv: &mut quinn::RecvStream,
+) -> Result<()> {
+    let read = framed::drain_unary_request_end(recv);
+    if let Some(timeout) = server.options().initial_request_timeout() {
+        tokio::time::timeout(timeout, read).await.map_err(|_| {
+            Error::from(Status::deadline_exceeded(
+                "unary request stream finish timeout",
+            ))
+        })?
+    } else {
+        read.await
+    }
+}
+
+async fn drain_unary_request_end_or_stop(
+    server: &crate::server::Server,
+    recv: &mut quinn::RecvStream,
+) {
+    if let Err(error) = read_unary_request_end(server, recv).await {
+        let _ = &error;
+        let _ = recv.stop(CANCELLED_STREAM_CODE.into());
+        #[cfg(feature = "tracing")]
+        tracing::debug!(%error, "failed to drain Quinn unary request stream");
     }
 }
 
@@ -993,21 +1051,18 @@ async fn handle_streaming_rpc(
 }
 
 async fn write_rpc_status(
-    mut send: quinn::SendStream,
+    send: &mut quinn::SendStream,
     request: &RpcRequest,
     status: Status,
     max_frame_size: usize,
-) {
+) -> bool {
     let result = if request.rpc_kind() == RpcKind::Unary {
-        write_frame(&mut send, &status.into_response(Vec::new()), max_frame_size).await
+        write_frame(send, &status.into_response(Vec::new()), max_frame_size).await
     } else {
-        write_frame(&mut send, &RpcStreamFrame::status(status), max_frame_size).await
+        write_frame(send, &RpcStreamFrame::status(status), max_frame_size).await
     };
 
-    if result.is_ok() {
-        let _ = send.finish();
-        trace_quinn_event("tx_fin", "server_rpc_status");
-    }
+    result.is_ok()
 }
 
 struct QuinnRequestStream {

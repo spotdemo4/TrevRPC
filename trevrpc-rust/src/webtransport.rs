@@ -683,7 +683,7 @@ async fn read_unary_request_end(
     server: &crate::server::Server,
     recv: &mut web_transport_quinn::RecvStream,
 ) -> Result<()> {
-    let read = drain_unary_request_end(recv);
+    let read = framed::drain_unary_request_end(recv);
     if let Some(timeout) = server.options().initial_request_timeout() {
         tokio::time::timeout(timeout, read).await.map_err(|_| {
             Error::from(Status::deadline_exceeded(
@@ -692,21 +692,6 @@ async fn read_unary_request_end(
         })?
     } else {
         read.await
-    }
-}
-
-async fn drain_unary_request_end(recv: &mut web_transport_quinn::RecvStream) -> Result<()> {
-    let mut buf = [0; 1024];
-    loop {
-        match recv.read(&mut buf).await.map_err(Error::transport)? {
-            Some(0) => {}
-            Some(_) => {
-                return Err(Error::from(Status::invalid_argument(
-                    "unary request stream contained data after the initial request frame",
-                )));
-            }
-            None => return Ok(()),
-        }
     }
 }
 

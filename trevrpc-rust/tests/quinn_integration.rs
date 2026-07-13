@@ -1127,18 +1127,29 @@ async fn quinn_stream_concurrency_limit_returns_unavailable() -> TestResult {
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
     let hanging = hold_server_stream_open(&client).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "SayHello",
+        greeter::HelloRequest {
+            name: "second".to_owned(),
+        }
+        .encode_to_vec(),
+    );
 
-    let error = client
-        .say_hello(
-            greeter::HelloRequest {
-                name: "second".to_owned(),
-            },
-            authenticated_options(),
-        )
-        .await
-        .expect_err("second stream should exceed stream concurrency limit");
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    send.finish()?;
+    let response = read_raw_quinn_response(&mut recv).await?;
 
-    assert_eq!(error.into_status().code(), Code::Unavailable);
+    assert_eq!(Code::from_u32(response.status), Code::Unavailable);
+    read_quinn_fin(&mut recv).await?;
+    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    assert_eq!(stopped, None);
 
     drop(hanging);
     close_client(endpoint, connection).await;
@@ -1160,18 +1171,29 @@ async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
     let hanging = hold_server_stream_open(&client).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "SayHello",
+        greeter::HelloRequest {
+            name: "second".to_owned(),
+        }
+        .encode_to_vec(),
+    );
 
-    let error = client
-        .say_hello(
-            greeter::HelloRequest {
-                name: "second".to_owned(),
-            },
-            authenticated_options(),
-        )
-        .await
-        .expect_err("second request should exceed global request concurrency limit");
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    send.finish()?;
+    let response = read_raw_quinn_response(&mut recv).await?;
 
-    assert_eq!(error.into_status().code(), Code::Unavailable);
+    assert_eq!(Code::from_u32(response.status), Code::Unavailable);
+    read_quinn_fin(&mut recv).await?;
+    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    assert_eq!(stopped, None);
     observed_metrics.wait_for_code(Code::Unavailable).await;
     assert_eq!(observed_metrics.codes(), vec![Code::Unavailable]);
 
@@ -1508,6 +1530,55 @@ async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResu
 
     assert_eq!(error.into_status().code(), Code::PermissionDenied);
     close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_unary_request_fin_is_drained_without_stop_sending() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_options(fast_server_options().with_max_concurrent_requests(Some(1)));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "SayHello",
+        greeter::HelloRequest {
+            name: "delayed fin".to_owned(),
+        }
+        .encode_to_vec(),
+    );
+
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+
+    let response = read_raw_quinn_response(&mut recv).await?;
+    assert_eq!(Code::from_u32(response.status), Code::Ok);
+    assert_eq!(
+        greeter::HelloReply::decode(response.body.as_slice())?.message,
+        "hello, delayed fin",
+    );
+
+    let concurrent = client
+        .say_hello(
+            greeter::HelloRequest {
+                name: "concurrent".to_owned(),
+            },
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await?;
+    assert_eq!(concurrent.message, "hello, concurrent");
+
+    send.finish()?;
+    read_quinn_fin(&mut recv).await?;
+    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    assert_eq!(stopped, None);
+
+    close_client(endpoint, connection).await;
     server.shutdown().await
 }
 

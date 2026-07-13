@@ -298,6 +298,24 @@ where
     Ok(())
 }
 
+pub(crate) async fn drain_unary_request_end<R>(recv: &mut R) -> Result<()>
+where
+    R: FrameRead,
+{
+    let mut buf = [0; 1024];
+    loop {
+        match recv.read_frame_bytes(&mut buf).await? {
+            Some(0) => {}
+            Some(_) => {
+                return Err(Error::from(Status::invalid_argument(
+                    "unary request stream contained data after the initial request frame",
+                )));
+            }
+            None => return Ok(()),
+        }
+    }
+}
+
 async fn read_body<R>(recv: &mut R, len: usize) -> Result<Vec<u8>>
 where
     R: FrameRead,
