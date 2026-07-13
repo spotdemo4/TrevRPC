@@ -7,13 +7,21 @@
   "platform": "forgejo",
   "endpoint": "https://trev.zip/api/v1",
   "repositories": ["llc/TrevRPC"],
-  "allowedCommands": ["fix-hash .#trevrpc-go", "npm audit fix --prefix trevrpc-js"],
+  "allowedCommands": [
+    "fix-hash .#trevrpc-go",
+    "npm audit fix --prefix trevrpc-js",
+    "^nix run \\.#update-kotlin-deps$"
+  ],
+  "allowedUnsafeExecutions": ["gradleWrapper"],
 
   // repository
   "extends": ["config:recommended"],
   "addLabels": ["dep"],
   "nix": {
     "enabled": true
+  },
+  "gradle": {
+    "ignorePaths": []
   },
   "git-submodules": {
     "enabled": true
@@ -54,6 +62,14 @@
     {
       "matchManagers": ["gradle", "gradle-wrapper"],
       "addLabels": ["kotlin"]
+    },
+    {
+      "matchManagers": ["gradle"],
+      "postUpgradeTasks": {
+        "commands": ["nix run .#update-kotlin-deps"],
+        "fileFilters": ["trevrpc-kotlin/gradle/deps.json"],
+        "executionMode": "branch"
+      }
     },
     {
       "matchManagers": ["npm"],
