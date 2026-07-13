@@ -21,11 +21,13 @@ import io.netty.handler.codec.http3.Http3HeadersFrame
 import io.netty.handler.codec.http3.Http3RequestStreamInboundHandler
 import io.netty.handler.codec.http3.Http3ServerConnectionHandler
 import io.netty.handler.codec.http3.TrevRpcWebTransportServerConnectionHandler
+import io.netty.handler.codec.quic.DefaultQuicStreamFrame
 import io.netty.handler.codec.quic.QuicChannel
 import io.netty.handler.codec.quic.QuicServerCodecBuilder
 import io.netty.handler.codec.quic.QuicStreamChannel
 import io.netty.handler.ssl.SslHandshakeCompletionEvent
 import io.netty.util.AttributeKey
+import io.netty.util.ReferenceCountUtil
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -171,6 +173,7 @@ class NettyRpcServer private constructor(
             processRpc(
                 input,
                 write = { writeRaw(channel, it) },
+                writeTerminal = { writeRaw(channel, it, finish = true) },
                 finish = { channel.shutdownOutput().awaitCompletion() },
                 cancelInput = channel::cancelBoth,
             )
@@ -200,6 +203,7 @@ class NettyRpcServer private constructor(
     private suspend fun processRpc(
         input: ServerFrameInput,
         write: suspend (ByteArray) -> Unit,
+        writeTerminal: suspend (ByteArray) -> Unit,
         finish: suspend () -> Unit,
         cancelInput: () -> Unit,
     ) {
@@ -208,34 +212,37 @@ class NettyRpcServer private constructor(
                 val encoded = receiveInitial(input, server.options.initialRequestTimeout)
                 WireCodec.decodeRequest(encoded)
             } catch (error: Throwable) {
-                write(WireCodec.encode(RpcResponse.fromStatus(error.statusForWire())))
-                finish()
+                writeTerminal(WireCodec.encode(RpcResponse.fromStatus(error.statusForWire())))
                 return
             }
         try {
             if (request.kind == RpcKind.UNARY) {
-                write(WireCodec.encode(server.handleUnary(request)))
-                finish()
+                writeTerminal(WireCodec.encode(server.handleUnary(request)))
                 return
             }
             val responses = server.handleStreaming(request, requestFlow(input))
+            var terminalWritten = false
             try {
                 while (true) {
                     val response = responses.receive() ?: break
-                    write(WireCodec.encode(response))
-                    if (response.kind == RpcStreamFrameKind.STATUS) break
+                    val encoded = WireCodec.encode(response)
+                    if (response.kind == RpcStreamFrameKind.STATUS) {
+                        writeTerminal(encoded)
+                        terminalWritten = true
+                        break
+                    }
+                    write(encoded)
                 }
             } finally {
                 responses.close()
             }
-            finish()
+            if (!terminalWritten) finish()
         } catch (error: CancellationException) {
             cancelInput()
             throw error
         } catch (error: Throwable) {
             val status = RpcStreamFrame.status(error.statusForWire())
-            runCatching { write(WireCodec.encode(status)) }
-            runCatching { finish() }
+            runCatching { writeTerminal(WireCodec.encode(status)) }
         }
     }
 
@@ -286,8 +293,7 @@ class NettyRpcServer private constructor(
                     } else {
                         WireCodec.encode(RpcStreamFrame.status(status))
                     }
-                writeRaw(channel, response)
-                channel.shutdownOutput().awaitCompletion()
+                writeRaw(channel, response, finish = true)
                 channel.shutdownInput(CANCELLED_STREAM_CODE)
             } catch (_: Throwable) {
                 channel.cancelBoth()
@@ -298,8 +304,18 @@ class NettyRpcServer private constructor(
     private suspend fun writeRaw(
         channel: QuicStreamChannel,
         body: ByteArray,
+        finish: Boolean = false,
     ) {
-        TrevRpcFrameWriter.write(channel, body, config.options.maxFrameSize).awaitCompletion()
+        val framed = TrevRpcFrameWriter.encode(channel.alloc(), body, config.options.maxFrameSize)
+        val message: Any = if (finish) DefaultQuicStreamFrame(framed, true) else framed
+        val future =
+            try {
+                channel.writeAndFlush(message)
+            } catch (error: Throwable) {
+                ReferenceCountUtil.release(message)
+                throw error
+            }
+        future.awaitCompletion()
     }
 
     private inner class Http3ServerStreamHandler(
@@ -350,6 +366,10 @@ class NettyRpcServer private constructor(
                 processRpc(
                     input,
                     write = { writeHttp3(channel, it) },
+                    writeTerminal = {
+                        writeHttp3(channel, it)
+                        channel.shutdownOutput().awaitCompletion()
+                    },
                     finish = { channel.shutdownOutput().awaitCompletion() },
                     cancelInput = channel::cancelBoth,
                 )
@@ -528,6 +548,7 @@ class NettyRpcServer private constructor(
             processRpc(
                 input,
                 write = { writeRaw(channel, it) },
+                writeTerminal = { writeRaw(channel, it, finish = true) },
                 finish = { channel.shutdownOutput().awaitCompletion() },
                 cancelInput = channel::cancelBoth,
             )

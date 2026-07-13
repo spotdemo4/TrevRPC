@@ -14,6 +14,9 @@ import io.netty.handler.ssl.util.SelfSignedCertificate
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.toList
@@ -23,6 +26,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import zip.trev.trevrpc.BidirectionalStreamingHandler
+import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.Client
 import zip.trev.trevrpc.ClientStreamingHandler
 import zip.trev.trevrpc.Code
@@ -44,6 +48,7 @@ import zip.trev.trevrpc.netty.advanced.connectQuic
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.seconds
 
 class NettyIntegrationTest {
     @Test
@@ -140,6 +145,85 @@ class NettyIntegrationTest {
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    fun `native sequential unary calls release stream admission`() =
+        runBlocking {
+            val certificate = SelfSignedCertificate("localhost")
+            val core = testServer(ServerOptions(maxConcurrentStreamsPerConnection = 1))
+            val transportServer = bindNative(core, certificate)
+            val transport = connectNative(transportServer, certificate)
+            try {
+                val client = Client(transport)
+                val codec = MessageCodec.BYTE_ARRAY
+                repeat(256) {
+                    assertEquals(
+                        listOf<Byte>(9, 1),
+                        client.unary("test.Service", "Unary", byteArrayOf(9), codec, codec).toList(),
+                    )
+                }
+            } finally {
+                transport.shutdown()
+                transportServer.shutdown()
+                certificate.delete()
+            }
+        }
+
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    fun `native concurrent server streams retire cleanly`(): Unit =
+        runBlocking {
+            val certificate = SelfSignedCertificate("localhost")
+            val core = testServer(ServerOptions(maxConcurrentStreamsPerConnection = 4))
+            core.routeServerStreaming(
+                "test.Service",
+                "ManyServerStream",
+                ServerStreamingHandler { _, body ->
+                    ResponseEnvelope(
+                        flow {
+                            repeat(128) { emit(body) }
+                        },
+                    )
+                },
+            )
+            val transportOptions = NettyTransportOptions(workerParallelism = 4, maxIdleTime = 5.seconds)
+            val transportServer = bindNative(core, certificate, transportOptions)
+            val transport = connectNative(transportServer, certificate, transportOptions)
+            try {
+                val client = Client(transport)
+                val codec = MessageCodec.BYTE_ARRAY
+                val callOptions = CallOptions(maxResponseMessages = 128, streamIdleTimeout = 2.seconds)
+                coroutineScope {
+                    List(4) {
+                        async {
+                            repeat(1_000) {
+                                val call =
+                                    client.serverStreaming(
+                                        "test.Service",
+                                        "ManyServerStream",
+                                        byteArrayOf(9),
+                                        codec,
+                                        codec,
+                                        callOptions,
+                                    )
+                                var responses = 0
+                                try {
+                                    while (call.receive() != null) responses++
+                                } finally {
+                                    call.close()
+                                }
+                                assertEquals(128, responses)
+                            }
+                        }
+                    }.awaitAll()
+                }
+            } finally {
+                transport.shutdown()
+                transportServer.shutdown()
+                certificate.delete()
+            }
+        }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
     fun `concurrent server shutdown callers await the same cleanup`() =
         runBlocking {
             val certificate = SelfSignedCertificate("localhost")
@@ -223,6 +307,7 @@ class NettyIntegrationTest {
         rawStream.shutdownOutput().awaitCompletion()
         val rawResponse = WireCodec.decodeResponse(checkNotNull(rawInbox.receive()))
         assertEquals(listOf<Byte>(10, 1), rawResponse.body.toList())
+        rawInbox.requireEnd(config.options.maxIdleTime)
         rawStream.close().awaitCompletion()
 
         val concurrentHttp3 = RawNettyHttp3RpcTransport.fromEndpoint(endpoint, config)
@@ -296,6 +381,7 @@ class NettyIntegrationTest {
     private suspend fun bindNative(
         core: Server,
         certificate: SelfSignedCertificate,
+        options: NettyTransportOptions = NettyTransportOptions(),
     ): NettyRpcServer =
         NettyRpcServer.bind(
             core,
@@ -303,17 +389,20 @@ class NettyIntegrationTest {
                 bindAddress = InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
                 tls = NettyServerTls.Pem(certificate.privateKey(), certificate.certificate()),
                 enableHttp3 = false,
+                options = options,
             ),
         )
 
     private suspend fun connectNative(
         server: NettyRpcServer,
         certificate: SelfSignedCertificate,
+        options: NettyTransportOptions = NettyTransportOptions(),
     ): RawNettyQuicRpcTransport =
         RawNettyQuicRpcTransport.connect(
             NettyQuicClientConfig(
                 remoteAddress = server.localAddress,
                 tls = NettyClientTls("localhost", trustCertificates = listOf(certificate.cert())),
+                options = options,
             ),
         )
 

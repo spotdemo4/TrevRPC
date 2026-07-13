@@ -23,11 +23,14 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
@@ -52,6 +55,7 @@ import java.net.Inet6Address
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration
 import kotlinx.coroutines.channels.Channel as CoroutineChannel
 
 /** Advanced single-connection native QUIC transport. Prefer [NettyRpcChannel.nativeQuic]. */
@@ -75,14 +79,14 @@ class RawNettyQuicRpcTransport private constructor(
             stream.shutdownOutput().awaitCompletion()
             val body = inbox.receive() ?: throw transportException("native QUIC unary response ended before a frame")
             val response = WireCodec.decodeResponse(body)
-            stream.shutdownInput()
-            stream.close()
+            inbox.requireEnd(options.maxIdleTime)
+            stream.close().awaitCompletion()
             return response
         } catch (error: CancellationException) {
-            stream.cancelBoth()
+            stream.cancelAndClose()
             throw error
         } catch (error: Throwable) {
-            stream.cancelBoth()
+            stream.cancelAndClose()
             throw transportException("native QUIC unary RPC failed", error)
         }
     }
@@ -94,6 +98,7 @@ class RawNettyQuicRpcTransport private constructor(
         checkOpen()
         val inbox = RawFrameInbox(options)
         val stream = openRawStream(inbox)
+        val closed = AtomicBoolean(false)
         val writer =
             scope.launch {
                 try {
@@ -105,10 +110,10 @@ class RawNettyQuicRpcTransport private constructor(
                     stream.shutdownOutput().awaitCompletion()
                 } catch (error: Throwable) {
                     stream.cancelBoth()
-                    inbox.fail(error)
+                    if (!closed.get()) inbox.fail(error)
                 }
             }
-        return RawRpcTransportStream(stream, inbox, writer)
+        return RawRpcTransportStream(stream, inbox, writer, closed, options.maxIdleTime)
     }
 
     suspend fun shutdown() {
@@ -289,22 +294,39 @@ internal class RawFrameInbox(
     fun fail(error: Throwable) {
         frames.close(error)
     }
+
+    suspend fun requireEnd(timeout: Duration) {
+        val ended =
+            withTimeoutOrNull(timeout) {
+                if (receive() != null) {
+                    throw transportException("native QUIC response contained data after its terminal frame")
+                }
+                true
+            } == true
+        if (!ended) throw transportException("native QUIC response stream idle timeout")
+    }
 }
 
 internal class RawRpcTransportStream(
     private val stream: QuicStreamChannel,
     private val inbox: RawFrameInbox,
     private val writer: Job,
+    private val closed: AtomicBoolean,
+    private val responseIdleTimeout: Duration,
 ) : RpcTransportStream {
-    private val closed = AtomicBoolean(false)
-
     override suspend fun receive(): RpcStreamFrame? {
         val body = inbox.receive() ?: return null
         val frame = WireCodec.decodeStreamFrame(body)
         if (frame.kind == RpcStreamFrameKind.STATUS && closed.compareAndSet(false, true)) {
-            writer.cancel()
-            stream.shutdownInput()
-            stream.close()
+            try {
+                inbox.requireEnd(responseIdleTimeout)
+                writer.cancel()
+                stream.close().awaitCompletion()
+            } catch (error: Throwable) {
+                writer.cancel()
+                stream.cancelAndClose()
+                throw error
+            }
         }
         return frame
     }
@@ -312,7 +334,11 @@ internal class RawRpcTransportStream(
     override suspend fun close(cause: Throwable?) {
         if (!closed.compareAndSet(false, true)) return
         writer.cancel(CancellationException("RPC stream closed", cause))
-        stream.cancelBoth()
-        stream.close().awaitCompletion()
+        stream.cancelAndClose()
     }
+}
+
+private suspend fun QuicStreamChannel.cancelAndClose() {
+    cancelBoth()
+    withContext(NonCancellable) { close().awaitCompletion() }
 }
