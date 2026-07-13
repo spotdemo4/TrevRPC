@@ -249,6 +249,7 @@
               src = fileset.toSource {
                 root = ./.;
                 fileset = fileset.unions [
+                  ./bench/proto
                   ./testdata/wire-golden-vectors.txt
                   ./trevrpc-c
                 ];
@@ -424,6 +425,7 @@
               src = fileset.toSource {
                 root = ./.;
                 fileset = fileset.unions [
+                  ./bench/proto
                   ./testdata/wire-golden-vectors.txt
                   ./trevrpc-rust
                 ];
@@ -470,6 +472,7 @@
               src = fileset.toSource {
                 root = ./.;
                 fileset = fileset.unions [
+                  ./bench/proto
                   ./testdata/wire-golden-vectors.txt
                   ./trevrpc-go
                 ];
@@ -516,6 +519,7 @@
               src = fileset.toSource {
                 root = ./.;
                 fileset = fileset.unions [
+                  ./bench/proto
                   ./testdata/wire-golden-vectors.txt
                   ./trevrpc-js
                 ];
@@ -666,6 +670,7 @@
               self.packages.${system}.trevrpc-kotlin
               self.packages.${system}.trevrpc-rust
             ];
+            meta.platforms = [ "x86_64-linux" ];
           };
         };
 
@@ -685,6 +690,46 @@
         # nix flake check
         checks = pkgs.mkChecks {
           benchmark-controller = self.packages.${system}.trevrpc-bench;
+
+          benchmark-proto-sync =
+            pkgs.runCommand "trevrpc-benchmark-proto-sync"
+              {
+                nativeBuildInputs = with pkgs; [
+                  protobuf
+                  protoc-gen-go
+                ];
+              }
+              ''
+                   cmp ${./bench/proto/benchmark.proto} ${./trevrpc-c/bench/proto/benchmark.proto}
+                   cmp ${./bench/proto/benchmark.proto} ${./trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto}
+                   cmp ${./bench/proto/benchmark.proto} ${./trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto}
+                mkdir generated
+                protoc \
+                  --proto_path=${./bench/proto} \
+                  --go_out=generated \
+                  --go_opt=paths=source_relative \
+                  ${./bench/proto}/benchmark.proto
+                # The packaged plugin was built with an older Go toolchain, which
+                # selects the equivalent pre-TypeFor reflection expression.
+                substituteInPlace generated/benchmark.pb.go \
+                  --replace-fail 'reflect.TypeOf(x{}).PkgPath()' 'reflect.TypeFor[x]().PkgPath()'
+                cmp generated/benchmark.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go}
+                   touch $out
+              '';
+
+          benchmark-smoke =
+            pkgs.runCommand "trevrpc-benchmark-smoke"
+              {
+                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
+              }
+              ''
+                trevrpc-bench run ${./bench/campaigns/smoke.example.json} --out run
+                test "$(wc -l < run/samples.jsonl)" -eq 4
+                test -s run/aggregate.csv
+                test -s run/report.md
+                test -s run/report.html
+                touch $out
+              '';
 
           benchmark-peer-capabilities =
             let
