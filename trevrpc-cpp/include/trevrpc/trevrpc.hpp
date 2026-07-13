@@ -276,13 +276,15 @@ private:
 
 template <typename Message>
 [[nodiscard]] Result<std::vector<std::byte>> serialize(const Message& message) {
-  std::string encoded;
-  if (!message.SerializeToString(&encoded)) {
-    return Error::protobuf("failed to serialize protobuf message");
+  const std::size_t encoded_size = message.ByteSizeLong();
+  if (encoded_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return Error::protobuf("protobuf message exceeds the serializer size limit");
   }
-  std::vector<std::byte> body(encoded.size());
-  for (std::size_t index = 0; index < encoded.size(); ++index) {
-    body[index] = static_cast<std::byte>(static_cast<unsigned char>(encoded[index]));
+  std::vector<std::byte> body(encoded_size);
+  std::byte empty_buffer{};
+  void* data = body.empty() ? static_cast<void*>(&empty_buffer) : body.data();
+  if (!message.SerializeToArray(data, static_cast<int>(body.size()))) {
+    return Error::protobuf("failed to serialize protobuf message");
   }
   return body;
 }

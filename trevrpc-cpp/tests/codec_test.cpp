@@ -16,6 +16,11 @@ int main() {
   assert(decoded_lite);
   assert(decoded_lite.value().message() == "lite");
 
+  trevrpc::cpp::test::common::ImportedReply empty;
+  auto empty_body = trevrpc::detail::serialize(empty);
+  assert(empty_body);
+  assert(empty_body.value().empty());
+
   trevrpc::cpp::test::full::FullMessage full;
   full.set_value("full");
   auto full_body = trevrpc::detail::serialize(full);

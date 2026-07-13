@@ -13,6 +13,40 @@ namespace fixture = trevrpc::cpp::test::v1;
 namespace common = trevrpc::cpp::test::common;
 using namespace std::chrono_literals;
 
+constexpr std::size_t kStreamMessageCount = 128;
+
+fixture::Outer::Request make_request(const std::string& name) {
+  fixture::Outer::Request request;
+  request.set_name(name);
+  return request;
+}
+
+common::ImportedReply make_reply(const std::string& message) {
+  common::ImportedReply reply;
+  reply.set_message(message);
+  return reply;
+}
+
+std::vector<std::string> indexed_messages(const std::string& prefix) {
+  std::vector<std::string> messages;
+  messages.reserve(kStreamMessageCount);
+  for (std::size_t index = 0; index < kStreamMessageCount; ++index) {
+    messages.push_back(prefix + std::to_string(index));
+  }
+  return messages;
+}
+
+std::string join_messages(const std::vector<std::string>& messages) {
+  std::string joined;
+  for (const std::string& message : messages) {
+    if (!joined.empty()) {
+      joined += ',';
+    }
+    joined += message;
+  }
+  return joined;
+}
+
 class FixtureService final : public fixture::FixtureService {
 public:
   trevrpc::Result<common::ImportedReply> Unary(const trevrpc::CallContext& context,
@@ -45,6 +79,15 @@ public:
       metadata.set(std::string(TREVRPC_MAX_METADATA_KEY_LEN + 1, 'x'), "invalid");
       return trevrpc::Status(trevrpc::StatusCode::PermissionDenied, "invalid metadata",
                              std::move(metadata));
+    }
+    if (request.name() == "stress") {
+      for (std::size_t index = 0; index < kStreamMessageCount; ++index) {
+        auto sent = writer.send(make_reply("server-" + std::to_string(index)));
+        if (!sent) {
+          return trevrpc::Status::internal(sent.error().message());
+        }
+      }
+      return trevrpc::Status::ok();
     }
     for (const char* prefix : {"hello, ", "goodbye, "}) {
       common::ImportedReply reply;
@@ -91,9 +134,7 @@ public:
       if (!request.value().has_value()) {
         return trevrpc::Status::ok();
       }
-      common::ImportedReply reply;
-      reply.set_message("echo, " + request.value().value().name());
-      auto sent = stream.send(reply);
+      auto sent = stream.send(make_reply("echo, " + request.value().value().name()));
       if (!sent) {
         return trevrpc::Status::internal(sent.error().message());
       }
@@ -121,6 +162,8 @@ int main() {
   server_config.port = 0;
   server_config.cert_file = TREVRPC_CPP_TEST_CERT;
   server_config.key_file = TREVRPC_CPP_TEST_KEY;
+  server_config.max_pending_send_bytes = std::size_t{64} * 1024;
+  server_config.max_pending_send_count = 1;
   auto listening = trevrpc::Server::listen(server_config);
   assert(listening);
   trevrpc::Server server = std::move(listening).value();
@@ -134,6 +177,8 @@ int main() {
 
   trevrpc::ChannelConfig channel_config;
   channel_config.skip_certificate_validation = true;
+  channel_config.max_pending_send_bytes = std::size_t{64} * 1024;
+  channel_config.max_pending_send_count = 1;
   auto connected = trevrpc::Channel::connect("127.0.0.1", port.value(), channel_config, 5s);
   assert(connected);
   auto channel = std::move(connected).value();
@@ -173,6 +218,11 @@ int main() {
   assert(server_stream);
   expect_messages(server_stream.value(), {"hello, server", "goodbye, server"});
 
+  request.set_name("stress");
+  auto server_stream_stress = client.ServerStreaming(request);
+  assert(server_stream_stress);
+  expect_messages(server_stream_stress.value(), indexed_messages("server-"));
+
   request.set_name("denied");
   auto denied = client.ServerStreaming(request);
   assert(denied);
@@ -205,23 +255,26 @@ int main() {
 
   auto client_stream = client.ClientStreaming();
   assert(client_stream);
-  for (const char* name : {"left", "right"}) {
-    fixture::Outer::Request streamed;
-    streamed.set_name(name);
-    assert(client_stream.value().send(streamed));
+  const auto client_messages = indexed_messages("client-");
+  for (const std::string& message : client_messages) {
+    assert(client_stream.value().send(make_request(message)));
   }
   assert(client_stream.value().finish_send());
-  expect_messages(client_stream.value(), {"left,right"});
+  expect_messages(client_stream.value(), {join_messages(client_messages)});
 
   auto bidi = client.BidirectionalStreaming();
   assert(bidi);
-  for (const char* name : {"one", "two"}) {
-    fixture::Outer::Request streamed;
-    streamed.set_name(name);
-    assert(bidi.value().send(streamed));
+  const auto bidi_messages = indexed_messages("bidi-");
+  for (const std::string& message : bidi_messages) {
+    assert(bidi.value().send(make_request(message)));
   }
   assert(bidi.value().finish_send());
-  expect_messages(bidi.value(), {"echo, one", "echo, two"});
+  std::vector<std::string> bidi_responses;
+  bidi_responses.reserve(kStreamMessageCount);
+  for (const std::string& message : bidi_messages) {
+    bidi_responses.push_back("echo, " + message);
+  }
+  expect_messages(bidi.value(), bidi_responses);
 
   channel->close();
   channel.reset();

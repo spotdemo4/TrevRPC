@@ -223,7 +223,7 @@ Result<void> ClientStream::send(std::span<const std::byte> body) {
   if (stream_ == nullptr || send_finished_) {
     return Error::runtime(-EPIPE, "stream send side is closed");
   }
-  const int error = trevrpc_stream_send_message_borrowed_wait(
+  const int error = trevrpc_stream_send_message_copy_wait(
       stream_, reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
   return error == 0 ? Result<void>{} : Result<void>{Error::runtime(error)};
 }
@@ -283,7 +283,7 @@ void ClientStream::close() noexcept {
 }
 
 Result<void> send_server_message(trevrpc_stream* stream, std::span<const std::byte> body) {
-  const int error = trevrpc_stream_send_message_borrowed_wait(
+  const int error = trevrpc_stream_send_message_copy_wait(
       stream, reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
   return error == 0 ? Result<void>{} : Result<void>{Error::runtime(error)};
 }
