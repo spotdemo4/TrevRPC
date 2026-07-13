@@ -35,9 +35,9 @@
     "com/google/protobuf#protobuf-bom/4.35.1": {
       "pom": "sha256-CO7Fa9FhG0DEcfS2FG0KZ7wVSzW1XgAU6HKg0rdDc9U="
     },
-    "com/google/protobuf#protobuf-gradle-plugin/0.9.5": {
-      "jar": "sha256-0AfdqBr+rq1dqwXCf+AjzLrJd5Dk0ReH9L5o5nFlV/g=",
-      "pom": "sha256-ZGe+F84LfYei0lLpP9vB7hUT/aU/BjqFYx+9vtUOKuY="
+    "com/google/protobuf#protobuf-gradle-plugin/0.10.0": {
+      "jar": "sha256-QhN92PXZUggB6eVAWLa9ZeSjOiM7q7PyQcxIz3OHDyc=",
+      "pom": "sha256-eXblGp381DjApRGWcEj1n5xLCgr35LX3sDV5uJEWz1w="
     },
     "com/google/protobuf#protobuf-java/4.35.1": {
       "jar": "sha256-pDRboqoAmRL/b5BGf+otEEYFJWtyxQhA118TJWY4pHI=",

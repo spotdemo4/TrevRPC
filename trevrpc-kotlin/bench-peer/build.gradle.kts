@@ -31,7 +31,7 @@ abstract class VerifyCanonicalBenchmarkProto : DefaultTask() {
 plugins {
     application
     kotlin("jvm")
-    id("com.google.protobuf") version "0.9.5"
+    id("com.google.protobuf") version "0.10.0"
 }
 
 java {
