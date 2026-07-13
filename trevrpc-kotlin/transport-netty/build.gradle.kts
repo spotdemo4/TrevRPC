@@ -23,7 +23,7 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.13.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
-    testImplementation("org.bouncycastle:bcpkix-jdk18on:1.84")
+    testImplementation("org.bouncycastle:bcpkix-jdk18on:1.85")
     testRuntimeOnly("io.netty:netty-codec-native-quic:4.2.16.Final:linux-x86_64")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }

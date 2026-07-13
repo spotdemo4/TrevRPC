@@ -58,7 +58,7 @@ dependencies {
     implementation(project(":core"))
     implementation(project(":transport-netty"))
     implementation("com.google.protobuf:protobuf-java:4.35.1")
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.84")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.85")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 
     runtimeOnly("io.netty:netty-codec-native-quic:4.2.16.Final:linux-x86_64")

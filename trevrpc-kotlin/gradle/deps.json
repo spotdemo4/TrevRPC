@@ -133,17 +133,17 @@
       "module": "sha256-iKuIhKXnQS6Y8JHBRu7BRNeej4yVjzgLwtTNDwrUaGk=",
       "pom": "sha256-8O7pMr+yRrDfvrwIkmE2TGA9ut6tGPxV/WNCwXxW80w="
     },
-    "org/bouncycastle#bcpkix-jdk18on/1.84": {
-      "jar": "sha256-yH8W7Z5exhvJQVHp82RqxE5QzUSBIc6ENn+kt+x+wbs=",
-      "pom": "sha256-wSge1er48+QFVX56UgXLbzzfdT+E3psagVx16965mSo="
+    "org/bouncycastle#bcpkix-jdk18on/1.85": {
+      "jar": "sha256-yfgrLU6ZxLvfzPaE5SzAbqBqC1Z7/Q0I+cWj9BcFWZY=",
+      "pom": "sha256-mwUrDLhct9i7CVavzHTzHIFPHGfgNJjhynT4/oYR2Vc="
     },
-    "org/bouncycastle#bcprov-jdk18on/1.84": {
-      "jar": "sha256-ZNbFphIfzZJxUt0YLL7Tmv4P2mQalw2bzAycsYWLJzE=",
-      "pom": "sha256-znq7SpG6XSpz/fF6PfR2LjYFoDksx5g+8vGuFs04TMM="
+    "org/bouncycastle#bcprov-jdk18on/1.85": {
+      "jar": "sha256-IK8mv2Bgu4AFzCOJkWgSweDpmNxI0s7XExuJRhtUz/c=",
+      "pom": "sha256-pI6XjWskwYPEgy9cSdccH4QVa5nG+ppBCq+zc6JUvnw="
     },
-    "org/bouncycastle#bcutil-jdk18on/1.84": {
-      "jar": "sha256-s3ThaWNCH7nPsBzCDXrY/S+LgYjj7vDsColl4kX3YZo=",
-      "pom": "sha256-Cwy4GmXuFzfVEoY1Cp5WSJM2uPmQgZj+vQSUJD7qKXg="
+    "org/bouncycastle#bcutil-jdk18on/1.85": {
+      "jar": "sha256-WQ9V7V1oUpI5iYpKXE9zC2439F0c+j++UfhIWr4yxC0=",
+      "pom": "sha256-nxx5oSp8A9eIYOBXUNzEToVeICBcevfP+/KaaUSNheo="
     },
     "org/jetbrains#annotations/13.0": {
       "jar": "sha256-rOKhDcji1f00kl7KwD5JiLLA+FFlDJS4zvSbob0RFHg=",
