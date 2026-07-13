@@ -151,11 +151,8 @@
 
         # nix run [#...]
         apps = pkgs.mkApps {
-          benchmark = "${self.packages.${system}.trevrpc-bench}/bin/trevrpc-bench";
           browser-webtransport-soak = "nix develop -c bash -c 'npm --prefix trevrpc-js ci && npm --prefix trevrpc-js run test:browser:soak'";
           cross-runtime-lifecycle-stress = "nix develop -c bash -c 'mkdir -p target && go build -C trevrpc-go -o ../target/trevrpc-xruntime-go ./cmd/trevrpc-xruntime-go && TREVRPC_XRUNTIME_GO=$PWD/target/trevrpc-xruntime-go cargo test --manifest-path trevrpc-rust/Cargo.toml --test cross_runtime -- --ignored cross_runtime_lifecycle_stress --nocapture'";
-          dev = "cargo run --manifest-path trevrpc-rust/Cargo.toml";
-          test = "nix flake check";
           update-kotlin-deps = {
             packages = [ pkgs.oxfmt ];
             script = ''
