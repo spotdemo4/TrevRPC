@@ -11,6 +11,7 @@ import io.netty.channel.EventLoopGroup
 import io.netty.channel.MultiThreadIoEventLoopGroup
 import io.netty.channel.nio.NioIoHandler
 import io.netty.channel.socket.ChannelInputShutdownReadComplete
+import io.netty.channel.socket.SocketProtocolFamily
 import io.netty.channel.socket.nio.NioDatagramChannel
 import io.netty.handler.codec.quic.QuicChannel
 import io.netty.handler.codec.quic.QuicClientCodecBuilder
@@ -47,6 +48,7 @@ import zip.trev.trevrpc.netty.cancelBoth
 import zip.trev.trevrpc.netty.closeApplication
 import zip.trev.trevrpc.netty.copyReadableBytes
 import zip.trev.trevrpc.netty.transportException
+import java.net.Inet6Address
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -171,6 +173,8 @@ internal suspend fun connectQuic(
     connectionHandler: io.netty.channel.ChannelHandler,
 ): ClientQuicEndpoint {
     val group = MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory())
+    val protocolFamily =
+        if (config.remoteAddress.address is Inet6Address) SocketProtocolFamily.INET6 else SocketProtocolFamily.INET
     var datagram: Channel? = null
     try {
         val sslContext = config.tls.context(protocol)
@@ -197,7 +201,7 @@ internal suspend fun connectQuic(
         datagram =
             Bootstrap()
                 .group(group)
-                .channel(NioDatagramChannel::class.java)
+                .channelFactory { NioDatagramChannel(protocolFamily) }
                 .handler(codec)
                 .bind(InetSocketAddress(0))
                 .awaitChannel()
