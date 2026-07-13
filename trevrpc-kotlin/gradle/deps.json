@@ -1,8 +1,11 @@
 {
   "!comment": "This is a nixpkgs Gradle dependency lockfile. For more details, refer to the Gradle section in the nixpkgs manual.",
   "!version": 1,
-  "https://dl.google.com": {
-    "dl/android/maven2/org/chromium/net/cronet-api/143.7445.0/cronet-api-143.7445.0": {
+  "https://dl.google.com/dl/android/maven2/org/chromium": {
+    "net#cronet-api/143.7445.0": {
+      "pom": "sha256-nm3ORrziqZcQ/9467xoetPX2HxieiEd6RqrziQC3YIY="
+    },
+    "net/cronet-api/143.7445.0/cronet-api-143.7445.0": {
       "aar": "sha256-g5f1s3UuM4dXGg/zPhmg20zBTaFvQzeHLc86pmrZNyo="
     }
   },
