@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include "trevrpc.h"
-#include "trevrpc_runtime_internal.h"
+#include "trevrpc_binding.h"
 
 #include <errno.h> // IWYU pragma: keep
 #include <node_api.h>
@@ -1449,10 +1448,8 @@ static void native_client_observer_release(native_client_observer* observer) {
     }
 }
 
-static void native_client_connection_event(void* context, const trevrpc_msquic_conn_event* event) {
-    if (event != NULL && event->kind == TREV_MSQUIC_CONN_EVENT_SHUTDOWN_COMPLETE) {
-        native_client_observer_notify(context, event->error_code);
-    }
+static void native_client_connection_shutdown(void* context, int error_code) {
+    native_client_observer_notify(context, error_code);
 }
 
 static void native_client_maybe_destroy(native_client* client) {
@@ -1535,7 +1532,7 @@ static void native_client_close_request(native_client* client) {
     }
     pthread_mutex_unlock(&client->mutex);
 
-    trevrpc_raw_client_clear_observer(close_client != NULL ? close_client : shutdown_client);
+    trevrpc_raw_client_clear_shutdown_callback(close_client != NULL ? close_client : shutdown_client);
     native_client_observer_notify(observer, 0);
     native_client_observer_release(observer);
     trevrpc_raw_client_shutdown(shutdown_client);
@@ -2882,13 +2879,6 @@ static napi_value noop_js_callback(napi_env env, napi_callback_info info) {
     return undefined;
 }
 
-static int connect_is_cancelled(void* data) {
-    connect_work* work = data;
-    trevrpc_cancellation* cancellation =
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    return trevrpc_cancellation_cancelled(cancellation);
-}
-
 static void connect_execute(napi_env env, void* data) {
     (void)env;
     connect_work* work = data;
@@ -2913,14 +2903,13 @@ static void connect_execute(napi_env env, void* data) {
     }
     config.ca_cert_file = work->ca_cert_file;
     config.skip_certificate_validation = work->skip_certificate_validation;
-    work->base.err = trevrpc_raw_client_connect_observed(work->host,
+    trevrpc_cancellation* cancellation =
+        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
+    work->base.err = trevrpc_raw_client_connect_cancellable_with_shutdown_callback(work->host,
         work->port,
         &config,
-        connect_is_cancelled,
-        work,
-        NULL,
-        0,
-        native_client_connection_event,
+        cancellation,
+        native_client_connection_shutdown,
         work->observer,
         &work->client);
 }
@@ -2936,22 +2925,25 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
     trevrpc_cancellation* cancellation =
         work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
     if (work->base.err == 0 && trevrpc_cancellation_cancelled(cancellation)) {
-        trevrpc_raw_client_clear_observer(work->client);
+        trevrpc_raw_client_clear_shutdown_callback(work->client);
         trevrpc_raw_client_close(work->client);
         work->client = NULL;
         work->base.err = -ECANCELED;
     }
     if (env == NULL) {
-        trevrpc_raw_client_clear_observer(work->client);
+        trevrpc_raw_client_clear_shutdown_callback(work->client);
         trevrpc_raw_client_close(work->client);
     } else if (status != napi_ok) {
+        trevrpc_raw_client_clear_shutdown_callback(work->client);
+        trevrpc_raw_client_close(work->client);
+        work->client = NULL;
         reject_native_error(env, work->base.deferred, -ECANCELED, "connectMsQuic");
     } else if (work->base.err != 0) {
         reject_native_error(env, work->base.deferred, work->base.err, "connectMsQuic");
     } else {
         native_client* client = calloc(1, sizeof(*client));
         if (client == NULL) {
-            trevrpc_raw_client_clear_observer(work->client);
+            trevrpc_raw_client_clear_shutdown_callback(work->client);
             trevrpc_raw_client_close(work->client);
             reject_native_error(env, work->base.deferred, -ENOMEM, "connectMsQuic");
         } else {

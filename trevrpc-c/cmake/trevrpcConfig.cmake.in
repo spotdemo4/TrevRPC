@@ -2,6 +2,9 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
+if(@TREVRPC_BUILD_MSQUIC@)
+    find_dependency(msquic CONFIG)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/trevrpcTargets.cmake")
 

@@ -8,6 +8,7 @@ include(CMakePackageConfigHelpers)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(trevrpc_default_build_codegen ON)
@@ -24,6 +25,10 @@ option(TREVRPC_BUILD_RUNTIME "Build trevrpc-c high-level runtime" ON)
 option(TREVRPC_BUILD_CODEGEN "Build protoc-gen-trevrpc-c" "${trevrpc_default_build_codegen}")
 option(TREVRPC_INSTALL_INTERNAL_HEADERS "Install trevrpc-c internal headers for tests and development" OFF)
 option(TREVRPC_ENABLE_SANITIZERS "Build trevrpc-c with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+set(TREVRPC_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc" CACHE PATH
+    "Install directory for trevrpc CMake package files")
+set(TREVRPC_INSTALL_PKGCONFIGDIR "${CMAKE_INSTALL_LIBDIR}/pkgconfig" CACHE PATH
+    "Install directory for trevrpc pkg-config files")
 
 find_package(Threads REQUIRED)
 
@@ -78,11 +83,21 @@ trevrpc_c_sanitizers(trevrpc_core)
 set(trevrpc_install_targets trevrpc_core)
 set(trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_core.pc")
 
+if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+    set(trevrpc_pc_libdir "${CMAKE_INSTALL_LIBDIR}")
+else()
+    set(trevrpc_pc_libdir "\${pcfiledir}/..")
+endif()
+if(IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+    set(trevrpc_pc_includedir "${CMAKE_INSTALL_INCLUDEDIR}")
+else()
+    set(trevrpc_pc_includedir "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
+
 configure_file(cmake/trevrpc_core.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_core.pc" @ONLY)
 
 if(TREVRPC_BUILD_MSQUIC)
-    find_path(MSQUIC_INCLUDE_DIR NAMES msquic.h inc/msquic.h REQUIRED)
-    find_library(MSQUIC_LIBRARY NAMES msquic REQUIRED)
+    find_package(msquic CONFIG REQUIRED)
 
     add_library(trevrpc_msquic STATIC
         src/trevrpc_msquic.c
@@ -91,9 +106,8 @@ if(TREVRPC_BUILD_MSQUIC)
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE ${MSQUIC_INCLUDE_DIR}
     )
-    target_link_libraries(trevrpc_msquic PUBLIC Threads::Threads PRIVATE ${MSQUIC_LIBRARY})
+    target_link_libraries(trevrpc_msquic PUBLIC Threads::Threads PRIVATE msquic::msquic)
     trevrpc_c_warnings(trevrpc_msquic)
     trevrpc_c_sanitizers(trevrpc_msquic)
     list(APPEND trevrpc_install_targets trevrpc_msquic)
@@ -343,12 +357,12 @@ if(TARGET protoc-gen-trevrpc-c)
 endif()
 install(EXPORT trevrpcTargets
     NAMESPACE trevrpc::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc
+    DESTINATION "${TREVRPC_INSTALL_CMAKEDIR}"
 )
 configure_package_config_file(
     cmake/trevrpcConfig.cmake.in
     "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc
+    INSTALL_DESTINATION "${TREVRPC_INSTALL_CMAKEDIR}"
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfigVersion.cmake"
@@ -358,12 +372,13 @@ write_basic_package_version_file(
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfigVersion.cmake"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc
+    DESTINATION "${TREVRPC_INSTALL_CMAKEDIR}"
 )
 install(FILES ${trevrpc_pkg_config_files}
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+    DESTINATION "${TREVRPC_INSTALL_PKGCONFIGDIR}"
 )
 install(FILES
+    include/trevrpc_binding.h
     include/trevrpc.h
     include/trevrpc_msquic.h
     include/trevrpc_raw.h

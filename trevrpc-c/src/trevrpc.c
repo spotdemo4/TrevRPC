@@ -2,6 +2,7 @@
 
 #include "trevrpc.h"
 
+#include "trevrpc_binding.h"
 #include "trevrpc_msquic.h"
 #include "trevrpc_raw.h"
 #include "trevrpc_runtime_internal.h"
@@ -37,6 +38,8 @@ struct trevrpc_raw_client {
     trevrpc_msquic_conn* msquic_conn;
     trevrpc_wt_session* wt_session;
     size_t max_frame_size;
+    trevrpc_raw_client_shutdown_callback shutdown_callback;
+    void* shutdown_callback_user_data;
 };
 
 struct trevrpc_call_context {
@@ -1650,6 +1653,54 @@ int trevrpc_raw_client_connect_cancellable(const char* host,
         out_client);
 }
 
+static void trevrpc_raw_client_shutdown_event(void* context, const trevrpc_msquic_conn_event* event) {
+    trevrpc_raw_client* client = context;
+    if (event != NULL && event->kind == TREV_MSQUIC_CONN_EVENT_SHUTDOWN_COMPLETE && client->shutdown_callback != NULL) {
+        client->shutdown_callback(client->shutdown_callback_user_data, event->error_code);
+    }
+}
+
+int trevrpc_raw_client_connect_cancellable_with_shutdown_callback(const char* host,
+    uint16_t port,
+    const trevrpc_config* config,
+    trevrpc_cancellation* cancellation,
+    trevrpc_raw_client_shutdown_callback callback,
+    void* user_data,
+    trevrpc_raw_client** out_client) {
+    if (host == NULL || out_client == NULL) {
+        return -EINVAL;
+    }
+    *out_client = NULL;
+
+    trevrpc_raw_client* client = calloc(1, sizeof(*client));
+    if (client == NULL) {
+        return -ENOMEM;
+    }
+    client->max_frame_size = trevrpc_config_max_frame_size(config);
+    client->transport = TREVRPC_TRANSPORT_KIND_MSQUIC;
+    client->shutdown_callback = callback;
+    client->shutdown_callback_user_data = user_data;
+
+    trevrpc_msquic_config msquic_config = trevrpc_make_msquic_config(config);
+    int err = trevrpc_msquic_dial_observed(host,
+        port,
+        &msquic_config,
+        cancellation == NULL ? NULL : trevrpc_connect_cancelled,
+        cancellation,
+        NULL,
+        0,
+        callback == NULL ? NULL : trevrpc_raw_client_shutdown_event,
+        client,
+        &client->msquic_conn);
+    if (err != 0) {
+        trevrpc_raw_client_close(client);
+        return err;
+    }
+
+    *out_client = client;
+    return 0;
+}
+
 int trevrpc_raw_client_connect_observed(const char* host,
     uint16_t port,
     const trevrpc_config* config,
@@ -1695,6 +1746,14 @@ int trevrpc_raw_client_connect_observed(const char* host,
 void trevrpc_raw_client_clear_observer(trevrpc_raw_client* client) {
     if (client != NULL && client->transport == TREVRPC_TRANSPORT_KIND_MSQUIC) {
         trevrpc_msquic_conn_clear_observer(client->msquic_conn);
+    }
+}
+
+void trevrpc_raw_client_clear_shutdown_callback(trevrpc_raw_client* client) {
+    trevrpc_raw_client_clear_observer(client);
+    if (client != NULL) {
+        client->shutdown_callback = NULL;
+        client->shutdown_callback_user_data = NULL;
     }
 }
 

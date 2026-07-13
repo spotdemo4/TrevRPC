@@ -4,6 +4,8 @@ include(CMakeFindDependencyMacro)
 find_dependency(trevrpc CONFIG)
 find_dependency(Protobuf CONFIG)
 
+set(TREVRPC_CPP_BINDIR "@PACKAGE_CMAKE_INSTALL_BINDIR@")
+
 include("${CMAKE_CURRENT_LIST_DIR}/trevrpcCppTargets.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/trevrpc-cpp-generate.cmake")
 

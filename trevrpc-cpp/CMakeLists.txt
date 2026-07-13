@@ -8,6 +8,7 @@ include(GNUInstallDirs)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set(trevrpc_cpp_default_codegen ON)
@@ -19,6 +20,8 @@ option(TREVRPC_CPP_BUILD_CODEGEN "Build protoc-gen-trevrpc-cpp" "${trevrpc_cpp_d
 option(TREVRPC_CPP_BUILD_TESTS "Build trevrpc-cpp tests" ON)
 option(TREVRPC_CPP_BUILD_EXAMPLES "Build trevrpc-cpp examples" "${TREVRPC_CPP_BUILD_TESTS}")
 option(TREVRPC_CPP_ENABLE_SANITIZERS "Build with address and undefined behavior sanitizers" OFF)
+set(TREVRPC_CPP_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc-cpp" CACHE PATH
+    "Install directory for trevrpc-cpp CMake package files")
 set(TREVRPC_CPP_TREVRPC_C_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../trevrpc-c" CACHE PATH
     "Path to the trevrpc-c source tree; empty uses an installed package")
 
@@ -97,12 +100,13 @@ endif()
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT trevrpcCppTargets
   NAMESPACE trevrpc::
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc-cpp)
+  DESTINATION "${TREVRPC_CPP_INSTALL_CMAKEDIR}")
 
 configure_package_config_file(
   cmake/trevrpc-cppConfig.cmake.in
   "${CMAKE_CURRENT_BINARY_DIR}/trevrpc-cppConfig.cmake"
-  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc-cpp)
+  INSTALL_DESTINATION "${TREVRPC_CPP_INSTALL_CMAKEDIR}"
+  PATH_VARS CMAKE_INSTALL_BINDIR)
 write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/trevrpc-cppConfigVersion.cmake"
   VERSION ${PROJECT_VERSION}
@@ -111,7 +115,7 @@ install(FILES
   "${CMAKE_CURRENT_BINARY_DIR}/trevrpc-cppConfig.cmake"
   "${CMAKE_CURRENT_BINARY_DIR}/trevrpc-cppConfigVersion.cmake"
   cmake/trevrpc-cpp-generate.cmake
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc-cpp)
+  DESTINATION "${TREVRPC_CPP_INSTALL_CMAKEDIR}")
 
 if(TREVRPC_CPP_BUILD_TESTS)
   enable_testing()

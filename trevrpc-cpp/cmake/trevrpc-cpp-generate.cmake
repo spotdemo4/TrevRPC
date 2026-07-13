@@ -34,7 +34,7 @@ function(trevrpc_cpp_generate)
     set(generator_dependency protoc-gen-trevrpc-cpp)
   else()
     find_program(generator_executable NAMES protoc-gen-trevrpc-cpp
-      HINTS "${PACKAGE_PREFIX_DIR}/bin" REQUIRED)
+      HINTS "${TREVRPC_CPP_BINDIR}" "${PACKAGE_PREFIX_DIR}/bin" REQUIRED)
     set(generator_dependency)
   endif()
 
