@@ -1,0 +1,369 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+import {
+  LogLinearHistogram,
+  createBenchmarkHandlers,
+  createClientOperation,
+  logLinearUpperBound,
+  parseCommandLine,
+  prepareFixedAdmissionPhase,
+  root,
+} from "../bench/trevrpc-bench-peer.js";
+
+const execFileAsync = promisify(execFile);
+const BenchmarkRequest = root.lookupType("trevrpc.benchmark.v1.BenchmarkRequest");
+const BenchmarkResponse = root.lookupType("trevrpc.benchmark.v1.BenchmarkResponse");
+const StreamRequest = root.lookupType("trevrpc.benchmark.v1.StreamRequest");
+const BenchmarkSummary = root.lookupType("trevrpc.benchmark.v1.BenchmarkSummary");
+
+test("benchmark peer capabilities use protocol v1", async () => {
+  const { stdout, stderr } = await execFileAsync(process.execPath, [
+    fileURLToPath(new URL("../bench/trevrpc-bench-peer.js", import.meta.url)),
+    "capabilities",
+  ]);
+
+  assert.equal(stderr, "");
+  assert.deepEqual(JSON.parse(stdout), {
+    schema_version: 1,
+    event: "capabilities",
+    roles: ["client", "server"],
+    rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
+    transports: ["native_quic"],
+    histogram: "log_linear_v1",
+    peer: "js",
+  });
+});
+
+test("benchmark peer parses required client and IPv6 server options", () => {
+  const clientArgs = [
+    "client",
+    "--address",
+    "127.0.0.1:43117",
+    "--cert",
+    "ca.pem",
+    "--rpc",
+    "bidi",
+    "--concurrency",
+    "8",
+    "--warmup-ms",
+    "0",
+    "--measurement-ms",
+    "1000",
+    "--request-bytes",
+    "64",
+    "--response-bytes",
+    "128",
+    "--messages-per-stream",
+    "4",
+  ];
+  assert.deepEqual(parseCommandLine(clientArgs), {
+    command: "client",
+    address: { host: "127.0.0.1", port: 43117 },
+    cert: "ca.pem",
+    rpcKind: "bidi",
+    concurrency: 8,
+    warmupMs: 0,
+    measurementMs: 1000,
+    requestBytes: 64,
+    responseBytes: 128,
+    messagesPerStream: 4,
+  });
+  assert.deepEqual(
+    parseCommandLine([
+      "server",
+      "--listen",
+      "[::1]:0",
+      "--cert",
+      "server.pem",
+      "--key",
+      "server-key.pem",
+    ]),
+    {
+      command: "server",
+      listen: { host: "::1", port: 0 },
+      cert: "server.pem",
+      key: "server-key.pem",
+    },
+  );
+  assert.throws(
+    () =>
+      parseCommandLine([
+        "client",
+        "--address",
+        "127.0.0.1:1",
+        "--cert",
+        "ca.pem",
+        "--rpc",
+        "unary",
+      ]),
+    /missing required option --concurrency/u,
+  );
+  const oversizedPayload = [...clientArgs];
+  oversizedPayload[oversizedPayload.indexOf("--request-bytes") + 1] = "67108865";
+  assert.throws(() => parseCommandLine(oversizedPayload), /through 67108864/u);
+});
+
+test("log_linear_v1 uses exact low buckets and sorted sparse output", () => {
+  assert.equal(logLinearUpperBound(1n), 1n);
+  assert.equal(logLinearUpperBound(1023n), 1023n);
+  assert.equal(logLinearUpperBound(1024n), 1025n);
+  assert.equal(logLinearUpperBound(1025n), 1025n);
+  assert.equal(logLinearUpperBound(1026n), 1027n);
+
+  const histogram = new LogLinearHistogram();
+  histogram.record(1026n);
+  histogram.record(1n);
+  histogram.record(1024n);
+  histogram.record(1025n);
+  assert.deepEqual(histogram.toJSON(), [
+    { upper_bound_ns: "1", count: "1" },
+    { upper_bound_ns: "1025", count: "2" },
+    { upper_bound_ns: "1027", count: "1" },
+  ]);
+});
+
+test("fixed admission does not start work at or after the deadline", async () => {
+  let clock = 0n;
+  const phase = prepareFixedAdmissionPhase({
+    concurrency: 1,
+    durationNs: 10n,
+    recordLatency: true,
+    now: () => clock,
+    async operation() {
+      clock += 5n;
+      return { requestMessages: 2n, responseMessages: 3n };
+    },
+  });
+
+  const result = await phase.start();
+
+  assert.equal(result.elapsedNs, 10n);
+  assert.equal(result.completed, 2n);
+  assert.equal(result.failed, 0n);
+  assert.equal(result.requestMessages, 4n);
+  assert.equal(result.responseMessages, 6n);
+  assert.equal(result.histogram.count, 2n);
+});
+
+test("fixed admission creates and releases every concurrency lane", async () => {
+  let clock = 0n;
+  let active = 0;
+  let maximumActive = 0;
+  const pending = [];
+  const phase = prepareFixedAdmissionPhase({
+    concurrency: 3,
+    durationNs: 10n,
+    recordLatency: false,
+    now: () => clock,
+    operation() {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      return new Promise((resolveOperation) => {
+        pending.push(() => {
+          active -= 1;
+          resolveOperation({ requestMessages: 1n, responseMessages: 1n });
+        });
+      });
+    },
+  });
+
+  const resultPromise = phase.start();
+  while (pending.length < 3) {
+    await Promise.resolve();
+  }
+  clock = 10n;
+  for (const resolveOperation of pending) {
+    resolveOperation();
+  }
+  const result = await resultPromise;
+
+  assert.equal(maximumActive, 3);
+  assert.equal(result.completed, 3n);
+  assert.equal(result.requestMessages, 3n);
+  assert.equal(result.responseMessages, 3n);
+});
+
+test("client operations validate and count all four RPC kinds", async () => {
+  const config = {
+    requestBytes: 3,
+    responseBytes: 4,
+    messagesPerStream: 3,
+  };
+
+  const unary = createClientOperation(
+    {
+      async unary(request) {
+        assert.equal(request.payload.byteLength, config.requestBytes);
+        return { sequence: request.sequence, payload: new Uint8Array(config.responseBytes) };
+      },
+    },
+    { ...config, rpcKind: "unary" },
+  );
+  assert.deepEqual(await unary({ laneIndex: 2, operationIndex: 7n }), {
+    requestMessages: 1n,
+    responseMessages: 1n,
+  });
+
+  const streamedRequests = [];
+  const clientStream = createClientOperation(
+    {
+      async clientStream() {
+        return {
+          async sendMany(messages) {
+            streamedRequests.push(...messages);
+          },
+          async closeAndRecv() {
+            return {
+              messageCount: streamedRequests.length,
+              payloadBytes: streamedRequests.reduce(
+                (total, request) => total + request.payload.byteLength,
+                0,
+              ),
+            };
+          },
+        };
+      },
+    },
+    { ...config, rpcKind: "client_stream" },
+  );
+  assert.deepEqual(await clientStream({ laneIndex: 0, operationIndex: 0n }), {
+    requestMessages: 3n,
+    responseMessages: 1n,
+  });
+  assert.deepEqual(
+    streamedRequests.map((request) => String(request.sequence)),
+    ["0", "1", "2"],
+  );
+
+  const serverStream = createClientOperation(
+    {
+      async serverStream(request) {
+        assert.equal(request.payload.byteLength, config.requestBytes);
+        return responseMessages(request.messageCount, request.responseBytes);
+      },
+    },
+    { ...config, rpcKind: "server_stream" },
+  );
+  assert.deepEqual(await serverStream({ laneIndex: 0, operationIndex: 0n }), {
+    requestMessages: 1n,
+    responseMessages: 3n,
+  });
+
+  const bidiResponses = [];
+  let bidiClosed = false;
+  const bidi = createClientOperation(
+    {
+      async bidi() {
+        return {
+          async sendMany(messages) {
+            bidiResponses.push(
+              ...messages.map((request) => ({
+                sequence: request.sequence,
+                payload: new Uint8Array(request.responseBytes),
+              })),
+            );
+          },
+          async closeSend() {
+            bidiClosed = true;
+          },
+          async recv() {
+            return (
+              bidiResponses.shift() ?? (bidiClosed ? undefined : assert.fail("receive stalled"))
+            );
+          },
+        };
+      },
+    },
+    { ...config, rpcKind: "bidi" },
+  );
+  assert.deepEqual(await bidi({ laneIndex: 0, operationIndex: 0n }), {
+    requestMessages: 3n,
+    responseMessages: 3n,
+  });
+});
+
+test("server handlers implement all four benchmark RPCs", async () => {
+  const handlers = createBenchmarkHandlers();
+  const unaryBody = await handlers.unary({
+    request: {
+      body: BenchmarkRequest.encode({
+        sequence: "42",
+        payload: new Uint8Array(2),
+        responseBytes: 3,
+      }).finish(),
+    },
+  });
+  const unaryResponse = BenchmarkResponse.decode(unaryBody);
+  assert.equal(String(unaryResponse.sequence), "42");
+  assert.equal(unaryResponse.payload.byteLength, 3);
+
+  const clientFrames = [requestFrame("0", 2, 0), requestFrame("1", 2, 0), requestFrame("2", 2, 0)];
+  const summaries = [];
+  for await (const body of handlers.clientStream(receivingCall(clientFrames))) {
+    summaries.push(BenchmarkSummary.decode(body));
+  }
+  assert.equal(summaries.length, 1);
+  assert.equal(String(summaries[0].messageCount), "3");
+  assert.equal(String(summaries[0].payloadBytes), "6");
+
+  const serverResponses = [];
+  const responseStream = handlers.serverStream({
+    request: {
+      body: StreamRequest.encode({
+        messageCount: 3,
+        payload: new Uint8Array(2),
+        responseBytes: 4,
+      }).finish(),
+    },
+  });
+  for await (const body of responseStream) {
+    serverResponses.push(BenchmarkResponse.decode(body));
+  }
+  assert.deepEqual(
+    serverResponses.map((response) => String(response.sequence)),
+    ["0", "1", "2"],
+  );
+  assert.ok(serverResponses.every((response) => response.payload.byteLength === 4));
+
+  const bidiResponses = [];
+  for await (const body of handlers.bidi(
+    receivingCall([requestFrame("7", 2, 4), requestFrame("8", 2, 4)]),
+  )) {
+    bidiResponses.push(BenchmarkResponse.decode(body));
+  }
+  assert.deepEqual(
+    bidiResponses.map((response) => String(response.sequence)),
+    ["7", "8"],
+  );
+  assert.ok(bidiResponses.every((response) => response.payload.byteLength === 4));
+});
+
+async function* responseMessages(count, responseBytes) {
+  for (let index = 0; index < count; index += 1) {
+    yield { sequence: String(index), payload: new Uint8Array(responseBytes) };
+  }
+}
+
+function requestFrame(sequence, requestBytes, responseBytes) {
+  return {
+    body: BenchmarkRequest.encode({
+      sequence,
+      payload: new Uint8Array(requestBytes),
+      responseBytes,
+    }).finish(),
+  };
+}
+
+function receivingCall(frames) {
+  const queued = [...frames, null];
+  return {
+    request: {},
+    recv() {
+      return Promise.resolve(queued.shift());
+    },
+  };
+}

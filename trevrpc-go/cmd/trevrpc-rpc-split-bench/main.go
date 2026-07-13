@@ -17,13 +17,13 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
+	"trev.zip/llc/trevrpc/trevrpc-go/internal/benchutil"
 )
 
 const (
@@ -32,7 +32,6 @@ const (
 	payloadProfileEnv         = "TREVRPC_BENCH_PAYLOAD_PROFILE"
 	metadataProfileEnv        = "TREVRPC_BENCH_METADATA_PROFILE"
 	idleTimeout               = 10 * time.Minute
-	keepAlive                 = 5 * time.Second
 	shutdownTimeout           = 2 * time.Second
 )
 
@@ -418,11 +417,7 @@ func grpcClientTransportCredentials(certFile string) (credentials.TransportCrede
 func dialTransport(ctx context.Context, transportName, addr, certFile string) (trevrpc.ClientTransport, error) {
 	switch transportName {
 	case "quic":
-		conn, err := quic.DialAddr(ctx, addr, clientTLSConfig(certFile), trevrpc.QUICClientConfig(trevrpc.DefaultMaxFrameSize, quicConfig()))
-		if err != nil {
-			return nil, err
-		}
-		return trevrpc.Advanced.NewRawQUICClient(conn), nil
+		return benchutil.DialNativeQUIC(ctx, addr, clientTLSConfig(certFile))
 	default:
 		return nil, fmt.Errorf("unsupported transport %q", transportName)
 	}
@@ -431,17 +426,7 @@ func dialTransport(ctx context.Context, transportName, addr, certFile string) (t
 func listenTransport(transportName, addr, certFile, keyFile string, server *trevrpc.Server) (trevrpc.ServerListener, error) {
 	switch transportName {
 	case "quic":
-		if certFile == "" || keyFile == "" {
-			return nil, errors.New("quic server requires -cert and -key")
-		}
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			return nil, err
-		}
-		return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
-			TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN}},
-			QUICConfig: quicConfig(),
-		})
+		return benchutil.ListenNativeQUIC(addr, certFile, keyFile, server)
 	case "webtransport":
 		if certFile == "" || keyFile == "" {
 			return nil, errors.New("webtransport server requires -cert and -key")
@@ -452,7 +437,7 @@ func listenTransport(transportName, addr, certFile, keyFile string, server *trev
 		}
 		return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
 			TLSConfig:  &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN, http3.NextProtoH3}},
-			QUICConfig: quicConfig(),
+			QUICConfig: benchutil.QUICConfig(),
 		})
 	default:
 		return nil, fmt.Errorf("unsupported transport %q", transportName)
@@ -462,10 +447,6 @@ func listenTransport(transportName, addr, certFile, keyFile string, server *trev
 func clientTLSConfig(certFile string) *tls.Config {
 	_ = certFile
 	return &tls.Config{ServerName: "localhost", NextProtos: []string{trevrpc.ALPN}, InsecureSkipVerify: true}
-}
-
-func quicConfig() *quic.Config {
-	return &quic.Config{MaxIdleTimeout: idleTimeout, KeepAlivePeriod: keepAlive}
 }
 
 func waitForShutdown(ctx context.Context, serveDone <-chan error) error {

@@ -19,6 +19,7 @@ endif()
 option(TREVRPC_CPP_BUILD_CODEGEN "Build protoc-gen-trevrpc-cpp" "${trevrpc_cpp_default_codegen}")
 option(TREVRPC_CPP_BUILD_TESTS "Build trevrpc-cpp tests" ON)
 option(TREVRPC_CPP_BUILD_EXAMPLES "Build trevrpc-cpp examples" "${TREVRPC_CPP_BUILD_TESTS}")
+option(TREVRPC_CPP_BUILD_BENCHMARKS "Build the trevrpc-cpp benchmark peer" OFF)
 option(TREVRPC_CPP_ENABLE_SANITIZERS "Build with address and undefined behavior sanitizers" OFF)
 set(TREVRPC_CPP_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc-cpp" CACHE PATH
     "Install directory for trevrpc-cpp CMake package files")
@@ -74,12 +75,14 @@ set_target_properties(trevrpc_cpp PROPERTIES EXPORT_NAME cpp)
 trevrpc_cpp_warnings(trevrpc_cpp)
 trevrpc_cpp_sanitizers(trevrpc_cpp)
 
-if(TREVRPC_CPP_BUILD_CODEGEN OR TREVRPC_CPP_BUILD_TESTS OR TREVRPC_CPP_BUILD_EXAMPLES)
+if(TREVRPC_CPP_BUILD_CODEGEN OR TREVRPC_CPP_BUILD_TESTS OR TREVRPC_CPP_BUILD_EXAMPLES OR
+   TREVRPC_CPP_BUILD_BENCHMARKS)
   find_package(Protobuf CONFIG REQUIRED)
   include(cmake/trevrpc-cpp-generate.cmake)
 endif()
 
-if(TREVRPC_CPP_BUILD_CODEGEN OR TREVRPC_CPP_BUILD_TESTS OR TREVRPC_CPP_BUILD_EXAMPLES)
+if(TREVRPC_CPP_BUILD_CODEGEN OR TREVRPC_CPP_BUILD_TESTS OR TREVRPC_CPP_BUILD_EXAMPLES OR
+   TREVRPC_CPP_BUILD_BENCHMARKS)
   add_executable(protoc-gen-trevrpc-cpp
     tools/protoc-gen-trevrpc-cpp/main.cpp
     tools/protoc-gen-trevrpc-cpp/generator.cpp)
@@ -124,4 +127,8 @@ endif()
 
 if(TREVRPC_CPP_BUILD_EXAMPLES)
   add_subdirectory(examples)
+endif()
+
+if(TREVRPC_CPP_BUILD_BENCHMARKS)
+  add_subdirectory(bench)
 endif()

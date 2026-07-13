@@ -254,6 +254,33 @@ if(trevrpc_needs_generated_bindings)
             trevrpc_generated_trevrpc_c
         )
 
+        set(trevrpc_benchmark_proto "${CMAKE_CURRENT_SOURCE_DIR}/bench/proto/benchmark.proto")
+        set(trevrpc_canonical_benchmark_proto "${CMAKE_CURRENT_SOURCE_DIR}/../bench/proto/benchmark.proto")
+        if(EXISTS "${trevrpc_canonical_benchmark_proto}")
+            file(SHA256 "${trevrpc_benchmark_proto}" trevrpc_benchmark_proto_sha256)
+            file(SHA256 "${trevrpc_canonical_benchmark_proto}" trevrpc_canonical_benchmark_proto_sha256)
+            if(NOT trevrpc_benchmark_proto_sha256 STREQUAL trevrpc_canonical_benchmark_proto_sha256)
+                message(FATAL_ERROR "trevrpc-c benchmark.proto differs from the canonical benchmark contract")
+            endif()
+        endif()
+        trevrpc_generate_c_service_bindings(
+            "${trevrpc_generated_test_dir}"
+            "${trevrpc_benchmark_proto}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/proto"
+            benchmark
+            trevrpc_generated_benchmark_pb_c
+            trevrpc_generated_benchmark_trevrpc_c
+        )
+
+        add_library(trevrpc_benchmark_generated STATIC
+            "${trevrpc_generated_benchmark_pb_c}"
+            "${trevrpc_generated_benchmark_trevrpc_c}"
+        )
+        target_include_directories(trevrpc_benchmark_generated PUBLIC "${trevrpc_generated_test_dir}")
+        target_link_libraries(trevrpc_benchmark_generated PUBLIC trevrpc protobuf-c)
+        trevrpc_c_warnings(trevrpc_benchmark_generated)
+        trevrpc_c_sanitizers(trevrpc_benchmark_generated)
+
         set(trevrpc_msquic_test_cert "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-cert.pem")
         set(trevrpc_msquic_test_key "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-key.pem")
         add_custom_command(
@@ -304,6 +331,12 @@ if(TREVRPC_BUILD_BENCHMARKS)
     trevrpc_c_sanitizers(trevrpc_wire_bench)
 
     if(TREVRPC_BUILD_RUNTIME)
+        add_executable(trevrpc_bench_peer_c bench/trevrpc_bench_peer.c)
+        set_target_properties(trevrpc_bench_peer_c PROPERTIES OUTPUT_NAME "trevrpc-bench-peer-c")
+        target_link_libraries(trevrpc_bench_peer_c PRIVATE trevrpc_benchmark_generated)
+        trevrpc_c_warnings(trevrpc_bench_peer_c)
+        trevrpc_c_sanitizers(trevrpc_bench_peer_c)
+
         add_executable(trevrpc_rpc_comparison_bench
             bench/rpc_comparison_bench.c
             "${trevrpc_generated_pb_c}"
@@ -355,6 +388,11 @@ if(TARGET protoc-gen-trevrpc-c)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 endif()
+if(TARGET trevrpc_bench_peer_c)
+    install(TARGETS trevrpc_bench_peer_c
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
 install(EXPORT trevrpcTargets
     NAMESPACE trevrpc::
     DESTINATION "${TREVRPC_INSTALL_CMAKEDIR}"
@@ -403,6 +441,14 @@ if(TREVRPC_BUILD_TESTS)
     trevrpc_c_sanitizers(trevrpc_wire_test)
 
     add_test(NAME trevrpc_wire COMMAND trevrpc_wire_test)
+
+    if(TARGET trevrpc_bench_peer_c)
+        add_test(NAME trevrpc_bench_peer_capabilities COMMAND trevrpc_bench_peer_c capabilities)
+        set_tests_properties(trevrpc_bench_peer_capabilities PROPERTIES
+            PASS_REGULAR_EXPRESSION
+                "\"event\":\"capabilities\".*\"rpc_kinds\":\\[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"\\].*\"transports\":\\[\"native_quic\"\\].*\"histogram\":\"log_linear_v1\""
+        )
+    endif()
 
     if(TREVRPC_BUILD_RUNTIME)
         add_executable(trevrpc_api_test tests/api_test.c)

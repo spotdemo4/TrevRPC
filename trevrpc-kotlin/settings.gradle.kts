@@ -26,4 +26,5 @@ include(
     "transport-cronet",
     "protoc-gen-trevrpc-kotlin",
     "examples",
+    "bench-peer",
 )

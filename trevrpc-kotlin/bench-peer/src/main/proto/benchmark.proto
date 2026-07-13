@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package trevrpc.benchmark.v1;
+
+option go_package = "trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb;benchmarkpb";
+option java_multiple_files = true;
+option java_package = "zip.trev.trevrpc.benchmark.v1";
+
+service BenchmarkService {
+  rpc Unary(BenchmarkRequest) returns (BenchmarkResponse);
+  rpc ClientStream(stream BenchmarkRequest) returns (BenchmarkSummary);
+  rpc ServerStream(StreamRequest) returns (stream BenchmarkResponse);
+  rpc Bidi(stream BenchmarkRequest) returns (stream BenchmarkResponse);
+}
+
+message BenchmarkRequest {
+  uint64 sequence = 1;
+  bytes payload = 2;
+  uint32 response_bytes = 3;
+}
+
+message BenchmarkResponse {
+  uint64 sequence = 1;
+  bytes payload = 2;
+}
+
+message StreamRequest {
+  uint32 message_count = 1;
+  bytes payload = 2;
+  uint32 response_bytes = 3;
+}
+
+message BenchmarkSummary {
+  uint64 message_count = 1;
+  uint64 payload_bytes = 2;
+}

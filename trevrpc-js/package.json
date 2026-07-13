@@ -4,7 +4,8 @@
   "description": "JavaScript WebTransport runtime and protobuf.js code generator for TrevRPC",
   "license": "MIT",
   "bin": {
-    "protoc-gen-trevrpc-js": "./bin/protoc-gen-trevrpc-js.js"
+    "protoc-gen-trevrpc-js": "./bin/protoc-gen-trevrpc-js.js",
+    "trevrpc-bench-peer-js": "./bench/trevrpc-bench-peer.js"
   },
   "files": [
     "bench",
@@ -45,6 +46,7 @@
   },
   "scripts": {
     "bench:native": "node bench/rpc_comparison_native.js",
+    "bench:peer": "node bench/trevrpc-bench-peer.js",
     "profile:completion-worker:native": "node bench/completion_worker_profile_native.js",
     "profile:native": "node bench/rpc_profile_native.js",
     "build:native": "TREVRPC_NODE_TEST_HOOKS=OFF npm run build:native:cmake",
