@@ -135,7 +135,8 @@ try {
 ```
 
 Use independent sender and receiver coroutines when a protocol must continuously read and write
-large bidi streams.
+large bidi streams. Interactive `send` calls wait for transport write completion, and `closeSend`
+waits for the request-side FIN.
 
 ## Server
 

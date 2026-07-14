@@ -10,7 +10,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -19,10 +18,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import zip.trev.trevrpc.RpcChannel
 import zip.trev.trevrpc.RpcChannelState
+import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcTransport
-import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.netty.advanced.RawNettyHttp3RpcTransport
@@ -113,10 +112,7 @@ private class DefaultNettyRpcChannel(
 
     override suspend fun unary(request: RpcRequest): RpcResponse = snapshot().unary(request)
 
-    override suspend fun openStream(
-        request: RpcRequest,
-        requestBody: Flow<ByteArray>,
-    ): RpcTransportStream = snapshot().openStream(request, requestBody)
+    override suspend fun openStream(request: RpcRequest): RpcClientStream = snapshot().openStream(request)
 
     override suspend fun awaitReady() {
         when (state.first { it == RpcChannelState.READY || it == RpcChannelState.CLOSED }) {

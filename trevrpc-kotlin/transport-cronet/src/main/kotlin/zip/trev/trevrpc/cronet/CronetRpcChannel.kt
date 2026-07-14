@@ -1,7 +1,6 @@
 package zip.trev.trevrpc.cronet
 
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -11,10 +10,10 @@ import org.chromium.net.CronetException
 import org.chromium.net.UrlResponseInfo
 import zip.trev.trevrpc.RpcChannel
 import zip.trev.trevrpc.RpcChannelState
+import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcTransport
-import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import java.net.URI
@@ -57,12 +56,9 @@ internal class CronetChannel(
         return delegate.unary(request)
     }
 
-    override suspend fun openStream(
-        request: RpcRequest,
-        requestBody: Flow<ByteArray>,
-    ): RpcTransportStream {
+    override suspend fun openStream(request: RpcRequest): RpcClientStream {
         checkOpen()
-        return delegate.openStream(request, requestBody)
+        return delegate.openStream(request)
     }
 
     override suspend fun awaitReady() = checkOpen()

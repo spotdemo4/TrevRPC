@@ -4,7 +4,7 @@ import java.io.PrintStream
 import java.nio.file.Path
 import java.util.TreeMap
 
-internal const val PEER_NAME = "kotlin"
+internal val PEER_NAME = System.getenv("TREVRPC_BENCH_PEER_NAME") ?: "kotlin"
 internal const val MAX_APPLICATION_PAYLOAD_BYTES = 64 * 1024 * 1024
 internal const val MAX_ENCODED_MESSAGE_BYTES = MAX_APPLICATION_PAYLOAD_BYTES + 1024
 internal const val MAX_BENCHMARK_CONCURRENCY = 1024
@@ -247,7 +247,7 @@ internal class EventWriter(
 ) {
     fun capabilities() {
         emit(
-            """{"schema_version":1,"event":"capabilities","peer":"kotlin","roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"transports":["native_quic"],"histogram":"log_linear_v1"}""",
+            """{"schema_version":1,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"transports":["native_quic"],"histogram":"log_linear_v1"}""",
         )
     }
 

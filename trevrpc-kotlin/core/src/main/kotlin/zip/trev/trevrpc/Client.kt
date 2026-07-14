@@ -1,12 +1,9 @@
 package zip.trev.trevrpc
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ClosedSendChannelException
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.emptyFlow
-import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration
@@ -35,7 +32,6 @@ data class CallOptions(
     val maxResponseStreamBodySize: Long? = DEFAULT_MAX_STREAM_BODY_SIZE,
     val streamIdleTimeout: Duration? = 30.seconds,
     val metadata: Metadata = Metadata.EMPTY,
-    val requestChannelCapacity: Int = DEFAULT_CALL_CHANNEL_CAPACITY,
 ) {
     init {
         require(timeout == null || (timeout.isFinite() && timeout.isPositive())) {
@@ -51,23 +47,30 @@ data class CallOptions(
         require(streamIdleTimeout == null || (streamIdleTimeout.isFinite() && streamIdleTimeout.isPositive())) {
             "streamIdleTimeout must be positive and finite"
         }
-        require(requestChannelCapacity > 0) { "requestChannelCapacity must be positive" }
     }
 }
 
 interface RpcTransport {
     suspend fun unary(request: RpcRequest): RpcResponse
 
-    suspend fun openStream(
-        request: RpcRequest,
-        requestBody: Flow<ByteArray>,
-    ): RpcTransportStream
+    suspend fun openStream(request: RpcRequest): RpcClientStream
 }
 
 interface RpcTransportStream {
     suspend fun receive(): RpcStreamFrame?
 
     suspend fun close(cause: Throwable? = null)
+}
+
+/**
+ * A bidirectional client transport stream. Sends are serialized with [finishSend] and complete only
+ * after the transport accepts the write. Sending and receiving may proceed concurrently.
+ */
+interface RpcClientStream : RpcTransportStream {
+    suspend fun send(body: ByteArray)
+
+    /** Half-closes the request side after prior sends. Repeated calls have no effect. */
+    suspend fun finishSend()
 }
 
 class Client(
@@ -108,11 +111,11 @@ class Client(
         val state =
             open(
                 request(service, method, RpcKind.SERVER_STREAMING, requestCodec.encode(request), options),
-                emptyFlow(),
                 responseCodec,
                 options,
+                finishSend = true,
             )
-        return ServerStreamingCall(state)
+        return ServerStreamingCall(state.reader)
     }
 
     suspend fun <Req, Res> clientStreaming(
@@ -122,21 +125,13 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): ClientStreamingCall<Req, Res> {
-        val outbound = Channel<ByteArray>(options.requestChannelCapacity)
         val state =
-            try {
-                open(
-                    request(service, method, RpcKind.CLIENT_STREAMING, byteArrayOf(), options),
-                    outbound.receiveAsFlow(),
-                    responseCodec,
-                    options,
-                    onTerminal = { outbound.cancel() },
-                )
-            } catch (error: Throwable) {
-                outbound.cancel()
-                throw error
-            }
-        return ClientStreamingCall(outbound, requestCodec, state)
+            open(
+                request(service, method, RpcKind.CLIENT_STREAMING, byteArrayOf(), options),
+                responseCodec,
+                options,
+            )
+        return ClientStreamingCall(state.writer, requestCodec, state.reader)
     }
 
     suspend fun <Req, Res> bidirectionalStreaming(
@@ -146,33 +141,63 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): BidirectionalStreamingCall<Req, Res> {
-        val outbound = Channel<ByteArray>(options.requestChannelCapacity)
         val state =
-            try {
-                open(
-                    request(service, method, RpcKind.BIDIRECTIONAL_STREAMING, byteArrayOf(), options),
-                    outbound.receiveAsFlow(),
-                    responseCodec,
-                    options,
-                    onTerminal = { outbound.cancel() },
-                )
-            } catch (error: Throwable) {
-                outbound.cancel()
-                throw error
-            }
-        return BidirectionalStreamingCall(outbound, requestCodec, state)
+            open(
+                request(service, method, RpcKind.BIDIRECTIONAL_STREAMING, byteArrayOf(), options),
+                responseCodec,
+                options,
+            )
+        return BidirectionalStreamingCall(state.writer, requestCodec, state.reader)
     }
 
     private suspend fun <Res> open(
         request: RpcRequest,
-        body: Flow<ByteArray>,
         codec: MessageCodec<Res>,
         options: CallOptions,
-        onTerminal: () -> Unit = {},
-    ): ResponseReader<Res> {
+        finishSend: Boolean = false,
+    ): OpenedStream<Res> {
         val deadline = options.timeout?.let { TimeSource.Monotonic.markNow() + it }
-        val stream = callWithDeadline(deadline, null) { transport.openStream(request, body) }
-        return ResponseReader(stream, codec, options, deadline, onTerminal)
+        val stream = callWithDeadline(deadline, null) { transport.openStream(request) }
+        val writer = RequestWriter(stream, deadline)
+        if (finishSend) writer.finishSend()
+        return OpenedStream(writer, ResponseReader(stream, codec, options, deadline))
+    }
+}
+
+private data class OpenedStream<T>(
+    val writer: RequestWriter,
+    val reader: ResponseReader<T>,
+)
+
+internal class RequestWriter(
+    private val stream: RpcClientStream,
+    private val deadline: TimeMark?,
+) {
+    private val sendFinished = AtomicBoolean(false)
+
+    suspend fun send(body: ByteArray) {
+        if (sendFinished.get()) {
+            throw TrevRpcException(Status.cancelled("request stream is closed"))
+        }
+        write { stream.send(body) }
+    }
+
+    suspend fun finishSend() {
+        if (!sendFinished.compareAndSet(false, true)) return
+        write { stream.finishSend() }
+    }
+
+    private suspend fun write(operation: suspend () -> Unit) {
+        try {
+            callWithDeadline(deadline, null, operation)
+        } catch (error: Throwable) {
+            val closeError =
+                withContext(NonCancellable) {
+                    runCatching { stream.close(error) }.exceptionOrNull()
+                }
+            if (closeError != null && closeError !== error) error.addSuppressed(closeError)
+            throw error
+        }
     }
 }
 
@@ -191,17 +216,15 @@ class ServerStreamingCall<T> internal constructor(
 }
 
 class ClientStreamingCall<Req, Res> internal constructor(
-    private val outbound: Channel<ByteArray>,
+    private val writer: RequestWriter,
     private val requestCodec: MessageCodec<Req>,
     private val reader: ResponseReader<Res>,
 ) {
     private val received = AtomicBoolean(false)
 
-    suspend fun send(request: Req) = sendOutbound(outbound, requestCodec.encode(request))
+    suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
 
-    fun closeSend() {
-        outbound.close()
-    }
+    suspend fun closeSend() = writer.finishSend()
 
     suspend fun receive(): ResponseEnvelope<Res> {
         if (!received.compareAndSet(false, true)) {
@@ -222,13 +245,12 @@ class ClientStreamingCall<Req, Res> internal constructor(
     }
 
     suspend fun close() {
-        outbound.cancel()
         reader.close()
     }
 }
 
 class BidirectionalStreamingCall<Req, Res> internal constructor(
-    private val outbound: Channel<ByteArray>,
+    private val writer: RequestWriter,
     private val requestCodec: MessageCodec<Req>,
     private val reader: ResponseReader<Res>,
 ) {
@@ -238,16 +260,13 @@ class BidirectionalStreamingCall<Req, Res> internal constructor(
     val responseMetadata: Metadata
         get() = reader.responseMetadata
 
-    suspend fun send(request: Req) = sendOutbound(outbound, requestCodec.encode(request))
+    suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
 
-    fun closeSend() {
-        outbound.close()
-    }
+    suspend fun closeSend() = writer.finishSend()
 
     suspend fun receive(): Res? = reader.receive()
 
     suspend fun close() {
-        outbound.cancel()
         reader.close()
     }
 }
@@ -257,7 +276,6 @@ internal class ResponseReader<T>(
     private val codec: MessageCodec<T>,
     private val options: CallOptions,
     private val deadline: TimeMark?,
-    private val onTerminal: () -> Unit,
 ) {
     private val closed = AtomicBoolean(false)
     private var messages = 0
@@ -305,7 +323,6 @@ internal class ResponseReader<T>(
 
     suspend fun close(cause: Throwable? = null) {
         done = true
-        onTerminal()
         if (closed.compareAndSet(false, true)) stream.close(cause)
     }
 
@@ -365,17 +382,6 @@ private fun request(
 private fun timeoutNanos(timeout: Duration?): ULong {
     if (timeout == null) return 0u
     return timeout.inWholeNanoseconds.coerceAtLeast(1).toULong()
-}
-
-private suspend fun sendOutbound(
-    outbound: Channel<ByteArray>,
-    body: ByteArray,
-) {
-    try {
-        outbound.send(body.copyOf())
-    } catch (error: ClosedSendChannelException) {
-        throw TrevRpcException(Status.cancelled("request stream is closed"), error)
-    }
 }
 
 private fun enforceBodyLimit(

@@ -9,17 +9,18 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import zip.trev.trevrpc.DEFAULT_MAX_FRAME_SIZE
 import zip.trev.trevrpc.FrameDecoder
+import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcStreamFrameKind
 import zip.trev.trevrpc.RpcTransport
-import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
@@ -104,7 +105,7 @@ internal class Http3RpcTransport(
     private val coroutineContext: CoroutineContext = Dispatchers.IO,
 ) : RpcTransport {
     override suspend fun unary(request: RpcRequest): RpcResponse {
-        val exchange = open(request, null)
+        val exchange = open(request, endOfStream = true)
         try {
             val first = exchange.receiveBody() ?: protocolError("unary response body was empty")
             if (exchange.receiveBody() != null) protocolError("unary response contained more than one frame")
@@ -118,26 +119,27 @@ internal class Http3RpcTransport(
         }
     }
 
-    override suspend fun openStream(
-        request: RpcRequest,
-        requestBody: Flow<ByteArray>,
-    ): RpcTransportStream = StreamingTransportStream(open(request, requestBody))
+    override suspend fun openStream(request: RpcRequest): RpcClientStream = StreamingTransportStream(open(request, endOfStream = false))
 
-    private fun open(
+    private suspend fun open(
         request: RpcRequest,
-        requestBody: Flow<ByteArray>?,
+        endOfStream: Boolean,
     ): Http3Exchange {
         val parent = coroutineContext[Job]
         val scope = CoroutineScope(SupervisorJob(parent) + coroutineContext.minusKey(Job))
-        val exchange = Http3Exchange(factory, options, scope, requestBody != null)
-        exchange.start(request, requestBody)
+        val exchange = Http3Exchange(factory, options, scope, streaming = !endOfStream)
+        exchange.start(request, endOfStream)
         return exchange
     }
 }
 
 private class StreamingTransportStream(
     private val exchange: Http3Exchange,
-) : RpcTransportStream {
+) : RpcClientStream {
+    override suspend fun send(body: ByteArray) = exchange.send(body)
+
+    override suspend fun finishSend() = exchange.finishSend()
+
     override suspend fun receive(): RpcStreamFrame? = exchange.receiveBody()?.let(WireCodec::decodeStreamFrame)
 
     override suspend fun close(cause: Throwable?) = exchange.close(cause)
@@ -157,14 +159,15 @@ internal class Http3Exchange(
     private val responseBodies = Channel<ByteArray>(options.responseChannelCapacity)
     private val readChunks = Channel<ReadChunk>(1)
     private val writeReady = CompletableDeferred<Unit>()
+    private val sendLock = Mutex()
     private val writeLock = Any()
+    private var sendFinished = false
     private var pendingWrite: PendingWrite? = null
-    private lateinit var uploadJob: Job
     private lateinit var stream: DuplexStream
 
-    fun start(
+    suspend fun start(
         request: RpcRequest,
-        requestBody: Flow<ByteArray>?,
+        endOfStream: Boolean,
     ) {
         try {
             stream = factory.open(this)
@@ -172,7 +175,7 @@ internal class Http3Exchange(
         } catch (error: Throwable) {
             if (::stream.isInitialized) {
                 fail(error)
-            } else if (completed.compareAndSet(false, true)) {
+            } else if (completeOnce()) {
                 responseBodies.close(error)
                 readChunks.close(error)
                 scope.cancel(cancellationException("Cronet stream creation failed", error))
@@ -180,7 +183,29 @@ internal class Http3Exchange(
             throw error
         }
         scope.launch { readResponses() }
-        uploadJob = scope.launch { upload(request, requestBody) }
+        sendFinished = endOfStream
+        writeDirect(
+            endOfStream,
+            "initial request write failed",
+        ) { frame(WireCodec.encode(request), options.maxFrameSize) }
+    }
+
+    suspend fun send(body: ByteArray) {
+        sendLock.withLock {
+            checkSendOpen()
+            writeDirect(false, "request write failed") {
+                frame(WireCodec.encode(RpcStreamFrame.message(body)), options.maxFrameSize)
+            }
+        }
+    }
+
+    suspend fun finishSend() {
+        sendLock.withLock {
+            if (sendFinished) return
+            checkSendOpen()
+            sendFinished = true
+            writeDirect(true, "request finish failed") { byteArrayOf() }
+        }
     }
 
     suspend fun receiveBody(): ByteArray? {
@@ -189,7 +214,7 @@ internal class Http3Exchange(
     }
 
     suspend fun close(cause: Throwable? = null) {
-        if (completed.compareAndSet(false, true)) {
+        if (completeOnce()) {
             cancelNative()
             responseBodies.close(cause)
             readChunks.close(cause)
@@ -199,7 +224,7 @@ internal class Http3Exchange(
     }
 
     override fun onReady(stream: DuplexStream) {
-        if (stream !== this.stream || completed.get()) return
+        if (stream !== this.stream || completed.get() || remoteTerminalSeen.get()) return
         writeReady.complete(Unit)
     }
 
@@ -207,7 +232,7 @@ internal class Http3Exchange(
         stream: DuplexStream,
         headers: ResponseHeaders,
     ) {
-        if (stream !== this.stream || completed.get()) return
+        if (stream !== this.stream || completed.get() || remoteTerminalSeen.get()) return
         if (!headersReceived.compareAndSet(false, true)) {
             fail(protocolException("received response headers more than once"))
             return
@@ -225,7 +250,7 @@ internal class Http3Exchange(
         buffer: ByteBuffer,
         endOfStream: Boolean,
     ) {
-        if (stream !== this.stream || completed.get()) return
+        if (stream !== this.stream || completed.get() || remoteTerminalSeen.get()) return
         val bytes = ByteArray(buffer.position())
         buffer.flip()
         buffer.get(bytes)
@@ -252,14 +277,16 @@ internal class Http3Exchange(
                 }
             }
         if (continuation == null) {
-            if (!completed.get()) fail(protocolException("Cronet completed an unexpected request write"))
+            if (!completed.get() && !remoteTerminalSeen.get()) {
+                fail(protocolException("Cronet completed an unexpected request write"))
+            }
         } else {
             continuation.resume(Unit)
         }
     }
 
     override fun onSucceeded(stream: DuplexStream) {
-        if (stream !== this.stream || completed.get()) return
+        if (stream !== this.stream || completed.get() || remoteTerminalSeen.get()) return
         if (!headersReceived.get()) {
             fail(protocolException("Cronet stream succeeded before response headers"))
         } else if (!responseEndReceived.get()) {
@@ -284,25 +311,23 @@ internal class Http3Exchange(
         }
     }
 
-    private suspend fun upload(
-        request: RpcRequest,
-        requestBody: Flow<ByteArray>?,
+    private suspend fun writeDirect(
+        endOfStream: Boolean,
+        failureMessage: String,
+        bytes: () -> ByteArray,
     ) {
         try {
-            write(frame(WireCodec.encode(request), options.maxFrameSize), requestBody == null)
-            if (requestBody != null) {
-                requestBody.collect { body ->
-                    val message = WireCodec.encode(RpcStreamFrame.message(body))
-                    write(frame(message, options.maxFrameSize), false)
-                }
-                write(byteArrayOf(), true)
-            }
+            write(bytes(), endOfStream)
         } catch (error: CancellationException) {
             if (!completed.get() && !remoteTerminalSeen.get()) {
-                fail(transportException("request upload was canceled", error))
+                fail(error)
             }
+            throw error
         } catch (error: Throwable) {
-            if (!remoteTerminalSeen.get()) fail(transportException("request upload failed", error))
+            val transportError =
+                if (error is TrevRpcException) error else transportException(failureMessage, error)
+            if (!remoteTerminalSeen.get()) fail(transportError)
+            throw transportError
         }
     }
 
@@ -317,24 +342,51 @@ internal class Http3Exchange(
         buffer.flip()
         suspendCancellableCoroutine { continuation ->
             val pending = PendingWrite(buffer, endOfStream, continuation)
-            synchronized(writeLock) {
-                check(pendingWrite == null) { "only one Cronet write may be in flight" }
-                pendingWrite = pending
-            }
             continuation.invokeOnCancellation {
-                synchronized(writeLock) {
-                    if (pendingWrite === pending) pendingWrite = null
+                val canceledByCaller =
+                    synchronized(writeLock) {
+                        if (pendingWrite !== pending) {
+                            false
+                        } else {
+                            pendingWrite = null
+                            true
+                        }
+                    }
+                if (canceledByCaller) {
+                    fail(CancellationException("request write was canceled"))
                 }
-                cancelNative()
             }
-            try {
-                stream.write(buffer, endOfStream)
-                stream.flush()
-            } catch (error: Throwable) {
+            val installed =
                 synchronized(writeLock) {
-                    if (pendingWrite === pending) pendingWrite = null
+                    if (completed.get() || remoteTerminalSeen.get() || !continuation.isActive) {
+                        false
+                    } else {
+                        check(pendingWrite == null) { "only one Cronet write may be in flight" }
+                        pendingWrite = pending
+                        true
+                    }
                 }
-                continuation.resumeWithException(error)
+            if (!installed) {
+                if (continuation.isActive) {
+                    continuation.resumeWithException(CancellationException("RPC stream completed"))
+                }
+                return@suspendCancellableCoroutine
+            }
+
+            var dispatchError: Throwable? = null
+            synchronized(writeLock) {
+                if (pendingWrite === pending && !completed.get() && !remoteTerminalSeen.get()) {
+                    try {
+                        stream.write(buffer, endOfStream)
+                        stream.flush()
+                    } catch (error: Throwable) {
+                        pendingWrite = null
+                        dispatchError = error
+                    }
+                }
+            }
+            dispatchError?.let { error ->
+                if (continuation.isActive) continuation.resumeWithException(error)
             }
         }
     }
@@ -380,7 +432,8 @@ internal class Http3Exchange(
     }
 
     private fun finishRemoteStatus() {
-        if (completed.compareAndSet(false, true)) {
+        if (completeOnce()) {
+            writeReady.completeExceptionally(CancellationException("remote terminal status received"))
             responseBodies.close()
             readChunks.close()
             cancelPendingWrite(CancellationException("remote terminal status received"))
@@ -390,15 +443,15 @@ internal class Http3Exchange(
     }
 
     private fun beginRemoteStatus() {
-        if (remoteTerminalSeen.compareAndSet(false, true)) {
-            if (::uploadJob.isInitialized) uploadJob.cancel(CancellationException("remote terminal status received"))
+        if (beginRemoteTerminalOnce()) {
             cancelPendingWrite(CancellationException("remote terminal status received"))
             cancelNative()
         }
     }
 
     private fun finishEndOfResponse() {
-        if (completed.compareAndSet(false, true)) {
+        if (completeOnce()) {
+            writeReady.completeExceptionally(CancellationException("response ended"))
             responseBodies.close()
             readChunks.close()
             cancelPendingWrite(CancellationException("response ended"))
@@ -408,7 +461,8 @@ internal class Http3Exchange(
     }
 
     private fun fail(error: Throwable) {
-        if (completed.compareAndSet(false, true)) {
+        if (completeOnce()) {
+            writeReady.completeExceptionally(error)
             responseBodies.close(error)
             readChunks.close(error)
             cancelPendingWrite(error)
@@ -429,6 +483,22 @@ internal class Http3Exchange(
 
     private fun cancelNative() {
         if (canceled.compareAndSet(false, true)) runCatching(stream::cancel)
+    }
+
+    private fun completeOnce(): Boolean =
+        synchronized(writeLock) {
+            completed.compareAndSet(false, true)
+        }
+
+    private fun beginRemoteTerminalOnce(): Boolean =
+        synchronized(writeLock) {
+            remoteTerminalSeen.compareAndSet(false, true)
+        }
+
+    private fun checkSendOpen() {
+        if (completed.get() || sendFinished) {
+            throw TrevRpcException(Status.cancelled("request stream is closed"))
+        }
     }
 
     private data class ReadChunk(

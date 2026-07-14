@@ -150,7 +150,6 @@ internal fun benchmarkCallOptions(config: PeerCommand.Client): CallOptions =
         maxResponseBodySize = MAX_ENCODED_MESSAGE_BYTES,
         maxResponseMessages = config.messagesPerStream.coerceAtLeast(1),
         maxResponseStreamBodySize = null,
-        requestChannelCapacity = 1,
     )
 
 internal data class PhaseResult(
