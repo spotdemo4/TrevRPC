@@ -1,10 +1,9 @@
 package zip.trev.trevrpc.cronet
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertArrayEquals
@@ -17,12 +16,12 @@ import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.Code
 import zip.trev.trevrpc.FrameDecoder
 import zip.trev.trevrpc.RpcChannelState
+import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcStreamFrameKind
-import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
@@ -57,9 +56,9 @@ class Http3RpcTransportTest {
             runCurrent()
             fake.ready()
             runCurrent()
-            val upload = fake.onlyWrite()
-            assertTrue(upload.endOfStream)
-            assertRequestEquals(request, WireCodec.decodeRequest(decodeFrame(upload.bytes)))
+            val requestWrite = fake.onlyWrite()
+            assertTrue(requestWrite.endOfStream)
+            assertRequestEquals(request, WireCodec.decodeRequest(decodeFrame(requestWrite.bytes)))
             fake.completeWrite()
 
             fake.headers(validHeaders())
@@ -84,24 +83,17 @@ class Http3RpcTransportTest {
                     "Bidi",
                     kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value,
                 )
-            val stream = transport.openStream(request, flowOf(byteArrayOf(1), byteArrayOf(2)))
+            val opening = async { transport.openStream(request) }
+            runCurrent()
 
             fake.headers(validHeaders("Application/TrevRPC"))
             assertEquals(1, fake.pendingReads)
             fake.ready()
             runCurrent()
             assertRequestEquals(request, WireCodec.decodeRequest(decodeFrame(fake.onlyWrite().bytes)))
+            assertFalse(opening.isCompleted)
             fake.completeWrite()
-            runCurrent()
-            assertMessageWrite(fake.onlyWrite().bytes, byteArrayOf(1))
-            fake.completeWrite()
-            runCurrent()
-            assertMessageWrite(fake.onlyWrite().bytes, byteArrayOf(2))
-            fake.completeWrite()
-            runCurrent()
-            assertTrue(fake.onlyWrite().endOfStream)
-            assertArrayEquals(byteArrayOf(), fake.onlyWrite().bytes)
-            fake.completeWrite()
+            val stream = opening.await()
 
             val message = RpcStreamFrame.message(byteArrayOf(4, 5))
             val status = RpcStreamFrame.status(Status.ok())
@@ -121,6 +113,68 @@ class Http3RpcTransportTest {
         }
 
     @Test
+    fun `send waits for direct completion and serializes with finish`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext)
+            val stream = openStreaming(transport, fake)
+
+            val first = async { stream.send(byteArrayOf(1)) }
+            val second = async { stream.send(byteArrayOf(2)) }
+            val finish = async { stream.finishSend() }
+            runCurrent()
+
+            assertMessageWrite(fake.onlyWrite().bytes, byteArrayOf(1))
+            assertFalse(first.isCompleted)
+            assertFalse(second.isCompleted)
+            assertFalse(finish.isCompleted)
+
+            fake.completeWrite()
+            runCurrent()
+            assertTrue(first.isCompleted)
+            assertMessageWrite(fake.onlyWrite().bytes, byteArrayOf(2))
+            assertFalse(second.isCompleted)
+            assertFalse(finish.isCompleted)
+
+            fake.completeWrite()
+            runCurrent()
+            assertTrue(second.isCompleted)
+            assertTrue(fake.onlyWrite().endOfStream)
+            assertArrayEquals(byteArrayOf(), fake.onlyWrite().bytes)
+            assertFalse(finish.isCompleted)
+
+            fake.completeWrite()
+            finish.await()
+            stream.finishSend()
+            assertEquals(0, fake.pendingWrites)
+
+            val error = runCatching { stream.send(byteArrayOf(3)) }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.CANCELLED, error.status.code)
+            stream.close()
+        }
+
+    @Test
+    fun `canceling an in-flight send cancels the exchange`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext),
+                    fake,
+                )
+            val send = async { stream.send(byteArrayOf(1)) }
+            runCurrent()
+            assertEquals(1, fake.pendingWrites)
+
+            send.cancel()
+            runCurrent()
+
+            assertTrue(send.isCancelled)
+            assertEquals(1, fake.cancelCalls)
+            assertInstanceOf(CancellationException::class.java, stream.receiveFailure())
+        }
+
+    @Test
     fun `response channel backpressures subsequent Cronet reads`() =
         runTest {
             val fake = FakeFactory()
@@ -130,7 +184,7 @@ class Http3RpcTransportTest {
                     CronetTransportOptions(responseChannelCapacity = 1),
                     coroutineContext,
                 )
-            val stream = transport.openStream(streamRequest(), flowOf())
+            val stream = openStreaming(transport, fake)
             fake.headers(validHeaders())
             val frames =
                 (1..3).fold(byteArrayOf()) { bytes, value ->
@@ -189,8 +243,10 @@ class Http3RpcTransportTest {
             invalid.forEach { headers ->
                 val fake = FakeFactory()
                 val stream =
-                    Http3RpcTransport(fake, coroutineContext = coroutineContext)
-                        .openStream(streamRequest(), flowOf())
+                    openStreaming(
+                        Http3RpcTransport(fake, coroutineContext = coroutineContext),
+                        fake,
+                    )
                 fake.headers(headers)
                 val error = stream.receiveFailure()
                 assertInstanceOf(TrevRpcException::class.java, error)
@@ -203,8 +259,10 @@ class Http3RpcTransportTest {
         runTest {
             val earlyFake = FakeFactory()
             val early =
-                Http3RpcTransport(earlyFake, coroutineContext = coroutineContext)
-                    .openStream(streamRequest(), flowOf())
+                openStreaming(
+                    Http3RpcTransport(earlyFake, coroutineContext = coroutineContext),
+                    earlyFake,
+                )
             earlyFake.headers(validHeaders())
             earlyFake.deliverRead(byteArrayOf(), endOfStream = true)
             runCurrent()
@@ -212,8 +270,10 @@ class Http3RpcTransportTest {
 
             val partialFake = FakeFactory()
             val partial =
-                Http3RpcTransport(partialFake, coroutineContext = coroutineContext)
-                    .openStream(streamRequest(), flowOf())
+                openStreaming(
+                    Http3RpcTransport(partialFake, coroutineContext = coroutineContext),
+                    partialFake,
+                )
             partialFake.headers(validHeaders())
             partialFake.deliverRead(byteArrayOf(0, 0), endOfStream = true)
             runCurrent()
@@ -222,7 +282,7 @@ class Http3RpcTransportTest {
         }
 
     @Test
-    fun `remote terminal status wins while upload is still pending`() =
+    fun `remote terminal status wins while direct send is still pending`() =
         runTest {
             val fake = FakeFactory()
             val transport =
@@ -231,15 +291,8 @@ class Http3RpcTransportTest {
                     CronetTransportOptions(responseChannelCapacity = 1),
                     coroutineContext,
                 )
-            val requestBody =
-                flow {
-                    emit(byteArrayOf(1))
-                    awaitCancellation()
-                }
-            val stream = transport.openStream(streamRequest(), requestBody)
-            fake.ready()
-            runCurrent()
-            fake.completeWrite()
+            val stream = openStreaming(transport, fake)
+            val send = async { stream.send(byteArrayOf(1)) }
             runCurrent()
             assertFalse(fake.onlyWrite().endOfStream)
             fake.headers(validHeaders())
@@ -247,7 +300,9 @@ class Http3RpcTransportTest {
             val terminal = RpcStreamFrame.status(Status.unavailable("remote result"))
             fake.deliverRead(frame(WireCodec.encode(message)) + frame(WireCodec.encode(terminal)))
             runCurrent()
-            fake.fail(IllegalStateException("late upload close failure"))
+            fake.completeWrite()
+            fake.fail(IllegalStateException("late request write failure"))
+            assertTrue(send.isCancelled)
 
             assertArrayEquals(message.body, stream.receive()?.body)
             runCurrent()
@@ -263,8 +318,10 @@ class Http3RpcTransportTest {
         runTest {
             val fake = FakeFactory()
             val stream =
-                Http3RpcTransport(fake, coroutineContext = coroutineContext)
-                    .openStream(streamRequest(), flowOf())
+                openStreaming(
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext),
+                    fake,
+                )
             stream.close()
             stream.close()
             fake.cancelCallback()
@@ -278,8 +335,10 @@ class Http3RpcTransportTest {
         runTest {
             val fake = FakeFactory()
             val stream =
-                Http3RpcTransport(fake, coroutineContext = coroutineContext)
-                    .openStream(streamRequest(), flowOf())
+                openStreaming(
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext),
+                    fake,
+                )
             fake.fail(IllegalArgumentException("first"))
             fake.cancelCallback()
             fake.fail(IllegalStateException("second"))
@@ -291,7 +350,25 @@ class Http3RpcTransportTest {
         }
 }
 
-private suspend fun RpcTransportStream.receiveFailure(): Throwable =
+@OptIn(ExperimentalCoroutinesApi::class)
+private suspend fun TestScope.openStreaming(
+    transport: Http3RpcTransport,
+    fake: FakeFactory,
+    request: RpcRequest = streamRequest(),
+): RpcClientStream {
+    val opening = async { transport.openStream(request) }
+    runCurrent()
+    fake.ready()
+    runCurrent()
+    assertFalse(opening.isCompleted)
+    val initial = fake.onlyWrite()
+    assertFalse(initial.endOfStream)
+    assertRequestEquals(request, WireCodec.decodeRequest(decodeFrame(initial.bytes)))
+    fake.completeWrite()
+    return opening.await()
+}
+
+private suspend fun RpcClientStream.receiveFailure(): Throwable =
     runCatching { receive() }.exceptionOrNull() ?: error("receive unexpectedly succeeded")
 
 private fun streamRequest(): RpcRequest = RpcRequest("example.Service", "Stream", kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value)
@@ -332,6 +409,9 @@ private class FakeFactory : DuplexStreamFactory {
 
     val pendingReads: Int
         get() = stream.reads.size
+
+    val pendingWrites: Int
+        get() = stream.writes.size
 
     override fun open(callback: DuplexCallback): DuplexStream {
         this.callback = callback
@@ -382,6 +462,7 @@ private class FakeStream : DuplexStream {
         endOfStream: Boolean,
     ) {
         check(buffer.isDirect)
+        check(writes.isEmpty()) { "only one write may be in flight" }
         val copy = buffer.duplicate()
         val bytes = ByteArray(copy.remaining())
         copy.get(bytes)

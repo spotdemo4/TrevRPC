@@ -2,7 +2,6 @@ package zip.trev.trevrpc.netty
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -10,11 +9,11 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.Code
 import zip.trev.trevrpc.RpcChannelState
+import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcTransport
-import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import java.util.concurrent.atomic.AtomicInteger
@@ -257,11 +256,12 @@ private class TestGeneration(
                 return unary()
             }
 
-            override suspend fun openStream(
-                request: RpcRequest,
-                requestBody: Flow<ByteArray>,
-            ): RpcTransportStream =
-                object : RpcTransportStream {
+            override suspend fun openStream(request: RpcRequest): RpcClientStream =
+                object : RpcClientStream {
+                    override suspend fun send(body: ByteArray) = Unit
+
+                    override suspend fun finishSend() = Unit
+
                     override suspend fun receive(): RpcStreamFrame? = null
 
                     override suspend fun close(cause: Throwable?) = Unit

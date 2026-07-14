@@ -1,13 +1,16 @@
 package zip.trev.trevrpc.bench
 
-import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
+import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
+import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcTransport
-import zip.trev.trevrpc.RpcTransportStream
 import zip.trev.trevrpc.Server
 import zip.trev.trevrpc.benchmark.v1.BenchmarkServiceClient
 import java.nio.file.Path
@@ -48,9 +51,25 @@ class WorkloadTest {
     ) : RpcTransport {
         override suspend fun unary(request: RpcRequest): RpcResponse = server.handleUnary(request)
 
-        override suspend fun openStream(
-            request: RpcRequest,
-            requestBody: Flow<ByteArray>,
-        ): RpcTransportStream = server.handleStreaming(request, requestBody)
+        override suspend fun openStream(request: RpcRequest): RpcClientStream {
+            val requests = Channel<ByteArray>(1)
+            val responses = server.handleStreaming(request, requests.receiveAsFlow())
+            return object : RpcClientStream {
+                override suspend fun send(body: ByteArray) {
+                    requests.send(body.copyOf())
+                }
+
+                override suspend fun finishSend() {
+                    requests.close()
+                }
+
+                override suspend fun receive(): RpcStreamFrame? = responses.receive()
+
+                override suspend fun close(cause: Throwable?) {
+                    requests.cancel(CancellationException("in-memory request stream closed", cause))
+                    responses.close(cause)
+                }
+            }
+        }
     }
 }

@@ -2,13 +2,15 @@ package zip.trev.trevrpc
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -67,16 +69,78 @@ class ClientRuntimeTest {
         }
 
     @Test
+    fun `streaming calls send directly and finish exactly once`() =
+        runTest {
+            val stream =
+                RecordingClientStream(
+                    RpcStreamFrame.message("reply".encodeToByteArray()),
+                    RpcStreamFrame.status(Status.ok()),
+                )
+            val call =
+                Client(SingleStreamTransport(stream))
+                    .clientStreaming<String, String>("svc", "method", strings, strings)
+
+            call.send("request")
+            assertEquals(1, stream.sent.size)
+            assertArrayEquals("request".encodeToByteArray(), stream.sent.single())
+            call.closeSend()
+            call.closeSend()
+            assertEquals(1, stream.finishes)
+            assertCode(Code.CANCELLED) { call.send("late") }
+            assertEquals("reply", call.receive().message)
+            assertEquals(1, stream.closes)
+
+            val serverStream = RecordingClientStream(RpcStreamFrame.status(Status.ok()))
+            Client(SingleStreamTransport(serverStream))
+                .serverStreaming("svc", "method", "request", strings, strings)
+            assertEquals(1, serverStream.finishes)
+        }
+
+    @Test
+    fun `request writes and half close obey the RPC deadline`() =
+        runTest {
+            val sendCloses = AtomicInteger()
+            val blockedSend =
+                SequenceStream(onClose = { sendCloses.incrementAndGet() }) { awaitCancellation() }
+                    .apply { sendOperation = { awaitCancellation() } }
+            val upload =
+                Client(SingleStreamTransport(blockedSend))
+                    .clientStreaming<String, String>(
+                        "svc",
+                        "method",
+                        strings,
+                        strings,
+                        CallOptions(timeout = 1.seconds),
+                    )
+            assertCode(Code.DEADLINE_EXCEEDED) { upload.send("request") }
+            assertEquals(1, sendCloses.get())
+
+            val finishCloses = AtomicInteger()
+            val blockedFinish =
+                SequenceStream(onClose = { finishCloses.incrementAndGet() }) { awaitCancellation() }
+                    .apply { finishOperation = { awaitCancellation() } }
+            assertCode(Code.DEADLINE_EXCEEDED) {
+                Client(SingleStreamTransport(blockedFinish))
+                    .serverStreaming(
+                        "svc",
+                        "method",
+                        "request",
+                        strings,
+                        strings,
+                        CallOptions(timeout = 1.seconds),
+                    )
+            }
+            assertEquals(1, finishCloses.get())
+        }
+
+    @Test
     fun `client enforces deadline idle message body and per-message limits`() =
         runTest {
             val pendingTransport =
                 object : RpcTransport {
                     override suspend fun unary(request: RpcRequest): RpcResponse = awaitCancellation()
 
-                    override suspend fun openStream(
-                        request: RpcRequest,
-                        requestBody: Flow<ByteArray>,
-                    ): RpcTransportStream = SequenceStream { awaitCancellation() }
+                    override suspend fun openStream(request: RpcRequest): RpcClientStream = SequenceStream { awaitCancellation() }
                 }
             val client = Client(pendingTransport)
             assertCode(Code.DEADLINE_EXCEEDED) {
@@ -201,10 +265,7 @@ class ClientRuntimeTest {
                                 body = ByteArray(1024),
                             )
 
-                        override suspend fun openStream(
-                            request: RpcRequest,
-                            requestBody: Flow<ByteArray>,
-                        ): RpcTransportStream = StaticStreamTransport().openStream(request, requestBody)
+                        override suspend fun openStream(request: RpcRequest): RpcClientStream = StaticStreamTransport().openStream(request)
                     },
                 )
             assertCode(Code.UNAVAILABLE) {
@@ -227,10 +288,8 @@ class ClientRuntimeTest {
                 object : RpcTransport {
                     override suspend fun unary(request: RpcRequest): RpcResponse = RpcResponse.ok(byteArrayOf())
 
-                    override suspend fun openStream(
-                        request: RpcRequest,
-                        requestBody: Flow<ByteArray>,
-                    ): RpcTransportStream = SequenceStream(onClose = { closes.incrementAndGet() }) { awaitCancellation() }
+                    override suspend fun openStream(request: RpcRequest): RpcClientStream =
+                        SequenceStream(onClose = { closes.incrementAndGet() }) { awaitCancellation() }
                 }
             val call = Client(transport).bidirectionalStreaming<String, String>("svc", "method", strings, strings)
             call.close()
@@ -242,7 +301,11 @@ class ClientRuntimeTest {
     fun `terminal status cleanup preserves coroutine cancellation`() =
         runTest {
             val stream =
-                object : RpcTransportStream {
+                object : RpcClientStream {
+                    override suspend fun send(body: ByteArray) = Unit
+
+                    override suspend fun finishSend() = Unit
+
                     override suspend fun receive(): RpcStreamFrame = RpcStreamFrame.status(Status.unavailable("remote down"))
 
                     override suspend fun close(cause: Throwable?): Unit = throw CancellationException("close cancelled")
@@ -275,10 +338,26 @@ private class InMemoryTransport(
 ) : RpcTransport {
     override suspend fun unary(request: RpcRequest): RpcResponse = server.handleUnary(request)
 
-    override suspend fun openStream(
-        request: RpcRequest,
-        requestBody: Flow<ByteArray>,
-    ): RpcTransportStream = server.handleStreaming(request, requestBody)
+    override suspend fun openStream(request: RpcRequest): RpcClientStream {
+        val requests = Channel<ByteArray>(1)
+        val responses = server.handleStreaming(request, requests.receiveAsFlow())
+        return object : RpcClientStream {
+            override suspend fun send(body: ByteArray) {
+                requests.send(body.copyOf())
+            }
+
+            override suspend fun finishSend() {
+                requests.close()
+            }
+
+            override suspend fun receive(): RpcStreamFrame? = responses.receive()
+
+            override suspend fun close(cause: Throwable?) {
+                requests.cancel(CancellationException("in-memory request stream closed", cause))
+                responses.close(cause)
+            }
+        }
+    }
 }
 
 private class StaticStreamTransport(
@@ -288,33 +367,63 @@ private class StaticStreamTransport(
 
     override suspend fun unary(request: RpcRequest): RpcResponse = RpcResponse.fromStatus(Status.unimplemented("unary"))
 
-    override suspend fun openStream(
-        request: RpcRequest,
-        requestBody: Flow<ByteArray>,
-    ): RpcTransportStream {
+    override suspend fun openStream(request: RpcRequest): RpcClientStream {
         val iterator = frames.iterator()
         return SequenceStream { if (iterator.hasNext()) iterator.next() else null }
     }
 }
 
 private class SingleStreamTransport(
-    private val stream: RpcTransportStream,
+    private val stream: RpcClientStream,
 ) : RpcTransport {
     override suspend fun unary(request: RpcRequest): RpcResponse = RpcResponse.fromStatus(Status.unimplemented("unary"))
 
-    override suspend fun openStream(
-        request: RpcRequest,
-        requestBody: Flow<ByteArray>,
-    ): RpcTransportStream = stream
+    override suspend fun openStream(request: RpcRequest): RpcClientStream = stream
 }
 
 private class SequenceStream(
     private val onClose: () -> Unit = {},
     private val next: suspend () -> RpcStreamFrame?,
-) : RpcTransportStream {
+) : RpcClientStream {
+    var sendOperation: suspend () -> Unit = {}
+    var finishOperation: suspend () -> Unit = {}
+
+    override suspend fun send(body: ByteArray) = sendOperation()
+
+    override suspend fun finishSend() = finishOperation()
+
     override suspend fun receive(): RpcStreamFrame? = next()
 
     override suspend fun close(cause: Throwable?) {
         onClose()
+    }
+}
+
+private class RecordingClientStream(
+    vararg frames: RpcStreamFrame,
+) : RpcClientStream {
+    private val frames = frames.iterator()
+    private var sendFinished = false
+    val sent = mutableListOf<ByteArray>()
+    var finishes = 0
+        private set
+    var closes = 0
+        private set
+
+    override suspend fun send(body: ByteArray) {
+        if (sendFinished) throw TrevRpcException(Status.cancelled("request stream is closed"))
+        sent += body.copyOf()
+    }
+
+    override suspend fun finishSend() {
+        if (sendFinished) return
+        sendFinished = true
+        finishes++
+    }
+
+    override suspend fun receive(): RpcStreamFrame? = if (frames.hasNext()) frames.next() else null
+
+    override suspend fun close(cause: Throwable?) {
+        closes++
     }
 }
