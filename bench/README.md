@@ -18,8 +18,12 @@ packages Netty's Linux x86-64 native QUIC transport.
 
 The resulting `bin` directory contains `trevrpc-bench` and one
 `trevrpc-bench-peer-*` executable for C, C++, Go, JavaScript, Kotlin, and Rust.
-Peers live and build in their associated `trevrpc-*` directory. The canonical
-RPC contract and process protocol live under `bench/`.
+Peers are packaged separately from their associated `trevrpc-*` consumer
+packages. The canonical RPC contract and process protocol live under `bench/`.
+Individual Nix packages use the `trevrpc-<language>-bench-peer` attribute names.
+The JavaScript peer's nested npm manifest is private until `trevrpc-js` is
+published; the supported distributable peer package is currently its Nix
+package.
 
 ## Run
 

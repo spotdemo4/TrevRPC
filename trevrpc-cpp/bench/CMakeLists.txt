@@ -105,4 +105,6 @@ if(TREVRPC_CPP_BUILD_TESTS)
   set_tests_properties(trevrpc_cpp_grpc_adapter PROPERTIES TIMEOUT 30)
 endif()
 
-install(TARGETS trevrpc_cpp_bench_peer RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS trevrpc_cpp_bench_peer
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  COMPONENT benchmark-peer)

@@ -385,6 +385,7 @@ endif()
 if(TARGET trevrpc_bench_peer_c)
     install(TARGETS trevrpc_bench_peer_c
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT benchmark-peer
     )
 endif()
 install(EXPORT trevrpcTargets

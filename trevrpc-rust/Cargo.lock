@@ -2227,8 +2227,6 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
- "tonic",
- "tonic-prost",
  "tracing",
  "tracing-subscriber",
  "url",

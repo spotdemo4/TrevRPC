@@ -164,7 +164,7 @@
         };
 
         # nix build [#...]
-        packages = {
+        packages = rec {
           trevrpc-bench = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
               pname = "trevrpc-bench";
@@ -231,7 +231,7 @@
                   -DCMAKE_INSTALL_LIBEXECDIR="$lib/libexec" \
                   -DTREVRPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc" \
                   -DTREVRPC_INSTALL_PKGCONFIGDIR="$dev/lib/pkgconfig" \
-                  -DTREVRPC_BUILD_BENCHMARKS=ON \
+                  -DTREVRPC_BUILD_BENCHMARKS=OFF \
                   -DTREVRPC_BUILD_TESTS=ON
                 runHook postConfigure
               '';
@@ -245,7 +245,6 @@
                 protobufc
               ];
               buildInputs = with pkgs; [
-                grpc
                 protobufc
               ];
               propagatedBuildInputs = with pkgs; [
@@ -262,7 +261,7 @@
                 runHook preCheck
                 export HOME=$TMPDIR
                 clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' \))
-                clang-tidy --quiet $(find bench examples src tests tools -name '*.c') -- \
+                clang-tidy --quiet $(find examples src tests tools -name '*.c') -- \
                   -x c \
                   -std=c11 \
                   -Iinclude \
@@ -289,6 +288,43 @@
                 homepage = "https://trev.zip/llc/TrevRPC";
                 changelog = "https://trev.zip/llc/TrevRPC/releases";
                 downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+              };
+            }
+          );
+
+          trevrpc-c-bench-peer = trevrpc-c.overrideAttrs (
+            old: with pkgs.lib; {
+              pname = "trevrpc-c-bench-peer";
+              outputs = [ "out" ];
+
+              configurePhase = ''
+                runHook preConfigure
+                cmake -S . -B build \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_INSTALL_BINDIR="$out/bin" \
+                  -DTREVRPC_BUILD_BENCHMARKS=ON \
+                  -DTREVRPC_BUILD_TESTS=ON
+                runHook postConfigure
+              '';
+              buildInputs = (old.buildInputs or [ ]) ++ [ pkgs.grpc ];
+
+              doCheck = true;
+              checkPhase = ''
+                runHook preCheck
+                ctest --test-dir build --output-on-failure
+                runHook postCheck
+              '';
+              installPhase = ''
+                runHook preInstall
+                cmake --install build --component benchmark-peer
+                runHook postInstall
+              '';
+
+              meta = {
+                mainProgram = "trevrpc-bench-peer-c";
+                description = "C TrevRPC and gRPC benchmark peer";
+                license = licenses.mit;
+                platforms = platforms.linux;
               };
             }
           );
@@ -323,7 +359,7 @@
                   -DCMAKE_INSTALL_LIBEXECDIR="$lib/libexec" \
                   -DTREVRPC_CPP_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc-cpp" \
                   -DTREVRPC_CPP_TREVRPC_C_ROOT= \
-                  -DTREVRPC_CPP_BUILD_BENCHMARKS=ON \
+                  -DTREVRPC_CPP_BUILD_BENCHMARKS=OFF \
                   -DTREVRPC_CPP_BUILD_TESTS=ON \
                   -DTREVRPC_CPP_BUILD_EXAMPLES=ON
                 runHook postConfigure
@@ -332,12 +368,10 @@
               nativeBuildInputs = with pkgs; [
                 clang-tools
                 cmake
-                grpc
                 openssl
                 protobuf
               ];
               propagatedBuildInputs = with pkgs; [
-                grpc
                 self.packages.${system}.trevrpc-c
                 protobuf
               ];
@@ -360,11 +394,7 @@
                   tests/codec_test.cpp \
                    tests/generated_service_test.cpp \
                    tests/generator_options_test.cpp \
-                   bench/benchmark_peer.cpp \
-                   bench/grpc_adapter.cpp \
-                   bench/grpc_adapter_test.cpp \
-                   bench/trevrpc_bench_peer.cpp \
-                  examples/greeter/client.cpp \
+                   examples/greeter/client.cpp \
                   examples/greeter/server.cpp
                 ctest --test-dir build --output-on-failure
                 cmake --install build
@@ -392,6 +422,48 @@
             }
           );
 
+          trevrpc-cpp-bench-peer = trevrpc-cpp.overrideAttrs (
+            old: with pkgs.lib; {
+              pname = "trevrpc-cpp-bench-peer";
+              outputs = [ "out" ];
+
+              configurePhase = ''
+                runHook preConfigure
+                cmake -S . -B build \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_INSTALL_BINDIR="$out/bin" \
+                  -DTREVRPC_CPP_TREVRPC_C_ROOT= \
+                  -DTREVRPC_CPP_BUILD_BENCHMARKS=ON \
+                  -DTREVRPC_CPP_BUILD_CODEGEN=ON \
+                  -DTREVRPC_CPP_BUILD_EXAMPLES=OFF \
+                  -DTREVRPC_CPP_BUILD_TESTS=ON
+                runHook postConfigure
+              '';
+              nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.grpc ];
+              buildInputs = (old.propagatedBuildInputs or [ ]) ++ [ pkgs.grpc ];
+              propagatedBuildInputs = [ ];
+
+              doCheck = true;
+              checkPhase = ''
+                runHook preCheck
+                ctest --test-dir build --output-on-failure
+                runHook postCheck
+              '';
+              installPhase = ''
+                runHook preInstall
+                cmake --install build --component benchmark-peer
+                runHook postInstall
+              '';
+
+              meta = {
+                mainProgram = "trevrpc-bench-peer-cpp";
+                description = "C++ TrevRPC and gRPC benchmark peer";
+                license = licenses.mit;
+                platforms = platforms.linux;
+              };
+            }
+          );
+
           trevrpc-rust = pkgs.rustPlatform.buildRustPackage (
             final: with pkgs.lib; {
               pname = "trevrpc-rust";
@@ -407,7 +479,10 @@
               };
               sourceRoot = "${final.src.name}/trevrpc-rust";
               cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
-              cargoBuildFlags = [ "--workspace" ];
+              cargoBuildFlags = [
+                "--package"
+                "protoc-gen-trevrpc-rust"
+              ];
 
               doCheck = false;
               nativeCheckInputs = with pkgs; [
@@ -423,9 +498,7 @@
               installPhase = ''
                 runHook preInstall
                 generator=$(find target -path '*/release/protoc-gen-trevrpc-rust' -type f -perm -0100 | head -n1)
-                peer=$(find target -path '*/release/trevrpc-bench-peer-rust' -type f -perm -0100 | head -n1)
                 install -Dm755 "$generator" $out/bin/protoc-gen-trevrpc-rust
-                install -Dm755 "$peer" $out/bin/trevrpc-bench-peer-rust
                 runHook postInstall
               '';
 
@@ -437,6 +510,36 @@
                 homepage = "https://trev.zip/llc/TrevRPC";
                 changelog = "https://trev.zip/llc/TrevRPC/releases";
                 downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+              };
+            }
+          );
+
+          trevrpc-rust-bench-peer = trevrpc-rust.overrideAttrs (
+            old: with pkgs.lib; {
+              pname = "trevrpc-rust-bench-peer";
+              cargoBuildFlags = [
+                "--package"
+                "trevrpc-bench-peer"
+              ];
+
+              doCheck = true;
+              checkPhase = ''
+                runHook preCheck
+                cargo test --package trevrpc-bench-peer --offline
+                runHook postCheck
+              '';
+              installPhase = ''
+                runHook preInstall
+                peer=$(find target -path '*/release/trevrpc-bench-peer-rust' -type f -perm -0100 | head -n1)
+                install -Dm755 "$peer" $out/bin/trevrpc-bench-peer-rust
+                runHook postInstall
+              '';
+
+              meta = {
+                mainProgram = "trevrpc-bench-peer-rust";
+                description = "Rust TrevRPC and gRPC benchmark peer";
+                license = licenses.mit;
+                platforms = platforms.linux;
               };
             }
           );
@@ -455,14 +558,9 @@
                 ];
               };
               sourceRoot = "${final.src.name}/trevrpc-go";
-              vendorHash = "sha256-+Qq36WRF5ddke4HwDD3ty+MpgKToT0Y64PA5YIafUFk=";
-              subPackages = [
-                "cmd/protoc-gen-trevrpc-go"
-                "cmd/trevrpc-bench-peer"
-              ];
-              postInstall = ''
-                mv $out/bin/trevrpc-bench-peer $out/bin/trevrpc-bench-peer-go
-              '';
+              env.GOWORK = "off";
+              vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
+              subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
 
               doCheck = false;
               nativeCheckInputs = with pkgs; [
@@ -489,6 +587,53 @@
             }
           );
 
+          trevrpc-go-bench-peer = pkgs.buildGoModule (
+            final: with pkgs.lib; {
+              pname = "trevrpc-go-bench-peer";
+              version = "0.1.0";
+
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./bench/proto
+                  ./trevrpc-go
+                ];
+              };
+              sourceRoot = "${final.src.name}/trevrpc-go/cmd/trevrpc-bench-peer";
+              env.GOWORK = "off";
+              vendorHash = "sha256-6vRmNAlXFa8OoR2AAs849+JR6CvNYwSR1aHSEasnqcI=";
+              postPatch = ''
+                go mod edit -replace=trev.zip/llc/trevrpc/trevrpc-go=../..
+              '';
+              subPackages = [ "." ];
+              postInstall = ''
+                mv $out/bin/trevrpc-bench-peer $out/bin/trevrpc-bench-peer-go
+              '';
+
+              doCheck = true;
+              nativeCheckInputs = with pkgs; [
+                go-tools
+                gotools
+              ];
+              checkPhase = ''
+                runHook preCheck
+                export HOME=$(mktemp -d)
+                go test ./...
+                go vet ./...
+                staticcheck ./...
+                modernize ./...
+                runHook postCheck
+              '';
+
+              meta = {
+                mainProgram = "trevrpc-bench-peer-go";
+                description = "Go TrevRPC and gRPC benchmark peer";
+                license = licenses.mit;
+                platforms = platforms.linux;
+              };
+            }
+          );
+
           trevrpc-js = pkgs.buildNpmPackage (
             final: with pkgs.lib; {
               pname = "trevrpc-js";
@@ -497,7 +642,6 @@
               src = fileset.toSource {
                 root = ./.;
                 fileset = fileset.unions [
-                  ./bench/proto
                   ./testdata/wire-golden-vectors.txt
                   ./trevrpc-js
                 ];
@@ -555,6 +699,54 @@
             }
           );
 
+          trevrpc-js-bench-peer = pkgs.buildNpmPackage (
+            final: with pkgs.lib; {
+              pname = "trevrpc-js-bench-peer";
+              version = "0.1.0";
+
+              src = fileset.toSource {
+                root = ./.;
+                fileset = fileset.unions [
+                  ./bench/proto
+                  ./trevrpc-js
+                ];
+              };
+              sourceRoot = "${final.src.name}/trevrpc-js/bench";
+              nodejs = pkgs.nodejs_24;
+
+              npmConfigHook = pkgs.importNpmLock.npmConfigHook;
+              npmDeps = pkgs.importNpmLock {
+                npmRoot = ./trevrpc-js/bench;
+              };
+
+              dontNpmBuild = true;
+              preBuild = ''
+                ln -s ${self.packages.${system}.trevrpc-js}/lib/node_modules/trevrpc-js \
+                  node_modules/trevrpc-js
+              '';
+
+              doCheck = true;
+              nativeCheckInputs = [ pkgs.openssl ];
+              checkPhase = ''
+                runHook preCheck
+                npm test
+                runHook postCheck
+              '';
+              postInstall = ''
+                mkdir -p $out/lib/node_modules/trevrpc-bench-peer-js/node_modules
+                ln -s ${self.packages.${system}.trevrpc-js}/lib/node_modules/trevrpc-js \
+                  $out/lib/node_modules/trevrpc-bench-peer-js/node_modules/trevrpc-js
+              '';
+
+              meta = {
+                mainProgram = "trevrpc-bench-peer-js";
+                description = "JavaScript TrevRPC and gRPC benchmark peer";
+                license = licenses.mit;
+                platforms = platforms.linux;
+              };
+            }
+          );
+
           trevrpc-kotlin = pkgs.stdenvNoCC.mkDerivation (
             final: with pkgs.lib; {
               pname = "trevrpc-kotlin";
@@ -588,8 +780,9 @@
                 "-Dorg.gradle.java.home=${pkgs.jdk25.home}"
               ];
               gradleBuildTask = [
-                "assemble"
-                ":bench-peer:installDist"
+                ":core:assemble"
+                ":transport-cronet:assemble"
+                ":transport-netty:assemble"
                 ":examples:installDist"
                 ":protoc-gen-trevrpc-kotlin:installDist"
               ];
@@ -605,17 +798,10 @@
                 runHook preInstall
                 mkdir -p $out/bin $out/share/trevrpc-kotlin
                 cp -R examples/build/install/trevrpc-xruntime-kotlin/* $out/share/trevrpc-kotlin/
-                cp -R bench-peer/build/install/trevrpc-bench-peer-kotlin \
-                  $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin
                 cp -R protoc-gen-trevrpc-kotlin/build/install/protoc-gen-trevrpc-kotlin \
                   $out/share/trevrpc-kotlin/protoc-gen-trevrpc-kotlin
                 makeWrapper $out/share/trevrpc-kotlin/bin/trevrpc-xruntime-kotlin \
                   $out/bin/trevrpc-xruntime-kotlin \
-                  --set JAVA_HOME ${pkgs.jdk25.home} \
-                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk25 ]}
-                makeWrapper \
-                  $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin/bin/trevrpc-bench-peer-kotlin \
-                  $out/bin/trevrpc-bench-peer-kotlin \
                   --set JAVA_HOME ${pkgs.jdk25.home} \
                   --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk25 ]}
                 makeWrapper \
@@ -640,16 +826,49 @@
             }
           );
 
+          trevrpc-kotlin-bench-peer = trevrpc-kotlin.overrideAttrs (
+            old: with pkgs.lib; {
+              pname = "trevrpc-kotlin-bench-peer";
+              gradleBuildTask = [ ":bench-peer:installDist" ];
+
+              doCheck = true;
+              gradleCheckTask = ":bench-peer:check";
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out/bin $out/share/trevrpc-kotlin
+                cp -R bench-peer/build/install/trevrpc-bench-peer-kotlin \
+                  $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin
+                makeWrapper \
+                  $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin/bin/trevrpc-bench-peer-kotlin \
+                  $out/bin/trevrpc-bench-peer-kotlin \
+                  --set JAVA_HOME ${pkgs.jdk25.home} \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.jdk25 ]}
+                runHook postInstall
+              '';
+
+              meta = {
+                mainProgram = "trevrpc-bench-peer-kotlin";
+                description = "Kotlin TrevRPC and gRPC benchmark peer";
+                license = licenses.mit;
+                platforms = [ "x86_64-linux" ];
+                sourceProvenance = with sourceTypes; [
+                  fromSource
+                  binaryBytecode
+                ];
+              };
+            }
+          );
+
           trevrpc-bench-suite = pkgs.symlinkJoin {
             name = "trevrpc-bench-suite";
             paths = [
               self.packages.${system}.trevrpc-bench
-              self.packages.${system}.trevrpc-c
-              self.packages.${system}.trevrpc-cpp
-              self.packages.${system}.trevrpc-go
-              self.packages.${system}.trevrpc-js
-              self.packages.${system}.trevrpc-kotlin
-              self.packages.${system}.trevrpc-rust
+              self.packages.${system}.trevrpc-c-bench-peer
+              self.packages.${system}.trevrpc-cpp-bench-peer
+              self.packages.${system}.trevrpc-go-bench-peer
+              self.packages.${system}.trevrpc-js-bench-peer
+              self.packages.${system}.trevrpc-kotlin-bench-peer
+              self.packages.${system}.trevrpc-rust-bench-peer
             ];
             meta.platforms = [ "x86_64-linux" ];
           };
@@ -739,12 +958,12 @@
 
           benchmark-peer-capabilities =
             let
-              c = self.packages.${system}.trevrpc-c;
-              cpp = self.packages.${system}.trevrpc-cpp;
-              go = self.packages.${system}.trevrpc-go;
-              js = self.packages.${system}.trevrpc-js;
-              kotlin = self.packages.${system}.trevrpc-kotlin;
-              rust = self.packages.${system}.trevrpc-rust;
+              c = self.packages.${system}.trevrpc-c-bench-peer;
+              cpp = self.packages.${system}.trevrpc-cpp-bench-peer;
+              go = self.packages.${system}.trevrpc-go-bench-peer;
+              js = self.packages.${system}.trevrpc-js-bench-peer;
+              kotlin = self.packages.${system}.trevrpc-kotlin-bench-peer;
+              rust = self.packages.${system}.trevrpc-rust-bench-peer;
             in
             pkgs.runCommand "trevrpc-benchmark-peer-capabilities-check" { nativeBuildInputs = [ pkgs.jq ]; } ''
               check_capabilities() {
@@ -788,10 +1007,36 @@
             let
               c = self.packages.${system}.trevrpc-c;
               cpp = self.packages.${system}.trevrpc-cpp;
+              go = self.packages.${system}.trevrpc-go;
               js = self.packages.${system}.trevrpc-js;
+              kotlin = self.packages.${system}.trevrpc-kotlin;
+              rust = self.packages.${system}.trevrpc-rust;
+              consumerClosure = pkgs.closureInfo {
+                rootPaths = [
+                  c
+                  cpp
+                  go
+                  js
+                  kotlin
+                  rust
+                ];
+              };
             in
             pkgs.runCommand "trevrpc-native-package-outputs-check" { } ''
+              if ${pkgs.gnugrep}/bin/grep -Eiq '(grpc|tonic)' ${consumerClosure}/store-paths; then
+                echo "consumer package closure contains a gRPC or Tonic store path" >&2
+                exit 1
+              fi
+              ! ${pkgs.gnugrep}/bin/grep -q '@grpc/' ${./trevrpc-js/package.json}
+              ! ${pkgs.gnugrep}/bin/grep -q 'google.golang.org/grpc' ${./trevrpc-go/go.mod}
+              ! ${pkgs.gnugrep}/bin/grep -Eq '^tonic(-prost)?[[:space:]]*=' ${./trevrpc-rust/Cargo.toml}
+              if find ${kotlin} -iname '*grpc*' -o -iname '*tonic*' | ${pkgs.gnugrep}/bin/grep -q .; then
+                echo "Kotlin consumer package contains a gRPC or Tonic artifact" >&2
+                exit 1
+              fi
+
               test -x ${c}/bin/protoc-gen-trevrpc-c
+              test ! -e ${c}/bin/trevrpc-bench-peer-c
               test -f ${c.dev}/include/trevrpc_binding.h
               test -f ${c.dev}/lib/cmake/trevrpc/trevrpcConfig.cmake
               test -f ${c.dev}/lib/pkgconfig/trevrpc.pc
@@ -807,6 +1052,7 @@
                 --variable=includedir ${c.dev}/lib/pkgconfig/trevrpc.pc)" = "${c.dev}/include"
 
               test -x ${cpp}/bin/protoc-gen-trevrpc-cpp
+              test ! -e ${cpp}/bin/trevrpc-bench-peer-cpp
               test -f ${cpp.dev}/include/trevrpc/trevrpc.hpp
               test -f ${cpp.dev}/lib/cmake/trevrpc-cpp/trevrpc-cppConfig.cmake
               test -f ${cpp.lib}/lib/libtrevrpc_cpp.a
@@ -816,6 +1062,11 @@
               ${pkgs.nodejs_24}/bin/node -e \
                 'require(process.argv[1])' \
                 ${js}/lib/node_modules/trevrpc-js/build/native/trevrpc_native.node
+              test ! -e ${js}/bin/trevrpc-bench-peer-js
+
+              test ! -e ${go}/bin/trevrpc-bench-peer-go
+              test ! -e ${kotlin}/bin/trevrpc-bench-peer-kotlin
+              test ! -e ${rust}/bin/trevrpc-bench-peer-rust
 
               mkdir -p $out
             '';
@@ -855,7 +1106,8 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-+Qq36WRF5ddke4HwDD3ty+MpgKToT0Y64PA5YIafUFk=";
+                env.GOWORK = "off";
+                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
                 subPackages = [ "cmd/trevrpc-xruntime-go" ];
 
                 meta.mainProgram = "trevrpc-xruntime-go";
@@ -880,7 +1132,8 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-+Qq36WRF5ddke4HwDD3ty+MpgKToT0Y64PA5YIafUFk=";
+                env.GOWORK = "off";
+                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
                 subPackages = [ "examples/greeter_server" ];
 
                 meta.mainProgram = "greeter_server";
@@ -890,7 +1143,8 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-+Qq36WRF5ddke4HwDD3ty+MpgKToT0Y64PA5YIafUFk=";
+                env.GOWORK = "off";
+                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
                 subPackages = [ "cmd/trevrpc-browser-lifecycle-go" ];
 
                 meta.mainProgram = "trevrpc-browser-lifecycle-go";
