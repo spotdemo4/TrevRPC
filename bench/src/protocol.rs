@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::campaign::RpcKind;
+use crate::campaign::{RpcKind, Stack};
 use crate::{BoxError, SCHEMA_VERSION};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13,13 +13,14 @@ pub struct EventHeader {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Capabilities {
     pub schema_version: u32,
     pub event: String,
     pub peer: String,
     pub roles: Vec<String>,
     pub rpc_kinds: Vec<String>,
-    pub transports: Vec<String>,
+    pub stacks: Vec<Stack>,
     pub histogram: String,
 }
 
@@ -84,7 +85,13 @@ pub struct ValidatedSample {
 }
 
 impl Capabilities {
-    pub fn validate(&self, expected_peer: &str, required: &[RpcKind]) -> Result<(), BoxError> {
+    pub fn validate(
+        &self,
+        expected_peer: &str,
+        required_roles: &[&str],
+        required_rpc_kinds: &[RpcKind],
+        required_stacks: &[Stack],
+    ) -> Result<(), BoxError> {
         validate_event(
             self.schema_version,
             &self.event,
@@ -97,17 +104,24 @@ impl Capabilities {
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        if !roles.contains("client") || !roles.contains("server") {
-            return Err(format!("peer {expected_peer} does not support both roles").into());
+        for role in required_roles {
+            if !roles.contains(role) {
+                return Err(format!("peer {expected_peer} does not support role {role}").into());
+            }
         }
-        if self.histogram != "log_linear_v1"
-            || !self.transports.iter().any(|item| item == "native_quic")
-        {
-            return Err(
-                format!("peer {expected_peer} lacks the required transport or histogram").into(),
-            );
+        if self.histogram != "log_linear_v1" {
+            return Err(format!("peer {expected_peer} lacks the required histogram").into());
         }
-        for kind in required {
+        for stack in required_stacks {
+            if !self.stacks.contains(stack) {
+                return Err(format!(
+                    "peer {expected_peer} does not support stack {}",
+                    stack.as_str()
+                )
+                .into());
+            }
+        }
+        for kind in required_rpc_kinds {
             if !self.rpc_kinds.iter().any(|item| item == kind.as_str()) {
                 return Err(
                     format!("peer {expected_peer} does not support {}", kind.as_str()).into(),
@@ -324,8 +338,79 @@ fn quantile(buckets: &[(u64, u64)], total: u64, numerator: u64, denominator: u64
 
 #[cfg(test)]
 mod tests {
-    use super::{HistogramBucket, expected_message_counts, histogram_quantiles, validate_timing};
-    use crate::campaign::RpcKind;
+    use super::{
+        Capabilities, HistogramBucket, expected_message_counts, histogram_quantiles,
+        validate_timing,
+    };
+    use crate::SCHEMA_VERSION;
+    use crate::campaign::{RpcKind, Stack};
+
+    fn capabilities(stacks: Vec<Stack>) -> Capabilities {
+        Capabilities {
+            schema_version: SCHEMA_VERSION,
+            event: "capabilities".to_owned(),
+            peer: "rust".to_owned(),
+            roles: vec!["client".to_owned(), "server".to_owned()],
+            rpc_kinds: vec!["unary".to_owned()],
+            stacks,
+            histogram: "log_linear_v1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn validates_required_roles_rpc_kinds_and_stacks() {
+        capabilities(vec![Stack::TrevrpcNativeQuic])
+            .validate(
+                "rust",
+                &["client", "server"],
+                &[RpcKind::Unary],
+                &[Stack::TrevrpcNativeQuic],
+            )
+            .expect("matching capabilities");
+    }
+
+    #[test]
+    fn rejects_missing_or_mismatched_required_stacks() {
+        let missing = capabilities(Vec::new()).validate(
+            "rust",
+            &["client"],
+            &[RpcKind::Unary],
+            &[Stack::TrevrpcNativeQuic],
+        );
+        assert!(
+            missing
+                .unwrap_err()
+                .to_string()
+                .contains("trevrpc_native_quic")
+        );
+
+        let mismatched = capabilities(vec![Stack::GrpcHttp2]).validate(
+            "rust",
+            &["client"],
+            &[RpcKind::Unary],
+            &[Stack::TrevrpcNativeQuic],
+        );
+        assert!(
+            mismatched
+                .unwrap_err()
+                .to_string()
+                .contains("trevrpc_native_quic")
+        );
+    }
+
+    #[test]
+    fn rejects_v1_transport_capabilities() {
+        let input = r#"{
+            "schema_version": 2,
+            "event": "capabilities",
+            "peer": "rust",
+            "roles": ["client", "server"],
+            "rpc_kinds": ["unary"],
+            "transports": ["native_quic"],
+            "histogram": "log_linear_v1"
+        }"#;
+        assert!(serde_json::from_str::<Capabilities>(input).is_err());
+    }
 
     #[test]
     fn computes_quantiles_from_sparse_buckets() {

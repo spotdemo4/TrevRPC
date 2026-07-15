@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "campaign_id": "native-quic-smoke",
   "repetitions": 1,
   "peers": [
@@ -12,7 +12,8 @@
     {
       "id": "rust-rust",
       "client": "rust",
-      "server": "rust"
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
     }
   ],
   "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],

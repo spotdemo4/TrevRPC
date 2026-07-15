@@ -1,8 +1,9 @@
-# TrevRPC Benchmarks
+# RPC Benchmark Harness
 
-`trevrpc-bench` is the centralized controller for the language-owned benchmark
-peers. It runs native QUIC client/server pairs, validates their structured
-results, collects process metrics, and generates replayable reports.
+`trevrpc-bench` is the centralized controller for language-owned benchmark
+peers. It runs TrevRPC native QUIC and gRPC HTTP/2 client/server pairs,
+validates their structured results, collects process metrics, and generates
+replayable reports.
 
 ## Build
 
@@ -22,9 +23,11 @@ RPC contract and process protocol live under `bench/`.
 
 ## Run
 
-Campaigns are JSON files. A cell may use any listed peer as its client and any
-listed peer as its server, so the same controller supports product-stack and
-split client/server comparisons.
+Campaigns are schema V2 JSON files. Every cell selects a required `stack`:
+`trevrpc_native_quic` or `grpc_http2`. A cell may use any listed peer as its
+client and any listed peer as its server, so the same controller supports stack
+and split client/server comparisons. V1 campaigns and peer events are not
+supported.
 
 ```sh
 export PATH="$PWD/result/bin:$PATH"
@@ -40,6 +43,10 @@ reference server to exercise every peer in both roles. Its deliberately short
 windows validate interoperability and the harness only; they are not suitable
 for performance comparisons.
 
+`stack-comparison.example.json` contains same-language TrevRPC and gRPC cells
+for C, C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's
+advertised stacks, roles, RPC kinds, and histogram before starting a run.
+
 Compilation and dependency realization must happen before a publishable run.
 Run measurements on `ssh bench` and keep the host otherwise idle. Retain the
 complete output directory so its manifest, samples, raw peer logs, and generated
@@ -54,7 +61,7 @@ Every output directory contains:
 - `aggregate.csv`: medians across repetitions.
 - `report.md`: human-readable result table and interpretation boundary.
 - `report.html`: self-contained SVG throughput and p99 graphs.
-- `raw/<sample>/`: exact peer stdout and stderr.
+- `raw/<sample>/`: exact peer stdout and stderr; sample names include the stack.
 - `certificates/`: one-run private CA and server identity.
 
 Reports are deterministic from `samples.jsonl` and can be regenerated without
@@ -77,4 +84,5 @@ can stop sampling.
 
 Latency is measured for a complete bounded RPC. A streaming RPC contains the
 configured `messages_per_stream`; message throughput is reported separately
-from operation throughput. See `peer-protocol-v1.md` for exact semantics.
+from operation throughput. See `peer-protocol-v2.md` for the peer protocol
+and exact semantics.

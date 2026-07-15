@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::campaign::{Campaign, Cell, Peer, RpcKind};
+use crate::campaign::{Campaign, Cell, Peer, RpcKind, Stack};
 use crate::certificate::{self, Certificates};
 use crate::metrics::{ProcessDelta, ProcessMonitor};
 use crate::protocol::{
@@ -28,6 +29,7 @@ pub struct SampleRecord {
     pub repetition: u32,
     pub client_peer: String,
     pub server_peer: String,
+    pub stack: Stack,
     pub rpc_kind: RpcKind,
     pub concurrency: usize,
     pub warmup_ms: u64,
@@ -75,7 +77,7 @@ struct Artifact {
 pub fn print_capabilities(campaign: &Campaign) -> Result<(), BoxError> {
     for peer in &campaign.peers {
         let capabilities = capabilities(peer, Duration::from_millis(campaign.startup_timeout_ms))?;
-        capabilities.validate(&peer.id, &campaign.rpc_kinds)?;
+        validate_capabilities(campaign, peer, &capabilities)?;
         println!("{}", serde_json::to_string(&capabilities)?);
     }
     Ok(())
@@ -92,8 +94,8 @@ pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(
     fs::create_dir_all(output.join("raw"))?;
     let certificates = certificate::generate(output)?;
     for peer in &campaign.peers {
-        capabilities(peer, Duration::from_millis(campaign.startup_timeout_ms))?
-            .validate(&peer.id, &campaign.rpc_kinds)?;
+        let capabilities = capabilities(peer, Duration::from_millis(campaign.startup_timeout_ms))?;
+        validate_capabilities(campaign, peer, &capabilities)?;
     }
     write_manifest(campaign, campaign_path, output)?;
 
@@ -145,13 +147,7 @@ fn run_sample(
     certificates: &Certificates,
     output: &Path,
 ) -> Result<SampleRecord, BoxError> {
-    let sample_id = format!(
-        "{}-{}-c{}-r{}",
-        cell.id,
-        rpc_kind.as_str(),
-        concurrency,
-        repetition
-    );
+    let sample_id = sample_id(cell, rpc_kind, concurrency, repetition);
     eprintln!("running {sample_id}");
     let raw = output.join("raw").join(&sample_id);
     fs::create_dir_all(&raw)?;
@@ -162,6 +158,8 @@ fn run_sample(
         server_peer,
         &[
             "server".to_owned(),
+            "--stack".to_owned(),
+            cell.stack.as_str().to_owned(),
             "--listen".to_owned(),
             "127.0.0.1:0".to_owned(),
             "--cert".to_owned(),
@@ -180,6 +178,8 @@ fn run_sample(
         client_peer,
         &[
             "client".to_owned(),
+            "--stack".to_owned(),
+            cell.stack.as_str().to_owned(),
             "--address".to_owned(),
             ready.address,
             "--cert".to_owned(),
@@ -252,6 +252,17 @@ fn run_sample(
     ))
 }
 
+fn sample_id(cell: &Cell, rpc_kind: RpcKind, concurrency: usize, repetition: u32) -> String {
+    format!(
+        "{}-{}-{}-c{}-r{}",
+        cell.id,
+        cell.stack.as_str(),
+        rpc_kind.as_str(),
+        concurrency,
+        repetition
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record(
     campaign: &Campaign,
@@ -274,6 +285,7 @@ fn record(
         repetition,
         client_peer: cell.client.clone(),
         server_peer: cell.server.clone(),
+        stack: cell.stack,
         rpc_kind,
         concurrency,
         warmup_ms: campaign.timing.warmup_ms,
@@ -326,8 +338,8 @@ fn capabilities(peer: &Peer, timeout: Duration) -> Result<Capabilities, BoxError
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let stdout = capture.read(&capture.stdout, &peer.id, "stdout")?;
-    let stderr = capture.read(&capture.stderr, &peer.id, "stderr")?;
+    let stdout = CapabilityCapture::read(&capture.stdout, &peer.id, "stdout")?;
+    let stderr = CapabilityCapture::read(&capture.stderr, &peer.id, "stderr")?;
     if !status.success() {
         return Err(format!(
             "peer {} capabilities failed: {}",
@@ -345,6 +357,31 @@ fn capabilities(peer: &Peer, timeout: Duration) -> Result<Capabilities, BoxError
         return Err(format!("peer {} emitted extra capability output", peer.id).into());
     }
     Ok(serde_json::from_str(line)?)
+}
+
+fn validate_capabilities(
+    campaign: &Campaign,
+    peer: &Peer,
+    capabilities: &Capabilities,
+) -> Result<(), BoxError> {
+    let mut roles = BTreeSet::new();
+    let mut stacks = BTreeSet::new();
+    for cell in &campaign.cells {
+        if cell.client == peer.id {
+            roles.insert("client");
+            stacks.insert(cell.stack);
+        }
+        if cell.server == peer.id {
+            roles.insert("server");
+            stacks.insert(cell.stack);
+        }
+    }
+    capabilities.validate(
+        &peer.id,
+        &roles.into_iter().collect::<Vec<_>>(),
+        &campaign.rpc_kinds,
+        &stacks.into_iter().collect::<Vec<_>>(),
+    )
 }
 
 struct CapabilityCapture {
@@ -380,7 +417,7 @@ impl CapabilityCapture {
         Ok(false)
     }
 
-    fn read(&self, path: &Path, peer: &str, stream: &str) -> Result<Vec<u8>, BoxError> {
+    fn read(path: &Path, peer: &str, stream: &str) -> Result<Vec<u8>, BoxError> {
         let output = fs::read(path)?;
         if output.len() > MAX_CAPABILITY_OUTPUT_BYTES {
             return Err(format!("peer {peer} capabilities {stream} exceeded output limit").into());
@@ -598,7 +635,95 @@ fn path_string(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sha256;
+    use super::{sample_id, sha256, validate_capabilities};
+    use crate::SCHEMA_VERSION;
+    use crate::campaign::{Campaign, Cell, Peer, RpcKind, Stack, Timing, Workload};
+    use crate::protocol::Capabilities;
+
+    fn campaign() -> Campaign {
+        Campaign {
+            schema_version: SCHEMA_VERSION,
+            campaign_id: "role-specific".to_owned(),
+            repetitions: 1,
+            peers: vec![
+                Peer {
+                    id: "client".to_owned(),
+                    command: vec!["client-peer".to_owned()],
+                },
+                Peer {
+                    id: "server".to_owned(),
+                    command: vec!["server-peer".to_owned()],
+                },
+            ],
+            cells: vec![Cell {
+                id: "grpc".to_owned(),
+                client: "client".to_owned(),
+                server: "server".to_owned(),
+                stack: Stack::GrpcHttp2,
+            }],
+            rpc_kinds: vec![RpcKind::Unary],
+            concurrencies: vec![1],
+            timing: Timing {
+                warmup_ms: 0,
+                measurement_ms: 1,
+            },
+            workload: Workload {
+                request_bytes: 1,
+                response_bytes: 1,
+                messages_per_stream: 1,
+            },
+            startup_timeout_ms: 1000,
+            drain_timeout_ms: 1000,
+        }
+    }
+
+    fn capabilities(peer: &str, roles: &[&str], stacks: Vec<Stack>) -> Capabilities {
+        Capabilities {
+            schema_version: SCHEMA_VERSION,
+            event: "capabilities".to_owned(),
+            peer: peer.to_owned(),
+            roles: roles.iter().map(ToString::to_string).collect(),
+            rpc_kinds: vec!["unary".to_owned()],
+            stacks,
+            histogram: "log_linear_v1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn validates_capabilities_for_each_peers_actual_cell_usage() {
+        let campaign = campaign();
+        validate_capabilities(
+            &campaign,
+            &campaign.peers[0],
+            &capabilities("client", &["client"], vec![Stack::GrpcHttp2]),
+        )
+        .expect("client-only peer");
+        validate_capabilities(
+            &campaign,
+            &campaign.peers[1],
+            &capabilities("server", &["server"], vec![Stack::GrpcHttp2]),
+        )
+        .expect("server-only peer");
+
+        let error = validate_capabilities(
+            &campaign,
+            &campaign.peers[0],
+            &capabilities("client", &["client"], vec![Stack::TrevrpcNativeQuic]),
+        )
+        .expect_err("wrong stack");
+        assert!(error.to_string().contains("grpc_http2"));
+    }
+
+    #[test]
+    fn sample_ids_distinguish_stacks() {
+        let mut cell = campaign().cells.remove(0);
+        let grpc = sample_id(&cell, RpcKind::Unary, 1, 1);
+        cell.stack = Stack::TrevrpcNativeQuic;
+        let trevrpc = sample_id(&cell, RpcKind::Unary, 1, 1);
+        assert_ne!(grpc, trevrpc);
+        assert!(grpc.contains("grpc_http2"));
+        assert!(trevrpc.contains("trevrpc_native_quic"));
+    }
 
     #[test]
     fn encodes_sha256_as_lowercase_hex() {

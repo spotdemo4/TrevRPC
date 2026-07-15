@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "campaign_id": "native-quic-cross-language-smoke",
   "repetitions": 1,
   "peers": [
@@ -32,57 +32,68 @@
     {
       "id": "c-stack",
       "client": "c",
-      "server": "c"
+      "server": "c",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "cpp-client",
       "client": "cpp",
-      "server": "c"
+      "server": "c",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "go-client",
       "client": "go",
-      "server": "c"
+      "server": "c",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "js-client",
       "client": "js",
-      "server": "c"
+      "server": "c",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "kotlin-client",
       "client": "kotlin",
-      "server": "c"
+      "server": "c",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "rust-client",
       "client": "rust",
-      "server": "c"
+      "server": "c",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "cpp-server",
       "client": "c",
-      "server": "cpp"
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "go-server",
       "client": "c",
-      "server": "go"
+      "server": "go",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "js-server",
       "client": "c",
-      "server": "js"
+      "server": "js",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "kotlin-server",
       "client": "c",
-      "server": "kotlin"
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "rust-server",
       "client": "c",
-      "server": "rust"
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
     }
   ],
   "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],

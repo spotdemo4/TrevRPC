@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::campaign::Campaign;
+use crate::campaign::{Campaign, Stack};
 use crate::protocol::{expected_message_counts, histogram_quantiles, validate_timing};
 use crate::runner::SampleRecord;
 use crate::{BoxError, SCHEMA_VERSION};
@@ -21,10 +21,13 @@ struct Aggregate<'a> {
     cell_id: String,
     client_peer: String,
     server_peer: String,
+    stack: Stack,
     rpc_kind: String,
     concurrency: usize,
     samples: Vec<&'a SampleRecord>,
 }
+
+type AggregateKey = (String, String, String, Stack, String, usize);
 
 impl Aggregate<'_> {
     fn runs(&self) -> usize {
@@ -80,7 +83,13 @@ impl Aggregate<'_> {
     }
 
     fn label(&self) -> String {
-        format!("{} {} c{}", self.cell_id, self.rpc_kind, self.concurrency)
+        format!(
+            "{} {} {} c{}",
+            self.cell_id,
+            self.stack.as_str(),
+            self.rpc_kind,
+            self.concurrency
+        )
     }
 }
 
@@ -99,6 +108,7 @@ pub fn generate(output: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_samples(campaign: &Campaign, samples: &[SampleRecord]) -> Result<(), BoxError> {
     campaign.validate()?;
     let expected_count = usize::try_from(campaign.repetitions)?
@@ -133,6 +143,7 @@ fn validate_samples(campaign: &Campaign, samples: &[SampleRecord]) -> Result<(),
             .ok_or_else(|| format!("sample {} references an unknown cell", sample.sample_id))?;
         if sample.client_peer != cell.client
             || sample.server_peer != cell.server
+            || sample.stack != cell.stack
             || !campaign.rpc_kinds.contains(&sample.rpc_kind)
             || !campaign.concurrencies.contains(&sample.concurrency)
             || sample.repetition == 0
@@ -261,14 +272,14 @@ fn read_samples(path: &Path) -> Result<Vec<SampleRecord>, BoxError> {
 }
 
 fn aggregate(samples: &[SampleRecord]) -> Vec<Aggregate<'_>> {
-    let mut groups: BTreeMap<(String, String, String, String, usize), Vec<&SampleRecord>> =
-        BTreeMap::new();
+    let mut groups: BTreeMap<AggregateKey, Vec<&SampleRecord>> = BTreeMap::new();
     for sample in samples {
         groups
             .entry((
                 sample.cell_id.clone(),
                 sample.client_peer.clone(),
                 sample.server_peer.clone(),
+                sample.stack,
                 sample.rpc_kind.as_str().to_owned(),
                 sample.concurrency,
             ))
@@ -278,13 +289,16 @@ fn aggregate(samples: &[SampleRecord]) -> Vec<Aggregate<'_>> {
     groups
         .into_iter()
         .map(
-            |((cell_id, client_peer, server_peer, rpc_kind, concurrency), samples)| Aggregate {
-                cell_id,
-                client_peer,
-                server_peer,
-                rpc_kind,
-                concurrency,
-                samples,
+            |((cell_id, client_peer, server_peer, stack, rpc_kind, concurrency), samples)| {
+                Aggregate {
+                    cell_id,
+                    client_peer,
+                    server_peer,
+                    stack,
+                    rpc_kind,
+                    concurrency,
+                    samples,
+                }
             },
         )
         .collect()
@@ -292,13 +306,14 @@ fn aggregate(samples: &[SampleRecord]) -> Vec<Aggregate<'_>> {
 
 fn write_csv(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError> {
     let mut output = String::from(
-        "cell,client,server,rpc_kind,concurrency,runs,latency_p50_ns_median,latency_p99_ns_median,operations_per_second_median,client_cpu_ns_per_op_median,server_cpu_ns_per_op_median,client_peak_rss_bytes_median,server_peak_rss_bytes_median\n",
+        "cell,stack,client,server,rpc_kind,concurrency,runs,latency_p50_ns_median,latency_p99_ns_median,operations_per_second_median,client_cpu_ns_per_op_median,server_cpu_ns_per_op_median,client_peak_rss_bytes_median,server_peak_rss_bytes_median\n",
     );
     for aggregate in aggregates {
         writeln!(
             output,
-            "{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{}",
+            "{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{}",
             aggregate.cell_id,
+            aggregate.stack.as_str(),
             aggregate.client_peer,
             aggregate.server_peer,
             aggregate.rpc_kind,
@@ -319,13 +334,14 @@ fn write_csv(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError> 
 
 fn write_markdown(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError> {
     let mut output = String::from(
-        "# TrevRPC Benchmark\n\n| Cell | Client | Server | RPC | Concurrency | Runs | p50 us | p99 us | ops/s | Client CPU us/op | Server CPU us/op | Client peak MiB | Server peak MiB |\n| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "# RPC Benchmark Report\n\n| Cell | Stack | Client | Server | RPC | Concurrency | Runs | p50 us | p99 us | ops/s | Client CPU us/op | Server CPU us/op | Client peak MiB | Server peak MiB |\n| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for aggregate in aggregates {
         writeln!(
             output,
-            "| `{}` | `{}` | `{}` | `{}` | {} | {} | {:.3} | {:.3} | {:.0} | {:.3} | {:.3} | {:.2} | {:.2} |",
+            "| `{}` | `{}` | `{}` | `{}` | `{}` | {} | {} | {:.3} | {:.3} | {:.0} | {:.3} | {:.3} | {:.2} | {:.2} |",
             aggregate.cell_id,
+            aggregate.stack.as_str(),
             aggregate.client_peer,
             aggregate.server_peer,
             aggregate.rpc_kind,
@@ -359,6 +375,7 @@ fn write_html(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError>
     let height = 70 + aggregates.len() * 30;
     let mut throughput_bars = String::new();
     let mut latency_bars = String::new();
+    let mut table_rows = String::new();
     for (index, aggregate) in aggregates.iter().enumerate() {
         let y = 35 + index * 30;
         let throughput_width = aggregate.throughput() / throughput_max * 500.0;
@@ -387,9 +404,23 @@ fn write_html(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError>
             y + 14,
             p99_us
         )?;
+        writeln!(
+            table_rows,
+            "<tr><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.0}</td></tr>",
+            html_escape(&aggregate.cell_id),
+            html_escape(aggregate.stack.as_str()),
+            html_escape(&aggregate.client_peer),
+            html_escape(&aggregate.server_peer),
+            html_escape(&aggregate.rpc_kind),
+            aggregate.concurrency,
+            aggregate.runs(),
+            aggregate.p50_ns() as f64 / 1000.0,
+            p99_us,
+            aggregate.throughput(),
+        )?;
     }
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>TrevRPC Benchmark</title><style>body{{font:14px system-ui,sans-serif;max-width:1000px;margin:40px auto;padding:0 20px;color:#18202b}}svg{{width:100%;overflow:visible}}rect{{fill:#176b87}}text{{font-size:12px;fill:#18202b}}h1,h2{{letter-spacing:-.02em}}</style></head><body><h1>TrevRPC Benchmark</h1><h2>Median throughput (operations/s)</h2><svg viewBox=\"0 0 850 {height}\">{throughput_bars}</svg><h2>Median p99 latency</h2><svg viewBox=\"0 0 850 {height}\">{latency_bars}</svg><p>See <code>aggregate.csv</code>, <code>samples.jsonl</code>, and <code>manifest.json</code> for canonical data and provenance.</p></body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>RPC Benchmark Report</title><style>body{{font:14px system-ui,sans-serif;max-width:1100px;margin:40px auto;padding:0 20px;color:#18202b}}svg{{width:100%;overflow:visible}}rect{{fill:#176b87}}text{{font-size:12px;fill:#18202b}}h1,h2{{letter-spacing:-.02em}}table{{border-collapse:collapse;width:100%}}th,td{{border-bottom:1px solid #ccd3da;padding:8px;text-align:left}}th{{background:#eef2f5}}</style></head><body><h1>RPC Benchmark Report</h1><h2>Results</h2><table><thead><tr><th>Cell</th><th>Stack</th><th>Client</th><th>Server</th><th>RPC</th><th>Concurrency</th><th>Runs</th><th>p50 us</th><th>p99 us</th><th>ops/s</th></tr></thead><tbody>{table_rows}</tbody></table><h2>Median throughput (operations/s)</h2><svg viewBox=\"0 0 850 {height}\">{throughput_bars}</svg><h2>Median p99 latency</h2><svg viewBox=\"0 0 850 {height}\">{latency_bars}</svg><p>See <code>aggregate.csv</code>, <code>samples.jsonl</code>, and <code>manifest.json</code> for canonical data and provenance.</p></body></html>"
     );
     fs::write(path, html)?;
     Ok(())
@@ -420,5 +451,103 @@ fn median_f64(values: impl Iterator<Item = f64>) -> f64 {
         0 => 0.0,
         length if length % 2 == 1 => values[length / 2],
         length => f64::midpoint(values[length / 2 - 1], values[length / 2]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{aggregate, validate_samples};
+    use crate::SCHEMA_VERSION;
+    use crate::campaign::{Campaign, Cell, Peer, RpcKind, Stack, Timing, Workload};
+    use crate::metrics::ProcessDelta;
+    use crate::protocol::HistogramBucket;
+    use crate::runner::SampleRecord;
+
+    fn campaign(stack: Stack) -> Campaign {
+        Campaign {
+            schema_version: SCHEMA_VERSION,
+            campaign_id: "comparison".to_owned(),
+            repetitions: 1,
+            peers: vec![Peer {
+                id: "rust".to_owned(),
+                command: vec!["peer".to_owned()],
+            }],
+            cells: vec![Cell {
+                id: "rust-rust".to_owned(),
+                client: "rust".to_owned(),
+                server: "rust".to_owned(),
+                stack,
+            }],
+            rpc_kinds: vec![RpcKind::Unary],
+            concurrencies: vec![1],
+            timing: Timing {
+                warmup_ms: 0,
+                measurement_ms: 1,
+            },
+            workload: Workload {
+                request_bytes: 16,
+                response_bytes: 16,
+                messages_per_stream: 1,
+            },
+            startup_timeout_ms: 1000,
+            drain_timeout_ms: 1000,
+        }
+    }
+
+    fn sample(stack: Stack) -> SampleRecord {
+        SampleRecord {
+            schema_version: SCHEMA_VERSION,
+            campaign_id: "comparison".to_owned(),
+            sample_id: format!("rust-rust-{}-unary-c1-r1", stack.as_str()),
+            cell_id: "rust-rust".to_owned(),
+            repetition: 1,
+            client_peer: "rust".to_owned(),
+            server_peer: "rust".to_owned(),
+            stack,
+            rpc_kind: RpcKind::Unary,
+            concurrency: 1,
+            warmup_ms: 0,
+            measurement_ms: 1,
+            request_bytes: 16,
+            response_bytes: 16,
+            messages_per_stream: 1,
+            admission_ns: 1_000_000,
+            elapsed_ns: 1_000_000,
+            drain_ns: 0,
+            completed: 1,
+            failed: 0,
+            request_messages: 1,
+            response_messages: 1,
+            operations_per_second: 1000.0,
+            request_messages_per_second: 1000.0,
+            response_messages_per_second: 1000.0,
+            latency_p50_ns: 10,
+            latency_p99_ns: 10,
+            latency_max_ns: 10,
+            client: ProcessDelta::default(),
+            server: ProcessDelta::default(),
+            histogram: vec![HistogramBucket {
+                upper_bound_ns: "10".to_owned(),
+                count: "1".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn aggregates_identical_dimensions_separately_by_stack() {
+        let samples = vec![sample(Stack::TrevrpcNativeQuic), sample(Stack::GrpcHttp2)];
+        let aggregates = aggregate(&samples);
+        assert_eq!(aggregates.len(), 2);
+        assert_ne!(aggregates[0].stack, aggregates[1].stack);
+    }
+
+    #[test]
+    fn rejects_sample_stack_that_differs_from_its_campaign_cell() {
+        let error = validate_samples(
+            &campaign(Stack::TrevrpcNativeQuic),
+            &[sample(Stack::GrpcHttp2)],
+        )
+        .expect_err("mismatched sample stack");
+        assert!(error.to_string().contains("does not match its matrix cell"));
     }
 }

@@ -1,8 +1,8 @@
-# TrevRPC Benchmark Peer Protocol V1
+# Benchmark Peer Protocol V2
 
 The benchmark controller starts one server peer and one client peer for every
-sample. Peers exercise their language's public TrevRPC API; the controller does
-not implement an RPC transport.
+sample. Peers exercise the selected stack through its public language API; the
+controller does not implement an RPC transport.
 
 ## Process interface
 
@@ -20,9 +20,13 @@ Configuration is supplied as command-line arguments so peers do not need a
 general-purpose JSON parser. Standard input carries only the ASCII commands
 `START` and `SHUTDOWN`.
 
-All events contain `schema_version: 1`, `event`, and `peer`. Counters and
+All events contain `schema_version: 2`, `event`, and `peer`. Counters and
 nanosecond values are decimal JSON strings so JavaScript can represent them
 without loss.
+
+V2 has no V1 compatibility mode. Campaign cells must select one of the closed
+stack values `trevrpc_native_quic` or `grpc_http2`, peers must advertise that
+stack, and both server and client commands receive it through `--stack`.
 
 ## Capabilities
 
@@ -30,12 +34,12 @@ without loss.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "event": "capabilities",
   "peer": "rust",
   "roles": ["client", "server"],
   "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
-  "transports": ["native_quic"],
+  "stacks": ["trevrpc_native_quic", "grpc_http2"],
   "histogram": "log_linear_v1"
 }
 ```
@@ -45,13 +49,14 @@ without loss.
 Required arguments:
 
 ```text
+--stack trevrpc_native_quic|grpc_http2
 --listen HOST:PORT --cert FILE --key FILE
 ```
 
 `PORT` may be zero. Once the listener can accept RPCs, the peer prints:
 
 ```json
-{ "schema_version": 1, "event": "ready", "peer": "rust", "address": "127.0.0.1:43117", "pid": 1234 }
+{ "schema_version": 2, "event": "ready", "peer": "rust", "address": "127.0.0.1:43117", "pid": 1234 }
 ```
 
 The server continues until it reads `SHUTDOWN` or receives a termination
@@ -64,6 +69,7 @@ Required arguments:
 ```text
 --address HOST:PORT
 --cert FILE
+--stack trevrpc_native_quic|grpc_http2
 --rpc unary|client_stream|server_stream|bidi
 --concurrency N
 --warmup-ms N
@@ -73,7 +79,7 @@ Required arguments:
 --messages-per-stream N
 ```
 
-Protocol V1 campaigns are limited to concurrency 1,024, request and response
+Protocol V2 campaigns are limited to concurrency 1,024, request and response
 payloads of 64 MiB each, and 1,000,000 application messages per streaming RPC.
 Peers reject wire requests outside the payload and stream-message limits before
 allocating responses.
@@ -82,7 +88,7 @@ The client establishes one verified connection, validates one RPC, runs the
 untimed warmup, creates all workload lanes, then prints:
 
 ```json
-{ "schema_version": 1, "event": "armed", "peer": "rust", "pid": 1235 }
+{ "schema_version": 2, "event": "armed", "peer": "rust", "pid": 1235 }
 ```
 
 It does not begin measured work until it reads `START`. The measurement uses a
@@ -93,7 +99,7 @@ The client prints one `sample` event after drain:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "event": "sample",
   "peer": "rust",
   "rpc_kind": "unary",
@@ -151,7 +157,7 @@ A fatal peer error is written as an event when stdout remains usable:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "event": "error",
   "peer": "rust",
   "phase": "measure",

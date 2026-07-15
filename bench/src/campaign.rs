@@ -41,6 +41,24 @@ pub struct Cell {
     pub id: String,
     pub client: String,
     pub server: String,
+    pub stack: Stack,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stack {
+    TrevrpcNativeQuic,
+    GrpcHttp2,
+}
+
+impl Stack {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrevrpcNativeQuic => "trevrpc_native_quic",
+            Self::GrpcHttp2 => "grpc_http2",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -200,12 +218,13 @@ fn validate_id(value: &str, name: &str) -> Result<(), BoxError> {
 mod tests {
     use super::{
         Campaign, Cell, MAX_CONCURRENCY, MAX_MESSAGES_PER_STREAM, MAX_PAYLOAD_BYTES, Peer, RpcKind,
-        Timing, Workload,
+        Stack, Timing, Workload,
     };
+    use crate::SCHEMA_VERSION;
 
     fn campaign() -> Campaign {
         Campaign {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             campaign_id: "smoke".to_owned(),
             repetitions: 1,
             peers: vec![Peer {
@@ -216,6 +235,7 @@ mod tests {
                 id: "rust".to_owned(),
                 client: "rust".to_owned(),
                 server: "rust".to_owned(),
+                stack: Stack::TrevrpcNativeQuic,
             }],
             rpc_kinds: vec![RpcKind::Unary],
             concurrencies: vec![1],
@@ -243,6 +263,27 @@ mod tests {
         let mut campaign = campaign();
         campaign.cells[0].server = "missing".to_owned();
         assert!(campaign.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_cells_without_a_stack() {
+        let mut value = serde_json::to_value(campaign()).expect("campaign JSON");
+        value["cells"][0]
+            .as_object_mut()
+            .expect("cell object")
+            .remove("stack");
+        let error = serde_json::from_value::<Campaign>(value).expect_err("missing stack");
+        assert!(error.to_string().contains("missing field `stack`"));
+    }
+
+    #[test]
+    fn stack_values_are_closed_and_stable() {
+        assert_eq!(
+            serde_json::to_string(&Stack::TrevrpcNativeQuic).unwrap(),
+            "\"trevrpc_native_quic\""
+        );
+        assert_eq!(Stack::GrpcHttp2.as_str(), "grpc_http2");
+        assert!(serde_json::from_str::<Stack>("\"native_quic\"").is_err());
     }
 
     #[test]
