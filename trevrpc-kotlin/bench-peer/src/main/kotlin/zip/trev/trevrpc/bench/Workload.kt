@@ -25,6 +25,8 @@ internal class BenchmarkWorkload(
     private val client: BenchmarkServiceClient,
     private val config: PeerCommand.Client,
 ) {
+    private val requestPayload = ByteString.copyFrom(ByteArray(config.requestBytes))
+
     suspend fun runOperation(): MessageCounts =
         when (config.rpcKind) {
             BenchmarkRpcKind.UNARY -> unary()
@@ -68,7 +70,7 @@ internal class BenchmarkWorkload(
             StreamRequest
                 .newBuilder()
                 .setMessageCount(config.messagesPerStream)
-                .setPayload(payload(config.requestBytes))
+                .setPayload(requestPayload)
                 .setResponseBytes(config.responseBytes)
                 .build()
         val call = client.serverStreamCall(request)
@@ -131,11 +133,9 @@ internal class BenchmarkWorkload(
         BenchmarkRequest
             .newBuilder()
             .setSequence(sequence)
-            .setPayload(payload(config.requestBytes))
+            .setPayload(requestPayload)
             .setResponseBytes(config.responseBytes)
             .build()
-
-    private fun payload(size: Int): ByteString = ByteString.copyFrom(ByteArray(size))
 
     private fun validateResponse(
         response: BenchmarkResponse,

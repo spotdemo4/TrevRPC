@@ -18,6 +18,9 @@ import zip.trev.trevrpc.benchmark.v1.registerBenchmarkService
 import zip.trev.trevrpc.readyResponseFlow
 
 internal class BenchmarkRpcService : BenchmarkServiceService {
+    @Volatile
+    private var cachedResponsePayload: ByteString? = null
+
     override suspend fun unary(
         context: RequestContext,
         request: BenchmarkRequest,
@@ -63,8 +66,24 @@ internal class BenchmarkRpcService : BenchmarkServiceService {
         BenchmarkResponse
             .newBuilder()
             .setSequence(sequence)
-            .setPayload(ByteString.copyFrom(ByteArray(responseBytes)))
+            .setPayload(responsePayload(responseBytes))
             .build()
+
+    private fun responsePayload(responseBytes: Int): ByteString {
+        val cached = cachedResponsePayload
+        if (cached != null) {
+            return if (cached.size() == responseBytes) cached else ByteString.copyFrom(ByteArray(responseBytes))
+        }
+        val created = ByteString.copyFrom(ByteArray(responseBytes))
+        return synchronized(this) {
+            val published = cachedResponsePayload
+            when {
+                published == null -> created.also { cachedResponsePayload = it }
+                published.size() == responseBytes -> published
+                else -> created
+            }
+        }
+    }
 
     private fun checkedResponseBytes(responseBytes: Int): Int {
         if (responseBytes !in 0..MAX_APPLICATION_PAYLOAD_BYTES) {

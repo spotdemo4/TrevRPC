@@ -69,7 +69,12 @@ sourceSets {
 application {
     mainClass.set("zip.trev.trevrpc.bench.PeerKt")
     applicationName = "trevrpc-bench-peer-kotlin"
-    applicationDefaultJvmArgs = listOf("--enable-native-access=ALL-UNNAMED")
+    applicationDefaultJvmArgs =
+        listOf(
+            "--enable-native-access=ALL-UNNAMED",
+            "-Xms32m",
+            "-Xmx512m",
+        )
 }
 
 dependencies {
