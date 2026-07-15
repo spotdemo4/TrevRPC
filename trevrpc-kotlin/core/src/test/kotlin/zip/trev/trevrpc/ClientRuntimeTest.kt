@@ -45,9 +45,9 @@ class ClientRuntimeTest {
             assertEquals(1, unary.metadata["result"]?.single())
 
             val serverStream = client.serverStreaming("test.Service", "ServerStream", "s", strings, strings)
-            assertEquals("s-1", serverStream.receive())
-            assertEquals("s-2", serverStream.receive())
-            assertNull(serverStream.receive())
+            assertEquals(listOf("s-1"), serverStream.receiveBatch())
+            assertEquals(listOf("s-2"), serverStream.receiveBatch())
+            assertEquals(emptyList<String>(), serverStream.receiveBatch())
             assertEquals(Code.OK, serverStream.terminalStatus?.code)
 
             val clientStream = client.clientStreaming("test.Service", "ClientStream", strings, strings)
@@ -241,6 +241,32 @@ class ClientRuntimeTest {
             assertEquals(7, terminal.responseMetadata["trace"]?.single())
             assertEquals(1, closes.get())
 
+            var batchDelivered = false
+            val batchedErrorStream =
+                object : RpcClientStream {
+                    override suspend fun send(body: ByteArray) = Unit
+
+                    override suspend fun finishSend() = Unit
+
+                    override suspend fun receive(): RpcStreamFrame? = null
+
+                    override suspend fun receiveBatch(maxFrames: Int): List<RpcStreamFrame> {
+                        if (batchDelivered) return emptyList()
+                        batchDelivered = true
+                        return listOf(
+                            RpcStreamFrame.message("ok".encodeToByteArray()),
+                            RpcStreamFrame.status(Status.unavailable("late failure")),
+                        )
+                    }
+
+                    override suspend fun close(cause: Throwable?) = Unit
+                }
+            val batchedError =
+                Client(SingleStreamTransport(batchedErrorStream))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            assertEquals(listOf("ok"), batchedError.receiveBatch())
+            assertCode(Code.UNAVAILABLE) { batchedError.receiveBatch() }
+
             val eof = Client(StaticStreamTransport()).serverStreaming("svc", "method", "request", strings, strings)
             assertCode(Code.INTERNAL) { eof.receive() }
 
@@ -320,6 +346,29 @@ class ClientRuntimeTest {
             val error = runCatching { call.receive() }.exceptionOrNull()
             assertTrue(error is CancellationException)
             assertEquals("close cancelled", error?.message)
+
+            val batchStream =
+                object : RpcClientStream {
+                    override suspend fun send(body: ByteArray) = Unit
+
+                    override suspend fun finishSend() = Unit
+
+                    override suspend fun receive(): RpcStreamFrame? = null
+
+                    override suspend fun receiveBatch(maxFrames: Int): List<RpcStreamFrame> =
+                        listOf(
+                            RpcStreamFrame.message("response".encodeToByteArray()),
+                            RpcStreamFrame.status(Status.ok()),
+                        )
+
+                    override suspend fun close(cause: Throwable?): Unit = throw CancellationException("batch close cancelled")
+                }
+            val batchCall =
+                Client(SingleStreamTransport(batchStream))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            val batchError = runCatching { batchCall.receiveBatch() }.exceptionOrNull()
+            assertTrue(batchError is CancellationException)
+            assertEquals("batch close cancelled", batchError?.message)
         }
 
     private suspend fun assertCode(

@@ -122,6 +122,14 @@ fun interface BidirectionalStreamingHandler {
     ): ResponseEnvelope<Flow<ByteArray>>
 }
 
+fun interface ServerResponseSink {
+    suspend fun send(frame: RpcStreamFrame)
+}
+
+interface BatchingServerResponseSink : ServerResponseSink {
+    suspend fun sendBatch(frames: List<RpcStreamFrame>)
+}
+
 class Server(
     val options: ServerOptions = ServerOptions(),
     private val authorizer: Authorizer? = null,
@@ -216,7 +224,7 @@ class Server(
         val streamJob =
             scope.launch {
                 try {
-                    handleStreaming(request, requestBody, channel::send)
+                    handleStreaming(request, requestBody, ServerResponseSink(channel::send))
                 } finally {
                     channel.close()
                 }
@@ -227,14 +235,14 @@ class Server(
     suspend fun handleStreaming(
         request: RpcRequest,
         requestBody: Flow<ByteArray>,
-        send: suspend (RpcStreamFrame) -> Unit,
+        sink: ServerResponseSink,
     ) {
         val lifecycle = Lifecycle(metrics, request)
         val admission = admit(currentCoroutineContext()[Job])
         if (admission == null) {
             val status = rejectionStatus()
             lifecycle.finish(status.code)
-            sendFrame(send, RpcStreamFrame.status(status))
+            sendFrame(sink, RpcStreamFrame.status(status))
             return
         }
         try {
@@ -253,24 +261,30 @@ class Server(
                 when {
                     kind == RpcKind.SERVER_STREAMING && route is Route.ServerStreaming -> {
                         val response = invokeHandler { route.handler.handle(context, request.body.copyOf()) }
-                        sendResponses(send, limitedFlow(response.message, "response", deadline), lifecycle)
-                        sendFrame(send, RpcStreamFrame.status(Status.ok(response.metadata)))
+                        val batching = response.message.responseBatching()?.takeIf { sink is BatchingServerResponseSink }
+                        sendResponses(
+                            sink,
+                            if (batching == null) limitedFlow(response.message, "response", deadline) else response.message,
+                            lifecycle,
+                            batching,
+                        )
+                        sendFrame(sink, RpcStreamFrame.status(Status.ok(response.metadata)))
                         lifecycle.finish(Code.OK)
                     }
 
                     kind == RpcKind.CLIENT_STREAMING && route is Route.ClientStreaming -> {
                         val response = invokeHandler { route.handler.handle(context, limitedRequests) }
                         checkResponseBody(response.message.size)
-                        sendFrame(send, RpcStreamFrame.message(response.message))
+                        sendFrame(sink, RpcStreamFrame.message(response.message))
                         lifecycle.addResponseBytes(response.message.size)
-                        sendFrame(send, RpcStreamFrame.status(Status.ok(response.metadata)))
+                        sendFrame(sink, RpcStreamFrame.status(Status.ok(response.metadata)))
                         lifecycle.finish(Code.OK)
                     }
 
                     kind == RpcKind.BIDIRECTIONAL_STREAMING && route is Route.BidirectionalStreaming -> {
                         val response = invokeHandler { route.handler.handle(context, limitedRequests) }
-                        sendResponses(send, limitedFlow(response.message, "response", deadline), lifecycle)
-                        sendFrame(send, RpcStreamFrame.status(Status.ok(response.metadata)))
+                        sendResponses(sink, limitedFlow(response.message, "response", deadline), lifecycle)
+                        sendFrame(sink, RpcStreamFrame.status(Status.ok(response.metadata)))
                         lifecycle.finish(Code.OK)
                     }
 
@@ -285,15 +299,15 @@ class Server(
         } catch (error: TimeoutCancellationException) {
             val status = Status.deadlineExceeded("RPC deadline exceeded")
             lifecycle.finish(status.code)
-            sendTerminalStatus(send, status)
+            sendTerminalStatus(sink, status)
         } catch (error: CancellationException) {
             lifecycle.finish(Code.CANCELLED)
-            sendTerminalStatus(send, Status.cancelled("RPC cancelled"))
+            sendTerminalStatus(sink, Status.cancelled("RPC cancelled"))
             throw error
         } catch (error: Throwable) {
             val status = error.toStatus()
             lifecycle.finish(status.code)
-            sendTerminalStatus(send, status)
+            sendTerminalStatus(sink, status)
         } finally {
             admission.close()
         }
@@ -375,34 +389,103 @@ class Server(
     }
 
     private suspend fun sendResponses(
-        send: suspend (RpcStreamFrame) -> Unit,
+        sink: ServerResponseSink,
         responses: Flow<ByteArray>,
         lifecycle: Lifecycle,
+        batching: ResponseBatching? = null,
     ) {
+        if (batching != null) {
+            sendBatchedResponses(sink as BatchingServerResponseSink, responses, lifecycle, batching)
+            return
+        }
         responses.collect { body ->
             checkResponseBody(body.size)
-            sendFrame(send, RpcStreamFrame.message(body))
+            sendFrame(sink, RpcStreamFrame.message(body))
             lifecycle.addResponseBytes(body.size)
         }
     }
 
+    private suspend fun sendBatchedResponses(
+        sink: BatchingServerResponseSink,
+        responses: Flow<ByteArray>,
+        lifecycle: Lifecycle,
+        batching: ResponseBatching,
+    ) {
+        var frames = ArrayList<RpcStreamFrame>(batching.maxMessages)
+        var bodyBytes = 0
+        var streamMessages = 0
+        var streamBytes = 0L
+
+        suspend fun flush() {
+            if (frames.isEmpty()) return
+            val batch = frames
+            val acceptedBodyBytes = bodyBytes
+            frames = ArrayList(batching.maxMessages)
+            bodyBytes = 0
+            sendFrames(sink, batch)
+            lifecycle.addResponseBytes(acceptedBodyBytes)
+        }
+
+        responses.collect { body ->
+            checkResponseBody(body.size)
+            val maxMessages = options.maxStreamMessages
+            if (maxMessages != null && streamMessages >= maxMessages) {
+                flush()
+                throw TrevRpcException(
+                    Status.resourceExhausted("response stream exceeded maximum of $maxMessages messages"),
+                )
+            }
+            val maxBody = options.maxStreamBodySize
+            if (maxBody != null && body.size.toLong() > maxBody - streamBytes) {
+                flush()
+                throw TrevRpcException(
+                    Status.resourceExhausted("response stream exceeded maximum body size of $maxBody bytes"),
+                )
+            }
+            if (
+                frames.isNotEmpty() &&
+                (frames.size == batching.maxMessages || body.size > batching.maxBytes - bodyBytes)
+            ) {
+                flush()
+            }
+            frames += RpcStreamFrame.message(body)
+            bodyBytes = Math.addExact(bodyBytes, body.size)
+            streamMessages++
+            streamBytes += body.size
+        }
+        flush()
+    }
+
     private suspend fun sendTerminalStatus(
-        send: suspend (RpcStreamFrame) -> Unit,
+        sink: ServerResponseSink,
         status: Status,
     ) {
         try {
-            sendFrame(send, RpcStreamFrame.status(status))
+            sendFrame(sink, RpcStreamFrame.status(status))
         } catch (_: CancellationException) {
             // The peer closed the stream, so there is nowhere to deliver the terminal status.
         }
     }
 
     private suspend fun sendFrame(
-        send: suspend (RpcStreamFrame) -> Unit,
+        sink: ServerResponseSink,
         frame: RpcStreamFrame,
     ) {
         try {
-            send(frame)
+            sink.send(frame)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            throw ResponseSinkException(error)
+        }
+    }
+
+    private suspend fun sendFrames(
+        sink: BatchingServerResponseSink,
+        frames: List<RpcStreamFrame>,
+    ) {
+        try {
+            sink.sendBatch(frames)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {

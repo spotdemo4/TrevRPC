@@ -75,9 +75,12 @@ internal class BenchmarkWorkload(
         var sequence = 0L
         try {
             while (true) {
-                val response = call.receive() ?: break
-                validateResponse(response, sequence)
-                sequence++
+                val responses = call.receiveBatch()
+                if (responses.isEmpty()) break
+                responses.forEach { response ->
+                    validateResponse(response, sequence)
+                    sequence++
+                }
             }
             check(sequence == config.messagesPerStream.toLong()) {
                 "server stream returned $sequence messages, expected ${config.messagesPerStream}"

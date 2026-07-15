@@ -6,6 +6,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -118,7 +119,12 @@ class ServerRuntimeTest {
 
             val responseLimited = Server(ServerOptions(maxStreamBodySize = 2))
             responseLimited.routeServerStreaming("svc", "download") { _, _ ->
-                ResponseEnvelope(flowOf(byteArrayOf(1, 2), byteArrayOf(3)))
+                ResponseEnvelope(
+                    readyResponseFlow {
+                        emit(byteArrayOf(1, 2))
+                        emit(byteArrayOf(3))
+                    },
+                )
             }
             val responseStream =
                 responseLimited.handleStreaming(
@@ -189,6 +195,55 @@ class ServerRuntimeTest {
         }
 
     @Test
+    fun `only ready server responses use bounded batches`() =
+        runTest {
+            val server = Server()
+            server.routeServerStreaming("svc", "ready") { _, _ ->
+                ResponseEnvelope(
+                    readyResponseFlow<String>(maxBatchMessages = 2, maxBatchBytes = 3) {
+                        emit("a")
+                        emit("bc")
+                        emit("de")
+                    }.mapReadyResponses(String::encodeToByteArray),
+                )
+            }
+            server.routeServerStreaming("svc", "ordinary") { _, _ ->
+                ResponseEnvelope(flowOf("a", "bc", "de").map(String::encodeToByteArray))
+            }
+            server.routeBidirectionalStreaming("svc", "bidi") { _, _ ->
+                ResponseEnvelope(
+                    readyResponseFlow {
+                        emit("a".encodeToByteArray())
+                        emit("b".encodeToByteArray())
+                    },
+                )
+            }
+
+            suspend fun invoke(
+                method: String,
+                kind: RpcKind,
+            ): List<String> {
+                val sink = RecordingResponseSink()
+                server.handleStreaming(RpcRequest("svc", method, kindValue = kind.value), flowOf(), sink)
+                return sink.events
+            }
+
+            assertEquals(
+                listOf("batch:2:3", "batch:1:2", "status"),
+                invoke("ready", RpcKind.SERVER_STREAMING),
+            )
+            assertEquals(
+                listOf("message:1", "message:2", "message:2", "status"),
+                invoke("ordinary", RpcKind.SERVER_STREAMING),
+            )
+            assertEquals(
+                listOf("message:1", "message:1", "status"),
+                invoke("bidi", RpcKind.BIDIRECTIONAL_STREAMING),
+            )
+            server.shutdown()
+        }
+
+    @Test
     fun `graceful shutdown is idempotent cancels after timeout and rejects new work`() =
         runTest {
             val entered = CompletableDeferred<Unit>()
@@ -232,6 +287,18 @@ class ServerRuntimeTest {
             assertTrue(checkNotNull(observed).timeRemaining()?.isPositive() == true)
             server.shutdown()
         }
+}
+
+private class RecordingResponseSink : BatchingServerResponseSink {
+    val events = mutableListOf<String>()
+
+    override suspend fun send(frame: RpcStreamFrame) {
+        events += if (frame.kind == RpcStreamFrameKind.STATUS) "status" else "message:${frame.body.size}"
+    }
+
+    override suspend fun sendBatch(frames: List<RpcStreamFrame>) {
+        events += "batch:${frames.size}:${frames.sumOf { it.body.size }}"
+    }
 }
 
 private class RecordingMetrics : Metrics {

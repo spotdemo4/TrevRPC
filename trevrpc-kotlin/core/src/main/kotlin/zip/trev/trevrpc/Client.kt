@@ -59,6 +59,12 @@ interface RpcTransport {
 interface RpcTransportStream {
     suspend fun receive(): RpcStreamFrame?
 
+    /** Receives one frame, then drains up to [maxFrames] frames that are already available. */
+    suspend fun receiveBatch(maxFrames: Int): List<RpcStreamFrame> {
+        require(maxFrames > 0) { "maxFrames must be positive" }
+        return listOfNotNull(receive())
+    }
+
     suspend fun close(cause: Throwable? = null)
 }
 
@@ -224,6 +230,8 @@ class ServerStreamingCall<T> internal constructor(
 
     suspend fun receive(): T? = reader.receive()
 
+    suspend fun receiveBatch(maxMessages: Int = 32): List<T> = reader.receiveBatch(maxMessages)
+
     suspend fun close() = reader.close()
 }
 
@@ -297,6 +305,7 @@ internal class ResponseReader<T>(
     private var messages = 0
     private var bodySize = 0L
     private var done = false
+    private var pendingTerminalError: Throwable? = null
 
     var terminalStatus: Status? = null
         private set
@@ -305,6 +314,10 @@ internal class ResponseReader<T>(
         get() = terminalStatus?.metadata ?: Metadata.EMPTY
 
     suspend fun receive(): T? {
+        pendingTerminalError?.let { error ->
+            pendingTerminalError = null
+            throw error
+        }
         if (done) return null
         try {
             val frame = callWithDeadline(deadline, options.streamIdleTimeout) { stream.receive() }
@@ -326,6 +339,57 @@ internal class ResponseReader<T>(
                     throw TrevRpcException(Status.internal("response stream contained an unknown frame kind"))
                 }
             }
+        } catch (error: CancellationException) {
+            done = true
+            close(error)
+            throw error
+        } catch (error: Throwable) {
+            done = true
+            close(error)
+            throw error
+        }
+    }
+
+    suspend fun receiveBatch(maxMessages: Int): List<T> {
+        require(maxMessages > 0) { "maxMessages must be positive" }
+        pendingTerminalError?.let { error ->
+            pendingTerminalError = null
+            throw error
+        }
+        if (done) return emptyList()
+        try {
+            val frames = callWithDeadline(deadline, options.streamIdleTimeout) { stream.receiveBatch(maxMessages) }
+            if (frames.isEmpty()) {
+                done = true
+                throw TrevRpcException(Status.internal("response stream ended before final status"))
+            }
+            val messages = ArrayList<T>(frames.size)
+            frames.forEachIndexed { index, frame ->
+                when (frame.kind) {
+                    RpcStreamFrameKind.MESSAGE -> {
+                        messages += receiveMessage(frame)
+                    }
+
+                    RpcStreamFrameKind.STATUS -> {
+                        if (index != frames.lastIndex) {
+                            throw TrevRpcException(Status.internal("response stream contained data after final status"))
+                        }
+                        try {
+                            receiveStatus(frame)
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Throwable) {
+                            if (messages.isEmpty()) throw error
+                            pendingTerminalError = error
+                        }
+                    }
+
+                    null -> {
+                        throw TrevRpcException(Status.internal("response stream contained an unknown frame kind"))
+                    }
+                }
+            }
+            return messages
         } catch (error: CancellationException) {
             done = true
             close(error)

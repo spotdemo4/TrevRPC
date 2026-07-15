@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import zip.trev.trevrpc.mapReadyResponses
 
 private val trevrpcCodec0: zip.trev.trevrpc.MessageCodec<zip.trev.trevrpc.examples.greeter.HelloRequest> =
     zip.trev.trevrpc.MessageCodec(
@@ -191,7 +192,7 @@ public fun registerGreeter(
     server.routeServerStreaming(GREETER_SERVICE_NAME, GREETER_LOTS_OF_REPLIES_METHOD_NAME) { context, body ->
         requireTrevrpcKind(context, GREETER_LOTS_OF_REPLIES_RPC_KIND)
         val request = decodeTrevrpcRequest(trevrpcCodec0, body)
-        zip.trev.trevrpc.ResponseEnvelope(service.lotsOfReplies(context, request).map(trevrpcCodec1.encode))
+        zip.trev.trevrpc.ResponseEnvelope(service.lotsOfReplies(context, request).mapReadyResponses(trevrpcCodec1.encode))
     }
     server.routeClientStreaming(GREETER_SERVICE_NAME, GREETER_LOTS_OF_GREETINGS_METHOD_NAME) { context, requests ->
         requireTrevrpcKind(context, GREETER_LOTS_OF_GREETINGS_RPC_KIND)

@@ -3,7 +3,6 @@ package zip.trev.trevrpc.bench
 import com.google.protobuf.ByteString
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import zip.trev.trevrpc.RequestContext
 import zip.trev.trevrpc.Server
@@ -16,6 +15,7 @@ import zip.trev.trevrpc.benchmark.v1.BenchmarkServiceService
 import zip.trev.trevrpc.benchmark.v1.BenchmarkSummary
 import zip.trev.trevrpc.benchmark.v1.StreamRequest
 import zip.trev.trevrpc.benchmark.v1.registerBenchmarkService
+import zip.trev.trevrpc.readyResponseFlow
 
 internal class BenchmarkRpcService : BenchmarkServiceService {
     override suspend fun unary(
@@ -46,7 +46,7 @@ internal class BenchmarkRpcService : BenchmarkServiceService {
     ): Flow<BenchmarkResponse> {
         val messageCount = checkedMessageCount(request.messageCount)
         val responseBytes = checkedResponseBytes(request.responseBytes)
-        return flow {
+        return readyResponseFlow {
             repeat(messageCount) { sequence -> emit(response(sequence.toLong(), responseBytes)) }
         }
     }

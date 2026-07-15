@@ -210,6 +210,7 @@ private fun generateFile(
         appendLine("import kotlinx.coroutines.flow.flow")
         appendLine("import kotlinx.coroutines.flow.map")
         appendLine("import kotlinx.coroutines.launch")
+        appendLine("import $runtime.mapReadyResponses")
         appendLine()
         codecs.values.forEach { type -> generateCodec(runtime, type, checkNotNull(codecNames[type.protoName])) }
         appendLine("private fun <T> decodeTrevrpcRequest(codec: $runtime.MessageCodec<T>, body: ByteArray): T =")
@@ -512,7 +513,9 @@ private fun StringBuilder.generateRegistration(
                 appendLine("    server.routeServerStreaming($serviceConstant, $methodConstant) { context, body ->")
                 appendLine("        requireTrevrpcKind(context, $kindConstant)")
                 appendLine("        val request = decodeTrevrpcRequest($inputCodec, body)")
-                appendLine("        $runtime.ResponseEnvelope(service.${method.kotlinName}(context, request).map($outputCodec.encode))")
+                appendLine(
+                    "        $runtime.ResponseEnvelope(service.${method.kotlinName}(context, request).mapReadyResponses($outputCodec.encode))",
+                )
                 appendLine("    }")
             }
 
