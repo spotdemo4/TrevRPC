@@ -9,7 +9,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/benchutil"
+	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/internal/benchutil"
 )
 
 type benchmarkListener interface {
