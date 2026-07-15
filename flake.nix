@@ -280,6 +280,27 @@
                 runHook postInstall
               '';
 
+              doInstallCheck = true;
+              installCheckPhase = ''
+                runHook preInstallCheck
+                test -x "$out/bin/protoc-gen-trevrpc-c"
+                test ! -e "$out/bin/trevrpc-bench-peer-c"
+                test -f "$dev/include/trevrpc_binding.h"
+                test -f "$dev/lib/cmake/trevrpc/trevrpcConfig.cmake"
+                test -f "$dev/lib/pkgconfig/trevrpc.pc"
+                test -f "$lib/lib/libtrevrpc.a"
+                test ! -e "$out/include"
+                test ! -e "$out/lib"
+
+                test "$(pkg-config \
+                  --define-prefix \
+                  --variable=libdir "$dev/lib/pkgconfig/trevrpc.pc")" = "$lib/lib"
+                test "$(pkg-config \
+                  --define-prefix \
+                  --variable=includedir "$dev/lib/pkgconfig/trevrpc.pc")" = "$dev/include"
+                runHook postInstallCheck
+              '';
+
               meta = {
                 mainProgram = "protoc-gen-trevrpc-c";
                 description = "C runtime and code generator for TrevRPC";
@@ -296,6 +317,7 @@
             old: with pkgs.lib; {
               pname = "trevrpc-c-bench-peer";
               outputs = [ "out" ];
+              doInstallCheck = false;
 
               configurePhase = ''
                 runHook preConfigure
@@ -410,6 +432,19 @@
                 runHook postInstall
               '';
 
+              doInstallCheck = true;
+              installCheckPhase = ''
+                runHook preInstallCheck
+                test -x "$out/bin/protoc-gen-trevrpc-cpp"
+                test ! -e "$out/bin/trevrpc-bench-peer-cpp"
+                test -f "$dev/include/trevrpc/trevrpc.hpp"
+                test -f "$dev/lib/cmake/trevrpc-cpp/trevrpc-cppConfig.cmake"
+                test -f "$lib/lib/libtrevrpc_cpp.a"
+                test ! -e "$out/include"
+                test ! -e "$out/lib"
+                runHook postInstallCheck
+              '';
+
               meta = {
                 mainProgram = "protoc-gen-trevrpc-cpp";
                 description = "C++20 runtime and protobuf code generator for TrevRPC";
@@ -426,6 +461,7 @@
             old: with pkgs.lib; {
               pname = "trevrpc-cpp-bench-peer";
               outputs = [ "out" ];
+              doInstallCheck = false;
 
               configurePhase = ''
                 runHook preConfigure
@@ -502,6 +538,15 @@
                 runHook postInstall
               '';
 
+              doInstallCheck = true;
+              nativeInstallCheckInputs = [ pkgs.gnugrep ];
+              installCheckPhase = ''
+                runHook preInstallCheck
+                ! grep -Eq '^tonic(-prost)?[[:space:]]*=' Cargo.toml
+                test ! -e "$out/bin/trevrpc-bench-peer-rust"
+                runHook postInstallCheck
+              '';
+
               meta = {
                 mainProgram = "protoc-gen-trevrpc-rust";
                 description = "Protobuf over QUIC, HTTP/3 & WebTransport";
@@ -517,6 +562,7 @@
           trevrpc-rust-bench-peer = trevrpc-rust.overrideAttrs (
             old: with pkgs.lib; {
               pname = "trevrpc-rust-bench-peer";
+              doInstallCheck = false;
               cargoBuildFlags = [
                 "--package"
                 "trevrpc-bench-peer"
@@ -573,6 +619,15 @@
                 go vet ./...
                 staticcheck ./...
                 modernize ./...
+              '';
+
+              doInstallCheck = true;
+              nativeInstallCheckInputs = [ pkgs.gnugrep ];
+              installCheckPhase = ''
+                runHook preInstallCheck
+                ! grep -q 'google.golang.org/grpc' go.mod
+                test ! -e "$out/bin/trevrpc-bench-peer-go"
+                runHook postInstallCheck
               '';
 
               meta = {
@@ -684,6 +739,18 @@
                 npm test
                 npm run build:native
                 npm run verify:native:production
+              '';
+
+              doInstallCheck = true;
+              nativeInstallCheckInputs = [ pkgs.gnugrep ];
+              installCheckPhase = ''
+                runHook preInstallCheck
+                ! grep -q '@grpc/' package.json
+                ${pkgs.nodejs_24}/bin/node -e \
+                  'require(process.argv[1])' \
+                  "$out/lib/node_modules/trevrpc-js/build/native/trevrpc_native.node"
+                test ! -e "$out/bin/trevrpc-bench-peer-js"
+                runHook postInstallCheck
               '';
 
               meta = {
@@ -812,6 +879,19 @@
                 runHook postInstall
               '';
 
+              doInstallCheck = true;
+              nativeInstallCheckInputs = [ pkgs.gnugrep ];
+              installCheckPhase = ''
+                runHook preInstallCheck
+                if find "$out" \( -iname '*grpc*' -o -iname '*tonic*' \) -print -quit \
+                  | grep -q .; then
+                  echo "Kotlin consumer package contains a gRPC or Tonic artifact" >&2
+                  exit 1
+                fi
+                test ! -e "$out/bin/trevrpc-bench-peer-kotlin"
+                runHook postInstallCheck
+              '';
+
               meta = {
                 mainProgram = "protoc-gen-trevrpc-kotlin";
                 description = "Kotlin TrevRPC runtime, transports, and protobuf generator";
@@ -829,6 +909,7 @@
           trevrpc-kotlin-bench-peer = trevrpc-kotlin.overrideAttrs (
             old: with pkgs.lib; {
               pname = "trevrpc-kotlin-bench-peer";
+              doInstallCheck = false;
               gradleBuildTask = [ ":bench-peer:installDist" ];
 
               doCheck = true;
@@ -981,12 +1062,14 @@
             '';
 
           c = self.packages.${system}.trevrpc-c.overrideAttrs {
+            doInstallCheck = false;
             installPhase = ''
               mkdir -p "$out" "$dev" "$lib"
             '';
           };
 
           c-sanitizers = self.packages.${system}.trevrpc-c.overrideAttrs {
+            doInstallCheck = false;
             configurePhase = ''
               runHook preConfigure
               cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON -DTREVRPC_ENABLE_SANITIZERS=ON
@@ -998,12 +1081,13 @@
           };
 
           cpp = self.packages.${system}.trevrpc-cpp.overrideAttrs {
+            doInstallCheck = false;
             installPhase = ''
               mkdir -p "$out" "$dev" "$lib"
             '';
           };
 
-          native-package-outputs =
+          consumer-closures-no-grpc =
             let
               c = self.packages.${system}.trevrpc-c;
               cpp = self.packages.${system}.trevrpc-cpp;
@@ -1022,57 +1106,17 @@
                 ];
               };
             in
-            pkgs.runCommand "trevrpc-native-package-outputs-check" { } ''
+            pkgs.runCommand "trevrpc-consumer-closures-no-grpc-check" { } ''
               if ${pkgs.gnugrep}/bin/grep -Eiq '(grpc|tonic)' ${consumerClosure}/store-paths; then
                 echo "consumer package closure contains a gRPC or Tonic store path" >&2
                 exit 1
               fi
-              ! ${pkgs.gnugrep}/bin/grep -q '@grpc/' ${./trevrpc-js/package.json}
-              ! ${pkgs.gnugrep}/bin/grep -q 'google.golang.org/grpc' ${./trevrpc-go/go.mod}
-              ! ${pkgs.gnugrep}/bin/grep -Eq '^tonic(-prost)?[[:space:]]*=' ${./trevrpc-rust/Cargo.toml}
-              if find ${kotlin} -iname '*grpc*' -o -iname '*tonic*' | ${pkgs.gnugrep}/bin/grep -q .; then
-                echo "Kotlin consumer package contains a gRPC or Tonic artifact" >&2
-                exit 1
-              fi
-
-              test -x ${c}/bin/protoc-gen-trevrpc-c
-              test ! -e ${c}/bin/trevrpc-bench-peer-c
-              test -f ${c.dev}/include/trevrpc_binding.h
-              test -f ${c.dev}/lib/cmake/trevrpc/trevrpcConfig.cmake
-              test -f ${c.dev}/lib/pkgconfig/trevrpc.pc
-              test -f ${c.lib}/lib/libtrevrpc.a
-              test ! -e ${c}/include
-              test ! -e ${c}/lib
-
-              test "$(${pkgs.pkg-config}/bin/pkg-config \
-                --define-prefix \
-                --variable=libdir ${c.dev}/lib/pkgconfig/trevrpc.pc)" = "${c.lib}/lib"
-              test "$(${pkgs.pkg-config}/bin/pkg-config \
-                --define-prefix \
-                --variable=includedir ${c.dev}/lib/pkgconfig/trevrpc.pc)" = "${c.dev}/include"
-
-              test -x ${cpp}/bin/protoc-gen-trevrpc-cpp
-              test ! -e ${cpp}/bin/trevrpc-bench-peer-cpp
-              test -f ${cpp.dev}/include/trevrpc/trevrpc.hpp
-              test -f ${cpp.dev}/lib/cmake/trevrpc-cpp/trevrpc-cppConfig.cmake
-              test -f ${cpp.lib}/lib/libtrevrpc_cpp.a
-              test ! -e ${cpp}/include
-              test ! -e ${cpp}/lib
-
-              ${pkgs.nodejs_24}/bin/node -e \
-                'require(process.argv[1])' \
-                ${js}/lib/node_modules/trevrpc-js/build/native/trevrpc_native.node
-              test ! -e ${js}/bin/trevrpc-bench-peer-js
-
-              test ! -e ${go}/bin/trevrpc-bench-peer-go
-              test ! -e ${kotlin}/bin/trevrpc-bench-peer-kotlin
-              test ! -e ${rust}/bin/trevrpc-bench-peer-rust
-
               mkdir -p $out
             '';
 
           rust = self.packages.${system}.trevrpc-rust.overrideAttrs {
             dontBuild = true;
+            doInstallCheck = false;
             installPhase = ''
               touch $out
             '';
@@ -1080,6 +1124,7 @@
 
           go = self.packages.${system}.trevrpc-go.overrideAttrs {
             dontBuild = true;
+            doInstallCheck = false;
             installPhase = ''
               touch $out
             '';
@@ -1087,6 +1132,7 @@
 
           js = self.packages.${system}.trevrpc-js.overrideAttrs {
             dontBuild = true;
+            doInstallCheck = false;
             installPhase = ''
               touch $out
             '';
@@ -1094,6 +1140,7 @@
 
           kotlin = self.packages.${system}.trevrpc-kotlin.overrideAttrs {
             dontBuild = true;
+            doInstallCheck = false;
             installPhase = ''
               touch $out
             '';
@@ -1115,6 +1162,7 @@
             in
             self.packages.${system}.trevrpc-rust.overrideAttrs {
               dontBuild = true;
+              doInstallCheck = false;
               TREVRPC_XRUNTIME_GO = "${crossRuntimeGo}/bin/trevrpc-xruntime-go";
               TREVRPC_XRUNTIME_KOTLIN = "${self.packages.${system}.trevrpc-kotlin}/bin/trevrpc-xruntime-kotlin";
               checkPhase = ''
@@ -1208,6 +1256,7 @@
             in
             self.packages.${system}.trevrpc-js.overrideAttrs {
               dontBuild = true;
+              doInstallCheck = false;
               PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
               TREVRPC_BROWSER = "chromium";
               TREVRPC_BROWSER_GO_SERVER = "${browserGoServer}/bin/greeter_server";
