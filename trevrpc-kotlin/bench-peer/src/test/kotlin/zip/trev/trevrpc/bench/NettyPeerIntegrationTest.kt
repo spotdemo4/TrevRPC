@@ -91,6 +91,6 @@ class NettyPeerIntegrationTest {
             measurementMilliseconds = 1,
             requestBytes = 8,
             responseBytes = 13,
-            messagesPerStream = 3,
+            messagesPerStream = 35,
         )
 }

@@ -221,21 +221,15 @@ class NettyRpcServer private constructor(
                 writeTerminal(WireCodec.encode(server.handleUnary(request)))
                 return
             }
-            val responses = server.handleStreaming(request, requestFlow(input))
             var terminalWritten = false
-            try {
-                while (true) {
-                    val response = responses.receive() ?: break
-                    val encoded = WireCodec.encode(response)
-                    if (response.kind == RpcStreamFrameKind.STATUS) {
-                        writeTerminal(encoded)
-                        terminalWritten = true
-                        break
-                    }
+            server.handleStreaming(request, requestFlow(input)) { response ->
+                val encoded = WireCodec.encode(response)
+                if (response.kind == RpcStreamFrameKind.STATUS) {
+                    writeTerminal(encoded)
+                    terminalWritten = true
+                } else {
                     write(encoded)
                 }
-            } finally {
-                responses.close()
             }
             if (!terminalWritten) finish()
         } catch (error: CancellationException) {

@@ -167,6 +167,28 @@ class ServerRuntimeTest {
         }
 
     @Test
+    fun `direct response sink failure completes lifecycle and propagates`() =
+        runTest {
+            val metrics = RecordingMetrics()
+            val server = Server(metrics = metrics)
+            server.routeServerStreaming("svc", "stream") { _, _ -> ResponseEnvelope(flowOf(byteArrayOf(1))) }
+            val failure = IllegalStateException("write failed")
+
+            val error =
+                runCatching {
+                    server.handleStreaming(
+                        RpcRequest("svc", "stream", kindValue = RpcKind.SERVER_STREAMING.value),
+                        flowOf(),
+                    ) { throw failure }
+                }.exceptionOrNull()
+
+            assertTrue(error === failure)
+            assertEquals(1, metrics.started.get())
+            assertEquals(listOf(Code.CANCELLED), metrics.finished)
+            server.shutdown()
+        }
+
+    @Test
     fun `graceful shutdown is idempotent cancels after timeout and rejects new work`() =
         runTest {
             val entered = CompletableDeferred<Unit>()

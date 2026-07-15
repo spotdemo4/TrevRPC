@@ -215,75 +215,88 @@ class Server(
         val channel = Channel<RpcStreamFrame>(1)
         val streamJob =
             scope.launch {
-                val lifecycle = Lifecycle(metrics, request)
-                val admission = admit(currentCoroutineContext()[Job])
-                if (admission == null) {
-                    val status = rejectionStatus()
-                    lifecycle.finish(status.code)
-                    channel.send(RpcStreamFrame.status(status))
-                    channel.close()
-                    return@launch
-                }
                 try {
-                    val deadline = prepare(request)
-                    val kind =
-                        request.kind ?: throw TrevRpcException(
-                            Status.invalidArgument("unsupported TrevRPC RPC kind ${request.kindValue}"),
-                        )
-                    if (kind == RpcKind.UNARY) {
-                        throw TrevRpcException(Status.invalidArgument("streaming endpoint received unary request"))
-                    }
-                    val route = routes[RouteKey(request.service, request.method)]
-                    val context = requestContext(request, deadline)
-                    val limitedRequests = limitedFlow(requestBody, "request", deadline)
-                    runWithDeadline(deadline) {
-                        when {
-                            kind == RpcKind.SERVER_STREAMING && route is Route.ServerStreaming -> {
-                                val response = invokeHandler { route.handler.handle(context, request.body.copyOf()) }
-                                sendResponses(channel, limitedFlow(response.message, "response", deadline), lifecycle)
-                                channel.send(RpcStreamFrame.status(Status.ok(response.metadata)))
-                                lifecycle.finish(Code.OK)
-                            }
-
-                            kind == RpcKind.CLIENT_STREAMING && route is Route.ClientStreaming -> {
-                                val response = invokeHandler { route.handler.handle(context, limitedRequests) }
-                                checkResponseBody(response.message.size)
-                                channel.send(RpcStreamFrame.message(response.message))
-                                lifecycle.addResponseBytes(response.message.size)
-                                channel.send(RpcStreamFrame.status(Status.ok(response.metadata)))
-                                lifecycle.finish(Code.OK)
-                            }
-
-                            kind == RpcKind.BIDIRECTIONAL_STREAMING && route is Route.BidirectionalStreaming -> {
-                                val response = invokeHandler { route.handler.handle(context, limitedRequests) }
-                                sendResponses(channel, limitedFlow(response.message, "response", deadline), lifecycle)
-                                channel.send(RpcStreamFrame.status(Status.ok(response.metadata)))
-                                lifecycle.finish(Code.OK)
-                            }
-
-                            else -> {
-                                throw unknownOrMismatched(request, route)
-                            }
-                        }
-                    }
-                } catch (error: TimeoutCancellationException) {
-                    val status = Status.deadlineExceeded("RPC deadline exceeded")
-                    sendTerminalStatus(channel, status)
-                    lifecycle.finish(status.code)
-                } catch (error: CancellationException) {
-                    sendTerminalStatus(channel, Status.cancelled("RPC cancelled"))
-                    lifecycle.finish(Code.CANCELLED)
-                    throw error
-                } catch (error: Throwable) {
-                    val status = error.toStatus()
-                    sendTerminalStatus(channel, status)
-                    lifecycle.finish(status.code)
+                    handleStreaming(request, requestBody, channel::send)
                 } finally {
-                    admission.close()
                     channel.close()
                 }
             }
         return ChannelTransportStream(channel, streamJob)
+    }
+
+    suspend fun handleStreaming(
+        request: RpcRequest,
+        requestBody: Flow<ByteArray>,
+        send: suspend (RpcStreamFrame) -> Unit,
+    ) {
+        val lifecycle = Lifecycle(metrics, request)
+        val admission = admit(currentCoroutineContext()[Job])
+        if (admission == null) {
+            val status = rejectionStatus()
+            lifecycle.finish(status.code)
+            sendFrame(send, RpcStreamFrame.status(status))
+            return
+        }
+        try {
+            val deadline = prepare(request)
+            val kind =
+                request.kind ?: throw TrevRpcException(
+                    Status.invalidArgument("unsupported TrevRPC RPC kind ${request.kindValue}"),
+                )
+            if (kind == RpcKind.UNARY) {
+                throw TrevRpcException(Status.invalidArgument("streaming endpoint received unary request"))
+            }
+            val route = routes[RouteKey(request.service, request.method)]
+            val context = requestContext(request, deadline)
+            val limitedRequests = limitedFlow(requestBody, "request", deadline)
+            runWithDeadline(deadline) {
+                when {
+                    kind == RpcKind.SERVER_STREAMING && route is Route.ServerStreaming -> {
+                        val response = invokeHandler { route.handler.handle(context, request.body.copyOf()) }
+                        sendResponses(send, limitedFlow(response.message, "response", deadline), lifecycle)
+                        sendFrame(send, RpcStreamFrame.status(Status.ok(response.metadata)))
+                        lifecycle.finish(Code.OK)
+                    }
+
+                    kind == RpcKind.CLIENT_STREAMING && route is Route.ClientStreaming -> {
+                        val response = invokeHandler { route.handler.handle(context, limitedRequests) }
+                        checkResponseBody(response.message.size)
+                        sendFrame(send, RpcStreamFrame.message(response.message))
+                        lifecycle.addResponseBytes(response.message.size)
+                        sendFrame(send, RpcStreamFrame.status(Status.ok(response.metadata)))
+                        lifecycle.finish(Code.OK)
+                    }
+
+                    kind == RpcKind.BIDIRECTIONAL_STREAMING && route is Route.BidirectionalStreaming -> {
+                        val response = invokeHandler { route.handler.handle(context, limitedRequests) }
+                        sendResponses(send, limitedFlow(response.message, "response", deadline), lifecycle)
+                        sendFrame(send, RpcStreamFrame.status(Status.ok(response.metadata)))
+                        lifecycle.finish(Code.OK)
+                    }
+
+                    else -> {
+                        throw unknownOrMismatched(request, route)
+                    }
+                }
+            }
+        } catch (error: ResponseSinkException) {
+            lifecycle.finish(Code.CANCELLED)
+            throw error.cause ?: error
+        } catch (error: TimeoutCancellationException) {
+            val status = Status.deadlineExceeded("RPC deadline exceeded")
+            lifecycle.finish(status.code)
+            sendTerminalStatus(send, status)
+        } catch (error: CancellationException) {
+            lifecycle.finish(Code.CANCELLED)
+            sendTerminalStatus(send, Status.cancelled("RPC cancelled"))
+            throw error
+        } catch (error: Throwable) {
+            val status = error.toStatus()
+            lifecycle.finish(status.code)
+            sendTerminalStatus(send, status)
+        } finally {
+            admission.close()
+        }
     }
 
     suspend fun shutdown(timeout: Duration? = options.gracefulShutdownTimeout) {
@@ -362,25 +375,38 @@ class Server(
     }
 
     private suspend fun sendResponses(
-        output: Channel<RpcStreamFrame>,
+        send: suspend (RpcStreamFrame) -> Unit,
         responses: Flow<ByteArray>,
         lifecycle: Lifecycle,
     ) {
         responses.collect { body ->
             checkResponseBody(body.size)
-            output.send(RpcStreamFrame.message(body))
+            sendFrame(send, RpcStreamFrame.message(body))
             lifecycle.addResponseBytes(body.size)
         }
     }
 
     private suspend fun sendTerminalStatus(
-        output: Channel<RpcStreamFrame>,
+        send: suspend (RpcStreamFrame) -> Unit,
         status: Status,
     ) {
         try {
-            output.send(RpcStreamFrame.status(status))
+            sendFrame(send, RpcStreamFrame.status(status))
         } catch (_: CancellationException) {
             // The peer closed the stream, so there is nowhere to deliver the terminal status.
+        }
+    }
+
+    private suspend fun sendFrame(
+        send: suspend (RpcStreamFrame) -> Unit,
+        frame: RpcStreamFrame,
+    ) {
+        try {
+            send(frame)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            throw ResponseSinkException(error)
         }
     }
 
@@ -502,6 +528,10 @@ private sealed interface Route {
         val handler: BidirectionalStreamingHandler,
     ) : Route
 }
+
+private class ResponseSinkException(
+    cause: Throwable,
+) : RuntimeException(cause)
 
 private class ChannelTransportStream(
     private val channel: Channel<RpcStreamFrame>,
