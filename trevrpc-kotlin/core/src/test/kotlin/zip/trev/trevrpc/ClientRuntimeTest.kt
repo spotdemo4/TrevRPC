@@ -83,10 +83,14 @@ class ClientRuntimeTest {
             call.send("request")
             assertEquals(1, stream.sent.size)
             assertArrayEquals("request".encodeToByteArray(), stream.sent.single())
+            call.sendBatch(listOf("batch-1", "batch-2"))
+            assertEquals(1, stream.batches)
+            assertEquals(listOf("request", "batch-1", "batch-2"), stream.sent.map(ByteArray::decodeToString))
             call.closeSend()
             call.closeSend()
             assertEquals(1, stream.finishes)
             assertCode(Code.CANCELLED) { call.send("late") }
+            assertCode(Code.CANCELLED) { call.sendBatch(listOf("late")) }
             assertEquals("reply", call.receive().message)
             assertEquals(1, stream.closes)
 
@@ -407,12 +411,20 @@ private class RecordingClientStream(
     val sent = mutableListOf<ByteArray>()
     var finishes = 0
         private set
+    var batches = 0
+        private set
     var closes = 0
         private set
 
     override suspend fun send(body: ByteArray) {
         if (sendFinished) throw TrevRpcException(Status.cancelled("request stream is closed"))
         sent += body.copyOf()
+    }
+
+    override suspend fun sendBatch(bodies: List<ByteArray>) {
+        if (sendFinished) throw TrevRpcException(Status.cancelled("request stream is closed"))
+        batches++
+        sent += bodies.map(ByteArray::copyOf)
     }
 
     override suspend fun finishSend() {

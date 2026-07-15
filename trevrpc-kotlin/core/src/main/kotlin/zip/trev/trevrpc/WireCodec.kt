@@ -71,16 +71,36 @@ object WireCodec {
     }
 
     fun encode(frame: RpcStreamFrame): ByteArray =
-        Writer()
-            .apply {
-                int32(1, frame.kindValue)
-                uint32(2, frame.statusValue)
-                string(3, frame.message)
-                bytes(4, frame.body)
-                metadata(5, frame.metadata)
-            }.toByteArray()
+        if (
+            frame.kindValue == RpcStreamFrameKind.MESSAGE.value &&
+            frame.statusValue == Code.OK.value &&
+            frame.message.isEmpty() &&
+            frame.metadata.isEmpty
+        ) {
+            encodeMessageFrame(frame.body)
+        } else {
+            Writer()
+                .apply {
+                    int32(1, frame.kindValue)
+                    uint32(2, frame.statusValue)
+                    string(3, frame.message)
+                    bytes(4, frame.body)
+                    metadata(5, frame.metadata)
+                }.toByteArray()
+        }
+
+    fun encodeMessageFrame(body: ByteArray): ByteArray {
+        if (body.isEmpty()) return byteArrayOf()
+        val lengthBytes = varintSize(body.size)
+        return ByteArray(1 + lengthBytes + body.size).also { encoded ->
+            encoded[0] = MESSAGE_BODY_TAG
+            val bodyOffset = writeVarint(encoded, 1, body.size)
+            body.copyInto(encoded, bodyOffset)
+        }
+    }
 
     fun decodeStreamFrame(bytes: ByteArray): RpcStreamFrame {
+        decodeMessageFrame(bytes)?.let { return it }
         val reader = Reader(bytes)
         var kind = 0
         var status = 0u
@@ -100,6 +120,52 @@ object WireCodec {
         }
         return RpcStreamFrame(kind, status, message, body, Metadata.fromWire(metadata))
     }
+
+    private fun decodeMessageFrame(bytes: ByteArray): RpcStreamFrame? {
+        if (bytes.isEmpty()) return RpcStreamFrame()
+        if (bytes[0] != MESSAGE_BODY_TAG) return null
+        var length = 0uL
+        var offset = 1
+        for (index in 0 until 10) {
+            if (offset >= bytes.size) return null
+            val value = bytes[offset].toInt() and 0xff
+            offset++
+            if (index == 9 && value > 1) return null
+            length = length or ((value and 0x7f).toULong() shl (index * 7))
+            if (value and 0x80 == 0) {
+                if (length > Int.MAX_VALUE.toULong() || bytes.size - offset != length.toInt()) return null
+                return RpcStreamFrame(body = bytes.copyOfRange(offset, bytes.size))
+            }
+        }
+        return null
+    }
+}
+
+private const val MESSAGE_BODY_TAG: Byte = (4 shl 3 or 2).toByte()
+
+private fun varintSize(value: Int): Int {
+    var remaining = value
+    var size = 1
+    while (remaining >= 0x80) {
+        remaining = remaining ushr 7
+        size++
+    }
+    return size
+}
+
+private fun writeVarint(
+    output: ByteArray,
+    initialOffset: Int,
+    initialValue: Int,
+): Int {
+    var offset = initialOffset
+    var value = initialValue
+    while (value >= 0x80) {
+        output[offset++] = ((value and 0x7f) or 0x80).toByte()
+        value = value ushr 7
+    }
+    output[offset++] = value.toByte()
+    return offset
 }
 
 private data class Tag(

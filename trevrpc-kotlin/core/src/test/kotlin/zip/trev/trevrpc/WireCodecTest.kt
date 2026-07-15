@@ -8,6 +8,27 @@ import org.junit.jupiter.api.Test
 
 class WireCodecTest {
     @Test
+    fun `plain message frame uses exact compact encoding across varint lengths`() {
+        listOf(0, 1, 127, 128, 16_384).forEach { size ->
+            val body = ByteArray(size) { index -> index.toByte() }
+            val encoded = WireCodec.encodeMessageFrame(body)
+            assertArrayEquals(encoded, WireCodec.encode(RpcStreamFrame.message(body)))
+            assertArrayEquals(body, WireCodec.decodeStreamFrame(encoded).body)
+            if (size > 0) assertEquals(0x22, encoded[0].toInt())
+        }
+
+        listOf(
+            byteArrayOf(0x22, 0x80.toByte()),
+            byteArrayOf(0x22, 0x80.toByte(), 0x80.toByte(), 0x80.toByte(), 0x80.toByte(), 0x10),
+        ).forEach { malformed ->
+            assertEquals(
+                Code.INVALID_ARGUMENT,
+                assertThrows(TrevRpcException::class.java) { WireCodec.decodeStreamFrame(malformed) }.status.code,
+            )
+        }
+    }
+
+    @Test
     fun `all shared golden vectors encode decode and frame byte for byte`() {
         val vectors = goldenVectors()
         val metadata = Metadata.of("authorization" to "ok".encodeToByteArray())

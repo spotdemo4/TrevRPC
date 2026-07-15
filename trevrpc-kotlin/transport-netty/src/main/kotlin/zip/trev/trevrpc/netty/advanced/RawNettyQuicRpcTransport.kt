@@ -309,9 +309,39 @@ internal class RawRpcTransportStream(
     override suspend fun send(body: ByteArray) {
         sendLock.withLock {
             checkSendOpen()
-            val frame = WireCodec.encode(RpcStreamFrame.message(body))
+            val frame = WireCodec.encodeMessageFrame(body)
             try {
                 TrevRpcFrameWriter.write(stream, frame, options.maxFrameSize).awaitCompletion()
+            } catch (error: Throwable) {
+                failSend(error)
+            }
+        }
+    }
+
+    override suspend fun sendBatch(bodies: List<ByteArray>) {
+        if (bodies.isEmpty()) return
+        sendLock.withLock {
+            checkSendOpen()
+            try {
+                val batch = ArrayList<ByteArray>(MAX_WRITE_BATCH_MESSAGES)
+                var batchBytes = 0
+                bodies.forEach { body ->
+                    val encoded = WireCodec.encodeMessageFrame(body)
+                    val framedBytes = Integer.sum(4, encoded.size)
+                    if (
+                        batch.isNotEmpty() &&
+                        (batch.size == MAX_WRITE_BATCH_MESSAGES || batchBytes + framedBytes > MAX_WRITE_BATCH_BYTES)
+                    ) {
+                        TrevRpcFrameWriter.writeBatch(stream, batch, options.maxFrameSize).awaitCompletion()
+                        batch.clear()
+                        batchBytes = 0
+                    }
+                    batch += encoded
+                    batchBytes = Math.addExact(batchBytes, framedBytes)
+                }
+                if (batch.isNotEmpty()) {
+                    TrevRpcFrameWriter.writeBatch(stream, batch, options.maxFrameSize).awaitCompletion()
+                }
             } catch (error: Throwable) {
                 failSend(error)
             }
@@ -392,6 +422,9 @@ internal class RawRpcTransportStream(
         throw transportException("native QUIC request write failed", error)
     }
 }
+
+private const val MAX_WRITE_BATCH_MESSAGES = 16
+private const val MAX_WRITE_BATCH_BYTES = 16 * 1024
 
 private suspend fun QuicStreamChannel.cancelAndClose() {
     cancelBoth()

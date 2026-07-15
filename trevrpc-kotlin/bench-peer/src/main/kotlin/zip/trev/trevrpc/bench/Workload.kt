@@ -42,7 +42,12 @@ internal class BenchmarkWorkload(
     private suspend fun clientStream(): MessageCounts {
         val call = client.clientStreamCall()
         try {
-            repeat(config.messagesPerStream) { sequence -> call.send(request(sequence.toLong())) }
+            var sequence = 0
+            while (sequence < config.messagesPerStream) {
+                val count = minOf(REQUEST_BATCH_SIZE, config.messagesPerStream - sequence)
+                call.sendBatch(List(count) { offset -> request((sequence + offset).toLong()) })
+                sequence += count
+            }
             call.closeSend()
             val summary = call.receive().message
             check(summary.messageCount == config.messagesPerStream.toLong()) {
@@ -89,7 +94,12 @@ internal class BenchmarkWorkload(
             coroutineScope {
                 val sender =
                     launch {
-                        repeat(config.messagesPerStream) { sequence -> call.send(request(sequence.toLong())) }
+                        var sequence = 0
+                        while (sequence < config.messagesPerStream) {
+                            val count = minOf(REQUEST_BATCH_SIZE, config.messagesPerStream - sequence)
+                            call.sendBatch(List(count) { offset -> request((sequence + offset).toLong()) })
+                            sequence += count
+                        }
                         call.closeSend()
                     }
                 var sequence = 0L
@@ -144,6 +154,8 @@ internal class BenchmarkWorkload(
             config.rpcKind.responseMessages(config.messagesPerStream),
         )
 }
+
+private const val REQUEST_BATCH_SIZE = 16
 
 internal fun benchmarkCallOptions(config: PeerCommand.Client): CallOptions =
     CallOptions(

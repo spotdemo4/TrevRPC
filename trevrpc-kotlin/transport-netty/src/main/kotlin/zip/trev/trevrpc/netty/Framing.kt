@@ -70,6 +70,29 @@ object TrevRpcFrameWriter {
         }
     }
 
+    /** Returns one buffer containing multiple independently framed bodies. */
+    fun encodeBatch(
+        allocator: ByteBufAllocator,
+        bodies: List<ByteArray>,
+        maxFrameSize: Int,
+    ): ByteBuf {
+        require(bodies.isNotEmpty()) { "frame batch must not be empty" }
+        val capacity =
+            bodies.fold(0L) { total, body ->
+                requireFrameSize(body, maxFrameSize)
+                total + FRAME_HEADER_SIZE + body.size
+            }
+        if (capacity > Int.MAX_VALUE) {
+            throw TrevRpcException(Status.resourceExhausted("frame batch exceeded maximum buffer size"))
+        }
+        return allocator.buffer(capacity.toInt(), capacity.toInt()).apply {
+            bodies.forEach { body ->
+                writeInt(body.size)
+                writeBytes(body)
+            }
+        }
+    }
+
     /** Transfers ownership of the allocated frame to [channel]. */
     fun write(
         channel: Channel,
@@ -81,6 +104,21 @@ object TrevRpcFrameWriter {
             channel.writeAndFlush(frame)
         } catch (error: Throwable) {
             frame.release()
+            throw error
+        }
+    }
+
+    /** Transfers ownership of one buffer containing all framed [bodies] to [channel]. */
+    fun writeBatch(
+        channel: Channel,
+        bodies: List<ByteArray>,
+        maxFrameSize: Int,
+    ): ChannelFuture {
+        val frames = encodeBatch(channel.alloc(), bodies, maxFrameSize)
+        return try {
+            channel.writeAndFlush(frames)
+        } catch (error: Throwable) {
+            frames.release()
             throw error
         }
     }
@@ -97,6 +135,18 @@ object TrevRpcFrameWriter {
         } catch (error: Throwable) {
             frame.release()
             throw error
+        }
+    }
+
+    private fun requireFrameSize(
+        body: ByteArray,
+        maxFrameSize: Int,
+    ) {
+        require(maxFrameSize >= 0) { "maxFrameSize must be non-negative" }
+        if (body.size > maxFrameSize) {
+            throw TrevRpcException(
+                Status.resourceExhausted("frame body is ${body.size} bytes, maximum is $maxFrameSize"),
+            )
         }
     }
 }

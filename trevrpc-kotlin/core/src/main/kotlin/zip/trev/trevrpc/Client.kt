@@ -69,6 +69,11 @@ interface RpcTransportStream {
 interface RpcClientStream : RpcTransportStream {
     suspend fun send(body: ByteArray)
 
+    /** Sends an ordered batch. Transports may override this to combine immediately ready writes. */
+    suspend fun sendBatch(bodies: List<ByteArray>) {
+        bodies.forEach { send(it) }
+    }
+
     /** Half-closes the request side after prior sends. Repeated calls have no effect. */
     suspend fun finishSend()
 }
@@ -182,6 +187,13 @@ internal class RequestWriter(
         write { stream.send(body) }
     }
 
+    suspend fun sendBatch(bodies: List<ByteArray>) {
+        if (sendFinished.get()) {
+            throw TrevRpcException(Status.cancelled("request stream is closed"))
+        }
+        if (bodies.isNotEmpty()) write { stream.sendBatch(bodies) }
+    }
+
     suspend fun finishSend() {
         if (!sendFinished.compareAndSet(false, true)) return
         write { stream.finishSend() }
@@ -224,6 +236,8 @@ class ClientStreamingCall<Req, Res> internal constructor(
 
     suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
 
+    suspend fun sendBatch(requests: List<Req>) = writer.sendBatch(requests.map(requestCodec.encode))
+
     suspend fun closeSend() = writer.finishSend()
 
     suspend fun receive(): ResponseEnvelope<Res> {
@@ -261,6 +275,8 @@ class BidirectionalStreamingCall<Req, Res> internal constructor(
         get() = reader.responseMetadata
 
     suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
+
+    suspend fun sendBatch(requests: List<Req>) = writer.sendBatch(requests.map(requestCodec.encode))
 
     suspend fun closeSend() = writer.finishSend()
 

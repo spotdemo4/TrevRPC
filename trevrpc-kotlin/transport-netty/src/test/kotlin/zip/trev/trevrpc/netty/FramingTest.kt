@@ -78,6 +78,23 @@ class FramingTest {
     }
 
     @Test
+    fun `batch writer preserves independent frame boundaries`() {
+        val channel = EmbeddedChannel(TrevRpcFrameDecoder(8))
+        val bodies = listOf(byteArrayOf(1, 2), byteArrayOf(), byteArrayOf(3, 4, 5))
+
+        val encoded = TrevRpcFrameWriter.encodeBatch(channel.alloc(), bodies, 8)
+        channel.writeInbound(encoded)
+
+        bodies.forEach { expected ->
+            val actual = channel.readInbound<ByteBuf>()
+            assertArrayEquals(expected, actual.copyReadableBytes())
+            actual.release()
+        }
+        assertEquals(null, channel.readInbound<ByteBuf>())
+        channel.finishAndReleaseAll()
+    }
+
+    @Test
     fun `final writer combines terminal request status and QUIC FIN`() {
         val channel = EmbeddedChannel()
         val body = WireCodec.encode(RpcStreamFrame.status(Status.ok()))
