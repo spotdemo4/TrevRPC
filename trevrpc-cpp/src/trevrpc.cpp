@@ -301,8 +301,10 @@ Result<std::optional<std::vector<std::byte>>> receive_server_message(trevrpc_str
     const Status status =
         status_from(frame->status, frame->message, frame->message_len, frame->metadata);
     trevrpc_stream_frame_free(frame);
-    return Error::rpc(status.is_ok() ? Status::data_loss("unexpected request status frame")
-                                     : status);
+    if (status.is_ok()) {
+      return std::optional<std::vector<std::byte>>{};
+    }
+    return Error::rpc(status);
   }
   std::vector<std::byte> body(frame->body_len);
   if (frame->body_len > 0) {

@@ -5,6 +5,7 @@ import io.netty.buffer.ByteBufAllocator
 import io.netty.channel.Channel
 import io.netty.channel.ChannelFuture
 import io.netty.handler.codec.ByteToMessageDecoder
+import io.netty.handler.codec.quic.DefaultQuicStreamFrame
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 
@@ -76,6 +77,21 @@ object TrevRpcFrameWriter {
         maxFrameSize: Int,
     ): ChannelFuture {
         val frame = encode(channel.alloc(), body, maxFrameSize)
+        return try {
+            channel.writeAndFlush(frame)
+        } catch (error: Throwable) {
+            frame.release()
+            throw error
+        }
+    }
+
+    /** Writes a framed body and the QUIC FIN atomically. */
+    fun writeFinal(
+        channel: Channel,
+        body: ByteArray,
+        maxFrameSize: Int,
+    ): ChannelFuture {
+        val frame = DefaultQuicStreamFrame(encode(channel.alloc(), body, maxFrameSize), true)
         return try {
             channel.writeAndFlush(frame)
         } catch (error: Throwable) {

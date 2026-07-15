@@ -10,6 +10,7 @@ import io.netty.channel.ChannelOption
 import io.netty.channel.EventLoopGroup
 import io.netty.channel.MultiThreadIoEventLoopGroup
 import io.netty.channel.nio.NioIoHandler
+import io.netty.channel.socket.ChannelInputShutdownEvent
 import io.netty.channel.socket.ChannelInputShutdownReadComplete
 import io.netty.channel.socket.SocketProtocolFamily
 import io.netty.channel.socket.nio.NioDatagramChannel
@@ -25,6 +26,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import zip.trev.trevrpc.RpcClientStream
+import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
@@ -91,7 +93,13 @@ class RawNettyQuicRpcTransport private constructor(
         val closed = AtomicBoolean(false)
         try {
             TrevRpcFrameWriter.write(stream, WireCodec.encode(request), options.maxFrameSize).awaitCompletion()
-            return RawRpcTransportStream(stream, inbox, closed, options)
+            return RawRpcTransportStream(
+                stream,
+                inbox,
+                closed,
+                options,
+                awaitRequestFin = request.kind != RpcKind.SERVER_STREAMING,
+            )
         } catch (error: CancellationException) {
             stream.cancelAndClose()
             throw error
@@ -249,7 +257,7 @@ internal class RawFrameInbox(
                 context: ChannelHandlerContext,
                 event: Any,
             ) {
-                if (event is ChannelInputShutdownReadComplete) frames.close()
+                if (event is ChannelInputShutdownEvent || event is ChannelInputShutdownReadComplete) frames.close()
                 context.fireUserEventTriggered(event)
             }
 
@@ -293,6 +301,7 @@ internal class RawRpcTransportStream(
     private val inbox: RawFrameInbox,
     private val closed: AtomicBoolean,
     private val options: NettyTransportOptions,
+    private val awaitRequestFin: Boolean,
 ) : RpcClientStream {
     private val sendLock = Mutex()
     private var sendFinished = false
@@ -314,12 +323,30 @@ internal class RawRpcTransportStream(
             if (sendFinished) return
             checkSendOpen()
             sendFinished = true
-            stream.shutdownOutput().addListener { future ->
-                if (!future.isSuccess && closed.compareAndSet(false, true)) {
-                    val error = future.cause() ?: transportException("native QUIC request finish failed")
-                    inbox.fail(error)
-                    stream.cancelBoth()
-                    stream.close()
+            val future =
+                if (awaitRequestFin) {
+                    TrevRpcFrameWriter.writeFinal(
+                        stream,
+                        WireCodec.encode(RpcStreamFrame.status(Status.ok())),
+                        options.maxFrameSize,
+                    )
+                } else {
+                    stream.shutdownOutput()
+                }
+            if (awaitRequestFin) {
+                try {
+                    future.awaitCompletion()
+                } catch (error: Throwable) {
+                    failSend(error, ignoreIfClosed = true)
+                }
+            } else {
+                future.addListener { completed ->
+                    if (!completed.isSuccess && closed.compareAndSet(false, true)) {
+                        val error = completed.cause() ?: transportException("native QUIC request finish failed")
+                        inbox.fail(error)
+                        stream.cancelBoth()
+                        stream.close()
+                    }
                 }
             }
         }
@@ -351,12 +378,17 @@ internal class RawRpcTransportStream(
         }
     }
 
-    private suspend fun failSend(error: Throwable): Nothing {
-        if (closed.compareAndSet(false, true)) {
+    private suspend fun failSend(
+        error: Throwable,
+        ignoreIfClosed: Boolean = false,
+    ) {
+        val ownsFailure = closed.compareAndSet(false, true)
+        if (ownsFailure) {
             inbox.fail(error)
             stream.cancelAndClose()
         }
         if (error is CancellationException) throw error
+        if (!ownsFailure && ignoreIfClosed) return
         throw transportException("native QUIC request write failed", error)
     }
 }

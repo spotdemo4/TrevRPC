@@ -3,12 +3,18 @@ package zip.trev.trevrpc.netty
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.Unpooled
 import io.netty.channel.embedded.EmbeddedChannel
+import io.netty.handler.codec.quic.QuicStreamFrame
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.Code
+import zip.trev.trevrpc.RpcStreamFrame
+import zip.trev.trevrpc.RpcStreamFrameKind
+import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
+import zip.trev.trevrpc.WireCodec
 
 class FramingTest {
     @Test
@@ -68,6 +74,23 @@ class FramingTest {
         assertEquals(2, framed.readInt())
         assertArrayEquals(byteArrayOf(3, 4), framed.copyReadableBytes())
         framed.release()
+        channel.finishAndReleaseAll()
+    }
+
+    @Test
+    fun `final writer combines terminal request status and QUIC FIN`() {
+        val channel = EmbeddedChannel()
+        val body = WireCodec.encode(RpcStreamFrame.status(Status.ok()))
+
+        TrevRpcFrameWriter.writeFinal(channel, body, 128)
+
+        val final = channel.readOutbound<QuicStreamFrame>()
+        assertTrue(final.hasFin())
+        assertEquals(body.size, final.content().readInt())
+        val decoded = WireCodec.decodeStreamFrame(final.content().copyReadableBytes())
+        assertEquals(RpcStreamFrameKind.STATUS, decoded.kind)
+        assertEquals(Code.OK, decoded.status.code)
+        final.release()
         channel.finishAndReleaseAll()
     }
 }

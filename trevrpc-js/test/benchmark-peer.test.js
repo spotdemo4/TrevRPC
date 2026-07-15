@@ -14,7 +14,7 @@ import {
   prepareFixedAdmissionPhase,
   root,
 } from "../bench/trevrpc-bench-peer.js";
-import { protobuf } from "../src/index.node.js";
+import { Code, RpcStreamFrameKind, protobuf } from "../src/index.node.js";
 
 const execFileAsync = promisify(execFile);
 const BenchmarkRequest = root.lookupType("trevrpc.benchmark.v1.BenchmarkRequest");
@@ -399,7 +399,12 @@ test("server handlers implement all four benchmark RPCs", async () => {
   assert.equal(String(unaryResponse.sequence), "42");
   assert.equal(unaryResponse.payload.byteLength, 3);
 
-  const clientFrames = [requestFrame("0", 2, 0), requestFrame("1", 2, 0), requestFrame("2", 2, 0)];
+  const clientFrames = [
+    requestFrame("0", 2, 0),
+    requestFrame("1", 2, 0),
+    requestFrame("2", 2, 0),
+    { kind: RpcStreamFrameKind.Status, status: Code.Ok },
+  ];
   const summaries = [];
   for await (const body of handlers.clientStream(receivingCall(clientFrames))) {
     summaries.push(BenchmarkSummary.decode(body));
@@ -429,7 +434,11 @@ test("server handlers implement all four benchmark RPCs", async () => {
 
   const bidiResponses = [];
   for await (const body of handlers.bidi(
-    receivingCall([requestFrame("7", 2, 4), requestFrame("8", 2, 4)]),
+    receivingCall([
+      requestFrame("7", 2, 4),
+      requestFrame("8", 2, 4),
+      { kind: RpcStreamFrameKind.Status, status: Code.Ok },
+    ]),
   )) {
     bidiResponses.push(BenchmarkResponse.decode(body));
   }

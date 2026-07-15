@@ -5,10 +5,13 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import {
+  Code,
+  RpcStreamFrameKind,
   createRoot,
   createServiceClient,
   invalidArgument,
   resourceExhausted,
+  statusError,
 } from "../src/index.node.js";
 import { RawNodeTransport } from "../src/node-advanced.js";
 import { NodeServer } from "../src/node-index.js";
@@ -244,15 +247,15 @@ export function createBenchmarkHandlers() {
       let messageCount = 0n;
       let payloadBytes = 0n;
       for (;;) {
-        const frame = await call.recv();
-        if (frame == null) {
+        const body = requestBody(await call.recv());
+        if (body == null) {
           yield BenchmarkSummary.encode({
             messageCount: String(messageCount),
             payloadBytes: String(payloadBytes),
           }).finish();
           return;
         }
-        const request = BenchmarkRequest.decode(frame.body);
+        const request = BenchmarkRequest.decode(body);
         messageCount += 1n;
         if (messageCount > BigInt(MaxMessagesPerStream)) {
           throw resourceExhausted("message count exceeded the benchmark peer limit");
@@ -271,20 +274,38 @@ export function createBenchmarkHandlers() {
     async *bidi(call) {
       let messageCount = 0;
       for (;;) {
-        const frame = await call.recv();
-        if (frame == null) {
+        const body = requestBody(await call.recv());
+        if (body == null) {
           return;
         }
         messageCount += 1;
         if (messageCount > MaxMessagesPerStream) {
           throw resourceExhausted("message count exceeded the benchmark peer limit");
         }
-        const request = BenchmarkRequest.decode(frame.body);
+        const request = BenchmarkRequest.decode(body);
         validateResponseBytes(request.responseBytes);
         yield encodeResponse(request.sequence, request.responseBytes);
       }
     },
   };
+}
+
+function requestBody(frame) {
+  if (frame == null) {
+    return null;
+  }
+  const kind = frame.kind ?? RpcStreamFrameKind.Message;
+  if (kind === RpcStreamFrameKind.Message) {
+    return frame.body ?? new Uint8Array(0);
+  }
+  if (kind === RpcStreamFrameKind.Status) {
+    const code = frame.status ?? Code.Ok;
+    if (code !== Code.Ok) {
+      throw statusError(code, frame.message ?? "", frame.metadata ?? {});
+    }
+    return null;
+  }
+  throw invalidArgument("request stream contained an unknown frame kind");
 }
 
 export function createClientOperation(client, config) {

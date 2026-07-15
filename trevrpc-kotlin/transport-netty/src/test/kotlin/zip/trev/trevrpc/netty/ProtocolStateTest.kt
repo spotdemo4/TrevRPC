@@ -107,4 +107,12 @@ class ProtocolStateTest {
                 frames.release()
             }
         }
+
+    @Test
+    fun `server input shutdown ends receive without a read-complete event`() =
+        runBlocking {
+            val input = ServerFrameInput(NettyTransportOptions())
+            input.shutdown()
+            assertEquals(null, input.receive())
+        }
 }

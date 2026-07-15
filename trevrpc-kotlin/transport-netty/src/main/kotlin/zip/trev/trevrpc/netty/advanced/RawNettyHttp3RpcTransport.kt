@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import zip.trev.trevrpc.RpcClientStream
+import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
@@ -83,7 +84,12 @@ class RawNettyHttp3RpcTransport private constructor(
             writeRequestHeaders(stream)
             inbox.awaitSuccess()
             writeDataFrame(stream, WireCodec.encode(request), config.options.maxFrameSize).awaitCompletion()
-            return Http3RpcTransportStream(stream, inbox, config.options)
+            return Http3RpcTransportStream(
+                stream,
+                inbox,
+                config.options,
+                awaitRequestFin = request.kind != RpcKind.SERVER_STREAMING,
+            )
         } catch (error: CancellationException) {
             stream.cancelAndClose()
             throw error
@@ -280,6 +286,7 @@ private class Http3RpcTransportStream(
     private val stream: QuicStreamChannel,
     private val inbox: Http3FrameInbox,
     private val options: NettyTransportOptions,
+    private val awaitRequestFin: Boolean,
 ) : RpcClientStream {
     private val closed = AtomicBoolean(false)
     private val sendLock = Mutex()
@@ -302,12 +309,21 @@ private class Http3RpcTransportStream(
             if (sendFinished) return
             checkSendOpen()
             sendFinished = true
-            stream.shutdownOutput().addListener { future ->
-                if (!future.isSuccess && closed.compareAndSet(false, true)) {
-                    val error = future.cause() ?: transportException("HTTP/3 request finish failed")
-                    inbox.fail(error)
-                    stream.cancelBoth()
-                    stream.close()
+            val future = stream.shutdownOutput()
+            if (awaitRequestFin) {
+                try {
+                    future.awaitCompletion()
+                } catch (error: Throwable) {
+                    failSend(error, ignoreIfClosed = true)
+                }
+            } else {
+                future.addListener { completed ->
+                    if (!completed.isSuccess && closed.compareAndSet(false, true)) {
+                        val error = completed.cause() ?: transportException("HTTP/3 request finish failed")
+                        inbox.fail(error)
+                        stream.cancelBoth()
+                        stream.close()
+                    }
                 }
             }
         }
@@ -337,12 +353,17 @@ private class Http3RpcTransportStream(
         }
     }
 
-    private suspend fun failSend(error: Throwable): Nothing {
-        if (closed.compareAndSet(false, true)) {
+    private suspend fun failSend(
+        error: Throwable,
+        ignoreIfClosed: Boolean = false,
+    ) {
+        val ownsFailure = closed.compareAndSet(false, true)
+        if (ownsFailure) {
             inbox.fail(error)
             stream.cancelAndClose()
         }
         if (error is CancellationException) throw error
+        if (!ownsFailure && ignoreIfClosed) return
         throw transportException("HTTP/3 request write failed", error)
     }
 }

@@ -262,6 +262,33 @@ int main() {
   assert(client_stream.value().finish_send());
   expect_messages(client_stream.value(), {join_messages(client_messages)});
 
+  trevrpc_stream* status_terminated_stream = nullptr;
+  assert(trevrpc_channel_start_stream(channel->native_handle(), "trevrpc.cpp.test.v1.Fixture",
+                                      "ClientStreaming", TREVRPC_RPC_KIND_CLIENT_STREAMING, nullptr,
+                                      0, &status_terminated_stream) == 0);
+  const std::string status_terminated_body = make_request("status-terminated").SerializeAsString();
+  assert(trevrpc_stream_send_message_copy_wait(
+             status_terminated_stream,
+             reinterpret_cast<const std::uint8_t*>(status_terminated_body.data()),
+             status_terminated_body.size()) == 0);
+  assert(trevrpc_stream_send_status(status_terminated_stream, TREVRPC_STATUS_OK, nullptr, 0) == 0);
+  assert(trevrpc_stream_finish_send(status_terminated_stream) == 0);
+  trevrpc_stream_frame* status_terminated_response = nullptr;
+  assert(trevrpc_stream_recv(status_terminated_stream, &status_terminated_response) == 0);
+  assert(status_terminated_response != nullptr);
+  assert(status_terminated_response->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
+  common::ImportedReply status_terminated_reply;
+  assert(status_terminated_reply.ParseFromArray(
+      status_terminated_response->body, static_cast<int>(status_terminated_response->body_len)));
+  assert(status_terminated_reply.message() == "status-terminated");
+  trevrpc_stream_frame_free(status_terminated_response);
+  assert(trevrpc_stream_recv(status_terminated_stream, &status_terminated_response) == 0);
+  assert(status_terminated_response != nullptr);
+  assert(status_terminated_response->kind == TREVRPC_STREAM_FRAME_KIND_STATUS);
+  assert(status_terminated_response->status == TREVRPC_STATUS_OK);
+  trevrpc_stream_frame_free(status_terminated_response);
+  trevrpc_stream_close(status_terminated_stream);
+
   auto bidi = client.BidirectionalStreaming();
   assert(bidi);
   const auto bidi_messages = indexed_messages("bidi-");

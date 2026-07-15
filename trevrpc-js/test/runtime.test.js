@@ -2248,6 +2248,8 @@ test("generator emits JavaScript service clients", () => {
   assert.match(generatedJavaScript.content, /lotsOfReplies\(request, options = \{\}\)/);
   assert.match(generatedJavaScript.content, /lotsOfGreetings\(options = \{\}\)/);
   assert.match(generatedJavaScript.content, /bidiHello\(options = \{\}\)/);
+  assert.match(generatedJavaScript.content, /if \(frame\.kind === RpcStreamFrameKind\.Status\)/);
+  assert.match(generatedJavaScript.content, /throw statusError\(code, frame\.message/);
   assert.match(generatedTypes.content, /export interface HelloRequest/);
   assert.match(generatedTypes.content, /name\?: string;/);
   assert.match(generatedTypes.content, /export interface HelloReply/);

@@ -11,6 +11,7 @@ import io.netty.channel.ChannelOption
 import io.netty.channel.EventLoopGroup
 import io.netty.channel.MultiThreadIoEventLoopGroup
 import io.netty.channel.nio.NioIoHandler
+import io.netty.channel.socket.ChannelInputShutdownEvent
 import io.netty.channel.socket.ChannelInputShutdownReadComplete
 import io.netty.channel.socket.nio.NioDatagramChannel
 import io.netty.handler.codec.http3.DefaultHttp3DataFrame
@@ -852,7 +853,7 @@ internal class ServerFrameInput(
                 context: ChannelHandlerContext,
                 event: Any,
             ) {
-                if (event is ChannelInputShutdownReadComplete) frames.close()
+                if (event is ChannelInputShutdownEvent || event is ChannelInputShutdownReadComplete) shutdown()
                 context.fireUserEventTriggered(event)
             }
 
@@ -886,6 +887,10 @@ internal class ServerFrameInput(
         } catch (error: Throwable) {
             fail(error)
         }
+    }
+
+    fun shutdown() {
+        if (accepting.compareAndSet(true, false)) frames.close()
     }
 
     suspend fun receive(): ByteArray? {
