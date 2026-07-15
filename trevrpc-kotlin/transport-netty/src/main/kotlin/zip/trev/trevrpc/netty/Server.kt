@@ -42,6 +42,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import zip.trev.trevrpc.BatchingServerResponseSink
 import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
@@ -174,6 +175,7 @@ class NettyRpcServer private constructor(
             processRpc(
                 input,
                 write = { writeRaw(channel, it) },
+                writeBatch = { writeRawBatch(channel, it) },
                 writeTerminal = { writeRaw(channel, it, finish = true) },
                 finish = { channel.shutdownOutput().awaitCompletion() },
                 cancelInput = channel::cancelBoth,
@@ -204,6 +206,7 @@ class NettyRpcServer private constructor(
     private suspend fun processRpc(
         input: ServerFrameInput,
         write: suspend (ByteArray) -> Unit,
+        writeBatch: suspend (List<ByteArray>) -> Unit,
         writeTerminal: suspend (ByteArray) -> Unit,
         finish: suspend () -> Unit,
         cancelInput: () -> Unit,
@@ -222,15 +225,28 @@ class NettyRpcServer private constructor(
                 return
             }
             var terminalWritten = false
-            server.handleStreaming(request, requestFlow(input)) { response ->
-                val encoded = WireCodec.encode(response)
-                if (response.kind == RpcStreamFrameKind.STATUS) {
-                    writeTerminal(encoded)
-                    terminalWritten = true
-                } else {
-                    write(encoded)
-                }
-            }
+            server.handleStreaming(
+                request,
+                requestFlow(input),
+                object : BatchingServerResponseSink {
+                    override suspend fun send(frame: RpcStreamFrame) {
+                        val encoded = WireCodec.encode(frame)
+                        if (frame.kind == RpcStreamFrameKind.STATUS) {
+                            writeTerminal(encoded)
+                            terminalWritten = true
+                        } else {
+                            write(encoded)
+                        }
+                    }
+
+                    override suspend fun sendBatch(frames: List<RpcStreamFrame>) {
+                        check(frames.all { it.kind == RpcStreamFrameKind.MESSAGE }) {
+                            "response batch contained a terminal frame"
+                        }
+                        writeBatch(frames.map(WireCodec::encode))
+                    }
+                },
+            )
             if (!terminalWritten) finish()
         } catch (error: CancellationException) {
             cancelInput()
@@ -313,6 +329,21 @@ class NettyRpcServer private constructor(
         future.awaitCompletion()
     }
 
+    private suspend fun writeRawBatch(
+        channel: QuicStreamChannel,
+        bodies: List<ByteArray>,
+    ) {
+        val frames = TrevRpcFrameWriter.encodeBatch(channel.alloc(), bodies, config.options.maxFrameSize)
+        val future =
+            try {
+                channel.writeAndFlush(frames)
+            } catch (error: Throwable) {
+                frames.release()
+                throw error
+            }
+        future.awaitCompletion()
+    }
+
     private inner class Http3ServerStreamHandler(
         private val channel: QuicStreamChannel,
     ) : Http3RequestStreamInboundHandler() {
@@ -361,6 +392,7 @@ class NettyRpcServer private constructor(
                 processRpc(
                     input,
                     write = { writeHttp3(channel, it) },
+                    writeBatch = { writeHttp3Batch(channel, it) },
                     writeTerminal = {
                         writeHttp3(channel, it)
                         channel.shutdownOutput().awaitCompletion()
@@ -543,6 +575,7 @@ class NettyRpcServer private constructor(
             processRpc(
                 input,
                 write = { writeRaw(channel, it) },
+                writeBatch = { writeRawBatch(channel, it) },
                 writeTerminal = { writeRaw(channel, it, finish = true) },
                 finish = { channel.shutdownOutput().awaitCompletion() },
                 cancelInput = channel::cancelBoth,
@@ -603,12 +636,31 @@ class NettyRpcServer private constructor(
         body: ByteArray,
     ) {
         val buffer = TrevRpcFrameWriter.encode(channel.alloc(), body, config.options.maxFrameSize)
-        try {
-            channel.writeAndFlush(DefaultHttp3DataFrame(buffer)).awaitCompletion()
-        } catch (error: Throwable) {
-            if (buffer.refCnt() > 0) buffer.release()
-            throw error
-        }
+        val frame = DefaultHttp3DataFrame(buffer)
+        val future =
+            try {
+                channel.writeAndFlush(frame)
+            } catch (error: Throwable) {
+                frame.release()
+                throw error
+            }
+        future.awaitCompletion()
+    }
+
+    private suspend fun writeHttp3Batch(
+        channel: QuicStreamChannel,
+        bodies: List<ByteArray>,
+    ) {
+        val buffer = TrevRpcFrameWriter.encodeBatch(channel.alloc(), bodies, config.options.maxFrameSize)
+        val frame = DefaultHttp3DataFrame(buffer)
+        val future =
+            try {
+                channel.writeAndFlush(frame)
+            } catch (error: Throwable) {
+                frame.release()
+                throw error
+            }
+        future.awaitCompletion()
     }
 
     companion object {

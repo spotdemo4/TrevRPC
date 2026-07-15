@@ -45,6 +45,7 @@ import zip.trev.trevrpc.netty.advanced.RawFrameInbox
 import zip.trev.trevrpc.netty.advanced.RawNettyHttp3RpcTransport
 import zip.trev.trevrpc.netty.advanced.RawNettyQuicRpcTransport
 import zip.trev.trevrpc.netty.advanced.connectQuic
+import zip.trev.trevrpc.readyResponseFlow
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
@@ -413,7 +414,12 @@ class NettyIntegrationTest {
                 "test.Service",
                 "ServerStream",
                 ServerStreamingHandler { _, body ->
-                    ResponseEnvelope(flowOf(body, body + byteArrayOf(2)))
+                    ResponseEnvelope(
+                        readyResponseFlow {
+                            emit(body)
+                            emit(body + byteArrayOf(2))
+                        },
+                    )
                 },
             )
             routeClientStreaming(

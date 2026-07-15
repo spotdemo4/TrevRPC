@@ -280,6 +280,20 @@ internal class RawFrameInbox(
         return result.getOrNull()
     }
 
+    suspend fun receiveBatch(maxFrames: Int): List<ByteArray> {
+        require(maxFrames > 0) { "maxFrames must be positive" }
+        val first = receive() ?: return emptyList()
+        val batch = ArrayList<ByteArray>(maxFrames)
+        batch += first
+        while (batch.size < maxFrames) {
+            val result = frames.tryReceive()
+            result.exceptionOrNull()?.let { throw it }
+            val frame = result.getOrNull() ?: break
+            batch += frame
+        }
+        return batch
+    }
+
     fun fail(error: Throwable) {
         frames.close(error)
     }
@@ -385,16 +399,21 @@ internal class RawRpcTransportStream(
     override suspend fun receive(): RpcStreamFrame? {
         val body = inbox.receive() ?: return null
         val frame = WireCodec.decodeStreamFrame(body)
-        if (frame.kind == RpcStreamFrameKind.STATUS && closed.compareAndSet(false, true)) {
-            try {
-                inbox.requireEnd(options.maxIdleTime)
-                stream.close().awaitCompletion()
-            } catch (error: Throwable) {
-                stream.cancelAndClose()
-                throw error
-            }
-        }
+        if (frame.kind == RpcStreamFrameKind.STATUS) finishReceive()
         return frame
+    }
+
+    override suspend fun receiveBatch(maxFrames: Int): List<RpcStreamFrame> {
+        val frames = inbox.receiveBatch(maxFrames).map(WireCodec::decodeStreamFrame)
+        val terminalIndex = frames.indexOfFirst { it.kind == RpcStreamFrameKind.STATUS }
+        if (terminalIndex >= 0) {
+            if (terminalIndex != frames.lastIndex) {
+                stream.cancelAndClose()
+                throw transportException("native QUIC response contained data after its terminal frame")
+            }
+            finishReceive()
+        }
+        return frames
     }
 
     override suspend fun close(cause: Throwable?) {
@@ -405,6 +424,17 @@ internal class RawRpcTransportStream(
     private fun checkSendOpen() {
         if (closed.get() || sendFinished) {
             throw TrevRpcException(Status.cancelled("request stream is closed"))
+        }
+    }
+
+    private suspend fun finishReceive() {
+        if (!closed.compareAndSet(false, true)) return
+        try {
+            inbox.requireEnd(options.maxIdleTime)
+            stream.close().awaitCompletion()
+        } catch (error: Throwable) {
+            stream.cancelAndClose()
+            throw error
         }
     }
 
