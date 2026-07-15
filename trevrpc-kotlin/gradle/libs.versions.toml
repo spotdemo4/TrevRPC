@@ -2,6 +2,8 @@
 bouncycastle = "1.85"
 coroutines = "1.11.0"
 cronet = "143.7445.0"
+grpc = "1.82.2"
+grpc-kotlin = "1.5.0"
 junit = "6.1.2"
 kotlin = "2.4.10"
 netty = "4.2.16.Final"
@@ -13,6 +15,12 @@ bouncycastle-bcpkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref 
 coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
 cronet-api = { module = "org.chromium.net:cronet-api", version.ref = "cronet" }
+grpc-kotlin-stub = { module = "io.grpc:grpc-kotlin-stub", version.ref = "grpc-kotlin" }
+grpc-netty-shaded = { module = "io.grpc:grpc-netty-shaded", version.ref = "grpc" }
+grpc-protobuf = { module = "io.grpc:grpc-protobuf", version.ref = "grpc" }
+grpc-protoc-java = { module = "io.grpc:protoc-gen-grpc-java", version.ref = "grpc" }
+grpc-protoc-kotlin = { module = "io.grpc:protoc-gen-grpc-kotlin", version.ref = "grpc-kotlin" }
+grpc-stub = { module = "io.grpc:grpc-stub", version.ref = "grpc" }
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
 kotlin-compiler-embeddable = { module = "org.jetbrains.kotlin:kotlin-compiler-embeddable", version.ref = "kotlin" }
 netty-bom = { module = "io.netty:netty-bom", version.ref = "netty" }

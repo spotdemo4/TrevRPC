@@ -9,11 +9,15 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.benchmark.v1.BenchmarkRequest
 import zip.trev.trevrpc.benchmark.v1.BenchmarkResponse
 import zip.trev.trevrpc.benchmark.v1.BenchmarkServiceClient
+import zip.trev.trevrpc.benchmark.v1.BenchmarkSummary
 import zip.trev.trevrpc.benchmark.v1.StreamRequest
 
 internal data class MessageCounts(
@@ -21,8 +25,72 @@ internal data class MessageCounts(
     val responses: Long,
 )
 
-internal class BenchmarkWorkload(
+internal interface BenchmarkClient {
+    suspend fun unary(request: BenchmarkRequest): BenchmarkResponse
+
+    suspend fun clientStream(requests: Flow<List<BenchmarkRequest>>): BenchmarkSummary
+
+    fun serverStream(request: StreamRequest): Flow<BenchmarkResponse>
+
+    fun bidi(requests: Flow<List<BenchmarkRequest>>): Flow<BenchmarkResponse>
+}
+
+internal class NativeBenchmarkClient(
     private val client: BenchmarkServiceClient,
+) : BenchmarkClient {
+    override suspend fun unary(request: BenchmarkRequest): BenchmarkResponse = client.unary(request)
+
+    override suspend fun clientStream(requests: Flow<List<BenchmarkRequest>>): BenchmarkSummary {
+        val call = client.clientStreamCall()
+        try {
+            requests.collect(call::sendBatch)
+            call.closeSend()
+            return call.receive().message
+        } finally {
+            call.close()
+        }
+    }
+
+    override fun serverStream(request: StreamRequest): Flow<BenchmarkResponse> =
+        flow {
+            val call = client.serverStreamCall(request)
+            try {
+                while (true) {
+                    val responses = call.receiveBatch()
+                    if (responses.isEmpty()) break
+                    responses.forEach { emit(it) }
+                }
+            } finally {
+                call.close()
+            }
+        }
+
+    override fun bidi(requests: Flow<List<BenchmarkRequest>>): Flow<BenchmarkResponse> =
+        flow {
+            val call = client.bidiCall()
+            try {
+                coroutineScope {
+                    val sender =
+                        launch {
+                            requests.collect(call::sendBatch)
+                            call.closeSend()
+                        }
+                    try {
+                        while (true) emit(call.receive() ?: break)
+                        sender.join()
+                    } catch (error: Throwable) {
+                        sender.cancelAndJoin()
+                        throw error
+                    }
+                }
+            } finally {
+                call.close()
+            }
+        }
+}
+
+internal class BenchmarkWorkload(
+    private val client: BenchmarkClient,
     private val config: PeerCommand.Client,
 ) {
     private val requestPayload = ByteString.copyFrom(ByteArray(config.requestBytes))
@@ -42,25 +110,13 @@ internal class BenchmarkWorkload(
     }
 
     private suspend fun clientStream(): MessageCounts {
-        val call = client.clientStreamCall()
-        try {
-            var sequence = 0
-            while (sequence < config.messagesPerStream) {
-                val count = minOf(REQUEST_BATCH_SIZE, config.messagesPerStream - sequence)
-                call.sendBatch(List(count) { offset -> request((sequence + offset).toLong()) })
-                sequence += count
-            }
-            call.closeSend()
-            val summary = call.receive().message
-            check(summary.messageCount == config.messagesPerStream.toLong()) {
-                "client stream returned ${summary.messageCount} messages, expected ${config.messagesPerStream}"
-            }
-            val expectedPayloadBytes = Math.multiplyExact(config.requestBytes.toLong(), config.messagesPerStream.toLong())
-            check(summary.payloadBytes == expectedPayloadBytes) {
-                "client stream returned ${summary.payloadBytes} payload bytes, expected $expectedPayloadBytes"
-            }
-        } finally {
-            call.close()
+        val summary = client.clientStream(requestBatches())
+        check(summary.messageCount == config.messagesPerStream.toLong()) {
+            "client stream returned ${summary.messageCount} messages, expected ${config.messagesPerStream}"
+        }
+        val expectedPayloadBytes = Math.multiplyExact(config.requestBytes.toLong(), config.messagesPerStream.toLong())
+        check(summary.payloadBytes == expectedPayloadBytes) {
+            "client stream returned ${summary.payloadBytes} payload bytes, expected $expectedPayloadBytes"
         }
         return counts()
     }
@@ -73,61 +129,38 @@ internal class BenchmarkWorkload(
                 .setPayload(requestPayload)
                 .setResponseBytes(config.responseBytes)
                 .build()
-        val call = client.serverStreamCall(request)
         var sequence = 0L
-        try {
-            while (true) {
-                val responses = call.receiveBatch()
-                if (responses.isEmpty()) break
-                responses.forEach { response ->
-                    validateResponse(response, sequence)
-                    sequence++
-                }
-            }
-            check(sequence == config.messagesPerStream.toLong()) {
-                "server stream returned $sequence messages, expected ${config.messagesPerStream}"
-            }
-        } finally {
-            call.close()
+        client.serverStream(request).collect { response ->
+            validateResponse(response, sequence)
+            sequence++
+        }
+        check(sequence == config.messagesPerStream.toLong()) {
+            "server stream returned $sequence messages, expected ${config.messagesPerStream}"
         }
         return counts()
     }
 
     private suspend fun bidi(): MessageCounts {
-        val call = client.bidiCall()
-        try {
-            coroutineScope {
-                val sender =
-                    launch {
-                        var sequence = 0
-                        while (sequence < config.messagesPerStream) {
-                            val count = minOf(REQUEST_BATCH_SIZE, config.messagesPerStream - sequence)
-                            call.sendBatch(List(count) { offset -> request((sequence + offset).toLong()) })
-                            sequence += count
-                        }
-                        call.closeSend()
-                    }
-                var sequence = 0L
-                try {
-                    while (true) {
-                        val response = call.receive() ?: break
-                        validateResponse(response, sequence)
-                        sequence++
-                    }
-                    sender.join()
-                    check(sequence == config.messagesPerStream.toLong()) {
-                        "bidi returned $sequence messages, expected ${config.messagesPerStream}"
-                    }
-                } catch (error: Throwable) {
-                    sender.cancelAndJoin()
-                    throw error
-                }
-            }
-        } finally {
-            call.close()
+        var sequence = 0L
+        client.bidi(requestBatches()).collect { response ->
+            validateResponse(response, sequence)
+            sequence++
+        }
+        check(sequence == config.messagesPerStream.toLong()) {
+            "bidi returned $sequence messages, expected ${config.messagesPerStream}"
         }
         return counts()
     }
+
+    private fun requestBatches(): Flow<List<BenchmarkRequest>> =
+        flow {
+            var sequence = 0
+            while (sequence < config.messagesPerStream) {
+                val count = minOf(REQUEST_BATCH_SIZE, config.messagesPerStream - sequence)
+                emit(List(count) { offset -> request((sequence + offset).toLong()) })
+                sequence += count
+            }
+        }
 
     private fun request(sequence: Long): BenchmarkRequest =
         BenchmarkRequest

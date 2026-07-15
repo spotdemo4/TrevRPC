@@ -61,6 +61,7 @@
     "verify:native:production": "node -e 'const { readFileSync } = require(\"node:fs\"); const path = \"./build/native/trevrpc_native.node\"; const expectedExports = [\"connectMsQuic\", \"createCancellation\", \"listenMsQuic\"]; const actualExports = Object.getOwnPropertyNames(require(path)).sort(); const exportsMatch = JSON.stringify(actualExports) === JSON.stringify(expectedExports); const embedsDebugNames = readFileSync(path).includes(Buffer.from(\"_debug\")); if (!exportsMatch || embedsDebugNames) throw new Error(`production addon exports ${JSON.stringify(actualExports)}; expected exactly ${JSON.stringify(expectedExports)}${embedsDebugNames ? \"; binary contains _debug\" : \"\"}`);'"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
     "protobufjs": "^8.7.1"
   },
   "devDependencies": {

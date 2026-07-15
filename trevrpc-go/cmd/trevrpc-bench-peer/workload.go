@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
 )
 
@@ -24,12 +23,34 @@ type operationCounts struct {
 
 type benchmarkOperation func(context.Context, uint64) (operationCounts, error)
 
-func newBenchmarkOperation(client *benchmarkpb.BenchmarkServiceClient, config clientConfig) benchmarkOperation {
+type benchmarkClient interface {
+	Unary(context.Context, *benchmarkpb.BenchmarkRequest) (*benchmarkpb.BenchmarkResponse, error)
+	ClientStream(context.Context) (benchmarkClientStream, error)
+	ServerStream(context.Context, *benchmarkpb.StreamRequest) (benchmarkResponseStream, error)
+	Bidi(context.Context) (benchmarkBidiStream, error)
+}
+
+type benchmarkClientStream interface {
+	Send(*benchmarkpb.BenchmarkRequest) error
+	CloseAndRecv() (*benchmarkpb.BenchmarkSummary, error)
+}
+
+type benchmarkResponseStream interface {
+	Recv() (*benchmarkpb.BenchmarkResponse, error)
+}
+
+type benchmarkBidiStream interface {
+	Send(*benchmarkpb.BenchmarkRequest) error
+	Recv() (*benchmarkpb.BenchmarkResponse, error)
+	CloseSend() error
+}
+
+func newBenchmarkOperation(client benchmarkClient, config clientConfig) benchmarkOperation {
 	switch config.rpc {
 	case rpcUnary:
 		return func(ctx context.Context, sequence uint64) (operationCounts, error) {
 			request := newBenchmarkRequest(sequence, config)
-			response, err := client.Unary(ctx, request, trevrpc.WithMaxResponseBodySize(maxBenchmarkFrameSize))
+			response, err := client.Unary(ctx, request)
 			if err != nil {
 				return operationCounts{}, err
 			}
@@ -40,11 +61,12 @@ func newBenchmarkOperation(client *benchmarkpb.BenchmarkServiceClient, config cl
 		}
 	case rpcClientStream:
 		return func(ctx context.Context, _ uint64) (operationCounts, error) {
-			call, err := client.ClientStream(ctx)
+			callCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			call, err := client.ClientStream(callCtx)
 			if err != nil {
 				return operationCounts{}, err
 			}
-			defer call.Close()
 			for index := range config.messagesPerStream {
 				if err := call.Send(newBenchmarkRequest(uint64(index), config)); err != nil {
 					return operationCounts{}, err
@@ -62,20 +84,17 @@ func newBenchmarkOperation(client *benchmarkpb.BenchmarkServiceClient, config cl
 		}
 	case rpcServerStream:
 		return func(ctx context.Context, _ uint64) (operationCounts, error) {
+			callCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
 			request := &benchmarkpb.StreamRequest{
 				MessageCount:  config.messagesPerStream,
 				Payload:       make([]byte, int(config.requestBytes)),
 				ResponseBytes: config.responseBytes,
 			}
-			responses, err := client.ServerStream(ctx, request,
-				trevrpc.WithMaxResponseBodySize(maxBenchmarkFrameSize),
-				trevrpc.WithMaxResponseMessages(int(config.messagesPerStream)),
-				trevrpc.WithoutMaxResponseStreamBodySize(),
-			)
+			responses, err := client.ServerStream(callCtx, request)
 			if err != nil {
 				return operationCounts{}, err
 			}
-			defer responses.Close()
 			for index := range config.messagesPerStream {
 				response, err := responses.Recv()
 				if err != nil {
@@ -94,15 +113,10 @@ func newBenchmarkOperation(client *benchmarkpb.BenchmarkServiceClient, config cl
 		return func(ctx context.Context, _ uint64) (operationCounts, error) {
 			callCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			call, err := client.Bidi(callCtx,
-				trevrpc.WithMaxResponseBodySize(maxBenchmarkFrameSize),
-				trevrpc.WithMaxResponseMessages(int(config.messagesPerStream)),
-				trevrpc.WithoutMaxResponseStreamBodySize(),
-			)
+			call, err := client.Bidi(callCtx)
 			if err != nil {
 				return operationCounts{}, err
 			}
-			defer call.Close()
 			sendResult := make(chan error, 1)
 			go func() {
 				for index := range config.messagesPerStream {

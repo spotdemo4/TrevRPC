@@ -13,6 +13,8 @@ class ProtocolTest {
             parseCommand(
                 arrayOf(
                     "client",
+                    "--stack",
+                    "grpc_http2",
                     "--address",
                     "127.0.0.1:7443",
                     "--cert",
@@ -35,6 +37,7 @@ class ProtocolTest {
             ) as PeerCommand.Client
 
         assertEquals("127.0.0.1:7443", command.address)
+        assertEquals(BenchmarkStack.GRPC_HTTP2, command.stack)
         assertEquals(BenchmarkRpcKind.BIDI, command.rpcKind)
         assertEquals(8, command.concurrency)
         assertEquals(250, command.warmupMilliseconds)
@@ -47,10 +50,38 @@ class ProtocolTest {
     @Test
     fun `commands reject unknown duplicate and invalid settings`() {
         assertThrows(IllegalArgumentException::class.java) {
-            parseCommand(arrayOf("server", "--listen", "127.0.0.1:0", "--cert", "cert", "--key", "key", "--x", "1"))
+            parseCommand(
+                arrayOf(
+                    "server",
+                    "--stack",
+                    "trevrpc_native_quic",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--cert",
+                    "cert",
+                    "--key",
+                    "key",
+                    "--x",
+                    "1",
+                ),
+            )
         }
         assertThrows(IllegalArgumentException::class.java) {
-            parseCommand(arrayOf("server", "--listen", "a", "--listen", "b", "--cert", "cert", "--key", "key"))
+            parseCommand(
+                arrayOf(
+                    "server",
+                    "--stack",
+                    "trevrpc_native_quic",
+                    "--listen",
+                    "a",
+                    "--listen",
+                    "b",
+                    "--cert",
+                    "cert",
+                    "--key",
+                    "key",
+                ),
+            )
         }
         assertThrows(IllegalArgumentException::class.java) {
             clientArgs("--concurrency", "0")
@@ -60,6 +91,28 @@ class ProtocolTest {
         }
         assertThrows(IllegalArgumentException::class.java) {
             clientArgs("--messages-per-stream", "0")
+        }
+    }
+
+    @Test
+    fun `schema 2 capabilities advertise stacks and commands require one`() {
+        val output = ByteArrayOutputStream()
+        EventWriter(PrintStream(output, true, Charsets.UTF_8)).capabilities()
+
+        val expectedCapabilities =
+            """{"schema_version":2,"event":"capabilities","peer":"kotlin","roles":["client","server"],""" +
+                """"rpc_kinds":["unary","client_stream","server_stream","bidi"],""" +
+                """"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}""" +
+                System.lineSeparator()
+        assertEquals(
+            expectedCapabilities,
+            output.toString(Charsets.UTF_8),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            parseCommand(arrayOf("server", "--listen", "127.0.0.1:0", "--cert", "cert", "--key", "key"))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            clientArgs("--stack", "unknown")
         }
     }
 
@@ -107,8 +160,8 @@ class ProtocolTest {
 
         assertEquals(
             listOf(
-                """{"schema_version":1,"event":"ready","peer":"kotlin","address":"127.0.0.1:7","pid":12}""",
-                """{"schema_version":1,"event":"sample","peer":"kotlin","rpc_kind":"unary","admission_ns":"1000000","elapsed_ns":"1000100","drain_ns":"100","completed":"1","failed":"0","request_messages":"1","response_messages":"1","histogram":[{"upper_bound_ns":"100","count":"1"}]}""",
+                """{"schema_version":2,"event":"ready","peer":"kotlin","address":"127.0.0.1:7","pid":12}""",
+                """{"schema_version":2,"event":"sample","peer":"kotlin","rpc_kind":"unary","admission_ns":"1000000","elapsed_ns":"1000100","drain_ns":"100","completed":"1","failed":"0","request_messages":"1","response_messages":"1","histogram":[{"upper_bound_ns":"100","count":"1"}]}""",
             ),
             output
                 .toString(Charsets.UTF_8)
@@ -124,6 +177,7 @@ class ProtocolTest {
     ) {
         val values =
             linkedMapOf(
+                "--stack" to "trevrpc_native_quic",
                 "--address" to "127.0.0.1:7443",
                 "--cert" to "cert",
                 "--rpc" to "unary",

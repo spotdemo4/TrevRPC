@@ -1,4 +1,5 @@
 #include "benchmark.trevrpc.hpp"
+#include "benchmark_peer.hpp"
 
 #include <trevrpc/trevrpc.hpp>
 
@@ -30,33 +31,16 @@ namespace benchmark = trevrpc::benchmark::v1;
 
 namespace {
 
+using namespace trevrpc_bench;
+
 using Clock = std::chrono::steady_clock;
 using Nanoseconds = std::chrono::nanoseconds;
 
-constexpr auto kConnectTimeout = std::chrono::seconds(10);
 constexpr std::size_t kMaximumControlLine = 1024;
-constexpr std::size_t kMaximumPayloadBytes = std::size_t{64} * 1024 * 1024;
-constexpr std::uint32_t kMaximumMessagesPerStream = 1'000'000;
-constexpr std::size_t kMaximumFrameSize = kMaximumPayloadBytes + 1024;
-constexpr std::uint16_t kPeerStreamLimit = 1024;
 
 volatile std::sig_atomic_t stop_requested = 0;
 
 void handle_signal(int) { stop_requested = 1; }
-
-class PeerError final : public std::runtime_error {
-public:
-  PeerError(std::string phase, std::string code, std::string_view message)
-      : std::runtime_error(std::string(message)), phase_(std::move(phase)), code_(std::move(code)) {
-  }
-
-  [[nodiscard]] const std::string& phase() const noexcept { return phase_; }
-  [[nodiscard]] const std::string& code() const noexcept { return code_; }
-
-private:
-  std::string phase_;
-  std::string code_;
-};
 
 [[nodiscard]] std::string json_string(std::string_view value) {
   constexpr char hexadecimal[] = "0123456789abcdef";
@@ -107,12 +91,15 @@ void emit(std::string_view event) {
 }
 
 void emit_error(std::string_view phase, std::string_view code, std::string_view message) {
-  emit(
-      "{\"schema_version\":1,\"event\":\"error\",\"peer\":\"cpp\",\"phase\":" + json_string(phase) +
-      ",\"code\":" + json_string(code) + ",\"message\":" + json_string(message) + '}');
+  emit("{\"schema_version\":" + std::to_string(kSchemaVersion) +
+       ",\"event\":\"error\",\"peer\":\"cpp\",\"phase\":" + json_string(phase) +
+       ",\"code\":" + json_string(code) + ",\"message\":" + json_string(message) + '}');
 }
 
-void emit_stopped() { emit("{\"schema_version\":1,\"event\":\"stopped\",\"peer\":\"cpp\"}"); }
+void emit_stopped() {
+  emit("{\"schema_version\":" + std::to_string(kSchemaVersion) +
+       ",\"event\":\"stopped\",\"peer\":\"cpp\"}");
+}
 
 [[nodiscard]] std::string describe(const trevrpc::Error& error) {
   if (error.status().has_value()) {
@@ -122,18 +109,6 @@ void emit_stopped() { emit("{\"schema_version\":1,\"event\":\"stopped\",\"peer\"
   return error.message().empty() ? "TrevRPC error " + std::to_string(error.code())
                                  : error.message() + " (code " + std::to_string(error.code()) + ')';
 }
-
-struct Endpoint {
-  std::string host;
-  std::uint16_t port = 0;
-
-  [[nodiscard]] std::string address(std::uint16_t actual_port) const {
-    if (host.find(':') != std::string::npos) {
-      return '[' + host + "]:" + std::to_string(actual_port);
-    }
-    return host + ':' + std::to_string(actual_port);
-  }
-};
 
 [[nodiscard]] std::uint64_t parse_unsigned(std::string_view name, std::string_view value) {
   std::uint64_t parsed = 0;
@@ -208,7 +183,16 @@ void reject_unknown(const Arguments& arguments) {
   }
 }
 
-enum class RpcKind { Unary, ClientStream, ServerStream, Bidi };
+[[nodiscard]] Stack parse_stack(std::string_view value) {
+  if (value == "trevrpc_native_quic") {
+    return Stack::TrevrpcNativeQuic;
+  }
+  if (value == "grpc_http2") {
+    return Stack::GrpcHttp2;
+  }
+  throw PeerError("config", "invalid_argument",
+                  "--stack must be trevrpc_native_quic or grpc_http2");
+}
 
 [[nodiscard]] RpcKind parse_rpc_kind(std::string_view value) {
   if (value == "unary") {
@@ -241,21 +225,24 @@ enum class RpcKind { Unary, ClientStream, ServerStream, Bidi };
   return "unknown";
 }
 
-struct ClientConfig {
-  Endpoint endpoint;
-  std::string certificate;
-  RpcKind rpc_kind = RpcKind::Unary;
-  std::size_t concurrency = 0;
-  std::uint64_t warmup_ms = 0;
-  std::uint64_t measurement_ms = 0;
-  std::size_t request_bytes = 0;
-  std::uint32_t response_bytes = 0;
-  std::uint32_t messages_per_stream = 0;
-};
+[[nodiscard]] ServerConfig parse_server_config(int argc, char** argv) {
+  Arguments arguments = parse_arguments(argc, argv);
+  ServerConfig config;
+  config.stack = parse_stack(take_required(arguments, "stack"));
+  config.endpoint = parse_endpoint("--listen", take_required(arguments, "listen"), true);
+  config.certificate = take_required(arguments, "cert");
+  config.private_key = take_required(arguments, "key");
+  reject_unknown(arguments);
+  if (config.certificate.empty() || config.private_key.empty()) {
+    throw PeerError("config", "invalid_argument", "--cert and --key must not be empty");
+  }
+  return config;
+}
 
 [[nodiscard]] ClientConfig parse_client_config(int argc, char** argv) {
   Arguments arguments = parse_arguments(argc, argv);
   ClientConfig config;
+  config.stack = parse_stack(take_required(arguments, "stack"));
   config.endpoint = parse_endpoint("--address", take_required(arguments, "address"), false);
   config.certificate = take_required(arguments, "cert");
   config.rpc_kind = parse_rpc_kind(take_required(arguments, "rpc"));
@@ -299,19 +286,13 @@ struct ClientConfig {
   return config;
 }
 
-[[nodiscard]] std::string make_payload(std::size_t size, std::uint64_t) {
-  return std::string(size, '\0');
-}
-
-[[nodiscard]] bool valid_payload(std::string_view payload, std::size_t size, std::uint64_t) {
-  return payload.size() == size &&
-         std::all_of(payload.begin(), payload.end(), [](char character) { return character == 0; });
-}
-
-class BenchmarkService final : public benchmark::BenchmarkServiceService {
+class NativeBenchmarkService final : public benchmark::BenchmarkServiceService {
 public:
   trevrpc::Result<benchmark::BenchmarkResponse>
   Unary(const trevrpc::CallContext&, const benchmark::BenchmarkRequest& request) override {
+    if (request.payload().size() > kMaximumPayloadBytes) {
+      return trevrpc::Status::invalid_argument("request payload exceeds the benchmark peer limit");
+    }
     if (request.response_bytes() > kMaximumPayloadBytes) {
       return trevrpc::Status::invalid_argument("response_bytes exceeds the benchmark peer limit");
     }
@@ -335,6 +316,10 @@ public:
         break;
       }
       const std::size_t size = request.value()->payload().size();
+      if (size > kMaximumPayloadBytes) {
+        return trevrpc::Status::invalid_argument(
+            "request payload exceeds the benchmark peer limit");
+      }
       if (message_count >= kMaximumMessagesPerStream) {
         return trevrpc::Status(trevrpc::StatusCode::ResourceExhausted,
                                "message count exceeds the benchmark peer limit");
@@ -354,7 +339,8 @@ public:
   trevrpc::Status
   ServerStream(const trevrpc::CallContext&, const benchmark::StreamRequest& request,
                trevrpc::ServerWriter<benchmark::BenchmarkResponse>& writer) override {
-    if (request.message_count() == 0 || request.message_count() > kMaximumMessagesPerStream ||
+    if (request.payload().size() > kMaximumPayloadBytes || request.message_count() == 0 ||
+        request.message_count() > kMaximumMessagesPerStream ||
         request.response_bytes() > kMaximumPayloadBytes) {
       return trevrpc::Status::invalid_argument(
           "stream response settings exceed the benchmark peer limits");
@@ -387,6 +373,10 @@ public:
         return trevrpc::Status(trevrpc::StatusCode::ResourceExhausted,
                                "message count exceeds the benchmark peer limit");
       }
+      if (request.value()->payload().size() > kMaximumPayloadBytes) {
+        return trevrpc::Status::invalid_argument(
+            "request payload exceeds the benchmark peer limit");
+      }
       ++message_count;
       if (request.value()->response_bytes() > kMaximumPayloadBytes) {
         return trevrpc::Status::invalid_argument("response_bytes exceeds the benchmark peer limit");
@@ -405,13 +395,13 @@ public:
 
 enum class ControlCommand { Start, Shutdown, EndOfInput, Interrupted, ServeEnded };
 
-[[nodiscard]] ControlCommand wait_for_control(std::atomic<bool>* serve_done = nullptr) {
+[[nodiscard]] ControlCommand wait_for_control(BenchmarkServer* server = nullptr) {
   std::string pending;
   for (;;) {
     if (stop_requested != 0) {
       return ControlCommand::Interrupted;
     }
-    if (serve_done != nullptr && serve_done->load(std::memory_order_acquire)) {
+    if (server != nullptr && server->stopped()) {
       return ControlCommand::ServeEnded;
     }
 
@@ -473,21 +463,50 @@ enum class ControlCommand { Start, Shutdown, EndOfInput, Interrupted, ServeEnded
   }
 }
 
-int run_server(int argc, char** argv) {
-  Arguments arguments = parse_arguments(argc, argv);
-  const Endpoint endpoint = parse_endpoint("--listen", take_required(arguments, "listen"), true);
-  const std::string certificate = take_required(arguments, "cert");
-  const std::string private_key = take_required(arguments, "key");
-  reject_unknown(arguments);
-  if (certificate.empty() || private_key.empty()) {
-    throw PeerError("config", "invalid_argument", "--cert and --key must not be empty");
+class NativeBenchmarkServer final : public BenchmarkServer {
+public:
+  NativeBenchmarkServer(trevrpc::Server server, std::uint16_t port)
+      : server_(std::move(server)), port_(port), serve_thread_([this] {
+          serve_result_ = server_.serve();
+          stopped_.store(true, std::memory_order_release);
+        }) {}
+
+  ~NativeBenchmarkServer() override { shutdown(); }
+
+  [[nodiscard]] std::uint16_t port() const override { return port_; }
+
+  [[nodiscard]] bool stopped() const override { return stopped_.load(std::memory_order_acquire); }
+
+  void shutdown() override {
+    if (!serve_thread_.joinable()) {
+      return;
+    }
+    server_.shutdown();
+    serve_thread_.join();
   }
 
+  [[nodiscard]] std::optional<std::string> finish_error() override {
+    if (!serve_result_) {
+      return describe(serve_result_.error());
+    }
+    return std::nullopt;
+  }
+
+private:
+  trevrpc::Server server_;
+  std::uint16_t port_;
+  trevrpc::Result<void> serve_result_;
+  std::atomic<bool> stopped_{false};
+  std::thread serve_thread_;
+};
+
+[[nodiscard]] std::unique_ptr<BenchmarkServer>
+start_native_server(const ServerConfig& peer_config) {
   trevrpc::ServerConfig config;
-  config.host = endpoint.host;
-  config.port = endpoint.port;
-  config.cert_file = certificate;
-  config.key_file = private_key;
+  config.host = peer_config.endpoint.host;
+  config.port = peer_config.endpoint.port;
+  config.cert_file = peer_config.certificate;
+  config.key_file = peer_config.private_key;
   config.peer_bidi_stream_count = kPeerStreamLimit;
   config.max_frame_size = kMaximumFrameSize;
   auto listening = trevrpc::Server::listen(config);
@@ -505,7 +524,7 @@ int run_server(int argc, char** argv) {
     throw PeerError("setup", "server_config_failed", describe(configured.error()));
   }
   auto registered =
-      benchmark::RegisterBenchmarkService(server, std::make_shared<BenchmarkService>());
+      benchmark::RegisterBenchmarkService(server, std::make_shared<NativeBenchmarkService>());
   if (!registered) {
     throw PeerError("setup", "registration_failed", describe(registered.error()));
   }
@@ -514,35 +533,36 @@ int run_server(int argc, char** argv) {
     throw PeerError("setup", "listen_failed", describe(port.error()));
   }
 
-  trevrpc::Result<void> serve_result;
-  std::atomic<bool> serve_done{false};
-  std::thread serve_thread([&] {
-    serve_result = server.serve();
-    serve_done.store(true, std::memory_order_release);
-  });
+  return std::make_unique<NativeBenchmarkServer>(std::move(server), port.value());
+}
+
+int run_server(int argc, char** argv) {
+  const ServerConfig config = parse_server_config(argc, argv);
+  std::unique_ptr<BenchmarkServer> server = config.stack == Stack::TrevrpcNativeQuic
+                                                ? start_native_server(config)
+                                                : start_grpc_server(config);
+
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  if (serve_done.load(std::memory_order_acquire)) {
-    serve_thread.join();
-    throw PeerError("serve", "serve_failed",
-                    serve_result ? "server stopped during startup"
-                                 : describe(serve_result.error()));
+  if (server->stopped()) {
+    const std::optional<std::string> error = server->finish_error();
+    throw PeerError("serve", "serve_failed", error.value_or("server stopped during startup"));
   }
 
-  emit("{\"schema_version\":1,\"event\":\"ready\",\"peer\":\"cpp\",\"address\":" +
-       json_string(endpoint.address(port.value())) + ",\"pid\":" + std::to_string(getpid()) + '}');
+  emit("{\"schema_version\":" + std::to_string(kSchemaVersion) +
+       ",\"event\":\"ready\",\"peer\":\"cpp\",\"address\":" +
+       json_string(config.endpoint.address(server->port())) +
+       ",\"pid\":" + std::to_string(getpid()) + '}');
 
   ControlCommand command = ControlCommand::EndOfInput;
   try {
-    command = wait_for_control(&serve_done);
+    command = wait_for_control(server.get());
   } catch (...) {
-    server.shutdown();
-    serve_thread.join();
+    server->shutdown();
     throw;
   }
-  server.shutdown();
-  serve_thread.join();
-  if (!serve_result) {
-    throw PeerError("serve", "serve_failed", describe(serve_result.error()));
+  server->shutdown();
+  if (const std::optional<std::string> error = server->finish_error(); error.has_value()) {
+    throw PeerError("serve", "serve_failed", *error);
   }
   if (command == ControlCommand::ServeEnded) {
     throw PeerError("serve", "serve_stopped", "server stopped before SHUTDOWN");
@@ -762,6 +782,61 @@ run_server_stream(benchmark::BenchmarkServiceClient& client, const ClientConfig&
   return "unknown RPC kind";
 }
 
+class NativeBenchmarkClient final : public BenchmarkClient {
+public:
+  explicit NativeBenchmarkClient(const std::shared_ptr<trevrpc::Channel>& channel)
+      : client_(channel) {}
+
+  [[nodiscard]] std::optional<std::string> run(const ClientConfig& config,
+                                               std::uint64_t sequence) override {
+    return run_operation(client_, config, sequence);
+  }
+
+private:
+  benchmark::BenchmarkServiceClient client_;
+};
+
+class NativeClientFactory final : public ClientFactory {
+public:
+  explicit NativeClientFactory(std::shared_ptr<trevrpc::Channel> channel)
+      : channel_(std::move(channel)) {}
+
+  ~NativeClientFactory() override { close(); }
+
+  [[nodiscard]] std::unique_ptr<BenchmarkClient> create() override {
+    std::lock_guard lock(mutex_);
+    if (channel_ == nullptr) {
+      throw std::runtime_error("TrevRPC channel is closed");
+    }
+    return std::make_unique<NativeBenchmarkClient>(channel_);
+  }
+
+  void close() override {
+    std::lock_guard lock(mutex_);
+    if (channel_ != nullptr) {
+      channel_->close();
+      channel_.reset();
+    }
+  }
+
+private:
+  std::mutex mutex_;
+  std::shared_ptr<trevrpc::Channel> channel_;
+};
+
+[[nodiscard]] std::shared_ptr<ClientFactory> connect_native_client(const ClientConfig& config) {
+  trevrpc::ChannelConfig channel_config;
+  channel_config.ca_cert_file = config.certificate;
+  channel_config.skip_certificate_validation = false;
+  channel_config.max_frame_size = kMaximumFrameSize;
+  auto connected = trevrpc::Channel::connect(config.endpoint.host, config.endpoint.port,
+                                             channel_config, kConnectTimeout);
+  if (!connected) {
+    throw PeerError("setup", "connect_failed", describe(connected.error()));
+  }
+  return std::make_shared<NativeClientFactory>(std::move(connected).value());
+}
+
 [[nodiscard]] std::pair<std::uint64_t, std::uint64_t>
 messages_per_operation(RpcKind kind, std::uint32_t messages) {
   switch (kind) {
@@ -817,7 +892,7 @@ struct PhaseResult {
   std::map<std::uint64_t, std::uint64_t> histogram;
 };
 
-[[nodiscard]] PreparedPhase prepare_phase(const std::shared_ptr<trevrpc::Channel>& channel,
+[[nodiscard]] PreparedPhase prepare_phase(const std::shared_ptr<ClientFactory>& factory,
                                           const ClientConfig& config, std::uint64_t duration_ms,
                                           bool record_histogram) {
   PreparedPhase phase;
@@ -826,13 +901,27 @@ struct PhaseResult {
   phase.threads.reserve(config.concurrency);
   try {
     for (std::size_t lane_index = 0; lane_index < config.concurrency; ++lane_index) {
-      phase.threads.emplace_back([channel, &config, duration_ms, record_histogram, lane_index,
+      phase.threads.emplace_back([factory, &config, duration_ms, record_histogram, lane_index,
                                   control = phase.control, lanes = phase.lanes] {
-        benchmark::BenchmarkServiceClient client(channel);
+        std::unique_ptr<BenchmarkClient> client;
+        try {
+          client = factory->create();
+        } catch (const std::exception& error) {
+          LaneResult& lane = (*lanes)[lane_index];
+          lane.failed = 1;
+          lane.error = error.what();
+        } catch (...) {
+          LaneResult& lane = (*lanes)[lane_index];
+          lane.failed = 1;
+          lane.error = "benchmark client creation failed";
+        }
         {
           std::unique_lock lock(control->mutex);
           ++control->ready;
           control->ready_condition.notify_one();
+          if (client == nullptr) {
+            return;
+          }
           control->start_condition.wait(lock,
                                         [&] { return control->started || control->cancelled; });
           if (control->cancelled) {
@@ -851,7 +940,7 @@ struct PhaseResult {
             break;
           }
           try {
-            auto error = run_operation(client, config, sequence++);
+            auto error = client->run(config, sequence++);
             if (error.has_value()) {
               lane.failed = 1;
               lane.error = std::move(error).value();
@@ -939,9 +1028,9 @@ void cancel_phase(PreparedPhase& phase) {
   return result;
 }
 
-[[nodiscard]] PhaseResult run_warmup(const std::shared_ptr<trevrpc::Channel>& channel,
+[[nodiscard]] PhaseResult run_warmup(const std::shared_ptr<ClientFactory>& factory,
                                      const ClientConfig& config) {
-  PreparedPhase phase = prepare_phase(channel, config, config.warmup_ms, false);
+  PreparedPhase phase = prepare_phase(factory, config, config.warmup_ms, false);
   wait_until_ready(phase, config.concurrency);
   static_cast<void>(start_phase(phase));
   return finish_phase(phase);
@@ -950,7 +1039,8 @@ void cancel_phase(PreparedPhase& phase) {
 void emit_sample(const ClientConfig& config, const PhaseResult& result, std::uint64_t elapsed_ns) {
   const std::uint64_t admission_ns = config.measurement_ms * 1'000'000;
   const std::uint64_t drain_ns = elapsed_ns > admission_ns ? elapsed_ns - admission_ns : 0;
-  std::string event = "{\"schema_version\":1,\"event\":\"sample\",\"peer\":\"cpp\",\"rpc_kind\":" +
+  std::string event = "{\"schema_version\":" + std::to_string(kSchemaVersion) +
+                      ",\"event\":\"sample\",\"peer\":\"cpp\",\"rpc_kind\":" +
                       json_string(rpc_kind_name(config.rpc_kind)) + ",\"admission_ns\":\"" +
                       std::to_string(admission_ns) + "\",\"elapsed_ns\":\"" +
                       std::to_string(elapsed_ns) + "\",\"drain_ns\":\"" + std::to_string(drain_ns) +
@@ -974,34 +1064,28 @@ void emit_sample(const ClientConfig& config, const PhaseResult& result, std::uin
 
 int run_client(int argc, char** argv) {
   const ClientConfig config = parse_client_config(argc, argv);
-  trevrpc::ChannelConfig channel_config;
-  channel_config.ca_cert_file = config.certificate;
-  channel_config.skip_certificate_validation = false;
-  channel_config.max_frame_size = kMaximumFrameSize;
-  auto connected = trevrpc::Channel::connect(config.endpoint.host, config.endpoint.port,
-                                             channel_config, kConnectTimeout);
-  if (!connected) {
-    throw PeerError("setup", "connect_failed", describe(connected.error()));
-  }
-  auto channel = std::move(connected).value();
-  benchmark::BenchmarkServiceClient validation_client(channel);
-  auto validation_error = run_operation(validation_client, config, 0);
+  const std::shared_ptr<ClientFactory> factory = config.stack == Stack::TrevrpcNativeQuic
+                                                     ? connect_native_client(config)
+                                                     : connect_grpc_client(config);
+  std::unique_ptr<BenchmarkClient> validation_client = factory->create();
+  auto validation_error = validation_client->run(config, 0);
   if (validation_error.has_value()) {
     throw PeerError("validate", "rpc_failed", std::move(validation_error).value());
   }
+  validation_client.reset();
 
   if (config.warmup_ms > 0) {
-    const PhaseResult warmup = run_warmup(channel, config);
+    const PhaseResult warmup = run_warmup(factory, config);
     if (warmup.failed != 0) {
       throw PeerError("warmup", "rpc_failed",
                       "warmup recorded " + std::to_string(warmup.failed) + " failed operations");
     }
   }
 
-  PreparedPhase measurement = prepare_phase(channel, config, config.measurement_ms, true);
+  PreparedPhase measurement = prepare_phase(factory, config, config.measurement_ms, true);
   wait_until_ready(measurement, config.concurrency);
-  emit("{\"schema_version\":1,\"event\":\"armed\",\"peer\":\"cpp\",\"pid\":" +
-       std::to_string(getpid()) + '}');
+  emit("{\"schema_version\":" + std::to_string(kSchemaVersion) +
+       ",\"event\":\"armed\",\"peer\":\"cpp\",\"pid\":" + std::to_string(getpid()) + '}');
 
   ControlCommand command;
   try {
@@ -1030,7 +1114,7 @@ int run_client(int argc, char** argv) {
   const std::uint64_t elapsed_ns =
       elapsed.count() <= 0 ? 0 : static_cast<std::uint64_t>(elapsed.count());
   emit_sample(config, result, elapsed_ns);
-  channel->close();
+  factory->close();
   return 0;
 }
 
@@ -1049,10 +1133,12 @@ int main(int argc, char** argv) {
       if (argc != 2) {
         throw PeerError("config", "invalid_argument", "capabilities does not accept options");
       }
-      emit("{\"schema_version\":1,\"event\":\"capabilities\",\"peer\":\"cpp\","
+      emit("{\"schema_version\":" + std::to_string(kSchemaVersion) +
+           ",\"event\":\"capabilities\",\"peer\":\"cpp\","
            "\"roles\":[\"client\",\"server\"],"
            "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
-           "\"transports\":[\"native_quic\"],\"histogram\":\"log_linear_v1\"}");
+           "\"stacks\":[\"trevrpc_native_quic\",\"grpc_http2\"],"
+           "\"histogram\":\"log_linear_v1\"}");
       return 0;
     }
     if (command == "server") {

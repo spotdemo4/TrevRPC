@@ -23,7 +23,8 @@ class WorkloadTest {
                 val config = config(kind)
                 val server = createBenchmarkServer()
                 try {
-                    val client = BenchmarkServiceClient(InMemoryTransport(server), benchmarkCallOptions(config))
+                    val client =
+                        NativeBenchmarkClient(BenchmarkServiceClient(InMemoryTransport(server), benchmarkCallOptions(config)))
                     val counts = BenchmarkWorkload(client, config).runOperation()
                     assertEquals(kind.requestMessages(config.messagesPerStream), counts.requests, kind.wireName)
                     assertEquals(kind.responseMessages(config.messagesPerStream), counts.responses, kind.wireName)
@@ -35,6 +36,7 @@ class WorkloadTest {
 
     private fun config(kind: BenchmarkRpcKind): PeerCommand.Client =
         PeerCommand.Client(
+            stack = BenchmarkStack.TREVRPC_NATIVE_QUIC,
             address = "127.0.0.1:7443",
             certificate = Path.of("unused"),
             rpcKind = kind,

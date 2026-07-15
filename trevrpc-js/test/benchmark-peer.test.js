@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
   LogLinearHistogram,
+  connectGrpcBenchmarkClient,
   createBenchmarkHandlers,
   createClientOperation,
+  listenGrpcBenchmarkServer,
   logLinearUpperBound,
   parseCommandLine,
   prepareFixedAdmissionPhase,
@@ -93,7 +98,7 @@ function schemaFields(type) {
   );
 }
 
-test("benchmark peer capabilities use protocol v1", async () => {
+test("benchmark peer capabilities use protocol v2 stacks", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     fileURLToPath(new URL("../bench/trevrpc-bench-peer.js", import.meta.url)),
     "capabilities",
@@ -101,11 +106,11 @@ test("benchmark peer capabilities use protocol v1", async () => {
 
   assert.equal(stderr, "");
   assert.deepEqual(JSON.parse(stdout), {
-    schema_version: 1,
+    schema_version: 2,
     event: "capabilities",
     roles: ["client", "server"],
     rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
-    transports: ["native_quic"],
+    stacks: ["trevrpc_native_quic", "grpc_http2"],
     histogram: "log_linear_v1",
     peer: "js",
   });
@@ -114,6 +119,8 @@ test("benchmark peer capabilities use protocol v1", async () => {
 test("benchmark peer parses required client and IPv6 server options", () => {
   const clientArgs = [
     "client",
+    "--stack",
+    "grpc_http2",
     "--address",
     "127.0.0.1:43117",
     "--cert",
@@ -135,6 +142,7 @@ test("benchmark peer parses required client and IPv6 server options", () => {
   ];
   assert.deepEqual(parseCommandLine(clientArgs), {
     command: "client",
+    stack: "grpc_http2",
     address: { host: "127.0.0.1", port: 43117 },
     cert: "ca.pem",
     rpcKind: "bidi",
@@ -148,6 +156,8 @@ test("benchmark peer parses required client and IPv6 server options", () => {
   assert.deepEqual(
     parseCommandLine([
       "server",
+      "--stack",
+      "trevrpc_native_quic",
       "--listen",
       "[::1]:0",
       "--cert",
@@ -157,6 +167,7 @@ test("benchmark peer parses required client and IPv6 server options", () => {
     ]),
     {
       command: "server",
+      stack: "trevrpc_native_quic",
       listen: { host: "::1", port: 0 },
       cert: "server.pem",
       key: "server-key.pem",
@@ -166,6 +177,8 @@ test("benchmark peer parses required client and IPv6 server options", () => {
     () =>
       parseCommandLine([
         "client",
+        "--stack",
+        "grpc_http2",
         "--address",
         "127.0.0.1:1",
         "--cert",
@@ -175,9 +188,29 @@ test("benchmark peer parses required client and IPv6 server options", () => {
       ]),
     /missing required option --concurrency/u,
   );
+  assert.throws(
+    () => parseCommandLine([clientArgs[0], ...clientArgs.slice(3)]),
+    /missing required option --stack/u,
+  );
+  assert.throws(
+    () =>
+      parseCommandLine([
+        "server",
+        "--listen",
+        "127.0.0.1:0",
+        "--cert",
+        "server.pem",
+        "--key",
+        "server-key.pem",
+      ]),
+    /missing required option --stack/u,
+  );
   const oversizedPayload = [...clientArgs];
   oversizedPayload[oversizedPayload.indexOf("--request-bytes") + 1] = "67108865";
   assert.throws(() => parseCommandLine(oversizedPayload), /through 67108864/u);
+  const invalidStack = [...clientArgs];
+  invalidStack[invalidStack.indexOf("--stack") + 1] = "native_quic";
+  assert.throws(() => parseCommandLine(invalidStack), /trevrpc_native_quic or grpc_http2/u);
 });
 
 test("log_linear_v1 uses exact low buckets and sorted sparse output", () => {
@@ -384,6 +417,47 @@ test("client operations validate and count all four RPC kinds", async () => {
   });
 });
 
+test("gRPC loopback preserves all four benchmark RPC semantics", async (t) => {
+  const certificate = await testCertificate(t);
+  const server = await listenGrpcBenchmarkServer({
+    listen: { host: "127.0.0.1", port: 0 },
+    cert: certificate.certFile,
+    key: certificate.keyFile,
+  });
+  const connection = await connectGrpcBenchmarkClient({
+    address: { host: "127.0.0.1", port: server.port },
+    cert: certificate.certFile,
+  });
+  try {
+    const expectedCounts = {
+      unary: { requestMessages: 1n, responseMessages: 1n },
+      client_stream: { requestMessages: 3n, responseMessages: 1n },
+      server_stream: { requestMessages: 1n, responseMessages: 3n },
+      bidi: { requestMessages: 3n, responseMessages: 3n },
+    };
+    for (const rpcKind of ["unary", "client_stream", "server_stream", "bidi"]) {
+      const operation = createClientOperation(connection.client, {
+        rpcKind,
+        requestBytes: 5,
+        responseBytes: 7,
+        messagesPerStream: 3,
+      });
+      assert.deepEqual(
+        await operation({ laneIndex: 2, operationIndex: 9n }),
+        expectedCounts[rpcKind],
+      );
+    }
+
+    await assert.rejects(
+      connection.client.unary({ sequence: "1", responseBytes: 0xffffffff }),
+      (error) => error.code === Code.InvalidArgument,
+    );
+  } finally {
+    connection.close();
+    await server.close();
+  }
+});
+
 test("server handlers implement all four benchmark RPCs", async () => {
   const handlers = createBenchmarkHandlers();
   const unaryBody = await handlers.unary({
@@ -492,4 +566,36 @@ function receivingCall(frames) {
       return Promise.resolve(queued.shift());
     },
   };
+}
+
+async function testCertificate(t) {
+  const directory = await mkdtemp(join(tmpdir(), "trevrpc-js-benchmark-grpc-cert-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const certFile = join(directory, "cert.pem");
+  const keyFile = join(directory, "key.pem");
+  const generated = spawnSync(
+    "openssl",
+    [
+      "req",
+      "-x509",
+      "-newkey",
+      "ec",
+      "-pkeyopt",
+      "ec_paramgen_curve:prime256v1",
+      "-nodes",
+      "-days",
+      "1",
+      "-subj",
+      "/CN=localhost",
+      "-addext",
+      "subjectAltName=DNS:localhost,IP:127.0.0.1",
+      "-keyout",
+      keyFile,
+      "-out",
+      certFile,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(generated.status, 0, generated.stderr);
+  return { certFile, keyFile };
 }

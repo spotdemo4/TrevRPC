@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+
+import * as grpc from "@grpc/grpc-js";
 
 import {
   Code,
@@ -16,15 +19,18 @@ import {
 import { RawNodeTransport } from "../src/node-advanced.js";
 import { NodeServer } from "../src/node-index.js";
 
-const SchemaVersion = 1;
+const SchemaVersion = 2;
 const Peer = "js";
 const ServiceName = "trevrpc.benchmark.v1.BenchmarkService";
+const Stacks = new Set(["trevrpc_native_quic", "grpc_http2"]);
 const IdleTimeoutMs = 600_000;
+const ConnectTimeoutMs = 30_000;
+const ShutdownTimeoutMs = 5_000;
 const StreamBatchSize = 16;
 const MaxConcurrency = 1024;
 const MaxPayloadBytes = 64 * 1024 * 1024;
 const MaxMessagesPerStream = 1_000_000;
-const MaxFrameSize = 128 * 1024 * 1024;
+const MaxFrameSize = MaxPayloadBytes + 1024;
 
 export const root = createRoot({
   nested: {
@@ -106,6 +112,20 @@ export const BenchmarkService = Object.freeze({
   },
 });
 
+export const GrpcBenchmarkService = Object.freeze({
+  unary: grpcMethod("Unary", BenchmarkRequest, BenchmarkResponse, false, false),
+  clientStream: grpcMethod("ClientStream", BenchmarkRequest, BenchmarkSummary, true, false),
+  serverStream: grpcMethod("ServerStream", StreamRequest, BenchmarkResponse, false, true),
+  bidi: grpcMethod("Bidi", BenchmarkRequest, BenchmarkResponse, true, true),
+});
+
+const GrpcBenchmarkClient = grpc.makeGenericClientConstructor(GrpcBenchmarkService, ServiceName);
+const GrpcOptions = Object.freeze({
+  "grpc.default_compression_algorithm": grpc.compressionAlgorithms.identity,
+  "grpc.max_receive_message_length": MaxFrameSize,
+  "grpc.max_send_message_length": MaxFrameSize,
+});
+
 export class PeerError extends Error {
   constructor(phase, code, message, options = {}) {
     super(message, options);
@@ -123,7 +143,7 @@ export async function main(argv = process.argv.slice(2), io = process) {
         event: "capabilities",
         roles: ["client", "server"],
         rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
-        transports: ["native_quic"],
+        stacks: ["trevrpc_native_quic", "grpc_http2"],
         histogram: "log_linear_v1",
       });
       return;
@@ -147,9 +167,10 @@ export function parseCommandLine(argv) {
     return { command };
   }
   if (command === "server") {
-    const options = parseOptions(args, ["listen", "cert", "key"]);
+    const options = parseOptions(args, ["stack", "listen", "cert", "key"]);
     return {
       command,
+      stack: parseStack(options),
       listen: parseAddress(requiredOption(options, "listen"), true),
       cert: requiredOption(options, "cert"),
       key: requiredOption(options, "key"),
@@ -157,6 +178,7 @@ export function parseCommandLine(argv) {
   }
   if (command === "client") {
     const options = parseOptions(args, [
+      "stack",
       "address",
       "cert",
       "rpc",
@@ -177,6 +199,7 @@ export function parseCommandLine(argv) {
     }
     return {
       command,
+      stack: parseStack(options),
       address: parseAddress(requiredOption(options, "address"), false),
       cert: requiredOption(options, "cert"),
       rpcKind,
@@ -239,34 +262,25 @@ export function createBenchmarkHandlers() {
   return {
     unary(call) {
       const request = BenchmarkRequest.decode(call.request.body);
-      validateResponseBytes(request.responseBytes);
-      return encodeResponse(request.sequence, request.responseBytes);
+      return encodeResponseMessage(responseForRequest(request));
     },
 
     async *clientStream(call) {
-      let messageCount = 0n;
-      let payloadBytes = 0n;
+      const summary = emptySummary();
       for (;;) {
         const body = requestBody(await call.recv());
         if (body == null) {
-          yield BenchmarkSummary.encode({
-            messageCount: String(messageCount),
-            payloadBytes: String(payloadBytes),
-          }).finish();
+          yield BenchmarkSummary.encode(summaryResponse(summary)).finish();
           return;
         }
-        const request = BenchmarkRequest.decode(body);
-        messageCount += 1n;
-        if (messageCount > BigInt(MaxMessagesPerStream)) {
-          throw resourceExhausted("message count exceeded the benchmark peer limit");
-        }
-        payloadBytes += BigInt(request.payload.byteLength);
+        addSummaryRequest(summary, BenchmarkRequest.decode(body));
       }
     },
 
     serverStream(call) {
       const request = StreamRequest.decode(call.request.body);
       validateMessageCount(request.messageCount);
+      validateRequestPayload(request.payload);
       validateResponseBytes(request.responseBytes);
       return encodedResponseStream(request.messageCount, request.responseBytes);
     },
@@ -283,11 +297,76 @@ export function createBenchmarkHandlers() {
           throw resourceExhausted("message count exceeded the benchmark peer limit");
         }
         const request = BenchmarkRequest.decode(body);
-        validateResponseBytes(request.responseBytes);
-        yield encodeResponse(request.sequence, request.responseBytes);
+        yield encodeResponseMessage(responseForRequest(request));
       }
     },
   };
+}
+
+export function createGrpcBenchmarkHandlers() {
+  return {
+    unary(call, callback) {
+      try {
+        callback(null, responseForRequest(call.request));
+      } catch (error) {
+        callback(toGrpcError(error));
+      }
+    },
+
+    clientStream(call, callback) {
+      void receiveGrpcClientStream(call, callback);
+    },
+
+    serverStream(call) {
+      void sendGrpcServerStream(call);
+    },
+
+    bidi(call) {
+      void runGrpcBidi(call);
+    },
+  };
+}
+
+async function receiveGrpcClientStream(call, callback) {
+  const summary = emptySummary();
+  try {
+    for await (const request of call) {
+      addSummaryRequest(summary, request);
+    }
+    callback(null, summaryResponse(summary));
+  } catch (error) {
+    callback(toGrpcError(error));
+  }
+}
+
+async function sendGrpcServerStream(call) {
+  try {
+    validateMessageCount(call.request.messageCount);
+    validateRequestPayload(call.request.payload);
+    validateResponseBytes(call.request.responseBytes);
+    for (let sequence = 0; sequence < call.request.messageCount; sequence += 1) {
+      await writeGrpcMessage(call, createResponse(String(sequence), call.request.responseBytes));
+    }
+    call.end();
+  } catch (error) {
+    call.destroy(toGrpcError(error));
+  }
+}
+
+async function runGrpcBidi(call) {
+  let messageCount = 0;
+  try {
+    for await (const request of call.iterator({ destroyOnReturn: false })) {
+      messageCount += 1;
+      if (messageCount > MaxMessagesPerStream) {
+        throw resourceExhausted("message count exceeded the benchmark peer limit");
+      }
+      await writeGrpcMessage(call, responseForRequest(request));
+    }
+    call.end();
+  } catch (error) {
+    call.destroy(toGrpcError(error));
+  }
 }
 
 function requestBody(frame) {
@@ -412,6 +491,108 @@ export function createClientOperation(client, config) {
   }
 }
 
+function createGrpcClientAdapter(client) {
+  return {
+    unary(request) {
+      return new Promise((resolveResponse, rejectResponse) => {
+        client.unary(request, (error, response) => {
+          if (error != null) {
+            rejectResponse(error);
+          } else if (response == null) {
+            rejectResponse(new Error("gRPC unary call returned no response"));
+          } else {
+            resolveResponse(response);
+          }
+        });
+      });
+    },
+
+    clientStream() {
+      let resolveResponse;
+      const response = new Promise((resolvePromise) => {
+        resolveResponse = resolvePromise;
+      });
+      const call = client.clientStream((error, value) => {
+        resolveResponse({ error, value });
+      });
+      const terminalStatus = grpcTerminalStatus(call);
+      return Promise.resolve({
+        send(message) {
+          return writeGrpcMessage(call, message);
+        },
+        async sendMany(messages) {
+          for (const message of messages) {
+            await writeGrpcMessage(call, message);
+          }
+        },
+        async closeAndRecv() {
+          call.end();
+          const [outcome, status] = await Promise.all([response, terminalStatus]);
+          assertGrpcOk(status);
+          if (outcome.error != null) {
+            throw outcome.error;
+          }
+          if (outcome.value == null) {
+            throw new Error("gRPC client-stream call returned no response");
+          }
+          return outcome.value;
+        },
+      });
+    },
+
+    serverStream(request) {
+      const call = client.serverStream(request);
+      const terminalStatus = grpcTerminalStatus(call);
+      return Promise.resolve(grpcResponseStream(call, terminalStatus));
+    },
+
+    bidi() {
+      const call = client.bidi();
+      const iterator = call[Symbol.asyncIterator]();
+      const terminalStatus = grpcTerminalStatus(call);
+      return Promise.resolve({
+        send(message) {
+          return writeGrpcMessage(call, message);
+        },
+        async sendMany(messages) {
+          for (const message of messages) {
+            await writeGrpcMessage(call, message);
+          }
+        },
+        closeSend() {
+          return endGrpcWrites(call);
+        },
+        async recv() {
+          let result;
+          try {
+            result = await iterator.next();
+          } catch (error) {
+            assertGrpcOk(await terminalStatus);
+            throw error;
+          }
+          if (result.done) {
+            assertGrpcOk(await terminalStatus);
+            return undefined;
+          }
+          return result.value;
+        },
+      });
+    },
+  };
+}
+
+async function* grpcResponseStream(call, terminalStatus) {
+  try {
+    for await (const response of call) {
+      yield response;
+    }
+  } catch (error) {
+    assertGrpcOk(await terminalStatus);
+    throw error;
+  }
+  assertGrpcOk(await terminalStatus);
+}
+
 export function prepareFixedAdmissionPhase({
   operation,
   concurrency,
@@ -484,26 +665,11 @@ export function prepareFixedAdmissionPhase({
 async function runServer(config, io) {
   let server;
   try {
-    server = await NodeServer.listen({
-      host: config.listen.host,
-      port: config.listen.port,
-      certFile: config.cert,
-      keyFile: config.key,
-      path: "/trevrpc",
-      maxSessionsPerConnection: 16,
-      maxStreamsPerSession: MaxConcurrency,
-      maxStreamMessages: -1,
-      idleTimeoutMs: IdleTimeoutMs,
-      streamIdleTimeoutMs: IdleTimeoutMs,
-      maxFrameSize: MaxFrameSize,
-      maxPendingSendBytes: MaxFrameSize,
-    });
+    server = await listenBenchmarkServer(config);
   } catch (error) {
     throw wrapError("listen", "listen_failed", error);
   }
 
-  server.registerService(BenchmarkService, createBenchmarkHandlers());
-  const serveDone = server.serve();
   const control = createInterface({ input: io.stdin, crlfDelay: Infinity });
   const termination = terminationSignal();
   let reason;
@@ -516,7 +682,7 @@ async function runServer(config, io) {
     reason = await Promise.race([
       waitForControl(control, new Set(["SHUTDOWN"])),
       termination.promise,
-      serveDone.then(
+      server.done.then(
         () => {
           throw new PeerError("serve", "server_stopped", "server stopped before SHUTDOWN");
         },
@@ -531,35 +697,109 @@ async function runServer(config, io) {
   } finally {
     control.close();
     termination.cleanup();
-    server.close();
-    await serveDone;
+    await server.close();
   }
 }
 
-async function runClient(config, io) {
-  let transport;
+async function listenBenchmarkServer(config) {
+  if (config.stack === "grpc_http2") {
+    return await listenGrpcBenchmarkServer(config);
+  }
+
+  const server = await NodeServer.listen({
+    host: config.listen.host,
+    port: config.listen.port,
+    certFile: config.cert,
+    keyFile: config.key,
+    path: "/trevrpc",
+    maxSessionsPerConnection: 16,
+    maxStreamsPerSession: MaxConcurrency,
+    maxStreamMessages: -1,
+    idleTimeoutMs: IdleTimeoutMs,
+    streamIdleTimeoutMs: IdleTimeoutMs,
+    maxFrameSize: MaxFrameSize,
+    maxPendingSendBytes: MaxFrameSize,
+  });
+  server.registerService(BenchmarkService, createBenchmarkHandlers());
+  const done = server.serve();
+  return {
+    port: server.port,
+    done,
+    async close() {
+      server.close();
+      await done;
+    },
+  };
+}
+
+export async function listenGrpcBenchmarkServer(config) {
+  const [certificate, privateKey] = await Promise.all([
+    readFile(config.cert),
+    readFile(config.key),
+  ]);
+  const server = new grpc.Server({
+    ...GrpcOptions,
+    "grpc.max_concurrent_streams": MaxConcurrency,
+  });
+  server.addService(GrpcBenchmarkService, createGrpcBenchmarkHandlers());
+  const credentials = grpc.ServerCredentials.createSsl(
+    null,
+    [{ private_key: privateKey, cert_chain: certificate }],
+    false,
+  );
+  let port;
   try {
-    transport = await RawNodeTransport.connect({
-      host: config.address.host,
-      port: config.address.port,
-      caCertFile: config.cert,
-      maxStreamsPerSession: Math.max(128, config.concurrency),
-      idleTimeoutMs: IdleTimeoutMs,
-      maxFrameSize: MaxFrameSize,
-      maxPendingSendBytes: MaxFrameSize,
+    port = await new Promise((resolvePort, rejectPort) => {
+      server.bindAsync(
+        formatAddress(config.listen.host, config.listen.port),
+        credentials,
+        (error, boundPort) => {
+          if (error == null) {
+            resolvePort(boundPort);
+          } else {
+            rejectPort(error);
+          }
+        },
+      );
     });
+  } catch (error) {
+    server.forceShutdown();
+    throw error;
+  }
+  let closePromise;
+  return {
+    port,
+    done: new Promise(() => {}),
+    close() {
+      closePromise ??= new Promise((resolveClose, rejectClose) => {
+        const timeout = setTimeout(() => {
+          server.forceShutdown();
+          resolveClose();
+        }, ShutdownTimeoutMs);
+        server.tryShutdown((error) => {
+          clearTimeout(timeout);
+          if (error == null) {
+            resolveClose();
+          } else {
+            rejectClose(error);
+          }
+        });
+      });
+      return closePromise;
+    },
+  };
+}
+
+async function runClient(config, io) {
+  let connection;
+  try {
+    connection = await connectBenchmarkClient(config);
   } catch (error) {
     throw wrapError("connect", "connect_failed", error);
   }
 
   try {
-    const client = createServiceClient(transport, BenchmarkService, root, {
-      maxResponseBodySize: MaxFrameSize,
-      maxResponseMessages: -1,
-      maxResponseStreamBodySize: -1,
-      streamIdleTimeoutMs: IdleTimeoutMs,
-    });
-    const operation = createClientOperation(client, config);
+    const operation = createClientOperation(connection.client, config);
     try {
       await operation({ laneIndex: 0, operationIndex: 0n });
     } catch (error) {
@@ -624,8 +864,67 @@ async function runClient(config, io) {
       histogram: result.histogram.toJSON(),
     });
   } finally {
-    transport.close();
+    connection.close();
   }
+}
+
+async function connectBenchmarkClient(config) {
+  if (config.stack === "grpc_http2") {
+    return await connectGrpcBenchmarkClient(config);
+  }
+
+  const transport = await RawNodeTransport.connect({
+    host: config.address.host,
+    port: config.address.port,
+    caCertFile: config.cert,
+    maxStreamsPerSession: Math.max(128, config.concurrency),
+    idleTimeoutMs: IdleTimeoutMs,
+    maxFrameSize: MaxFrameSize,
+    maxPendingSendBytes: MaxFrameSize,
+  });
+  return {
+    client: createServiceClient(transport, BenchmarkService, root, {
+      maxResponseBodySize: MaxFrameSize,
+      maxResponseMessages: -1,
+      maxResponseStreamBodySize: -1,
+      streamIdleTimeoutMs: IdleTimeoutMs,
+    }),
+    close() {
+      transport.close();
+    },
+  };
+}
+
+export async function connectGrpcBenchmarkClient(config) {
+  const certificate = await readFile(config.cert);
+  const credentials = grpc.credentials.createSsl(certificate, null, null, {
+    rejectUnauthorized: true,
+  });
+  const grpcClient = new GrpcBenchmarkClient(
+    formatAddress(config.address.host, config.address.port),
+    credentials,
+    GrpcOptions,
+  );
+  try {
+    await new Promise((resolveReady, rejectReady) => {
+      grpcClient.waitForReady(Date.now() + ConnectTimeoutMs, (error) => {
+        if (error == null) {
+          resolveReady();
+        } else {
+          rejectReady(error);
+        }
+      });
+    });
+  } catch (error) {
+    grpcClient.close();
+    throw error;
+  }
+  return {
+    client: createGrpcClientAdapter(grpcClient),
+    close() {
+      grpcClient.close();
+    },
+  };
 }
 
 function parseOptions(args, allowed) {
@@ -655,6 +954,18 @@ function requiredOption(options, name) {
     throw new PeerError("configure", "invalid_arguments", `missing required option --${name}`);
   }
   return value;
+}
+
+function parseStack(options) {
+  const stack = requiredOption(options, "stack");
+  if (!Stacks.has(stack)) {
+    throw new PeerError(
+      "configure",
+      "invalid_arguments",
+      `--stack must be trevrpc_native_quic or grpc_http2; got ${JSON.stringify(stack)}`,
+    );
+  }
+  return stack;
 }
 
 function parseIntegerOption(options, name, minimum, maximum) {
@@ -742,16 +1053,52 @@ async function sendRequestMessages(call, config) {
   }
 }
 
-function encodeResponse(sequence, responseBytes) {
-  return BenchmarkResponse.encode({
+function responseForRequest(request) {
+  validateRequestPayload(request.payload);
+  validateResponseBytes(request.responseBytes);
+  return createResponse(request.sequence, request.responseBytes);
+}
+
+function createResponse(sequence, responseBytes) {
+  return {
     sequence: uint64Text(sequence),
     payload: new Uint8Array(responseBytes),
-  }).finish();
+  };
+}
+
+function encodeResponseMessage(response) {
+  return BenchmarkResponse.encode(response).finish();
+}
+
+function emptySummary() {
+  return { messageCount: 0n, payloadBytes: 0n };
+}
+
+function addSummaryRequest(summary, request) {
+  validateRequestPayload(request.payload);
+  summary.messageCount += 1n;
+  if (summary.messageCount > BigInt(MaxMessagesPerStream)) {
+    throw resourceExhausted("message count exceeded the benchmark peer limit");
+  }
+  summary.payloadBytes += BigInt(request.payload.byteLength);
+}
+
+function summaryResponse(summary) {
+  return {
+    messageCount: String(summary.messageCount),
+    payloadBytes: String(summary.payloadBytes),
+  };
 }
 
 function validateResponseBytes(responseBytes) {
   if (!Number.isInteger(responseBytes) || responseBytes < 0 || responseBytes > MaxPayloadBytes) {
     throw invalidArgument("response_bytes is outside the benchmark peer limit");
+  }
+}
+
+function validateRequestPayload(payload) {
+  if (payload.byteLength > MaxPayloadBytes) {
+    throw invalidArgument("request payload is outside the benchmark peer limit");
   }
 }
 
@@ -771,7 +1118,7 @@ function encodedResponseStream(messageCount, responseBytes) {
       if (sent >= messageCount) {
         return Promise.resolve({ done: true, value: undefined });
       }
-      const body = encodeResponse(String(sent), responseBytes);
+      const body = encodeResponseMessage(createResponse(String(sent), responseBytes));
       sent += 1;
       return Promise.resolve({ done: false, value: body });
     },
@@ -781,7 +1128,7 @@ function encodedResponseStream(messageCount, responseBytes) {
       }
       const count = Math.min(messageCount - sent, Math.max(1, max), streamBatchSize(responseBytes));
       const bodies = Array.from({ length: count }, () => {
-        const body = encodeResponse(String(sent), responseBytes);
+        const body = encodeResponseMessage(createResponse(String(sent), responseBytes));
         sent += 1;
         return body;
       });
@@ -819,6 +1166,80 @@ function validateZeroPayload(payload, label) {
 
 function uint64Text(value) {
   return String(value ?? 0);
+}
+
+function grpcMethod(name, requestType, responseType, requestStream, responseStream) {
+  return Object.freeze({
+    path: `/${ServiceName}/${name}`,
+    requestStream,
+    responseStream,
+    requestSerialize: protobufSerializer(requestType),
+    requestDeserialize: protobufDeserializer(requestType),
+    responseSerialize: protobufSerializer(responseType),
+    responseDeserialize: protobufDeserializer(responseType),
+    originalName: name,
+  });
+}
+
+function protobufSerializer(type) {
+  return (value) => {
+    const encoded = type.encode(value).finish();
+    return Buffer.from(encoded.buffer, encoded.byteOffset, encoded.byteLength);
+  };
+}
+
+function protobufDeserializer(type) {
+  return (value) => type.decode(value);
+}
+
+function writeGrpcMessage(call, message) {
+  return new Promise((resolveWrite, rejectWrite) => {
+    try {
+      call.write(message, (error) => {
+        if (error == null) {
+          resolveWrite();
+        } else {
+          rejectWrite(error);
+        }
+      });
+    } catch (error) {
+      rejectWrite(error);
+    }
+  });
+}
+
+function endGrpcWrites(call) {
+  return new Promise((resolveEnd, rejectEnd) => {
+    call.end((error) => {
+      if (error == null) {
+        resolveEnd();
+      } else {
+        rejectEnd(error);
+      }
+    });
+  });
+}
+
+function grpcTerminalStatus(call) {
+  return new Promise((resolveStatus) => {
+    call.once("status", resolveStatus);
+  });
+}
+
+function assertGrpcOk(status) {
+  if (status.code === grpc.status.OK) {
+    return;
+  }
+  const error = new Error(`gRPC status ${status.code}: ${status.details}`);
+  error.code = status.code;
+  error.details = status.details;
+  throw error;
+}
+
+function toGrpcError(error) {
+  const code = Number.isInteger(error?.code) ? error.code : grpc.status.UNKNOWN;
+  const details = error?.statusMessage ?? error?.details ?? error?.message ?? String(error);
+  return Object.assign(new Error(details), { code, details });
 }
 
 function emptyPhaseResult() {
@@ -884,7 +1305,7 @@ function wrapError(phase, code, error) {
 }
 
 function usage() {
-  return "usage: trevrpc-bench-peer-js capabilities | server --listen HOST:PORT --cert FILE --key FILE | client --address HOST:PORT --cert FILE --rpc KIND --concurrency N --warmup-ms N --measurement-ms N --request-bytes N --response-bytes N --messages-per-stream N";
+  return "usage: trevrpc-bench-peer-js capabilities | server --stack STACK --listen HOST:PORT --cert FILE --key FILE | client --stack STACK --address HOST:PORT --cert FILE --rpc KIND --concurrency N --warmup-ms N --measurement-ms N --request-bytes N --response-bytes N --messages-per-stream N";
 }
 
 function isMainModule() {

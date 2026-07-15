@@ -44,6 +44,26 @@ impl FromStr for RpcKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Stack {
+    TrevrpcNativeQuic,
+    GrpcHttp2,
+}
+
+impl FromStr for Stack {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "trevrpc_native_quic" => Ok(Self::TrevrpcNativeQuic),
+            "grpc_http2" => Ok(Self::GrpcHttp2),
+            _ => Err(ConfigError(format!(
+                "invalid --stack value {value:?}; expected trevrpc_native_quic or grpc_http2"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum Command {
     Capabilities,
@@ -53,6 +73,7 @@ pub(crate) enum Command {
 
 #[derive(Debug)]
 pub(crate) struct ServerConfig {
+    pub(crate) stack: Stack,
     pub(crate) listen: SocketAddr,
     pub(crate) certificate: PathBuf,
     pub(crate) private_key: PathBuf,
@@ -60,6 +81,7 @@ pub(crate) struct ServerConfig {
 
 #[derive(Debug)]
 pub(crate) struct ClientConfig {
+    pub(crate) stack: Stack,
     pub(crate) address: SocketAddr,
     pub(crate) certificate: PathBuf,
     pub(crate) rpc: RpcKind,
@@ -127,6 +149,7 @@ fn parse_options(
 
 fn parse_server(mut options: BTreeMap<String, String>) -> Result<ServerConfig, ConfigError> {
     let config = ServerConfig {
+        stack: take_parsed(&mut options, "--stack")?,
         listen: take_parsed(&mut options, "--listen")?,
         certificate: PathBuf::from(take(&mut options, "--cert")?),
         private_key: PathBuf::from(take(&mut options, "--key")?),
@@ -137,6 +160,7 @@ fn parse_server(mut options: BTreeMap<String, String>) -> Result<ServerConfig, C
 
 fn parse_client(mut options: BTreeMap<String, String>) -> Result<ClientConfig, ConfigError> {
     let config = ClientConfig {
+        stack: take_parsed(&mut options, "--stack")?,
         address: take_parsed(&mut options, "--address")?,
         certificate: PathBuf::from(take(&mut options, "--cert")?),
         rpc: take_parsed(&mut options, "--rpc")?,
@@ -207,13 +231,15 @@ fn reject_unknown(options: &BTreeMap<String, String>) -> Result<(), ConfigError>
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, RpcKind, parse};
+    use super::{Command, RpcKind, Stack, parse};
 
     #[test]
     fn parses_complete_client_configuration() {
         let command = parse(
             [
                 "client",
+                "--stack",
+                "grpc_http2",
                 "--address",
                 "127.0.0.1:1234",
                 "--cert",
@@ -241,6 +267,7 @@ mod tests {
             panic!("expected client command");
         };
         assert_eq!(config.rpc, RpcKind::Bidi);
+        assert_eq!(config.stack, Stack::GrpcHttp2);
         assert_eq!(config.concurrency, 8);
         assert_eq!(config.messages_per_stream, 4);
     }
@@ -249,6 +276,8 @@ mod tests {
     fn rejects_zero_concurrency_and_unknown_options() {
         let base = [
             "client",
+            "--stack",
+            "trevrpc_native_quic",
             "--address",
             "127.0.0.1:1234",
             "--cert",
@@ -271,18 +300,55 @@ mod tests {
         assert!(parse(base.map(str::to_owned)).is_err());
 
         let mut unknown = base.to_vec();
-        unknown[8] = "1";
+        unknown[10] = "1";
         unknown.extend(["--extra", "value"]);
         assert!(parse(unknown.into_iter().map(str::to_owned)).is_err());
 
         let mut oversized_payload = base.to_vec();
-        oversized_payload[8] = "1";
-        oversized_payload[16] = "67108865";
+        oversized_payload[10] = "1";
+        oversized_payload[18] = "67108865";
         assert!(parse(oversized_payload.into_iter().map(str::to_owned)).is_err());
 
         let mut oversized_stream = base.to_vec();
-        oversized_stream[8] = "1";
-        oversized_stream[18] = "1000001";
+        oversized_stream[10] = "1";
+        oversized_stream[20] = "1000001";
         assert!(parse(oversized_stream.into_iter().map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn requires_stack_for_server_and_client() {
+        let server = [
+            "server",
+            "--listen",
+            "127.0.0.1:0",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+        ];
+        assert!(parse(server.map(str::to_owned)).is_err());
+
+        let client = [
+            "client",
+            "--address",
+            "127.0.0.1:1",
+            "--cert",
+            "ca.pem",
+            "--rpc",
+            "unary",
+            "--concurrency",
+            "1",
+            "--warmup-ms",
+            "0",
+            "--measurement-ms",
+            "1",
+            "--request-bytes",
+            "0",
+            "--response-bytes",
+            "0",
+            "--messages-per-stream",
+            "1",
+        ];
+        assert!(parse(client.map(str::to_owned)).is_err());
     }
 }

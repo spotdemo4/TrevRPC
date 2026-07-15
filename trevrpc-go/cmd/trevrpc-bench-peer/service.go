@@ -2,56 +2,86 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
 )
 
-type benchmarkService struct{}
+type benchmarkServiceErrorCode uint8
 
-func (benchmarkService) Unary(_ context.Context, request *benchmarkpb.BenchmarkRequest) (*benchmarkpb.BenchmarkResponse, error) {
+const (
+	serviceInvalidArgument benchmarkServiceErrorCode = iota
+	serviceResourceExhausted
+)
+
+type benchmarkServiceError struct {
+	code    benchmarkServiceErrorCode
+	message string
+}
+
+func (e *benchmarkServiceError) Error() string { return e.message }
+
+func benchmarkUnary(request *benchmarkpb.BenchmarkRequest) (*benchmarkpb.BenchmarkResponse, error) {
+	if request == nil {
+		return nil, invalidBenchmarkArgument("missing benchmark request")
+	}
+	if err := validateRequestPayload(request.Payload); err != nil {
+		return nil, err
+	}
 	if err := validateResponseBytes(request.ResponseBytes); err != nil {
 		return nil, err
 	}
 	return benchmarkResponse(request.Sequence, request.ResponseBytes), nil
 }
 
-func (benchmarkService) ClientStream(_ context.Context, requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]) (*benchmarkpb.BenchmarkSummary, error) {
+func summarizeClientStream(recv func() (*benchmarkpb.BenchmarkRequest, error)) (*benchmarkpb.BenchmarkSummary, error) {
 	var messageCount uint64
 	var payloadBytes uint64
 	for {
-		request, err := requests.Recv()
+		request, err := recv()
 		if err == io.EOF {
 			return &benchmarkpb.BenchmarkSummary{MessageCount: messageCount, PayloadBytes: payloadBytes}, nil
 		}
 		if err != nil {
 			return nil, err
 		}
+		if request == nil {
+			return nil, invalidBenchmarkArgument("client stream contained a missing request")
+		}
+		if err := validateRequestPayload(request.Payload); err != nil {
+			return nil, err
+		}
 		if messageCount >= maxBenchmarkMessagesPerStream {
-			return nil, trevrpc.ResourceExhausted("client stream exceeds the benchmark message limit")
+			return nil, exhaustedBenchmarkResource("client stream exceeds the benchmark message limit")
 		}
 		if math.MaxUint64-payloadBytes < uint64(len(request.Payload)) {
-			return nil, trevrpc.InvalidArgument("client stream payload byte count overflow")
+			return nil, invalidBenchmarkArgument("client stream payload byte count overflow")
 		}
 		messageCount++
 		payloadBytes += uint64(len(request.Payload))
 	}
 }
 
-func (benchmarkService) ServerStream(_ context.Context, request *benchmarkpb.StreamRequest) (trevrpc.MessageStream[*benchmarkpb.BenchmarkResponse], error) {
+func newServerResponseStream(request *benchmarkpb.StreamRequest) (*serverResponseStream, error) {
+	if request == nil {
+		return nil, invalidBenchmarkArgument("missing server stream request")
+	}
+	if err := validateRequestPayload(request.Payload); err != nil {
+		return nil, err
+	}
 	if request.MessageCount == 0 || request.MessageCount > maxBenchmarkMessagesPerStream {
-		return nil, trevrpc.InvalidArgument("server stream message count is outside the benchmark limit")
+		return nil, invalidBenchmarkArgument("server stream message count is outside the benchmark limit")
 	}
 	if err := validateResponseBytes(request.ResponseBytes); err != nil {
 		return nil, err
 	}
 	return &serverResponseStream{remaining: request.MessageCount, responseBytes: request.ResponseBytes}, nil
-}
-
-func (benchmarkService) Bidi(_ context.Context, requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]) (trevrpc.MessageStream[*benchmarkpb.BenchmarkResponse], error) {
-	return &bidiResponseStream{requests: requests}, nil
 }
 
 type serverResponseStream struct {
@@ -75,18 +105,19 @@ func (s *serverResponseStream) Close() error {
 	return nil
 }
 
-type bidiResponseStream struct {
-	requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]
+type bidiResponder struct {
 	messages uint32
 }
 
-func (s *bidiResponseStream) Recv() (*benchmarkpb.BenchmarkResponse, error) {
-	request, err := s.requests.Recv()
-	if err != nil {
+func (s *bidiResponder) respond(request *benchmarkpb.BenchmarkRequest) (*benchmarkpb.BenchmarkResponse, error) {
+	if request == nil {
+		return nil, invalidBenchmarkArgument("bidi stream contained a missing request")
+	}
+	if err := validateRequestPayload(request.Payload); err != nil {
 		return nil, err
 	}
 	if s.messages >= maxBenchmarkMessagesPerStream {
-		return nil, trevrpc.ResourceExhausted("bidi stream exceeds the benchmark message limit")
+		return nil, exhaustedBenchmarkResource("bidi stream exceeds the benchmark message limit")
 	}
 	if err := validateResponseBytes(request.ResponseBytes); err != nil {
 		return nil, err
@@ -95,22 +126,100 @@ func (s *bidiResponseStream) Recv() (*benchmarkpb.BenchmarkResponse, error) {
 	return benchmarkResponse(request.Sequence, request.ResponseBytes), nil
 }
 
-func (s *bidiResponseStream) Close() error {
-	return s.requests.Close()
-}
-
 func benchmarkResponse(sequence uint64, size uint32) *benchmarkpb.BenchmarkResponse {
 	return &benchmarkpb.BenchmarkResponse{Sequence: sequence, Payload: make([]byte, int(size))}
 }
 
-func validateResponseBytes(size uint32) error {
-	if size > maxBenchmarkPayloadBytes {
-		return trevrpc.InvalidArgument("response payload exceeds the benchmark limit")
+func validateRequestPayload(payload []byte) error {
+	if len(payload) > maxBenchmarkPayloadBytes {
+		return invalidBenchmarkArgument("request payload exceeds the benchmark limit")
 	}
 	return nil
 }
 
-func newBenchmarkServer() *trevrpc.Server {
+func validateResponseBytes(size uint32) error {
+	if size > maxBenchmarkPayloadBytes {
+		return invalidBenchmarkArgument("response payload exceeds the benchmark limit")
+	}
+	return nil
+}
+
+func invalidBenchmarkArgument(message string) error {
+	return &benchmarkServiceError{code: serviceInvalidArgument, message: message}
+}
+
+func exhaustedBenchmarkResource(message string) error {
+	return &benchmarkServiceError{code: serviceResourceExhausted, message: message}
+}
+
+func nativeServiceError(err error) error {
+	var serviceError *benchmarkServiceError
+	if !errors.As(err, &serviceError) {
+		return err
+	}
+	switch serviceError.code {
+	case serviceInvalidArgument:
+		return trevrpc.InvalidArgument(serviceError.message)
+	case serviceResourceExhausted:
+		return trevrpc.ResourceExhausted(serviceError.message)
+	default:
+		return trevrpc.Internal(serviceError.message)
+	}
+}
+
+func grpcServiceError(err error) error {
+	var serviceError *benchmarkServiceError
+	if !errors.As(err, &serviceError) {
+		return err
+	}
+	switch serviceError.code {
+	case serviceInvalidArgument:
+		return status.Error(codes.InvalidArgument, serviceError.message)
+	case serviceResourceExhausted:
+		return status.Error(codes.ResourceExhausted, serviceError.message)
+	default:
+		return status.Error(codes.Internal, serviceError.message)
+	}
+}
+
+type nativeBenchmarkService struct{}
+
+func (nativeBenchmarkService) Unary(_ context.Context, request *benchmarkpb.BenchmarkRequest) (*benchmarkpb.BenchmarkResponse, error) {
+	response, err := benchmarkUnary(request)
+	return response, nativeServiceError(err)
+}
+
+func (nativeBenchmarkService) ClientStream(_ context.Context, requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]) (*benchmarkpb.BenchmarkSummary, error) {
+	response, err := summarizeClientStream(requests.Recv)
+	return response, nativeServiceError(err)
+}
+
+func (nativeBenchmarkService) ServerStream(_ context.Context, request *benchmarkpb.StreamRequest) (trevrpc.MessageStream[*benchmarkpb.BenchmarkResponse], error) {
+	responses, err := newServerResponseStream(request)
+	return responses, nativeServiceError(err)
+}
+
+func (nativeBenchmarkService) Bidi(_ context.Context, requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]) (trevrpc.MessageStream[*benchmarkpb.BenchmarkResponse], error) {
+	return &nativeBidiResponseStream{requests: requests}, nil
+}
+
+type nativeBidiResponseStream struct {
+	requests  trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]
+	responder bidiResponder
+}
+
+func (s *nativeBidiResponseStream) Recv() (*benchmarkpb.BenchmarkResponse, error) {
+	request, err := s.requests.Recv()
+	if err != nil {
+		return nil, err
+	}
+	response, err := s.responder.respond(request)
+	return response, nativeServiceError(err)
+}
+
+func (s *nativeBidiResponseStream) Close() error { return s.requests.Close() }
+
+func newNativeBenchmarkServer() *trevrpc.Server {
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.MaxFrameSize = maxBenchmarkFrameSize
@@ -120,8 +229,65 @@ func newBenchmarkServer() *trevrpc.Server {
 	options.MaxStreamMessages = maxBenchmarkMessagesPerStream
 	options.MaxStreamBodySize = -1
 	server.SetOptions(options)
-	benchmarkpb.RegisterBenchmarkServiceServer(server, benchmarkService{})
+	benchmarkpb.RegisterNativeBenchmarkServiceServer(server, nativeBenchmarkService{})
 	return server
 }
 
-var _ benchmarkpb.BenchmarkServiceServer = benchmarkService{}
+type grpcBenchmarkService struct {
+	benchmarkpb.UnimplementedBenchmarkServiceServer
+}
+
+func (grpcBenchmarkService) Unary(_ context.Context, request *benchmarkpb.BenchmarkRequest) (*benchmarkpb.BenchmarkResponse, error) {
+	response, err := benchmarkUnary(request)
+	return response, grpcServiceError(err)
+}
+
+func (grpcBenchmarkService) ClientStream(stream grpc.ClientStreamingServer[benchmarkpb.BenchmarkRequest, benchmarkpb.BenchmarkSummary]) error {
+	response, err := summarizeClientStream(stream.Recv)
+	if err != nil {
+		return grpcServiceError(err)
+	}
+	return stream.SendAndClose(response)
+}
+
+func (grpcBenchmarkService) ServerStream(request *benchmarkpb.StreamRequest, stream grpc.ServerStreamingServer[benchmarkpb.BenchmarkResponse]) error {
+	responses, err := newServerResponseStream(request)
+	if err != nil {
+		return grpcServiceError(err)
+	}
+	for {
+		response, err := responses.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return grpcServiceError(err)
+		}
+		if err := stream.Send(response); err != nil {
+			return err
+		}
+	}
+}
+
+func (grpcBenchmarkService) Bidi(stream grpc.BidiStreamingServer[benchmarkpb.BenchmarkRequest, benchmarkpb.BenchmarkResponse]) error {
+	var responder bidiResponder
+	for {
+		request, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		response, err := responder.respond(request)
+		if err != nil {
+			return grpcServiceError(err)
+		}
+		if err := stream.Send(response); err != nil {
+			return err
+		}
+	}
+}
+
+var _ benchmarkpb.NativeBenchmarkServiceServer = nativeBenchmarkService{}
+var _ benchmarkpb.BenchmarkServiceServer = grpcBenchmarkService{}

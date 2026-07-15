@@ -59,6 +59,7 @@
               openssl
               pkg-config
               protobufc
+              grpc
               libmsquic
 
               # javascript
@@ -175,7 +176,7 @@
                   ./bench/Cargo.lock
                   ./bench/Cargo.toml
                   ./bench/campaigns
-                  ./bench/peer-protocol-v1.md
+                  ./bench/peer-protocol-v2.md
                   ./bench/proto
                   ./bench/src
                 ];
@@ -239,10 +240,12 @@
                 clang-tools
                 cmake
                 openssl
+                pkg-config
                 protobuf
                 protobufc
               ];
               buildInputs = with pkgs; [
+                grpc
                 protobufc
               ];
               propagatedBuildInputs = with pkgs; [
@@ -329,10 +332,12 @@
               nativeBuildInputs = with pkgs; [
                 clang-tools
                 cmake
+                grpc
                 openssl
                 protobuf
               ];
               propagatedBuildInputs = with pkgs; [
+                grpc
                 self.packages.${system}.trevrpc-c
                 protobuf
               ];
@@ -353,9 +358,12 @@
                   tools/protoc-gen-trevrpc-cpp/generator.cpp \
                   tools/protoc-gen-trevrpc-cpp/main.cpp \
                   tests/codec_test.cpp \
-                  tests/generated_service_test.cpp \
-                  tests/generator_options_test.cpp \
-                  bench/trevrpc_bench_peer.cpp \
+                   tests/generated_service_test.cpp \
+                   tests/generator_options_test.cpp \
+                   bench/benchmark_peer.cpp \
+                   bench/grpc_adapter.cpp \
+                   bench/grpc_adapter_test.cpp \
+                   bench/trevrpc_bench_peer.cpp \
                   examples/greeter/client.cpp \
                   examples/greeter/server.cpp
                 ctest --test-dir build --output-on-failure
@@ -447,7 +455,7 @@
                 ];
               };
               sourceRoot = "${final.src.name}/trevrpc-go";
-              vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
+              vendorHash = "sha256-+Qq36WRF5ddke4HwDD3ty+MpgKToT0Y64PA5YIafUFk=";
               subPackages = [
                 "cmd/protoc-gen-trevrpc-go"
                 "cmd/trevrpc-bench-peer"
@@ -517,6 +525,7 @@
               doCheck = false;
               nativeCheckInputs = with pkgs; [
                 clang-tools
+                openssl
                 oxfmt
                 oxlint
               ];
@@ -667,8 +676,10 @@
             pkgs.runCommand "trevrpc-benchmark-proto-sync"
               {
                 nativeBuildInputs = with pkgs; [
+                  go
                   protobuf
                   protoc-gen-go
+                  protoc-gen-go-grpc
                 ];
               }
               ''
@@ -685,8 +696,17 @@
                 # selects the equivalent pre-TypeFor reflection expression.
                 substituteInPlace generated/benchmark.pb.go \
                   --replace-fail 'reflect.TypeOf(x{}).PkgPath()' 'reflect.TypeFor[x]().PkgPath()'
-                cmp generated/benchmark.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go}
-                   touch $out
+                 cmp generated/benchmark.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go}
+                 protoc \
+                   --proto_path=${./bench/proto} \
+                   --go-grpc_out=generated \
+                   --go-grpc_opt=paths=source_relative \
+                   ${./bench/proto}/benchmark.proto
+                 substituteInPlace generated/benchmark_grpc.pb.go \
+                   --replace-fail 'interface{}' 'any'
+                 gofmt -w generated/benchmark_grpc.pb.go
+                 cmp generated/benchmark_grpc.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark_grpc.pb.go}
+                    touch $out
               '';
 
           benchmark-smoke =
@@ -703,6 +723,20 @@
                 touch $out
               '';
 
+          benchmark-grpc-smoke =
+            pkgs.runCommand "trevrpc-benchmark-grpc-smoke"
+              {
+                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
+              }
+              ''
+                trevrpc-bench run ${./bench/campaigns/grpc-smoke.example.json} --out run
+                test "$(wc -l < run/samples.jsonl)" -eq 24
+                test -s run/aggregate.csv
+                test -s run/report.md
+                test -s run/report.html
+                touch $out
+              '';
+
           benchmark-peer-capabilities =
             let
               c = self.packages.${system}.trevrpc-c;
@@ -713,12 +747,17 @@
               rust = self.packages.${system}.trevrpc-rust;
             in
             pkgs.runCommand "trevrpc-benchmark-peer-capabilities-check" { nativeBuildInputs = [ pkgs.jq ]; } ''
-              test "$(${c}/bin/trevrpc-bench-peer-c capabilities | jq -r .peer)" = c
-              test "$(${cpp}/bin/trevrpc-bench-peer-cpp capabilities | jq -r .peer)" = cpp
-              test "$(${go}/bin/trevrpc-bench-peer-go capabilities | jq -r .peer)" = go
-              test "$(${js}/bin/trevrpc-bench-peer-js capabilities | jq -r .peer)" = js
-              test "$(${kotlin}/bin/trevrpc-bench-peer-kotlin capabilities | jq -r .peer)" = kotlin
-              test "$(${rust}/bin/trevrpc-bench-peer-rust capabilities | jq -r .peer)" = rust
+              check_capabilities() {
+                test "$($1 capabilities | jq -r .schema_version)" = 2
+                test "$($1 capabilities | jq -r .peer)" = "$2"
+                test "$($1 capabilities | jq -c .stacks)" = '["trevrpc_native_quic","grpc_http2"]'
+              }
+              check_capabilities ${c}/bin/trevrpc-bench-peer-c c
+              check_capabilities ${cpp}/bin/trevrpc-bench-peer-cpp cpp
+              check_capabilities ${go}/bin/trevrpc-bench-peer-go go
+              check_capabilities ${js}/bin/trevrpc-bench-peer-js js
+              check_capabilities ${kotlin}/bin/trevrpc-bench-peer-kotlin kotlin
+              check_capabilities ${rust}/bin/trevrpc-bench-peer-rust rust
               touch $out
             '';
 
@@ -816,7 +855,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
+                vendorHash = "sha256-+Qq36WRF5ddke4HwDD3ty+MpgKToT0Y64PA5YIafUFk=";
                 subPackages = [ "cmd/trevrpc-xruntime-go" ];
 
                 meta.mainProgram = "trevrpc-xruntime-go";
@@ -841,7 +880,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
+                vendorHash = "sha256-+Qq36WRF5ddke4HwDD3ty+MpgKToT0Y64PA5YIafUFk=";
                 subPackages = [ "examples/greeter_server" ];
 
                 meta.mainProgram = "greeter_server";
@@ -851,7 +890,7 @@
                 version = "0.1.0";
 
                 src = ./trevrpc-go;
-                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
+                vendorHash = "sha256-+Qq36WRF5ddke4HwDD3ty+MpgKToT0Y64PA5YIafUFk=";
                 subPackages = [ "cmd/trevrpc-browser-lifecycle-go" ];
 
                 meta.mainProgram = "trevrpc-browser-lifecycle-go";

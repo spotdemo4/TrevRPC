@@ -46,19 +46,9 @@ private suspend fun runServer(
     events: EventWriter,
     control: BufferedReader,
 ) {
-    val core = createBenchmarkServer()
     val server =
         try {
-            NettyRpcServer.bind(
-                core,
-                NettyRpcServerConfig(
-                    bindAddress = parseAddress(config.listen, allowZeroPort = true),
-                    tls = NettyServerTls.Pem(config.privateKey.toFile(), config.certificate.toFile()),
-                    enableNative = true,
-                    enableHttp3 = false,
-                    options = benchmarkTransportOptions(),
-                ),
-            )
+            bindBenchmarkServer(config)
         } catch (error: Throwable) {
             throw PeerFailure("serve", "bind_failed", "failed to bind benchmark server", error)
         }
@@ -94,26 +84,14 @@ private suspend fun runClient(
     events: EventWriter,
     control: BufferedReader,
 ) {
-    val transport =
+    val connection =
         try {
-            RawNettyQuicRpcTransport.connect(
-                NettyQuicClientConfig(
-                    remoteAddress = parseAddress(config.address, allowZeroPort = false),
-                    tls =
-                        NettyClientTls(
-                            serverName = "localhost",
-                            trustCertificates = listOf(readCertificate(config.certificate)),
-                            verifyHostname = true,
-                        ),
-                    options = benchmarkTransportOptions(),
-                ),
-            )
+            connectBenchmarkClient(config)
         } catch (error: Throwable) {
-            throw PeerFailure("connect", "connection_failed", "failed to establish verified QUIC connection", error)
+            throw PeerFailure("connect", "connection_failed", "failed to configure verified benchmark connection", error)
         }
     try {
-        val client = BenchmarkServiceClient(transport, benchmarkCallOptions(config))
-        val workload = BenchmarkWorkload(client, config)
+        val workload = BenchmarkWorkload(connection.client, config)
         try {
             workload.runOperation()
         } catch (error: Throwable) {
@@ -157,9 +135,83 @@ private suspend fun runClient(
             ),
         )
     } finally {
-        transport.shutdown()
+        connection.shutdown()
     }
 }
+
+private suspend fun bindBenchmarkServer(config: PeerCommand.Server): RunningBenchmarkServer {
+    val address = parseAddress(config.listen, allowZeroPort = true)
+    return when (config.stack) {
+        BenchmarkStack.TREVRPC_NATIVE_QUIC -> {
+            val server =
+                NettyRpcServer.bind(
+                    createBenchmarkServer(),
+                    NettyRpcServerConfig(
+                        bindAddress = address,
+                        tls = NettyServerTls.Pem(config.privateKey.toFile(), config.certificate.toFile()),
+                        enableNative = true,
+                        enableHttp3 = false,
+                        options = benchmarkTransportOptions(),
+                    ),
+                )
+            object : RunningBenchmarkServer {
+                override val localAddress = server.localAddress
+
+                override suspend fun shutdown() = server.shutdown()
+            }
+        }
+
+        BenchmarkStack.GRPC_HTTP2 -> {
+            val server = GrpcBenchmarkServer.bind(address, config.certificate, config.privateKey)
+            object : RunningBenchmarkServer {
+                override val localAddress = server.localAddress
+
+                override suspend fun shutdown() = server.shutdown()
+            }
+        }
+    }
+}
+
+private suspend fun connectBenchmarkClient(config: PeerCommand.Client): BenchmarkClientConnection {
+    val address = parseAddress(config.address, allowZeroPort = false)
+    return when (config.stack) {
+        BenchmarkStack.TREVRPC_NATIVE_QUIC -> {
+            val transport =
+                RawNettyQuicRpcTransport.connect(
+                    NettyQuicClientConfig(
+                        remoteAddress = address,
+                        tls =
+                            NettyClientTls(
+                                serverName = address.hostString,
+                                trustCertificates = listOf(readCertificate(config.certificate)),
+                                verifyHostname = true,
+                            ),
+                        options = benchmarkTransportOptions(),
+                    ),
+                )
+            BenchmarkClientConnection(
+                NativeBenchmarkClient(BenchmarkServiceClient(transport, benchmarkCallOptions(config))),
+                transport::shutdown,
+            )
+        }
+
+        BenchmarkStack.GRPC_HTTP2 -> {
+            val channel = createGrpcChannel(address, config.certificate)
+            BenchmarkClientConnection(GrpcBenchmarkClient(channel), channel::shutdownGracefully)
+        }
+    }
+}
+
+private interface RunningBenchmarkServer {
+    val localAddress: InetSocketAddress
+
+    suspend fun shutdown()
+}
+
+private data class BenchmarkClientConnection(
+    val client: BenchmarkClient,
+    val shutdown: suspend () -> Unit,
+)
 
 private fun benchmarkTransportOptions(): NettyTransportOptions =
     NettyTransportOptions(

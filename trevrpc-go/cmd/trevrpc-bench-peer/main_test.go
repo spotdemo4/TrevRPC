@@ -21,70 +21,95 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/benchutil"
 )
 
-func TestNativeQUICOperationsAndCertificateVerification(t *testing.T) {
-	certFile, keyFile := writeTestCertificate(t)
-	address, stopServer := startTestBenchmarkServer(t, certFile, keyFile)
-	defer stopServer()
+func TestStackOperationsAndCertificateVerification(t *testing.T) {
+	for _, stack := range []stackKind{stackNativeQUIC, stackGRPCHTTP2} {
+		t.Run(string(stack), func(t *testing.T) {
+			certFile, keyFile := writeTestCertificate(t)
+			address, stopServer := startTestBenchmarkServer(t, stack, certFile, keyFile)
+			defer stopServer()
 
-	tlsConfig, err := benchutil.VerifiedClientTLSConfig(certFile, address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	transport, err := benchutil.DialNativeQUIC(ctx, address, tlsConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer transport.Close()
-	client := benchmarkpb.NewBenchmarkServiceClient(transport)
-
-	tests := []struct {
-		kind             rpcKind
-		requestMessages  uint64
-		responseMessages uint64
-	}{
-		{kind: rpcUnary, requestMessages: 1, responseMessages: 1},
-		{kind: rpcClientStream, requestMessages: 4, responseMessages: 1},
-		{kind: rpcServerStream, requestMessages: 1, responseMessages: 4},
-		{kind: rpcBidi, requestMessages: 4, responseMessages: 4},
-	}
-	for _, test := range tests {
-		t.Run(string(test.kind), func(t *testing.T) {
-			config := testClientConfig(address, certFile, test.kind)
-			counts, err := newBenchmarkOperation(client, config)(ctx, 17)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			baseConfig := testClientConfig(stack, address, certFile, rpcUnary)
+			client, closeClient, err := dialBenchmarkClient(ctx, baseConfig)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if counts.requestMessages != test.requestMessages || counts.responseMessages != test.responseMessages {
-				t.Fatalf("message counts = %+v, want request=%d response=%d", counts, test.requestMessages, test.responseMessages)
+			defer closeClient()
+
+			tests := []struct {
+				kind             rpcKind
+				requestMessages  uint64
+				responseMessages uint64
+			}{
+				{kind: rpcUnary, requestMessages: 1, responseMessages: 1},
+				{kind: rpcClientStream, requestMessages: 4, responseMessages: 1},
+				{kind: rpcServerStream, requestMessages: 1, responseMessages: 4},
+				{kind: rpcBidi, requestMessages: 4, responseMessages: 4},
+			}
+			for _, test := range tests {
+				t.Run(string(test.kind), func(t *testing.T) {
+					config := testClientConfig(stack, address, certFile, test.kind)
+					counts, err := newBenchmarkOperation(client, config)(ctx, 17)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if counts.requestMessages != test.requestMessages || counts.responseMessages != test.responseMessages {
+						t.Fatalf("message counts = %+v, want request=%d response=%d", counts, test.requestMessages, test.responseMessages)
+					}
+				})
+			}
+
+			untrustedCert, _ := writeTestCertificate(t)
+			untrustedConfig := testClientConfig(stack, address, untrustedCert, rpcUnary)
+			untrustedCtx, untrustedCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer untrustedCancel()
+			untrustedClient, closeUntrusted, err := dialBenchmarkClient(untrustedCtx, untrustedConfig)
+			if err == nil {
+				defer closeUntrusted()
+				_, err = newBenchmarkOperation(untrustedClient, untrustedConfig)(untrustedCtx, 0)
+			}
+			if err == nil {
+				t.Fatal("RPC with an untrusted certificate succeeded")
 			}
 		})
 	}
+}
 
-	untrustedCert, _ := writeTestCertificate(t)
-	untrustedTLS, err := benchutil.VerifiedClientTLSConfig(untrustedCert, address)
+func TestGRPCMaximumPayloadAndTerminalStatus(t *testing.T) {
+	certFile, keyFile := writeTestCertificate(t)
+	address, stopServer := startTestBenchmarkServer(t, stackGRPCHTTP2, certFile, keyFile)
+	defer stopServer()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	config := testClientConfig(stackGRPCHTTP2, address, certFile, rpcUnary)
+	client, closeClient, err := dialBenchmarkClient(ctx, config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	untrustedCtx, untrustedCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer untrustedCancel()
-	if transport, err := benchutil.DialNativeQUIC(untrustedCtx, address, untrustedTLS); err == nil {
-		transport.Close()
-		t.Fatal("dial with an untrusted certificate succeeded")
+	defer closeClient()
+
+	config.requestBytes = maxBenchmarkPayloadBytes
+	if _, err := newBenchmarkOperation(client, config)(ctx, 0); err != nil {
+		t.Fatalf("maximum request payload: %v", err)
+	}
+	config.requestBytes = 0
+	config.responseBytes = maxBenchmarkPayloadBytes
+	if _, err := newBenchmarkOperation(client, config)(ctx, 0); err != nil {
+		t.Fatalf("maximum response payload: %v", err)
 	}
 
-	wrongHostTLS := tlsConfig.Clone()
-	wrongHostTLS.ServerName = "wrong.example"
-	wrongHostCtx, wrongHostCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer wrongHostCancel()
-	if transport, err := benchutil.DialNativeQUIC(wrongHostCtx, address, wrongHostTLS); err == nil {
-		transport.Close()
-		t.Fatal("dial with the wrong certificate hostname succeeded")
+	responses, err := client.ServerStream(ctx, &benchmarkpb.StreamRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := responses.Recv(); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("invalid server stream status = %v, want InvalidArgument", status.Code(err))
 	}
 }
 
@@ -145,9 +170,9 @@ func TestLogLinearV1Buckets(t *testing.T) {
 
 func TestClientSTARTEmitsArmedAndSample(t *testing.T) {
 	certFile, keyFile := writeTestCertificate(t)
-	address, stopServer := startTestBenchmarkServer(t, certFile, keyFile)
+	address, stopServer := startTestBenchmarkServer(t, stackNativeQUIC, certFile, keyFile)
 	defer stopServer()
-	config := testClientConfig(address, certFile, rpcUnary)
+	config := testClientConfig(stackNativeQUIC, address, certFile, rpcUnary)
 	config.concurrency = 2
 	config.warmup = 2 * time.Millisecond
 	config.measurement = 5 * time.Millisecond
@@ -191,25 +216,30 @@ func TestClientSTARTEmitsArmedAndSample(t *testing.T) {
 func TestServerSHUTDOWNEmitsReadyAndStopped(t *testing.T) {
 	certFile, keyFile := writeTestCertificate(t)
 	var output bytes.Buffer
-	config := serverConfig{listen: "127.0.0.1:0", certFile: certFile, keyFile: keyFile}
-	if err := runServer(config, strings.NewReader("SHUTDOWN\n"), newEventEmitter(&output)); err != nil {
-		t.Fatal(err)
-	}
-	events := decodeEvents(t, output.Bytes())
-	if len(events) != 2 || events[0]["event"] != "ready" || events[1]["event"] != "stopped" {
-		t.Fatalf("events = %v", events)
-	}
-	if _, _, err := net.SplitHostPort(events[0]["address"].(string)); err != nil {
-		t.Fatalf("ready address: %v", err)
+	for _, stack := range []stackKind{stackNativeQUIC, stackGRPCHTTP2} {
+		t.Run(string(stack), func(t *testing.T) {
+			output.Reset()
+			config := serverConfig{stack: stack, listen: "127.0.0.1:0", certFile: certFile, keyFile: keyFile}
+			if err := runServer(config, strings.NewReader("SHUTDOWN\n"), newEventEmitter(&output)); err != nil {
+				t.Fatal(err)
+			}
+			events := decodeEvents(t, output.Bytes())
+			if len(events) != 2 || events[0]["event"] != "ready" || events[1]["event"] != "stopped" {
+				t.Fatalf("events = %v", events)
+			}
+			if _, _, err := net.SplitHostPort(events[0]["address"].(string)); err != nil {
+				t.Fatalf("ready address: %v", err)
+			}
+		})
 	}
 }
 
 func TestClientSHUTDOWNWhileArmed(t *testing.T) {
 	certFile, keyFile := writeTestCertificate(t)
-	address, stopServer := startTestBenchmarkServer(t, certFile, keyFile)
+	address, stopServer := startTestBenchmarkServer(t, stackNativeQUIC, certFile, keyFile)
 	defer stopServer()
 	var output bytes.Buffer
-	config := testClientConfig(address, certFile, rpcUnary)
+	config := testClientConfig(stackNativeQUIC, address, certFile, rpcUnary)
 	if err := runClient(config, strings.NewReader("SHUTDOWN\n"), newEventEmitter(&output)); err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +251,7 @@ func TestClientSHUTDOWNWhileArmed(t *testing.T) {
 
 func TestClientConfigRejectsDuplicateAndOversizedOptions(t *testing.T) {
 	base := []string{
+		"--stack", "trevrpc_native_quic",
 		"--address", "127.0.0.1:1",
 		"--cert", "cert.pem",
 		"--rpc", "unary",
@@ -234,19 +265,57 @@ func TestClientConfigRejectsDuplicateAndOversizedOptions(t *testing.T) {
 	if _, err := parseClientConfig(base); err != nil {
 		t.Fatalf("valid config: %v", err)
 	}
+	if _, err := parseClientConfig(base[2:]); err == nil {
+		t.Fatal("missing --stack was accepted")
+	}
+	unsupported := append([]string{}, base...)
+	unsupported[1] = "unknown"
+	if _, err := parseClientConfig(unsupported); err == nil {
+		t.Fatal("unsupported --stack was accepted")
+	}
 	duplicate := append(append([]string{}, base...), "--rpc", "bidi")
 	if _, err := parseClientConfig(duplicate); err == nil {
 		t.Fatal("duplicate option was accepted")
 	}
 	oversized := append([]string{}, base...)
-	oversized[13] = strconv.Itoa(maxBenchmarkPayloadBytes + 1)
+	for index, value := range oversized {
+		if value == "--request-bytes" {
+			oversized[index+1] = strconv.Itoa(maxBenchmarkPayloadBytes + 1)
+			break
+		}
+	}
 	if _, err := parseClientConfig(oversized); err == nil {
 		t.Fatal("oversized request payload was accepted")
 	}
 }
 
-func testClientConfig(address, certFile string, kind rpcKind) clientConfig {
+func TestServerConfigRequiresSupportedStack(t *testing.T) {
+	base := []string{
+		"--stack", "grpc_http2",
+		"--listen", "127.0.0.1:0",
+		"--cert", "cert.pem",
+		"--key", "key.pem",
+	}
+	config, err := parseServerConfig(base)
+	if err != nil {
+		t.Fatalf("valid config: %v", err)
+	}
+	if config.stack != stackGRPCHTTP2 {
+		t.Fatalf("stack = %q, want %q", config.stack, stackGRPCHTTP2)
+	}
+	if _, err := parseServerConfig(base[2:]); err == nil {
+		t.Fatal("missing --stack was accepted")
+	}
+	unsupported := append([]string{}, base...)
+	unsupported[1] = "unknown"
+	if _, err := parseServerConfig(unsupported); err == nil {
+		t.Fatal("unsupported --stack was accepted")
+	}
+}
+
+func testClientConfig(stack stackKind, address, certFile string, kind rpcKind) clientConfig {
 	return clientConfig{
+		stack:             stack,
 		address:           address,
 		certFile:          certFile,
 		rpc:               kind,
@@ -258,9 +327,14 @@ func testClientConfig(address, certFile string, kind rpcKind) clientConfig {
 	}
 }
 
-func startTestBenchmarkServer(t *testing.T, certFile, keyFile string) (string, func()) {
+func startTestBenchmarkServer(t *testing.T, stack stackKind, certFile, keyFile string) (string, func()) {
 	t.Helper()
-	listener, err := benchutil.ListenNativeQUIC("127.0.0.1:0", certFile, keyFile, newBenchmarkServer())
+	listener, err := listenBenchmarkServer(serverConfig{
+		stack:    stack,
+		listen:   "127.0.0.1:0",
+		certFile: certFile,
+		keyFile:  keyFile,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,6 +415,6 @@ func Example_runCapabilities() {
 	err := run([]string{"capabilities"}, strings.NewReader(""), newEventEmitter(&output))
 	fmt.Print(output.String(), err)
 	// Output:
-	// {"schema_version":1,"event":"capabilities","peer":"go","roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"transports":["native_quic"],"histogram":"log_linear_v1"}
+	// {"schema_version":2,"event":"capabilities","peer":"go","roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}
 	// <nil>
 }

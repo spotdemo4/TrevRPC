@@ -11,25 +11,30 @@ import (
 )
 
 type rpcKind string
+type stackKind string
 
 const (
-	rpcUnary                      rpcKind = "unary"
-	rpcClientStream               rpcKind = "client_stream"
-	rpcServerStream               rpcKind = "server_stream"
-	rpcBidi                       rpcKind = "bidi"
-	maxBenchmarkPayloadBytes              = 64 * 1024 * 1024
-	maxBenchmarkFrameSize                 = maxBenchmarkPayloadBytes + 1024
-	maxBenchmarkConcurrency               = 1024
-	maxBenchmarkMessagesPerStream         = 1_000_000
+	stackNativeQUIC               stackKind = "trevrpc_native_quic"
+	stackGRPCHTTP2                stackKind = "grpc_http2"
+	rpcUnary                      rpcKind   = "unary"
+	rpcClientStream               rpcKind   = "client_stream"
+	rpcServerStream               rpcKind   = "server_stream"
+	rpcBidi                       rpcKind   = "bidi"
+	maxBenchmarkPayloadBytes                = 64 * 1024 * 1024
+	maxBenchmarkFrameSize                   = maxBenchmarkPayloadBytes + 1024
+	maxBenchmarkConcurrency                 = 1024
+	maxBenchmarkMessagesPerStream           = 1_000_000
 )
 
 type serverConfig struct {
+	stack    stackKind
 	listen   string
 	certFile string
 	keyFile  string
 }
 
 type clientConfig struct {
+	stack             stackKind
 	address           string
 	certFile          string
 	rpc               rpcKind
@@ -42,12 +47,14 @@ type clientConfig struct {
 }
 
 func parseServerConfig(args []string) (serverConfig, error) {
-	if err := validateOptionSyntax(args, "listen", "cert", "key"); err != nil {
+	if err := validateOptionSyntax(args, "stack", "listen", "cert", "key"); err != nil {
 		return serverConfig{}, err
 	}
 	flags := flag.NewFlagSet("server", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	var stackText string
 	config := serverConfig{}
+	flags.StringVar(&stackText, "stack", "", "RPC stack")
 	flags.StringVar(&config.listen, "listen", "", "listen address")
 	flags.StringVar(&config.certFile, "cert", "", "PEM certificate path")
 	flags.StringVar(&config.keyFile, "key", "", "PEM private key path")
@@ -57,20 +64,25 @@ func parseServerConfig(args []string) (serverConfig, error) {
 	if flags.NArg() != 0 {
 		return config, fmt.Errorf("unexpected server arguments: %v", flags.Args())
 	}
-	if config.listen == "" || config.certFile == "" || config.keyFile == "" {
-		return config, errors.New("server requires --listen, --cert, and --key")
+	if stackText == "" || config.listen == "" || config.certFile == "" || config.keyFile == "" {
+		return config, errors.New("server requires --stack, --listen, --cert, and --key")
+	}
+	config.stack = stackKind(stackText)
+	if err := validateStack(config.stack); err != nil {
+		return config, err
 	}
 	return config, nil
 }
 
 func parseClientConfig(args []string) (clientConfig, error) {
-	if err := validateOptionSyntax(args, "address", "cert", "rpc", "concurrency", "warmup-ms", "measurement-ms", "request-bytes", "response-bytes", "messages-per-stream"); err != nil {
+	if err := validateOptionSyntax(args, "stack", "address", "cert", "rpc", "concurrency", "warmup-ms", "measurement-ms", "request-bytes", "response-bytes", "messages-per-stream"); err != nil {
 		return clientConfig{}, err
 	}
 	flags := flag.NewFlagSet("client", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	var (
 		config            clientConfig
+		stackText         string
 		rpcText           string
 		concurrency       uint64
 		warmupMS          uint64
@@ -79,6 +91,7 @@ func parseClientConfig(args []string) (clientConfig, error) {
 		responseBytes     uint64
 		messagesPerStream uint64
 	)
+	flags.StringVar(&stackText, "stack", "", "RPC stack")
 	flags.StringVar(&config.address, "address", "", "server address")
 	flags.StringVar(&config.certFile, "cert", "", "PEM CA certificate path")
 	flags.StringVar(&rpcText, "rpc", "", "RPC kind")
@@ -94,8 +107,12 @@ func parseClientConfig(args []string) (clientConfig, error) {
 	if flags.NArg() != 0 {
 		return config, fmt.Errorf("unexpected client arguments: %v", flags.Args())
 	}
-	if config.address == "" || config.certFile == "" {
-		return config, errors.New("client requires --address and --cert")
+	if stackText == "" || config.address == "" || config.certFile == "" {
+		return config, errors.New("client requires --stack, --address, and --cert")
+	}
+	config.stack = stackKind(stackText)
+	if err := validateStack(config.stack); err != nil {
+		return config, err
 	}
 	config.rpc = rpcKind(rpcText)
 	switch config.rpc {
@@ -129,6 +146,15 @@ func parseClientConfig(args []string) (clientConfig, error) {
 	config.responseBytes = uint32(responseBytes)
 	config.messagesPerStream = uint32(messagesPerStream)
 	return config, nil
+}
+
+func validateStack(stack stackKind) error {
+	switch stack {
+	case stackNativeQUIC, stackGRPCHTTP2:
+		return nil
+	default:
+		return fmt.Errorf("unsupported --stack %q", stack)
+	}
 }
 
 func millisecondsDuration(name string, value uint64) (time.Duration, error) {

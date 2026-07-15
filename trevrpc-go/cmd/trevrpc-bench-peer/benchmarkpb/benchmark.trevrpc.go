@@ -20,8 +20,8 @@ func mergeTrevrpcCallOptions(base []trevrpc.CallOption, override []trevrpc.CallO
 	return merged
 }
 
-// BenchmarkServiceServer handles the BenchmarkService service.
-type BenchmarkServiceServer interface {
+// NativeBenchmarkServiceServer handles the BenchmarkService service over native TrevRPC.
+type NativeBenchmarkServiceServer interface {
 	// Unary handles the Unary RPC.
 	Unary(context.Context, *BenchmarkRequest) (*BenchmarkResponse, error)
 	// ClientStream handles the ClientStream RPC.
@@ -32,59 +32,59 @@ type BenchmarkServiceServer interface {
 	Bidi(context.Context, trevrpc.MessageStream[*BenchmarkRequest]) (trevrpc.MessageStream[*BenchmarkResponse], error)
 }
 
-// BenchmarkServiceClient calls the BenchmarkService service.
-type BenchmarkServiceClient struct {
+// NativeBenchmarkServiceClient calls the BenchmarkService service over native TrevRPC.
+type NativeBenchmarkServiceClient struct {
 	transport trevrpc.Transport
 	options   []trevrpc.CallOption
 }
 
-// NewBenchmarkServiceClient creates a client for the BenchmarkService service.
-func NewBenchmarkServiceClient(transport trevrpc.Transport, options ...trevrpc.CallOption) *BenchmarkServiceClient {
-	return &BenchmarkServiceClient{transport: transport, options: options}
+// NewNativeBenchmarkServiceClient creates a native TrevRPC client for the BenchmarkService service.
+func NewNativeBenchmarkServiceClient(transport trevrpc.Transport, options ...trevrpc.CallOption) *NativeBenchmarkServiceClient {
+	return &NativeBenchmarkServiceClient{transport: transport, options: options}
 }
 
 // Unary calls the Unary RPC.
-func (c *BenchmarkServiceClient) Unary(ctx context.Context, request *BenchmarkRequest, options ...trevrpc.CallOption) (*BenchmarkResponse, error) {
+func (c *NativeBenchmarkServiceClient) Unary(ctx context.Context, request *BenchmarkRequest, options ...trevrpc.CallOption) (*BenchmarkResponse, error) {
 	return trevrpc.Unary[*BenchmarkRequest, *BenchmarkResponse](ctx, c.transport, "trevrpc.benchmark.v1.BenchmarkService", "Unary", request, func() *BenchmarkResponse { return &BenchmarkResponse{} }, mergeTrevrpcCallOptions(c.options, options)...)
 }
 
 // UnaryResponse calls the Unary RPC and returns response metadata.
-func (c *BenchmarkServiceClient) UnaryResponse(ctx context.Context, request *BenchmarkRequest, options ...trevrpc.CallOption) (*trevrpc.Response[*BenchmarkResponse], error) {
+func (c *NativeBenchmarkServiceClient) UnaryResponse(ctx context.Context, request *BenchmarkRequest, options ...trevrpc.CallOption) (*trevrpc.Response[*BenchmarkResponse], error) {
 	return trevrpc.UnaryResponse[*BenchmarkRequest, *BenchmarkResponse](ctx, c.transport, "trevrpc.benchmark.v1.BenchmarkService", "Unary", request, func() *BenchmarkResponse { return &BenchmarkResponse{} }, mergeTrevrpcCallOptions(c.options, options)...)
 }
 
 // ClientStream calls the ClientStream RPC.
-func (c *BenchmarkServiceClient) ClientStream(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*BenchmarkRequest, *BenchmarkSummary], error) {
+func (c *NativeBenchmarkServiceClient) ClientStream(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*BenchmarkRequest, *BenchmarkSummary], error) {
 	return trevrpc.ClientStreaming[*BenchmarkRequest, *BenchmarkSummary](ctx, c.transport, "trevrpc.benchmark.v1.BenchmarkService", "ClientStream", func() *BenchmarkSummary { return &BenchmarkSummary{} }, mergeTrevrpcCallOptions(c.options, options)...)
 }
 
 // ClientStreamFromStream calls the ClientStream RPC from an existing request stream.
-func (c *BenchmarkServiceClient) ClientStreamFromStream(ctx context.Context, requests trevrpc.MessageStream[*BenchmarkRequest], options ...trevrpc.CallOption) (*BenchmarkSummary, error) {
+func (c *NativeBenchmarkServiceClient) ClientStreamFromStream(ctx context.Context, requests trevrpc.MessageStream[*BenchmarkRequest], options ...trevrpc.CallOption) (*BenchmarkSummary, error) {
 	return trevrpc.ClientStreamingFromStream[*BenchmarkRequest, *BenchmarkSummary](ctx, c.transport, "trevrpc.benchmark.v1.BenchmarkService", "ClientStream", requests, func() *BenchmarkSummary { return &BenchmarkSummary{} }, mergeTrevrpcCallOptions(c.options, options)...)
 }
 
 // ServerStream calls the ServerStream RPC.
-func (c *BenchmarkServiceClient) ServerStream(ctx context.Context, request *StreamRequest, options ...trevrpc.CallOption) (trevrpc.MessageStream[*BenchmarkResponse], error) {
+func (c *NativeBenchmarkServiceClient) ServerStream(ctx context.Context, request *StreamRequest, options ...trevrpc.CallOption) (trevrpc.MessageStream[*BenchmarkResponse], error) {
 	return trevrpc.ServerStreaming[*StreamRequest, *BenchmarkResponse](ctx, c.transport, "trevrpc.benchmark.v1.BenchmarkService", "ServerStream", request, func() *BenchmarkResponse { return &BenchmarkResponse{} }, mergeTrevrpcCallOptions(c.options, options)...)
 }
 
 // ServerStreamResponse calls the ServerStream RPC and returns a response stream with terminal metadata.
-func (c *BenchmarkServiceClient) ServerStreamResponse(ctx context.Context, request *StreamRequest, options ...trevrpc.CallOption) (trevrpc.ResponseStream[*BenchmarkResponse], error) {
+func (c *NativeBenchmarkServiceClient) ServerStreamResponse(ctx context.Context, request *StreamRequest, options ...trevrpc.CallOption) (trevrpc.ResponseStream[*BenchmarkResponse], error) {
 	return trevrpc.ServerStreamingResponse[*StreamRequest, *BenchmarkResponse](ctx, c.transport, "trevrpc.benchmark.v1.BenchmarkService", "ServerStream", request, func() *BenchmarkResponse { return &BenchmarkResponse{} }, mergeTrevrpcCallOptions(c.options, options)...)
 }
 
 // Bidi calls the Bidi RPC.
-func (c *BenchmarkServiceClient) Bidi(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*BenchmarkRequest, *BenchmarkResponse], error) {
+func (c *NativeBenchmarkServiceClient) Bidi(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*BenchmarkRequest, *BenchmarkResponse], error) {
 	return trevrpc.BidirectionalStreaming[*BenchmarkRequest, *BenchmarkResponse](ctx, c.transport, "trevrpc.benchmark.v1.BenchmarkService", "Bidi", func() *BenchmarkResponse { return &BenchmarkResponse{} }, mergeTrevrpcCallOptions(c.options, options)...)
 }
 
 // BidiFromStream calls the Bidi RPC from an existing request stream.
-func (c *BenchmarkServiceClient) BidiFromStream(ctx context.Context, requests trevrpc.MessageStream[*BenchmarkRequest], options ...trevrpc.CallOption) (trevrpc.MessageStream[*BenchmarkResponse], error) {
+func (c *NativeBenchmarkServiceClient) BidiFromStream(ctx context.Context, requests trevrpc.MessageStream[*BenchmarkRequest], options ...trevrpc.CallOption) (trevrpc.MessageStream[*BenchmarkResponse], error) {
 	return trevrpc.BidirectionalStreamingFromStream[*BenchmarkRequest, *BenchmarkResponse](ctx, c.transport, "trevrpc.benchmark.v1.BenchmarkService", "Bidi", requests, func() *BenchmarkResponse { return &BenchmarkResponse{} }, mergeTrevrpcCallOptions(c.options, options)...)
 }
 
-// RegisterBenchmarkServiceServer registers handlers for the BenchmarkService service.
-func RegisterBenchmarkServiceServer(server *trevrpc.Server, implementation BenchmarkServiceServer) {
+// RegisterNativeBenchmarkServiceServer registers native TrevRPC handlers for the BenchmarkService service.
+func RegisterNativeBenchmarkServiceServer(server *trevrpc.Server, implementation NativeBenchmarkServiceServer) {
 	server.Route("trevrpc.benchmark.v1.BenchmarkService", "Unary", func(ctx context.Context, body []byte) ([]byte, error) {
 		request := &BenchmarkRequest{}
 		if err := trevrpc.UnmarshalMessage(body, request); err != nil {

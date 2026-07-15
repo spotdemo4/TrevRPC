@@ -14,12 +14,14 @@ internal sealed interface PeerCommand {
     data object Capabilities : PeerCommand
 
     data class Server(
+        val stack: BenchmarkStack,
         val listen: String,
         val certificate: Path,
         val privateKey: Path,
     ) : PeerCommand
 
     data class Client(
+        val stack: BenchmarkStack,
         val address: String,
         val certificate: Path,
         val rpcKind: BenchmarkRpcKind,
@@ -31,6 +33,20 @@ internal sealed interface PeerCommand {
         val messagesPerStream: Int,
     ) : PeerCommand {
         val admissionNanoseconds: Long = Math.multiplyExact(measurementMilliseconds, 1_000_000L)
+    }
+}
+
+internal enum class BenchmarkStack(
+    val wireName: String,
+) {
+    TREVRPC_NATIVE_QUIC("trevrpc_native_quic"),
+    GRPC_HTTP2("grpc_http2"),
+    ;
+
+    companion object {
+        fun parse(value: String): BenchmarkStack =
+            entries.firstOrNull { it.wireName == value }
+                ?: throw IllegalArgumentException("--stack must be trevrpc_native_quic or grpc_http2")
     }
 }
 
@@ -81,8 +97,9 @@ internal fun parseCommand(args: Array<String>): PeerCommand {
 }
 
 private fun parseServer(values: Map<String, String>): PeerCommand.Server {
-    requireKnown(values, setOf("listen", "cert", "key"))
+    requireKnown(values, setOf("stack", "listen", "cert", "key"))
     return PeerCommand.Server(
+        stack = BenchmarkStack.parse(required(values, "stack")),
         listen = required(values, "listen"),
         certificate = Path.of(required(values, "cert")),
         privateKey = Path.of(required(values, "key")),
@@ -94,6 +111,7 @@ private fun parseClient(values: Map<String, String>): PeerCommand.Client {
         values,
         setOf(
             "address",
+            "stack",
             "cert",
             "rpc",
             "concurrency",
@@ -125,6 +143,7 @@ private fun parseClient(values: Map<String, String>): PeerCommand.Client {
         "--messages-per-stream must not exceed $MAX_MESSAGES_PER_STREAM"
     }
     return PeerCommand.Client(
+        stack = BenchmarkStack.parse(required(values, "stack")),
         address = required(values, "address"),
         certificate = Path.of(required(values, "cert")),
         rpcKind = BenchmarkRpcKind.parse(required(values, "rpc")),
@@ -247,7 +266,7 @@ internal class EventWriter(
 ) {
     fun capabilities() {
         emit(
-            """{"schema_version":1,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"transports":["native_quic"],"histogram":"log_linear_v1"}""",
+            """{"schema_version":2,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}""",
         )
     }
 
@@ -303,7 +322,7 @@ internal class EventWriter(
         check(!output.checkError()) { "failed to write benchmark protocol event" }
     }
 
-    private fun base(event: String): String = """{"schema_version":1,"event":${event.jsonString()},"peer":${PEER_NAME.jsonString()}"""
+    private fun base(event: String): String = """{"schema_version":2,"event":${event.jsonString()},"peer":${PEER_NAME.jsonString()}"""
 }
 
 private fun String.jsonString(): String =

@@ -10,9 +10,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-
-	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/benchutil"
 )
 
 type peerError struct {
@@ -59,7 +56,7 @@ func run(args []string, stdin io.Reader, emitter *eventEmitter) error {
 			Peer:          peerName,
 			Roles:         []string{"client", "server"},
 			RPCKinds:      []string{"unary", "client_stream", "server_stream", "bidi"},
-			Transports:    []string{"native_quic"},
+			Stacks:        []string{string(stackNativeQUIC), string(stackGRPCHTTP2)},
 			Histogram:     "log_linear_v1",
 		})
 	case "server":
@@ -80,8 +77,7 @@ func run(args []string, stdin io.Reader, emitter *eventEmitter) error {
 }
 
 func runServer(config serverConfig, stdin io.Reader, emitter *eventEmitter) error {
-	server := newBenchmarkServer()
-	listener, err := benchutil.ListenNativeQUIC(config.listen, config.certFile, config.keyFile, server)
+	listener, err := listenBenchmarkServer(config)
 	if err != nil {
 		return fail("startup", "listen_failed", err)
 	}
@@ -142,16 +138,11 @@ func runServer(config serverConfig, stdin io.Reader, emitter *eventEmitter) erro
 func runClient(config clientConfig, stdin io.Reader, emitter *eventEmitter) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	tlsConfig, err := benchutil.VerifiedClientTLSConfig(config.certFile, config.address)
-	if err != nil {
-		return fail("connect", "certificate_failed", err)
-	}
-	transport, err := benchutil.DialNativeQUICWithMaxFrameSize(ctx, config.address, tlsConfig, maxBenchmarkFrameSize)
+	client, closeClient, err := dialBenchmarkClient(ctx, config)
 	if err != nil {
 		return fail("connect", "connect_failed", err)
 	}
-	defer transport.Close()
-	client := benchmarkpb.NewBenchmarkServiceClient(transport)
+	defer closeClient()
 	operation := newBenchmarkOperation(client, config)
 	if _, err := operation(ctx, 0); err != nil {
 		return fail("validate", "rpc_failed", err)

@@ -46,8 +46,14 @@ func ListenNativeQUIC(addr, certFile, keyFile string, server *trevrpc.Server) (t
 
 // VerifiedClientTLSConfig trusts certFile and verifies the host in address.
 func VerifiedClientTLSConfig(certFile, address string) (*tls.Config, error) {
+	return VerifiedClientTLSConfigForProtocol(certFile, address, trevrpc.ALPN)
+}
+
+// VerifiedClientTLSConfigForProtocol trusts certFile, verifies the address host,
+// and negotiates protocol over TLS.
+func VerifiedClientTLSConfigForProtocol(certFile, address, protocol string) (*tls.Config, error) {
 	if certFile == "" {
-		return nil, errors.New("quic client requires certificate")
+		return nil, errors.New("client requires certificate")
 	}
 	certificatePEM, err := os.ReadFile(certFile)
 	if err != nil {
@@ -71,7 +77,7 @@ func VerifiedClientTLSConfig(certFile, address string) (*tls.Config, error) {
 		RootCAs:    roots,
 		ServerName: host,
 		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{trevrpc.ALPN},
+		NextProtos: []string{protocol},
 	}, nil
 }
 

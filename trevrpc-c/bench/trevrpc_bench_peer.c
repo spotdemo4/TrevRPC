@@ -2,6 +2,7 @@
 
 #include "benchmark.pb-c.h"
 #include "benchmark.trevrpc.h"
+#include "trevrpc_bench_peer.h"
 #include "trevrpc_raw.h"
 
 #include <errno.h> // IWYU pragma: keep
@@ -19,50 +20,19 @@
 #include <time.h>
 #include <unistd.h>
 
-#define BENCHMARK_IDLE_TIMEOUT_MS 600000u
-#define BENCHMARK_KEEP_ALIVE_MS 5000u
-#define BENCHMARK_MAX_CONCURRENCY 1024u
-#define BENCHMARK_MAX_PAYLOAD_BYTES (64u * 1024u * 1024u)
-#define BENCHMARK_MAX_MESSAGES_PER_STREAM 1000000u
-#define BENCHMARK_MAX_FRAME_SIZE (128u * 1024u * 1024u)
-#define BENCHMARK_SERVER_WORKERS 128
-#define BENCHMARK_SERVER_STREAMS 1024
-#define BENCHMARK_SERVER_REQUESTS 4096
-#define BENCHMARK_GRACEFUL_SHUTDOWN_NS 5000000000ull
-
 typedef Trevrpc__Benchmark__V1__BenchmarkRequest BenchmarkRequest;
 typedef Trevrpc__Benchmark__V1__BenchmarkResponse BenchmarkResponse;
 typedef Trevrpc__Benchmark__V1__BenchmarkSummary BenchmarkSummary;
 typedef Trevrpc__Benchmark__V1__StreamRequest StreamRequest;
 typedef trevrpc_benchmark_v1_benchmark_service_server BenchmarkService;
 
-typedef enum benchmark_rpc_kind {
-    BENCHMARK_RPC_UNARY,
-    BENCHMARK_RPC_CLIENT_STREAM,
-    BENCHMARK_RPC_SERVER_STREAM,
-    BENCHMARK_RPC_BIDI,
-} benchmark_rpc_kind;
-
-typedef struct client_options {
-    char* host;
-    uint16_t port;
-    const char* cert;
-    benchmark_rpc_kind rpc_kind;
-    const char* rpc_name;
-    size_t concurrency;
-    uint64_t warmup_ns;
-    uint64_t measurement_ns;
-    uint32_t request_bytes;
-    uint32_t response_bytes;
-    uint32_t messages_per_stream;
-} client_options;
-
-typedef struct server_options {
-    char* host;
-    uint16_t port;
-    const char* cert;
-    const char* key;
-} server_options;
+typedef struct benchmark_client {
+    benchmark_stack stack;
+    union {
+        trevrpc_raw_client* native;
+        trevrpc_bench_grpc_client* grpc;
+    } impl;
+} benchmark_client;
 
 typedef struct histogram_bucket {
     uint64_t upper_bound_ns;
@@ -94,11 +64,12 @@ typedef struct phase_control phase_control;
 typedef struct lane_args {
     phase_control* phase;
     size_t lane_index;
+    trevrpc_bench_grpc_lane* grpc_lane;
     lane_result result;
 } lane_args;
 
 struct phase_control {
-    trevrpc_raw_client* client;
+    benchmark_client* client;
     const client_options* options;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -231,10 +202,10 @@ static int flush_event(void) {
 }
 
 static int emit_capabilities(void) {
-    if (fputs("{\"schema_version\":1,\"event\":\"capabilities\",\"peer\":\"c\","
+    if (fputs("{\"schema_version\":2,\"event\":\"capabilities\",\"peer\":\"c\","
               "\"roles\":[\"client\",\"server\"],"
               "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
-              "\"transports\":[\"native_quic\"],\"histogram\":\"log_linear_v1\"}",
+              "\"stacks\":[\"trevrpc_native_quic\",\"grpc_http2\"],\"histogram\":\"log_linear_v1\"}",
             stdout) == EOF) {
         return -EIO;
     }
@@ -243,7 +214,7 @@ static int emit_capabilities(void) {
 
 static int emit_error(const char* phase, const char* code, const char* message) {
     fprintf(stderr, "%s: %s: %s\n", phase, code, message);
-    if (fputs("{\"schema_version\":1,\"event\":\"error\",\"peer\":\"c\",\"phase\":", stdout) == EOF ||
+    if (fputs("{\"schema_version\":2,\"event\":\"error\",\"peer\":\"c\",\"phase\":", stdout) == EOF ||
         write_json_string(stdout, phase) != 0 || fputs(",\"code\":", stdout) == EOF ||
         write_json_string(stdout, code) != 0 || fputs(",\"message\":", stdout) == EOF ||
         write_json_string(stdout, message) != 0 || fputc('}', stdout) == EOF) {
@@ -262,29 +233,32 @@ static int fail_with_error(const char* phase, const char* code, const char* form
     return 1;
 }
 
-static int emit_ready(const char* host, uint16_t port) {
-    if (fputs("{\"schema_version\":1,\"event\":\"ready\",\"peer\":\"c\",\"address\":", stdout) == EOF) {
+static int emit_ready(const char* host, uint16_t port, const char* stack) {
+    if (fputs("{\"schema_version\":2,\"event\":\"ready\",\"peer\":\"c\",\"address\":", stdout) == EOF) {
         return -EIO;
     }
     char address[512];
     int length = strchr(host, ':') == NULL ? snprintf(address, sizeof(address), "%s:%u", host, port)
                                            : snprintf(address, sizeof(address), "[%s]:%u", host, port);
     if (length < 0 || (size_t)length >= sizeof(address) || write_json_string(stdout, address) != 0 ||
+        fputs(",\"stack\":", stdout) == EOF || write_json_string(stdout, stack) != 0 ||
         fprintf(stdout, ",\"pid\":%ld}", (long)getpid()) < 0) {
         return -EIO;
     }
     return flush_event();
 }
 
-static int emit_armed(void) {
-    if (fprintf(stdout, "{\"schema_version\":1,\"event\":\"armed\",\"peer\":\"c\",\"pid\":%ld}", (long)getpid()) < 0) {
+static int emit_armed(const char* stack) {
+    if (fputs("{\"schema_version\":2,\"event\":\"armed\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+        write_json_string(stdout, stack) != 0 || fprintf(stdout, ",\"pid\":%ld}", (long)getpid()) < 0) {
         return -EIO;
     }
     return flush_event();
 }
 
-static int emit_stopped(void) {
-    if (fputs("{\"schema_version\":1,\"event\":\"stopped\",\"peer\":\"c\"}", stdout) == EOF) {
+static int emit_stopped(const char* stack) {
+    if (fputs("{\"schema_version\":2,\"event\":\"stopped\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+        write_json_string(stdout, stack) != 0 || fputc('}', stdout) == EOF) {
         return -EIO;
     }
     return flush_event();
@@ -354,9 +328,22 @@ static int set_once(const char** destination, const char* value) {
     return 0;
 }
 
+static int parse_stack(const char* value, benchmark_stack* stack, const char** stack_name) {
+    if (strcmp(value, "trevrpc_native_quic") == 0) {
+        *stack = BENCHMARK_STACK_TREVRPC_NATIVE_QUIC;
+    } else if (strcmp(value, "grpc_http2") == 0) {
+        *stack = BENCHMARK_STACK_GRPC_HTTP2;
+    } else {
+        return -EINVAL;
+    }
+    *stack_name = value;
+    return 0;
+}
+
 static int parse_server_options(int argc, char** argv, server_options* options, char* error, size_t error_len) {
     memset(options, 0, sizeof(*options));
     const char* listen = NULL;
+    const char* stack = NULL;
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 >= argc) {
             snprintf(error, error_len, "missing value for %s", argv[i]);
@@ -365,6 +352,8 @@ static int parse_server_options(int argc, char** argv, server_options* options, 
         int err = 0;
         if (strcmp(argv[i], "--listen") == 0) {
             err = set_once(&listen, argv[i + 1]);
+        } else if (strcmp(argv[i], "--stack") == 0) {
+            err = set_once(&stack, argv[i + 1]);
         } else if (strcmp(argv[i], "--cert") == 0) {
             err = set_once(&options->cert, argv[i + 1]);
         } else if (strcmp(argv[i], "--key") == 0) {
@@ -378,8 +367,12 @@ static int parse_server_options(int argc, char** argv, server_options* options, 
             return err;
         }
     }
-    if (listen == NULL || options->cert == NULL || options->key == NULL) {
-        snprintf(error, error_len, "server requires --listen, --cert, and --key");
+    if (listen == NULL || stack == NULL || options->cert == NULL || options->key == NULL) {
+        snprintf(error, error_len, "server requires --stack, --listen, --cert, and --key");
+        return -EINVAL;
+    }
+    if (parse_stack(stack, &options->stack, &options->stack_name) != 0) {
+        snprintf(error, error_len, "invalid --stack value: %s", stack);
         return -EINVAL;
     }
     int err = split_address(listen, true, &options->host, &options->port);
@@ -408,6 +401,7 @@ static int parse_rpc_kind(const char* value, client_options* options) {
 static int parse_client_options(int argc, char** argv, client_options* options, char* error, size_t error_len) {
     memset(options, 0, sizeof(*options));
     const char* address = NULL;
+    const char* stack = NULL;
     const char* rpc = NULL;
     const char* concurrency = NULL;
     const char* warmup_ms = NULL;
@@ -423,6 +417,8 @@ static int parse_client_options(int argc, char** argv, client_options* options, 
         int err = 0;
         if (strcmp(argv[i], "--address") == 0) {
             err = set_once(&address, argv[i + 1]);
+        } else if (strcmp(argv[i], "--stack") == 0) {
+            err = set_once(&stack, argv[i + 1]);
         } else if (strcmp(argv[i], "--cert") == 0) {
             err = set_once(&options->cert, argv[i + 1]);
         } else if (strcmp(argv[i], "--rpc") == 0) {
@@ -448,9 +444,14 @@ static int parse_client_options(int argc, char** argv, client_options* options, 
             return err;
         }
     }
-    if (address == NULL || options->cert == NULL || rpc == NULL || concurrency == NULL || warmup_ms == NULL ||
-        measurement_ms == NULL || request_bytes == NULL || response_bytes == NULL || messages_per_stream == NULL) {
+    if (address == NULL || stack == NULL || options->cert == NULL || rpc == NULL || concurrency == NULL ||
+        warmup_ms == NULL || measurement_ms == NULL || request_bytes == NULL || response_bytes == NULL ||
+        messages_per_stream == NULL) {
         snprintf(error, error_len, "client requires all peer protocol options");
+        return -EINVAL;
+    }
+    if (parse_stack(stack, &options->stack, &options->stack_name) != 0) {
+        snprintf(error, error_len, "invalid --stack value: %s", stack);
         return -EINVAL;
     }
     if (parse_rpc_kind(rpc, options) != 0) {
@@ -540,8 +541,8 @@ static int service_unary(void* user_data,
     const BenchmarkRequest* request,
     BenchmarkResponse** response) {
     (void)user_data;
-    if (request == NULL || response == NULL || request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES ||
-        trevrpc_call_context_cancelled(context)) {
+    if (request == NULL || response == NULL || request->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES ||
+        request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES || trevrpc_call_context_cancelled(context)) {
         return -EINVAL;
     }
     *response = new_response(request->sequence, request->response_bytes);
@@ -577,6 +578,10 @@ static int service_client_stream(
             }
             break;
         }
+        if (request->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES) {
+            trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
+            return -EINVAL;
+        }
         if (count >= BENCHMARK_MAX_MESSAGES_PER_STREAM) {
             trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
             return -E2BIG;
@@ -598,7 +603,8 @@ static int service_client_stream(
 static int service_server_stream(
     void* user_data, const trevrpc_call_context* context, const StreamRequest* request, trevrpc_stream* stream) {
     (void)user_data;
-    if (request == NULL || request->message_count == 0 || request->message_count > BENCHMARK_MAX_MESSAGES_PER_STREAM ||
+    if (request == NULL || request->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES || request->message_count == 0 ||
+        request->message_count > BENCHMARK_MAX_MESSAGES_PER_STREAM ||
         request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES) {
         return -EINVAL;
     }
@@ -635,7 +641,8 @@ static int service_bidi(void* user_data, const trevrpc_call_context* context, tr
         if (request == NULL) {
             return status == TREVRPC_STATUS_OK ? 0 : -EINVAL;
         }
-        if (count >= BENCHMARK_MAX_MESSAGES_PER_STREAM || request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES) {
+        if (request->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES || count >= BENCHMARK_MAX_MESSAGES_PER_STREAM ||
+            request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES) {
             trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
             return -EINVAL;
         }
@@ -924,7 +931,7 @@ static int run_bidi(trevrpc_raw_client* client, const client_options* options) {
     return err;
 }
 
-static int run_operation(trevrpc_raw_client* client, const client_options* options, uint64_t sequence) {
+static int run_native_operation(trevrpc_raw_client* client, const client_options* options, uint64_t sequence) {
     switch (options->rpc_kind) {
     case BENCHMARK_RPC_UNARY:
         return run_unary(client, options, sequence);
@@ -936,6 +943,14 @@ static int run_operation(trevrpc_raw_client* client, const client_options* optio
         return run_bidi(client, options);
     }
     return -EINVAL;
+}
+
+static int run_operation(
+    benchmark_client* client, trevrpc_bench_grpc_lane* grpc_lane, const client_options* options, uint64_t sequence) {
+    if (client->stack == BENCHMARK_STACK_GRPC_HTTP2) {
+        return trevrpc_bench_grpc_run_operation(grpc_lane, options, sequence);
+    }
+    return run_native_operation(client->impl.native, options, sequence);
 }
 
 static operation_counts operation_message_counts(const client_options* options) {
@@ -1009,6 +1024,9 @@ static void histogram_reset(histogram* target) {
 static void* lane_thread(void* context) {
     lane_args* lane = context;
     phase_control* phase = lane->phase;
+    if (phase->client->stack == BENCHMARK_STACK_GRPC_HTTP2) {
+        lane->result.internal_error = trevrpc_bench_grpc_lane_open(phase->client->impl.grpc, &lane->grpc_lane);
+    }
     pthread_mutex_lock(&phase->mutex);
     phase->ready_count++;
     pthread_cond_broadcast(&phase->cond);
@@ -1017,6 +1035,10 @@ static void* lane_thread(void* context) {
     }
     uint64_t deadline_ns = phase->deadline_ns;
     pthread_mutex_unlock(&phase->mutex);
+
+    if (lane->result.internal_error != 0) {
+        return NULL;
+    }
 
     operation_counts counts = operation_message_counts(phase->options);
     uint64_t operation_index = 0;
@@ -1030,7 +1052,7 @@ static void* lane_thread(void* context) {
             break;
         }
         uint64_t sequence = operation_index * phase->options->concurrency + lane->lane_index;
-        int err = run_operation(phase->client, phase->options, sequence);
+        int err = run_operation(phase->client, lane->grpc_lane, phase->options, sequence);
         uint64_t operation_end = monotonic_nanos();
         if (err != 0) {
             lane->result.failed++;
@@ -1061,11 +1083,13 @@ static void* lane_thread(void* context) {
         }
         operation_index++;
     }
+    trevrpc_bench_grpc_lane_close(lane->grpc_lane);
+    lane->grpc_lane = NULL;
     return NULL;
 }
 
 static int phase_prepare(
-    phase_control* phase, trevrpc_raw_client* client, const client_options* options, bool record_latency) {
+    phase_control* phase, benchmark_client* client, const client_options* options, bool record_latency) {
     memset(phase, 0, sizeof(*phase));
     phase->client = client;
     phase->options = options;
@@ -1189,7 +1213,7 @@ static int phase_join(phase_control* phase, lane_result* total, uint64_t* elapse
     return result;
 }
 
-static int run_warmup(trevrpc_raw_client* client, const client_options* options) {
+static int run_warmup(benchmark_client* client, const client_options* options) {
     if (options->warmup_ns == 0) {
         return 0;
     }
@@ -1214,7 +1238,8 @@ static int run_warmup(trevrpc_raw_client* client, const client_options* options)
 
 static int emit_sample(const client_options* options, uint64_t elapsed_ns, const lane_result* result) {
     uint64_t drain_ns = elapsed_ns > options->measurement_ns ? elapsed_ns - options->measurement_ns : 0;
-    if (fputs("{\"schema_version\":1,\"event\":\"sample\",\"peer\":\"c\",\"rpc_kind\":", stdout) == EOF ||
+    if (fputs("{\"schema_version\":2,\"event\":\"sample\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+        write_json_string(stdout, options->stack_name) != 0 || fputs(",\"rpc_kind\":", stdout) == EOF ||
         write_json_string(stdout, options->rpc_name) != 0 ||
         fprintf(stdout,
             ",\"admission_ns\":\"%" PRIu64 "\",\"elapsed_ns\":\"%" PRIu64 "\",\"drain_ns\":\"%" PRIu64
@@ -1285,17 +1310,26 @@ static bool server_thread_done(server_thread_args* args, int* result) {
     return done;
 }
 
+static bool native_server_done(void* context, int* result) {
+    return server_thread_done(context, result);
+}
+
+static bool grpc_server_done(void* context, int* result) {
+    return trevrpc_bench_grpc_server_done(context, result);
+}
+
 static void server_signal_handler(int signal_number) {
     (void)signal_number;
     server_stop_requested = 1;
 }
 
-static int wait_for_server_shutdown(server_thread_args* thread_args, bool* graceful) {
+static int wait_for_server_shutdown(
+    void* server_context, bool (*server_done)(void* context, int* result), bool* graceful) {
     *graceful = false;
     char command[32];
     for (;;) {
         int server_result = 0;
-        if (server_thread_done(thread_args, &server_result)) {
+        if (server_done(server_context, &server_result)) {
             return server_result == 0 ? -ECANCELED : server_result;
         }
         if (server_stop_requested) {
@@ -1329,6 +1363,41 @@ static int wait_for_server_shutdown(server_thread_args* thread_args, bool* grace
     }
 }
 
+static int run_grpc_server(const server_options* options) {
+    trevrpc_bench_grpc_server* server = NULL;
+    uint16_t actual_port = 0;
+    int err = trevrpc_bench_grpc_server_start(options, &server, &actual_port);
+    if (err != 0) {
+        return fail_with_error("listen", "listen_failed", "%s (%d)", trevrpc_error(err), err);
+    }
+
+    struct sigaction action = {0};
+    action.sa_handler = server_signal_handler;
+    sigemptyset(&action.sa_mask);
+    (void)sigaction(SIGINT, &action, NULL);
+    (void)sigaction(SIGTERM, &action, NULL);
+    if (emit_ready(options->host, actual_port, options->stack_name) != 0) {
+        (void)trevrpc_bench_grpc_server_close(server);
+        return 1;
+    }
+
+    bool graceful = false;
+    int wait_err = wait_for_server_shutdown(server, grpc_server_done, &graceful);
+    int shutdown_err = trevrpc_bench_grpc_server_shutdown(server);
+    int close_err = trevrpc_bench_grpc_server_close(server);
+    if (wait_err != 0) {
+        return fail_with_error("serve", "control_failed", "%s (%d)", trevrpc_error(wait_err), wait_err);
+    }
+    err = shutdown_err != 0 ? shutdown_err : close_err;
+    if (err != 0) {
+        return fail_with_error("serve", "shutdown_failed", "%s (%d)", trevrpc_error(err), err);
+    }
+    if (graceful && emit_stopped(options->stack_name) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static int run_server(int argc, char** argv) {
     char parse_error[256];
     server_options options;
@@ -1336,6 +1405,11 @@ static int run_server(int argc, char** argv) {
     if (err != 0) {
         free(options.host);
         return fail_with_error("config", "invalid_argument", "%s", parse_error);
+    }
+    if (options.stack == BENCHMARK_STACK_GRPC_HTTP2) {
+        err = run_grpc_server(&options);
+        free(options.host);
+        return err;
     }
 
     trevrpc_server_config config = trevrpc_default_server_config();
@@ -1403,7 +1477,7 @@ static int run_server(int argc, char** argv) {
     sigemptyset(&action.sa_mask);
     (void)sigaction(SIGINT, &action, NULL);
     (void)sigaction(SIGTERM, &action, NULL);
-    if (emit_ready(options.host, actual_port) != 0) {
+    if (emit_ready(options.host, actual_port, options.stack_name) != 0) {
         trevrpc_server_shutdown(server);
         (void)pthread_join(thread, NULL);
         pthread_mutex_destroy(&thread_args.mutex);
@@ -1413,7 +1487,7 @@ static int run_server(int argc, char** argv) {
     }
 
     bool graceful = false;
-    int wait_err = wait_for_server_shutdown(&thread_args, &graceful);
+    int wait_err = wait_for_server_shutdown(&thread_args, native_server_done, &graceful);
     trevrpc_server_shutdown(server);
     int join_err = thread_started ? pthread_join(thread, NULL) : 0;
     int serve_result = 0;
@@ -1428,10 +1502,32 @@ static int run_server(int argc, char** argv) {
         err = join_err != 0 ? -join_err : serve_result;
         return fail_with_error("serve", "shutdown_failed", "%s (%d)", trevrpc_error(err), err);
     }
-    if (graceful && emit_stopped() != 0) {
+    if (graceful && emit_stopped(options.stack_name) != 0) {
         return 1;
     }
     return 0;
+}
+
+static void benchmark_client_close(benchmark_client* client) {
+    if (client->stack == BENCHMARK_STACK_GRPC_HTTP2) {
+        trevrpc_bench_grpc_client_close(client->impl.grpc);
+    } else {
+        trevrpc_raw_client_close(client->impl.native);
+    }
+    memset(client, 0, sizeof(*client));
+}
+
+static int validate_client(benchmark_client* client, const client_options* options) {
+    trevrpc_bench_grpc_lane* grpc_lane = NULL;
+    int err = 0;
+    if (client->stack == BENCHMARK_STACK_GRPC_HTTP2) {
+        err = trevrpc_bench_grpc_lane_open(client->impl.grpc, &grpc_lane);
+    }
+    if (err == 0) {
+        err = run_operation(client, grpc_lane, options, 0);
+    }
+    trevrpc_bench_grpc_lane_close(grpc_lane);
+    return err;
 }
 
 static int run_client(int argc, char** argv) {
@@ -1443,47 +1539,51 @@ static int run_client(int argc, char** argv) {
         return fail_with_error("config", "invalid_argument", "%s", parse_error);
     }
 
-    trevrpc_config config = trevrpc_default_config();
-    config.ca_cert_file = options.cert;
-    config.skip_certificate_validation = 0;
-    config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
-    config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
-    config.peer_bidi_stream_count = (uint16_t)(options.concurrency > UINT16_MAX ? UINT16_MAX : options.concurrency);
-    config.max_frame_size = BENCHMARK_MAX_FRAME_SIZE;
-    trevrpc_raw_client* client = NULL;
-    err = trevrpc_raw_client_connect(options.host, options.port, &config, &client);
+    benchmark_client client = {.stack = options.stack};
+    if (options.stack == BENCHMARK_STACK_GRPC_HTTP2) {
+        err = trevrpc_bench_grpc_client_connect(&options, &client.impl.grpc);
+    } else {
+        trevrpc_config config = trevrpc_default_config();
+        config.ca_cert_file = options.cert;
+        config.skip_certificate_validation = 0;
+        config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
+        config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
+        config.peer_bidi_stream_count = (uint16_t)(options.concurrency > UINT16_MAX ? UINT16_MAX : options.concurrency);
+        config.max_frame_size = BENCHMARK_MAX_FRAME_SIZE;
+        err = trevrpc_raw_client_connect(options.host, options.port, &config, &client.impl.native);
+    }
     if (err != 0) {
         int result = fail_with_error("connect", "connect_failed", "%s (%d)", trevrpc_error(err), err);
         free(options.host);
         return result;
     }
 
-    err = run_operation(client, &options, 0);
+    err = validate_client(&client, &options);
     if (err != 0) {
-        trevrpc_raw_client_close(client);
+        benchmark_client_close(&client);
         free(options.host);
         return fail_with_error("validate", "rpc_failed", "%s (%d)", trevrpc_error(err), err);
     }
-    err = run_warmup(client, &options);
+    err = run_warmup(&client, &options);
     if (err != 0) {
-        trevrpc_raw_client_close(client);
+        benchmark_client_close(&client);
         free(options.host);
         return fail_with_error("warmup", "rpc_failed", "%s (%d)", trevrpc_error(err), err);
     }
 
     phase_control phase;
-    err = phase_prepare(&phase, client, &options, true);
+    err = phase_prepare(&phase, &client, &options, true);
     if (err != 0) {
-        trevrpc_raw_client_close(client);
+        benchmark_client_close(&client);
         free(options.host);
         return fail_with_error("arm", "lane_setup_failed", "%s (%d)", trevrpc_error(err), err);
     }
-    if (emit_armed() != 0) {
+    if (emit_armed(options.stack_name) != 0) {
         phase_abort(&phase);
         lane_result discarded;
         (void)phase_join(&phase, &discarded, NULL);
         histogram_reset(&discarded.latency);
-        trevrpc_raw_client_close(client);
+        benchmark_client_close(&client);
         free(options.host);
         return 1;
     }
@@ -1497,7 +1597,7 @@ static int run_client(int argc, char** argv) {
         lane_result discarded;
         (void)phase_join(&phase, &discarded, NULL);
         histogram_reset(&discarded.latency);
-        trevrpc_raw_client_close(client);
+        benchmark_client_close(&client);
         free(options.host);
         return fail_with_error("control", "invalid_command", "expected START");
     }
@@ -1506,7 +1606,7 @@ static int run_client(int argc, char** argv) {
     lane_result result;
     uint64_t elapsed_ns = 0;
     int join_err = phase_join(&phase, &result, &elapsed_ns);
-    trevrpc_raw_client_close(client);
+    benchmark_client_close(&client);
     free(options.host);
     if (err == 0) {
         err = join_err;
@@ -1536,7 +1636,8 @@ static int run_client(int argc, char** argv) {
 
 static void print_usage(const char* program) {
     fprintf(stderr,
-        "usage: %s capabilities | server --listen HOST:PORT --cert FILE --key FILE | client [options]\n",
+        "usage: %s capabilities | server --stack STACK --listen HOST:PORT --cert FILE --key FILE | client --stack "
+        "STACK [options]\n",
         program);
 }
 

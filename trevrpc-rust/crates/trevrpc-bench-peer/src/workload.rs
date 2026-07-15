@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +17,11 @@ use crate::proto::{
     BenchmarkSummary, StreamRequest,
 };
 
-type BoxError = Box<dyn Error + Send + Sync>;
+pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
+
+pub(crate) trait BenchmarkWorkload: Clone + Send + Sync + 'static {
+    fn execute(&self) -> impl Future<Output = Result<MessageCounts, BoxError>> + Send;
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MessageCounts {
@@ -175,6 +180,12 @@ impl Workload {
     }
 }
 
+impl BenchmarkWorkload for Workload {
+    fn execute(&self) -> impl Future<Output = Result<MessageCounts, BoxError>> + Send {
+        Self::execute(self)
+    }
+}
+
 fn call_options() -> CallOptions {
     CallOptions::new()
         .with_max_response_body_size(MAX_ENCODED_FRAME_BYTES)
@@ -182,7 +193,7 @@ fn call_options() -> CallOptions {
         .with_max_response_stream_body_size(None)
 }
 
-fn validate_response(
+pub(crate) fn validate_response(
     response: &BenchmarkResponse,
     expected_sequence: u64,
     expected_bytes: u32,
@@ -227,6 +238,7 @@ impl BenchmarkService for BenchmarkServiceImpl {
         let mut payload_bytes = 0_u64;
         while let Some(request) = requests.next().await {
             let request = request.map_err(trevrpc::Error::into_status)?;
+            checked_request_payload(&request.payload)?;
             message_count = message_count
                 .checked_add(1)
                 .ok_or_else(|| trevrpc::Status::resource_exhausted("message count overflowed"))?;
@@ -254,6 +266,7 @@ impl BenchmarkService for BenchmarkServiceImpl {
         _context: RequestContext,
         request: StreamRequest,
     ) -> Result<trevrpc::BoxMessageStream<BenchmarkResponse>, trevrpc::Status> {
+        checked_request_payload(&request.payload)?;
         let response_bytes = checked_response_bytes(request.response_bytes)?;
         if request.message_count == 0 || request.message_count > MAX_MESSAGES_PER_STREAM {
             return Err(trevrpc::Status::invalid_argument(
@@ -303,11 +316,21 @@ impl MessageStream<BenchmarkResponse> for BidiResponses {
 }
 
 fn response_for(request: &BenchmarkRequest) -> Result<BenchmarkResponse, trevrpc::Status> {
+    checked_request_payload(&request.payload)?;
     let response_bytes = checked_response_bytes(request.response_bytes)?;
     Ok(BenchmarkResponse {
         sequence: request.sequence,
         payload: vec![0; response_bytes],
     })
+}
+
+fn checked_request_payload(payload: &[u8]) -> Result<(), trevrpc::Status> {
+    if payload.len() > MAX_APPLICATION_PAYLOAD_BYTES {
+        return Err(trevrpc::Status::invalid_argument(
+            "request payload is outside the benchmark peer limit",
+        ));
+    }
+    Ok(())
 }
 
 fn checked_response_bytes(response_bytes: u32) -> Result<usize, trevrpc::Status> {
@@ -318,4 +341,85 @@ fn checked_response_bytes(response_bytes: u32) -> Result<usize, trevrpc::Status>
         ));
     }
     Ok(response_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BenchmarkServiceImpl;
+    use crate::config::MAX_APPLICATION_PAYLOAD_BYTES;
+    use crate::proto::{BenchmarkRequest, BenchmarkService, StreamRequest};
+
+    #[tokio::test]
+    async fn native_service_rejects_oversized_request_payloads() {
+        let status = BenchmarkServiceImpl
+            .unary(request_context(), oversized_request())
+            .await
+            .expect_err("oversized unary payload unexpectedly succeeded");
+        assert_oversized_status(&status);
+
+        let status = BenchmarkServiceImpl
+            .client_stream(
+                request_context(),
+                trevrpc::stream::from_iter([oversized_request()]),
+            )
+            .await
+            .expect_err("oversized client-stream payload unexpectedly succeeded");
+        assert_oversized_status(&status);
+
+        let Err(status) = BenchmarkServiceImpl
+            .server_stream(
+                request_context(),
+                StreamRequest {
+                    message_count: 1,
+                    payload: oversized_payload(),
+                    response_bytes: 0,
+                },
+            )
+            .await
+        else {
+            panic!("oversized server-stream payload unexpectedly succeeded");
+        };
+        assert_oversized_status(&status);
+
+        let mut responses = BenchmarkServiceImpl
+            .bidi(
+                request_context(),
+                trevrpc::stream::from_iter([oversized_request()]),
+            )
+            .await
+            .expect("bidi response stream should be created");
+        let error = responses
+            .next()
+            .await
+            .expect("bidi response stream ended before rejecting the payload")
+            .expect_err("oversized bidi payload unexpectedly succeeded");
+        assert_oversized_status(&error.into_status());
+    }
+
+    fn request_context() -> trevrpc::server::RequestContext {
+        trevrpc::server::RequestContext::new(
+            &trevrpc::RpcRequest::new("benchmark", "test", Vec::new()),
+            None,
+        )
+    }
+
+    fn oversized_request() -> BenchmarkRequest {
+        BenchmarkRequest {
+            sequence: 0,
+            payload: oversized_payload(),
+            response_bytes: 0,
+        }
+    }
+
+    fn oversized_payload() -> Vec<u8> {
+        vec![0; MAX_APPLICATION_PAYLOAD_BYTES + 1]
+    }
+
+    fn assert_oversized_status(status: &trevrpc::Status) {
+        assert_eq!(status.code(), trevrpc::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "request payload is outside the benchmark peer limit"
+        );
+    }
 }
