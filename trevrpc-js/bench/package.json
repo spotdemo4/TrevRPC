@@ -1,0 +1,31 @@
+{
+  "name": "trevrpc-bench-peer-js",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JavaScript TrevRPC and gRPC benchmark peer",
+  "license": "MIT",
+  "bin": {
+    "trevrpc-bench-peer-js": "./trevrpc-bench-peer.js"
+  },
+  "files": [
+    "trevrpc-bench-peer.js"
+  ],
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/benchmark-peer.test.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.4"
+  },
+  "peerDependencies": {
+    "trevrpc-js": "0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "trevrpc-js": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

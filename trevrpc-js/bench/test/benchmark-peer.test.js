@@ -8,6 +8,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { Code, RpcStreamFrameKind, protobuf } from "trevrpc-js";
+
 import {
   LogLinearHistogram,
   connectGrpcBenchmarkClient,
@@ -18,8 +20,7 @@ import {
   parseCommandLine,
   prepareFixedAdmissionPhase,
   root,
-} from "../bench/trevrpc-bench-peer.js";
-import { Code, RpcStreamFrameKind, protobuf } from "../src/index.node.js";
+} from "../trevrpc-bench-peer.js";
 
 const execFileAsync = promisify(execFile);
 const BenchmarkRequest = root.lookupType("trevrpc.benchmark.v1.BenchmarkRequest");
@@ -29,7 +30,7 @@ const BenchmarkSummary = root.lookupType("trevrpc.benchmark.v1.BenchmarkSummary"
 
 test("benchmark peer schema matches the canonical proto", () => {
   const canonical = protobuf.parse(
-    readFileSync(new URL("../../bench/proto/benchmark.proto", import.meta.url), "utf8"),
+    readFileSync(new URL("../../../bench/proto/benchmark.proto", import.meta.url), "utf8"),
   ).root;
   for (const typeName of [
     "BenchmarkRequest",
@@ -100,7 +101,7 @@ function schemaFields(type) {
 
 test("benchmark peer capabilities use protocol v2 stacks", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
-    fileURLToPath(new URL("../bench/trevrpc-bench-peer.js", import.meta.url)),
+    fileURLToPath(new URL("../trevrpc-bench-peer.js", import.meta.url)),
     "capabilities",
   ]);
 

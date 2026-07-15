@@ -4,11 +4,9 @@
   "description": "JavaScript WebTransport runtime and protobuf.js code generator for TrevRPC",
   "license": "MIT",
   "bin": {
-    "protoc-gen-trevrpc-js": "./bin/protoc-gen-trevrpc-js.js",
-    "trevrpc-bench-peer-js": "./bench/trevrpc-bench-peer.js"
+    "protoc-gen-trevrpc-js": "./bin/protoc-gen-trevrpc-js.js"
   },
   "files": [
-    "bench",
     "bin",
     "examples",
     "native",
@@ -45,7 +43,6 @@
     }
   },
   "scripts": {
-    "bench:peer": "node bench/trevrpc-bench-peer.js",
     "build:native": "TREVRPC_NODE_TEST_HOOKS=OFF npm run build:native:cmake",
     "build:native:test": "TREVRPC_NODE_TEST_HOOKS=ON npm run build:native:cmake",
     "build:native:cmake": "cmake -S native -B build/native -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release} -DTREVRPC_NODE_TEST_HOOKS=${TREVRPC_NODE_TEST_HOOKS:?} ${TREVRPC_C_ROOT:+-DTREVRPC_C_ROOT=$TREVRPC_C_ROOT} ${NODE_INCLUDE_DIR:+-DNODE_INCLUDE_DIR=$NODE_INCLUDE_DIR} && cmake --build build/native --config ${CMAKE_BUILD_TYPE:-Release}",
@@ -54,14 +51,13 @@
     "format": "oxfmt --write",
     "format:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",
-    "test": "node --test test/*.test.js",
+    "test": "node --test test/channel.test.js test/native-ownership-lifecycle.test.js test/node-server.test.js test/runtime.test.js",
     "test:browser": "node --test test/browser/*.test.js",
     "test:browser:soak": "env TREVRPC_BROWSER_SOAK=1 node --test test/browser/*.test.js",
     "typecheck": "tsc --noEmit",
     "verify:native:production": "node -e 'const { readFileSync } = require(\"node:fs\"); const path = \"./build/native/trevrpc_native.node\"; const expectedExports = [\"connectMsQuic\", \"createCancellation\", \"listenMsQuic\"]; const actualExports = Object.getOwnPropertyNames(require(path)).sort(); const exportsMatch = JSON.stringify(actualExports) === JSON.stringify(expectedExports); const embedsDebugNames = readFileSync(path).includes(Buffer.from(\"_debug\")); if (!exportsMatch || embedsDebugNames) throw new Error(`production addon exports ${JSON.stringify(actualExports)}; expected exactly ${JSON.stringify(expectedExports)}${embedsDebugNames ? \"; binary contains _debug\" : \"\"}`);'"
   },
   "dependencies": {
-    "@grpc/grpc-js": "^1.14.4",
     "protobufjs": "^8.7.1"
   },
   "devDependencies": {

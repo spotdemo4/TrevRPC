@@ -6,7 +6,6 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import * as grpc from "@grpc/grpc-js";
-
 import {
   Code,
   RpcStreamFrameKind,
@@ -15,9 +14,9 @@ import {
   invalidArgument,
   resourceExhausted,
   statusError,
-} from "../src/index.node.js";
-import { RawNodeTransport } from "../src/node-advanced.js";
-import { NodeServer } from "../src/node-index.js";
+} from "trevrpc-js";
+import { NodeServer } from "trevrpc-js/node";
+import { RawNodeTransport } from "trevrpc-js/node/advanced";
 
 const SchemaVersion = 2;
 const Peer = "js";
