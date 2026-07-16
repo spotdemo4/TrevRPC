@@ -167,62 +167,61 @@
         packages =
           let
             bench = pkgs.callPackage ./bench {
-              inherit pkgs;
               sourceCommit = self.rev or (self.dirtyRev or "unknown");
               sourceDirty = if self ? rev then "false" else "true";
             };
             c = pkgs.callPackage ./trevrpc-c {
-              inherit pkgs;
               repoRoot = ./.;
             };
+            cBenchPeer = c.override { benchPeer = true; };
             cpp = pkgs.callPackage ./trevrpc-cpp {
-              inherit pkgs;
               repoRoot = ./.;
-              trevrpcC = c.package;
+              trevrpcC = c;
             };
+            cppBenchPeer = cpp.override { benchPeer = true; };
             go = pkgs.callPackage ./trevrpc-go {
-              inherit pkgs;
               repoRoot = ./.;
             };
+            goBenchPeer = go.override { benchPeer = true; };
             js = pkgs.callPackage ./trevrpc-js {
-              inherit pkgs;
               repoRoot = ./.;
-              trevrpcC = c.package;
+              trevrpcC = c;
             };
+            jsBenchPeer = js.override { benchPeer = true; };
             kotlin = pkgs.callPackage ./trevrpc-kotlin {
-              inherit pkgs;
               repoRoot = ./.;
             };
+            kotlinBenchPeer = kotlin.override { benchPeer = true; };
             rust = pkgs.callPackage ./trevrpc-rust {
-              inherit pkgs;
               repoRoot = ./.;
             };
+            rustBenchPeer = rust.override { benchPeer = true; };
           in
           {
             trevrpc-bench = bench;
-            trevrpc-c = c.package;
-            trevrpc-c-bench-peer = c.benchPeer;
-            trevrpc-cpp = cpp.package;
-            trevrpc-cpp-bench-peer = cpp.benchPeer;
-            trevrpc-go = go.package;
-            trevrpc-go-bench-peer = go.benchPeer;
-            trevrpc-js = js.package;
-            trevrpc-js-bench-peer = js.benchPeer;
-            trevrpc-kotlin = kotlin.package;
-            trevrpc-kotlin-bench-peer = kotlin.benchPeer;
-            trevrpc-rust = rust.package;
-            trevrpc-rust-bench-peer = rust.benchPeer;
+            trevrpc-c = c;
+            trevrpc-c-bench-peer = cBenchPeer;
+            trevrpc-cpp = cpp;
+            trevrpc-cpp-bench-peer = cppBenchPeer;
+            trevrpc-go = go;
+            trevrpc-go-bench-peer = goBenchPeer;
+            trevrpc-js = js;
+            trevrpc-js-bench-peer = jsBenchPeer;
+            trevrpc-kotlin = kotlin;
+            trevrpc-kotlin-bench-peer = kotlinBenchPeer;
+            trevrpc-rust = rust;
+            trevrpc-rust-bench-peer = rustBenchPeer;
 
             trevrpc-bench-suite = pkgs.symlinkJoin {
               name = "trevrpc-bench-suite";
               paths = [
                 bench
-                c.benchPeer
-                cpp.benchPeer
-                go.benchPeer
-                js.benchPeer
-                kotlin.benchPeer
-                rust.benchPeer
+                cBenchPeer
+                cppBenchPeer
+                goBenchPeer
+                jsBenchPeer
+                kotlinBenchPeer
+                rustBenchPeer
               ];
               meta.platforms = [ "x86_64-linux" ];
             };
@@ -336,16 +335,8 @@
 
           c = self.packages.${system}.trevrpc-c;
 
-          c-sanitizers = self.packages.${system}.trevrpc-c.overrideAttrs {
-            doInstallCheck = false;
-            configurePhase = ''
-              runHook preConfigure
-              cmake -S . -B build -DTREVRPC_BUILD_TESTS=ON -DTREVRPC_ENABLE_SANITIZERS=ON
-              runHook postConfigure
-            '';
-            installPhase = ''
-              mkdir -p "$out" "$dev" "$lib"
-            '';
+          c-sanitizers = self.packages.${system}.trevrpc-c.override {
+            sanitizers = true;
           };
 
           cpp = self.packages.${system}.trevrpc-cpp;

@@ -1,10 +1,13 @@
 {
-  pkgs,
+  lib,
+  makeWrapper,
+  openssl,
+  rustPlatform,
   sourceCommit,
   sourceDirty,
 }:
-pkgs.rustPlatform.buildRustPackage (
-  final: with pkgs.lib; {
+rustPlatform.buildRustPackage (
+  final: with lib; {
     pname = "trevrpc-bench";
     version = "0.1.0";
 
@@ -21,10 +24,10 @@ pkgs.rustPlatform.buildRustPackage (
     };
     cargoLock.lockFile = ./Cargo.lock;
 
-    nativeBuildInputs = [ pkgs.makeWrapper ];
+    nativeBuildInputs = [ makeWrapper ];
     postInstall = ''
       wrapProgram $out/bin/trevrpc-bench \
-        --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.openssl ]} \
+        --prefix PATH : ${makeBinPath [ openssl ]} \
         --set TREVRPC_BENCH_SOURCE_COMMIT ${sourceCommit} \
         --set TREVRPC_BENCH_SOURCE_DIRTY ${sourceDirty}
     '';
