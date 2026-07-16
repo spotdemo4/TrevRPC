@@ -95,6 +95,10 @@ the controller never silently substitutes loopback. See
 improves repeatability but does not reproduce physical NIC offloads, cloud
 routing, or competing traffic.
 
+`regional-wan-netns.example.json` is the retained publication campaign. It
+applies approximately 30 ms RTT, 2 ms one-way jitter, 0.1% random loss, and a
+100 Mbit/s rate to the full same-language TrevRPC/gRPC matrix.
+
 Compilation and dependency realization must happen before a publishable run.
 Run measurements on `ssh bench` and keep the host otherwise idle. Retain the
 complete output directory so its manifest, samples, raw peer logs, and generated

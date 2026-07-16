@@ -1,0 +1,136 @@
+{
+  "schema_version": 3,
+  "campaign_id": "regional-wan-netns-stack-comparison",
+  "repetitions": 3,
+  "peers": [
+    {
+      "id": "c",
+      "command": ["trevrpc-bench-peer-c"]
+    },
+    {
+      "id": "cpp",
+      "command": ["trevrpc-bench-peer-cpp"]
+    },
+    {
+      "id": "go",
+      "command": ["trevrpc-bench-peer-go"]
+    },
+    {
+      "id": "js",
+      "command": ["trevrpc-bench-peer-js"]
+    },
+    {
+      "id": "kotlin",
+      "command": ["trevrpc-bench-peer-kotlin"]
+    },
+    {
+      "id": "rust",
+      "command": ["trevrpc-bench-peer-rust"]
+    }
+  ],
+  "cells": [
+    {
+      "id": "c-trevrpc",
+      "client": "c",
+      "server": "c",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "c-grpc",
+      "client": "c",
+      "server": "c",
+      "stack": "grpc_http2"
+    },
+    {
+      "id": "cpp-trevrpc",
+      "client": "cpp",
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "cpp-grpc",
+      "client": "cpp",
+      "server": "cpp",
+      "stack": "grpc_http2"
+    },
+    {
+      "id": "go-trevrpc",
+      "client": "go",
+      "server": "go",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "go-grpc",
+      "client": "go",
+      "server": "go",
+      "stack": "grpc_http2"
+    },
+    {
+      "id": "js-trevrpc",
+      "client": "js",
+      "server": "js",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "js-grpc",
+      "client": "js",
+      "server": "js",
+      "stack": "grpc_http2"
+    },
+    {
+      "id": "kotlin-trevrpc",
+      "client": "kotlin",
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "kotlin-grpc",
+      "client": "kotlin",
+      "server": "kotlin",
+      "stack": "grpc_http2"
+    },
+    {
+      "id": "rust-trevrpc",
+      "client": "rust",
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "rust-grpc",
+      "client": "rust",
+      "server": "rust",
+      "stack": "grpc_http2"
+    }
+  ],
+  "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
+  "concurrencies": [1, 4],
+  "timing": {
+    "warmup_ms": 1000,
+    "measurement_ms": 5000
+  },
+  "workload": {
+    "request_bytes": 256,
+    "response_bytes": 256,
+    "messages_per_stream": 128
+  },
+  "network": {
+    "backend": "netns",
+    "client_to_server": {
+      "delay_ms": 15,
+      "jitter_ms": 2,
+      "loss_percent": 0.1,
+      "rate_mbit": 100,
+      "queue_packets": 1000
+    },
+    "server_to_client": {
+      "delay_ms": 15,
+      "jitter_ms": 2,
+      "loss_percent": 0.1,
+      "rate_mbit": 100,
+      "queue_packets": 1000
+    },
+    "mtu": 1500
+  },
+  "startup_timeout_ms": 30000,
+  "drain_timeout_ms": 60000
+}
