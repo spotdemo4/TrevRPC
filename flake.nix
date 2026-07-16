@@ -244,6 +244,17 @@
         checks = pkgs.mkChecks {
           benchmark-controller = self.packages.${system}.trevrpc-bench;
 
+          c = self.packages.${system}.trevrpc-c;
+          c-sanitizers = self.packages.${system}.trevrpc-c.override {
+            sanitizers = true;
+          };
+
+          cpp = self.packages.${system}.trevrpc-cpp;
+          rust = self.packages.${system}.trevrpc-rust;
+          go = self.packages.${system}.trevrpc-go;
+          js = self.packages.${system}.trevrpc-js;
+          kotlin = self.packages.${system}.trevrpc-kotlin;
+
           benchmark-proto-sync =
             pkgs.runCommand "trevrpc-benchmark-proto-sync"
               {
@@ -333,14 +344,6 @@
               touch $out
             '';
 
-          c = self.packages.${system}.trevrpc-c;
-
-          c-sanitizers = self.packages.${system}.trevrpc-c.override {
-            sanitizers = true;
-          };
-
-          cpp = self.packages.${system}.trevrpc-cpp;
-
           consumer-closures-no-grpc =
             let
               c = self.packages.${system}.trevrpc-c;
@@ -367,14 +370,6 @@
               fi
               mkdir -p $out
             '';
-
-          rust = self.packages.${system}.trevrpc-rust;
-
-          go = self.packages.${system}.trevrpc-go;
-
-          js = self.packages.${system}.trevrpc-js;
-
-          kotlin = self.packages.${system}.trevrpc-kotlin;
 
           cross-runtime =
             let
