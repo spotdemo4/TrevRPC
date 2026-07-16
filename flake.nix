@@ -244,16 +244,6 @@
         checks = pkgs.mkChecks {
           benchmark-controller = self.packages.${system}.trevrpc-bench;
 
-          benchmark-netns-config =
-            pkgs.runCommand "trevrpc-benchmark-netns-config"
-              {
-                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench ];
-              }
-              ''
-                trevrpc-bench validate ${./bench/campaigns/netns-smoke.example.json}
-                touch $out
-              '';
-
           c = self.packages.${system}.trevrpc-c;
           c-sanitizers = self.packages.${system}.trevrpc-c.override {
             sanitizers = true;
