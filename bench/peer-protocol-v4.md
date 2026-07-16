@@ -1,4 +1,4 @@
-# Benchmark Peer Protocol V3
+# Benchmark Peer Protocol V4
 
 The benchmark controller starts one server peer and one client peer for every
 sample. Peers exercise the selected stack through its public language API; the
@@ -17,48 +17,69 @@ trevrpc-bench-peer-<language> client [options]
 Standard output is reserved for newline-delimited JSON protocol events. Peers
 write diagnostics to standard error and flush every event before continuing.
 Configuration is supplied as command-line arguments so peers do not need a
-general-purpose JSON parser. Standard input carries only the ASCII commands
-`START` and `SHUTDOWN`.
+general-purpose JSON parser. Standard input carries the ASCII commands
+`CONNECT HOST:PORT`, `START`, and `SHUTDOWN` at the phases described below.
 
-All events contain `schema_version: 3`, `event`, and `peer`. Counters and
+All events contain `schema_version: 4`, `event`, and `peer`. Counters and
 nanosecond values are decimal JSON strings so JavaScript can represent them
 without loss.
 
-V3 has no compatibility mode for earlier protocol versions. Campaign cells must select one of the closed
-stack values `trevrpc_native_quic` or `grpc_http2`, peers must advertise that
-stack, and both server and client commands receive it through `--stack`.
+V4 has no compatibility mode for earlier protocol versions. Campaign cells
+select one of the closed stack values `trevrpc_native_quic`,
+`trevrpc_webtransport`, or `grpc_http2`. Both server and client commands receive
+the selected value through `--stack`.
+
+The controller starts every peer as a new session and process-group leader.
+Peer subprocesses must remain in that process group. Metrics and forced cleanup
+cover the complete group, including Chromium and its helper processes.
 
 ## Capabilities
 
-`capabilities` prints one event and exits successfully:
+`capabilities` prints one event and exits successfully. Stack capabilities are
+scoped to each role: advertising a stack for one role does not advertise it for
+the other role. RPC kinds and the client histogram format remain event-wide.
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "event": "capabilities",
   "peer": "rust",
-  "roles": ["client", "server"],
+  "roles": {
+    "client": ["trevrpc_native_quic", "grpc_http2"],
+    "server": ["trevrpc_native_quic", "trevrpc_webtransport", "grpc_http2"]
+  },
   "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
-  "stacks": ["trevrpc_native_quic", "grpc_http2"],
   "histogram": "log_linear_v1"
 }
 ```
 
+A Chromium-only peer therefore advertises only
+`"roles":{"client":["trevrpc_webtransport"]}`, while a peer that only serves
+WebTransport advertises `trevrpc_webtransport` only under `roles.server`.
+
 ## Server
 
-Required arguments:
+Required arguments for every stack:
 
 ```text
---stack trevrpc_native_quic|grpc_http2
+--stack trevrpc_native_quic|trevrpc_webtransport|grpc_http2
 --listen HOST:PORT --cert FILE --key FILE
 ```
 
+For `trevrpc_webtransport`, the controller also supplies the origin emitted by
+the prepared client:
+
+```text
+--webtransport-origin http://HOST:PORT
+```
+
+The server must allow that exact browser origin for WebTransport admission.
 `PORT` may be zero. The controller may place the peer in an isolated network
 namespace and supply a non-loopback literal IP. Once the listener can accept
 RPCs, the peer prints:
 
 ```json
-{ "schema_version": 3, "event": "ready", "peer": "rust", "address": "127.0.0.1:43117", "pid": 1234 }
+{ "schema_version": 4, "event": "ready", "peer": "rust", "address": "127.0.0.1:43117", "pid": 1234 }
 ```
 
 The server continues until it reads `SHUTDOWN` or receives a termination
@@ -66,12 +87,11 @@ signal. A graceful protocol shutdown prints a `stopped` event before exiting.
 
 ## Client
 
-Required arguments:
+Required arguments for every stack:
 
 ```text
---address HOST:PORT
 --cert FILE
---stack trevrpc_native_quic|grpc_http2
+--stack trevrpc_native_quic|trevrpc_webtransport|grpc_http2
 --rpc unary|client_stream|server_stream|bidi
 --concurrency N
 --warmup-ms N
@@ -81,19 +101,41 @@ Required arguments:
 --messages-per-stream N
 ```
 
-Campaigns are limited to concurrency 1,024, request and response
-payloads of 64 MiB each, and 1,000,000 application messages per streaming RPC.
-Peers reject wire requests outside the payload and stream-message limits before
-allocating responses.
+Native QUIC and gRPC clients also receive `--address HOST:PORT` at startup.
+Their `--cert` file is the campaign CA. Their startup behavior is unchanged:
+connect, validate one RPC, warm up, create all lanes, and emit `armed`.
 
-The client establishes one verified connection, validates one RPC, runs the
-untimed warmup, creates all workload lanes, then prints:
+A WebTransport client starts before its RPC server and does not receive
+`--address`. Its `--cert` file is the exact `server.pem` leaf certificate, which
+the Chromium peer uses to configure trust for the generated server identity.
+After its HTTPS browser page and Chromium process are ready, it emits:
 
 ```json
-{ "schema_version": 3, "event": "armed", "peer": "rust", "pid": 1235 }
+{
+  "schema_version": 4,
+  "event": "prepared",
+  "peer": "chromium",
+  "origin": "http://127.0.0.1:4443",
+  "pid": 1235
+}
 ```
 
-It does not begin measured work until it reads `START`. The measurement uses a
+The controller starts the server with that origin, waits for `ready`, and sends
+the WebTransport client:
+
+```text
+CONNECT 127.0.0.1:43117
+```
+
+The client then creates and verifies its WebTransport session, validates one
+RPC, runs untimed warmup, creates all workload lanes, and emits the same event
+used by native clients:
+
+```json
+{ "schema_version": 4, "event": "armed", "peer": "chromium", "pid": 1235 }
+```
+
+Every client waits for `START` before measured work. The measurement uses a
 fixed admission window. Operations admitted before the deadline may drain
 after it; no operation may begin after the deadline.
 
@@ -101,7 +143,7 @@ The client prints one `sample` event after drain:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "event": "sample",
   "peer": "rust",
   "rpc_kind": "unary",
@@ -119,6 +161,11 @@ The client prints one `sample` event after drain:
 The histogram count must equal `completed`. Throughput and quantiles are not
 peer fields; the controller derives them from the configured admission window
 and histogram.
+
+Campaigns are limited to concurrency 1,024, request and response payloads of
+64 MiB each, and 1,000,000 application messages per streaming RPC. Peers reject
+wire requests outside the payload and stream-message limits before allocating
+responses.
 
 ## Workload semantics
 
@@ -159,7 +206,7 @@ A fatal peer error is written as an event when stdout remains usable:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "event": "error",
   "peer": "rust",
   "phase": "measure",
@@ -169,5 +216,6 @@ A fatal peer error is written as an event when stdout remains usable:
 ```
 
 Any peer exit, malformed event, failed operation, histogram/count mismatch,
-timeout, or configuration mismatch invalidates the sample. Raw stdout and
-stderr are retained in the campaign artifact directory.
+timeout, or configuration mismatch invalidates the sample. The controller
+kills the full peer process group on failure. Raw stdout and stderr are retained
+in the campaign artifact directory.

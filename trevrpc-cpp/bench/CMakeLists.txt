@@ -61,7 +61,7 @@ if(TREVRPC_CPP_BUILD_TESTS)
   add_test(NAME trevrpc_cpp_benchmark_capabilities COMMAND trevrpc_cpp_bench_peer capabilities)
   set_tests_properties(trevrpc_cpp_benchmark_capabilities PROPERTIES
     PASS_REGULAR_EXPRESSION
-      "schema_version.:3.*stacks.*trevrpc_native_quic.*grpc_http2")
+      "schema_version.:4.*roles.*client.*trevrpc_native_quic.*grpc_http2.*server.*trevrpc_native_quic.*grpc_http2.*trevrpc_webtransport.*rpc_kinds.*unary.*client_stream.*server_stream.*bidi.*histogram.*log_linear_v1")
 
   add_test(NAME trevrpc_cpp_benchmark_server_requires_stack
     COMMAND "${CMAKE_COMMAND}"
@@ -73,6 +73,10 @@ if(TREVRPC_CPP_BUILD_TESTS)
       -DPEER=$<TARGET_FILE:trevrpc_cpp_bench_peer>
       -DROLE=client
       -P "${CMAKE_CURRENT_SOURCE_DIR}/requires-stack-test.cmake")
+  add_test(NAME trevrpc_cpp_benchmark_webtransport_config
+    COMMAND "${CMAKE_COMMAND}"
+      -DPEER=$<TARGET_FILE:trevrpc_cpp_bench_peer>
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/webtransport-config-test.cmake")
 
   find_program(trevrpc_cpp_benchmark_openssl openssl REQUIRED)
   set(trevrpc_cpp_benchmark_test_cert "${CMAKE_CURRENT_BINARY_DIR}/grpc-test-cert.pem")
@@ -91,6 +95,20 @@ if(TREVRPC_CPP_BUILD_TESTS)
     VERBATIM)
   add_custom_target(trevrpc_cpp_benchmark_test_certificates
     DEPENDS "${trevrpc_cpp_benchmark_test_cert}" "${trevrpc_cpp_benchmark_test_key}")
+
+  add_executable(trevrpc_cpp_webtransport_probe webtransport_probe.cpp)
+  target_link_libraries(trevrpc_cpp_webtransport_probe PRIVATE ${trevrpc_cpp_c_target})
+  trevrpc_cpp_warnings(trevrpc_cpp_webtransport_probe)
+  trevrpc_cpp_sanitizers(trevrpc_cpp_webtransport_probe)
+
+  add_test(NAME trevrpc_cpp_benchmark_webtransport_smoke
+    COMMAND sh
+      "${CMAKE_CURRENT_SOURCE_DIR}/webtransport-smoke-test.sh"
+      "$<TARGET_FILE:trevrpc_cpp_bench_peer>"
+      "$<TARGET_FILE:trevrpc_cpp_webtransport_probe>"
+      "${trevrpc_cpp_benchmark_test_cert}"
+      "${trevrpc_cpp_benchmark_test_key}")
+  set_tests_properties(trevrpc_cpp_benchmark_webtransport_smoke PROPERTIES TIMEOUT 30)
 
   add_executable(trevrpc_cpp_grpc_adapter_test grpc_adapter_test.cpp)
   add_dependencies(trevrpc_cpp_grpc_adapter_test trevrpc_cpp_benchmark_test_certificates)

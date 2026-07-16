@@ -1,19 +1,8 @@
 # TrevRPC Kotlin examples
 
-`trevrpc-xruntime-kotlin` is the installed JVM executable. It serves the generated Greeter API over native QUIC, HTTP/3, and WebTransport on one UDP listener, or exercises another runtime as a client.
-
-```shell
-./gradlew :examples:installDist
-examples/build/install/trevrpc-xruntime-kotlin/bin/trevrpc-xruntime-kotlin \
-  -mode server -addr 127.0.0.1:0 -cert /tmp/trevrpc-kotlin.pem -token cross-runtime-token
-```
-
-Client modes are `client` and `lifecycle-client`. Select `-transport native` (the default) or `-transport http3`; `-iterations` repeats the complete operation. `browser-server` adds the browser lifecycle routes and emits `READY https://<address>/trevrpc`. Browser admission can be set with `-browser-origin` and `-browser-authority`, or `TREVRPC_EXAMPLE_ORIGIN` and `TREVRPC_EXAMPLE_AUTHORITIES` (comma separated). `-max-streams` or `TREVRPC_EXAMPLE_MAX_STREAMS` configures the per-connection limit used by lifecycle tests. Without overrides, only `http://localhost:8080`, `http://127.0.0.1:8080`, and loopback authorities on the bound port are admitted.
-
-The cross-runtime executable uses the advanced single-connection Netty transports so each harness
-iteration has a deterministic connection lifetime. It does not send the Go harness's malformed
-initial frame because the raw RPC transports intentionally do not expose arbitrary QUIC stream
-writes. `GreeterServiceTest` separately verifies malformed request decoding.
+This module is a compile-tested consumer of the Kotlin generator and runtime. `GreeterExample.kt`
+implements and exercises unary, client-streaming, server-streaming, and bidirectional-streaming
+methods. `GreeterServiceTest` verifies those methods, authorization, and malformed request decoding.
 
 ## Protobuf generation
 
@@ -56,7 +45,7 @@ class PlayServicesCronetProvider : CronetEngineProvider {
 val engine = provider.create(applicationContext)
 val executor = Executors.newSingleThreadExecutor()
 val channel = CronetRpcChannel.create(engine, "https://localhost:7443", executor)
-val client = GreeterClient(channel, authenticatedOptions("cross-runtime-token"))
+val client = GreeterClient(channel, authenticatedOptions("example-token"))
 ```
 
 `channel.close()` prevents future TrevRPC calls but does not shut down the injected engine or

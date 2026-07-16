@@ -8,9 +8,14 @@
     "trevrpc-bench-peer-js": "./trevrpc-bench-peer.js"
   },
   "files": [
+    "common.js",
     "trevrpc-bench-peer.js"
   ],
   "type": "module",
+  "exports": {
+    ".": "./trevrpc-bench-peer.js",
+    "./common": "./common.js"
+  },
   "scripts": {
     "test": "node --test test/benchmark-peer.test.js"
   },

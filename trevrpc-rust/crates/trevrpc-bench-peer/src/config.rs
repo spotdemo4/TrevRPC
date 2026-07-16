@@ -48,6 +48,7 @@ impl FromStr for RpcKind {
 pub(crate) enum Stack {
     TrevrpcNativeQuic,
     GrpcHttp2,
+    TrevrpcWebTransport,
 }
 
 impl FromStr for Stack {
@@ -57,8 +58,9 @@ impl FromStr for Stack {
         match value {
             "trevrpc_native_quic" => Ok(Self::TrevrpcNativeQuic),
             "grpc_http2" => Ok(Self::GrpcHttp2),
+            "trevrpc_webtransport" => Ok(Self::TrevrpcWebTransport),
             _ => Err(ConfigError(format!(
-                "invalid --stack value {value:?}; expected trevrpc_native_quic or grpc_http2"
+                "invalid --stack value {value:?}; expected trevrpc_native_quic, grpc_http2, or trevrpc_webtransport"
             ))),
         }
     }
@@ -77,6 +79,7 @@ pub(crate) struct ServerConfig {
     pub(crate) listen: SocketAddr,
     pub(crate) certificate: PathBuf,
     pub(crate) private_key: PathBuf,
+    pub(crate) webtransport_origin: Option<String>,
 }
 
 #[derive(Debug)]
@@ -148,11 +151,29 @@ fn parse_options(
 }
 
 fn parse_server(mut options: BTreeMap<String, String>) -> Result<ServerConfig, ConfigError> {
+    let stack = take_parsed(&mut options, "--stack")?;
+    let webtransport_origin = if stack == Stack::TrevrpcWebTransport {
+        let origin = take(&mut options, "--webtransport-origin")?;
+        if origin.is_empty() {
+            return Err(ConfigError(
+                "--webtransport-origin must not be empty".to_owned(),
+            ));
+        }
+        Some(origin)
+    } else {
+        if options.contains_key("--webtransport-origin") {
+            return Err(ConfigError(
+                "--webtransport-origin is only valid with trevrpc_webtransport".to_owned(),
+            ));
+        }
+        None
+    };
     let config = ServerConfig {
-        stack: take_parsed(&mut options, "--stack")?,
+        stack,
         listen: take_parsed(&mut options, "--listen")?,
         certificate: PathBuf::from(take(&mut options, "--cert")?),
         private_key: PathBuf::from(take(&mut options, "--key")?),
+        webtransport_origin,
     };
     reject_unknown(&options)?;
     Ok(config)
@@ -172,6 +193,11 @@ fn parse_client(mut options: BTreeMap<String, String>) -> Result<ClientConfig, C
         messages_per_stream: take_positive(&mut options, "--messages-per-stream")?,
     };
     reject_unknown(&options)?;
+    if config.stack == Stack::TrevrpcWebTransport {
+        return Err(ConfigError(
+            "trevrpc_webtransport is a server-only stack".to_owned(),
+        ));
+    }
     if config.concurrency > MAX_BENCHMARK_CONCURRENCY {
         return Err(ConfigError(format!(
             "--concurrency must not exceed {MAX_BENCHMARK_CONCURRENCY}"
@@ -332,6 +358,79 @@ mod tests {
             "client",
             "--address",
             "127.0.0.1:1",
+            "--cert",
+            "ca.pem",
+            "--rpc",
+            "unary",
+            "--concurrency",
+            "1",
+            "--warmup-ms",
+            "0",
+            "--measurement-ms",
+            "1",
+            "--request-bytes",
+            "0",
+            "--response-bytes",
+            "0",
+            "--messages-per-stream",
+            "1",
+        ];
+        assert!(parse(client.map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn webtransport_is_server_only_and_requires_origin() {
+        let server = [
+            "server",
+            "--stack",
+            "trevrpc_webtransport",
+            "--listen",
+            "127.0.0.1:0",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+        ];
+        assert!(parse(server.map(str::to_owned)).is_err());
+
+        let mut empty_origin = server.to_vec();
+        empty_origin.extend(["--webtransport-origin", ""]);
+        assert!(parse(empty_origin.into_iter().map(str::to_owned)).is_err());
+
+        let mut with_origin = server.to_vec();
+        with_origin.extend(["--webtransport-origin", "https://benchmark.example"]);
+        let Command::Server(config) = parse(with_origin.into_iter().map(str::to_owned))
+            .expect("WebTransport server configuration should parse")
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(config.stack, Stack::TrevrpcWebTransport);
+        assert_eq!(
+            config.webtransport_origin.as_deref(),
+            Some("https://benchmark.example")
+        );
+
+        let native_with_origin = [
+            "server",
+            "--stack",
+            "trevrpc_native_quic",
+            "--listen",
+            "127.0.0.1:0",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+            "--webtransport-origin",
+            "https://benchmark.example",
+        ];
+        assert!(parse(native_with_origin.map(str::to_owned)).is_err());
+
+        let client = [
+            "client",
+            "--stack",
+            "trevrpc_webtransport",
+            "--address",
+            "127.0.0.1:1234",
             "--cert",
             "ca.pem",
             "--rpc",

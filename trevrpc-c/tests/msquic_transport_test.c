@@ -418,6 +418,24 @@ static int connect_pair(
     return connect_pair_with_config(&test_config, out_listener, out_client, out_server);
 }
 
+static int test_webtransport_transport_requirements_are_negotiated(void) {
+    int result = 1;
+    trevrpc_msquic_listener* listener = NULL;
+    trevrpc_msquic_conn* client = NULL;
+    trevrpc_msquic_conn* server = NULL;
+
+    CHECK_GOTO(connect_pair_with_config(&test_h3_config, &listener, &client, &server) == 0);
+    CHECK_GOTO(trevrpc_msquic_test_reliable_reset_negotiated(client));
+    CHECK_GOTO(trevrpc_msquic_test_reliable_reset_negotiated(server));
+    result = 0;
+
+cleanup:
+    trevrpc_msquic_conn_close(server);
+    trevrpc_msquic_conn_close(client);
+    trevrpc_msquic_listener_close(listener);
+    return result;
+}
+
 static int test_listener_shutdown_is_concurrent_and_idempotent(void) {
     enum { shutdown_thread_count = 16 };
     int result = 1;
@@ -2652,6 +2670,7 @@ static int test_http3_post_data_adapter_and_request_local_rejection(void) {
     trevrpc_msquic_conn* server_conn = NULL;
     trevrpc_msquic_stream* server_control = NULL;
     trevrpc_msquic_stream* client_control = NULL;
+    trevrpc_msquic_stream* client_qpack_encoder = NULL;
     trevrpc_msquic_stream* rejected_stream = NULL;
     trevrpc_msquic_stream* media_stream = NULL;
     trevrpc_msquic_stream* duplicate_media_stream = NULL;
@@ -2715,6 +2734,11 @@ static int test_http3_post_data_adapter_and_request_local_rejection(void) {
     server_conn = NULL;
     CHECK_EQ_GOTO(accept_args.result, 0);
     CHECK_GOTO(accept_args.h3_conn != NULL);
+
+    const uint8_t qpack_zero_capacity[] = {0x02, 0x20};
+    CHECK_GOTO(trevrpc_msquic_conn_open_uni_stream(client_conn, &client_qpack_encoder) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write(client_qpack_encoder, qpack_zero_capacity, sizeof(qpack_zero_capacity)),
+        (int)sizeof(qpack_zero_capacity));
 
     CHECK_GOTO(test_build_post_headers_with_extra(field_headers, sizeof(field_headers), &field_headers_len, 3821) == 0);
     CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &exact_client_stream) == 0);
@@ -2939,6 +2963,7 @@ cleanup:
     trevrpc_msquic_stream_close(exact_client_stream);
     trevrpc_msquic_stream_close(oversized_client_stream);
     trevrpc_msquic_stream_close(client_control);
+    trevrpc_msquic_stream_close(client_qpack_encoder);
     trevrpc_msquic_stream_close(server_control);
     trevrpc_h3_conn_close(accept_args.h3_conn);
     trevrpc_msquic_conn_close(server_conn);
@@ -3143,6 +3168,9 @@ int main(void) {
         goto cleanup;
     }
     if (test_client_close_unblocks_server_accept_stream() != 0) {
+        goto cleanup;
+    }
+    if (test_webtransport_transport_requirements_are_negotiated() != 0) {
         goto cleanup;
     }
     if (test_webtransport_connects_h3_quic_session() != 0) {

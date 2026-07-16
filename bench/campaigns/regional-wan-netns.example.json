@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "campaign_id": "regional-wan-netns-stack-comparison",
   "repetitions": 3,
   "peers": [

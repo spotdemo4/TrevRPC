@@ -152,8 +152,6 @@
 
         # nix run [#...]
         apps = pkgs.mkApps {
-          browser-webtransport-soak = "nix develop -c bash -c 'npm --prefix trevrpc-js ci && npm --prefix trevrpc-js run test:browser:soak'";
-          cross-runtime-lifecycle-stress = "nix develop -c bash -c 'mkdir -p target && go build -C trevrpc-go -o ../target/trevrpc-xruntime-go ./cmd/trevrpc-xruntime-go && TREVRPC_XRUNTIME_GO=$PWD/target/trevrpc-xruntime-go cargo test --manifest-path trevrpc-rust/Cargo.toml --test cross_runtime -- --ignored cross_runtime_lifecycle_stress --nocapture'";
           update-kotlin-deps = {
             packages = [ pkgs.oxfmt ];
             script = ''
@@ -188,6 +186,11 @@
               trevrpcC = c;
             };
             jsBenchPeer = js.override { benchPeer = true; };
+            chromiumBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
+              repoRoot = ./.;
+              trevrpcJs = js;
+              trevrpcJsBenchPeer = jsBenchPeer;
+            };
             kotlin = pkgs.callPackage ./trevrpc-kotlin {
               repoRoot = ./.;
             };
@@ -207,6 +210,7 @@
             trevrpc-go-bench-peer = goBenchPeer;
             trevrpc-js = js;
             trevrpc-js-bench-peer = jsBenchPeer;
+            trevrpc-chromium-bench-peer = chromiumBenchPeer;
             trevrpc-kotlin = kotlin;
             trevrpc-kotlin-bench-peer = kotlinBenchPeer;
             trevrpc-rust = rust;
@@ -220,6 +224,7 @@
                 cppBenchPeer
                 goBenchPeer
                 jsBenchPeer
+                chromiumBenchPeer
                 kotlinBenchPeer
                 rustBenchPeer
               ];
@@ -320,27 +325,61 @@
                 touch $out
               '';
 
+          benchmark-cross-language-smoke =
+            pkgs.runCommand "trevrpc-benchmark-cross-language-smoke"
+              {
+                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
+              }
+              ''
+                trevrpc-bench run ${./bench/campaigns/cross-language-smoke.example.json} --out run
+                test "$(wc -l < run/samples.jsonl)" -eq 44
+                test -s run/aggregate.csv
+                test -s run/report.md
+                test -s run/report.html
+                touch $out
+              '';
+
+          benchmark-webtransport-smoke =
+            pkgs.runCommand "trevrpc-benchmark-webtransport-smoke"
+              {
+                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
+              }
+              ''
+                export HOME=$(mktemp -d)
+                trevrpc-bench run ${./bench/campaigns/webtransport-smoke.example.json} --out run
+                test "$(wc -l < run/samples.jsonl)" -eq 24
+                test -s run/aggregate.csv
+                test -s run/report.md
+                test -s run/report.html
+                touch $out
+              '';
+
           benchmark-peer-capabilities =
             let
               c = self.packages.${system}.trevrpc-c-bench-peer;
               cpp = self.packages.${system}.trevrpc-cpp-bench-peer;
               go = self.packages.${system}.trevrpc-go-bench-peer;
               js = self.packages.${system}.trevrpc-js-bench-peer;
+              chromium = self.packages.${system}.trevrpc-chromium-bench-peer;
               kotlin = self.packages.${system}.trevrpc-kotlin-bench-peer;
               rust = self.packages.${system}.trevrpc-rust-bench-peer;
             in
             pkgs.runCommand "trevrpc-benchmark-peer-capabilities-check" { nativeBuildInputs = [ pkgs.jq ]; } ''
-              check_capabilities() {
-                test "$($1 capabilities | jq -r .schema_version)" = 3
+              check_native_capabilities() {
+                test "$($1 capabilities | jq -r .schema_version)" = 4
                 test "$($1 capabilities | jq -r .peer)" = "$2"
-                test "$($1 capabilities | jq -c .stacks)" = '["trevrpc_native_quic","grpc_http2"]'
+                test "$($1 capabilities | jq -c '.roles.client | sort')" = '["grpc_http2","trevrpc_native_quic"]'
+                test "$($1 capabilities | jq -c '.roles.server | sort')" = '["grpc_http2","trevrpc_native_quic","trevrpc_webtransport"]'
               }
-              check_capabilities ${c}/bin/trevrpc-bench-peer-c c
-              check_capabilities ${cpp}/bin/trevrpc-bench-peer-cpp cpp
-              check_capabilities ${go}/bin/trevrpc-bench-peer-go go
-              check_capabilities ${js}/bin/trevrpc-bench-peer-js js
-              check_capabilities ${kotlin}/bin/trevrpc-bench-peer-kotlin kotlin
-              check_capabilities ${rust}/bin/trevrpc-bench-peer-rust rust
+              check_native_capabilities ${c}/bin/trevrpc-bench-peer-c c
+              check_native_capabilities ${cpp}/bin/trevrpc-bench-peer-cpp cpp
+              check_native_capabilities ${go}/bin/trevrpc-bench-peer-go go
+              check_native_capabilities ${js}/bin/trevrpc-bench-peer-js js
+              check_native_capabilities ${kotlin}/bin/trevrpc-bench-peer-kotlin kotlin
+              check_native_capabilities ${rust}/bin/trevrpc-bench-peer-rust rust
+              test "$(${chromium}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .schema_version)" = 4
+              test "$(${chromium}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .peer)" = chromium
+              test "$(${chromium}/bin/trevrpc-bench-peer-chromium capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
               touch $out
             '';
 
@@ -370,139 +409,6 @@
               fi
               mkdir -p $out
             '';
-
-          cross-runtime =
-            let
-              crossRuntimeGo = pkgs.buildGoModule (final: {
-                pname = "trevrpc-cross-runtime-go";
-                version = "0.1.0";
-
-                src = ./trevrpc-go;
-                env.GOWORK = "off";
-                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
-                subPackages = [ "cmd/trevrpc-xruntime-go" ];
-
-                meta.mainProgram = "trevrpc-xruntime-go";
-              });
-            in
-            self.packages.${system}.trevrpc-rust.overrideAttrs {
-              dontBuild = true;
-              doInstallCheck = false;
-              TREVRPC_XRUNTIME_GO = "${crossRuntimeGo}/bin/trevrpc-xruntime-go";
-              TREVRPC_XRUNTIME_KOTLIN = "${self.packages.${system}.trevrpc-kotlin}/bin/trevrpc-xruntime-kotlin";
-              checkPhase = ''
-                cargo test --test cross_runtime --offline -- --nocapture --test-threads=1
-              '';
-              installPhase = ''
-                touch $out
-              '';
-            };
-
-          browser-webtransport =
-            let
-              browserGoServer = pkgs.buildGoModule (final: {
-                pname = "trevrpc-browser-go-server";
-                version = "0.1.0";
-
-                src = ./trevrpc-go;
-                env.GOWORK = "off";
-                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
-                subPackages = [ "examples/greeter_server" ];
-
-                meta.mainProgram = "greeter_server";
-              });
-              browserLifecycleGoServer = pkgs.buildGoModule (final: {
-                pname = "trevrpc-browser-lifecycle-go-server";
-                version = "0.1.0";
-
-                src = ./trevrpc-go;
-                env.GOWORK = "off";
-                vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
-                subPackages = [ "cmd/trevrpc-browser-lifecycle-go" ];
-
-                meta.mainProgram = "trevrpc-browser-lifecycle-go";
-              });
-              browserLifecycleRustServer = pkgs.rustPlatform.buildRustPackage (final: {
-                pname = "trevrpc-browser-lifecycle-rust-server";
-                version = "0.1.0";
-
-                src = pkgs.lib.fileset.toSource {
-                  root = ./.;
-                  fileset = pkgs.lib.fileset.unions [
-                    ./testdata/wire-golden-vectors.txt
-                    ./trevrpc-rust
-                  ];
-                };
-                sourceRoot = "${final.src.name}/trevrpc-rust";
-                cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
-                cargoBuildFlags = [
-                  "--example"
-                  "browser_lifecycle_server"
-                ];
-                doCheck = false;
-
-                installPhase = ''
-                  runHook preInstall
-                  server=$(find target -path '*/release/examples/browser_lifecycle_server' -type f -perm -0100 | head -n1)
-                  install -Dm755 "$server" $out/bin/trevrpc-browser-lifecycle-rust
-                  runHook postInstall
-                '';
-
-                meta.mainProgram = "trevrpc-browser-lifecycle-rust";
-              });
-              browserRustServer = pkgs.rustPlatform.buildRustPackage (final: {
-                pname = "trevrpc-browser-rust-server";
-                version = "0.1.0";
-
-                src = pkgs.lib.fileset.toSource {
-                  root = ./.;
-                  fileset = pkgs.lib.fileset.unions [
-                    ./testdata/wire-golden-vectors.txt
-                    ./trevrpc-rust
-                  ];
-                };
-                sourceRoot = "${final.src.name}/trevrpc-rust";
-                cargoLock.lockFile = ./trevrpc-rust/Cargo.lock;
-                cargoBuildFlags = [
-                  "--example"
-                  "greeter_server"
-                ];
-                doCheck = false;
-
-                installPhase = ''
-                  runHook preInstall
-                  server=$(find target -path '*/release/examples/greeter_server' -type f -perm -0100 | head -n1)
-                  install -Dm755 "$server" $out/bin/greeter_server
-                  runHook postInstall
-                '';
-
-                meta.mainProgram = "greeter_server";
-              });
-            in
-            self.packages.${system}.trevrpc-js.overrideAttrs {
-              dontBuild = true;
-              doInstallCheck = false;
-              PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
-              TREVRPC_BROWSER = "chromium";
-              TREVRPC_BROWSER_GO_SERVER = "${browserGoServer}/bin/greeter_server";
-              TREVRPC_BROWSER_LIFECYCLE_GO_SERVER = "${browserLifecycleGoServer}/bin/trevrpc-browser-lifecycle-go";
-              TREVRPC_BROWSER_LIFECYCLE_RUST_SERVER = "${browserLifecycleRustServer}/bin/trevrpc-browser-lifecycle-rust";
-              TREVRPC_BROWSER_LIFECYCLE_KOTLIN_SERVER = "${
-                self.packages.${system}.trevrpc-kotlin
-              }/bin/trevrpc-xruntime-kotlin";
-              TREVRPC_BROWSER_RUST_SERVER = "${browserRustServer}/bin/greeter_server";
-              checkPhase = ''
-                export HOME=$(mktemp -d)
-                for chromium in ${pkgs.playwright-driver.browsers}/chromium-*/chrome-linux*/chrome; do
-                  export TREVRPC_BROWSER_CHROMIUM="$chromium"
-                  break
-                done
-                npm run test:browser
-              '';
-              installPhase = ''
-                touch $out
-              '';
-            };
 
           nix = {
             root = ./.;

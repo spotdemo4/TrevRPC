@@ -19,7 +19,7 @@ rustPlatform.buildRustPackage (
         ./Cargo.lock
         ./Cargo.toml
         ./campaigns
-        ./peer-protocol-v3.md
+        ./peer-protocol-v4.md
         ./proto
         ./src
       ];

@@ -360,7 +360,7 @@ fn write_markdown(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxEr
             aggregate.server_peak_rss() as f64 / 1024.0 / 1024.0,
         )?;
     }
-    output.push_str("\nLatency is complete bounded-RPC latency under closed-loop load. Throughput uses the fixed admission window; connection setup and warmup are excluded. CPU and RSS cover the direct peer processes and are sampled externally through procfs.\n");
+    output.push_str("\nLatency is complete bounded-RPC latency under closed-loop load. Throughput uses the fixed admission window; connection setup and warmup are excluded. CPU and RSS cover complete peer process groups and are sampled externally through procfs.\n");
     fs::write(path, output)?;
     Ok(())
 }

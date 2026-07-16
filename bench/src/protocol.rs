@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,10 +18,16 @@ pub struct Capabilities {
     pub schema_version: u32,
     pub event: String,
     pub peer: String,
-    pub roles: Vec<String>,
     pub rpc_kinds: Vec<String>,
-    pub stacks: Vec<Stack>,
+    pub roles: BTreeMap<Role, Vec<Stack>>,
     pub histogram: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Client,
+    Server,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -30,6 +36,15 @@ pub struct Ready {
     pub event: String,
     pub peer: String,
     pub address: String,
+    pub pid: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Prepared {
+    pub schema_version: u32,
+    pub event: String,
+    pub peer: String,
+    pub origin: String,
     pub pid: u32,
 }
 
@@ -88,9 +103,8 @@ impl Capabilities {
     pub fn validate(
         &self,
         expected_peer: &str,
-        required_roles: &[&str],
+        required_roles: &BTreeMap<Role, BTreeSet<Stack>>,
         required_rpc_kinds: &[RpcKind],
-        required_stacks: &[Stack],
     ) -> Result<(), BoxError> {
         validate_event(
             self.schema_version,
@@ -99,27 +113,8 @@ impl Capabilities {
             &self.peer,
             expected_peer,
         )?;
-        let roles = self
-            .roles
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        for role in required_roles {
-            if !roles.contains(role) {
-                return Err(format!("peer {expected_peer} does not support role {role}").into());
-            }
-        }
-        if self.histogram != "log_linear_v1" {
+        if required_roles.contains_key(&Role::Client) && self.histogram != "log_linear_v1" {
             return Err(format!("peer {expected_peer} lacks the required histogram").into());
-        }
-        for stack in required_stacks {
-            if !self.stacks.contains(stack) {
-                return Err(format!(
-                    "peer {expected_peer} does not support stack {}",
-                    stack.as_str()
-                )
-                .into());
-            }
         }
         for kind in required_rpc_kinds {
             if !self.rpc_kinds.iter().any(|item| item == kind.as_str()) {
@@ -128,7 +123,35 @@ impl Capabilities {
                 );
             }
         }
+        for (role, required_stacks) in required_roles {
+            let stacks = self.roles.get(role).ok_or_else(|| {
+                format!(
+                    "peer {expected_peer} does not support role {}",
+                    role.as_str()
+                )
+            })?;
+            for stack in required_stacks {
+                if !stacks.contains(stack) {
+                    return Err(format!(
+                        "peer {expected_peer} role {} does not support stack {}",
+                        role.as_str(),
+                        stack.as_str()
+                    )
+                    .into());
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+impl Role {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
     }
 }
 
@@ -148,6 +171,34 @@ impl Ready {
         }
         Ok(())
     }
+}
+
+impl Prepared {
+    pub fn validate(&self, expected_peer: &str, expected_pid: u32) -> Result<(), BoxError> {
+        validate_event(
+            self.schema_version,
+            &self.event,
+            "prepared",
+            &self.peer,
+            expected_peer,
+        )?;
+        if !valid_origin(&self.origin) || self.pid != expected_pid {
+            return Err(
+                format!("peer {expected_peer} emitted inconsistent prepared metadata").into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn valid_origin(origin: &str) -> bool {
+    origin.split_once("://").is_some_and(|(scheme, authority)| {
+        matches!(scheme, "http" | "https")
+            && !authority.is_empty()
+            && !authority
+                .chars()
+                .any(|character| character.is_whitespace() || matches!(character, '/' | '?' | '#'))
+    })
 }
 
 impl Armed {
@@ -338,9 +389,11 @@ fn quantile(buckets: &[(u64, u64)], total: u64, numerator: u64, denominator: u64
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::{
-        Capabilities, HistogramBucket, expected_message_counts, histogram_quantiles,
-        validate_timing,
+        Capabilities, HistogramBucket, Prepared, Role, expected_message_counts,
+        histogram_quantiles, validate_timing,
     };
     use crate::SCHEMA_VERSION;
     use crate::campaign::{RpcKind, Stack};
@@ -350,11 +403,17 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             event: "capabilities".to_owned(),
             peer: "rust".to_owned(),
-            roles: vec!["client".to_owned(), "server".to_owned()],
             rpc_kinds: vec!["unary".to_owned()],
-            stacks,
+            roles: BTreeMap::from([(Role::Client, stacks.clone()), (Role::Server, stacks)]),
             histogram: "log_linear_v1".to_owned(),
         }
+    }
+
+    fn required(stacks: &[Stack]) -> BTreeMap<Role, BTreeSet<Stack>> {
+        BTreeMap::from([
+            (Role::Client, stacks.iter().copied().collect()),
+            (Role::Server, stacks.iter().copied().collect()),
+        ])
     }
 
     #[test]
@@ -362,24 +421,22 @@ mod tests {
         capabilities(vec![Stack::TrevrpcNativeQuic])
             .validate(
                 "rust",
-                &["client", "server"],
+                &required(&[Stack::TrevrpcNativeQuic]),
                 &[RpcKind::Unary],
-                &[Stack::TrevrpcNativeQuic],
             )
             .expect("matching capabilities");
     }
 
     #[test]
-    fn rejects_schema_v2_peer_events() {
+    fn rejects_schema_v3_peer_events() {
         let mut capabilities = capabilities(vec![Stack::TrevrpcNativeQuic]);
-        capabilities.schema_version = 2;
+        capabilities.schema_version = 3;
         assert!(
             capabilities
                 .validate(
                     "rust",
-                    &["client", "server"],
+                    &required(&[Stack::TrevrpcNativeQuic]),
                     &[RpcKind::Unary],
-                    &[Stack::TrevrpcNativeQuic],
                 )
                 .is_err()
         );
@@ -387,12 +444,9 @@ mod tests {
 
     #[test]
     fn rejects_missing_or_mismatched_required_stacks() {
-        let missing = capabilities(Vec::new()).validate(
-            "rust",
-            &["client"],
-            &[RpcKind::Unary],
-            &[Stack::TrevrpcNativeQuic],
-        );
+        let client_only =
+            BTreeMap::from([(Role::Client, BTreeSet::from([Stack::TrevrpcNativeQuic]))]);
+        let missing = capabilities(Vec::new()).validate("rust", &client_only, &[RpcKind::Unary]);
         assert!(
             missing
                 .unwrap_err()
@@ -400,12 +454,8 @@ mod tests {
                 .contains("trevrpc_native_quic")
         );
 
-        let mismatched = capabilities(vec![Stack::GrpcHttp2]).validate(
-            "rust",
-            &["client"],
-            &[RpcKind::Unary],
-            &[Stack::TrevrpcNativeQuic],
-        );
+        let mismatched =
+            capabilities(vec![Stack::GrpcHttp2]).validate("rust", &client_only, &[RpcKind::Unary]);
         assert!(
             mismatched
                 .unwrap_err()
@@ -415,17 +465,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_v1_transport_capabilities() {
+    fn validates_stacks_independently_for_each_role() {
+        let mut capabilities = capabilities(vec![Stack::GrpcHttp2]);
+        capabilities
+            .roles
+            .get_mut(&Role::Server)
+            .expect("server capabilities")
+            .clone_from(&vec![Stack::TrevrpcWebtransport]);
+        let required = BTreeMap::from([
+            (Role::Client, BTreeSet::from([Stack::GrpcHttp2])),
+            (Role::Server, BTreeSet::from([Stack::TrevrpcWebtransport])),
+        ]);
+        capabilities
+            .validate("rust", &required, &[RpcKind::Unary])
+            .expect("role-specific stacks");
+    }
+
+    #[test]
+    fn rejects_v3_global_capabilities() {
         let input = r#"{
             "schema_version": 3,
             "event": "capabilities",
             "peer": "rust",
             "roles": ["client", "server"],
             "rpc_kinds": ["unary"],
-            "transports": ["native_quic"],
+            "stacks": ["trevrpc_native_quic"],
             "histogram": "log_linear_v1"
         }"#;
         assert!(serde_json::from_str::<Capabilities>(input).is_err());
+    }
+
+    #[test]
+    fn validates_webtransport_prepared_metadata() {
+        let mut prepared = Prepared {
+            schema_version: SCHEMA_VERSION,
+            event: "prepared".to_owned(),
+            peer: "chromium".to_owned(),
+            origin: "http://127.0.0.1:43117".to_owned(),
+            pid: 1234,
+        };
+        prepared
+            .validate("chromium", 1234)
+            .expect("valid prepared event");
+        prepared.origin = "http://127.0.0.1:43117/path".to_owned();
+        assert!(prepared.validate("chromium", 1234).is_err());
     }
 
     #[test]

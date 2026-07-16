@@ -6,5 +6,5 @@ pub mod protocol;
 pub mod report;
 pub mod runner;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;

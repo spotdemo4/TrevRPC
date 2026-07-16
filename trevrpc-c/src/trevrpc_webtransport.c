@@ -46,6 +46,7 @@
 #define TREV_H3_MAX_UNKNOWN_FRAME_SIZE (16 * 1024 * 1024)
 #define TREV_H3_CONTENT_TYPE "application/trevrpc"
 #define TREV_H3_REQUEST_TIMEOUT_STATUS 408
+#define TREV_H3_QPACK_SET_CAPACITY_ZERO 0x20
 
 #define TREV_H3_ERR_QPACK_DECOMPRESSION_FAILED -3101
 #define TREV_H3_ERR_FRAME_UNEXPECTED -3102
@@ -2198,6 +2199,18 @@ static void* trevrpc_h3_unidi_monitor(void* context) {
     uint8_t ignored[1024];
     for (;;) {
         intptr_t n = trevrpc_msquic_stream_read(stream, ignored, sizeof(ignored));
+        if (n > 0 && stream_type == 0x02) {
+            bool valid = true;
+            for (intptr_t i = 0; i < n; i++) {
+                if (ignored[i] != TREV_H3_QPACK_SET_CAPACITY_ZERO) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid) {
+                continue;
+            }
+        }
         if (n > 0 && critical) {
             trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn,
                 stream_type == 0x02 ? TREV_H3_APP_QPACK_ENCODER_STREAM_ERROR : TREV_H3_APP_QPACK_DECODER_STREAM_ERROR);

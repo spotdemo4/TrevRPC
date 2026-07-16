@@ -50,6 +50,7 @@ pub struct Cell {
 #[serde(rename_all = "snake_case")]
 pub enum Stack {
     TrevrpcNativeQuic,
+    TrevrpcWebtransport,
     GrpcHttp2,
 }
 
@@ -58,6 +59,7 @@ impl Stack {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TrevrpcNativeQuic => "trevrpc_native_quic",
+            Self::TrevrpcWebtransport => "trevrpc_webtransport",
             Self::GrpcHttp2 => "grpc_http2",
         }
     }
@@ -352,9 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_schema_v2_campaigns() {
+    fn rejects_schema_v3_campaigns() {
         let mut campaign = campaign();
-        campaign.schema_version = 2;
+        campaign.schema_version = 3;
         assert!(campaign.validate().is_err());
     }
 
@@ -381,6 +383,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Stack::TrevrpcNativeQuic).unwrap(),
             "\"trevrpc_native_quic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Stack::TrevrpcWebtransport).unwrap(),
+            "\"trevrpc_webtransport\""
         );
         assert_eq!(Stack::GrpcHttp2.as_str(), "grpc_http2");
         assert!(serde_json::from_str::<Stack>("\"native_quic\"").is_err());
@@ -438,5 +444,25 @@ mod tests {
         let mut campaign = campaign();
         campaign.network.client_to_server.delay_ms = 1;
         assert!(campaign.validate().is_err());
+    }
+
+    #[test]
+    fn webtransport_smoke_has_six_servers_and_twenty_four_samples() {
+        let campaign: Campaign =
+            serde_json::from_str(include_str!("../campaigns/webtransport-smoke.example.json"))
+                .expect("WebTransport smoke campaign");
+        campaign.validate().expect("valid WebTransport campaign");
+        assert_eq!(campaign.cells.len(), 6);
+        assert!(
+            campaign
+                .cells
+                .iter()
+                .all(|cell| cell.client == "chromium" && cell.stack == Stack::TrevrpcWebtransport)
+        );
+        let sample_count = usize::try_from(campaign.repetitions).unwrap()
+            * campaign.cells.len()
+            * campaign.rpc_kinds.len()
+            * campaign.concurrencies.len();
+        assert_eq!(sample_count, 24);
     }
 }

@@ -3,6 +3,7 @@
 #include "benchmark.pb-c.h"
 #include "benchmark.trevrpc.h"
 #include "trevrpc_bench_peer.h"
+#include "trevrpc_msquic.h"
 #include "trevrpc_raw.h"
 
 #include <errno.h> // IWYU pragma: keep
@@ -19,6 +20,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#define BENCHMARK_SCHEMA_VERSION 4
+#define BENCHMARK_WEBTRANSPORT_PATH "/trevrpc"
 
 typedef Trevrpc__Benchmark__V1__BenchmarkRequest BenchmarkRequest;
 typedef Trevrpc__Benchmark__V1__BenchmarkResponse BenchmarkResponse;
@@ -202,11 +206,13 @@ static int flush_event(void) {
 }
 
 static int emit_capabilities(void) {
-    if (fputs("{\"schema_version\":3,\"event\":\"capabilities\",\"peer\":\"c\","
-              "\"roles\":[\"client\",\"server\"],"
-              "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
-              "\"stacks\":[\"trevrpc_native_quic\",\"grpc_http2\"],\"histogram\":\"log_linear_v1\"}",
-            stdout) == EOF) {
+    if (fprintf(stdout,
+            "{\"schema_version\":%d,\"event\":\"capabilities\",\"peer\":\"c\","
+            "\"roles\":{\"client\":[\"trevrpc_native_quic\",\"grpc_http2\"],"
+            "\"server\":[\"trevrpc_native_quic\",\"grpc_http2\",\"trevrpc_webtransport\"]},"
+            "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
+            "\"histogram\":\"log_linear_v1\"}",
+            BENCHMARK_SCHEMA_VERSION) < 0) {
         return -EIO;
     }
     return flush_event();
@@ -214,7 +220,9 @@ static int emit_capabilities(void) {
 
 static int emit_error(const char* phase, const char* code, const char* message) {
     fprintf(stderr, "%s: %s: %s\n", phase, code, message);
-    if (fputs("{\"schema_version\":3,\"event\":\"error\",\"peer\":\"c\",\"phase\":", stdout) == EOF ||
+    if (fprintf(
+            stdout, "{\"schema_version\":%d,\"event\":\"error\",\"peer\":\"c\",\"phase\":", BENCHMARK_SCHEMA_VERSION) <
+            0 ||
         write_json_string(stdout, phase) != 0 || fputs(",\"code\":", stdout) == EOF ||
         write_json_string(stdout, code) != 0 || fputs(",\"message\":", stdout) == EOF ||
         write_json_string(stdout, message) != 0 || fputc('}', stdout) == EOF) {
@@ -234,7 +242,9 @@ static int fail_with_error(const char* phase, const char* code, const char* form
 }
 
 static int emit_ready(const char* host, uint16_t port, const char* stack) {
-    if (fputs("{\"schema_version\":3,\"event\":\"ready\",\"peer\":\"c\",\"address\":", stdout) == EOF) {
+    if (fprintf(stdout,
+            "{\"schema_version\":%d,\"event\":\"ready\",\"peer\":\"c\",\"address\":",
+            BENCHMARK_SCHEMA_VERSION) < 0) {
         return -EIO;
     }
     char address[512];
@@ -249,7 +259,9 @@ static int emit_ready(const char* host, uint16_t port, const char* stack) {
 }
 
 static int emit_armed(const char* stack) {
-    if (fputs("{\"schema_version\":3,\"event\":\"armed\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+    if (fprintf(
+            stdout, "{\"schema_version\":%d,\"event\":\"armed\",\"peer\":\"c\",\"stack\":", BENCHMARK_SCHEMA_VERSION) <
+            0 ||
         write_json_string(stdout, stack) != 0 || fprintf(stdout, ",\"pid\":%ld}", (long)getpid()) < 0) {
         return -EIO;
     }
@@ -257,7 +269,9 @@ static int emit_armed(const char* stack) {
 }
 
 static int emit_stopped(const char* stack) {
-    if (fputs("{\"schema_version\":3,\"event\":\"stopped\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+    if (fprintf(stdout,
+            "{\"schema_version\":%d,\"event\":\"stopped\",\"peer\":\"c\",\"stack\":",
+            BENCHMARK_SCHEMA_VERSION) < 0 ||
         write_json_string(stdout, stack) != 0 || fputc('}', stdout) == EOF) {
         return -EIO;
     }
@@ -333,6 +347,8 @@ static int parse_stack(const char* value, benchmark_stack* stack, const char** s
         *stack = BENCHMARK_STACK_TREVRPC_NATIVE_QUIC;
     } else if (strcmp(value, "grpc_http2") == 0) {
         *stack = BENCHMARK_STACK_GRPC_HTTP2;
+    } else if (strcmp(value, "trevrpc_webtransport") == 0) {
+        *stack = BENCHMARK_STACK_TREVRPC_WEBTRANSPORT;
     } else {
         return -EINVAL;
     }
@@ -358,6 +374,8 @@ static int parse_server_options(int argc, char** argv, server_options* options, 
             err = set_once(&options->cert, argv[i + 1]);
         } else if (strcmp(argv[i], "--key") == 0) {
             err = set_once(&options->key, argv[i + 1]);
+        } else if (strcmp(argv[i], "--webtransport-origin") == 0) {
+            err = set_once(&options->webtransport_origin, argv[i + 1]);
         } else {
             snprintf(error, error_len, "unknown server option: %s", argv[i]);
             return -EINVAL;
@@ -373,6 +391,15 @@ static int parse_server_options(int argc, char** argv, server_options* options, 
     }
     if (parse_stack(stack, &options->stack, &options->stack_name) != 0) {
         snprintf(error, error_len, "invalid --stack value: %s", stack);
+        return -EINVAL;
+    }
+    if (options->stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
+        if (options->webtransport_origin == NULL || options->webtransport_origin[0] == '\0') {
+            snprintf(error, error_len, "trevrpc_webtransport server requires --webtransport-origin");
+            return -EINVAL;
+        }
+    } else if (options->webtransport_origin != NULL) {
+        snprintf(error, error_len, "--webtransport-origin is only valid for a trevrpc_webtransport server");
         return -EINVAL;
     }
     int err = split_address(listen, true, &options->host, &options->port);
@@ -452,6 +479,10 @@ static int parse_client_options(int argc, char** argv, client_options* options, 
     }
     if (parse_stack(stack, &options->stack, &options->stack_name) != 0) {
         snprintf(error, error_len, "invalid --stack value: %s", stack);
+        return -EINVAL;
+    }
+    if (options->stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
+        snprintf(error, error_len, "trevrpc_webtransport is server-only");
         return -EINVAL;
     }
     if (parse_rpc_kind(rpc, options) != 0) {
@@ -1238,7 +1269,9 @@ static int run_warmup(benchmark_client* client, const client_options* options) {
 
 static int emit_sample(const client_options* options, uint64_t elapsed_ns, const lane_result* result) {
     uint64_t drain_ns = elapsed_ns > options->measurement_ns ? elapsed_ns - options->measurement_ns : 0;
-    if (fputs("{\"schema_version\":3,\"event\":\"sample\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+    if (fprintf(
+            stdout, "{\"schema_version\":%d,\"event\":\"sample\",\"peer\":\"c\",\"stack\":", BENCHMARK_SCHEMA_VERSION) <
+            0 ||
         write_json_string(stdout, options->stack_name) != 0 || fputs(",\"rpc_kind\":", stdout) == EOF ||
         write_json_string(stdout, options->rpc_name) != 0 ||
         fprintf(stdout,
@@ -1423,6 +1456,10 @@ static int run_server(int argc, char** argv) {
     config.max_stateless_operations = BENCHMARK_SERVER_REQUESTS;
     config.max_binding_stateless_operations = BENCHMARK_SERVER_STREAMS;
     config.max_frame_size = BENCHMARK_MAX_FRAME_SIZE;
+    if (options.stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
+        config.webtransport_path = BENCHMARK_WEBTRANSPORT_PATH;
+        config.webtransport_origin = options.webtransport_origin;
+    }
     trevrpc_server* server = NULL;
     err = trevrpc_server_listen(&config, &server);
     if (err != 0) {
@@ -1492,6 +1529,9 @@ static int run_server(int argc, char** argv) {
     int join_err = thread_started ? pthread_join(thread, NULL) : 0;
     int serve_result = 0;
     (void)server_thread_done(&thread_args, &serve_result);
+    if (serve_result == TREV_MSQUIC_ERR_CLOSED) {
+        serve_result = 0;
+    }
     pthread_mutex_destroy(&thread_args.mutex);
     trevrpc_server_close(server);
     free(options.host);
@@ -1636,7 +1676,8 @@ static int run_client(int argc, char** argv) {
 
 static void print_usage(const char* program) {
     fprintf(stderr,
-        "usage: %s capabilities | server --stack STACK --listen HOST:PORT --cert FILE --key FILE | client --stack "
+        "usage: %s capabilities | server --stack STACK --listen HOST:PORT --cert FILE --key FILE "
+        "[--webtransport-origin ORIGIN] | client --stack "
         "STACK [options]\n",
         program);
 }

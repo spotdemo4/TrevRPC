@@ -52,8 +52,6 @@
     "format:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",
     "test": "node --test test/channel.test.js test/native-ownership-lifecycle.test.js test/node-server.test.js test/runtime.test.js",
-    "test:browser": "node --test test/browser/*.test.js",
-    "test:browser:soak": "env TREVRPC_BROWSER_SOAK=1 node --test test/browser/*.test.js",
     "typecheck": "tsc --noEmit",
     "verify:native:production": "node -e 'const { readFileSync } = require(\"node:fs\"); const path = \"./build/native/trevrpc_native.node\"; const expectedExports = [\"connectMsQuic\", \"createCancellation\", \"listenMsQuic\"]; const actualExports = Object.getOwnPropertyNames(require(path)).sort(); const exportsMatch = JSON.stringify(actualExports) === JSON.stringify(expectedExports); const embedsDebugNames = readFileSync(path).includes(Buffer.from(\"_debug\")); if (!exportsMatch || embedsDebugNames) throw new Error(`production addon exports ${JSON.stringify(actualExports)}; expected exactly ${JSON.stringify(expectedExports)}${embedsDebugNames ? \"; binary contains _debug\" : \"\"}`);'"
   },
@@ -61,7 +59,6 @@
     "protobufjs": "^8.7.1"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
     "typescript": "^7.0.2"
   },
   "engines": {

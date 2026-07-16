@@ -26,7 +26,6 @@ abstract class VerifyGeneratedTrevrpc : DefaultTask() {
 }
 
 plugins {
-    application
     kotlin("jvm")
     alias(libs.plugins.protobuf)
 }
@@ -48,24 +47,13 @@ kotlin {
     }
 }
 
-application {
-    mainClass.set("zip.trev.trevrpc.examples.XRuntimeKt")
-    applicationName = "trevrpc-xruntime-kotlin"
-    applicationDefaultJvmArgs = listOf("--enable-native-access=ALL-UNNAMED")
-}
-
 dependencies {
     implementation(project(":core"))
-    implementation(project(":transport-netty"))
     implementation(libs.protobuf.java)
-    implementation(libs.bouncycastle.bcpkix)
     implementation(libs.coroutines.core)
-
-    runtimeOnly("io.netty:netty-codec-native-quic:${libs.versions.netty.get()}:linux-x86_64")
 
     testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")
-    testImplementation(libs.coroutines.test)
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
@@ -119,5 +107,4 @@ tasks.named("check") {
 
 tasks.test {
     useJUnitPlatform()
-    jvmArgs("--enable-native-access=ALL-UNNAMED")
 }

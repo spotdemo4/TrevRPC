@@ -16,6 +16,7 @@ type stackKind string
 const (
 	stackNativeQUIC               stackKind = "trevrpc_native_quic"
 	stackGRPCHTTP2                stackKind = "grpc_http2"
+	stackWebTransport             stackKind = "trevrpc_webtransport"
 	rpcUnary                      rpcKind   = "unary"
 	rpcClientStream               rpcKind   = "client_stream"
 	rpcServerStream               rpcKind   = "server_stream"
@@ -27,10 +28,11 @@ const (
 )
 
 type serverConfig struct {
-	stack    stackKind
-	listen   string
-	certFile string
-	keyFile  string
+	stack              stackKind
+	listen             string
+	certFile           string
+	keyFile            string
+	webTransportOrigin string
 }
 
 type clientConfig struct {
@@ -47,7 +49,7 @@ type clientConfig struct {
 }
 
 func parseServerConfig(args []string) (serverConfig, error) {
-	if err := validateOptionSyntax(args, "stack", "listen", "cert", "key"); err != nil {
+	if err := validateOptionSyntax(args, "stack", "listen", "cert", "key", "webtransport-origin"); err != nil {
 		return serverConfig{}, err
 	}
 	flags := flag.NewFlagSet("server", flag.ContinueOnError)
@@ -58,6 +60,7 @@ func parseServerConfig(args []string) (serverConfig, error) {
 	flags.StringVar(&config.listen, "listen", "", "listen address")
 	flags.StringVar(&config.certFile, "cert", "", "PEM certificate path")
 	flags.StringVar(&config.keyFile, "key", "", "PEM private key path")
+	flags.StringVar(&config.webTransportOrigin, "webtransport-origin", "", "required WebTransport Origin header")
 	if err := flags.Parse(args); err != nil {
 		return config, err
 	}
@@ -68,8 +71,14 @@ func parseServerConfig(args []string) (serverConfig, error) {
 		return config, errors.New("server requires --stack, --listen, --cert, and --key")
 	}
 	config.stack = stackKind(stackText)
-	if err := validateStack(config.stack); err != nil {
+	if err := validateServerStack(config.stack); err != nil {
 		return config, err
+	}
+	if config.stack == stackWebTransport && config.webTransportOrigin == "" {
+		return config, errors.New("trevrpc_webtransport server requires --webtransport-origin")
+	}
+	if config.stack != stackWebTransport && config.webTransportOrigin != "" {
+		return config, errors.New("--webtransport-origin is only valid with trevrpc_webtransport")
 	}
 	return config, nil
 }
@@ -111,7 +120,7 @@ func parseClientConfig(args []string) (clientConfig, error) {
 		return config, errors.New("client requires --stack, --address, and --cert")
 	}
 	config.stack = stackKind(stackText)
-	if err := validateStack(config.stack); err != nil {
+	if err := validateClientStack(config.stack); err != nil {
 		return config, err
 	}
 	config.rpc = rpcKind(rpcText)
@@ -148,12 +157,21 @@ func parseClientConfig(args []string) (clientConfig, error) {
 	return config, nil
 }
 
-func validateStack(stack stackKind) error {
+func validateServerStack(stack stackKind) error {
+	switch stack {
+	case stackNativeQUIC, stackGRPCHTTP2, stackWebTransport:
+		return nil
+	default:
+		return fmt.Errorf("unsupported --stack %q", stack)
+	}
+}
+
+func validateClientStack(stack stackKind) error {
 	switch stack {
 	case stackNativeQUIC, stackGRPCHTTP2:
 		return nil
 	default:
-		return fmt.Errorf("unsupported --stack %q", stack)
+		return fmt.Errorf("unsupported client --stack %q", stack)
 	}
 }
 

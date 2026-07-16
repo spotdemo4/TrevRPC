@@ -19,6 +19,7 @@
 typedef enum benchmark_stack {
     BENCHMARK_STACK_TREVRPC_NATIVE_QUIC,
     BENCHMARK_STACK_GRPC_HTTP2,
+    BENCHMARK_STACK_TREVRPC_WEBTRANSPORT,
 } benchmark_stack;
 
 typedef enum benchmark_rpc_kind {
@@ -49,6 +50,7 @@ typedef struct server_options {
     uint16_t port;
     const char* cert;
     const char* key;
+    const char* webtransport_origin;
     benchmark_stack stack;
     const char* stack_name;
 } server_options;

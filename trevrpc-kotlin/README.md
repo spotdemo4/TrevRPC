@@ -41,8 +41,8 @@ never retried or replayed. Channels do not use 0-RTT. Observe `channel.state`, u
 when readiness is required, and call `channel.close()` when the application is done.
 
 `RpcTransport` remains the generated-client and test integration SPI. Applications should use an
-`RpcChannel` factory rather than assembling transport lifecycle components. Deterministic tests,
-benchmarks, and cross-runtime harnesses can explicitly own one connection with
+`RpcChannel` factory rather than assembling transport lifecycle components. Deterministic tests
+and benchmarks can explicitly own one connection with
 `RawNettyQuicRpcTransport` or `RawNettyHttp3RpcTransport` from
 `zip.trev.trevrpc.netty.advanced`, then call `shutdown()` when finished.
 
@@ -210,6 +210,16 @@ registerGreeter(server, GreeterServiceImpl())
 
 See
 [`examples/src/main/kotlin/zip/trev/trevrpc/examples/GreeterExample.kt`](examples/src/main/kotlin/zip/trev/trevrpc/examples/GreeterExample.kt)
-for the complete service and
-[`examples/src/main/kotlin/zip/trev/trevrpc/examples/XRuntime.kt`](examples/src/main/kotlin/zip/trev/trevrpc/examples/XRuntime.kt)
-for Netty TLS, native QUIC, HTTP/3, and WebTransport serving.
+for the complete service and client exercise. The examples module verifies that generated bindings
+remain current and that all four RPC shapes work without installing a cross-runtime executable.
+
+## Benchmark peer
+
+`bench-peer` implements benchmark protocol V4. Its client role supports `trevrpc_native_quic` and
+`grpc_http2`; its server role additionally supports `trevrpc_webtransport`. A WebTransport server
+requires `--webtransport-origin ORIGIN` and admits only secure WebTransport sessions whose path is
+exactly `/trevrpc` and whose `Origin` header exactly matches that value. WebTransport client mode is
+not supported.
+
+The normal Nix package installs the first-party runtime JARs in `share/java` and installs
+`protoc-gen-trevrpc-kotlin` in `bin`. The benchmark peer remains a separate package output.

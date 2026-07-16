@@ -45,6 +45,7 @@ typedef void (*trevrpc_msquic_test_stream_hook)(trevrpc_msquic_test_stream_event
 void trevrpc_msquic_test_set_stream_hook(trevrpc_msquic_test_stream_hook hook, void* context);
 void trevrpc_msquic_test_fail_next_stream_send(void);
 void trevrpc_msquic_test_fail_next_graceful_shutdown(void);
+int trevrpc_msquic_test_reliable_reset_negotiated(trevrpc_msquic_conn* conn);
 void trevrpc_msquic_test_wait_stream_shutdown_complete(trevrpc_msquic_stream* stream);
 
 #endif

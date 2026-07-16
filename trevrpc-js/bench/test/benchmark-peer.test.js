@@ -12,14 +12,16 @@ import { Code, RpcStreamFrameKind, protobuf } from "trevrpc-js";
 
 import {
   LogLinearHistogram,
-  connectGrpcBenchmarkClient,
-  createBenchmarkHandlers,
   createClientOperation,
-  listenGrpcBenchmarkServer,
   logLinearUpperBound,
-  parseCommandLine,
   prepareFixedAdmissionPhase,
   root,
+} from "../common.js";
+import {
+  connectGrpcBenchmarkClient,
+  createBenchmarkHandlers,
+  listenGrpcBenchmarkServer,
+  parseCommandLine,
 } from "../trevrpc-bench-peer.js";
 
 const execFileAsync = promisify(execFile);
@@ -99,7 +101,7 @@ function schemaFields(type) {
   );
 }
 
-test("benchmark peer capabilities use protocol v3 stacks", async () => {
+test("benchmark peer capabilities use protocol v4 role-specific stacks", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     fileURLToPath(new URL("../trevrpc-bench-peer.js", import.meta.url)),
     "capabilities",
@@ -107,11 +109,13 @@ test("benchmark peer capabilities use protocol v3 stacks", async () => {
 
   assert.equal(stderr, "");
   assert.deepEqual(JSON.parse(stdout), {
-    schema_version: 3,
+    schema_version: 4,
     event: "capabilities",
-    roles: ["client", "server"],
+    roles: {
+      client: ["trevrpc_native_quic", "grpc_http2"],
+      server: ["trevrpc_native_quic", "grpc_http2", "trevrpc_webtransport"],
+    },
     rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
-    stacks: ["trevrpc_native_quic", "grpc_http2"],
     histogram: "log_linear_v1",
     peer: "js",
   });
@@ -174,6 +178,29 @@ test("benchmark peer parses required client and IPv6 server options", () => {
       key: "server-key.pem",
     },
   );
+  assert.deepEqual(
+    parseCommandLine([
+      "server",
+      "--stack",
+      "trevrpc_webtransport",
+      "--listen",
+      "127.0.0.1:0",
+      "--cert",
+      "server.pem",
+      "--key",
+      "server-key.pem",
+      "--webtransport-origin",
+      "http://127.0.0.1:8080",
+    ]),
+    {
+      command: "server",
+      stack: "trevrpc_webtransport",
+      listen: { host: "127.0.0.1", port: 0 },
+      cert: "server.pem",
+      key: "server-key.pem",
+      webtransportOrigin: "http://127.0.0.1:8080",
+    },
+  );
   assert.throws(
     () =>
       parseCommandLine([
@@ -211,7 +238,42 @@ test("benchmark peer parses required client and IPv6 server options", () => {
   assert.throws(() => parseCommandLine(oversizedPayload), /through 67108864/u);
   const invalidStack = [...clientArgs];
   invalidStack[invalidStack.indexOf("--stack") + 1] = "native_quic";
-  assert.throws(() => parseCommandLine(invalidStack), /trevrpc_native_quic or grpc_http2/u);
+  assert.throws(() => parseCommandLine(invalidStack), /trevrpc_native_quic, grpc_http2/u);
+  const webtransportClient = [...clientArgs];
+  webtransportClient[webtransportClient.indexOf("--stack") + 1] = "trevrpc_webtransport";
+  assert.throws(() => parseCommandLine(webtransportClient), /trevrpc_native_quic, grpc_http2/u);
+  assert.throws(
+    () =>
+      parseCommandLine([
+        "server",
+        "--stack",
+        "trevrpc_webtransport",
+        "--listen",
+        "127.0.0.1:0",
+        "--cert",
+        "server.pem",
+        "--key",
+        "server-key.pem",
+      ]),
+    /missing required option --webtransport-origin/u,
+  );
+  assert.throws(
+    () =>
+      parseCommandLine([
+        "server",
+        "--stack",
+        "trevrpc_native_quic",
+        "--listen",
+        "127.0.0.1:0",
+        "--cert",
+        "server.pem",
+        "--key",
+        "server-key.pem",
+        "--webtransport-origin",
+        "http://127.0.0.1:8080",
+      ]),
+    /only valid with server stack trevrpc_webtransport/u,
+  );
 });
 
 test("log_linear_v1 uses exact low buckets and sorted sparse output", () => {

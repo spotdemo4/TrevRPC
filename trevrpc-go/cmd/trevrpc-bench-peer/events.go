@@ -7,7 +7,7 @@ import (
 	"sync"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 const peerName = "go"
 
 type eventEmitter struct {
@@ -31,13 +31,17 @@ func (e *eventEmitter) emit(event any) error {
 }
 
 type capabilitiesEvent struct {
-	SchemaVersion int      `json:"schema_version"`
-	Event         string   `json:"event"`
-	Peer          string   `json:"peer"`
-	Roles         []string `json:"roles"`
-	RPCKinds      []string `json:"rpc_kinds"`
-	Stacks        []string `json:"stacks"`
-	Histogram     string   `json:"histogram"`
+	SchemaVersion int              `json:"schema_version"`
+	Event         string           `json:"event"`
+	Peer          string           `json:"peer"`
+	Roles         roleCapabilities `json:"roles"`
+	RPCKinds      []string         `json:"rpc_kinds"`
+	Histogram     string           `json:"histogram"`
+}
+
+type roleCapabilities struct {
+	Client []string `json:"client"`
+	Server []string `json:"server"`
 }
 
 type readyEvent struct {

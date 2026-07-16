@@ -39,8 +39,17 @@ func listenBenchmarkServer(config serverConfig) (benchmarkListener, error) {
 		)
 		benchmarkpb.RegisterBenchmarkServiceServer(server, grpcBenchmarkService{})
 		return &grpcBenchmarkListener{listener: listener, server: server}, nil
+	case stackWebTransport:
+		server := newNativeBenchmarkServer()
+		options := server.Options()
+		options.EnableWebTransport = true
+		options.WebTransportAdmission = func(request trevrpc.WebTransportAdmissionRequest) bool {
+			return request.Path == trevrpc.DefaultHTTP3Path && request.Origin == config.webTransportOrigin
+		}
+		server.SetOptions(options)
+		return benchutil.ListenWebTransport(config.listen, config.certFile, config.keyFile, server)
 	default:
-		return nil, validateStack(config.stack)
+		return nil, validateServerStack(config.stack)
 	}
 }
 
@@ -110,7 +119,7 @@ func dialBenchmarkClient(ctx context.Context, config clientConfig) (benchmarkCli
 		}
 		return grpcBenchmarkClient{client: benchmarkpb.NewBenchmarkServiceClient(connection)}, connection.Close, nil
 	default:
-		return nil, nil, validateStack(config.stack)
+		return nil, nil, validateClientStack(config.stack)
 	}
 }
 

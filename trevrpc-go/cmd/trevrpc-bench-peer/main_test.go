@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,9 +22,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
+	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/internal/benchutil"
 )
 
 func TestStackOperationsAndCertificateVerification(t *testing.T) {
@@ -76,6 +80,57 @@ func TestStackOperationsAndCertificateVerification(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatal("RPC with an untrusted certificate succeeded")
+			}
+		})
+	}
+}
+
+func TestWebTransportServerOperationsAndAdmission(t *testing.T) {
+	const origin = "https://benchmark.example"
+	certFile, keyFile := writeTestCertificate(t)
+	address, stopServer := startTestBenchmarkServerWithOrigin(t, stackWebTransport, certFile, keyFile, origin)
+	defer stopServer()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tlsConfig, err := benchutil.VerifiedClientTLSConfigForProtocol(certFile, address, http3.NextProtoH3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, err := trevrpc.Advanced.DialRawWebTransport(ctx, "https://"+address+trevrpc.DefaultHTTP3Path, trevrpc.RawWebTransportDialOptions{
+		TLSClientConfig: tlsConfig,
+		QUICConfig:      trevrpc.WebTransportQUICClientConfig(maxBenchmarkFrameSize, benchutil.QUICConfig()),
+		RequestHeader:   http.Header{"Origin": []string{origin}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+	client := nativeBenchmarkClient{
+		client:              benchmarkpb.NewNativeBenchmarkServiceClient(transport.WithMaxFrameSize(maxBenchmarkFrameSize)),
+		maxResponseMessages: 4,
+	}
+	for _, kind := range []rpcKind{rpcUnary, rpcClientStream, rpcServerStream, rpcBidi} {
+		config := testClientConfig(stackNativeQUIC, address, certFile, kind)
+		if _, err := newBenchmarkOperation(client, config)(ctx, 17); err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+	}
+
+	for name, target := range map[string][2]string{
+		"path":   {"/wrong", origin},
+		"origin": {trevrpc.DefaultHTTP3Path, "https://wrong.example"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			badTLS := tlsConfig.Clone()
+			badTransport, err := trevrpc.Advanced.DialRawWebTransport(ctx, "https://"+address+target[0], trevrpc.RawWebTransportDialOptions{
+				TLSClientConfig: badTLS,
+				QUICConfig:      trevrpc.WebTransportQUICClientConfig(maxBenchmarkFrameSize, benchutil.QUICConfig()),
+				RequestHeader:   http.Header{"Origin": []string{target[1]}},
+			})
+			if err == nil {
+				badTransport.Close()
+				t.Fatal("WebTransport admission unexpectedly succeeded")
 			}
 		})
 	}
@@ -216,10 +271,13 @@ func TestClientSTARTEmitsArmedAndSample(t *testing.T) {
 func TestServerSHUTDOWNEmitsReadyAndStopped(t *testing.T) {
 	certFile, keyFile := writeTestCertificate(t)
 	var output bytes.Buffer
-	for _, stack := range []stackKind{stackNativeQUIC, stackGRPCHTTP2} {
+	for _, stack := range []stackKind{stackNativeQUIC, stackGRPCHTTP2, stackWebTransport} {
 		t.Run(string(stack), func(t *testing.T) {
 			output.Reset()
 			config := serverConfig{stack: stack, listen: "127.0.0.1:0", certFile: certFile, keyFile: keyFile}
+			if stack == stackWebTransport {
+				config.webTransportOrigin = "https://benchmark.example"
+			}
 			if err := runServer(config, strings.NewReader("SHUTDOWN\n"), newEventEmitter(&output)); err != nil {
 				t.Fatal(err)
 			}
@@ -273,6 +331,11 @@ func TestClientConfigRejectsDuplicateAndOversizedOptions(t *testing.T) {
 	if _, err := parseClientConfig(unsupported); err == nil {
 		t.Fatal("unsupported --stack was accepted")
 	}
+	webTransport := append([]string{}, base...)
+	webTransport[1] = string(stackWebTransport)
+	if _, err := parseClientConfig(webTransport); err == nil {
+		t.Fatal("server-only WebTransport stack was accepted by the client")
+	}
 	duplicate := append(append([]string{}, base...), "--rpc", "bidi")
 	if _, err := parseClientConfig(duplicate); err == nil {
 		t.Fatal("duplicate option was accepted")
@@ -311,6 +374,23 @@ func TestServerConfigRequiresSupportedStack(t *testing.T) {
 	if _, err := parseServerConfig(unsupported); err == nil {
 		t.Fatal("unsupported --stack was accepted")
 	}
+	webTransport := append([]string{}, base...)
+	webTransport[1] = string(stackWebTransport)
+	if _, err := parseServerConfig(webTransport); err == nil {
+		t.Fatal("WebTransport server without --webtransport-origin was accepted")
+	}
+	webTransport = append(webTransport, "--webtransport-origin", "https://benchmark.example")
+	config, err = parseServerConfig(webTransport)
+	if err != nil {
+		t.Fatalf("valid WebTransport config: %v", err)
+	}
+	if config.webTransportOrigin != "https://benchmark.example" {
+		t.Fatalf("WebTransport origin = %q", config.webTransportOrigin)
+	}
+	nativeWithOrigin := append(append([]string{}, base...), "--webtransport-origin", "https://benchmark.example")
+	if _, err := parseServerConfig(nativeWithOrigin); err == nil {
+		t.Fatal("native server accepted --webtransport-origin")
+	}
 }
 
 func testClientConfig(stack stackKind, address, certFile string, kind rpcKind) clientConfig {
@@ -328,12 +408,17 @@ func testClientConfig(stack stackKind, address, certFile string, kind rpcKind) c
 }
 
 func startTestBenchmarkServer(t *testing.T, stack stackKind, certFile, keyFile string) (string, func()) {
+	return startTestBenchmarkServerWithOrigin(t, stack, certFile, keyFile, "")
+}
+
+func startTestBenchmarkServerWithOrigin(t *testing.T, stack stackKind, certFile, keyFile, origin string) (string, func()) {
 	t.Helper()
 	listener, err := listenBenchmarkServer(serverConfig{
-		stack:    stack,
-		listen:   "127.0.0.1:0",
-		certFile: certFile,
-		keyFile:  keyFile,
+		stack:              stack,
+		listen:             "127.0.0.1:0",
+		certFile:           certFile,
+		keyFile:            keyFile,
+		webTransportOrigin: origin,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -415,6 +500,6 @@ func Example_runCapabilities() {
 	err := run([]string{"capabilities"}, strings.NewReader(""), newEventEmitter(&output))
 	fmt.Print(output.String(), err)
 	// Output:
-	// {"schema_version":3,"event":"capabilities","peer":"go","roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}
+	// {"schema_version":4,"event":"capabilities","peer":"go","roles":{"client":["trevrpc_native_quic","grpc_http2"],"server":["trevrpc_native_quic","grpc_http2","trevrpc_webtransport"]},"rpc_kinds":["unary","client_stream","server_stream","bidi"],"histogram":"log_linear_v1"}
 	// <nil>
 }

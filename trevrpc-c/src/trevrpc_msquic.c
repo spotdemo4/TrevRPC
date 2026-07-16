@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define QUIC_API_ENABLE_PREVIEW_FEATURES 1
 
 #include "trevrpc_msquic.h"
 
@@ -111,6 +112,7 @@ struct trevrpc_msquic_conn {
     trevrpc_msquic_stream_node* stream_head;
     trevrpc_msquic_stream_node* stream_tail;
     bool connected;
+    bool reliable_reset_negotiated;
     bool shutdown_complete;
     bool close_pending;
     bool closed;
@@ -202,6 +204,16 @@ void trevrpc_msquic_test_fail_next_graceful_shutdown(void) {
     pthread_mutex_lock(&TrevMsQuicTestStreamHookMutex);
     TrevMsQuicTestFailNextGracefulShutdown = true;
     pthread_mutex_unlock(&TrevMsQuicTestStreamHookMutex);
+}
+
+int trevrpc_msquic_test_reliable_reset_negotiated(trevrpc_msquic_conn* conn) {
+    if (conn == NULL) {
+        return 0;
+    }
+    pthread_mutex_lock(&conn->mutex);
+    bool negotiated = conn->reliable_reset_negotiated;
+    pthread_mutex_unlock(&conn->mutex);
+    return negotiated;
 }
 
 void trevrpc_msquic_test_wait_stream_shutdown_complete(trevrpc_msquic_stream* stream) {
@@ -1292,6 +1304,8 @@ static int trevrpc_msquic_configure_endpoint_with_alpns(const trevrpc_msquic_con
     settings.SendBufferingEnabled = config->send_buffering_enabled != 0;
     settings.IsSet.DatagramReceiveEnabled = TRUE;
     settings.DatagramReceiveEnabled = TRUE;
+    settings.IsSet.ReliableResetEnabled = TRUE;
+    settings.ReliableResetEnabled = TRUE;
     if (server) {
         settings.IsSet.ServerResumptionLevel = TRUE;
         settings.ServerResumptionLevel = QUIC_SERVER_RESUME_ONLY;
@@ -2793,6 +2807,11 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(
         trevrpc_msquic_conn_notify(conn, &ticket_event);
         return QUIC_STATUS_SUCCESS;
     }
+    case QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED:
+        pthread_mutex_lock(&conn->mutex);
+        conn->reliable_reset_negotiated = event->RELIABLE_RESET_NEGOTIATED.IsNegotiated != FALSE;
+        pthread_mutex_unlock(&conn->mutex);
+        return QUIC_STATUS_SUCCESS;
     default:
         return QUIC_STATUS_SUCCESS;
     }

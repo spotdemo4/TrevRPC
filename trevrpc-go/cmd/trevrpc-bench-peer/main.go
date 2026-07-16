@@ -54,10 +54,12 @@ func run(args []string, stdin io.Reader, emitter *eventEmitter) error {
 			SchemaVersion: schemaVersion,
 			Event:         "capabilities",
 			Peer:          peerName,
-			Roles:         []string{"client", "server"},
-			RPCKinds:      []string{"unary", "client_stream", "server_stream", "bidi"},
-			Stacks:        []string{string(stackNativeQUIC), string(stackGRPCHTTP2)},
-			Histogram:     "log_linear_v1",
+			Roles: roleCapabilities{
+				Client: []string{string(stackNativeQUIC), string(stackGRPCHTTP2)},
+				Server: []string{string(stackNativeQUIC), string(stackGRPCHTTP2), string(stackWebTransport)},
+			},
+			RPCKinds:  []string{"unary", "client_stream", "server_stream", "bidi"},
+			Histogram: "log_linear_v1",
 		})
 	case "server":
 		config, err := parseServerConfig(args[1:])

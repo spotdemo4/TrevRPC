@@ -49,7 +49,6 @@ stdenvNoCC.mkDerivation (final: {
         ":core:assemble"
         ":transport-cronet:assemble"
         ":transport-netty:assemble"
-        ":examples:installDist"
         ":protoc-gen-trevrpc-kotlin:installDist"
       ];
   gradleUpdateScript = ''
@@ -77,14 +76,12 @@ stdenvNoCC.mkDerivation (final: {
     else
       ''
         runHook preInstall
-        mkdir -p $out/bin $out/share/trevrpc-kotlin
-        cp -R examples/build/install/trevrpc-xruntime-kotlin/* $out/share/trevrpc-kotlin/
+        mkdir -p $out/bin $out/share/java $out/share/trevrpc-kotlin
+        cp core/build/libs/core-${final.version}.jar $out/share/java/
+        cp transport-cronet/build/libs/transport-cronet-${final.version}.jar $out/share/java/
+        cp transport-netty/build/libs/transport-netty-${final.version}.jar $out/share/java/
         cp -R protoc-gen-trevrpc-kotlin/build/install/protoc-gen-trevrpc-kotlin \
           $out/share/trevrpc-kotlin/protoc-gen-trevrpc-kotlin
-        makeWrapper $out/share/trevrpc-kotlin/bin/trevrpc-xruntime-kotlin \
-          $out/bin/trevrpc-xruntime-kotlin \
-          --set JAVA_HOME ${jdk25.home} \
-          --prefix PATH : ${lib.makeBinPath [ jdk25 ]}
         makeWrapper \
           $out/share/trevrpc-kotlin/protoc-gen-trevrpc-kotlin/bin/protoc-gen-trevrpc-kotlin \
           $out/bin/protoc-gen-trevrpc-kotlin \
@@ -103,6 +100,10 @@ stdenvNoCC.mkDerivation (final: {
       exit 1
     fi
     test ! -e "$out/bin/trevrpc-bench-peer-kotlin"
+    test ! -e "$out/bin/trevrpc-xruntime-kotlin"
+    test -f "$out/share/java/core-${final.version}.jar"
+    test -f "$out/share/java/transport-cronet-${final.version}.jar"
+    test -f "$out/share/java/transport-netty-${final.version}.jar"
     runHook postInstallCheck
   '';
 

@@ -9,7 +9,6 @@ import * as grpc from "@grpc/grpc-js";
 import {
   Code,
   RpcStreamFrameKind,
-  createRoot,
   createServiceClient,
   invalidArgument,
   resourceExhausted,
@@ -18,98 +17,43 @@ import {
 import { NodeServer } from "trevrpc-js/node";
 import { RawNodeTransport } from "trevrpc-js/node/advanced";
 
-const SchemaVersion = 3;
+import {
+  BenchmarkService,
+  IdleTimeoutMs,
+  MaxConcurrency,
+  MaxFrameSize,
+  MaxMessagesPerStream,
+  MaxPayloadBytes,
+  RpcKinds,
+  SchemaVersion,
+  StreamBatchSize,
+  createClientOperation,
+  parseWorkloadOptions,
+  prepareFixedAdmissionPhase,
+  root,
+  sampleForResult,
+} from "./common.js";
+
+export {
+  BenchmarkService,
+  LogLinearHistogram,
+  createClientOperation,
+  logLinearUpperBound,
+  prepareFixedAdmissionPhase,
+  root,
+} from "./common.js";
+
 const Peer = "js";
 const ServiceName = "trevrpc.benchmark.v1.BenchmarkService";
-const Stacks = new Set(["trevrpc_native_quic", "grpc_http2"]);
-const IdleTimeoutMs = 600_000;
+const ClientStacks = new Set(["trevrpc_native_quic", "grpc_http2"]);
+const ServerStacks = new Set(["trevrpc_native_quic", "grpc_http2", "trevrpc_webtransport"]);
 const ConnectTimeoutMs = 30_000;
 const ShutdownTimeoutMs = 5_000;
-const StreamBatchSize = 16;
-const MaxConcurrency = 1024;
-const MaxPayloadBytes = 64 * 1024 * 1024;
-const MaxMessagesPerStream = 1_000_000;
-const MaxFrameSize = MaxPayloadBytes + 1024;
-
-export const root = createRoot({
-  nested: {
-    trevrpc: {
-      nested: {
-        benchmark: {
-          nested: {
-            v1: {
-              nested: {
-                BenchmarkRequest: {
-                  fields: {
-                    sequence: { type: "uint64", id: 1 },
-                    payload: { type: "bytes", id: 2 },
-                    responseBytes: { type: "uint32", id: 3 },
-                  },
-                },
-                BenchmarkResponse: {
-                  fields: {
-                    sequence: { type: "uint64", id: 1 },
-                    payload: { type: "bytes", id: 2 },
-                  },
-                },
-                StreamRequest: {
-                  fields: {
-                    messageCount: { type: "uint32", id: 1 },
-                    payload: { type: "bytes", id: 2 },
-                    responseBytes: { type: "uint32", id: 3 },
-                  },
-                },
-                BenchmarkSummary: {
-                  fields: {
-                    messageCount: { type: "uint64", id: 1 },
-                    payloadBytes: { type: "uint64", id: 2 },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-  },
-});
 
 const BenchmarkRequest = root.lookupType("trevrpc.benchmark.v1.BenchmarkRequest");
 const BenchmarkResponse = root.lookupType("trevrpc.benchmark.v1.BenchmarkResponse");
 const StreamRequest = root.lookupType("trevrpc.benchmark.v1.StreamRequest");
 const BenchmarkSummary = root.lookupType("trevrpc.benchmark.v1.BenchmarkSummary");
-
-export const BenchmarkService = Object.freeze({
-  name: "BenchmarkService",
-  fullName: ServiceName,
-  exportName: "BenchmarkService",
-  methods: {
-    unary: {
-      name: "Unary",
-      kind: "unary",
-      inputType: "trevrpc.benchmark.v1.BenchmarkRequest",
-      outputType: "trevrpc.benchmark.v1.BenchmarkResponse",
-    },
-    clientStream: {
-      name: "ClientStream",
-      kind: "clientStreaming",
-      inputType: "trevrpc.benchmark.v1.BenchmarkRequest",
-      outputType: "trevrpc.benchmark.v1.BenchmarkSummary",
-    },
-    serverStream: {
-      name: "ServerStream",
-      kind: "serverStreaming",
-      inputType: "trevrpc.benchmark.v1.StreamRequest",
-      outputType: "trevrpc.benchmark.v1.BenchmarkResponse",
-    },
-    bidi: {
-      name: "Bidi",
-      kind: "bidirectionalStreaming",
-      inputType: "trevrpc.benchmark.v1.BenchmarkRequest",
-      outputType: "trevrpc.benchmark.v1.BenchmarkResponse",
-    },
-  },
-});
 
 export const GrpcBenchmarkService = Object.freeze({
   unary: grpcMethod("Unary", BenchmarkRequest, BenchmarkResponse, false, false),
@@ -140,9 +84,11 @@ export async function main(argv = process.argv.slice(2), io = process) {
     case "capabilities":
       await writeEvent(io.stdout, {
         event: "capabilities",
-        roles: ["client", "server"],
-        rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
-        stacks: ["trevrpc_native_quic", "grpc_http2"],
+        roles: {
+          client: [...ClientStacks],
+          server: [...ServerStacks],
+        },
+        rpc_kinds: RpcKinds,
         histogram: "log_linear_v1",
       });
       return;
@@ -166,13 +112,35 @@ export function parseCommandLine(argv) {
     return { command };
   }
   if (command === "server") {
-    const options = parseOptions(args, ["stack", "listen", "cert", "key"]);
+    const options = parseOptions(args, ["stack", "listen", "cert", "key", "webtransport-origin"]);
+    const stack = parseStack(options, ServerStacks);
+    const webtransportOrigin = options.get("webtransport-origin");
+    if (
+      stack === "trevrpc_webtransport" &&
+      (webtransportOrigin == null || webtransportOrigin === "")
+    ) {
+      throw new PeerError(
+        "configure",
+        "invalid_arguments",
+        "missing required option --webtransport-origin",
+      );
+    }
+    if (stack !== "trevrpc_webtransport" && webtransportOrigin != null) {
+      throw new PeerError(
+        "configure",
+        "invalid_arguments",
+        "--webtransport-origin is only valid with server stack trevrpc_webtransport",
+      );
+    }
     return {
       command,
-      stack: parseStack(options),
+      stack,
       listen: parseAddress(requiredOption(options, "listen"), true),
       cert: requiredOption(options, "cert"),
       key: requiredOption(options, "key"),
+      ...(webtransportOrigin == null
+        ? {}
+        : { webtransportOrigin: parseOrigin(webtransportOrigin) }),
     };
   }
   if (command === "client") {
@@ -188,73 +156,21 @@ export function parseCommandLine(argv) {
       "response-bytes",
       "messages-per-stream",
     ]);
-    const rpcKind = requiredOption(options, "rpc");
-    if (!new Set(["unary", "client_stream", "server_stream", "bidi"]).has(rpcKind)) {
-      throw new PeerError(
-        "configure",
-        "invalid_arguments",
-        `--rpc must be unary, client_stream, server_stream, or bidi; got ${JSON.stringify(rpcKind)}`,
-      );
+    let workload;
+    try {
+      workload = parseWorkloadOptions(options, requiredOption, parseIntegerOption);
+    } catch (error) {
+      throw wrapError("configure", "invalid_arguments", error);
     }
     return {
       command,
-      stack: parseStack(options),
+      stack: parseStack(options, ClientStacks),
       address: parseAddress(requiredOption(options, "address"), false),
       cert: requiredOption(options, "cert"),
-      rpcKind,
-      concurrency: parseIntegerOption(options, "concurrency", 1, MaxConcurrency),
-      warmupMs: parseIntegerOption(options, "warmup-ms", 0, Number.MAX_SAFE_INTEGER),
-      measurementMs: parseIntegerOption(options, "measurement-ms", 1, Number.MAX_SAFE_INTEGER),
-      requestBytes: parseIntegerOption(options, "request-bytes", 0, MaxPayloadBytes),
-      responseBytes: parseIntegerOption(options, "response-bytes", 0, MaxPayloadBytes),
-      messagesPerStream: parseIntegerOption(
-        options,
-        "messages-per-stream",
-        1,
-        MaxMessagesPerStream,
-      ),
+      ...workload,
     };
   }
   throw new PeerError("configure", "invalid_arguments", usage());
-}
-
-export function logLinearUpperBound(value) {
-  const latency = typeof value === "bigint" ? value : BigInt(value);
-  if (latency <= 0n) {
-    throw new RangeError("histogram latency must be positive");
-  }
-  const shift = Math.max(latency.toString(2).length - 1 - 9, 0);
-  const shiftBits = BigInt(shift);
-  return (((latency >> shiftBits) + 1n) << shiftBits) - 1n;
-}
-
-export class LogLinearHistogram {
-  constructor() {
-    this.buckets = new Map();
-    this.count = 0n;
-  }
-
-  record(value) {
-    const upperBound = logLinearUpperBound(value);
-    this.buckets.set(upperBound, (this.buckets.get(upperBound) ?? 0n) + 1n);
-    this.count += 1n;
-  }
-
-  add(other) {
-    for (const [upperBound, count] of other.buckets) {
-      this.buckets.set(upperBound, (this.buckets.get(upperBound) ?? 0n) + count);
-    }
-    this.count += other.count;
-  }
-
-  toJSON() {
-    return [...this.buckets]
-      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      .map(([upperBound, count]) => ({
-        upper_bound_ns: String(upperBound),
-        count: String(count),
-      }));
-  }
 }
 
 export function createBenchmarkHandlers() {
@@ -386,110 +302,6 @@ function requestBody(frame) {
   throw invalidArgument("request stream contained an unknown frame kind");
 }
 
-export function createClientOperation(client, config) {
-  const callOptions = {
-    maxResponseBodySize: MaxFrameSize,
-    maxResponseMessages: -1,
-    maxResponseStreamBodySize: -1,
-    streamIdleTimeoutMs: IdleTimeoutMs,
-  };
-
-  switch (config.rpcKind) {
-    case "unary":
-      return async ({ laneIndex, operationIndex }) => {
-        const sequence = operationSequence(laneIndex, operationIndex);
-        const response = await client.unary({
-          sequence,
-          payload: new Uint8Array(config.requestBytes),
-          responseBytes: config.responseBytes,
-        });
-        validateResponse(response, sequence, config.responseBytes, "unary response");
-        return { requestMessages: 1n, responseMessages: 1n };
-      };
-    case "client_stream":
-      return async () => {
-        const call = await client.clientStream(callOptions);
-        await sendRequestMessages(call, config);
-        const summary = await call.closeAndRecv();
-        const expectedMessages = BigInt(config.messagesPerStream);
-        const expectedBytes = expectedMessages * BigInt(config.requestBytes);
-        if (
-          uint64Text(summary.messageCount) !== String(expectedMessages) ||
-          uint64Text(summary.payloadBytes) !== String(expectedBytes)
-        ) {
-          throw new Error(
-            `client-stream summary was ${uint64Text(summary.messageCount)} messages and ${uint64Text(summary.payloadBytes)} bytes; expected ${expectedMessages} messages and ${expectedBytes} bytes`,
-          );
-        }
-        return { requestMessages: expectedMessages, responseMessages: 1n };
-      };
-    case "server_stream":
-      return async () => {
-        const responses = await client.serverStream(
-          {
-            messageCount: config.messagesPerStream,
-            payload: new Uint8Array(config.requestBytes),
-            responseBytes: config.responseBytes,
-          },
-          callOptions,
-        );
-        let received = 0;
-        for await (const response of responses) {
-          validateResponse(
-            response,
-            String(received),
-            config.responseBytes,
-            "server-stream response",
-          );
-          received += 1;
-        }
-        if (received !== config.messagesPerStream) {
-          throw new Error(
-            `server stream returned ${received} messages; expected ${config.messagesPerStream}`,
-          );
-        }
-        return { requestMessages: 1n, responseMessages: BigInt(received) };
-      };
-    case "bidi":
-      return async () => {
-        const call = await client.bidi(callOptions);
-        let received = 0;
-        await Promise.all([sendAndClose(), receiveAll()]);
-        if (received !== config.messagesPerStream) {
-          throw new Error(
-            `bidi returned ${received} messages; expected ${config.messagesPerStream}`,
-          );
-        }
-        return {
-          requestMessages: BigInt(config.messagesPerStream),
-          responseMessages: BigInt(received),
-        };
-
-        async function sendAndClose() {
-          await sendRequestMessages(call, config);
-          await call.closeSend();
-        }
-
-        async function receiveAll() {
-          for (;;) {
-            const response = await call.recv();
-            if (response === undefined) {
-              return;
-            }
-            validateResponse(response, String(received), config.responseBytes, "bidi response");
-            received += 1;
-          }
-        }
-      };
-    default:
-      throw new PeerError(
-        "configure",
-        "invalid_arguments",
-        `unsupported RPC kind ${JSON.stringify(config.rpcKind)}`,
-      );
-  }
-}
-
 function createGrpcClientAdapter(client) {
   return {
     unary(request) {
@@ -592,75 +404,6 @@ async function* grpcResponseStream(call, terminalStatus) {
   assertGrpcOk(await terminalStatus);
 }
 
-export function prepareFixedAdmissionPhase({
-  operation,
-  concurrency,
-  durationNs,
-  recordLatency,
-  now = process.hrtime.bigint,
-}) {
-  let release;
-  const gate = new Promise((resolveGate) => {
-    release = resolveGate;
-  });
-  const state = { failed: false, firstError: null };
-  const lanes = Array.from({ length: concurrency }, (_, laneIndex) => runLane(laneIndex));
-  let started = false;
-
-  return {
-    async start() {
-      if (started) {
-        throw new Error("benchmark phase has already started");
-      }
-      started = true;
-      const start = now();
-      release({ deadline: start + durationNs });
-      const results = await Promise.all(lanes);
-      const elapsedNs = now() - start;
-      const result = emptyPhaseResult();
-      for (const lane of results) {
-        result.completed += lane.completed;
-        result.failed += lane.failed;
-        result.requestMessages += lane.requestMessages;
-        result.responseMessages += lane.responseMessages;
-        result.histogram.add(lane.histogram);
-      }
-      result.elapsedNs = elapsedNs;
-      result.error = state.firstError;
-      return result;
-    },
-  };
-
-  async function runLane(laneIndex) {
-    const { deadline } = await gate;
-    const result = emptyPhaseResult();
-    let operationIndex = 0n;
-    while (!state.failed) {
-      const operationStart = now();
-      if (operationStart >= deadline) {
-        break;
-      }
-      try {
-        const counts = await operation({ laneIndex, operationIndex });
-        result.completed += 1n;
-        result.requestMessages += counts.requestMessages;
-        result.responseMessages += counts.responseMessages;
-        if (recordLatency) {
-          const latency = now() - operationStart;
-          result.histogram.record(latency > 0n ? latency : 1n);
-        }
-      } catch (error) {
-        result.failed += 1n;
-        state.failed = true;
-        state.firstError ??= error;
-        break;
-      }
-      operationIndex += 1n;
-    }
-    return result;
-  }
-}
-
 async function runServer(config, io) {
   let server;
   try {
@@ -710,7 +453,9 @@ async function listenBenchmarkServer(config) {
     port: config.listen.port,
     certFile: config.cert,
     keyFile: config.key,
-    path: "/trevrpc",
+    ...(config.stack === "trevrpc_webtransport"
+      ? { path: "/trevrpc", origin: config.webtransportOrigin }
+      : {}),
     maxSessionsPerConnection: 16,
     maxStreamsPerSession: MaxConcurrency,
     maxStreamMessages: -1,
@@ -842,26 +587,13 @@ async function runClient(config, io) {
     if (result.failed !== 0n) {
       throw wrapError("measure", "rpc_failed", result.error);
     }
-    if (result.histogram.count !== result.completed) {
-      throw new PeerError(
-        "measure",
-        "histogram_mismatch",
-        `histogram contains ${result.histogram.count} samples for ${result.completed} completed operations`,
-      );
+    let sample;
+    try {
+      sample = sampleForResult(config, admissionNs, result);
+    } catch (error) {
+      throw wrapError("measure", "histogram_mismatch", error);
     }
-    const drainNs = result.elapsedNs > admissionNs ? result.elapsedNs - admissionNs : 0n;
-    await writeEvent(io.stdout, {
-      event: "sample",
-      rpc_kind: config.rpcKind,
-      admission_ns: String(admissionNs),
-      elapsed_ns: String(result.elapsedNs),
-      drain_ns: String(drainNs),
-      completed: String(result.completed),
-      failed: String(result.failed),
-      request_messages: String(result.requestMessages),
-      response_messages: String(result.responseMessages),
-      histogram: result.histogram.toJSON(),
-    });
+    await writeEvent(io.stdout, sample);
   } finally {
     connection.close();
   }
@@ -955,16 +687,37 @@ function requiredOption(options, name) {
   return value;
 }
 
-function parseStack(options) {
+function parseStack(options, stacks) {
   const stack = requiredOption(options, "stack");
-  if (!Stacks.has(stack)) {
+  if (!stacks.has(stack)) {
     throw new PeerError(
       "configure",
       "invalid_arguments",
-      `--stack must be trevrpc_native_quic or grpc_http2; got ${JSON.stringify(stack)}`,
+      `--stack must be ${[...stacks].join(", ")}; got ${JSON.stringify(stack)}`,
     );
   }
   return stack;
+}
+
+function parseOrigin(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new PeerError(
+      "configure",
+      "invalid_arguments",
+      `--webtransport-origin must be an HTTP origin; got ${JSON.stringify(value)}`,
+    );
+  }
+  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin !== value) {
+    throw new PeerError(
+      "configure",
+      "invalid_arguments",
+      `--webtransport-origin must be an HTTP origin; got ${JSON.stringify(value)}`,
+    );
+  }
+  return url.origin;
 }
 
 function parseIntegerOption(options, name, minimum, maximum) {
@@ -1023,33 +776,6 @@ function parseAddress(value, allowZeroPort) {
 
 function formatAddress(host, port) {
   return host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
-}
-
-function operationSequence(laneIndex, operationIndex) {
-  return String(BigInt.asUintN(64, (BigInt(laneIndex) << 48n) | operationIndex));
-}
-
-async function sendRequestMessages(call, config) {
-  const payload = new Uint8Array(config.requestBytes);
-  let sent = 0;
-  while (sent < config.messagesPerStream) {
-    const count = Math.min(streamBatchSize(config.requestBytes), config.messagesPerStream - sent);
-    const messages = Array.from({ length: count }, (_, offset) => ({
-      sequence: String(sent + offset),
-      payload,
-      responseBytes: config.responseBytes,
-    }));
-    if (typeof call.sendMany !== "function") {
-      for (const message of messages) {
-        await call.send(message);
-      }
-    } else if (messages.length === 1) {
-      await call.send(messages[0]);
-    } else {
-      await call.sendMany(messages);
-    }
-    sent += count;
-  }
 }
 
 function responseForRequest(request) {
@@ -1141,28 +867,6 @@ function streamBatchSize(payloadBytes) {
   return Math.max(1, Math.min(StreamBatchSize, Math.floor(MaxPayloadBytes / encodedSizeEstimate)));
 }
 
-function validateResponse(response, expectedSequence, expectedBytes, label) {
-  if (uint64Text(response.sequence) !== String(expectedSequence)) {
-    throw new Error(
-      `${label} sequence was ${uint64Text(response.sequence)}; expected ${expectedSequence}`,
-    );
-  }
-  if (response.payload.byteLength !== expectedBytes) {
-    throw new Error(
-      `${label} payload was ${response.payload.byteLength} bytes; expected ${expectedBytes}`,
-    );
-  }
-  validateZeroPayload(response.payload, label);
-}
-
-function validateZeroPayload(payload, label) {
-  for (const byte of payload) {
-    if (byte !== 0) {
-      throw new Error(`${label} payload contains non-zero data`);
-    }
-  }
-}
-
 function uint64Text(value) {
   return String(value ?? 0);
 }
@@ -1241,18 +945,6 @@ function toGrpcError(error) {
   return Object.assign(new Error(details), { code, details });
 }
 
-function emptyPhaseResult() {
-  return {
-    completed: 0n,
-    failed: 0n,
-    requestMessages: 0n,
-    responseMessages: 0n,
-    elapsedNs: 0n,
-    error: null,
-    histogram: new LogLinearHistogram(),
-  };
-}
-
 async function waitForControl(control, allowed) {
   for await (const line of control) {
     const command = line.trim();
@@ -1304,7 +996,7 @@ function wrapError(phase, code, error) {
 }
 
 function usage() {
-  return "usage: trevrpc-bench-peer-js capabilities | server --stack STACK --listen HOST:PORT --cert FILE --key FILE | client --stack STACK --address HOST:PORT --cert FILE --rpc KIND --concurrency N --warmup-ms N --measurement-ms N --request-bytes N --response-bytes N --messages-per-stream N";
+  return "usage: trevrpc-bench-peer-js capabilities | server --stack STACK --listen HOST:PORT --cert FILE --key FILE [--webtransport-origin ORIGIN] | client --stack STACK --address HOST:PORT --cert FILE --rpc KIND --concurrency N --warmup-ms N --measurement-ms N --request-bytes N --response-bytes N --messages-per-stream N";
 }
 
 function isMainModule() {

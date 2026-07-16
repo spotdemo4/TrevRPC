@@ -2,6 +2,7 @@ package zip.trev.trevrpc.bench
 
 import kotlinx.coroutines.runBlocking
 import org.bouncycastle.asn1.x509.GeneralName
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
@@ -12,12 +13,44 @@ import zip.trev.trevrpc.netty.NettyRpcServer
 import zip.trev.trevrpc.netty.NettyRpcServerConfig
 import zip.trev.trevrpc.netty.NettyServerTls
 import zip.trev.trevrpc.netty.NettyTransportOptions
+import zip.trev.trevrpc.netty.WebTransportAdmissionRequest
 import zip.trev.trevrpc.netty.advanced.RawNettyQuicRpcTransport
 import java.net.InetSocketAddress
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
 class NettyPeerIntegrationTest {
+    @Test
+    fun `WebTransport benchmark server enables H3 and admits only its exact secure origin`() {
+        val origin = "https://benchmark.example"
+        val config =
+            benchmarkNettyServerConfig(
+                PeerCommand.Server(
+                    BenchmarkStack.TREVRPC_WEBTRANSPORT,
+                    "127.0.0.1:0",
+                    Path.of("certificate.pem"),
+                    Path.of("key.pem"),
+                    origin,
+                ),
+                InetSocketAddress(TEST_SERVER_IP, 0),
+            )
+
+        assertEquals(false, config.enableNative)
+        assertEquals(true, config.enableHttp3)
+        assertEquals(true, config.enableWebTransport)
+        val admission = checkNotNull(config.webTransportAdmission)
+
+        fun admitted(
+            path: String,
+            secure: Boolean,
+            actualOrigin: String?,
+        ): Boolean = admission.admit(WebTransportAdmissionRequest(path, "localhost:7443", actualOrigin, secure, emptyMap()))
+        assertEquals(true, admitted("/trevrpc", true, origin))
+        assertEquals(false, admitted("/trevrpc/", true, origin))
+        assertEquals(false, admitted("/trevrpc", false, origin))
+        assertEquals(false, admitted("/trevrpc", true, "https://other.example"))
+    }
+
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     fun `native peer verifies trust and requested IP SAN`(): Unit =

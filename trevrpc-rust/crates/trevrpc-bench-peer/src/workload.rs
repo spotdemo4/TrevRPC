@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use trevrpc::MessageStream;
 use trevrpc::advanced::RawQuinnTransport;
-use trevrpc::client::CallOptions;
+use trevrpc::client::{CallOptions, RpcTransport};
 use trevrpc::server::RequestContext;
 
 use crate::config::{
@@ -38,14 +38,17 @@ pub(crate) struct WorkloadConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct Workload {
-    client: BenchmarkServiceClient<RawQuinnTransport>,
+pub(crate) struct Workload<T = RawQuinnTransport> {
+    client: BenchmarkServiceClient<T>,
     config: WorkloadConfig,
     next_sequence: Arc<AtomicU64>,
 }
 
-impl Workload {
-    pub(crate) fn new(transport: RawQuinnTransport, config: WorkloadConfig) -> Self {
+impl<T> Workload<T>
+where
+    T: RpcTransport,
+{
+    pub(crate) fn new(transport: T, config: WorkloadConfig) -> Self {
         Self {
             client: BenchmarkServiceClient::with_default_call_options(transport, call_options()),
             config,
@@ -180,7 +183,10 @@ impl Workload {
     }
 }
 
-impl BenchmarkWorkload for Workload {
+impl<T> BenchmarkWorkload for Workload<T>
+where
+    T: RpcTransport,
+{
     fn execute(&self) -> impl Future<Output = Result<MessageCounts, BoxError>> + Send {
         Self::execute(self)
     }

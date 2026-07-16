@@ -45,7 +45,16 @@ pub fn generate(output: &Path, server_ips: &[IpAddr]) -> Result<Certificates, Bo
         .join(",");
     let mut request = Command::new("openssl");
     request
-        .args(["req", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+        .args([
+            "req",
+            "-new",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-keyout",
+        ])
         .arg(&private_key)
         .arg("-out")
         .arg(&csr)

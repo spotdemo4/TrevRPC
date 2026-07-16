@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 )
 
@@ -23,6 +24,25 @@ const (
 // QUICConfig returns the common long-lived benchmark connection settings.
 func QUICConfig() *quic.Config {
 	return &quic.Config{MaxIdleTimeout: idleTimeout, KeepAlivePeriod: keepAlive}
+}
+
+// ListenWebTransport starts an HTTP/3-only TrevRPC WebTransport listener.
+func ListenWebTransport(addr, certFile, keyFile string, server *trevrpc.Server) (trevrpc.ServerListener, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, errors.New("webtransport server requires -cert and -key")
+	}
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{certificate},
+			MinVersion:   tls.VersionTLS13,
+			NextProtos:   []string{http3.NextProtoH3},
+		},
+		QUICConfig: QUICConfig(),
+	})
 }
 
 // ListenNativeQUIC starts a native TrevRPC listener with the supplied identity.

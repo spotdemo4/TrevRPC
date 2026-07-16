@@ -18,6 +18,7 @@ internal sealed interface PeerCommand {
         val listen: String,
         val certificate: Path,
         val privateKey: Path,
+        val webTransportOrigin: String? = null,
     ) : PeerCommand
 
     data class Client(
@@ -41,12 +42,15 @@ internal enum class BenchmarkStack(
 ) {
     TREVRPC_NATIVE_QUIC("trevrpc_native_quic"),
     GRPC_HTTP2("grpc_http2"),
+    TREVRPC_WEBTRANSPORT("trevrpc_webtransport"),
     ;
 
     companion object {
         fun parse(value: String): BenchmarkStack =
             entries.firstOrNull { it.wireName == value }
-                ?: throw IllegalArgumentException("--stack must be trevrpc_native_quic or grpc_http2")
+                ?: throw IllegalArgumentException(
+                    "--stack must be trevrpc_native_quic, grpc_http2, or trevrpc_webtransport",
+                )
     }
 }
 
@@ -97,12 +101,20 @@ internal fun parseCommand(args: Array<String>): PeerCommand {
 }
 
 private fun parseServer(values: Map<String, String>): PeerCommand.Server {
-    requireKnown(values, setOf("stack", "listen", "cert", "key"))
+    requireKnown(values, setOf("stack", "listen", "cert", "key", "webtransport-origin"))
+    val stack = BenchmarkStack.parse(required(values, "stack"))
+    val webTransportOrigin = values["webtransport-origin"]?.takeIf(String::isNotEmpty)
+    if (stack == BenchmarkStack.TREVRPC_WEBTRANSPORT) {
+        require(webTransportOrigin != null) { "--webtransport-origin is required for trevrpc_webtransport servers" }
+    } else {
+        require(webTransportOrigin == null) { "--webtransport-origin is only valid for trevrpc_webtransport servers" }
+    }
     return PeerCommand.Server(
-        stack = BenchmarkStack.parse(required(values, "stack")),
+        stack = stack,
         listen = required(values, "listen"),
         certificate = Path.of(required(values, "cert")),
         privateKey = Path.of(required(values, "key")),
+        webTransportOrigin = webTransportOrigin,
     )
 }
 
@@ -122,6 +134,10 @@ private fun parseClient(values: Map<String, String>): PeerCommand.Client {
             "messages-per-stream",
         ),
     )
+    val stack = BenchmarkStack.parse(required(values, "stack"))
+    require(stack != BenchmarkStack.TREVRPC_WEBTRANSPORT) {
+        "trevrpc_webtransport is not supported by the Kotlin benchmark client"
+    }
     val concurrency = positiveInt(values, "concurrency")
     require(concurrency <= MAX_BENCHMARK_CONCURRENCY) {
         "--concurrency must not exceed $MAX_BENCHMARK_CONCURRENCY"
@@ -143,7 +159,7 @@ private fun parseClient(values: Map<String, String>): PeerCommand.Client {
         "--messages-per-stream must not exceed $MAX_MESSAGES_PER_STREAM"
     }
     return PeerCommand.Client(
-        stack = BenchmarkStack.parse(required(values, "stack")),
+        stack = stack,
         address = required(values, "address"),
         certificate = Path.of(required(values, "cert")),
         rpcKind = BenchmarkRpcKind.parse(required(values, "rpc")),
@@ -265,8 +281,12 @@ internal class EventWriter(
     private val output: PrintStream,
 ) {
     fun capabilities() {
+        val rpcKinds = """["unary","client_stream","server_stream","bidi"]"""
         emit(
-            """{"schema_version":3,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}""",
+            """{"schema_version":4,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":{""" +
+                """"client":["trevrpc_native_quic","grpc_http2"],""" +
+                """"server":["trevrpc_native_quic","trevrpc_webtransport","grpc_http2"]},""" +
+                """"rpc_kinds":$rpcKinds,"histogram":"log_linear_v1"}""",
         )
     }
 
@@ -322,7 +342,7 @@ internal class EventWriter(
         check(!output.checkError()) { "failed to write benchmark protocol event" }
     }
 
-    private fun base(event: String): String = """{"schema_version":3,"event":${event.jsonString()},"peer":${PEER_NAME.jsonString()}"""
+    private fun base(event: String): String = """{"schema_version":4,"event":${event.jsonString()},"peer":${PEER_NAME.jsonString()}"""
 }
 
 private fun String.jsonString(): String =

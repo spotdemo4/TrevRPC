@@ -11,7 +11,7 @@
 
 namespace trevrpc_bench {
 
-constexpr std::uint32_t kSchemaVersion = 3;
+constexpr std::uint32_t kSchemaVersion = 4;
 constexpr auto kConnectTimeout = std::chrono::seconds(10);
 constexpr std::size_t kMaximumPayloadBytes = std::size_t{64} * 1024 * 1024;
 constexpr std::uint32_t kMaximumMessagesPerStream = 1'000'000;
@@ -37,7 +37,7 @@ struct Endpoint {
   [[nodiscard]] std::string address(std::uint16_t actual_port) const;
 };
 
-enum class Stack { TrevrpcNativeQuic, GrpcHttp2 };
+enum class Stack { TrevrpcNativeQuic, GrpcHttp2, TrevrpcWebTransport };
 enum class RpcKind { Unary, ClientStream, ServerStream, Bidi };
 
 struct ServerConfig {
@@ -45,6 +45,7 @@ struct ServerConfig {
   Endpoint endpoint;
   std::string certificate;
   std::string private_key;
+  std::string webtransport_origin;
 };
 
 struct ClientConfig {

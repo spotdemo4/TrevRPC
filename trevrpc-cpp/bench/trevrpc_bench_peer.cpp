@@ -37,6 +37,7 @@ using Clock = std::chrono::steady_clock;
 using Nanoseconds = std::chrono::nanoseconds;
 
 constexpr std::size_t kMaximumControlLine = 1024;
+constexpr std::string_view kWebTransportPath = "/trevrpc";
 
 volatile std::sig_atomic_t stop_requested = 0;
 
@@ -190,8 +191,11 @@ void reject_unknown(const Arguments& arguments) {
   if (value == "grpc_http2") {
     return Stack::GrpcHttp2;
   }
+  if (value == "trevrpc_webtransport") {
+    return Stack::TrevrpcWebTransport;
+  }
   throw PeerError("config", "invalid_argument",
-                  "--stack must be trevrpc_native_quic or grpc_http2");
+                  "--stack must be trevrpc_native_quic, grpc_http2, or trevrpc_webtransport");
 }
 
 [[nodiscard]] RpcKind parse_rpc_kind(std::string_view value) {
@@ -232,6 +236,15 @@ void reject_unknown(const Arguments& arguments) {
   config.endpoint = parse_endpoint("--listen", take_required(arguments, "listen"), true);
   config.certificate = take_required(arguments, "cert");
   config.private_key = take_required(arguments, "key");
+  if (config.stack == Stack::TrevrpcWebTransport) {
+    config.webtransport_origin = take_required(arguments, "webtransport-origin");
+    if (config.webtransport_origin.empty()) {
+      throw PeerError("config", "invalid_argument", "--webtransport-origin must not be empty");
+    }
+  } else if (arguments.contains("webtransport-origin")) {
+    throw PeerError("config", "invalid_argument",
+                    "--webtransport-origin is only valid for a trevrpc_webtransport server");
+  }
   reject_unknown(arguments);
   if (config.certificate.empty() || config.private_key.empty()) {
     throw PeerError("config", "invalid_argument", "--cert and --key must not be empty");
@@ -243,6 +256,9 @@ void reject_unknown(const Arguments& arguments) {
   Arguments arguments = parse_arguments(argc, argv);
   ClientConfig config;
   config.stack = parse_stack(take_required(arguments, "stack"));
+  if (config.stack == Stack::TrevrpcWebTransport) {
+    throw PeerError("config", "invalid_argument", "trevrpc_webtransport is server-only");
+  }
   config.endpoint = parse_endpoint("--address", take_required(arguments, "address"), false);
   config.certificate = take_required(arguments, "cert");
   config.rpc_kind = parse_rpc_kind(take_required(arguments, "rpc"));
@@ -507,6 +523,10 @@ start_native_server(const ServerConfig& peer_config) {
   config.port = peer_config.endpoint.port;
   config.cert_file = peer_config.certificate;
   config.key_file = peer_config.private_key;
+  if (peer_config.stack == Stack::TrevrpcWebTransport) {
+    config.webtransport_path = kWebTransportPath;
+    config.webtransport_origin = peer_config.webtransport_origin;
+  }
   config.peer_bidi_stream_count = kPeerStreamLimit;
   config.max_frame_size = kMaximumFrameSize;
   auto listening = trevrpc::Server::listen(config);
@@ -517,6 +537,7 @@ start_native_server(const ServerConfig& peer_config) {
 
   trevrpc::ServerOptions options;
   options.worker_queue_capacity = std::numeric_limits<std::int64_t>::max();
+  options.initial_request_timeout = kConnectTimeout;
   options.max_stream_messages = kMaximumMessagesPerStream;
   options.max_stream_body_size = std::numeric_limits<std::int64_t>::max();
   auto configured = server.set_options(options);
@@ -538,9 +559,8 @@ start_native_server(const ServerConfig& peer_config) {
 
 int run_server(int argc, char** argv) {
   const ServerConfig config = parse_server_config(argc, argv);
-  std::unique_ptr<BenchmarkServer> server = config.stack == Stack::TrevrpcNativeQuic
-                                                ? start_native_server(config)
-                                                : start_grpc_server(config);
+  std::unique_ptr<BenchmarkServer> server =
+      config.stack == Stack::GrpcHttp2 ? start_grpc_server(config) : start_native_server(config);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   if (server->stopped()) {
@@ -1135,9 +1155,9 @@ int main(int argc, char** argv) {
       }
       emit("{\"schema_version\":" + std::to_string(kSchemaVersion) +
            ",\"event\":\"capabilities\",\"peer\":\"cpp\","
-           "\"roles\":[\"client\",\"server\"],"
+           "\"roles\":{\"client\":[\"trevrpc_native_quic\",\"grpc_http2\"],"
+           "\"server\":[\"trevrpc_native_quic\",\"grpc_http2\",\"trevrpc_webtransport\"]},"
            "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
-           "\"stacks\":[\"trevrpc_native_quic\",\"grpc_http2\"],"
            "\"histogram\":\"log_linear_v1\"}");
       return 0;
     }

@@ -1,8 +1,12 @@
 {
   "schema_version": 4,
-  "campaign_id": "grpc-all-languages-smoke",
+  "campaign_id": "chromium-webtransport-all-servers-smoke",
   "repetitions": 1,
   "peers": [
+    {
+      "id": "chromium",
+      "command": ["trevrpc-bench-peer-chromium"]
+    },
     {
       "id": "c",
       "command": ["trevrpc-bench-peer-c"]
@@ -30,52 +34,52 @@
   ],
   "cells": [
     {
-      "id": "c-grpc",
-      "client": "c",
+      "id": "chromium-c",
+      "client": "chromium",
       "server": "c",
-      "stack": "grpc_http2"
+      "stack": "trevrpc_webtransport"
     },
     {
-      "id": "cpp-grpc",
-      "client": "cpp",
+      "id": "chromium-cpp",
+      "client": "chromium",
       "server": "cpp",
-      "stack": "grpc_http2"
+      "stack": "trevrpc_webtransport"
     },
     {
-      "id": "go-grpc",
-      "client": "go",
+      "id": "chromium-go",
+      "client": "chromium",
       "server": "go",
-      "stack": "grpc_http2"
+      "stack": "trevrpc_webtransport"
     },
     {
-      "id": "js-grpc",
-      "client": "js",
+      "id": "chromium-js",
+      "client": "chromium",
       "server": "js",
-      "stack": "grpc_http2"
+      "stack": "trevrpc_webtransport"
     },
     {
-      "id": "kotlin-grpc",
-      "client": "kotlin",
+      "id": "chromium-kotlin",
+      "client": "chromium",
       "server": "kotlin",
-      "stack": "grpc_http2"
+      "stack": "trevrpc_webtransport"
     },
     {
-      "id": "rust-grpc",
-      "client": "rust",
+      "id": "chromium-rust",
+      "client": "chromium",
       "server": "rust",
-      "stack": "grpc_http2"
+      "stack": "trevrpc_webtransport"
     }
   ],
   "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
   "concurrencies": [1],
   "timing": {
-    "warmup_ms": 10,
-    "measurement_ms": 20
+    "warmup_ms": 50,
+    "measurement_ms": 250
   },
   "workload": {
     "request_bytes": 16,
     "response_bytes": 16,
-    "messages_per_stream": 8
+    "messages_per_stream": 4
   },
   "startup_timeout_ms": 30000,
   "drain_timeout_ms": 30000

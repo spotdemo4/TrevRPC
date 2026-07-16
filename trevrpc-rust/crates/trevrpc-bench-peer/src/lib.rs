@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -36,10 +36,13 @@ use grpc::GrpcWorkload;
 use histogram::{HistogramBucket, LogLinearHistogram};
 use workload::{BenchmarkServiceImpl, BenchmarkWorkload, MessageCounts, Workload, WorkloadConfig};
 
-const SCHEMA_VERSION: u8 = 3;
+const SCHEMA_VERSION: u8 = 4;
 const PEER: &str = "rust";
 const SERVER_MAX_STREAMS: usize = 1024;
 const SERVER_MAX_REQUESTS: usize = 4096;
+const WEBTRANSPORT_PATH: &str = "/trevrpc";
+
+static WEBTRANSPORT_ORIGIN: OnceLock<RwLock<String>> = OnceLock::new();
 
 type PeerResult<T = ()> = Result<T, PeerError>;
 
@@ -100,20 +103,42 @@ async fn run_server(config: ServerConfig) -> PeerResult {
     match config.stack {
         Stack::TrevrpcNativeQuic => run_native_server(config).await,
         Stack::GrpcHttp2 => run_grpc_server(config).await,
+        Stack::TrevrpcWebTransport => run_webtransport_server(config).await,
     }
 }
 
 async fn run_native_server(config: ServerConfig) -> PeerResult {
+    run_trevrpc_server(config, false).await
+}
+
+async fn run_webtransport_server(config: ServerConfig) -> PeerResult {
+    run_trevrpc_server(config, true).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_trevrpc_server(config: ServerConfig, webtransport: bool) -> PeerResult {
     let mut server = trevrpc::server::Server::new();
-    server.set_options(
-        trevrpc::server::ServerOptions::new()
-            .with_max_frame_size(MAX_ENCODED_FRAME_BYTES)
-            .with_max_concurrent_connections(Some(8))
-            .with_max_concurrent_streams_per_connection(Some(SERVER_MAX_STREAMS))
-            .with_max_concurrent_requests(Some(SERVER_MAX_REQUESTS))
-            .with_max_stream_messages(Some(MAX_MESSAGES_PER_STREAM as usize))
-            .with_max_stream_body_size(None),
-    );
+    let mut options = trevrpc::server::ServerOptions::new()
+        .with_max_frame_size(MAX_ENCODED_FRAME_BYTES)
+        .with_max_concurrent_connections(Some(8))
+        .with_max_concurrent_streams_per_connection(Some(SERVER_MAX_STREAMS))
+        .with_max_concurrent_requests(Some(SERVER_MAX_REQUESTS))
+        .with_max_stream_messages(Some(MAX_MESSAGES_PER_STREAM as usize))
+        .with_max_stream_body_size(None);
+    if webtransport {
+        let origin = config.webtransport_origin.as_deref().ok_or_else(|| {
+            PeerError::new(
+                "config",
+                "invalid_argument",
+                "trevrpc_webtransport server requires --webtransport-origin",
+            )
+        })?;
+        set_webtransport_origin(origin)?;
+        options = options
+            .with_webtransport_path(WEBTRANSPORT_PATH)
+            .with_webtransport_admission(Some(benchmark_webtransport_admission));
+    }
+    server.set_options(options);
     proto::register_benchmark_service(&mut server, BenchmarkServiceImpl);
 
     let certificate_pem = fs::read(&config.certificate)
@@ -136,7 +161,11 @@ async fn run_native_server(config: ServerConfig) -> PeerResult {
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
         .map_err(|error| PeerError::wrap("server", "tls_config_failed", error))?;
-    crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+    crypto.alpn_protocols = if webtransport {
+        vec![trevrpc::HTTP3_ALPN.to_vec()]
+    } else {
+        vec![trevrpc::ALPN.to_vec()]
+    };
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(crypto)
             .map_err(|error| PeerError::wrap("server", "tls_config_failed", error))?,
@@ -144,7 +173,11 @@ async fn run_native_server(config: ServerConfig) -> PeerResult {
     trevrpc::quinn::configure_server_config(
         &mut server_config,
         server.options(),
-        trevrpc::quinn::TransportMode::Native,
+        if webtransport {
+            trevrpc::quinn::TransportMode::WebTransport
+        } else {
+            trevrpc::quinn::TransportMode::Native
+        },
     );
     let server_transport = Arc::get_mut(&mut server_config.transport).ok_or_else(|| {
         PeerError::new(
@@ -161,11 +194,16 @@ async fn run_native_server(config: ServerConfig) -> PeerResult {
         .map_err(|error| PeerError::wrap("server", "listen_failed", error))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let mut server_task = tokio::spawn(async move {
-        server
-            .serve_quinn_with_shutdown(endpoint, async {
-                let _ = shutdown_rx.await;
-            })
-            .await
+        let shutdown = async {
+            let _ = shutdown_rx.await;
+        };
+        if webtransport {
+            server
+                .serve_quinn_and_webtransport_with_shutdown(endpoint, shutdown)
+                .await
+        } else {
+            server.serve_quinn_with_shutdown(endpoint, shutdown).await
+        }
     });
 
     emit(&ReadyEvent {
@@ -192,6 +230,31 @@ async fn run_native_server(config: ServerConfig) -> PeerResult {
         }
     };
     finish_server_task(server_result, protocol_shutdown)
+}
+
+fn benchmark_webtransport_admission(
+    request: &trevrpc::server::WebTransportAdmissionRequest<'_>,
+) -> bool {
+    request.path == WEBTRANSPORT_PATH
+        && request.origin.is_some_and(|origin| {
+            WEBTRANSPORT_ORIGIN
+                .get()
+                .and_then(|configured| configured.read().ok())
+                .is_some_and(|configured| configured.as_str() == origin)
+        })
+}
+
+fn set_webtransport_origin(origin: &str) -> PeerResult {
+    let configured_origin = WEBTRANSPORT_ORIGIN.get_or_init(|| RwLock::new(String::new()));
+    let mut configured_origin = configured_origin.write().map_err(|_| {
+        PeerError::new(
+            "config",
+            "origin_lock_failed",
+            "WebTransport origin lock is poisoned",
+        )
+    })?;
+    origin.clone_into(&mut configured_origin);
+    Ok(())
 }
 
 async fn run_grpc_server(config: ServerConfig) -> PeerResult {
@@ -332,6 +395,13 @@ async fn run_client(config: ClientConfig) -> PeerResult {
         Stack::GrpcHttp2 => {
             let workload = connect_grpc_client(&config).await?;
             run_client_workload(&config, workload).await?;
+        }
+        Stack::TrevrpcWebTransport => {
+            return Err(PeerError::new(
+                "config",
+                "invalid_argument",
+                "trevrpc_webtransport is a server-only stack",
+            ));
         }
     }
     Ok(())
@@ -716,10 +786,15 @@ struct CapabilitiesEvent {
     schema_version: u8,
     event: &'static str,
     peer: &'static str,
-    roles: [&'static str; 2],
+    roles: RoleCapabilities,
     rpc_kinds: [&'static str; 4],
-    stacks: [&'static str; 2],
     histogram: &'static str,
+}
+
+#[derive(Serialize)]
+struct RoleCapabilities {
+    client: &'static [&'static str],
+    server: &'static [&'static str],
 }
 
 const fn capabilities() -> CapabilitiesEvent {
@@ -727,9 +802,11 @@ const fn capabilities() -> CapabilitiesEvent {
         schema_version: SCHEMA_VERSION,
         event: "capabilities",
         peer: PEER,
-        roles: ["client", "server"],
+        roles: RoleCapabilities {
+            client: &["trevrpc_native_quic", "grpc_http2"],
+            server: &["trevrpc_native_quic", "grpc_http2", "trevrpc_webtransport"],
+        },
         rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
-        stacks: ["trevrpc_native_quic", "grpc_http2"],
         histogram: "log_linear_v1",
     }
 }
@@ -808,21 +885,26 @@ mod tests {
     use crate::workload::{
         BenchmarkServiceImpl, BenchmarkWorkload, MessageCounts, Workload, WorkloadConfig,
     };
-    use crate::{PreparedPhase, capabilities, connect_grpc_channel, connect_native_transport};
+    use crate::{
+        PreparedPhase, capabilities, connect_grpc_channel, connect_native_transport,
+        set_webtransport_origin,
+    };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
     #[test]
-    fn capabilities_advertise_schema_two_stacks() -> TestResult {
+    fn capabilities_advertise_role_specific_stacks() -> TestResult {
         assert_eq!(
             serde_json::to_value(capabilities())?,
             json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "event": "capabilities",
                 "peer": "rust",
-                "roles": ["client", "server"],
+                "roles": {
+                    "client": ["trevrpc_native_quic", "grpc_http2"],
+                    "server": ["trevrpc_native_quic", "grpc_http2", "trevrpc_webtransport"]
+                },
                 "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
-                "stacks": ["trevrpc_native_quic", "grpc_http2"],
                 "histogram": "log_linear_v1"
             })
         );
@@ -1075,6 +1157,141 @@ mod tests {
 
         connection.close(0_u32.into(), b"test complete");
         client_endpoint.wait_idle().await;
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), server_task).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn private_ca_webtransport_round_trips_all_rpc_kinds_and_enforces_admission() -> TestResult
+    {
+        const ORIGIN: &str = "https://benchmark.example";
+
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate()?)?;
+        let server_key = KeyPair::generate()?;
+        let certificate =
+            CertificateParams::new(vec!["127.0.0.1".to_owned()])?.signed_by(&server_key, &ca)?;
+        let certificate_der = CertificateDer::from(certificate);
+        let private_key = PrivatePkcs8KeyDer::from(server_key.serialize_der());
+
+        set_webtransport_origin(ORIGIN)?;
+        let mut server = trevrpc::server::Server::new();
+        server.set_options(
+            trevrpc::server::ServerOptions::new()
+                .with_max_frame_size(MAX_ENCODED_FRAME_BYTES)
+                .with_graceful_shutdown_timeout(Some(Duration::from_secs(1)))
+                .with_webtransport_path(crate::WEBTRANSPORT_PATH)
+                .with_webtransport_admission(Some(crate::benchmark_webtransport_admission)),
+        );
+        crate::proto::register_benchmark_service(&mut server, BenchmarkServiceImpl);
+
+        let mut server_crypto = quinn::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate_der.clone()],
+                PrivateKeyDer::from(private_key),
+            )?;
+        server_crypto.alpn_protocols = vec![trevrpc::HTTP3_ALPN.to_vec()];
+        let mut server_config =
+            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+        trevrpc::quinn::configure_server_config(
+            &mut server_config,
+            server.options(),
+            trevrpc::quinn::TransportMode::WebTransport,
+        );
+        let server_endpoint =
+            quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        let server_address = server_endpoint.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_quinn_and_webtransport_with_shutdown(server_endpoint, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = web_transport_quinn::ClientBuilder::new()
+            .with_server_certificates(vec![certificate_der])?;
+        let connect_request = |path: &str, origin: &'static str| {
+            web_transport_quinn::proto::ConnectRequest::new(
+                format!("https://{server_address}{path}")
+                    .parse::<url::Url>()
+                    .expect("test WebTransport URL should parse"),
+            )
+            .with_header(
+                web_transport_quinn::http::header::ORIGIN,
+                web_transport_quinn::http::HeaderValue::from_static(origin),
+            )
+        };
+        assert!(
+            client
+                .connect(connect_request("/wrong", ORIGIN))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .connect(connect_request(
+                    crate::WEBTRANSPORT_PATH,
+                    "https://wrong.example",
+                ))
+                .await
+                .is_err()
+        );
+
+        let session = client
+            .connect(connect_request(crate::WEBTRANSPORT_PATH, ORIGIN))
+            .await?;
+        let transport = trevrpc::advanced::RawWebTransport::new(session.clone())
+            .with_max_frame_size(MAX_ENCODED_FRAME_BYTES);
+        for (rpc, expected) in [
+            (
+                RpcKind::Unary,
+                MessageCounts {
+                    request: 1,
+                    response: 1,
+                },
+            ),
+            (
+                RpcKind::ClientStream,
+                MessageCounts {
+                    request: 4,
+                    response: 1,
+                },
+            ),
+            (
+                RpcKind::ServerStream,
+                MessageCounts {
+                    request: 1,
+                    response: 4,
+                },
+            ),
+            (
+                RpcKind::Bidi,
+                MessageCounts {
+                    request: 4,
+                    response: 4,
+                },
+            ),
+        ] {
+            let workload = Workload::new(
+                transport.clone(),
+                WorkloadConfig {
+                    rpc,
+                    request_bytes: 17,
+                    response_bytes: 23,
+                    messages_per_stream: 4,
+                },
+            );
+            assert_eq!(workload.execute().await?, expected);
+        }
+
+        session.close(0, b"test complete");
+        drop(client);
         let _ = shutdown_tx.send(());
         tokio::time::timeout(Duration::from_secs(2), server_task).await???;
         Ok(())

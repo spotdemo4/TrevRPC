@@ -11,6 +11,8 @@ import zip.trev.trevrpc.netty.NettyRpcServer
 import zip.trev.trevrpc.netty.NettyRpcServerConfig
 import zip.trev.trevrpc.netty.NettyServerTls
 import zip.trev.trevrpc.netty.NettyTransportOptions
+import zip.trev.trevrpc.netty.WEBTRANSPORT_PATH
+import zip.trev.trevrpc.netty.WebTransportAdmission
 import zip.trev.trevrpc.netty.advanced.RawNettyQuicRpcTransport
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -146,13 +148,7 @@ private suspend fun bindBenchmarkServer(config: PeerCommand.Server): RunningBenc
             val server =
                 NettyRpcServer.bind(
                     createBenchmarkServer(),
-                    NettyRpcServerConfig(
-                        bindAddress = address,
-                        tls = NettyServerTls.Pem(config.privateKey.toFile(), config.certificate.toFile()),
-                        enableNative = true,
-                        enableHttp3 = false,
-                        options = benchmarkTransportOptions(),
-                    ),
+                    benchmarkNettyServerConfig(config, address),
                 )
             object : RunningBenchmarkServer {
                 override val localAddress = server.localAddress
@@ -163,6 +159,19 @@ private suspend fun bindBenchmarkServer(config: PeerCommand.Server): RunningBenc
 
         BenchmarkStack.GRPC_HTTP2 -> {
             val server = GrpcBenchmarkServer.bind(address, config.certificate, config.privateKey)
+            object : RunningBenchmarkServer {
+                override val localAddress = server.localAddress
+
+                override suspend fun shutdown() = server.shutdown()
+            }
+        }
+
+        BenchmarkStack.TREVRPC_WEBTRANSPORT -> {
+            val server =
+                NettyRpcServer.bind(
+                    createBenchmarkServer(),
+                    benchmarkNettyServerConfig(config, address),
+                )
             object : RunningBenchmarkServer {
                 override val localAddress = server.localAddress
 
@@ -199,7 +208,42 @@ private suspend fun connectBenchmarkClient(config: PeerCommand.Client): Benchmar
             val channel = createGrpcChannel(address, config.certificate)
             BenchmarkClientConnection(GrpcBenchmarkClient(channel), channel::shutdownGracefully)
         }
+
+        BenchmarkStack.TREVRPC_WEBTRANSPORT -> {
+            throw IllegalArgumentException("trevrpc_webtransport is not supported by the Kotlin benchmark client")
+        }
     }
+}
+
+internal fun benchmarkNettyServerConfig(
+    config: PeerCommand.Server,
+    address: InetSocketAddress,
+): NettyRpcServerConfig {
+    val webTransport = config.stack == BenchmarkStack.TREVRPC_WEBTRANSPORT
+    val expectedOrigin =
+        if (webTransport) {
+            requireNotNull(config.webTransportOrigin) {
+                "trevrpc_webtransport server requires --webtransport-origin"
+            }
+        } else {
+            null
+        }
+    return NettyRpcServerConfig(
+        bindAddress = address,
+        tls = NettyServerTls.Pem(config.privateKey.toFile(), config.certificate.toFile()),
+        enableNative = !webTransport,
+        enableHttp3 = webTransport,
+        enableWebTransport = webTransport,
+        webTransportAdmission =
+            if (webTransport) {
+                WebTransportAdmission { request ->
+                    request.path == WEBTRANSPORT_PATH && request.secure && request.origin == expectedOrigin
+                }
+            } else {
+                null
+            },
+        options = benchmarkTransportOptions(),
+    )
 }
 
 private interface RunningBenchmarkServer {

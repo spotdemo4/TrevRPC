@@ -1,9 +1,9 @@
 # RPC Benchmark Harness
 
 `trevrpc-bench` is the centralized controller for language-owned benchmark
-peers. It runs TrevRPC native QUIC and gRPC HTTP/2 client/server pairs,
-validates their structured results, collects process metrics, and generates
-replayable reports.
+peers. It runs TrevRPC native QUIC, TrevRPC WebTransport, and gRPC HTTP/2
+client/server pairs, validates their structured results, collects process-group
+metrics, and generates replayable reports.
 
 ## Build
 
@@ -16,8 +16,9 @@ nix build .#trevrpc-bench-suite
 The complete suite currently targets `x86_64-linux` because the Kotlin peer
 packages Netty's Linux x86-64 native QUIC transport.
 
-The resulting `bin` directory contains `trevrpc-bench` and one
-`trevrpc-bench-peer-*` executable for C, C++, Go, JavaScript, Kotlin, and Rust.
+The resulting `bin` directory contains `trevrpc-bench`, one
+`trevrpc-bench-peer-*` executable for C, C++, Go, JavaScript, Kotlin, and Rust,
+and the dedicated Chromium WebTransport client peer.
 Peers are peer-only overrides of their associated `trevrpc-*` consumer packages,
 which remain free of benchmark-only gRPC dependencies by default. The canonical
 RPC contract and process protocol live under `bench/`. Individual Nix packages
@@ -29,11 +30,13 @@ package.
 
 ## Run
 
-Campaigns and peers use schema V3. Every cell selects a required `stack`:
-`trevrpc_native_quic` or `grpc_http2`. A cell may use any listed peer as its
-client and any listed peer as its server, so the same controller supports stack
-and split client/server comparisons. Earlier campaign and peer-event schema
-versions are not supported.
+Campaigns and peers use schema V4. Every cell selects a required `stack`:
+`trevrpc_native_quic`, `trevrpc_webtransport`, or `grpc_http2`. A cell may use
+any listed peer as its client and any listed peer as its server, so the same
+controller supports stack and split client/server comparisons. Capabilities are
+validated independently for each role; client support never implies server
+support or vice versa. Earlier campaign and peer-event schema versions are not
+supported.
 
 ```sh
 export PATH="$PWD/result/bin:$PATH"
@@ -52,6 +55,13 @@ for performance comparisons.
 `stack-comparison.example.json` contains same-language TrevRPC and gRPC cells
 for C, C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's
 advertised stacks, roles, RPC kinds, and histogram before starting a run.
+
+`webtransport-smoke.example.json` starts the Chromium client before each RPC
+server and runs it against all six server implementations. Its six cells and
+four RPC kinds produce 24 functional samples. The client first reports its
+prepared browser origin; the controller passes that origin to the server, sends
+the ready server address back with `CONNECT`, waits for `armed`, and then starts
+measurement.
 
 ### Single-Host Network Emulation
 
@@ -85,8 +95,9 @@ delay, jitter, random loss, rate, and queue limit to the sending endpoint.
 Delay is one-way: 15 ms on each endpoint produces approximately 30 ms RTT.
 The controller uses the benchmark-only `198.18.0.0/30` range inside its private
 namespace and records the effective addresses and qdisc configuration in
-`manifest.json`. Peer processes remain direct children with host-visible PIDs,
-so process metrics retain the same scope as loopback campaigns.
+`manifest.json`. Peer leaders remain direct children with host-visible PIDs,
+and every peer runs in its own session, so process-group metrics retain the same
+scope as loopback campaigns while including peer subprocesses.
 
 The netns backend is Linux-only and requires `unshare`, `ip`, `tc`, and a kernel
 that permits unprivileged user namespaces. Unsupported hosts fail explicitly;
@@ -115,7 +126,7 @@ Every output directory contains:
 - `report.md`: human-readable result table and interpretation boundary.
 - `report.html`: self-contained SVG throughput and p99 graphs.
 - `raw/<sample>/`: exact peer stdout and stderr; sample names include the stack.
-- `certificates/`: one-run private CA and server identity.
+- `certificates/`: one-run private CA and ECDSA P-256 server identity.
 
 Reports are deterministic from `samples.jsonl` and can be regenerated without
 rerunning a campaign:
@@ -127,15 +138,19 @@ trevrpc-bench report target/bench/native-quic
 ## Measurement Boundary
 
 Peers establish and validate their connection, run warmup, and arm all lanes
-before the controller starts process metrics and sends `START`. The client then
-runs closed-loop operations during a fixed admission window and drains work
-admitted before its deadline. Peak RSS is the highest 10 ms `VmRSS` sample in
-that interval rather than the process lifetime high-water mark. Connection
-setup, warmup, report generation, and shutdown are excluded; client process CPU
-includes encoding and writing the final histogram event before the controller
-can stop sampling.
+before the controller starts process metrics and sends `START`. WebTransport is
+the exception only during setup: the Chromium peer first prepares its browser
+origin, then receives `CONNECT HOST:PORT` after the server is ready. The client
+then runs closed-loop operations during a fixed admission window and drains work
+admitted before its deadline. Peak RSS is the highest 10 ms sum of `VmRSS`
+across the peer process group rather than a process lifetime high-water mark.
+CPU includes the complete process group and Linux reaped-child CPU accounting;
+context-switch counters retain the final observed value for exited members.
+Connection setup, warmup, report generation, and shutdown are excluded; client
+group CPU includes encoding and writing the final histogram event before the
+controller can stop sampling.
 
 Latency is measured for a complete bounded RPC. A streaming RPC contains the
 configured `messages_per_stream`; message throughput is reported separately
-from operation throughput. See `peer-protocol-v3.md` for the peer protocol
+from operation throughput. See `peer-protocol-v4.md` for the peer protocol
 and exact semantics.

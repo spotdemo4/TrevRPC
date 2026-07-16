@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -15,7 +16,7 @@ use crate::certificate::{self, Certificates};
 use crate::metrics::{ProcessDelta, ProcessMonitor};
 use crate::network::{Endpoint, NetworkSnapshot, NetworkTopology};
 use crate::protocol::{
-    self, Armed, Capabilities, HistogramBucket, PeerSample, Ready, ValidatedSample,
+    self, Armed, Capabilities, HistogramBucket, PeerSample, Prepared, Ready, Role, ValidatedSample,
 };
 use crate::{BoxError, SCHEMA_VERSION, report};
 
@@ -160,58 +161,63 @@ fn run_sample(
     let server_peer = campaign.peer(&cell.server).ok_or("missing server peer")?;
     let client_peer = campaign.peer(&cell.client).ok_or("missing client peer")?;
 
-    let mut server = PeerProcess::spawn(
-        server_peer,
-        &[
-            "server".to_owned(),
-            "--stack".to_owned(),
-            cell.stack.as_str().to_owned(),
-            "--listen".to_owned(),
-            topology.server_listen(),
-            "--cert".to_owned(),
-            path_string(&certificates.certificate),
-            "--key".to_owned(),
-            path_string(&certificates.private_key),
-        ],
-        &raw,
-        "server",
-        topology,
-        Endpoint::Server,
-    )?;
-    let ready_line = server.event(Duration::from_millis(campaign.startup_timeout_ms))?;
-    let ready: Ready = parse_expected(&ready_line, "ready")?;
-    ready.validate(&server_peer.id, server.id())?;
+    let startup_timeout = Duration::from_millis(campaign.startup_timeout_ms);
+    let (mut server, mut client) = if cell.stack == Stack::TrevrpcWebtransport {
+        let mut client = PeerProcess::spawn(
+            client_peer,
+            &client_arguments(campaign, cell, rpc_kind, concurrency, certificates, None),
+            &raw,
+            "client",
+            topology,
+            Endpoint::Client,
+        )?;
+        let prepared_line = client.event(startup_timeout)?;
+        let prepared: Prepared = parse_expected(&prepared_line, "prepared")?;
+        prepared.validate(&client_peer.id, client.id())?;
 
-    let mut client = PeerProcess::spawn(
-        client_peer,
-        &[
-            "client".to_owned(),
-            "--stack".to_owned(),
-            cell.stack.as_str().to_owned(),
-            "--address".to_owned(),
-            ready.address,
-            "--cert".to_owned(),
-            path_string(&certificates.ca),
-            "--rpc".to_owned(),
-            rpc_kind.as_str().to_owned(),
-            "--concurrency".to_owned(),
-            concurrency.to_string(),
-            "--warmup-ms".to_owned(),
-            campaign.timing.warmup_ms.to_string(),
-            "--measurement-ms".to_owned(),
-            campaign.timing.measurement_ms.to_string(),
-            "--request-bytes".to_owned(),
-            campaign.workload.request_bytes.to_string(),
-            "--response-bytes".to_owned(),
-            campaign.workload.response_bytes.to_string(),
-            "--messages-per-stream".to_owned(),
-            campaign.workload.messages_per_stream.to_string(),
-        ],
-        &raw,
-        "client",
-        topology,
-        Endpoint::Client,
-    )?;
+        let server = PeerProcess::spawn(
+            server_peer,
+            &server_arguments(cell, topology, certificates, Some(&prepared.origin)),
+            &raw,
+            "server",
+            topology,
+            Endpoint::Server,
+        )?;
+        let ready_line = server.event(startup_timeout)?;
+        let ready: Ready = parse_expected(&ready_line, "ready")?;
+        ready.validate(&server_peer.id, server.id())?;
+        client.send(&format!("CONNECT {}", ready.address))?;
+        (server, client)
+    } else {
+        let server = PeerProcess::spawn(
+            server_peer,
+            &server_arguments(cell, topology, certificates, None),
+            &raw,
+            "server",
+            topology,
+            Endpoint::Server,
+        )?;
+        let ready_line = server.event(startup_timeout)?;
+        let ready: Ready = parse_expected(&ready_line, "ready")?;
+        ready.validate(&server_peer.id, server.id())?;
+
+        let client = PeerProcess::spawn(
+            client_peer,
+            &client_arguments(
+                campaign,
+                cell,
+                rpc_kind,
+                concurrency,
+                certificates,
+                Some(&ready.address),
+            ),
+            &raw,
+            "client",
+            topology,
+            Endpoint::Client,
+        )?;
+        (server, client)
+    };
     let armed_timeout = campaign
         .startup_timeout_ms
         .saturating_add(campaign.timing.warmup_ms)
@@ -236,10 +242,15 @@ fn run_sample(
         campaign.timing.measurement_ms,
         campaign.workload.messages_per_stream,
     )?;
-    let client_metrics = client_monitor.finish(client.id());
-    let server_metrics = server_monitor.finish(server.id());
+    let client_metrics = client_monitor.finish();
+    let server_metrics = server_monitor.finish();
 
-    client.wait_success(Duration::from_secs(5))?;
+    let client_exit_timeout = if cell.stack == Stack::TrevrpcWebtransport {
+        Duration::from_secs(20)
+    } else {
+        Duration::from_secs(5)
+    };
+    client.wait_success(client_exit_timeout)?;
     server.send("SHUTDOWN")?;
     let stopped = server.event(Duration::from_secs(5))?;
     let stopped_header = protocol::parse_header(&stopped)?;
@@ -260,6 +271,71 @@ fn run_sample(
         server_metrics,
         peer_sample.histogram,
     ))
+}
+
+fn server_arguments(
+    cell: &Cell,
+    topology: &NetworkTopology,
+    certificates: &Certificates,
+    webtransport_origin: Option<&str>,
+) -> Vec<String> {
+    let mut arguments = vec![
+        "server".to_owned(),
+        "--stack".to_owned(),
+        cell.stack.as_str().to_owned(),
+        "--listen".to_owned(),
+        topology.server_listen(),
+        "--cert".to_owned(),
+        path_string(&certificates.certificate),
+        "--key".to_owned(),
+        path_string(&certificates.private_key),
+    ];
+    if let Some(origin) = webtransport_origin {
+        arguments.extend(["--webtransport-origin".to_owned(), origin.to_owned()]);
+    }
+    arguments
+}
+
+fn client_arguments(
+    campaign: &Campaign,
+    cell: &Cell,
+    rpc_kind: RpcKind,
+    concurrency: usize,
+    certificates: &Certificates,
+    address: Option<&str>,
+) -> Vec<String> {
+    let certificate = if cell.stack == Stack::TrevrpcWebtransport {
+        &certificates.certificate
+    } else {
+        &certificates.ca
+    };
+    let mut arguments = vec![
+        "client".to_owned(),
+        "--stack".to_owned(),
+        cell.stack.as_str().to_owned(),
+    ];
+    if let Some(address) = address {
+        arguments.extend(["--address".to_owned(), address.to_owned()]);
+    }
+    arguments.extend([
+        "--cert".to_owned(),
+        path_string(certificate),
+        "--rpc".to_owned(),
+        rpc_kind.as_str().to_owned(),
+        "--concurrency".to_owned(),
+        concurrency.to_string(),
+        "--warmup-ms".to_owned(),
+        campaign.timing.warmup_ms.to_string(),
+        "--measurement-ms".to_owned(),
+        campaign.timing.measurement_ms.to_string(),
+        "--request-bytes".to_owned(),
+        campaign.workload.request_bytes.to_string(),
+        "--response-bytes".to_owned(),
+        campaign.workload.response_bytes.to_string(),
+        "--messages-per-stream".to_owned(),
+        campaign.workload.messages_per_stream.to_string(),
+    ]);
+    arguments
 }
 
 fn sample_id(cell: &Cell, rpc_kind: RpcKind, concurrency: usize, repetition: u32) -> String {
@@ -325,6 +401,7 @@ fn record(
 fn capabilities(peer: &Peer, timeout: Duration) -> Result<Capabilities, BoxError> {
     let capture = CapabilityCapture::new(peer)?;
     let mut command = peer_command(peer)?;
+    configure_peer_session(&mut command);
     let mut child = command
         .arg("capabilities")
         .stdin(Stdio::null())
@@ -337,17 +414,18 @@ fn capabilities(peer: &Peer, timeout: Duration) -> Result<Capabilities, BoxError
             break status;
         }
         if capture.output_too_large()? {
-            let _ = child.kill();
+            terminate_child_group(&mut child);
             let _ = child.wait();
             return Err(format!("peer {} capabilities exceeded output limit", peer.id).into());
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            terminate_child_group(&mut child);
             let _ = child.wait();
             return Err(format!("peer {} capabilities timed out", peer.id).into());
         }
         thread::sleep(Duration::from_millis(10));
     };
+    terminate_child_group(&mut child);
     let stdout = CapabilityCapture::read(&capture.stdout, &peer.id, "stdout")?;
     let stderr = CapabilityCapture::read(&capture.stderr, &peer.id, "stderr")?;
     if !status.success() {
@@ -374,24 +452,16 @@ fn validate_capabilities(
     peer: &Peer,
     capabilities: &Capabilities,
 ) -> Result<(), BoxError> {
-    let mut roles = BTreeSet::new();
-    let mut stacks = BTreeSet::new();
+    let mut roles = BTreeMap::<Role, BTreeSet<Stack>>::new();
     for cell in &campaign.cells {
         if cell.client == peer.id {
-            roles.insert("client");
-            stacks.insert(cell.stack);
+            roles.entry(Role::Client).or_default().insert(cell.stack);
         }
         if cell.server == peer.id {
-            roles.insert("server");
-            stacks.insert(cell.stack);
+            roles.entry(Role::Server).or_default().insert(cell.stack);
         }
     }
-    capabilities.validate(
-        &peer.id,
-        &roles.into_iter().collect::<Vec<_>>(),
-        &campaign.rpc_kinds,
-        &stacks.into_iter().collect::<Vec<_>>(),
-    )
+    capabilities.validate(&peer.id, &roles, &campaign.rpc_kinds)
 }
 
 struct CapabilityCapture {
@@ -451,6 +521,7 @@ fn peer_command(peer: &Peer) -> Result<Command, BoxError> {
 
 struct PeerProcess {
     child: Child,
+    process_group: Option<u32>,
     stdin: ChildStdin,
     events: Receiver<Result<String, String>>,
 }
@@ -469,6 +540,7 @@ impl PeerProcess {
         let stderr = File::create(&stderr_path)?;
         let mut command = peer_command(peer)?;
         topology.configure_command(&mut command, endpoint);
+        configure_peer_session(&mut command);
         let mut child = command
             .args(arguments)
             .stdin(Stdio::piped())
@@ -505,8 +577,10 @@ impl PeerProcess {
                 }
             }
         });
+        let process_group = child.id();
         Ok(Self {
             child,
+            process_group: Some(process_group),
             stdin,
             events,
         })
@@ -540,28 +614,81 @@ impl PeerProcess {
         loop {
             if let Some(status) = self.child.try_wait()? {
                 if status.success() {
+                    self.terminate_group();
                     return Ok(());
                 }
+                self.terminate_group();
                 return Err(
                     format!("peer process {} exited with {status}", self.child.id()).into(),
                 );
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
+                self.terminate_group();
                 let _ = self.child.wait();
                 return Err(format!("peer process {} did not exit", self.child.id()).into());
             }
             thread::sleep(Duration::from_millis(10));
         }
     }
+
+    fn terminate_group(&mut self) {
+        let Some(process_group) = self.process_group.take() else {
+            return;
+        };
+        if kill_process_group(process_group).is_err() {
+            let _ = self.child.kill();
+        }
+    }
 }
 
 impl Drop for PeerProcess {
     fn drop(&mut self) {
+        self.terminate_group();
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+}
+
+fn terminate_child_group(child: &mut Child) {
+    if kill_process_group(child.id()).is_err() {
+        let _ = child.kill();
+    }
+}
+
+fn configure_peer_session(command: &mut Command) {
+    let parent_pid = std::process::id();
+    // SAFETY: these libc calls run in the forked child before exec and only
+    // affect that child. Errors are returned through Command's exec error pipe.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid.cast_signed() {
+                return Err(io::Error::from_raw_os_error(libc::ECHILD));
+            }
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn kill_process_group(process_group: u32) -> Result<(), io::Error> {
+    let process_group =
+        i32::try_from(process_group).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: a negative PID asks kill(2) to signal the process group. Every
+    // peer is a session leader whose process-group ID is its child PID.
+    if unsafe { libc::kill(-process_group, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -611,7 +738,7 @@ fn write_manifest(
         source_commit,
         source_dirty,
         peer_artifacts: artifacts,
-        metrics_scope: "direct_peer_process_procfs_10ms",
+        metrics_scope: "peer_process_group_procfs_10ms",
         network_environment,
     };
     let file = File::create(output.join("manifest.json"))?;
@@ -655,10 +782,15 @@ fn path_string(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sample_id, sha256, validate_capabilities};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::{client_arguments, sample_id, server_arguments, sha256, validate_capabilities};
     use crate::SCHEMA_VERSION;
     use crate::campaign::{Campaign, Cell, Network, Peer, RpcKind, Stack, Timing, Workload};
-    use crate::protocol::Capabilities;
+    use crate::certificate::Certificates;
+    use crate::network::NetworkTopology;
+    use crate::protocol::{Capabilities, Role};
 
     fn campaign() -> Campaign {
         Campaign {
@@ -698,16 +830,41 @@ mod tests {
         }
     }
 
-    fn capabilities(peer: &str, roles: &[&str], stacks: Vec<Stack>) -> Capabilities {
+    fn capabilities(peer: &str, roles: &[&str], stacks: &[Stack]) -> Capabilities {
         Capabilities {
             schema_version: SCHEMA_VERSION,
             event: "capabilities".to_owned(),
             peer: peer.to_owned(),
-            roles: roles.iter().map(ToString::to_string).collect(),
             rpc_kinds: vec!["unary".to_owned()],
-            stacks,
+            roles: roles
+                .iter()
+                .map(|role| {
+                    let role = match *role {
+                        "client" => Role::Client,
+                        "server" => Role::Server,
+                        _ => panic!("unknown role"),
+                    };
+                    (role, stacks.to_vec())
+                })
+                .collect::<BTreeMap<_, _>>(),
             histogram: "log_linear_v1".to_owned(),
         }
+    }
+
+    fn certificates() -> Certificates {
+        Certificates {
+            ca: PathBuf::from("/certificates/ca.pem"),
+            certificate: PathBuf::from("/certificates/server.pem"),
+            private_key: PathBuf::from("/certificates/server-key.pem"),
+        }
+    }
+
+    fn option_value<'a>(arguments: &'a [String], option: &str) -> Option<&'a str> {
+        arguments
+            .iter()
+            .position(|argument| argument == option)
+            .and_then(|index| arguments.get(index + 1))
+            .map(String::as_str)
     }
 
     #[test]
@@ -716,20 +873,20 @@ mod tests {
         validate_capabilities(
             &campaign,
             &campaign.peers[0],
-            &capabilities("client", &["client"], vec![Stack::GrpcHttp2]),
+            &capabilities("client", &["client"], &[Stack::GrpcHttp2]),
         )
         .expect("client-only peer");
         validate_capabilities(
             &campaign,
             &campaign.peers[1],
-            &capabilities("server", &["server"], vec![Stack::GrpcHttp2]),
+            &capabilities("server", &["server"], &[Stack::GrpcHttp2]),
         )
         .expect("server-only peer");
 
         let error = validate_capabilities(
             &campaign,
             &campaign.peers[0],
-            &capabilities("client", &["client"], vec![Stack::TrevrpcNativeQuic]),
+            &capabilities("client", &["client"], &[Stack::TrevrpcNativeQuic]),
         )
         .expect_err("wrong stack");
         assert!(error.to_string().contains("grpc_http2"));
@@ -744,6 +901,56 @@ mod tests {
         assert_ne!(grpc, trevrpc);
         assert!(grpc.contains("grpc_http2"));
         assert!(trevrpc.contains("trevrpc_native_quic"));
+    }
+
+    #[test]
+    fn webtransport_arguments_prepare_client_before_server_address_exists() {
+        let campaign = campaign();
+        let mut cell = campaign.cells[0].clone();
+        cell.stack = Stack::TrevrpcWebtransport;
+        let certificates = certificates();
+        let topology = NetworkTopology::create(&Network::default()).expect("loopback topology");
+
+        let client = client_arguments(&campaign, &cell, RpcKind::Unary, 1, &certificates, None);
+        assert_eq!(
+            option_value(&client, "--cert"),
+            Some("/certificates/server.pem")
+        );
+        assert_eq!(option_value(&client, "--address"), None);
+
+        let server = server_arguments(
+            &cell,
+            &topology,
+            &certificates,
+            Some("http://127.0.0.1:4443"),
+        );
+        assert_eq!(
+            option_value(&server, "--webtransport-origin"),
+            Some("http://127.0.0.1:4443")
+        );
+    }
+
+    #[test]
+    fn native_client_arguments_keep_address_and_ca_certificate() {
+        let campaign = campaign();
+        let cell = &campaign.cells[0];
+        let arguments = client_arguments(
+            &campaign,
+            cell,
+            RpcKind::Unary,
+            1,
+            &certificates(),
+            Some("127.0.0.1:43117"),
+        );
+        assert_eq!(
+            option_value(&arguments, "--cert"),
+            Some("/certificates/ca.pem")
+        );
+        assert_eq!(
+            option_value(&arguments, "--address"),
+            Some("127.0.0.1:43117")
+        );
+        assert_eq!(option_value(&arguments, "--webtransport-origin"), None);
     }
 
     #[test]
