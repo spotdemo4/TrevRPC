@@ -23,7 +23,7 @@ let
         "protoc-gen-trevrpc-rust"
       ];
 
-      doCheck = false;
+      doCheck = true;
       nativeCheckInputs = with pkgs; [
         rustfmt
         clippy

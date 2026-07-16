@@ -47,7 +47,7 @@ let
         gradle build
       '';
 
-      doCheck = false;
+      doCheck = true;
       gradleCheckTask = "check";
 
       installPhase = ''

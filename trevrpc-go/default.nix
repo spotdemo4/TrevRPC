@@ -21,7 +21,7 @@ let
       vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
       subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
 
-      doCheck = false;
+      doCheck = true;
       nativeCheckInputs = with pkgs; [
         go-tools
         gotools

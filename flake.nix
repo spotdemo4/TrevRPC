@@ -334,12 +334,7 @@
               touch $out
             '';
 
-          c = self.packages.${system}.trevrpc-c.overrideAttrs {
-            doInstallCheck = false;
-            installPhase = ''
-              mkdir -p "$out" "$dev" "$lib"
-            '';
-          };
+          c = self.packages.${system}.trevrpc-c;
 
           c-sanitizers = self.packages.${system}.trevrpc-c.overrideAttrs {
             doInstallCheck = false;
@@ -353,12 +348,7 @@
             '';
           };
 
-          cpp = self.packages.${system}.trevrpc-cpp.overrideAttrs {
-            doInstallCheck = false;
-            installPhase = ''
-              mkdir -p "$out" "$dev" "$lib"
-            '';
-          };
+          cpp = self.packages.${system}.trevrpc-cpp;
 
           consumer-closures-no-grpc =
             let
@@ -387,37 +377,13 @@
               mkdir -p $out
             '';
 
-          rust = self.packages.${system}.trevrpc-rust.overrideAttrs {
-            dontBuild = true;
-            doInstallCheck = false;
-            installPhase = ''
-              touch $out
-            '';
-          };
+          rust = self.packages.${system}.trevrpc-rust;
 
-          go = self.packages.${system}.trevrpc-go.overrideAttrs {
-            dontBuild = true;
-            doInstallCheck = false;
-            installPhase = ''
-              touch $out
-            '';
-          };
+          go = self.packages.${system}.trevrpc-go;
 
-          js = self.packages.${system}.trevrpc-js.overrideAttrs {
-            dontBuild = true;
-            doInstallCheck = false;
-            installPhase = ''
-              touch $out
-            '';
-          };
+          js = self.packages.${system}.trevrpc-js;
 
-          kotlin = self.packages.${system}.trevrpc-kotlin.overrideAttrs {
-            dontBuild = true;
-            doInstallCheck = false;
-            installPhase = ''
-              touch $out
-            '';
-          };
+          kotlin = self.packages.${system}.trevrpc-kotlin;
 
           cross-runtime =
             let

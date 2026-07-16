@@ -58,7 +58,7 @@ let
         runHook postBuild
       '';
 
-      doCheck = false;
+      doCheck = true;
       checkPhase = ''
         runHook preCheck
         export HOME=$TMPDIR

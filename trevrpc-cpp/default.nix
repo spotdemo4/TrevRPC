@@ -56,7 +56,7 @@ let
         runHook postBuild
       '';
 
-      doCheck = false;
+      doCheck = true;
       checkPhase = ''
         runHook preCheck
         clang-format --dry-run --Werror $(find . \

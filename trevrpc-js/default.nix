@@ -36,7 +36,7 @@ let
         trevrpcC
       ];
 
-      doCheck = false;
+      doCheck = true;
       nativeCheckInputs = with pkgs; [
         clang-tools
         openssl
