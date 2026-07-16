@@ -202,7 +202,7 @@ static int flush_event(void) {
 }
 
 static int emit_capabilities(void) {
-    if (fputs("{\"schema_version\":2,\"event\":\"capabilities\",\"peer\":\"c\","
+    if (fputs("{\"schema_version\":3,\"event\":\"capabilities\",\"peer\":\"c\","
               "\"roles\":[\"client\",\"server\"],"
               "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
               "\"stacks\":[\"trevrpc_native_quic\",\"grpc_http2\"],\"histogram\":\"log_linear_v1\"}",
@@ -214,7 +214,7 @@ static int emit_capabilities(void) {
 
 static int emit_error(const char* phase, const char* code, const char* message) {
     fprintf(stderr, "%s: %s: %s\n", phase, code, message);
-    if (fputs("{\"schema_version\":2,\"event\":\"error\",\"peer\":\"c\",\"phase\":", stdout) == EOF ||
+    if (fputs("{\"schema_version\":3,\"event\":\"error\",\"peer\":\"c\",\"phase\":", stdout) == EOF ||
         write_json_string(stdout, phase) != 0 || fputs(",\"code\":", stdout) == EOF ||
         write_json_string(stdout, code) != 0 || fputs(",\"message\":", stdout) == EOF ||
         write_json_string(stdout, message) != 0 || fputc('}', stdout) == EOF) {
@@ -234,7 +234,7 @@ static int fail_with_error(const char* phase, const char* code, const char* form
 }
 
 static int emit_ready(const char* host, uint16_t port, const char* stack) {
-    if (fputs("{\"schema_version\":2,\"event\":\"ready\",\"peer\":\"c\",\"address\":", stdout) == EOF) {
+    if (fputs("{\"schema_version\":3,\"event\":\"ready\",\"peer\":\"c\",\"address\":", stdout) == EOF) {
         return -EIO;
     }
     char address[512];
@@ -249,7 +249,7 @@ static int emit_ready(const char* host, uint16_t port, const char* stack) {
 }
 
 static int emit_armed(const char* stack) {
-    if (fputs("{\"schema_version\":2,\"event\":\"armed\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+    if (fputs("{\"schema_version\":3,\"event\":\"armed\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
         write_json_string(stdout, stack) != 0 || fprintf(stdout, ",\"pid\":%ld}", (long)getpid()) < 0) {
         return -EIO;
     }
@@ -257,7 +257,7 @@ static int emit_armed(const char* stack) {
 }
 
 static int emit_stopped(const char* stack) {
-    if (fputs("{\"schema_version\":2,\"event\":\"stopped\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+    if (fputs("{\"schema_version\":3,\"event\":\"stopped\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
         write_json_string(stdout, stack) != 0 || fputc('}', stdout) == EOF) {
         return -EIO;
     }
@@ -1238,7 +1238,7 @@ static int run_warmup(benchmark_client* client, const client_options* options) {
 
 static int emit_sample(const client_options* options, uint64_t elapsed_ns, const lane_result* result) {
     uint64_t drain_ns = elapsed_ns > options->measurement_ns ? elapsed_ns - options->measurement_ns : 0;
-    if (fputs("{\"schema_version\":2,\"event\":\"sample\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
+    if (fputs("{\"schema_version\":3,\"event\":\"sample\",\"peer\":\"c\",\"stack\":", stdout) == EOF ||
         write_json_string(stdout, options->stack_name) != 0 || fputs(",\"rpc_kind\":", stdout) == EOF ||
         write_json_string(stdout, options->rpc_name) != 0 ||
         fprintf(stdout,

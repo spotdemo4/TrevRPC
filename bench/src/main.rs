@@ -18,6 +18,10 @@ fn run() -> Result<(), BoxError> {
     let mut args = std::env::args().skip(1);
     let command = args.next().ok_or_else(usage)?;
     match command.as_str() {
+        "__network-holder" => {
+            ensure_finished(args)?;
+            trevrpc_bench::network::hold_namespace()?;
+        }
         "validate" => {
             let campaign_path = args.next().ok_or_else(usage)?;
             ensure_finished(args)?;
@@ -41,6 +45,23 @@ fn run() -> Result<(), BoxError> {
             ensure_finished(args)?;
             let campaign = Campaign::read(Path::new(&campaign_path))?;
             campaign.validate()?;
+            trevrpc_bench::network::enter_owner_namespace_if_needed(
+                &campaign.network,
+                Path::new(&campaign_path),
+                Path::new(&output),
+            )?;
+            trevrpc_bench::runner::run(&campaign, Path::new(&campaign_path), Path::new(&output))?;
+        }
+        "__network-run" => {
+            let campaign_path = args.next().ok_or_else(usage)?;
+            if args.next().as_deref() != Some("--out") {
+                return Err(usage().into());
+            }
+            let output = args.next().ok_or_else(usage)?;
+            ensure_finished(args)?;
+            let campaign = Campaign::read(Path::new(&campaign_path))?;
+            campaign.validate()?;
+            trevrpc_bench::network::prepare_owner_namespace(&campaign.network)?;
             trevrpc_bench::runner::run(&campaign, Path::new(&campaign_path), Path::new(&output))?;
         }
         "report" => {

@@ -11,7 +11,7 @@
 
 namespace trevrpc_bench {
 
-constexpr std::uint32_t kSchemaVersion = 2;
+constexpr std::uint32_t kSchemaVersion = 3;
 constexpr auto kConnectTimeout = std::chrono::seconds(10);
 constexpr std::size_t kMaximumPayloadBytes = std::size_t{64} * 1024 * 1024;
 constexpr std::uint32_t kMaximumMessagesPerStream = 1'000'000;

@@ -244,6 +244,16 @@
         checks = pkgs.mkChecks {
           benchmark-controller = self.packages.${system}.trevrpc-bench;
 
+          benchmark-netns-config =
+            pkgs.runCommand "trevrpc-benchmark-netns-config"
+              {
+                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench ];
+              }
+              ''
+                trevrpc-bench validate ${./bench/campaigns/netns-smoke.example.json}
+                touch $out
+              '';
+
           c = self.packages.${system}.trevrpc-c;
           c-sanitizers = self.packages.${system}.trevrpc-c.override {
             sanitizers = true;
@@ -331,7 +341,7 @@
             in
             pkgs.runCommand "trevrpc-benchmark-peer-capabilities-check" { nativeBuildInputs = [ pkgs.jq ]; } ''
               check_capabilities() {
-                test "$($1 capabilities | jq -r .schema_version)" = 2
+                test "$($1 capabilities | jq -r .schema_version)" = 3
                 test "$($1 capabilities | jq -r .peer)" = "$2"
                 test "$($1 capabilities | jq -c .stacks)" = '["trevrpc_native_quic","grpc_http2"]'
               }

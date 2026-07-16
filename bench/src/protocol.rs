@@ -370,6 +370,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_schema_v2_peer_events() {
+        let mut capabilities = capabilities(vec![Stack::TrevrpcNativeQuic]);
+        capabilities.schema_version = 2;
+        assert!(
+            capabilities
+                .validate(
+                    "rust",
+                    &["client", "server"],
+                    &[RpcKind::Unary],
+                    &[Stack::TrevrpcNativeQuic],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn rejects_missing_or_mismatched_required_stacks() {
         let missing = capabilities(Vec::new()).validate(
             "rust",
@@ -401,7 +417,7 @@ mod tests {
     #[test]
     fn rejects_v1_transport_capabilities() {
         let input = r#"{
-            "schema_version": 2,
+            "schema_version": 3,
             "event": "capabilities",
             "peer": "rust",
             "roles": ["client", "server"],

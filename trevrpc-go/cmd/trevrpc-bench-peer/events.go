@@ -7,7 +7,7 @@ import (
 	"sync"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 const peerName = "go"
 
 type eventEmitter struct {

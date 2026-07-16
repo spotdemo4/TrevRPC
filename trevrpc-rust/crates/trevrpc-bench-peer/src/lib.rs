@@ -36,7 +36,7 @@ use grpc::GrpcWorkload;
 use histogram::{HistogramBucket, LogLinearHistogram};
 use workload::{BenchmarkServiceImpl, BenchmarkWorkload, MessageCounts, Workload, WorkloadConfig};
 
-const SCHEMA_VERSION: u8 = 2;
+const SCHEMA_VERSION: u8 = 3;
 const PEER: &str = "rust";
 const SERVER_MAX_STREAMS: usize = 1024;
 const SERVER_MAX_REQUESTS: usize = 4096;
@@ -817,7 +817,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(capabilities())?,
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "event": "capabilities",
                 "peer": "rust",
                 "roles": ["client", "server"],

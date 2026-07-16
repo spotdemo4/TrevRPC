@@ -22,6 +22,8 @@ pub struct Campaign {
     pub concurrencies: Vec<usize>,
     pub timing: Timing,
     pub workload: Workload,
+    #[serde(default)]
+    pub network: Network,
     #[serde(default = "default_startup_timeout_ms")]
     pub startup_timeout_ms: u64,
     #[serde(default = "default_drain_timeout_ms")]
@@ -97,6 +99,84 @@ pub struct Workload {
     pub messages_per_stream: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Network {
+    #[serde(default)]
+    pub backend: NetworkBackend,
+    #[serde(default)]
+    pub client_to_server: LinkCondition,
+    #[serde(default)]
+    pub server_to_client: LinkCondition,
+    #[serde(default = "default_mtu")]
+    pub mtu: u32,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            backend: NetworkBackend::Loopback,
+            client_to_server: LinkCondition::default(),
+            server_to_client: LinkCondition::default(),
+            mtu: default_mtu(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkBackend {
+    #[default]
+    Loopback,
+    Netns,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkCondition {
+    #[serde(default)]
+    pub delay_ms: u32,
+    #[serde(default)]
+    pub jitter_ms: u32,
+    #[serde(default)]
+    pub loss_percent: f64,
+    #[serde(default)]
+    pub rate_mbit: Option<u32>,
+    #[serde(default)]
+    pub queue_packets: Option<u32>,
+}
+
+impl LinkCondition {
+    #[must_use]
+    pub fn is_unrestricted(&self) -> bool {
+        self.delay_ms == 0
+            && self.jitter_ms == 0
+            && self.loss_percent == 0.0
+            && self.rate_mbit.is_none()
+            && self.queue_packets.is_none()
+    }
+
+    fn validate(&self, direction: &str) -> Result<(), BoxError> {
+        if self.jitter_ms > 0 && self.delay_ms == 0 {
+            return Err(format!("{direction} jitter requires a positive delay").into());
+        }
+        if !self.loss_percent.is_finite() || self.loss_percent < 0.0 || self.loss_percent > 100.0 {
+            return Err(format!("{direction} loss_percent must be between 0 and 100").into());
+        }
+        if self.rate_mbit == Some(0) {
+            return Err(format!("{direction} rate_mbit must be positive").into());
+        }
+        if self.queue_packets == Some(0) {
+            return Err(format!("{direction} queue_packets must be positive").into());
+        }
+        Ok(())
+    }
+}
+
+const fn default_mtu() -> u32 {
+    1500
+}
+
 const fn default_startup_timeout_ms() -> u64 {
     30_000
 }
@@ -148,6 +228,18 @@ impl Campaign {
             return Err(
                 format!("messages_per_stream must not exceed {MAX_MESSAGES_PER_STREAM}").into(),
             );
+        }
+        self.network.client_to_server.validate("client_to_server")?;
+        self.network.server_to_client.validate("server_to_client")?;
+        if !(576..=65_535).contains(&self.network.mtu) {
+            return Err("network MTU must be between 576 and 65535".into());
+        }
+        if self.network.backend == NetworkBackend::Loopback
+            && (!self.network.client_to_server.is_unrestricted()
+                || !self.network.server_to_client.is_unrestricted()
+                || self.network.mtu != default_mtu())
+        {
+            return Err("loopback network backend cannot define link impairments or MTU".into());
         }
         if self.startup_timeout_ms == 0 || self.drain_timeout_ms == 0 {
             return Err("timeouts must be positive".into());
@@ -217,8 +309,8 @@ fn validate_id(value: &str, name: &str) -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Campaign, Cell, MAX_CONCURRENCY, MAX_MESSAGES_PER_STREAM, MAX_PAYLOAD_BYTES, Peer, RpcKind,
-        Stack, Timing, Workload,
+        Campaign, Cell, LinkCondition, MAX_CONCURRENCY, MAX_MESSAGES_PER_STREAM, MAX_PAYLOAD_BYTES,
+        Network, NetworkBackend, Peer, RpcKind, Stack, Timing, Workload,
     };
     use crate::SCHEMA_VERSION;
 
@@ -248,6 +340,7 @@ mod tests {
                 response_bytes: 16,
                 messages_per_stream: 4,
             },
+            network: Network::default(),
             startup_timeout_ms: 1000,
             drain_timeout_ms: 1000,
         }
@@ -256,6 +349,13 @@ mod tests {
     #[test]
     fn validates_minimal_campaign() {
         campaign().validate().expect("valid campaign");
+    }
+
+    #[test]
+    fn rejects_schema_v2_campaigns() {
+        let mut campaign = campaign();
+        campaign.schema_version = 2;
+        assert!(campaign.validate().is_err());
     }
 
     #[test]
@@ -299,5 +399,44 @@ mod tests {
         let mut excessive_stream = campaign();
         excessive_stream.workload.messages_per_stream = MAX_MESSAGES_PER_STREAM + 1;
         assert!(excessive_stream.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_omitted_network_to_loopback() {
+        let mut value = serde_json::to_value(campaign()).expect("campaign JSON");
+        value
+            .as_object_mut()
+            .expect("campaign object")
+            .remove("network");
+        let parsed = serde_json::from_value::<Campaign>(value).expect("campaign without network");
+        assert_eq!(parsed.network, Network::default());
+    }
+
+    #[test]
+    fn validates_network_impairments() {
+        let mut campaign = campaign();
+        campaign.network = Network {
+            backend: NetworkBackend::Netns,
+            client_to_server: LinkCondition {
+                delay_ms: 10,
+                jitter_ms: 2,
+                loss_percent: 0.1,
+                rate_mbit: Some(100),
+                queue_packets: Some(1000),
+            },
+            server_to_client: LinkCondition::default(),
+            mtu: 1400,
+        };
+        campaign.validate().expect("valid netns profile");
+
+        campaign.network.client_to_server.delay_ms = 0;
+        assert!(campaign.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_impairments_for_loopback() {
+        let mut campaign = campaign();
+        campaign.network.client_to_server.delay_ms = 1;
+        assert!(campaign.validate().is_err());
     }
 }

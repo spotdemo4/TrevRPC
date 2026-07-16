@@ -1,10 +1,12 @@
 {
   lib,
+  iproute2,
   makeWrapper,
   openssl,
   rustPlatform,
   sourceCommit,
   sourceDirty,
+  util-linux,
 }:
 rustPlatform.buildRustPackage (
   final: with lib; {
@@ -17,7 +19,7 @@ rustPlatform.buildRustPackage (
         ./Cargo.lock
         ./Cargo.toml
         ./campaigns
-        ./peer-protocol-v2.md
+        ./peer-protocol-v3.md
         ./proto
         ./src
       ];
@@ -27,7 +29,13 @@ rustPlatform.buildRustPackage (
     nativeBuildInputs = [ makeWrapper ];
     postInstall = ''
       wrapProgram $out/bin/trevrpc-bench \
-        --prefix PATH : ${makeBinPath [ openssl ]} \
+        --prefix PATH : ${
+          makeBinPath [
+            openssl
+            iproute2
+            util-linux
+          ]
+        } \
         --set TREVRPC_BENCH_SOURCE_COMMIT ${sourceCommit} \
         --set TREVRPC_BENCH_SOURCE_DIRTY ${sourceDirty}
     '';

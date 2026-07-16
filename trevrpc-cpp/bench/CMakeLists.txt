@@ -61,7 +61,7 @@ if(TREVRPC_CPP_BUILD_TESTS)
   add_test(NAME trevrpc_cpp_benchmark_capabilities COMMAND trevrpc_cpp_bench_peer capabilities)
   set_tests_properties(trevrpc_cpp_benchmark_capabilities PROPERTIES
     PASS_REGULAR_EXPRESSION
-      "schema_version.:2.*stacks.*trevrpc_native_quic.*grpc_http2")
+      "schema_version.:3.*stacks.*trevrpc_native_quic.*grpc_http2")
 
   add_test(NAME trevrpc_cpp_benchmark_server_requires_stack
     COMMAND "${CMAKE_COMMAND}"

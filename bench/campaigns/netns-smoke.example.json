@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "campaign_id": "grpc-all-languages-smoke",
+  "campaign_id": "single-host-netns-smoke",
   "repetitions": 1,
   "peers": [
     {
@@ -30,10 +30,22 @@
   ],
   "cells": [
     {
+      "id": "c-trevrpc",
+      "client": "c",
+      "server": "c",
+      "stack": "trevrpc_native_quic"
+    },
+    {
       "id": "c-grpc",
       "client": "c",
       "server": "c",
       "stack": "grpc_http2"
+    },
+    {
+      "id": "cpp-trevrpc",
+      "client": "cpp",
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "cpp-grpc",
@@ -42,10 +54,22 @@
       "stack": "grpc_http2"
     },
     {
+      "id": "go-trevrpc",
+      "client": "go",
+      "server": "go",
+      "stack": "trevrpc_native_quic"
+    },
+    {
       "id": "go-grpc",
       "client": "go",
       "server": "go",
       "stack": "grpc_http2"
+    },
+    {
+      "id": "js-trevrpc",
+      "client": "js",
+      "server": "js",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "js-grpc",
@@ -54,10 +78,22 @@
       "stack": "grpc_http2"
     },
     {
+      "id": "kotlin-trevrpc",
+      "client": "kotlin",
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
+    },
+    {
       "id": "kotlin-grpc",
       "client": "kotlin",
       "server": "kotlin",
       "stack": "grpc_http2"
+    },
+    {
+      "id": "rust-trevrpc",
+      "client": "rust",
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
     },
     {
       "id": "rust-grpc",
@@ -66,16 +102,34 @@
       "stack": "grpc_http2"
     }
   ],
-  "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
+  "rpc_kinds": ["unary"],
   "concurrencies": [1],
   "timing": {
-    "warmup_ms": 10,
-    "measurement_ms": 20
+    "warmup_ms": 20,
+    "measurement_ms": 250
   },
   "workload": {
-    "request_bytes": 16,
-    "response_bytes": 16,
-    "messages_per_stream": 8
+    "request_bytes": 256,
+    "response_bytes": 256,
+    "messages_per_stream": 16
+  },
+  "network": {
+    "backend": "netns",
+    "client_to_server": {
+      "delay_ms": 5,
+      "jitter_ms": 1,
+      "loss_percent": 0.0,
+      "rate_mbit": 100,
+      "queue_packets": 1000
+    },
+    "server_to_client": {
+      "delay_ms": 5,
+      "jitter_ms": 1,
+      "loss_percent": 0.0,
+      "rate_mbit": 100,
+      "queue_packets": 1000
+    },
+    "mtu": 1500
   },
   "startup_timeout_ms": 30000,
   "drain_timeout_ms": 30000

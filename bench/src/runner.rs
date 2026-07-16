@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::campaign::{Campaign, Cell, Peer, RpcKind, Stack};
 use crate::certificate::{self, Certificates};
 use crate::metrics::{ProcessDelta, ProcessMonitor};
+use crate::network::{Endpoint, NetworkSnapshot, NetworkTopology};
 use crate::protocol::{
     self, Armed, Capabilities, HistogramBucket, PeerSample, Ready, ValidatedSample,
 };
@@ -65,6 +66,7 @@ struct Manifest<'a> {
     source_dirty: bool,
     peer_artifacts: Vec<Artifact>,
     metrics_scope: &'static str,
+    network_environment: &'a NetworkSnapshot,
 }
 
 #[derive(Serialize)]
@@ -92,12 +94,13 @@ pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(
         .into());
     }
     fs::create_dir_all(output.join("raw"))?;
-    let certificates = certificate::generate(output)?;
     for peer in &campaign.peers {
         let capabilities = capabilities(peer, Duration::from_millis(campaign.startup_timeout_ms))?;
         validate_capabilities(campaign, peer, &capabilities)?;
     }
-    write_manifest(campaign, campaign_path, output)?;
+    let topology = NetworkTopology::create(&campaign.network)?;
+    let certificates = certificate::generate(output, &topology.certificate_ips())?;
+    write_manifest(campaign, campaign_path, output, topology.snapshot())?;
 
     let samples_path = output.join("samples.jsonl");
     let mut samples = OpenOptions::new()
@@ -128,6 +131,7 @@ pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(
                 concurrency,
                 repetition,
                 &certificates,
+                &topology,
                 output,
             )?;
             serde_json::to_writer(&mut samples, &sample)?;
@@ -138,6 +142,7 @@ pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(
     report::generate(output)
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_sample(
     campaign: &Campaign,
     cell: &Cell,
@@ -145,6 +150,7 @@ fn run_sample(
     concurrency: usize,
     repetition: u32,
     certificates: &Certificates,
+    topology: &NetworkTopology,
     output: &Path,
 ) -> Result<SampleRecord, BoxError> {
     let sample_id = sample_id(cell, rpc_kind, concurrency, repetition);
@@ -161,7 +167,7 @@ fn run_sample(
             "--stack".to_owned(),
             cell.stack.as_str().to_owned(),
             "--listen".to_owned(),
-            "127.0.0.1:0".to_owned(),
+            topology.server_listen(),
             "--cert".to_owned(),
             path_string(&certificates.certificate),
             "--key".to_owned(),
@@ -169,6 +175,8 @@ fn run_sample(
         ],
         &raw,
         "server",
+        topology,
+        Endpoint::Server,
     )?;
     let ready_line = server.event(Duration::from_millis(campaign.startup_timeout_ms))?;
     let ready: Ready = parse_expected(&ready_line, "ready")?;
@@ -201,6 +209,8 @@ fn run_sample(
         ],
         &raw,
         "client",
+        topology,
+        Endpoint::Client,
     )?;
     let armed_timeout = campaign
         .startup_timeout_ms
@@ -446,11 +456,19 @@ struct PeerProcess {
 }
 
 impl PeerProcess {
-    fn spawn(peer: &Peer, arguments: &[String], raw: &Path, role: &str) -> Result<Self, BoxError> {
+    fn spawn(
+        peer: &Peer,
+        arguments: &[String],
+        raw: &Path,
+        role: &str,
+        topology: &NetworkTopology,
+        endpoint: Endpoint,
+    ) -> Result<Self, BoxError> {
         let stdout_path = raw.join(format!("{role}.stdout"));
         let stderr_path = raw.join(format!("{role}.stderr"));
         let stderr = File::create(&stderr_path)?;
         let mut command = peer_command(peer)?;
+        topology.configure_command(&mut command, endpoint);
         let mut child = command
             .args(arguments)
             .stdin(Stdio::piped())
@@ -562,6 +580,7 @@ fn write_manifest(
     campaign: &Campaign,
     campaign_path: &Path,
     output: &Path,
+    network_environment: &NetworkSnapshot,
 ) -> Result<(), BoxError> {
     let campaign_bytes = fs::read(campaign_path)?;
     let mut artifacts = Vec::with_capacity(campaign.peers.len());
@@ -593,6 +612,7 @@ fn write_manifest(
         source_dirty,
         peer_artifacts: artifacts,
         metrics_scope: "direct_peer_process_procfs_10ms",
+        network_environment,
     };
     let file = File::create(output.join("manifest.json"))?;
     serde_json::to_writer_pretty(file, &manifest)?;
@@ -637,7 +657,7 @@ fn path_string(path: &Path) -> String {
 mod tests {
     use super::{sample_id, sha256, validate_capabilities};
     use crate::SCHEMA_VERSION;
-    use crate::campaign::{Campaign, Cell, Peer, RpcKind, Stack, Timing, Workload};
+    use crate::campaign::{Campaign, Cell, Network, Peer, RpcKind, Stack, Timing, Workload};
     use crate::protocol::Capabilities;
 
     fn campaign() -> Campaign {
@@ -672,6 +692,7 @@ mod tests {
                 response_bytes: 1,
                 messages_per_stream: 1,
             },
+            network: Network::default(),
             startup_timeout_ms: 1000,
             drain_timeout_ms: 1000,
         }

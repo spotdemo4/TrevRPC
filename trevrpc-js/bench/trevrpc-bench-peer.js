@@ -18,7 +18,7 @@ import {
 import { NodeServer } from "trevrpc-js/node";
 import { RawNodeTransport } from "trevrpc-js/node/advanced";
 
-const SchemaVersion = 2;
+const SchemaVersion = 3;
 const Peer = "js";
 const ServiceName = "trevrpc.benchmark.v1.BenchmarkService";
 const Stacks = new Set(["trevrpc_native_quic", "grpc_http2"]);

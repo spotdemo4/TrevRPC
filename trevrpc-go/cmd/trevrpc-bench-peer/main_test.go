@@ -415,6 +415,6 @@ func Example_runCapabilities() {
 	err := run([]string{"capabilities"}, strings.NewReader(""), newEventEmitter(&output))
 	fmt.Print(output.String(), err)
 	// Output:
-	// {"schema_version":2,"event":"capabilities","peer":"go","roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}
+	// {"schema_version":3,"event":"capabilities","peer":"go","roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}
 	// <nil>
 }

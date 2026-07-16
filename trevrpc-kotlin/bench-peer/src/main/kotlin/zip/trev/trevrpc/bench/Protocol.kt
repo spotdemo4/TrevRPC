@@ -266,7 +266,7 @@ internal class EventWriter(
 ) {
     fun capabilities() {
         emit(
-            """{"schema_version":2,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}""",
+            """{"schema_version":3,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":["client","server"],"rpc_kinds":["unary","client_stream","server_stream","bidi"],"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}""",
         )
     }
 
@@ -322,7 +322,7 @@ internal class EventWriter(
         check(!output.checkError()) { "failed to write benchmark protocol event" }
     }
 
-    private fun base(event: String): String = """{"schema_version":2,"event":${event.jsonString()},"peer":${PEER_NAME.jsonString()}"""
+    private fun base(event: String): String = """{"schema_version":3,"event":${event.jsonString()},"peer":${PEER_NAME.jsonString()}"""
 }
 
 private fun String.jsonString(): String =

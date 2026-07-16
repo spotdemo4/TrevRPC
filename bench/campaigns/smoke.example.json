@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "campaign_id": "native-quic-smoke",
   "repetitions": 1,
   "peers": [

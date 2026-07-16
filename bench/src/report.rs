@@ -96,7 +96,9 @@ impl Aggregate<'_> {
 pub fn generate(output: &Path) -> Result<(), BoxError> {
     let manifest: ReportManifest =
         serde_json::from_str(&fs::read_to_string(output.join("manifest.json"))?)?;
-    if manifest.schema_version != SCHEMA_VERSION {
+    if manifest.schema_version != SCHEMA_VERSION
+        || manifest.schema_version != manifest.campaign.schema_version
+    {
         return Err("unsupported benchmark manifest schema".into());
     }
     let samples = read_samples(&output.join("samples.jsonl"))?;
@@ -126,7 +128,9 @@ fn validate_samples(campaign: &Campaign, samples: &[SampleRecord]) -> Result<(),
     let mut sample_ids = BTreeSet::new();
     let mut cells = BTreeSet::new();
     for sample in samples {
-        if sample.schema_version != SCHEMA_VERSION || sample.campaign_id != campaign.campaign_id {
+        if sample.schema_version != campaign.schema_version
+            || sample.campaign_id != campaign.campaign_id
+        {
             return Err(format!(
                 "sample {} has inconsistent schema or campaign",
                 sample.sample_id
@@ -458,7 +462,7 @@ fn median_f64(values: impl Iterator<Item = f64>) -> f64 {
 mod tests {
     use super::{aggregate, validate_samples};
     use crate::SCHEMA_VERSION;
-    use crate::campaign::{Campaign, Cell, Peer, RpcKind, Stack, Timing, Workload};
+    use crate::campaign::{Campaign, Cell, Network, Peer, RpcKind, Stack, Timing, Workload};
     use crate::metrics::ProcessDelta;
     use crate::protocol::HistogramBucket;
     use crate::runner::SampleRecord;
@@ -489,6 +493,7 @@ mod tests {
                 response_bytes: 16,
                 messages_per_stream: 1,
             },
+            network: Network::default(),
             startup_timeout_ms: 1000,
             drain_timeout_ms: 1000,
         }

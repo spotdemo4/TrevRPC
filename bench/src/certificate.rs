@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,7 +12,7 @@ pub struct Certificates {
     pub private_key: PathBuf,
 }
 
-pub fn generate(output: &Path) -> Result<Certificates, BoxError> {
+pub fn generate(output: &Path, server_ips: &[IpAddr]) -> Result<Certificates, BoxError> {
     let directory = output.join("certificates");
     fs::create_dir_all(&directory)?;
     let ca = directory.join("ca.pem");
@@ -38,20 +39,19 @@ pub fn generate(output: &Path) -> Result<Certificates, BoxError> {
             ]),
         "generate benchmark CA",
     )?;
-    run(
-        Command::new("openssl")
-            .args(["req", "-newkey", "rsa:2048", "-nodes", "-keyout"])
-            .arg(&private_key)
-            .arg("-out")
-            .arg(&csr)
-            .args([
-                "-subj",
-                "/CN=localhost",
-                "-addext",
-                "subjectAltName=DNS:localhost,IP:127.0.0.1",
-            ]),
-        "generate benchmark server CSR",
-    )?;
+    let subject_alt_name = std::iter::once("DNS:localhost".to_owned())
+        .chain(server_ips.iter().map(|address| format!("IP:{address}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut request = Command::new("openssl");
+    request
+        .args(["req", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+        .arg(&private_key)
+        .arg("-out")
+        .arg(&csr)
+        .args(["-subj", "/CN=localhost", "-addext"])
+        .arg(format!("subjectAltName={subject_alt_name}"));
+    run(&mut request, "generate benchmark server CSR")?;
     run(
         Command::new("openssl")
             .args(["x509", "-req", "-in"])

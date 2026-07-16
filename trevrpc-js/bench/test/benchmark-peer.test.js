@@ -99,7 +99,7 @@ function schemaFields(type) {
   );
 }
 
-test("benchmark peer capabilities use protocol v2 stacks", async () => {
+test("benchmark peer capabilities use protocol v3 stacks", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     fileURLToPath(new URL("../trevrpc-bench-peer.js", import.meta.url)),
     "capabilities",
@@ -107,7 +107,7 @@ test("benchmark peer capabilities use protocol v2 stacks", async () => {
 
   assert.equal(stderr, "");
   assert.deepEqual(JSON.parse(stdout), {
-    schema_version: 2,
+    schema_version: 3,
     event: "capabilities",
     roles: ["client", "server"],
     rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],

@@ -100,7 +100,7 @@ class ProtocolTest {
         EventWriter(PrintStream(output, true, Charsets.UTF_8)).capabilities()
 
         val expectedCapabilities =
-            """{"schema_version":2,"event":"capabilities","peer":"kotlin","roles":["client","server"],""" +
+            """{"schema_version":3,"event":"capabilities","peer":"kotlin","roles":["client","server"],""" +
                 """"rpc_kinds":["unary","client_stream","server_stream","bidi"],""" +
                 """"stacks":["trevrpc_native_quic","grpc_http2"],"histogram":"log_linear_v1"}""" +
                 System.lineSeparator()
@@ -160,8 +160,8 @@ class ProtocolTest {
 
         assertEquals(
             listOf(
-                """{"schema_version":2,"event":"ready","peer":"kotlin","address":"127.0.0.1:7","pid":12}""",
-                """{"schema_version":2,"event":"sample","peer":"kotlin","rpc_kind":"unary","admission_ns":"1000000","elapsed_ns":"1000100","drain_ns":"100","completed":"1","failed":"0","request_messages":"1","response_messages":"1","histogram":[{"upper_bound_ns":"100","count":"1"}]}""",
+                """{"schema_version":3,"event":"ready","peer":"kotlin","address":"127.0.0.1:7","pid":12}""",
+                """{"schema_version":3,"event":"sample","peer":"kotlin","rpc_kind":"unary","admission_ns":"1000000","elapsed_ns":"1000100","drain_ns":"100","completed":"1","failed":"0","request_messages":"1","response_messages":"1","histogram":[{"upper_bound_ns":"100","count":"1"}]}""",
             ),
             output
                 .toString(Charsets.UTF_8)
