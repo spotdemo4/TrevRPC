@@ -343,7 +343,7 @@ fn write_markdown(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxEr
     for aggregate in aggregates {
         writeln!(
             output,
-            "| `{}` | `{}` | `{}` | `{}` | `{}` | {} | {} | {:.3} | {:.3} | {:.0} | {:.3} | {:.3} | {:.2} | {:.2} |",
+            "| `{}` | `{}` | `{}` | `{}` | `{}` | {} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.2} | {:.2} |",
             aggregate.cell_id,
             aggregate.stack.as_str(),
             aggregate.client_peer,
@@ -388,7 +388,7 @@ fn write_html(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError>
         let label = html_escape(&aggregate.label());
         writeln!(
             throughput_bars,
-            "<text x=\"0\" y=\"{}\">{}</text><rect x=\"230\" y=\"{}\" width=\"{:.1}\" height=\"18\"/><text x=\"{:.1}\" y=\"{}\">{:.0}</text>",
+            "<text x=\"0\" y=\"{}\">{}</text><rect x=\"230\" y=\"{}\" width=\"{:.1}\" height=\"18\"/><text x=\"{:.1}\" y=\"{}\">{:.3}</text>",
             y + 14,
             label,
             y,
@@ -410,7 +410,7 @@ fn write_html(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError>
         )?;
         writeln!(
             table_rows,
-            "<tr><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.0}</td></tr>",
+            "<tr><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td></tr>",
             html_escape(&aggregate.cell_id),
             html_escape(aggregate.stack.as_str()),
             html_escape(&aggregate.client_peer),
@@ -460,7 +460,9 @@ fn median_f64(values: impl Iterator<Item = f64>) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate, validate_samples};
+    use std::fs;
+
+    use super::{aggregate, validate_samples, write_html, write_markdown};
     use crate::SCHEMA_VERSION;
     use crate::campaign::{Campaign, Cell, Network, Peer, RpcKind, Stack, Timing, Workload};
     use crate::metrics::ProcessDelta;
@@ -554,5 +556,27 @@ mod tests {
         )
         .expect_err("mismatched sample stack");
         assert!(error.to_string().contains("does not match its matrix cell"));
+    }
+
+    #[test]
+    fn preserves_fractional_throughput_in_generated_reports() {
+        let mut sample = sample(Stack::TrevrpcNativeQuic);
+        sample.operations_per_second = 15.4;
+        let samples = vec![sample];
+        let aggregates = aggregate(&samples);
+        let output = std::env::temp_dir();
+        let markdown_path = output.join(format!("trevrpc-bench-report-{}.md", std::process::id()));
+        let html_path = output.join(format!("trevrpc-bench-report-{}.html", std::process::id()));
+
+        write_markdown(&markdown_path, &aggregates).expect("write Markdown report");
+        write_html(&html_path, &aggregates).expect("write HTML report");
+        let markdown = fs::read_to_string(&markdown_path).expect("read Markdown report");
+        let html = fs::read_to_string(&html_path).expect("read HTML report");
+
+        assert!(markdown.contains("| 15.400 |"));
+        assert_eq!(html.matches(">15.400<").count(), 2);
+
+        fs::remove_file(markdown_path).expect("remove Markdown report");
+        fs::remove_file(html_path).expect("remove HTML report");
     }
 }
