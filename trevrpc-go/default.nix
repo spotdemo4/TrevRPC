@@ -71,7 +71,7 @@ let
     };
     sourceRoot = "${final.src.name}/trevrpc-go/cmd/trevrpc-bench-peer";
     env.GOWORK = "off";
-    vendorHash = "sha256-mYL+u51KtNPgSvfvHf1XA7fllpCZu2/6iXAaWRsHpcA=";
+    vendorHash = "sha256-D4Su9x9A7XMMif9atOpAfAqMQqOOpA0Q9GU/fFaRzi8=";
     postPatch = ''
       go mod edit -replace=trev.zip/llc/trevrpc/trevrpc-go=../..
     '';
