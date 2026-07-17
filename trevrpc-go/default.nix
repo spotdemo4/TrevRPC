@@ -8,6 +8,8 @@
   benchPeer ? false,
 }:
 let
+  goSource = lib.fileset.difference ./. ./default.nix;
+
   normal = buildGoModule (final: {
     pname = "trevrpc-go";
     version = "0.1.0";
@@ -17,7 +19,7 @@ let
       fileset = lib.fileset.unions [
         (repoRoot + "/bench/proto")
         (repoRoot + "/testdata/wire-golden-vectors.txt")
-        ./.
+        goSource
       ];
     };
     sourceRoot = "${final.src.name}/trevrpc-go";
@@ -66,12 +68,12 @@ let
       root = repoRoot;
       fileset = lib.fileset.unions [
         (repoRoot + "/bench/proto")
-        ./.
+        goSource
       ];
     };
     sourceRoot = "${final.src.name}/trevrpc-go/cmd/trevrpc-bench-peer";
     env.GOWORK = "off";
-    vendorHash = "sha256-lGF6j0qNpMuiAsb7lBmYtayRwd0QgFpLGUWJKjlSha0=";
+    vendorHash = "sha256-bVoZcvfN3avMxhAlvGq9LUpbaUqLlPfr9k9o9ZX4hPU=";
     postPatch = ''
       go mod edit -replace=trev.zip/llc/trevrpc/trevrpc-go=../..
     '';
