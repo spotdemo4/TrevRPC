@@ -19,7 +19,7 @@ jobs:
       id-token: write
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@a381c8e0765c98cb84fdc4a392eefd6c4db309a5 # v1.57.0
+        uses: spotdemo4/nix-init@c0437e8d7de78564b4c3a1db710f43ce407e509b # v1.59.0
 
       - name: Run bounded Go fuzz targets
         run: |
