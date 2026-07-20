@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -21,6 +21,8 @@ use crate::protocol::{
 use crate::{BoxError, SCHEMA_VERSION, report};
 
 const MAX_CAPABILITY_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTIC_STREAM_BYTES: u64 = 8 * 1024;
+const PEER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SampleRecord {
@@ -171,11 +173,11 @@ fn run_sample(
             topology,
             Endpoint::Client,
         )?;
-        let prepared_line = client.event(startup_timeout)?;
+        let prepared_line = client.event("client prepared", "prepared", startup_timeout)?;
         let prepared: Prepared = parse_expected(&prepared_line, "prepared")?;
         prepared.validate(&client_peer.id, client.id())?;
 
-        let server = PeerProcess::spawn(
+        let mut server = PeerProcess::spawn(
             server_peer,
             &server_arguments(cell, topology, certificates, Some(&prepared.origin)),
             &raw,
@@ -183,13 +185,13 @@ fn run_sample(
             topology,
             Endpoint::Server,
         )?;
-        let ready_line = server.event(startup_timeout)?;
+        let ready_line = server.event("server ready", "ready", startup_timeout)?;
         let ready: Ready = parse_expected(&ready_line, "ready")?;
         ready.validate(&server_peer.id, server.id())?;
         client.send(&format!("CONNECT {}", ready.address))?;
         (server, client)
     } else {
-        let server = PeerProcess::spawn(
+        let mut server = PeerProcess::spawn(
             server_peer,
             &server_arguments(cell, topology, certificates, None),
             &raw,
@@ -197,7 +199,7 @@ fn run_sample(
             topology,
             Endpoint::Server,
         )?;
-        let ready_line = server.event(startup_timeout)?;
+        let ready_line = server.event("server ready", "ready", startup_timeout)?;
         let ready: Ready = parse_expected(&ready_line, "ready")?;
         ready.validate(&server_peer.id, server.id())?;
 
@@ -222,7 +224,13 @@ fn run_sample(
         .startup_timeout_ms
         .saturating_add(campaign.timing.warmup_ms)
         .saturating_add(1000);
-    let armed_line = client.event(Duration::from_millis(armed_timeout))?;
+    let armed_line = wait_for_client_event(
+        "client armed",
+        "armed",
+        &mut client,
+        &mut server,
+        Duration::from_millis(armed_timeout),
+    )?;
     let armed: Armed = parse_expected(&armed_line, "armed")?;
     armed.validate(&client_peer.id, client.id())?;
 
@@ -234,7 +242,13 @@ fn run_sample(
         .measurement_ms
         .saturating_add(campaign.drain_timeout_ms)
         .saturating_add(1000);
-    let sample_line = client.event(Duration::from_millis(result_timeout))?;
+    let sample_line = wait_for_client_event(
+        "client sample",
+        "sample",
+        &mut client,
+        &mut server,
+        Duration::from_millis(result_timeout),
+    )?;
     let peer_sample: PeerSample = parse_expected(&sample_line, "sample")?;
     let validated = peer_sample.validate(
         &client_peer.id,
@@ -252,7 +266,7 @@ fn run_sample(
     };
     client.wait_success(client_exit_timeout)?;
     server.send("SHUTDOWN")?;
-    let stopped = server.event(Duration::from_secs(5))?;
+    let stopped = server.event("server stopped", "stopped", Duration::from_secs(5))?;
     let stopped_header = protocol::parse_header(&stopped)?;
     if stopped_header.event != "stopped" || stopped_header.peer != server_peer.id {
         return Err(format!("server {} did not acknowledge shutdown", server_peer.id).into());
@@ -524,6 +538,16 @@ struct PeerProcess {
     process_group: Option<u32>,
     stdin: ChildStdin,
     events: Receiver<Result<String, String>>,
+    peer: String,
+    role: String,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+enum EventPoll {
+    Line(String),
+    Empty,
+    Disconnected,
 }
 
 impl PeerProcess {
@@ -551,8 +575,9 @@ impl PeerProcess {
         let stdin = child.stdin.take().ok_or("peer stdin was not piped")?;
         let stdout = child.stdout.take().ok_or("peer stdout was not piped")?;
         let (sender, events) = mpsc::channel();
+        let capture_path = stdout_path.clone();
         thread::spawn(move || {
-            let mut raw_output = match File::create(stdout_path) {
+            let mut raw_output = match File::create(capture_path) {
                 Ok(file) => file,
                 Err(error) => {
                     let _ = sender.send(Err(error.to_string()));
@@ -583,6 +608,10 @@ impl PeerProcess {
             process_group: Some(process_group),
             stdin,
             events,
+            peer: peer.id.clone(),
+            role: role.to_owned(),
+            stdout_path,
+            stderr_path,
         })
     }
 
@@ -596,17 +625,64 @@ impl PeerProcess {
         Ok(())
     }
 
-    fn event(&self, timeout: Duration) -> Result<String, BoxError> {
-        let line = self
-            .events
-            .recv_timeout(timeout)
-            .map_err(|error| format!("timed out waiting for peer event: {error}"))?
-            .map_err(|error| format!("failed to read peer output: {error}"))?;
-        let header = protocol::parse_header(&line)?;
-        if header.event == "error" {
-            return Err(protocol::peer_error(&line)?.into());
+    fn event(
+        &mut self,
+        phase: &str,
+        expected: &str,
+        timeout: Duration,
+    ) -> Result<String, BoxError> {
+        let deadline = Instant::now() + timeout;
+        let mut exit_status = None;
+        loop {
+            match self.poll_event()? {
+                EventPoll::Line(line) => {
+                    return validate_peer_event(phase, expected, line, &[self]);
+                }
+                EventPoll::Disconnected => {
+                    if exit_status.is_none() {
+                        exit_status = self.child.try_wait()?;
+                    }
+                    let detail = exit_status.map_or_else(
+                        || "closed its event stream".to_owned(),
+                        |status| format!("exited with {status}"),
+                    );
+                    return Err(phase_failure(
+                        phase,
+                        format!("{} {} {detail}", self.role, self.peer),
+                        &[self],
+                    ));
+                }
+                EventPoll::Empty => {}
+            }
+            if exit_status.is_none()
+                && let Some(status) = self.child.try_wait()?
+            {
+                exit_status = Some(status);
+                self.terminate_group();
+            }
+            if Instant::now() >= deadline {
+                if let EventPoll::Line(line) = self.poll_event()? {
+                    return validate_peer_event(phase, expected, line, &[self]);
+                }
+                let detail = exit_status.map_or_else(
+                    || format!("{} {} was silent", self.role, self.peer),
+                    |status| format!("{} {} exited with {status}", self.role, self.peer),
+                );
+                return Err(phase_failure(phase, detail, &[self]));
+            }
+            thread::sleep(
+                PEER_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
-        Ok(line)
+    }
+
+    fn poll_event(&self) -> Result<EventPoll, BoxError> {
+        match self.events.try_recv() {
+            Ok(Ok(line)) => Ok(EventPoll::Line(line)),
+            Ok(Err(error)) => Err(format!("failed to read peer output: {error}").into()),
+            Err(TryRecvError::Empty) => Ok(EventPoll::Empty),
+            Err(TryRecvError::Disconnected) => Ok(EventPoll::Disconnected),
+        }
     }
 
     fn wait_success(&mut self, timeout: Duration) -> Result<(), BoxError> {
@@ -648,6 +724,162 @@ impl Drop for PeerProcess {
             let _ = self.child.wait();
         }
     }
+}
+
+fn wait_for_client_event(
+    phase: &str,
+    expected: &str,
+    client: &mut PeerProcess,
+    server: &mut PeerProcess,
+    timeout: Duration,
+) -> Result<String, BoxError> {
+    let deadline = Instant::now() + timeout;
+    let mut client_exit: Option<ExitStatus> = None;
+    let mut server_exit: Option<ExitStatus> = None;
+    loop {
+        match server.poll_event()? {
+            EventPoll::Line(line) => {
+                return Err(server_event_failure(phase, &line, &[&*client, &*server]));
+            }
+            EventPoll::Disconnected => {
+                if server_exit.is_none() {
+                    server_exit = server.child.try_wait()?;
+                }
+                let detail = server_exit.map_or_else(
+                    || format!("server {} closed its event stream", server.peer),
+                    |status| format!("server {} exited with {status}", server.peer),
+                );
+                return Err(phase_failure(phase, detail, &[&*client, &*server]));
+            }
+            EventPoll::Empty => {}
+        }
+
+        match client.poll_event()? {
+            EventPoll::Line(line) => {
+                return validate_peer_event(phase, expected, line, &[&*client, &*server]);
+            }
+            EventPoll::Disconnected => {
+                if client_exit.is_none() {
+                    client_exit = client.child.try_wait()?;
+                }
+                let detail = client_exit.map_or_else(
+                    || format!("client {} closed its event stream", client.peer),
+                    |status| format!("client {} exited with {status}", client.peer),
+                );
+                return Err(phase_failure(phase, detail, &[&*client, &*server]));
+            }
+            EventPoll::Empty => {}
+        }
+
+        if server_exit.is_none()
+            && let Some(status) = server.child.try_wait()?
+        {
+            server_exit = Some(status);
+            server.terminate_group();
+        }
+        if client_exit.is_none()
+            && let Some(status) = client.child.try_wait()?
+        {
+            client_exit = Some(status);
+            client.terminate_group();
+        }
+        if Instant::now() >= deadline {
+            if let EventPoll::Line(line) = server.poll_event()? {
+                return Err(server_event_failure(phase, &line, &[&*client, &*server]));
+            }
+            if let EventPoll::Line(line) = client.poll_event()? {
+                return validate_peer_event(phase, expected, line, &[&*client, &*server]);
+            }
+            let detail = server_exit.map_or_else(
+                || {
+                    client_exit.map_or_else(
+                        || format!("client {} was silent", client.peer),
+                        |status| format!("client {} exited with {status}", client.peer),
+                    )
+                },
+                |status| format!("server {} exited with {status}", server.peer),
+            );
+            return Err(phase_failure(phase, detail, &[&*client, &*server]));
+        }
+        thread::sleep(PEER_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn server_event_failure(phase: &str, line: &str, peers: &[&PeerProcess]) -> BoxError {
+    let header = match protocol::parse_header(line) {
+        Ok(header) => header,
+        Err(error) => return phase_failure(phase, error, peers),
+    };
+    let detail = if header.event == "error" {
+        match protocol::peer_error(line) {
+            Ok(error) => error,
+            Err(error) => return phase_failure(phase, error, peers),
+        }
+    } else {
+        format!("unexpected server event {}", header.event)
+    };
+    phase_failure(phase, detail, peers)
+}
+
+fn validate_peer_event(
+    phase: &str,
+    expected: &str,
+    line: String,
+    peers: &[&PeerProcess],
+) -> Result<String, BoxError> {
+    let header =
+        protocol::parse_header(&line).map_err(|error| phase_failure(phase, error, peers))?;
+    if header.event == "error" {
+        return Err(phase_failure(phase, protocol::peer_error(&line)?, peers));
+    }
+    if header.event != expected {
+        return Err(phase_failure(
+            phase,
+            format!("expected {expected} event, got {}", header.event),
+            peers,
+        ));
+    }
+    Ok(line)
+}
+
+fn phase_failure(phase: &str, detail: impl std::fmt::Display, peers: &[&PeerProcess]) -> BoxError {
+    let mut message = format!("phase {phase:?}: {detail}");
+    for peer in peers {
+        append_output_tail(&mut message, peer, "stdout", &peer.stdout_path);
+        append_output_tail(&mut message, peer, "stderr", &peer.stderr_path);
+    }
+    message.into()
+}
+
+fn append_output_tail(message: &mut String, peer: &PeerProcess, stream: &str, path: &Path) {
+    message.push_str(&format!("\n--- {} {} {stream}", peer.role, peer.peer));
+    match read_output_tail(path) {
+        Ok((output, truncated)) => {
+            if truncated {
+                message.push_str(" (truncated)");
+            }
+            message.push_str(" ---\n");
+            message.push_str(&output);
+            if !output.ends_with('\n') {
+                message.push('\n');
+            }
+        }
+        Err(error) => message.push_str(&format!(" unavailable: {error} ---\n")),
+    }
+}
+
+fn read_output_tail(path: &Path) -> Result<(String, bool), io::Error> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let truncated = length > MAX_DIAGNOSTIC_STREAM_BYTES;
+    if truncated {
+        file.seek(SeekFrom::Start(length - MAX_DIAGNOSTIC_STREAM_BYTES))?;
+    }
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(length.min(MAX_DIAGNOSTIC_STREAM_BYTES)).unwrap_or(0));
+    file.take(MAX_DIAGNOSTIC_STREAM_BYTES)
+        .read_to_end(&mut bytes)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
 fn terminate_child_group(child: &mut Child) {
@@ -783,13 +1015,19 @@ fn path_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
-    use super::{client_arguments, sample_id, server_arguments, sha256, validate_capabilities};
+    use super::{
+        MAX_DIAGNOSTIC_STREAM_BYTES, PeerProcess, client_arguments, read_output_tail, sample_id,
+        server_arguments, sha256, validate_capabilities, wait_for_client_event,
+    };
     use crate::SCHEMA_VERSION;
     use crate::campaign::{Campaign, Cell, Network, Peer, RpcKind, Stack, Timing, Workload};
     use crate::certificate::Certificates;
-    use crate::network::NetworkTopology;
+    use crate::network::{Endpoint, NetworkTopology};
     use crate::protocol::{Capabilities, Role};
 
     fn campaign() -> Campaign {
@@ -828,6 +1066,29 @@ mod tests {
             startup_timeout_ms: 1000,
             drain_timeout_ms: 1000,
         }
+    }
+
+    fn test_raw_directory(name: &str) -> PathBuf {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "trevrpc-bench-{name}-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).expect("create test raw directory");
+        path
+    }
+
+    fn scripted_peer(id: &str, script: &str) -> Peer {
+        Peer {
+            id: id.to_owned(),
+            command: vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        }
+    }
+
+    fn spawn_scripted_peer(peer: &Peer, raw: &Path, role: &str) -> PeerProcess {
+        let topology = NetworkTopology::create(&Network::default()).expect("loopback topology");
+        PeerProcess::spawn(peer, &[], raw, role, &topology, Endpoint::Server).expect("spawn peer")
     }
 
     fn capabilities(peer: &str, roles: &[&str], stacks: &[Stack]) -> Capabilities {
@@ -951,6 +1212,70 @@ mod tests {
             Some("127.0.0.1:43117")
         );
         assert_eq!(option_value(&arguments, "--webtransport-origin"), None);
+    }
+
+    #[test]
+    fn client_wait_surfaces_server_error_before_timeout() {
+        let raw = test_raw_directory("server-error");
+        let client_peer = scripted_peer("client", "sleep 10");
+        let server_peer = scripted_peer(
+            "server",
+            "printf '%s\\n' '{\"schema_version\":4,\"event\":\"error\",\"peer\":\"server\",\"phase\":\"serve\",\"code\":\"worker_failed\",\"message\":\"worker startup failed\"}'",
+        );
+        let mut client = spawn_scripted_peer(&client_peer, &raw, "client");
+        let mut server = spawn_scripted_peer(&server_peer, &raw, "server");
+
+        let error = wait_for_client_event(
+            "client armed",
+            "armed",
+            &mut client,
+            &mut server,
+            Duration::from_secs(2),
+        )
+        .expect_err("server error must fail the wait")
+        .to_string();
+
+        assert!(error.contains("client armed"));
+        assert!(error.contains("worker_failed"));
+        assert!(error.contains("worker startup failed"));
+        drop(client);
+        drop(server);
+        fs::remove_dir_all(raw).expect("remove test raw directory");
+    }
+
+    #[test]
+    fn event_reports_peer_exit_with_phase_and_stderr() {
+        let raw = test_raw_directory("peer-exit");
+        let peer = scripted_peer("server", "printf 'worker exhausted\\n' >&2; exit 7");
+        let mut process = spawn_scripted_peer(&peer, &raw, "server");
+
+        let error = process
+            .event("server ready", "ready", Duration::from_secs(2))
+            .expect_err("peer exit must fail the wait")
+            .to_string();
+
+        assert!(error.contains("server ready"));
+        assert!(error.contains("exit status: 7"), "{error}");
+        assert!(error.contains("worker exhausted"));
+        drop(process);
+        fs::remove_dir_all(raw).expect("remove test raw directory");
+    }
+
+    #[test]
+    fn diagnostic_output_tail_is_bounded() {
+        let raw = test_raw_directory("output-tail");
+        let path = raw.join("peer.stderr");
+        let mut output =
+            vec![b'x'; usize::try_from(MAX_DIAGNOSTIC_STREAM_BYTES).expect("tail size") + 32];
+        output.extend_from_slice(b"ending marker\n");
+        fs::write(&path, output).expect("write diagnostic fixture");
+
+        let (tail, truncated) = read_output_tail(&path).expect("read diagnostic tail");
+
+        assert!(truncated);
+        assert!(tail.len() <= usize::try_from(MAX_DIAGNOSTIC_STREAM_BYTES).expect("tail size"));
+        assert!(tail.ends_with("ending marker\n"));
+        fs::remove_dir_all(raw).expect("remove test raw directory");
     }
 
     #[test]
