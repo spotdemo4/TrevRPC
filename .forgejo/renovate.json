@@ -18,6 +18,7 @@
   // repository
   "extends": ["config:recommended"],
   "addLabels": ["dep"],
+  "ignoreDeps": ["trevrpc-bench-peer-js", "trevrpc-js"],
   "nix": {
     "enabled": true
   },
