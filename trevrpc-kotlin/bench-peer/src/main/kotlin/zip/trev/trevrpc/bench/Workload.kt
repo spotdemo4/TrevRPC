@@ -13,12 +13,16 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.benchmark.v1.BenchmarkRequest
 import zip.trev.trevrpc.benchmark.v1.BenchmarkResponse
 import zip.trev.trevrpc.benchmark.v1.BenchmarkServiceClient
 import zip.trev.trevrpc.benchmark.v1.BenchmarkSummary
 import zip.trev.trevrpc.benchmark.v1.StreamRequest
+import kotlin.time.Duration.Companion.seconds
+
+internal val BENCHMARK_OPERATION_TIMEOUT = 10.seconds
 
 internal data class MessageCounts(
     val requests: Long,
@@ -96,11 +100,13 @@ internal class BenchmarkWorkload(
     private val requestPayload = ByteString.copyFrom(ByteArray(config.requestBytes))
 
     suspend fun runOperation(): MessageCounts =
-        when (config.rpcKind) {
-            BenchmarkRpcKind.UNARY -> unary()
-            BenchmarkRpcKind.CLIENT_STREAM -> clientStream()
-            BenchmarkRpcKind.SERVER_STREAM -> serverStream()
-            BenchmarkRpcKind.BIDI -> bidi()
+        withTimeout(BENCHMARK_OPERATION_TIMEOUT) {
+            when (config.rpcKind) {
+                BenchmarkRpcKind.UNARY -> unary()
+                BenchmarkRpcKind.CLIENT_STREAM -> clientStream()
+                BenchmarkRpcKind.SERVER_STREAM -> serverStream()
+                BenchmarkRpcKind.BIDI -> bidi()
+            }
         }
 
     private suspend fun unary(): MessageCounts {
@@ -195,6 +201,7 @@ private const val REQUEST_BATCH_SIZE = 16
 
 internal fun benchmarkCallOptions(config: PeerCommand.Client): CallOptions =
     CallOptions(
+        timeout = BENCHMARK_OPERATION_TIMEOUT,
         maxResponseBodySize = MAX_ENCODED_MESSAGE_BYTES,
         maxResponseMessages = config.messagesPerStream.coerceAtLeast(1),
         maxResponseStreamBodySize = null,

@@ -70,8 +70,7 @@ class RawNettyQuicRpcTransport private constructor(
         val inbox = RawFrameInbox(options)
         val stream = openRawStream(inbox)
         try {
-            TrevRpcFrameWriter.write(stream, WireCodec.encode(request), options.maxFrameSize).awaitCompletion()
-            stream.shutdownOutput().awaitCompletion()
+            TrevRpcFrameWriter.writeFinal(stream, WireCodec.encode(request), options.maxFrameSize).awaitCompletion()
             val body = inbox.receive() ?: throw transportException("native QUIC unary response ended before a frame")
             val response = WireCodec.decodeResponse(body)
             inbox.requireEnd(options.maxIdleTime)

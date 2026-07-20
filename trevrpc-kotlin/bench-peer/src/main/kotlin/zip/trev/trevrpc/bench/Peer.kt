@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import zip.trev.trevrpc.benchmark.v1.BenchmarkServiceClient
 import zip.trev.trevrpc.netty.NettyClientTls
 import zip.trev.trevrpc.netty.NettyQuicClientConfig
@@ -88,7 +89,7 @@ private suspend fun runClient(
 ) {
     val connection =
         try {
-            connectBenchmarkClient(config)
+            withTimeout(BENCHMARK_OPERATION_TIMEOUT) { connectBenchmarkClient(config) }
         } catch (error: Throwable) {
             throw PeerFailure("connect", "connection_failed", "failed to configure verified benchmark connection", error)
         }
