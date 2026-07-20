@@ -39,10 +39,16 @@ typedef struct test_blocker {
 typedef struct test_server {
     trevrpc_server* server;
     pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
     atomic_int* calls;
     test_blocker* blocker;
     uint16_t port;
     bool thread_started;
+    bool sync_initialized;
+    bool observer_set;
+    bool ready;
+    bool serve_done;
     int serve_result;
 } test_server;
 
@@ -129,25 +135,59 @@ static int test_stream_handler(
 
 static void* test_serve(void* context) {
     test_server* fixture = context;
-    fixture->serve_result = trevrpc_server_serve(fixture->server);
+    int result = trevrpc_server_serve(fixture->server);
+    pthread_mutex_lock(&fixture->mutex);
+    fixture->serve_result = result;
+    fixture->serve_done = true;
+    pthread_cond_broadcast(&fixture->cond);
+    pthread_mutex_unlock(&fixture->mutex);
     return NULL;
+}
+
+static void test_server_transport_event(void* context, const trevrpc_transport_event* event) {
+    if (event->kind != TREVRPC_TRANSPORT_EVENT_LISTENER_OPEN) {
+        return;
+    }
+    test_server* fixture = context;
+    pthread_mutex_lock(&fixture->mutex);
+    fixture->ready = true;
+    pthread_cond_broadcast(&fixture->cond);
+    pthread_mutex_unlock(&fixture->mutex);
+}
+
+static void test_server_destroy_sync(test_server* fixture) {
+    if (!fixture->sync_initialized) {
+        return;
+    }
+    pthread_cond_destroy(&fixture->cond);
+    pthread_mutex_destroy(&fixture->mutex);
+    fixture->sync_initialized = false;
 }
 
 static int test_server_start(test_server* fixture, uint16_t port, atomic_int* calls, test_blocker* blocker) {
     memset(fixture, 0, sizeof(*fixture));
     fixture->calls = calls;
     fixture->blocker = blocker;
+    int err = pthread_mutex_init(&fixture->mutex, NULL);
+    if (err != 0) {
+        return -err;
+    }
+    err = pthread_cond_init(&fixture->cond, NULL);
+    if (err != 0) {
+        pthread_mutex_destroy(&fixture->mutex);
+        return -err;
+    }
+    fixture->sync_initialized = true;
     trevrpc_server_config config = trevrpc_default_server_config();
     config.host = "127.0.0.1";
     config.port = port;
     config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
     config.key_file = TREVRPC_MSQUIC_TEST_KEY;
     config.peer_bidi_stream_count = 16;
-    int err = trevrpc_server_listen(&config, &fixture->server);
-    if (err != 0) {
-        return err;
+    err = trevrpc_server_listen(&config, &fixture->server);
+    if (err == 0) {
+        err = trevrpc_server_register_unary(fixture->server, "test.Service", "Unary", test_unary_handler, calls);
     }
-    err = trevrpc_server_register_unary(fixture->server, "test.Service", "Unary", test_unary_handler, calls);
     if (err == 0) {
         err = trevrpc_server_register_unary(fixture->server, "test.Service", "Block", test_blocking_handler, blocker);
     }
@@ -163,6 +203,14 @@ static int test_server_start(test_server* fixture, uint16_t port, atomic_int* ca
         err = trevrpc_server_port(fixture->server, &fixture->port);
     }
     if (err == 0) {
+        trevrpc_transport_observer observer = {
+            .transport_event = test_server_transport_event,
+            .user_data = fixture,
+        };
+        err = trevrpc_server_set_transport_observer(fixture->server, &observer);
+        fixture->observer_set = err == 0;
+    }
+    if (err == 0) {
         err = pthread_create(&fixture->thread, NULL, test_serve, fixture);
         if (err == 0) {
             fixture->thread_started = true;
@@ -170,9 +218,32 @@ static int test_server_start(test_server* fixture, uint16_t port, atomic_int* ca
             err = -err;
         }
     }
+    if (err == 0) {
+        pthread_mutex_lock(&fixture->mutex);
+        while (!fixture->ready && !fixture->serve_done && err == 0) {
+            int wait_err = pthread_cond_wait(&fixture->cond, &fixture->mutex);
+            if (wait_err != 0) {
+                err = -wait_err;
+            }
+        }
+        if (err == 0 && !fixture->ready) {
+            err = fixture->serve_result == 0 ? -ECANCELED : fixture->serve_result;
+        }
+        pthread_mutex_unlock(&fixture->mutex);
+    }
     if (err != 0) {
+        trevrpc_server_shutdown(fixture->server);
+        if (fixture->thread_started) {
+            (void)pthread_join(fixture->thread, NULL);
+            fixture->thread_started = false;
+        }
+        if (fixture->observer_set) {
+            trevrpc_server_clear_transport_observer(fixture->server);
+            fixture->observer_set = false;
+        }
         trevrpc_server_close(fixture->server);
         fixture->server = NULL;
+        test_server_destroy_sync(fixture);
     }
     return err;
 }
@@ -189,11 +260,17 @@ static int test_server_stop(test_server* fixture) {
         if (err != 0) {
             result = -err;
         } else if (fixture->serve_result != 0) {
+            fprintf(stderr, "server serve failed: %d\n", fixture->serve_result);
             result = fixture->serve_result;
         }
     }
+    if (fixture->observer_set) {
+        trevrpc_server_clear_transport_observer(fixture->server);
+        fixture->observer_set = false;
+    }
     trevrpc_server_close(fixture->server);
     fixture->server = NULL;
+    test_server_destroy_sync(fixture);
     return result;
 }
 
@@ -218,6 +295,23 @@ static int test_wait_state(trevrpc_channel* channel, uint32_t expected, uint64_t
             return err;
         }
         if (state == expected) {
+            return 0;
+        }
+        test_sleep_ms(5);
+    }
+    return TREV_MSQUIC_ERR_TIMEOUT;
+}
+
+static int test_wait_lifecycle(lifecycle_counts* counts,
+    int expected_shutdowns,
+    int expected_tickets,
+    int expected_ready_states,
+    uint64_t timeout_ms) {
+    uint64_t deadline = test_monotonic_nanos() + timeout_ms * 1000000ull;
+    while (test_monotonic_nanos() < deadline) {
+        if (atomic_load(&counts->shutdowns) >= expected_shutdowns &&
+            atomic_load(&counts->tickets) >= expected_tickets &&
+            atomic_load(&counts->ready_states) >= expected_ready_states) {
             return 0;
         }
         test_sleep_ms(5);
@@ -350,13 +444,10 @@ static int test_channel_reconnect_and_ownership(void) {
     uint64_t recovered_generation = 0;
     CHECK_GOTO(trevrpc_channel_wait_ready(channel, 5000000000ull, NULL, &recovered_generation) == 0);
     CHECK_GOTO(recovered_generation > first_generation);
-    test_sleep_ms(200);
+    CHECK_GOTO(test_wait_lifecycle(&lifecycle, 1, 1, 2, 5000) == 0);
     CHECK_GOTO(atomic_load(&calls) == 1);
     CHECK_GOTO(test_call(channel, "Unary") == 0);
     CHECK_GOTO(atomic_load(&calls) == 2);
-    CHECK_GOTO(atomic_load(&lifecycle.shutdowns) >= 1);
-    CHECK_GOTO(atomic_load(&lifecycle.ready_states) >= 2);
-    CHECK_GOTO(atomic_load(&lifecycle.tickets) >= 1);
 
     CHECK_GOTO(trevrpc_channel_start_stream(
                    channel, "test.Service", "Stream", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, &stream) == 0);
