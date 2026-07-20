@@ -32,6 +32,7 @@ exec 4<>"$directory/events"
 "$peer" server \
     --stack trevrpc_webtransport \
     --listen 127.0.0.1:0 \
+    --workers 8 \
     --cert "$certificate" \
     --key "$private_key" \
     --webtransport-origin https://benchmark.invalid \

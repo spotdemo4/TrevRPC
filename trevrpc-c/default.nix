@@ -87,7 +87,7 @@ stdenv.mkDerivation (
       if benchPeer then
         ''
           runHook preCheck
-          ctest --test-dir build --output-on-failure
+          ctest --test-dir build --output-on-failure --no-tests=error -R '^trevrpc_bench_peer_'
           runHook postCheck
         ''
       else

@@ -32,6 +32,7 @@ exec 4<>"$directory/events"
 "$peer" server \
     --stack grpc_http2 \
     --listen 127.0.0.1:0 \
+    --workers 8 \
     --cert "$certificate" \
     --key "$private_key" \
     <&3 >&4 2>"$directory/server.err" &

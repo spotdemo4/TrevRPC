@@ -25,4 +25,4 @@ jobs:
           niks3_url: https://niks3.trev.zip
 
       - name: Check
-        run: nix flake check
+        run: nix flake check --option log-lines 100
