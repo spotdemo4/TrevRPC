@@ -53,6 +53,7 @@ typedef struct server_options {
     const char* webtransport_origin;
     benchmark_stack stack;
     const char* stack_name;
+    size_t workers;
 } server_options;
 
 typedef struct trevrpc_bench_grpc_client trevrpc_bench_grpc_client;

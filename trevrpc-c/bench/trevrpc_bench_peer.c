@@ -90,6 +90,8 @@ struct phase_control {
 typedef struct server_thread_args {
     trevrpc_server* server;
     pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool ready;
     bool done;
     int result;
 } server_thread_args;
@@ -360,6 +362,7 @@ static int parse_server_options(int argc, char** argv, server_options* options, 
     memset(options, 0, sizeof(*options));
     const char* listen = NULL;
     const char* stack = NULL;
+    const char* workers = NULL;
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 >= argc) {
             snprintf(error, error_len, "missing value for %s", argv[i]);
@@ -376,6 +379,8 @@ static int parse_server_options(int argc, char** argv, server_options* options, 
             err = set_once(&options->key, argv[i + 1]);
         } else if (strcmp(argv[i], "--webtransport-origin") == 0) {
             err = set_once(&options->webtransport_origin, argv[i + 1]);
+        } else if (strcmp(argv[i], "--workers") == 0) {
+            err = set_once(&workers, argv[i + 1]);
         } else {
             snprintf(error, error_len, "unknown server option: %s", argv[i]);
             return -EINVAL;
@@ -392,6 +397,16 @@ static int parse_server_options(int argc, char** argv, server_options* options, 
     if (parse_stack(stack, &options->stack, &options->stack_name) != 0) {
         snprintf(error, error_len, "invalid --stack value: %s", stack);
         return -EINVAL;
+    }
+    options->workers = BENCHMARK_SERVER_WORKERS;
+    const char* configured_workers = workers != NULL ? workers : getenv("TREVRPC_BENCH_SERVER_WORKERS");
+    if (configured_workers != NULL) {
+        uint64_t parsed = 0;
+        if (parse_u64(configured_workers, 1, BENCHMARK_SERVER_WORKERS, &parsed) != 0) {
+            snprintf(error, error_len, "invalid worker count: %s", configured_workers);
+            return -EINVAL;
+        }
+        options->workers = (size_t)parsed;
     }
     if (options->stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
         if (options->webtransport_origin == NULL || options->webtransport_origin[0] == '\0') {
@@ -1329,8 +1344,30 @@ static void* server_thread(void* context) {
     pthread_mutex_lock(&args->mutex);
     args->result = result;
     args->done = true;
+    pthread_cond_broadcast(&args->cond);
     pthread_mutex_unlock(&args->mutex);
     return NULL;
+}
+
+static void server_transport_event(void* context, const trevrpc_transport_event* event) {
+    if (event->kind != TREVRPC_TRANSPORT_EVENT_LISTENER_OPEN) {
+        return;
+    }
+    server_thread_args* args = context;
+    pthread_mutex_lock(&args->mutex);
+    args->ready = true;
+    pthread_cond_broadcast(&args->cond);
+    pthread_mutex_unlock(&args->mutex);
+}
+
+static int wait_for_server_ready(server_thread_args* args) {
+    pthread_mutex_lock(&args->mutex);
+    while (!args->ready && !args->done) {
+        pthread_cond_wait(&args->cond, &args->mutex);
+    }
+    int result = args->ready ? 0 : (args->result == 0 ? -ECANCELED : args->result);
+    pthread_mutex_unlock(&args->mutex);
+    return result;
 }
 
 static bool server_thread_done(server_thread_args* args, int* result) {
@@ -1469,7 +1506,7 @@ static int run_server(int argc, char** argv) {
     trevrpc_server_options runtime_options = trevrpc_default_server_options();
     runtime_options.max_concurrent_streams_per_connection = BENCHMARK_SERVER_STREAMS;
     runtime_options.max_concurrent_requests = BENCHMARK_SERVER_REQUESTS;
-    runtime_options.worker_count = BENCHMARK_SERVER_WORKERS;
+    runtime_options.worker_count = (int64_t)options.workers;
     runtime_options.worker_queue_capacity = BENCHMARK_SERVER_REQUESTS;
     runtime_options.graceful_shutdown_timeout_nanos = BENCHMARK_GRACEFUL_SHUTDOWN_NS;
     runtime_options.max_stream_messages = BENCHMARK_MAX_MESSAGES_PER_STREAM;
@@ -1489,6 +1526,8 @@ static int run_server(int argc, char** argv) {
     server_thread_args thread_args = {.server = server};
     pthread_t thread;
     bool mutex_initialized = false;
+    bool cond_initialized = false;
+    bool observer_set = false;
     bool thread_started = false;
     if (err == 0) {
         int mutex_err = pthread_mutex_init(&thread_args.mutex, NULL);
@@ -1496,14 +1535,44 @@ static int run_server(int argc, char** argv) {
         mutex_initialized = mutex_err == 0;
     }
     if (err == 0) {
+        int cond_err = pthread_cond_init(&thread_args.cond, NULL);
+        err = cond_err == 0 ? 0 : -cond_err;
+        cond_initialized = cond_err == 0;
+    }
+    if (err == 0) {
+        trevrpc_transport_observer observer = {
+            .transport_event = server_transport_event,
+            .user_data = &thread_args,
+        };
+        err = trevrpc_server_set_transport_observer(server, &observer);
+        observer_set = err == 0;
+    }
+    if (err == 0) {
         int thread_err = pthread_create(&thread, NULL, server_thread, &thread_args);
         err = thread_err == 0 ? 0 : -thread_err;
         thread_started = thread_err == 0;
     }
     if (err != 0) {
+        if (observer_set) {
+            trevrpc_server_clear_transport_observer(server);
+        }
+        if (cond_initialized) {
+            pthread_cond_destroy(&thread_args.cond);
+        }
         if (mutex_initialized) {
             pthread_mutex_destroy(&thread_args.mutex);
         }
+        trevrpc_server_close(server);
+        free(options.host);
+        return fail_with_error("listen", "serve_failed", "%s (%d)", trevrpc_error(err), err);
+    }
+
+    err = wait_for_server_ready(&thread_args);
+    if (err != 0) {
+        (void)pthread_join(thread, NULL);
+        trevrpc_server_clear_transport_observer(server);
+        pthread_cond_destroy(&thread_args.cond);
+        pthread_mutex_destroy(&thread_args.mutex);
         trevrpc_server_close(server);
         free(options.host);
         return fail_with_error("listen", "serve_failed", "%s (%d)", trevrpc_error(err), err);
@@ -1517,6 +1586,8 @@ static int run_server(int argc, char** argv) {
     if (emit_ready(options.host, actual_port, options.stack_name) != 0) {
         trevrpc_server_shutdown(server);
         (void)pthread_join(thread, NULL);
+        trevrpc_server_clear_transport_observer(server);
+        pthread_cond_destroy(&thread_args.cond);
         pthread_mutex_destroy(&thread_args.mutex);
         trevrpc_server_close(server);
         free(options.host);
@@ -1532,6 +1603,8 @@ static int run_server(int argc, char** argv) {
     if (serve_result == TREV_MSQUIC_ERR_CLOSED) {
         serve_result = 0;
     }
+    trevrpc_server_clear_transport_observer(server);
+    pthread_cond_destroy(&thread_args.cond);
     pthread_mutex_destroy(&thread_args.mutex);
     trevrpc_server_close(server);
     free(options.host);

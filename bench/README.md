@@ -50,7 +50,9 @@ trevrpc-bench run bench/campaigns/native-quic.example.json \
 `cross-language-smoke.example.json` uses C as both reference client and
 reference server to exercise every peer in both roles. Its deliberately short
 windows validate interoperability and the harness only; they are not suitable
-for performance comparisons.
+for performance comparisons. The Nix smoke checks set
+`TREVRPC_BENCH_SERVER_WORKERS=8` to keep concurrent checks within CI task
+limits; normal benchmark runs retain the C peer's 128-worker default.
 
 `stack-comparison.example.json` contains same-language TrevRPC and gRPC cells
 for C, C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's

@@ -317,6 +317,7 @@
                 nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
               }
               ''
+                export TREVRPC_BENCH_SERVER_WORKERS=8
                 trevrpc-bench run ${./bench/campaigns/grpc-smoke.example.json} --out run
                 test "$(wc -l < run/samples.jsonl)" -eq 24
                 test -s run/aggregate.csv
@@ -331,6 +332,7 @@
                 nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
               }
               ''
+                export TREVRPC_BENCH_SERVER_WORKERS=8
                 trevrpc-bench run ${./bench/campaigns/cross-language-smoke.example.json} --out run
                 test "$(wc -l < run/samples.jsonl)" -eq 44
                 test -s run/aggregate.csv
@@ -346,6 +348,7 @@
               }
               ''
                 export HOME=$(mktemp -d)
+                export TREVRPC_BENCH_SERVER_WORKERS=8
                 trevrpc-bench run ${./bench/campaigns/webtransport-smoke.example.json} --out run
                 test "$(wc -l < run/samples.jsonl)" -eq 24
                 test -s run/aggregate.csv

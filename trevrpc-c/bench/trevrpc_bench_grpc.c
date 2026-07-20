@@ -1416,7 +1416,7 @@ int trevrpc_bench_grpc_server_start(
             created->accept_thread_started = true;
         }
     }
-    for (size_t i = 0; result == 0 && i < BENCHMARK_SERVER_WORKERS; i++) {
+    for (size_t i = 0; result == 0 && i < options->workers; i++) {
         int thread_result = pthread_create(&created->workers[i], NULL, server_worker, created);
         if (thread_result != 0) {
             result = -thread_result;
