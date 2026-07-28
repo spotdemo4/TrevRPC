@@ -74,9 +74,6 @@ let
     sourceRoot = "${final.src.name}/trevrpc-go/cmd/trevrpc-bench-peer";
     env.GOWORK = "off";
     vendorHash = "sha256-bVoZcvfN3avMxhAlvGq9LUpbaUqLlPfr9k9o9ZX4hPU=";
-    postPatch = ''
-      go mod edit -replace=trev.zip/llc/trevrpc/trevrpc-go=../..
-    '';
     subPackages = [ "." ];
     postInstall = ''
       mv $out/bin/trevrpc-bench-peer $out/bin/trevrpc-bench-peer-go

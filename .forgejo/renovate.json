@@ -9,6 +9,7 @@
   "repositories": ["llc/TrevRPC"],
   "allowedCommands": [
     "^fix-hash \\.#trevrpc-go$",
+    "^fix-hash \\.#trevrpc-go-bench-peer$",
     "^npm audit fix --prefix trevrpc-js$",
     "^trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --refresh-dependencies --write-locks --write-verification-metadata sha256 resolveAndLockAll$",
     "^nix run \\.#update-kotlin-deps$"
@@ -34,7 +35,11 @@
     "schedule": ["* * * * 0"], // sunday
     "skipInstalls": false,
     "postUpgradeTasks": {
-      "commands": ["fix-hash .#trevrpc-go", "npm audit fix --prefix trevrpc-js"]
+      "commands": [
+        "fix-hash .#trevrpc-go",
+        "fix-hash .#trevrpc-go-bench-peer",
+        "npm audit fix --prefix trevrpc-js"
+      ]
     }
   },
   "packageRules": [
@@ -58,7 +63,8 @@
       "matchManagers": ["gomod"],
       "addLabels": ["go"],
       "postUpgradeTasks": {
-        "commands": ["fix-hash .#trevrpc-go"]
+        "commands": ["fix-hash .#trevrpc-go", "fix-hash .#trevrpc-go-bench-peer"],
+        "executionMode": "branch"
       }
     },
     {

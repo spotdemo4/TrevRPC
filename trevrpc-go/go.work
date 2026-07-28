@@ -4,5 +4,3 @@ use (
 	.
 	./cmd/trevrpc-bench-peer
 )
-
-replace trev.zip/llc/trevrpc/trevrpc-go v0.1.0 => .

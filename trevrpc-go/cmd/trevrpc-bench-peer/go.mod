@@ -19,3 +19,5 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250324211829-b45e905df463 // indirect
 )
+
+replace trev.zip/llc/trevrpc/trevrpc-go => ../..
