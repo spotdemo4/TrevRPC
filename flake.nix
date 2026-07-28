@@ -153,9 +153,21 @@
         # nix run [#...]
         apps = pkgs.mkApps {
           update-kotlin-deps = {
-            packages = [ pkgs.oxfmt ];
+            packages = with pkgs; [
+              jdk25
+              oxfmt
+            ];
             script = ''
-              USE_BWRAP=0 ${self.packages.${system}.trevrpc-kotlin.mitmCache.updateScript}
+              trevrpc-kotlin/gradlew \
+                --project-dir trevrpc-kotlin \
+                --no-configuration-cache \
+                --refresh-dependencies \
+                --write-locks \
+                --write-verification-metadata sha256 \
+                resolveAndLockAll
+
+              update_script=$(nix build .#trevrpc-kotlin.mitmCache.updateScript --no-link --print-out-paths)
+              USE_BWRAP=0 "$update_script"
               oxfmt --write trevrpc-kotlin/gradle/deps.json
             '';
           };

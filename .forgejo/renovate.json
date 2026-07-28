@@ -11,7 +11,6 @@
     "^fix-hash \\.#trevrpc-go$",
     "^fix-hash \\.#trevrpc-go-bench-peer$",
     "^npm audit fix --prefix trevrpc-js$",
-    "^trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --refresh-dependencies --write-locks --write-verification-metadata sha256 resolveAndLockAll$",
     "^nix run \\.#update-kotlin-deps$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
@@ -74,10 +73,7 @@
     {
       "matchManagers": ["gradle"],
       "postUpgradeTasks": {
-        "commands": [
-          "trevrpc-kotlin/gradlew --project-dir trevrpc-kotlin --no-configuration-cache --refresh-dependencies --write-locks --write-verification-metadata sha256 resolveAndLockAll",
-          "nix run .#update-kotlin-deps"
-        ],
+        "commands": ["nix run .#update-kotlin-deps"],
         "fileFilters": [
           "trevrpc-kotlin/**/gradle.lockfile",
           "trevrpc-kotlin/settings-gradle.lockfile",
