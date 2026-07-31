@@ -73,7 +73,7 @@ let
     };
     sourceRoot = "${final.src.name}/trevrpc-go/cmd/trevrpc-bench-peer";
     env.GOWORK = "off";
-    vendorHash = "sha256-bVoZcvfN3avMxhAlvGq9LUpbaUqLlPfr9k9o9ZX4hPU=";
+    vendorHash = "sha256-Drj0AXZ6zl7oetEMrvSumBB+m+CodEMzBURPa2qBwQA=";
     subPackages = [ "." ];
     postInstall = ''
       mv $out/bin/trevrpc-bench-peer $out/bin/trevrpc-bench-peer-go
