@@ -104,7 +104,8 @@ private class DefaultNettyRpcChannel(
     private val terminal = AtomicBoolean(false)
     private val transitionLock = Any()
     private val current = AtomicReference<NettyChannelConnection?>(null)
-    private val closeComplete = CompletableDeferred<Unit>()
+    private val terminalCleanupStarted = AtomicBoolean(false)
+    private val closeComplete = CompletableDeferred<Result<Unit>>()
     private val mutableState = MutableStateFlow(RpcChannelState.CONNECTING)
     private val manager: Job = scope.launch { manageConnections() }
 
@@ -127,9 +128,8 @@ private class DefaultNettyRpcChannel(
         withContext(NonCancellable) {
             if (first) manager.cancel()
             manager.join()
-            closeCurrent()
-            closeComplete.complete(Unit)
-            closeComplete.await()
+            completeTerminalCleanup()
+            closeComplete.await().getOrThrow()
         }
     }
 
@@ -196,17 +196,22 @@ private class DefaultNettyRpcChannel(
                 delay(backoff.delayForAttempt(failedAttempts))
             }
         } finally {
-            withContext(NonCancellable) {
-                owned?.let { closeQuietly(it) }
-                closeCurrent()
-            }
+            withContext(NonCancellable) { completeTerminalCleanup(owned) }
             markClosed()
-            closeComplete.complete(Unit)
         }
     }
 
-    private suspend fun closeCurrent() {
-        current.getAndSet(null)?.let { closeQuietly(it) }
+    private suspend fun completeTerminalCleanup(owned: NettyChannelConnection? = null) {
+        if (!terminalCleanupStarted.compareAndSet(false, true)) return
+        var failure = runCatching { owned?.close() }.exceptionOrNull()
+        failure = failure.combineFailure(runCatching { current.getAndSet(null)?.close() }.exceptionOrNull())
+        closeComplete.complete(
+            if (failure == null) {
+                Result.success(Unit)
+            } else {
+                Result.failure(failure)
+            },
+        )
     }
 
     private suspend fun closeQuietly(connection: NettyChannelConnection) {

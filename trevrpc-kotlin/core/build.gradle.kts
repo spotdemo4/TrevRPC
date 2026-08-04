@@ -18,7 +18,8 @@ kotlin {
 }
 
 dependencies {
-    implementation(libs.coroutines.core)
+    api(libs.coroutines.core)
+    api(libs.protobuf.java)
 
     testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")

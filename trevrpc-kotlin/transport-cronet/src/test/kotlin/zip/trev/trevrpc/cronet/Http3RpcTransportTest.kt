@@ -1,16 +1,27 @@
 package zip.trev.trevrpc.cronet
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
+import org.chromium.net.BidirectionalStream
+import org.chromium.net.CronetEngine
+import org.chromium.net.UrlRequest
+import org.chromium.net.UrlResponseInfo
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.Code
@@ -26,14 +37,34 @@ import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
 import zip.trev.trevrpc.frame
+import java.net.URL
+import java.net.URLConnection
+import java.net.URLStreamHandlerFactory
 import java.nio.ByteBuffer
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.CoroutineContext
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.measureTime
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class Http3RpcTransportTest {
     @Test
     fun `provider channel is ready until explicitly closed`() =
         runTest {
-            val channel = CronetChannel(Http3RpcTransport(FakeFactory(), coroutineContext = coroutineContext))
+            val channel =
+                CronetChannel(
+                    Http3RpcTransport(
+                        FakeFactory(),
+                        coroutineContext = coroutineContext,
+                        shutdownContext = coroutineContext,
+                    ),
+                )
 
             assertEquals(RpcChannelState.READY, channel.state.value)
             channel.awaitReady()
@@ -49,7 +80,7 @@ class Http3RpcTransportTest {
     fun `unary writes one request and decodes one response`() =
         runTest {
             val fake = FakeFactory()
-            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext)
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
             val request = RpcRequest("example.Service", "Unary", byteArrayOf(1, 2))
             val call = async { transport.unary(request) }
 
@@ -69,6 +100,7 @@ class Http3RpcTransportTest {
             val actual = call.await()
             assertEquals(response.statusValue, actual.statusValue)
             assertArrayEquals(response.body, actual.body)
+            assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
         }
 
@@ -76,7 +108,7 @@ class Http3RpcTransportTest {
     fun `headers may precede ready and reads split and coalesced frames`() =
         runTest {
             val fake = FakeFactory()
-            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext)
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
             val request =
                 RpcRequest(
                     "example.Service",
@@ -109,6 +141,7 @@ class Http3RpcTransportTest {
             assertArrayEquals(message.body, actualMessage?.body)
             assertEquals(RpcStreamFrameKind.STATUS, actualStatus?.kind)
             assertNull(stream.receive())
+            assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
         }
 
@@ -116,7 +149,7 @@ class Http3RpcTransportTest {
     fun `send waits for direct completion and serializes with finish`() =
         runTest {
             val fake = FakeFactory()
-            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext)
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
             val stream = openStreaming(transport, fake)
 
             val first = async { stream.send(byteArrayOf(1)) }
@@ -159,7 +192,7 @@ class Http3RpcTransportTest {
             val fake = FakeFactory()
             val stream =
                 openStreaming(
-                    Http3RpcTransport(fake, coroutineContext = coroutineContext),
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
                     fake,
                 )
             val send = async { stream.send(byteArrayOf(1)) }
@@ -170,6 +203,7 @@ class Http3RpcTransportTest {
             runCurrent()
 
             assertTrue(send.isCancelled)
+            assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
             assertInstanceOf(CancellationException::class.java, stream.receiveFailure())
         }
@@ -244,12 +278,13 @@ class Http3RpcTransportTest {
                 val fake = FakeFactory()
                 val stream =
                     openStreaming(
-                        Http3RpcTransport(fake, coroutineContext = coroutineContext),
+                        Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
                         fake,
                     )
                 fake.headers(headers)
                 val error = stream.receiveFailure()
                 assertInstanceOf(TrevRpcException::class.java, error)
+                assertTrue(fake.awaitCancel())
                 assertEquals(1, fake.cancelCalls)
             }
         }
@@ -310,6 +345,7 @@ class Http3RpcTransportTest {
             assertEquals(Code.UNAVAILABLE, actual?.status?.code)
             assertEquals("remote result", actual?.status?.message)
             assertNull(stream.receive())
+            assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
         }
 
@@ -319,15 +355,29 @@ class Http3RpcTransportTest {
             val fake = FakeFactory()
             val stream =
                 openStreaming(
-                    Http3RpcTransport(fake, coroutineContext = coroutineContext),
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
                     fake,
                 )
+            val race = CyclicBarrier(3)
+            val localClose =
+                async(Dispatchers.Default) {
+                    race.await(5, TimeUnit.SECONDS)
+                    stream.close(TrevRpcException(Status.cancelled("local close")))
+                }
+            val terminalCallback =
+                async(Dispatchers.Default) {
+                    race.await(5, TimeUnit.SECONDS)
+                    fake.cancelCallback()
+                }
+            race.await(5, TimeUnit.SECONDS)
+            localClose.await()
+            terminalCallback.await()
+
             stream.close()
-            stream.close()
-            fake.cancelCallback()
             fake.fail(IllegalStateException("late failure"))
+            assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
-            assertNull(stream.receive())
+            assertInstanceOf(TrevRpcException::class.java, stream.receiveFailure())
         }
 
     @Test
@@ -336,7 +386,7 @@ class Http3RpcTransportTest {
             val fake = FakeFactory()
             val stream =
                 openStreaming(
-                    Http3RpcTransport(fake, coroutineContext = coroutineContext),
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
                     fake,
                 )
             fake.fail(IllegalArgumentException("first"))
@@ -346,7 +396,528 @@ class Http3RpcTransportTest {
             val error = stream.receiveFailure() as TrevRpcException
             assertEquals(Code.UNAVAILABLE, error.status.code)
             assertEquals("first", error.cause?.message)
+            assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
+        }
+
+    @Test
+    fun `channel close cancels and drains unary and every streaming exchange shape`() =
+        runTest {
+            RpcKind.entries.forEach { kind ->
+                val fake = FakeFactory()
+                val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+                val request = RpcRequest("example.Service", kind.name, kindValue = kind.value)
+                val call =
+                    async {
+                        runCatching {
+                            if (kind == RpcKind.UNARY) {
+                                transport.unary(request)
+                            } else {
+                                transport.openStream(request)
+                            }
+                        }.exceptionOrNull()
+                    }
+                runCurrent()
+                assertEquals(1, transport.activeExchangeCount)
+
+                val closing = async { transport.close() }
+                runCurrent()
+                assertTrue(fake.awaitCancel())
+                assertEquals(1, fake.cancelCalls)
+                assertFalse(closing.isCompleted)
+                fake.cancelCallback()
+                runCurrent()
+
+                closing.await()
+                assertEquals(0, transport.activeExchangeCount)
+                assertInstanceOf(TrevRpcException::class.java, call.await())
+            }
+        }
+
+    @Test
+    fun `logical close remains registered until native termination and callback barrier`() =
+        runTest {
+            val fake = FakeFactory()
+            val callbackDrain = ControlledCallbackDrain()
+            val transport =
+                Http3RpcTransport(
+                    fake,
+                    coroutineContext = coroutineContext,
+                    callbackDrain = callbackDrain,
+                    shutdownContext = coroutineContext,
+                )
+            val stream = openStreaming(transport, fake)
+
+            stream.close()
+            assertTrue(fake.awaitCancel())
+            assertEquals(1, fake.cancelCalls)
+            assertEquals(1, transport.activeExchangeCount)
+
+            val closing = async { transport.close() }
+            runCurrent()
+            assertFalse(closing.isCompleted)
+            assertTrue(fake.awaitCancel())
+            assertEquals(1, fake.cancelCalls)
+
+            fake.cancelCallback()
+            runCurrent()
+            assertEquals(0, transport.activeExchangeCount)
+            assertFalse(closing.isCompleted)
+            assertTrue(callbackDrain.entered.isCompleted)
+
+            callbackDrain.release.complete(Unit)
+            closing.await()
+        }
+
+    @Test
+    fun `remote terminal status waits for terminal Cronet callback before deregistration`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+            val stream = openStreaming(transport, fake)
+            fake.headers(validHeaders())
+            fake.deliverRead(frame(WireCodec.encode(RpcStreamFrame.status(Status.ok()))))
+            runCurrent()
+
+            assertEquals(RpcStreamFrameKind.STATUS, stream.receive()?.kind)
+            assertNull(stream.receive())
+            assertEquals(1, transport.activeExchangeCount)
+
+            fake.cancelCallback()
+            assertEquals(0, transport.activeExchangeCount)
+            assertTrue(fake.awaitCancelReturned())
+            transport.close()
+        }
+
+    @Test
+    fun `factory failure settles both logical and native exchange state`() =
+        runTest {
+            val transport =
+                Http3RpcTransport(
+                    object : DuplexStreamFactory {
+                        override fun open(callback: DuplexCallback): DuplexStream = throw IllegalStateException("factory failed")
+                    },
+                    coroutineContext = coroutineContext,
+                )
+
+            val error = runCatching { transport.openStream(streamRequest()) }.exceptionOrNull()
+            assertEquals("factory failed", error?.message)
+            assertEquals(0, transport.activeExchangeCount)
+            transport.close()
+        }
+
+    @Test
+    fun `synchronous start failure releases native registration`() =
+        runTest {
+            val transport =
+                Http3RpcTransport(
+                    StartFailingFactory(),
+                    coroutineContext = coroutineContext,
+                    shutdownContext = coroutineContext,
+                )
+
+            val error = runCatching { transport.openStream(streamRequest()) }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, error.status.code)
+            assertEquals(0, transport.activeExchangeCount)
+            transport.close()
+        }
+
+    @Test
+    fun `canceling one close caller does not cancel the shared drain`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+            openStreaming(transport, fake)
+
+            val first = async { transport.close() }
+            runCurrent()
+            first.cancel()
+            runCurrent()
+            assertTrue(first.isCancelled)
+            assertTrue(fake.awaitCancel())
+            assertEquals(1, fake.cancelCalls)
+
+            val second = async { transport.close() }
+            runCurrent()
+            assertFalse(second.isCompleted)
+            fake.cancelCallback()
+            runCurrent()
+            second.await()
+            transport.close()
+        }
+
+    @Test
+    fun `close timeout is bounded and shared by concurrent callers`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport =
+                Http3RpcTransport(
+                    fake,
+                    CronetTransportOptions(closeTimeout = 100.milliseconds),
+                    coroutineContext,
+                    shutdownContext = coroutineContext,
+                )
+            openStreaming(transport, fake)
+
+            val first = async { runCatching { transport.close() }.exceptionOrNull() }
+            val second = async { runCatching { transport.close() }.exceptionOrNull() }
+            runCurrent()
+            assertTrue(fake.awaitCancel())
+            assertEquals(1, fake.cancelCalls)
+            assertFalse(first.isCompleted)
+            assertFalse(second.isCompleted)
+
+            advanceTimeBy(100)
+            runCurrent()
+            val firstError = first.await() as TrevRpcException
+            val secondError = second.await() as TrevRpcException
+            assertSame(firstError, secondError)
+            assertEquals(Code.UNAVAILABLE, firstError.status.code)
+            assertTrue(firstError.status.message.contains("not proven quiescent"))
+        }
+
+    @Test
+    fun `close timeout also bounds a stalled callback barrier`() =
+        runTest {
+            val fake = FakeFactory()
+            val callbackDrain = ControlledCallbackDrain()
+            val transport =
+                Http3RpcTransport(
+                    fake,
+                    CronetTransportOptions(closeTimeout = 100.milliseconds),
+                    coroutineContext,
+                    callbackDrain,
+                    shutdownContext = coroutineContext,
+                )
+            val stream = openStreaming(transport, fake)
+            stream.close()
+
+            val closing = async { runCatching { transport.close() }.exceptionOrNull() }
+            runCurrent()
+            assertTrue(fake.awaitCancel())
+            fake.cancelCallback()
+            assertTrue(fake.awaitCancelReturned())
+            runCurrent()
+            assertTrue(callbackDrain.entered.isCompleted)
+            assertFalse(closing.isCompleted)
+
+            advanceTimeBy(100)
+            runCurrent()
+            val error = closing.await() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, error.status.code)
+            assertTrue(error.status.message.contains("not proven quiescent"))
+        }
+
+    @Test
+    fun `close timeout bounds a provider write that blocks synchronously`(): Unit =
+        runBlocking {
+            val fake = FakeFactory()
+            val writeEntered = CountDownLatch(1)
+            val releaseWrite = CountDownLatch(1)
+            fake.blockWrite(writeEntered, releaseWrite)
+            fake.cancelCallbackBeforeReturn()
+            val transport =
+                Http3RpcTransport(
+                    fake,
+                    CronetTransportOptions(closeTimeout = 100.milliseconds),
+                    Dispatchers.Default,
+                    shutdownContext = Dispatchers.Default,
+                )
+            val opening = async(Dispatchers.Default) { runCatching { transport.openStream(streamRequest()) }.exceptionOrNull() }
+            assertTrue(fake.awaitOpen())
+            assertTrue(fake.awaitStart())
+            fake.ready()
+            assertTrue(writeEntered.await(5, TimeUnit.SECONDS))
+
+            try {
+                lateinit var failure: Throwable
+                val elapsed =
+                    measureTime {
+                        failure = checkNotNull(runCatching { transport.close() }.exceptionOrNull())
+                    }
+                assertEquals(Code.UNAVAILABLE, (failure as TrevRpcException).status.code)
+                assertTrue(elapsed < 2.seconds)
+            } finally {
+                releaseWrite.countDown()
+            }
+            assertInstanceOf(TrevRpcException::class.java, opening.await())
+        }
+
+    @Test
+    fun `close timeout bounds a provider flush that blocks synchronously`(): Unit =
+        runBlocking {
+            val fake = FakeFactory()
+            val flushEntered = CountDownLatch(1)
+            val releaseFlush = CountDownLatch(1)
+            fake.blockFlush(flushEntered, releaseFlush)
+            fake.cancelCallbackBeforeReturn()
+            val transport =
+                Http3RpcTransport(
+                    fake,
+                    CronetTransportOptions(closeTimeout = 100.milliseconds),
+                    Dispatchers.Default,
+                    shutdownContext = Dispatchers.Default,
+                )
+            val opening = async(Dispatchers.Default) { runCatching { transport.openStream(streamRequest()) }.exceptionOrNull() }
+            assertTrue(fake.awaitOpen())
+            assertTrue(fake.awaitStart())
+            fake.ready()
+            assertTrue(flushEntered.await(5, TimeUnit.SECONDS))
+
+            try {
+                lateinit var failure: Throwable
+                val elapsed =
+                    measureTime {
+                        failure = checkNotNull(runCatching { transport.close() }.exceptionOrNull())
+                    }
+                assertEquals(Code.UNAVAILABLE, (failure as TrevRpcException).status.code)
+                assertTrue(elapsed < 2.seconds)
+            } finally {
+                releaseFlush.countDown()
+            }
+            assertInstanceOf(TrevRpcException::class.java, opening.await())
+        }
+
+    @Test
+    fun `callback before provider cancel returns does not report quiescence`(): Unit =
+        runBlocking {
+            val fake = FakeFactory()
+            val cancelEntered = CountDownLatch(1)
+            val releaseCancel = CountDownLatch(1)
+            fake.cancelCallbackBeforeReturn()
+            fake.blockCancel(cancelEntered, releaseCancel)
+            val transport = Http3RpcTransport(fake, coroutineContext = Dispatchers.Default)
+            val opening = async(Dispatchers.Default) { transport.openStream(streamRequest()) }
+            assertTrue(fake.awaitOpen())
+            assertTrue(fake.awaitStart())
+            fake.ready()
+            assertTrue(fake.awaitWrite())
+            fake.completeWrite()
+            val stream = opening.await()
+
+            val closing = async(Dispatchers.Default) { transport.close() }
+            assertTrue(cancelEntered.await(5, TimeUnit.SECONDS))
+            withTimeout(5_000) {
+                while (transport.activeExchangeCount != 0) yield()
+            }
+            assertFalse(closing.isCompleted)
+
+            releaseCancel.countDown()
+            closing.await()
+            assertInstanceOf(TrevRpcException::class.java, stream.receiveFailure())
+        }
+
+    @Test
+    fun `close timeout bounds a provider cancel that blocks synchronously`() =
+        runBlocking {
+            val fake = FakeFactory()
+            val cancelEntered = CountDownLatch(1)
+            val releaseCancel = CountDownLatch(1)
+            fake.blockCancel(cancelEntered, releaseCancel)
+            val transport =
+                Http3RpcTransport(
+                    fake,
+                    CronetTransportOptions(closeTimeout = 100.milliseconds),
+                    Dispatchers.Default,
+                    shutdownContext = Dispatchers.Default,
+                )
+            val opening = async(Dispatchers.Default) { transport.openStream(streamRequest()) }
+            assertTrue(fake.awaitOpen())
+            assertTrue(fake.awaitStart())
+            fake.ready()
+            assertTrue(fake.awaitWrite())
+            val initial = fake.onlyWrite()
+            assertRequestEquals(streamRequest(), WireCodec.decodeRequest(decodeFrame(initial.bytes)))
+            fake.completeWrite()
+            opening.await()
+
+            try {
+                lateinit var failure: Throwable
+                val elapsed =
+                    measureTime {
+                        failure = checkNotNull(runCatching { transport.close() }.exceptionOrNull())
+                    }
+                assertTrue(cancelEntered.await(5, TimeUnit.SECONDS))
+                assertEquals(Code.UNAVAILABLE, (failure as TrevRpcException).status.code)
+                assertTrue(elapsed < 2.seconds)
+            } finally {
+                releaseCancel.countDown()
+            }
+        }
+
+    @Test
+    fun `close timeout bounds borrowed executor submission that blocks synchronously`() =
+        runBlocking {
+            val submissionEntered = CountDownLatch(1)
+            val releaseSubmission = CountDownLatch(1)
+            val callbackDrain =
+                DrainableSerialExecutor(
+                    Executor {
+                        submissionEntered.countDown()
+                        check(releaseSubmission.await(5, TimeUnit.SECONDS))
+                    },
+                )
+            val transport =
+                Http3RpcTransport(
+                    FakeFactory(),
+                    CronetTransportOptions(closeTimeout = 100.milliseconds),
+                    Dispatchers.Default,
+                    callbackDrain,
+                    shutdownContext = Dispatchers.Default,
+                )
+
+            try {
+                lateinit var failure: Throwable
+                val elapsed =
+                    measureTime {
+                        failure = checkNotNull(runCatching { transport.close() }.exceptionOrNull())
+                    }
+                assertTrue(submissionEntered.await(5, TimeUnit.SECONDS))
+                assertEquals(Code.UNAVAILABLE, (failure as TrevRpcException).status.code)
+                assertTrue(elapsed < 2.seconds)
+            } finally {
+                releaseSubmission.countDown()
+            }
+        }
+
+    @Test
+    fun `close timeout does not block on callback executor monitor held by provider submission`() =
+        runBlocking {
+            val submissionEntered = CountDownLatch(1)
+            val releaseSubmission = CountDownLatch(1)
+            val callbackDrain =
+                DrainableSerialExecutor(
+                    Executor { command ->
+                        command.run()
+                        submissionEntered.countDown()
+                        check(releaseSubmission.await(5, TimeUnit.SECONDS))
+                    },
+                )
+            val providerSubmission =
+                async(Dispatchers.Default) {
+                    runCatching { callbackDrain.execute {} }.exceptionOrNull()
+                }
+            assertTrue(submissionEntered.await(5, TimeUnit.SECONDS))
+            val transport =
+                Http3RpcTransport(
+                    FakeFactory(),
+                    CronetTransportOptions(closeTimeout = 100.milliseconds),
+                    Dispatchers.Default,
+                    callbackDrain,
+                )
+
+            try {
+                lateinit var failure: Throwable
+                val elapsed =
+                    measureTime {
+                        failure = checkNotNull(runCatching { transport.close() }.exceptionOrNull())
+                    }
+                assertEquals(Code.UNAVAILABLE, (failure as TrevRpcException).status.code)
+                assertTrue(elapsed < 2.seconds)
+            } finally {
+                releaseSubmission.countDown()
+            }
+            assertNull(providerSubmission.await())
+        }
+
+    @Test
+    fun `close racing factory open cancels the registered exchange and rejects later admission`() =
+        runBlocking {
+            val factory = BlockingFactory()
+            val transport = Http3RpcTransport(factory, coroutineContext = Dispatchers.Default)
+            val opening = async(Dispatchers.Default) { runCatching { transport.openStream(streamRequest()) }.exceptionOrNull() }
+            assertTrue(factory.entered.await(5, TimeUnit.SECONDS))
+
+            val closing = async { transport.close() }
+            yield()
+            val rejected = runCatching { transport.openStream(streamRequest()) }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, rejected.status.code)
+            assertEquals(1, factory.openCalls)
+            withTimeout(5_000) {
+                while (transport.logicallyActiveExchangeCount != 0) yield()
+            }
+
+            factory.release.countDown()
+            val openingError = opening.await() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, openingError.status.code)
+            closing.await()
+            assertEquals(0, factory.stream.cancelCalls)
+        }
+
+    @Test
+    fun `close racing native start cancels only after start returns`() =
+        runBlocking {
+            val factory = StartBlockingFactory()
+            val transport = Http3RpcTransport(factory, coroutineContext = Dispatchers.Default)
+            val opening = async(Dispatchers.Default) { runCatching { transport.openStream(streamRequest()) }.exceptionOrNull() }
+            assertTrue(factory.stream.startEntered.await(5, TimeUnit.SECONDS))
+
+            val closing = async { transport.close() }
+            withTimeout(5_000) {
+                while (transport.logicallyActiveExchangeCount != 0) yield()
+            }
+            assertFalse(closing.isCompleted)
+            assertEquals(0, factory.stream.cancelCalls)
+
+            factory.stream.releaseStart.countDown()
+            val openingError = opening.await()
+            assertInstanceOf(TrevRpcException::class.java, openingError)
+            closing.await()
+            assertEquals(1, factory.stream.cancelCalls)
+        }
+
+    @Test
+    fun `close orchestration does not depend on exchange dispatcher progress`() =
+        runBlocking {
+            val transport = Http3RpcTransport(FakeFactory(), coroutineContext = StalledDispatcher())
+            transport.close()
+        }
+
+    @Test
+    fun `serial callback executor contains task failures and orders its barrier`() =
+        runBlocking {
+            val borrowed = Executors.newSingleThreadExecutor()
+            try {
+                val serial = DrainableSerialExecutor(borrowed)
+                val events = CopyOnWriteArrayList<String>()
+                serial.execute {
+                    events += "first"
+                    error("callback failure")
+                }
+                serial.execute { events += "second" }
+
+                withTimeout(5_000) { serial.barrier() }
+                events += "barrier"
+
+                assertEquals(listOf("first", "second", "barrier"), events)
+            } finally {
+                borrowed.shutdown()
+                assertTrue(borrowed.awaitTermination(5, TimeUnit.SECONDS))
+            }
+        }
+
+    @Test
+    fun `channel close never shuts down borrowed engine or executor`() =
+        runBlocking {
+            val engine = BorrowedCronetEngine()
+            val executor = Executors.newSingleThreadExecutor()
+            try {
+                val channel = CronetRpcChannel.create(engine, "https://example.com", executor)
+                val stream = channel.openStream(streamRequest())
+                assertEquals(1, engine.openCalls)
+                assertInstanceOf(DrainableSerialExecutor::class.java, engine.callbackExecutor)
+                assertFalse(engine.callbackExecutor === executor)
+                assertSame(engine.callbackExecutor, engine.stream.callbackExecutor)
+                channel.close()
+
+                assertEquals(1, engine.stream.cancelCalls)
+                assertInstanceOf(TrevRpcException::class.java, stream.receiveFailure())
+                assertEquals(0, engine.shutdownCalls)
+                assertFalse(executor.isShutdown)
+            } finally {
+                executor.shutdown()
+                assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS))
+            }
         }
 }
 
@@ -403,9 +974,20 @@ private fun assertRequestEquals(
 private class FakeFactory : DuplexStreamFactory {
     private lateinit var callback: DuplexCallback
     private val stream = FakeStream()
+    private val opened = CountDownLatch(1)
 
     val cancelCalls: Int
         get() = stream.cancelCalls
+
+    fun awaitCancel(): Boolean = stream.cancelObserved.await(5, TimeUnit.SECONDS)
+
+    fun awaitCancelReturned(): Boolean = stream.cancelReturned.await(5, TimeUnit.SECONDS)
+
+    fun awaitOpen(): Boolean = opened.await(5, TimeUnit.SECONDS)
+
+    fun awaitStart(): Boolean = stream.startObserved.await(5, TimeUnit.SECONDS)
+
+    fun awaitWrite(): Boolean = stream.writeObserved.await(5, TimeUnit.SECONDS)
 
     val pendingReads: Int
         get() = stream.reads.size
@@ -415,6 +997,7 @@ private class FakeFactory : DuplexStreamFactory {
 
     override fun open(callback: DuplexCallback): DuplexStream {
         this.callback = callback
+        opened.countDown()
         return stream
     }
 
@@ -443,14 +1026,55 @@ private class FakeFactory : DuplexStreamFactory {
     fun fail(error: Throwable) = callback.onFailed(stream, error)
 
     fun cancelCallback() = callback.onCanceled(stream)
+
+    fun blockWrite(
+        entered: CountDownLatch,
+        release: CountDownLatch,
+    ) {
+        stream.writeEntered = entered
+        stream.releaseWrite = release
+    }
+
+    fun blockFlush(
+        entered: CountDownLatch,
+        release: CountDownLatch,
+    ) {
+        stream.flushEntered = entered
+        stream.releaseFlush = release
+    }
+
+    fun cancelCallbackBeforeReturn() {
+        stream.cancelAction = { callback.onCanceled(stream) }
+    }
+
+    fun blockCancel(
+        entered: CountDownLatch,
+        release: CountDownLatch,
+    ) {
+        stream.cancelEntered = entered
+        stream.releaseCancel = release
+    }
 }
 
 private class FakeStream : DuplexStream {
     val reads = ArrayDeque<ByteBuffer>()
     val writes = ArrayDeque<FakeWrite>()
     var cancelCalls = 0
+    val cancelObserved = CountDownLatch(1)
+    val cancelReturned = CountDownLatch(1)
+    val startObserved = CountDownLatch(1)
+    val writeObserved = CountDownLatch(1)
+    var writeEntered: CountDownLatch? = null
+    var releaseWrite: CountDownLatch? = null
+    var flushEntered: CountDownLatch? = null
+    var releaseFlush: CountDownLatch? = null
+    var cancelAction: (() -> Unit)? = null
+    var cancelEntered: CountDownLatch? = null
+    var releaseCancel: CountDownLatch? = null
 
-    override fun start() = Unit
+    override fun start() {
+        startObserved.countDown()
+    }
 
     override fun read(buffer: ByteBuffer) {
         check(buffer.isDirect)
@@ -462,17 +1086,28 @@ private class FakeStream : DuplexStream {
         endOfStream: Boolean,
     ) {
         check(buffer.isDirect)
+        writeEntered?.countDown()
+        releaseWrite?.let { check(it.await(5, TimeUnit.SECONDS)) { "write release timed out" } }
         check(writes.isEmpty()) { "only one write may be in flight" }
         val copy = buffer.duplicate()
         val bytes = ByteArray(copy.remaining())
         copy.get(bytes)
         writes.add(FakeWrite(buffer, bytes, endOfStream))
+        writeObserved.countDown()
     }
 
-    override fun flush() = Unit
+    override fun flush() {
+        flushEntered?.countDown()
+        releaseFlush?.let { check(it.await(5, TimeUnit.SECONDS)) { "flush release timed out" } }
+    }
 
     override fun cancel() {
         cancelCalls++
+        cancelObserved.countDown()
+        cancelAction?.invoke()
+        cancelEntered?.countDown()
+        releaseCancel?.let { check(it.await(5, TimeUnit.SECONDS)) }
+        cancelReturned.countDown()
     }
 }
 
@@ -481,3 +1116,225 @@ private data class FakeWrite(
     val bytes: ByteArray,
     val endOfStream: Boolean,
 )
+
+private class ControlledCallbackDrain : CallbackDrain {
+    val entered = kotlinx.coroutines.CompletableDeferred<Unit>()
+    val release = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+    override suspend fun barrier() {
+        entered.complete(Unit)
+        release.await()
+    }
+}
+
+private class BlockingFactory : DuplexStreamFactory {
+    val entered = CountDownLatch(1)
+    val release = CountDownLatch(1)
+    val stream = CancelCompletingStream()
+    var openCalls = 0
+
+    override fun open(callback: DuplexCallback): DuplexStream {
+        openCalls++
+        stream.callback = callback
+        entered.countDown()
+        check(release.await(5, TimeUnit.SECONDS)) { "factory release timed out" }
+        return stream
+    }
+}
+
+private class CancelCompletingStream : DuplexStream {
+    lateinit var callback: DuplexCallback
+    var cancelCalls = 0
+
+    override fun start() = Unit
+
+    override fun read(buffer: ByteBuffer) = Unit
+
+    override fun write(
+        buffer: ByteBuffer,
+        endOfStream: Boolean,
+    ) = Unit
+
+    override fun flush() = Unit
+
+    override fun cancel() {
+        cancelCalls++
+        callback.onCanceled(this)
+    }
+}
+
+private class StartFailingFactory : DuplexStreamFactory {
+    override fun open(callback: DuplexCallback): DuplexStream =
+        object : DuplexStream {
+            override fun start(): Unit = throw IllegalStateException("start failed")
+
+            override fun read(buffer: ByteBuffer) = Unit
+
+            override fun write(
+                buffer: ByteBuffer,
+                endOfStream: Boolean,
+            ) = Unit
+
+            override fun flush() = Unit
+
+            override fun cancel() = Unit
+        }
+}
+
+private class StartBlockingFactory : DuplexStreamFactory {
+    val stream = StartBlockingStream()
+
+    override fun open(callback: DuplexCallback): DuplexStream = stream.also { it.callback = callback }
+}
+
+private class StartBlockingStream : DuplexStream {
+    val startEntered = CountDownLatch(1)
+    val releaseStart = CountDownLatch(1)
+    lateinit var callback: DuplexCallback
+    var cancelCalls = 0
+
+    override fun start() {
+        startEntered.countDown()
+        check(releaseStart.await(5, TimeUnit.SECONDS)) { "start release timed out" }
+    }
+
+    override fun read(buffer: ByteBuffer) = Unit
+
+    override fun write(
+        buffer: ByteBuffer,
+        endOfStream: Boolean,
+    ) = Unit
+
+    override fun flush() = Unit
+
+    override fun cancel() {
+        cancelCalls++
+        callback.onCanceled(this)
+    }
+}
+
+private class StalledDispatcher : CoroutineDispatcher() {
+    override fun dispatch(
+        context: CoroutineContext,
+        block: Runnable,
+    ) = Unit
+}
+
+@Suppress("OVERRIDE_DEPRECATION")
+private class BorrowedCronetEngine : CronetEngine() {
+    var shutdownCalls = 0
+    var openCalls = 0
+    lateinit var callbackExecutor: Executor
+    lateinit var stream: AdapterCronetStream
+
+    override fun getVersionString(): String = "fake"
+
+    override fun shutdown() {
+        shutdownCalls++
+    }
+
+    override fun newBidirectionalStreamBuilder(
+        url: String,
+        callback: BidirectionalStream.Callback,
+        executor: Executor,
+    ): BidirectionalStream.Builder {
+        openCalls++
+        callbackExecutor = executor
+        return AdapterCronetBuilder {
+            AdapterCronetStream(callback, executor).also { stream = it }
+        }
+    }
+
+    override fun startNetLogToFile(
+        fileName: String,
+        logAll: Boolean,
+    ) = Unit
+
+    override fun stopNetLog() = Unit
+
+    override fun getGlobalMetricsDeltas(): ByteArray = byteArrayOf()
+
+    override fun openConnection(url: URL): URLConnection = throw UnsupportedOperationException()
+
+    override fun createURLStreamHandlerFactory(): URLStreamHandlerFactory = throw UnsupportedOperationException()
+
+    override fun newUrlRequestBuilder(
+        url: String,
+        callback: UrlRequest.Callback,
+        executor: Executor,
+    ): UrlRequest.Builder = throw UnsupportedOperationException()
+}
+
+private class AdapterCronetBuilder(
+    private val buildStream: () -> BidirectionalStream,
+) : BidirectionalStream.Builder() {
+    override fun setHttpMethod(method: String): BidirectionalStream.Builder = this
+
+    override fun addHeader(
+        header: String,
+        value: String,
+    ): BidirectionalStream.Builder = this
+
+    override fun setPriority(priority: Int): BidirectionalStream.Builder = this
+
+    override fun delayRequestHeadersUntilFirstFlush(delay: Boolean): BidirectionalStream.Builder = this
+
+    override fun build(): BidirectionalStream = buildStream()
+}
+
+private class AdapterCronetStream(
+    private val callback: BidirectionalStream.Callback,
+    val callbackExecutor: Executor,
+) : BidirectionalStream() {
+    var cancelCalls = 0
+    private var done = false
+
+    override fun start() {
+        callbackExecutor.execute { callback.onStreamReady(this) }
+    }
+
+    override fun read(buffer: ByteBuffer) = Unit
+
+    override fun write(
+        buffer: ByteBuffer,
+        endOfStream: Boolean,
+    ) {
+        callbackExecutor.execute {
+            buffer.position(buffer.limit())
+            callback.onWriteCompleted(this, FakeUrlResponseInfo, buffer, endOfStream)
+        }
+    }
+
+    override fun flush() = Unit
+
+    override fun cancel() {
+        cancelCalls++
+        done = true
+        callbackExecutor.execute { callback.onCanceled(this, null) }
+    }
+
+    override fun isDone(): Boolean = done
+}
+
+private object FakeUrlResponseInfo : UrlResponseInfo() {
+    override fun getUrl(): String = "https://example.com/trevrpc"
+
+    override fun getUrlChain(): List<String> = listOf(url)
+
+    override fun getHttpStatusCode(): Int = 200
+
+    override fun getHttpStatusText(): String = "OK"
+
+    override fun getAllHeadersAsList(): List<Map.Entry<String, String>> =
+        listOf(java.util.AbstractMap.SimpleImmutableEntry("content-type", TREV_RPC_CONTENT_TYPE))
+
+    override fun getAllHeaders(): Map<String, List<String>> = mapOf("content-type" to listOf(TREV_RPC_CONTENT_TYPE))
+
+    override fun wasCached(): Boolean = false
+
+    override fun getNegotiatedProtocol(): String = "h3"
+
+    override fun getProxyServer(): String = ""
+
+    override fun getReceivedByteCount(): Long = 0
+}

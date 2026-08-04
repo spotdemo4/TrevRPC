@@ -221,5 +221,31 @@ requires `--webtransport-origin ORIGIN` and admits only secure WebTransport sess
 exactly `/trevrpc` and whose `Origin` header exactly matches that value. WebTransport client mode is
 not supported.
 
-The normal Nix package installs the first-party runtime JARs in `share/java` and installs
-`protoc-gen-trevrpc-kotlin` in `bin`. The benchmark peer remains a separate package output.
+## Local Maven staging
+
+Milestone 4 packages exactly four local coordinates at version `0.1.0`:
+
+- `zip.trev.trevrpc:core`
+- `zip.trev.trevrpc:transport-netty`
+- `zip.trev.trevrpc:transport-cronet`
+- `zip.trev.trevrpc:protoc-gen-trevrpc-kotlin`
+
+Run `./gradlew stageMavenRepository` to write them only to
+`build/staging-repository`. `publishToMavenLocal` is disabled, and the build defines no remote
+publishing repository. Every coordinate includes sources and Dokka documentation JARs. The thin
+generator JAR declares `zip.trev.trevrpc.generator.MainKt`; the generator also publishes a
+self-contained `jdk21` classifier for `java -jar` use.
+
+The Netty transport requires JDK 21 and declares native QUIC JARs for Linux x86-64/AArch64, macOS
+x86-64/AArch64, and Windows x86-64. All five are present on the runtime graph; Netty selects the
+host implementation. Other hosts are unsupported.
+
+The Cronet transport is a JVM 17 JAR that bundles the Cronet API classes required by its public
+surface, together with their Chromium license. It does not select a provider. An application must
+choose a compatible Cronet provider, construct and own the `CronetEngine`, and own its callback
+executor. TrevRPC neither publishes nor selects `cronet-embedded`, and this milestone does not
+claim Android device or instrumentation validation.
+
+The normal Nix package installs the staged repository in `share/maven`, retains the first-party
+runtime JARs in `share/java`, and installs `protoc-gen-trevrpc-kotlin` in `bin`. The benchmark peer
+remains a separate package output.

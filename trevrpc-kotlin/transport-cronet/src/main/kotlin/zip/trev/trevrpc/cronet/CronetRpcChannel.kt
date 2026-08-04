@@ -1,5 +1,8 @@
 package zip.trev.trevrpc.cronet
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -13,18 +16,25 @@ import zip.trev.trevrpc.RpcChannelState
 import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
-import zip.trev.trevrpc.RpcTransport
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import java.net.URI
 import java.nio.ByteBuffer
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.CoroutineContext
 
 /**
- * Android Cronet channel factory. Cronet owns connection pooling and reconnection; the caller owns
- * the engine and callback executor, including shutting them down.
+ * Cronet channel factory.
+ *
+ * The published transport is a JVM 17 API JAR and does not select or bundle a Cronet provider. The
+ * caller selects and owns the provider, [CronetEngine], and callback [Executor]. TrevRPC
+ * never shuts down either borrowed resource. A successful [RpcChannel.close] proves that all TrevRPC
+ * exchanges settled logically, reached a terminal Cronet callback, returned from every provider call,
+ * and drained their serialized callback queue; only then may the caller shut down the engine and
+ * executor. A failed or timed-out close does not prove that either borrowed resource is quiescent.
  */
 object CronetRpcChannel {
     fun create(
@@ -33,18 +43,21 @@ object CronetRpcChannel {
         callbackExecutor: Executor,
         options: CronetTransportOptions = CronetTransportOptions(),
         coroutineContext: CoroutineContext = Dispatchers.IO,
-    ): RpcChannel =
-        CronetChannel(
+    ): RpcChannel {
+        val containedExecutor = DrainableSerialExecutor(callbackExecutor)
+        return CronetChannel(
             Http3RpcTransport(
-                CronetDuplexStreamFactory(engine, rpcUrl(origin), callbackExecutor),
+                CronetDuplexStreamFactory(engine, rpcUrl(origin), containedExecutor),
                 options,
                 coroutineContext,
+                containedExecutor,
             ),
         )
+    }
 }
 
 internal class CronetChannel(
-    private val delegate: RpcTransport,
+    private val delegate: CronetTransport,
 ) : RpcChannel {
     private val closed = AtomicBoolean(false)
     private val mutableState = MutableStateFlow(RpcChannelState.READY)
@@ -65,6 +78,7 @@ internal class CronetChannel(
 
     override suspend fun close() {
         if (closed.compareAndSet(false, true)) mutableState.value = RpcChannelState.CLOSED
+        delegate.close()
     }
 
     private fun checkOpen() {
@@ -72,7 +86,112 @@ internal class CronetChannel(
     }
 }
 
-private class CronetDuplexStreamFactory(
+internal interface CallbackDrain {
+    suspend fun barrier()
+}
+
+internal object ImmediateCallbackDrain : CallbackDrain {
+    override suspend fun barrier() = Unit
+}
+
+/** Isolates synchronous provider calls so coroutine timeout does not structurally await them. */
+internal object DetachedExternalCalls : CoroutineDispatcher() {
+    private val threadId = AtomicLong()
+    private val executor =
+        Executors.newCachedThreadPool { command ->
+            Thread(command, "trevrpc-cronet-external-${threadId.incrementAndGet()}").apply { isDaemon = true }
+        }
+
+    override fun dispatch(
+        context: CoroutineContext,
+        block: Runnable,
+    ) {
+        executor.execute(block)
+    }
+
+    fun dispatch(action: () -> Unit) {
+        executor.execute(action)
+    }
+
+    suspend fun await(action: () -> Unit) {
+        val outcome = CompletableDeferred<Result<Unit>>()
+        dispatch { outcome.complete(runCatching(action)) }
+        outcome.await().getOrThrow()
+    }
+}
+
+/** Serializes Cronet callbacks without taking ownership of the caller's executor. */
+internal class DrainableSerialExecutor(
+    private val delegate: Executor,
+) : Executor,
+    CallbackDrain {
+    private val lock = Any()
+    private val tasks = ArrayDeque<Runnable>()
+    private var workerRunning = false
+
+    override fun execute(command: Runnable) {
+        synchronized(lock) {
+            tasks.addLast(command)
+            if (workerRunning) return
+            workerRunning = true
+            try {
+                // Hold the reentrant monitor until submission is accepted or rejected so another
+                // callback cannot return successfully and then be discarded by this submission.
+                delegate.execute(::drainTasks)
+            } catch (error: Throwable) {
+                workerRunning = false
+                tasks.clear()
+                throw error
+            }
+        }
+    }
+
+    override suspend fun barrier() {
+        val reached = CompletableDeferred<Unit>()
+        try {
+            DetachedExternalCalls.await {
+                val submitWorker =
+                    synchronized(lock) {
+                        tasks.addLast { reached.complete(Unit) }
+                        if (workerRunning) {
+                            false
+                        } else {
+                            workerRunning = true
+                            true
+                        }
+                    }
+                if (submitWorker) delegate.execute(::drainTasks)
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            DetachedExternalCalls.dispatch {
+                synchronized(lock) {
+                    workerRunning = false
+                    tasks.clear()
+                }
+            }
+            throw TrevRpcException(Status.unavailable("Cronet callback executor rejected the drain barrier"), error)
+        }
+        reached.await()
+    }
+
+    private fun drainTasks() {
+        while (true) {
+            val task =
+                synchronized(lock) {
+                    if (tasks.isEmpty()) {
+                        workerRunning = false
+                        return
+                    }
+                    tasks.removeFirst()
+                }
+            runCatching(task::run)
+        }
+    }
+}
+
+internal class CronetDuplexStreamFactory(
     private val engine: CronetEngine,
     private val url: String,
     private val executor: Executor,
@@ -115,48 +234,58 @@ private class CronetCallback(
         facade = stream
     }
 
-    override fun onStreamReady(stream: BidirectionalStream) = callback.onReady(facade)
+    override fun onStreamReady(stream: BidirectionalStream) = dispatch { callback.onReady(facade) }
 
     override fun onResponseHeadersReceived(
         stream: BidirectionalStream,
         info: UrlResponseInfo,
-    ) = callback.onHeaders(
-        facade,
-        ResponseHeaders(
-            info.httpStatusCode,
-            info.allHeadersAsList.map { it.key to it.value },
-        ),
-    )
+    ) = dispatch {
+        callback.onHeaders(
+            facade,
+            ResponseHeaders(
+                info.httpStatusCode,
+                info.allHeadersAsList.map { it.key to it.value },
+            ),
+        )
+    }
 
     override fun onReadCompleted(
         stream: BidirectionalStream,
         info: UrlResponseInfo,
         buffer: ByteBuffer,
         endOfStream: Boolean,
-    ) = callback.onRead(facade, buffer, endOfStream)
+    ) = dispatch { callback.onRead(facade, buffer, endOfStream) }
 
     override fun onWriteCompleted(
         stream: BidirectionalStream,
         info: UrlResponseInfo,
         buffer: ByteBuffer,
         endOfStream: Boolean,
-    ) = callback.onWrite(facade, buffer, endOfStream)
+    ) = dispatch { callback.onWrite(facade, buffer, endOfStream) }
 
     override fun onSucceeded(
         stream: BidirectionalStream,
         info: UrlResponseInfo,
-    ) = callback.onSucceeded(facade)
+    ) = dispatch { callback.onSucceeded(facade) }
 
     override fun onFailed(
         stream: BidirectionalStream,
         info: UrlResponseInfo?,
         error: CronetException,
-    ) = callback.onFailed(facade, error)
+    ) = dispatch { callback.onFailed(facade, error) }
 
     override fun onCanceled(
         stream: BidirectionalStream,
         info: UrlResponseInfo?,
-    ) = callback.onCanceled(facade)
+    ) = dispatch { callback.onCanceled(facade) }
+
+    private fun dispatch(action: () -> Unit) {
+        try {
+            action()
+        } catch (error: Throwable) {
+            if (::facade.isInitialized) runCatching { callback.onCallbackFailure(facade, error) }
+        }
+    }
 }
 
 private fun rpcUrl(origin: String): String {

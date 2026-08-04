@@ -14,17 +14,28 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":core"))
-    implementation(platform(libs.netty.bom))
-    implementation("io.netty:netty-codec-classes-quic")
-    implementation("io.netty:netty-codec-http3")
+    api(project(":core"))
+    api(platform(libs.netty.bom))
+    api("io.netty:netty-codec-classes-quic")
+    api("io.netty:netty-codec-http3") {
+        exclude(group = "io.netty", module = "netty-codec-native-quic")
+    }
     implementation(libs.coroutines.core)
+
+    listOf(
+        "linux-x86_64",
+        "linux-aarch_64",
+        "osx-x86_64",
+        "osx-aarch_64",
+        "windows-x86_64",
+    ).forEach { classifier ->
+        runtimeOnly("io.netty:netty-codec-native-quic:${libs.versions.netty.get()}:$classifier")
+    }
 
     testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation(libs.coroutines.test)
     testImplementation(libs.bouncycastle.bcpkix)
-    testRuntimeOnly("io.netty:netty-codec-native-quic:${libs.versions.netty.get()}:linux-x86_64")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 

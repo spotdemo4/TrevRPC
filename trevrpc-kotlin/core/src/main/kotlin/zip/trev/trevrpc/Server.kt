@@ -5,6 +5,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
@@ -15,6 +16,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
@@ -31,7 +33,8 @@ data class ServerOptions(
     val maxConcurrentConnections: Int? = DEFAULT_MAX_CONCURRENT_CONNECTIONS,
     val maxConcurrentStreamsPerConnection: Int? = DEFAULT_MAX_CONCURRENT_STREAMS_PER_CONNECTION,
     val maxConcurrentRequests: Int? = DEFAULT_MAX_CONCURRENT_REQUESTS,
-    val gracefulShutdownTimeout: Duration? = 30.seconds,
+    val gracefulShutdownTimeout: Duration = 30.seconds,
+    val forceShutdownTimeout: Duration = 10.seconds,
     val initialRequestTimeout: Duration? = 10.seconds,
     val maxStreamMessages: Int? = DEFAULT_MAX_STREAM_MESSAGES,
     val maxStreamBodySize: Long? = DEFAULT_MAX_STREAM_BODY_SIZE,
@@ -42,7 +45,8 @@ data class ServerOptions(
         require(maxConcurrentConnections == null || maxConcurrentConnections > 0)
         require(maxConcurrentStreamsPerConnection == null || maxConcurrentStreamsPerConnection > 0)
         require(maxConcurrentRequests == null || maxConcurrentRequests > 0)
-        require(gracefulShutdownTimeout == null || gracefulShutdownTimeout.isPositive())
+        require(gracefulShutdownTimeout.isFinite() && gracefulShutdownTimeout.isPositive())
+        require(forceShutdownTimeout.isFinite() && forceShutdownTimeout.isPositive())
         require(initialRequestTimeout == null || initialRequestTimeout.isPositive())
         require(maxStreamMessages == null || maxStreamMessages >= 0)
         require(maxStreamBodySize == null || maxStreamBodySize >= 0)
@@ -138,9 +142,10 @@ class Server(
     private val routes = ConcurrentHashMap<RouteKey, Route>()
     private val requestPermits = options.maxConcurrentRequests?.let(::Semaphore)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val shutdownScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val accepting = AtomicBoolean(true)
     private val shutdownStarted = AtomicBoolean(false)
-    private val shutdownComplete = CompletableDeferred<Unit>()
+    private val shutdownComplete = CompletableDeferred<Result<Unit>>()
     private val stateLock = Any()
     private val activeJobs = linkedMapOf<Job, Int>()
     private var activeWithoutJob = 0
@@ -313,30 +318,40 @@ class Server(
         }
     }
 
-    suspend fun shutdown(timeout: Duration? = options.gracefulShutdownTimeout) {
-        if (!shutdownStarted.compareAndSet(false, true)) {
-            shutdownComplete.await()
-            return
-        }
-        accepting.set(false)
-        try {
-            val waitForDrain = synchronized(stateLock) { drained }
-            val completed =
-                if (timeout == null) {
-                    waitForDrain.await()
-                    true
-                } else {
-                    withTimeoutOrNull(timeout) { waitForDrain.await() } != null
-                }
-            if (!completed) {
-                val jobs = synchronized(stateLock) { activeJobs.keys.toList() }
-                jobs.forEach { it.cancel(CancellationException("server graceful shutdown timed out")) }
-                jobs.forEach { it.join() }
+    suspend fun shutdown(
+        gracefulTimeout: Duration = options.gracefulShutdownTimeout,
+        forceTimeout: Duration = options.forceShutdownTimeout,
+    ) {
+        require(gracefulTimeout.isFinite() && gracefulTimeout.isPositive())
+        require(forceTimeout.isFinite() && forceTimeout.isPositive())
+        if (shutdownStarted.compareAndSet(false, true)) {
+            accepting.set(false)
+            shutdownScope.launch {
+                val result =
+                    runCatching {
+                        withContext(NonCancellable) {
+                            val waitForDrain = synchronized(stateLock) { drained }
+                            val graceful = withTimeoutOrNull(gracefulTimeout) { waitForDrain.await() } != null
+                            if (!graceful) {
+                                val jobs = synchronized(stateLock) { activeJobs.keys.toList() }
+                                jobs.forEach {
+                                    it.cancel(CancellationException("server graceful shutdown timed out"))
+                                }
+                                val forced = withTimeoutOrNull(forceTimeout) { waitForDrain.await() } != null
+                                if (!forced) {
+                                    throw IllegalStateException(
+                                        "server shutdown timed out waiting for cancelled requests",
+                                    )
+                                }
+                            }
+                        }
+                    }
+                scope.cancel()
+                shutdownComplete.complete(result)
+                shutdownScope.cancel()
             }
-        } finally {
-            scope.cancel()
-            shutdownComplete.complete(Unit)
         }
+        shutdownComplete.await().getOrThrow()
     }
 
     private suspend fun prepare(request: RpcRequest): TimeMark? {

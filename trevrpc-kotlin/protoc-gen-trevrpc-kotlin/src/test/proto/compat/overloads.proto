@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package generator.compat.overloads;
+
+option java_package = "generator.compat.overloads";
+option java_multiple_files = true;
+
+message FirstRequest {}
+message SecondRequest {}
+message Reply {}
+
+service LegalOverloads {
+  rpc Foo_Bar(FirstRequest) returns (Reply);
+  rpc Foo__Bar(SecondRequest) returns (Reply);
+}

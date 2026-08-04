@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package generator.compat.multiple;
+
+option java_package = "generator.compat";
+option java_outer_classname = "MultipleFilesDescriptor";
+option java_multiple_files = true;
+
+message multi_snake_name {
+  message _nested_Mixed {}
+}
+
+message _multi_leading {}
+
+service MultipleNaming {
+  rpc Nested(multi_snake_name._nested_Mixed) returns (_multi_leading);
+}

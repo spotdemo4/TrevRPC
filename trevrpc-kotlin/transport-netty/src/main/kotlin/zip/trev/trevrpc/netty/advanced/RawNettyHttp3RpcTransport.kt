@@ -14,10 +14,9 @@ import io.netty.handler.codec.http3.Http3RequestStreamInboundHandler
 import io.netty.handler.codec.quic.QuicStreamChannel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
@@ -33,42 +32,92 @@ import zip.trev.trevrpc.netty.HTTP3_PATH
 import zip.trev.trevrpc.netty.IncrementalFrameReader
 import zip.trev.trevrpc.netty.NettyQuicClientConfig
 import zip.trev.trevrpc.netty.NettyRpcChannel
+import zip.trev.trevrpc.netty.NettyShutdownCoordinator
 import zip.trev.trevrpc.netty.NettyTransportOptions
 import zip.trev.trevrpc.netty.TREV_RPC_MEDIA_TYPE
 import zip.trev.trevrpc.netty.TrevRpcFrameWriter
 import zip.trev.trevrpc.netty.awaitCompletion
 import zip.trev.trevrpc.netty.awaitValue
+import zip.trev.trevrpc.netty.cancelAndAwaitReset
+import zip.trev.trevrpc.netty.cancelAndClose
 import zip.trev.trevrpc.netty.cancelBoth
 import zip.trev.trevrpc.netty.closeApplication
+import zip.trev.trevrpc.netty.finishAndClose
+import zip.trev.trevrpc.netty.isOwnedEventLoopThread
 import zip.trev.trevrpc.netty.isTrevRpcMediaType
+import zip.trev.trevrpc.netty.shutdownOwnedNettyResources
 import zip.trev.trevrpc.netty.transportException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.channels.Channel as CoroutineChannel
 
 /** Advanced single-connection HTTP/3 transport. Prefer [NettyRpcChannel.http3]. */
 class RawNettyHttp3RpcTransport private constructor(
     private val endpoint: ClientQuicEndpoint,
     private val config: NettyQuicClientConfig,
+    private val onTerminalFrame: () -> Unit,
 ) : RpcTransport,
     AutoCloseable {
     private val closed = AtomicBoolean(false)
+    private val streams = ConcurrentHashMap<QuicStreamChannel, (Throwable) -> Unit>()
+    private val shutdownCoordinator =
+        NettyShutdownCoordinator {
+            shutdownOwnedNettyResources(
+                group = endpoint.group,
+                timeout = config.options.shutdownTimeout,
+                description = "HTTP/3 transport",
+                forceClose = {
+                    streams.keys.forEach { it.close() }
+                    endpoint.quicChannel.close()
+                    endpoint.datagramChannel.close()
+                },
+            ) {
+                closed.set(true)
+                val failure = transportException("HTTP/3 transport is shutting down")
+                streams.toMap().forEach { (stream, fail) ->
+                    fail(failure)
+                    stream.cancelBoth()
+                    stream.close()
+                }
+                endpoint.quicChannel.closeApplication(0, "HTTP/3 client closed")
+                endpoint.quicChannel.closeFuture().awaitCompletion()
+                endpoint.datagramChannel.close().awaitCompletion()
+            }
+        }
 
     override suspend fun unary(request: RpcRequest): RpcResponse {
         checkOpen()
         val inbox = Http3FrameInbox(config.options)
         val stream = openRequest(inbox)
         try {
-            writeRequestHeaders(stream)
-            writeDataFrame(stream, WireCodec.encode(request), config.options.maxFrameSize).awaitCompletion()
-            stream.shutdownOutput().awaitCompletion()
-            inbox.awaitSuccess()
+            performHttp3RequestHandshake(
+                writeHeaders = { writeRequestHeaders(stream) },
+                writeInitialData = {
+                    writeDataFrame(stream, WireCodec.encode(request), config.options.maxFrameSize).awaitCompletion()
+                },
+                finishRequest = { stream.shutdownOutput().awaitCompletion() },
+                awaitResponse = inbox::awaitSuccess,
+            )
             val body = inbox.receive() ?: throw transportException("HTTP/3 unary response ended before a frame")
             val response = WireCodec.decodeResponse(body)
-            inbox.requireEnd()
-            stream.close()
+            when (val end = inbox.awaitEnd()) {
+                TerminalStreamEnd.Clean -> {
+                    stream.finishAndClose(config.options.shutdownTimeout)
+                }
+
+                is TerminalStreamEnd.TrailingData -> {
+                    throw end.error
+                }
+
+                is TerminalStreamEnd.MissingFin -> {
+                    stream.cancelAndClose()
+                    if (response.status.isOk) throw end.error
+                }
+            }
             return response
         } catch (error: CancellationException) {
-            stream.cancelAndClose()
+            stream.cancelAndAwaitReset(config.options.shutdownTimeout)
             throw error
         } catch (error: Throwable) {
             stream.cancelAndClose()
@@ -81,17 +130,26 @@ class RawNettyHttp3RpcTransport private constructor(
         val inbox = Http3FrameInbox(config.options)
         val stream = openRequest(inbox)
         try {
-            writeRequestHeaders(stream)
-            inbox.awaitSuccess()
-            writeDataFrame(stream, WireCodec.encode(request), config.options.maxFrameSize).awaitCompletion()
+            val requestEndsAfterInitialData = http3RequestEndsAfterInitialData(request.kind)
+            performHttp3RequestHandshake(
+                writeHeaders = { writeRequestHeaders(stream) },
+                writeInitialData = {
+                    writeDataFrame(stream, WireCodec.encode(request), config.options.maxFrameSize).awaitCompletion()
+                },
+                finishRequest = { stream.shutdownOutput().awaitCompletion() },
+                awaitResponse = inbox::awaitSuccess,
+                finishInitialRequest = requestEndsAfterInitialData,
+            )
             return Http3RpcTransportStream(
                 stream,
                 inbox,
                 config.options,
-                awaitRequestFin = request.kind != RpcKind.SERVER_STREAMING,
+                sendRequestEndFrame = !requestEndsAfterInitialData,
+                requestFinished = requestEndsAfterInitialData,
+                onTerminalFrame = onTerminalFrame,
             )
         } catch (error: CancellationException) {
-            stream.cancelAndClose()
+            stream.cancelAndAwaitReset(config.options.shutdownTimeout)
             throw error
         } catch (error: Throwable) {
             stream.cancelAndClose()
@@ -100,11 +158,8 @@ class RawNettyHttp3RpcTransport private constructor(
     }
 
     suspend fun shutdown() {
-        if (!closed.compareAndSet(false, true)) return
-        endpoint.quicChannel.closeApplication(0, "HTTP/3 client closed")
-        endpoint.quicChannel.closeFuture().awaitCompletion()
-        endpoint.datagramChannel.close().awaitCompletion()
-        endpoint.group.shutdownGracefully().awaitValue()
+        closed.set(true)
+        shutdownCoordinator.shutdown()
     }
 
     internal suspend fun awaitClosed() {
@@ -112,19 +167,32 @@ class RawNettyHttp3RpcTransport private constructor(
     }
 
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
-        endpoint.quicChannel.closeApplication(0, "HTTP/3 client closed")
-        endpoint.quicChannel.closeFuture().syncUninterruptibly()
-        endpoint.datagramChannel.close().syncUninterruptibly()
-        endpoint.group.shutdownGracefully().syncUninterruptibly()
+        check(!endpoint.group.isOwnedEventLoopThread()) {
+            "RawNettyHttp3RpcTransport.close() cannot run on its owned Netty event loop; use shutdown()"
+        }
+        runBlocking { shutdown() }
     }
 
-    private suspend fun openRequest(inbox: Http3FrameInbox): QuicStreamChannel =
-        Http3
-            .newRequestStreamBootstrap(endpoint.quicChannel, inbox)
-            .option(ChannelOption.WRITE_BUFFER_WATER_MARK, config.options.waterMark)
-            .create()
-            .awaitValue()
+    private suspend fun openRequest(inbox: Http3FrameInbox): QuicStreamChannel {
+        val stream =
+            Http3
+                .newRequestStreamBootstrap(endpoint.quicChannel, inbox)
+                .option(ChannelOption.WRITE_BUFFER_WATER_MARK, config.options.waterMark)
+                .create()
+                .awaitValue { rejectedStream ->
+                    rejectedStream.cancelBoth()
+                    rejectedStream.close()
+                }
+        streams[stream] = inbox::fail
+        stream.closeFuture().addListener { streams.remove(stream) }
+        if (closed.get()) {
+            streams.remove(stream)
+            inbox.fail(transportException("HTTP/3 transport is closed"))
+            stream.cancelAndClose()
+            throw transportException("HTTP/3 transport is closed")
+        }
+        return stream
+    }
 
     private suspend fun writeRequestHeaders(stream: QuicStreamChannel) {
         val headers = DefaultHttp3HeadersFrame()
@@ -143,16 +211,46 @@ class RawNettyHttp3RpcTransport private constructor(
     }
 
     companion object {
-        suspend fun connect(config: NettyQuicClientConfig): RawNettyHttp3RpcTransport {
+        suspend fun connect(config: NettyQuicClientConfig): RawNettyHttp3RpcTransport = connect(config) {}
+
+        internal suspend fun connect(
+            config: NettyQuicClientConfig,
+            onTerminalFrame: () -> Unit,
+        ): RawNettyHttp3RpcTransport {
             val endpoint = connectQuic(config, HTTP3_ALPN, Http3ClientConnectionHandler())
-            return RawNettyHttp3RpcTransport(endpoint, config)
+            return RawNettyHttp3RpcTransport(endpoint, config, onTerminalFrame)
         }
 
         internal fun fromEndpoint(
             endpoint: ClientQuicEndpoint,
             config: NettyQuicClientConfig,
-        ): RawNettyHttp3RpcTransport = RawNettyHttp3RpcTransport(endpoint, config)
+        ): RawNettyHttp3RpcTransport = RawNettyHttp3RpcTransport(endpoint, config) {}
     }
+}
+
+internal fun http3RequestEndsAfterInitialData(kind: RpcKind?): Boolean = kind == RpcKind.UNARY || kind == RpcKind.SERVER_STREAMING
+
+internal suspend fun performHttp3RequestHandshake(
+    writeHeaders: suspend () -> Unit,
+    writeInitialData: suspend () -> Unit,
+    finishRequest: suspend () -> Unit,
+    awaitResponse: suspend () -> Unit,
+    finishInitialRequest: Boolean = true,
+) {
+    writeHeaders()
+    writeInitialData()
+    if (finishInitialRequest) {
+        finishRequest()
+        awaitResponse()
+    }
+}
+
+internal suspend fun finishHttp3StreamingRequest(
+    writeEndFrame: suspend () -> Unit,
+    finishRequest: suspend () -> Unit,
+) {
+    writeEndFrame()
+    finishRequest()
 }
 
 private fun writeDataFrame(
@@ -170,20 +268,27 @@ private fun writeDataFrame(
 }
 
 internal class Http3FrameInbox(
-    options: NettyTransportOptions,
+    private val options: NettyTransportOptions,
 ) : Http3RequestStreamInboundHandler() {
     private val parser = IncrementalFrameReader(options.maxFrameSize)
     private val frames = CoroutineChannel<ByteArray>(options.inboundQueueCapacity)
     private val responseValidated = CompletableDeferred<Unit>()
     private var headersSeen = false
     private var responseAccepted = false
+    private var inputClosed = false
+    private var stream: QuicStreamChannel? = null
+    private val protocolFailure = AtomicReference<Throwable?>()
+
+    override fun handlerAdded(context: ChannelHandlerContext) {
+        stream = context.channel() as? QuicStreamChannel
+    }
 
     override fun channelRead(
         context: ChannelHandlerContext,
         frame: Http3HeadersFrame,
     ) {
         if (headersSeen) {
-            fail(TrevRpcException(Status.unavailable("HTTP/3 response contained duplicate headers or trailers")))
+            failProtocol(TrevRpcException(Status.unavailable("HTTP/3 response contained duplicate headers or trailers")))
             return
         }
         headersSeen = true
@@ -191,7 +296,7 @@ internal class Http3FrameInbox(
         val contentTypes = frame.headers().getAll("content-type").map(CharSequence::toString)
         when {
             statuses != listOf("200") -> {
-                fail(
+                failProtocol(
                     TrevRpcException(
                         Status.unavailable("HTTP/3 response must contain exactly status 200"),
                     ),
@@ -199,7 +304,7 @@ internal class Http3FrameInbox(
             }
 
             !isTrevRpcMediaType(contentTypes) -> {
-                fail(
+                failProtocol(
                     TrevRpcException(
                         Status.unavailable(
                             "HTTP/3 response must contain exactly content-type $TREV_RPC_MEDIA_TYPE",
@@ -221,19 +326,19 @@ internal class Http3FrameInbox(
     ) {
         try {
             if (!responseAccepted) {
-                fail(TrevRpcException(Status.unavailable("HTTP/3 response data arrived before valid headers")))
+                failProtocol(TrevRpcException(Status.unavailable("HTTP/3 response data arrived before valid headers")))
                 (context.channel() as QuicStreamChannel).cancelBoth()
                 return
             }
             parser.feed(frame.content()).forEach { body ->
                 if (frames.trySend(body).isFailure) {
-                    fail(transportException("HTTP/3 inbound frame queue is full"))
+                    failProtocol(transportException("HTTP/3 inbound frame queue is full"))
                     (context.channel() as QuicStreamChannel).cancelBoth()
                     return
                 }
             }
         } catch (error: Throwable) {
-            fail(error)
+            failProtocol(error)
             (context.channel() as QuicStreamChannel).cancelBoth()
         } finally {
             frame.release()
@@ -241,22 +346,31 @@ internal class Http3FrameInbox(
     }
 
     override fun channelInputClosed(context: ChannelHandlerContext) {
+        inputClosed = true
+        if (!responseAccepted) {
+            fail(TrevRpcException(Status.unavailable("HTTP/3 response ended before valid headers")))
+            return
+        }
         try {
-            if (!responseAccepted) {
-                throw TrevRpcException(Status.unavailable("HTTP/3 response ended before valid headers"))
-            }
             parser.finish()
             frames.close()
         } catch (error: Throwable) {
-            fail(error)
+            failProtocol(error)
         }
+    }
+
+    override fun channelInactive(context: ChannelHandlerContext) {
+        if (!inputClosed) {
+            fail(transportException("HTTP/3 response stream closed before FIN"))
+        }
+        context.fireChannelInactive()
     }
 
     override fun exceptionCaught(
         context: ChannelHandlerContext,
         cause: Throwable,
     ) {
-        fail(cause)
+        fail(transportException("HTTP/3 response stream failed", cause))
         context.close()
     }
 
@@ -275,9 +389,29 @@ internal class Http3FrameInbox(
         frames.close(error)
     }
 
-    suspend fun requireEnd() {
-        if (receive() != null) {
-            throw TrevRpcException(Status.unavailable("HTTP/3 response contained data after its terminal frame"))
+    private fun failProtocol(error: Throwable) {
+        protocolFailure.compareAndSet(null, error)
+        fail(error)
+    }
+
+    suspend fun awaitEnd(timeout: kotlin.time.Duration = options.maxIdleTime): TerminalStreamEnd =
+        awaitTerminalStreamEnd(
+            timeout = timeout,
+            receive = ::receive,
+            missingFinMessage = "HTTP/3 response stream ended without FIN",
+            trailingDataMessage = "HTTP/3 response contained data after its terminal frame",
+            onTimeout = {
+                stream?.cancelBoth()
+                stream?.close()
+            },
+            isTrailingDataFailure = { it === protocolFailure.get() },
+        )
+
+    suspend fun requireEnd(timeout: kotlin.time.Duration = options.maxIdleTime) {
+        when (val end = awaitEnd(timeout)) {
+            TerminalStreamEnd.Clean -> Unit
+            is TerminalStreamEnd.MissingFin -> throw end.error
+            is TerminalStreamEnd.TrailingData -> throw end.error
         }
     }
 }
@@ -286,11 +420,14 @@ private class Http3RpcTransportStream(
     private val stream: QuicStreamChannel,
     private val inbox: Http3FrameInbox,
     private val options: NettyTransportOptions,
-    private val awaitRequestFin: Boolean,
+    private val sendRequestEndFrame: Boolean,
+    requestFinished: Boolean,
+    private val onTerminalFrame: () -> Unit,
 ) : RpcClientStream {
     private val closed = AtomicBoolean(false)
+    private val terminalSeen = AtomicBoolean(false)
     private val sendLock = Mutex()
-    private var sendFinished = false
+    private var sendFinished = requestFinished
 
     override suspend fun send(body: ByteArray) {
         sendLock.withLock {
@@ -309,42 +446,60 @@ private class Http3RpcTransportStream(
             if (sendFinished) return
             checkSendOpen()
             sendFinished = true
-            val future = stream.shutdownOutput()
-            if (awaitRequestFin) {
-                try {
-                    future.awaitCompletion()
-                } catch (error: Throwable) {
-                    failSend(error, ignoreIfClosed = true)
-                }
-            } else {
-                future.addListener { completed ->
-                    if (!completed.isSuccess && closed.compareAndSet(false, true)) {
-                        val error = completed.cause() ?: transportException("HTTP/3 request finish failed")
-                        inbox.fail(error)
-                        stream.cancelBoth()
-                        stream.close()
-                    }
-                }
+            try {
+                finishHttp3StreamingRequest(
+                    writeEndFrame = {
+                        if (sendRequestEndFrame) {
+                            writeDataFrame(
+                                stream,
+                                WireCodec.encode(RpcStreamFrame.status(Status.ok())),
+                                options.maxFrameSize,
+                            ).awaitCompletion()
+                        }
+                    },
+                    finishRequest = { stream.shutdownOutput().awaitCompletion() },
+                )
+            } catch (error: Throwable) {
+                failSend(error, ignoreIfClosed = true)
             }
         }
     }
 
     override suspend fun receive(): RpcStreamFrame? {
+        inbox.awaitSuccess()
         val body = inbox.receive() ?: return null
         val frame = WireCodec.decodeStreamFrame(body)
-        if (frame.kind == RpcStreamFrameKind.STATUS && closed.compareAndSet(false, true)) {
-            try {
-                inbox.requireEnd()
-            } finally {
-                stream.closeAndAwait()
-            }
-        }
+        if (frame.kind == RpcStreamFrameKind.STATUS) finishReceive(frame.status)
         return frame
     }
 
     override suspend fun close(cause: Throwable?) {
         if (!closed.compareAndSet(false, true)) return
-        stream.cancelAndClose()
+        inbox.fail(cause ?: TrevRpcException(Status.cancelled("RPC stream was closed")))
+        stream.cancelAndAwaitReset(options.shutdownTimeout)
+    }
+
+    private suspend fun finishReceive(status: Status) {
+        if (!terminalSeen.compareAndSet(false, true)) {
+            stream.cancelAndClose()
+            throw transportException("HTTP/3 response contained data after its terminal frame")
+        }
+        onTerminalFrame()
+        when (val end = inbox.awaitEnd()) {
+            TerminalStreamEnd.Clean -> {
+                if (closed.compareAndSet(false, true)) stream.finishAndClose(options.shutdownTimeout)
+            }
+
+            is TerminalStreamEnd.TrailingData -> {
+                if (closed.compareAndSet(false, true)) stream.cancelAndClose()
+                throw end.error
+            }
+
+            is TerminalStreamEnd.MissingFin -> {
+                if (closed.compareAndSet(false, true)) stream.cancelAndClose()
+                if (status.isOk) throw end.error
+            }
+        }
     }
 
     private fun checkSendOpen() {
@@ -360,19 +515,14 @@ private class Http3RpcTransportStream(
         val ownsFailure = closed.compareAndSet(false, true)
         if (ownsFailure) {
             inbox.fail(error)
-            stream.cancelAndClose()
+            if (error is CancellationException) {
+                stream.cancelAndAwaitReset(options.shutdownTimeout)
+            } else {
+                stream.cancelAndClose()
+            }
         }
         if (error is CancellationException) throw error
         if (!ownsFailure && ignoreIfClosed) return
         throw transportException("HTTP/3 request write failed", error)
     }
-}
-
-private suspend fun QuicStreamChannel.cancelAndClose() {
-    cancelBoth()
-    closeAndAwait()
-}
-
-private suspend fun QuicStreamChannel.closeAndAwait() {
-    withContext(NonCancellable) { close().awaitCompletion() }
 }

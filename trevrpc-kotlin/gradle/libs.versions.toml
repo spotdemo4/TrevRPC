@@ -2,6 +2,7 @@
 bouncycastle = "1.85"
 coroutines = "1.11.0"
 cronet = "143.7445.0"
+dokka = "2.1.0"
 grpc = "1.83.1"
 grpc-kotlin = "1.5.0"
 junit = "6.1.2"
@@ -28,5 +29,6 @@ protobuf-java = { module = "com.google.protobuf:protobuf-java", version.ref = "p
 protobuf-protoc = { module = "com.google.protobuf:protoc", version.ref = "protobuf" }
 
 [plugins]
+dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 protobuf = { id = "com.google.protobuf", version.ref = "protobuf-plugin" }

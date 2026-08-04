@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 class ClientRuntimeTest {
@@ -40,7 +41,7 @@ class ClientRuntimeTest {
             }
             val client = Client(InMemoryTransport(server))
 
-            val unary = client.unaryEnvelope("test.Service", "Unary", "x", strings, strings)
+            val unary = client.unaryResponse("test.Service", "Unary", "x", strings, strings)
             assertEquals("u:x", unary.message)
             assertEquals(1, unary.metadata["result"]?.single())
 
@@ -65,6 +66,38 @@ class ClientRuntimeTest {
             assertNull(bidi.receive())
             assertEquals(Code.OK, bidi.terminalStatus?.code)
 
+            server.shutdown()
+        }
+
+    @Test
+    fun `failed response flow does not expose success envelope metadata`() =
+        runBlocking {
+            val server = Server()
+            server.routeServerStreaming("test.Service", "Fail") { _, _ ->
+                ResponseEnvelope(
+                    flow<ByteArray> { throw TrevRpcException(Status(Code.ABORTED, "stream failed")) },
+                    Metadata.of("success" to byteArrayOf(1)),
+                )
+            }
+            val call =
+                Client(InMemoryTransport(server)).serverStreaming(
+                    "test.Service",
+                    "Fail",
+                    "request",
+                    strings,
+                    strings,
+                )
+
+            val failure =
+                try {
+                    call.receive()
+                    error("expected response stream failure")
+                } catch (error: TrevRpcException) {
+                    error
+                }
+
+            assertEquals(Code.ABORTED, failure.status.code)
+            assertTrue(call.responseMetadata.isEmpty)
             server.shutdown()
         }
 
@@ -273,7 +306,78 @@ class ClientRuntimeTest {
             val unknown =
                 Client(StaticStreamTransport(RpcStreamFrame(kindValue = 99)))
                     .serverStreaming("svc", "method", "request", strings, strings)
-            assertCode(Code.INTERNAL) { unknown.receive() }
+            assertCode(Code.INVALID_ARGUMENT) { unknown.receive() }
+
+            val unknownBatchStream =
+                object : RpcClientStream {
+                    override suspend fun send(body: ByteArray) = Unit
+
+                    override suspend fun finishSend() = Unit
+
+                    override suspend fun receive(): RpcStreamFrame? = null
+
+                    override suspend fun receiveBatch(maxFrames: Int): List<RpcStreamFrame> = listOf(RpcStreamFrame(kindValue = 99))
+
+                    override suspend fun close(cause: Throwable?) = Unit
+                }
+            val unknownBatch =
+                Client(SingleStreamTransport(unknownBatchStream))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            assertCode(Code.INVALID_ARGUMENT) { unknownBatch.receiveBatch() }
+
+            val trailingCloses = AtomicInteger()
+            val trailingFrames =
+                listOf(
+                    RpcStreamFrame.status(Status.unavailable("remote")),
+                    RpcStreamFrame.message("late".encodeToByteArray()),
+                ).iterator()
+            val trailing =
+                Client(
+                    SingleStreamTransport(
+                        SequenceStream(onClose = { trailingCloses.incrementAndGet() }) {
+                            if (trailingFrames.hasNext()) trailingFrames.next() else null
+                        },
+                    ),
+                ).serverStreaming("svc", "method", "request", strings, strings)
+            assertCode(Code.INTERNAL) { trailing.receive() }
+            assertEquals(1, trailingCloses.get())
+
+            var pendingTerminalReads = 0
+            val pendingTerminal =
+                Client(
+                    SingleStreamTransport(
+                        SequenceStream {
+                            if (pendingTerminalReads++ == 0) RpcStreamFrame.status(Status.ok()) else awaitCancellation()
+                        },
+                    ),
+                ).serverStreaming(
+                    "svc",
+                    "method",
+                    "request",
+                    strings,
+                    strings,
+                    CallOptions(streamIdleTimeout = 1.milliseconds),
+                )
+            assertCode(Code.UNAVAILABLE) { pendingTerminal.receive() }
+            assertNull(pendingTerminal.terminalStatus)
+
+            var malformedTrailingReads = 0
+            val malformedTrailing =
+                Client(
+                    SingleStreamTransport(
+                        SequenceStream {
+                            if (malformedTrailingReads++ == 0) {
+                                RpcStreamFrame.status(Status.ok())
+                            } else {
+                                throw TrevRpcException(Status.internal("malformed trailing protobuf"))
+                            }
+                        },
+                    ),
+                ).serverStreaming("svc", "method", "request", strings, strings)
+            assertStatus(Code.INTERNAL, "response stream contained data after final status") {
+                malformedTrailing.receive()
+            }
+            assertNull(malformedTrailing.terminalStatus)
 
             val multiple =
                 Client(
@@ -283,7 +387,58 @@ class ClientRuntimeTest {
                         RpcStreamFrame.status(Status.ok()),
                     ),
                 ).clientStreaming<String, String>("svc", "method", strings, strings)
-            assertCode(Code.INTERNAL) { multiple.receive() }
+            assertStatus(
+                Code.INTERNAL,
+                "client-streaming RPC returned more than one response message",
+            ) { multiple.receive() }
+
+            val multipleWithoutStatus =
+                Client(
+                    StaticStreamTransport(
+                        RpcStreamFrame.message("one".encodeToByteArray()),
+                        RpcStreamFrame.message("two".encodeToByteArray()),
+                    ),
+                ).clientStreaming<String, String>("svc", "method", strings, strings)
+            assertStatus(Code.INTERNAL, "response stream ended before final status") {
+                multipleWithoutStatus.receive()
+            }
+
+            val multipleThenRemote =
+                Client(
+                    StaticStreamTransport(
+                        RpcStreamFrame.message("one".encodeToByteArray()),
+                        RpcStreamFrame.message("two".encodeToByteArray()),
+                        RpcStreamFrame.status(Status.unavailable("remote")),
+                    ),
+                ).clientStreaming<String, String>("svc", "method", strings, strings)
+            assertStatus(Code.UNAVAILABLE, "remote") { multipleThenRemote.receive() }
+
+            val multipleThenTrailing =
+                Client(
+                    StaticStreamTransport(
+                        RpcStreamFrame.message("one".encodeToByteArray()),
+                        RpcStreamFrame.message("two".encodeToByteArray()),
+                        RpcStreamFrame.status(Status.ok()),
+                        RpcStreamFrame.message("late".encodeToByteArray()),
+                    ),
+                ).clientStreaming<String, String>("svc", "method", strings, strings)
+            assertStatus(Code.INTERNAL, "response stream contained data after final status") {
+                multipleThenTrailing.receive()
+            }
+
+            val oneThenRemote =
+                Client(
+                    StaticStreamTransport(
+                        RpcStreamFrame.message("one".encodeToByteArray()),
+                        RpcStreamFrame.status(Status.unavailable("remote")),
+                    ),
+                ).clientStreaming<String, String>("svc", "method", strings, strings)
+            assertCode(Code.UNAVAILABLE) { oneThenRemote.receive() }
+
+            val messageWithoutStatus =
+                Client(StaticStreamTransport(RpcStreamFrame.message("one".encodeToByteArray())))
+                    .clientStreaming<String, String>("svc", "method", strings, strings)
+            assertCode(Code.INTERNAL) { messageWithoutStatus.receive() }
 
             val remote =
                 Client(
@@ -375,15 +530,29 @@ class ClientRuntimeTest {
         code: Code,
         block: suspend () -> Unit,
     ) {
-        val error =
-            try {
-                block()
-                throw AssertionError("expected TrevRpcException with code $code")
-            } catch (error: TrevRpcException) {
-                error
-            }
-        assertEquals(code, error.status.code)
+        assertEquals(code, captureTrevRpcException(code, block).status.code)
     }
+
+    private suspend fun assertStatus(
+        code: Code,
+        message: String,
+        block: suspend () -> Unit,
+    ) {
+        val error = captureTrevRpcException(code, block)
+        assertEquals(code, error.status.code)
+        assertEquals(message, error.status.message)
+    }
+
+    private suspend fun captureTrevRpcException(
+        code: Code,
+        block: suspend () -> Unit,
+    ): TrevRpcException =
+        try {
+            block()
+            throw AssertionError("expected TrevRpcException with code $code")
+        } catch (error: TrevRpcException) {
+            error
+        }
 }
 
 private class InMemoryTransport(

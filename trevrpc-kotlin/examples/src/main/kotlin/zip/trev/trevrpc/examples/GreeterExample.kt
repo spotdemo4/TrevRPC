@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.toList
 import zip.trev.trevrpc.Authorizer
 import zip.trev.trevrpc.Metadata
 import zip.trev.trevrpc.RequestContext
+import zip.trev.trevrpc.ResponseEnvelope
 import zip.trev.trevrpc.Server
 import zip.trev.trevrpc.ServerOptions
 import zip.trev.trevrpc.Status
@@ -19,30 +20,35 @@ import zip.trev.trevrpc.examples.greeter.registerGreeter
 import java.security.MessageDigest
 import kotlin.time.Duration.Companion.seconds
 
-class ExampleGreeterService : GreeterService {
+class ExampleGreeterService(
+    private val responseMetadata: Metadata = Metadata.EMPTY,
+) : GreeterService {
     override suspend fun sayHello(
         context: RequestContext,
         request: HelloRequest,
-    ): HelloReply = reply("hello, ${request.name}")
+    ): ResponseEnvelope<HelloReply> = ResponseEnvelope(reply("hello, ${request.name}"), responseMetadata)
 
     override suspend fun lotsOfReplies(
         context: RequestContext,
         request: HelloRequest,
-    ): Flow<HelloReply> =
-        flowOf(
-            reply("hello, ${request.name}"),
-            reply("goodbye, ${request.name}"),
+    ): ResponseEnvelope<Flow<HelloReply>> =
+        ResponseEnvelope(
+            flowOf(
+                reply("hello, ${request.name}"),
+                reply("goodbye, ${request.name}"),
+            ),
+            responseMetadata,
         )
 
     override suspend fun lotsOfGreetings(
         context: RequestContext,
         requests: Flow<HelloRequest>,
-    ): HelloReply = reply(requests.toList().joinToString(separator = ",") { it.name })
+    ): ResponseEnvelope<HelloReply> = ResponseEnvelope(reply(requests.toList().joinToString(separator = ",") { it.name }), responseMetadata)
 
     override suspend fun bidiHello(
         context: RequestContext,
         requests: Flow<HelloRequest>,
-    ): Flow<HelloReply> = requests.map { request -> reply("echo, ${request.name}") }
+    ): ResponseEnvelope<Flow<HelloReply>> = ResponseEnvelope(requests.map { request -> reply("echo, ${request.name}") }, responseMetadata)
 
     private fun reply(message: String): HelloReply = HelloReply.newBuilder().setMessage(message).build()
 }

@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package generator.compat.derived;
+
+option java_package = "generator.compat.derived";
+option java_multiple_files = false;
+
+message raw_message_name {}
+message _raw_Output {}
+
+service DerivedOuter {
+  rpc Call(raw_message_name) returns (_raw_Output);
+}

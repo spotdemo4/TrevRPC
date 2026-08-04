@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class FramingMetadataTest {
@@ -103,6 +104,8 @@ class FramingMetadataTest {
     }
 
     private fun assertInvalid(block: () -> Unit) {
-        assertEquals(Code.INVALID_ARGUMENT, assertThrows(TrevRpcException::class.java, block).status.code)
+        val error = assertThrows(TrevRpcException::class.java, block)
+        assertEquals(Code.INVALID_ARGUMENT, error.status.code)
+        assertTrue(error.status.message.startsWith("invalid metadata:"))
     }
 }

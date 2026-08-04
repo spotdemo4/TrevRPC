@@ -5,6 +5,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
 import zip.trev.trevrpc.RequestContext
+import zip.trev.trevrpc.ResponseEnvelope
 import zip.trev.trevrpc.Server
 import zip.trev.trevrpc.ServerOptions
 import zip.trev.trevrpc.Status
@@ -23,22 +24,22 @@ internal class BenchmarkRpcService : BenchmarkServiceService {
     override suspend fun unary(
         context: RequestContext,
         request: BenchmarkRequest,
-    ): BenchmarkResponse = application.unary(request)
+    ): ResponseEnvelope<BenchmarkResponse> = ResponseEnvelope(application.unary(request))
 
     override suspend fun clientStream(
         context: RequestContext,
         requests: Flow<BenchmarkRequest>,
-    ): BenchmarkSummary = application.clientStream(requests)
+    ): ResponseEnvelope<BenchmarkSummary> = ResponseEnvelope(application.clientStream(requests))
 
     override suspend fun serverStream(
         context: RequestContext,
         request: StreamRequest,
-    ): Flow<BenchmarkResponse> = application.serverStream(request)
+    ): ResponseEnvelope<Flow<BenchmarkResponse>> = ResponseEnvelope(application.serverStream(request))
 
     override suspend fun bidi(
         context: RequestContext,
         requests: Flow<BenchmarkRequest>,
-    ): Flow<BenchmarkResponse> = application.bidi(requests)
+    ): ResponseEnvelope<Flow<BenchmarkResponse>> = ResponseEnvelope(application.bidi(requests))
 }
 
 internal class BenchmarkApplication(

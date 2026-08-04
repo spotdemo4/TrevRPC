@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package generator.compat.trailing_hash;
+
+option java_package = "generator.compat.derived";
+option java_multiple_files = false;
+
+message hash_request {}
+message _hash_Response {}
+
+service TrailingHashNaming {
+  rpc Call(hash_request) returns (_hash_Response);
+}

@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package generator.compat.single;
+
+option java_package = "generator.compat";
+option java_outer_classname = "SingleFileTypes";
+option java_multiple_files = false;
+
+message snake_name {
+  message _nested_Name {}
+}
+
+message _leading_Name {}
+message mixedCASE_name {}
+message AlreadyMixed {}
+
+service SingleNaming {
+  rpc Nested(snake_name._nested_Name) returns (_leading_Name);
+  rpc Mixed(mixedCASE_name) returns (AlreadyMixed);
+}

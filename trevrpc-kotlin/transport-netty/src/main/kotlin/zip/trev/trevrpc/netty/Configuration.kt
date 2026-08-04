@@ -98,6 +98,7 @@ data class NettyTransportOptions(
     val workerParallelism: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(2),
     val inboundQueueCapacity: Int = DEFAULT_MAX_STREAM_MESSAGES,
     val maxIdleTime: Duration = 30.seconds,
+    val shutdownTimeout: Duration = 10.seconds,
     val writeBufferLowWaterMark: Int = 32 * 1024,
     val writeBufferHighWaterMark: Int = 64 * 1024,
 ) {
@@ -105,7 +106,10 @@ data class NettyTransportOptions(
         require(maxFrameSize >= 0) { "maxFrameSize must be non-negative" }
         require(workerParallelism > 0) { "workerParallelism must be positive" }
         require(inboundQueueCapacity > 0) { "inboundQueueCapacity must be positive" }
-        require(maxIdleTime.isPositive()) { "maxIdleTime must be positive" }
+        require(maxIdleTime.isFinite() && maxIdleTime.isPositive()) { "maxIdleTime must be positive and finite" }
+        require(shutdownTimeout.isFinite() && shutdownTimeout.isPositive()) {
+            "shutdownTimeout must be positive and finite"
+        }
         require(writeBufferLowWaterMark >= 0) { "writeBufferLowWaterMark must be non-negative" }
         require(writeBufferHighWaterMark >= writeBufferLowWaterMark) {
             "writeBufferHighWaterMark must be at least writeBufferLowWaterMark"

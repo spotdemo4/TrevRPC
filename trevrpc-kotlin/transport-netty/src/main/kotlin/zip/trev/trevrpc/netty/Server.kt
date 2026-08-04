@@ -13,6 +13,7 @@ import io.netty.channel.MultiThreadIoEventLoopGroup
 import io.netty.channel.nio.NioIoHandler
 import io.netty.channel.socket.ChannelInputShutdownEvent
 import io.netty.channel.socket.ChannelInputShutdownReadComplete
+import io.netty.channel.socket.ChannelOutputShutdownEvent
 import io.netty.channel.socket.nio.NioDatagramChannel
 import io.netty.handler.codec.http3.DefaultHttp3DataFrame
 import io.netty.handler.codec.http3.DefaultHttp3HeadersFrame
@@ -30,17 +31,15 @@ import io.netty.handler.ssl.SslHandshakeCompletionEvent
 import io.netty.util.AttributeKey
 import io.netty.util.ReferenceCountUtil
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
 import zip.trev.trevrpc.BatchingServerResponseSink
 import zip.trev.trevrpc.RpcKind
@@ -71,9 +70,10 @@ class NettyRpcServer private constructor(
     private val scope: CoroutineScope,
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
-    private val shutdownComplete = CompletableDeferred<Result<Unit>>()
-    private val connections = ConcurrentHashMap.newKeySet<QuicChannel>()
-    private val activeConnections = AtomicInteger()
+    private val admission = NettyAdmissionGate()
+    private val calls = NettyCallRegistry(admission)
+    private val shutdownCoordinator = NettyShutdownCoordinator(::shutdownTransport)
+    private val connections = NettyConnectionAdmission<QuicChannel>(admission)
 
     val localAddress: InetSocketAddress
         get() = checkNotNull(datagramChannel) { "server is not bound" }.localAddress() as InetSocketAddress
@@ -81,56 +81,51 @@ class NettyRpcServer private constructor(
     internal val bindCount: Int = 1
 
     suspend fun shutdown() {
-        if (!closed.compareAndSet(false, true)) {
-            shutdownComplete.await().getOrThrow()
-            return
-        }
-        val result =
-            runCatching {
-                try {
-                    server.shutdown()
-                } finally {
-                    withContext(NonCancellable) {
-                        try {
-                            connections.forEach { it.closeApplication(0, "server shutdown") }
-                            connections.map { it.closeFuture() }.forEach { it.awaitCompletion() }
-                        } finally {
-                            try {
-                                datagramChannel?.close()?.awaitCompletion()
-                            } finally {
-                                scope.cancel()
-                                group.shutdownGracefully().awaitValue()
-                            }
-                        }
-                    }
-                }
-            }
-        shutdownComplete.complete(result)
-        result.getOrThrow()
+        closed.set(true)
+        admission.stopAdmission()
+        shutdownCoordinator.shutdown()
     }
 
     override fun close() {
+        check(!group.isOwnedEventLoopThread()) {
+            "NettyRpcServer.close() cannot run on its owned Netty event loop; use shutdown()"
+        }
         runBlocking { shutdown() }
     }
+
+    private suspend fun shutdownTransport() =
+        supervisorScope {
+            closed.set(true)
+            admission.stopAdmission()
+            val coreShutdown = async { runCatching { server.shutdown() } }
+            val graceful = calls.awaitDrained(server.options.gracefulShutdownTimeout)
+            if (!graceful) calls.cancelAndCloseAll("server graceful shutdown timed out")
+
+            connections.snapshot().forEach { it.closeApplication(0, "server shutdown") }
+            shutdownOwnedNettyResources(
+                group = group,
+                timeout = server.options.forceShutdownTimeout,
+                description = "Netty RPC server force",
+                cancelScope = scope::cancel,
+                forceClose = {
+                    calls.cancelAndCloseAll("server force shutdown")
+                    connections.snapshot().forEach { it.close() }
+                    datagramChannel?.close()
+                },
+            ) {
+                if (!graceful) calls.awaitDrained()
+                connections.snapshot().map { it.closeFuture() }.forEach { it.awaitCompletion() }
+                datagramChannel?.close()?.awaitCompletion()
+                coreShutdown.await().getOrThrow()
+            }
+        }
 
     private fun initializeConnection(channel: QuicChannel) {
         channel.pipeline().addLast(
             AlpnDispatchHandler(
                 config.protocols().toSet(),
                 onAccepted = {
-                    val limit = server.options.maxConcurrentConnections
-                    if (closed.get()) {
-                        false
-                    } else {
-                        val active = activeConnections.incrementAndGet()
-                        if (limit != null && active > limit) {
-                            activeConnections.decrementAndGet()
-                            false
-                        } else {
-                            connections += channel
-                            true
-                        }
-                    }
+                    connections.admit(channel, server.options.maxConcurrentConnections)
                 },
                 onNative = {
                     channel.attr(CONNECTION_STATE).set(ServerConnectionState(Protocol.NATIVE))
@@ -149,7 +144,8 @@ class NettyRpcServer private constructor(
                     channel.pipeline().addLast(handler)
                 },
                 onClosed = {
-                    if (connections.remove(channel)) activeConnections.decrementAndGet()
+                    calls.cancelConnection(channel, "QUIC connection closed")
+                    connections.remove(channel)
                 },
             ),
         )
@@ -168,18 +164,40 @@ class NettyRpcServer private constructor(
             rejectRawRpcStream(channel, "too many concurrent streams on connection")
             return
         }
-        val input = ServerFrameInput(config.options, channel::cancelBoth)
+        val input =
+            ServerFrameInput(config.options, channel::cancelBoth) {
+                calls.cancel(channel, "request stream aborted")
+            }
+        val permitReleased = AtomicBoolean(false)
+        val releasePermit = { if (permitReleased.compareAndSet(false, true)) connection.release() }
         channel.pipeline().addLast(TrevRpcFrameDecoder(config.options.maxFrameSize), input.handler())
-        channel.closeFuture().addListener { connection.release() }
-        scope.launch {
-            processRpc(
-                input,
-                write = { writeRaw(channel, it) },
-                writeBatch = { writeRawBatch(channel, it) },
-                writeTerminal = { writeRaw(channel, it, finish = true) },
-                finish = { channel.shutdownOutput().awaitCompletion() },
-                cancelInput = channel::cancelBoth,
-            )
+        channel.closeFuture().addListener { releasePermit() }
+        val job =
+            calls.launch(
+                scope,
+                channel,
+                onComplete = {
+                    input.shutdown()
+                    releasePermit()
+                },
+            ) {
+                processRpc(
+                    input,
+                    write = { writeRaw(channel, it) },
+                    writeBatch = { writeRawBatch(channel, it) },
+                    writeTerminal = { writeRaw(channel, it, finish = true) },
+                    finish = {
+                        calls.expectClose(channel)
+                        channel.shutdownOutput().awaitCompletion()
+                    },
+                    cancelInput = channel::cancelBoth,
+                )
+            }
+        if (job == null) {
+            input.fail(transportException("server is shutting down"))
+            releasePermit()
+            channel.cancelBoth()
+            channel.close()
         }
     }
 
@@ -291,24 +309,32 @@ class NettyRpcServer private constructor(
         channel: QuicStreamChannel,
         message: String,
     ) {
-        val input = ServerFrameInput(config.options, channel::cancelBoth)
-        channel.pipeline().addLast(TrevRpcFrameDecoder(config.options.maxFrameSize), input.handler())
-        scope.launch {
-            try {
-                val body = receiveInitial(input, server.options.initialRequestTimeout)
-                val request = WireCodec.decodeRequest(body)
-                val status = Status.unavailable(message)
-                val response =
-                    if (request.kind == RpcKind.UNARY) {
-                        WireCodec.encode(RpcResponse.fromStatus(status))
-                    } else {
-                        WireCodec.encode(RpcStreamFrame.status(status))
-                    }
-                writeRaw(channel, response, finish = true)
-                channel.shutdownInput(CANCELLED_STREAM_CODE)
-            } catch (_: Throwable) {
-                channel.cancelBoth()
+        val input =
+            ServerFrameInput(config.options, channel::cancelBoth) {
+                calls.cancel(channel, "request stream aborted")
             }
+        channel.pipeline().addLast(TrevRpcFrameDecoder(config.options.maxFrameSize), input.handler())
+        val job =
+            calls.launch(scope, channel, onComplete = input::shutdown) {
+                try {
+                    val body = receiveInitial(input, server.options.initialRequestTimeout)
+                    val request = WireCodec.decodeRequest(body)
+                    val status = Status.unavailable(message)
+                    val response =
+                        if (request.kind == RpcKind.UNARY) {
+                            WireCodec.encode(RpcResponse.fromStatus(status))
+                        } else {
+                            WireCodec.encode(RpcStreamFrame.status(status))
+                        }
+                    writeRaw(channel, response, finish = true)
+                } catch (_: Throwable) {
+                    channel.cancelBoth()
+                }
+            }
+        if (job == null) {
+            input.shutdown()
+            channel.cancelBoth()
+            channel.close()
         }
     }
 
@@ -317,6 +343,10 @@ class NettyRpcServer private constructor(
         body: ByteArray,
         finish: Boolean = false,
     ) {
+        check(channel.isActive && !channel.eventLoop().isShuttingDown) {
+            "cannot write to a closed QUIC stream"
+        }
+        if (finish) calls.expectClose(channel)
         val framed = TrevRpcFrameWriter.encode(channel.alloc(), body, config.options.maxFrameSize)
         val message: Any = if (finish) DefaultQuicStreamFrame(framed, true) else framed
         val future =
@@ -333,6 +363,9 @@ class NettyRpcServer private constructor(
         channel: QuicStreamChannel,
         bodies: List<ByteArray>,
     ) {
+        check(channel.isActive && !channel.eventLoop().isShuttingDown) {
+            "cannot write to a closed QUIC stream"
+        }
         val frames = TrevRpcFrameWriter.encodeBatch(channel.alloc(), bodies, config.options.maxFrameSize)
         val future =
             try {
@@ -347,11 +380,11 @@ class NettyRpcServer private constructor(
     private inner class Http3ServerStreamHandler(
         private val channel: QuicStreamChannel,
     ) : Http3RequestStreamInboundHandler() {
-        private val input = ServerFrameInput(config.options, channel::cancelBoth)
+        private val input =
+            ServerFrameInput(config.options, channel::cancelBoth) {
+                calls.cancel(channel, "request stream aborted")
+            }
         private var headersReceived = false
-
-        @Volatile
-        private var admitted = false
 
         @Volatile
         private var rejected = false
@@ -363,43 +396,78 @@ class NettyRpcServer private constructor(
             frame: Http3HeadersFrame,
         ) {
             if (headersReceived) {
-                if (admitted) input.fail(TrevRpcException(Status.invalidArgument("HTTP/3 trailers are not supported")))
+                rejectTrailers()
                 return
             }
             headersReceived = true
             val request = snapshot(frame)
             if (request.method == "CONNECT" && request.protocol.equals("webtransport", ignoreCase = true)) {
                 webTransportConnect = true
-                scope.launch { handleWebTransportConnect(request) }
+                if (calls.launch(scope, channel) { handleWebTransportConnect(request) } == null) {
+                    rejected = true
+                    channel.cancelBoth()
+                    channel.close()
+                }
                 return
             }
-            scope.launch {
-                val rejection = runCatching { validateHttp3(request) }.getOrElse { 403 }
-                if (rejection != null) {
-                    rejected = true
-                    sendHttpStatus(channel, rejection)
-                    return@launch
-                }
-                val connection = checkNotNull(channel.parent().attr(CONNECTION_STATE).get())
-                if (!connection.tryAcquire(server.options.maxConcurrentStreamsPerConnection)) {
-                    rejected = true
-                    sendHttpStatus(channel, 503)
-                    return@launch
-                }
-                channel.closeFuture().addListener { connection.release() }
-                admitted = true
-                sendHttpStatus(channel, 200, finish = false)
-                processRpc(
-                    input,
-                    write = { writeHttp3(channel, it) },
-                    writeBatch = { writeHttp3Batch(channel, it) },
-                    writeTerminal = {
-                        writeHttp3(channel, it)
-                        channel.shutdownOutput().awaitCompletion()
+            val permitHeld = AtomicBoolean(false)
+            val connection = channel.parent().attr(CONNECTION_STATE).get()
+            val releasePermit = { if (permitHeld.compareAndSet(true, false)) connection?.release() }
+            channel.closeFuture().addListener { releasePermit() }
+            val job =
+                calls.launch(
+                    scope,
+                    channel,
+                    onComplete = {
+                        input.shutdown()
+                        releasePermit()
                     },
-                    finish = { channel.shutdownOutput().awaitCompletion() },
-                    cancelInput = channel::cancelBoth,
-                )
+                ) {
+                    val rejection = runCatching { validateHttp3(request) }.getOrElse { 403 }
+                    if (rejected) return@launch
+                    if (rejection != null) {
+                        rejected = true
+                        sendHttpStatus(channel, rejection)
+                        return@launch
+                    }
+                    val acceptedConnection = checkNotNull(connection)
+                    if (!acceptedConnection.tryAcquire(server.options.maxConcurrentStreamsPerConnection)) {
+                        rejected = true
+                        sendHttpStatus(channel, 503)
+                        return@launch
+                    }
+                    permitHeld.set(true)
+                    ensureRequestAccepted()
+                    sendHttpStatus(channel, 200, finish = false)
+                    processRpc(
+                        input,
+                        write = {
+                            ensureRequestAccepted()
+                            writeHttp3(channel, it)
+                        },
+                        writeBatch = {
+                            ensureRequestAccepted()
+                            writeHttp3Batch(channel, it)
+                        },
+                        writeTerminal = {
+                            ensureRequestAccepted()
+                            writeHttp3(channel, it)
+                            calls.expectClose(channel)
+                            channel.shutdownOutput().awaitCompletion()
+                        },
+                        finish = {
+                            ensureRequestAccepted()
+                            calls.expectClose(channel)
+                            channel.shutdownOutput().awaitCompletion()
+                        },
+                        cancelInput = channel::cancelBoth,
+                    )
+                }
+            if (job == null) {
+                rejected = true
+                input.shutdown()
+                channel.cancelBoth()
+                channel.close()
             }
         }
 
@@ -418,16 +486,46 @@ class NettyRpcServer private constructor(
             if (!webTransportConnect) input.finish()
         }
 
+        override fun userEventTriggered(
+            context: ChannelHandlerContext,
+            event: Any,
+        ) {
+            if (event is ChannelOutputShutdownEvent) {
+                input.fail(transportException("peer stopped the HTTP/3 response stream"))
+                calls.cancel(channel, "peer stopped the HTTP/3 response stream")
+            }
+            context.fireUserEventTriggered(event)
+        }
+
         override fun channelInactive(context: ChannelHandlerContext) {
-            if (!webTransportConnect) input.finish()
+            if (!webTransportConnect) {
+                input.fail(transportException("HTTP/3 request stream closed before completion"))
+            }
+            calls.cancel(channel, "HTTP/3 request stream closed")
+            context.fireChannelInactive()
         }
 
         override fun exceptionCaught(
             context: ChannelHandlerContext,
             cause: Throwable,
         ) {
-            input.fail(cause)
-            if (!admitted) context.close()
+            input.fail(transportException("HTTP/3 request stream failed", cause))
+            calls.cancel(channel, "HTTP/3 request stream failed")
+            context.close()
+        }
+
+        private fun rejectTrailers() {
+            if (rejected) return
+            rejected = true
+            val error = TrevRpcException(Status.invalidArgument("HTTP/3 trailers are not supported"))
+            input.fail(error)
+            calls.cancel(channel, "HTTP/3 trailers are not supported")
+            channel.cancelBoth()
+            channel.close()
+        }
+
+        private fun ensureRequestAccepted() {
+            if (rejected) throw CancellationException("HTTP/3 request stream was rejected")
         }
 
         private suspend fun handleWebTransportConnect(request: Http3AdmissionRequest) {
@@ -468,7 +566,6 @@ class NettyRpcServer private constructor(
                 return
             }
             channel.closeFuture().addListener { connection.closeSession(sessionId) }
-            admitted = true
             val response = DefaultHttp3HeadersFrame()
             response.headers().status("200")
             response.headers().set("sec-webtransport-http3-draft", "draft02")
@@ -568,18 +665,40 @@ class NettyRpcServer private constructor(
             rejectRawRpcStream(channel, "too many concurrent streams on WebTransport session")
             return
         }
-        channel.closeFuture().addListener { connection.release() }
-        val input = ServerFrameInput(config.options, channel::cancelBoth)
+        val input =
+            ServerFrameInput(config.options, channel::cancelBoth) {
+                calls.cancel(channel, "request stream aborted")
+            }
+        val permitReleased = AtomicBoolean(false)
+        val releasePermit = { if (permitReleased.compareAndSet(false, true)) connection.release() }
         channel.pipeline().addLast(TrevRpcFrameDecoder(config.options.maxFrameSize), input.handler())
-        scope.launch {
-            processRpc(
-                input,
-                write = { writeRaw(channel, it) },
-                writeBatch = { writeRawBatch(channel, it) },
-                writeTerminal = { writeRaw(channel, it, finish = true) },
-                finish = { channel.shutdownOutput().awaitCompletion() },
-                cancelInput = channel::cancelBoth,
-            )
+        channel.closeFuture().addListener { releasePermit() }
+        val job =
+            calls.launch(
+                scope,
+                channel,
+                onComplete = {
+                    input.shutdown()
+                    releasePermit()
+                },
+            ) {
+                processRpc(
+                    input,
+                    write = { writeRaw(channel, it) },
+                    writeBatch = { writeRawBatch(channel, it) },
+                    writeTerminal = { writeRaw(channel, it, finish = true) },
+                    finish = {
+                        calls.expectClose(channel)
+                        channel.shutdownOutput().awaitCompletion()
+                    },
+                    cancelInput = channel::cancelBoth,
+                )
+            }
+        if (job == null) {
+            input.shutdown()
+            releasePermit()
+            channel.cancelBoth()
+            channel.close()
         }
     }
 
@@ -628,7 +747,10 @@ class NettyRpcServer private constructor(
         if (status == 200) frame.headers().set("content-type", TREV_RPC_MEDIA_TYPE)
         if (status == 405) frame.headers().set("allow", "POST")
         channel.writeAndFlush(frame).awaitCompletion()
-        if (finish) channel.shutdownOutput().awaitCompletion()
+        if (finish) {
+            calls.expectClose(channel)
+            channel.shutdownOutput().awaitCompletion()
+        }
     }
 
     private suspend fun writeHttp3(
@@ -726,18 +848,41 @@ class NettyRpcServer private constructor(
                 instance.datagramChannel = datagram
                 return instance
             } catch (error: CancellationException) {
-                runCatching { instance.datagramChannel?.close()?.syncUninterruptibly() }
-                scope.cancel()
-                runCatching { group.shutdownGracefully().syncUninterruptibly() }
+                cleanupFailedServerBind(instance.datagramChannel, scope, group, config.options.shutdownTimeout, error)
                 throw error
             } catch (error: Throwable) {
-                instance.datagramChannel?.close()?.syncUninterruptibly()
-                scope.cancel()
-                group.shutdownGracefully().syncUninterruptibly()
+                cleanupFailedServerBind(instance.datagramChannel, scope, group, config.options.shutdownTimeout, error)
                 throw transportException("failed to bind Netty RPC server", error)
             }
         }
     }
+}
+
+private suspend fun cleanupFailedServerBind(
+    datagramChannel: Channel?,
+    scope: CoroutineScope,
+    group: EventLoopGroup,
+    timeout: Duration,
+    original: Throwable,
+) {
+    val cleanupFailure =
+        runCatching {
+            runBoundedNonCancellableCleanup(
+                timeout = timeout,
+                description = "Netty RPC server bind",
+                cleanup = {
+                    scope.cancel()
+                    datagramChannel?.close()?.awaitCompletion()
+                    group.shutdownNow(timeout)
+                },
+                forceCleanup = {
+                    scope.cancel()
+                    datagramChannel?.close()
+                    group.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS)
+                },
+            )
+        }.exceptionOrNull()
+    if (cleanupFailure != null && cleanupFailure !== original) original.addSuppressed(cleanupFailure)
 }
 
 internal enum class AlpnDispatchResult {
@@ -876,6 +1021,7 @@ private class ServerConnectionState(
 internal class ServerFrameInput(
     options: NettyTransportOptions,
     private val onOverflow: () -> Unit = {},
+    private val onAbort: (Throwable) -> Unit = {},
 ) {
     private val parser = IncrementalFrameReader(options.maxFrameSize)
     private val frames = CoroutineChannel<ByteArray>(options.inboundQueueCapacity)
@@ -899,19 +1045,36 @@ internal class ServerFrameInput(
                 context: ChannelHandlerContext,
                 event: Any,
             ) {
-                if (event is ChannelInputShutdownEvent || event is ChannelInputShutdownReadComplete) shutdown()
+                when (event) {
+                    is ChannelInputShutdownEvent,
+                    is ChannelInputShutdownReadComplete,
+                    -> {
+                        shutdown()
+                    }
+
+                    is ChannelOutputShutdownEvent -> {
+                        val error = transportException("peer stopped the response stream")
+                        fail(error)
+                        onAbort(error)
+                    }
+                }
                 context.fireUserEventTriggered(event)
             }
 
             override fun channelInactive(context: ChannelHandlerContext) {
-                frames.close()
+                val error = transportException("request stream closed before completion")
+                fail(error)
+                onAbort(error)
+                context.fireChannelInactive()
             }
 
             override fun exceptionCaught(
                 context: ChannelHandlerContext,
                 cause: Throwable,
             ) {
-                fail(cause)
+                val error = transportException("request stream failed", cause)
+                fail(error)
+                onAbort(error)
             }
         }
 

@@ -12,9 +12,12 @@ import zip.trev.trevrpc.TrevRpcException
 private const val FRAME_HEADER_SIZE = 4
 
 /** Emits retained frame bodies. The next handler owns and must release every emitted [ByteBuf]. */
-class TrevRpcFrameDecoder(
+class TrevRpcFrameDecoder internal constructor(
     val maxFrameSize: Int,
+    private val onPartialFrameAtEnd: (TrevRpcException) -> Unit,
 ) : ByteToMessageDecoder() {
+    constructor(maxFrameSize: Int) : this(maxFrameSize, {})
+
     init {
         require(maxFrameSize >= 0) { "maxFrameSize must be non-negative" }
     }
@@ -46,7 +49,9 @@ class TrevRpcFrameDecoder(
     ) {
         decode(context, input, output)
         if (input.isReadable) {
-            throw TrevRpcException(Status.invalidArgument("framed stream ended with a partial frame"))
+            val error = TrevRpcException(Status.internal("framed stream ended with a partial frame"))
+            onPartialFrameAtEnd(error)
+            throw error
         }
     }
 }
@@ -196,7 +201,7 @@ internal class IncrementalFrameReader(
 
     fun finish() {
         if (headerBytes != 0 || body != null) {
-            throw TrevRpcException(Status.invalidArgument("framed stream ended with a partial frame"))
+            throw TrevRpcException(Status.internal("framed stream ended with a partial frame"))
         }
     }
 }

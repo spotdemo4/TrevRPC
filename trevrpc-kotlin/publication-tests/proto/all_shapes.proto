@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package trevrpc.publication;
+
+option java_multiple_files = true;
+option java_package = "zip.trev.trevrpc.publication";
+
+message Request {
+  string value = 1;
+}
+
+message Response {
+  string value = 1;
+}
+
+service AllShapes {
+  rpc Unary(Request) returns (Response);
+  rpc ServerStreaming(Request) returns (stream Response);
+  rpc ClientStreaming(stream Request) returns (Response);
+  rpc BidirectionalStreaming(stream Request) returns (stream Response);
+}

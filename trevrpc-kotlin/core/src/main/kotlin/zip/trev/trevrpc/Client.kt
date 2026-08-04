@@ -94,9 +94,9 @@ class Client(
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
-    ): Res = unaryEnvelope(service, method, request, requestCodec, responseCodec, options).message
+    ): Res = unaryResponse(service, method, request, requestCodec, responseCodec, options).message
 
-    suspend fun <Req, Res> unaryEnvelope(
+    suspend fun <Req, Res> unaryResponse(
         service: String,
         method: String,
         request: Req,
@@ -169,9 +169,16 @@ class Client(
     ): OpenedStream<Res> {
         val deadline = options.timeout?.let { TimeSource.Monotonic.markNow() + it }
         val stream = callWithDeadline(deadline, null) { transport.openStream(request) }
-        val writer = RequestWriter(stream, deadline)
-        if (finishSend) writer.finishSend()
-        return OpenedStream(writer, ResponseReader(stream, codec, options, deadline))
+        var committed = false
+        try {
+            if (finishSend) callWithDeadline(deadline, null) { stream.finishSend() }
+            val writer = RequestWriter(stream, deadline)
+            return OpenedStream(writer, ResponseReader(stream, codec, options, deadline)).also { committed = true }
+        } finally {
+            if (!committed) {
+                withContext(NonCancellable) { runCatching { stream.close() } }
+            }
+        }
     }
 }
 
@@ -253,17 +260,25 @@ class ClientStreamingCall<Req, Res> internal constructor(
             throw TrevRpcException(Status.failedPrecondition("client-streaming response was already received"))
         }
         closeSend()
-        val first =
-            reader.receive()
-                ?: throw TrevRpcException(Status.internal("response stream ended without a response message"))
-        val second = reader.receive()
-        if (second != null) {
-            reader.close()
+        var response: ResponseEnvelope<Res>? = null
+        var multipleResponses = false
+        while (true) {
+            val message = reader.receive() ?: break
+            if (response == null) {
+                response = ResponseEnvelope(message)
+            } else {
+                multipleResponses = true
+            }
+        }
+        if (response == null) {
+            throw TrevRpcException(Status.internal("response stream ended without a response message"))
+        }
+        if (multipleResponses) {
             throw TrevRpcException(
                 Status.internal("client-streaming RPC returned more than one response message"),
             )
         }
-        return ResponseEnvelope(first, reader.responseMetadata)
+        return ResponseEnvelope(response.message, reader.responseMetadata)
     }
 
     suspend fun close() {
@@ -336,7 +351,7 @@ internal class ResponseReader<T>(
 
                 null -> {
                     done = true
-                    throw TrevRpcException(Status.internal("response stream contained an unknown frame kind"))
+                    throw TrevRpcException(Status.invalidArgument("response stream contained an unknown frame kind"))
                 }
             }
         } catch (error: CancellationException) {
@@ -385,7 +400,7 @@ internal class ResponseReader<T>(
                     }
 
                     null -> {
-                        throw TrevRpcException(Status.internal("response stream contained an unknown frame kind"))
+                        throw TrevRpcException(Status.invalidArgument("response stream contained an unknown frame kind"))
                     }
                 }
             }
@@ -426,8 +441,18 @@ internal class ResponseReader<T>(
     }
 
     private suspend fun receiveStatus(frame: RpcStreamFrame): T? {
+        val status = frame.status
+        var trailingError: Throwable? = null
+        val trailing =
+            try {
+                callWithDeadline(deadline, options.streamIdleTimeout) { stream.receive() }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                trailingError = error
+                null
+            }
         done = true
-        terminalStatus = frame.status
         val closeError =
             try {
                 close()
@@ -437,8 +462,25 @@ internal class ResponseReader<T>(
             } catch (error: Throwable) {
                 error
             }
-        if (!frame.status.isOk) throw TrevRpcException(frame.status)
+        if (trailing != null) {
+            throw TrevRpcException(Status.internal("response stream contained data after final status"))
+        }
+        if (!status.isOk) {
+            terminalStatus = status
+            throw TrevRpcException(status).also { failure ->
+                trailingError?.let(failure::addSuppressed)
+                closeError?.let(failure::addSuppressed)
+            }
+        }
+        trailingError?.let { error ->
+            if (!error.isMalformedTrailingData()) throw error
+            throw TrevRpcException(
+                Status.internal("response stream contained data after final status"),
+                error,
+            )
+        }
         if (closeError != null) throw closeError
+        terminalStatus = status
         return null
     }
 }
@@ -475,6 +517,20 @@ private fun enforceBodyLimit(
         )
     }
 }
+
+private fun Throwable.isMalformedTrailingData(): Boolean =
+    when (this) {
+        is TrevRpcException -> {
+            status.code == Code.INTERNAL ||
+                status.code == Code.INVALID_ARGUMENT ||
+                status.code == Code.RESOURCE_EXHAUSTED ||
+                status.code == Code.DATA_LOSS
+        }
+
+        else -> {
+            true
+        }
+    }
 
 private fun <T> decodeResponse(
     codec: MessageCodec<T>,

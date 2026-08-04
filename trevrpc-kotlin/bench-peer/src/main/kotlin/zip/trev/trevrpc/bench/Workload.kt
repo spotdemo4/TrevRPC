@@ -45,7 +45,7 @@ internal class NativeBenchmarkClient(
     override suspend fun unary(request: BenchmarkRequest): BenchmarkResponse = client.unary(request)
 
     override suspend fun clientStream(requests: Flow<List<BenchmarkRequest>>): BenchmarkSummary {
-        val call = client.clientStreamCall()
+        val call = client.clientStreamResponse()
         try {
             requests.collect(call::sendBatch)
             call.closeSend()
@@ -57,7 +57,7 @@ internal class NativeBenchmarkClient(
 
     override fun serverStream(request: StreamRequest): Flow<BenchmarkResponse> =
         flow {
-            val call = client.serverStreamCall(request)
+            val call = client.serverStreamResponse(request)
             try {
                 while (true) {
                     val responses = call.receiveBatch()
@@ -71,7 +71,7 @@ internal class NativeBenchmarkClient(
 
     override fun bidi(requests: Flow<List<BenchmarkRequest>>): Flow<BenchmarkResponse> =
         flow {
-            val call = client.bidiCall()
+            val call = client.bidiResponse()
             try {
                 coroutineScope {
                     val sender =

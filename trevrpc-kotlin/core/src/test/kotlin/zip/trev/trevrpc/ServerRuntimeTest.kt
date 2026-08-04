@@ -1,6 +1,7 @@
 package zip.trev.trevrpc
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.collect
@@ -14,6 +15,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 class ServerRuntimeTest {
@@ -260,6 +262,33 @@ class ServerRuntimeTest {
             server.shutdown()
             val rejected = server.handleUnary(RpcRequest("svc", "blocked"))
             assertEquals(Code.UNAVAILABLE, rejected.status.code)
+        }
+
+    @Test
+    fun `shutdown cleanup survives first caller cancellation and remains shared`() =
+        runTest {
+            val entered = CompletableDeferred<Unit>()
+            val server =
+                Server(
+                    ServerOptions(
+                        gracefulShutdownTimeout = 20.milliseconds,
+                        forceShutdownTimeout = 1.seconds,
+                    ),
+                )
+            server.routeUnary("svc", "blocked") { _, _ ->
+                entered.complete(Unit)
+                awaitCancellation()
+            }
+            val active = async { server.handleUnary(RpcRequest("svc", "blocked")) }
+            entered.await()
+
+            val first = async(start = CoroutineStart.UNDISPATCHED) { server.shutdown() }
+            first.cancel()
+            val second = async(start = CoroutineStart.UNDISPATCHED) { server.shutdown() }
+
+            second.await()
+            assertTrue(active.isCancelled)
+            assertTrue(first.isCancelled)
         }
 
     @Test

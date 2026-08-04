@@ -1,10 +1,10 @@
 package example.`class`
 private val trevrpcCodec0: custom.rpc.MessageCodec<shared.`when`.Result> =
-        decode = { body -> shared.`when`.Result.parseFrom(body) },
+        decode = { body -> custom.rpc.decodeProtobuf(body, shared.`when`.Result.getDescriptor(), shared.`when`.Result::parseFrom) },
 private val trevrpcCodec1: custom.rpc.MessageCodec<example.`class`.ApiTypes.Envelope.Result> =
-        decode = { body -> example.`class`.ApiTypes.Envelope.Result.parseFrom(body) },
+        decode = { body -> custom.rpc.decodeProtobuf(body, example.`class`.ApiTypes.Envelope.Result.getDescriptor(), example.`class`.ApiTypes.Envelope.Result::parseFrom) },
 private val trevrpcCodec2: custom.rpc.MessageCodec<example.`class`.ApiTypes.Result> =
-        decode = { body -> example.`class`.ApiTypes.Result.parseFrom(body) },
+        decode = { body -> custom.rpc.decodeProtobuf(body, example.`class`.ApiTypes.Result.getDescriptor(), example.`class`.ApiTypes.Result::parseFrom) },
 private fun <T> decodeTrevrpcRequest(codec: custom.rpc.MessageCodec<T>, body: ByteArray): T =
             custom.rpc.Status.invalidArgument("failed to decode request: ${error.message ?: error.javaClass.simpleName}"),
 private fun requireTrevrpcKind(
@@ -18,18 +18,18 @@ public interface WhenService {
     public suspend fun `when`(
     public suspend fun nested(
 public class WhenClient(
-    public suspend fun whenEnvelope(
-        client.unaryEnvelope(WHEN_SERVICE_NAME, WHEN_WHEN_METHOD_NAME, request, trevrpcCodec0, trevrpcCodec1, options)
+    public suspend fun whenResponse(
+        client.unaryResponse(WHEN_SERVICE_NAME, WHEN_WHEN_METHOD_NAME, request, trevrpcCodec0, trevrpcCodec1, options)
     public suspend fun `when`(
-    public suspend fun nestedEnvelope(
-        client.unaryEnvelope(WHEN_SERVICE_NAME, WHEN_NESTED_METHOD_NAME, request, trevrpcCodec2, trevrpcCodec0, options)
+    public suspend fun nestedResponse(
+        client.unaryResponse(WHEN_SERVICE_NAME, WHEN_NESTED_METHOD_NAME, request, trevrpcCodec2, trevrpcCodec0, options)
     public suspend fun nested(
 public fun registerWhen(
     server.routeUnary(WHEN_SERVICE_NAME, WHEN_WHEN_METHOD_NAME) { context, body ->
         requireTrevrpcKind(context, WHEN_WHEN_RPC_KIND)
         val request = decodeTrevrpcRequest(trevrpcCodec0, body)
-        custom.rpc.ResponseEnvelope(trevrpcCodec1.encode(service.`when`(context, request)))
+        custom.rpc.ResponseEnvelope(trevrpcCodec1.encode(response.message), response.metadata)
     server.routeUnary(WHEN_SERVICE_NAME, WHEN_NESTED_METHOD_NAME) { context, body ->
         requireTrevrpcKind(context, WHEN_NESTED_RPC_KIND)
         val request = decodeTrevrpcRequest(trevrpcCodec2, body)
-        custom.rpc.ResponseEnvelope(trevrpcCodec0.encode(service.nested(context, request)))
+        custom.rpc.ResponseEnvelope(trevrpcCodec0.encode(response.message), response.metadata)

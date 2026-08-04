@@ -32,4 +32,5 @@ include(
     "protoc-gen-trevrpc-kotlin",
     "examples",
     "bench-peer",
+    "conformance-peer",
 )

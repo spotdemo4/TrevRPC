@@ -1,7 +1,6 @@
 # This is a Gradle generated file for dependency locking.
 # Manual edits can break the build and are not advised.
 # This file is expected to be part of source control.
-# To regenerate this file, run: ./gradlew :bench-peer:dependencies --write-locks
 com.google.android:annotations:4.1.1.4=compileProtoPath,runtimeClasspath,testCompileProtoPath,testRuntimeClasspath
 com.google.api.grpc:proto-google-common-protos:2.64.1=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
 com.google.code.findbugs:jsr305:3.0.2=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
@@ -25,19 +24,19 @@ io.grpc:grpc-util:1.83.1=compileProtoPath,runtimeClasspath,testCompileProtoPath,
 io.grpc:protoc-gen-grpc-java:1.82.2=protobufToolsLocator_grpc
 io.grpc:protoc-gen-grpc-java:1.83.1=grpcJavaCodegen
 io.grpc:protoc-gen-grpc-kotlin:1.5.0=protobufToolsLocator_grpckt
-io.netty:netty-bom:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-buffer:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-codec-base:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-codec-classes-quic:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-codec-compression:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-codec-http3:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-codec-http:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-bom:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-buffer:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-codec-base:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-codec-classes-quic:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-codec-compression:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-codec-http3:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-codec-http:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
 io.netty:netty-codec-native-quic:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-common:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-handler:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-resolver:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-transport-native-unix-common:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
-io.netty:netty-transport:4.2.16.Final=compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-common:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-handler:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-resolver:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-transport-native-unix-common:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+io.netty:netty-transport:4.2.16.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
 io.perfmark:perfmark-api:0.27.0=compileProtoPath,runtimeClasspath,testCompileProtoPath,testRuntimeClasspath
 javax.annotation:javax.annotation-api:1.3.2=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
 org.apiguardian:apiguardian-api:1.1.2=testCompileClasspath

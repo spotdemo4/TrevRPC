@@ -1,0 +1,22 @@
+Bundled third-party components
+==============================
+
+This inventory describes every external runtime artifact unpacked into the
+protoc-gen-trevrpc-kotlin jdk21 classifier. Entries are sorted by Maven
+coordinate.
+
+com.google.protobuf:protobuf-java:4.35.1
+  Project: Protocol Buffers
+  License: BSD 3-Clause
+  License file: META-INF/third-party/protobuf-java/LICENSE.txt
+
+org.jetbrains:annotations:13.0
+  Project: IntelliJ IDEA Annotations
+  License: Apache License 2.0
+  License file: META-INF/third-party/jetbrains-annotations/LICENSE.txt
+
+org.jetbrains.kotlin:kotlin-stdlib:2.4.10
+  Project: Kotlin Standard Library
+  License: Apache License 2.0
+  License file: META-INF/third-party/kotlin-stdlib/LICENSE.txt
+  Notice file: META-INF/third-party/kotlin-stdlib/NOTICE.txt

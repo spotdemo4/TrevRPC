@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package generator.compat.custom_extension;
+
+option java_package = "generator.compat.derived";
+option java_multiple_files = false;
+
+message custom_request {}
+message _custom_Response {}
+
+service CustomExtensionNaming {
+  rpc Call(custom_request) returns (_custom_Response);
+}

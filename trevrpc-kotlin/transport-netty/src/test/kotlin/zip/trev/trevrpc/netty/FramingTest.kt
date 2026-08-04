@@ -4,17 +4,20 @@ import io.netty.buffer.ByteBuf
 import io.netty.buffer.Unpooled
 import io.netty.channel.embedded.EmbeddedChannel
 import io.netty.handler.codec.quic.QuicStreamFrame
+import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.Code
+import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcStreamFrameKind
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
+import zip.trev.trevrpc.netty.advanced.writeNativeUnaryRequest
 
 class FramingTest {
     @Test
@@ -56,6 +59,26 @@ class FramingTest {
         val cause = generateSequence(error as Throwable?) { it.cause }.filterIsInstance<TrevRpcException>().first()
         assertEquals(Code.RESOURCE_EXHAUSTED, cause.status.code)
         runCatching { channel.finishAndReleaseAll() }
+    }
+
+    @Test
+    fun `both partial eof paths report internal`() {
+        val channel = EmbeddedChannel(TrevRpcFrameDecoder(8))
+        channel.writeInbound(Unpooled.wrappedBuffer(byteArrayOf(0, 0, 0)))
+        val channelError = assertThrows(Exception::class.java) { channel.finish() }
+        val channelCause =
+            generateSequence(channelError as Throwable?) { it.cause }
+                .filterIsInstance<TrevRpcException>()
+                .first()
+        assertEquals(Code.INTERNAL, channelCause.status.code)
+        runCatching { channel.finishAndReleaseAll() }
+
+        val reader = IncrementalFrameReader(8)
+        val partial = Unpooled.wrappedBuffer(byteArrayOf(0, 0, 0, 2, 1))
+        reader.feed(partial)
+        partial.release()
+        val readerError = assertThrows(TrevRpcException::class.java, reader::finish)
+        assertEquals(Code.INTERNAL, readerError.status.code)
     }
 
     @Test
@@ -110,4 +133,24 @@ class FramingTest {
         final.release()
         channel.finishAndReleaseAll()
     }
+
+    @Test
+    fun `native unary request writer sends request and FIN atomically`(): Unit =
+        runBlocking {
+            val channel = EmbeddedChannel()
+            val request = RpcRequest("test.Service", "Unary", byteArrayOf(1, 2, 3))
+
+            writeNativeUnaryRequest(channel, request, 128)
+
+            val final = channel.readOutbound<QuicStreamFrame>()
+            assertTrue(final.hasFin())
+            val encoded = ByteArray(final.content().readInt())
+            final.content().readBytes(encoded)
+            val decoded = WireCodec.decodeRequest(encoded)
+            assertEquals(request.service, decoded.service)
+            assertEquals(request.method, decoded.method)
+            assertArrayEquals(request.body, decoded.body)
+            final.release()
+            channel.finishAndReleaseAll()
+        }
 }

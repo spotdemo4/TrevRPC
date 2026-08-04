@@ -2,8 +2,10 @@ package zip.trev.trevrpc
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class WireCodecTest {
@@ -98,6 +100,35 @@ class WireCodecTest {
                 assertThrows(TrevRpcException::class.java) { WireCodec.decodeRequest(bytes) }.status.code,
             )
         }
+    }
+
+    @Test
+    fun `metadata validation remains distinguishable from malformed metadata utf8`() {
+        val invalidMetadata =
+            assertThrows(TrevRpcException::class.java) {
+                WireCodec.decodeResponse(
+                    byteArrayOf(
+                        0x22,
+                        0x13,
+                        0x0a,
+                        0x0d,
+                        *"Authorization".encodeToByteArray(),
+                        0x12,
+                        0x02,
+                        0x6f,
+                        0x6b,
+                    ),
+                )
+            }
+        assertEquals(Code.INVALID_ARGUMENT, invalidMetadata.status.code)
+        assertTrue(invalidMetadata.status.message.startsWith("invalid metadata:"))
+
+        val malformedKey =
+            assertThrows(TrevRpcException::class.java) {
+                WireCodec.decodeResponse(byteArrayOf(0x22, 0x03, 0x0a, 0x01, 0xff.toByte()))
+            }
+        assertEquals(Code.INVALID_ARGUMENT, malformedKey.status.code)
+        assertFalse(malformedKey.status.message.startsWith("invalid metadata:"))
     }
 
     @Test

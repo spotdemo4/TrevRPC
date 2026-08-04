@@ -119,7 +119,7 @@ class Metadata private constructor(
             condition: Boolean,
             message: () -> String,
         ) {
-            if (condition) throw TrevRpcException(Status.invalidArgument(message()))
+            if (condition) throw TrevRpcException(Status.invalidArgument("invalid metadata: ${message()}"))
         }
     }
 }
