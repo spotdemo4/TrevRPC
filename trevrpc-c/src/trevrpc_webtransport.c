@@ -4,6 +4,9 @@
 
 #include "trevrpc_msquic.h"
 
+#include "trevrpc_frame_internal.h"
+#include "trevrpc_msquic_internal.h"
+
 #include <errno.h> // IWYU pragma: keep
 #include <limits.h>
 #include <pthread.h>
@@ -160,11 +163,8 @@ struct trevrpc_h3_stream {
     uint8_t* trailer_block;
     size_t trailer_len;
     size_t trailer_offset;
-    uint8_t rpc_header[4];
-    size_t rpc_header_len;
-    uint8_t* rpc_body;
-    size_t rpc_body_len;
-    size_t rpc_body_offset;
+    trevrpc_frame_parser rpc_parser;
+    bool rpc_parser_initialized;
     bool trailers_seen;
     bool owns_msquic_stream;
 };
@@ -2882,6 +2882,31 @@ intptr_t trevrpc_wt_stream_read_frame(trevrpc_wt_stream* stream, uint8_t** body,
     return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
 }
 
+intptr_t trevrpc_wt_stream_read_frame_owned(trevrpc_wt_stream* stream, trevrpc_owned_bytes* body, size_t max_len) {
+    if (stream == NULL || body == NULL) {
+        return -EINVAL;
+    }
+    trevrpc_owned_bytes_init(body);
+    if (stream->msquic_stream == NULL) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    intptr_t n = trevrpc_msquic_stream_read_frame_owned(stream->msquic_stream, body, max_len);
+    return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
+}
+
+intptr_t trevrpc_wt_stream_read_frame_owned_timeout(
+    trevrpc_wt_stream* stream, trevrpc_owned_bytes* body, size_t max_len, uint64_t timeout_nanos) {
+    if (stream == NULL || body == NULL) {
+        return -EINVAL;
+    }
+    trevrpc_owned_bytes_init(body);
+    if (stream->msquic_stream == NULL) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    intptr_t n = trevrpc_msquic_stream_read_frame_owned_timeout(stream->msquic_stream, body, max_len, timeout_nanos);
+    return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
+}
+
 intptr_t trevrpc_wt_stream_read_frame_timeout(
     trevrpc_wt_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos) {
     if (stream == NULL || body == NULL || len == NULL) {
@@ -2893,6 +2918,19 @@ intptr_t trevrpc_wt_stream_read_frame_timeout(
         return TREV_WT_ERR_CLOSED;
     }
     intptr_t n = trevrpc_msquic_stream_read_frame_timeout(stream->msquic_stream, body, len, max_len, timeout_nanos);
+    return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
+}
+
+intptr_t trevrpc_wt_stream_read_frame_owned_ready(
+    trevrpc_wt_stream* stream, trevrpc_owned_bytes* body, size_t max_len) {
+    if (stream == NULL || body == NULL) {
+        return -EINVAL;
+    }
+    trevrpc_owned_bytes_init(body);
+    if (stream->msquic_stream == NULL) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    intptr_t n = trevrpc_msquic_stream_read_frame_owned_ready(stream->msquic_stream, body, max_len);
     return n < 0 ? trevrpc_wt_map_msquic_error((int)n) : n;
 }
 
@@ -2955,7 +2993,16 @@ int trevrpc_wt_stream_shutdown_send(trevrpc_wt_stream* stream) {
 }
 
 int trevrpc_wt_stream_abort(trevrpc_wt_stream* stream, uint32_t error_code) {
-    (void)error_code;
+    if (stream == NULL) {
+        return -EINVAL;
+    }
+    if (stream->msquic_stream == NULL) {
+        return TREV_WT_ERR_CLOSED;
+    }
+    return trevrpc_wt_map_msquic_error(trevrpc_msquic_stream_abort_with_error(stream->msquic_stream, error_code));
+}
+
+int trevrpc_wt_stream_abort_receive(trevrpc_wt_stream* stream) {
     if (stream == NULL) {
         return -EINVAL;
     }
@@ -3152,21 +3199,15 @@ static intptr_t trevrpc_h3_read_data(
     }
 }
 
-static size_t trevrpc_h3_rpc_frame_len(const uint8_t header[4]) {
-    return ((size_t)header[0] << 24) | ((size_t)header[1] << 16) | ((size_t)header[2] << 8) | (size_t)header[3];
-}
-
-static intptr_t trevrpc_h3_stream_read_frame_mode(trevrpc_h3_stream* stream,
-    uint8_t** body,
-    size_t* len,
+static intptr_t trevrpc_h3_stream_read_frame_owned_mode(trevrpc_h3_stream* stream,
+    trevrpc_owned_bytes* body,
     size_t max_len,
     trevrpc_h3_read_mode mode,
     uint64_t timeout_nanos) {
-    if (stream == NULL || body == NULL || len == NULL) {
+    if (stream == NULL || body == NULL) {
         return -EINVAL;
     }
-    *body = NULL;
-    *len = 0;
+    trevrpc_owned_bytes_init(body);
     uint64_t deadline = 0;
     if (mode == TREV_H3_READ_DEADLINE) {
         uint64_t now = trevrpc_h3_monotonic_nanos();
@@ -3175,53 +3216,111 @@ static intptr_t trevrpc_h3_stream_read_frame_mode(trevrpc_h3_stream* stream,
         }
         deadline = now + timeout_nanos;
     }
+    if (!stream->rpc_parser_initialized) {
+        trevrpc_frame_parser_init(&stream->rpc_parser, max_len);
+        stream->rpc_parser_initialized = true;
+    } else {
+        trevrpc_frame_parser_set_max_body_len(&stream->rpc_parser, max_len);
+    }
 
-    while (stream->rpc_header_len < sizeof(stream->rpc_header)) {
-        intptr_t n = trevrpc_h3_read_data(stream,
-            stream->rpc_header + stream->rpc_header_len,
-            sizeof(stream->rpc_header) - stream->rpc_header_len,
-            mode,
-            deadline);
+    uint8_t buffer[4096];
+    for (;;) {
+        size_t requested = sizeof(buffer);
+        if (stream->rpc_parser.skip_remaining > 0 && stream->rpc_parser.skip_remaining < requested) {
+            requested = stream->rpc_parser.skip_remaining;
+        } else if (stream->rpc_parser.header_len < sizeof(stream->rpc_parser.header)) {
+            requested = sizeof(stream->rpc_parser.header) - stream->rpc_parser.header_len;
+        } else if (stream->rpc_parser.body != NULL) {
+            size_t body_remaining = stream->rpc_parser.body_len - stream->rpc_parser.body_offset;
+            if (body_remaining < requested) {
+                requested = body_remaining;
+            }
+        }
+
+        intptr_t n = trevrpc_h3_read_data(stream, buffer, requested, mode, deadline);
         if (n == 0) {
-            return stream->rpc_header_len == 0 ? 0 : TREV_WT_ERR_CLOSED;
+            return trevrpc_frame_parser_finish(&stream->rpc_parser) == TREVRPC_FRAME_CLEAN_EOF ? 0 : TREV_WT_ERR_CLOSED;
         }
         if (n < 0) {
             return n;
         }
-        stream->rpc_header_len += (size_t)n;
-    }
-    if (stream->rpc_body == NULL) {
-        stream->rpc_body_len = trevrpc_h3_rpc_frame_len(stream->rpc_header);
-        if (stream->rpc_body_len > max_len) {
-            return TREV_WT_ERR_FRAME_TOO_LARGE;
+
+        size_t offset = 0;
+        while (offset < (size_t)n) {
+            size_t consumed = 0;
+            size_t declared_body_len = 0;
+            trevrpc_frame_result result = trevrpc_frame_parser_consume_owned(
+                &stream->rpc_parser, buffer + offset, (size_t)n - offset, &consumed, body, &declared_body_len);
+            (void)declared_body_len;
+            offset += consumed;
+            if (result == TREVRPC_FRAME_READY) {
+                return 1;
+            }
+            if (result == TREVRPC_FRAME_TOO_LARGE) {
+                return TREV_WT_ERR_FRAME_TOO_LARGE;
+            }
+            if (result == TREVRPC_FRAME_ALLOCATION_FAILURE) {
+                return -ENOMEM;
+            }
+            if (result != TREVRPC_FRAME_NEED_MORE) {
+                return TREV_WT_ERR_CLOSED;
+            }
+            if (consumed == 0) {
+                return TREV_WT_ERR_CLOSED;
+            }
         }
-        stream->rpc_body = malloc(stream->rpc_body_len == 0 ? 1 : stream->rpc_body_len);
-        if (stream->rpc_body == NULL) {
+    }
+}
+
+intptr_t trevrpc_h3_stream_read_frame_owned(trevrpc_h3_stream* stream, trevrpc_owned_bytes* body, size_t max_len) {
+    return trevrpc_h3_stream_read_frame_owned_mode(stream, body, max_len, TREV_H3_READ_BLOCK, 0);
+}
+
+intptr_t trevrpc_h3_stream_read_frame_owned_timeout(
+    trevrpc_h3_stream* stream, trevrpc_owned_bytes* body, size_t max_len, uint64_t timeout_nanos) {
+    return timeout_nanos == 0
+               ? trevrpc_h3_stream_read_frame_owned(stream, body, max_len)
+               : trevrpc_h3_stream_read_frame_owned_mode(stream, body, max_len, TREV_H3_READ_DEADLINE, timeout_nanos);
+}
+
+intptr_t trevrpc_h3_stream_read_frame_owned_ready(
+    trevrpc_h3_stream* stream, trevrpc_owned_bytes* body, size_t max_len) {
+    return trevrpc_h3_stream_read_frame_owned_mode(stream, body, max_len, TREV_H3_READ_READY, 0);
+}
+
+static intptr_t trevrpc_h3_stream_read_frame_mode(trevrpc_h3_stream* stream,
+    uint8_t** body,
+    size_t* len,
+    size_t max_len,
+    trevrpc_h3_read_mode mode,
+    uint64_t timeout_nanos) {
+    if (body == NULL || len == NULL) {
+        return -EINVAL;
+    }
+    *body = NULL;
+    *len = 0;
+    trevrpc_owned_bytes owned;
+    intptr_t result = trevrpc_h3_stream_read_frame_owned_mode(stream, &owned, max_len, mode, timeout_nanos);
+    if (result <= 0) {
+        return result;
+    }
+    *len = owned.len;
+    if (owned.owner == (void*)owned.data && owned.release == trevrpc_frame_default_free &&
+        owned.release_context == NULL) {
+        *body = (uint8_t*)owned.data;
+        trevrpc_owned_bytes_init(&owned);
+        return result;
+    }
+    if (owned.len > 0) {
+        *body = malloc(owned.len);
+        if (*body == NULL) {
+            trevrpc_owned_bytes_reset(&owned);
             return -ENOMEM;
         }
+        memcpy(*body, owned.data, owned.len);
     }
-    while (stream->rpc_body_offset < stream->rpc_body_len) {
-        intptr_t n = trevrpc_h3_read_data(stream,
-            stream->rpc_body + stream->rpc_body_offset,
-            stream->rpc_body_len - stream->rpc_body_offset,
-            mode,
-            deadline);
-        if (n == 0) {
-            return TREV_WT_ERR_CLOSED;
-        }
-        if (n < 0) {
-            return n;
-        }
-        stream->rpc_body_offset += (size_t)n;
-    }
-
-    *body = stream->rpc_body;
-    *len = stream->rpc_body_len;
-    stream->rpc_body = NULL;
-    stream->rpc_body_len = 0;
-    stream->rpc_body_offset = 0;
-    stream->rpc_header_len = 0;
-    return 1;
+    trevrpc_owned_bytes_reset(&owned);
+    return result;
 }
 
 intptr_t trevrpc_h3_stream_read_frame(trevrpc_h3_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
@@ -3293,10 +3392,18 @@ int trevrpc_h3_stream_abort(trevrpc_h3_stream* stream) {
                : trevrpc_wt_map_msquic_error(trevrpc_msquic_stream_abort(stream->msquic_stream));
 }
 
+int trevrpc_h3_stream_abort_receive(trevrpc_h3_stream* stream) {
+    return stream == NULL || stream->msquic_stream == NULL
+               ? -EINVAL
+               : trevrpc_wt_map_msquic_error(trevrpc_msquic_stream_abort_receive(stream->msquic_stream));
+}
+
 void trevrpc_h3_stream_close(trevrpc_h3_stream* stream) {
     if (stream != NULL) {
         free(stream->trailer_block);
-        free(stream->rpc_body);
+        if (stream->rpc_parser_initialized) {
+            trevrpc_frame_parser_reset(&stream->rpc_parser);
+        }
         if (stream->owns_msquic_stream) {
             trevrpc_msquic_stream_close(stream->msquic_stream);
         }

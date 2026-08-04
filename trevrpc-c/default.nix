@@ -12,11 +12,13 @@
   repoRoot,
   benchPeer ? false,
   sanitizers ? false,
+  threadSanitizer ? false,
 }:
+assert !(sanitizers && threadSanitizer);
 stdenv.mkDerivation (
   final: with lib; {
     pname = if benchPeer then "trevrpc-c-bench-peer" else "trevrpc-c";
-    version = "0.1.0";
+    version = "0.2.0";
     outputs =
       if benchPeer then
         [ "out" ]
@@ -46,7 +48,8 @@ stdenv.mkDerivation (
             -DCMAKE_INSTALL_BINDIR="$out/bin" \
             -DTREVRPC_BUILD_BENCHMARKS=ON \
             -DTREVRPC_BUILD_TESTS=ON \
-            -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"}
+            -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
+            -DTREVRPC_ENABLE_THREAD_SANITIZER=${if threadSanitizer then "ON" else "OFF"}
           runHook postConfigure
         ''
       else
@@ -62,7 +65,8 @@ stdenv.mkDerivation (
             -DTREVRPC_INSTALL_PKGCONFIGDIR="$dev/lib/pkgconfig" \
             -DTREVRPC_BUILD_BENCHMARKS=OFF \
             -DTREVRPC_BUILD_TESTS=ON \
-            -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"}
+            -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
+            -DTREVRPC_ENABLE_THREAD_SANITIZER=${if threadSanitizer then "ON" else "OFF"}
           runHook postConfigure
         '';
 
@@ -94,10 +98,15 @@ stdenv.mkDerivation (
         ''
           runHook preCheck
           export HOME=$TMPDIR
-          clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' \))
-          clang-tidy --quiet $(find examples src tests tools -name '*.c') -- \
+          clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' -o -name '*.cpp' \))
+          clang-tidy --quiet $(find examples src tests tools -name '*.c' \
+            ! -path 'tests/abi5/*' \
+            ! -path 'tests/golden/*' \
+            ! -path 'tests/install/*') -- \
             -x c \
             -std=c11 \
+            -DQUIC_API_ENABLE_PREVIEW_FEATURES \
+            -DTREVRPC_GENERATED_TESTING \
             -Iinclude \
             -Isrc \
             -Ibuild/protoc-gen-trevrpc-c-protos \
@@ -120,6 +129,7 @@ stdenv.mkDerivation (
       test -x "$out/bin/protoc-gen-trevrpc-c"
       test ! -e "$out/bin/trevrpc-bench-peer-c"
       test -f "$dev/include/trevrpc_binding.h"
+      test ! -e "$dev/include/trevrpc_preview.h"
       test -f "$dev/lib/cmake/trevrpc/trevrpcConfig.cmake"
       test -f "$dev/lib/pkgconfig/trevrpc.pc"
       test -f "$lib/lib/libtrevrpc.a"
@@ -132,6 +142,48 @@ stdenv.mkDerivation (
       test "$(pkg-config \
         --define-prefix \
         --variable=includedir "$dev/lib/pkgconfig/trevrpc.pc")" = "$dev/include"
+      test "$(pkg-config \
+        --define-prefix \
+        --variable=trevrpc_c_abi_version "$dev/lib/pkgconfig/trevrpc.pc")" = "6"
+
+      consumer_sanitizer_flags="${optionalString sanitizers "-fsanitize=address,undefined -fno-omit-frame-pointer"}${optionalString threadSanitizer "-fsanitize=thread -fno-omit-frame-pointer"}"
+      export CFLAGS="$consumer_sanitizer_flags''${CFLAGS:+ $CFLAGS}"
+      export LDFLAGS="$consumer_sanitizer_flags''${LDFLAGS:+ $LDFLAGS}"
+      cmake -S tests/install/cmake -B "$TMPDIR/trevrpc-installed-cmake" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="$dev;$lib" \
+        -DTREVRPC_C_GENERATOR_EXECUTABLE="$out/bin/protoc-gen-trevrpc-c"
+      cmake --build "$TMPDIR/trevrpc-installed-cmake"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-cmake-consumer"
+
+      export PKG_CONFIG_PATH="$dev/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      pkg_codegen="$TMPDIR/trevrpc-installed-pkg-config-codegen"
+      mkdir -p "$pkg_codegen"
+      protoc-c -I tests/install/codegen --c_out="$pkg_codegen" tests/install/codegen/greeter.proto
+      protoc -I tests/install/codegen \
+        --plugin=protoc-gen-trevrpc-c="$out/bin/protoc-gen-trevrpc-c" \
+        --trevrpc-c_out="$pkg_codegen" tests/install/codegen/greeter.proto
+      cc $consumer_sanitizer_flags \
+        -I"$pkg_codegen" \
+        tests/install/codegen/main.c \
+        "$pkg_codegen/greeter.pb-c.c" \
+        "$pkg_codegen/greeter.trevrpc.c" \
+        -o "$TMPDIR/trevrpc-installed-pkg-config-consumer" \
+        $(pkg-config --static --cflags --libs trevrpc libprotobuf-c)
+      "$TMPDIR/trevrpc-installed-pkg-config-consumer"
+
+      syntax_codegen="$TMPDIR/trevrpc-installed-direct-codegen"
+      mkdir -p "$syntax_codegen"
+      protoc-c -I tests/install/codegen --c_out="$syntax_codegen" tests/install/codegen/greeter.proto
+      protoc -I tests/install/codegen \
+        --plugin=protoc-gen-trevrpc-c="$out/bin/protoc-gen-trevrpc-c" \
+        --trevrpc-c_out="$syntax_codegen" tests/install/codegen/greeter.proto
+      cc -std=c11 -Wall -Wextra -Werror -fsyntax-only \
+        -I"$syntax_codegen" \
+        $(pkg-config --cflags trevrpc libprotobuf-c) \
+        tests/install/codegen/main.c \
+        "$syntax_codegen/greeter.pb-c.c" \
+        "$syntax_codegen/greeter.trevrpc.c"
       runHook postInstallCheck
     '';
 

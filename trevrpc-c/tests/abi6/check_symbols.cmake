@@ -1,0 +1,142 @@
+if(NOT DEFINED TREVRPC_NM OR NOT DEFINED TREVRPC_ARCHIVES)
+    message(FATAL_ERROR "TREVRPC_NM and TREVRPC_ARCHIVES are required")
+endif()
+
+function(read_manifest path output)
+    file(STRINGS "${path}" lines)
+    set(values "")
+    foreach(line IN LISTS lines)
+        string(STRIP "${line}" line)
+        if(NOT line STREQUAL "" AND NOT line MATCHES "^#")
+            list(APPEND values "${line}")
+        endif()
+    endforeach()
+    list(SORT values)
+    set(${output} "${values}" PARENT_SCOPE)
+endfunction()
+
+function(unique_list input output duplicates_output)
+    set(unique "")
+    set(duplicates "")
+    foreach(value IN LISTS ${input})
+        if(value IN_LIST unique)
+            list(APPEND duplicates "${value}")
+        else()
+            list(APPEND unique "${value}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES duplicates)
+    set(${output} "${unique}" PARENT_SCOPE)
+    set(${duplicates_output} "${duplicates}" PARENT_SCOPE)
+endfunction()
+
+read_manifest("${CMAKE_CURRENT_LIST_DIR}/public-symbols.txt" public_manifest_symbols)
+read_manifest("${CMAKE_CURRENT_LIST_DIR}/internal-symbols.txt" internal_manifest_symbols)
+read_manifest("${CMAKE_CURRENT_LIST_DIR}/removed-symbols.txt" removed_manifest_symbols)
+unique_list(public_manifest_symbols public_symbols public_manifest_duplicates)
+unique_list(internal_manifest_symbols internal_symbols internal_manifest_duplicates)
+unique_list(removed_manifest_symbols removed_symbols removed_manifest_duplicates)
+
+set(classification_overlap "")
+foreach(symbol IN LISTS public_symbols)
+    if(symbol IN_LIST internal_symbols)
+        list(APPEND classification_overlap "${symbol}")
+    endif()
+endforeach()
+
+execute_process(
+    COMMAND "${TREVRPC_NM}" -g --defined-only ${TREVRPC_ARCHIVES}
+    RESULT_VARIABLE nm_result
+    OUTPUT_VARIABLE nm_output
+    ERROR_VARIABLE nm_error
+)
+if(NOT nm_result EQUAL 0)
+    message(FATAL_ERROR "nm failed: ${nm_error}")
+endif()
+
+string(REPLACE "\n" ";" nm_lines "${nm_output}")
+set(actual_symbol_occurrences "")
+foreach(line IN LISTS nm_lines)
+    if(line MATCHES "[ \t][TDBR][ \t]+(trevrpc_[A-Za-z0-9_]+)$")
+        list(APPEND actual_symbol_occurrences "${CMAKE_MATCH_1}")
+    endif()
+endforeach()
+set(actual_symbols ${actual_symbol_occurrences})
+list(REMOVE_DUPLICATES actual_symbols)
+list(SORT actual_symbols)
+
+set(public_wrong_counts "")
+foreach(symbol IN LISTS public_symbols)
+    set(count 0)
+    foreach(actual IN LISTS actual_symbol_occurrences)
+        if("${actual}" STREQUAL "${symbol}")
+            math(EXPR count "${count} + 1")
+        endif()
+    endforeach()
+    if(NOT count EQUAL 1)
+        list(APPEND public_wrong_counts "${symbol}=${count}")
+    endif()
+endforeach()
+
+set(header_symbols "")
+foreach(header IN LISTS TREVRPC_PUBLIC_HEADERS)
+    if(NOT EXISTS "${header}")
+        message(FATAL_ERROR "public header does not exist: ${header}")
+    endif()
+    file(READ "${header}" header_text)
+    string(REGEX MATCHALL "trevrpc_[A-Za-z0-9_]+[ \t\r\n]*\\(" declarations "${header_text}")
+    foreach(declaration IN LISTS declarations)
+        string(REGEX MATCH "trevrpc_[A-Za-z0-9_]+" symbol "${declaration}")
+        list(APPEND header_symbols "${symbol}")
+    endforeach()
+endforeach()
+list(REMOVE_DUPLICATES header_symbols)
+set(unclassified_header_symbols "")
+foreach(symbol IN LISTS header_symbols)
+    if(NOT symbol IN_LIST public_symbols)
+        list(APPEND unclassified_header_symbols "${symbol}")
+    endif()
+endforeach()
+
+set(expected_symbols ${public_symbols} ${internal_symbols})
+list(REMOVE_DUPLICATES expected_symbols)
+list(SORT expected_symbols)
+
+set(unclassified ${actual_symbols})
+foreach(symbol IN LISTS expected_symbols)
+    list(REMOVE_ITEM unclassified "${symbol}")
+endforeach()
+set(missing ${expected_symbols})
+foreach(symbol IN LISTS actual_symbols)
+    list(REMOVE_ITEM missing "${symbol}")
+endforeach()
+set(resurrected "")
+foreach(symbol IN LISTS removed_symbols)
+    if(symbol IN_LIST actual_symbols)
+        list(APPEND resurrected "${symbol}")
+    endif()
+endforeach()
+
+if(public_manifest_duplicates OR internal_manifest_duplicates OR removed_manifest_duplicates OR classification_overlap OR
+    public_wrong_counts OR unclassified_header_symbols OR unclassified OR missing OR resurrected)
+    list(JOIN public_manifest_duplicates ", " public_manifest_duplicates_text)
+    list(JOIN internal_manifest_duplicates ", " internal_manifest_duplicates_text)
+    list(JOIN removed_manifest_duplicates ", " removed_manifest_duplicates_text)
+    list(JOIN classification_overlap ", " classification_overlap_text)
+    list(JOIN public_wrong_counts ", " public_wrong_counts_text)
+    list(JOIN unclassified_header_symbols ", " unclassified_header_symbols_text)
+    list(JOIN unclassified ", " unclassified_text)
+    list(JOIN missing ", " missing_text)
+    list(JOIN resurrected ", " resurrected_text)
+    message(FATAL_ERROR
+        "ABI-6 symbol classification failed\n"
+        "duplicate public manifest entries: ${public_manifest_duplicates_text}\n"
+        "duplicate internal manifest entries: ${internal_manifest_duplicates_text}\n"
+        "duplicate removed manifest entries: ${removed_manifest_duplicates_text}\n"
+        "public/internal overlap: ${classification_overlap_text}\n"
+        "public symbol occurrence counts other than one: ${public_wrong_counts_text}\n"
+        "installed-header functions absent from public manifest: ${unclassified_header_symbols_text}\n"
+        "unclassified: ${unclassified_text}\n"
+        "missing: ${missing_text}\n"
+        "removed but exported: ${resurrected_text}")
+endif()

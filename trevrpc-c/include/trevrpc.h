@@ -12,7 +12,7 @@ extern "C" {
 
 #define TREVRPC_ALPN "trevrpc/1"
 #define TREVRPC_WIRE_VERSION 1u
-#define TREVRPC_C_ABI_VERSION 5u
+#define TREVRPC_C_ABI_VERSION 6u
 #define TREVRPC_DEFAULT_MAX_FRAME_SIZE (4u * 1024u * 1024u)
 
 #define TREVRPC_MAX_METADATA_ENTRIES 64u
@@ -112,67 +112,6 @@ typedef int (*trevrpc_http3_admission)(void* user_data, const trevrpc_http3_admi
 
 #define TREVRPC_CALL_DEFERRED 1
 
-typedef struct trevrpc_config {
-    const char* cert_file;
-    const char* key_file;
-    const char* ca_cert_file;
-    int skip_certificate_validation;
-    uint64_t max_idle_timeout_ms;
-    uint32_t keep_alive_ms;
-    uint16_t peer_bidi_stream_count;
-    uint32_t max_stateless_operations;
-    uint16_t max_binding_stateless_operations;
-    size_t max_pending_send_bytes;
-    size_t max_pending_send_count;
-    size_t max_frame_size;
-    uint32_t stream_recv_window;
-    uint32_t conn_flow_control_window;
-    trevrpc_msquic_execution_profile msquic_execution_profile;
-    int msquic_send_buffering_enabled;
-} trevrpc_config;
-
-typedef struct trevrpc_server_config {
-    const char* host;
-    uint16_t port;
-    const char* cert_file;
-    const char* key_file;
-    const char* webtransport_path;
-    const char* webtransport_origin;
-    trevrpc_webtransport_admission webtransport_admission;
-    void* webtransport_admission_user_data;
-    int enable_http3;
-    const char* http3_path;
-    trevrpc_http3_admission http3_admission;
-    void* http3_admission_user_data;
-    uint64_t max_idle_timeout_ms;
-    uint32_t keep_alive_ms;
-    uint16_t peer_bidi_stream_count;
-    uint32_t max_stateless_operations;
-    uint16_t max_binding_stateless_operations;
-    size_t max_pending_send_bytes;
-    size_t max_pending_send_count;
-    uint32_t max_sessions_per_connection;
-    uint32_t max_streams_per_session;
-    uint32_t stream_recv_window;
-    uint32_t conn_flow_control_window;
-    size_t max_frame_size;
-    trevrpc_msquic_execution_profile msquic_execution_profile;
-    int msquic_send_buffering_enabled;
-} trevrpc_server_config;
-
-typedef struct trevrpc_server_options {
-    int64_t max_concurrent_connections;
-    int64_t max_concurrent_streams_per_connection;
-    int64_t max_concurrent_requests;
-    int64_t worker_count;
-    int64_t worker_queue_capacity;
-    uint64_t graceful_shutdown_timeout_nanos;
-    uint64_t initial_request_timeout_nanos;
-    int64_t max_stream_messages;
-    int64_t max_stream_body_size;
-    uint64_t stream_idle_timeout_nanos;
-} trevrpc_server_options;
-
 typedef struct trevrpc_metadata_entry {
     char* key;
     size_t key_len;
@@ -204,7 +143,117 @@ typedef struct trevrpc_request {
     uint64_t timeout_nanos;
 } trevrpc_request;
 
-typedef struct trevrpc_call_options {
+#define TREVRPC_STRUCT_VERSION_1 1u
+#define TREVRPC_DEADLINE_INFINITE UINT64_MAX
+
+#define TREVRPC_REQUEST_BODY_COPY 0u
+#define TREVRPC_REQUEST_BODY_BORROW_UNTIL_RETURN 1u
+
+#define TREVRPC_SERVER_PHASE_CONFIGURING 0u
+#define TREVRPC_SERVER_PHASE_FROZEN 1u
+#define TREVRPC_SERVER_PHASE_SERVING 2u
+#define TREVRPC_SERVER_PHASE_STOPPING 3u
+#define TREVRPC_SERVER_PHASE_CANCELLING 4u
+#define TREVRPC_SERVER_PHASE_STOPPED 5u
+
+/*
+ * Inbound response and stream-frame shells own their message, metadata, and body
+ * until released. Message and metadata views remain valid until shell release.
+ * A shell body view remains valid until the body is taken or the shell is
+ * released. Getters, body take, and release must not be called concurrently on
+ * the same object. Shell release functions accept NULL.
+ */
+typedef struct trevrpc_inbound_response trevrpc_inbound_response;
+typedef struct trevrpc_inbound_stream_frame trevrpc_inbound_stream_frame;
+
+/*
+ * A body-owner view remains valid until owner release. Releasing an owner
+ * invokes the original allocator-specific release callback with the original
+ * allocation owner and release context. Owner release accepts NULL and must not
+ * be called concurrently with a getter or another release on the same owner.
+ */
+typedef struct trevrpc_body_owner trevrpc_body_owner;
+
+typedef struct trevrpc_bytes_view {
+    const uint8_t* data;
+    size_t len;
+} trevrpc_bytes_view;
+
+typedef struct trevrpc_client_config_v1 {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    const char* cert_file;
+    const char* key_file;
+    const char* ca_cert_file;
+    int skip_certificate_validation;
+    uint64_t max_idle_timeout_ms;
+    uint32_t keep_alive_ms;
+    uint16_t peer_bidi_stream_count;
+    uint32_t max_stateless_operations;
+    uint16_t max_binding_stateless_operations;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
+    size_t max_frame_size;
+    uint32_t stream_recv_window;
+    uint32_t conn_flow_control_window;
+    trevrpc_msquic_execution_profile msquic_execution_profile;
+    int msquic_send_buffering_enabled;
+} trevrpc_client_config_v1;
+
+typedef struct trevrpc_server_config_v1 {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    const char* host;
+    uint16_t port;
+    const char* cert_file;
+    const char* key_file;
+    const char* webtransport_path;
+    const char* webtransport_origin;
+    trevrpc_webtransport_admission webtransport_admission;
+    void* webtransport_admission_user_data;
+    int enable_http3;
+    const char* http3_path;
+    trevrpc_http3_admission http3_admission;
+    void* http3_admission_user_data;
+    uint64_t max_idle_timeout_ms;
+    uint32_t keep_alive_ms;
+    uint16_t peer_bidi_stream_count;
+    uint32_t max_stateless_operations;
+    uint16_t max_binding_stateless_operations;
+    size_t max_pending_send_bytes;
+    size_t max_pending_send_count;
+    uint32_t max_sessions_per_connection;
+    uint32_t max_streams_per_session;
+    uint32_t stream_recv_window;
+    uint32_t conn_flow_control_window;
+    size_t max_frame_size;
+    trevrpc_msquic_execution_profile msquic_execution_profile;
+    int msquic_send_buffering_enabled;
+} trevrpc_server_config_v1;
+
+typedef struct trevrpc_server_options_v1 {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    int64_t max_concurrent_connections;
+    int64_t max_concurrent_streams_per_connection;
+    int64_t max_concurrent_requests;
+    int64_t worker_count;
+    int64_t worker_queue_capacity;
+    uint64_t graceful_shutdown_timeout_nanos;
+    uint64_t initial_request_timeout_nanos;
+    int64_t max_stream_messages;
+    int64_t max_stream_body_size;
+    uint64_t stream_idle_timeout_nanos;
+} trevrpc_server_options_v1;
+
+/*
+ * With TREVRPC_REQUEST_BODY_BORROW_UNTIL_RETURN, the request descriptor and all
+ * storage it references are borrowed only until the client call or stream-start
+ * function returns.
+ */
+typedef struct trevrpc_call_options_v1 {
+    uint32_t struct_size;
+    uint32_t struct_version;
     const trevrpc_metadata* metadata;
     uint64_t timeout_nanos;
     trevrpc_cancellation* cancellation;
@@ -212,36 +261,41 @@ typedef struct trevrpc_call_options {
     int64_t max_response_messages;
     int64_t max_response_stream_body_size;
     uint64_t response_idle_timeout_nanos;
-} trevrpc_call_options;
+    uint32_t request_body_lifetime;
+    uint32_t reserved0;
+} trevrpc_call_options_v1;
 
-typedef struct trevrpc_response {
+/*
+ * Storage referenced by response and status views is borrowed only until the
+ * called borrowed-response or borrowed-status function returns.
+ */
+typedef struct trevrpc_response_view_v1 {
+    uint32_t struct_size;
+    uint32_t struct_version;
     uint32_t status;
-    char* message;
+    uint32_t reserved0;
+    const char* message;
     size_t message_len;
-    uint8_t* body;
+    const uint8_t* body;
     size_t body_len;
-    trevrpc_metadata metadata;
-    uint8_t* _body_owner;
-} trevrpc_response;
+    const trevrpc_metadata* metadata;
+} trevrpc_response_view_v1;
 
-typedef struct trevrpc_stream_frame {
-    uint32_t kind;
+typedef struct trevrpc_status_view_v1 {
+    uint32_t struct_size;
+    uint32_t struct_version;
     uint32_t status;
-    char* message;
+    uint32_t reserved0;
+    const char* message;
     size_t message_len;
-    uint8_t* body;
-    size_t body_len;
-    trevrpc_metadata metadata;
-    uint8_t* _body_owner;
-} trevrpc_stream_frame;
+    const trevrpc_metadata* metadata;
+} trevrpc_status_view_v1;
 
-typedef int (*trevrpc_unary_handler)(
-    void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_response* response);
 typedef int (*trevrpc_stream_handler)(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_stream* stream);
 /*
  * Binding-oriented handler surface. Handlers must complete the call with
- * trevrpc_call_respond, trevrpc_call_finish_stream, or trevrpc_call_close.
+ * trevrpc_call_respond_borrowed_v1, trevrpc_call_finish_stream, or trevrpc_call_close.
  * Return TREVRPC_CALL_DEFERRED or call trevrpc_call_defer before handing the
  * call to another runtime thread.
  */
@@ -347,11 +401,9 @@ typedef struct trevrpc_channel_event {
 
 typedef void (*trevrpc_channel_lifecycle_callback)(void* user_data, const trevrpc_channel_event* event);
 
-trevrpc_config trevrpc_default_config(void);
-trevrpc_server_config trevrpc_default_server_config(void);
-trevrpc_server_options trevrpc_default_server_options(void);
-trevrpc_call_options trevrpc_default_call_options(void);
 uint32_t trevrpc_c_abi_version(void);
+/* Link-time anchor for consumers that require the ABI-6 runtime. */
+void trevrpc_c_abi_6_anchor(void);
 
 int trevrpc_call_context_has_deadline(const trevrpc_call_context* context);
 int trevrpc_call_context_deadline_expired(const trevrpc_call_context* context);
@@ -395,79 +447,85 @@ int trevrpc_channel_options_set_lifecycle_callback(
     trevrpc_channel_options* options, trevrpc_channel_lifecycle_callback callback, void* user_data);
 void trevrpc_channel_options_free(trevrpc_channel_options* options);
 /* Blocks until the initial connection is ready. A zero timeout waits indefinitely. */
-int trevrpc_channel_connect(const char* host,
+
+int trevrpc_inbound_response_get_status(const trevrpc_inbound_response* response, uint32_t* status);
+int trevrpc_inbound_response_get_message(const trevrpc_inbound_response* response, trevrpc_bytes_view* message);
+int trevrpc_inbound_response_get_body(const trevrpc_inbound_response* response, trevrpc_bytes_view* body);
+size_t trevrpc_inbound_response_metadata_count(const trevrpc_inbound_response* response);
+int trevrpc_inbound_response_metadata_at(
+    const trevrpc_inbound_response* response, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* value);
+int trevrpc_inbound_response_take_body(trevrpc_inbound_response* response, trevrpc_body_owner** owner);
+void trevrpc_inbound_response_release(trevrpc_inbound_response* response);
+
+int trevrpc_inbound_stream_frame_get_kind(const trevrpc_inbound_stream_frame* frame, uint32_t* kind);
+int trevrpc_inbound_stream_frame_get_status(const trevrpc_inbound_stream_frame* frame, uint32_t* status);
+int trevrpc_inbound_stream_frame_get_message(const trevrpc_inbound_stream_frame* frame, trevrpc_bytes_view* message);
+int trevrpc_inbound_stream_frame_get_body(const trevrpc_inbound_stream_frame* frame, trevrpc_bytes_view* body);
+size_t trevrpc_inbound_stream_frame_metadata_count(const trevrpc_inbound_stream_frame* frame);
+int trevrpc_inbound_stream_frame_metadata_at(
+    const trevrpc_inbound_stream_frame* frame, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* value);
+int trevrpc_inbound_stream_frame_take_body(trevrpc_inbound_stream_frame* frame, trevrpc_body_owner** owner);
+void trevrpc_inbound_stream_frame_release(trevrpc_inbound_stream_frame* frame);
+
+int trevrpc_body_owner_get_view(const trevrpc_body_owner* owner, trevrpc_bytes_view* body);
+void trevrpc_body_owner_release(trevrpc_body_owner* owner);
+
+int trevrpc_client_config_v1_init(trevrpc_client_config_v1* config, size_t struct_size);
+int trevrpc_server_config_v1_init(trevrpc_server_config_v1* config, size_t struct_size);
+int trevrpc_server_options_v1_init(trevrpc_server_options_v1* options, size_t struct_size);
+int trevrpc_call_options_v1_init(trevrpc_call_options_v1* options, size_t struct_size);
+int trevrpc_response_view_v1_init(trevrpc_response_view_v1* response, size_t struct_size);
+int trevrpc_status_view_v1_init(trevrpc_status_view_v1* status, size_t struct_size);
+
+int trevrpc_channel_connect_v1(const char* host,
     uint16_t port,
-    const trevrpc_config* config,
+    const trevrpc_client_config_v1* config,
     const trevrpc_channel_options* options,
     uint64_t timeout_nanos,
     trevrpc_cancellation* cancellation,
     trevrpc_channel** channel);
+
+int trevrpc_server_listen_v1(const trevrpc_server_config_v1* config, trevrpc_server** server);
+int trevrpc_server_set_options_v1(trevrpc_server* server, const trevrpc_server_options_v1* options);
+int trevrpc_server_get_options_v1(trevrpc_server* server, trevrpc_server_options_v1* options);
+
+int trevrpc_channel_call_request_inbound_v1(trevrpc_channel* channel,
+    const trevrpc_request* request,
+    const trevrpc_call_options_v1* options,
+    trevrpc_inbound_response** response);
+
+int trevrpc_channel_start_stream_request_v1(trevrpc_channel* channel,
+    const trevrpc_request* request,
+    const trevrpc_call_options_v1* options,
+    trevrpc_stream** stream);
+int trevrpc_stream_recv_inbound(trevrpc_stream* stream, trevrpc_inbound_stream_frame** frame);
+int trevrpc_stream_recv_inbound_ready(trevrpc_stream* stream, trevrpc_inbound_stream_frame** frame, int* ready);
+int trevrpc_stream_recv_inbound_ready_since(
+    trevrpc_stream* stream, trevrpc_inbound_stream_frame** frame, int* ready, uint64_t wait_started_nanos);
+/*
+ * On a successful batch receive, slots [0, count) are independently owned by
+ * the caller and each shell must be released separately.
+ */
+int trevrpc_stream_recv_inbound_batch(
+    trevrpc_stream* stream, trevrpc_inbound_stream_frame** frames, size_t capacity, size_t* count, int* eof);
+
+int trevrpc_call_respond_borrowed_v1(trevrpc_call* call, const trevrpc_response_view_v1* response);
+int trevrpc_call_finish_stream_borrowed_v1(trevrpc_call* call, const trevrpc_status_view_v1* status);
+int trevrpc_stream_send_status_borrowed_v1(trevrpc_stream* stream, const trevrpc_status_view_v1* status);
+
+int trevrpc_monotonic_now_nanos(uint64_t* now_nanos);
+int trevrpc_server_get_phase(trevrpc_server* server, uint32_t* phase);
+int trevrpc_server_freeze(trevrpc_server* server);
+int trevrpc_server_stop(trevrpc_server* server);
+int trevrpc_server_cancel(trevrpc_server* server);
+int trevrpc_server_wait_until(trevrpc_server* server, uint64_t monotonic_deadline_nanos);
+int trevrpc_server_release(trevrpc_server* server);
+
 int trevrpc_channel_get_state(trevrpc_channel* channel, uint32_t* state, uint64_t* generation);
 /* Waits for a later ready generation after a connection loss. A zero timeout waits indefinitely. */
 int trevrpc_channel_wait_ready(
     trevrpc_channel* channel, uint64_t timeout_nanos, trevrpc_cancellation* cancellation, uint64_t* generation);
-int trevrpc_channel_call_unary(trevrpc_channel* channel,
-    const char* service,
-    const char* method,
-    const uint8_t* body,
-    size_t body_len,
-    trevrpc_response** response);
-int trevrpc_channel_call_unary_with_options(trevrpc_channel* channel,
-    const char* service,
-    const char* method,
-    const uint8_t* body,
-    size_t body_len,
-    const trevrpc_call_options* options,
-    trevrpc_response** response);
-int trevrpc_channel_call_request(trevrpc_channel* channel, const trevrpc_request* request, trevrpc_response** response);
-int trevrpc_channel_call_request_cancellable(trevrpc_channel* channel,
-    const trevrpc_request* request,
-    trevrpc_cancellation* cancellation,
-    trevrpc_response** response);
-/* Binding-oriented request path. The request body is borrowed until SEND_COMPLETE drains. */
-int trevrpc_channel_call_request_borrowed_cancellable(trevrpc_channel* channel,
-    const trevrpc_request* request,
-    trevrpc_cancellation* cancellation,
-    trevrpc_response** response);
-int trevrpc_channel_call_request_with_options(trevrpc_channel* channel,
-    const trevrpc_request* request,
-    const trevrpc_call_options* options,
-    trevrpc_response** response);
-int trevrpc_channel_start_stream(trevrpc_channel* channel,
-    const char* service,
-    const char* method,
-    uint32_t kind,
-    const uint8_t* body,
-    size_t body_len,
-    trevrpc_stream** stream);
-int trevrpc_channel_start_stream_with_options(trevrpc_channel* channel,
-    const char* service,
-    const char* method,
-    uint32_t kind,
-    const uint8_t* body,
-    size_t body_len,
-    const trevrpc_call_options* options,
-    trevrpc_stream** stream);
-int trevrpc_channel_start_stream_request(
-    trevrpc_channel* channel, const trevrpc_request* request, trevrpc_stream** stream);
-int trevrpc_channel_start_stream_request_cancellable(trevrpc_channel* channel,
-    const trevrpc_request* request,
-    trevrpc_cancellation* cancellation,
-    trevrpc_stream** stream);
-/* Binding-oriented request path. The request body is borrowed until SEND_COMPLETE drains. */
-int trevrpc_channel_start_stream_request_borrowed_cancellable(trevrpc_channel* channel,
-    const trevrpc_request* request,
-    trevrpc_cancellation* cancellation,
-    trevrpc_stream** stream);
-int trevrpc_channel_start_stream_request_with_options(trevrpc_channel* channel,
-    const trevrpc_request* request,
-    const trevrpc_call_options* options,
-    trevrpc_stream** stream);
-/*
- * Initiates idempotent shutdown without releasing the handle. Safe from lifecycle callbacks and
- * concurrently entered channel operations. Lifecycle callbacks use a 64-record queue; when
- * full, the newest queued event of the same kind is replaced, or a new unmatched event is dropped.
- */
+
 void trevrpc_channel_close(trevrpc_channel* channel);
 /*
  * Completes shutdown, drains entered operations and callbacks, and releases the handle. The caller
@@ -479,14 +537,13 @@ void trevrpc_channel_release(trevrpc_channel* channel);
 trevrpc_cancellation* trevrpc_cancellation_new(void);
 void trevrpc_cancellation_cancel(trevrpc_cancellation* cancellation);
 int trevrpc_cancellation_cancelled(trevrpc_cancellation* cancellation);
-void trevrpc_cancellation_free(trevrpc_cancellation* cancellation);
+
+int trevrpc_cancellation_retain(trevrpc_cancellation* cancellation);
+void trevrpc_cancellation_release(trevrpc_cancellation* cancellation);
 
 void trevrpc_request_reset(trevrpc_request* request);
 
-int trevrpc_server_listen(const trevrpc_server_config* config, trevrpc_server** server);
 int trevrpc_server_port(trevrpc_server* server, uint16_t* port);
-int trevrpc_server_set_options(trevrpc_server* server, const trevrpc_server_options* options);
-int trevrpc_server_get_options(trevrpc_server* server, trevrpc_server_options* options);
 int trevrpc_server_set_authorizer(trevrpc_server* server, trevrpc_authorizer authorizer, void* user_data);
 void trevrpc_server_clear_authorizer(trevrpc_server* server);
 int trevrpc_server_set_metrics(trevrpc_server* server, const trevrpc_metrics* metrics);
@@ -495,8 +552,7 @@ int trevrpc_server_set_transport_observer(trevrpc_server* server, const trevrpc_
 void trevrpc_server_clear_transport_observer(trevrpc_server* server);
 int trevrpc_server_set_logger(trevrpc_server* server, const trevrpc_logger* logger);
 void trevrpc_server_clear_logger(trevrpc_server* server);
-int trevrpc_server_register_unary(
-    trevrpc_server* server, const char* service, const char* method, trevrpc_unary_handler handler, void* user_data);
+
 int trevrpc_server_register_streaming(trevrpc_server* server,
     const char* service,
     const char* method,
@@ -510,8 +566,6 @@ int trevrpc_server_register_call(trevrpc_server* server,
     trevrpc_call_handler handler,
     void* user_data);
 int trevrpc_server_serve(trevrpc_server* server);
-void trevrpc_server_shutdown(trevrpc_server* server);
-void trevrpc_server_close(trevrpc_server* server);
 
 const trevrpc_request* trevrpc_call_request(const trevrpc_call* call);
 const trevrpc_call_context* trevrpc_call_get_context(const trevrpc_call* call);
@@ -523,17 +577,11 @@ void trevrpc_call_release(trevrpc_call* call);
 void trevrpc_call_cancel(trevrpc_call* call);
 /* Keeps call alive after the handler returns; completion APIs release it. */
 int trevrpc_call_defer(trevrpc_call* call);
-int trevrpc_call_respond(trevrpc_call* call, trevrpc_response* response);
+
 int trevrpc_call_finish_stream(trevrpc_call* call, uint32_t status, const char* message, size_t message_len);
 int trevrpc_call_finish_stream_with_metadata(
     trevrpc_call* call, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata);
 void trevrpc_call_close(trevrpc_call* call);
-
-int trevrpc_response_set_message(trevrpc_response* response, const char* message, size_t message_len);
-int trevrpc_response_set_body(trevrpc_response* response, const uint8_t* body, size_t body_len);
-int trevrpc_response_set_status(trevrpc_response* response, trevrpc_status status);
-void trevrpc_response_reset(trevrpc_response* response);
-void trevrpc_response_free(trevrpc_response* response);
 
 int trevrpc_stream_send_message(trevrpc_stream* stream, const uint8_t* body, size_t body_len);
 /*
@@ -554,28 +602,10 @@ int trevrpc_stream_send_messages_borrowed_wait(
 int trevrpc_stream_send_status(trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len);
 int trevrpc_stream_send_status_with_metadata(
     trevrpc_stream* stream, uint32_t status, const char* message, size_t message_len, const trevrpc_metadata* metadata);
-int trevrpc_stream_recv(trevrpc_stream* stream, trevrpc_stream_frame** frame);
-int trevrpc_stream_recv_ready(trevrpc_stream* stream, trevrpc_stream_frame** frame, int* ready);
-/* Binding-oriented readiness check whose idle budget includes time spent queued before the first poll. */
-int trevrpc_stream_recv_ready_since(
-    trevrpc_stream* stream, trevrpc_stream_frame** frame, int* ready, uint64_t wait_started_nanos);
-/* Returns 1 when an immutable stream idle budget has elapsed since the supplied monotonic timestamp. */
-int trevrpc_stream_wait_timeout_elapsed(const trevrpc_stream* stream, uint64_t wait_started_nanos);
-/*
- * Receives up to capacity frames. The first receive may block like trevrpc_stream_recv;
- * following receives only drain already-ready frames. Returned frames are owned by the caller.
- */
-int trevrpc_stream_recv_batch(
-    trevrpc_stream* stream, trevrpc_stream_frame** frames, size_t capacity, size_t* count, int* eof);
+
 int trevrpc_stream_finish_send(trevrpc_stream* stream);
 void trevrpc_stream_cancel(trevrpc_stream* stream);
 void trevrpc_stream_close(trevrpc_stream* stream);
-
-int trevrpc_stream_frame_set_message(trevrpc_stream_frame* frame, const char* message, size_t message_len);
-int trevrpc_stream_frame_set_body(trevrpc_stream_frame* frame, const uint8_t* body, size_t body_len);
-int trevrpc_stream_frame_set_status(trevrpc_stream_frame* frame, trevrpc_status status);
-void trevrpc_stream_frame_reset(trevrpc_stream_frame* frame);
-void trevrpc_stream_frame_free(trevrpc_stream_frame* frame);
 
 const char* trevrpc_error(int code);
 

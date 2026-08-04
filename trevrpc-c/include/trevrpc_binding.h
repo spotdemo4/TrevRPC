@@ -12,10 +12,11 @@ typedef void (*trevrpc_raw_client_shutdown_callback)(void* user_data, int error_
 /*
  * Connects a raw client and reports transport shutdown through callback. The
  * callback may run on a transport thread and may run before this call returns.
+ * The cancellation reference is retained across the entire blocking connect.
  */
-int trevrpc_raw_client_connect_cancellable_with_shutdown_callback(const char* host,
+int trevrpc_raw_client_connect_v1_with_shutdown_callback(const char* host,
     uint16_t port,
-    const trevrpc_config* config,
+    const trevrpc_client_config_v1* config,
     trevrpc_cancellation* cancellation,
     trevrpc_raw_client_shutdown_callback callback,
     void* user_data,

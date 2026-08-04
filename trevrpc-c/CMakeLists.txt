@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(trevrpc-c VERSION 0.1.0 LANGUAGES C)
+project(trevrpc-c VERSION 0.2.0 LANGUAGES C)
+
+set(TREVRPC_C_ABI_VERSION 6)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -25,6 +27,10 @@ option(TREVRPC_BUILD_RUNTIME "Build trevrpc-c high-level runtime" ON)
 option(TREVRPC_BUILD_CODEGEN "Build protoc-gen-trevrpc-c" "${trevrpc_default_build_codegen}")
 option(TREVRPC_INSTALL_INTERNAL_HEADERS "Install trevrpc-c internal headers for tests and development" OFF)
 option(TREVRPC_ENABLE_SANITIZERS "Build trevrpc-c with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(TREVRPC_ENABLE_THREAD_SANITIZER "Build trevrpc-c with ThreadSanitizer" OFF)
+if(TREVRPC_ENABLE_SANITIZERS AND TREVRPC_ENABLE_THREAD_SANITIZER)
+    message(FATAL_ERROR "TREVRPC_ENABLE_SANITIZERS and TREVRPC_ENABLE_THREAD_SANITIZER are mutually exclusive")
+endif()
 set(TREVRPC_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc" CACHE PATH
     "Install directory for trevrpc CMake package files")
 set(TREVRPC_INSTALL_PKGCONFIGDIR "${CMAKE_INSTALL_LIBDIR}/pkgconfig" CACHE PATH
@@ -33,6 +39,8 @@ set(TREVRPC_INSTALL_PKGCONFIGDIR "${CMAKE_INSTALL_LIBDIR}/pkgconfig" CACHE PATH
 find_package(Threads REQUIRED)
 
 add_library(trevrpc_core STATIC
+    src/trevrpc_frame.c
+    src/trevrpc_ownership.c
     src/trevrpc_values.c
     src/trevrpc_wire.c
 )
@@ -54,6 +62,10 @@ function(trevrpc_c_sanitizers target)
         target_compile_definitions(${target} PRIVATE TREVRPC_SANITIZER_BUILD)
         target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    elseif(TREVRPC_ENABLE_THREAD_SANITIZER AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_definitions(${target} PRIVATE TREVRPC_SANITIZER_BUILD TREVRPC_THREAD_SANITIZER_BUILD)
+        target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=thread)
     endif()
 endfunction()
 
@@ -71,7 +83,8 @@ function(trevrpc_c_configure_msquic target)
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
-    target_link_libraries(${target} PUBLIC Threads::Threads PRIVATE msquic::msquic)
+    target_link_libraries(${target} PUBLIC Threads::Threads PRIVATE msquic::msquic trevrpc_core)
+    target_compile_definitions(${target} PRIVATE QUIC_API_ENABLE_PREVIEW_FEATURES)
     trevrpc_c_warnings(${target})
     trevrpc_c_sanitizers(${target})
 endfunction()
@@ -83,7 +96,7 @@ function(trevrpc_c_configure_runtime target)
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE src
     )
-    target_link_libraries(${target} PUBLIC trevrpc_core Threads::Threads ${ARGN})
+    target_link_libraries(${target} PUBLIC ${ARGN} trevrpc_core Threads::Threads)
     trevrpc_c_warnings(${target})
     trevrpc_c_sanitizers(${target})
 endfunction()
@@ -139,7 +152,7 @@ if(TREVRPC_BUILD_WEBTRANSPORT)
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
-    target_link_libraries(trevrpc_webtransport PUBLIC trevrpc_msquic Threads::Threads)
+    target_link_libraries(trevrpc_webtransport PUBLIC trevrpc_msquic Threads::Threads PRIVATE trevrpc_core)
     trevrpc_c_warnings(trevrpc_webtransport)
     trevrpc_c_sanitizers(trevrpc_webtransport)
     list(APPEND trevrpc_install_targets trevrpc_webtransport)
@@ -158,6 +171,8 @@ if(TREVRPC_BUILD_RUNTIME)
     add_library(trevrpc STATIC
         src/trevrpc.c
         src/trevrpc_channel.c
+        src/trevrpc_lifetime.c
+        src/trevrpc_versioned_runtime.c
     )
     trevrpc_c_configure_runtime(trevrpc trevrpc_msquic trevrpc_webtransport)
     list(APPEND trevrpc_install_targets trevrpc)
@@ -168,6 +183,8 @@ if(TREVRPC_BUILD_RUNTIME)
         add_library(trevrpc_testing STATIC
             src/trevrpc.c
             src/trevrpc_channel.c
+            src/trevrpc_lifetime.c
+            src/trevrpc_versioned_runtime.c
         )
         target_compile_definitions(trevrpc_testing PRIVATE TREVRPC_TESTING)
         trevrpc_c_configure_runtime(trevrpc_testing trevrpc_msquic trevrpc_webtransport)
@@ -175,6 +192,8 @@ if(TREVRPC_BUILD_RUNTIME)
         add_library(trevrpc_msquic_testing_runtime STATIC
             src/trevrpc.c
             src/trevrpc_channel.c
+            src/trevrpc_lifetime.c
+            src/trevrpc_versioned_runtime.c
             src/trevrpc_webtransport.c
         )
         trevrpc_c_configure_runtime(trevrpc_msquic_testing_runtime trevrpc_msquic_testing)
@@ -420,6 +439,7 @@ install(FILES
 )
 if(TREVRPC_INSTALL_INTERNAL_HEADERS)
     install(FILES
+        src/trevrpc_owned_bytes_internal.h
         src/trevrpc_wire_internal.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/trevrpc/internal
     )
@@ -427,6 +447,21 @@ endif()
 
 if(TREVRPC_BUILD_TESTS)
     enable_testing()
+    enable_language(CXX)
+
+    add_test(NAME trevrpc_abi6_source_surface
+        COMMAND "${CMAKE_COMMAND}"
+            -DTREVRPC_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/abi6/check_surface.cmake"
+    )
+
+    add_executable(trevrpc_frame_test tests/frame_test.c)
+    target_include_directories(trevrpc_frame_test PRIVATE src)
+    target_link_libraries(trevrpc_frame_test PRIVATE trevrpc_core)
+    trevrpc_c_warnings(trevrpc_frame_test)
+    trevrpc_c_sanitizers(trevrpc_frame_test)
+
+    add_test(NAME trevrpc_frame COMMAND trevrpc_frame_test)
 
     add_executable(trevrpc_wire_test tests/wire_test.c)
     target_include_directories(trevrpc_wire_test PRIVATE src)
@@ -436,6 +471,14 @@ if(TREVRPC_BUILD_TESTS)
     trevrpc_c_sanitizers(trevrpc_wire_test)
 
     add_test(NAME trevrpc_wire COMMAND trevrpc_wire_test)
+
+    add_executable(trevrpc_ownership_test tests/ownership_test.c)
+    target_include_directories(trevrpc_ownership_test PRIVATE src)
+    target_link_libraries(trevrpc_ownership_test PRIVATE trevrpc_core)
+    trevrpc_c_warnings(trevrpc_ownership_test)
+    trevrpc_c_sanitizers(trevrpc_ownership_test)
+
+    add_test(NAME trevrpc_ownership COMMAND trevrpc_ownership_test)
 
     if(TARGET trevrpc_bench_peer_c)
         add_test(NAME trevrpc_bench_peer_capabilities COMMAND trevrpc_bench_peer_c capabilities)
@@ -473,12 +516,60 @@ if(TREVRPC_BUILD_TESTS)
     endif()
 
     if(TREVRPC_BUILD_RUNTIME)
-        add_executable(trevrpc_api_test tests/api_test.c)
+        add_executable(trevrpc_api_test tests/abi6/public_api.c)
         target_link_libraries(trevrpc_api_test PRIVATE trevrpc)
         trevrpc_c_warnings(trevrpc_api_test)
         trevrpc_c_sanitizers(trevrpc_api_test)
 
         add_test(NAME trevrpc_api COMMAND trevrpc_api_test)
+
+        add_executable(trevrpc_api_cpp_test tests/abi6/public_api.cpp)
+        target_link_libraries(trevrpc_api_cpp_test PRIVATE trevrpc)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(trevrpc_api_cpp_test PRIVATE -Wall -Wextra -Werror)
+        endif()
+        trevrpc_c_sanitizers(trevrpc_api_cpp_test)
+
+        add_test(NAME trevrpc_api_cpp COMMAND trevrpc_api_cpp_test)
+
+        add_test(NAME trevrpc_abi6_symbols
+            COMMAND "${CMAKE_COMMAND}"
+                -DTREVRPC_NM=${CMAKE_NM}
+                "-DTREVRPC_ARCHIVES=$<TARGET_FILE:trevrpc>;$<TARGET_FILE:trevrpc_core>;$<TARGET_FILE:trevrpc_msquic>;$<TARGET_FILE:trevrpc_webtransport>"
+                "-DTREVRPC_PUBLIC_HEADERS=${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc.h;${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_raw.h;${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_binding.h;${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_msquic.h;${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_webtransport.h"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/abi6/check_symbols.cmake"
+        )
+
+        add_executable(trevrpc_cancellation_lifecycle_test tests/cancellation_lifecycle_test.c)
+        target_link_libraries(trevrpc_cancellation_lifecycle_test PRIVATE trevrpc)
+        trevrpc_c_warnings(trevrpc_cancellation_lifecycle_test)
+        trevrpc_c_sanitizers(trevrpc_cancellation_lifecycle_test)
+
+        add_test(NAME trevrpc_cancellation_lifecycle COMMAND trevrpc_cancellation_lifecycle_test)
+
+        add_executable(trevrpc_stream_lifecycle_test tests/stream_lifecycle_test.c)
+        target_include_directories(trevrpc_stream_lifecycle_test PRIVATE src)
+        target_link_libraries(trevrpc_stream_lifecycle_test PRIVATE trevrpc_testing)
+        trevrpc_c_warnings(trevrpc_stream_lifecycle_test)
+        trevrpc_c_sanitizers(trevrpc_stream_lifecycle_test)
+
+        add_test(NAME trevrpc_stream_lifecycle COMMAND trevrpc_stream_lifecycle_test)
+
+        add_executable(trevrpc_versioned_api_test tests/versioned_api_test.c)
+        target_include_directories(trevrpc_versioned_api_test PRIVATE src)
+        target_link_libraries(trevrpc_versioned_api_test PRIVATE trevrpc)
+        trevrpc_c_warnings(trevrpc_versioned_api_test)
+        trevrpc_c_sanitizers(trevrpc_versioned_api_test)
+
+        add_test(NAME trevrpc_versioned_api COMMAND trevrpc_versioned_api_test)
+
+        add_executable(trevrpc_server_lifecycle_test tests/server_lifecycle_test.c)
+        target_include_directories(trevrpc_server_lifecycle_test PRIVATE src)
+        target_link_libraries(trevrpc_server_lifecycle_test PRIVATE trevrpc_testing)
+        trevrpc_c_warnings(trevrpc_server_lifecycle_test)
+        trevrpc_c_sanitizers(trevrpc_server_lifecycle_test)
+
+        add_test(NAME trevrpc_server_lifecycle COMMAND trevrpc_server_lifecycle_test)
 
         add_executable(trevrpc_runtime_test tests/runtime_test.c)
         target_include_directories(trevrpc_runtime_test PRIVATE src)
@@ -518,6 +609,7 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_lsan_suppressions(trevrpc_channel)
 
         add_executable(trevrpc_buffering_config_test tests/buffering_config_test.c)
+        target_include_directories(trevrpc_buffering_config_test PRIVATE src)
         target_link_libraries(trevrpc_buffering_config_test PRIVATE trevrpc_testing)
         trevrpc_c_warnings(trevrpc_buffering_config_test)
         trevrpc_c_sanitizers(trevrpc_buffering_config_test)
@@ -565,13 +657,33 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
             TREVRPC_GENERATED_HEADER="${trevrpc_generated_test_dir}/greeter.trevrpc.h"
             TREVRPC_GENERATED_SOURCE="${trevrpc_generated_test_dir}/greeter.trevrpc.c"
+            TREVRPC_GENERATED_TESTING
         )
         target_include_directories(trevrpc_generated_service_test PRIVATE src "${trevrpc_generated_test_dir}")
-        target_link_libraries(trevrpc_generated_service_test PRIVATE trevrpc_testing protobuf-c)
+        target_link_libraries(trevrpc_generated_service_test PRIVATE trevrpc_msquic_testing trevrpc_testing protobuf-c)
         trevrpc_c_warnings(trevrpc_generated_service_test)
         trevrpc_c_sanitizers(trevrpc_generated_service_test)
 
         add_test(NAME trevrpc_generated_service COMMAND trevrpc_generated_service_test)
         trevrpc_c_lsan_suppressions(trevrpc_generated_service)
+        add_test(NAME trevrpc_codegen_golden_header
+            COMMAND "${CMAKE_COMMAND}" -E compare_files
+                "${trevrpc_generated_test_dir}/greeter.trevrpc.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/greeter.trevrpc.h"
+        )
+        add_test(NAME trevrpc_codegen_golden_source
+            COMMAND "${CMAKE_COMMAND}" -E compare_files
+                "${trevrpc_generated_test_dir}/greeter.trevrpc.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/greeter.trevrpc.c"
+        )
+    endif()
+
+    if(TREVRPC_ENABLE_THREAD_SANITIZER)
+        get_property(trevrpc_all_tests DIRECTORY PROPERTY TESTS)
+        foreach(trevrpc_test IN LISTS trevrpc_all_tests)
+            set_property(TEST ${trevrpc_test} APPEND PROPERTY ENVIRONMENT
+                "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp"
+            )
+        endforeach()
     endif()
 endif()

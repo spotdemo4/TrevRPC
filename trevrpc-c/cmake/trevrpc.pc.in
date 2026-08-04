@@ -2,10 +2,11 @@ prefix=${pcfiledir}/../..
 exec_prefix=${prefix}
 libdir=@trevrpc_pc_libdir@
 includedir=@trevrpc_pc_includedir@
+trevrpc_c_abi_version=@TREVRPC_C_ABI_VERSION@
 
 Name: trevrpc
 Description: High-level TrevRPC C runtime over MsQuic
 Version: @PROJECT_VERSION@
-Requires.private: trevrpc_core trevrpc_msquic trevrpc_webtransport
+Requires.private: trevrpc_webtransport trevrpc_msquic trevrpc_core
 Libs: -L${libdir} -ltrevrpc
 Cflags: -I${includedir}

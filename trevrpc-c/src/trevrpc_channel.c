@@ -40,7 +40,7 @@ struct trevrpc_channel {
     pthread_t worker;
     pthread_t dispatcher;
     char* host;
-    trevrpc_config config;
+    trevrpc_client_config_internal config;
     char* cert_file;
     char* key_file;
     char* ca_cert_file;
@@ -80,8 +80,8 @@ static char* trevrpc_channel_copy_string(const char* value) {
     return copy;
 }
 
-static bool trevrpc_channel_copy_config(trevrpc_channel* client, const trevrpc_config* config) {
-    client->config = config == NULL ? trevrpc_default_config() : *config;
+static bool trevrpc_channel_copy_config(trevrpc_channel* client, const trevrpc_client_config_internal* config) {
+    client->config = config == NULL ? trevrpc_internal_default_config() : *config;
     client->cert_file = trevrpc_channel_copy_string(client->config.cert_file);
     client->key_file = trevrpc_channel_copy_string(client->config.key_file);
     client->ca_cert_file = trevrpc_channel_copy_string(client->config.ca_cert_file);
@@ -333,7 +333,7 @@ static void* trevrpc_channel_worker(void* context) {
         generation->owner = client;
         atomic_init(&generation->refs, 1);
 
-        int err = trevrpc_raw_client_connect_observed(client->host,
+        int err = trevrpc_internal_raw_client_connect_observed(client->host,
             client->port,
             &client->config,
             trevrpc_channel_connect_cancelled,
@@ -388,7 +388,7 @@ static void* trevrpc_channel_worker(void* context) {
             pthread_mutex_unlock(&client->mutex);
         }
 
-        trevrpc_raw_client_clear_observer(generation->client);
+        trevrpc_internal_raw_client_clear_observer(generation->client);
         if (stop) {
             trevrpc_raw_client_shutdown(generation->client);
         }
@@ -455,7 +455,7 @@ static void trevrpc_channel_free_storage(trevrpc_channel* client) {
 
 static int trevrpc_channel_create_async(const char* host,
     uint16_t port,
-    const trevrpc_config* config,
+    const trevrpc_client_config_internal* config,
     const trevrpc_channel_options* options,
     trevrpc_channel** out_client) {
     if (host == NULL || out_client == NULL) {
@@ -533,9 +533,9 @@ static int trevrpc_channel_create_async(const char* host,
     return 0;
 }
 
-int trevrpc_channel_connect(const char* host,
+int trevrpc_internal_channel_connect(const char* host,
     uint16_t port,
-    const trevrpc_config* config,
+    const trevrpc_client_config_internal* config,
     const trevrpc_channel_options* options,
     uint64_t timeout_nanos,
     trevrpc_cancellation* cancellation,
@@ -705,55 +705,72 @@ static int trevrpc_channel_snapshot(trevrpc_channel* client, trevrpc_channel_gen
         return err;                                                                                                    \
     }
 
-TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_channel_call_unary,
-    trevrpc_raw_client_call_unary,
+TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_internal_channel_call_unary,
+    trevrpc_internal_raw_client_call_unary,
     (trevrpc_channel * client,
         const char* service,
         const char* method,
         const uint8_t* body,
         size_t body_len,
-        trevrpc_response** response),
+        trevrpc_wire_response_values** response),
     (generation->client, service, method, body, body_len, response))
 
-TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_channel_call_unary_with_options,
-    trevrpc_raw_client_call_unary_with_options,
+TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_internal_channel_call_unary_with_options,
+    trevrpc_internal_raw_client_call_unary_with_options,
     (trevrpc_channel * client,
         const char* service,
         const char* method,
         const uint8_t* body,
         size_t body_len,
-        const trevrpc_call_options* options,
-        trevrpc_response** response),
+        const trevrpc_call_options_internal* options,
+        trevrpc_wire_response_values** response),
     (generation->client, service, method, body, body_len, options, response))
 
-TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_channel_call_request,
-    trevrpc_raw_client_call_request,
-    (trevrpc_channel * client, const trevrpc_request* request, trevrpc_response** response),
+TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_internal_channel_call_request,
+    trevrpc_internal_raw_client_call_request,
+    (trevrpc_channel * client, const trevrpc_request* request, trevrpc_wire_response_values** response),
     (generation->client, request, response))
 
-TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_channel_call_request_cancellable,
-    trevrpc_raw_client_call_request_cancellable,
+TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_internal_channel_call_request_cancellable,
+    trevrpc_internal_raw_client_call_request_cancellable,
     (trevrpc_channel * client,
         const trevrpc_request* request,
         trevrpc_cancellation* cancellation,
-        trevrpc_response** response),
+        trevrpc_wire_response_values** response),
     (generation->client, request, cancellation, response))
 
-TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_channel_call_request_borrowed_cancellable,
-    trevrpc_raw_client_call_request_borrowed_cancellable,
+TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_internal_channel_call_request_borrowed_cancellable,
+    trevrpc_internal_raw_client_call_request_borrowed_cancellable,
     (trevrpc_channel * client,
         const trevrpc_request* request,
         trevrpc_cancellation* cancellation,
-        trevrpc_response** response),
+        trevrpc_wire_response_values** response),
     (generation->client, request, cancellation, response))
 
-TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_channel_call_request_with_options,
-    trevrpc_raw_client_call_request_with_options,
+TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_internal_channel_call_request_with_options,
+    trevrpc_internal_raw_client_call_request_with_options,
     (trevrpc_channel * client,
         const trevrpc_request* request,
-        const trevrpc_call_options* options,
-        trevrpc_response** response),
+        const trevrpc_call_options_internal* options,
+        trevrpc_wire_response_values** response),
     (generation->client, request, options, response))
+
+int trevrpc_channel_call_request_versioned(trevrpc_channel* client,
+    const trevrpc_request* request,
+    const trevrpc_call_options_internal* options,
+    bool borrow_request_body,
+    trevrpc_inbound_response** response) {
+    trevrpc_channel_generation* generation = NULL;
+    int err = trevrpc_channel_snapshot(client, &generation);
+    if (err != 0) {
+        return err;
+    }
+    err =
+        trevrpc_raw_client_call_request_versioned(generation->client, request, options, borrow_request_body, response);
+    trevrpc_channel_generation_release(generation);
+    trevrpc_channel_leave(client);
+    return err;
+}
 
 #define TREVRPC_CHANNEL_STREAM_WRAPPER(name, low_name, parameters, arguments)                                          \
     int name parameters {                                                                                              \
@@ -772,8 +789,8 @@ TREVRPC_CHANNEL_UNARY_WRAPPER(trevrpc_channel_call_request_with_options,
         return err;                                                                                                    \
     }
 
-TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_channel_start_stream,
-    trevrpc_raw_client_start_stream,
+TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_internal_channel_start_stream,
+    trevrpc_internal_raw_client_start_stream,
     (trevrpc_channel * client,
         const char* service,
         const char* method,
@@ -783,46 +800,67 @@ TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_channel_start_stream,
         trevrpc_stream** stream),
     (generation->client, service, method, kind, body, body_len, stream))
 
-TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_channel_start_stream_with_options,
-    trevrpc_raw_client_start_stream_with_options,
+TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_internal_channel_start_stream_with_options,
+    trevrpc_internal_raw_client_start_stream_with_options,
     (trevrpc_channel * client,
         const char* service,
         const char* method,
         uint32_t kind,
         const uint8_t* body,
         size_t body_len,
-        const trevrpc_call_options* options,
+        const trevrpc_call_options_internal* options,
         trevrpc_stream** stream),
     (generation->client, service, method, kind, body, body_len, options, stream))
 
-TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_channel_start_stream_request,
-    trevrpc_raw_client_start_stream_request,
+TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_internal_channel_start_stream_request,
+    trevrpc_internal_raw_client_start_stream_request,
     (trevrpc_channel * client, const trevrpc_request* request, trevrpc_stream** stream),
     (generation->client, request, stream))
 
-TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_channel_start_stream_request_cancellable,
-    trevrpc_raw_client_start_stream_request_cancellable,
+TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_internal_channel_start_stream_request_cancellable,
+    trevrpc_internal_raw_client_start_stream_request_cancellable,
     (trevrpc_channel * client,
         const trevrpc_request* request,
         trevrpc_cancellation* cancellation,
         trevrpc_stream** stream),
     (generation->client, request, cancellation, stream))
 
-TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_channel_start_stream_request_borrowed_cancellable,
-    trevrpc_raw_client_start_stream_request_borrowed_cancellable,
+TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_internal_channel_start_stream_request_borrowed_cancellable,
+    trevrpc_internal_raw_client_start_stream_request_borrowed_cancellable,
     (trevrpc_channel * client,
         const trevrpc_request* request,
         trevrpc_cancellation* cancellation,
         trevrpc_stream** stream),
     (generation->client, request, cancellation, stream))
 
-TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_channel_start_stream_request_with_options,
-    trevrpc_raw_client_start_stream_request_with_options,
+TREVRPC_CHANNEL_STREAM_WRAPPER(trevrpc_internal_channel_start_stream_request_with_options,
+    trevrpc_internal_raw_client_start_stream_request_with_options,
     (trevrpc_channel * client,
         const trevrpc_request* request,
-        const trevrpc_call_options* options,
+        const trevrpc_call_options_internal* options,
         trevrpc_stream** stream),
     (generation->client, request, options, stream))
+
+int trevrpc_channel_start_stream_request_versioned(trevrpc_channel* client,
+    const trevrpc_request* request,
+    const trevrpc_call_options_internal* options,
+    bool borrow_request_body,
+    trevrpc_stream** stream) {
+    trevrpc_channel_generation* generation = NULL;
+    int err = trevrpc_channel_snapshot(client, &generation);
+    if (err != 0) {
+        return err;
+    }
+    err = trevrpc_raw_client_start_stream_request_versioned(
+        generation->client, request, options, borrow_request_body, stream);
+    if (err == 0) {
+        trevrpc_stream_set_release(*stream, trevrpc_channel_generation_release, generation);
+    } else {
+        trevrpc_channel_generation_release(generation);
+    }
+    trevrpc_channel_leave(client);
+    return err;
+}
 
 void trevrpc_channel_close(trevrpc_channel* client) {
     if (client == NULL) {

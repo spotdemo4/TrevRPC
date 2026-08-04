@@ -178,19 +178,13 @@ static const trevrpc_msquic_config test_native_config = {
 };
 
 struct trevrpc_stream {
-    uint32_t transport;
     trevrpc_msquic_stream* msquic_stream;
     trevrpc_wt_stream* wt_stream;
     trevrpc_h3_stream* h3_stream;
     const trevrpc_call_context* context;
     size_t max_frame_size;
-    bool owns_stream;
-    bool sent_status;
-    bool status_queued;
-    uint32_t terminal_status;
     int64_t max_stream_messages;
     int64_t max_stream_body_size;
-    bool has_recv_limits;
     int64_t max_recv_stream_messages;
     int64_t max_recv_stream_body_size;
     uint64_t stream_idle_timeout_nanos;
@@ -198,12 +192,24 @@ struct trevrpc_stream {
     int64_t response_message_count;
     uint64_t request_body_size;
     uint64_t response_body_size;
-    bool response_idle_started;
-    struct timespec response_last_activity;
-    bool request_poll_idle_started;
-    struct timespec request_poll_started_at;
-    uint32_t failure_status;
     const char* failure_message;
+    void (*release)(void* context);
+    void* release_context;
+    trevrpc_cancellation* cancellation;
+    void* scripted_source;
+    void* state;
+    struct timespec response_last_activity;
+    struct timespec request_poll_started_at;
+    uint32_t transport;
+    uint32_t terminal_status;
+    uint32_t failure_status;
+    trevrpc_wire_diagnostic_reason last_wire_diagnostic;
+    bool owns_stream;
+    bool sent_status;
+    bool status_queued;
+    bool has_recv_limits;
+    bool response_idle_started;
+    bool request_poll_idle_started;
 };
 
 #define TEST_WT_SETTINGS_ENABLE_CONNECT_PROTOCOL 0x08
@@ -1103,7 +1109,7 @@ static int test_native_malformed_stream_frame_remains_invalid_frame(void) {
     const uint8_t malformed_frame[] = {0, 0, 0, 3, 0xff, 0xff, 0xff};
     uint8_t* body = NULL;
     size_t body_len = 0;
-    trevrpc_stream_frame* decoded = NULL;
+    trevrpc_wire_stream_frame_values* decoded = NULL;
 
     CHECK_GOTO(open_native_stream_pair(&listener, &client, &server, &client_stream, &server_stream) == 0);
     CHECK_EQ_GOTO(trevrpc_msquic_stream_write_fin(client_stream, malformed_frame, sizeof(malformed_frame)),
@@ -1115,7 +1121,7 @@ static int test_native_malformed_stream_frame_remains_invalid_frame(void) {
     result = 0;
 
 cleanup:
-    trevrpc_stream_frame_free(decoded);
+    trevrpc_internal_stream_frame_free(decoded);
     trevrpc_msquic_free(body);
     trevrpc_msquic_stream_close(server_stream);
     trevrpc_msquic_stream_close(client_stream);
@@ -1706,7 +1712,7 @@ static int test_stream_borrowed_message_wait_drains_send_complete(void) {
     uint8_t* expected = NULL;
     uint8_t* frame_body = NULL;
     size_t frame_body_len = 0;
-    trevrpc_stream_frame* frame = NULL;
+    trevrpc_wire_stream_frame_values* frame = NULL;
     bool took_frame_body = false;
     const size_t body_len = 32768;
 
@@ -1743,13 +1749,13 @@ static int test_stream_borrowed_message_wait_drains_send_complete(void) {
     }
     CHECK_GOTO(frame != NULL);
     CHECK_GOTO(frame->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
-    CHECK_GOTO(frame->body_len == body_len);
-    CHECK_GOTO(memcmp(frame->body, expected, body_len) == 0);
+    CHECK_GOTO(frame->body.len == body_len);
+    CHECK_GOTO(memcmp(frame->body.data, expected, body_len) == 0);
 
     result = 0;
 
 cleanup:
-    trevrpc_stream_frame_free(frame);
+    trevrpc_internal_stream_frame_free(frame);
     trevrpc_msquic_free(frame_body);
     free(expected);
     free(borrowed);
@@ -1792,7 +1798,7 @@ static int test_copy_wait_and_terminal_status_with_one_pending_send(void) {
     for (size_t i = 0; i < 2; i++) {
         uint8_t* frame_body = NULL;
         size_t frame_body_len = 0;
-        trevrpc_stream_frame* frame = NULL;
+        trevrpc_wire_stream_frame_values* frame = NULL;
         bool took_frame_body = false;
         CHECK_EQ_GOTO(trevrpc_msquic_stream_read_frame_timeout(
                           server_stream, &frame_body, &frame_body_len, config.max_frame_size, 1000000000ull),
@@ -1804,13 +1810,13 @@ static int test_copy_wait_and_terminal_status_with_one_pending_send(void) {
         CHECK_GOTO(frame != NULL);
         if (i == 0) {
             CHECK_GOTO(frame->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
-            CHECK_GOTO(frame->body_len == sizeof(message));
-            CHECK_GOTO(memcmp(frame->body, message, sizeof(message)) == 0);
+            CHECK_GOTO(frame->body.len == sizeof(message));
+            CHECK_GOTO(memcmp(frame->body.data, message, sizeof(message)) == 0);
         } else {
             CHECK_GOTO(frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS);
             CHECK_GOTO(frame->status == TREVRPC_STATUS_OK);
         }
-        trevrpc_stream_frame_free(frame);
+        trevrpc_internal_stream_frame_free(frame);
         trevrpc_msquic_free(frame_body);
     }
 
@@ -1863,7 +1869,7 @@ static int test_stream_borrowed_message_batch_wait_drains_send_complete(void) {
     for (size_t i = 0; i < sizeof(body_lens) / sizeof(body_lens[0]); i++) {
         uint8_t* frame_body = NULL;
         size_t frame_body_len = 0;
-        trevrpc_stream_frame* frame = NULL;
+        trevrpc_wire_stream_frame_values* frame = NULL;
         bool took_frame_body = false;
         CHECK_EQ_GOTO(trevrpc_msquic_stream_read_frame_timeout(
                           server_stream, &frame_body, &frame_body_len, config.max_frame_size, 1000000000ull),
@@ -1874,9 +1880,9 @@ static int test_stream_borrowed_message_batch_wait_drains_send_complete(void) {
         }
         CHECK_GOTO(frame != NULL);
         CHECK_GOTO(frame->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
-        CHECK_GOTO(frame->body_len == body_lens[i]);
-        CHECK_GOTO(memcmp(frame->body, expected[i], body_lens[i]) == 0);
-        trevrpc_stream_frame_free(frame);
+        CHECK_GOTO(frame->body.len == body_lens[i]);
+        CHECK_GOTO(memcmp(frame->body.data, expected[i], body_lens[i]) == 0);
+        trevrpc_internal_stream_frame_free(frame);
         trevrpc_msquic_free(frame_body);
     }
 
@@ -3089,9 +3095,83 @@ cleanup:
     return result;
 }
 
+typedef struct owned_frame_allocator_state {
+    void* allocated;
+    void* released;
+    void* expected_context;
+    size_t release_count;
+} owned_frame_allocator_state;
+
+static void* owned_frame_alloc(size_t size, void* context) {
+    owned_frame_allocator_state* state = context;
+    state->allocated = malloc(size);
+    return state->allocated;
+}
+
+static void owned_frame_free(void* owner, void* context) {
+    owned_frame_allocator_state* state = context;
+    state->released = owner;
+    state->expected_context = context;
+    state->release_count++;
+    free(owner);
+}
+
+static int test_owned_frame_queue_preserves_allocator_provenance(void) {
+    int result = 0;
+    static const uint8_t payload[] = {0xa1, 0xb2, 0xc3};
+    trevrpc_wire_response_values response = {
+        .status = TREVRPC_STATUS_OK,
+        .body =
+            {
+                .data = payload,
+                .len = sizeof(payload),
+            },
+    };
+    uint8_t* framed = NULL;
+    size_t framed_len = 0;
+    trevrpc_owned_bytes owned;
+    trevrpc_owned_bytes_init(&owned);
+    trevrpc_inbound_response* inbound = NULL;
+    trevrpc_body_owner* owner = NULL;
+    owned_frame_allocator_state allocator = {0};
+
+    CHECK_GOTO(trevrpc_wire_encode_response(&response, 1024, &framed, &framed_len) == 0);
+    CHECK_GOTO(trevrpc_msquic_test_parse_frame_owned(
+                   framed, framed_len, 1024, owned_frame_alloc, owned_frame_free, &allocator, &owned) == 0);
+    CHECK_GOTO(owned.owner == allocator.allocated);
+    CHECK_GOTO(owned.release_context == &allocator);
+    CHECK_GOTO(trevrpc_wire_decode_response_owned(&owned, &inbound) == 0);
+    CHECK_GOTO(allocator.release_count == 0);
+
+    trevrpc_bytes_view body = {0};
+    CHECK_GOTO(trevrpc_inbound_response_get_body(inbound, &body) == 0);
+    CHECK_GOTO(body.len == sizeof(payload));
+    CHECK_GOTO(memcmp(body.data, payload, sizeof(payload)) == 0);
+    CHECK_GOTO(trevrpc_inbound_response_take_body(inbound, &owner) == 0);
+    CHECK_GOTO(owner != NULL);
+    trevrpc_inbound_response_release(inbound);
+    inbound = NULL;
+    CHECK_GOTO(allocator.release_count == 0);
+    trevrpc_body_owner_release(owner);
+    owner = NULL;
+    CHECK_GOTO(allocator.release_count == 1);
+    CHECK_GOTO(allocator.released == allocator.allocated);
+    CHECK_GOTO(allocator.expected_context == &allocator);
+
+cleanup:
+    trevrpc_body_owner_release(owner);
+    trevrpc_inbound_response_release(inbound);
+    trevrpc_owned_bytes_reset(&owned);
+    free(framed);
+    return result;
+}
+
 int main(void) {
     int result = 1;
 
+    if (test_owned_frame_queue_preserves_allocator_provenance() != 0) {
+        goto cleanup;
+    }
     if (test_listener_shutdown_is_concurrent_and_idempotent() != 0) {
         goto cleanup;
     }

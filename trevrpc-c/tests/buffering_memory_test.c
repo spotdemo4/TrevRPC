@@ -65,6 +65,7 @@ typedef struct call_registry {
     size_t count;
     size_t duplicate_ids;
     size_t invalid_ids;
+    bool closing;
 } call_registry;
 
 typedef struct serve_args {
@@ -233,16 +234,30 @@ static int registry_init(call_registry* registry, size_t capacity) {
     return 0;
 }
 
+static void registry_close_calls(call_registry* registry) {
+    if (registry == NULL || registry->calls == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&registry->mutex);
+    registry->closing = true;
+    pthread_cond_broadcast(&registry->cond);
+    pthread_mutex_unlock(&registry->mutex);
+    for (size_t i = 0; i < registry->capacity; i++) {
+        pthread_mutex_lock(&registry->mutex);
+        trevrpc_call* call = registry->calls[i];
+        registry->calls[i] = NULL;
+        pthread_mutex_unlock(&registry->mutex);
+        if (call != NULL) {
+            trevrpc_call_close(call);
+        }
+    }
+}
+
 static void registry_destroy(call_registry* registry) {
     if (registry == NULL || registry->calls == NULL) {
         return;
     }
-    for (size_t i = 0; i < registry->capacity; i++) {
-        if (registry->calls[i] != NULL) {
-            trevrpc_call_close(registry->calls[i]);
-            registry->calls[i] = NULL;
-        }
-    }
+    registry_close_calls(registry);
     pthread_cond_destroy(&registry->cond);
     pthread_mutex_destroy(&registry->mutex);
     free(registry->calls);
@@ -269,6 +284,11 @@ static int deferred_call_handler(void* user_data, trevrpc_call* call) {
     size_t id = request_id(trevrpc_call_request(call));
 
     pthread_mutex_lock(&registry->mutex);
+    if (registry->closing) {
+        pthread_mutex_unlock(&registry->mutex);
+        trevrpc_call_close(call);
+        return TREVRPC_CALL_DEFERRED;
+    }
     if (id >= registry->capacity) {
         registry->invalid_ids++;
         pthread_mutex_unlock(&registry->mutex);
@@ -349,7 +369,11 @@ static int fixture_start(
     }
     fixture->registry_initialized = true;
 
-    trevrpc_server_config server_config = trevrpc_default_server_config();
+    trevrpc_server_config_v1 server_config;
+    err = trevrpc_server_config_v1_init(&server_config, sizeof(server_config));
+    if (err != 0) {
+        return err;
+    }
     server_config.host = "127.0.0.1";
     server_config.port = 0;
     server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
@@ -359,7 +383,7 @@ static int fixture_start(
     server_config.peer_bidi_stream_count = (uint16_t)concurrency;
     server_config.max_streams_per_session = (uint32_t)concurrency;
     server_config.max_frame_size = PROFILE_MAX_FRAME_SIZE;
-    err = trevrpc_server_listen(&server_config, &fixture->server);
+    err = trevrpc_server_listen_v1(&server_config, &fixture->server);
     if (err != 0) {
         return err;
     }
@@ -369,7 +393,11 @@ static int fixture_start(
         admitted = 1;
     }
     size_t max_messages = cumulative_body / min_message_size + 4;
-    trevrpc_server_options options = trevrpc_default_server_options();
+    trevrpc_server_options_v1 options;
+    err = trevrpc_server_options_v1_init(&options, sizeof(options));
+    if (err != 0) {
+        return err;
+    }
     options.max_concurrent_connections = 1;
     options.max_concurrent_streams_per_connection = (int64_t)concurrency;
     options.max_concurrent_requests = (int64_t)admitted;
@@ -379,7 +407,7 @@ static int fixture_start(
     options.max_stream_messages = (int64_t)max_messages;
     options.max_stream_body_size = (int64_t)cumulative_body;
     options.stream_idle_timeout_nanos = PROFILE_RPC_IDLE_TIMEOUT_NANOS;
-    err = trevrpc_server_set_options(fixture->server, &options);
+    err = trevrpc_server_set_options_v1(fixture->server, &options);
     if (err == 0) {
         err = trevrpc_server_register_call(fixture->server,
             SERVICE_NAME,
@@ -387,6 +415,9 @@ static int fixture_start(
             scenario_rpc_kind(scenario),
             deferred_call_handler,
             &fixture->registry);
+    }
+    if (err == 0) {
+        err = trevrpc_server_freeze(fixture->server);
     }
     if (err != 0) {
         return err;
@@ -404,35 +435,50 @@ static int fixture_start(
     if (err != 0) {
         return err;
     }
-    trevrpc_config client_config = trevrpc_default_config();
+    trevrpc_client_config_v1 client_config;
+    err = trevrpc_client_config_v1_init(&client_config, sizeof(client_config));
+    if (err != 0) {
+        return err;
+    }
     client_config.skip_certificate_validation = 1;
     client_config.max_idle_timeout_ms = PROFILE_IDLE_TIMEOUT_MS;
     client_config.keep_alive_ms = 15000;
     client_config.peer_bidi_stream_count = (uint16_t)concurrency;
     client_config.max_frame_size = PROFILE_MAX_FRAME_SIZE;
-    return trevrpc_raw_client_connect("127.0.0.1", port, &client_config, &fixture->client);
+    return trevrpc_raw_client_connect_v1("127.0.0.1", port, &client_config, NULL, &fixture->client);
 }
 
 static int fixture_stop(rpc_fixture* fixture) {
     if (fixture->registry_initialized) {
-        registry_destroy(&fixture->registry);
-        fixture->registry_initialized = false;
+        registry_close_calls(&fixture->registry);
     }
     trevrpc_raw_client_close(fixture->client);
     fixture->client = NULL;
-    trevrpc_server_shutdown(fixture->server);
-    int err = 0;
+    int err = fixture->server == NULL ? 0 : trevrpc_server_stop(fixture->server);
     if (fixture->serve_thread_started) {
         int join_err = pthread_join(fixture->serve_thread, NULL);
         fixture->serve_thread_started = false;
-        if (join_err != 0) {
+        if (join_err != 0 && err == 0) {
             err = -join_err;
-        } else if (fixture->serve.result != 0) {
+        } else if (fixture->serve.result != 0 && err == 0) {
             err = fixture->serve.result;
         }
     }
-    trevrpc_server_close(fixture->server);
-    fixture->server = NULL;
+    if (fixture->server != NULL) {
+        int wait_err = trevrpc_server_wait_until(fixture->server, TREVRPC_DEADLINE_INFINITE);
+        if (wait_err != 0 && err == 0) {
+            err = wait_err;
+        }
+        int release_err = trevrpc_server_release(fixture->server);
+        if (release_err != 0 && err == 0) {
+            err = release_err;
+        }
+        fixture->server = NULL;
+    }
+    if (fixture->registry_initialized) {
+        registry_destroy(&fixture->registry);
+        fixture->registry_initialized = false;
+    }
     return err;
 }
 
@@ -453,18 +499,25 @@ static int open_client_stream(rpc_fixture* fixture,
     size_t min_message_size,
     trevrpc_stream** out_stream) {
     encode_request_id(request_body, request_frame_size, id);
-    trevrpc_call_options options = trevrpc_default_call_options();
+    trevrpc_call_options_v1 options;
+    int err = trevrpc_call_options_v1_init(&options, sizeof(options));
+    if (err != 0) {
+        return err;
+    }
     options.max_response_messages = (int64_t)(cumulative_body / min_message_size + 4);
     options.max_response_stream_body_size = (int64_t)cumulative_body;
     options.response_idle_timeout_nanos = PROFILE_RPC_IDLE_TIMEOUT_NANOS;
-    return trevrpc_raw_client_start_stream_with_options(fixture->client,
-        SERVICE_NAME,
-        METHOD_NAME,
-        scenario_rpc_kind(scenario),
-        request_body,
-        request_frame_size,
-        &options,
-        out_stream);
+    trevrpc_request request = {
+        .service = SERVICE_NAME,
+        .service_len = sizeof(SERVICE_NAME) - 1,
+        .method = METHOD_NAME,
+        .method_len = sizeof(METHOD_NAME) - 1,
+        .body = request_body,
+        .body_len = request_frame_size,
+        .kind = scenario_rpc_kind(scenario),
+        .version = TREVRPC_WIRE_VERSION,
+    };
+    return trevrpc_raw_client_start_stream_request_v1(fixture->client, &request, &options, out_stream);
 }
 
 static int send_exact_messages(trevrpc_stream* stream,
@@ -490,19 +543,23 @@ static int send_exact_messages(trevrpc_stream* stream,
 static int recv_messages_to(
     trevrpc_stream* stream, size_t target, size_t* received, scenario_metrics* metrics, bool server_side) {
     while (*received < target) {
-        trevrpc_stream_frame* frame = NULL;
-        int err = trevrpc_stream_recv(stream, &frame);
+        trevrpc_inbound_stream_frame* frame = NULL;
+        int err = trevrpc_stream_recv_inbound(stream, &frame);
+        uint32_t kind = 0;
+        trevrpc_bytes_view body = {0};
         if (err != 0) {
             return err;
         }
-        if (frame == NULL || frame->kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE || frame->body_len > target - *received) {
-            trevrpc_stream_frame_free(frame);
+        if (frame == NULL || trevrpc_inbound_stream_frame_get_kind(frame, &kind) != 0 ||
+            trevrpc_inbound_stream_frame_get_body(frame, &body) != 0 || kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE ||
+            body.len > target - *received) {
+            trevrpc_inbound_stream_frame_release(frame);
             return -EPROTO;
         }
-        *received += frame->body_len;
-        metrics->received_bytes += frame->body_len;
+        *received += body.len;
+        metrics->received_bytes += body.len;
         metrics->message_frames++;
-        trevrpc_stream_frame_free(frame);
+        trevrpc_inbound_stream_frame_release(frame);
     }
     (void)server_side;
     return 0;
@@ -510,22 +567,36 @@ static int recv_messages_to(
 
 static int recv_terminal_status(trevrpc_stream* stream, uint32_t expected_status, scenario_metrics* metrics) {
     for (;;) {
-        trevrpc_stream_frame* frame = NULL;
-        int err = trevrpc_stream_recv(stream, &frame);
+        trevrpc_inbound_stream_frame* frame = NULL;
+        int err = trevrpc_stream_recv_inbound(stream, &frame);
         if (err != 0) {
             return err;
         }
         if (frame == NULL) {
             return -EPROTO;
         }
-        if (frame->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
-            metrics->received_bytes += frame->body_len;
+        uint32_t kind = 0;
+        if (trevrpc_inbound_stream_frame_get_kind(frame, &kind) != 0) {
+            trevrpc_inbound_stream_frame_release(frame);
+            return -EPROTO;
+        }
+        if (kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+            trevrpc_bytes_view body = {0};
+            if (trevrpc_inbound_stream_frame_get_body(frame, &body) != 0) {
+                trevrpc_inbound_stream_frame_release(frame);
+                return -EPROTO;
+            }
+            metrics->received_bytes += body.len;
             metrics->message_frames++;
-            trevrpc_stream_frame_free(frame);
+            trevrpc_inbound_stream_frame_release(frame);
             continue;
         }
-        uint32_t status = frame->status;
-        trevrpc_stream_frame_free(frame);
+        uint32_t status = TREVRPC_STATUS_UNKNOWN;
+        if (trevrpc_inbound_stream_frame_get_status(frame, &status) != 0) {
+            trevrpc_inbound_stream_frame_release(frame);
+            return -EPROTO;
+        }
+        trevrpc_inbound_stream_frame_release(frame);
         if (status != expected_status) {
             return -EPROTO;
         }
@@ -543,7 +614,14 @@ static int finish_call(call_registry* registry, size_t id, uint32_t status) {
     if (call == NULL) {
         return -ENOENT;
     }
-    return trevrpc_call_finish_stream(call, status, NULL, 0);
+    trevrpc_status_view_v1 status_view;
+    int err = trevrpc_status_view_v1_init(&status_view, sizeof(status_view));
+    if (err != 0) {
+        trevrpc_call_close(call);
+        return err;
+    }
+    status_view.status = status;
+    return trevrpc_call_finish_stream_borrowed_v1(call, &status_view);
 }
 
 static int run_slow_reader(rpc_fixture* fixture,
@@ -695,9 +773,9 @@ static int run_ingress_success(rpc_fixture* fixture,
         if (result != 0) {
             goto cleanup;
         }
-        trevrpc_stream_frame* frame = NULL;
-        result = trevrpc_stream_recv(trevrpc_call_stream(call), &frame);
-        trevrpc_stream_frame_free(frame);
+        trevrpc_inbound_stream_frame* frame = NULL;
+        result = trevrpc_stream_recv_inbound(trevrpc_call_stream(call), &frame);
+        trevrpc_inbound_stream_frame_release(frame);
         if (result != 0 || frame != NULL) {
             result = result != 0 ? result : -EPROTO;
             goto cleanup;
@@ -750,18 +828,26 @@ static int run_reset(rpc_fixture* fixture,
     }
     for (size_t i = 0; i < concurrency; i++) {
         trevrpc_call* call = registry_get(&fixture->registry, i);
-        trevrpc_stream_frame* frame = NULL;
+        trevrpc_inbound_stream_frame* frame = NULL;
         int recv_result = 0;
         do {
-            trevrpc_stream_frame_free(frame);
+            trevrpc_inbound_stream_frame_release(frame);
             frame = NULL;
-            recv_result = trevrpc_stream_recv(trevrpc_call_stream(call), &frame);
-            if (frame != NULL && frame->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
-                metrics->received_bytes += frame->body_len;
-                metrics->message_frames++;
+            recv_result = trevrpc_stream_recv_inbound(trevrpc_call_stream(call), &frame);
+            if (frame != NULL) {
+                uint32_t kind = 0;
+                trevrpc_bytes_view body = {0};
+                if (trevrpc_inbound_stream_frame_get_kind(frame, &kind) != 0 ||
+                    (kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE &&
+                        trevrpc_inbound_stream_frame_get_body(frame, &body) != 0)) {
+                    recv_result = -EPROTO;
+                } else if (kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+                    metrics->received_bytes += body.len;
+                    metrics->message_frames++;
+                }
             }
         } while (recv_result == 0 && frame != NULL);
-        trevrpc_stream_frame_free(frame);
+        trevrpc_inbound_stream_frame_release(frame);
         if (recv_result != TREV_MSQUIC_ERR_CLOSED) {
             metrics->observed_reset_result = recv_result;
             result = -EPROTO;
@@ -818,9 +904,9 @@ static int run_body_limit(rpc_fixture* fixture,
         if (result != 0) {
             goto cleanup;
         }
-        trevrpc_stream_frame* frame = NULL;
-        result = trevrpc_stream_recv(trevrpc_call_stream(call), &frame);
-        trevrpc_stream_frame_free(frame);
+        trevrpc_inbound_stream_frame* frame = NULL;
+        result = trevrpc_stream_recv_inbound(trevrpc_call_stream(call), &frame);
+        trevrpc_inbound_stream_frame_release(frame);
         if (result != TREVRPC_ERR_STREAM_LIMIT_EXCEEDED || frame != NULL) {
             result = -EPROTO;
             goto cleanup;

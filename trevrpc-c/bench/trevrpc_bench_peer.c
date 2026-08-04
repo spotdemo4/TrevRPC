@@ -29,6 +29,12 @@ typedef Trevrpc__Benchmark__V1__BenchmarkResponse BenchmarkResponse;
 typedef Trevrpc__Benchmark__V1__BenchmarkSummary BenchmarkSummary;
 typedef Trevrpc__Benchmark__V1__StreamRequest StreamRequest;
 typedef trevrpc_benchmark_v1_benchmark_service_server BenchmarkService;
+typedef trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_receiver BenchmarkRequestReceiver;
+typedef trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event BenchmarkRequestEvent;
+typedef trevrpc_benchmark_v1_benchmark_service_benchmark_response_receiver BenchmarkResponseReceiver;
+typedef trevrpc_benchmark_v1_benchmark_service_benchmark_response_event BenchmarkResponseEvent;
+typedef trevrpc_benchmark_v1_benchmark_service_benchmark_summary_receiver BenchmarkSummaryReceiver;
+typedef trevrpc_benchmark_v1_benchmark_service_benchmark_summary_event BenchmarkSummaryEvent;
 
 typedef struct benchmark_client {
     benchmark_stack stack;
@@ -585,65 +591,102 @@ static BenchmarkSummary* new_summary(uint64_t message_count, uint64_t payload_by
 static int service_unary(void* user_data,
     const trevrpc_call_context* context,
     const BenchmarkRequest* request,
-    BenchmarkResponse** response) {
+    trevrpc_benchmark_v1_benchmark_service_unary_respond_fn respond,
+    void* respond_context) {
     (void)user_data;
-    if (request == NULL || response == NULL || request->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES ||
+    if (request == NULL || respond == NULL || request->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES ||
         request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES || trevrpc_call_context_cancelled(context)) {
         return -EINVAL;
     }
-    *response = new_response(request->sequence, request->response_bytes);
-    return *response == NULL ? -ENOMEM : 0;
-}
-
-static int recv_benchmark_request(trevrpc_stream* stream, BenchmarkRequest** request, uint32_t* status) {
-    return trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_request(stream, request, status);
+    BenchmarkResponse* message = new_response(request->sequence, request->response_bytes);
+    if (message == NULL) {
+        return -ENOMEM;
+    }
+    trevrpc_benchmark_v1_benchmark_service_unary_response_view response = {
+        .message = message,
+        .status = TREVRPC_STATUS_OK,
+    };
+    int err = respond(respond_context, &response);
+    trevrpc__benchmark__v1__benchmark_response__free_unpacked(message, NULL);
+    return err;
 }
 
 static int send_benchmark_response(trevrpc_stream* stream, const BenchmarkResponse* response) {
     return trevrpc_benchmark_v1_benchmark_service_send_trevrpc_benchmark_v1_benchmark_response(stream, response);
 }
 
-static int service_client_stream(
-    void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream, BenchmarkSummary** response) {
+static int service_client_stream(void* user_data,
+    const trevrpc_call_context* context,
+    trevrpc_stream* stream,
+    trevrpc_benchmark_v1_benchmark_service_client_stream_respond_fn respond,
+    void* respond_context) {
     (void)user_data;
     uint64_t count = 0;
     uint64_t payload_bytes = 0;
+    BenchmarkRequestReceiver receiver = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_RECEIVER_INIT;
+    int result = trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_receiver_init(&receiver, stream);
+    if (result != 0) {
+        return result;
+    }
     for (;;) {
         if (trevrpc_call_context_cancelled(context)) {
-            return -ECANCELED;
-        }
-        BenchmarkRequest* request = NULL;
-        uint32_t status = TREVRPC_STATUS_OK;
-        int err = recv_benchmark_request(stream, &request, &status);
-        if (err != 0) {
-            return err;
-        }
-        if (request == NULL) {
-            if (status != TREVRPC_STATUS_OK) {
-                return -EINVAL;
-            }
+            result = -ECANCELED;
             break;
         }
-        if (request->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES) {
-            trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
-            return -EINVAL;
+        BenchmarkRequestEvent event = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_EVENT_INIT;
+        result = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_request_request(
+            &receiver, &event);
+        if (result != 0) {
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
         }
-        if (count >= BENCHMARK_MAX_MESSAGES_PER_STREAM) {
-            trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
-            return -E2BIG;
+        if (event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_EVENT_END) {
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
         }
-        if (checked_add_u64(&payload_bytes, request->payload.len) != 0) {
-            trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
-            return -EINVAL;
+        if (event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_EVENT_TERMINAL_STATUS) {
+            uint32_t status = TREVRPC_STATUS_UNKNOWN;
+            result = trevrpc_inbound_stream_frame_get_status(event.frame, &status);
+            if (result == 0 && status != TREVRPC_STATUS_OK) {
+                result = -EINVAL;
+            }
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
         }
-        if (checked_add_u64(&count, 1) != 0) {
-            trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
-            return -EOVERFLOW;
+        if (event.kind != TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_EVENT_MESSAGE) {
+            result = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
         }
-        trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
+        if (event.message->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES) {
+            result = -EINVAL;
+        } else if (count >= BENCHMARK_MAX_MESSAGES_PER_STREAM) {
+            result = -E2BIG;
+        } else if (checked_add_u64(&payload_bytes, event.message->payload.len) != 0) {
+            result = -EINVAL;
+        } else if (checked_add_u64(&count, 1) != 0) {
+            result = -EOVERFLOW;
+        }
+        trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+        if (result != 0) {
+            break;
+        }
     }
-    *response = new_summary(count, payload_bytes);
-    return *response == NULL ? -ENOMEM : 0;
+    trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_receiver_reset(&receiver);
+    if (result != 0) {
+        return result;
+    }
+    BenchmarkSummary* message = new_summary(count, payload_bytes);
+    if (message == NULL) {
+        return -ENOMEM;
+    }
+    trevrpc_benchmark_v1_benchmark_service_client_stream_response_view response = {
+        .message = message,
+        .status = TREVRPC_STATUS_OK,
+    };
+    result = respond(respond_context, &response);
+    trevrpc__benchmark__v1__benchmark_summary__free_unpacked(message, NULL);
+    return result;
 }
 
 static int service_server_stream(
@@ -674,36 +717,62 @@ static int service_server_stream(
 static int service_bidi(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream) {
     (void)user_data;
     uint32_t count = 0;
+    BenchmarkRequestReceiver receiver = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_RECEIVER_INIT;
+    int result = trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_receiver_init(&receiver, stream);
+    if (result != 0) {
+        return result;
+    }
     for (;;) {
         if (trevrpc_call_context_cancelled(context)) {
-            return -ECANCELED;
+            result = -ECANCELED;
+            break;
         }
-        BenchmarkRequest* request = NULL;
-        uint32_t status = TREVRPC_STATUS_OK;
-        int err = recv_benchmark_request(stream, &request, &status);
-        if (err != 0) {
-            return err;
+        BenchmarkRequestEvent event = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_EVENT_INIT;
+        result = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_request_request(
+            &receiver, &event);
+        if (result != 0) {
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
         }
-        if (request == NULL) {
-            return status == TREVRPC_STATUS_OK ? 0 : -EINVAL;
+        if (event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_EVENT_END) {
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
         }
-        if (request->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES || count >= BENCHMARK_MAX_MESSAGES_PER_STREAM ||
-            request->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES) {
-            trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
-            return -EINVAL;
+        if (event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_EVENT_TERMINAL_STATUS) {
+            uint32_t status = TREVRPC_STATUS_UNKNOWN;
+            result = trevrpc_inbound_stream_frame_get_status(event.frame, &status);
+            if (result == 0 && status != TREVRPC_STATUS_OK) {
+                result = -EINVAL;
+            }
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
+        }
+        if (event.kind != TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_REQUEST_REQUEST_EVENT_MESSAGE) {
+            result = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
+        }
+        if (event.message->payload.len > BENCHMARK_MAX_PAYLOAD_BYTES || count >= BENCHMARK_MAX_MESSAGES_PER_STREAM ||
+            event.message->response_bytes > BENCHMARK_MAX_PAYLOAD_BYTES) {
+            result = -EINVAL;
+            trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
+            break;
         }
         count++;
-        BenchmarkResponse* response = new_response(request->sequence, request->response_bytes);
-        trevrpc__benchmark__v1__benchmark_request__free_unpacked(request, NULL);
+        BenchmarkResponse* response = new_response(event.message->sequence, event.message->response_bytes);
+        trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_event_reset(&event);
         if (response == NULL) {
-            return -ENOMEM;
+            result = -ENOMEM;
+            break;
         }
-        err = send_benchmark_response(stream, response);
+        result = send_benchmark_response(stream, response);
         trevrpc__benchmark__v1__benchmark_response__free_unpacked(response, NULL);
-        if (err != 0) {
-            return err;
+        if (result != 0) {
+            break;
         }
     }
+    trevrpc_benchmark_v1_benchmark_service_benchmark_request_request_receiver_reset(&receiver);
+    return result;
 }
 
 static const BenchmarkService BenchmarkServiceImplementation = {
@@ -747,24 +816,14 @@ static int validate_response(const BenchmarkResponse* response, uint64_t sequenc
     return 0;
 }
 
-static int recv_benchmark_response(trevrpc_stream* stream, BenchmarkResponse** response, uint32_t* status) {
-    return trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_response(
-        stream, response, status);
+static int require_ok_status_frame(const trevrpc_inbound_stream_frame* frame) {
+    uint32_t status = TREVRPC_STATUS_UNKNOWN;
+    int err = trevrpc_inbound_stream_frame_get_status(frame, &status);
+    return err != 0 ? err : (status == TREVRPC_STATUS_OK ? 0 : -EINVAL);
 }
 
 static int send_benchmark_request(trevrpc_stream* stream, const BenchmarkRequest* request) {
     return trevrpc_benchmark_v1_benchmark_service_send_trevrpc_benchmark_v1_benchmark_request(stream, request);
-}
-
-static int recv_terminal_response_status(trevrpc_stream* stream) {
-    BenchmarkResponse* response = NULL;
-    uint32_t status = TREVRPC_STATUS_OK;
-    int err = recv_benchmark_response(stream, &response, &status);
-    if (response != NULL) {
-        trevrpc__benchmark__v1__benchmark_response__free_unpacked(response, NULL);
-        return -EINVAL;
-    }
-    return err == 0 && status == TREVRPC_STATUS_OK ? 0 : (err != 0 ? err : -EINVAL);
 }
 
 static int run_unary(trevrpc_raw_client* client, const client_options* options, uint64_t operation_sequence) {
@@ -780,25 +839,40 @@ static int run_unary(trevrpc_raw_client* client, const client_options* options, 
     uint8_t* body = NULL;
     size_t body_len = 0;
     int err = pack_benchmark_request(&request, &body, &body_len);
-    trevrpc_response* raw_response = NULL;
+    trevrpc_inbound_response* raw_response = NULL;
     if (err == 0) {
-        err = trevrpc_raw_client_call_unary(
-            client, "trevrpc.benchmark.v1.BenchmarkService", "Unary", body, body_len, &raw_response);
+        trevrpc_request rpc_request = {
+            .service = "trevrpc.benchmark.v1.BenchmarkService",
+            .service_len = sizeof("trevrpc.benchmark.v1.BenchmarkService") - 1,
+            .method = "Unary",
+            .method_len = sizeof("Unary") - 1,
+            .body = body,
+            .body_len = body_len,
+            .kind = TREVRPC_RPC_KIND_UNARY,
+            .version = TREVRPC_WIRE_VERSION,
+        };
+        err = trevrpc_raw_client_call_request_inbound_v1(client, &rpc_request, NULL, &raw_response);
     }
     free(request.payload.data);
     free(body);
-    if (err == 0 && (raw_response == NULL || raw_response->status != TREVRPC_STATUS_OK)) {
+    uint32_t status = TREVRPC_STATUS_UNKNOWN;
+    if (err == 0 && (raw_response == NULL || trevrpc_inbound_response_get_status(raw_response, &status) != 0 ||
+                        status != TREVRPC_STATUS_OK)) {
         err = -EINVAL;
     }
     BenchmarkResponse* response = NULL;
     if (err == 0) {
-        response = trevrpc__benchmark__v1__benchmark_response__unpack(NULL, raw_response->body_len, raw_response->body);
-        err = validate_response(response, operation_sequence, options->response_bytes);
+        trevrpc_bytes_view response_body = {0};
+        err = trevrpc_inbound_response_get_body(raw_response, &response_body);
+        if (err == 0) {
+            response = trevrpc__benchmark__v1__benchmark_response__unpack(NULL, response_body.len, response_body.data);
+            err = validate_response(response, operation_sequence, options->response_bytes);
+        }
     }
     if (response != NULL) {
         trevrpc__benchmark__v1__benchmark_response__free_unpacked(response, NULL);
     }
-    trevrpc_response_free(raw_response);
+    trevrpc_inbound_response_release(raw_response);
     return err;
 }
 
@@ -808,8 +882,17 @@ static int start_raw_stream(trevrpc_raw_client* client,
     const uint8_t* body,
     size_t body_len,
     trevrpc_stream** stream) {
-    return trevrpc_raw_client_start_stream(
-        client, "trevrpc.benchmark.v1.BenchmarkService", method, kind, body, body_len, stream);
+    trevrpc_request request = {
+        .service = "trevrpc.benchmark.v1.BenchmarkService",
+        .service_len = sizeof("trevrpc.benchmark.v1.BenchmarkService") - 1,
+        .method = method,
+        .method_len = strlen(method),
+        .body = body,
+        .body_len = body_len,
+        .kind = kind,
+        .version = TREVRPC_WIRE_VERSION,
+    };
+    return trevrpc_raw_client_start_stream_request_v1(client, &request, NULL, stream);
 }
 
 static int run_client_stream(trevrpc_raw_client* client, const client_options* options) {
@@ -835,31 +918,35 @@ static int run_client_stream(trevrpc_raw_client* client, const client_options* o
         err = trevrpc_stream_finish_send(stream);
     }
 
-    BenchmarkSummary* summary = NULL;
-    uint32_t status = TREVRPC_STATUS_OK;
+    BenchmarkSummaryReceiver receiver = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_SUMMARY_RECEIVER_INIT;
     if (err == 0) {
-        err = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_summary(
-            stream, &summary, &status);
-    }
-    uint64_t expected_bytes = (uint64_t)options->request_bytes * options->messages_per_stream;
-    if (err == 0 && (summary == NULL || summary->message_count != options->messages_per_stream ||
-                        summary->payload_bytes != expected_bytes)) {
-        err = -EINVAL;
-    }
-    if (summary != NULL) {
-        trevrpc__benchmark__v1__benchmark_summary__free_unpacked(summary, NULL);
-        summary = NULL;
+        err = trevrpc_benchmark_v1_benchmark_service_benchmark_summary_receiver_init(&receiver, stream);
     }
     if (err == 0) {
-        err = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_summary(
-            stream, &summary, &status);
-        if (err == 0 && (summary != NULL || status != TREVRPC_STATUS_OK)) {
-            err = -EINVAL;
+        BenchmarkSummaryEvent event = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_SUMMARY_EVENT_INIT;
+        err = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_summary(&receiver, &event);
+        uint64_t expected_bytes = (uint64_t)options->request_bytes * options->messages_per_stream;
+        if (err == 0 && event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_SUMMARY_EVENT_MESSAGE) {
+            if (event.message->message_count != options->messages_per_stream ||
+                event.message->payload_bytes != expected_bytes) {
+                err = -EINVAL;
+            }
+        } else if (err == 0) {
+            err = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
         }
+        trevrpc_benchmark_v1_benchmark_service_benchmark_summary_event_reset(&event);
     }
-    if (summary != NULL) {
-        trevrpc__benchmark__v1__benchmark_summary__free_unpacked(summary, NULL);
+    if (err == 0) {
+        BenchmarkSummaryEvent event = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_SUMMARY_EVENT_INIT;
+        err = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_summary(&receiver, &event);
+        if (err == 0 && event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_SUMMARY_EVENT_TERMINAL_STATUS) {
+            err = require_ok_status_frame(event.frame);
+        } else if (err == 0) {
+            err = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
+        }
+        trevrpc_benchmark_v1_benchmark_service_benchmark_summary_event_reset(&event);
     }
+    trevrpc_benchmark_v1_benchmark_service_benchmark_summary_receiver_reset(&receiver);
     if (err != 0 && stream != NULL) {
         trevrpc_stream_cancel(stream);
     }
@@ -888,20 +975,31 @@ static int run_server_stream(trevrpc_raw_client* client, const client_options* o
     if (err == 0) {
         err = trevrpc_stream_finish_send(stream);
     }
+    BenchmarkResponseReceiver receiver = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_RECEIVER_INIT;
+    if (err == 0) {
+        err = trevrpc_benchmark_v1_benchmark_service_benchmark_response_receiver_init(&receiver, stream);
+    }
     for (uint64_t sequence = 0; err == 0 && sequence < options->messages_per_stream; sequence++) {
-        BenchmarkResponse* response = NULL;
-        uint32_t status = TREVRPC_STATUS_OK;
-        err = recv_benchmark_response(stream, &response, &status);
-        if (err == 0) {
-            err = validate_response(response, sequence, options->response_bytes);
+        BenchmarkResponseEvent event = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_EVENT_INIT;
+        err = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_response(&receiver, &event);
+        if (err == 0 && event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_EVENT_MESSAGE) {
+            err = validate_response(event.message, sequence, options->response_bytes);
+        } else if (err == 0) {
+            err = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
         }
-        if (response != NULL) {
-            trevrpc__benchmark__v1__benchmark_response__free_unpacked(response, NULL);
-        }
+        trevrpc_benchmark_v1_benchmark_service_benchmark_response_event_reset(&event);
     }
     if (err == 0) {
-        err = recv_terminal_response_status(stream);
+        BenchmarkResponseEvent event = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_EVENT_INIT;
+        err = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_response(&receiver, &event);
+        if (err == 0 && event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_EVENT_TERMINAL_STATUS) {
+            err = require_ok_status_frame(event.frame);
+        } else if (err == 0) {
+            err = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
+        }
+        trevrpc_benchmark_v1_benchmark_service_benchmark_response_event_reset(&event);
     }
+    trevrpc_benchmark_v1_benchmark_service_benchmark_response_receiver_reset(&receiver);
     if (err != 0 && stream != NULL) {
         trevrpc_stream_cancel(stream);
     }
@@ -940,25 +1038,32 @@ static int run_bidi(trevrpc_raw_client* client, const client_options* options) {
     if (err != 0) {
         return err;
     }
+    BenchmarkResponseReceiver receiver = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_RECEIVER_INIT;
+    err = trevrpc_benchmark_v1_benchmark_service_benchmark_response_receiver_init(&receiver, stream);
+    if (err != 0) {
+        trevrpc_stream_cancel(stream);
+        trevrpc_stream_close(stream);
+        return err;
+    }
 
     bidi_sender_args sender_args = {.stream = stream, .options = options};
     pthread_t sender;
     int thread_err = pthread_create(&sender, NULL, bidi_sender_thread, &sender_args);
     if (thread_err != 0) {
+        trevrpc_benchmark_v1_benchmark_service_benchmark_response_receiver_reset(&receiver);
         trevrpc_stream_cancel(stream);
         trevrpc_stream_close(stream);
         return -thread_err;
     }
     for (uint64_t sequence = 0; err == 0 && sequence < options->messages_per_stream; sequence++) {
-        BenchmarkResponse* response = NULL;
-        uint32_t status = TREVRPC_STATUS_OK;
-        err = recv_benchmark_response(stream, &response, &status);
-        if (err == 0) {
-            err = validate_response(response, sequence, options->response_bytes);
+        BenchmarkResponseEvent event = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_EVENT_INIT;
+        err = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_response(&receiver, &event);
+        if (err == 0 && event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_EVENT_MESSAGE) {
+            err = validate_response(event.message, sequence, options->response_bytes);
+        } else if (err == 0) {
+            err = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
         }
-        if (response != NULL) {
-            trevrpc__benchmark__v1__benchmark_response__free_unpacked(response, NULL);
-        }
+        trevrpc_benchmark_v1_benchmark_service_benchmark_response_event_reset(&event);
     }
     if (err != 0) {
         trevrpc_stream_cancel(stream);
@@ -968,8 +1073,16 @@ static int run_bidi(trevrpc_raw_client* client, const client_options* options) {
         err = join_err == 0 ? sender_args.result : -join_err;
     }
     if (err == 0) {
-        err = recv_terminal_response_status(stream);
+        BenchmarkResponseEvent event = TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_EVENT_INIT;
+        err = trevrpc_benchmark_v1_benchmark_service_recv_trevrpc_benchmark_v1_benchmark_response(&receiver, &event);
+        if (err == 0 && event.kind == TREVRPC_BENCHMARK_V1_BENCHMARK_SERVICE_BENCHMARK_RESPONSE_EVENT_TERMINAL_STATUS) {
+            err = require_ok_status_frame(event.frame);
+        } else if (err == 0) {
+            err = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
+        }
+        trevrpc_benchmark_v1_benchmark_service_benchmark_response_event_reset(&event);
     }
+    trevrpc_benchmark_v1_benchmark_service_benchmark_response_receiver_reset(&receiver);
     if (err != 0) {
         trevrpc_stream_cancel(stream);
     }
@@ -1482,7 +1595,12 @@ static int run_server(int argc, char** argv) {
         return err;
     }
 
-    trevrpc_server_config config = trevrpc_default_server_config();
+    trevrpc_server_config_v1 config;
+    err = trevrpc_server_config_v1_init(&config, sizeof(config));
+    if (err != 0) {
+        free(options.host);
+        return fail_with_error("config", "config_failed", "%s (%d)", trevrpc_error(err), err);
+    }
     config.host = options.host;
     config.port = options.port;
     config.cert_file = options.cert;
@@ -1498,12 +1616,20 @@ static int run_server(int argc, char** argv) {
         config.webtransport_origin = options.webtransport_origin;
     }
     trevrpc_server* server = NULL;
-    err = trevrpc_server_listen(&config, &server);
+    err = trevrpc_server_listen_v1(&config, &server);
     if (err != 0) {
         free(options.host);
         return fail_with_error("listen", "listen_failed", "%s (%d)", trevrpc_error(err), err);
     }
-    trevrpc_server_options runtime_options = trevrpc_default_server_options();
+    trevrpc_server_options_v1 runtime_options;
+    err = trevrpc_server_options_v1_init(&runtime_options, sizeof(runtime_options));
+    if (err != 0) {
+        (void)trevrpc_server_stop(server);
+        (void)trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
+        (void)trevrpc_server_release(server);
+        free(options.host);
+        return fail_with_error("config", "config_failed", "%s (%d)", trevrpc_error(err), err);
+    }
     runtime_options.max_concurrent_streams_per_connection = BENCHMARK_SERVER_STREAMS;
     runtime_options.max_concurrent_requests = BENCHMARK_SERVER_REQUESTS;
     runtime_options.worker_count = (int64_t)options.workers;
@@ -1511,12 +1637,14 @@ static int run_server(int argc, char** argv) {
     runtime_options.graceful_shutdown_timeout_nanos = BENCHMARK_GRACEFUL_SHUTDOWN_NS;
     runtime_options.max_stream_messages = BENCHMARK_MAX_MESSAGES_PER_STREAM;
     runtime_options.max_stream_body_size = -1;
-    err = trevrpc_server_set_options(server, &runtime_options);
+    err = trevrpc_server_set_options_v1(server, &runtime_options);
     if (err == 0) {
         err = trevrpc_benchmark_v1_benchmark_service_register(server, &BenchmarkServiceImplementation);
     }
     if (err != 0) {
-        trevrpc_server_close(server);
+        (void)trevrpc_server_stop(server);
+        (void)trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
+        (void)trevrpc_server_release(server);
         free(options.host);
         return fail_with_error("listen", "service_setup_failed", "%s (%d)", trevrpc_error(err), err);
     }
@@ -1548,6 +1676,9 @@ static int run_server(int argc, char** argv) {
         observer_set = err == 0;
     }
     if (err == 0) {
+        err = trevrpc_server_freeze(server);
+    }
+    if (err == 0) {
         int thread_err = pthread_create(&thread, NULL, server_thread, &thread_args);
         err = thread_err == 0 ? 0 : -thread_err;
         thread_started = thread_err == 0;
@@ -1562,7 +1693,9 @@ static int run_server(int argc, char** argv) {
         if (mutex_initialized) {
             pthread_mutex_destroy(&thread_args.mutex);
         }
-        trevrpc_server_close(server);
+        (void)trevrpc_server_stop(server);
+        (void)trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
+        (void)trevrpc_server_release(server);
         free(options.host);
         return fail_with_error("listen", "serve_failed", "%s (%d)", trevrpc_error(err), err);
     }
@@ -1573,7 +1706,9 @@ static int run_server(int argc, char** argv) {
         trevrpc_server_clear_transport_observer(server);
         pthread_cond_destroy(&thread_args.cond);
         pthread_mutex_destroy(&thread_args.mutex);
-        trevrpc_server_close(server);
+        (void)trevrpc_server_stop(server);
+        (void)trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
+        (void)trevrpc_server_release(server);
         free(options.host);
         return fail_with_error("listen", "serve_failed", "%s (%d)", trevrpc_error(err), err);
     }
@@ -1584,19 +1719,21 @@ static int run_server(int argc, char** argv) {
     (void)sigaction(SIGINT, &action, NULL);
     (void)sigaction(SIGTERM, &action, NULL);
     if (emit_ready(options.host, actual_port, options.stack_name) != 0) {
-        trevrpc_server_shutdown(server);
+        (void)trevrpc_server_stop(server);
         (void)pthread_join(thread, NULL);
         trevrpc_server_clear_transport_observer(server);
         pthread_cond_destroy(&thread_args.cond);
         pthread_mutex_destroy(&thread_args.mutex);
-        trevrpc_server_close(server);
+        (void)trevrpc_server_stop(server);
+        (void)trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
+        (void)trevrpc_server_release(server);
         free(options.host);
         return 1;
     }
 
     bool graceful = false;
     int wait_err = wait_for_server_shutdown(&thread_args, native_server_done, &graceful);
-    trevrpc_server_shutdown(server);
+    (void)trevrpc_server_stop(server);
     int join_err = thread_started ? pthread_join(thread, NULL) : 0;
     int serve_result = 0;
     (void)server_thread_done(&thread_args, &serve_result);
@@ -1606,13 +1743,14 @@ static int run_server(int argc, char** argv) {
     trevrpc_server_clear_transport_observer(server);
     pthread_cond_destroy(&thread_args.cond);
     pthread_mutex_destroy(&thread_args.mutex);
-    trevrpc_server_close(server);
+    int server_wait_err = trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
+    int server_release_err = server_wait_err == 0 ? trevrpc_server_release(server) : server_wait_err;
     free(options.host);
     if (wait_err != 0) {
         return fail_with_error("serve", "control_failed", "%s (%d)", trevrpc_error(wait_err), wait_err);
     }
-    if (join_err != 0 || serve_result != 0) {
-        err = join_err != 0 ? -join_err : serve_result;
+    if (join_err != 0 || serve_result != 0 || server_release_err != 0) {
+        err = join_err != 0 ? -join_err : (serve_result != 0 ? serve_result : server_release_err);
         return fail_with_error("serve", "shutdown_failed", "%s (%d)", trevrpc_error(err), err);
     }
     if (graceful && emit_stopped(options.stack_name) != 0) {
@@ -1656,14 +1794,18 @@ static int run_client(int argc, char** argv) {
     if (options.stack == BENCHMARK_STACK_GRPC_HTTP2) {
         err = trevrpc_bench_grpc_client_connect(&options, &client.impl.grpc);
     } else {
-        trevrpc_config config = trevrpc_default_config();
-        config.ca_cert_file = options.cert;
-        config.skip_certificate_validation = 0;
-        config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
-        config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
-        config.peer_bidi_stream_count = (uint16_t)(options.concurrency > UINT16_MAX ? UINT16_MAX : options.concurrency);
-        config.max_frame_size = BENCHMARK_MAX_FRAME_SIZE;
-        err = trevrpc_raw_client_connect(options.host, options.port, &config, &client.impl.native);
+        trevrpc_client_config_v1 config;
+        err = trevrpc_client_config_v1_init(&config, sizeof(config));
+        if (err == 0) {
+            config.ca_cert_file = options.cert;
+            config.skip_certificate_validation = 0;
+            config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
+            config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
+            config.peer_bidi_stream_count =
+                (uint16_t)(options.concurrency > UINT16_MAX ? UINT16_MAX : options.concurrency);
+            config.max_frame_size = BENCHMARK_MAX_FRAME_SIZE;
+            err = trevrpc_raw_client_connect_v1(options.host, options.port, &config, NULL, &client.impl.native);
+        }
     }
     if (err != 0) {
         int result = fail_with_error("connect", "connect_failed", "%s (%d)", trevrpc_error(err), err);

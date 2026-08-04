@@ -1,0 +1,5 @@
+# libmsquic 2.5.8 teardown races in its uninstrumented platform event loop.
+race:CxPlatProcessEvents
+
+# OpenSSL teardown inside the statically linked libmsquic runtime.
+race:CRYPTO_THREAD_lock_free

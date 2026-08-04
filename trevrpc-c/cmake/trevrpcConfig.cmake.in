@@ -6,6 +6,8 @@ if(@TREVRPC_BUILD_MSQUIC@)
     find_dependency(msquic CONFIG)
 endif()
 
+set(TREVRPC_C_ABI_VERSION @TREVRPC_C_ABI_VERSION@)
+
 include("${CMAKE_CURRENT_LIST_DIR}/trevrpcTargets.cmake")
 
 check_required_components(trevrpc)

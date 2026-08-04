@@ -1,4 +1,4 @@
-#include "trevrpc.h"
+#include "trevrpc_wire_internal.h"
 
 #include <errno.h> // IWYU pragma: keep
 #include <stdbool.h>
@@ -36,26 +36,6 @@ static int trevrpc_copy_chars(char** dst, size_t* dst_len, const char* src, size
     }
 
     char* copy = NULL;
-    if (src_len > 0) {
-        copy = malloc(src_len);
-        if (copy == NULL) {
-            return -ENOMEM;
-        }
-        memcpy(copy, src, src_len);
-    }
-
-    free(*dst);
-    *dst = copy;
-    *dst_len = src_len;
-    return 0;
-}
-
-static int trevrpc_copy_bytes(uint8_t** dst, size_t* dst_len, const uint8_t* src, size_t src_len) {
-    if (src == NULL && src_len > 0) {
-        return -EINVAL;
-    }
-
-    uint8_t* copy = NULL;
     if (src_len > 0) {
         copy = malloc(src_len);
         if (copy == NULL) {
@@ -463,34 +443,42 @@ void trevrpc_request_reset(trevrpc_request* request) {
     memset(request, 0, sizeof(*request));
 }
 
-int trevrpc_response_set_message(trevrpc_response* response, const char* message, size_t message_len) {
+static void trevrpc_internal_owned_free(void* owner, void* context) {
+    (void)context;
+    free(owner);
+}
+
+int trevrpc_internal_response_set_message(
+    trevrpc_wire_response_values* response, const char* message, size_t message_len) {
     if (response == NULL) {
         return -EINVAL;
     }
-
     return trevrpc_copy_chars(&response->message, &response->message_len, message, message_len);
 }
 
-int trevrpc_response_set_body(trevrpc_response* response, const uint8_t* body, size_t body_len) {
-    if (response == NULL) {
+int trevrpc_internal_response_set_body(trevrpc_wire_response_values* response, const uint8_t* body, size_t body_len) {
+    if (response == NULL || (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
-
-    if (response->_body_owner != NULL) {
-        free(response->_body_owner);
-        response->_body_owner = NULL;
-        response->body = NULL;
-        response->body_len = 0;
+    uint8_t* copy = NULL;
+    if (body_len > 0) {
+        copy = malloc(body_len);
+        if (copy == NULL) {
+            return -ENOMEM;
+        }
+        memcpy(copy, body, body_len);
     }
-    return trevrpc_copy_bytes(&response->body, &response->body_len, body, body_len);
+    trevrpc_owned_bytes_reset(&response->body);
+    response->body = (trevrpc_owned_bytes){
+        .data = copy, .len = body_len, .owner = copy, .release = trevrpc_internal_owned_free, .release_context = NULL};
+    return 0;
 }
 
-int trevrpc_response_set_status(trevrpc_response* response, trevrpc_status status) {
+int trevrpc_internal_response_set_status(trevrpc_wire_response_values* response, trevrpc_status status) {
     if (response == NULL) {
         return -EINVAL;
     }
-
-    int err = trevrpc_response_set_message(response, status.message, status.message_len);
+    int err = trevrpc_internal_response_set_message(response, status.message, status.message_len);
     if (err != 0) {
         return err;
     }
@@ -498,67 +486,60 @@ int trevrpc_response_set_status(trevrpc_response* response, trevrpc_status statu
     return 0;
 }
 
-void trevrpc_response_reset(trevrpc_response* response) {
+void trevrpc_internal_response_reset(trevrpc_wire_response_values* response) {
     if (response == NULL) {
         return;
     }
-
     free(response->message);
-    if (response->_body_owner != NULL) {
-        free(response->_body_owner);
-    } else {
-        free(response->body);
-    }
+    trevrpc_owned_bytes_reset(&response->body);
     trevrpc_metadata_reset(&response->metadata);
-    response->status = TREVRPC_STATUS_OK;
-    response->message = NULL;
-    response->message_len = 0;
-    response->body = NULL;
-    response->body_len = 0;
-    response->_body_owner = NULL;
+    memset(response, 0, sizeof(*response));
 }
 
-void trevrpc_response_free(trevrpc_response* response) {
+void trevrpc_internal_response_free(trevrpc_wire_response_values* response) {
     if (response == NULL) {
         return;
     }
-
-    trevrpc_response_reset(response);
+    trevrpc_internal_response_reset(response);
     free(response);
 }
 
-int trevrpc_stream_frame_set_message(trevrpc_stream_frame* frame, const char* message, size_t message_len) {
+int trevrpc_internal_stream_frame_set_message(
+    trevrpc_wire_stream_frame_values* frame, const char* message, size_t message_len) {
     if (frame == NULL) {
         return -EINVAL;
     }
-
     return trevrpc_copy_chars(&frame->message, &frame->message_len, message, message_len);
 }
 
-int trevrpc_stream_frame_set_body(trevrpc_stream_frame* frame, const uint8_t* body, size_t body_len) {
-    if (frame == NULL) {
+int trevrpc_internal_stream_frame_set_body(
+    trevrpc_wire_stream_frame_values* frame, const uint8_t* body, size_t body_len) {
+    if (frame == NULL || (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
-
-    if (frame->_body_owner != NULL) {
-        free(frame->_body_owner);
-        frame->_body_owner = NULL;
-        frame->body = NULL;
-        frame->body_len = 0;
+    uint8_t* copy = NULL;
+    if (body_len > 0) {
+        copy = malloc(body_len);
+        if (copy == NULL) {
+            return -ENOMEM;
+        }
+        memcpy(copy, body, body_len);
     }
-    return trevrpc_copy_bytes(&frame->body, &frame->body_len, body, body_len);
+    trevrpc_owned_bytes_reset(&frame->body);
+    frame->body = (trevrpc_owned_bytes){
+        .data = copy, .len = body_len, .owner = copy, .release = trevrpc_internal_owned_free, .release_context = NULL};
+    return 0;
 }
 
-int trevrpc_stream_frame_set_status(trevrpc_stream_frame* frame, trevrpc_status status) {
+int trevrpc_internal_stream_frame_set_status(trevrpc_wire_stream_frame_values* frame, trevrpc_status status) {
     if (frame == NULL) {
         return -EINVAL;
     }
-
-    int err = trevrpc_stream_frame_set_message(frame, status.message, status.message_len);
+    int err = trevrpc_internal_stream_frame_set_message(frame, status.message, status.message_len);
     if (err != 0) {
         return err;
     }
-    err = trevrpc_stream_frame_set_body(frame, NULL, 0);
+    err = trevrpc_internal_stream_frame_set_body(frame, NULL, 0);
     if (err != 0) {
         return err;
     }
@@ -567,32 +548,21 @@ int trevrpc_stream_frame_set_status(trevrpc_stream_frame* frame, trevrpc_status 
     return 0;
 }
 
-void trevrpc_stream_frame_reset(trevrpc_stream_frame* frame) {
+void trevrpc_internal_stream_frame_reset(trevrpc_wire_stream_frame_values* frame) {
     if (frame == NULL) {
         return;
     }
-
     free(frame->message);
-    if (frame->_body_owner != NULL) {
-        free(frame->_body_owner);
-    } else {
-        free(frame->body);
-    }
+    trevrpc_owned_bytes_reset(&frame->body);
     trevrpc_metadata_reset(&frame->metadata);
+    memset(frame, 0, sizeof(*frame));
     frame->kind = TREVRPC_STREAM_FRAME_KIND_MESSAGE;
-    frame->status = TREVRPC_STATUS_OK;
-    frame->message = NULL;
-    frame->message_len = 0;
-    frame->body = NULL;
-    frame->body_len = 0;
-    frame->_body_owner = NULL;
 }
 
-void trevrpc_stream_frame_free(trevrpc_stream_frame* frame) {
+void trevrpc_internal_stream_frame_free(trevrpc_wire_stream_frame_values* frame) {
     if (frame == NULL) {
         return;
     }
-
-    trevrpc_stream_frame_reset(frame);
+    trevrpc_internal_stream_frame_reset(frame);
     free(frame);
 }

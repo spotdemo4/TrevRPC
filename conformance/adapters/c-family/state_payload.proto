@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package trevrpc.conformance.c_family;
+
+message StatePayload {
+  bytes body = 3;
+}

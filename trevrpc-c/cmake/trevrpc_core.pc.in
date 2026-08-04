@@ -2,6 +2,7 @@ prefix=${pcfiledir}/../..
 exec_prefix=${prefix}
 libdir=@trevrpc_pc_libdir@
 includedir=@trevrpc_pc_includedir@
+trevrpc_c_abi_version=@TREVRPC_C_ABI_VERSION@
 
 Name: trevrpc_core
 Description: TrevRPC C wire and value runtime

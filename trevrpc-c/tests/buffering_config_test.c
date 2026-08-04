@@ -1,12 +1,11 @@
-#include "trevrpc.h"
-#include "trevrpc_msquic.h"
-#include "trevrpc_webtransport.h"
+#include "trevrpc_runtime_internal.h"
 
 #include <stdio.h>
 
-int trevrpc_test_make_client_msquic_config(const trevrpc_config* config, trevrpc_msquic_config* out_config);
-int trevrpc_test_make_server_msquic_config(const trevrpc_server_config* config,
-    trevrpc_server_config* out_effective,
+int trevrpc_test_make_client_msquic_config(
+    const trevrpc_client_config_internal* config, trevrpc_msquic_config* out_config);
+int trevrpc_test_make_server_msquic_config(const trevrpc_server_config_internal* config,
+    trevrpc_server_config_internal* out_effective,
     trevrpc_msquic_config* out_msquic_config,
     trevrpc_wt_config* out_wt_config);
 
@@ -19,16 +18,16 @@ int trevrpc_test_make_server_msquic_config(const trevrpc_server_config* config,
     } while (0)
 
 int main(void) {
-    trevrpc_config client = trevrpc_default_config();
-    trevrpc_server_config defaults = trevrpc_default_server_config();
+    trevrpc_client_config_internal client = trevrpc_internal_default_config();
+    trevrpc_server_config_internal defaults = trevrpc_internal_default_server_config();
     trevrpc_msquic_config client_msquic = {0};
-    trevrpc_server_config server = {0};
-    trevrpc_server_config effective_server = {0};
+    trevrpc_server_config_internal server = {0};
+    trevrpc_server_config_internal effective_server = {0};
     trevrpc_msquic_config server_msquic = {0};
     trevrpc_wt_config server_wt = {0};
 
-    CHECK(TREVRPC_C_ABI_VERSION == 5u);
-    CHECK(trevrpc_c_abi_version() == 5u);
+    CHECK(TREVRPC_C_ABI_VERSION == 6u);
+    CHECK(trevrpc_c_abi_version() == 6u);
     CHECK(defaults.enable_http3 == 0);
     CHECK(defaults.http3_path != NULL);
     client.stream_recv_window = 1024u * 1024u;
