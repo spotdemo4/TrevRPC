@@ -6,6 +6,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -14,6 +15,67 @@ namespace common = trevrpc::cpp::test::common;
 using namespace std::chrono_literals;
 
 constexpr std::size_t kStreamMessageCount = 128;
+
+struct InboundResponseDeleter {
+  void operator()(trevrpc_inbound_response* response) const noexcept {
+    trevrpc_inbound_response_release(response);
+  }
+};
+
+struct InboundFrameDeleter {
+  void operator()(trevrpc_inbound_stream_frame* frame) const noexcept {
+    trevrpc_inbound_stream_frame_release(frame);
+  }
+};
+
+using InboundResponse = std::unique_ptr<trevrpc_inbound_response, InboundResponseDeleter>;
+using InboundFrame = std::unique_ptr<trevrpc_inbound_stream_frame, InboundFrameDeleter>;
+
+int raw_call_options(trevrpc_call_options_v1* options) {
+  const int error = trevrpc_call_options_v1_init(options, sizeof(*options));
+  if (error == 0) {
+    options->request_body_lifetime = TREVRPC_REQUEST_BODY_BORROW_UNTIL_RETURN;
+  }
+  return error;
+}
+
+trevrpc_request raw_request(std::string_view service, std::string_view method, std::uint32_t kind,
+                            const std::uint8_t* body, std::size_t body_len) {
+  trevrpc_request request{};
+  request.service = service.data();
+  request.service_len = service.size();
+  request.method = method.data();
+  request.method_len = method.size();
+  request.body = body;
+  request.body_len = body_len;
+  request.kind = kind;
+  request.version = TREVRPC_WIRE_VERSION;
+  return request;
+}
+
+int raw_unary(trevrpc_channel* channel, std::string_view service, std::string_view method,
+              const std::uint8_t* body, std::size_t body_len, trevrpc_inbound_response** response) {
+  trevrpc_call_options_v1 options{};
+  const int error = raw_call_options(&options);
+  if (error != 0) {
+    return error;
+  }
+  const trevrpc_request request =
+      raw_request(service, method, TREVRPC_RPC_KIND_UNARY, body, body_len);
+  return trevrpc_channel_call_request_inbound_v1(channel, &request, &options, response);
+}
+
+int raw_start_stream(trevrpc_channel* channel, std::string_view service, std::string_view method,
+                     std::uint32_t kind, const std::uint8_t* body, std::size_t body_len,
+                     trevrpc_stream** stream) {
+  trevrpc_call_options_v1 options{};
+  const int error = raw_call_options(&options);
+  if (error != 0) {
+    return error;
+  }
+  const trevrpc_request request = raw_request(service, method, kind, body, body_len);
+  return trevrpc_channel_start_stream_request_v1(channel, &request, &options, stream);
+}
 
 fixture::Outer::Request make_request(const std::string& name) {
   fixture::Outer::Request request;
@@ -49,8 +111,8 @@ std::string join_messages(const std::vector<std::string>& messages) {
 
 class FixtureService final : public fixture::FixtureService {
 public:
-  trevrpc::Result<common::ImportedReply> Unary(const trevrpc::CallContext& context,
-                                               const fixture::Outer::Request& request) override {
+  trevrpc::Result<trevrpc::Response<common::ImportedReply>>
+  Unary(const trevrpc::CallContext& context, const fixture::Outer::Request& request) override {
     if (request.name() == "throw") {
       throw std::runtime_error("fixture exception");
     }
@@ -62,7 +124,9 @@ public:
     } else {
       reply.set_message("hello, " + request.name());
     }
-    return reply;
+    trevrpc::Metadata metadata;
+    metadata.set("response-key", "response-value");
+    return trevrpc::Response<common::ImportedReply>{std::move(reply), std::move(metadata)};
   }
 
   trevrpc::Status ServerStreaming(const trevrpc::CallContext&,
@@ -100,7 +164,7 @@ public:
     return trevrpc::Status::ok();
   }
 
-  trevrpc::Result<common::ImportedReply>
+  trevrpc::Result<trevrpc::Response<common::ImportedReply>>
   ClientStreaming(const trevrpc::CallContext&,
                   trevrpc::ServerReader<fixture::Outer::Request>& reader) override {
     std::string names;
@@ -119,7 +183,9 @@ public:
     }
     common::ImportedReply reply;
     reply.set_message(names);
-    return reply;
+    trevrpc::Metadata metadata;
+    metadata.set("response-key", "response-value");
+    return trevrpc::Response<common::ImportedReply>{std::move(reply), std::move(metadata)};
   }
 
   trevrpc::Status BidirectionalStreaming(
@@ -189,6 +255,7 @@ int main() {
   auto unary = client.Unary(request);
   assert(unary);
   assert(unary.value().message.message() == "hello, unary");
+  assert(unary.value().metadata.get("response-key").has_value());
 
   request.set_name("metadata");
   trevrpc::CallOptions metadata_options;
@@ -204,14 +271,17 @@ int main() {
   assert(thrown.error().status().value().code() == trevrpc::StatusCode::Internal);
 
   const std::uint8_t malformed_body[] = {0xff};
-  trevrpc_response* malformed_response = nullptr;
+  trevrpc_inbound_response* raw_malformed_response = nullptr;
   const int malformed_error =
-      trevrpc_channel_call_unary(channel->native_handle(), "trevrpc.cpp.test.v1.Fixture", "Unary",
-                                 malformed_body, sizeof(malformed_body), &malformed_response);
+      raw_unary(channel->native_handle(), "trevrpc.cpp.test.v1.Fixture", "Unary", malformed_body,
+                sizeof(malformed_body), &raw_malformed_response);
+  InboundResponse malformed_response(raw_malformed_response);
   assert(malformed_error == 0);
   assert(malformed_response != nullptr);
-  assert(malformed_response->status == TREVRPC_STATUS_INVALID_ARGUMENT);
-  trevrpc_response_free(malformed_response);
+  std::uint32_t malformed_status = TREVRPC_STATUS_UNKNOWN;
+  assert(trevrpc_inbound_response_get_status(malformed_response.get(), &malformed_status) == 0);
+  assert(malformed_status == TREVRPC_STATUS_INVALID_ARGUMENT);
+  malformed_response.reset();
 
   request.set_name("server");
   auto server_stream = client.ServerStreaming(request);
@@ -259,13 +329,15 @@ int main() {
   for (const std::string& message : client_messages) {
     assert(client_stream.value().send(make_request(message)));
   }
-  assert(client_stream.value().finish_send());
-  expect_messages(client_stream.value(), {join_messages(client_messages)});
+  auto client_stream_response = client_stream.value().finish_and_receive();
+  assert(client_stream_response);
+  assert(client_stream_response.value().message.message() == join_messages(client_messages));
+  assert(client_stream_response.value().metadata.get("response-key").has_value());
 
   trevrpc_stream* status_terminated_stream = nullptr;
-  assert(trevrpc_channel_start_stream(channel->native_handle(), "trevrpc.cpp.test.v1.Fixture",
-                                      "ClientStreaming", TREVRPC_RPC_KIND_CLIENT_STREAMING, nullptr,
-                                      0, &status_terminated_stream) == 0);
+  assert(raw_start_stream(channel->native_handle(), "trevrpc.cpp.test.v1.Fixture",
+                          "ClientStreaming", TREVRPC_RPC_KIND_CLIENT_STREAMING, nullptr, 0,
+                          &status_terminated_stream) == 0);
   const std::string status_terminated_body = make_request("status-terminated").SerializeAsString();
   assert(trevrpc_stream_send_message_copy_wait(
              status_terminated_stream,
@@ -273,20 +345,37 @@ int main() {
              status_terminated_body.size()) == 0);
   assert(trevrpc_stream_send_status(status_terminated_stream, TREVRPC_STATUS_OK, nullptr, 0) == 0);
   assert(trevrpc_stream_finish_send(status_terminated_stream) == 0);
-  trevrpc_stream_frame* status_terminated_response = nullptr;
-  assert(trevrpc_stream_recv(status_terminated_stream, &status_terminated_response) == 0);
+
+  trevrpc_inbound_stream_frame* raw_status_terminated_response = nullptr;
+  assert(trevrpc_stream_recv_inbound(status_terminated_stream, &raw_status_terminated_response) ==
+         0);
+  InboundFrame status_terminated_response(raw_status_terminated_response);
   assert(status_terminated_response != nullptr);
-  assert(status_terminated_response->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
+  std::uint32_t response_kind = 0;
+  assert(trevrpc_inbound_stream_frame_get_kind(status_terminated_response.get(), &response_kind) ==
+         0);
+  assert(response_kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
+  trevrpc_bytes_view response_body{};
+  assert(trevrpc_inbound_stream_frame_get_body(status_terminated_response.get(), &response_body) ==
+         0);
   common::ImportedReply status_terminated_reply;
-  assert(status_terminated_reply.ParseFromArray(
-      status_terminated_response->body, static_cast<int>(status_terminated_response->body_len)));
+  assert(status_terminated_reply.ParseFromArray(response_body.data,
+                                                static_cast<int>(response_body.len)));
   assert(status_terminated_reply.message() == "status-terminated");
-  trevrpc_stream_frame_free(status_terminated_response);
-  assert(trevrpc_stream_recv(status_terminated_stream, &status_terminated_response) == 0);
+
+  raw_status_terminated_response = nullptr;
+  assert(trevrpc_stream_recv_inbound(status_terminated_stream, &raw_status_terminated_response) ==
+         0);
+  status_terminated_response.reset(raw_status_terminated_response);
   assert(status_terminated_response != nullptr);
-  assert(status_terminated_response->kind == TREVRPC_STREAM_FRAME_KIND_STATUS);
-  assert(status_terminated_response->status == TREVRPC_STATUS_OK);
-  trevrpc_stream_frame_free(status_terminated_response);
+  assert(trevrpc_inbound_stream_frame_get_kind(status_terminated_response.get(), &response_kind) ==
+         0);
+  assert(response_kind == TREVRPC_STREAM_FRAME_KIND_STATUS);
+  std::uint32_t response_status = TREVRPC_STATUS_UNKNOWN;
+  assert(trevrpc_inbound_stream_frame_get_status(status_terminated_response.get(),
+                                                 &response_status) == 0);
+  assert(response_status == TREVRPC_STATUS_OK);
+  status_terminated_response.reset();
   trevrpc_stream_close(status_terminated_stream);
 
   auto bidi = client.BidirectionalStreaming();
@@ -305,7 +394,7 @@ int main() {
 
   channel->close();
   channel.reset();
-  server.shutdown();
+  assert(server.request_stop());
   server_thread.join();
   assert(serve_result);
   return 0;

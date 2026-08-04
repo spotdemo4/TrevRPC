@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 #include <google/protobuf/compiler/cpp/names.h>
 #include <google/protobuf/descriptor.h>
@@ -98,12 +99,22 @@ enum class RpcShape {
   return CppIdentifier(service.name()) + "Client";
 }
 
+[[nodiscard]] std::string AsyncServiceTypeName(const ServiceDescriptor& service) {
+  return CppIdentifier(service.name()) + "AsyncService";
+}
+
+[[nodiscard]] std::string AsyncClientTypeName(const ServiceDescriptor& service) {
+  return CppIdentifier(service.name()) + "AsyncClient";
+}
+
 [[nodiscard]] std::string MethodName(const ServiceDescriptor& service,
-                                     const MethodDescriptor& method, bool client_method) {
+                                     const MethodDescriptor& method) {
   std::string name = CppIdentifier(method.name());
-  const std::string& enclosing_name =
-      client_method ? ClientTypeName(service) : ServiceTypeName(service);
-  if (name == enclosing_name) {
+  const std::string enclosing_names[] = {ServiceTypeName(service), ClientTypeName(service),
+                                         AsyncServiceTypeName(service),
+                                         AsyncClientTypeName(service)};
+  if (std::find(std::begin(enclosing_names), std::end(enclosing_names), name) !=
+      std::end(enclosing_names)) {
     name.push_back('_');
   }
   return name;
@@ -193,6 +204,39 @@ void CloseNamespace(std::ostringstream& output, const FileDescriptor& file) {
   }
 }
 
+[[nodiscard]] bool ValidateGeneratedNames(const FileDescriptor& file, std::string* error) {
+  std::unordered_set<std::string> declarations;
+  for (int service_index = 0; service_index < file.service_count(); ++service_index) {
+    const ServiceDescriptor& service = *file.service(service_index);
+    const std::string prefix = CppIdentifier(service.name());
+    const std::string generated[] = {ServiceTypeName(service),      ClientTypeName(service),
+                                     AsyncServiceTypeName(service), AsyncClientTypeName(service),
+                                     "Register" + prefix,           "Register" + prefix + "Async"};
+    for (const std::string& name : generated) {
+      if (!declarations.insert(name).second) {
+        if (error != nullptr) {
+          *error = "generated C++ declaration collision for " + Quoted(name);
+        }
+        return false;
+      }
+    }
+
+    std::unordered_set<std::string> methods;
+    for (int method_index = 0; method_index < service.method_count(); ++method_index) {
+      const MethodDescriptor& method = *service.method(method_index);
+      const std::string name = MethodName(service, method);
+      if (!methods.insert(name).second) {
+        if (error != nullptr) {
+          *error = "generated C++ method collision in service " + Quoted(service.full_name()) +
+                   " for " + Quoted(name);
+        }
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 void GenerateServiceInterface(std::ostringstream& output, const ServiceDescriptor& service) {
   const std::string service_type = ServiceTypeName(service);
   output << "class " << service_type << " {\n"
@@ -203,12 +247,13 @@ void GenerateServiceInterface(std::ostringstream& output, const ServiceDescripto
     const MethodDescriptor& method = *service.method(index);
     const std::string input = MessageType(*method.input_type());
     const std::string response = MessageType(*method.output_type());
-    const std::string method_name = MethodName(service, method, false);
+    const std::string method_name = MethodName(service, method);
 
     switch (Shape(method)) {
     case RpcShape::kUnary:
-      output << "    [[nodiscard]] virtual ::trevrpc::Result<" << response << "> " << method_name
-             << "(const ::trevrpc::CallContext& context, const " << input << "& request) = 0;\n";
+      output << "    [[nodiscard]] virtual ::trevrpc::Result<::trevrpc::Response<" << response
+             << ">> " << method_name << "(const ::trevrpc::CallContext& context, const " << input
+             << "& request) = 0;\n";
       break;
     case RpcShape::kServerStreaming:
       output << "    [[nodiscard]] virtual ::trevrpc::Status " << method_name
@@ -216,7 +261,8 @@ void GenerateServiceInterface(std::ostringstream& output, const ServiceDescripto
              << "& request, ::trevrpc::ServerWriter<" << response << ">& writer) = 0;\n";
       break;
     case RpcShape::kClientStreaming:
-      output << "    [[nodiscard]] virtual ::trevrpc::Result<" << response << "> " << method_name
+      output << "    [[nodiscard]] virtual ::trevrpc::Result<::trevrpc::Response<" << response
+             << ">> " << method_name
              << "(const ::trevrpc::CallContext& context, ::trevrpc::ServerReader<" << input
              << ">& reader) = 0;\n";
       break;
@@ -225,6 +271,48 @@ void GenerateServiceInterface(std::ostringstream& output, const ServiceDescripto
              << "(const ::trevrpc::CallContext& context, "
                 "::trevrpc::ServerReaderWriter<"
              << input << ", " << response << ">& stream) = 0;\n";
+      break;
+    }
+  }
+
+  output << "};\n\n";
+}
+
+void GenerateAsyncServiceInterface(std::ostringstream& output, const ServiceDescriptor& service) {
+  const std::string service_type = AsyncServiceTypeName(service);
+  output << "class " << service_type << " {\n"
+         << "  public:\n"
+         << "    virtual ~" << service_type << "() = default;\n\n";
+
+  for (int index = 0; index < service.method_count(); ++index) {
+    const MethodDescriptor& method = *service.method(index);
+    const std::string input = MessageType(*method.input_type());
+    const std::string response = MessageType(*method.output_type());
+    const std::string method_name = MethodName(service, method);
+
+    switch (Shape(method)) {
+    case RpcShape::kUnary:
+      output << "    [[nodiscard]] virtual ::trevrpc::Task<::trevrpc::Result<"
+                "::trevrpc::Response<"
+             << response << ">>> " << method_name << "(::trevrpc::CallContext context, " << input
+             << " request) = 0;\n";
+      break;
+    case RpcShape::kServerStreaming:
+      output << "    [[nodiscard]] virtual ::trevrpc::Task<::trevrpc::Status> " << method_name
+             << "(::trevrpc::CallContext context, " << input
+             << " request, ::trevrpc::AsyncServerWriter<" << response << "> writer) = 0;\n";
+      break;
+    case RpcShape::kClientStreaming:
+      output << "    [[nodiscard]] virtual ::trevrpc::Task<::trevrpc::Result<"
+                "::trevrpc::Response<"
+             << response << ">>> " << method_name
+             << "(::trevrpc::CallContext context, ::trevrpc::AsyncServerReader<" << input
+             << "> reader) = 0;\n";
+      break;
+    case RpcShape::kBidirectionalStreaming:
+      output << "    [[nodiscard]] virtual ::trevrpc::Task<::trevrpc::Status> " << method_name
+             << "(::trevrpc::CallContext context, ::trevrpc::AsyncServerReader<" << input
+             << "> reader, ::trevrpc::AsyncServerWriter<" << response << "> writer) = 0;\n";
       break;
     }
   }
@@ -242,7 +330,7 @@ void GenerateClientDeclaration(std::ostringstream& output, const ServiceDescript
     const MethodDescriptor& method = *service.method(index);
     const std::string input = MessageType(*method.input_type());
     const std::string response = MessageType(*method.output_type());
-    const std::string method_name = MethodName(service, method, true);
+    const std::string method_name = MethodName(service, method);
 
     switch (Shape(method)) {
     case RpcShape::kUnary:
@@ -276,10 +364,61 @@ void GenerateClientDeclaration(std::ostringstream& output, const ServiceDescript
          << "};\n\n";
 }
 
+void GenerateAsyncClientDeclaration(std::ostringstream& output, const ServiceDescriptor& service) {
+  const std::string client_type = AsyncClientTypeName(service);
+  output << "class " << client_type << " final {\n"
+         << "  public:\n"
+         << "    " << client_type
+         << "(std::shared_ptr<::trevrpc::Channel> channel, "
+            "std::shared_ptr<::trevrpc::AsyncRuntime> runtime);\n\n";
+
+  for (int index = 0; index < service.method_count(); ++index) {
+    const MethodDescriptor& method = *service.method(index);
+    const std::string input = MessageType(*method.input_type());
+    const std::string response = MessageType(*method.output_type());
+    const std::string method_name = MethodName(service, method);
+
+    switch (Shape(method)) {
+    case RpcShape::kUnary:
+      output << "    [[nodiscard]] ::trevrpc::Task<::trevrpc::Result<"
+                "::trevrpc::Response<"
+             << response << ">>> " << method_name << "(const " << input
+             << "& request, const ::trevrpc::AsyncCallOptions& options = {}) const;\n";
+      break;
+    case RpcShape::kServerStreaming:
+      output << "    [[nodiscard]] ::trevrpc::Task<::trevrpc::Result<"
+                "::trevrpc::AsyncServerStreamingCall<"
+             << response << ">>> " << method_name << "(const " << input
+             << "& request, const ::trevrpc::AsyncCallOptions& options = {}) const;\n";
+      break;
+    case RpcShape::kClientStreaming:
+      output << "    [[nodiscard]] ::trevrpc::Task<::trevrpc::Result<"
+                "::trevrpc::AsyncClientStreamingCall<"
+             << input << ", " << response << ">>> " << method_name
+             << "(const ::trevrpc::AsyncCallOptions& options = {}) const;\n";
+      break;
+    case RpcShape::kBidirectionalStreaming:
+      output << "    [[nodiscard]] ::trevrpc::Task<::trevrpc::Result<"
+                "::trevrpc::AsyncBidirectionalStreamingCall<"
+             << input << ", " << response << ">>> " << method_name
+             << "(const ::trevrpc::AsyncCallOptions& options = {}) const;\n";
+      break;
+    }
+  }
+
+  output << "\n  private:\n"
+         << "    std::shared_ptr<::trevrpc::Channel> channel_;\n"
+         << "    std::shared_ptr<::trevrpc::AsyncRuntime> runtime_;\n"
+         << "};\n\n";
+}
+
 void GenerateRegistrationDeclaration(std::ostringstream& output, const ServiceDescriptor& service) {
   output << "[[nodiscard]] ::trevrpc::Result<void> Register" << CppIdentifier(service.name())
          << "(::trevrpc::Server& server, std::shared_ptr<" << ServiceTypeName(service)
-         << "> service);\n\n";
+         << "> service);\n\n"
+         << "[[nodiscard]] ::trevrpc::Result<void> Register" << CppIdentifier(service.name())
+         << "Async(::trevrpc::Server& server, std::shared_ptr<" << AsyncServiceTypeName(service)
+         << "> service, std::shared_ptr<::trevrpc::AsyncRuntime> runtime);\n\n";
 }
 
 [[nodiscard]] std::string GenerateHeader(const FileDescriptor& file,
@@ -289,13 +428,16 @@ void GenerateRegistrationDeclaration(std::ostringstream& output, const ServiceDe
          << "#pragma once\n\n"
          << "#include <memory>\n\n"
          << "#include <" << options.runtime_include << ">\n"
+         << "#include <trevrpc/async.hpp>\n"
          << "#include " << Quoted(ProtoStem(file.name()) + ".pb.h") << "\n\n";
 
   OpenNamespace(output, file);
   for (int index = 0; index < file.service_count(); ++index) {
     const ServiceDescriptor& service = *file.service(index);
     GenerateServiceInterface(output, service);
+    GenerateAsyncServiceInterface(output, service);
     GenerateClientDeclaration(output, service);
+    GenerateAsyncClientDeclaration(output, service);
     GenerateRegistrationDeclaration(output, service);
   }
   CloseNamespace(output, file);
@@ -313,7 +455,7 @@ void GenerateClientDefinition(std::ostringstream& output, const FileDescriptor& 
     const MethodDescriptor& method = *service.method(index);
     const std::string input = MessageType(*method.input_type());
     const std::string response = MessageType(*method.output_type());
-    const std::string method_name = MethodName(service, method, true);
+    const std::string method_name = MethodName(service, method);
     const std::string method_path = Quoted(method.name());
 
     switch (Shape(method)) {
@@ -321,6 +463,10 @@ void GenerateClientDefinition(std::ostringstream& output, const FileDescriptor& 
       output << "::trevrpc::Result<::trevrpc::UnaryResponse<" << response << ">> " << client_type
              << "::" << method_name << "(const " << input
              << "& request, const ::trevrpc::CallOptions& options) const {\n"
+             << "    if (!channel_) {\n"
+             << "        return ::trevrpc::Error::runtime(-22, \"generated client channel must not "
+                "be null\");\n"
+             << "    }\n"
              << "    return ::trevrpc::unary<" << input << ", " << response << ">(*channel_, "
              << service_path << ", " << method_path << ", request, options);\n"
              << "}\n\n";
@@ -329,6 +475,10 @@ void GenerateClientDefinition(std::ostringstream& output, const FileDescriptor& 
       output << "::trevrpc::Result<::trevrpc::ServerStreamingCall<" << response << ">> "
              << client_type << "::" << method_name << "(const " << input
              << "& request, const ::trevrpc::CallOptions& options) const {\n"
+             << "    if (!channel_) {\n"
+             << "        return ::trevrpc::Error::runtime(-22, \"generated client channel must not "
+                "be null\");\n"
+             << "    }\n"
              << "    return ::trevrpc::server_streaming<" << input << ", " << response
              << ">(*channel_, " << service_path << ", " << method_path << ", request, options);\n"
              << "}\n\n";
@@ -337,6 +487,10 @@ void GenerateClientDefinition(std::ostringstream& output, const FileDescriptor& 
       output << "::trevrpc::Result<::trevrpc::ClientStreamingCall<" << input << ", " << response
              << ">> " << client_type << "::" << method_name
              << "(const ::trevrpc::CallOptions& options) const {\n"
+             << "    if (!channel_) {\n"
+             << "        return ::trevrpc::Error::runtime(-22, \"generated client channel must not "
+                "be null\");\n"
+             << "    }\n"
              << "    return ::trevrpc::client_streaming<" << input << ", " << response
              << ">(*channel_, " << service_path << ", " << method_path << ", options);\n"
              << "}\n\n";
@@ -345,8 +499,107 @@ void GenerateClientDefinition(std::ostringstream& output, const FileDescriptor& 
       output << "::trevrpc::Result<::trevrpc::BidirectionalStreamingCall<" << input << ", "
              << response << ">> " << client_type << "::" << method_name
              << "(const ::trevrpc::CallOptions& options) const {\n"
+             << "    if (!channel_) {\n"
+             << "        return ::trevrpc::Error::runtime(-22, \"generated client channel must not "
+                "be null\");\n"
+             << "    }\n"
              << "    return ::trevrpc::bidirectional_streaming<" << input << ", " << response
              << ">(*channel_, " << service_path << ", " << method_path << ", options);\n"
+             << "}\n\n";
+      break;
+    }
+  }
+}
+
+void GenerateAsyncClientDefinition(std::ostringstream& output, const FileDescriptor& file,
+                                   const ServiceDescriptor& service) {
+  const std::string client_type = AsyncClientTypeName(service);
+  output << client_type << "::" << client_type
+         << "(std::shared_ptr<::trevrpc::Channel> channel, "
+            "std::shared_ptr<::trevrpc::AsyncRuntime> runtime)\n"
+         << "    : channel_(std::move(channel)), runtime_(std::move(runtime)) {}\n\n";
+
+  const std::string service_path = Quoted(ServicePath(file, service));
+  for (int index = 0; index < service.method_count(); ++index) {
+    const MethodDescriptor& method = *service.method(index);
+    const std::string input = MessageType(*method.input_type());
+    const std::string response = MessageType(*method.output_type());
+    const std::string method_name = MethodName(service, method);
+    const std::string method_path = Quoted(method.name());
+
+    switch (Shape(method)) {
+    case RpcShape::kUnary:
+      output << "::trevrpc::Task<::trevrpc::Result<::trevrpc::Response<" << response << ">>> "
+             << client_type << "::" << method_name << "(const " << input
+             << "& request, const ::trevrpc::AsyncCallOptions& options) const {\n"
+             << "    if (!channel_ || !runtime_) {\n"
+             << "        auto task = ::trevrpc::detail::ready_error<::trevrpc::Response<"
+             << response
+             << ">>(::trevrpc::Error::runtime(-22, \"generated async client channel and runtime "
+                "must not be null\"));\n"
+             << "        task.associate_executor(runtime_ ? runtime_->continuation_executor() : "
+                "nullptr);\n"
+             << "        return task;\n"
+             << "    }\n"
+             << "    return ::trevrpc::async_unary<" << input << ", " << response
+             << ">(channel_, runtime_, " << service_path << ", " << method_path
+             << ", request, options);\n"
+             << "}\n\n";
+      break;
+    case RpcShape::kServerStreaming:
+      output << "::trevrpc::Task<::trevrpc::Result<::trevrpc::AsyncServerStreamingCall<" << response
+             << ">>> " << client_type << "::" << method_name << "(const " << input
+             << "& request, const ::trevrpc::AsyncCallOptions& options) const {\n"
+             << "    if (!channel_ || !runtime_) {\n"
+             << "        auto task = ::trevrpc::detail::ready_error<"
+                "::trevrpc::AsyncServerStreamingCall<"
+             << response
+             << ">>(::trevrpc::Error::runtime(-22, \"generated async client channel and runtime "
+                "must not be null\"));\n"
+             << "        task.associate_executor(runtime_ ? runtime_->continuation_executor() : "
+                "nullptr);\n"
+             << "        return task;\n"
+             << "    }\n"
+             << "    return ::trevrpc::async_server_streaming<" << input << ", " << response
+             << ">(channel_, runtime_, " << service_path << ", " << method_path
+             << ", request, options);\n"
+             << "}\n\n";
+      break;
+    case RpcShape::kClientStreaming:
+      output << "::trevrpc::Task<::trevrpc::Result<::trevrpc::AsyncClientStreamingCall<" << input
+             << ", " << response << ">>> " << client_type << "::" << method_name
+             << "(const ::trevrpc::AsyncCallOptions& options) const {\n"
+             << "    if (!channel_ || !runtime_) {\n"
+             << "        auto task = ::trevrpc::detail::ready_error<"
+                "::trevrpc::AsyncClientStreamingCall<"
+             << input << ", " << response
+             << ">>(::trevrpc::Error::runtime(-22, \"generated async client channel and runtime "
+                "must not be null\"));\n"
+             << "        task.associate_executor(runtime_ ? runtime_->continuation_executor() : "
+                "nullptr);\n"
+             << "        return task;\n"
+             << "    }\n"
+             << "    return ::trevrpc::async_client_streaming<" << input << ", " << response
+             << ">(channel_, runtime_, " << service_path << ", " << method_path << ", options);\n"
+             << "}\n\n";
+      break;
+    case RpcShape::kBidirectionalStreaming:
+      output << "::trevrpc::Task<::trevrpc::Result<"
+                "::trevrpc::AsyncBidirectionalStreamingCall<"
+             << input << ", " << response << ">>> " << client_type << "::" << method_name
+             << "(const ::trevrpc::AsyncCallOptions& options) const {\n"
+             << "    if (!channel_ || !runtime_) {\n"
+             << "        auto task = ::trevrpc::detail::ready_error<"
+                "::trevrpc::AsyncBidirectionalStreamingCall<"
+             << input << ", " << response
+             << ">>(::trevrpc::Error::runtime(-22, \"generated async client channel and runtime "
+                "must not be null\"));\n"
+             << "        task.associate_executor(runtime_ ? runtime_->continuation_executor() : "
+                "nullptr);\n"
+             << "        return task;\n"
+             << "    }\n"
+             << "    return ::trevrpc::async_bidirectional_streaming<" << input << ", " << response
+             << ">(channel_, runtime_, " << service_path << ", " << method_path << ", options);\n"
              << "}\n\n";
       break;
     }
@@ -367,7 +620,7 @@ void GenerateRegistrationDefinition(std::ostringstream& output, const FileDescri
     const MethodDescriptor& method = *service.method(index);
     const std::string input = MessageType(*method.input_type());
     const std::string response = MessageType(*method.output_type());
-    const std::string method_name = MethodName(service, method, false);
+    const std::string method_name = MethodName(service, method);
     const std::string method_path = Quoted(method.name());
 
     switch (Shape(method)) {
@@ -414,6 +667,73 @@ void GenerateRegistrationDefinition(std::ostringstream& output, const FileDescri
          << "}\n\n";
 }
 
+void GenerateAsyncRegistrationDefinition(std::ostringstream& output, const FileDescriptor& file,
+                                         const ServiceDescriptor& service) {
+  const std::string service_type = AsyncServiceTypeName(service);
+  output << "::trevrpc::Result<void> Register" << CppIdentifier(service.name())
+         << "Async(::trevrpc::Server& server, std::shared_ptr<" << service_type
+         << "> service, std::shared_ptr<::trevrpc::AsyncRuntime> runtime) {\n"
+         << "    if (!service || !runtime) {\n"
+         << "        return ::trevrpc::Error::runtime(-22, \"async service and runtime must not be "
+            "null\");\n"
+         << "    }\n";
+
+  const std::string service_path = Quoted(ServicePath(file, service));
+  for (int index = 0; index < service.method_count(); ++index) {
+    const MethodDescriptor& method = *service.method(index);
+    const std::string input = MessageType(*method.input_type());
+    const std::string response = MessageType(*method.output_type());
+    const std::string method_name = MethodName(service, method);
+    const std::string method_path = Quoted(method.name());
+
+    switch (Shape(method)) {
+    case RpcShape::kUnary:
+      output << "    auto registered_" << index << " = ::trevrpc::register_async_unary<" << input
+             << ", " << response << ">(server, " << service_path << ", " << method_path
+             << ", runtime, [service](::trevrpc::CallContext context, " << input << " request) {\n"
+             << "        return service->" << method_name
+             << "(std::move(context), std::move(request));\n"
+             << "    });\n";
+      break;
+    case RpcShape::kServerStreaming:
+      output << "    auto registered_" << index << " = ::trevrpc::register_async_server_streaming<"
+             << input << ", " << response << ">(server, " << service_path << ", " << method_path
+             << ", runtime, [service](::trevrpc::CallContext context, " << input
+             << " request, ::trevrpc::AsyncServerWriter<" << response << "> writer) {\n"
+             << "        return service->" << method_name
+             << "(std::move(context), std::move(request), std::move(writer));\n"
+             << "    });\n";
+      break;
+    case RpcShape::kClientStreaming:
+      output << "    auto registered_" << index << " = ::trevrpc::register_async_client_streaming<"
+             << input << ", " << response << ">(server, " << service_path << ", " << method_path
+             << ", runtime, [service](::trevrpc::CallContext context, "
+                "::trevrpc::AsyncServerReader<"
+             << input << "> reader) {\n"
+             << "        return service->" << method_name
+             << "(std::move(context), std::move(reader));\n"
+             << "    });\n";
+      break;
+    case RpcShape::kBidirectionalStreaming:
+      output << "    auto registered_" << index
+             << " = ::trevrpc::register_async_bidirectional_streaming<" << input << ", " << response
+             << ">(server, " << service_path << ", " << method_path
+             << ", runtime, [service](::trevrpc::CallContext context, "
+                "::trevrpc::AsyncServerReader<"
+             << input << "> reader, ::trevrpc::AsyncServerWriter<" << response << "> writer) {\n"
+             << "        return service->" << method_name
+             << "(std::move(context), std::move(reader), std::move(writer));\n"
+             << "    });\n";
+      break;
+    }
+    output << "    if (!registered_" << index << ") {\n"
+           << "        return registered_" << index << ".error();\n"
+           << "    }\n";
+  }
+  output << "    return {};\n"
+         << "}\n\n";
+}
+
 [[nodiscard]] std::string GenerateSource(const FileDescriptor& file,
                                          const GeneratorOptions& options) {
   std::ostringstream output;
@@ -425,7 +745,9 @@ void GenerateRegistrationDefinition(std::ostringstream& output, const FileDescri
   for (int index = 0; index < file.service_count(); ++index) {
     const ServiceDescriptor& service = *file.service(index);
     GenerateClientDefinition(output, file, service);
+    GenerateAsyncClientDefinition(output, file, service);
     GenerateRegistrationDefinition(output, file, service);
+    GenerateAsyncRegistrationDefinition(output, file, service);
   }
   CloseNamespace(output, file);
   return output.str();
@@ -538,7 +860,7 @@ bool TrevRpcCppGenerator::Generate(const FileDescriptor* file, const std::string
   }
 
   GeneratorOptions options;
-  if (!ParseGeneratorOptions(parameter, &options, error)) {
+  if (!ParseGeneratorOptions(parameter, &options, error) || !ValidateGeneratedNames(*file, error)) {
     return false;
   }
 

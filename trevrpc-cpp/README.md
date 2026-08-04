@@ -6,14 +6,15 @@ Generated bindings use protobuf C++ full or lite message classes. They serialize
 
 ## API
 
-- `{Service}Service` synchronous server interfaces.
-- `{Service}Client` synchronous typed clients.
-- `Register{Service}` registration functions for `Server`.
+- `{Service}Service` and `{Service}Client` synchronous generated APIs.
+- `{Service}AsyncService` and `{Service}AsyncClient` coroutine APIs for all four RPC shapes.
+- `Register{Service}` and `Register{Service}Async` registration functions for `Server`.
 - `Channel`, `Server`, and `Result` runtime types.
 - Unary, server-streaming, client-streaming, and bidirectional-streaming RPCs.
 - Protobuf C++ full and lite generated messages.
 - Move-only RAII server and stream owners, plus shared long-lived channels.
-- `CallOptions`, `Metadata`, `Cancellation`, explicit terminal stream events, and status-preserving errors.
+- `CallOptions`, `Metadata`, copyable single-operation `Cancellation`, and async cancellation fan-out.
+- Explicit terminal stream events, bounded async queues, owned callbacks, and report-bearing shutdown.
 
 ## Build And Generation Model
 
@@ -44,4 +45,10 @@ Create one long-lived `Channel` per destination and share it across generated cl
 
 During shutdown, stop starting calls, finish or cancel active streams, explicitly close the channel, and then destroy clients and channel state. The C++ wrapper owns its underlying C transport handles.
 
-See the [C++ Guide](../wiki/Cpp-Guide.md) and [Protobuf and Code Generation](../wiki/Protobuf-and-Code-Generation.md) for the complete API and integration workflow.
+## Async and shutdown
+
+Create `AsyncRuntime` with an explicit continuation executor. `Task<T>` is lazy and move-only; use `co_await`, `spawn` with a completion sink, or `sync_wait` outside the continuation executor. Async send and receive halves are independently movable, one send and one receive may progress concurrently, and bounded queue saturation is reported instead of running work inline. No RPC or message is replayed across reconnect.
+
+Call `Server::shutdown(ShutdownOptions)` to obtain a bounded `ShutdownReport`. A timed-out shutdown retains native and route ownership and can be resumed. The legacy no-argument `shutdown()` only requests stop.
+
+See [MIGRATING-7D.md](MIGRATING-7D.md), the [C++ Guide](../wiki/Cpp-Guide.md), and [Protobuf and Code Generation](../wiki/Protobuf-and-Code-Generation.md) for the complete API and integration workflow.

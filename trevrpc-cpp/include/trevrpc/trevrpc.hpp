@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -18,6 +19,20 @@
 #include <vector>
 
 namespace trevrpc {
+
+class Authorizer;
+class MetricsObserver;
+class Logger;
+class TransportObserver;
+class WebTransportAdmission;
+class Http3Admission;
+class ChannelLifecycleObserver;
+class CallbackExceptionSink;
+
+namespace detail {
+struct AsyncRegistrationAccess;
+struct CallbackAccess;
+} // namespace detail
 
 enum class StatusCode : std::uint32_t {
   Ok = TREVRPC_STATUS_OK,
@@ -147,8 +162,8 @@ class Cancellation {
 public:
   Cancellation();
   ~Cancellation();
-  Cancellation(const Cancellation&) = delete;
-  Cancellation& operator=(const Cancellation&) = delete;
+  Cancellation(const Cancellation& other);
+  Cancellation& operator=(const Cancellation& other);
   Cancellation(Cancellation&& other) noexcept;
   Cancellation& operator=(Cancellation&& other) noexcept;
 
@@ -175,6 +190,8 @@ struct ChannelConfig {
   std::size_t max_frame_size = 0;
   std::uint32_t stream_recv_window = 0;
   std::uint32_t conn_flow_control_window = 0;
+  std::shared_ptr<ChannelLifecycleObserver> lifecycle_observer;
+  std::shared_ptr<CallbackExceptionSink> callback_exception_sink;
 };
 
 struct CallOptions {
@@ -208,19 +225,45 @@ struct ServerConfig {
   std::uint32_t stream_recv_window = 0;
   std::uint32_t conn_flow_control_window = 0;
   std::size_t max_frame_size = 0;
+  std::shared_ptr<WebTransportAdmission> webtransport_admission;
+  std::shared_ptr<Http3Admission> http3_admission;
+  std::shared_ptr<CallbackExceptionSink> callback_exception_sink;
 };
 
 struct ServerOptions {
-  std::int64_t max_concurrent_connections = 0;
-  std::int64_t max_concurrent_streams_per_connection = 0;
-  std::int64_t max_concurrent_requests = 0;
-  std::int64_t worker_count = 0;
-  std::int64_t worker_queue_capacity = 0;
-  std::chrono::nanoseconds graceful_shutdown_timeout{0};
-  std::chrono::nanoseconds initial_request_timeout{0};
-  std::int64_t max_stream_messages = 0;
-  std::int64_t max_stream_body_size = 0;
-  std::chrono::nanoseconds stream_idle_timeout{0};
+  std::optional<std::int64_t> max_concurrent_connections;
+  std::optional<std::int64_t> max_concurrent_streams_per_connection;
+  std::optional<std::int64_t> max_concurrent_requests;
+  std::optional<std::int64_t> worker_count;
+  std::optional<std::int64_t> worker_queue_capacity;
+  std::optional<std::chrono::nanoseconds> graceful_shutdown_timeout;
+  std::optional<std::chrono::nanoseconds> initial_request_timeout;
+  std::optional<std::int64_t> max_stream_messages;
+  std::optional<std::int64_t> max_stream_body_size;
+  std::optional<std::chrono::nanoseconds> stream_idle_timeout;
+};
+
+enum class ServerPhase : std::uint32_t {
+  Configuring = TREVRPC_SERVER_PHASE_CONFIGURING,
+  Frozen = TREVRPC_SERVER_PHASE_FROZEN,
+  Serving = TREVRPC_SERVER_PHASE_SERVING,
+  Stopping = TREVRPC_SERVER_PHASE_STOPPING,
+  Cancelling = TREVRPC_SERVER_PHASE_CANCELLING,
+  Stopped = TREVRPC_SERVER_PHASE_STOPPED,
+  Released,
+};
+
+enum class ShutdownOutcome { Graceful, Cancelled, TimedOut };
+
+struct ShutdownOptions {
+  std::optional<std::chrono::nanoseconds> graceful_timeout;
+  std::chrono::nanoseconds cancellation_timeout{std::chrono::seconds(10)};
+};
+
+struct ShutdownReport {
+  ShutdownOutcome outcome;
+  ServerPhase final_phase;
+  bool released;
 };
 
 class CallContext {
@@ -233,6 +276,8 @@ public:
 
 private:
   friend class Server;
+  friend struct detail::AsyncRegistrationAccess;
+  friend struct detail::CallbackAccess;
   CallContext(const trevrpc_call_context* context, const trevrpc_request* request);
 
   const trevrpc_call_context* context_ = nullptr;
@@ -240,6 +285,10 @@ private:
 };
 
 namespace detail {
+
+class AsyncServerScopeControl;
+class ChannelState;
+class ServerState;
 
 struct ByteResponse {
   Status status;
@@ -268,10 +317,14 @@ public:
   [[nodiscard]] Result<StreamFrame> receive();
   void cancel() noexcept;
   void close() noexcept;
+  [[nodiscard]] trevrpc_stream* release_native_handle() noexcept {
+    return std::exchange(stream_, nullptr);
+  }
 
 private:
   trevrpc_stream* stream_ = nullptr;
   bool send_finished_ = false;
+  bool receive_finished_ = false;
 };
 
 template <typename Message>
@@ -289,11 +342,148 @@ template <typename Message>
   return body;
 }
 
+inline bool consume_protobuf_varint(std::span<const std::byte> data, std::size_t& offset,
+                                    std::uint64_t& value) {
+  value = 0;
+  for (unsigned int shift = 0; shift < 64; shift += 7) {
+    if (offset >= data.size()) {
+      return false;
+    }
+    const auto byte = std::to_integer<std::uint8_t>(data[offset++]);
+    if (shift == 63 && byte > 1) {
+      return false;
+    }
+    value |= static_cast<std::uint64_t>(byte & 0x7fU) << shift;
+    if (byte < 0x80U) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool skip_protobuf_field(std::span<const std::byte> data, std::size_t& offset,
+                                std::uint64_t wire_type, std::uint64_t field_number) {
+  std::uint64_t value = 0;
+  switch (wire_type) {
+  case 0:
+    return consume_protobuf_varint(data, offset, value);
+  case 1:
+    if (data.size() - offset < 8) {
+      return false;
+    }
+    offset += 8;
+    return true;
+  case 2:
+    if (!consume_protobuf_varint(data, offset, value) || value > data.size() - offset) {
+      return false;
+    }
+    offset += static_cast<std::size_t>(value);
+    return true;
+  case 3:
+    while (offset < data.size()) {
+      std::uint64_t tag = 0;
+      if (!consume_protobuf_varint(data, offset, tag) || tag == 0) {
+        return false;
+      }
+      const std::uint64_t nested_field = tag >> 3;
+      const std::uint64_t nested_wire_type = tag & 0x7U;
+      if (nested_field == 0 || nested_field > 0x1fffffffU) {
+        return false;
+      }
+      if (nested_wire_type == 4) {
+        return nested_field == field_number;
+      }
+      if (!skip_protobuf_field(data, offset, nested_wire_type, nested_field)) {
+        return false;
+      }
+    }
+    return false;
+  case 5:
+    if (data.size() - offset < 4) {
+      return false;
+    }
+    offset += 4;
+    return true;
+  default:
+    return false;
+  }
+}
+
+inline std::optional<std::uint64_t> protobuf_wire_type_for_field_type(int field_type) {
+  switch (field_type) {
+  case 1:  // double
+  case 6:  // fixed64
+  case 16: // sfixed64
+    return 1;
+  case 2:  // float
+  case 7:  // fixed32
+  case 15: // sfixed32
+    return 5;
+  case 9:  // string
+  case 11: // message
+  case 12: // bytes
+    return 2;
+  case 10: // group
+    return 3;
+  case 3:  // int64
+  case 4:  // uint64
+  case 5:  // int32
+  case 8:  // bool
+  case 13: // uint32
+  case 14: // enum
+  case 17: // sint32
+  case 18: // sint64
+    return 0;
+  default:
+    return std::nullopt;
+  }
+}
+
+template <typename Message>
+[[nodiscard]] bool valid_known_protobuf_wire_types(std::span<const std::byte> body) {
+  if constexpr (!requires { Message::descriptor(); }) {
+    return true;
+  } else {
+    const auto* descriptor = Message::descriptor();
+    for (std::size_t offset = 0; offset < body.size();) {
+      std::uint64_t tag = 0;
+      if (!consume_protobuf_varint(body, offset, tag) || tag == 0) {
+        return false;
+      }
+      const std::uint64_t field_number = tag >> 3;
+      const std::uint64_t wire_type = tag & 0x7U;
+      if (field_number == 0 || field_number > 0x1fffffffU || wire_type == 4) {
+        return false;
+      }
+
+      if (const auto* field = descriptor->FindFieldByNumber(static_cast<int>(field_number));
+          field != nullptr) {
+        const auto expected = protobuf_wire_type_for_field_type(static_cast<int>(field->type()));
+        if (!expected.has_value()) {
+          return false;
+        }
+        const bool packed = field->is_repeated() && field->is_packable() && wire_type == 2;
+        if (!packed && wire_type != expected.value()) {
+          return false;
+        }
+      }
+
+      if (!skip_protobuf_field(body, offset, wire_type, field_number)) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
 template <typename Message>
 [[nodiscard]] Result<Message> parse(std::span<const std::byte> body,
                                     std::string_view failure_message) {
   if (body.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     return Error::protobuf("protobuf message exceeds the parser size limit");
+  }
+  if (!valid_known_protobuf_wire_types<Message>(body)) {
+    return Error::protobuf(std::string(failure_message));
   }
   Message message;
   const void* data = body.empty() ? nullptr : body.data();
@@ -308,6 +498,28 @@ template <typename Message>
 [[nodiscard]] Result<std::optional<std::vector<std::byte>>>
 receive_server_message(trevrpc_stream* stream);
 [[nodiscard]] Status error_status(const Error& error);
+
+template <typename T> [[nodiscard]] const auto& response_message(const T& value) {
+  if constexpr (requires {
+                  value.message;
+                  value.metadata;
+                }) {
+    return value.message;
+  } else {
+    return value;
+  }
+}
+
+template <typename T> [[nodiscard]] Metadata response_metadata(const T& value) {
+  if constexpr (requires {
+                  value.message;
+                  value.metadata;
+                }) {
+    return value.metadata;
+  } else {
+    return {};
+  }
+}
 
 } // namespace detail
 
@@ -326,7 +538,7 @@ public:
   wait_ready(std::chrono::nanoseconds timeout = std::chrono::nanoseconds{0},
              Cancellation* cancellation = nullptr);
   void close() noexcept;
-  [[nodiscard]] trevrpc_channel* native_handle() const noexcept { return channel_; }
+  [[nodiscard]] trevrpc_channel* native_handle() const noexcept;
 
   [[nodiscard]] Result<detail::ByteResponse> call_unary(std::string_view service,
                                                         std::string_view method,
@@ -337,14 +549,17 @@ public:
                std::span<const std::byte> body, const CallOptions& options);
 
 private:
-  explicit Channel(trevrpc_channel* channel) noexcept : channel_(channel) {}
-  trevrpc_channel* channel_ = nullptr;
+  explicit Channel(std::shared_ptr<detail::ChannelState> state) noexcept
+      : state_(std::move(state)) {}
+  std::shared_ptr<detail::ChannelState> state_;
 };
 
-template <typename T> struct UnaryResponse {
+template <typename T> struct Response {
   T message;
   Metadata metadata;
 };
+
+template <typename T> using UnaryResponse = Response<T>;
 
 template <typename T> class StreamEvent {
 public:
@@ -389,7 +604,8 @@ private:
 
 template <typename Request, typename Response> class ClientStreamingCall {
 public:
-  explicit ClientStreamingCall(detail::ClientStream stream) : stream_(std::move(stream)) {}
+  explicit ClientStreamingCall(detail::ClientStream stream, bool exactly_one_response = true)
+      : stream_(std::move(stream)), exactly_one_response_(exactly_one_response) {}
   [[nodiscard]] Result<void> send(const Request& request) {
     auto body = detail::serialize(request);
     if (!body) {
@@ -398,17 +614,59 @@ public:
     return stream_.send(body.value());
   }
   [[nodiscard]] Result<void> finish_send() { return stream_.finish_send(); }
+  [[nodiscard]] Result<trevrpc::Response<Response>> finish_and_receive() {
+    auto finished = finish_send();
+    if (!finished) {
+      return finished.error();
+    }
+    std::optional<Response> response;
+    bool multiple_responses = false;
+    for (;;) {
+      auto event = receive();
+      if (!event) {
+        return event.error();
+      }
+      if (event.value().is_message()) {
+        if (response.has_value()) {
+          multiple_responses = true;
+        } else {
+          response = std::move(event.value().message());
+        }
+        continue;
+      }
+      if (!event.value().status().is_ok()) {
+        return Error::rpc(event.value().status());
+      }
+      if (multiple_responses) {
+        return Error::protobuf("client-streaming RPC returned more than one response message");
+      }
+      if (!response.has_value()) {
+        return Error::protobuf("client-streaming RPC did not return exactly one response message");
+      }
+      return trevrpc::Response<Response>{std::move(response).value(),
+                                         event.value().status().metadata()};
+    }
+  }
   [[nodiscard]] Result<StreamEvent<Response>> receive() {
     auto frame = stream_.receive();
     if (!frame) {
       return frame.error();
     }
     if (frame.value().terminal) {
+      if (!frame.value().status.is_ok()) {
+        return Error::rpc(std::move(frame.value().status));
+      }
+      if (exactly_one_response_ && response_count_ != 1) {
+        return Error::protobuf("client-streaming RPC did not return exactly one response message");
+      }
       return StreamEvent<Response>::terminal(std::move(frame.value().status));
     }
     auto message = detail::parse<Response>(frame.value().body, "failed to parse stream response");
     if (!message) {
       return message.error();
+    }
+    if (response_count_ != std::numeric_limits<std::size_t>::max()) {
+      ++response_count_;
     }
     return StreamEvent<Response>::message(std::move(message).value());
   }
@@ -417,6 +675,8 @@ public:
 
 private:
   detail::ClientStream stream_;
+  std::size_t response_count_ = 0;
+  bool exactly_one_response_ = true;
 };
 
 template <typename Request, typename Response>
@@ -540,7 +800,7 @@ bidirectional_streaming(Channel& channel, std::string_view service, std::string_
   if (!stream) {
     return stream.error();
   }
-  return BidirectionalStreamingCall<Request, Response>(std::move(stream).value());
+  return BidirectionalStreamingCall<Request, Response>(std::move(stream).value(), false);
 }
 
 class Server {
@@ -554,10 +814,27 @@ public:
   [[nodiscard]] static Result<Server> listen(const ServerConfig& config);
   [[nodiscard]] Result<std::uint16_t> port() const;
   [[nodiscard]] Result<void> set_options(const ServerOptions& options);
+  [[nodiscard]] Result<void>
+  set_authorizer(std::shared_ptr<Authorizer> callback,
+                 std::shared_ptr<CallbackExceptionSink> exception_sink = {});
+  [[nodiscard]] Result<void>
+  set_metrics(std::shared_ptr<MetricsObserver> callback,
+              std::shared_ptr<CallbackExceptionSink> exception_sink = {});
+  [[nodiscard]] Result<void> set_logger(std::shared_ptr<Logger> callback,
+                                        std::shared_ptr<CallbackExceptionSink> exception_sink = {});
+  [[nodiscard]] Result<void>
+  set_transport_observer(std::shared_ptr<TransportObserver> callback,
+                         std::shared_ptr<CallbackExceptionSink> exception_sink = {});
+  [[nodiscard]] Result<void> clear_authorizer();
+  [[nodiscard]] Result<void> clear_metrics();
+  [[nodiscard]] Result<void> clear_logger();
+  [[nodiscard]] Result<void> clear_transport_observer();
   [[nodiscard]] Result<void> serve();
-  void shutdown() noexcept;
-  void close() noexcept;
-  [[nodiscard]] trevrpc_server* native_handle() const noexcept { return server_; }
+  [[nodiscard]] Result<void> request_stop();
+  [[nodiscard]] Result<ShutdownReport> shutdown(const ShutdownOptions& options);
+  [[deprecated("use request_stop() or shutdown(ShutdownOptions)")]] void shutdown() noexcept;
+  [[deprecated("use shutdown(ShutdownOptions)")]] void close() noexcept;
+  [[nodiscard]] trevrpc_server* native_handle() const noexcept;
 
   template <typename Request, typename Response, typename Handler>
   [[nodiscard]] Result<void> register_unary(std::string_view service, std::string_view method,
@@ -579,12 +856,13 @@ public:
             respond(call, detail::error_status(response.error()), {});
             return;
           }
-          auto body = detail::serialize(response.value());
+          auto body = detail::serialize(detail::response_message(response.value()));
           if (!body) {
             respond(call, Status::internal(body.error().message()), {});
             return;
           }
-          respond(call, Status::ok(), body.value());
+          respond(call, Status(StatusCode::Ok, {}, detail::response_metadata(response.value())),
+                  body.value());
         });
   }
 
@@ -611,25 +889,27 @@ public:
   template <typename Request, typename Response, typename Handler>
   [[nodiscard]] Result<void> register_client_streaming(std::string_view service,
                                                        std::string_view method, Handler handler) {
-    return register_route(service, method, TREVRPC_RPC_KIND_CLIENT_STREAMING,
-                          [handler = std::move(handler)](trevrpc_call* call) mutable {
-                            const trevrpc_request* request = trevrpc_call_request(call);
-                            CallContext context(trevrpc_call_get_context(call), request);
-                            ServerReader<Request> reader(trevrpc_call_stream(call));
-                            auto response = handler(context, reader);
-                            if (!response) {
-                              finish(call, detail::error_status(response.error()));
-                              return;
-                            }
-                            auto body = detail::serialize(response.value());
-                            if (!body) {
-                              finish(call, Status::internal(body.error().message()));
-                              return;
-                            }
-                            auto sent = detail::send_server_message(trevrpc_call_stream(call),
-                                                                    body.value());
-                            finish(call, sent ? Status::ok() : detail::error_status(sent.error()));
-                          });
+    return register_route(
+        service, method, TREVRPC_RPC_KIND_CLIENT_STREAMING,
+        [handler = std::move(handler)](trevrpc_call* call) mutable {
+          const trevrpc_request* request = trevrpc_call_request(call);
+          CallContext context(trevrpc_call_get_context(call), request);
+          ServerReader<Request> reader(trevrpc_call_stream(call));
+          auto response = handler(context, reader);
+          if (!response) {
+            finish(call, detail::error_status(response.error()));
+            return;
+          }
+          auto body = detail::serialize(detail::response_message(response.value()));
+          if (!body) {
+            finish(call, Status::internal(body.error().message()));
+            return;
+          }
+          auto sent = detail::send_server_message(trevrpc_call_stream(call), body.value());
+          finish(call, sent
+                           ? Status(StatusCode::Ok, {}, detail::response_metadata(response.value()))
+                           : detail::error_status(sent.error()));
+        });
   }
 
   template <typename Request, typename Response, typename Handler>
@@ -646,19 +926,24 @@ public:
   }
 
 private:
+  friend struct detail::AsyncRegistrationAccess;
   using Handler = std::function<void(trevrpc_call*)>;
   struct Route;
 
-  explicit Server(trevrpc_server* server) noexcept;
+  explicit Server(std::shared_ptr<detail::ServerState> state) noexcept;
   [[nodiscard]] Result<void> register_route(std::string_view service, std::string_view method,
                                             std::uint32_t kind, Handler handler);
+  [[nodiscard]] Result<void>
+  register_native_route(std::string_view service, std::string_view method, std::uint32_t kind,
+                        trevrpc_call_handler callback, const std::shared_ptr<void>& route,
+                        void* user_data,
+                        const std::shared_ptr<detail::AsyncServerScopeControl>& async_scope = {});
   static int dispatch_route(void* user_data, trevrpc_call* call) noexcept;
   static void respond(trevrpc_call* call, const Status& status,
                       std::span<const std::byte> body) noexcept;
   static void finish(trevrpc_call* call, const Status& status) noexcept;
 
-  trevrpc_server* server_ = nullptr;
-  std::vector<std::unique_ptr<Route>> routes_;
+  std::shared_ptr<detail::ServerState> state_;
 };
 
 } // namespace trevrpc

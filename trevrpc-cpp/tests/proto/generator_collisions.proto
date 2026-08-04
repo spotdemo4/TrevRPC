@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package trevrpc.cpp.test.collisions;
+
+message Request {}
+message Response {}
+
+service Echo {
+  rpc Call(Request) returns (Response);
+}
+
+// Echo's generated asynchronous service is also named EchoAsyncService.
+service EchoAsync {
+  rpc Call(Request) returns (Response);
+}

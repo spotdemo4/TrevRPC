@@ -4,11 +4,25 @@ project(trevrpc-cpp VERSION 0.1.0 LANGUAGES CXX)
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
+include(CheckCXXSourceCompiles)
+
+find_package(Threads REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+check_cxx_source_compiles("
+#include <coroutine>
+#if !defined(__cpp_impl_coroutine) || __cpp_impl_coroutine < 201902L
+#error C++20 coroutine support is required
+#endif
+int main() { return 0; }
+" TREVRPC_CPP_HAS_COROUTINES)
+if(NOT TREVRPC_CPP_HAS_COROUTINES)
+  message(FATAL_ERROR "trevrpc-cpp requires C++20 <coroutine> support")
+endif()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set(trevrpc_cpp_default_codegen ON)
@@ -56,11 +70,20 @@ elseif(TREVRPC_CPP_TREVRPC_C_ROOT)
                    "${CMAKE_CURRENT_BINARY_DIR}/trevrpc-c")
   set(trevrpc_cpp_c_target trevrpc)
 else()
-  find_package(trevrpc CONFIG REQUIRED)
+  find_package(trevrpc 0.2 CONFIG REQUIRED)
+  if(NOT TREVRPC_C_ABI_VERSION EQUAL 6)
+    message(FATAL_ERROR "trevrpc-cpp requires TrevRPC C ABI 6")
+  endif()
   set(trevrpc_cpp_c_target trevrpc::trevrpc)
 endif()
 
-add_library(trevrpc_cpp STATIC src/trevrpc.cpp)
+add_library(trevrpc_cpp STATIC
+  src/trevrpc.cpp
+  src/async.cpp
+  src/callbacks.cpp
+  src/detail/abi6_bridge.cpp
+  src/detail/async_core.cpp
+  src/detail/lifecycle.cpp)
 add_library(trevrpc::cpp ALIAS trevrpc_cpp)
 target_include_directories(trevrpc_cpp
   PUBLIC
@@ -70,7 +93,8 @@ target_compile_features(trevrpc_cpp PUBLIC cxx_std_20)
 target_link_libraries(trevrpc_cpp
   PUBLIC
     $<BUILD_INTERFACE:${trevrpc_cpp_c_target}>
-    $<INSTALL_INTERFACE:trevrpc::trevrpc>)
+    $<INSTALL_INTERFACE:trevrpc::trevrpc>
+    Threads::Threads)
 set_target_properties(trevrpc_cpp PROPERTIES EXPORT_NAME cpp)
 trevrpc_cpp_warnings(trevrpc_cpp)
 trevrpc_cpp_sanitizers(trevrpc_cpp)

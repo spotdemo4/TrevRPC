@@ -9,6 +9,7 @@
   repoRoot,
   trevrpcC,
   benchPeer ? false,
+  sanitizers ? false,
 }:
 stdenv.mkDerivation (
   final: with lib; {
@@ -44,7 +45,8 @@ stdenv.mkDerivation (
             -DTREVRPC_CPP_BUILD_BENCHMARKS=ON \
             -DTREVRPC_CPP_BUILD_CODEGEN=ON \
             -DTREVRPC_CPP_BUILD_EXAMPLES=OFF \
-            -DTREVRPC_CPP_BUILD_TESTS=ON
+            -DTREVRPC_CPP_BUILD_TESTS=ON \
+            -DTREVRPC_CPP_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"}
           runHook postConfigure
         ''
       else
@@ -61,7 +63,8 @@ stdenv.mkDerivation (
             -DTREVRPC_CPP_TREVRPC_C_ROOT= \
             -DTREVRPC_CPP_BUILD_BENCHMARKS=OFF \
             -DTREVRPC_CPP_BUILD_TESTS=ON \
-            -DTREVRPC_CPP_BUILD_EXAMPLES=ON
+            -DTREVRPC_CPP_BUILD_EXAMPLES=ON \
+            -DTREVRPC_CPP_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"}
           runHook postConfigure
         '';
 
@@ -101,20 +104,36 @@ stdenv.mkDerivation (
           clang-format --dry-run --Werror $(find . \
             -path './build' -prune -o \
             \( -name '*.cpp' -o -name '*.hpp' \) -print)
-          clang-tidy --quiet -p build \
-            src/trevrpc.cpp \
-            tools/protoc-gen-trevrpc-cpp/generator.cpp \
-            tools/protoc-gen-trevrpc-cpp/main.cpp \
-            tests/codec_test.cpp \
-             tests/generated_service_test.cpp \
-             tests/generator_options_test.cpp \
-             examples/greeter/client.cpp \
-            examples/greeter/server.cpp
+          ${optionalString (!sanitizers) ''
+            clang-tidy --quiet -p build \
+              src/trevrpc.cpp \
+              src/async.cpp \
+              src/callbacks.cpp \
+              src/detail/abi6_bridge.cpp \
+              src/detail/async_core.cpp \
+              src/detail/lifecycle.cpp \
+              tools/protoc-gen-trevrpc-cpp/generator.cpp \
+              tools/protoc-gen-trevrpc-cpp/main.cpp \
+              tests/codec_test.cpp \
+              tests/generated_service_test.cpp \
+              tests/generated_async_service_test.cpp \
+              tests/generator_options_test.cpp \
+              tests/async_core_test.cpp \
+              tests/async_stream_test.cpp \
+              tests/async_server_core_test.cpp \
+              tests/callbacks_test.cpp \
+              tests/server_lifecycle_test.cpp \
+              examples/greeter/client.cpp \
+              examples/greeter/server.cpp
+          ''}
           ctest --test-dir build --output-on-failure
-          cmake --install build
-          cmake -S tests/consumer -B build/consumer \
-            -DCMAKE_PREFIX_PATH="$dev"
-          cmake --build build/consumer
+          ${optionalString (!sanitizers) ''
+            cmake --install build
+            cmake -S tests/consumer -B build/consumer \
+              -DCMAKE_PREFIX_PATH="$dev"
+            cmake --build build/consumer
+            ctest --test-dir build/consumer --output-on-failure
+          ''}
           runHook postCheck
         '';
 
@@ -130,6 +149,8 @@ stdenv.mkDerivation (
       test -x "$out/bin/protoc-gen-trevrpc-cpp"
       test ! -e "$out/bin/trevrpc-bench-peer-cpp"
       test -f "$dev/include/trevrpc/trevrpc.hpp"
+      test -f "$dev/include/trevrpc/async.hpp"
+      test -f "$dev/include/trevrpc/callbacks.hpp"
       test -f "$dev/lib/cmake/trevrpc-cpp/trevrpc-cppConfig.cmake"
       test -f "$lib/lib/libtrevrpc_cpp.a"
       test ! -e "$out/include"

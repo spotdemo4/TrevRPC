@@ -6,14 +6,15 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <utility>
 
 class Greeter final : public hello::v1::GreeterService {
 public:
-  trevrpc::Result<hello::v1::HelloReply> SayHello(const trevrpc::CallContext&,
-                                                  const hello::v1::HelloRequest& request) override {
+  trevrpc::Result<trevrpc::Response<hello::v1::HelloReply>>
+  SayHello(const trevrpc::CallContext&, const hello::v1::HelloRequest& request) override {
     hello::v1::HelloReply reply;
     reply.set_message("Hello, " + request.name());
-    return reply;
+    return trevrpc::Response<hello::v1::HelloReply>{std::move(reply), {}};
   }
 
   trevrpc::Status LotsOfReplies(const trevrpc::CallContext&, const hello::v1::HelloRequest& request,
@@ -29,7 +30,7 @@ public:
     return trevrpc::Status::ok();
   }
 
-  trevrpc::Result<hello::v1::HelloReply>
+  trevrpc::Result<trevrpc::Response<hello::v1::HelloReply>>
   LotsOfGreetings(const trevrpc::CallContext&,
                   trevrpc::ServerReader<hello::v1::HelloRequest>& reader) override {
     std::string names;
@@ -48,7 +49,7 @@ public:
     }
     hello::v1::HelloReply reply;
     reply.set_message("Hello, " + names);
-    return reply;
+    return trevrpc::Response<hello::v1::HelloReply>{std::move(reply), {}};
   }
 
   trevrpc::Status

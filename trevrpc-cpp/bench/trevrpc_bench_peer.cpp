@@ -304,7 +304,7 @@ void reject_unknown(const Arguments& arguments) {
 
 class NativeBenchmarkService final : public benchmark::BenchmarkServiceService {
 public:
-  trevrpc::Result<benchmark::BenchmarkResponse>
+  trevrpc::Result<trevrpc::Response<benchmark::BenchmarkResponse>>
   Unary(const trevrpc::CallContext&, const benchmark::BenchmarkRequest& request) override {
     if (request.payload().size() > kMaximumPayloadBytes) {
       return trevrpc::Status::invalid_argument("request payload exceeds the benchmark peer limit");
@@ -315,10 +315,10 @@ public:
     benchmark::BenchmarkResponse response;
     response.set_sequence(request.sequence());
     response.set_payload(make_payload(request.response_bytes(), request.sequence()));
-    return response;
+    return trevrpc::Response<benchmark::BenchmarkResponse>{std::move(response), {}};
   }
 
-  trevrpc::Result<benchmark::BenchmarkSummary>
+  trevrpc::Result<trevrpc::Response<benchmark::BenchmarkSummary>>
   ClientStream(const trevrpc::CallContext&,
                trevrpc::ServerReader<benchmark::BenchmarkRequest>& reader) override {
     std::uint64_t message_count = 0;
@@ -349,7 +349,7 @@ public:
     benchmark::BenchmarkSummary summary;
     summary.set_message_count(message_count);
     summary.set_payload_bytes(payload_bytes);
-    return summary;
+    return trevrpc::Response<benchmark::BenchmarkSummary>{std::move(summary), {}};
   }
 
   trevrpc::Status
@@ -482,37 +482,67 @@ enum class ControlCommand { Start, Shutdown, EndOfInput, Interrupted, ServeEnded
 class NativeBenchmarkServer final : public BenchmarkServer {
 public:
   NativeBenchmarkServer(trevrpc::Server server, std::uint16_t port)
-      : server_(std::move(server)), port_(port), serve_thread_([this] {
-          serve_result_ = server_.serve();
-          stopped_.store(true, std::memory_order_release);
+      : state_(std::make_shared<State>(std::move(server))), port_(port),
+        serve_thread_([state = state_] {
+          state->serve_result = state->server.serve();
+          state->stopped.store(true, std::memory_order_release);
         }) {}
 
-  ~NativeBenchmarkServer() override { shutdown(); }
+  ~NativeBenchmarkServer() override {
+    shutdown();
+    if (serve_thread_.joinable()) {
+      serve_thread_.detach();
+    }
+  }
 
   [[nodiscard]] std::uint16_t port() const override { return port_; }
 
-  [[nodiscard]] bool stopped() const override { return stopped_.load(std::memory_order_acquire); }
+  [[nodiscard]] bool stopped() const override {
+    return state_->stopped.load(std::memory_order_acquire);
+  }
 
   void shutdown() override {
     if (!serve_thread_.joinable()) {
       return;
     }
-    server_.shutdown();
+    trevrpc::ShutdownOptions options;
+    options.graceful_timeout = std::chrono::seconds(10);
+    options.cancellation_timeout = std::chrono::seconds(10);
+    auto report = state_->server.shutdown(options);
+    if (!report) {
+      shutdown_error_ = describe(report.error());
+      return;
+    }
+    if (!report.value().released) {
+      shutdown_error_ = "native server shutdown timed out before release";
+      return;
+    }
+    shutdown_error_.reset();
     serve_thread_.join();
   }
 
   [[nodiscard]] std::optional<std::string> finish_error() override {
-    if (!serve_result_) {
-      return describe(serve_result_.error());
+    if (shutdown_error_) {
+      return shutdown_error_;
+    }
+    if (!state_->serve_result) {
+      return describe(state_->serve_result.error());
     }
     return std::nullopt;
   }
 
 private:
-  trevrpc::Server server_;
+  struct State {
+    explicit State(trevrpc::Server value) : server(std::move(value)) {}
+
+    trevrpc::Server server;
+    trevrpc::Result<void> serve_result;
+    std::atomic<bool> stopped{false};
+  };
+
+  std::shared_ptr<State> state_;
   std::uint16_t port_;
-  trevrpc::Result<void> serve_result_;
-  std::atomic<bool> stopped_{false};
+  std::optional<std::string> shutdown_error_;
   std::thread serve_thread_;
 };
 

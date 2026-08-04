@@ -76,6 +76,23 @@ trevrpc_cpp_sanitizers(trevrpc_cpp_generator_options_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_generator_options_test)
 add_test(NAME trevrpc_cpp_generator_options COMMAND trevrpc_cpp_generator_options_test)
 
+add_test(NAME trevrpc_cpp_generator_collisions
+  COMMAND "${CMAKE_COMMAND}"
+    -DPROTOC=$<TARGET_FILE:protobuf::protoc>
+    -DPLUGIN=$<TARGET_FILE:protoc-gen-trevrpc-cpp>
+    -DPROTO_DIR=${trevrpc_cpp_test_proto_dir}
+    -DOUTPUT_DIR=${trevrpc_cpp_test_generated_dir}/collisions
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/generator-collision-test.cmake")
+
+add_test(NAME trevrpc_cpp_generator_header_drift
+  COMMAND "${CMAKE_COMMAND}" -E compare_files
+    "${trevrpc_cpp_test_generated_dir}/generator.trevrpc.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/golden/generator.trevrpc.hpp.golden")
+add_test(NAME trevrpc_cpp_generator_source_drift
+  COMMAND "${CMAKE_COMMAND}" -E compare_files
+    "${trevrpc_cpp_test_generated_dir}/generator.trevrpc.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/golden/generator.trevrpc.cpp.golden")
+
 find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
 set(trevrpc_cpp_test_cert "${CMAKE_CURRENT_BINARY_DIR}/test-cert.pem")
 set(trevrpc_cpp_test_key "${CMAKE_CURRENT_BINARY_DIR}/test-key.pem")
@@ -105,3 +122,68 @@ trevrpc_cpp_sanitizers(trevrpc_cpp_generated_service_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_generated_service_test)
 add_test(NAME trevrpc_cpp_generated_service COMMAND trevrpc_cpp_generated_service_test)
 set_tests_properties(trevrpc_cpp_generated_service PROPERTIES TIMEOUT 30)
+
+
+add_executable(trevrpc_cpp_async_core_test async_core_test.cpp)
+target_link_libraries(trevrpc_cpp_async_core_test PRIVATE trevrpc_cpp)
+trevrpc_cpp_warnings(trevrpc_cpp_async_core_test)
+trevrpc_cpp_sanitizers(trevrpc_cpp_async_core_test)
+trevrpc_cpp_test_assertions(trevrpc_cpp_async_core_test)
+add_test(NAME trevrpc_cpp_async_core COMMAND trevrpc_cpp_async_core_test)
+set_tests_properties(trevrpc_cpp_async_core PROPERTIES TIMEOUT 15)
+
+add_executable(trevrpc_cpp_async_stream_test async_stream_test.cpp)
+target_include_directories(trevrpc_cpp_async_stream_test PRIVATE ../src)
+target_link_libraries(trevrpc_cpp_async_stream_test PRIVATE trevrpc_cpp)
+trevrpc_cpp_warnings(trevrpc_cpp_async_stream_test)
+trevrpc_cpp_sanitizers(trevrpc_cpp_async_stream_test)
+trevrpc_cpp_test_assertions(trevrpc_cpp_async_stream_test)
+add_test(NAME trevrpc_cpp_async_stream COMMAND trevrpc_cpp_async_stream_test)
+set_tests_properties(trevrpc_cpp_async_stream PROPERTIES TIMEOUT 15)
+
+add_executable(trevrpc_cpp_async_server_core_test async_server_core_test.cpp)
+target_include_directories(trevrpc_cpp_async_server_core_test PRIVATE ../src)
+target_link_libraries(trevrpc_cpp_async_server_core_test PRIVATE trevrpc_cpp)
+trevrpc_cpp_warnings(trevrpc_cpp_async_server_core_test)
+trevrpc_cpp_sanitizers(trevrpc_cpp_async_server_core_test)
+trevrpc_cpp_test_assertions(trevrpc_cpp_async_server_core_test)
+add_test(NAME trevrpc_cpp_async_server_core COMMAND trevrpc_cpp_async_server_core_test)
+set_tests_properties(trevrpc_cpp_async_server_core PROPERTIES TIMEOUT 15)
+
+add_executable(trevrpc_cpp_callbacks_test callbacks_test.cpp)
+add_dependencies(trevrpc_cpp_callbacks_test trevrpc_cpp_test_certificates)
+target_include_directories(trevrpc_cpp_callbacks_test PRIVATE ../src)
+target_compile_definitions(trevrpc_cpp_callbacks_test PRIVATE
+  TREVRPC_CPP_TEST_CERT="${trevrpc_cpp_test_cert}"
+  TREVRPC_CPP_TEST_KEY="${trevrpc_cpp_test_key}")
+target_link_libraries(trevrpc_cpp_callbacks_test PRIVATE trevrpc_cpp)
+trevrpc_cpp_warnings(trevrpc_cpp_callbacks_test)
+trevrpc_cpp_sanitizers(trevrpc_cpp_callbacks_test)
+trevrpc_cpp_test_assertions(trevrpc_cpp_callbacks_test)
+add_test(NAME trevrpc_cpp_callbacks COMMAND trevrpc_cpp_callbacks_test)
+set_tests_properties(trevrpc_cpp_callbacks PROPERTIES TIMEOUT 20)
+
+add_executable(trevrpc_cpp_server_lifecycle_test server_lifecycle_test.cpp)
+add_dependencies(trevrpc_cpp_server_lifecycle_test trevrpc_cpp_test_certificates)
+target_include_directories(trevrpc_cpp_server_lifecycle_test PRIVATE ../src)
+target_compile_definitions(trevrpc_cpp_server_lifecycle_test PRIVATE
+  TREVRPC_CPP_TEST_CERT="${trevrpc_cpp_test_cert}"
+  TREVRPC_CPP_TEST_KEY="${trevrpc_cpp_test_key}")
+target_link_libraries(trevrpc_cpp_server_lifecycle_test PRIVATE trevrpc_cpp)
+trevrpc_cpp_warnings(trevrpc_cpp_server_lifecycle_test)
+trevrpc_cpp_sanitizers(trevrpc_cpp_server_lifecycle_test)
+trevrpc_cpp_test_assertions(trevrpc_cpp_server_lifecycle_test)
+add_test(NAME trevrpc_cpp_server_lifecycle COMMAND trevrpc_cpp_server_lifecycle_test)
+set_tests_properties(trevrpc_cpp_server_lifecycle PROPERTIES TIMEOUT 15)
+
+add_executable(trevrpc_cpp_generated_async_service_test generated_async_service_test.cpp)
+add_dependencies(trevrpc_cpp_generated_async_service_test trevrpc_cpp_test_certificates)
+target_compile_definitions(trevrpc_cpp_generated_async_service_test PRIVATE
+  TREVRPC_CPP_TEST_CERT="${trevrpc_cpp_test_cert}"
+  TREVRPC_CPP_TEST_KEY="${trevrpc_cpp_test_key}")
+target_link_libraries(trevrpc_cpp_generated_async_service_test PRIVATE trevrpc_cpp_test_generated)
+trevrpc_cpp_warnings(trevrpc_cpp_generated_async_service_test)
+trevrpc_cpp_sanitizers(trevrpc_cpp_generated_async_service_test)
+trevrpc_cpp_test_assertions(trevrpc_cpp_generated_async_service_test)
+add_test(NAME trevrpc_cpp_generated_async_service COMMAND trevrpc_cpp_generated_async_service_test)
+set_tests_properties(trevrpc_cpp_generated_async_service PROPERTIES TIMEOUT 30)
