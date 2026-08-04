@@ -230,6 +230,7 @@
                 pkgs.callPackage ./trevrpc-js/npm-stage.nix {
                   repoRoot = ./.;
                   trevrpcC = c;
+                  trevrpcJs = js;
                   nativePackage = jsNative;
                   nodejs_20 = portablePkgs.nodejs_20;
                 }

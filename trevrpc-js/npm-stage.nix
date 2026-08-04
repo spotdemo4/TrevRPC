@@ -5,16 +5,14 @@
   nodejs_20,
   nodejs_22,
   nodejs_24,
-  cmake,
   openssl,
-  oxfmt,
-  oxlint,
   protobuf,
   jq,
   binutils,
   gnugrep,
   repoRoot,
   trevrpcC,
+  trevrpcJs,
   nativePackage,
   playwright-driver,
 }:
@@ -43,10 +41,7 @@ buildNpmPackage (final: {
   PLAYWRIGHT_BROWSERS_PATH = "${playwright-driver.browsers}";
 
   nativeBuildInputs = [
-    cmake
     openssl
-    oxfmt
-    oxlint
     protobuf
     jq
     binutils
@@ -55,19 +50,12 @@ buildNpmPackage (final: {
   buildInputs = [ trevrpcC ];
 
   doCheck = true;
+  nativeCheckInputs = [ trevrpcJs ];
   checkPhase = ''
     runHook preCheck
+    # Source checks and native lifecycle tests run once in the prerequisite package.
+    test -d ${trevrpcJs}/lib/node_modules/trevrpc-js
     patchShebangs bin/protoc-gen-trevrpc-js.js
-
-    npm run format:check
-    npm run lint
-    npm run typecheck
-    npm run build:native:test
-    npm test
-    rm -rf build/native
-    npm run build:native
-    npm run verify:native:production
-
     runHook postCheck
   '';
 

@@ -67,6 +67,7 @@ if (!gcAvailable) {
   );
 } else {
   const native = existsSync(nativeAddonPath) ? require(nativeAddonPath) : null;
+  const nativeTestHooks = typeof native?._debugClientCloseReleaseRace === "function";
   after(async () => {
     if (certificateDirectory != null) {
       await rm(certificateDirectory, { force: true, recursive: true });
@@ -127,26 +128,26 @@ if (!gcAvailable) {
           });
         },
         async (client) => {
-          let response = await client.nativeClient.call({
-            service: "ownership",
-            method: "OpaqueUnary",
-            kind: RpcKind.Unary,
-            version: 1,
-            body: new Uint8Array(),
-          });
-          let body = response.body;
+          await (async () => {
+            let response = await client.nativeClient.call({
+              service: "ownership",
+              method: "OpaqueUnary",
+              kind: RpcKind.Unary,
+              version: 1,
+              body: new Uint8Array(),
+            });
+            const body = response.body;
 
-          assert.equal(response.status, Code.Unavailable);
-          assert.equal(response.message, "opaque unary");
-          assert.deepEqual(Array.from(response.metadata.trace), [7, 8, 9]);
-          assert.deepEqual(Array.from(body), Array.from(expected));
-          response = null;
-          await forceGcCycles();
+            assert.equal(response.status, Code.Unavailable);
+            assert.equal(response.message, "opaque unary");
+            assert.deepEqual(Array.from(response.metadata.trace), [7, 8, 9]);
+            assert.deepEqual(Array.from(body), Array.from(expected));
+            response = null;
+            await forceGcCycles();
 
-          assert.deepEqual(Array.from(body), Array.from(expected));
-          assert.equal(finalizerCount(native), before);
-
-          body = null;
+            assert.deepEqual(Array.from(body), Array.from(expected));
+            assert.equal(finalizerCount(native), before);
+          })();
           await waitForFinalizers(native, before + 1);
           assert.equal(ownerReleaseCount(native), releasesBefore + 1);
 
@@ -350,9 +351,9 @@ if (!gcAvailable) {
           assert.deepEqual(Array.from(response.body), Array.from(expected));
           assert.equal(ownerReleaseCount(native), releases);
           assert.equal(native._debugBodyConversionFailureStage(), 0);
+          response = null;
           await waitForFinalizers(native, finalizers + 1);
           assert.equal(ownerReleaseCount(native), releases + 1);
-          response = null;
 
           releases = ownerReleaseCount(native);
           finalizers = finalizerCount(native);
@@ -609,42 +610,50 @@ parentPort.postMessage("connecting");
         message: "remote unavailable",
       }));
       const serving = server.serve();
-      const client = await Channel.connect({
-        host: "127.0.0.1",
-        port: server.port,
-        skipCertificateValidation: true,
-        maxPendingSendBytes: 128,
-      });
+      let client;
       try {
-        const unavailableResponse = await client.call({
-          service: "ownership",
-          method: "Unavailable",
-          kind: RpcKind.Unary,
-          version: 1,
-          body: new Uint8Array(),
-          metadata: {},
+        client = await Channel.connect({
+          host: "127.0.0.1",
+          port: server.port,
+          skipCertificateValidation: true,
+          maxPendingSendBytes: 128,
+          timeoutMs: 5_000,
         });
-        assert.equal(unavailableResponse.status, Code.Unavailable);
-        assert.equal(client.generation, 1);
-        assert.equal(client.state, "ready");
-
-        await assert.rejects(
+        const unavailableResponse = await settlesWithin(
           client.call({
             service: "ownership",
             method: "Unavailable",
             kind: RpcKind.Unary,
             version: 1,
-            body: new Uint8Array(1024),
+            body: new Uint8Array(),
             metadata: {},
           }),
+          5_000,
+        );
+        assert.equal(unavailableResponse.status, Code.Unavailable);
+        assert.equal(client.generation, 1);
+        assert.equal(client.state, "ready");
+
+        await assert.rejects(
+          settlesWithin(
+            client.call({
+              service: "ownership",
+              method: "Unavailable",
+              kind: RpcKind.Unary,
+              version: 1,
+              body: new Uint8Array(1024),
+              metadata: {},
+            }),
+            5_000,
+          ),
           (error) => error.nativeCode === -1004,
         );
         assert.equal(client.generation, 1);
         assert.equal(client.state, "ready");
       } finally {
-        client.close();
         server.close();
-        await serving;
+        client?.close();
+        await settlesWithin(serving, 5_000);
       }
     },
   );
@@ -1017,7 +1026,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             },
           );
         },
-        async (client) => {
+        async (client, server) => {
           const transport = {
             async streamingCall(request, requestBody, options) {
               const iterator = requestBody[Symbol.asyncIterator]();
@@ -1054,22 +1063,45 @@ const native = require(${JSON.stringify(nativeAddonPath)});
               return await client.streamingCall(request, wrapped, options);
             },
           };
-          const call = await bidirectionalStreaming(
-            transport,
-            "ownership",
-            "EarlyTerminal",
-            Hello,
-            Hello,
-            { streamIdleTimeoutMs: undefined },
-          );
+          let call;
+          let primaryError;
+          let cleanupError;
+          try {
+            call = await bidirectionalStreaming(
+              transport,
+              "ownership",
+              "EarlyTerminal",
+              Hello,
+              Hello,
+              { streamIdleTimeoutMs: undefined },
+            );
 
-          assert.equal(await settlesWithin(call.recv(), 5_000), undefined);
-          await settlesWithin(requestReadSettledPromise, 5_000);
-          await setImmediate();
-          assert.equal(requestReadCalls, 1);
-          assert.equal(requestReadSettlements, 1);
-          assert.equal(requestReadDone, true);
-          assert.ok(requestReturns === 0 || requestReturns === 1);
+            assert.equal(await settlesWithin(call.recv(), 5_000), undefined);
+            await settlesWithin(requestReadSettledPromise, 5_000);
+            await setImmediate();
+            assert.equal(requestReadCalls, 1);
+            assert.equal(requestReadSettlements, 1);
+            assert.equal(requestReadDone, true);
+            assert.ok(requestReturns === 0 || requestReturns === 1);
+          } catch (error) {
+            primaryError = error;
+          } finally {
+            try {
+              await call?.close();
+              await waitForCondition(
+                () => server.activeCalls.size === 0,
+                "early-terminal server handler did not settle",
+              );
+            } catch (error) {
+              cleanupError = error;
+            }
+          }
+          if (primaryError != null) {
+            throw primaryError;
+          }
+          if (cleanupError != null) {
+            throw cleanupError;
+          }
         },
       );
     },
@@ -1249,11 +1281,15 @@ const native = require(${JSON.stringify(nativeAddonPath)});
 
   test(
     "rejected double-terminal work cannot abandon the terminal operation owner",
-    { skip: native == null, timeout: 15_000 },
+    { skip: !nativeTestHooks, timeout: 15_000 },
     async () => {
       let terminalOutcome;
       const terminalOutcomePromise = new Promise((resolve) => {
         terminalOutcome = resolve;
+      });
+      let clientReady;
+      const clientReadyPromise = new Promise((resolve) => {
+        clientReady = resolve;
       });
       await withNativePair(
         async (server) => {
@@ -1262,62 +1298,82 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             "DoubleTerminal",
             RpcKind.BidirectionalStreaming,
             (call) => {
-              const heldSend = call.sendMessage(new Uint8Array(3 * 1024 * 1024)).then(
-                () => ({ status: "fulfilled" }),
-                (error) => ({ status: "rejected", error }),
-              );
               void (async () => {
-                const deadline = Date.now() + 3_000;
-                while (!call._debugOperationLocked()) {
-                  if (Date.now() >= deadline) {
-                    throw new Error("send never acquired the call operation mutex");
+                try {
+                  await clientReadyPromise;
+                  call._debugArmOutboundGate();
+                  const heldSend = call.sendMessage(new Uint8Array([7]));
+                  await waitForCondition(
+                    () => call._debugOutboundGateReached(),
+                    "send never reached the outbound gate",
+                  );
+                  const firstTerminal = call.finishStream(Code.Ok);
+                  const secondTerminal = call.finishStream(Code.Ok);
+                  call._debugReleaseOutboundGate();
+                  const results = await settlesWithin(
+                    Promise.allSettled([heldSend, firstTerminal, secondTerminal]),
+                    5_000,
+                  );
+                  terminalOutcome({
+                    send: results[0],
+                    terminals: results.slice(1),
+                  });
+                } catch (error) {
+                  terminalOutcome(error);
+                } finally {
+                  try {
+                    call._debugReleaseOutboundGate?.();
+                  } finally {
+                    call.close();
                   }
-                  await setImmediate();
                 }
-                const terminals = await Promise.allSettled([
-                  call.finishStream(Code.Ok),
-                  call.finishStream(Code.Ok),
-                ]);
-                terminalOutcome({ heldSend: await heldSend, terminals });
-              })().catch(terminalOutcome);
+              })();
             },
           );
         },
         async (client) => {
-          const stream = await client.nativeClient.startStream({
-            service: "ownership",
-            method: "DoubleTerminal",
-            kind: RpcKind.BidirectionalStreaming,
-            body: new Uint8Array(),
-          });
-          await stream.finishSend();
-          await delay(50);
-          const frames = [];
-          for (;;) {
-            const frame = await settlesWithin(stream.recv(), 5_000);
-            if (frame == null) {
-              break;
+          let stream;
+          try {
+            stream = await client.nativeClient.startStream({
+              service: "ownership",
+              method: "DoubleTerminal",
+              kind: RpcKind.BidirectionalStreaming,
+              body: new Uint8Array(),
+            });
+            await stream.finishSend();
+            clientReady();
+            const outcome = await settlesWithin(terminalOutcomePromise, 5_000);
+            if (outcome instanceof Error) {
+              throw outcome;
             }
-            frames.push(frame);
-            if (frame.kind === RpcStreamFrameKind.Status) {
-              break;
+            const frames = [];
+            for (;;) {
+              const frame = await settlesWithin(stream.recv(), 5_000);
+              if (frame == null) {
+                break;
+              }
+              frames.push(frame);
+              if (frame.kind === RpcStreamFrameKind.Status) {
+                break;
+              }
             }
+            assert.equal(outcome.send.status, "fulfilled");
+            assert.equal(
+              outcome.terminals.filter((result) => result.status === "fulfilled").length,
+              1,
+            );
+            assert.equal(
+              outcome.terminals.filter((result) => result.status === "rejected").length,
+              1,
+            );
+            assert.deepEqual(
+              frames.map((frame) => frame.kind),
+              [RpcStreamFrameKind.Message, RpcStreamFrameKind.Status],
+            );
+          } finally {
+            clientReady();
+            stream?.close();
           }
-          const outcome = await settlesWithin(terminalOutcomePromise, 5_000);
-          assert.equal(outcome.heldSend.status, "fulfilled");
-          assert.equal(
-            outcome.terminals.filter((result) => result.status === "fulfilled").length,
-            1,
-          );
-          assert.equal(
-            outcome.terminals.filter((result) => result.status === "rejected").length,
-            1,
-          );
-          assert.deepEqual(
-            frames.map((frame) => frame.kind),
-            [RpcStreamFrameKind.Message, RpcStreamFrameKind.Status],
-          );
-          stream.close();
         },
       );
     },
@@ -1325,7 +1381,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
 
   test(
     "outbound FIFO preserves body order before finish",
-    { skip: native == null, timeout: 30_000 },
+    { skip: !nativeTestHooks, timeout: 30_000 },
     async () => {
       let requestQueuedResolve;
       const requestQueued = new Promise((resolve) => {
@@ -1334,6 +1390,14 @@ const native = require(${JSON.stringify(nativeAddonPath)});
       let requestResultResolve;
       const requestResult = new Promise((resolve) => {
         requestResultResolve = resolve;
+      });
+      let requestWritesSettledResolve;
+      const requestWritesSettled = new Promise((resolve) => {
+        requestWritesSettledResolve = resolve;
+      });
+      let responseClientReadyResolve;
+      const responseClientReady = new Promise((resolve) => {
+        responseClientReadyResolve = resolve;
       });
       let responseQueuedResolve;
       const responseQueued = new Promise((resolve) => {
@@ -1352,18 +1416,25 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             RpcKind.BidirectionalStreaming,
             (call) => {
               void (async () => {
-                await requestQueued;
-                const received = [];
-                for (;;) {
-                  const frame = await call.recv();
-                  if (frame == null) {
-                    break;
+                try {
+                  await requestQueued;
+                  const received = [];
+                  for (;;) {
+                    const frame = await call.recv();
+                    if (frame == null) {
+                      break;
+                    }
+                    received.push({ first: frame.body[0], length: frame.body.byteLength });
                   }
-                  received.push({ first: frame.body[0], length: frame.body.byteLength });
+                  await requestWritesSettled;
+                  await call.finishStream(Code.Ok);
+                  requestResultResolve(received);
+                } catch (error) {
+                  requestResultResolve(error);
+                } finally {
+                  call.close();
                 }
-                await call.finishStream(Code.Ok);
-                requestResultResolve(received);
-              })().catch(requestResultResolve);
+              })();
             },
           );
           server.nativeServer.register(
@@ -1371,90 +1442,135 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             "ResponseOrder",
             RpcKind.BidirectionalStreaming,
             (call) => {
-              const held = call.sendMessage(new Uint8Array(3 * 1024 * 1024).fill(9));
               void (async () => {
-                await waitForCondition(
-                  () => call._debugOperationLocked(),
-                  "response send never held the call operation mutex",
-                );
-                const later = [
-                  call.sendMessage(new Uint8Array([1])),
-                  call.sendMessages([new Uint8Array([2]), new Uint8Array([3])]),
-                  call.finishStream(Code.Ok),
-                ];
-                responseQueuedResolve();
-                responseResultResolve(await Promise.allSettled([held, ...later]));
-              })().catch(responseResultResolve);
+                try {
+                  await responseClientReady;
+                  call._debugArmOutboundGate();
+                  const held = call.sendMessage(new Uint8Array([9]));
+                  await waitForCondition(
+                    () => call._debugOutboundGateReached(),
+                    "response send never reached the outbound gate",
+                  );
+                  const later = [
+                    call.sendMessage(new Uint8Array([1])),
+                    call.sendMessages([new Uint8Array([2]), new Uint8Array([3])]),
+                    call.finishStream(Code.Ok),
+                  ];
+                  responseQueuedResolve(null);
+                  call._debugReleaseOutboundGate();
+                  responseResultResolve(
+                    await settlesWithin(Promise.allSettled([held, ...later]), 5_000),
+                  );
+                } catch (error) {
+                  responseQueuedResolve(error);
+                  responseResultResolve(error);
+                } finally {
+                  try {
+                    call._debugReleaseOutboundGate?.();
+                  } finally {
+                    call.close();
+                  }
+                }
+              })();
             },
           );
         },
         async (client) => {
-          const requestStream = await client.nativeClient.startStream({
-            service: "ownership",
-            method: "RequestOrder",
-            kind: RpcKind.BidirectionalStreaming,
-            body: new Uint8Array(),
-          });
-          const held = requestStream.sendMessage(new Uint8Array(3 * 1024 * 1024).fill(9));
-          await waitForCondition(
-            () => requestStream._debugOperationLocked(),
-            "request send never held the stream operation mutex",
-          );
-          const later = [
-            requestStream.sendMessage(new Uint8Array([1])),
-            requestStream.sendMessages([new Uint8Array([2]), new Uint8Array([3])]),
-            requestStream.finishSend(),
-          ];
-          requestQueuedResolve();
-          const requestResults = await Promise.allSettled([held, ...later]);
-          assert.equal(
-            requestResults.filter((result) => result.status === "fulfilled").length,
-            requestResults.length,
-          );
-          assert.deepEqual(await settlesWithin(requestResult, 5_000), [
-            { first: 9, length: 3 * 1024 * 1024 },
-            { first: 1, length: 1 },
-            { first: 2, length: 1 },
-            { first: 3, length: 1 },
-          ]);
-          const requestStatus = await settlesWithin(requestStream.recv(), 5_000);
-          assert.equal(requestStatus.kind, RpcStreamFrameKind.Status);
-          requestStream.close();
-
-          const responseStream = await client.nativeClient.startStream({
-            service: "ownership",
-            method: "ResponseOrder",
-            kind: RpcKind.BidirectionalStreaming,
-            body: new Uint8Array(),
-          });
-          await responseStream.finishSend();
-          await settlesWithin(responseQueued, 5_000);
-          const responseBodies = [];
-          let responseStatus = null;
-          for (;;) {
-            const frame = await settlesWithin(responseStream.recv(), 5_000);
-            if (frame == null) {
-              break;
+          let requestStream;
+          try {
+            requestStream = await client.nativeClient.startStream({
+              service: "ownership",
+              method: "RequestOrder",
+              kind: RpcKind.BidirectionalStreaming,
+              body: new Uint8Array(),
+            });
+            requestStream._debugArmOutboundGate();
+            const held = requestStream.sendMessage(new Uint8Array([9]));
+            await waitForCondition(
+              () => requestStream._debugOutboundGateReached(),
+              "request send never reached the outbound gate",
+            );
+            const later = [
+              requestStream.sendMessage(new Uint8Array([1])),
+              requestStream.sendMessages([new Uint8Array([2]), new Uint8Array([3])]),
+              requestStream.finishSend(),
+            ];
+            requestQueuedResolve();
+            requestStream._debugReleaseOutboundGate();
+            const requestResults = await settlesWithin(Promise.allSettled([held, ...later]), 5_000);
+            requestWritesSettledResolve();
+            assert.equal(
+              requestResults.filter((result) => result.status === "fulfilled").length,
+              requestResults.length,
+            );
+            const received = await settlesWithin(requestResult, 5_000);
+            if (received instanceof Error) {
+              throw received;
             }
-            if (frame.kind === RpcStreamFrameKind.Status) {
-              responseStatus = frame;
-              break;
+            assert.deepEqual(received, [
+              { first: 9, length: 1 },
+              { first: 1, length: 1 },
+              { first: 2, length: 1 },
+              { first: 3, length: 1 },
+            ]);
+            const requestStatus = await settlesWithin(requestStream.recv(), 5_000);
+            assert.equal(requestStatus.kind, RpcStreamFrameKind.Status);
+          } finally {
+            requestQueuedResolve();
+            requestWritesSettledResolve();
+            try {
+              requestStream?._debugReleaseOutboundGate?.();
+            } finally {
+              requestStream?.close();
             }
-            responseBodies.push({ first: frame.body[0], length: frame.body.byteLength });
           }
-          assert.deepEqual(responseBodies, [
-            { first: 9, length: 3 * 1024 * 1024 },
-            { first: 1, length: 1 },
-            { first: 2, length: 1 },
-            { first: 3, length: 1 },
-          ]);
-          assert.equal(responseStatus.status, Code.Ok);
-          const responseResults = await settlesWithin(responseResult, 5_000);
-          assert.equal(
-            responseResults.filter((result) => result.status === "fulfilled").length,
-            responseResults.length,
-          );
-          responseStream.close();
+
+          let responseStream;
+          try {
+            responseStream = await client.nativeClient.startStream({
+              service: "ownership",
+              method: "ResponseOrder",
+              kind: RpcKind.BidirectionalStreaming,
+              body: new Uint8Array(),
+            });
+            await responseStream.finishSend();
+            responseClientReadyResolve();
+            const queued = await settlesWithin(responseQueued, 5_000);
+            if (queued instanceof Error) {
+              throw queued;
+            }
+            const responseBodies = [];
+            let responseStatus = null;
+            for (;;) {
+              const frame = await settlesWithin(responseStream.recv(), 5_000);
+              if (frame == null) {
+                break;
+              }
+              if (frame.kind === RpcStreamFrameKind.Status) {
+                responseStatus = frame;
+                break;
+              }
+              responseBodies.push({ first: frame.body[0], length: frame.body.byteLength });
+            }
+            assert.deepEqual(responseBodies, [
+              { first: 9, length: 1 },
+              { first: 1, length: 1 },
+              { first: 2, length: 1 },
+              { first: 3, length: 1 },
+            ]);
+            assert.equal(responseStatus.status, Code.Ok);
+            const responseResults = await settlesWithin(responseResult, 5_000);
+            if (responseResults instanceof Error) {
+              throw responseResults;
+            }
+            assert.equal(
+              responseResults.filter((result) => result.status === "fulfilled").length,
+              responseResults.length,
+            );
+          } finally {
+            responseClientReadyResolve();
+            responseStream?.close();
+          }
         },
       );
     },
@@ -1462,7 +1578,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
 
   test(
     "outbound FIFO advances after submission failure",
-    { skip: native == null, timeout: 15_000 },
+    { skip: !nativeTestHooks, timeout: 15_000 },
     async () => {
       let receivedResolve;
       const received = new Promise((resolve) => {
@@ -1491,23 +1607,42 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           );
         },
         async (client) => {
-          const stream = await client.nativeClient.startStream({
-            service: "ownership",
-            method: "FailureOrder",
-            kind: RpcKind.BidirectionalStreaming,
-            body: new Uint8Array(),
-          });
-          const failed = stream.sendMessage(new Uint8Array(1024));
-          const retry = stream.sendMessage(new Uint8Array([7]));
-          const results = await Promise.allSettled([failed, retry, stream.finishSend()]);
-          assert.equal(results[0].status, "rejected");
-          assert.equal(results[0].reason.nativeCode, -1004);
-          assert.equal(results[1].status, "fulfilled");
-          assert.equal(results[2].status, "fulfilled");
-          assert.deepEqual(await settlesWithin(received, 5_000), [[7]]);
-          const status = await settlesWithin(stream.recv(), 5_000);
-          assert.equal(status.kind, RpcStreamFrameKind.Status);
-          stream.close();
+          let stream;
+          try {
+            stream = await client.nativeClient.startStream({
+              service: "ownership",
+              method: "FailureOrder",
+              kind: RpcKind.BidirectionalStreaming,
+              body: new Uint8Array(),
+            });
+            stream._debugArmOutboundGate();
+            const failed = stream.sendMessage(new Uint8Array(1024));
+            await waitForCondition(
+              () => stream._debugOutboundGateReached(),
+              "failing send never reached the outbound gate",
+            );
+            const retry = stream.sendMessage(new Uint8Array([7]));
+            const finish = stream.finishSend();
+            stream._debugReleaseOutboundGate();
+            const results = await settlesWithin(Promise.allSettled([failed, retry, finish]), 5_000);
+            assert.equal(results[0].status, "rejected");
+            assert.equal(results[0].reason.nativeCode, -1004);
+            assert.equal(results[1].status, "fulfilled");
+            assert.equal(results[2].status, "fulfilled");
+            const bodies = await settlesWithin(received, 5_000);
+            if (bodies instanceof Error) {
+              throw bodies;
+            }
+            assert.deepEqual(bodies, [[7]]);
+            const status = await settlesWithin(stream.recv(), 5_000);
+            assert.equal(status.kind, RpcStreamFrameKind.Status);
+          } finally {
+            try {
+              stream?._debugReleaseOutboundGate?.();
+            } finally {
+              stream?.close();
+            }
+          }
         },
         () => ({}),
         () => ({ maxPendingSendBytes: 128 }),
@@ -1743,8 +1878,8 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
-    "native connection close cancels an accepted send",
-    { skip: native == null, timeout: 20_000 },
+    "native connection close cancels queued work and settles an acquired send",
+    { skip: !nativeTestHooks, timeout: 20_000 },
     async () => {
       let heldCall;
       let callStarted;
@@ -1764,23 +1899,47 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           );
         },
         async (client) => {
-          const stream = await client.nativeClient.startStream({
-            service: "ownership",
-            method: "ConnectionClose",
-            kind: RpcKind.BidirectionalStreaming,
-            body: new Uint8Array(),
-          });
-          const bodies = Array.from({ length: 6 }, () => new Uint8Array(3 * 1024 * 1024));
-          const pending = stream.sendMessages(bodies).then(
-            () => null,
-            (error) => error,
-          );
-          await callStartedPromise;
-          client.close();
-          const sendError = await settlesWithin(pending, 5_000);
-          assert.equal(sendError.nativeCode, -1001);
-          heldCall?.close();
-          heldCall = null;
+          let stream;
+          try {
+            stream = await client.nativeClient.startStream({
+              service: "ownership",
+              method: "ConnectionClose",
+              kind: RpcKind.BidirectionalStreaming,
+              body: new Uint8Array(),
+            });
+            stream._debugArmOutboundGate();
+            const acquired = stream.sendMessage(new Uint8Array([7])).then(
+              () => null,
+              (error) => error,
+            );
+            await waitForCondition(
+              () => stream._debugOutboundGateReached(),
+              "accepted send never reached the outbound gate",
+            );
+            const queued = stream.sendMessage(new Uint8Array([8])).then(
+              () => null,
+              (error) => error,
+            );
+            await callStartedPromise;
+            client.close();
+            stream._debugReleaseOutboundGate();
+            const [acquiredResult, queuedResult] = await settlesWithin(
+              Promise.all([acquired, queued]),
+              5_000,
+            );
+            assert.equal(acquiredResult instanceof Error, true);
+            assert.equal(acquiredResult.nativeCode, -osConstants.errno.ECANCELED);
+            assert.equal(queuedResult instanceof Error, true);
+            assert.equal(queuedResult.nativeCode, -osConstants.errno.ECANCELED);
+          } finally {
+            try {
+              stream?._debugReleaseOutboundGate?.();
+            } finally {
+              stream?.close();
+              heldCall?.close();
+              heldCall = null;
+            }
+          }
         },
       );
     },
@@ -1876,14 +2035,17 @@ async function waitForResourceFinalizers(native, target) {
   );
 }
 
-async function waitForCondition(predicate, message) {
-  for (let i = 0; i < 100; i += 1) {
+async function waitForCondition(predicate, message, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
     if (predicate()) {
       return;
     }
+    if (Date.now() >= deadline) {
+      assert.fail(message);
+    }
     await delay(1);
   }
-  assert.fail(message);
 }
 
 function bodyBatchIterable(batches) {
@@ -1929,8 +2091,8 @@ async function withNativePair(
   try {
     await run(client, server);
   } finally {
-    client.close();
     server.close();
+    client.close();
     await settlesWithin(serving, 5_000);
   }
 }

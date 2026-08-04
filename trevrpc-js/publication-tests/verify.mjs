@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -75,10 +76,15 @@ assert.deepEqual(nativeManifest.os, ["linux"]);
 assert.deepEqual(nativeManifest.cpu, ["x64"]);
 assert.deepEqual(nativeManifest.libc, ["glibc"]);
 
-for (const file of [
-  join(nativeExtract, "package/trevrpc_native.node"),
-  join(nativeExtract, "package/libmsquic.so.2"),
-]) {
+const nativeAddon = join(nativeExtract, "package/trevrpc_native.node");
+const nativeExports = Object.getOwnPropertyNames(
+  createRequire(import.meta.url)(nativeAddon),
+).sort();
+assert.deepEqual(nativeExports, ["connectMsQuic", "createCancellation", "listenMsQuic"]);
+const nativeBytes = await readFile(nativeAddon);
+assert.equal(nativeBytes.includes(Buffer.from("_debug")), false);
+
+for (const file of [nativeAddon, join(nativeExtract, "package/libmsquic.so.2")]) {
   const bytes = await readFile(file);
   for (const forbidden of ["/nix/store", "/home/", "/build/"]) {
     assert.equal(bytes.includes(Buffer.from(forbidden)), false, `${file} contains ${forbidden}`);

@@ -34,6 +34,17 @@ typedef struct server_route server_route;
 typedef struct node_http3_admission_state node_http3_admission_state;
 #ifdef TREVRPC_NODE_TEST_HOOKS
 typedef struct debug_client_close_race debug_client_close_race;
+
+typedef enum debug_outbound_gate_state {
+    DEBUG_OUTBOUND_GATE_IDLE = 0,
+    DEBUG_OUTBOUND_GATE_ARMED = 1,
+    DEBUG_OUTBOUND_GATE_REACHED = 2,
+} debug_outbound_gate_state;
+
+typedef struct debug_outbound_gate {
+    pthread_cond_t cond;
+    debug_outbound_gate_state state;
+} debug_outbound_gate;
 #endif
 
 static void http3_admission_state_shutdown(node_http3_admission_state* state);
@@ -68,6 +79,9 @@ struct native_stream {
     pthread_mutex_t operation_mutex;
     base_work* outbound_head;
     base_work* outbound_tail;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate debug_outbound_gate;
+#endif
     size_t refs;
     bool closing;
     bool js_alive;
@@ -104,6 +118,9 @@ struct native_call {
     pthread_mutex_t operation_mutex;
     base_work* outbound_head;
     base_work* outbound_tail;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate debug_outbound_gate;
+#endif
     size_t refs;
     bool completing;
     bool js_alive;
@@ -426,6 +443,47 @@ static atomic_uint_least64_t NodeBodyOwnerReleases = ATOMIC_VAR_INIT(0);
 static atomic_int NextBodyConversionFailure = ATOMIC_VAR_INIT(DEBUG_BODY_CONVERSION_FAILURE_NONE);
 static atomic_uint_least64_t DebugPendingResourceCloses = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugPendingResourceFinalizers = ATOMIC_VAR_INIT(0);
+
+static int debug_outbound_gate_init(debug_outbound_gate* gate) {
+    return pthread_cond_init(&gate->cond, NULL);
+}
+
+static void debug_outbound_gate_destroy(debug_outbound_gate* gate) {
+    pthread_cond_destroy(&gate->cond);
+}
+
+static bool debug_outbound_gate_arm_locked(debug_outbound_gate* gate) {
+    if (gate->state != DEBUG_OUTBOUND_GATE_IDLE) {
+        return false;
+    }
+    gate->state = DEBUG_OUTBOUND_GATE_ARMED;
+    return true;
+}
+
+static bool debug_outbound_gate_reached_locked(const debug_outbound_gate* gate) {
+    return gate->state == DEBUG_OUTBOUND_GATE_REACHED;
+}
+
+static void debug_outbound_gate_release_locked(debug_outbound_gate* gate) {
+    if (gate->state == DEBUG_OUTBOUND_GATE_IDLE) {
+        return;
+    }
+    gate->state = DEBUG_OUTBOUND_GATE_IDLE;
+    pthread_cond_broadcast(&gate->cond);
+}
+
+static void debug_outbound_gate_wait(debug_outbound_gate* gate, pthread_mutex_t* owner_mutex) {
+    pthread_mutex_lock(owner_mutex);
+    if (gate->state != DEBUG_OUTBOUND_GATE_ARMED) {
+        pthread_mutex_unlock(owner_mutex);
+        return;
+    }
+    gate->state = DEBUG_OUTBOUND_GATE_REACHED;
+    while (gate->state == DEBUG_OUTBOUND_GATE_REACHED) {
+        pthread_cond_wait(&gate->cond, owner_mutex);
+    }
+    pthread_mutex_unlock(owner_mutex);
+}
 #endif
 
 static napi_value noop_js_callback(napi_env env, napi_callback_info info);
@@ -2214,6 +2272,9 @@ static void native_stream_maybe_destroy(native_stream* stream) {
     destroy = !stream->js_alive && stream->refs == 0 && stream->stream == NULL;
     pthread_mutex_unlock(&stream->mutex);
     if (destroy) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+        debug_outbound_gate_destroy(&stream->debug_outbound_gate);
+#endif
         pthread_mutex_destroy(&stream->operation_mutex);
         pthread_mutex_destroy(&stream->mutex);
         free(stream);
@@ -2242,6 +2303,9 @@ static void native_stream_release(native_stream* stream) {
         native_client_release(stream->owner);
     }
     if (destroy) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+        debug_outbound_gate_destroy(&stream->debug_outbound_gate);
+#endif
         pthread_mutex_destroy(&stream->operation_mutex);
         pthread_mutex_destroy(&stream->mutex);
         free(stream);
@@ -2345,6 +2409,24 @@ static void native_stream_operation_release(native_stream* stream) {
     native_stream_release(stream);
 }
 
+static bool native_stream_cancel_requested(native_stream* stream) {
+    pthread_mutex_lock(&stream->mutex);
+    bool closing = stream->closing;
+    native_client* owner = stream->owner;
+    pthread_mutex_unlock(&stream->mutex);
+    if (closing || owner == NULL) {
+        return closing;
+    }
+    pthread_mutex_lock(&owner->mutex);
+    closing = owner->closing;
+    pthread_mutex_unlock(&owner->mutex);
+    return closing;
+}
+
+static int native_stream_normalize_cancelled_error(native_stream* stream, int err) {
+    return err != 0 && native_stream_cancel_requested(stream) ? -ECANCELED : err;
+}
+
 static void native_stream_close_request(native_stream* stream) {
     if (stream == NULL) {
         return;
@@ -2354,6 +2436,9 @@ static void native_stream_close_request(native_stream* stream) {
     bool should_release_owner = false;
     pthread_mutex_lock(&stream->mutex);
     stream->closing = true;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_release_locked(&stream->debug_outbound_gate);
+#endif
     if (stream->refs == 0 && stream->stream != NULL) {
         close_stream = stream->stream;
         stream->stream = NULL;
@@ -2452,6 +2537,9 @@ static void native_call_maybe_destroy(native_call* call) {
     destroy = !call->js_alive && call->refs == 0 && call->call == NULL;
     pthread_mutex_unlock(&call->mutex);
     if (destroy) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+        debug_outbound_gate_destroy(&call->debug_outbound_gate);
+#endif
         pthread_mutex_destroy(&call->operation_mutex);
         pthread_mutex_destroy(&call->mutex);
         free(call);
@@ -2475,6 +2563,9 @@ static void native_call_release(native_call* call, trevrpc_call* acquired_call) 
     trevrpc_call_close(close_call);
     trevrpc_call_release(acquired_call);
     if (destroy) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+        debug_outbound_gate_destroy(&call->debug_outbound_gate);
+#endif
         pthread_mutex_destroy(&call->operation_mutex);
         pthread_mutex_destroy(&call->mutex);
         free(call);
@@ -2619,6 +2710,9 @@ static void native_call_close_request(native_call* call) {
     trevrpc_call* cancel_call = NULL;
     pthread_mutex_lock(&call->mutex);
     call->completing = true;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_release_locked(&call->debug_outbound_gate);
+#endif
     if (call->refs == 0 && call->call != NULL) {
         close_call = call->call;
         call->call = NULL;
@@ -3543,7 +3637,16 @@ static int native_server_call_handler(void* user_data, trevrpc_call* call) {
     }
     int mutex_err = pthread_mutex_init(&native->mutex, NULL);
     int operation_mutex_err = mutex_err == 0 ? pthread_mutex_init(&native->operation_mutex, NULL) : mutex_err;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    int gate_err =
+        operation_mutex_err == 0 ? debug_outbound_gate_init(&native->debug_outbound_gate) : operation_mutex_err;
+    if (mutex_err != 0 || operation_mutex_err != 0 || gate_err != 0) {
+#else
     if (mutex_err != 0 || operation_mutex_err != 0) {
+#endif
+        if (operation_mutex_err == 0) {
+            pthread_mutex_destroy(&native->operation_mutex);
+        }
         if (mutex_err == 0) {
             pthread_mutex_destroy(&native->mutex);
         }
@@ -4704,7 +4807,16 @@ static void start_stream_complete(napi_env env, napi_status status, void* data) 
         } else {
             int mutex_err = pthread_mutex_init(&stream->mutex, NULL);
             int operation_mutex_err = mutex_err == 0 ? pthread_mutex_init(&stream->operation_mutex, NULL) : mutex_err;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+            int gate_err =
+                operation_mutex_err == 0 ? debug_outbound_gate_init(&stream->debug_outbound_gate) : operation_mutex_err;
+            if (mutex_err != 0 || operation_mutex_err != 0 || gate_err != 0) {
+#else
             if (mutex_err != 0 || operation_mutex_err != 0) {
+#endif
+                if (operation_mutex_err == 0) {
+                    pthread_mutex_destroy(&stream->operation_mutex);
+                }
                 if (mutex_err == 0) {
                     pthread_mutex_destroy(&stream->mutex);
                 }
@@ -4915,7 +5027,15 @@ static void stream_send_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    work->base.err = trevrpc_stream_send_message(stream, work->body, work->body_len);
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_wait(&work->stream->debug_outbound_gate, &work->stream->mutex);
+#endif
+    if (native_stream_cancel_requested(work->stream)) {
+        work->base.err = -ECANCELED;
+    } else {
+        work->base.err = trevrpc_stream_send_message(stream, work->body, work->body_len);
+        work->base.err = native_stream_normalize_cancelled_error(work->stream, work->base.err);
+    }
     native_stream_operation_release(work->stream);
     work->acquired = false;
     native_stream_outbound_finish(work->stream, &work->base);
@@ -5003,7 +5123,15 @@ static void stream_send_many_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    work->base.err = trevrpc_stream_send_messages(stream, work->bodies, work->body_lens, work->count);
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_wait(&work->stream->debug_outbound_gate, &work->stream->mutex);
+#endif
+    if (native_stream_cancel_requested(work->stream)) {
+        work->base.err = -ECANCELED;
+    } else {
+        work->base.err = trevrpc_stream_send_messages(stream, work->bodies, work->body_lens, work->count);
+        work->base.err = native_stream_normalize_cancelled_error(work->stream, work->base.err);
+    }
     native_stream_operation_release(work->stream);
     work->acquired = false;
     native_stream_outbound_finish(work->stream, &work->base);
@@ -5050,7 +5178,15 @@ static void stream_finish_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    work->base.err = trevrpc_stream_finish_send(stream);
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_wait(&work->stream->debug_outbound_gate, &work->stream->mutex);
+#endif
+    if (native_stream_cancel_requested(work->stream)) {
+        work->base.err = -ECANCELED;
+    } else {
+        work->base.err = trevrpc_stream_finish_send(stream);
+        work->base.err = native_stream_normalize_cancelled_error(work->stream, work->base.err);
+    }
     native_stream_operation_release(work->stream);
     work->acquired = false;
     native_stream_outbound_finish(work->stream, &work->base);
@@ -5322,24 +5458,54 @@ static napi_value native_stream_close(napi_env env, napi_callback_info info) {
 }
 
 #ifdef TREVRPC_NODE_TEST_HOOKS
-static napi_value native_stream_debug_operation_locked(napi_env env, napi_callback_info info) {
+static napi_value native_stream_debug_arm_outbound_gate(napi_env env, napi_callback_info info) {
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
     native_stream* stream = NULL;
     if (!unwrap_native_stream(env, this_arg, &stream)) {
         return NULL;
     }
-    int err = pthread_mutex_trylock(&stream->operation_mutex);
-    bool locked = err == EBUSY;
-    if (err == 0) {
-        pthread_mutex_unlock(&stream->operation_mutex);
-    } else if (err != EBUSY) {
-        napi_throw_error(env, NULL, "failed to inspect native stream operation lock");
+    pthread_mutex_lock(&stream->mutex);
+    bool armed =
+        stream->stream != NULL && !stream->closing && debug_outbound_gate_arm_locked(&stream->debug_outbound_gate);
+    pthread_mutex_unlock(&stream->mutex);
+    if (!armed) {
+        napi_throw_error(env, NULL, "failed to arm native stream outbound gate");
         return NULL;
     }
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static napi_value native_stream_debug_outbound_gate_reached(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    native_stream* stream = NULL;
+    if (!unwrap_native_stream(env, this_arg, &stream)) {
+        return NULL;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    bool reached = debug_outbound_gate_reached_locked(&stream->debug_outbound_gate);
+    pthread_mutex_unlock(&stream->mutex);
     napi_value result = NULL;
-    napi_get_boolean(env, locked, &result);
+    napi_get_boolean(env, reached, &result);
     return result;
+}
+
+static napi_value native_stream_debug_release_outbound_gate(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    native_stream* stream = NULL;
+    if (!unwrap_native_stream(env, this_arg, &stream)) {
+        return NULL;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    debug_outbound_gate_release_locked(&stream->debug_outbound_gate);
+    pthread_mutex_unlock(&stream->mutex);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
 }
 #endif
 
@@ -5374,6 +5540,9 @@ static void call_respond_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_wait(&work->call->debug_outbound_gate, &work->call->mutex);
+#endif
     trevrpc_response_view_v1 response = {0};
     work->base.err = trevrpc_response_view_v1_init(&response, sizeof(response));
     if (work->base.err == 0) {
@@ -5515,6 +5684,9 @@ static void call_send_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_wait(&work->call->debug_outbound_gate, &work->call->mutex);
+#endif
     trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
     work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
                                     : trevrpc_stream_send_message(stream, work->body, work->body_len);
@@ -5603,6 +5775,9 @@ static void call_send_many_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_wait(&work->call->debug_outbound_gate, &work->call->mutex);
+#endif
     trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
     work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
                                     : trevrpc_stream_send_messages(stream, work->bodies, work->body_lens, work->count);
@@ -5650,6 +5825,9 @@ static void call_finish_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_wait(&work->call->debug_outbound_gate, &work->call->mutex);
+#endif
     trevrpc_status_view_v1 status = {0};
     work->base.err = trevrpc_status_view_v1_init(&status, sizeof(status));
     if (work->base.err == 0) {
@@ -5913,24 +6091,53 @@ static napi_value native_call_close(napi_env env, napi_callback_info info) {
 }
 
 #ifdef TREVRPC_NODE_TEST_HOOKS
-static napi_value native_call_debug_operation_locked(napi_env env, napi_callback_info info) {
+static napi_value native_call_debug_arm_outbound_gate(napi_env env, napi_callback_info info) {
     napi_value this_arg = NULL;
     napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
     native_call* call = NULL;
     if (!unwrap_native_call(env, this_arg, &call)) {
         return NULL;
     }
-    int err = pthread_mutex_trylock(&call->operation_mutex);
-    bool locked = err == EBUSY;
-    if (err == 0) {
-        pthread_mutex_unlock(&call->operation_mutex);
-    } else if (err != EBUSY) {
-        napi_throw_error(env, NULL, "failed to inspect native call operation lock");
+    pthread_mutex_lock(&call->mutex);
+    bool armed = call->call != NULL && !call->completing && debug_outbound_gate_arm_locked(&call->debug_outbound_gate);
+    pthread_mutex_unlock(&call->mutex);
+    if (!armed) {
+        napi_throw_error(env, NULL, "failed to arm native call outbound gate");
         return NULL;
     }
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static napi_value native_call_debug_outbound_gate_reached(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    native_call* call = NULL;
+    if (!unwrap_native_call(env, this_arg, &call)) {
+        return NULL;
+    }
+    pthread_mutex_lock(&call->mutex);
+    bool reached = debug_outbound_gate_reached_locked(&call->debug_outbound_gate);
+    pthread_mutex_unlock(&call->mutex);
     napi_value result = NULL;
-    napi_get_boolean(env, locked, &result);
+    napi_get_boolean(env, reached, &result);
     return result;
+}
+
+static napi_value native_call_debug_release_outbound_gate(napi_env env, napi_callback_info info) {
+    napi_value this_arg = NULL;
+    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
+    native_call* call = NULL;
+    if (!unwrap_native_call(env, this_arg, &call)) {
+        return NULL;
+    }
+    pthread_mutex_lock(&call->mutex);
+    debug_outbound_gate_release_locked(&call->debug_outbound_gate);
+    pthread_mutex_unlock(&call->mutex);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
 }
 
 static void debug_pending_resource_destroy(debug_pending_resource* resource) {
@@ -6247,7 +6454,23 @@ static napi_value init(napi_env env, napi_value exports) {
         {"recvBodyBatch", NULL, native_stream_recv_body_batch, NULL, NULL, NULL, napi_default, NULL},
         {"close", NULL, native_stream_close, NULL, NULL, NULL, napi_default, NULL},
 #ifdef TREVRPC_NODE_TEST_HOOKS
-        {"_debugOperationLocked", NULL, native_stream_debug_operation_locked, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugArmOutboundGate", NULL, native_stream_debug_arm_outbound_gate, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugOutboundGateReached",
+            NULL,
+            native_stream_debug_outbound_gate_reached,
+            NULL,
+            NULL,
+            NULL,
+            napi_default,
+            NULL},
+        {"_debugReleaseOutboundGate",
+            NULL,
+            native_stream_debug_release_outbound_gate,
+            NULL,
+            NULL,
+            NULL,
+            napi_default,
+            NULL},
 #endif
     };
     napi_value stream_ctor = NULL;
@@ -6286,7 +6509,23 @@ static napi_value init(napi_env env, napi_value exports) {
         {"recvMany", NULL, native_call_recv_many, NULL, NULL, NULL, napi_default, NULL},
         {"close", NULL, native_call_close, NULL, NULL, NULL, napi_default, NULL},
 #ifdef TREVRPC_NODE_TEST_HOOKS
-        {"_debugOperationLocked", NULL, native_call_debug_operation_locked, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugArmOutboundGate", NULL, native_call_debug_arm_outbound_gate, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugOutboundGateReached",
+            NULL,
+            native_call_debug_outbound_gate_reached,
+            NULL,
+            NULL,
+            NULL,
+            napi_default,
+            NULL},
+        {"_debugReleaseOutboundGate",
+            NULL,
+            native_call_debug_release_outbound_gate,
+            NULL,
+            NULL,
+            NULL,
+            napi_default,
+            NULL},
 #endif
     };
     napi_value call_ctor = NULL;
