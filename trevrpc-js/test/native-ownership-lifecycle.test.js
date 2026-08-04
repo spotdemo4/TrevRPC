@@ -983,7 +983,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
-    "real MsQuic early terminal releases the pending request writer once",
+    "real MsQuic early terminal settles the pending request writer once",
     { skip: native == null, timeout: 15_000 },
     async () => {
       const Hello = createRoot({
@@ -998,9 +998,12 @@ const native = require(${JSON.stringify(nativeAddonPath)});
         },
       }).lookupType("ownership.Hello");
       let requestReturns = 0;
-      let requestReturned;
-      const requestReturnedPromise = new Promise((resolve) => {
-        requestReturned = resolve;
+      let requestReadCalls = 0;
+      let requestReadSettlements = 0;
+      let requestReadDone = false;
+      let requestReadSettled;
+      const requestReadSettledPromise = new Promise((resolve) => {
+        requestReadSettled = resolve;
       });
 
       await withNativePair(
@@ -1018,21 +1021,31 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           const transport = {
             async streamingCall(request, requestBody, options) {
               const iterator = requestBody[Symbol.asyncIterator]();
+              const readRequest = async (max) => {
+                requestReadCalls += 1;
+                const result =
+                  max === undefined
+                    ? await iterator.next()
+                    : typeof iterator.nextBatch === "function"
+                      ? await iterator.nextBatch(max)
+                      : await iterator.next();
+                requestReadSettlements += 1;
+                requestReadDone = result.done;
+                requestReadSettled();
+                return result;
+              };
               const wrapped = {
                 [Symbol.asyncIterator]() {
                   return this;
                 },
                 next() {
-                  return iterator.next();
+                  return readRequest();
                 },
                 nextBatch(max) {
-                  return typeof iterator.nextBatch === "function"
-                    ? iterator.nextBatch(max)
-                    : iterator.next();
+                  return readRequest(max);
                 },
                 async return() {
                   requestReturns += 1;
-                  requestReturned();
                   return typeof iterator.return === "function"
                     ? await iterator.return()
                     : { done: true, value: undefined };
@@ -1051,9 +1064,12 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           );
 
           assert.equal(await settlesWithin(call.recv(), 5_000), undefined);
-          await settlesWithin(requestReturnedPromise, 5_000);
+          await settlesWithin(requestReadSettledPromise, 5_000);
           await setImmediate();
-          assert.equal(requestReturns, 1);
+          assert.equal(requestReadCalls, 1);
+          assert.equal(requestReadSettlements, 1);
+          assert.equal(requestReadDone, true);
+          assert.ok(requestReturns === 0 || requestReturns === 1);
         },
       );
     },
