@@ -3,6 +3,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::pki_types::pem::PemObject;
@@ -31,18 +32,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = greeter::GreeterClient::new(channel.clone());
 
     let reply = client
-        .say_hello(greeter::HelloRequest { name: name.clone() }, call_options())
+        .say_hello_with_options(greeter::HelloRequest { name: name.clone() }, call_options())
         .await?;
     println!("unary: {}", reply.message);
 
     let mut replies = client
-        .lots_of_replies(greeter::HelloRequest { name: name.clone() }, call_options())
+        .lots_of_replies_with_options(greeter::HelloRequest { name: name.clone() }, call_options())
         .await?;
     while let Some(reply) = replies.next().await {
         println!("server-streaming: {}", reply?.message);
     }
 
-    let mut greetings = client.lots_of_greetings(call_options()).await?;
+    let greetings = client
+        .lots_of_greetings_with_options(call_options())
+        .await?;
     for suffix in ["client stream 1", "client stream 2"] {
         greetings
             .send(greeter::HelloRequest {
@@ -53,23 +56,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let summary = greetings.close_and_recv().await?;
     println!("client-streaming: {}", summary.message);
 
-    let mut replies = client.bidi_hello(call_options()).await?;
-    for suffix in ["bidi 1", "bidi 2"] {
-        replies
-            .send(greeter::HelloRequest {
-                name: format!("{name} {suffix}"),
-            })
-            .await?;
+    let call = client.bidi_hello_with_options(call_options()).await?;
+    let (sender, mut replies) = call.split();
+    let send_name = name.clone();
+    let send_task = tokio::spawn(async move {
+        for suffix in ["bidi 1", "bidi 2"] {
+            sender
+                .send(greeter::HelloRequest {
+                    name: format!("{send_name} {suffix}"),
+                })
+                .await?;
+        }
+        sender.finish()
+    });
+    let receive_task = tokio::spawn(async move {
+        while let Some(reply) = replies.next().await {
+            println!("bidi: {}", reply?.message);
+        }
+        Ok::<_, trevrpc::Error>(replies.terminal_metadata().cloned().unwrap_or_default())
+    });
 
-        let reply = replies.recv().await?.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "bidi stream ended early")
-        })?;
-        println!("bidi: {}", reply.message);
-    }
-    replies.close_send()?;
-    while let Some(reply) = replies.recv().await? {
-        println!("bidi: {}", reply.message);
-    }
+    send_task.await??;
+    let terminal_metadata = receive_task.await??;
+    println!(
+        "bidi terminal metadata entries: {}",
+        terminal_metadata.len()
+    );
 
     channel.close();
     endpoint.wait_idle().await;

@@ -11,13 +11,16 @@ use std::io::{self, Read, Write};
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use prost::Message;
 use prost_types::compiler::{CodeGeneratorRequest, CodeGeneratorResponse, code_generator_response};
-use prost_types::{DescriptorProto, FileDescriptorProto, MethodDescriptorProto};
+use prost_types::{
+    DescriptorProto, EnumDescriptorProto, FileDescriptorProto, MethodDescriptorProto,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PluginOptions {
     runtime_path: String,
     file_suffix: String,
     package_root: String,
+    extern_paths: Vec<(String, String)>,
 }
 
 impl Default for PluginOptions {
@@ -26,6 +29,7 @@ impl Default for PluginOptions {
             runtime_path: "::trevrpc".to_owned(),
             file_suffix: ".trevrpc.rs".to_owned(),
             package_root: "crate".to_owned(),
+            extern_paths: Vec::new(),
         }
     }
 }
@@ -76,7 +80,10 @@ fn generate_plugin_response(request: &CodeGeneratorRequest) -> CodeGeneratorResp
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let type_index = TypeIndex::from_files(&request.proto_file);
+    let type_index = match TypeIndex::from_files(&request.proto_file) {
+        Ok(type_index) => type_index,
+        Err(error) => return generator_error(error),
+    };
     let mut services_by_package = BTreeMap::<String, Vec<Service>>::new();
 
     for file in &request.proto_file {
@@ -89,16 +96,43 @@ fn generate_plugin_response(request: &CodeGeneratorRequest) -> CodeGeneratorResp
         }
 
         let package = file.package.clone().unwrap_or_default();
-        let services = file
-            .service
-            .iter()
-            .map(|service| descriptor_service(&package, service, &type_index, &options))
-            .collect::<Vec<_>>();
+        let mut services = Vec::with_capacity(file.service.len());
+        for service in &file.service {
+            match descriptor_service(file_name, &package, service, &type_index, &options) {
+                Ok(service) => services.push(service),
+                Err(error) => {
+                    return CodeGeneratorResponse {
+                        error: Some(error),
+                        supported_features: Some(
+                            code_generator_response::Feature::Proto3Optional as u64,
+                        ),
+                        file: Vec::new(),
+                    };
+                }
+            }
+        }
 
         services_by_package
             .entry(package)
             .or_default()
             .extend(services);
+    }
+
+    if let Err(error) = validate_generated_names(&services_by_package, &type_index) {
+        return generator_error(error);
+    }
+
+    let mut output_names = HashMap::<String, String>::new();
+    for (package, services) in &services_by_package {
+        if services.is_empty() {
+            continue;
+        }
+        let output_name = package_file_name(package, &options.file_suffix);
+        if let Some(owner) = output_names.insert(output_name.clone(), package.clone()) {
+            return generator_error(format!(
+                "protobuf packages {owner:?} and {package:?} both require generated output {output_name:?}"
+            ));
+        }
     }
 
     let file = services_by_package
@@ -130,6 +164,14 @@ fn generate_plugin_response(request: &CodeGeneratorRequest) -> CodeGeneratorResp
     }
 }
 
+fn generator_error(error: String) -> CodeGeneratorResponse {
+    CodeGeneratorResponse {
+        error: Some(error),
+        supported_features: Some(code_generator_response::Feature::Proto3Optional as u64),
+        file: Vec::new(),
+    }
+}
+
 fn parse_plugin_options(parameter: Option<&str>) -> Result<PluginOptions, String> {
     let mut options = PluginOptions::default();
     let Some(parameter) = parameter else {
@@ -147,6 +189,28 @@ fn parse_plugin_options(parameter: Option<&str>) -> Result<PluginOptions, String
             "runtime_path" => value.clone_into(&mut options.runtime_path),
             "file_suffix" => value.clone_into(&mut options.file_suffix),
             "package_root" => value.clone_into(&mut options.package_root),
+            "extern_path" => {
+                let Some((proto_path, rust_path)) = value.split_once('=') else {
+                    return Err(format!(
+                        "invalid extern_path {value:?}; expected .protobuf.package=::rust::path"
+                    ));
+                };
+                if !proto_path.starts_with('.') || proto_path == "." || rust_path.is_empty() {
+                    return Err(format!(
+                        "invalid extern_path {value:?}; expected .protobuf.package=::rust::path"
+                    ));
+                }
+                if options
+                    .extern_paths
+                    .iter()
+                    .any(|(existing, _)| existing == proto_path)
+                {
+                    return Err(format!("duplicate extern protobuf path {proto_path:?}"));
+                }
+                options
+                    .extern_paths
+                    .push((proto_path.to_owned(), rust_path.to_owned()));
+            }
             unknown => return Err(format!("unknown trevrpc option {unknown:?}")),
         }
     }
@@ -181,21 +245,47 @@ struct TypeRef {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct TypeIndex {
     messages: HashMap<String, TypeRef>,
+    package_declarations: HashMap<String, HashMap<String, String>>,
+    rust_declaration_paths: HashMap<String, String>,
+    rust_package_paths: HashMap<String, String>,
 }
 
 impl TypeIndex {
-    fn from_files(files: &[FileDescriptorProto]) -> Self {
+    fn from_files(files: &[FileDescriptorProto]) -> Result<Self, String> {
         let mut index = Self::default();
 
         for file in files {
             let package = file.package.as_deref().unwrap_or_default();
+            index.index_package_path(package)?;
 
             for message in &file.message_type {
-                index.index_message(package, Vec::new(), Vec::new(), message);
+                index.index_message(package, Vec::new(), Vec::new(), message)?;
+            }
+            for proto_enum in &file.enum_type {
+                index.index_top_level_enum(package, proto_enum)?;
             }
         }
 
-        index
+        Ok(index)
+    }
+
+    fn index_package_path(&mut self, package: &str) -> Result<(), String> {
+        let rust_path = package
+            .split('.')
+            .filter(|module| !module.is_empty())
+            .map(to_rust_module_name)
+            .collect::<Vec<_>>()
+            .join("::");
+        if let Some(existing) = self
+            .rust_package_paths
+            .insert(rust_path.clone(), package.to_owned())
+            && existing != package
+        {
+            return Err(format!(
+                "protobuf packages {existing:?} and {package:?} both map to Rust module path {rust_path:?}"
+            ));
+        }
+        Ok(())
     }
 
     fn index_message(
@@ -204,28 +294,40 @@ impl TypeIndex {
         mut proto_parents: Vec<String>,
         mut rust_parent_modules: Vec<String>,
         message: &DescriptorProto,
-    ) {
+    ) -> Result<(), String> {
         let Some(name) = message.name.as_deref() else {
-            return;
+            return Ok(());
         };
+        if message
+            .options
+            .as_ref()
+            .and_then(|options| options.map_entry)
+            .unwrap_or_default()
+        {
+            return Ok(());
+        }
         let full_name = full_message_name(package, &proto_parents, name);
         let rust_type_name = to_rust_type_name(name);
         let rust_path = if rust_parent_modules.is_empty() {
+            self.index_package_declaration(package, &rust_type_name, &full_name)?;
             rust_type_name
         } else {
             format!("{}::{rust_type_name}", rust_parent_modules.join("::"))
         };
+        let type_ref = TypeRef {
+            package: package.to_owned(),
+            rust_path,
+        };
 
-        self.messages.insert(
-            full_name,
-            TypeRef {
-                package: package.to_owned(),
-                rust_path,
-            },
-        );
+        if let Some(existing) = self.messages.insert(full_name.clone(), type_ref.clone()) {
+            return Err(format!(
+                "protobuf message type {full_name:?} was described more than once ({existing:?} and {type_ref:?})"
+            ));
+        }
+        self.index_rust_declaration_path(package, &type_ref.rust_path, &full_name)?;
 
         proto_parents.push(name.to_owned());
-        rust_parent_modules.push(to_rust_ident(&name.to_snake_case()));
+        rust_parent_modules.push(to_rust_module_name(name));
 
         for nested in &message.nested_type {
             self.index_message(
@@ -233,77 +335,363 @@ impl TypeIndex {
                 proto_parents.clone(),
                 rust_parent_modules.clone(),
                 nested,
-            );
+            )?;
         }
+        for proto_enum in &message.enum_type {
+            self.index_nested_enum(package, &proto_parents, &rust_parent_modules, proto_enum)?;
+        }
+        Ok(())
     }
 
-    fn resolve(&self, current_package: &str, proto_type: &str, package_root: &str) -> String {
-        let proto_type = if proto_type.starts_with('.') {
-            proto_type.to_owned()
-        } else if current_package.is_empty() {
-            format!(".{proto_type}")
-        } else {
-            format!(".{current_package}.{proto_type}")
+    fn index_top_level_enum(
+        &mut self,
+        package: &str,
+        proto_enum: &EnumDescriptorProto,
+    ) -> Result<(), String> {
+        let Some(name) = proto_enum.name.as_deref() else {
+            return Ok(());
         };
+        let full_name = full_message_name(package, &[], name);
+        let rust_name = to_rust_type_name(name);
+        self.index_package_declaration(package, &rust_name, &full_name)?;
+        self.index_rust_declaration_path(package, &rust_name, &full_name)
+    }
 
-        let Some(type_ref) = self.messages.get(&proto_type) else {
-            return proto_type
-                .rsplit('.')
-                .next()
-                .map_or_else(|| "()".to_owned(), to_rust_type_name);
+    fn index_nested_enum(
+        &mut self,
+        package: &str,
+        proto_parents: &[String],
+        rust_parent_modules: &[String],
+        proto_enum: &EnumDescriptorProto,
+    ) -> Result<(), String> {
+        let Some(name) = proto_enum.name.as_deref() else {
+            return Ok(());
         };
+        let full_name = full_message_name(package, proto_parents, name);
+        let rust_path = format!(
+            "{}::{}",
+            rust_parent_modules.join("::"),
+            to_rust_type_name(name)
+        );
+        self.index_rust_declaration_path(package, &rust_path, &full_name)
+    }
 
-        if type_ref.package == current_package {
-            return type_ref.rust_path.clone();
+    fn index_rust_declaration_path(
+        &mut self,
+        package: &str,
+        rust_path: &str,
+        proto_name: &str,
+    ) -> Result<(), String> {
+        let key = format!("{package}::{rust_path}");
+        if let Some(existing) = self
+            .rust_declaration_paths
+            .insert(key, proto_name.to_owned())
+        {
+            return Err(format!(
+                "protobuf declarations {existing:?} and {proto_name:?} both map to Rust path {rust_path:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn index_package_declaration(
+        &mut self,
+        package: &str,
+        rust_name: &str,
+        proto_name: &str,
+    ) -> Result<(), String> {
+        let declarations = self
+            .package_declarations
+            .entry(package.to_owned())
+            .or_default();
+        if let Some(existing) = declarations.insert(rust_name.to_owned(), proto_name.to_owned()) {
+            return Err(format!(
+                "protobuf declarations {existing:?} and {proto_name:?} both map to Rust type {rust_name:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        current_package: &str,
+        proto_type: &str,
+        options: &PluginOptions,
+    ) -> Result<String, String> {
+        let proto_type = self.resolve_proto_type(current_package, proto_type)?;
+        let type_ref = self
+            .messages
+            .get(&proto_type)
+            .expect("resolved protobuf type must be indexed");
+
+        if let Some(rust_path) = resolve_extern_path(&proto_type, &options.extern_paths)
+            .or_else(|| resolve_default_well_known_type(&proto_type))
+        {
+            return Ok(rust_path);
         }
 
-        let package_modules = type_ref.package.split('.').map(to_rust_module_name);
+        if type_ref.package == current_package {
+            return Ok(type_ref.rust_path.clone());
+        }
+
         let mut path = Vec::new();
-        path.push(package_root.trim_end_matches("::").to_owned());
-        path.extend(package_modules);
+        let package_root = options.package_root.trim_end_matches("::");
+        if !package_root.is_empty() {
+            path.push(package_root.to_owned());
+        }
+        path.extend(
+            type_ref
+                .package
+                .split('.')
+                .filter(|module| !module.is_empty())
+                .map(to_rust_module_name),
+        );
         path.push(type_ref.rust_path.clone());
-        path.join("::")
+        Ok(path.join("::"))
+    }
+
+    fn resolve_proto_type(
+        &self,
+        current_package: &str,
+        proto_type: &str,
+    ) -> Result<String, String> {
+        if proto_type.starts_with('.') {
+            return self
+                .messages
+                .contains_key(proto_type)
+                .then(|| proto_type.to_owned())
+                .ok_or_else(|| format!("unresolved protobuf message type {proto_type:?}"));
+        }
+
+        let mut scope = current_package;
+        loop {
+            let candidate = if scope.is_empty() {
+                format!(".{proto_type}")
+            } else {
+                format!(".{scope}.{proto_type}")
+            };
+            if self.messages.contains_key(&candidate) {
+                return Ok(candidate);
+            }
+
+            let Some((parent, _)) = scope.rsplit_once('.') else {
+                if scope.is_empty() {
+                    break;
+                }
+                scope = "";
+                continue;
+            };
+            scope = parent;
+        }
+
+        Err(format!("unresolved protobuf message type {proto_type:?}"))
     }
 }
 
+fn resolve_extern_path(proto_type: &str, extern_paths: &[(String, String)]) -> Option<String> {
+    let (proto_path, rust_path) = extern_paths
+        .iter()
+        .filter(|(proto_path, _)| {
+            proto_type == proto_path
+                || proto_type
+                    .strip_prefix(proto_path)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        .max_by_key(|(proto_path, _)| proto_path.len())?;
+    if proto_type == proto_path {
+        return Some(rust_path.clone());
+    }
+
+    let suffix = proto_type
+        .strip_prefix(proto_path)
+        .expect("matching extern path must be a prefix")
+        .trim_start_matches('.');
+    let mut segments = suffix.split('.').collect::<Vec<_>>();
+    let type_name = to_rust_type_name(
+        segments
+            .pop()
+            .expect("external protobuf type must have a type suffix"),
+    );
+    let mut path = rust_path.trim_end_matches("::").to_owned();
+    for module in segments {
+        if !path.is_empty() {
+            path.push_str("::");
+        }
+        path.push_str(&to_rust_module_name(module));
+    }
+    if !path.is_empty() {
+        path.push_str("::");
+    }
+    path.push_str(&type_name);
+    Some(path)
+}
+
+fn resolve_default_well_known_type(proto_type: &str) -> Option<String> {
+    let rust_type = match proto_type {
+        ".google.protobuf.BoolValue" => "bool",
+        ".google.protobuf.BytesValue" => "::prost::alloc::vec::Vec<u8>",
+        ".google.protobuf.DoubleValue" => "f64",
+        ".google.protobuf.Empty" => "()",
+        ".google.protobuf.FloatValue" => "f32",
+        ".google.protobuf.Int32Value" => "i32",
+        ".google.protobuf.Int64Value" => "i64",
+        ".google.protobuf.StringValue" => "::prost::alloc::string::String",
+        ".google.protobuf.UInt32Value" => "u32",
+        ".google.protobuf.UInt64Value" => "u64",
+        _ => {
+            let name = proto_type.strip_prefix(".google.protobuf.")?;
+            return Some(format!("::prost_types::{}", to_rust_type_name(name)));
+        }
+    };
+    Some(rust_type.to_owned())
+}
+
 fn descriptor_service(
+    file_name: &str,
     package: &str,
     service: &prost_types::ServiceDescriptorProto,
     type_index: &TypeIndex,
     options: &PluginOptions,
-) -> Service {
+) -> Result<Service, String> {
     let proto_name = service.name.clone().unwrap_or_default();
 
-    Service {
+    let methods = service
+        .method
+        .iter()
+        .map(|method| {
+            descriptor_method(file_name, package, &proto_name, method, type_index, options)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Service {
         name: to_rust_type_name(&proto_name),
         proto_name,
         package: package.to_owned(),
-        methods: service
-            .method
-            .iter()
-            .map(|method| descriptor_method(package, method, type_index, options))
-            .collect(),
-    }
+        methods,
+    })
 }
 
 fn descriptor_method(
+    file_name: &str,
     package: &str,
+    service_name: &str,
     method: &MethodDescriptorProto,
     type_index: &TypeIndex,
     options: &PluginOptions,
-) -> Method {
+) -> Result<Method, String> {
     let proto_name = method.name.clone().unwrap_or_default();
     let input_proto_type = method.input_type.clone().unwrap_or_default();
     let output_proto_type = method.output_type.clone().unwrap_or_default();
 
-    Method {
+    let input_type = type_index
+        .resolve(package, &input_proto_type, options)
+        .map_err(|error| {
+            format!(
+                "{file_name}: service {service_name:?}, method {proto_name:?}, input type {input_proto_type:?}: {error}"
+            )
+        })?;
+    let output_type = type_index
+        .resolve(package, &output_proto_type, options)
+        .map_err(|error| {
+            format!(
+                "{file_name}: service {service_name:?}, method {proto_name:?}, output type {output_proto_type:?}: {error}"
+            )
+        })?;
+
+    Ok(Method {
         name: to_rust_method_name(&proto_name),
         proto_name,
-        input_type: type_index.resolve(package, &input_proto_type, &options.package_root),
-        output_type: type_index.resolve(package, &output_proto_type, &options.package_root),
+        input_type,
+        output_type,
         client_streaming: method.client_streaming.unwrap_or_default(),
         server_streaming: method.server_streaming.unwrap_or_default(),
+    })
+}
+
+fn validate_generated_names(
+    services_by_package: &BTreeMap<String, Vec<Service>>,
+    type_index: &TypeIndex,
+) -> Result<(), String> {
+    for (package, services) in services_by_package {
+        let mut type_owners = type_index
+            .package_declarations
+            .get(package)
+            .cloned()
+            .unwrap_or_default();
+        let mut registration_owners = HashMap::<String, String>::new();
+
+        for service in services {
+            let service_path = service_path(service);
+            for declaration in [service.name.clone(), format!("{}Client", service.name)] {
+                let key = semantic_rust_identifier(&declaration).to_owned();
+                if let Some(owner) = type_owners.insert(key.clone(), service_path.clone()) {
+                    return Err(format!(
+                        "protobuf declarations {owner:?} and {service_path:?} both require generated Rust type {key:?}"
+                    ));
+                }
+            }
+
+            let registration = format!("register_{}", to_snake_case(&service.name));
+            let registration_key = semantic_rust_identifier(&registration).to_owned();
+            if let Some(owner) =
+                registration_owners.insert(registration_key.clone(), service_path.clone())
+            {
+                return Err(format!(
+                    "protobuf services {owner:?} and {service_path:?} both require generated Rust function {registration_key:?}"
+                ));
+            }
+
+            validate_generated_method_names(service)?;
+        }
     }
+    Ok(())
+}
+
+fn validate_generated_method_names(service: &Service) -> Result<(), String> {
+    let mut owners = HashMap::<String, String>::new();
+    for fixed in [
+        "new",
+        "with_default_call_options",
+        "default_call_options",
+        "transport",
+        "into_transport",
+    ] {
+        owners.insert(fixed.to_owned(), "generated client support".to_owned());
+    }
+
+    for method in &service.methods {
+        for generated_name in generated_client_method_names(method) {
+            let key = semantic_rust_identifier(&generated_name).to_owned();
+            if let Some(owner) = owners.insert(key.clone(), method.proto_name.clone()) {
+                return Err(format!(
+                    "service {:?} RPC methods {owner:?} and {:?} both require generated Rust method {key:?}",
+                    service_path(service),
+                    method.proto_name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn generated_client_method_names(method: &Method) -> Vec<String> {
+    let mut names = vec![method.name.clone(), format!("{}_with_options", method.name)];
+    if method.client_streaming {
+        names.push(format!("{}_from_stream", method.name));
+        names.push(format!("{}_from_stream_with_options", method.name));
+        if !method.server_streaming {
+            names.push(format!("{}_from_stream_envelope", method.name));
+            names.push(format!("{}_from_stream_envelope_with_options", method.name));
+        }
+    } else if !method.server_streaming {
+        names.push(format!("{}_envelope", method.name));
+        names.push(format!("{}_envelope_with_options", method.name));
+    }
+    names
+}
+
+fn semantic_rust_identifier(identifier: &str) -> &str {
+    identifier.strip_prefix("r#").unwrap_or(identifier)
 }
 
 fn generate_service(runtime_path: &str, service: &Service, buf: &mut String) {
@@ -325,22 +713,22 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
         ));
         if method.client_streaming && method.server_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{runtime_path}::BoxStream<{}>>, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else if method.client_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else if method.server_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{runtime_path}::BoxStream<{}>>, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else {
             buf.push_str(&format!(
-                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         }
@@ -365,7 +753,24 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
         "#[allow(clippy::missing_errors_doc)]\nimpl<T> {client_name}<T>\nwhere\n    T: {runtime_path}::client::RpcTransport,\n{{\n"
     ));
 
-    for method in &service.methods {
+    for method in service
+        .methods
+        .iter()
+        .filter(|method| !method.client_streaming && !method.server_streaming)
+    {
+        generate_client_method(runtime_path, method, buf);
+    }
+
+    buf.push_str("}\n\n");
+    buf.push_str(&format!(
+        "#[allow(clippy::missing_errors_doc)]\nimpl<T> {client_name}<T>\nwhere\n    T: {runtime_path}::client::StreamingRpcTransport,\n{{\n"
+    ));
+
+    for method in service
+        .methods
+        .iter()
+        .filter(|method| method.client_streaming || method.server_streaming)
+    {
         generate_client_method(runtime_path, method, buf);
     }
 
@@ -376,7 +781,7 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
     buf.push_str(&format!("    /// Calls the `{}` RPC.\n", method.proto_name));
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
-            "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::BidirectionalStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::BidirectionalStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxMessageStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming_from_stream(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::BidirectionalCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::BidirectionalCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming_from_stream(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
             method.name,
             method.input_type,
             method.output_type,
@@ -399,7 +804,7 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
         ));
     } else if method.client_streaming {
         buf.push_str(&format!(
-            "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxMessageStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxMessageStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming_from_stream(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming(&self.transport, Self::SERVICE, {:?}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming_from_stream(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
             method.name,
             method.input_type,
             method.output_type,
@@ -420,9 +825,22 @@ fn generate_client_method(runtime_path: &str, method: &Method, buf: &mut String)
             method.output_type,
             method.proto_name
         ));
+        buf.push_str(&format!(
+            "    /// Calls the `{}` RPC with a caller-provided request stream and preserves response metadata.\n    pub async fn {}_from_stream_envelope(&self, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Error> {{\n        self.{}_from_stream_envelope_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream, explicit options, and response metadata.\n    pub async fn {}_from_stream_envelope_with_options(&self, requests: {runtime_path}::BoxStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming_from_stream_envelope(&self.transport, Self::SERVICE, {:?}, requests, options).await\n    }}\n\n",
+            method.proto_name,
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.name,
+            method.proto_name,
+            method.name,
+            method.input_type,
+            method.output_type,
+            method.proto_name
+        ));
     } else if method.server_streaming {
         buf.push_str(&format!(
-            "    pub async fn {}(&self, request: {}) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        self.{}_with_options(request, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, request: {}, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::BoxMessageStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::server_streaming(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
+            "    pub async fn {}(&self, request: {}) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        self.{}_with_options(request, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, request: {}, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::server_streaming(&self.transport, Self::SERVICE, {:?}, &request, options).await\n    }}\n\n",
             method.name,
             method.input_type,
             method.output_type,
@@ -483,22 +901,22 @@ fn generate_registration_method(
 ) {
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::BidirectionalStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let responses = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_envelope_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::BidirectionalStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let responses = service.{}(context, requests).await?;\n                Ok(responses.map({runtime_path}::stream::encode))\n            }}\n        }});\n    }}\n",
             method.proto_name, method.input_type, method.name
         ));
     } else if method.client_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::ClientStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let response = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode({runtime_path}::stream::from_iter([response])))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_envelope_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::ClientStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let response = service.{}(context, requests).await?;\n                Ok(response.map(|response| {runtime_path}::stream::encode({runtime_path}::stream::from_iter([response]))))\n            }}\n        }});\n    }}\n",
             method.proto_name, method.input_type, method.name
         ));
     } else if method.server_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::ServerStreaming, move |context, body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let responses = service.{}(context, request).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_envelope_with_context({service_name:?}, {:?}, {runtime_path}::RpcKind::ServerStreaming, move |context, body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let responses = service.{}(context, request).await?;\n                Ok(responses.map({runtime_path}::stream::encode))\n            }}\n        }});\n    }}\n",
             method.proto_name, method.input_type, method.name
         ));
     } else {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_with_context({service_name:?}, {:?}, move |context, body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(context, request).await?;\n                Ok(::prost::Message::encode_to_vec(&response))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_envelope_with_context({service_name:?}, {:?}, move |context, body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(context, request).await?;\n                Ok(response.map(|response| ::prost::Message::encode_to_vec(&response)))\n            }}\n        }});\n    }}\n",
             method.proto_name, method.input_type, method.name
         ));
     }
@@ -546,23 +964,25 @@ fn to_rust_module_name(input: &str) -> String {
 }
 
 fn to_rust_ident(input: &str) -> String {
-    let ident = input.trim_matches('_');
-    let ident = if ident.is_empty() { "_" } else { ident };
-
-    if RUST_KEYWORDS.contains(&ident) {
-        format!("r#{ident}")
+    if RUST_RAW_KEYWORDS.contains(&input) {
+        format!("r#{input}")
+    } else if RUST_SUFFIXED_KEYWORDS.contains(&input) {
+        format!("{input}_")
+    } else if input.starts_with(char::is_numeric) {
+        format!("_{input}")
     } else {
-        ident.to_owned()
+        input.to_owned()
     }
 }
 
-const RUST_KEYWORDS: &[&str] = &[
-    "Self", "abstract", "as", "async", "await", "become", "box", "break", "const", "continue",
-    "crate", "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "if", "impl",
-    "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
-    "return", "self", "static", "struct", "super", "trait", "true", "try", "type", "typeof",
-    "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
+const RUST_RAW_KEYWORDS: &[&str] = &[
+    "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "do", "dyn",
+    "else", "enum", "false", "final", "fn", "for", "gen", "if", "impl", "in", "let", "loop",
+    "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref", "return", "static",
+    "struct", "trait", "true", "try", "type", "typeof", "unsafe", "unsized", "use", "virtual",
+    "where", "while", "yield",
 ];
+const RUST_SUFFIXED_KEYWORDS: &[&str] = &["_", "Self", "crate", "extern", "self", "super"];
 
 fn to_snake_case(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
@@ -585,7 +1005,9 @@ fn to_snake_case(input: &str) -> String {
 mod tests {
     use prost::Message;
     use prost_types::compiler::CodeGeneratorRequest;
-    use prost_types::{DescriptorProto, FileDescriptorProto, MethodDescriptorProto};
+    use prost_types::{
+        DescriptorProto, FileDescriptorProto, MessageOptions, MethodDescriptorProto,
+    };
 
     use super::{
         Service, generate_plugin_response, generate_service, package_file_name, service_path,
@@ -689,8 +1111,8 @@ mod tests {
 
         generate_service("::trevrpc", &service, &mut generated);
 
-        assert!(generated.contains("BoxMessageStream<HelloRequest>"));
-        assert!(generated.contains("BoxMessageStream<HelloReply>"));
+        assert!(generated.contains("BoxStream<HelloRequest>"));
+        assert!(generated.contains("BoxStream<HelloReply>"));
         assert!(generated.contains("::trevrpc::client::server_streaming"));
         assert!(generated.contains("::trevrpc::client::client_streaming"));
         assert!(
@@ -698,9 +1120,7 @@ mod tests {
         );
         assert!(generated.contains("::trevrpc::client::bidirectional_streaming"));
         assert!(
-            generated.contains(
-                "::trevrpc::client::BidirectionalStreamingCall<HelloRequest, HelloReply>"
-            )
+            generated.contains("::trevrpc::client::BidirectionalCall<HelloRequest, HelloReply>")
         );
         assert!(generated.contains("server.route_streaming"));
         assert!(generated.contains("::trevrpc::RpcKind::ServerStreaming"));
@@ -757,11 +1177,185 @@ mod tests {
     }
 
     #[test]
+    fn plugin_uses_prost_default_well_known_type_paths() {
+        let mut request = hello_request(None);
+        request.proto_file.push(FileDescriptorProto {
+            name: Some("google/protobuf/empty.proto".to_owned()),
+            package: Some("google.protobuf".to_owned()),
+            message_type: vec![message("Empty")],
+            ..Default::default()
+        });
+        request.proto_file[0].service[0].method[0].input_type =
+            Some(".google.protobuf.Empty".to_owned());
+        request.proto_file[0].service[0].method[0].output_type =
+            Some(".google.protobuf.Empty".to_owned());
+
+        let response = generate_plugin_response(&request);
+
+        assert_eq!(response.error, None);
+        let content = response.file[0]
+            .content
+            .as_deref()
+            .expect("plugin should generate service content");
+        assert!(content.contains("request: ()"));
+        assert!(content.contains("ResponseEnvelope<()>"));
+        assert!(!content.contains("crate::google::protobuf::Empty"));
+    }
+
+    #[test]
+    fn plugin_resolves_custom_extern_paths() {
+        let mut request = hello_request(Some("extern_path=.shared=::external::pb".to_owned()));
+        request.proto_file.push(FileDescriptorProto {
+            name: Some("proto/shared.proto".to_owned()),
+            package: Some("shared".to_owned()),
+            message_type: vec![message("ExternalRequest")],
+            ..Default::default()
+        });
+        request.proto_file[0].service[0].method[0].input_type =
+            Some(".shared.ExternalRequest".to_owned());
+
+        let response = generate_plugin_response(&request);
+
+        assert_eq!(response.error, None);
+        let content = response.file[0]
+            .content
+            .as_deref()
+            .expect("plugin should generate service content");
+        assert!(content.contains("request: ::external::pb::ExternalRequest"));
+    }
+
+    #[test]
+    fn plugin_resolves_relative_types_through_parent_packages() {
+        let mut request = hello_request(None);
+        request.proto_file.push(FileDescriptorProto {
+            name: Some("proto/parent.proto".to_owned()),
+            package: Some("hello".to_owned()),
+            message_type: vec![message("ParentRequest")],
+            ..Default::default()
+        });
+        request.proto_file[0].service[0].method[0].input_type = Some("ParentRequest".to_owned());
+
+        let response = generate_plugin_response(&request);
+
+        assert_eq!(response.error, None);
+        let content = response.file[0]
+            .content
+            .as_deref()
+            .expect("plugin should generate service content");
+        assert!(content.contains("request: crate::hello::ParentRequest"));
+    }
+
+    #[test]
     fn plugin_reports_bad_options_in_response() {
         let request = hello_request(Some("bad".to_owned()));
         let response = generate_plugin_response(&request);
 
         assert!(response.error.is_some());
+        assert!(response.file.is_empty());
+    }
+
+    #[test]
+    fn plugin_rejects_packages_with_the_same_rust_module_path() {
+        let mut request = hello_request(None);
+        request.proto_file.push(FileDescriptorProto {
+            name: Some("proto/collision.proto".to_owned()),
+            package: Some("hello_v1".to_owned()),
+            message_type: vec![message("Other")],
+            ..Default::default()
+        });
+        request.proto_file[0].package = Some("helloV1".to_owned());
+        request.proto_file[0].service[0].method[0].input_type =
+            Some(".helloV1.HelloRequest".to_owned());
+        request.proto_file[0].service[0].method[0].output_type =
+            Some(".helloV1.HelloReply".to_owned());
+
+        let response = generate_plugin_response(&request);
+
+        let error = response
+            .error
+            .expect("colliding Rust package modules should fail generation");
+        assert!(error.contains("protobuf packages \"helloV1\" and \"hello_v1\""));
+        assert!(error.contains("Rust module path \"hello_v1\""));
+        assert!(response.file.is_empty());
+    }
+
+    #[test]
+    fn plugin_rejects_unresolved_input_descriptor() {
+        let mut request = hello_request(None);
+        request.proto_file[0].service[0].method[0].input_type =
+            Some(".hello.v1.MissingRequest".to_owned());
+
+        let response = generate_plugin_response(&request);
+
+        let error = response
+            .error
+            .expect("unresolved input should fail generation");
+        assert!(error.contains("input type \".hello.v1.MissingRequest\""));
+        assert!(error.contains("unresolved protobuf message type"));
+        assert!(response.file.is_empty());
+    }
+
+    #[test]
+    fn plugin_rejects_unresolved_output_descriptor() {
+        let mut request = hello_request(None);
+        request.proto_file[0].service[0].method[0].output_type =
+            Some(".hello.v1.MissingReply".to_owned());
+
+        let response = generate_plugin_response(&request);
+
+        let error = response
+            .error
+            .expect("unresolved output should fail generation");
+        assert!(error.contains("output type \".hello.v1.MissingReply\""));
+        assert!(error.contains("unresolved protobuf message type"));
+        assert!(response.file.is_empty());
+    }
+
+    #[test]
+    fn plugin_rejects_nested_messages_with_the_same_rust_path() {
+        let mut request = hello_request(None);
+        request.proto_file[0].message_type = vec![DescriptorProto {
+            name: Some("Outer".to_owned()),
+            nested_type: vec![message("FooBar"), message("Foo_Bar")],
+            ..Default::default()
+        }];
+
+        let response = generate_plugin_response(&request);
+
+        let error = response
+            .error
+            .expect("nested Rust path collision should fail generation");
+        assert!(error.contains(".hello.v1.Outer.FooBar"));
+        assert!(error.contains(".hello.v1.Outer.Foo_Bar"));
+        assert!(error.contains("both map to Rust path \"outer::FooBar\""));
+        assert!(response.file.is_empty());
+    }
+
+    #[test]
+    fn plugin_rejects_synthetic_map_entry_rpc_types() {
+        let mut request = hello_request(None);
+        request.proto_file[0].message_type.push(DescriptorProto {
+            name: Some("Container".to_owned()),
+            nested_type: vec![DescriptorProto {
+                name: Some("LabelsEntry".to_owned()),
+                options: Some(MessageOptions {
+                    map_entry: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        request.proto_file[0].service[0].method[0].input_type =
+            Some(".hello.v1.Container.LabelsEntry".to_owned());
+
+        let response = generate_plugin_response(&request);
+
+        let error = response
+            .error
+            .expect("synthetic map-entry RPC type should fail generation");
+        assert!(error.contains("input type \".hello.v1.Container.LabelsEntry\""));
+        assert!(error.contains("unresolved protobuf message type"));
         assert!(response.file.is_empty());
     }
 

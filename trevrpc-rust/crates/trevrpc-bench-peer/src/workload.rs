@@ -4,9 +4,9 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use trevrpc::MessageStream;
+use futures_util::StreamExt;
 use trevrpc::advanced::RawQuinnTransport;
-use trevrpc::client::{CallOptions, RpcTransport};
+use trevrpc::client::{CallOptions, StreamingRpcTransport};
 use trevrpc::server::RequestContext;
 
 use crate::config::{
@@ -46,7 +46,7 @@ pub(crate) struct Workload<T = RawQuinnTransport> {
 
 impl<T> Workload<T>
 where
-    T: RpcTransport,
+    T: StreamingRpcTransport,
 {
     pub(crate) fn new(transport: T, config: WorkloadConfig) -> Self {
         Self {
@@ -185,7 +185,7 @@ where
 
 impl<T> BenchmarkWorkload for Workload<T>
 where
-    T: RpcTransport,
+    T: StreamingRpcTransport + Clone,
 {
     fn execute(&self) -> impl Future<Output = Result<MessageCounts, BoxError>> + Send {
         Self::execute(self)
@@ -231,15 +231,15 @@ impl BenchmarkService for BenchmarkServiceImpl {
         &self,
         _context: RequestContext,
         request: BenchmarkRequest,
-    ) -> Result<BenchmarkResponse, trevrpc::Status> {
-        response_for(&request)
+    ) -> Result<trevrpc::ResponseEnvelope<BenchmarkResponse>, trevrpc::Status> {
+        response_for(&request).map(trevrpc::ResponseEnvelope::new)
     }
 
     async fn client_stream(
         &self,
         _context: RequestContext,
-        mut requests: trevrpc::BoxMessageStream<BenchmarkRequest>,
-    ) -> Result<BenchmarkSummary, trevrpc::Status> {
+        mut requests: trevrpc::BoxStream<BenchmarkRequest>,
+    ) -> Result<trevrpc::ResponseEnvelope<BenchmarkSummary>, trevrpc::Status> {
         let mut message_count = 0_u64;
         let mut payload_bytes = 0_u64;
         while let Some(request) = requests.next().await {
@@ -261,17 +261,18 @@ impl BenchmarkService for BenchmarkServiceImpl {
                     trevrpc::Status::resource_exhausted("payload byte count overflowed")
                 })?;
         }
-        Ok(BenchmarkSummary {
+        Ok(trevrpc::ResponseEnvelope::new(BenchmarkSummary {
             message_count,
             payload_bytes,
-        })
+        }))
     }
 
     async fn server_stream(
         &self,
         _context: RequestContext,
         request: StreamRequest,
-    ) -> Result<trevrpc::BoxMessageStream<BenchmarkResponse>, trevrpc::Status> {
+    ) -> Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<BenchmarkResponse>>, trevrpc::Status>
+    {
         checked_request_payload(&request.payload)?;
         let response_bytes = checked_response_bytes(request.response_bytes)?;
         if request.message_count == 0 || request.message_count > MAX_MESSAGES_PER_STREAM {
@@ -279,45 +280,44 @@ impl BenchmarkService for BenchmarkServiceImpl {
                 "message_count is outside the benchmark peer limit",
             ));
         }
-        Ok(trevrpc::stream::from_iter((0..request.message_count).map(
-            move |sequence| BenchmarkResponse {
+        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter(
+            (0..request.message_count).map(move |sequence| BenchmarkResponse {
                 sequence: u64::from(sequence),
                 payload: vec![0; response_bytes],
-            },
+            }),
         )))
     }
 
     async fn bidi(
         &self,
         _context: RequestContext,
-        requests: trevrpc::BoxMessageStream<BenchmarkRequest>,
-    ) -> Result<trevrpc::BoxMessageStream<BenchmarkResponse>, trevrpc::Status> {
-        Ok(Box::new(BidiResponses {
-            requests,
-            received: 0,
-        }))
-    }
-}
-
-struct BidiResponses {
-    requests: trevrpc::BoxMessageStream<BenchmarkRequest>,
-    received: u32,
-}
-
-#[trevrpc::async_trait]
-impl MessageStream<BenchmarkResponse> for BidiResponses {
-    async fn next(&mut self) -> Option<trevrpc::Result<BenchmarkResponse>> {
-        let request = self.requests.next().await?;
-        self.received = match self.received.checked_add(1) {
-            Some(received) if received <= MAX_MESSAGES_PER_STREAM => received,
-            _ => {
-                return Some(Err(trevrpc::Status::resource_exhausted(
-                    "message count exceeded the benchmark peer limit",
-                )
-                .into()));
-            }
-        };
-        Some(request.and_then(|request| response_for(&request).map_err(Into::into)))
+        requests: trevrpc::BoxStream<BenchmarkRequest>,
+    ) -> Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<BenchmarkResponse>>, trevrpc::Status>
+    {
+        let responses: trevrpc::BoxStream<BenchmarkResponse> =
+            Box::pin(futures_util::stream::unfold(
+                (requests, 0_u32),
+                |(mut requests, received)| async move {
+                    let request = requests.next().await?;
+                    let Some(received) = received
+                        .checked_add(1)
+                        .filter(|received| *received <= MAX_MESSAGES_PER_STREAM)
+                    else {
+                        return Some((
+                            Err(trevrpc::Status::resource_exhausted(
+                                "message count exceeded the benchmark peer limit",
+                            )
+                            .into()),
+                            (requests, received),
+                        ));
+                    };
+                    Some((
+                        request.and_then(|request| response_for(&request).map_err(Into::into)),
+                        (requests, received),
+                    ))
+                },
+            ));
+        Ok(trevrpc::ResponseEnvelope::new(responses))
     }
 }
 
@@ -351,6 +351,8 @@ fn checked_response_bytes(response_bytes: u32) -> Result<usize, trevrpc::Status>
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
+
     use super::BenchmarkServiceImpl;
     use crate::config::MAX_APPLICATION_PAYLOAD_BYTES;
     use crate::proto::{BenchmarkRequest, BenchmarkService, StreamRequest};
@@ -387,13 +389,14 @@ mod tests {
         };
         assert_oversized_status(&status);
 
-        let mut responses = BenchmarkServiceImpl
+        let (mut responses, _) = BenchmarkServiceImpl
             .bidi(
                 request_context(),
                 trevrpc::stream::from_iter([oversized_request()]),
             )
             .await
-            .expect("bidi response stream should be created");
+            .expect("bidi response stream should be created")
+            .into_parts();
         let error = responses
             .next()
             .await

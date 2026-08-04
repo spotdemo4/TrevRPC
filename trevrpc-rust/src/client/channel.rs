@@ -8,8 +8,8 @@ use tokio::sync::{broadcast, watch};
 use crate::advanced::RawQuinnTransport;
 #[cfg(feature = "webtransport")]
 use crate::advanced::RawWebTransport;
-use crate::client::RpcTransport;
-use crate::{BoxMessageStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+use crate::client::{RpcTransport, StreamingRpcTransport};
+use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
 const EVENT_CAPACITY: usize = 32;
 const CLOSE_REASON: &[u8] = b"channel closed";
@@ -444,12 +444,15 @@ impl RpcTransport for Channel {
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
         self.snapshot()?.call(request).await
     }
+}
 
+#[crate::async_trait]
+impl StreamingRpcTransport for Channel {
     async fn streaming_call(
         &self,
         request: RpcRequest,
-        request_body: BoxMessageStream<Vec<u8>>,
-    ) -> Result<BoxMessageStream<RpcStreamFrame>> {
+        request_body: BoxStream<Vec<u8>>,
+    ) -> Result<BoxStream<RpcStreamFrame>> {
         self.snapshot()?.streaming_call(request, request_body).await
     }
 }
@@ -463,12 +466,15 @@ impl RpcTransport for Transport {
             Self::WebTransport(transport) => transport.call(request).await,
         }
     }
+}
 
+#[crate::async_trait]
+impl StreamingRpcTransport for Transport {
     async fn streaming_call(
         &self,
         request: RpcRequest,
-        request_body: BoxMessageStream<Vec<u8>>,
-    ) -> Result<BoxMessageStream<RpcStreamFrame>> {
+        request_body: BoxStream<Vec<u8>>,
+    ) -> Result<BoxStream<RpcStreamFrame>> {
         match self {
             Self::Quinn(transport) => transport.streaming_call(request, request_body).await,
             #[cfg(feature = "webtransport")]

@@ -1,37 +1,20 @@
 use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use futures_core::Stream;
 use prost::Message;
 
 use crate::{Error, Result};
 
-#[crate::async_trait]
-pub trait MessageStream<T>: Send {
-    /// Returns the next message from the stream, or `None` after the stream finishes.
-    async fn next(&mut self) -> Option<Result<T>>;
-
-    /// Returns true when calling `next` is expected to complete immediately.
-    ///
-    /// Transports use this to batch ready stream items without adding latency to
-    /// streams backed by asynchronous producers.
-    fn is_non_blocking(&self) -> bool {
-        false
-    }
-
-    /// Drains immediately ready items into `out` without awaiting one future per item.
-    ///
-    /// Returns `Ok(true)` when the stream is exhausted. The default implementation
-    /// drains nothing, preserving compatibility for streams backed by async work.
-    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
-        let _ = limit;
-        let _ = out;
-        Ok(false)
-    }
-}
-
-pub type BoxMessageStream<T> = Box<dyn MessageStream<T> + Send + 'static>;
+/// A sendable, heap-allocated asynchronous message stream.
+///
+/// This is a standard [`futures_core::Stream`], so callers can use
+/// [`futures_util::StreamExt`] and the rest of the futures ecosystem directly.
+pub type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T>> + Send + 'static>>;
 
 pub struct EmptyStream<T> {
-    _marker: PhantomData<T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
 impl<T> Default for EmptyStream<T> {
@@ -42,85 +25,21 @@ impl<T> Default for EmptyStream<T> {
     }
 }
 
-#[crate::async_trait]
-impl<T> MessageStream<T> for EmptyStream<T>
-where
-    T: Send + 'static,
-{
-    async fn next(&mut self) -> Option<Result<T>> {
-        None
-    }
+impl<T> Stream for EmptyStream<T> {
+    type Item = Result<T>;
 
-    fn is_non_blocking(&self) -> bool {
-        true
-    }
-
-    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
-        let _ = limit;
-        let _ = out;
-        Ok(true)
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(None)
     }
 }
 
 /// Returns an empty boxed message stream.
 #[must_use]
-pub fn empty<T>() -> BoxMessageStream<T>
+pub fn empty<T>() -> BoxStream<T>
 where
     T: Send + 'static,
 {
-    Box::new(EmptyStream::default())
-}
-
-pub(crate) struct PrefixedStream<T> {
-    first: Option<Result<T>>,
-    inner: BoxMessageStream<T>,
-}
-
-impl<T> PrefixedStream<T> {
-    pub(crate) fn new(first: Result<T>, inner: BoxMessageStream<T>) -> Self {
-        Self {
-            first: Some(first),
-            inner,
-        }
-    }
-}
-
-#[crate::async_trait]
-impl<T> MessageStream<T> for PrefixedStream<T>
-where
-    T: Send + 'static,
-{
-    async fn next(&mut self) -> Option<Result<T>> {
-        if let Some(first) = self.first.take() {
-            return Some(first);
-        }
-
-        self.inner.next().await
-    }
-
-    fn is_non_blocking(&self) -> bool {
-        self.first.is_some() || self.inner.is_non_blocking()
-    }
-
-    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
-        if out.len() >= limit {
-            return Ok(false);
-        }
-        if let Some(first) = self.first.take() {
-            out.push(first?);
-        }
-        if out.len() >= limit {
-            return Ok(false);
-        }
-        self.inner.drain_ready(limit, out)
-    }
-}
-
-pub(crate) fn prefixed<T>(first: Result<T>, inner: BoxMessageStream<T>) -> BoxMessageStream<T>
-where
-    T: Send + 'static,
-{
-    Box::new(PrefixedStream::new(first, inner))
+    Box::pin(EmptyStream::default())
 }
 
 pub struct IterStream<I> {
@@ -134,101 +53,74 @@ impl<I> IterStream<I> {
     }
 }
 
-#[crate::async_trait]
-impl<T, I> MessageStream<T> for IterStream<I>
+impl<T, I> Stream for IterStream<I>
 where
-    T: Send + 'static,
-    I: Iterator<Item = T> + Send,
+    I: Iterator<Item = T> + Unpin,
 {
-    async fn next(&mut self) -> Option<Result<T>> {
-        self.iter.next().map(Ok)
-    }
+    type Item = Result<T>;
 
-    fn is_non_blocking(&self) -> bool {
-        true
-    }
-
-    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
-        while out.len() < limit {
-            let Some(item) = self.iter.next() else {
-                return Ok(true);
-            };
-            out.push(item);
-        }
-        Ok(false)
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.iter.next().map(Ok))
     }
 }
 
 /// Returns a boxed message stream that yields items from an iterator.
 #[must_use]
-pub fn from_iter<T, I>(iter: I) -> BoxMessageStream<T>
+pub fn from_iter<T, I>(iter: I) -> BoxStream<T>
 where
     T: Send + 'static,
     I: IntoIterator<Item = T>,
-    I::IntoIter: Send + 'static,
+    I::IntoIter: Send + Unpin + 'static,
 {
-    Box::new(IterStream::new(iter.into_iter()))
+    Box::pin(IterStream::new(iter.into_iter()))
 }
 
 pub struct EncodeStream<T> {
-    inner: BoxMessageStream<T>,
+    inner: BoxStream<T>,
 }
 
 impl<T> EncodeStream<T> {
     /// Creates a stream that encodes protobuf messages into byte bodies.
     #[must_use]
-    pub fn new(inner: BoxMessageStream<T>) -> Self {
+    pub fn new(inner: BoxStream<T>) -> Self {
         Self { inner }
     }
 }
 
-#[crate::async_trait]
-impl<T> MessageStream<Vec<u8>> for EncodeStream<T>
+impl<T> Stream for EncodeStream<T>
 where
-    T: Message + Send + 'static,
+    T: Message,
 {
-    async fn next(&mut self) -> Option<Result<Vec<u8>>> {
-        match self.inner.next().await {
-            Some(Ok(message)) => Some(Ok(message.encode_to_vec())),
-            Some(Err(error)) => Some(Err(error)),
-            None => None,
-        }
-    }
+    type Item = Result<Vec<u8>>;
 
-    fn is_non_blocking(&self) -> bool {
-        self.inner.is_non_blocking()
-    }
-
-    fn drain_ready(&mut self, limit: usize, out: &mut Vec<Vec<u8>>) -> Result<bool> {
-        let remaining = limit.saturating_sub(out.len());
-        if remaining == 0 {
-            return Ok(false);
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(message.encode_to_vec()))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
-        let mut messages = Vec::with_capacity(remaining);
-        let done = self.inner.drain_ready(remaining, &mut messages)?;
-        out.extend(messages.into_iter().map(|message| message.encode_to_vec()));
-        Ok(done)
     }
 }
 
 /// Wraps a message stream and encodes each protobuf message into bytes.
 #[must_use]
-pub fn encode<T>(inner: BoxMessageStream<T>) -> BoxMessageStream<Vec<u8>>
+pub fn encode<T>(inner: BoxStream<T>) -> BoxStream<Vec<u8>>
 where
     T: Message + Send + 'static,
 {
-    Box::new(EncodeStream::new(inner))
+    Box::pin(EncodeStream::new(inner))
 }
 
 pub struct DecodeStream<T> {
-    inner: BoxMessageStream<Vec<u8>>,
-    _marker: PhantomData<T>,
+    inner: BoxStream<Vec<u8>>,
+    _marker: PhantomData<fn() -> T>,
 }
 
 impl<T> DecodeStream<T> {
     /// Creates a stream that decodes byte bodies into protobuf messages.
     #[must_use]
-    pub fn new(inner: BoxMessageStream<Vec<u8>>) -> Self {
+    pub fn new(inner: BoxStream<Vec<u8>>) -> Self {
         Self {
             inner,
             _marker: PhantomData,
@@ -236,48 +128,37 @@ impl<T> DecodeStream<T> {
     }
 }
 
-#[crate::async_trait]
-impl<T> MessageStream<T> for DecodeStream<T>
+impl<T> Stream for DecodeStream<T>
 where
-    T: Message + Default + Send + 'static,
+    T: Message + Default,
 {
-    async fn next(&mut self) -> Option<Result<T>> {
-        match self.inner.next().await {
-            Some(Ok(body)) => Some(T::decode(body.as_slice()).map_err(Error::from)),
-            Some(Err(error)) => Some(Err(error)),
-            None => None,
-        }
-    }
+    type Item = Result<T>;
 
-    fn is_non_blocking(&self) -> bool {
-        self.inner.is_non_blocking()
-    }
-
-    fn drain_ready(&mut self, limit: usize, out: &mut Vec<T>) -> Result<bool> {
-        let remaining = limit.saturating_sub(out.len());
-        if remaining == 0 {
-            return Ok(false);
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(body))) => {
+                Poll::Ready(Some(T::decode(body.as_slice()).map_err(Error::from)))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
-        let mut bodies = Vec::with_capacity(remaining);
-        let done = self.inner.drain_ready(remaining, &mut bodies)?;
-        for body in bodies {
-            out.push(T::decode(body.as_slice()).map_err(Error::from)?);
-        }
-        Ok(done)
     }
 }
 
 /// Wraps a byte stream and decodes each body into a protobuf message.
 #[must_use]
-pub fn decode<T>(inner: BoxMessageStream<Vec<u8>>) -> BoxMessageStream<T>
+pub fn decode<T>(inner: BoxStream<Vec<u8>>) -> BoxStream<T>
 where
     T: Message + Default + Send + 'static,
 {
-    Box::new(DecodeStream::new(inner))
+    Box::pin(DecodeStream::new(inner))
 }
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
+
     use super::{decode, encode, from_iter};
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -303,26 +184,13 @@ mod tests {
         assert!(decoded.next().await.is_none());
     }
 
-    #[test]
-    fn ready_drain_encodes_and_decodes_nonblocking_streams() {
-        let messages = from_iter([
-            TestMessage {
-                value: "one".to_owned(),
-            },
-            TestMessage {
-                value: "two".to_owned(),
-            },
-        ]);
-        let mut encoded = encode(messages);
-        let mut bodies = Vec::new();
+    #[tokio::test]
+    async fn standard_stream_ext_consumes_iterator_streams() {
+        let values = from_iter([1_u8, 2, 3])
+            .map(|value| value.expect("iterator stream should not fail"))
+            .collect::<Vec<_>>()
+            .await;
 
-        assert!(encoded.drain_ready(8, &mut bodies).unwrap());
-        assert_eq!(bodies.len(), 2);
-
-        let mut decoded = decode::<TestMessage>(from_iter(bodies));
-        let mut drained = Vec::new();
-        assert!(decoded.drain_ready(8, &mut drained).unwrap());
-        assert_eq!(drained[0].value, "one");
-        assert_eq!(drained[1].value, "two");
+        assert_eq!(values, [1, 2, 3]);
     }
 }

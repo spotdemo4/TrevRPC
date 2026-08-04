@@ -2,26 +2,28 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use futures_util::StreamExt;
+use tokio::sync::watch;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
-    BoxMessageStream, Code, Error, MessageStream, Metadata, Result, RpcKind, RpcRequest,
-    RpcResponse, RpcStreamFrame, Status,
+    BoxStream, Code, Error, Metadata, ResponseEnvelope, Result, RpcKind, RpcRequest, RpcResponse,
+    RpcStreamFrame, Status,
 };
 
-type UnaryHandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
+type UnaryHandlerFuture =
+    Pin<Box<dyn Future<Output = Result<ResponseEnvelope<Vec<u8>>>> + Send + 'static>>;
 type UnaryHandler =
     Arc<dyn Fn(RequestContext, Vec<u8>) -> UnaryHandlerFuture + Send + Sync + 'static>;
 type StreamingHandlerFuture =
-    Pin<Box<dyn Future<Output = Result<BoxMessageStream<Vec<u8>>>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<ResponseEnvelope<BoxStream<Vec<u8>>>>> + Send + 'static>>;
 type StreamingHandler = Arc<
-    dyn Fn(RequestContext, Vec<u8>, BoxMessageStream<Vec<u8>>) -> StreamingHandlerFuture
-        + Send
-        + Sync,
+    dyn Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> StreamingHandlerFuture + Send + Sync,
 >;
 type RouteMap = HashMap<String, HashMap<String, Route>>;
 
@@ -42,13 +44,120 @@ pub struct Server {
     metrics: Arc<dyn Metrics>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Identifies the first lifecycle event that cancelled an RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationSource {
+    /// The effective RPC deadline elapsed.
+    Deadline,
+    /// The peer reset or stopped the RPC stream.
+    PeerReset,
+    /// The underlying transport connection was lost.
+    ConnectionLost,
+    /// The server began shutting down before the RPC completed.
+    ServerShutdown,
+}
+
+#[derive(Debug)]
+struct CancellationState {
+    source: watch::Sender<Option<CancellationSource>>,
+    completion_code: Mutex<Option<Code>>,
+}
+
+/// A cloneable, first-writer-wins RPC cancellation signal.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    state: Arc<CancellationState>,
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancellationToken {
+    /// Creates an uncancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(CancellationState {
+                source: watch::channel(None).0,
+                completion_code: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Returns the cancellation source once cancellation has been observed.
+    #[must_use]
+    pub fn source(&self) -> Option<CancellationSource> {
+        *self.state.source.borrow()
+    }
+
+    /// Returns whether the RPC has been cancelled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.source().is_some()
+    }
+
+    /// Waits until cancellation and returns its source.
+    pub async fn cancelled(&self) -> CancellationSource {
+        let mut source = self.subscribe();
+        loop {
+            if let Some(source) = *source.borrow_and_update() {
+                return source;
+            }
+            if source.changed().await.is_err() {
+                // `self` retains the sender, so disconnection is unreachable while this
+                // future is alive. Preserve the API's wait-until-cancelled contract if
+                // that invariant ever changes instead of panicking or spinning.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<Option<CancellationSource>> {
+        self.state.source.subscribe()
+    }
+
+    pub(crate) fn cancel(&self, source: CancellationSource) -> bool {
+        self.state.source.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(source);
+                true
+            }
+        })
+    }
+
+    pub(crate) fn set_completion_code(&self, code: Code) {
+        let mut completion_code = self
+            .state
+            .completion_code
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if completion_code.is_none() {
+            *completion_code = Some(code);
+        }
+    }
+
+    fn completion_code(&self) -> Option<Code> {
+        *self
+            .state
+            .completion_code
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RequestContext {
     service: String,
     method: String,
     kind: RpcKind,
     metadata: Metadata,
     deadline: Option<Instant>,
+    cancellation: CancellationToken,
 }
 
 impl RequestContext {
@@ -60,6 +169,7 @@ impl RequestContext {
             kind: request.rpc_kind(),
             metadata: request.metadata.clone(),
             deadline,
+            cancellation: CancellationToken::new(),
         }
     }
 
@@ -100,9 +210,46 @@ impl RequestContext {
             .is_some_and(|deadline| deadline <= Instant::now())
     }
 
+    /// Returns the call's cloneable cancellation token.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Returns the first cancellation source, if cancellation was observed.
+    #[must_use]
+    pub fn cancellation_source(&self) -> Option<CancellationSource> {
+        if self.cancellation.source().is_none() && self.deadline_expired() {
+            self.cancellation.cancel(CancellationSource::Deadline);
+        }
+        self.cancellation.source()
+    }
+
+    /// Returns whether the call was cancelled or its deadline elapsed.
     #[must_use]
     pub fn cancelled(&self) -> bool {
-        self.deadline_expired()
+        self.cancellation_source().is_some()
+    }
+
+    /// Waits until the call is cancelled and returns the first cancellation source.
+    pub async fn cancelled_signal(&self) -> CancellationSource {
+        if let Some(source) = self.cancellation_source() {
+            return source;
+        }
+
+        let Some(deadline) = self.deadline else {
+            return self.cancellation.cancelled().await;
+        };
+        let deadline = tokio::time::Instant::from_std(deadline);
+
+        tokio::select! {
+            biased;
+            source = self.cancellation.cancelled() => source,
+            () = tokio::time::sleep_until(deadline) => {
+                self.cancellation.cancel(CancellationSource::Deadline);
+                self.cancellation.cancelled().await
+            }
+        }
     }
 }
 
@@ -136,7 +283,7 @@ pub struct Http3AdmissionRequest<'a> {
 #[cfg(feature = "http3")]
 pub type Http3Admission = for<'a> fn(&Http3AdmissionRequest<'a>) -> bool;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ServerOptions {
     frame_size: usize,
     connections: Option<usize>,
@@ -150,12 +297,12 @@ pub struct ServerOptions {
     #[cfg(feature = "http3")]
     http3_enabled: bool,
     #[cfg(feature = "http3")]
-    http3_path: &'static str,
+    http3_path: String,
     #[cfg(feature = "http3")]
     http3_admission: Option<Http3Admission>,
-    webtransport_path: &'static str,
-    webtransport_allowed_authorities: &'static [&'static str],
-    webtransport_allowed_origins: &'static [&'static str],
+    webtransport_path: String,
+    webtransport_allowed_authorities: Vec<String>,
+    webtransport_allowed_origins: Vec<String>,
     webtransport_admission: Option<WebTransportAdmission>,
 }
 
@@ -174,12 +321,12 @@ impl Default for ServerOptions {
             #[cfg(feature = "http3")]
             http3_enabled: false,
             #[cfg(feature = "http3")]
-            http3_path: "/trevrpc",
+            http3_path: "/trevrpc".to_owned(),
             #[cfg(feature = "http3")]
             http3_admission: None,
-            webtransport_path: "/trevrpc",
-            webtransport_allowed_authorities: &[],
-            webtransport_allowed_origins: &[],
+            webtransport_path: "/trevrpc".to_owned(),
+            webtransport_allowed_authorities: Vec::new(),
+            webtransport_allowed_origins: Vec::new(),
             webtransport_admission: None,
         }
     }
@@ -256,8 +403,8 @@ impl ServerOptions {
     /// Returns the HTTP/3 POST path accepted by the server.
     #[cfg(feature = "http3")]
     #[must_use]
-    pub const fn http3_path(&self) -> &'static str {
-        self.http3_path
+    pub fn http3_path(&self) -> &str {
+        &self.http3_path
     }
 
     /// Returns the HTTP/3 POST admission callback, if configured.
@@ -269,20 +416,20 @@ impl ServerOptions {
 
     /// Returns the `WebTransport` request path accepted by the server.
     #[must_use]
-    pub const fn webtransport_path(&self) -> &'static str {
-        self.webtransport_path
+    pub fn webtransport_path(&self) -> &str {
+        &self.webtransport_path
     }
 
     /// Returns the allowed `WebTransport` authorities, or an empty list to allow any authority.
     #[must_use]
-    pub const fn webtransport_allowed_authorities(&self) -> &'static [&'static str] {
-        self.webtransport_allowed_authorities
+    pub fn webtransport_allowed_authorities(&self) -> &[String] {
+        &self.webtransport_allowed_authorities
     }
 
     /// Returns the allowed `WebTransport` origins, or an empty list to reject origin-bearing requests.
     #[must_use]
-    pub const fn webtransport_allowed_origins(&self) -> &'static [&'static str] {
-        self.webtransport_allowed_origins
+    pub fn webtransport_allowed_origins(&self) -> &[String] {
+        &self.webtransport_allowed_origins
     }
 
     /// Returns the `WebTransport` admission callback, if configured.
@@ -380,8 +527,8 @@ impl ServerOptions {
     /// Sets the HTTP/3 POST request path accepted by the server.
     #[cfg(feature = "http3")]
     #[must_use]
-    pub const fn with_http3_path(mut self, http3_path: &'static str) -> Self {
-        self.http3_path = http3_path;
+    pub fn with_http3_path(mut self, http3_path: impl Into<String>) -> Self {
+        self.http3_path = http3_path.into();
         self
     }
 
@@ -395,28 +542,42 @@ impl ServerOptions {
 
     /// Sets the `WebTransport` request path accepted by the server.
     #[must_use]
-    pub const fn with_webtransport_path(mut self, webtransport_path: &'static str) -> Self {
-        self.webtransport_path = webtransport_path;
+    pub fn with_webtransport_path(mut self, webtransport_path: impl Into<String>) -> Self {
+        self.webtransport_path = webtransport_path.into();
         self
     }
 
     /// Sets the `WebTransport` authorities allowed by the server.
     #[must_use]
-    pub const fn with_webtransport_allowed_authorities(
+    pub fn with_webtransport_allowed_authorities<I, S>(
         mut self,
-        webtransport_allowed_authorities: &'static [&'static str],
-    ) -> Self {
-        self.webtransport_allowed_authorities = webtransport_allowed_authorities;
+        webtransport_allowed_authorities: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.webtransport_allowed_authorities = webtransport_allowed_authorities
+            .into_iter()
+            .map(Into::into)
+            .collect();
         self
     }
 
     /// Sets the `WebTransport` origins allowed by the server.
     #[must_use]
-    pub const fn with_webtransport_allowed_origins(
+    pub fn with_webtransport_allowed_origins<I, S>(
         mut self,
-        webtransport_allowed_origins: &'static [&'static str],
-    ) -> Self {
-        self.webtransport_allowed_origins = webtransport_allowed_origins;
+        webtransport_allowed_origins: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.webtransport_allowed_origins = webtransport_allowed_origins
+            .into_iter()
+            .map(Into::into)
+            .collect();
         self
     }
 
@@ -647,8 +808,8 @@ impl Server {
 
     /// Sets the HTTP/3 POST request path accepted by the server.
     #[cfg(feature = "http3")]
-    pub fn set_http3_path(&mut self, http3_path: &'static str) -> &mut Self {
-        self.options.http3_path = http3_path;
+    pub fn set_http3_path(&mut self, http3_path: impl Into<String>) -> &mut Self {
+        self.options.http3_path = http3_path.into();
         self
     }
 
@@ -660,26 +821,40 @@ impl Server {
     }
 
     /// Sets the `WebTransport` request path accepted by the server.
-    pub fn set_webtransport_path(&mut self, webtransport_path: &'static str) -> &mut Self {
-        self.options.webtransport_path = webtransport_path;
+    pub fn set_webtransport_path(&mut self, webtransport_path: impl Into<String>) -> &mut Self {
+        self.options.webtransport_path = webtransport_path.into();
         self
     }
 
     /// Sets the `WebTransport` authorities allowed by the server.
-    pub fn set_webtransport_allowed_authorities(
+    pub fn set_webtransport_allowed_authorities<I, S>(
         &mut self,
-        webtransport_allowed_authorities: &'static [&'static str],
-    ) -> &mut Self {
-        self.options.webtransport_allowed_authorities = webtransport_allowed_authorities;
+        webtransport_allowed_authorities: I,
+    ) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.options.webtransport_allowed_authorities = webtransport_allowed_authorities
+            .into_iter()
+            .map(Into::into)
+            .collect();
         self
     }
 
     /// Sets the `WebTransport` origins allowed by the server.
-    pub fn set_webtransport_allowed_origins(
+    pub fn set_webtransport_allowed_origins<I, S>(
         &mut self,
-        webtransport_allowed_origins: &'static [&'static str],
-    ) -> &mut Self {
-        self.options.webtransport_allowed_origins = webtransport_allowed_origins;
+        webtransport_allowed_origins: I,
+    ) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.options.webtransport_allowed_origins = webtransport_allowed_origins
+            .into_iter()
+            .map(Into::into)
+            .collect();
         self
     }
 
@@ -745,6 +920,22 @@ impl Server {
         F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
+        self.route_envelope_with_context(service, method, move |context, body| {
+            let future = handler(context, body);
+            async move { future.await.map(ResponseEnvelope::new) }
+        });
+    }
+
+    /// Registers a unary route handler that can attach successful response metadata.
+    pub fn route_envelope_with_context<F, Fut>(
+        &mut self,
+        service: impl Into<String>,
+        method: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResponseEnvelope<Vec<u8>>>> + Send + 'static,
+    {
         Arc::make_mut(&mut self.routes)
             .entry(service.into())
             .or_default()
@@ -764,8 +955,8 @@ impl Server {
         kind: RpcKind,
         handler: F,
     ) where
-        F: Fn(Vec<u8>, BoxMessageStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<BoxMessageStream<Vec<u8>>>> + Send + 'static,
+        F: Fn(Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
     {
         self.route_streaming_with_context(service, method, kind, move |_context, body, stream| {
             handler(body, stream)
@@ -780,8 +971,30 @@ impl Server {
         kind: RpcKind,
         handler: F,
     ) where
-        F: Fn(RequestContext, Vec<u8>, BoxMessageStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<BoxMessageStream<Vec<u8>>>> + Send + 'static,
+        F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
+    {
+        self.route_streaming_envelope_with_context(
+            service,
+            method,
+            kind,
+            move |context, body, stream| {
+                let future = handler(context, body, stream);
+                async move { future.await.map(ResponseEnvelope::new) }
+            },
+        );
+    }
+
+    /// Registers a streaming route handler that can attach terminal success metadata.
+    pub fn route_streaming_envelope_with_context<F, Fut>(
+        &mut self,
+        service: impl Into<String>,
+        method: impl Into<String>,
+        kind: RpcKind,
+        handler: F,
+    ) where
+        F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResponseEnvelope<BoxStream<Vec<u8>>>>> + Send + 'static,
     {
         Arc::make_mut(&mut self.routes)
             .entry(service.into())
@@ -806,6 +1019,15 @@ impl Server {
 
     /// Handles a unary RPC request and returns a response.
     pub async fn handle_request(&self, request: RpcRequest) -> RpcResponse {
+        self.handle_request_with_cancellation(request, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn handle_request_with_cancellation(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> RpcResponse {
         let started_at = Instant::now();
         let request_body_len = request.body.len();
 
@@ -825,7 +1047,7 @@ impl Server {
             "rpc started"
         );
 
-        let deadline = match self.prepare_request(&request).await {
+        let deadline = match self.prepare_request(&request, &cancellation).await {
             Ok(deadline) => deadline,
             Err(status) => {
                 return self.finish_response(
@@ -865,11 +1087,19 @@ impl Server {
             kind,
             metadata,
             deadline,
+            cancellation: cancellation.clone(),
         };
 
         let response = match invoke_unary_handler(&handler, context, body) {
-            Ok(future) => match run_handler_with_deadline(future, deadline).await {
-                Ok(Ok(body)) => RpcResponse::ok(body),
+            Ok(future) => match run_handler_with_deadline(future, deadline, &cancellation).await {
+                Ok(Ok(response)) => {
+                    let (body, metadata) = response.into_parts();
+                    match validate_metadata(&metadata) {
+                        Ok(()) => Status::ok().into_response_with_metadata(body, metadata),
+                        Err(_) => Status::internal("invalid successful response metadata")
+                            .into_response(Vec::new()),
+                    }
+                }
                 Ok(Err(error)) => error.into_status().into_response(Vec::new()),
                 Err(status) => status.into_response(Vec::new()),
             },
@@ -880,12 +1110,26 @@ impl Server {
     }
 
     /// Handles a streaming RPC request and returns response frames.
-    #[allow(clippy::too_many_lines)]
     pub async fn handle_streaming_request(
         &self,
         request: RpcRequest,
-        request_body: BoxMessageStream<Vec<u8>>,
-    ) -> BoxMessageStream<RpcStreamFrame> {
+        request_body: BoxStream<Vec<u8>>,
+    ) -> BoxStream<RpcStreamFrame> {
+        self.handle_streaming_request_with_cancellation(
+            request,
+            request_body,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn handle_streaming_request_with_cancellation(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        cancellation: CancellationToken,
+    ) -> BoxStream<RpcStreamFrame> {
         let started_at = Instant::now();
         let request_body_len = request.body.len();
 
@@ -906,7 +1150,7 @@ impl Server {
             "streaming rpc started"
         );
 
-        let deadline = match self.prepare_request(&request).await {
+        let deadline = match self.prepare_request(&request, &cancellation).await {
             Ok(deadline) => deadline,
             Err(status) => {
                 return self.finish_streaming_status(
@@ -919,7 +1163,8 @@ impl Server {
             }
         };
         let stream_limits = StreamLimits::from_options(self.options(), deadline);
-        let request_body = limit_stream(request_body, stream_limits, "request");
+        let request_body =
+            limit_stream(request_body, stream_limits, "request", cancellation.clone());
 
         let Some(Route::Streaming { kind, handler }) =
             self.route_for(&request.service, &request.method)
@@ -965,9 +1210,10 @@ impl Server {
             kind: request_kind,
             metadata,
             deadline,
+            cancellation: cancellation.clone(),
         };
         let handler_result = match invoke_streaming_handler(&handler, context, body, request_body) {
-            Ok(future) => run_handler_with_deadline(future, deadline).await,
+            Ok(future) => run_handler_with_deadline(future, deadline, &cancellation).await,
             Err(status) => Err(status),
         };
 
@@ -979,15 +1225,31 @@ impl Server {
                 started_at,
                 status,
             ),
-            Ok(Ok(response_body)) => Box::new(ServerResponseStream::new(
-                response_body,
-                Arc::clone(&self.metrics),
-                service,
-                method,
-                request_body_len,
-                started_at,
-                stream_limits,
-            )),
+            Ok(Ok(response)) => {
+                let (response_body, metadata) = response.into_parts();
+                if validate_metadata(&metadata).is_err() {
+                    return self.finish_streaming_status(
+                        &service,
+                        &method,
+                        request_body_len,
+                        started_at,
+                        Status::internal("invalid successful response metadata"),
+                    );
+                }
+                server_response_stream(
+                    response_body,
+                    metadata,
+                    StreamingCompletion {
+                        metrics: Arc::clone(&self.metrics),
+                        service,
+                        method,
+                        request_body_len,
+                        started_at,
+                    },
+                    stream_limits,
+                    cancellation,
+                )
+            }
             Ok(Err(error)) => {
                 let status = error.into_status();
                 self.finish_streaming_status(
@@ -1004,13 +1266,22 @@ impl Server {
     async fn prepare_request(
         &self,
         request: &RpcRequest,
+        cancellation: &CancellationToken,
     ) -> std::result::Result<Option<Instant>, Status> {
         validate_metadata(&request.metadata)?;
         request.validate_protocol()?;
         let deadline = request_deadline(request)?;
 
         if let Some(authorizer) = &self.authorizer {
-            with_deadline(authorizer.authorize(request), deadline).await??;
+            match with_deadline(authorizer.authorize(request), deadline).await {
+                Ok(result) => result?,
+                Err(status) => {
+                    if status.code() == Code::DeadlineExceeded {
+                        cancellation.cancel(CancellationSource::Deadline);
+                    }
+                    return Err(status);
+                }
+            }
         }
 
         Ok(deadline)
@@ -1078,7 +1349,7 @@ impl Server {
         request_body_len: usize,
         started_at: Instant,
         status: Status,
-    ) -> BoxMessageStream<RpcStreamFrame> {
+    ) -> BoxStream<RpcStreamFrame> {
         self.finish_streaming_response(
             service,
             method,
@@ -1103,6 +1374,17 @@ impl Server {
             &request.method,
             request.body.len(),
             started_at,
+            0,
+            status.code(),
+        );
+    }
+
+    pub(crate) fn record_active_request_failure(&self, request: &RpcRequest, status: &Status) {
+        self.finish_streaming_response(
+            &request.service,
+            &request.method,
+            request.body.len(),
+            Instant::now(),
             0,
             status.code(),
         );
@@ -1140,7 +1422,7 @@ fn invoke_streaming_handler(
     handler: &StreamingHandler,
     context: RequestContext,
     body: Vec<u8>,
-    request_body: BoxMessageStream<Vec<u8>>,
+    request_body: BoxStream<Vec<u8>>,
 ) -> std::result::Result<StreamingHandlerFuture, Status> {
     catch_unwind(AssertUnwindSafe(|| handler(context, body, request_body)))
         .map_err(|_| Status::internal("RPC handler panicked"))
@@ -1149,13 +1431,21 @@ fn invoke_streaming_handler(
 async fn run_handler_with_deadline<T, F>(
     future: F,
     deadline: Option<Instant>,
+    cancellation: &CancellationToken,
 ) -> std::result::Result<T, Status>
 where
     F: Future<Output = T> + Unpin,
 {
-    match with_deadline(CatchUnwindFuture::new(future), deadline).await? {
-        Ok(result) => Ok(result),
-        Err(_) => Err(Status::internal("RPC handler panicked")),
+    let result = with_deadline(CatchUnwindFuture::new(future), deadline).await;
+    match result {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(Status::internal("RPC handler panicked")),
+        Err(status) => {
+            if status.code() == Code::DeadlineExceeded {
+                cancellation.cancel(CancellationSource::Deadline);
+            }
+            Err(status)
+        }
     }
 }
 
@@ -1212,7 +1502,7 @@ fn remaining_deadline(deadline: Option<Instant>) -> std::result::Result<Option<D
         .ok_or_else(|| Status::deadline_exceeded("RPC deadline exceeded"))
 }
 
-fn status_stream(status: Status) -> BoxMessageStream<RpcStreamFrame> {
+fn status_stream(status: Status) -> BoxStream<RpcStreamFrame> {
     crate::stream::from_iter([RpcStreamFrame::status(status)])
 }
 
@@ -1236,77 +1526,92 @@ impl StreamLimits {
 }
 
 struct LimitedStream {
-    inner: BoxMessageStream<Vec<u8>>,
+    inner: BoxStream<Vec<u8>>,
     limits: StreamLimits,
     direction: &'static str,
+    cancellation: CancellationToken,
     messages: usize,
     body_size: usize,
     done: bool,
 }
 
 fn limit_stream(
-    inner: BoxMessageStream<Vec<u8>>,
+    inner: BoxStream<Vec<u8>>,
     limits: StreamLimits,
     direction: &'static str,
-) -> BoxMessageStream<Vec<u8>> {
-    Box::new(LimitedStream {
-        inner,
-        limits,
-        direction,
-        messages: 0,
-        body_size: 0,
-        done: false,
-    })
-}
+    cancellation: CancellationToken,
+) -> BoxStream<Vec<u8>> {
+    Box::pin(futures_util::stream::unfold(
+        LimitedStream {
+            inner,
+            limits,
+            direction,
+            cancellation,
+            messages: 0,
+            body_size: 0,
+            done: false,
+        },
+        |mut stream| async move {
+            if stream.done {
+                return None;
+            }
 
-#[crate::async_trait]
-impl MessageStream<Vec<u8>> for LimitedStream {
-    async fn next(&mut self) -> Option<Result<Vec<u8>>> {
-        if self.done {
-            return None;
-        }
-
-        let Some(body) =
-            (match next_limited_item(&mut self.inner, self.limits, self.direction).await {
-                Ok(body) => body,
+            let body = match next_limited_item(
+                &mut stream.inner,
+                stream.limits,
+                stream.direction,
+                &stream.cancellation,
+            )
+            .await
+            {
+                Ok(Some(body)) => body,
+                Ok(None) => return None,
                 Err(error) => {
-                    self.done = true;
-                    return Some(Err(error));
+                    stream.done = true;
+                    return Some((Err(error), stream));
                 }
-            })
-        else {
-            self.done = true;
-            return None;
-        };
+            };
 
-        if let Err(error) = check_stream_limits(
-            self.direction,
-            self.limits,
-            &mut self.messages,
-            &mut self.body_size,
-            body.len(),
-        ) {
-            self.done = true;
-            return Some(Err(error));
-        }
+            let item = match check_stream_limits(
+                stream.direction,
+                stream.limits,
+                &mut stream.messages,
+                &mut stream.body_size,
+                body.len(),
+            ) {
+                Ok(()) => Ok(body),
+                Err(error) => {
+                    stream.done = true;
+                    Err(error)
+                }
+            };
 
-        Some(Ok(body))
-    }
-
-    fn is_non_blocking(&self) -> bool {
-        self.inner.is_non_blocking()
-    }
+            Some((item, stream))
+        },
+    ))
 }
 
 async fn next_limited_item(
-    inner: &mut BoxMessageStream<Vec<u8>>,
+    inner: &mut BoxStream<Vec<u8>>,
     limits: StreamLimits,
     direction: &'static str,
+    cancellation: &CancellationToken,
 ) -> Result<Option<Vec<u8>>> {
-    match stream_next_timeout(limits.deadline, limits.idle_timeout)? {
+    let timeout = match stream_next_timeout(limits.deadline, limits.idle_timeout) {
+        Ok(timeout) => timeout,
+        Err(status) => {
+            cancellation.cancel(CancellationSource::Deadline);
+            return Err(Error::from(status));
+        }
+    };
+
+    match timeout {
         Some((timeout, reason)) => tokio::time::timeout(timeout, inner.next())
             .await
-            .map_err(|_| Error::from(reason.status(direction)))?
+            .map_err(|_| {
+                reason.cancel(cancellation);
+                Error::from(reason.status(direction))
+            })?
             .transpose(),
         None => inner.next().await.transpose(),
     }
@@ -1319,7 +1624,25 @@ fn check_stream_limits(
     body_size: &mut usize,
     item_len: usize,
 ) -> Result<()> {
-    if let Some(max) = limits.max_messages
+    check_stream_message_body_limits(
+        direction,
+        limits.max_messages,
+        limits.max_body_size,
+        messages,
+        body_size,
+        item_len,
+    )
+}
+
+pub(crate) fn check_stream_message_body_limits(
+    direction: &str,
+    max_messages: Option<usize>,
+    max_body_size: Option<usize>,
+    messages: &mut usize,
+    body_size: &mut usize,
+    item_len: usize,
+) -> Result<()> {
+    if let Some(max) = max_messages
         && *messages >= max
     {
         return Err(Error::from(Status::resource_exhausted(format!(
@@ -1330,7 +1653,7 @@ fn check_stream_limits(
     *messages = messages.saturating_add(1);
     *body_size = body_size.saturating_add(item_len);
 
-    if let Some(max) = limits.max_body_size
+    if let Some(max) = max_body_size
         && *body_size > max
     {
         return Err(Error::from(Status::resource_exhausted(format!(
@@ -1354,6 +1677,12 @@ impl StreamTimeoutReason {
             Self::Idle => Status::unavailable(format!("{direction} stream idle timeout")),
         }
     }
+
+    fn cancel(self, cancellation: &CancellationToken) {
+        if matches!(self, Self::Deadline) {
+            cancellation.cancel(CancellationSource::Deadline);
+        }
+    }
 }
 
 fn stream_next_timeout(
@@ -1372,38 +1701,54 @@ fn stream_next_timeout(
     })
 }
 
-struct ServerResponseStream {
-    inner: BoxMessageStream<Vec<u8>>,
+struct StreamingCompletion {
     metrics: Arc<dyn Metrics>,
     service: String,
     method: String,
     request_body_len: usize,
-    response_body_len: usize,
     started_at: Instant,
+}
+
+impl StreamingCompletion {
+    fn finish(&self, response_body_len: usize, code: Code) {
+        finish_streaming_response(
+            self.metrics.as_ref(),
+            &self.service,
+            &self.method,
+            self.request_body_len,
+            self.started_at,
+            response_body_len,
+            code,
+        );
+    }
+}
+
+struct ServerResponseStream {
+    inner: BoxStream<Vec<u8>>,
+    metadata: Metadata,
+    completion: StreamingCompletion,
+    response_body_len: usize,
     limits: StreamLimits,
+    cancellation: CancellationToken,
     messages: usize,
     done: bool,
 }
 
 impl ServerResponseStream {
     fn new(
-        inner: BoxMessageStream<Vec<u8>>,
-        metrics: Arc<dyn Metrics>,
-        service: String,
-        method: String,
-        request_body_len: usize,
-        started_at: Instant,
+        inner: BoxStream<Vec<u8>>,
+        metadata: Metadata,
+        completion: StreamingCompletion,
         limits: StreamLimits,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             inner,
-            metrics,
-            service,
-            method,
-            request_body_len,
+            metadata,
+            completion,
             response_body_len: 0,
-            started_at,
             limits,
+            cancellation,
             messages: 0,
             done: false,
         }
@@ -1411,62 +1756,71 @@ impl ServerResponseStream {
 
     fn finish(&mut self, code: Code) {
         self.done = true;
-        finish_streaming_response(
-            self.metrics.as_ref(),
-            &self.service,
-            &self.method,
-            self.request_body_len,
-            self.started_at,
-            self.response_body_len,
-            code,
-        );
+        self.completion.finish(self.response_body_len, code);
     }
 }
 
-#[crate::async_trait]
-impl MessageStream<RpcStreamFrame> for ServerResponseStream {
-    async fn next(&mut self) -> Option<Result<RpcStreamFrame>> {
-        if self.done {
-            return None;
-        }
+fn server_response_stream(
+    inner: BoxStream<Vec<u8>>,
+    metadata: Metadata,
+    completion: StreamingCompletion,
+    limits: StreamLimits,
+    cancellation: CancellationToken,
+) -> BoxStream<RpcStreamFrame> {
+    Box::pin(futures_util::stream::unfold(
+        ServerResponseStream::new(inner, metadata, completion, limits, cancellation),
+        |mut stream| async move {
+            if stream.done {
+                return None;
+            }
 
-        match next_limited_item(&mut self.inner, self.limits, "response").await {
-            Ok(Some(body)) => {
-                if let Err(error) = check_stream_limits(
-                    "response",
-                    self.limits,
-                    &mut self.messages,
-                    &mut self.response_body_len,
-                    body.len(),
-                ) {
-                    let status = error.into_status();
-                    self.finish(status.code());
-                    return Some(Ok(RpcStreamFrame::status(status)));
+            let frame = match next_limited_item(
+                &mut stream.inner,
+                stream.limits,
+                "response",
+                &stream.cancellation,
+            )
+            .await
+            {
+                Ok(Some(body)) => {
+                    if let Err(error) = check_stream_limits(
+                        "response",
+                        stream.limits,
+                        &mut stream.messages,
+                        &mut stream.response_body_len,
+                        body.len(),
+                    ) {
+                        let status = error.into_status();
+                        stream.finish(status.code());
+                        RpcStreamFrame::status(status)
+                    } else {
+                        RpcStreamFrame::message(body)
+                    }
                 }
+                Err(error) => {
+                    let status = error.into_status();
+                    stream.finish(status.code());
+                    RpcStreamFrame::status(status)
+                }
+                Ok(None) => {
+                    stream.finish(Code::Ok);
+                    RpcStreamFrame::status(Status::ok().with_metadata(stream.metadata.clone()))
+                }
+            };
 
-                Some(Ok(RpcStreamFrame::message(body)))
-            }
-            Err(error) => {
-                let status = error.into_status();
-                self.finish(status.code());
-                Some(Ok(RpcStreamFrame::status(status)))
-            }
-            Ok(None) => {
-                self.finish(Code::Ok);
-                Some(Ok(RpcStreamFrame::status(Status::ok())))
-            }
-        }
-    }
-
-    fn is_non_blocking(&self) -> bool {
-        self.inner.is_non_blocking()
-    }
+            Some((Ok(frame), stream))
+        },
+    ))
 }
 
 impl Drop for ServerResponseStream {
     fn drop(&mut self) {
         if !self.done {
-            self.finish(Code::Cancelled);
+            self.finish(
+                self.cancellation
+                    .completion_code()
+                    .unwrap_or(Code::Cancelled),
+            );
         }
     }
 }
@@ -1552,11 +1906,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::{Code, Error, MessageStream, RpcKind, RpcRequest, RpcStreamFrameKind, Status};
+    use futures_util::StreamExt;
+
+    use crate::{Code, Error, RpcKind, RpcRequest, RpcStreamFrameKind, Status};
 
     use super::{
-        Authorizer, MetadataValueAuthorizer, Metrics, RpcFinished, Server, ServerOptions,
-        StreamLimits, check_stream_limits,
+        Authorizer, CancellationSource, CancellationToken, MetadataValueAuthorizer, Metrics,
+        RequestContext, RpcFinished, Server, ServerOptions, StreamLimits, check_stream_limits,
     };
 
     #[derive(Clone, Default)]
@@ -1926,6 +2282,97 @@ mod tests {
         assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
     }
 
+    #[tokio::test]
+    async fn cancellation_token_is_cloneable_and_first_writer_wins() {
+        let cancellation = CancellationToken::new();
+        let observer = cancellation.clone();
+
+        assert!(cancellation.cancel(CancellationSource::PeerReset));
+        assert!(!observer.cancel(CancellationSource::ServerShutdown));
+        assert_eq!(observer.source(), Some(CancellationSource::PeerReset));
+        assert_eq!(observer.cancelled().await, CancellationSource::PeerReset);
+    }
+
+    #[tokio::test]
+    async fn cancellation_subscription_retains_cancel_before_await() {
+        let cancellation = CancellationToken::new();
+        let mut observer = cancellation.subscribe();
+
+        assert!(cancellation.cancel(CancellationSource::PeerReset));
+
+        tokio::time::timeout(Duration::from_secs(1), observer.changed())
+            .await
+            .expect("subscribed cancellation must not be lost before await")
+            .expect("cancellation sender is retained by the token");
+        assert_eq!(*observer.borrow(), Some(CancellationSource::PeerReset));
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_wakes_all_subscribers_without_lost_notifications() {
+        let cancellation = CancellationToken::new();
+        let mut observers = Vec::new();
+        for _ in 0..32 {
+            let observer = cancellation.clone();
+            observers.push(tokio::spawn(async move { observer.cancelled().await }));
+        }
+        tokio::task::yield_now().await;
+
+        assert!(cancellation.cancel(CancellationSource::ConnectionLost));
+
+        for observer in observers {
+            let source = tokio::time::timeout(Duration::from_secs(1), observer)
+                .await
+                .expect("every cancellation subscriber should wake")
+                .expect("cancellation subscriber should not panic");
+            assert_eq!(source, CancellationSource::ConnectionLost);
+        }
+    }
+
+    #[tokio::test]
+    async fn cloned_request_context_observes_deadline_cancellation() {
+        let request = RpcRequest::new("example.Greeter", "Watch", Vec::new())
+            .with_kind(RpcKind::ServerStreaming);
+        let context = RequestContext::new(
+            &request,
+            Some(std::time::Instant::now() + Duration::from_millis(1)),
+        );
+        let observer = context.clone();
+
+        let source = tokio::time::timeout(Duration::from_secs(1), observer.cancelled_signal())
+            .await
+            .expect("deadline cancellation should be observed promptly");
+
+        assert_eq!(source, CancellationSource::Deadline);
+        assert_eq!(
+            context.cancellation_source(),
+            Some(CancellationSource::Deadline)
+        );
+    }
+
+    #[test]
+    fn observing_an_expired_deadline_commits_the_first_source() {
+        let request = RpcRequest::new("example.Greeter", "Watch", Vec::new())
+            .with_kind(RpcKind::ServerStreaming);
+        let context = RequestContext::new(
+            &request,
+            Some(
+                std::time::Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("test deadline should be representable"),
+            ),
+        );
+
+        assert_eq!(
+            context.cancellation_source(),
+            Some(CancellationSource::Deadline)
+        );
+        assert!(!context.cancellation().cancel(CancellationSource::PeerReset));
+        assert_eq!(
+            context.cancellation_source(),
+            Some(CancellationSource::Deadline)
+        );
+    }
+
     #[test]
     fn default_options_use_bounded_production_limits() {
         let options = ServerOptions::new();
@@ -1945,6 +2392,29 @@ mod tests {
             assert_eq!(options.http3_path(), "/trevrpc");
             assert!(options.http3_admission().is_none());
         }
+    }
+
+    #[cfg(feature = "http3")]
+    #[test]
+    fn options_own_runtime_paths_and_allowlists() {
+        let http3_path = String::from("/owned-http3");
+        let webtransport_path = String::from("/owned-webtransport");
+        let authority = String::from("rpc.example");
+        let origin = String::from("https://app.example");
+        let options = ServerOptions::new()
+            .with_http3_path(http3_path.clone())
+            .with_webtransport_path(webtransport_path.clone())
+            .with_webtransport_allowed_authorities([authority.clone()])
+            .with_webtransport_allowed_origins([origin.clone()]);
+        drop((http3_path, webtransport_path, authority, origin));
+
+        assert_eq!(options.http3_path(), "/owned-http3");
+        assert_eq!(options.webtransport_path(), "/owned-webtransport");
+        assert_eq!(options.webtransport_allowed_authorities(), ["rpc.example"]);
+        assert_eq!(
+            options.webtransport_allowed_origins(),
+            ["https://app.example"]
+        );
     }
 
     fn allow_any_webtransport(_request: &super::WebTransportAdmissionRequest<'_>) -> bool {
@@ -2083,7 +2553,7 @@ mod tests {
             "Download",
             RpcKind::ServerStreaming,
             |_body, _requests| async move {
-                Ok(Box::new(PendingStream) as crate::BoxMessageStream<Vec<u8>>)
+                Ok(Box::pin(futures_util::stream::pending()) as crate::BoxStream<Vec<u8>>)
             },
         );
 
@@ -2162,15 +2632,6 @@ mod tests {
         assert!(response.next().await.is_none());
     }
 
-    struct PendingStream;
-
-    #[crate::async_trait]
-    impl MessageStream<Vec<u8>> for PendingStream {
-        async fn next(&mut self) -> Option<crate::Result<Vec<u8>>> {
-            std::future::pending().await
-        }
-    }
-
     #[tokio::test]
     async fn request_stream_idle_timeout_returns_unavailable() {
         let mut server = Server::new();
@@ -2195,7 +2656,7 @@ mod tests {
         let request = RpcRequest::new("example.Greeter", "Upload", Vec::new())
             .with_kind(RpcKind::ClientStreaming);
         let mut response = server
-            .handle_streaming_request(request, Box::new(PendingStream))
+            .handle_streaming_request(request, Box::pin(futures_util::stream::pending()))
             .await;
 
         let status = response
@@ -2210,22 +2671,15 @@ mod tests {
 
     #[tokio::test]
     async fn response_stream_errors_are_converted_to_status_frames() {
-        struct ErrorStream;
-
-        #[crate::async_trait]
-        impl MessageStream<Vec<u8>> for ErrorStream {
-            async fn next(&mut self) -> Option<crate::Result<Vec<u8>>> {
-                Some(Err(Error::from(crate::Status::unavailable("down"))))
-            }
-        }
-
         let mut server = Server::new();
         server.route_streaming(
             "example.Greeter",
             "Download",
             RpcKind::ServerStreaming,
             |_body, _requests| async move {
-                Ok(Box::new(ErrorStream) as crate::BoxMessageStream<Vec<u8>>)
+                Ok(Box::pin(futures_util::stream::iter([Err(Error::from(
+                    crate::Status::unavailable("down"),
+                ))])) as crate::BoxStream<Vec<u8>>)
             },
         );
 

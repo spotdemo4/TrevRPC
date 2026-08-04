@@ -1,6 +1,7 @@
 use std::error::Error;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use prost::Message;
 use prost_types::compiler::{CodeGeneratorRequest, CodeGeneratorResponse};
@@ -54,9 +55,37 @@ fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error
     let buf_config = include_str!("proto/buf.gen.yaml");
     assert!(buf_config.contains("protoc-gen-trevrpc-rust"));
 
+    let checked_in =
+        std::fs::read_to_string(manifest_dir.join("../../examples/shared/greeter.rs"))?;
+    let formatted = rustfmt_generated(content)?;
+    assert!(
+        checked_in.ends_with(&formatted),
+        "checked-in greeter bindings have drifted from generator output"
+    );
+
     compile_generated_service(content)?;
 
     Ok(())
+}
+
+fn rustfmt_generated(content: &str) -> Result<String, Box<dyn Error>> {
+    let rustfmt = std::env::var_os("RUSTFMT").unwrap_or_else(|| "rustfmt".into());
+    let mut child = Command::new(rustfmt)
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("rustfmt stdin should be piped")
+        .write_all(content.as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "rustfmt should format generated code"
+    );
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -81,6 +110,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures-util = "0.3"
 prost = "0.14.4"
 trevrpc = {{ path = "{}" }}
 "#,
@@ -89,7 +119,9 @@ trevrpc = {{ path = "{}" }}
     )?;
     std::fs::write(
         temp_dir.join("src/lib.rs"),
-        r#"#[derive(Clone, PartialEq, prost::Message)]
+        r#"use futures_util::StreamExt;
+
+#[derive(Clone, PartialEq, prost::Message)]
 pub struct HelloRequest {
     #[prost(string, tag = "1")]
     pub name: String,
@@ -111,53 +143,46 @@ impl Greeter for Service {
         &self,
         _context: trevrpc::server::RequestContext,
         request: HelloRequest,
-    ) -> core::result::Result<HelloReply, trevrpc::Status> {
-        Ok(HelloReply { message: request.name })
+    ) -> core::result::Result<trevrpc::ResponseEnvelope<HelloReply>, trevrpc::Status> {
+        Ok(trevrpc::ResponseEnvelope::new(HelloReply { message: request.name }))
     }
 
     async fn lots_of_replies(
         &self,
         _context: trevrpc::server::RequestContext,
         request: HelloRequest,
-    ) -> core::result::Result<trevrpc::BoxMessageStream<HelloReply>, trevrpc::Status> {
-        Ok(trevrpc::stream::from_iter([HelloReply { message: request.name }]))
+    ) -> core::result::Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<HelloReply>>, trevrpc::Status> {
+        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter([HelloReply {
+            message: request.name,
+        }])))
     }
 
     async fn lots_of_greetings(
         &self,
         _context: trevrpc::server::RequestContext,
-        mut requests: trevrpc::BoxMessageStream<HelloRequest>,
-    ) -> core::result::Result<HelloReply, trevrpc::Status> {
+        mut requests: trevrpc::BoxStream<HelloRequest>,
+    ) -> core::result::Result<trevrpc::ResponseEnvelope<HelloReply>, trevrpc::Status> {
         let mut names = Vec::new();
 
         while let Some(request) = requests.next().await {
             names.push(request?.name);
         }
 
-        Ok(HelloReply { message: names.join(",") })
+        Ok(trevrpc::ResponseEnvelope::new(HelloReply {
+            message: names.join(","),
+        }))
     }
 
     async fn bidi_hello(
         &self,
         _context: trevrpc::server::RequestContext,
-        requests: trevrpc::BoxMessageStream<HelloRequest>,
-    ) -> core::result::Result<trevrpc::BoxMessageStream<HelloReply>, trevrpc::Status> {
-        Ok(Box::new(BidiReplies { requests }))
-    }
-}
-
-struct BidiReplies {
-    requests: trevrpc::BoxMessageStream<HelloRequest>,
-}
-
-#[trevrpc::async_trait]
-impl trevrpc::MessageStream<HelloReply> for BidiReplies {
-    async fn next(&mut self) -> Option<trevrpc::Result<HelloReply>> {
-        self.requests.next().await.map(|request| {
+        requests: trevrpc::BoxStream<HelloRequest>,
+    ) -> core::result::Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<HelloReply>>, trevrpc::Status> {
+        Ok(trevrpc::ResponseEnvelope::new(Box::pin(requests.map(|request| {
             request.map(|request| HelloReply {
                 message: request.name,
             })
-        })
+        }))))
     }
 }
 

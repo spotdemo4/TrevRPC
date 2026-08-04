@@ -1,13 +1,13 @@
 use std::io;
 
-use bytes::Bytes;
-use prost::Message;
-
 use crate::framing::{
     STREAM_FRAME_BODY_TAG, decode_frame, decode_stream_frame_body_owned, encode_frame_with_max,
     encode_message_stream_frame_prefix, frame_body_len,
 };
-use crate::{BoxMessageStream, Error, Result, RpcStreamFrame, RpcStreamFrameKind, Status};
+use crate::{BoxStream, Error, Result, RpcStreamFrame, RpcStreamFrameKind, Status};
+use bytes::Bytes;
+use futures_util::{FutureExt, StreamExt};
+use prost::Message;
 
 pub(crate) const MESSAGE_FRAME_BATCH: usize = 32;
 
@@ -28,11 +28,6 @@ pub(crate) trait FrameRead {
         &mut self,
         bytes: &mut [u8],
     ) -> impl std::future::Future<Output = Result<Option<usize>>> + Send;
-
-    fn read_exact_frame_bytes(
-        &mut self,
-        bytes: &mut [u8],
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 pub(crate) trait FrameTrace {
@@ -146,41 +141,35 @@ where
 
 pub(crate) async fn write_request_body_frames<W, T>(
     send: &mut W,
-    request_body: &mut BoxMessageStream<Vec<u8>>,
+    request_body: &mut BoxStream<Vec<u8>>,
     max_frame_size: usize,
 ) -> Result<()>
 where
     W: FrameWrite,
     T: FrameTrace,
 {
-    if !request_body.is_non_blocking() {
-        while let Some(body) = request_body.next().await.transpose()? {
-            write_message_stream_frame::<W, T>(send, body, max_frame_size).await?;
-        }
-        return Ok(());
-    }
-
     let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     loop {
         batch.clear();
+        let Some(body) = request_body.next().await.transpose()? else {
+            return Ok(());
+        };
+        batch.push(body);
+
         let mut done = false;
         while batch.len() < MESSAGE_FRAME_BATCH {
-            if request_body.drain_ready(MESSAGE_FRAME_BATCH, &mut batch)? {
-                done = true;
-                break;
+            match request_body.next().now_or_never() {
+                Some(Some(Ok(body))) => batch.push(body),
+                Some(Some(Err(error))) => return Err(error),
+                Some(None) => {
+                    done = true;
+                    break;
+                }
+                None => break,
             }
-            if batch.len() >= MESSAGE_FRAME_BATCH {
-                break;
-            }
-            let Some(body) = request_body.next().await.transpose()? else {
-                done = true;
-                break;
-            };
-            batch.push(body);
         }
-        if !batch.is_empty() {
-            write_message_stream_frames::<W, T>(send, &mut batch, max_frame_size).await?;
-        }
+
+        write_message_stream_frames::<W, T>(send, &mut batch, max_frame_size).await?;
         if done {
             return Ok(());
         }
@@ -198,16 +187,30 @@ pub(crate) async fn read_frame<R, T, M>(recv: &mut R, max_frame_size: usize) -> 
 where
     R: FrameRead,
     T: FrameTrace,
-    M: Message + Default,
+    M: Message + Default + 'static,
 {
-    let mut header = [0; 4];
-    recv.read_exact_frame_bytes(&mut header).await?;
-
-    let len = frame_body_len(header, max_frame_size)?;
-    let body = read_body(recv, len).await?;
-    T::rx_frame::<M>(len);
+    let body = read_raw_frame_or_eof(recv, max_frame_size)
+        .await?
+        .ok_or_else(unexpected_eof)?;
+    T::rx_frame::<M>(body.len());
 
     decode_frame(&body)
+}
+
+pub(crate) async fn read_raw_frame_or_eof<R>(
+    recv: &mut R,
+    max_frame_size: usize,
+) -> Result<Option<Vec<u8>>>
+where
+    R: FrameRead,
+{
+    let mut header = [0; 4];
+    if !read_exact_or_eof(recv, &mut header).await? {
+        return Ok(None);
+    }
+
+    let len = frame_body_len(header, max_frame_size)?;
+    read_body(recv, len).await.map(Some)
 }
 
 pub(crate) async fn read_stream_frame_or_eof<R, T>(
@@ -290,7 +293,7 @@ where
         .await?
         .is_some()
     {
-        return Err(Error::from(Status::invalid_argument(format!(
+        return Err(Error::from(Status::internal(format!(
             "{stream_name} continued after terminal status"
         ))));
     }

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
@@ -22,34 +23,42 @@ struct GreeterService;
 impl greeter::Greeter for GreeterService {
     async fn say_hello(
         &self,
+        _context: trevrpc::server::RequestContext,
         request: greeter::HelloRequest,
-    ) -> core::result::Result<greeter::HelloReply, trevrpc::Status> {
-        Ok(greeter::HelloReply {
+    ) -> core::result::Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, trevrpc::Status> {
+        Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
             message: format!("hello, {}", request.name),
-        })
+        }))
     }
 
     async fn lots_of_replies(
         &self,
+        _context: trevrpc::server::RequestContext,
         request: greeter::HelloRequest,
-    ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
-        Ok(trevrpc::stream::from_iter([
-            greeter::HelloReply {
-                message: format!("hello, {}", request.name),
-            },
-            greeter::HelloReply {
-                message: format!("hello again, {}", request.name),
-            },
-            greeter::HelloReply {
-                message: format!("goodbye, {}", request.name),
-            },
-        ]))
+    ) -> core::result::Result<
+        trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
+        trevrpc::Status,
+    > {
+        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter(
+            [
+                greeter::HelloReply {
+                    message: format!("hello, {}", request.name),
+                },
+                greeter::HelloReply {
+                    message: format!("hello again, {}", request.name),
+                },
+                greeter::HelloReply {
+                    message: format!("goodbye, {}", request.name),
+                },
+            ],
+        )))
     }
 
     async fn lots_of_greetings(
         &self,
-        mut requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-    ) -> core::result::Result<greeter::HelloReply, trevrpc::Status> {
+        _context: trevrpc::server::RequestContext,
+        mut requests: trevrpc::BoxStream<greeter::HelloRequest>,
+    ) -> core::result::Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, trevrpc::Status> {
         let mut names = Vec::new();
 
         while let Some(request) = requests.next().await {
@@ -62,29 +71,27 @@ impl greeter::Greeter for GreeterService {
             format!("hello, {}", names.join(", "))
         };
 
-        Ok(greeter::HelloReply { message })
+        Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
+            message,
+        }))
     }
 
     async fn bidi_hello(
         &self,
-        requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-    ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
-        Ok(Box::new(EchoReplies { requests }))
-    }
-}
-
-struct EchoReplies {
-    requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-}
-
-#[trevrpc::async_trait]
-impl trevrpc::MessageStream<greeter::HelloReply> for EchoReplies {
-    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloReply>> {
-        self.requests.next().await.map(|request| {
+        _context: trevrpc::server::RequestContext,
+        requests: trevrpc::BoxStream<greeter::HelloRequest>,
+    ) -> core::result::Result<
+        trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
+        trevrpc::Status,
+    > {
+        let replies: trevrpc::BoxStream<greeter::HelloReply> = Box::pin(requests.map(|request| {
             request.map(|request| greeter::HelloReply {
                 message: format!("stream hello, {}", request.name),
             })
-        })
+        }));
+        let mut metadata = trevrpc::Metadata::new();
+        metadata.insert("x-trevrpc-example".to_owned(), b"complete".to_vec());
+        Ok(trevrpc::ResponseEnvelope::new(replies).with_metadata(metadata))
     }
 }
 
@@ -100,7 +107,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let certificate_path = cert::certificate_path()?;
     write_certificate(&identity, &certificate_path)?;
     let webtransport_authorities =
-        env_list("TREVRPC_EXAMPLE_AUTHORITIES").unwrap_or_else(|| webtransport_authorities(addr));
+        env_list("TREVRPC_EXAMPLE_AUTHORITIES").unwrap_or_else(|| vec![addr.to_string()]);
     let browser_example_origin = env_or("TREVRPC_EXAMPLE_ORIGIN", DEFAULT_BROWSER_EXAMPLE_ORIGIN);
     let auth_token = env_or("TREVRPC_EXAMPLE_TOKEN", DEFAULT_AUTH_TOKEN);
 
@@ -111,9 +118,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_max_concurrent_requests(Some(1024))
         .with_http3_enabled(true)
         .with_webtransport_allowed_authorities(webtransport_authorities)
-        .with_webtransport_allowed_origins(leak_slice([browser_example_origin]));
+        .with_webtransport_allowed_origins([browser_example_origin]);
     server.set_options(options);
-    server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(auth_token));
+    server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(
+        &auth_token,
+    ));
     greeter::register_greeter(&mut server, GreeterService);
 
     let endpoint = make_endpoint(addr, &identity, server.options())?;
@@ -177,32 +186,23 @@ fn make_endpoint(
     Ok(quinn::Endpoint::server(server_config, addr)?)
 }
 
-fn webtransport_authorities(addr: SocketAddr) -> &'static [&'static str] {
-    let authority: &'static str = Box::leak(addr.to_string().into_boxed_str());
-    leak_slice([authority])
-}
-
-fn env_or(name: &str, fallback: &'static str) -> &'static str {
+fn env_or(name: &str, fallback: &str) -> String {
     match std::env::var(name) {
-        Ok(value) if !value.is_empty() => Box::leak(value.into_boxed_str()),
-        _ => fallback,
+        Ok(value) if !value.is_empty() => value,
+        _ => fallback.to_owned(),
     }
 }
 
-fn env_list(name: &str) -> Option<&'static [&'static str]> {
+fn env_list(name: &str) -> Option<Vec<String>> {
     let values = std::env::var(name).ok()?;
     let values = values
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| Box::leak(value.to_owned().into_boxed_str()) as &'static str)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
 
-    (!values.is_empty()).then(|| Box::leak(values.into_boxed_slice()) as &'static [&'static str])
-}
-
-fn leak_slice<const N: usize>(values: [&'static str; N]) -> &'static [&'static str] {
-    Box::leak(Vec::from(values).into_boxed_slice())
+    (!values.is_empty()).then_some(values)
 }
 
 fn write_certificate(

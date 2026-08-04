@@ -6,18 +6,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use futures_util::StreamExt;
 use prost::Message;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use quinn::rustls::server::WebPkiClientVerifier;
-use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
-use trevrpc::client::{CallOptions, RpcTransport};
+use trevrpc::client::{CallOptions, RpcTransport, StreamingRpcTransport};
 use trevrpc::server::{
-    MetadataValueAuthorizer, Metrics, RpcFinished, RpcStarted, Server, ServerOptions,
+    CancellationSource, MetadataValueAuthorizer, Metrics, RequestContext, RpcFinished, RpcStarted,
+    Server, ServerOptions,
 };
-use trevrpc::{Code, MessageStream, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+use trevrpc::{Code, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
+#[allow(dead_code)]
 #[path = "../examples/shared/greeter.rs"]
 mod greeter;
 
@@ -44,89 +47,91 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 struct TestGreeter;
 
+fn successful_response<T>(shape: &str, response: T) -> trevrpc::ResponseEnvelope<T> {
+    let mut metadata = trevrpc::Metadata::new();
+    metadata.insert("x-rpc-shape".to_owned(), shape.as_bytes().to_vec());
+    trevrpc::ResponseEnvelope::new(response).with_metadata(metadata)
+}
+
 #[trevrpc::async_trait]
 impl greeter::Greeter for TestGreeter {
     async fn say_hello(
         &self,
+        _context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> core::result::Result<greeter::HelloReply, Status> {
-        Ok(greeter::HelloReply {
-            message: format!("hello, {}", request.name),
-        })
+    ) -> core::result::Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
+        Ok(successful_response(
+            "unary",
+            greeter::HelloReply {
+                message: format!("hello, {}", request.name),
+            },
+        ))
     }
 
     async fn lots_of_replies(
         &self,
+        _context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, Status> {
+    ) -> core::result::Result<
+        trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
+        Status,
+    > {
         if request.name == "cancel" {
-            return Ok(Box::new(FirstThenPendingReply {
-                first: Some(greeter::HelloReply {
+            let replies: trevrpc::BoxStream<greeter::HelloReply> = Box::pin(
+                trevrpc::stream::from_iter([greeter::HelloReply {
                     message: "first".to_owned(),
-                }),
-            }));
+                }])
+                .chain(futures_util::stream::pending()),
+            );
+            return Ok(successful_response("server-streaming", replies));
         }
 
-        Ok(trevrpc::stream::from_iter([
-            greeter::HelloReply {
-                message: format!("hello, {}", request.name),
-            },
-            greeter::HelloReply {
-                message: format!("goodbye, {}", request.name),
-            },
-        ]))
+        Ok(successful_response(
+            "server-streaming",
+            trevrpc::stream::from_iter([
+                greeter::HelloReply {
+                    message: format!("hello, {}", request.name),
+                },
+                greeter::HelloReply {
+                    message: format!("goodbye, {}", request.name),
+                },
+            ]),
+        ))
     }
 
     async fn lots_of_greetings(
         &self,
-        mut requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-    ) -> core::result::Result<greeter::HelloReply, Status> {
+        _context: RequestContext,
+        mut requests: trevrpc::BoxStream<greeter::HelloRequest>,
+    ) -> core::result::Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
         let mut names = Vec::new();
 
         while let Some(request) = requests.next().await {
             names.push(request?.name);
         }
 
-        Ok(greeter::HelloReply {
-            message: names.join(","),
-        })
+        Ok(successful_response(
+            "client-streaming",
+            greeter::HelloReply {
+                message: names.join(","),
+            },
+        ))
     }
 
     async fn bidi_hello(
         &self,
-        requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-    ) -> core::result::Result<trevrpc::BoxMessageStream<greeter::HelloReply>, Status> {
-        Ok(Box::new(BidiReplies { requests }))
-    }
-}
-
-struct FirstThenPendingReply {
-    first: Option<greeter::HelloReply>,
-}
-
-#[trevrpc::async_trait]
-impl MessageStream<greeter::HelloReply> for FirstThenPendingReply {
-    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloReply>> {
-        if let Some(first) = self.first.take() {
-            return Some(Ok(first));
-        }
-
-        std::future::pending().await
-    }
-}
-
-struct BidiReplies {
-    requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-}
-
-#[trevrpc::async_trait]
-impl MessageStream<greeter::HelloReply> for BidiReplies {
-    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloReply>> {
-        self.requests.next().await.map(|request| {
+        _context: RequestContext,
+        requests: trevrpc::BoxStream<greeter::HelloRequest>,
+    ) -> core::result::Result<
+        trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
+        Status,
+    > {
+        let replies: trevrpc::BoxStream<greeter::HelloReply> = Box::pin(requests.map(|request| {
             request.map(|request| greeter::HelloReply {
                 message: format!("echo, {}", request.name),
             })
-        })
+        }));
+        Ok(successful_response("bidirectional-streaming", replies))
     }
 }
 
@@ -231,12 +236,15 @@ impl RpcTransport for Http3Transport {
         let body = read_http3_body(&mut stream).await?;
         decode_single_frame(&body)
     }
+}
 
+#[trevrpc::async_trait]
+impl StreamingRpcTransport for Http3Transport {
     async fn streaming_call(
         &self,
         request: RpcRequest,
-        mut request_body: trevrpc::BoxMessageStream<Vec<u8>>,
-    ) -> trevrpc::Result<trevrpc::BoxMessageStream<RpcStreamFrame>> {
+        mut request_body: trevrpc::BoxStream<Vec<u8>>,
+    ) -> trevrpc::Result<trevrpc::BoxStream<RpcStreamFrame>> {
         let stream = self
             .open(http::Method::POST, "/trevrpc", Some("application/trevrpc"))
             .await?;
@@ -261,61 +269,37 @@ impl RpcTransport for Http3Transport {
             .await
             .map_err(trevrpc::Error::transport)?;
         validate_http3_response(&response)?;
-        Ok(Box::new(Http3ResponseStream {
-            recv,
-            chunk: Bytes::new(),
-            write_task: Some(write_task),
-            done: false,
-        }))
+        Ok(http3_response_stream(recv, write_task))
     }
 }
 
-struct Http3ResponseStream {
+fn http3_response_stream(
     recv: H3RecvStream,
-    chunk: Bytes,
-    write_task: Option<JoinHandle<trevrpc::Result<()>>>,
-    done: bool,
-}
-
-#[trevrpc::async_trait]
-impl MessageStream<RpcStreamFrame> for Http3ResponseStream {
-    async fn next(&mut self) -> Option<trevrpc::Result<RpcStreamFrame>> {
-        if self.done {
-            return None;
-        }
-        let body = match read_http3_frame_body(&mut self.recv, &mut self.chunk).await {
-            Ok(Some(body)) => body,
-            Ok(None) => {
-                self.done = true;
-                return None;
-            }
-            Err(error) => {
-                self.done = true;
-                return Some(Err(error));
-            }
-        };
-        let frame = match trevrpc::framing::decode_stream_frame_body(&body) {
-            Ok(frame) => frame,
-            Err(error) => return Some(Err(error)),
-        };
-        if frame.frame_kind() == Some(trevrpc::RpcStreamFrameKind::Status) {
-            self.done = true;
-            if let Some(write_task) = self.write_task.take()
-                && !write_task.is_finished()
+    write_task: JoinHandle<trevrpc::Result<()>>,
+) -> trevrpc::BoxStream<RpcStreamFrame> {
+    Box::pin(futures_util::stream::unfold(
+        (recv, Bytes::new(), Some(write_task)),
+        |(mut recv, mut chunk, mut write_task)| async move {
+            let body = match read_http3_frame_body(&mut recv, &mut chunk).await {
+                Ok(Some(body)) => body,
+                Ok(None) => return None,
+                Err(error) => {
+                    return Some((Err(error), (recv, chunk, write_task)));
+                }
+            };
+            let frame = match trevrpc::framing::decode_stream_frame_body(&body) {
+                Ok(frame) => frame,
+                Err(error) => return Some((Err(error), (recv, chunk, write_task))),
+            };
+            if frame.frame_kind() == Some(trevrpc::RpcStreamFrameKind::Status)
+                && let Some(task) = write_task.take()
+                && !task.is_finished()
             {
-                write_task.abort();
+                task.abort();
             }
-        }
-        Some(Ok(frame))
-    }
-}
-
-impl Drop for Http3ResponseStream {
-    fn drop(&mut self) {
-        if let Some(write_task) = &self.write_task {
-            write_task.abort();
-        }
-    }
+            Some((Ok(frame), (recv, chunk, write_task)))
+        },
+    ))
 }
 
 impl RunningWebTransportServer {
@@ -435,7 +419,7 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let reply = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "unary".to_owned(),
             },
@@ -445,7 +429,7 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
     assert_eq!(reply.message, "hello, unary");
 
     let mut replies = client
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "server stream".to_owned(),
             },
@@ -469,6 +453,111 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
 }
 
 #[tokio::test]
+async fn quinn_preserves_success_metadata_for_every_rpc_shape() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let unary = client
+        .say_hello_envelope_with_options(
+            greeter::HelloRequest {
+                name: "metadata".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_response_shape(unary.metadata(), "unary");
+
+    let mut server_stream = client
+        .lots_of_replies_with_options(
+            greeter::HelloRequest {
+                name: "metadata".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    while let Some(reply) = server_stream.next().await {
+        reply?;
+    }
+    assert_response_shape(
+        server_stream
+            .terminal_metadata()
+            .expect("clean server stream should retain terminal metadata"),
+        "server-streaming",
+    );
+
+    let client_stream = client
+        .lots_of_greetings_with_options(authenticated_options())
+        .await?;
+    client_stream
+        .send(greeter::HelloRequest {
+            name: "metadata".to_owned(),
+        })
+        .await?;
+    let client_stream = client_stream.close_and_recv_envelope().await?;
+    assert_response_shape(client_stream.metadata(), "client-streaming");
+
+    let bidi = client
+        .bidi_hello_with_options(authenticated_options())
+        .await?;
+    let (sender, mut responses) = bidi.split();
+    let send_task = tokio::spawn(async move {
+        sender
+            .send(greeter::HelloRequest {
+                name: "metadata".to_owned(),
+            })
+            .await?;
+        sender.finish()
+    });
+    let receive_task = tokio::spawn(async move {
+        while let Some(response) = responses.next().await {
+            response?;
+        }
+        Ok::<_, trevrpc::Error>(
+            responses
+                .terminal_metadata()
+                .cloned()
+                .expect("clean bidi stream should retain terminal metadata"),
+        )
+    });
+    send_task.await??;
+    let bidi_metadata = receive_task.await??;
+    assert_response_shape(&bidi_metadata, "bidirectional-streaming");
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+fn assert_response_shape(metadata: &trevrpc::Metadata, expected: &str) {
+    assert_eq!(
+        metadata.get("x-rpc-shape").map(Vec::as_slice),
+        Some(expected.as_bytes())
+    );
+}
+
+#[tokio::test]
+async fn dedicated_webtransport_round_trips_unary() -> TestResult {
+    let server = spawn_dedicated_webtransport_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+
+    let reply = greeter_client
+        .say_hello_with_options(
+            greeter::HelloRequest {
+                name: "dedicated".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, dedicated");
+
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
@@ -476,7 +565,7 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
     let (endpoint, connection, client) = connect_webtransport_client(&server).await?;
 
     let reply = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "unary".to_owned(),
             },
@@ -486,7 +575,7 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
     assert_eq!(reply.message, "hello, unary");
 
     let mut replies = client
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "server stream".to_owned(),
             },
@@ -521,7 +610,7 @@ async fn managed_webtransport_channel_round_trips_unary() -> TestResult {
     let client = greeter::GreeterClient::new(channel.clone());
 
     let reply = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "channel WebTransport".to_owned(),
             },
@@ -548,7 +637,7 @@ async fn managed_webtransport_channel_round_trips_unary() -> TestResult {
     .await?;
     let error = tokio::time::timeout(
         Duration::from_millis(20),
-        client.say_hello(
+        client.say_hello_with_options(
             greeter::HelloRequest {
                 name: "must fail fast".to_owned(),
             },
@@ -572,7 +661,7 @@ async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let (endpoint, connection, client) = connect_http3_client(&server).await?;
 
     let reply = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "unary".to_owned(),
             },
@@ -582,7 +671,7 @@ async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
     assert_eq!(reply.message, "hello, unary");
 
     let mut replies = client
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "server stream".to_owned(),
             },
@@ -617,7 +706,7 @@ async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResul
         connection.clone(),
     ));
     let quinn_reply = quinn_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "quinn".to_owned(),
             },
@@ -630,7 +719,7 @@ async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResul
     let (webtransport_client, session, greeter_client) =
         connect_webtransport_client(&server).await?;
     let webtransport_reply = greeter_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "webtransport".to_owned(),
             },
@@ -641,7 +730,7 @@ async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResul
 
     let (http3_endpoint, http3_connection, http3_client) = connect_http3_client(&server).await?;
     let http3_reply = http3_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "http3".to_owned(),
             },
@@ -651,7 +740,7 @@ async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResul
     assert_eq!(http3_reply.message, "hello, http3");
 
     let webtransport_reply = greeter_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "webtransport interleaved".to_owned(),
             },
@@ -663,7 +752,7 @@ async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResul
         "hello, webtransport interleaved"
     );
     let http3_reply = http3_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "http3 interleaved".to_owned(),
             },
@@ -692,7 +781,7 @@ async fn unified_h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs(
     let (http3_endpoint, http3_connection, http3_rpc) = connect_http3_client(&server).await?;
 
     let mut webtransport_replies = webtransport_rpc
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "cancel".to_owned(),
             },
@@ -700,7 +789,7 @@ async fn unified_h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs(
         )
         .await?;
     let mut http3_replies = http3_rpc
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "cancel".to_owned(),
             },
@@ -818,22 +907,23 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
 }
 
 #[tokio::test]
-async fn http3_enforces_stream_limits_and_detects_cancellation() -> TestResult {
-    let metrics = RecordingMetrics::default();
-    let observed_metrics = metrics.clone();
+async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult {
+    let (source_tx, _source_rx) = mpsc::unbounded_channel();
     let server = spawn_webtransport_greeter_server(move |server| {
         server.set_options(
             fast_server_options()
                 .with_http3_enabled(true)
                 .with_max_stream_messages(Some(1)),
         );
-        server.set_metrics(metrics);
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+        register_cancellation_probe_route(server, source_tx.clone());
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
     let client = greeter::GreeterClient::new(transport.clone());
 
-    let mut call = client.lots_of_greetings(authenticated_options()).await?;
+    let call = client
+        .lots_of_greetings_with_options(authenticated_options())
+        .await?;
     call.send(greeter::HelloRequest {
         name: "one".to_owned(),
     })
@@ -848,16 +938,9 @@ async fn http3_enforces_stream_limits_and_detects_cancellation() -> TestResult {
         .expect_err("HTTP/3 request stream should exceed message limit");
     assert_eq!(error.into_status().code(), Code::ResourceExhausted);
 
-    let mut request = RpcRequest::new(
-        greeter::GreeterClient::<()>::SERVICE,
-        "LotsOfReplies",
-        greeter::HelloRequest {
-            name: "cancel".to_owned(),
-        }
-        .encode_to_vec(),
-    )
-    .with_kind(RpcKind::ServerStreaming)
-    .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
+    let mut request = RpcRequest::new("lifecycle.Probe", "Watch", Vec::new())
+        .with_kind(RpcKind::ServerStreaming)
+        .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
     request.metadata.insert(
         "authorization".to_owned(),
         format!("Bearer {AUTH_TOKEN}").into_bytes(),
@@ -876,18 +959,16 @@ async fn http3_enforces_stream_limits_and_detects_cancellation() -> TestResult {
     let first = trevrpc::framing::decode_stream_frame_body(&first)?;
     assert_eq!(
         greeter::HelloReply::decode(first.body.as_slice())?.message,
-        "first"
+        "ready"
     );
+    // h3 0.0.8 does not expose an independent request-reset waiter, and
+    // h3-quinn 0.0.10 can panic if `stop_sending` races a pending body read.
+    // The server must still contain the reset to this RPC and keep the
+    // connection usable without an unbounded detached observer.
     send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
-    tokio::time::timeout(
-        Duration::from_millis(500),
-        observed_metrics.wait_for_code(Code::Cancelled),
-    )
-    .await
-    .expect("HTTP/3 request reset should promptly cancel the handler");
 
     let reply = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "after cancellation".to_owned(),
             },
@@ -933,7 +1014,7 @@ async fn webtransport_rejects_browser_origin_without_allowlist() -> TestResult {
 #[tokio::test]
 async fn webtransport_allows_configured_browser_origin() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
-        server.set_webtransport_allowed_origins(&["https://example.invalid"]);
+        server.set_webtransport_allowed_origins(["https://example.invalid"]);
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let client = make_webtransport_client(&server)?;
@@ -948,7 +1029,7 @@ async fn webtransport_allows_configured_browser_origin() -> TestResult {
     let greeter_client = greeter::GreeterClient::new(transport);
 
     let reply = greeter_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "origin".to_owned(),
             },
@@ -984,7 +1065,7 @@ async fn webtransport_admission_receives_generic_request_headers() -> TestResult
     let session = client.connect(allowed).await?;
     let rpc = greeter::GreeterClient::new(trevrpc::advanced::RawWebTransport::new(session.clone()));
     let reply = rpc
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "admitted".to_owned(),
             },
@@ -1000,7 +1081,7 @@ async fn webtransport_admission_receives_generic_request_headers() -> TestResult
 #[tokio::test]
 async fn webtransport_rejects_unexpected_authority_when_allowlist_is_set() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
-        server.set_webtransport_allowed_authorities(&["expected.example"]);
+        server.set_webtransport_allowed_authorities(["expected.example"]);
     })?;
     let client = make_webtransport_client(&server)?;
     let request =
@@ -1020,7 +1101,7 @@ async fn quinn_auth_failures_return_status_errors() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let error = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "missing auth".to_owned(),
             },
@@ -1063,7 +1144,9 @@ async fn quinn_request_stream_limits_return_resource_exhausted() -> TestResult {
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
 
-    let mut call = client.lots_of_greetings(authenticated_options()).await?;
+    let call = client
+        .lots_of_greetings_with_options(authenticated_options())
+        .await?;
     call.send(greeter::HelloRequest {
         name: "one".to_owned(),
     })
@@ -1091,7 +1174,7 @@ async fn quinn_response_stream_limits_return_resource_exhausted() -> TestResult 
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let mut replies = client
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "limited".to_owned(),
             },
@@ -1203,6 +1286,81 @@ async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
 }
 
 #[tokio::test]
+async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+    let server = spawn_greeter_server(move |server| {
+        server.set_options(
+            fast_server_options()
+                .with_max_stream_messages(Some(0))
+                .with_stream_idle_timeout(None),
+        );
+        server.set_metrics(metrics);
+        server.route_streaming(
+            "lifecycle.LateFailure",
+            "Upload",
+            RpcKind::ClientStreaming,
+            move |_body, requests| {
+                let ready_tx = ready_tx.clone();
+                async move {
+                    let _ = ready_tx.send(());
+                    Ok(Box::pin(futures_util::stream::unfold(
+                        requests,
+                        |requests| async move {
+                            let _requests = requests;
+                            std::future::pending().await
+                        },
+                    )) as trevrpc::BoxStream<Vec<u8>>)
+                }
+            },
+        );
+    })?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let request = RpcRequest::new("lifecycle.LateFailure", "Upload", Vec::new())
+        .with_kind(RpcKind::ClientStreaming);
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    tokio::time::timeout(TEST_TIMEOUT, ready_rx.recv())
+        .await?
+        .expect("handler should return its pending response stream");
+
+    trevrpc::quinn::write_frame(
+        &mut send,
+        &RpcStreamFrame::message(b"over limit".to_vec()),
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    let status = trevrpc::quinn::read_frame::<RpcStreamFrame>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    assert_eq!(
+        status.frame_kind(),
+        Some(trevrpc::RpcStreamFrameKind::Status)
+    );
+    assert_eq!(Code::from_u32(status.status), Code::ResourceExhausted);
+    read_quinn_fin(&mut recv).await?;
+    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped())
+        .await??
+        .expect("server should stop the rejected upload");
+    assert_eq!(stopped.into_inner(), 1);
+    observed_metrics
+        .wait_for_code(Code::ResourceExhausted)
+        .await;
+    assert_eq!(observed_metrics.codes(), vec![Code::ResourceExhausted]);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_options(
@@ -1257,7 +1415,7 @@ async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let mut replies = client
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "cancel".to_owned(),
             },
@@ -1278,25 +1436,80 @@ async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
 }
 
 #[tokio::test]
-async fn webtransport_request_reset_cancels_only_one_rpc() -> TestResult {
-    let metrics = RecordingMetrics::default();
-    let server_metrics = metrics.clone();
+async fn quinn_response_drop_reports_peer_reset_to_request_context() -> TestResult {
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_greeter_server(move |server| {
+        register_cancellation_probe_route(server, source_tx.clone());
+    })?;
+    let (endpoint, connection, _) = connect_client(&server).await?;
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
+    let mut responses = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+        &transport,
+        "lifecycle.Probe",
+        "Watch",
+        &greeter::HelloRequest::default(),
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+    )
+    .await?;
+    responses
+        .next()
+        .await
+        .expect("probe should yield its first response")?;
+
+    drop(responses);
+
+    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
+        .await?
+        .expect("probe should report a cancellation source");
+    assert_eq!(source, CancellationSource::PeerReset);
+
+    close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn quinn_shutdown_reports_server_shutdown_to_request_context() -> TestResult {
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_greeter_server(move |server| {
+        register_cancellation_probe_route(server, source_tx.clone());
+    })?;
+    let (_endpoint, connection, _) = connect_client(&server).await?;
+    let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
+    let mut responses = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+        &transport,
+        "lifecycle.Probe",
+        "Watch",
+        &greeter::HelloRequest::default(),
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+    )
+    .await?;
+    responses
+        .next()
+        .await
+        .expect("probe should yield its first response")?;
+
+    let shutdown = tokio::spawn(server.shutdown());
+    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
+        .await?
+        .expect("probe should report a cancellation source");
+    assert_eq!(source, CancellationSource::ServerShutdown);
+    shutdown.await??;
+    drop(responses);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unified_webtransport_request_reset_is_contained() -> TestResult {
+    let (source_tx, _source_rx) = mpsc::unbounded_channel();
     let server = spawn_webtransport_greeter_server(move |server| {
-        server.set_metrics(server_metrics);
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+        register_cancellation_probe_route(server, source_tx.clone());
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
     let (mut send, mut recv) = session.open_bi().await?;
-    let mut request = RpcRequest::new(
-        greeter::GreeterClient::<()>::SERVICE,
-        "LotsOfReplies",
-        greeter::HelloRequest {
-            name: "cancel".to_owned(),
-        }
-        .encode_to_vec(),
-    )
-    .with_kind(RpcKind::ServerStreaming)
-    .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
+    let mut request = RpcRequest::new("lifecycle.Probe", "Watch", Vec::new())
+        .with_kind(RpcKind::ServerStreaming)
+        .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
     request.metadata.insert(
         "authorization".to_owned(),
         format!("Bearer {AUTH_TOKEN}").into_bytes(),
@@ -1314,18 +1527,15 @@ async fn webtransport_request_reset_cancels_only_one_rpc() -> TestResult {
     .await?;
     assert_eq!(
         greeter::HelloReply::decode(first.body.as_slice())?.message,
-        "first"
+        "ready"
     );
 
+    // The unified h3-WebTransport API has no independent reset observer for
+    // a request body read. Contain the reset to this RPC and preserve the
+    // session; dedicated WebTransport reset cancellation is covered below.
     send.reset(1)?;
-    tokio::time::timeout(
-        Duration::from_millis(500),
-        metrics.wait_for_code(Code::Cancelled),
-    )
-    .await
-    .expect("WebTransport request reset should promptly cancel the handler");
     let reply = greeter_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "after cancellation".to_owned(),
             },
@@ -1340,6 +1550,107 @@ async fn webtransport_request_reset_cancels_only_one_rpc() -> TestResult {
 }
 
 #[tokio::test]
+async fn dedicated_webtransport_request_reset_cancels_only_one_rpc() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let server_metrics = metrics.clone();
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_dedicated_webtransport_greeter_server(move |server| {
+        server.set_metrics(server_metrics);
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+        register_cancellation_probe_route(server, source_tx.clone());
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+    let mut request = RpcRequest::new("lifecycle.Probe", "Watch", Vec::new())
+        .with_kind(RpcKind::ServerStreaming)
+        .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
+    request.metadata.insert(
+        "authorization".to_owned(),
+        format!("Bearer {AUTH_TOKEN}").into_bytes(),
+    );
+    trevrpc::webtransport::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    let first = trevrpc::webtransport::read_frame::<RpcStreamFrame>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    assert_eq!(
+        greeter::HelloReply::decode(first.body.as_slice())?.message,
+        "ready"
+    );
+
+    send.reset(1)?;
+    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
+        .await?
+        .expect("dedicated WebTransport probe should report a cancellation source");
+    assert_eq!(source, CancellationSource::PeerReset);
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        metrics.wait_for_code(Code::Cancelled),
+    )
+    .await
+    .expect("dedicated WebTransport reset should promptly cancel the handler");
+    let reply = greeter_client
+        .say_hello_with_options(
+            greeter::HelloRequest {
+                name: "after cancellation".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, after cancellation");
+    drop(recv);
+
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn dedicated_webtransport_session_close_reports_connection_loss() -> TestResult {
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_dedicated_webtransport_greeter_server(move |server| {
+        register_cancellation_probe_route(server, source_tx.clone());
+    })?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+    let request = RpcRequest::new("lifecycle.Probe", "Watch", Vec::new())
+        .with_kind(RpcKind::ServerStreaming)
+        .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
+    trevrpc::webtransport::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    let first = trevrpc::webtransport::read_frame::<RpcStreamFrame>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    assert_eq!(
+        greeter::HelloReply::decode(first.body.as_slice())?.message,
+        "ready"
+    );
+
+    session.close(7, b"adversarial session close");
+    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
+        .await?
+        .expect("dedicated WebTransport probe should report a cancellation source");
+    assert_eq!(source, CancellationSource::ConnectionLost);
+    tokio::time::timeout(TEST_TIMEOUT, session.closed())
+        .await
+        .expect("client session should close");
+    drop((client, send, recv));
+
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_server_streaming_deadline_while_response_pending() -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
@@ -1347,7 +1658,7 @@ async fn quinn_server_streaming_deadline_while_response_pending() -> TestResult 
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let mut replies = client
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "cancel".to_owned(),
             },
@@ -1379,7 +1690,7 @@ async fn webtransport_server_streaming_deadline_while_response_pending() -> Test
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
 
     let mut replies = greeter_client
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "cancel".to_owned(),
             },
@@ -1411,7 +1722,7 @@ async fn quinn_client_streaming_deadline_drops_pending_upload() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let call = client
-        .lots_of_greetings(short_authenticated_options())
+        .lots_of_greetings_with_options(short_authenticated_options())
         .await?;
     tokio::time::sleep(Duration::from_millis(60)).await;
     let error = call
@@ -1432,7 +1743,7 @@ async fn webtransport_client_streaming_deadline_drops_pending_upload() -> TestRe
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
 
     let call = greeter_client
-        .lots_of_greetings(short_authenticated_options())
+        .lots_of_greetings_with_options(short_authenticated_options())
         .await?;
     tokio::time::sleep(Duration::from_millis(60)).await;
     let error = call
@@ -1452,7 +1763,9 @@ async fn quinn_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
 
-    let mut replies = client.bidi_hello(short_authenticated_options()).await?;
+    let mut replies = client
+        .bidi_hello_with_options(short_authenticated_options())
+        .await?;
     tokio::time::sleep(Duration::from_millis(60)).await;
     let error = replies
         .recv()
@@ -1472,7 +1785,7 @@ async fn webtransport_bidi_deadline_drops_pending_upload_and_response() -> TestR
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
 
     let mut replies = greeter_client
-        .bidi_hello(short_authenticated_options())
+        .bidi_hello_with_options(short_authenticated_options())
         .await?;
     tokio::time::sleep(Duration::from_millis(60)).await;
     let error = replies
@@ -1564,7 +1877,7 @@ async fn quinn_unary_request_fin_is_drained_without_stop_sending() -> TestResult
     );
 
     let concurrent = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "concurrent".to_owned(),
             },
@@ -1587,6 +1900,8 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
     let (server_endpoint, cert_der) = make_server_endpoint(&fast_server_options())?;
     let server_addr = server_endpoint.local_addr()?;
     let (stopped_tx, stopped_rx) = oneshot::channel();
+    let (status_written_tx, status_written_rx) = oneshot::channel();
+    let (finish_tx, finish_rx) = oneshot::channel();
     let server_task = tokio::spawn(async move {
         let incoming = tokio::time::timeout(TEST_TIMEOUT, server_endpoint.accept())
             .await?
@@ -1607,7 +1922,8 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
             trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
         )
         .await?;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = status_written_tx.send(());
+        let _ = finish_rx.await;
         send.finish()?;
         let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
         let _ = stopped_tx.send(stopped);
@@ -1626,9 +1942,21 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
         )
         .await?;
 
-    let frame = tokio::time::timeout(TEST_TIMEOUT, response.next())
-        .await?
-        .expect("response status should arrive")?;
+    let (next_started_tx, next_started_rx) = oneshot::channel();
+    let next_task = tokio::spawn(async move {
+        let _ = next_started_tx.send(());
+        let item = response.next().await;
+        (item, response)
+    });
+    next_started_rx.await?;
+    status_written_rx.await?;
+    assert!(
+        !next_task.is_finished(),
+        "terminal response status must wait for clean response FIN"
+    );
+    let _ = finish_tx.send(());
+    let (frame, response) = tokio::time::timeout(TEST_TIMEOUT, next_task).await??;
+    let frame = frame.expect("response status should arrive")?;
 
     assert_eq!(
         frame.frame_kind(),
@@ -1695,7 +2023,7 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
         .await?
         .expect("post-terminal frame should produce an error")
         .expect_err("post-terminal frame should be rejected");
-    assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    assert_eq!(error.into_status().code(), Code::Internal);
     drop(response);
     let _ = done_tx.send(());
 
@@ -1728,14 +2056,25 @@ async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> Test
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
     )
     .await?;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    send.finish()?;
 
-    let frame = trevrpc::quinn::read_frame::<RpcStreamFrame>(
-        &mut recv,
-        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-    )
-    .await?;
+    let (read_started_tx, read_started_rx) = oneshot::channel();
+    let response_task = tokio::spawn(async move {
+        let _ = read_started_tx.send(());
+        let frame = trevrpc::quinn::read_frame::<RpcStreamFrame>(
+            &mut recv,
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        )
+        .await;
+        (frame, recv)
+    });
+    read_started_rx.await?;
+    assert!(
+        !response_task.is_finished(),
+        "terminal request status must wait for clean request FIN"
+    );
+    send.finish()?;
+    let (frame, mut recv) = tokio::time::timeout(TEST_TIMEOUT, response_task).await??;
+    let frame = frame?;
     assert_eq!(
         frame.frame_kind(),
         Some(trevrpc::RpcStreamFrameKind::Status)
@@ -1810,7 +2149,7 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
     server.shutdown().await?;
 
     let error = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "after shutdown".to_owned(),
             },
@@ -1835,7 +2174,7 @@ async fn webtransport_shutdown_closes_active_sessions() -> TestResult {
         .expect("client should observe WebTransport server shutdown");
 
     let error = greeter_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "after shutdown".to_owned(),
             },
@@ -1963,7 +2302,7 @@ async fn quinn_local_close_maps_to_cancelled() -> TestResult {
     connection.close(0_u32.into(), b"client closed");
 
     let error = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "after local close".to_owned(),
             },
@@ -2260,7 +2599,7 @@ async fn quinn_large_partial_initial_body_does_not_hold_request_permit() -> Test
     send.write_all(&[1]).await?;
 
     let reply = client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "after partial".to_owned(),
             },
@@ -2292,7 +2631,7 @@ async fn webtransport_large_partial_initial_body_does_not_hold_request_permit() 
     send.write_all(&[1]).await?;
 
     let reply = greeter_client
-        .say_hello(
+        .say_hello_with_options(
             greeter::HelloRequest {
                 name: "after partial".to_owned(),
             },
@@ -2328,7 +2667,7 @@ async fn quinn_oversized_initial_frame_is_rejected_before_body() -> TestResult {
 #[tokio::test]
 async fn webtransport_oversized_initial_frame_is_rejected_before_body() -> TestResult {
     let server = spawn_webtransport_greeter_server(|_| {})?;
-    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
     let (mut send, mut recv) = session.open_bi().await?;
     let oversized = (trevrpc::framing::DEFAULT_MAX_FRAME_SIZE + 1)
         .try_into()
@@ -2339,10 +2678,21 @@ async fn webtransport_oversized_initial_frame_is_rejected_before_body() -> TestR
 
     assert_eq!(Code::from_u32(response.status), Code::ResourceExhausted);
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    assert!(
-        stopped.is_some(),
-        "server should stop the oversized request stream"
+    assert_eq!(
+        stopped, None,
+        "unified h3-WebTransport should use bounded stream drop instead of unsafe stop_sending"
     );
+
+    let reply = greeter_client
+        .say_hello_with_options(
+            greeter::HelloRequest {
+                name: "after oversized".to_owned(),
+            },
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        )
+        .await?;
+    assert_eq!(reply.message, "hello, after oversized");
+
     close_webtransport_client(client, session).await;
     server.shutdown().await
 }
@@ -2360,7 +2710,7 @@ async fn quinn_handles_many_concurrent_unary_calls() -> TestResult {
         calls.spawn(async move {
             let name = format!("concurrent-{index}");
             let response = client
-                .say_hello(
+                .say_hello_with_options(
                     greeter::HelloRequest { name: name.clone() },
                     authenticated_options(),
                 )
@@ -2438,7 +2788,7 @@ async fn run_mixed_call(
         0 => {
             let name = format!("load-unary-{index}");
             let response = client
-                .say_hello(
+                .say_hello_with_options(
                     greeter::HelloRequest { name: name.clone() },
                     authenticated_options(),
                 )
@@ -2448,7 +2798,7 @@ async fn run_mixed_call(
         1 => {
             let name = format!("load-server-stream-{index}");
             let mut responses = client
-                .lots_of_replies(
+                .lots_of_replies_with_options(
                     greeter::HelloRequest { name: name.clone() },
                     authenticated_options(),
                 )
@@ -2497,9 +2847,9 @@ async fn run_mixed_call(
 
 async fn hold_server_stream_open(
     client: &greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
-) -> TestResult<trevrpc::BoxMessageStream<greeter::HelloReply>> {
+) -> TestResult<trevrpc::client::ResponseStream<greeter::HelloReply>> {
     let mut replies = client
-        .lots_of_replies(
+        .lots_of_replies_with_options(
             greeter::HelloRequest {
                 name: "cancel".to_owned(),
             },
@@ -2521,6 +2871,34 @@ fn spawn_greeter_server(configure: impl FnOnce(&mut Server)) -> TestResult<Runni
     configure(&mut server);
     let endpoint = make_server_endpoint(server.options())?;
     spawn_configured_greeter_server(endpoint, server)
+}
+
+fn register_cancellation_probe_route(
+    server: &mut Server,
+    source_tx: mpsc::UnboundedSender<CancellationSource>,
+) {
+    server.route_streaming_with_context(
+        "lifecycle.Probe",
+        "Watch",
+        RpcKind::ServerStreaming,
+        move |context, _body, _requests| {
+            let source_tx = source_tx.clone();
+            async move {
+                tokio::spawn(async move {
+                    let source = context.cancelled_signal().await;
+                    let _ = source_tx.send(source);
+                });
+                let first = greeter::HelloReply {
+                    message: "ready".to_owned(),
+                }
+                .encode_to_vec();
+                let stream: trevrpc::BoxStream<Vec<u8>> = Box::pin(
+                    trevrpc::stream::from_iter([first]).chain(futures_util::stream::pending()),
+                );
+                Ok(stream)
+            }
+        },
+    );
 }
 
 fn register_reject_upload_route(server: &mut Server) {
@@ -2613,6 +2991,37 @@ fn spawn_webtransport_greeter_server(
     let task = tokio::spawn(async move {
         server
             .serve_quinn_and_webtransport_with_shutdown(endpoint, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    Ok(RunningWebTransportServer {
+        addr,
+        cert_der,
+        shutdown: Some(shutdown_tx),
+        task: Some(task),
+    })
+}
+
+fn spawn_dedicated_webtransport_greeter_server(
+    configure: impl FnOnce(&mut Server),
+) -> TestResult<RunningWebTransportServer> {
+    let mut server = Server::new();
+    server.set_options(fast_server_options());
+    configure(&mut server);
+    let (endpoint, cert_der) = make_server_endpoint_with_alpns(
+        &[web_transport_quinn::ALPN.as_bytes()],
+        trevrpc::quinn::TransportMode::WebTransport,
+        server.options(),
+    )?;
+    let addr = endpoint.local_addr()?;
+    greeter::register_greeter(&mut server, TestGreeter);
+    let endpoint = web_transport_quinn::Server::new(endpoint);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        server
+            .serve_webtransport_with_shutdown(endpoint, async {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -2917,9 +3326,9 @@ async fn run_client_greetings<T>(
     options: CallOptions,
 ) -> trevrpc::Result<greeter::HelloReply>
 where
-    T: RpcTransport,
+    T: StreamingRpcTransport,
 {
-    let mut call = client.lots_of_greetings(options).await?;
+    let call = client.lots_of_greetings_with_options(options).await?;
     for name in names {
         call.send(greeter::HelloRequest {
             name: (*name).to_owned(),
@@ -2935,9 +3344,9 @@ async fn run_bidi_greetings<T>(
     options: CallOptions,
 ) -> trevrpc::Result<Vec<String>>
 where
-    T: RpcTransport,
+    T: StreamingRpcTransport,
 {
-    let mut call = client.bidi_hello(options).await?;
+    let mut call = client.bidi_hello_with_options(options).await?;
     for name in names {
         call.send(greeter::HelloRequest {
             name: (*name).to_owned(),

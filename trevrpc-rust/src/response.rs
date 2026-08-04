@@ -35,6 +35,15 @@ impl<T> ResponseEnvelope<T> {
     pub fn into_parts(self) -> (T, Metadata) {
         (self.message, self.metadata)
     }
+
+    /// Maps the successful response value while preserving metadata.
+    #[must_use]
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> ResponseEnvelope<U> {
+        ResponseEnvelope {
+            message: map(self.message),
+            metadata: self.metadata,
+        }
+    }
 }
 
 impl<T> From<T> for ResponseEnvelope<T> {

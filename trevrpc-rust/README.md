@@ -2,7 +2,8 @@
 
 The examples use `prost` messages and the generated-style Greeter bindings in
 [`examples/shared/greeter.rs`](examples/shared/greeter.rs). Its service defines unary,
-server-streaming, client-streaming, and bidirectional-streaming methods.
+server-streaming, client-streaming, and bidirectional-streaming methods. Applications upgrading
+from the former custom stream APIs should follow [the Milestone 5 migration guide](MIGRATING-M5.md).
 
 ## Client
 
@@ -81,7 +82,7 @@ endpoint.wait_idle().await;
 
 ```rust
 let reply = client
-    .say_hello(
+    .say_hello_with_options(
         greeter::HelloRequest {
             name: "TrevRPC".to_owned(),
         },
@@ -97,7 +98,7 @@ Call `next` until the response stream ends. Each item carries any decode or term
 
 ```rust
 let mut replies = client
-    .lots_of_replies(
+    .lots_of_replies_with_options(
         greeter::HelloRequest {
             name: "TrevRPC".to_owned(),
         },
@@ -113,8 +114,8 @@ while let Some(reply) = replies.next().await {
 ### Client streaming
 
 ```rust
-let mut greetings = client
-    .lots_of_greetings(trevrpc::client::CallOptions::new())
+let greetings = client
+    .lots_of_greetings_with_options(trevrpc::client::CallOptions::new())
     .await?;
 
 for name in ["Alice", "Bob"] {
@@ -131,40 +132,46 @@ println!("{}", reply.message);
 
 ### Bidirectional streaming
 
-Requests and responses may be interleaved. `close_send` half-closes the request side; receive until
-`recv` returns `None` to consume the terminal status:
+Split the call when request and response work must move to independent tasks. `finish` gracefully
+half-closes the request side; dropping an unfinished sender cancels it. Drain `ResponseStream` to
+clean EOF before reading successful terminal metadata:
 
 ```rust
-let mut stream = client
-    .bidi_hello(trevrpc::client::CallOptions::new())
+let call = client
+    .bidi_hello_with_options(trevrpc::client::CallOptions::new())
     .await?;
+let (sender, mut responses) = call.split();
 
-for name in ["Alice", "Bob"] {
-    stream
-        .send(greeter::HelloRequest {
-            name: name.to_owned(),
-        })
-        .await?;
-    let reply = stream.recv().await?.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "BidiHello ended early")
-    })?;
-    println!("{}", reply.message);
-}
+let send_task = tokio::spawn(async move {
+    for name in ["Alice", "Bob"] {
+        sender
+            .send(greeter::HelloRequest {
+                name: name.to_owned(),
+            })
+            .await?;
+    }
+    sender.finish()
+});
 
-stream.close_send()?;
-while let Some(reply) = stream.recv().await? {
-    println!("{}", reply.message);
-}
+let receive_task = tokio::spawn(async move {
+    while let Some(reply) = responses.next().await {
+        println!("{}", reply?.message);
+    }
+    Ok::<_, trevrpc::Error>(responses.terminal_metadata().cloned())
+});
+
+send_task.await??;
+let terminal_metadata = receive_task.await??;
 ```
-
-Use independent sender and receiver tasks when a protocol must continuously read and write large
-bidi streams.
 
 ## Server
 
 Implement the generated `Greeter` trait. Registration wires each method to the matching RPC shape.
 
 ### Unary
+
+Generated service methods receive a cloneable `RequestContext` and return a
+`ResponseEnvelope<T>`. The envelope carries successful response metadata:
 
 ```rust
 struct GreeterService;
@@ -173,11 +180,15 @@ struct GreeterService;
 impl greeter::Greeter for GreeterService {
     async fn say_hello(
         &self,
+        context: trevrpc::server::RequestContext,
         request: greeter::HelloRequest,
-    ) -> Result<greeter::HelloReply, trevrpc::Status> {
-        Ok(greeter::HelloReply {
+    ) -> Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, trevrpc::Status> {
+        if context.cancelled() {
+            return Err(trevrpc::Status::cancelled("request cancelled"));
+        }
+        Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
             message: format!("hello, {}", request.name),
-        })
+        }))
     }
 
     // Implement the three streaming methods below in the same trait block.
@@ -186,21 +197,26 @@ impl greeter::Greeter for GreeterService {
 
 ### Server streaming
 
-Return a boxed `MessageStream`. `trevrpc::stream::from_iter` is convenient for a fixed sequence:
+Return `ResponseEnvelope<BoxStream<T>>`. `BoxStream<T>` is a pinned standard
+`futures_core::Stream<Item = trevrpc::Result<T>>`, so normal `StreamExt` combinators work:
 
 ```rust
 async fn lots_of_replies(
     &self,
+    _context: trevrpc::server::RequestContext,
     request: greeter::HelloRequest,
-) -> Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
-    Ok(trevrpc::stream::from_iter([
+) -> Result<
+    trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
+    trevrpc::Status,
+> {
+    Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter([
         greeter::HelloReply {
             message: format!("hello, {}", request.name),
         },
         greeter::HelloReply {
             message: format!("goodbye, {}", request.name),
         },
-    ]))
+    ])))
 }
 ```
 
@@ -209,44 +225,41 @@ async fn lots_of_replies(
 ```rust
 async fn lots_of_greetings(
     &self,
-    mut requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-) -> Result<greeter::HelloReply, trevrpc::Status> {
+    _context: trevrpc::server::RequestContext,
+    mut requests: trevrpc::BoxStream<greeter::HelloRequest>,
+) -> Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, trevrpc::Status> {
     let mut names = Vec::new();
     while let Some(request) = requests.next().await {
         names.push(request?.name);
     }
 
-    Ok(greeter::HelloReply {
+    Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
         message: format!("hello, {}", names.join(", ")),
-    })
+    }))
 }
 ```
 
 ### Bidirectional streaming
 
-A response stream can pull from the request stream to preserve backpressure:
+A mapped standard stream preserves request-side backpressure without a custom stream trait:
 
 ```rust
-struct EchoReplies {
-    requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-}
-
-#[trevrpc::async_trait]
-impl trevrpc::MessageStream<greeter::HelloReply> for EchoReplies {
-    async fn next(&mut self) -> Option<trevrpc::Result<greeter::HelloReply>> {
-        self.requests.next().await.map(|request| {
+async fn bidi_hello(
+    &self,
+    _context: trevrpc::server::RequestContext,
+    requests: trevrpc::BoxStream<greeter::HelloRequest>,
+) -> Result<
+    trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
+    trevrpc::Status,
+> {
+    let replies: trevrpc::BoxStream<greeter::HelloReply> = Box::pin(
+        requests.map(|request| {
             request.map(|request| greeter::HelloReply {
                 message: format!("stream hello, {}", request.name),
             })
-        })
-    }
-}
-
-async fn bidi_hello(
-    &self,
-    requests: trevrpc::BoxMessageStream<greeter::HelloRequest>,
-) -> Result<trevrpc::BoxMessageStream<greeter::HelloReply>, trevrpc::Status> {
-    Ok(Box::new(EchoReplies { requests }))
+        }),
+    );
+    Ok(trevrpc::ResponseEnvelope::new(replies))
 }
 ```
 

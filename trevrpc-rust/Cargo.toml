@@ -9,7 +9,11 @@ repository = "https://trev.zip/llc/TrevRPC"
 license-file = "../LICENSE"
 
 [workspace]
-members = ["crates/protoc-gen-trevrpc-rust", "crates/trevrpc-bench-peer"]
+members = [
+  "crates/protoc-gen-trevrpc-rust",
+  "crates/trevrpc-bench-peer",
+  "crates/trevrpc-conformance-rust",
+]
 resolver = "3"
 
 [lints.clippy]
@@ -37,6 +41,8 @@ webtransport = [
 [dependencies]
 async-trait = "0.1.89"
 bytes = "1"
+futures-core = "0.3"
+futures-util = "0.3"
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 h3-webtransport = { version = "0.1.2", optional = true }

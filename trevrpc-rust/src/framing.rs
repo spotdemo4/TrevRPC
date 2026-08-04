@@ -1,3 +1,5 @@
+use std::any::TypeId;
+
 use prost::Message;
 
 use crate::{Code, Error, Metadata, Result, RpcStreamFrame, RpcStreamFrameKind, Status};
@@ -53,6 +55,7 @@ pub fn encode_message_stream_frame(body: &[u8], max_frame_size: usize) -> Result
     Ok(frame)
 }
 
+#[cfg(any(feature = "quinn", feature = "webtransport"))]
 pub(crate) fn encode_message_stream_frame_prefix(
     body_len: usize,
     max_frame_size: usize,
@@ -191,9 +194,128 @@ fn plain_message_payload_start(body: &[u8]) -> Result<Option<usize>> {
 /// Decodes a protobuf message from a `TrevRPC` frame body.
 pub fn decode_frame<M>(body: &[u8]) -> Result<M>
 where
-    M: Message + Default,
+    M: Message + Default + 'static,
 {
+    preflight_known_wire::<M>(body)?;
     M::decode(body).map_err(Error::from)
+}
+
+fn preflight_known_wire<M: 'static>(body: &[u8]) -> Result<()> {
+    let (fields, metadata_field): (&[(u64, u64)], Option<u64>) =
+        if TypeId::of::<M>() == TypeId::of::<crate::RpcRequest>() {
+            (
+                &[(1, 2), (2, 2), (3, 2), (4, 2), (5, 0), (6, 0), (7, 0)],
+                Some(4),
+            )
+        } else if TypeId::of::<M>() == TypeId::of::<crate::RpcResponse>() {
+            (&[(1, 0), (2, 2), (3, 2), (4, 2)], Some(4))
+        } else if TypeId::of::<M>() == TypeId::of::<crate::RpcStreamFrame>() {
+            (&[(1, 0), (2, 0), (3, 2), (4, 2), (5, 2)], Some(5))
+        } else {
+            return Ok(());
+        };
+    preflight_wire_message(body, fields, metadata_field)
+}
+
+fn preflight_wire_message(
+    data: &[u8],
+    fields: &[(u64, u64)],
+    metadata_field: Option<u64>,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let tag = consume_proto_varint(data, &mut offset)?;
+        if tag == 0 {
+            return Err(malformed_protobuf("invalid protobuf field tag"));
+        }
+        let field = tag >> 3;
+        let wire_type = tag & 7;
+        if let Some((_, expected)) = fields.iter().find(|(known, _)| *known == field)
+            && wire_type != *expected
+        {
+            return Err(malformed_protobuf(
+                "known protobuf field used the wrong wire type",
+            ));
+        }
+        if metadata_field == Some(field) {
+            let entry = consume_proto_bytes(data, &mut offset)?;
+            preflight_wire_message(entry, &[(1, 2), (2, 2)], None)?;
+        } else {
+            skip_proto_value(data, &mut offset, field, wire_type)?;
+        }
+    }
+    Ok(())
+}
+
+fn consume_proto_varint(data: &[u8], offset: &mut usize) -> Result<u64> {
+    let mut value = 0_u64;
+    for shift in (0..64).step_by(7) {
+        let byte = data
+            .get(*offset)
+            .copied()
+            .ok_or_else(|| malformed_protobuf("truncated protobuf varint"))?;
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return Ok(value);
+        }
+    }
+    Err(malformed_protobuf("protobuf varint exceeded 64 bits"))
+}
+
+fn consume_proto_bytes<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
+    let len = usize::try_from(consume_proto_varint(data, offset)?)
+        .map_err(|_| malformed_protobuf("protobuf field length exceeded supported range"))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| malformed_protobuf("protobuf field length overflowed"))?;
+    if end > data.len() {
+        return Err(malformed_protobuf("truncated protobuf field"));
+    }
+    let start = *offset;
+    *offset = end;
+    Ok(&data[start..end])
+}
+
+fn skip_proto_value(data: &[u8], offset: &mut usize, field: u64, wire_type: u64) -> Result<()> {
+    match wire_type {
+        0 => consume_proto_varint(data, offset).map(|_| ()),
+        1 => skip_proto_fixed(data, offset, 8),
+        2 => consume_proto_bytes(data, offset).map(|_| ()),
+        3 => loop {
+            let tag = consume_proto_varint(data, offset)?;
+            if tag == 0 {
+                return Err(malformed_protobuf("invalid protobuf group tag"));
+            }
+            let nested_field = tag >> 3;
+            let nested_wire_type = tag & 7;
+            if nested_wire_type == 4 {
+                if nested_field != field {
+                    return Err(malformed_protobuf("mismatched protobuf end group"));
+                }
+                break Ok(());
+            }
+            skip_proto_value(data, offset, nested_field, nested_wire_type)?;
+        },
+        4 => Err(malformed_protobuf("unexpected protobuf end group")),
+        5 => skip_proto_fixed(data, offset, 4),
+        _ => Err(malformed_protobuf("unsupported protobuf wire type")),
+    }
+}
+
+fn skip_proto_fixed(data: &[u8], offset: &mut usize, len: usize) -> Result<()> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| malformed_protobuf("protobuf fixed field length overflowed"))?;
+    if end > data.len() {
+        return Err(malformed_protobuf("truncated protobuf fixed field"));
+    }
+    *offset = end;
+    Ok(())
+}
+
+fn malformed_protobuf(message: &'static str) -> Error {
+    Error::from(Status::invalid_argument(message))
 }
 
 fn check_frame_body_len(len: usize, max_frame_size: usize) -> Result<()> {

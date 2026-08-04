@@ -2228,6 +2228,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-core",
+ "futures-util",
  "h3",
  "h3-quinn",
  "h3-webtransport",
@@ -2248,6 +2250,7 @@ dependencies = [
 name = "trevrpc-bench-peer"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "prost",
  "prost-build",
  "prost-types",
@@ -2265,6 +2268,15 @@ dependencies = [
  "trevrpc",
  "url",
  "web-transport-quinn",
+]
+
+[[package]]
+name = "trevrpc-conformance-rust"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "serde_json",
+ "trevrpc",
 ]
 
 [[package]]

@@ -22,6 +22,13 @@ impl Error {
         Self::Transport(Box::new(error))
     }
 
+    pub(crate) fn transport_code(&self) -> Option<crate::Code> {
+        match self {
+            Self::Transport(error) => Some(transport_status(error.as_ref()).code()),
+            _ => None,
+        }
+    }
+
     /// Converts the error into the RPC status that should be returned to callers.
     #[must_use]
     pub fn into_status(self) -> Status {
@@ -90,11 +97,42 @@ fn transport_status(error: &(dyn StdError + Send + Sync + 'static)) -> Status {
         return Status::cancelled(error.to_string());
     }
 
+    #[cfg(feature = "http3")]
+    if let Some(error) = error.downcast_ref::<h3::error::StreamError>() {
+        return h3_stream_status(error);
+    }
+
+    #[cfg(feature = "http3")]
+    if let Some(error) = error.downcast_ref::<h3::quic::StreamErrorIncoming>() {
+        return h3_quic_stream_status(error);
+    }
+
     if let Some(error) = error.downcast_ref::<io::Error>() {
         return io_status(error);
     }
 
     transport_unavailable(error)
+}
+
+#[cfg(feature = "http3")]
+fn h3_stream_status(error: &h3::error::StreamError) -> Status {
+    match error {
+        h3::error::StreamError::RemoteTerminate { .. } => Status::cancelled(error.to_string()),
+        h3::error::StreamError::StreamError { .. }
+        | h3::error::StreamError::HeaderTooBig { .. } => Status::internal(error.to_string()),
+        _ => transport_unavailable(error),
+    }
+}
+
+#[cfg(feature = "http3")]
+fn h3_quic_stream_status(error: &h3::quic::StreamErrorIncoming) -> Status {
+    match error {
+        h3::quic::StreamErrorIncoming::StreamTerminated { .. } => {
+            Status::cancelled(error.to_string())
+        }
+        h3::quic::StreamErrorIncoming::ConnectionErrorIncoming { .. }
+        | h3::quic::StreamErrorIncoming::Unknown(_) => transport_unavailable(error),
+    }
 }
 
 fn io_status(error: &io::Error) -> Status {
@@ -173,10 +211,9 @@ fn webtransport_error_status(error: &web_transport_quinn::WebTransportError) -> 
 fn webtransport_stream_read_status(error: &web_transport_quinn::ReadError) -> Status {
     match error {
         web_transport_quinn::ReadError::SessionError(error) => webtransport_session_status(error),
-        web_transport_quinn::ReadError::Reset(_) | web_transport_quinn::ReadError::ClosedStream => {
-            Status::cancelled(error.to_string())
-        }
-        web_transport_quinn::ReadError::InvalidReset(_) => transport_unavailable(error),
+        web_transport_quinn::ReadError::Reset(_)
+        | web_transport_quinn::ReadError::InvalidReset(_)
+        | web_transport_quinn::ReadError::ClosedStream => Status::cancelled(error.to_string()),
         web_transport_quinn::ReadError::IllegalOrderedRead => Status::internal(error.to_string()),
     }
 }
@@ -196,8 +233,8 @@ fn webtransport_stream_write_status(error: &web_transport_quinn::WriteError) -> 
     match error {
         web_transport_quinn::WriteError::SessionError(error) => webtransport_session_status(error),
         web_transport_quinn::WriteError::Stopped(_)
+        | web_transport_quinn::WriteError::InvalidStopped(_)
         | web_transport_quinn::WriteError::ClosedStream => Status::cancelled(error.to_string()),
-        web_transport_quinn::WriteError::InvalidStopped(_) => transport_unavailable(error),
     }
 }
 
@@ -310,5 +347,24 @@ mod tests {
         let status = Error::transport(quinn::ConnectionError::TimedOut).into_status();
 
         assert_eq!(status.code(), Code::Unavailable);
+    }
+
+    #[cfg(feature = "http3")]
+    #[test]
+    fn h3_quic_stream_reset_maps_to_cancelled() {
+        let status =
+            Error::transport(h3::quic::StreamErrorIncoming::StreamTerminated { error_code: 1 })
+                .into_status();
+
+        assert_eq!(status.code(), Code::Cancelled);
+    }
+
+    #[cfg(feature = "webtransport")]
+    #[test]
+    fn webtransport_invalid_reset_codes_still_map_to_cancelled() {
+        let status = Error::transport(web_transport_quinn::ReadError::InvalidReset(1_u32.into()))
+            .into_status();
+
+        assert_eq!(status.code(), Code::Cancelled);
     }
 }

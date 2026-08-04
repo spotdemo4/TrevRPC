@@ -11,6 +11,7 @@ missing_errors_doc = "allow"
 module_name_repetitions = "allow"
 
 [dependencies]
+futures-util = "0.3"
 prost = "0.14.4"
 quinn = "0.11.11"
 serde = { version = "1.0.228", features = ["derive"] }
