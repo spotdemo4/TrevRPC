@@ -46,12 +46,18 @@ async function runFromForm(data) {
     for await (const reply of replies) {
       log(`LotsOfReplies: ${reply.message}`);
     }
+    const replyStatus = await replies.status;
+    log(
+      `LotsOfReplies status: ${replyStatus.code} ${replyStatus.message}; trailers=${Object.keys(replyStatus.metadata).join(",")}`,
+    );
 
     const greetings = await client.lotsOfGreetings();
     await greetings.send({ name: `${name} client stream 1` });
     await greetings.send({ name: `${name} client stream 2` });
-    const summary = await greetings.closeAndRecv();
-    log(`LotsOfGreetings: ${summary.message}`);
+    const summary = await greetings.closeAndRecvWithResponse();
+    log(
+      `LotsOfGreetings: ${summary.message.message}; trailers=${Object.keys(summary.metadata).join(",")}`,
+    );
 
     const bidi = await client.bidiHello();
     try {

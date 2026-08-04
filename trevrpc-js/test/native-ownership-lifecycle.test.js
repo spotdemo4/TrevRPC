@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
 import { setImmediate, setTimeout as delay } from "node:timers/promises";
@@ -14,30 +14,59 @@ import { connect } from "trevrpc-js";
 import { Channel, NodeServer } from "trevrpc-js/node";
 import { RawNodeTransport } from "trevrpc-js/node/advanced";
 
-import { Code, RpcKind, RpcStreamFrameKind } from "../src/index.js";
+import {
+  Code,
+  RpcKind,
+  RpcStreamFrameKind,
+  bidirectionalStreaming,
+  createRoot,
+} from "../src/index.js";
 
 const require = createRequire(import.meta.url);
 const nativeAddonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
 const thisFile = fileURLToPath(import.meta.url);
 const gcChild = process.env.TREVRPC_NATIVE_OWNERSHIP_LIFECYCLE_GC_CHILD === "1";
+const gcAvailable = typeof global.gc === "function";
+// A black-hole UDP peer can take one MsQuic handshake retransmission window to close.
+const stalledConnectShutdownTimeoutMs = 5_000;
 let certificateDirectory;
 
-if (typeof global.gc !== "function" && !gcChild) {
+if (gcChild && !gcAvailable) {
+  throw new Error("forced-GC lifecycle child started without global.gc");
+}
+
+if (!gcAvailable) {
   test(
     "native ownership lifecycle tests run with forced GC",
     { skip: !existsSync(nativeAddonPath) },
     () => {
-      const result = spawnSync(process.execPath, ["--expose-gc", "--test", thisFile], {
+      const childEnvironment = {
+        ...process.env,
+        TREVRPC_NATIVE_OWNERSHIP_LIFECYCLE_GC_CHILD: "1",
+      };
+      delete childEnvironment.NODE_TEST_CONTEXT;
+      const result = spawnSync(process.execPath, ["--expose-gc", thisFile], {
         encoding: "utf8",
-        env: { ...process.env, TREVRPC_NATIVE_OWNERSHIP_LIFECYCLE_GC_CHILD: "1" },
+        env: childEnvironment,
+        timeout: 180_000,
       });
+      const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
 
-      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      assert.equal(result.error, undefined, output);
+      assert.equal(result.signal, null, output);
+      assert.equal(result.status, 0, output);
+      assert.match(
+        output,
+        /native client close transaction pins the wrapper across final release/u,
+      );
+      assert.match(
+        output,
+        /native response external body owner survives C cleanup until GC finalizer/u,
+      );
     },
   );
 } else {
   const native = existsSync(nativeAddonPath) ? require(nativeAddonPath) : null;
-  const hasGc = typeof global.gc === "function";
   after(async () => {
     if (certificateDirectory != null) {
       await rm(certificateDirectory, { force: true, recursive: true });
@@ -45,74 +74,298 @@ if (typeof global.gc !== "function" && !gcChild) {
   });
 
   test(
-    "native response external body owner survives C cleanup until GC finalizer",
-    {
-      skip: native == null || !hasGc,
+    "native client close transaction pins the wrapper across final release",
+    { skip: typeof native?._debugClientCloseReleaseRace !== "function" },
+    () => {
+      const result = native._debugClientCloseReleaseRace();
+      assert.equal(result.passed, true, JSON.stringify(result));
+      for (const interleaving of [
+        result.firstCloseVsFinalRelease,
+        result.finalizerAfterExplicitClose,
+      ]) {
+        assert.equal(interleaving.passed, true, JSON.stringify(interleaving));
+        assert.equal(interleaving.pinObserved, true);
+        assert.equal(interleaving.stateObserved, true);
+        assert.equal(interleaving.noDestroyBeforeResume, true);
+        assert.equal(interleaving.destroyAttempts, 1);
+        assert.equal(interleaving.destructionCount, 1);
+        assert.equal(interleaving.prematureDestructionCount, 0);
+        assert.equal(interleaving.barriersOk, true);
+      }
     },
+  );
+
+  test(
+    "native response external body owner survives C cleanup until GC finalizer",
+    { skip: native == null, timeout: 15_000 },
     async () => {
       await forceGcCycles();
       const before = finalizerCount(native);
+      const releasesBefore = ownerReleaseCount(native);
       const expected = new Uint8Array([1, 2, 3, 4, 5]);
-      let response = native._debugMakeBorrowedResponse(expected);
-      let body = response.body;
 
-      assert.deepEqual(Array.from(body), Array.from(expected));
-      response = null;
-      await forceGcCycles();
+      await withNativePair(
+        async (server) => {
+          server.nativeServer.register("ownership", "OpaqueUnary", RpcKind.Unary, (call) => {
+            call
+              .respond({
+                status: Code.Unavailable,
+                message: "opaque unary",
+                body: expected,
+                metadata: { trace: new Uint8Array([7, 8, 9]) },
+              })
+              .catch(() => {});
+          });
+          server.nativeServer.register("ownership", "EmptyUnary", RpcKind.Unary, (call) => {
+            call
+              .respond({
+                status: Code.Unavailable,
+                message: "empty opaque unary",
+                body: new Uint8Array(),
+              })
+              .catch(() => {});
+          });
+        },
+        async (client) => {
+          let response = await client.nativeClient.call({
+            service: "ownership",
+            method: "OpaqueUnary",
+            kind: RpcKind.Unary,
+            version: 1,
+            body: new Uint8Array(),
+          });
+          let body = response.body;
 
-      assert.deepEqual(Array.from(body), Array.from(expected));
-      assert.equal(finalizerCount(native), before);
+          assert.equal(response.status, Code.Unavailable);
+          assert.equal(response.message, "opaque unary");
+          assert.deepEqual(Array.from(response.metadata.trace), [7, 8, 9]);
+          assert.deepEqual(Array.from(body), Array.from(expected));
+          response = null;
+          await forceGcCycles();
 
-      body = null;
-      await waitForFinalizers(native, before + 1);
+          assert.deepEqual(Array.from(body), Array.from(expected));
+          assert.equal(finalizerCount(native), before);
+
+          body = null;
+          await waitForFinalizers(native, before + 1);
+          assert.equal(ownerReleaseCount(native), releasesBefore + 1);
+
+          const beforeEmpty = finalizerCount(native);
+          const releasesBeforeEmpty = ownerReleaseCount(native);
+          let empty = await client.nativeClient.call({
+            service: "ownership",
+            method: "EmptyUnary",
+            kind: RpcKind.Unary,
+            version: 1,
+            body: new Uint8Array(),
+          });
+          assert.equal(empty.status, Code.Unavailable);
+          assert.equal(empty.message, "empty opaque unary");
+          assert.equal(empty.body instanceof Uint8Array, true);
+          assert.equal(empty.body.byteLength, 0);
+          assert.equal(ownerReleaseCount(native), releasesBeforeEmpty + 1);
+          empty = null;
+          await forceGcCycles();
+          assert.equal(finalizerCount(native), beforeEmpty);
+          assert.equal(ownerReleaseCount(native), releasesBeforeEmpty + 1);
+        },
+      );
     },
   );
 
   test(
     "native stream frame external body owner survives C cleanup until GC finalizer",
-    {
-      skip: native == null || !hasGc,
-    },
+    { skip: native == null, timeout: 15_000 },
     async () => {
       await forceGcCycles();
       const before = finalizerCount(native);
+      const releasesBefore = ownerReleaseCount(native);
       const expected = new Uint8Array([9, 8, 7, 6]);
-      let frame = native._debugMakeBorrowedStreamFrame(expected);
-      let body = frame.body;
 
-      assert.deepEqual(Array.from(body), Array.from(expected));
-      frame = null;
-      await forceGcCycles();
+      await withNativePair(
+        async (server) => {
+          server.nativeServer.register(
+            "ownership",
+            "OpaqueStreamFrame",
+            RpcKind.ServerStreaming,
+            (call) => {
+              void (async () => {
+                await call.sendMessage(expected);
+                await call.finishStream(Code.ResourceExhausted, "opaque terminal", {
+                  trailer: new Uint8Array([3, 2, 1]),
+                });
+              })().catch(() => call.close());
+            },
+          );
+        },
+        async (client) => {
+          const stream = await client.nativeClient.startStream({
+            service: "ownership",
+            method: "OpaqueStreamFrame",
+            kind: RpcKind.ServerStreaming,
+            version: 1,
+            body: new Uint8Array(),
+          });
+          let frame = await stream.recv();
+          let body = frame.body;
 
-      assert.deepEqual(Array.from(body), Array.from(expected));
-      assert.equal(finalizerCount(native), before);
+          assert.equal(frame.kind, RpcStreamFrameKind.Message);
+          assert.deepEqual(Array.from(body), Array.from(expected));
+          frame = null;
+          await forceGcCycles();
 
-      body = null;
-      await waitForFinalizers(native, before + 1);
+          assert.deepEqual(Array.from(body), Array.from(expected));
+          assert.equal(finalizerCount(native), before);
+
+          const terminal = await stream.recv();
+          assert.equal(terminal.kind, RpcStreamFrameKind.Status);
+          assert.equal(terminal.status, Code.ResourceExhausted);
+          assert.equal(terminal.message, "opaque terminal");
+          assert.deepEqual(Array.from(terminal.metadata.trailer), [3, 2, 1]);
+          assert.equal(terminal.body.byteLength, 0);
+          assert.equal(ownerReleaseCount(native), releasesBefore + 1);
+
+          body = null;
+          await waitForFinalizers(native, before + 1);
+          assert.equal(ownerReleaseCount(native), releasesBefore + 2);
+          stream.close();
+        },
+      );
     },
   );
 
   test(
     "native stream body batches transfer borrowed frame owners",
-    {
-      skip: native == null || !hasGc,
-    },
+    { skip: native == null, timeout: 15_000 },
     async () => {
       await forceGcCycles();
       const before = finalizerCount(native);
-      const expected = new Uint8Array([42, 43, 44]);
-      let batch = native._debugMakeBorrowedStreamBodyBatch(expected);
-      let body = batch.bodies[0];
+      const releasesBefore = ownerReleaseCount(native);
+      const firstExpected = new Uint8Array([42, 43, 44]);
+      const secondExpected = new Uint8Array([51, 52, 53, 54]);
+      let messagesSent;
+      const messagesSentPromise = new Promise((resolve) => {
+        messagesSent = resolve;
+      });
 
-      assert.deepEqual(Array.from(body), Array.from(expected));
-      batch = null;
+      await withNativePair(
+        async (server) => {
+          server.nativeServer.register(
+            "ownership",
+            "OpaqueBatch",
+            RpcKind.ServerStreaming,
+            (call) => {
+              void (async () => {
+                await call.sendMessage(firstExpected);
+                await call.sendMessage(secondExpected);
+                messagesSent();
+                await call.finishStream(Code.Ok);
+              })().catch(() => call.close());
+            },
+          );
+        },
+        async (client) => {
+          const stream = await client.nativeClient.startStream({
+            service: "ownership",
+            method: "OpaqueBatch",
+            kind: RpcKind.ServerStreaming,
+            version: 1,
+            body: new Uint8Array(),
+          });
+          await messagesSentPromise;
+          let bodies = [];
+          let batch = null;
+          while (bodies.length < 2) {
+            batch = await stream.recvBodyBatch(2 - bodies.length);
+            assert.equal(batch.bodies.length > 0, true);
+            bodies.push(...batch.bodies);
+          }
+          let firstBody = bodies[0];
+          let secondBody = bodies[1];
+          batch = null;
+          bodies = null;
+          await forceGcCycles();
+
+          assert.deepEqual(Array.from(firstBody), Array.from(firstExpected));
+          assert.deepEqual(Array.from(secondBody), Array.from(secondExpected));
+          assert.equal(finalizerCount(native), before);
+
+          firstBody = null;
+          await waitForFinalizers(native, before + 1);
+          assert.equal(ownerReleaseCount(native), releasesBefore + 1);
+          assert.deepEqual(Array.from(secondBody), Array.from(secondExpected));
+
+          secondBody = null;
+          await waitForFinalizers(native, before + 2);
+          assert.equal(ownerReleaseCount(native), releasesBefore + 2);
+          stream.close();
+        },
+      );
+    },
+  );
+
+  test(
+    "native opaque body conversion failure fallbacks release owners exactly once",
+    {
+      skip:
+        typeof native?._debugSetNextBodyConversionFailure !== "function" ||
+        typeof native?._debugBodyOwnerReleases !== "function",
+      timeout: 15_000,
+    },
+    async () => {
       await forceGcCycles();
+      const expected = new Uint8Array([61, 62, 63, 64]);
 
-      assert.deepEqual(Array.from(body), Array.from(expected));
-      assert.equal(finalizerCount(native), before);
+      await withNativePair(
+        async (server) => {
+          server.nativeServer.register("ownership", "ConversionFailure", RpcKind.Unary, (call) => {
+            call.respond({ body: expected }).catch(() => {});
+          });
+        },
+        async (client) => {
+          const request = {
+            service: "ownership",
+            method: "ConversionFailure",
+            kind: RpcKind.Unary,
+            version: 1,
+            body: new Uint8Array(),
+          };
 
-      body = null;
-      await waitForFinalizers(native, before + 1);
+          let releases = ownerReleaseCount(native);
+          let finalizers = finalizerCount(native);
+          native._debugSetNextBodyConversionFailure(1);
+          let response = await client.nativeClient.call(request);
+          assert.deepEqual(Array.from(response.body), Array.from(expected));
+          assert.equal(ownerReleaseCount(native), releases + 1);
+          assert.equal(finalizerCount(native), finalizers);
+          assert.equal(native._debugBodyConversionFailureStage(), 0);
+          response = null;
+          await forceGcCycles();
+          assert.equal(finalizerCount(native), finalizers);
+
+          releases = ownerReleaseCount(native);
+          finalizers = finalizerCount(native);
+          native._debugSetNextBodyConversionFailure(2);
+          response = await client.nativeClient.call(request);
+          assert.deepEqual(Array.from(response.body), Array.from(expected));
+          assert.equal(ownerReleaseCount(native), releases);
+          assert.equal(native._debugBodyConversionFailureStage(), 0);
+          await waitForFinalizers(native, finalizers + 1);
+          assert.equal(ownerReleaseCount(native), releases + 1);
+          response = null;
+
+          releases = ownerReleaseCount(native);
+          finalizers = finalizerCount(native);
+          native._debugSetNextBodyConversionFailure(3);
+          await assert.rejects(
+            client.nativeClient.call(request),
+            (error) => error.nativeCode === -osConstants.errno.ENOMEM,
+          );
+          assert.equal(native._debugBodyConversionFailureStage(), 0);
+          await waitForFinalizers(native, finalizers + 1);
+          assert.equal(ownerReleaseCount(native), releases + 1);
+        },
+      );
     },
   );
 
@@ -140,6 +393,74 @@ const native = require(${JSON.stringify(nativeAddonPath)});
       );
       await waitForWorkerMessage(worker, (message) => message === "serving");
       await settlesWithin(worker.terminate(), 3_000);
+    },
+  );
+
+  test(
+    "Worker termination force-cancels an admitted native server call",
+    { skip: native == null, timeout: 10_000 },
+    async () => {
+      const certificate = await testCertificate();
+      const worker = new Worker(
+        `
+const { parentPort } = require("node:worker_threads");
+const native = require(${JSON.stringify(nativeAddonPath)});
+(async () => {
+  const server = await native.listenMsQuic({
+    host: "127.0.0.1",
+    port: 0,
+    certFile: ${JSON.stringify(certificate.certFile)},
+    keyFile: ${JSON.stringify(certificate.keyFile)},
+  });
+  server.register("ownership", "StalledUnary", 0, (call) => {
+    globalThis.heldCall = call;
+    parentPort.postMessage("started");
+  });
+  server.serve().catch(() => {});
+  parentPort.postMessage({ port: server.port });
+})().catch((error) => { throw error; });
+`,
+        { eval: true },
+      );
+      const listening = await waitForWorkerMessage(
+        worker,
+        (message) => typeof message === "object" && Number.isInteger(message?.port),
+      );
+      const client = await RawNodeTransport.connect({
+        host: "127.0.0.1",
+        port: listening.port,
+        skipCertificateValidation: true,
+      });
+      try {
+        const started = waitForWorkerMessage(worker, (message) => message === "started");
+        const response = client
+          .call({
+            service: "ownership",
+            method: "StalledUnary",
+            body: new Uint8Array(),
+            metadata: {},
+          })
+          .then(
+            (value) => ({ value }),
+            (error) => ({ error }),
+          );
+        await started;
+        await settlesWithin(worker.terminate(), 3_000);
+        const outcome = await settlesWithin(response, 3_000);
+        if (outcome.value !== undefined) {
+          assert.equal(outcome.error, undefined);
+          assert.equal(outcome.value.status, Code.Cancelled);
+          assert.deepEqual(Array.from(outcome.value.body), []);
+        } else {
+          assert.ok(
+            outcome.error.code === Code.Cancelled || outcome.error.code === Code.Unavailable,
+            `unexpected forced-teardown error status ${outcome.error.code}`,
+          );
+        }
+      } finally {
+        client.close();
+        await worker.terminate();
+      }
     },
   );
 
@@ -230,7 +551,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
         controller.abort();
 
         await assert.rejects(
-          settlesWithin(connecting, 2_000),
+          settlesWithin(connecting, stalledConnectShutdownTimeoutMs),
           (error) => error.code === Code.Cancelled,
         );
       } finally {
@@ -265,7 +586,7 @@ parentPort.postMessage("connecting");
       );
       try {
         await waitForWorkerMessage(worker, (message) => message === "connecting");
-        await settlesWithin(worker.terminate(), 2_000);
+        await settlesWithin(worker.terminate(), stalledConnectShutdownTimeoutMs);
       } finally {
         sink.close();
       }
@@ -361,6 +682,74 @@ parentPort.postMessage("connecting");
         client.close();
         server.close();
         await serving;
+      }
+    },
+  );
+
+  test(
+    "normal Node server close drains an admitted native unary call",
+    { skip: native == null, timeout: 15_000 },
+    async () => {
+      const certificate = await testCertificate();
+      const server = await NodeServer.listen({
+        host: "127.0.0.1",
+        port: 0,
+        certFile: certificate.certFile,
+        keyFile: certificate.keyFile,
+      });
+      let releaseHandler;
+      const handlerReleased = new Promise((resolve) => {
+        releaseHandler = resolve;
+      });
+      let handlerStarted;
+      const handlerStartedPromise = new Promise((resolve) => {
+        handlerStarted = resolve;
+      });
+      server.register("ownership", "DrainUnary", RpcKind.Unary, async () => {
+        handlerStarted();
+        await handlerReleased;
+        return { body: new Uint8Array([7, 8, 9]) };
+      });
+
+      const serving = server.serve();
+      let serveSettled = false;
+      void serving.then(
+        () => {
+          serveSettled = true;
+        },
+        () => {
+          serveSettled = true;
+        },
+      );
+      const client = await RawNodeTransport.connect({
+        host: "127.0.0.1",
+        port: server.port,
+        skipCertificateValidation: true,
+      });
+      try {
+        const responsePromise = client.call({
+          service: "ownership",
+          method: "DrainUnary",
+          body: new Uint8Array([1]),
+          metadata: {},
+        });
+        await settlesWithin(handlerStartedPromise, 3_000);
+
+        server.close();
+        await setImmediate();
+        assert.equal(serveSettled, false);
+
+        releaseHandler();
+        const response = await settlesWithin(responsePromise, 5_000);
+        assert.equal(response.status, Code.Ok);
+        assert.deepEqual(Array.from(response.body), [7, 8, 9]);
+        await settlesWithin(serving, 5_000);
+        assert.equal(serveSettled, true);
+      } finally {
+        releaseHandler();
+        client.close();
+        server.close();
+        await settlesWithin(serving, 5_000);
       }
     },
   );
@@ -464,7 +853,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           );
           await waitForWorkerMessage(worker, (message) => message === "queued");
           await settlesWithin(callStartedPromise, 3_000);
-          await settlesWithin(worker.terminate(), 5_000);
+          await settlesWithin(worker.terminate(), stalledConnectShutdownTimeoutMs);
           heldCall?.close();
           heldCall = null;
         },
@@ -594,12 +983,93 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   );
 
   test(
+    "real MsQuic early terminal releases the pending request writer once",
+    { skip: native == null, timeout: 15_000 },
+    async () => {
+      const Hello = createRoot({
+        nested: {
+          ownership: {
+            nested: {
+              Hello: {
+                fields: { value: { type: "string", id: 1 } },
+              },
+            },
+          },
+        },
+      }).lookupType("ownership.Hello");
+      let requestReturns = 0;
+      let requestReturned;
+      const requestReturnedPromise = new Promise((resolve) => {
+        requestReturned = resolve;
+      });
+
+      await withNativePair(
+        async (server) => {
+          server.register(
+            "ownership",
+            "EarlyTerminal",
+            RpcKind.BidirectionalStreaming,
+            async (call) => {
+              await call.finishStream(Code.Ok);
+            },
+          );
+        },
+        async (client) => {
+          const transport = {
+            async streamingCall(request, requestBody, options) {
+              const iterator = requestBody[Symbol.asyncIterator]();
+              const wrapped = {
+                [Symbol.asyncIterator]() {
+                  return this;
+                },
+                next() {
+                  return iterator.next();
+                },
+                nextBatch(max) {
+                  return typeof iterator.nextBatch === "function"
+                    ? iterator.nextBatch(max)
+                    : iterator.next();
+                },
+                async return() {
+                  requestReturns += 1;
+                  requestReturned();
+                  return typeof iterator.return === "function"
+                    ? await iterator.return()
+                    : { done: true, value: undefined };
+                },
+              };
+              return await client.streamingCall(request, wrapped, options);
+            },
+          };
+          const call = await bidirectionalStreaming(
+            transport,
+            "ownership",
+            "EarlyTerminal",
+            Hello,
+            Hello,
+            { streamIdleTimeoutMs: undefined },
+          );
+
+          assert.equal(await settlesWithin(call.recv(), 5_000), undefined);
+          await settlesWithin(requestReturnedPromise, 5_000);
+          await setImmediate();
+          assert.equal(requestReturns, 1);
+        },
+      );
+    },
+  );
+
+  test(
     "native synchronous exhaustion and response failure settle queued operations",
     { skip: native == null, timeout: 15_000 },
     async () => {
       let responseFailure;
       const responseFailurePromise = new Promise((resolve) => {
         responseFailure = resolve;
+      });
+      let exhaustStarted;
+      const exhaustStartedPromise = new Promise((resolve) => {
+        exhaustStarted = resolve;
       });
       let exhaustClosed;
       const exhaustClosedPromise = new Promise((resolve) => {
@@ -612,6 +1082,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             "Exhaust",
             RpcKind.BidirectionalStreaming,
             (call) => {
+              exhaustStarted();
               setTimeout(() => {
                 call.close();
                 exhaustClosed();
@@ -632,12 +1103,13 @@ const native = require(${JSON.stringify(nativeAddonPath)});
             kind: RpcKind.BidirectionalStreaming,
             body: new Uint8Array(),
           });
+          await settlesWithin(exhaustStartedPromise, 3_000);
           await assert.rejects(
             stream.sendMessage(new Uint8Array(1024)),
             (error) => error.nativeCode === -1004,
           );
           stream.close();
-          await exhaustClosedPromise;
+          await settlesWithin(exhaustClosedPromise, 3_000);
 
           const failedResponseCall = client.nativeClient
             .call({
@@ -651,7 +1123,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           const responseError = await settlesWithin(responseFailurePromise, 3_000);
           assert.equal(responseError.nativeCode, -1004);
           client.close();
-          await failedResponseCall;
+          await settlesWithin(failedResponseCall, 5_000);
         },
         () => ({ maxPendingSendBytes: 128 }),
         () => ({ maxPendingSendBytes: 128 }),
@@ -1065,7 +1537,11 @@ const native = require(${JSON.stringify(nativeAddonPath)});
           await resetStartedPromise;
           stream.close();
           const sendError = await settlesWithin(sendResult, 5_000);
-          assert.equal(sendError.nativeCode, -1001);
+          assert.equal(sendError.nativeCode, -osConstants.errno.ECANCELED);
+          await assert.rejects(
+            stream.sendMessage(new Uint8Array([7])),
+            (error) => error.nativeCode === -4001,
+          );
           await resetFinishedPromise;
         },
       );
@@ -1318,7 +1794,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   test(
     "native evented completion receiver ref prevents GC finalizer while operation is pending",
     {
-      skip: native == null || !hasGc,
+      skip: native == null,
     },
     async () => {
       await forceGcCycles();
@@ -1339,6 +1815,10 @@ const native = require(${JSON.stringify(nativeAddonPath)});
 
 function finalizerCount(native) {
   return native._debugExternalArrayBufferFinalizers();
+}
+
+function ownerReleaseCount(native) {
+  return native._debugBodyOwnerReleases();
 }
 
 function resourceCloseCount(native) {
@@ -1435,7 +1915,7 @@ async function withNativePair(
   } finally {
     client.close();
     server.close();
-    await serving;
+    await settlesWithin(serving, 5_000);
   }
 }
 

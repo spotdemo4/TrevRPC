@@ -4,7 +4,6 @@ import type {
   ChannelState,
   RpcChannel,
   MetadataInput,
-  NodeConnectOptions as RuntimeNodeConnectOptions,
   RpcKindValue,
   RpcMethodKind,
   RpcResponseMessage,
@@ -13,11 +12,40 @@ import type {
   Transport,
 } from "./index.js";
 
-export interface NodeConnectOptions extends RuntimeNodeConnectOptions {}
+type TrevRpcEventListener = ((event: Event) => void) | { handleEvent(event: Event): void };
+interface TrevRpcEventListenerOptions {
+  capture?: boolean;
+}
+interface TrevRpcAddEventListenerOptions extends TrevRpcEventListenerOptions {
+  once?: boolean;
+  passive?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface NodeEndpoint {
+  host: string;
+  port: number;
+}
+
+export interface NodeConnectOptions {
+  caCertFile?: string;
+  skipCertificateValidation?: boolean;
+  maxStreamsPerSession?: number;
+  idleTimeoutMs?: number;
+  maxFrameSize?: number;
+  maxPendingSendBytes?: number;
+  maxPendingSendCount?: number;
+  signal?: AbortSignal;
+}
 
 export interface NodeChannelOptions extends NodeConnectOptions, ChannelLifecycleOptions {
   /** Bounds initial readiness only. Later reconnects continue until close(). */
   timeoutMs?: number;
+}
+
+export interface NodeChannelTarget extends NodeChannelOptions {
+  host: string;
+  port?: number;
 }
 
 export interface NodeRpcStartedEvent {
@@ -80,7 +108,9 @@ export interface NodeHttp3AdmissionRequest {
 
 export type NodeHttp3Admission = (request: NodeHttp3AdmissionRequest) => boolean;
 
-export interface NodeListenOptions extends RuntimeNodeConnectOptions {
+export interface NodeListenOptions extends NodeConnectOptions {
+  host?: string;
+  port?: number;
   path?: string;
   origin?: string;
   certFile?: string;
@@ -106,17 +136,17 @@ export interface NodeListenOptions extends RuntimeNodeConnectOptions {
 
 /** Native Node channel with background connection reconnection. */
 export class Channel extends EventTarget implements RpcChannel {
-  readonly urlOrOptions: string | URL | Readonly<NodeChannelOptions>;
+  readonly endpoint: Readonly<NodeEndpoint>;
   readonly options: Readonly<NodeChannelOptions>;
   readonly ready: boolean;
   readonly state: ChannelState;
   readonly generation: number;
 
-  constructor(urlOrOptions: string | URL | NodeChannelOptions, options?: NodeChannelOptions);
+  constructor(target: string | URL | NodeChannelTarget, options?: NodeChannelOptions);
 
   /** Creates a native channel and waits for its first ready generation. */
   static connect(
-    urlOrOptions: string | URL | NodeChannelOptions,
+    target: string | URL | NodeChannelTarget,
     options?: NodeChannelOptions,
   ): Promise<Channel>;
   /** Waits for the current or next connection generation to become ready. */
@@ -137,12 +167,22 @@ export class Channel extends EventTarget implements RpcChannel {
   addEventListener(
     type: "statechange" | ChannelState,
     callback: (event: ChannelLifecycleEvent) => void,
-    options?: boolean | AddEventListenerOptions,
+    options?: boolean | TrevRpcAddEventListenerOptions,
+  ): void;
+  addEventListener(
+    type: string,
+    callback: TrevRpcEventListener | null,
+    options?: boolean | TrevRpcAddEventListenerOptions,
   ): void;
   removeEventListener(
     type: "statechange" | ChannelState,
     callback: (event: ChannelLifecycleEvent) => void,
-    options?: boolean | EventListenerOptions,
+    options?: boolean | TrevRpcEventListenerOptions,
+  ): void;
+  removeEventListener(
+    type: string,
+    callback: TrevRpcEventListener | null,
+    options?: boolean | TrevRpcEventListenerOptions,
   ): void;
 }
 
@@ -181,6 +221,10 @@ export class NodeServerCall {
   finalStatus: number;
   startedAt: number;
   completedAt: number | null;
+  /** Aborts when the deadline, cancellation, or server shutdown settles first. */
+  readonly signal: AbortSignal;
+  /** Absolute peer deadline captured from the native call context, or null when absent. */
+  readonly deadline: Date | null;
 
   /** Keeps the call open after the handler returns. */
   defer(): this;
@@ -199,7 +243,7 @@ export class NodeServerCall {
   /** Sends the terminal streaming status and completes the call. */
   finishStream(status?: number, message?: string, metadata?: MetadataInput): Promise<void>;
   /** Cancels and closes the call. */
-  close(): void;
+  close(reason?: unknown): void;
 }
 
 /** Native Node server backed by trevrpc-c and MsQuic. */
@@ -240,7 +284,7 @@ export class NodeServer {
 
   /** Starts accepting RPCs. The returned promise resolves after close. */
   serve(): Promise<void>;
-  /** Requests server shutdown. */
+  /** Requests graceful server shutdown and drains already admitted calls. */
   close(): void;
 }
 

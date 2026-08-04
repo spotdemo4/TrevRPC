@@ -141,9 +141,13 @@ test("Channel.connect honors an initial AbortSignal", async () => {
     WebTransport: FakeWebTransport,
     signal: controller.signal,
   });
-  controller.abort();
+  const reason = new Error("stop connecting");
+  controller.abort(reason);
 
-  await assert.rejects(connecting, (error) => error.code === Code.Cancelled);
+  await assert.rejects(
+    connecting,
+    (error) => error.code === Code.Cancelled && error.cause === reason,
+  );
 });
 
 test("Channel.connect does not start a pre-cancelled initial connection", async () => {

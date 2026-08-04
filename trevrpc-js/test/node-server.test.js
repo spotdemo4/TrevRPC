@@ -13,6 +13,7 @@ class FakeNativeServer {
   constructor() {
     this.port = 0;
     this.handlers = [];
+    this.closeCount = 0;
   }
 
   register(service, method, kind, handler) {
@@ -23,7 +24,9 @@ class FakeNativeServer {
     return Promise.resolve();
   }
 
-  close() {}
+  close() {
+    this.closeCount += 1;
+  }
 }
 
 class FakeNativeCall {
@@ -132,6 +135,37 @@ test("Node server metadata authorizer accepts and metrics record success", async
   assert.equal(finished[0].responseBodyLength, 2);
 });
 
+test("Node server accepts readonly number arrays as raw unary bodies", async () => {
+  const native = new FakeNativeServer();
+  const server = new NodeServer(native);
+  server.register("hello.v1.Greeter", "SayHello", RpcKind.Unary, () => [9, 8]);
+
+  const call = new FakeNativeCall(unaryRequest());
+  native.handlers[0].handler(call);
+  await waitForDispatch(call);
+
+  assert.deepEqual(call.responses[0].body, new Uint8Array([9, 8]));
+});
+
+test("Node raw client streaming sends one response message then terminal status", async () => {
+  const native = new FakeNativeServer();
+  const server = new NodeServer(native);
+  server.register(
+    "hello.v1.Greeter",
+    "LotsOfGreetings",
+    RpcKind.ClientStreaming,
+    () => new Uint8Array([7]),
+  );
+
+  const call = new FakeNativeCall({ ...unaryRequest(), kind: RpcKind.ClientStreaming });
+  native.handlers[0].handler(call);
+  await waitForDispatch(call);
+
+  assert.deepEqual(call.messages, [new Uint8Array([7])]);
+  assert.deepEqual(call.streamStatus, { status: Code.Ok, message: "", metadata: {} });
+  assert.deepEqual(call.responses, []);
+});
+
 test("Node server handler errors are logged and finished", async () => {
   const native = new FakeNativeServer();
   const finished = [];
@@ -179,6 +213,22 @@ test("Node server batches explicit streaming response batches", async () => {
   );
   assert.deepEqual(call.streamStatus, { status: Code.Ok, message: "", metadata: {} });
   assert.equal(finished[0].responseBodyLength, 4);
+});
+
+test("Node server shutdown leaves admitted calls for the native graceful drain", () => {
+  const native = new FakeNativeServer();
+  const server = new NodeServer(native);
+  let callClosed = 0;
+  server.activeCalls.add({
+    close() {
+      callClosed += 1;
+    },
+  });
+
+  server.close();
+
+  assert.equal(callClosed, 0);
+  assert.equal(native.closeCount, 1);
 });
 
 test("NodeServerCall sendMany falls back to single-message sends", async () => {
@@ -253,11 +303,10 @@ test("NodeServerCall uses native unary and batched send methods", async () => {
     },
     close() {},
   };
-  const call = new NodeServerCall(nativeCall);
-
-  await call.respond({ body: new Uint8Array([1]) });
-  await call.sendMessage(new Uint8Array([2]));
-  await call.sendMany([new Uint8Array([3]), new Uint8Array([4])]);
+  await new NodeServerCall(nativeCall).respond({ body: new Uint8Array([1]) });
+  const streamingCall = new NodeServerCall(nativeCall);
+  await streamingCall.sendMessage(new Uint8Array([2]));
+  await streamingCall.sendMany([new Uint8Array([3]), new Uint8Array([4])]);
 
   assert.deepEqual(used, ["respond", "sendMessage", "sendMessages"]);
 });

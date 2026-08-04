@@ -24,18 +24,24 @@ export const Code: Readonly<{
 
 export type StatusCode = (typeof Code)[keyof typeof Code];
 
-/** Error carrying a TrevRPC status code, message, and metadata. */
-export class TrevRpcError extends Error {
-  code: StatusCode;
-  statusMessage: string;
-  metadata: Metadata;
-
-  /** Creates a TrevRPC status error. */
-  constructor(code: number, message?: string, metadata?: Metadata);
+export interface TrevRpcErrorOptions extends ErrorOptions {
+  nativeCode?: number;
 }
 
-/** Error reported when a frame exceeds the configured size limit. */
-export class FrameTooLargeError extends Error {
+/** Error carrying a TrevRPC status code, message, and metadata. */
+export class TrevRpcError extends Error {
+  readonly code: StatusCode;
+  readonly statusMessage: string;
+  readonly metadata: Metadata;
+  readonly nativeCode?: number;
+  override readonly cause?: unknown;
+
+  /** Creates a TrevRPC status error. */
+  constructor(code: number, message?: string, metadata?: Metadata, options?: TrevRpcErrorOptions);
+}
+
+/** Resource-exhausted status reported when a frame exceeds the configured size limit. */
+export class FrameTooLargeError extends TrevRpcError {
   length: number;
   max: number;
 
@@ -277,19 +283,53 @@ export interface Transport {
 }
 
 export interface UnaryResponse<TResponse> {
-  message: TResponse;
-  metadata: Metadata;
+  readonly message: TResponse;
+  readonly metadata: Metadata;
 }
 
 export interface StreamStatus {
-  code: StatusCode;
-  message: string;
-  metadata: Metadata;
+  readonly code: StatusCode;
+  readonly message: string;
+  readonly metadata: Metadata;
 }
 
 export interface ResponseAsyncIterable<TResponse> extends AsyncIterable<TResponse> {
-  status: Promise<StreamStatus>;
+  readonly status: Promise<StreamStatus>;
+  close(reason?: unknown): Promise<void>;
 }
+
+declare const unaryServerResponseBrand: unique symbol;
+declare const streamingServerResponseBrand: unique symbol;
+
+export interface UnaryServerResponse<T> {
+  /** Opaque brand; construct responses with createUnaryResponse(). */
+  readonly [unaryServerResponseBrand]: true;
+  readonly message: T;
+  readonly metadata: Metadata;
+}
+
+export interface StreamingServerResponse<T> {
+  /** Opaque brand; construct responses with createStreamingResponse(). */
+  readonly [streamingServerResponseBrand]: true;
+  readonly messages: Iterable<T> | AsyncIterable<T>;
+  readonly status: StreamStatus;
+}
+
+/** Creates an opaque unary generated-server response envelope. */
+export function createUnaryResponse<T>(
+  message: T,
+  metadata?: MetadataInput,
+): UnaryServerResponse<T>;
+
+/** Creates an opaque streaming generated-server response envelope. */
+export function createStreamingResponse<T>(
+  messages: Iterable<T> | AsyncIterable<T>,
+  status?: {
+    code?: StatusCode;
+    message?: string;
+    metadata?: MetadataInput;
+  },
+): StreamingServerResponse<T>;
 
 export interface ClientStreamingCall<TRequest extends object, TResponse> {
   /** Sends one request message. */
@@ -303,7 +343,7 @@ export interface ClientStreamingCall<TRequest extends object, TResponse> {
   /** Closes the request stream and returns the final response envelope. */
   closeAndRecvWithResponse(): Promise<UnaryResponse<TResponse>>;
   /** Releases call resources without waiting for the response. */
-  close(): Promise<void>;
+  close(reason?: unknown): Promise<void>;
 }
 
 export interface BidirectionalStreamingCall<
@@ -321,7 +361,7 @@ export interface BidirectionalStreamingCall<
   /** Closes the request stream while keeping the response stream readable. */
   closeSend(): Promise<void>;
   /** Releases call resources without waiting for more responses. */
-  close(): Promise<void>;
+  close(reason?: unknown): Promise<void>;
 }
 
 export type ServiceClient = Record<
@@ -427,7 +467,7 @@ export interface WebTransportConstructorLike {
 
 export interface WebTransportCertificateHash {
   algorithm: string;
-  value: BufferSource;
+  value: ArrayBuffer | ArrayBufferView;
 }
 
 export interface BrowserWebTransportOptions {
@@ -462,6 +502,16 @@ export interface ChannelLifecycleOptions {
   onStateChange?(event: ChannelLifecycle): void;
 }
 
+type TrevRpcEventListener = ((event: Event) => void) | { handleEvent(event: Event): void };
+interface TrevRpcEventListenerOptions {
+  capture?: boolean;
+}
+interface TrevRpcAddEventListenerOptions extends TrevRpcEventListenerOptions {
+  once?: boolean;
+  passive?: boolean;
+  signal?: AbortSignal;
+}
+
 export interface RpcChannel extends Transport, EventTarget {
   readonly ready: boolean;
   readonly state: ChannelState;
@@ -470,43 +520,28 @@ export interface RpcChannel extends Transport, EventTarget {
   close(closeInfo?: WebTransportCloseInfoLike): void;
 }
 
-export interface ChannelOptions extends WebTransportOptions, ChannelLifecycleOptions {
+export interface BrowserChannelOptions extends WebTransportOptions, ChannelLifecycleOptions {
   /** Bounds initial readiness only. Later reconnects continue until close(). */
   timeoutMs?: number;
   /** Cancels initial readiness only. Later reconnects continue until close(). */
   signal?: AbortSignal;
 }
 
-export interface NodeConnectOptions {
-  host?: string;
-  port?: number;
-  caCertFile?: string;
-  skipCertificateValidation?: boolean;
-  maxStreamsPerSession?: number;
-  idleTimeoutMs?: number;
-  maxFrameSize?: number;
-  maxPendingSendBytes?: number;
-  maxPendingSendCount?: number;
-  signal?: AbortSignal;
-}
-
-export interface ConnectOptions extends ChannelOptions, NodeConnectOptions {}
-
-/** Opens a channel for the current JavaScript runtime. */
-export function connect(url: string | URL, options?: ConnectOptions): Promise<Channel>;
+/** Opens a browser channel and waits for its first ready generation. */
+export function connect(url: string | URL, options?: BrowserChannelOptions): Promise<Channel>;
 
 /** Application channel with background connection reconnection. */
 export class Channel extends EventTarget implements RpcChannel {
   readonly url: string | URL;
-  readonly options: Readonly<ChannelOptions>;
+  readonly options: Readonly<BrowserChannelOptions>;
   readonly ready: boolean;
   readonly state: ChannelState;
   readonly generation: number;
 
-  constructor(url: string | URL, options?: ChannelOptions);
+  constructor(url: string | URL, options?: BrowserChannelOptions);
 
   /** Creates a channel and waits for its first ready generation. */
-  static connect(url: string | URL, options?: ChannelOptions): Promise<Channel>;
+  static connect(url: string | URL, options?: BrowserChannelOptions): Promise<Channel>;
   /** Waits for the current or next connection generation to become ready. */
   waitUntilReady(): Promise<void>;
   /** Sends a unary call on the current generation without replaying it. */
@@ -522,11 +557,21 @@ export class Channel extends EventTarget implements RpcChannel {
   addEventListener(
     type: "statechange" | ChannelState,
     callback: (event: ChannelLifecycleEvent) => void,
-    options?: boolean | AddEventListenerOptions,
+    options?: boolean | TrevRpcAddEventListenerOptions,
+  ): void;
+  addEventListener(
+    type: string,
+    callback: TrevRpcEventListener | null,
+    options?: boolean | TrevRpcAddEventListenerOptions,
   ): void;
   removeEventListener(
     type: "statechange" | ChannelState,
     callback: (event: ChannelLifecycleEvent) => void,
-    options?: boolean | EventListenerOptions,
+    options?: boolean | TrevRpcEventListenerOptions,
+  ): void;
+  removeEventListener(
+    type: string,
+    callback: TrevRpcEventListener | null,
+    options?: boolean | TrevRpcEventListenerOptions,
   ): void;
 }

@@ -1,285 +1,202 @@
 # trevrpc-js
 
-The examples use JavaScript bindings generated from
-[`examples/greeter/greeter.proto`](examples/greeter/greeter.proto). Its Greeter service defines
-unary, server-streaming, client-streaming, and bidirectional-streaming methods.
+`trevrpc-js` is the ESM-only JavaScript runtime and protobuf.js generator for TrevRPC. Version 0.2.0 is the Milestone 6 compatibility break; see [MIGRATING-M6.md](MIGRATING-M6.md).
 
-## Client
+## Generated files
 
-### Browser application
+For every protobuf file containing services, `protoc-gen-trevrpc-js` emits an ordinary browser-safe client module and a separate Node server module:
 
-Create a channel and generated client once, then reuse them across calls:
+```text
+greeter.trevrpc.js
+greeter.trevrpc.d.ts
+greeter.node.trevrpc.js
+greeter.node.trevrpc.d.ts
+```
+
+The ordinary module contains the protobuf root, service descriptors, typed clients, and client factories. The Node companion contains typed handler interfaces and registration helpers backed by `trevrpc-js/node/generated`.
+
+```sh
+protoc \
+  --plugin=protoc-gen-trevrpc-js=./node_modules/.bin/protoc-gen-trevrpc-js \
+  --trevrpc-js_out=. \
+  greeter.proto
+```
+
+Generator options are `runtime_import`, `runtime_type_import`, `node_runtime_import`, `node_runtime_type_import`, and `file_suffix`. Runtime type imports default to their matching runtime import for bare and relative specifiers. URL specifiers such as `file:` require an explicit type import because TypeScript NodeNext does not resolve them in declarations. A Node import is never inferred by appending `/node` to another specifier.
+
+## Browser clients
+
+Browser declarations accept only `BrowserChannelOptions`.
 
 ```js
 import { connect } from "trevrpc-js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
-const channel = await connect("https://localhost:50051/trevrpc", { timeoutMs: 10_000 });
-try {
-  const client = new GreeterClient(channel, { timeoutMs: 5_000 });
-  const reply = await client.sayHello({ name: "TrevRPC" });
-} finally {
-  channel.close({ closeCode: 0, reason: "client shutdown" });
-}
-```
-
-Close the channel with `channel.close({ closeCode: 0, reason: "done" })` after all calls have
-completed, preferably from an application-level `finally` block. Channels own persistent reconnect
-loops and must be closed during shutdown.
-
-`connect()` retries failed initial connections until it becomes ready, its `timeoutMs` expires, its
-`signal` is aborted, or the channel is closed. The timeout and signal only bound initial readiness;
-after connecting, future connection losses keep reconnecting for later calls until `close()`.
-
-### Unary
-
-```js
-const reply = await client.sayHello({ name: "TrevRPC" });
-console.log(reply.message);
-```
-
-### Server streaming
-
-The generated method returns an async iterable. Completing the loop consumes the terminal RPC
-status:
-
-```js
-const replies = await client.lotsOfReplies({ name: "TrevRPC" });
-for await (const reply of replies) {
-  console.log(reply.message);
-}
-```
-
-### Client streaming
-
-```js
-const greetings = await client.lotsOfGreetings();
-await greetings.send({ name: "Alice" });
-await greetings.send({ name: "Bob" });
-
-const reply = await greetings.closeAndRecv();
-console.log(reply.message);
-```
-
-`closeAndRecv` half-closes the request side, receives the single response, validates the terminal
-status, and releases the call.
-
-### Bidirectional streaming
-
-Requests and responses may be interleaved. `closeSend` half-closes the request side; continue
-receiving until `recv` returns `undefined`:
-
-```js
-const stream = await client.bidiHello();
-try {
-  for (const name of ["Alice", "Bob"]) {
-    await stream.send({ name });
-    const reply = await stream.recv();
-    if (reply == null) {
-      throw new Error("BidiHello response stream ended early");
-    }
-    console.log(reply.message);
-  }
-
-  await stream.closeSend();
-  for (;;) {
-    const reply = await stream.recv();
-    if (reply == null) {
-      break;
-    }
-    console.log(reply.message);
-  }
-} finally {
-  await stream.close();
-}
-```
-
-Use independent sender and receiver tasks when a protocol must continuously read and write large
-bidi streams.
-
-### Browser transport options
-
-Browsers pass WebTransport constructor options directly to `connect`:
-
-```js
 const channel = await connect("https://localhost:50051/trevrpc", {
+  timeoutMs: 10_000,
   congestionControl: "low-latency",
   serverCertificateHashes: [{ algorithm: "sha-256", value: certificateHash }],
 });
 try {
-  const client = new GreeterClient(channel);
+  const client = new GreeterClient(channel, { timeoutMs: 5_000 });
   const reply = await client.sayHello({ name: "TrevRPC" });
+  console.log(reply.message);
 } finally {
   channel.close({ closeCode: 0, reason: "client shutdown" });
 }
 ```
 
-### Node application
+Native TLS bypass, certificate validation, MsQuic buffering, and native stream options are intentionally unavailable under browser or Bundler resolution.
 
-Node applications use the same root channel API backed by native QUIC:
+## Node clients
+
+Under Node conditions, the root package uses the native channel. The explicit `trevrpc-js/node` subpath also exports `Channel`, `NodeServer`, and `NodeServerCall`.
 
 ```js
 import { connect } from "trevrpc-js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
-const channel = await connect("https://localhost:50051", { timeoutMs: 10_000 });
+const channel = await connect("https://localhost:50051", {
+  timeoutMs: 10_000,
+  caCertFile: "localhost-cert.pem",
+});
 try {
+  console.log(channel.endpoint); // frozen { host, port }
+  console.log(channel.options); // frozen effective NodeChannelOptions
   const client = new GreeterClient(channel, { timeoutMs: 5_000 });
-  const reply = await client.sayHello({ name: "TrevRPC" });
+  console.log((await client.sayHello({ name: "TrevRPC" })).message);
 } finally {
   channel.close();
 }
 ```
 
-Call `channel.close()` during application shutdown. Node observes native connection shutdowns and
-starts reconnecting even while idle. An RPC already assigned to the failed connection still fails;
-channels never replay or retry calls.
+URL and `{ host, port, ...options }` forms normalize to the same public state. Channels reconnect for future calls after native transport loss, but never replay or resume an operation that already failed.
 
-### Low-level transports
+## Streaming clients
 
-`RawWebTransport` wraps an established browser WebTransport session, while `RawNodeTransport` opens
-one native connection. These advanced paths do not reconnect automatically and must also be closed
-by the application:
+Server-streaming methods resolve to `ResponseAsyncIterable<T>`:
 
 ```js
-import { RawWebTransport } from "trevrpc-js/advanced";
-
-const session = new WebTransport("https://localhost:50051/trevrpc");
-await session.ready;
-const browserTransport = new RawWebTransport(session);
+const replies = await client.lotsOfReplies({ name: "TrevRPC" });
 try {
-  // Use browserTransport for calls.
+  for await (const reply of replies) {
+    console.log(reply.message);
+  }
+  const terminal = await replies.status;
+  console.log(terminal.code, terminal.message, terminal.metadata);
 } finally {
-  browserTransport.close({ closeCode: 0, reason: "client shutdown" });
+  await replies.close();
 }
 ```
 
-```js
-import { RawNodeTransport } from "trevrpc-js/node/advanced";
+Full clean consumption resolves `status`. A non-OK terminal status rejects iteration and `status` with the same `TrevRpcError`. `close()`, iterator `return()`, and breaking a `for await` loop cancel the stream and reject `status` with `Code.Cancelled`. Consuming a valid terminal frame claims terminal precedence and cancels the absolute deadline, but `status` settles only after trailing EOF is validated; merely buffering a status frame is not completion.
 
-const nodeTransport = await RawNodeTransport.connect("https://localhost:50051");
+The status/error text distinction is deliberate:
+
+- `StreamStatus.message` is the unmodified peer terminal message.
+- `TrevRpcError.statusMessage` is the unmodified peer error message.
+- `TrevRpcError.message` is formatted JavaScript text such as `"Unavailable: down"`.
+
+Unary and client-streaming terminal metadata is available through `sayHelloWithResponse()` and `closeAndRecvWithResponse()`.
+
+Client streaming:
+
+```js
+const call = await client.lotsOfGreetings();
+await call.send({ name: "Alice" });
+await call.send({ name: "Bob" });
+const { message, metadata } = await call.closeAndRecvWithResponse();
+```
+
+Bidirectional streaming:
+
+```js
+const call = await client.bidiHello();
 try {
-  // Use nodeTransport for calls.
+  await call.send({ name: "Alice" });
+  console.log(await call.recv());
+  await call.closeSend();
+  while ((await call.recv()) != null) {}
+  console.log(await call.status);
 } finally {
-  nodeTransport.close();
+  await call.close();
 }
 ```
 
-## Server
+`timeoutMs` is one absolute RPC deadline that begins before transport setup and covers upload, send, receive, and cleanup. The same `DeadlineExceeded` object wins signal and rejection settlement. `streamIdleTimeoutMs` remains an independent per-read inactivity bound.
 
-Register the generated service descriptor with `NodeServer`. Raw Node handlers decode request
-bodies and encode response messages with the generated protobuf root:
+## Typed Node servers
+
+Import the generated registration helper from the Node companion. Direct protobuf responses are never confused with metadata envelopes, even when they have `message` or `messages` properties.
 
 ```js
-import { RpcStreamFrameKind } from "trevrpc-js";
+import { Code, createStreamingResponse, createUnaryResponse } from "trevrpc-js";
 import { NodeServer } from "trevrpc-js/node";
-import { GreeterService, root } from "./greeter.trevrpc.js";
+import { registerGreeterServer } from "./greeter.node.trevrpc.js";
 
-const HelloRequest = root.lookupType("example.greeter.HelloRequest");
-const HelloReply = root.lookupType("example.greeter.HelloReply");
-
-function encodeReply(message) {
-  return HelloReply.encode({ message }).finish();
-}
-```
-
-### Unary
-
-```js
-function sayHello(call) {
-  const request = HelloRequest.decode(call.request.body);
-  return encodeReply(`Hello, ${request.name || "world"}`);
-}
-```
-
-### Server streaming
-
-Return an async iterable of encoded response messages:
-
-```js
-async function* lotsOfReplies(call) {
-  const request = HelloRequest.decode(call.request.body);
-  const name = request.name || "world";
-  yield encodeReply(`Hello, ${name}`);
-  yield encodeReply(`Goodbye, ${name}`);
-}
-```
-
-### Client streaming
-
-Receive request frames until EOF, then yield the single encoded response:
-
-```js
-async function* lotsOfGreetings(call) {
-  const names = [];
-  for (;;) {
-    const frame = await call.recv();
-    if (frame == null) {
-      break;
-    }
-    if (frame.kind === RpcStreamFrameKind.Message) {
-      names.push(HelloRequest.decode(frame.body).name);
-    }
-  }
-  yield encodeReply(`Hello, ${names.join(", ")}`);
-}
-```
-
-### Bidirectional streaming
-
-An async generator can consume request frames and emit encoded responses with natural
-backpressure:
-
-```js
-async function* bidiHello(call) {
-  for (;;) {
-    const frame = await call.recv();
-    if (frame == null) {
-      return;
-    }
-    if (frame.kind === RpcStreamFrameKind.Message) {
-      const request = HelloRequest.decode(frame.body);
-      yield encodeReply(`Stream hello, ${request.name}`);
-    }
-  }
-}
-```
-
-Create the native Node server and register all four handlers. `NodeServer` sends each message from
-the returned async iterables and appends an OK terminal status:
-
-```js
 const server = await NodeServer.listen({
   host: "127.0.0.1",
   port: 50051,
   certFile: "localhost-cert.pem",
   keyFile: "localhost-key.pem",
-  enableHttp3: true,
-  http3Path: "/trevrpc",
 });
 
-server.registerService(GreeterService, {
-  sayHello,
-  lotsOfReplies,
-  lotsOfGreetings,
-  bidiHello,
+registerGreeterServer(server, {
+  sayHello(request, call) {
+    console.log(call.deadline, call.signal.aborted);
+    return createUnaryResponse(
+      { message: `Hello, ${request.name || "world"}` },
+      { trailer: "unary" },
+    );
+  },
+
+  async lotsOfGreetings(requests) {
+    const names = [];
+    for await (const request of requests) names.push(request.name);
+    return createUnaryResponse({ message: names.join(", ") }, { trailer: "client-stream" });
+  },
+
+  lotsOfReplies(request) {
+    return createStreamingResponse([{ message: request.name }], {
+      code: Code.Ok,
+      message: "complete",
+      metadata: { trailer: "server-stream" },
+    });
+  },
+
+  async *bidiHello(requests) {
+    for await (const request of requests) yield { message: request.name };
+  },
 });
 
 await server.serve();
 ```
 
-`enableHttp3` adds ordinary HTTP/3 POST serving to the same native MsQuic listener used by native
-QUIC and WebTransport. An optional synchronous `http3Admission` callback is bounded by
-`initialRequestTimeoutMs`.
+Client-streaming completion uses streaming wire semantics: exactly one response message followed by exactly one terminal status; it never uses unary `respond()`.
 
-See [`examples/greeter/client.js`](examples/greeter/client.js) for a complete browser client.
+`NodeServerCall.signal` covers effective deadlines, server shutdown, local close, and cancellation observed by native I/O. The current native bridge cannot promptly report remote peer cancellation while a handler is idle and performs no call I/O; cancellation becomes observable when the handler next enters native call I/O.
 
-## Native Development
+## Native package support
 
-`npm run build:native` creates the production addon without test-only debug hooks. Build the test
-addon before running the native tests:
+The core tarball is platform-neutral. Native code is supplied by the exact optional package `@trev/trevrpc-js-native-linux-x64-gnu@0.2.0`.
+
+Initial support is Linux x86-64, glibc 2.39 or newer, and Node 20, 22, or 24. Browser usage still installs and runs on Darwin, ARM, and musl. Requesting a native Node channel on an unsupported or incomplete installation throws `TrevRpcError(Code.Unavailable)` with the detected target, supported targets, expected optional package, whether loading was missing or failed, and the original loader error as `cause`.
+
+All addon errors crossing public Node transport and server boundaries become `TrevRpcError` unless already normalized. `nativeCode` and `cause` preserve native provenance.
+
+## Package resolution
+
+Conditional ESM exports are authoritative; the package has no legacy top-level `main` or `types`. Use TypeScript NodeNext resolution for Node consumers and Bundler resolution with browser conditions for browser consumers.
+
+## Native development
+
+Installation never builds native code. In a source checkout:
 
 ```sh
 npm run build:native:test
 npm test
+npm run build:native
+npm run verify:native:production
 ```
+
+The development fallback is only `build/native/trevrpc_native.node` in a source checkout.

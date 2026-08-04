@@ -1,5 +1,10 @@
 import { FrameTooLargeError, invalidArgument, unavailable } from "./status.js";
-import { RpcStreamFrame, RpcStreamFrameKind } from "./wire.js";
+import {
+  RpcStreamFrame,
+  RpcStreamFrameKind,
+  preflightWireMessage,
+  validateWireMessage,
+} from "./wire.js";
 
 export const DefaultMaxFrameSize = 4 * 1024 * 1024;
 
@@ -17,9 +22,15 @@ export function marshalMessage(messageType, message) {
 /** Decodes a protobuf message body. */
 export function unmarshalMessage(messageType, body) {
   try {
+    preflightWireMessage(messageType, body);
     return messageType.decode(body);
   } catch (error) {
-    throw invalidArgument(`failed to decode protobuf message: ${error?.message ?? String(error)}`);
+    const failure = invalidArgument(
+      `failed to decode protobuf message: ${error?.message ?? String(error)}`,
+    );
+    failure.reason = error?.reason ?? "malformed_protobuf";
+    failure.cause = error;
+    throw failure;
   }
 }
 
@@ -103,6 +114,16 @@ export function decodeFrame(messageType, body) {
 /** Decodes a streaming RPC frame body using a fast path for common message frames. */
 export function decodeStreamFrameBody(body) {
   const bytes = byteView(body);
+  try {
+    preflightWireMessage(RpcStreamFrame, bytes);
+  } catch (error) {
+    const failure = invalidArgument(
+      `failed to decode protobuf message: ${error?.message ?? String(error)}`,
+    );
+    failure.reason = error?.reason ?? "malformed_protobuf";
+    failure.cause = error;
+    throw failure;
+  }
   if (bytes.byteLength === 0) {
     return streamFrameMessage(EmptyBytes);
   }
@@ -138,19 +159,20 @@ export function decodeStreamFrameBody(body) {
         requireWireType(wireType, 2, "invalid stream frame body wire type");
         frameBody = consumeLengthDelimited(bytes, cursor, "invalid stream frame body");
         break;
-      case 5:
-        return decodeFrame(RpcStreamFrame, bytes);
+      case 5: {
+        const frame = decodeFrame(RpcStreamFrame, bytes);
+        validateDecodedWireMessage(RpcStreamFrame, frame);
+        return frame;
+      }
       default:
         skipProtoField(bytes, cursor, wireType);
         break;
     }
   }
 
-  if (kind !== RpcStreamFrameKind.Message && kind !== RpcStreamFrameKind.Status) {
-    throw invalidArgument("stream frame contained an unknown frame kind");
-  }
-
-  return { kind, status, message, body: frameBody, metadata: {} };
+  const frame = { kind, status, message, body: frameBody, metadata: {} };
+  validateDecodedWireMessage(RpcStreamFrame, frame);
+  return frame;
 }
 
 /** Writes one length-prefixed protobuf frame. */
@@ -295,7 +317,9 @@ export class FrameReader {
           return null;
         }
 
-        throw unavailable("transport unavailable: stream ended in the middle of a frame");
+        const error = unavailable("transport unavailable: stream ended in the middle of a frame");
+        error.reason = "incomplete_frame";
+        throw error;
       }
 
       if (value == null || value.byteLength === 0) {
@@ -442,6 +466,17 @@ export function frameBodyLength(header, maxFrameSize = DefaultMaxFrameSize) {
   }
 
   return length;
+}
+
+function validateDecodedWireMessage(messageType, message) {
+  try {
+    validateWireMessage(messageType, message);
+  } catch (error) {
+    const failure = invalidArgument(error?.message ?? String(error));
+    failure.reason = error?.reason;
+    failure.cause = error;
+    throw failure;
+  }
 }
 
 function prepareMessage(messageType, message) {

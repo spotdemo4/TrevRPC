@@ -542,13 +542,9 @@ test("server handlers implement all four benchmark RPCs", async () => {
     requestFrame("2", 2, 0),
     { kind: RpcStreamFrameKind.Status, status: Code.Ok },
   ];
-  const summaries = [];
-  for await (const body of handlers.clientStream(receivingCall(clientFrames))) {
-    summaries.push(BenchmarkSummary.decode(body));
-  }
-  assert.equal(summaries.length, 1);
-  assert.equal(String(summaries[0].messageCount), "3");
-  assert.equal(String(summaries[0].payloadBytes), "6");
+  const summary = BenchmarkSummary.decode(await handlers.clientStream(receivingCall(clientFrames)));
+  assert.equal(String(summary.messageCount), "3");
+  assert.equal(String(summary.payloadBytes), "6");
 
   const serverResponses = [];
   const responseStream = handlers.serverStream({

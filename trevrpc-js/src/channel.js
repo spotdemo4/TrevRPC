@@ -287,9 +287,14 @@ function normalizeChannelOptions(options) {
 }
 
 function initialAbortError(signal) {
-  return signal.reason?.name === "TrevRpcError"
-    ? signal.reason
-    : cancelled("initial connection cancelled");
+  if (signal.reason?.name === "TrevRpcError") {
+    return signal.reason;
+  }
+  const error = cancelled("initial connection cancelled");
+  if (signal.reason !== undefined) {
+    Object.defineProperty(error, "cause", { configurable: true, value: signal.reason });
+  }
+  return error;
 }
 
 function reconnectDelay(options, exponent) {

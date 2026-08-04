@@ -180,13 +180,12 @@ export function createBenchmarkHandlers() {
       return encodeResponseMessage(responseForRequest(request));
     },
 
-    async *clientStream(call) {
+    async clientStream(call) {
       const summary = emptySummary();
       for (;;) {
         const body = requestBody(await call.recv());
         if (body == null) {
-          yield BenchmarkSummary.encode(summaryResponse(summary)).finish();
-          return;
+          return BenchmarkSummary.encode(summaryResponse(summary)).finish();
         }
         addSummaryRequest(summary, BenchmarkRequest.decode(body));
       }

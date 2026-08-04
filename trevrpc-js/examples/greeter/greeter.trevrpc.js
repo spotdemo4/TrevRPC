@@ -76,6 +76,11 @@ export class GreeterClient {
     return this._client.sayHello(request, options);
   }
 
+  /** Calls the SayHello RPC and returns response metadata. */
+  sayHelloWithResponse(request, options = {}) {
+    return this._client.sayHelloWithResponse(request, options);
+  }
+
   /** Calls the LotsOfReplies RPC. */
   lotsOfReplies(request, options = {}) {
     return this._client.lotsOfReplies(request, options);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
@@ -24,6 +24,7 @@ import {
   RpcResponse,
   RpcStreamFrame,
   RpcStreamFrameKind,
+  TrevRpcError,
   WireVersion,
   bidirectionalStreaming,
   clientStreaming,
@@ -97,6 +98,7 @@ test("package entry points separate channels and raw transports", async () => {
   assert.equal(root.Channel, node.Channel);
   assert.equal(root.RawWebTransport, undefined);
   assert.equal(root.RawNodeTransport, undefined);
+  assert.equal(root.RequestWriterSettlement, undefined);
   assert.equal(node.RawNodeTransport, undefined);
   assert.equal(typeof browserAdvanced.RawWebTransport, "function");
   assert.equal(typeof nodeAdvanced.RawNodeTransport, "function");
@@ -141,6 +143,20 @@ test("browser WebTransport connect reports unsupported runtime", async () => {
     RawWebTransport.connect("https://example.test/trevrpc", { WebTransport: {} }),
     (error) => error.code === Code.Unavailable,
   );
+});
+
+test("browser raw transport maps explicit abort reasons to cancellation with cause", async () => {
+  const reason = new Error("stop browser call");
+  const controller = new AbortController();
+  controller.abort(reason);
+  const client = new RawWebTransport({ ready: Promise.resolve() });
+
+  await assert.rejects(client.call({}, { signal: controller.signal }), (error) => {
+    assert.ok(error instanceof TrevRpcError);
+    assert.equal(error.code, Code.Cancelled);
+    assert.equal(error.cause, reason);
+    return true;
+  });
 });
 
 test("browser WebTransport stream open reports unsupported bidirectional streams", async () => {
@@ -384,6 +400,14 @@ test("frame length boundary cases are stable", () => {
 
     assert.throws(() => frameBodyLength(header, 16), FrameTooLargeError);
   }
+});
+
+test("frame size failures use the public TrevRpcError hierarchy", () => {
+  const error = new FrameTooLargeError(17, 16);
+
+  assert.ok(error instanceof TrevRpcError);
+  assert.equal(error.code, Code.ResourceExhausted);
+  assert.equal(error.statusMessage, "frame length 17 exceeds maximum 16");
 });
 
 test("stream message fast path matches protobuf encoding", () => {
@@ -808,6 +832,37 @@ test("unknown response stream frame kind maps to invalid argument", async () => 
   );
 });
 
+test("response stream classifies malformed reads after terminal status as trailing", async () => {
+  const Hello = helloTestType();
+  const malformed = invalidArgument("malformed trailing frame");
+  malformed.reason = "malformed_protobuf";
+  const transport = {
+    async streamingCall() {
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok });
+          throw malformed;
+        },
+      };
+    },
+  };
+
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { streamIdleTimeoutMs: undefined },
+  );
+
+  await assert.rejects(
+    stream[Symbol.asyncIterator]().next(),
+    (error) => error.code === Code.Internal && error.reason === "trailing_frame",
+  );
+});
+
 test("response streams consume transport frame batches", async () => {
   const Hello = helloTestType();
   let returned = false;
@@ -1094,7 +1149,7 @@ test("Node transport uses native unary and stream send methods", async () => {
   ]);
 });
 
-test("Node transport reads native response body batches and delays terminal status", async () => {
+test("Node transport returns native response bodies with terminal status", async () => {
   const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
   const status = RpcStreamFrame.create({
     kind: RpcStreamFrameKind.Status,
@@ -1120,10 +1175,12 @@ test("Node transport reads native response body batches and delays terminal stat
         async recvBodyBatch(max) {
           observedMax = max;
           recvBodyBatchCalls += 1;
-          return {
-            bodies: [new Uint8Array([1]), new Uint8Array([2, 3])],
-            status,
-          };
+          return recvBodyBatchCalls === 1
+            ? {
+                bodies: [new Uint8Array([1]), new Uint8Array([2, 3])],
+                status,
+              }
+            : null;
         },
         close() {
           closed = true;
@@ -1150,18 +1207,14 @@ test("Node transport reads native response body batches and delays terminal stat
     first.value.bodies.map((body) => Array.from(body)),
     [[1], [2, 3]],
   );
-  assert.equal(first.value.status, null);
+  assert.equal(first.value.status.status, Code.Ok);
+  assert.deepEqual(first.value.status.metadata.trailer, new Uint8Array([7]));
   assert.equal(closed, false);
 
-  const second = await iterator.nextBodyBatch();
-
-  assert.equal(second.done, false);
-  assert.deepEqual(second.value.bodies, []);
-  assert.equal(second.value.status.status, Code.Ok);
-  assert.deepEqual(second.value.status.metadata.trailer, new Uint8Array([7]));
+  assert.deepEqual(await iterator.nextBodyBatch(), { done: true, value: undefined });
   assert.equal(closed, true);
   assert.equal(observedMax, 32);
-  assert.equal(recvBodyBatchCalls, 1);
+  assert.equal(recvBodyBatchCalls, 2);
 });
 
 test("Node transport terminal OK reports already-settled local upload errors", async () => {
@@ -1200,10 +1253,10 @@ test("Node transport terminal OK reports already-settled local upload errors", a
     batchedFrameStream([[new Uint8Array([1])]]),
   );
 
-  await assert.rejects(
-    responses[Symbol.asyncIterator]().next(),
-    (error) => error.code === Code.InvalidArgument,
-  );
+  const iterator = responses[Symbol.asyncIterator]();
+  const terminal = await iterator.next();
+  assert.equal(terminal.value.status, Code.Ok);
+  await assert.rejects(iterator.return(), (error) => error.code === Code.InvalidArgument);
 });
 
 test("Node transport terminal error wins over local upload errors", async () => {
@@ -1708,6 +1761,33 @@ test("Node transport skips native cancellation without signal", async () => {
   assert.equal(startStreamArgumentCount, 1);
 });
 
+test("client deadlines above the platform timer limit do not fire immediately", async () => {
+  const Hello = helloTestType();
+  let signal;
+  const response = await unary(
+    {
+      call(_request, options) {
+        signal = options.signal;
+        return new Promise((resolve) =>
+          setTimeout(
+            () => resolve({ status: Code.Ok, body: Hello.encode({ value: "done" }).finish() }),
+            5,
+          ),
+        );
+      },
+    },
+    "hello.v1.Greeter",
+    "SayHello",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { timeoutMs: 2_147_483_648 },
+  );
+
+  assert.equal(response.value, "done");
+  assert.equal(signal.aborted, false);
+});
+
 test("unary timeout aborts transport signal", async () => {
   const root = createRoot({
     nested: {
@@ -1843,7 +1923,7 @@ test("client streaming deadline cancels pending request upload", async () => {
               return new Promise(() => {});
             },
             return() {
-              return Promise.resolve({ done: true, value: undefined });
+              return Promise.reject(invalidArgument("deadline cleanup failed"));
             },
           };
         },
@@ -2075,10 +2155,10 @@ test("WebTransport terminal OK does not hide local upload error", async () => {
     requestBody,
   );
 
-  await assert.rejects(
-    responses[Symbol.asyncIterator]().next(),
-    (error) => error.code === Code.InvalidArgument,
-  );
+  const iterator = responses[Symbol.asyncIterator]();
+  const terminal = await iterator.next();
+  assert.equal(terminal.value.status, Code.Ok);
+  await assert.rejects(iterator.return(), (error) => error.code === Code.InvalidArgument);
 });
 
 test("WebTransport terminal OK ignores browser upload cleanup transport closes", async () => {
@@ -2236,20 +2316,352 @@ test("WebTransport response stream return is idempotent after local upload error
   assert.equal(cancels, cancelsAfterFirstReturn);
 });
 
-test("generator emits JavaScript service clients", () => {
+test("Node and WebTransport join delayed FIN with terminal precedence", async (t) => {
+  for (const runtime of ["node", "webtransport"]) {
+    await t.test(`${runtime} local FIN failure beats terminal OK`, async () => {
+      const uploadError = invalidArgument("delayed local FIN failed");
+      const scenario = await requestWriterScenario(runtime, Code.Ok);
+      const terminal = await scenario.iterator.next();
+
+      assert.equal(terminal.value.status, Code.Ok);
+      const returned = scenario.iterator.return();
+      await assertPending(returned);
+      scenario.writer.reject(uploadError);
+      await assert.rejects(returned, (error) => error.code === Code.InvalidArgument);
+      assert.equal(scenario.closeCount(), 1);
+    });
+
+    await t.test(`${runtime} terminal non-OK beats delayed FIN failure`, async () => {
+      const scenario = await requestWriterScenario(runtime, Code.PermissionDenied);
+      const terminal = await scenario.iterator.next();
+
+      assert.equal(terminal.value.status, Code.PermissionDenied);
+      const returned = scenario.iterator.return();
+      await assertPending(returned);
+      scenario.writer.reject(cleanupWriterError(runtime));
+      assert.deepEqual(await returned, { done: true, value: undefined });
+      assert.equal(scenario.closeCount(), 1);
+    });
+  }
+});
+
+test("Node and WebTransport RPC completion waits for delayed FIN failure", async (t) => {
+  const Hello = helloTestType();
+  for (const runtime of ["node", "webtransport"]) {
+    await t.test(runtime, async () => {
+      const scenario = await requestWriterScenario(runtime, Code.Ok);
+      const stream = await serverStreaming(
+        {
+          async streamingCall() {
+            return scenario.iterator;
+          },
+        },
+        "hello.v1.Greeter",
+        "LotsOfReplies",
+        Hello,
+        Hello,
+        { value: "Trev" },
+        { streamIdleTimeoutMs: undefined },
+      );
+      const completed = stream[Symbol.asyncIterator]().next();
+
+      await scenario.writerStarted;
+      await flushMicrotasks();
+      await assertPending(completed);
+      scenario.writer.reject(invalidArgument("delayed FIN failed"));
+      await assert.rejects(completed, (error) => error.code === Code.InvalidArgument);
+    });
+  }
+});
+
+test("Node and WebTransport surface remote non-OK over cleanup cancellation", async (t) => {
+  const Hello = helloTestType();
+  for (const runtime of ["node", "webtransport"]) {
+    await t.test(runtime, async () => {
+      const scenario = await requestWriterScenario(runtime, Code.PermissionDenied);
+      const stream = await serverStreaming(
+        {
+          async streamingCall() {
+            return scenario.iterator;
+          },
+        },
+        "hello.v1.Greeter",
+        "LotsOfReplies",
+        Hello,
+        Hello,
+        { value: "Trev" },
+        { streamIdleTimeoutMs: undefined },
+      );
+      const completed = stream[Symbol.asyncIterator]().next();
+
+      await scenario.writerStarted;
+      await flushMicrotasks();
+      scenario.writer.reject(cleanupWriterError(runtime));
+      await assert.rejects(completed, (error) => error.code === Code.PermissionDenied);
+    });
+  }
+});
+
+test("Node and WebTransport classify only cleanup-committed writer failures", async (t) => {
+  for (const runtime of ["node", "webtransport"]) {
+    await t.test(`${runtime} suppresses cleanup writer failure after terminal OK`, async () => {
+      const scenario = await requestWriterScenario(runtime, Code.Ok);
+      const terminal = await scenario.iterator.next();
+      assert.equal(terminal.value.status, Code.Ok);
+
+      const returned = scenario.iterator.return();
+      scenario.writer.reject(cleanupWriterError(runtime));
+      assert.deepEqual(await returned, { done: true, value: undefined });
+    });
+
+    await t.test(
+      `${runtime} reports matching writer failure committed before cleanup`,
+      async () => {
+        const scenario = await requestWriterScenario(runtime, Code.Ok, { holdResponse: true });
+        await scenario.writerStarted;
+        scenario.writer.reject(cleanupWriterError(runtime));
+        await flushMicrotasks();
+        scenario.releaseResponse();
+
+        const terminal = await scenario.iterator.next();
+        assert.equal(terminal.value.status, Code.Ok);
+        await assert.rejects(scenario.iterator.return());
+        assert.deepEqual(await scenario.iterator.return(), { done: true, value: undefined });
+      },
+    );
+  }
+});
+
+test("Node and WebTransport preserve writer failure provenance across delayed cleanup", async (t) => {
+  for (const runtime of ["node", "webtransport"]) {
+    await t.test(runtime, async () => {
+      const scenario = await requestWriterScenario(runtime, Code.Ok, {
+        holdResponse: true,
+        holdRequestReturn: true,
+      });
+      await scenario.writerStarted;
+      scenario.writer.reject(cleanupWriterError(runtime));
+      await scenario.requestReturnStarted;
+      scenario.releaseResponse();
+
+      const terminal = await scenario.iterator.next();
+      assert.equal(terminal.value.status, Code.Ok);
+      const returned = scenario.iterator.return();
+      await assertPending(returned);
+      scenario.releaseRequestReturn();
+
+      await assert.rejects(returned);
+    });
+  }
+});
+
+test("WebTransport terminal OK wins over an earlier remote STOP_SENDING", async () => {
+  const scenario = await requestWriterScenario("webtransport", Code.Ok, {
+    holdResponse: true,
+    holdRequestReturn: true,
+  });
+  await scenario.writerStarted;
+  scenario.writer.reject(new Error("Received STOP_SENDING."));
+  await scenario.requestReturnStarted;
+  scenario.releaseResponse();
+
+  const terminal = await scenario.iterator.next();
+  assert.equal(terminal.value.status, Code.Ok);
+  const returned = scenario.iterator.return();
+  scenario.releaseRequestReturn();
+
+  assert.deepEqual(await returned, { done: true, value: undefined });
+});
+
+test("Node and WebTransport normal exhaustion joins delayed writer failure", async (t) => {
+  for (const runtime of ["node", "webtransport"]) {
+    await t.test(`${runtime} raw iterator`, async () => {
+      const scenario = await requestWriterScenario(runtime, Code.Ok);
+      const terminal = await scenario.iterator.next();
+      assert.equal(terminal.value.status, Code.Ok);
+
+      const completed = scenario.iterator.next();
+      await assertPending(completed);
+      scenario.writer.reject(invalidArgument("delayed FIN failed"));
+
+      await assert.rejects(completed, (error) => error.code === Code.InvalidArgument);
+    });
+
+    await t.test(`${runtime} for await`, async () => {
+      const scenario = await requestWriterScenario(runtime, Code.Ok);
+      const terminalSeen = deferredPromise();
+      const frames = {
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              const result = await scenario.iterator.next();
+              if (!result.done && result.value.kind === RpcStreamFrameKind.Status) {
+                terminalSeen.resolve();
+              }
+              return result;
+            },
+          };
+        },
+      };
+      const completed = (async () => {
+        for await (const _frame of frames) {
+          // Consume through normal iterator exhaustion.
+        }
+      })();
+
+      await terminalSeen.promise;
+      await assertPending(completed);
+      scenario.writer.reject(invalidArgument("delayed FIN failed"));
+
+      await assert.rejects(completed, (error) => error.code === Code.InvalidArgument);
+    });
+  }
+});
+
+test("Node cleanup cancellation uses the platform ECANCELED value", async () => {
+  const scenario = await requestWriterScenario("node", Code.Ok);
+  const terminal = await scenario.iterator.next();
+  assert.equal(terminal.value.status, Code.Ok);
+
+  const completed = scenario.iterator.next();
+  await assertPending(completed);
+  const error = new Error("finishSend failed: operation cancelled");
+  error.nativeCode = -osConstants.errno.ECANCELED;
+  scenario.writer.reject(error);
+
+  assert.deepEqual(await completed, { done: true, value: undefined });
+});
+
+test("Node terminal status suppresses transport-closed request cleanup", async () => {
+  const scenario = await requestWriterScenario("node", Code.Ok);
+  const terminal = await scenario.iterator.next();
+  assert.equal(terminal.value.status, Code.Ok);
+
+  const completed = scenario.iterator.next();
+  await assertPending(completed);
+  const error = new Error("finishSend failed: connection closed");
+  error.nativeCode = -1001;
+  scenario.writer.reject(error);
+
+  assert.deepEqual(await completed, { done: true, value: undefined });
+});
+
+test("Node and WebTransport abandonment reports writer failure once without duplicate cleanup", async (t) => {
+  for (const runtime of ["node", "webtransport"]) {
+    await t.test(runtime, async () => {
+      const scenario = await requestWriterScenario(runtime, Code.Ok, { noResponse: true });
+      await scenario.writerStarted;
+      const returned = scenario.iterator.return();
+      scenario.writer.reject(invalidArgument("abandoned upload failed"));
+
+      await assert.rejects(returned, (error) => error.code === Code.InvalidArgument);
+      assert.deepEqual(await scenario.iterator.return(), { done: true, value: undefined });
+      assert.equal(scenario.closeCount(), 1);
+    });
+  }
+});
+
+test("Node and WebTransport terminal status finishes blocked request iteration", async (t) => {
+  const Hello = helloTestType();
+  for (const runtime of ["node", "webtransport"]) {
+    await t.test(runtime, async () => {
+      const scenario = await blockedRequestWriterScenario(runtime);
+      const call = await bidirectionalStreaming(
+        scenario.transport,
+        "hello.v1.Greeter",
+        "BidiHello",
+        Hello,
+        Hello,
+        { streamIdleTimeoutMs: undefined },
+      );
+
+      assert.equal(await call.recv(), undefined);
+      assert.equal(scenario.returnCount(), 0);
+      assert.equal(scenario.closeCount(), 1);
+    });
+  }
+});
+
+test("request writer rejection is caught before delayed observation", async () => {
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const scenario = await requestWriterScenario("webtransport", Code.Ok);
+    const terminal = await scenario.iterator.next();
+    assert.equal(terminal.value.status, Code.Ok);
+
+    scenario.writer.reject(invalidArgument("late FIN failed"));
+    await flushMicrotasks();
+    await assert.rejects(
+      scenario.iterator.return(),
+      (error) => error.code === Code.InvalidArgument,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("explicit response abort preserves the primary error over writer cleanup failure", async () => {
+  const Hello = helloTestType();
+  let returned = false;
+  const transport = {
+    async streamingCall() {
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              return new Promise(() => {});
+            },
+            return() {
+              returned = true;
+              return Promise.reject(invalidArgument("writer cleanup failed"));
+            },
+          };
+        },
+      };
+    },
+  };
+  const controller = new AbortController();
+  const stream = await serverStreaming(
+    transport,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+    { signal: controller.signal, streamIdleTimeoutMs: undefined },
+  );
+
+  const next = stream[Symbol.asyncIterator]().next();
+  controller.abort(new DOMException("user cancelled", "AbortError"));
+
+  await assert.rejects(next, (error) => error.code === Code.Cancelled);
+  assert.equal(returned, true);
+});
+
+test("generator emits browser-safe clients and Node server companions", () => {
   const response = generateBindings(greeterRequest());
   const generatedJavaScript = generatedFile(response, "hello/v1/greeter.trevrpc.js");
   const generatedTypes = generatedFile(response, "hello/v1/greeter.trevrpc.d.ts");
+  const generatedNodeJavaScript = generatedFile(response, "hello/v1/greeter.node.trevrpc.js");
+  const generatedNodeTypes = generatedFile(response, "hello/v1/greeter.node.trevrpc.d.ts");
 
   assert.equal(response.error, undefined);
-  assert.equal(response.file.length, 2);
+  assert.equal(response.file.length, 4);
   assert.match(generatedJavaScript.content, /export class GreeterClient/);
   assert.match(generatedJavaScript.content, /sayHello\(request, options = \{\}\)/);
   assert.match(generatedJavaScript.content, /lotsOfReplies\(request, options = \{\}\)/);
   assert.match(generatedJavaScript.content, /lotsOfGreetings\(options = \{\}\)/);
   assert.match(generatedJavaScript.content, /bidiHello\(options = \{\}\)/);
-  assert.match(generatedJavaScript.content, /if \(frame\.kind === RpcStreamFrameKind\.Status\)/);
-  assert.match(generatedJavaScript.content, /throw statusError\(code, frame\.message/);
+  assert.doesNotMatch(
+    generatedJavaScript.content,
+    /node\/generated|NodeServer|registerTypedService/,
+  );
+  assert.match(generatedNodeJavaScript.content, /registerTypedService/);
+  assert.match(generatedNodeJavaScript.content, /registerGreeterServer/);
   assert.match(generatedTypes.content, /export interface HelloRequest/);
   assert.match(generatedTypes.content, /name\?: string;/);
   assert.match(generatedTypes.content, /export interface HelloReply/);
@@ -2259,7 +2671,7 @@ test("generator emits JavaScript service clients", () => {
   );
   assert.match(
     generatedTypes.content,
-    /lotsOfReplies\(request: HelloRequest, options\?: CallOptions\): Promise<AsyncIterable<HelloReply>>;/,
+    /lotsOfReplies[\s\S]*Promise<ResponseAsyncIterable<HelloReply>>;/,
   );
   assert.match(
     generatedTypes.content,
@@ -2269,15 +2681,21 @@ test("generator emits JavaScript service clients", () => {
     generatedTypes.content,
     /bidiHello\(options\?: CallOptions\): Promise<BidirectionalStreamingCall<HelloRequest, HelloReply>>;/,
   );
+  assert.match(generatedNodeTypes.content, /export interface GreeterHandlers/);
+  assert.match(generatedNodeTypes.content, /UnaryServerResponse<HelloReply>/);
+  assert.match(generatedNodeTypes.content, /StreamingServerResponse<HelloReply>/);
 });
 
 test("generated JavaScript clients call the runtime", async () => {
-  const runtimeImport = pathToFileURL(join(process.cwd(), "src", "index.js")).href;
-  const response = generateBindings(greeterRequest(`runtime_import=${runtimeImport}`));
+  const runtimeImport = new URL("../src/index.js", import.meta.url).href;
+  const response = generateBindings(
+    greeterRequest(`runtime_import=${runtimeImport},runtime_type_import=${runtimeImport}`),
+  );
   assert.equal(response.error, undefined);
 
   const directory = await mkdtemp(join(tmpdir(), "trevrpc-js-generated-"));
   const generatedPath = join(directory, "greeter.trevrpc.js");
+  await writeFile(join(directory, "package.json"), '{"type":"module"}\n');
   await writeFile(generatedPath, generatedFile(response, "hello/v1/greeter.trevrpc.js").content);
 
   const generated = await import(pathToFileURL(generatedPath).href);
@@ -2300,6 +2718,69 @@ test("generated JavaScript clients call the runtime", async () => {
   const reply = await client.sayHello({ name: "Trev" });
 
   assert.equal(reply.message, "hello Trev");
+});
+
+test("generated client-streaming closeAndRecv waits for FIN and preserves status precedence", async () => {
+  const runtimeImport = new URL("../src/index.js", import.meta.url).href;
+  const response = generateBindings(
+    greeterRequest(`runtime_import=${runtimeImport},runtime_type_import=${runtimeImport}`),
+  );
+  assert.equal(response.error, undefined);
+
+  const directory = await mkdtemp(join(tmpdir(), "trevrpc-js-generated-stream-"));
+  const generatedPath = join(directory, "greeter.trevrpc.js");
+  await writeFile(join(directory, "package.json"), '{"type":"module"}\n');
+  await writeFile(generatedPath, generatedFile(response, "hello/v1/greeter.trevrpc.js").content);
+  const generated = await import(pathToFileURL(generatedPath).href);
+  const replyBody = generated.root
+    .lookupType("hello.v1.HelloReply")
+    .encode({ message: "done" })
+    .finish();
+
+  for (const status of [Code.Ok, Code.PermissionDenied]) {
+    const writer = deferredPromise();
+    const writerStarted = deferredPromise();
+    const stream = fakeBidirectionalStream({
+      beforeRead: () => writerStarted.promise,
+      closePromise: writer.promise,
+      onClose: writerStarted.resolve,
+      readableChunks: [
+        concatBytes([
+          encodeMessageStreamFrame(replyBody),
+          encodeFrame(
+            RpcStreamFrame,
+            RpcStreamFrame.create({
+              kind: RpcStreamFrameKind.Status,
+              status,
+              message: status === Code.Ok ? "" : "remote rejected upload",
+            }),
+          ),
+        ]),
+      ],
+    });
+    const transport = new RawWebTransport({
+      ready: Promise.resolve(),
+      createBidirectionalStream() {
+        return Promise.resolve(stream);
+      },
+    });
+    const client = new generated.GreeterClient(transport);
+    const call = await client.lotsOfGreetings();
+    const result = call.closeAndRecv();
+
+    await writerStarted.promise;
+    await assertPending(result);
+    writer.reject(invalidArgument("delayed generated FIN failed"));
+    if (status === Code.Ok) {
+      await assert.rejects(result, (error) => error.code === Code.InvalidArgument);
+    } else {
+      await assert.rejects(
+        result,
+        (error) =>
+          error.code === Code.PermissionDenied && error.statusMessage === "remote rejected upload",
+      );
+    }
+  }
 });
 
 test("service clients merge static and override metadata", async () => {
@@ -2367,6 +2848,16 @@ test("service clients merge static and override metadata", async () => {
     },
     (error) => error.code === Code.InvalidArgument,
   );
+});
+
+test("generated TypeScript declarations match protobuf.js long and map values", () => {
+  const response = generateBindings(longAndMapRequest());
+  const generatedTypes = generatedFile(response, "types/v1/values.trevrpc.d.ts");
+
+  assert.equal(response.error, undefined);
+  assert.match(generatedTypes.content, /import type \{ Long, Root \} from "protobufjs";/);
+  assert.match(generatedTypes.content, /count\?: number \| string \| Long;/);
+  assert.match(generatedTypes.content, /labels\?: Record<string, string>;/);
 });
 
 test("generated TypeScript declarations include imported message types", () => {
@@ -2482,6 +2973,56 @@ function greeterRequest(parameter = "") {
                 outputType: ".hello.v1.HelloReply",
                 clientStreaming: true,
                 serverStreaming: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function longAndMapRequest() {
+  return {
+    fileToGenerate: ["types/v1/values.proto"],
+    protoFile: [
+      {
+        name: "types/v1/values.proto",
+        package: "types.v1",
+        messageType: [
+          {
+            name: "Values",
+            field: [
+              { name: "count", number: 1, label: 1, type: 3, jsonName: "count" },
+              {
+                name: "labels",
+                number: 2,
+                label: 3,
+                type: 11,
+                typeName: ".types.v1.Values.LabelsEntry",
+                jsonName: "labels",
+              },
+            ],
+            nestedType: [
+              {
+                name: "LabelsEntry",
+                options: { mapEntry: true },
+                field: [
+                  { name: "key", number: 1, label: 1, type: 5, jsonName: "key" },
+                  { name: "value", number: 2, label: 1, type: 9, jsonName: "value" },
+                ],
+              },
+            ],
+          },
+        ],
+        service: [
+          {
+            name: "ValuesService",
+            method: [
+              {
+                name: "GetValues",
+                inputType: ".types.v1.Values",
+                outputType: ".types.v1.Values",
               },
             ],
           },
@@ -2610,7 +3151,250 @@ function fakeReaderFromChunks(chunks) {
   };
 }
 
+async function requestWriterScenario(
+  runtime,
+  status,
+  { holdResponse = false, holdRequestReturn = false, noResponse = false } = {},
+) {
+  const writer = deferredPromise();
+  const writerStarted = deferredPromise();
+  const response = deferredPromise();
+  const requestReturn = deferredPromise();
+  const requestReturnStarted = deferredPromise();
+  const requestBody = holdRequestReturn
+    ? {
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              return Promise.resolve({ done: true, value: undefined });
+            },
+            async return() {
+              requestReturnStarted.resolve();
+              await requestReturn.promise;
+              return { done: true, value: undefined };
+            },
+          };
+        },
+      }
+    : emptyAsyncIterable();
+  if (!holdResponse) {
+    response.resolve();
+  }
+
+  if (runtime === "node") {
+    const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+    let closes = 0;
+    const transport = new RawNodeTransport({
+      async startStream() {
+        let recvCalls = 0;
+        return {
+          async finishSend() {
+            writerStarted.resolve();
+            await writer.promise;
+          },
+          async recvMany() {
+            await writerStarted.promise;
+            await response.promise;
+            if (noResponse) {
+              return await new Promise(() => {});
+            }
+            recvCalls += 1;
+            return recvCalls === 1
+              ? [RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status })]
+              : [null];
+          },
+          close() {
+            closes += 1;
+          },
+        };
+      },
+    });
+    const frames = await transport.streamingCall(
+      { service: "svc", method: "stream", kind: RpcKind.BidirectionalStreaming },
+      requestBody,
+    );
+    return {
+      iterator: frames[Symbol.asyncIterator](),
+      writer,
+      writerStarted: writerStarted.promise,
+      requestReturnStarted: requestReturnStarted.promise,
+      releaseRequestReturn: requestReturn.resolve,
+      releaseResponse: response.resolve,
+      closeCount: () => closes,
+    };
+  }
+
+  let aborts = 0;
+  let cancels = 0;
+  const statusFrame = encodeFrame(
+    RpcStreamFrame,
+    RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status }),
+  );
+  const stream = fakeBidirectionalStream({
+    beforeRead: async () => {
+      await writerStarted.promise;
+      await response.promise;
+    },
+    closePromise: writer.promise,
+    onAbort() {
+      aborts += 1;
+    },
+    onCancel() {
+      cancels += 1;
+    },
+    onClose() {
+      writerStarted.resolve();
+    },
+    readableChunks: noResponse ? [] : [statusFrame],
+  });
+  const transport = new RawWebTransport({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+  const frames = await transport.streamingCall(
+    RpcRequest.create({
+      service: "svc",
+      method: "stream",
+      kind: RpcKind.BidirectionalStreaming,
+      version: WireVersion,
+    }),
+    requestBody,
+  );
+  return {
+    iterator: frames[Symbol.asyncIterator](),
+    writer,
+    writerStarted: writerStarted.promise,
+    requestReturnStarted: requestReturnStarted.promise,
+    releaseRequestReturn: requestReturn.resolve,
+    releaseResponse: response.resolve,
+    closeCount: () => Math.max(aborts, cancels),
+  };
+}
+
+async function blockedRequestWriterScenario(runtime) {
+  const iterationStarted = deferredPromise();
+  let returns = 0;
+  let closes = 0;
+  let rawTransport;
+
+  if (runtime === "node") {
+    const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+    rawTransport = new RawNodeTransport({
+      async startStream() {
+        let recvCalls = 0;
+        return {
+          async finishSend() {},
+          async recvMany() {
+            await iterationStarted.promise;
+            recvCalls += 1;
+            return recvCalls === 1
+              ? [RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok })]
+              : [null];
+          },
+          close() {
+            closes += 1;
+          },
+        };
+      },
+    });
+  } else {
+    const stream = fakeBidirectionalStream({
+      beforeRead: () => iterationStarted.promise,
+      onAbort() {
+        closes += 1;
+      },
+      readableChunks: [
+        encodeFrame(
+          RpcStreamFrame,
+          RpcStreamFrame.create({ kind: RpcStreamFrameKind.Status, status: Code.Ok }),
+        ),
+      ],
+    });
+    rawTransport = new RawWebTransport({
+      ready: Promise.resolve(),
+      createBidirectionalStream() {
+        return Promise.resolve(stream);
+      },
+    });
+  }
+
+  return {
+    transport: {
+      async streamingCall(request, requestBody, options) {
+        const iterator = requestBody[Symbol.asyncIterator]();
+        const wrappedRequestBody = {
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+          next() {
+            iterationStarted.resolve();
+            return iterator.next();
+          },
+          nextBatch(max) {
+            iterationStarted.resolve();
+            return typeof iterator.nextBatch === "function"
+              ? iterator.nextBatch(max)
+              : iterator.next();
+          },
+          async return() {
+            returns += 1;
+            return typeof iterator.return === "function"
+              ? await iterator.return()
+              : { done: true, value: undefined };
+          },
+        };
+        return await rawTransport.streamingCall(request, wrappedRequestBody, options);
+      },
+    },
+    returnCount: () => returns,
+    closeCount: () => closes,
+  };
+}
+
+function cleanupWriterError(runtime) {
+  const error = new Error(
+    runtime === "node" ? "native stream closed" : "stream canceled with error code 0",
+  );
+  if (runtime === "node") {
+    error.nativeCode = -1001;
+  }
+  return error;
+}
+
+function deferredPromise() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function assertPending(promise) {
+  let settled = false;
+  promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await flushMicrotasks();
+  assert.equal(settled, false);
+}
+
+async function flushMicrotasks() {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 function fakeBidirectionalStream({
+  beforeRead = null,
   closeError = null,
   closePromise = null,
   onAbort = () => {},
@@ -2646,11 +3430,10 @@ function fakeBidirectionalStream({
     readable: {
       getReader() {
         return {
-          read() {
+          async read() {
+            await beforeRead?.();
             const value = chunks.shift();
-            return Promise.resolve(
-              value == null ? { done: true, value: undefined } : { done: false, value },
-            );
+            return value == null ? { done: true, value: undefined } : { done: false, value };
           },
           cancel(reason) {
             onCancel(reason);

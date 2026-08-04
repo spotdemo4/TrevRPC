@@ -63,3 +63,4 @@ export {
   unary,
   unaryWithResponse,
 } from "./client.js";
+export { createStreamingResponse, createUnaryResponse } from "./server-response.js";

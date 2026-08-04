@@ -8,15 +8,22 @@
   openssl,
   oxfmt,
   oxlint,
+  protobuf,
   gnugrep,
+  makeWrapper,
   repoRoot,
   trevrpcC,
+  nativePackage ? null,
   benchPeer ? false,
+  conformancePeer ? false,
 }:
+assert lib.assertMsg (
+  !(benchPeer && conformancePeer)
+) "trevrpc-js benchPeer and conformancePeer are mutually exclusive";
 let
   normal = buildNpmPackage (final: {
     pname = "trevrpc-js";
-    version = "0.1.0";
+    version = "0.2.0";
 
     src = lib.fileset.toSource {
       root = repoRoot;
@@ -51,9 +58,11 @@ let
       openssl
       oxfmt
       oxlint
+      protobuf
     ];
     checkPhase = ''
       rm -rf build
+      patchShebangs bin/protoc-gen-trevrpc-js.js
       oxfmt --check
       oxlint --deny-warnings
       npm run typecheck
@@ -65,15 +74,22 @@ let
       npm run verify:native:production
     '';
 
+    postInstall = lib.optionalString (nativePackage != null) ''
+      native_dir="$out/lib/node_modules/trevrpc-js/node_modules/@trev/trevrpc-js-native-linux-x64-gnu"
+      mkdir -p "$(dirname "$native_dir")"
+      cp -R "${nativePackage}/package" "$native_dir"
+    '';
+
     doInstallCheck = true;
     nativeInstallCheckInputs = [ gnugrep ];
     installCheckPhase = ''
       runHook preInstallCheck
       ! grep -q '@grpc/' package.json
-      ${nodejs_24}/bin/node -e \
-        'require(process.argv[1])' \
-        "$out/lib/node_modules/trevrpc-js/build/native/trevrpc_native.node"
+      ${nodejs_24}/bin/node --input-type=module -e \
+        'import(process.argv[1]).then((module) => module.loadNativeAddon())' \
+        "$out/lib/node_modules/trevrpc-js/src/native-loader.js"
       test ! -e "$out/bin/trevrpc-bench-peer-js"
+      test ! -e "$out/bin/trevrpc-conformance-js"
       runHook postInstallCheck
     '';
 
@@ -134,5 +150,72 @@ let
       platforms = lib.platforms.linux;
     };
   });
+
+  conformance = buildNpmPackage (final: {
+    pname = "trevrpc-js-conformance-peer";
+    version = "0.1.0";
+
+    src = lib.fileset.toSource {
+      root = repoRoot;
+      fileset = ./.;
+    };
+    sourceRoot = "${final.src.name}/trevrpc-js";
+    nodejs = nodejs_24;
+
+    npmConfigHook = importNpmLock.npmConfigHook;
+    npmDeps = importNpmLock {
+      npmRoot = ./.;
+    };
+
+    dontNpmBuild = true;
+
+    doCheck = true;
+    nativeCheckInputs = [
+      oxfmt
+      oxlint
+    ];
+    checkPhase = ''
+      runHook preCheck
+      oxfmt --check
+      oxlint --deny-warnings
+      npm run typecheck
+      node --no-addons --test test/conformance.test.js
+      node --no-addons --test test/conformance-process.test.js
+      runHook postCheck
+    '';
+
+    nativeBuildInputs = [ makeWrapper ];
+    postInstall = ''
+      rm -rf $out/bin
+      cp -r conformance $out/lib/node_modules/trevrpc-js/conformance
+      mkdir -p $out/bin
+      makeWrapper ${nodejs_24}/bin/node $out/bin/trevrpc-conformance-js \
+        --add-flags "--no-addons" \
+        --add-flags "$out/lib/node_modules/trevrpc-js/conformance/trevrpc-conformance-js.js"
+    '';
+
+    doInstallCheck = true;
+    nativeInstallCheckInputs = [ gnugrep ];
+    installCheckPhase = ''
+      runHook preInstallCheck
+      test "$(find $out/bin -maxdepth 1 -type f | wc -l)" -eq 1
+      printf 'STOP\n' | $out/bin/trevrpc-conformance-js --protocol 1 > peer.out
+      grep -q '"event":"ready"' peer.out
+      grep -q '"peer":"js"' peer.out
+      runHook postInstallCheck
+    '';
+
+    meta = {
+      mainProgram = "trevrpc-conformance-js";
+      description = "JavaScript TrevRPC conformance process peer";
+      license = lib.licenses.mit;
+      platforms = lib.platforms.linux;
+    };
+  });
 in
-if benchPeer then peer else normal
+if conformancePeer then
+  conformance
+else if benchPeer then
+  peer
+else
+  normal

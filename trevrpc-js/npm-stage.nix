@@ -1,0 +1,240 @@
+{
+  lib,
+  buildNpmPackage,
+  importNpmLock,
+  nodejs_20,
+  nodejs_22,
+  nodejs_24,
+  cmake,
+  openssl,
+  oxfmt,
+  oxlint,
+  protobuf,
+  jq,
+  binutils,
+  gnugrep,
+  repoRoot,
+  trevrpcC,
+  nativePackage,
+  playwright-driver,
+}:
+buildNpmPackage (final: {
+  pname = "trevrpc-js-npm-stage";
+  version = "0.2.0";
+
+  src = lib.fileset.toSource {
+    root = repoRoot;
+    fileset = lib.fileset.unions [
+      (repoRoot + "/testdata/wire-golden-vectors.txt")
+      (repoRoot + "/trevrpc-c")
+      (repoRoot + "/trevrpc-js")
+    ];
+  };
+  sourceRoot = "${final.src.name}/trevrpc-js";
+  nodejs = nodejs_24;
+
+  npmConfigHook = importNpmLock.npmConfigHook;
+  npmDeps = importNpmLock { npmRoot = ./.; };
+  dontNpmBuild = true;
+  dontUseCmakeConfigure = true;
+
+  NODE_INCLUDE_DIR = "${nodejs_24}/include/node";
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
+  PLAYWRIGHT_BROWSERS_PATH = "${playwright-driver.browsers}";
+
+  nativeBuildInputs = [
+    cmake
+    openssl
+    oxfmt
+    oxlint
+    protobuf
+    jq
+    binutils
+    gnugrep
+  ];
+  buildInputs = [ trevrpcC ];
+
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+    patchShebangs bin/protoc-gen-trevrpc-js.js
+
+    npm run format:check
+    npm run lint
+    npm run typecheck
+    npm run build:native:test
+    npm test
+    rm -rf build/native
+    npm run build:native
+    npm run verify:native:production
+
+    runHook postCheck
+  '';
+
+  installPhase = ''
+        runHook preInstall
+        export HOME="$TMPDIR/home"
+        mkdir -p "$HOME" "$out"
+
+        native_work="$TMPDIR/native-package"
+        cp -R "${nativePackage}/package" "$native_work"
+        chmod -R u+w "$native_work"
+        npm pack "$native_work" --pack-destination "$out" >/dev/null
+        native_tgz="$out/trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz"
+        test -f "$native_tgz"
+
+        core_name="$(npm pack . --pack-destination "$out")"
+        test "$core_name" = "trevrpc-js-0.2.0.tgz"
+        core_tgz="$out/$core_name"
+
+        dependency_tarballs="$TMPDIR/dependency-tarballs"
+        dependency_work="$TMPDIR/dependency-pack-work"
+        mkdir -p "$dependency_tarballs" \
+          "$dependency_work/protobufjs/package" "$dependency_work/long/package" \
+          "$dependency_work/node-types/package" "$dependency_work/undici-types/package"
+        cp -R node_modules/protobufjs/. "$dependency_work/protobufjs/package/"
+        cp -R node_modules/long/. "$dependency_work/long/package/"
+        cp -R node_modules/@types/node/. "$dependency_work/node-types/package/"
+        cp -R node_modules/undici-types/. "$dependency_work/undici-types/package/"
+        protobufjs_tgz="$dependency_tarballs/protobufjs-8.7.1.tgz"
+        long_tgz="$dependency_tarballs/long-5.3.2.tgz"
+        node_types_tgz="$dependency_tarballs/types-node-24.13.3.tgz"
+        undici_types_tgz="$dependency_tarballs/undici-types-7.18.2.tgz"
+        tar -czf "$protobufjs_tgz" -C "$dependency_work/protobufjs" package
+        tar -czf "$long_tgz" -C "$dependency_work/long" package
+        tar -czf "$node_types_tgz" -C "$dependency_work/node-types" package
+        tar -czf "$undici_types_tgz" -C "$dependency_work/undici-types" package
+
+        # Artifact checks and both npm publish dry runs happen before consumers.
+        mkdir -p "$TMPDIR/verify-stage"
+        ln -s "$core_tgz" "$TMPDIR/verify-stage/trevrpc-js-0.2.0.tgz"
+        ln -s "$native_tgz" \
+          "$TMPDIR/verify-stage/trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz"
+        node publication-tests/verify.mjs "$TMPDIR/verify-stage"
+
+        test_cert="$TMPDIR/server-cert.pem"
+        test_key="$TMPDIR/server-key.pem"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+          -subj /CN=localhost -keyout "$test_key" -out "$test_cert" >/dev/null 2>&1
+
+        tsc="$PWD/node_modules/.bin/tsc"
+        esbuild="$PWD/node_modules/.bin/esbuild"
+        for runtime in "${nodejs_20}" "${nodejs_22}" "${nodejs_24}"; do
+          consumer="$TMPDIR/node-$(basename "$runtime")"
+          mkdir -p "$consumer/generated"
+          printf '%s\n' '{"private":true,"type":"module"}' > "$consumer/package.json"
+          cp publication-tests/node/loopback.mjs publication-tests/node/types.ts "$consumer/"
+          cp publication-tests/proto/all-shapes.proto "$consumer/"
+          (
+            cd "$consumer"
+            export PATH="$runtime/bin:$PATH"
+            npm install --offline --ignore-scripts \
+              "$core_tgz" "$native_tgz" "$protobufjs_tgz" "$long_tgz" \
+              "$node_types_tgz" "$undici_types_tgz" >/dev/null
+            protoc \
+              --plugin=protoc-gen-trevrpc-js="$consumer/node_modules/.bin/protoc-gen-trevrpc-js" \
+              --trevrpc-js_out="$consumer/generated" \
+              --proto_path="$consumer" \
+              all-shapes.proto
+            cat > tsconfig.json <<'JSON'
+    {
+      "compilerOptions": {
+        "target": "ES2022",
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+        "strict": true,
+        "noEmit": true,
+        "skipLibCheck": false,
+        "lib": ["ES2022"],
+        "types": ["node"]
+      },
+      "include": ["types.ts", "generated/*.d.ts"]
+    }
+    JSON
+            "$tsc" -p tsconfig.json
+            TREVRPC_TEST_CERT="$test_cert" TREVRPC_TEST_KEY="$test_key" \
+              "$runtime/bin/node" loopback.mjs
+          )
+        done
+
+        browser="$TMPDIR/browser-consumer"
+        mkdir -p "$browser/generated"
+        printf '%s\n' '{"private":true,"type":"module"}' > "$browser/package.json"
+        cp publication-tests/browser/entry.js publication-tests/browser/types.ts "$browser/"
+        cp publication-tests/proto/all-shapes.proto "$browser/"
+        (
+          cd "$browser"
+          npm install --offline --ignore-scripts --omit=optional \
+            "$core_tgz" "$protobufjs_tgz" "$long_tgz" >/dev/null
+          protoc \
+            --plugin=protoc-gen-trevrpc-js="$browser/node_modules/.bin/protoc-gen-trevrpc-js" \
+            --trevrpc-js_out="$browser/generated" \
+            --proto_path="$browser" \
+            all-shapes.proto
+          cat > tsconfig.json <<'JSON'
+    {
+      "compilerOptions": {
+        "target": "ES2022",
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "customConditions": ["browser"],
+        "strict": true,
+        "noEmit": true,
+        "skipLibCheck": false,
+        "lib": ["ES2022", "DOM", "DOM.Iterable"],
+        "types": []
+      },
+      "include": ["types.ts", "generated/*.d.ts"]
+    }
+    JSON
+          "$tsc" -p tsconfig.json
+          "$esbuild" entry.js \
+            --bundle \
+            --format=esm \
+            --platform=browser \
+            --conditions=browser,import \
+            --outfile=bundle.js \
+            --metafile=metafile.json
+          ! grep -a -E 'node:|trevrpc_native|native-loader|@trev/trevrpc-js-native' \
+            bundle.js metafile.json
+        )
+
+        for chromium in "$PLAYWRIGHT_BROWSERS_PATH"/chromium-*/chrome-linux*/chrome; do
+          if test -x "$chromium"; then
+            export TREVRPC_BROWSER_CHROMIUM="$chromium"
+            break
+          fi
+        done
+        test -n "''${TREVRPC_BROWSER_CHROMIUM:-}"
+        node publication-tests/browser/smoke.mjs "$browser/bundle.js"
+
+        (
+          cd "$out"
+          sha256sum \
+            trevrpc-js-0.2.0.tgz \
+            trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz \
+            > sha256sums.txt
+          jq -n \
+            --arg core "$(sha256sum trevrpc-js-0.2.0.tgz | cut -d' ' -f1)" \
+            --arg native "$(sha256sum trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz | cut -d' ' -f1)" \
+            '{
+              version: "0.2.0",
+              publication: "local-stage-only",
+              native_target: "linux/x64/glibc>=2.39",
+              node_versions: [20, 22, 24],
+              rpc_shapes: ["unary", "client-streaming", "server-streaming", "bidirectional-streaming"],
+              browser: { bundler_types: true, esbuild: true, chromium_unary: true },
+              sha256: { "trevrpc-js-0.2.0.tgz": $core, "trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz": $native }
+            }' > manifest.json
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
+        )
+
+        runHook postInstall
+  '';
+
+  meta = {
+    description = "Locally verified TrevRPC JavaScript npm publication stage";
+    license = lib.licenses.mit;
+    platforms = [ "x86_64-linux" ];
+  };
+})

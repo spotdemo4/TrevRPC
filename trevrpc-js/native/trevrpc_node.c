@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc_binding.h"
+#include "trevrpc.h"
 
 #include <errno.h> // IWYU pragma: keep
 #include <node_api.h>
@@ -31,6 +32,9 @@ typedef struct native_call native_call;
 typedef struct native_cancellation native_cancellation;
 typedef struct server_route server_route;
 typedef struct node_http3_admission_state node_http3_admission_state;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+typedef struct debug_client_close_race debug_client_close_race;
+#endif
 
 static void http3_admission_state_shutdown(node_http3_admission_state* state);
 static void http3_admission_state_release(node_http3_admission_state* state);
@@ -42,13 +46,17 @@ struct native_client {
     size_t refs;
     bool closing;
     bool js_alive;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_client_close_race* debug_close_race;
+#endif
 };
 
 struct native_client_observer {
     napi_env env;
     napi_deferred deferred;
     napi_ref promise_ref;
-    napi_threadsafe_function tsfn;
+    _Atomic(napi_threadsafe_function) tsfn;
+    atomic_size_t refs;
     atomic_bool notified;
     int error_code;
 };
@@ -85,6 +93,7 @@ struct native_server {
     uint16_t port;
     size_t refs;
     bool closing;
+    bool cancel_on_close;
     bool serving;
     bool js_alive;
 };
@@ -164,8 +173,7 @@ struct native_completion_runtime {
 typedef struct connect_work {
     base_work base;
     trevrpc_raw_client* client;
-    native_cancellation* cancellation;
-    trevrpc_cancellation* owned_cancellation;
+    trevrpc_cancellation* cancellation;
     napi_ref cancellation_ref;
     native_client_observer* observer;
     char* host;
@@ -183,22 +191,20 @@ typedef struct call_work {
     base_work base;
     native_client* client;
     bool acquired;
-    native_cancellation* cancellation;
-    trevrpc_cancellation* owned_cancellation;
+    trevrpc_cancellation* cancellation;
     napi_ref cancellation_ref;
     trevrpc_request request;
     char* service;
     char* method;
     uint8_t* body;
-    trevrpc_response* response;
+    trevrpc_inbound_response* response;
 } call_work;
 
 typedef struct start_stream_work {
     base_work base;
     native_client* client;
     bool acquired;
-    native_cancellation* cancellation;
-    trevrpc_cancellation* owned_cancellation;
+    trevrpc_cancellation* cancellation;
     napi_ref cancellation_ref;
     trevrpc_request request;
     char* service;
@@ -211,7 +217,7 @@ typedef struct stream_recv_work {
     base_work base;
     native_stream* stream;
     bool acquired;
-    trevrpc_stream_frame* frame;
+    trevrpc_inbound_stream_frame* frame;
 } stream_recv_work;
 
 typedef struct stream_recv_many_work {
@@ -219,7 +225,7 @@ typedef struct stream_recv_many_work {
     native_stream* stream;
     bool acquired;
     size_t max_frames;
-    trevrpc_stream_frame** frames;
+    trevrpc_inbound_stream_frame** frames;
     size_t frames_len;
     size_t frames_cap;
     bool eof;
@@ -284,7 +290,12 @@ typedef struct call_response_work {
     native_call* call;
     bool acquired;
     trevrpc_call* c_call;
-    trevrpc_response response;
+    uint32_t status;
+    char* message;
+    size_t message_len;
+    uint8_t* body;
+    size_t body_len;
+    trevrpc_metadata metadata;
     bool terminal_released;
 } call_response_work;
 
@@ -305,7 +316,7 @@ typedef struct call_recv_work {
     native_call* call;
     bool acquired;
     trevrpc_call* c_call;
-    trevrpc_stream_frame* frame;
+    trevrpc_inbound_stream_frame* frame;
 } call_recv_work;
 
 typedef struct call_recv_many_work {
@@ -314,7 +325,7 @@ typedef struct call_recv_many_work {
     bool acquired;
     trevrpc_call* c_call;
     size_t max_frames;
-    trevrpc_stream_frame** frames;
+    trevrpc_inbound_stream_frame** frames;
     size_t frames_len;
     size_t frames_cap;
     bool eof;
@@ -354,6 +365,47 @@ typedef struct debug_pending_wait_work {
     bool acquired;
     uint32_t delay_ms;
 } debug_pending_wait_work;
+
+typedef struct debug_bounded_barrier {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    size_t arrived;
+    bool released;
+    bool failed;
+} debug_bounded_barrier;
+
+struct debug_client_close_race {
+    pthread_mutex_t mutex;
+    debug_bounded_barrier close_unlocked;
+    debug_bounded_barrier close_resume;
+    debug_bounded_barrier release_done;
+    debug_bounded_barrier close_done;
+    size_t destroy_attempts;
+    size_t destroy_count;
+    size_t premature_destroy_count;
+    bool close_transaction_active;
+};
+
+typedef struct debug_client_close_thread {
+    native_client* client;
+    debug_client_close_race* race;
+    bool finalizing;
+} debug_client_close_thread;
+
+typedef struct debug_client_release_thread {
+    native_client* client;
+    debug_client_close_race* race;
+} debug_client_release_thread;
+
+typedef struct debug_client_close_race_result {
+    bool pin_observed;
+    bool state_observed;
+    bool no_destroy_before_resume;
+    size_t destroy_attempts;
+    size_t destroy_count;
+    size_t premature_destroy_count;
+    bool barriers_ok;
+} debug_client_close_race_result;
 #endif
 
 typedef struct server_call_event {
@@ -362,7 +414,16 @@ typedef struct server_call_event {
 } server_call_event;
 
 #ifdef TREVRPC_NODE_TEST_HOOKS
+typedef enum debug_body_conversion_failure {
+    DEBUG_BODY_CONVERSION_FAILURE_NONE = 0,
+    DEBUG_BODY_CONVERSION_FAILURE_BEFORE_EXTERNAL = 1,
+    DEBUG_BODY_CONVERSION_FAILURE_AFTER_EXTERNAL = 2,
+    DEBUG_BODY_CONVERSION_FAILURE_AFTER_TYPED_ARRAY = 3,
+} debug_body_conversion_failure;
+
 static atomic_uint_least64_t ExternalArrayBufferFinalizers = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t NodeBodyOwnerReleases = ATOMIC_VAR_INIT(0);
+static atomic_int NextBodyConversionFailure = ATOMIC_VAR_INIT(DEBUG_BODY_CONVERSION_FAILURE_NONE);
 static atomic_uint_least64_t DebugPendingResourceCloses = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugPendingResourceFinalizers = ATOMIC_VAR_INIT(0);
 #endif
@@ -370,7 +431,7 @@ static atomic_uint_least64_t DebugPendingResourceFinalizers = ATOMIC_VAR_INIT(0)
 static napi_value noop_js_callback(napi_env env, napi_callback_info info);
 static void native_client_release(native_client* client);
 static void native_stream_close_request(native_stream* stream);
-static void native_server_close_request(native_server* server);
+static void native_server_close_request(native_server* server, bool force_cancel);
 static void native_call_close_request(native_call* call);
 static void native_call_release(native_call* call, trevrpc_call* acquired_call);
 static void native_call_release_keep_wrapper(native_call* call, trevrpc_call* acquired_call);
@@ -693,54 +754,124 @@ static int copy_bytes_array_arg(napi_env env, napi_value value, uint8_t** out, s
     return 0;
 }
 
-static napi_value make_uint8_array(napi_env env, const uint8_t* data, size_t len) {
+static int make_uint8_array(napi_env env, const uint8_t* data, size_t len, napi_value* out) {
+    *out = NULL;
+    if (len > 0 && data == NULL) {
+        return -EINVAL;
+    }
     napi_value arraybuffer = NULL;
-    napi_value typedarray = NULL;
     void* buffer = NULL;
-    napi_create_arraybuffer(env, len, &buffer, &arraybuffer);
-    if (len > 0 && data != NULL) {
+    if (napi_create_arraybuffer(env, len, &buffer, &arraybuffer) != napi_ok) {
+        return -ENOMEM;
+    }
+    if (len > 0) {
         memcpy(buffer, data, len);
     }
-    napi_create_typedarray(env, napi_uint8_array, len, arraybuffer, 0, &typedarray);
-    return typedarray;
+    if (napi_create_typedarray(env, napi_uint8_array, len, arraybuffer, 0, out) != napi_ok) {
+        return -ENOMEM;
+    }
+    return 0;
 }
+
+static void node_body_owner_release(trevrpc_body_owner* owner) {
+    if (owner == NULL) {
+        return;
+    }
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&NodeBodyOwnerReleases, 1, memory_order_relaxed);
+#endif
+    trevrpc_body_owner_release(owner);
+}
+
+#ifdef TREVRPC_NODE_TEST_HOOKS
+static bool debug_consume_body_conversion_failure(debug_body_conversion_failure stage) {
+    int expected = stage;
+    return atomic_compare_exchange_strong_explicit(&NextBodyConversionFailure,
+        &expected,
+        DEBUG_BODY_CONVERSION_FAILURE_NONE,
+        memory_order_relaxed,
+        memory_order_relaxed);
+}
+#endif
 
 static void external_arraybuffer_finalize(napi_env env, void* data, void* hint) {
     (void)env;
     (void)data;
-    free(hint);
+    node_body_owner_release(hint);
 #ifdef TREVRPC_NODE_TEST_HOOKS
     atomic_fetch_add_explicit(&ExternalArrayBufferFinalizers, 1, memory_order_relaxed);
 #endif
 }
 
-static napi_value make_external_uint8_array(
-    napi_env env, uint8_t* data, size_t len, uint8_t** owner_slot, bool* transferred) {
-    if (transferred != NULL) {
-        *transferred = false;
+static int body_owner_to_js(
+    napi_env env, trevrpc_bytes_view borrowed_body, trevrpc_body_owner** owner_slot, napi_value* out) {
+    *out = NULL;
+    trevrpc_body_owner* owner = owner_slot != NULL ? *owner_slot : NULL;
+    trevrpc_bytes_view body = borrowed_body;
+    if (owner != NULL) {
+        int err = trevrpc_body_owner_get_view(owner, &body);
+        if (err != 0) {
+            node_body_owner_release(owner);
+            *owner_slot = NULL;
+            return err;
+        }
     }
-    if (len == 0 || data == NULL || owner_slot == NULL || *owner_slot == NULL) {
-        return make_uint8_array(env, data, len);
+    if (body.len == 0) {
+        node_body_owner_release(owner);
+        if (owner_slot != NULL) {
+            *owner_slot = NULL;
+        }
+        return make_uint8_array(env, NULL, 0, out);
+    }
+    if (body.data == NULL) {
+        node_body_owner_release(owner);
+        if (owner_slot != NULL) {
+            *owner_slot = NULL;
+        }
+        return -EINVAL;
+    }
+    if (owner == NULL) {
+        return make_uint8_array(env, body.data, body.len, out);
     }
 
-    uint8_t* owner = *owner_slot;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    if (debug_consume_body_conversion_failure(DEBUG_BODY_CONVERSION_FAILURE_BEFORE_EXTERNAL)) {
+        int err = make_uint8_array(env, body.data, body.len, out);
+        node_body_owner_release(owner);
+        *owner_slot = NULL;
+        return err;
+    }
+#endif
+
     napi_value arraybuffer = NULL;
-    napi_value typedarray = NULL;
-    if (napi_create_external_arraybuffer(env, data, len, external_arraybuffer_finalize, owner, &arraybuffer) !=
-        napi_ok) {
+    if (napi_create_external_arraybuffer(
+            env, (void*)body.data, body.len, external_arraybuffer_finalize, owner, &arraybuffer) != napi_ok) {
         clear_pending_exception(env);
-        return make_uint8_array(env, data, len);
+        int err = make_uint8_array(env, body.data, body.len, out);
+        node_body_owner_release(owner);
+        *owner_slot = NULL;
+        return err;
     }
-
     *owner_slot = NULL;
-    if (transferred != NULL) {
-        *transferred = true;
+
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    if (debug_consume_body_conversion_failure(DEBUG_BODY_CONVERSION_FAILURE_AFTER_EXTERNAL)) {
+        return make_uint8_array(env, body.data, body.len, out);
     }
-    if (napi_create_typedarray(env, napi_uint8_array, len, arraybuffer, 0, &typedarray) != napi_ok) {
+#endif
+
+    napi_value typedarray = NULL;
+    if (napi_create_typedarray(env, napi_uint8_array, body.len, arraybuffer, 0, &typedarray) != napi_ok) {
         clear_pending_exception(env);
-        return make_uint8_array(env, data, len);
+        return make_uint8_array(env, body.data, body.len, out);
     }
-    return typedarray;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    if (debug_consume_body_conversion_failure(DEBUG_BODY_CONVERSION_FAILURE_AFTER_TYPED_ARRAY)) {
+        return -ENOMEM;
+    }
+#endif
+    *out = typedarray;
+    return 0;
 }
 
 static napi_status set_uint32(napi_env env, napi_value object, const char* name, uint32_t value) {
@@ -749,11 +880,13 @@ static napi_status set_uint32(napi_env env, napi_value object, const char* name,
     return napi_set_named_property(env, object, name, js_value);
 }
 
+#ifdef TREVRPC_NODE_TEST_HOOKS
 static napi_status set_bool(napi_env env, napi_value object, const char* name, bool value) {
     napi_value js_value = NULL;
     napi_get_boolean(env, value, &js_value);
     return napi_set_named_property(env, object, name, js_value);
 }
+#endif
 
 static napi_status set_uint64_string(napi_env env, napi_value object, const char* name, uint64_t value) {
     char buffer[32];
@@ -770,13 +903,18 @@ static napi_status set_string_bytes(napi_env env, napi_value object, const char*
 }
 
 static napi_status set_bytes(napi_env env, napi_value object, const char* name, const uint8_t* value, size_t len) {
-    napi_value bytes = make_uint8_array(env, value, len);
+    napi_value bytes = NULL;
+    if (make_uint8_array(env, value, len, &bytes) != 0) {
+        return napi_generic_failure;
+    }
     return napi_set_named_property(env, object, name, bytes);
 }
 
-static napi_value metadata_to_js(napi_env env, const trevrpc_metadata* metadata) {
+static napi_value legacy_request_metadata_to_js(napi_env env, const trevrpc_metadata* metadata) {
     napi_value object = NULL;
-    napi_create_object(env, &object);
+    if (napi_create_object(env, &object) != napi_ok) {
+        return NULL;
+    }
     if (metadata == NULL) {
         return object;
     }
@@ -784,9 +922,12 @@ static napi_value metadata_to_js(napi_env env, const trevrpc_metadata* metadata)
     for (size_t i = 0; i < metadata->entries_len; i++) {
         const trevrpc_metadata_entry* entry = &metadata->entries[i];
         napi_value key = NULL;
-        napi_value value = make_uint8_array(env, entry->value, entry->value_len);
-        napi_create_string_utf8(env, entry->key, entry->key_len, &key);
-        napi_set_property(env, object, key, value);
+        napi_value value = NULL;
+        if (make_uint8_array(env, entry->value, entry->value_len, &value) != 0 ||
+            napi_create_string_utf8(env, entry->key, entry->key_len, &key) != napi_ok ||
+            napi_set_property(env, object, key, value) != napi_ok) {
+            return NULL;
+        }
     }
     return object;
 }
@@ -1000,14 +1141,17 @@ static napi_value request_to_js(napi_env env, const trevrpc_request* request) {
     if (request->timeout_nanos > 0) {
         set_uint64_string(env, object, "timeoutNanos", request->timeout_nanos);
     }
-    napi_value metadata = metadata_to_js(env, &request->metadata);
+    napi_value metadata = legacy_request_metadata_to_js(env, &request->metadata);
     napi_set_named_property(env, object, "metadata", metadata);
     return object;
 }
 
-static int response_from_js(napi_env env, napi_value value, trevrpc_response* response) {
+static int server_response_from_js(napi_env env, napi_value value, call_response_work* work) {
+    work->status = TREVRPC_STATUS_OK;
     napi_valuetype type = napi_undefined;
-    napi_typeof(env, value, &type);
+    if (napi_typeof(env, value, &type) != napi_ok) {
+        return -EINVAL;
+    }
     if (type == napi_undefined || type == napi_null) {
         return 0;
     }
@@ -1015,107 +1159,280 @@ static int response_from_js(napi_env env, napi_value value, trevrpc_response* re
         return -EINVAL;
     }
 
-    response->status = get_uint32_property(env, value, "status", TREVRPC_STATUS_OK);
+    work->status = get_uint32_property(env, value, "status", TREVRPC_STATUS_OK);
 
     bool has_property = false;
-    napi_has_named_property(env, value, "message", &has_property);
+    if (napi_has_named_property(env, value, "message", &has_property) != napi_ok) {
+        return -EINVAL;
+    }
     if (has_property) {
         napi_value message = NULL;
-        napi_get_named_property(env, value, "message", &message);
-        char* copied = copy_string_value(env, message);
-        if (copied == NULL) {
+        if (napi_get_named_property(env, value, "message", &message) != napi_ok) {
+            return -EINVAL;
+        }
+        work->message = copy_string_value(env, message);
+        if (work->message == NULL) {
             return -ENOMEM;
         }
-        int err = trevrpc_response_set_message(response, copied, strlen(copied));
-        free(copied);
-        if (err != 0) {
-            return err;
-        }
+        work->message_len = strlen(work->message);
     }
 
-    napi_has_named_property(env, value, "body", &has_property);
+    if (napi_has_named_property(env, value, "body", &has_property) != napi_ok) {
+        return -EINVAL;
+    }
     if (has_property) {
         napi_value body = NULL;
-        napi_get_named_property(env, value, "body", &body);
-        uint8_t* bytes = NULL;
-        size_t bytes_len = 0;
-        int err = copy_bytes_arg(env, body, &bytes, &bytes_len);
-        if (err == 0) {
-            err = trevrpc_response_set_body(response, bytes, bytes_len);
+        if (napi_get_named_property(env, value, "body", &body) != napi_ok) {
+            return -EINVAL;
         }
-        free(bytes);
+        int err = copy_bytes_arg(env, body, &work->body, &work->body_len);
         if (err != 0) {
             return err;
         }
     }
 
-    napi_has_named_property(env, value, "metadata", &has_property);
+    if (napi_has_named_property(env, value, "metadata", &has_property) != napi_ok) {
+        return -EINVAL;
+    }
     if (has_property) {
         napi_value metadata = NULL;
-        napi_get_named_property(env, value, "metadata", &metadata);
-        int err = metadata_from_js(env, metadata, &response->metadata);
-        if (err != 0) {
-            return err;
+        if (napi_get_named_property(env, value, "metadata", &metadata) != napi_ok) {
+            return -EINVAL;
         }
+        return metadata_from_js(env, metadata, &work->metadata);
     }
     return 0;
 }
 
-static napi_value response_to_js(napi_env env, trevrpc_response* response) {
+typedef size_t (*inbound_metadata_count_fn)(const void* value);
+typedef int (*inbound_metadata_at_fn)(
+    const void* value, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* entry_value);
+typedef int (*inbound_body_get_fn)(const void* value, trevrpc_bytes_view* body);
+typedef int (*inbound_body_take_fn)(void* value, trevrpc_body_owner** owner);
+
+static size_t inbound_response_metadata_count(const void* value) {
+    return trevrpc_inbound_response_metadata_count(value);
+}
+
+static int inbound_response_metadata_at(
+    const void* value, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* entry_value) {
+    return trevrpc_inbound_response_metadata_at(value, index, key, entry_value);
+}
+
+static int inbound_response_get_body(const void* value, trevrpc_bytes_view* body) {
+    return trevrpc_inbound_response_get_body(value, body);
+}
+
+static int inbound_response_take_body(void* value, trevrpc_body_owner** owner) {
+    return trevrpc_inbound_response_take_body(value, owner);
+}
+
+static size_t inbound_stream_frame_metadata_count(const void* value) {
+    return trevrpc_inbound_stream_frame_metadata_count(value);
+}
+
+static int inbound_stream_frame_metadata_at(
+    const void* value, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* entry_value) {
+    return trevrpc_inbound_stream_frame_metadata_at(value, index, key, entry_value);
+}
+
+static int inbound_stream_frame_get_body(const void* value, trevrpc_bytes_view* body) {
+    return trevrpc_inbound_stream_frame_get_body(value, body);
+}
+
+static int inbound_stream_frame_take_body(void* value, trevrpc_body_owner** owner) {
+    return trevrpc_inbound_stream_frame_take_body(value, owner);
+}
+
+static int inbound_metadata_to_js(napi_env env,
+    const void* value,
+    inbound_metadata_count_fn count_fn,
+    inbound_metadata_at_fn at_fn,
+    napi_value* out) {
+    *out = NULL;
     napi_value object = NULL;
-    napi_create_object(env, &object);
-    set_uint32(env, object, "status", response != NULL ? response->status : TREVRPC_STATUS_UNKNOWN);
-    set_string_bytes(env,
-        object,
-        "message",
-        response != NULL ? response->message : "",
-        response != NULL ? response->message_len : 0);
-    napi_value body = NULL;
-    bool body_transferred = false;
-    if (response != NULL) {
-        body = make_external_uint8_array(
-            env, response->body, response->body_len, &response->_body_owner, &body_transferred);
-        if (body_transferred) {
-            response->body = NULL;
-            response->body_len = 0;
+    if (napi_create_object(env, &object) != napi_ok) {
+        return -ENOMEM;
+    }
+    size_t count = count_fn(value);
+    for (size_t i = 0; i < count; i++) {
+        trevrpc_bytes_view key_view = {0};
+        trevrpc_bytes_view value_view = {0};
+        int err = at_fn(value, i, &key_view, &value_view);
+        if (err != 0) {
+            return err;
         }
-    } else {
-        body = make_uint8_array(env, NULL, 0);
+        if ((key_view.data == NULL && key_view.len > 0) || (value_view.data == NULL && value_view.len > 0)) {
+            return -EINVAL;
+        }
+        napi_value key = NULL;
+        napi_value entry_value = NULL;
+        if (napi_create_string_utf8(env, (const char*)key_view.data, key_view.len, &key) != napi_ok) {
+            return -ENOMEM;
+        }
+        err = make_uint8_array(env, value_view.data, value_view.len, &entry_value);
+        if (err != 0) {
+            return err;
+        }
+        if (napi_set_property(env, object, key, entry_value) != napi_ok) {
+            return -ENOMEM;
+        }
     }
-    napi_set_named_property(env, object, "body", body);
-    napi_value metadata = metadata_to_js(env, response != NULL ? &response->metadata : NULL);
-    napi_set_named_property(env, object, "metadata", metadata);
-    return object;
+    *out = object;
+    return 0;
 }
 
-static napi_value stream_frame_to_js(napi_env env, trevrpc_stream_frame* frame) {
+static int inbound_body_to_js(
+    napi_env env, void* value, inbound_body_get_fn get_fn, inbound_body_take_fn take_fn, napi_value* out) {
+    trevrpc_bytes_view borrowed_body = {0};
+    int err = get_fn(value, &borrowed_body);
+    if (err != 0) {
+        return err;
+    }
+    if (borrowed_body.data == NULL && borrowed_body.len > 0) {
+        return -EINVAL;
+    }
+
+    trevrpc_body_owner* owner = NULL;
+    err = take_fn(value, &owner);
+    if (err == -ENOMEM) {
+        return make_uint8_array(env, borrowed_body.data, borrowed_body.len, out);
+    }
+    if (err != 0) {
+        return err;
+    }
+    return body_owner_to_js(env, borrowed_body, &owner, out);
+}
+
+static int set_uint32_checked(napi_env env, napi_value object, const char* name, uint32_t value) {
+    napi_value property = NULL;
+    if (napi_create_uint32(env, value, &property) != napi_ok ||
+        napi_set_named_property(env, object, name, property) != napi_ok) {
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+static int set_string_checked(
+    napi_env env, napi_value object, const char* name, const uint8_t* value, size_t value_len) {
+    if (value == NULL && value_len > 0) {
+        return -EINVAL;
+    }
+    napi_value property = NULL;
+    if (napi_create_string_utf8(env, (const char*)(value != NULL ? value : (const uint8_t*)""), value_len, &property) !=
+            napi_ok ||
+        napi_set_named_property(env, object, name, property) != napi_ok) {
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+static int inbound_response_to_js(napi_env env, trevrpc_inbound_response* response, napi_value* out) {
+    *out = NULL;
+    if (response == NULL) {
+        return -EINVAL;
+    }
+    uint32_t status = TREVRPC_STATUS_UNKNOWN;
+    trevrpc_bytes_view message = {0};
+    int err = trevrpc_inbound_response_get_status(response, &status);
+    if (err == 0) {
+        err = trevrpc_inbound_response_get_message(response, &message);
+    }
+    if (err != 0) {
+        return err;
+    }
+
     napi_value object = NULL;
-    napi_create_object(env, &object);
-    set_uint32(env, object, "kind", frame->kind);
-    set_uint32(env, object, "status", frame->status);
-    set_string_bytes(env, object, "message", frame->message, frame->message_len);
-    bool body_transferred = false;
-    napi_value body =
-        make_external_uint8_array(env, frame->body, frame->body_len, &frame->_body_owner, &body_transferred);
-    if (body_transferred) {
-        frame->body = NULL;
-        frame->body_len = 0;
+    if (napi_create_object(env, &object) != napi_ok) {
+        return -ENOMEM;
     }
-    napi_set_named_property(env, object, "body", body);
-    napi_value metadata = metadata_to_js(env, &frame->metadata);
-    napi_set_named_property(env, object, "metadata", metadata);
-    return object;
+    err = set_uint32_checked(env, object, "status", status);
+    if (err == 0) {
+        err = set_string_checked(env, object, "message", message.data, message.len);
+    }
+    napi_value metadata = NULL;
+    if (err == 0) {
+        err = inbound_metadata_to_js(
+            env, response, inbound_response_metadata_count, inbound_response_metadata_at, &metadata);
+    }
+    if (err == 0 && napi_set_named_property(env, object, "metadata", metadata) != napi_ok) {
+        err = -ENOMEM;
+    }
+    napi_value body = NULL;
+    if (err == 0) {
+        err = inbound_body_to_js(env, response, inbound_response_get_body, inbound_response_take_body, &body);
+    }
+    if (err == 0 && napi_set_named_property(env, object, "body", body) != napi_ok) {
+        err = -ENOMEM;
+    }
+    if (err == 0) {
+        *out = object;
+    }
+    return err;
 }
 
-static void stream_frame_list_reset(trevrpc_stream_frame** frames, size_t frames_len) {
+static int inbound_stream_frame_to_js(napi_env env, trevrpc_inbound_stream_frame* frame, napi_value* out) {
+    *out = NULL;
+    if (frame == NULL) {
+        return -EINVAL;
+    }
+    uint32_t kind = 0;
+    uint32_t status = TREVRPC_STATUS_UNKNOWN;
+    trevrpc_bytes_view message = {0};
+    int err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);
+    if (err == 0) {
+        err = trevrpc_inbound_stream_frame_get_status(frame, &status);
+    }
+    if (err == 0) {
+        err = trevrpc_inbound_stream_frame_get_message(frame, &message);
+    }
+    if (err != 0) {
+        return err;
+    }
+
+    napi_value object = NULL;
+    if (napi_create_object(env, &object) != napi_ok) {
+        return -ENOMEM;
+    }
+    err = set_uint32_checked(env, object, "kind", kind);
+    if (err == 0) {
+        err = set_uint32_checked(env, object, "status", status);
+    }
+    if (err == 0) {
+        err = set_string_checked(env, object, "message", message.data, message.len);
+    }
+    napi_value metadata = NULL;
+    if (err == 0) {
+        err = inbound_metadata_to_js(
+            env, frame, inbound_stream_frame_metadata_count, inbound_stream_frame_metadata_at, &metadata);
+    }
+    if (err == 0 && napi_set_named_property(env, object, "metadata", metadata) != napi_ok) {
+        err = -ENOMEM;
+    }
+    napi_value body = NULL;
+    if (err == 0) {
+        err = inbound_body_to_js(env, frame, inbound_stream_frame_get_body, inbound_stream_frame_take_body, &body);
+    }
+    if (err == 0 && napi_set_named_property(env, object, "body", body) != napi_ok) {
+        err = -ENOMEM;
+    }
+    if (err == 0) {
+        *out = object;
+    }
+    return err;
+}
+
+static void inbound_stream_frame_list_reset(trevrpc_inbound_stream_frame** frames, size_t frames_len) {
     for (size_t i = 0; i < frames_len; i++) {
-        trevrpc_stream_frame_free(frames[i]);
+        trevrpc_inbound_stream_frame_release(frames[i]);
     }
     free(frames);
 }
 
-static int stream_frame_list_append(
-    trevrpc_stream_frame*** frames, size_t* frames_len, size_t* frames_cap, trevrpc_stream_frame* frame) {
+static int inbound_stream_frame_list_append(trevrpc_inbound_stream_frame*** frames,
+    size_t* frames_len,
+    size_t* frames_cap,
+    trevrpc_inbound_stream_frame* frame) {
     if (*frames_len == *frames_cap) {
         size_t next_cap = *frames_cap == 0 ? 4 : *frames_cap * 2;
         if (next_cap < *frames_cap || next_cap > TREV_NODE_RECV_MANY_LIMIT) {
@@ -1124,7 +1441,7 @@ static int stream_frame_list_append(
         if (*frames_len == next_cap) {
             return -ENOMEM;
         }
-        trevrpc_stream_frame** next = realloc(*frames, next_cap * sizeof(**frames));
+        trevrpc_inbound_stream_frame** next = realloc(*frames, next_cap * sizeof(**frames));
         if (next == NULL) {
             return -ENOMEM;
         }
@@ -1137,14 +1454,14 @@ static int stream_frame_list_append(
 
 static int recv_many_ready_from_stream(trevrpc_stream* stream,
     size_t max_frames,
-    trevrpc_stream_frame*** frames,
+    trevrpc_inbound_stream_frame*** frames,
     size_t* frames_len,
     size_t* frames_cap,
     bool* eof,
     int* ready,
     uint64_t wait_started_nanos) {
-    trevrpc_stream_frame* frame = NULL;
-    int err = trevrpc_stream_recv_ready_since(stream, &frame, ready, wait_started_nanos);
+    trevrpc_inbound_stream_frame* frame = NULL;
+    int err = trevrpc_stream_recv_inbound_ready_since(stream, &frame, ready, wait_started_nanos);
     if (err != 0) {
         return err;
     }
@@ -1156,19 +1473,25 @@ static int recv_many_ready_from_stream(trevrpc_stream* stream,
         return 0;
     }
 
-    err = stream_frame_list_append(frames, frames_len, frames_cap, frame);
+    uint32_t kind = 0;
+    err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);
     if (err != 0) {
-        trevrpc_stream_frame_free(frame);
+        trevrpc_inbound_stream_frame_release(frame);
         return err;
     }
-    if (frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+    err = inbound_stream_frame_list_append(frames, frames_len, frames_cap, frame);
+    if (err != 0) {
+        trevrpc_inbound_stream_frame_release(frame);
+        return err;
+    }
+    if (kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
         return 0;
     }
 
     while (*frames_len < max_frames) {
         int next_ready = 0;
         frame = NULL;
-        err = trevrpc_stream_recv_ready(stream, &frame, &next_ready);
+        err = trevrpc_stream_recv_inbound_ready(stream, &frame, &next_ready);
         if (err != 0) {
             return err;
         }
@@ -1179,46 +1502,70 @@ static int recv_many_ready_from_stream(trevrpc_stream* stream,
             *eof = true;
             return 0;
         }
-        err = stream_frame_list_append(frames, frames_len, frames_cap, frame);
+        err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);
         if (err != 0) {
-            trevrpc_stream_frame_free(frame);
+            trevrpc_inbound_stream_frame_release(frame);
             return err;
         }
-        if (frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+        err = inbound_stream_frame_list_append(frames, frames_len, frames_cap, frame);
+        if (err != 0) {
+            trevrpc_inbound_stream_frame_release(frame);
+            return err;
+        }
+        if (kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
             return 0;
         }
     }
     return 0;
 }
 
-static napi_value stream_frame_list_to_js(napi_env env, trevrpc_stream_frame** frames, size_t frames_len, bool eof) {
+static int inbound_stream_frame_list_to_js(
+    napi_env env, trevrpc_inbound_stream_frame** frames, size_t frames_len, bool eof, napi_value* out) {
+    *out = NULL;
     napi_value array = NULL;
-    napi_create_array_with_length(env, frames_len + (eof ? 1 : 0), &array);
+    if (napi_create_array_with_length(env, frames_len + (eof ? 1 : 0), &array) != napi_ok) {
+        return -ENOMEM;
+    }
     for (size_t i = 0; i < frames_len; i++) {
-        napi_value value = stream_frame_to_js(env, frames[i]);
-        napi_set_element(env, array, (uint32_t)i, value);
+        napi_value value = NULL;
+        int err = inbound_stream_frame_to_js(env, frames[i], &value);
+        if (err != 0) {
+            return err;
+        }
+        if (napi_set_element(env, array, (uint32_t)i, value) != napi_ok) {
+            return -ENOMEM;
+        }
     }
     if (eof) {
         napi_value null_value = NULL;
-        napi_get_null(env, &null_value);
-        napi_set_element(env, array, (uint32_t)frames_len, null_value);
+        if (napi_get_null(env, &null_value) != napi_ok ||
+            napi_set_element(env, array, (uint32_t)frames_len, null_value) != napi_ok) {
+            return -ENOMEM;
+        }
     }
-    return array;
+    *out = array;
+    return 0;
 }
 
-static napi_value stream_body_batch_to_js(napi_env env, trevrpc_stream_frame** frames, size_t frames_len, bool eof) {
+static int inbound_stream_body_batch_to_js(
+    napi_env env, trevrpc_inbound_stream_frame** frames, size_t frames_len, bool eof, napi_value* out) {
+    *out = NULL;
     if (frames_len == 0 && eof) {
-        napi_value null_value = NULL;
-        napi_get_null(env, &null_value);
-        return null_value;
+        return napi_get_null(env, out) == napi_ok ? 0 : -ENOMEM;
     }
 
     size_t body_count = 0;
-    trevrpc_stream_frame* terminal = NULL;
+    trevrpc_inbound_stream_frame* terminal = NULL;
+    uint32_t terminal_kind = 0;
     for (size_t i = 0; i < frames_len; i++) {
-        trevrpc_stream_frame* frame = frames[i];
-        if (frame->kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
-            terminal = frame;
+        uint32_t kind = 0;
+        int err = trevrpc_inbound_stream_frame_get_kind(frames[i], &kind);
+        if (err != 0) {
+            return err;
+        }
+        if (kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+            terminal = frames[i];
+            terminal_kind = kind;
             break;
         }
         body_count++;
@@ -1226,33 +1573,54 @@ static napi_value stream_body_batch_to_js(napi_env env, trevrpc_stream_frame** f
 
     napi_value object = NULL;
     napi_value bodies = NULL;
-    napi_create_object(env, &object);
-    napi_create_array_with_length(env, body_count, &bodies);
-    for (size_t i = 0; i < body_count; i++) {
-        bool body_transferred = false;
-        napi_value body = make_external_uint8_array(
-            env, frames[i]->body, frames[i]->body_len, &frames[i]->_body_owner, &body_transferred);
-        if (body_transferred) {
-            frames[i]->body = NULL;
-            frames[i]->body_len = 0;
-        }
-        napi_set_element(env, bodies, (uint32_t)i, body);
+    if (napi_create_object(env, &object) != napi_ok ||
+        napi_create_array_with_length(env, body_count, &bodies) != napi_ok) {
+        return -ENOMEM;
     }
-    napi_set_named_property(env, object, "bodies", bodies);
+    for (size_t i = 0; i < body_count; i++) {
+        napi_value body = NULL;
+        int err =
+            inbound_body_to_js(env, frames[i], inbound_stream_frame_get_body, inbound_stream_frame_take_body, &body);
+        if (err != 0) {
+            return err;
+        }
+        if (napi_set_element(env, bodies, (uint32_t)i, body) != napi_ok) {
+            return -ENOMEM;
+        }
+    }
+    if (napi_set_named_property(env, object, "bodies", bodies) != napi_ok) {
+        return -ENOMEM;
+    }
 
-    if (terminal != NULL && terminal->kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
-        napi_value status = stream_frame_to_js(env, terminal);
-        napi_set_named_property(env, object, "status", status);
+    if (terminal != NULL && terminal_kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
+        napi_value status = NULL;
+        int err = inbound_stream_frame_to_js(env, terminal, &status);
+        if (err != 0) {
+            return err;
+        }
+        if (napi_set_named_property(env, object, "status", status) != napi_ok) {
+            return -ENOMEM;
+        }
     } else {
         napi_value null_value = NULL;
-        napi_get_null(env, &null_value);
-        napi_set_named_property(env, object, "status", null_value);
+        if (napi_get_null(env, &null_value) != napi_ok ||
+            napi_set_named_property(env, object, "status", null_value) != napi_ok) {
+            return -ENOMEM;
+        }
     }
-    if (terminal != NULL && terminal->kind != TREVRPC_STREAM_FRAME_KIND_STATUS) {
-        set_uint32(env, object, "unknownFrameKind", terminal->kind);
+    if (terminal != NULL && terminal_kind != TREVRPC_STREAM_FRAME_KIND_STATUS) {
+        int err = set_uint32_checked(env, object, "unknownFrameKind", terminal_kind);
+        if (err != 0) {
+            return err;
+        }
     }
-    set_bool(env, object, "eof", eof);
-    return object;
+    napi_value eof_value = NULL;
+    if (napi_get_boolean(env, eof, &eof_value) != napi_ok ||
+        napi_set_named_property(env, object, "eof", eof_value) != napi_ok) {
+        return -ENOMEM;
+    }
+    *out = object;
+    return 0;
 }
 
 static bool recv_batch_max_arg(napi_env env, size_t argc, napi_value* args, size_t* max_frames, const char* operation) {
@@ -1329,7 +1697,7 @@ static int optional_cancellation_arg(napi_env env,
     size_t argc,
     napi_value* args,
     size_t index,
-    native_cancellation** out_cancellation,
+    trevrpc_cancellation** out_cancellation,
     napi_ref* out_ref) {
     *out_cancellation = NULL;
     *out_ref = NULL;
@@ -1338,16 +1706,26 @@ static int optional_cancellation_arg(napi_env env,
     }
 
     napi_valuetype type = napi_undefined;
-    napi_typeof(env, args[index], &type);
+    if (napi_typeof(env, args[index], &type) != napi_ok) {
+        return -EINVAL;
+    }
     if (type == napi_undefined || type == napi_null) {
         return 0;
     }
-    if (!unwrap_native_cancellation(env, args[index], out_cancellation)) {
+    native_cancellation* wrapper = NULL;
+    if (!unwrap_native_cancellation(env, args[index], &wrapper)) {
         return -EINVAL;
     }
     if (napi_create_reference(env, args[index], 1, out_ref) != napi_ok) {
         return -ENOMEM;
     }
+    int err = trevrpc_cancellation_retain(wrapper->cancellation);
+    if (err != 0) {
+        napi_delete_reference(env, *out_ref);
+        *out_ref = NULL;
+        return err;
+    }
+    *out_cancellation = wrapper->cancellation;
     return 0;
 }
 
@@ -1360,13 +1738,20 @@ static bool create_receiver_ref(napi_env env, napi_value receiver, napi_ref* out
     return true;
 }
 
+static void native_client_observer_unref(native_client_observer* observer) {
+    if (atomic_fetch_sub_explicit(&observer->refs, 1, memory_order_acq_rel) == 1) {
+        free(observer);
+    }
+}
+
 static void native_client_observer_finalize(napi_env env, void* data, void* hint) {
     (void)hint;
     native_client_observer* observer = data;
+    atomic_store_explicit(&observer->tsfn, NULL, memory_order_release);
     if (env != NULL && observer->promise_ref != NULL) {
         napi_delete_reference(env, observer->promise_ref);
     }
-    free(observer);
+    native_client_observer_unref(observer);
 }
 
 static void native_client_closed_js(napi_env env, napi_value callback, void* context, void* data) {
@@ -1395,11 +1780,14 @@ static native_client_observer* native_client_observer_create(napi_env env) {
         return NULL;
     }
     observer->env = env;
+    atomic_init(&observer->refs, 2);
     atomic_init(&observer->notified, false);
+    atomic_init(&observer->tsfn, NULL);
 
     napi_value promise = NULL;
     napi_value callback = NULL;
     napi_value resource_name = NULL;
+    napi_threadsafe_function tsfn = NULL;
     napi_status status = napi_create_promise(env, &observer->deferred, &promise);
     if (status == napi_ok) {
         status = napi_create_reference(env, promise, 1, &observer->promise_ref);
@@ -1421,7 +1809,7 @@ static native_client_observer* native_client_observer_create(napi_env env) {
             native_client_observer_finalize,
             observer,
             native_client_closed_js,
-            &observer->tsfn);
+            &tsfn);
     }
     if (status != napi_ok) {
         if (observer->promise_ref != NULL) {
@@ -1430,7 +1818,8 @@ static native_client_observer* native_client_observer_create(napi_env env) {
         free(observer);
         return NULL;
     }
-    (void)napi_unref_threadsafe_function(env, observer->tsfn);
+    atomic_store_explicit(&observer->tsfn, tsfn, memory_order_release);
+    (void)napi_unref_threadsafe_function(env, tsfn);
     return observer;
 }
 
@@ -1439,28 +1828,118 @@ static void native_client_observer_notify(native_client_observer* observer, int 
         return;
     }
     observer->error_code = error_code;
-    (void)napi_call_threadsafe_function(observer->tsfn, NULL, napi_tsfn_nonblocking);
+    napi_threadsafe_function tsfn = atomic_load_explicit(&observer->tsfn, memory_order_acquire);
+    if (tsfn != NULL && napi_acquire_threadsafe_function(tsfn) == napi_ok) {
+        (void)napi_call_threadsafe_function(tsfn, NULL, napi_tsfn_nonblocking);
+        (void)napi_release_threadsafe_function(tsfn, napi_tsfn_release);
+    }
 }
 
 static void native_client_observer_release(native_client_observer* observer) {
-    if (observer != NULL) {
-        (void)napi_release_threadsafe_function(observer->tsfn, napi_tsfn_release);
+    if (observer == NULL) {
+        return;
     }
+    napi_threadsafe_function tsfn = atomic_load_explicit(&observer->tsfn, memory_order_acquire);
+    if (tsfn != NULL) {
+        (void)napi_release_threadsafe_function(tsfn, napi_tsfn_release);
+    }
+    native_client_observer_unref(observer);
 }
 
 static void native_client_connection_shutdown(void* context, int error_code) {
     native_client_observer_notify(context, error_code);
 }
 
-static void native_client_maybe_destroy(native_client* client) {
-    bool destroy = false;
-    pthread_mutex_lock(&client->mutex);
-    destroy = !client->js_alive && client->refs == 0 && client->client == NULL;
-    pthread_mutex_unlock(&client->mutex);
-    if (destroy) {
-        pthread_mutex_destroy(&client->mutex);
-        free(client);
+#ifdef TREVRPC_NODE_TEST_HOOKS
+static bool debug_bounded_barrier_init(debug_bounded_barrier* barrier) {
+    if (pthread_mutex_init(&barrier->mutex, NULL) != 0) {
+        return false;
     }
+    pthread_condattr_t attr;
+    if (pthread_condattr_init(&attr) != 0) {
+        pthread_mutex_destroy(&barrier->mutex);
+        return false;
+    }
+    int clock_err = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    int cond_err = clock_err == 0 ? pthread_cond_init(&barrier->cond, &attr) : clock_err;
+    pthread_condattr_destroy(&attr);
+    if (cond_err != 0) {
+        pthread_mutex_destroy(&barrier->mutex);
+        return false;
+    }
+    return true;
+}
+
+static void debug_bounded_barrier_destroy(debug_bounded_barrier* barrier) {
+    pthread_cond_destroy(&barrier->cond);
+    pthread_mutex_destroy(&barrier->mutex);
+}
+
+static bool debug_bounded_barrier_wait(debug_bounded_barrier* barrier) {
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        return false;
+    }
+    deadline.tv_sec += 5;
+
+    pthread_mutex_lock(&barrier->mutex);
+    if (barrier->failed) {
+        pthread_mutex_unlock(&barrier->mutex);
+        return false;
+    }
+    barrier->arrived++;
+    if (barrier->arrived == 2) {
+        barrier->released = true;
+        pthread_cond_broadcast(&barrier->cond);
+    }
+    while (!barrier->released && !barrier->failed) {
+        int err = pthread_cond_timedwait(&barrier->cond, &barrier->mutex, &deadline);
+        if (err != 0) {
+            barrier->failed = true;
+            pthread_cond_broadcast(&barrier->cond);
+        }
+    }
+    bool released = barrier->released && !barrier->failed;
+    pthread_mutex_unlock(&barrier->mutex);
+    return released;
+}
+
+static void debug_client_close_pause(native_client* client) {
+    debug_client_close_race* race = client->debug_close_race;
+    if (race == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&race->mutex);
+    race->close_transaction_active = true;
+    pthread_mutex_unlock(&race->mutex);
+    bool unlocked = debug_bounded_barrier_wait(&race->close_unlocked);
+    if (unlocked) {
+        (void)debug_bounded_barrier_wait(&race->close_resume);
+    }
+    pthread_mutex_lock(&race->mutex);
+    race->close_transaction_active = false;
+    pthread_mutex_unlock(&race->mutex);
+}
+#endif
+
+static void native_client_destroy(native_client* client) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_client_close_race* race = client->debug_close_race;
+    if (race != NULL) {
+        pthread_mutex_lock(&race->mutex);
+        race->destroy_attempts++;
+        if (race->close_transaction_active) {
+            race->premature_destroy_count++;
+            pthread_mutex_unlock(&race->mutex);
+            return;
+        }
+        race->destroy_count++;
+        pthread_mutex_unlock(&race->mutex);
+    }
+#endif
+    pthread_mutex_destroy(&client->mutex);
+    free(client);
 }
 
 static int native_client_acquire(native_client* client, trevrpc_raw_client** out_client) {
@@ -1494,8 +1973,7 @@ static void native_client_release(native_client* client) {
 
     trevrpc_raw_client_close(close_client);
     if (destroy) {
-        pthread_mutex_destroy(&client->mutex);
-        free(client);
+        native_client_destroy(client);
     }
 }
 
@@ -1513,32 +1991,207 @@ static int native_client_work_reserve(native_client* client, base_work* work) {
     return err;
 }
 
-static void native_client_close_request(native_client* client) {
+static void native_client_close_request(native_client* client, bool finalizing) {
     if (client == NULL) {
         return;
     }
     trevrpc_raw_client* close_client = NULL;
     trevrpc_raw_client* shutdown_client = NULL;
     native_client_observer* observer = NULL;
+    bool first_close = false;
     pthread_mutex_lock(&client->mutex);
-    client->closing = true;
-    observer = client->observer;
-    client->observer = NULL;
-    if (client->refs == 0 && client->client != NULL) {
-        close_client = client->client;
-        client->client = NULL;
-    } else if (client->client != NULL) {
-        shutdown_client = client->client;
+    client->refs++;
+    if (finalizing) {
+        client->js_alive = false;
+    }
+    if (!client->closing) {
+        first_close = true;
+        client->closing = true;
+        observer = client->observer;
+        client->observer = NULL;
+        if (client->refs == 1 && client->client != NULL) {
+            close_client = client->client;
+            client->client = NULL;
+        } else if (client->client != NULL) {
+            shutdown_client = client->client;
+        }
     }
     pthread_mutex_unlock(&client->mutex);
 
-    trevrpc_raw_client_clear_shutdown_callback(close_client != NULL ? close_client : shutdown_client);
-    native_client_observer_notify(observer, 0);
-    native_client_observer_release(observer);
-    trevrpc_raw_client_shutdown(shutdown_client);
-    trevrpc_raw_client_close(close_client);
-    native_client_maybe_destroy(client);
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_client_close_pause(client);
+#endif
+    if (first_close) {
+        trevrpc_raw_client_clear_shutdown_callback(close_client != NULL ? close_client : shutdown_client);
+        native_client_observer_notify(observer, 0);
+        native_client_observer_release(observer);
+        trevrpc_raw_client_shutdown(shutdown_client);
+        trevrpc_raw_client_close(close_client);
+    }
+    native_client_release(client);
 }
+
+#ifdef TREVRPC_NODE_TEST_HOOKS
+static bool debug_client_close_race_init(debug_client_close_race* race) {
+    memset(race, 0, sizeof(*race));
+    if (pthread_mutex_init(&race->mutex, NULL) != 0) {
+        return false;
+    }
+    if (!debug_bounded_barrier_init(&race->close_unlocked)) {
+        pthread_mutex_destroy(&race->mutex);
+        return false;
+    }
+    if (!debug_bounded_barrier_init(&race->close_resume)) {
+        debug_bounded_barrier_destroy(&race->close_unlocked);
+        pthread_mutex_destroy(&race->mutex);
+        return false;
+    }
+    if (!debug_bounded_barrier_init(&race->release_done)) {
+        debug_bounded_barrier_destroy(&race->close_resume);
+        debug_bounded_barrier_destroy(&race->close_unlocked);
+        pthread_mutex_destroy(&race->mutex);
+        return false;
+    }
+    if (!debug_bounded_barrier_init(&race->close_done)) {
+        debug_bounded_barrier_destroy(&race->release_done);
+        debug_bounded_barrier_destroy(&race->close_resume);
+        debug_bounded_barrier_destroy(&race->close_unlocked);
+        pthread_mutex_destroy(&race->mutex);
+        return false;
+    }
+    return true;
+}
+
+static void debug_client_close_race_destroy(debug_client_close_race* race) {
+    debug_bounded_barrier_destroy(&race->close_done);
+    debug_bounded_barrier_destroy(&race->release_done);
+    debug_bounded_barrier_destroy(&race->close_resume);
+    debug_bounded_barrier_destroy(&race->close_unlocked);
+    pthread_mutex_destroy(&race->mutex);
+}
+
+static void* debug_client_close_thread_main(void* data) {
+    debug_client_close_thread* thread = data;
+    native_client_close_request(thread->client, thread->finalizing);
+    (void)debug_bounded_barrier_wait(&thread->race->close_done);
+    return NULL;
+}
+
+static void* debug_client_release_thread_main(void* data) {
+    debug_client_release_thread* thread = data;
+    native_client_release(thread->client);
+    (void)debug_bounded_barrier_wait(&thread->race->release_done);
+    return NULL;
+}
+
+static bool debug_client_close_race_passed(const debug_client_close_race_result* result) {
+    return result->pin_observed && result->state_observed && result->no_destroy_before_resume &&
+           result->destroy_attempts == 1 && result->destroy_count == 1 && result->premature_destroy_count == 0 &&
+           result->barriers_ok;
+}
+
+static debug_client_close_race_result debug_run_client_close_race(bool finalizing) {
+    debug_client_close_race_result result = {0};
+    debug_client_close_race race;
+    if (!debug_client_close_race_init(&race)) {
+        return result;
+    }
+
+    native_client* client = calloc(1, sizeof(*client));
+    if (client == NULL || pthread_mutex_init(&client->mutex, NULL) != 0) {
+        free(client);
+        debug_client_close_race_destroy(&race);
+        return result;
+    }
+    client->refs = 1;
+    client->closing = finalizing;
+    client->js_alive = finalizing;
+    client->debug_close_race = &race;
+
+    debug_client_close_thread close_thread = {
+        .client = client,
+        .race = &race,
+        .finalizing = finalizing,
+    };
+    pthread_t close_thread_id;
+    bool close_started = pthread_create(&close_thread_id, NULL, debug_client_close_thread_main, &close_thread) == 0;
+    bool release_started = false;
+    pthread_t release_thread_id;
+    if (close_started) {
+        bool close_unlocked = debug_bounded_barrier_wait(&race.close_unlocked);
+        result.barriers_ok = close_unlocked;
+        if (close_unlocked) {
+            pthread_mutex_lock(&client->mutex);
+            result.pin_observed = client->refs == 2;
+            result.state_observed = client->closing && !client->js_alive;
+            pthread_mutex_unlock(&client->mutex);
+
+            debug_client_release_thread release_thread = {
+                .client = client,
+                .race = &race,
+            };
+            release_started =
+                pthread_create(&release_thread_id, NULL, debug_client_release_thread_main, &release_thread) == 0;
+            if (release_started) {
+                result.barriers_ok = debug_bounded_barrier_wait(&race.release_done) && result.barriers_ok;
+                pthread_mutex_lock(&race.mutex);
+                result.no_destroy_before_resume = race.destroy_attempts == 0;
+                pthread_mutex_unlock(&race.mutex);
+            }
+            result.barriers_ok = debug_bounded_barrier_wait(&race.close_resume) && result.barriers_ok;
+            if (release_started) {
+                pthread_join(release_thread_id, NULL);
+            }
+        }
+        result.barriers_ok = debug_bounded_barrier_wait(&race.close_done) && result.barriers_ok;
+        pthread_join(close_thread_id, NULL);
+    }
+
+    if (!release_started) {
+        native_client_release(client);
+    }
+
+    pthread_mutex_lock(&race.mutex);
+    result.destroy_attempts = race.destroy_attempts;
+    result.destroy_count = race.destroy_count;
+    result.premature_destroy_count = race.premature_destroy_count;
+    pthread_mutex_unlock(&race.mutex);
+    debug_client_close_race_destroy(&race);
+    return result;
+}
+
+static napi_value debug_client_close_race_result_to_js(napi_env env, const debug_client_close_race_result* result) {
+    napi_value object = NULL;
+    napi_create_object(env, &object);
+    set_bool(env, object, "passed", debug_client_close_race_passed(result));
+    set_bool(env, object, "pinObserved", result->pin_observed);
+    set_bool(env, object, "stateObserved", result->state_observed);
+    set_bool(env, object, "noDestroyBeforeResume", result->no_destroy_before_resume);
+    set_uint32(env, object, "destroyAttempts", (uint32_t)result->destroy_attempts);
+    set_uint32(env, object, "destructionCount", (uint32_t)result->destroy_count);
+    set_uint32(env, object, "prematureDestructionCount", (uint32_t)result->premature_destroy_count);
+    set_bool(env, object, "barriersOk", result->barriers_ok);
+    return object;
+}
+
+static napi_value debug_client_close_release_race(napi_env env, napi_callback_info info) {
+    (void)info;
+    debug_client_close_race_result first_close = debug_run_client_close_race(false);
+    debug_client_close_race_result finalizer = debug_run_client_close_race(true);
+
+    napi_value result = NULL;
+    napi_value first_close_result = debug_client_close_race_result_to_js(env, &first_close);
+    napi_value finalizer_result = debug_client_close_race_result_to_js(env, &finalizer);
+    napi_create_object(env, &result);
+    set_bool(env,
+        result,
+        "passed",
+        debug_client_close_race_passed(&first_close) && debug_client_close_race_passed(&finalizer));
+    napi_set_named_property(env, result, "firstCloseVsFinalRelease", first_close_result);
+    napi_set_named_property(env, result, "finalizerAfterExplicitClose", finalizer_result);
+    return result;
+}
+#endif
 
 static int native_stream_acquire(native_stream* stream, trevrpc_stream** out_stream) {
     if (stream == NULL) {
@@ -1662,7 +2315,9 @@ static void native_stream_outbound_finish(native_stream* stream, base_work* work
 static int native_stream_operation_acquire(native_stream* stream, trevrpc_stream** out_stream) {
     int err = native_stream_acquire(stream, out_stream);
     if (err != 0) {
-        return err;
+        // The caller already reserved this operation before close. Distinguish its
+        // cancellation from a new operation rejected after the object closed.
+        return err == TREV_NODE_ERR_CLOSED ? -ECANCELED : err;
     }
     err = pthread_mutex_trylock(&stream->operation_mutex);
     if (err == EBUSY) {
@@ -1680,7 +2335,7 @@ static int native_stream_operation_acquire(native_stream* stream, trevrpc_stream
     if (closing) {
         pthread_mutex_unlock(&stream->operation_mutex);
         native_stream_release(stream);
-        return TREV_NODE_ERR_CLOSED;
+        return -ECANCELED;
     }
     return 0;
 }
@@ -2011,18 +2666,43 @@ static void native_server_release(native_server* server) {
     native_server_maybe_destroy(server);
 }
 
-static void native_server_close_request(native_server* server) {
+static int native_server_shutdown_and_release(trevrpc_server* server, bool force_cancel) {
+    if (server == NULL) {
+        return 0;
+    }
+    int result = force_cancel ? trevrpc_server_cancel(server) : trevrpc_server_stop(server);
+    int err = trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
+    if (result == 0) {
+        result = err;
+    }
+    if (err == 0) {
+        err = trevrpc_server_release(server);
+        if (result == 0) {
+            result = err;
+        }
+    }
+    return result;
+}
+
+static int native_server_cancel_and_release(trevrpc_server* server) {
+    return native_server_shutdown_and_release(server, true);
+}
+
+static void native_server_close_request(native_server* server, bool force_cancel) {
     if (server == NULL) {
         return;
     }
-    trevrpc_server* close_server = NULL;
+    trevrpc_server* release_server = NULL;
     trevrpc_server* shutdown_server = NULL;
     napi_env env = NULL;
+    bool cancel_on_close = force_cancel;
     pthread_mutex_lock(&server->mutex);
     server->closing = true;
+    server->cancel_on_close = server->cancel_on_close || force_cancel;
+    cancel_on_close = server->cancel_on_close;
     node_http3_admission_state* admission = server->http3_admission;
     if (!server->serving && server->server != NULL) {
-        close_server = server->server;
+        release_server = server->server;
         server->server = NULL;
     } else {
         shutdown_server = server->server;
@@ -2031,9 +2711,13 @@ static void native_server_close_request(native_server* server) {
     pthread_mutex_unlock(&server->mutex);
 
     http3_admission_state_shutdown(admission);
-    trevrpc_server_shutdown(shutdown_server);
-    trevrpc_server_close(close_server);
-    if (close_server != NULL) {
+    if (cancel_on_close) {
+        (void)trevrpc_server_cancel(shutdown_server);
+    } else {
+        (void)trevrpc_server_stop(shutdown_server);
+    }
+    (void)native_server_shutdown_and_release(release_server, cancel_on_close);
+    if (release_server != NULL) {
         free_server_routes(env, server->routes);
         server->routes = NULL;
         napi_threadsafe_function tsfn = NULL;
@@ -2053,28 +2737,30 @@ static void native_server_close_request(native_server* server) {
 }
 
 static void native_server_close_after_serve(native_server* server, napi_env env, bool server_closed) {
-    trevrpc_server* close_server = NULL;
+    trevrpc_server* release_server = NULL;
     napi_threadsafe_function tsfn = NULL;
     node_http3_admission_state* admission_state = NULL;
+    bool cancel_on_close = false;
     pthread_mutex_lock(&server->mutex);
     server->serving = false;
     if (!server_closed && server->closing && server->server != NULL) {
-        close_server = server->server;
+        release_server = server->server;
         server->server = NULL;
+        cancel_on_close = server->cancel_on_close;
     }
-    if (server_closed || close_server != NULL) {
+    if (server_closed || release_server != NULL) {
         tsfn = server->call_tsfn;
         server->call_tsfn = NULL;
         admission_state = server->http3_admission;
         server->http3_admission = NULL;
     }
     pthread_mutex_unlock(&server->mutex);
-    trevrpc_server_close(close_server);
+    (void)native_server_shutdown_and_release(release_server, cancel_on_close);
     if (tsfn != NULL) {
         napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
     }
     http3_admission_state_release(admission_state);
-    if (server_closed || close_server != NULL) {
+    if (server_closed || release_server != NULL) {
         free_server_routes(env, server->routes);
         server->routes = NULL;
     }
@@ -2602,10 +3288,7 @@ static void native_client_finalize(napi_env env, void* data, void* hint) {
     (void)env;
     (void)hint;
     native_client* client = data;
-    pthread_mutex_lock(&client->mutex);
-    client->js_alive = false;
-    pthread_mutex_unlock(&client->mutex);
-    native_client_close_request(client);
+    native_client_close_request(client, true);
 }
 
 static void native_stream_finalize(napi_env env, void* data, void* hint) {
@@ -2625,7 +3308,7 @@ static void native_server_finalize(napi_env env, void* data, void* hint) {
     pthread_mutex_lock(&server->mutex);
     server->js_alive = false;
     pthread_mutex_unlock(&server->mutex);
-    native_server_close_request(server);
+    native_server_close_request(server, true);
 }
 
 static void native_call_finalize(napi_env env, void* data, void* hint) {
@@ -2646,7 +3329,7 @@ static void native_cancellation_finalize(napi_env env, void* data, void* hint) {
         return;
     }
     cancellation->js_alive = false;
-    trevrpc_cancellation_free(cancellation->cancellation);
+    trevrpc_cancellation_release(cancellation->cancellation);
     cancellation->cancellation = NULL;
     free(cancellation);
 }
@@ -2745,6 +3428,26 @@ static napi_value native_call_constructor(napi_env env, napi_callback_info info)
     if (native_call_acquire(call, &c_call) == 0) {
         napi_value request = request_to_js(env, trevrpc_call_request(c_call));
         napi_set_named_property(env, this_arg, "request", request);
+
+        const trevrpc_call_context* context = trevrpc_call_get_context(c_call);
+        uint64_t remaining_nanos = 0;
+        int has_deadline = trevrpc_call_context_has_deadline(context);
+        if (has_deadline) {
+            (void)trevrpc_call_context_time_remaining_nanos(context, &remaining_nanos);
+        }
+        napi_value context_object = NULL;
+        napi_value has_deadline_value = NULL;
+        napi_value remaining_nanos_value = NULL;
+        napi_value cancelled_value = NULL;
+        if (napi_create_object(env, &context_object) == napi_ok &&
+            napi_get_boolean(env, has_deadline != 0, &has_deadline_value) == napi_ok &&
+            napi_create_bigint_uint64(env, remaining_nanos, &remaining_nanos_value) == napi_ok &&
+            napi_get_boolean(env, trevrpc_call_context_cancelled(context) != 0, &cancelled_value) == napi_ok) {
+            napi_set_named_property(env, context_object, "hasDeadline", has_deadline_value);
+            napi_set_named_property(env, context_object, "timeRemainingNanos", remaining_nanos_value);
+            napi_set_named_property(env, context_object, "cancelled", cancelled_value);
+            napi_set_named_property(env, this_arg, "context", context_object);
+        }
         native_call_release(call, c_call);
     }
     return this_arg;
@@ -2884,7 +3587,11 @@ static napi_value noop_js_callback(napi_env env, napi_callback_info info) {
 static void connect_execute(napi_env env, void* data) {
     (void)env;
     connect_work* work = data;
-    trevrpc_config config = trevrpc_default_config();
+    trevrpc_client_config_v1 config;
+    work->base.err = trevrpc_client_config_v1_init(&config, sizeof(config));
+    if (work->base.err != 0) {
+        return;
+    }
     if (work->idle_timeout_ms > 0) {
         config.max_idle_timeout_ms = work->idle_timeout_ms;
     }
@@ -2905,12 +3612,10 @@ static void connect_execute(napi_env env, void* data) {
     }
     config.ca_cert_file = work->ca_cert_file;
     config.skip_certificate_validation = work->skip_certificate_validation;
-    trevrpc_cancellation* cancellation =
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    work->base.err = trevrpc_raw_client_connect_cancellable_with_shutdown_callback(work->host,
+    work->base.err = trevrpc_raw_client_connect_v1_with_shutdown_callback(work->host,
         work->port,
         &config,
-        cancellation,
+        work->cancellation,
         native_client_connection_shutdown,
         work->observer,
         &work->client);
@@ -2918,15 +3623,12 @@ static void connect_execute(napi_env env, void* data) {
 
 static void connect_cancel(void* data) {
     connect_work* work = data;
-    trevrpc_cancellation_cancel(
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation);
+    trevrpc_cancellation_cancel(work->cancellation);
 }
 
 static void connect_complete(napi_env env, napi_status status, void* data) {
     connect_work* work = data;
-    trevrpc_cancellation* cancellation =
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    if (work->base.err == 0 && trevrpc_cancellation_cancelled(cancellation)) {
+    if (work->base.err == 0 && trevrpc_cancellation_cancelled(work->cancellation)) {
         trevrpc_raw_client_clear_shutdown_callback(work->client);
         trevrpc_raw_client_close(work->client);
         work->client = NULL;
@@ -2976,7 +3678,7 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
             }
             if (wrap_status != napi_ok) {
                 clear_pending_exception(env);
-                native_client_close_request(client);
+                native_client_close_request(client, false);
                 reject_native_error(env, work->base.deferred, -ENOMEM, "connectMsQuic");
             } else {
                 napi_resolve_deferred(env, work->base.deferred, instance);
@@ -2989,7 +3691,7 @@ static void connect_complete(napi_env env, napi_status status, void* data) {
     if (env != NULL && work->cancellation_ref != NULL) {
         napi_delete_reference(env, work->cancellation_ref);
     }
-    trevrpc_cancellation_free(work->owned_cancellation);
+    trevrpc_cancellation_release(work->cancellation);
     native_client_observer_release(work->observer);
     native_work_delete(work->base.work);
     free(work);
@@ -3026,8 +3728,8 @@ static napi_value connect_msquic(napi_env env, napi_callback_info info) {
     get_size_property(env, args[0], "maxPendingSendCount", &work->max_pending_send_count);
     int cancellation_err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
     if (cancellation_err == 0 && work->cancellation == NULL) {
-        work->owned_cancellation = trevrpc_cancellation_new();
-        if (work->owned_cancellation == NULL) {
+        work->cancellation = trevrpc_cancellation_new();
+        if (work->cancellation == NULL) {
             cancellation_err = -ENOMEM;
         }
     }
@@ -3039,7 +3741,7 @@ static napi_value connect_msquic(napi_env env, napi_callback_info info) {
         if (work->cancellation_ref != NULL) {
             napi_delete_reference(env, work->cancellation_ref);
         }
-        trevrpc_cancellation_free(work->owned_cancellation);
+        trevrpc_cancellation_release(work->cancellation);
         native_client_observer_release(work->observer);
         free(work);
         if (invalid_options) {
@@ -3406,7 +4108,11 @@ static napi_value debug_http3_admission(napi_env env, napi_callback_info info) {
 static void listen_execute(napi_env env, void* data) {
     (void)env;
     listen_work* work = data;
-    trevrpc_server_config config = trevrpc_default_server_config();
+    trevrpc_server_config_v1 config;
+    work->base.err = trevrpc_server_config_v1_init(&config, sizeof(config));
+    if (work->base.err != 0) {
+        return;
+    }
     config.host = work->host;
     config.port = work->port;
     config.cert_file = work->cert_file;
@@ -3435,13 +4141,17 @@ static void listen_execute(napi_env env, void* data) {
     if (work->max_pending_send_count > 0) {
         config.max_pending_send_count = work->max_pending_send_count;
     }
-    work->base.err = trevrpc_server_listen(&config, &work->server);
+    work->base.err = trevrpc_server_listen_v1(&config, &work->server);
     if (work->base.err == 0) {
         work->base.err = trevrpc_server_port(work->server, &work->bound_port);
     }
     if (work->base.err == 0 &&
         (work->has_max_stream_messages || work->stream_idle_timeout_ms > 0 || work->initial_request_timeout_ms > 0)) {
-        trevrpc_server_options options = trevrpc_default_server_options();
+        trevrpc_server_options_v1 options;
+        work->base.err = trevrpc_server_options_v1_init(&options, sizeof(options));
+        if (work->base.err != 0) {
+            return;
+        }
         if (work->has_max_stream_messages) {
             options.max_stream_messages = work->max_stream_messages;
         }
@@ -3451,23 +4161,23 @@ static void listen_execute(napi_env env, void* data) {
         if (work->initial_request_timeout_ms > 0) {
             options.initial_request_timeout_nanos = (uint64_t)work->initial_request_timeout_ms * 1000000ull;
         }
-        work->base.err = trevrpc_server_set_options(work->server, &options);
+        work->base.err = trevrpc_server_set_options_v1(work->server, &options);
     }
 }
 
 static void listen_complete(napi_env env, napi_status status, void* data) {
     listen_work* work = data;
     if (env == NULL) {
-        trevrpc_server_close(work->server);
+        (void)native_server_cancel_and_release(work->server);
     } else if (status != napi_ok) {
         reject_native_error(env, work->base.deferred, -ECANCELED, "listenMsQuic");
     } else if (work->base.err != 0) {
-        trevrpc_server_close(work->server);
+        (void)native_server_cancel_and_release(work->server);
         reject_native_error(env, work->base.deferred, work->base.err, "listenMsQuic");
     } else {
         native_server* server = calloc(1, sizeof(*server));
         if (server == NULL) {
-            trevrpc_server_close(work->server);
+            (void)native_server_cancel_and_release(work->server);
             reject_native_error(env, work->base.deferred, -ENOMEM, "listenMsQuic");
         } else {
             pthread_mutex_init(&server->mutex, NULL);
@@ -3510,7 +4220,7 @@ static void listen_complete(napi_env env, napi_status status, void* data) {
                 }
                 http3_admission_state_shutdown(server->http3_admission);
                 http3_admission_state_release(server->http3_admission);
-                trevrpc_server_close(work->server);
+                (void)native_server_cancel_and_release(work->server);
                 pthread_mutex_destroy(&server->mutex);
                 free(server);
                 reject_native_error(env, work->base.deferred, -ENOMEM, "listenMsQuic");
@@ -3686,16 +4396,23 @@ static void serve_execute(napi_env env, void* data) {
     c_server = server->server;
     pthread_mutex_unlock(&server->mutex);
     work->base.err = c_server == NULL ? TREV_NODE_ERR_CLOSED : trevrpc_server_serve(c_server);
-    trevrpc_server* close_server = NULL;
+    trevrpc_server* release_server = NULL;
+    bool cancel_on_close = false;
     pthread_mutex_lock(&server->mutex);
     if (server->closing && server->server == c_server) {
-        close_server = server->server;
+        release_server = server->server;
         server->server = NULL;
+        cancel_on_close = server->cancel_on_close;
     }
     server->serving = false;
     pthread_mutex_unlock(&server->mutex);
-    trevrpc_server_close(close_server);
-    work->server_closed = close_server != NULL;
+    if (release_server != NULL) {
+        int release_err = native_server_shutdown_and_release(release_server, cancel_on_close);
+        if (work->base.err == 0) {
+            work->base.err = release_err;
+        }
+    }
+    work->server_closed = release_server != NULL;
 }
 
 static void serve_complete(napi_env env, napi_status status, void* data) {
@@ -3723,7 +4440,7 @@ static void serve_work_cancel(void* data) {
     pthread_mutex_lock(&work->server->mutex);
     work->server->env = NULL;
     pthread_mutex_unlock(&work->server->mutex);
-    native_server_close_request(work->server);
+    native_server_close_request(work->server, true);
 }
 
 static napi_value native_server_serve(napi_env env, napi_callback_info info) {
@@ -3742,8 +4459,13 @@ static napi_value native_server_serve(napi_env env, napi_callback_info info) {
         free(work);
         return NULL;
     }
+    int freeze_err = 0;
     pthread_mutex_lock(&server->mutex);
     bool can_start = !server->closing && !server->serving && server->server != NULL;
+    if (can_start) {
+        freeze_err = trevrpc_server_freeze(server->server);
+        can_start = freeze_err == 0;
+    }
     if (can_start) {
         server->serving = true;
         server->refs++;
@@ -3752,7 +4474,11 @@ static napi_value native_server_serve(napi_env env, napi_callback_info info) {
     if (!can_start) {
         napi_delete_reference(env, work->base.receiver_ref);
         free(work);
-        napi_throw_error(env, NULL, "server is closed or already serving");
+        if (freeze_err != 0) {
+            throw_native_error(env, freeze_err, "serve");
+        } else {
+            napi_throw_error(env, NULL, "server is closed or already serving");
+        }
         return NULL;
     }
     work->server = server;
@@ -3767,7 +4493,7 @@ static napi_value native_server_close(napi_env env, napi_callback_info info) {
     if (!unwrap_native_server(env, this_arg, &server)) {
         return NULL;
     }
-    native_server_close_request(server);
+    native_server_close_request(server, false);
     napi_value undefined = NULL;
     napi_get_undefined(env, &undefined);
     return undefined;
@@ -3800,7 +4526,7 @@ static napi_value create_native_cancellation(napi_env env) {
     }
     if (status != napi_ok) {
         clear_pending_exception(env);
-        trevrpc_cancellation_free(cancellation->cancellation);
+        trevrpc_cancellation_release(cancellation->cancellation);
         free(cancellation);
         napi_throw_error(env, NULL, "failed to create cancellation");
         return NULL;
@@ -3845,20 +4571,35 @@ static void call_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    trevrpc_cancellation* cancellation =
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    work->base.err = trevrpc_raw_client_call_request_cancellable(client, &work->request, cancellation, &work->response);
+    trevrpc_call_options_v1 options = {0};
+    work->base.err = trevrpc_call_options_v1_init(&options, sizeof(options));
+    if (work->base.err != 0) {
+        return;
+    }
+    options.cancellation = work->cancellation;
+    options.max_response_body_size = -1;
+    options.max_response_messages = -1;
+    options.max_response_stream_body_size = -1;
+    options.response_idle_timeout_nanos = 0;
+    options.request_body_lifetime = TREVRPC_REQUEST_BODY_BORROW_UNTIL_RETURN;
+    work->base.err = trevrpc_raw_client_call_request_inbound_v1(client, &work->request, &options, &work->response);
 }
 
 static void call_complete(napi_env env, napi_status status, void* data) {
     call_work* work = data;
     if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value response = response_to_js(env, work->response);
-        napi_resolve_deferred(env, work->base.deferred, response);
+        napi_value response = NULL;
+        int conversion_err = inbound_response_to_js(env, work->response, &response);
+        if (conversion_err == 0) {
+            napi_resolve_deferred(env, work->base.deferred, response);
+        } else {
+            clear_pending_exception(env);
+            reject_native_error(env, work->base.deferred, conversion_err, "call");
+        }
     } else if (env != NULL) {
         reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "call");
     }
-    trevrpc_response_free(work->response);
+    trevrpc_inbound_response_release(work->response);
     if (work->acquired) {
         native_client_release(work->client);
     }
@@ -3868,7 +4609,7 @@ static void call_complete(napi_env env, napi_status status, void* data) {
     if (env != NULL && work->cancellation_ref != NULL) {
         napi_delete_reference(env, work->cancellation_ref);
     }
-    trevrpc_cancellation_free(work->owned_cancellation);
+    trevrpc_cancellation_release(work->cancellation);
     native_work_delete(work->base.work);
     trevrpc_metadata_reset(&work->request.metadata);
     free(work->service);
@@ -3879,8 +4620,7 @@ static void call_complete(napi_env env, napi_status status, void* data) {
 
 static void call_work_cancel(void* data) {
     call_work* work = data;
-    trevrpc_cancellation_cancel(
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation);
+    trevrpc_cancellation_cancel(work->cancellation);
 }
 
 static napi_value native_client_call(napi_env env, napi_callback_info info) {
@@ -3908,8 +4648,8 @@ static napi_value native_client_call(napi_env env, napi_callback_info info) {
         err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
     }
     if (err == 0 && work->cancellation == NULL) {
-        work->owned_cancellation = trevrpc_cancellation_new();
-        if (work->owned_cancellation == NULL) {
+        work->cancellation = trevrpc_cancellation_new();
+        if (work->cancellation == NULL) {
             err = -ENOMEM;
         }
     }
@@ -3918,7 +4658,7 @@ static napi_value native_client_call(napi_env env, napi_callback_info info) {
         if (work->cancellation_ref != NULL) {
             napi_delete_reference(env, work->cancellation_ref);
         }
-        trevrpc_cancellation_free(work->owned_cancellation);
+        trevrpc_cancellation_release(work->cancellation);
         trevrpc_metadata_reset(&work->request.metadata);
         free(work->service);
         free(work->method);
@@ -3940,10 +4680,18 @@ static void start_stream_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    trevrpc_cancellation* cancellation =
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation;
-    work->base.err =
-        trevrpc_raw_client_start_stream_request_cancellable(client, &work->request, cancellation, &work->stream);
+    trevrpc_call_options_v1 options = {0};
+    work->base.err = trevrpc_call_options_v1_init(&options, sizeof(options));
+    if (work->base.err != 0) {
+        return;
+    }
+    options.cancellation = work->cancellation;
+    options.max_response_body_size = -1;
+    options.max_response_messages = -1;
+    options.max_response_stream_body_size = -1;
+    options.response_idle_timeout_nanos = 0;
+    options.request_body_lifetime = TREVRPC_REQUEST_BODY_BORROW_UNTIL_RETURN;
+    work->base.err = trevrpc_raw_client_start_stream_request_v1(client, &work->request, &options, &work->stream);
 }
 
 static void start_stream_complete(napi_env env, napi_status status, void* data) {
@@ -4011,7 +4759,7 @@ static void start_stream_complete(napi_env env, napi_status status, void* data) 
     if (env != NULL && work->cancellation_ref != NULL) {
         napi_delete_reference(env, work->cancellation_ref);
     }
-    trevrpc_cancellation_free(work->owned_cancellation);
+    trevrpc_cancellation_release(work->cancellation);
     native_work_delete(work->base.work);
     trevrpc_metadata_reset(&work->request.metadata);
     free(work->service);
@@ -4022,8 +4770,7 @@ static void start_stream_complete(napi_env env, napi_status status, void* data) 
 
 static void start_stream_work_cancel(void* data) {
     start_stream_work* work = data;
-    trevrpc_cancellation_cancel(
-        work->cancellation != NULL ? work->cancellation->cancellation : work->owned_cancellation);
+    trevrpc_cancellation_cancel(work->cancellation);
 }
 
 static napi_value native_client_start_stream(napi_env env, napi_callback_info info) {
@@ -4051,8 +4798,8 @@ static napi_value native_client_start_stream(napi_env env, napi_callback_info in
         err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
     }
     if (err == 0 && work->cancellation == NULL) {
-        work->owned_cancellation = trevrpc_cancellation_new();
-        if (work->owned_cancellation == NULL) {
+        work->cancellation = trevrpc_cancellation_new();
+        if (work->cancellation == NULL) {
             err = -ENOMEM;
         }
     }
@@ -4061,7 +4808,7 @@ static napi_value native_client_start_stream(napi_env env, napi_callback_info in
         if (work->cancellation_ref != NULL) {
             napi_delete_reference(env, work->cancellation_ref);
         }
-        trevrpc_cancellation_free(work->owned_cancellation);
+        trevrpc_cancellation_release(work->cancellation);
         trevrpc_metadata_reset(&work->request.metadata);
         free(work->service);
         free(work->method);
@@ -4087,7 +4834,7 @@ static napi_value native_client_close(napi_env env, napi_callback_info info) {
     if (!unwrap_native_client(env, this_arg, &client)) {
         return NULL;
     }
-    native_client_close_request(client);
+    native_client_close_request(client, false);
     napi_value undefined = NULL;
     napi_get_undefined(env, &undefined);
     return undefined;
@@ -4101,16 +4848,6 @@ typedef struct native_stream_work_prefix {
 static void native_stream_work_cancel(void* data) {
     native_stream_work_prefix* work = data;
     native_stream_close_request(work->stream);
-}
-
-static bool native_stream_wait_timed_out(native_stream* stream, uint64_t wait_started_nanos) {
-    trevrpc_stream* c_stream = NULL;
-    if (native_stream_acquire(stream, &c_stream) != 0) {
-        return false;
-    }
-    bool timed_out = trevrpc_stream_wait_timeout_elapsed(c_stream, wait_started_nanos) == 1;
-    native_stream_release(stream);
-    return timed_out;
 }
 
 static void stream_send_execute(napi_env env, void* data);
@@ -4365,11 +5102,6 @@ static napi_value native_stream_finish_send(napi_env env, napi_callback_info inf
 static void stream_recv_execute(napi_env env, void* data) {
     (void)env;
     stream_recv_work* work = data;
-    if (native_stream_wait_timed_out(work->stream, work->base.queued_at_nanos)) {
-        work->base.err = TREVRPC_ERR_STREAM_IDLE_TIMEOUT;
-        native_stream_close_request(work->stream);
-        return;
-    }
     trevrpc_stream* stream = NULL;
     work->base.err = native_stream_operation_acquire(work->stream, &stream);
     if (work->base.err == -EAGAIN) {
@@ -4382,9 +5114,12 @@ static void stream_recv_execute(napi_env env, void* data) {
     }
     work->acquired = true;
     int ready = 0;
-    work->base.err = trevrpc_stream_recv_ready_since(stream, &work->frame, &ready, work->base.queued_at_nanos);
+    work->base.err = trevrpc_stream_recv_inbound_ready_since(stream, &work->frame, &ready, work->base.queued_at_nanos);
     native_stream_operation_release(work->stream);
     work->acquired = false;
+    if (work->base.err == TREVRPC_ERR_STREAM_IDLE_TIMEOUT) {
+        native_stream_close_request(work->stream);
+    }
     if (work->base.err == 0 && !ready) {
         work->base.retry = true;
     }
@@ -4394,16 +5129,18 @@ static void stream_recv_complete(napi_env env, napi_status status, void* data) {
     stream_recv_work* work = data;
     if (env != NULL && work->base.err == 0 && status == napi_ok) {
         napi_value value = NULL;
-        if (work->frame == NULL) {
-            napi_get_null(env, &value);
+        int conversion_err = work->frame == NULL ? (napi_get_null(env, &value) == napi_ok ? 0 : -ENOMEM)
+                                                 : inbound_stream_frame_to_js(env, work->frame, &value);
+        if (conversion_err == 0) {
+            napi_resolve_deferred(env, work->base.deferred, value);
         } else {
-            value = stream_frame_to_js(env, work->frame);
+            clear_pending_exception(env);
+            reject_native_error(env, work->base.deferred, conversion_err, "recv");
         }
-        napi_resolve_deferred(env, work->base.deferred, value);
     } else if (env != NULL) {
         reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recv");
     }
-    trevrpc_stream_frame_free(work->frame);
+    trevrpc_inbound_stream_frame_release(work->frame);
     if (work->acquired) {
         native_stream_operation_release(work->stream);
     }
@@ -4440,11 +5177,6 @@ static napi_value native_stream_recv(napi_env env, napi_callback_info info) {
 static void stream_recv_many_execute(napi_env env, void* data) {
     (void)env;
     stream_recv_many_work* work = data;
-    if (native_stream_wait_timed_out(work->stream, work->base.queued_at_nanos)) {
-        work->base.err = TREVRPC_ERR_STREAM_IDLE_TIMEOUT;
-        native_stream_close_request(work->stream);
-        return;
-    }
     trevrpc_stream* stream = NULL;
     work->base.err = native_stream_operation_acquire(work->stream, &stream);
     if (work->base.err == -EAGAIN) {
@@ -4467,6 +5199,9 @@ static void stream_recv_many_execute(napi_env env, void* data) {
         work->base.queued_at_nanos);
     native_stream_operation_release(work->stream);
     work->acquired = false;
+    if (work->base.err == TREVRPC_ERR_STREAM_IDLE_TIMEOUT) {
+        native_stream_close_request(work->stream);
+    }
     if (work->base.err == 0 && !ready) {
         work->base.retry = true;
     }
@@ -4475,12 +5210,18 @@ static void stream_recv_many_execute(napi_env env, void* data) {
 static void stream_recv_many_complete(napi_env env, napi_status status, void* data) {
     stream_recv_many_work* work = data;
     if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value frames = stream_frame_list_to_js(env, work->frames, work->frames_len, work->eof);
-        napi_resolve_deferred(env, work->base.deferred, frames);
+        napi_value frames = NULL;
+        int conversion_err = inbound_stream_frame_list_to_js(env, work->frames, work->frames_len, work->eof, &frames);
+        if (conversion_err == 0) {
+            napi_resolve_deferred(env, work->base.deferred, frames);
+        } else {
+            clear_pending_exception(env);
+            reject_native_error(env, work->base.deferred, conversion_err, "recvMany");
+        }
     } else if (env != NULL) {
         reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recvMany");
     }
-    stream_frame_list_reset(work->frames, work->frames_len);
+    inbound_stream_frame_list_reset(work->frames, work->frames_len);
     if (work->acquired) {
         native_stream_operation_release(work->stream);
     }
@@ -4519,12 +5260,18 @@ static napi_value native_stream_recv_many(napi_env env, napi_callback_info info)
 static void stream_recv_body_batch_complete(napi_env env, napi_status status, void* data) {
     stream_recv_many_work* work = data;
     if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value batch = stream_body_batch_to_js(env, work->frames, work->frames_len, work->eof);
-        napi_resolve_deferred(env, work->base.deferred, batch);
+        napi_value batch = NULL;
+        int conversion_err = inbound_stream_body_batch_to_js(env, work->frames, work->frames_len, work->eof, &batch);
+        if (conversion_err == 0) {
+            napi_resolve_deferred(env, work->base.deferred, batch);
+        } else {
+            clear_pending_exception(env);
+            reject_native_error(env, work->base.deferred, conversion_err, "recvBodyBatch");
+        }
     } else if (env != NULL) {
         reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recvBodyBatch");
     }
-    stream_frame_list_reset(work->frames, work->frames_len);
+    inbound_stream_frame_list_reset(work->frames, work->frames_len);
     if (work->acquired) {
         native_stream_operation_release(work->stream);
     }
@@ -4606,17 +5353,6 @@ static void native_call_work_cancel(void* data) {
     native_call_close_request(work->call);
 }
 
-static bool native_call_wait_timed_out(native_call* call, uint64_t wait_started_nanos) {
-    trevrpc_call* c_call = NULL;
-    if (native_call_acquire(call, &c_call) != 0) {
-        return false;
-    }
-    trevrpc_stream* stream = trevrpc_call_stream(c_call);
-    bool timed_out = stream != NULL && trevrpc_stream_wait_timeout_elapsed(stream, wait_started_nanos) == 1;
-    native_call_release_keep_wrapper(call, c_call);
-    return timed_out;
-}
-
 static void call_send_execute(napi_env env, void* data);
 static void call_send_complete(napi_env env, napi_status status, void* data);
 static void call_send_many_execute(napi_env env, void* data);
@@ -4638,7 +5374,17 @@ static void call_respond_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    work->base.err = trevrpc_call_respond(work->c_call, &work->response);
+    trevrpc_response_view_v1 response = {0};
+    work->base.err = trevrpc_response_view_v1_init(&response, sizeof(response));
+    if (work->base.err == 0) {
+        response.status = work->status;
+        response.message = work->message;
+        response.message_len = work->message_len;
+        response.body = work->body;
+        response.body_len = work->body_len;
+        response.metadata = &work->metadata;
+        work->base.err = trevrpc_call_respond_borrowed_v1(work->c_call, &response);
+    }
     trevrpc_call_close(work->c_call);
     native_call_terminal_operation_complete(work->call, work->c_call, &work->base);
     work->c_call = NULL;
@@ -4667,7 +5413,9 @@ static void call_respond_complete(napi_env env, napi_status status, void* data) 
         napi_delete_reference(env, work->base.receiver_ref);
     }
     native_work_delete(work->base.work);
-    trevrpc_response_reset(&work->response);
+    trevrpc_metadata_reset(&work->metadata);
+    free(work->message);
+    free(work->body);
     free(work);
 }
 
@@ -4690,10 +5438,12 @@ static napi_value native_call_respond(napi_env env, napi_callback_info info) {
         free(work);
         return NULL;
     }
-    int err = response_from_js(env, args[0], &work->response);
+    int err = server_response_from_js(env, args[0], work);
     if (err != 0) {
         napi_delete_reference(env, work->base.receiver_ref);
-        trevrpc_response_reset(&work->response);
+        trevrpc_metadata_reset(&work->metadata);
+        free(work->message);
+        free(work->body);
         free(work);
         throw_if_no_pending_exception(env, "invalid response object");
         return NULL;
@@ -4900,8 +5650,15 @@ static void call_finish_execute(napi_env env, void* data) {
         return;
     }
     work->acquired = true;
-    work->base.err = trevrpc_call_finish_stream_with_metadata(
-        work->c_call, work->status, work->message, work->message_len, &work->metadata);
+    trevrpc_status_view_v1 status = {0};
+    work->base.err = trevrpc_status_view_v1_init(&status, sizeof(status));
+    if (work->base.err == 0) {
+        status.status = work->status;
+        status.message = work->message;
+        status.message_len = work->message_len;
+        status.metadata = &work->metadata;
+        work->base.err = trevrpc_call_finish_stream_borrowed_v1(work->c_call, &status);
+    }
     trevrpc_call_close(work->c_call);
     native_call_terminal_operation_complete(work->call, work->c_call, &work->base);
     work->c_call = NULL;
@@ -4991,11 +5748,6 @@ static napi_value native_call_finish_stream(napi_env env, napi_callback_info inf
 static void call_recv_execute(napi_env env, void* data) {
     (void)env;
     call_recv_work* work = data;
-    if (native_call_wait_timed_out(work->call, work->base.queued_at_nanos)) {
-        work->base.err = TREVRPC_ERR_STREAM_IDLE_TIMEOUT;
-        native_call_close_request(work->call);
-        return;
-    }
     work->base.err = native_call_operation_acquire(work->call, false, &work->c_call, &work->base);
     if (work->base.err != 0) {
         return;
@@ -5006,12 +5758,15 @@ static void call_recv_execute(napi_env env, void* data) {
     work->acquired = true;
     trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
     int ready = 0;
-    work->base.err = stream == NULL
-                         ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
-                         : trevrpc_stream_recv_ready_since(stream, &work->frame, &ready, work->base.queued_at_nanos);
+    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
+                                    : trevrpc_stream_recv_inbound_ready_since(
+                                          stream, &work->frame, &ready, work->base.queued_at_nanos);
     native_call_work_operation_release(work->call, work->c_call);
     work->c_call = NULL;
     work->acquired = false;
+    if (work->base.err == TREVRPC_ERR_STREAM_IDLE_TIMEOUT) {
+        native_call_close_request(work->call);
+    }
     if (work->base.err == 0 && !ready) {
         work->base.retry = true;
     }
@@ -5021,16 +5776,18 @@ static void call_recv_complete(napi_env env, napi_status status, void* data) {
     call_recv_work* work = data;
     if (env != NULL && status == napi_ok && work->base.err == 0) {
         napi_value value = NULL;
-        if (work->frame == NULL) {
-            napi_get_null(env, &value);
+        int conversion_err = work->frame == NULL ? (napi_get_null(env, &value) == napi_ok ? 0 : -ENOMEM)
+                                                 : inbound_stream_frame_to_js(env, work->frame, &value);
+        if (conversion_err == 0) {
+            napi_resolve_deferred(env, work->base.deferred, value);
         } else {
-            value = stream_frame_to_js(env, work->frame);
+            clear_pending_exception(env);
+            reject_native_error(env, work->base.deferred, conversion_err, "recv");
         }
-        napi_resolve_deferred(env, work->base.deferred, value);
     } else if (env != NULL) {
         reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recv");
     }
-    trevrpc_stream_frame_free(work->frame);
+    trevrpc_inbound_stream_frame_release(work->frame);
     if (work->acquired) {
         native_call_work_operation_release(work->call, work->c_call);
     }
@@ -5062,11 +5819,6 @@ static napi_value native_call_recv(napi_env env, napi_callback_info info) {
 static void call_recv_many_execute(napi_env env, void* data) {
     (void)env;
     call_recv_many_work* work = data;
-    if (native_call_wait_timed_out(work->call, work->base.queued_at_nanos)) {
-        work->base.err = TREVRPC_ERR_STREAM_IDLE_TIMEOUT;
-        native_call_close_request(work->call);
-        return;
-    }
     work->base.err = native_call_operation_acquire(work->call, false, &work->c_call, &work->base);
     if (work->base.err != 0) {
         return;
@@ -5089,6 +5841,9 @@ static void call_recv_many_execute(napi_env env, void* data) {
     native_call_work_operation_release(work->call, work->c_call);
     work->c_call = NULL;
     work->acquired = false;
+    if (work->base.err == TREVRPC_ERR_STREAM_IDLE_TIMEOUT) {
+        native_call_close_request(work->call);
+    }
     if (work->base.err == 0 && !ready) {
         work->base.retry = true;
     }
@@ -5097,12 +5852,18 @@ static void call_recv_many_execute(napi_env env, void* data) {
 static void call_recv_many_complete(napi_env env, napi_status status, void* data) {
     call_recv_many_work* work = data;
     if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value frames = stream_frame_list_to_js(env, work->frames, work->frames_len, work->eof);
-        napi_resolve_deferred(env, work->base.deferred, frames);
+        napi_value frames = NULL;
+        int conversion_err = inbound_stream_frame_list_to_js(env, work->frames, work->frames_len, work->eof, &frames);
+        if (conversion_err == 0) {
+            napi_resolve_deferred(env, work->base.deferred, frames);
+        } else {
+            clear_pending_exception(env);
+            reject_native_error(env, work->base.deferred, conversion_err, "recvMany");
+        }
     } else if (env != NULL) {
         reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recvMany");
     }
-    stream_frame_list_reset(work->frames, work->frames_len);
+    inbound_stream_frame_list_reset(work->frames, work->frames_len);
     if (work->acquired) {
         native_call_work_operation_release(work->call, work->c_call);
     }
@@ -5408,35 +6169,6 @@ static napi_value debug_pending_resource_finalizers(napi_env env, napi_callback_
     return value;
 }
 
-static int debug_borrowed_body_from_arg(
-    napi_env env, napi_value value, uint8_t** out_owner, uint8_t** out_body, size_t* out_body_len) {
-    *out_owner = NULL;
-    *out_body = NULL;
-    *out_body_len = 0;
-
-    const uint8_t* source = NULL;
-    size_t source_len = 0;
-    int err = bytes_arg_view(env, value, &source, &source_len);
-    if (err != 0) {
-        return err;
-    }
-    if (source_len > SIZE_MAX - 16) {
-        return -EOVERFLOW;
-    }
-    uint8_t* owner = malloc(source_len + 16);
-    if (owner == NULL) {
-        return -ENOMEM;
-    }
-    memset(owner, 0xa5, source_len + 16);
-    if (source_len > 0) {
-        memcpy(owner + 8, source, source_len);
-        *out_body = owner + 8;
-    }
-    *out_owner = owner;
-    *out_body_len = source_len;
-    return 0;
-}
-
 static napi_value debug_external_arraybuffer_finalizers(napi_env env, napi_callback_info info) {
     (void)info;
     uint64_t count = atomic_load_explicit(&ExternalArrayBufferFinalizers, memory_order_relaxed);
@@ -5445,67 +6177,36 @@ static napi_value debug_external_arraybuffer_finalizers(napi_env env, napi_callb
     return value;
 }
 
-static napi_value debug_make_borrowed_response(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "_debugMakeBorrowedResponse requires a body");
-        return NULL;
-    }
-
-    trevrpc_response response = {.status = TREVRPC_STATUS_OK};
-    int err = debug_borrowed_body_from_arg(env, args[0], &response._body_owner, &response.body, &response.body_len);
-    if (err != 0) {
-        throw_native_error(env, err, "_debugMakeBorrowedResponse");
-        return NULL;
-    }
-
-    napi_value object = response_to_js(env, &response);
-    trevrpc_response_reset(&response);
-    return object;
+static napi_value debug_body_owner_releases(napi_env env, napi_callback_info info) {
+    (void)info;
+    uint64_t count = atomic_load_explicit(&NodeBodyOwnerReleases, memory_order_relaxed);
+    napi_value value = NULL;
+    napi_create_double(env, (double)count, &value);
+    return value;
 }
 
-static napi_value debug_make_borrowed_stream_frame(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "_debugMakeBorrowedStreamFrame requires a body");
-        return NULL;
-    }
-
-    trevrpc_stream_frame frame = {.kind = TREVRPC_STREAM_FRAME_KIND_MESSAGE, .status = TREVRPC_STATUS_OK};
-    int err = debug_borrowed_body_from_arg(env, args[0], &frame._body_owner, &frame.body, &frame.body_len);
-    if (err != 0) {
-        throw_native_error(env, err, "_debugMakeBorrowedStreamFrame");
-        return NULL;
-    }
-
-    napi_value object = stream_frame_to_js(env, &frame);
-    trevrpc_stream_frame_reset(&frame);
-    return object;
+static napi_value debug_body_conversion_failure_stage(napi_env env, napi_callback_info info) {
+    (void)info;
+    int stage = atomic_load_explicit(&NextBodyConversionFailure, memory_order_relaxed);
+    napi_value value = NULL;
+    napi_create_int32(env, stage, &value);
+    return value;
 }
 
-static napi_value debug_make_borrowed_stream_body_batch(napi_env env, napi_callback_info info) {
+static napi_value debug_set_next_body_conversion_failure(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "_debugMakeBorrowedStreamBodyBatch requires a body");
+    uint32_t stage = 0;
+    if (argc != 1 || napi_get_value_uint32(env, args[0], &stage) != napi_ok ||
+        stage > DEBUG_BODY_CONVERSION_FAILURE_AFTER_TYPED_ARRAY) {
+        napi_throw_type_error(env, NULL, "invalid body conversion failure stage");
         return NULL;
     }
-
-    trevrpc_stream_frame frame = {.kind = TREVRPC_STREAM_FRAME_KIND_MESSAGE, .status = TREVRPC_STATUS_OK};
-    int err = debug_borrowed_body_from_arg(env, args[0], &frame._body_owner, &frame.body, &frame.body_len);
-    if (err != 0) {
-        throw_native_error(env, err, "_debugMakeBorrowedStreamBodyBatch");
-        return NULL;
-    }
-    trevrpc_stream_frame* frames[] = {&frame};
-    napi_value object = stream_body_batch_to_js(env, frames, 1, false);
-    trevrpc_stream_frame_reset(&frame);
-    return object;
+    atomic_store_explicit(&NextBodyConversionFailure, (int)stage, memory_order_relaxed);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
 }
 
 #endif
@@ -5618,6 +6319,7 @@ static napi_value init(napi_env env, napi_value exports) {
         {"connectMsQuic", NULL, connect_msquic, NULL, NULL, NULL, napi_default, NULL},
         {"listenMsQuic", NULL, listen_msquic, NULL, NULL, NULL, napi_default, NULL},
 #ifdef TREVRPC_NODE_TEST_HOOKS
+        {"_debugClientCloseReleaseRace", NULL, debug_client_close_release_race, NULL, NULL, NULL, napi_default, NULL},
         {"_debugHttp3Admission", NULL, debug_http3_admission, NULL, NULL, NULL, napi_default, NULL},
         {"_debugExternalArrayBufferFinalizers",
             NULL,
@@ -5627,11 +6329,18 @@ static napi_value init(napi_env env, napi_value exports) {
             NULL,
             napi_default,
             NULL},
-        {"_debugMakeBorrowedResponse", NULL, debug_make_borrowed_response, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugMakeBorrowedStreamFrame", NULL, debug_make_borrowed_stream_frame, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugMakeBorrowedStreamBodyBatch",
+        {"_debugBodyOwnerReleases", NULL, debug_body_owner_releases, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugBodyConversionFailureStage",
             NULL,
-            debug_make_borrowed_stream_body_batch,
+            debug_body_conversion_failure_stage,
+            NULL,
+            NULL,
+            NULL,
+            napi_default,
+            NULL},
+        {"_debugSetNextBodyConversionFailure",
+            NULL,
+            debug_set_next_body_conversion_failure,
             NULL,
             NULL,
             NULL,

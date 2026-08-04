@@ -1,9 +1,5 @@
-import type {
-  NodeConnectOptions,
-  RpcResponseMessage,
-  RpcStreamFrameMessage,
-  Transport,
-} from "./index.js";
+import type { RpcResponseMessage, RpcStreamFrameMessage, Transport } from "./index.js";
+import type { NodeChannelTarget, NodeConnectOptions } from "./node.js";
 
 export interface RawNodeCloseInfo {
   nativeCode: number;
@@ -15,7 +11,7 @@ export class RawNodeTransport implements Transport {
   readonly closed: Promise<RawNodeCloseInfo>;
 
   static connect(
-    urlOrOptions: string | URL | NodeConnectOptions,
+    target: string | URL | NodeChannelTarget,
     options?: NodeConnectOptions,
   ): Promise<RawNodeTransport>;
   call(

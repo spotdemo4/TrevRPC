@@ -1,18 +1,25 @@
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { getSystemErrorName } from "node:util";
 
 import { ChannelStateMachine, stripChannelOptions, waitForInitialReady } from "./channel.js";
-import { Code, cancelled, codeFromNumber, invalidArgument } from "./status.js";
+import { RequestWriterSettlement } from "./client.js";
+import { loadNativeAddon } from "./native-loader.js";
+import { Code, TrevRpcError, cancelled, codeFromNumber, invalidArgument } from "./status.js";
+import { scheduleTimeout } from "./timer.js";
 import { RpcKind, RpcStreamFrameKind } from "./wire.js";
 
-const require = createRequire(import.meta.url);
-const moduleDir = dirname(fileURLToPath(import.meta.url));
 const EmptyBody = new Uint8Array(0);
-const RpcStatusOk = 0;
 const RecvManyBatchSize = 32;
 const SendManyBatchSize = 16;
 const NativeTransportClosed = -1001;
+const NativeFrameLimit = -1002;
+const NativeMsQuicTimeout = -1003;
+const NativeStreamLimit = -1004;
+const NativeInvalidFrame = -2001;
+const NativeUnsupportedWireVersion = -2002;
+const NativeInvalidFrameKind = -2003;
+const NativeSendByteLimit = -2005;
+const NativeSendCountLimit = -2006;
+const NativeObjectClosed = -4001;
 
 /** Native Node transport backed by trevrpc-c and MsQuic. */
 export class RawNodeTransport {
@@ -35,10 +42,10 @@ export class RawNodeTransport {
       return new RawNodeTransport(nativeClient, connectOptions);
     } catch (error) {
       if (connectOptions.signal?.aborted) {
-        nativeClient?.close();
+        closeNativeObjectQuietly(nativeClient);
         throw signalAbortError(connectOptions.signal);
       }
-      throw error;
+      throw nativeError(error, "connect");
     } finally {
       cleanupAbort();
     }
@@ -62,7 +69,7 @@ export class RawNodeTransport {
       if (options.signal?.aborted) {
         throw signalAbortError(options.signal);
       }
-      throw error;
+      throw nativeError(error, "unary call");
     } finally {
       cleanupAbort();
     }
@@ -85,21 +92,35 @@ export class RawNodeTransport {
       throwIfAborted(options.signal);
     } catch (error) {
       cleanupStartAbort();
-      stream?.close();
+      closeNativeObjectQuietly(stream);
       if (options.signal?.aborted) {
         throw signalAbortError(options.signal);
       }
-      throw error;
+      throw nativeError(error, "start streaming call");
     }
 
-    const cleanupStreamAbort = onAbort(options.signal, () => stream.close());
-    const writerTask = writeRequestStream(stream, requestBody);
-    return new NativeResponseFrameStream(stream, writerTask, cleanupStreamAbort, options.signal);
+    const closeStream = once(() => closeNativeObject(stream, "close response stream"));
+    const writerSettlement = new RequestWriterSettlement(
+      (error) => error,
+      isNativeCleanupWriterError,
+      isNativeCleanupWriterError,
+      true,
+    );
+    writerSettlement.track(
+      writeRequestStream(stream, requestBody, closeStream, (error) =>
+        writerSettlement.recordError(error),
+      ),
+    );
+    return new NativeResponseFrameStream(stream, writerSettlement, closeStream, options.signal);
   }
 
   /** Closes the underlying native client. */
   close() {
-    this.nativeClient.close();
+    try {
+      this.nativeClient.close();
+    } catch (error) {
+      throw nativeError(error, "close client");
+    }
   }
 
   /** Resolves when the underlying native connection closes. */
@@ -110,36 +131,23 @@ export class RawNodeTransport {
 
 /** Native Node channel with background connection reconnection. */
 export class Channel extends ChannelStateMachine {
-  constructor(urlOrOptions, options = {}) {
-    const retainedInput = retainNodeConnectInput(urlOrOptions);
-    const retainedOptions = Object.freeze({ ...options });
-    const reconnectOptions =
-      retainedInput != null && typeof retainedInput === "object"
-        ? { ...retainedInput, ...retainedOptions }
-        : retainedOptions;
-    const transportInput =
-      retainedInput != null && typeof retainedInput === "object"
-        ? stripChannelOptions(retainedInput)
-        : retainedInput;
-    const transportOptions = stripChannelOptions(retainedOptions);
+  constructor(target, options = {}) {
+    const normalized = normalizeNodeChannelOptions(target, options);
+    const transportOptions = stripChannelOptions(normalized.options);
     super(
-      (signal) => RawNodeTransport.connect(transportInput, { ...transportOptions, signal }),
-      reconnectOptions,
+      (signal) => RawNodeTransport.connect(normalized.endpoint, { ...transportOptions, signal }),
+      normalized.options,
       (transport) => transport.closed,
       (error) => error?.nativeCode === NativeTransportClosed,
     );
-    this.urlOrOptions = retainedInput;
-    this.options = retainedOptions;
+    this.endpoint = normalized.endpoint;
+    this.options = normalized.options;
   }
 
   /** Creates a native channel and waits for its first ready generation. */
-  static async connect(urlOrOptions, options = {}) {
-    const channel = new Channel(urlOrOptions, options);
-    const connectOptions =
-      urlOrOptions != null && typeof urlOrOptions === "object" && !(urlOrOptions instanceof URL)
-        ? { ...urlOrOptions, ...options }
-        : options;
-    await waitForInitialReady(channel, connectOptions);
+  static async connect(target, options = {}) {
+    const channel = new Channel(target, options);
+    await waitForInitialReady(channel, channel.options);
     return channel;
   }
 }
@@ -154,14 +162,19 @@ export class NodeServer {
     this.authorizer = options.authorizer ?? null;
     this.metrics = options.metrics ?? null;
     this.logger = options.logger ?? null;
+    this.activeCalls = new Set();
   }
 
   /** Creates a native QUIC TrevRPC server backed by trevrpc-c. */
   static async listen(urlOrOptions, options = {}) {
-    const native = loadNative();
-    const listenOptions = normalizeNodeListenOptions(urlOrOptions, options);
-    const nativeServer = await native.listenMsQuic(listenOptions);
-    return new NodeServer(nativeServer, listenOptions);
+    try {
+      const native = loadNative();
+      const listenOptions = normalizeNodeListenOptions(urlOrOptions, options);
+      const nativeServer = await native.listenMsQuic(listenOptions);
+      return new NodeServer(nativeServer, listenOptions);
+    } catch (error) {
+      throw nativeError(error, "listen");
+    }
   }
 
   /** Registers one raw RPC handler. */
@@ -169,10 +182,14 @@ export class NodeServer {
     if (typeof handler !== "function") {
       throw new TypeError("register requires a handler function");
     }
-    this.nativeServer.register(service, method, rpcKindNumber(kind), (nativeCall) => {
-      void this.#dispatch(handler, nativeCall);
-    });
-    return this;
+    try {
+      this.nativeServer.register(service, method, rpcKindNumber(kind), (nativeCall) => {
+        void this.#dispatch(handler, nativeCall);
+      });
+      return this;
+    } catch (error) {
+      throw nativeError(error, "register server handler");
+    }
   }
 
   /** Registers handlers for a generated service descriptor. */
@@ -233,19 +250,29 @@ export class NodeServer {
 
   /** Starts accepting RPCs. The returned promise resolves after close. */
   serve() {
-    this.closed ??= this.nativeServer.serve();
+    this.closed ??= Promise.resolve()
+      .then(() => this.nativeServer.serve())
+      .catch((error) => {
+        throw nativeError(error, "serve");
+      });
     return this.closed;
   }
 
-  /** Requests server shutdown. */
+  /** Requests graceful server shutdown and drains already admitted calls. */
   close() {
-    this.nativeServer.close();
+    try {
+      this.nativeServer.close();
+    } catch (error) {
+      throw nativeError(error, "close server");
+    }
   }
 
   async #dispatch(handler, nativeCall) {
-    const call = new NodeServerCall(nativeCall, (completedCall) =>
-      this.#recordFinished(completedCall),
-    );
+    const call = new NodeServerCall(nativeCall, (completedCall) => {
+      this.activeCalls.delete(completedCall);
+      this.#recordFinished(completedCall);
+    });
+    this.activeCalls.add(call);
     this.#recordStarted(call);
     try {
       const authorization = await this.#authorize(call);
@@ -361,60 +388,107 @@ export class NodeServerCall {
     this.readBatchMaxMessages = RecvManyBatchSize;
     this.writeBatchMaxMessages = SendManyBatchSize;
     this.#onComplete = onComplete;
+    this.#abortController = new AbortController();
+    this.signal = this.#abortController.signal;
+
+    const context = nativeCall.context ?? {};
+    const remainingNanos = context.hasDeadline ? bigintValue(context.timeRemainingNanos) : null;
+    const remainingMs = remainingNanos == null ? null : Number(remainingNanos) / 1_000_000;
+    this.deadline = remainingMs == null ? null : new Date(this.startedAt + remainingMs);
+    if (context.cancelled) {
+      queueMicrotask(() => this.#cancel(cancelled("RPC cancelled by peer")));
+    } else if (remainingMs != null) {
+      const deadlineError = new TrevRpcError(Code.DeadlineExceeded, "RPC deadline exceeded");
+      this.#cancelDeadline = scheduleTimeout(
+        () => this.#completeDeadline(deadlineError),
+        Math.max(0, remainingMs),
+      );
+    }
   }
 
+  #abortController;
+  #cancelDeadline = () => {};
   #onComplete;
+  #terminalError = null;
+  #terminalSettled = false;
 
   /** Keeps the call open after the handler returns. */
   defer() {
+    this.#throwIfTerminal();
     this.deferred = true;
     return this;
   }
 
   /** Sends a unary response and completes the call. */
   async respond(response = {}) {
+    this.#throwIfTerminal();
     const rpcResponse = responseObject(response);
-    await this.nativeCall.respond(rpcResponse);
-    this.completed = true;
+    const status = codeFromNumber(rpcResponse.status ?? rpcResponse.code ?? Code.Ok);
     this.responseBodyLength = rpcResponse.body?.byteLength ?? 0;
-    this.finalStatus = codeFromNumber(rpcResponse.status ?? rpcResponse.code ?? Code.Ok);
-    this.#completeMetrics();
+    this.#claimTerminal(status);
+    try {
+      await this.nativeCall.respond(rpcResponse);
+      if (!this.#settleTerminalSuccess()) {
+        throw this.#terminalError;
+      }
+    } catch (error) {
+      throw this.#settleTerminalFailure(error, "send unary response");
+    }
   }
 
   /** Sends one streaming response message. */
-  sendMessage(body) {
+  async sendMessage(body) {
+    this.#throwIfTerminal();
     const bytes = byteBody(body);
-    return Promise.resolve(this.nativeCall.sendMessage(bytes)).then(() => {
+    try {
+      await this.nativeCall.sendMessage(bytes);
+      this.#throwIfTerminal();
       this.responseBodyLength += bytes.byteLength;
-    });
+    } catch (error) {
+      if (this.#terminalError != null) {
+        throw this.#terminalError;
+      }
+      throw this.#observeNativeIoError(error, "send streaming response");
+    }
   }
 
   /** Sends multiple streaming response messages. */
-  sendMany(bodies) {
+  async sendMany(bodies) {
+    this.#throwIfTerminal();
     const batch = Array.from(bodies, byteBody);
     if (batch.length === 0) {
-      return Promise.resolve();
+      return;
     }
     if (batch.length === 1 || typeof this.nativeCall.sendMessages !== "function") {
-      return sendManyIndividually(this, batch);
+      await sendManyIndividually(this, batch);
+      return;
     }
 
     let bodyLength = 0;
     for (const body of batch) {
       bodyLength += body.byteLength;
     }
-    return Promise.resolve(this.nativeCall.sendMessages(batch)).then(() => {
+    try {
+      await this.nativeCall.sendMessages(batch);
+      this.#throwIfTerminal();
       this.responseBodyLength += bodyLength;
-    });
+    } catch (error) {
+      if (this.#terminalError != null) {
+        throw this.#terminalError;
+      }
+      throw this.#observeNativeIoError(error, "send streaming response batch");
+    }
   }
 
   /** Receives one streaming request frame, or null after EOF. */
   async recv() {
+    this.#throwIfTerminal();
     if (this.recvDone) {
       return null;
     }
     while (this.recvQueue.length === 0) {
       const frames = await this.#recvMany();
+      this.#throwIfTerminal();
       this.recvQueue.push(...frames);
     }
     const frame = this.recvQueue.shift();
@@ -428,20 +502,137 @@ export class NodeServerCall {
 
   /** Sends the terminal streaming status and completes the call. */
   async finishStream(status = Code.Ok, message = "", metadata = {}) {
-    await this.nativeCall.finishStream(status, message, metadata);
-    this.completed = true;
-    this.finalStatus = codeFromNumber(status);
-    this.#completeMetrics();
+    this.#throwIfTerminal();
+    const normalizedStatus = codeFromNumber(status);
+    this.#claimTerminal(normalizedStatus);
+    try {
+      await this.nativeCall.finishStream(normalizedStatus, message, metadata);
+      if (!this.#settleTerminalSuccess()) {
+        throw this.#terminalError;
+      }
+    } catch (error) {
+      throw this.#settleTerminalFailure(error, "finish response stream");
+    }
   }
 
   /** Cancels and closes the call. */
-  close() {
+  close(reason = cancelled("RPC cancelled")) {
+    if (this.#terminalSettled) {
+      return;
+    }
+    const error = cancellationError(reason);
+    if (!this.completed) {
+      this.#claimTerminal(error.code, error);
+    }
+    this.#settleLocalTerminal(error);
+    closeNativeObject(this.nativeCall, "close server call");
+  }
+
+  #cancel(error) {
+    if (this.#terminalSettled) {
+      return;
+    }
+    if (!this.completed) {
+      this.#claimTerminal(error.code, error);
+    }
+    this.#settleLocalTerminal(error);
+    closeNativeObjectQuietly(this.nativeCall);
+  }
+
+  #completeDeadline(error) {
+    if (this.#terminalSettled) {
+      return;
+    }
+    const sendStatus = !this.completed;
+    if (sendStatus) {
+      this.#claimTerminal(error.code, error);
+    }
+    this.#settleLocalTerminal(error);
+    if (sendStatus) {
+      void this.#sendAutomaticDeadline(error);
+    } else {
+      closeNativeObjectQuietly(this.nativeCall);
+    }
+  }
+
+  async #sendAutomaticDeadline(error) {
+    try {
+      if (this.request.kind === RpcKind.Unary) {
+        await this.nativeCall.respond({
+          status: error.code,
+          message: error.statusMessage,
+          metadata: error.metadata,
+        });
+      } else {
+        await this.nativeCall.finishStream(error.code, error.statusMessage, error.metadata);
+      }
+    } catch {
+      // The deadline remains the primary terminal reason.
+    } finally {
+      closeNativeObjectQuietly(this.nativeCall);
+    }
+  }
+
+  #claimTerminal(status, error = null) {
+    if (this.completed) {
+      return false;
+    }
     this.completed = true;
+    this.finalStatus = codeFromNumber(status);
+    this.#terminalError = error;
+    return true;
+  }
+
+  #settleTerminalSuccess() {
+    if (this.#terminalSettled) {
+      return false;
+    }
+    this.#terminalSettled = true;
+    this.#clearDeadline();
+    this.#completeMetrics();
+    return true;
+  }
+
+  #settleTerminalFailure(error, operation) {
+    if (this.#terminalSettled) {
+      return this.#terminalError ?? nativeError(error, operation);
+    }
+    const normalized = nativeError(error, operation);
+    this.#terminalSettled = true;
+    this.#clearDeadline();
+    this.finalStatus = normalized.code;
+    this.#terminalError = normalized;
+    this.#abortController.abort(normalized);
     this.recvDone = true;
     this.recvQueue.length = 0;
-    this.nativeCall.close();
-    this.finalStatus = Code.Cancelled;
+    closeNativeObjectQuietly(this.nativeCall);
     this.#completeMetrics();
+    return normalized;
+  }
+
+  #settleLocalTerminal(error) {
+    this.#terminalSettled = true;
+    this.#clearDeadline();
+    this.finalStatus = error.code;
+    this.#terminalError = error;
+    this.#abortController.abort(error);
+    this.recvDone = true;
+    this.recvQueue.length = 0;
+    this.#completeMetrics();
+  }
+
+  #clearDeadline() {
+    this.#cancelDeadline();
+    this.#cancelDeadline = () => {};
+  }
+
+  #throwIfTerminal() {
+    if (this.#terminalError != null) {
+      throw this.#terminalError;
+    }
+    if (this.completed) {
+      throw new TrevRpcError(Code.FailedPrecondition, "server call already completed");
+    }
   }
 
   #completeMetrics() {
@@ -453,10 +644,28 @@ export class NodeServerCall {
   }
 
   async #recvMany() {
-    if (typeof this.nativeCall.recvMany === "function") {
-      return await this.nativeCall.recvMany(this.readBatchMaxMessages);
+    try {
+      if (typeof this.nativeCall.recvMany === "function") {
+        return await this.nativeCall.recvMany(this.readBatchMaxMessages);
+      }
+      return [await this.nativeCall.recv()];
+    } catch (error) {
+      if (this.#terminalError != null) {
+        throw this.#terminalError;
+      }
+      throw this.#observeNativeIoError(error, "receive request stream");
     }
-    return [await this.nativeCall.recv()];
+  }
+
+  #observeNativeIoError(error, operation) {
+    const normalized = nativeError(error, operation);
+    if (
+      !this.completed &&
+      (normalized.code === Code.Cancelled || normalized.code === Code.DeadlineExceeded)
+    ) {
+      this.#cancel(normalized);
+    }
+    return this.#terminalError ?? normalized;
   }
 }
 
@@ -480,29 +689,20 @@ export function bearerAuthorizer(token) {
 }
 
 class NativeResponseFrameStream {
-  constructor(stream, writerTask, cleanupAbort = () => {}, signal = undefined) {
+  constructor(stream, writerSettlement, closeStream, signal = undefined) {
     this.stream = stream;
     this.done = false;
-    this.cleanupAbort = cleanupAbort;
+    this.closeStream = closeStream;
     this.signal = signal;
-    this.writerError = null;
-    this.writerSettled = false;
-    this.returnDone = null;
-    this.returnErrorReported = false;
-    this.suppressReturnWriterError = false;
+    this.cleanupAbort = () => {};
+    this.cleanupDone = null;
     this.recvQueue = [];
     this.recvTask = null;
-    this.pendingBodyStatus = null;
     this.pendingBodyError = null;
     this.pendingBodyEof = false;
     this.readBatchMaxMessages = RecvManyBatchSize;
-    this.writerDone = writerTask
-      .catch((error) => {
-        this.writerError = error;
-      })
-      .finally(() => {
-        this.writerSettled = true;
-      });
+    this.writerSettlement = writerSettlement;
+    this.cleanupAbort = onAbort(signal, () => this.startCleanup());
   }
 
   [Symbol.asyncIterator]() {
@@ -511,7 +711,7 @@ class NativeResponseFrameStream {
 
   async next() {
     if (this.done) {
-      return { done: true, value: undefined };
+      return await this.#finishDone();
     }
 
     await this.#fillRecvQueue();
@@ -528,7 +728,7 @@ class NativeResponseFrameStream {
 
   async nextBatch() {
     if (this.done) {
-      return { done: true, value: undefined };
+      return await this.#finishDone();
     }
 
     await this.#fillRecvQueue();
@@ -549,7 +749,7 @@ class NativeResponseFrameStream {
 
   async nextBodyBatch(max = this.readBatchMaxMessages) {
     if (this.done) {
-      return { done: true, value: undefined };
+      return await this.#finishDone();
     }
 
     if (typeof this.stream.recvBodyBatch !== "function") {
@@ -557,12 +757,6 @@ class NativeResponseFrameStream {
     }
 
     try {
-      if (this.pendingBodyStatus != null) {
-        const status = this.pendingBodyStatus;
-        this.pendingBodyStatus = null;
-        await this.#finishStatus(status);
-        return { done: false, value: { bodies: [], status } };
-      }
       if (this.pendingBodyError != null) {
         const error = this.pendingBodyError;
         this.pendingBodyError = null;
@@ -589,10 +783,6 @@ class NativeResponseFrameStream {
       }
 
       const status = batch.status ?? null;
-      if (status != null && bodies.length > 0) {
-        this.pendingBodyStatus = status;
-        return { done: false, value: { bodies, status: null } };
-      }
       if (batch.eof && bodies.length === 0) {
         return await this.#finishEof();
       }
@@ -605,36 +795,43 @@ class NativeResponseFrameStream {
       }
       return { done: false, value: { bodies, status } };
     } catch (error) {
-      this.done = true;
-      this.cleanupAbort();
+      this.startCleanup();
       if (this.signal?.aborted) {
         throw signalAbortError(this.signal);
       }
-      throw error;
+      throw nativeError(error, "receive response stream");
     }
   }
 
   async return() {
-    if (this.returnDone == null) {
-      this.done = true;
-      this.returnDone = (async () => {
-        this.cleanupAbort();
-        this.recvQueue.length = 0;
-        this.pendingBodyStatus = null;
-        this.pendingBodyError = null;
-        this.pendingBodyEof = false;
-        this.stream.close();
-        await this.recvTask;
-        await this.writerDone;
-      })();
+    this.startCleanup();
+    return await this.#finishDone();
+  }
+
+  startCleanup() {
+    this.writerSettlement.beginCleanup();
+    if (this.cleanupDone != null) {
+      return;
     }
 
-    await this.returnDone;
-    if (!this.returnErrorReported && !this.suppressReturnWriterError && this.writerError != null) {
-      this.returnErrorReported = true;
-      throw this.writerError;
+    this.done = true;
+    this.cleanupAbort();
+    this.recvQueue.length = 0;
+    this.pendingBodyError = null;
+    this.pendingBodyEof = false;
+    const recvTask = this.recvTask;
+    let closeError;
+    try {
+      this.closeStream();
+    } catch (error) {
+      closeError = error;
     }
-    return { done: true, value: undefined };
+    this.cleanupDone = (async () => {
+      await recvTask;
+      if (closeError != null) {
+        throw closeError;
+      }
+    })();
   }
 
   #startRecv() {
@@ -654,12 +851,11 @@ class NativeResponseFrameStream {
       const result = await this.recvTask;
       this.recvTask = null;
       if (result.error != null) {
-        this.done = true;
-        this.cleanupAbort();
+        this.startCleanup();
         if (this.signal?.aborted) {
           throw signalAbortError(this.signal);
         }
-        throw result.error;
+        throw nativeError(result.error, "receive response stream");
       }
       this.recvQueue.push(...result.frames);
       if (this.recvQueue.length > 0 && !hasTerminalFrame(this.recvQueue)) {
@@ -695,41 +891,35 @@ class NativeResponseFrameStream {
         this.recvQueue.shift();
         bodies.push(queued.body ?? EmptyBody);
       }
+      const status = this.recvQueue[0];
+      if (status?.kind === RpcStreamFrameKind.Status) {
+        this.recvQueue.shift();
+        await this.#finishStatus(status);
+        return { done: false, value: { bodies, status } };
+      }
       return { done: false, value: { bodies, status: null } };
     } catch (error) {
-      this.done = true;
-      this.cleanupAbort();
+      this.startCleanup();
       if (this.signal?.aborted) {
         throw signalAbortError(this.signal);
       }
-      throw error;
+      throw nativeError(error, "receive response stream");
     }
   }
 
   async #finishEof() {
-    this.done = true;
-    this.cleanupAbort();
-    this.recvQueue.length = 0;
-    await this.writerDone;
-    if (this.writerError != null) {
-      throw this.writerError;
-    }
+    this.startCleanup();
+    return await this.#finishDone();
+  }
+
+  async #finishDone() {
+    await this.cleanupDone;
+    await this.writerSettlement.finish();
     return { done: true, value: undefined };
   }
 
-  async #finishStatus(frame) {
-    this.done = true;
-    this.cleanupAbort();
-    this.recvQueue.length = 0;
-    this.stream.close();
-    if (this.writerSettled) {
-      await this.writerDone;
-      if ((frame.status ?? RpcStatusOk) === RpcStatusOk && this.writerError != null) {
-        throw this.writerError;
-      }
-    } else {
-      this.suppressReturnWriterError = true;
-    }
+  #finishStatus(frame) {
+    this.writerSettlement.recordTerminal(frame.status ?? Code.Ok);
   }
 }
 
@@ -741,9 +931,30 @@ function isTerminalFrame(frame) {
   return frame == null || frame.kind === RpcStreamFrameKind.Status;
 }
 
-async function writeRequestStream(stream, requestBody) {
-  const iterator = requestBody[Symbol.asyncIterator]();
+function isNativeCleanupWriterError(error) {
+  return (
+    error?.code === Code.Cancelled ||
+    error?.nativeCode === NativeTransportClosed ||
+    error?.nativeCode === NativeObjectClosed ||
+    nativeErrorName(error?.nativeCode) === "ECANCELED"
+  );
+}
+
+function nativeErrorName(code) {
+  if (!Number.isInteger(code)) {
+    return null;
+  }
   try {
+    return getSystemErrorName(code);
+  } catch {
+    return null;
+  }
+}
+
+async function writeRequestStream(stream, requestBody, closeStream, recordError) {
+  let iterator;
+  try {
+    iterator = requestBody[Symbol.asyncIterator]();
     for (;;) {
       const result = await nextRequestBodyBatch(iterator, SendManyBatchSize);
       if (result.done) {
@@ -760,13 +971,15 @@ async function writeRequestStream(stream, requestBody) {
     }
     await stream.finishSend();
   } catch (error) {
+    const normalized = nativeError(error, "send request stream");
+    recordError(normalized);
     try {
-      await iterator.return?.();
+      await iterator?.return?.();
     } catch {
       // Preserve the upload error; closing the native stream releases resources.
     }
-    stream.close();
-    throw error;
+    closeStream();
+    throw normalized;
   }
 }
 
@@ -781,6 +994,21 @@ async function nextRequestBodyBatch(iterator, maxMessages) {
 async function completeDefault(call, result) {
   if (call.request.kind === RpcKind.Unary) {
     await call.respond(result ?? {});
+    return;
+  }
+
+  if (call.request.kind === RpcKind.ClientStreaming) {
+    if (result == null) {
+      await call.finishStream(Code.Ok);
+      return;
+    }
+    const response = responseObject(result);
+    await call.sendMessage(response.body);
+    await call.finishStream(
+      response.status ?? Code.Ok,
+      response.message ?? "",
+      response.metadata ?? {},
+    );
     return;
   }
 
@@ -907,7 +1135,8 @@ function responseObject(response) {
   if (
     response instanceof Uint8Array ||
     ArrayBuffer.isView(response) ||
-    response instanceof ArrayBuffer
+    response instanceof ArrayBuffer ||
+    Array.isArray(response)
   ) {
     return { body: byteBody(response) };
   }
@@ -941,30 +1170,45 @@ function isAsyncIterable(value) {
   return value != null && typeof value[Symbol.asyncIterator] === "function";
 }
 
-function normalizeNodeTransportOptions(urlOrOptions, options) {
-  if (typeof urlOrOptions === "string" || urlOrOptions instanceof URL) {
-    const url = new URL(urlOrOptions);
-    return {
-      ...options,
-      host: url.hostname,
-      port: Number(url.port || 443),
-    };
+function normalizeNodeTransportOptions(target, options) {
+  const normalized =
+    typeof target === "string" || target instanceof URL
+      ? endpointFromUrl(target, options)
+      : target != null && typeof target === "object"
+        ? { port: 443, ...target, ...options }
+        : null;
+  if (normalized == null) {
+    throw new TypeError("native transport requires a URL or endpoint object");
   }
-
-  if (urlOrOptions == null || typeof urlOrOptions !== "object") {
-    throw new TypeError("native transport requires a URL or options object");
-  }
-  return { ...urlOrOptions, ...options };
+  validateNodeEndpoint(normalized);
+  return normalized;
 }
 
-function retainNodeConnectInput(urlOrOptions) {
-  if (urlOrOptions instanceof URL) {
-    return urlOrOptions.href;
+function normalizeNodeChannelOptions(target, options) {
+  const normalized = normalizeNodeTransportOptions(target, options);
+  const endpoint = Object.freeze({ host: normalized.host, port: normalized.port });
+  const effectiveOptions = { ...normalized };
+  delete effectiveOptions.host;
+  delete effectiveOptions.port;
+  return Object.freeze({ endpoint, options: Object.freeze(effectiveOptions) });
+}
+
+function endpointFromUrl(target, options) {
+  const url = new URL(target);
+  return {
+    ...options,
+    host: url.hostname,
+    port: Number(url.port || 443),
+  };
+}
+
+function validateNodeEndpoint(endpoint) {
+  if (typeof endpoint.host !== "string" || endpoint.host.length === 0) {
+    throw new TypeError("native endpoint host must be a non-empty string");
   }
-  if (urlOrOptions != null && typeof urlOrOptions === "object") {
-    return Object.freeze({ ...urlOrOptions });
+  if (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65_535) {
+    throw new TypeError("native endpoint port must be an integer from 1 through 65535");
   }
-  return urlOrOptions;
 }
 
 function normalizeNodeListenOptions(urlOrOptions, options) {
@@ -1009,6 +1253,16 @@ function nativeConnect(native, options, cancellation) {
     : native.connectMsQuic(options, cancellation);
 }
 
+function once(callback) {
+  let called = false;
+  return () => {
+    if (!called) {
+      called = true;
+      callback();
+    }
+  };
+}
+
 function onAbort(signal, callback) {
   if (signal == null) {
     return () => {};
@@ -1028,8 +1282,7 @@ function throwIfAborted(signal) {
 }
 
 function signalAbortError(signal) {
-  const reason = signal?.reason;
-  return reason?.name === "TrevRpcError" ? reason : cancelled("RPC cancelled");
+  return cancellationError(signal?.reason);
 }
 
 function nativeRequest(request, defaultKind) {
@@ -1094,5 +1347,110 @@ function bytesEqual(left, right) {
 }
 
 function loadNative() {
-  return require(join(moduleDir, "..", "build", "native", "trevrpc_native.node"));
+  try {
+    return loadNativeAddon();
+  } catch (error) {
+    throw new TrevRpcError(
+      Code.Unavailable,
+      error?.message ?? "native addon unavailable",
+      {},
+      {
+        cause: error?.cause ?? error,
+      },
+    );
+  }
+}
+
+function nativeError(error, operation) {
+  if (error instanceof TrevRpcError) {
+    return error;
+  }
+  const nativeCode = Number.isInteger(error?.nativeCode)
+    ? error.nativeCode
+    : Number.isInteger(error?.code) && (error.code < 0 || error.code > Code.Unauthenticated)
+      ? error.code
+      : undefined;
+  const code = nativeStatusCode(error, nativeCode);
+  const detail = error?.message ?? String(error);
+  return new TrevRpcError(code, `${operation} failed: ${detail}`, error?.metadata ?? {}, {
+    cause: error,
+    nativeCode,
+  });
+}
+
+function nativeStatusCode(error, nativeCode) {
+  if (Number.isInteger(error?.status)) {
+    return codeFromNumber(error.status);
+  }
+  if (
+    Number.isInteger(error?.code) &&
+    error.code >= Code.Ok &&
+    error.code <= Code.Unauthenticated
+  ) {
+    return codeFromNumber(error.code);
+  }
+  if (nativeCode === NativeObjectClosed || nativeErrorName(nativeCode) === "ECANCELED") {
+    return Code.Cancelled;
+  }
+  if (nativeCode === NativeMsQuicTimeout || nativeErrorName(nativeCode) === "ETIMEDOUT") {
+    return Code.DeadlineExceeded;
+  }
+  if (
+    nativeCode === NativeFrameLimit ||
+    nativeCode === NativeStreamLimit ||
+    nativeCode === NativeSendByteLimit ||
+    nativeCode === NativeSendCountLimit
+  ) {
+    return Code.ResourceExhausted;
+  }
+  if (nativeCode === NativeInvalidFrame || nativeCode === NativeInvalidFrameKind) {
+    return Code.InvalidArgument;
+  }
+  if (nativeCode === NativeUnsupportedWireVersion) {
+    return Code.FailedPrecondition;
+  }
+  return Code.Unavailable;
+}
+
+function cancellationError(reason) {
+  if (reason instanceof TrevRpcError) {
+    return reason;
+  }
+  const error = cancelled(typeof reason === "string" ? reason : "RPC cancelled");
+  if (reason !== undefined) {
+    Object.defineProperty(error, "cause", { configurable: true, value: reason });
+  }
+  return error;
+}
+
+function closeNativeObject(value, operation) {
+  if (value == null) {
+    return;
+  }
+  try {
+    value.close();
+  } catch (error) {
+    throw nativeError(error, operation);
+  }
+}
+
+function closeNativeObjectQuietly(value) {
+  try {
+    value?.close();
+  } catch {
+    // Preserve the primary operation error.
+  }
+}
+
+function bigintValue(value) {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return BigInt(Math.floor(value));
+  }
+  if (typeof value === "string" && /^\d+$/u.test(value)) {
+    return BigInt(value);
+  }
+  return 0n;
 }

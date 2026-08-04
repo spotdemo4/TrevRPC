@@ -1,10 +1,13 @@
-# Greeter Browser Client
+# Greeter example
 
-This example uses `trevrpc-js` from a browser page to call the shared `example.greeter.Greeter` service implemented by the Go and Rust examples.
+This directory contains the generated Milestone 6 split:
 
-The browser WebTransport API can only connect to WebTransport servers. Native QUIC examples that advertise only `trevrpc/1` cannot be called directly from JavaScript.
+- `greeter.trevrpc.js` and `.d.ts`: protobuf root, descriptors, typed clients, and factories; browser-safe.
+- `greeter.node.trevrpc.js` and `.d.ts`: typed Node handler interfaces and `registerGreeterServer`.
 
-## Run The Page
+Browser code must import only `greeter.trevrpc.js`. Node servers import registration from `greeter.node.trevrpc.js` and use `createUnaryResponse` or `createStreamingResponse` when returning metadata or a custom terminal status. A direct protobuf object such as `{ message: "hello" }` remains a protobuf response.
+
+## Run the browser page
 
 From `trevrpc-js`:
 
@@ -12,64 +15,21 @@ From `trevrpc-js`:
 npm run example:greeter
 ```
 
-Open:
+Open `http://127.0.0.1:8080/examples/greeter/` and use a WebTransport greeter endpoint:
 
 ```text
-http://127.0.0.1:8080/examples/greeter/
+https://127.0.0.1:50051/trevrpc  # Go default
+https://127.0.0.1:5000/trevrpc   # Rust default
 ```
 
-## Server URL
+The path selects the WebTransport session; TrevRPC routing remains inside the request frame. The example policies allow origin `http://127.0.0.1:8080` and use bearer token `trevrpc-example-token`.
 
-Use whichever WebTransport greeter endpoint you started:
+Both example servers write their development certificate to `~/.config/trevrpc/trevrpc-example-cert.pem`. Override it with `TREVRPC_EXAMPLE_CERT`. The static server computes the SHA-256 DER hash and the browser client passes it through `serverCertificateHashes`.
 
-```text
-https://127.0.0.1:50051/trevrpc  # Go default in this example UI
-https://127.0.0.1:5000/trevrpc   # Rust default in this example UI
-```
-
-The URL path is only the WebTransport session path. TrevRPC service routing still happens inside the `RpcRequest` frame.
-
-## WebTransport Policy
-
-The example servers intentionally configure an explicit WebTransport policy instead of accepting every browser session:
-
-- Path: `/trevrpc`
-- Go authority: `127.0.0.1:50051` or `localhost:50051`
-- Rust authority: the listen address passed to `greeter_server`, defaulting to `127.0.0.1:5000`
-- Browser origin: `http://127.0.0.1:8080`
-
-Open the page through the exact local static-server URL above so the browser sends the allowed `Origin`. Native non-browser WebTransport clients may omit `Origin`, but the authority and path still need to match.
-
-## Authentication
-
-The Go server, Rust server, Go client, Rust client, and JavaScript client examples all use the same bearer token:
-
-```text
-trevrpc-example-token
-```
-
-## Local Certificates
-
-Both example servers write their local development certificate to:
-
-```text
-~/.config/trevrpc/trevrpc-example-cert.pem
-```
-
-Override the path for all examples with:
-
-```sh
-export TREVRPC_EXAMPLE_CERT=/path/to/trevrpc-example-cert.pem
-```
-
-The JavaScript static server reads that file, computes its SHA-256 DER hash, and the browser client uses that hash as `serverCertificateHashes`.
-
-For a locally trusted certificate, leave the certificate hash field empty.
-
-For a temporary self-signed WebTransport certificate, enter the SHA-256 digest of the DER certificate in hex or base64. For example:
+For a temporary self-signed certificate, calculate the hash with:
 
 ```sh
 openssl x509 -in server.pem -outform der | openssl dgst -sha256 -binary | openssl base64
 ```
 
-Browsers enforce WebTransport certificate rules. Certificate hashes only work for short-lived self-signed certificates, so restart the example server if the generated certificate is stale. If a self-signed certificate is still rejected even with a hash, use a browser-compatible WebTransport development certificate or trust the certificate through the OS/browser trust store.
+The client fully consumes server streams, then reads terminal metadata from `stream.status`. It calls `close()` when abandoning streams. Client `timeoutMs` is absolute across setup, upload, and receive, while `streamIdleTimeoutMs` is a separate inactivity bound.

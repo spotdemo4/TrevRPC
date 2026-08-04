@@ -1,10 +1,11 @@
+import { RequestWriterSettlement } from "./client.js";
 import {
   DefaultMaxFrameSize,
   FrameReader,
   writeFrame,
   writeMessageStreamFrames,
 } from "./framing.js";
-import { Code, statusFromTransportError, unavailable } from "./status.js";
+import { Code, TrevRpcError, cancelled, statusFromTransportError, unavailable } from "./status.js";
 import { RpcRequest, RpcResponse, RpcStreamFrameKind } from "./wire.js";
 
 const CancelledStreamReason = new DOMException("TrevRPC stream cancelled", "AbortError");
@@ -107,17 +108,28 @@ export class RawWebTransport {
       const writer = stream.writable.getWriter();
       const reader = stream.readable.getReader();
       const maxFrameSize = options.maxFrameSize ?? this.maxFrameSize;
-      const cleanupAbort = onAbort(options.signal, () => {
-        void abortWriter(writer);
-        void cancelReader(reader);
-      });
-      const writerTask = writeStreamingRequest(writer, request, requestBody, maxFrameSize);
+      const abortRequestWriter = onceAsync(() => abortWriter(writer));
+      const writerSettlement = new RequestWriterSettlement(
+        statusFromTransportError,
+        isCleanupWriterError,
+        isRemoteStopSendingWriterError,
+      );
+      writerSettlement.track(
+        writeStreamingRequest(
+          writer,
+          request,
+          requestBody,
+          maxFrameSize,
+          abortRequestWriter,
+          (error) => writerSettlement.recordError(error),
+        ),
+      );
       return new WebTransportResponseFrameStream(
         reader,
-        writer,
-        writerTask,
+        writerSettlement,
+        abortRequestWriter,
         maxFrameSize,
-        cleanupAbort,
+        options.signal,
       );
     } catch (error) {
       throw statusFromTransportError(error);
@@ -158,33 +170,24 @@ function browserConstructorOptions(options) {
 class WebTransportResponseFrameStream {
   constructor(
     reader,
-    writer,
-    writerTask,
+    writerSettlement,
+    abortRequestWriter,
     maxFrameSize = DefaultMaxFrameSize,
-    cleanupAbort = () => {},
+    signal = undefined,
   ) {
     this.reader = reader;
-    this.writer = writer;
     this.frameReader = new FrameReader(reader);
+    this.abortRequestWriter = abortRequestWriter;
     this.maxFrameSize = maxFrameSize;
     this.readBatchMaxMessages = ResponseFrameBatchMaxMessages;
     this.frameQueue = [];
     this.frameQueueHead = 0;
-    this.pendingStatus = null;
     this.done = false;
-    this.writerError = null;
-    this.writerSettled = false;
-    this.returnDone = null;
-    this.returnErrorReported = false;
-    this.suppressReturnWriterError = false;
-    this.cleanupAbort = cleanupAbort;
-    this.writerDone = writerTask
-      .catch((error) => {
-        this.writerError = statusFromTransportError(error);
-      })
-      .finally(() => {
-        this.writerSettled = true;
-      });
+    this.readerOwned = true;
+    this.cleanupAbort = () => {};
+    this.cleanupDone = null;
+    this.writerSettlement = writerSettlement;
+    this.cleanupAbort = onAbort(signal, () => this.startCleanup());
   }
 
   [Symbol.asyncIterator]() {
@@ -193,7 +196,7 @@ class WebTransportResponseFrameStream {
 
   async next() {
     if (this.done) {
-      return { done: true, value: undefined };
+      return await this.finishDone();
     }
 
     try {
@@ -209,14 +212,14 @@ class WebTransportResponseFrameStream {
 
       return { done: false, value: frame };
     } catch (error) {
-      this.done = true;
+      this.startCleanup();
       throw statusFromTransportError(error);
     }
   }
 
   async nextBatch(max = this.readBatchMaxMessages) {
     if (this.done) {
-      return { done: true, value: undefined };
+      return await this.finishDone();
     }
 
     try {
@@ -234,68 +237,57 @@ class WebTransportResponseFrameStream {
       const count = terminalOffset < 0 ? this.queuedFrameCount() : terminalOffset;
       return { done: false, value: this.takeQueuedFrames(count) };
     } catch (error) {
-      this.done = true;
+      this.startCleanup();
       throw statusFromTransportError(error);
     }
   }
 
   async nextBodyBatch(max = this.readBatchMaxMessages) {
     if (this.done) {
-      return { done: true, value: undefined };
+      return await this.finishDone();
     }
 
     try {
-      if (this.pendingStatus != null) {
-        const status = this.pendingStatus;
-        this.pendingStatus = null;
-        await this.finishStatus(status);
-        return { done: false, value: { bodies: [], status } };
-      }
-
       const batch = await this.frameReader.readStreamMessageBodyBatchOrEOF(max, this.maxFrameSize);
       if (batch == null) {
         return await this.finishEof();
-      }
-      if (batch.status != null && batch.bodies.length > 0) {
-        this.pendingStatus = batch.status;
-        return { done: false, value: { bodies: batch.bodies, status: null } };
       }
       if (batch.status != null) {
         await this.finishStatus(batch.status);
       }
       return { done: false, value: batch };
     } catch (error) {
-      this.done = true;
+      this.startCleanup();
       throw statusFromTransportError(error);
     }
   }
 
   async return() {
-    if (this.returnDone == null) {
-      this.done = true;
-      this.returnDone = (async () => {
-        this.clearFrameQueue();
-        this.pendingStatus = null;
-        await cancelReader(this.reader);
-        await abortWriter(this.writer);
-        releaseLock(this.reader);
-        releaseLock(this.writer);
-        this.cleanupAbort();
-        await this.writerDone;
-      })();
+    this.startCleanup();
+    return await this.finishDone();
+  }
+
+  startCleanup() {
+    this.writerSettlement.beginCleanup();
+    if (this.cleanupDone != null) {
+      return;
     }
 
-    await this.returnDone;
-    if (
-      !this.returnErrorReported &&
-      !this.suppressReturnWriterError &&
-      this.writerError != null &&
-      !isTerminalCleanupWriterError(this.writerError)
-    ) {
-      this.returnErrorReported = true;
-      throw this.writerError;
+    this.done = true;
+    this.clearFrameQueue();
+    this.cleanupAbort();
+    const cancel = this.readerOwned ? cancelReader(this.reader) : Promise.resolve();
+    this.cleanupDone = Promise.all([cancel, this.abortRequestWriter()]).then(() => {
+      this.releaseReader();
+    });
+  }
+
+  releaseReader() {
+    if (!this.readerOwned) {
+      return;
     }
-    return { done: true, value: undefined };
+    this.readerOwned = false;
+    releaseLock(this.reader);
   }
 
   async fillFrameQueue(max = this.readBatchMaxMessages) {
@@ -313,35 +305,18 @@ class WebTransportResponseFrameStream {
   }
 
   async finishEof() {
-    this.done = true;
-    this.clearFrameQueue();
-    releaseLock(this.reader);
-    await this.writerDone;
-    if (this.writerError != null) {
-      throw this.writerError;
-    }
+    this.startCleanup();
+    return await this.finishDone();
+  }
+
+  async finishDone() {
+    await this.cleanupDone;
+    await this.writerSettlement.finish();
     return { done: true, value: undefined };
   }
 
-  async finishStatus(frame) {
-    this.done = true;
-    this.clearFrameQueue();
-    releaseLock(this.reader);
-    this.cleanupAbort();
-    await abortWriter(this.writer);
-    if (this.writerSettled) {
-      await this.writerDone;
-      const statusCode = frame.status ?? Code.Ok;
-      if (
-        statusCode === Code.Ok &&
-        this.writerError != null &&
-        !isTerminalCleanupWriterError(this.writerError)
-      ) {
-        throw this.writerError;
-      }
-    } else {
-      this.suppressReturnWriterError = true;
-    }
+  finishStatus(frame) {
+    this.writerSettlement.recordTerminal(frame.status ?? Code.Ok);
   }
 
   queuedFrameCount() {
@@ -407,16 +382,18 @@ function isTerminalFrame(frame) {
   return frame == null || frame.kind === RpcStreamFrameKind.Status;
 }
 
-function isTerminalCleanupWriterError(error) {
+function isCleanupWriterError(error) {
   if (error?.code === Code.Cancelled) {
     return true;
   }
 
   const message = error?.statusMessage ?? error?.message ?? "";
-  return (
-    error?.code === Code.Unavailable &&
-    /(?:stream canceled with error code 0|received stop_sending)/i.test(message)
-  );
+  return error?.code === Code.Unavailable && /stream canceled with error code 0/i.test(message);
+}
+
+function isRemoteStopSendingWriterError(error) {
+  const message = error?.statusMessage ?? error?.message ?? "";
+  return error?.code === Code.Unavailable && /received stop_sending/i.test(message);
 }
 
 function closeUnaryRequestWriter(writer) {
@@ -434,8 +411,20 @@ function closeUnaryRequestWriter(writer) {
 
 function throwIfAborted(signal) {
   if (signal?.aborted) {
-    throw signal.reason ?? new DOMException("RPC cancelled", "AbortError");
+    throw signalAbortError(signal);
   }
+}
+
+function signalAbortError(signal) {
+  const reason = signal?.reason;
+  if (reason instanceof TrevRpcError) {
+    return reason;
+  }
+  const error = cancelled("RPC cancelled");
+  if (reason !== undefined) {
+    Object.defineProperty(error, "cause", { configurable: true, value: reason });
+  }
+  return error;
 }
 
 function abortable(promise, signal) {
@@ -445,7 +434,7 @@ function abortable(promise, signal) {
   }
 
   return new Promise((resolve, reject) => {
-    const onAbort = () => reject(signal.reason ?? new DOMException("RPC cancelled", "AbortError"));
+    const onAbort = () => reject(signalAbortError(signal));
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => {
@@ -470,7 +459,7 @@ function abortableBidirectionalStream(promise, signal) {
   return new Promise((resolve, reject) => {
     const onAbort = () => {
       aborted = true;
-      reject(signal.reason ?? new DOMException("RPC cancelled", "AbortError"));
+      reject(signalAbortError(signal));
     };
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
@@ -478,7 +467,7 @@ function abortableBidirectionalStream(promise, signal) {
         signal.removeEventListener("abort", onAbort);
         if (aborted || signal.aborted) {
           void cleanupBidirectionalStream(stream);
-          reject(signal.reason ?? new DOMException("RPC cancelled", "AbortError"));
+          reject(signalAbortError(signal));
           return;
         }
 
@@ -490,6 +479,21 @@ function abortableBidirectionalStream(promise, signal) {
       },
     );
   });
+}
+
+function onceAsync(callback) {
+  let task;
+  return () => {
+    if (task == null) {
+      try {
+        task = Promise.resolve(callback());
+      } catch (error) {
+        task = Promise.reject(error);
+      }
+      task.catch(() => {});
+    }
+    return task;
+  };
 }
 
 function onAbort(signal, abort) {
@@ -506,9 +510,17 @@ function onAbort(signal, abort) {
   return () => signal.removeEventListener("abort", abort);
 }
 
-async function writeStreamingRequest(writer, request, requestBody, maxFrameSize) {
-  const iterator = requestBody[Symbol.asyncIterator]();
+async function writeStreamingRequest(
+  writer,
+  request,
+  requestBody,
+  maxFrameSize,
+  abortRequestWriter,
+  recordError,
+) {
+  let iterator;
   try {
+    iterator = requestBody[Symbol.asyncIterator]();
     await writeFrame(writer, RpcRequest, request, maxFrameSize);
     for (;;) {
       const result = await nextRequestBodyBatch(iterator, RequestBodyBatchMaxMessages);
@@ -519,12 +531,13 @@ async function writeStreamingRequest(writer, request, requestBody, maxFrameSize)
     }
     await writer.close();
   } catch (error) {
+    recordError(error);
     try {
-      await iterator.return?.();
+      await iterator?.return?.();
     } catch {
       // Preserve the upload error; aborting the writer releases stream resources.
     }
-    await abortWriter(writer);
+    await abortRequestWriter();
     throw error;
   } finally {
     releaseLock(writer);

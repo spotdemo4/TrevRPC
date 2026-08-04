@@ -41,21 +41,26 @@ const CODE_NAMES = Object.freeze([
 /** Error carrying a TrevRPC status code, message, and metadata. */
 export class TrevRpcError extends Error {
   /** Creates a TrevRPC status error. */
-  constructor(code, message = "", metadata = {}) {
+  constructor(code, message = "", metadata = {}, options = {}) {
     const normalizedCode = codeFromNumber(code);
-    super(message === "" ? codeName(normalizedCode) : `${codeName(normalizedCode)}: ${message}`);
+    super(message === "" ? codeName(normalizedCode) : `${codeName(normalizedCode)}: ${message}`, {
+      cause: options.cause,
+    });
     this.name = "TrevRpcError";
     this.code = normalizedCode;
     this.statusMessage = message;
     this.metadata = metadata;
+    if (Number.isInteger(options.nativeCode)) {
+      this.nativeCode = options.nativeCode;
+    }
   }
 }
 
-/** Error reported when a frame exceeds the configured size limit. */
-export class FrameTooLargeError extends Error {
+/** Resource-exhausted status reported when a frame exceeds the configured size limit. */
+export class FrameTooLargeError extends TrevRpcError {
   /** Creates a frame size error. */
   constructor(length, max) {
-    super(`frame length ${length} exceeds maximum ${max}`);
+    super(Code.ResourceExhausted, `frame length ${length} exceeds maximum ${max}`);
     this.name = "FrameTooLargeError";
     this.length = length;
     this.max = max;
@@ -127,13 +132,14 @@ export function statusFromTransportError(error) {
     return error;
   }
 
-  if (error instanceof FrameTooLargeError) {
-    return resourceExhausted(error.message);
-  }
-
   if (error?.name === "AbortError") {
-    return cancelled("transport closed locally");
+    return new TrevRpcError(Code.Cancelled, "transport closed locally", {}, { cause: error });
   }
 
-  return unavailable(`transport unavailable: ${error?.message ?? String(error)}`);
+  return new TrevRpcError(
+    Code.Unavailable,
+    `transport unavailable: ${error?.message ?? String(error)}`,
+    {},
+    { cause: error },
+  );
 }
