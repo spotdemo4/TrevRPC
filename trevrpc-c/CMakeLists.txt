@@ -77,6 +77,14 @@ function(trevrpc_c_lsan_suppressions test_name)
     endif()
 endfunction()
 
+function(trevrpc_c_tsan_suppressions test_name)
+    if(TREVRPC_ENABLE_THREAD_SANITIZER)
+        set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT
+            "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp"
+        )
+    endif()
+endfunction()
+
 function(trevrpc_c_configure_msquic target)
     target_include_directories(${target}
         PUBLIC
@@ -562,6 +570,7 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_sanitizers(trevrpc_versioned_api_test)
 
         add_test(NAME trevrpc_versioned_api COMMAND trevrpc_versioned_api_test)
+        trevrpc_c_tsan_suppressions(trevrpc_versioned_api)
 
         add_executable(trevrpc_server_lifecycle_test tests/server_lifecycle_test.c)
         target_include_directories(trevrpc_server_lifecycle_test PRIVATE src)
@@ -594,6 +603,7 @@ if(TREVRPC_BUILD_TESTS)
 
         add_test(NAME trevrpc_msquic_transport COMMAND trevrpc_msquic_transport_test)
         trevrpc_c_lsan_suppressions(trevrpc_msquic_transport)
+        trevrpc_c_tsan_suppressions(trevrpc_msquic_transport)
 
         add_executable(trevrpc_channel_test tests/channel_test.c)
         add_dependencies(trevrpc_channel_test trevrpc_msquic_test_certificates)
@@ -608,6 +618,7 @@ if(TREVRPC_BUILD_TESTS)
         add_test(NAME trevrpc_channel COMMAND trevrpc_channel_test)
         set_tests_properties(trevrpc_channel PROPERTIES TIMEOUT 30)
         trevrpc_c_lsan_suppressions(trevrpc_channel)
+        trevrpc_c_tsan_suppressions(trevrpc_channel)
 
         add_executable(trevrpc_buffering_config_test tests/buffering_config_test.c)
         target_include_directories(trevrpc_buffering_config_test PRIVATE src)
@@ -645,6 +656,7 @@ if(TREVRPC_BUILD_TESTS)
                 PROPERTIES LABELS "buffering" TIMEOUT 30
             )
             trevrpc_c_lsan_suppressions(trevrpc_buffering_memory_${trevrpc_buffering_name})
+            trevrpc_c_tsan_suppressions(trevrpc_buffering_memory_${trevrpc_buffering_name})
         endforeach()
 
         add_executable(trevrpc_generated_service_test
@@ -667,6 +679,7 @@ if(TREVRPC_BUILD_TESTS)
 
         add_test(NAME trevrpc_generated_service COMMAND trevrpc_generated_service_test)
         trevrpc_c_lsan_suppressions(trevrpc_generated_service)
+        trevrpc_c_tsan_suppressions(trevrpc_generated_service)
         add_test(NAME trevrpc_codegen_golden_header
             COMMAND "${CMAKE_COMMAND}" -E compare_files
                 "${trevrpc_generated_test_dir}/greeter.trevrpc.h"
@@ -679,12 +692,4 @@ if(TREVRPC_BUILD_TESTS)
         )
     endif()
 
-    if(TREVRPC_ENABLE_THREAD_SANITIZER)
-        get_property(trevrpc_all_tests DIRECTORY PROPERTY TESTS)
-        foreach(trevrpc_test IN LISTS trevrpc_all_tests)
-            set_property(TEST ${trevrpc_test} APPEND PROPERTY ENVIRONMENT
-                "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp"
-            )
-        endforeach()
-    endif()
 endif()
