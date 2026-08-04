@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::process::CommandExt;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -15,12 +14,16 @@ use crate::campaign::{Campaign, Cell, Peer, RpcKind, Stack};
 use crate::certificate::{self, Certificates};
 use crate::metrics::{ProcessDelta, ProcessMonitor};
 use crate::network::{Endpoint, NetworkSnapshot, NetworkTopology};
+use crate::process::{ManagedChild, OutputLimits, PollLine};
 use crate::protocol::{
     self, Armed, Capabilities, HistogramBucket, PeerSample, Prepared, Ready, Role, ValidatedSample,
 };
 use crate::{BoxError, SCHEMA_VERSION, report};
 
 const MAX_CAPABILITY_OUTPUT_BYTES: usize = 64 * 1024;
+// log_linear_v1 has at most 28,671 distinct u64 buckets; 3 MiB bounds a
+// maximally sparse sample event without imposing the capability-output limit.
+const MAX_BENCHMARK_EVENT_BYTES: usize = 3 * 1024 * 1024;
 const MAX_DIAGNOSTIC_STREAM_BYTES: u64 = 8 * 1024;
 const PEER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -415,7 +418,7 @@ fn record(
 fn capabilities(peer: &Peer, timeout: Duration) -> Result<Capabilities, BoxError> {
     let capture = CapabilityCapture::new(peer)?;
     let mut command = peer_command(peer)?;
-    configure_peer_session(&mut command);
+    crate::process::configure_session(&mut command);
     let mut child = command
         .arg("capabilities")
         .stdin(Stdio::null())
@@ -428,18 +431,24 @@ fn capabilities(peer: &Peer, timeout: Duration) -> Result<Capabilities, BoxError
             break status;
         }
         if capture.output_too_large()? {
-            terminate_child_group(&mut child);
+            if crate::process::kill_process_group(child.id()).is_err() {
+                let _ = child.kill();
+            }
             let _ = child.wait();
             return Err(format!("peer {} capabilities exceeded output limit", peer.id).into());
         }
         if Instant::now() >= deadline {
-            terminate_child_group(&mut child);
+            if crate::process::kill_process_group(child.id()).is_err() {
+                let _ = child.kill();
+            }
             let _ = child.wait();
             return Err(format!("peer {} capabilities timed out", peer.id).into());
         }
         thread::sleep(Duration::from_millis(10));
     };
-    terminate_child_group(&mut child);
+    if crate::process::kill_process_group(child.id()).is_err() {
+        let _ = child.kill();
+    }
     let stdout = CapabilityCapture::read(&capture.stdout, &peer.id, "stdout")?;
     let stderr = CapabilityCapture::read(&capture.stderr, &peer.id, "stderr")?;
     if !status.success() {
@@ -534,10 +543,7 @@ fn peer_command(peer: &Peer) -> Result<Command, BoxError> {
 }
 
 struct PeerProcess {
-    child: Child,
-    process_group: Option<u32>,
-    stdin: ChildStdin,
-    events: Receiver<Result<String, String>>,
+    child: ManagedChild,
     peer: String,
     role: String,
     stdout_path: PathBuf,
@@ -561,53 +567,24 @@ impl PeerProcess {
     ) -> Result<Self, BoxError> {
         let stdout_path = raw.join(format!("{role}.stdout"));
         let stderr_path = raw.join(format!("{role}.stderr"));
-        let stderr = File::create(&stderr_path)?;
         let mut command = peer_command(peer)?;
         topology.configure_command(&mut command, endpoint);
-        configure_peer_session(&mut command);
-        let mut child = command
-            .args(arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .map_err(|error| format!("failed to start {} {role}: {error}", peer.id))?;
-        let stdin = child.stdin.take().ok_or("peer stdin was not piped")?;
-        let stdout = child.stdout.take().ok_or("peer stdout was not piped")?;
-        let (sender, events) = mpsc::channel();
-        let capture_path = stdout_path.clone();
-        thread::spawn(move || {
-            let mut raw_output = match File::create(capture_path) {
-                Ok(file) => file,
-                Err(error) => {
-                    let _ = sender.send(Err(error.to_string()));
-                    return;
-                }
-            };
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(line) => {
-                        if let Err(error) = writeln!(raw_output, "{line}") {
-                            let _ = sender.send(Err(error.to_string()));
-                            return;
-                        }
-                        if sender.send(Ok(line)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Err(error.to_string()));
-                        return;
-                    }
-                }
-            }
-        });
-        let process_group = child.id();
+        command.args(arguments);
+        let child = ManagedChild::spawn(
+            command,
+            &stdout_path,
+            &stderr_path,
+            OutputLimits {
+                max_line_bytes: MAX_BENCHMARK_EVENT_BYTES,
+                max_stdout_bytes: usize::MAX,
+                max_stderr_bytes: usize::MAX,
+                diagnostic_tail_bytes: usize::try_from(MAX_DIAGNOSTIC_STREAM_BYTES)
+                    .unwrap_or(8 * 1024),
+            },
+        )
+        .map_err(|error| format!("failed to start {} {role}: {error}", peer.id))?;
         Ok(Self {
             child,
-            process_group: Some(process_group),
-            stdin,
-            events,
             peer: peer.id.clone(),
             role: role.to_owned(),
             stdout_path,
@@ -620,9 +597,7 @@ impl PeerProcess {
     }
 
     fn send(&mut self, command: &str) -> Result<(), BoxError> {
-        writeln!(self.stdin, "{command}")?;
-        self.stdin.flush()?;
-        Ok(())
+        self.child.send(command)
     }
 
     fn event(
@@ -676,53 +651,38 @@ impl PeerProcess {
         }
     }
 
-    fn poll_event(&self) -> Result<EventPoll, BoxError> {
-        match self.events.try_recv() {
-            Ok(Ok(line)) => Ok(EventPoll::Line(line)),
-            Ok(Err(error)) => Err(format!("failed to read peer output: {error}").into()),
-            Err(TryRecvError::Empty) => Ok(EventPoll::Empty),
-            Err(TryRecvError::Disconnected) => Ok(EventPoll::Disconnected),
+    fn poll_event(&mut self) -> Result<EventPoll, BoxError> {
+        match self.child.poll_line()? {
+            PollLine::Line(line) => Ok(EventPoll::Line(line)),
+            PollLine::Empty => Ok(EventPoll::Empty),
+            PollLine::Disconnected => Ok(EventPoll::Disconnected),
+            PollLine::LineTooLong => Err("peer emitted an overlong event line".into()),
+            PollLine::StreamTooLong => Err("peer stdout exceeded the configured limit".into()),
         }
     }
 
     fn wait_success(&mut self, timeout: Duration) -> Result<(), BoxError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                if status.success() {
-                    self.terminate_group();
-                    return Ok(());
-                }
-                self.terminate_group();
-                return Err(
-                    format!("peer process {} exited with {status}", self.child.id()).into(),
-                );
-            }
-            if Instant::now() >= deadline {
-                self.terminate_group();
-                let _ = self.child.wait();
-                return Err(format!("peer process {} did not exit", self.child.id()).into());
-            }
-            thread::sleep(Duration::from_millis(10));
+        let status = self.child.wait(timeout)?;
+        if !status.success() {
+            return Err(format!("peer process {} exited with {status}", self.child.id()).into());
         }
+        if self.child.stdout_overflowed() || self.child.stderr_overflowed() {
+            return Err(format!("peer process {} exceeded output limits", self.child.id()).into());
+        }
+        let extra_lines = self.child.drain_output()?;
+        if !extra_lines.is_empty() {
+            return Err(format!(
+                "peer process {} emitted {} extra event(s)",
+                self.child.id(),
+                extra_lines.len()
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn terminate_group(&mut self) {
-        let Some(process_group) = self.process_group.take() else {
-            return;
-        };
-        if kill_process_group(process_group).is_err() {
-            let _ = self.child.kill();
-        }
-    }
-}
-
-impl Drop for PeerProcess {
-    fn drop(&mut self) {
-        self.terminate_group();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.wait();
-        }
+        self.child.terminate_group();
     }
 }
 
@@ -852,7 +812,7 @@ fn phase_failure(phase: &str, detail: impl std::fmt::Display, peers: &[&PeerProc
 }
 
 fn append_output_tail(message: &mut String, peer: &PeerProcess, stream: &str, path: &Path) {
-    message.push_str(&format!("\n--- {} {} {stream}", peer.role, peer.peer));
+    let _ = write!(message, "\n--- {} {} {stream}", peer.role, peer.peer);
     match read_output_tail(path) {
         Ok((output, truncated)) => {
             if truncated {
@@ -864,7 +824,9 @@ fn append_output_tail(message: &mut String, peer: &PeerProcess, stream: &str, pa
                 message.push('\n');
             }
         }
-        Err(error) => message.push_str(&format!(" unavailable: {error} ---\n")),
+        Err(error) => {
+            let _ = writeln!(message, " unavailable: {error} ---");
+        }
     }
 }
 
@@ -880,48 +842,6 @@ fn read_output_tail(path: &Path) -> Result<(String, bool), io::Error> {
     file.take(MAX_DIAGNOSTIC_STREAM_BYTES)
         .read_to_end(&mut bytes)?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
-}
-
-fn terminate_child_group(child: &mut Child) {
-    if kill_process_group(child.id()).is_err() {
-        let _ = child.kill();
-    }
-}
-
-fn configure_peer_session(command: &mut Command) {
-    let parent_pid = std::process::id();
-    // SAFETY: these libc calls run in the forked child before exec and only
-    // affect that child. Errors are returned through Command's exec error pipe.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::getppid() != parent_pid.cast_signed() {
-                return Err(io::Error::from_raw_os_error(libc::ECHILD));
-            }
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-fn kill_process_group(process_group: u32) -> Result<(), io::Error> {
-    let process_group =
-        i32::try_from(process_group).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    // SAFETY: a negative PID asks kill(2) to signal the process group. Every
-    // peer is a session leader whose process-group ID is its child PID.
-    if unsafe { libc::kill(-process_group, libc::SIGKILL) } == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
-    }
 }
 
 fn parse_expected<T>(line: &str, expected: &str) -> Result<T, BoxError>
@@ -1021,14 +941,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        MAX_DIAGNOSTIC_STREAM_BYTES, PeerProcess, client_arguments, read_output_tail, sample_id,
-        server_arguments, sha256, validate_capabilities, wait_for_client_event,
+        MAX_BENCHMARK_EVENT_BYTES, MAX_CAPABILITY_OUTPUT_BYTES, MAX_DIAGNOSTIC_STREAM_BYTES,
+        PeerProcess, client_arguments, read_output_tail, sample_id, server_arguments, sha256,
+        validate_capabilities, wait_for_client_event,
     };
     use crate::SCHEMA_VERSION;
     use crate::campaign::{Campaign, Cell, Network, Peer, RpcKind, Stack, Timing, Workload};
     use crate::certificate::Certificates;
     use crate::network::{Endpoint, NetworkTopology};
-    use crate::protocol::{Capabilities, Role};
+    use crate::protocol::{Capabilities, PeerSample, Role};
 
     fn campaign() -> Campaign {
         Campaign {
@@ -1162,6 +1083,39 @@ mod tests {
         assert_ne!(grpc, trevrpc);
         assert!(grpc.contains("grpc_http2"));
         assert!(trevrpc.contains("trevrpc_native_quic"));
+    }
+
+    #[test]
+    fn benchmark_event_limit_accepts_large_valid_histogram() {
+        let histogram = (1..=1800u64)
+            .map(|upper_bound| {
+                serde_json::json!({
+                    "upper_bound_ns": upper_bound.to_string(),
+                    "count": "1"
+                })
+            })
+            .collect::<Vec<_>>();
+        let line = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "event": "sample",
+            "peer": "client",
+            "rpc_kind": "unary",
+            "admission_ns": "1000000",
+            "elapsed_ns": "1000000",
+            "drain_ns": "0",
+            "completed": "1800",
+            "failed": "0",
+            "request_messages": "1800",
+            "response_messages": "1800",
+            "histogram": histogram
+        })
+        .to_string();
+        assert!(line.len() > MAX_CAPABILITY_OUTPUT_BYTES);
+        assert!(line.len() <= MAX_BENCHMARK_EVENT_BYTES);
+        let sample: PeerSample = serde_json::from_str(&line).expect("valid sample event");
+        sample
+            .validate("client", RpcKind::Unary, 1, 1)
+            .expect("valid large histogram");
     }
 
     #[test]

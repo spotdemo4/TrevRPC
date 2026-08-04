@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "kind": "stream_state",
+  "cases": [
+    {
+      "id": "state.server.message_ok",
+      "operation": "state.server_stream",
+      "frames_hex": ["22031a0161", "08012a0a0a057472616365120107"],
+      "expected_events": [
+        {
+          "event": "message",
+          "body_hex": "1a0161"
+        },
+        {
+          "event": "eof"
+        },
+        {
+          "event": "eof"
+        }
+      ],
+      "expected_terminal_status": {
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "metadata": [
+          {
+            "key_hex": "7472616365",
+            "value_hex": "07"
+          }
+        ]
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.server.malformed_typed_payload",
+      "operation": "state.server_stream",
+      "frames_hex": ["220108", "0801"],
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 13
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.server.remote_invalid_argument",
+      "operation": "state.server_stream",
+      "frames_hex": ["08011003"],
+      "expected_error": {
+        "category": "remote_status",
+        "status_code": 3
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.server.remote_internal",
+      "operation": "state.server_stream",
+      "frames_hex": ["0801100d"],
+      "expected_error": {
+        "category": "remote_status",
+        "status_code": 13
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.server.empty_fin",
+      "operation": "state.server_stream",
+      "frames_hex": [],
+      "expected_error": {
+        "category": "missing_terminal_status",
+        "status_code": 13
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.server.message_fin",
+      "operation": "state.server_stream",
+      "frames_hex": ["22031a0161"],
+      "expected_error": {
+        "category": "missing_terminal_status",
+        "status_code": 13
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.server.unknown_kind",
+      "operation": "state.server_stream",
+      "frames_hex": ["0863"],
+      "expected_error": {
+        "category": "unsupported_frame_kind",
+        "status_code": 3
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.client.one_response",
+      "operation": "state.client_stream",
+      "frames_hex": ["22031a0161", "0801"],
+      "expected_response_body_hex": "1a0161"
+    },
+    {
+      "id": "state.client.zero_response",
+      "operation": "state.client_stream",
+      "frames_hex": ["0801"],
+      "expected_error": {
+        "category": "response_cardinality",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.client.two_responses",
+      "operation": "state.client_stream",
+      "frames_hex": ["22031a0161", "22031a0162", "0801"],
+      "expected_error": {
+        "category": "response_cardinality",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.client.remote_invalid_argument",
+      "operation": "state.client_stream",
+      "frames_hex": ["08011003"],
+      "expected_error": {
+        "category": "remote_status",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "state.client.remote_internal",
+      "operation": "state.client_stream",
+      "frames_hex": ["0801100d"],
+      "expected_error": {
+        "category": "remote_status",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.client.malformed_typed_payload",
+      "operation": "state.client_stream",
+      "frames_hex": ["220108", "0801"],
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 13
+      }
+    }
+  ]
+}

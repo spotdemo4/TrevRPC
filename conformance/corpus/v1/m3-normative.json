@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "kind": "m3_normative",
+  "cases": [
+    {
+      "id": "rpc_stream_frame.unknown_status.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_stream_frame",
+      "body_hex": "080110e7071a036f6464",
+      "expected_message": {
+        "type": "rpc_stream_frame",
+        "kind": "status",
+        "kind_raw": "1",
+        "status_raw": "999",
+        "status_code": 2,
+        "message_hex": "6f6464",
+        "body_hex": "",
+        "metadata": []
+      },
+      "canonical_body_hex": "080110e7071a036f6464"
+    },
+    {
+      "id": "rpc_response.truncated_varint",
+      "operation": "codec.decode",
+      "message_type": "rpc_response",
+      "body_hex": "80",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "rpc_response.wrong_wire_type",
+      "operation": "codec.decode",
+      "message_type": "rpc_response",
+      "body_hex": "0a00",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "rpc_response.invalid_utf8",
+      "operation": "codec.decode",
+      "message_type": "rpc_response",
+      "body_hex": "1201ff",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "rpc_response.invalid_metadata",
+      "operation": "codec.decode",
+      "message_type": "rpc_response",
+      "body_hex": "22130a0d417574686f72697a6174696f6e12026f6b",
+      "expected_error": {
+        "category": "invalid_metadata",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "rpc_stream_frame.invalid_metadata",
+      "operation": "codec.decode",
+      "message_type": "rpc_stream_frame",
+      "body_hex": "2a130a0d417574686f72697a6174696f6e12026f6b",
+      "expected_error": {
+        "category": "invalid_metadata",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.server.remote_unknown",
+      "operation": "state.server_stream",
+      "frames_hex": ["080110e7071a036f6464"],
+      "expected_error": {
+        "category": "remote_status",
+        "status_code": 2
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.client.remote_unknown",
+      "operation": "state.client_stream",
+      "frames_hex": ["080110e7071a036f6464"],
+      "expected_error": {
+        "category": "remote_status",
+        "status_code": 2
+      }
+    },
+    {
+      "id": "state.client.empty_fin",
+      "operation": "state.client_stream",
+      "frames_hex": [],
+      "expected_error": {
+        "category": "missing_terminal_status",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.client.message_fin",
+      "operation": "state.client_stream",
+      "frames_hex": ["22031a0161"],
+      "expected_error": {
+        "category": "missing_terminal_status",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.server.trailing_after_status",
+      "operation": "state.server_stream",
+      "frames_hex": ["0801", "22031a0161"],
+      "expected_error": {
+        "category": "trailing_frame",
+        "status_code": 13
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.client.trailing_after_status",
+      "operation": "state.client_stream",
+      "frames_hex": ["22031a0161", "0801", "22031a0162"],
+      "expected_error": {
+        "category": "trailing_frame",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.client.one_response_remote_status",
+      "operation": "state.client_stream",
+      "frames_hex": ["22031a0161", "0801100e1a04646f776e"],
+      "expected_error": {
+        "category": "remote_status",
+        "status_code": 14
+      }
+    },
+    {
+      "id": "state.server.payload_unknown_field",
+      "operation": "state.server_stream",
+      "frames_hex": ["22070a01781a026f6b", "0801"],
+      "expected_events": [
+        {
+          "event": "message",
+          "body_hex": "1a026f6b"
+        },
+        {
+          "event": "eof"
+        },
+        {
+          "event": "eof"
+        }
+      ],
+      "expected_terminal_status": {
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "metadata": []
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.client.payload_unknown_field",
+      "operation": "state.client_stream",
+      "frames_hex": ["22070a01781a026f6b", "0801"],
+      "expected_response_body_hex": "1a026f6b"
+    },
+    {
+      "id": "state.server.payload_field3_wrong_wire",
+      "operation": "state.server_stream",
+      "frames_hex": ["22021801", "0801"],
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 13
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.client.payload_field3_wrong_wire",
+      "operation": "state.client_stream",
+      "frames_hex": ["22021801", "0801"],
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.server.trailing_malformed_after_status",
+      "operation": "state.server_stream",
+      "frames_hex": ["0801", "80"],
+      "expected_error": {
+        "category": "trailing_frame",
+        "status_code": 13
+      },
+      "expected_transport_close_count": "1"
+    },
+    {
+      "id": "state.client.trailing_malformed_after_status",
+      "operation": "state.client_stream",
+      "frames_hex": ["22031a0161", "0801", "80"],
+      "expected_error": {
+        "category": "trailing_frame",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "state.client.two_responses_remote_status",
+      "operation": "state.client_stream",
+      "frames_hex": ["22031a0161", "22031a0162", "0801100e1a04646f776e"],
+      "expected_error": {
+        "category": "remote_status",
+        "status_code": 14
+      }
+    },
+    {
+      "id": "state.client.two_responses_fin",
+      "operation": "state.client_stream",
+      "frames_hex": ["22031a0161", "22031a0162"],
+      "expected_error": {
+        "category": "missing_terminal_status",
+        "status_code": 13
+      }
+    }
+  ]
+}

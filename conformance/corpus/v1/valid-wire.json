@@ -1,0 +1,469 @@
+{
+  "schema_version": 1,
+  "kind": "valid_wire",
+  "cases": [
+    {
+      "id": "rpc_request.unary.encode",
+      "operation": "codec.encode",
+      "message_type": "rpc_request",
+      "message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "golden": "rpc_request.unary"
+    },
+    {
+      "id": "rpc_request.unary.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "golden": "rpc_request.unary",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      }
+    },
+    {
+      "id": "rpc_request.timeout.encode",
+      "operation": "codec.encode",
+      "message_type": "rpc_request",
+      "message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "123456"
+      },
+      "golden": "rpc_request.timeout"
+    },
+    {
+      "id": "rpc_request.timeout.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "golden": "rpc_request.timeout",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "123456"
+      }
+    },
+    {
+      "id": "rpc_request.metadata.encode",
+      "operation": "codec.encode",
+      "message_type": "rpc_request",
+      "message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [
+          {
+            "key_hex": "617574686f72697a6174696f6e",
+            "value_hex": "6f6b"
+          }
+        ],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "golden": "rpc_request.metadata"
+    },
+    {
+      "id": "rpc_request.metadata.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "golden": "rpc_request.metadata",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [
+          {
+            "key_hex": "617574686f72697a6174696f6e",
+            "value_hex": "6f6b"
+          }
+        ],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      }
+    },
+    {
+      "id": "rpc_stream_frame.message.encode",
+      "operation": "codec.encode",
+      "message_type": "rpc_stream_frame",
+      "message": {
+        "type": "rpc_stream_frame",
+        "kind": "message",
+        "kind_raw": "0",
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "body_hex": "6869",
+        "metadata": []
+      },
+      "golden": "rpc_stream_frame.message"
+    },
+    {
+      "id": "rpc_stream_frame.message.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_stream_frame",
+      "golden": "rpc_stream_frame.message",
+      "expected_message": {
+        "type": "rpc_stream_frame",
+        "kind": "message",
+        "kind_raw": "0",
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "body_hex": "6869",
+        "metadata": []
+      }
+    },
+    {
+      "id": "rpc_stream_frame.status.encode",
+      "operation": "codec.encode",
+      "message_type": "rpc_stream_frame",
+      "message": {
+        "type": "rpc_stream_frame",
+        "kind": "status",
+        "kind_raw": "1",
+        "status_raw": "14",
+        "status_code": 14,
+        "message_hex": "646f776e",
+        "body_hex": "",
+        "metadata": []
+      },
+      "golden": "rpc_stream_frame.status"
+    },
+    {
+      "id": "rpc_stream_frame.status.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_stream_frame",
+      "golden": "rpc_stream_frame.status",
+      "expected_message": {
+        "type": "rpc_stream_frame",
+        "kind": "status",
+        "kind_raw": "1",
+        "status_raw": "14",
+        "status_code": 14,
+        "message_hex": "646f776e",
+        "body_hex": "",
+        "metadata": []
+      }
+    },
+    {
+      "id": "rpc_response.ok_body.encode",
+      "operation": "codec.encode",
+      "message_type": "rpc_response",
+      "message": {
+        "type": "rpc_response",
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "body_hex": "6869",
+        "metadata": []
+      },
+      "golden": "rpc_response.ok_body"
+    },
+    {
+      "id": "rpc_response.ok_body.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_response",
+      "golden": "rpc_response.ok_body",
+      "expected_message": {
+        "type": "rpc_response",
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "body_hex": "6869",
+        "metadata": []
+      }
+    },
+    {
+      "id": "rpc_response.unavailable.encode",
+      "operation": "codec.encode",
+      "message_type": "rpc_response",
+      "message": {
+        "type": "rpc_response",
+        "status_raw": "14",
+        "status_code": 14,
+        "message_hex": "646f776e",
+        "body_hex": "",
+        "metadata": []
+      },
+      "golden": "rpc_response.unavailable"
+    },
+    {
+      "id": "rpc_response.unavailable.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_response",
+      "golden": "rpc_response.unavailable",
+      "expected_message": {
+        "type": "rpc_response",
+        "status_raw": "14",
+        "status_code": 14,
+        "message_hex": "646f776e",
+        "body_hex": "",
+        "metadata": []
+      }
+    },
+    {
+      "id": "rpc_request.default.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "3001",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "",
+        "method_hex": "",
+        "body_hex": "",
+        "metadata": [],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "canonical_body_hex": "3001"
+    },
+    {
+      "id": "rpc_request.client_stream.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a02686928013001",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "client_stream",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "canonical_body_hex": "0a0373766312016d1a02686928013001"
+    },
+    {
+      "id": "rpc_request.server_stream.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a02686928023001",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "server_stream",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "canonical_body_hex": "0a0373766312016d1a02686928023001"
+    },
+    {
+      "id": "rpc_request.bidi.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a02686928033001",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "bidi",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "canonical_body_hex": "0a0373766312016d1a02686928033001"
+    },
+    {
+      "id": "rpc_request.timeout_max.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a026869300138ffffffffffffffffff01",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "18446744073709551615"
+      },
+      "canonical_body_hex": "0a0373766312016d1a026869300138ffffffffffffffffff01"
+    },
+    {
+      "id": "rpc_request.binary_metadata.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a02686922110a0a74726163655f69642d31120300ff103001",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [
+          {
+            "key_hex": "74726163655f69642d31",
+            "value_hex": "00ff10"
+          }
+        ],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "canonical_body_hex": "0a0373766312016d1a02686922110a0a74726163655f69642d31120300ff103001"
+    },
+    {
+      "id": "rpc_response.metadata.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_response",
+      "body_hex": "1a026869220f0a0874726163652d69641203010203",
+      "expected_message": {
+        "type": "rpc_response",
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "body_hex": "6869",
+        "metadata": [
+          {
+            "key_hex": "74726163652d6964",
+            "value_hex": "010203"
+          }
+        ]
+      },
+      "canonical_body_hex": "1a026869220f0a0874726163652d69641203010203"
+    },
+    {
+      "id": "rpc_response.unknown_status.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_response",
+      "body_hex": "08e70712036f6464",
+      "expected_message": {
+        "type": "rpc_response",
+        "status_raw": "999",
+        "status_code": 2,
+        "message_hex": "6f6464",
+        "body_hex": "",
+        "metadata": []
+      },
+      "canonical_body_hex": "08e70712036f6464"
+    },
+    {
+      "id": "rpc_stream_frame.empty_message.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_stream_frame",
+      "body_hex": "",
+      "expected_message": {
+        "type": "rpc_stream_frame",
+        "kind": "message",
+        "kind_raw": "0",
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "body_hex": "",
+        "metadata": []
+      },
+      "canonical_body_hex": ""
+    },
+    {
+      "id": "rpc_stream_frame.ok_trailer.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_stream_frame",
+      "body_hex": "08012a0a0a057472616365120107",
+      "expected_message": {
+        "type": "rpc_stream_frame",
+        "kind": "status",
+        "kind_raw": "1",
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "body_hex": "",
+        "metadata": [
+          {
+            "key_hex": "7472616365",
+            "value_hex": "07"
+          }
+        ]
+      },
+      "canonical_body_hex": "08012a0a0a057472616365120107"
+    },
+    {
+      "id": "rpc_request.unknown_field.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a02686930014007",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "canonical_body_hex": "0a0373766312016d1a0268693001"
+    },
+    {
+      "id": "rpc_request.duplicate_service.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a036f6c640a0373766312016d3001",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "",
+        "metadata": [],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "canonical_body_hex": "0a0373766312016d3001"
+    },
+    {
+      "id": "rpc_request.duplicate_metadata.decode",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a02686922140a0d617574686f72697a6174696f6e12036f6c6422140a0d617574686f72697a6174696f6e12036e65773001",
+      "expected_message": {
+        "type": "rpc_request",
+        "service_hex": "737663",
+        "method_hex": "6d",
+        "body_hex": "6869",
+        "metadata": [
+          {
+            "key_hex": "617574686f72697a6174696f6e",
+            "value_hex": "6e6577"
+          }
+        ],
+        "kind": "unary",
+        "version": "1",
+        "timeout_nanos": "0"
+      },
+      "canonical_body_hex": "0a0373766312016d1a02686922140a0d617574686f72697a6174696f6e12036e65773001"
+    }
+  ]
+}

@@ -4,6 +4,7 @@
   makeWrapper,
   openssl,
   rustPlatform,
+  repoRoot,
   sourceCommit,
   sourceDirty,
   util-linux,
@@ -14,7 +15,7 @@ rustPlatform.buildRustPackage (
     version = "0.1.0";
 
     src = fileset.toSource {
-      root = ./.;
+      root = repoRoot;
       fileset = fileset.unions [
         ./Cargo.lock
         ./Cargo.toml
@@ -22,8 +23,11 @@ rustPlatform.buildRustPackage (
         ./peer-protocol-v4.md
         ./proto
         ./src
+        (repoRoot + "/conformance")
+        (repoRoot + "/testdata/wire-golden-vectors.txt")
       ];
     };
+    sourceRoot = "${final.src.name}/bench";
     cargoLock.lockFile = ./Cargo.lock;
 
     nativeBuildInputs = [ makeWrapper ];
@@ -36,6 +40,9 @@ rustPlatform.buildRustPackage (
             util-linux
           ]
         } \
+        --set TREVRPC_BENCH_SOURCE_COMMIT ${sourceCommit} \
+        --set TREVRPC_BENCH_SOURCE_DIRTY ${sourceDirty}
+      wrapProgram $out/bin/trevrpc-conformance \
         --set TREVRPC_BENCH_SOURCE_COMMIT ${sourceCommit} \
         --set TREVRPC_BENCH_SOURCE_DIRTY ${sourceDirty}
     '';

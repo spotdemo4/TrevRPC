@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "kind": "malformed_wire",
+  "cases": [
+    {
+      "id": "rpc_request.unsupported_version",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a0268693002",
+      "expected_error": {
+        "category": "unsupported_wire_version",
+        "status_code": 9
+      }
+    },
+    {
+      "id": "rpc_request.unsupported_kind",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d1a02686928633001",
+      "expected_error": {
+        "category": "unsupported_rpc_kind",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_stream_frame.unsupported_kind",
+      "operation": "codec.decode",
+      "message_type": "rpc_stream_frame",
+      "body_hex": "0863",
+      "expected_error": {
+        "category": "unsupported_frame_kind",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.truncated_varint",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "80",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.unterminated_varint",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "80808080808080808080",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.overflow_varint",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "ffffffffffffffffffff02",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.zero_tag",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "00",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.truncated_service",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0261",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.truncated_metadata",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "22040a0361",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.invalid_utf8",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a01ff3001",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.wrong_wire_type",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0801",
+      "expected_error": {
+        "category": "malformed_protobuf",
+        "status_code": 3
+      }
+    },
+    {
+      "id": "rpc_request.invalid_metadata",
+      "operation": "codec.decode",
+      "message_type": "rpc_request",
+      "body_hex": "0a0373766312016d22130a0d417574686f72697a6174696f6e12026f6b3001",
+      "expected_error": {
+        "category": "invalid_metadata",
+        "status_code": 3
+      }
+    }
+  ]
+}

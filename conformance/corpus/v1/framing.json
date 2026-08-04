@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "kind": "framing",
+  "cases": [
+    {
+      "id": "framing.zero",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "chunks_hex": ["00000000"],
+      "expected_bodies_hex": [""],
+      "expected_eof": true
+    },
+    {
+      "id": "framing.exact_max",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "chunks_hex": ["00000010220e000102030405060708090a0b0c0d"],
+      "expected_bodies_hex": ["220e000102030405060708090a0b0c0d"],
+      "expected_eof": true
+    },
+    {
+      "id": "framing.fragmented",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "chunks_hex": ["00", "0000", "0322", "0161"],
+      "expected_bodies_hex": ["220161"],
+      "expected_eof": true
+    },
+    {
+      "id": "framing.coalesced",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "chunks_hex": ["00000000000000032201a5"],
+      "expected_bodies_hex": ["", "2201a5"],
+      "expected_eof": true
+    },
+    {
+      "id": "framing.unknown_field_body",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_request",
+      "max_frame_size": 16,
+      "chunks_hex": ["0000000430014007"],
+      "expected_bodies_hex": ["30014007"],
+      "expected_eof": true
+    },
+    {
+      "id": "framing.malformed_body",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_request",
+      "max_frame_size": 16,
+      "chunks_hex": ["0000000180"],
+      "expected_bodies_hex": ["80"],
+      "expected_eof": true
+    },
+    {
+      "id": "framing.partial_header",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "chunks_hex": ["000000"],
+      "expected_error": {
+        "category": "incomplete_frame",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "framing.partial_body",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "chunks_hex": ["000000032201"],
+      "expected_error": {
+        "category": "incomplete_frame",
+        "status_code": 13
+      }
+    },
+    {
+      "id": "framing.over_limit",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "chunks_hex": ["00000011"],
+      "expected_error": {
+        "category": "frame_too_large",
+        "status_code": 8
+      }
+    },
+    {
+      "id": "framing.max_u32",
+      "operation": "framing.decode_stream",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "chunks_hex": ["ffffffff"],
+      "expected_error": {
+        "category": "frame_too_large",
+        "status_code": 8
+      }
+    },
+    {
+      "id": "framing.encode_over_limit",
+      "operation": "framing.encode",
+      "message_type": "rpc_stream_frame",
+      "max_frame_size": 16,
+      "message": {
+        "type": "rpc_stream_frame",
+        "kind": "message",
+        "kind_raw": "0",
+        "status_raw": "0",
+        "status_code": 0,
+        "message_hex": "",
+        "body_hex": "000102030405060708090a0b0c0d0e",
+        "metadata": []
+      },
+      "expected_error": {
+        "category": "frame_too_large",
+        "status_code": 8
+      }
+    }
+  ]
+}

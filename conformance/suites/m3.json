@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "suite_id": "m3",
+  "protocol_version": 1,
+  "peer_resolution": "absolute_overrides",
+  "allowance_policy": "forbid",
+  "startup_timeout_ms": 10000,
+  "case_timeout_ms": 2000,
+  "shutdown_timeout_ms": 2000,
+  "max_command_bytes": 262144,
+  "max_event_bytes": 65536,
+  "max_stdout_bytes": 4194304,
+  "max_stderr_bytes": 1048576,
+  "crash_budget": 1,
+  "golden_path": "../../testdata/wire-golden-vectors.txt",
+  "corpus_paths": [
+    "../corpus/v1/valid-wire.json",
+    "../corpus/v1/malformed-wire.json",
+    "../corpus/v1/framing.json",
+    "../corpus/v1/stream-state.json",
+    "../corpus/v1/m3-normative.json",
+    "../corpus/v1/resource-limits.json"
+  ],
+  "peers": [
+    {
+      "id": "c",
+      "command": ["trevrpc-conformance-c", "--protocol", "1"],
+      "required_capabilities": [
+        "codec.decode",
+        "codec.encode",
+        "framing.decode_stream",
+        "framing.encode",
+        "state.client_stream",
+        "state.server_stream"
+      ]
+    },
+    {
+      "id": "cpp",
+      "command": ["trevrpc-conformance-cpp", "--protocol", "1"],
+      "required_capabilities": [
+        "codec.decode",
+        "codec.encode",
+        "framing.decode_stream",
+        "framing.encode",
+        "state.client_stream",
+        "state.server_stream"
+      ]
+    },
+    {
+      "id": "go",
+      "command": ["trevrpc-conformance-go", "--protocol", "1"],
+      "required_capabilities": [
+        "codec.decode",
+        "codec.encode",
+        "framing.decode_stream",
+        "framing.encode",
+        "state.client_stream",
+        "state.server_stream"
+      ]
+    },
+    {
+      "id": "js",
+      "command": ["trevrpc-conformance-js", "--protocol", "1"],
+      "required_capabilities": [
+        "codec.decode",
+        "codec.encode",
+        "framing.decode_stream",
+        "framing.encode",
+        "state.client_stream",
+        "state.server_stream"
+      ]
+    },
+    {
+      "id": "kotlin",
+      "command": ["trevrpc-conformance-kotlin", "--protocol", "1"],
+      "required_capabilities": [
+        "codec.decode",
+        "codec.encode",
+        "framing.decode_stream",
+        "framing.encode",
+        "state.client_stream",
+        "state.server_stream"
+      ]
+    },
+    {
+      "id": "rust",
+      "command": ["trevrpc-conformance-rust", "--protocol", "1"],
+      "required_capabilities": [
+        "codec.decode",
+        "codec.encode",
+        "framing.decode_stream",
+        "framing.encode",
+        "state.client_stream",
+        "state.server_stream"
+      ]
+    }
+  ]
+}
