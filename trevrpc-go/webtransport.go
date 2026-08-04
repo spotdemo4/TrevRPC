@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -359,22 +360,28 @@ func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport
 	return nil
 }
 
-func webTransportAdmitted(options ServerOptions, r *http.Request) bool {
-	if options.WebTransportAdmission == nil {
-		return false
+func (r *serverRuntime) webTransportAdmitted(request *http.Request) (admitted bool, err error) {
+	callback := r.options.WebTransportAdmission
+	if callback == nil {
+		return false, nil
 	}
-
-	return options.WebTransportAdmission(WebTransportAdmissionRequest{
-		Request:   r,
-		Path:      r.URL.Path,
-		Authority: r.Host,
-		Origin:    r.Header.Get("Origin"),
-		Secure:    r.TLS != nil,
-	})
+	if !tryAcquire(r.admissionLimit) {
+		return false, errAdmissionSaturated
+	}
+	defer release(r.admissionLimit)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &serverPanicError{phase: ServerDiagnosticAdmissionPanic, recovered: recovered, stack: debug.Stack()}
+			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticAdmissionPanic, Panic: recovered, Stack: debug.Stack(), Err: err})
+		}
+	}()
+	snapshot := cloneAdmissionRequest(request)
+	return callback(WebTransportAdmissionRequest{Request: snapshot, Path: snapshot.URL.Path, Authority: snapshot.Host, Origin: snapshot.Header.Get("Origin"), Secure: snapshot.TLS != nil}), nil
 }
 
 func handleWebTransportSession(ctx context.Context, session *webtransport.Session, server *Server, requestLimit semaphore) {
-	streamLimit := newSemaphore(server.options.MaxConcurrentStreamsPerConnection)
+	runtime := server.freeze()
+	streamLimit := newSemaphore(runtime.options.MaxConcurrentStreamsPerConnection)
 	var streamTasks sync.WaitGroup
 
 	go func() {
@@ -392,7 +399,7 @@ func handleWebTransportSession(ctx context.Context, session *webtransport.Sessio
 		}
 
 		if !tryAcquire(streamLimit) {
-			writeStatusResponse(stream, Unavailable("too many concurrent streams on WebTransport session"), server.options.MaxFrameSize)
+			writeStatusResponse(stream, Unavailable("too many concurrent streams on WebTransport session"), runtime.options.MaxFrameSize)
 			continue
 		}
 
@@ -404,7 +411,8 @@ func handleWebTransportSession(ctx context.Context, session *webtransport.Sessio
 		})
 	}
 
-	waitForWaitGroup(&streamTasks, server.options.GracefulShutdownTimeout, func() {
+	waitForWaitGroup(&streamTasks, runtime.options.GracefulShutdownTimeout, func() {
+		runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
 		_ = session.CloseWithError(cancelledWebTransportSessionCode, "server WebTransport stream drain timed out")
 	})
 }
@@ -427,6 +435,10 @@ func (s webTransportRPCStream) Close() error {
 
 func (s webTransportRPCStream) SetReadDeadline(ttl time.Time) error {
 	return s.stream.SetReadDeadline(ttl)
+}
+
+func (s webTransportRPCStream) trevrpcCancelRead() {
+	s.stream.CancelRead(cancelledWebTransportStreamCode)
 }
 
 func (s webTransportRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {

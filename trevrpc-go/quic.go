@@ -315,8 +315,9 @@ func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error
 
 // ServeQUIC accepts QUIC connections and serves TrevRPC until ctx is cancelled.
 func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) error {
-	connectionLimit := newSemaphore(server.options.MaxConcurrentConnections)
-	requestLimit := newSemaphore(server.options.MaxConcurrentRequests)
+	runtime := server.freeze()
+	connectionLimit := runtime.connectionLimit
+	requestLimit := runtime.requestLimit
 	connectionsCtx, stopConnections := context.WithCancel(context.Background())
 	defer stopConnections()
 
@@ -347,9 +348,11 @@ func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) err
 
 			stopConnections()
 			closeActiveConnections("server accept failed")
-			waitForWaitGroup(&connectionTasks, server.options.GracefulShutdownTimeout, func() {
+			waitForWaitGroup(&connectionTasks, runtime.options.GracefulShutdownTimeout, func() {
+				runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
 				closeActiveConnections("server connection drain timed out")
 			})
+			waitForRuntimeExecutions(runtime)
 			return transportStatus(err)
 		}
 
@@ -368,7 +371,7 @@ func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) err
 				delete(active, conn)
 				activeMu.Unlock()
 			}()
-			if isHTTP3QUICConnection(conn, server.options) {
+			if isHTTP3QUICConnection(conn, runtime.options) {
 				handleHTTP3Connection(connectionsCtx, conn, server, requestLimit, true)
 				return
 			}
@@ -378,11 +381,20 @@ func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) err
 	}
 
 	stopConnections()
-	waitForWaitGroup(&connectionTasks, server.options.GracefulShutdownTimeout, func() {
+	waitForWaitGroup(&connectionTasks, runtime.options.GracefulShutdownTimeout, func() {
+		runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
 		closeActiveConnections("server graceful shutdown timed out")
 	})
+	waitForRuntimeExecutions(runtime)
 
 	return nil
+}
+
+func waitForRuntimeExecutions(runtime *serverRuntime) {
+	if runtime.waitForExecutions(runtime.options.GracefulShutdownTimeout) {
+		return
+	}
+	runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
 }
 
 // HandleQUICConnection serves TrevRPC streams on an accepted QUIC connection.
@@ -391,12 +403,13 @@ func HandleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 }
 
 func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, requestLimit semaphore, closeOnShutdown bool) {
+	runtime := server.freeze()
 	if conn.ConnectionState().TLS.NegotiatedProtocol != ALPN {
 		conn.CloseWithError(0, "unsupported ALPN")
 		return
 	}
 
-	streamLimit := newSemaphore(server.options.MaxConcurrentStreamsPerConnection)
+	streamLimit := newSemaphore(runtime.options.MaxConcurrentStreamsPerConnection)
 	var streamTasks sync.WaitGroup
 
 	for {
@@ -406,7 +419,7 @@ func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 		}
 
 		if !tryAcquire(streamLimit) {
-			writeStatusResponse(stream, Unavailable("too many concurrent streams on connection"), server.options.MaxFrameSize)
+			writeStatusResponse(stream, Unavailable("too many concurrent streams on connection"), runtime.options.MaxFrameSize)
 			continue
 		}
 
@@ -418,7 +431,8 @@ func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, 
 		})
 	}
 
-	waitForWaitGroup(&streamTasks, server.options.GracefulShutdownTimeout, func() {
+	waitForWaitGroup(&streamTasks, runtime.options.GracefulShutdownTimeout, func() {
+		runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
 		conn.CloseWithError(0, "server stream drain timed out")
 	})
 
@@ -449,6 +463,10 @@ func (s quicRPCStream) Close() error {
 
 func (s quicRPCStream) SetReadDeadline(ttl time.Time) error {
 	return s.stream.SetReadDeadline(ttl)
+}
+
+func (s quicRPCStream) trevrpcCancelRead() {
+	s.stream.CancelRead(cancelledStreamCode)
 }
 
 func (s quicRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
@@ -483,46 +501,52 @@ type transportResponseFramesWriter interface {
 	trevrpcWriteNextFrames(context.Context, io.Writer, int) (bool, error)
 }
 
-func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore, stream rpcStream) {
+func handleRPCStream(ctx context.Context, server *Server, _ semaphore, stream rpcStream) {
+	runtime := server.freeze()
+	startedAt := time.Now()
 	request := &RpcRequest{}
-	if err := readInitialRequestFrame(ctx, server, stream, request); err != nil {
+	if err := readInitialRequestFrame(ctx, runtime.options, stream, request); err != nil {
 		status := requestFrameStatus(err)
-		server.recordPreHandlerFailure(status)
-		_ = WriteFrame(stream, status.IntoResponse(nil), server.options.MaxFrameSize)
+		runtime.recordPreHandlerFailure(startedAt, status)
+		_ = WriteFrame(stream, status.IntoResponse(nil), runtime.options.MaxFrameSize)
 		_ = stream.Close()
 		return
 	}
-	if !tryAcquire(requestLimit) {
+	lease, ok := runtime.tryRequestLease(request)
+	if !ok {
 		status := Unavailable("too many concurrent RPCs")
-		server.recordRejectedRequest(request, status)
-		writeRPCStatus(stream, request, status, server.options.MaxFrameSize)
+		runtime.recordRejectedRequest(request, status)
+		writeRPCStatus(stream, request, status, runtime.options.MaxFrameSize)
 		return
 	}
-	defer release(requestLimit)
 
 	if request.RPCKind() == RpcKindUnary {
-		response := server.HandleRequest(ctx, request)
+		defer lease.release()
+		response := runtime.handleRequest(ctx, request, lease)
 		if ctx.Err() != nil {
 			return
 		}
-		if err := WriteFrame(stream, response, server.options.MaxFrameSize); err == nil {
-			_ = drainUnaryRequestEnd(ctx, server, stream)
+		if err := WriteFrame(stream, response, runtime.options.MaxFrameSize); err == nil {
+			_ = drainUnaryRequestEnd(ctx, runtime.options, stream)
 			_ = stream.Close()
 		}
 		return
 	}
 
-	requestBody := &rpcRequestStream{stream: stream, maxFrameSize: server.options.MaxFrameSize}
+	requestBody := &rpcRequestStream{stream: stream, maxFrameSize: runtime.options.MaxFrameSize}
 	if request.RPCKind() == RpcKindClientStreaming || request.RPCKind() == RpcKindBidirectionalStreaming {
 		if cancellable, ok := stream.(contextCancelReadStream); ok {
 			requestBody.cancelReadOnContext = cancellable.trevrpcCancelReadOnContext
 		}
+		if cancellable, ok := stream.(immediateCancelReadStream); ok {
+			requestBody.cancelRead = cancellable.trevrpcCancelRead
+		}
 	}
-	response := server.HandleStreamingRequest(ctx, request, requestBody)
+	response := runtime.handleStreamingRequest(ctx, request, requestBody, lease)
 	defer closeMessageStream(response)
 	if frameWriter, ok := response.(transportResponseFramesWriter); ok {
 		for {
-			done, err := frameWriter.trevrpcWriteNextFrames(ctx, stream, server.options.MaxFrameSize)
+			done, err := frameWriter.trevrpcWriteNextFrames(ctx, stream, runtime.options.MaxFrameSize)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				closeMessageStream(response)
 				return
@@ -540,7 +564,7 @@ func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore
 	}
 	if frameWriter, ok := response.(transportResponseFrameWriter); ok {
 		for {
-			done, err := frameWriter.trevrpcWriteNextFrame(ctx, stream, server.options.MaxFrameSize)
+			done, err := frameWriter.trevrpcWriteNextFrame(ctx, stream, runtime.options.MaxFrameSize)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				closeMessageStream(response)
 				return
@@ -567,11 +591,11 @@ func handleRPCStream(ctx context.Context, server *Server, requestLimit semaphore
 		}
 
 		if err != nil {
-			frame = StatusFrame(StatusFromError(err))
+			frame = StatusFrame(runtime.wireStatus(err, ServerDiagnosticInternalError, request))
 		}
 
 		isStatus := frame.Kind == RpcStreamFrameKindStatus
-		if err := WriteFrame(stream, frame, server.options.MaxFrameSize); err != nil {
+		if err := WriteFrame(stream, frame, runtime.options.MaxFrameSize); err != nil {
 			return
 		}
 
@@ -674,18 +698,18 @@ type readDeadlineStream interface {
 	SetReadDeadline(time.Time) error
 }
 
-func readInitialRequestFrame(ctx context.Context, server *Server, stream rpcStream, request *RpcRequest) error {
+func readInitialRequestFrame(ctx context.Context, options ServerOptions, stream rpcStream, request *RpcRequest) error {
 	stopCancelRead := cancelReadOnContext(ctx, stream)
 	defer stopCancelRead()
 
-	if deadline, ok := readDeadline(ctx, server.options.InitialRequestTimeout); ok {
+	if deadline, ok := readDeadline(ctx, options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
 			defer deadlineStream.SetReadDeadline(time.Time{})
 		}
 	}
 
-	err := ReadFrame(stream, request, server.options.MaxFrameSize)
+	err := ReadFrame(stream, request, options.MaxFrameSize)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
@@ -705,11 +729,11 @@ func readDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) 
 	return deadline, ok
 }
 
-func drainUnaryRequestEnd(ctx context.Context, server *Server, stream rpcStream) error {
+func drainUnaryRequestEnd(ctx context.Context, options ServerOptions, stream rpcStream) error {
 	stopCancelRead := cancelReadOnContext(ctx, stream)
 	defer stopCancelRead()
 
-	if deadline, ok := readDeadline(ctx, server.options.InitialRequestTimeout); ok {
+	if deadline, ok := readDeadline(ctx, options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
 			defer deadlineStream.SetReadDeadline(time.Time{})
@@ -757,6 +781,7 @@ type rpcRequestStream struct {
 	stream              io.Reader
 	maxFrameSize        int
 	cancelReadOnContext func(context.Context) func()
+	cancelRead          func()
 	done                bool
 }
 
@@ -770,6 +795,12 @@ func (s *rpcRequestStream) trevrpcCancelReadOnContext(ctx context.Context) func(
 	}
 
 	return s.cancelReadOnContext(ctx)
+}
+
+func (s *rpcRequestStream) trevrpcCancelRead() {
+	if s.cancelRead != nil {
+		s.cancelRead()
+	}
 }
 
 func (s *rpcRequestStream) Recv() ([]byte, error) {

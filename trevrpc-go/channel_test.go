@@ -310,8 +310,32 @@ func TestChannelEventDispatcherBoundsSlowConsumerQueue(t *testing.T) {
 	if queued != channelEventQueueCapacity {
 		t.Fatalf("queued lifecycle events = %d, want %d", queued, channelEventQueueCapacity)
 	}
+	if dropped := dispatcher.dropped.Load(); dropped == 0 {
+		t.Fatal("bounded event queue drops were not observable")
+	}
 
 	close(release)
+}
+
+func TestChannelEventDispatcherRecoversCallbackPanicAndContinues(t *testing.T) {
+	delivered := make(chan ChannelEvent, 1)
+	var calls atomic.Int64
+	dispatcher := newChannelEventDispatcher(func(event ChannelEvent) {
+		if calls.Add(1) == 1 {
+			panic("callback boom")
+		}
+		delivered <- event
+	})
+	dispatcher.emit(ChannelEvent{Type: ChannelEventReady})
+	dispatcher.close(ChannelEvent{Type: ChannelEventClosed})
+	select {
+	case event := <-delivered:
+		if event.Type != ChannelEventClosed {
+			t.Fatalf("event after panic = %v, want closed", event.Type)
+		}
+	case <-time.After(channelTestTimeout):
+		t.Fatal("event dispatcher stopped after callback panic")
+	}
 }
 
 func TestChannelConnectorReusesSessionAndTokenStores(t *testing.T) {

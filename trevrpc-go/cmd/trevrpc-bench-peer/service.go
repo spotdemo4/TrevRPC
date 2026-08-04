@@ -184,23 +184,32 @@ func grpcServiceError(err error) error {
 
 type nativeBenchmarkService struct{}
 
-func (nativeBenchmarkService) Unary(_ context.Context, request *benchmarkpb.BenchmarkRequest) (*benchmarkpb.BenchmarkResponse, error) {
+func (nativeBenchmarkService) Unary(_ context.Context, request *benchmarkpb.BenchmarkRequest) (*trevrpc.Response[*benchmarkpb.BenchmarkResponse], error) {
 	response, err := benchmarkUnary(request)
-	return response, nativeServiceError(err)
+	if err != nil {
+		return nil, nativeServiceError(err)
+	}
+	return trevrpc.NewResponse(response), nil
 }
 
-func (nativeBenchmarkService) ClientStream(_ context.Context, requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]) (*benchmarkpb.BenchmarkSummary, error) {
+func (nativeBenchmarkService) ClientStream(_ context.Context, requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]) (*trevrpc.Response[*benchmarkpb.BenchmarkSummary], error) {
 	response, err := summarizeClientStream(requests.Recv)
-	return response, nativeServiceError(err)
+	if err != nil {
+		return nil, nativeServiceError(err)
+	}
+	return trevrpc.NewResponse(response), nil
 }
 
-func (nativeBenchmarkService) ServerStream(_ context.Context, request *benchmarkpb.StreamRequest) (trevrpc.MessageStream[*benchmarkpb.BenchmarkResponse], error) {
+func (nativeBenchmarkService) ServerStream(_ context.Context, request *benchmarkpb.StreamRequest) (trevrpc.ResponseStream[*benchmarkpb.BenchmarkResponse], error) {
 	responses, err := newServerResponseStream(request)
-	return responses, nativeServiceError(err)
+	if err != nil {
+		return nil, nativeServiceError(err)
+	}
+	return trevrpc.NewResponseStream[*benchmarkpb.BenchmarkResponse](responses), nil
 }
 
-func (nativeBenchmarkService) Bidi(_ context.Context, requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]) (trevrpc.MessageStream[*benchmarkpb.BenchmarkResponse], error) {
-	return &nativeBidiResponseStream{requests: requests}, nil
+func (nativeBenchmarkService) Bidi(_ context.Context, requests trevrpc.MessageStream[*benchmarkpb.BenchmarkRequest]) (trevrpc.ResponseStream[*benchmarkpb.BenchmarkResponse], error) {
+	return trevrpc.NewResponseStream[*benchmarkpb.BenchmarkResponse](&nativeBidiResponseStream{requests: requests}), nil
 }
 
 type nativeBidiResponseStream struct {

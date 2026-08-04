@@ -21,6 +21,7 @@ func QUICTransportLimitsFromServerOptions(options ServerOptions) QUICTransportLi
 
 // QUICServerConfig clones and caps a QUIC server config for TrevRPC traffic.
 func QUICServerConfig(options ServerOptions, base *quic.Config) *quic.Config {
+	options = canonicalServerOptions(options)
 	config := cloneQUICConfig(base)
 	limits := transportLimitsFromServerOptions(options)
 	capQUICReceiveWindows(config, limits.StreamReceiveWindow, limits.ConnectionReceiveWindow)

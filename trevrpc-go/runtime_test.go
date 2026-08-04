@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -110,6 +111,24 @@ func TestFrameDecodeErrorMapsToInvalidArgument(t *testing.T) {
 	}
 	if status := StatusFromError(transportStatus(err)); status.Code != CodeInvalidArgument {
 		t.Fatalf("expected transport invalid argument for malformed protobuf frame, got %v", status)
+	}
+}
+
+func TestTypedProtobufPreflightRejectsKnownWireTypesAndAllowsUnknownFields(t *testing.T) {
+	if err := UnmarshalMessage([]byte{0x0a, 0x00}, &RpcResponse{}); err == nil {
+		t.Fatal("known status field with a length-delimited wire type was accepted")
+	}
+
+	for _, body := range [][]byte{
+		{0x40, 0x01},
+		{0x49, 1, 2, 3, 4, 5, 6, 7, 8},
+		{0x52, 0x01, 0xff},
+		{0x5d, 1, 2, 3, 4},
+		{0x63, 0x08, 0x01, 0x64},
+	} {
+		if err := UnmarshalMessage(body, &RpcResponse{}); err != nil {
+			t.Fatalf("valid unknown field %x was rejected: %v", body, err)
+		}
 	}
 }
 
@@ -770,6 +789,7 @@ func TestRequestStreamLimitBoundaries(t *testing.T) {
 	options.MaxStreamMessages = 2
 	options.MaxStreamBodySize = 3
 	options.StreamIdleTimeout = 0
+	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
 	server.RouteStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
 		for {
@@ -865,6 +885,7 @@ func TestResponseStreamLimitBoundaries(t *testing.T) {
 	options.MaxStreamMessages = 2
 	options.MaxStreamBodySize = 3
 	options.StreamIdleTimeout = 0
+	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
 	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
 		return FromSlice([]byte("a"), []byte("bc")), nil
@@ -969,6 +990,7 @@ func TestServerResponseBatchWriterBatchesNonBlockingMessages(t *testing.T) {
 	options := DefaultServerOptions()
 	options.MaxStreamMessages = -1
 	options.StreamIdleTimeout = 0
+	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
 	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
 		return FromSlice([]byte("one"), []byte("two"), []byte("three")), nil
@@ -1009,6 +1031,7 @@ func TestServerResponseBatchWriterSplitsOnByteCap(t *testing.T) {
 	options := DefaultServerOptions()
 	options.MaxStreamMessages = -1
 	options.StreamIdleTimeout = 0
+	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
 	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
 		return FromSlice([]byte("abcd"), []byte("efgh"), []byte("ijkl")), nil
@@ -1092,6 +1115,7 @@ func TestServerResponseBatchWriterPreservesTerminalStatusAfterBatch(t *testing.T
 	options := DefaultServerOptions()
 	options.MaxStreamBodySize = 3
 	options.StreamIdleTimeout = 0
+	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
 	server.RouteStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
 		return FromSlice([]byte("ok"), []byte("too")), nil
@@ -1257,6 +1281,491 @@ func TestBidirectionalStreamingContextCancellationReturnsCancelled(t *testing.T)
 		t.Fatalf("expected cancelled, got %v (%v)", code, err)
 	}
 }
+
+func TestServerOptionsCanonicalizeSafePartialValues(t *testing.T) {
+	server := NewServer()
+	server.SetOptions(ServerOptions{MaxConcurrentRequests: 1})
+	options := server.Options()
+	defaults := DefaultServerOptions()
+	if options.MaxConcurrentRequests != 1 || options.MaxFrameSize != defaults.MaxFrameSize || options.MaxConcurrentConnections != defaults.MaxConcurrentConnections || options.MaxConcurrentAdmissionCallbacks != defaults.MaxConcurrentAdmissionCallbacks {
+		t.Fatalf("partial options were not safely canonicalized: %+v", options)
+	}
+	if options.InitialRequestTimeout != defaults.InitialRequestTimeout || options.StreamIdleTimeout != defaults.StreamIdleTimeout || options.GracefulShutdownTimeout != defaults.GracefulShutdownTimeout || options.HTTP3Path != DefaultHTTP3Path {
+		t.Fatalf("partial options removed safety defaults: %+v", options)
+	}
+
+	server = NewServer()
+	server.SetOptions(ServerOptions{DisableInitialRequestTimeout: true, DisableStreamIdleTimeout: true, DisableGracefulShutdownTimeout: true, MaxStreamMessages: -1, MaxStreamBodySize: -1})
+	options = server.Options()
+	if options.InitialRequestTimeout != 0 || options.StreamIdleTimeout != 0 || options.GracefulShutdownTimeout != 0 || options.MaxStreamMessages != -1 || options.MaxStreamBodySize != -1 {
+		t.Fatalf("explicit advanced controls were not preserved: %+v", options)
+	}
+}
+
+func TestServerOptionsRejectInvalidValues(t *testing.T) {
+	tests := []ServerOptions{
+		{MaxFrameSize: -1},
+		{MaxFrameSize: int(uint64(math.MaxUint32) + 1)},
+		{MaxConcurrentConnections: -1},
+		{MaxConcurrentStreamsPerConnection: -1},
+		{MaxConcurrentRequests: -1},
+		{MaxConcurrentAdmissionCallbacks: -1},
+		{MaxStreamMessages: -2},
+		{MaxStreamBodySize: -2},
+		{InitialRequestTimeout: -time.Nanosecond},
+		{StreamIdleTimeout: -time.Nanosecond},
+		{GracefulShutdownTimeout: -time.Nanosecond},
+		{HTTP3Path: "relative"},
+	}
+	for index, options := range tests {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("invalid options case %d did not panic: %+v", index, options)
+				}
+			}()
+			NewServer().SetOptions(options)
+		}()
+	}
+}
+
+func TestServerFreezesConfigurationOnDirectHandle(t *testing.T) {
+	server := NewServer()
+	server.Route("service", "method", func(context.Context, []byte) ([]byte, error) { return nil, nil })
+	response := server.HandleRequest(context.Background(), NewRpcRequest("service", "method", nil))
+	if CodeFromUint32(response.Status) != CodeOK {
+		t.Fatalf("initial response = %#v", response)
+	}
+
+	mutations := []func(){
+		func() { server.SetOptions(ServerOptions{}) },
+		func() { server.SetAuthorizer(nil) },
+		func() { server.ClearAuthorizer() },
+		func() { server.SetMetrics(nil) },
+		func() { server.SetDiagnostics(nil) },
+		func() {
+			server.Route("service", "other", func(context.Context, []byte) ([]byte, error) { return nil, nil })
+		},
+		func() {
+			server.RouteResponse("service", "other", func(context.Context, []byte) (*RpcResponse, error) { return OKResponse(nil), nil })
+		},
+		func() {
+			server.RouteStreaming("service", "stream", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) { return EmptyStream[[]byte](), nil })
+		},
+	}
+	for index, mutate := range mutations {
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != ErrServerFrozen {
+					t.Errorf("mutation %d panic = %#v, want ErrServerFrozen", index, recovered)
+				}
+			}()
+			mutate()
+		}()
+	}
+	if options := server.Options(); options.MaxConcurrentRequests != DefaultServerOptions().MaxConcurrentRequests {
+		t.Fatalf("frozen options changed: %+v", options)
+	}
+}
+
+func TestServerFreezesAtListen(t *testing.T) {
+	server := NewServer()
+	serverTLS, _ := testTLSConfig(t)
+	listener, err := Listen("127.0.0.1:0", server, ListenOptions{TLSConfig: serverTLS})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	defer func() {
+		if recovered := recover(); recovered != ErrServerFrozen {
+			t.Fatalf("post-Listen mutation panic = %#v, want ErrServerFrozen", recovered)
+		}
+	}()
+	server.SetOptions(ServerOptions{})
+}
+
+func TestServerRejectsInvalidRoutesBeforeServing(t *testing.T) {
+	tests := []func(*Server){
+		func(server *Server) {
+			server.Route("", "method", func(context.Context, []byte) ([]byte, error) { return nil, nil })
+		},
+		func(server *Server) {
+			server.Route("service", "", func(context.Context, []byte) ([]byte, error) { return nil, nil })
+		},
+		func(server *Server) { server.Route("service", "method", nil) },
+		func(server *Server) { server.RouteResponse("service", "method", nil) },
+		func(server *Server) {
+			server.RouteStreaming("service", "method", RpcKindUnary, func(context.Context, []byte, ByteStream) (ByteStream, error) { return nil, nil })
+		},
+		func(server *Server) {
+			server.RouteStreaming("service", "method", RpcKind(99), func(context.Context, []byte, ByteStream) (ByteStream, error) { return nil, nil })
+		},
+		func(server *Server) { server.RouteStreaming("service", "method", RpcKindServerStreaming, nil) },
+	}
+	for index, register := range tests {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("invalid route case %d did not panic", index)
+				}
+			}()
+			register(NewServer())
+		}()
+	}
+}
+
+func TestMetadataValueAuthorizerSnapshotsExpectedValue(t *testing.T) {
+	value := bytes.Repeat([]byte{'a'}, 256)
+	expected := append([]byte(nil), value...)
+	authorizer := NewMetadataValueAuthorizer("authorization", value)
+	value[0] = 'X'
+
+	request := NewRpcRequest("service", "method", nil)
+	request.Metadata["authorization"] = expected
+	if err := authorizer.Authorize(context.Background(), request); err != nil {
+		t.Fatalf("authorization changed after source mutation: %v", err)
+	}
+
+	stop := make(chan struct{})
+	mutated := make(chan struct{})
+	go func() {
+		defer close(mutated)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				value[0] ^= 1
+			}
+		}
+	}()
+	for range 1000 {
+		if err := authorizer.Authorize(context.Background(), request); err != nil {
+			close(stop)
+			<-mutated
+			t.Fatalf("authorization changed during source mutation: %v", err)
+		}
+	}
+	close(stop)
+	<-mutated
+}
+
+func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
+	deadlineRequest := func(method string, kind RpcKind) *RpcRequest {
+		request := NewRpcRequest("service", method, nil)
+		request.Kind = kind
+		request.TimeoutNanos = uint64(10 * time.Millisecond)
+		return request
+	}
+
+	t.Run("unary handler", func(t *testing.T) {
+		server := NewServer()
+		server.Route("service", "method", func(ctx context.Context, _ []byte) ([]byte, error) {
+			<-ctx.Done()
+			return []byte("late success"), nil
+		})
+		response := server.HandleRequest(context.Background(), deadlineRequest("method", RpcKindUnary))
+		if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+			t.Fatalf("response = %#v, want deadline exceeded", response)
+		}
+	})
+
+	t.Run("unary response handler", func(t *testing.T) {
+		server := NewServer()
+		server.RouteResponse("service", "method", func(ctx context.Context, _ []byte) (*RpcResponse, error) {
+			<-ctx.Done()
+			return OKResponse([]byte("late success")), nil
+		})
+		response := server.HandleRequest(context.Background(), deadlineRequest("method", RpcKindUnary))
+		if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+			t.Fatalf("response = %#v, want deadline exceeded", response)
+		}
+	})
+
+	t.Run("authorizer", func(t *testing.T) {
+		server := NewServer()
+		server.SetAuthorizer(authorizerFunc(func(ctx context.Context, _ *RpcRequest) error {
+			<-ctx.Done()
+			return nil
+		}))
+		server.Route("service", "method", func(context.Context, []byte) ([]byte, error) { return nil, nil })
+		response := server.HandleRequest(context.Background(), deadlineRequest("method", RpcKindUnary))
+		if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+			t.Fatalf("response = %#v, want deadline exceeded", response)
+		}
+	})
+
+	t.Run("streaming handler closes late stream", func(t *testing.T) {
+		server := NewServer()
+		late := &closeCountingByteStream{}
+		server.RouteStreaming("service", "method", RpcKindServerStreaming, func(ctx context.Context, _ []byte, _ ByteStream) (ByteStream, error) {
+			<-ctx.Done()
+			return late, nil
+		})
+		frame, err := server.HandleStreamingRequest(context.Background(), deadlineRequest("method", RpcKindServerStreaming), EmptyStream[[]byte]()).Recv()
+		if err != nil {
+			t.Fatalf("receive deadline status: %v", err)
+		}
+		if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeDeadlineExceeded {
+			t.Fatalf("frame = %#v, want deadline exceeded", frame)
+		}
+		waitForAtomicCount(t, &late.closed, 1, "late response stream close")
+		time.Sleep(10 * time.Millisecond)
+		if got := late.closed.Load(); got != 1 {
+			t.Fatalf("late response stream close count = %d, want 1", got)
+		}
+	})
+
+	t.Run("stream recv", func(t *testing.T) {
+		server := NewServer()
+		runtime := server.freeze()
+		request := deadlineRequest("method", RpcKindClientStreaming)
+		lease, ok := runtime.tryRequestLease(request)
+		if !ok {
+			t.Fatal("failed to acquire request lease")
+		}
+		defer lease.release()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		_, err := recvByteWithTimeout(ctx, contextResultByteStream{done: ctx.Done()}, time.Minute, "request", lease, request)
+		if StatusFromError(err).Code != CodeDeadlineExceeded {
+			t.Fatalf("recv error = %v, want deadline exceeded", err)
+		}
+		waitForServerExecutionCount(t, server, 0)
+	})
+}
+
+func TestServerDiagnosticDispatcherExitsAfterDraining(t *testing.T) {
+	delivered := make(chan struct{}, 1)
+	server := NewServer()
+	server.SetDiagnostics(func(ServerDiagnostic) { delivered <- struct{}{} })
+	runtime := server.freeze()
+	runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInternalError})
+	select {
+	case <-delivered:
+	case <-time.After(testTimeout):
+		t.Fatal("diagnostic was not delivered")
+	}
+
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		runtime.diagnostics.mu.Lock()
+		idle := !runtime.diagnostics.running && len(runtime.diagnostics.queue) == 0
+		runtime.diagnostics.mu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("diagnostic dispatcher remained running after draining")
+}
+
+func TestServerNonCooperativeUnaryRetainsAdmissionUntilExit(t *testing.T) {
+	server := NewServer()
+	server.SetOptions(ServerOptions{MaxConcurrentRequests: 1})
+	started := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	exited := make(chan struct{})
+	server.Route("service", "hang", func(context.Context, []byte) ([]byte, error) {
+		close(started)
+		<-releaseHandler
+		close(exited)
+		return nil, nil
+	})
+	server.Route("service", "fast", func(context.Context, []byte) ([]byte, error) { return []byte("ok"), nil })
+
+	request := NewRpcRequest("service", "hang", nil)
+	request.TimeoutNanos = uint64(20 * time.Millisecond)
+	response := server.HandleRequest(context.Background(), request)
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("deadline response = %#v", response)
+	}
+	<-started
+	for range 64 {
+		if response := server.HandleRequest(context.Background(), NewRpcRequest("service", "fast", nil)); CodeFromUint32(response.Status) != CodeUnavailable {
+			t.Fatalf("detached handler released admission: %#v", response)
+		}
+	}
+	close(releaseHandler)
+	select {
+	case <-exited:
+	case <-time.After(testTimeout):
+		t.Fatal("handler did not exit")
+	}
+	waitForServerExecutionCount(t, server, 0)
+	if response := server.HandleRequest(context.Background(), NewRpcRequest("service", "fast", nil)); CodeFromUint32(response.Status) != CodeOK {
+		t.Fatalf("request after handler exit = %#v", response)
+	}
+}
+
+func TestServerNonCooperativeRequestAndResponseRecvRetainAdmission(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kind RpcKind
+		run  func(*Server, *controlledByteStream) *RpcStreamFrame
+	}{
+		{name: "request recv", kind: RpcKindClientStreaming, run: func(server *Server, blocked *controlledByteStream) *RpcStreamFrame {
+			server.RouteStreaming("service", "stream", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+				_, err := requests.Recv()
+				return EmptyStream[[]byte](), err
+			})
+			request := NewRpcRequest("service", "stream", nil)
+			request.Kind = RpcKindClientStreaming
+			request.TimeoutNanos = uint64(20 * time.Millisecond)
+			frame, err := server.HandleStreamingRequest(context.Background(), request, blocked).Recv()
+			if err != nil {
+				t.Fatalf("receive request timeout status: %v", err)
+			}
+			return frame
+		}},
+		{name: "response recv", kind: RpcKindServerStreaming, run: func(server *Server, blocked *controlledByteStream) *RpcStreamFrame {
+			server.RouteStreaming("service", "stream", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) { return blocked, nil })
+			request := NewRpcRequest("service", "stream", nil)
+			request.Kind = RpcKindServerStreaming
+			request.TimeoutNanos = uint64(20 * time.Millisecond)
+			frame, err := server.HandleStreamingRequest(context.Background(), request, EmptyStream[[]byte]()).Recv()
+			if err != nil {
+				t.Fatalf("receive response timeout status: %v", err)
+			}
+			return frame
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer()
+			server.SetOptions(ServerOptions{MaxConcurrentRequests: 1})
+			server.Route("service", "fast", func(context.Context, []byte) ([]byte, error) { return nil, nil })
+			blocked := newControlledByteStream()
+			frame := test.run(server, blocked)
+			if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeDeadlineExceeded {
+				t.Fatalf("timeout frame = %#v", frame)
+			}
+			if response := server.HandleRequest(context.Background(), NewRpcRequest("service", "fast", nil)); CodeFromUint32(response.Status) != CodeUnavailable {
+				t.Fatalf("blocked Recv released admission: %#v", response)
+			}
+			close(blocked.release)
+			waitForServerExecutionCount(t, server, 0)
+			if response := server.HandleRequest(context.Background(), NewRpcRequest("service", "fast", nil)); CodeFromUint32(response.Status) != CodeOK {
+				t.Fatalf("request after Recv exit = %#v", response)
+			}
+		})
+	}
+}
+
+func TestServerSanitizesInternalFailuresAndRetainsDiagnostics(t *testing.T) {
+	diagnostics := make(chan ServerDiagnostic, 8)
+	server := NewServer()
+	server.SetDiagnostics(func(event ServerDiagnostic) { diagnostics <- event })
+	server.Route("service", "secret", func(context.Context, []byte) ([]byte, error) { return nil, errors.New("secret local detail") })
+	server.Route("service", "panic", func(context.Context, []byte) ([]byte, error) { panic("boom secret") })
+	server.RouteResponse("service", "internal", func(context.Context, []byte) (*RpcResponse, error) {
+		return Internal("secret status").WithMetadata(Metadata{"private": []byte("value")}).IntoResponse(nil), nil
+	})
+
+	for _, method := range []string{"secret", "panic", "internal"} {
+		response := server.HandleRequest(context.Background(), NewRpcRequest("service", method, nil))
+		if CodeFromUint32(response.Status) != CodeInternal || response.Message != "internal server error" || len(response.Metadata) != 0 {
+			t.Fatalf("%s leaked remote details: %#v", method, response)
+		}
+	}
+	seenLocalDetail := false
+	deadline := time.After(testTimeout)
+	for range 3 {
+		select {
+		case diagnostic := <-diagnostics:
+			if diagnostic.Err != nil && strings.Contains(diagnostic.Err.Error(), "secret") {
+				seenLocalDetail = true
+			}
+			if diagnostic.Panic != nil && strings.Contains(fmt.Sprint(diagnostic.Panic), "secret") {
+				seenLocalDetail = true
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for server diagnostics")
+		}
+	}
+	if !seenLocalDetail {
+		t.Fatal("local diagnostics did not retain internal detail")
+	}
+}
+
+func TestServerAuthorizerAndDiagnosticPanicsAreContained(t *testing.T) {
+	var authorizerCalls atomic.Int64
+	var diagnosticCalls atomic.Int64
+	server := NewServer()
+	server.SetAuthorizer(authorizerFunc(func(context.Context, *RpcRequest) error {
+		if authorizerCalls.Add(1) == 1 {
+			panic("auth boom")
+		}
+		return nil
+	}))
+	server.SetDiagnostics(func(ServerDiagnostic) {
+		if diagnosticCalls.Add(1) == 1 {
+			panic("diagnostic boom")
+		}
+	})
+	server.Route("service", "method", func(context.Context, []byte) ([]byte, error) { return nil, nil })
+	first := server.HandleRequest(context.Background(), NewRpcRequest("service", "method", nil))
+	if CodeFromUint32(first.Status) != CodeInternal || first.Message != "internal server error" {
+		t.Fatalf("authorizer panic response = %#v", first)
+	}
+	second := server.HandleRequest(context.Background(), NewRpcRequest("service", "method", nil))
+	if CodeFromUint32(second.Status) != CodeOK {
+		t.Fatalf("request after callback panic = %#v", second)
+	}
+}
+
+func waitForServerExecutionCount(t *testing.T, server *Server, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		if server.freeze().active.Load() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("active server executions = %d, want %d", server.freeze().active.Load(), want)
+}
+
+type authorizerFunc func(context.Context, *RpcRequest) error
+
+func (f authorizerFunc) Authorize(ctx context.Context, request *RpcRequest) error {
+	return f(ctx, request)
+}
+
+func waitForAtomicCount(t *testing.T, count *atomic.Int64, want int64, description string) {
+	t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		if count.Load() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("%s count = %d, want %d", description, count.Load(), want)
+}
+
+type closeCountingByteStream struct{ closed atomic.Int64 }
+
+func (*closeCountingByteStream) Recv() ([]byte, error) { return nil, io.EOF }
+func (s *closeCountingByteStream) Close() error {
+	s.closed.Add(1)
+	return nil
+}
+
+type contextResultByteStream struct{ done <-chan struct{} }
+
+func (s contextResultByteStream) Recv() ([]byte, error) {
+	<-s.done
+	return []byte("late success"), nil
+}
+func (contextResultByteStream) Close() error { return nil }
+
+type controlledByteStream struct{ release chan struct{} }
+
+func newControlledByteStream() *controlledByteStream {
+	return &controlledByteStream{release: make(chan struct{})}
+}
+func (s *controlledByteStream) Recv() ([]byte, error) { <-s.release; return nil, io.EOF }
+func (*controlledByteStream) Close() error            { return nil }
 
 type echoTestMessages struct {
 	requests MessageStream[*testMessage]
@@ -1648,9 +2157,13 @@ func TestWebTransportAdmissionReceivesRequestFields(t *testing.T) {
 		return request.Path == "/trevrpc" && request.Origin == "https://origin.test" && request.Request != nil
 	}
 
+	server := NewServer()
+	server.SetOptions(options)
+	runtime := server.freeze()
 	request := httptest.NewRequest(http.MethodGet, "https://example.test/trevrpc", nil)
 	request.Header.Set("Origin", "https://origin.test")
-	if !webTransportAdmitted(options, request) {
+	admitted, err := runtime.webTransportAdmitted(request)
+	if err != nil || !admitted {
 		t.Fatal("expected admission callback to accept matching request")
 	}
 	if seen.Authority == "" {
@@ -1659,7 +2172,8 @@ func TestWebTransportAdmissionReceivesRequestFields(t *testing.T) {
 
 	wrongPath := httptest.NewRequest(http.MethodGet, "https://example.test/wrong", nil)
 	wrongPath.Header.Set("Origin", "https://origin.test")
-	if webTransportAdmitted(options, wrongPath) {
+	admitted, err = runtime.webTransportAdmitted(wrongPath)
+	if err != nil || admitted {
 		t.Fatal("expected admission callback to reject unexpected path")
 	}
 }
@@ -1667,9 +2181,11 @@ func TestWebTransportAdmissionReceivesRequestFields(t *testing.T) {
 func TestWebTransportAdmissionRequired(t *testing.T) {
 	options := DefaultServerOptions()
 	options.EnableWebTransport = true
+	server := NewServer()
+	server.SetOptions(options)
 	request := httptest.NewRequest(http.MethodGet, "https://example.test/trevrpc", nil)
 
-	if webTransportAdmitted(options, request) {
+	if admitted, err := server.freeze().webTransportAdmitted(request); err != nil || admitted {
 		t.Fatal("WebTransport without an admission callback should be rejected")
 	}
 }
@@ -1733,6 +2249,87 @@ func TestQuicOversizedTimeoutRejectedOverWire(t *testing.T) {
 	if CodeFromUint32(response.Status) != CodeInvalidArgument {
 		t.Fatalf("expected invalid argument, got %#v", response)
 	}
+}
+
+func TestQuicRequestIdleTimeoutRecoversAdmission(t *testing.T) {
+	running := startTestQUICServer(t, configureIdleTimeoutAdmissionTestServer)
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open idle request stream: %v", err)
+	}
+	defer stream.CancelRead(cancelledStreamCode)
+	defer stream.CancelWrite(cancelledStreamCode)
+	writeIdleTimeoutRequest(t, stream)
+	assertIdleTimeoutStatus(t, stream)
+	waitForServerExecutionCount(t, running.server, 0)
+	assertUnaryAdmissionRecovered(t, Advanced.NewRawQUICClient(conn))
+}
+
+func TestWebTransportRequestIdleTimeoutRecoversAdmission(t *testing.T) {
+	running := startTestWebTransportServer(t, configureIdleTimeoutAdmissionTestServer)
+	transport := connectTestWebTransportClient(t, running)
+	defer transport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	stream, err := transport.Session().OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open idle WebTransport request stream: %v", err)
+	}
+	defer stream.CancelRead(cancelledWebTransportStreamCode)
+	defer stream.CancelWrite(cancelledWebTransportStreamCode)
+	writeIdleTimeoutRequest(t, stream)
+	assertIdleTimeoutStatus(t, stream)
+	waitForServerExecutionCount(t, running.server, 0)
+	assertUnaryAdmissionRecovered(t, transport)
+}
+
+func TestServeQUICWaitsForDetachedExecutions(t *testing.T) {
+	const shutdownTimeout = 60 * time.Millisecond
+	releaseHandler := make(chan struct{})
+	diagnostics := make(chan ServerDiagnostic, 8)
+	running := startTestQUICServer(t, func(server *Server) {
+		options := DefaultServerOptions()
+		options.GracefulShutdownTimeout = shutdownTimeout
+		server.SetOptions(options)
+		server.SetDiagnostics(func(event ServerDiagnostic) { diagnostics <- event })
+		server.Route("service", "hang", func(context.Context, []byte) ([]byte, error) {
+			<-releaseHandler
+			return nil, nil
+		})
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	request := NewRpcRequest("service", "hang", nil)
+	request.TimeoutNanos = uint64(10 * time.Millisecond)
+	response, err := Advanced.NewRawQUICClient(conn).Call(context.Background(), request)
+	if err != nil {
+		t.Fatalf("deadline call: %v", err)
+	}
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("deadline response = %#v", response)
+	}
+
+	startedAt := time.Now()
+	running.stop(t)
+	if elapsed := time.Since(startedAt); elapsed < shutdownTimeout/2 {
+		t.Fatalf("shutdown returned after %s, before detached execution timeout %s", elapsed, shutdownTimeout)
+	}
+	seenIncomplete := false
+	deadline := time.After(testTimeout)
+	for !seenIncomplete {
+		select {
+		case diagnostic := <-diagnostics:
+			seenIncomplete = diagnostic.Phase == ServerDiagnosticShutdownIncomplete
+		case <-deadline:
+			t.Fatal("shutdown did not report incomplete detached execution")
+		}
+	}
+	close(releaseHandler)
+	waitForServerExecutionCount(t, running.server, 0)
 }
 
 func TestQuicRequestStreamLimitsReturnResourceExhausted(t *testing.T) {
@@ -1850,6 +2447,9 @@ func TestQuicConnectionLimitRefusesNewConnections(t *testing.T) {
 func TestQuicDroppedResponseStreamCancelsServerWork(t *testing.T) {
 	metrics := &recordingMetrics{}
 	running := startTestQUICServer(t, func(server *Server) {
+		options := server.Options()
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
 		server.SetMetrics(metrics)
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
@@ -1864,6 +2464,9 @@ func TestQuicDroppedResponseStreamCancelsServerWork(t *testing.T) {
 func TestWebTransportDroppedResponseStreamCancelsServerWork(t *testing.T) {
 	metrics := &recordingMetrics{}
 	running := startTestWebTransportServer(t, func(server *Server) {
+		options := server.Options()
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
 		server.SetMetrics(metrics)
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
@@ -1878,6 +2481,9 @@ func TestWebTransportDroppedResponseStreamCancelsServerWork(t *testing.T) {
 func TestQuicServerStreamingContextCancelWhileResponsePending(t *testing.T) {
 	metrics := &recordingMetrics{}
 	running := startTestQUICServer(t, func(server *Server) {
+		options := server.Options()
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
 		server.SetMetrics(metrics)
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
@@ -1908,6 +2514,9 @@ func TestQuicServerStreamingContextCancelWhileResponsePending(t *testing.T) {
 func TestWebTransportServerStreamingContextCancelWhileResponsePending(t *testing.T) {
 	metrics := &recordingMetrics{}
 	running := startTestWebTransportServer(t, func(server *Server) {
+		options := server.Options()
+		options.GracefulShutdownTimeout = 50 * time.Millisecond
+		server.SetOptions(options)
 		server.SetMetrics(metrics)
 		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
 	})
@@ -2235,6 +2844,49 @@ func TestQuicRequestPermitReleasedAfterDeadline(t *testing.T) {
 	}
 }
 
+func TestQuicNonCooperativeHandlerRetainsRequestPermit(t *testing.T) {
+	releaseHandler := make(chan struct{})
+	exited := make(chan struct{})
+	running := startTestQUICServer(t, func(server *Server) {
+		server.SetOptions(ServerOptions{MaxConcurrentRequests: 1})
+		server.Route(testServiceName, "NonCooperative", func(context.Context, []byte) ([]byte, error) { <-releaseHandler; close(exited); return nil, nil })
+	})
+	conn := connectTestQUICClient(t, running)
+	defer conn.CloseWithError(0, "test complete")
+	transport := Advanced.NewRawQUICClient(conn)
+	request := NewRpcRequest(testServiceName, "NonCooperative", nil)
+	request.TimeoutNanos = uint64(50 * time.Millisecond)
+	response, err := transport.Call(context.Background(), request)
+	if err != nil {
+		t.Fatalf("deadline call transport: %v", err)
+	}
+	if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
+		t.Fatalf("deadline response = %#v", response)
+	}
+
+	response, err = transport.Call(context.Background(), NewRpcRequest(testServiceName, "SayHello", mustEncodeTestMessage(t, "bounded")))
+	if err != nil {
+		t.Fatalf("bounded call transport: %v", err)
+	}
+	if CodeFromUint32(response.Status) != CodeUnavailable {
+		t.Fatalf("non-cooperative handler released global admission: %#v", response)
+	}
+	close(releaseHandler)
+	select {
+	case <-exited:
+	case <-time.After(testTimeout):
+		t.Fatal("non-cooperative handler did not exit")
+	}
+	waitForServerExecutionCount(t, running.server, 0)
+	response, err = transport.Call(context.Background(), NewRpcRequest(testServiceName, "SayHello", mustEncodeTestMessage(t, "released")))
+	if err != nil {
+		t.Fatalf("call after handler exit: %v", err)
+	}
+	if CodeFromUint32(response.Status) != CodeOK {
+		t.Fatalf("call after handler exit = %#v", response)
+	}
+}
+
 func TestQuicLocalCloseMapsToCancelled(t *testing.T) {
 	running := startTestQUICServer(t, func(*Server) {})
 	conn := connectTestQUICClient(t, running)
@@ -2476,13 +3128,13 @@ func TestServerTransportReadsCancelWithContext(t *testing.T) {
 		{
 			name: "initial request",
 			read: func(ctx context.Context, stream rpcStream) error {
-				return readInitialRequestFrame(ctx, server, stream, &RpcRequest{})
+				return readInitialRequestFrame(ctx, server.Options(), stream, &RpcRequest{})
 			},
 		},
 		{
 			name: "unary request end",
 			read: func(ctx context.Context, stream rpcStream) error {
-				return drainUnaryRequestEnd(ctx, server, stream)
+				return drainUnaryRequestEnd(ctx, server.Options(), stream)
 			},
 		},
 	}
@@ -2633,6 +3285,7 @@ const testServiceName = "example.Greeter"
 type runningTestQUICServer struct {
 	addr      string
 	clientTLS *tls.Config
+	server    *Server
 	cancel    context.CancelFunc
 	done      chan error
 }
@@ -2672,6 +3325,7 @@ func startTestQUICServerWithTLS(t *testing.T, serverTLS, clientTLS *tls.Config, 
 	running := &runningTestQUICServer{
 		addr:      listener.Addr().String(),
 		clientTLS: clientTLS,
+		server:    server,
 		cancel:    cancel,
 		done:      done,
 	}
@@ -2717,6 +3371,7 @@ func startTestWebTransportServerWithAdmission(t *testing.T, admission WebTranspo
 	running := &runningTestQUICServer{
 		addr:      listener.Addr().String(),
 		clientTLS: clientTLS,
+		server:    server,
 		cancel:    cancel,
 		done:      done,
 	}
@@ -2755,6 +3410,54 @@ func connectTestQUICClient(t *testing.T, running *runningTestQUICServer) *quic.C
 	}
 
 	return conn
+}
+
+func configureIdleTimeoutAdmissionTestServer(server *Server) {
+	options := DefaultServerOptions()
+	options.MaxConcurrentRequests = 1
+	options.StreamIdleTimeout = 30 * time.Millisecond
+	options.GracefulShutdownTimeout = 100 * time.Millisecond
+	server.SetOptions(options)
+}
+
+func writeIdleTimeoutRequest(t *testing.T, stream io.Writer) {
+	t.Helper()
+	request := NewRpcRequest(testServiceName, "LotsOfGreetings", nil)
+	request.Kind = RpcKindClientStreaming
+	if err := WriteFrame(stream, request, DefaultMaxFrameSize); err != nil {
+		t.Fatalf("write idle timeout request: %v", err)
+	}
+}
+
+type rawTestStatusStream interface {
+	io.Reader
+	SetReadDeadline(time.Time) error
+}
+
+func assertIdleTimeoutStatus(t *testing.T, stream rawTestStatusStream) {
+	t.Helper()
+	if err := stream.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
+		t.Fatalf("set idle timeout response deadline: %v", err)
+	}
+	defer stream.SetReadDeadline(time.Time{})
+	frame := &RpcStreamFrame{}
+	if err := ReadFrame(stream, frame, DefaultMaxFrameSize); err != nil {
+		t.Fatalf("read idle timeout status: %v", err)
+	}
+	if frame.Kind != RpcStreamFrameKindStatus || CodeFromUint32(frame.Status) != CodeUnavailable {
+		t.Fatalf("idle timeout frame = %#v, want unavailable status", frame)
+	}
+}
+
+func assertUnaryAdmissionRecovered(t *testing.T, transport Transport) {
+	t.Helper()
+	response, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "after idle timeout"}, func() *testMessage { return &testMessage{} }, WithTimeout(testTimeout))
+	if err != nil {
+		t.Fatalf("unary after idle timeout: %v", err)
+	}
+	if response.Value != "hello, after idle timeout" {
+		t.Fatalf("unary response after idle timeout = %q", response.Value)
+	}
 }
 
 func openRawTestQUICStream(t *testing.T, running *runningTestQUICServer) *quic.Stream {

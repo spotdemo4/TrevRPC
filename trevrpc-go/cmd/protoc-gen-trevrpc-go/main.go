@@ -1,23 +1,21 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
+	"go/token"
 	"io"
 	"os"
-	"path"
-	"sort"
 	"strings"
-	"unicode"
 
+	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
-	descriptor "google.golang.org/protobuf/types/descriptorpb"
 	plugin "google.golang.org/protobuf/types/pluginpb"
 )
 
 type pluginOptions struct {
-	runtimeImport string
+	runtimeImport protogen.GoImportPath
 	fileSuffix    string
+	servicePrefix string
 }
 
 func defaultPluginOptions() pluginOptions {
@@ -27,14 +25,32 @@ func defaultPluginOptions() pluginOptions {
 	}
 }
 
-type typeRef struct {
-	protoName string
-	goIdent   string
-	goPackage string
-	goImport  string
+func (o *pluginOptions) set(name, value string) error {
+	switch name {
+	case "runtime_import":
+		o.runtimeImport = protogen.GoImportPath(value)
+	case "file_suffix":
+		o.fileSuffix = value
+	case "service_prefix":
+		o.servicePrefix = value
+	default:
+		return fmt.Errorf("unknown trevrpc-go option %q", name)
+	}
+	return nil
 }
 
-type typeIndex map[string]typeRef
+func (o pluginOptions) validate() error {
+	if o.runtimeImport == "" || (!strings.Contains(string(o.runtimeImport), ".") && !strings.Contains(string(o.runtimeImport), "/")) {
+		return fmt.Errorf("invalid runtime_import %q: expected a usable Go import path", o.runtimeImport)
+	}
+	if o.fileSuffix == "" {
+		return fmt.Errorf("file_suffix must not be empty")
+	}
+	if o.servicePrefix != "" && !token.IsIdentifier(o.servicePrefix+"Service") {
+		return fmt.Errorf("invalid service_prefix %q: expected a Go identifier prefix", o.servicePrefix)
+	}
+	return nil
+}
 
 func main() {
 	if err := run(os.Stdin, os.Stdout); err != nil {
@@ -65,469 +81,327 @@ func run(reader io.Reader, writer io.Writer) error {
 }
 
 func generate(request *plugin.CodeGeneratorRequest) *plugin.CodeGeneratorResponse {
-	options, err := parseOptions(request.GetParameter())
+	request = withDefaultSourceRelative(request)
+	options := defaultPluginOptions()
+	generator, err := (protogen.Options{ParamFunc: options.set}).New(request)
 	if err != nil {
 		return &plugin.CodeGeneratorResponse{Error: new(err.Error())}
 	}
-
-	filesToGenerate := map[string]bool{}
-	for _, fileName := range request.FileToGenerate {
-		filesToGenerate[fileName] = true
+	if err := options.validate(); err != nil {
+		return &plugin.CodeGeneratorResponse{Error: new(err.Error())}
+	}
+	if err := validateGeneratedNames(generator.Files, options); err != nil {
+		return &plugin.CodeGeneratorResponse{Error: new(err.Error())}
 	}
 
-	index := buildTypeIndex(request.ProtoFile)
-	response := &plugin.CodeGeneratorResponse{}
-	for _, file := range request.ProtoFile {
-		if !filesToGenerate[file.GetName()] || len(file.Service) == 0 {
+	for _, file := range generator.Files {
+		if !file.Generate || len(file.Services) == 0 {
 			continue
 		}
-
-		content, err := generateFile(file, request.ProtoFile, index, options)
-		if err != nil {
-			return &plugin.CodeGeneratorResponse{Error: new(err.Error())}
-		}
-
-		response.File = append(response.File, &plugin.CodeGeneratorResponse_File{
-			Name:    new(outputFileName(file.GetName(), options.fileSuffix)),
-			Content: new(content),
-		})
-	}
-
-	return response
-}
-
-func parseOptions(parameter string) (pluginOptions, error) {
-	options := defaultPluginOptions()
-	if parameter == "" {
-		return options, nil
-	}
-
-	for option := range strings.SplitSeq(parameter, ",") {
-		if option == "" {
-			continue
-		}
-
-		key, value, ok := strings.Cut(option, "=")
-		if !ok {
-			return options, fmt.Errorf("invalid trevrpc-go option %q; expected key=value", option)
-		}
-
-		switch key {
-		case "runtime_import":
-			options.runtimeImport = value
-		case "file_suffix":
-			options.fileSuffix = value
-		default:
-			return options, fmt.Errorf("unknown trevrpc-go option %q", key)
+		if err := generateFile(generator, file, options); err != nil {
+			generator.Error(err)
+			break
 		}
 	}
-
-	return options, nil
+	return generator.Response()
 }
 
-func buildTypeIndex(files []*descriptor.FileDescriptorProto) typeIndex {
-	index := typeIndex{}
-	for _, file := range files {
-		goPackage := fileGoPackageName(file)
-		goImport := fileGoImportPath(file)
-		for _, message := range file.MessageType {
-			indexMessage(index, file.GetPackage(), nil, message, goPackage, goImport)
+func withDefaultSourceRelative(request *plugin.CodeGeneratorRequest) *plugin.CodeGeneratorRequest {
+	clone := proto.Clone(request).(*plugin.CodeGeneratorRequest)
+	for parameter := range strings.SplitSeq(clone.GetParameter(), ",") {
+		name, _, _ := strings.Cut(parameter, "=")
+		if name == "paths" || name == "module" {
+			return clone
 		}
 	}
-
-	return index
-}
-
-func indexMessage(index typeIndex, protoPackage string, parents []string, message *descriptor.DescriptorProto, goPackage, goImport string) {
-	name := message.GetName()
-	protoName := fullProtoName(protoPackage, append(parents, name))
-	goParts := make([]string, 0, len(parents)+1)
-	for _, parent := range parents {
-		goParts = append(goParts, goExportedName(parent))
-	}
-	goParts = append(goParts, goExportedName(name))
-
-	index[protoName] = typeRef{
-		protoName: protoName,
-		goIdent:   strings.Join(goParts, "_"),
-		goPackage: goPackage,
-		goImport:  goImport,
-	}
-
-	for _, nested := range message.NestedType {
-		indexMessage(index, protoPackage, append(parents, name), nested, goPackage, goImport)
-	}
-}
-
-func generateFile(file *descriptor.FileDescriptorProto, files []*descriptor.FileDescriptorProto, index typeIndex, options pluginOptions) (string, error) {
-	goPackage := fileGoPackageName(file)
-	imports := map[string]string{
-		"context": "context",
-		"trevrpc": options.runtimeImport,
-	}
-
-	services := make([]string, 0, len(file.Service))
-	for _, service := range file.Service {
-		serviceCode, err := generateService(file, service, index, imports)
-		if err != nil {
-			return "", err
-		}
-
-		services = append(services, serviceCode)
-	}
-
-	var buffer bytes.Buffer
-	buffer.WriteString("// Code generated by protoc-gen-trevrpc-go. DO NOT EDIT.\n\n")
-	buffer.WriteString("package ")
-	buffer.WriteString(goPackage)
-	buffer.WriteString("\n\n")
-	writeImports(&buffer, imports)
-	buffer.WriteString("func mergeTrevrpcCallOptions(base []trevrpc.CallOption, override []trevrpc.CallOption) []trevrpc.CallOption {\n")
-	buffer.WriteString("\tif len(base) == 0 {\n")
-	buffer.WriteString("\t\treturn override\n")
-	buffer.WriteString("\t}\n")
-	buffer.WriteString("\tif len(override) == 0 {\n")
-	buffer.WriteString("\t\treturn base\n")
-	buffer.WriteString("\t}\n")
-	buffer.WriteString("\tmerged := make([]trevrpc.CallOption, 0, len(base)+len(override))\n")
-	buffer.WriteString("\tmerged = append(merged, base...)\n")
-	buffer.WriteString("\tmerged = append(merged, override...)\n")
-	buffer.WriteString("\treturn merged\n")
-	buffer.WriteString("}\n\n")
-
-	for _, service := range services {
-		buffer.WriteString(service)
-		buffer.WriteByte('\n')
-	}
-
-	_ = files
-	return buffer.String(), nil
-}
-
-func writeImports(buffer *bytes.Buffer, imports map[string]string) {
-	aliases := make([]string, 0, len(imports))
-	for alias := range imports {
-		aliases = append(aliases, alias)
-	}
-	sort.Strings(aliases)
-
-	buffer.WriteString("import (\n")
-	for _, alias := range aliases {
-		importPath := imports[alias]
-		if alias == path.Base(importPath) || alias == "context" {
-			fmt.Fprintf(buffer, "\t%q\n", importPath)
-		} else {
-			fmt.Fprintf(buffer, "\t%s %q\n", alias, importPath)
-		}
-	}
-	buffer.WriteString(")\n\n")
-}
-
-func generateService(file *descriptor.FileDescriptorProto, service *descriptor.ServiceDescriptorProto, index typeIndex, imports map[string]string) (string, error) {
-	serviceName := goExportedName(service.GetName())
-	fullServiceName := service.GetName()
-	if file.GetPackage() != "" {
-		fullServiceName = file.GetPackage() + "." + service.GetName()
-	}
-
-	methods := make([]methodInfo, 0, len(service.Method))
-	for _, method := range service.Method {
-		methodInfo, err := describeMethod(file, method, index, imports)
-		if err != nil {
-			return "", err
-		}
-
-		methods = append(methods, methodInfo)
-	}
-
-	var buffer bytes.Buffer
-	fmt.Fprintf(&buffer, "// %sServer handles the %s service.\n", serviceName, serviceName)
-	fmt.Fprintf(&buffer, "type %sServer interface {\n", serviceName)
-	for _, method := range methods {
-		fmt.Fprintf(&buffer, "\t// %s handles the %s RPC.\n", method.name, method.protoName)
-		fmt.Fprintf(&buffer, "\t%s\n", method.serverSignature)
-	}
-	buffer.WriteString("}\n\n")
-
-	fmt.Fprintf(&buffer, "// %sClient calls the %s service.\n", serviceName, serviceName)
-	fmt.Fprintf(&buffer, "type %sClient struct {\n", serviceName)
-	buffer.WriteString("\ttransport trevrpc.Transport\n")
-	buffer.WriteString("\toptions []trevrpc.CallOption\n")
-	buffer.WriteString("}\n\n")
-	fmt.Fprintf(&buffer, "// New%sClient creates a client for the %s service.\n", serviceName, serviceName)
-	fmt.Fprintf(&buffer, "func New%sClient(transport trevrpc.Transport, options ...trevrpc.CallOption) *%sClient {\n", serviceName, serviceName)
-	fmt.Fprintf(&buffer, "\treturn &%sClient{transport: transport, options: options}\n", serviceName)
-	buffer.WriteString("}\n\n")
-
-	for _, method := range methods {
-		generateClientMethod(&buffer, serviceName, fullServiceName, method)
-	}
-
-	fmt.Fprintf(&buffer, "// Register%sServer registers handlers for the %s service.\n", serviceName, serviceName)
-	fmt.Fprintf(&buffer, "func Register%sServer(server *trevrpc.Server, implementation %sServer) {\n", serviceName, serviceName)
-	for _, method := range methods {
-		generateServerRegistration(&buffer, fullServiceName, method)
-	}
-	buffer.WriteString("}\n")
-
-	return buffer.String(), nil
-}
-
-type methodInfo struct {
-	name            string
-	protoName       string
-	inputType       string
-	outputType      string
-	clientStreaming bool
-	serverStreaming bool
-	serverSignature string
-}
-
-func describeMethod(file *descriptor.FileDescriptorProto, method *descriptor.MethodDescriptorProto, index typeIndex, imports map[string]string) (methodInfo, error) {
-	inputType, err := goTypeFor(file, method.GetInputType(), index, imports)
-	if err != nil {
-		return methodInfo{}, err
-	}
-	outputType, err := goTypeFor(file, method.GetOutputType(), index, imports)
-	if err != nil {
-		return methodInfo{}, err
-	}
-
-	info := methodInfo{
-		name:            goExportedName(method.GetName()),
-		protoName:       method.GetName(),
-		inputType:       inputType,
-		outputType:      outputType,
-		clientStreaming: method.GetClientStreaming(),
-		serverStreaming: method.GetServerStreaming(),
-	}
-
-	switch {
-	case info.clientStreaming && info.serverStreaming:
-		info.serverSignature = fmt.Sprintf("%s(context.Context, trevrpc.MessageStream[%s]) (trevrpc.MessageStream[%s], error)", info.name, inputType, outputType)
-	case info.clientStreaming:
-		info.serverSignature = fmt.Sprintf("%s(context.Context, trevrpc.MessageStream[%s]) (%s, error)", info.name, inputType, outputType)
-	case info.serverStreaming:
-		info.serverSignature = fmt.Sprintf("%s(context.Context, %s) (trevrpc.MessageStream[%s], error)", info.name, inputType, outputType)
-	default:
-		info.serverSignature = fmt.Sprintf("%s(context.Context, %s) (%s, error)", info.name, inputType, outputType)
-	}
-
-	return info, nil
-}
-
-func generateClientMethod(buffer *bytes.Buffer, serviceName, fullServiceName string, method methodInfo) {
-	fmt.Fprintf(buffer, "// %s calls the %s RPC.\n", method.name, method.protoName)
-	switch {
-	case method.clientStreaming && method.serverStreaming:
-		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[%s, %s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
-		fmt.Fprintf(buffer, "\treturn trevrpc.BidirectionalStreaming[%s, %s](ctx, c.transport, %q, %q, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
-		buffer.WriteString("}\n\n")
-		fmt.Fprintf(buffer, "// %sFromStream calls the %s RPC from an existing request stream.\n", method.name, method.protoName)
-		fmt.Fprintf(buffer, "func (c *%sClient) %sFromStream(ctx context.Context, requests trevrpc.MessageStream[%s], options ...trevrpc.CallOption) (trevrpc.MessageStream[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
-		fmt.Fprintf(buffer, "\treturn trevrpc.BidirectionalStreamingFromStream[%s, %s](ctx, c.transport, %q, %q, requests, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
-	case method.clientStreaming:
-		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[%s, %s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
-		fmt.Fprintf(buffer, "\treturn trevrpc.ClientStreaming[%s, %s](ctx, c.transport, %q, %q, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
-		buffer.WriteString("}\n\n")
-		fmt.Fprintf(buffer, "// %sFromStream calls the %s RPC from an existing request stream.\n", method.name, method.protoName)
-		fmt.Fprintf(buffer, "func (c *%sClient) %sFromStream(ctx context.Context, requests trevrpc.MessageStream[%s], options ...trevrpc.CallOption) (%s, error) {\n", serviceName, method.name, method.inputType, method.outputType)
-		fmt.Fprintf(buffer, "\treturn trevrpc.ClientStreamingFromStream[%s, %s](ctx, c.transport, %q, %q, requests, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
-	case method.serverStreaming:
-		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, request %s, options ...trevrpc.CallOption) (trevrpc.MessageStream[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
-		fmt.Fprintf(buffer, "\treturn trevrpc.ServerStreaming[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
-		buffer.WriteString("}\n\n")
-		fmt.Fprintf(buffer, "// %sResponse calls the %s RPC and returns a response stream with terminal metadata.\n", method.name, method.protoName)
-		fmt.Fprintf(buffer, "func (c *%sClient) %sResponse(ctx context.Context, request %s, options ...trevrpc.CallOption) (trevrpc.ResponseStream[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
-		fmt.Fprintf(buffer, "\treturn trevrpc.ServerStreamingResponse[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
-	default:
-		fmt.Fprintf(buffer, "func (c *%sClient) %s(ctx context.Context, request %s, options ...trevrpc.CallOption) (%s, error) {\n", serviceName, method.name, method.inputType, method.outputType)
-		fmt.Fprintf(buffer, "\treturn trevrpc.Unary[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
-		buffer.WriteString("}\n\n")
-		fmt.Fprintf(buffer, "// %sResponse calls the %s RPC and returns response metadata.\n", method.name, method.protoName)
-		fmt.Fprintf(buffer, "func (c *%sClient) %sResponse(ctx context.Context, request %s, options ...trevrpc.CallOption) (*trevrpc.Response[%s], error) {\n", serviceName, method.name, method.inputType, method.outputType)
-		fmt.Fprintf(buffer, "\treturn trevrpc.UnaryResponse[%s, %s](ctx, c.transport, %q, %q, request, func() %s { return &%s{} }, mergeTrevrpcCallOptions(c.options, options)...)\n", method.inputType, method.outputType, fullServiceName, method.protoName, method.outputType, strings.TrimPrefix(method.outputType, "*"))
-	}
-	buffer.WriteString("}\n\n")
-}
-
-func generateServerRegistration(buffer *bytes.Buffer, fullServiceName string, method methodInfo) {
-	if !method.clientStreaming && !method.serverStreaming {
-		fmt.Fprintf(buffer, "\tserver.Route(%q, %q, func(ctx context.Context, body []byte) ([]byte, error) {\n", fullServiceName, method.protoName)
-		fmt.Fprintf(buffer, "\t\trequest := &%s{}\n", strings.TrimPrefix(method.inputType, "*"))
-		buffer.WriteString("\t\tif err := trevrpc.UnmarshalMessage(body, request); err != nil {\n")
-		buffer.WriteString("\t\t\treturn nil, trevrpc.InvalidArgument(\"failed to decode request: \"+err.Error())\n")
-		buffer.WriteString("\t\t}\n")
-		fmt.Fprintf(buffer, "\t\tresponse, err := implementation.%s(ctx, request)\n", method.name)
-		buffer.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
-		buffer.WriteString("\t\tif response == nil {\n\t\t\treturn nil, trevrpc.Internal(\"handler returned nil response\")\n\t\t}\n")
-		buffer.WriteString("\t\treturn trevrpc.MarshalMessage(response)\n")
-		buffer.WriteString("\t})\n")
-		return
-	}
-
-	kind := "trevrpc.RpcKindServerStreaming"
-	if method.clientStreaming && method.serverStreaming {
-		kind = "trevrpc.RpcKindBidirectionalStreaming"
-	} else if method.clientStreaming {
-		kind = "trevrpc.RpcKindClientStreaming"
-	}
-
-	fmt.Fprintf(buffer, "\tserver.RouteStreaming(%q, %q, %s, func(ctx context.Context, body []byte, requests trevrpc.ByteStream) (trevrpc.ByteStream, error) {\n", fullServiceName, method.protoName, kind)
-	if method.clientStreaming {
-		fmt.Fprintf(buffer, "\t\trequestStream := trevrpc.DecodeStream[%s](requests, func() %s { return &%s{} })\n", method.inputType, method.inputType, strings.TrimPrefix(method.inputType, "*"))
+	if clone.GetParameter() == "" {
+		clone.Parameter = new("paths=source_relative")
 	} else {
-		fmt.Fprintf(buffer, "\t\trequest := &%s{}\n", strings.TrimPrefix(method.inputType, "*"))
-		buffer.WriteString("\t\tif err := trevrpc.UnmarshalMessage(body, request); err != nil {\n")
-		buffer.WriteString("\t\t\treturn nil, trevrpc.InvalidArgument(\"failed to decode request: \"+err.Error())\n")
-		buffer.WriteString("\t\t}\n")
+		clone.Parameter = new(clone.GetParameter() + ",paths=source_relative")
 	}
-
-	switch {
-	case method.clientStreaming && method.serverStreaming:
-		fmt.Fprintf(buffer, "\t\tresponseStream, err := implementation.%s(ctx, requestStream)\n", method.name)
-		buffer.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
-		fmt.Fprintf(buffer, "\t\treturn trevrpc.EncodeStream[%s](responseStream), nil\n", method.outputType)
-	case method.clientStreaming:
-		fmt.Fprintf(buffer, "\t\tresponse, err := implementation.%s(ctx, requestStream)\n", method.name)
-		buffer.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
-		buffer.WriteString("\t\tif response == nil {\n\t\t\treturn nil, trevrpc.Internal(\"handler returned nil response\")\n\t\t}\n")
-		buffer.WriteString("\t\treturn trevrpc.SingleMessageStream(response), nil\n")
-	case method.serverStreaming:
-		fmt.Fprintf(buffer, "\t\tresponseStream, err := implementation.%s(ctx, request)\n", method.name)
-		buffer.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
-		fmt.Fprintf(buffer, "\t\treturn trevrpc.EncodeStream[%s](responseStream), nil\n", method.outputType)
-	}
-	buffer.WriteString("\t})\n")
+	return clone
 }
 
-func goTypeFor(file *descriptor.FileDescriptorProto, protoName string, index typeIndex, imports map[string]string) (string, error) {
-	if !strings.HasPrefix(protoName, ".") {
-		protoName = "." + file.GetPackage() + "." + protoName
-	}
-
-	typeRef, ok := index[protoName]
-	if !ok {
-		return "", fmt.Errorf("unknown protobuf message type %q", protoName)
-	}
-
-	currentImport := fileGoImportPath(file)
-	currentPackage := fileGoPackageName(file)
-	if typeRef.goImport == "" || typeRef.goImport == currentImport || typeRef.goPackage == currentPackage {
-		return "*" + typeRef.goIdent, nil
-	}
-
-	alias := uniqueImportAlias(typeRef.goPackage, imports)
-	imports[alias] = typeRef.goImport
-	return "*" + alias + "." + typeRef.goIdent, nil
+type fileGenerator struct {
+	generated *protogen.GeneratedFile
+	options   pluginOptions
 }
 
-func uniqueImportAlias(base string, imports map[string]string) string {
-	alias := sanitizeIdentifier(base)
-	if alias == "" {
-		alias = "protoimport"
-	}
-	if _, exists := imports[alias]; !exists {
-		return alias
-	}
+func generateFile(plugin *protogen.Plugin, file *protogen.File, options pluginOptions) error {
+	generated := plugin.NewGeneratedFile(file.GeneratedFilenamePrefix+options.fileSuffix, file.GoImportPath)
+	g := fileGenerator{generated: generated, options: options}
+	generated.P("// Code generated by protoc-gen-trevrpc-go. DO NOT EDIT.")
+	generated.P()
+	generated.P("package ", file.GoPackageName)
+	generated.P()
 
-	for i := 2; ; i++ {
-		candidate := fmt.Sprintf("%s%d", alias, i)
-		if _, exists := imports[candidate]; !exists {
-			return candidate
-		}
+	for _, service := range file.Services {
+		g.generateService(service)
 	}
+	return nil
 }
 
-func outputFileName(inputName, suffix string) string {
-	ext := path.Ext(inputName)
-	return strings.TrimSuffix(inputName, ext) + suffix
-}
-
-func fullProtoName(protoPackage string, names []string) string {
-	parts := make([]string, 0, len(names)+1)
-	if protoPackage != "" {
-		parts = append(parts, protoPackage)
-	}
-	parts = append(parts, names...)
-	return "." + strings.Join(parts, ".")
-}
-
-func fileGoPackageName(file *descriptor.FileDescriptorProto) string {
-	goPackage := file.GetOptions().GetGoPackage()
-	if _, name, ok := strings.Cut(goPackage, ";"); ok {
-		return sanitizeIdentifier(name)
-	}
-
-	if goPackage != "" {
-		base := path.Base(goPackage)
-		if base != "." && base != "/" {
-			return sanitizeIdentifier(base)
-		}
-	}
-
-	if file.GetPackage() != "" {
-		parts := strings.Split(file.GetPackage(), ".")
-		return sanitizeIdentifier(parts[len(parts)-1])
-	}
-
-	return "proto"
-}
-
-func fileGoImportPath(file *descriptor.FileDescriptorProto) string {
-	goPackage := file.GetOptions().GetGoPackage()
-	if importPath, _, ok := strings.Cut(goPackage, ";"); ok {
-		return importPath
-	}
-
-	if strings.Contains(goPackage, "/") {
-		return goPackage
-	}
-
-	return ""
-}
-
-func goExportedName(name string) string {
-	if name == "" {
-		return "X"
-	}
-
-	parts := strings.FieldsFunc(name, func(r rune) bool {
-		return r == '_' || r == '-' || r == '.'
-	})
-	for i, part := range parts {
-		if part == "" {
+func validateGeneratedNames(files []*protogen.File, options pluginOptions) error {
+	packageOwners := make(map[protogen.GoImportPath]map[string]*protogen.Service)
+	for _, file := range files {
+		if !file.Generate || len(file.Services) == 0 {
 			continue
 		}
+		owners := packageOwners[file.GoImportPath]
+		if owners == nil {
+			owners = make(map[string]*protogen.Service)
+			packageOwners[file.GoImportPath] = owners
+		}
 
-		runes := []rune(part)
-		runes[0] = unicode.ToUpper(runes[0])
-		parts[i] = string(runes)
-	}
-
-	return strings.Join(parts, "")
-}
-
-func sanitizeIdentifier(name string) string {
-	if name == "" {
-		return ""
-	}
-
-	var builder strings.Builder
-	for i, r := range name {
-		if r == '_' || unicode.IsLetter(r) || (i > 0 && unicode.IsDigit(r)) {
-			builder.WriteRune(r)
+		for _, service := range file.Services {
+			if err := validateGeneratedMethodNames(service); err != nil {
+				return err
+			}
+			for _, generatedName := range generatedServiceNames(service, options) {
+				if owner, exists := owners[generatedName]; exists && owner != service {
+					return fmt.Errorf("go package %s services %s and %s both require generated declaration %s", file.GoImportPath, owner.Desc.FullName(), service.Desc.FullName(), generatedName)
+				}
+				owners[generatedName] = service
+			}
 		}
 	}
+	return nil
+}
 
-	result := builder.String()
-	if result == "" {
-		return "_"
+func generatedServiceNames(service *protogen.Service, options pluginOptions) []string {
+	serviceName := options.servicePrefix + service.GoName
+	serverName := serviceName + "Server"
+	clientName := serviceName + "Client"
+	names := []string{
+		serverName,
+		clientName,
+		"New" + clientName,
+		"Register" + serverName,
+		"(*" + clientName + ").mergedCallOptions",
+	}
+	for _, method := range service.Methods {
+		for _, methodName := range generatedClientMethodNames(method) {
+			names = append(names, "(*"+clientName+")."+methodName)
+		}
+	}
+	return names
+}
+
+func validateGeneratedMethodNames(service *protogen.Service) error {
+	owners := make(map[string]*protogen.Method)
+	for _, method := range service.Methods {
+		for _, generatedName := range generatedClientMethodNames(method) {
+			if owner, exists := owners[generatedName]; exists && owner != method {
+				return fmt.Errorf("service %s RPC methods %s and %s (%s and %s) both require generated Go method %s", service.Desc.FullName(), owner.GoName, method.GoName, owner.Desc.FullName(), method.Desc.FullName(), generatedName)
+			}
+			owners[generatedName] = method
+		}
+	}
+	return nil
+}
+
+func generatedClientMethodNames(method *protogen.Method) []string {
+	names := []string{method.GoName, method.GoName + "Response"}
+	if method.Desc.IsStreamingClient() {
+		names = append(names, method.GoName+"FromStream", method.GoName+"FromStreamResponse")
+	}
+	return names
+}
+
+func (g fileGenerator) generateService(service *protogen.Service) {
+	serviceName := g.options.servicePrefix + service.GoName
+	serverName := serviceName + "Server"
+	clientName := serviceName + "Client"
+	fullServiceName := string(service.Desc.FullName())
+	contextType := g.qualified(protogen.GoImportPath("context").Ident("Context"))
+
+	g.generated.P("// ", serverName, " handles the ", service.GoName, " service.")
+	g.generated.P("type ", serverName, " interface {")
+	for _, method := range service.Methods {
+		g.generated.P("// ", method.GoName, " handles the ", method.Desc.Name(), " RPC.")
+		g.generated.P(method.GoName, "(", contextType, ", ", g.serverRequestType(method), ") (", g.serverResponseType(method), ", error)")
+	}
+	g.generated.P("}")
+	g.generated.P()
+
+	g.generated.P("// ", clientName, " calls the ", service.GoName, " service.")
+	g.generated.P("type ", clientName, " struct {")
+	g.generated.P("transport ", g.runtime("Transport"))
+	g.generated.P("options []", g.runtime("CallOption"))
+	g.generated.P("}")
+	g.generated.P()
+	g.generated.P("// New", clientName, " creates a client for the ", service.GoName, " service.")
+	g.generated.P("func New", clientName, "(transport ", g.runtime("Transport"), ", options ...", g.runtime("CallOption"), ") *", clientName, " {")
+	g.generated.P("return &", clientName, "{transport: transport, options: options}")
+	g.generated.P("}")
+	g.generated.P()
+	g.generateMergeOptions(clientName)
+
+	for _, method := range service.Methods {
+		g.generateClientMethods(clientName, fullServiceName, method)
 	}
 
-	if unicode.IsDigit([]rune(result)[0]) {
-		return "_" + result
+	g.generated.P("// Register", serverName, " registers handlers for the ", service.GoName, " service.")
+	g.generated.P("func Register", serverName, "(server *", g.runtime("Server"), ", implementation ", serverName, ") {")
+	for _, method := range service.Methods {
+		g.generateServerRegistration(fullServiceName, method)
 	}
+	g.generated.P("}")
+	g.generated.P()
+}
 
-	return result
+func (g fileGenerator) generateMergeOptions(clientName string) {
+	callOption := g.runtime("CallOption")
+	g.generated.P("func (c *", clientName, ") mergedCallOptions(overrides []", callOption, ") []", callOption, " {")
+	g.generated.P("if len(c.options) == 0 {")
+	g.generated.P("return overrides")
+	g.generated.P("}")
+	g.generated.P("if len(overrides) == 0 {")
+	g.generated.P("return c.options")
+	g.generated.P("}")
+	g.generated.P("merged := make([]", callOption, ", 0, len(c.options)+len(overrides))")
+	g.generated.P("merged = append(merged, c.options...)")
+	g.generated.P("merged = append(merged, overrides...)")
+	g.generated.P("return merged")
+	g.generated.P("}")
+	g.generated.P()
+}
+
+func (g fileGenerator) generateClientMethods(clientName, serviceName string, method *protogen.Method) {
+	contextType := g.qualified(protogen.GoImportPath("context").Ident("Context"))
+	inputType := g.messageType(method.Input)
+	outputType := g.messageType(method.Output)
+	factory := g.messageFactory(method.Output)
+	options := "options ..." + g.runtime("CallOption")
+	merged := "c.mergedCallOptions(options)..."
+	methodName := method.GoName
+	protoMethodName := string(method.Desc.Name())
+
+	g.generated.P("// ", methodName, " calls the ", method.Desc.Name(), " RPC.")
+	switch {
+	case method.Desc.IsStreamingClient() && method.Desc.IsStreamingServer():
+		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", ", options, ") (", g.runtime("BidirectionalStreamingCall"), "[", inputType, ", ", outputType, "], error) {")
+		g.generated.P("return ", g.runtime("BidirectionalStreaming"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", ", factory, ", ", merged, ")")
+		g.generated.P("}")
+		g.generated.P()
+		g.generated.P("// ", methodName, "Response calls the ", method.Desc.Name(), " RPC and exposes terminal metadata.")
+		g.generated.P("func (c *", clientName, ") ", methodName, "Response(ctx ", contextType, ", ", options, ") (", g.runtime("BidirectionalStreamingResponseCall"), "[", inputType, ", ", outputType, "], error) {")
+		g.generated.P("return ", g.runtime("BidirectionalStreamingResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", ", factory, ", ", merged, ")")
+		g.generated.P("}")
+		g.generated.P()
+		g.generateBidiFromStreamMethods(clientName, serviceName, protoMethodName, methodName, contextType, inputType, outputType, factory, options, merged)
+	case method.Desc.IsStreamingClient():
+		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", ", options, ") (", g.runtime("ClientStreamingCall"), "[", inputType, ", ", outputType, "], error) {")
+		g.generated.P("return ", g.runtime("ClientStreaming"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", ", factory, ", ", merged, ")")
+		g.generated.P("}")
+		g.generated.P()
+		g.generated.P("// ", methodName, "Response calls the ", method.Desc.Name(), " RPC and exposes response metadata.")
+		g.generated.P("func (c *", clientName, ") ", methodName, "Response(ctx ", contextType, ", ", options, ") (", g.runtime("ClientStreamingResponseCall"), "[", inputType, ", ", outputType, "], error) {")
+		g.generated.P("return ", g.runtime("ClientStreamingResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", ", factory, ", ", merged, ")")
+		g.generated.P("}")
+		g.generated.P()
+		g.generateClientFromStreamMethods(clientName, serviceName, protoMethodName, methodName, contextType, inputType, outputType, factory, options, merged)
+	case method.Desc.IsStreamingServer():
+		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", request ", inputType, ", ", options, ") (", g.runtime("MessageStream"), "[", outputType, "], error) {")
+		g.generated.P("return ", g.runtime("ServerStreaming"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", request, ", factory, ", ", merged, ")")
+		g.generated.P("}")
+		g.generated.P()
+		g.generated.P("// ", methodName, "Response calls the ", method.Desc.Name(), " RPC and exposes terminal metadata.")
+		g.generated.P("func (c *", clientName, ") ", methodName, "Response(ctx ", contextType, ", request ", inputType, ", ", options, ") (", g.runtime("ResponseStream"), "[", outputType, "], error) {")
+		g.generated.P("return ", g.runtime("ServerStreamingResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", request, ", factory, ", ", merged, ")")
+		g.generated.P("}")
+		g.generated.P()
+	default:
+		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", request ", inputType, ", ", options, ") (", outputType, ", error) {")
+		g.generated.P("return ", g.runtime("Unary"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", request, ", factory, ", ", merged, ")")
+		g.generated.P("}")
+		g.generated.P()
+		g.generated.P("// ", methodName, "Response calls the ", method.Desc.Name(), " RPC and exposes response metadata.")
+		g.generated.P("func (c *", clientName, ") ", methodName, "Response(ctx ", contextType, ", request ", inputType, ", ", options, ") (*", g.runtime("Response"), "[", outputType, "], error) {")
+		g.generated.P("return ", g.runtime("UnaryResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", request, ", factory, ", ", merged, ")")
+		g.generated.P("}")
+		g.generated.P()
+	}
+}
+
+func (g fileGenerator) generateClientFromStreamMethods(clientName, serviceName, protoMethodName, methodName, contextType, inputType, outputType, factory, options, merged string) {
+	requests := "requests " + g.runtime("MessageStream") + "[" + inputType + "]"
+	g.generated.P("// ", methodName, "FromStream calls the ", protoMethodName, " RPC from an existing request stream.")
+	g.generated.P("func (c *", clientName, ") ", methodName, "FromStream(ctx ", contextType, ", ", requests, ", ", options, ") (", outputType, ", error) {")
+	g.generated.P("return ", g.runtime("ClientStreamingFromStream"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", requests, ", factory, ", ", merged, ")")
+	g.generated.P("}")
+	g.generated.P()
+	g.generated.P("// ", methodName, "FromStreamResponse calls the ", protoMethodName, " RPC and exposes response metadata.")
+	g.generated.P("func (c *", clientName, ") ", methodName, "FromStreamResponse(ctx ", contextType, ", ", requests, ", ", options, ") (*", g.runtime("Response"), "[", outputType, "], error) {")
+	g.generated.P("return ", g.runtime("ClientStreamingFromStreamResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", requests, ", factory, ", ", merged, ")")
+	g.generated.P("}")
+	g.generated.P()
+}
+
+func (g fileGenerator) generateBidiFromStreamMethods(clientName, serviceName, protoMethodName, methodName, contextType, inputType, outputType, factory, options, merged string) {
+	requests := "requests " + g.runtime("MessageStream") + "[" + inputType + "]"
+	g.generated.P("// ", methodName, "FromStream calls the ", protoMethodName, " RPC from an existing request stream.")
+	g.generated.P("func (c *", clientName, ") ", methodName, "FromStream(ctx ", contextType, ", ", requests, ", ", options, ") (", g.runtime("MessageStream"), "[", outputType, "], error) {")
+	g.generated.P("return ", g.runtime("BidirectionalStreamingFromStream"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", requests, ", factory, ", ", merged, ")")
+	g.generated.P("}")
+	g.generated.P()
+	g.generated.P("// ", methodName, "FromStreamResponse calls the ", protoMethodName, " RPC and exposes terminal metadata.")
+	g.generated.P("func (c *", clientName, ") ", methodName, "FromStreamResponse(ctx ", contextType, ", ", requests, ", ", options, ") (", g.runtime("ResponseStream"), "[", outputType, "], error) {")
+	g.generated.P("return ", g.runtime("BidirectionalStreamingFromStreamResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", requests, ", factory, ", ", merged, ")")
+	g.generated.P("}")
+	g.generated.P()
+}
+
+func (g fileGenerator) generateServerRegistration(serviceName string, method *protogen.Method) {
+	inputType := g.messageType(method.Input)
+	outputType := g.messageType(method.Output)
+	factory := g.messageFactory(method.Input)
+	var helper string
+	switch {
+	case method.Desc.IsStreamingClient() && method.Desc.IsStreamingServer():
+		helper = g.runtime("RegisterBidirectionalStreamingResponse")
+	case method.Desc.IsStreamingClient():
+		helper = g.runtime("RegisterClientStreamingResponse")
+	case method.Desc.IsStreamingServer():
+		helper = g.runtime("RegisterServerStreamingResponse")
+	default:
+		helper = g.runtime("RegisterUnaryResponse")
+	}
+	g.generated.P(helper, "[", inputType, ", ", outputType, "](server, ", quoted(serviceName), ", ", quoted(string(method.Desc.Name())), ", ", factory, ", implementation.", method.GoName, ")")
+}
+
+func (g fileGenerator) serverRequestType(method *protogen.Method) string {
+	if method.Desc.IsStreamingClient() {
+		return g.runtime("MessageStream") + "[" + g.messageType(method.Input) + "]"
+	}
+	return g.messageType(method.Input)
+}
+
+func (g fileGenerator) serverResponseType(method *protogen.Method) string {
+	outputType := g.messageType(method.Output)
+	if method.Desc.IsStreamingServer() {
+		return g.runtime("ResponseStream") + "[" + outputType + "]"
+	}
+	return "*" + g.runtime("Response") + "[" + outputType + "]"
+}
+
+func (g fileGenerator) messageType(message *protogen.Message) string {
+	return "*" + g.qualified(message.GoIdent)
+}
+
+func (g fileGenerator) messageFactory(message *protogen.Message) string {
+	typeName := g.qualified(message.GoIdent)
+	return "func() *" + typeName + " { return &" + typeName + "{} }"
+}
+
+func (g fileGenerator) runtime(name string) string {
+	return g.qualified(g.options.runtimeImport.Ident(name))
+}
+
+func (g fileGenerator) qualified(ident protogen.GoIdent) string {
+	return g.generated.QualifiedGoIdent(ident)
+}
+
+func quoted(value string) string {
+	return fmt.Sprintf("%q", value)
 }

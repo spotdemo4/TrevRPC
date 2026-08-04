@@ -39,18 +39,18 @@ var (
 
 type greeterService struct{}
 
-func (greeterService) SayHello(_ context.Context, request *greeter.HelloRequest) (*greeter.HelloReply, error) {
-	return &greeter.HelloReply{Message: "hello " + request.Name}, nil
+func (greeterService) SayHello(_ context.Context, request *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) {
+	return trevrpc.NewResponse(&greeter.HelloReply{Message: "hello " + request.Name}), nil
 }
 
-func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
-	return trevrpc.FromSlice(
+func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.ResponseStream[*greeter.HelloReply], error) {
+	return trevrpc.NewResponseStream(trevrpc.FromSlice(
 		&greeter.HelloReply{Message: "hello " + request.Name},
 		&greeter.HelloReply{Message: "welcome to TrevRPC over QUIC"},
-	), nil
+	)), nil
 }
 
-func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*greeter.HelloReply, error) {
+func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*trevrpc.Response[*greeter.HelloReply], error) {
 	var names []string
 	for request, err := range trevrpc.Messages(requests) {
 		if err != nil {
@@ -61,14 +61,14 @@ func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.Messag
 	}
 
 	if len(names) == 0 {
-		return &greeter.HelloReply{Message: "hello, nobody"}, nil
+		return trevrpc.NewResponse(&greeter.HelloReply{Message: "hello, nobody"}), nil
 	}
 
-	return &greeter.HelloReply{Message: "hello, " + strings.Join(names, ", ")}, nil
+	return trevrpc.NewResponse(&greeter.HelloReply{Message: "hello, " + strings.Join(names, ", ")}), nil
 }
 
-func (greeterService) BidiHello(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (trevrpc.MessageStream[*greeter.HelloReply], error) {
-	return &echoReplies{requests: requests}, nil
+func (greeterService) BidiHello(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (trevrpc.ResponseStream[*greeter.HelloReply], error) {
+	return trevrpc.NewResponseStream[*greeter.HelloReply](&echoReplies{requests: requests}), nil
 }
 
 type echoReplies struct {

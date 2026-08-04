@@ -52,22 +52,24 @@ func Listen(addr string, server *Server, options ListenOptions) (ServerListener,
 	if server == nil {
 		return nil, InvalidArgument("server is nil")
 	}
+	runtime := server.freeze()
 	if options.TLSConfig == nil {
 		return nil, InvalidArgument("quic-go listener requires TLSConfig")
 	}
-	serverOptions := server.Options()
+	serverOptions := runtime.options
 	config := QUICServerConfig(serverOptions, options.QUICConfig)
 	applyDefaultQUICTransportConfig(config, mergeTransportConfig(transportConfigFromServerOptions(serverOptions), options.Transport))
 	listener, err := quic.ListenAddr(addr, options.TLSConfig, config)
 	if err != nil {
 		return nil, transportStatus(err)
 	}
-	return &quicServerListener{listener: listener, server: server}, nil
+	return &quicServerListener{listener: listener, server: server, runtime: runtime}, nil
 }
 
 type quicServerListener struct {
 	listener *quic.Listener
 	server   *Server
+	runtime  *serverRuntime
 }
 
 func (l *quicServerListener) Addr() net.Addr {

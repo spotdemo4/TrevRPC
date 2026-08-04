@@ -31,10 +31,10 @@ func (m *HelloReply) String() string { return m.Message }
 func (*HelloReply) ProtoMessage()    {}
 
 type GreeterServer interface {
-	SayHello(context.Context, *HelloRequest) (*HelloReply, error)
-	LotsOfReplies(context.Context, *HelloRequest) (trevrpc.MessageStream[*HelloReply], error)
-	LotsOfGreetings(context.Context, trevrpc.MessageStream[*HelloRequest]) (*HelloReply, error)
-	BidiHello(context.Context, trevrpc.MessageStream[*HelloRequest]) (trevrpc.MessageStream[*HelloReply], error)
+	SayHello(context.Context, *HelloRequest) (*trevrpc.Response[*HelloReply], error)
+	LotsOfReplies(context.Context, *HelloRequest) (trevrpc.ResponseStream[*HelloReply], error)
+	LotsOfGreetings(context.Context, trevrpc.MessageStream[*HelloRequest]) (*trevrpc.Response[*HelloReply], error)
+	BidiHello(context.Context, trevrpc.MessageStream[*HelloRequest]) (trevrpc.ResponseStream[*HelloReply], error)
 }
 
 type GreeterClient struct {
@@ -46,95 +46,70 @@ func NewGreeterClient(transport trevrpc.Transport, options ...trevrpc.CallOption
 	return &GreeterClient{transport: transport, options: options}
 }
 
+func (c *GreeterClient) mergedCallOptions(overrides []trevrpc.CallOption) []trevrpc.CallOption {
+	if len(c.options) == 0 {
+		return overrides
+	}
+	if len(overrides) == 0 {
+		return c.options
+	}
+	merged := make([]trevrpc.CallOption, 0, len(c.options)+len(overrides))
+	merged = append(merged, c.options...)
+	merged = append(merged, overrides...)
+	return merged
+}
+
 func (c *GreeterClient) SayHello(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (*HelloReply, error) {
-	return trevrpc.Unary[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodSayHello, request, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
+	return trevrpc.Unary[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodSayHello, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+}
+
+func (c *GreeterClient) SayHelloResponse(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (*trevrpc.Response[*HelloReply], error) {
+	return trevrpc.UnaryResponse[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodSayHello, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 func (c *GreeterClient) LotsOfReplies(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (trevrpc.MessageStream[*HelloReply], error) {
-	return trevrpc.ServerStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfReplies, request, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
+	return trevrpc.ServerStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfReplies, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+}
+
+func (c *GreeterClient) LotsOfRepliesResponse(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (trevrpc.ResponseStream[*HelloReply], error) {
+	return trevrpc.ServerStreamingResponse[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfReplies, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 func (c *GreeterClient) LotsOfGreetings(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*HelloRequest, *HelloReply], error) {
-	return trevrpc.ClientStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfGreetings, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
+	return trevrpc.ClientStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfGreetings, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+}
+
+func (c *GreeterClient) LotsOfGreetingsResponse(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.ClientStreamingResponseCall[*HelloRequest, *HelloReply], error) {
+	return trevrpc.ClientStreamingResponse[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfGreetings, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 func (c *GreeterClient) LotsOfGreetingsFromStream(ctx context.Context, requests trevrpc.MessageStream[*HelloRequest], options ...trevrpc.CallOption) (*HelloReply, error) {
-	return trevrpc.ClientStreamingFromStream[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfGreetings, requests, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
+	return trevrpc.ClientStreamingFromStream[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfGreetings, requests, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+}
+
+func (c *GreeterClient) LotsOfGreetingsFromStreamResponse(ctx context.Context, requests trevrpc.MessageStream[*HelloRequest], options ...trevrpc.CallOption) (*trevrpc.Response[*HelloReply], error) {
+	return trevrpc.ClientStreamingFromStreamResponse[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfGreetings, requests, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 func (c *GreeterClient) BidiHello(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*HelloRequest, *HelloReply], error) {
-	return trevrpc.BidirectionalStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodBidiHello, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
+	return trevrpc.BidirectionalStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodBidiHello, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+}
+
+func (c *GreeterClient) BidiHelloResponse(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingResponseCall[*HelloRequest, *HelloReply], error) {
+	return trevrpc.BidirectionalStreamingResponse[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodBidiHello, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 func (c *GreeterClient) BidiHelloFromStream(ctx context.Context, requests trevrpc.MessageStream[*HelloRequest], options ...trevrpc.CallOption) (trevrpc.MessageStream[*HelloReply], error) {
-	return trevrpc.BidirectionalStreamingFromStream[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodBidiHello, requests, func() *HelloReply { return &HelloReply{} }, mergeOptions(c.options, options)...)
+	return trevrpc.BidirectionalStreamingFromStream[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodBidiHello, requests, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+}
+
+func (c *GreeterClient) BidiHelloFromStreamResponse(ctx context.Context, requests trevrpc.MessageStream[*HelloRequest], options ...trevrpc.CallOption) (trevrpc.ResponseStream[*HelloReply], error) {
+	return trevrpc.BidirectionalStreamingFromStreamResponse[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodBidiHello, requests, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 func RegisterGreeterServer(server *trevrpc.Server, implementation GreeterServer) {
-	server.Route(ServiceName, MethodSayHello, func(ctx context.Context, body []byte) ([]byte, error) {
-		request := &HelloRequest{}
-		if err := trevrpc.UnmarshalMessage(body, request); err != nil {
-			return nil, trevrpc.InvalidArgument("failed to decode request: " + err.Error())
-		}
-
-		response, err := implementation.SayHello(ctx, request)
-		if err != nil {
-			return nil, err
-		}
-		if response == nil {
-			return nil, trevrpc.Internal("handler returned nil response")
-		}
-
-		return trevrpc.MarshalMessage(response)
-	})
-
-	server.RouteStreaming(ServiceName, MethodLotsOfReplies, trevrpc.RpcKindServerStreaming, func(ctx context.Context, body []byte, _ trevrpc.ByteStream) (trevrpc.ByteStream, error) {
-		request := &HelloRequest{}
-		if err := trevrpc.UnmarshalMessage(body, request); err != nil {
-			return nil, trevrpc.InvalidArgument("failed to decode request: " + err.Error())
-		}
-
-		responses, err := implementation.LotsOfReplies(ctx, request)
-		if err != nil {
-			return nil, err
-		}
-
-		return trevrpc.EncodeStream[*HelloReply](responses), nil
-	})
-
-	server.RouteStreaming(ServiceName, MethodLotsOfGreetings, trevrpc.RpcKindClientStreaming, func(ctx context.Context, _ []byte, requests trevrpc.ByteStream) (trevrpc.ByteStream, error) {
-		requestStream := trevrpc.DecodeStream[*HelloRequest](requests, func() *HelloRequest { return &HelloRequest{} })
-		response, err := implementation.LotsOfGreetings(ctx, requestStream)
-		if err != nil {
-			return nil, err
-		}
-		if response == nil {
-			return nil, trevrpc.Internal("handler returned nil response")
-		}
-
-		return trevrpc.SingleMessageStream(response), nil
-	})
-
-	server.RouteStreaming(ServiceName, MethodBidiHello, trevrpc.RpcKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests trevrpc.ByteStream) (trevrpc.ByteStream, error) {
-		requestStream := trevrpc.DecodeStream[*HelloRequest](requests, func() *HelloRequest { return &HelloRequest{} })
-		responses, err := implementation.BidiHello(ctx, requestStream)
-		if err != nil {
-			return nil, err
-		}
-
-		return trevrpc.EncodeStream[*HelloReply](responses), nil
-	})
-}
-
-func mergeOptions(base []trevrpc.CallOption, override []trevrpc.CallOption) []trevrpc.CallOption {
-	if len(base) == 0 {
-		return override
-	}
-	if len(override) == 0 {
-		return base
-	}
-	merged := make([]trevrpc.CallOption, 0, len(base)+len(override))
-	merged = append(merged, base...)
-	merged = append(merged, override...)
-	return merged
+	trevrpc.RegisterUnaryResponse[*HelloRequest, *HelloReply](server, ServiceName, MethodSayHello, func() *HelloRequest { return &HelloRequest{} }, implementation.SayHello)
+	trevrpc.RegisterServerStreamingResponse[*HelloRequest, *HelloReply](server, ServiceName, MethodLotsOfReplies, func() *HelloRequest { return &HelloRequest{} }, implementation.LotsOfReplies)
+	trevrpc.RegisterClientStreamingResponse[*HelloRequest, *HelloReply](server, ServiceName, MethodLotsOfGreetings, func() *HelloRequest { return &HelloRequest{} }, implementation.LotsOfGreetings)
+	trevrpc.RegisterBidirectionalStreamingResponse[*HelloRequest, *HelloReply](server, ServiceName, MethodBidiHello, func() *HelloRequest { return &HelloRequest{} }, implementation.BidiHello)
 }

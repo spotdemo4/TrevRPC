@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -186,6 +187,14 @@ func (c *Channel) State() ChannelState {
 // Generation returns the latest successfully established connection generation.
 func (c *Channel) Generation() uint64 {
 	return c.Snapshot().Generation
+}
+
+// DroppedEventCount returns the number of lifecycle events dropped by the bounded callback queue.
+func (c *Channel) DroppedEventCount() uint64 {
+	if c == nil || c.events == nil {
+		return 0
+	}
+	return c.events.dropped.Load()
 }
 
 // Snapshot returns a coherent connectivity state and connection generation.
@@ -487,11 +496,12 @@ func (realReconnectClock) Sleep(ctx context.Context, delay time.Duration) error 
 }
 
 type channelEventDispatcher struct {
-	hook   func(ChannelEvent)
-	mu     sync.Mutex
-	queue  []ChannelEvent
-	wake   chan struct{}
-	closed bool
+	hook    func(ChannelEvent)
+	mu      sync.Mutex
+	queue   []ChannelEvent
+	wake    chan struct{}
+	closed  bool
+	dropped atomic.Uint64
 }
 
 func newChannelEventDispatcher(hook func(ChannelEvent)) *channelEventDispatcher {
@@ -512,6 +522,7 @@ func (d *channelEventDispatcher) emit(event ChannelEvent) {
 		if len(d.queue) == channelEventQueueCapacity {
 			copy(d.queue, d.queue[1:])
 			d.queue = d.queue[:channelEventQueueCapacity-1]
+			d.dropped.Add(1)
 		}
 		d.queue = append(d.queue, event)
 	}
@@ -528,6 +539,7 @@ func (d *channelEventDispatcher) close(event ChannelEvent) {
 		if len(d.queue) == channelEventQueueCapacity {
 			copy(d.queue, d.queue[1:])
 			d.queue = d.queue[:channelEventQueueCapacity-1]
+			d.dropped.Add(1)
 		}
 		d.queue = append(d.queue, event)
 		d.closed = true
@@ -553,7 +565,10 @@ func (d *channelEventDispatcher) run() {
 			event := d.queue[0]
 			d.queue = d.queue[1:]
 			d.mu.Unlock()
-			d.hook(event)
+			func() {
+				defer func() { _ = recover() }()
+				d.hook(event)
+			}()
 			continue
 		}
 		closed := d.closed

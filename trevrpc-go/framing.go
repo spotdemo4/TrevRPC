@@ -2,11 +2,14 @@ package trevrpc
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/protoadapt"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // DefaultMaxFrameSize is the default maximum TrevRPC frame body size in bytes.
@@ -80,7 +83,11 @@ func MarshalMessage(message ProtoMessage) ([]byte, error) {
 
 // UnmarshalMessage decodes a protobuf message body into message.
 func UnmarshalMessage(body []byte, message ProtoMessage) error {
-	return proto.Unmarshal(body, protoMessageV2(message))
+	protoMessage := protoMessageV2(message)
+	if err := preflightWireMessage(body, protoMessage.ProtoReflect().Descriptor()); err != nil {
+		return err
+	}
+	return proto.Unmarshal(body, protoMessage)
 }
 
 func protoMessageV2(message ProtoMessage) proto.Message {
@@ -209,6 +216,126 @@ func DecodeFrame(body []byte, message ProtoMessage) error {
 	}
 
 	return nil
+}
+
+const maxPreflightMessageDepth = 100
+
+func preflightWireMessage(data []byte, descriptor protoreflect.MessageDescriptor) error {
+	return preflightWireMessageDepth(data, descriptor, 0)
+}
+
+func preflightWireMessageDepth(data []byte, descriptor protoreflect.MessageDescriptor, depth int) error {
+	if depth > maxPreflightMessageDepth {
+		return errors.New("protobuf message nesting exceeded limit")
+	}
+
+	for len(data) > 0 {
+		fieldNumber, wireType, tagLength := protowire.ConsumeTag(data)
+		if tagLength < 0 || fieldNumber <= 0 {
+			return errors.New("invalid protobuf field tag")
+		}
+		data = data[tagLength:]
+
+		field := descriptor.Fields().ByNumber(fieldNumber)
+		if field == nil {
+			valueLength := protowire.ConsumeFieldValue(fieldNumber, wireType, data)
+			if valueLength < 0 {
+				return fmt.Errorf("invalid protobuf field %d", fieldNumber)
+			}
+			data = data[valueLength:]
+			continue
+		}
+
+		expected := protobufWireType(field.Kind())
+		packed := field.IsList() && isPackableProtobufKind(field.Kind()) && wireType == protowire.BytesType
+		if wireType != expected && !packed {
+			return fmt.Errorf("known field %d used wire type %d; expected %d", fieldNumber, wireType, expected)
+		}
+
+		if packed {
+			packedData, valueLength := protowire.ConsumeBytes(data)
+			if valueLength < 0 || !preflightPackedValues(packedData, expected) {
+				return fmt.Errorf("invalid packed protobuf field %d", fieldNumber)
+			}
+			data = data[valueLength:]
+			continue
+		}
+
+		if field.Kind() == protoreflect.MessageKind {
+			nested, valueLength := protowire.ConsumeBytes(data)
+			if valueLength < 0 {
+				return fmt.Errorf("invalid protobuf message field %d", fieldNumber)
+			}
+			if err := preflightWireMessageDepth(nested, field.Message(), depth+1); err != nil {
+				return fmt.Errorf("invalid protobuf message field %d: %w", fieldNumber, err)
+			}
+			data = data[valueLength:]
+			continue
+		}
+		if field.Kind() == protoreflect.GroupKind {
+			nested, valueLength := protowire.ConsumeGroup(fieldNumber, data)
+			if valueLength < 0 {
+				return fmt.Errorf("invalid protobuf group field %d", fieldNumber)
+			}
+			if err := preflightWireMessageDepth(nested, field.Message(), depth+1); err != nil {
+				return fmt.Errorf("invalid protobuf group field %d: %w", fieldNumber, err)
+			}
+			data = data[valueLength:]
+			continue
+		}
+
+		valueLength := protowire.ConsumeFieldValue(fieldNumber, wireType, data)
+		if valueLength < 0 {
+			return fmt.Errorf("invalid protobuf field %d", fieldNumber)
+		}
+		data = data[valueLength:]
+	}
+	return nil
+}
+
+func protobufWireType(kind protoreflect.Kind) protowire.Type {
+	switch kind {
+	case protoreflect.DoubleKind, protoreflect.Fixed64Kind, protoreflect.Sfixed64Kind:
+		return protowire.Fixed64Type
+	case protoreflect.StringKind, protoreflect.BytesKind, protoreflect.MessageKind:
+		return protowire.BytesType
+	case protoreflect.GroupKind:
+		return protowire.StartGroupType
+	case protoreflect.FloatKind, protoreflect.Fixed32Kind, protoreflect.Sfixed32Kind:
+		return protowire.Fixed32Type
+	default:
+		return protowire.VarintType
+	}
+}
+
+func isPackableProtobufKind(kind protoreflect.Kind) bool {
+	switch kind {
+	case protoreflect.StringKind, protoreflect.BytesKind, protoreflect.MessageKind, protoreflect.GroupKind:
+		return false
+	default:
+		return true
+	}
+}
+
+func preflightPackedValues(data []byte, wireType protowire.Type) bool {
+	for len(data) > 0 {
+		var valueLength int
+		switch wireType {
+		case protowire.VarintType:
+			_, valueLength = protowire.ConsumeVarint(data)
+		case protowire.Fixed64Type:
+			_, valueLength = protowire.ConsumeFixed64(data)
+		case protowire.Fixed32Type:
+			_, valueLength = protowire.ConsumeFixed32(data)
+		default:
+			return false
+		}
+		if valueLength < 0 {
+			return false
+		}
+		data = data[valueLength:]
+	}
+	return true
 }
 
 // WriteFrame writes one length-prefixed protobuf frame.
@@ -373,7 +500,7 @@ func ReadFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (b
 		return frameReader.trevrpcReadFrame(message, maxFrameSize)
 	}
 
-	body, read, err := readRawFrameOrEOF(reader, maxFrameSize)
+	body, read, err := ReadRawFrameOrEOF(reader, maxFrameSize)
 	if err != nil || !read {
 		return read, err
 	}
@@ -381,8 +508,9 @@ func ReadFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (b
 	return true, DecodeFrame(body, message)
 }
 
-func readRawFrameOrEOF(reader io.Reader, maxFrameSize int) ([]byte, bool, error) {
-
+// ReadRawFrameOrEOF reads one length-prefixed frame without interpreting its body.
+// It reports false when the stream is already at EOF.
+func ReadRawFrameOrEOF(reader io.Reader, maxFrameSize int) ([]byte, bool, error) {
 	header := [4]byte{}
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		if err == io.EOF {
@@ -423,7 +551,7 @@ func readStreamFrameFieldsOrEOF(reader io.Reader, maxFrameSize int) (streamFrame
 		return frameReader.trevrpcReadStreamFrame(maxFrameSize)
 	}
 
-	body, read, err := readRawFrameOrEOF(reader, maxFrameSize)
+	body, read, err := ReadRawFrameOrEOF(reader, maxFrameSize)
 	if err != nil || !read {
 		return streamFrameFields{}, read, err
 	}

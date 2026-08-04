@@ -2,9 +2,11 @@ package trevrpc
 
 import (
 	"context"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -26,11 +28,12 @@ func isHTTP3QUICConnection(conn *quic.Conn, options ServerOptions) bool {
 }
 
 func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server, requestLimit semaphore, closeOnShutdown bool) {
+	runtime := server.freeze()
 	sessionsCtx, stopSessions := context.WithCancel(ctx)
 	defer stopSessions()
 
 	var sessionTasks sync.WaitGroup
-	rpcStreamLimit := newSemaphore(server.options.MaxConcurrentStreamsPerConnection)
+	rpcStreamLimit := newSemaphore(runtime.options.MaxConcurrentStreamsPerConnection)
 	releaseConnContext := func() {}
 	h3Server := &http3.Server{
 		ConnContext: func(connCtx context.Context, _ *quic.Conn) context.Context {
@@ -47,15 +50,24 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 
 	var wtServer *webtransport.Server
 	h3Server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if server.options.EnableWebTransport && r.Method == http.MethodConnect {
-			if !webTransportAdmitted(server.options, r) {
+		if runtime.options.EnableWebTransport && r.Method == http.MethodConnect {
+			admitted, err := runtime.webTransportAdmitted(r)
+			if err != nil {
+				status := http.StatusInternalServerError
+				if errors.Is(err, errAdmissionSaturated) {
+					status = http.StatusServiceUnavailable
+				}
+				http.Error(w, "internal server error", status)
+				return
+			}
+			if !admitted {
 				http.Error(w, "WebTransport admission denied", http.StatusForbidden)
 				return
 			}
 
 			session, err := wtServer.Upgrade(w, r)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				http.Error(w, "WebTransport upgrade failed", http.StatusBadRequest)
 				return
 			}
 
@@ -68,7 +80,7 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 		handleHTTP3RPC(w, r, server, requestLimit, rpcStreamLimit)
 	})
 
-	if server.options.EnableWebTransport {
+	if runtime.options.EnableWebTransport {
 		wtServer = &webtransport.Server{
 			CheckOrigin: func(*http.Request) bool { return true },
 			H3:          h3Server,
@@ -94,8 +106,8 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 
 		shutdownCtx := context.Background()
 		cancel := func() {}
-		if server.options.GracefulShutdownTimeout > 0 {
-			shutdownCtx, cancel = context.WithTimeout(shutdownCtx, server.options.GracefulShutdownTimeout)
+		if runtime.options.GracefulShutdownTimeout > 0 {
+			shutdownCtx, cancel = context.WithTimeout(shutdownCtx, runtime.options.GracefulShutdownTimeout)
 		}
 		defer cancel()
 		_ = h3Server.Shutdown(shutdownCtx)
@@ -116,7 +128,8 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 		}
 	}
 	stopSessions()
-	waitForWaitGroup(&sessionTasks, server.options.GracefulShutdownTimeout, func() {
+	waitForWaitGroup(&sessionTasks, runtime.options.GracefulShutdownTimeout, func() {
+		runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
 		if conn.Context().Err() == nil {
 			conn.CloseWithError(0, "server WebTransport session drain timed out")
 		}
@@ -128,7 +141,8 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 }
 
 func handleHTTP3RPC(w http.ResponseWriter, r *http.Request, server *Server, requestLimit, streamLimit semaphore) {
-	if !server.options.EnableHTTP3 || r.URL.Path != http3Path(server.options) {
+	runtime := server.freeze()
+	if !runtime.options.EnableHTTP3 || r.URL.Path != http3Path(runtime.options) {
 		http.NotFound(w, r)
 		return
 	}
@@ -141,7 +155,16 @@ func handleHTTP3RPC(w http.ResponseWriter, r *http.Request, server *Server, requ
 		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
 		return
 	}
-	if !http3Admitted(server.options, r) {
+	admitted, err := runtime.http3Admitted(r)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errAdmissionSaturated) {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, "internal server error", status)
+		return
+	}
+	if !admitted {
 		http.Error(w, "HTTP/3 admission denied", http.StatusForbidden)
 		return
 	}
@@ -180,18 +203,32 @@ func isTrevRPCMediaType(values []string) bool {
 	return err == nil && strings.EqualFold(mediaType, HTTP3ContentType) && len(parameters) == 0
 }
 
-func http3Admitted(options ServerOptions, r *http.Request) bool {
-	if options.HTTP3Admission == nil {
-		return true
-	}
+var errAdmissionSaturated = errors.New("server admission callbacks saturated")
 
-	return options.HTTP3Admission(HTTP3AdmissionRequest{
-		Request:   r,
-		Path:      r.URL.Path,
-		Method:    r.Method,
-		Authority: r.Host,
-		Secure:    r.TLS != nil,
-	})
+func cloneAdmissionRequest(request *http.Request) *http.Request {
+	clone := request.Clone(request.Context())
+	clone.Header = request.Header.Clone()
+	clone.Body = http.NoBody
+	return clone
+}
+
+func (r *serverRuntime) http3Admitted(request *http.Request) (admitted bool, err error) {
+	callback := r.options.HTTP3Admission
+	if callback == nil {
+		return true, nil
+	}
+	if !tryAcquire(r.admissionLimit) {
+		return false, errAdmissionSaturated
+	}
+	defer release(r.admissionLimit)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &serverPanicError{phase: ServerDiagnosticAdmissionPanic, recovered: recovered, stack: debug.Stack()}
+			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticAdmissionPanic, Panic: recovered, Stack: debug.Stack(), Err: err})
+		}
+	}()
+	snapshot := cloneAdmissionRequest(request)
+	return callback(HTTP3AdmissionRequest{Request: snapshot, Path: snapshot.URL.Path, Method: snapshot.Method, Authority: snapshot.Host, Secure: snapshot.TLS != nil}), nil
 }
 
 type http3RPCStream struct {
@@ -224,6 +261,10 @@ func (s *http3RPCStream) Close() error {
 
 func (s *http3RPCStream) SetReadDeadline(deadline time.Time) error {
 	return s.controller.SetReadDeadline(deadline)
+}
+
+func (s *http3RPCStream) trevrpcCancelRead() {
+	_ = s.Close()
 }
 
 func (s *http3RPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {

@@ -3,11 +3,17 @@ package trevrpc
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
+	"net/url"
+	"reflect"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,12 +38,18 @@ type methodKey struct {
 	method  string
 }
 
+// ErrServerFrozen is the panic value used when a server is mutated after first use.
+var ErrServerFrozen = errors.New("trevrpc: server configuration is frozen")
+
 // Server routes and handles TrevRPC requests.
 type Server struct {
-	routes     map[methodKey]route
-	options    ServerOptions
-	authorizer Authorizer
-	metrics    Metrics
+	mu          sync.Mutex
+	routes      map[methodKey]route
+	options     ServerOptions
+	authorizer  Authorizer
+	metrics     Metrics
+	diagnostics ServerDiagnosticHandler
+	runtime     *serverRuntime
 }
 
 // ServerOptions configures server limits, timeouts, and HTTP/3 behavior.
@@ -46,11 +58,15 @@ type ServerOptions struct {
 	MaxConcurrentConnections          int
 	MaxConcurrentStreamsPerConnection int
 	MaxConcurrentRequests             int
+	MaxConcurrentAdmissionCallbacks   int
 	GracefulShutdownTimeout           time.Duration
+	DisableGracefulShutdownTimeout    bool
 	InitialRequestTimeout             time.Duration
+	DisableInitialRequestTimeout      bool
 	MaxStreamMessages                 int
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
+	DisableStreamIdleTimeout          bool
 	EnableHTTP3                       bool
 	HTTP3Path                         string
 	HTTP3Admission                    HTTP3Admission
@@ -84,6 +100,42 @@ type WebTransportAdmissionRequest struct {
 // WebTransport sessions are rejected when it is nil.
 type WebTransportAdmission func(WebTransportAdmissionRequest) bool
 
+// ServerDiagnosticPhase identifies a local server-runtime failure boundary.
+type ServerDiagnosticPhase string
+
+const (
+	ServerDiagnosticHandlerPanic           ServerDiagnosticPhase = "handler_panic"
+	ServerDiagnosticAuthorizerPanic        ServerDiagnosticPhase = "authorizer_panic"
+	ServerDiagnosticRequestStreamPanic     ServerDiagnosticPhase = "request_stream_panic"
+	ServerDiagnosticResponseStreamPanic    ServerDiagnosticPhase = "response_stream_panic"
+	ServerDiagnosticMetricsPanic           ServerDiagnosticPhase = "metrics_panic"
+	ServerDiagnosticAdmissionPanic         ServerDiagnosticPhase = "admission_panic"
+	ServerDiagnosticInvalidResponse        ServerDiagnosticPhase = "invalid_response"
+	ServerDiagnosticInternalError          ServerDiagnosticPhase = "internal_error"
+	ServerDiagnosticExecutionDetached      ServerDiagnosticPhase = "execution_detached"
+	ServerDiagnosticExecutionFinallyExited ServerDiagnosticPhase = "execution_finally_exited"
+	ServerDiagnosticShutdownIncomplete     ServerDiagnosticPhase = "shutdown_incomplete"
+)
+
+// ServerDiagnostic describes a local server failure. Request bodies and metadata are never included.
+type ServerDiagnostic struct {
+	Phase                  ServerDiagnosticPhase
+	Service                string
+	Method                 string
+	Kind                   RpcKind
+	Err                    error
+	Panic                  any
+	Stack                  []byte
+	ActiveExecutionCount   int64
+	DetachedExecutionCount int64
+	DroppedEventCount      uint64
+}
+
+// ServerDiagnosticHandler receives bounded asynchronous local server diagnostics.
+type ServerDiagnosticHandler func(ServerDiagnostic)
+
+const serverDiagnosticQueueCapacity = 64
+
 // DefaultServerOptions returns the default server limits and timeouts.
 func DefaultServerOptions() ServerOptions {
 	return ServerOptions{
@@ -91,6 +143,7 @@ func DefaultServerOptions() ServerOptions {
 		MaxConcurrentConnections:          256,
 		MaxConcurrentStreamsPerConnection: 64,
 		MaxConcurrentRequests:             1024,
+		MaxConcurrentAdmissionCallbacks:   64,
 		GracefulShutdownTimeout:           30 * time.Second,
 		InitialRequestTimeout:             10 * time.Second,
 		MaxStreamMessages:                 4096,
@@ -114,7 +167,7 @@ type MetadataValueAuthorizer struct {
 
 // NewMetadataValueAuthorizer creates an authorizer for an exact metadata key/value pair.
 func NewMetadataValueAuthorizer(key string, value []byte) MetadataValueAuthorizer {
-	return MetadataValueAuthorizer{key: NormalizeMetadataKey(key), value: value}
+	return MetadataValueAuthorizer{key: NormalizeMetadataKey(key), value: append([]byte(nil), value...)}
 }
 
 // BearerAuthorizer creates an authorizer for the authorization bearer token metadata.
@@ -174,24 +227,35 @@ func NewServer() *Server {
 	}
 }
 
-// SetOptions replaces all server options.
+// SetOptions canonicalizes and replaces the server options. It panics after first use.
 func (s *Server) SetOptions(options ServerOptions) {
-	s.options = options
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requireMutableLocked()
+	s.options = canonicalServerOptions(options)
 }
 
-// Options returns a copy of the server options.
+// Options returns the canonical server options snapshot.
 func (s *Server) Options() ServerOptions {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runtime != nil {
+		return s.runtime.options
+	}
 	return s.options
 }
 
 // SetAuthorizer installs an authorizer that runs before route lookup.
 func (s *Server) SetAuthorizer(authorizer Authorizer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requireMutableLocked()
 	s.authorizer = authorizer
 }
 
 // ClearAuthorizer removes the configured authorizer.
 func (s *Server) ClearAuthorizer() {
-	s.authorizer = nil
+	s.SetAuthorizer(nil)
 }
 
 // SetMetrics installs metrics callbacks for RPC lifecycle events.
@@ -199,22 +263,47 @@ func (s *Server) SetMetrics(metrics Metrics) {
 	if metrics == nil {
 		metrics = NoopMetrics{}
 	}
-
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requireMutableLocked()
 	s.metrics = metrics
+}
+
+// SetDiagnostics installs a bounded asynchronous local diagnostic callback.
+func (s *Server) SetDiagnostics(handler ServerDiagnosticHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requireMutableLocked()
+	s.diagnostics = handler
 }
 
 // Route registers a unary route handler for a service and method.
 func (s *Server) Route(service, method string, handler UnaryHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requireMutableLocked()
+	validateRoute(service, method, RpcKindUnary, handler != nil)
 	s.routes[methodKey{service: service, method: method}] = route{kind: RpcKindUnary, unaryHandler: handler}
 }
 
 // RouteResponse registers a unary route handler that can return response metadata.
 func (s *Server) RouteResponse(service, method string, handler UnaryResponseHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requireMutableLocked()
+	validateRoute(service, method, RpcKindUnary, handler != nil)
 	s.routes[methodKey{service: service, method: method}] = route{kind: RpcKindUnary, unaryResponse: handler}
 }
 
 // RouteStreaming registers a streaming route handler for a service, method, and RPC kind.
 func (s *Server) RouteStreaming(service, method string, kind RpcKind, handler StreamingHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requireMutableLocked()
+	if kind == RpcKindUnary || !kind.IsValid() {
+		panic("trevrpc: streaming route requires a streaming RPC kind")
+	}
+	validateRoute(service, method, kind, handler != nil)
 	s.routes[methodKey{service: service, method: method}] = route{kind: kind, streamingHandler: handler}
 }
 
@@ -235,68 +324,552 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, service, metho
 	})
 }
 
-// RegisterUnaryResponse registers a typed unary protobuf handler that can return response metadata.
+// RegisterUnaryResponse registers a typed unary protobuf handler that returns a response envelope.
 func RegisterUnaryResponse[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (*Response[Res], error)) {
 	s.RouteResponse(service, method, func(ctx context.Context, body []byte) (*RpcResponse, error) {
-		request := newRequest()
-		if err := UnmarshalMessage(body, request); err != nil {
-			return nil, InvalidArgument("failed to decode request: " + err.Error())
+		request, err := decodeRegisteredRequest(body, newRequest)
+		if err != nil {
+			return nil, err
 		}
 
 		response, err := handler(ctx, request)
 		if err != nil {
 			return nil, err
 		}
-		if response == nil {
-			return nil, Internal("handler returned nil response")
-		}
+		return encodeRegisteredResponse(response)
+	})
+}
 
-		responseBody, err := MarshalMessage(response.Message)
+// RegisterClientStreamingResponse registers a typed client-streaming handler that returns a response envelope.
+func RegisterClientStreamingResponse[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (*Response[Res], error)) {
+	s.RouteStreaming(service, method, RpcKindClientStreaming, func(ctx context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		response, err := handler(ctx, DecodeStream(requests, newRequest))
 		if err != nil {
 			return nil, err
 		}
-		return OK().IntoResponseWithMetadata(responseBody, response.Metadata), nil
+		if err := validateRegisteredResponse(response); err != nil {
+			return nil, err
+		}
+		return EncodeStream(WithResponseStreamMetadata(FromSlice(response.Message), response.Metadata)), nil
 	})
+}
+
+// RegisterServerStreamingResponse registers a typed server-streaming handler that returns a response stream.
+func RegisterServerStreamingResponse[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (ResponseStream[Res], error)) {
+	s.RouteStreaming(service, method, RpcKindServerStreaming, func(ctx context.Context, body []byte, _ ByteStream) (ByteStream, error) {
+		request, err := decodeRegisteredRequest(body, newRequest)
+		if err != nil {
+			return nil, err
+		}
+
+		responses, err := handler(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		if isNilRegisteredValue(responses) {
+			return nil, Internal("handler returned nil response stream")
+		}
+		return EncodeStream(responses), nil
+	})
+}
+
+// RegisterBidirectionalStreamingResponse registers a typed bidirectional handler that returns a response stream.
+func RegisterBidirectionalStreamingResponse[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (ResponseStream[Res], error)) {
+	s.RouteStreaming(service, method, RpcKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
+		responses, err := handler(ctx, DecodeStream(requests, newRequest))
+		if err != nil {
+			return nil, err
+		}
+		if isNilRegisteredValue(responses) {
+			return nil, Internal("handler returned nil response stream")
+		}
+		return EncodeStream(responses), nil
+	})
+}
+
+func decodeRegisteredRequest[Req ProtoMessage](body []byte, newRequest func() Req) (Req, error) {
+	request := newRequest()
+	if isNilRegisteredValue(request) {
+		var zero Req
+		return zero, Internal("request factory returned nil")
+	}
+	if err := UnmarshalMessage(body, request); err != nil {
+		var zero Req
+		return zero, InvalidArgument("failed to decode request: " + err.Error())
+	}
+	return request, nil
+}
+
+func encodeRegisteredResponse[Res ProtoMessage](response *Response[Res]) (*RpcResponse, error) {
+	if err := validateRegisteredResponse(response); err != nil {
+		return nil, err
+	}
+	body, err := MarshalMessage(response.Message)
+	if err != nil {
+		return nil, err
+	}
+	return OK().IntoResponseWithMetadata(body, cloneMetadata(response.Metadata)), nil
+}
+
+func validateRegisteredResponse[Res ProtoMessage](response *Response[Res]) error {
+	if response == nil {
+		return Internal("handler returned nil response")
+	}
+	if isNilRegisteredValue(response.Message) {
+		return Internal("handler returned nil response message")
+	}
+	if err := ValidateMetadata(response.Metadata); err != nil {
+		return Internal("handler returned invalid response metadata: " + err.Error())
+	}
+	return nil
+}
+
+func isNilRegisteredValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}
+
+type serverRuntime struct {
+	options          ServerOptions
+	routes           map[methodKey]route
+	authorizer       Authorizer
+	metrics          Metrics
+	requestLimit     semaphore
+	connectionLimit  semaphore
+	admissionLimit   semaphore
+	diagnostics      *serverDiagnosticDispatcher
+	active           atomic.Int64
+	detached         atomic.Int64
+	executionMu      sync.Mutex
+	executionChanged chan struct{}
+}
+
+func canonicalServerOptions(options ServerOptions) ServerOptions {
+	defaults := DefaultServerOptions()
+	canonical := options
+	canonical.MaxFrameSize = canonicalPositiveLimit("MaxFrameSize", options.MaxFrameSize, defaults.MaxFrameSize)
+	if uint64(canonical.MaxFrameSize) > math.MaxUint32 {
+		panic("trevrpc: MaxFrameSize exceeds uint32 framing limit")
+	}
+	canonical.MaxConcurrentConnections = canonicalPositiveLimit("MaxConcurrentConnections", options.MaxConcurrentConnections, defaults.MaxConcurrentConnections)
+	canonical.MaxConcurrentStreamsPerConnection = canonicalPositiveLimit("MaxConcurrentStreamsPerConnection", options.MaxConcurrentStreamsPerConnection, defaults.MaxConcurrentStreamsPerConnection)
+	canonical.MaxConcurrentRequests = canonicalPositiveLimit("MaxConcurrentRequests", options.MaxConcurrentRequests, defaults.MaxConcurrentRequests)
+	canonical.MaxConcurrentAdmissionCallbacks = canonicalPositiveLimit("MaxConcurrentAdmissionCallbacks", options.MaxConcurrentAdmissionCallbacks, defaults.MaxConcurrentAdmissionCallbacks)
+	canonical.MaxStreamMessages = canonicalStreamLimit("MaxStreamMessages", options.MaxStreamMessages, defaults.MaxStreamMessages)
+	canonical.MaxStreamBodySize = canonicalStreamLimit("MaxStreamBodySize", options.MaxStreamBodySize, defaults.MaxStreamBodySize)
+	canonical.GracefulShutdownTimeout = canonicalDuration("GracefulShutdownTimeout", options.GracefulShutdownTimeout, defaults.GracefulShutdownTimeout, options.DisableGracefulShutdownTimeout)
+	canonical.InitialRequestTimeout = canonicalDuration("InitialRequestTimeout", options.InitialRequestTimeout, defaults.InitialRequestTimeout, options.DisableInitialRequestTimeout)
+	canonical.StreamIdleTimeout = canonicalDuration("StreamIdleTimeout", options.StreamIdleTimeout, defaults.StreamIdleTimeout, options.DisableStreamIdleTimeout)
+	if canonical.HTTP3Path == "" {
+		canonical.HTTP3Path = defaults.HTTP3Path
+	}
+	parsed, err := url.ParseRequestURI(canonical.HTTP3Path)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" || canonical.HTTP3Path[0] != '/' {
+		panic("trevrpc: HTTP3Path must be an absolute path without query or fragment")
+	}
+	return canonical
+}
+
+func canonicalPositiveLimit(name string, value, fallback int) int {
+	if value < 0 {
+		panic("trevrpc: " + name + " must be positive")
+	}
+	if value == 0 {
+		return fallback
+	}
+	return value
+}
+
+func canonicalStreamLimit(name string, value, fallback int) int {
+	if value < -1 {
+		panic("trevrpc: " + name + " must be -1 or positive")
+	}
+	if value == 0 {
+		return fallback
+	}
+	return value
+}
+
+func canonicalDuration(name string, value, fallback time.Duration, disabled bool) time.Duration {
+	if value < 0 {
+		panic("trevrpc: " + name + " must not be negative")
+	}
+	if disabled {
+		return 0
+	}
+	if value == 0 {
+		return fallback
+	}
+	return value
+}
+
+func validateRoute(service, method string, _ RpcKind, hasHandler bool) {
+	if service == "" || method == "" {
+		panic("trevrpc: route service and method must be non-empty")
+	}
+	if !hasHandler {
+		panic("trevrpc: route handler must not be nil")
+	}
+}
+
+func (s *Server) requireMutableLocked() {
+	if s.runtime != nil {
+		panic(ErrServerFrozen)
+	}
+}
+
+func (s *Server) freeze() *serverRuntime {
+	if s == nil {
+		panic("trevrpc: server is nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runtime != nil {
+		return s.runtime
+	}
+	options := canonicalServerOptions(s.options)
+	routes := maps.Clone(s.routes)
+	metrics := s.metrics
+	if metrics == nil {
+		metrics = NoopMetrics{}
+	}
+	runtime := &serverRuntime{
+		options:          options,
+		routes:           routes,
+		authorizer:       s.authorizer,
+		metrics:          metrics,
+		requestLimit:     newSemaphore(options.MaxConcurrentRequests),
+		connectionLimit:  newSemaphore(options.MaxConcurrentConnections),
+		admissionLimit:   newSemaphore(options.MaxConcurrentAdmissionCallbacks),
+		executionChanged: make(chan struct{}),
+	}
+	runtime.diagnostics = newServerDiagnosticDispatcher(s.diagnostics, runtime)
+	s.options = options
+	s.runtime = runtime
+	return runtime
+}
+
+type serverDiagnosticDispatcher struct {
+	hook    ServerDiagnosticHandler
+	runtime *serverRuntime
+	mu      sync.Mutex
+	queue   []ServerDiagnostic
+	running bool
+	dropped atomic.Uint64
+}
+
+func newServerDiagnosticDispatcher(hook ServerDiagnosticHandler, runtime *serverRuntime) *serverDiagnosticDispatcher {
+	return &serverDiagnosticDispatcher{hook: hook, runtime: runtime}
+}
+
+func (d *serverDiagnosticDispatcher) emit(event ServerDiagnostic) {
+	if d == nil || d.hook == nil {
+		return
+	}
+	event.ActiveExecutionCount = d.runtime.active.Load()
+	event.DetachedExecutionCount = d.runtime.detached.Load()
+	d.mu.Lock()
+	if len(d.queue) == serverDiagnosticQueueCapacity {
+		copy(d.queue, d.queue[1:])
+		d.queue = d.queue[:serverDiagnosticQueueCapacity-1]
+		d.dropped.Add(1)
+	}
+	event.DroppedEventCount = d.dropped.Load()
+	d.queue = append(d.queue, event)
+	if !d.running {
+		d.running = true
+		go d.run()
+	}
+	d.mu.Unlock()
+}
+
+func (d *serverDiagnosticDispatcher) run() {
+	for {
+		d.mu.Lock()
+		if len(d.queue) == 0 {
+			d.running = false
+			d.mu.Unlock()
+			return
+		}
+		event := d.queue[0]
+		d.queue = d.queue[1:]
+		d.mu.Unlock()
+		func() {
+			defer func() { _ = recover() }()
+			d.hook(event)
+		}()
+	}
+}
+
+func (r *serverRuntime) emitDiagnostic(event ServerDiagnostic) {
+	if r != nil && r.diagnostics != nil {
+		r.diagnostics.emit(event)
+	}
+}
+
+func (r *serverRuntime) executionStarted() {
+	r.executionMu.Lock()
+	r.active.Add(1)
+	close(r.executionChanged)
+	r.executionChanged = make(chan struct{})
+	r.executionMu.Unlock()
+}
+
+func (r *serverRuntime) executionFinished() {
+	r.executionMu.Lock()
+	r.active.Add(-1)
+	close(r.executionChanged)
+	r.executionChanged = make(chan struct{})
+	r.executionMu.Unlock()
+}
+
+func (r *serverRuntime) waitForExecutions(timeout time.Duration) bool {
+	var timeoutChannel <-chan time.Time
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		timeoutChannel = timer.C
+		defer timer.Stop()
+	}
+
+	for {
+		r.executionMu.Lock()
+		if r.active.Load() == 0 {
+			r.executionMu.Unlock()
+			return true
+		}
+		changed := r.executionChanged
+		r.executionMu.Unlock()
+
+		select {
+		case <-changed:
+		case <-timeoutChannel:
+			return false
+		}
+	}
+}
+
+type requestExecutionLease struct {
+	runtime *serverRuntime
+	limit   semaphore
+	service string
+	method  string
+	kind    RpcKind
+	refs    atomic.Int64
+}
+
+func (r *serverRuntime) tryRequestLease(request *RpcRequest) (*requestExecutionLease, bool) {
+	if !tryAcquire(r.requestLimit) {
+		return nil, false
+	}
+	lease := &requestExecutionLease{runtime: r, limit: r.requestLimit}
+	lease.refs.Store(1)
+	if request != nil {
+		lease.service, lease.method, lease.kind = request.Service, request.Method, request.RPCKind()
+	}
+	return lease, true
+}
+
+func (l *requestExecutionLease) release() {
+	if l != nil && l.refs.Add(-1) == 0 {
+		release(l.limit)
+	}
+}
+
+func (l *requestExecutionLease) retain(phase ServerDiagnosticPhase) *executionReference {
+	if l == nil {
+		return nil
+	}
+	l.refs.Add(1)
+	l.runtime.executionStarted()
+	return &executionReference{lease: l, phase: phase}
+}
+
+type executionReference struct {
+	lease    *requestExecutionLease
+	phase    ServerDiagnosticPhase
+	mu       sync.Mutex
+	detached bool
+	finished bool
+}
+
+func (r *executionReference) detach() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.detached || r.finished {
+		r.mu.Unlock()
+		return
+	}
+	r.detached = true
+	r.lease.runtime.detached.Add(1)
+	r.mu.Unlock()
+	r.lease.runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticExecutionDetached, Service: r.lease.service, Method: r.lease.method, Kind: r.lease.kind})
+}
+
+func (r *executionReference) finish() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.finished {
+		r.mu.Unlock()
+		return
+	}
+	r.finished = true
+	detached := r.detached
+	r.mu.Unlock()
+	r.lease.release()
+	r.lease.runtime.executionFinished()
+	if detached {
+		r.lease.runtime.detached.Add(-1)
+		r.lease.runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticExecutionFinallyExited, Service: r.lease.service, Method: r.lease.method, Kind: r.lease.kind})
+	}
+}
+
+type serverPanicError struct {
+	phase     ServerDiagnosticPhase
+	recovered any
+	stack     []byte
+}
+
+func (e *serverPanicError) Error() string {
+	return fmt.Sprintf("server callback panicked: %v", e.recovered)
+}
+
+func cloneServerRequest(request *RpcRequest) *RpcRequest {
+	if request == nil {
+		return nil
+	}
+	clone := *request
+	clone.Body = append([]byte(nil), request.Body...)
+	clone.Metadata = cloneMetadata(request.Metadata)
+	return &clone
+}
+
+func internalServerStatus() *Status { return Internal("internal server error") }
+
+func (r *serverRuntime) wireStatus(err error, phase ServerDiagnosticPhase, request *RpcRequest) *Status {
+	if err == nil {
+		return OK()
+	}
+	var panicErr *serverPanicError
+	if errors.As(err, &panicErr) {
+		r.emitDiagnostic(ServerDiagnostic{Phase: panicErr.phase, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err, Panic: panicErr.recovered, Stack: panicErr.stack})
+		return internalServerStatus()
+	}
+	var status *Status
+	if errors.As(err, &status) && status.Code != CodeInternal {
+		if ValidateMetadata(status.Metadata) == nil {
+			return NewStatus(status.Code, status.Message).WithMetadata(status.Metadata)
+		}
+	}
+	r.emitDiagnostic(ServerDiagnostic{Phase: phase, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err})
+	return internalServerStatus()
+}
+
+func requestService(request *RpcRequest) string {
+	if request == nil {
+		return ""
+	}
+	return request.Service
+}
+func requestMethod(request *RpcRequest) string {
+	if request == nil {
+		return ""
+	}
+	return request.Method
+}
+func requestKind(request *RpcRequest) RpcKind {
+	if request == nil {
+		return RpcKindUnary
+	}
+	return request.RPCKind()
 }
 
 // HandleRequest handles a unary RPC request and returns a response.
 func (s *Server) HandleRequest(ctx context.Context, request *RpcRequest) *RpcResponse {
-	startedAt := time.Now()
-	service := request.Service
-	method := request.Method
-	requestBodyLen := len(request.Body)
-	recordRPCStarted(s.metrics, RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen})
+	runtime := s.freeze()
+	lease, ok := runtime.tryRequestLease(request)
+	if !ok {
+		return runtime.rejectedUnary(request)
+	}
+	defer lease.release()
+	return runtime.handleRequest(ctx, request, lease)
+}
 
-	ctx, cancel, err := s.prepareRequest(ctx, request)
+func (r *serverRuntime) rejectedUnary(request *RpcRequest) *RpcResponse {
+	startedAt := time.Now()
+	service, method, bodyLen := requestService(request), requestMethod(request), 0
+	if request != nil {
+		bodyLen = len(request.Body)
+	}
+	r.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: bodyLen}, request)
+	return r.finishResponse(service, method, bodyLen, startedAt, Unavailable("too many concurrent RPCs").IntoResponse(nil), request)
+}
+
+func (r *serverRuntime) handleRequest(ctx context.Context, request *RpcRequest, lease *requestExecutionLease) *RpcResponse {
+	startedAt := time.Now()
+	if request == nil {
+		r.recordStarted(RPCStarted{}, nil)
+		return r.finishResponse("", "", 0, startedAt, InvalidArgument("RPC request is nil").IntoResponse(nil), nil)
+	}
+	service, method, requestBodyLen := request.Service, request.Method, len(request.Body)
+	r.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen}, request)
+
+	ctx, cancel, err := r.prepareRequest(ctx, request, lease)
 	if err != nil {
-		return s.finishResponse(service, method, requestBodyLen, startedAt, StatusFromError(err).IntoResponse(nil))
+		return r.finishResponse(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request).IntoResponse(nil), request)
 	}
 	defer cancel()
 
-	route, ok := s.routes[methodKey{service: request.Service, method: request.Method}]
+	route, ok := r.routes[methodKey{service: request.Service, method: request.Method}]
 	if !ok || (route.unaryHandler == nil && route.unaryResponse == nil) {
-		return s.finishResponse(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown RPC method %s/%s", request.Service, request.Method)).IntoResponse(nil))
+		return r.finishResponse(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown RPC method %s/%s", request.Service, request.Method)).IntoResponse(nil), request)
 	}
 	if route.unaryResponse != nil {
-		response, err := invokeUnaryResponseHandler(ctx, route.unaryResponse, request.Body, handlerNeedsDeadlineRace(ctx))
+		response, err := invokeUnaryResponseHandler(ctx, route.unaryResponse, request.Body, handlerNeedsDeadlineRace(ctx), lease)
 		if err != nil {
-			return s.finishResponse(service, method, requestBodyLen, startedAt, StatusFromError(err).IntoResponse(nil))
+			return r.finishResponse(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request).IntoResponse(nil), request)
 		}
-		if response == nil {
-			return s.finishResponse(service, method, requestBodyLen, startedAt, Internal("handler returned nil response").IntoResponse(nil))
-		}
-		if err := ValidateMetadata(response.Metadata); err != nil {
-			return s.finishResponse(service, method, requestBodyLen, startedAt, Internal("invalid response metadata: "+err.Error()).IntoResponse(nil))
-		}
-		return s.finishResponse(service, method, requestBodyLen, startedAt, response)
+		response = r.sanitizeResponse(response, request)
+		return r.finishResponse(service, method, requestBodyLen, startedAt, response, request)
 	}
 
-	responseBody, err := invokeUnaryHandler(ctx, route.unaryHandler, request.Body, handlerNeedsDeadlineRace(ctx))
+	responseBody, err := invokeUnaryHandler(ctx, route.unaryHandler, request.Body, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
-		return s.finishResponse(service, method, requestBodyLen, startedAt, StatusFromError(err).IntoResponse(nil))
+		return r.finishResponse(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request).IntoResponse(nil), request)
 	}
+	return r.finishResponse(service, method, requestBodyLen, startedAt, OKResponse(responseBody), request)
+}
 
-	return s.finishResponse(service, method, requestBodyLen, startedAt, OKResponse(responseBody))
+func (r *serverRuntime) sanitizeResponse(response *RpcResponse, request *RpcRequest) *RpcResponse {
+	if response == nil {
+		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: errors.New("handler returned nil response")})
+		return internalServerStatus().IntoResponse(nil)
+	}
+	status := StatusFromResponse(response)
+	if status.Code == CodeInternal {
+		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInternalError, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: status})
+		return internalServerStatus().IntoResponse(nil)
+	}
+	if err := ValidateMetadata(response.Metadata); err != nil {
+		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err})
+		return internalServerStatus().IntoResponse(nil)
+	}
+	clone := *response
+	clone.Body = append([]byte(nil), response.Body...)
+	clone.Metadata = cloneMetadata(response.Metadata)
+	return &clone
 }
 
 func invokeUnaryResponseHandler(
@@ -304,31 +877,36 @@ func invokeUnaryResponseHandler(
 	handler UnaryResponseHandler,
 	body []byte,
 	raceContext bool,
+	lease *requestExecutionLease,
 ) (response *RpcResponse, err error) {
 	if !raceContext {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				response = nil
-				err = Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))
+				err = &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}
 			}
 		}()
 		return handler(ctx, body)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContextError(err)
 	}
 
 	result := make(chan struct {
 		response *RpcResponse
 		err      error
 	}, 1)
+	execution := lease.retain(ServerDiagnosticHandlerPanic)
 	go func() {
+		defer execution.finish()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				result <- struct {
 					response *RpcResponse
 					err      error
-				}{err: Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))}
+				}{err: &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}}
 			}
 		}()
-
 		response, err := handler(ctx, body)
 		result <- struct {
 			response *RpcResponse
@@ -338,64 +916,78 @@ func invokeUnaryResponseHandler(
 
 	select {
 	case result := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, statusFromContextError(ctxErr)
+		}
 		return result.response, result.err
 	case <-ctx.Done():
+		execution.detach()
 		return nil, statusFromContextError(ctx.Err())
 	}
 }
 
 // HandleStreamingRequest handles a streaming RPC request and returns response frames.
 func (s *Server) HandleStreamingRequest(ctx context.Context, request *RpcRequest, requestBody ByteStream) FrameStream {
-	startedAt := time.Now()
-	service := request.Service
-	method := request.Method
-	requestBodyLen := len(request.Body)
-	recordRPCStarted(s.metrics, RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen})
+	runtime := s.freeze()
+	lease, ok := runtime.tryRequestLease(request)
+	if !ok {
+		startedAt := time.Now()
+		service, method := requestService(request), requestMethod(request)
+		bodyLen := 0
+		if request != nil {
+			bodyLen = len(request.Body)
+		}
+		runtime.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: bodyLen}, request)
+		return runtime.finishStreamingStatus(service, method, bodyLen, startedAt, Unavailable("too many concurrent RPCs"), request)
+	}
+	return runtime.handleStreamingRequest(ctx, request, requestBody, lease)
+}
 
-	ctx, cancel, err := s.prepareRequest(ctx, request)
+func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *RpcRequest, requestBody ByteStream, lease *requestExecutionLease) FrameStream {
+	startedAt := time.Now()
+	if request == nil {
+		r.recordStarted(RPCStarted{}, nil)
+		lease.release()
+		return r.finishStreamingStatus("", "", 0, startedAt, InvalidArgument("RPC request is nil"), nil)
+	}
+	service, method, requestBodyLen := request.Service, request.Method, len(request.Body)
+	r.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen}, request)
+
+	ctx, cancel, err := r.prepareRequest(ctx, request, lease)
 	if err != nil {
 		cancel()
-		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, StatusFromError(err))
+		lease.release()
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request), request)
 	}
 
-	limits := streamLimitsFromOptions(s.options)
-	requestBody = limitByteStream(ctx, requestBody, limits, "request")
-
-	route, ok := s.routes[methodKey{service: request.Service, method: request.Method}]
+	limits := streamLimitsFromOptions(r.options)
+	requestBody = limitByteStream(ctx, requestBody, limits, "request", lease, request)
+	route, ok := r.routes[methodKey{service: request.Service, method: request.Method}]
 	if !ok || route.streamingHandler == nil {
 		cancel()
-		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown streaming RPC method %s/%s", request.Service, request.Method)))
+		lease.release()
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown streaming RPC method %s/%s", request.Service, request.Method)), request)
 	}
-
 	if route.kind != request.RPCKind() {
 		cancel()
-		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s/%s: expected %d, got %d", request.Service, request.Method, route.kind, request.RPCKind())))
+		lease.release()
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s/%s: expected %d, got %d", request.Service, request.Method, route.kind, request.RPCKind())), request)
 	}
 
-	responseBody, err := invokeStreamingHandler(
-		ctx,
-		route.streamingHandler,
-		request.Body,
-		requestBody,
-		handlerNeedsDeadlineRace(ctx),
-	)
+	responseBody, err := invokeStreamingHandler(ctx, route.streamingHandler, request.Body, requestBody, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
 		cancel()
-		return s.finishStreamingStatus(service, method, requestBodyLen, startedAt, StatusFromError(err))
+		lease.release()
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request), request)
+	}
+	if responseBody == nil {
+		cancel()
+		lease.release()
+		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Service: service, Method: method, Kind: request.RPCKind(), Err: errors.New("handler returned nil response stream")})
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), request)
 	}
 	responseBody = closeStreamOnContext(ctx, responseBody)
-
-	return &serverResponseStream{
-		inner:          responseBody,
-		metrics:        s.metrics,
-		service:        service,
-		method:         method,
-		requestBodyLen: requestBodyLen,
-		startedAt:      startedAt,
-		ctx:            ctx,
-		limits:         limits,
-		cancel:         cancel,
-	}
+	return &serverResponseStream{inner: responseBody, runtime: r, request: request, lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
 }
 
 type unaryHandlerResult struct {
@@ -403,33 +995,41 @@ type unaryHandlerResult struct {
 	err  error
 }
 
-func invokeUnaryHandler(ctx context.Context, handler UnaryHandler, body []byte, raceContext bool) (bodyOut []byte, err error) {
+func invokeUnaryHandler(ctx context.Context, handler UnaryHandler, body []byte, raceContext bool, lease *requestExecutionLease) (bodyOut []byte, err error) {
 	if !raceContext {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				bodyOut = nil
-				err = Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))
+				err = &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}
 			}
 		}()
 		return handler(ctx, body)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContextError(err)
+	}
 
 	result := make(chan unaryHandlerResult, 1)
+	execution := lease.retain(ServerDiagnosticHandlerPanic)
 	go func() {
+		defer execution.finish()
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				result <- unaryHandlerResult{err: Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))}
+				result <- unaryHandlerResult{err: &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}}
 			}
 		}()
-
 		responseBody, err := handler(ctx, body)
 		result <- unaryHandlerResult{body: responseBody, err: err}
 	}()
 
 	select {
 	case result := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, statusFromContextError(ctxErr)
+		}
 		return result.body, result.err
 	case <-ctx.Done():
+		execution.detach()
 		return nil, statusFromContextError(ctx.Err())
 	}
 }
@@ -445,33 +1045,52 @@ func invokeStreamingHandler(
 	body []byte,
 	requestBody ByteStream,
 	raceContext bool,
+	lease *requestExecutionLease,
 ) (stream ByteStream, err error) {
 	if !raceContext {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				stream = nil
-				err = Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))
+				err = &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}
 			}
 		}()
 		return handler(ctx, body, requestBody)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContextError(err)
+	}
 
-	result := make(chan streamingHandlerResult, 1)
+	result := make(chan streamingHandlerResult)
+	abandoned := make(chan struct{})
+	execution := lease.retain(ServerDiagnosticHandlerPanic)
 	go func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				result <- streamingHandlerResult{err: Internal(fmt.Sprintf("RPC handler panicked: %v", recovered))}
-			}
+		defer execution.finish()
+		resultValue := func() (result streamingHandlerResult) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					result = streamingHandlerResult{err: &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}}
+				}
+			}()
+			result.stream, result.err = handler(ctx, body, requestBody)
+			return result
 		}()
-
-		responseBody, err := handler(ctx, body, requestBody)
-		result <- streamingHandlerResult{stream: responseBody, err: err}
+		select {
+		case result <- resultValue:
+		case <-abandoned:
+			closeMessageStream(resultValue.stream)
+		}
 	}()
 
 	select {
 	case result := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			closeMessageStream(result.stream)
+			return nil, statusFromContextError(ctxErr)
+		}
 		return result.stream, result.err
 	case <-ctx.Done():
+		execution.detach()
+		close(abandoned)
 		return nil, statusFromContextError(ctx.Err())
 	}
 }
@@ -484,28 +1103,54 @@ func handlerNeedsDeadlineRace(ctx context.Context) bool {
 	return ok
 }
 
-func (s *Server) prepareRequest(ctx context.Context, request *RpcRequest) (context.Context, context.CancelFunc, error) {
+func (r *serverRuntime) prepareRequest(ctx context.Context, request *RpcRequest, lease *requestExecutionLease) (context.Context, context.CancelFunc, error) {
 	if err := ValidateMetadata(request.Metadata); err != nil {
 		return ctx, func() {}, err
 	}
-
 	if err := request.ValidateProtocol(); err != nil {
 		return ctx, func() {}, err
 	}
-
 	ctx, cancel, err := requestContext(ctx, request)
 	if err != nil {
 		return ctx, cancel, err
 	}
-
-	if s.authorizer != nil {
-		if err := s.authorizer.Authorize(ctx, request); err != nil {
+	if r.authorizer != nil {
+		if err := invokeAuthorizer(ctx, r.authorizer, cloneServerRequest(request), handlerNeedsDeadlineRace(ctx), lease); err != nil {
 			cancel()
 			return ctx, func() {}, err
 		}
 	}
-
 	return ctx, cancel, nil
+}
+
+func invokeAuthorizer(ctx context.Context, authorizer Authorizer, request *RpcRequest, raceContext bool, lease *requestExecutionLease) (err error) {
+	invoke := func() (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err = &serverPanicError{phase: ServerDiagnosticAuthorizerPanic, recovered: recovered, stack: debug.Stack()}
+			}
+		}()
+		return authorizer.Authorize(ctx, request)
+	}
+	if !raceContext {
+		return invoke()
+	}
+	if err := ctx.Err(); err != nil {
+		return statusFromContextError(err)
+	}
+	result := make(chan error, 1)
+	execution := lease.retain(ServerDiagnosticAuthorizerPanic)
+	go func() { defer execution.finish(); result <- invoke() }()
+	select {
+	case err := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return statusFromContextError(ctxErr)
+		}
+		return err
+	case <-ctx.Done():
+		execution.detach()
+		return statusFromContextError(ctx.Err())
+	}
 }
 
 func requestContext(ctx context.Context, request *RpcRequest) (context.Context, context.CancelFunc, error) {
@@ -522,48 +1167,54 @@ func requestContext(ctx context.Context, request *RpcRequest) (context.Context, 
 	return contextWithHandlerContext(ctx, request), cancel, nil
 }
 
-func (s *Server) finishResponse(service, method string, requestBodyLen int, startedAt time.Time, response *RpcResponse) *RpcResponse {
-	recordRPCFinished(s.metrics, RPCFinished{
-		Service:         service,
-		Method:          method,
-		RequestBodyLen:  requestBodyLen,
-		ResponseBodyLen: len(response.Body),
-		Code:            CodeFromUint32(response.Status),
-		Elapsed:         time.Since(startedAt),
-	})
-
+func (r *serverRuntime) finishResponse(service, method string, requestBodyLen int, startedAt time.Time, response *RpcResponse, request *RpcRequest) *RpcResponse {
+	if response == nil {
+		response = internalServerStatus().IntoResponse(nil)
+	}
+	r.recordFinished(RPCFinished{Service: service, Method: method, RequestBodyLen: requestBodyLen, ResponseBodyLen: len(response.Body), Code: CodeFromUint32(response.Status), Elapsed: time.Since(startedAt)}, request)
 	return response
 }
 
-func (s *Server) finishStreamingStatus(service, method string, requestBodyLen int, startedAt time.Time, status *Status) FrameStream {
-	s.finishStreamingResponse(service, method, requestBodyLen, 0, startedAt, status.Code)
+func (r *serverRuntime) finishStreamingStatus(service, method string, requestBodyLen int, startedAt time.Time, status *Status, request *RpcRequest) FrameStream {
+	r.finishStreamingResponse(service, method, requestBodyLen, 0, startedAt, status.Code, request)
 	return StatusStream(status)
 }
 
-func (s *Server) recordRejectedRequest(request *RpcRequest, status *Status) {
+func (r *serverRuntime) recordRejectedRequest(request *RpcRequest, status *Status) {
 	startedAt := time.Now()
-	service := request.Service
-	method := request.Method
-	requestBodyLen := len(request.Body)
-	recordRPCStarted(s.metrics, RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen})
-	s.finishStreamingResponse(service, method, requestBodyLen, 0, startedAt, status.Code)
+	service, method, requestBodyLen := requestService(request), requestMethod(request), 0
+	if request != nil {
+		requestBodyLen = len(request.Body)
+	}
+	r.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen}, request)
+	r.finishStreamingResponse(service, method, requestBodyLen, 0, startedAt, status.Code, request)
 }
 
-func (s *Server) recordPreHandlerFailure(status *Status) {
-	startedAt := time.Now()
-	recordRPCStarted(s.metrics, RPCStarted{})
-	s.finishStreamingResponse("", "", 0, 0, startedAt, status.Code)
+func (r *serverRuntime) recordPreHandlerFailure(startedAt time.Time, status *Status) {
+	r.recordStarted(RPCStarted{}, nil)
+	r.finishStreamingResponse("", "", 0, 0, startedAt, status.Code, nil)
 }
 
-func (s *Server) finishStreamingResponse(service, method string, requestBodyLen, responseBodyLen int, startedAt time.Time, code Code) {
-	recordRPCFinished(s.metrics, RPCFinished{
-		Service:         service,
-		Method:          method,
-		RequestBodyLen:  requestBodyLen,
-		ResponseBodyLen: responseBodyLen,
-		Code:            code,
-		Elapsed:         time.Since(startedAt),
-	})
+func (r *serverRuntime) finishStreamingResponse(service, method string, requestBodyLen, responseBodyLen int, startedAt time.Time, code Code, request *RpcRequest) {
+	r.recordFinished(RPCFinished{Service: service, Method: method, RequestBodyLen: requestBodyLen, ResponseBodyLen: responseBodyLen, Code: code, Elapsed: time.Since(startedAt)}, request)
+}
+
+func (r *serverRuntime) recordStarted(event RPCStarted, request *RpcRequest) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticMetricsPanic, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
+		}
+	}()
+	r.metrics.RPCStarted(event)
+}
+
+func (r *serverRuntime) recordFinished(event RPCFinished, request *RpcRequest) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticMetricsPanic, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
+		}
+	}()
+	r.metrics.RPCFinished(event)
 }
 
 type streamLimits struct {
@@ -576,19 +1227,31 @@ func streamLimitsFromOptions(options ServerOptions) streamLimits {
 	return streamLimits{maxMessages: options.MaxStreamMessages, maxBodySize: options.MaxStreamBodySize, idleTimeout: options.StreamIdleTimeout}
 }
 
+type immediateCancelReadStream interface {
+	trevrpcCancelRead()
+}
+
+func cancelStreamRead(stream any) {
+	if cancellable, ok := stream.(immediateCancelReadStream); ok {
+		cancellable.trevrpcCancelRead()
+	}
+}
+
 type limitedByteStream struct {
 	inner          ByteStream
 	ctx            context.Context
 	limits         streamLimits
 	direction      string
+	lease          *requestExecutionLease
+	request        *RpcRequest
 	messages       int
 	bodySize       int
 	stopCancelRead func()
 	done           bool
 }
 
-func limitByteStream(ctx context.Context, inner ByteStream, limits streamLimits, direction string) ByteStream {
-	stream := &limitedByteStream{inner: inner, ctx: ctx, limits: limits, direction: direction}
+func limitByteStream(ctx context.Context, inner ByteStream, limits streamLimits, direction string, lease *requestExecutionLease, request *RpcRequest) ByteStream {
+	stream := &limitedByteStream{inner: inner, ctx: ctx, limits: limits, direction: direction, lease: lease, request: request}
 	if cancellable, ok := inner.(contextCancelReadStream); ok {
 		stream.stopCancelRead = cancellable.trevrpcCancelReadOnContext(ctx)
 	}
@@ -601,7 +1264,7 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, s.direction)
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, s.direction, s.lease, s.request)
 	if err != nil {
 		s.finish()
 		return nil, err
@@ -636,28 +1299,29 @@ func (s *limitedByteStream) finish() {
 	}
 }
 
-func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout time.Duration, direction string) ([]byte, error) {
+func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout time.Duration, direction string, lease *requestExecutionLease, request *RpcRequest) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
 	if idleTimeout <= 0 && (isNonBlockingStream(stream) || streamContextCancelsRecv(stream)) {
 		body, err := recvByte(stream, direction)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, statusFromContextError(ctxErr)
-			}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, statusFromContextError(ctxErr)
 		}
-
 		return body, err
 	}
-
 	type recvResult struct {
 		body []byte
 		err  error
 	}
-
+	phase := ServerDiagnosticRequestStreamPanic
+	if direction == "response" {
+		phase = ServerDiagnosticResponseStreamPanic
+	}
 	results := make(chan recvResult, 1)
+	execution := lease.retain(phase)
 	go func() {
+		defer execution.finish()
 		body, err := recvByte(stream, direction)
 		results <- recvResult{body: body, err: err}
 	}()
@@ -669,13 +1333,19 @@ func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout tim
 		idle = timer.C
 		defer timer.Stop()
 	}
-
 	select {
 	case result := <-results:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, statusFromContextError(ctxErr)
+		}
 		return result.body, result.err
 	case <-ctx.Done():
+		cancelStreamRead(stream)
+		execution.detach()
 		return nil, statusFromContextError(ctx.Err())
 	case <-idle:
+		cancelStreamRead(stream)
+		execution.detach()
 		return nil, Unavailable(fmt.Sprintf("%s stream idle timeout", direction))
 	}
 }
@@ -683,10 +1353,13 @@ func recvByteWithTimeout(ctx context.Context, stream ByteStream, idleTimeout tim
 func recvByte(stream ByteStream, direction string) (body []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = Internal(fmt.Sprintf("%s stream panicked: %v", direction, recovered))
+			phase := ServerDiagnosticRequestStreamPanic
+			if direction == "response" {
+				phase = ServerDiagnosticResponseStreamPanic
+			}
+			err = &serverPanicError{phase: phase, recovered: recovered, stack: debug.Stack()}
 		}
 	}()
-
 	return stream.Recv()
 }
 
@@ -707,7 +1380,9 @@ func checkStreamLimits(direction string, limits streamLimits, messages, bodySize
 
 type serverResponseStream struct {
 	inner           ByteStream
-	metrics         Metrics
+	runtime         *serverRuntime
+	request         *RpcRequest
+	lease           *requestExecutionLease
 	service         string
 	method          string
 	requestBodyLen  int
@@ -734,20 +1409,21 @@ func (s *serverResponseStream) Recv() (*RpcStreamFrame, error) {
 		return nil, io.EOF
 	}
 
-	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response")
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response", s.lease, s.request)
 	if err == io.EOF {
-		s.finish(CodeOK)
-		return StatusFrame(OK()), nil
+		status := s.terminalResponseStatus()
+		s.finish(status.Code)
+		return StatusFrame(status), nil
 	}
 
 	if err != nil {
-		status := StatusFromError(err)
+		status := s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request)
 		s.finish(status.Code)
 		return StatusFrame(status), nil
 	}
 
 	if err := checkStreamLimits("response", s.limits, &s.messages, &s.responseBodyLen, len(body)); err != nil {
-		status := StatusFromError(err)
+		status := s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request)
 		s.finish(status.Code)
 		return StatusFrame(status), nil
 	}
@@ -864,14 +1540,8 @@ func (s *serverResponseStream) finish(code Code) {
 		s.done = true
 		s.cancel()
 		closeMessageStream(s.inner)
-		recordRPCFinished(s.metrics, RPCFinished{
-			Service:         s.service,
-			Method:          s.method,
-			RequestBodyLen:  s.requestBodyLen,
-			ResponseBodyLen: s.responseBodyLen,
-			Code:            code,
-			Elapsed:         time.Since(s.startedAt),
-		})
+		s.runtime.recordFinished(RPCFinished{Service: s.service, Method: s.method, RequestBodyLen: s.requestBodyLen, ResponseBodyLen: s.responseBodyLen, Code: code, Elapsed: time.Since(s.startedAt)}, s.request)
+		s.lease.release()
 	})
 }
 
@@ -883,12 +1553,12 @@ func (s *serverResponseStream) readNextResponseItem() responseStreamItem {
 		return responseStreamItem{body: body}
 	}
 
-	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response")
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response", s.lease, s.request)
 	if err == io.EOF {
-		return responseStreamItem{status: OK()}
+		return responseStreamItem{status: s.terminalResponseStatus()}
 	}
 	if err != nil {
-		return responseStreamItem{status: StatusFromError(err)}
+		return responseStreamItem{status: s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request)}
 	}
 
 	return responseStreamItem{body: body}
@@ -900,6 +1570,19 @@ func (s *serverResponseStream) acceptResponseBody(body []byte) *Status {
 	}
 
 	return nil
+}
+
+func (s *serverResponseStream) terminalResponseStatus() *Status {
+	terminal, aware := s.inner.(terminalStatusByteStream)
+	if !aware {
+		return OK()
+	}
+
+	status, present := terminal.trevrpcTerminalStatus()
+	if !present || status == nil {
+		return s.runtime.wireStatus(Internal("response stream reached EOF without a terminal status"), ServerDiagnosticInternalError, s.request)
+	}
+	return s.runtime.wireStatus(status, ServerDiagnosticInternalError, s.request)
 }
 
 func (s *serverResponseStream) writeResponseStatusFrame(writer io.Writer, maxFrameSize int, status *Status) (bool, error) {
@@ -929,14 +1612,4 @@ func responseBatchReachedStreamLimit(limits streamLimits, messages, bodySize int
 	}
 
 	return false
-}
-
-func recordRPCStarted(metrics Metrics, event RPCStarted) {
-	defer func() { _ = recover() }()
-	metrics.RPCStarted(event)
-}
-
-func recordRPCFinished(metrics Metrics, event RPCFinished) {
-	defer func() { _ = recover() }()
-	metrics.RPCFinished(event)
 }

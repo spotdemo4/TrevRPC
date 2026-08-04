@@ -6,7 +6,11 @@
   gnugrep,
   repoRoot,
   benchPeer ? false,
+  conformancePeer ? false,
 }:
+assert lib.assertMsg (
+  !(benchPeer && conformancePeer)
+) "trevrpc-go benchPeer and conformancePeer are mutually exclusive";
 let
   goSource = lib.fileset.difference ./. ./default.nix;
 
@@ -24,7 +28,7 @@ let
     };
     sourceRoot = "${final.src.name}/trevrpc-go";
     env.GOWORK = "off";
-    vendorHash = "sha256-mgF3Ijy2WIM/LxSDr7wDcWa6rgqQ+DSu0V6tgqGWHRo=";
+    vendorHash = "sha256-oScgto4J7jT17Wq3tTrAOSW8hw8C9WGIMEMgTjHzTr0=";
     subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
 
     doCheck = true;
@@ -73,7 +77,7 @@ let
     };
     sourceRoot = "${final.src.name}/trevrpc-go/cmd/trevrpc-bench-peer";
     env.GOWORK = "off";
-    vendorHash = "sha256-Drj0AXZ6zl7oetEMrvSumBB+m+CodEMzBURPa2qBwQA=";
+    vendorHash = "sha256-l3f5gyohzNr8bqYMBw7h0TJK0p7ae+QCw4OK6j43bn0=";
     subPackages = [ "." ];
     postInstall = ''
       mv $out/bin/trevrpc-bench-peer $out/bin/trevrpc-bench-peer-go
@@ -101,5 +105,52 @@ let
       platforms = lib.platforms.linux;
     };
   });
+
+  conformance = buildGoModule (final: {
+    pname = "trevrpc-go-conformance-peer";
+    version = "0.1.0";
+
+    src = lib.fileset.toSource {
+      root = repoRoot;
+      fileset = lib.fileset.unions [
+        (repoRoot + "/testdata/wire-golden-vectors.txt")
+        goSource
+      ];
+    };
+    sourceRoot = "${final.src.name}/trevrpc-go";
+    env.GOWORK = "off";
+    vendorHash = "sha256-oScgto4J7jT17Wq3tTrAOSW8hw8C9WGIMEMgTjHzTr0=";
+    subPackages = [ "cmd/trevrpc-conformance-go" ];
+
+    doCheck = true;
+    checkPhase = ''
+      runHook preCheck
+      go test ./cmd/trevrpc-conformance-go
+      runHook postCheck
+    '';
+
+    doInstallCheck = true;
+    nativeInstallCheckInputs = [ gnugrep ];
+    installCheckPhase = ''
+      runHook preInstallCheck
+      test "$(find $out/bin -maxdepth 1 -type f | wc -l)" -eq 1
+      printf 'STOP\n' | $out/bin/trevrpc-conformance-go --protocol 1 > peer.out
+      grep -q '"event":"ready"' peer.out
+      grep -q '"peer":"go"' peer.out
+      runHook postInstallCheck
+    '';
+
+    meta = {
+      mainProgram = "trevrpc-conformance-go";
+      description = "Go TrevRPC conformance process peer";
+      license = lib.licenses.mit;
+      platforms = lib.platforms.linux;
+    };
+  });
 in
-if benchPeer then peer else normal
+if conformancePeer then
+  conformance
+else if benchPeer then
+  peer
+else
+  normal

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -170,6 +171,141 @@ func TestHTTP3AdmissionReceivesRequestAndCanReject(t *testing.T) {
 		if admission.Request == nil || admission.Path != DefaultHTTP3Path || admission.Method != http.MethodPost || admission.Authority == "" || !admission.Secure {
 			t.Fatalf("incomplete admission request: %#v", admission)
 		}
+	}
+}
+
+func TestServerAdmissionCallbacksUseSnapshotsAndAreBounded(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*Server, chan struct{}, chan struct{})
+		invoke    func(*serverRuntime, *http.Request) (bool, error)
+	}{
+		{name: "http3", configure: func(server *Server, entered, release chan struct{}) {
+			server.SetOptions(ServerOptions{MaxConcurrentAdmissionCallbacks: 1, HTTP3Admission: func(request HTTP3AdmissionRequest) bool {
+				request.Request.Header.Set("X-Mutated", "yes")
+				request.Request.URL.Path = "/mutated"
+				close(entered)
+				<-release
+				return true
+			}})
+		}, invoke: func(runtime *serverRuntime, request *http.Request) (bool, error) {
+			return runtime.http3Admitted(request)
+		}},
+		{name: "webtransport", configure: func(server *Server, entered, release chan struct{}) {
+			server.SetOptions(ServerOptions{MaxConcurrentAdmissionCallbacks: 1, WebTransportAdmission: func(request WebTransportAdmissionRequest) bool {
+				request.Request.Header.Set("X-Mutated", "yes")
+				request.Request.URL.Path = "/mutated"
+				close(entered)
+				<-release
+				return true
+			}})
+		}, invoke: func(runtime *serverRuntime, request *http.Request) (bool, error) {
+			return runtime.webTransportAdmitted(request)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer()
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			test.configure(server, entered, release)
+			runtime := server.freeze()
+			request := httptest.NewRequest(http.MethodPost, "https://example.test/trevrpc", nil)
+			request.Header.Set("X-Original", "yes")
+			first := make(chan error, 1)
+			go func() { _, err := test.invoke(runtime, request); first <- err }()
+			select {
+			case <-entered:
+			case <-time.After(testTimeout):
+				t.Fatal("admission callback did not start")
+			}
+			if admitted, err := test.invoke(runtime, request); admitted || err != errAdmissionSaturated {
+				t.Fatalf("saturated admission = %t, %v", admitted, err)
+			}
+			if request.Header.Get("X-Mutated") != "" || request.URL.Path != "/trevrpc" {
+				t.Fatalf("admission callback mutated original request: %s %#v", request.URL.Path, request.Header)
+			}
+			close(release)
+			select {
+			case err := <-first:
+				if err != nil {
+					t.Fatalf("first admission: %v", err)
+				}
+			case <-time.After(testTimeout):
+				t.Fatal("first admission did not finish")
+			}
+		})
+	}
+}
+
+func TestHTTP3AdmissionPanicIsGenericAndFutureRequestsContinue(t *testing.T) {
+	var calls atomic.Int64
+	running := startTestHTTP3Server(t, false, func(server *Server) {
+		options := server.Options()
+		options.HTTP3Admission = func(HTTP3AdmissionRequest) bool {
+			if calls.Add(1) == 1 {
+				panic("secret admission panic")
+			}
+			return true
+		}
+		server.SetOptions(options)
+	})
+	client := newTestHTTP3HTTPClient(t, running)
+	body := encodeTestHTTP3Request(t, NewRpcRequest(testServiceName, "SayHello", mustEncodeTestMessage(t, "after panic")))
+	request, err := http.NewRequest(http.MethodPost, "https://"+running.addr+DefaultHTTP3Path, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", HTTP3ContentType)
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("panic request: %v", err)
+	}
+	failureBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError || string(failureBody) != "internal server error\n" {
+		t.Fatalf("admission panic leaked remotely: status=%d body=%q", response.StatusCode, failureBody)
+	}
+
+	request, err = http.NewRequest(http.MethodPost, "https://"+running.addr+DefaultHTTP3Path, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", HTTP3ContentType)
+	response, err = client.Do(request)
+	if err != nil {
+		t.Fatalf("request after admission panic: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status after admission panic = %d", response.StatusCode)
+	}
+}
+
+func TestAdmissionCallbackPanicsAreContainedForBothTransports(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		set  func(*Server)
+		call func(*serverRuntime, *http.Request) (bool, error)
+	}{
+		{name: "http3", set: func(server *Server) {
+			server.SetOptions(ServerOptions{HTTP3Admission: func(HTTP3AdmissionRequest) bool { panic("boom") }})
+		}, call: func(runtime *serverRuntime, request *http.Request) (bool, error) {
+			return runtime.http3Admitted(request)
+		}},
+		{name: "webtransport", set: func(server *Server) {
+			server.SetOptions(ServerOptions{WebTransportAdmission: func(WebTransportAdmissionRequest) bool { panic("boom") }})
+		}, call: func(runtime *serverRuntime, request *http.Request) (bool, error) {
+			return runtime.webTransportAdmitted(request)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer()
+			test.set(server)
+			admitted, err := test.call(server.freeze(), httptest.NewRequest(http.MethodPost, "https://example.test/trevrpc", nil))
+			if admitted || err == nil {
+				t.Fatalf("panic admission = %t, %v", admitted, err)
+			}
+		})
 	}
 }
 

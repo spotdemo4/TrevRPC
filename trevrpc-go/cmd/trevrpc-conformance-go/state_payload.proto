@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package trevrpc.conformance;
+
+option go_package = "trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-conformance-go;main";
+
+message StatePayload {
+  bytes body = 3;
+}
