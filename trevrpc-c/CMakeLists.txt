@@ -570,6 +570,7 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_sanitizers(trevrpc_server_lifecycle_test)
 
         add_test(NAME trevrpc_server_lifecycle COMMAND trevrpc_server_lifecycle_test)
+        set_tests_properties(trevrpc_server_lifecycle PROPERTIES TIMEOUT 30)
 
         add_executable(trevrpc_runtime_test tests/runtime_test.c)
         target_include_directories(trevrpc_runtime_test PRIVATE src)

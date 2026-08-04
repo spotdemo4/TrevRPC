@@ -162,6 +162,13 @@ struct trevrpc_call {
     bool close_stream_active;
 };
 
+#ifdef TREVRPC_TESTING
+enum {
+    TREVRPC_TEST_SERVER_WAIT_AFTER_PREDICATE = 1u,
+    TREVRPC_TEST_SERVER_WAIT_BEFORE_COND_WAIT = 2u,
+};
+#endif
+
 struct trevrpc_server_conn_ref {
     trevrpc_server_conn_ref* next;
     trevrpc_msquic_conn* conn;
@@ -209,6 +216,8 @@ struct trevrpc_server {
     uint8_t test_last_envelope[128];
     size_t test_last_envelope_len;
     bool test_last_envelope_finished_send;
+    void (*test_wait_hook)(uint32_t event, void* user_data);
+    void* test_wait_hook_user_data;
 #endif
     size_t active_tasks;
     size_t active_connections;
@@ -3988,6 +3997,35 @@ int trevrpc_test_server_release_from_callback(trevrpc_server* server) {
     return err;
 }
 
+void trevrpc_test_server_set_wait_hook(
+    trevrpc_server* server, void (*hook)(uint32_t event, void* user_data), void* user_data) {
+    if (server == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&server->mutex);
+    server->test_wait_hook = hook;
+    server->test_wait_hook_user_data = user_data;
+    pthread_mutex_unlock(&server->mutex);
+}
+
+int trevrpc_test_server_try_lock_wait_mutex(trevrpc_server* server) {
+    if (server == NULL) {
+        return -EINVAL;
+    }
+    int err = pthread_mutex_trylock(&server->mutex);
+    if (err != 0) {
+        return -err;
+    }
+    err = pthread_mutex_unlock(&server->mutex);
+    return err == 0 ? 0 : -err;
+}
+
+static void trevrpc_test_server_wait_event(trevrpc_server* server, uint32_t event) {
+    if (server->test_wait_hook != NULL) {
+        server->test_wait_hook(event, server->test_wait_hook_user_data);
+    }
+}
+
 #endif
 
 static bool trevrpc_server_mutation_allowed_locked(const trevrpc_server* server) {
@@ -6746,8 +6784,8 @@ int trevrpc_server_wait_until(trevrpc_server* server, uint64_t monotonic_deadlin
         return -EDEADLK;
     }
 
+    pthread_mutex_lock(&server->mutex);
     for (;;) {
-        pthread_mutex_lock(&server->mutex);
         if (server->lifecycle_phase == TREVRPC_SERVER_PHASE_STOPPED) {
             pthread_mutex_unlock(&server->mutex);
             return 0;
@@ -6769,17 +6807,27 @@ int trevrpc_server_wait_until(trevrpc_server* server, uint64_t monotonic_deadlin
             pthread_mutex_unlock(&server->mutex);
             return 0;
         }
-        pthread_mutex_unlock(&server->mutex);
 
         if (shutdown_connections) {
+            pthread_mutex_unlock(&server->mutex);
             trevrpc_server_shutdown_connections(server);
+            pthread_mutex_lock(&server->mutex);
             continue;
         }
 
-        pthread_mutex_lock(&server->mutex);
+#ifdef TREVRPC_TESTING
+        trevrpc_test_server_wait_event(server, TREVRPC_TEST_SERVER_WAIT_AFTER_PREDICATE);
+#endif
+
         if (monotonic_deadline_nanos == TREVRPC_DEADLINE_INFINITE) {
-            pthread_cond_wait(&server->cond, &server->mutex);
-            pthread_mutex_unlock(&server->mutex);
+#ifdef TREVRPC_TESTING
+            trevrpc_test_server_wait_event(server, TREVRPC_TEST_SERVER_WAIT_BEFORE_COND_WAIT);
+#endif
+            int err = pthread_cond_wait(&server->cond, &server->mutex);
+            if (err != 0) {
+                pthread_mutex_unlock(&server->mutex);
+                return -err;
+            }
             continue;
         }
 
@@ -6809,12 +6857,12 @@ int trevrpc_server_wait_until(trevrpc_server* server, uint64_t monotonic_deadlin
                 return err;
             }
         }
+#ifdef TREVRPC_TESTING
+        trevrpc_test_server_wait_event(server, TREVRPC_TEST_SERVER_WAIT_BEFORE_COND_WAIT);
+#endif
         err = pthread_cond_timedwait(&server->cond, &server->mutex, &wait_deadline);
-        pthread_mutex_unlock(&server->mutex);
-        if (err == ETIMEDOUT) {
-            return -ETIMEDOUT;
-        }
-        if (err != 0) {
+        if (err != 0 && err != ETIMEDOUT) {
+            pthread_mutex_unlock(&server->mutex);
             return -err;
         }
     }
