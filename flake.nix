@@ -13,6 +13,7 @@
   inputs = {
     systems.url = "github:spotdemo4/systems";
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    nixpkgs-glibc-2-39.url = "github:nixos/nixpkgs/nixos-24.05";
     trevpkgs = {
       url = "github:spotdemo4/trevpkgs";
       inputs.systems.follows = "systems";
@@ -23,6 +24,7 @@
   outputs =
     {
       self,
+      nixpkgs-glibc-2-39,
       trevpkgs,
       ...
     }:
@@ -164,7 +166,7 @@
                 --refresh-dependencies \
                 --write-locks \
                 --write-verification-metadata sha256 \
-                resolveAndLockAll
+                resolveAndLockAll :core:dokkaGeneratePublicationHtml
 
               update_script=$(nix build .#trevrpc-kotlin.mitmCache.updateScript --no-link --print-out-paths)
               USE_BWRAP=0 "$update_script"
@@ -177,13 +179,17 @@
         packages =
           let
             bench = pkgs.callPackage ./bench {
-              sourceCommit = self.rev or (self.dirtyRev or "unknown");
+              repoRoot = ./.;
+              sourceCommit = self.rev or (self.dirtyRev or "unversioned");
               sourceDirty = if self ? rev then "false" else "true";
             };
             c = pkgs.callPackage ./trevrpc-c {
               repoRoot = ./.;
             };
             cBenchPeer = c.override { benchPeer = true; };
+            cFamilyConformancePeers = pkgs.callPackage ./conformance/adapters/c-family {
+              repoRoot = ./.;
+            };
             cpp = pkgs.callPackage ./trevrpc-cpp {
               repoRoot = ./.;
               trevrpcC = c;
@@ -193,11 +199,44 @@
               repoRoot = ./.;
             };
             goBenchPeer = go.override { benchPeer = true; };
+            goConformancePeer = go.override { conformancePeer = true; };
+            portablePkgs = import nixpkgs-glibc-2-39 {
+              inherit system;
+            };
+            portableLibmsquic =
+              (portablePkgs.callPackage (pkgs.path + "/pkgs/by-name/li/libmsquic/package.nix") {
+                fetchFromGitHub =
+                  args: portablePkgs.fetchFromGitHub (builtins.removeAttrs args [ "tag" ] // { rev = args.tag; });
+              }).overrideAttrs
+                (_: {
+                  dontPatchELF = true;
+                });
+            jsNative =
+              if system == "x86_64-linux" then
+                pkgs.callPackage ./trevrpc-js/native-package.nix {
+                  inherit portablePkgs;
+                  libmsquic = portableLibmsquic;
+                  repoRoot = ./.;
+                }
+              else
+                null;
             js = pkgs.callPackage ./trevrpc-js {
               repoRoot = ./.;
               trevrpcC = c;
+              nativePackage = jsNative;
             };
+            jsNpmStage =
+              if system == "x86_64-linux" then
+                pkgs.callPackage ./trevrpc-js/npm-stage.nix {
+                  repoRoot = ./.;
+                  trevrpcC = c;
+                  nativePackage = jsNative;
+                  nodejs_20 = portablePkgs.nodejs_20;
+                }
+              else
+                null;
             jsBenchPeer = js.override { benchPeer = true; };
+            jsConformancePeer = js.override { conformancePeer = true; };
             chromiumBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
               repoRoot = ./.;
               trevrpcJs = js;
@@ -207,26 +246,47 @@
               repoRoot = ./.;
             };
             kotlinBenchPeer = kotlin.override { benchPeer = true; };
+            kotlinConformancePeer = kotlin.override { conformancePeer = true; };
             rust = pkgs.callPackage ./trevrpc-rust {
               repoRoot = ./.;
             };
             rustBenchPeer = rust.override { benchPeer = true; };
+            rustConformancePeer = rust.override { conformancePeer = true; };
           in
           {
             trevrpc-bench = bench;
             trevrpc-c = c;
             trevrpc-c-bench-peer = cBenchPeer;
+            trevrpc-c-conformance-peer = cFamilyConformancePeers;
             trevrpc-cpp = cpp;
             trevrpc-cpp-bench-peer = cppBenchPeer;
+            trevrpc-cpp-conformance-peer = cFamilyConformancePeers;
             trevrpc-go = go;
             trevrpc-go-bench-peer = goBenchPeer;
+            trevrpc-go-conformance-peer = goConformancePeer;
             trevrpc-js = js;
             trevrpc-js-bench-peer = jsBenchPeer;
+            trevrpc-js-conformance-peer = jsConformancePeer;
             trevrpc-chromium-bench-peer = chromiumBenchPeer;
             trevrpc-kotlin = kotlin;
             trevrpc-kotlin-bench-peer = kotlinBenchPeer;
+            trevrpc-kotlin-conformance-peer = kotlinConformancePeer;
             trevrpc-rust = rust;
             trevrpc-rust-bench-peer = rustBenchPeer;
+            trevrpc-rust-conformance-peer = rustConformancePeer;
+
+            trevrpc-conformance-suite = pkgs.symlinkJoin {
+              name = "trevrpc-conformance-suite";
+              paths = [
+                bench
+                cFamilyConformancePeers
+                goConformancePeer
+                jsConformancePeer
+                kotlinConformancePeer
+                rustConformancePeer
+              ];
+              meta.platforms = [ "x86_64-linux" ];
+            };
 
             trevrpc-bench-suite = pkgs.symlinkJoin {
               name = "trevrpc-bench-suite";
@@ -242,6 +302,10 @@
               ];
               meta.platforms = [ "x86_64-linux" ];
             };
+          }
+          // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+            trevrpc-js-native-linux-x64-gnu = jsNative;
+            trevrpc-js-npm-stage = jsNpmStage;
           };
 
         # nix fmt
@@ -265,12 +329,53 @@
           c-sanitizers = self.packages.${system}.trevrpc-c.override {
             sanitizers = true;
           };
+          ${if system == "x86_64-linux" then "c-tsan" else null} =
+            self.packages.${system}.trevrpc-c.override
+              {
+                threadSanitizer = true;
+              };
+          c-family-sanitizers = self.packages.${system}.trevrpc-c-conformance-peer.override {
+            sanitizers = true;
+          };
 
           cpp = self.packages.${system}.trevrpc-cpp;
+          cpp-sanitizers = self.packages.${system}.trevrpc-cpp.override {
+            sanitizers = true;
+            trevrpcC = self.packages.${system}.trevrpc-c.override {
+              sanitizers = true;
+            };
+          };
           rust = self.packages.${system}.trevrpc-rust;
           go = self.packages.${system}.trevrpc-go;
           js = self.packages.${system}.trevrpc-js;
+          ${if system == "x86_64-linux" then "js-npm-stage" else null} =
+            self.packages.${system}.trevrpc-js-npm-stage;
           kotlin = self.packages.${system}.trevrpc-kotlin;
+          kotlin-maven-consumer =
+            let
+              publicationTests = pkgs.lib.fileset.toSource {
+                root = ./trevrpc-kotlin/publication-tests;
+                fileset = pkgs.lib.fileset.unions [
+                  ./trevrpc-kotlin/publication-tests/maven
+                  ./trevrpc-kotlin/publication-tests/proto
+                  ./trevrpc-kotlin/publication-tests/sources
+                ];
+              };
+            in
+            pkgs.maven.buildMavenPackage {
+              pname = "trevrpc-kotlin-maven-consumer";
+              version = "0.1.0";
+              src = publicationTests;
+              sourceRoot = "source/maven";
+              mvnHash = "sha256-rImtM+XfS3e5wv9z7COVr+jUo0pPbkui/DsTbjD56Lk=";
+              mvnJdk = pkgs.jdk25;
+              mvnGoal = "verify";
+              mvnParameters = "-Dtrevrpc.repository=file://${self.packages.${system}.trevrpc-kotlin}/share/maven";
+              doCheck = false;
+              installPhase = ''
+                mkdir -p $out
+              '';
+            };
 
           benchmark-proto-sync =
             pkgs.runCommand "trevrpc-benchmark-proto-sync"
@@ -280,6 +385,7 @@
                   protobuf
                   protoc-gen-go
                   protoc-gen-go-grpc
+                  self.packages.${system}.trevrpc-go
                 ];
               }
               ''
@@ -306,6 +412,12 @@
                    --replace-fail 'interface{}' 'any'
                  gofmt -w generated/benchmark_grpc.pb.go
                  cmp generated/benchmark_grpc.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark_grpc.pb.go}
+                 protoc \
+                   --proto_path=${./bench/proto} \
+                   --trevrpc-go_out=generated \
+                   --trevrpc-go_opt=paths=source_relative,service_prefix=Native \
+                   ${./bench/proto}/benchmark.proto
+                 cmp generated/benchmark.trevrpc.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go}
                     touch $out
               '';
 
@@ -483,6 +595,107 @@
               oxfmt --check
             '';
           };
+
+          conformance-m3 =
+            let
+              conformanceSource = pkgs.lib.fileset.toSource {
+                root = ./.;
+                fileset = pkgs.lib.fileset.unions [
+                  ./conformance
+                  ./testdata/wire-golden-vectors.txt
+                ];
+              };
+              controller = self.packages.${system}.trevrpc-bench;
+              cPeer = self.packages.${system}.trevrpc-c-conformance-peer;
+              cppPeer = self.packages.${system}.trevrpc-cpp-conformance-peer;
+              goPeer = self.packages.${system}.trevrpc-go-conformance-peer;
+              jsPeer = self.packages.${system}.trevrpc-js-conformance-peer;
+              kotlinPeer = self.packages.${system}.trevrpc-kotlin-conformance-peer;
+              rustPeer = self.packages.${system}.trevrpc-rust-conformance-peer;
+            in
+            pkgs.runCommand "trevrpc-conformance-m3"
+              {
+                nativeBuildInputs = [
+                  controller
+                  pkgs.coreutils
+                  pkgs.gnugrep
+                  pkgs.jq
+                ];
+                meta.platforms = [ "x86_64-linux" ];
+              }
+              ''
+                set -euo pipefail
+                ulimit -v 6291456
+                export JAVA_TOOL_OPTIONS="-Xmx1024m -XX:MaxMetaspaceSize=512m"
+                m0_suite=${conformanceSource}/conformance/suites/m0.json
+                suite=${conformanceSource}/conformance/suites/m3.json
+
+                trevrpc-conformance validate "$m0_suite" | grep -q '63 cases'
+                timeout --kill-after=5s 60s \
+                  trevrpc-conformance run "$m0_suite" --out "$TMPDIR/m0" \
+                    --peer go=${goPeer}/bin/trevrpc-conformance-go
+                test "$(wc -l < "$TMPDIR/m0/results.jsonl")" -eq 63
+                jq -e '
+                  .peers.go == {total:63,passed:63,allowed:0,failed:0,skipped:0} and
+                  .overall == {total:63,passed:63,allowed:0,failed:0,skipped:0} and
+                  .clean_shutdown == true
+                ' "$TMPDIR/m0/summary.json" >/dev/null
+
+                trevrpc-conformance validate "$suite" | grep -q '90 cases'
+                mkdir -p "$out"
+                timeout --kill-after=5s 300s \
+                  trevrpc-conformance run "$suite" --out "$out" \
+                    --peer c=${cPeer}/bin/trevrpc-conformance-c \
+                    --peer cpp=${cppPeer}/bin/trevrpc-conformance-cpp \
+                    --peer go=${goPeer}/bin/trevrpc-conformance-go \
+                    --peer js=${jsPeer}/bin/trevrpc-conformance-js \
+                    --peer kotlin=${kotlinPeer}/bin/trevrpc-conformance-kotlin \
+                    --peer rust=${rustPeer}/bin/trevrpc-conformance-rust
+
+                test "$(wc -l < "$out/results.jsonl")" -eq 540
+                jq -e '
+                  .peers.c == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
+                  .peers.cpp == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
+                  .peers.go == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
+                  .peers.js == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
+                  .peers.kotlin == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
+                  .peers.rust == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
+                  .overall == {total:540,passed:540,allowed:0,failed:0,skipped:0} and
+                  .clean_shutdown == true
+                ' "$out/summary.json" >/dev/null
+                jq -e '
+                  .source_revision != "unknown" and
+                  .limits.max_command_bytes == 262144 and
+                  .peer_resolution == "absolute_overrides" and
+                  .allowance_policy == "forbid" and
+                  .suite_path == "inputs/conformance/suites/m3.json" and
+                  .golden_path == "inputs/testdata/wire-golden-vectors.txt" and
+                  (.corpus | length) == 6 and
+                  (.peers | length) == 6 and
+                  all(.peers[];
+                    (.executable | startswith("/nix/store/")) and
+                    (.sha256 | test("^[0-9a-f]{64}$"))
+                  )
+                ' "$out/manifest.json" >/dev/null
+                while IFS=$'\t' read -r relative expected; do
+                  test -f "$out/$relative"
+                  test "$(sha256sum "$out/$relative" | cut -d' ' -f1)" = "$expected"
+                done < <(
+                  jq -r '
+                    [.suite_path,.suite_sha256],
+                    [.golden_path,.golden_sha256],
+                    (.corpus[] | [.path,.sha256]) |
+                    @tsv
+                  ' "$out/manifest.json"
+                )
+                trevrpc-conformance validate \
+                  "$out/inputs/conformance/suites/m3.json" | grep -q '90 cases'
+                while IFS=$'\t' read -r executable expected; do
+                  test "$executable" = "$(realpath "$executable")"
+                  test -x "$executable"
+                  test "$(sha256sum "$executable" | cut -d' ' -f1)" = "$expected"
+                done < <(jq -r '.peers[] | [.executable,.sha256] | @tsv' "$out/manifest.json")
+              '';
         };
       }
     );

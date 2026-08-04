@@ -18,6 +18,7 @@ includes = ["*.nix"]
 command = "clang-format"
 options = ["-i"]
 includes = ["*.c", "*.cc", "*.cpp", "*.h", "*.hpp"]
+excludes = ["trevrpc-c/tests/golden/**"]
 
 [formatter.ktlint]
 command = "ktlint"

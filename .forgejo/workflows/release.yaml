@@ -68,15 +68,3 @@ jobs:
             --header "Authorization: token ${FORGEJO_TOKEN}" \
             --upload-file "${archive}" \
             "${FORGEJO_GO_UPLOAD_URL}"
-
-      - name: Release to NPM
-        working-directory: trevrpc-js
-        env:
-          SERVER_URL: ${{ forgejo.SERVER_URL }}
-          REPOSITORY_OWNER: ${{ forgejo.REPOSITORY_OWNER }}
-          PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-        run: | # zizmor: ignore[use-trusted-publishing]
-          npm config set @trev:registry "${SERVER_URL}/api/packages/${REPOSITORY_OWNER}/npm/"
-          npm config set "//trev.zip/api/packages/${REPOSITORY_OWNER}/npm/:_authToken=${PACKAGE_TOKEN}"
-          npm ci
-          npm publish --scope=@trev --registry="${SERVER_URL}/api/packages/${REPOSITORY_OWNER}/npm/"
