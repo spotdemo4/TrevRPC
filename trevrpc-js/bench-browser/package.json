@@ -16,7 +16,7 @@
     "test": "node --test test/chromium-peer.test.js"
   },
   "dependencies": {
-    "playwright-core": "^1.61.1"
+    "playwright-core": "^1.62.1"
   },
   "peerDependencies": {
     "trevrpc-bench-peer-js": "0.1.0",
