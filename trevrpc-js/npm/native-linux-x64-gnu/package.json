@@ -30,6 +30,6 @@
   ],
   "main": "trevrpc_native.node",
   "engines": {
-    "node": ">=20 <25"
+    "node": ">=24 <25"
   }
 }

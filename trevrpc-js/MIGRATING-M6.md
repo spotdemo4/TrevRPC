@@ -63,7 +63,7 @@ Custom generator runtime URLs such as `file:` require explicit `runtime_type_imp
 
 The main `trevrpc-js` tarball is platform-neutral. Native code is supplied by the exact optional dependency `@trev/trevrpc-js-native-linux-x64-gnu@0.2.0`.
 
-Initial native support is Linux x86-64 with glibc 2.39 or newer on Node 20, 22, and 24. Darwin, ARM, and musl installation remains usable for browser code; requesting a native Node channel fails with a `TrevRpcError(Code.Unavailable)` that names the detected target, supported target, expected optional package, load state, and original loader cause.
+Initial native support is Linux x86-64 with glibc 2.42 or newer on Node 24. Darwin, ARM, and musl installation remains usable for browser code; requesting a native Node channel fails with a `TrevRpcError(Code.Unavailable)` that names the detected target, supported target, expected optional package, load state, and original loader cause.
 
 Native failures exposed by Node transport and server APIs are normalized to `TrevRpcError`. `cause` preserves the native error and `nativeCode` preserves its numeric code. A failed operation is never replayed during channel reconnection.
 

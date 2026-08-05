@@ -2,8 +2,6 @@
   lib,
   buildNpmPackage,
   importNpmLock,
-  nodejs_20,
-  nodejs_22,
   nodejs_24,
   openssl,
   protobuf,
@@ -107,7 +105,7 @@ buildNpmPackage (final: {
 
         tsc="$PWD/node_modules/.bin/tsc"
         esbuild="$PWD/node_modules/.bin/esbuild"
-        for runtime in "${nodejs_20}" "${nodejs_22}" "${nodejs_24}"; do
+        for runtime in "${nodejs_24}"; do
           consumer="$TMPDIR/node-$(basename "$runtime")"
           mkdir -p "$consumer/generated"
           printf '%s\n' '{"private":true,"type":"module"}' > "$consumer/package.json"
@@ -208,8 +206,8 @@ buildNpmPackage (final: {
             '{
               version: "0.2.0",
               publication: "local-stage-only",
-              native_target: "linux/x64/glibc>=2.39",
-              node_versions: [20, 22, 24],
+              native_target: "linux/x64/glibc>=2.42",
+              node_versions: [24],
               rpc_shapes: ["unary", "client-streaming", "server-streaming", "bidirectional-streaming"],
               browser: { bundler_types: true, esbuild: true, chromium_unary: true },
               sha256: { "trevrpc-js-0.2.0.tgz": $core, "trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz": $native }

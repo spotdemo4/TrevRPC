@@ -13,7 +13,6 @@
   inputs = {
     systems.url = "github:spotdemo4/systems";
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
-    nixpkgs-glibc-2-39.url = "github:nixos/nixpkgs/nixos-24.05";
     trevpkgs = {
       url = "github:spotdemo4/trevpkgs";
       inputs.systems.follows = "systems";
@@ -24,7 +23,6 @@
   outputs =
     {
       self,
-      nixpkgs-glibc-2-39,
       trevpkgs,
       ...
     }:
@@ -215,13 +213,10 @@
             };
             goBenchPeer = go.override { benchPeer = true; };
             goConformancePeer = go.override { conformancePeer = true; };
-            portablePkgs = import nixpkgs-glibc-2-39 {
-              inherit system;
-            };
-            portableLibmsquic =
-              (portablePkgs.callPackage (pkgs.path + "/pkgs/by-name/li/libmsquic/package.nix") {
+            nativeLibmsquic =
+              (pkgs.callPackage (pkgs.path + "/pkgs/by-name/li/libmsquic/package.nix") {
                 fetchFromGitHub =
-                  args: portablePkgs.fetchFromGitHub (builtins.removeAttrs args [ "tag" ] // { rev = args.tag; });
+                  args: pkgs.fetchFromGitHub (builtins.removeAttrs args [ "tag" ] // { rev = args.tag; });
               }).overrideAttrs
                 (_: {
                   dontPatchELF = true;
@@ -229,8 +224,7 @@
             jsNative =
               if system == "x86_64-linux" then
                 pkgs.callPackage ./trevrpc-js/native-package.nix {
-                  inherit portablePkgs;
-                  libmsquic = portableLibmsquic;
+                  libmsquic = nativeLibmsquic;
                   repoRoot = ./.;
                 }
               else
@@ -247,7 +241,6 @@
                   trevrpcC = c;
                   trevrpcJs = js;
                   nativePackage = jsNative;
-                  nodejs_20 = portablePkgs.nodejs_20;
                 }
               else
                 null;

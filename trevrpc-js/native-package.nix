@@ -1,10 +1,16 @@
 {
+  cmake,
   lib,
   libmsquic,
-  portablePkgs,
+  nodejs_24,
+  openssl,
+  patchelf,
+  perl,
+  pkg-config,
   repoRoot,
+  stdenv,
 }:
-portablePkgs.stdenv.mkDerivation {
+stdenv.mkDerivation {
   pname = "trevrpc-js-native-linux-x64-gnu";
   version = "0.2.0";
 
@@ -20,16 +26,16 @@ portablePkgs.stdenv.mkDerivation {
 
   sourceRoot = ".";
   strictDeps = true;
-  nativeBuildInputs = with portablePkgs; [
+  nativeBuildInputs = [
     cmake
-    nodejs_20
+    nodejs_24
     patchelf
     perl
     pkg-config
   ];
   buildInputs = [
     libmsquic
-    portablePkgs.openssl
+    openssl
   ];
 
   configurePhase = ''
@@ -40,7 +46,7 @@ portablePkgs.stdenv.mkDerivation {
       -DCMAKE_BUILD_TYPE=Release \
       -DTREVRPC_NODE_TEST_HOOKS=OFF \
       -DTREVRPC_C_ROOT="$src/trevrpc-c" \
-      -DNODE_INCLUDE_DIR="${portablePkgs.nodejs_20}/include/node"
+      -DNODE_INCLUDE_DIR="${nodejs_24}/include/node"
     runHook postConfigure
   '';
 
@@ -81,7 +87,7 @@ portablePkgs.stdenv.mkDerivation {
       readelf --version-info "$out/package/trevrpc_native.node"
       readelf --version-info "$out/package/libmsquic.so.2"
     } | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -1)"
-    test "$(printf '%s\n' "$max_glibc" 'GLIBC_2.39' | sort -V | tail -1)" = 'GLIBC_2.39'
+    test "$(printf '%s\n' "$max_glibc" 'GLIBC_2.42' | sort -V | tail -1)" = 'GLIBC_2.42'
     runHook postInstall
   '';
 
