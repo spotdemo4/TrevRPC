@@ -8,8 +8,7 @@
   "endpoint": "https://trev.zip/api/v1",
   "repositories": ["llc/TrevRPC"],
   "allowedCommands": [
-    "^fix-hash \\.#trevrpc-go$",
-    "^fix-hash \\.#trevrpc-go-bench-peer$",
+    "^nix run \\.#update-go-deps$",
     "^npm audit fix --prefix trevrpc-js$",
     "^nix run \\.#update-kotlin-deps$"
   ],
@@ -34,11 +33,8 @@
     "schedule": ["* * * * 0"], // sunday
     "skipInstalls": false,
     "postUpgradeTasks": {
-      "commands": [
-        "fix-hash .#trevrpc-go",
-        "fix-hash .#trevrpc-go-bench-peer",
-        "npm audit fix --prefix trevrpc-js"
-      ]
+      "commands": ["nix run .#update-go-deps", "npm audit fix --prefix trevrpc-js"],
+      "executionMode": "branch"
     }
   },
   "packageRules": [
@@ -62,9 +58,60 @@
       "matchManagers": ["gomod"],
       "addLabels": ["go"],
       "postUpgradeTasks": {
-        "commands": ["fix-hash .#trevrpc-go", "fix-hash .#trevrpc-go-bench-peer"],
+        "commands": ["nix run .#update-go-deps"],
+        "fileFilters": [
+          "trevrpc-go/go.mod",
+          "trevrpc-go/go.sum",
+          "trevrpc-go/go.work",
+          "trevrpc-go/go.work.sum",
+          "trevrpc-go/cmd/trevrpc-bench-peer/go.mod",
+          "trevrpc-go/cmd/trevrpc-bench-peer/go.sum",
+          "trevrpc-go/default.nix"
+        ],
         "executionMode": "branch"
       }
+    },
+    {
+      // quic-go and webtransport-go release as a compatible pair.
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/quic-go/quic-go", "github.com/quic-go/webtransport-go"],
+      "groupName": "quic-go transport stack",
+      "groupSlug": "quic-go-transport-stack",
+      "separateMajorMinor": false
+    },
+    {
+      // Maven publication checks inject this repository at runtime.
+      "matchManagers": ["maven"],
+      "matchFileNames": [
+        "trevrpc-kotlin/publication-tests/maven/**/pom.xml",
+        "trevrpc-kotlin/publication-tests/cronet/maven/**/pom.xml"
+      ],
+      "registryUrls": ["https://repo.maven.apache.org/maven2"]
+    },
+    {
+      // These coordinates are produced into a staged repository by this build.
+      "matchManagers": ["maven", "gradle"],
+      "matchFileNames": [
+        "trevrpc-kotlin/publication-tests/maven/**/pom.xml",
+        "trevrpc-kotlin/publication-tests/cronet/maven/**/pom.xml",
+        "trevrpc-kotlin/publication-tests/gradle/**/*.gradle.kts",
+        "trevrpc-kotlin/publication-tests/cronet/gradle/**/*.gradle.kts"
+      ],
+      "matchPackageNames": [
+        "zip.trev.trevrpc:core",
+        "zip.trev.trevrpc:transport-netty",
+        "zip.trev.trevrpc:transport-cronet",
+        "zip.trev.trevrpc:protoc-gen-trevrpc-kotlin",
+        "zip.trev.trevrpc.fixture:publication-consumers"
+      ],
+      "enabled": false
+    },
+    {
+      // cronet-api 500.x is an empty redirect to the aggregate cronet artifact.
+      "matchManagers": ["gradle"],
+      "matchDatasources": ["maven"],
+      "matchPackageNames": ["org.chromium.net:cronet-api"],
+      "allowedVersions": "/^[0-9]+\\.[0-9]{4,}\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$/"
     },
     {
       "matchManagers": ["gradle", "gradle-wrapper"],
@@ -82,6 +129,12 @@
         ],
         "executionMode": "branch"
       }
+    },
+    {
+      // The native package is built and versioned with trevrpc-js in this repository.
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["@trev/trevrpc-js-native-linux-x64-gnu"],
+      "enabled": false
     },
     {
       "matchManagers": ["npm"],

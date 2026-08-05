@@ -154,6 +154,21 @@
 
         # nix run [#...]
         apps = pkgs.mkApps {
+          update-go-deps = {
+            packages = with pkgs; [
+              go
+              fix-hash
+            ];
+            script = ''
+              go -C trevrpc-go work sync
+              GOWORK=off go -C trevrpc-go mod tidy
+              GOWORK=off go -C trevrpc-go/cmd/trevrpc-bench-peer mod tidy
+              go -C trevrpc-go work sync
+              fix-hash .#trevrpc-go
+              fix-hash .#trevrpc-go-bench-peer
+            '';
+          };
+
           update-kotlin-deps = {
             packages = with pkgs; [
               jdk25
