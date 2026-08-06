@@ -224,12 +224,11 @@
                 pkgs.callPackage ./trevrpc-js/native-package.nix {
                   libmsquic =
                     (pkgs.callPackage (pkgs.path + "/pkgs/by-name/li/libmsquic/package.nix") {
-                      fetchFromGitHub =
-                        args: pkgs.fetchFromGitHub (removeAttrs args [ "tag" ] // { rev = args.tag; });
+                      fetchFromGitHub = args: pkgs.fetchFromGitHub (removeAttrs args [ "tag" ] // { rev = args.tag; });
                     }).overrideAttrs
-                      (_: {
+                      {
                         dontPatchELF = true;
-                      });
+                      };
                   repoRoot = ./.;
                 }
               else
