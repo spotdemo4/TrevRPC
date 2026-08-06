@@ -4,6 +4,12 @@ project(trevrpc-c VERSION 0.2.0 LANGUAGES C)
 
 set(TREVRPC_C_ABI_VERSION 6)
 
+# Export compile_commands.json for clangd / editor integration. Honor a
+# user-provided value but default to ON.
+if(NOT DEFINED CMAKE_EXPORT_COMPILE_COMMANDS)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 

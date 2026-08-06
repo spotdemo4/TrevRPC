@@ -1,8 +1,17 @@
 -xc
 -std=c11
+-DQUIC_API_ENABLE_PREVIEW_FEATURES
 -Iinclude
 -Isrc
--I../build/generated-service-test
--I../build/generated-greeter-example
+# Fallback generated headers — keep in sync with trevrpc-c/.clangd.
+# Covers in-tree builds (trevrpc-c/build) and repo-root builds.
 -Ibuild/generated-service-test
 -Ibuild/generated-greeter-example
+-I../build/generated-service-test
+-I../build/generated-greeter-example
+-I../build/trevrpc-c-m3/generated-service-test
+-I../build/trevrpc-c-m3/generated-greeter-example
+-I../build/trevrpc-c-m3-sanitized/generated-service-test
+-I../build/trevrpc-c-m3-sanitized/generated-greeter-example
+-I../build/c-family-m3/generated-service-test
+-I../build/c-family-m3/generated-greeter-example

@@ -4,6 +4,11 @@
     "Shell Script": [".envrc*"]
   },
   "lsp": {
+    "clangd": {
+      "binary": {
+        "arguments": ["--query-driver=**", "--background-index", "--clang-tidy"]
+      }
+    },
     "nixd": {
       "settings": {
         "nixpkgs": {
