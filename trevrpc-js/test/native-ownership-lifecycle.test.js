@@ -1972,18 +1972,21 @@ const native = require(${JSON.stringify(nativeAddonPath)});
       skip: native == null,
     },
     async () => {
-      await forceGcCycles();
+      await forceGcCycles(10);
       const before = resourceFinalizerCount(native);
       let resource = native._debugCreatePendingResource();
-      const pending = resource.wait(75);
+      const weak = new WeakRef(resource);
+      const pending = resource.wait(500);
 
       await waitForCondition(() => resource.refs() === 1, "pending resource was not acquired");
       resource = null;
       await forceGcCycles(5);
 
+      assert.notEqual(weak.deref(), undefined);
       assert.equal(resourceFinalizerCount(native), before);
       await pending;
       await waitForResourceFinalizers(native, before + 1);
+      assert.equal(weak.deref(), undefined);
     },
   );
 }
