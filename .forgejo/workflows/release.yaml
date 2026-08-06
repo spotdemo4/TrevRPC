@@ -110,6 +110,10 @@ jobs:
       - name: Release to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # publishConfig.provenance=true would otherwise trigger Sigstore
+          # provenance which requires GitHub OIDC; Forgejo's OIDC issuer is not
+          # trusted by registry.npmjs.org (CA_CREATE_SIGNING_CERTIFICATE_ERROR).
+          NPM_CONFIG_PROVENANCE: "false"
         run: | # zizmor: ignore[use-trusted-publishing]
           set -euo pipefail
           cat "${stage}/manifest.json"
@@ -122,8 +126,8 @@ jobs:
           # NODE_AUTH_TOKEN alone is not sufficient; npm reads auth from .npmrc.
           # `nix-init` does not configure npm auth like `actions/setup-node` does.
           echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
-          npm publish --provenance --access public "$native_tgz"
-          npm publish --provenance --access public "$core_tgz"
+          npm publish --access public "$native_tgz"
+          npm publish --access public "$core_tgz"
 
   maven:
     # zizmor: ignore[excessive-permissions]
