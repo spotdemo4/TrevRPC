@@ -9,7 +9,7 @@ on:
 enable-openid-connect: true
 
 jobs:
-  linux:
+  check:
     # zizmor: ignore[excessive-permissions]
     runs-on: ubuntu-24.04
     steps:
@@ -18,7 +18,35 @@ jobs:
         with:
           github_token: ${{ secrets.GH_TOKEN }}
           niks3_url: https://niks3.trev.zip
+
+      - name: Verify versions
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag=$tag"
+          test "$(jq -r .version trevrpc-js/package.json)" = "$tag"
+          test "$(jq -r .version trevrpc-js/npm/native-linux-x64-gnu/package.json)" = "$tag"
+          test "$(grep '^version =' trevrpc-rust/Cargo.toml | head -1 | cut -d'"' -f2)" = "$tag"
+          test "$(grep 'version =' trevrpc-js/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-js/native-package.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-kotlin/build.gradle.kts | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-kotlin/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+
+      - name: Check
+        run: nix flake check
+
+  forgejo:
+    # zizmor: ignore[excessive-permissions]
+    needs: check
+    name: forgejo
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
           token: ${{ secrets.DOCTOR_TOKEN }}
+          niks3_url: https://niks3.trev.zip
           fetch_depth: 0
           shell: release
 
@@ -32,3 +60,98 @@ jobs:
             packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl
             packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl
         run: flake-release
+
+  crates:
+    # zizmor: ignore[excessive-permissions]
+    needs: check
+    name: crates.io
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          fetch_depth: 0
+          shell: release
+
+      - name: Release to crates.io
+        working-directory: trevrpc-rust
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+        run: cargo publish --locked
+
+  npm:
+    # zizmor: ignore[excessive-permissions]
+    needs: check
+    name: npm
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          fetch_depth: 0
+          shell: release
+
+      - name: Build npm stage
+        run: |
+          set -euo pipefail
+          stage="$(nix build .#trevrpc-js-npm-stage --no-link --print-out-paths)"
+          echo "stage=$stage"
+          ls -lh "$stage"/*.tgz
+          cat "$stage"/manifest.json
+          echo "stage=$stage" >> "$GITHUB_ENV"
+
+      - name: Release to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat "${stage}/manifest.json"
+          native_tgz="$(ls "${stage}"/trevrpc-trevrpc-js-native-linux-x64-gnu-*.tgz)"
+          core_tgz="$(ls "${stage}"/trevrpc-trevrpc-js-*.tgz | grep -v native)"
+          echo "native: $native_tgz"
+          echo "core: $core_tgz"
+          test -f "$native_tgz"
+          test -f "$core_tgz"
+          npm publish --provenance --access public "$native_tgz"
+          npm publish --provenance --access public "$core_tgz"
+
+  maven:
+    # zizmor: ignore[excessive-permissions]
+    needs: check
+    name: maven central
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          fetch_depth: 0
+          shell: release
+
+      - name: Stage Kotlin Maven repository
+        working-directory: trevrpc-kotlin
+        run: ./gradlew stageMavenRepository --no-configuration-cache
+
+      - name: Verify Kotlin staging repository
+        working-directory: trevrpc-kotlin
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          python3 publication-tests/verify_staged_repository.py build/staging-repository "$tag"
+
+      - name: Publish Kotlin to Maven Central
+        working-directory: trevrpc-kotlin
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}
+        run: ./gradlew publishToCentral --no-configuration-cache --parallel
