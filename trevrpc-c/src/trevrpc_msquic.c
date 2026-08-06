@@ -1604,6 +1604,11 @@ int trevrpc_msquic_dial_observed(const char* host,
         }
     }
 
+    if (cancelled != NULL && cancelled(cancellation_context)) {
+        trevrpc_msquic_conn_close(conn);
+        return -ECANCELED;
+    }
+
     HQUIC connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
     if (connection_handle == NULL) {
         trevrpc_msquic_conn_close(conn);
@@ -1612,6 +1617,10 @@ int trevrpc_msquic_dial_observed(const char* host,
     status = TrevMsQuic->ConnectionStart(connection_handle, configuration, QUIC_ADDRESS_FAMILY_UNSPEC, host, port);
     trevrpc_msquic_conn_handle_release(conn);
     if (QUIC_FAILED(status)) {
+        if (cancelled != NULL && cancelled(cancellation_context)) {
+            trevrpc_msquic_conn_close(conn);
+            return -ECANCELED;
+        }
         trevrpc_msquic_conn_close(conn);
         return (int)status;
     }
@@ -1619,7 +1628,7 @@ int trevrpc_msquic_dial_observed(const char* host,
     pthread_mutex_lock(&conn->mutex);
     bool was_cancelled = false;
     int wait_err = 0;
-    while (!conn->connected && !conn->shutdown_complete && conn->err == 0) {
+    while (!conn->connected && !conn->shutdown_complete && !was_cancelled && conn->err == 0) {
         if (cancelled != NULL && cancelled(cancellation_context)) {
             was_cancelled = true;
             break;
@@ -1640,7 +1649,7 @@ int trevrpc_msquic_dial_observed(const char* host,
     bool connected = conn->connected;
     pthread_mutex_unlock(&conn->mutex);
 
-    if (was_cancelled) {
+    if (was_cancelled || (cancelled != NULL && cancelled(cancellation_context))) {
         trevrpc_msquic_conn_shutdown(conn);
         trevrpc_msquic_conn_close(conn);
         return -ECANCELED;
