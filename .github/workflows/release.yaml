@@ -12,7 +12,32 @@ permissions:
   contents: read
 
 jobs:
-  linux:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+
+      - name: Verify versions
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag=$tag"
+          test "$(jq -r .version trevrpc-js/package.json)" = "$tag"
+          test "$(jq -r .version trevrpc-js/npm/native-linux-x64-gnu/package.json)" = "$tag"
+          test "$(grep '^version =' trevrpc-rust/Cargo.toml | head -1 | cut -d'"' -f2)" = "$tag"
+          test "$(grep 'version =' trevrpc-js/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-js/native-package.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-kotlin/build.gradle.kts | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-kotlin/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+
+      - name: Check
+        run: nix flake check
+
+  github:
+    needs: check
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
@@ -33,22 +58,41 @@ jobs:
             packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl
         run: flake-release
 
-      - name: Verify versions
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          echo "tag=$tag"
-          test "$(jq -r .version trevrpc-js/package.json)" = "$tag"
-          test "$(jq -r .version trevrpc-js/npm/native-linux-x64-gnu/package.json)" = "$tag"
-          test "$(grep '^version =' trevrpc-rust/Cargo.toml | head -1 | cut -d'"' -f2)" = "$tag"
-          test "$(grep 'version =' trevrpc-js/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
-          test "$(grep 'version =' trevrpc-js/native-package.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
-          test "$(grep 'version =' trevrpc-kotlin/build.gradle.kts | head -1 | grep -o '[0-9.]\+')" = "$tag"
-          test "$(grep 'version =' trevrpc-kotlin/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+  crates:
+    needs: check
+    name: crates.io
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+        with:
+          fetch_depth: 0
+          shell: release
+
+      - id: auth
+        name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Release to crates.io
         working-directory: trevrpc-rust
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
+
+  npm:
+    needs: check
+    name: npm
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+        with:
+          fetch_depth: 0
+          shell: release
 
       - name: Build npm stage
         run: |
@@ -71,6 +115,19 @@ jobs:
           test -f "$core_tgz"
           npm publish --provenance --access public "$native_tgz"
           npm publish --provenance --access public "$core_tgz"
+
+  maven:
+    needs: check
+    name: maven central
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+        with:
+          fetch_depth: 0
+          shell: release
 
       - name: Stage Kotlin Maven repository
         working-directory: trevrpc-kotlin
