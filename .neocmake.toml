@@ -1,0 +1,2 @@
+# Effectively disable C0301 while retaining NeoCMake's other diagnostics.
+line_max_words = 1000
