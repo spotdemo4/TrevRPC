@@ -110,7 +110,7 @@
       "addLabels": ["kotlin"]
     },
     {
-      "matchManagers": ["gradle"],
+      "matchManagers": ["gradle", "gradle-wrapper"],
       "postUpgradeTasks": {
         "commands": ["nix run .#update-kotlin-deps"],
         "fileFilters": [
