@@ -405,12 +405,24 @@ func runFixtureTests(t *testing.T, runtimeRoot, relativeRoot string) {
 
 func legacyMessages(packageName string, names ...string) string {
 	var source strings.Builder
-	source.WriteString("package " + packageName + "\n\n")
+	source.WriteString("package ")
+	source.WriteString(packageName)
+	source.WriteString("\n\n")
 	for _, name := range names {
-		source.WriteString("type " + name + " struct{}\n")
-		source.WriteString("func (m *" + name + ") Reset() { *m = " + name + "{} }\n")
-		source.WriteString("func (*" + name + ") String() string { return \"\" }\n")
-		source.WriteString("func (*" + name + ") ProtoMessage() {}\n\n")
+		source.WriteString("type ")
+		source.WriteString(name)
+		source.WriteString(" struct{}\n")
+		source.WriteString("func (m *")
+		source.WriteString(name)
+		source.WriteString(") Reset() { *m = ")
+		source.WriteString(name)
+		source.WriteString("{} }\n")
+		source.WriteString("func (*")
+		source.WriteString(name)
+		source.WriteString(") String() string { return \"\" }\n")
+		source.WriteString("func (*")
+		source.WriteString(name)
+		source.WriteString(") ProtoMessage() {}\n\n")
 	}
 	return source.String()
 }
