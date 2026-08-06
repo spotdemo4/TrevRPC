@@ -387,7 +387,7 @@
               version = "0.1.1";
               src = publicationTests;
               sourceRoot = "source/maven";
-              mvnHash = "sha256-rImtM+XfS3e5wv9z7COVr+jUo0pPbkui/DsTbjD56Lk=";
+              mvnHash = "sha256-uNF3p2fldwDehl8Kz8/eyXLj65gKiwAz1yY8b9W91hA=";
               mvnJdk = pkgs.jdk25;
               mvnGoal = "verify";
               mvnParameters = "-Dtrevrpc.repository=file://${self.packages.${system}.trevrpc-kotlin}/share/maven";

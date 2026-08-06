@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 GROUP = "zip.trev.trevrpc"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 MODULE_TARGETS = {
     "core": 52,
     "transport-cronet": 61,
@@ -84,6 +84,16 @@ def resolve_version(repository: pathlib.Path) -> str:
                 versions.update(p.name for p in module_dir.iterdir() if p.is_dir())
         if len(versions) == 1:
             return next(iter(versions))
+    # Fallback for manual runs: read from the main project's build file
+    build_file = pathlib.Path(__file__).resolve().parents[1] / "build.gradle.kts"
+    if build_file.is_file():
+        import re
+
+        for line in build_file.read_text().splitlines():
+            if 'version = "' in line:
+                m = re.search(r'version = "([0-9]+\.[0-9]+\.[0-9]+)"', line)
+                if m:
+                    return m.group(1)
     return VERSION
 
 

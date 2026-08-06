@@ -22,8 +22,7 @@ resolve_trevrpc_version() {
   local group_dir="$TREVRPC_STAGING_REPOSITORY/zip/trev/trevrpc"
   if [[ -d "$group_dir" ]]; then
     local versions
-    # shellcheck disable=SC2012
-    versions=$(ls -1 "$group_dir"/core/ 2>/dev/null | tr '\n' ' ')
+    versions=$(find "$group_dir"/core -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
     # shellcheck disable=SC2206
     local arr=($versions)
     if [[ ${#arr[@]} -eq 1 ]]; then
@@ -31,7 +30,7 @@ resolve_trevrpc_version() {
       return
     fi
   fi
-  echo "0.1.0"
+  echo "0.1.1"
 }
 
 TREVRPC_VERSION="$(resolve_trevrpc_version)"
@@ -44,7 +43,7 @@ import sys
 import xml.etree.ElementTree as ET
 import zipfile
 
-version = sys.argv[2] if len(sys.argv) >= 3 and sys.argv[2].strip() else "0.1.0"
+version = sys.argv[2] if len(sys.argv) >= 3 and sys.argv[2].strip() else "0.1.1"
 repository = pathlib.Path(sys.argv[1])
 artifact = repository / f"zip/trev/trevrpc/transport-cronet/{version}"
 jar = artifact / f"transport-cronet-{version}.jar"

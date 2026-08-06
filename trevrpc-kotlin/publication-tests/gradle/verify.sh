@@ -16,17 +16,15 @@ resolve_trevrpc_version() {
   local group_dir="$TREVRPC_STAGING_REPOSITORY/zip/trev/trevrpc"
   if [[ -d "$group_dir" ]]; then
     local versions
-    # shellcheck disable=SC2012
-    versions=$(ls -1 "$group_dir"/core/ 2>/dev/null | tr '\n' ' ')
+    versions=$(find "$group_dir"/core -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | tr '\n' ' ')
     # shellcheck disable=SC2206
     local arr=($versions)
     if [[ ${#arr[@]} -eq 1 ]]; then echo "${arr[0]}"; return; fi
   fi
-  echo "0.1.0"
+  echo "0.1.1"
 }
 TREVRPC_VERSION="$(resolve_trevrpc_version)"
 export TREVRPC_VERSION
-
 for metadata in "${metadata_modes[@]}"; do
   gradle_user_home="$work_dir/gradle-user-home-$metadata"
   mkdir -p "$gradle_user_home"

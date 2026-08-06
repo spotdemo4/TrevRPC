@@ -240,6 +240,7 @@ val verifyStagedMavenRepository =
         group = "verification"
         description = "Validates the staged Maven repository, metadata, archives, and executable generator."
         dependsOn("stageMavenRepository")
+        environment("TREVRPC_VERSION", project.version.toString())
         commandLine(
             "python3",
             layout.projectDirectory.file("publication-tests/verify_staged_repository.py").asFile,
@@ -252,6 +253,7 @@ tasks.register<Exec>("verifyGradleConsumers") {
     description = "Compiles isolated Gradle consumers against Gradle metadata and Maven POM metadata."
     dependsOn(verifyStagedMavenRepository)
     environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
+    environment("TREVRPC_VERSION", project.version.toString())
     commandLine("bash", layout.projectDirectory.file("publication-tests/gradle/verify.sh").asFile)
 }
 
@@ -260,6 +262,7 @@ tasks.register<Exec>("verifyMavenConsumers") {
     description = "Compiles isolated Maven consumers using an isolated local repository."
     dependsOn(verifyStagedMavenRepository)
     environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
+    environment("TREVRPC_VERSION", project.version.toString())
     commandLine("bash", layout.projectDirectory.file("publication-tests/maven/verify.sh").asFile)
 }
 
@@ -268,6 +271,7 @@ tasks.register<Exec>("verifyCronetConsumers") {
     description = "Validates and compiles isolated JVM 17 Cronet consumers with Gradle and Maven."
     dependsOn(verifyStagedMavenRepository)
     environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
+    environment("TREVRPC_VERSION", project.version.toString())
     commandLine("bash", layout.projectDirectory.file("publication-tests/cronet/verify.sh").asFile)
 }
 

@@ -12,7 +12,7 @@ val trevrpcVersion =
         .gradleProperty("trevrpcVersion")
         .orElse(providers.environmentVariable("TREVRPC_VERSION"))
         .orElse(providers.gradleProperty("trevrpc.version"))
-        .getOrElse("0.1.0")
+        .getOrElse("0.1.1")
 
 val cronetPublication =
     configurations.create("cronetPublication") {
