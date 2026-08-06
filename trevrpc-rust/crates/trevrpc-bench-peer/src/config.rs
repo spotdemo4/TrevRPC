@@ -47,7 +47,6 @@ impl FromStr for RpcKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Stack {
     TrevrpcNativeQuic,
-    GrpcHttp2,
     TrevrpcWebTransport,
 }
 
@@ -57,10 +56,9 @@ impl FromStr for Stack {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "trevrpc_native_quic" => Ok(Self::TrevrpcNativeQuic),
-            "grpc_http2" => Ok(Self::GrpcHttp2),
             "trevrpc_webtransport" => Ok(Self::TrevrpcWebTransport),
             _ => Err(ConfigError(format!(
-                "invalid --stack value {value:?}; expected trevrpc_native_quic, grpc_http2, or trevrpc_webtransport"
+                "invalid --stack value {value:?}; expected trevrpc_native_quic or trevrpc_webtransport"
             ))),
         }
     }
@@ -265,7 +263,7 @@ mod tests {
             [
                 "client",
                 "--stack",
-                "grpc_http2",
+                "trevrpc_native_quic",
                 "--address",
                 "127.0.0.1:1234",
                 "--cert",
@@ -293,7 +291,7 @@ mod tests {
             panic!("expected client command");
         };
         assert_eq!(config.rpc, RpcKind::Bidi);
-        assert_eq!(config.stack, Stack::GrpcHttp2);
+        assert_eq!(config.stack, Stack::TrevrpcNativeQuic);
         assert_eq!(config.concurrency, 8);
         assert_eq!(config.messages_per_stream, 4);
     }

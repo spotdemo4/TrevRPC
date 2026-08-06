@@ -215,8 +215,8 @@ remain current and that all four RPC shapes work without installing a cross-runt
 
 ## Benchmark peer
 
-`bench-peer` implements benchmark protocol V4. Its client role supports `trevrpc_native_quic` and
-`grpc_http2`; its server role additionally supports `trevrpc_webtransport`. A WebTransport server
+`bench-peer` implements benchmark protocol V4. Its client role supports `trevrpc_native_quic`; its
+server role additionally supports `trevrpc_webtransport`. A WebTransport server
 requires `--webtransport-origin ORIGIN` and admits only secure WebTransport sessions whose path is
 exactly `/trevrpc` and whose `Origin` header exactly matches that value. WebTransport client mode is
 not supported.

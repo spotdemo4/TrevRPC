@@ -55,8 +55,8 @@ func run(args []string, stdin io.Reader, emitter *eventEmitter) error {
 			Event:         "capabilities",
 			Peer:          peerName,
 			Roles: roleCapabilities{
-				Client: []string{string(stackNativeQUIC), string(stackGRPCHTTP2)},
-				Server: []string{string(stackNativeQUIC), string(stackGRPCHTTP2), string(stackWebTransport)},
+				Client: []string{string(stackNativeQUIC)},
+				Server: []string{string(stackNativeQUIC), string(stackWebTransport)},
 			},
 			RPCKinds:  []string{"unary", "client_stream", "server_stream", "bidi"},
 			Histogram: "log_linear_v1",

@@ -1,9 +1,9 @@
 # RPC Benchmark Harness
 
 `trevrpc-bench` is the centralized controller for language-owned benchmark
-peers. It runs TrevRPC native QUIC, TrevRPC WebTransport, and gRPC HTTP/2
-client/server pairs, validates their structured results, collects process-group
-metrics, and generates replayable reports.
+peers. It runs TrevRPC native QUIC and WebTransport client/server pairs,
+validates their structured results, collects process-group metrics, and
+generates replayable reports.
 
 ## Build
 
@@ -19,11 +19,9 @@ packages Netty's Linux x86-64 native QUIC transport.
 The resulting `bin` directory contains `trevrpc-bench`, one
 `trevrpc-bench-peer-*` executable for C, C++, Go, JavaScript, Kotlin, and Rust,
 and the dedicated Chromium WebTransport client peer.
-Peers are peer-only overrides of their associated `trevrpc-*` consumer packages,
-which remain free of benchmark-only gRPC dependencies by default. The canonical
-RPC contract and process protocol live under `bench/`. Individual Nix packages
-use the `trevrpc-<language>-bench-peer` attribute names and are equivalent to
-overriding the associated language package with `benchPeer = true`.
+The benchmark and conformance executables are included in their associated
+`trevrpc-*` packages. The canonical RPC contract and process protocol live under
+`bench/`.
 The JavaScript peer's nested npm manifest is private until `trevrpc-js` is
 published; the supported distributable peer package is currently its Nix
 package.
@@ -31,7 +29,7 @@ package.
 ## Run
 
 Campaigns and peers use schema V4. Every cell selects a required `stack`:
-`trevrpc_native_quic`, `trevrpc_webtransport`, or `grpc_http2`. A cell may use
+`trevrpc_native_quic` or `trevrpc_webtransport`. A cell may use
 any listed peer as its client and any listed peer as its server, so the same
 controller supports stack and split client/server comparisons. Capabilities are
 validated independently for each role; client support never implies server
@@ -54,8 +52,8 @@ for performance comparisons. The Nix smoke checks set
 `TREVRPC_BENCH_SERVER_WORKERS=8` to keep concurrent checks within CI task
 limits; normal benchmark runs retain the C peer's 128-worker default.
 
-`stack-comparison.example.json` contains same-language TrevRPC and gRPC cells
-for C, C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's
+`stack-comparison.example.json` contains same-language native QUIC cells for C,
+C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's
 advertised stacks, roles, RPC kinds, and histogram before starting a run.
 
 `webtransport-smoke.example.json` starts the Chromium client before each RPC
@@ -110,7 +108,7 @@ routing, or competing traffic.
 
 `regional-wan-netns.example.json` is the retained publication campaign. It
 applies approximately 30 ms RTT, 2 ms one-way jitter, 0.1% random loss, and a
-100 Mbit/s rate to the full same-language TrevRPC/gRPC matrix.
+100 Mbit/s rate to the full same-language native QUIC matrix.
 
 Compilation and dependency realization must happen before a publishable run.
 Run measurements on `ssh bench` and keep the host otherwise idle. Retain the

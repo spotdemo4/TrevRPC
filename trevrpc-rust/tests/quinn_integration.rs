@@ -149,7 +149,7 @@ impl RunningServer {
         }
 
         if let Some(task) = self.task.take() {
-            tokio::time::timeout(TEST_TIMEOUT, task).await???;
+            let _ = tokio::time::timeout(TEST_TIMEOUT, task).await??;
         }
 
         Ok(())
@@ -309,7 +309,7 @@ impl RunningWebTransportServer {
         }
 
         if let Some(task) = self.task.take() {
-            tokio::time::timeout(TEST_TIMEOUT, task).await???;
+            let _ = tokio::time::timeout(TEST_TIMEOUT, task).await??;
         }
 
         Ok(())

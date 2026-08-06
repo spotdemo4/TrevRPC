@@ -15,7 +15,6 @@ type stackKind string
 
 const (
 	stackNativeQUIC               stackKind = "trevrpc_native_quic"
-	stackGRPCHTTP2                stackKind = "grpc_http2"
 	stackWebTransport             stackKind = "trevrpc_webtransport"
 	rpcUnary                      rpcKind   = "unary"
 	rpcClientStream               rpcKind   = "client_stream"
@@ -159,7 +158,7 @@ func parseClientConfig(args []string) (clientConfig, error) {
 
 func validateServerStack(stack stackKind) error {
 	switch stack {
-	case stackNativeQUIC, stackGRPCHTTP2, stackWebTransport:
+	case stackNativeQUIC, stackWebTransport:
 		return nil
 	default:
 		return fmt.Errorf("unsupported --stack %q", stack)
@@ -168,7 +167,7 @@ func validateServerStack(stack stackKind) error {
 
 func validateClientStack(stack stackKind) error {
 	switch stack {
-	case stackNativeQUIC, stackGRPCHTTP2:
+	case stackNativeQUIC:
 		return nil
 	default:
 		return fmt.Errorf("unsupported client --stack %q", stack)

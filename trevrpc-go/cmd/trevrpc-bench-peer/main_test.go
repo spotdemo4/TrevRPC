@@ -23,15 +23,13 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/internal/benchutil"
 )
 
 func TestStackOperationsAndCertificateVerification(t *testing.T) {
-	for _, stack := range []stackKind{stackNativeQUIC, stackGRPCHTTP2} {
+	for _, stack := range []stackKind{stackNativeQUIC} {
 		t.Run(string(stack), func(t *testing.T) {
 			certFile, keyFile := writeTestCertificate(t)
 			address, stopServer := startTestBenchmarkServer(t, stack, certFile, keyFile)
@@ -133,38 +131,6 @@ func TestWebTransportServerOperationsAndAdmission(t *testing.T) {
 				t.Fatal("WebTransport admission unexpectedly succeeded")
 			}
 		})
-	}
-}
-
-func TestGRPCMaximumPayloadAndTerminalStatus(t *testing.T) {
-	certFile, keyFile := writeTestCertificate(t)
-	address, stopServer := startTestBenchmarkServer(t, stackGRPCHTTP2, certFile, keyFile)
-	defer stopServer()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	config := testClientConfig(stackGRPCHTTP2, address, certFile, rpcUnary)
-	client, closeClient, err := dialBenchmarkClient(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeClient()
-
-	config.requestBytes = maxBenchmarkPayloadBytes
-	if _, err := newBenchmarkOperation(client, config)(ctx, 0); err != nil {
-		t.Fatalf("maximum request payload: %v", err)
-	}
-	config.requestBytes = 0
-	config.responseBytes = maxBenchmarkPayloadBytes
-	if _, err := newBenchmarkOperation(client, config)(ctx, 0); err != nil {
-		t.Fatalf("maximum response payload: %v", err)
-	}
-
-	responses, err := client.ServerStream(ctx, &benchmarkpb.StreamRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := responses.Recv(); status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("invalid server stream status = %v, want InvalidArgument", status.Code(err))
 	}
 }
 
@@ -271,7 +237,7 @@ func TestClientSTARTEmitsArmedAndSample(t *testing.T) {
 func TestServerSHUTDOWNEmitsReadyAndStopped(t *testing.T) {
 	certFile, keyFile := writeTestCertificate(t)
 	var output bytes.Buffer
-	for _, stack := range []stackKind{stackNativeQUIC, stackGRPCHTTP2, stackWebTransport} {
+	for _, stack := range []stackKind{stackNativeQUIC, stackWebTransport} {
 		t.Run(string(stack), func(t *testing.T) {
 			output.Reset()
 			config := serverConfig{stack: stack, listen: "127.0.0.1:0", certFile: certFile, keyFile: keyFile}
@@ -354,7 +320,7 @@ func TestClientConfigRejectsDuplicateAndOversizedOptions(t *testing.T) {
 
 func TestServerConfigRequiresSupportedStack(t *testing.T) {
 	base := []string{
-		"--stack", "grpc_http2",
+		"--stack", "trevrpc_native_quic",
 		"--listen", "127.0.0.1:0",
 		"--cert", "cert.pem",
 		"--key", "key.pem",
@@ -363,8 +329,8 @@ func TestServerConfigRequiresSupportedStack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid config: %v", err)
 	}
-	if config.stack != stackGRPCHTTP2 {
-		t.Fatalf("stack = %q, want %q", config.stack, stackGRPCHTTP2)
+	if config.stack != stackNativeQUIC {
+		t.Fatalf("stack = %q, want %q", config.stack, stackNativeQUIC)
 	}
 	if _, err := parseServerConfig(base[2:]); err == nil {
 		t.Fatal("missing --stack was accepted")
@@ -500,6 +466,6 @@ func Example_runCapabilities() {
 	err := run([]string{"capabilities"}, strings.NewReader(""), newEventEmitter(&output))
 	fmt.Print(output.String(), err)
 	// Output:
-	// {"schema_version":4,"event":"capabilities","peer":"go","roles":{"client":["trevrpc_native_quic","grpc_http2"],"server":["trevrpc_native_quic","grpc_http2","trevrpc_webtransport"]},"rpc_kinds":["unary","client_stream","server_stream","bidi"],"histogram":"log_linear_v1"}
+	// {"schema_version":4,"event":"capabilities","peer":"go","roles":{"client":["trevrpc_native_quic"],"server":["trevrpc_native_quic","trevrpc_webtransport"]},"rpc_kinds":["unary","client_stream","server_stream","bidi"],"histogram":"log_linear_v1"}
 	// <nil>
 }

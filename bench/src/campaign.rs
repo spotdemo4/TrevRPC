@@ -51,7 +51,6 @@ pub struct Cell {
 pub enum Stack {
     TrevrpcNativeQuic,
     TrevrpcWebtransport,
-    GrpcHttp2,
 }
 
 impl Stack {
@@ -60,7 +59,6 @@ impl Stack {
         match self {
             Self::TrevrpcNativeQuic => "trevrpc_native_quic",
             Self::TrevrpcWebtransport => "trevrpc_webtransport",
-            Self::GrpcHttp2 => "grpc_http2",
         }
     }
 }
@@ -388,7 +386,6 @@ mod tests {
             serde_json::to_string(&Stack::TrevrpcWebtransport).unwrap(),
             "\"trevrpc_webtransport\""
         );
-        assert_eq!(Stack::GrpcHttp2.as_str(), "grpc_http2");
         assert!(serde_json::from_str::<Stack>("\"native_quic\"").is_err());
     }
 

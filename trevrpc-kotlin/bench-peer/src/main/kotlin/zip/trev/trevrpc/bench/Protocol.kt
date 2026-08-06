@@ -41,7 +41,6 @@ internal enum class BenchmarkStack(
     val wireName: String,
 ) {
     TREVRPC_NATIVE_QUIC("trevrpc_native_quic"),
-    GRPC_HTTP2("grpc_http2"),
     TREVRPC_WEBTRANSPORT("trevrpc_webtransport"),
     ;
 
@@ -49,7 +48,7 @@ internal enum class BenchmarkStack(
         fun parse(value: String): BenchmarkStack =
             entries.firstOrNull { it.wireName == value }
                 ?: throw IllegalArgumentException(
-                    "--stack must be trevrpc_native_quic, grpc_http2, or trevrpc_webtransport",
+                    "--stack must be trevrpc_native_quic or trevrpc_webtransport",
                 )
     }
 }
@@ -284,8 +283,8 @@ internal class EventWriter(
         val rpcKinds = """["unary","client_stream","server_stream","bidi"]"""
         emit(
             """{"schema_version":4,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":{""" +
-                """"client":["trevrpc_native_quic","grpc_http2"],""" +
-                """"server":["trevrpc_native_quic","trevrpc_webtransport","grpc_http2"]},""" +
+                """"client":["trevrpc_native_quic"],""" +
+                """"server":["trevrpc_native_quic","trevrpc_webtransport"]},""" +
                 """"rpc_kinds":$rpcKinds,"histogram":"log_linear_v1"}""",
         )
     }

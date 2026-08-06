@@ -370,27 +370,13 @@ endif()
 
 if(TREVRPC_BUILD_BENCHMARKS)
     if(TREVRPC_BUILD_RUNTIME)
-        find_package(PkgConfig QUIET)
-        if(PkgConfig_FOUND)
-            pkg_check_modules(GRPC_CORE QUIET IMPORTED_TARGET grpc)
-        endif()
-        if(TARGET PkgConfig::GRPC_CORE)
-            set(trevrpc_grpc_core_target PkgConfig::GRPC_CORE)
-        else()
-            find_package(gRPC CONFIG REQUIRED)
-            set(trevrpc_grpc_core_target gRPC::grpc)
-        endif()
         find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
-        add_executable(trevrpc_bench_peer_c
-            bench/trevrpc_bench_grpc.c
-            bench/trevrpc_bench_peer.c
-        )
+        add_executable(trevrpc_bench_peer_c bench/trevrpc_bench_peer.c)
         add_dependencies(trevrpc_bench_peer_c trevrpc_msquic_test_certificates)
         set_target_properties(trevrpc_bench_peer_c PROPERTIES OUTPUT_NAME "trevrpc-bench-peer-c")
         target_link_libraries(trevrpc_bench_peer_c PRIVATE
             trevrpc_benchmark_generated
-            ${trevrpc_grpc_core_target}
             OpenSSL::Crypto
         )
         trevrpc_c_warnings(trevrpc_bench_peer_c)
@@ -492,7 +478,7 @@ if(TREVRPC_BUILD_TESTS)
         add_test(NAME trevrpc_bench_peer_capabilities COMMAND trevrpc_bench_peer_c capabilities)
         set_tests_properties(trevrpc_bench_peer_capabilities PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "\"schema_version\":4.*\"roles\":\\{\"client\":\\[\"trevrpc_native_quic\",\"grpc_http2\"\\],\"server\":\\[\"trevrpc_native_quic\",\"grpc_http2\",\"trevrpc_webtransport\"\\]\\}.*\"rpc_kinds\":\\[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"\\].*\"histogram\":\"log_linear_v1\""
+                "\"schema_version\":4.*\"roles\":\\{\"client\":\\[\"trevrpc_native_quic\"\\],\"server\":\\[\"trevrpc_native_quic\",\"trevrpc_webtransport\"\\]\\}.*\"rpc_kinds\":\\[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"\\].*\"histogram\":\"log_linear_v1\""
         )
         add_test(NAME trevrpc_bench_peer_webtransport_config
             COMMAND "${CMAKE_COMMAND}"
@@ -508,19 +494,6 @@ if(TREVRPC_BUILD_TESTS)
         )
         set_tests_properties(trevrpc_bench_peer_webtransport_smoke PROPERTIES TIMEOUT 30)
         trevrpc_c_lsan_suppressions(trevrpc_bench_peer_webtransport_smoke)
-        add_test(NAME trevrpc_bench_peer_grpc_smoke
-            COMMAND sh
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_peer_grpc_smoke.sh"
-                "$<TARGET_FILE:trevrpc_bench_peer_c>"
-                "${trevrpc_msquic_test_cert}"
-                "${trevrpc_msquic_test_key}"
-        )
-        set_tests_properties(trevrpc_bench_peer_grpc_smoke PROPERTIES TIMEOUT 60)
-        trevrpc_c_lsan_suppressions(trevrpc_bench_peer_grpc_smoke)
-        if(TREVRPC_ENABLE_SANITIZERS)
-            # LeakSanitizer cannot reliably suspend gRPC's uninstrumented EventEngine workers.
-            set_property(TEST trevrpc_bench_peer_grpc_smoke APPEND PROPERTY ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
-        endif()
     endif()
 
     if(TREVRPC_BUILD_RUNTIME)

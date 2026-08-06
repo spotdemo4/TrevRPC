@@ -3,31 +3,26 @@
   lib,
   clang-tools,
   cmake,
-  grpc,
   libmsquic,
   openssl,
   pkg-config,
   protobuf,
   protobufc,
   repoRoot,
-  benchPeer ? false,
+  peerBinaries ? [ ],
   sanitizers ? false,
   threadSanitizer ? false,
 }:
 assert !(sanitizers && threadSanitizer);
 stdenv.mkDerivation (
   final: with lib; {
-    pname = if benchPeer then "trevrpc-c-bench-peer" else "trevrpc-c";
+    pname = "trevrpc-c";
     version = "0.2.0";
-    outputs =
-      if benchPeer then
-        [ "out" ]
-      else
-        [
-          "out"
-          "dev"
-          "lib"
-        ];
+    outputs = [
+      "out"
+      "dev"
+      "lib"
+    ];
 
     src = fileset.toSource {
       root = repoRoot;
@@ -39,36 +34,22 @@ stdenv.mkDerivation (
     };
     sourceRoot = "${final.src.name}/trevrpc-c";
 
-    configurePhase =
-      if benchPeer then
-        ''
-          runHook preConfigure
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_BINDIR="$out/bin" \
-            -DTREVRPC_BUILD_BENCHMARKS=ON \
-            -DTREVRPC_BUILD_TESTS=ON \
-            -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
-            -DTREVRPC_ENABLE_THREAD_SANITIZER=${if threadSanitizer then "ON" else "OFF"}
-          runHook postConfigure
-        ''
-      else
-        ''
-          runHook preConfigure
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_BINDIR="$out/bin" \
-            -DCMAKE_INSTALL_INCLUDEDIR="$dev/include" \
-            -DCMAKE_INSTALL_LIBDIR="$lib/lib" \
-            -DCMAKE_INSTALL_LIBEXECDIR="$lib/libexec" \
-            -DTREVRPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc" \
-            -DTREVRPC_INSTALL_PKGCONFIGDIR="$dev/lib/pkgconfig" \
-            -DTREVRPC_BUILD_BENCHMARKS=OFF \
-            -DTREVRPC_BUILD_TESTS=ON \
-            -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
-            -DTREVRPC_ENABLE_THREAD_SANITIZER=${if threadSanitizer then "ON" else "OFF"}
-          runHook postConfigure
-        '';
+    configurePhase = ''
+      runHook preConfigure
+      cmake -S . -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_BINDIR="$out/bin" \
+        -DCMAKE_INSTALL_INCLUDEDIR="$dev/include" \
+        -DCMAKE_INSTALL_LIBDIR="$lib/lib" \
+        -DCMAKE_INSTALL_LIBEXECDIR="$lib/libexec" \
+        -DTREVRPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc" \
+        -DTREVRPC_INSTALL_PKGCONFIGDIR="$dev/lib/pkgconfig" \
+        -DTREVRPC_BUILD_BENCHMARKS=ON \
+        -DTREVRPC_BUILD_TESTS=ON \
+        -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
+        -DTREVRPC_ENABLE_THREAD_SANITIZER=${if threadSanitizer then "ON" else "OFF"}
+      runHook postConfigure
+    '';
 
     nativeBuildInputs = [
       clang-tools
@@ -78,7 +59,7 @@ stdenv.mkDerivation (
       protobuf
       protobufc
     ];
-    buildInputs = [ protobufc ] ++ optional benchPeer grpc;
+    buildInputs = [ protobufc ];
     propagatedBuildInputs = [ libmsquic ];
     buildPhase = ''
       runHook preBuild
@@ -87,47 +68,45 @@ stdenv.mkDerivation (
     '';
 
     doCheck = true;
-    checkPhase =
-      if benchPeer then
-        ''
-          runHook preCheck
-          ctest --test-dir build --output-on-failure --no-tests=error -R '^trevrpc_bench_peer_'
-          runHook postCheck
-        ''
-      else
-        ''
-          runHook preCheck
-          export HOME=$TMPDIR
-          clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' -o -name '*.cpp' \))
-          clang-tidy --quiet $(find examples src tests tools -name '*.c' \
-            ! -path 'tests/abi5/*' \
-            ! -path 'tests/golden/*' \
-            ! -path 'tests/install/*') -- \
-            -x c \
-            -std=c11 \
-            -DQUIC_API_ENABLE_PREVIEW_FEATURES \
-            -DTREVRPC_GENERATED_TESTING \
-            -Iinclude \
-            -Isrc \
-            -Ibuild/protoc-gen-trevrpc-c-protos \
-            -Ibuild/generated-service-test \
-            -Ibuild/generated-greeter-example \
-            -isystem ${libmsquic}/include
-          ctest --test-dir build --output-on-failure
-          runHook postCheck
-        '';
+    checkPhase = ''
+      runHook preCheck
+      export HOME=$TMPDIR
+      clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' -o -name '*.cpp' \))
+      clang-tidy --quiet $(find examples src tests tools -name '*.c' \
+        ! -path 'tests/abi5/*' \
+        ! -path 'tests/golden/*' \
+        ! -path 'tests/install/*') -- \
+        -x c \
+        -std=c11 \
+        -DQUIC_API_ENABLE_PREVIEW_FEATURES \
+        -DTREVRPC_GENERATED_TESTING \
+        -Iinclude \
+        -Isrc \
+        -Ibuild/protoc-gen-trevrpc-c-protos \
+        -Ibuild/generated-service-test \
+        -Ibuild/generated-greeter-example \
+        -isystem ${libmsquic}/include
+      ctest --test-dir build --output-on-failure \
+        ${optionalString threadSanitizer "-E '^trevrpc_bench_peer_webtransport_smoke$'"}
+      runHook postCheck
+    '';
 
     installPhase = ''
       runHook preInstall
-      cmake --install build${optionalString benchPeer " --component benchmark-peer"}
+      cmake --install build
       runHook postInstall
     '';
 
-    doInstallCheck = !benchPeer;
+    postInstall = concatMapStringsSep "\n" (
+      peer: "install -Dm755 ${peer.package}/bin/${peer.binary} $out/bin/${peer.binary}"
+    ) peerBinaries;
+
+    doInstallCheck = true;
     installCheckPhase = ''
       runHook preInstallCheck
       test -x "$out/bin/protoc-gen-trevrpc-c"
-      test ! -e "$out/bin/trevrpc-bench-peer-c"
+      test -x "$out/bin/trevrpc-bench-peer-c"
+      test -x "$out/bin/trevrpc-conformance-c"
       test -f "$dev/include/trevrpc_binding.h"
       test ! -e "$dev/include/trevrpc_preview.h"
       test -f "$dev/lib/cmake/trevrpc/trevrpcConfig.cmake"
@@ -187,23 +166,14 @@ stdenv.mkDerivation (
       runHook postInstallCheck
     '';
 
-    meta =
-      if benchPeer then
-        {
-          mainProgram = "trevrpc-bench-peer-c";
-          description = "C TrevRPC and gRPC benchmark peer";
-          license = licenses.mit;
-          platforms = platforms.linux;
-        }
-      else
-        {
-          mainProgram = "protoc-gen-trevrpc-c";
-          description = "C runtime and code generator for TrevRPC";
-          license = licenses.mit;
-          platforms = platforms.all;
-          homepage = "https://trev.zip/llc/TrevRPC";
-          changelog = "https://trev.zip/llc/TrevRPC/releases";
-          downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
-        };
+    meta = {
+      mainProgram = "protoc-gen-trevrpc-c";
+      description = "C runtime and code generator for TrevRPC";
+      license = licenses.mit;
+      platforms = platforms.all;
+      homepage = "https://trev.zip/llc/TrevRPC";
+      changelog = "https://trev.zip/llc/TrevRPC/releases";
+      downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+    };
   }
 )

@@ -25,9 +25,9 @@ nanosecond values are decimal JSON strings so JavaScript can represent them
 without loss.
 
 V4 has no compatibility mode for earlier protocol versions. Campaign cells
-select one of the closed stack values `trevrpc_native_quic`,
-`trevrpc_webtransport`, or `grpc_http2`. Both server and client commands receive
-the selected value through `--stack`.
+select one of the closed stack values `trevrpc_native_quic` or
+`trevrpc_webtransport`. Both server and client commands receive the selected
+value through `--stack`.
 
 The controller starts every peer as a new session and process-group leader.
 Peer subprocesses must remain in that process group. Metrics and forced cleanup
@@ -45,8 +45,8 @@ the other role. RPC kinds and the client histogram format remain event-wide.
   "event": "capabilities",
   "peer": "rust",
   "roles": {
-    "client": ["trevrpc_native_quic", "grpc_http2"],
-    "server": ["trevrpc_native_quic", "trevrpc_webtransport", "grpc_http2"]
+    "client": ["trevrpc_native_quic"],
+    "server": ["trevrpc_native_quic", "trevrpc_webtransport"]
   },
   "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
   "histogram": "log_linear_v1"
@@ -62,7 +62,7 @@ WebTransport advertises `trevrpc_webtransport` only under `roles.server`.
 Required arguments for every stack:
 
 ```text
---stack trevrpc_native_quic|trevrpc_webtransport|grpc_http2
+--stack trevrpc_native_quic|trevrpc_webtransport
 --listen HOST:PORT --cert FILE --key FILE
 ```
 
@@ -91,7 +91,7 @@ Required arguments for every stack:
 
 ```text
 --cert FILE
---stack trevrpc_native_quic|trevrpc_webtransport|grpc_http2
+--stack trevrpc_native_quic|trevrpc_webtransport
 --rpc unary|client_stream|server_stream|bidi
 --concurrency N
 --warmup-ms N
@@ -101,8 +101,8 @@ Required arguments for every stack:
 --messages-per-stream N
 ```
 
-Native QUIC and gRPC clients also receive `--address HOST:PORT` at startup.
-Their `--cert` file is the campaign CA. Their startup behavior is unchanged:
+Native QUIC clients also receive `--address HOST:PORT` at startup. Their
+`--cert` file is the campaign CA. Their startup behavior is unchanged:
 connect, validate one RPC, warm up, create all lanes, and emit `armed`.
 
 A WebTransport client starts before its RPC server and does not receive

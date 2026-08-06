@@ -18,7 +18,6 @@
 
 typedef enum benchmark_stack {
     BENCHMARK_STACK_TREVRPC_NATIVE_QUIC,
-    BENCHMARK_STACK_GRPC_HTTP2,
     BENCHMARK_STACK_TREVRPC_WEBTRANSPORT,
 } benchmark_stack;
 
@@ -55,22 +54,5 @@ typedef struct server_options {
     const char* stack_name;
     size_t workers;
 } server_options;
-
-typedef struct trevrpc_bench_grpc_client trevrpc_bench_grpc_client;
-typedef struct trevrpc_bench_grpc_lane trevrpc_bench_grpc_lane;
-typedef struct trevrpc_bench_grpc_server trevrpc_bench_grpc_server;
-
-int trevrpc_bench_grpc_client_connect(const client_options* options, trevrpc_bench_grpc_client** client);
-void trevrpc_bench_grpc_client_close(trevrpc_bench_grpc_client* client);
-int trevrpc_bench_grpc_lane_open(trevrpc_bench_grpc_client* client, trevrpc_bench_grpc_lane** lane);
-void trevrpc_bench_grpc_lane_close(trevrpc_bench_grpc_lane* lane);
-int trevrpc_bench_grpc_run_operation(
-    trevrpc_bench_grpc_lane* lane, const client_options* options, uint64_t operation_sequence);
-
-int trevrpc_bench_grpc_server_start(
-    const server_options* options, trevrpc_bench_grpc_server** server, uint16_t* actual_port);
-bool trevrpc_bench_grpc_server_done(trevrpc_bench_grpc_server* server, int* result);
-int trevrpc_bench_grpc_server_shutdown(trevrpc_bench_grpc_server* server);
-int trevrpc_bench_grpc_server_close(trevrpc_bench_grpc_server* server);
 
 #endif

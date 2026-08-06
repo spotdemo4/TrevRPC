@@ -188,14 +188,11 @@ void reject_unknown(const Arguments& arguments) {
   if (value == "trevrpc_native_quic") {
     return Stack::TrevrpcNativeQuic;
   }
-  if (value == "grpc_http2") {
-    return Stack::GrpcHttp2;
-  }
   if (value == "trevrpc_webtransport") {
     return Stack::TrevrpcWebTransport;
   }
   throw PeerError("config", "invalid_argument",
-                  "--stack must be trevrpc_native_quic, grpc_http2, or trevrpc_webtransport");
+                  "--stack must be trevrpc_native_quic or trevrpc_webtransport");
 }
 
 [[nodiscard]] RpcKind parse_rpc_kind(std::string_view value) {
@@ -589,8 +586,7 @@ start_native_server(const ServerConfig& peer_config) {
 
 int run_server(int argc, char** argv) {
   const ServerConfig config = parse_server_config(argc, argv);
-  std::unique_ptr<BenchmarkServer> server =
-      config.stack == Stack::GrpcHttp2 ? start_grpc_server(config) : start_native_server(config);
+  std::unique_ptr<BenchmarkServer> server = start_native_server(config);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   if (server->stopped()) {
@@ -1114,9 +1110,7 @@ void emit_sample(const ClientConfig& config, const PhaseResult& result, std::uin
 
 int run_client(int argc, char** argv) {
   const ClientConfig config = parse_client_config(argc, argv);
-  const std::shared_ptr<ClientFactory> factory = config.stack == Stack::TrevrpcNativeQuic
-                                                     ? connect_native_client(config)
-                                                     : connect_grpc_client(config);
+  const std::shared_ptr<ClientFactory> factory = connect_native_client(config);
   std::unique_ptr<BenchmarkClient> validation_client = factory->create();
   auto validation_error = validation_client->run(config, 0);
   if (validation_error.has_value()) {
@@ -1185,8 +1179,8 @@ int main(int argc, char** argv) {
       }
       emit("{\"schema_version\":" + std::to_string(kSchemaVersion) +
            ",\"event\":\"capabilities\",\"peer\":\"cpp\","
-           "\"roles\":{\"client\":[\"trevrpc_native_quic\",\"grpc_http2\"],"
-           "\"server\":[\"trevrpc_native_quic\",\"grpc_http2\",\"trevrpc_webtransport\"]},"
+           "\"roles\":{\"client\":[\"trevrpc_native_quic\"],"
+           "\"server\":[\"trevrpc_native_quic\",\"trevrpc_webtransport\"]},"
            "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
            "\"histogram\":\"log_linear_v1\"}");
       return 0;

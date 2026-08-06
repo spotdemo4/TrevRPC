@@ -967,10 +967,10 @@ mod tests {
                 },
             ],
             cells: vec![Cell {
-                id: "grpc".to_owned(),
+                id: "native".to_owned(),
                 client: "client".to_owned(),
                 server: "server".to_owned(),
-                stack: Stack::GrpcHttp2,
+                stack: Stack::TrevrpcNativeQuic,
             }],
             rpc_kinds: vec![RpcKind::Unary],
             concurrencies: vec![1],
@@ -1055,34 +1055,33 @@ mod tests {
         validate_capabilities(
             &campaign,
             &campaign.peers[0],
-            &capabilities("client", &["client"], &[Stack::GrpcHttp2]),
+            &capabilities("client", &["client"], &[Stack::TrevrpcNativeQuic]),
         )
         .expect("client-only peer");
         validate_capabilities(
             &campaign,
             &campaign.peers[1],
-            &capabilities("server", &["server"], &[Stack::GrpcHttp2]),
+            &capabilities("server", &["server"], &[Stack::TrevrpcNativeQuic]),
         )
         .expect("server-only peer");
 
         let error = validate_capabilities(
             &campaign,
             &campaign.peers[0],
-            &capabilities("client", &["client"], &[Stack::TrevrpcNativeQuic]),
+            &capabilities("client", &["client"], &[Stack::TrevrpcWebtransport]),
         )
         .expect_err("wrong stack");
-        assert!(error.to_string().contains("grpc_http2"));
+        assert!(error.to_string().contains("trevrpc_native_quic"));
     }
 
     #[test]
     fn sample_ids_distinguish_stacks() {
         let mut cell = campaign().cells.remove(0);
-        let grpc = sample_id(&cell, RpcKind::Unary, 1, 1);
-        cell.stack = Stack::TrevrpcNativeQuic;
-        let trevrpc = sample_id(&cell, RpcKind::Unary, 1, 1);
-        assert_ne!(grpc, trevrpc);
-        assert!(grpc.contains("grpc_http2"));
-        assert!(trevrpc.contains("trevrpc_native_quic"));
+        let native = sample_id(&cell, RpcKind::Unary, 1, 1);
+        cell.id = "other".to_owned();
+        let other = sample_id(&cell, RpcKind::Unary, 1, 1);
+        assert_ne!(native, other);
+        assert!(native.contains("trevrpc_native_quic"));
     }
 
     #[test]

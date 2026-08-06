@@ -6,9 +6,6 @@ import (
 	"io"
 	"math"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
 )
@@ -167,21 +164,6 @@ func nativeServiceError(err error) error {
 	}
 }
 
-func grpcServiceError(err error) error {
-	var serviceError *benchmarkServiceError
-	if !errors.As(err, &serviceError) {
-		return err
-	}
-	switch serviceError.code {
-	case serviceInvalidArgument:
-		return status.Error(codes.InvalidArgument, serviceError.message)
-	case serviceResourceExhausted:
-		return status.Error(codes.ResourceExhausted, serviceError.message)
-	default:
-		return status.Error(codes.Internal, serviceError.message)
-	}
-}
-
 type nativeBenchmarkService struct{}
 
 func (nativeBenchmarkService) Unary(_ context.Context, request *benchmarkpb.BenchmarkRequest) (*trevrpc.Response[*benchmarkpb.BenchmarkResponse], error) {
@@ -242,61 +224,4 @@ func newNativeBenchmarkServer() *trevrpc.Server {
 	return server
 }
 
-type grpcBenchmarkService struct {
-	benchmarkpb.UnimplementedBenchmarkServiceServer
-}
-
-func (grpcBenchmarkService) Unary(_ context.Context, request *benchmarkpb.BenchmarkRequest) (*benchmarkpb.BenchmarkResponse, error) {
-	response, err := benchmarkUnary(request)
-	return response, grpcServiceError(err)
-}
-
-func (grpcBenchmarkService) ClientStream(stream grpc.ClientStreamingServer[benchmarkpb.BenchmarkRequest, benchmarkpb.BenchmarkSummary]) error {
-	response, err := summarizeClientStream(stream.Recv)
-	if err != nil {
-		return grpcServiceError(err)
-	}
-	return stream.SendAndClose(response)
-}
-
-func (grpcBenchmarkService) ServerStream(request *benchmarkpb.StreamRequest, stream grpc.ServerStreamingServer[benchmarkpb.BenchmarkResponse]) error {
-	responses, err := newServerResponseStream(request)
-	if err != nil {
-		return grpcServiceError(err)
-	}
-	for {
-		response, err := responses.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return grpcServiceError(err)
-		}
-		if err := stream.Send(response); err != nil {
-			return err
-		}
-	}
-}
-
-func (grpcBenchmarkService) Bidi(stream grpc.BidiStreamingServer[benchmarkpb.BenchmarkRequest, benchmarkpb.BenchmarkResponse]) error {
-	var responder bidiResponder
-	for {
-		request, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		response, err := responder.respond(request)
-		if err != nil {
-			return grpcServiceError(err)
-		}
-		if err := stream.Send(response); err != nil {
-			return err
-		}
-	}
-}
-
 var _ benchmarkpb.NativeBenchmarkServiceServer = nativeBenchmarkService{}
-var _ benchmarkpb.BenchmarkServiceServer = grpcBenchmarkService{}

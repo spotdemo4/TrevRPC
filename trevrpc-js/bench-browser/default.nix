@@ -7,7 +7,6 @@
   playwright-driver,
   repoRoot,
   trevrpcJs,
-  trevrpcJsBenchPeer,
 }:
 buildNpmPackage (final: {
   pname = "trevrpc-bench-peer-chromium";
@@ -30,7 +29,7 @@ buildNpmPackage (final: {
   nativeBuildInputs = [ makeWrapper ];
   preBuild = ''
     ln -s ${trevrpcJs}/lib/node_modules/trevrpc-js node_modules/trevrpc-js
-    ln -s ${trevrpcJsBenchPeer}/lib/node_modules/trevrpc-bench-peer-js \
+    ln -s ${trevrpcJs}/lib/node_modules/trevrpc-bench-peer-js \
       node_modules/trevrpc-bench-peer-js
   '';
 
@@ -46,7 +45,7 @@ buildNpmPackage (final: {
     mkdir -p "$package/node_modules"
     ln -s ${trevrpcJs}/lib/node_modules/trevrpc-js \
       "$package/node_modules/trevrpc-js"
-    ln -s ${trevrpcJsBenchPeer}/lib/node_modules/trevrpc-bench-peer-js \
+    ln -s ${trevrpcJs}/lib/node_modules/trevrpc-bench-peer-js \
       "$package/node_modules/trevrpc-bench-peer-js"
 
     chromium=

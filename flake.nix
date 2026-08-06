@@ -59,7 +59,6 @@
               openssl
               pkg-config
               protobufc
-              grpc
               libmsquic
 
               # javascript
@@ -163,7 +162,6 @@
               GOWORK=off go -C trevrpc-go/cmd/trevrpc-bench-peer mod tidy
               go -C trevrpc-go work sync
               fix-hash .#trevrpc-go
-              fix-hash .#trevrpc-go-bench-peer
             '';
           };
 
@@ -196,23 +194,31 @@
               sourceCommit = self.rev or (self.dirtyRev or "unversioned");
               sourceDirty = if self ? rev then "false" else "true";
             };
-            c = pkgs.callPackage ./trevrpc-c {
-              repoRoot = ./.;
-            };
-            cBenchPeer = c.override { benchPeer = true; };
             cFamilyConformancePeers = pkgs.callPackage ./conformance/adapters/c-family {
               repoRoot = ./.;
+            };
+            c = pkgs.callPackage ./trevrpc-c {
+              repoRoot = ./.;
+              peerBinaries = [
+                {
+                  package = cFamilyConformancePeers;
+                  binary = "trevrpc-conformance-c";
+                }
+              ];
             };
             cpp = pkgs.callPackage ./trevrpc-cpp {
               repoRoot = ./.;
               trevrpcC = c;
+              peerBinaries = [
+                {
+                  package = cFamilyConformancePeers;
+                  binary = "trevrpc-conformance-cpp";
+                }
+              ];
             };
-            cppBenchPeer = cpp.override { benchPeer = true; };
             go = pkgs.callPackage ./trevrpc-go {
               repoRoot = ./.;
             };
-            goBenchPeer = go.override { benchPeer = true; };
-            goConformancePeer = go.override { conformancePeer = true; };
             nativeLibmsquic =
               (pkgs.callPackage (pkgs.path + "/pkgs/by-name/li/libmsquic/package.nix") {
                 fetchFromGitHub =
@@ -229,11 +235,12 @@
                 }
               else
                 null;
-            js = pkgs.callPackage ./trevrpc-js {
+            jsRuntime = pkgs.callPackage ./trevrpc-js {
               repoRoot = ./.;
               trevrpcC = c;
               nativePackage = jsNative;
             };
+            js = jsRuntime;
             jsNpmStage =
               if system == "x86_64-linux" then
                 pkgs.callPackage ./trevrpc-js/npm-stage.nix {
@@ -244,55 +251,37 @@
                 }
               else
                 null;
-            jsBenchPeer = js.override { benchPeer = true; };
-            jsConformancePeer = js.override { conformancePeer = true; };
             chromiumBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
               repoRoot = ./.;
               trevrpcJs = js;
-              trevrpcJsBenchPeer = jsBenchPeer;
             };
             kotlin = pkgs.callPackage ./trevrpc-kotlin {
               repoRoot = ./.;
             };
-            kotlinBenchPeer = kotlin.override { benchPeer = true; };
-            kotlinConformancePeer = kotlin.override { conformancePeer = true; };
             rust = pkgs.callPackage ./trevrpc-rust {
               repoRoot = ./.;
             };
-            rustBenchPeer = rust.override { benchPeer = true; };
-            rustConformancePeer = rust.override { conformancePeer = true; };
           in
           {
             trevrpc-bench = bench;
             trevrpc-c = c;
-            trevrpc-c-bench-peer = cBenchPeer;
-            trevrpc-c-conformance-peer = cFamilyConformancePeers;
             trevrpc-cpp = cpp;
-            trevrpc-cpp-bench-peer = cppBenchPeer;
-            trevrpc-cpp-conformance-peer = cFamilyConformancePeers;
             trevrpc-go = go;
-            trevrpc-go-bench-peer = goBenchPeer;
-            trevrpc-go-conformance-peer = goConformancePeer;
             trevrpc-js = js;
-            trevrpc-js-bench-peer = jsBenchPeer;
-            trevrpc-js-conformance-peer = jsConformancePeer;
             trevrpc-chromium-bench-peer = chromiumBenchPeer;
             trevrpc-kotlin = kotlin;
-            trevrpc-kotlin-bench-peer = kotlinBenchPeer;
-            trevrpc-kotlin-conformance-peer = kotlinConformancePeer;
             trevrpc-rust = rust;
-            trevrpc-rust-bench-peer = rustBenchPeer;
-            trevrpc-rust-conformance-peer = rustConformancePeer;
 
             trevrpc-conformance-suite = pkgs.symlinkJoin {
               name = "trevrpc-conformance-suite";
               paths = [
                 bench
-                cFamilyConformancePeers
-                goConformancePeer
-                jsConformancePeer
-                kotlinConformancePeer
-                rustConformancePeer
+                c
+                cpp
+                go
+                js
+                kotlin
+                rust
               ];
               meta.platforms = [ "x86_64-linux" ];
             };
@@ -301,13 +290,13 @@
               name = "trevrpc-bench-suite";
               paths = [
                 bench
-                cBenchPeer
-                cppBenchPeer
-                goBenchPeer
-                jsBenchPeer
+                c
+                cpp
+                go
+                js
                 chromiumBenchPeer
-                kotlinBenchPeer
-                rustBenchPeer
+                kotlin
+                rust
               ];
               meta.platforms = [ "x86_64-linux" ];
             };
@@ -343,9 +332,13 @@
               {
                 threadSanitizer = true;
               };
-          c-family-sanitizers = self.packages.${system}.trevrpc-c-conformance-peer.override {
-            sanitizers = true;
-          };
+          c-family-sanitizers =
+            (pkgs.callPackage ./conformance/adapters/c-family {
+              repoRoot = ./.;
+            }).override
+              {
+                sanitizers = true;
+              };
 
           cpp = self.packages.${system}.trevrpc-cpp;
           cpp-sanitizers = self.packages.${system}.trevrpc-cpp.override {
@@ -393,7 +386,6 @@
                   go
                   protobuf
                   protoc-gen-go
-                  protoc-gen-go-grpc
                   self.packages.${system}.trevrpc-go
                 ];
               }
@@ -414,15 +406,6 @@
                  cmp generated/benchmark.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go}
                  protoc \
                    --proto_path=${./bench/proto} \
-                   --go-grpc_out=generated \
-                   --go-grpc_opt=paths=source_relative \
-                   ${./bench/proto}/benchmark.proto
-                 substituteInPlace generated/benchmark_grpc.pb.go \
-                   --replace-fail 'interface{}' 'any'
-                 gofmt -w generated/benchmark_grpc.pb.go
-                 cmp generated/benchmark_grpc.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark_grpc.pb.go}
-                 protoc \
-                   --proto_path=${./bench/proto} \
                    --trevrpc-go_out=generated \
                    --trevrpc-go_opt=paths=source_relative,service_prefix=Native \
                    ${./bench/proto}/benchmark.proto
@@ -438,21 +421,6 @@
               ''
                 trevrpc-bench run ${./bench/campaigns/smoke.example.json} --out run
                 test "$(wc -l < run/samples.jsonl)" -eq 4
-                test -s run/aggregate.csv
-                test -s run/report.md
-                test -s run/report.html
-                touch $out
-              '';
-
-          benchmark-grpc-smoke =
-            pkgs.runCommand "trevrpc-benchmark-grpc-smoke"
-              {
-                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
-              }
-              ''
-                export TREVRPC_BENCH_SERVER_WORKERS=8
-                trevrpc-bench run ${./bench/campaigns/grpc-smoke.example.json} --out run
-                test "$(wc -l < run/samples.jsonl)" -eq 24
                 test -s run/aggregate.csv
                 test -s run/report.md
                 test -s run/report.html
@@ -492,20 +460,20 @@
 
           benchmark-peer-capabilities =
             let
-              c = self.packages.${system}.trevrpc-c-bench-peer;
-              cpp = self.packages.${system}.trevrpc-cpp-bench-peer;
-              go = self.packages.${system}.trevrpc-go-bench-peer;
-              js = self.packages.${system}.trevrpc-js-bench-peer;
+              c = self.packages.${system}.trevrpc-c;
+              cpp = self.packages.${system}.trevrpc-cpp;
+              go = self.packages.${system}.trevrpc-go;
+              js = self.packages.${system}.trevrpc-js;
               chromium = self.packages.${system}.trevrpc-chromium-bench-peer;
-              kotlin = self.packages.${system}.trevrpc-kotlin-bench-peer;
-              rust = self.packages.${system}.trevrpc-rust-bench-peer;
+              kotlin = self.packages.${system}.trevrpc-kotlin;
+              rust = self.packages.${system}.trevrpc-rust;
             in
             pkgs.runCommand "trevrpc-benchmark-peer-capabilities-check" { nativeBuildInputs = [ pkgs.jq ]; } ''
               check_native_capabilities() {
                 test "$($1 capabilities | jq -r .schema_version)" = 4
                 test "$($1 capabilities | jq -r .peer)" = "$2"
-                test "$($1 capabilities | jq -c '.roles.client | sort')" = '["grpc_http2","trevrpc_native_quic"]'
-                test "$($1 capabilities | jq -c '.roles.server | sort')" = '["grpc_http2","trevrpc_native_quic","trevrpc_webtransport"]'
+                test "$($1 capabilities | jq -c '.roles.client | sort')" = '["trevrpc_native_quic"]'
+                test "$($1 capabilities | jq -c '.roles.server | sort')" = '["trevrpc_native_quic","trevrpc_webtransport"]'
               }
               check_native_capabilities ${c}/bin/trevrpc-bench-peer-c c
               check_native_capabilities ${cpp}/bin/trevrpc-bench-peer-cpp cpp
@@ -615,12 +583,12 @@
                 ];
               };
               controller = self.packages.${system}.trevrpc-bench;
-              cPeer = self.packages.${system}.trevrpc-c-conformance-peer;
-              cppPeer = self.packages.${system}.trevrpc-cpp-conformance-peer;
-              goPeer = self.packages.${system}.trevrpc-go-conformance-peer;
-              jsPeer = self.packages.${system}.trevrpc-js-conformance-peer;
-              kotlinPeer = self.packages.${system}.trevrpc-kotlin-conformance-peer;
-              rustPeer = self.packages.${system}.trevrpc-rust-conformance-peer;
+              cPeer = self.packages.${system}.trevrpc-c;
+              cppPeer = self.packages.${system}.trevrpc-cpp;
+              goPeer = self.packages.${system}.trevrpc-go;
+              jsPeer = self.packages.${system}.trevrpc-js;
+              kotlinPeer = self.packages.${system}.trevrpc-kotlin;
+              rustPeer = self.packages.${system}.trevrpc-rust;
             in
             pkgs.runCommand "trevrpc-conformance-m3"
               {

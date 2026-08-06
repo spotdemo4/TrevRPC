@@ -454,8 +454,11 @@ mod tests {
                 .contains("trevrpc_native_quic")
         );
 
-        let mismatched =
-            capabilities(vec![Stack::GrpcHttp2]).validate("rust", &client_only, &[RpcKind::Unary]);
+        let mismatched = capabilities(vec![Stack::TrevrpcWebtransport]).validate(
+            "rust",
+            &client_only,
+            &[RpcKind::Unary],
+        );
         assert!(
             mismatched
                 .unwrap_err()
@@ -466,14 +469,14 @@ mod tests {
 
     #[test]
     fn validates_stacks_independently_for_each_role() {
-        let mut capabilities = capabilities(vec![Stack::GrpcHttp2]);
+        let mut capabilities = capabilities(vec![Stack::TrevrpcNativeQuic]);
         capabilities
             .roles
             .get_mut(&Role::Server)
             .expect("server capabilities")
             .clone_from(&vec![Stack::TrevrpcWebtransport]);
         let required = BTreeMap::from([
-            (Role::Client, BTreeSet::from([Stack::GrpcHttp2])),
+            (Role::Client, BTreeSet::from([Stack::TrevrpcNativeQuic])),
             (Role::Server, BTreeSet::from([Stack::TrevrpcWebtransport])),
         ]);
         capabilities

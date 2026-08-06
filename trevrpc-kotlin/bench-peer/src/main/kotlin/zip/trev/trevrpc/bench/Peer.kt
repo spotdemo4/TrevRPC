@@ -158,15 +158,6 @@ private suspend fun bindBenchmarkServer(config: PeerCommand.Server): RunningBenc
             }
         }
 
-        BenchmarkStack.GRPC_HTTP2 -> {
-            val server = GrpcBenchmarkServer.bind(address, config.certificate, config.privateKey)
-            object : RunningBenchmarkServer {
-                override val localAddress = server.localAddress
-
-                override suspend fun shutdown() = server.shutdown()
-            }
-        }
-
         BenchmarkStack.TREVRPC_WEBTRANSPORT -> {
             val server =
                 NettyRpcServer.bind(
@@ -203,11 +194,6 @@ private suspend fun connectBenchmarkClient(config: PeerCommand.Client): Benchmar
                 NativeBenchmarkClient(BenchmarkServiceClient(transport, benchmarkCallOptions(config))),
                 transport::shutdown,
             )
-        }
-
-        BenchmarkStack.GRPC_HTTP2 -> {
-            val channel = createGrpcChannel(address, config.certificate)
-            BenchmarkClientConnection(GrpcBenchmarkClient(channel), channel::shutdownGracefully)
         }
 
         BenchmarkStack.TREVRPC_WEBTRANSPORT -> {

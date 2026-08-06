@@ -1,11 +1,9 @@
 #!/usr/bin/env node
 
-import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-import * as grpc from "@grpc/grpc-js";
 import {
   Code,
   RpcStreamFrameKind,
@@ -44,30 +42,13 @@ export {
 } from "./common.js";
 
 const Peer = "js";
-const ServiceName = "trevrpc.benchmark.v1.BenchmarkService";
-const ClientStacks = new Set(["trevrpc_native_quic", "grpc_http2"]);
-const ServerStacks = new Set(["trevrpc_native_quic", "grpc_http2", "trevrpc_webtransport"]);
-const ConnectTimeoutMs = 30_000;
-const ShutdownTimeoutMs = 5_000;
+const ClientStacks = new Set(["trevrpc_native_quic"]);
+const ServerStacks = new Set(["trevrpc_native_quic", "trevrpc_webtransport"]);
 
 const BenchmarkRequest = root.lookupType("trevrpc.benchmark.v1.BenchmarkRequest");
 const BenchmarkResponse = root.lookupType("trevrpc.benchmark.v1.BenchmarkResponse");
 const StreamRequest = root.lookupType("trevrpc.benchmark.v1.StreamRequest");
 const BenchmarkSummary = root.lookupType("trevrpc.benchmark.v1.BenchmarkSummary");
-
-export const GrpcBenchmarkService = Object.freeze({
-  unary: grpcMethod("Unary", BenchmarkRequest, BenchmarkResponse, false, false),
-  clientStream: grpcMethod("ClientStream", BenchmarkRequest, BenchmarkSummary, true, false),
-  serverStream: grpcMethod("ServerStream", StreamRequest, BenchmarkResponse, false, true),
-  bidi: grpcMethod("Bidi", BenchmarkRequest, BenchmarkResponse, true, true),
-});
-
-const GrpcBenchmarkClient = grpc.makeGenericClientConstructor(GrpcBenchmarkService, ServiceName);
-const GrpcOptions = Object.freeze({
-  "grpc.default_compression_algorithm": grpc.compressionAlgorithms.identity,
-  "grpc.max_receive_message_length": MaxFrameSize,
-  "grpc.max_send_message_length": MaxFrameSize,
-});
 
 export class PeerError extends Error {
   constructor(phase, code, message, options = {}) {
@@ -217,72 +198,6 @@ export function createBenchmarkHandlers() {
   };
 }
 
-export function createGrpcBenchmarkHandlers() {
-  return {
-    unary(call, callback) {
-      try {
-        callback(null, responseForRequest(call.request));
-      } catch (error) {
-        callback(toGrpcError(error));
-      }
-    },
-
-    clientStream(call, callback) {
-      void receiveGrpcClientStream(call, callback);
-    },
-
-    serverStream(call) {
-      void sendGrpcServerStream(call);
-    },
-
-    bidi(call) {
-      void runGrpcBidi(call);
-    },
-  };
-}
-
-async function receiveGrpcClientStream(call, callback) {
-  const summary = emptySummary();
-  try {
-    for await (const request of call) {
-      addSummaryRequest(summary, request);
-    }
-    callback(null, summaryResponse(summary));
-  } catch (error) {
-    callback(toGrpcError(error));
-  }
-}
-
-async function sendGrpcServerStream(call) {
-  try {
-    validateMessageCount(call.request.messageCount);
-    validateRequestPayload(call.request.payload);
-    validateResponseBytes(call.request.responseBytes);
-    for (let sequence = 0; sequence < call.request.messageCount; sequence += 1) {
-      await writeGrpcMessage(call, createResponse(String(sequence), call.request.responseBytes));
-    }
-    call.end();
-  } catch (error) {
-    call.destroy(toGrpcError(error));
-  }
-}
-
-async function runGrpcBidi(call) {
-  let messageCount = 0;
-  try {
-    for await (const request of call.iterator({ destroyOnReturn: false })) {
-      messageCount += 1;
-      if (messageCount > MaxMessagesPerStream) {
-        throw resourceExhausted("message count exceeded the benchmark peer limit");
-      }
-      await writeGrpcMessage(call, responseForRequest(request));
-    }
-    call.end();
-  } catch (error) {
-    call.destroy(toGrpcError(error));
-  }
-}
-
 function requestBody(frame) {
   if (frame == null) {
     return null;
@@ -299,108 +214,6 @@ function requestBody(frame) {
     return null;
   }
   throw invalidArgument("request stream contained an unknown frame kind");
-}
-
-function createGrpcClientAdapter(client) {
-  return {
-    unary(request) {
-      return new Promise((resolveResponse, rejectResponse) => {
-        client.unary(request, (error, response) => {
-          if (error != null) {
-            rejectResponse(error);
-          } else if (response == null) {
-            rejectResponse(new Error("gRPC unary call returned no response"));
-          } else {
-            resolveResponse(response);
-          }
-        });
-      });
-    },
-
-    clientStream() {
-      let resolveResponse;
-      const response = new Promise((resolvePromise) => {
-        resolveResponse = resolvePromise;
-      });
-      const call = client.clientStream((error, value) => {
-        resolveResponse({ error, value });
-      });
-      const terminalStatus = grpcTerminalStatus(call);
-      return Promise.resolve({
-        send(message) {
-          return writeGrpcMessage(call, message);
-        },
-        async sendMany(messages) {
-          for (const message of messages) {
-            await writeGrpcMessage(call, message);
-          }
-        },
-        async closeAndRecv() {
-          call.end();
-          const [outcome, status] = await Promise.all([response, terminalStatus]);
-          assertGrpcOk(status);
-          if (outcome.error != null) {
-            throw outcome.error;
-          }
-          if (outcome.value == null) {
-            throw new Error("gRPC client-stream call returned no response");
-          }
-          return outcome.value;
-        },
-      });
-    },
-
-    serverStream(request) {
-      const call = client.serverStream(request);
-      const terminalStatus = grpcTerminalStatus(call);
-      return Promise.resolve(grpcResponseStream(call, terminalStatus));
-    },
-
-    bidi() {
-      const call = client.bidi();
-      const iterator = call[Symbol.asyncIterator]();
-      const terminalStatus = grpcTerminalStatus(call);
-      return Promise.resolve({
-        send(message) {
-          return writeGrpcMessage(call, message);
-        },
-        async sendMany(messages) {
-          for (const message of messages) {
-            await writeGrpcMessage(call, message);
-          }
-        },
-        closeSend() {
-          return endGrpcWrites(call);
-        },
-        async recv() {
-          let result;
-          try {
-            result = await iterator.next();
-          } catch (error) {
-            assertGrpcOk(await terminalStatus);
-            throw error;
-          }
-          if (result.done) {
-            assertGrpcOk(await terminalStatus);
-            return undefined;
-          }
-          return result.value;
-        },
-      });
-    },
-  };
-}
-
-async function* grpcResponseStream(call, terminalStatus) {
-  try {
-    for await (const response of call) {
-      yield response;
-    }
-  } catch (error) {
-    assertGrpcOk(await terminalStatus);
-    throw error;
-  }
-  assertGrpcOk(await terminalStatus);
 }
 
 async function runServer(config, io) {
@@ -443,10 +256,6 @@ async function runServer(config, io) {
 }
 
 async function listenBenchmarkServer(config) {
-  if (config.stack === "grpc_http2") {
-    return await listenGrpcBenchmarkServer(config);
-  }
-
   const server = await NodeServer.listen({
     host: config.listen.host,
     port: config.listen.port,
@@ -471,64 +280,6 @@ async function listenBenchmarkServer(config) {
     async close() {
       server.close();
       await done;
-    },
-  };
-}
-
-export async function listenGrpcBenchmarkServer(config) {
-  const [certificate, privateKey] = await Promise.all([
-    readFile(config.cert),
-    readFile(config.key),
-  ]);
-  const server = new grpc.Server({
-    ...GrpcOptions,
-    "grpc.max_concurrent_streams": MaxConcurrency,
-  });
-  server.addService(GrpcBenchmarkService, createGrpcBenchmarkHandlers());
-  const credentials = grpc.ServerCredentials.createSsl(
-    null,
-    [{ private_key: privateKey, cert_chain: certificate }],
-    false,
-  );
-  let port;
-  try {
-    port = await new Promise((resolvePort, rejectPort) => {
-      server.bindAsync(
-        formatAddress(config.listen.host, config.listen.port),
-        credentials,
-        (error, boundPort) => {
-          if (error == null) {
-            resolvePort(boundPort);
-          } else {
-            rejectPort(error);
-          }
-        },
-      );
-    });
-  } catch (error) {
-    server.forceShutdown();
-    throw error;
-  }
-  let closePromise;
-  return {
-    port,
-    done: new Promise(() => {}),
-    close() {
-      closePromise ??= new Promise((resolveClose, rejectClose) => {
-        const timeout = setTimeout(() => {
-          server.forceShutdown();
-          resolveClose();
-        }, ShutdownTimeoutMs);
-        server.tryShutdown((error) => {
-          clearTimeout(timeout);
-          if (error == null) {
-            resolveClose();
-          } else {
-            rejectClose(error);
-          }
-        });
-      });
-      return closePromise;
     },
   };
 }
@@ -599,10 +350,6 @@ async function runClient(config, io) {
 }
 
 async function connectBenchmarkClient(config) {
-  if (config.stack === "grpc_http2") {
-    return await connectGrpcBenchmarkClient(config);
-  }
-
   const transport = await RawNodeTransport.connect({
     host: config.address.host,
     port: config.address.port,
@@ -621,38 +368,6 @@ async function connectBenchmarkClient(config) {
     }),
     close() {
       transport.close();
-    },
-  };
-}
-
-export async function connectGrpcBenchmarkClient(config) {
-  const certificate = await readFile(config.cert);
-  const credentials = grpc.credentials.createSsl(certificate, null, null, {
-    rejectUnauthorized: true,
-  });
-  const grpcClient = new GrpcBenchmarkClient(
-    formatAddress(config.address.host, config.address.port),
-    credentials,
-    GrpcOptions,
-  );
-  try {
-    await new Promise((resolveReady, rejectReady) => {
-      grpcClient.waitForReady(Date.now() + ConnectTimeoutMs, (error) => {
-        if (error == null) {
-          resolveReady();
-        } else {
-          rejectReady(error);
-        }
-      });
-    });
-  } catch (error) {
-    grpcClient.close();
-    throw error;
-  }
-  return {
-    client: createGrpcClientAdapter(grpcClient),
-    close() {
-      grpcClient.close();
     },
   };
 }
@@ -868,80 +583,6 @@ function streamBatchSize(payloadBytes) {
 
 function uint64Text(value) {
   return String(value ?? 0);
-}
-
-function grpcMethod(name, requestType, responseType, requestStream, responseStream) {
-  return Object.freeze({
-    path: `/${ServiceName}/${name}`,
-    requestStream,
-    responseStream,
-    requestSerialize: protobufSerializer(requestType),
-    requestDeserialize: protobufDeserializer(requestType),
-    responseSerialize: protobufSerializer(responseType),
-    responseDeserialize: protobufDeserializer(responseType),
-    originalName: name,
-  });
-}
-
-function protobufSerializer(type) {
-  return (value) => {
-    const encoded = type.encode(value).finish();
-    return Buffer.from(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-  };
-}
-
-function protobufDeserializer(type) {
-  return (value) => type.decode(value);
-}
-
-function writeGrpcMessage(call, message) {
-  return new Promise((resolveWrite, rejectWrite) => {
-    try {
-      call.write(message, (error) => {
-        if (error == null) {
-          resolveWrite();
-        } else {
-          rejectWrite(error);
-        }
-      });
-    } catch (error) {
-      rejectWrite(error);
-    }
-  });
-}
-
-function endGrpcWrites(call) {
-  return new Promise((resolveEnd, rejectEnd) => {
-    call.end((error) => {
-      if (error == null) {
-        resolveEnd();
-      } else {
-        rejectEnd(error);
-      }
-    });
-  });
-}
-
-function grpcTerminalStatus(call) {
-  return new Promise((resolveStatus) => {
-    call.once("status", resolveStatus);
-  });
-}
-
-function assertGrpcOk(status) {
-  if (status.code === grpc.status.OK) {
-    return;
-  }
-  const error = new Error(`gRPC status ${status.code}: ${status.details}`);
-  error.code = status.code;
-  error.details = status.details;
-  throw error;
-}
-
-function toGrpcError(error) {
-  const code = Number.isInteger(error?.code) ? error.code : grpc.status.UNKNOWN;
-  const details = error?.statusMessage ?? error?.details ?? error?.message ?? String(error);
-  return Object.assign(new Error(details), { code, details });
 }
 
 async function waitForControl(control, allowed) {

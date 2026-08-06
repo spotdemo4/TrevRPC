@@ -38,10 +38,7 @@ typedef trevrpc_benchmark_v1_benchmark_service_benchmark_summary_event Benchmark
 
 typedef struct benchmark_client {
     benchmark_stack stack;
-    union {
-        trevrpc_raw_client* native;
-        trevrpc_bench_grpc_client* grpc;
-    } impl;
+    trevrpc_raw_client* native;
 } benchmark_client;
 
 typedef struct histogram_bucket {
@@ -74,7 +71,6 @@ typedef struct phase_control phase_control;
 typedef struct lane_args {
     phase_control* phase;
     size_t lane_index;
-    trevrpc_bench_grpc_lane* grpc_lane;
     lane_result result;
 } lane_args;
 
@@ -216,8 +212,8 @@ static int flush_event(void) {
 static int emit_capabilities(void) {
     if (fprintf(stdout,
             "{\"schema_version\":%d,\"event\":\"capabilities\",\"peer\":\"c\","
-            "\"roles\":{\"client\":[\"trevrpc_native_quic\",\"grpc_http2\"],"
-            "\"server\":[\"trevrpc_native_quic\",\"grpc_http2\",\"trevrpc_webtransport\"]},"
+            "\"roles\":{\"client\":[\"trevrpc_native_quic\"],"
+            "\"server\":[\"trevrpc_native_quic\",\"trevrpc_webtransport\"]},"
             "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
             "\"histogram\":\"log_linear_v1\"}",
             BENCHMARK_SCHEMA_VERSION) < 0) {
@@ -353,8 +349,6 @@ static int set_once(const char** destination, const char* value) {
 static int parse_stack(const char* value, benchmark_stack* stack, const char** stack_name) {
     if (strcmp(value, "trevrpc_native_quic") == 0) {
         *stack = BENCHMARK_STACK_TREVRPC_NATIVE_QUIC;
-    } else if (strcmp(value, "grpc_http2") == 0) {
-        *stack = BENCHMARK_STACK_GRPC_HTTP2;
     } else if (strcmp(value, "trevrpc_webtransport") == 0) {
         *stack = BENCHMARK_STACK_TREVRPC_WEBTRANSPORT;
     } else {
@@ -1104,12 +1098,8 @@ static int run_native_operation(trevrpc_raw_client* client, const client_options
     return -EINVAL;
 }
 
-static int run_operation(
-    benchmark_client* client, trevrpc_bench_grpc_lane* grpc_lane, const client_options* options, uint64_t sequence) {
-    if (client->stack == BENCHMARK_STACK_GRPC_HTTP2) {
-        return trevrpc_bench_grpc_run_operation(grpc_lane, options, sequence);
-    }
-    return run_native_operation(client->impl.native, options, sequence);
+static int run_operation(benchmark_client* client, const client_options* options, uint64_t sequence) {
+    return run_native_operation(client->native, options, sequence);
 }
 
 static operation_counts operation_message_counts(const client_options* options) {
@@ -1183,9 +1173,6 @@ static void histogram_reset(histogram* target) {
 static void* lane_thread(void* context) {
     lane_args* lane = context;
     phase_control* phase = lane->phase;
-    if (phase->client->stack == BENCHMARK_STACK_GRPC_HTTP2) {
-        lane->result.internal_error = trevrpc_bench_grpc_lane_open(phase->client->impl.grpc, &lane->grpc_lane);
-    }
     pthread_mutex_lock(&phase->mutex);
     phase->ready_count++;
     pthread_cond_broadcast(&phase->cond);
@@ -1211,7 +1198,7 @@ static void* lane_thread(void* context) {
             break;
         }
         uint64_t sequence = operation_index * phase->options->concurrency + lane->lane_index;
-        int err = run_operation(phase->client, lane->grpc_lane, phase->options, sequence);
+        int err = run_operation(phase->client, phase->options, sequence);
         uint64_t operation_end = monotonic_nanos();
         if (err != 0) {
             lane->result.failed++;
@@ -1242,8 +1229,6 @@ static void* lane_thread(void* context) {
         }
         operation_index++;
     }
-    trevrpc_bench_grpc_lane_close(lane->grpc_lane);
-    lane->grpc_lane = NULL;
     return NULL;
 }
 
@@ -1497,10 +1482,6 @@ static bool native_server_done(void* context, int* result) {
     return server_thread_done(context, result);
 }
 
-static bool grpc_server_done(void* context, int* result) {
-    return trevrpc_bench_grpc_server_done(context, result);
-}
-
 static void server_signal_handler(int signal_number) {
     (void)signal_number;
     server_stop_requested = 1;
@@ -1546,41 +1527,6 @@ static int wait_for_server_shutdown(
     }
 }
 
-static int run_grpc_server(const server_options* options) {
-    trevrpc_bench_grpc_server* server = NULL;
-    uint16_t actual_port = 0;
-    int err = trevrpc_bench_grpc_server_start(options, &server, &actual_port);
-    if (err != 0) {
-        return fail_with_error("listen", "listen_failed", "%s (%d)", trevrpc_error(err), err);
-    }
-
-    struct sigaction action = {0};
-    action.sa_handler = server_signal_handler;
-    sigemptyset(&action.sa_mask);
-    (void)sigaction(SIGINT, &action, NULL);
-    (void)sigaction(SIGTERM, &action, NULL);
-    if (emit_ready(options->host, actual_port, options->stack_name) != 0) {
-        (void)trevrpc_bench_grpc_server_close(server);
-        return 1;
-    }
-
-    bool graceful = false;
-    int wait_err = wait_for_server_shutdown(server, grpc_server_done, &graceful);
-    int shutdown_err = trevrpc_bench_grpc_server_shutdown(server);
-    int close_err = trevrpc_bench_grpc_server_close(server);
-    if (wait_err != 0) {
-        return fail_with_error("serve", "control_failed", "%s (%d)", trevrpc_error(wait_err), wait_err);
-    }
-    err = shutdown_err != 0 ? shutdown_err : close_err;
-    if (err != 0) {
-        return fail_with_error("serve", "shutdown_failed", "%s (%d)", trevrpc_error(err), err);
-    }
-    if (graceful && emit_stopped(options->stack_name) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
 static int run_server(int argc, char** argv) {
     char parse_error[256];
     server_options options;
@@ -1589,12 +1535,6 @@ static int run_server(int argc, char** argv) {
         free(options.host);
         return fail_with_error("config", "invalid_argument", "%s", parse_error);
     }
-    if (options.stack == BENCHMARK_STACK_GRPC_HTTP2) {
-        err = run_grpc_server(&options);
-        free(options.host);
-        return err;
-    }
-
     trevrpc_server_config_v1 config;
     err = trevrpc_server_config_v1_init(&config, sizeof(config));
     if (err != 0) {
@@ -1760,25 +1700,12 @@ static int run_server(int argc, char** argv) {
 }
 
 static void benchmark_client_close(benchmark_client* client) {
-    if (client->stack == BENCHMARK_STACK_GRPC_HTTP2) {
-        trevrpc_bench_grpc_client_close(client->impl.grpc);
-    } else {
-        trevrpc_raw_client_close(client->impl.native);
-    }
+    trevrpc_raw_client_close(client->native);
     memset(client, 0, sizeof(*client));
 }
 
 static int validate_client(benchmark_client* client, const client_options* options) {
-    trevrpc_bench_grpc_lane* grpc_lane = NULL;
-    int err = 0;
-    if (client->stack == BENCHMARK_STACK_GRPC_HTTP2) {
-        err = trevrpc_bench_grpc_lane_open(client->impl.grpc, &grpc_lane);
-    }
-    if (err == 0) {
-        err = run_operation(client, grpc_lane, options, 0);
-    }
-    trevrpc_bench_grpc_lane_close(grpc_lane);
-    return err;
+    return run_operation(client, options, 0);
 }
 
 static int run_client(int argc, char** argv) {
@@ -1791,21 +1718,16 @@ static int run_client(int argc, char** argv) {
     }
 
     benchmark_client client = {.stack = options.stack};
-    if (options.stack == BENCHMARK_STACK_GRPC_HTTP2) {
-        err = trevrpc_bench_grpc_client_connect(&options, &client.impl.grpc);
-    } else {
-        trevrpc_client_config_v1 config;
-        err = trevrpc_client_config_v1_init(&config, sizeof(config));
-        if (err == 0) {
-            config.ca_cert_file = options.cert;
-            config.skip_certificate_validation = 0;
-            config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
-            config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
-            config.peer_bidi_stream_count =
-                (uint16_t)(options.concurrency > UINT16_MAX ? UINT16_MAX : options.concurrency);
-            config.max_frame_size = BENCHMARK_MAX_FRAME_SIZE;
-            err = trevrpc_raw_client_connect_v1(options.host, options.port, &config, NULL, &client.impl.native);
-        }
+    trevrpc_client_config_v1 config;
+    err = trevrpc_client_config_v1_init(&config, sizeof(config));
+    if (err == 0) {
+        config.ca_cert_file = options.cert;
+        config.skip_certificate_validation = 0;
+        config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
+        config.keep_alive_ms = BENCHMARK_KEEP_ALIVE_MS;
+        config.peer_bidi_stream_count = (uint16_t)(options.concurrency > UINT16_MAX ? UINT16_MAX : options.concurrency);
+        config.max_frame_size = BENCHMARK_MAX_FRAME_SIZE;
+        err = trevrpc_raw_client_connect_v1(options.host, options.port, &config, NULL, &client.native);
     }
     if (err != 0) {
         int result = fail_with_error("connect", "connect_failed", "%s (%d)", trevrpc_error(err), err);

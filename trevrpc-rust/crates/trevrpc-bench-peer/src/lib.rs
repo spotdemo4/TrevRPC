@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 mod config;
-mod grpc;
 mod histogram;
 mod proto;
 mod workload;
@@ -20,19 +19,12 @@ use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpListener;
 use tokio::sync::{Barrier, watch};
 use tokio::task::JoinHandle;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{
-    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig,
-};
 
 use config::{
     ClientConfig, Command, MAX_ENCODED_FRAME_BYTES, MAX_MESSAGES_PER_STREAM, ServerConfig, Stack,
 };
-use grpc::GrpcWorkload;
 use histogram::{HistogramBucket, LogLinearHistogram};
 use workload::{BenchmarkServiceImpl, BenchmarkWorkload, MessageCounts, Workload, WorkloadConfig};
 
@@ -102,7 +94,6 @@ pub fn emit_error(error: &PeerError) {
 async fn run_server(config: ServerConfig) -> PeerResult {
     match config.stack {
         Stack::TrevrpcNativeQuic => run_native_server(config).await,
-        Stack::GrpcHttp2 => run_grpc_server(config).await,
         Stack::TrevrpcWebTransport => run_webtransport_server(config).await,
     }
 }
@@ -257,84 +248,6 @@ fn set_webtransport_origin(origin: &str) -> PeerResult {
     Ok(())
 }
 
-async fn run_grpc_server(config: ServerConfig) -> PeerResult {
-    let certificate_pem = fs::read(&config.certificate)
-        .map_err(|error| PeerError::wrap("server", "certificate_read_failed", error))?;
-    let private_key_pem = fs::read(&config.private_key)
-        .map_err(|error| PeerError::wrap("server", "private_key_read_failed", error))?;
-    let tls = ServerTlsConfig::new().identity(Identity::from_pem(certificate_pem, private_key_pem));
-    let mut server = tonic::transport::Server::builder()
-        .max_concurrent_streams(
-            u32::try_from(SERVER_MAX_STREAMS)
-                .map_err(|error| PeerError::wrap("server", "transport_config_failed", error))?,
-        )
-        .tls_config(tls)
-        .map_err(|error| PeerError::wrap("server", "tls_config_failed", error))?;
-    let listener = TcpListener::bind(config.listen)
-        .await
-        .map_err(|error| PeerError::wrap("server", "listen_failed", error))?;
-    let address = listener
-        .local_addr()
-        .map_err(|error| PeerError::wrap("server", "listen_failed", error))?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let incoming = TcpListenerStream::new(listener).map(|result| {
-        result.and_then(|stream| {
-            stream.set_nodelay(true)?;
-            Ok(stream)
-        })
-    });
-    let mut server_task = tokio::spawn(async move {
-        server
-            .add_service(grpc::benchmark_service())
-            .serve_with_incoming_shutdown(incoming, async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-    });
-
-    emit(&ReadyEvent {
-        schema_version: SCHEMA_VERSION,
-        event: "ready",
-        peer: PEER,
-        address: address.to_string(),
-        pid: process::id(),
-    })?;
-
-    let control = tokio::select! {
-        control = wait_for_server_control() => control,
-        result = &mut server_task => {
-            return finish_grpc_server_task(result, false);
-        }
-    };
-    let _ = shutdown_tx.send(());
-    let server_result = server_task.await;
-    let protocol_shutdown = match control {
-        Ok(protocol_shutdown) => protocol_shutdown,
-        Err(error) => {
-            let _ = finish_grpc_server_task(server_result, false);
-            return Err(error);
-        }
-    };
-    finish_grpc_server_task(server_result, protocol_shutdown)
-}
-
-fn finish_grpc_server_task(
-    result: Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>,
-    emit_stopped: bool,
-) -> PeerResult {
-    result
-        .map_err(|error| PeerError::wrap("server", "server_task_failed", error))?
-        .map_err(|error| PeerError::wrap("server", "serve_failed", error))?;
-    if emit_stopped {
-        emit(&StoppedEvent {
-            schema_version: SCHEMA_VERSION,
-            event: "stopped",
-            peer: PEER,
-        })?;
-    }
-    Ok(())
-}
-
 fn finish_server_task(
     result: Result<trevrpc::Result<()>, tokio::task::JoinError>,
     emit_stopped: bool,
@@ -391,10 +304,6 @@ async fn run_client(config: ClientConfig) -> PeerResult {
                 .connection
                 .close(0_u32.into(), b"benchmark complete");
             connected.endpoint.wait_idle().await;
-        }
-        Stack::GrpcHttp2 => {
-            let workload = connect_grpc_client(&config).await?;
-            run_client_workload(&config, workload).await?;
         }
         Stack::TrevrpcWebTransport => {
             return Err(PeerError::new(
@@ -572,38 +481,6 @@ async fn connect_native_transport(
         .await
         .map_err(|error| PeerError::wrap("connect", "tls_connect_failed", error))?;
     Ok((endpoint, connection))
-}
-
-async fn connect_grpc_client(config: &ClientConfig) -> PeerResult<GrpcWorkload> {
-    let certificate_pem = fs::read(&config.certificate)
-        .map_err(|error| PeerError::wrap("connect", "certificate_read_failed", error))?;
-    let channel = connect_grpc_channel(config.address, certificate_pem).await?;
-    Ok(GrpcWorkload::new(
-        channel,
-        WorkloadConfig {
-            rpc: config.rpc,
-            request_bytes: config.request_bytes,
-            response_bytes: config.response_bytes,
-            messages_per_stream: config.messages_per_stream,
-        },
-    ))
-}
-
-async fn connect_grpc_channel(
-    address: SocketAddr,
-    certificate_pem: Vec<u8>,
-) -> PeerResult<Channel> {
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(certificate_pem))
-        .domain_name(tls_server_identity(address));
-    let endpoint = Endpoint::from_shared(format!("https://{address}"))
-        .map_err(|error| PeerError::wrap("connect", "endpoint_failed", error))?
-        .tls_config(tls)
-        .map_err(|error| PeerError::wrap("connect", "tls_config_failed", error))?;
-    endpoint
-        .connect()
-        .await
-        .map_err(|error| PeerError::wrap("connect", "tls_connect_failed", error))
 }
 
 fn tls_server_identity(address: SocketAddr) -> String {
@@ -803,8 +680,8 @@ const fn capabilities() -> CapabilitiesEvent {
         event: "capabilities",
         peer: PEER,
         roles: RoleCapabilities {
-            client: &["trevrpc_native_quic", "grpc_http2"],
-            server: &["trevrpc_native_quic", "grpc_http2", "trevrpc_webtransport"],
+            client: &["trevrpc_native_quic"],
+            server: &["trevrpc_native_quic", "trevrpc_webtransport"],
         },
         rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
         histogram: "log_linear_v1",
@@ -872,23 +749,11 @@ mod tests {
     use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     use serde_json::json;
-    use tokio::net::TcpListener;
     use tokio::sync::oneshot;
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::Code;
-    use tonic::transport::{Identity, ServerTlsConfig};
 
     use crate::config::{MAX_ENCODED_FRAME_BYTES, RpcKind};
-    use crate::grpc::GrpcWorkload;
-    use crate::proto::StreamRequest;
-    use crate::proto::grpc::benchmark_service_client::BenchmarkServiceClient as GrpcClient;
-    use crate::workload::{
-        BenchmarkServiceImpl, BenchmarkWorkload, MessageCounts, Workload, WorkloadConfig,
-    };
-    use crate::{
-        PreparedPhase, capabilities, connect_grpc_channel, connect_native_transport,
-        set_webtransport_origin,
-    };
+    use crate::workload::{BenchmarkServiceImpl, MessageCounts, Workload, WorkloadConfig};
+    use crate::{PreparedPhase, capabilities, connect_native_transport, set_webtransport_origin};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -901,146 +766,13 @@ mod tests {
                 "event": "capabilities",
                 "peer": "rust",
                 "roles": {
-                    "client": ["trevrpc_native_quic", "grpc_http2"],
-                    "server": ["trevrpc_native_quic", "grpc_http2", "trevrpc_webtransport"]
+                    "client": ["trevrpc_native_quic"],
+                    "server": ["trevrpc_native_quic", "trevrpc_webtransport"]
                 },
                 "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
                 "histogram": "log_linear_v1"
             })
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn private_ca_grpc_round_trips_all_rpc_kinds() -> TestResult {
-        let mut ca_params = CertificateParams::default();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate()?)?;
-        let server_key = KeyPair::generate()?;
-        let certificate =
-            CertificateParams::new(vec!["127.0.0.1".to_owned()])?.signed_by(&server_key, &ca)?;
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-        let server_address = listener.local_addr()?;
-        let tls = ServerTlsConfig::new().identity(Identity::from_pem(
-            certificate.pem(),
-            server_key.serialize_pem(),
-        ));
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let server_task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .tls_config(tls)?
-                .add_service(crate::grpc::benchmark_service())
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-        });
-        let channel = connect_grpc_channel(server_address, ca.pem().into_bytes()).await?;
-
-        for (rpc, messages_per_stream, expected) in [
-            (
-                RpcKind::Unary,
-                4,
-                MessageCounts {
-                    request: 1,
-                    response: 1,
-                },
-            ),
-            (
-                RpcKind::ClientStream,
-                4,
-                MessageCounts {
-                    request: 4,
-                    response: 1,
-                },
-            ),
-            (
-                RpcKind::ServerStream,
-                4,
-                MessageCounts {
-                    request: 1,
-                    response: 4,
-                },
-            ),
-            (
-                RpcKind::Bidi,
-                64,
-                MessageCounts {
-                    request: 64,
-                    response: 64,
-                },
-            ),
-        ] {
-            let workload = GrpcWorkload::new(
-                channel.clone(),
-                WorkloadConfig {
-                    rpc,
-                    request_bytes: 17,
-                    response_bytes: 23,
-                    messages_per_stream,
-                },
-            );
-            assert_eq!(BenchmarkWorkload::execute(&workload).await?, expected);
-        }
-
-        let mut client = GrpcClient::new(channel)
-            .max_decoding_message_size(MAX_ENCODED_FRAME_BYTES)
-            .max_encoding_message_size(MAX_ENCODED_FRAME_BYTES);
-        let Err(status) = client
-            .server_stream(StreamRequest {
-                message_count: 0,
-                payload: Vec::new(),
-                response_bytes: 0,
-            })
-            .await
-        else {
-            return Err("zero message_count unexpectedly succeeded".into());
-        };
-        assert_eq!(status.code(), Code::InvalidArgument);
-        assert_eq!(
-            status.message(),
-            "message_count is outside the benchmark peer limit"
-        );
-
-        let _ = shutdown_tx.send(());
-        tokio::time::timeout(Duration::from_secs(2), server_task).await???;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn private_ca_grpc_rejects_wrong_server_san() -> TestResult {
-        let mut ca_params = CertificateParams::default();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate()?)?;
-        let server_key = KeyPair::generate()?;
-        let certificate =
-            CertificateParams::new(vec!["localhost".to_owned()])?.signed_by(&server_key, &ca)?;
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-        let server_address = listener.local_addr()?;
-        let tls = ServerTlsConfig::new().identity(Identity::from_pem(
-            certificate.pem(),
-            server_key.serialize_pem(),
-        ));
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let server_task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .tls_config(tls)?
-                .add_service(crate::grpc::benchmark_service())
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-        });
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            connect_grpc_channel(server_address, ca.pem().into_bytes()),
-        )
-        .await?;
-        let _ = shutdown_tx.send(());
-        tokio::time::timeout(Duration::from_secs(2), server_task).await???;
-        let error = result.expect_err("IP connection unexpectedly accepted a localhost SAN");
-        assert_eq!(error.code, "tls_connect_failed");
         Ok(())
     }
 
@@ -1158,7 +890,7 @@ mod tests {
         connection.close(0_u32.into(), b"test complete");
         client_endpoint.wait_idle().await;
         let _ = shutdown_tx.send(());
-        tokio::time::timeout(Duration::from_secs(2), server_task).await???;
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await??;
         Ok(())
     }
 
@@ -1293,7 +1025,7 @@ mod tests {
         session.close(0, b"test complete");
         drop(client);
         let _ = shutdown_tx.send(());
-        tokio::time::timeout(Duration::from_secs(2), server_task).await???;
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await??;
         Ok(())
     }
 

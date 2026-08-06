@@ -30,12 +30,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     prost_build::Config::new().compile_fds(descriptor.clone())?;
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
-    let tonic_out_dir = out_dir.join("tonic");
-    fs::create_dir_all(&tonic_out_dir)?;
-    tonic_prost_build::configure()
-        .out_dir(tonic_out_dir)
-        .extern_path(".trevrpc.benchmark.v1", "crate::proto")
-        .compile_fds(descriptor.clone())?;
 
     let request = CodeGeneratorRequest {
         file_to_generate: vec!["benchmark.proto".to_owned()],

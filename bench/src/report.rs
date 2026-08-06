@@ -542,7 +542,10 @@ mod tests {
 
     #[test]
     fn aggregates_identical_dimensions_separately_by_stack() {
-        let samples = vec![sample(Stack::TrevrpcNativeQuic), sample(Stack::GrpcHttp2)];
+        let samples = vec![
+            sample(Stack::TrevrpcNativeQuic),
+            sample(Stack::TrevrpcWebtransport),
+        ];
         let aggregates = aggregate(&samples);
         assert_eq!(aggregates.len(), 2);
         assert_ne!(aggregates[0].stack, aggregates[1].stack);
@@ -552,7 +555,7 @@ mod tests {
     fn rejects_sample_stack_that_differs_from_its_campaign_cell() {
         let error = validate_samples(
             &campaign(Stack::TrevrpcNativeQuic),
-            &[sample(Stack::GrpcHttp2)],
+            &[sample(Stack::TrevrpcWebtransport)],
         )
         .expect_err("mismatched sample stack");
         assert!(error.to_string().contains("does not match its matrix cell"));

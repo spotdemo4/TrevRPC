@@ -14,7 +14,7 @@ class ProtocolTest {
                 arrayOf(
                     "client",
                     "--stack",
-                    "grpc_http2",
+                    "trevrpc_native_quic",
                     "--address",
                     "127.0.0.1:7443",
                     "--cert",
@@ -37,7 +37,7 @@ class ProtocolTest {
             ) as PeerCommand.Client
 
         assertEquals("127.0.0.1:7443", command.address)
-        assertEquals(BenchmarkStack.GRPC_HTTP2, command.stack)
+        assertEquals(BenchmarkStack.TREVRPC_NATIVE_QUIC, command.stack)
         assertEquals(BenchmarkRpcKind.BIDI, command.rpcKind)
         assertEquals(8, command.concurrency)
         assertEquals(250, command.warmupMilliseconds)
@@ -102,8 +102,8 @@ class ProtocolTest {
         val rpcKinds = """["unary","client_stream","server_stream","bidi"]"""
         val expectedCapabilities =
             """{"schema_version":4,"event":"capabilities","peer":"kotlin","roles":{""" +
-                """"client":["trevrpc_native_quic","grpc_http2"],""" +
-                """"server":["trevrpc_native_quic","trevrpc_webtransport","grpc_http2"]},""" +
+                """"client":["trevrpc_native_quic"],""" +
+                """"server":["trevrpc_native_quic","trevrpc_webtransport"]},""" +
                 """"rpc_kinds":$rpcKinds,"histogram":"log_linear_v1"}""" +
                 System.lineSeparator()
         assertEquals(

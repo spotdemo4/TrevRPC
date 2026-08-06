@@ -37,7 +37,7 @@ struct Endpoint {
   [[nodiscard]] std::string address(std::uint16_t actual_port) const;
 };
 
-enum class Stack { TrevrpcNativeQuic, GrpcHttp2, TrevrpcWebTransport };
+enum class Stack { TrevrpcNativeQuic, TrevrpcWebTransport };
 enum class RpcKind { Unary, ClientStream, ServerStream, Bidi };
 
 struct ServerConfig {
@@ -87,8 +87,5 @@ public:
   virtual void shutdown() = 0;
   [[nodiscard]] virtual std::optional<std::string> finish_error() = 0;
 };
-
-[[nodiscard]] std::unique_ptr<BenchmarkServer> start_grpc_server(const ServerConfig& config);
-[[nodiscard]] std::shared_ptr<ClientFactory> connect_grpc_client(const ClientConfig& config);
 
 } // namespace trevrpc_bench
