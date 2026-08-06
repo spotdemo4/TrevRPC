@@ -98,7 +98,7 @@ buildNpmPackage (final: {
         ln -s "$core_tgz" "$TMPDIR/verify-stage/trevrpc-trevrpc-js-${final.version}.tgz"
         ln -s "$native_tgz" \
           "$TMPDIR/verify-stage/trevrpc-trevrpc-js-native-linux-x64-gnu-${final.version}.tgz"
-        node publication-tests/verify.mjs "$TMPDIR/verify-stage"
+        node publication-tests/verify.mjs "$TMPDIR/verify-stage" "${final.version}"
 
         test_cert="$TMPDIR/server-cert.pem"
         test_key="$TMPDIR/server-key.pem"

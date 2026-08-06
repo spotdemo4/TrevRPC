@@ -26,8 +26,8 @@
     "playwright-core": "^1.62.1"
   },
   "peerDependencies": {
-    "@trevrpc/trevrpc-js": "0.1.0",
-    "trevrpc-bench-peer-js": "0.1.0"
+    "@trevrpc/trevrpc-js": "0.1.1",
+    "trevrpc-bench-peer-js": "0.1.1"
   },
   "peerDependenciesMeta": {
     "trevrpc-bench-peer-js": {

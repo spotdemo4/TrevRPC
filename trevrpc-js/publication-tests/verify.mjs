@@ -3,15 +3,23 @@ import { execFile } from "node:child_process";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const stage = process.argv[2];
-if (stage == null) throw new Error("usage: verify.mjs STAGE_DIRECTORY");
+if (stage == null) throw new Error("usage: verify.mjs STAGE_DIRECTORY [EXPECTED_VERSION]");
+let expectedVersion = process.argv[3] ?? null;
+if (expectedVersion == null) {
+  const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+  const pkgRaw = await readFile(pkgPath, "utf8");
+  expectedVersion = JSON.parse(pkgRaw).version;
+}
+if (!expectedVersion) throw new Error("unable to determine expected version");
 
-const core = join(stage, "trevrpc-trevrpc-js-0.1.0.tgz");
-const native = join(stage, "trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz");
+const core = join(stage, `trevrpc-trevrpc-js-${expectedVersion}.tgz`);
+const native = join(stage, `trevrpc-trevrpc-js-native-linux-x64-gnu-${expectedVersion}.tgz`);
 
 const coreEntries = await tarEntries(core);
 const nativeEntries = await tarEntries(native);
@@ -54,7 +62,7 @@ const extract = await mkdtemp(join(tmpdir(), "trevrpc-js-stage-"));
 await execFileAsync("tar", ["-xzf", core, "-C", extract]);
 const coreManifest = JSON.parse(await readFile(join(extract, "package/package.json"), "utf8"));
 assert.equal(coreManifest.name, "@trevrpc/trevrpc-js");
-assert.equal(coreManifest.version, "0.1.0");
+assert.equal(coreManifest.version, expectedVersion);
 assert.equal(coreManifest.license, "MIT");
 assert.equal(coreManifest.main, undefined);
 assert.equal(coreManifest.types, undefined);
@@ -62,7 +70,7 @@ assert.equal(coreManifest.bin["protoc-gen-trevrpc-js"], "bin/protoc-gen-trevrpc-
 assert.equal(coreManifest.sideEffects, false);
 assert.equal(
   coreManifest.optionalDependencies["@trevrpc/trevrpc-js-native-linux-x64-gnu"],
-  "0.1.0",
+  expectedVersion,
 );
 assert.ok(coreManifest.exports["./node/generated"]);
 
@@ -72,7 +80,7 @@ const nativeManifest = JSON.parse(
   await readFile(join(nativeExtract, "package/package.json"), "utf8"),
 );
 assert.equal(nativeManifest.name, "@trevrpc/trevrpc-js-native-linux-x64-gnu");
-assert.equal(nativeManifest.version, "0.1.0");
+assert.equal(nativeManifest.version, expectedVersion);
 assert.equal(nativeManifest.license, "MIT");
 assert.deepEqual(nativeManifest.os, ["linux"]);
 assert.deepEqual(nativeManifest.cpu, ["x64"]);
