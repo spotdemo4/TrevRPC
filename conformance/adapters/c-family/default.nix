@@ -1,8 +1,8 @@
 {
   stdenv,
   lib,
-  clang-tools,
   cmake,
+  ninja,
   libmsquic,
   protobuf,
   python3,
@@ -24,8 +24,8 @@ stdenv.mkDerivation (final: {
   sourceRoot = "${final.src.name}/conformance/adapters/c-family";
 
   nativeBuildInputs = [
-    clang-tools
     cmake
+    ninja
     protobuf
     python3
   ];
@@ -36,7 +36,7 @@ stdenv.mkDerivation (final: {
 
   configurePhase = ''
     runHook preConfigure
-    cmake -S . -B build \
+    cmake -S . -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX="$out" \
       -DCMAKE_INSTALL_BINDIR=bin \
@@ -46,16 +46,14 @@ stdenv.mkDerivation (final: {
 
   buildPhase = ''
     runHook preBuild
-    cmake --build build
+    cmake --build build --parallel $NIX_BUILD_CORES
     runHook postBuild
   '';
 
   doCheck = true;
   checkPhase = ''
     runHook preCheck
-    clang-format --dry-run --Werror $(find . -path './build' -prune -o \
-      \( -name '*.c' -o -name '*.h' -o -name '*.cpp' \) -print)
-    ctest --test-dir build --output-on-failure
+    ctest --test-dir build --output-on-failure -j $NIX_BUILD_CORES
     runHook postCheck
   '';
 

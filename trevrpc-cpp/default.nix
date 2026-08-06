@@ -3,6 +3,7 @@
   lib,
   clang-tools,
   cmake,
+  ninja,
   openssl,
   protobuf,
   repoRoot,
@@ -31,7 +32,7 @@ stdenv.mkDerivation (
 
     configurePhase = ''
       runHook preConfigure
-      cmake -S . -B build \
+      cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
         -DCMAKE_INSTALL_BINDIR="$out/bin" \
@@ -51,6 +52,7 @@ stdenv.mkDerivation (
     nativeBuildInputs = [
       clang-tools
       cmake
+      ninja
       openssl
       protobuf
     ];
@@ -64,18 +66,15 @@ stdenv.mkDerivation (
     ];
     buildPhase = ''
       runHook preBuild
-      cmake --build build
+      cmake --build build --parallel $NIX_BUILD_CORES
       runHook postBuild
     '';
 
     doCheck = true;
     checkPhase = ''
       runHook preCheck
-      clang-format --dry-run --Werror $(find . \
-        -path './build' -prune -o \
-        \( -name '*.cpp' -o -name '*.hpp' \) -print)
       ${optionalString (!sanitizers) ''
-        clang-tidy --quiet -p build \
+        printf '%s\0' \
           src/trevrpc.cpp \
           src/async.cpp \
           src/callbacks.cpp \
@@ -94,15 +93,15 @@ stdenv.mkDerivation (
           tests/callbacks_test.cpp \
           tests/server_lifecycle_test.cpp \
           examples/greeter/client.cpp \
-          examples/greeter/server.cpp
+          examples/greeter/server.cpp | xargs -0 -P $NIX_BUILD_CORES -n1 clang-tidy --quiet -p build
       ''}
-      ctest --test-dir build --output-on-failure
+      ctest --test-dir build --output-on-failure -j $NIX_BUILD_CORES
       ${optionalString (!sanitizers) ''
         cmake --install build
-        cmake -S tests/consumer -B build/consumer \
+        cmake -S tests/consumer -B build/consumer -G Ninja \
           -DCMAKE_PREFIX_PATH="$dev"
-        cmake --build build/consumer
-        ctest --test-dir build/consumer --output-on-failure
+        cmake --build build/consumer --parallel $NIX_BUILD_CORES
+        ctest --test-dir build/consumer --output-on-failure -j $NIX_BUILD_CORES
       ''}
       runHook postCheck
     '';

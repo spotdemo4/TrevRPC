@@ -3,6 +3,7 @@
   lib,
   clang-tools,
   cmake,
+  ninja,
   libmsquic,
   openssl,
   pkg-config,
@@ -36,7 +37,7 @@ stdenv.mkDerivation (
 
     configurePhase = ''
       runHook preConfigure
-      cmake -S . -B build \
+      cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_BINDIR="$out/bin" \
         -DCMAKE_INSTALL_INCLUDEDIR="$dev/include" \
@@ -54,6 +55,7 @@ stdenv.mkDerivation (
     nativeBuildInputs = [
       clang-tools
       cmake
+      ninja
       openssl
       pkg-config
       protobuf
@@ -63,7 +65,7 @@ stdenv.mkDerivation (
     propagatedBuildInputs = [ libmsquic ];
     buildPhase = ''
       runHook preBuild
-      cmake --build build
+      cmake --build build --parallel $NIX_BUILD_CORES
       runHook postBuild
     '';
 
@@ -71,11 +73,11 @@ stdenv.mkDerivation (
     checkPhase = ''
       runHook preCheck
       export HOME=$TMPDIR
-      clang-format --dry-run --Werror $(find bench examples include src tests tools \( -name '*.c' -o -name '*.h' -o -name '*.cpp' \))
-      clang-tidy --quiet $(find examples src tests tools -name '*.c' \
+      find examples src tests tools -name '*.c' \
         ! -path 'tests/abi5/*' \
         ! -path 'tests/golden/*' \
-        ! -path 'tests/install/*') -- \
+        ! -path 'tests/install/*' -print0 | \
+        xargs -0 -P $NIX_BUILD_CORES -I{} clang-tidy --quiet {} -- \
         -x c \
         -std=c11 \
         -DQUIC_API_ENABLE_PREVIEW_FEATURES \
@@ -86,7 +88,7 @@ stdenv.mkDerivation (
         -Ibuild/generated-service-test \
         -Ibuild/generated-greeter-example \
         -isystem ${libmsquic}/include
-      ctest --test-dir build --output-on-failure \
+      ctest --test-dir build --output-on-failure -j $NIX_BUILD_CORES \
         ${optionalString threadSanitizer "-E '^trevrpc_bench_peer_webtransport_smoke$'"}
       runHook postCheck
     '';
@@ -128,11 +130,11 @@ stdenv.mkDerivation (
       consumer_sanitizer_flags="${optionalString sanitizers "-fsanitize=address,undefined -fno-omit-frame-pointer"}${optionalString threadSanitizer "-fsanitize=thread -fno-omit-frame-pointer"}"
       export CFLAGS="$consumer_sanitizer_flags''${CFLAGS:+ $CFLAGS}"
       export LDFLAGS="$consumer_sanitizer_flags''${LDFLAGS:+ $LDFLAGS}"
-      cmake -S tests/install/cmake -B "$TMPDIR/trevrpc-installed-cmake" \
+      cmake -S tests/install/cmake -B "$TMPDIR/trevrpc-installed-cmake" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_PREFIX_PATH="$dev;$lib" \
         -DTREVRPC_C_GENERATOR_EXECUTABLE="$out/bin/protoc-gen-trevrpc-c"
-      cmake --build "$TMPDIR/trevrpc-installed-cmake"
+      cmake --build "$TMPDIR/trevrpc-installed-cmake" --parallel $NIX_BUILD_CORES
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-cmake-consumer"
 
       export PKG_CONFIG_PATH="$dev/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"

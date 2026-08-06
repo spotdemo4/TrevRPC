@@ -58,6 +58,7 @@
 
               # c
               cmake
+              ninja
               gcc
               clang-tools
               openssl
