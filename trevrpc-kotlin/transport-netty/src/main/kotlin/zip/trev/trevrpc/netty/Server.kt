@@ -185,10 +185,22 @@ class NettyRpcServer private constructor(
                     input,
                     write = { writeRaw(channel, it) },
                     writeBatch = { writeRawBatch(channel, it) },
-                    writeTerminal = { writeRaw(channel, it, finish = true) },
+                    writeTerminal = {
+                        writeRaw(channel, it, finish = true)
+                        if (channel.eventLoop().inEventLoop()) {
+                            releasePermit()
+                        } else {
+                            channel.eventLoop().execute { releasePermit() }
+                        }
+                    },
                     finish = {
                         calls.expectClose(channel)
                         channel.shutdownOutput().awaitCompletion()
+                        if (channel.eventLoop().inEventLoop()) {
+                            releasePermit()
+                        } else {
+                            channel.eventLoop().execute { releasePermit() }
+                        }
                     },
                     cancelInput = channel::cancelBoth,
                 )
@@ -454,11 +466,21 @@ class NettyRpcServer private constructor(
                             writeHttp3(channel, it)
                             calls.expectClose(channel)
                             channel.shutdownOutput().awaitCompletion()
+                            if (channel.eventLoop().inEventLoop()) {
+                                releasePermit()
+                            } else {
+                                channel.eventLoop().execute { releasePermit() }
+                            }
                         },
                         finish = {
                             ensureRequestAccepted()
                             calls.expectClose(channel)
                             channel.shutdownOutput().awaitCompletion()
+                            if (channel.eventLoop().inEventLoop()) {
+                                releasePermit()
+                            } else {
+                                channel.eventLoop().execute { releasePermit() }
+                            }
                         },
                         cancelInput = channel::cancelBothHttp3,
                     )
@@ -686,10 +708,22 @@ class NettyRpcServer private constructor(
                     input,
                     write = { writeRaw(channel, it) },
                     writeBatch = { writeRawBatch(channel, it) },
-                    writeTerminal = { writeRaw(channel, it, finish = true) },
+                    writeTerminal = {
+                        writeRaw(channel, it, finish = true)
+                        if (channel.eventLoop().inEventLoop()) {
+                            releasePermit()
+                        } else {
+                            channel.eventLoop().execute { releasePermit() }
+                        }
+                    },
                     finish = {
                         calls.expectClose(channel)
                         channel.shutdownOutput().awaitCompletion()
+                        if (channel.eventLoop().inEventLoop()) {
+                            releasePermit()
+                        } else {
+                            channel.eventLoop().execute { releasePermit() }
+                        }
                     },
                     cancelInput = channel::cancelBoth,
                 )
