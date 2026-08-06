@@ -82,6 +82,7 @@
               jdk25
               gradle_9
               androidenv.androidPkgs.androidsdk
+              kotlin-lsp
               ktlint
               protobuf
 

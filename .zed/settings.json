@@ -30,6 +30,12 @@
         }
       }
     },
+    "kotlin-lsp": {
+      "binary": {
+        "path": "kotlin-lsp",
+        "arguments": ["--stdio"]
+      }
+    },
     "nixd": {
       "settings": {
         "nixpkgs": {
@@ -105,7 +111,14 @@
     },
     "Kotlin": {
       "format_on_save": "on",
-      "language_servers": ["kotlin-lsp"]
+      "language_servers": ["kotlin-lsp"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "kotlin-lsp"
+          }
+        }
+      ]
     },
     "Rust": {
       "format_on_save": "on",
