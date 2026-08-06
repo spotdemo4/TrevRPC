@@ -4,7 +4,8 @@
   makeWrapper,
   openssl,
   rustPlatform,
-  repoRoot,
+  conformanceSrc,
+  wireGolden,
   sourceCommit,
   sourceDirty,
   util-linux,
@@ -15,7 +16,7 @@ rustPlatform.buildRustPackage (
     version = "0.1.0";
 
     src = fileset.toSource {
-      root = repoRoot;
+      root = ../.;
       fileset = fileset.unions [
         ./Cargo.lock
         ./Cargo.toml
@@ -23,8 +24,8 @@ rustPlatform.buildRustPackage (
         ./peer-protocol-v4.md
         ./proto
         ./src
-        (repoRoot + "/conformance")
-        (repoRoot + "/testdata/wire-golden-vectors.txt")
+        conformanceSrc
+        wireGolden
       ];
     };
     sourceRoot = "${final.src.name}/bench";

@@ -9,7 +9,8 @@
   pkg-config,
   protobuf,
   protobufc,
-  repoRoot,
+  benchProto,
+  wireGolden,
   peerBinaries ? [ ],
   sanitizers ? false,
   threadSanitizer ? false,
@@ -26,10 +27,10 @@ stdenv.mkDerivation (
     ];
 
     src = fileset.toSource {
-      root = repoRoot;
+      root = ../.;
       fileset = fileset.unions [
-        (repoRoot + "/bench/proto")
-        (repoRoot + "/testdata/wire-golden-vectors.txt")
+        benchProto
+        wireGolden
         ./.
       ];
     };

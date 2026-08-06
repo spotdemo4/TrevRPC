@@ -4,7 +4,8 @@
   go-tools,
   gotools,
   gnugrep,
-  repoRoot,
+  benchProto,
+  wireGolden,
 }:
 let
   goSource = lib.fileset.difference ./. ./default.nix;
@@ -14,10 +15,10 @@ buildGoModule (final: {
   version = "0.1.0";
 
   src = lib.fileset.toSource {
-    root = repoRoot;
+    root = ../.;
     fileset = lib.fileset.unions [
-      (repoRoot + "/bench/proto")
-      (repoRoot + "/testdata/wire-golden-vectors.txt")
+      benchProto
+      wireGolden
       goSource
     ];
   };

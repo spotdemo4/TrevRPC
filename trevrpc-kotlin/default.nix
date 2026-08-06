@@ -8,19 +8,21 @@
   runtimeShell,
   gnugrep,
   python3,
-  repoRoot,
+  licenseFile,
+  wireGolden,
+  greeterProto,
 }:
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin";
   version = "0.1.0";
 
   src = lib.fileset.toSource {
-    root = repoRoot;
+    root = ../.;
     fileset = lib.fileset.unions [
-      (repoRoot + "/LICENSE")
-      (repoRoot + "/testdata/wire-golden-vectors.txt")
+      licenseFile
+      wireGolden
       ./.
-      (repoRoot + "/trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto")
+      greeterProto
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-kotlin";

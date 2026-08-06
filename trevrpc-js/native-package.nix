@@ -7,7 +7,10 @@
   patchelf,
   perl,
   pkg-config,
-  repoRoot,
+  trevrpcCSrc,
+  jsNativeSrc,
+  jsNativePackageSrc,
+  jsLicense,
   stdenv,
 }:
 stdenv.mkDerivation {
@@ -15,12 +18,12 @@ stdenv.mkDerivation {
   version = "0.1.0";
 
   src = lib.fileset.toSource {
-    root = repoRoot;
+    root = ../.;
     fileset = lib.fileset.unions [
-      (repoRoot + "/trevrpc-c")
-      (repoRoot + "/trevrpc-js/native")
-      (repoRoot + "/trevrpc-js/npm/native-linux-x64-gnu")
-      (repoRoot + "/trevrpc-js/LICENSE")
+      trevrpcCSrc
+      jsNativeSrc
+      jsNativePackageSrc
+      jsLicense
     ];
   };
 

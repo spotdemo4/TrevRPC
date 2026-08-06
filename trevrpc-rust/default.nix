@@ -4,17 +4,18 @@
   rustfmt,
   clippy,
   gnugrep,
-  repoRoot,
+  benchProto,
+  wireGolden,
 }:
 rustPlatform.buildRustPackage (final: {
   pname = "trevrpc-rust";
   version = "0.1.0";
 
   src = lib.fileset.toSource {
-    root = repoRoot;
+    root = ../.;
     fileset = lib.fileset.unions [
-      (repoRoot + "/bench/proto")
-      (repoRoot + "/testdata/wire-golden-vectors.txt")
+      benchProto
+      wireGolden
       ./.
     ];
   };

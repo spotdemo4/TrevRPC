@@ -11,7 +11,8 @@
   protobuf,
   gnugrep,
   makeWrapper,
-  repoRoot,
+  benchProto,
+  wireGolden,
   trevrpcC,
   nativePackage ? null,
 }:
@@ -20,10 +21,10 @@ buildNpmPackage (final: {
   version = "0.1.0";
 
   src = lib.fileset.toSource {
-    root = repoRoot;
+    root = ../.;
     fileset = lib.fileset.unions [
-      (repoRoot + "/bench/proto")
-      (repoRoot + "/testdata/wire-golden-vectors.txt")
+      benchProto
+      wireGolden
       ./.
     ];
   };

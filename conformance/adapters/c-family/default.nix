@@ -6,7 +6,8 @@
   libmsquic,
   protobuf,
   python3,
-  repoRoot,
+  trevrpcCSrc,
+  trevrpcCppSrc,
   sanitizers ? false,
 }:
 stdenv.mkDerivation (final: {
@@ -14,11 +15,11 @@ stdenv.mkDerivation (final: {
   version = "0.1.0";
 
   src = lib.fileset.toSource {
-    root = repoRoot;
+    root = ../../../.;
     fileset = lib.fileset.unions [
       ./.
-      (repoRoot + "/trevrpc-c")
-      (repoRoot + "/trevrpc-cpp")
+      trevrpcCSrc
+      trevrpcCppSrc
     ];
   };
   sourceRoot = "${final.src.name}/conformance/adapters/c-family";

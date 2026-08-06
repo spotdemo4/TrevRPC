@@ -197,10 +197,12 @@
         packages =
           let
             cFamilyConformancePeers = pkgs.callPackage ./conformance/adapters/c-family {
-              repoRoot = ./.;
+              trevrpcCSrc = ./trevrpc-c;
+              trevrpcCppSrc = ./trevrpc-cpp;
             };
             c = pkgs.callPackage ./trevrpc-c {
-              repoRoot = ./.;
+              benchProto = ./bench/proto;
+              wireGolden = ./testdata/wire-golden-vectors.txt;
               peerBinaries = [
                 {
                   package = cFamilyConformancePeers;
@@ -210,7 +212,7 @@
             };
 
             cpp = pkgs.callPackage ./trevrpc-cpp {
-              repoRoot = ./.;
+              benchProto = ./bench/proto;
               trevrpcC = c;
               peerBinaries = [
                 {
@@ -220,7 +222,8 @@
               ];
             };
             go = pkgs.callPackage ./trevrpc-go {
-              repoRoot = ./.;
+              benchProto = ./bench/proto;
+              wireGolden = ./testdata/wire-golden-vectors.txt;
             };
 
             jsNative =
@@ -229,31 +232,38 @@
                   libmsquic = pkgs.libmsquic.overrideAttrs {
                     dontPatchELF = true;
                   };
-                  repoRoot = ./.;
+                  trevrpcCSrc = ./trevrpc-c;
+                  jsNativeSrc = ./trevrpc-js/native;
+                  jsNativePackageSrc = ./trevrpc-js/npm/native-linux-x64-gnu;
+                  jsLicense = ./trevrpc-js/LICENSE;
                 }
               else
                 null;
             js = pkgs.callPackage ./trevrpc-js {
-              repoRoot = ./.;
+              benchProto = ./bench/proto;
+              wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = c;
               nativePackage = jsNative;
             };
 
             kotlin = pkgs.callPackage ./trevrpc-kotlin {
-              repoRoot = ./.;
+              licenseFile = ./LICENSE;
+              wireGolden = ./testdata/wire-golden-vectors.txt;
+              greeterProto = ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto;
             };
 
             rust = pkgs.callPackage ./trevrpc-rust {
-              repoRoot = ./.;
+              benchProto = ./bench/proto;
+              wireGolden = ./testdata/wire-golden-vectors.txt;
             };
 
             bench = pkgs.callPackage ./bench {
-              repoRoot = ./.;
+              conformanceSrc = ./conformance;
+              wireGolden = ./testdata/wire-golden-vectors.txt;
               sourceCommit = self.rev or (self.dirtyRev or "unversioned");
               sourceDirty = if self ? rev then "false" else "true";
             };
             browserBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
-              repoRoot = ./.;
               trevrpcJs = js;
             };
           in
@@ -299,7 +309,9 @@
           // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             trevrpc-js-native-linux-x64-gnu = jsNative;
             trevrpc-js-npm-stage = pkgs.callPackage ./trevrpc-js/npm-stage.nix {
-              repoRoot = ./.;
+              wireGolden = ./testdata/wire-golden-vectors.txt;
+              trevrpcCSrc = ./trevrpc-c;
+              trevrpcJsSrc = ./trevrpc-js;
               trevrpcC = c;
               trevrpcJs = js;
               nativePackage = jsNative;
@@ -335,7 +347,8 @@
               };
           c-family-sanitizers =
             (pkgs.callPackage ./conformance/adapters/c-family {
-              repoRoot = ./.;
+              trevrpcCSrc = ./trevrpc-c;
+              trevrpcCppSrc = ./trevrpc-cpp;
             }).override
               {
                 sanitizers = true;

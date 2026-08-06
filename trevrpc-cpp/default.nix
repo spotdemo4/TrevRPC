@@ -6,7 +6,7 @@
   ninja,
   openssl,
   protobuf,
-  repoRoot,
+  benchProto,
   trevrpcC,
   peerBinaries ? [ ],
   sanitizers ? false,
@@ -22,9 +22,9 @@ stdenv.mkDerivation (
     ];
 
     src = fileset.toSource {
-      root = repoRoot;
+      root = ../.;
       fileset = fileset.unions [
-        (repoRoot + "/bench/proto")
+        benchProto
         ./.
       ];
     };

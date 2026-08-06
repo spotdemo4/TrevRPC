@@ -6,7 +6,6 @@
   makeWrapper,
   nssTools,
   playwright-driver,
-  repoRoot,
   trevrpcJs,
 }:
 buildNpmPackage (final: {
@@ -14,7 +13,7 @@ buildNpmPackage (final: {
   version = "0.1.0";
 
   src = lib.fileset.toSource {
-    root = repoRoot;
+    root = ../../.;
     fileset = ./.;
   };
   sourceRoot = "${final.src.name}/trevrpc-js/bench-browser";
