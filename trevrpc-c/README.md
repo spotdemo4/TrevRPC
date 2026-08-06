@@ -1,6 +1,6 @@
 # trevrpc-c
 
-`trevrpc-c` 0.1.4 provides TrevRPC C ABI 6. The transport protocol remains
+`trevrpc-c` 0.1.5 provides TrevRPC C ABI 6. The transport protocol remains
 `TREVRPC_ALPN == "trevrpc/1"` and `TREVRPC_WIRE_VERSION == 1u`; ABI 6 changes only the
 native C API and ownership contract.
 

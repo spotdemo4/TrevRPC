@@ -9,7 +9,7 @@
 }:
 rustPlatform.buildRustPackage (final: {
   pname = "trevrpc-rust";
-  version = "0.1.4";
+  version = "0.1.5";
 
   src = lib.fileset.toSource {
     root = ../.;

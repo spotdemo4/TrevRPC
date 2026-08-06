@@ -19,7 +19,7 @@ assert !(sanitizers && threadSanitizer);
 stdenv.mkDerivation (
   final: with lib; {
     pname = "trevrpc-c";
-    version = "0.1.4";
+    version = "0.1.5";
     outputs = [
       "out"
       "dev"

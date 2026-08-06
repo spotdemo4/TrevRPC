@@ -1,6 +1,6 @@
 {
   "name": "trevrpc-bench-peer-js",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "JavaScript TrevRPC benchmark peer",
   "license": "MIT",
@@ -21,7 +21,7 @@
   },
   "dependencies": {},
   "peerDependencies": {
-    "@trevrpc/trevrpc-js": "0.1.4"
+    "@trevrpc/trevrpc-js": "0.1.5"
   },
   "peerDependenciesMeta": {
     "@trevrpc/trevrpc-js": {
