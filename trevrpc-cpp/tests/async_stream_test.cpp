@@ -331,6 +331,9 @@ int main() {
   auto timed_out = trevrpc::sync_wait(deadline_operation->receive());
   assert(!timed_out);
   assert(timed_out.error().code() == -ETIMEDOUT);
+  for (int i = 0; i < 50 && !deadline_native->cancelled(); ++i) {
+    std::this_thread::sleep_for(1ms);
+  }
   assert(deadline_native->cancelled());
   deadline_operation->close();
 
