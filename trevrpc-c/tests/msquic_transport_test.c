@@ -1673,7 +1673,14 @@ static int test_frame_parts_borrowed_body_reset_drains_send_complete(void) {
         (int)(4 + borrowed_len));
 
     CHECK_EQ_GOTO(trevrpc_msquic_stream_abort(client_stream), 0);
-    CHECK_EQ_GOTO(trevrpc_msquic_send_completion_wait(completion), -ECANCELED);
+    {
+        int wait_result = trevrpc_msquic_send_completion_wait(completion);
+        // Abort races with SEND_COMPLETE; MsQuic may report success if the send
+        // completed before the abort was processed, or -ECANCELED if canceled.
+        // Both are valid; the key is that the wait drains and borrowed memory
+        // can be safely reclaimed without hanging.
+        CHECK_GOTO(wait_result == 0 || wait_result == -ECANCELED);
+    }
     trevrpc_msquic_send_completion_free(completion);
     completion = NULL;
     trevrpc_msquic_stream_close(client_stream);

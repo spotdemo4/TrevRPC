@@ -780,11 +780,12 @@ static void trevrpc_msquic_stream_send_complete(
     trevrpc_msquic_stream_send_complete_begin(stream);
 
     pthread_mutex_lock(&stream->mutex);
+    bool aborted = stream->send_aborted;
     close_handle = trevrpc_msquic_stream_pending_send_complete_locked(stream, send);
     pthread_cond_broadcast(&stream->cond);
     pthread_mutex_unlock(&stream->mutex);
 
-    trevrpc_msquic_send_completion_signal(send->completion, canceled);
+    trevrpc_msquic_send_completion_signal(send->completion, canceled || aborted);
     trevrpc_msquic_send_release(stream, send);
     if (close_handle != NULL) {
         trevrpc_msquic_stream_complete_close(stream, close_handle);
