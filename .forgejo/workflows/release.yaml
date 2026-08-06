@@ -45,10 +45,10 @@ jobs:
         uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
         with:
           github_token: ${{ secrets.GH_TOKEN }}
-          token: ${{ secrets.DOCTOR_TOKEN }}
           niks3_url: https://niks3.trev.zip
-          fetch_depth: 0
           shell: release
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          fetch_depth: 0
 
       - name: Release to Forgejo
         env:
@@ -71,9 +71,7 @@ jobs:
         uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
         with:
           github_token: ${{ secrets.GH_TOKEN }}
-          token: ${{ secrets.DOCTOR_TOKEN }}
           niks3_url: https://niks3.trev.zip
-          fetch_depth: 0
           shell: release
 
       - name: Release to crates.io
@@ -93,9 +91,7 @@ jobs:
         uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
         with:
           github_token: ${{ secrets.GH_TOKEN }}
-          token: ${{ secrets.DOCTOR_TOKEN }}
           niks3_url: https://niks3.trev.zip
-          fetch_depth: 0
           shell: release
 
       - name: Build npm stage
@@ -132,9 +128,7 @@ jobs:
         uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
         with:
           github_token: ${{ secrets.GH_TOKEN }}
-          token: ${{ secrets.DOCTOR_TOKEN }}
           niks3_url: https://niks3.trev.zip
-          fetch_depth: 0
           shell: release
 
       - name: Stage Kotlin Maven repository
