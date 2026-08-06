@@ -79,7 +79,11 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
         run: | # zizmor: ignore[use-trusted-publishing]
-          cargo publish --locked
+          # Bumper only bumps `trevrpc` in Cargo.lock; workspace members keep
+          # their old version until Cargo regenerates the lockfile. Ensure the
+          # lockfile matches all Cargo.toml versions before publishing.
+          cargo update --workspace
+          cargo publish --locked --allow-dirty
 
   npm:
     # zizmor: ignore[excessive-permissions]
@@ -115,6 +119,9 @@ jobs:
           echo "core: $core_tgz"
           test -f "$native_tgz"
           test -f "$core_tgz"
+          # NODE_AUTH_TOKEN alone is not sufficient; npm reads auth from .npmrc.
+          # `nix-init` does not configure npm auth like `actions/setup-node` does.
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
           npm publish --provenance --access public "$native_tgz"
           npm publish --provenance --access public "$core_tgz"
 
