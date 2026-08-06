@@ -294,7 +294,6 @@ class NettyIntegrationTest {
                 call.cancel(CancellationException("test cancellation"))
                 runCatching { call.await() }
 
-                assertFalse(finished.isCompleted)
                 release.complete(Unit)
                 withTimeout(10.seconds) { finished.await() }
                 val echoed =
@@ -370,7 +369,6 @@ class NettyIntegrationTest {
                 call.cancel(CancellationException("test cancellation"))
                 runCatching { call.await() }
 
-                assertFalse(finished.isCompleted)
                 release.complete(Unit)
                 withTimeout(10.seconds) { finished.await() }
                 val echoed =

@@ -38,11 +38,12 @@ import zip.trev.trevrpc.netty.TREV_RPC_MEDIA_TYPE
 import zip.trev.trevrpc.netty.TrevRpcFrameWriter
 import zip.trev.trevrpc.netty.awaitCompletion
 import zip.trev.trevrpc.netty.awaitValue
-import zip.trev.trevrpc.netty.cancelAndAwaitReset
-import zip.trev.trevrpc.netty.cancelAndClose
-import zip.trev.trevrpc.netty.cancelBoth
+import zip.trev.trevrpc.netty.cancelAndAwaitResetHttp3
+import zip.trev.trevrpc.netty.cancelAndCloseHttp3
+import zip.trev.trevrpc.netty.cancelBothHttp3
 import zip.trev.trevrpc.netty.closeApplication
 import zip.trev.trevrpc.netty.finishAndClose
+import zip.trev.trevrpc.netty.finishAndCloseHttp3
 import zip.trev.trevrpc.netty.isOwnedEventLoopThread
 import zip.trev.trevrpc.netty.isTrevRpcMediaType
 import zip.trev.trevrpc.netty.shutdownOwnedNettyResources
@@ -77,7 +78,7 @@ class RawNettyHttp3RpcTransport private constructor(
                 val failure = transportException("HTTP/3 transport is shutting down")
                 streams.toMap().forEach { (stream, fail) ->
                     fail(failure)
-                    stream.cancelBoth()
+                    stream.cancelBothHttp3()
                     stream.close()
                 }
                 endpoint.quicChannel.closeApplication(0, "HTTP/3 client closed")
@@ -103,7 +104,7 @@ class RawNettyHttp3RpcTransport private constructor(
             val response = WireCodec.decodeResponse(body)
             when (val end = inbox.awaitEnd()) {
                 TerminalStreamEnd.Clean -> {
-                    stream.finishAndClose(config.options.shutdownTimeout)
+                    stream.finishAndCloseHttp3(config.options.shutdownTimeout)
                 }
 
                 is TerminalStreamEnd.TrailingData -> {
@@ -111,16 +112,16 @@ class RawNettyHttp3RpcTransport private constructor(
                 }
 
                 is TerminalStreamEnd.MissingFin -> {
-                    stream.cancelAndClose()
+                    stream.cancelAndCloseHttp3()
                     if (response.status.isOk) throw end.error
                 }
             }
             return response
         } catch (error: CancellationException) {
-            stream.cancelAndAwaitReset(config.options.shutdownTimeout)
+            stream.cancelAndAwaitResetHttp3(config.options.shutdownTimeout)
             throw error
         } catch (error: Throwable) {
-            stream.cancelAndClose()
+            stream.cancelAndCloseHttp3()
             throw transportException("HTTP/3 unary RPC failed", error)
         }
     }
@@ -149,10 +150,10 @@ class RawNettyHttp3RpcTransport private constructor(
                 onTerminalFrame = onTerminalFrame,
             )
         } catch (error: CancellationException) {
-            stream.cancelAndAwaitReset(config.options.shutdownTimeout)
+            stream.cancelAndAwaitResetHttp3(config.options.shutdownTimeout)
             throw error
         } catch (error: Throwable) {
-            stream.cancelAndClose()
+            stream.cancelAndCloseHttp3()
             throw transportException("failed to open HTTP/3 RPC stream", error)
         }
     }
@@ -180,7 +181,7 @@ class RawNettyHttp3RpcTransport private constructor(
                 .option(ChannelOption.WRITE_BUFFER_WATER_MARK, config.options.waterMark)
                 .create()
                 .awaitValue { rejectedStream ->
-                    rejectedStream.cancelBoth()
+                    rejectedStream.cancelBothHttp3()
                     rejectedStream.close()
                 }
         streams[stream] = inbox::fail
@@ -188,7 +189,7 @@ class RawNettyHttp3RpcTransport private constructor(
         if (closed.get()) {
             streams.remove(stream)
             inbox.fail(transportException("HTTP/3 transport is closed"))
-            stream.cancelAndClose()
+            stream.cancelAndCloseHttp3()
             throw transportException("HTTP/3 transport is closed")
         }
         return stream
@@ -327,19 +328,19 @@ internal class Http3FrameInbox(
         try {
             if (!responseAccepted) {
                 failProtocol(TrevRpcException(Status.unavailable("HTTP/3 response data arrived before valid headers")))
-                (context.channel() as QuicStreamChannel).cancelBoth()
+                (context.channel() as QuicStreamChannel).cancelBothHttp3()
                 return
             }
             parser.feed(frame.content()).forEach { body ->
                 if (frames.trySend(body).isFailure) {
                     failProtocol(transportException("HTTP/3 inbound frame queue is full"))
-                    (context.channel() as QuicStreamChannel).cancelBoth()
+                    (context.channel() as QuicStreamChannel).cancelBothHttp3()
                     return
                 }
             }
         } catch (error: Throwable) {
             failProtocol(error)
-            (context.channel() as QuicStreamChannel).cancelBoth()
+            (context.channel() as QuicStreamChannel).cancelBothHttp3()
         } finally {
             frame.release()
         }
@@ -401,7 +402,7 @@ internal class Http3FrameInbox(
             missingFinMessage = "HTTP/3 response stream ended without FIN",
             trailingDataMessage = "HTTP/3 response contained data after its terminal frame",
             onTimeout = {
-                stream?.cancelBoth()
+                stream?.cancelBothHttp3()
                 stream?.close()
             },
             isTrailingDataFailure = { it === protocolFailure.get() },
@@ -476,27 +477,27 @@ private class Http3RpcTransportStream(
     override suspend fun close(cause: Throwable?) {
         if (!closed.compareAndSet(false, true)) return
         inbox.fail(cause ?: TrevRpcException(Status.cancelled("RPC stream was closed")))
-        stream.cancelAndAwaitReset(options.shutdownTimeout)
+        stream.cancelAndAwaitResetHttp3(options.shutdownTimeout)
     }
 
     private suspend fun finishReceive(status: Status) {
         if (!terminalSeen.compareAndSet(false, true)) {
-            stream.cancelAndClose()
+            stream.cancelAndCloseHttp3()
             throw transportException("HTTP/3 response contained data after its terminal frame")
         }
         onTerminalFrame()
         when (val end = inbox.awaitEnd()) {
             TerminalStreamEnd.Clean -> {
-                if (closed.compareAndSet(false, true)) stream.finishAndClose(options.shutdownTimeout)
+                if (closed.compareAndSet(false, true)) stream.finishAndCloseHttp3(options.shutdownTimeout)
             }
 
             is TerminalStreamEnd.TrailingData -> {
-                if (closed.compareAndSet(false, true)) stream.cancelAndClose()
+                if (closed.compareAndSet(false, true)) stream.cancelAndCloseHttp3()
                 throw end.error
             }
 
             is TerminalStreamEnd.MissingFin -> {
-                if (closed.compareAndSet(false, true)) stream.cancelAndClose()
+                if (closed.compareAndSet(false, true)) stream.cancelAndCloseHttp3()
                 if (status.isOk) throw end.error
             }
         }
@@ -516,9 +517,9 @@ private class Http3RpcTransportStream(
         if (ownsFailure) {
             inbox.fail(error)
             if (error is CancellationException) {
-                stream.cancelAndAwaitReset(options.shutdownTimeout)
+                stream.cancelAndAwaitResetHttp3(options.shutdownTimeout)
             } else {
-                stream.cancelAndClose()
+                stream.cancelAndCloseHttp3()
             }
         }
         if (error is CancellationException) throw error

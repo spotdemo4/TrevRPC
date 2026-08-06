@@ -18,6 +18,7 @@ import kotlin.coroutines.resumeWithException
 import kotlin.time.Duration
 
 internal const val CANCELLED_STREAM_CODE = 1
+internal const val HTTP3_CANCELLED_STREAM_CODE = 268 // Http3ErrorCode.H3_REQUEST_CANCELLED
 
 internal suspend fun ChannelFuture.awaitChannel(): Channel =
     suspendCancellableCoroutine<Channel> { continuation ->
@@ -62,19 +63,27 @@ internal suspend fun ChannelFuture.awaitCompletion() {
     }
 }
 
-internal fun QuicStreamChannel.cancelBoth() {
-    val combined = runCatching { shutdown(CANCELLED_STREAM_CODE) }
+internal fun QuicStreamChannel.cancelBoth(code: Int = CANCELLED_STREAM_CODE) {
+    val combined = runCatching { shutdown(code) }
     if (combined.isFailure) {
-        runCatching { shutdownInput(CANCELLED_STREAM_CODE) }
-        runCatching { shutdownOutput(CANCELLED_STREAM_CODE) }
+        runCatching { shutdownInput(code) }
+        runCatching { shutdownOutput(code) }
     }
 }
 
-internal suspend fun QuicStreamChannel.cancelAndClose() {
+internal fun QuicStreamChannel.cancelBothHttp3() {
+    cancelBoth(HTTP3_CANCELLED_STREAM_CODE)
+}
+
+internal suspend fun QuicStreamChannel.cancelAndClose(code: Int = CANCELLED_STREAM_CODE) {
     withContext(NonCancellable) {
-        cancelBoth()
+        cancelBoth(code)
         close()
     }
+}
+
+internal suspend fun QuicStreamChannel.cancelAndCloseHttp3() {
+    cancelAndClose(HTTP3_CANCELLED_STREAM_CODE)
 }
 
 internal suspend fun awaitCancellationResetFutures(
@@ -87,26 +96,33 @@ internal suspend fun awaitCancellationResetFutures(
     runCatching { closeFuture?.awaitCompletion() }
 }
 
-internal suspend fun QuicStreamChannel.cancelAndAwaitReset(timeout: Duration) {
+internal suspend fun QuicStreamChannel.cancelAndAwaitReset(
+    timeout: Duration,
+    code: Int = CANCELLED_STREAM_CODE,
+) {
     withContext(NonCancellable) {
         if (!isActive || !parent().isActive || eventLoop().isShuttingDown) {
-            cancelBoth()
+            cancelBoth(code)
             close()
             return@withContext
         }
         val completed =
             withTimeoutOrNull(timeout) {
                 awaitCancellationResetFutures(
-                    issueReset = { shutdown(CANCELLED_STREAM_CODE) },
+                    issueReset = { shutdown(code) },
                     issueClose = ::close,
                 )
                 true
             } == true
         if (!completed) {
-            cancelBoth()
+            cancelBoth(code)
             close()
         }
     }
+}
+
+internal suspend fun QuicStreamChannel.cancelAndAwaitResetHttp3(timeout: Duration) {
+    cancelAndAwaitReset(timeout, HTTP3_CANCELLED_STREAM_CODE)
 }
 
 /**
@@ -119,6 +135,7 @@ internal suspend fun QuicStreamChannel.cancelAndAwaitReset(timeout: Duration) {
 internal suspend fun QuicStreamChannel.finishAndClose(
     timeout: Duration,
     outputFinSubmitted: Boolean = false,
+    cancelCode: Int = CANCELLED_STREAM_CODE,
 ) {
     if (outputFinSubmitted) {
         runCatching { close() }
@@ -131,13 +148,17 @@ internal suspend fun QuicStreamChannel.finishAndClose(
                 close().awaitCompletion()
                 true
             } == true
-        if (!completed) cancelAndClose()
+        if (!completed) cancelAndClose(cancelCode)
     } catch (error: CancellationException) {
-        cancelAndClose()
+        cancelAndClose(cancelCode)
         throw error
     } catch (_: Throwable) {
-        cancelAndClose()
+        cancelAndClose(cancelCode)
     }
+}
+
+internal suspend fun QuicStreamChannel.finishAndCloseHttp3(timeout: Duration) {
+    finishAndClose(timeout, cancelCode = HTTP3_CANCELLED_STREAM_CODE)
 }
 
 internal fun QuicChannel.closeApplication(

@@ -381,7 +381,7 @@ class NettyRpcServer private constructor(
         private val channel: QuicStreamChannel,
     ) : Http3RequestStreamInboundHandler() {
         private val input =
-            ServerFrameInput(config.options, channel::cancelBoth) {
+            ServerFrameInput(config.options, channel::cancelBothHttp3) {
                 calls.cancel(channel, "request stream aborted")
             }
         private var headersReceived = false
@@ -405,7 +405,7 @@ class NettyRpcServer private constructor(
                 webTransportConnect = true
                 if (calls.launch(scope, channel) { handleWebTransportConnect(request) } == null) {
                     rejected = true
-                    channel.cancelBoth()
+                    channel.cancelBothHttp3()
                     channel.close()
                 }
                 return
@@ -460,13 +460,13 @@ class NettyRpcServer private constructor(
                             calls.expectClose(channel)
                             channel.shutdownOutput().awaitCompletion()
                         },
-                        cancelInput = channel::cancelBoth,
+                        cancelInput = channel::cancelBothHttp3,
                     )
                 }
             if (job == null) {
                 rejected = true
                 input.shutdown()
-                channel.cancelBoth()
+                channel.cancelBothHttp3()
                 channel.close()
             }
         }
@@ -520,7 +520,7 @@ class NettyRpcServer private constructor(
             val error = TrevRpcException(Status.invalidArgument("HTTP/3 trailers are not supported"))
             input.fail(error)
             calls.cancel(channel, "HTTP/3 trailers are not supported")
-            channel.cancelBoth()
+            channel.cancelBothHttp3()
             channel.close()
         }
 

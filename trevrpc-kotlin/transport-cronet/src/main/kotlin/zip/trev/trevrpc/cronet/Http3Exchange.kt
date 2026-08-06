@@ -639,7 +639,7 @@ internal class Http3Exchange(
     private fun cancelNative() {
         val streamToCancel =
             synchronized(nativeLock) {
-                if (!::stream.isInitialized || lease.isNativeDone || nativeTerminalReceived) return
+                if (!::stream.isInitialized) return
                 if (startInProgress || !nativeStarted) {
                     cancelAfterStart = true
                     return
