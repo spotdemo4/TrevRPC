@@ -13,7 +13,7 @@
 rustPlatform.buildRustPackage (
   final: with lib; {
     pname = "trevrpc-bench";
-    version = "0.1.0";
+    version = "0.1.1";
 
     src = fileset.toSource {
       root = ../.;

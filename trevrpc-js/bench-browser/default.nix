@@ -10,7 +10,7 @@
 }:
 buildNpmPackage (final: {
   pname = "trevrpc-bench-peer-browser";
-  version = "0.1.0";
+  version = "0.1.1";
 
   src = lib.fileset.toSource {
     root = ../../.;

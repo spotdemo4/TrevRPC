@@ -384,7 +384,7 @@
             in
             pkgs.maven.buildMavenPackage {
               pname = "trevrpc-kotlin-maven-consumer";
-              version = "0.1.0";
+              version = "0.1.1";
               src = publicationTests;
               sourceRoot = "source/maven";
               mvnHash = "sha256-rImtM+XfS3e5wv9z7COVr+jUo0pPbkui/DsTbjD56Lk=";
