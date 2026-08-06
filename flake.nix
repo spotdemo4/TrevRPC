@@ -157,10 +157,7 @@
               fix-hash
             ];
             script = ''
-              go -C trevrpc-go work sync
-              GOWORK=off go -C trevrpc-go mod tidy
-              GOWORK=off go -C trevrpc-go/cmd/trevrpc-bench-peer mod tidy
-              go -C trevrpc-go work sync
+              go -C trevrpc-go mod tidy
               fix-hash .#trevrpc-go
             '';
           };

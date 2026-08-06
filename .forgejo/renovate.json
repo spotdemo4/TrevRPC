@@ -59,15 +59,7 @@
       "addLabels": ["go"],
       "postUpgradeTasks": {
         "commands": ["nix run .#update-go-deps"],
-        "fileFilters": [
-          "trevrpc-go/go.mod",
-          "trevrpc-go/go.sum",
-          "trevrpc-go/go.work",
-          "trevrpc-go/go.work.sum",
-          "trevrpc-go/cmd/trevrpc-bench-peer/go.mod",
-          "trevrpc-go/cmd/trevrpc-bench-peer/go.sum",
-          "trevrpc-go/default.nix"
-        ],
+        "fileFilters": ["trevrpc-go/go.mod", "trevrpc-go/go.sum", "trevrpc-go/default.nix"],
         "executionMode": "branch"
       }
     },

@@ -22,23 +22,15 @@ buildGoModule (final: {
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  env.GOWORK = "off";
   vendorHash = "sha256-oScgto4J7jT17Wq3tTrAOSW8hw8C9WGIMEMgTjHzTr0=";
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
+    "cmd/trevrpc-bench-peer"
     "cmd/trevrpc-conformance-go"
   ];
 
   postInstall = ''
-    mkdir -p "$out/bin"
-    mv cmd/trevrpc-bench-peer/go.mod cmd/trevrpc-bench-peer/go.mod.peer
-    mv cmd/trevrpc-bench-peer/go.sum cmd/trevrpc-bench-peer/go.sum.peer
-    (
-      GOWORK=off go build -mod=vendor -o "$out/bin/trevrpc-bench-peer-go" \
-        ./cmd/trevrpc-bench-peer
-    )
-    mv cmd/trevrpc-bench-peer/go.mod.peer cmd/trevrpc-bench-peer/go.mod
-    mv cmd/trevrpc-bench-peer/go.sum.peer cmd/trevrpc-bench-peer/go.sum
+    mv "$out/bin/trevrpc-bench-peer" "$out/bin/trevrpc-bench-peer-go"
   '';
 
   doCheck = true;
@@ -53,16 +45,6 @@ buildGoModule (final: {
     go vet ./...
     staticcheck ./...
     modernize ./...
-    mv cmd/trevrpc-bench-peer/go.mod cmd/trevrpc-bench-peer/go.mod.peer
-    mv cmd/trevrpc-bench-peer/go.sum cmd/trevrpc-bench-peer/go.sum.peer
-    (
-      GOWORK=off go test -mod=vendor ./cmd/trevrpc-bench-peer/...
-      GOWORK=off go vet -mod=vendor ./cmd/trevrpc-bench-peer/...
-      GOWORK=off GOFLAGS=-mod=vendor staticcheck ./cmd/trevrpc-bench-peer/...
-      GOWORK=off GOFLAGS=-mod=vendor modernize ./cmd/trevrpc-bench-peer/...
-    )
-    mv cmd/trevrpc-bench-peer/go.mod.peer cmd/trevrpc-bench-peer/go.mod
-    mv cmd/trevrpc-bench-peer/go.sum.peer cmd/trevrpc-bench-peer/go.sum
     runHook postCheck
   '';
 

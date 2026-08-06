@@ -1,7 +1,7 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-find_dependency(trevrpc 0.2 CONFIG)
+find_dependency(trevrpc 0.1 CONFIG)
 if(NOT TREVRPC_C_ABI_VERSION EQUAL 6)
     set(trevrpc-cpp_FOUND FALSE)
     set(trevrpc-cpp_NOT_FOUND_MESSAGE "trevrpc-cpp requires TrevRPC C ABI 6")
