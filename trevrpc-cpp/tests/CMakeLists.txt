@@ -6,6 +6,14 @@ function(trevrpc_cpp_test_assertions target)
     target_compile_options(${target} PRIVATE -UNDEBUG)
   endif()
 endfunction()
+
+function(trevrpc_cpp_lsan_suppressions test_name)
+  if(TREVRPC_CPP_ENABLE_SANITIZERS)
+    set_tests_properties(${test_name} PROPERTIES ENVIRONMENT
+      "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp"
+    )
+  endif()
+endfunction()
 set(trevrpc_cpp_test_generated_files
   "${trevrpc_cpp_test_generated_dir}/common.pb.cc"
   "${trevrpc_cpp_test_generated_dir}/common.pb.h"
@@ -122,6 +130,7 @@ trevrpc_cpp_sanitizers(trevrpc_cpp_generated_service_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_generated_service_test)
 add_test(NAME trevrpc_cpp_generated_service COMMAND trevrpc_cpp_generated_service_test)
 set_tests_properties(trevrpc_cpp_generated_service PROPERTIES TIMEOUT 30)
+trevrpc_cpp_lsan_suppressions(trevrpc_cpp_generated_service)
 
 
 add_executable(trevrpc_cpp_async_core_test async_core_test.cpp)
@@ -162,6 +171,7 @@ trevrpc_cpp_sanitizers(trevrpc_cpp_callbacks_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_callbacks_test)
 add_test(NAME trevrpc_cpp_callbacks COMMAND trevrpc_cpp_callbacks_test)
 set_tests_properties(trevrpc_cpp_callbacks PROPERTIES TIMEOUT 20)
+trevrpc_cpp_lsan_suppressions(trevrpc_cpp_callbacks)
 
 add_executable(trevrpc_cpp_server_lifecycle_test server_lifecycle_test.cpp)
 add_dependencies(trevrpc_cpp_server_lifecycle_test trevrpc_cpp_test_certificates)
@@ -175,6 +185,7 @@ trevrpc_cpp_sanitizers(trevrpc_cpp_server_lifecycle_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_server_lifecycle_test)
 add_test(NAME trevrpc_cpp_server_lifecycle COMMAND trevrpc_cpp_server_lifecycle_test)
 set_tests_properties(trevrpc_cpp_server_lifecycle PROPERTIES TIMEOUT 15)
+trevrpc_cpp_lsan_suppressions(trevrpc_cpp_server_lifecycle)
 
 add_executable(trevrpc_cpp_generated_async_service_test generated_async_service_test.cpp)
 add_dependencies(trevrpc_cpp_generated_async_service_test trevrpc_cpp_test_certificates)
@@ -187,3 +198,4 @@ trevrpc_cpp_sanitizers(trevrpc_cpp_generated_async_service_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_generated_async_service_test)
 add_test(NAME trevrpc_cpp_generated_async_service COMMAND trevrpc_cpp_generated_async_service_test)
 set_tests_properties(trevrpc_cpp_generated_async_service PROPERTIES TIMEOUT 30)
+trevrpc_cpp_lsan_suppressions(trevrpc_cpp_generated_async_service)

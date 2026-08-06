@@ -1,0 +1,4 @@
+# libmsquic/OpenSSL keeps process-global and worker-thread TLS allocations alive
+# until process teardown. Closing MsQuic explicitly during sanitizer tests can trip
+# MsQuic worker aborts, so suppress only leaks whose stack is inside libmsquic.
+leak:libmsquic.so

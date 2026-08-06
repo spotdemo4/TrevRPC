@@ -27,6 +27,14 @@ target_link_libraries(trevrpc_cpp_bench_peer PRIVATE
 trevrpc_cpp_warnings(trevrpc_cpp_bench_peer)
 trevrpc_cpp_sanitizers(trevrpc_cpp_bench_peer)
 
+function(trevrpc_cpp_bench_lsan_suppressions test_name)
+  if(TREVRPC_CPP_ENABLE_SANITIZERS)
+    set_tests_properties(${test_name} PROPERTIES ENVIRONMENT
+      "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/../tests/lsan.supp"
+    )
+  endif()
+endfunction()
+
 if(TREVRPC_CPP_BUILD_TESTS)
   add_test(NAME trevrpc_cpp_benchmark_capabilities COMMAND trevrpc_cpp_bench_peer capabilities)
   set_tests_properties(trevrpc_cpp_benchmark_capabilities PROPERTIES
@@ -80,6 +88,7 @@ if(TREVRPC_CPP_BUILD_TESTS)
       "${trevrpc_cpp_benchmark_test_key}")
   add_dependencies(trevrpc_cpp_bench_peer trevrpc_cpp_benchmark_test_certificates)
   set_tests_properties(trevrpc_cpp_benchmark_webtransport_smoke PROPERTIES TIMEOUT 30)
+  trevrpc_cpp_bench_lsan_suppressions(trevrpc_cpp_benchmark_webtransport_smoke)
 
 endif()
 
