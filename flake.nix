@@ -372,31 +372,6 @@
             self.packages.${system}.trevrpc-js-npm-stage;
 
           kotlin = self.packages.${system}.trevrpc-kotlin;
-          kotlin-maven-consumer =
-            let
-              publicationTests = pkgs.lib.fileset.toSource {
-                root = ./trevrpc-kotlin/publication-tests;
-                fileset = pkgs.lib.fileset.unions [
-                  ./trevrpc-kotlin/publication-tests/maven
-                  ./trevrpc-kotlin/publication-tests/proto
-                  ./trevrpc-kotlin/publication-tests/sources
-                ];
-              };
-            in
-            pkgs.maven.buildMavenPackage {
-              pname = "trevrpc-kotlin-maven-consumer";
-              version = "0.1.1";
-              src = publicationTests;
-              sourceRoot = "source/maven";
-              mvnHash = "sha256-uNF3p2fldwDehl8Kz8/eyXLj65gKiwAz1yY8b9W91hA=";
-              mvnJdk = pkgs.jdk25;
-              mvnGoal = "verify";
-              mvnParameters = "-Dtrevrpc.repository=file://${self.packages.${system}.trevrpc-kotlin}/share/maven";
-              doCheck = false;
-              installPhase = ''
-                mkdir -p $out
-              '';
-            };
 
           benchmark-proto-sync =
             pkgs.runCommand "trevrpc-benchmark-proto-sync"

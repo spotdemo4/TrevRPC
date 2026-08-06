@@ -4,6 +4,7 @@
   gradle_9,
   jdk25,
   makeWrapper,
+  maven,
   protobuf,
   runtimeShell,
   gnugrep,
@@ -31,6 +32,7 @@ stdenvNoCC.mkDerivation (final: {
     gradle_9
     jdk25
     makeWrapper
+    maven
     protobuf
     python3
   ];
@@ -61,10 +63,24 @@ stdenvNoCC.mkDerivation (final: {
   doCheck = true;
   preCheck = ''
     export TREVRPC_GRADLE_CACHE_SEED="$GRADLE_USER_HOME"
-    # Maven POM fallback is covered independently by kotlin-maven-consumer.
     export TREVRPC_GRADLE_METADATA_MODES=gradle
+    if [ -d "''${mitmCache:-}" ]; then
+      export MAVEN_SETTINGS="$PWD/maven-settings.xml"
+      cat > "$MAVEN_SETTINGS" <<EOF
+    <?xml version="1.0" encoding="UTF-8"?>
+    <settings>
+      <mirrors>
+        <mirror>
+          <id>mitm-central</id>
+          <mirrorOf>*,!trevrpc-staging</mirrorOf>
+          <url>file://$mitmCache/https/repo.maven.apache.org/maven2</url>
+        </mirror>
+      </mirrors>
+    </settings>
+    EOF
+    fi
   '';
-  gradleCheckTask = "check verifyStagedMavenRepository verifyGradleConsumers";
+  gradleCheckTask = "check verifyStagedMavenRepository verifyGradleConsumers verifyMavenConsumers";
 
   installPhase = ''
     runHook preInstall

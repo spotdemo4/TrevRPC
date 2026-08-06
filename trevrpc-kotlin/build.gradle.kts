@@ -263,6 +263,8 @@ tasks.register<Exec>("verifyMavenConsumers") {
     dependsOn(verifyStagedMavenRepository)
     environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
     environment("TREVRPC_VERSION", project.version.toString())
+    providers.environmentVariable("MAVEN_SETTINGS").orNull?.let { environment("MAVEN_SETTINGS", it) }
+    providers.environmentVariable("MAVEN_OPTS").orNull?.let { environment("MAVEN_OPTS", it) }
     commandLine("bash", layout.projectDirectory.file("publication-tests/maven/verify.sh").asFile)
 }
 

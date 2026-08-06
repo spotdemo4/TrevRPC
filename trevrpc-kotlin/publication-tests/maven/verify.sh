@@ -34,11 +34,15 @@ if $cleanup; then
   trap 'rm -rf "$local_repository"' EXIT
 fi
 
-"$maven_bin" \
-  --batch-mode \
-  --errors \
-  -Dmaven.repo.local="$local_repository" \
-  -Dtrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY" \
-  -Dtrevrpc.version="$TREVRPC_VERSION" \
-  -f "$project_dir/pom.xml" \
-  clean verify
+maven_args=(
+  --batch-mode
+  --errors
+  -Dmaven.repo.local="$local_repository"
+  -Dtrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY"
+  -Dtrevrpc.version="$TREVRPC_VERSION"
+  -f "$project_dir/pom.xml"
+)
+if [[ -n "${MAVEN_SETTINGS:-}" && -f "$MAVEN_SETTINGS" ]]; then
+  maven_args+=(-s "$MAVEN_SETTINGS")
+fi
+"$maven_bin" "${maven_args[@]}" clean verify
