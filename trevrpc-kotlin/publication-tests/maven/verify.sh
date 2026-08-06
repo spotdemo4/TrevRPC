@@ -22,7 +22,7 @@ resolve_trevrpc_version() {
   local fallback
   fallback=$(grep -m1 -E 'version = "[0-9]+\.[0-9]+\.[0-9]+"' "$(dirname "$0")/../../build.gradle.kts" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
   if [[ -n "$fallback" ]]; then echo "$fallback"; return; fi
-  echo "0.1.1"
+  echo "0.1.2"
 }
 TREVRPC_VERSION="$(resolve_trevrpc_version)"
 export TREVRPC_VERSION

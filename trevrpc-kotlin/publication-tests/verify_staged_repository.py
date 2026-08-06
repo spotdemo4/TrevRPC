@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 GROUP = "zip.trev.trevrpc"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 MODULE_TARGETS = {
     "core": 52,
     "transport-cronet": 61,

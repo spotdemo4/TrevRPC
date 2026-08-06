@@ -25,7 +25,7 @@ val trevrpcVersion =
                         ?.groupValues
                         ?.get(1) ?: ""
                 }.filter { it.isNotEmpty() },
-        ).getOrElse("0.1.1")
+        ).getOrElse("0.1.2")
 
 val verifyRejectedJvmVariants =
     tasks.register("verifyRejectedJvmVariants") {

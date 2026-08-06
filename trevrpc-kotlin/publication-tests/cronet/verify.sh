@@ -34,7 +34,7 @@ resolve_trevrpc_version() {
   local fallback
   fallback=$(grep -m1 -E 'version = "[0-9]+\.[0-9]+\.[0-9]+"' "$(dirname "$0")/../../build.gradle.kts" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
   if [[ -n "$fallback" ]]; then echo "$fallback"; return; fi
-  echo "0.1.1"
+  echo "0.1.2"
 }
 
 TREVRPC_VERSION="$(resolve_trevrpc_version)"
@@ -47,7 +47,7 @@ import sys
 import xml.etree.ElementTree as ET
 import zipfile
 
-version = sys.argv[2] if len(sys.argv) >= 3 and sys.argv[2].strip() else "0.1.1"
+version = sys.argv[2] if len(sys.argv) >= 3 and sys.argv[2].strip() else "0.1.2"
 repository = pathlib.Path(sys.argv[1])
 artifact = repository / f"zip/trev/trevrpc/transport-cronet/{version}"
 jar = artifact / f"transport-cronet-{version}.jar"

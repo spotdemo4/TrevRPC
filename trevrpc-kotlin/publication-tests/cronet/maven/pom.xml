@@ -10,7 +10,7 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <kotlin.version>2.4.10</kotlin.version>
-    <trevrpc.version>0.1.1</trevrpc.version>
+    <trevrpc.version>0.1.2</trevrpc.version>
     <trevrpc.repository>${env.TREVRPC_STAGING_REPOSITORY}</trevrpc.repository>
   </properties>
 
