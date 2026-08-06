@@ -311,6 +311,7 @@ void test_server_callback_configuration() {
   assert(report.value().released);
   server_thread.join();
   assert(serve_result);
+  assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() + 5s));
 }
 
 void test_channel_final_owner_drop_from_callback() {
@@ -354,5 +355,6 @@ int main() {
   test_admission_and_recursive_exception_containment();
   test_server_callback_configuration();
   test_channel_final_owner_drop_from_callback();
+  assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() + 5s));
   return 0;
 }
