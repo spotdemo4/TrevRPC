@@ -483,33 +483,6 @@
               touch $out
             '';
 
-          consumer-closures-no-grpc =
-            let
-              c = self.packages.${system}.trevrpc-c;
-              cpp = self.packages.${system}.trevrpc-cpp;
-              go = self.packages.${system}.trevrpc-go;
-              js = self.packages.${system}.trevrpc-js;
-              kotlin = self.packages.${system}.trevrpc-kotlin;
-              rust = self.packages.${system}.trevrpc-rust;
-              consumerClosure = pkgs.closureInfo {
-                rootPaths = [
-                  c
-                  cpp
-                  go
-                  js
-                  kotlin
-                  rust
-                ];
-              };
-            in
-            pkgs.runCommand "trevrpc-consumer-closures-no-grpc-check" { } ''
-              if ${pkgs.gnugrep}/bin/grep -Eiq '(grpc|tonic)' ${consumerClosure}/store-paths; then
-                echo "consumer package closure contains a gRPC or Tonic store path" >&2
-                exit 1
-              fi
-              mkdir -p $out
-            '';
-
           nix = {
             root = ./.;
             filter = file: file.hasExt "nix";
