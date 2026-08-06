@@ -33,3 +33,6 @@
 
 # c
 /trevrpc-c/build/
+
+# cpp
+/trevrpc-cpp/build/

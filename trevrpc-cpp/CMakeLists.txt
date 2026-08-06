@@ -8,6 +8,12 @@ include(CheckCXXSourceCompiles)
 
 find_package(Threads REQUIRED)
 
+# Export compile_commands.json for clangd / editor integration. Honor a
+# user-provided value but default to ON.
+if(NOT DEFINED CMAKE_EXPORT_COMPILE_COMMANDS)
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
