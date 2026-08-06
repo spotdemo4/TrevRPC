@@ -4,9 +4,7 @@
 `TREVRPC_ALPN == "trevrpc/1"` and `TREVRPC_WIRE_VERSION == 1u`; ABI 6 changes only the
 native C API and ownership contract.
 
-ABI 6 has no ABI-5 compatibility declarations, targets, or shims. See
-[`MIGRATING-ABI5-TO-ABI6.md`](MIGRATING-ABI5-TO-ABI6.md) when updating an existing
-consumer.
+ABI 6 has no ABI-5 compatibility declarations, targets, or shims.
 
 ## Generate bindings
 

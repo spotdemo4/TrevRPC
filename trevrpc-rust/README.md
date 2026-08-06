@@ -2,8 +2,7 @@
 
 The examples use `prost` messages and the generated-style Greeter bindings in
 [`examples/shared/greeter.rs`](examples/shared/greeter.rs). Its service defines unary,
-server-streaming, client-streaming, and bidirectional-streaming methods. Applications upgrading
-from the former custom stream APIs should follow [the Milestone 5 migration guide](MIGRATING-M5.md).
+server-streaming, client-streaming, and bidirectional-streaming methods.
 
 ## Client
 

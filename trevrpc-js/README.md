@@ -1,6 +1,6 @@
 # trevrpc-js
 
-`trevrpc-js` is the ESM-only JavaScript runtime and protobuf.js generator for TrevRPC. Version 0.2.0 is the Milestone 6 compatibility break; see [MIGRATING-M6.md](MIGRATING-M6.md).
+`trevrpc-js` is the ESM-only JavaScript runtime and protobuf.js generator for TrevRPC.
 
 ## Generated files
 

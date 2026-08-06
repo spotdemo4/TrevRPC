@@ -19,8 +19,7 @@
     "bin/protoc-gen-trevrpc-js.js",
     "examples/greeter/**",
     "README.md",
-    "LICENSE",
-    "MIGRATING-M6.md"
+    "LICENSE"
   ],
   "type": "module",
   "sideEffects": false,

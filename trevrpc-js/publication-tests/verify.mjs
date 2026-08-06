@@ -19,7 +19,6 @@ for (const required of [
   "package/package.json",
   "package/README.md",
   "package/LICENSE",
-  "package/MIGRATING-M6.md",
   "package/bin/protoc-gen-trevrpc-js.js",
 ]) {
   assert(coreEntries.includes(required), `core tarball is missing ${required}`);
@@ -29,7 +28,7 @@ assert(coreEntries.some((entry) => entry.startsWith("package/examples/greeter/")
 for (const entry of coreEntries) {
   assert.match(
     entry,
-    /^package\/(?:src\/|bin\/protoc-gen-trevrpc-js\.js$|examples\/greeter\/|README\.md$|LICENSE$|MIGRATING-M6\.md$|package\.json$)/u,
+    /^package\/(?:src\/|bin\/protoc-gen-trevrpc-js\.js$|examples\/greeter\/|README\.md$|LICENSE$|package\.json$)/u,
     `unexpected core tar entry ${entry}`,
   );
   assert(!entry.endsWith(".node"));

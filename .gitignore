@@ -30,6 +30,7 @@
 /trevrpc-kotlin/.kotlin/
 /trevrpc-kotlin/build/
 /trevrpc-kotlin/**/build/
+/trevrpc-kotlin/**/target/
 
 # c
 /trevrpc-c/build/

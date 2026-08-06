@@ -51,4 +51,4 @@ Create `AsyncRuntime` with an explicit continuation executor. `Task<T>` is lazy 
 
 Call `Server::shutdown(ShutdownOptions)` to obtain a bounded `ShutdownReport`. A timed-out shutdown retains native and route ownership and can be resumed. The legacy no-argument `shutdown()` only requests stop.
 
-See [MIGRATING-7D.md](MIGRATING-7D.md), the [C++ Guide](../wiki/Cpp-Guide.md), and [Protobuf and Code Generation](../wiki/Protobuf-and-Code-Generation.md) for the complete API and integration workflow.
+See the [C++ Guide](../wiki/Cpp-Guide.md) and [Protobuf and Code Generation](../wiki/Protobuf-and-Code-Generation.md) for the complete API and integration workflow.
