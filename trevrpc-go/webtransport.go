@@ -40,7 +40,7 @@ type RawWebTransportClient struct {
 var _ ClientTransport = (*RawWebTransportClient)(nil)
 
 func dialRawWebTransport(ctx context.Context, url string, options RawWebTransportDialOptions) (*RawWebTransportClient, error) {
-	dialer := &webtransport.Dialer{
+	dialer := &webtransport.Transport{
 		TLSClientConfig:         options.TLSClientConfig,
 		QUICConfig:              options.QUICConfig,
 		ApplicationProtocols:    options.ApplicationProtocols,
@@ -167,7 +167,7 @@ func newWebTransportChannelConnector(url string, options DialOptions) (*webTrans
 }
 
 func (c *webTransportChannelConnector) Connect(ctx context.Context) (channelGeneration, error) {
-	dialer := &webtransport.Dialer{
+	dialer := &webtransport.Transport{
 		TLSClientConfig:         c.tlsConfig,
 		QUICConfig:              c.quicConfig,
 		ApplicationProtocols:    c.applicationProtocols,
