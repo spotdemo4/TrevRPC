@@ -16,15 +16,18 @@ let admissionNs;
 
 export async function connectAndPrepare(input) {
   if (channel != null) {
-    throw new Error("Chromium benchmark workload is already connected");
+    throw new Error("Benchmark workload is already connected");
   }
   config = input.config;
-  const hash = base64Bytes(input.certificateHash);
-  channel = await connect(`https://${input.address}/trevrpc`, {
-    serverCertificateHashes: [{ algorithm: "sha-256", value: hash }],
+  const connectOptions = {
     maxFrameSize: MaxFrameSize,
     streamIdleTimeoutMs: IdleTimeoutMs,
-  });
+  };
+  if (input.certificateHash != null && input.certificateHash !== "") {
+    const hash = base64Bytes(input.certificateHash);
+    connectOptions.serverCertificateHashes = [{ algorithm: "sha-256", value: hash }];
+  }
+  channel = await connect(`https://${input.address}/trevrpc`, connectOptions);
 
   const client = createServiceClient(channel, BenchmarkService, root, {
     maxResponseBodySize: MaxFrameSize,
@@ -44,7 +47,7 @@ export async function connectAndPrepare(input) {
     });
     const result = await warmup.start();
     if (result.failed !== 0n) {
-      throw result.error ?? new Error("Chromium benchmark warmup failed");
+      throw result.error ?? new Error("Benchmark warmup failed");
     }
   }
 
@@ -59,7 +62,7 @@ export async function connectAndPrepare(input) {
 
 export async function startMeasurement() {
   if (measurement == null) {
-    throw new Error("Chromium benchmark workload is not armed");
+    throw new Error("Benchmark workload is not armed");
   }
   const result = await measurement.start();
   return sampleForResult(config, admissionNs, result);

@@ -40,6 +40,12 @@
                 export TREVRPC_BROWSER_CHROMIUM="$chromium"
                 break
               done
+              for firefox in "$PLAYWRIGHT_BROWSERS_PATH"/firefox-*/firefox/firefox; do
+                export TREVRPC_BROWSER_FIREFOX="$firefox"
+                break
+              done
+              export TREVRPC_BROWSER_WEBKIT="$PLAYWRIGHT_BROWSERS_PATH"
+              export TREVRPC_BROWSER_SAFARI="$PLAYWRIGHT_BROWSERS_PATH"
             '';
             packages = with pkgs; [
               # rust
@@ -190,11 +196,6 @@
         # nix build [#...]
         packages =
           let
-            bench = pkgs.callPackage ./bench {
-              repoRoot = ./.;
-              sourceCommit = self.rev or (self.dirtyRev or "unversioned");
-              sourceDirty = if self ? rev then "false" else "true";
-            };
             cFamilyConformancePeers = pkgs.callPackage ./conformance/adapters/c-family {
               repoRoot = ./.;
             };
@@ -207,6 +208,7 @@
                 }
               ];
             };
+
             cpp = pkgs.callPackage ./trevrpc-cpp {
               repoRoot = ./.;
               trevrpcC = c;
@@ -220,6 +222,7 @@
             go = pkgs.callPackage ./trevrpc-go {
               repoRoot = ./.;
             };
+
             jsNative =
               if system == "x86_64-linux" then
                 pkgs.callPackage ./trevrpc-js/native-package.nix {
@@ -235,52 +238,60 @@
               trevrpcC = c;
               nativePackage = jsNative;
             };
-            chromiumBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
-              repoRoot = ./.;
-              trevrpcJs = js;
-            };
+
             kotlin = pkgs.callPackage ./trevrpc-kotlin {
               repoRoot = ./.;
             };
+
             rust = pkgs.callPackage ./trevrpc-rust {
               repoRoot = ./.;
             };
+
+            bench = pkgs.callPackage ./bench {
+              repoRoot = ./.;
+              sourceCommit = self.rev or (self.dirtyRev or "unversioned");
+              sourceDirty = if self ? rev then "false" else "true";
+            };
+            browserBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
+              repoRoot = ./.;
+              trevrpcJs = js;
+            };
           in
           {
-            trevrpc-bench = bench;
             trevrpc-c = c;
             trevrpc-cpp = cpp;
             trevrpc-go = go;
             trevrpc-js = js;
-            trevrpc-chromium-bench-peer = chromiumBenchPeer;
             trevrpc-kotlin = kotlin;
             trevrpc-rust = rust;
 
-            trevrpc-conformance-suite = pkgs.symlinkJoin {
-              name = "trevrpc-conformance-suite";
+            trevrpc-bench = bench;
+            trevrpc-browser-bench-peer = browserBenchPeer;
+            trevrpc-bench-suite = pkgs.symlinkJoin {
+              name = "trevrpc-bench-suite";
               paths = [
-                bench
                 c
                 cpp
                 go
                 js
                 kotlin
                 rust
+                bench
+                browserBenchPeer
               ];
               meta.platforms = [ "x86_64-linux" ];
             };
 
-            trevrpc-bench-suite = pkgs.symlinkJoin {
-              name = "trevrpc-bench-suite";
+            trevrpc-conformance-suite = pkgs.symlinkJoin {
+              name = "trevrpc-conformance-suite";
               paths = [
-                bench
                 c
                 cpp
                 go
                 js
-                chromiumBenchPeer
                 kotlin
                 rust
+                bench
               ];
               meta.platforms = [ "x86_64-linux" ];
             };
@@ -458,9 +469,9 @@
               cpp = self.packages.${system}.trevrpc-cpp;
               go = self.packages.${system}.trevrpc-go;
               js = self.packages.${system}.trevrpc-js;
-              chromium = self.packages.${system}.trevrpc-chromium-bench-peer;
               kotlin = self.packages.${system}.trevrpc-kotlin;
               rust = self.packages.${system}.trevrpc-rust;
+              browser = self.packages.${system}.trevrpc-browser-bench-peer;
             in
             pkgs.runCommand "trevrpc-benchmark-peer-capabilities-check" { nativeBuildInputs = [ pkgs.jq ]; } ''
               check_native_capabilities() {
@@ -475,9 +486,18 @@
               check_native_capabilities ${js}/bin/trevrpc-bench-peer-js js
               check_native_capabilities ${kotlin}/bin/trevrpc-bench-peer-kotlin kotlin
               check_native_capabilities ${rust}/bin/trevrpc-bench-peer-rust rust
-              test "$(${chromium}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .schema_version)" = 4
-              test "$(${chromium}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .peer)" = chromium
-              test "$(${chromium}/bin/trevrpc-bench-peer-chromium capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
+              test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .schema_version)" = 4
+              test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .peer)" = chromium
+              test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
+              test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -r .schema_version)" = 4
+              test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -r .peer)" = firefox
+              test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
+              test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .schema_version)" = 4
+              test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .peer)" = webkit
+              test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
+              test "$(${browser}/bin/trevrpc-bench-peer-safari capabilities | jq -r .schema_version)" = 4
+              test "$(${browser}/bin/trevrpc-bench-peer-safari capabilities | jq -r .peer)" = safari
+              test "$(${browser}/bin/trevrpc-bench-peer-safari capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
               touch $out
             '';
 

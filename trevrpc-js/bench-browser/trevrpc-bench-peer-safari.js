@@ -10,7 +10,7 @@ import {
   parseConnectCommand,
 } from "./browser-peer.js";
 
-const Peer = "chromium";
+const Peer = "safari";
 
 export { PeerError, parseConnectCommand };
 export function parseCommandLine(argv) {
@@ -30,7 +30,7 @@ if (isMainModule()) {
       error instanceof PeerError
         ? error
         : new PeerError("run", "peer_failed", error?.message ?? String(error), { cause: error });
-    console.error(`trevrpc-bench-peer-chromium: ${peerError.message}`);
+    console.error(`trevrpc-bench-peer-safari: ${peerError.message}`);
     try {
       const { SchemaVersion } = await import("trevrpc-bench-peer-js/common");
       const line = `${JSON.stringify({ schema_version: SchemaVersion, event: "error", phase: peerError.phase, code: peerError.code, message: peerError.message, peer: Peer })}\n`;
@@ -39,7 +39,7 @@ if (isMainModule()) {
       });
     } catch (writeError) {
       console.error(
-        `trevrpc-bench-peer-chromium: could not write error event: ${writeError.message}`,
+        `trevrpc-bench-peer-safari: could not write error event: ${writeError.message}`,
       );
     }
     process.exitCode = 1;

@@ -1,19 +1,26 @@
 {
-  "name": "trevrpc-bench-peer-chromium",
+  "name": "trevrpc-bench-peer-browser",
   "version": "0.1.0",
   "private": true,
-  "description": "Chromium WebTransport benchmark peer for TrevRPC",
+  "description": "Browser WebTransport benchmark peers for TrevRPC (Chromium, Firefox, WebKit/Safari)",
   "license": "MIT",
   "bin": {
-    "trevrpc-bench-peer-chromium": "./trevrpc-bench-peer-chromium.js"
+    "trevrpc-bench-peer-chromium": "./trevrpc-bench-peer-chromium.js",
+    "trevrpc-bench-peer-firefox": "./trevrpc-bench-peer-firefox.js",
+    "trevrpc-bench-peer-safari": "./trevrpc-bench-peer-safari.js",
+    "trevrpc-bench-peer-webkit": "./trevrpc-bench-peer-webkit.js"
   },
   "files": [
     "browser-workload.js",
-    "trevrpc-bench-peer-chromium.js"
+    "browser-peer.js",
+    "trevrpc-bench-peer-chromium.js",
+    "trevrpc-bench-peer-firefox.js",
+    "trevrpc-bench-peer-webkit.js",
+    "trevrpc-bench-peer-safari.js"
   ],
   "type": "module",
   "scripts": {
-    "test": "node --test test/chromium-peer.test.js"
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "playwright-core": "^1.62.1"
