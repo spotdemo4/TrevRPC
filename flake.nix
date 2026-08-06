@@ -219,13 +219,9 @@
             jsNative =
               if system == "x86_64-linux" then
                 pkgs.callPackage ./trevrpc-js/native-package.nix {
-                  libmsquic =
-                    (pkgs.callPackage (pkgs.path + "/pkgs/by-name/li/libmsquic/package.nix") {
-                      fetchFromGitHub = args: pkgs.fetchFromGitHub (removeAttrs args [ "tag" ] // { rev = args.tag; });
-                    }).overrideAttrs
-                      {
-                        dontPatchELF = true;
-                      };
+                  libmsquic = pkgs.libmsquic.overrideAttrs {
+                    dontPatchELF = true;
+                  };
                   repoRoot = ./.;
                 }
               else
