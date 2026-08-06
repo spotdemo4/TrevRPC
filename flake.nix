@@ -219,38 +219,26 @@
             go = pkgs.callPackage ./trevrpc-go {
               repoRoot = ./.;
             };
-            nativeLibmsquic =
-              (pkgs.callPackage (pkgs.path + "/pkgs/by-name/li/libmsquic/package.nix") {
-                fetchFromGitHub =
-                  args: pkgs.fetchFromGitHub (builtins.removeAttrs args [ "tag" ] // { rev = args.tag; });
-              }).overrideAttrs
-                (_: {
-                  dontPatchELF = true;
-                });
             jsNative =
               if system == "x86_64-linux" then
                 pkgs.callPackage ./trevrpc-js/native-package.nix {
-                  libmsquic = nativeLibmsquic;
+                  libmsquic =
+                    (pkgs.callPackage (pkgs.path + "/pkgs/by-name/li/libmsquic/package.nix") {
+                      fetchFromGitHub =
+                        args: pkgs.fetchFromGitHub (removeAttrs args [ "tag" ] // { rev = args.tag; });
+                    }).overrideAttrs
+                      (_: {
+                        dontPatchELF = true;
+                      });
                   repoRoot = ./.;
                 }
               else
                 null;
-            jsRuntime = pkgs.callPackage ./trevrpc-js {
+            js = pkgs.callPackage ./trevrpc-js {
               repoRoot = ./.;
               trevrpcC = c;
               nativePackage = jsNative;
             };
-            js = jsRuntime;
-            jsNpmStage =
-              if system == "x86_64-linux" then
-                pkgs.callPackage ./trevrpc-js/npm-stage.nix {
-                  repoRoot = ./.;
-                  trevrpcC = c;
-                  trevrpcJs = js;
-                  nativePackage = jsNative;
-                }
-              else
-                null;
             chromiumBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
               repoRoot = ./.;
               trevrpcJs = js;
@@ -303,7 +291,12 @@
           }
           // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             trevrpc-js-native-linux-x64-gnu = jsNative;
-            trevrpc-js-npm-stage = jsNpmStage;
+            trevrpc-js-npm-stage = pkgs.callPackage ./trevrpc-js/npm-stage.nix {
+              repoRoot = ./.;
+              trevrpcC = c;
+              trevrpcJs = js;
+              nativePackage = jsNative;
+            };
           };
 
         # nix fmt
@@ -347,11 +340,15 @@
               sanitizers = true;
             };
           };
+
           rust = self.packages.${system}.trevrpc-rust;
+
           go = self.packages.${system}.trevrpc-go;
+
           js = self.packages.${system}.trevrpc-js;
           ${if system == "x86_64-linux" then "js-npm-stage" else null} =
             self.packages.${system}.trevrpc-js-npm-stage;
+
           kotlin = self.packages.${system}.trevrpc-kotlin;
           kotlin-maven-consumer =
             let
