@@ -80,7 +80,8 @@ jobs:
         working-directory: trevrpc-rust
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
-        run: cargo publish --locked
+        run: | # zizmor: ignore[use-trusted-publishing]
+          cargo publish --locked
 
   npm:
     # zizmor: ignore[excessive-permissions]
