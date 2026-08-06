@@ -15,7 +15,7 @@
 }:
 stdenv.mkDerivation {
   pname = "trevrpc-js-native-linux-x64-gnu";
-  version = "0.1.3";
+  version = "0.1.4";
 
   src = lib.fileset.toSource {
     root = ../.;

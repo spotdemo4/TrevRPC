@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(trevrpc-cpp VERSION 0.1.3 LANGUAGES CXX)
+project(trevrpc-cpp VERSION 0.1.4 LANGUAGES CXX)
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
