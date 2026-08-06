@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(trevrpc-installed-cmake-consumer LANGUAGES C)
 
-find_package(trevrpc 0.2 CONFIG REQUIRED)
+find_package(trevrpc 0.1 CONFIG REQUIRED)
 if(NOT TREVRPC_C_ABI_VERSION EQUAL 6)
     message(FATAL_ERROR "installed TrevRPC package does not expose C ABI 6")
 endif()
