@@ -4,15 +4,55 @@ import org.gradle.api.publish.maven.tasks.PublishToMavenLocal
 import org.gradle.api.tasks.Delete
 import org.gradle.api.tasks.Exec
 import org.gradle.jvm.tasks.Jar
+import org.gradle.plugins.signing.SigningExtension
 
 plugins {
     alias(libs.plugins.dokka) apply false
     alias(libs.plugins.kotlin.jvm) apply false
 }
 
+val centralUsername =
+    providers.gradleProperty("centralUsername").orElse(providers.environmentVariable("MAVEN_CENTRAL_USERNAME")).orNull
+val centralPassword =
+    providers.gradleProperty("centralPassword").orElse(providers.environmentVariable("MAVEN_CENTRAL_PASSWORD")).orNull
+val centralUrl =
+    providers
+        .gradleProperty("centralUrl")
+        .orElse(providers.environmentVariable("MAVEN_CENTRAL_URL"))
+        .orElse("https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/")
+        .get()
+val rawSigningKey =
+    providers.gradleProperty("signingKey").orElse(providers.environmentVariable("GPG_PRIVATE_KEY")).orNull
+val signingKey =
+    rawSigningKey?.let { raw ->
+        val trimmed = raw.trim()
+        if (trimmed.contains("BEGIN PGP")) {
+            trimmed
+        } else {
+            try {
+                String(
+                    java.util.Base64
+                        .getDecoder()
+                        .decode(trimmed),
+                )
+            } catch (_: Exception) {
+                trimmed
+            }
+        }
+    }
+val signingPassword =
+    providers
+        .gradleProperty("signingPassword")
+        .orElse(providers.environmentVariable("GPG_PASSWORD"))
+        .orElse("")
+        .get()
+val isSigningEnabled = !signingKey.isNullOrBlank()
+
 allprojects {
     group = "zip.trev.trevrpc"
     version = "0.1.0"
+    providers.gradleProperty("trevrpcVersion").orNull?.let { version = it }
+    providers.environmentVariable("TREVRPC_VERSION").orNull?.let { version = it }
 
     configurations.configureEach {
         resolutionStrategy.eachDependency {
@@ -87,6 +127,7 @@ publishableModules.forEach { (moduleName, metadata) ->
     project(":$moduleName") {
         pluginManager.apply("java-library")
         pluginManager.apply("maven-publish")
+        pluginManager.apply("signing")
         pluginManager.apply("org.jetbrains.dokka")
 
         tasks.matching { it.name.startsWith("dokka") }.configureEach {
@@ -148,6 +189,14 @@ publishableModules.forEach { (moduleName, metadata) ->
                     name = "staging"
                     url = uri(stagingRepository)
                 }
+                maven {
+                    name = "central"
+                    url = uri(centralUrl)
+                    credentials {
+                        username = centralUsername
+                        password = centralPassword
+                    }
+                }
             }
         }
 
@@ -156,6 +205,14 @@ publishableModules.forEach { (moduleName, metadata) ->
                 publications.named("maven", MavenPublication::class) {
                     artifact(tasks.named("kotlinSourcesJar"))
                 }
+            }
+        }
+
+        extensions.configure<SigningExtension> {
+            isRequired = isSigningEnabled
+            if (isSigningEnabled) {
+                useInMemoryPgpKeys(signingKey, signingPassword)
+                sign(extensions.getByType<PublishingExtension>().publications["maven"])
             }
         }
     }
@@ -212,6 +269,17 @@ tasks.register<Exec>("verifyCronetConsumers") {
     dependsOn(verifyStagedMavenRepository)
     environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
     commandLine("bash", layout.projectDirectory.file("publication-tests/cronet/verify.sh").asFile)
+}
+
+val publishToCentralTasks =
+    publishableModules.keys.map { moduleName ->
+        ":$moduleName:publishMavenPublicationToCentralRepository"
+    }
+
+tasks.register("publishToCentral") {
+    group = "publishing"
+    description = "Publishes all TrevRPC Kotlin artifacts to Maven Central (requires signing and credentials)."
+    dependsOn(publishToCentralTasks)
 }
 
 gradle.projectsEvaluated {

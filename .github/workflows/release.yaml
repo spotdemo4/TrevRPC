@@ -43,6 +43,8 @@ jobs:
           test "$(grep '^version =' trevrpc-rust/Cargo.toml | head -1 | cut -d'\"' -f2)" = "$tag"
           test "$(grep 'version =' trevrpc-js/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
           test "$(grep 'version =' trevrpc-js/native-package.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-kotlin/build.gradle.kts | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-kotlin/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
 
       - name: Release to crates.io
         working-directory: trevrpc-rust
@@ -57,8 +59,35 @@ jobs:
           cat "$stage"/manifest.json
           echo "stage=$stage" >> "$GITHUB_ENV"
 
-      - name: Release to npm (native)
-        run: npm publish --provenance --access public "${stage}/trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz"
+      - name: Release to npm
+        run: |
+          set -euo pipefail
+          cat "${stage}/manifest.json"
+          native_tgz="$(ls "${stage}"/trevrpc-trevrpc-js-native-linux-x64-gnu-*.tgz)"
+          core_tgz="$(ls "${stage}"/trevrpc-trevrpc-js-*.tgz | grep -v native)"
+          echo "native: $native_tgz"
+          echo "core: $core_tgz"
+          test -f "$native_tgz"
+          test -f "$core_tgz"
+          npm publish --provenance --access public "$native_tgz"
+          npm publish --provenance --access public "$core_tgz"
 
-      - name: Release to npm (core)
-        run: npm publish --provenance --access public "${stage}/trevrpc-trevrpc-js-0.1.0.tgz"
+      - name: Stage Kotlin Maven repository
+        working-directory: trevrpc-kotlin
+        run: ./gradlew stageMavenRepository --no-configuration-cache
+
+      - name: Verify Kotlin staging repository
+        working-directory: trevrpc-kotlin
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          python3 publication-tests/verify_staged_repository.py build/staging-repository "$tag"
+
+      - name: Publish Kotlin to Maven Central
+        working-directory: trevrpc-kotlin
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}
+        run: ./gradlew publishToCentral --no-configuration-cache --parallel

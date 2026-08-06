@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import struct
 import subprocess
@@ -54,6 +55,24 @@ def require(condition: bool, message: str) -> None:
 
 def artifact_path(repository: pathlib.Path, module: str, suffix: str) -> pathlib.Path:
     return repository / GROUP.replace(".", "/") / module / VERSION / f"{module}-{VERSION}{suffix}"
+
+
+def resolve_version(repository: pathlib.Path) -> str:
+    if len(sys.argv) >= 3 and sys.argv[2].strip():
+        return sys.argv[2].strip()
+    env_version = (os.environ.get("TREVRPC_VERSION") or os.environ.get("TREVRPC_KOTLIN_VERSION") or "").strip()
+    if env_version:
+        return env_version
+    group_directory = repository / GROUP.replace(".", "/")
+    if group_directory.is_dir():
+        versions: set[str] = set()
+        for module in MODULE_TARGETS:
+            module_dir = group_directory / module
+            if module_dir.is_dir():
+                versions.update(p.name for p in module_dir.iterdir() if p.is_dir())
+        if len(versions) == 1:
+            return next(iter(versions))
+    return VERSION
 
 
 def verify_checksums(path: pathlib.Path) -> None:
@@ -208,8 +227,10 @@ def verify_generator_legal_metadata(archive: zipfile.ZipFile, path: pathlib.Path
 
 
 def main() -> None:
-    require(len(sys.argv) == 2, "usage: verify_staged_repository.py REPOSITORY")
+    require(len(sys.argv) in (2, 3), "usage: verify_staged_repository.py REPOSITORY [VERSION]")
     repository = pathlib.Path(sys.argv[1]).resolve()
+    global VERSION
+    VERSION = resolve_version(repository)
     group_directory = repository / GROUP.replace(".", "/")
     require(group_directory.is_dir(), f"missing group directory {group_directory}")
     modules = {path.name for path in group_directory.iterdir() if path.is_dir()}
@@ -253,12 +274,19 @@ def main() -> None:
         else:
             require(not list(version_directory.glob(f"{module}-{VERSION}-jdk21.*")), f"unexpected jdk21 classifier for {module}")
 
-        published = {
+        published_all = {
             path.name
             for path in version_directory.iterdir()
             if path.is_file() and not any(path.name.endswith(suffix) for suffix in (".md5", ".sha1", ".sha256", ".sha512"))
         }
+        asc_files = {name for name in published_all if name.endswith(".asc")}
+        published = published_all - asc_files
         require(published == allowed_artifacts, f"unexpected artifacts for {module}: {sorted(published - allowed_artifacts)}")
+        for asc_name in asc_files:
+            asc_path = version_directory / asc_name
+            verify_checksums(asc_path)
+            require(asc_path.stat().st_size > 0, f"empty signature {asc_path}")
+            require(asc_path.read_bytes().startswith(b"-----BEGIN PGP"), f"invalid PGP signature {asc_path}")
 
     print("staged Maven repository verified")
 

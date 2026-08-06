@@ -66,11 +66,11 @@ buildNpmPackage (final: {
         cp -R "${nativePackage}/package" "$native_work"
         chmod -R u+w "$native_work"
         npm pack "$native_work" --pack-destination "$out" >/dev/null
-        native_tgz="$out/trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz"
+        native_tgz="$out/trevrpc-trevrpc-js-native-linux-x64-gnu-${final.version}.tgz"
         test -f "$native_tgz"
 
         core_name="$(npm pack . --pack-destination "$out")"
-        test "$core_name" = "trevrpc-trevrpc-js-0.1.0.tgz"
+        test "$core_name" = "trevrpc-trevrpc-js-${final.version}.tgz"
         core_tgz="$out/$core_name"
 
         dependency_tarballs="$TMPDIR/dependency-tarballs"
@@ -93,9 +93,9 @@ buildNpmPackage (final: {
 
         # Artifact checks and both npm publish dry runs happen before consumers.
         mkdir -p "$TMPDIR/verify-stage"
-        ln -s "$core_tgz" "$TMPDIR/verify-stage/trevrpc-trevrpc-js-0.1.0.tgz"
+        ln -s "$core_tgz" "$TMPDIR/verify-stage/trevrpc-trevrpc-js-${final.version}.tgz"
         ln -s "$native_tgz" \
-          "$TMPDIR/verify-stage/trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz"
+          "$TMPDIR/verify-stage/trevrpc-trevrpc-js-native-linux-x64-gnu-${final.version}.tgz"
         node publication-tests/verify.mjs "$TMPDIR/verify-stage"
 
         test_cert="$TMPDIR/server-cert.pem"
@@ -197,20 +197,21 @@ buildNpmPackage (final: {
         (
           cd "$out"
           sha256sum \
-            trevrpc-trevrpc-js-0.1.0.tgz \
-            trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz \
+            trevrpc-trevrpc-js-${final.version}.tgz \
+            trevrpc-trevrpc-js-native-linux-x64-gnu-${final.version}.tgz \
             > sha256sums.txt
           jq -n \
-            --arg core "$(sha256sum trevrpc-trevrpc-js-0.1.0.tgz | cut -d' ' -f1)" \
-            --arg native "$(sha256sum trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz | cut -d' ' -f1)" \
+            --arg core "$(sha256sum trevrpc-trevrpc-js-${final.version}.tgz | cut -d' ' -f1)" \
+            --arg native "$(sha256sum trevrpc-trevrpc-js-native-linux-x64-gnu-${final.version}.tgz | cut -d' ' -f1)" \
+            --arg version "${final.version}" \
             '{
-              version: "0.1.0",
+              version: $version,
               publication: "local-stage-only",
               native_target: "linux/x64/glibc>=2.42",
               node_versions: [24],
               rpc_shapes: ["unary", "client-streaming", "server-streaming", "bidirectional-streaming"],
               browser: { bundler_types: true, esbuild: true, chromium_unary: true },
-              sha256: { "trevrpc-trevrpc-js-0.1.0.tgz": $core, "trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz": $native }
+              sha256: { ("trevrpc-trevrpc-js-\($version).tgz"): $core, ("trevrpc-trevrpc-js-native-linux-x64-gnu-\($version).tgz"): $native }
             }' > manifest.json
           test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
         )
