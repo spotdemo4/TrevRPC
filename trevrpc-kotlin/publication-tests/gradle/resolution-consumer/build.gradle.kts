@@ -7,6 +7,13 @@ plugins {
     java
 }
 
+val trevrpcVersion =
+    providers
+        .gradleProperty("trevrpcVersion")
+        .orElse(providers.environmentVariable("TREVRPC_VERSION"))
+        .orElse(providers.gradleProperty("trevrpc.version"))
+        .getOrElse("0.1.0")
+
 val cronetPublication =
     configurations.create("cronetPublication") {
         isCanBeConsumed = false
@@ -20,14 +27,14 @@ val cronetPublication =
     }
 
 dependencies {
-    add(cronetPublication.name, "zip.trev.trevrpc:transport-cronet:0.1.0")
+    add(cronetPublication.name, "zip.trev.trevrpc:transport-cronet:$trevrpcVersion")
 }
 
 tasks.register("resolveCronetPublication") {
     inputs.files(cronetPublication)
     doLast {
         val files = cronetPublication.resolve()
-        check(files.any { it.name == "transport-cronet-0.1.0.jar" }) {
+        check(files.any { it.name == "transport-cronet-$trevrpcVersion.jar" }) {
             "Cronet transport JAR was not resolved"
         }
         check(files.none { it.name.startsWith("cronet-api-") }) {

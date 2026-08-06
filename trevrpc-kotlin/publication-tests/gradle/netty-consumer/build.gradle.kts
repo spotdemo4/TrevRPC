@@ -16,6 +16,13 @@ kotlin {
     }
 }
 
+val trevrpcVersion =
+    providers
+        .gradleProperty("trevrpcVersion")
+        .orElse(providers.environmentVariable("TREVRPC_VERSION"))
+        .orElse(providers.gradleProperty("trevrpc.version"))
+        .getOrElse("0.1.0")
+
 dependencies {
-    implementation("zip.trev.trevrpc:transport-netty:0.1.0")
+    implementation("zip.trev.trevrpc:transport-netty:$trevrpcVersion")
 }

@@ -10,6 +10,13 @@ plugins {
 
 val metadataSource = providers.gradleProperty("trevrpc.metadata").orElse("gradle")
 
+val trevrpcVersion =
+    providers
+        .gradleProperty("trevrpcVersion")
+        .orElse(providers.environmentVariable("TREVRPC_VERSION"))
+        .orElse(providers.gradleProperty("trevrpc.version"))
+        .getOrElse("0.1.0")
+
 val verifyRejectedJvmVariants =
     tasks.register("verifyRejectedJvmVariants") {
         onlyIf { metadataSource.get() == "gradle" }
@@ -45,10 +52,10 @@ val verifyRejectedJvmVariants =
                 }
             }
 
-            expectRejected("nettyOnJava8", 8, "zip.trev.trevrpc:transport-netty:0.1.0")
-            expectRejected("nettyOnJava17", 17, "zip.trev.trevrpc:transport-netty:0.1.0")
-            expectRejected("generatorOnJava8", 8, "zip.trev.trevrpc:protoc-gen-trevrpc-kotlin:0.1.0")
-            expectRejected("generatorOnJava17", 17, "zip.trev.trevrpc:protoc-gen-trevrpc-kotlin:0.1.0")
+            expectRejected("nettyOnJava8", 8, "zip.trev.trevrpc:transport-netty:$trevrpcVersion")
+            expectRejected("nettyOnJava17", 17, "zip.trev.trevrpc:transport-netty:$trevrpcVersion")
+            expectRejected("generatorOnJava8", 8, "zip.trev.trevrpc:protoc-gen-trevrpc-kotlin:$trevrpcVersion")
+            expectRejected("generatorOnJava17", 17, "zip.trev.trevrpc:protoc-gen-trevrpc-kotlin:$trevrpcVersion")
         }
     }
 

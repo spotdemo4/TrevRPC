@@ -27,8 +27,15 @@ sourceSets.main {
     proto.srcDir("../../proto")
 }
 
+val trevrpcVersion =
+    providers
+        .gradleProperty("trevrpcVersion")
+        .orElse(providers.environmentVariable("TREVRPC_VERSION"))
+        .orElse(providers.gradleProperty("trevrpc.version"))
+        .getOrElse("0.1.0")
+
 dependencies {
-    implementation("zip.trev.trevrpc:core:0.1.0")
+    implementation("zip.trev.trevrpc:core:$trevrpcVersion")
 }
 
 val generator =
@@ -37,7 +44,7 @@ val generator =
         isCanBeResolved = true
         isTransitive = false
     }
-dependencies.add(generator.name, "zip.trev.trevrpc:protoc-gen-trevrpc-kotlin:0.1.0:jdk21@jar")
+dependencies.add(generator.name, "zip.trev.trevrpc:protoc-gen-trevrpc-kotlin:$trevrpcVersion:jdk21@jar")
 
 val generatorWrapper = layout.buildDirectory.file("tools/protoc-gen-trevrpc-kotlin")
 val prepareGenerator =

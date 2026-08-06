@@ -9,17 +9,46 @@ fixture_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 
-python3 - "$TREVRPC_STAGING_REPOSITORY" <<'PY'
+resolve_trevrpc_version() {
+  if [[ -n "${TREVRPC_VERSION:-}" ]]; then
+    echo "$TREVRPC_VERSION"
+    return
+  fi
+  if [[ -n "${TREVRPC_KOTLIN_VERSION:-}" ]]; then
+    echo "$TREVRPC_KOTLIN_VERSION"
+    return
+  fi
+  # Scan staging repository for the single published version (all modules share it)
+  local group_dir="$TREVRPC_STAGING_REPOSITORY/zip/trev/trevrpc"
+  if [[ -d "$group_dir" ]]; then
+    local versions
+    # shellcheck disable=SC2012
+    versions=$(ls -1 "$group_dir"/core/ 2>/dev/null | tr '\n' ' ')
+    # shellcheck disable=SC2206
+    local arr=($versions)
+    if [[ ${#arr[@]} -eq 1 ]]; then
+      echo "${arr[0]}"
+      return
+    fi
+  fi
+  echo "0.1.0"
+}
+
+TREVRPC_VERSION="$(resolve_trevrpc_version)"
+export TREVRPC_VERSION
+
+python3 - "$TREVRPC_STAGING_REPOSITORY" "$TREVRPC_VERSION" <<'PY'
 import pathlib
 import struct
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
 
+version = sys.argv[2] if len(sys.argv) >= 3 and sys.argv[2].strip() else "0.1.0"
 repository = pathlib.Path(sys.argv[1])
-artifact = repository / "zip/trev/trevrpc/transport-cronet/0.1.0"
-jar = artifact / "transport-cronet-0.1.0.jar"
-pom = artifact / "transport-cronet-0.1.0.pom"
+artifact = repository / f"zip/trev/trevrpc/transport-cronet/{version}"
+jar = artifact / f"transport-cronet-{version}.jar"
+pom = artifact / f"transport-cronet-{version}.pom"
 
 with zipfile.ZipFile(jar) as archive:
     names = archive.namelist()
@@ -59,6 +88,8 @@ GRADLE_USER_HOME="$work_dir/gradle-user-home" \
     --no-configuration-cache \
     --no-daemon \
     -Ptrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY" \
+    -PtrevrpcVersion="$TREVRPC_VERSION" \
+    -Ptrevrpc.version="$TREVRPC_VERSION" \
     clean compileKotlin
 
 "$maven_bin" \
@@ -66,5 +97,6 @@ GRADLE_USER_HOME="$work_dir/gradle-user-home" \
   --errors \
   -Dmaven.repo.local="$work_dir/maven-local-repository" \
   -Dtrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY" \
+  -Dtrevrpc.version="$TREVRPC_VERSION" \
   -f "$fixture_dir/maven/pom.xml" \
   clean compile

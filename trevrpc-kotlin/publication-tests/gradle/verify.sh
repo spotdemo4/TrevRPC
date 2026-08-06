@@ -10,6 +10,23 @@ trap 'rm -rf "$work_dir"' EXIT
 cache_seed=${TREVRPC_GRADLE_CACHE_SEED:-}
 read -r -a metadata_modes <<<"${TREVRPC_GRADLE_METADATA_MODES:-gradle pom}"
 
+resolve_trevrpc_version() {
+  if [[ -n "${TREVRPC_VERSION:-}" ]]; then echo "$TREVRPC_VERSION"; return; fi
+  if [[ -n "${TREVRPC_KOTLIN_VERSION:-}" ]]; then echo "$TREVRPC_KOTLIN_VERSION"; return; fi
+  local group_dir="$TREVRPC_STAGING_REPOSITORY/zip/trev/trevrpc"
+  if [[ -d "$group_dir" ]]; then
+    local versions
+    # shellcheck disable=SC2012
+    versions=$(ls -1 "$group_dir"/core/ 2>/dev/null | tr '\n' ' ')
+    # shellcheck disable=SC2206
+    local arr=($versions)
+    if [[ ${#arr[@]} -eq 1 ]]; then echo "${arr[0]}"; return; fi
+  fi
+  echo "0.1.0"
+}
+TREVRPC_VERSION="$(resolve_trevrpc_version)"
+export TREVRPC_VERSION
+
 for metadata in "${metadata_modes[@]}"; do
   gradle_user_home="$work_dir/gradle-user-home-$metadata"
   mkdir -p "$gradle_user_home"
@@ -28,5 +45,7 @@ for metadata in "${metadata_modes[@]}"; do
       --no-daemon \
       -Ptrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY" \
       -Ptrevrpc.metadata="$metadata" \
+      -PtrevrpcVersion="$TREVRPC_VERSION" \
+      -Ptrevrpc.version="$TREVRPC_VERSION" \
       verifyConsumers
 done

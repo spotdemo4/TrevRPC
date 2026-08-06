@@ -6,6 +6,23 @@ set -euo pipefail
 maven_bin=${MAVEN:-mvn}
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 local_repository=${MAVEN_LOCAL_REPOSITORY:-$(mktemp -d)}
+
+resolve_trevrpc_version() {
+  if [[ -n "${TREVRPC_VERSION:-}" ]]; then echo "$TREVRPC_VERSION"; return; fi
+  if [[ -n "${TREVRPC_KOTLIN_VERSION:-}" ]]; then echo "$TREVRPC_KOTLIN_VERSION"; return; fi
+  local group_dir="$TREVRPC_STAGING_REPOSITORY/zip/trev/trevrpc"
+  if [[ -d "$group_dir" ]]; then
+    local versions
+    # shellcheck disable=SC2012
+    versions=$(ls -1 "$group_dir"/core/ 2>/dev/null | tr '\n' ' ')
+    # shellcheck disable=SC2206
+    local arr=($versions)
+    if [[ ${#arr[@]} -eq 1 ]]; then echo "${arr[0]}"; return; fi
+  fi
+  echo "0.1.0"
+}
+TREVRPC_VERSION="$(resolve_trevrpc_version)"
+export TREVRPC_VERSION
 cleanup=false
 if [[ -z ${MAVEN_LOCAL_REPOSITORY:-} ]]; then
   cleanup=true
@@ -19,5 +36,6 @@ fi
   --errors \
   -Dmaven.repo.local="$local_repository" \
   -Dtrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY" \
+  -Dtrevrpc.version="$TREVRPC_VERSION" \
   -f "$project_dir/pom.xml" \
   clean verify
