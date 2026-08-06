@@ -1,13 +1,13 @@
-import { Channel as RootChannel, connect as connectRoot } from "trevrpc-js";
-import { Channel, NodeServer } from "trevrpc-js/node";
+import { Channel as RootChannel, connect as connectRoot } from "@trevrpc/trevrpc-js";
+import { Channel, NodeServer } from "@trevrpc/trevrpc-js/node";
 import type {
   NodeChannelOptions,
   NodeChannelTarget,
   NodeEndpoint,
   NodeListenOptions,
   NodeServerCall,
-} from "trevrpc-js/node";
-import { RawNodeTransport } from "trevrpc-js/node/advanced";
+} from "@trevrpc/trevrpc-js/node";
+import { RawNodeTransport } from "@trevrpc/trevrpc-js/node/advanced";
 
 const target = new URL("https://localhost:50051/trevrpc");
 const objectTarget: NodeChannelTarget = {

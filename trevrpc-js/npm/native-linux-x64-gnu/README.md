@@ -1,6 +1,6 @@
-# @trev/trevrpc-js-native-linux-x64-gnu
+# @trevrpc/trevrpc-js-native-linux-x64-gnu
 
-Target-specific native addon used by `trevrpc-js@0.2.0`.
+Target-specific native addon used by `@trevrpc/trevrpc-js@0.1.0`.
 
 Supported runtime contract:
 
@@ -8,4 +8,4 @@ Supported runtime contract:
 - glibc 2.42 or newer
 - Node.js 24
 
-Install `trevrpc-js`; its exact optional dependency selects this package automatically. Do not import this package directly. The package contains one N-API `.node` addon and its `$ORIGIN`-resolved `libmsquic.so.2` dependency.
+Install `@trevrpc/trevrpc-js`; its exact optional dependency selects this package automatically. Do not import this package directly. The package contains one N-API `.node` addon and its `$ORIGIN`-resolved `libmsquic.so.2` dependency.

@@ -17,7 +17,7 @@
 }:
 buildNpmPackage (final: {
   pname = "trevrpc-js";
-  version = "0.2.0";
+  version = "0.1.0";
 
   src = lib.fileset.toSource {
     root = repoRoot;
@@ -68,8 +68,8 @@ buildNpmPackage (final: {
     clang-tidy -p build/native native/trevrpc_node.c
     npm test
     rm -rf bench/node_modules
-    mkdir -p bench/node_modules
-    ln -s "$PWD" bench/node_modules/trevrpc-js
+    mkdir -p bench/node_modules/@trevrpc
+    ln -s "$PWD" bench/node_modules/@trevrpc/trevrpc-js
     npm --prefix bench test
     rm -rf bench/node_modules
     npm run build:native
@@ -78,24 +78,24 @@ buildNpmPackage (final: {
   '';
 
   postInstall = ''
-    native_dir="$out/lib/node_modules/trevrpc-js/node_modules/@trev/trevrpc-js-native-linux-x64-gnu"
+    native_dir="$out/lib/node_modules/@trevrpc/trevrpc-js/node_modules/@trevrpc/trevrpc-js-native-linux-x64-gnu"
     ${lib.optionalString (nativePackage != null) ''
       mkdir -p "$(dirname "$native_dir")"
       cp -R "${nativePackage}/package" "$native_dir"
     ''}
 
-    mkdir -p "$out/lib/node_modules/trevrpc-bench-peer-js/node_modules"
+    mkdir -p "$out/lib/node_modules/trevrpc-bench-peer-js/node_modules/@trevrpc"
     cp bench/package.json bench/common.js bench/trevrpc-bench-peer.js \
       "$out/lib/node_modules/trevrpc-bench-peer-js/"
-    ln -s "$out/lib/node_modules/trevrpc-js" \
-      "$out/lib/node_modules/trevrpc-bench-peer-js/node_modules/trevrpc-js"
+    ln -s "$out/lib/node_modules/@trevrpc/trevrpc-js" \
+      "$out/lib/node_modules/trevrpc-bench-peer-js/node_modules/@trevrpc/trevrpc-js"
     makeWrapper ${nodejs_24}/bin/node "$out/bin/trevrpc-bench-peer-js" \
       --add-flags "$out/lib/node_modules/trevrpc-bench-peer-js/trevrpc-bench-peer.js"
 
-    cp -R conformance "$out/lib/node_modules/trevrpc-js/conformance"
+    cp -R conformance "$out/lib/node_modules/@trevrpc/trevrpc-js/conformance"
     makeWrapper ${nodejs_24}/bin/node "$out/bin/trevrpc-conformance-js" \
       --add-flags "--no-addons" \
-      --add-flags "$out/lib/node_modules/trevrpc-js/conformance/trevrpc-conformance-js.js"
+      --add-flags "$out/lib/node_modules/@trevrpc/trevrpc-js/conformance/trevrpc-conformance-js.js"
   '';
 
   doInstallCheck = true;
@@ -105,7 +105,7 @@ buildNpmPackage (final: {
     ! grep -q '@grpc/' package.json
     ${nodejs_24}/bin/node --input-type=module -e \
       'import(process.argv[1]).then((module) => module.loadNativeAddon())' \
-      "$out/lib/node_modules/trevrpc-js/src/native-loader.js"
+      "$out/lib/node_modules/@trevrpc/trevrpc-js/src/native-loader.js"
     test -x "$out/bin/trevrpc-bench-peer-js"
     test -x "$out/bin/trevrpc-conformance-js"
     printf 'STOP\n' | "$out/bin/trevrpc-conformance-js" --protocol 1 > peer.out

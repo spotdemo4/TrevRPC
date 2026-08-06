@@ -1,6 +1,6 @@
-import { createUnaryResponse } from "trevrpc-js";
-import { Channel, NodeServer } from "trevrpc-js/node";
-import type { NodeChannelTarget, NodeServerCall } from "trevrpc-js/node";
+import { createUnaryResponse } from "@trevrpc/trevrpc-js";
+import { Channel, NodeServer } from "@trevrpc/trevrpc-js/node";
+import type { NodeChannelTarget, NodeServerCall } from "@trevrpc/trevrpc-js/node";
 
 import { registerAllShapesServer } from "./generated/all-shapes.node.trevrpc.js";
 import { AllShapesClient } from "./generated/all-shapes.trevrpc.js";

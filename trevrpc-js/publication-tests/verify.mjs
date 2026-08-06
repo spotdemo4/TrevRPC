@@ -10,8 +10,8 @@ const execFileAsync = promisify(execFile);
 const stage = process.argv[2];
 if (stage == null) throw new Error("usage: verify.mjs STAGE_DIRECTORY");
 
-const core = join(stage, "trevrpc-js-0.2.0.tgz");
-const native = join(stage, "trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz");
+const core = join(stage, "trevrpc-trevrpc-js-0.1.0.tgz");
+const native = join(stage, "trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz");
 
 const coreEntries = await tarEntries(core);
 const nativeEntries = await tarEntries(native);
@@ -53,14 +53,17 @@ assert.deepEqual(
 const extract = await mkdtemp(join(tmpdir(), "trevrpc-js-stage-"));
 await execFileAsync("tar", ["-xzf", core, "-C", extract]);
 const coreManifest = JSON.parse(await readFile(join(extract, "package/package.json"), "utf8"));
-assert.equal(coreManifest.name, "trevrpc-js");
-assert.equal(coreManifest.version, "0.2.0");
+assert.equal(coreManifest.name, "@trevrpc/trevrpc-js");
+assert.equal(coreManifest.version, "0.1.0");
 assert.equal(coreManifest.license, "MIT");
 assert.equal(coreManifest.main, undefined);
 assert.equal(coreManifest.types, undefined);
 assert.equal(coreManifest.bin["protoc-gen-trevrpc-js"], "bin/protoc-gen-trevrpc-js.js");
 assert.equal(coreManifest.sideEffects, false);
-assert.equal(coreManifest.optionalDependencies["@trev/trevrpc-js-native-linux-x64-gnu"], "0.2.0");
+assert.equal(
+  coreManifest.optionalDependencies["@trevrpc/trevrpc-js-native-linux-x64-gnu"],
+  "0.1.0",
+);
 assert.ok(coreManifest.exports["./node/generated"]);
 
 const nativeExtract = await mkdtemp(join(tmpdir(), "trevrpc-js-native-stage-"));
@@ -68,8 +71,8 @@ await execFileAsync("tar", ["-xzf", native, "-C", nativeExtract]);
 const nativeManifest = JSON.parse(
   await readFile(join(nativeExtract, "package/package.json"), "utf8"),
 );
-assert.equal(nativeManifest.name, "@trev/trevrpc-js-native-linux-x64-gnu");
-assert.equal(nativeManifest.version, "0.2.0");
+assert.equal(nativeManifest.name, "@trevrpc/trevrpc-js-native-linux-x64-gnu");
+assert.equal(nativeManifest.version, "0.1.0");
 assert.equal(nativeManifest.license, "MIT");
 assert.deepEqual(nativeManifest.os, ["linux"]);
 assert.deepEqual(nativeManifest.cpu, ["x64"]);

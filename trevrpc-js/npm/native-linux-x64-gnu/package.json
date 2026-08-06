@@ -1,6 +1,6 @@
 {
-  "name": "@trev/trevrpc-js-native-linux-x64-gnu",
-  "version": "0.2.0",
+  "name": "@trevrpc/trevrpc-js-native-linux-x64-gnu",
+  "version": "0.1.0",
   "description": "TrevRPC native Node addon for Linux x86-64 glibc",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {
@@ -10,7 +10,7 @@
   "repository": {
     "type": "git",
     "url": "https://trev.zip/llc/TrevRPC.git",
-    "directory": "trevrpc-js"
+    "directory": "/trevrpc-js"
   },
   "files": [
     "trevrpc_native.node",
@@ -29,6 +29,10 @@
     "glibc"
   ],
   "main": "trevrpc_native.node",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "engines": {
     "node": ">=24 <25"
   }

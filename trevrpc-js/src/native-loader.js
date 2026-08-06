@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SupportedTarget = "linux/x64/glibc";
-const LinuxX64GnuPackage = "@trev/trevrpc-js-native-linux-x64-gnu";
+const LinuxX64GnuPackage = "@trevrpc/trevrpc-js-native-linux-x64-gnu";
 
 /** Loads the target-specific native addon without building during installation. */
 export function loadNativeAddon() {
@@ -45,7 +45,7 @@ export function loadNativeAddon() {
         : "the source-checkout fallback failed to load";
   throw new Error(
     `TrevRPC native addon is unavailable for detected target ${detected}. ` +
-      `Supported targets: ${SupportedTarget}. Expected optional package: ${expected}@0.2.0; ` +
+      `Supported targets: ${SupportedTarget}. Expected optional package: ${expected}@0.1.0; ` +
       `package state: ${packageState}; ${fallbackState}. ` +
       "Install the matching optional package or build build/native/trevrpc_native.node explicitly in a source checkout; npm installation never starts a source build.",
     { cause: fallbackError ?? packageError },

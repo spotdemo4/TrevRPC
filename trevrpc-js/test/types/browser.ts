@@ -7,13 +7,13 @@ import {
   connect,
   createRoot,
   serverStreaming,
-} from "trevrpc-js";
+} from "@trevrpc/trevrpc-js";
 import type {
   BrowserChannelOptions,
   ResponseAsyncIterable,
   RpcStreamFrameMessage,
   StreamStatus,
-} from "trevrpc-js";
+} from "@trevrpc/trevrpc-js";
 
 const nativeCause = new Error("native");
 const statusError = new TrevRpcError(

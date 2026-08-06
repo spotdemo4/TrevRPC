@@ -10,9 +10,9 @@ import { setImmediate, setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
-import { connect } from "trevrpc-js";
-import { Channel, NodeServer } from "trevrpc-js/node";
-import { RawNodeTransport } from "trevrpc-js/node/advanced";
+import { connect } from "@trevrpc/trevrpc-js";
+import { Channel, NodeServer } from "@trevrpc/trevrpc-js/node";
+import { RawNodeTransport } from "@trevrpc/trevrpc-js/node/advanced";
 
 import {
   Code,

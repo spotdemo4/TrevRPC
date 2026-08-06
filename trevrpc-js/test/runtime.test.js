@@ -7,7 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { RawWebTransport } from "trevrpc-js/advanced";
+import { RawWebTransport } from "@trevrpc/trevrpc-js/advanced";
 
 import { generate as generateBindings } from "../src/generator.js";
 import {
@@ -74,7 +74,7 @@ test("frames round-trip TrevRPC requests", () => {
 
 test("Node native transport subpath exports without loading the addon", async () => {
   const node = await import("../src/node-index.js");
-  const advanced = await import("trevrpc-js/node/advanced");
+  const advanced = await import("@trevrpc/trevrpc-js/node/advanced");
 
   assert.equal(typeof node.Channel, "function");
   assert.equal(typeof node.Channel.connect, "function");
@@ -87,10 +87,10 @@ test("Node native transport subpath exports without loading the addon", async ()
 });
 
 test("package entry points separate channels and raw transports", async () => {
-  const root = await import("trevrpc-js");
-  const node = await import("trevrpc-js/node");
-  const browserAdvanced = await import("trevrpc-js/advanced");
-  const nodeAdvanced = await import("trevrpc-js/node/advanced");
+  const root = await import("@trevrpc/trevrpc-js");
+  const node = await import("@trevrpc/trevrpc-js/node");
+  const browserAdvanced = await import("@trevrpc/trevrpc-js/advanced");
+  const nodeAdvanced = await import("@trevrpc/trevrpc-js/node/advanced");
 
   assert.equal(typeof root.connect, "function");
   assert.equal(typeof root.Channel, "function");
@@ -169,7 +169,7 @@ test("browser WebTransport stream open reports unsupported bidirectional streams
 });
 
 test("Node transport forwards metadata, version, and timeout to native client", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const metadata = { authorization: new Uint8Array([1, 2, 3]) };
   let unaryRequest;
   let streamRequest;
@@ -242,7 +242,7 @@ test("Node transport forwards metadata, version, and timeout to native client", 
 });
 
 test("Node transport aborts native unary calls without closing the client", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   let cancellation;
   let clientClosed = false;
   let callCancellation;
@@ -290,7 +290,7 @@ test("Node transport aborts native unary calls without closing the client", asyn
 });
 
 test("Node transport aborts native stream setup and established streams", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   let setupCancellation;
   let nativeStream;
   let setupCancelled;
@@ -1043,7 +1043,7 @@ test("request streams expose sendMany batches", async () => {
 });
 
 test("Node transport writes request body batches with native sendMessages", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const sentBatches = [];
   let finishSend;
   const finishDone = new Promise((resolve) => {
@@ -1088,7 +1088,7 @@ test("Node transport writes request body batches with native sendMessages", asyn
 });
 
 test("Node transport uses native unary and stream send methods", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const used = [];
   const makeStream = () => {
     let finished = false;
@@ -1150,7 +1150,7 @@ test("Node transport uses native unary and stream send methods", async () => {
 });
 
 test("Node transport returns native response bodies with terminal status", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const status = RpcStreamFrame.create({
     kind: RpcStreamFrameKind.Status,
     status: Code.Ok,
@@ -1218,7 +1218,7 @@ test("Node transport returns native response bodies with terminal status", async
 });
 
 test("Node transport terminal OK reports already-settled local upload errors", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const uploadError = invalidArgument("local upload failed");
   let sendAttempted;
   const sendAttemptedDone = new Promise((resolve) => {
@@ -1260,7 +1260,7 @@ test("Node transport terminal OK reports already-settled local upload errors", a
 });
 
 test("Node transport terminal error wins over local upload errors", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const uploadError = invalidArgument("local upload failed");
   let closeCalls = 0;
   let closed = false;
@@ -1313,7 +1313,7 @@ test("Node transport terminal error wins over local upload errors", async () => 
 });
 
 test("Node transport return cleans up partial streams with a pending native receive", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   let closeCalls = 0;
   let resolvePendingRecv;
   const nativeClient = {
@@ -1361,7 +1361,7 @@ test("Node transport return cleans up partial streams with a pending native rece
 });
 
 test("Node transport native response body batches delay EOF until queued bodies drain", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const Hello = helloTestType();
   let recvBodyBatchCalls = 0;
   const nativeClient = {
@@ -1703,7 +1703,7 @@ test("unary without signal or deadline leaves transport abort signal unset", asy
 });
 
 test("Node transport skips native cancellation without signal", async () => {
-  const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   let cancellationCalls = 0;
   let callArgumentCount = 0;
   let startStreamArgumentCount = 0;
@@ -3182,7 +3182,7 @@ async function requestWriterScenario(
   }
 
   if (runtime === "node") {
-    const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+    const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
     let closes = 0;
     const transport = new RawNodeTransport({
       async startStream() {
@@ -3280,7 +3280,7 @@ async function blockedRequestWriterScenario(runtime) {
   let rawTransport;
 
   if (runtime === "node") {
-    const { RawNodeTransport } = await import("trevrpc-js/node/advanced");
+    const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
     rawTransport = new RawNodeTransport({
       async startStream() {
         let recvCalls = 0;

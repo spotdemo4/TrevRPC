@@ -1,4 +1,4 @@
-import { connect } from "trevrpc-js";
+import { connect } from "@trevrpc/trevrpc-js";
 
 import { AllShapesClient } from "./generated/all-shapes.trevrpc.js";
 

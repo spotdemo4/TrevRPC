@@ -16,7 +16,7 @@
 }:
 buildNpmPackage (final: {
   pname = "trevrpc-js-npm-stage";
-  version = "0.2.0";
+  version = "0.1.0";
 
   src = lib.fileset.toSource {
     root = repoRoot;
@@ -52,7 +52,7 @@ buildNpmPackage (final: {
   checkPhase = ''
     runHook preCheck
     # Source checks and native lifecycle tests run once in the prerequisite package.
-    test -d ${trevrpcJs}/lib/node_modules/trevrpc-js
+    test -d ${trevrpcJs}/lib/node_modules/@trevrpc/trevrpc-js
     patchShebangs bin/protoc-gen-trevrpc-js.js
     runHook postCheck
   '';
@@ -66,11 +66,11 @@ buildNpmPackage (final: {
         cp -R "${nativePackage}/package" "$native_work"
         chmod -R u+w "$native_work"
         npm pack "$native_work" --pack-destination "$out" >/dev/null
-        native_tgz="$out/trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz"
+        native_tgz="$out/trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz"
         test -f "$native_tgz"
 
         core_name="$(npm pack . --pack-destination "$out")"
-        test "$core_name" = "trevrpc-js-0.2.0.tgz"
+        test "$core_name" = "trevrpc-trevrpc-js-0.1.0.tgz"
         core_tgz="$out/$core_name"
 
         dependency_tarballs="$TMPDIR/dependency-tarballs"
@@ -93,9 +93,9 @@ buildNpmPackage (final: {
 
         # Artifact checks and both npm publish dry runs happen before consumers.
         mkdir -p "$TMPDIR/verify-stage"
-        ln -s "$core_tgz" "$TMPDIR/verify-stage/trevrpc-js-0.2.0.tgz"
+        ln -s "$core_tgz" "$TMPDIR/verify-stage/trevrpc-trevrpc-js-0.1.0.tgz"
         ln -s "$native_tgz" \
-          "$TMPDIR/verify-stage/trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz"
+          "$TMPDIR/verify-stage/trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz"
         node publication-tests/verify.mjs "$TMPDIR/verify-stage"
 
         test_cert="$TMPDIR/server-cert.pem"
@@ -181,7 +181,7 @@ buildNpmPackage (final: {
             --conditions=browser,import \
             --outfile=bundle.js \
             --metafile=metafile.json
-          ! grep -a -E 'node:|trevrpc_native|native-loader|@trev/trevrpc-js-native' \
+          ! grep -a -E 'node:|trevrpc_native|native-loader|@trevrpc/trevrpc-js-native' \
             bundle.js metafile.json
         )
 
@@ -197,20 +197,20 @@ buildNpmPackage (final: {
         (
           cd "$out"
           sha256sum \
-            trevrpc-js-0.2.0.tgz \
-            trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz \
+            trevrpc-trevrpc-js-0.1.0.tgz \
+            trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz \
             > sha256sums.txt
           jq -n \
-            --arg core "$(sha256sum trevrpc-js-0.2.0.tgz | cut -d' ' -f1)" \
-            --arg native "$(sha256sum trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz | cut -d' ' -f1)" \
+            --arg core "$(sha256sum trevrpc-trevrpc-js-0.1.0.tgz | cut -d' ' -f1)" \
+            --arg native "$(sha256sum trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz | cut -d' ' -f1)" \
             '{
-              version: "0.2.0",
+              version: "0.1.0",
               publication: "local-stage-only",
               native_target: "linux/x64/glibc>=2.42",
               node_versions: [24],
               rpc_shapes: ["unary", "client-streaming", "server-streaming", "bidirectional-streaming"],
               browser: { bundler_types: true, esbuild: true, chromium_unary: true },
-              sha256: { "trevrpc-js-0.2.0.tgz": $core, "trev-trevrpc-js-native-linux-x64-gnu-0.2.0.tgz": $native }
+              sha256: { "trevrpc-trevrpc-js-0.1.0.tgz": $core, "trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz": $native }
             }' > manifest.json
           test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
         )

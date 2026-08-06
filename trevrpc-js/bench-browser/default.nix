@@ -28,7 +28,8 @@ buildNpmPackage (final: {
 
   nativeBuildInputs = [ makeWrapper ];
   preBuild = ''
-    ln -s ${trevrpcJs}/lib/node_modules/trevrpc-js node_modules/trevrpc-js
+    mkdir -p node_modules/@trevrpc
+    ln -s ${trevrpcJs}/lib/node_modules/@trevrpc/trevrpc-js node_modules/@trevrpc/trevrpc-js
     ln -s ${trevrpcJs}/lib/node_modules/trevrpc-bench-peer-js \
       node_modules/trevrpc-bench-peer-js
   '';
@@ -42,9 +43,9 @@ buildNpmPackage (final: {
 
   postInstall = ''
     package=$out/lib/node_modules/trevrpc-bench-peer-chromium
-    mkdir -p "$package/node_modules"
-    ln -s ${trevrpcJs}/lib/node_modules/trevrpc-js \
-      "$package/node_modules/trevrpc-js"
+    mkdir -p "$package/node_modules/@trevrpc"
+    ln -s ${trevrpcJs}/lib/node_modules/@trevrpc/trevrpc-js \
+      "$package/node_modules/@trevrpc/trevrpc-js"
     ln -s ${trevrpcJs}/lib/node_modules/trevrpc-bench-peer-js \
       "$package/node_modules/trevrpc-bench-peer-js"
 

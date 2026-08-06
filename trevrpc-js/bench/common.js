@@ -1,4 +1,4 @@
-import { createRoot } from "trevrpc-js";
+import { createRoot } from "@trevrpc/trevrpc-js";
 
 export const SchemaVersion = 4;
 export const RpcKinds = Object.freeze(["unary", "client_stream", "server_stream", "bidi"]);

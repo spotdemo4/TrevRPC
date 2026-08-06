@@ -13,7 +13,7 @@ greeter.node.trevrpc.js
 greeter.node.trevrpc.d.ts
 ```
 
-The ordinary module contains the protobuf root, service descriptors, typed clients, and client factories. The Node companion contains typed handler interfaces and registration helpers backed by `trevrpc-js/node/generated`.
+The ordinary module contains the protobuf root, service descriptors, typed clients, and client factories. The Node companion contains typed handler interfaces and registration helpers backed by `@trevrpc/trevrpc-js/node/generated`.
 
 ```sh
 protoc \
@@ -29,7 +29,7 @@ Generator options are `runtime_import`, `runtime_type_import`, `node_runtime_imp
 Browser declarations accept only `BrowserChannelOptions`.
 
 ```js
-import { connect } from "trevrpc-js";
+import { connect } from "@trevrpc/trevrpc-js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
 const channel = await connect("https://localhost:50051/trevrpc", {
@@ -50,10 +50,10 @@ Native TLS bypass, certificate validation, MsQuic buffering, and native stream o
 
 ## Node clients
 
-Under Node conditions, the root package uses the native channel. The explicit `trevrpc-js/node` subpath also exports `Channel`, `NodeServer`, and `NodeServerCall`.
+Under Node conditions, the root package uses the native channel. The explicit `@trevrpc/trevrpc-js/node` subpath also exports `Channel`, `NodeServer`, and `NodeServerCall`.
 
 ```js
-import { connect } from "trevrpc-js";
+import { connect } from "@trevrpc/trevrpc-js";
 import { GreeterClient } from "./greeter.trevrpc.js";
 
 const channel = await connect("https://localhost:50051", {
@@ -130,8 +130,8 @@ try {
 Import the generated registration helper from the Node companion. Direct protobuf responses are never confused with metadata envelopes, even when they have `message` or `messages` properties.
 
 ```js
-import { Code, createStreamingResponse, createUnaryResponse } from "trevrpc-js";
-import { NodeServer } from "trevrpc-js/node";
+import { Code, createStreamingResponse, createUnaryResponse } from "@trevrpc/trevrpc-js";
+import { NodeServer } from "@trevrpc/trevrpc-js/node";
 import { registerGreeterServer } from "./greeter.node.trevrpc.js";
 
 const server = await NodeServer.listen({
@@ -178,7 +178,7 @@ Client-streaming completion uses streaming wire semantics: exactly one response 
 
 ## Native package support
 
-The core tarball is platform-neutral. Native code is supplied by the exact optional package `@trev/trevrpc-js-native-linux-x64-gnu@0.2.0`.
+The core tarball is platform-neutral. Native code is supplied by the exact optional package `@trevrpc/trevrpc-js-native-linux-x64-gnu@0.1.0`.
 
 Initial support is Linux x86-64, glibc 2.42 or newer, and Node 24. Browser usage still installs and runs on Darwin, ARM, and musl. Requesting a native Node channel on an unsupported or incomplete installation throws `TrevRpcError(Code.Unavailable)` with the detected target, supported targets, expected optional package, whether loading was missing or failed, and the original loader error as `cause`.
 

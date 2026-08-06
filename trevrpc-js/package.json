@@ -1,6 +1,6 @@
 {
-  "name": "trevrpc-js",
-  "version": "0.2.0",
+  "name": "@trevrpc/trevrpc-js",
+  "version": "0.1.0",
   "description": "JavaScript WebTransport runtime and protobuf.js code generator for TrevRPC",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {
@@ -53,6 +53,10 @@
       "import": "./src/node-generated.js"
     }
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build:native": "TREVRPC_NODE_TEST_HOOKS=OFF npm run build:native:cmake",
     "build:native:test": "TREVRPC_NODE_TEST_HOOKS=ON npm run build:native:cmake",
@@ -76,7 +80,7 @@
     "typescript": "^7.0.2"
   },
   "optionalDependencies": {
-    "@trev/trevrpc-js-native-linux-x64-gnu": "0.2.0"
+    "@trevrpc/trevrpc-js-native-linux-x64-gnu": "0.1.0"
   },
   "engines": {
     "node": ">=24 <25"

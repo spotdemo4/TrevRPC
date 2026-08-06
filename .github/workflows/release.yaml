@@ -32,3 +32,33 @@ jobs:
             packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl
             packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl
         run: flake-release
+
+      - name: Verify versions
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag=$tag"
+          test "$(jq -r .version trevrpc-js/package.json)" = "$tag"
+          test "$(jq -r .version trevrpc-js/npm/native-linux-x64-gnu/package.json)" = "$tag"
+          test "$(grep '^version =' trevrpc-rust/Cargo.toml | head -1 | cut -d'\"' -f2)" = "$tag"
+          test "$(grep 'version =' trevrpc-js/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-js/native-package.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+
+      - name: Release to crates.io
+        working-directory: trevrpc-rust
+        run: cargo publish --locked
+
+      - name: Build npm stage
+        run: |
+          set -euo pipefail
+          stage="$(nix build .#trevrpc-js-npm-stage --no-link --print-out-paths)"
+          echo "stage=$stage"
+          ls -lh "$stage"/*.tgz
+          cat "$stage"/manifest.json
+          echo "stage=$stage" >> "$GITHUB_ENV"
+
+      - name: Release to npm (native)
+        run: npm publish --provenance --access public "${stage}/trevrpc-trevrpc-js-native-linux-x64-gnu-0.1.0.tgz"
+
+      - name: Release to npm (core)
+        run: npm publish --provenance --access public "${stage}/trevrpc-trevrpc-js-0.1.0.tgz"

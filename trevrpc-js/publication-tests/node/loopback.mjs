@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
-import { Code, createStreamingResponse, createUnaryResponse } from "trevrpc-js";
-import { Channel, NodeServer } from "trevrpc-js/node";
+import { Code, createStreamingResponse, createUnaryResponse } from "@trevrpc/trevrpc-js";
+import { Channel, NodeServer } from "@trevrpc/trevrpc-js/node";
 
 import { registerAllShapesServer } from "./generated/all-shapes.node.trevrpc.js";
 import { AllShapesClient } from "./generated/all-shapes.trevrpc.js";

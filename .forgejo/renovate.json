@@ -17,7 +17,7 @@
   // repository
   "extends": ["config:recommended"],
   "addLabels": ["dep"],
-  "ignoreDeps": ["trevrpc-bench-peer-js", "trevrpc-js"],
+  "ignoreDeps": ["trevrpc-bench-peer-js", "@trevrpc/trevrpc-js"],
   "nix": {
     "enabled": true
   },
@@ -133,7 +133,7 @@
     {
       // The native package is built and versioned with trevrpc-js in this repository.
       "matchManagers": ["npm"],
-      "matchPackageNames": ["@trev/trevrpc-js-native-linux-x64-gnu"],
+      "matchPackageNames": ["@trevrpc/trevrpc-js-native-linux-x64-gnu"],
       "enabled": false
     },
     {

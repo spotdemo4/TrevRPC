@@ -11,9 +11,9 @@ import {
   invalidArgument,
   resourceExhausted,
   statusError,
-} from "trevrpc-js";
-import { NodeServer } from "trevrpc-js/node";
-import { RawNodeTransport } from "trevrpc-js/node/advanced";
+} from "@trevrpc/trevrpc-js";
+import { NodeServer } from "@trevrpc/trevrpc-js/node";
+import { RawNodeTransport } from "@trevrpc/trevrpc-js/node/advanced";
 
 import {
   BenchmarkService,

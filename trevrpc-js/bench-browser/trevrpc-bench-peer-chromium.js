@@ -200,7 +200,7 @@ async function runClient(config, io, env) {
 }
 
 async function startOriginServer() {
-  const trevrpcEntry = fileURLToPath(import.meta.resolve("trevrpc-js"));
+  const trevrpcEntry = fileURLToPath(import.meta.resolve("@trevrpc/trevrpc-js"));
   const trevrpcSource = dirname(trevrpcEntry);
   const commonPath = fileURLToPath(import.meta.resolve("trevrpc-bench-peer-js/common"));
   const protobufBundle = resolve(trevrpcSource, "../node_modules/protobufjs/dist/protobuf.min.js");
@@ -212,7 +212,7 @@ async function startOriginServer() {
         writeText(
           response,
           "text/html; charset=utf-8",
-          `<!doctype html><meta charset="utf-8"><script type="importmap">${JSON.stringify({ imports: { protobufjs: "/vendor/protobufjs.js", "trevrpc-js": "/trevrpc-js/index.js", "trevrpc-bench-peer-js/common": "/bench-common.js" } })}</script>`,
+          `<!doctype html><meta charset="utf-8"><script type="importmap">${JSON.stringify({ imports: { protobufjs: "/vendor/protobufjs.js", "@trevrpc/trevrpc-js": "/trevrpc-js/index.js", "trevrpc-bench-peer-js/common": "/bench-common.js" } })}</script>`,
         );
         return;
       }

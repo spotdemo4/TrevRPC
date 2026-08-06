@@ -1,6 +1,6 @@
-import { Code, createStreamingResponse, createUnaryResponse } from "trevrpc-js";
-import { NodeServer } from "trevrpc-js/node";
-import { registerTypedService } from "trevrpc-js/node/generated";
+import { Code, createStreamingResponse, createUnaryResponse } from "@trevrpc/trevrpc-js";
+import { NodeServer } from "@trevrpc/trevrpc-js/node";
+import { registerTypedService } from "@trevrpc/trevrpc-js/node/generated";
 
 import type { GreeterHandlers } from "../../examples/greeter/greeter.node.trevrpc.js";
 import { registerGreeterServer } from "../../examples/greeter/greeter.node.trevrpc.js";

@@ -253,9 +253,9 @@ export function generate(request) {
 /** Parses protoc plugin options for the JavaScript generator. */
 export function parseOptions(parameter) {
   const options = {
-    runtimeImport: "trevrpc-js",
+    runtimeImport: "@trevrpc/trevrpc-js",
     runtimeTypeImport: null,
-    nodeRuntimeImport: "trevrpc-js/node/generated",
+    nodeRuntimeImport: "@trevrpc/trevrpc-js/node/generated",
     nodeRuntimeTypeImport: null,
     fileSuffix: ".trevrpc.js",
   };

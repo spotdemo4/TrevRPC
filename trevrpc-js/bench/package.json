@@ -21,10 +21,10 @@
   },
   "dependencies": {},
   "peerDependencies": {
-    "trevrpc-js": "0.1.0"
+    "@trevrpc/trevrpc-js": "0.1.0"
   },
   "peerDependenciesMeta": {
-    "trevrpc-js": {
+    "@trevrpc/trevrpc-js": {
       "optional": true
     }
   },

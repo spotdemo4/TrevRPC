@@ -1,3 +1,4 @@
+import { connect, createServiceClient } from "@trevrpc/trevrpc-js";
 import {
   BenchmarkService,
   IdleTimeoutMs,
@@ -7,7 +8,6 @@ import {
   root,
   sampleForResult,
 } from "trevrpc-bench-peer-js/common";
-import { connect, createServiceClient } from "trevrpc-js";
 
 let channel;
 let measurement;

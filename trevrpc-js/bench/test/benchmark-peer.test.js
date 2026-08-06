@@ -5,7 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { Code, RpcStreamFrameKind, protobuf } from "trevrpc-js";
+import { Code, RpcStreamFrameKind, protobuf } from "@trevrpc/trevrpc-js";
 
 import {
   LogLinearHistogram,

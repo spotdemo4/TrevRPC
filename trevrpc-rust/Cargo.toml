@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
 description = "Protobuf over QUIC, HTTP/3 & WebTransport"
-readme = "../README.md"
+readme = "README.md"
 repository = "https://trev.zip/llc/TrevRPC"
-license-file = "../LICENSE"
+license = "MIT"
+keywords = ["quic", "rpc", "protobuf", "webtransport", "http3"]
+categories = ["network-programming"]
 
 [workspace]
 members = [
