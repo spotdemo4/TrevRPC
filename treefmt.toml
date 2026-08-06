@@ -26,6 +26,11 @@ options = ["--format"]
 includes = ["*.kt", "*.kts"]
 excludes = ["trevrpc-kotlin/examples/generated/**"]
 
+[formatter.ruff]
+command = "ruff"
+options = ["format"]
+includes = ["*.py"]
+
 [formatter.oxfmt]
 command = "oxfmt"
 options = ["--write"]

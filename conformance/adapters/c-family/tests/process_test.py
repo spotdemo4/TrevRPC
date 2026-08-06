@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
 import json
 import subprocess
 import sys
+import typing
 
 MAX_COMMAND_BYTES = 262_144
 CAPABILITIES = [
@@ -23,9 +25,11 @@ def start_peer(executable: str, peer: str) -> subprocess.Popen[bytes]:
         stderr=subprocess.PIPE,
     )
     assert process.stdout is not None
-    ready_line = process.stdout.readline()
+    ready_line: bytes = typing.cast(bytes, process.stdout.readline())
     assert len(ready_line) <= 65_536
-    ready = json.loads(ready_line)
+    ready: dict[str, typing.Any] = typing.cast(
+        dict[str, typing.Any], json.loads(ready_line)
+    )
     assert set(ready) == {"schema_version", "event", "peer", "pid", "capabilities"}
     assert ready["schema_version"] == 1
     assert ready["event"] == "ready"
@@ -35,33 +39,38 @@ def start_peer(executable: str, peer: str) -> subprocess.Popen[bytes]:
     return process
 
 
-def run_commands(executable: str, peer: str, commands: list[str]) -> list[dict]:
+def run_commands(
+    executable: str, peer: str, commands: list[str]
+) -> list[dict[str, typing.Any]]:
     process = start_peer(executable, peer)
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
     for command in commands:
-        process.stdin.write(command.encode("ascii") + b"\n")
-    process.stdin.write(b"STOP\n")
+        _ = process.stdin.write(command.encode("ascii") + b"\n")
+    _ = process.stdin.write(b"STOP\n")
     process.stdin.flush()
     process.stdin.close()
-    lines = process.stdout.readlines()
-    stderr = process.stderr.read()
+    lines: list[bytes] = typing.cast(list[bytes], process.stdout.readlines())
+    stderr: bytes = typing.cast(bytes, process.stderr.read())
     return_code = process.wait(timeout=10)
     assert return_code == 0, stderr.decode("utf-8", errors="replace")
     assert len(lines) == len(commands)
     assert all(len(line) <= 65_536 for line in lines)
-    return [json.loads(line) for line in lines]
+    return [typing.cast(dict[str, typing.Any], json.loads(line)) for line in lines]
 
 
 def expect_fatal(executable: str, peer: str, data: bytes) -> None:
     process = start_peer(executable, peer)
+    stdout: bytes
     stdout, _ = process.communicate(data, timeout=10)
     assert process.returncode == 2
     lines = stdout.splitlines()
     assert len(lines) == 1
     assert len(lines[0]) <= 65_536
-    event = json.loads(lines[0])
+    event: dict[str, typing.Any] = typing.cast(
+        dict[str, typing.Any], json.loads(lines[0])
+    )
     assert set(event) == {"schema_version", "event", "peer", "message"}
     assert event["schema_version"] == 1
     assert event["event"] == "fatal"
@@ -80,7 +89,7 @@ def encode_varint(value: int) -> bytes:
 
 def main() -> None:
     executable, peer = sys.argv[1:]
-    results = run_commands(
+    results: list[dict[str, typing.Any]] = run_commands(
         executable,
         peer,
         [

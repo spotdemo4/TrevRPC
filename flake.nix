@@ -45,11 +45,15 @@
               # rust
               rustc
               cargo
+              clippy
+              cargo-audit
+              rustfmt
 
               # go
               go
               gopls
               gotools
+              go-tools
               protobuf
 
               # c
@@ -64,29 +68,27 @@
               # javascript
               nodejs_24
               playwright-driver.browsers
+              oxlint
+              oxfmt
 
               # kotlin / android
               jdk25
               gradle_9
-              protobuf
               androidenv.androidPkgs.androidsdk
-
-              # lint
-              clippy
-              cargo-audit
-              go-tools
-              oxlint
-              nixd
-              nil
-
-              # format
-              rustfmt
-              nixfmt
-              oxfmt
               ktlint
-              treefmt
+              protobuf
+
+              # python
+              python3
+              ruff
+              basedpyright
+
+              # nix
+              nixd
+              nixfmt
 
               # util
+              treefmt
               bumper
               fix-hash
               jq
@@ -112,6 +114,7 @@
               # kotlin
               jdk25
               gradle_9
+              python3
             ];
           };
 
@@ -301,6 +304,7 @@
             nixfmt
             oxfmt
             ktlint
+            ruff
           ];
         };
 
@@ -484,6 +488,30 @@
             ];
             script = ''
               nixfmt --check "$file"
+            '';
+          };
+
+          shell = {
+            root = ./.;
+            filter = file: file.hasExt "sh";
+            packages = with pkgs; [
+              shellcheck
+            ];
+            script = ''
+              shellcheck "$file"
+            '';
+          };
+
+          python = {
+            root = ./.;
+            filter = file: file.hasExt "py";
+            packages = with pkgs; [
+              ruff
+              basedpyright
+            ];
+            script = ''
+              ruff check
+              basedpyright
             '';
           };
 

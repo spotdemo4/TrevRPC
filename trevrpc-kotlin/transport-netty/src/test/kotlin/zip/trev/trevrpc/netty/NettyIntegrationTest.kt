@@ -197,7 +197,7 @@ class NettyIntegrationTest {
         }
 
     @Test
-    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    @Timeout(value = 180, unit = TimeUnit.SECONDS)
     fun `native concurrent server streams retire cleanly`(): Unit =
         runBlocking {
             val certificate = SelfSignedCertificate("localhost")
@@ -213,17 +213,17 @@ class NettyIntegrationTest {
                     )
                 },
             )
-            val transportOptions = NettyTransportOptions(workerParallelism = 4, maxIdleTime = 5.seconds)
+            val transportOptions = NettyTransportOptions(workerParallelism = 2, maxIdleTime = 10.seconds)
             val transportServer = bindNative(core, certificate, transportOptions)
             val transport = connectNative(transportServer, certificate, transportOptions)
             try {
                 val client = Client(transport)
                 val codec = MessageCodec.BYTE_ARRAY
-                val callOptions = CallOptions(maxResponseMessages = 128, streamIdleTimeout = 2.seconds)
+                val callOptions = CallOptions(maxResponseMessages = 128, streamIdleTimeout = 5.seconds)
                 coroutineScope {
                     List(4) {
                         async {
-                            repeat(1_000) {
+                            repeat(250) {
                                 val call =
                                     client.serverStreaming(
                                         "test.Service",

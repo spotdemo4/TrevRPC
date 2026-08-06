@@ -1,5 +1,8 @@
 {
   "semantic_tokens": "combined",
+  "prettier": {
+    "allowed": false
+  },
   "file_types": {
     "Shell Script": [".envrc*"]
   },
@@ -9,10 +12,13 @@
         "arguments": ["--query-driver=**", "--background-index", "--clang-tidy"]
       }
     },
-    "nixd": {
-      "settings": {
-        "nixpkgs": {
-          "expr": "(builtins.getFlake (builtins.toString ./.)).outputs.nixpkgs.${builtins.currentSystem}"
+    "oxlint": {
+      "initialization_options": {
+        "settings": {
+          "configPath": null,
+          "run": "onType",
+          "disableNestedConfig": false,
+          "fixKind": "safe_fix"
         }
       }
     },
@@ -23,14 +29,105 @@
           "run": "onSave"
         }
       }
+    },
+    "nixd": {
+      "settings": {
+        "nixpkgs": {
+          "expr": "(builtins.getFlake (builtins.toString ./.)).outputs.nixpkgs.${builtins.currentSystem}"
+        },
+        "formatting": {
+          "command": ["nixfmt"]
+        }
+      }
     }
   },
   "languages": {
+    "C": {
+      "format_on_save": "on",
+      "language_servers": ["clangd"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "clangd"
+          }
+        }
+      ]
+    },
+    "C++": {
+      "format_on_save": "on",
+      "language_servers": ["clangd"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "clangd"
+          }
+        }
+      ]
+    },
+    "Go": {
+      "format_on_save": "on",
+      "language_servers": ["gopls"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "gopls"
+          }
+        }
+      ]
+    },
+    "TypeScript": {
+      "format_on_save": "on",
+      "language_servers": ["typescript-ls", "oxlint", "oxfmt"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "oxfmt"
+          }
+        },
+        {
+          "code_action": "source.fixAll.oxc"
+        }
+      ]
+    },
+    "JavaScript": {
+      "format_on_save": "on",
+      "language_servers": ["typescript-ls", "oxlint", "oxfmt"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "oxfmt"
+          }
+        },
+        {
+          "code_action": "source.fixAll.oxc"
+        }
+      ]
+    },
+    "Kotlin": {
+      "format_on_save": "on",
+      "language_servers": ["kotlin-language-server"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "kotlin-language-server"
+          }
+        }
+      ]
+    },
+    "Rust": {
+      "format_on_save": "on",
+      "language_servers": ["rust-analyzer"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "rust-analyzer"
+          }
+        }
+      ]
+    },
     "JSON": {
       "format_on_save": "on",
-      "prettier": {
-        "allowed": false
-      },
+      "language_servers": ["json-language-server", "oxfmt"],
       "formatter": [
         {
           "language_server": {
@@ -41,9 +138,7 @@
     },
     "JSONC": {
       "format_on_save": "on",
-      "prettier": {
-        "allowed": false
-      },
+      "language_servers": ["json-language-server", "oxfmt"],
       "formatter": [
         {
           "language_server": {
@@ -54,9 +149,7 @@
     },
     "Markdown": {
       "format_on_save": "on",
-      "prettier": {
-        "allowed": false
-      },
+      "language_servers": ["oxfmt"],
       "formatter": [
         {
           "language_server": {
@@ -67,9 +160,7 @@
     },
     "YAML": {
       "format_on_save": "on",
-      "prettier": {
-        "allowed": false
-      },
+      "language_servers": ["yaml-language-server", "oxfmt"],
       "formatter": [
         {
           "language_server": {
@@ -81,13 +172,32 @@
     "TOML": {
       "format_on_save": "on",
       "language_servers": ["tombi", "oxfmt"],
-      "prettier": {
-        "allowed": false
-      },
       "formatter": [
         {
           "language_server": {
             "name": "oxfmt"
+          }
+        }
+      ]
+    },
+    "Python": {
+      "format_on_save": "on",
+      "language_servers": ["basedpyright", "ruff"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "ruff"
+          }
+        }
+      ]
+    },
+    "Nix": {
+      "format_on_save": "on",
+      "language_servers": ["nixd"],
+      "formatter": [
+        {
+          "language_server": {
+            "name": "nixd"
           }
         }
       ]

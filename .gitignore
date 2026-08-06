@@ -37,3 +37,9 @@
 
 # cpp
 /trevrpc-cpp/build/
+
+# python
+/.venv
+/dist
+/.ruff_cache
+__pycache__
