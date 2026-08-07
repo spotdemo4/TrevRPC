@@ -223,7 +223,7 @@ not supported.
 
 ## Local Maven staging
 
-Milestone 4 packages exactly four local coordinates at version `0.1.5`:
+Milestone 4 packages exactly four local coordinates at version `0.1.6`:
 
 - `zip.trev.trevrpc:core`
 - `zip.trev.trevrpc:transport-netty`
