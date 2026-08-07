@@ -218,9 +218,14 @@ type preparedPhase struct {
 	results       chan laneResult
 	startedAt     time.Time
 	deadline      time.Time
+	now           func() time.Time
 }
 
 func preparePhase(ctx context.Context, concurrency int, operation benchmarkOperation, recordLatency bool) *preparedPhase {
+	return preparePhaseWithNow(ctx, concurrency, operation, recordLatency, nil)
+}
+
+func preparePhaseWithNow(ctx context.Context, concurrency int, operation benchmarkOperation, recordLatency bool, now func() time.Time) *preparedPhase {
 	phase := &preparedPhase{
 		ctx:           ctx,
 		operation:     operation,
@@ -228,6 +233,7 @@ func preparePhase(ctx context.Context, concurrency int, operation benchmarkOpera
 		recordLatency: recordLatency,
 		gate:          make(chan struct{}),
 		results:       make(chan laneResult, concurrency),
+		now:           now,
 	}
 	phase.ready.Add(concurrency)
 	phase.done.Add(concurrency)
@@ -239,21 +245,41 @@ func preparePhase(ctx context.Context, concurrency int, operation benchmarkOpera
 }
 
 func (p *preparedPhase) run(duration time.Duration) phaseResult {
-	p.startedAt = time.Now()
+	now := p.now
+	if now == nil {
+		now = time.Now
+	}
+	p.startedAt = now()
 	p.deadline = p.startedAt.Add(duration)
 	close(p.gate)
-	if remaining := time.Until(p.deadline); remaining > 0 {
-		timer := time.NewTimer(remaining)
-		select {
-		case <-timer.C:
-		case <-p.ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
+	isRealClock := p.now == nil
+	if isRealClock {
+		if remaining := time.Until(p.deadline); remaining > 0 {
+			timer := time.NewTimer(remaining)
+			select {
+			case <-timer.C:
+			case <-p.ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
 			}
+		}
+	} else {
+		// Fake clock: admission window is driven by the injected clock.
+		// Don't block on real time; lanes will observe deadline via p.now().
+		select {
+		case <-p.ctx.Done():
+		default:
 		}
 	}
 	p.done.Wait()
-	result := phaseResult{startedAt: p.startedAt, elapsed: time.Since(p.startedAt)}
+	elapsed := max(now().Sub(p.startedAt), time.Duration(0))
+	// For the real clock, ensure wall time is at least as large as the
+	// recorded elapsed (covers drain beyond the admission window).
+	if isRealClock {
+		elapsed = max(elapsed, time.Since(p.startedAt))
+	}
+	result := phaseResult{startedAt: p.startedAt, elapsed: elapsed}
 	for range p.concurrency {
 		result.merge(<-p.results)
 	}
@@ -270,13 +296,24 @@ func (p *preparedPhase) runLane(lane int) {
 		return
 	}
 
+	now := p.now
+	if now == nil {
+		now = time.Now
+	}
 	result := laneResult{histogram: map[uint64]uint64{}}
 	sequence := uint64(lane)
 	stride := uint64(p.concurrency)
+	first := true
 	for {
-		operationStarted := time.Now()
-		if !operationStarted.Before(p.deadline) || p.ctx.Err() != nil {
-			break
+		operationStarted := now()
+		if !first {
+			if !operationStarted.Before(p.deadline) || p.ctx.Err() != nil {
+				break
+			}
+		} else {
+			if p.ctx.Err() != nil {
+				break
+			}
 		}
 		counts, err := p.operation(p.ctx, sequence)
 		if err != nil {
@@ -289,10 +326,13 @@ func (p *preparedPhase) runLane(lane int) {
 		result.requestMessages += counts.requestMessages
 		result.responseMessages += counts.responseMessages
 		if p.recordLatency {
-			latency := uint64(max(time.Since(operationStarted).Nanoseconds(), 1))
-			result.histogram[logLinearUpperBound(latency)]++
+			// Use the same clock for latency measurement; for the real clock
+			// this is equivalent to time.Since(operationStarted).
+			latency := max(now().Sub(operationStarted).Nanoseconds(), int64(1))
+			result.histogram[logLinearUpperBound(uint64(latency))]++
 		}
 		sequence += stride
+		first = false
 	}
 	p.results <- result
 }

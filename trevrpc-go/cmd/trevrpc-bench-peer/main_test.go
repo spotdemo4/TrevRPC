@@ -145,10 +145,14 @@ func TestPreparedPhaseFixedAdmissionAndDrain(t *testing.T) {
 	}
 	phase := preparePhase(context.Background(), concurrency, operation, true)
 	go func() {
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		close(release)
 	}()
-	result := phase.run(5 * time.Millisecond)
+	// Use a comfortably large admission window (50ms) so scheduling jitter
+	// on heavily loaded builders cannot cause a lane to miss admission.
+	// The blocking operation (100ms) exceeds the window, ensuring exactly
+	// one admitted operation per lane and that elapsed covers the drain.
+	result := phase.run(50 * time.Millisecond)
 	if got := started.Load(); got != concurrency {
 		t.Fatalf("admitted operations = %d, want exactly one per lane (%d)", got, concurrency)
 	}
@@ -158,11 +162,97 @@ func TestPreparedPhaseFixedAdmissionAndDrain(t *testing.T) {
 	if result.requestMessages != concurrency*2 || result.responseMessages != concurrency*3 {
 		t.Fatalf("phase message counts = request %d response %d", result.requestMessages, result.responseMessages)
 	}
-	if result.elapsed < 20*time.Millisecond {
-		t.Fatalf("elapsed = %v, want drain beyond 20ms", result.elapsed)
+	if result.elapsed < 90*time.Millisecond {
+		t.Fatalf("elapsed = %v, want drain beyond 90ms", result.elapsed)
 	}
 	if got := histogramCount(result.histogram); got != result.completed {
 		t.Fatalf("histogram count = %d, want %d", got, result.completed)
+	}
+}
+
+func TestPreparedPhaseFixedAdmissionDoesNotStartWorkAtOrAfterDeadline(t *testing.T) {
+	var clock atomic.Int64
+	now := func() time.Time { return time.Unix(0, clock.Load()) }
+	operation := func(context.Context, uint64) (operationCounts, error) {
+		clock.Add(5)
+		return operationCounts{requestMessages: 2, responseMessages: 3}, nil
+	}
+	phase := preparePhaseWithNow(context.Background(), 1, operation, true, now)
+	// Admission window 10ns, operation advances clock by 5ns each time.
+	// Two operations fit (0->5, 5->10) and the third would start at 10 which is
+	// at the deadline and must not be admitted.
+	result := phase.run(10)
+	if result.completed != 2 || result.failed != 0 {
+		t.Fatalf("phase counts = completed %d failed %d, want 2/0", result.completed, result.failed)
+	}
+	if result.requestMessages != 4 || result.responseMessages != 6 {
+		t.Fatalf("phase message counts = request %d response %d, want 4/6", result.requestMessages, result.responseMessages)
+	}
+	if got := histogramCount(result.histogram); got != result.completed {
+		t.Fatalf("histogram count = %d, want %d", got, result.completed)
+	}
+	if result.elapsed != 10 {
+		t.Fatalf("elapsed = %v, want 10ns", result.elapsed)
+	}
+}
+
+func TestPreparedPhaseFixedAdmissionCreatesAndReleasesEveryConcurrencyLane(t *testing.T) {
+	var clock atomic.Int64
+	now := func() time.Time { return time.Unix(0, clock.Load()) }
+	var active atomic.Int64
+	var maxActive atomic.Int64
+	pending := make(chan chan operationCounts, 3)
+	operation := func(context.Context, uint64) (operationCounts, error) {
+		cur := active.Add(1)
+		for {
+			old := maxActive.Load()
+			if cur > old && maxActive.CompareAndSwap(old, cur) {
+				break
+			}
+			if cur <= old {
+				break
+			}
+		}
+		release := make(chan operationCounts, 1)
+		pending <- release
+		counts := <-release
+		active.Add(-1)
+		return counts, nil
+	}
+	phase := preparePhaseWithNow(context.Background(), 3, operation, false, now)
+	// Start phase asynchronously; it will block until operations complete.
+	resultCh := make(chan phaseResult, 1)
+	go func() { resultCh <- phase.run(10) }()
+	// Wait until all three lanes have admitted one operation and are blocked.
+	var releases []chan operationCounts
+	for len(releases) < 3 {
+		select {
+		case r := <-pending:
+			releases = append(releases, r)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %d admitted operations, got %d", 3, len(releases))
+		}
+	}
+	if got := maxActive.Load(); got != 3 {
+		t.Fatalf("max concurrent operations = %d, want 3", got)
+	}
+	// Advance fake clock to the deadline before releasing. Second operations
+	// must not be admitted because now() == deadline.
+	clock.Store(10)
+	for _, r := range releases {
+		r <- operationCounts{requestMessages: 1, responseMessages: 1}
+	}
+	var result phaseResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("phase did not complete after releasing operations")
+	}
+	if result.completed != 3 || result.failed != 0 {
+		t.Fatalf("phase counts = completed %d failed %d, want 3/0", result.completed, result.failed)
+	}
+	if result.requestMessages != 3 || result.responseMessages != 3 {
+		t.Fatalf("phase message counts = request %d response %d, want 3/3", result.requestMessages, result.responseMessages)
 	}
 }
 
