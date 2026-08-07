@@ -50,7 +50,7 @@ val isSigningEnabled = !signingKey.isNullOrBlank()
 
 allprojects {
     group = "zip.trev.trevrpc"
-    version = "0.1.7"
+    version = "0.1.8"
     providers.gradleProperty("trevrpcVersion").orNull?.let { version = it }
     providers.environmentVariable("TREVRPC_VERSION").orNull?.let { version = it }
 

@@ -12,7 +12,7 @@
 }:
 stdenv.mkDerivation (final: {
   pname = "trevrpc-c-family-conformance-peers";
-  version = "0.1.7";
+  version = "0.1.8";
 
   src = lib.fileset.toSource {
     root = ../../../.;

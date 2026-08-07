@@ -1,6 +1,6 @@
 {
   "name": "@trevrpc/trevrpc-js",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "JavaScript WebTransport runtime and protobuf.js code generator for TrevRPC",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {
@@ -79,7 +79,7 @@
     "typescript": "^7.0.2"
   },
   "optionalDependencies": {
-    "@trevrpc/trevrpc-js-native-linux-x64-gnu": "0.1.7"
+    "@trevrpc/trevrpc-js-native-linux-x64-gnu": "0.1.8"
   },
   "engines": {
     "node": ">=24 <25"

@@ -18,7 +18,7 @@
 }:
 buildNpmPackage (final: {
   pname = "trevrpc-js";
-  version = "0.1.7";
+  version = "0.1.8";
 
   src = lib.fileset.toSource {
     root = ../.;

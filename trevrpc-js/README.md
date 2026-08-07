@@ -178,7 +178,7 @@ Client-streaming completion uses streaming wire semantics: exactly one response 
 
 ## Native package support
 
-The core tarball is platform-neutral. Native code is supplied by the exact optional package `@trevrpc/trevrpc-js-native-linux-x64-gnu@0.1.7`.
+The core tarball is platform-neutral. Native code is supplied by the exact optional package `@trevrpc/trevrpc-js-native-linux-x64-gnu@0.1.8`.
 
 Initial support is Linux x86-64, glibc 2.42 or newer, and Node 24. Browser usage still installs and runs on Darwin, ARM, and musl. Requesting a native Node channel on an unsupported or incomplete installation throws `TrevRpcError(Code.Unavailable)` with the detected target, supported targets, expected optional package, whether loading was missing or failed, and the original loader error as `cause`.
 
