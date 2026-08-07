@@ -3,6 +3,7 @@ import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.api.publish.maven.tasks.PublishToMavenLocal
 import org.gradle.api.tasks.Delete
 import org.gradle.api.tasks.Exec
+import org.gradle.api.tasks.bundling.Zip
 import org.gradle.jvm.tasks.Jar
 import org.gradle.plugins.signing.SigningExtension
 
@@ -11,16 +12,6 @@ plugins {
     alias(libs.plugins.kotlin.jvm) apply false
 }
 
-val centralUsername =
-    providers.gradleProperty("centralUsername").orElse(providers.environmentVariable("MAVEN_CENTRAL_USERNAME")).orNull
-val centralPassword =
-    providers.gradleProperty("centralPassword").orElse(providers.environmentVariable("MAVEN_CENTRAL_PASSWORD")).orNull
-val centralUrl =
-    providers
-        .gradleProperty("centralUrl")
-        .orElse(providers.environmentVariable("MAVEN_CENTRAL_URL"))
-        .orElse("https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/")
-        .get()
 val rawSigningKey =
     providers.gradleProperty("signingKey").orElse(providers.environmentVariable("GPG_PRIVATE_KEY")).orNull
 val signingKey =
@@ -185,17 +176,13 @@ publishableModules.forEach { (moduleName, metadata) ->
                 }
             }
             repositories {
+                // Local staging repository for Central Portal bundle creation.
+                // Publishing to Maven Central uses the staged repository zipped as a bundle
+                // and uploaded via https://central.sonatype.com/api/v1/publisher/upload
+                // (see .forgejo/workflows/release.yaml). No remote Maven repository is defined here.
                 maven {
                     name = "staging"
                     url = uri(stagingRepository)
-                }
-                maven {
-                    name = "central"
-                    url = uri(centralUrl)
-                    credentials {
-                        username = centralUsername
-                        password = centralPassword
-                    }
                 }
             }
         }
@@ -277,15 +264,15 @@ tasks.register<Exec>("verifyCronetConsumers") {
     commandLine("bash", layout.projectDirectory.file("publication-tests/cronet/verify.sh").asFile)
 }
 
-val publishToCentralTasks =
-    publishableModules.keys.map { moduleName ->
-        ":$moduleName:publishMavenPublicationToCentralRepository"
-    }
-
-tasks.register("publishToCentral") {
+tasks.register<Zip>("createCentralBundle") {
     group = "publishing"
-    description = "Publishes all TrevRPC Kotlin artifacts to Maven Central (requires signing and credentials)."
-    dependsOn(publishToCentralTasks)
+    description = "Creates a Central Publisher Portal bundle from the staged Maven repository."
+    dependsOn("stageMavenRepository")
+    from(stagingRepository)
+    destinationDirectory = layout.buildDirectory
+    archiveFileName = "central-bundle.zip"
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
 }
 
 gradle.projectsEvaluated {
