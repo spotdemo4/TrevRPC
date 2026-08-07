@@ -14,7 +14,7 @@
 stdenv.mkDerivation (
   final: with lib; {
     pname = "trevrpc-cpp";
-    version = "0.1.8";
+    version = "0.1.9";
     outputs = [
       "out"
       "dev"
