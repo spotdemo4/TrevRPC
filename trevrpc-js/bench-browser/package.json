@@ -1,6 +1,6 @@
 {
   "name": "trevrpc-bench-peer-browser",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "Browser WebTransport benchmark peers for TrevRPC (Chromium, Firefox, WebKit/Safari)",
   "license": "MIT",
@@ -26,8 +26,8 @@
     "playwright-core": "^1.62.1"
   },
   "peerDependencies": {
-    "@trevrpc/trevrpc-js": "0.1.6",
-    "trevrpc-bench-peer-js": "0.1.6"
+    "@trevrpc/trevrpc-js": "0.1.7",
+    "trevrpc-bench-peer-js": "0.1.7"
   },
   "peerDependenciesMeta": {
     "trevrpc-bench-peer-js": {

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(trevrpc-c VERSION 0.1.6 LANGUAGES C)
+project(trevrpc-c VERSION 0.1.7 LANGUAGES C)
 
 set(TREVRPC_C_ABI_VERSION 6)
 
