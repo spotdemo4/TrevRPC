@@ -1,54 +1,102 @@
 # trevrpc-cpp
 
-`trevrpc-cpp` is the C++20 TrevRPC runtime and code generator. Its synchronous public API reports failures through explicit `Result` values.
+TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients and servers, and run them over QUIC.
 
-Generated bindings use protobuf C++ full or lite message classes. They serialize and parse those messages around the byte-oriented `trevrpc-c` transport, so C++ applications reuse its QUIC, framing, cancellation, limits, server, and channel lifecycle without generating or linking protobuf-c code.
+Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
-## API
+## Protobuf
 
-- `{Service}Service` and `{Service}Client` synchronous generated APIs.
-- `{Service}AsyncService` and `{Service}AsyncClient` coroutine APIs for all four RPC shapes.
-- `Register{Service}` and `Register{Service}Async` registration functions for `Server`.
-- `Channel`, `Server`, and `Result` runtime types.
-- Unary, server-streaming, client-streaming, and bidirectional-streaming RPCs.
-- Protobuf C++ full and lite generated messages.
-- Move-only RAII server and stream owners, plus shared long-lived channels.
-- `CallOptions`, `Metadata`, copyable single-operation `Cancellation`, and async cancellation fan-out.
-- Explicit terminal stream events, bounded async queues, owned callbacks, and report-bearing shutdown.
+```proto
+syntax = "proto3";
 
-## Build And Generation Model
+package hello.v1;
 
-Build the runtime, tests, examples, and `protoc-gen-trevrpc-cpp` from the repository root:
+service Greeter {
+  rpc SayHello(HelloRequest) returns (HelloReply);
+  rpc LotsOfReplies(HelloRequest) returns (stream HelloReply);
+  rpc LotsOfGreetings(stream HelloRequest) returns (HelloReply);
+  rpc BidiHello(stream HelloRequest) returns (stream HelloReply);
+}
 
-```sh
-cmake -S trevrpc-cpp -B build/trevrpc-cpp
-cmake --build build/trevrpc-cpp
-ctest --test-dir build/trevrpc-cpp --output-on-failure
+message HelloRequest { string name = 1; }
+message HelloReply { string message = 1; }
 ```
 
-Generate protobuf messages and TrevRPC service bindings from the same schema:
+Generate with `protoc --cpp_out` + `protoc --trevrpc-cpp_out`.
 
-```sh
-protoc -I proto \
-  --cpp_out=gen/cpp \
-  --trevrpc-cpp_out=gen/cpp \
-  proto/example/greeter.proto
+## Client
+
+```cpp
+#include <trevrpc/trevrpc.hpp>
+#include "greeter.trevrpc.hpp"
+
+trevrpc::ChannelConfig cfg;
+cfg.skip_certificate_validation = true;
+auto ch = trevrpc::Channel::connect("127.0.0.1", 50051, cfg, 5s).value();
+hello::v1::GreeterClient client(ch);
+
+hello::v1::HelloRequest req;
+req.set_name("TrevRPC");
+
+// Unary
+auto reply = client.SayHello(req);
+std::cout << reply.value().message.message() << "\n";
+
+// Server streaming
+auto stream = client.LotsOfReplies(req).value();
+for (;;) {
+  auto ev = stream.receive();
+  if (!ev || !ev.value().is_message()) break;
+  std::cout << ev.value().message().message() << "\n";
+}
+
+// Client streaming
+auto cs = client.LotsOfGreetings().value();
+cs.send(req);
+cs.finish_send();
+auto summary = cs.receive(); // terminal status or message
+
+// Bidi
+auto bidi = client.BidiHello().value();
+bidi.send(req);
+auto ev = bidi.receive();
+bidi.finish_send();
 ```
 
-The plugin emits `.trevrpc.hpp` and `.trevrpc.cpp` beside protobuf's `.pb.h` and `.pb.cc`. Compile both generated source sets as C++20 and link `trevrpc::cpp` plus `protobuf::libprotobuf` or `protobuf::libprotobuf-lite`. Do not run the protobuf-c generator for this runtime.
+## Server
 
-Installed CMake packages expose `trevrpc::cpp`, and `trevrpc_cpp_generate` can create a generated binding target. The plugin accepts `runtime_include`, `header_suffix`, and `source_suffix` options.
+```cpp
+class Greeter final : public hello::v1::GreeterService {
+ public:
+  trevrpc::Result<trevrpc::Response<hello::v1::HelloReply>>
+  SayHello(const trevrpc::CallContext&, const hello::v1::HelloRequest& req) override {
+    hello::v1::HelloReply r; r.set_message("hello, " + req.name());
+    return trevrpc::Response<hello::v1::HelloReply>{std::move(r), {}};
+  }
+  trevrpc::Status LotsOfReplies(const trevrpc::CallContext&, const hello::v1::HelloRequest& req,
+                                trevrpc::ServerWriter<hello::v1::HelloReply>& w) override {
+    hello::v1::HelloReply r; r.set_message("hello, " + req.name()); w.send(r);
+    r.set_message("goodbye, " + req.name()); w.send(r);
+    return trevrpc::Status::ok();
+  }
+  trevrpc::Result<trevrpc::Response<hello::v1::HelloReply>>
+  LotsOfGreetings(const trevrpc::CallContext&, trevrpc::ServerReader<hello::v1::HelloRequest>& r) override {
+    std::string names;
+    while (auto req = r.receive()) { if (!req.value()) break; names += req.value().value().name() + ", "; }
+    hello::v1::HelloReply reply; reply.set_message("hello, " + names);
+    return trevrpc::Response<hello::v1::HelloReply>{std::move(reply), {}};
+  }
+  trevrpc::Status BidiHello(const trevrpc::CallContext&,
+                            trevrpc::ServerReaderWriter<hello::v1::HelloRequest, hello::v1::HelloReply>& s) override {
+    while (auto req = s.receive()) {
+      if (!req.value()) return trevrpc::Status::ok();
+      hello::v1::HelloReply r; r.set_message("hello, " + req.value().value().name()); s.send(r);
+    }
+    return trevrpc::Status::ok();
+  }
+};
 
-## Channel Lifecycle
-
-Create one long-lived `Channel` per destination and share it across generated clients. Every RPC remains pinned to the ready connection generation on which it starts. Connection loss fails that RPC through `Result`; TrevRPC never retries, replays, resumes, or moves it. Reconnection only enables future calls, and new work fails fast while reconnecting unless the application explicitly waits for readiness.
-
-During shutdown, stop starting calls, finish or cancel active streams, explicitly close the channel, and then destroy clients and channel state. The C++ wrapper owns its underlying C transport handles.
-
-## Async and shutdown
-
-Create `AsyncRuntime` with an explicit continuation executor. `Task<T>` is lazy and move-only; use `co_await`, `spawn` with a completion sink, or `sync_wait` outside the continuation executor. Async send and receive halves are independently movable, one send and one receive may progress concurrently, and bounded queue saturation is reported instead of running work inline. No RPC or message is replayed across reconnect.
-
-Call `Server::shutdown(ShutdownOptions)` to obtain a bounded `ShutdownReport`. A timed-out shutdown retains native and route ownership and can be resumed. The legacy no-argument `shutdown()` only requests stop.
-
-See the [C++ Guide](../wiki/Cpp-Guide.md) and [Protobuf and Code Generation](../wiki/Protobuf-and-Code-Generation.md) for the complete API and integration workflow.
+auto srv = trevrpc::Server::listen({.host="127.0.0.1", .port=50051}).value();
+hello::v1::RegisterGreeter(srv, std::make_shared<Greeter>());
+srv.serve();
+```
