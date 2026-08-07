@@ -1,12 +1,9 @@
-import { execFile } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { access, constants, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
 import { chromium, firefox, webkit } from "playwright-core";
 import { RpcKinds, SchemaVersion, parseWorkloadOptions } from "trevrpc-bench-peer-js/common";
@@ -14,20 +11,17 @@ import { RpcKinds, SchemaVersion, parseWorkloadOptions } from "trevrpc-bench-pee
 const Stack = "trevrpc_webtransport";
 const BrowserCloseTimeoutMs = 5_000;
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
-const execFileAsync = promisify(execFile);
 
 const BrowserEngines = {
   chromium: chromium,
   firefox: firefox,
   webkit: webkit,
-  safari: webkit,
 };
 
 const PeerToEngine = {
   chromium: "chromium",
   firefox: "firefox",
   webkit: "webkit",
-  safari: "webkit",
 };
 
 export class PeerError extends Error {
@@ -140,15 +134,6 @@ async function runClient(config, io, env, peerName, engineName) {
   const lines = control[Symbol.asyncIterator]();
   const termination = terminationSignal();
   try {
-    // Prepare trust artifacts for non-chromium browsers before launching.
-    if (engineName !== "chromium") {
-      try {
-        trustArtifacts = await prepareTrustArtifacts(engineName, config.cert);
-      } catch (error) {
-        throw wrapError("prepare", "browser_failed", error);
-      }
-    }
-
     originServer = await startOriginServer();
     try {
       const launchResult = await launchBrowser(browserType, engineName, env, trustArtifacts);
@@ -178,10 +163,7 @@ async function runClient(config, io, env, peerName, engineName) {
       return;
     }
     const address = parseConnectCommand(connectLine);
-    let certificateHash = "";
-    if (engineName === "chromium") {
-      certificateHash = await leafCertificateHash(config.cert);
-    }
+    const certificateHash = await leafCertificateHash(config.cert);
 
     try {
       await page.evaluate(
@@ -281,38 +263,18 @@ async function launchBrowser(browserType, engineName, env, trustArtifacts) {
   }
 
   if (engineName === "firefox") {
-    // Check for Firefox-specific executable path.
-    const executablePath = env.TREVRPC_BROWSER_FIREFOX ?? env.TREVRPC_BROWSER_CHROMIUM ?? "";
+    const executablePath = env.TREVRPC_BROWSER_FIREFOX ?? "";
     const launchOptions = {
       headless: true,
     };
     if (executablePath !== "") {
-      // Firefox executable is typically firefox/firefox binary; allow override.
       launchOptions.executablePath = executablePath;
     }
-    // If we have a prepared profile dir via certutil, use persistent context.
-    if (trustArtifacts != null && trustArtifacts.firefoxUserDataDir != null) {
-      const context = await browserType.launchPersistentContext(trustArtifacts.firefoxUserDataDir, {
-        ...launchOptions,
-        // Firefox prefs: no extra needed since cert is already in DB.
-        // But ensure sandbox etc not needed.
-      });
-      const page = await context.newPage();
-      // For persistent context, browser is accessible via context.browser() if needed.
-      // We treat browser as null and context as both.
-      return { browser: null, context, page, trustArtifacts };
-    }
-    // Fallback: use SSL_CERT_FILE bundle with enterprise roots.
-    const envOverrides = trustArtifacts?.env ?? {};
-    const firefoxUserPrefs = {
-      "security.enterprise_roots.enabled": true,
-      "network.http.http3.enable": true,
-      ...trustArtifacts?.firefoxUserPrefs,
-    };
     const browser = await browserType.launch({
       ...launchOptions,
-      firefoxUserPrefs,
-      env: { ...env, ...envOverrides },
+      firefoxUserPrefs: {
+        "network.http.http3.enable": true,
+      },
     });
     const context = await browser.newContext({ ignoreHTTPSErrors: true });
     const page = await context.newPage();
@@ -320,189 +282,20 @@ async function launchBrowser(browserType, engineName, env, trustArtifacts) {
   }
 
   if (engineName === "webkit") {
-    const executablePath = env.TREVRPC_BROWSER_WEBKIT ?? env.TREVRPC_BROWSER_SAFARI ?? "";
+    const executablePath = env.TREVRPC_BROWSER_WEBKIT ?? "";
     const launchOptions = {
       headless: true,
     };
     if (executablePath !== "") {
       launchOptions.executablePath = executablePath;
     }
-    const envOverrides = trustArtifacts?.env ?? {};
-    const browser = await browserType.launch({
-      ...launchOptions,
-      env: { ...env, ...envOverrides },
-    });
+    const browser = await browserType.launch(launchOptions);
     const context = await browser.newContext({ ignoreHTTPSErrors: true });
     const page = await context.newPage();
     return { browser, context, page, trustArtifacts };
   }
 
   throw new PeerError("configure", "invalid_arguments", `unsupported engine ${engineName}`);
-}
-
-async function prepareTrustArtifacts(engineName, certPath) {
-  if (engineName === "chromium") {
-    return null;
-  }
-  const caPath = await findCaPath(certPath);
-  if (engineName === "firefox") {
-    return await prepareFirefoxTrust(certPath, caPath);
-  }
-  if (engineName === "webkit") {
-    return await prepareWebkitTrust(certPath, caPath);
-  }
-  return null;
-}
-
-async function findCaPath(certPath) {
-  try {
-    const dir = dirname(certPath);
-    const caCandidate = join(dir, "ca.pem");
-    await access(caCandidate, constants.R_OK);
-    return caCandidate;
-  } catch {
-    return null;
-  }
-}
-
-async function prepareFirefoxTrust(certPath, caPath) {
-  // Try certutil-based profile injection first.
-  const hasCertUtil = await commandExists("certutil");
-  if (hasCertUtil) {
-    try {
-      const userDataDir = await mkdtemp(join(tmpdir(), "trevrpc-firefox-"));
-      // Initialize NSS DB.
-      await execFileAsync("certutil", ["-N", "-d", `sql:${userDataDir}`, "--empty-password"]);
-      // Add CA if available.
-      if (caPath != null) {
-        await execFileAsync("certutil", [
-          "-A",
-          "-n",
-          "TrevRPC Benchmark CA",
-          "-t",
-          "C,,",
-          "-i",
-          caPath,
-          "-d",
-          `sql:${userDataDir}`,
-        ]);
-      }
-      // Add leaf as trusted peer (or CA if no separate CA).
-      await execFileAsync("certutil", [
-        "-A",
-        "-n",
-        "TrevRPC Server",
-        "-t",
-        "P,,",
-        "-i",
-        certPath,
-        "-d",
-        `sql:${userDataDir}`,
-      ]);
-      return {
-        firefoxUserDataDir: userDataDir,
-        env: {},
-        firefoxUserPrefs: {},
-        async cleanup() {
-          await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
-        },
-      };
-    } catch {
-      // Fall through to bundle method on any certutil failure.
-    }
-  }
-  // Fallback: create CA bundle and use enterprise roots.
-  const bundle = await prepareCaBundle(certPath, caPath);
-  return {
-    firefoxUserDataDir: null,
-    env: { SSL_CERT_FILE: bundle.bundlePath, SSL_CERT_DIR: "" },
-    firefoxUserPrefs: { "security.enterprise_roots.enabled": true },
-    async cleanup() {
-      await bundle.cleanup();
-    },
-  };
-}
-
-async function prepareWebkitTrust(certPath, caPath) {
-  const bundle = await prepareCaBundle(certPath, caPath);
-  return {
-    env: { SSL_CERT_FILE: bundle.bundlePath },
-    async cleanup() {
-      await bundle.cleanup();
-    },
-  };
-}
-
-async function prepareCaBundle(certPath, caPath) {
-  const tmpFile = join(tmpdir(), `trevrpc-ca-${randomUUID()}.pem`);
-  let bundleContent = "";
-  // Try to include system bundle if available for completeness.
-  const systemCandidates = [
-    process.env.SSL_CERT_FILE,
-    "/etc/ssl/certs/ca-certificates.crt",
-    "/etc/ssl/certs/ca-bundle.crt",
-    "/etc/ssl/cert.pem",
-    "/etc/pki/tls/certs/ca-bundle.crt",
-  ].filter(Boolean);
-  let systemBundle = null;
-  for (const candidate of systemCandidates) {
-    try {
-      await access(candidate, constants.R_OK);
-      systemBundle = candidate;
-      break;
-    } catch {
-      // Try next.
-    }
-  }
-  if (systemBundle != null) {
-    try {
-      const systemContent = await readFile(systemBundle, "utf8");
-      bundleContent += systemContent;
-      if (!bundleContent.endsWith("\n")) {
-        bundleContent += "\n";
-      }
-    } catch {
-      // Ignore system bundle read errors.
-    }
-  }
-  if (caPath != null) {
-    try {
-      const caContent = await readFile(caPath, "utf8");
-      bundleContent += caContent;
-      if (!bundleContent.endsWith("\n")) {
-        bundleContent += "\n";
-      }
-    } catch {}
-  }
-  const leafContent = await readFile(certPath, "utf8");
-  bundleContent += leafContent;
-  if (!bundleContent.endsWith("\n")) {
-    bundleContent += "\n";
-  }
-  await writeFile(tmpFile, bundleContent, "utf8");
-  return {
-    bundlePath: tmpFile,
-    async cleanup() {
-      await rm(tmpFile, { force: true }).catch(() => {});
-    },
-  };
-}
-
-async function commandExists(command) {
-  try {
-    await execFileAsync(command, ["--help"]);
-    return true;
-  } catch (error) {
-    // certutil returns non-zero for --help? Check if ENOENT.
-    if (error?.code === "ENOENT") {
-      return false;
-    }
-    // If it executed but returned error, assume it exists (e.g., certutil help exits non-zero).
-    if (error?.stdout != null || error?.stderr != null) {
-      return true;
-    }
-    return false;
-  }
 }
 
 async function startOriginServer() {

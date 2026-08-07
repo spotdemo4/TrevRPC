@@ -1,11 +1,11 @@
 {
   "schema_version": 4,
-  "campaign_id": "safari-webtransport-all-servers-smoke",
+  "campaign_id": "webkit-webtransport-all-servers-smoke",
   "repetitions": 1,
   "peers": [
     {
-      "id": "safari",
-      "command": ["trevrpc-bench-peer-safari"]
+      "id": "webkit",
+      "command": ["trevrpc-bench-peer-webkit"]
     },
     {
       "id": "c",
@@ -34,38 +34,38 @@
   ],
   "cells": [
     {
-      "id": "safari-c",
-      "client": "safari",
+      "id": "webkit-c",
+      "client": "webkit",
       "server": "c",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "safari-cpp",
-      "client": "safari",
+      "id": "webkit-cpp",
+      "client": "webkit",
       "server": "cpp",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "safari-go",
-      "client": "safari",
+      "id": "webkit-go",
+      "client": "webkit",
       "server": "go",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "safari-js",
-      "client": "safari",
+      "id": "webkit-js",
+      "client": "webkit",
       "server": "js",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "safari-kotlin",
-      "client": "safari",
+      "id": "webkit-kotlin",
+      "client": "webkit",
       "server": "kotlin",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "safari-rust",
-      "client": "safari",
+      "id": "webkit-rust",
+      "client": "webkit",
       "server": "rust",
       "stack": "trevrpc_webtransport"
     }

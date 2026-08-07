@@ -2,12 +2,11 @@
   "name": "trevrpc-bench-peer-browser",
   "version": "0.1.9",
   "private": true,
-  "description": "Browser WebTransport benchmark peers for TrevRPC (Chromium, Firefox, WebKit/Safari)",
+  "description": "Browser WebTransport benchmark peers for TrevRPC (Chromium, Firefox, WebKit)",
   "license": "MIT",
   "bin": {
     "trevrpc-bench-peer-chromium": "./trevrpc-bench-peer-chromium.js",
     "trevrpc-bench-peer-firefox": "./trevrpc-bench-peer-firefox.js",
-    "trevrpc-bench-peer-safari": "./trevrpc-bench-peer-safari.js",
     "trevrpc-bench-peer-webkit": "./trevrpc-bench-peer-webkit.js"
   },
   "files": [
@@ -15,8 +14,7 @@
     "browser-peer.js",
     "trevrpc-bench-peer-chromium.js",
     "trevrpc-bench-peer-firefox.js",
-    "trevrpc-bench-peer-webkit.js",
-    "trevrpc-bench-peer-safari.js"
+    "trevrpc-bench-peer-webkit.js"
   ],
   "type": "module",
   "scripts": {

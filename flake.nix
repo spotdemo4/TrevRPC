@@ -44,8 +44,10 @@
                 export TREVRPC_BROWSER_FIREFOX="$firefox"
                 break
               done
-              export TREVRPC_BROWSER_WEBKIT="$PLAYWRIGHT_BROWSERS_PATH"
-              export TREVRPC_BROWSER_SAFARI="$PLAYWRIGHT_BROWSERS_PATH"
+              for webkit in "$PLAYWRIGHT_BROWSERS_PATH"/webkit-*/pw_run.sh; do
+                export TREVRPC_BROWSER_WEBKIT="$webkit"
+                break
+              done
             '';
             packages = with pkgs; [
               # rust
@@ -468,15 +470,15 @@
                 touch $out
               '';
 
-          benchmark-safari-smoke =
-            pkgs.runCommand "trevrpc-benchmark-safari-smoke"
+          benchmark-webkit-smoke =
+            pkgs.runCommand "trevrpc-benchmark-webkit-smoke"
               {
                 nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
               }
               ''
                 export HOME=$(mktemp -d)
                 export TREVRPC_BENCH_SERVER_WORKERS=8
-                trevrpc-bench run ${./bench/campaigns/safari-smoke.example.json} --out run
+                trevrpc-bench run ${./bench/campaigns/webkit-smoke.example.json} --out run
                 test "$(wc -l < run/samples.jsonl)" -eq 24
                 test -s run/aggregate.csv
                 test -s run/report.md
@@ -516,9 +518,6 @@
               test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .schema_version)" = 4
               test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .peer)" = webkit
               test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
-              test "$(${browser}/bin/trevrpc-bench-peer-safari capabilities | jq -r .schema_version)" = 4
-              test "$(${browser}/bin/trevrpc-bench-peer-safari capabilities | jq -r .peer)" = safari
-              test "$(${browser}/bin/trevrpc-bench-peer-safari capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
               touch $out
             '';
 

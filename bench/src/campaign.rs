@@ -455,8 +455,8 @@ mod tests {
                 "firefox",
             ),
             (
-                include_str!("../campaigns/safari-smoke.example.json"),
-                "safari",
+                include_str!("../campaigns/webkit-smoke.example.json"),
+                "webkit",
             ),
         ] {
             let campaign: Campaign =

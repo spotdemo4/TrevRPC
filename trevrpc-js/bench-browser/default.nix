@@ -63,7 +63,14 @@ buildNpmPackage (final: {
     done
     test -n "$firefox"
 
-    # WebKit/Safari use the browsers directory via PLAYWRIGHT_BROWSERS_PATH, but
+    webkit=
+    for candidate in ${playwright-driver.browsers}/webkit-*/pw_run.sh; do
+      webkit=$candidate
+      break
+    done
+    test -n "$webkit"
+
+    # WebKit uses the browsers directory via PLAYWRIGHT_BROWSERS_PATH, but
     # also expose a dedicated env for explicit executable overrides.
     wrapProgram $out/bin/trevrpc-bench-peer-chromium \
       --set TREVRPC_BROWSER_CHROMIUM "$chromium" \
@@ -74,9 +81,7 @@ buildNpmPackage (final: {
       --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}" \
       --prefix PATH : "${lib.makeBinPath [ nssTools ]}"
     wrapProgram $out/bin/trevrpc-bench-peer-webkit \
-      --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}" \
-      --prefix PATH : "${lib.makeBinPath [ nssTools ]}"
-    wrapProgram $out/bin/trevrpc-bench-peer-safari \
+      --set TREVRPC_BROWSER_WEBKIT "$webkit" \
       --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}" \
       --prefix PATH : "${lib.makeBinPath [ nssTools ]}"
 
@@ -88,7 +93,7 @@ buildNpmPackage (final: {
 
   meta = {
     mainProgram = "trevrpc-bench-peer-chromium";
-    description = "Browser WebTransport benchmark peers for TrevRPC (Chromium, Firefox, WebKit/Safari)";
+    description = "Browser WebTransport benchmark peers for TrevRPC (Chromium, Firefox, WebKit)";
     license = lib.licenses.mit;
     platforms = [ "x86_64-linux" ];
   };

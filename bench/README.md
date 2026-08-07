@@ -19,7 +19,7 @@ packages Netty's Linux x86-64 native QUIC transport.
 The resulting `bin` directory contains `trevrpc-bench`, one
 `trevrpc-bench-peer-*` executable for C, C++, Go, JavaScript, Kotlin, and Rust,
 and the dedicated browser WebTransport client peers (`chromium`, `firefox`,
-`webkit`, `safari`).
+`webkit`).
 The benchmark and conformance executables are included in their associated
 `trevrpc-*` packages. The canonical RPC contract and process protocol live under
 `bench/`.
@@ -58,7 +58,7 @@ C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's
 advertised stacks, roles, RPC kinds, and histogram before starting a run.
 
 `chromium-smoke.example.json`, `firefox-smoke.example.json`, and
-`safari-smoke.example.json` each start the respective browser client before
+`webkit-smoke.example.json` each start the respective browser client before
 each RPC server and run it against all six server implementations. Each
 campaign's six cells and four RPC kinds produce 24 functional samples. The
 client first reports its prepared browser origin; the controller passes that

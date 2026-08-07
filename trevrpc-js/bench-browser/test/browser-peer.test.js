@@ -11,10 +11,6 @@ import {
   parseConnectCommand as parseConnectFirefox,
 } from "../trevrpc-bench-peer-firefox.js";
 import {
-  parseCommandLine as parseSafari,
-  parseConnectCommand as parseConnectSafari,
-} from "../trevrpc-bench-peer-safari.js";
-import {
   parseCommandLine as parseWebkit,
   parseConnectCommand as parseConnectWebkit,
 } from "../trevrpc-bench-peer-webkit.js";
@@ -39,12 +35,6 @@ const peers = [
     file: "../trevrpc-bench-peer-webkit.js",
     parse: parseWebkit,
     connect: parseConnectWebkit,
-  },
-  {
-    name: "safari",
-    file: "../trevrpc-bench-peer-safari.js",
-    parse: parseSafari,
-    connect: parseConnectSafari,
   },
 ];
 
@@ -123,15 +113,3 @@ for (const { name, file, parse, connect } of peers) {
     }
   });
 }
-
-test("safari peer uses WebKit engine alias", async () => {
-  const webkitPeer = fileURLToPath(new URL("../trevrpc-bench-peer-webkit.js", import.meta.url));
-  const safariPeer = fileURLToPath(new URL("../trevrpc-bench-peer-safari.js", import.meta.url));
-  const { stdout: webkitOut } = await execFileAsync(process.execPath, [webkitPeer, "capabilities"]);
-  const { stdout: safariOut } = await execFileAsync(process.execPath, [safariPeer, "capabilities"]);
-  const webkitCaps = JSON.parse(webkitOut);
-  const safariCaps = JSON.parse(safariOut);
-  assert.equal(webkitCaps.peer, "webkit");
-  assert.equal(safariCaps.peer, "safari");
-  assert.deepEqual(webkitCaps.roles, safariCaps.roles);
-});
