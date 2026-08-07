@@ -1,0 +1,86 @@
+{
+  "schema_version": 4,
+  "campaign_id": "firefox-webtransport-all-servers-smoke",
+  "repetitions": 1,
+  "peers": [
+    {
+      "id": "firefox",
+      "command": ["trevrpc-bench-peer-firefox"]
+    },
+    {
+      "id": "c",
+      "command": ["trevrpc-bench-peer-c"]
+    },
+    {
+      "id": "cpp",
+      "command": ["trevrpc-bench-peer-cpp"]
+    },
+    {
+      "id": "go",
+      "command": ["trevrpc-bench-peer-go"]
+    },
+    {
+      "id": "js",
+      "command": ["trevrpc-bench-peer-js"]
+    },
+    {
+      "id": "kotlin",
+      "command": ["trevrpc-bench-peer-kotlin"]
+    },
+    {
+      "id": "rust",
+      "command": ["trevrpc-bench-peer-rust"]
+    }
+  ],
+  "cells": [
+    {
+      "id": "firefox-c",
+      "client": "firefox",
+      "server": "c",
+      "stack": "trevrpc_webtransport"
+    },
+    {
+      "id": "firefox-cpp",
+      "client": "firefox",
+      "server": "cpp",
+      "stack": "trevrpc_webtransport"
+    },
+    {
+      "id": "firefox-go",
+      "client": "firefox",
+      "server": "go",
+      "stack": "trevrpc_webtransport"
+    },
+    {
+      "id": "firefox-js",
+      "client": "firefox",
+      "server": "js",
+      "stack": "trevrpc_webtransport"
+    },
+    {
+      "id": "firefox-kotlin",
+      "client": "firefox",
+      "server": "kotlin",
+      "stack": "trevrpc_webtransport"
+    },
+    {
+      "id": "firefox-rust",
+      "client": "firefox",
+      "server": "rust",
+      "stack": "trevrpc_webtransport"
+    }
+  ],
+  "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
+  "concurrencies": [1],
+  "timing": {
+    "warmup_ms": 50,
+    "measurement_ms": 250
+  },
+  "workload": {
+    "request_bytes": 16,
+    "response_bytes": 16,
+    "messages_per_stream": 4
+  },
+  "startup_timeout_ms": 30000,
+  "drain_timeout_ms": 30000
+}

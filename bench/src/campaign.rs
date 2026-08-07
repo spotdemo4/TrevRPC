@@ -445,21 +445,35 @@ mod tests {
 
     #[test]
     fn webtransport_smoke_has_six_servers_and_twenty_four_samples() {
-        let campaign: Campaign =
-            serde_json::from_str(include_str!("../campaigns/webtransport-smoke.example.json"))
-                .expect("WebTransport smoke campaign");
-        campaign.validate().expect("valid WebTransport campaign");
-        assert_eq!(campaign.cells.len(), 6);
-        assert!(
-            campaign
-                .cells
-                .iter()
-                .all(|cell| cell.client == "chromium" && cell.stack == Stack::TrevrpcWebtransport)
-        );
-        let sample_count = usize::try_from(campaign.repetitions).unwrap()
-            * campaign.cells.len()
-            * campaign.rpc_kinds.len()
-            * campaign.concurrencies.len();
-        assert_eq!(sample_count, 24);
+        for (content, browser) in [
+            (
+                include_str!("../campaigns/chromium-smoke.example.json"),
+                "chromium",
+            ),
+            (
+                include_str!("../campaigns/firefox-smoke.example.json"),
+                "firefox",
+            ),
+            (
+                include_str!("../campaigns/safari-smoke.example.json"),
+                "safari",
+            ),
+        ] {
+            let campaign: Campaign =
+                serde_json::from_str(content).expect("WebTransport smoke campaign");
+            campaign.validate().expect("valid WebTransport campaign");
+            assert_eq!(campaign.cells.len(), 6);
+            assert!(
+                campaign
+                    .cells
+                    .iter()
+                    .all(|cell| cell.client == browser && cell.stack == Stack::TrevrpcWebtransport)
+            );
+            let sample_count = usize::try_from(campaign.repetitions).unwrap()
+                * campaign.cells.len()
+                * campaign.rpc_kinds.len()
+                * campaign.concurrencies.len();
+            assert_eq!(sample_count, 24);
+        }
     }
 }

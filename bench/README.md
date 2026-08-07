@@ -18,7 +18,8 @@ packages Netty's Linux x86-64 native QUIC transport.
 
 The resulting `bin` directory contains `trevrpc-bench`, one
 `trevrpc-bench-peer-*` executable for C, C++, Go, JavaScript, Kotlin, and Rust,
-and the dedicated Chromium WebTransport client peer.
+and the dedicated browser WebTransport client peers (`chromium`, `firefox`,
+`webkit`, `safari`).
 The benchmark and conformance executables are included in their associated
 `trevrpc-*` packages. The canonical RPC contract and process protocol live under
 `bench/`.
@@ -56,12 +57,13 @@ limits; normal benchmark runs retain the C peer's 128-worker default.
 C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's
 advertised stacks, roles, RPC kinds, and histogram before starting a run.
 
-`webtransport-smoke.example.json` starts the Chromium client before each RPC
-server and runs it against all six server implementations. Its six cells and
-four RPC kinds produce 24 functional samples. The client first reports its
-prepared browser origin; the controller passes that origin to the server, sends
-the ready server address back with `CONNECT`, waits for `armed`, and then starts
-measurement.
+`chromium-smoke.example.json`, `firefox-smoke.example.json`, and
+`safari-smoke.example.json` each start the respective browser client before
+each RPC server and run it against all six server implementations. Each
+campaign's six cells and four RPC kinds produce 24 functional samples. The
+client first reports its prepared browser origin; the controller passes that
+origin to the server, sends the ready server address back with `CONNECT`, waits
+for `armed`, and then starts measurement.
 
 ### Single-Host Network Emulation
 
@@ -139,7 +141,7 @@ trevrpc-bench report target/bench/native-quic
 
 Peers establish and validate their connection, run warmup, and arm all lanes
 before the controller starts process metrics and sends `START`. WebTransport is
-the exception only during setup: the Chromium peer first prepares its browser
+the exception only during setup: the browser peer first prepares its browser
 origin, then receives `CONNECT HOST:PORT` after the server is ready. The client
 then runs closed-loop operations during a fixed admission window and drains work
 admitted before its deadline. Peak RSS is the highest 10 ms sum of `VmRSS`

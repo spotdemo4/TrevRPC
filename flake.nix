@@ -436,15 +436,47 @@
                 touch $out
               '';
 
-          benchmark-webtransport-smoke =
-            pkgs.runCommand "trevrpc-benchmark-webtransport-smoke"
+          benchmark-chromium-smoke =
+            pkgs.runCommand "trevrpc-benchmark-chromium-smoke"
               {
                 nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
               }
               ''
                 export HOME=$(mktemp -d)
                 export TREVRPC_BENCH_SERVER_WORKERS=8
-                trevrpc-bench run ${./bench/campaigns/webtransport-smoke.example.json} --out run
+                trevrpc-bench run ${./bench/campaigns/chromium-smoke.example.json} --out run
+                test "$(wc -l < run/samples.jsonl)" -eq 24
+                test -s run/aggregate.csv
+                test -s run/report.md
+                test -s run/report.html
+                touch $out
+              '';
+
+          benchmark-firefox-smoke =
+            pkgs.runCommand "trevrpc-benchmark-firefox-smoke"
+              {
+                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
+              }
+              ''
+                export HOME=$(mktemp -d)
+                export TREVRPC_BENCH_SERVER_WORKERS=8
+                trevrpc-bench run ${./bench/campaigns/firefox-smoke.example.json} --out run
+                test "$(wc -l < run/samples.jsonl)" -eq 24
+                test -s run/aggregate.csv
+                test -s run/report.md
+                test -s run/report.html
+                touch $out
+              '';
+
+          benchmark-safari-smoke =
+            pkgs.runCommand "trevrpc-benchmark-safari-smoke"
+              {
+                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
+              }
+              ''
+                export HOME=$(mktemp -d)
+                export TREVRPC_BENCH_SERVER_WORKERS=8
+                trevrpc-bench run ${./bench/campaigns/safari-smoke.example.json} --out run
                 test "$(wc -l < run/samples.jsonl)" -eq 24
                 test -s run/aggregate.csv
                 test -s run/report.md
