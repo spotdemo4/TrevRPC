@@ -54,8 +54,7 @@
     }
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "scripts": {
     "build:native": "TREVRPC_NODE_TEST_HOOKS=OFF npm run build:native:cmake",

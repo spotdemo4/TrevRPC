@@ -30,8 +30,7 @@
   ],
   "main": "trevrpc_native.node",
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "engines": {
     "node": ">=24 <25"

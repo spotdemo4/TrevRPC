@@ -67,13 +67,27 @@ buildNpmPackage (final: {
         native_work="$TMPDIR/native-package"
         cp -R "${nativePackage}/package" "$native_work"
         chmod -R u+w "$native_work"
+        # Forgejo's OIDC issuer is not trusted by npm Sigstore; ensure packed
+        # tarballs never request provenance. Source package.json is already fixed,
+        # but guard against future re-introduction: only CLI --provenance=false
+        # reliably overrides publishConfig.provenance (env vars do not).
+        ${jq}/bin/jq 'del(.publishConfig.provenance)' "$native_work/package.json" > "$native_work/package.json.tmp"
+        mv "$native_work/package.json.tmp" "$native_work/package.json"
+        # Also handle the core package.json in-place before packing.
+        if ${jq}/bin/jq -e '.publishConfig.provenance' package.json >/dev/null 2>&1; then
+          ${jq}/bin/jq 'del(.publishConfig.provenance)' package.json > package.json.tmp
+          mv package.json.tmp package.json
+        fi
         npm pack "$native_work" --pack-destination "$out" >/dev/null
         native_tgz="$out/trevrpc-trevrpc-js-native-linux-x64-gnu-${final.version}.tgz"
         test -f "$native_tgz"
+        # Verify packed tgz does not contain provenance:true.
+        ! tar -xOzf "$native_tgz" package/package.json | ${jq}/bin/jq -e '.publishConfig.provenance == true' >/dev/null 2>&1
 
         core_name="$(npm pack . --pack-destination "$out")"
         test "$core_name" = "trevrpc-trevrpc-js-${final.version}.tgz"
         core_tgz="$out/$core_name"
+        ! tar -xOzf "$core_tgz" package/package.json | ${jq}/bin/jq -e '.publishConfig.provenance == true' >/dev/null 2>&1
 
         dependency_tarballs="$TMPDIR/dependency-tarballs"
         dependency_work="$TMPDIR/dependency-pack-work"

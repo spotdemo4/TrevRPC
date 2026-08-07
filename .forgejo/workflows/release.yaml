@@ -110,10 +110,6 @@ jobs:
       - name: Release to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          # publishConfig.provenance=true would otherwise trigger Sigstore
-          # provenance which requires GitHub OIDC; Forgejo's OIDC issuer is not
-          # trusted by registry.npmjs.org (CA_CREATE_SIGNING_CERTIFICATE_ERROR).
-          NPM_CONFIG_PROVENANCE: "false"
         run: | # zizmor: ignore[use-trusted-publishing]
           set -euo pipefail
           cat "${stage}/manifest.json"
@@ -126,8 +122,14 @@ jobs:
           # NODE_AUTH_TOKEN alone is not sufficient; npm reads auth from .npmrc.
           # `nix-init` does not configure npm auth like `actions/setup-node` does.
           echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
-          npm publish --access public "$native_tgz"
-          npm publish --access public "$core_tgz"
+          # Forgejo's OIDC issuer (trev.zip) is not trusted by registry.npmjs.org
+          # Sigstore/Fulcio, so provenance must be disabled. NPM_CONFIG_PROVENANCE
+          # is insufficient: publishConfig.provenance=true in the packed tarball
+          # overrides env vars via @npmcli/config flatten (only CLI flags win).
+          # Use --provenance=false explicitly and clear any Forgejo-issued tokens.
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN NPM_ID_TOKEN SIGSTORE_ID_TOKEN || true
+          npm publish --provenance=false --access public "$native_tgz"
+          npm publish --provenance=false --access public "$core_tgz"
 
   maven:
     # zizmor: ignore[excessive-permissions]
