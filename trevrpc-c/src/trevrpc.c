@@ -5667,6 +5667,45 @@ static bool trevrpc_handle_stream(trevrpc_server* server,
         return false;
     }
 
+    // Firefox fails both stream directions if cleanup sends STOP_SENDING before it observes the request FIN.
+    if (stream->transport == TREVRPC_TRANSPORT_KIND_WEBTRANSPORT &&
+        (request.kind == TREVRPC_RPC_KIND_UNARY || request.kind == TREVRPC_RPC_KIND_SERVER_STREAMING)) {
+        if (request.timeout_nanos > INT64_MAX) {
+            trevrpc_server_write_failure(
+                stream, request.kind, TREVRPC_STATUS_INVALID_ARGUMENT, "RPC timeout is too large");
+            trevrpc_metrics_record_pre_handler(server, TREVRPC_STATUS_INVALID_ARGUMENT);
+            trevrpc_request_reset(&request);
+            trevrpc_stream_free_body(stream, body);
+            return false;
+        }
+        uint8_t* trailing_body = NULL;
+        size_t trailing_body_len = 0;
+        bool request_completion_expired = false;
+        uint64_t request_completion_timeout = trevrpc_initial_timeout_remaining(
+            options.initial_request_timeout_nanos, accepted_at, &request_completion_expired);
+        if (request.timeout_nanos > 0 &&
+            (request_completion_timeout == 0 || request.timeout_nanos < request_completion_timeout)) {
+            request_completion_timeout = request.timeout_nanos;
+        }
+        intptr_t trailing = TREV_MSQUIC_ERR_TIMEOUT;
+        if (!request_completion_expired) {
+            stream->stream_idle_timeout_nanos = request_completion_timeout;
+            trailing = trevrpc_stream_read_frame_body(stream, &trailing_body, &trailing_body_len);
+        }
+        stream->stream_idle_timeout_nanos = 0;
+        trevrpc_stream_free_body(stream, trailing_body);
+        if (trailing != 0) {
+            const char* message = trailing < 0 ? NULL : "unexpected additional request frame";
+            uint32_t status = trailing < 0 ? trevrpc_transport_status_from_error((int)trailing, &message)
+                                           : TREVRPC_STATUS_INVALID_ARGUMENT;
+            trevrpc_server_write_failure(stream, request.kind, status, message);
+            trevrpc_metrics_record_pre_handler(server, status);
+            trevrpc_request_reset(&request);
+            trevrpc_stream_free_body(stream, body);
+            return false;
+        }
+    }
+
     struct timespec rpc_started_at = {0};
     (void)trevrpc_clock_now(&rpc_started_at);
     trevrpc_metrics_record_started(server, &request);

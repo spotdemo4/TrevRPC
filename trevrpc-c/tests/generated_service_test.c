@@ -566,6 +566,9 @@ static int open_binding_unary_request(
             err = TREV_WT_ERR_CLOSED;
         }
     }
+    if (err == 0) {
+        err = trevrpc_wt_stream_shutdown_send(stream);
+    }
     free(request_frame);
     if (err != 0) {
         trevrpc_wt_stream_close(stream);
@@ -1183,7 +1186,6 @@ static int test_binding_webtransport_unary_graceful_cleanup(void) {
     pthread_mutex_unlock(&actions.mutex);
     CHECK_GOTO(handler_ok);
     CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_SHUTDOWN_GRACEFUL) > 0);
-    CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT_RECEIVE) > 0);
     CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT) == 0);
     CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_CLOSE_STARTED) > 0);
 

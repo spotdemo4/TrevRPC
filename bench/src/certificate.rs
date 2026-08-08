@@ -61,6 +61,11 @@ pub fn generate(output: &Path, server_ips: &[IpAddr]) -> Result<Certificates, Bo
         .args(["-subj", "/CN=localhost", "-addext"])
         .arg(format!("subjectAltName={subject_alt_name}"));
     run(&mut request, "generate benchmark server CSR")?;
+    let extfile = directory.join("server.ext");
+    let ext_content = format!(
+        "basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName={subject_alt_name}\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n"
+    );
+    fs::write(&extfile, ext_content)?;
     run(
         Command::new("openssl")
             .args(["x509", "-req", "-in"])
@@ -72,7 +77,8 @@ pub fn generate(output: &Path, server_ips: &[IpAddr]) -> Result<Certificates, Bo
             .arg("-CAcreateserial")
             .arg("-out")
             .arg(&certificate)
-            .args(["-days", "1", "-copy_extensions", "copyall"]),
+            .args(["-days", "1", "-extfile"])
+            .arg(&extfile),
         "sign benchmark server certificate",
     )?;
     Ok(Certificates {
