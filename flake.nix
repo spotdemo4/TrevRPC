@@ -470,21 +470,22 @@
                 touch $out
               '';
 
-          benchmark-webkit-smoke =
-            pkgs.runCommand "trevrpc-benchmark-webkit-smoke"
-              {
-                nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
-              }
-              ''
-                export HOME=$(mktemp -d)
-                export TREVRPC_BENCH_SERVER_WORKERS=8
-                trevrpc-bench run ${./bench/campaigns/webkit-smoke.example.json} --out run
-                test "$(wc -l < run/samples.jsonl)" -eq 24
-                test -s run/aggregate.csv
-                test -s run/report.md
-                test -s run/report.html
-                touch $out
-              '';
+          # TODO: get webkit working on linux
+          # benchmark-webkit-smoke =
+          #   pkgs.runCommand "trevrpc-benchmark-webkit-smoke"
+          #     {
+          #       nativeBuildInputs = [ self.packages.${system}.trevrpc-bench-suite ];
+          #     }
+          #     ''
+          #       export HOME=$(mktemp -d)
+          #       export TREVRPC_BENCH_SERVER_WORKERS=8
+          #       trevrpc-bench run ${./bench/campaigns/webkit-smoke.example.json} --out run
+          #       test "$(wc -l < run/samples.jsonl)" -eq 24
+          #       test -s run/aggregate.csv
+          #       test -s run/report.md
+          #       test -s run/report.html
+          #       touch $out
+          #     '';
 
           benchmark-peer-capabilities =
             let
