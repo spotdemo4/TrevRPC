@@ -22,7 +22,7 @@
 /trevrpc-go/bin/
 
 # javascript
-/trevrpc-js/node_modules/
+node_modules/
 /trevrpc-js/build/
 
 # kotlin
