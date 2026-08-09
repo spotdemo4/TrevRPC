@@ -9,7 +9,9 @@
 
 #include <errno.h>
 #if defined(__APPLE__)
-#include <mach/mach.h>
+#include <mach/mach_init.h>
+#include <mach/task.h>
+#include <mach/task_info.h>
 #include <sys/resource.h>
 #endif
 #if defined(__GLIBC__)
