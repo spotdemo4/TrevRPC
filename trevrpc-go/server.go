@@ -1153,17 +1153,35 @@ func invokeAuthorizer(ctx context.Context, authorizer Authorizer, request *RpcRe
 	}
 }
 
-func requestContext(ctx context.Context, request *RpcRequest) (context.Context, context.CancelFunc, error) {
+func rpcRequestTimeout(request *RpcRequest) (time.Duration, bool, error) {
 	if request.TimeoutNanos == 0 {
+		return 0, false, nil
+	}
+	if request.TimeoutNanos > math.MaxInt64 {
+		return 0, false, InvalidArgument("RPC timeout is too large")
+	}
+	return time.Duration(request.TimeoutNanos), true, nil
+}
+
+func requestLifetimeContext(ctx context.Context, request *RpcRequest) (context.Context, context.CancelFunc) {
+	timeout, ok, err := rpcRequestTimeout(request)
+	if err != nil || !ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func requestContext(ctx context.Context, request *RpcRequest) (context.Context, context.CancelFunc, error) {
+	timeout, ok, err := rpcRequestTimeout(request)
+	if err != nil {
+		return ctx, func() {}, err
+	}
+	if !ok {
 		ctx, cancel := context.WithCancel(ctx)
 		return contextWithHandlerContext(ctx, request), cancel, nil
 	}
 
-	if request.TimeoutNanos > math.MaxInt64 {
-		return ctx, func() {}, InvalidArgument("RPC timeout is too large")
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(request.TimeoutNanos))
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	return contextWithHandlerContext(ctx, request), cancel, nil
 }
 
@@ -1181,7 +1199,10 @@ func (r *serverRuntime) finishStreamingStatus(service, method string, requestBod
 }
 
 func (r *serverRuntime) recordRejectedRequest(request *RpcRequest, status *Status) {
-	startedAt := time.Now()
+	r.recordRequestFailure(time.Now(), request, status)
+}
+
+func (r *serverRuntime) recordRequestFailure(startedAt time.Time, request *RpcRequest, status *Status) {
 	service, method, requestBodyLen := requestService(request), requestMethod(request), 0
 	if request != nil {
 		requestBodyLen = len(request.Body)

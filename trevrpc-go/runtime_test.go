@@ -985,6 +985,404 @@ func TestResponseStreamCloseRecordsCancelled(t *testing.T) {
 	expectMetrics(t, metrics, CodeCancelled)
 }
 
+func TestServerDrainsFiniteRequestBeforeResponseClose(t *testing.T) {
+	tests := []struct {
+		name      string
+		kind      RpcKind
+		configure func(*Server)
+	}{
+		{
+			name: "unary",
+			kind: RpcKindUnary,
+			configure: func(server *Server) {
+				server.Route("example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
+					return []byte("response"), nil
+				})
+			},
+		},
+		{
+			name: "server streaming",
+			kind: RpcKindServerStreaming,
+			configure: func(server *Server) {
+				server.RouteStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+					return FromSlice([]byte("response")), nil
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer()
+			test.configure(server)
+			request := NewRpcRequest("example.Greeter", "Call", []byte("request"))
+			request.Kind = test.kind
+			var input bytes.Buffer
+			if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
+				t.Fatalf("write request frame: %v", err)
+			}
+			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
+
+			handleRPCStream(context.Background(), server, nil, stream)
+
+			if !stream.readEOF {
+				t.Fatal("expected request EOF to be observed")
+			}
+			if stream.closedBeforeReadEOF {
+				t.Fatal("response closed before request EOF was observed")
+			}
+			if stream.closeCount != 1 {
+				t.Fatalf("expected one response close, got %d", stream.closeCount)
+			}
+			if stream.cancelReadCount != 0 {
+				t.Fatalf("expected graceful request completion, got %d read cancellations", stream.cancelReadCount)
+			}
+		})
+	}
+}
+
+func TestServerFiniteRequestDrainUsesRPCDeadline(t *testing.T) {
+	for _, kind := range []RpcKind{RpcKindUnary, RpcKindServerStreaming} {
+		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
+			server := NewServer()
+			options := DefaultServerOptions()
+			options.InitialRequestTimeout = time.Second
+			server.SetOptions(options)
+			if kind == RpcKindUnary {
+				server.Route("example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
+					time.Sleep(20 * time.Millisecond)
+					return []byte("response"), nil
+				})
+			} else {
+				server.RouteStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+					time.Sleep(20 * time.Millisecond)
+					return FromSlice([]byte("response")), nil
+				})
+			}
+
+			request := NewRpcRequest("example.Greeter", "Call", nil)
+			request.Kind = kind
+			request.TimeoutNanos = uint64(100 * time.Millisecond)
+			var input bytes.Buffer
+			if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
+				t.Fatalf("write request frame: %v", err)
+			}
+			stream := newRequestThenBlockingRPCStream(input.Bytes())
+
+			startedAt := time.Now()
+			handleRPCStream(context.Background(), server, nil, stream)
+			elapsed := time.Since(startedAt)
+
+			if elapsed < 50*time.Millisecond {
+				t.Fatalf("request completed before RPC deadline: %s", elapsed)
+			}
+			if elapsed > 500*time.Millisecond {
+				t.Fatalf("request drain exceeded RPC deadline bound: %s", elapsed)
+			}
+			if stream.cancelReadCount != 1 {
+				t.Fatalf("request read cancellations = %d, want 1", stream.cancelReadCount)
+			}
+			if stream.closeCount != 1 {
+				t.Fatalf("response closes = %d, want 1", stream.closeCount)
+			}
+			if want := []string{"cancel read", "close"}; !slices.Equal(stream.cleanupOrder, want) {
+				t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
+			}
+		})
+	}
+}
+
+func TestServerFiniteRequestDrainReusesInitialRequestDeadline(t *testing.T) {
+	for _, kind := range []RpcKind{RpcKindUnary, RpcKindServerStreaming} {
+		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
+			server := NewServer()
+			options := DefaultServerOptions()
+			options.InitialRequestTimeout = time.Second
+			server.SetOptions(options)
+			if kind == RpcKindUnary {
+				server.Route("example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
+					time.Sleep(20 * time.Millisecond)
+					return []byte("response"), nil
+				})
+			} else {
+				server.RouteStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+					time.Sleep(20 * time.Millisecond)
+					return FromSlice([]byte("response")), nil
+				})
+			}
+
+			request := NewRpcRequest("example.Greeter", "Call", nil)
+			request.Kind = kind
+			var input bytes.Buffer
+			if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
+				t.Fatalf("write request frame: %v", err)
+			}
+			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
+
+			handleRPCStream(context.Background(), server, nil, stream)
+
+			if len(stream.readDeadlines) != 4 {
+				t.Fatalf("read deadlines = %v, want initial set/clear and drain set/clear", stream.readDeadlines)
+			}
+			if stream.readDeadlines[0].IsZero() || stream.readDeadlines[2].IsZero() {
+				t.Fatalf("expected non-zero initial and drain deadlines: %v", stream.readDeadlines)
+			}
+			if !stream.readDeadlines[0].Equal(stream.readDeadlines[2]) {
+				t.Fatalf("drain deadline %s restarted initial deadline %s", stream.readDeadlines[2], stream.readDeadlines[0])
+			}
+			if !stream.readDeadlines[1].IsZero() || !stream.readDeadlines[3].IsZero() {
+				t.Fatalf("read deadlines were not cleared: %v", stream.readDeadlines)
+			}
+		})
+	}
+}
+
+func TestServerRejectsFiniteRequestTrailingDataBeforeHandler(t *testing.T) {
+	tests := []struct {
+		name      string
+		kind      RpcKind
+		configure func(*Server, *bool)
+	}{
+		{
+			name: "unary",
+			kind: RpcKindUnary,
+			configure: func(server *Server, called *bool) {
+				server.Route("example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
+					*called = true
+					return []byte("response"), nil
+				})
+			},
+		},
+		{
+			name: "server streaming",
+			kind: RpcKindServerStreaming,
+			configure: func(server *Server, called *bool) {
+				server.RouteStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+					*called = true
+					return FromSlice([]byte("response")), nil
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer()
+			called := false
+			test.configure(server, &called)
+			request := NewRpcRequest("example.Greeter", "Call", nil)
+			request.Kind = test.kind
+			var input bytes.Buffer
+			if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
+				t.Fatalf("write request frame: %v", err)
+			}
+			input.WriteString("invalid trailing request data")
+			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
+
+			handleRPCStream(context.Background(), server, nil, stream)
+
+			if called {
+				t.Fatal("handler ran before the finite request was validated")
+			}
+			if stream.cancelReadCount != 1 || stream.closeCount != 1 {
+				t.Fatalf("cleanup counts = close %d, cancel read %d; want 1 each", stream.closeCount, stream.cancelReadCount)
+			}
+			if want := []string{"close", "cancel read"}; !slices.Equal(stream.cleanupOrder, want) {
+				t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
+			}
+			if test.kind == RpcKindUnary {
+				response := &RpcResponse{}
+				if err := ReadFrame(bytes.NewReader(stream.written.Bytes()), response, DefaultMaxFrameSize); err != nil {
+					t.Fatalf("read unary rejection: %v", err)
+				}
+				if CodeFromUint32(response.Status) != CodeInvalidArgument {
+					t.Fatalf("unary rejection status = %d, want invalid argument", response.Status)
+				}
+				return
+			}
+			frames := readStreamFramesFromBytes(t, stream.written.Bytes(), DefaultMaxFrameSize)
+			if len(frames) != 1 || frames[0].Kind != RpcStreamFrameKindStatus || CodeFromUint32(frames[0].Status) != CodeInvalidArgument {
+				t.Fatalf("expected invalid argument status, got %#v", frames)
+			}
+		})
+	}
+}
+
+func TestAdmissionRejectedUploadCancelsRead(t *testing.T) {
+	for _, kind := range []RpcKind{RpcKindClientStreaming, RpcKindBidirectionalStreaming} {
+		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
+			server := NewServer()
+			options := DefaultServerOptions()
+			options.MaxConcurrentRequests = 1
+			server.SetOptions(options)
+			runtime := server.freeze()
+			lease, ok := runtime.tryRequestLease(NewRpcRequest("holder", "Call", nil))
+			if !ok {
+				t.Fatal("acquire request lease")
+			}
+			defer lease.release()
+
+			request := NewRpcRequest("example.Greeter", "Call", nil)
+			request.Kind = kind
+			var input bytes.Buffer
+			if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
+				t.Fatalf("write request frame: %v", err)
+			}
+			trailing := []byte("active upload")
+			input.Write(trailing)
+			reader := bytes.NewReader(input.Bytes())
+			stream := &countingRPCStream{reader: reader}
+
+			handleRPCStream(context.Background(), server, nil, stream)
+
+			if reader.Len() != len(trailing) {
+				t.Fatalf("rejected upload consumed %d bytes", len(trailing)-reader.Len())
+			}
+			if stream.cancelReadCount != 1 {
+				t.Fatalf("request read cancellations = %d, want 1", stream.cancelReadCount)
+			}
+			if stream.closeCount != 1 {
+				t.Fatalf("response closes = %d, want 1", stream.closeCount)
+			}
+			if want := []string{"close", "cancel read"}; !slices.Equal(stream.cleanupOrder, want) {
+				t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
+			}
+			frames := readStreamFramesFromBytes(t, stream.written.Bytes(), DefaultMaxFrameSize)
+			if len(frames) != 1 || frames[0].Kind != RpcStreamFrameKindStatus || CodeFromUint32(frames[0].Status) != CodeUnavailable {
+				t.Fatalf("expected unavailable status, got %#v", frames)
+			}
+		})
+	}
+}
+
+func TestAdmissionRejectedFiniteRequestDoesNotWaitForFIN(t *testing.T) {
+	for _, kind := range []RpcKind{RpcKindUnary, RpcKindServerStreaming} {
+		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
+			server := NewServer()
+			options := DefaultServerOptions()
+			options.MaxConcurrentRequests = 1
+			options.DisableInitialRequestTimeout = true
+			server.SetOptions(options)
+			runtime := server.freeze()
+			lease, ok := runtime.tryRequestLease(NewRpcRequest("holder", "Call", nil))
+			if !ok {
+				t.Fatal("acquire request lease")
+			}
+			defer lease.release()
+
+			request := NewRpcRequest("example.Greeter", "Call", nil)
+			request.Kind = kind
+			var input bytes.Buffer
+			if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
+				t.Fatalf("write request frame: %v", err)
+			}
+			stream := newRequestThenBlockingRPCStream(input.Bytes())
+			done := make(chan struct{})
+			go func() {
+				handleRPCStream(context.Background(), server, nil, stream)
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("admission rejection waited for request FIN")
+			}
+			if stream.cancelReadCount != 1 || stream.closeCount != 1 {
+				t.Fatalf("cleanup counts = close %d, cancel read %d; want 1 each", stream.closeCount, stream.cancelReadCount)
+			}
+			if want := []string{"close", "cancel read"}; !slices.Equal(stream.cleanupOrder, want) {
+				t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
+			}
+		})
+	}
+}
+
+func TestServerAbortsRPCStreamOnResponseWriteError(t *testing.T) {
+	writeErr := errors.New("response write failed")
+	tests := []struct {
+		name      string
+		kind      RpcKind
+		configure func(*Server)
+	}{
+		{
+			name: "unary",
+			kind: RpcKindUnary,
+			configure: func(server *Server) {
+				server.Route("example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
+					return []byte("response"), nil
+				})
+			},
+		},
+		{
+			name: "server streaming batch",
+			kind: RpcKindServerStreaming,
+			configure: func(server *Server) {
+				server.RouteStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+					return FromSlice([]byte("response")), nil
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer()
+			test.configure(server)
+			request := NewRpcRequest("example.Greeter", "Call", nil)
+			request.Kind = test.kind
+			var input bytes.Buffer
+			if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
+				t.Fatalf("write request frame: %v", err)
+			}
+			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes()), writeErr: writeErr}
+
+			handleRPCStream(context.Background(), server, nil, stream)
+
+			if stream.cancelReadCount != 1 {
+				t.Fatalf("request read cancellations = %d, want 1", stream.cancelReadCount)
+			}
+			if stream.closeCount != 1 {
+				t.Fatalf("response closes = %d, want 1", stream.closeCount)
+			}
+			if want := []string{"close", "cancel read"}; !slices.Equal(stream.cleanupOrder, want) {
+				t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
+			}
+		})
+	}
+}
+
+func TestServerAbortsRPCStreamOnLocalResponseFrameTooLarge(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.MaxFrameSize = 128
+	server.SetOptions(options)
+	server.Route("example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
+		return make([]byte, 1024), nil
+	})
+	request := NewRpcRequest("example.Greeter", "Call", nil)
+	var input bytes.Buffer
+	if err := WriteFrame(&input, request, options.MaxFrameSize); err != nil {
+		t.Fatalf("write request frame: %v", err)
+	}
+	stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
+
+	handleRPCStream(context.Background(), server, nil, stream)
+
+	if stream.writeCount != 0 {
+		t.Fatalf("transport writes = %d, want 0 for local frame rejection", stream.writeCount)
+	}
+	if stream.cancelReadCount != 1 {
+		t.Fatalf("request read cancellations = %d, want 1", stream.cancelReadCount)
+	}
+	if stream.closeCount != 1 {
+		t.Fatalf("response closes = %d, want 1", stream.closeCount)
+	}
+	if want := []string{"close", "cancel read"}; !slices.Equal(stream.cleanupOrder, want) {
+		t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
+	}
+}
+
 func TestServerResponseBatchWriterBatchesNonBlockingMessages(t *testing.T) {
 	server := NewServer()
 	options := DefaultServerOptions()
@@ -3128,13 +3526,13 @@ func TestServerTransportReadsCancelWithContext(t *testing.T) {
 		{
 			name: "initial request",
 			read: func(ctx context.Context, stream rpcStream) error {
-				return readInitialRequestFrame(ctx, server.Options(), stream, &RpcRequest{})
+				return readInitialRequestFrame(ctx, server.Options(), time.Now(), stream, &RpcRequest{})
 			},
 		},
 		{
-			name: "unary request end",
+			name: "finite request end",
 			read: func(ctx context.Context, stream rpcStream) error {
-				return drainUnaryRequestEnd(ctx, server.Options(), stream)
+				return drainRequestEnd(ctx, server.Options(), time.Now(), stream)
 			},
 		},
 	}
@@ -3590,24 +3988,114 @@ func (w *countingWriter) Write(data []byte) (int, error) {
 }
 
 type countingRPCStream struct {
-	reader     *bytes.Reader
-	written    bytes.Buffer
-	writeCount int
-	closed     bool
+	reader              *bytes.Reader
+	written             bytes.Buffer
+	writeErr            error
+	readCount           int
+	writeCount          int
+	closeCount          int
+	cancelReadCount     int
+	cleanupOrder        []string
+	readDeadlines       []time.Time
+	readEOF             bool
+	closedBeforeReadEOF bool
+	closed              bool
 }
 
 func (s *countingRPCStream) Read(data []byte) (int, error) {
-	return s.reader.Read(data)
+	s.readCount++
+	read, err := s.reader.Read(data)
+	if errors.Is(err, io.EOF) {
+		s.readEOF = true
+	}
+	return read, err
 }
 
 func (s *countingRPCStream) Write(data []byte) (int, error) {
 	s.writeCount++
+	if s.writeErr != nil {
+		return 0, s.writeErr
+	}
 	return s.written.Write(data)
 }
 
+func (s *countingRPCStream) SetReadDeadline(deadline time.Time) error {
+	s.readDeadlines = append(s.readDeadlines, deadline)
+	return nil
+}
+
 func (s *countingRPCStream) Close() error {
+	s.closeCount++
+	s.cleanupOrder = append(s.cleanupOrder, "close")
+	s.closedBeforeReadEOF = !s.readEOF
 	s.closed = true
 	return nil
+}
+
+func (s *countingRPCStream) trevrpcCancelRead() {
+	s.cancelReadCount++
+	s.cleanupOrder = append(s.cleanupOrder, "cancel read")
+}
+
+type requestThenBlockingRPCStream struct {
+	reader          *bytes.Reader
+	written         bytes.Buffer
+	readCancelled   chan struct{}
+	cancelOnce      sync.Once
+	cleanupMu       sync.Mutex
+	cleanupOrder    []string
+	cancelReadCount int
+	closeCount      int
+}
+
+func newRequestThenBlockingRPCStream(request []byte) *requestThenBlockingRPCStream {
+	return &requestThenBlockingRPCStream{
+		reader:        bytes.NewReader(request),
+		readCancelled: make(chan struct{}),
+	}
+}
+
+func (s *requestThenBlockingRPCStream) Read(data []byte) (int, error) {
+	if s.reader.Len() > 0 {
+		return s.reader.Read(data)
+	}
+	<-s.readCancelled
+	return 0, errors.New("transport read cancelled")
+}
+
+func (s *requestThenBlockingRPCStream) Write(data []byte) (int, error) {
+	return s.written.Write(data)
+}
+
+func (s *requestThenBlockingRPCStream) Close() error {
+	s.cleanupMu.Lock()
+	s.closeCount++
+	s.cleanupOrder = append(s.cleanupOrder, "close")
+	s.cleanupMu.Unlock()
+	return nil
+}
+
+func (s *requestThenBlockingRPCStream) trevrpcCancelRead() {
+	s.cancelOnce.Do(func() {
+		s.cleanupMu.Lock()
+		s.cancelReadCount++
+		s.cleanupOrder = append(s.cleanupOrder, "cancel read")
+		s.cleanupMu.Unlock()
+		close(s.readCancelled)
+	})
+}
+
+func (s *requestThenBlockingRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.trevrpcCancelRead()
+		case <-done:
+		}
+	}()
+	return func() { stopOnce.Do(func() { close(done) }) }
 }
 
 func readStreamFramesFromBytes(t *testing.T, data []byte, maxFrameSize int) []*RpcStreamFrame {

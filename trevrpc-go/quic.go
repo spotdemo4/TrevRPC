@@ -505,31 +505,46 @@ func handleRPCStream(ctx context.Context, server *Server, _ semaphore, stream rp
 	runtime := server.freeze()
 	startedAt := time.Now()
 	request := &RpcRequest{}
-	if err := readInitialRequestFrame(ctx, runtime.options, stream, request); err != nil {
+	if err := readInitialRequestFrame(ctx, runtime.options, startedAt, stream, request); err != nil {
 		status := requestFrameStatus(err)
 		runtime.recordPreHandlerFailure(startedAt, status)
 		_ = WriteFrame(stream, status.IntoResponse(nil), runtime.options.MaxFrameSize)
-		_ = stream.Close()
+		abortRPCStream(stream)
 		return
 	}
+	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
+	defer cancelRequest()
+
 	lease, ok := runtime.tryRequestLease(request)
 	if !ok {
 		status := Unavailable("too many concurrent RPCs")
 		runtime.recordRejectedRequest(request, status)
-		writeRPCStatus(stream, request, status, runtime.options.MaxFrameSize)
+		writeRPCStatus(runtime.options, stream, request, status)
 		return
+	}
+
+	if requestEndsAfterInitialFrame(request.RPCKind()) {
+		if err := drainRequestEnd(requestCtx, runtime.options, startedAt, stream); err != nil {
+			status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
+			lease.release()
+			runtime.recordRequestFailure(startedAt, request, status)
+			writeRPCStatus(runtime.options, stream, request, status)
+			return
+		}
 	}
 
 	if request.RPCKind() == RpcKindUnary {
 		defer lease.release()
-		response := runtime.handleRequest(ctx, request, lease)
+		response := runtime.handleRequest(requestCtx, request, lease)
 		if ctx.Err() != nil {
+			abortRPCStream(stream)
 			return
 		}
-		if err := WriteFrame(stream, response, runtime.options.MaxFrameSize); err == nil {
-			_ = drainUnaryRequestEnd(ctx, runtime.options, stream)
-			_ = stream.Close()
+		if err := WriteFrame(stream, response, runtime.options.MaxFrameSize); err != nil {
+			abortRPCStream(stream)
+			return
 		}
+		_ = stream.Close()
 		return
 	}
 
@@ -542,16 +557,18 @@ func handleRPCStream(ctx context.Context, server *Server, _ semaphore, stream rp
 			requestBody.cancelRead = cancellable.trevrpcCancelRead
 		}
 	}
-	response := runtime.handleStreamingRequest(ctx, request, requestBody, lease)
+	response := runtime.handleStreamingRequest(requestCtx, request, requestBody, lease)
 	defer closeMessageStream(response)
 	if frameWriter, ok := response.(transportResponseFramesWriter); ok {
 		for {
 			done, err := frameWriter.trevrpcWriteNextFrames(ctx, stream, runtime.options.MaxFrameSize)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				closeMessageStream(response)
+				abortRPCStream(stream)
 				return
 			}
 			if err != nil {
+				abortRPCStream(stream)
 				return
 			}
 			if done {
@@ -567,9 +584,11 @@ func handleRPCStream(ctx context.Context, server *Server, _ semaphore, stream rp
 			done, err := frameWriter.trevrpcWriteNextFrame(ctx, stream, runtime.options.MaxFrameSize)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				closeMessageStream(response)
+				abortRPCStream(stream)
 				return
 			}
 			if err != nil {
+				abortRPCStream(stream)
 				return
 			}
 			if done {
@@ -587,6 +606,7 @@ func handleRPCStream(ctx context.Context, server *Server, _ semaphore, stream rp
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			closeMessageStream(response)
+			abortRPCStream(stream)
 			return
 		}
 
@@ -596,6 +616,7 @@ func handleRPCStream(ctx context.Context, server *Server, _ semaphore, stream rp
 
 		isStatus := frame.Kind == RpcStreamFrameKindStatus
 		if err := WriteFrame(stream, frame, runtime.options.MaxFrameSize); err != nil {
+			abortRPCStream(stream)
 			return
 		}
 
@@ -698,11 +719,11 @@ type readDeadlineStream interface {
 	SetReadDeadline(time.Time) error
 }
 
-func readInitialRequestFrame(ctx context.Context, options ServerOptions, stream rpcStream, request *RpcRequest) error {
+func readInitialRequestFrame(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream, request *RpcRequest) error {
 	stopCancelRead := cancelReadOnContext(ctx, stream)
 	defer stopCancelRead()
 
-	if deadline, ok := readDeadline(ctx, options.InitialRequestTimeout); ok {
+	if deadline, ok := readDeadline(ctx, startedAt, options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
 			defer deadlineStream.SetReadDeadline(time.Time{})
@@ -716,10 +737,10 @@ func readInitialRequestFrame(ctx context.Context, options ServerOptions, stream 
 	return err
 }
 
-func readDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) {
+func readDeadline(ctx context.Context, startedAt time.Time, timeout time.Duration) (time.Time, bool) {
 	deadline, ok := ctx.Deadline()
 	if timeout > 0 {
-		requestDeadline := time.Now().Add(timeout)
+		requestDeadline := startedAt.Add(timeout)
 		if !ok || requestDeadline.Before(deadline) {
 			deadline = requestDeadline
 			ok = true
@@ -729,11 +750,14 @@ func readDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) 
 	return deadline, ok
 }
 
-func drainUnaryRequestEnd(ctx context.Context, options ServerOptions, stream rpcStream) error {
+func drainRequestEnd(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream) error {
 	stopCancelRead := cancelReadOnContext(ctx, stream)
 	defer stopCancelRead()
+	return readRequestEnd(ctx, options, startedAt, stream)
+}
 
-	if deadline, ok := readDeadline(ctx, options.InitialRequestTimeout); ok {
+func readRequestEnd(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream) error {
+	if deadline, ok := readDeadline(ctx, startedAt, options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
 			defer deadlineStream.SetReadDeadline(time.Time{})
@@ -744,7 +768,7 @@ func drainUnaryRequestEnd(ctx context.Context, options ServerOptions, stream rpc
 	for {
 		read, err := stream.Read(buf[:])
 		if read > 0 {
-			return InvalidArgument("unary request stream contained data after the initial request frame")
+			return InvalidArgument("request stream contained data after the initial request frame")
 		}
 		if errors.Is(err, io.EOF) {
 			return nil
@@ -753,6 +777,15 @@ func drainUnaryRequestEnd(ctx context.Context, options ServerOptions, stream rpc
 			return transportOrContextStatus(ctx, err)
 		}
 	}
+}
+
+func requestEndsAfterInitialFrame(kind RpcKind) bool {
+	return kind == RpcKindUnary || kind == RpcKindServerStreaming
+}
+
+func abortRPCStream(stream rpcStream) {
+	_ = stream.Close()
+	cancelStreamRead(stream)
 }
 
 func cancelReadOnContext(ctx context.Context, stream rpcStream) func() {
@@ -764,17 +797,16 @@ func cancelReadOnContext(ctx context.Context, stream rpcStream) func() {
 
 func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {
 	_ = WriteFrame(stream, status.IntoResponse(nil), maxFrameSize)
-	_ = stream.Close()
+	abortRPCStream(stream)
 }
 
-func writeRPCStatus(stream rpcStream, request *RpcRequest, status *Status, maxFrameSize int) {
+func writeRPCStatus(options ServerOptions, stream rpcStream, request *RpcRequest, status *Status) {
 	if request.RPCKind() == RpcKindUnary {
-		writeStatusResponse(stream, status, maxFrameSize)
-		return
+		_ = WriteFrame(stream, status.IntoResponse(nil), options.MaxFrameSize)
+	} else {
+		_ = WriteFrame(stream, StatusFrame(status), options.MaxFrameSize)
 	}
-
-	_ = WriteFrame(stream, StatusFrame(status), maxFrameSize)
-	_ = stream.Close()
+	abortRPCStream(stream)
 }
 
 type rpcRequestStream struct {
