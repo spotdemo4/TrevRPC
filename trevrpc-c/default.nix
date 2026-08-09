@@ -164,7 +164,9 @@ stdenv.mkDerivation (
       protoc -I tests/install/codegen \
         --plugin=protoc-gen-trevrpc-c="$out/bin/protoc-gen-trevrpc-c" \
         --trevrpc-c_out="$syntax_codegen" tests/install/codegen/greeter.proto
-      cc -std=c11 -Wall -Wextra -Werror -fsyntax-only \
+      cc -std=c11 -Wall -Wextra -Werror \
+        ${optionalString stdenv.cc.isClang "-Wno-unused-command-line-argument"} \
+        -fsyntax-only \
         -I"$syntax_codegen" \
         $(pkg-config --cflags trevrpc libprotobuf-c) \
         tests/install/codegen/main.c \
