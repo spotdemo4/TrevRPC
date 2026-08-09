@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE 700
+#define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc_runtime_internal.h"
 
@@ -15,15 +15,68 @@
         }                                                                                                              \
     } while (0)
 
+typedef struct test_barrier {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    size_t participants;
+    size_t arrived;
+} test_barrier;
+
 typedef struct stream_race_user {
-    pthread_barrier_t* barrier;
+    test_barrier* barrier;
     trevrpc_stream* stream;
     int result;
 } stream_race_user;
 
-static int barrier_wait(pthread_barrier_t* barrier) {
-    int err = pthread_barrier_wait(barrier);
-    return err == 0 || err == PTHREAD_BARRIER_SERIAL_THREAD ? 0 : err;
+static int barrier_init(test_barrier* barrier, size_t participants) {
+    if (participants == 0) {
+        return EINVAL;
+    }
+
+    int err = pthread_mutex_init(&barrier->mutex, NULL);
+    if (err != 0) {
+        return err;
+    }
+    err = pthread_cond_init(&barrier->condition, NULL);
+    if (err != 0) {
+        pthread_mutex_destroy(&barrier->mutex);
+        return err;
+    }
+    barrier->participants = participants;
+    barrier->arrived = 0;
+    return 0;
+}
+
+static int barrier_wait(test_barrier* barrier) {
+    int err = pthread_mutex_lock(&barrier->mutex);
+    if (err != 0) {
+        return err;
+    }
+
+    if (barrier->arrived == barrier->participants) {
+        err = EINVAL;
+    } else {
+        barrier->arrived++;
+        if (barrier->arrived == barrier->participants) {
+            err = pthread_cond_broadcast(&barrier->condition);
+        } else {
+            while (barrier->arrived < barrier->participants) {
+                err = pthread_cond_wait(&barrier->condition, &barrier->mutex);
+                if (err != 0) {
+                    break;
+                }
+            }
+        }
+    }
+
+    int unlock_err = pthread_mutex_unlock(&barrier->mutex);
+    return err != 0 ? err : unlock_err;
+}
+
+static int barrier_destroy(test_barrier* barrier) {
+    int condition_err = pthread_cond_destroy(&barrier->condition);
+    int mutex_err = pthread_mutex_destroy(&barrier->mutex);
+    return condition_err != 0 ? condition_err : mutex_err;
 }
 
 static void* send_main(void* context) {
@@ -73,8 +126,8 @@ static int test_send_status_cancel_race(void) {
     trevrpc_scripted_stream_source* source = NULL;
     CHECK(trevrpc_scripted_stream_new(NULL, 0, 0, 1024, &stream, &source) == 0);
 
-    pthread_barrier_t barrier;
-    CHECK(pthread_barrier_init(&barrier, NULL, 5) == 0);
+    test_barrier barrier;
+    CHECK(barrier_init(&barrier, 5) == 0);
     stream_race_user users[4] = {
         {.barrier = &barrier, .stream = stream},
         {.barrier = &barrier, .stream = stream},
@@ -92,7 +145,7 @@ static int test_send_status_cancel_race(void) {
         CHECK(pthread_join(threads[i], NULL) == 0);
         CHECK(users[i].result == 0);
     }
-    CHECK(pthread_barrier_destroy(&barrier) == 0);
+    CHECK(barrier_destroy(&barrier) == 0);
     CHECK(trevrpc_stream_send_message(stream, NULL, 0) == -EPIPE);
 
     trevrpc_stream_close(stream);
