@@ -73,7 +73,7 @@ val configuredProtoc = providers.gradleProperty("trevrpcProtocPath")
 protobuf {
     protoc {
         if (configuredProtoc.isPresent) {
-            val protocFile = file(configuredProtoc.get())
+            val protocFile = rootProject.file(configuredProtoc.get())
             require(protocFile.isFile && protocFile.canExecute()) {
                 "trevrpcProtocPath must name an executable protoc binary: $protocFile"
             }

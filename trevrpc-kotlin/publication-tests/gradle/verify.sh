@@ -9,6 +9,18 @@ work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 cache_seed=${TREVRPC_GRADLE_CACHE_SEED:-}
 read -r -a metadata_modes <<<"${TREVRPC_GRADLE_METADATA_MODES:-gradle pom}"
+protoc_args=()
+if [[ -n "${TREVRPC_PROTOC_PATH:-}" ]]; then
+  [[ "$TREVRPC_PROTOC_PATH" = /* ]] || {
+    echo "TREVRPC_PROTOC_PATH must be absolute: $TREVRPC_PROTOC_PATH" >&2
+    exit 1
+  }
+  [[ -f "$TREVRPC_PROTOC_PATH" && -x "$TREVRPC_PROTOC_PATH" ]] || {
+    echo "TREVRPC_PROTOC_PATH must name an executable file: $TREVRPC_PROTOC_PATH" >&2
+    exit 1
+  }
+  protoc_args+=("-PtrevrpcProtocPath=$TREVRPC_PROTOC_PATH")
+fi
 
 resolve_trevrpc_version() {
   if [[ -n "${TREVRPC_VERSION:-}" ]]; then echo "$TREVRPC_VERSION"; return; fi
@@ -41,6 +53,7 @@ for metadata in "${metadata_modes[@]}"; do
   GRADLE_USER_HOME="$gradle_user_home" \
     "$gradle_bin" \
       "${gradle_args[@]}" \
+      "${protoc_args[@]}" \
       --project-dir "$project_dir" \
       --project-cache-dir "$work_dir/project-cache-$metadata" \
       --no-configuration-cache \

@@ -45,4 +45,15 @@ maven_args=(
 if [[ -n "${MAVEN_SETTINGS:-}" && -f "$MAVEN_SETTINGS" ]]; then
   maven_args+=(-s "$MAVEN_SETTINGS")
 fi
+if [[ -n "${TREVRPC_PROTOC_PATH:-}" ]]; then
+  [[ "$TREVRPC_PROTOC_PATH" = /* ]] || {
+    echo "TREVRPC_PROTOC_PATH must be absolute: $TREVRPC_PROTOC_PATH" >&2
+    exit 1
+  }
+  [[ -f "$TREVRPC_PROTOC_PATH" && -x "$TREVRPC_PROTOC_PATH" ]] || {
+    echo "TREVRPC_PROTOC_PATH must name an executable file: $TREVRPC_PROTOC_PATH" >&2
+    exit 1
+  }
+  maven_args+=("-DprotocExecutable=$TREVRPC_PROTOC_PATH")
+fi
 "$maven_bin" "${maven_args[@]}" clean verify

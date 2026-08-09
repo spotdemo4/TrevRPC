@@ -71,9 +71,19 @@ val prepareGenerator =
         }
     }
 
+val configuredProtoc = providers.gradleProperty("trevrpcProtocPath")
+
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:4.35.1"
+        if (configuredProtoc.isPresent) {
+            val protocFile = rootProject.file(configuredProtoc.get())
+            require(protocFile.isFile && protocFile.canExecute()) {
+                "trevrpcProtocPath must name an executable protoc binary: $protocFile"
+            }
+            path = protocFile.absolutePath
+        } else {
+            artifact = "com.google.protobuf:protoc:4.35.1"
+        }
     }
     plugins {
         id("trevrpc-kotlin") {

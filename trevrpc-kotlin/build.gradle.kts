@@ -38,6 +38,14 @@ val signingPassword =
         .orElse("")
         .get()
 val isSigningEnabled = !signingKey.isNullOrBlank()
+val configuredProtocPath =
+    providers.gradleProperty("trevrpcProtocPath").orNull?.let { configured ->
+        val protocFile = file(configured)
+        require(protocFile.isFile && protocFile.canExecute()) {
+            "trevrpcProtocPath must name an executable protoc binary: $protocFile"
+        }
+        protocFile.absolutePath
+    }
 
 allprojects {
     group = "zip.trev.trevrpc"
@@ -241,6 +249,7 @@ tasks.register<Exec>("verifyGradleConsumers") {
     dependsOn(verifyStagedMavenRepository)
     environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
     environment("TREVRPC_VERSION", project.version.toString())
+    configuredProtocPath?.let { environment("TREVRPC_PROTOC_PATH", it) }
     commandLine("bash", layout.projectDirectory.file("publication-tests/gradle/verify.sh").asFile)
 }
 
@@ -250,6 +259,7 @@ tasks.register<Exec>("verifyMavenConsumers") {
     dependsOn(verifyStagedMavenRepository)
     environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
     environment("TREVRPC_VERSION", project.version.toString())
+    configuredProtocPath?.let { environment("TREVRPC_PROTOC_PATH", it) }
     providers.environmentVariable("MAVEN_SETTINGS").orNull?.let { environment("MAVEN_SETTINGS", it) }
     providers.environmentVariable("MAVEN_OPTS").orNull?.let { environment("MAVEN_OPTS", it) }
     commandLine("bash", layout.projectDirectory.file("publication-tests/maven/verify.sh").asFile)

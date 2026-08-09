@@ -61,13 +61,22 @@ val trevrpcPlugin =
     project(":protoc-gen-trevrpc-kotlin")
         .layout.buildDirectory
         .file("install/protoc-gen-trevrpc-kotlin/bin/protoc-gen-trevrpc-kotlin")
+val configuredProtoc = providers.gradleProperty("trevrpcProtocPath")
 
 protobuf {
     protoc {
-        artifact =
-            libs.protobuf.protoc
-                .get()
-                .toString()
+        if (configuredProtoc.isPresent) {
+            val protocFile = rootProject.file(configuredProtoc.get())
+            require(protocFile.isFile && protocFile.canExecute()) {
+                "trevrpcProtocPath must name an executable protoc binary: $protocFile"
+            }
+            path = protocFile.absolutePath
+        } else {
+            artifact =
+                libs.protobuf.protoc
+                    .get()
+                    .toString()
+        }
     }
     plugins {
         id("trevrpc-kotlin") {

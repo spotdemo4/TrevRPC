@@ -35,12 +35,22 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
+val configuredProtoc = providers.gradleProperty("trevrpcProtocPath")
+
 protobuf {
     protoc {
-        artifact =
-            libs.protobuf.protoc
-                .get()
-                .toString()
+        if (configuredProtoc.isPresent) {
+            val protocFile = rootProject.file(configuredProtoc.get())
+            require(protocFile.isFile && protocFile.canExecute()) {
+                "trevrpcProtocPath must name an executable protoc binary: $protocFile"
+            }
+            path = protocFile.absolutePath
+        } else {
+            artifact =
+                libs.protobuf.protoc
+                    .get()
+                    .toString()
+        }
     }
 }
 
