@@ -1092,6 +1092,22 @@ func TestServerFiniteRequestDrainUsesRPCDeadline(t *testing.T) {
 	}
 }
 
+func TestFiniteRequestDrainMapsInitialTimeoutToDeadlineExceeded(t *testing.T) {
+	options := DefaultServerOptions()
+	err := drainRequestEnd(context.Background(), options, time.Now(), timeoutRPCStream{err: os.ErrDeadlineExceeded})
+	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
+		t.Fatalf("finite request timeout status = %v, want deadline exceeded", code)
+	}
+}
+
+func TestFiniteRequestDrainPreservesTransportTimeout(t *testing.T) {
+	options := DefaultServerOptions()
+	err := drainRequestEnd(context.Background(), options, time.Now(), timeoutRPCStream{err: &quic.IdleTimeoutError{}})
+	if code := StatusFromError(err).Code; code != CodeUnavailable {
+		t.Fatalf("finite request transport timeout status = %v, want unavailable", code)
+	}
+}
+
 func TestServerFiniteRequestDrainReusesInitialRequestDeadline(t *testing.T) {
 	for _, kind := range []RpcKind{RpcKindUnary, RpcKindServerStreaming} {
 		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
@@ -1255,23 +1271,23 @@ func TestAdmissionRejectedUploadCancelsRead(t *testing.T) {
 	}
 }
 
-func TestAdmissionRejectedFiniteRequestDoesNotWaitForFIN(t *testing.T) {
-	for _, kind := range []RpcKind{RpcKindUnary, RpcKindServerStreaming} {
-		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
+func TestMalformedFiniteRequestDoesNotWaitForFIN(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*RpcRequest)
+	}{
+		{name: "invalid kind", configure: func(request *RpcRequest) { request.Kind = RpcKind(99) }},
+		{name: "oversized timeout", configure: func(request *RpcRequest) { request.TimeoutNanos = math.MaxInt64 + 1 }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			server := NewServer()
 			options := DefaultServerOptions()
-			options.MaxConcurrentRequests = 1
 			options.DisableInitialRequestTimeout = true
 			server.SetOptions(options)
-			runtime := server.freeze()
-			lease, ok := runtime.tryRequestLease(NewRpcRequest("holder", "Call", nil))
-			if !ok {
-				t.Fatal("acquire request lease")
-			}
-			defer lease.release()
-
 			request := NewRpcRequest("example.Greeter", "Call", nil)
-			request.Kind = kind
+			test.configure(request)
 			var input bytes.Buffer
 			if err := WriteFrame(&input, request, DefaultMaxFrameSize); err != nil {
 				t.Fatalf("write request frame: %v", err)
@@ -1286,13 +1302,20 @@ func TestAdmissionRejectedFiniteRequestDoesNotWaitForFIN(t *testing.T) {
 			select {
 			case <-done:
 			case <-time.After(500 * time.Millisecond):
-				t.Fatal("admission rejection waited for request FIN")
+				t.Fatal("malformed request waited for request FIN")
 			}
 			if stream.cancelReadCount != 1 || stream.closeCount != 1 {
 				t.Fatalf("cleanup counts = close %d, cancel read %d; want 1 each", stream.closeCount, stream.cancelReadCount)
 			}
 			if want := []string{"close", "cancel read"}; !slices.Equal(stream.cleanupOrder, want) {
 				t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
+			}
+			response := &RpcResponse{}
+			if err := ReadFrame(bytes.NewReader(stream.written.Bytes()), response, DefaultMaxFrameSize); err != nil {
+				t.Fatalf("read malformed request response: %v", err)
+			}
+			if CodeFromUint32(response.Status) != CodeInvalidArgument {
+				t.Fatalf("response status = %d, want invalid argument", response.Status)
 			}
 		})
 	}
@@ -3986,6 +4009,13 @@ func (w *countingWriter) Write(data []byte) (int, error) {
 	w.writeCount++
 	return w.Buffer.Write(data)
 }
+
+type timeoutRPCStream struct{ err error }
+
+func (s timeoutRPCStream) Read([]byte) (int, error)      { return 0, s.err }
+func (timeoutRPCStream) Write(data []byte) (int, error)  { return len(data), nil }
+func (timeoutRPCStream) Close() error                    { return nil }
+func (timeoutRPCStream) SetReadDeadline(time.Time) error { return nil }
 
 type countingRPCStream struct {
 	reader              *bytes.Reader

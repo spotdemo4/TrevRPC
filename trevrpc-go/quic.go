@@ -512,25 +512,30 @@ func handleRPCStream(ctx context.Context, server *Server, _ semaphore, stream rp
 		abortRPCStream(stream)
 		return
 	}
-	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
-	defer cancelRequest()
-
-	lease, ok := runtime.tryRequestLease(request)
-	if !ok {
-		status := Unavailable("too many concurrent RPCs")
-		runtime.recordRejectedRequest(request, status)
+	if err := validateRequest(request); err != nil {
+		status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
+		runtime.recordRequestFailure(startedAt, request, status)
 		writeRPCStatus(runtime.options, stream, request, status)
 		return
 	}
+	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
+	defer cancelRequest()
 
 	if requestEndsAfterInitialFrame(request.RPCKind()) {
 		if err := drainRequestEnd(requestCtx, runtime.options, startedAt, stream); err != nil {
 			status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
-			lease.release()
 			runtime.recordRequestFailure(startedAt, request, status)
 			writeRPCStatus(runtime.options, stream, request, status)
 			return
 		}
+	}
+
+	lease, ok := runtime.tryRequestLease(request)
+	if !ok {
+		status := Unavailable("too many concurrent RPCs")
+		runtime.recordRejectedRequest(startedAt, request, status)
+		writeRPCStatus(runtime.options, stream, request, status)
+		return
 	}
 
 	if request.RPCKind() == RpcKindUnary {
@@ -774,7 +779,13 @@ func readRequestEnd(ctx context.Context, options ServerOptions, startedAt time.T
 			return nil
 		}
 		if err != nil {
-			return transportOrContextStatus(ctx, err)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return statusFromContextError(ctxErr)
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				return DeadlineExceeded("initial request completion timeout")
+			}
+			return transportStatus(err)
 		}
 	}
 }

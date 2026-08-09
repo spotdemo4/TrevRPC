@@ -1103,11 +1103,19 @@ func handlerNeedsDeadlineRace(ctx context.Context) bool {
 	return ok
 }
 
-func (r *serverRuntime) prepareRequest(ctx context.Context, request *RpcRequest, lease *requestExecutionLease) (context.Context, context.CancelFunc, error) {
+func validateRequest(request *RpcRequest) error {
 	if err := ValidateMetadata(request.Metadata); err != nil {
-		return ctx, func() {}, err
+		return err
 	}
 	if err := request.ValidateProtocol(); err != nil {
+		return err
+	}
+	_, _, err := rpcRequestTimeout(request)
+	return err
+}
+
+func (r *serverRuntime) prepareRequest(ctx context.Context, request *RpcRequest, lease *requestExecutionLease) (context.Context, context.CancelFunc, error) {
+	if err := validateRequest(request); err != nil {
 		return ctx, func() {}, err
 	}
 	ctx, cancel, err := requestContext(ctx, request)
@@ -1198,8 +1206,8 @@ func (r *serverRuntime) finishStreamingStatus(service, method string, requestBod
 	return StatusStream(status)
 }
 
-func (r *serverRuntime) recordRejectedRequest(request *RpcRequest, status *Status) {
-	r.recordRequestFailure(time.Now(), request, status)
+func (r *serverRuntime) recordRejectedRequest(startedAt time.Time, request *RpcRequest, status *Status) {
+	r.recordRequestFailure(startedAt, request, status)
 }
 
 func (r *serverRuntime) recordRequestFailure(startedAt time.Time, request *RpcRequest, status *Status) {
