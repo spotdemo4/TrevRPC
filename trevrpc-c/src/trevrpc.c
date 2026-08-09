@@ -580,6 +580,7 @@ trevrpc_call_options_internal trevrpc_internal_default_call_options(void) {
 
 #ifdef TREVRPC_TESTING
 static int trevrpc_test_call_context_init_error;
+static atomic_bool trevrpc_test_force_next_call_context_deadline_expired_enabled;
 static trevrpc_test_stream_send_hook trevrpc_test_stream_send_callback;
 static void* trevrpc_test_stream_send_callback_context;
 static trevrpc_test_call_insert_hook trevrpc_test_call_insert_callback;
@@ -703,6 +704,8 @@ static int trevrpc_call_context_init(
     context->has_deadline = false;
     context->deadline = (struct timespec){0};
 #ifdef TREVRPC_TESTING
+    bool force_deadline_expired = atomic_exchange_explicit(
+        &trevrpc_test_force_next_call_context_deadline_expired_enabled, false, memory_order_relaxed);
     if (trevrpc_test_call_context_init_error != 0) {
         int err = trevrpc_test_call_context_init_error;
         trevrpc_test_call_context_init_error = 0;
@@ -739,6 +742,11 @@ static int trevrpc_call_context_init(
     }
 
     context->has_deadline = true;
+#ifdef TREVRPC_TESTING
+    if (force_deadline_expired) {
+        context->deadline = now;
+    }
+#endif
     return 0;
 }
 
@@ -3975,6 +3983,11 @@ const uint8_t* trevrpc_test_server_last_envelope(trevrpc_server* server, size_t*
 
 void trevrpc_test_fail_next_call_context_init(int err) {
     trevrpc_test_call_context_init_error = err;
+}
+
+void trevrpc_test_force_next_call_context_deadline_expired(bool enabled) {
+    atomic_store_explicit(
+        &trevrpc_test_force_next_call_context_deadline_expired_enabled, enabled, memory_order_relaxed);
 }
 
 int trevrpc_test_server_wait_from_callback(trevrpc_server* server) {
