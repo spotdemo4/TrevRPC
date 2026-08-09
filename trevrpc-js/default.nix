@@ -1,5 +1,6 @@
 {
   lib,
+  stdenv,
   buildNpmPackage,
   importNpmLock,
   nodejs_24,
@@ -84,6 +85,10 @@ buildNpmPackage (final: {
       mkdir -p "$(dirname "$native_dir")"
       cp -R "${nativePackage}/package" "$native_dir"
     ''}
+    ${lib.optionalString stdenv.hostPlatform.isDarwin ''
+      install -Dm755 build/native/trevrpc_native.node \
+        "$out/lib/node_modules/@trevrpc/trevrpc-js/native/trevrpc_native.node"
+    ''}
 
     mkdir -p "$out/lib/node_modules/trevrpc-bench-peer-js/node_modules/@trevrpc"
     cp bench/package.json bench/common.js bench/trevrpc-bench-peer.js \
@@ -104,9 +109,25 @@ buildNpmPackage (final: {
   installCheckPhase = ''
     runHook preInstallCheck
     ! grep -q '@grpc/' package.json
-    ${nodejs_24}/bin/node --input-type=module -e \
-      'import(process.argv[1]).then((module) => module.loadNativeAddon())' \
-      "$out/lib/node_modules/@trevrpc/trevrpc-js/src/native-loader.js"
+    loader="$out/lib/node_modules/@trevrpc/trevrpc-js/src/native-loader.js"
+    ${lib.optionalString stdenv.hostPlatform.isDarwin ''
+      expected_native="$out/lib/node_modules/@trevrpc/trevrpc-js/native/trevrpc_native.node"
+      test -f "$expected_native"
+      test ! -e "$out/lib/node_modules/@trevrpc/trevrpc-js/node_modules/@trevrpc/trevrpc-js-native-linux-x64-gnu"
+    ''}
+    ${lib.optionalString (nativePackage != null) ''
+      expected_native="$out/lib/node_modules/@trevrpc/trevrpc-js/node_modules/@trevrpc/trevrpc-js-native-linux-x64-gnu/trevrpc_native.node"
+      test -f "$expected_native"
+      test ! -e "$out/lib/node_modules/@trevrpc/trevrpc-js/native/trevrpc_native.node"
+    ''}
+    ${nodejs_24}/bin/node --input-type=module -e '
+      import assert from "node:assert/strict";
+      import { createRequire } from "node:module";
+      import { pathToFileURL } from "node:url";
+      const require = createRequire(import.meta.url);
+      const { loadNativeAddon } = await import(pathToFileURL(process.argv[1]));
+      assert.strictEqual(loadNativeAddon(), require(process.argv[2]));
+    ' "$loader" "$expected_native"
     test -x "$out/bin/trevrpc-bench-peer-js"
     test -x "$out/bin/trevrpc-conformance-js"
     printf 'STOP\n' | "$out/bin/trevrpc-conformance-js" --protocol 1 > peer.out

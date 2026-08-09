@@ -4,6 +4,10 @@
 #include "trevrpc_raw.h"
 
 #include <errno.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/resource.h>
+#endif
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -135,6 +139,24 @@ static void sleep_millis(uint64_t millis) {
 }
 
 static size_t process_status_kib(const char* key) {
+#if defined(__APPLE__)
+    if (strcmp(key, "VmRSS") == 0) {
+        mach_task_basic_info_data_t info = {0};
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) {
+            return 0;
+        }
+        return (size_t)(info.resident_size / 1024u);
+    }
+    if (strcmp(key, "VmHWM") == 0) {
+        struct rusage usage = {0};
+        if (getrusage(RUSAGE_SELF, &usage) != 0) {
+            return 0;
+        }
+        return (size_t)((uint64_t)usage.ru_maxrss / 1024u);
+    }
+    return 0;
+#else
     FILE* status = fopen("/proc/self/status", "r");
     if (status == NULL) {
         return 0;
@@ -151,6 +173,7 @@ static size_t process_status_kib(const char* key) {
     }
     fclose(status);
     return value;
+#endif
 }
 
 static int parse_size(const char* value, size_t* out) {

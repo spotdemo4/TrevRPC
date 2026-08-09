@@ -112,16 +112,20 @@ stdenv.mkDerivation (
       runHook postInstall
     '';
 
-    postInstall = concatMapStringsSep "\n" (
-      peer: "install -Dm755 ${peer.package}/bin/${peer.binary} $out/bin/${peer.binary}"
-    ) peerBinaries;
+    postInstall = optionalString stdenv.hostPlatform.isLinux (
+      concatMapStringsSep "\n" (
+        peer: "install -Dm755 ${peer.package}/bin/${peer.binary} $out/bin/${peer.binary}"
+      ) peerBinaries
+    );
 
     doInstallCheck = true;
     installCheckPhase = ''
       runHook preInstallCheck
       test -x "$out/bin/protoc-gen-trevrpc-cpp"
       test -x "$out/bin/trevrpc-bench-peer-cpp"
-      test -x "$out/bin/trevrpc-conformance-cpp"
+      ${optionalString stdenv.hostPlatform.isLinux ''
+        test -x "$out/bin/trevrpc-conformance-cpp"
+      ''}
       test -f "$dev/include/trevrpc/trevrpc.hpp"
       test -f "$dev/include/trevrpc/async.hpp"
       test -f "$dev/include/trevrpc/callbacks.hpp"
@@ -136,7 +140,7 @@ stdenv.mkDerivation (
       mainProgram = "protoc-gen-trevrpc-cpp";
       description = "C++20 runtime and protobuf code generator for TrevRPC";
       license = licenses.mit;
-      platforms = platforms.linux;
+      platforms = platforms.linux ++ platforms.darwin;
       homepage = "https://trev.zip/llc/TrevRPC";
       changelog = "https://trev.zip/llc/TrevRPC/releases";
       downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";

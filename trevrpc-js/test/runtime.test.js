@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -44,8 +43,9 @@ import {
   unary,
   validateMetadata,
 } from "../src/index.js";
+import { loadNativeAddon } from "../src/native-loader.js";
+import { waitForWebTransportReady } from "../src/webtransport.js";
 
-const require = createRequire(import.meta.url);
 const nativeAddonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
 
 test("frames round-trip TrevRPC requests", () => {
@@ -142,6 +142,26 @@ test("browser WebTransport connect reports unsupported runtime", async () => {
   await assert.rejects(
     RawWebTransport.connect("https://example.test/trevrpc", { WebTransport: {} }),
     (error) => error.code === Code.Unavailable,
+  );
+});
+
+test("browser WebTransport readiness rejects when the session closes first", async () => {
+  const closedError = new Error("session failed");
+  await assert.rejects(
+    waitForWebTransportReady({
+      ready: new Promise(() => {}),
+      closed: Promise.reject(closedError),
+    }),
+    (error) => error === closedError,
+  );
+
+  await assert.rejects(
+    waitForWebTransportReady({
+      ready: new Promise(() => {}),
+      closed: Promise.resolve(),
+    }),
+    (error) =>
+      error.code === Code.Unavailable && /closed before becoming ready/u.test(error.statusMessage),
   );
 });
 
@@ -379,12 +399,19 @@ test("Node transport aborts native stream setup and established streams", async 
   assert.equal(nativeStream.closed, true);
 });
 
-test("Node native addon loads when built", { skip: !existsSync(nativeAddonPath) }, () => {
-  const native = require(nativeAddonPath);
+test(
+  "native loader loads the source-checkout addon when built",
+  { skip: !existsSync(nativeAddonPath) },
+  () => {
+    const native = loadNativeAddon({
+      loadOptionalPackage: false,
+      loadBundledAddon: false,
+    });
 
-  assert.equal(typeof native.connectMsQuic, "function");
-  assert.equal(typeof native.listenMsQuic, "function");
-});
+    assert.equal(typeof native.connectMsQuic, "function");
+    assert.equal(typeof native.listenMsQuic, "function");
+  },
+);
 
 test("frame length boundary cases are stable", () => {
   for (const length of [0, 1, 15, 16]) {

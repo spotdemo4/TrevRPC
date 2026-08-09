@@ -45,7 +45,7 @@ foreach(symbol IN LISTS public_symbols)
 endforeach()
 
 execute_process(
-    COMMAND "${TREVRPC_NM}" -g --defined-only ${TREVRPC_ARCHIVES}
+    COMMAND "${TREVRPC_NM}" -g ${TREVRPC_ARCHIVES}
     RESULT_VARIABLE nm_result
     OUTPUT_VARIABLE nm_output
     ERROR_VARIABLE nm_error
@@ -57,7 +57,7 @@ endif()
 string(REPLACE "\n" ";" nm_lines "${nm_output}")
 set(actual_symbol_occurrences "")
 foreach(line IN LISTS nm_lines)
-    if(line MATCHES "[ \t][TDBR][ \t]+(trevrpc_[A-Za-z0-9_]+)$")
+    if(line MATCHES "[ \t][TDBR][ \t]+_?(trevrpc_[A-Za-z0-9_]+)$")
         list(APPEND actual_symbol_occurrences "${CMAKE_MATCH_1}")
     endif()
 endforeach()

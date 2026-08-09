@@ -100,16 +100,20 @@ stdenv.mkDerivation (
       runHook postInstall
     '';
 
-    postInstall = concatMapStringsSep "\n" (
-      peer: "install -Dm755 ${peer.package}/bin/${peer.binary} $out/bin/${peer.binary}"
-    ) peerBinaries;
+    postInstall = optionalString stdenv.hostPlatform.isLinux (
+      concatMapStringsSep "\n" (
+        peer: "install -Dm755 ${peer.package}/bin/${peer.binary} $out/bin/${peer.binary}"
+      ) peerBinaries
+    );
 
     doInstallCheck = true;
     installCheckPhase = ''
       runHook preInstallCheck
       test -x "$out/bin/protoc-gen-trevrpc-c"
       test -x "$out/bin/trevrpc-bench-peer-c"
-      test -x "$out/bin/trevrpc-conformance-c"
+      ${optionalString stdenv.hostPlatform.isLinux ''
+        test -x "$out/bin/trevrpc-conformance-c"
+      ''}
       test -f "$dev/include/trevrpc_binding.h"
       test ! -e "$dev/include/trevrpc_preview.h"
       test -f "$dev/lib/cmake/trevrpc/trevrpcConfig.cmake"

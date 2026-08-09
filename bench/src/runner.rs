@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::campaign::{Campaign, Cell, Peer, RpcKind, Stack};
 use crate::certificate::{self, Certificates};
-use crate::metrics::{ProcessDelta, ProcessMonitor};
+use crate::metrics::{METRICS_SCOPE, ProcessDelta, ProcessMonitor};
 use crate::network::{Endpoint, NetworkSnapshot, NetworkTopology};
 use crate::process::{ManagedChild, OutputLimits, PollLine};
 use crate::protocol::{
@@ -890,7 +890,7 @@ fn write_manifest(
         source_commit,
         source_dirty,
         peer_artifacts: artifacts,
-        metrics_scope: "peer_process_group_procfs_10ms",
+        metrics_scope: METRICS_SCOPE,
         network_environment,
     };
     let file = File::create(output.join("manifest.json"))?;

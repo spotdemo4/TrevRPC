@@ -10,6 +10,8 @@ import { RpcKinds, SchemaVersion, parseWorkloadOptions } from "trevrpc-bench-pee
 
 const Stack = "trevrpc_webtransport";
 const BrowserCloseTimeoutMs = 5_000;
+const BrowserLaunchTimeoutMs = 20_000;
+const OriginNavigationTimeoutMs = 5_000;
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 
 const BrowserEngines = {
@@ -23,6 +25,14 @@ const PeerToEngine = {
   firefox: "firefox",
   webkit: "webkit",
 };
+
+export function browserRoles(peerName, platform) {
+  // Playwright uses WPE on Linux, where WebKit has no WebTransport network backend.
+  if (peerName === "webkit" && platform === "linux") {
+    return {};
+  }
+  return { client: [Stack] };
+}
 
 export class PeerError extends Error {
   constructor(phase, code, message, options = {}) {
@@ -45,7 +55,7 @@ export function createPeerMain(peerName) {
         io.stdout,
         {
           event: "capabilities",
-          roles: { client: [Stack] },
+          roles: browserRoles(peerName, process.platform),
           rpc_kinds: RpcKinds,
           histogram: "log_linear_v1",
         },
@@ -144,7 +154,10 @@ async function runClient(config, io, env, peerName, engineName) {
       if (launchResult.trustArtifacts != null) {
         trustArtifacts = launchResult.trustArtifacts;
       }
-      await page.goto(originServer.origin, { waitUntil: "domcontentloaded" });
+      await page.goto(originServer.origin, {
+        waitUntil: "domcontentloaded",
+        timeout: OriginNavigationTimeoutMs,
+      });
     } catch (error) {
       throw wrapError("prepare", "browser_failed", error);
     }
@@ -228,6 +241,43 @@ async function runClient(config, io, env, peerName, engineName) {
   }
 }
 
+export function webkitLaunchOptions(env) {
+  const executablePath = env.TREVRPC_BROWSER_WEBKIT ?? "";
+  const launchOptions = {
+    headless: true,
+    timeout: BrowserLaunchTimeoutMs,
+  };
+  if (executablePath !== "") {
+    launchOptions.executablePath = executablePath;
+  }
+  return launchOptions;
+}
+
+export function webkitRuntimeDiagnostics(env) {
+  const entries = [
+    ["executable", env.TREVRPC_BROWSER_WEBKIT],
+    ["browsers_path", env.PLAYWRIGHT_BROWSERS_PATH],
+    ["launch_timeout_ms", BrowserLaunchTimeoutMs],
+    ["EGL_PLATFORM", env.EGL_PLATFORM],
+    ["WPE_FDO_HEADLESS", env.WPE_FDO_HEADLESS],
+    ["LIBGL_ALWAYS_SOFTWARE", env.LIBGL_ALWAYS_SOFTWARE],
+    ["LIBGL_DRIVERS_PATH", env.LIBGL_DRIVERS_PATH],
+    ["__EGL_VENDOR_LIBRARY_FILENAMES", env.__EGL_VENDOR_LIBRARY_FILENAMES],
+    ["GBM_BACKEND", env.GBM_BACKEND],
+    ["GBM_BACKENDS_PATH", env.GBM_BACKENDS_PATH],
+  ];
+  return entries
+    .map(([name, value]) => `${name}=${value == null || value === "" ? "<unset>" : value}`)
+    .join(", ");
+}
+
+export function webkitLaunchError(error, env) {
+  return new Error(
+    `${error?.message ?? String(error)}\nWebKit runtime: ${webkitRuntimeDiagnostics(env)}`,
+    { cause: error },
+  );
+}
+
 async function launchBrowser(browserType, engineName, env, trustArtifacts) {
   if (engineName === "chromium") {
     const executablePath = env.TREVRPC_BROWSER_CHROMIUM;
@@ -282,14 +332,12 @@ async function launchBrowser(browserType, engineName, env, trustArtifacts) {
   }
 
   if (engineName === "webkit") {
-    const executablePath = env.TREVRPC_BROWSER_WEBKIT ?? "";
-    const launchOptions = {
-      headless: true,
-    };
-    if (executablePath !== "") {
-      launchOptions.executablePath = executablePath;
+    let browser;
+    try {
+      browser = await browserType.launch(webkitLaunchOptions(env));
+    } catch (error) {
+      throw webkitLaunchError(error, env);
     }
-    const browser = await browserType.launch(launchOptions);
     const context = await browser.newContext({ ignoreHTTPSErrors: true });
     const page = await context.newPage();
     return { browser, context, page, trustArtifacts };

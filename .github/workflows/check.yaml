@@ -25,3 +25,16 @@ jobs:
 
       - name: Check
         run: nix flake check --option log-lines 100
+
+  webkit-macos:
+    if: ${{ !startsWith(github.event.head_commit.message || github.event.pull_request.title || '', 'bump:') }}
+    runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@3111d9c56193a4983beca8b41a2e0835678abcaa # v1.63.0
+
+      - name: Check WebKit
+        run: nix build .#checks.aarch64-darwin.benchmark-webkit-smoke --no-link --option log-lines 100

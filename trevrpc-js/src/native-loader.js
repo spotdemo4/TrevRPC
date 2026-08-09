@@ -13,22 +13,32 @@ const packageVersion = (() => {
     return "unknown";
   }
 })();
-const SupportedTarget = "linux/x64/glibc";
+const SupportedOptionalTarget = "linux/x64/glibc";
 const LinuxX64GnuPackage = "@trevrpc/trevrpc-js-native-linux-x64-gnu";
 
 /** Loads the target-specific native addon without building during installation. */
-export function loadNativeAddon() {
+export function loadNativeAddon({ loadOptionalPackage = true, loadBundledAddon = true } = {}) {
   const target = nativeTarget();
   const packageName = nativePackageName(target);
   let packageError;
   let packageState = "unsupported";
 
-  if (packageName != null) {
+  if (loadOptionalPackage && packageName != null) {
     try {
       return require(packageName);
     } catch (error) {
       packageError = error;
       packageState = isMissingPackage(error, packageName) ? "missing" : "failed to load";
+    }
+  }
+
+  const bundled = loadBundledAddon ? bundledNativePath() : null;
+  let bundledError;
+  if (bundled != null) {
+    try {
+      return require(bundled);
+    } catch (error) {
+      bundledError = error;
     }
   }
 
@@ -44,6 +54,8 @@ export function loadNativeAddon() {
 
   const detected = targetName(target);
   const expected = packageName ?? "no optional package (unsupported target)";
+  const bundledState =
+    bundled == null ? "no Nix-bundled addon was present" : "the Nix-bundled addon failed to load";
   const fallbackState =
     fallback == null
       ? "no source-checkout fallback was present"
@@ -52,10 +64,10 @@ export function loadNativeAddon() {
         : "the source-checkout fallback failed to load";
   throw new Error(
     `TrevRPC native addon is unavailable for detected target ${detected}. ` +
-      `Supported targets: ${SupportedTarget}. Expected optional package: ${expected}@${packageVersion}; ` +
-      `package state: ${packageState}; ${fallbackState}. ` +
+      `Supported optional-package targets: ${SupportedOptionalTarget}. Expected optional package: ${expected}@${packageVersion}; ` +
+      `package state: ${packageState}; ${bundledState}; ${fallbackState}. ` +
       "Install the matching optional package or build build/native/trevrpc_native.node explicitly in a source checkout; npm installation never starts a source build.",
-    { cause: fallbackError ?? packageError },
+    { cause: fallbackError ?? bundledError ?? packageError },
   );
 }
 
@@ -73,6 +85,11 @@ function nativePackageName(target) {
     return LinuxX64GnuPackage;
   }
   return null;
+}
+
+function bundledNativePath() {
+  const path = join(packageRoot, "native", "trevrpc_native.node");
+  return existsSync(path) ? path : null;
 }
 
 function developmentFallbackPath() {

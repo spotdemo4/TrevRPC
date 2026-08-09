@@ -55,15 +55,12 @@ dependencies {
     implementation(libs.protobuf.java)
     implementation(libs.coroutines.core)
 
-    runtimeOnly("io.netty:netty-codec-native-quic:${libs.versions.netty.get()}:linux-x86_64")
-
     testImplementation(platform(libs.junit.bom))
     testImplementation(platform(libs.netty.bom))
     testImplementation("io.netty:netty-handler")
     testImplementation(libs.bouncycastle.bcpkix)
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation(libs.coroutines.test)
-    testRuntimeOnly("io.netty:netty-codec-native-quic:${libs.versions.netty.get()}:linux-x86_64")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
@@ -71,13 +68,22 @@ val trevrpcPlugin =
     project(":protoc-gen-trevrpc-kotlin")
         .layout.buildDirectory
         .file("install/protoc-gen-trevrpc-kotlin/bin/protoc-gen-trevrpc-kotlin")
+val configuredProtoc = providers.gradleProperty("trevrpcProtocPath")
 
 protobuf {
     protoc {
-        artifact =
-            libs.protobuf.protoc
-                .get()
-                .toString()
+        if (configuredProtoc.isPresent) {
+            val protocFile = file(configuredProtoc.get())
+            require(protocFile.isFile && protocFile.canExecute()) {
+                "trevrpcProtocPath must name an executable protoc binary: $protocFile"
+            }
+            path = protocFile.absolutePath
+        } else {
+            artifact =
+                libs.protobuf.protoc
+                    .get()
+                    .toString()
+        }
     }
     plugins {
         id("trevrpc-kotlin") {

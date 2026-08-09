@@ -9,6 +9,8 @@ import {
   sampleForResult,
 } from "trevrpc-bench-peer-js/common";
 
+const ConnectTimeoutMs = 20_000;
+
 let channel;
 let measurement;
 let config;
@@ -22,6 +24,7 @@ export async function connectAndPrepare(input) {
   const connectOptions = {
     maxFrameSize: MaxFrameSize,
     streamIdleTimeoutMs: IdleTimeoutMs,
+    timeoutMs: ConnectTimeoutMs,
   };
   if (input.certificateHash != null && input.certificateHash !== "") {
     const hash = base64Bytes(input.certificateHash);

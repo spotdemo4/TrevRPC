@@ -14,6 +14,7 @@ use crate::{BoxError, SCHEMA_VERSION};
 struct ReportManifest {
     schema_version: u32,
     campaign: Campaign,
+    metrics_scope: String,
 }
 
 #[derive(Debug)]
@@ -105,7 +106,11 @@ pub fn generate(output: &Path) -> Result<(), BoxError> {
     validate_samples(&manifest.campaign, &samples)?;
     let aggregates = aggregate(&samples);
     write_csv(&output.join("aggregate.csv"), &aggregates)?;
-    write_markdown(&output.join("report.md"), &aggregates)?;
+    write_markdown(
+        &output.join("report.md"),
+        &aggregates,
+        &manifest.metrics_scope,
+    )?;
     write_html(&output.join("report.html"), &aggregates)?;
     Ok(())
 }
@@ -336,7 +341,11 @@ fn write_csv(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError> 
     Ok(())
 }
 
-fn write_markdown(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxError> {
+fn write_markdown(
+    path: &Path,
+    aggregates: &[Aggregate<'_>],
+    metrics_scope: &str,
+) -> Result<(), BoxError> {
     let mut output = String::from(
         "# RPC Benchmark Report\n\n| Cell | Stack | Client | Server | RPC | Concurrency | Runs | p50 us | p99 us | ops/s | Client CPU us/op | Server CPU us/op | Client peak MiB | Server peak MiB |\n| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
@@ -360,7 +369,16 @@ fn write_markdown(path: &Path, aggregates: &[Aggregate<'_>]) -> Result<(), BoxEr
             aggregate.server_peak_rss() as f64 / 1024.0 / 1024.0,
         )?;
     }
-    output.push_str("\nLatency is complete bounded-RPC latency under closed-loop load. Throughput uses the fixed admission window; connection setup and warmup are excluded. CPU and RSS cover complete peer process groups and are sampled externally through procfs.\n");
+    output.push_str("\nLatency is complete bounded-RPC latency under closed-loop load. Throughput uses the fixed admission window; connection setup and warmup are excluded. ");
+    match metrics_scope {
+        "peer_process_group_procfs_10ms" => output.push_str(
+            "CPU and RSS cover complete peer process groups and are sampled externally through Linux procfs.\n",
+        ),
+        "peer_process_group_metrics_unavailable" => output.push_str(
+            "Peer process CPU, RSS, and context-switch metrics are unavailable on this platform and are reported as zero.\n",
+        ),
+        scope => writeln!(output, "Process metrics scope: `{scope}`.")?,
+    }
     fs::write(path, output)?;
     Ok(())
 }
@@ -571,7 +589,12 @@ mod tests {
         let markdown_path = output.join(format!("trevrpc-bench-report-{}.md", std::process::id()));
         let html_path = output.join(format!("trevrpc-bench-report-{}.html", std::process::id()));
 
-        write_markdown(&markdown_path, &aggregates).expect("write Markdown report");
+        write_markdown(
+            &markdown_path,
+            &aggregates,
+            "peer_process_group_procfs_10ms",
+        )
+        .expect("write Markdown report");
         write_html(&html_path, &aggregates).expect("write HTML report");
         let markdown = fs::read_to_string(&markdown_path).expect("read Markdown report");
         let html = fs::read_to_string(&html_path).expect("read HTML report");
@@ -581,5 +604,23 @@ mod tests {
 
         fs::remove_file(markdown_path).expect("remove Markdown report");
         fs::remove_file(html_path).expect("remove HTML report");
+    }
+
+    #[test]
+    fn reports_unavailable_metrics_without_claiming_procfs() {
+        let samples = vec![sample(Stack::TrevrpcNativeQuic)];
+        let aggregates = aggregate(&samples);
+        let path = std::env::temp_dir().join(format!(
+            "trevrpc-bench-unavailable-metrics-{}.md",
+            std::process::id()
+        ));
+
+        write_markdown(&path, &aggregates, "peer_process_group_metrics_unavailable")
+            .expect("write Markdown report");
+        let markdown = fs::read_to_string(&path).expect("read Markdown report");
+
+        assert!(markdown.contains("metrics are unavailable"));
+        assert!(!markdown.contains("procfs"));
+        fs::remove_file(path).expect("remove Markdown report");
     }
 }

@@ -30,13 +30,13 @@ export class RawWebTransport {
   /** Opens a WebTransport session and wraps it in a TrevRPC client. */
   static async connect(url, options = {}) {
     const session = createWebTransportSession(url, options);
-    await session.ready;
+    await waitForWebTransportReady(session);
     return new RawWebTransport(session, options);
   }
 
   /** Waits for the underlying WebTransport session to become ready. */
   async ready() {
-    await this.session.ready;
+    await waitForWebTransportReady(this.session);
   }
 
   /** Closes the underlying WebTransport session. */
@@ -144,6 +144,21 @@ export class RawWebTransport {
 
     return this.session.createBidirectionalStream();
   }
+}
+
+/** Waits for readiness without hanging when a session closes during setup. */
+export async function waitForWebTransportReady(session) {
+  if (session.closed == null) {
+    await session.ready;
+    return;
+  }
+
+  await Promise.race([
+    session.ready,
+    Promise.resolve(session.closed).then(() => {
+      throw unavailable("WebTransport session closed before becoming ready");
+    }),
+  ]);
 }
 
 /** Creates a WebTransport session using only browser constructor options. */

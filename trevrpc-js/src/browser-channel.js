@@ -1,6 +1,10 @@
 import { ChannelStateMachine, stripChannelOptions, waitForInitialReady } from "./channel.js";
 import { unavailable } from "./status.js";
-import { RawWebTransport, createWebTransportSession } from "./webtransport.js";
+import {
+  RawWebTransport,
+  createWebTransportSession,
+  waitForWebTransportReady,
+} from "./webtransport.js";
 
 /** Browser channel with background session reconnection. */
 export class Channel extends ChannelStateMachine {
@@ -31,7 +35,7 @@ async function connectWebTransport(url, options, signal) {
   signal.addEventListener("abort", onAbort, { once: true });
 
   try {
-    await session.ready;
+    await waitForWebTransportReady(session);
     if (signal.aborted) {
       throw unavailable("channel is closed");
     }

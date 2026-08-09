@@ -13,6 +13,25 @@ kotlin {
     compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
 }
 
+val supportedNettyNativeClassifiers =
+    listOf(
+        "linux-x86_64",
+        "linux-aarch_64",
+        "osx-x86_64",
+        "osx-aarch_64",
+        "windows-x86_64",
+    )
+val configuredNettyNativeClassifier = providers.gradleProperty("trevrpcNettyNativeClassifier")
+val nettyNativeClassifiers =
+    configuredNettyNativeClassifier
+        .map { classifier ->
+            require(classifier in supportedNettyNativeClassifiers) {
+                "Unsupported trevrpcNettyNativeClassifier '$classifier'; expected one of " +
+                    supportedNettyNativeClassifiers.joinToString()
+            }
+            listOf(classifier)
+        }.orElse(supportedNettyNativeClassifiers)
+
 dependencies {
     api(project(":core"))
     api(platform(libs.netty.bom))
@@ -22,13 +41,7 @@ dependencies {
     }
     implementation(libs.coroutines.core)
 
-    listOf(
-        "linux-x86_64",
-        "linux-aarch_64",
-        "osx-x86_64",
-        "osx-aarch_64",
-        "windows-x86_64",
-    ).forEach { classifier ->
+    nettyNativeClassifiers.get().forEach { classifier ->
         runtimeOnly("io.netty:netty-codec-native-quic:${libs.versions.netty.get()}:$classifier")
     }
 

@@ -433,6 +433,7 @@ pub fn configure_session(command: &mut Command) {
     // affect that child. Errors are returned through Command's exec error pipe.
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -503,6 +504,18 @@ mod tests {
             max_stderr_bytes: 32,
             diagnostic_tail_bytes: 16,
         }
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 performs existence and permission checks without
+        // delivering a signal.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     #[test]
@@ -577,13 +590,12 @@ mod tests {
         child.terminate_group();
         let _ = child.wait(Duration::from_secs(2)).expect("wait after kill");
 
-        let proc_path = std::path::PathBuf::from(format!("/proc/{grandchild}"));
         let deadline = Instant::now() + Duration::from_secs(2);
-        while proc_path.exists() && Instant::now() < deadline {
+        while process_exists(grandchild) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            !proc_path.exists(),
+            !process_exists(grandchild),
             "grandchild {grandchild} survived group kill"
         );
     }

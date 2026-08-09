@@ -6,8 +6,39 @@
   makeWrapper,
   nssTools,
   playwright-driver,
+  stdenv,
   trevrpcJs,
 }:
+let
+  packageLock = lib.importJSON ./package-lock.json;
+  playwrightCoreVersion = packageLock.packages."node_modules/playwright-core".version;
+  isX86Linux = stdenv.hostPlatform.system == "x86_64-linux";
+  isDarwin = stdenv.hostPlatform.system == "aarch64-darwin";
+  browsers =
+    if isX86Linux then
+      playwright-driver.selectBrowsers {
+        withChromium = true;
+        withChromiumHeadlessShell = false;
+        withFirefox = true;
+        withWebkit = false;
+        withFfmpeg = false;
+      }
+    else if isDarwin then
+      playwright-driver.selectBrowsers {
+        withChromium = false;
+        withChromiumHeadlessShell = false;
+        withFirefox = false;
+        withWebkit = true;
+        withFfmpeg = false;
+      }
+    else
+      null;
+  inherit (playwright-driver.browsersJSON) chromium firefox webkit;
+in
+assert lib.assertMsg (playwrightCoreVersion == playwright-driver.version) ''
+  trevrpc-bench-peer-browser playwright-core ${playwrightCoreVersion} must match
+  nixpkgs playwright-driver ${playwright-driver.version}
+'';
 buildNpmPackage (final: {
   pname = "trevrpc-bench-peer-browser";
   version = "0.1.9";
@@ -49,41 +80,33 @@ buildNpmPackage (final: {
     ln -s ${trevrpcJs}/lib/node_modules/trevrpc-bench-peer-js \
       "$package/node_modules/trevrpc-bench-peer-js"
 
-    chromium=
-    for candidate in ${playwright-driver.browsers}/chromium-*/chrome-linux*/chrome; do
-      chromium=$candidate
-      break
-    done
-    test -n "$chromium"
+    # Keep explicit executable paths paired with the matching Nix browser
+    # bundle so Playwright never downloads browsers at runtime.
+    ${lib.optionalString isX86Linux ''
+      chromium=${browsers}/chromium-${chromium.revision}/chrome-linux64/chrome
+      firefox=${browsers}/firefox-${firefox.revision}/firefox/firefox
+      test -x "$chromium"
+      test -x "$firefox"
 
-    firefox=
-    for candidate in ${playwright-driver.browsers}/firefox-*/firefox/firefox; do
-      firefox=$candidate
-      break
-    done
-    test -n "$firefox"
+      wrapProgram $out/bin/trevrpc-bench-peer-chromium \
+        --set TREVRPC_BROWSER_CHROMIUM "$chromium" \
+        --set PLAYWRIGHT_BROWSERS_PATH "${browsers}" \
+        --prefix PATH : "${lib.makeBinPath [ nssTools ]}"
+      wrapProgram $out/bin/trevrpc-bench-peer-firefox \
+        --set TREVRPC_BROWSER_FIREFOX "$firefox" \
+        --set PLAYWRIGHT_BROWSERS_PATH "${browsers}" \
+        --prefix PATH : "${lib.makeBinPath [ nssTools ]}"
+    ''}
+    ${lib.optionalString isDarwin ''
+      webkit=${browsers}/webkit-${webkit.revision}/pw_run.sh
+      playwright=${browsers}/webkit-${webkit.revision}/Playwright.app/Contents/MacOS/Playwright
+      test -x "$webkit"
+      test -x "$playwright"
 
-    webkit=
-    for candidate in ${playwright-driver.browsers}/webkit-*/pw_run.sh; do
-      webkit=$candidate
-      break
-    done
-    test -n "$webkit"
-
-    # WebKit uses the browsers directory via PLAYWRIGHT_BROWSERS_PATH, but
-    # also expose a dedicated env for explicit executable overrides.
-    wrapProgram $out/bin/trevrpc-bench-peer-chromium \
-      --set TREVRPC_BROWSER_CHROMIUM "$chromium" \
-      --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}" \
-      --prefix PATH : "${lib.makeBinPath [ nssTools ]}"
-    wrapProgram $out/bin/trevrpc-bench-peer-firefox \
-      --set TREVRPC_BROWSER_FIREFOX "$firefox" \
-      --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}" \
-      --prefix PATH : "${lib.makeBinPath [ nssTools ]}"
-    wrapProgram $out/bin/trevrpc-bench-peer-webkit \
-      --set TREVRPC_BROWSER_WEBKIT "$webkit" \
-      --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}" \
-      --prefix PATH : "${lib.makeBinPath [ nssTools ]}"
+      wrapProgram $out/bin/trevrpc-bench-peer-webkit \
+        --set TREVRPC_BROWSER_WEBKIT "$webkit" \
+        --set PLAYWRIGHT_BROWSERS_PATH "${browsers}"
+    ''}
 
     # Keep legacy package name symlink for backwards compatibility.
     if [ ! -e "$out/lib/node_modules/trevrpc-bench-peer-chromium" ]; then
@@ -92,9 +115,12 @@ buildNpmPackage (final: {
   '';
 
   meta = {
-    mainProgram = "trevrpc-bench-peer-chromium";
-    description = "Browser WebTransport benchmark peers for TrevRPC (Chromium, Firefox, WebKit)";
+    mainProgram = if isDarwin then "trevrpc-bench-peer-webkit" else "trevrpc-bench-peer-chromium";
+    description = "Platform-native browser WebTransport benchmark peers for TrevRPC";
     license = lib.licenses.mit;
-    platforms = [ "x86_64-linux" ];
+    platforms = [
+      "x86_64-linux"
+      "aarch64-darwin"
+    ];
   };
 })

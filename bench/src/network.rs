@@ -1,27 +1,50 @@
-use std::env;
-use std::fs::File;
-use std::io::{self, BufRead, Write};
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::Command;
+
+#[cfg(target_os = "linux")]
+use std::env;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::{self, BufRead, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::process::{Child, ChildStdin, Stdio};
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::thread;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::BoxError;
-use crate::campaign::{LinkCondition, Network, NetworkBackend};
+#[cfg(any(target_os = "linux", test))]
+use crate::campaign::LinkCondition;
+use crate::campaign::{Network, NetworkBackend};
 
+#[cfg(not(target_os = "linux"))]
+const NETNS_LINUX_ONLY_ERROR: &str = "netns network backend is only supported on Linux";
+#[cfg(target_os = "linux")]
 const OWNER_ENV: &str = "TREVRPC_BENCH_PARENT_NAMESPACES";
+#[cfg(target_os = "linux")]
 const CLIENT_ADDRESS: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+#[cfg(target_os = "linux")]
 const SERVER_ADDRESS: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
+#[cfg(target_os = "linux")]
 const CLIENT_CIDR: &str = "198.18.0.1/30";
+#[cfg(target_os = "linux")]
 const SERVER_CIDR: &str = "198.18.0.2/30";
+#[cfg(target_os = "linux")]
 const CLIENT_INTERFACE: &str = "trc0";
+#[cfg(target_os = "linux")]
 const SERVER_INTERFACE: &str = "trs0";
+#[cfg(target_os = "linux")]
 static OWNER_VERIFIED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
@@ -48,6 +71,7 @@ pub struct NetworkTopology {
 
 enum TopologyInner {
     Loopback,
+    #[cfg(target_os = "linux")]
     Netns {
         client: NamespaceHolder,
         server: NamespaceHolder,
@@ -73,6 +97,7 @@ impl NetworkTopology {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn create_netns(network: &Network) -> Result<Self, BoxError> {
         if !OWNER_VERIFIED.load(Ordering::Acquire) {
             return Err("netns backend owner namespace was not verified".into());
@@ -154,21 +179,35 @@ impl NetworkTopology {
         })
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn create_netns(_network: &Network) -> Result<Self, BoxError> {
+        Err(NETNS_LINUX_ONLY_ERROR.into())
+    }
+
     #[must_use]
     pub fn server_listen(&self) -> String {
         match self.inner {
             TopologyInner::Loopback => "127.0.0.1:0".to_owned(),
+            #[cfg(target_os = "linux")]
             TopologyInner::Netns { .. } => format!("{SERVER_ADDRESS}:0"),
         }
     }
 
     #[must_use]
     pub fn certificate_ips(&self) -> Vec<IpAddr> {
-        let mut ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
-        if matches!(self.inner, TopologyInner::Netns { .. }) {
-            ips.push(IpAddr::V4(SERVER_ADDRESS));
+        let ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        #[cfg(target_os = "linux")]
+        {
+            let mut ips = ips;
+            if matches!(self.inner, TopologyInner::Netns { .. }) {
+                ips.push(IpAddr::V4(SERVER_ADDRESS));
+            }
+            ips
         }
-        ips
+        #[cfg(not(target_os = "linux"))]
+        {
+            ips
+        }
     }
 
     #[must_use]
@@ -177,17 +216,23 @@ impl NetworkTopology {
     }
 
     pub fn configure_command(&self, command: &mut Command, endpoint: Endpoint) {
-        let TopologyInner::Netns { client, server } = &self.inner else {
-            return;
-        };
-        let namespace = match endpoint {
-            Endpoint::Client => client,
-            Endpoint::Server => server,
-        };
-        enter_namespace_before_exec(command, namespace.file.as_raw_fd());
+        #[cfg(target_os = "linux")]
+        {
+            let TopologyInner::Netns { client, server } = &self.inner else {
+                return;
+            };
+            let namespace = match endpoint {
+                Endpoint::Client => client,
+                Endpoint::Server => server,
+            };
+            enter_namespace_before_exec(command, namespace.file.as_raw_fd());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (command, endpoint);
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn enter_owner_namespace_if_needed(
     network: &Network,
     campaign_path: &Path,
@@ -215,6 +260,20 @@ pub fn enter_owner_namespace_if_needed(
     Err(format!("failed to start rootless netns backend with unshare: {error}").into())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn enter_owner_namespace_if_needed(
+    network: &Network,
+    _campaign_path: &Path,
+    _output: &Path,
+) -> Result<(), BoxError> {
+    if network.backend == NetworkBackend::Netns {
+        Err(NETNS_LINUX_ONLY_ERROR.into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn prepare_owner_namespace(network: &Network) -> Result<(), BoxError> {
     if network.backend != NetworkBackend::Netns {
         return Err("internal network runner requires the netns backend".into());
@@ -228,6 +287,12 @@ pub fn prepare_owner_namespace(network: &Network) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn prepare_owner_namespace(_network: &Network) -> Result<(), BoxError> {
+    Err(NETNS_LINUX_ONLY_ERROR.into())
+}
+
+#[cfg(target_os = "linux")]
 fn verify_owner_namespace() -> Result<(), BoxError> {
     let parent = env::var(OWNER_ENV)
         .map_err(|_| "netns backend was not started through its rootless namespace launcher")?;
@@ -251,6 +316,7 @@ fn verify_owner_namespace() -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn namespace_identity(path: &str) -> Result<String, BoxError> {
     Ok(std::fs::read_link(path)
         .map_err(|error| format!("failed to inspect namespace {path}: {error}"))?
@@ -258,6 +324,7 @@ fn namespace_identity(path: &str) -> Result<String, BoxError> {
         .into_owned())
 }
 
+#[cfg(target_os = "linux")]
 pub fn hold_namespace() -> Result<(), BoxError> {
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line)?;
@@ -267,12 +334,19 @@ pub fn hold_namespace() -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn hold_namespace() -> Result<(), BoxError> {
+    Err(NETNS_LINUX_ONLY_ERROR.into())
+}
+
+#[cfg(target_os = "linux")]
 struct NamespaceHolder {
     child: Child,
     stdin: Option<ChildStdin>,
     file: File,
 }
 
+#[cfg(target_os = "linux")]
 impl NamespaceHolder {
     fn spawn(role: &str) -> Result<Self, BoxError> {
         let executable = env::current_exe()?;
@@ -323,10 +397,12 @@ impl NamespaceHolder {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct OwnerVethGuard {
     active: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl OwnerVethGuard {
     const fn new() -> Self {
         Self { active: true }
@@ -337,6 +413,7 @@ impl OwnerVethGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for OwnerVethGuard {
     fn drop(&mut self) {
         if !self.active {
@@ -355,6 +432,7 @@ impl Drop for OwnerVethGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for NamespaceHolder {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_some() {
@@ -376,6 +454,7 @@ impl Drop for NamespaceHolder {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn configure_endpoint(
     namespace: &NamespaceHolder,
     interface: &str,
@@ -420,6 +499,7 @@ fn configure_endpoint(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn netem_arguments(interface: &str, condition: &LinkCondition) -> Vec<String> {
     if condition.is_unrestricted() {
         return Vec::new();
@@ -454,6 +534,7 @@ fn netem_arguments(interface: &str, condition: &LinkCondition) -> Vec<String> {
     arguments
 }
 
+#[cfg(target_os = "linux")]
 fn verify_route(namespace: &NamespaceHolder, destination: Ipv4Addr) -> Result<(), BoxError> {
     run_in_namespace(
         namespace,
@@ -464,6 +545,7 @@ fn verify_route(namespace: &NamespaceHolder, destination: Ipv4Addr) -> Result<()
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn inspect_qdisc(namespace: &NamespaceHolder, interface: &str) -> Result<String, BoxError> {
     run_in_namespace(
         namespace,
@@ -473,10 +555,12 @@ fn inspect_qdisc(namespace: &NamespaceHolder, interface: &str) -> Result<String,
     )
 }
 
+#[cfg(target_os = "linux")]
 fn run_owner(program: &str, arguments: &[&str], description: &str) -> Result<String, BoxError> {
     run_command(Command::new(program).args(arguments), description)
 }
 
+#[cfg(target_os = "linux")]
 fn run_in_namespace(
     namespace: &NamespaceHolder,
     program: &str,
@@ -489,6 +573,7 @@ fn run_in_namespace(
     run_command(&mut command, description)
 }
 
+#[cfg(target_os = "linux")]
 fn run_command(command: &mut Command, description: &str) -> Result<String, BoxError> {
     let output = command
         .output()
@@ -503,6 +588,7 @@ fn run_command(command: &mut Command, description: &str) -> Result<String, BoxEr
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+#[cfg(target_os = "linux")]
 fn enter_namespace_before_exec(command: &mut Command, namespace_fd: RawFd) {
     let parent_pid = std::process::id();
     // SAFETY: setns is called in the forked child immediately before exec and
@@ -527,7 +613,11 @@ fn enter_namespace_before_exec(command: &mut Command, namespace_fd: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::netem_arguments;
+    #[cfg(not(target_os = "linux"))]
+    use super::{NETNS_LINUX_ONLY_ERROR, NetworkTopology};
     use crate::campaign::LinkCondition;
+    #[cfg(not(target_os = "linux"))]
+    use crate::campaign::{Network, NetworkBackend};
 
     #[test]
     fn omits_netem_for_unrestricted_links() {
@@ -553,5 +643,18 @@ mod tests {
                 "15ms", "2ms", "loss", "random", "0.1%", "rate", "100mbit",
             ]
         );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn netns_backend_reports_linux_requirement() {
+        let network = Network {
+            backend: NetworkBackend::Netns,
+            ..Network::default()
+        };
+        let Err(error) = NetworkTopology::create(&network) else {
+            panic!("netns must be rejected");
+        };
+        assert_eq!(error.to_string(), NETNS_LINUX_ONLY_ERROR);
     }
 }
