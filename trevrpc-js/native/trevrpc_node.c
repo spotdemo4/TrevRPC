@@ -40,6 +40,7 @@ typedef struct server_route server_route;
 typedef struct node_http3_admission_state node_http3_admission_state;
 #ifdef TREVRPC_NODE_TEST_HOOKS
 typedef struct debug_client_close_race debug_client_close_race;
+typedef struct debug_http3_admission_work debug_http3_admission_work;
 
 typedef enum debug_outbound_gate_state {
     DEBUG_OUTBOUND_GATE_IDLE = 0,
@@ -4323,6 +4324,7 @@ typedef struct http3_admission_call {
     size_t authority_len;
     bool secure;
     clockid_t clock_id;
+    uint64_t due_nanos;
     bool completed;
     bool admitted;
     bool cancelled;
@@ -4333,18 +4335,19 @@ struct node_http3_admission_state {
     http3_admission_call* active_calls;
     napi_threadsafe_function tsfn;
 #ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_bounded_barrier* debug_wait_armed;
+    debug_http3_admission_work* debug_work;
+    bool debug_callback_queued;
 #endif
     uint64_t timeout_nanos;
     bool shutting_down;
 };
 
 static void http3_admission_js(napi_env env, napi_value callback, void* context, void* data);
+#ifdef TREVRPC_NODE_TEST_HOOKS
+static void debug_http3_admission_finish(napi_env env, debug_http3_admission_work* work, bool callback_queued);
+#endif
 
-static void http3_admission_call_release(http3_admission_call* call) {
-    if (atomic_fetch_sub_explicit(&call->refs, 1, memory_order_acq_rel) != 1) {
-        return;
-    }
+static void http3_admission_call_destroy(http3_admission_call* call) {
     pthread_cond_destroy(&call->cond);
     pthread_mutex_destroy(&call->mutex);
     free(call->authority);
@@ -4352,12 +4355,53 @@ static void http3_admission_call_release(http3_admission_call* call) {
     free(call);
 }
 
+static void http3_admission_call_release_count(http3_admission_call* call, size_t count) {
+    if (atomic_fetch_sub_explicit(&call->refs, count, memory_order_acq_rel) == count) {
+        http3_admission_call_destroy(call);
+    }
+}
+
+static void http3_admission_call_release(http3_admission_call* call) {
+    http3_admission_call_release_count(call, 1);
+}
+
+static void http3_admission_call_cancel_locked(http3_admission_call* call) {
+    call->admitted = false;
+    call->cancelled = true;
+    call->completed = true;
+    pthread_cond_signal(&call->cond);
+}
+
+static void http3_admission_call_complete_locked(http3_admission_call* call, bool admitted) {
+    if (call->completed) {
+        return;
+    }
+    call->admitted = admitted;
+    call->completed = true;
+    pthread_cond_signal(&call->cond);
+}
+
+static bool http3_admission_call_deadline_expired_locked(http3_admission_call* call) {
+    uint64_t now_nanos = 0;
+    return native_monotonic_now_nanos(&now_nanos) != 0 || now_nanos >= call->due_nanos;
+}
+
 static void http3_admission_state_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
     (void)hint;
     node_http3_admission_state* state = data;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_http3_admission_work* debug_work = state->debug_work;
+    bool debug_callback_queued = state->debug_callback_queued;
+#endif
     pthread_mutex_destroy(&state->mutex);
     free(state);
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    if (debug_work != NULL) {
+        debug_http3_admission_finish(env, debug_work, debug_callback_queued);
+    }
+#else
+    (void)env;
+#endif
 }
 
 static void http3_admission_state_shutdown(node_http3_admission_state* state) {
@@ -4368,9 +4412,7 @@ static void http3_admission_state_shutdown(node_http3_admission_state* state) {
     state->shutting_down = true;
     for (http3_admission_call* call = state->active_calls; call != NULL; call = call->next) {
         pthread_mutex_lock(&call->mutex);
-        call->cancelled = true;
-        call->completed = true;
-        pthread_cond_signal(&call->cond);
+        http3_admission_call_cancel_locked(call);
         pthread_mutex_unlock(&call->mutex);
     }
     pthread_mutex_unlock(&state->mutex);
@@ -4417,18 +4459,27 @@ static napi_status http3_admission_state_create(napi_env env,
 static void http3_admission_js(napi_env env, napi_value callback, void* context, void* data) {
     (void)context;
     http3_admission_call* call = data;
-    bool admitted = false;
+    bool invoke = false;
     pthread_mutex_lock(&call->mutex);
-    bool cancelled = call->cancelled;
+    if (!call->completed) {
+        if (env == NULL || callback == NULL || http3_admission_call_deadline_expired_locked(call)) {
+            http3_admission_call_cancel_locked(call);
+        } else {
+            invoke = true;
+        }
+    }
     pthread_mutex_unlock(&call->mutex);
-    if (!cancelled && env != NULL && callback != NULL) {
-        napi_value request = NULL;
+
+    bool admitted = false;
+    napi_status status = invoke ? napi_ok : napi_cancelled;
+    napi_value request = NULL;
+    if (invoke) {
         napi_value path = NULL;
         napi_value authority = NULL;
         napi_value secure = NULL;
         napi_value global = NULL;
         napi_value result = NULL;
-        napi_status status = napi_create_object(env, &request);
+        status = napi_create_object(env, &request);
         if (status == napi_ok) {
             status = napi_create_string_utf8(env, call->path, call->path_len, &path);
         }
@@ -4458,16 +4509,17 @@ static void http3_admission_js(napi_env env, napi_value callback, void* context,
         }
         if (status != napi_ok) {
             clear_pending_exception(env);
-            admitted = false;
         }
     }
 
     pthread_mutex_lock(&call->mutex);
-    if (!call->cancelled) {
-        call->admitted = admitted;
+    if (!call->completed) {
+        if (status != napi_ok || http3_admission_call_deadline_expired_locked(call)) {
+            http3_admission_call_cancel_locked(call);
+        } else {
+            http3_admission_call_complete_locked(call, admitted);
+        }
     }
-    call->completed = true;
-    pthread_cond_signal(&call->cond);
     pthread_mutex_unlock(&call->mutex);
     http3_admission_call_release(call);
 }
@@ -4475,6 +4527,10 @@ static void http3_admission_js(napi_env env, napi_value callback, void* context,
 static int node_http3_admission(void* user_data, const trevrpc_http3_admission_request* request) {
     node_http3_admission_state* state = user_data;
     if (state == NULL || request == NULL || request->path_len == SIZE_MAX || request->authority_len == SIZE_MAX) {
+        return -1;
+    }
+    uint64_t due_nanos = 0;
+    if (native_monotonic_deadline_after(state->timeout_nanos, &due_nanos) != 0) {
         return -1;
     }
     http3_admission_call* call = calloc(1, sizeof(*call));
@@ -4509,13 +4565,13 @@ static int node_http3_admission(void* user_data, const trevrpc_http3_admission_r
         free(call);
         return -1;
     }
+    call->due_nanos = due_nanos;
     atomic_init(&call->refs, 2);
 
     pthread_mutex_lock(&state->mutex);
     if (state->shutting_down) {
         pthread_mutex_unlock(&state->mutex);
-        http3_admission_call_release(call);
-        http3_admission_call_release(call);
+        http3_admission_call_release_count(call, 2);
         return -1;
     }
     call->next = state->active_calls;
@@ -4523,47 +4579,43 @@ static int node_http3_admission(void* user_data, const trevrpc_http3_admission_r
     pthread_mutex_unlock(&state->mutex);
 
     napi_status status = napi_call_threadsafe_function(state->tsfn, call, napi_tsfn_nonblocking);
-    if (status != napi_ok) {
-        http3_admission_call_release(call);
-        pthread_mutex_lock(&call->mutex);
-        call->completed = true;
-        call->cancelled = true;
-        pthread_mutex_unlock(&call->mutex);
-    }
-
-    uint64_t due_nanos = 0;
-    bool admitted = false;
-    int deadline_err = native_monotonic_deadline_after(state->timeout_nanos, &due_nanos);
+    bool callback_queued = status == napi_ok;
 #ifdef TREVRPC_NODE_TEST_HOOKS
-    pthread_mutex_lock(&state->mutex);
-    debug_bounded_barrier* debug_wait_armed = state->debug_wait_armed;
-    pthread_mutex_unlock(&state->mutex);
-    if (debug_wait_armed != NULL) {
-        (void)debug_bounded_barrier_wait(debug_wait_armed);
+    if (callback_queued) {
+        pthread_mutex_lock(&state->mutex);
+        state->debug_callback_queued = true;
+        pthread_mutex_unlock(&state->mutex);
     }
 #endif
-    if (deadline_err == 0) {
+    if (!callback_queued) {
         pthread_mutex_lock(&call->mutex);
-        while (!call->completed) {
-            uint64_t now_nanos = 0;
-            int err = native_monotonic_now_nanos(&now_nanos);
-            if (err == 0) {
-                err = native_condition_timedwait_until(&call->cond, &call->mutex, call->clock_id, due_nanos, now_nanos);
-            }
-            if (err != 0) {
-                call->cancelled = true;
-                break;
-            }
-        }
-        admitted = call->completed && !call->cancelled && call->admitted;
-        pthread_mutex_unlock(&call->mutex);
-    } else {
-        pthread_mutex_lock(&call->mutex);
-        call->cancelled = true;
+        http3_admission_call_cancel_locked(call);
         pthread_mutex_unlock(&call->mutex);
     }
 
+    pthread_mutex_lock(&call->mutex);
+    while (!call->completed) {
+        uint64_t now_nanos = 0;
+        int err = native_monotonic_now_nanos(&now_nanos);
+        if (err != 0 || now_nanos >= call->due_nanos) {
+            http3_admission_call_cancel_locked(call);
+            break;
+        }
+        err = native_condition_timedwait_until(&call->cond, &call->mutex, call->clock_id, call->due_nanos, now_nanos);
+        if (err != 0) {
+            http3_admission_call_cancel_locked(call);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&call->mutex);
+
     pthread_mutex_lock(&state->mutex);
+    pthread_mutex_lock(&call->mutex);
+    if (state->shutting_down ||
+        (!call->cancelled && call->admitted && http3_admission_call_deadline_expired_locked(call))) {
+        http3_admission_call_cancel_locked(call);
+    }
+    bool admitted = call->completed && !call->cancelled && call->admitted;
     http3_admission_call** link = &state->active_calls;
     while (*link != NULL) {
         if (*link == call) {
@@ -4572,21 +4624,23 @@ static int node_http3_admission(void* user_data, const trevrpc_http3_admission_r
         }
         link = &(*link)->next;
     }
+    pthread_mutex_unlock(&call->mutex);
     pthread_mutex_unlock(&state->mutex);
-    http3_admission_call_release(call);
+    http3_admission_call_release_count(call, callback_queued ? 1 : 2);
     return admitted ? 0 : -1;
 }
 
 #ifdef TREVRPC_NODE_TEST_HOOKS
-typedef struct debug_http3_admission_work {
+struct debug_http3_admission_work {
     napi_async_work work;
     napi_deferred deferred;
     node_http3_admission_state* state;
-    debug_bounded_barrier wait_armed;
-    bool wait_armed_initialized;
+    debug_bounded_barrier timeout_committed;
+    bool timeout_committed_initialized;
     bool shutdown_first;
+    napi_status completion_status;
     int result;
-} debug_http3_admission_work;
+};
 
 static void debug_http3_admission_execute(napi_env env, void* data) {
     (void)env;
@@ -4602,39 +4656,48 @@ static void debug_http3_admission_execute(napi_env env, void* data) {
         .secure = 1,
     };
     work->result = node_http3_admission(work->state, &request);
+    if (work->timeout_committed_initialized) {
+        (void)debug_bounded_barrier_wait(&work->timeout_committed);
+    }
 }
 
 static void debug_http3_admission_barrier_destroy(debug_http3_admission_work* work) {
-    if (!work->wait_armed_initialized) {
+    if (!work->timeout_committed_initialized) {
         return;
     }
-    pthread_mutex_lock(&work->state->mutex);
-    if (work->state->debug_wait_armed == &work->wait_armed) {
-        work->state->debug_wait_armed = NULL;
-    }
-    pthread_mutex_unlock(&work->state->mutex);
-    debug_bounded_barrier_destroy(&work->wait_armed);
-    work->wait_armed_initialized = false;
+    debug_bounded_barrier_destroy(&work->timeout_committed);
+    work->timeout_committed_initialized = false;
 }
 
-static void debug_http3_admission_complete(napi_env env, napi_status status, void* data) {
-    debug_http3_admission_work* work = data;
-    http3_admission_state_shutdown(work->state);
-    debug_http3_admission_barrier_destroy(work);
-    http3_admission_state_release(work->state);
-    if (status == napi_ok) {
+static void debug_http3_admission_finish(napi_env env, debug_http3_admission_work* work, bool callback_queued) {
+    if (env == NULL) {
+        free(work);
+        return;
+    }
+    if (work->completion_status == napi_ok && (work->shutdown_first || callback_queued)) {
         napi_value admitted = NULL;
         napi_get_boolean(env, work->result == 0, &admitted);
         napi_resolve_deferred(env, work->deferred, admitted);
     } else {
+        const char* text = callback_queued || work->shutdown_first ? "debug HTTP/3 admission work failed"
+                                                                   : "debug HTTP/3 admission callback was not queued";
         napi_value message = NULL;
         napi_value error = NULL;
-        napi_create_string_utf8(env, "debug HTTP/3 admission work failed", NAPI_AUTO_LENGTH, &message);
+        napi_create_string_utf8(env, text, NAPI_AUTO_LENGTH, &message);
         napi_create_error(env, NULL, message, &error);
         napi_reject_deferred(env, work->deferred, error);
     }
-    napi_delete_async_work(env, work->work);
     free(work);
+}
+
+static void debug_http3_admission_complete(napi_env env, napi_status status, void* data) {
+    debug_http3_admission_work* work = data;
+    work->completion_status = status;
+    http3_admission_state_shutdown(work->state);
+    debug_http3_admission_barrier_destroy(work);
+    napi_delete_async_work(env, work->work);
+    work->work = NULL;
+    (void)napi_release_threadsafe_function(work->state->tsfn, napi_tsfn_release);
 }
 
 static napi_value debug_http3_admission(napi_env env, napi_callback_info info) {
@@ -4674,17 +4737,19 @@ static napi_value debug_http3_admission(napi_env env, napi_callback_info info) {
     }
     work->shutdown_first = shutdown_first;
     if (status == napi_ok && !shutdown_first) {
-        if (!debug_bounded_barrier_init(&work->wait_armed)) {
+        if (!debug_bounded_barrier_init(&work->timeout_committed)) {
             status = napi_generic_failure;
         } else {
-            work->wait_armed_initialized = true;
-            pthread_mutex_lock(&work->state->mutex);
-            work->state->debug_wait_armed = &work->wait_armed;
-            pthread_mutex_unlock(&work->state->mutex);
+            work->timeout_committed_initialized = true;
         }
     }
     if (status == napi_ok) {
         status = napi_queue_async_work(env, work->work);
+    }
+    if (status == napi_ok) {
+        pthread_mutex_lock(&work->state->mutex);
+        work->state->debug_work = work;
+        pthread_mutex_unlock(&work->state->mutex);
     }
     if (status != napi_ok) {
         if (work->work != NULL) {
@@ -4697,7 +4762,7 @@ static napi_value debug_http3_admission(napi_env env, napi_callback_info info) {
         napi_throw_error(env, NULL, "failed to queue debug HTTP/3 admission work");
         return NULL;
     }
-    if (work->wait_armed_initialized && !debug_bounded_barrier_wait(&work->wait_armed)) {
+    if (work->timeout_committed_initialized && !debug_bounded_barrier_wait(&work->timeout_committed)) {
         http3_admission_state_shutdown(work->state);
     }
     return promise;

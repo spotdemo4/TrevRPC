@@ -523,16 +523,11 @@ const native = require(${JSON.stringify(nativeAddonPath)});
     { skip: typeof native?._debugHttp3Admission !== "function" },
     async () => {
       let callbacks = 0;
-      const admission = native._debugHttp3Admission(() => {
+      const admitted = await native._debugHttp3Admission(() => {
         callbacks += 1;
         return true;
       }, 20);
-      const blockedUntil = Date.now() + 100;
-      while (Date.now() < blockedUntil) {
-        // The debug hook has armed the native timeout; block its queued JS callback until it expires.
-      }
-      assert.equal(await admission, false);
-      await delay(20);
+      assert.equal(admitted, false);
       assert.equal(callbacks, 0);
     },
   );
