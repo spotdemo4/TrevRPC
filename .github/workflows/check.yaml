@@ -28,7 +28,7 @@ jobs:
 
   webkit-macos:
     if: ${{ !startsWith(github.event.head_commit.message || github.event.pull_request.title || '', 'bump:') }}
-    runs-on: macos-15
+    runs-on: macos-26
     permissions:
       contents: read
       id-token: write
