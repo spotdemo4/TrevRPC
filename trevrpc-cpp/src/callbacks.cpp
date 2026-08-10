@@ -24,12 +24,12 @@ namespace {
 }
 
 void report_exception(const CallbackExceptionState& state, std::string_view callback,
-                      std::exception_ptr&& exception) noexcept {
+                      const std::exception_ptr& exception) noexcept {
   if (!state.sink) {
     return;
   }
   try {
-    state.sink->callback_exception(callback, std::move(exception));
+    state.sink->callback_exception(callback, exception);
   } catch (...) {
     (void)std::current_exception();
   }
