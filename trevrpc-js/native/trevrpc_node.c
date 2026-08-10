@@ -280,12 +280,15 @@ struct native_async_work {
     void (*cancel)(void* data);
     native_async_work* next;
     native_async_work* active_next;
+    native_async_work* tsfn_prev;
+    native_async_work* tsfn_next;
     uint64_t retry_delay_nanos;
     uint64_t retry_due_nanos;
 };
 
 struct native_completion_runtime {
     napi_env env;
+    atomic_uint refs;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     clockid_t cond_clock;
@@ -298,6 +301,7 @@ struct native_completion_runtime {
     native_async_work* head;
     native_async_work* tail;
     native_async_work* active;
+    native_async_work* tsfn_pending;
     native_async_work** retry_heap;
     size_t retry_heap_len;
     size_t retry_heap_cap;
@@ -309,6 +313,7 @@ struct native_completion_runtime {
     napi_ref cancellation_constructor;
     size_t loop_ref_count;
     bool stopping;
+    bool closing;
     bool closed;
 };
 
@@ -508,6 +513,23 @@ typedef struct debug_pending_wait_work {
     uint32_t delay_ms;
 } debug_pending_wait_work;
 
+typedef struct debug_gated_completion_work {
+    base_work base;
+    atomic_bool cancelled;
+} debug_gated_completion_work;
+
+typedef struct debug_completion_gate {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    native_completion_runtime* runtime;
+    size_t waiters;
+    size_t js_waiters;
+    bool reached;
+    bool released;
+    bool js_blocked;
+    bool js_released;
+} debug_completion_gate;
+
 typedef struct debug_bounded_barrier {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -569,6 +591,23 @@ static atomic_uint_least64_t NodeBodyOwnerReleases = ATOMIC_VAR_INIT(0);
 static atomic_int NextBodyConversionFailure = ATOMIC_VAR_INIT(DEBUG_BODY_CONVERSION_FAILURE_NONE);
 static atomic_uint_least64_t DebugPendingResourceCloses = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugPendingResourceFinalizers = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeAllocations = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeCloses = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeDestroys = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeTsfnFinalizers = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeInstanceFinalizers = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeTsfnAcceptances = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeEnvNullAbandons = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeCallbackEnvNullAbandons = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeStoppingAbandons = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugCompletionRuntimeFinalizerAbandons = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugGatedCompletionAllocations = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugGatedCompletionAbandons = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugGatedCompletionFrees = ATOMIC_VAR_INIT(0);
+static debug_completion_gate DebugCompletionGate = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+};
 
 static int debug_outbound_gate_init(debug_outbound_gate* gate) {
     return pthread_cond_init(&gate->cond, NULL);
@@ -2999,6 +3038,51 @@ static void native_work_delete(native_async_work* work) {
     free(work);
 }
 
+static void native_completion_runtime_retain(native_completion_runtime* runtime) {
+    atomic_fetch_add_explicit(&runtime->refs, 1, memory_order_relaxed);
+}
+
+static void native_completion_runtime_destroy(native_completion_runtime* runtime) {
+    free(runtime->retry_heap);
+    runtime->retry_heap = NULL;
+    runtime->retry_heap_len = 0;
+    runtime->retry_heap_cap = 0;
+    if (runtime->cond_initialized) {
+        pthread_cond_destroy(&runtime->cond);
+        runtime->cond_initialized = false;
+    }
+    if (runtime->mutex_initialized) {
+        pthread_mutex_destroy(&runtime->mutex);
+        runtime->mutex_initialized = false;
+    }
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&DebugCompletionRuntimeDestroys, 1, memory_order_relaxed);
+#endif
+    free(runtime);
+}
+
+static void native_completion_runtime_release(native_completion_runtime* runtime) {
+    if (runtime != NULL && atomic_fetch_sub_explicit(&runtime->refs, 1, memory_order_acq_rel) == 1) {
+        native_completion_runtime_destroy(runtime);
+    }
+}
+
+static void native_completion_runtime_delete_constructor_refs(napi_env env, native_completion_runtime* runtime) {
+    napi_ref* refs[] = {
+        &runtime->client_constructor,
+        &runtime->stream_constructor,
+        &runtime->server_constructor,
+        &runtime->call_constructor,
+        &runtime->cancellation_constructor,
+    };
+    for (size_t i = 0; i < sizeof(refs) / sizeof(refs[0]); i++) {
+        if (*refs[i] != NULL) {
+            (void)napi_delete_reference(env, *refs[i]);
+            *refs[i] = NULL;
+        }
+    }
+}
+
 static void native_completion_runtime_unref_loop(napi_env env, native_completion_runtime* runtime) {
     if (runtime == NULL || runtime->tsfn == NULL) {
         return;
@@ -3148,6 +3232,22 @@ static void native_completion_active_remove_locked(native_completion_runtime* ru
     }
 }
 
+static void native_completion_tsfn_remove_locked(native_completion_runtime* runtime, native_async_work* work) {
+    if (work->tsfn_prev == NULL) {
+        if (runtime->tsfn_pending != work) {
+            return;
+        }
+        runtime->tsfn_pending = work->tsfn_next;
+    } else {
+        work->tsfn_prev->tsfn_next = work->tsfn_next;
+    }
+    if (work->tsfn_next != NULL) {
+        work->tsfn_next->tsfn_prev = work->tsfn_prev;
+    }
+    work->tsfn_prev = NULL;
+    work->tsfn_next = NULL;
+}
+
 static void native_completion_abandon(native_async_work* work) {
     if (work->abandon != NULL) {
         work->abandon(NULL, napi_cancelled, work->base);
@@ -3157,7 +3257,6 @@ static void native_completion_abandon(native_async_work* work) {
 }
 
 static void native_completion_complete_js(napi_env env, napi_value js_callback, void* context, void* data) {
-    (void)js_callback;
     (void)context;
     native_async_work* work = data;
     if (work == NULL) {
@@ -3165,7 +3264,18 @@ static void native_completion_complete_js(napi_env env, napi_value js_callback, 
     }
 
     native_completion_runtime* runtime = work->runtime;
-    if (env == NULL) {
+    pthread_mutex_lock(&runtime->mutex);
+    native_completion_tsfn_remove_locked(runtime, work);
+    bool stopping = runtime->stopping;
+    pthread_mutex_unlock(&runtime->mutex);
+    if (env == NULL || js_callback == NULL || stopping) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+        atomic_fetch_add_explicit(&DebugCompletionRuntimeEnvNullAbandons, 1, memory_order_relaxed);
+        atomic_uint_least64_t* cause = env == NULL || js_callback == NULL
+                                           ? &DebugCompletionRuntimeCallbackEnvNullAbandons
+                                           : &DebugCompletionRuntimeStoppingAbandons;
+        atomic_fetch_add_explicit(cause, 1, memory_order_relaxed);
+#endif
         native_completion_abandon(work);
         return;
     }
@@ -3233,9 +3343,31 @@ static void* native_completion_worker_main(void* data) {
             native_completion_abandon(work);
             continue;
         }
-        if (napi_call_threadsafe_function(runtime->tsfn, work, napi_tsfn_blocking) != napi_ok) {
+        pthread_mutex_lock(&runtime->mutex);
+        if (runtime->stopping) {
+            pthread_mutex_unlock(&runtime->mutex);
             native_completion_abandon(work);
+            continue;
         }
+        work->tsfn_prev = NULL;
+        work->tsfn_next = runtime->tsfn_pending;
+        if (runtime->tsfn_pending != NULL) {
+            runtime->tsfn_pending->tsfn_prev = work;
+        }
+        runtime->tsfn_pending = work;
+        pthread_mutex_unlock(&runtime->mutex);
+
+        napi_status status = napi_call_threadsafe_function(runtime->tsfn, work, napi_tsfn_blocking);
+        if (status != napi_ok) {
+            pthread_mutex_lock(&runtime->mutex);
+            native_completion_tsfn_remove_locked(runtime, work);
+            pthread_mutex_unlock(&runtime->mutex);
+            native_completion_abandon(work);
+            continue;
+        }
+#ifdef TREVRPC_NODE_TEST_HOOKS
+        atomic_fetch_add_explicit(&DebugCompletionRuntimeTsfnAcceptances, 1, memory_order_relaxed);
+#endif
     }
 
     if (runtime->tsfn != NULL) {
@@ -3292,15 +3424,28 @@ static void* native_completion_scheduler_main(void* data) {
 }
 
 static void native_completion_runtime_close(native_completion_runtime* runtime) {
-    if (runtime == NULL || runtime->closed) {
+    if (runtime == NULL) {
         return;
     }
     if (!runtime->mutex_initialized) {
-        runtime->closed = true;
+        if (!runtime->closed) {
+            runtime->closed = true;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+            atomic_fetch_add_explicit(&DebugCompletionRuntimeCloses, 1, memory_order_relaxed);
+#endif
+        }
         return;
     }
 
     pthread_mutex_lock(&runtime->mutex);
+    while (runtime->closing && !runtime->closed) {
+        pthread_cond_wait(&runtime->cond, &runtime->mutex);
+    }
+    if (runtime->closed) {
+        pthread_mutex_unlock(&runtime->mutex);
+        return;
+    }
+    runtime->closing = true;
     runtime->stopping = true;
     native_async_work* abandoned = runtime->head;
     runtime->head = NULL;
@@ -3342,41 +3487,66 @@ static void native_completion_runtime_close(native_completion_runtime* runtime) 
         (void)napi_release_threadsafe_function(runtime->tsfn, napi_tsfn_abort);
         runtime->tsfn = NULL;
     }
-    free(runtime->retry_heap);
-    runtime->retry_heap = NULL;
-    runtime->retry_heap_cap = 0;
+
+    pthread_mutex_lock(&runtime->mutex);
+    runtime->loop_ref_count = 0;
     runtime->closed = true;
+    runtime->closing = false;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&DebugCompletionRuntimeCloses, 1, memory_order_relaxed);
+#endif
     if (runtime->cond_initialized) {
-        pthread_cond_destroy(&runtime->cond);
-        runtime->cond_initialized = false;
+        pthread_cond_broadcast(&runtime->cond);
     }
-    pthread_mutex_destroy(&runtime->mutex);
-    runtime->mutex_initialized = false;
+    pthread_mutex_unlock(&runtime->mutex);
 }
 
-static void native_completion_runtime_shutdown(native_completion_runtime* runtime) {
-    if (runtime == NULL) {
-        return;
+static void native_completion_runtime_tsfn_finalize(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    native_completion_runtime* runtime = data;
+    pthread_mutex_lock(&runtime->mutex);
+    native_async_work* abandoned = runtime->tsfn_pending;
+    runtime->tsfn_pending = NULL;
+    pthread_mutex_unlock(&runtime->mutex);
+    while (abandoned != NULL) {
+        native_async_work* next = abandoned->tsfn_next;
+        abandoned->tsfn_prev = NULL;
+        abandoned->tsfn_next = NULL;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+        atomic_fetch_add_explicit(&DebugCompletionRuntimeEnvNullAbandons, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&DebugCompletionRuntimeFinalizerAbandons, 1, memory_order_relaxed);
+#endif
+        native_completion_abandon(abandoned);
+        abandoned = next;
     }
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&DebugCompletionRuntimeTsfnFinalizers, 1, memory_order_relaxed);
+#endif
+    native_completion_runtime_release(runtime);
+}
 
-    native_completion_runtime_close(runtime);
-    free(runtime);
+static void native_completion_runtime_instance_finalize(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&DebugCompletionRuntimeInstanceFinalizers, 1, memory_order_relaxed);
+#endif
+    native_completion_runtime_release(data);
 }
 
 static void native_completion_runtime_cleanup(void* data) {
-    native_completion_runtime_shutdown(data);
+    native_completion_runtime_close(data);
 }
 
 static int native_completion_runtime_init(napi_env env, native_completion_runtime* runtime) {
     runtime->env = env;
     if (pthread_mutex_init(&runtime->mutex, NULL) != 0) {
-        runtime->closed = true;
         return -ENOMEM;
     }
     runtime->mutex_initialized = true;
     int cond_err = native_condition_init(&runtime->cond, &runtime->cond_clock);
     if (cond_err != 0) {
-        native_completion_runtime_close(runtime);
         return -cond_err;
     }
     runtime->cond_initialized = true;
@@ -3391,31 +3561,30 @@ static int native_completion_runtime_init(napi_env env, native_completion_runtim
             resource_name,
             0,
             1,
-            NULL,
-            NULL,
+            runtime,
+            native_completion_runtime_tsfn_finalize,
             NULL,
             native_completion_complete_js,
             &runtime->tsfn) != napi_ok) {
-        native_completion_runtime_close(runtime);
         return -ENOMEM;
     }
-    (void)napi_unref_threadsafe_function(env, runtime->tsfn);
+    native_completion_runtime_retain(runtime);
+    if (napi_unref_threadsafe_function(env, runtime->tsfn) != napi_ok) {
+        return -ENOMEM;
+    }
 
     if (pthread_create(&runtime->scheduler, NULL, native_completion_scheduler_main, runtime) != 0) {
-        native_completion_runtime_close(runtime);
         return -ENOMEM;
     }
     runtime->scheduler_started = true;
 
     for (size_t i = 0; i < TREV_NODE_COMPLETION_WORKERS; i++) {
         if (napi_acquire_threadsafe_function(runtime->tsfn) != napi_ok) {
-            native_completion_runtime_close(runtime);
             return -ENOMEM;
         }
         if (pthread_create(&runtime->workers[runtime->worker_count], NULL, native_completion_worker_main, runtime) !=
             0) {
             (void)napi_release_threadsafe_function(runtime->tsfn, napi_tsfn_release);
-            native_completion_runtime_close(runtime);
             return -ENOMEM;
         }
         runtime->worker_count++;
@@ -6541,17 +6710,227 @@ static napi_value debug_set_next_body_conversion_failure(napi_env env, napi_call
     return undefined;
 }
 
+static napi_status debug_set_counter(
+    napi_env env, napi_value object, const char* name, atomic_uint_least64_t* counter) {
+    uint64_t count = atomic_load_explicit(counter, memory_order_relaxed);
+    napi_value value = NULL;
+    if (napi_create_double(env, (double)count, &value) != napi_ok) {
+        return napi_generic_failure;
+    }
+    return napi_set_named_property(env, object, name, value);
+}
+
+static napi_value debug_completion_runtime_stats(napi_env env, napi_callback_info info) {
+    (void)info;
+    napi_value result = NULL;
+    if (napi_create_object(env, &result) != napi_ok ||
+        debug_set_counter(env, result, "allocations", &DebugCompletionRuntimeAllocations) != napi_ok ||
+        debug_set_counter(env, result, "closes", &DebugCompletionRuntimeCloses) != napi_ok ||
+        debug_set_counter(env, result, "destroys", &DebugCompletionRuntimeDestroys) != napi_ok ||
+        debug_set_counter(env, result, "tsfnFinalizers", &DebugCompletionRuntimeTsfnFinalizers) != napi_ok ||
+        debug_set_counter(env, result, "instanceFinalizers", &DebugCompletionRuntimeInstanceFinalizers) != napi_ok ||
+        debug_set_counter(env, result, "tsfnAcceptances", &DebugCompletionRuntimeTsfnAcceptances) != napi_ok ||
+        debug_set_counter(env, result, "envNullAbandons", &DebugCompletionRuntimeEnvNullAbandons) != napi_ok ||
+        debug_set_counter(env, result, "callbackEnvNullAbandons", &DebugCompletionRuntimeCallbackEnvNullAbandons) !=
+            napi_ok ||
+        debug_set_counter(env, result, "stoppingAbandons", &DebugCompletionRuntimeStoppingAbandons) != napi_ok ||
+        debug_set_counter(env, result, "finalizerAbandons", &DebugCompletionRuntimeFinalizerAbandons) != napi_ok ||
+        debug_set_counter(env, result, "gatedAllocations", &DebugGatedCompletionAllocations) != napi_ok ||
+        debug_set_counter(env, result, "gatedAbandons", &DebugGatedCompletionAbandons) != napi_ok ||
+        debug_set_counter(env, result, "gatedFrees", &DebugGatedCompletionFrees) != napi_ok) {
+        napi_throw_error(env, NULL, "failed to read native completion runtime stats");
+        return NULL;
+    }
+    return result;
+}
+
+static void debug_gated_completion_execute(napi_env env, void* data) {
+    (void)env;
+    debug_gated_completion_work* work = data;
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    if (DebugCompletionGate.runtime != NULL) {
+        pthread_mutex_unlock(&DebugCompletionGate.mutex);
+        work->base.err = -EBUSY;
+        return;
+    }
+    DebugCompletionGate.runtime = work->base.work->runtime;
+    native_completion_runtime_retain(DebugCompletionGate.runtime);
+    DebugCompletionGate.waiters++;
+    DebugCompletionGate.reached = true;
+    pthread_cond_broadcast(&DebugCompletionGate.cond);
+    while (!DebugCompletionGate.released && !atomic_load_explicit(&work->cancelled, memory_order_acquire)) {
+        pthread_cond_wait(&DebugCompletionGate.cond, &DebugCompletionGate.mutex);
+    }
+    DebugCompletionGate.waiters--;
+    pthread_cond_broadcast(&DebugCompletionGate.cond);
+    bool cancelled = atomic_load_explicit(&work->cancelled, memory_order_acquire);
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+    work->base.err = cancelled ? -ECANCELED : 0;
+}
+
+static void debug_gated_completion_cancel(void* data) {
+    debug_gated_completion_work* work = data;
+    atomic_store_explicit(&work->cancelled, true, memory_order_release);
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    pthread_cond_broadcast(&DebugCompletionGate.cond);
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+}
+
+static void debug_gated_completion_complete(napi_env env, napi_status status, void* data) {
+    debug_gated_completion_work* work = data;
+    if (env == NULL) {
+        atomic_fetch_add_explicit(&DebugGatedCompletionAbandons, 1, memory_order_relaxed);
+    }
+    if (env != NULL && status == napi_ok && work->base.err == 0) {
+        napi_value undefined = NULL;
+        napi_get_undefined(env, &undefined);
+        napi_resolve_deferred(env, work->base.deferred, undefined);
+    } else if (env != NULL) {
+        reject_native_error(
+            env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "debugGatedCompletion");
+    }
+    native_work_delete(work->base.work);
+    free(work);
+    atomic_fetch_add_explicit(&DebugGatedCompletionFrees, 1, memory_order_relaxed);
+}
+
+static napi_value debug_queue_gated_completion(napi_env env, napi_callback_info info) {
+    (void)info;
+    debug_gated_completion_work* work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        napi_throw_error(env, NULL, "failed to allocate gated completion work");
+        return NULL;
+    }
+    atomic_fetch_add_explicit(&DebugGatedCompletionAllocations, 1, memory_order_relaxed);
+    atomic_init(&work->cancelled, false);
+    return queue_work_managed(env,
+        &work->base,
+        "debugGatedCompletion",
+        debug_gated_completion_execute,
+        debug_gated_completion_complete,
+        debug_gated_completion_complete,
+        debug_gated_completion_cancel);
+}
+
+static napi_value debug_completion_gate_reached(napi_env env, napi_callback_info info) {
+    (void)info;
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    bool reached = DebugCompletionGate.reached;
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+    napi_value result = NULL;
+    napi_get_boolean(env, reached, &result);
+    return result;
+}
+
+static napi_value debug_release_completion_gate(napi_env env, napi_callback_info info) {
+    (void)info;
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    DebugCompletionGate.released = true;
+    pthread_cond_broadcast(&DebugCompletionGate.cond);
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static napi_value debug_close_gated_completion_runtime(napi_env env, napi_callback_info info) {
+    (void)info;
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    native_completion_runtime* runtime = DebugCompletionGate.runtime;
+    DebugCompletionGate.runtime = NULL;
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+    if (runtime != NULL) {
+        native_completion_runtime_close(runtime);
+        native_completion_runtime_release(runtime);
+    }
+    napi_value closed = NULL;
+    napi_get_boolean(env, runtime != NULL, &closed);
+    return closed;
+}
+
+static napi_value debug_block_completion_js(napi_env env, napi_callback_info info) {
+    (void)info;
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    DebugCompletionGate.js_waiters++;
+    DebugCompletionGate.js_blocked = true;
+    pthread_cond_broadcast(&DebugCompletionGate.cond);
+    while (!DebugCompletionGate.js_released) {
+        pthread_cond_wait(&DebugCompletionGate.cond, &DebugCompletionGate.mutex);
+    }
+    DebugCompletionGate.js_waiters--;
+    pthread_cond_broadcast(&DebugCompletionGate.cond);
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static napi_value debug_completion_js_blocked(napi_env env, napi_callback_info info) {
+    (void)info;
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    bool blocked = DebugCompletionGate.js_blocked;
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+    napi_value result = NULL;
+    napi_get_boolean(env, blocked, &result);
+    return result;
+}
+
+static napi_value debug_release_completion_js(napi_env env, napi_callback_info info) {
+    (void)info;
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    DebugCompletionGate.js_released = true;
+    pthread_cond_broadcast(&DebugCompletionGate.cond);
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static napi_value debug_reset_completion_gate(napi_env env, napi_callback_info info) {
+    (void)info;
+    pthread_mutex_lock(&DebugCompletionGate.mutex);
+    if (DebugCompletionGate.runtime != NULL || DebugCompletionGate.waiters != 0 ||
+        DebugCompletionGate.js_waiters != 0) {
+        pthread_mutex_unlock(&DebugCompletionGate.mutex);
+        napi_throw_error(env, NULL, "cannot reset an active completion gate");
+        return NULL;
+    }
+    DebugCompletionGate.reached = false;
+    DebugCompletionGate.released = false;
+    DebugCompletionGate.js_blocked = false;
+    DebugCompletionGate.js_released = false;
+    pthread_mutex_unlock(&DebugCompletionGate.mutex);
+    napi_value undefined = NULL;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
 #endif
 
 static napi_value init(napi_env env, napi_value exports) {
     native_completion_runtime* runtime = calloc(1, sizeof(*runtime));
-    if (runtime == NULL || native_completion_runtime_init(env, runtime) != 0 ||
-        napi_set_instance_data(env, runtime, NULL, NULL) != napi_ok ||
-        napi_add_env_cleanup_hook(env, native_completion_runtime_cleanup, runtime) != napi_ok) {
-        native_completion_runtime_shutdown(runtime);
+    if (runtime == NULL) {
         napi_throw_error(env, NULL, "failed to initialize native completion runtime");
         return NULL;
     }
+    atomic_init(&runtime->refs, 1);
+    bool instance_data_installed = false;
+    bool cleanup_hook_installed = false;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&DebugCompletionRuntimeAllocations, 1, memory_order_relaxed);
+#endif
+    if (native_completion_runtime_init(env, runtime) != 0) {
+        goto fail;
+    }
+    if (napi_set_instance_data(env, runtime, native_completion_runtime_instance_finalize, runtime) != napi_ok) {
+        goto fail;
+    }
+    native_completion_runtime_retain(runtime);
+    instance_data_installed = true;
+    if (napi_add_env_cleanup_hook(env, native_completion_runtime_cleanup, runtime) != napi_ok) {
+        goto fail;
+    }
+    cleanup_hook_installed = true;
 
     napi_property_descriptor client_methods[] = {
         {"call", NULL, native_client_call, NULL, NULL, NULL, napi_default, NULL},
@@ -6560,15 +6939,17 @@ static napi_value init(napi_env env, napi_value exports) {
         {"close", NULL, native_client_close, NULL, NULL, NULL, napi_default, NULL},
     };
     napi_value client_ctor = NULL;
-    napi_define_class(env,
-        "NativeClient",
-        NAPI_AUTO_LENGTH,
-        native_client_constructor,
-        NULL,
-        sizeof(client_methods) / sizeof(client_methods[0]),
-        client_methods,
-        &client_ctor);
-    napi_create_reference(env, client_ctor, 1, &runtime->client_constructor);
+    if (napi_define_class(env,
+            "NativeClient",
+            NAPI_AUTO_LENGTH,
+            native_client_constructor,
+            NULL,
+            sizeof(client_methods) / sizeof(client_methods[0]),
+            client_methods,
+            &client_ctor) != napi_ok ||
+        napi_create_reference(env, client_ctor, 1, &runtime->client_constructor) != napi_ok) {
+        goto fail;
+    }
 
     napi_property_descriptor stream_methods[] = {
         {"sendMessage", NULL, native_stream_send_message, NULL, NULL, NULL, napi_default, NULL},
@@ -6599,15 +6980,17 @@ static napi_value init(napi_env env, napi_value exports) {
 #endif
     };
     napi_value stream_ctor = NULL;
-    napi_define_class(env,
-        "NativeStream",
-        NAPI_AUTO_LENGTH,
-        native_stream_constructor,
-        NULL,
-        sizeof(stream_methods) / sizeof(stream_methods[0]),
-        stream_methods,
-        &stream_ctor);
-    napi_create_reference(env, stream_ctor, 1, &runtime->stream_constructor);
+    if (napi_define_class(env,
+            "NativeStream",
+            NAPI_AUTO_LENGTH,
+            native_stream_constructor,
+            NULL,
+            sizeof(stream_methods) / sizeof(stream_methods[0]),
+            stream_methods,
+            &stream_ctor) != napi_ok ||
+        napi_create_reference(env, stream_ctor, 1, &runtime->stream_constructor) != napi_ok) {
+        goto fail;
+    }
 
     napi_property_descriptor server_methods[] = {
         {"register", NULL, native_server_register, NULL, NULL, NULL, napi_default, NULL},
@@ -6615,15 +6998,17 @@ static napi_value init(napi_env env, napi_value exports) {
         {"close", NULL, native_server_close, NULL, NULL, NULL, napi_default, NULL},
     };
     napi_value server_ctor = NULL;
-    napi_define_class(env,
-        "NativeServer",
-        NAPI_AUTO_LENGTH,
-        native_server_constructor,
-        NULL,
-        sizeof(server_methods) / sizeof(server_methods[0]),
-        server_methods,
-        &server_ctor);
-    napi_create_reference(env, server_ctor, 1, &runtime->server_constructor);
+    if (napi_define_class(env,
+            "NativeServer",
+            NAPI_AUTO_LENGTH,
+            native_server_constructor,
+            NULL,
+            sizeof(server_methods) / sizeof(server_methods[0]),
+            server_methods,
+            &server_ctor) != napi_ok ||
+        napi_create_reference(env, server_ctor, 1, &runtime->server_constructor) != napi_ok) {
+        goto fail;
+    }
 
     napi_property_descriptor call_methods[] = {
         {"respond", NULL, native_call_respond, NULL, NULL, NULL, napi_default, NULL},
@@ -6654,29 +7039,33 @@ static napi_value init(napi_env env, napi_value exports) {
 #endif
     };
     napi_value call_ctor = NULL;
-    napi_define_class(env,
-        "NativeCall",
-        NAPI_AUTO_LENGTH,
-        native_call_constructor,
-        NULL,
-        sizeof(call_methods) / sizeof(call_methods[0]),
-        call_methods,
-        &call_ctor);
-    napi_create_reference(env, call_ctor, 1, &runtime->call_constructor);
+    if (napi_define_class(env,
+            "NativeCall",
+            NAPI_AUTO_LENGTH,
+            native_call_constructor,
+            NULL,
+            sizeof(call_methods) / sizeof(call_methods[0]),
+            call_methods,
+            &call_ctor) != napi_ok ||
+        napi_create_reference(env, call_ctor, 1, &runtime->call_constructor) != napi_ok) {
+        goto fail;
+    }
 
     napi_property_descriptor cancellation_methods[] = {
         {"cancel", NULL, native_cancellation_cancel, NULL, NULL, NULL, napi_default, NULL},
     };
     napi_value cancellation_ctor = NULL;
-    napi_define_class(env,
-        "NativeCancellation",
-        NAPI_AUTO_LENGTH,
-        native_cancellation_constructor,
-        NULL,
-        sizeof(cancellation_methods) / sizeof(cancellation_methods[0]),
-        cancellation_methods,
-        &cancellation_ctor);
-    napi_create_reference(env, cancellation_ctor, 1, &runtime->cancellation_constructor);
+    if (napi_define_class(env,
+            "NativeCancellation",
+            NAPI_AUTO_LENGTH,
+            native_cancellation_constructor,
+            NULL,
+            sizeof(cancellation_methods) / sizeof(cancellation_methods[0]),
+            cancellation_methods,
+            &cancellation_ctor) != napi_ok ||
+        napi_create_reference(env, cancellation_ctor, 1, &runtime->cancellation_constructor) != napi_ok) {
+        goto fail;
+    }
 
     napi_property_descriptor exports_desc[] = {
         {"createCancellation", NULL, native_create_cancellation, NULL, NULL, NULL, napi_default, NULL},
@@ -6720,10 +7109,44 @@ static napi_value init(napi_env env, napi_value exports) {
             NULL,
             napi_default,
             NULL},
+        {"_debugCompletionRuntimeStats", NULL, debug_completion_runtime_stats, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugQueueGatedCompletion", NULL, debug_queue_gated_completion, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugCompletionGateReached", NULL, debug_completion_gate_reached, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugReleaseCompletionGate", NULL, debug_release_completion_gate, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugCloseGatedCompletionRuntime",
+            NULL,
+            debug_close_gated_completion_runtime,
+            NULL,
+            NULL,
+            NULL,
+            napi_default,
+            NULL},
+        {"_debugBlockCompletionJs", NULL, debug_block_completion_js, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugCompletionJsBlocked", NULL, debug_completion_js_blocked, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugReleaseCompletionJs", NULL, debug_release_completion_js, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugResetCompletionGate", NULL, debug_reset_completion_gate, NULL, NULL, NULL, napi_default, NULL},
 #endif
     };
-    napi_define_properties(env, exports, sizeof(exports_desc) / sizeof(exports_desc[0]), exports_desc);
+    if (napi_define_properties(env, exports, sizeof(exports_desc) / sizeof(exports_desc[0]), exports_desc) != napi_ok) {
+        goto fail;
+    }
+    native_completion_runtime_release(runtime);
     return exports;
+
+fail:
+    native_completion_runtime_close(runtime);
+    native_completion_runtime_delete_constructor_refs(env, runtime);
+    if (cleanup_hook_installed &&
+        napi_remove_env_cleanup_hook(env, native_completion_runtime_cleanup, runtime) == napi_ok) {
+        cleanup_hook_installed = false;
+    }
+    if (instance_data_installed && !cleanup_hook_installed &&
+        napi_set_instance_data(env, NULL, NULL, NULL) == napi_ok) {
+        native_completion_runtime_release(runtime);
+    }
+    native_completion_runtime_release(runtime);
+    napi_throw_error(env, NULL, "failed to initialize native completion runtime");
+    return NULL;
 }
 
 NAPI_MODULE(NODE_GYP_MODULE_NAME, init)
