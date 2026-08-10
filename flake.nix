@@ -518,7 +518,8 @@
                   export HOME=$(mktemp -d)
                   export TREVRPC_BENCH_SERVER_WORKERS=8
                   trevrpc-bench run ${./bench/campaigns/webkit-smoke.example.json} --out run
-                  test "$(wc -l < run/samples.jsonl)" -eq 24
+                  # Go remains excluded pending https://github.com/quic-go/webtransport-go/issues/355.
+                  test "$(wc -l < run/samples.jsonl)" -eq 20
                   test -s run/aggregate.csv
                   test -s run/report.md
                   test -s run/report.html

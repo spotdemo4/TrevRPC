@@ -444,36 +444,48 @@ mod tests {
     }
 
     #[test]
-    fn webtransport_smoke_has_six_servers_and_twenty_four_samples() {
-        for (content, browser) in [
+    fn webtransport_smoke_has_expected_servers_and_samples() {
+        for (content, browser, expected_servers, expected_samples) in [
             (
                 include_str!("../campaigns/chromium-smoke.example.json"),
                 "chromium",
+                6,
+                24,
             ),
             (
                 include_str!("../campaigns/firefox-smoke.example.json"),
                 "firefox",
+                6,
+                24,
             ),
             (
                 include_str!("../campaigns/webkit-smoke.example.json"),
                 "webkit",
+                5,
+                20,
             ),
         ] {
             let campaign: Campaign =
                 serde_json::from_str(content).expect("WebTransport smoke campaign");
             campaign.validate().expect("valid WebTransport campaign");
-            assert_eq!(campaign.cells.len(), 6);
+            assert_eq!(campaign.cells.len(), expected_servers);
             assert!(
                 campaign
                     .cells
                     .iter()
                     .all(|cell| cell.client == browser && cell.stack == Stack::TrevrpcWebtransport)
             );
+            if browser == "webkit" {
+                // Keep the Go server excluded until upstream Safari compatibility is resolved:
+                // https://github.com/quic-go/webtransport-go/issues/355
+                assert!(campaign.peer("go").is_none());
+                assert!(campaign.cells.iter().all(|cell| cell.server != "go"));
+            }
             let sample_count = usize::try_from(campaign.repetitions).unwrap()
                 * campaign.cells.len()
                 * campaign.rpc_kinds.len()
                 * campaign.concurrencies.len();
-            assert_eq!(sample_count, 24);
+            assert_eq!(sample_count, expected_samples);
         }
     }
 }
