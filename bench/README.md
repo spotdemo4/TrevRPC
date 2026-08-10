@@ -64,14 +64,23 @@ for performance comparisons. The Nix smoke checks set
 `TREVRPC_BENCH_SERVER_WORKERS=8` to keep concurrent checks within CI task
 limits; normal benchmark runs retain the C peer's 128-worker default.
 
+Campaign runs stop at the first failed sample by default. Set
+`TREVRPC_BENCH_RUN_ENTIRE_CAMPAIGN=true` to attempt every remaining sample and
+return an aggregate failure after the matrix completes. The variable accepts
+only `true` or `false`. Campaign setup failures still stop immediately, and an
+incomplete campaign retains its successful samples and raw diagnostics without
+generating reports.
+
 `stack-comparison.example.json` contains same-language native QUIC cells for C,
 C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's
 advertised stacks, roles, RPC kinds, and histogram before starting a run.
 
 `chromium-smoke.example.json`, `firefox-smoke.example.json`, and
 `webkit-smoke.example.json` each start the respective browser client before
-each RPC server and run it against all six server implementations. Each
-campaign's six cells and four RPC kinds produce 24 functional samples. The
+each RPC server. Chromium and Firefox run against all six server implementations
+for 24 functional samples. WebKit currently runs against five implementations
+for 20 samples because Go remains excluded pending
+[webtransport-go#355](https://github.com/quic-go/webtransport-go/issues/355). The
 client first reports its prepared browser origin; the controller passes that
 origin to the server, sends the ready server address back with `CONNECT`, waits
 for `armed`, and then starts measurement.

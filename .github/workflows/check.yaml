@@ -40,4 +40,12 @@ jobs:
         run: nix build .#checks.aarch64-darwin.kotlin --no-link --option log-lines 100
 
       - name: Check WebKit
-        run: nix build .#checks.aarch64-darwin.benchmark-webkit-smoke --no-link --option log-lines 100
+        run: |
+          nix build --impure --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+            in
+            flake.checks.aarch64-darwin.benchmark-webkit-smoke.overrideAttrs (_: {
+              TREVRPC_BENCH_RUN_ENTIRE_CAMPAIGN = "true";
+            })
+          ' --no-link --option log-lines 100

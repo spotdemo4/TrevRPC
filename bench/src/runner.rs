@@ -20,6 +20,7 @@ use crate::protocol::{
 };
 use crate::{BoxError, SCHEMA_VERSION, report};
 
+const RUN_ENTIRE_CAMPAIGN_ENV: &str = "TREVRPC_BENCH_RUN_ENTIRE_CAMPAIGN";
 const MAX_CAPABILITY_OUTPUT_BYTES: usize = 64 * 1024;
 // log_linear_v1 has at most 28,671 distinct u64 buckets; 3 MiB bounds a
 // maximally sparse sample event without imposing the capability-output limit.
@@ -92,6 +93,7 @@ pub fn print_capabilities(campaign: &Campaign) -> Result<(), BoxError> {
 }
 
 pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(), BoxError> {
+    let run_entire_campaign = parse_run_entire_campaign(std::env::var(RUN_ENTIRE_CAMPAIGN_ENV))?;
     if output.join("manifest.json").exists() || output.join("samples.jsonl").exists() {
         return Err(format!(
             "output directory {} already contains a campaign",
@@ -113,6 +115,47 @@ pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(
         .create_new(true)
         .write(true)
         .open(&samples_path)?;
+    run_samples(
+        campaign,
+        &mut samples,
+        run_entire_campaign,
+        |cell, rpc_kind, concurrency, repetition| {
+            run_sample(
+                campaign,
+                cell,
+                rpc_kind,
+                concurrency,
+                repetition,
+                &certificates,
+                &topology,
+                output,
+            )
+        },
+    )?;
+    report::generate(output)
+}
+
+fn parse_run_entire_campaign(value: Result<String, std::env::VarError>) -> Result<bool, BoxError> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(value) => match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(format!("{RUN_ENTIRE_CAMPAIGN_ENV} must be true or false").into()),
+        },
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{RUN_ENTIRE_CAMPAIGN_ENV} must be true or false").into())
+        }
+    }
+}
+
+fn run_samples(
+    campaign: &Campaign,
+    samples: &mut impl Write,
+    run_entire_campaign: bool,
+    mut execute: impl FnMut(&Cell, RpcKind, usize, u32) -> Result<SampleRecord, BoxError>,
+) -> Result<(), BoxError> {
+    let mut failures = Vec::new();
     for repetition in 1..=campaign.repetitions {
         let mut matrix = campaign
             .concurrencies
@@ -130,22 +173,30 @@ pub fn run(campaign: &Campaign, campaign_path: &Path, output: &Path) -> Result<(
             matrix.reverse();
         }
         for (concurrency, rpc_kind, cell) in matrix {
-            let sample = run_sample(
-                campaign,
-                cell,
-                rpc_kind,
-                concurrency,
-                repetition,
-                &certificates,
-                &topology,
-                output,
-            )?;
-            serde_json::to_writer(&mut samples, &sample)?;
-            samples.write_all(b"\n")?;
-            samples.flush()?;
+            match execute(cell, rpc_kind, concurrency, repetition) {
+                Ok(sample) => {
+                    serde_json::to_writer(&mut *samples, &sample)?;
+                    samples.write_all(b"\n")?;
+                    samples.flush()?;
+                }
+                Err(error) if run_entire_campaign => {
+                    let sample_id = sample_id(cell, rpc_kind, concurrency, repetition);
+                    eprintln!("failed {sample_id}: {error}");
+                    failures.push((sample_id, error.to_string()));
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
-    report::generate(output)
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = format!("{} benchmark samples failed", failures.len());
+    for (sample_id, error) in failures {
+        let _ = write!(message, "\n{sample_id}: {error}");
+    }
+    Err(message.into())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -935,15 +986,18 @@ fn path_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::fs;
+    use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use super::{
         MAX_BENCHMARK_EVENT_BYTES, MAX_CAPABILITY_OUTPUT_BYTES, MAX_DIAGNOSTIC_STREAM_BYTES,
-        PeerProcess, client_arguments, read_output_tail, sample_id, server_arguments, sha256,
-        validate_capabilities, wait_for_client_event,
+        PeerProcess, RUN_ENTIRE_CAMPAIGN_ENV, SampleRecord, client_arguments,
+        parse_run_entire_campaign, read_output_tail, run_samples, sample_id, server_arguments,
+        sha256, validate_capabilities, wait_for_client_event,
     };
     use crate::SCHEMA_VERSION;
     use crate::campaign::{Campaign, Cell, Network, Peer, RpcKind, Stack, Timing, Workload};
@@ -1047,6 +1101,95 @@ mod tests {
             .position(|argument| argument == option)
             .and_then(|index| arguments.get(index + 1))
             .map(String::as_str)
+    }
+
+    #[test]
+    fn parses_run_entire_campaign_strictly() {
+        assert!(!parse_run_entire_campaign(Err(std::env::VarError::NotPresent)).expect("unset"));
+        assert!(parse_run_entire_campaign(Ok("true".to_owned())).expect("true"));
+        assert!(!parse_run_entire_campaign(Ok("false".to_owned())).expect("false"));
+
+        for value in ["", "TRUE", "1", " true"] {
+            let error = parse_run_entire_campaign(Ok(value.to_owned()))
+                .expect_err("invalid value")
+                .to_string();
+            assert_eq!(
+                error,
+                format!("{RUN_ENTIRE_CAMPAIGN_ENV} must be true or false")
+            );
+        }
+
+        let error = parse_run_entire_campaign(Err(std::env::VarError::NotUnicode(
+            OsString::from_vec(vec![0xff]),
+        )))
+        .expect_err("non-Unicode value")
+        .to_string();
+        assert_eq!(
+            error,
+            format!("{RUN_ENTIRE_CAMPAIGN_ENV} must be true or false")
+        );
+    }
+
+    #[test]
+    fn sample_matrix_fails_fast_by_default() {
+        let mut campaign = campaign();
+        campaign.rpc_kinds = vec![RpcKind::Unary, RpcKind::Bidi];
+        campaign.concurrencies = vec![1, 2];
+        let mut attempts = Vec::new();
+        let mut samples = Vec::new();
+
+        let error = run_samples(
+            &campaign,
+            &mut samples,
+            false,
+            |cell, rpc_kind, concurrency, repetition| {
+                let sample_id = sample_id(cell, rpc_kind, concurrency, repetition);
+                attempts.push(sample_id.clone());
+                Err::<SampleRecord, _>(format!("failure {sample_id}").into())
+            },
+        )
+        .expect_err("first sample failure")
+        .to_string();
+
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(error, format!("failure {}", attempts[0]));
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn sample_matrix_can_collect_every_failure() {
+        let mut campaign = campaign();
+        campaign.repetitions = 2;
+        campaign.rpc_kinds = vec![RpcKind::Unary, RpcKind::Bidi];
+        campaign.concurrencies = vec![1, 2];
+        let mut attempts = Vec::new();
+        let mut samples = Vec::new();
+
+        let error = run_samples(
+            &campaign,
+            &mut samples,
+            true,
+            |cell, rpc_kind, concurrency, repetition| {
+                let sample_id = sample_id(cell, rpc_kind, concurrency, repetition);
+                attempts.push(sample_id.clone());
+                Err::<SampleRecord, _>(format!("failure {sample_id}").into())
+            },
+        )
+        .expect_err("campaign failures")
+        .to_string();
+
+        assert_eq!(attempts.len(), 8);
+        assert!(error.starts_with("8 benchmark samples failed\n"));
+        let positions = attempts
+            .iter()
+            .map(|sample_id| {
+                error
+                    .find(&format!("{sample_id}: failure {sample_id}"))
+                    .expect("sample failure in aggregate")
+            })
+            .collect::<Vec<_>>();
+        assert!(positions.windows(2).all(|window| window[0] < window[1]));
+        assert!(samples.is_empty());
     }
 
     #[test]
