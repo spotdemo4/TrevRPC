@@ -461,8 +461,8 @@ mod tests {
             (
                 include_str!("../campaigns/webkit-smoke.example.json"),
                 "webkit",
-                5,
-                20,
+                4,
+                16,
             ),
         ] {
             let campaign: Campaign =
@@ -480,6 +480,10 @@ mod tests {
                 // https://github.com/quic-go/webtransport-go/issues/355
                 assert!(campaign.peer("go").is_none());
                 assert!(campaign.cells.iter().all(|cell| cell.server != "go"));
+                // Keep the Rust server excluded until upstream Safari compatibility is resolved:
+                // https://github.com/hyperium/h3/issues/347
+                assert!(campaign.peer("rust").is_none());
+                assert!(campaign.cells.iter().all(|cell| cell.server != "rust"));
             }
             let sample_count = usize::try_from(campaign.repetitions).unwrap()
                 * campaign.cells.len()

@@ -22,10 +22,6 @@
     {
       "id": "kotlin",
       "command": ["trevrpc-bench-peer-kotlin"]
-    },
-    {
-      "id": "rust",
-      "command": ["trevrpc-bench-peer-rust"]
     }
   ],
   "cells": [
@@ -51,12 +47,6 @@
       "id": "webkit-kotlin",
       "client": "webkit",
       "server": "kotlin",
-      "stack": "trevrpc_webtransport"
-    },
-    {
-      "id": "webkit-rust",
-      "client": "webkit",
-      "server": "rust",
       "stack": "trevrpc_webtransport"
     }
   ],
