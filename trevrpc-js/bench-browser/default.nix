@@ -41,7 +41,7 @@ assert lib.assertMsg (playwrightCoreVersion == playwright-driver.version) ''
 '';
 buildNpmPackage (final: {
   pname = "trevrpc-bench-peer-browser";
-  version = "0.1.9";
+  version = "0.2.0";
 
   src = lib.fileset.toSource {
     root = ../../.;

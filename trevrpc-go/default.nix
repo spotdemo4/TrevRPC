@@ -12,7 +12,7 @@ let
 in
 buildGoModule (final: {
   pname = "trevrpc-go";
-  version = "0.1.9";
+  version = "0.1.10";
 
   src = lib.fileset.toSource {
     root = ../.;
