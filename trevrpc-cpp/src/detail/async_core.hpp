@@ -83,14 +83,14 @@ public:
     schedule(continuation);
   }
 
-  void fail(std::exception_ptr exception) noexcept {
+  void fail(const std::exception_ptr& exception) noexcept {
     std::coroutine_handle<> continuation;
     {
       std::lock_guard lock(mutex_);
       if (ready_) {
         return;
       }
-      exception_ = std::move(exception);
+      exception_ = exception;
       ready_ = true;
       continuation = continuation_;
     }

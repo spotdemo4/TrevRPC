@@ -24,7 +24,7 @@ namespace {
 }
 
 void report_exception(const CallbackExceptionState& state, std::string_view callback,
-                      std::exception_ptr exception) noexcept {
+                      std::exception_ptr&& exception) noexcept {
   if (!state.sink) {
     return;
   }

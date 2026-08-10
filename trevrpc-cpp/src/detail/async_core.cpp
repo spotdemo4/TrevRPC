@@ -165,21 +165,16 @@ void CancellationState::cancel() noexcept {
 }
 
 std::uint64_t CancellationState::register_callback(Work callback) {
-  bool invoke = false;
-  std::uint64_t id = 0;
   {
     std::lock_guard lock(mutex_);
-    if (cancelled_) {
-      invoke = true;
-    } else {
-      id = next_id_++;
-      callbacks_.emplace(id, callback);
+    if (!cancelled_) {
+      const std::uint64_t id = next_id_++;
+      callbacks_.emplace(id, std::move(callback));
+      return id;
     }
   }
-  if (invoke) {
-    callback();
-  }
-  return id;
+  callback();
+  return 0;
 }
 
 void CancellationState::unregister_callback(std::uint64_t id) noexcept {
