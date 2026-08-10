@@ -529,7 +529,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
       }, 20);
       const blockedUntil = Date.now() + 100;
       while (Date.now() < blockedUntil) {
-        // Keep the JS thread busy so the native admission wait expires first.
+        // The debug hook has armed the native timeout; block its queued JS callback until it expires.
       }
       assert.equal(await admission, false);
       await delay(20);
