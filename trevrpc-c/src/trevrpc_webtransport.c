@@ -41,6 +41,11 @@
 #define TREV_WT_H3_SETTINGS_WT_ENABLED_DRAFT15 0x2c7cf000
 #define TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS 0x14e9cd29
 #define TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE (1ull << 60)
+#define TREV_WT_NETWORK_FRAMEWORK_INITIAL_MAX_DATA (8ull * 1024 * 1024)
+#define TREV_WT_NETWORK_FRAMEWORK_INITIAL_MAX_STREAMS 100
+#define TREV_WT_CAPSULE_MAX_DATA 0x190b4d3d
+#define TREV_WT_CAPSULE_MAX_STREAMS_BIDI 0x190b4d3f
+#define TREV_WT_CAPSULE_MAX_STREAMS_UNI 0x190b4d40
 #define TREV_WT_CONNECT_STATUS_OK 200
 #define TREV_WT_STREAM_TYPE_BIDI 0x41
 #define TREV_WT_STREAM_TYPE_BIDI_LEN 2
@@ -77,6 +82,7 @@ typedef enum trevrpc_wt_draft {
     TREV_WT_DRAFT_NONE = 0,
     TREV_WT_DRAFT_02 = 2,
     TREV_WT_DRAFT_07 = 7,
+    TREV_WT_DRAFT_14 = 14,
     TREV_WT_DRAFT_15 = 15,
 } trevrpc_wt_draft;
 
@@ -95,7 +101,11 @@ typedef struct trevrpc_wt_peer_settings {
     bool enable_connect_protocol;
     bool enable_webtransport_draft02;
     bool enable_webtransport_draft07;
+    bool enable_webtransport_draft14;
     bool enable_webtransport_draft15;
+    uint64_t wt_initial_max_data;
+    uint64_t wt_initial_max_streams_uni;
+    uint64_t wt_initial_max_streams_bidi;
     bool h3_datagram_rfc;
     bool h3_datagram_draft04;
 } trevrpc_wt_peer_settings;
@@ -116,6 +126,7 @@ struct trevrpc_wt_session {
     trevrpc_msquic_stream* connect_stream;
     uint64_t connect_stream_id;
     trevrpc_wt_draft draft;
+    bool requires_initial_capsule_flow_control;
 };
 
 struct trevrpc_wt_stream {
@@ -221,6 +232,13 @@ static uint64_t trevrpc_h3_monotonic_nanos(void);
 static intptr_t trevrpc_h3_read_varint_incremental(
     trevrpc_h3_stream* stream, uint64_t* value, trevrpc_h3_read_mode mode, uint64_t deadline_nanos);
 
+static uint16_t trevrpc_wt_effective_stream_limit(uint32_t configured) {
+    if (configured == 0) {
+        return TREV_WT_DEFAULT_STREAMS;
+    }
+    return configured > UINT16_MAX ? UINT16_MAX : (uint16_t)configured;
+}
+
 static trevrpc_msquic_config trevrpc_wt_msquic_config(const trevrpc_wt_config* config) {
     trevrpc_msquic_config msquic_config = {0};
     msquic_config.alpn = TREV_WT_H3_ALPN;
@@ -230,8 +248,7 @@ static trevrpc_msquic_config trevrpc_wt_msquic_config(const trevrpc_wt_config* c
     msquic_config.ca_cert_file = config->ca_cert_file;
     msquic_config.skip_certificate_validation = config->skip_certificate_validation;
     msquic_config.max_idle_timeout_ms = config->idle_timeout_ms;
-    msquic_config.peer_bidi_stream_count =
-        config->max_streams_per_session > 0 ? (uint16_t)config->max_streams_per_session : TREV_WT_DEFAULT_STREAMS;
+    msquic_config.peer_bidi_stream_count = trevrpc_wt_effective_stream_limit(config->max_streams_per_session);
     msquic_config.peer_unidi_stream_count = TREV_WT_H3_DEFAULT_UNIDI_STREAMS;
     return msquic_config;
 }
@@ -459,16 +476,30 @@ static int trevrpc_wt_accept_peer_bidirectional_stream(
     }
 }
 
+static bool trevrpc_wt_is_network_framework_legacy_peer(const trevrpc_wt_peer_settings* settings) {
+    return settings != NULL && settings->h3_datagram_rfc && settings->enable_webtransport_draft07 &&
+           settings->enable_webtransport_draft14 && !settings->enable_webtransport_draft15 &&
+           settings->wt_initial_max_data == TREV_WT_NETWORK_FRAMEWORK_INITIAL_MAX_DATA &&
+           settings->wt_initial_max_streams_uni == TREV_WT_NETWORK_FRAMEWORK_INITIAL_MAX_STREAMS &&
+           settings->wt_initial_max_streams_bidi == TREV_WT_NETWORK_FRAMEWORK_INITIAL_MAX_STREAMS;
+}
+
 static trevrpc_wt_draft trevrpc_wt_select_draft(trevrpc_wt_role role, const trevrpc_wt_peer_settings* settings) {
     if (settings == NULL) {
         return TREV_WT_DRAFT_NONE;
     }
 
-    bool server_peer_can_attempt_draft15 = role == TREV_WT_ROLE_SERVER && settings->h3_datagram_rfc &&
-                                           !settings->enable_webtransport_draft02 &&
-                                           !settings->enable_webtransport_draft07;
+    bool server_peer_can_attempt_draft15 =
+        role == TREV_WT_ROLE_SERVER && settings->h3_datagram_rfc && !settings->enable_webtransport_draft02 &&
+        !settings->enable_webtransport_draft07 && !settings->enable_webtransport_draft14;
     if (settings->enable_webtransport_draft15 || server_peer_can_attempt_draft15) {
         return TREV_WT_DRAFT_15;
+    }
+    if (role == TREV_WT_ROLE_SERVER && trevrpc_wt_is_network_framework_legacy_peer(settings)) {
+        return TREV_WT_DRAFT_07;
+    }
+    if (settings->enable_webtransport_draft14) {
+        return TREV_WT_DRAFT_14;
     }
     if (settings->enable_webtransport_draft07) {
         return TREV_WT_DRAFT_07;
@@ -491,6 +522,7 @@ static int trevrpc_wt_validate_settings_for_draft(
             return TREV_WT_ERR_REJECTED;
         }
         return settings->h3_datagram_rfc ? 0 : TREV_WT_ERR_REJECTED;
+    case TREV_WT_DRAFT_14:
     case TREV_WT_DRAFT_07:
         if (role == TREV_WT_ROLE_CLIENT && !settings->enable_connect_protocol) {
             return TREV_WT_ERR_REJECTED;
@@ -1668,6 +1700,61 @@ static int trevrpc_h3_write_response_headers(trevrpc_msquic_stream* stream, unsi
     return err == 0 ? trevrpc_wt_write_headers_frame_with_fin(stream, block, offset, finish_send) : err;
 }
 
+static int trevrpc_wt_write_capsule_value_frame(trevrpc_msquic_stream* stream, uint64_t type, uint64_t value) {
+    uint8_t value_bytes[8];
+    size_t value_len = 0;
+    int err = trevrpc_wt_varint_write(value_bytes, sizeof(value_bytes), value, &value_len);
+    if (err != 0) {
+        return err;
+    }
+
+    uint8_t capsule[24];
+    size_t capsule_len = 0;
+    size_t written = 0;
+    err = trevrpc_wt_varint_write(capsule + capsule_len, sizeof(capsule) - capsule_len, type, &written);
+    if (err == 0) {
+        capsule_len += written;
+        err = trevrpc_wt_varint_write(capsule + capsule_len, sizeof(capsule) - capsule_len, value_len, &written);
+    }
+    if (err == 0) {
+        capsule_len += written;
+        memcpy(capsule + capsule_len, value_bytes, value_len);
+        capsule_len += value_len;
+    }
+
+    uint8_t frame[40];
+    size_t frame_len = 0;
+    if (err == 0) {
+        err = trevrpc_wt_varint_write(frame + frame_len, sizeof(frame) - frame_len, TREV_WT_H3_FRAME_DATA, &written);
+    }
+    if (err == 0) {
+        frame_len += written;
+        err = trevrpc_wt_varint_write(frame + frame_len, sizeof(frame) - frame_len, capsule_len, &written);
+    }
+    if (err == 0) {
+        frame_len += written;
+        memcpy(frame + frame_len, capsule, capsule_len);
+        frame_len += capsule_len;
+    }
+    return err == 0 ? trevrpc_wt_write_all(stream, frame, frame_len) : err;
+}
+
+static int trevrpc_wt_write_initial_capsule_flow_control(trevrpc_wt_session* session, trevrpc_msquic_stream* stream) {
+    if (!session->requires_initial_capsule_flow_control) {
+        return 0;
+    }
+    int err = trevrpc_wt_write_capsule_value_frame(
+        stream, TREV_WT_CAPSULE_MAX_STREAMS_BIDI, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE);
+    if (err == 0) {
+        err = trevrpc_wt_write_capsule_value_frame(stream, TREV_WT_CAPSULE_MAX_STREAMS_UNI, 0);
+    }
+    if (err == 0) {
+        err = trevrpc_wt_write_capsule_value_frame(
+            stream, TREV_WT_CAPSULE_MAX_DATA, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE);
+    }
+    return err;
+}
+
 static int trevrpc_wt_validate_connect_response(const trevrpc_wt_headers* headers, void* context) {
     trevrpc_wt_connect_response_context* response_context = context;
     if (!headers->status_200) {
@@ -1683,6 +1770,7 @@ static bool trevrpc_wt_connect_protocol_matches(const trevrpc_wt_headers* header
     switch (draft) {
     case TREV_WT_DRAFT_15:
         return headers->protocol_webtransport_h3 || headers->protocol_webtransport;
+    case TREV_WT_DRAFT_14:
     case TREV_WT_DRAFT_07:
     case TREV_WT_DRAFT_02:
         return headers->protocol_webtransport;
@@ -1831,6 +1919,9 @@ static int trevrpc_wt_accept_connect_stream(trevrpc_wt_session* session, const t
     if (err == 0) {
         err = trevrpc_wt_write_headers_frame(stream, block, offset);
     }
+    if (err == 0) {
+        err = trevrpc_wt_write_initial_capsule_flow_control(session, stream);
+    }
     if (err != 0) {
         trevrpc_msquic_stream_close(stream);
         return err;
@@ -1848,24 +1939,55 @@ static int trevrpc_wt_write_control_settings(trevrpc_wt_session* session, const 
     }
 
     uint64_t session_limit = trevrpc_wt_configured_session_limit(config);
-    const trevrpc_wt_setting_pair settings[] = {
-        {TREV_WT_H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0},
-        {TREV_WT_H3_SETTINGS_QPACK_BLOCKED_STREAMS, 0},
-        {TREV_WT_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1},
-        {TREV_WT_H3_SETTINGS_WT_ENABLED_DRAFT15, 1},
-        {TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS, session_limit},
-        {TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE},
-        {TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE},
-        {TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_DATA, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE},
-        {TREV_WT_H3_SETTINGS_WEBTRANSPORT_DRAFT02, 1},
-        {TREV_WT_H3_SETTINGS_H3_DATAGRAM, 1},
-        {TREV_WT_H3_SETTINGS_H3_DRAFT04_DATAGRAM, 1},
-        {TREV_WT_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, session_limit},
-        {TREV_WT_H3_SETTINGS_MAX_FIELD_SECTION_SIZE, 4096},
-    };
+    trevrpc_wt_setting_pair settings[13];
+    size_t settings_len = 0;
+    settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0};
+    settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_QPACK_BLOCKED_STREAMS, 0};
+    settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1};
+    settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_H3_DATAGRAM, 1};
+
+    switch (session->draft) {
+    case TREV_WT_DRAFT_15:
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WT_ENABLED_DRAFT15, 1};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS, session_limit};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){
+            TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){
+            TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){
+            TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_DATA, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE};
+        break;
+    case TREV_WT_DRAFT_14:
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS, session_limit};
+        break;
+    case TREV_WT_DRAFT_07:
+        settings[settings_len++] =
+            (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, session_limit};
+        break;
+    case TREV_WT_DRAFT_02:
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WEBTRANSPORT_DRAFT02, 1};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_H3_DRAFT04_DATAGRAM, 1};
+        break;
+    case TREV_WT_DRAFT_NONE:
+    default:
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WT_ENABLED_DRAFT15, 1};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS, session_limit};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){
+            TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){
+            TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){
+            TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_DATA, TREV_WT_H3_SETTINGS_MAX_FLOW_CONTROL_VALUE};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WEBTRANSPORT_DRAFT02, 1};
+        settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_H3_DRAFT04_DATAGRAM, 1};
+        settings[settings_len++] =
+            (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, session_limit};
+        break;
+    }
+    settings[settings_len++] = (trevrpc_wt_setting_pair){TREV_WT_H3_SETTINGS_MAX_FIELD_SECTION_SIZE, 4096};
 
     size_t payload_len = 0;
-    for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
+    for (size_t i = 0; i < settings_len; i++) {
         payload_len += trevrpc_wt_varint_len(settings[i].id) + trevrpc_wt_varint_len(settings[i].value);
     }
 
@@ -1883,7 +2005,7 @@ static int trevrpc_wt_write_control_settings(trevrpc_wt_session* session, const 
     }
     if (err == 0) {
         offset += written;
-        for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
+        for (size_t i = 0; i < settings_len; i++) {
             err = trevrpc_wt_varint_write(buffer + offset, sizeof(buffer) - offset, settings[i].id, &written);
             if (err != 0) {
                 break;
@@ -1944,7 +2066,16 @@ static int trevrpc_wt_read_settings_payload(
             settings->enable_webtransport_draft15 = value != 0;
             break;
         case TREV_WT_H3_SETTINGS_WT_MAX_SESSIONS:
-            settings->enable_webtransport_draft15 = value != 0;
+            settings->enable_webtransport_draft14 = value != 0;
+            break;
+        case TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_DATA:
+            settings->wt_initial_max_data = value;
+            break;
+        case TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI:
+            settings->wt_initial_max_streams_uni = value;
+            break;
+        case TREV_WT_H3_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI:
+            settings->wt_initial_max_streams_bidi = value;
             break;
         case TREV_WT_H3_SETTINGS_H3_DATAGRAM:
             if (!trevrpc_wt_bool_setting_valid(value)) {
@@ -1999,6 +2130,9 @@ static int trevrpc_wt_read_peer_control_settings(
         if (require_webtransport || session->draft != TREV_WT_DRAFT_NONE) {
             err = trevrpc_wt_validate_settings_for_draft(role, session->draft, settings);
         }
+        session->requires_initial_capsule_flow_control = role == TREV_WT_ROLE_SERVER &&
+                                                         session->draft == TREV_WT_DRAFT_07 &&
+                                                         trevrpc_wt_is_network_framework_legacy_peer(settings);
     }
 
     session->peer_control = control;
@@ -2007,12 +2141,20 @@ static int trevrpc_wt_read_peer_control_settings(
 
 static int trevrpc_wt_h3_handshake(
     trevrpc_wt_session* session, const trevrpc_wt_config* config, trevrpc_wt_role role, bool require_webtransport) {
-    int err = trevrpc_wt_write_control_settings(session, config);
-    if (err != 0) {
+    trevrpc_wt_peer_settings peer_settings = {0};
+    int err = 0;
+    if (role == TREV_WT_ROLE_SERVER) {
+        err = trevrpc_wt_read_peer_control_settings(session, role, require_webtransport, &peer_settings);
+        if (err == 0) {
+            err = trevrpc_wt_write_control_settings(session, config);
+        }
         return err;
     }
-    trevrpc_wt_peer_settings peer_settings = {0};
-    err = trevrpc_wt_read_peer_control_settings(session, role, require_webtransport, &peer_settings);
+
+    err = trevrpc_wt_write_control_settings(session, config);
+    if (err == 0) {
+        err = trevrpc_wt_read_peer_control_settings(session, role, require_webtransport, &peer_settings);
+    }
     return err;
 }
 
@@ -2424,6 +2566,9 @@ static int trevrpc_h3_accept_webtransport_connect(
         if (err == 0) {
             err = trevrpc_wt_write_headers_frame(stream->msquic_stream, block, offset);
         }
+        if (err == 0) {
+            err = trevrpc_wt_write_initial_capsule_flow_control(&conn->session, stream->msquic_stream);
+        }
     }
     if (err != 0) {
         trevrpc_msquic_stream_close(stream->msquic_stream);
@@ -2433,7 +2578,7 @@ static int trevrpc_h3_accept_webtransport_connect(
         conn->webtransport_resolving = false;
         pthread_cond_broadcast(&conn->cond);
         pthread_mutex_unlock(&conn->mutex);
-        return 0;
+        return err;
     }
     pthread_mutex_lock(&conn->mutex);
     conn->session.connect_stream = stream->msquic_stream;

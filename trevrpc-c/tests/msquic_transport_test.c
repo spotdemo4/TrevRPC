@@ -213,12 +213,19 @@ struct trevrpc_stream {
 };
 
 #define TEST_WT_SETTINGS_ENABLE_CONNECT_PROTOCOL 0x08
+#define TEST_WT_SETTINGS_GREASE 0x21
 #define TEST_WT_SETTINGS_H3_DATAGRAM 0x33
 #define TEST_WT_SETTINGS_H3_DRAFT04_DATAGRAM 0xffd277
 #define TEST_WT_SETTINGS_WEBTRANSPORT_DRAFT02 0x2b603742
 #define TEST_WT_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07 0xc671706a
 #define TEST_WT_SETTINGS_WT_ENABLED_DRAFT15 0x2c7cf000
 #define TEST_WT_SETTINGS_WT_MAX_SESSIONS 0x14e9cd29
+#define TEST_WT_SETTINGS_WT_INITIAL_MAX_DATA 0x2b61
+#define TEST_WT_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI 0x2b64
+#define TEST_WT_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI 0x2b65
+#define TEST_WT_CAPSULE_MAX_DATA 0x190b4d3d
+#define TEST_WT_CAPSULE_MAX_STREAMS_BIDI 0x190b4d3f
+#define TEST_WT_CAPSULE_MAX_STREAMS_UNI 0x190b4d40
 
 static void* accept_conn_thread(void* arg) {
     accept_args* args = arg;
@@ -567,6 +574,23 @@ static int test_varint_write(uint8_t* out, size_t out_len, size_t* offset, uint6
     return 0;
 }
 
+static int test_varint_read(const uint8_t* data, size_t len, size_t* offset, uint64_t* value) {
+    if (*offset >= len) {
+        return -1;
+    }
+    size_t varint_len = (size_t)1 << (data[*offset] >> 6);
+    if (len - *offset < varint_len) {
+        return -1;
+    }
+    uint64_t result = data[*offset] & 0x3f;
+    for (size_t i = 1; i < varint_len; i++) {
+        result = (result << 8) | data[*offset + i];
+    }
+    *offset += varint_len;
+    *value = result;
+    return 0;
+}
+
 static int test_qpack_varint_write(
     uint8_t* out, size_t out_len, size_t* offset, uint8_t prefix_bits, uint8_t flags, uint64_t value) {
     if (prefix_bits == 0 || prefix_bits > 8 || *offset >= out_len) {
@@ -641,6 +665,20 @@ static int test_build_draft15_control_settings(uint8_t* out, size_t out_len, siz
         {TEST_WT_SETTINGS_H3_DATAGRAM, 1},
         {TEST_WT_SETTINGS_WT_ENABLED_DRAFT15, 1},
         {TEST_WT_SETTINGS_WT_MAX_SESSIONS, 1},
+    };
+    return test_build_control_settings(out, out_len, out_written, settings, sizeof(settings) / sizeof(settings[0]));
+}
+
+static int test_build_webkit_control_settings(
+    uint8_t* out, size_t out_len, size_t* out_written, uint64_t initial_max_streams) {
+    const wt_setting_pair settings[] = {
+        {TEST_WT_SETTINGS_GREASE, 42},
+        {TEST_WT_SETTINGS_H3_DATAGRAM, 1},
+        {TEST_WT_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1},
+        {TEST_WT_SETTINGS_WT_MAX_SESSIONS, 1},
+        {TEST_WT_SETTINGS_WT_INITIAL_MAX_DATA, 8 * 1024 * 1024},
+        {TEST_WT_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, initial_max_streams},
+        {TEST_WT_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, initial_max_streams},
     };
     return test_build_control_settings(out, out_len, out_written, settings, sizeof(settings) / sizeof(settings[0]));
 }
@@ -802,6 +840,35 @@ static int test_read_varint(trevrpc_msquic_stream* stream, uint64_t* value) {
     }
     size_t len = (size_t)1 << (bytes[0] >> 6);
     if (test_read_exact(stream, bytes + 1, len - 1) != 0) {
+        return -1;
+    }
+    uint64_t decoded = bytes[0] & 0x3f;
+    for (size_t i = 1; i < len; i++) {
+        decoded = (decoded << 8) | bytes[i];
+    }
+    *value = decoded;
+    return 0;
+}
+
+static int test_read_exact_timeout(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        intptr_t n = trevrpc_msquic_stream_read_timeout(stream, data + offset, len - offset, 5000000000ull);
+        if (n <= 0) {
+            return -1;
+        }
+        offset += (size_t)n;
+    }
+    return 0;
+}
+
+static int test_read_varint_timeout(trevrpc_msquic_stream* stream, uint64_t* value) {
+    uint8_t bytes[8];
+    if (test_read_exact_timeout(stream, bytes, 1) != 0) {
+        return -1;
+    }
+    size_t len = (size_t)1 << (bytes[0] >> 6);
+    if (test_read_exact_timeout(stream, bytes + 1, len - 1) != 0) {
         return -1;
     }
     uint64_t decoded = bytes[0] & 0x3f;
@@ -2249,12 +2316,10 @@ static int run_malformed_wt_peer_case(const malformed_wt_peer_case* test_case) {
     trevrpc_wt_listener* listener = NULL;
     trevrpc_msquic_conn* client_conn = NULL;
     trevrpc_msquic_stream* local_control = NULL;
-    trevrpc_msquic_stream* peer_control = NULL;
     trevrpc_msquic_stream* connect_stream = NULL;
     wt_accept_args accept_args = {0};
     pthread_t accept_thread = {0};
     bool accept_thread_started = false;
-    uint8_t server_control[32];
     uint16_t port = 0;
     trevrpc_wt_config server_config = {
         .host = "127.0.0.1",
@@ -2270,9 +2335,6 @@ static int run_malformed_wt_peer_case(const malformed_wt_peer_case* test_case) {
     CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_wt_session_thread, &accept_args) == 0);
     accept_thread_started = true;
     CHECK_GOTO(trevrpc_msquic_dial("127.0.0.1", port, &test_h3_config, &client_conn) == 0);
-
-    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &peer_control) == 0);
-    CHECK_GOTO(trevrpc_msquic_stream_read(peer_control, server_control, sizeof(server_control)) > 0);
 
     CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &local_control) == 0);
     CHECK_GOTO(trevrpc_msquic_stream_write(local_control, test_case->control, test_case->control_len) ==
@@ -2298,7 +2360,6 @@ cleanup:
         (void)pthread_join(accept_thread, NULL);
     }
     trevrpc_msquic_stream_close(connect_stream);
-    trevrpc_msquic_stream_close(peer_control);
     trevrpc_msquic_stream_close(local_control);
     trevrpc_msquic_conn_close(client_conn);
     trevrpc_wt_session_close(accept_args.session);
@@ -2399,6 +2460,342 @@ static int test_webtransport_accepts_draft15_peer(void) {
         return 1;
     }
     return run_wt_accepts_raw_peer_case(control, control_len, "webtransport-h3", false);
+}
+
+static int test_expect_server_settings(trevrpc_msquic_stream* control, uint64_t expected_webtransport_setting) {
+    uint8_t payload[256];
+    uint64_t stream_type = 0;
+    uint64_t frame_type = 0;
+    uint64_t frame_len = 0;
+    if (test_read_varint_timeout(control, &stream_type) != 0 || test_read_varint_timeout(control, &frame_type) != 0 ||
+        test_read_varint_timeout(control, &frame_len) != 0 || stream_type != 0 || frame_type != 0x04 ||
+        frame_len > sizeof(payload) || test_read_exact_timeout(control, payload, (size_t)frame_len) != 0) {
+        return -1;
+    }
+
+    bool saw_connect_protocol = false;
+    bool saw_h3_datagram = false;
+    bool saw_expected_webtransport_setting = false;
+    bool saw_unexpected_webtransport_setting = false;
+    size_t offset = 0;
+    while (offset < (size_t)frame_len) {
+        uint64_t id = 0;
+        uint64_t value = 0;
+        if (test_varint_read(payload, (size_t)frame_len, &offset, &id) != 0 ||
+            test_varint_read(payload, (size_t)frame_len, &offset, &value) != 0) {
+            return -1;
+        }
+        if (id == TEST_WT_SETTINGS_ENABLE_CONNECT_PROTOCOL && value == 1) {
+            saw_connect_protocol = true;
+        } else if (id == TEST_WT_SETTINGS_H3_DATAGRAM && value == 1) {
+            saw_h3_datagram = true;
+        }
+        bool webtransport_setting =
+            id == TEST_WT_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07 || id == TEST_WT_SETTINGS_WT_ENABLED_DRAFT15 ||
+            id == TEST_WT_SETTINGS_WT_MAX_SESSIONS || id == TEST_WT_SETTINGS_WT_INITIAL_MAX_DATA ||
+            id == TEST_WT_SETTINGS_WT_INITIAL_MAX_STREAMS_UNI || id == TEST_WT_SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI ||
+            id == TEST_WT_SETTINGS_WEBTRANSPORT_DRAFT02;
+        if (webtransport_setting) {
+            if (id == expected_webtransport_setting && value == 1) {
+                saw_expected_webtransport_setting = true;
+            } else {
+                saw_unexpected_webtransport_setting = true;
+            }
+        }
+    }
+    return saw_connect_protocol && saw_h3_datagram && saw_expected_webtransport_setting &&
+                   !saw_unexpected_webtransport_setting
+               ? 0
+               : -1;
+}
+
+static int test_expect_connect_response_headers(trevrpc_msquic_stream* connect_stream) {
+    uint8_t payload[256];
+    uint64_t frame_type = 0;
+    uint64_t frame_len = 0;
+    if (test_read_varint_timeout(connect_stream, &frame_type) != 0 ||
+        test_read_varint_timeout(connect_stream, &frame_len) != 0 || frame_type != 0x01 ||
+        frame_len > sizeof(payload) || test_read_exact_timeout(connect_stream, payload, (size_t)frame_len) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int test_expect_initial_capsule_flow_control(trevrpc_msquic_stream* connect_stream) {
+    uint8_t payload[256];
+    uint64_t frame_type = 0;
+    uint64_t frame_len = 0;
+    if (test_expect_connect_response_headers(connect_stream) != 0) {
+        return -1;
+    }
+
+    bool saw_max_data = false;
+    bool saw_max_streams_bidi = false;
+    bool saw_max_streams_uni = false;
+    for (size_t i = 0; i < 3; i++) {
+        if (test_read_varint_timeout(connect_stream, &frame_type) != 0 ||
+            test_read_varint_timeout(connect_stream, &frame_len) != 0 || frame_type != 0x00 ||
+            frame_len > sizeof(payload) || test_read_exact_timeout(connect_stream, payload, (size_t)frame_len) != 0) {
+            return -1;
+        }
+        size_t offset = 0;
+        uint64_t capsule_type = 0;
+        uint64_t capsule_len = 0;
+        uint64_t capsule_value = 0;
+        if (test_varint_read(payload, (size_t)frame_len, &offset, &capsule_type) != 0 ||
+            test_varint_read(payload, (size_t)frame_len, &offset, &capsule_len) != 0) {
+            return -1;
+        }
+        size_t value_offset = offset;
+        if (test_varint_read(payload, (size_t)frame_len, &offset, &capsule_value) != 0 ||
+            capsule_len != offset - value_offset || offset != (size_t)frame_len) {
+            return -1;
+        }
+        switch (capsule_type) {
+        case TEST_WT_CAPSULE_MAX_DATA:
+            if (saw_max_data || capsule_value != ((uint64_t)1 << 60)) {
+                return -1;
+            }
+            saw_max_data = true;
+            break;
+        case TEST_WT_CAPSULE_MAX_STREAMS_BIDI:
+            if (saw_max_streams_bidi || capsule_value != ((uint64_t)1 << 60)) {
+                return -1;
+            }
+            saw_max_streams_bidi = true;
+            break;
+        case TEST_WT_CAPSULE_MAX_STREAMS_UNI:
+            if (saw_max_streams_uni || capsule_value != 0) {
+                return -1;
+            }
+            saw_max_streams_uni = true;
+            break;
+        default:
+            return -1;
+        }
+    }
+    return saw_max_data && saw_max_streams_bidi && saw_max_streams_uni ? 0 : -1;
+}
+
+static int test_webtransport_accepts_webkit_hybrid_peer(void) {
+    int result = 1;
+    trevrpc_wt_listener* listener = NULL;
+    trevrpc_msquic_conn* client_conn = NULL;
+    trevrpc_msquic_stream* client_control = NULL;
+    trevrpc_msquic_stream* server_control = NULL;
+    trevrpc_msquic_stream* connect_stream = NULL;
+    wt_accept_args accept_args = {0};
+    pthread_t accept_thread = {0};
+    bool accept_thread_started = false;
+    uint8_t control[128];
+    uint8_t headers[512];
+    size_t control_len = 0;
+    size_t headers_len = 0;
+    uint16_t port = 0;
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .path = "/trevrpc",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+    };
+
+    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
+    CHECK_GOTO(trevrpc_wt_listener_port(listener, &port) == 0);
+    accept_args.listener = listener;
+    CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_wt_session_thread, &accept_args) == 0);
+    accept_thread_started = true;
+    CHECK_GOTO(trevrpc_msquic_dial("127.0.0.1", port, &test_h3_config, &client_conn) == 0);
+
+    CHECK_GOTO(test_build_webkit_control_settings(control, sizeof(control), &control_len, 100) == 0);
+    CHECK_GOTO(trevrpc_msquic_conn_open_uni_stream(client_conn, &client_control) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write(client_control, control, control_len), (int)control_len);
+    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
+    CHECK_GOTO(test_expect_server_settings(server_control, TEST_WT_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07) == 0);
+
+    CHECK_GOTO(test_build_connect_headers(headers,
+                   sizeof(headers),
+                   &headers_len,
+                   "CONNECT",
+                   "webtransport",
+                   "https",
+                   "/trevrpc",
+                   "127.0.0.1",
+                   false) == 0);
+    CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &connect_stream) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write(connect_stream, headers, headers_len), (int)headers_len);
+    CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
+    accept_thread_started = false;
+    CHECK_EQ_GOTO(accept_args.result, 0);
+    CHECK_GOTO(accept_args.session != NULL);
+    CHECK_GOTO(test_expect_initial_capsule_flow_control(connect_stream) == 0);
+
+    result = 0;
+
+cleanup:
+    if (accept_thread_started) {
+        trevrpc_msquic_conn_shutdown(client_conn);
+        trevrpc_wt_listener_shutdown(listener);
+        (void)pthread_join(accept_thread, NULL);
+    }
+    trevrpc_msquic_stream_close(connect_stream);
+    trevrpc_msquic_stream_close(server_control);
+    trevrpc_msquic_stream_close(client_control);
+    trevrpc_msquic_conn_close(client_conn);
+    trevrpc_wt_session_close(accept_args.session);
+    trevrpc_wt_listener_close(listener);
+    return result;
+}
+
+static int test_webtransport_does_not_downgrade_near_webkit_fingerprint(void) {
+    int result = 1;
+    trevrpc_wt_listener* listener = NULL;
+    trevrpc_msquic_conn* client_conn = NULL;
+    trevrpc_msquic_stream* client_control = NULL;
+    trevrpc_msquic_stream* server_control = NULL;
+    trevrpc_msquic_stream* connect_stream = NULL;
+    wt_accept_args accept_args = {0};
+    pthread_t accept_thread = {0};
+    bool accept_thread_started = false;
+    uint8_t control[128];
+    uint8_t headers[512];
+    size_t control_len = 0;
+    size_t headers_len = 0;
+    uint16_t port = 0;
+    trevrpc_wt_config server_config = {
+        .host = "127.0.0.1",
+        .path = "/trevrpc",
+        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
+        .key_file = TREVRPC_MSQUIC_TEST_KEY,
+        .max_streams_per_session = 8,
+    };
+
+    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
+    CHECK_GOTO(trevrpc_wt_listener_port(listener, &port) == 0);
+    accept_args.listener = listener;
+    CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_wt_session_thread, &accept_args) == 0);
+    accept_thread_started = true;
+    CHECK_GOTO(trevrpc_msquic_dial("127.0.0.1", port, &test_h3_config, &client_conn) == 0);
+
+    CHECK_GOTO(test_build_webkit_control_settings(control, sizeof(control), &control_len, 101) == 0);
+    CHECK_GOTO(trevrpc_msquic_conn_open_uni_stream(client_conn, &client_control) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write(client_control, control, control_len), (int)control_len);
+    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
+    CHECK_GOTO(test_expect_server_settings(server_control, TEST_WT_SETTINGS_WT_MAX_SESSIONS) == 0);
+
+    CHECK_GOTO(test_build_connect_headers(headers,
+                   sizeof(headers),
+                   &headers_len,
+                   "CONNECT",
+                   "webtransport",
+                   "https",
+                   "/trevrpc",
+                   "127.0.0.1",
+                   false) == 0);
+    CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &connect_stream) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write(connect_stream, headers, headers_len), (int)headers_len);
+    CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
+    accept_thread_started = false;
+    CHECK_EQ_GOTO(accept_args.result, 0);
+    CHECK_GOTO(accept_args.session != NULL);
+    CHECK_GOTO(test_expect_connect_response_headers(connect_stream) == 0);
+    uint8_t unexpected = 0;
+    CHECK_EQ_GOTO(
+        trevrpc_msquic_stream_read_timeout(connect_stream, &unexpected, 1, 100000000ull), TREV_MSQUIC_ERR_TIMEOUT);
+
+    result = 0;
+
+cleanup:
+    if (accept_thread_started) {
+        trevrpc_msquic_conn_shutdown(client_conn);
+        trevrpc_wt_listener_shutdown(listener);
+        (void)pthread_join(accept_thread, NULL);
+    }
+    trevrpc_msquic_stream_close(connect_stream);
+    trevrpc_msquic_stream_close(server_control);
+    trevrpc_msquic_stream_close(client_control);
+    trevrpc_msquic_conn_close(client_conn);
+    trevrpc_wt_session_close(accept_args.session);
+    trevrpc_wt_listener_close(listener);
+    return result;
+}
+
+static int test_combined_http3_accepts_webkit_hybrid_peer(void) {
+    int result = 1;
+    trevrpc_msquic_listener* listener = NULL;
+    trevrpc_msquic_conn* client_conn = NULL;
+    trevrpc_msquic_conn* server_conn = NULL;
+    trevrpc_msquic_stream* client_control = NULL;
+    trevrpc_msquic_stream* server_control = NULL;
+    trevrpc_msquic_stream* connect_stream = NULL;
+    trevrpc_h3_stream* pending_stream = NULL;
+    trevrpc_wt_stream* wt_stream = NULL;
+    h3_accept_args accept_args = {0};
+    pthread_t accept_thread = {0};
+    bool accept_thread_started = false;
+    uint8_t control[128];
+    uint8_t headers[512];
+    size_t control_len = 0;
+    size_t headers_len = 0;
+    const trevrpc_wt_config server_config = {
+        .path = "/trevrpc",
+        .max_streams_per_session = 11,
+    };
+
+    CHECK_GOTO(connect_pair_with_config(&test_h3_config, &listener, &client_conn, &server_conn) == 0);
+    accept_args.conn = server_conn;
+    accept_args.config = server_config;
+    CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_h3_conn_thread, &accept_args) == 0);
+    accept_thread_started = true;
+
+    CHECK_GOTO(test_build_webkit_control_settings(control, sizeof(control), &control_len, 100) == 0);
+    CHECK_GOTO(trevrpc_msquic_conn_open_uni_stream(client_conn, &client_control) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write(client_control, control, control_len), (int)control_len);
+    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
+    CHECK_GOTO(test_expect_server_settings(server_control, TEST_WT_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07) == 0);
+    CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
+    accept_thread_started = false;
+    server_conn = NULL;
+    CHECK_EQ_GOTO(accept_args.result, 0);
+    CHECK_GOTO(accept_args.h3_conn != NULL);
+
+    CHECK_GOTO(test_build_connect_headers(headers,
+                   sizeof(headers),
+                   &headers_len,
+                   "CONNECT",
+                   "webtransport",
+                   "https",
+                   "/trevrpc",
+                   "127.0.0.1",
+                   false) == 0);
+    CHECK_GOTO(trevrpc_msquic_conn_open_stream(client_conn, &connect_stream) == 0);
+    CHECK_EQ_GOTO(trevrpc_msquic_stream_write(connect_stream, headers, headers_len), (int)headers_len);
+    CHECK_EQ_GOTO(trevrpc_h3_conn_accept_stream(accept_args.h3_conn, &pending_stream), 0);
+    int resolution = TREV_H3_STREAM_RESOLVED_HTTP3;
+    CHECK_EQ_GOTO(
+        trevrpc_h3_stream_resolve(accept_args.h3_conn, pending_stream, 5000000000ull, &wt_stream, &resolution), 0);
+    CHECK_EQ_GOTO(resolution, TREV_H3_STREAM_RESOLVED_HANDLED);
+    CHECK_GOTO(wt_stream == NULL);
+    CHECK_GOTO(test_expect_initial_capsule_flow_control(connect_stream) == 0);
+
+    result = 0;
+
+cleanup:
+    if (accept_thread_started) {
+        trevrpc_msquic_conn_shutdown(server_conn);
+        (void)pthread_join(accept_thread, NULL);
+        server_conn = NULL;
+    }
+    trevrpc_wt_stream_close(wt_stream);
+    trevrpc_h3_stream_close(pending_stream);
+    trevrpc_msquic_stream_close(connect_stream);
+    trevrpc_msquic_stream_close(server_control);
+    trevrpc_msquic_stream_close(client_control);
+    trevrpc_h3_conn_close(accept_args.h3_conn);
+    trevrpc_msquic_conn_close(server_conn);
+    trevrpc_msquic_conn_close(client_conn);
+    trevrpc_msquic_listener_close(listener);
+    return result;
 }
 
 static int test_webtransport_h3_control_and_connect_remain_byte_oriented(void) {
@@ -2737,11 +3134,11 @@ static int test_http3_post_data_adapter_and_request_local_rejection(void) {
     CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_h3_conn_thread, &accept_args) == 0);
     accept_thread_started = true;
 
-    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
-    CHECK_GOTO(trevrpc_msquic_stream_read(server_control, control, sizeof(control)) > 0);
     CHECK_GOTO(test_build_draft15_control_settings(control, sizeof(control), &control_len) == 0);
     CHECK_GOTO(trevrpc_msquic_conn_open_uni_stream(client_conn, &client_control) == 0);
     CHECK_EQ_GOTO(trevrpc_msquic_stream_write(client_control, control, control_len), (int)control_len);
+    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
+    CHECK_GOTO(trevrpc_msquic_stream_read(server_control, control, sizeof(control)) > 0);
     CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
     accept_thread_started = false;
     server_conn = NULL;
@@ -3008,11 +3405,11 @@ static int run_http3_connection_error_case(
     accept_args.config = server_config;
     CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_h3_conn_thread, &accept_args) == 0);
     accept_thread_started = true;
-    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
-    CHECK_GOTO(trevrpc_msquic_stream_read(server_control, control, sizeof(control)) > 0);
     CHECK_GOTO(test_build_draft15_control_settings(control, sizeof(control), &control_len) == 0);
     CHECK_GOTO(trevrpc_msquic_conn_open_uni_stream(client_conn, &client_control) == 0);
     CHECK_EQ_GOTO(trevrpc_msquic_stream_write(client_control, control, control_len), (int)control_len);
+    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
+    CHECK_GOTO(trevrpc_msquic_stream_read(server_control, control, sizeof(control)) > 0);
     CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
     accept_thread_started = false;
     server_conn = NULL;
@@ -3074,11 +3471,11 @@ static int test_http3_closed_control_stream_closes_connection(void) {
     accept_args.config = server_config;
     CHECK_GOTO(pthread_create(&accept_thread, NULL, accept_h3_conn_thread, &accept_args) == 0);
     accept_thread_started = true;
-    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
-    CHECK_GOTO(trevrpc_msquic_stream_read(server_control, control, sizeof(control)) > 0);
     CHECK_GOTO(test_build_draft15_control_settings(control, sizeof(control), &control_len) == 0);
     CHECK_GOTO(trevrpc_msquic_conn_open_uni_stream(client_conn, &client_control) == 0);
     CHECK_EQ_GOTO(trevrpc_msquic_stream_write(client_control, control, control_len), (int)control_len);
+    CHECK_GOTO(trevrpc_msquic_conn_accept_stream(client_conn, &server_control) == 0);
+    CHECK_GOTO(trevrpc_msquic_stream_read(server_control, control, sizeof(control)) > 0);
     CHECK_GOTO(pthread_join(accept_thread, NULL) == 0);
     accept_thread_started = false;
     server_conn = NULL;
@@ -3276,6 +3673,15 @@ int main(void) {
         goto cleanup;
     }
     if (test_webtransport_accepts_draft15_peer() != 0) {
+        goto cleanup;
+    }
+    if (test_webtransport_accepts_webkit_hybrid_peer() != 0) {
+        goto cleanup;
+    }
+    if (test_webtransport_does_not_downgrade_near_webkit_fingerprint() != 0) {
+        goto cleanup;
+    }
+    if (test_combined_http3_accepts_webkit_hybrid_peer() != 0) {
         goto cleanup;
     }
     if (test_webtransport_h3_control_and_connect_remain_byte_oriented() != 0) {

@@ -338,7 +338,7 @@ async function launchBrowser(browserType, engineName, env, trustArtifacts) {
     } catch (error) {
       throw webkitLaunchError(error, env);
     }
-    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    const context = await browser.newContext();
     const page = await context.newPage();
     return { browser, context, page, trustArtifacts };
   }
