@@ -1,9 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 
 #include "trevrpc_binding.h"
 #include "trevrpc.h"
 
 #include <errno.h> // IWYU pragma: keep
+#include <limits.h>
 #include <node_api.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -13,11 +17,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define TREV_NODE_ERR_CLOSED -4001
 #define TREV_NODE_COMPLETION_WORKERS 4u
 #define TREV_NODE_COMPLETION_POLL_MIN_NANOS (250 * 1000)
 #define TREV_NODE_COMPLETION_POLL_MAX_NANOS (8 * 1000 * 1000)
+#define TREV_NODE_NANOS_PER_SEC 1000000000ull
 #define TREV_NODE_RECV_MANY_DEFAULT 16u
 #define TREV_NODE_RECV_MANY_LIMIT 256u
 
@@ -49,6 +55,124 @@ typedef struct debug_outbound_gate {
 
 static void http3_admission_state_shutdown(node_http3_admission_state* state);
 static void http3_admission_state_release(node_http3_admission_state* state);
+
+static int native_condition_init(pthread_cond_t* condition, clockid_t* out_clock) {
+    pthread_condattr_t attributes;
+    int err = pthread_condattr_init(&attributes);
+    if (err != 0) {
+        return err;
+    }
+
+    clockid_t clock_id = CLOCK_REALTIME;
+#if defined(_POSIX_CLOCK_SELECTION) && _POSIX_CLOCK_SELECTION >= 0
+    if (pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0) {
+        clock_id = CLOCK_MONOTONIC;
+    }
+#endif
+    err = pthread_cond_init(condition, &attributes);
+    pthread_condattr_destroy(&attributes);
+    if (err == 0) {
+        *out_clock = clock_id;
+    }
+    return err;
+}
+
+static int native_timespec_from_nanos(uint64_t nanos, struct timespec* out_timespec) {
+    uint64_t seconds = nanos / TREV_NODE_NANOS_PER_SEC;
+    if (seconds > (uint64_t)INT64_MAX) {
+        return EOVERFLOW;
+    }
+    out_timespec->tv_sec = (time_t)seconds;
+    out_timespec->tv_nsec = (long)(nanos % TREV_NODE_NANOS_PER_SEC);
+    return 0;
+}
+
+static int native_monotonic_now_nanos(uint64_t* out_now_nanos) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return errno == 0 ? EIO : errno;
+    }
+    if (now.tv_sec < 0 || (uint64_t)now.tv_sec > UINT64_MAX / TREV_NODE_NANOS_PER_SEC) {
+        return EOVERFLOW;
+    }
+    uint64_t seconds = (uint64_t)now.tv_sec * TREV_NODE_NANOS_PER_SEC;
+    if (seconds > UINT64_MAX - (uint64_t)now.tv_nsec) {
+        return EOVERFLOW;
+    }
+    *out_now_nanos = seconds + (uint64_t)now.tv_nsec;
+    return 0;
+}
+
+static int native_monotonic_deadline_after(uint64_t duration_nanos, uint64_t* out_deadline_nanos) {
+    uint64_t now_nanos = 0;
+    int err = native_monotonic_now_nanos(&now_nanos);
+    if (err != 0) {
+        return err;
+    }
+    if (now_nanos > UINT64_MAX - duration_nanos) {
+        return EOVERFLOW;
+    }
+    *out_deadline_nanos = now_nanos + duration_nanos;
+    return 0;
+}
+
+#if !defined(__APPLE__)
+static int native_deadline_after(clockid_t clock_id, uint64_t duration_nanos, struct timespec* out_deadline) {
+    struct timespec now = {0};
+    if (clock_gettime(clock_id, &now) != 0) {
+        return errno == 0 ? EIO : errno;
+    }
+
+    uint64_t seconds = duration_nanos / TREV_NODE_NANOS_PER_SEC;
+    uint64_t nanos = duration_nanos % TREV_NODE_NANOS_PER_SEC;
+    if (now.tv_sec < 0 || seconds > (uint64_t)(INT64_MAX - now.tv_sec)) {
+        return EOVERFLOW;
+    }
+    out_deadline->tv_sec = now.tv_sec + (time_t)seconds;
+    out_deadline->tv_nsec = now.tv_nsec + (long)nanos;
+    if (out_deadline->tv_nsec >= (long)TREV_NODE_NANOS_PER_SEC) {
+        if (out_deadline->tv_sec == INT64_MAX) {
+            return EOVERFLOW;
+        }
+        out_deadline->tv_sec++;
+        out_deadline->tv_nsec -= (long)TREV_NODE_NANOS_PER_SEC;
+    }
+    return 0;
+}
+
+static int native_condition_deadline_from_monotonic_due(
+    clockid_t condition_clock, uint64_t due_nanos, uint64_t now_nanos, struct timespec* out_deadline) {
+    if (condition_clock == CLOCK_MONOTONIC) {
+        return native_timespec_from_nanos(due_nanos, out_deadline);
+    }
+    return native_deadline_after(condition_clock, due_nanos - now_nanos, out_deadline);
+}
+#endif
+
+static int native_condition_timedwait_until(pthread_cond_t* condition,
+    pthread_mutex_t* mutex,
+    clockid_t condition_clock,
+    uint64_t due_nanos,
+    uint64_t now_nanos) {
+    if (due_nanos <= now_nanos) {
+        return ETIMEDOUT;
+    }
+    struct timespec deadline = {0};
+#if defined(__APPLE__)
+    (void)condition_clock;
+    int err = native_timespec_from_nanos(due_nanos - now_nanos, &deadline);
+    if (err != 0) {
+        return err;
+    }
+    return pthread_cond_timedwait_relative_np(condition, mutex, &deadline);
+#else
+    int err = native_condition_deadline_from_monotonic_due(condition_clock, due_nanos, now_nanos, &deadline);
+    if (err != 0) {
+        return err;
+    }
+    return pthread_cond_timedwait(condition, mutex, &deadline);
+#endif
+}
 
 struct native_client {
     trevrpc_raw_client* client;
@@ -164,6 +288,7 @@ struct native_completion_runtime {
     napi_env env;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    clockid_t cond_clock;
     bool mutex_initialized;
     bool cond_initialized;
     pthread_t workers[TREV_NODE_COMPLETION_WORKERS];
@@ -386,6 +511,7 @@ typedef struct debug_pending_wait_work {
 typedef struct debug_bounded_barrier {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    clockid_t clock_id;
     size_t arrived;
     bool released;
     bool failed;
@@ -1913,15 +2039,7 @@ static bool debug_bounded_barrier_init(debug_bounded_barrier* barrier) {
     if (pthread_mutex_init(&barrier->mutex, NULL) != 0) {
         return false;
     }
-    pthread_condattr_t attr;
-    if (pthread_condattr_init(&attr) != 0) {
-        pthread_mutex_destroy(&barrier->mutex);
-        return false;
-    }
-    int clock_err = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-    int cond_err = clock_err == 0 ? pthread_cond_init(&barrier->cond, &attr) : clock_err;
-    pthread_condattr_destroy(&attr);
-    if (cond_err != 0) {
+    if (native_condition_init(&barrier->cond, &barrier->clock_id) != 0) {
         pthread_mutex_destroy(&barrier->mutex);
         return false;
     }
@@ -1934,11 +2052,10 @@ static void debug_bounded_barrier_destroy(debug_bounded_barrier* barrier) {
 }
 
 static bool debug_bounded_barrier_wait(debug_bounded_barrier* barrier) {
-    struct timespec deadline;
-    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+    uint64_t due_nanos = 0;
+    if (native_monotonic_deadline_after(5 * TREV_NODE_NANOS_PER_SEC, &due_nanos) != 0) {
         return false;
     }
-    deadline.tv_sec += 5;
 
     pthread_mutex_lock(&barrier->mutex);
     if (barrier->failed) {
@@ -1951,7 +2068,12 @@ static bool debug_bounded_barrier_wait(debug_bounded_barrier* barrier) {
         pthread_cond_broadcast(&barrier->cond);
     }
     while (!barrier->released && !barrier->failed) {
-        int err = pthread_cond_timedwait(&barrier->cond, &barrier->mutex, &deadline);
+        uint64_t now_nanos = 0;
+        int err = native_monotonic_now_nanos(&now_nanos);
+        if (err == 0) {
+            err = native_condition_timedwait_until(
+                &barrier->cond, &barrier->mutex, barrier->clock_id, due_nanos, now_nanos);
+        }
         if (err != 0) {
             barrier->failed = true;
             pthread_cond_broadcast(&barrier->cond);
@@ -2937,21 +3059,6 @@ static int native_completion_enqueue(native_completion_runtime* runtime, native_
     return 0;
 }
 
-static uint64_t native_completion_now_nanos(void) {
-    struct timespec now = {0};
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-        return 0;
-    }
-    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
-}
-
-static struct timespec native_completion_timespec(uint64_t nanos) {
-    return (struct timespec){
-        .tv_sec = (time_t)(nanos / 1000000000ull),
-        .tv_nsec = (long)(nanos % 1000000000ull),
-    };
-}
-
 static void native_completion_enqueue_locked(native_completion_runtime* runtime, native_async_work* work) {
     work->next = NULL;
     if (runtime->tail == NULL) {
@@ -3103,11 +3210,16 @@ static void* native_completion_worker_main(void* data) {
             if (work->retry_delay_nanos > TREV_NODE_COMPLETION_POLL_MAX_NANOS) {
                 work->retry_delay_nanos = TREV_NODE_COMPLETION_POLL_MAX_NANOS;
             }
-            uint64_t now = native_completion_now_nanos();
-            work->retry_due_nanos =
-                now > UINT64_MAX - work->retry_delay_nanos ? UINT64_MAX : now + work->retry_delay_nanos;
-            retry_err = native_completion_retry_heap_push_locked(runtime, work);
-            queued_for_retry = retry_err == 0;
+            uint64_t now_nanos = 0;
+            int clock_err = native_monotonic_now_nanos(&now_nanos);
+            if (clock_err != 0) {
+                retry_err = -clock_err;
+            } else {
+                work->retry_due_nanos =
+                    now_nanos > UINT64_MAX - work->retry_delay_nanos ? UINT64_MAX : now_nanos + work->retry_delay_nanos;
+                retry_err = native_completion_retry_heap_push_locked(runtime, work);
+                queued_for_retry = retry_err == 0;
+            }
         }
         pthread_mutex_unlock(&runtime->mutex);
         if (queued_for_retry) {
@@ -3141,11 +3253,29 @@ static void* native_completion_scheduler_main(void* data) {
             continue;
         }
 
-        uint64_t now = native_completion_now_nanos();
-        uint64_t due = runtime->retry_heap[0]->retry_due_nanos;
-        if (due > now) {
-            struct timespec deadline = native_completion_timespec(due);
-            (void)pthread_cond_timedwait(&runtime->cond, &runtime->mutex, &deadline);
+        uint64_t now_nanos = 0;
+        int clock_err = native_monotonic_now_nanos(&now_nanos);
+        if (clock_err != 0) {
+            native_async_work* work = native_completion_retry_heap_pop_locked(runtime);
+            work->retry_due_nanos = 0;
+            work->base->err = -clock_err;
+            native_completion_enqueue_locked(runtime, work);
+            pthread_cond_broadcast(&runtime->cond);
+            continue;
+        }
+
+        uint64_t due_nanos = runtime->retry_heap[0]->retry_due_nanos;
+        if (due_nanos > now_nanos) {
+            int wait_err = native_condition_timedwait_until(
+                &runtime->cond, &runtime->mutex, runtime->cond_clock, due_nanos, now_nanos);
+            if (wait_err == 0 || wait_err == ETIMEDOUT) {
+                continue;
+            }
+            native_async_work* work = native_completion_retry_heap_pop_locked(runtime);
+            work->retry_due_nanos = 0;
+            work->base->err = -wait_err;
+            native_completion_enqueue_locked(runtime, work);
+            pthread_cond_broadcast(&runtime->cond);
             continue;
         }
 
@@ -3153,8 +3283,8 @@ static void* native_completion_scheduler_main(void* data) {
             native_async_work* work = native_completion_retry_heap_pop_locked(runtime);
             work->retry_due_nanos = 0;
             native_completion_enqueue_locked(runtime, work);
-            now = native_completion_now_nanos();
-        } while (runtime->retry_heap_len > 0 && runtime->retry_heap[0]->retry_due_nanos <= now);
+            clock_err = native_monotonic_now_nanos(&now_nanos);
+        } while (clock_err == 0 && runtime->retry_heap_len > 0 && runtime->retry_heap[0]->retry_due_nanos <= now_nanos);
         pthread_cond_broadcast(&runtime->cond);
     }
     pthread_mutex_unlock(&runtime->mutex);
@@ -3244,17 +3374,10 @@ static int native_completion_runtime_init(napi_env env, native_completion_runtim
         return -ENOMEM;
     }
     runtime->mutex_initialized = true;
-    pthread_condattr_t condattr;
-    if (pthread_condattr_init(&condattr) != 0) {
-        native_completion_runtime_close(runtime);
-        return -ENOMEM;
-    }
-    (void)pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC);
-    int cond_err = pthread_cond_init(&runtime->cond, &condattr);
-    pthread_condattr_destroy(&condattr);
+    int cond_err = native_condition_init(&runtime->cond, &runtime->cond_clock);
     if (cond_err != 0) {
         native_completion_runtime_close(runtime);
-        return -ENOMEM;
+        return -cond_err;
     }
     runtime->cond_initialized = true;
 
@@ -3319,7 +3442,8 @@ static napi_value queue_work_managed(napi_env env,
     (void)name;
     napi_value promise = NULL;
     work->env = env;
-    work->queued_at_nanos = native_completion_now_nanos();
+    work->queued_at_nanos = 0;
+    (void)native_monotonic_now_nanos(&work->queued_at_nanos);
     napi_create_promise(env, &work->deferred, &promise);
 
     native_completion_runtime* runtime = native_completion_runtime_for_env(env);
@@ -4040,12 +4164,19 @@ static int node_http3_admission(void* user_data, const trevrpc_http3_admission_r
     call->authority[request->authority_len] = 0;
     call->authority_len = request->authority_len;
     call->secure = request->secure != 0;
-    pthread_mutex_init(&call->mutex, NULL);
-    pthread_condattr_t cond_attr;
-    pthread_condattr_init(&cond_attr);
-    call->clock_id = pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC) == 0 ? CLOCK_MONOTONIC : CLOCK_REALTIME;
-    pthread_cond_init(&call->cond, call->clock_id == CLOCK_MONOTONIC ? &cond_attr : NULL);
-    pthread_condattr_destroy(&cond_attr);
+    if (pthread_mutex_init(&call->mutex, NULL) != 0) {
+        free(call->authority);
+        free(call->path);
+        free(call);
+        return -1;
+    }
+    if (native_condition_init(&call->cond, &call->clock_id) != 0) {
+        pthread_mutex_destroy(&call->mutex);
+        free(call->authority);
+        free(call->path);
+        free(call);
+        return -1;
+    }
     atomic_init(&call->refs, 2);
 
     pthread_mutex_lock(&state->mutex);
@@ -4068,21 +4199,15 @@ static int node_http3_admission(void* user_data, const trevrpc_http3_admission_r
         pthread_mutex_unlock(&call->mutex);
     }
 
-    struct timespec deadline = {0};
+    uint64_t due_nanos = 0;
     bool admitted = false;
-    if (clock_gettime(call->clock_id, &deadline) == 0) {
-        deadline.tv_sec += (time_t)(state->timeout_nanos / 1000000000ull);
-        deadline.tv_nsec += (long)(state->timeout_nanos % 1000000000ull);
-        if (deadline.tv_nsec >= 1000000000l) {
-            deadline.tv_sec++;
-            deadline.tv_nsec -= 1000000000l;
-        }
+    if (native_monotonic_deadline_after(state->timeout_nanos, &due_nanos) == 0) {
         pthread_mutex_lock(&call->mutex);
         while (!call->completed) {
-            int err = pthread_cond_timedwait(&call->cond, &call->mutex, &deadline);
-            if (err == ETIMEDOUT) {
-                call->cancelled = true;
-                break;
+            uint64_t now_nanos = 0;
+            int err = native_monotonic_now_nanos(&now_nanos);
+            if (err == 0) {
+                err = native_condition_timedwait_until(&call->cond, &call->mutex, call->clock_id, due_nanos, now_nanos);
             }
             if (err != 0) {
                 call->cancelled = true;
