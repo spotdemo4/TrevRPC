@@ -17,4 +17,15 @@
 
 Protobuf over QUIC, HTTP/3 & WebTransport, with C, C++20, Go, Rust, JavaScript, and Kotlin runtimes
 
+## Browser support
+
+| Runtime    | Chromium | Firefox |                                      Safari                                       |
+| ---------- | :------: | :-----: | :-------------------------------------------------------------------------------: |
+| C          |    ✅    |   ✅    |                                        ✅                                         |
+| C++        |    ✅    |   ✅    |                                        ✅                                         |
+| Go         |    ✅    |   ✅    | ❌<sup>[quic-go#355](https://github.com/quic-go/webtransport-go/issues/355)</sup> |
+| Rust       |    ✅    |   ✅    |         ❌<sup>[h3#347](https://github.com/hyperium/h3/issues/347)</sup>          |
+| JavaScript |    ✅    |   ✅    |                                        ✅                                         |
+| Kotlin     |    ✅    |   ✅    |                                        ✅                                         |
+
 Full documentation is available in the [TrevRPC wiki](https://trev.zip/llc/TrevRPC/wiki)
