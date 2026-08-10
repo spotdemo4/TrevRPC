@@ -63,11 +63,13 @@ if (!gcAvailable) {
         output,
         /native response external body owner survives C cleanup until GC finalizer/u,
       );
+      assert.match(output, /Worker termination force-cancels an admitted native server call/u);
     },
   );
 } else {
   const native = existsSync(nativeAddonPath) ? require(nativeAddonPath) : null;
   const nativeTestHooks = typeof native?._debugClientCloseReleaseRace === "function";
+  const nativeCallTestHooks = typeof native?._debugNativeCallStats === "function";
   after(async () => {
     if (certificateDirectory != null) {
       await rm(certificateDirectory, { force: true, recursive: true });
@@ -402,8 +404,10 @@ const native = require(${JSON.stringify(nativeAddonPath)});
     { skip: native == null, timeout: 10_000 },
     async () => {
       const certificate = await testCertificate();
-      const worker = new Worker(
-        `
+      for (let iteration = 0; iteration < 3; iteration++) {
+        const before = nativeCallTestHooks ? native._debugNativeCallStats() : null;
+        const worker = new Worker(
+          `
 const { parentPort } = require("node:worker_threads");
 const native = require(${JSON.stringify(nativeAddonPath)});
 (async () => {
@@ -421,46 +425,68 @@ const native = require(${JSON.stringify(nativeAddonPath)});
   parentPort.postMessage({ port: server.port });
 })().catch((error) => { throw error; });
 `,
-        { eval: true },
-      );
-      const listening = await waitForWorkerMessage(
-        worker,
-        (message) => typeof message === "object" && Number.isInteger(message?.port),
-      );
-      const client = await RawNodeTransport.connect({
-        host: "127.0.0.1",
-        port: listening.port,
-        skipCertificateValidation: true,
-      });
-      try {
-        const started = waitForWorkerMessage(worker, (message) => message === "started");
-        const response = client
-          .call({
-            service: "ownership",
-            method: "StalledUnary",
-            body: new Uint8Array(),
-            metadata: {},
-          })
-          .then(
-            (value) => ({ value }),
-            (error) => ({ error }),
-          );
-        await started;
-        await settlesWithin(worker.terminate(), 3_000);
-        const outcome = await settlesWithin(response, 3_000);
-        if (outcome.value !== undefined) {
-          assert.equal(outcome.error, undefined);
-          assert.equal(outcome.value.status, Code.Cancelled);
-          assert.deepEqual(Array.from(outcome.value.body), []);
-        } else {
-          assert.ok(
-            outcome.error.code === Code.Cancelled || outcome.error.code === Code.Unavailable,
-            `unexpected forced-teardown error status ${outcome.error.code}`,
-          );
+          { eval: true },
+        );
+        const listening = await waitForWorkerMessage(
+          worker,
+          (message) => typeof message === "object" && Number.isInteger(message?.port),
+        );
+        const client = await RawNodeTransport.connect({
+          host: "127.0.0.1",
+          port: listening.port,
+          skipCertificateValidation: true,
+        });
+        try {
+          const started = waitForWorkerMessage(worker, (message) => message === "started");
+          const response = client
+            .call({
+              service: "ownership",
+              method: "StalledUnary",
+              body: new Uint8Array(),
+              metadata: {},
+            })
+            .then(
+              (value) => ({ value }),
+              (error) => ({ error }),
+            );
+          await started;
+          await settlesWithin(worker.terminate(), 3_000);
+          const outcome = await settlesWithin(response, 3_000);
+          if (outcome.value !== undefined) {
+            assert.equal(outcome.error, undefined);
+            assert.equal(outcome.value.status, Code.Cancelled);
+            assert.deepEqual(Array.from(outcome.value.body), []);
+          } else {
+            assert.ok(
+              outcome.error.code === Code.Cancelled || outcome.error.code === Code.Unavailable,
+              `iteration ${iteration}: unexpected forced-teardown error status ${outcome.error.code}`,
+            );
+          }
+          if (before != null) {
+            await waitUntil(() => {
+              const current = native._debugNativeCallStats();
+              return (
+                current.allocations >= before.allocations + 1 &&
+                current.destroys >= before.destroys + 1 &&
+                current.ownerRetains >= before.ownerRetains + 1 &&
+                current.ownerReleases >= before.ownerReleases + 1
+              );
+            }, 3_000);
+            const after = native._debugNativeCallStats();
+            assert.deepEqual(
+              {
+                allocations: after.allocations - before.allocations,
+                destroys: after.destroys - before.destroys,
+                ownerRetains: after.ownerRetains - before.ownerRetains,
+                ownerReleases: after.ownerReleases - before.ownerReleases,
+              },
+              { allocations: 1, destroys: 1, ownerRetains: 1, ownerReleases: 1 },
+            );
+          }
+        } finally {
+          client.close();
+          await worker.terminate();
         }
-      } finally {
-        client.close();
-        await worker.terminate();
       }
     },
   );
@@ -2134,6 +2160,16 @@ async function testCertificate() {
     certFile: join(certificateDirectory, "cert.pem"),
     keyFile: join(certificateDirectory, "key.pem"),
   };
+}
+
+async function waitUntil(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`condition did not become true within ${timeoutMs}ms`);
+    }
+    await delay(10, undefined, { ref: false });
+  }
 }
 
 async function settlesWithin(promise, timeoutMs) {

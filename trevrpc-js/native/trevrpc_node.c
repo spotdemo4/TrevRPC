@@ -225,6 +225,7 @@ struct native_server {
     trevrpc_server* server;
     pthread_mutex_t mutex;
     server_route* routes;
+    native_call* calls;
     napi_env env;
     napi_threadsafe_function call_tsfn;
     node_http3_admission_state* http3_admission;
@@ -234,6 +235,7 @@ struct native_server {
     bool cancel_on_close;
     bool serving;
     bool js_alive;
+    bool destroying;
 };
 
 struct native_call {
@@ -242,12 +244,17 @@ struct native_call {
     pthread_mutex_t operation_mutex;
     base_work* outbound_head;
     base_work* outbound_tail;
+    native_server* server;
+    native_call* server_next;
 #ifdef TREVRPC_NODE_TEST_HOOKS
     debug_outbound_gate debug_outbound_gate;
 #endif
     size_t refs;
+    size_t pins;
     bool completing;
     bool js_alive;
+    bool registered;
+    bool destroying;
 };
 
 struct native_cancellation {
@@ -604,6 +611,10 @@ static atomic_uint_least64_t DebugCompletionRuntimeFinalizerAbandons = ATOMIC_VA
 static atomic_uint_least64_t DebugGatedCompletionAllocations = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugGatedCompletionAbandons = ATOMIC_VAR_INIT(0);
 static atomic_uint_least64_t DebugGatedCompletionFrees = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugNativeCallAllocations = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugNativeCallDestroys = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugNativeCallOwnerRetains = ATOMIC_VAR_INIT(0);
+static atomic_uint_least64_t DebugNativeCallOwnerReleases = ATOMIC_VAR_INIT(0);
 static debug_completion_gate DebugCompletionGate = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
@@ -654,6 +665,7 @@ static void debug_outbound_gate_wait(debug_outbound_gate* gate, pthread_mutex_t*
 static napi_value noop_js_callback(napi_env env, napi_callback_info info);
 static void native_client_release(native_client* client);
 static void native_stream_close_request(native_stream* stream);
+static void native_server_release(native_server* server);
 static void native_server_close_request(native_server* server, bool force_cancel);
 static void native_call_close_request(native_call* call);
 static void native_call_release(native_call* call, trevrpc_call* acquired_call);
@@ -2692,45 +2704,109 @@ static int native_call_operation_acquire(native_call* call, bool completion, tre
     return 0;
 }
 
+static void native_call_destroy(native_call* call) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&DebugNativeCallDestroys, 1, memory_order_relaxed);
+#endif
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    debug_outbound_gate_destroy(&call->debug_outbound_gate);
+#endif
+    pthread_mutex_destroy(&call->operation_mutex);
+    pthread_mutex_destroy(&call->mutex);
+    free(call);
+}
+
+static bool native_call_claim_destroy_locked(native_call* call) {
+    if (call->destroying || call->js_alive || call->refs != 0 || call->pins != 0 || call->call != NULL) {
+        return false;
+    }
+    call->destroying = true;
+    return true;
+}
+
 static void native_call_maybe_destroy(native_call* call) {
-    bool destroy = false;
     pthread_mutex_lock(&call->mutex);
-    destroy = !call->js_alive && call->refs == 0 && call->call == NULL;
+    bool destroy = native_call_claim_destroy_locked(call);
     pthread_mutex_unlock(&call->mutex);
     if (destroy) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        debug_outbound_gate_destroy(&call->debug_outbound_gate);
-#endif
-        pthread_mutex_destroy(&call->operation_mutex);
-        pthread_mutex_destroy(&call->mutex);
-        free(call);
+        native_call_destroy(call);
     }
 }
 
+static void native_call_release_pin(native_call* call) {
+    pthread_mutex_lock(&call->mutex);
+    if (call->pins > 0) {
+        call->pins--;
+    }
+    bool destroy = native_call_claim_destroy_locked(call);
+    pthread_mutex_unlock(&call->mutex);
+    if (destroy) {
+        native_call_destroy(call);
+    }
+}
+
+static bool native_call_unregister(native_call* call) {
+    pthread_mutex_lock(&call->mutex);
+    native_server* server = call->registered ? call->server : NULL;
+    if (server == NULL) {
+        pthread_mutex_unlock(&call->mutex);
+        return false;
+    }
+
+    bool removed = false;
+    pthread_mutex_lock(&server->mutex);
+    native_call** link = &server->calls;
+    while (*link != NULL && *link != call) {
+        link = &(*link)->server_next;
+    }
+    if (*link == call) {
+        *link = call->server_next;
+        call->server = NULL;
+        call->server_next = NULL;
+        call->registered = false;
+        removed = true;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    pthread_mutex_unlock(&call->mutex);
+    if (!removed) {
+        return false;
+    }
+
+    native_call_release_pin(call);
+    native_server_release(server);
+    return true;
+}
+
+static void native_call_release_owner(trevrpc_call* call, bool cancel) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&DebugNativeCallOwnerReleases, 1, memory_order_relaxed);
+#endif
+    if (cancel) {
+        trevrpc_call_cancel(call);
+    }
+    trevrpc_call_close(call);
+    trevrpc_call_release(call);
+}
+
 static void native_call_release(native_call* call, trevrpc_call* acquired_call) {
-    trevrpc_call* close_call = NULL;
-    bool destroy = false;
+    trevrpc_call* owner_call = NULL;
     pthread_mutex_lock(&call->mutex);
     if (call->refs > 0) {
         call->refs--;
     }
     if (call->completing && call->refs == 0 && call->call != NULL) {
-        close_call = call->call;
+        owner_call = call->call;
         call->call = NULL;
     }
-    destroy = !call->js_alive && call->refs == 0 && call->call == NULL;
     pthread_mutex_unlock(&call->mutex);
 
-    trevrpc_call_close(close_call);
     trevrpc_call_release(acquired_call);
-    if (destroy) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        debug_outbound_gate_destroy(&call->debug_outbound_gate);
-#endif
-        pthread_mutex_destroy(&call->operation_mutex);
-        pthread_mutex_destroy(&call->mutex);
-        free(call);
+    if (owner_call != NULL) {
+        native_call_release_owner(owner_call, false);
+        (void)native_call_unregister(call);
+        return;
     }
+    native_call_maybe_destroy(call);
 }
 
 static void native_call_work_release(void* owner) {
@@ -2801,18 +2877,21 @@ static void native_call_outbound_finish(native_call* call, base_work* work) {
 }
 
 static void native_call_release_keep_wrapper(native_call* call, trevrpc_call* acquired_call) {
-    trevrpc_call* close_call = NULL;
+    trevrpc_call* owner_call = NULL;
     pthread_mutex_lock(&call->mutex);
     if (call->refs > 0) {
         call->refs--;
     }
     if (call->completing && call->refs == 0 && call->call != NULL) {
-        close_call = call->call;
+        owner_call = call->call;
         call->call = NULL;
     }
     pthread_mutex_unlock(&call->mutex);
-    trevrpc_call_close(close_call);
     trevrpc_call_release(acquired_call);
+    if (owner_call != NULL) {
+        native_call_release_owner(owner_call, false);
+        (void)native_call_unregister(call);
+    }
 }
 
 static void native_call_work_operation_release(native_call* call, trevrpc_call* acquired_call) {
@@ -2822,11 +2901,13 @@ static void native_call_work_operation_release(native_call* call, trevrpc_call* 
 
 static void native_call_terminal_operation_complete(native_call* call, trevrpc_call* acquired_call, base_work* work) {
     trevrpc_call* completion_call = work->completion_call;
+    trevrpc_call* owner_call = NULL;
     work->completion_call = NULL;
     pthread_mutex_unlock(&call->operation_mutex);
 
     pthread_mutex_lock(&call->mutex);
     if (call->call == completion_call) {
+        owner_call = call->call;
         call->call = NULL;
     }
     if (call->refs > 0) {
@@ -2839,6 +2920,10 @@ static void native_call_terminal_operation_complete(native_call* call, trevrpc_c
 
     trevrpc_call_release(acquired_call);
     trevrpc_call_release(completion_call);
+    if (owner_call != NULL) {
+        native_call_release_owner(owner_call, false);
+        (void)native_call_unregister(call);
+    }
 }
 
 static void native_call_terminal_abandon(native_call* call, base_work* work) {
@@ -2847,44 +2932,58 @@ static void native_call_terminal_abandon(native_call* call, base_work* work) {
     }
     trevrpc_call* completion_call = work->completion_call;
     work->completion_call = NULL;
-    trevrpc_call* close_call = NULL;
+    trevrpc_call* owner_call = NULL;
 
     pthread_mutex_lock(&call->mutex);
     call->completing = true;
-    close_call = call->call;
+    owner_call = call->call;
     call->call = NULL;
     if (completion_call != NULL && call->refs > 0) {
         call->refs--;
     }
     pthread_mutex_unlock(&call->mutex);
 
-    trevrpc_call_cancel(close_call);
-    trevrpc_call_close(close_call);
     trevrpc_call_release(completion_call);
+    if (owner_call != NULL) {
+        native_call_release_owner(owner_call, true);
+        (void)native_call_unregister(call);
+    }
 }
 
-static void native_call_close_request(native_call* call) {
+static void native_call_close_request_internal(native_call* call, bool finalizing) {
     if (call == NULL) {
         return;
     }
-    trevrpc_call* close_call = NULL;
+    trevrpc_call* owner_call = NULL;
     trevrpc_call* cancel_call = NULL;
     pthread_mutex_lock(&call->mutex);
+    call->pins++;
+    if (finalizing) {
+        call->js_alive = false;
+    }
     call->completing = true;
 #ifdef TREVRPC_NODE_TEST_HOOKS
     debug_outbound_gate_release_locked(&call->debug_outbound_gate);
 #endif
     if (call->refs == 0 && call->call != NULL) {
-        close_call = call->call;
+        owner_call = call->call;
         call->call = NULL;
-    } else if (call->call != NULL) {
+    } else if (call->call != NULL && trevrpc_call_retain(call->call) == 0) {
         cancel_call = call->call;
     }
     pthread_mutex_unlock(&call->mutex);
 
     trevrpc_call_cancel(cancel_call);
-    trevrpc_call_close(close_call);
-    native_call_maybe_destroy(call);
+    trevrpc_call_release(cancel_call);
+    if (owner_call != NULL) {
+        native_call_release_owner(owner_call, false);
+        (void)native_call_unregister(call);
+    }
+    native_call_release_pin(call);
+}
+
+static void native_call_close_request(native_call* call) {
+    native_call_close_request_internal(call, false);
 }
 
 static void free_server_routes(napi_env env, server_route* route) {
@@ -2903,8 +3002,12 @@ static void free_server_routes(napi_env env, server_route* route) {
 static void native_server_maybe_destroy(native_server* server) {
     bool destroy = false;
     pthread_mutex_lock(&server->mutex);
-    destroy = !server->js_alive && server->refs == 0 && server->server == NULL && server->call_tsfn == NULL &&
-              server->http3_admission == NULL && server->routes == NULL;
+    if (!server->destroying && !server->js_alive && server->refs == 0 && server->server == NULL &&
+        server->call_tsfn == NULL && server->http3_admission == NULL && server->routes == NULL &&
+        server->calls == NULL) {
+        server->destroying = true;
+        destroy = true;
+    }
     pthread_mutex_unlock(&server->mutex);
     if (destroy) {
         pthread_mutex_destroy(&server->mutex);
@@ -2912,13 +3015,19 @@ static void native_server_maybe_destroy(native_server* server) {
     }
 }
 
-static void native_server_release(native_server* server) {
+static void native_server_release_count(native_server* server, size_t count) {
     pthread_mutex_lock(&server->mutex);
-    if (server->refs > 0) {
-        server->refs--;
+    if (count >= server->refs) {
+        server->refs = 0;
+    } else {
+        server->refs -= count;
     }
     pthread_mutex_unlock(&server->mutex);
     native_server_maybe_destroy(server);
+}
+
+static void native_server_release(native_server* server) {
+    native_server_release_count(server, 1);
 }
 
 static int native_server_shutdown_and_release(trevrpc_server* server, bool force_cancel) {
@@ -2951,11 +3060,18 @@ static void native_server_close_request(native_server* server, bool force_cancel
     trevrpc_server* shutdown_server = NULL;
     napi_env env = NULL;
     bool cancel_on_close = force_cancel;
+    size_t call_refs = 0;
+    native_call* calls = NULL;
     pthread_mutex_lock(&server->mutex);
+    server->refs++;
     server->closing = true;
     server->cancel_on_close = server->cancel_on_close || force_cancel;
     cancel_on_close = server->cancel_on_close;
     node_http3_admission_state* admission = server->http3_admission;
+    if (cancel_on_close) {
+        calls = server->calls;
+        server->calls = NULL;
+    }
     if (!server->serving && server->server != NULL) {
         release_server = server->server;
         server->server = NULL;
@@ -2965,6 +3081,19 @@ static void native_server_close_request(native_server* server, bool force_cancel
     env = server->env;
     pthread_mutex_unlock(&server->mutex);
 
+    while (calls != NULL) {
+        native_call* next = calls->server_next;
+        pthread_mutex_lock(&calls->mutex);
+        calls->server = NULL;
+        calls->server_next = NULL;
+        calls->registered = false;
+        pthread_mutex_unlock(&calls->mutex);
+        native_call_close_request(calls);
+        native_call_release_pin(calls);
+        call_refs++;
+        calls = next;
+    }
+
     http3_admission_state_shutdown(admission);
     if (cancel_on_close) {
         (void)trevrpc_server_cancel(shutdown_server);
@@ -2973,8 +3102,6 @@ static void native_server_close_request(native_server* server, bool force_cancel
     }
     (void)native_server_shutdown_and_release(release_server, cancel_on_close);
     if (release_server != NULL) {
-        free_server_routes(env, server->routes);
-        server->routes = NULL;
         napi_threadsafe_function tsfn = NULL;
         node_http3_admission_state* admission_state = NULL;
         pthread_mutex_lock(&server->mutex);
@@ -2986,9 +3113,11 @@ static void native_server_close_request(native_server* server, bool force_cancel
         if (tsfn != NULL) {
             napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
         }
+        free_server_routes(env, server->routes);
+        server->routes = NULL;
         http3_admission_state_release(admission_state);
     }
-    native_server_maybe_destroy(server);
+    native_server_release_count(server, call_refs + 1);
 }
 
 static void native_server_close_after_serve(native_server* server, napi_env env, bool server_closed) {
@@ -3701,11 +3830,7 @@ static void native_server_finalize(napi_env env, void* data, void* hint) {
 static void native_call_finalize(napi_env env, void* data, void* hint) {
     (void)env;
     (void)hint;
-    native_call* call = data;
-    pthread_mutex_lock(&call->mutex);
-    call->js_alive = false;
-    pthread_mutex_unlock(&call->mutex);
-    native_call_close_request(call);
+    native_call_close_request_internal(data, true);
 }
 
 static void native_cancellation_finalize(napi_env env, void* data, void* hint) {
@@ -3866,8 +3991,10 @@ static void server_call_event_close(server_call_event* event) {
     if (event == NULL) {
         return;
     }
-    native_call_close_request(event->call);
+    native_call* call = event->call;
     free(event);
+    native_call_close_request(call);
+    native_call_release_pin(call);
 }
 
 static void server_call_js(napi_env env, napi_value js_callback, void* context, void* data) {
@@ -3876,6 +4003,14 @@ static void server_call_js(napi_env env, napi_value js_callback, void* context, 
     server_call_event* event = data;
     if (env == NULL || event == NULL) {
         server_call_event_close(event);
+        return;
+    }
+
+    native_call* call = event->call;
+    trevrpc_call* acquired_call = NULL;
+    if (native_call_acquire(call, &acquired_call) != 0) {
+        free(event);
+        native_call_release_pin(call);
         return;
     }
 
@@ -3891,7 +4026,7 @@ static void server_call_js(napi_env env, napi_value js_callback, void* context, 
             runtime == NULL ? napi_generic_failure : napi_get_reference_value(env, runtime->call_constructor, &ctor);
     }
     if (status == napi_ok) {
-        status = napi_create_external(env, event->call, NULL, NULL, &external);
+        status = napi_create_external(env, call, NULL, NULL, &external);
     }
     if (status == napi_ok) {
         status = napi_new_instance(env, ctor, 1, &external, &call_object);
@@ -3905,9 +4040,11 @@ static void server_call_js(napi_env env, napi_value js_callback, void* context, 
     }
     if (status != napi_ok) {
         clear_pending_exception(env);
-        native_call_close_request(event->call);
+        native_call_close_request(call);
     }
+    native_call_release(call, acquired_call);
     free(event);
+    native_call_release_pin(call);
 }
 
 static int native_server_call_handler(void* user_data, trevrpc_call* call) {
@@ -3948,20 +4085,42 @@ static int native_server_call_handler(void* user_data, trevrpc_call* call) {
         trevrpc_call_close(call);
         return TREVRPC_CALL_DEFERRED;
     }
+    if (trevrpc_call_retain(call) != 0) {
+#ifdef TREVRPC_NODE_TEST_HOOKS
+        debug_outbound_gate_destroy(&native->debug_outbound_gate);
+#endif
+        pthread_mutex_destroy(&native->operation_mutex);
+        pthread_mutex_destroy(&native->mutex);
+        free(native);
+        free(event);
+        trevrpc_call_close(call);
+        return TREVRPC_CALL_DEFERRED;
+    }
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    atomic_fetch_add_explicit(&DebugNativeCallAllocations, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&DebugNativeCallOwnerRetains, 1, memory_order_relaxed);
+#endif
     native->call = call;
+    native->pins = 1;
     event->route = route;
     event->call = native;
 
+    napi_status status = napi_closing;
+    napi_threadsafe_function tsfn = NULL;
     pthread_mutex_lock(&route->server->mutex);
-    napi_threadsafe_function tsfn = route->server->call_tsfn;
-    pthread_mutex_unlock(&route->server->mutex);
-    if (tsfn == NULL) {
-        native_call_close_request(native);
-        free(event);
-        return TREVRPC_CALL_DEFERRED;
+    if (!route->server->closing && route->server->call_tsfn != NULL) {
+        tsfn = route->server->call_tsfn;
+        status = napi_acquire_threadsafe_function(tsfn);
+        if (status == napi_ok) {
+            native->server = route->server;
+            native->server_next = route->server->calls;
+            native->registered = true;
+            native->pins++;
+            route->server->refs++;
+            route->server->calls = native;
+        }
     }
-
-    napi_status status = napi_acquire_threadsafe_function(tsfn);
+    pthread_mutex_unlock(&route->server->mutex);
     if (status == napi_ok) {
         status = napi_call_threadsafe_function(tsfn, event, napi_tsfn_nonblocking);
         napi_release_threadsafe_function(tsfn, napi_tsfn_release);
@@ -3969,6 +4128,7 @@ static int native_server_call_handler(void* user_data, trevrpc_call* call) {
     if (status != napi_ok) {
         native_call_close_request(native);
         free(event);
+        native_call_release_pin(native);
     }
     return TREVRPC_CALL_DEFERRED;
 }
@@ -6744,6 +6904,20 @@ static napi_value debug_completion_runtime_stats(napi_env env, napi_callback_inf
     return result;
 }
 
+static napi_value debug_native_call_stats(napi_env env, napi_callback_info info) {
+    (void)info;
+    napi_value result = NULL;
+    if (napi_create_object(env, &result) != napi_ok ||
+        debug_set_counter(env, result, "allocations", &DebugNativeCallAllocations) != napi_ok ||
+        debug_set_counter(env, result, "destroys", &DebugNativeCallDestroys) != napi_ok ||
+        debug_set_counter(env, result, "ownerRetains", &DebugNativeCallOwnerRetains) != napi_ok ||
+        debug_set_counter(env, result, "ownerReleases", &DebugNativeCallOwnerReleases) != napi_ok) {
+        napi_throw_error(env, NULL, "failed to read native call stats");
+        return NULL;
+    }
+    return result;
+}
+
 static void debug_gated_completion_execute(napi_env env, void* data) {
     (void)env;
     debug_gated_completion_work* work = data;
@@ -7110,6 +7284,7 @@ static napi_value init(napi_env env, napi_value exports) {
             napi_default,
             NULL},
         {"_debugCompletionRuntimeStats", NULL, debug_completion_runtime_stats, NULL, NULL, NULL, napi_default, NULL},
+        {"_debugNativeCallStats", NULL, debug_native_call_stats, NULL, NULL, NULL, napi_default, NULL},
         {"_debugQueueGatedCompletion", NULL, debug_queue_gated_completion, NULL, NULL, NULL, napi_default, NULL},
         {"_debugCompletionGateReached", NULL, debug_completion_gate_reached, NULL, NULL, NULL, napi_default, NULL},
         {"_debugReleaseCompletionGate", NULL, debug_release_completion_gate, NULL, NULL, NULL, napi_default, NULL},
