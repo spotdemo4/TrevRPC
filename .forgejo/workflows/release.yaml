@@ -171,7 +171,8 @@ jobs:
           (cd build/staging-repository && zip -r "../central-bundle.zip" .)
           echo "bundle: $bundle"
           ls -lh "$bundle"
-          unzip -l "$bundle" | head -n 100
+          unzip -l "$bundle" > "$bundle.list"
+          head -n 100 "$bundle.list"
           token=$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 -w0)
           curl --fail-with-body --show-error \
             -H "Authorization: Bearer $token" \
