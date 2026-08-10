@@ -17,15 +17,15 @@
 
 Protobuf over QUIC, HTTP/3 & WebTransport, with C, C++20, Go, Rust, JavaScript, and Kotlin runtimes
 
-## Browser support
+## Client support
 
-| Runtime    | Chromium | Firefox |                                 Safari                                  |
-| ---------- | :------: | :-----: | :---------------------------------------------------------------------: |
-| C          |    ✅    |   ✅    |                                   ✅                                    |
-| C++        |    ✅    |   ✅    |                                   ✅                                    |
-| Go         |    ✅    |   ✅    | ❌ [quic-go#355](https://github.com/quic-go/webtransport-go/issues/355) |
-| Rust       |    ✅    |   ✅    |         ❌ [h3#347](https://github.com/hyperium/h3/issues/347)          |
-| JavaScript |    ✅    |   ✅    |                                   ✅                                    |
-| Kotlin     |    ✅    |   ✅    |                                   ✅                                    |
+| Server     |  C  | C++ | Go  | Rust | JavaScript (Node) | Kotlin | Chromium | Firefox |                                 Safari                                  |
+| ---------- | :-: | :-: | :-: | :--: | :---------------: | :----: | :------: | :-----: | :---------------------------------------------------------------------: |
+| C          | ✅  | ✅  | ✅  |  ✅  |        ✅         |   ✅   |    ✅    |   ✅    |                                   ✅                                    |
+| C++        | ✅  | ✅  | ✅  |  ✅  |        ✅         |   ✅   |    ✅    |   ✅    |                                   ✅                                    |
+| Go         | ✅  | ✅  | ✅  |  ✅  |        ✅         |   ✅   |    ✅    |   ✅    | ❌ [quic-go#355](https://github.com/quic-go/webtransport-go/issues/355) |
+| Rust       | ✅  | ✅  | ✅  |  ✅  |        ✅         |   ✅   |    ✅    |   ✅    |         ❌ [h3#347](https://github.com/hyperium/h3/issues/347)          |
+| JavaScript | ✅  | ✅  | ✅  |  ✅  |        ✅         |   ✅   |    ✅    |   ✅    |                                   ✅                                    |
+| Kotlin     | ✅  | ✅  | ✅  |  ✅  |        ✅         |   ✅   |    ✅    |   ✅    |                                   ✅                                    |
 
 Full documentation is available in the [TrevRPC wiki](https://trev.zip/llc/TrevRPC/wiki)
