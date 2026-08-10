@@ -21,6 +21,12 @@ const (
 	DefaultHTTP3Path = "/trevrpc"
 	// HTTP3ContentType is the media type for TrevRPC request and response bodies.
 	HTTP3ContentType = "application/trevrpc"
+
+	// These permissive limits keep the WebTransport SETTINGS_WT_INITIAL_MAX_*
+	// settings enabled for Network.framework clients. webtransport-go v0.12
+	// otherwise sends WT_MAX_SESSIONS without its associated flow-control settings.
+	webTransportInitialMaxData    int64 = 1 << 60
+	webTransportInitialMaxStreams       = 1 << 60
 )
 
 func isHTTP3QUICConnection(conn *quic.Conn, options ServerOptions) bool {
@@ -83,7 +89,12 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 	if runtime.options.EnableWebTransport {
 		wtServer = &webtransport.Server{
 			CheckOrigin: func(*http.Request) bool { return true },
-			H3:          h3Server,
+			Config: &webtransport.Config{
+				MaxIncomingData:       webTransportInitialMaxData,
+				MaxIncomingStreams:    webTransportInitialMaxStreams,
+				MaxIncomingUniStreams: webTransportInitialMaxStreams,
+			},
+			H3: h3Server,
 		}
 		webtransport.ConfigureHTTP3Server(h3Server)
 	}

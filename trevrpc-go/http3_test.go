@@ -1,6 +1,7 @@
 package trevrpc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
@@ -48,6 +50,97 @@ func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
 	} {
 		if isTrevRPCMediaType(values) {
 			t.Errorf("expected media type values %#v to be rejected", values)
+		}
+	}
+}
+
+func TestWebTransportServerAdvertisesInitialFlowControl(t *testing.T) {
+	running := startTestWebTransportServer(t, func(*Server) {})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS.Clone(), &quic.Config{
+		EnableDatagrams:                  true,
+		EnableStreamResetPartialDelivery: true,
+	})
+	if err != nil {
+		t.Fatalf("dial WebTransport server: %v", err)
+	}
+	defer conn.CloseWithError(0, "test complete")
+
+	settings := []struct {
+		id    uint64
+		value uint64
+	}{
+		{id: 0x33, value: 1},
+		{id: 0x2c7cf000, value: 1},
+		{id: 0x2b61, value: uint64(webTransportInitialMaxData)},
+		{id: 0x2b64, value: webTransportInitialMaxStreams},
+		{id: 0x2b65, value: webTransportInitialMaxStreams},
+	}
+	payload := make([]byte, 0, 64)
+	for _, setting := range settings {
+		payload = quicvarint.Append(payload, setting.id)
+		payload = quicvarint.Append(payload, setting.value)
+	}
+	control := quicvarint.Append(nil, 0)
+	control = quicvarint.Append(control, 4)
+	control = quicvarint.Append(control, uint64(len(payload)))
+	control = append(control, payload...)
+	clientControl, err := conn.OpenUniStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open client control stream: %v", err)
+	}
+	if _, err := clientControl.Write(control); err != nil {
+		t.Fatalf("write client SETTINGS: %v", err)
+	}
+	if err := clientControl.Close(); err != nil {
+		t.Fatalf("close client control stream: %v", err)
+	}
+
+	serverControl, err := conn.AcceptUniStream(ctx)
+	if err != nil {
+		t.Fatalf("accept server control stream: %v", err)
+	}
+	reader := bufio.NewReader(serverControl)
+	streamType, err := quicvarint.Read(reader)
+	if err != nil {
+		t.Fatalf("read server control stream type: %v", err)
+	}
+	if streamType != 0 {
+		t.Fatalf("server first unidirectional stream type = %#x, want control stream", streamType)
+	}
+	frameType, err := quicvarint.Read(reader)
+	if err != nil {
+		t.Fatalf("read server SETTINGS frame type: %v", err)
+	}
+	if frameType != 4 {
+		t.Fatalf("server first control frame type = %#x, want SETTINGS", frameType)
+	}
+	frameLength, err := quicvarint.Read(reader)
+	if err != nil {
+		t.Fatalf("read server SETTINGS frame length: %v", err)
+	}
+	serverPayload := make([]byte, frameLength)
+	if _, err := io.ReadFull(reader, serverPayload); err != nil {
+		t.Fatalf("read server SETTINGS payload: %v", err)
+	}
+	serverReader := bytes.NewReader(serverPayload)
+	serverSettings := make(map[uint64]uint64)
+	for serverReader.Len() > 0 {
+		id, err := quicvarint.Read(serverReader)
+		if err != nil {
+			t.Fatalf("read server setting identifier: %v", err)
+		}
+		value, err := quicvarint.Read(serverReader)
+		if err != nil {
+			t.Fatalf("read server setting value: %v", err)
+		}
+		serverSettings[id] = value
+	}
+	for _, want := range []uint64{0x2b61, 0x2b64, 0x2b65, 0x14e9cd29} {
+		if value := serverSettings[want]; value == 0 {
+			t.Fatalf("server SETTINGS %#x = %d, want a positive value", want, value)
 		}
 	}
 }
