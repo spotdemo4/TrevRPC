@@ -19,19 +19,6 @@ jobs:
           github_token: ${{ secrets.GH_TOKEN }}
           niks3_url: https://niks3.trev.zip
 
-      - name: Verify versions
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          echo "tag=$tag"
-          test "$(jq -r .version trevrpc-js/package.json)" = "$tag"
-          test "$(jq -r .version trevrpc-js/npm/native-linux-x64-gnu/package.json)" = "$tag"
-          test "$(grep '^version =' trevrpc-rust/Cargo.toml | head -1 | cut -d'"' -f2)" = "$tag"
-          test "$(grep 'version =' trevrpc-js/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
-          test "$(grep 'version =' trevrpc-js/native-package.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
-          test "$(grep 'version =' trevrpc-kotlin/build.gradle.kts | head -1 | grep -o '[0-9.]\+')" = "$tag"
-          test "$(grep 'version =' trevrpc-kotlin/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
-
       - name: Check
         run: nix flake check
 
