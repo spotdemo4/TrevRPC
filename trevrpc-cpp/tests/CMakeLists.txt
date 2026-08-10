@@ -22,6 +22,14 @@ set(trevrpc_cpp_test_generated_files
   "${trevrpc_cpp_test_generated_dir}/generator.trevrpc.cpp"
   "${trevrpc_cpp_test_generated_dir}/generator.trevrpc.hpp")
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set_source_files_properties(
+    "${trevrpc_cpp_test_generated_dir}/common.pb.cc"
+    "${trevrpc_cpp_test_generated_dir}/generator.pb.cc"
+    "${trevrpc_cpp_test_generated_dir}/full.pb.cc"
+    PROPERTIES COMPILE_OPTIONS -Wno-nullability-extension)
+endif()
+
 add_custom_command(
   OUTPUT ${trevrpc_cpp_test_generated_files}
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${trevrpc_cpp_test_generated_dir}"
