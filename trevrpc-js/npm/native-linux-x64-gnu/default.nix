@@ -7,6 +7,7 @@
   patchelf,
   perl,
   pkg-config,
+  sourceTree,
   trevrpcCSrc,
   jsNativeSrc,
   jsNativePackageSrc,
@@ -18,7 +19,7 @@ stdenv.mkDerivation {
   version = "0.2.0";
 
   src = lib.fileset.toSource {
-    root = ../.;
+    root = sourceTree;
     fileset = lib.fileset.unions [
       trevrpcCSrc
       jsNativeSrc

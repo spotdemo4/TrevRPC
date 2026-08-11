@@ -29,7 +29,7 @@ jobs:
           test "$(jq -r .version trevrpc-js/npm/native-linux-x64-gnu/package.json)" = "$tag"
           test "$(grep '^version =' trevrpc-rust/Cargo.toml | head -1 | cut -d'"' -f2)" = "$tag"
           test "$(grep 'version =' trevrpc-js/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
-          test "$(grep 'version =' trevrpc-js/native-package.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
+          test "$(grep 'version =' trevrpc-js/npm/native-linux-x64-gnu/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
           test "$(grep 'version =' trevrpc-kotlin/build.gradle.kts | head -1 | grep -o '[0-9.]\+')" = "$tag"
           test "$(grep 'version =' trevrpc-kotlin/default.nix | head -1 | grep -o '[0-9.]\+')" = "$tag"
 

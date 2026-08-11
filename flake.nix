@@ -65,7 +65,8 @@
             };
             jsNative =
               if system == "x86_64-linux" then
-                pkgs.callPackage ./trevrpc-js/native-package.nix {
+                pkgs.callPackage ./trevrpc-js/npm/native-linux-x64-gnu {
+                  sourceTree = ./.;
                   libmsquic = pkgs.libmsquic.overrideAttrs {
                     dontPatchELF = true;
                   };
