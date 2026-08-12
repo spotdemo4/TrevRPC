@@ -85,10 +85,10 @@ jobs:
           niks3_url: https://niks3.trev.zip
           shell: release
 
-      - name: Build npm stage
+      - name: Build npm artifacts
         run: |
           set -euo pipefail
-          stage="$(nix build .#trevrpc-js-npm-stage --no-link --print-out-paths)"
+          stage="$(nix build '.#trevrpc-js^npm' --no-link --print-out-paths)"
           echo "stage=$stage"
           ls -lh "$stage"/*.tgz
           cat "$stage"/manifest.json

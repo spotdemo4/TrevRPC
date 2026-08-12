@@ -1,4 +1,5 @@
 {
+  binutils,
   cmake,
   lib,
   libmsquic,
@@ -7,6 +8,7 @@
   patchelf,
   perl,
   pkg-config,
+  publicationVerifier,
   sourceTree,
   trevrpcCSrc,
   jsNativeSrc,
@@ -14,9 +16,13 @@
   jsLicense,
   stdenv,
 }:
-stdenv.mkDerivation {
+stdenv.mkDerivation (final: {
   pname = "trevrpc-js-native-linux-x64-gnu";
   version = "0.2.0";
+  outputs = [
+    "out"
+    "npm"
+  ];
 
   src = lib.fileset.toSource {
     root = sourceTree;
@@ -62,7 +68,8 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    mkdir -p "$out/package"
+    export HOME="$TMPDIR/home"
+    mkdir -p "$HOME" "$out/package" "$npm"
     cp build/trevrpc_native.node "$out/package/trevrpc_native.node"
     cp "${libmsquic}/lib/libmsquic.so.2" "$out/package/libmsquic.so.2"
     cp "$src/trevrpc-js/npm/native-linux-x64-gnu/package.json" "$out/package/package.json"
@@ -82,24 +89,28 @@ stdenv.mkDerivation {
       's{/nix/store}{/trev/path}g; s{/home/}{/trev/}g; s{/build/}{/trevr/}g' \
       "$out/package/trevrpc_native.node" "$out/package/libmsquic.so.2"
 
-    test "$(find "$out/package" -maxdepth 1 -name '*.node' -type f | wc -l)" -eq 1
-    readelf -d "$out/package/trevrpc_native.node" | grep -E '(RPATH|RUNPATH).*\$ORIGIN'
-    ! grep -a -E '/nix/store|/home/|/build/' \
-      "$out/package/trevrpc_native.node" "$out/package/libmsquic.so.2"
-
-    max_glibc="$({
-      readelf --version-info "$out/package/trevrpc_native.node"
-      readelf --version-info "$out/package/libmsquic.so.2"
-    } | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -1)"
-    test "$(printf '%s\n' "$max_glibc" 'GLIBC_2.42' | sort -V | tail -1)" = 'GLIBC_2.42'
+    native_name="$(npm pack "$out/package" --pack-destination "$npm")"
+    test "$native_name" = "trevrpc-trevrpc-js-native-linux-x64-gnu-${final.version}.tgz"
+    test -f "$npm/$native_name"
     runHook postInstall
   '';
 
   dontFixup = true;
+
+  doInstallCheck = true;
+  nativeInstallCheckInputs = [ binutils ];
+  installCheckPhase = ''
+    runHook preInstallCheck
+    test "$(find "$npm" -maxdepth 1 -type f | wc -l)" -eq 1
+    node ${publicationVerifier} native \
+      "$npm/trevrpc-trevrpc-js-native-linux-x64-gnu-${final.version}.tgz" \
+      "${final.version}"
+    runHook postInstallCheck
+  '';
 
   meta = {
     description = "Portable TrevRPC native Node addon for Linux x86-64 glibc";
     license = lib.licenses.mit;
     platforms = [ "x86_64-linux" ];
   };
-}
+})

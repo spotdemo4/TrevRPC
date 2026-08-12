@@ -74,6 +74,7 @@
                   jsNativeSrc = ./trevrpc-js/native;
                   jsNativePackageSrc = ./trevrpc-js/npm/native-linux-x64-gnu;
                   jsLicense = ./trevrpc-js/LICENSE;
+                  publicationVerifier = ./trevrpc-js/publication-tests/verify.mjs;
                 }
               else
                 null;
@@ -157,14 +158,6 @@
           }
           // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             trevrpc-js-native-linux-x64-gnu = jsNative;
-            trevrpc-js-npm-stage = pkgs.callPackage ./trevrpc-js/npm-stage.nix {
-              wireGolden = ./testdata/wire-golden-vectors.txt;
-              trevrpcCSrc = ./trevrpc-c;
-              trevrpcJsSrc = ./trevrpc-js;
-              trevrpcC = c;
-              trevrpcJs = js;
-              nativePackage = jsNative;
-            };
           };
       in
       {
@@ -403,7 +396,6 @@
             go = packageSet.trevrpc-go;
 
             js = packageSet.trevrpc-js;
-            ${if system == "x86_64-linux" then "js-npm-stage" else null} = packageSet.trevrpc-js-npm-stage;
 
             kotlin = packageSet.trevrpc-kotlin;
 
