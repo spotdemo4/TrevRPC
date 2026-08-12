@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"math"
 
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
@@ -220,6 +221,11 @@ func newNativeBenchmarkServer() *trevrpc.Server {
 	options.MaxStreamMessages = maxBenchmarkMessagesPerStream
 	options.MaxStreamBodySize = -1
 	server.SetOptions(options)
+	server.SetDiagnostics(func(event trevrpc.ServerDiagnostic) {
+		if event.Err != nil {
+			log.Printf("server diagnostic: phase=%s: %v", event.Phase, event.Err)
+		}
+	})
 	benchmarkpb.RegisterNativeBenchmarkServiceServer(server, nativeBenchmarkService{})
 	return server
 }

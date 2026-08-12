@@ -54,7 +54,7 @@ func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
 	}
 }
 
-func TestWebTransportServerAdvertisesInitialFlowControl(t *testing.T) {
+func TestWebTransportServerAdvertisesSingleSessionWithoutFlowControl(t *testing.T) {
 	running := startTestWebTransportServer(t, func(*Server) {})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -74,9 +74,9 @@ func TestWebTransportServerAdvertisesInitialFlowControl(t *testing.T) {
 	}{
 		{id: 0x33, value: 1},
 		{id: 0x2c7cf000, value: 1},
-		{id: 0x2b61, value: uint64(webTransportInitialMaxData)},
-		{id: 0x2b64, value: webTransportInitialMaxStreams},
-		{id: 0x2b65, value: webTransportInitialMaxStreams},
+		{id: 0x2b61, value: 1},
+		{id: 0x2b64, value: 1},
+		{id: 0x2b65, value: 1},
 	}
 	payload := make([]byte, 0, 64)
 	for _, setting := range settings {
@@ -138,9 +138,12 @@ func TestWebTransportServerAdvertisesInitialFlowControl(t *testing.T) {
 		}
 		serverSettings[id] = value
 	}
-	for _, want := range []uint64{0x2b61, 0x2b64, 0x2b65, 0x14e9cd29} {
-		if value := serverSettings[want]; value == 0 {
-			t.Fatalf("server SETTINGS %#x = %d, want a positive value", want, value)
+	if value := serverSettings[0x14e9cd29]; value != 1 {
+		t.Fatalf("server SETTINGS_WT_MAX_SESSIONS = %d, want 1", value)
+	}
+	for _, setting := range []uint64{0x2b61, 0x2b64, 0x2b65} {
+		if value, ok := serverSettings[setting]; ok {
+			t.Fatalf("server SETTINGS %#x = %d, want omitted", setting, value)
 		}
 	}
 }

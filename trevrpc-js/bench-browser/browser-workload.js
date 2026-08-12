@@ -23,6 +23,13 @@ export async function connectAndPrepare(input) {
   config = input.config;
   const connectOptions = {
     maxFrameSize: MaxFrameSize,
+    onStateChange(event) {
+      if ((event.state === "connecting" || event.state === "reconnecting") && event.error != null) {
+        console.error(
+          `WebTransport ${event.state} attempt ${event.attempt}: ${errorMessage(event.error)}`,
+        );
+      }
+    },
     streamIdleTimeoutMs: IdleTimeoutMs,
     timeoutMs: ConnectTimeoutMs,
   };
@@ -75,6 +82,20 @@ export function close() {
   channel?.close();
   channel = undefined;
   measurement = undefined;
+}
+
+function errorMessage(error) {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  const parts = [error.name, error.message].filter((part) => part !== "");
+  if (error.source != null) {
+    parts.push(`source=${error.source}`);
+  }
+  if (error.streamErrorCode != null) {
+    parts.push(`streamErrorCode=${error.streamErrorCode}`);
+  }
+  return parts.join(": ");
 }
 
 function base64Bytes(value) {

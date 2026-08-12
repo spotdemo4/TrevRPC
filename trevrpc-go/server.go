@@ -110,6 +110,7 @@ const (
 	ServerDiagnosticResponseStreamPanic    ServerDiagnosticPhase = "response_stream_panic"
 	ServerDiagnosticMetricsPanic           ServerDiagnosticPhase = "metrics_panic"
 	ServerDiagnosticAdmissionPanic         ServerDiagnosticPhase = "admission_panic"
+	ServerDiagnosticWebTransportUpgrade    ServerDiagnosticPhase = "webtransport_upgrade"
 	ServerDiagnosticInvalidResponse        ServerDiagnosticPhase = "invalid_response"
 	ServerDiagnosticInternalError          ServerDiagnosticPhase = "internal_error"
 	ServerDiagnosticExecutionDetached      ServerDiagnosticPhase = "execution_detached"

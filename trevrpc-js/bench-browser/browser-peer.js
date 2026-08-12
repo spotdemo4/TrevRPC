@@ -150,6 +150,14 @@ async function runClient(config, io, env, peerName, engineName) {
       browser = launchResult.browser;
       context = launchResult.context;
       page = launchResult.page;
+      page.on("console", (message) => {
+        if (message.type() === "error" || message.type() === "warning") {
+          io.stderr.write(`[browser ${message.type()}] ${message.text()}\n`);
+        }
+      });
+      page.on("pageerror", (error) => {
+        io.stderr.write(`[browser pageerror] ${error.message}\n`);
+      });
       // Keep trust cleanup handle from launchResult if any.
       if (launchResult.trustArtifacts != null) {
         trustArtifacts = launchResult.trustArtifacts;
