@@ -511,10 +511,9 @@
                   export HOME=$(mktemp -d)
                   export TREVRPC_BENCH_SERVER_WORKERS=8
                   trevrpc-bench run ${./bench/campaigns/webkit-smoke.example.json} --out run
-                  # Go and Rust remain excluded pending upstream Safari compatibility fixes:
-                  # https://github.com/quic-go/webtransport-go/issues/355
+                  # Rust remains excluded pending an upstream Safari compatibility fix:
                   # https://github.com/hyperium/h3/issues/347
-                  test "$(wc -l < run/samples.jsonl)" -eq 16
+                  test "$(wc -l < run/samples.jsonl)" -eq 20
                   test -s run/aggregate.csv
                   test -s run/report.md
                   test -s run/report.html

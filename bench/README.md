@@ -78,10 +78,9 @@ advertised stacks, roles, RPC kinds, and histogram before starting a run.
 `chromium-smoke.example.json`, `firefox-smoke.example.json`, and
 `webkit-smoke.example.json` each start the respective browser client before
 each RPC server. Chromium and Firefox run against all six server implementations
-for 24 functional samples. WebKit currently runs against four implementations
-for 16 samples because Go remains excluded pending
-[webtransport-go#355](https://github.com/quic-go/webtransport-go/issues/355) and
-Rust remains excluded pending
+for 24 functional samples. WebKit currently runs against five implementations
+for 20 samples, with the Go server using a temporary `webtransport-go` fork to
+test Safari compatibility. Rust remains excluded pending
 [h3#347](https://github.com/hyperium/h3/issues/347). The client first reports its
 prepared browser origin; the controller passes that origin to the server, sends
 the ready server address back with `CONNECT`, waits for `armed`, and then starts

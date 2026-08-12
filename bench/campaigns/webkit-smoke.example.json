@@ -16,6 +16,10 @@
       "command": ["trevrpc-bench-peer-cpp"]
     },
     {
+      "id": "go",
+      "command": ["trevrpc-bench-peer-go"]
+    },
+    {
       "id": "js",
       "command": ["trevrpc-bench-peer-js"]
     },
@@ -35,6 +39,12 @@
       "id": "webkit-cpp",
       "client": "webkit",
       "server": "cpp",
+      "stack": "trevrpc_webtransport"
+    },
+    {
+      "id": "webkit-go",
+      "client": "webkit",
+      "server": "go",
       "stack": "trevrpc_webtransport"
     },
     {

@@ -16,3 +16,5 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 )
+
+replace github.com/quic-go/webtransport-go => github.com/spotdemo4/webtransport-go v0.0.0-20260812083448-14222cf7899a

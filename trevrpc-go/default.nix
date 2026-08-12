@@ -23,7 +23,7 @@ buildGoModule (final: {
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-J3IqdWEytH7F2+tec/0ODcFdfAzjJek5uz9BEFlbbwQ=";
+  vendorHash = "sha256-jP2ONIrh7DFMw7AjcFDclXa8Ek+Ox/z6Le9lHwSX0ZQ=";
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
     "cmd/trevrpc-bench-peer"
