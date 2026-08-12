@@ -2,7 +2,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -16,6 +16,7 @@ use crate::{
 };
 use prost::Message;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 #[cfg(feature = "quinn")]
 pub(crate) mod channel;
@@ -1055,18 +1056,21 @@ fn validate_response_metadata(response: &RpcResponse) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use futures_core::Stream;
     use futures_util::StreamExt;
 
     use crate::{Code, Error, Result, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
     use super::{
         BidirectionalCall, CallOptions, ResponseStream, RpcTransport, StreamingRpcTransport,
-        bidirectional_streaming, bidirectional_streaming_from_stream, client_streaming,
-        client_streaming_from_stream, read_unary_response_from_stream, request_channel,
-        server_streaming, unary,
+        bidirectional_streaming, bidirectional_streaming_from_stream, client_streaming_from_stream,
+        read_unary_response_from_stream, request_channel, server_streaming, unary,
     };
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -1298,7 +1302,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unary_deadline_cancels_pending_transport() {
         let error = unary::<_, _, TestMessage>(
             &PendingTransport,
@@ -1315,7 +1319,7 @@ mod tests {
         assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn server_streaming_deadline_cancels_pending_open() {
         let Err(error) = server_streaming::<_, _, TestMessage>(
             &PendingTransport,
@@ -1359,24 +1363,47 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    struct DropTrackedPendingStream {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for DropTrackedPendingStream {
+        type Item = Result<TestMessage>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropTrackedPendingStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn client_streaming_deadline_drops_pending_upload() {
-        let call = client_streaming::<_, TestMessage, TestMessage>(
+        let dropped = Arc::new(AtomicBool::new(false));
+        let call = client_streaming_from_stream::<_, TestMessage, TestMessage>(
             &UploadWaitingTransport,
             "example.Greeter",
             "LotsOfGreetings",
+            Box::pin(DropTrackedPendingStream {
+                dropped: Arc::clone(&dropped),
+            }),
             CallOptions::new().with_timeout(Duration::from_millis(1)),
-        )
-        .await
-        .expect("stream should open");
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        );
+        tokio::pin!(call);
+        assert!(
+            futures_util::poll!(&mut call).is_pending(),
+            "client-streaming call should wait for the pending upload"
+        );
 
-        let error = call
-            .close_and_recv()
-            .await
-            .expect_err("pending upload should hit deadline");
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let error = call.await.expect_err("pending upload should hit deadline");
 
         assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[derive(Clone, Default)]
@@ -1503,7 +1530,7 @@ mod tests {
         assert_eq!(values, ["one", "two"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bidirectional_streaming_deadline_cancels_pending_response_read() {
         let mut responses = bidirectional_streaming::<_, TestMessage, TestMessage>(
             &UploadWaitingTransport,
@@ -1513,10 +1540,15 @@ mod tests {
         )
         .await
         .expect("stream should open");
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        let response = responses.recv();
+        tokio::pin!(response);
+        assert!(
+            futures_util::poll!(&mut response).is_pending(),
+            "response read should be pending before the deadline"
+        );
 
-        let error = responses
-            .recv()
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let error = response
             .await
             .expect_err("pending response should hit deadline");
         assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
@@ -1774,7 +1806,7 @@ mod tests {
         assert!(response.next().await.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn response_stream_deadline_returns_deadline_exceeded() {
         let mut response = ResponseStream::<TestMessage>::new(
             pending_frame_stream(),
@@ -1782,7 +1814,7 @@ mod tests {
             Some(4096),
             Some(64 * 1024 * 1024),
             Some(Duration::from_secs(30)),
-            Some(std::time::Instant::now() + Duration::from_millis(1)),
+            Some(tokio::time::Instant::now() + Duration::from_millis(1)),
         );
 
         let error = response
@@ -1804,7 +1836,7 @@ mod tests {
             Some(64 * 1024 * 1024),
             Some(Duration::from_secs(30)),
             Some(
-                std::time::Instant::now()
+                tokio::time::Instant::now()
                     .checked_sub(Duration::from_millis(1))
                     .expect("test deadline should be representable"),
             ),

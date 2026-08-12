@@ -1715,18 +1715,16 @@ async fn webtransport_server_streaming_deadline_while_response_pending() -> Test
 }
 
 #[tokio::test]
-async fn quinn_client_streaming_deadline_drops_pending_upload() -> TestResult {
+async fn quinn_client_streaming_deadline_while_upload_pending() -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
 
-    let call = client
-        .lots_of_greetings_with_options(short_authenticated_options())
-        .await?;
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let error = call
-        .close_and_recv()
+    let requests: trevrpc::BoxStream<greeter::HelloRequest> =
+        Box::pin(futures_util::stream::pending());
+    let error = client
+        .lots_of_greetings_from_stream_with_options(requests, short_authenticated_options())
         .await
         .expect_err("pending upload should hit deadline");
     assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
@@ -1736,18 +1734,16 @@ async fn quinn_client_streaming_deadline_drops_pending_upload() -> TestResult {
 }
 
 #[tokio::test]
-async fn webtransport_client_streaming_deadline_drops_pending_upload() -> TestResult {
+async fn webtransport_client_streaming_deadline_while_upload_pending() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
 
-    let call = greeter_client
-        .lots_of_greetings_with_options(short_authenticated_options())
-        .await?;
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let error = call
-        .close_and_recv()
+    let requests: trevrpc::BoxStream<greeter::HelloRequest> =
+        Box::pin(futures_util::stream::pending());
+    let error = greeter_client
+        .lots_of_greetings_from_stream_with_options(requests, short_authenticated_options())
         .await
         .expect_err("pending upload should hit deadline");
     assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
@@ -1757,7 +1753,7 @@ async fn webtransport_client_streaming_deadline_drops_pending_upload() -> TestRe
 }
 
 #[tokio::test]
-async fn quinn_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
+async fn quinn_bidi_deadline_while_response_pending() -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
@@ -1766,19 +1762,19 @@ async fn quinn_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
     let mut replies = client
         .bidi_hello_with_options(short_authenticated_options())
         .await?;
-    tokio::time::sleep(Duration::from_millis(60)).await;
     let error = replies
         .recv()
         .await
         .expect_err("pending bidi response should hit deadline");
     assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    drop(replies);
 
     close_client(endpoint, connection).await;
     server.shutdown().await
 }
 
 #[tokio::test]
-async fn webtransport_bidi_deadline_drops_pending_upload_and_response() -> TestResult {
+async fn webtransport_bidi_deadline_while_response_pending() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
@@ -1787,12 +1783,12 @@ async fn webtransport_bidi_deadline_drops_pending_upload_and_response() -> TestR
     let mut replies = greeter_client
         .bidi_hello_with_options(short_authenticated_options())
         .await?;
-    tokio::time::sleep(Duration::from_millis(60)).await;
     let error = replies
         .recv()
         .await
         .expect_err("pending bidi response should hit deadline");
     assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    drop(replies);
 
     close_webtransport_client(client, session).await;
     server.shutdown().await
@@ -3315,7 +3311,7 @@ fn authenticated_options() -> CallOptions {
 
 fn short_authenticated_options() -> CallOptions {
     CallOptions::new()
-        .with_timeout(Duration::from_millis(50))
+        .with_timeout(Duration::from_secs(1))
         .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
 }
 

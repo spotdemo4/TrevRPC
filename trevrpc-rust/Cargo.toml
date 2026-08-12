@@ -63,6 +63,12 @@ url = { version = "2", optional = true }
 quinn = { version = "0.11.11", features = ["qlog"] }
 rcgen = "0.14"
 time = "0.3"
-tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.48.0", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "test-util",
+] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing-subscriber = "0.3"
