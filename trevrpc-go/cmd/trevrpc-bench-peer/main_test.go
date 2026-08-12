@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -405,6 +406,27 @@ func TestClientConfigRejectsDuplicateAndOversizedOptions(t *testing.T) {
 	}
 	if _, err := parseClientConfig(oversized); err == nil {
 		t.Fatal("oversized request payload was accepted")
+	}
+}
+
+func TestDraft07OnlyGlobalFlag(t *testing.T) {
+	var output bytes.Buffer
+	if err := run([]string{"--webtransport-draft07-only", "capabilities"}, strings.NewReader(""), newEventEmitter(&output)); err != nil {
+		t.Fatalf("capabilities with global draft-07 flag: %v", err)
+	}
+	if events := decodeEvents(t, output.Bytes()); len(events) != 1 || events[0]["event"] != "capabilities" {
+		t.Fatalf("events = %v", events)
+	}
+
+	nativeArgs := []string{
+		"--webtransport-draft07-only", "server",
+		"--stack", "trevrpc_native_quic",
+		"--listen", "127.0.0.1:0",
+		"--cert", "cert.pem",
+		"--key", "key.pem",
+	}
+	if err := run(nativeArgs, strings.NewReader(""), newEventEmitter(io.Discard)); err == nil {
+		t.Fatal("native server accepted the draft-07-only flag")
 	}
 }
 

@@ -71,7 +71,10 @@ type ServerOptions struct {
 	HTTP3Path                         string
 	HTTP3Admission                    HTTP3Admission
 	EnableWebTransport                bool
-	WebTransportAdmission             WebTransportAdmission
+	// WebTransportDraft07Only advertises only the draft-07 WebTransport setting.
+	// It is an interoperability escape hatch and is effective only when WebTransport is enabled.
+	WebTransportDraft07Only bool
+	WebTransportAdmission   WebTransportAdmission
 }
 
 // HTTP3AdmissionRequest contains HTTP/3 request information available before accepting an RPC.

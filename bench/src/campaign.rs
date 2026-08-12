@@ -475,11 +475,18 @@ mod tests {
                     .iter()
                     .all(|cell| cell.client == browser && cell.stack == Stack::TrevrpcWebtransport)
             );
+            let go = campaign.peer("go").expect("Go peer");
             if browser == "webkit" {
+                assert_eq!(
+                    go.command,
+                    ["trevrpc-bench-peer-go", "--webtransport-draft07-only"]
+                );
                 // Keep the Rust server excluded until upstream Safari compatibility is resolved:
                 // https://github.com/hyperium/h3/issues/347
                 assert!(campaign.peer("rust").is_none());
                 assert!(campaign.cells.iter().all(|cell| cell.server != "rust"));
+            } else {
+                assert_eq!(go.command, ["trevrpc-bench-peer-go"]);
             }
             let sample_count = usize::try_from(campaign.repetitions).unwrap()
                 * campaign.cells.len()

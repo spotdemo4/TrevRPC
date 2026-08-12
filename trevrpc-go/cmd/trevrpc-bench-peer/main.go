@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -42,8 +43,16 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, emitter *eventEmitter) error {
+	globalFlags := flag.NewFlagSet("trevrpc-bench-peer", flag.ContinueOnError)
+	globalFlags.SetOutput(io.Discard)
+	var webTransportDraft07Only bool
+	globalFlags.BoolVar(&webTransportDraft07Only, "webtransport-draft07-only", false, "advertise only draft-07 WebTransport settings")
+	if err := globalFlags.Parse(args); err != nil {
+		return fail("startup", "invalid_config", err)
+	}
+	args = globalFlags.Args()
 	if len(args) == 0 {
-		return fail("startup", "invalid_command", errors.New("usage: trevrpc-bench-peer capabilities|server|client [options]"))
+		return fail("startup", "invalid_command", errors.New("usage: trevrpc-bench-peer [--webtransport-draft07-only] capabilities|server|client [options]"))
 	}
 	switch args[0] {
 	case "capabilities":
@@ -66,8 +75,15 @@ func run(args []string, stdin io.Reader, emitter *eventEmitter) error {
 		if err != nil {
 			return fail("startup", "invalid_config", err)
 		}
+		config.webTransportDraft07Only = webTransportDraft07Only
+		if config.webTransportDraft07Only && config.stack != stackWebTransport {
+			return fail("startup", "invalid_config", errors.New("--webtransport-draft07-only is only valid with trevrpc_webtransport"))
+		}
 		return runServer(config, stdin, emitter)
 	case "client":
+		if webTransportDraft07Only {
+			return fail("startup", "invalid_config", errors.New("--webtransport-draft07-only is only valid with a trevrpc_webtransport server"))
+		}
 		config, err := parseClientConfig(args[1:])
 		if err != nil {
 			return fail("startup", "invalid_config", err)

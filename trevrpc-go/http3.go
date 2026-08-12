@@ -93,6 +93,7 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 	if runtime.options.EnableWebTransport {
 		wtServer = &webtransport.Server{
 			CheckOrigin: func(*http.Request) bool { return true },
+			Draft07Only: runtime.options.WebTransportDraft07Only,
 			H3:          h3Server,
 		}
 		webtransport.ConfigureHTTP3Server(h3Server)

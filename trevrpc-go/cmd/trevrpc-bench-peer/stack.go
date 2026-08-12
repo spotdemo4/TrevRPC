@@ -23,6 +23,7 @@ func listenBenchmarkServer(config serverConfig) (benchmarkListener, error) {
 		server := newNativeBenchmarkServer()
 		options := server.Options()
 		options.EnableWebTransport = true
+		options.WebTransportDraft07Only = config.webTransportDraft07Only
 		options.WebTransportAdmission = func(request trevrpc.WebTransportAdmissionRequest) bool {
 			return request.Path == trevrpc.DefaultHTTP3Path && request.Origin == config.webTransportOrigin
 		}

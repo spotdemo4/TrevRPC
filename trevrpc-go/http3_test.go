@@ -23,6 +23,9 @@ func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
 	if options.EnableHTTP3 {
 		t.Fatal("HTTP/3 RPC should be opt-in")
 	}
+	if options.EnableWebTransport || options.WebTransportDraft07Only {
+		t.Fatal("WebTransport and its draft-07 compatibility mode should be opt-in")
+	}
 	if options.HTTP3Path != DefaultHTTP3Path || http3Path(ServerOptions{}) != DefaultHTTP3Path {
 		t.Fatalf("unexpected default HTTP/3 path: options=%q zero-value=%q", options.HTTP3Path, http3Path(ServerOptions{}))
 	}
@@ -55,7 +58,36 @@ func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
 }
 
 func TestWebTransportServerAdvertisesSingleSessionWithoutFlowControl(t *testing.T) {
-	running := startTestWebTransportServer(t, func(*Server) {})
+	serverSettings := readWebTransportServerSettings(t, func(*Server) {})
+	if value := serverSettings[0x14e9cd29]; value != 1 {
+		t.Fatalf("server SETTINGS_WT_MAX_SESSIONS = %d, want 1", value)
+	}
+	for _, setting := range []uint64{0xc671706a, 0x2b61, 0x2b64, 0x2b65} {
+		if value, ok := serverSettings[setting]; ok {
+			t.Fatalf("server SETTINGS %#x = %d, want omitted", setting, value)
+		}
+	}
+}
+
+func TestWebTransportServerAdvertisesDraft07Only(t *testing.T) {
+	serverSettings := readWebTransportServerSettings(t, func(server *Server) {
+		options := server.Options()
+		options.WebTransportDraft07Only = true
+		server.SetOptions(options)
+	})
+	if value := serverSettings[0xc671706a]; value != 1 {
+		t.Fatalf("server draft-07 WEBTRANSPORT_MAX_SESSIONS = %d, want 1", value)
+	}
+	for _, setting := range []uint64{0x2b603742, 0x2c7cf000, 0x14e9cd29, 0x2b61, 0x2b64, 0x2b65} {
+		if value, ok := serverSettings[setting]; ok {
+			t.Fatalf("server SETTINGS %#x = %d, want omitted", setting, value)
+		}
+	}
+}
+
+func readWebTransportServerSettings(t *testing.T, configure func(*Server)) map[uint64]uint64 {
+	t.Helper()
+	running := startTestWebTransportServer(t, configure)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -138,14 +170,7 @@ func TestWebTransportServerAdvertisesSingleSessionWithoutFlowControl(t *testing.
 		}
 		serverSettings[id] = value
 	}
-	if value := serverSettings[0x14e9cd29]; value != 1 {
-		t.Fatalf("server SETTINGS_WT_MAX_SESSIONS = %d, want 1", value)
-	}
-	for _, setting := range []uint64{0x2b61, 0x2b64, 0x2b65} {
-		if value, ok := serverSettings[setting]; ok {
-			t.Fatalf("server SETTINGS %#x = %d, want omitted", setting, value)
-		}
-	}
+	return serverSettings
 }
 
 func TestHTTP3RoundTripsUnaryAndAllStreamingModes(t *testing.T) {

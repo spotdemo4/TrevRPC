@@ -27,11 +27,12 @@ const (
 )
 
 type serverConfig struct {
-	stack              stackKind
-	listen             string
-	certFile           string
-	keyFile            string
-	webTransportOrigin string
+	stack                   stackKind
+	listen                  string
+	certFile                string
+	keyFile                 string
+	webTransportOrigin      string
+	webTransportDraft07Only bool
 }
 
 type clientConfig struct {
