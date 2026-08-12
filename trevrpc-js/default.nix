@@ -24,7 +24,7 @@ let
 in
 buildNpmPackage (final: {
   pname = "trevrpc-js";
-  version = "0.2.0";
+  version = "0.2.1";
   outputs = [ "out" ] ++ lib.optional publication "npm";
 
   src = lib.fileset.toSource {
