@@ -3,14 +3,12 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use futures_util::{FutureExt, StreamExt};
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 use h3::ext::Protocol;
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 use h3::quic::BidiStream as _;
 use http::{Method, Request, Response, StatusCode, header};
 use prost::Message;
-#[cfg(feature = "webtransport")]
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
@@ -25,29 +23,35 @@ use crate::{
 };
 
 const MEDIA_TYPE: &str = "application/trevrpc";
-#[cfg(feature = "webtransport")]
-const CANCELLED_STREAM_CODE: u64 = web_transport_quinn::proto::error_to_http3(1);
+// RFC WebTransport reserves this error-code range for application protocol errors. Code 1 maps
+// to the first application code plus one; the division term is zero for this value.
+#[cfg(feature = "webtransport-server")]
+const CANCELLED_STREAM_CODE: u64 = 0x52e4_a40f_a8dc;
 
 type H3RequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 type H3SendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 type H3RecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 type WebTransportSession =
     h3_webtransport::server::WebTransportSession<h3_quinn::Connection, Bytes>;
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 type WebTransportSendStream =
     h3_webtransport::stream::SendStream<h3_quinn::SendStream<Bytes>, Bytes>;
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 type WebTransportRecvStream = h3_webtransport::stream::RecvStream<h3_quinn::RecvStream, Bytes>;
-/// Serves HTTP/3 POST RPCs on an h3-only Quinn endpoint.
+/// Serves `TrevRPC` over an h3-only Quinn endpoint.
+///
+/// Ordinary HTTP/3 POST RPCs are accepted when enabled in [`crate::server::ServerOptions`]. When
+/// the `webtransport-server` feature is enabled, the same endpoint also accepts admitted
+/// WebTransport CONNECT sessions.
 impl crate::server::Server {
     pub async fn serve_http3(self, endpoint: quinn::Endpoint) -> Result<()> {
         self.serve_http3_with_shutdown(endpoint, pending::<()>())
             .await
     }
 
-    /// Serves HTTP/3 POST RPCs until the shutdown future completes.
+    /// Serves the h3 endpoint until the shutdown future completes.
     pub async fn serve_http3_with_shutdown<S>(
         self,
         endpoint: quinn::Endpoint,
@@ -59,7 +63,7 @@ impl crate::server::Server {
         serve_endpoint(self, endpoint, shutdown, false).await
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-server")]
     pub(crate) async fn serve_quinn_and_http3_with_shutdown<S>(
         self,
         endpoint: quinn::Endpoint,
@@ -157,11 +161,11 @@ async fn handle_h3_connection(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let raw_connection = connection.clone();
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-server")]
     let mut builder = h3::server::builder();
-    #[cfg(not(feature = "webtransport"))]
+    #[cfg(not(feature = "webtransport-server"))]
     let builder = h3::server::builder();
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-server")]
     builder
         .enable_extended_connect(true)
         .enable_datagram(true)
@@ -208,27 +212,31 @@ async fn handle_h3_connection(
                     continue;
                 };
 
-                #[cfg(feature = "webtransport")]
+                #[cfg(feature = "webtransport-server")]
                 if is_webtransport_request(&request) {
                     if let Some(status) = validate_webtransport_request(&server, &request) {
                         reject_h3(stream, status).await;
                         continue;
                     }
-                    match WebTransportSession::accept(request, stream, h3_connection).await {
-                        Ok(session) => {
-                            handle_webtransport_session(
-                                server.clone(),
-                                session,
-                                request_limit,
-                                stream_limit,
-                                raw_connection.clone(),
-                                shutdown.clone(),
-                            )
-                            .await;
+                    let accept = WebTransportSession::accept(request, stream, h3_connection);
+                    tokio::pin!(accept);
+                    let session = tokio::select! {
+                        result = &mut accept => result.ok(),
+                        changed = shutdown.changed() => {
+                            let _ = changed;
+                            None
                         }
-                        Err(error) => {
-                            let _ = error;
-                        }
+                    };
+                    if let Some(session) = session {
+                        handle_webtransport_session(
+                            server.clone(),
+                            session,
+                            request_limit,
+                            stream_limit,
+                            raw_connection.clone(),
+                            shutdown.clone(),
+                        )
+                        .await;
                     }
                     break;
                 }
@@ -384,13 +392,13 @@ async fn reject_h3(mut stream: H3RequestStream, status: StatusCode) {
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 fn is_webtransport_request(request: &Request<()>) -> bool {
     request.method() == Method::CONNECT
         && request.extensions().get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT)
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 fn validate_webtransport_request(
     server: &crate::server::Server,
     request: &Request<()>,
@@ -399,7 +407,7 @@ fn validate_webtransport_request(
         .headers()
         .get(header::ORIGIN)
         .and_then(|origin| origin.to_str().ok());
-    crate::webtransport::validate_admission(
+    validate_webtransport_admission(
         server,
         request.uri().path(),
         request.uri().authority().map(http::uri::Authority::as_str),
@@ -409,7 +417,63 @@ fn validate_webtransport_request(
     )
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
+fn validate_webtransport_admission(
+    server: &crate::server::Server,
+    path: &str,
+    authority: Option<&str>,
+    origin: Option<&str>,
+    secure: bool,
+    headers: &[crate::server::AdmissionHeader<'_>],
+) -> Option<StatusCode> {
+    let options = server.options();
+    if let Some(admission) = options.webtransport_admission() {
+        let request = crate::server::WebTransportAdmissionRequest {
+            path,
+            authority,
+            origin,
+            secure,
+            headers,
+        };
+        return (!admission(&request)).then_some(StatusCode::FORBIDDEN);
+    }
+    if path != options.webtransport_path() {
+        return Some(StatusCode::NOT_FOUND);
+    }
+    let allowed_authorities = options.webtransport_allowed_authorities();
+    if !allowed_authorities.is_empty()
+        && !authority.is_some_and(|authority| {
+            allowed_authorities
+                .iter()
+                .any(|allowed| allowed == authority || allowed == authority_host(authority))
+        })
+    {
+        return Some(StatusCode::FORBIDDEN);
+    }
+    if origin.is_some_and(|origin| {
+        !options
+            .webtransport_allowed_origins()
+            .iter()
+            .any(|allowed| allowed == origin)
+    }) {
+        return Some(StatusCode::FORBIDDEN);
+    }
+    None
+}
+
+#[cfg(feature = "webtransport-server")]
+fn authority_host(authority: &str) -> &str {
+    if let Some(authority) = authority.strip_prefix('[')
+        && let Some((host, _)) = authority.split_once(']')
+    {
+        return host;
+    }
+    authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
+}
+
+#[cfg(feature = "webtransport-server")]
 async fn handle_webtransport_session(
     server: crate::server::Server,
     session: WebTransportSession,
@@ -429,11 +493,12 @@ async fn handle_webtransport_session(
                         if id == session_id =>
                     {
                         let Some(stream_permit) = try_acquire_permit(stream_limit.as_ref()) else {
-                            let (send, _recv) = stream.split();
-                            stream_tasks.spawn(write_transport_status(
-                                IoBodyWriter(send),
-                                Status::unavailable("too many concurrent streams on WebTransport session"),
-                                server.max_frame_size(),
+                            let server = server.clone();
+                            let stream_connection = connection.clone();
+                            stream_tasks.spawn(reject_webtransport_stream(
+                                server,
+                                stream,
+                                stream_connection,
                             ));
                             continue;
                         };
@@ -474,7 +539,12 @@ async fn handle_webtransport_session(
                             );
                         }
                     }
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => break,
+                    Err(error) => {
+                        let message = error.to_string();
+                        connection.close(0_u32.into(), message.as_bytes());
+                        break;
+                    }
                 }
             }
             changed = shutdown.changed() => {
@@ -499,6 +569,34 @@ async fn handle_webtransport_session(
     } else {
         drain_stream_tasks(&mut stream_tasks).await;
     }
+}
+
+#[cfg(feature = "webtransport-server")]
+async fn reject_webtransport_stream(
+    server: crate::server::Server,
+    stream: h3_webtransport::stream::BidiStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    connection: quinn::Connection,
+) {
+    let (send, recv) = stream.split();
+    let mut recv = IoBodyReader::new(recv, connection);
+    let request = match read_initial_request(&server, &mut recv).await {
+        Ok(request) => request,
+        Err(error) => {
+            let status = error.into_status();
+            server.record_pre_handler_failure(&status);
+            write_transport_status(IoBodyWriter(send), status, server.max_frame_size()).await;
+            return;
+        }
+    };
+    let status = Status::unavailable("too many concurrent streams on WebTransport session");
+    server.record_rejected_request(&request, &status);
+    write_rpc_status(
+        IoBodyWriter(send),
+        &request,
+        status,
+        server.max_frame_size(),
+    )
+    .await;
 }
 
 trait RpcBodyWriter: FrameWrite + Send {
@@ -598,27 +696,29 @@ impl RequestPumpReader for H3BodyReader {
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 struct IoBodyWriter(WebTransportSendStream);
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 impl FrameWrite for IoBodyWriter {
     async fn write_frame_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.0.write_all(bytes).await.map_err(Error::transport)
+        write_webtransport_bytes(&mut self.0, bytes).await
     }
 
     async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
         for chunk in chunks {
-            self.0.write_all(chunk).await.map_err(Error::transport)?;
+            write_webtransport_bytes(&mut self.0, chunk).await?;
         }
         Ok(())
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 impl RpcBodyWriter for IoBodyWriter {
     async fn finish(&mut self) -> Result<()> {
-        self.0.shutdown().await.map_err(Error::transport)
+        std::future::poll_fn(|context| h3::quic::SendStream::poll_finish(&mut self.0, context))
+            .await
+            .map_err(Error::transport)
     }
 
     fn reset(&mut self) {
@@ -626,14 +726,32 @@ impl RpcBodyWriter for IoBodyWriter {
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
+async fn write_webtransport_bytes(send: &mut WebTransportSendStream, bytes: &[u8]) -> Result<()> {
+    let mut bytes = bytes;
+    while !bytes.is_empty() {
+        let written = std::future::poll_fn(|context| {
+            h3::quic::SendStreamUnframed::poll_send(send, context, &mut bytes)
+        })
+        .await
+        .map_err(Error::transport)?;
+        if written == 0 {
+            return Err(Error::from(Status::internal(
+                "WebTransport stream write made no progress",
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "webtransport-server")]
 struct IoBodyReader {
     stream: WebTransportRecvStream,
     chunk: Bytes,
     connection: quinn::Connection,
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 impl IoBodyReader {
     fn new(stream: WebTransportRecvStream, connection: quinn::Connection) -> Self {
         Self {
@@ -644,7 +762,7 @@ impl IoBodyReader {
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 impl FrameRead for IoBodyReader {
     async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
         while self.chunk.is_empty() {
@@ -664,7 +782,7 @@ impl FrameRead for IoBodyReader {
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-server")]
 impl RequestPumpReader for IoBodyReader {
     fn stop_trevrpc(&mut self) {
         // Like ordinary h3 request streams, h3-WebTransport receive streams
@@ -766,8 +884,8 @@ async fn handle_rpc_stream<W, R>(
                 let _ = send.finish().await;
             }
             Err(error) => {
-                cancel_from_transport_error(&cancellation, &error);
-                let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
+                let settle = settle_from_transport_error(&cancellation, &error);
+                let _ = request_pump.settle(settle).await;
             }
         }
         return;
@@ -849,13 +967,29 @@ where
     framed::write_frame::<_, NoopFrameTrace, _>(send, message, max_frame_size).await
 }
 
-fn cancel_from_transport_error(cancellation: &CancellationToken, error: &Error) {
-    if let Some(code) = error.transport_code() {
-        cancellation.cancel(if code == crate::Code::Cancelled {
+fn cancel_from_transport_error(
+    cancellation: &CancellationToken,
+    error: &Error,
+) -> Option<CancellationSource> {
+    error.transport_code().map(|code| {
+        let source = if code == crate::Code::Cancelled {
             CancellationSource::PeerReset
         } else {
             CancellationSource::ConnectionLost
-        });
+        };
+        cancellation.cancel(source);
+        source
+    })
+}
+
+fn settle_from_transport_error(
+    cancellation: &CancellationToken,
+    error: &Error,
+) -> RequestPumpSettle {
+    if cancel_from_transport_error(cancellation, error) == Some(CancellationSource::PeerReset) {
+        RequestPumpSettle::ResponseStopped
+    } else {
+        RequestPumpSettle::ConnectionLost
     }
 }
 
@@ -957,8 +1091,7 @@ where
             )
             .await
             {
-                cancel_from_transport_error(cancellation, &error);
-                return RequestPumpSettle::ConnectionLost;
+                return settle_from_transport_error(cancellation, &error);
             }
             let Some(frame) = next_frame else {
                 continue;
@@ -967,8 +1100,7 @@ where
             if let Err(error) =
                 framed::write_stream_frame::<_, NoopFrameTrace>(send, frame, max_frame_size).await
             {
-                cancel_from_transport_error(cancellation, &error);
-                return RequestPumpSettle::ConnectionLost;
+                return settle_from_transport_error(cancellation, &error);
             }
             if is_status {
                 return RequestPumpSettle::ResponseCommitted;
@@ -980,8 +1112,7 @@ where
         if let Err(error) =
             framed::write_stream_frame::<_, NoopFrameTrace>(send, frame, max_frame_size).await
         {
-            cancel_from_transport_error(cancellation, &error);
-            return RequestPumpSettle::ConnectionLost;
+            return settle_from_transport_error(cancellation, &error);
         }
         if is_status {
             return RequestPumpSettle::ResponseCommitted;

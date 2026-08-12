@@ -67,32 +67,32 @@ fn transport_status(error: &(dyn StdError + Send + Sync + 'static)) -> Status {
         return quinn_write_status(error);
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     if let Some(error) = error.downcast_ref::<web_transport_quinn::SessionError>() {
         return webtransport_session_status(error);
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     if let Some(error) = error.downcast_ref::<web_transport_quinn::WebTransportError>() {
         return webtransport_error_status(error);
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     if let Some(error) = error.downcast_ref::<web_transport_quinn::ReadError>() {
         return webtransport_stream_read_status(error);
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     if let Some(error) = error.downcast_ref::<web_transport_quinn::ReadExactError>() {
         return webtransport_stream_read_exact_status(error);
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     if let Some(error) = error.downcast_ref::<web_transport_quinn::WriteError>() {
         return webtransport_stream_write_status(error);
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     if let Some(error) = error.downcast_ref::<web_transport_quinn::ClosedStream>() {
         return Status::cancelled(error.to_string());
     }
@@ -184,7 +184,7 @@ fn quinn_write_status(error: &quinn::WriteError) -> Status {
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 fn webtransport_session_status(error: &web_transport_quinn::SessionError) -> Status {
     match error {
         web_transport_quinn::SessionError::ConnectionError(error) => quinn_connection_status(error),
@@ -195,7 +195,7 @@ fn webtransport_session_status(error: &web_transport_quinn::SessionError) -> Sta
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 fn webtransport_error_status(error: &web_transport_quinn::WebTransportError) -> Status {
     match error {
         web_transport_quinn::WebTransportError::Closed(_, _) => {
@@ -207,7 +207,7 @@ fn webtransport_error_status(error: &web_transport_quinn::WebTransportError) -> 
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 fn webtransport_stream_read_status(error: &web_transport_quinn::ReadError) -> Status {
     match error {
         web_transport_quinn::ReadError::SessionError(error) => webtransport_session_status(error),
@@ -218,7 +218,7 @@ fn webtransport_stream_read_status(error: &web_transport_quinn::ReadError) -> St
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 fn webtransport_stream_read_exact_status(error: &web_transport_quinn::ReadExactError) -> Status {
     match error {
         web_transport_quinn::ReadExactError::FinishedEarly(_) => transport_unavailable(error),
@@ -228,7 +228,7 @@ fn webtransport_stream_read_exact_status(error: &web_transport_quinn::ReadExactE
     }
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 fn webtransport_stream_write_status(error: &web_transport_quinn::WriteError) -> Status {
     match error {
         web_transport_quinn::WriteError::SessionError(error) => webtransport_session_status(error),
@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(status.code(), Code::Cancelled);
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     #[test]
     fn webtransport_invalid_reset_codes_still_map_to_cancelled() {
         let status = Error::transport(web_transport_quinn::ReadError::InvalidReset(1_u32.into()))

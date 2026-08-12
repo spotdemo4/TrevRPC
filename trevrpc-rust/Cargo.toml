@@ -31,14 +31,9 @@ server = ["dep:tokio"]
 quinn = ["client", "server", "dep:quinn", "dep:tokio"]
 http3 = ["quinn", "server", "dep:h3", "dep:h3-quinn", "dep:http"]
 tracing = ["dep:tracing"]
-webtransport = [
-  "http3",
-  "client",
-  "dep:h3-webtransport",
-  "h3-quinn/datagram",
-  "dep:web-transport-quinn",
-  "dep:url",
-]
+webtransport = ["webtransport-client", "webtransport-server"]
+webtransport-client = ["quinn", "dep:web-transport-quinn", "dep:url"]
+webtransport-server = ["http3", "dep:h3-webtransport", "h3-quinn/datagram"]
 
 [dependencies]
 async-trait = "0.1.89"

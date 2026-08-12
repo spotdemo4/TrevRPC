@@ -537,27 +537,6 @@ fn assert_response_shape(metadata: &trevrpc::Metadata, expected: &str) {
 }
 
 #[tokio::test]
-async fn dedicated_webtransport_round_trips_unary() -> TestResult {
-    let server = spawn_dedicated_webtransport_greeter_server(|server| {
-        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-    })?;
-    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
-
-    let reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "dedicated".to_owned(),
-            },
-            authenticated_options(),
-        )
-        .await?;
-    assert_eq!(reply.message, "hello, dedicated");
-
-    close_webtransport_client(client, session).await;
-    server.shutdown().await
-}
-
-#[tokio::test]
 async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
@@ -654,7 +633,7 @@ async fn managed_webtransport_channel_round_trips_unary() -> TestResult {
 
 #[tokio::test]
 async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
-    let server = spawn_webtransport_greeter_server(|server| {
+    let server = spawn_http3_greeter_server(|server| {
         server.set_http3_enabled(true);
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
@@ -694,7 +673,7 @@ async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
 }
 
 #[tokio::test]
-async fn combined_endpoint_accepts_quinn_and_webtransport_clients() -> TestResult {
+async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> TestResult {
     let server = spawn_webtransport_greeter_server(|server| {
         server.set_http3_enabled(true);
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
@@ -1240,6 +1219,88 @@ async fn quinn_stream_concurrency_limit_returns_unavailable() -> TestResult {
 }
 
 #[tokio::test]
+async fn webtransport_stream_concurrency_limit_returns_unavailable() -> TestResult {
+    let server = spawn_webtransport_greeter_server(|server| {
+        server
+            .set_options(fast_server_options().with_max_concurrent_streams_per_connection(Some(1)));
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+    let mut hanging = greeter_client
+        .lots_of_replies_with_options(
+            greeter::HelloRequest {
+                name: "cancel".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    let first = hanging
+        .next()
+        .await
+        .expect("response stream should yield first item")?;
+    assert_eq!(first.message, "first");
+
+    let (mut send, mut recv) = session.open_bi().await?;
+    let mut request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "SayHello",
+        greeter::HelloRequest {
+            name: "overloaded".to_owned(),
+        }
+        .encode_to_vec(),
+    );
+    request.metadata.insert(
+        "authorization".to_owned(),
+        format!("Bearer {AUTH_TOKEN}").into_bytes(),
+    );
+    trevrpc::webtransport::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    send.finish()?;
+    let response = read_raw_webtransport_response(&mut recv).await?;
+    assert_eq!(Code::from_u32(response.status), Code::Unavailable);
+
+    let (mut send, mut recv) = session.open_bi().await?;
+    let mut request = RpcRequest::new(
+        greeter::GreeterClient::<()>::SERVICE,
+        "LotsOfReplies",
+        greeter::HelloRequest {
+            name: "overloaded streaming".to_owned(),
+        }
+        .encode_to_vec(),
+    )
+    .with_kind(RpcKind::ServerStreaming);
+    request.metadata.insert(
+        "authorization".to_owned(),
+        format!("Bearer {AUTH_TOKEN}").into_bytes(),
+    );
+    trevrpc::webtransport::write_frame(
+        &mut send,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    send.finish()?;
+    let status = trevrpc::webtransport::read_frame::<RpcStreamFrame>(
+        &mut recv,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )
+    .await?;
+    assert_eq!(
+        status.frame_kind(),
+        Some(trevrpc::RpcStreamFrameKind::Status)
+    );
+    assert_eq!(Code::from_u32(status.status), Code::Unavailable);
+
+    drop((hanging, recv));
+    close_webtransport_client(client, session).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
     let metrics = RecordingMetrics::default();
     let observed_metrics = metrics.clone();
@@ -1532,7 +1593,7 @@ async fn unified_webtransport_request_reset_is_contained() -> TestResult {
 
     // The unified h3-WebTransport API has no independent reset observer for
     // a request body read. Contain the reset to this RPC and preserve the
-    // session; dedicated WebTransport reset cancellation is covered below.
+    // session; prompt independent reset observation is not exposed by the current h3 stack.
     send.reset(1)?;
     let reply = greeter_client
         .say_hello_with_options(
@@ -1550,70 +1611,9 @@ async fn unified_webtransport_request_reset_is_contained() -> TestResult {
 }
 
 #[tokio::test]
-async fn dedicated_webtransport_request_reset_cancels_only_one_rpc() -> TestResult {
-    let metrics = RecordingMetrics::default();
-    let server_metrics = metrics.clone();
+async fn unified_webtransport_connection_close_reports_connection_loss() -> TestResult {
     let (source_tx, mut source_rx) = mpsc::unbounded_channel();
-    let server = spawn_dedicated_webtransport_greeter_server(move |server| {
-        server.set_metrics(server_metrics);
-        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-        register_cancellation_probe_route(server, source_tx.clone());
-    })?;
-    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
-    let (mut send, mut recv) = session.open_bi().await?;
-    let mut request = RpcRequest::new("lifecycle.Probe", "Watch", Vec::new())
-        .with_kind(RpcKind::ServerStreaming)
-        .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
-    request.metadata.insert(
-        "authorization".to_owned(),
-        format!("Bearer {AUTH_TOKEN}").into_bytes(),
-    );
-    trevrpc::webtransport::write_frame(
-        &mut send,
-        &request,
-        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-    )
-    .await?;
-    let first = trevrpc::webtransport::read_frame::<RpcStreamFrame>(
-        &mut recv,
-        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-    )
-    .await?;
-    assert_eq!(
-        greeter::HelloReply::decode(first.body.as_slice())?.message,
-        "ready"
-    );
-
-    send.reset(1)?;
-    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
-        .await?
-        .expect("dedicated WebTransport probe should report a cancellation source");
-    assert_eq!(source, CancellationSource::PeerReset);
-    tokio::time::timeout(
-        Duration::from_millis(500),
-        metrics.wait_for_code(Code::Cancelled),
-    )
-    .await
-    .expect("dedicated WebTransport reset should promptly cancel the handler");
-    let reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after cancellation".to_owned(),
-            },
-            authenticated_options(),
-        )
-        .await?;
-    assert_eq!(reply.message, "hello, after cancellation");
-    drop(recv);
-
-    close_webtransport_client(client, session).await;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn dedicated_webtransport_session_close_reports_connection_loss() -> TestResult {
-    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
-    let server = spawn_dedicated_webtransport_greeter_server(move |server| {
+    let server = spawn_webtransport_greeter_server(move |server| {
         register_cancellation_probe_route(server, source_tx.clone());
     })?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
@@ -1637,10 +1637,10 @@ async fn dedicated_webtransport_session_close_reports_connection_loss() -> TestR
         "ready"
     );
 
-    session.close(7, b"adversarial session close");
+    quinn::Connection::close(&session, 7_u32.into(), b"adversarial connection close");
     let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
         .await?
-        .expect("dedicated WebTransport probe should report a cancellation source");
+        .expect("unified WebTransport probe should report a cancellation source");
     assert_eq!(source, CancellationSource::ConnectionLost);
     tokio::time::timeout(TEST_TIMEOUT, session.closed())
         .await
@@ -3004,24 +3004,23 @@ fn spawn_webtransport_greeter_server(
     })
 }
 
-fn spawn_dedicated_webtransport_greeter_server(
+fn spawn_http3_greeter_server(
     configure: impl FnOnce(&mut Server),
 ) -> TestResult<RunningWebTransportServer> {
     let mut server = Server::new();
-    server.set_options(fast_server_options());
+    server.set_options(fast_server_options().with_http3_enabled(true));
     configure(&mut server);
     let (endpoint, cert_der) = make_server_endpoint_with_alpns(
-        &[web_transport_quinn::ALPN.as_bytes()],
+        &[trevrpc::HTTP3_ALPN],
         trevrpc::quinn::TransportMode::WebTransport,
         server.options(),
     )?;
     let addr = endpoint.local_addr()?;
     greeter::register_greeter(&mut server, TestGreeter);
-    let endpoint = web_transport_quinn::Server::new(endpoint);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         server
-            .serve_webtransport_with_shutdown(endpoint, async {
+            .serve_http3_with_shutdown(endpoint, async {
                 let _ = shutdown_rx.await;
             })
             .await

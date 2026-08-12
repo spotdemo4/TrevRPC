@@ -55,7 +55,7 @@ pub fn encode_message_stream_frame(body: &[u8], max_frame_size: usize) -> Result
     Ok(frame)
 }
 
-#[cfg(any(feature = "quinn", feature = "webtransport"))]
+#[cfg(feature = "quinn")]
 pub(crate) fn encode_message_stream_frame_prefix(
     body_len: usize,
     max_frame_size: usize,

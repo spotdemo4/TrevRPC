@@ -30,6 +30,10 @@ rustPlatform.buildRustPackage (final: {
   ];
   checkPhase = ''
     cargo fmt --check
+    cargo check --lib --no-default-features --features http3 --offline
+    cargo check --lib --no-default-features --features webtransport-client --offline
+    cargo check --lib --no-default-features --features webtransport-server --offline
+    cargo check --lib --no-default-features --features webtransport --offline
     cargo test --workspace --offline
     cargo clippy --workspace --all-targets --offline -- -D warnings
   '';

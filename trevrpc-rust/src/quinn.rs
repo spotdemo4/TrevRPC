@@ -226,10 +226,16 @@ pub fn transport_limits_from_server_options(
     TransportLimits {
         stream_receive_window,
         connection_receive_window: connection_receive_window(options, stream_receive_window),
-        max_concurrent_bidi_streams: options
-            .max_concurrent_streams_per_connection()
-            // Keep one extra stream available so over-limit RPCs can receive a TrevRPC status.
-            .map(|max_streams| saturating_usize_to_u64(max_streams).saturating_add(1)),
+        max_concurrent_bidi_streams: options.max_concurrent_streams_per_connection().map(
+            |max_streams| {
+                // Keep one stream available for an over-limit RPC status. WebTransport also owns
+                // one long-lived CONNECT stream, so reserve a second transport-level slot there.
+                saturating_usize_to_u64(max_streams).saturating_add(match mode {
+                    TransportMode::Native => 1,
+                    TransportMode::WebTransport => 2,
+                })
+            },
+        ),
         max_concurrent_uni_streams: mode.max_concurrent_uni_streams(),
     }
 }
@@ -693,15 +699,18 @@ impl crate::server::Server {
         Ok(())
     }
 
-    /// Serves `TrevRPC` over `Quinn` and `WebTransport` on the same endpoint.
-    #[cfg(feature = "webtransport")]
+    /// Serves native `TrevRPC`, HTTP/3, and WebTransport on the same endpoint.
+    ///
+    /// The endpoint must advertise both [`crate::ALPN`] and [`crate::HTTP3_ALPN`]. Ordinary HTTP/3
+    /// POST RPCs are accepted when enabled in [`crate::server::ServerOptions`].
+    #[cfg(feature = "webtransport-server")]
     pub async fn serve_quinn_and_webtransport(self, endpoint: quinn::Endpoint) -> Result<()> {
         self.serve_quinn_and_webtransport_with_shutdown(endpoint, pending::<()>())
             .await
     }
 
-    /// Serves `TrevRPC` over `Quinn` and `WebTransport` until the shutdown future completes.
-    #[cfg(feature = "webtransport")]
+    /// Serves native `TrevRPC`, HTTP/3, and WebTransport until shutdown completes.
+    #[cfg(feature = "webtransport-server")]
     pub async fn serve_quinn_and_webtransport_with_shutdown<S>(
         self,
         endpoint: quinn::Endpoint,
@@ -1259,9 +1268,13 @@ mod tests {
             }
         );
         assert_eq!(
-            transport_limits_from_server_options(&options, TransportMode::WebTransport)
-                .max_concurrent_uni_streams,
-            None
+            transport_limits_from_server_options(&options, TransportMode::WebTransport),
+            TransportLimits {
+                stream_receive_window: 1028,
+                connection_receive_window: 4096,
+                max_concurrent_bidi_streams: Some(12),
+                max_concurrent_uni_streams: None,
+            }
         );
     }
 

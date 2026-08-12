@@ -2,7 +2,7 @@
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 use std::sync::Arc;
 
 #[cfg(feature = "quinn")]
@@ -55,14 +55,14 @@ impl RawQuinnTransport {
 /// A raw `TrevRPC` transport over one established WebTransport session.
 ///
 /// This transport does not reconnect. Most applications should use [`Channel`] instead.
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 #[derive(Clone)]
 pub struct RawWebTransport {
     session: Arc<web_transport_quinn::Session>,
     max_frame_size: usize,
 }
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 impl RawWebTransport {
     /// Creates a raw transport over an established WebTransport session.
     #[must_use]
@@ -142,7 +142,7 @@ impl ChannelConfigOperations for ChannelConfig {
 ///
 /// This advanced entry point permits custom paths, headers, origins, and subprotocols. Routine
 /// channels should use [`Channel::connect_webtransport`], which always uses `/trevrpc`.
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 pub async fn connect_webtransport_channel_with_request(
     client: web_transport_quinn::Client,
     request: web_transport_quinn::proto::ConnectRequest,

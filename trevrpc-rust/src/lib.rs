@@ -7,10 +7,10 @@ extern crate self as trevrpc;
 #[cfg(feature = "client")]
 mod client_upload;
 pub mod error;
-#[cfg(any(feature = "quinn", feature = "webtransport"))]
+#[cfg(feature = "quinn")]
 pub(crate) mod framed;
 pub mod framing;
-#[cfg(any(feature = "quinn", feature = "webtransport"))]
+#[cfg(feature = "quinn")]
 mod request_pump;
 pub mod response;
 #[cfg(feature = "client")]
@@ -26,7 +26,7 @@ pub const HTTP3_ALPN: &[u8] = b"h3";
 #[cfg(feature = "client")]
 pub mod client;
 
-#[cfg(any(feature = "quinn", feature = "webtransport"))]
+#[cfg(feature = "quinn")]
 pub mod advanced;
 
 #[cfg(feature = "quinn")]
@@ -38,7 +38,7 @@ pub mod http3;
 #[cfg(feature = "server")]
 pub mod server;
 
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 pub mod webtransport;
 
 pub use async_trait::async_trait;

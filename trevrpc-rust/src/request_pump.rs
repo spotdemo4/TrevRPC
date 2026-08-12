@@ -584,7 +584,7 @@ fn transport_failure_kind(error: &Error) -> Option<TransportFailureKind> {
         });
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     if let Some(error) = error.downcast_ref::<web_transport_quinn::ReadError>() {
         return Some(match error {
             web_transport_quinn::ReadError::Reset(_)
@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(io.stops.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     #[test]
     fn webtransport_session_close_is_connection_loss_not_peer_reset() {
         let session_error = web_transport_quinn::SessionError::WebTransportError(

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
 use crate::advanced::RawQuinnTransport;
-#[cfg(feature = "webtransport")]
+#[cfg(feature = "webtransport-client")]
 use crate::advanced::RawWebTransport;
 use crate::client::{RpcTransport, StreamingRpcTransport};
 use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
@@ -218,7 +218,7 @@ enum Backend {
         remote_addr: SocketAddr,
         server_name: String,
     },
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     WebTransport {
         client: Arc<web_transport_quinn::Client>,
         request: Arc<web_transport_quinn::proto::ConnectRequest>,
@@ -239,13 +239,13 @@ struct Slot {
 #[derive(Clone)]
 enum Transport {
     Quinn(RawQuinnTransport),
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     WebTransport(RawWebTransport),
 }
 
 enum Connection {
     Quinn(quinn::Connection),
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     WebTransport(RawWebTransport),
 }
 
@@ -284,7 +284,7 @@ impl Channel {
     ///
     /// `origin` must be an HTTPS origin such as `https://example.com:443`; any supplied path,
     /// query, or fragment is discarded. Use the advanced constructor for custom CONNECT requests.
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     pub async fn connect_webtransport(
         client: web_transport_quinn::Client,
         origin: &str,
@@ -293,7 +293,7 @@ impl Channel {
     }
 
     /// Establishes a WebTransport channel with explicit channel configuration.
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     pub async fn connect_webtransport_with_config(
         client: web_transport_quinn::Client,
         origin: &str,
@@ -313,7 +313,7 @@ impl Channel {
         Self::connect_webtransport_request(client, request, config).await
     }
 
-    #[cfg(feature = "webtransport")]
+    #[cfg(feature = "webtransport-client")]
     pub(crate) async fn connect_webtransport_request(
         client: web_transport_quinn::Client,
         request: web_transport_quinn::proto::ConnectRequest,
@@ -462,7 +462,7 @@ impl RpcTransport for Transport {
     async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
         match self {
             Self::Quinn(transport) => transport.call(request).await,
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport(transport) => transport.call(request).await,
         }
     }
@@ -477,7 +477,7 @@ impl StreamingRpcTransport for Transport {
     ) -> Result<BoxStream<RpcStreamFrame>> {
         match self {
             Self::Quinn(transport) => transport.streaming_call(request, request_body).await,
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport(transport) => transport.streaming_call(request, request_body).await,
         }
     }
@@ -652,7 +652,7 @@ impl Backend {
                     RawQuinnTransport::new(connection.clone()).with_max_frame_size(max_frame_size);
                 Ok((Transport::Quinn(transport), Connection::Quinn(connection)))
             }
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport { client, request } => {
                 let session = client
                     .connect(request.as_ref().clone())
@@ -670,7 +670,7 @@ impl Backend {
     fn quinn_remote_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Quinn { remote_addr, .. } => Some(*remote_addr),
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport { .. } => None,
         }
     }
@@ -678,7 +678,7 @@ impl Backend {
     fn quinn_local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
         match self {
             Self::Quinn { endpoint, .. } => endpoint.local_addr().map(Some),
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport { .. } => Ok(None),
         }
     }
@@ -686,7 +686,7 @@ impl Backend {
     fn rebind_quinn(&self, socket: UdpSocket) -> std::io::Result<()> {
         match self {
             Self::Quinn { endpoint, .. } => endpoint.rebind(socket),
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport { .. } => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "channel does not use a Quinn endpoint",
@@ -699,7 +699,7 @@ impl Transport {
     fn connection(&self) -> Connection {
         match self {
             Self::Quinn(transport) => Connection::Quinn(transport.connection().clone()),
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport(transport) => Connection::WebTransport(transport.clone()),
         }
     }
@@ -711,7 +711,7 @@ impl Connection {
             Self::Quinn(connection) => {
                 connection.closed().await;
             }
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport(transport) => {
                 transport.session().closed().await;
             }
@@ -721,7 +721,7 @@ impl Connection {
     fn close(&self) {
         match self {
             Self::Quinn(connection) => connection.close(0_u32.into(), CLOSE_REASON),
-            #[cfg(feature = "webtransport")]
+            #[cfg(feature = "webtransport-client")]
             Self::WebTransport(transport) => transport.session().close(0, CLOSE_REASON),
         }
     }

@@ -31,7 +31,8 @@ trevrpc = { path = "../..", default-features = false, features = [
   "client",
   "server",
   "quinn",
-  "webtransport",
+  "webtransport-client",
+  "webtransport-server",
 ] }
 
 [build-dependencies]
