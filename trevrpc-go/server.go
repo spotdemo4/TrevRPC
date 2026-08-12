@@ -104,23 +104,29 @@ type WebTransportAdmission func(WebTransportAdmissionRequest) bool
 type ServerDiagnosticPhase string
 
 const (
-	ServerDiagnosticHandlerPanic           ServerDiagnosticPhase = "handler_panic"
-	ServerDiagnosticAuthorizerPanic        ServerDiagnosticPhase = "authorizer_panic"
-	ServerDiagnosticRequestStreamPanic     ServerDiagnosticPhase = "request_stream_panic"
-	ServerDiagnosticResponseStreamPanic    ServerDiagnosticPhase = "response_stream_panic"
-	ServerDiagnosticMetricsPanic           ServerDiagnosticPhase = "metrics_panic"
-	ServerDiagnosticAdmissionPanic         ServerDiagnosticPhase = "admission_panic"
-	ServerDiagnosticWebTransportUpgrade    ServerDiagnosticPhase = "webtransport_upgrade"
-	ServerDiagnosticInvalidResponse        ServerDiagnosticPhase = "invalid_response"
-	ServerDiagnosticInternalError          ServerDiagnosticPhase = "internal_error"
-	ServerDiagnosticExecutionDetached      ServerDiagnosticPhase = "execution_detached"
-	ServerDiagnosticExecutionFinallyExited ServerDiagnosticPhase = "execution_finally_exited"
-	ServerDiagnosticShutdownIncomplete     ServerDiagnosticPhase = "shutdown_incomplete"
+	ServerDiagnosticHandlerPanic               ServerDiagnosticPhase = "handler_panic"
+	ServerDiagnosticAuthorizerPanic            ServerDiagnosticPhase = "authorizer_panic"
+	ServerDiagnosticRequestStreamPanic         ServerDiagnosticPhase = "request_stream_panic"
+	ServerDiagnosticResponseStreamPanic        ServerDiagnosticPhase = "response_stream_panic"
+	ServerDiagnosticMetricsPanic               ServerDiagnosticPhase = "metrics_panic"
+	ServerDiagnosticAdmissionPanic             ServerDiagnosticPhase = "admission_panic"
+	ServerDiagnosticWebTransportConnect        ServerDiagnosticPhase = "webtransport_connect"
+	ServerDiagnosticWebTransportAdmission      ServerDiagnosticPhase = "webtransport_admission"
+	ServerDiagnosticWebTransportUpgrade        ServerDiagnosticPhase = "webtransport_upgrade"
+	ServerDiagnosticWebTransportUpgradeSuccess ServerDiagnosticPhase = "webtransport_upgrade_success"
+	ServerDiagnosticWebTransportSessionClosed  ServerDiagnosticPhase = "webtransport_session_closed"
+	ServerDiagnosticHTTP3ConnectionClosed      ServerDiagnosticPhase = "http3_connection_closed"
+	ServerDiagnosticInvalidResponse            ServerDiagnosticPhase = "invalid_response"
+	ServerDiagnosticInternalError              ServerDiagnosticPhase = "internal_error"
+	ServerDiagnosticExecutionDetached          ServerDiagnosticPhase = "execution_detached"
+	ServerDiagnosticExecutionFinallyExited     ServerDiagnosticPhase = "execution_finally_exited"
+	ServerDiagnosticShutdownIncomplete         ServerDiagnosticPhase = "shutdown_incomplete"
 )
 
 // ServerDiagnostic describes a local server failure. Request bodies and metadata are never included.
 type ServerDiagnostic struct {
 	Phase                  ServerDiagnosticPhase
+	Message                string
 	Service                string
 	Method                 string
 	Kind                   RpcKind

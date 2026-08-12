@@ -222,8 +222,8 @@ func newNativeBenchmarkServer() *trevrpc.Server {
 	options.MaxStreamBodySize = -1
 	server.SetOptions(options)
 	server.SetDiagnostics(func(event trevrpc.ServerDiagnostic) {
-		if event.Err != nil {
-			log.Printf("server diagnostic: phase=%s: %v", event.Phase, event.Err)
+		if event.Message != "" || event.Err != nil {
+			log.Printf("server diagnostic: phase=%s message=%q error=%v", event.Phase, event.Message, event.Err)
 		}
 	})
 	benchmarkpb.RegisterNativeBenchmarkServiceServer(server, nativeBenchmarkService{})

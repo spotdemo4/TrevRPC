@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"runtime/debug"
@@ -379,6 +380,26 @@ func (r *serverRuntime) webTransportAdmitted(request *http.Request) (admitted bo
 	return callback(WebTransportAdmissionRequest{Request: snapshot, Path: snapshot.URL.Path, Authority: snapshot.Host, Origin: snapshot.Header.Get("Origin"), Secure: snapshot.TLS != nil}), nil
 }
 
+func describeWebTransportSessionError(err error) string {
+	var sessionErr *webtransport.SessionError
+	if errors.As(err, &sessionErr) {
+		return fmt.Sprintf("type=session remote=%t code=%d message=%q", sessionErr.Remote, sessionErr.ErrorCode, sessionErr.Message)
+	}
+	var h3Err *http3.Error
+	if errors.As(err, &h3Err) {
+		return fmt.Sprintf("type=http3 remote=%t code=%#x message=%q", h3Err.Remote, uint64(h3Err.ErrorCode), h3Err.ErrorMessage)
+	}
+	var streamErr *quic.StreamError
+	if errors.As(err, &streamErr) {
+		return fmt.Sprintf("type=quic_stream remote=%t stream=%d code=%d", streamErr.Remote, streamErr.StreamID, streamErr.ErrorCode)
+	}
+	var appErr *quic.ApplicationError
+	if errors.As(err, &appErr) {
+		return fmt.Sprintf("type=quic_application remote=%t code=%d message=%q", appErr.Remote, appErr.ErrorCode, appErr.ErrorMessage)
+	}
+	return fmt.Sprintf("type=%T error=%q", err, err.Error())
+}
+
 func handleWebTransportSession(ctx context.Context, session *webtransport.Session, server *Server, requestLimit semaphore) {
 	runtime := server.freeze()
 	streamLimit := newSemaphore(runtime.options.MaxConcurrentStreamsPerConnection)
@@ -395,6 +416,11 @@ func handleWebTransportSession(ctx context.Context, session *webtransport.Sessio
 	for {
 		stream, err := session.AcceptStream(ctx)
 		if err != nil {
+			runtime.emitDiagnostic(ServerDiagnostic{
+				Phase:   ServerDiagnosticWebTransportSessionClosed,
+				Message: describeWebTransportSessionError(err),
+				Err:     err,
+			})
 			break
 		}
 

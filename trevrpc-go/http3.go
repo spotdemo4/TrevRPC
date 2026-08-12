@@ -51,19 +51,27 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 	var wtServer *webtransport.Server
 	h3Server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if runtime.options.EnableWebTransport && r.Method == http.MethodConnect {
+			runtime.emitDiagnostic(ServerDiagnostic{
+				Phase: ServerDiagnosticWebTransportConnect,
+				Message: "path=" + r.URL.Path + " authority=" + r.Host + " origin=" + r.Header.Get("Origin") +
+					" remote=" + r.RemoteAddr,
+			})
 			admitted, err := runtime.webTransportAdmitted(r)
 			if err != nil {
 				status := http.StatusInternalServerError
 				if errors.Is(err, errAdmissionSaturated) {
 					status = http.StatusServiceUnavailable
 				}
+				runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportAdmission, Message: "error", Err: err})
 				http.Error(w, "internal server error", status)
 				return
 			}
 			if !admitted {
+				runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportAdmission, Message: "denied"})
 				http.Error(w, "WebTransport admission denied", http.StatusForbidden)
 				return
 			}
+			runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportAdmission, Message: "accepted"})
 
 			session, err := wtServer.Upgrade(w, r)
 			if err != nil {
@@ -71,6 +79,7 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 				http.Error(w, "WebTransport upgrade failed", http.StatusBadRequest)
 				return
 			}
+			runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportUpgradeSuccess, Message: "accepted"})
 
 			sessionTasks.Go(func() {
 				handleWebTransportSession(sessionsCtx, session, server, requestLimit)
@@ -115,10 +124,19 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 		shutdownByServer <- true
 	}()
 
+	var serveErr error
 	if wtServer != nil {
-		_ = wtServer.ServeQUICConn(conn)
+		serveErr = wtServer.ServeQUICConn(conn)
 	} else {
-		_ = h3Server.ServeQUICConn(conn)
+		serveErr = h3Server.ServeQUICConn(conn)
+	}
+	connErr := context.Cause(conn.Context())
+	if serveErr != nil || connErr != nil {
+		runtime.emitDiagnostic(ServerDiagnostic{
+			Phase:   ServerDiagnosticHTTP3ConnectionClosed,
+			Message: "serve_error=" + errorString(serveErr) + " connection_error=" + errorString(connErr),
+			Err:     firstError(serveErr, connErr),
+		})
 	}
 	close(serveDone)
 	if shutdownPerformed := <-shutdownByServer; !shutdownPerformed {
@@ -139,6 +157,22 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 	if closeOnShutdown && ctx.Err() != nil && conn.Context().Err() == nil {
 		conn.CloseWithError(0, "server drained HTTP/3 connection")
 	}
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	return err.Error()
+}
+
+func firstError(errors ...error) error {
+	for _, err := range errors {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func handleHTTP3RPC(w http.ResponseWriter, r *http.Request, server *Server, requestLimit, streamLimit semaphore) {
