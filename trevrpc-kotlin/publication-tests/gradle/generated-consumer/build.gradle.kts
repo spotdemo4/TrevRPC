@@ -82,7 +82,7 @@ protobuf {
             }
             path = protocFile.absolutePath
         } else {
-            artifact = "com.google.protobuf:protoc:4.35.1"
+            artifact = "com.google.protobuf:protoc:4.36.0"
         }
     }
     plugins {
