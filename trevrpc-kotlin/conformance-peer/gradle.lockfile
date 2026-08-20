@@ -1,6 +1,7 @@
 # This is a Gradle generated file for dependency locking.
 # Manual edits can break the build and are not advised.
 # This file is expected to be part of source control.
+# To regenerate this file, run: ./gradlew :conformance-peer:dependencies --write-locks
 com.google.protobuf:protobuf-java:4.35.1=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
 com.google.protobuf:protoc:4.35.1=protobufToolsLocator_protoc
 org.apiguardian:apiguardian-api:1.1.2=testCompileClasspath
