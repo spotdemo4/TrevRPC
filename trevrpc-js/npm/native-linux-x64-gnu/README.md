@@ -1,6 +1,6 @@
 # @trevrpc/trevrpc-js-native-linux-x64-gnu
 
-Target-specific native addon used by `@trevrpc/trevrpc-js@0.2.0`.
+Target-specific native addon distributed with the matching version of `@trevrpc/trevrpc-js`.
 
 Supported runtime contract:
 

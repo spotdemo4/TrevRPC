@@ -17,6 +17,9 @@ on:
 # yaml-language-server-disable is not allowed
 enable-openid-connect: true
 
+concurrency:
+  group: bump
+
 jobs:
   bump:
     # zizmor: ignore[excessive-permissions]
@@ -31,8 +34,8 @@ jobs:
           fetch_depth: 0
           shell: bump
 
-      - name: Bump
-        run: bumper
+      - name: Bump, validate, and push
         env:
           GITHUB_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           FORCE: ${{ inputs.force }}
+        run: .forgejo/scripts/bump.sh

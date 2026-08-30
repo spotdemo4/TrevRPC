@@ -15,7 +15,6 @@ permissions:
 
 jobs:
   check:
-    if: ${{ !startsWith(github.event.head_commit.message || github.event.pull_request.title || '', 'bump:') }}
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
@@ -27,7 +26,6 @@ jobs:
         run: nix flake check --option log-lines 100
 
   webkit-macos:
-    if: ${{ !startsWith(github.event.head_commit.message || github.event.pull_request.title || '', 'bump:') }}
     runs-on: macos-26
     permissions:
       contents: read

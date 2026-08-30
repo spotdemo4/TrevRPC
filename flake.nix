@@ -63,6 +63,8 @@
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
             };
+            jsPackage = builtins.fromJSON (builtins.readFile ./trevrpc-js/package.json);
+            jsPackageManifestWriter = ./trevrpc-js/publication-tests/write-package-manifest.mjs;
             jsNative =
               if system == "x86_64-linux" then
                 pkgs.callPackage ./trevrpc-js/npm/native-linux-x64-gnu {
@@ -74,6 +76,8 @@
                   jsNativeSrc = ./trevrpc-js/native;
                   jsNativePackageSrc = ./trevrpc-js/npm/native-linux-x64-gnu;
                   jsLicense = ./trevrpc-js/LICENSE;
+                  inherit jsPackage;
+                  packageManifestWriter = jsPackageManifestWriter;
                   publicationVerifier = ./trevrpc-js/publication-tests/verify.mjs;
                 }
               else
@@ -82,6 +86,8 @@
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = c;
+              inherit jsPackage;
+              packageManifestWriter = jsPackageManifestWriter;
               nativePackage = jsNative;
             };
             kotlin = pkgs.callPackage ./trevrpc-kotlin {

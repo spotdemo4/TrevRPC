@@ -5,6 +5,7 @@
   libmsquic,
   nodejs_24,
   openssl,
+  packageManifestWriter,
   patchelf,
   perl,
   pkg-config,
@@ -14,11 +15,12 @@
   jsNativeSrc,
   jsNativePackageSrc,
   jsLicense,
+  jsPackage,
   stdenv,
 }:
 stdenv.mkDerivation (final: {
   pname = "trevrpc-js-native-linux-x64-gnu";
-  version = "0.2.0";
+  inherit (jsPackage) version;
   outputs = [
     "out"
     "npm"
@@ -72,7 +74,10 @@ stdenv.mkDerivation (final: {
     mkdir -p "$HOME" "$out/package" "$npm"
     cp build/trevrpc_native.node "$out/package/trevrpc_native.node"
     cp "${libmsquic}/lib/libmsquic.so.2" "$out/package/libmsquic.so.2"
-    cp "$src/trevrpc-js/npm/native-linux-x64-gnu/package.json" "$out/package/package.json"
+    cp "$src/trevrpc-js/npm/native-linux-x64-gnu/package.template.json" \
+      "$out/package/package.json"
+    chmod u+w "$out/package/package.json"
+    node ${packageManifestWriter} native "$out/package/package.json" "${final.version}"
     cp "$src/trevrpc-js/npm/native-linux-x64-gnu/README.md" "$out/package/README.md"
     cp "$src/trevrpc-js/LICENSE" "$out/package/LICENSE"
     cp "$src/trevrpc-js/npm/native-linux-x64-gnu/THIRD_PARTY_NOTICES.md" \

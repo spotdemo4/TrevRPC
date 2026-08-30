@@ -65,6 +65,7 @@
     "format": "oxfmt --write",
     "format:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",
+    "prepack": "node -e 'if (process.env.TREVRPC_NIX_PUBLICATION !== \"1\") throw new Error(\"Build release tarballs with nix build .#trevrpc-js^npm\")'",
     "test": "node --test --test-concurrency=1 test/*.test.js",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.browser.json && tsc -p tsconfig.node.json",
     "verify:native:production": "node -e 'const { readFileSync } = require(\"node:fs\"); const path = \"./build/native/trevrpc_native.node\"; const expectedExports = [\"connectMsQuic\", \"createCancellation\", \"listenMsQuic\"]; const actualExports = Object.getOwnPropertyNames(require(path)).sort(); const exportsMatch = JSON.stringify(actualExports) === JSON.stringify(expectedExports); const embedsDebugNames = readFileSync(path).includes(Buffer.from(\"_debug\")); if (!exportsMatch || embedsDebugNames) throw new Error(`production addon exports ${JSON.stringify(actualExports)}; expected exactly ${JSON.stringify(expectedExports)}${embedsDebugNames ? \"; binary contains _debug\" : \"\"}`);'"
@@ -77,9 +78,6 @@
     "esbuild": "^0.28.2",
     "playwright": "^1.62.1",
     "typescript": "^7.0.2"
-  },
-  "optionalDependencies": {
-    "@trevrpc/trevrpc-js-native-linux-x64-gnu": "0.2.0"
   },
   "engines": {
     "node": ">=24 <25"

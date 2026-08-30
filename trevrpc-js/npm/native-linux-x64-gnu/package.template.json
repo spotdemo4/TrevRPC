@@ -1,6 +1,5 @@
 {
   "name": "@trevrpc/trevrpc-js-native-linux-x64-gnu",
-  "version": "0.2.0",
   "description": "TrevRPC native Node addon for Linux x86-64 glibc",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {
@@ -19,15 +18,9 @@
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"
   ],
-  "os": [
-    "linux"
-  ],
-  "cpu": [
-    "x64"
-  ],
-  "libc": [
-    "glibc"
-  ],
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
   "main": "trevrpc_native.node",
   "publishConfig": {
     "access": "public"

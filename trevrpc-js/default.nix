@@ -3,6 +3,7 @@
   stdenv,
   buildNpmPackage,
   importNpmLock,
+  jsPackage,
   nodejs_24,
   cmake,
   clang-tools,
@@ -12,6 +13,7 @@
   protobuf,
   gnugrep,
   makeWrapper,
+  packageManifestWriter,
   playwright-driver,
   benchProto,
   wireGolden,
@@ -24,7 +26,7 @@ let
 in
 buildNpmPackage (final: {
   pname = "trevrpc-js";
-  version = "0.2.1";
+  inherit (jsPackage) version;
   outputs = [ "out" ] ++ lib.optional publication "npm";
 
   src = lib.fileset.toSource {
@@ -46,6 +48,7 @@ buildNpmPackage (final: {
   npmBuildScript = "build:native";
   dontUseCmakeConfigure = true;
   NODE_INCLUDE_DIR = "${nodejs_24}/include/node";
+  TREVRPC_NIX_PUBLICATION = "1";
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
   PLAYWRIGHT_BROWSERS_PATH = lib.optionalString publication "${playwright-driver.browsers}";
 
@@ -98,6 +101,10 @@ buildNpmPackage (final: {
     ${lib.optionalString publication ''
       mkdir -p "$(dirname "$native_dir")"
       cp -R "${nativePackage}/package" "$native_dir"
+      installed_manifest="$out/lib/node_modules/@trevrpc/trevrpc-js/package.json"
+      chmod u+w "$installed_manifest"
+      node ${packageManifestWriter} core "$installed_manifest" "${final.version}" \
+        npm/native-linux-x64-gnu/package.template.json
     ''}
     ${lib.optionalString stdenv.hostPlatform.isDarwin ''
       install -Dm755 build/native/trevrpc_native.node \
@@ -121,7 +128,10 @@ buildNpmPackage (final: {
       export HOME="$TMPDIR/home"
       mkdir -p "$HOME" "$npm"
 
-      core_name="$(npm pack . --pack-destination "$npm")"
+      node ${packageManifestWriter} core package.json "${final.version}" \
+        npm/native-linux-x64-gnu/package.template.json
+
+      core_name="$(npm pack . --silent --pack-destination "$npm")"
       test "$core_name" = "trevrpc-trevrpc-js-${final.version}.tgz"
       core_tgz="$npm/$core_name"
       test -f "$core_tgz"

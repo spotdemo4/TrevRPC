@@ -16,7 +16,6 @@ enable-openid-connect: true
 jobs:
   check:
     # zizmor: ignore[excessive-permissions]
-    if: ${{ !startsWith(github.event.head_commit.message || github.event.pull_request.title || '', 'bump:') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Initialize

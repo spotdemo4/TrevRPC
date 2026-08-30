@@ -10,6 +10,7 @@
   trevrpcJs,
 }:
 let
+  package = lib.importJSON ./package.json;
   packageLock = lib.importJSON ./package-lock.json;
   playwrightCoreVersion = packageLock.packages."node_modules/playwright-core".version;
   isX86Linux = stdenv.hostPlatform.system == "x86_64-linux";
@@ -41,7 +42,7 @@ assert lib.assertMsg (playwrightCoreVersion == playwright-driver.version) ''
 '';
 buildNpmPackage (final: {
   pname = "trevrpc-bench-peer-browser";
-  version = "0.2.1";
+  inherit (package) version;
 
   src = lib.fileset.toSource {
     root = ../../.;
