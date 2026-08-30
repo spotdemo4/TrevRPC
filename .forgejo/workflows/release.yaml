@@ -25,8 +25,14 @@ jobs:
   forgejo:
     # zizmor: ignore[excessive-permissions]
     needs: check
-    name: forgejo
+    name: forgejo (${{ matrix.package }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - trevrpc-go
+          - trevrpc-rust
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
@@ -37,16 +43,12 @@ jobs:
           token: ${{ secrets.DOCTOR_TOKEN }}
           fetch_depth: 0
 
-      - name: Release to Forgejo
+      - name: Release ${{ matrix.package }} to Forgejo
         env:
           GITHUB_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           REGISTRY: trev.zip
           REGISTRY_PASSWORD: ${{ secrets.PACKAGE_TOKEN }}
-          DELETE_OLD_RELEASE_ARTIFACTS: true
-          PACKAGES: |
-            packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl
-            packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl
-        run: flake-release
+        run: scripts/release-nix-package.sh "${{ matrix.package }}"
 
   crates:
     # zizmor: ignore[excessive-permissions]
@@ -131,19 +133,24 @@ jobs:
           niks3_url: https://niks3.trev.zip
           shell: release
 
-      - name: Stage Kotlin Maven repository
+      - name: Build and verify signed Kotlin Maven bundle
         working-directory: trevrpc-kotlin
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}
-        run: ./gradlew stageMavenRepository --no-configuration-cache
-
-      - name: Verify Kotlin staging repository
-        working-directory: trevrpc-kotlin
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          python3 publication-tests/verify_staged_repository.py build/staging-repository "$tag"
+          : "${GPG_PRIVATE_KEY:?GPG_PRIVATE_KEY must be configured for Maven Central releases}"
+          if [[ ! "${GITHUB_REF_NAME-}" =~ ^v[^/]+$ ]] || [[ "${GITHUB_REF-}" != "refs/tags/${GITHUB_REF_NAME-}" ]]; then
+            echo "Maven release requires a root v* tag ref" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          ./gradlew \
+            -PtrevrpcVersion="$version" \
+            verifyStagedMavenRepository \
+            createCentralBundle \
+            --no-configuration-cache
 
       - name: Publish Kotlin to Maven Central
         working-directory: trevrpc-kotlin
@@ -154,8 +161,6 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
           bundle="build/central-bundle.zip"
-          rm -f "$bundle"
-          (cd build/staging-repository && zip -r "../central-bundle.zip" .)
           echo "bundle: $bundle"
           ls -lh "$bundle"
           unzip -l "$bundle" > "$bundle.list"

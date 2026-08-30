@@ -502,6 +502,177 @@
                   touch $out
                 '';
 
+            release-contract =
+              pkgs.runCommand "trevrpc-release-contract"
+                {
+                  nativeBuildInputs = with pkgs; [
+                    bash
+                    coreutils
+                    git
+                    gnugrep
+                  ];
+                }
+                ''
+                  set -euo pipefail
+                  export HOME="$TMPDIR/home"
+                  mkdir -p "$HOME"
+                  git config --global user.email release-contract@example.invalid
+                  git config --global user.name "Release Contract"
+
+                  helper=${./scripts/release-nix-package.sh}
+                  fake_bin="$TMPDIR/fake-bin"
+                  mkdir -p "$fake_bin"
+
+                  cat > "$fake_bin/nix" <<'SH'
+                  #!${pkgs.runtimeShell}
+                  set -euo pipefail
+                  if [ "$#" -ne 3 ] || [ "$1" != "eval" ] || [ "$2" != "--raw" ]; then
+                    echo "unexpected nix invocation: $*" >&2
+                    exit 1
+                  fi
+                  case "$3" in
+                    .#packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl.version)
+                      printf '%s' "$FAKE_GO_VERSION"
+                      ;;
+                    .#packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl.version)
+                      printf '%s' "$FAKE_RUST_VERSION"
+                      ;;
+                    *)
+                      echo "unexpected Nix output: $3" >&2
+                      exit 1
+                      ;;
+                  esac
+                  SH
+                  chmod +x "$fake_bin/nix"
+
+                  cat > "$fake_bin/flake-release" <<'SH'
+                  #!${pkgs.runtimeShell}
+                  set -euo pipefail
+                  test -n "$RELEASE_LOG"
+                  printf '%s|%s\n' "$TAG" "$PACKAGES" >> "$RELEASE_LOG"
+                  SH
+                  chmod +x "$fake_bin/flake-release"
+
+                  export PATH="$fake_bin:$PATH"
+                  export FAKE_GO_VERSION=0.2.1
+                  export FAKE_RUST_VERSION=0.1.10
+                  export RELEASE_LOG="$TMPDIR/release.log"
+
+                  new_fixture() {
+                    fixture=$(mktemp -d "$TMPDIR/fixture.XXXXXX")
+                    git init --bare --quiet "$fixture/origin.git"
+                    git init --quiet "$fixture/work"
+                    printf 'initial\n' > "$fixture/work/state"
+                    git -C "$fixture/work" add state
+                    git -C "$fixture/work" commit --quiet -m initial
+                    git -C "$fixture/work" remote add origin "$fixture/origin.git"
+                    printf '%s\n' "$fixture/work"
+                  }
+
+                  add_commit() {
+                    fixture=$1
+                    message=$2
+                    printf '%s\n' "$message" >> "$fixture/state"
+                    git -C "$fixture" add state
+                    git -C "$fixture" commit --quiet -m "$message"
+                  }
+
+                  push_fixture() {
+                    git -C "$1" push --quiet --force --tags origin HEAD:refs/heads/main
+                  }
+
+                  set_event() {
+                    export GITHUB_REF_NAME=$1
+                    export GITHUB_REF="refs/tags/$1"
+                  }
+
+                  run_release() {
+                    fixture=$1
+                    package=$2
+                    (cd "$fixture" && bash "$helper" "$package")
+                  }
+
+                  expect_failure() {
+                    if "$@"; then
+                      echo "command unexpectedly succeeded: $*" >&2
+                      exit 1
+                    fi
+                  }
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag v1.0.0
+                  git -C "$fixture" tag trevrpc-go/v0.2.1
+                  git -C "$fixture" tag trevrpc-go/tools/v9.9.9
+                  push_fixture "$fixture"
+                  set_event v1.0.0
+                  : > "$RELEASE_LOG"
+                  TAG=untrusted PACKAGES=untrusted run_release "$fixture" trevrpc-go
+                  test "$(wc -l < "$RELEASE_LOG")" -eq 1
+                  grep -Fx 'trevrpc-go/v0.2.1|packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl' "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag v1.0.0
+                  git -C "$fixture" tag trevrpc-rust/v0.1.10
+                  git -C "$fixture" tag trevrpc-go/v9.9.9
+                  push_fixture "$fixture"
+                  set_event v1.0.0
+                  : > "$RELEASE_LOG"
+                  run_release "$fixture" trevrpc-rust
+                  test "$(wc -l < "$RELEASE_LOG")" -eq 1
+                  grep -Fx 'trevrpc-rust/v0.1.10|packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl' "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag trevrpc-go/v0.2.1
+                  add_commit "$fixture" root-release
+                  git -C "$fixture" tag v1.0.1
+                  git -C "$fixture" tag trevrpc-rust/v0.1.10
+                  push_fixture "$fixture"
+                  set_event v1.0.1
+                  : > "$RELEASE_LOG"
+                  run_release "$fixture" trevrpc-go
+                  test ! -s "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag v1.0.0
+                  git -C "$fixture" tag trevrpc-go/v9.9.9
+                  push_fixture "$fixture"
+                  set_event v1.0.0
+                  : > "$RELEASE_LOG"
+                  expect_failure run_release "$fixture" trevrpc-go
+                  test ! -s "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag v1.0.0
+                  git -C "$fixture" tag trevrpc-go/v0.2.1
+                  git -C "$fixture" tag trevrpc-go/v0.2.0
+                  push_fixture "$fixture"
+                  set_event v1.0.0
+                  : > "$RELEASE_LOG"
+                  expect_failure run_release "$fixture" trevrpc-go
+                  test ! -s "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag v1.0.0
+                  push_fixture "$fixture"
+                  set_event v1.0.0
+                  : > "$RELEASE_LOG"
+                  expect_failure run_release "$fixture" trevrpc-go
+                  expect_failure run_release "$fixture" trevrpc-python
+                  test ! -s "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag v1.0.0
+                  git -C "$fixture" tag trevrpc-go/v0.2.1
+                  push_fixture "$fixture"
+                  export GITHUB_REF_NAME=trevrpc-go/v0.2.1
+                  export GITHUB_REF=refs/tags/trevrpc-go/v0.2.1
+                  : > "$RELEASE_LOG"
+                  expect_failure run_release "$fixture" trevrpc-go
+                  test ! -s "$RELEASE_LOG"
+
+                  touch $out
+                '';
+
             benchmark-smoke =
               pkgs.runCommand "trevrpc-benchmark-smoke"
                 {

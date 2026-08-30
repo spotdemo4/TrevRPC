@@ -25,7 +25,14 @@ jobs:
 
   github:
     needs: check
+    name: github (${{ matrix.package }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - trevrpc-go
+          - trevrpc-rust
     permissions:
       id-token: write
       contents: write
@@ -37,10 +44,7 @@ jobs:
           fetch_depth: 0
           shell: release
 
-      - name: Release to GitHub
+      - name: Release ${{ matrix.package }} to GitHub
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PACKAGES: |
-            packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl
-            packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl
-        run: flake-release
+        run: scripts/release-nix-package.sh "${{ matrix.package }}"

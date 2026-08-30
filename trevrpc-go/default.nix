@@ -69,6 +69,6 @@ buildGoModule (final: {
     platforms = lib.platforms.all;
     homepage = "https://trev.zip/llc/TrevRPC";
     changelog = "https://trev.zip/llc/TrevRPC/releases";
-    downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+    downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/trevrpc-go/v${final.version}";
   };
 })
