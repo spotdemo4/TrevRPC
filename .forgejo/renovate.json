@@ -15,6 +15,11 @@
     "^nix run \\.#update-benchmark-proto$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
+  // Renovate sanitizes child environments, so configure this through its
+  // explicit child-process environment instead of the workflow environment.
+  "customEnvVariables": {
+    "JAVA_TOOL_OPTIONS": "-Dorg.gradle.dependency.verification=lenient"
+  },
 
   // repository
   "extends": ["config:recommended"],

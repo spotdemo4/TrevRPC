@@ -31,5 +31,4 @@ jobs:
           RENOVATE_CONFIG_FILE: .forgejo/renovate.json
           RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
           RENOVATE_GITHUB_COM_TOKEN: ${{ secrets.GH_TOKEN }}
-          JAVA_TOOL_OPTIONS: -Dorg.gradle.dependency.verification=lenient
           LOG_LEVEL: ${{ inputs.debug && 'debug' || 'info' }}
