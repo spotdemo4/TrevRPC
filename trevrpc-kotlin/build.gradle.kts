@@ -54,7 +54,7 @@ val kotlinVersion = libs.versions.kotlin.get()
 
 allprojects {
     group = "zip.trev.trevrpc"
-    version = "0.3.0"
+    version = "0.3.1"
     providers.gradleProperty("trevrpcVersion").orNull?.let { version = it }
     providers.environmentVariable("TREVRPC_VERSION").orNull?.let { version = it }
 
