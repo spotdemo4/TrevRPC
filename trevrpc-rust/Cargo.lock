@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "protoc-gen-trevrpc-rust"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "heck",
  "prost",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1989,7 +1989,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-bench-peer"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "futures-util",
  "prost",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-conformance-rust"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "prost",
  "serde_json",
