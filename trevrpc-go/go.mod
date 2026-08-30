@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/quic-go/quic-go v0.61.0
 	github.com/quic-go/webtransport-go v0.12.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
