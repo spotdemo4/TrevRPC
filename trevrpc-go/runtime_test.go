@@ -3256,12 +3256,29 @@ func TestQuicRequestPermitReleasedAfterDeadline(t *testing.T) {
 	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
 	}
-	response, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: "after deadline"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
-	if err != nil {
-		t.Fatalf("second RPC should acquire released request permit: %v", err)
-	}
-	if response.Value != "hello, after deadline" {
-		t.Fatalf("unexpected response after permit release: %q", response.Value)
+	// The client deadline can complete before the server observes cancellation,
+	// exits the handler, and releases the request permit.
+	retryCtx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	for {
+		response, err := Unary(retryCtx, transport, testServiceName, "SayHello", &testMessage{Value: "after deadline"}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		if err == nil {
+			if response.Value != "hello, after deadline" {
+				t.Fatalf("unexpected response after permit release: %q", response.Value)
+			}
+			return
+		}
+		if retryCtx.Err() != nil {
+			t.Fatalf("request permit was not released before timeout: %v", err)
+		}
+		if code := StatusFromError(err).Code; code != CodeUnavailable {
+			t.Fatalf("second RPC failed while waiting for request permit release: %v (%v)", code, err)
+		}
+		select {
+		case <-retryCtx.Done():
+			t.Fatalf("request permit was not released before timeout: %v", err)
+		case <-time.After(time.Millisecond):
+		}
 	}
 }
 

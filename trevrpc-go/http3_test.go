@@ -1,7 +1,6 @@
 package trevrpc
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -15,7 +14,16 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/quicvarint"
+)
+
+const (
+	settingsEnableWebTransportDraft06         = 0x2b603742
+	settingsWebTransportEnabled               = 0x2c7cf000
+	settingsWebTransportMaxSessionsDraft07    = 0xc671706a
+	settingsWebTransportMaxSessions           = 0x14e9cd29
+	settingsWebTransportInitialMaxData        = 0x2b61
+	settingsWebTransportInitialMaxStreamsUni  = 0x2b64
+	settingsWebTransportInitialMaxStreamsBidi = 0x2b65
 )
 
 func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
@@ -59,10 +67,15 @@ func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
 
 func TestWebTransportServerAdvertisesSingleSessionWithoutFlowControl(t *testing.T) {
 	serverSettings := readWebTransportServerSettings(t, func(*Server) {})
-	if value := serverSettings[0x14e9cd29]; value != 1 {
+	if value := serverSettings[settingsWebTransportMaxSessions]; value != 1 {
 		t.Fatalf("server SETTINGS_WT_MAX_SESSIONS = %d, want 1", value)
 	}
-	for _, setting := range []uint64{0xc671706a, 0x2b61, 0x2b64, 0x2b65} {
+	for _, setting := range []uint64{
+		settingsWebTransportMaxSessionsDraft07,
+		settingsWebTransportInitialMaxData,
+		settingsWebTransportInitialMaxStreamsUni,
+		settingsWebTransportInitialMaxStreamsBidi,
+	} {
 		if value, ok := serverSettings[setting]; ok {
 			t.Fatalf("server SETTINGS %#x = %d, want omitted", setting, value)
 		}
@@ -75,10 +88,17 @@ func TestWebTransportServerAdvertisesDraft07Only(t *testing.T) {
 		options.WebTransportDraft07Only = true
 		server.SetOptions(options)
 	})
-	if value := serverSettings[0xc671706a]; value != 1 {
+	if value := serverSettings[settingsWebTransportMaxSessionsDraft07]; value != 1 {
 		t.Fatalf("server draft-07 WEBTRANSPORT_MAX_SESSIONS = %d, want 1", value)
 	}
-	for _, setting := range []uint64{0x2b603742, 0x2c7cf000, 0x14e9cd29, 0x2b61, 0x2b64, 0x2b65} {
+	for _, setting := range []uint64{
+		settingsEnableWebTransportDraft06,
+		settingsWebTransportEnabled,
+		settingsWebTransportMaxSessions,
+		settingsWebTransportInitialMaxData,
+		settingsWebTransportInitialMaxStreamsUni,
+		settingsWebTransportInitialMaxStreamsBidi,
+	} {
 		if value, ok := serverSettings[setting]; ok {
 			t.Fatalf("server SETTINGS %#x = %d, want omitted", setting, value)
 		}
@@ -91,86 +111,30 @@ func readWebTransportServerSettings(t *testing.T, configure func(*Server)) map[u
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS.Clone(), &quic.Config{
-		EnableDatagrams:                  true,
-		EnableStreamResetPartialDelivery: true,
-	})
+	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS.Clone(), WebTransportQUICClientConfig(DefaultMaxFrameSize, nil))
 	if err != nil {
 		t.Fatalf("dial WebTransport server: %v", err)
 	}
 	defer conn.CloseWithError(0, "test complete")
 
-	settings := []struct {
-		id    uint64
-		value uint64
-	}{
-		{id: 0x33, value: 1},
-		{id: 0x2c7cf000, value: 1},
-		{id: 0x2b61, value: 1},
-		{id: 0x2b64, value: 1},
-		{id: 0x2b65, value: 1},
+	clientConn := (&http3.Transport{
+		EnableDatagrams: true,
+		AdditionalSettings: map[uint64]uint64{
+			settingsWebTransportEnabled:               1,
+			settingsWebTransportInitialMaxData:        1,
+			settingsWebTransportInitialMaxStreamsUni:  1,
+			settingsWebTransportInitialMaxStreamsBidi: 1,
+		},
+	}).NewClientConn(conn)
+	select {
+	case <-clientConn.ReceivedSettings():
+		return clientConn.Settings().Other
+	case <-conn.Context().Done():
+		t.Fatalf("WebTransport connection closed before server SETTINGS: %v", context.Cause(conn.Context()))
+	case <-ctx.Done():
+		t.Fatalf("wait for server SETTINGS: %v", context.Cause(ctx))
 	}
-	payload := make([]byte, 0, 64)
-	for _, setting := range settings {
-		payload = quicvarint.Append(payload, setting.id)
-		payload = quicvarint.Append(payload, setting.value)
-	}
-	control := quicvarint.Append(nil, 0)
-	control = quicvarint.Append(control, 4)
-	control = quicvarint.Append(control, uint64(len(payload)))
-	control = append(control, payload...)
-	clientControl, err := conn.OpenUniStreamSync(ctx)
-	if err != nil {
-		t.Fatalf("open client control stream: %v", err)
-	}
-	if _, err := clientControl.Write(control); err != nil {
-		t.Fatalf("write client SETTINGS: %v", err)
-	}
-	if err := clientControl.Close(); err != nil {
-		t.Fatalf("close client control stream: %v", err)
-	}
-
-	serverControl, err := conn.AcceptUniStream(ctx)
-	if err != nil {
-		t.Fatalf("accept server control stream: %v", err)
-	}
-	reader := bufio.NewReader(serverControl)
-	streamType, err := quicvarint.Read(reader)
-	if err != nil {
-		t.Fatalf("read server control stream type: %v", err)
-	}
-	if streamType != 0 {
-		t.Fatalf("server first unidirectional stream type = %#x, want control stream", streamType)
-	}
-	frameType, err := quicvarint.Read(reader)
-	if err != nil {
-		t.Fatalf("read server SETTINGS frame type: %v", err)
-	}
-	if frameType != 4 {
-		t.Fatalf("server first control frame type = %#x, want SETTINGS", frameType)
-	}
-	frameLength, err := quicvarint.Read(reader)
-	if err != nil {
-		t.Fatalf("read server SETTINGS frame length: %v", err)
-	}
-	serverPayload := make([]byte, frameLength)
-	if _, err := io.ReadFull(reader, serverPayload); err != nil {
-		t.Fatalf("read server SETTINGS payload: %v", err)
-	}
-	serverReader := bytes.NewReader(serverPayload)
-	serverSettings := make(map[uint64]uint64)
-	for serverReader.Len() > 0 {
-		id, err := quicvarint.Read(serverReader)
-		if err != nil {
-			t.Fatalf("read server setting identifier: %v", err)
-		}
-		value, err := quicvarint.Read(serverReader)
-		if err != nil {
-			t.Fatalf("read server setting value: %v", err)
-		}
-		serverSettings[id] = value
-	}
-	return serverSettings
+	return nil
 }
 
 func TestHTTP3RoundTripsUnaryAndAllStreamingModes(t *testing.T) {
