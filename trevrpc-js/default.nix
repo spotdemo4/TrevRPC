@@ -21,9 +21,26 @@
   nativePackage ? null,
 }:
 let
+  packageLock = lib.importJSON ./package-lock.json;
+  playwrightManifestVersion = jsPackage.devDependencies.playwright;
+  playwrightVersion = packageLock.packages."node_modules/playwright".version;
+  playwrightCoreVersion = packageLock.packages."node_modules/playwright-core".version;
+  expectedPlaywrightVersion = playwright-driver.version;
   publication = stdenv.hostPlatform.system == "x86_64-linux" && nativePackage != null;
   nativeNpmPackage = if publication then nativePackage.npm else null;
 in
+assert lib.assertMsg (playwrightManifestVersion == expectedPlaywrightVersion) ''
+  trevrpc-js playwright manifest ${playwrightManifestVersion} must exactly match
+  nixpkgs playwright-driver ${expectedPlaywrightVersion}
+'';
+assert lib.assertMsg (playwrightVersion == expectedPlaywrightVersion) ''
+  trevrpc-js locked playwright ${playwrightVersion} must match
+  nixpkgs playwright-driver ${expectedPlaywrightVersion}
+'';
+assert lib.assertMsg (playwrightCoreVersion == expectedPlaywrightVersion) ''
+  trevrpc-js locked playwright-core ${playwrightCoreVersion} must match
+  nixpkgs playwright-driver ${expectedPlaywrightVersion}
+'';
 buildNpmPackage (final: {
   pname = "trevrpc-js";
   inherit (jsPackage) version;

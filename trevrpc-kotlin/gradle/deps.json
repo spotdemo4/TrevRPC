@@ -61,9 +61,6 @@
       "jar": "sha256-jW/rHaM186sTxYTGE+I8ezxhs5LjeVaHIFe6+PDKHW8=",
       "pom": "sha256-eU2bmV7VkWXFQkPcxz/pSD1/4a9/uA/NiaWuW2k/Prc="
     },
-    "com/google#google/5": {
-      "pom": "sha256-4J00XnPKP7yn8+BfMN63Tp053Wt5qT/ujFEfI0F7aCg="
-    },
     "com/google/code/findbugs#jsr305/3.0.2": {
       "jar": "sha256-dmrSoHg/JoeWLIrXTO7MOKKLn3Ki0IXuQ4t4E+ko0Mc=",
       "pom": "sha256-GYidvfGyVLJgGl7mRbgUepdGRIgil2hMeYr+XWPXjf4="
@@ -131,12 +128,6 @@
     },
     "com/google/protobuf#protobuf-parent/4.35.1": {
       "pom": "sha256-u72BnBMG4ie3ZvTwIx9tXZGGcxVOfWzu0Gu7rKQVwVs="
-    },
-    "com/google/protobuf#protoc/4.35.1": {
-      "pom": "sha256-fTwy87oBNFvxEcnPFtae/9LPAiUVKGlrnwHI1aXNyno="
-    },
-    "com/google/protobuf/protoc/4.35.1/protoc-4.35.1-linux-x86_64": {
-      "exe": "sha256-0sZcPqXutZQn9oTtPgoM1Fg4YSL8nxuY3pRqckK1PTE="
     },
     "com/thoughtworks/qdox#qdox/2.2.0": {
       "jar": "sha256-wmDDIwsjQK+X1UvwH39n68V8kBkic2yIG7EcuYEwK+I=",

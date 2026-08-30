@@ -69,9 +69,49 @@ stdenvNoCC.mkDerivation (final: {
   ];
   gradleUpdateScript = ''
     runHook preBuild
-    gradle --no-configuration-cache --write-locks \
-      resolveAndLockAll \
-      :core:dokkaGeneratePublicationHtml
+    if [ -n "''${MITM_CACHE_ADDRESS:-}" ]; then
+      maven_trust_store=$(mktemp)
+      rm "$maven_trust_store"
+      keytool \
+        -importcert \
+        -noprompt \
+        -alias trevrpc-mitm-cache \
+        -file "$MITM_CACHE_CA" \
+        -keystore "$maven_trust_store" \
+        -storepass changeit
+      export MAVEN_OPTS="''${MAVEN_OPTS:-} \
+        -Djavax.net.ssl.trustStore=$maven_trust_store \
+        -Djavax.net.ssl.trustStorePassword=changeit \
+        -Dhttp.proxyHost=$MITM_CACHE_HOST \
+        -Dhttp.proxyPort=$MITM_CACHE_PORT \
+        -Dhttps.proxyHost=$MITM_CACHE_HOST \
+        -Dhttps.proxyPort=$MITM_CACHE_PORT"
+      export MAVEN_SETTINGS=$(mktemp)
+      cat > "$MAVEN_SETTINGS" <<EOF
+    <?xml version="1.0" encoding="UTF-8"?>
+    <settings>
+      <proxies>
+        <proxy>
+          <id>trevrpc-mitm-cache-http</id>
+          <active>true</active>
+          <protocol>http</protocol>
+          <host>$MITM_CACHE_HOST</host>
+          <port>$MITM_CACHE_PORT</port>
+          <nonProxyHosts>127.0.0.1|localhost</nonProxyHosts>
+        </proxy>
+        <proxy>
+          <id>trevrpc-mitm-cache-https</id>
+          <active>true</active>
+          <protocol>https</protocol>
+          <host>$MITM_CACHE_HOST</host>
+          <port>$MITM_CACHE_PORT</port>
+          <nonProxyHosts>127.0.0.1|localhost</nonProxyHosts>
+        </proxy>
+      </proxies>
+    </settings>
+    EOF
+    fi
+    gradle --no-configuration-cache --write-locks populateNixDependencyCache
   '';
 
   doCheck = true;
@@ -94,7 +134,7 @@ stdenvNoCC.mkDerivation (final: {
     EOF
     fi
   '';
-  gradleCheckTask = "check verifyStagedMavenRepository verifyGradleConsumers verifyMavenConsumers";
+  gradleCheckTask = "check verifyPublicationConsumers";
 
   installPhase = ''
     runHook preInstall
@@ -165,7 +205,6 @@ stdenvNoCC.mkDerivation (final: {
     test -f "$out/share/java/transport-cronet-${final.version}.jar"
     test -f "$out/share/java/transport-netty-${final.version}.jar"
     test -x "$out/bin/protoc-gen-trevrpc-kotlin"
-    python3 publication-tests/verify_staged_repository.py "$out/share/maven"
     runHook postInstallCheck
   '';
 

@@ -10,7 +10,9 @@
   "allowedCommands": [
     "^nix run \\.#update-go-deps$",
     "^npm audit fix --prefix trevrpc-js$",
-    "^nix run \\.#update-kotlin-deps$"
+    "^nix run \\.#update-kotlin-deps$",
+    "^nix run \\.#sync-playwright$",
+    "^nix run \\.#update-benchmark-proto$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
 
@@ -33,7 +35,26 @@
     "schedule": ["* * * * 0"], // sunday
     "skipInstalls": false,
     "postUpgradeTasks": {
-      "commands": ["nix run .#update-go-deps", "npm audit fix --prefix trevrpc-js"],
+      "commands": [
+        "nix run .#update-go-deps",
+        "npm audit fix --prefix trevrpc-js",
+        "nix run .#sync-playwright",
+        "nix run .#update-benchmark-proto"
+      ],
+      "fileFilters": [
+        "trevrpc-go/go.mod",
+        "trevrpc-go/go.sum",
+        "trevrpc-go/default.nix",
+        "trevrpc-js/package.json",
+        "trevrpc-js/package-lock.json",
+        "trevrpc-js/bench-browser/package.json",
+        "trevrpc-js/bench-browser/package-lock.json",
+        "trevrpc-c/bench/proto/benchmark.proto",
+        "trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto",
+        "trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto",
+        "trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go",
+        "trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go"
+      ],
       "executionMode": "branch"
     }
   },
@@ -44,7 +65,22 @@
     },
     {
       "matchManagers": ["nix"],
-      "addLabels": ["nix"]
+      "addLabels": ["nix"],
+      "postUpgradeTasks": {
+        "commands": ["nix run .#sync-playwright", "nix run .#update-benchmark-proto"],
+        "fileFilters": [
+          "trevrpc-js/package.json",
+          "trevrpc-js/package-lock.json",
+          "trevrpc-js/bench-browser/package.json",
+          "trevrpc-js/bench-browser/package-lock.json",
+          "trevrpc-c/bench/proto/benchmark.proto",
+          "trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto",
+          "trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto",
+          "trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go",
+          "trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go"
+        ],
+        "executionMode": "branch"
+      }
     },
     {
       "matchManagers": ["github-actions"],
@@ -121,6 +157,12 @@
         ],
         "executionMode": "branch"
       }
+    },
+    {
+      // Nixpkgs supplies the matching browser binaries and is the version authority.
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["playwright", "playwright-core"],
+      "enabled": false
     },
     {
       // The native package is built and versioned with trevrpc-js in this repository.

@@ -29,6 +29,47 @@
     trevpkgs.libs.mkFlake (
       system: pkgs:
       let
+        benchmarkProtoGenerator = pkgs.writeShellApplication {
+          name = "generate-trevrpc-benchmark-proto";
+          runtimeInputs = with pkgs; [
+            go
+            protobuf
+            protoc-gen-go
+            python3
+            packageSet.trevrpc-go
+          ];
+          text = ''
+            source_directory="$1"
+            source_proto="$source_directory/benchmark.proto"
+            output_directory="$2"
+            mkdir -p "$output_directory"
+            protoc \
+              --proto_path="$source_directory" \
+              --go_out="$output_directory" \
+              --go_opt=paths=source_relative \
+              "$source_proto"
+            protoc \
+              --proto_path="$source_directory" \
+              --trevrpc-go_out="$output_directory" \
+              --trevrpc-go_opt=paths=source_relative,service_prefix=Native \
+              "$source_proto"
+            # The packaged protoc-gen-go is built with an older Go toolchain.
+            # Normalize its equivalent reflection expression for current Go vet.
+            python3 - "$output_directory/benchmark.pb.go" <<'PY'
+            import pathlib
+            import sys
+
+            path = pathlib.Path(sys.argv[1])
+            old = "reflect.TypeOf(x{}).PkgPath()"
+            new = "reflect.TypeFor[x]().PkgPath()"
+            source = path.read_text()
+            if source.count(old) != 1:
+                raise SystemExit(f"expected exactly one generated reflection expression in {path}")
+            path.write_text(source.replace(old, new))
+            PY
+            gofmt -w "$output_directory/benchmark.pb.go" "$output_directory/benchmark.trevrpc.go"
+          '';
+        };
         packageSet =
           let
             cFamilyConformancePeers =
@@ -326,11 +367,52 @@
                 --refresh-dependencies \
                 --write-locks \
                 --write-verification-metadata sha256 \
-                resolveAndLockAll :core:dokkaGeneratePublicationHtml
+                updateGradleDependencyState
 
               update_script=$(nix build .#trevrpc-kotlin.mitmCache.updateScript --no-link --print-out-paths)
               USE_BWRAP=0 "$update_script"
               oxfmt --write trevrpc-kotlin/gradle/deps.json
+            '';
+          };
+
+          sync-playwright = {
+            packages = [ pkgs.nodejs_24 ];
+            script = ''
+              export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+              npm install \
+                --prefix trevrpc-js \
+                --package-lock-only \
+                --ignore-scripts \
+                --no-audit \
+                --no-fund \
+                --save-dev \
+                --save-exact \
+                "playwright@${pkgs.playwright-driver.version}"
+              npm install \
+                --prefix trevrpc-js/bench-browser \
+                --package-lock-only \
+                --ignore-scripts \
+                --no-audit \
+                --no-fund \
+                --save-exact \
+                "playwright-core@${pkgs.playwright-driver.version}"
+            '';
+          };
+
+          update-benchmark-proto = {
+            packages = [ benchmarkProtoGenerator ];
+            script = ''
+              cp bench/proto/benchmark.proto trevrpc-c/bench/proto/benchmark.proto
+              cp bench/proto/benchmark.proto trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto
+              cp bench/proto/benchmark.proto trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto
+
+              generated=$(mktemp -d)
+              trap 'rm -rf "$generated"' EXIT
+              generate-trevrpc-benchmark-proto bench/proto "$generated"
+              cp "$generated/benchmark.pb.go" \
+                trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go
+              cp "$generated/benchmark.trevrpc.go" \
+                trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go
             '';
           };
         };
@@ -408,35 +490,16 @@
             benchmark-proto-sync =
               pkgs.runCommand "trevrpc-benchmark-proto-sync"
                 {
-                  nativeBuildInputs = with pkgs; [
-                    go
-                    protobuf
-                    protoc-gen-go
-                    packageSet.trevrpc-go
-                  ];
+                  nativeBuildInputs = [ benchmarkProtoGenerator ];
                 }
                 ''
-                     cmp ${./bench/proto/benchmark.proto} ${./trevrpc-c/bench/proto/benchmark.proto}
-                     cmp ${./bench/proto/benchmark.proto} ${./trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto}
-                     cmp ${./bench/proto/benchmark.proto} ${./trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto}
-                  mkdir generated
-                  protoc \
-                    --proto_path=${./bench/proto} \
-                    --go_out=generated \
-                    --go_opt=paths=source_relative \
-                    ${./bench/proto}/benchmark.proto
-                  # The packaged plugin was built with an older Go toolchain, which
-                  # selects the equivalent pre-TypeFor reflection expression.
-                  substituteInPlace generated/benchmark.pb.go \
-                    --replace-fail 'reflect.TypeOf(x{}).PkgPath()' 'reflect.TypeFor[x]().PkgPath()'
-                   cmp generated/benchmark.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go}
-                   protoc \
-                     --proto_path=${./bench/proto} \
-                     --trevrpc-go_out=generated \
-                     --trevrpc-go_opt=paths=source_relative,service_prefix=Native \
-                     ${./bench/proto}/benchmark.proto
-                   cmp generated/benchmark.trevrpc.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go}
-                      touch $out
+                  cmp ${./bench/proto/benchmark.proto} ${./trevrpc-c/bench/proto/benchmark.proto}
+                  cmp ${./bench/proto/benchmark.proto} ${./trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto}
+                  cmp ${./bench/proto/benchmark.proto} ${./trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto}
+                  generate-trevrpc-benchmark-proto ${./bench/proto} generated
+                  cmp generated/benchmark.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go}
+                  cmp generated/benchmark.trevrpc.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go}
+                  touch $out
                 '';
 
             benchmark-smoke =

@@ -12,6 +12,7 @@
 let
   package = lib.importJSON ./package.json;
   packageLock = lib.importJSON ./package-lock.json;
+  playwrightCoreManifestVersion = package.dependencies.playwright-core;
   playwrightCoreVersion = packageLock.packages."node_modules/playwright-core".version;
   isX86Linux = stdenv.hostPlatform.system == "x86_64-linux";
   isDarwin = stdenv.hostPlatform.system == "aarch64-darwin";
@@ -36,6 +37,10 @@ let
       null;
   inherit (playwright-driver.browsersJSON) chromium firefox webkit;
 in
+assert lib.assertMsg (playwrightCoreManifestVersion == playwright-driver.version) ''
+  trevrpc-bench-peer-browser playwright-core manifest ${playwrightCoreManifestVersion} must match
+  nixpkgs playwright-driver ${playwright-driver.version}
+'';
 assert lib.assertMsg (playwrightCoreVersion == playwright-driver.version) ''
   trevrpc-bench-peer-browser playwright-core ${playwrightCoreVersion} must match
   nixpkgs playwright-driver ${playwright-driver.version}

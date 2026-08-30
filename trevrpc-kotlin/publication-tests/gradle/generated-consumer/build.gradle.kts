@@ -72,6 +72,7 @@ val prepareGenerator =
     }
 
 val configuredProtoc = providers.gradleProperty("trevrpcProtocPath")
+val protobufVersion = providers.gradleProperty("trevrpcProtobufVersion")
 
 protobuf {
     protoc {
@@ -82,7 +83,7 @@ protobuf {
             }
             path = protocFile.absolutePath
         } else {
-            artifact = "com.google.protobuf:protoc:4.35.1"
+            artifact = "com.google.protobuf:protoc:${protobufVersion.get()}"
         }
     }
     plugins {

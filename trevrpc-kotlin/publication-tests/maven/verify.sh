@@ -2,6 +2,7 @@
 set -euo pipefail
 
 : "${TREVRPC_STAGING_REPOSITORY:?TREVRPC_STAGING_REPOSITORY must name the staged Maven repository}"
+: "${TREVRPC_PROTOBUF_VERSION:?TREVRPC_PROTOBUF_VERSION must name the protobuf version}"
 
 maven_bin=${MAVEN:-mvn}
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -40,6 +41,7 @@ maven_args=(
   -Dmaven.repo.local="$local_repository"
   -Dtrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY"
   -Dtrevrpc.version="$TREVRPC_VERSION"
+  -Dprotobuf.version="$TREVRPC_PROTOBUF_VERSION"
   -f "$project_dir/pom.xml"
 )
 if [[ -n "${MAVEN_SETTINGS:-}" && -f "$MAVEN_SETTINGS" ]]; then

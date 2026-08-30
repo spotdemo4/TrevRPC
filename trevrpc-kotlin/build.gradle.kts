@@ -46,6 +46,11 @@ val configuredProtocPath =
         }
         protocFile.absolutePath
     }
+val protobufVersion =
+    libs.versions.protobuf
+        .asProvider()
+        .get()
+val kotlinVersion = libs.versions.kotlin.get()
 
 allprojects {
     group = "zip.trev.trevrpc"
@@ -100,6 +105,14 @@ subprojects {
         }
     }
 }
+
+val updateGradleDependencyState =
+    tasks.register("updateGradleDependencyState") {
+        group = "build setup"
+        description = "Resolves every Gradle configuration used to maintain locks and dependency caches."
+        dependsOn(subprojects.map { "${it.path}:resolveAndLockAll" })
+        dependsOn(":core:dokkaGeneratePublicationHtml")
+    }
 
 val stagingRepository = layout.buildDirectory.dir("staging-repository")
 val publishableModules =
@@ -235,43 +248,80 @@ val verifyStagedMavenRepository =
         group = "verification"
         description = "Validates the staged Maven repository, metadata, archives, and executable generator."
         dependsOn("stageMavenRepository")
-        environment("TREVRPC_VERSION", project.version.toString())
         commandLine(
             "python3",
             layout.projectDirectory.file("publication-tests/verify_staged_repository.py").asFile,
             stagingRepository.get().asFile,
+            "--version",
+            project.version.toString(),
+            "--protobuf-version",
+            protobufVersion,
+            "--kotlin-version",
+            kotlinVersion,
+            "--gradle-version",
+            gradle.gradleVersion,
         )
     }
 
-tasks.register<Exec>("verifyGradleConsumers") {
-    group = "verification"
-    description = "Compiles isolated Gradle consumers against Gradle metadata and Maven POM metadata."
-    dependsOn(verifyStagedMavenRepository)
-    environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
-    environment("TREVRPC_VERSION", project.version.toString())
-    configuredProtocPath?.let { environment("TREVRPC_PROTOC_PATH", it) }
-    commandLine("bash", layout.projectDirectory.file("publication-tests/gradle/verify.sh").asFile)
-}
+val verifyGradleConsumers =
+    tasks.register<Exec>("verifyGradleConsumers") {
+        group = "verification"
+        description = "Compiles isolated Gradle consumers against Gradle metadata and Maven POM metadata."
+        dependsOn("stageMavenRepository")
+        environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
+        environment("TREVRPC_VERSION", project.version.toString())
+        environment("TREVRPC_PROTOBUF_VERSION", protobufVersion)
+        configuredProtocPath?.let { environment("TREVRPC_PROTOC_PATH", it) }
+        commandLine("bash", layout.projectDirectory.file("publication-tests/gradle/verify.sh").asFile)
+    }
 
-tasks.register<Exec>("verifyMavenConsumers") {
-    group = "verification"
-    description = "Compiles isolated Maven consumers using an isolated local repository."
-    dependsOn(verifyStagedMavenRepository)
-    environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
-    environment("TREVRPC_VERSION", project.version.toString())
-    configuredProtocPath?.let { environment("TREVRPC_PROTOC_PATH", it) }
-    providers.environmentVariable("MAVEN_SETTINGS").orNull?.let { environment("MAVEN_SETTINGS", it) }
-    providers.environmentVariable("MAVEN_OPTS").orNull?.let { environment("MAVEN_OPTS", it) }
-    commandLine("bash", layout.projectDirectory.file("publication-tests/maven/verify.sh").asFile)
-}
+val verifyMavenConsumers =
+    tasks.register<Exec>("verifyMavenConsumers") {
+        group = "verification"
+        description = "Compiles isolated Maven consumers using an isolated local repository."
+        dependsOn("stageMavenRepository")
+        environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
+        environment("TREVRPC_VERSION", project.version.toString())
+        environment("TREVRPC_PROTOBUF_VERSION", protobufVersion)
+        configuredProtocPath?.let { environment("TREVRPC_PROTOC_PATH", it) }
+        providers.environmentVariable("MAVEN_SETTINGS").orNull?.let { environment("MAVEN_SETTINGS", it) }
+        providers.environmentVariable("MAVEN_OPTS").orNull?.let { environment("MAVEN_OPTS", it) }
+        commandLine("bash", layout.projectDirectory.file("publication-tests/maven/verify.sh").asFile)
+    }
 
-tasks.register<Exec>("verifyCronetConsumers") {
-    group = "verification"
-    description = "Validates and compiles isolated JVM 17 Cronet consumers with Gradle and Maven."
-    dependsOn(verifyStagedMavenRepository)
-    environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
-    environment("TREVRPC_VERSION", project.version.toString())
-    commandLine("bash", layout.projectDirectory.file("publication-tests/cronet/verify.sh").asFile)
+val verifyCronetConsumers =
+    tasks.register<Exec>("verifyCronetConsumers") {
+        group = "verification"
+        description = "Validates and compiles isolated JVM 17 Cronet consumers with Gradle and Maven."
+        dependsOn("stageMavenRepository")
+        environment("TREVRPC_STAGING_REPOSITORY", stagingRepository.get().asFile.absolutePath)
+        environment("TREVRPC_VERSION", project.version.toString())
+        providers.environmentVariable("MAVEN_SETTINGS").orNull?.let { environment("MAVEN_SETTINGS", it) }
+        providers.environmentVariable("MAVEN_OPTS").orNull?.let { environment("MAVEN_OPTS", it) }
+        commandLine("bash", layout.projectDirectory.file("publication-tests/cronet/verify.sh").asFile)
+    }
+
+val verifyPublicationConsumers =
+    tasks.register("verifyPublicationConsumers") {
+        group = "verification"
+        description = "Validates the staged repository with every isolated Gradle and Maven consumer."
+        dependsOn(
+            verifyStagedMavenRepository,
+            verifyGradleConsumers,
+            verifyMavenConsumers,
+            verifyCronetConsumers,
+        )
+    }
+
+tasks.register("populateNixDependencyCache") {
+    group = "build setup"
+    description = "Exercises every external resolver used by the hermetic Nix package."
+    dependsOn(
+        updateGradleDependencyState,
+        verifyGradleConsumers,
+        verifyMavenConsumers,
+        verifyCronetConsumers,
+    )
 }
 
 tasks.register<Zip>("createCentralBundle") {

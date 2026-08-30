@@ -2,6 +2,7 @@
 set -euo pipefail
 
 : "${TREVRPC_STAGING_REPOSITORY:?TREVRPC_STAGING_REPOSITORY must name the staged Maven repository}"
+: "${TREVRPC_PROTOBUF_VERSION:?TREVRPC_PROTOBUF_VERSION must name the protobuf version}"
 
 gradle_bin=${GRADLE:-gradle}
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -62,5 +63,6 @@ for metadata in "${metadata_modes[@]}"; do
       -Ptrevrpc.metadata="$metadata" \
       -PtrevrpcVersion="$TREVRPC_VERSION" \
       -Ptrevrpc.version="$TREVRPC_VERSION" \
+      -PtrevrpcProtobufVersion="$TREVRPC_PROTOBUF_VERSION" \
       verifyConsumers
 done

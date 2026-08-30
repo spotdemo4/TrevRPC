@@ -11,7 +11,8 @@ import { RpcKinds, SchemaVersion, parseWorkloadOptions } from "trevrpc-bench-pee
 const Stack = "trevrpc_webtransport";
 const BrowserCloseTimeoutMs = 5_000;
 const BrowserLaunchTimeoutMs = 20_000;
-const OriginNavigationTimeoutMs = 5_000;
+const BrowserPreparationTimeoutMs = 25_000;
+const OriginNavigationTimeoutMs = 20_000;
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 
 const BrowserEngines = {
@@ -41,6 +42,26 @@ export class PeerError extends Error {
     this.phase = phase;
     this.code = code;
   }
+}
+
+export function browserPreparationDeadline(nowMs = Date.now()) {
+  return nowMs + BrowserPreparationTimeoutMs;
+}
+
+export function remainingPreparationTime(deadlineMs, nowMs = Date.now()) {
+  const remainingMs = deadlineMs - nowMs;
+  if (remainingMs <= 0) {
+    throw new Error(`browser preparation timed out after ${BrowserPreparationTimeoutMs}ms`);
+  }
+  return remainingMs;
+}
+
+export function browserLaunchTimeout(deadlineMs, nowMs = Date.now()) {
+  return Math.min(BrowserLaunchTimeoutMs, remainingPreparationTime(deadlineMs, nowMs));
+}
+
+export function originNavigationTimeout(deadlineMs, nowMs = Date.now()) {
+  return Math.min(OriginNavigationTimeoutMs, remainingPreparationTime(deadlineMs, nowMs));
 }
 
 export function createPeerMain(peerName) {
@@ -143,10 +164,17 @@ async function runClient(config, io, env, peerName, engineName) {
   const control = createInterface({ input: io.stdin, crlfDelay: Infinity });
   const lines = control[Symbol.asyncIterator]();
   const termination = terminationSignal();
+  const preparationDeadline = browserPreparationDeadline();
   try {
     originServer = await startOriginServer();
     try {
-      const launchResult = await launchBrowser(browserType, engineName, env, trustArtifacts);
+      const launchResult = await launchBrowser(
+        browserType,
+        engineName,
+        env,
+        trustArtifacts,
+        preparationDeadline,
+      );
       browser = launchResult.browser;
       context = launchResult.context;
       page = launchResult.page;
@@ -164,7 +192,7 @@ async function runClient(config, io, env, peerName, engineName) {
       }
       await page.goto(originServer.origin, {
         waitUntil: "domcontentloaded",
-        timeout: OriginNavigationTimeoutMs,
+        timeout: originNavigationTimeout(preparationDeadline),
       });
     } catch (error) {
       throw wrapError("prepare", "browser_failed", error);
@@ -249,11 +277,11 @@ async function runClient(config, io, env, peerName, engineName) {
   }
 }
 
-export function webkitLaunchOptions(env) {
+export function webkitLaunchOptions(env, timeoutMs = BrowserLaunchTimeoutMs) {
   const executablePath = env.TREVRPC_BROWSER_WEBKIT ?? "";
   const launchOptions = {
     headless: true,
-    timeout: BrowserLaunchTimeoutMs,
+    timeout: timeoutMs,
   };
   if (executablePath !== "") {
     launchOptions.executablePath = executablePath;
@@ -261,11 +289,11 @@ export function webkitLaunchOptions(env) {
   return launchOptions;
 }
 
-export function webkitRuntimeDiagnostics(env) {
+export function webkitRuntimeDiagnostics(env, timeoutMs = BrowserLaunchTimeoutMs) {
   const entries = [
     ["executable", env.TREVRPC_BROWSER_WEBKIT],
     ["browsers_path", env.PLAYWRIGHT_BROWSERS_PATH],
-    ["launch_timeout_ms", BrowserLaunchTimeoutMs],
+    ["launch_timeout_ms", timeoutMs],
     ["EGL_PLATFORM", env.EGL_PLATFORM],
     ["WPE_FDO_HEADLESS", env.WPE_FDO_HEADLESS],
     ["LIBGL_ALWAYS_SOFTWARE", env.LIBGL_ALWAYS_SOFTWARE],
@@ -279,14 +307,15 @@ export function webkitRuntimeDiagnostics(env) {
     .join(", ");
 }
 
-export function webkitLaunchError(error, env) {
+export function webkitLaunchError(error, env, timeoutMs = BrowserLaunchTimeoutMs) {
   return new Error(
-    `${error?.message ?? String(error)}\nWebKit runtime: ${webkitRuntimeDiagnostics(env)}`,
+    `${error?.message ?? String(error)}\nWebKit runtime: ${webkitRuntimeDiagnostics(env, timeoutMs)}`,
     { cause: error },
   );
 }
 
-async function launchBrowser(browserType, engineName, env, trustArtifacts) {
+async function launchBrowser(browserType, engineName, env, trustArtifacts, preparationDeadline) {
+  const launchTimeoutMs = browserLaunchTimeout(preparationDeadline);
   if (engineName === "chromium") {
     const executablePath = env.TREVRPC_BROWSER_CHROMIUM;
     if (executablePath == null || executablePath === "") {
@@ -303,6 +332,7 @@ async function launchBrowser(browserType, engineName, env, trustArtifacts) {
     }
     const launchOptions = {
       headless: true,
+      timeout: launchTimeoutMs,
       chromiumSandbox: false,
       args: [
         "--no-sandbox",
@@ -324,6 +354,7 @@ async function launchBrowser(browserType, engineName, env, trustArtifacts) {
     const executablePath = env.TREVRPC_BROWSER_FIREFOX ?? "";
     const launchOptions = {
       headless: true,
+      timeout: launchTimeoutMs,
     };
     if (executablePath !== "") {
       launchOptions.executablePath = executablePath;
@@ -342,9 +373,9 @@ async function launchBrowser(browserType, engineName, env, trustArtifacts) {
   if (engineName === "webkit") {
     let browser;
     try {
-      browser = await browserType.launch(webkitLaunchOptions(env));
+      browser = await browserType.launch(webkitLaunchOptions(env, launchTimeoutMs));
     } catch (error) {
-      throw webkitLaunchError(error, env);
+      throw webkitLaunchError(error, env, launchTimeoutMs);
     }
     const context = await browser.newContext();
     const page = await context.newPage();

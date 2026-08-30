@@ -41,14 +41,37 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
+val protobufVersion =
+    libs.versions.protobuf
+        .asProvider()
+        .get()
+val kotlinVersion = libs.versions.kotlin.get()
+
 val executableJar =
     tasks.register<Jar>("executableJar") {
         archiveClassifier.set("jdk21")
         duplicatesStrategy = DuplicatesStrategy.EXCLUDE
         manifest.attributes["Main-Class"] = application.mainClass.get()
         exclude("META-INF/*.DSA", "META-INF/*.RSA", "META-INF/*.SF")
+        inputs.property("protobufVersion", protobufVersion)
+        inputs.property("kotlinVersion", kotlinVersion)
         from(sourceSets.main.get().output)
-        from(layout.projectDirectory.dir("src/executable/resources"))
+        from(layout.projectDirectory.dir("src/executable/resources")) {
+            exclude("META-INF/third-party/THIRD-PARTY.txt")
+        }
+        from(
+            layout.projectDirectory.file(
+                "src/executable/resources/META-INF/third-party/THIRD-PARTY.txt",
+            ),
+        ) {
+            into("META-INF/third-party")
+            expand(
+                mapOf(
+                    "protobufVersion" to protobufVersion,
+                    "kotlinVersion" to kotlinVersion,
+                ),
+            )
+        }
         from(
             configurations.runtimeClasspath.map { classpath ->
                 classpath.map { entry -> if (entry.isDirectory) entry else zipTree(entry) }

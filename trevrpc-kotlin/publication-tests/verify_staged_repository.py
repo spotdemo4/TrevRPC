@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import subprocess
 import sys
@@ -13,7 +12,6 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 GROUP = "zip.trev.trevrpc"
-VERSION = "0.1.2"
 MODULE_TARGETS = {
     "core": 52,
     "transport-cronet": 61,
@@ -34,11 +32,6 @@ NATIVE_CLASSIFIERS = {
     "windows-x86_64",
 }
 POM_NAMESPACE = {"m": "http://maven.apache.org/POM/4.0.0"}
-GENERATOR_THIRD_PARTY_COORDINATES = [
-    "com.google.protobuf:protobuf-java:4.35.1",
-    "org.jetbrains:annotations:13.0",
-    "org.jetbrains.kotlin:kotlin-stdlib:2.4.10",
-]
 GENERATOR_LEGAL_ENTRIES = {
     "META-INF/third-party/THIRD-PARTY.txt",
     "META-INF/third-party/jetbrains-annotations/LICENSE.txt",
@@ -54,7 +47,7 @@ def require(condition: bool, message: str) -> None:
 
 
 def artifact_path(
-    repository: pathlib.Path, module: str, suffix: str, version: str = VERSION
+    repository: pathlib.Path, module: str, suffix: str, version: str
 ) -> pathlib.Path:
     return (
         repository
@@ -63,38 +56,6 @@ def artifact_path(
         / version
         / f"{module}-{version}{suffix}"
     )
-
-
-def resolve_version(repository: pathlib.Path) -> str:
-    if len(sys.argv) >= 3 and sys.argv[2].strip():
-        return sys.argv[2].strip()
-    env_version = (
-        os.environ.get("TREVRPC_VERSION")
-        or os.environ.get("TREVRPC_KOTLIN_VERSION")
-        or ""
-    ).strip()
-    if env_version:
-        return env_version
-    group_directory = repository / GROUP.replace(".", "/")
-    if group_directory.is_dir():
-        versions: set[str] = set()
-        for module in MODULE_TARGETS:
-            module_dir = group_directory / module
-            if module_dir.is_dir():
-                versions.update(p.name for p in module_dir.iterdir() if p.is_dir())
-        if len(versions) == 1:
-            return next(iter(versions))
-    # Fallback for manual runs: read from the main project's build file
-    build_file = pathlib.Path(__file__).resolve().parents[1] / "build.gradle.kts"
-    if build_file.is_file():
-        import re
-
-        for line in build_file.read_text().splitlines():
-            if 'version = "' in line:
-                m = re.search(r'version = "([0-9]+\.[0-9]+\.[0-9]+)"', line)
-                if m:
-                    return m.group(1)
-    return VERSION
 
 
 def verify_checksums(path: pathlib.Path) -> None:
@@ -184,7 +145,9 @@ def dependency_rows(
     return rows
 
 
-def verify_pom(path: pathlib.Path, module: str, version: str = VERSION) -> None:
+def verify_pom(
+    path: pathlib.Path, module: str, version: str, protobuf_version: str
+) -> None:
     require(path.is_file(), f"missing POM {path}")
     verify_checksums(path)
     root = ET.parse(path).getroot()
@@ -239,7 +202,14 @@ def verify_pom(path: pathlib.Path, module: str, version: str = VERSION) -> None:
             "core coroutines must be compile scope",
         )
         require(
-            ("com.google.protobuf", "protobuf-java", "4.35.1", "compile", None) in rows,
+            (
+                "com.google.protobuf",
+                "protobuf-java",
+                protobuf_version,
+                "compile",
+                None,
+            )
+            in rows,
             "core protobuf must be compile scope",
         )
     elif module == "transport-netty":
@@ -302,12 +272,17 @@ def verify_pom(path: pathlib.Path, module: str, version: str = VERSION) -> None:
         )
 
 
-def verify_module_metadata(path: pathlib.Path, module: str) -> None:
+def verify_module_metadata(
+    path: pathlib.Path, module: str, expected_gradle_version: str
+) -> None:
     require(path.is_file(), f"missing Gradle module metadata {path}")
     verify_checksums(path)
     data = typing.cast(dict[str, typing.Any], json.loads(path.read_text()))
     gradle_version = typing.cast(str, data["createdBy"]["gradle"]["version"])
-    require(gradle_version == "9.5.1", f"wrong Gradle version in {path}")
+    require(
+        gradle_version == expected_gradle_version,
+        f"wrong Gradle version in {path}: {gradle_version}, expected {expected_gradle_version}",
+    )
     variants_raw = typing.cast(list[dict[str, typing.Any]], data["variants"])
     library_variants = [
         variant
@@ -359,7 +334,9 @@ def verify_module_metadata(path: pathlib.Path, module: str) -> None:
 
 
 def verify_generator_legal_metadata(
-    archive: zipfile.ZipFile, path: pathlib.Path
+    archive: zipfile.ZipFile,
+    path: pathlib.Path,
+    expected_coordinates: list[str],
 ) -> None:
     names = set(archive.namelist())
     require(
@@ -379,7 +356,7 @@ def verify_generator_legal_metadata(
         if line.count(":") == 2 and not line.startswith(" ")
     ]
     require(
-        coordinates == GENERATOR_THIRD_PARTY_COORDINATES,
+        coordinates == expected_coordinates,
         f"wrong or non-deterministic third-party inventory in {path}",
     )
     require(
@@ -405,13 +382,57 @@ def verify_generator_legal_metadata(
     )
 
 
-def main() -> None:
+def parse_arguments(
+    argv: list[str],
+) -> tuple[pathlib.Path, str, str, str, str]:
     require(
-        len(sys.argv) in (2, 3),
-        "usage: verify_staged_repository.py REPOSITORY [VERSION]",
+        len(argv) == 9,
+        "usage: verify_staged_repository.py REPOSITORY --version VERSION "
+        + "--protobuf-version VERSION --kotlin-version VERSION --gradle-version VERSION",
     )
-    repository = pathlib.Path(sys.argv[1]).resolve()
-    version = resolve_version(repository)
+    (
+        repository,
+        version_flag,
+        version,
+        protobuf_flag,
+        protobuf_version,
+        kotlin_flag,
+        kotlin_version,
+        gradle_flag,
+        gradle_version,
+    ) = argv
+    require(version_flag == "--version", f"expected --version, got {version_flag}")
+    require(
+        protobuf_flag == "--protobuf-version",
+        f"expected --protobuf-version, got {protobuf_flag}",
+    )
+    require(
+        kotlin_flag == "--kotlin-version",
+        f"expected --kotlin-version, got {kotlin_flag}",
+    )
+    require(
+        gradle_flag == "--gradle-version",
+        f"expected --gradle-version, got {gradle_flag}",
+    )
+    return (
+        pathlib.Path(repository),
+        version,
+        protobuf_version,
+        kotlin_version,
+        gradle_version,
+    )
+
+
+def main() -> None:
+    repository, version, protobuf_version, kotlin_version, gradle_version = (
+        parse_arguments(sys.argv[1:])
+    )
+    repository = repository.resolve()
+    expected_generator_coordinates = [
+        f"com.google.protobuf:protobuf-java:{protobuf_version}",
+        "org.jetbrains:annotations:13.0",
+        f"org.jetbrains.kotlin:kotlin-stdlib:{kotlin_version}",
+    ]
     group_directory = repository / GROUP.replace(".", "/")
     require(group_directory.is_dir(), f"missing group directory {group_directory}")
     modules = {path.name for path in group_directory.iterdir() if path.is_dir()}
@@ -442,8 +463,8 @@ def main() -> None:
                 )
         verify_archive(sources_jar, required_suffixes=(".kt", ".java"))
         verify_archive(javadoc_jar, required_suffixes=(".html",))
-        verify_pom(pom, module, version)
-        verify_module_metadata(module_metadata, module)
+        verify_pom(pom, module, version, protobuf_version)
+        verify_module_metadata(module_metadata, module, gradle_version)
 
         version_directory = main_jar.parent
         allowed_artifacts = {
@@ -471,7 +492,9 @@ def main() -> None:
                 verify_class_major(
                     archive, executable, "zip/trev/trevrpc/generator/MainKt.class", 65
                 )
-                verify_generator_legal_metadata(archive, executable)
+                verify_generator_legal_metadata(
+                    archive, executable, expected_generator_coordinates
+                )
             process = subprocess.run(
                 ["java", "-jar", str(executable)],
                 input=b"",

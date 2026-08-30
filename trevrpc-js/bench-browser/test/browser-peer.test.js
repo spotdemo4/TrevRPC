@@ -5,7 +5,11 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
+  browserLaunchTimeout,
+  browserPreparationDeadline,
   browserRoles,
+  originNavigationTimeout,
+  remainingPreparationTime,
   webkitLaunchError,
   webkitLaunchOptions,
   webkitRuntimeDiagnostics,
@@ -33,6 +37,23 @@ test("Linux WPE does not advertise WebTransport support", () => {
   });
 });
 
+test("browser preparation uses one decreasing deadline", () => {
+  const deadline = browserPreparationDeadline(1_000);
+  assert.equal(deadline, 26_000);
+  assert.equal(remainingPreparationTime(deadline, 1_000), 25_000);
+  assert.equal(remainingPreparationTime(deadline, 7_500), 18_500);
+  assert.equal(browserLaunchTimeout(deadline, 1_000), 20_000);
+  assert.equal(browserLaunchTimeout(deadline, 7_500), 18_500);
+  assert.equal(originNavigationTimeout(deadline, 1_000), 20_000);
+  assert.equal(originNavigationTimeout(deadline, 7_500), 18_500);
+});
+
+test("browser preparation fails when its deadline is exhausted", () => {
+  assert.throws(() => remainingPreparationTime(1_000, 1_000), /timed out after 25000ms/u);
+  assert.throws(() => browserLaunchTimeout(1_000, 1_001), /timed out after 25000ms/u);
+  assert.throws(() => originNavigationTimeout(1_000, 1_001), /timed out after 25000ms/u);
+});
+
 test("WebKit launch options bound startup and preserve an explicit executable", () => {
   assert.deepEqual(webkitLaunchOptions({ TREVRPC_BROWSER_WEBKIT: "/webkit/pw_run.sh" }), {
     headless: true,
@@ -42,6 +63,10 @@ test("WebKit launch options bound startup and preserve an explicit executable", 
   assert.deepEqual(webkitLaunchOptions({}), {
     headless: true,
     timeout: 20_000,
+  });
+  assert.deepEqual(webkitLaunchOptions({}, 12_000), {
+    headless: true,
+    timeout: 12_000,
   });
 });
 

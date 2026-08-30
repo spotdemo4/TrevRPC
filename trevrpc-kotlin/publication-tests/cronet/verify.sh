@@ -8,6 +8,7 @@ maven_bin=${MAVEN:-mvn}
 fixture_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
+cache_seed=${TREVRPC_GRADLE_CACHE_SEED:-}
 
 resolve_trevrpc_version() {
   if [[ -n "${TREVRPC_VERSION:-}" ]]; then
@@ -84,8 +85,17 @@ licenses = {
 assert "Chromium and built-in dependencies" in licenses, "Cronet POM omits bundled class licensing"
 PY
 
-GRADLE_USER_HOME="$work_dir/gradle-user-home" \
+gradle_user_home="$work_dir/gradle-user-home"
+mkdir -p "$gradle_user_home"
+gradle_args=()
+if [[ -n "$cache_seed" ]]; then
+  test -d "$cache_seed/caches"
+  cp -a "$cache_seed/caches" "$gradle_user_home/"
+  gradle_args+=(--offline)
+fi
+GRADLE_USER_HOME="$gradle_user_home" \
   "$gradle_bin" \
+    "${gradle_args[@]}" \
     --project-dir "$fixture_dir/gradle" \
     --project-cache-dir "$work_dir/gradle-project-cache" \
     --no-configuration-cache \
@@ -95,11 +105,15 @@ GRADLE_USER_HOME="$work_dir/gradle-user-home" \
     -Ptrevrpc.version="$TREVRPC_VERSION" \
     clean compileKotlin
 
-"$maven_bin" \
-  --batch-mode \
-  --errors \
-  -Dmaven.repo.local="$work_dir/maven-local-repository" \
-  -Dtrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY" \
-  -Dtrevrpc.version="$TREVRPC_VERSION" \
-  -f "$fixture_dir/maven/pom.xml" \
-  clean compile
+maven_args=(
+  --batch-mode
+  --errors
+  -Dmaven.repo.local="$work_dir/maven-local-repository"
+  -Dtrevrpc.repository="file://$TREVRPC_STAGING_REPOSITORY"
+  -Dtrevrpc.version="$TREVRPC_VERSION"
+  -f "$fixture_dir/maven/pom.xml"
+)
+if [[ -n "${MAVEN_SETTINGS:-}" && -f "$MAVEN_SETTINGS" ]]; then
+  maven_args+=(-s "$MAVEN_SETTINGS")
+fi
+"$maven_bin" "${maven_args[@]}" clean compile
