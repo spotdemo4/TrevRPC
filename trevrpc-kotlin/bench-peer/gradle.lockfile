@@ -1,6 +1,7 @@
 # This is a Gradle generated file for dependency locking.
 # Manual edits can break the build and are not advised.
 # This file is expected to be part of source control.
+# To regenerate this file, run: ./gradlew :bench-peer:dependencies --write-locks
 com.google.protobuf:protobuf-java:4.36.0=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
 com.google.protobuf:protoc:4.36.0=protobufToolsLocator_protoc
 io.netty:netty-bom:4.2.17.Final=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
