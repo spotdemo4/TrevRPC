@@ -2,8 +2,8 @@
 # Manual edits can break the build and are not advised.
 # This file is expected to be part of source control.
 # To regenerate this file, run: ./gradlew :conformance-peer:dependencies --write-locks
-com.google.protobuf:protobuf-java:4.36.0=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
-com.google.protobuf:protoc:4.36.0=protobufToolsLocator_protoc
+com.google.protobuf:protobuf-java:4.36.1=compileClasspath,compileProtoPath,runtimeClasspath,testCompileClasspath,testCompileProtoPath,testRuntimeClasspath
+com.google.protobuf:protoc:4.36.1=protobufToolsLocator_protoc
 org.apiguardian:apiguardian-api:1.1.2=testCompileClasspath
 org.jetbrains.kotlin:kotlin-build-tools-api:2.4.0=kotlinAbiValidationCompatClasspath
 org.jetbrains.kotlin:kotlin-build-tools-api:2.4.10=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinKlibCommonizerClasspath
