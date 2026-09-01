@@ -12,7 +12,7 @@
 
 [![pkg.go.dev](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fpkg.go.dev%2Fv1beta%2Fpackage%2Ftrev.zip%2Fllc%2Ftrevrpc%2Ftrevrpc-go&query=%24.version&logo=go&logoColor=%23bac2de&label=pkg.go.dev&labelColor=%23313244&color=%2300ADD8)](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go)
 [![npm](https://img.shields.io/npm/v/%40trevrpc%2Ftrevrpc-js?logo=npm&logoColor=%23bac2de&labelColor=%23313244&color=%23F7DF1E)](https://www.npmjs.com/package/@trevrpc/trevrpc-js)
-![maven-central](https://img.shields.io/maven-central/v/zip.trev.trevrpc/trevrpc?strategy=highestVersion&logo=apachemaven&logoColor=%23bac2de&labelColor=%23313244&color=%237F52FF)
+[![maven-central](https://img.shields.io/maven-central/v/zip.trev.trevrpc/core?strategy=highestVersion&logo=apachemaven&logoColor=%23bac2de&labelColor=%23313244&color=%237F52FF)](https://central.sonatype.com/search?namespace=zip.trev.trevrpc)
 [![crates.io](https://img.shields.io/crates/v/trevrpc?labelColor=%23313244&color=%23D34516)](https://crates.io/crates/trevrpc)
 
 Protobuf over QUIC, HTTP/3 & WebTransport, with C, C++20, Go, Rust, JavaScript, and Kotlin runtimes
