@@ -2,8 +2,9 @@
 
 ## Task Completion Requirements
 
-- `nix fmt` must be used for formatting.
-- `nix flake check` must pass before considering tasks completed. Intent-to-add (`git add -N`) new files so `nix flake check` can see them.
+- Use focused CMake, CTest, sanitizer, installed-consumer, or individual Nix derivation checks while implementation is in progress.
+- Do not repeatedly run the full `nix flake check` during intermediate implementation or review stages; it is intentionally reserved for the final completion gate. Run it earlier only when diagnosing a specific Nix integration failure that cannot be isolated more narrowly.
+- Once the implementation and focused verification have stabilized, intent-to-add (`git add -N`) every new file so Nix can see it, run `nix fmt`, and run the full `nix flake check` exactly once before considering the task completed.
 
 ## Project Snapshot
 
