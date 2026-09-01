@@ -7,7 +7,7 @@ trevrpc_c_abi_version=@TREVRPC_C_ABI_VERSION@
 Name: trevrpc_msquic
 Description: TrevRPC C low-level MsQuic transport wrapper
 Version: @PROJECT_VERSION@
-Requires.private: trevrpc_core
+Requires.private: trevrpc_core = @PROJECT_VERSION@
 Libs: -L${libdir} -ltrevrpc_msquic
-Libs.private: -lmsquic
+Libs.private: -ltrevrpc_msquic_native_core -ltrevrpc_msquic_api_owner -lmsquic -lpthread
 Cflags: -I${includedir}

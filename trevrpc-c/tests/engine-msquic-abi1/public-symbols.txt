@@ -1,0 +1,4 @@
+trevrpc_engine_msquic_abi_1_anchor
+trevrpc_engine_msquic_abi_version
+trevrpc_engine_msquic_config_v1_init
+trevrpc_engine_msquic_create_v1

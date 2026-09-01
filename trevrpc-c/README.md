@@ -4,6 +4,12 @@ TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport)
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
+## Engine ABI
+
+[Engine ABI 1](engine-abi-v1.md) is the provider-neutral and sole operational transport ABI. It defines the shared handles, commands, event and receive ownership, mandatory reservations, queue and wake integration, diagnostics, and lifecycle used after any provider factory succeeds. It is versioned and packaged independently from TrevRPC C ABI 6; neither ABI version implies the other.
+
+[MsQuic Engine factory ABI 1](engine-msquic-abi-v1.md) is the separately enabled MsQuic factory and reserved provider-configuration companion. It returns a `trevrpc_engine`; every subsequent operation uses the generic `trevrpc_engine_*` API and the engine's single queue, wake source, diagnostics, and lifecycle. Its package depends on the matching `trevrpc_engine` package, Threads, and MsQuic.
+
 ## Protobuf
 
 ```proto

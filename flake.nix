@@ -415,6 +415,9 @@
                 touch $out
               '';
 
+          c-engine = pkgs.callPackage ./trevrpc-c/engine-check.nix { };
+          c-engine-msquic = pkgs.callPackage ./trevrpc-c/engine-msquic-check.nix { };
+
           c = packageSet.trevrpc-c;
           c-sanitizers = packageSet.trevrpc-c.override {
             sanitizers = true;

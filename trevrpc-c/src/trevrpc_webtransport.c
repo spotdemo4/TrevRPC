@@ -334,7 +334,7 @@ static int trevrpc_wt_varint_write(uint8_t* out, size_t out_len, uint64_t value,
 static int trevrpc_wt_read_exact(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
     size_t offset = 0;
     while (offset < len) {
-        intptr_t n = trevrpc_msquic_stream_read(stream, data + offset, len - offset);
+        intptr_t n = trevrpc_msquic_stream_read_protocol(stream, data + offset, len - offset);
         if (n <= 0) {
             return n == 0 ? TREV_WT_ERR_CLOSED : trevrpc_wt_map_msquic_error((int)n);
         }
@@ -2340,7 +2340,7 @@ static void* trevrpc_h3_unidi_monitor(void* context) {
     }
     uint8_t ignored[1024];
     for (;;) {
-        intptr_t n = trevrpc_msquic_stream_read(stream, ignored, sizeof(ignored));
+        intptr_t n = trevrpc_msquic_stream_read_protocol(stream, ignored, sizeof(ignored));
         if (n > 0 && stream_type == 0x02) {
             bool valid = true;
             for (intptr_t i = 0; i < n; i++) {
@@ -3176,15 +3176,15 @@ static intptr_t trevrpc_h3_read_msquic(
     trevrpc_h3_stream* stream, uint8_t* data, size_t len, trevrpc_h3_read_mode mode, uint64_t deadline_nanos) {
     intptr_t result = 0;
     if (mode == TREV_H3_READ_READY) {
-        result = trevrpc_msquic_stream_read_ready(stream->msquic_stream, data, len);
+        result = trevrpc_msquic_stream_read_protocol_ready(stream->msquic_stream, data, len);
     } else if (mode == TREV_H3_READ_DEADLINE) {
         uint64_t now = trevrpc_h3_monotonic_nanos();
         if (now == 0 || now >= deadline_nanos) {
             return TREV_MSQUIC_ERR_TIMEOUT;
         }
-        result = trevrpc_msquic_stream_read_timeout(stream->msquic_stream, data, len, deadline_nanos - now);
+        result = trevrpc_msquic_stream_read_protocol_timeout(stream->msquic_stream, data, len, deadline_nanos - now);
     } else {
-        result = trevrpc_msquic_stream_read(stream->msquic_stream, data, len);
+        result = trevrpc_msquic_stream_read_protocol(stream->msquic_stream, data, len);
     }
     return result < 0 ? trevrpc_wt_map_msquic_error((int)result) : result;
 }

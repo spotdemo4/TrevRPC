@@ -43,6 +43,12 @@ void trevrpc_frame_parser_set_max_body_len(trevrpc_frame_parser* parser, size_t 
     }
 }
 
+void trevrpc_frame_parser_set_retain_on_allocation_failure(trevrpc_frame_parser* parser, bool retain) {
+    if (parser != NULL) {
+        parser->retain_on_allocation_failure = retain;
+    }
+}
+
 static void trevrpc_frame_parser_reset_message(trevrpc_frame_parser* parser) {
     parser->header_len = 0;
     parser->body = NULL;
@@ -105,9 +111,14 @@ trevrpc_frame_result trevrpc_frame_parser_consume(trevrpc_frame_parser* parser,
             trevrpc_frame_parser_reset_message(parser);
             return TREVRPC_FRAME_READY;
         }
+    }
+
+    if (parser->body == NULL) {
         parser->body = parser->alloc(parser->body_len, parser->allocator_context);
         if (parser->body == NULL) {
-            trevrpc_frame_parser_reset_message(parser);
+            if (!parser->retain_on_allocation_failure) {
+                trevrpc_frame_parser_reset_message(parser);
+            }
             return TREVRPC_FRAME_ALLOCATION_FAILURE;
         }
     }
@@ -174,9 +185,11 @@ void trevrpc_frame_parser_reset(trevrpc_frame_parser* parser) {
     trevrpc_frame_alloc_fn alloc = parser->alloc;
     trevrpc_frame_free_fn dealloc = parser->dealloc;
     void* allocator_context = parser->allocator_context;
+    bool retain_on_allocation_failure = parser->retain_on_allocation_failure;
     memset(parser, 0, sizeof(*parser));
     parser->max_body_len = max_body_len;
     parser->alloc = alloc == NULL ? trevrpc_frame_default_alloc : alloc;
     parser->dealloc = dealloc == NULL ? trevrpc_frame_default_free : dealloc;
     parser->allocator_context = allocator_context;
+    parser->retain_on_allocation_failure = retain_on_allocation_failure;
 }

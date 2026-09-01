@@ -33,6 +33,10 @@ int trevrpc_msquic_dial_observed(const char* host,
     trevrpc_msquic_conn** conn);
 void trevrpc_msquic_conn_clear_observer(trevrpc_msquic_conn* conn);
 int trevrpc_msquic_stream_abort_with_error(trevrpc_msquic_stream* stream, uint64_t error_code);
+intptr_t trevrpc_msquic_stream_read_protocol(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
+intptr_t trevrpc_msquic_stream_read_protocol_timeout(
+    trevrpc_msquic_stream* stream, uint8_t* data, size_t len, uint64_t timeout_nanos);
+intptr_t trevrpc_msquic_stream_read_protocol_ready(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_read_frame_owned(
     trevrpc_msquic_stream* stream, trevrpc_owned_bytes* body, size_t max_len);
 intptr_t trevrpc_msquic_stream_read_frame_owned_timeout(

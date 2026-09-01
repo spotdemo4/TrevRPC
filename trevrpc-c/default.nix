@@ -46,9 +46,13 @@ stdenv.mkDerivation (
         -DCMAKE_INSTALL_LIBDIR="$lib/lib" \
         -DCMAKE_INSTALL_LIBEXECDIR="$lib/libexec" \
         -DTREVRPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc" \
+        -DTREVRPC_ENGINE_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_engine" \
+        -DTREVRPC_ENGINE_MSQUIC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_engine_msquic" \
+        -DTREVRPC_MSQUIC_NATIVE_CORE_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_msquic_native_core" \
         -DTREVRPC_INSTALL_PKGCONFIGDIR="$dev/lib/pkgconfig" \
         -DTREVRPC_BUILD_BENCHMARKS=ON \
         -DTREVRPC_BUILD_TESTS=ON \
+        -DTREVRPC_BUILD_ENGINE_MSQUIC=ON \
         -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
         -DTREVRPC_ENABLE_THREAD_SANITIZER=${if threadSanitizer then "ON" else "OFF"}
       runHook postConfigure
@@ -116,10 +120,22 @@ stdenv.mkDerivation (
         test -x "$out/bin/trevrpc-conformance-c"
       ''}
       test -f "$dev/include/trevrpc_binding.h"
+      test -f "$dev/include/trevrpc_engine.h"
+      test -f "$dev/include/trevrpc_engine_msquic.h"
       test ! -e "$dev/include/trevrpc_preview.h"
       test -f "$dev/lib/cmake/trevrpc/trevrpcConfig.cmake"
+      test -f "$dev/lib/cmake/trevrpc_engine/trevrpc_engineConfig.cmake"
+      test -f "$dev/lib/cmake/trevrpc_engine/trevrpcEngineTargets.cmake"
+      test -f "$dev/lib/cmake/trevrpc_engine_msquic/trevrpc_engine_msquicConfig.cmake"
+      test -f "$dev/lib/cmake/trevrpc_engine_msquic/trevrpcEngineMsquicTargets.cmake"
       test -f "$dev/lib/pkgconfig/trevrpc.pc"
+      test -f "$dev/lib/pkgconfig/trevrpc_engine.pc"
+      test -f "$dev/lib/pkgconfig/trevrpc_engine_msquic.pc"
       test -f "$lib/lib/libtrevrpc.a"
+      test -f "$lib/lib/libtrevrpc_engine.a"
+      test -f "$lib/lib/libtrevrpc_engine_msquic.a"
+      test -f "$lib/lib/libtrevrpc_msquic_api_owner.a"
+      test -f "$lib/lib/libtrevrpc_msquic_native_core.a"
       test ! -e "$out/include"
       test ! -e "$out/lib"
 
@@ -132,6 +148,12 @@ stdenv.mkDerivation (
       test "$(pkg-config \
         --define-prefix \
         --variable=trevrpc_c_abi_version "$dev/lib/pkgconfig/trevrpc.pc")" = "6"
+      test "$(pkg-config \
+        --define-prefix \
+        --variable=trevrpc_engine_abi_version "$dev/lib/pkgconfig/trevrpc_engine.pc")" = "1"
+      test "$(pkg-config \
+        --define-prefix \
+        --variable=trevrpc_engine_msquic_abi_version "$dev/lib/pkgconfig/trevrpc_engine_msquic.pc")" = "1"
 
       consumer_sanitizer_flags="${optionalString sanitizers "-fsanitize=address,undefined -fno-omit-frame-pointer"}${optionalString threadSanitizer "-fsanitize=thread -fno-omit-frame-pointer"}"
       export CFLAGS="$consumer_sanitizer_flags''${CFLAGS:+ $CFLAGS}"
@@ -142,8 +164,22 @@ stdenv.mkDerivation (
         -DTREVRPC_C_GENERATOR_EXECUTABLE="$out/bin/protoc-gen-trevrpc-c"
       cmake --build "$TMPDIR/trevrpc-installed-cmake" --parallel $NIX_BUILD_CORES
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-cmake-consumer"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-cmake-consumer"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-msquic-cmake-consumer"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-msquic-cmake-cpp-consumer"
 
       export PKG_CONFIG_PATH="$dev/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+      cc $consumer_sanitizer_flags \
+        tests/install/pkg-config/engine_main.c \
+        -o "$TMPDIR/trevrpc-installed-engine-pkg-config-consumer" \
+        $(pkg-config --static --cflags --libs trevrpc_engine)
+      "$TMPDIR/trevrpc-installed-engine-pkg-config-consumer"
+      cc $consumer_sanitizer_flags \
+        tests/install/pkg-config/engine_msquic_main.c \
+        -o "$TMPDIR/trevrpc-installed-engine-msquic-pkg-config-consumer" \
+        $(pkg-config --static --cflags --libs trevrpc_engine_msquic)
+      "$TMPDIR/trevrpc-installed-engine-msquic-pkg-config-consumer"
+
       pkg_codegen="$TMPDIR/trevrpc-installed-pkg-config-codegen"
       mkdir -p "$pkg_codegen"
       protoc-c -I tests/install/codegen --c_out="$pkg_codegen" tests/install/codegen/greeter.proto

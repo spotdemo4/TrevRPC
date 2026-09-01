@@ -1,0 +1,12 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=@trevrpc_pc_libdir@
+includedir=@trevrpc_pc_includedir@
+trevrpc_engine_abi_version=@TREVRPC_ENGINE_ABI_VERSION@
+
+Name: trevrpc_engine
+Description: TrevRPC backend-independent event engine
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ltrevrpc_engine
+Libs.private: @CMAKE_THREAD_LIBS_INIT@
+Cflags: -I${includedir}

@@ -1,5 +1,36 @@
 cmake_minimum_required(VERSION 3.20)
-project(trevrpc-installed-cmake-consumer LANGUAGES C)
+project(trevrpc-installed-cmake-consumer LANGUAGES C CXX)
+
+option(TREVRPC_INSTALL_TEST_ENGINE_ONLY "Build only the installed engine consumer" OFF)
+option(TREVRPC_INSTALL_TEST_ENGINE_MSQUIC_ONLY "Build only the installed Engine consumers" OFF)
+
+find_package(trevrpc_engine CONFIG REQUIRED)
+if(NOT TREVRPC_ENGINE_ABI_VERSION EQUAL 1)
+    message(FATAL_ERROR "installed TrevRPC engine package does not expose Engine ABI 1")
+endif()
+add_executable(trevrpc-installed-engine-cmake-consumer engine_main.c)
+target_link_libraries(trevrpc-installed-engine-cmake-consumer PRIVATE trevrpc::trevrpc_engine)
+
+if(TREVRPC_INSTALL_TEST_ENGINE_ONLY)
+    return()
+endif()
+
+find_package(trevrpc_engine_msquic CONFIG REQUIRED)
+if(NOT TREVRPC_ENGINE_MSQUIC_ABI_VERSION EQUAL 1)
+    message(FATAL_ERROR "installed TrevRPC MsQuic engine package does not expose provider ABI 1")
+endif()
+add_executable(trevrpc-installed-engine-msquic-cmake-consumer engine_msquic_main.c)
+target_link_libraries(trevrpc-installed-engine-msquic-cmake-consumer PRIVATE
+    trevrpc::trevrpc_engine_msquic
+)
+add_executable(trevrpc-installed-engine-msquic-cmake-cpp-consumer engine_msquic_main.cpp)
+target_link_libraries(trevrpc-installed-engine-msquic-cmake-cpp-consumer PRIVATE
+    trevrpc::trevrpc_engine_msquic
+)
+
+if(TREVRPC_INSTALL_TEST_ENGINE_MSQUIC_ONLY)
+    return()
+endif()
 
 find_package(trevrpc 0.1 CONFIG REQUIRED)
 if(NOT TREVRPC_C_ABI_VERSION EQUAL 6)

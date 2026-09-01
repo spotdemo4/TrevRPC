@@ -3,6 +3,7 @@
 
 #include "trevrpc_owned_bytes_internal.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -31,6 +32,7 @@ typedef struct trevrpc_frame_parser {
     trevrpc_frame_alloc_fn alloc;
     trevrpc_frame_free_fn dealloc;
     void* allocator_context;
+    bool retain_on_allocation_failure;
 } trevrpc_frame_parser;
 
 void trevrpc_frame_parser_init(trevrpc_frame_parser* parser, size_t max_body_len);
@@ -40,6 +42,7 @@ void trevrpc_frame_parser_init_with_allocator(trevrpc_frame_parser* parser,
     trevrpc_frame_free_fn dealloc,
     void* allocator_context);
 void trevrpc_frame_parser_set_max_body_len(trevrpc_frame_parser* parser, size_t max_body_len);
+void trevrpc_frame_parser_set_retain_on_allocation_failure(trevrpc_frame_parser* parser, bool retain);
 trevrpc_frame_result trevrpc_frame_parser_consume(trevrpc_frame_parser* parser,
     const uint8_t* data,
     size_t len,
