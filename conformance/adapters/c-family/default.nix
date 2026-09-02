@@ -72,6 +72,8 @@ stdenv.mkDerivation (final: {
     runHook postInstallCheck
   '';
 
+  passthru.msquicProvider = libmsquic;
+
   meta = {
     description = "C and C++ TrevRPC conformance process peers";
     license = lib.licenses.mit;

@@ -31,6 +31,7 @@
 #define SEEN_REPLACEMENT_STREAM 0x0100u
 #define SEEN_REPLACEMENT_PEER_STREAM 0x0200u
 #define SEEN_CLIENT_SEND_SECOND 0x0400u
+#define SEEN_REPLACEMENT_READABLE 0x0800u
 
 typedef struct observations {
     trevrpc_engine_handle_v1 client_connection;
@@ -101,6 +102,10 @@ static void pump_until(
                     info.subject.slot == observed->server_stream.slot &&
                     info.subject.generation == observed->server_stream.generation) {
                     observed->seen |= SEEN_SERVER_READABLE;
+                } else if (info.subject.owner == observed->replacement_peer_stream.owner &&
+                           info.subject.slot == observed->replacement_peer_stream.slot &&
+                           info.subject.generation == observed->replacement_peer_stream.generation) {
+                    observed->seen |= SEEN_REPLACEMENT_READABLE;
                 } else {
                     observed->seen |= SEEN_CLIENT_READABLE;
                 }
@@ -121,6 +126,19 @@ static trevrpc_engine_receive* check_receive(
     assert(info.data_len == expected_len);
     assert(memcmp(info.data, expected, expected_len) == 0);
     return receive;
+}
+
+static void wait_for_pending_sends(trevrpc_engine* adapter) {
+    uint64_t deadline = monotonic_millis() + 10000;
+    for (;;) {
+        trevrpc_engine_diagnostics_v1 diagnostics;
+        assert(trevrpc_engine_diagnostics_v1_init(&diagnostics, sizeof(diagnostics)) == 0);
+        assert(trevrpc_engine_get_diagnostics_v1(adapter, &diagnostics) == 0);
+        if (diagnostics.pending_send_count == 0) {
+            return;
+        }
+        assert(monotonic_millis() < deadline);
+    }
 }
 
 int main(void) {
@@ -175,16 +193,7 @@ int main(void) {
     static const uint8_t second_request = 0;
     assert(trevrpc_engine_stream_send_frame_v1(adapter, observed.client_stream, 3, request, sizeof(request) - 1) == 0);
 
-    uint64_t completion_deadline = monotonic_millis() + 10000;
-    for (;;) {
-        trevrpc_engine_diagnostics_v1 diagnostics;
-        assert(trevrpc_engine_diagnostics_v1_init(&diagnostics, sizeof(diagnostics)) == 0);
-        assert(trevrpc_engine_get_diagnostics_v1(adapter, &diagnostics) == 0);
-        if (diagnostics.pending_send_count == 0) {
-            break;
-        }
-        assert(monotonic_millis() < completion_deadline);
-    }
+    wait_for_pending_sends(adapter);
     assert(trevrpc_engine_stream_send_frame_v1(
                adapter, observed.client_stream, 3, &second_request, sizeof(second_request) - 1) == 0);
 
@@ -196,11 +205,11 @@ int main(void) {
     observed.seen &= ~SEEN_SERVER_READABLE;
     trevrpc_engine_receive* request_receive =
         check_receive(adapter, observed.server_stream, request, sizeof(request) - 1);
-    trevrpc_engine_receive_release(request_receive);
     pump_until(adapter, &wake, &observed, SEEN_SERVER_READABLE);
     trevrpc_engine_receive* second_request_receive =
         check_receive(adapter, observed.server_stream, &second_request, sizeof(second_request) - 1);
     trevrpc_engine_receive_release(second_request_receive);
+    trevrpc_engine_receive_release(request_receive);
 
     static const uint8_t response[] = "response";
     assert(
@@ -242,14 +251,30 @@ int main(void) {
     } else {
         assert(observed.replacement_stream.generation != observed.server_stream.generation);
     }
-    pump_until(adapter, &wake, &observed, SEEN_REPLACEMENT_STREAM);
+    pump_until(adapter, &wake, &observed, SEEN_REPLACEMENT_STREAM | SEEN_REPLACEMENT_PEER_STREAM);
     detached_receive = check_receive(adapter, observed.client_stream, response, sizeof(response) - 1);
     trevrpc_engine_receive* exhausted_receive = NULL;
     assert(trevrpc_engine_stream_receive_frame(adapter, observed.client_stream, &exhausted_receive) == -ESTALE);
     assert(exhausted_receive == NULL);
-    assert(trevrpc_engine_stream_close(adapter, observed.replacement_stream) == 0);
+
+    static const uint8_t burst_payload[] = "burst";
+    assert(trevrpc_engine_stream_send_frame_v1(
+               adapter, observed.replacement_stream, 6, burst_payload, sizeof(burst_payload) - 1) == 0);
+    pump_until(adapter, &wake, &observed, SEEN_REPLACEMENT_READABLE);
+    for (uint64_t operation_id = 7; operation_id < 23; operation_id++) {
+        assert(trevrpc_engine_stream_send_frame_v1(
+                   adapter, observed.replacement_stream, operation_id, burst_payload, sizeof(burst_payload) - 1) == 0);
+    }
+    wait_for_pending_sends(adapter);
+    trevrpc_engine_diagnostics_v1 backpressure_diagnostics;
+    assert(trevrpc_engine_diagnostics_v1_init(&backpressure_diagnostics, sizeof(backpressure_diagnostics)) == 0);
+    assert(trevrpc_engine_get_diagnostics_v1(adapter, &backpressure_diagnostics) == 0);
+    assert(backpressure_diagnostics.terminal_status == 0);
+    assert(backpressure_diagnostics.receive_owned_count == 1);
+    assert(backpressure_diagnostics.peak_receive_owned_count == 1);
 
     assert(trevrpc_engine_connection_close(adapter, observed.client_connection, 0) == 0);
+    assert(trevrpc_engine_dial_cancel(adapter, observed.client_connection) == -EALREADY);
     assert(trevrpc_engine_connection_close(adapter, observed.server_connection, 0) == 0);
     assert(trevrpc_engine_listener_close(adapter, listener) == 0);
     assert(trevrpc_engine_close(adapter) == 0);

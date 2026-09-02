@@ -91,6 +91,10 @@ void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn);
 void trevrpc_msquic_conn_shutdown_error(trevrpc_msquic_conn* conn, uint64_t error_code);
 void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn);
 
+/*
+ * Callers must serialize close against starting any new stream operation.
+ * Close drains already-admitted reads and writes before destroying the stream.
+ */
 int trevrpc_msquic_stream_id(trevrpc_msquic_stream* stream, uint64_t* stream_id);
 intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_read_timeout(
@@ -101,11 +105,7 @@ intptr_t trevrpc_msquic_stream_read_frame_timeout(
     trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos);
 intptr_t trevrpc_msquic_stream_read_frame_ready(
     trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
-/*
- * Callers must serialize close against starting new write/send calls. Close
- * drains calls that have registered with the stream, then owns and destroys
- * the stream before returning.
- */
+/* Writes register with the stream so an already-admitted call is drained by close. */
 intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_write_fin(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
 /*

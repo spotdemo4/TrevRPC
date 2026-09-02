@@ -29,6 +29,26 @@
     trevpkgs.libs.mkFlake (
       system: pkgs:
       let
+        msquicPatch = ./nix/patches/trevrpc-msquic-reset-at.patch;
+        libmsquic =
+          assert pkgs.libmsquic.version == "2.6.0";
+          pkgs.libmsquic.overrideAttrs (previous: {
+            patches = (previous.patches or [ ]) ++ [ msquicPatch ];
+            dontPatchELF = true;
+            passthru = (previous.passthru or { }) // {
+              trevrpcResetStreamAtPatch = msquicPatch;
+            };
+          });
+        callPackage =
+          assert builtins.length (
+            builtins.filter (patch: patch == msquicPatch) libmsquic.patches
+          ) == 1;
+          pkgs.newScope {
+            inherit libmsquic;
+          };
+        requireCanonicalMsquic = consumer:
+          assert consumer.passthru.msquicProvider == libmsquic;
+          consumer;
         benchmarkProtoGenerator = pkgs.writeShellApplication {
           name = "generate-trevrpc-benchmark-proto";
           runtimeInputs = with pkgs; [
@@ -74,13 +94,13 @@
           let
             cFamilyConformancePeers =
               if pkgs.stdenv.hostPlatform.isLinux then
-                pkgs.callPackage ./conformance/adapters/c-family {
+                callPackage ./conformance/adapters/c-family {
                   trevrpcCSrc = ./trevrpc-c;
                   trevrpcCppSrc = ./trevrpc-cpp;
                 }
               else
                 null;
-            c = pkgs.callPackage ./trevrpc-c {
+            c = callPackage ./trevrpc-c {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
@@ -90,7 +110,7 @@
                 }
               ];
             };
-            cpp = pkgs.callPackage ./trevrpc-cpp {
+            cpp = callPackage ./trevrpc-cpp {
               benchProto = ./bench/proto;
               trevrpcC = c;
               peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
@@ -100,7 +120,7 @@
                 }
               ];
             };
-            go = pkgs.callPackage ./trevrpc-go {
+            go = callPackage ./trevrpc-go {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
             };
@@ -109,26 +129,29 @@
               wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = c;
             };
-            kotlin = pkgs.callPackage ./trevrpc-kotlin {
+            kotlin = callPackage ./trevrpc-kotlin {
               licenseFile = ./LICENSE;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               greeterProto = ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto;
               trevrpcBench = bench;
             };
-            rust = pkgs.callPackage ./trevrpc-rust {
+            rust = callPackage ./trevrpc-rust {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
             };
-            bench = pkgs.callPackage ./bench {
+            bench = callPackage ./bench {
               conformanceSrc = ./conformance;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               sourceCommit = self.rev or (self.dirtyRev or "unversioned");
               sourceDirty = if self ? rev then "false" else "true";
             };
-            browserBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
+            browserBenchPeer = callPackage ./trevrpc-js/bench-browser {
               trevrpcJs = js;
             };
           in
+          assert c.passthru.msquicProvider == libmsquic;
+          assert cFamilyConformancePeers == null
+            || cFamilyConformancePeers.passthru.msquicProvider == libmsquic;
           {
             trevrpc-c = c;
             trevrpc-cpp = cpp;
@@ -180,60 +203,61 @@
                 break
               done
             '';
-            packages = with pkgs; [
-              # rust
-              rustc
-              cargo
-              clippy
-              cargo-audit
-              rustfmt
+            packages =
+              (with pkgs; [
+                # rust
+                rustc
+                cargo
+                clippy
+                cargo-audit
+                rustfmt
 
-              # go
-              go
-              gopls
-              gotools
-              go-tools
-              protobuf
+                # go
+                go
+                gopls
+                gotools
+                go-tools
+                protobuf
 
-              # c
-              cmake
-              ninja
-              gcc
-              clang-tools
-              openssl
-              pkg-config
-              protobufc
-              libmsquic
+                # c
+                cmake
+                ninja
+                gcc
+                clang-tools
+                openssl
+                pkg-config
+                protobufc
 
-              # javascript
-              nodejs_24
-              playwright-driver.browsers
-              oxlint
-              oxfmt
+                # javascript
+                nodejs_24
+                playwright-driver.browsers
+                oxlint
+                oxfmt
 
-              # kotlin / android
-              jdk25
-              gradle_9
-              androidenv.androidPkgs.androidsdk
-              kotlin-lsp
-              ktlint
-              protobuf
+                # kotlin / android
+                jdk25
+                gradle_9
+                androidenv.androidPkgs.androidsdk
+                kotlin-lsp
+                ktlint
+                protobuf
 
-              # python
-              python3
-              ruff
-              basedpyright
+                # python
+                python3
+                ruff
+                basedpyright
 
-              # nix
-              nixd
-              nixfmt
+                # nix
+                nixd
+                nixfmt
 
-              # util
-              treefmt
-              bumper
-              fix-hash
-              jq
-            ];
+                # util
+                treefmt
+                bumper
+                fix-hash
+                jq
+              ])
+              ++ [ libmsquic ];
           };
 
           bump = pkgs.mkShell {
@@ -401,38 +425,90 @@
         };
 
         # nix flake check
-        checks = pkgs.mkChecks {
-          benchmark-controller = packageSet.trevrpc-bench;
-
-          android-smoke-runner =
-            pkgs.runCommand "trevrpc-android-smoke-runner-tests"
-              {
-                nativeBuildInputs = [ pkgs.python3 ];
-              }
-              ''
-                ANDROID_SMOKE_RUNNER=${./bench/ci/run-android-smoke-cell.py} \
-                  python3 ${./bench/ci/tests/test_run_android_smoke_cell.py}
-                touch $out
-              '';
-
-          c-engine = pkgs.callPackage ./trevrpc-c/engine-check.nix { };
-          c-engine-msquic = pkgs.callPackage ./trevrpc-c/engine-msquic-check.nix { };
-
-          c = packageSet.trevrpc-c;
-          c-sanitizers = packageSet.trevrpc-c.override {
-            sanitizers = true;
-          };
-          ${if system == "x86_64-linux" then "c-tsan" else null} = packageSet.trevrpc-c.override {
-            threadSanitizer = true;
-          };
-          c-family-sanitizers =
-            (pkgs.callPackage ./conformance/adapters/c-family {
-              trevrpcCSrc = ./trevrpc-c;
-              trevrpcCppSrc = ./trevrpc-cpp;
-            }).override
-              {
-                sanitizers = true;
+        checks =
+          let
+            linuxBenchSuite = pkgs.symlinkJoin {
+              name = "trevrpc-linux-bench-check-suite";
+              paths = [
+                packageSet.trevrpc-c
+                packageSet.trevrpc-cpp
+                packageSet.trevrpc-go
+                packageSet.trevrpc-js
+                packageSet.trevrpc-kotlin
+                packageSet.trevrpc-rust
+                packageSet.trevrpc-bench
+                packageSet.trevrpc-browser-bench-peer
+              ];
+              meta.platforms = [ "x86_64-linux" ];
+            };
+            stockMsquicProviderCheck =
+              assert pkgs.libmsquic.drvPath != libmsquic.drvPath;
+              callPackage ./nix/checks/msquic-provider {
+                libmsquic = pkgs.libmsquic;
+                expectedDescriptor = false;
               };
+            draft07MsquicProviderCheck = requireCanonicalMsquic (
+              callPackage ./nix/checks/msquic-provider {
+                expectedDescriptor = true;
+                requestedMask = 1;
+              }
+            );
+            draft10MsquicProviderCheck = requireCanonicalMsquic (
+              callPackage ./nix/checks/msquic-provider {
+                expectedDescriptor = true;
+                requestedMask = 2;
+              }
+            );
+            bothMsquicProviderCheck = requireCanonicalMsquic (
+              callPackage ./nix/checks/msquic-provider {
+                expectedDescriptor = true;
+                requestedMask = 3;
+              }
+            );
+          in
+          pkgs.mkChecks {
+            benchmark-controller = packageSet.trevrpc-bench;
+
+            android-smoke-runner =
+              pkgs.runCommand "trevrpc-android-smoke-runner-tests"
+                {
+                  nativeBuildInputs = [ pkgs.python3 ];
+                }
+                ''
+                  ANDROID_SMOKE_RUNNER=${./bench/ci/run-android-smoke-cell.py} \
+                    python3 ${./bench/ci/tests/test_run_android_smoke_cell.py}
+                  touch $out
+                '';
+
+            c = packageSet.trevrpc-c;
+            c-engine = callPackage ./trevrpc-c/engine-check.nix { };
+            c-engine-msquic = requireCanonicalMsquic (
+              callPackage ./trevrpc-c/engine-msquic-check.nix { }
+            );
+            c-sanitizers = packageSet.trevrpc-c.override {
+              sanitizers = true;
+            };
+            ${if system == "x86_64-linux" then "c-tsan" else null} = packageSet.trevrpc-c.override {
+              threadSanitizer = true;
+            };
+            c-family-sanitizers = requireCanonicalMsquic (
+              (callPackage ./conformance/adapters/c-family {
+                trevrpcCSrc = ./trevrpc-c;
+                trevrpcCppSrc = ./trevrpc-cpp;
+              }).override
+                {
+                  sanitizers = true;
+                }
+            );
+
+            ${if system == "x86_64-linux" then "msquic-provider-stock" else null} =
+              stockMsquicProviderCheck;
+            ${if system == "x86_64-linux" then "msquic-provider-draft07" else null} =
+              draft07MsquicProviderCheck;
+            ${if system == "x86_64-linux" then "msquic-provider-draft10" else null} =
+              draft10MsquicProviderCheck;
+            ${if system == "x86_64-linux" then "msquic-provider-both" else null} =
+              bothMsquicProviderCheck;
 
           cpp = packageSet.trevrpc-cpp;
           cpp-sanitizers = packageSet.trevrpc-cpp.override {

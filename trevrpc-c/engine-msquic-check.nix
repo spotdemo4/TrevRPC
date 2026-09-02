@@ -112,4 +112,6 @@ stdenv.mkDerivation (final: {
     "$TMPDIR/engine-msquic-pkg-config-consumer"
     runHook postInstallCheck
   '';
+
+  passthru.msquicProvider = libmsquic;
 })

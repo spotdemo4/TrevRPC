@@ -212,6 +212,8 @@ stdenv.mkDerivation (
       runHook postInstallCheck
     '';
 
+    passthru.msquicProvider = libmsquic;
+
     meta = {
       mainProgram = "protoc-gen-trevrpc-c";
       description = "C runtime and code generator for TrevRPC";

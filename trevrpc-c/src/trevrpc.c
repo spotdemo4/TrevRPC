@@ -3864,8 +3864,14 @@ int trevrpc_internal_server_listen(const trevrpc_server_config_internal* config,
         trevrpc_internal_server_close(server);
         return -EINVAL;
     }
-    err = trevrpc_msquic_listen_alpns(
-        effective.host, effective.port, &msquic_config, alpns, alpn_count, &server->shared_listener);
+    trevrpc_msquic_feature_request features = trevrpc_msquic_default_h3_features();
+    err = trevrpc_msquic_listen_alpns_features(effective.host,
+        effective.port,
+        &msquic_config,
+        alpns,
+        alpn_count,
+        &features,
+        &server->shared_listener);
     if (err != 0) {
         trevrpc_internal_server_close(server);
         return err;

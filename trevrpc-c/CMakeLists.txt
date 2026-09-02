@@ -220,13 +220,20 @@ endif()
 
 if(TREVRPC_BUILD_MSQUIC)
     list(APPEND trevrpc_install_targets trevrpc_msquic_api_owner)
-    add_library(trevrpc_msquic_native_core STATIC src/trevrpc_msquic_core.c)
+    add_library(trevrpc_msquic_native_core STATIC
+        src/trevrpc_msquic_core.c
+        src/trevrpc_msquic_features.c
+    )
     target_include_directories(trevrpc_msquic_native_core PRIVATE include src)
     target_link_libraries(trevrpc_msquic_native_core
         PUBLIC Threads::Threads trevrpc_core
         PRIVATE trevrpc_msquic_api_owner msquic::msquic
     )
-    target_compile_definitions(trevrpc_msquic_native_core PRIVATE QUIC_API_ENABLE_PREVIEW_FEATURES)
+    target_compile_definitions(trevrpc_msquic_native_core PRIVATE
+        QUIC_API_ENABLE_PREVIEW_FEATURES
+        QUIC_API_ENABLE_VERSIONED_FEATURES=1
+        TREVRPC_MSQUIC_PROVIDER_CAPABILITIES
+    )
     trevrpc_c_warnings(trevrpc_msquic_native_core)
     trevrpc_c_sanitizers(trevrpc_msquic_native_core)
     list(APPEND trevrpc_install_targets trevrpc_msquic_native_core)
@@ -245,8 +252,15 @@ if(TREVRPC_BUILD_MSQUIC)
     trevrpc_c_sanitizers(trevrpc_msquic)
 
     if(TREVRPC_BUILD_TESTS)
-        add_library(trevrpc_msquic_testing STATIC src/trevrpc_msquic_core.c)
-        target_compile_definitions(trevrpc_msquic_testing PRIVATE TREVRPC_MSQUIC_TESTING)
+        add_library(trevrpc_msquic_testing STATIC
+            src/trevrpc_msquic_core.c
+            src/trevrpc_msquic_features.c
+        )
+        target_compile_definitions(trevrpc_msquic_testing PRIVATE
+            QUIC_API_ENABLE_VERSIONED_FEATURES=1
+            TREVRPC_MSQUIC_PROVIDER_CAPABILITIES
+            TREVRPC_MSQUIC_TESTING
+        )
         trevrpc_c_configure_msquic(trevrpc_msquic_testing)
         target_include_directories(trevrpc_msquic_testing PRIVATE src)
         target_link_libraries(trevrpc_msquic_testing PRIVATE trevrpc_msquic_api_owner)
@@ -297,7 +311,16 @@ if(TREVRPC_BUILD_WEBTRANSPORT)
     endif()
 
     add_library(trevrpc_webtransport STATIC
+        src/trevrpc_h3_demux.c
+        src/trevrpc_h3_ingress.c
+        src/trevrpc_http3_frame.c
+        src/trevrpc_http3_headers.c
+        src/trevrpc_http3_settings.c
+        src/trevrpc_qpack_static.c
+        src/trevrpc_quic_varint.c
         src/trevrpc_webtransport.c
+        src/trevrpc_webtransport_capsule.c
+        src/trevrpc_webtransport_profile.c
     )
     target_include_directories(trevrpc_webtransport
         PUBLIC
@@ -346,8 +369,18 @@ if(TREVRPC_BUILD_RUNTIME)
             src/trevrpc_channel.c
             src/trevrpc_lifetime.c
             src/trevrpc_versioned_runtime.c
+            src/trevrpc_h3_demux.c
+            src/trevrpc_h3_ingress.c
+            src/trevrpc_http3_frame.c
+            src/trevrpc_http3_headers.c
+            src/trevrpc_http3_settings.c
+            src/trevrpc_qpack_static.c
+            src/trevrpc_quic_varint.c
             src/trevrpc_webtransport.c
+            src/trevrpc_webtransport_capsule.c
+            src/trevrpc_webtransport_profile.c
         )
+        target_compile_definitions(trevrpc_msquic_testing_runtime PRIVATE TREVRPC_H3_FRAME_POLICY_TESTING)
         trevrpc_c_configure_runtime(trevrpc_msquic_testing_runtime trevrpc_msquic_testing)
     endif()
 endif()
@@ -678,6 +711,119 @@ if(TREVRPC_BUILD_TESTS)
     enable_testing()
     enable_language(CXX)
 
+    add_executable(trevrpc_h3_demux_test
+        tests/h3_demux_test.c
+        src/trevrpc_h3_demux.c
+        src/trevrpc_msquic_features.c
+        src/trevrpc_quic_varint.c
+        src/trevrpc_webtransport_profile.c
+    )
+    target_include_directories(trevrpc_h3_demux_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_h3_demux_test)
+    trevrpc_c_sanitizers(trevrpc_h3_demux_test)
+    add_test(NAME trevrpc_h3_demux COMMAND trevrpc_h3_demux_test)
+
+    add_executable(trevrpc_h3_ingress_test
+        tests/h3_ingress_test.c
+        src/trevrpc_h3_ingress.c
+        src/trevrpc_h3_demux.c
+        src/trevrpc_msquic_features.c
+        src/trevrpc_quic_varint.c
+        src/trevrpc_webtransport_profile.c
+    )
+    target_compile_definitions(trevrpc_h3_ingress_test PRIVATE TREVRPC_H3_INGRESS_TESTING)
+    target_include_directories(trevrpc_h3_ingress_test PRIVATE include src)
+    target_link_libraries(trevrpc_h3_ingress_test PRIVATE Threads::Threads)
+    trevrpc_c_warnings(trevrpc_h3_ingress_test)
+    trevrpc_c_sanitizers(trevrpc_h3_ingress_test)
+    add_test(NAME trevrpc_h3_ingress COMMAND trevrpc_h3_ingress_test)
+    set_tests_properties(trevrpc_h3_ingress PROPERTIES TIMEOUT 30)
+
+    add_executable(trevrpc_http3_frame_test
+        tests/http3_frame_test.c
+        src/trevrpc_http3_frame.c
+        src/trevrpc_quic_varint.c
+    )
+    target_include_directories(trevrpc_http3_frame_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_http3_frame_test)
+    trevrpc_c_sanitizers(trevrpc_http3_frame_test)
+    add_test(NAME trevrpc_http3_frame COMMAND trevrpc_http3_frame_test)
+
+    if(TREVRPC_BUILD_RUNTIME)
+        add_executable(trevrpc_http3_frame_policy_test tests/http3_frame_policy_test.c)
+        target_include_directories(trevrpc_http3_frame_policy_test PRIVATE include src)
+        target_link_libraries(trevrpc_http3_frame_policy_test PRIVATE trevrpc_msquic_testing_runtime)
+        trevrpc_c_warnings(trevrpc_http3_frame_policy_test)
+        trevrpc_c_sanitizers(trevrpc_http3_frame_policy_test)
+        add_test(NAME trevrpc_http3_frame_policy COMMAND trevrpc_http3_frame_policy_test)
+    endif()
+
+    add_executable(trevrpc_http3_headers_test
+        tests/http3_headers_test.c
+        src/trevrpc_http3_headers.c
+    )
+    target_include_directories(trevrpc_http3_headers_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_http3_headers_test)
+    trevrpc_c_sanitizers(trevrpc_http3_headers_test)
+    add_test(NAME trevrpc_http3_headers COMMAND trevrpc_http3_headers_test)
+
+    add_executable(trevrpc_http3_settings_test
+        tests/http3_settings_test.c
+        src/trevrpc_http3_settings.c
+        src/trevrpc_quic_varint.c
+    )
+    target_include_directories(trevrpc_http3_settings_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_http3_settings_test)
+    trevrpc_c_sanitizers(trevrpc_http3_settings_test)
+    add_test(NAME trevrpc_http3_settings COMMAND trevrpc_http3_settings_test)
+
+    add_executable(trevrpc_qpack_static_test
+        tests/qpack_static_test.c
+        src/trevrpc_qpack_static.c
+    )
+    target_include_directories(trevrpc_qpack_static_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_qpack_static_test)
+    trevrpc_c_sanitizers(trevrpc_qpack_static_test)
+    add_test(NAME trevrpc_qpack_static COMMAND trevrpc_qpack_static_test)
+
+    add_executable(trevrpc_quic_varint_test
+        tests/quic_varint_test.c
+        src/trevrpc_quic_varint.c
+    )
+    target_include_directories(trevrpc_quic_varint_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_quic_varint_test)
+    trevrpc_c_sanitizers(trevrpc_quic_varint_test)
+    add_test(NAME trevrpc_quic_varint COMMAND trevrpc_quic_varint_test)
+
+    add_executable(trevrpc_msquic_features_test
+        tests/msquic_features_test.c
+        src/trevrpc_msquic_features.c
+    )
+    target_include_directories(trevrpc_msquic_features_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_msquic_features_test)
+    trevrpc_c_sanitizers(trevrpc_msquic_features_test)
+    add_test(NAME trevrpc_msquic_features COMMAND trevrpc_msquic_features_test)
+
+    add_executable(trevrpc_webtransport_profile_test
+        tests/webtransport_profile_test.c
+        src/trevrpc_msquic_features.c
+        src/trevrpc_webtransport_profile.c
+    )
+    target_include_directories(trevrpc_webtransport_profile_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_webtransport_profile_test)
+    trevrpc_c_sanitizers(trevrpc_webtransport_profile_test)
+    add_test(NAME trevrpc_webtransport_profile COMMAND trevrpc_webtransport_profile_test)
+
+    add_executable(trevrpc_webtransport_capsule_test
+        tests/webtransport_capsule_test.c
+        src/trevrpc_webtransport_capsule.c
+        src/trevrpc_quic_varint.c
+    )
+    target_include_directories(trevrpc_webtransport_capsule_test PRIVATE src)
+    trevrpc_c_warnings(trevrpc_webtransport_capsule_test)
+    trevrpc_c_sanitizers(trevrpc_webtransport_capsule_test)
+    add_test(NAME trevrpc_webtransport_capsule COMMAND trevrpc_webtransport_capsule_test)
+
     if(TREVRPC_BUILD_ENGINE)
         add_executable(trevrpc_engine_api_test tests/engine-abi1/public_api.c)
         target_link_libraries(trevrpc_engine_api_test PRIVATE trevrpc_engine)
@@ -769,6 +915,22 @@ if(TREVRPC_BUILD_TESTS)
         set_tests_properties(trevrpc_engine_msquic_smoke PROPERTIES TIMEOUT 30)
         trevrpc_c_lsan_suppressions(trevrpc_engine_msquic_smoke)
         trevrpc_c_tsan_suppressions(trevrpc_engine_msquic_smoke)
+
+        add_executable(trevrpc_engine_msquic_backpressure_test tests/engine_msquic_backpressure_test.c)
+        target_compile_definitions(trevrpc_engine_msquic_backpressure_test PRIVATE QUIC_API_ENABLE_PREVIEW_FEATURES)
+        target_include_directories(trevrpc_engine_msquic_backpressure_test PRIVATE include src)
+        target_link_libraries(trevrpc_engine_msquic_backpressure_test PRIVATE
+            trevrpc_engine
+            trevrpc_engine_msquic_support
+            Threads::Threads
+            msquic::msquic
+        )
+        trevrpc_c_warnings(trevrpc_engine_msquic_backpressure_test)
+        trevrpc_c_sanitizers(trevrpc_engine_msquic_backpressure_test)
+        add_test(NAME trevrpc_engine_msquic_backpressure COMMAND trevrpc_engine_msquic_backpressure_test)
+        set_tests_properties(trevrpc_engine_msquic_backpressure PROPERTIES TIMEOUT 30)
+        trevrpc_c_lsan_suppressions(trevrpc_engine_msquic_backpressure)
+        trevrpc_c_tsan_suppressions(trevrpc_engine_msquic_backpressure)
     endif()
 
     add_test(NAME trevrpc_abi6_source_surface

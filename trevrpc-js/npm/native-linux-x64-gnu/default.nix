@@ -113,6 +113,8 @@ stdenv.mkDerivation (final: {
     runHook postInstallCheck
   '';
 
+  passthru.msquicProvider = libmsquic;
+
   meta = {
     description = "Portable TrevRPC native Node addon for Linux x86-64 glibc";
     license = lib.licenses.mit;
