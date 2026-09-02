@@ -113,12 +113,17 @@ struct trevrpc_h3_ingress_runtime {
  * detaching and reclaiming its implementation, but retains the tombstone so an
  * already-started call can never alias a later allocation at the same address.
  * The registry lock serializes implementation acquisition with detachment.
+ * A released tombstone moves to a graveyard list: admission walks only live
+ * handles, while the tombstone memory stays allocated (never freed, never
+ * reused) so a stale raw pointer can only fail the membership check.
  */
 static pthread_mutex_t trevrpc_h3_ingress_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t trevrpc_h3_ingress_registry_cond = PTHREAD_COND_INITIALIZER;
 static trevrpc_h3_ingress* trevrpc_h3_ingress_registry_head;
+static trevrpc_h3_ingress* trevrpc_h3_ingress_graveyard_head;
 static _Thread_local trevrpc_h3_ingress_runtime* trevrpc_h3_ingress_shutdown_callback_runtime;
 #ifdef TREVRPC_H3_INGRESS_TESTING
+static size_t trevrpc_h3_ingress_test_released_count;
 static bool trevrpc_h3_ingress_test_recycle_runtime;
 static trevrpc_h3_ingress_runtime* trevrpc_h3_ingress_test_recycled_runtime;
 static pthread_mutex_t trevrpc_h3_ingress_test_timed_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1071,6 +1076,29 @@ size_t trevrpc_h3_ingress_test_runtime_reap_count(trevrpc_h3_ingress* handle) {
     pthread_mutex_unlock(&handle->test_admission_mutex);
     return count;
 }
+
+void trevrpc_h3_ingress_test_released_count_reset(void) {
+    pthread_mutex_lock(&trevrpc_h3_ingress_registry_mutex);
+    trevrpc_h3_ingress_test_released_count = 0;
+    pthread_mutex_unlock(&trevrpc_h3_ingress_registry_mutex);
+}
+
+size_t trevrpc_h3_ingress_test_released_count_get(void) {
+    pthread_mutex_lock(&trevrpc_h3_ingress_registry_mutex);
+    size_t count = trevrpc_h3_ingress_test_released_count;
+    pthread_mutex_unlock(&trevrpc_h3_ingress_registry_mutex);
+    return count;
+}
+
+size_t trevrpc_h3_ingress_test_registry_size(void) {
+    size_t size = 0;
+    pthread_mutex_lock(&trevrpc_h3_ingress_registry_mutex);
+    for (trevrpc_h3_ingress* node = trevrpc_h3_ingress_registry_head; node != NULL; node = node->registry_next) {
+        size++;
+    }
+    pthread_mutex_unlock(&trevrpc_h3_ingress_registry_mutex);
+    return size;
+}
 #endif
 
 #ifndef TREVRPC_H3_INGRESS_TESTING
@@ -1600,6 +1628,15 @@ void trevrpc_h3_ingress_release(trevrpc_h3_ingress* handle) {
     handle->runtime = NULL;
     handle->retired_runtime = runtime;
     handle->retired_reclaim_deferred = callback_reentry;
+    /* Move to the graveyard before the detach broadcast: admission must stop
+     * finding this handle, but its memory must stay allocated and reachable
+     * so a stale raw pointer cannot alias a future allocation. */
+    *slot = handle->registry_next;
+    handle->registry_next = trevrpc_h3_ingress_graveyard_head;
+    trevrpc_h3_ingress_graveyard_head = handle;
+#ifdef TREVRPC_H3_INGRESS_TESTING
+    trevrpc_h3_ingress_test_released_count++;
+#endif
     pthread_cond_broadcast(&trevrpc_h3_ingress_registry_cond);
     pthread_mutex_unlock(&trevrpc_h3_ingress_registry_mutex);
 

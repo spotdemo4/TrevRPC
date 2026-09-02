@@ -663,7 +663,7 @@ static int registry_get_with_policy(msquic_provider* adapter,
     }
     adapter_object* object = slot->object;
     bool unavailable = atomic_load_explicit(&object->closing, memory_order_acquire) || object->terminal_published;
-    int result = state_policy == REGISTRY_REQUIRE_OPEN && unavailable ? -EPIPE
+    int result = state_policy == REGISTRY_REQUIRE_OPEN && unavailable          ? -EPIPE
                  : require_ready && (!object->ready || object->handle == NULL) ? -EAGAIN
                                                                                : 0;
     if (result == 0) {
@@ -679,8 +679,7 @@ static int registry_get(msquic_provider* adapter,
     uint32_t expected_kind,
     adapter_object** out_object,
     bool require_ready) {
-    return registry_get_with_policy(
-        adapter, handle, expected_kind, out_object, require_ready, REGISTRY_REQUIRE_OPEN);
+    return registry_get_with_policy(adapter, handle, expected_kind, out_object, require_ready, REGISTRY_REQUIRE_OPEN);
 }
 
 typedef struct adapter_object_scope {
@@ -1060,12 +1059,8 @@ static int provider_dial_cancel(msquic_provider* adapter, trevrpc_engine_handle_
         return -EINVAL;
     }
     adapter_object* object = NULL;
-    int result = registry_get_with_policy(adapter,
-        connection_handle,
-        TREVRPC_ENGINE_OBJECT_CONNECTION,
-        &object,
-        false,
-        REGISTRY_ALLOW_UNAVAILABLE);
+    int result = registry_get_with_policy(
+        adapter, connection_handle, TREVRPC_ENGINE_OBJECT_CONNECTION, &object, false, REGISTRY_ALLOW_UNAVAILABLE);
     if (result != 0) {
         return result;
     }
@@ -2315,8 +2310,7 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
             bool fin_consumed = fin && accepted_total == event->RECEIVE.TotalBufferLength;
             event->RECEIVE.TotalBufferLength = accepted_total;
             if (fin_consumed) {
-                publish_receive_fin(
-                    stream, clean ? TREVRPC_ENGINE_EVENT_FLAG_CLEAN_FIN : 0, clean ? 0 : -EPROTO);
+                publish_receive_fin(stream, clean ? TREVRPC_ENGINE_EVENT_FLAG_CLEAN_FIN : 0, clean ? 0 : -EPROTO);
                 if (!clean) {
                     adapter->api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
                 }

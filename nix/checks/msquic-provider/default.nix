@@ -5,7 +5,13 @@
   expectedDescriptor,
   requestedMask ? null,
 }:
-assert expectedDescriptor -> builtins.elem requestedMask [ 1 2 3 ];
+assert
+  expectedDescriptor
+  -> builtins.elem requestedMask [
+    1
+    2
+    3
+  ];
 assert (!expectedDescriptor) -> requestedMask == null;
 stdenv.mkDerivation {
   pname =

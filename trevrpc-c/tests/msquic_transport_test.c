@@ -1800,10 +1800,8 @@ typedef enum test_invalid_connect_response_kind {
     TEST_CONNECT_RESPONSE_INVALID_CONTENT_LENGTH,
 } test_invalid_connect_response_kind;
 
-static int test_build_invalid_connect_response(uint8_t* out,
-    size_t out_len,
-    size_t* out_written,
-    test_invalid_connect_response_kind kind) {
+static int test_build_invalid_connect_response(
+    uint8_t* out, size_t out_len, size_t* out_written, test_invalid_connect_response_kind kind) {
     size_t block_offset = 0;
     size_t offset = 0;
     uint8_t block[128];

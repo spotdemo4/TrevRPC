@@ -391,8 +391,7 @@ static int test_protocol_errors_and_terminal(void) {
         CHECK(trevrpc_h3_demux_stream_feed(
                   &stream, &no_webtransport, truncated_unknown_cases[i], truncated_unknown_lengths[i], &result) ==
               TREV_H3_DEMUX_NEED_MORE);
-        CHECK(trevrpc_h3_demux_stream_terminal(&stream, &no_webtransport, &result) ==
-              TREV_H3_DEMUX_PROTOCOL_ERROR);
+        CHECK(trevrpc_h3_demux_stream_terminal(&stream, &no_webtransport, &result) == TREV_H3_DEMUX_PROTOCOL_ERROR);
         CHECK(result.application_error == TREV_H3_DEMUX_APP_FRAME_ERROR);
     }
     return 0;

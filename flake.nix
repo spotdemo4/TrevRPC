@@ -40,13 +40,12 @@
             };
           });
         callPackage =
-          assert builtins.length (
-            builtins.filter (patch: patch == msquicPatch) libmsquic.patches
-          ) == 1;
+          assert builtins.length (builtins.filter (patch: patch == msquicPatch) libmsquic.patches) == 1;
           pkgs.newScope {
             inherit libmsquic;
           };
-        requireCanonicalMsquic = consumer:
+        requireCanonicalMsquic =
+          consumer:
           assert consumer.passthru.msquicProvider == libmsquic;
           consumer;
         benchmarkProtoGenerator = pkgs.writeShellApplication {
@@ -482,9 +481,7 @@
 
             c = packageSet.trevrpc-c;
             c-engine = callPackage ./trevrpc-c/engine-check.nix { };
-            c-engine-msquic = requireCanonicalMsquic (
-              callPackage ./trevrpc-c/engine-msquic-check.nix { }
-            );
+            c-engine-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/engine-msquic-check.nix { });
             c-sanitizers = packageSet.trevrpc-c.override {
               sanitizers = true;
             };
@@ -501,14 +498,12 @@
                 }
             );
 
-            ${if system == "x86_64-linux" then "msquic-provider-stock" else null} =
-              stockMsquicProviderCheck;
+            ${if system == "x86_64-linux" then "msquic-provider-stock" else null} = stockMsquicProviderCheck;
             ${if system == "x86_64-linux" then "msquic-provider-draft07" else null} =
               draft07MsquicProviderCheck;
             ${if system == "x86_64-linux" then "msquic-provider-draft10" else null} =
               draft10MsquicProviderCheck;
-            ${if system == "x86_64-linux" then "msquic-provider-both" else null} =
-              bothMsquicProviderCheck;
+            ${if system == "x86_64-linux" then "msquic-provider-both" else null} = bothMsquicProviderCheck;
 
           cpp = packageSet.trevrpc-cpp;
           cpp-sanitizers = packageSet.trevrpc-cpp.override {

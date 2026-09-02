@@ -3187,6 +3187,75 @@ cleanup:
     return result;
 }
 
+static int test_release_unlinks_tombstone_and_bounds_registry(void) {
+    int result = 1;
+    fake_conn conn;
+    bool conn_initialized = false;
+    trevrpc_h3_ingress* live = NULL;
+    trevrpc_h3_ingress* released = NULL;
+    admitted_api_call call = {.kind = ADMITTED_API_START};
+    pthread_t call_thread;
+    bool call_started = false;
+    size_t baseline = 0;
+    size_t baseline_released = 0;
+
+    CHECK_GOTO(fake_conn_init(&conn) == 0);
+    conn_initialized = true;
+    trevrpc_h3_ingress_config config = test_config(1, 1);
+
+    trevrpc_h3_ingress_test_released_count_reset();
+    CHECK_GOTO(trevrpc_h3_ingress_create_with_ops(&conn, &fake_ops, &config, &live) == 0);
+    baseline = trevrpc_h3_ingress_test_registry_size();
+    baseline_released = trevrpc_h3_ingress_test_released_count_get();
+
+    /*
+     * Churn: create/release a handle while a stale call is paused before its
+     * registry reference. Each release must move the tombstone out of the
+     * live registry (which admission walks) into the graveyard while keeping
+     * its memory allocated, and the stale call must still fail closed with
+     * -EPIPE on the membership check.
+     */
+    for (size_t i = 0; i < 16; i++) {
+        CHECK_GOTO(trevrpc_h3_ingress_create_with_ops(&conn, &fake_ops, &config, &released) == 0);
+        CHECK_GOTO(released != NULL);
+        call.runtime = released;
+        trevrpc_h3_ingress_test_pause_before_reference(released, 1);
+        CHECK_GOTO(pthread_create(&call_thread, NULL, admitted_api_call_main, &call) == 0);
+        call_started = true;
+        trevrpc_h3_ingress_test_wait_before_reference_paused(released);
+
+        trevrpc_h3_ingress_release(released);
+        CHECK_GOTO(trevrpc_h3_ingress_test_registry_size() == baseline);
+        CHECK_GOTO(trevrpc_h3_ingress_test_released_count_get() == baseline_released + i + 1);
+
+        trevrpc_h3_ingress_test_pause_before_reference(released, 0);
+        CHECK_GOTO(pthread_join(call_thread, NULL) == 0);
+        call_started = false;
+        CHECK_GOTO(call.result == -EPIPE);
+
+        trevrpc_h3_ingress_release(released);
+        released = NULL;
+        CHECK_GOTO(trevrpc_h3_ingress_test_registry_size() == baseline);
+        CHECK_GOTO(trevrpc_h3_ingress_test_released_count_get() == baseline_released + i + 1);
+    }
+
+    CHECK_GOTO(
+        trevrpc_h3_ingress_publish_peer_settings(live, TREV_H3_INGRESS_SETTINGS_READY, TREV_WT_PROFILE_NONE, 0) == 0);
+    result = 0;
+
+cleanup:
+    if (call_started) {
+        trevrpc_h3_ingress_test_pause_before_reference(call.runtime, 0);
+        (void)pthread_join(call_thread, NULL);
+    }
+    trevrpc_h3_ingress_release(released);
+    trevrpc_h3_ingress_release(live);
+    if (conn_initialized) {
+        fake_conn_destroy(&conn);
+    }
+    return result;
+}
+
 int main(void) {
     int (*const tests[])(void) = {
         test_handoff_unclassified_bidi_skips_classifier,
@@ -3229,6 +3298,7 @@ int main(void) {
         test_release_waits_for_concurrent_shutdown_leader,
         test_shutdown_callbacks_allow_synchronous_release_reentry,
         test_internal_shutdown_callback_reentry_reaps_after_thread_exit,
+        test_release_unlinks_tombstone_and_bounds_registry,
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         int err = tests[i]();
