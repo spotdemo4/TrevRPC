@@ -28,7 +28,7 @@ let
 in
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin";
-  version = "0.3.2";
+  version = "0.3.3";
 
   src = lib.fileset.toSource {
     root = ../.;
