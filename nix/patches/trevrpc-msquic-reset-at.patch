@@ -1,0 +1,4070 @@
+--- a/docs/api/QUIC_CONNECTION_EVENT.md
++++ b/docs/api/QUIC_CONNECTION_EVENT.md
+@@ -25,7 +25,7 @@
+     QUIC_CONNECTION_EVENT_PEER_CERTIFICATE_RECEIVED         = 15    // Only with QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED set
+ 
+ #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+-    QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED         = 16,   // Only indicated if QUIC_SETTINGS.ReliableResetEnabled is TRUE.
++    QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED         = 16,   // Only indicated for a nonzero requested RESET_STREAM_AT dialect mask.
+     QUIC_CONNECTION_EVENT_ONE_WAY_DELAY_NEGOTIATED          = 17,   // Only indicated if QUIC_SETTINGS.OneWayDelayEnabled is TRUE.
+     QUIC_CONNECTION_EVENT_NETWORK_STATISTICS                = 18,   // Only indicated if QUIC_SETTINGS.EnableNetStatsEvent is TRUE.
+ #endif
+@@ -107,6 +107,9 @@
+ #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+         struct {
+             BOOLEAN IsNegotiated;
++            uint32_t RequestedDialectMask;
++            uint32_t PeerDialectMask;
++            uint32_t NegotiatedDialectMask;
+         } RELIABLE_RESET_NEGOTIATED;
+         struct {
+             BOOLEAN SendNegotiated;             // TRUE if sending one-way delay timestamps is negotiated.
+@@ -407,15 +410,54 @@
+ 
+ **Preview feature**: This event is in [preview](../PreviewFeatures.md). It should be considered unstable and can be subject to breaking changes.
+ 
+-This event indicates the result of reliable reset negotiation. This is only indicated if QUIC_SETTINGS.ReliableResetEnabled is TRUE.
++This event reports RESET_STREAM_AT dialect negotiation for the live handshake.
++It is delivered exactly once when the local requested dialect mask is nonzero,
++even when no dialect is negotiated. The event is delivered before
++`QUIC_CONNECTION_EVENT_CONNECTED`. A peer receive-capability mask restored
++from a resumption ticket may authorize 0-RTT RESET_STREAM_AT sending, but it
++does not produce or influence this event; the reported fields come from the
++live handshake transport parameters.
+ 
+ ### RELIABLE_RESET_NEGOTIATED
+ 
+-Result of reliable reset negotiation is passed in the `RELIABLE_RESET_NEGOTIATED` struct/union.
++The negotiation result is passed in the `RELIABLE_RESET_NEGOTIATED`
++struct/union. The supported bits are
++`QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07` and
++`QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10`.
+ 
+ `IsNegotiated`
+ 
+-If TRUE, reliable reset has been negotiated.
++`TRUE` if and only if `NegotiatedDialectMask` is nonzero.
++
++`RequestedDialectMask`
++
++The immutable local configuration mask used for this connection. This is set
++with `QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK`; the deprecated
++`QUIC_SETTINGS.ReliableResetEnabled` field is shorthand for requesting both
++supported modern dialects unless an explicit configuration mask, including
++zero, overrides it.
++
++`PeerDialectMask`
++
++The exact modern dialects advertised by the peer in the live handshake. The
++draft-07 bit represents transport parameter `0x17f7586d2cb571`; the draft-10
++bit represents transport parameter `0x1d`.
++
++`NegotiatedDialectMask`
++
++The intersection of `RequestedDialectMask` and `PeerDialectMask`. This reports
++the modern transport-parameter identities common to both endpoints; it is not
++the directional frame-permission check. A nonzero `PeerDialectMask` permits
++local sending, and a nonzero `RequestedDialectMask` permits receiving from the
++peer. Both modern dialects use RESET_STREAM_AT frame type `0x24`, including when
++the requested and peer masks are disjoint. The stock MsQuic 2.6.0 legacy
++transport parameter `0x17f7586d2cb570` and frame type `0x21` are not supported
++by this API.
++
++The first RESET_STREAM_AT or RESET_STREAM commits an immutable Final Size and
++application error code. Later reset frames may only lower Reliable Size. Final
++Size is validated against stream and connection flow control, with missing bytes
++pre-accounted exactly once until received or discarded.
+ 
+ ## QUIC_CONNECTION_EVENT_ONE_WAY_DELAY_NEGOTIATED
+ 
+--- a/docs/PreviewFeatures.md
++++ b/docs/PreviewFeatures.md
+@@ -1,4 +1,4 @@
+-GPreview features
++Preview features
+ =========
+ > [!IMPORTANT]
+ >
+@@ -23,9 +23,54 @@
+ 
+ ## Current list of Preview features
+ 
+-### Reliable Reset Negotiated
++### RESET_STREAM_AT dialect negotiation
+ 
+-TODO
++MsQuic can request and negotiate either or both of the modern
++RESET_STREAM_AT dialects:
++
++| Dialect | Public mask bit | Transport parameter | Frame type |
++|---------|-----------------|---------------------|------------|
++| draft-07 | `QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07` (`1u << 0`) | `0x17f7586d2cb571` | `0x24` |
++| draft-10 | `QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10` (`1u << 1`) | `0x1d` | `0x24` |
++
++Applications attest runtime support by querying the get-only
++`QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS` descriptor. Version 1 reports
++the supported mask and the exact transport-parameter and frame identities.
++Applications then set `QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK`
++to zero, either dialect bit, or both bits. An explicit value, including zero,
++overrides the deprecated `QUIC_SETTINGS.ReliableResetEnabled` alias. Setting
++that Boolean to `TRUE` requests all supported modern dialects; setting it to
++`FALSE` requests none.
++
++Each endpoint advertises exactly its requested dialects. Because the transport
++parameter advertises support for receiving `RESET_STREAM_AT`, frame permission
++is directional: a nonzero peer mask permits local sending, while a nonzero
++local requested mask permits receiving from the peer. The two modern dialects
++share frame type `0x24`, so these permissions remain valid when the endpoints
++advertise different modern transport-parameter identities.
++
++For reporting, the negotiated mask is the intersection of the local requested
++mask and the exact dialects present in the peer's live-handshake transport
++parameters. When the local requested mask is nonzero,
++`QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED` is delivered exactly once
++before `QUIC_CONNECTION_EVENT_CONNECTED`, whether or not the intersection is
++empty. Its payload reports the requested, peer, and negotiated masks, and
++`IsNegotiated` is equivalent to a nonzero negotiated mask. The intersection is
++common-dialect metadata; it is not the directional frame-permission check.
++A peer receive-capability mask restored from a resumption ticket permits 0-RTT
++RESET_STREAM_AT sending. It does not produce the public negotiation event or
++its reported intersection; those remain tied to the live handshake transport
++parameters, which replace the remembered peer mask.
++
++The stock MsQuic 2.6.0 legacy dialect (transport parameter
++`0x17f7586d2cb570`, frame `0x21`) is deliberately neither advertised nor
++recognized as RESET_STREAM_AT support. This preview wave negotiates the modern
++wire identities and gates use of the `0x24` frame. The first reset commits an
++immutable Final Size and application error code; later reset frames may only
++reduce Reliable Size. Final Size is checked against stream and connection flow
++control, and senders defer the reset frame until that credit is available.
++Receivers continue delivering through the smallest Reliable Size before
++reporting the abrupt reset.
+ 
+ ### Oneway Delay Negotiated
+ 
+--- a/docs/Settings.md
++++ b/docs/Settings.md
+@@ -116,6 +116,12 @@
+ 
+ For more details see [QUIC_SETTINGS](./api/QUIC_SETTINGS.md).
+ 
++`QUIC_SETTINGS.ReliableResetEnabled` is a deprecated preview alias for the
++RESET_STREAM_AT dialect mask. `FALSE` requests no dialects and `TRUE` requests
++all supported modern dialects (draft-07 and draft-10). An explicit
++`QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK` value, including zero,
++takes precedence and does not modify the Boolean field.
++
+ # API Object Parameters
+ 
+ MsQuic API Objects have a number of settings, or parameters, which can be queried via [GetParam](api/GetParam.md), or can be set/modifed via [SetParam](api/SetParam.md).
+@@ -142,6 +148,7 @@
+ | `QUIC_PARAM_GLOBAL_VERSION_NEGOTIATION_ENABLED`<br> (preview) | uint8_t (BOOLEAN) | Both | Globally enable the version negotiation extension for all client and server connections. |
+ | `QUIC_PARAM_GLOBAL_STATELESS_RETRY_CONFIG`<br> 13    | [QUIC_STATELESS_RETRY_CONFIG](./api/QUIC_STATELESS_RETRY_CONFIG.md) | Set-Only | Configure the stateless retry token secret, key algorithm, and key rotation interval. The secret length *must* match the AEAD algorithm key length. |
+ | `QUIC_PARAM_GLOBAL_XDP_MAP_CONFIG`<br> 14 (preview) | QUIC_XDP_MAP_CONFIG[] | Both | Configures XDP maps per interface. If using maps, this parameter must be set prior to opening any registration. See [MsQuic over XDP](./XDP.md#api-quic_param_global_xdp_map_config). |
++| `QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS`<br> 15 (preview) | `QUIC_RESET_STREAM_AT_DIALECTS` | Get-only | Versioned runtime descriptor for RESET_STREAM_AT support. Version 1 reports supported mask `0x3`, draft-07 TP `0x17f7586d2cb571`, draft-10 TP `0x1d`, and frame type `0x24`. Applications should query this descriptor before setting a configuration mask. |
+ 
+ ## Registration Parameters
+ 
+@@ -161,6 +168,7 @@
+ | `QUIC_PARAM_CONFIGURATION_VERSION_SETTINGS`<br> 2                | QUIC_VERSIONS_SETTINGS                 | Both      | Change version settings for all connections on the configuration.                                                 |
+ | `QUIC_PARAM_CONFIGURATION_SCHANNEL_CREDENTIAL_ATTRIBUTE_W`<br> 3 | QUIC_SCHANNEL_CREDENTIAL_ATTRIBUTE_W   | Set-only  | Calls `SetCredentialsAttributesW` with the supplied attribute and buffer on the credential handle. Schannel-only. Only valid once the credential has been loaded.  |
+ | `QUIC_PARAM_CONFIGURATION_VERSION_NEG_ENABLED`<br> (preview)     | uint8_t (BOOLEAN)                      | Both      | Enables the version negotiation extension for all client connections on the configuration. |
++| `QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK`<br> 4 (preview) | uint32_t | Both | Advertises receive support for no RESET_STREAM_AT dialects (`0`), draft-07 (`1u << 0`), draft-10 (`1u << 1`), or both (`0x3`). The peer's nonzero live-handshake mask permits local sending; a remembered peer mask also permits 0-RTT sending during resumption. This local nonzero mask permits receiving. The reported negotiated mask is their intersection, but disjoint modern masks still permit the shared frame `0x24` directionally. Explicit zero overrides the deprecated Boolean alias. The legacy MsQuic 2.6.0 TP `0x17f7586d2cb570` and frame `0x21` are excluded. |
+ 
+ ## Listener Parameters
+ 
+--- a/src/core/configuration.c
++++ b/src/core/configuration.c
+@@ -16,6 +16,20 @@
+ #include "configuration.c.clog.h"
+ #endif
+ 
++static
++void
++QuicConfigurationUpdateResetStreamAtDialectMask(
++    _Inout_ QUIC_CONFIGURATION* Configuration
++    )
++{
++    if (!Configuration->ResetStreamAtDialectMaskExplicit) {
++        Configuration->ResetStreamAtDialectMask =
++            Configuration->Settings.ReliableResetEnabled
++                ? QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK
++                : 0;
++    }
++}
++
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ QUIC_STATUS
+ QUIC_API
+@@ -430,6 +444,8 @@
+         QuicSettingsLoad(&Configuration->Settings, Configuration->AppSpecificStorage);
+     }
+ 
++    QuicConfigurationUpdateResetStreamAtDialectMask(Configuration);
++
+     QuicTraceLogInfo(
+         ConfigurationSettingsUpdated,
+         "[cnfg][%p] Settings %p Updated",
+@@ -454,6 +470,18 @@
+     if (Param == QUIC_PARAM_CONFIGURATION_VERSION_SETTINGS) {
+         return QuicSettingsGetVersionSettings(&Configuration->Settings, BufferLength, (QUIC_VERSION_SETTINGS*)Buffer);
+     }
++    if (Param == QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK) {
++        if (*BufferLength < sizeof(uint32_t)) {
++            *BufferLength = sizeof(uint32_t);
++            return QUIC_STATUS_BUFFER_TOO_SMALL;
++        }
++        if (Buffer == NULL) {
++            return QUIC_STATUS_INVALID_PARAMETER;
++        }
++        *BufferLength = sizeof(uint32_t);
++        *(uint32_t*)Buffer = Configuration->ResetStreamAtDialectMask;
++        return QUIC_STATUS_SUCCESS;
++    }
+     if (Param  == QUIC_PARAM_CONFIGURATION_VERSION_NEG_ENABLED) {
+ 
+         if (*BufferLength < sizeof(BOOLEAN)) {
+@@ -516,6 +544,22 @@
+             return QUIC_STATUS_INVALID_PARAMETER;
+         }
+ 
++        QuicConfigurationUpdateResetStreamAtDialectMask(Configuration);
++        return QUIC_STATUS_SUCCESS;
++
++    case QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK:
++
++        if (Buffer == NULL || BufferLength != sizeof(uint32_t)) {
++            return QUIC_STATUS_INVALID_PARAMETER;
++        }
++
++        if ((*(const uint32_t*)Buffer &
++             ~QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK) != 0) {
++            return QUIC_STATUS_INVALID_PARAMETER;
++        }
++
++        Configuration->ResetStreamAtDialectMask = *(const uint32_t*)Buffer;
++        Configuration->ResetStreamAtDialectMaskExplicit = TRUE;
+         return QUIC_STATUS_SUCCESS;
+ 
+     case QUIC_PARAM_CONFIGURATION_VERSION_SETTINGS:
+--- a/src/core/configuration.h
++++ b/src/core/configuration.h
+@@ -98,6 +98,14 @@
+     //
+     QUIC_SETTINGS_INTERNAL Settings;
+ 
++    //
++    // Effective requested RESET_STREAM_AT dialects. This is stored separately
++    // from Settings so an explicit zero can override the deprecated Boolean
++    // compatibility alias.
++    //
++    uint32_t ResetStreamAtDialectMask;
++    BOOLEAN ResetStreamAtDialectMaskExplicit;
++
+     uint16_t AlpnListLength;
+     uint8_t AlpnList[0];
+ 
+--- a/src/core/connection.c
++++ b/src/core/connection.c
+@@ -51,6 +51,33 @@
+     _In_ const QUIC_SETTINGS_INTERNAL* NewSettings
+     );
+ 
++uint32_t
++QuicConnGetResetStreamAtRequestedDialectMask(
++    _In_ const QUIC_CONNECTION* Connection,
++    _In_ const QUIC_CONFIGURATION* Configuration
++    )
++{
++    return Configuration->ResetStreamAtDialectMaskExplicit
++        ? Configuration->ResetStreamAtDialectMask
++        : (Connection->Settings.ReliableResetEnabled
++            ? QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK
++            : 0);
++}
++
++BOOLEAN
++QuicConnIsResetStreamAtResumptionCompatible(
++    _In_ const QUIC_CONNECTION* Connection,
++    _In_ const QUIC_TRANSPORT_PARAMETERS* ResumedTP
++    )
++{
++    const uint64_t ResetStreamAtFlags =
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07 |
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10;
++    return
++        !(ResumedTP->Flags & ResetStreamAtFlags) ||
++        Connection->ResetStreamAtRequestedDialectMask != 0;
++}
++
+ _IRQL_requires_max_(DISPATCH_LEVEL)
+ _Must_inspect_result_
+ _Success_(return == QUIC_STATUS_SUCCESS)
+@@ -2044,6 +2071,8 @@
+     QuicSendReset(&Connection->Send);
+     QuicLossDetectionReset(&Connection->LossDetection);
+     QuicCryptoTlsCleanupTransportParameters(&Connection->PeerTransportParams);
++    Connection->ResetStreamAtPeerDialectMask = 0;
++    Connection->ResetStreamAtNegotiatedDialectMask = 0;
+ 
+     if (CompleteReset) {
+         CXPLAT_DBG_ASSERT(Connection->Configuration != NULL);
+@@ -2180,7 +2209,8 @@
+             ResumedTP.InitialMaxStreamDataBidiRemote > Connection->Settings.StreamRecvWindowBidiRemoteDefault ||
+             ResumedTP.InitialMaxStreamDataUni > Connection->Settings.StreamRecvWindowUnidiDefault ||
+             ResumedTP.InitialMaxUniStreams > Connection->Streams.Types[STREAM_ID_FLAG_IS_CLIENT | STREAM_ID_FLAG_IS_UNI_DIR].MaxTotalStreamCount ||
+-            ResumedTP.InitialMaxBidiStreams > Connection->Streams.Types[STREAM_ID_FLAG_IS_CLIENT | STREAM_ID_FLAG_IS_BI_DIR].MaxTotalStreamCount) {
++            ResumedTP.InitialMaxBidiStreams > Connection->Streams.Types[STREAM_ID_FLAG_IS_CLIENT | STREAM_ID_FLAG_IS_BI_DIR].MaxTotalStreamCount ||
++            !QuicConnIsResetStreamAtResumptionCompatible(Connection, &ResumedTP)) {
+             //
+             // Server settings have changed since the resumption ticket was
+             // encoded, so reject resumption.
+@@ -2396,8 +2426,13 @@
+         LocalTP->Flags |= QUIC_TP_FLAG_GREASE_QUIC_BIT;
+     }
+ 
+-    if (Connection->Settings.ReliableResetEnabled) {
+-        LocalTP->Flags |= QUIC_TP_FLAG_RELIABLE_RESET_ENABLED;
++    if (Connection->ResetStreamAtRequestedDialectMask &
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07) {
++        LocalTP->Flags |= QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07;
++    }
++    if (Connection->ResetStreamAtRequestedDialectMask &
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10) {
++        LocalTP->Flags |= QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10;
+     }
+ 
+     if (Connection->Settings.OneWayDelayEnabled) {
+@@ -2518,6 +2553,11 @@
+             &Configuration->Settings);
+     }
+ 
++    Connection->ResetStreamAtRequestedDialectMask =
++        QuicConnGetResetStreamAtRequestedDialectMask(
++            Connection,
++            Configuration);
++
+     if (QuicConnIsClient(Connection)) {
+ 
+         if (Connection->Stats.QuicVersion == 0) {
+@@ -2951,6 +2991,61 @@
+     return QUIC_STATUS_SUCCESS;
+ }
+ 
++void
++QuicConnProcessResetStreamAtNegotiation(
++    _Inout_ QUIC_CONNECTION* Connection,
++    _In_ BOOLEAN FromResumptionTicket
++    )
++{
++    uint32_t PeerDialectMask = 0;
++    if (Connection->PeerTransportParams.Flags &
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07) {
++        PeerDialectMask |= QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07;
++    }
++    if (Connection->PeerTransportParams.Flags &
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10) {
++        PeerDialectMask |= QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10;
++    }
++
++    Connection->ResetStreamAtPeerDialectMask = PeerDialectMask;
++    if (FromResumptionTicket) {
++        //
++        // A remembered peer receive capability authorizes 0-RTT sending. The
++        // public negotiation result and event remain tied to the live handshake,
++        // which will overwrite this mask when its transport parameters arrive.
++        //
++        return;
++    }
++
++    Connection->ResetStreamAtNegotiatedDialectMask =
++        Connection->ResetStreamAtRequestedDialectMask & PeerDialectMask;
++
++    if (Connection->ResetStreamAtRequestedDialectMask != 0 &&
++        !Connection->State.ResetStreamAtNegotiationEventEmitted) {
++        QUIC_CONNECTION_EVENT Event = {0};
++        Event.Type = QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED;
++        Event.RELIABLE_RESET_NEGOTIATED.RequestedDialectMask =
++            Connection->ResetStreamAtRequestedDialectMask;
++        Event.RELIABLE_RESET_NEGOTIATED.PeerDialectMask =
++            Connection->ResetStreamAtPeerDialectMask;
++        Event.RELIABLE_RESET_NEGOTIATED.NegotiatedDialectMask =
++            Connection->ResetStreamAtNegotiatedDialectMask;
++        Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated =
++            Event.RELIABLE_RESET_NEGOTIATED.NegotiatedDialectMask != 0;
++        Connection->State.ResetStreamAtNegotiationEventEmitted = TRUE;
++
++        QuicTraceLogConnVerbose(
++            IndicateReliableResetNegotiated,
++            Connection,
++            "Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu,Requested=0x%x,Peer=0x%x,Negotiated=0x%x]",
++            Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated,
++            Event.RELIABLE_RESET_NEGOTIATED.RequestedDialectMask,
++            Event.RELIABLE_RESET_NEGOTIATED.PeerDialectMask,
++            Event.RELIABLE_RESET_NEGOTIATED.NegotiatedDialectMask);
++        QuicConnIndicateEvent(Connection, &Event);
++    }
++}
++
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ QUIC_STATUS
+ QuicConnProcessPeerTransportParameters(
+@@ -2965,6 +3060,10 @@
+         "Peer Transport Parameters Set");
+     Connection->State.PeerTransportParameterValid = TRUE;
+ 
++    if (FromResumptionTicket) {
++        QuicConnProcessResetStreamAtNegotiation(Connection, TRUE);
++    }
++
+     if (Connection->PeerTransportParams.Flags & QUIC_TP_FLAG_ACTIVE_CONNECTION_ID_LIMIT) {
+         CXPLAT_DBG_ASSERT(Connection->PeerTransportParams.ActiveConnectionIdLimit >= QUIC_TP_ACTIVE_CONNECTION_ID_LIMIT_MIN);
+         if (Connection->SourceCidLimit > Connection->PeerTransportParams.ActiveConnectionIdLimit) {
+@@ -3038,24 +3137,7 @@
+             Connection->Stats.GreaseBitNegotiated = TRUE;
+         }
+ 
+-        if (Connection->Settings.ReliableResetEnabled) {
+-            Connection->State.ReliableResetStreamNegotiated =
+-                !!(Connection->PeerTransportParams.Flags & QUIC_TP_FLAG_RELIABLE_RESET_ENABLED);
+-
+-            //
+-            // Send event to app to indicate result of negotiation if app cares.
+-            //
+-            QUIC_CONNECTION_EVENT Event;
+-            Event.Type = QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED;
+-            Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated = Connection->State.ReliableResetStreamNegotiated;
+-
+-            QuicTraceLogConnVerbose(
+-                IndicateReliableResetNegotiated,
+-                Connection,
+-                "Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu]",
+-                Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated);
+-            QuicConnIndicateEvent(Connection, &Event);
+-        }
++        QuicConnProcessResetStreamAtNegotiation(Connection, FALSE);
+ 
+         if (Connection->Settings.OneWayDelayEnabled) {
+             Connection->State.TimestampSendNegotiated = // Peer wants to recv, so we can send
+@@ -6045,9 +6127,11 @@
+             QuicPacketLogDrop(Connection, Packet, "0-RTT rejected");
+             Packets->DeferredPacketsCount--;
+             *ReleaseChainTail = Packet;
++            Packet->Next = NULL;
+             ReleaseChainTail = (QUIC_RX_PACKET**)&Packet->Next;
+         } else {
+             *DeferredPacketsTail = Packet;
++            Packet->Next = NULL;
+             DeferredPacketsTail = (QUIC_RX_PACKET**)&Packet->Next;
+         }
+     }
+@@ -7652,6 +7736,13 @@
+         return FALSE;
+     }
+ 
++    if (!Connection->State.Started && Connection->Configuration != NULL) {
++        Connection->ResetStreamAtRequestedDialectMask =
++            QuicConnGetResetStreamAtRequestedDialectMask(
++                Connection,
++                Connection->Configuration);
++    }
++
+     if (!Connection->State.Started) {
+ 
+         Connection->Paths[0].SmoothedRtt = MS_TO_US(Connection->Settings.InitialRttMs);
+@@ -7705,23 +7796,8 @@
+             Connection->Stats.GreaseBitNegotiated = TRUE;
+         }
+ 
+-        if (QuicConnIsServer(Connection) && Connection->Settings.ReliableResetEnabled) {
+-            Connection->State.ReliableResetStreamNegotiated =
+-                !!(Connection->PeerTransportParams.Flags & QUIC_TP_FLAG_RELIABLE_RESET_ENABLED);
+-
+-            //
+-            // Send event to app to indicate result of negotiation if app cares.
+-            //
+-            QUIC_CONNECTION_EVENT Event;
+-            Event.Type = QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED;
+-            Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated = Connection->State.ReliableResetStreamNegotiated;
+-
+-            QuicTraceLogConnVerbose(
+-                IndicateReliableResetNegotiated,
+-                Connection,
+-                "Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu]",
+-                Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated);
+-            QuicConnIndicateEvent(Connection, &Event);
++        if (QuicConnIsServer(Connection)) {
++            QuicConnProcessResetStreamAtNegotiation(Connection, FALSE);
+         }
+ 
+         if (QuicConnIsServer(Connection) && Connection->Settings.OneWayDelayEnabled) {
+--- a/src/core/connection.h
++++ b/src/core/connection.h
+@@ -177,9 +177,9 @@
+         BOOLEAN FixedBit : 1;
+ 
+         //
+-        // Indicates that the peer accepts RELIABLE_RESET kind of frames, in addition to RESET_STREAM frames.
++        // Indicates that the RESET_STREAM_AT negotiation event has been emitted.
+         //
+-        BOOLEAN ReliableResetStreamNegotiated : 1;
++        BOOLEAN ResetStreamAtNegotiationEventEmitted : 1;
+ 
+         //
+         // Sending timestamps has been negotiated.
+@@ -380,6 +380,14 @@
+     QUIC_SETTINGS_INTERNAL Settings;
+ 
+     //
++    // Immutable requested RESET_STREAM_AT dialect snapshot and live-handshake
++    // peer/negotiated masks.
++    //
++    uint32_t ResetStreamAtRequestedDialectMask;
++    uint32_t ResetStreamAtPeerDialectMask;
++    uint32_t ResetStreamAtNegotiatedDialectMask;
++
++    //
+     // Number of references to the handle.
+     //
+     long RefCount;
+@@ -710,6 +718,22 @@
+ 
+ } QUIC_CONNECTION;
+ 
++QUIC_INLINE BOOLEAN
++QuicConnCanSendResetStreamAt(
++    _In_ const QUIC_CONNECTION* Connection
++    )
++{
++    return Connection->ResetStreamAtPeerDialectMask != 0;
++}
++
++QUIC_INLINE BOOLEAN
++QuicConnCanReceiveResetStreamAt(
++    _In_ const QUIC_CONNECTION* Connection
++    )
++{
++    return Connection->ResetStreamAtRequestedDialectMask != 0;
++}
++
+ typedef struct QUIC_SERIALIZED_RESUMPTION_STATE {
+ 
+     uint32_t QuicVersion;
+@@ -1533,6 +1557,36 @@
+     );
+ 
+ //
++// Resolves the effective requested RESET_STREAM_AT dialects. An explicit
++// configuration mask wins over the deprecated per-connection Boolean alias.
++//
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++uint32_t
++QuicConnGetResetStreamAtRequestedDialectMask(
++    _In_ const QUIC_CONNECTION* Connection,
++    _In_ const QUIC_CONFIGURATION* Configuration
++    );
++
++BOOLEAN
++QuicConnIsResetStreamAtResumptionCompatible(
++    _In_ const QUIC_CONNECTION* Connection,
++    _In_ const QUIC_TRANSPORT_PARAMETERS* ResumedTP
++    );
++
++void
++QuicConnProcessResetStreamAtNegotiation(
++    _Inout_ QUIC_CONNECTION* Connection,
++    _In_ BOOLEAN FromResumptionTicket
++    );
++
++#if defined(__cplusplus)
++}
++#endif
++
++//
+ // Sets the configuration handle.
+ //
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+--- a/src/core/crypto.c
++++ b/src/core/crypto.c
+@@ -2579,7 +2579,9 @@
+         QUIC_TP_FLAG_INITIAL_MAX_STRM_DATA_BIDI_REMOTE |
+         QUIC_TP_FLAG_INITIAL_MAX_STRM_DATA_UNI |
+         QUIC_TP_FLAG_INITIAL_MAX_STRMS_BIDI |
+-        QUIC_TP_FLAG_INITIAL_MAX_STRMS_UNI);
++        QUIC_TP_FLAG_INITIAL_MAX_STRMS_UNI |
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07 |
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10);
+ 
+     EncodedHSTP =
+         QuicCryptoTlsEncodeTransportParameters(
+--- a/src/core/crypto_tls.c
++++ b/src/core/crypto_tls.c
+@@ -66,7 +66,8 @@
+ #define QUIC_TP_ID_MIN_ACK_DELAY                            0xFF04DE1BULL   // varint
+ #define QUIC_TP_ID_CIBIR_ENCODING                           0x1000          // {varint, varint}
+ #define QUIC_TP_ID_GREASE_QUIC_BIT                          0x2AB2          // N/A
+-#define QUIC_TP_ID_RELIABLE_RESET_ENABLED                   0x17f7586d2cb570   // varint
++#define QUIC_TP_ID_RESET_STREAM_AT_DRAFT_07                 0x17f7586d2cb571ULL
++#define QUIC_TP_ID_RESET_STREAM_AT_DRAFT_10                 0x1dULL
+ #define QUIC_TP_ID_ENABLE_TIMESTAMP                         0x7158          // varint
+ 
+ BOOLEAN
+@@ -888,10 +889,16 @@
+                 QUIC_TP_ID_GREASE_QUIC_BIT,
+                 0);
+     }
+-    if (TransportParams->Flags & QUIC_TP_FLAG_RELIABLE_RESET_ENABLED) {
++    if (TransportParams->Flags & QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07) {
+         RequiredTPLen +=
+             TlsTransportParamLength(
+-                QUIC_TP_ID_RELIABLE_RESET_ENABLED,
++                QUIC_TP_ID_RESET_STREAM_AT_DRAFT_07,
++                0);
++    }
++    if (TransportParams->Flags & QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10) {
++        RequiredTPLen +=
++            TlsTransportParamLength(
++                QUIC_TP_ID_RESET_STREAM_AT_DRAFT_10,
+                 0);
+     }
+     if (TransportParams->Flags & (QUIC_TP_FLAG_TIMESTAMP_SEND_ENABLED | QUIC_TP_FLAG_TIMESTAMP_RECV_ENABLED)) {
+@@ -1218,17 +1225,29 @@
+             Connection,
+             "TP: Grease Quic Bit");
+     }
+-    if (TransportParams->Flags & QUIC_TP_FLAG_RELIABLE_RESET_ENABLED) {
++    if (TransportParams->Flags & QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07) {
++        TPBuf =
++            TlsWriteTransportParam(
++                QUIC_TP_ID_RESET_STREAM_AT_DRAFT_07,
++                0,
++                NULL,
++                TPBuf);
++        QuicTraceLogConnVerbose(
++            EncodeTPReliableResetDraft07,
++            Connection,
++            "TP: RESET_STREAM_AT draft-07");
++    }
++    if (TransportParams->Flags & QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10) {
+         TPBuf =
+             TlsWriteTransportParam(
+-                QUIC_TP_ID_RELIABLE_RESET_ENABLED,
++                QUIC_TP_ID_RESET_STREAM_AT_DRAFT_10,
+                 0,
+                 NULL,
+                 TPBuf);
+         QuicTraceLogConnVerbose(
+-            EncodeTPReliableReset,
++            EncodeTPReliableResetDraft10,
+             Connection,
+-            "TP: Reliable Reset");
++            "TP: RESET_STREAM_AT draft-10");
+     }
+     if (TransportParams->Flags & (QUIC_TP_FLAG_TIMESTAMP_SEND_ENABLED | QUIC_TP_FLAG_TIMESTAMP_RECV_ENABLED)) {
+         const uint32_t value =
+@@ -1907,21 +1926,40 @@
+                 "TP: Grease QUIC Bit");
+             break;
+ 
+-        case QUIC_TP_ID_RELIABLE_RESET_ENABLED:
+-            if (Length != 0) {
++        case QUIC_TP_ID_RESET_STREAM_AT_DRAFT_07:
++            if (Length != 0 ||
++                (TransportParams->Flags & QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07) != 0) {
++                QuicTraceEvent(
++                    ConnErrorStatus,
++                    "[conn][%p] ERROR, %u, %s.",
++                    Connection,
++                    Length,
++                    "Invalid or duplicate RESET_STREAM_AT draft-07 TP");
++                goto Exit;
++            }
++            TransportParams->Flags |= QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07;
++            QuicTraceLogConnVerbose(
++                DecodeTPReliableResetDraft07,
++                Connection,
++                "TP: RESET_STREAM_AT draft-07");
++            break;
++
++        case QUIC_TP_ID_RESET_STREAM_AT_DRAFT_10:
++            if (Length != 0 ||
++                (TransportParams->Flags & QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10) != 0) {
+                 QuicTraceEvent(
+                     ConnErrorStatus,
+                     "[conn][%p] ERROR, %u, %s.",
+                     Connection,
+                     Length,
+-                    "Invalid length of QUIC_TP_ID_RELIABLE_RESET_ENABLED");
++                    "Invalid or duplicate RESET_STREAM_AT draft-10 TP");
+                 goto Exit;
+             }
+-            TransportParams->Flags |= QUIC_TP_FLAG_RELIABLE_RESET_ENABLED;
++            TransportParams->Flags |= QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10;
+             QuicTraceLogConnVerbose(
+-                DecodeTPReliableReset,
++                DecodeTPReliableResetDraft10,
+                 Connection,
+-                "TP: Reliable Reset");
++                "TP: RESET_STREAM_AT draft-10");
+             break;
+ 
+         case QUIC_TP_ID_ENABLE_TIMESTAMP: {
+--- a/src/core/frame.h
++++ b/src/core/frame.h
+@@ -149,9 +149,9 @@
+     QUIC_FRAME_CONNECTION_CLOSE     = 0x1cULL, // to 0x1d
+     QUIC_FRAME_CONNECTION_CLOSE_1   = 0x1dULL,
+     QUIC_FRAME_HANDSHAKE_DONE       = 0x1eULL,
+-    /* 0x1f to 0x20 are unused currently */
+-    QUIC_FRAME_RELIABLE_RESET_STREAM = 0x21ULL, // intentionally ignore type 0x20 of QUIC_RESET_STREAM cause it's likely to be removed from RFC.
+-    /* 0x22 to 0x2f are unused currently */
++    /* 0x20 to 0x23 are unused currently */
++    QUIC_FRAME_RELIABLE_RESET_STREAM = 0x24ULL,
++    /* 0x25 to 0x2f are unused currently */
+     QUIC_FRAME_DATAGRAM             = 0x30ULL, // to 0x31
+     QUIC_FRAME_DATAGRAM_1           = 0x31ULL,
+     /* 0x32 to 0xad are unused currently */
+--- a/src/core/library.c
++++ b/src/core/library.c
+@@ -1596,6 +1596,32 @@
+         Status = QUIC_STATUS_SUCCESS;
+         break;
+ 
++    case QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS: {
++        static const QUIC_RESET_STREAM_AT_DIALECTS ResetStreamAtDialects = {
++            QUIC_RESET_STREAM_AT_DIALECTS_VERSION_1,
++            QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK,
++            0x17f7586d2cb571ULL,
++            0x1dULL,
++            0x24ULL
++        };
++
++        if (*BufferLength < sizeof(ResetStreamAtDialects)) {
++            *BufferLength = sizeof(ResetStreamAtDialects);
++            Status = QUIC_STATUS_BUFFER_TOO_SMALL;
++            break;
++        }
++
++        if (Buffer == NULL) {
++            Status = QUIC_STATUS_INVALID_PARAMETER;
++            break;
++        }
++
++        *BufferLength = sizeof(ResetStreamAtDialects);
++        CxPlatCopyMemory(Buffer, &ResetStreamAtDialects, sizeof(ResetStreamAtDialects));
++        Status = QUIC_STATUS_SUCCESS;
++        break;
++    }
++
+     case QUIC_PARAM_GLOBAL_LOAD_BALACING_MODE:
+ 
+         if (*BufferLength < sizeof(uint16_t)) {
+--- a/src/core/loss_detection.c
++++ b/src/core/loss_detection.c
+@@ -712,12 +712,14 @@
+             break;
+ 
+         case QUIC_FRAME_RELIABLE_RESET_STREAM:
+-            NewDataQueued |=
+-                QuicSendSetStreamSendFlag(
+-                    &Connection->Send,
+-                    Packet->Frames[i].RELIABLE_RESET_STREAM.Stream,
+-                    QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT,
+-                    FALSE);
++            if (Packet->Frames[i].RELIABLE_RESET_STREAM.Stream->Flags.LocalCloseResetReliable) {
++                NewDataQueued |=
++                    QuicSendSetStreamSendFlag(
++                        &Connection->Send,
++                        Packet->Frames[i].RELIABLE_RESET_STREAM.Stream,
++                        QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT,
++                        FALSE);
++            }
+             break;
+ 
+         case QUIC_FRAME_STOP_SENDING:
+--- a/src/core/quicdef.h
++++ b/src/core/quicdef.h
+@@ -632,9 +632,10 @@
+ #define QUIC_TP_FLAG_MIN_ACK_DELAY                          0x00100000
+ #define QUIC_TP_FLAG_CIBIR_ENCODING                         0x00200000
+ #define QUIC_TP_FLAG_GREASE_QUIC_BIT                        0x00400000
+-#define QUIC_TP_FLAG_RELIABLE_RESET_ENABLED                 0x00800000
++#define QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07                0x00800000
+ #define QUIC_TP_FLAG_TIMESTAMP_RECV_ENABLED                 0x01000000
+ #define QUIC_TP_FLAG_TIMESTAMP_SEND_ENABLED                 0x02000000
++#define QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10                0x04000000
+ #define QUIC_TP_FLAG_TIMESTAMP_SHIFT                        24
+ 
+ #define QUIC_TP_MAX_PACKET_SIZE_DEFAULT                     65527
+--- a/src/core/settings.h
++++ b/src/core/settings.h
+@@ -111,7 +111,7 @@
+     uint8_t EcnEnabled                      : 1;
+     uint8_t HyStartEnabled                  : 1;
+     uint8_t EncryptionOffloadAllowed        : 1;
+-    uint8_t ReliableResetEnabled            : 1;
++    uint8_t ReliableResetEnabled            : 1; // Deprecated shorthand for all supported RESET_STREAM_AT dialects.
+     uint8_t OneWayDelayEnabled              : 1;
+     uint8_t NetStatsEventEnabled            : 1;
+     uint8_t StreamMultiReceiveEnabled       : 1;
+--- a/src/core/stream.c
++++ b/src/core/stream.c
+@@ -75,6 +75,7 @@
+         Connection->Settings.StreamMultiReceiveEnabled &&
+         !Stream->Flags.UseAppOwnedRecvBuffers;
+     Stream->RecvMaxLength = UINT64_MAX;
++    Stream->ReliableOffsetRecv = UINT64_MAX;
+     CxPlatRefInitialize(&Stream->RefCount);
+     Stream->SendRequestsTail = &Stream->SendRequests;
+     Stream->SendPriority = QUIC_STREAM_PRIORITY_DEFAULT;
+@@ -704,7 +705,7 @@
+             break;
+         }
+ 
+-        if (!Stream->Connection->State.ReliableResetStreamNegotiated ||
++        if (!QuicConnCanSendResetStreamAt(Stream->Connection) ||
+             *(uint64_t*)Buffer > Stream->QueuedSendOffset) {
+             Status = QUIC_STATUS_INVALID_STATE;
+             break;
+@@ -720,6 +721,7 @@
+             // We haven't called shutdown reliable yet. App can set ReliableOffsetSend to be whatever.
+             //
+             Stream->ReliableOffsetSend = *(uint64_t*)Buffer;
++            Stream->Flags.ReliableOffsetSendSet = TRUE;
+         } else if (*(uint64_t*)Buffer < Stream->ReliableOffsetSend) {
+             //
+             // TODO - Determine if we need to support this feature in future iterations.
+@@ -939,7 +941,7 @@
+             Status = QUIC_STATUS_INVALID_PARAMETER;
+             break;
+         }
+-        if (Stream->ReliableOffsetSend == 0) {
++        if (!Stream->Flags.ReliableOffsetSendSet) {
+             Status = QUIC_STATUS_INVALID_STATE;
+             break;
+         }
+@@ -962,7 +964,7 @@
+             break;
+         }
+ 
+-        *(uint64_t*)Buffer = Stream->RecvMaxLength;
++        *(uint64_t*)Buffer = Stream->ReliableOffsetRecv;
+         Status = QUIC_STATUS_SUCCESS;
+         break;
+ 
+--- a/src/core/stream.h
++++ b/src/core/stream.h
+@@ -125,7 +125,13 @@
+         BOOLEAN LocalCloseReset         : 1;    // Locally closed (locally aborted).
+         BOOLEAN LocalCloseResetReliable : 1;    // Indicates that we should shutdown the send path once we sent/ACK'd ReliableOffsetSend bytes.
+         BOOLEAN LocalCloseResetReliableAcked : 1; // Indicates the peer has acknowledged we will stop sending once we sent/ACK'd ReliableOffsetSend bytes.
+-        BOOLEAN RemoteCloseResetReliable : 1;   // Indicates that the peer initiated a reliable reset. Keep Recv path available for RecvMaxLength bytes.
++        BOOLEAN ReliableOffsetSendSet   : 1;    // Indicates ReliableOffsetSend was explicitly configured; zero is a valid value.
++        BOOLEAN ReliableResetSendFinalSizeSet : 1; // Indicates ReliableResetSendFinalSize was committed.
++        BOOLEAN ReliableResetSendFinalSizeReserved : 1; // Indicates connection flow control was reserved for ReliableResetSendFinalSize.
++        BOOLEAN RemoteCloseResetReliable : 1;   // Indicates that the peer initiated a reliable reset. Keep Recv path available through ReliableOffsetRecv.
++        BOOLEAN RecvResetErrorCodeSet   : 1;    // Indicates RecvResetErrorCode is immutable for received reset frames.
++        BOOLEAN RecvFinalSizeAccounted  : 1;    // Indicates RecvMaxLength has been charged to connection flow control.
++        BOOLEAN RecvFinalSizeCreditReturned : 1; // Indicates connection flow control credit for the final size was returned.
+         BOOLEAN ReceivedStopSending     : 1;    // Peer sent STOP_SENDING frame.
+         BOOLEAN LocalCloseAcked         : 1;    // Any close acknowledged.
+         BOOLEAN FinAcked                : 1;    // Our FIN was acknowledged.
+@@ -376,10 +382,16 @@
+     uint64_t RecoveryEndOffset;
+ 
+     //
+-    // If > 0, bytes up to offset must be re-transmitted and ACK'd from peer before we can abort this stream.
++    // Bytes below this offset must be transmitted and acknowledged before a
++    // reliable reset can complete. Zero is valid when ReliableOffsetSendSet is set.
+     //
+     uint64_t ReliableOffsetSend;
+ 
++    //
++    // Immutable final size committed by the first RESET_STREAM_AT.
++    //
++    uint64_t ReliableResetSendFinalSize;
++
+     #define RECOV_WINDOW_OPEN(S) ((S)->RecoveryNextOffset < (S)->RecoveryEndOffset)
+ 
+     //
+@@ -431,11 +443,27 @@
+     uint64_t RecvMax0RttLength;
+ 
+     //
+-    // Maximum allowed inbound byte offset, established when the FIN is received.
++    // Immutable final size established by FIN, RESET_STREAM, or RESET_STREAM_AT.
+     //
+     uint64_t RecvMaxLength;
+ 
+     //
++    // Smallest reliable size received in RESET_STREAM_AT frames.
++    //
++    uint64_t ReliableOffsetRecv;
++
++    //
++    // Application error code shared by RESET_STREAM_AT and RESET_STREAM.
++    //
++    QUIC_VAR_INT RecvResetErrorCode;
++
++    //
++    // Flow-control bytes pre-accounted by RESET_STREAM_AT but not yet represented
++    // by the receive buffer's greatest received offset.
++    //
++    uint64_t ReliableResetRecvBytesReserved;
++
++    //
+     // The number of bytes that are currently outstanding up to the app.
+     //
+     uint64_t RecvPendingLength;
+@@ -546,12 +574,20 @@
+ //
+ // Returns TRUE if the stream has anything to send.
+ //
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
+ BOOLEAN
+ QuicStreamCanSendNow(
+     _In_ const QUIC_STREAM* Stream,
+     _In_ BOOLEAN ZeroRtt
+     );
+ 
++#if defined(__cplusplus)
++}
++#endif
++
+ //
+ // Returns TRUE if the peer has indicated the stream ID is allowed to be used
+ // yet.
+@@ -681,6 +717,10 @@
+ //
+ // Sets a stream parameter.
+ //
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
+ QUIC_STATUS
+ QuicStreamParamSet(
+     _In_ QUIC_STREAM* Stream,
+@@ -690,6 +730,10 @@
+         const void* Buffer
+     );
+ 
++#if defined(__cplusplus)
++}
++#endif
++
+ //
+ // Gets a stream parameter.
+ //
+@@ -877,6 +921,10 @@
+ //
+ // Initiates async shutdown of send path.
+ //
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ void
+ QuicStreamSendShutdown(
+@@ -887,6 +935,10 @@
+     _In_ QUIC_VAR_INT ErrorCode   // Only for !Graceful
+     );
+ 
++#if defined(__cplusplus)
++}
++#endif
++
+ //
+ // Send path has completed shutdown.
+ //
+@@ -906,6 +958,39 @@
+     _In_ QUIC_STREAM* Stream
+     );
+ 
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++BOOLEAN
++QuicStreamHasPendingStreamData(
++    _In_ const QUIC_STREAM* Stream
++    );
++
++BOOLEAN
++QuicStreamSendCanWriteDataFrames(
++    _In_ const QUIC_STREAM* Stream
++    );
++
++BOOLEAN
++QuicStreamCanSendResetFrame(
++    _In_ const QUIC_STREAM* Stream
++    );
++
++void
++QuicStreamReserveResetFrameFlowControl(
++    _In_ QUIC_STREAM* Stream
++    );
++
++BOOLEAN
++QuicStreamDowngradeReliableResetIfUnsupported(
++    _In_ QUIC_STREAM* Stream
++    );
++
++#if defined(__cplusplus)
++}
++#endif
++
+ //
+ // Copies the bytes of a send request and completes it early.
+ //
+@@ -990,6 +1075,10 @@
+ // Receive Functions
+ //
+ 
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
+ //
+ // Initiates async shutdown of receive path.
+ //
+@@ -1001,6 +1090,32 @@
+     _In_ QUIC_VAR_INT ErrorCode
+     );
+ 
++void
++QuicStreamProcessReliableResetFrame(
++    _In_ QUIC_STREAM* Stream,
++    _In_ QUIC_VAR_INT ErrorCode,
++    _In_ QUIC_VAR_INT FinalSize,
++    _In_ QUIC_VAR_INT ReliableOffset
++    );
++
++void
++QuicStreamProcessResetFrame(
++    _In_ QUIC_STREAM* Stream,
++    _In_ uint64_t FinalSize,
++    _In_ QUIC_VAR_INT ErrorCode
++    );
++
++QUIC_STATUS
++QuicStreamProcessStreamFrame(
++    _In_ QUIC_STREAM* Stream,
++    _In_ BOOLEAN EncryptedWith0Rtt,
++    _In_ const QUIC_STREAM_EX* Frame
++    );
++
++#if defined(__cplusplus)
++}
++#endif
++
+ //
+ // Completes a receive call that was pended by the app.
+ //
+--- a/src/core/stream_recv.c
++++ b/src/core/stream_recv.c
+@@ -31,6 +31,23 @@
+     );
+ 
+ _IRQL_requires_max_(PASSIVE_LEVEL)
++static
++BOOLEAN
++QuicStreamCommitRecvResetState(
++    _In_ QUIC_STREAM* Stream,
++    _In_ uint64_t FinalSize,
++    _In_ QUIC_VAR_INT ErrorCode,
++    _In_ BOOLEAN CommitPeerErrorCode
++    );
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static
++void
++QuicStreamCompleteRecvReset(
++    _In_ QUIC_STREAM* Stream
++    );
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
+ void
+ QuicStreamRecvShutdown(
+     _In_ QUIC_STREAM* Stream,
+@@ -78,11 +95,24 @@
+ 
+     if (Stream->RecvMaxLength != UINT64_MAX) {
+         //
+-        // The peer has already gracefully closed, but we just haven't drained
+-        // the receives to that point. Just treat the shutdown as if it was
+-        // already acknowledged by a reset frame.
+-        //
+-        QuicStreamProcessResetFrame(Stream, Stream->RecvMaxLength, 0);
++        // The peer has already established a final size. If RESET_STREAM_AT is
++        // pending, the application is choosing not to wait for the reliable
++        // prefix; preserve the peer's immutable error/final-size state.
++        //
++        if (Stream->Flags.RemoteCloseResetReliable) {
++            QuicStreamCompleteRecvReset(Stream);
++        } else if (QuicStreamCommitRecvResetState(
++                       Stream,
++                       Stream->RecvMaxLength,
++                       0,
++                       FALSE)) {
++            //
++            // This is local completion, not a peer RESET_STREAM. Account and
++            // release the known final size without inventing an immutable peer
++            // application error code.
++            //
++            QuicStreamCompleteRecvReset(Stream);
++        }
+         Silent = TRUE; // To indicate we try to shutdown complete.
+         goto Exit;
+     }
+@@ -183,37 +213,198 @@
+ }
+ 
+ //
+-// Processes a received RELIABLE_RESET frame's payload.
++// Validates and commits the immutable fields shared by RESET_STREAM_AT and
++// RESET_STREAM. Final size consumes flow control when first learned, even when
++// some of the corresponding STREAM data has not arrived yet.
++//
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static
++BOOLEAN
++QuicStreamCommitRecvResetState(
++    _In_ QUIC_STREAM* Stream,
++    _In_ uint64_t FinalSize,
++    _In_ QUIC_VAR_INT ErrorCode,
++    _In_ BOOLEAN CommitPeerErrorCode
++    )
++{
++    const uint64_t TotalRecvLength =
++        QuicRecvBufferGetTotalLength(&Stream->RecvBuffer);
++
++    if (Stream->RecvMaxLength != UINT64_MAX &&
++        Stream->RecvMaxLength != FinalSize) {
++        QuicTraceLogStreamWarning(
++            ResetEarly,
++            Stream,
++            "Reset changed the final size!");
++        QuicConnTransportError(Stream->Connection, QUIC_ERROR_FINAL_SIZE_ERROR);
++        return FALSE;
++    }
++
++    if (TotalRecvLength > FinalSize) {
++        QuicTraceLogStreamWarning(
++            ResetEarly,
++            Stream,
++            "Tried to reset at earlier final size!");
++        QuicConnTransportError(Stream->Connection, QUIC_ERROR_FINAL_SIZE_ERROR);
++        return FALSE;
++    }
++
++    if (FinalSize > Stream->MaxAllowedRecvOffset) {
++        QuicTraceLogStreamWarning(
++            ResetTooBig,
++            Stream,
++            "Reset final size exceeded stream flow control!");
++        QuicConnTransportError(Stream->Connection, QUIC_ERROR_FLOW_CONTROL_ERROR);
++        return FALSE;
++    }
++
++    if (CommitPeerErrorCode &&
++        Stream->Flags.RecvResetErrorCodeSet &&
++        Stream->RecvResetErrorCode != ErrorCode) {
++        QuicTraceLogStreamWarning(
++            ResetEarly,
++            Stream,
++            "Reset changed the application error code!");
++        QuicConnTransportError(Stream->Connection, QUIC_ERROR_STREAM_STATE_ERROR);
++        return FALSE;
++    }
++
++    if (!Stream->Flags.RecvFinalSizeAccounted) {
++        QUIC_SEND* Send = &Stream->Connection->Send;
++        const uint64_t FlowControlIncrease = FinalSize - TotalRecvLength;
++        if (Send->OrderedStreamBytesReceived > Send->MaxData ||
++            FlowControlIncrease > Send->MaxData - Send->OrderedStreamBytesReceived) {
++            QuicTraceLogStreamWarning(
++                ResetTooBig,
++                Stream,
++                "Reset final size exceeded connection flow control!");
++            QuicConnTransportError(Stream->Connection, QUIC_ERROR_FLOW_CONTROL_ERROR);
++            return FALSE;
++        }
++
++        Send->OrderedStreamBytesReceived += FlowControlIncrease;
++        Stream->ReliableResetRecvBytesReserved = FlowControlIncrease;
++        Stream->Flags.RecvFinalSizeAccounted = TRUE;
++    }
++
++    Stream->RecvMaxLength = FinalSize;
++    if (CommitPeerErrorCode && !Stream->Flags.RecvResetErrorCodeSet) {
++        Stream->RecvResetErrorCode = ErrorCode;
++        Stream->Flags.RecvResetErrorCodeSet = TRUE;
++    }
++    return TRUE;
++}
++
++_IRQL_requires_max_(PASSIVE_LEVEL)
++static
++void
++QuicStreamCompleteRecvReset(
++    _In_ QUIC_STREAM* Stream
++    )
++{
++    if (Stream->Flags.RemoteCloseAcked) {
++        return;
++    }
++
++    Stream->Flags.RemoteCloseReset = TRUE;
++    Stream->Flags.RemoteCloseAcked = TRUE;
++    Stream->Flags.ReceiveEnabled = FALSE;
++    Stream->Flags.ReceiveDataPending = FALSE;
++    if (Stream->Flags.RecvResetErrorCodeSet) {
++        Stream->RecvShutdownErrorCode = Stream->RecvResetErrorCode;
++    }
++
++    if (!Stream->Flags.RecvFinalSizeCreditReturned) {
++        //
++        // Pending app receives still return their own credit when completed.
++        // Exclude them here unless the app already aborted receiving, in which
++        // case completion is ignored and this path must return all remaining
++        // final-size credit itself.
++        //
++        const uint64_t PendingCompletionLength =
++            Stream->Flags.SentStopSending ? 0 : Stream->RecvPendingLength;
++        const uint64_t AccountedReadLength =
++            Stream->RecvBuffer.BaseOffset + PendingCompletionLength;
++        CXPLAT_DBG_ASSERT(AccountedReadLength <= Stream->RecvMaxLength);
++        const uint64_t FlowControlIncrease =
++            Stream->RecvMaxLength - AccountedReadLength;
++        if (FlowControlIncrease != 0) {
++            Stream->Connection->Send.MaxData += FlowControlIncrease;
++            QuicSendSetSendFlag(
++                &Stream->Connection->Send,
++                QUIC_CONN_SEND_FLAG_MAX_DATA);
++        }
++        Stream->Flags.RecvFinalSizeCreditReturned = TRUE;
++    }
++    Stream->ReliableResetRecvBytesReserved = 0;
++
++    QuicTraceEvent(
++        StreamRecvState,
++        "[strm][%p] Recv State: %hhu",
++        Stream,
++        QuicStreamRecvGetState(Stream));
++
++    if (!Stream->Flags.SentStopSending) {
++        QuicStreamIndicatePeerSendAbortedEvent(
++            Stream, Stream->RecvResetErrorCode);
++    }
++
++    QuicSendClearStreamSendFlag(
++        &Stream->Connection->Send,
++        Stream,
++        QUIC_STREAM_SEND_FLAG_MAX_DATA | QUIC_STREAM_SEND_FLAG_RECV_ABORT);
++    QuicStreamTryCompleteShutdown(Stream);
++}
++
++//
++// Processes a received RESET_STREAM_AT frame's payload.
+ //
+ _IRQL_requires_max_(PASSIVE_LEVEL)
+ void
+ QuicStreamProcessReliableResetFrame(
+     _In_ QUIC_STREAM* Stream,
+     _In_ QUIC_VAR_INT ErrorCode,
++    _In_ QUIC_VAR_INT FinalSize,
+     _In_ QUIC_VAR_INT ReliableOffset
+     )
+ {
+-    if (!Stream->Connection->State.ReliableResetStreamNegotiated) {
++    if (!QuicConnCanReceiveResetStreamAt(Stream->Connection)) {
+         //
+-        // The peer tried to use an exprimental feature without
+-        // negotiating first. Kill the connection.
++        // The peer tried to use an experimental feature we didn't advertise.
+         //
+         QuicTraceLogStreamWarning(
+             ReliableResetNotNegotiatedError,
+             Stream,
+-            "Received ReliableReset without negotiation.");
++            "Received RESET_STREAM_AT without negotiation.");
+         QuicConnTransportError(Stream->Connection, QUIC_ERROR_TRANSPORT_PARAMETER_ERROR);
+         return;
+     }
+ 
+-    if (Stream->RecvMaxLength == 0 || ReliableOffset < Stream->RecvMaxLength) {
+-        //
+-        // As outlined in the spec, if we receive multiple CLOSE_STREAM frames, we only accept strictly
+-        // decreasing offsets.
+-        //
+-        Stream->RecvMaxLength = ReliableOffset;
+-        Stream->Flags.RemoteCloseResetReliable = TRUE;
++    if (ReliableOffset > FinalSize) {
++        QuicTraceLogStreamWarning(
++            ResetTooBig,
++            Stream,
++            "RESET_STREAM_AT reliable size exceeded final size!");
++        QuicConnTransportError(Stream->Connection, QUIC_ERROR_FRAME_ENCODING_ERROR);
++        return;
++    }
++
++    if (!QuicStreamCommitRecvResetState(Stream, FinalSize, ErrorCode, TRUE)) {
++        return;
++    }
++
++    //
++    // RESET_STREAM is equivalent to a reliable size of zero. Once it has been
++    // processed, reordered RESET_STREAM_AT frames cannot raise the commitment.
++    //
++    if (Stream->Flags.RemoteCloseReset) {
++        return;
++    }
+ 
++    Stream->Flags.RemoteCloseResetReliable = TRUE;
++    Stream->RecvShutdownErrorCode = ErrorCode;
++    if (ReliableOffset < Stream->ReliableOffsetRecv) {
++        Stream->ReliableOffsetRecv = ReliableOffset;
+         QuicTraceLogStreamInfo(
+             ReliableRecvOffsetSet,
+             Stream,
+@@ -221,19 +412,9 @@
+             ReliableOffset);
+     }
+ 
+-    if (Stream->RecvBuffer.BaseOffset >= Stream->RecvMaxLength) {
+-        QuicTraceEvent(
+-            StreamRecvState,
+-            "[strm][%p] Recv State: %hhu",
+-            Stream,
+-            QuicStreamRecvGetState(Stream));
+-        QuicStreamIndicatePeerSendAbortedEvent(Stream, ErrorCode);
+-        QuicStreamRecvShutdown(Stream, TRUE, ErrorCode);
+-    } else {
+-        //
+-        // We still have data to deliver to the app, just cache the error code for later.
+-        //
+-        Stream->RecvShutdownErrorCode = ErrorCode;
++    if (Stream->Flags.SentStopSending ||
++        Stream->RecvBuffer.BaseOffset >= Stream->ReliableOffsetRecv) {
++        QuicStreamCompleteRecvReset(Stream);
+     }
+ }
+ 
+@@ -248,88 +429,16 @@
+     _In_ QUIC_VAR_INT ErrorCode
+     )
+ {
++    if (!QuicStreamCommitRecvResetState(Stream, FinalSize, ErrorCode, TRUE)) {
++        return;
++    }
++
+     //
+-    // Make sure the stream is remotely closed if not already.
++    // RESET_STREAM lowers any previous RESET_STREAM_AT reliable commitment to
++    // zero while preserving its final size and application error code.
+     //
+-    Stream->Flags.RemoteCloseReset = TRUE;
+-
+-    if (!Stream->Flags.RemoteCloseAcked) {
+-        Stream->Flags.RemoteCloseAcked = TRUE;
+-        Stream->Flags.ReceiveEnabled = FALSE;
+-        Stream->Flags.ReceiveDataPending = FALSE;
+-
+-        uint64_t TotalRecvLength = QuicRecvBufferGetTotalLength(&Stream->RecvBuffer);
+-        if (TotalRecvLength > FinalSize) {
+-            //
+-            // The peer indicated a final offset less than what they have
+-            // already sent to us. Kill the connection.
+-            //
+-            QuicTraceLogStreamWarning(
+-                ResetEarly,
+-                Stream,
+-                "Tried to reset at earlier final size!");
+-            QuicConnTransportError(Stream->Connection, QUIC_ERROR_FINAL_SIZE_ERROR);
+-            return;
+-        }
+-
+-        if (TotalRecvLength < FinalSize) {
+-            //
+-            // The final offset is indicating that more data was sent than we
+-            // have actually received. Make sure to update our flow control
+-            // accounting so we stay in sync with the peer.
+-            //
+-            uint64_t FlowControlIncrease = FinalSize - TotalRecvLength;
+-            Stream->Connection->Send.OrderedStreamBytesReceived += FlowControlIncrease;
+-            if (Stream->Connection->Send.OrderedStreamBytesReceived < FlowControlIncrease ||
+-                Stream->Connection->Send.OrderedStreamBytesReceived > Stream->Connection->Send.MaxData) {
+-                //
+-                // The peer indicated a final offset more than allowed. Kill the
+-                // connection.
+-                //
+-                QuicTraceLogStreamWarning(
+-                    ResetTooBig,
+-                    Stream,
+-                    "Tried to reset with too big final size!");
+-                QuicConnTransportError(Stream->Connection, QUIC_ERROR_FINAL_SIZE_ERROR);
+-                return;
+-            }
+-        }
+-
+-        uint64_t TotalReadLength = Stream->RecvBuffer.BaseOffset;
+-        if (TotalReadLength < FinalSize) {
+-            //
+-            // The final offset is indicating that more data was sent than the
+-            // app has completely read. Make sure to give the peer more credit
+-            // as a result.
+-            //
+-            uint64_t FlowControlIncrease = FinalSize - TotalReadLength;
+-            Stream->Connection->Send.MaxData += FlowControlIncrease;
+-            QuicSendSetSendFlag(
+-                &Stream->Connection->Send,
+-                QUIC_CONN_SEND_FLAG_MAX_DATA);
+-        }
+-
+-        QuicTraceEvent(
+-            StreamRecvState,
+-            "[strm][%p] Recv State: %hhu",
+-            Stream,
+-            QuicStreamRecvGetState(Stream));
+-
+-        if (!Stream->Flags.SentStopSending) {
+-            QuicStreamIndicatePeerSendAbortedEvent(Stream, ErrorCode);
+-        }
+-
+-        //
+-        // Remove any flags we shouldn't be sending now that the receive
+-        // direction is closed.
+-        //
+-        QuicSendClearStreamSendFlag(
+-            &Stream->Connection->Send,
+-            Stream,
+-            QUIC_STREAM_SEND_FLAG_MAX_DATA | QUIC_STREAM_SEND_FLAG_RECV_ABORT);
+-
+-        QuicStreamTryCompleteShutdown(Stream);
+-    }
++    Stream->ReliableOffsetRecv = 0;
++    QuicStreamCompleteRecvReset(Stream);
+ }
+ 
+ //
+@@ -397,11 +506,30 @@
+         goto Error;
+     }
+ 
+-    if (Stream->Flags.RemoteCloseFin || Stream->Flags.RemoteCloseReset) {
++    if (Stream->Flags.RemoteCloseFin) {
++        //
++        // Ignore duplicate data after a graceful close has completed.
++        //
++        QuicTraceLogStreamVerbose(
++            IgnoreRecvAfterClose,
++            Stream,
++            "Ignoring recv after close");
++        Status = QUIC_STATUS_SUCCESS;
++        goto Error;
++    }
++
++    if ((Frame->Fin && Stream->RecvMaxLength != UINT64_MAX &&
++         EndOffset != Stream->RecvMaxLength) ||
++        EndOffset > Stream->RecvMaxLength) {
+         //
+-        // Ignore the data if we are already closed remotely. Likely means we
+-        // received a copy of already processed data that was resent.
++        // STREAM data and FIN must remain consistent with an established final
++        // size, including one established by RESET_STREAM_AT.
+         //
++        Status = QUIC_STATUS_INVALID_PARAMETER;
++        goto Error;
++    }
++
++    if (Stream->Flags.RemoteCloseReset) {
+         QuicTraceLogStreamVerbose(
+             IgnoreRecvAfterClose,
+             Stream,
+@@ -421,7 +549,13 @@
+                 TreatFinAsReset,
+                 Stream,
+                 "Treating FIN after receive abort as reset");
+-            QuicStreamProcessResetFrame(Stream, Frame->Offset + Frame->Length, 0);
++            if (QuicStreamCommitRecvResetState(
++                    Stream,
++                    EndOffset,
++                    0,
++                    FALSE)) {
++                QuicStreamCompleteRecvReset(Stream);
++            }
+ 
+         } else {
+             QuicTraceLogStreamVerbose(
+@@ -433,29 +567,13 @@
+         goto Error;
+     }
+ 
+-    if (Frame->Fin && Stream->RecvMaxLength != UINT64_MAX &&
+-        EndOffset != Stream->RecvMaxLength) {
++    if (Stream->Flags.RemoteCloseResetReliable &&
++        Stream->RecvBuffer.BaseOffset >= Stream->ReliableOffsetRecv) {
+         //
+-        // FIN disagrees with previous FIN.
++        // The reliable prefix has already been delivered. Data within the final
++        // size but beyond that prefix is no longer required.
+         //
+-        Status = QUIC_STATUS_INVALID_PARAMETER;
+-        goto Error;
+-    }
+-
+-    if (Stream->Flags.RemoteCloseResetReliable) {
+-        if (Stream->RecvBuffer.BaseOffset >= Stream->RecvMaxLength) {
+-            //
+-            // We've aborted reliably, but the stream goes past reliable offset, we can just
+-            // ignore it.
+-            //
+-            Status = QUIC_STATUS_SUCCESS;
+-            goto Error;
+-        }
+-    } else if (EndOffset > Stream->RecvMaxLength) {
+-        //
+-        // Frame goes past the FIN, and the stream is not reset reliably.
+-        //
+-        Status = QUIC_STATUS_INVALID_PARAMETER;
++        Status = QUIC_STATUS_SUCCESS;
+         goto Error;
+     }
+ 
+@@ -483,7 +601,8 @@
+         //
+         const uint64_t FlowControlQuota =
+             Stream->Connection->Send.MaxData -
+-            Stream->Connection->Send.OrderedStreamBytesReceived;
++            Stream->Connection->Send.OrderedStreamBytesReceived +
++            Stream->ReliableResetRecvBytesReserved;
+         uint64_t QuotaConsumed = 0;
+         uint64_t BufferSizeNeeded = 0;
+ 
+@@ -539,8 +658,14 @@
+         }
+ 
+         //
+-        // Keep track of the total ordered bytes received.
+-        //
++        // Keep track of the total ordered bytes received. RESET_STREAM_AT
++        // pre-accounts bytes through its final size, so consume that reservation
++        // before charging newly arrived STREAM data again.
++        //
++        const uint64_t ReservedConsumed =
++            CXPLAT_MIN(QuotaConsumed, Stream->ReliableResetRecvBytesReserved);
++        Stream->ReliableResetRecvBytesReserved -= ReservedConsumed;
++        QuotaConsumed -= ReservedConsumed;
+         Stream->Connection->Send.OrderedStreamBytesReceived += QuotaConsumed;
+         CXPLAT_DBG_ASSERT(Stream->Connection->Send.OrderedStreamBytesReceived <= Stream->Connection->Send.MaxData);
+         CXPLAT_DBG_ASSERT(Stream->Connection->Send.OrderedStreamBytesReceived >= QuotaConsumed);
+@@ -736,6 +861,7 @@
+         QuicStreamProcessReliableResetFrame(
+             Stream,
+             Frame.ErrorCode,
++            Frame.FinalSize,
+             Frame.ReliableSize);
+ 
+         break;
+@@ -908,6 +1034,13 @@
+         return;
+     }
+ 
++    if (Stream->Flags.RemoteCloseResetReliable &&
++        Stream->RecvBuffer.BaseOffset >= Stream->ReliableOffsetRecv &&
++        !QuicRecvBufferHasUnreadData(&Stream->RecvBuffer)) {
++        QuicStreamCompleteRecvReset(Stream);
++        return;
++    }
++
+     //
+     // Have 3 buffers one the stack, it's enough for most use cases.
+     //
+@@ -981,7 +1114,8 @@
+                 //
+             }
+ 
+-            if (Event.RECEIVE.AbsoluteOffset + Event.RECEIVE.TotalBufferLength == Stream->RecvMaxLength) {
++            if (!Stream->Flags.RemoteCloseResetReliable &&
++                Event.RECEIVE.AbsoluteOffset + Event.RECEIVE.TotalBufferLength == Stream->RecvMaxLength) {
+                 //
+                 // This data goes all the way to the FIN.
+                 //
+@@ -1167,7 +1301,15 @@
+         return !Stream->Flags.ReceiveMultiple;
+     }
+ 
+-    if (Stream->RecvBuffer.BaseOffset == Stream->RecvMaxLength) {
++    if (Stream->Flags.RemoteCloseResetReliable &&
++        Stream->RecvBuffer.BaseOffset >= Stream->ReliableOffsetRecv) {
++        //
++        // The smallest reliable prefix has been delivered. RESET_STREAM_AT is
++        // still an abrupt termination even when its reliable size equals the
++        // final size.
++        //
++        QuicStreamCompleteRecvReset(Stream);
++    } else if (Stream->RecvBuffer.BaseOffset == Stream->RecvMaxLength) {
+         CXPLAT_DBG_ASSERT(!Stream->Flags.ReceiveDataPending);
+         //
+         // We have delivered all the payload that needs to be delivered. Deliver
+@@ -1204,18 +1346,6 @@
+             &Stream->Connection->Send,
+             Stream,
+             QUIC_STREAM_SEND_FLAG_MAX_DATA | QUIC_STREAM_SEND_FLAG_RECV_ABORT);
+-    } else if (Stream->Flags.RemoteCloseResetReliable && Stream->RecvBuffer.BaseOffset >= Stream->RecvMaxLength) {
+-        //
+-        // ReliableReset was initiated by the peer, and we sent enough data to the app, we can alert the app
+-        // we're done and shutdown the RECV direction of this stream.
+-        //
+-        QuicTraceEvent(
+-            StreamRecvState,
+-            "[strm][%p] Recv State: %hhu",
+-            Stream,
+-            QuicStreamRecvGetState(Stream));
+-        QuicStreamIndicatePeerSendAbortedEvent(Stream, Stream->RecvShutdownErrorCode);
+-        QuicStreamRecvShutdown(Stream, TRUE, Stream->RecvShutdownErrorCode);
+     }
+ 
+     return FALSE;
+--- a/src/core/stream_send.c
++++ b/src/core/stream_send.c
+@@ -169,18 +169,23 @@
+             QUIC_STREAM_SEND_FLAG_FIN,
+             DelaySend);
+ 
+-    } else if (Stream->ReliableOffsetSend == 0 || Stream->Flags.LocalCloseResetReliable) {
++    } else if (!Stream->Flags.ReliableOffsetSendSet || Stream->Flags.LocalCloseResetReliable) {
+         //
+-        // Enter abortive branch if we are not aborting reliably or we have done it already.
+-        // Essentially, Reset trumps Reliable Reset, so if we have to call shutdown again, we reset.
++        // Enter the abortive branch if reliable reset wasn't configured or a
++        // second abort lowers an existing reliable commitment to zero.
+         //
++        const BOOLEAN LowerReliableCommitment =
++            Stream->Flags.LocalCloseResetReliable;
+ 
+         //
+-        // Can't be blocked by (stream) FC any more if we've aborted sending any
+-        // more.
++        // A first ordinary reset cannot require new stream credit because its
++        // final size was already sent. When lowering RESET_STREAM_AT, preserve
++        // blocked signaling until the immutable committed final size has credit.
+         //
+-        QuicStreamRemoveOutFlowBlockedReason(
+-            Stream, QUIC_FLOW_BLOCKED_STREAM_FLOW_CONTROL);
++        if (!LowerReliableCommitment) {
++            QuicStreamRemoveOutFlowBlockedReason(
++                Stream, QUIC_FLOW_BLOCKED_STREAM_FLOW_CONTROL);
++        }
+ 
+         //
+         // Make sure to deliver all send request cancelled callbacks first.
+@@ -220,7 +225,24 @@
+         }
+ 
+         Stream->Flags.LocalCloseReset = TRUE;
+-        Stream->SendShutdownErrorCode = ErrorCode;
++        if (LowerReliableCommitment) {
++            //
++            // RESET_STREAM after RESET_STREAM_AT keeps the committed final size
++            // and application error code, while reducing Reliable Size to zero.
++            //
++            Stream->Flags.LocalCloseResetReliable = FALSE;
++            Stream->ReliableOffsetSend = 0;
++        } else {
++            Stream->SendShutdownErrorCode = ErrorCode;
++            if (Stream->Flags.LocalCloseFin) {
++                //
++                // Preserve a FIN's final size only after it reached the wire.
++                // Unsent queued bytes remain discardable by an abort.
++                //
++                Stream->ReliableResetSendFinalSize = Stream->MaxSentLength;
++                Stream->Flags.ReliableResetSendFinalSizeSet = TRUE;
++            }
++        }
+ 
+         if (!Silent) {
+             //
+@@ -238,7 +260,10 @@
+             QuicSendClearStreamSendFlag(
+                 &Stream->Connection->Send,
+                 Stream,
+-                QUIC_STREAM_SEND_FLAG_ALL_SEND_PATH);
++                QUIC_STREAM_SEND_FLAG_ALL_SEND_PATH &
++                    ~(LowerReliableCommitment
++                        ? QUIC_STREAM_SEND_FLAG_DATA_BLOCKED
++                        : 0));
+         }
+     } else {
+         if (Stream->Flags.LocalCloseReset) {
+@@ -249,6 +274,7 @@
+             goto Exit;
+         }
+         Stream->Flags.LocalCloseResetReliable = TRUE;
++        Stream->Flags.ReliableResetSendFinalSizeSet = TRUE;
+         Stream->SendShutdownErrorCode = ErrorCode;
+ 
+         while (ApiSendRequests != NULL) {
+@@ -270,7 +296,37 @@
+         }
+ 
+         //
+-        // Queue up a RESET RELIABLE STREAM frame to be sent. We will clear up any flags later.
++        // Commit the final size once. Bytes already sent cannot be retracted;
++        // otherwise only the configured reliable prefix remains sendable.
++        //
++        Stream->ReliableResetSendFinalSize =
++            CXPLAT_MAX(Stream->MaxSentLength, Stream->ReliableOffsetSend);
++        if (Stream->RecoveryEndOffset > Stream->ReliableOffsetSend) {
++            Stream->RecoveryEndOffset = Stream->ReliableOffsetSend;
++        }
++        if (Stream->RecoveryNextOffset > Stream->RecoveryEndOffset) {
++            Stream->RecoveryNextOffset = Stream->RecoveryEndOffset;
++        }
++
++        //
++        // A RESET_STREAM_AT supersedes an unsent FIN. Only data below the
++        // reliable size remains eligible for transmission.
++        //
++        QuicSendClearStreamSendFlag(
++            &Stream->Connection->Send,
++            Stream,
++            QUIC_STREAM_SEND_FLAG_FIN);
++        if (!RECOV_WINDOW_OPEN(Stream) &&
++            Stream->NextSendOffset >= Stream->ReliableOffsetSend) {
++            QuicSendClearStreamSendFlag(
++                &Stream->Connection->Send,
++                Stream,
++                QUIC_STREAM_SEND_FLAG_DATA);
++        }
++
++        //
++        // Queue up a RESET_STREAM_AT frame to be sent. We will clear up any
++        // remaining data flags once the reliable prefix is acknowledged.
+         //
+         QuicSendSetStreamSendFlag(
+             &Stream->Connection->Send,
+@@ -314,9 +370,95 @@
+     _In_ const QUIC_STREAM* Stream
+     )
+ {
++    const uint64_t SendLimit =
++        Stream->Flags.LocalCloseResetReliable ?
++            Stream->ReliableOffsetSend :
++            Stream->QueuedSendOffset;
+     return
+         RECOV_WINDOW_OPEN(Stream) ||
+-        (Stream->NextSendOffset < Stream->QueuedSendOffset);
++        (Stream->NextSendOffset < SendLimit);
++}
++
++BOOLEAN
++QuicStreamCanSendResetFrame(
++    _In_ const QUIC_STREAM* Stream
++    )
++{
++    if (!Stream->Flags.ReliableResetSendFinalSizeSet ||
++        Stream->Flags.ReliableResetSendFinalSizeReserved) {
++        return TRUE;
++    }
++
++    CXPLAT_DBG_ASSERT(
++        Stream->ReliableResetSendFinalSize >= Stream->MaxSentLength);
++    if (Stream->ReliableResetSendFinalSize > Stream->MaxAllowedSendOffset) {
++        return FALSE;
++    }
++
++    const QUIC_SEND* Send = &Stream->Connection->Send;
++    CXPLAT_DBG_ASSERT(Send->OrderedStreamBytesSent <= Send->PeerMaxData);
++    const uint64_t FlowControlIncrease =
++        Stream->ReliableResetSendFinalSize - Stream->MaxSentLength;
++    return
++        FlowControlIncrease <= Send->PeerMaxData - Send->OrderedStreamBytesSent;
++}
++
++void
++QuicStreamReserveResetFrameFlowControl(
++    _In_ QUIC_STREAM* Stream
++    )
++{
++    if (!Stream->Flags.ReliableResetSendFinalSizeSet ||
++        Stream->Flags.ReliableResetSendFinalSizeReserved) {
++        return;
++    }
++
++    QUIC_SEND* Send = &Stream->Connection->Send;
++    CXPLAT_DBG_ASSERT(QuicStreamCanSendResetFrame(Stream));
++    const uint64_t FlowControlIncrease =
++        Stream->ReliableResetSendFinalSize - Stream->MaxSentLength;
++    Send->OrderedStreamBytesSent += FlowControlIncrease;
++    Stream->MaxSentLength = Stream->ReliableResetSendFinalSize;
++    Stream->Flags.ReliableResetSendFinalSizeReserved = TRUE;
++}
++
++BOOLEAN
++QuicStreamDowngradeReliableResetIfUnsupported(
++    _In_ QUIC_STREAM* Stream
++    )
++{
++    if (!(Stream->SendFlags & QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT) ||
++        QuicConnCanSendResetStreamAt(Stream->Connection)) {
++        return FALSE;
++    }
++
++    //
++    // A RESET_STREAM_AT may have been sent in 0-RTT based on remembered peer
++    // capability and then requeued when early data was rejected. If the live
++    // handshake no longer permits frame 0x24, finish with ordinary RESET_STREAM
++    // while preserving the immutable final size and application error code.
++    //
++
++    //
++    // Deliver the cancelled send completions before switching to the ordinary
++    // reset, mirroring the abortive shutdown path.
++    //
++    QuicStreamCancelRequests(Stream);
++
++    Stream->Flags.LocalCloseReset = TRUE;
++    Stream->Flags.LocalCloseResetReliable = FALSE;
++    Stream->Flags.LocalCloseResetReliableAcked = FALSE;
++    Stream->Flags.InRecovery = FALSE;
++    Stream->ReliableOffsetSend = 0;
++    Stream->RecoveryNextOffset = 0;
++    Stream->RecoveryEndOffset = 0;
++    Stream->SendFlags &=
++        ~(QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT |
++          QUIC_STREAM_SEND_FLAG_DATA |
++          QUIC_STREAM_SEND_FLAG_OPEN |
++          QUIC_STREAM_SEND_FLAG_FIN);
++    Stream->SendFlags |= QUIC_STREAM_SEND_FLAG_SEND_ABORT;
++    return TRUE;
+ }
+ 
+ //
+@@ -361,15 +503,27 @@
+         return TRUE;
+     }
+ 
+-    if (Stream->NextSendOffset == Stream->QueuedSendOffset) {
++    const uint64_t SendLimit =
++        Stream->Flags.LocalCloseResetReliable ?
++            Stream->ReliableOffsetSend :
++            Stream->QueuedSendOffset;
++    if (Stream->NextSendOffset >= SendLimit) {
+         //
+         // No unsent data. Can send only if a FIN is needed.
+         //
+         return !!(Stream->SendFlags & QUIC_STREAM_SEND_FLAG_FIN);
+     }
+ 
++    if (Stream->NextSendOffset < Stream->MaxSentLength) {
++        //
++        // These bytes were either sent previously or pre-accounted when a
++        // RESET_STREAM_AT reserved its immutable final size.
++        //
++        return TRUE;
++    }
++
+     //
+-    // Some unsent data. Can send only if flow control will allow.
++    // Some unaccounted data remains. It can be sent only if flow control allows.
+     //
+     QUIC_SEND* Send = &Stream->Connection->Send;
+     return
+@@ -392,16 +546,25 @@
+         return FALSE;
+     }
+ 
+-    if (HasStreamControlFrames(Stream->SendFlags) ||
++    const uint32_t ResetFlags =
++        QUIC_STREAM_SEND_FLAG_SEND_ABORT |
++        QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT;
++    if (HasStreamControlFrames(Stream->SendFlags & ~ResetFlags) ||
+         (Stream->SendFlags & QUIC_STREAM_SEND_FLAG_OPEN)) {
+         //
+-        // We can always send control frames and/or open new streams.
++        // Non-reset control frames and opening new streams are never blocked by
++        // the reset frame's final-size flow-control requirement.
+         //
+         return TRUE;
++    }
+ 
++    if ((Stream->SendFlags & ResetFlags) &&
++        QuicStreamCanSendResetFrame(Stream)) {
++        return TRUE;
+     }
+ 
+-    if (QuicStreamSendCanWriteDataFrames(Stream)) {
++    if (HasStreamDataFrames(Stream->SendFlags) &&
++        QuicStreamSendCanWriteDataFrames(Stream)) {
+         return ZeroRtt ? QuicStreamHasPending0RttData(Stream) : TRUE;
+     }
+ 
+@@ -963,6 +1126,14 @@
+             }
+         }
+ 
++        const uint64_t SendLimit =
++            Stream->Flags.LocalCloseResetReliable ?
++                Stream->ReliableOffsetSend :
++                Stream->QueuedSendOffset;
++        if (Right > SendLimit) {
++            Right = SendLimit;
++        }
++
+         //
+         // Stream flow control
+         //
+@@ -1014,9 +1185,9 @@
+         //
+         Right = Left + FramePayloadBytes;
+ 
+-        CXPLAT_DBG_ASSERT(Right <= Stream->QueuedSendOffset);
+-        if (Right == Stream->QueuedSendOffset) {
+-            if (Stream->Flags.SendEnabled) {
++        CXPLAT_DBG_ASSERT(Right <= SendLimit);
++        if (Right == SendLimit) {
++            if (Right == Stream->QueuedSendOffset && Stream->Flags.SendEnabled) {
+                 QuicStreamAddOutFlowBlockedReason(Stream, QUIC_FLOW_BLOCKED_APP);
+             }
+             ExitLoop = TRUE;
+@@ -1132,18 +1303,32 @@
+         }
+     }
+ 
+-    if (Stream->SendFlags & QUIC_STREAM_SEND_FLAG_SEND_ABORT) {
+-        QUIC_RESET_STREAM_EX Frame = { Stream->ID, Stream->SendShutdownErrorCode, Stream->MaxSentLength };
+-
+-        if (QuicResetStreamFrameEncode(
+-                &Frame,
+-                &Builder->DatagramLength,
+-                AvailableBufferLength,
+-                Builder->Datagram->Buffer)) {
++    (void)QuicStreamDowngradeReliableResetIfUnsupported(Stream);
+ 
+-            Stream->SendFlags &= ~QUIC_STREAM_SEND_FLAG_SEND_ABORT;
+-            if (QuicPacketBuilderAddStreamFrame(Builder, Stream, QUIC_FRAME_RESET_STREAM)) {
+-                return TRUE;
++    if (Stream->SendFlags & QUIC_STREAM_SEND_FLAG_SEND_ABORT) {
++        if (QuicStreamCanSendResetFrame(Stream)) {
++            const uint64_t FinalSize =
++                Stream->Flags.ReliableResetSendFinalSizeSet ?
++                    Stream->ReliableResetSendFinalSize :
++                    Stream->MaxSentLength;
++            QUIC_RESET_STREAM_EX Frame = {
++                Stream->ID,
++                Stream->SendShutdownErrorCode,
++                FinalSize };
++
++            if (QuicResetStreamFrameEncode(
++                    &Frame,
++                    &Builder->DatagramLength,
++                    AvailableBufferLength,
++                    Builder->Datagram->Buffer)) {
++
++                QuicStreamReserveResetFrameFlowControl(Stream);
++                Stream->SendFlags &= ~QUIC_STREAM_SEND_FLAG_SEND_ABORT;
++                if (QuicPacketBuilderAddStreamFrame(Builder, Stream, QUIC_FRAME_RESET_STREAM)) {
++                    return TRUE;
++                }
++            } else {
++                RanOutOfRoom = TRUE;
+             }
+         } else {
+             RanOutOfRoom = TRUE;
+@@ -1151,17 +1336,27 @@
+     }
+ 
+     if (Stream->SendFlags & QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT) {
+-        QUIC_RELIABLE_RESET_STREAM_EX Frame = { Stream->ID, Stream->SendShutdownErrorCode, Stream->MaxSentLength, Stream->ReliableOffsetSend };
+-
+-        if (QuicReliableResetFrameEncode(
+-                &Frame,
+-                &Builder->DatagramLength,
+-                AvailableBufferLength,
+-                Builder->Datagram->Buffer)) {
+-
+-            Stream->SendFlags &= ~QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT;
+-            if (QuicPacketBuilderAddStreamFrame(Builder, Stream, QUIC_FRAME_RELIABLE_RESET_STREAM)) {
+-                return TRUE;
++        if (QuicStreamCanSendResetFrame(Stream)) {
++            CXPLAT_DBG_ASSERT(Stream->Flags.ReliableResetSendFinalSizeSet);
++            QUIC_RELIABLE_RESET_STREAM_EX Frame = {
++                Stream->ID,
++                Stream->SendShutdownErrorCode,
++                Stream->ReliableResetSendFinalSize,
++                Stream->ReliableOffsetSend };
++
++            if (QuicReliableResetFrameEncode(
++                    &Frame,
++                    &Builder->DatagramLength,
++                    AvailableBufferLength,
++                    Builder->Datagram->Buffer)) {
++
++                QuicStreamReserveResetFrameFlowControl(Stream);
++                Stream->SendFlags &= ~QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT;
++                if (QuicPacketBuilderAddStreamFrame(Builder, Stream, QUIC_FRAME_RELIABLE_RESET_STREAM)) {
++                    return TRUE;
++                }
++            } else {
++                RanOutOfRoom = TRUE;
+             }
+         } else {
+             RanOutOfRoom = TRUE;
+@@ -1271,7 +1466,17 @@
+     uint64_t Start = FrameMetadata->StreamOffset;
+     uint64_t End = Start + FrameMetadata->StreamLength;
+ 
+-    if ((FrameMetadata->Flags & QUIC_SENT_FRAME_FLAG_STREAM_OPEN) &&
++    if (Stream->Flags.LocalCloseResetReliable) {
++        if (Start >= Stream->ReliableOffsetSend) {
++            return FALSE;
++        }
++        if (End > Stream->ReliableOffsetSend) {
++            End = Stream->ReliableOffsetSend;
++        }
++    }
++
++    if (!Stream->Flags.LocalCloseResetReliable &&
++        (FrameMetadata->Flags & QUIC_SENT_FRAME_FLAG_STREAM_OPEN) &&
+         !Stream->Flags.SendOpenAcked) {
+         AddSendFlags |= QUIC_STREAM_SEND_FLAG_OPEN;
+         QuicTraceLogStreamVerbose(
+@@ -1280,7 +1485,8 @@
+             "Recovering open STREAM frame");
+     }
+ 
+-    if ((FrameMetadata->Flags & QUIC_SENT_FRAME_FLAG_STREAM_FIN) &&
++    if (!Stream->Flags.LocalCloseResetReliable &&
++        (FrameMetadata->Flags & QUIC_SENT_FRAME_FLAG_STREAM_FIN) &&
+         !Stream->Flags.FinAcked) {
+         AddSendFlags |= QUIC_STREAM_SEND_FLAG_FIN;
+         QuicTraceLogStreamVerbose(
+@@ -1526,7 +1732,10 @@
+             QuicStreamCompleteSendRequest(Stream, Req, FALSE, TRUE);
+         }
+ 
+-        if (Stream->UnAckedOffset == Stream->QueuedSendOffset && Stream->Flags.FinAcked) {
++        if (Stream->UnAckedOffset == Stream->QueuedSendOffset &&
++            Stream->Flags.FinAcked &&
++            !Stream->Flags.LocalCloseResetReliable &&
++            !Stream->Flags.LocalCloseReset) {
+             CXPLAT_DBG_ASSERT(Stream->SendRequests == NULL);
+ 
+             QuicTraceLogStreamVerbose(
+@@ -1672,7 +1881,14 @@
+     _In_ QUIC_STREAM* Stream
+     )
+ {
+-    CXPLAT_DBG_ASSERT(Stream->Flags.LocalCloseResetReliable);
++    if (!Stream->Flags.LocalCloseResetReliable) {
++        //
++        // A later RESET_STREAM may have reduced the commitment to zero while
++        // this RESET_STREAM_AT was still in flight.
++        //
++        return;
++    }
++
+     if (Stream->UnAckedOffset >= Stream->ReliableOffsetSend && !Stream->Flags.LocalCloseAcked) {
+         Stream->Flags.LocalCloseResetReliableAcked = TRUE;
+         QuicTraceEvent(
+--- a/src/core/unittest/CMakeLists.txt
++++ b/src/core/unittest/CMakeLists.txt
+@@ -13,6 +13,7 @@
+     SettingsTest.cpp
+     SlidingWindowExtremumTest.cpp
+     SpinFrame.cpp
++    StreamResetTest.cpp
+     TicketTest.cpp
+     TransportParamTest.cpp
+     VarIntTest.cpp
+--- a/src/core/unittest/FrameTest.cpp
++++ b/src/core/unittest/FrameTest.cpp
+@@ -234,6 +234,8 @@
+ 
+     CxPlatZeroMemory(Buffer, sizeof(Buffer));
+     ASSERT_TRUE(QuicReliableResetFrameEncode(&Frame, &Offset, BufferLength, Buffer));
++    ASSERT_EQ(0x24, Buffer[0]);
++    ASSERT_FALSE(QUIC_FRAME_IS_KNOWN(0x21));
+     Offset = 1;
+     ASSERT_TRUE(QuicReliableResetFrameDecode(BufferLength, Buffer, &Offset, &DecodedFrame));
+ 
+--- a/src/core/unittest/TicketTest.cpp
++++ b/src/core/unittest/TicketTest.cpp
+@@ -481,7 +481,9 @@
+         QUIC_TP_FLAG_INITIAL_MAX_STRM_DATA_BIDI_REMOTE |
+         QUIC_TP_FLAG_INITIAL_MAX_STRM_DATA_UNI |
+         QUIC_TP_FLAG_INITIAL_MAX_STRMS_BIDI |
+-        QUIC_TP_FLAG_INITIAL_MAX_STRMS_UNI;
++        QUIC_TP_FLAG_INITIAL_MAX_STRMS_UNI |
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07 |
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10;
+     ServerTP.ActiveConnectionIdLimit = QUIC_TP_ACTIVE_CONNECTION_ID_LIMIT_MIN;
+ 
+     TEST_QUIC_SUCCEEDED(
+--- a/src/core/unittest/TransportParamTest.cpp
++++ b/src/core/unittest/TransportParamTest.cpp
+@@ -262,11 +262,124 @@
+     EncodeDecodeAndCompare(&OriginalTP, true);
+ }
+ 
+-TEST(TransportParamTest, ReliableResetEnabled)
++static
++void
++EncodeResetStreamAtAndCompareWire(
++    _In_ uint32_t Flags,
++    _In_reads_(ExpectedLength) const uint8_t* Expected,
++    _In_ uint16_t ExpectedLength
++    )
+ {
+-    QUIC_TRANSPORT_PARAMETERS OriginalTP;
+-    CxPlatZeroMemory(&OriginalTP, sizeof(OriginalTP));
+-    OriginalTP.Flags = QUIC_TP_FLAG_RELIABLE_RESET_ENABLED;
++    QUIC_TRANSPORT_PARAMETERS OriginalTP = {0};
++    OriginalTP.Flags = Flags;
++    uint32_t BufferLength = 0;
++    auto Buffer =
++        QuicCryptoTlsEncodeTransportParameters(
++            &JunkConnection, FALSE, &OriginalTP, NULL, &BufferLength);
++    ASSERT_NE(nullptr, Buffer);
++    ASSERT_EQ(
++        ExpectedLength,
++        (uint16_t)(BufferLength - CxPlatTlsTPHeaderSize));
++    ASSERT_EQ(
++        0,
++        memcmp(Buffer + CxPlatTlsTPHeaderSize, Expected, ExpectedLength));
++    CXPLAT_FREE(Buffer, QUIC_POOL_TLS_TRANSPARAMS);
++}
++
++static
++BOOLEAN
++DecodeResetStreamAtWire(
++    _In_reads_(BufferLength) const uint8_t* Buffer,
++    _In_ uint16_t BufferLength,
++    _Out_ uint32_t* Flags
++    )
++{
++    QUIC_TRANSPORT_PARAMETERS Decoded = {0};
++    const BOOLEAN Result =
++        QuicCryptoTlsDecodeTransportParameters(
++            &JunkConnection, FALSE, Buffer, BufferLength, &Decoded);
++    *Flags = Decoded.Flags;
++    QuicCryptoTlsCleanupTransportParameters(&Decoded);
++    return Result;
++}
++
++TEST(TransportParamTest, ResetStreamAtDraft07Wire)
++{
++    const uint8_t Expected[] = {
++        0xc0, 0x17, 0xf7, 0x58, 0x6d, 0x2c, 0xb5, 0x71, 0x00
++    };
++    EncodeResetStreamAtAndCompareWire(
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07,
++        Expected,
++        sizeof(Expected));
++    QUIC_TRANSPORT_PARAMETERS OriginalTP = {0};
++    OriginalTP.Flags = QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07;
+     EncodeDecodeAndCompare(&OriginalTP);
+-    EncodeDecodeAndCompare(&OriginalTP, true);
++}
++
++TEST(TransportParamTest, ResetStreamAtDraft10Wire)
++{
++    const uint8_t Expected[] = {0x1d, 0x00};
++    EncodeResetStreamAtAndCompareWire(
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10,
++        Expected,
++        sizeof(Expected));
++    QUIC_TRANSPORT_PARAMETERS OriginalTP = {0};
++    OriginalTP.Flags = QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10;
++    EncodeDecodeAndCompare(&OriginalTP);
++}
++
++TEST(TransportParamTest, ResetStreamAtBothDistinct)
++{
++    const uint8_t Expected[] = {
++        0xc0, 0x17, 0xf7, 0x58, 0x6d, 0x2c, 0xb5, 0x71, 0x00,
++        0x1d, 0x00
++    };
++    const uint32_t ExpectedFlags =
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07 |
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10;
++    EncodeResetStreamAtAndCompareWire(
++        ExpectedFlags,
++        Expected,
++        sizeof(Expected));
++
++    uint32_t Flags = 0;
++    ASSERT_TRUE(DecodeResetStreamAtWire(Expected, sizeof(Expected), &Flags));
++    ASSERT_EQ(ExpectedFlags, Flags);
++}
++
++TEST(TransportParamTest, LegacyReliableResetIsNotSupported)
++{
++    const uint8_t Legacy[] = {
++        0xc0, 0x17, 0xf7, 0x58, 0x6d, 0x2c, 0xb5, 0x70, 0x00
++    };
++    uint32_t Flags = 0;
++    ASSERT_TRUE(DecodeResetStreamAtWire(Legacy, sizeof(Legacy), &Flags));
++    ASSERT_EQ(
++        0u,
++        Flags & (QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07 |
++                 QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10));
++}
++
++TEST(TransportParamTest, ResetStreamAtInvalidLengths)
++{
++    const uint8_t Draft07[] = {
++        0xc0, 0x17, 0xf7, 0x58, 0x6d, 0x2c, 0xb5, 0x71, 0x01, 0x00
++    };
++    const uint8_t Draft10[] = {0x1d, 0x01, 0x00};
++    uint32_t Flags = 0;
++    ASSERT_FALSE(DecodeResetStreamAtWire(Draft07, sizeof(Draft07), &Flags));
++    ASSERT_FALSE(DecodeResetStreamAtWire(Draft10, sizeof(Draft10), &Flags));
++}
++
++TEST(TransportParamTest, ResetStreamAtDuplicatesRejected)
++{
++    const uint8_t Draft07[] = {
++        0xc0, 0x17, 0xf7, 0x58, 0x6d, 0x2c, 0xb5, 0x71, 0x00,
++        0xc0, 0x17, 0xf7, 0x58, 0x6d, 0x2c, 0xb5, 0x71, 0x00
++    };
++    const uint8_t Draft10[] = {0x1d, 0x00, 0x1d, 0x00};
++    uint32_t Flags = 0;
++    ASSERT_FALSE(DecodeResetStreamAtWire(Draft07, sizeof(Draft07), &Flags));
++    ASSERT_FALSE(DecodeResetStreamAtWire(Draft10, sizeof(Draft10), &Flags));
+ }
+--- a/src/cs/lib/msquic_generated.cs
++++ b/src/cs/lib/msquic_generated.cs
+@@ -248,6 +248,24 @@
+     {
+     }
+ 
++    internal partial struct QUIC_RESET_STREAM_AT_DIALECTS
++    {
++        [NativeTypeName("uint32_t")]
++        internal uint Version;
++
++        [NativeTypeName("uint32_t")]
++        internal uint SupportedDialectMask;
++
++        [NativeTypeName("uint64_t")]
++        internal ulong Draft07TransportParameterId;
++
++        [NativeTypeName("uint64_t")]
++        internal ulong Draft10TransportParameterId;
++
++        [NativeTypeName("uint64_t")]
++        internal ulong FrameType;
++    }
++
+     internal unsafe partial struct QUIC_REGISTRATION_CONFIG
+     {
+         [NativeTypeName("const char *")]
+@@ -3087,6 +3105,15 @@
+             {
+                 [NativeTypeName("BOOLEAN")]
+                 internal byte IsNegotiated;
++
++                [NativeTypeName("uint32_t")]
++                internal uint RequestedDialectMask;
++
++                [NativeTypeName("uint32_t")]
++                internal uint PeerDialectMask;
++
++                [NativeTypeName("uint32_t")]
++                internal uint NegotiatedDialectMask;
+             }
+ 
+             internal partial struct _ONE_WAY_DELAY_NEGOTIATED_e__Struct
+@@ -3600,6 +3627,21 @@
+         [NativeTypeName("#define QUIC_STATELESS_RESET_KEY_LENGTH 32")]
+         internal const uint QUIC_STATELESS_RESET_KEY_LENGTH = 32;
+ 
++        [NativeTypeName("#define QUIC_API_HAS_RESET_STREAM_AT_DIALECTS 1")]
++        internal const uint QUIC_API_HAS_RESET_STREAM_AT_DIALECTS = 1;
++
++        [NativeTypeName("#define QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07 (1u << 0)")]
++        internal const uint QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07 = 1;
++
++        [NativeTypeName("#define QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10 (1u << 1)")]
++        internal const uint QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10 = 2;
++
++        [NativeTypeName("#define QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK (QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07 | QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10)")]
++        internal const uint QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK = 3;
++
++        [NativeTypeName("#define QUIC_RESET_STREAM_AT_DIALECTS_VERSION_1 1u")]
++        internal const uint QUIC_RESET_STREAM_AT_DIALECTS_VERSION_1 = 1;
++
+         [NativeTypeName("#define QUIC_GLOBAL_EXECUTION_CONFIG_MIN_SIZE (uint32_t)FIELD_OFFSET(QUIC_GLOBAL_EXECUTION_CONFIG, ProcessorList)")]
+         internal static readonly uint QUIC_GLOBAL_EXECUTION_CONFIG_MIN_SIZE = unchecked((uint)((int)(Marshal.OffsetOf<QUIC_GLOBAL_EXECUTION_CONFIG>("ProcessorList"))));
+ 
+@@ -3678,6 +3720,9 @@
+         [NativeTypeName("#define QUIC_PARAM_GLOBAL_STATELESS_RETRY_CONFIG 0x0100000D")]
+         internal const uint QUIC_PARAM_GLOBAL_STATELESS_RETRY_CONFIG = 0x0100000D;
+ 
++        [NativeTypeName("#define QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS 0x0100000F")]
++        internal const uint QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS = 0x0100000F;
++
+         [NativeTypeName("#define QUIC_PARAM_CONFIGURATION_SETTINGS 0x03000000")]
+         internal const uint QUIC_PARAM_CONFIGURATION_SETTINGS = 0x03000000;
+ 
+@@ -3690,6 +3735,9 @@
+         [NativeTypeName("#define QUIC_PARAM_CONFIGURATION_SCHANNEL_CREDENTIAL_ATTRIBUTE_W 0x03000003")]
+         internal const uint QUIC_PARAM_CONFIGURATION_SCHANNEL_CREDENTIAL_ATTRIBUTE_W = 0x03000003;
+ 
++        [NativeTypeName("#define QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK 0x03000004")]
++        internal const uint QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK = 0x03000004;
++
+         [NativeTypeName("#define QUIC_PARAM_LISTENER_LOCAL_ADDRESS 0x04000000")]
+         internal const uint QUIC_PARAM_LISTENER_LOCAL_ADDRESS = 0x04000000;
+ 
+--- a/src/generated/linux/connection.c.clog.h
++++ b/src/generated/linux/connection.c.clog.h
+@@ -1183,18 +1183,24 @@
+ 
+ /*----------------------------------------------------------
+ // Decoder Ring for IndicateReliableResetNegotiated
+-// [conn][%p] Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu]
++// [conn][%p] Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu,Requested=0x%x,Peer=0x%x,Negotiated=0x%x]
+ // QuicTraceLogConnVerbose(
+                 IndicateReliableResetNegotiated,
+                 Connection,
+-                "Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu]",
+-                Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated);
++                "Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu,Requested=0x%x,Peer=0x%x,Negotiated=0x%x]",
++                Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated,
++                Event.RELIABLE_RESET_NEGOTIATED.RequestedDialectMask,
++                Event.RELIABLE_RESET_NEGOTIATED.PeerDialectMask,
++                Event.RELIABLE_RESET_NEGOTIATED.NegotiatedDialectMask);
+ // arg1 = arg1 = Connection = arg1
+ // arg3 = arg3 = Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated = arg3
++// arg4 = arg4 = Event.RELIABLE_RESET_NEGOTIATED.RequestedDialectMask = arg4
++// arg5 = arg5 = Event.RELIABLE_RESET_NEGOTIATED.PeerDialectMask = arg5
++// arg6 = arg6 = Event.RELIABLE_RESET_NEGOTIATED.NegotiatedDialectMask = arg6
+ ----------------------------------------------------------*/
+-#ifndef _clog_4_ARGS_TRACE_IndicateReliableResetNegotiated
+-#define _clog_4_ARGS_TRACE_IndicateReliableResetNegotiated(uniqueId, arg1, encoded_arg_string, arg3)\
+-tracepoint(CLOG_CONNECTION_C, IndicateReliableResetNegotiated , arg1, arg3);\
++#ifndef _clog_7_ARGS_TRACE_IndicateReliableResetNegotiated
++#define _clog_7_ARGS_TRACE_IndicateReliableResetNegotiated(uniqueId, arg1, encoded_arg_string, arg3, arg4, arg5, arg6)\
++tracepoint(CLOG_CONNECTION_C, IndicateReliableResetNegotiated , arg1, arg3, arg4, arg5, arg6);\
+ 
+ #endif
+ 
+--- a/src/generated/linux/connection.c.clog.h.lttng.h
++++ b/src/generated/linux/connection.c.clog.h.lttng.h
+@@ -1298,22 +1298,34 @@
+ 
+ /*----------------------------------------------------------
+ // Decoder Ring for IndicateReliableResetNegotiated
+-// [conn][%p] Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu]
++// [conn][%p] Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu,Requested=0x%x,Peer=0x%x,Negotiated=0x%x]
+ // QuicTraceLogConnVerbose(
+                 IndicateReliableResetNegotiated,
+                 Connection,
+-                "Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu]",
+-                Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated);
++                "Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu,Requested=0x%x,Peer=0x%x,Negotiated=0x%x]",
++                Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated,
++                Event.RELIABLE_RESET_NEGOTIATED.RequestedDialectMask,
++                Event.RELIABLE_RESET_NEGOTIATED.PeerDialectMask,
++                Event.RELIABLE_RESET_NEGOTIATED.NegotiatedDialectMask);
+ // arg1 = arg1 = Connection = arg1
+ // arg3 = arg3 = Event.RELIABLE_RESET_NEGOTIATED.IsNegotiated = arg3
++// arg4 = arg4 = Event.RELIABLE_RESET_NEGOTIATED.RequestedDialectMask = arg4
++// arg5 = arg5 = Event.RELIABLE_RESET_NEGOTIATED.PeerDialectMask = arg5
++// arg6 = arg6 = Event.RELIABLE_RESET_NEGOTIATED.NegotiatedDialectMask = arg6
+ ----------------------------------------------------------*/
+ TRACEPOINT_EVENT(CLOG_CONNECTION_C, IndicateReliableResetNegotiated,
+     TP_ARGS(
+         const void *, arg1,
+-        unsigned char, arg3), 
++        unsigned char, arg3,
++        unsigned int, arg4,
++        unsigned int, arg5,
++        unsigned int, arg6),
+     TP_FIELDS(
+         ctf_integer_hex(uint64_t, arg1, (uint64_t)arg1)
+         ctf_integer(unsigned char, arg3, arg3)
++        ctf_integer(unsigned int, arg4, arg4)
++        ctf_integer(unsigned int, arg5, arg5)
++        ctf_integer(unsigned int, arg6, arg6)
+     )
+ )
+ 
+--- a/src/generated/linux/crypto_tls.c.clog.h
++++ b/src/generated/linux/crypto_tls.c.clog.h
+@@ -600,6 +600,32 @@
+ 
+ 
+ /*----------------------------------------------------------
++// Decoder Ring for EncodeTPReliableResetDraft07
++// [conn][%p] TP: RESET_STREAM_AT draft-07
++----------------------------------------------------------*/
++#ifndef _clog_3_ARGS_TRACE_EncodeTPReliableResetDraft07
++#define _clog_3_ARGS_TRACE_EncodeTPReliableResetDraft07(uniqueId, arg1, encoded_arg_string)\
++tracepoint(CLOG_CRYPTO_TLS_C, EncodeTPReliableResetDraft07 , arg1);\
++
++#endif
++
++
++
++
++/*----------------------------------------------------------
++// Decoder Ring for EncodeTPReliableResetDraft10
++// [conn][%p] TP: RESET_STREAM_AT draft-10
++----------------------------------------------------------*/
++#ifndef _clog_3_ARGS_TRACE_EncodeTPReliableResetDraft10
++#define _clog_3_ARGS_TRACE_EncodeTPReliableResetDraft10(uniqueId, arg1, encoded_arg_string)\
++tracepoint(CLOG_CRYPTO_TLS_C, EncodeTPReliableResetDraft10 , arg1);\
++
++#endif
++
++
++
++
++/*----------------------------------------------------------
+ // Decoder Ring for EncodeTPTimestamp
+ // [conn][%p] TP: Timestamp (%u)
+ // QuicTraceLogConnVerbose(
+@@ -1168,6 +1194,32 @@
+ 
+ #endif
+ 
++
++
++
++/*----------------------------------------------------------
++// Decoder Ring for DecodeTPReliableResetDraft07
++// [conn][%p] TP: RESET_STREAM_AT draft-07
++----------------------------------------------------------*/
++#ifndef _clog_3_ARGS_TRACE_DecodeTPReliableResetDraft07
++#define _clog_3_ARGS_TRACE_DecodeTPReliableResetDraft07(uniqueId, arg1, encoded_arg_string)\
++tracepoint(CLOG_CRYPTO_TLS_C, DecodeTPReliableResetDraft07 , arg1);\
++
++#endif
++
++
++
++
++/*----------------------------------------------------------
++// Decoder Ring for DecodeTPReliableResetDraft10
++// [conn][%p] TP: RESET_STREAM_AT draft-10
++----------------------------------------------------------*/
++#ifndef _clog_3_ARGS_TRACE_DecodeTPReliableResetDraft10
++#define _clog_3_ARGS_TRACE_DecodeTPReliableResetDraft10(uniqueId, arg1, encoded_arg_string)\
++tracepoint(CLOG_CRYPTO_TLS_C, DecodeTPReliableResetDraft10 , arg1);\
++
++#endif
++
+ 
+ 
+ 
+--- a/src/generated/linux/crypto_tls.c.clog.h.lttng.h
++++ b/src/generated/linux/crypto_tls.c.clog.h.lttng.h
+@@ -641,7 +641,35 @@
+ ----------------------------------------------------------*/
+ TRACEPOINT_EVENT(CLOG_CRYPTO_TLS_C, EncodeTPReliableReset,
+     TP_ARGS(
+-        const void *, arg1), 
++        const void *, arg1),
++    TP_FIELDS(
++        ctf_integer_hex(uint64_t, arg1, (uint64_t)arg1)
++    )
++)
++
++
++
++/*----------------------------------------------------------
++// Decoder Ring for EncodeTPReliableResetDraft07
++// [conn][%p] TP: RESET_STREAM_AT draft-07
++----------------------------------------------------------*/
++TRACEPOINT_EVENT(CLOG_CRYPTO_TLS_C, EncodeTPReliableResetDraft07,
++    TP_ARGS(
++        const void *, arg1),
++    TP_FIELDS(
++        ctf_integer_hex(uint64_t, arg1, (uint64_t)arg1)
++    )
++)
++
++
++
++/*----------------------------------------------------------
++// Decoder Ring for EncodeTPReliableResetDraft10
++// [conn][%p] TP: RESET_STREAM_AT draft-10
++----------------------------------------------------------*/
++TRACEPOINT_EVENT(CLOG_CRYPTO_TLS_C, EncodeTPReliableResetDraft10,
++    TP_ARGS(
++        const void *, arg1),
+     TP_FIELDS(
+         ctf_integer_hex(uint64_t, arg1, (uint64_t)arg1)
+     )
+@@ -1293,7 +1321,35 @@
+ ----------------------------------------------------------*/
+ TRACEPOINT_EVENT(CLOG_CRYPTO_TLS_C, DecodeTPReliableReset,
+     TP_ARGS(
+-        const void *, arg1), 
++        const void *, arg1),
++    TP_FIELDS(
++        ctf_integer_hex(uint64_t, arg1, (uint64_t)arg1)
++    )
++)
++
++
++
++/*----------------------------------------------------------
++// Decoder Ring for DecodeTPReliableResetDraft07
++// [conn][%p] TP: RESET_STREAM_AT draft-07
++----------------------------------------------------------*/
++TRACEPOINT_EVENT(CLOG_CRYPTO_TLS_C, DecodeTPReliableResetDraft07,
++    TP_ARGS(
++        const void *, arg1),
++    TP_FIELDS(
++        ctf_integer_hex(uint64_t, arg1, (uint64_t)arg1)
++    )
++)
++
++
++
++/*----------------------------------------------------------
++// Decoder Ring for DecodeTPReliableResetDraft10
++// [conn][%p] TP: RESET_STREAM_AT draft-10
++----------------------------------------------------------*/
++TRACEPOINT_EVENT(CLOG_CRYPTO_TLS_C, DecodeTPReliableResetDraft10,
++    TP_ARGS(
++        const void *, arg1),
+     TP_FIELDS(
+         ctf_integer_hex(uint64_t, arg1, (uint64_t)arg1)
+     )
+--- a/src/inc/msquic.h
++++ b/src/inc/msquic.h
+@@ -368,6 +368,24 @@
+     QUIC_XDP_MAP_HANDLE MapHandle;  // XDP map handle.
+ } QUIC_XDP_MAP_CONFIG;
+ 
++#define QUIC_API_HAS_RESET_STREAM_AT_DIALECTS 1
++
++#define QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07 (1u << 0)
++#define QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10 (1u << 1)
++#define QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK \
++    (QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07 | \
++     QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10)
++
++#define QUIC_RESET_STREAM_AT_DIALECTS_VERSION_1 1u
++
++typedef struct QUIC_RESET_STREAM_AT_DIALECTS {
++    uint32_t Version;
++    uint32_t SupportedDialectMask;
++    uint64_t Draft07TransportParameterId;
++    uint64_t Draft10TransportParameterId;
++    uint64_t FrameType;
++} QUIC_RESET_STREAM_AT_DIALECTS;
++
+ #endif // QUIC_API_ENABLE_PREVIEW_FEATURES
+ 
+ typedef struct QUIC_REGISTRATION_CONFIG { // All fields may be NULL/zero.
+@@ -866,7 +884,7 @@
+             uint64_t HyStartEnabled            : 1;
+ #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+             uint64_t EncryptionOffloadAllowed  : 1;
+-            uint64_t ReliableResetEnabled      : 1;
++            uint64_t ReliableResetEnabled      : 1; // Deprecated shorthand for all supported RESET_STREAM_AT dialects.
+             uint64_t OneWayDelayEnabled        : 1;
+             uint64_t NetStatsEventEnabled      : 1;
+             uint64_t StreamMultiReceiveEnabled : 1;
+@@ -1008,6 +1026,7 @@
+ #define QUIC_PARAM_GLOBAL_STATELESS_RETRY_CONFIG        0x0100000D  // QUIC_STATELESS_RETRY_CONFIG
+ #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+ #define QUIC_PARAM_GLOBAL_XDP_MAP_CONFIG                0x0100000E  // QUIC_XDP_MAP_CONFIG[]
++#define QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS      0x0100000F  // QUIC_RESET_STREAM_AT_DIALECTS, get-only
+ #endif
+ 
+ //
+@@ -1029,6 +1048,9 @@
+     void* Buffer;
+ } QUIC_SCHANNEL_CREDENTIAL_ATTRIBUTE_W;
+ #define QUIC_PARAM_CONFIGURATION_SCHANNEL_CREDENTIAL_ATTRIBUTE_W  0x03000003  // QUIC_SCHANNEL_CREDENTIAL_ATTRIBUTE_W
++#ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
++#define QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK      0x03000004  // uint32_t, get/set
++#endif
+ 
+ //
+ // Parameters for Listener.
+@@ -1370,7 +1392,7 @@
+     QUIC_CONNECTION_EVENT_RESUMPTION_TICKET_RECEIVED        = 14,   // Client-only; provides ticket to persist, if any.
+     QUIC_CONNECTION_EVENT_PEER_CERTIFICATE_RECEIVED         = 15,   // Only with QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED set
+ #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+-    QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED         = 16,   // Only indicated if QUIC_SETTINGS.ReliableResetEnabled is TRUE.
++    QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED         = 16,   // Only indicated if a nonzero RESET_STREAM_AT dialect mask was requested.
+     QUIC_CONNECTION_EVENT_ONE_WAY_DELAY_NEGOTIATED          = 17,   // Only indicated if QUIC_SETTINGS.OneWayDelayEnabled is TRUE.
+     QUIC_CONNECTION_EVENT_NETWORK_STATISTICS                = 18,   // Only indicated if QUIC_SETTINGS.EnableNetStatsEvent is TRUE.
+ #endif
+@@ -1450,6 +1472,9 @@
+ #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+         struct {
+             BOOLEAN IsNegotiated;
++            uint32_t RequestedDialectMask;
++            uint32_t PeerDialectMask;
++            uint32_t NegotiatedDialectMask;
+         } RELIABLE_RESET_NEGOTIATED;
+         struct {
+             BOOLEAN SendNegotiated;             // TRUE if sending one-way delay timestamps is negotiated.
+--- a/src/inc/msquic.hpp
++++ b/src/inc/msquic.hpp
+@@ -733,6 +733,8 @@
+     MsQuicSettings& SetHyStartEnabled(bool Value) { HyStartEnabled = Value; IsSet.HyStartEnabled = TRUE; return *this; }
+ #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+     MsQuicSettings& SetEncryptionOffloadAllowed(bool Value) { EncryptionOffloadAllowed = Value; IsSet.EncryptionOffloadAllowed = TRUE; return *this; }
++    // Deprecated compatibility shorthand: TRUE requests all supported modern
++    // RESET_STREAM_AT dialects; FALSE requests none.
+     MsQuicSettings& SetReliableResetEnabled(bool value) { ReliableResetEnabled = value; IsSet.ReliableResetEnabled = TRUE; return *this; }
+     MsQuicSettings& SetXdpEnabled(bool value) { XdpEnabled = value; IsSet.XdpEnabled = TRUE; return *this; }
+     MsQuicSettings& SetQtipEnabled(bool value) { QTIPEnabled = value; IsSet.QTIPEnabled = TRUE; return *this; }
+@@ -973,6 +975,15 @@
+             sizeof(_Value),
+             &_Value);
+     }
++
++    QUIC_STATUS
++    SetResetStreamAtDialectMask(_In_ uint32_t DialectMask) noexcept {
++        return MsQuic->SetParam(
++            Handle,
++            QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++            sizeof(DialectMask),
++            &DialectMask);
++    }
+ #endif
+ };
+ 
+--- a/src/manifest/clog.sidecar
++++ b/src/manifest/clog.sidecar
+@@ -3534,10 +3534,22 @@
+       ],
+       "macroName": "QuicTraceLogConnVerbose"
+     },
+-    "DecodeTPReliableReset": {
++    "DecodeTPReliableResetDraft07": {
+       "ModuleProperites": {},
+-      "TraceString": "[conn][%p] TP: Reliable Reset",
+-      "UniqueId": "DecodeTPReliableReset",
++      "TraceString": "[conn][%p] TP: RESET_STREAM_AT draft-07",
++      "UniqueId": "DecodeTPReliableResetDraft07",
++      "splitArgs": [
++        {
++          "DefinationEncoding": "p",
++          "MacroVariableName": "arg1"
++        }
++      ],
++      "macroName": "QuicTraceLogConnVerbose"
++    },
++    "DecodeTPReliableResetDraft10": {
++      "ModuleProperites": {},
++      "TraceString": "[conn][%p] TP: RESET_STREAM_AT draft-10",
++      "UniqueId": "DecodeTPReliableResetDraft10",
+       "splitArgs": [
+         {
+           "DefinationEncoding": "p",
+@@ -4078,10 +4090,22 @@
+       ],
+       "macroName": "QuicTraceLogConnVerbose"
+     },
+-    "EncodeTPReliableReset": {
++    "EncodeTPReliableResetDraft07": {
+       "ModuleProperites": {},
+-      "TraceString": "[conn][%p] TP: Reliable Reset",
+-      "UniqueId": "EncodeTPReliableReset",
++      "TraceString": "[conn][%p] TP: RESET_STREAM_AT draft-07",
++      "UniqueId": "EncodeTPReliableResetDraft07",
++      "splitArgs": [
++        {
++          "DefinationEncoding": "p",
++          "MacroVariableName": "arg1"
++        }
++      ],
++      "macroName": "QuicTraceLogConnVerbose"
++    },
++    "EncodeTPReliableResetDraft10": {
++      "ModuleProperites": {},
++      "TraceString": "[conn][%p] TP: RESET_STREAM_AT draft-10",
++      "UniqueId": "EncodeTPReliableResetDraft10",
+       "splitArgs": [
+         {
+           "DefinationEncoding": "p",
+@@ -6123,7 +6147,7 @@
+     },
+     "IndicateReliableResetNegotiated": {
+       "ModuleProperites": {},
+-      "TraceString": "[conn][%p] Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu]",
++      "TraceString": "[conn][%p] Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu,Requested=0x%x,Peer=0x%x,Negotiated=0x%x]",
+       "UniqueId": "IndicateReliableResetNegotiated",
+       "splitArgs": [
+         {
+@@ -6133,6 +6157,18 @@
+         {
+           "DefinationEncoding": "hhu",
+           "MacroVariableName": "arg3"
++        },
++        {
++          "DefinationEncoding": "x",
++          "MacroVariableName": "arg4"
++        },
++        {
++          "DefinationEncoding": "x",
++          "MacroVariableName": "arg5"
++        },
++        {
++          "DefinationEncoding": "x",
++          "MacroVariableName": "arg6"
+         }
+       ],
+       "macroName": "QuicTraceLogConnVerbose"
+@@ -14414,9 +14450,14 @@
+         "EncodingString": "[conn][%p] TP: Preferred Address"
+       },
+       {
+-        "UniquenessHash": "ffb471c9-3bff-13c2-957a-46960c4d2d72",
+-        "TraceID": "DecodeTPReliableReset",
+-        "EncodingString": "[conn][%p] TP: Reliable Reset"
++        "UniquenessHash": "28663a55-4277-ddaa-3bae-421f4d08d194",
++        "TraceID": "DecodeTPReliableResetDraft07",
++        "EncodingString": "[conn][%p] TP: RESET_STREAM_AT draft-07"
++      },
++      {
++        "UniquenessHash": "5479c8c9-f36e-522c-9312-7e016b762d81",
++        "TraceID": "DecodeTPReliableResetDraft10",
++        "EncodingString": "[conn][%p] TP: RESET_STREAM_AT draft-10"
+       },
+       {
+         "UniquenessHash": "95f4176f-e0b5-1420-53d9-44e244c44ea5",
+@@ -14594,6 +14635,16 @@
+         "EncodingString": "[conn][%p] TP: Reliable Reset"
+       },
+       {
++        "UniquenessHash": "9d24fe09-a176-c92f-18e1-6923d16fbf5f",
++        "TraceID": "EncodeTPReliableResetDraft07",
++        "EncodingString": "[conn][%p] TP: RESET_STREAM_AT draft-07"
++      },
++      {
++        "UniquenessHash": "691a7c48-312e-ef29-3feb-87e154b68ae7",
++        "TraceID": "EncodeTPReliableResetDraft10",
++        "EncodingString": "[conn][%p] TP: RESET_STREAM_AT draft-10"
++      },
++      {
+         "UniquenessHash": "214be45a-42ba-44e1-05c2-f82f3200e671",
+         "TraceID": "EncodeTPRetrySourceCID",
+         "EncodingString": "[conn][%p] TP: Retry Source Connection ID (%s)"
+@@ -15099,9 +15150,9 @@
+         "EncodingString": "[conn][%p] Indicating QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED [%p, 0x%x]"
+       },
+       {
+-        "UniquenessHash": "cb6ed5bc-5216-e56f-9e29-117ba277fde6",
++        "UniquenessHash": "c39dee69-6355-7bf1-6df5-c641f97f67c6",
+         "TraceID": "IndicateReliableResetNegotiated",
+-        "EncodingString": "[conn][%p] Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu]"
++        "EncodingString": "[conn][%p] Indicating QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED [IsNegotiated=%hhu,Requested=0x%x,Peer=0x%x,Negotiated=0x%x]"
+       },
+       {
+         "UniquenessHash": "8c1a717b-f814-d6d9-3f2e-f1987be847d6",
+--- a/src/plugins/dbg/quictypes.h
++++ b/src/plugins/dbg/quictypes.h
+@@ -46,7 +46,13 @@
+         BOOLEAN LocalCloseReset         : 1;    // Locally closed (locally aborted).
+         BOOLEAN LocalCloseResetReliable : 1;    // Indicates that we should shutdown the send path once we sent/ACK'd ReliableOffsetSend bytes.
+         BOOLEAN LocalCloseResetReliableAcked : 1; // Indicates the peer has acknowledged we will stop sending once we sent/ACK'd ReliableOffsetSend bytes.
+-        BOOLEAN RemoteCloseResetReliable : 1;   // Indicates that the peer initiated a reliable reset. Keep Recv path available for RecvMaxLength bytes.
++        BOOLEAN ReliableOffsetSendSet   : 1;    // Indicates ReliableOffsetSend was explicitly configured; zero is a valid value.
++        BOOLEAN ReliableResetSendFinalSizeSet : 1; // Indicates ReliableResetSendFinalSize was committed.
++        BOOLEAN ReliableResetSendFinalSizeReserved : 1; // Indicates connection flow control was reserved for ReliableResetSendFinalSize.
++        BOOLEAN RemoteCloseResetReliable : 1;   // Indicates that the peer initiated a reliable reset. Keep Recv path available through ReliableOffsetRecv.
++        BOOLEAN RecvResetErrorCodeSet   : 1;    // Indicates RecvResetErrorCode is immutable for received reset frames.
++        BOOLEAN RecvFinalSizeAccounted  : 1;    // Indicates RecvMaxLength has been charged to connection flow control.
++        BOOLEAN RecvFinalSizeCreditReturned : 1; // Indicates connection flow control credit for the final size was returned.
+         BOOLEAN ReceivedStopSending     : 1;    // Peer sent STOP_SENDING frame.
+         BOOLEAN LocalCloseAcked         : 1;    // Any close acknowledged.
+         BOOLEAN FinAcked                : 1;    // Our FIN was acknowledged.
+--- a/src/rs/ffi/linux_bindings.rs
++++ b/src/rs/ffi/linux_bindings.rs
+@@ -150,6 +150,11 @@
+ pub const QUIC_MAX_SNI_LENGTH: u32 = 65535;
+ pub const QUIC_MAX_RESUMPTION_APP_DATA_LENGTH: u32 = 1000;
+ pub const QUIC_STATELESS_RESET_KEY_LENGTH: u32 = 32;
++pub const QUIC_API_HAS_RESET_STREAM_AT_DIALECTS: u32 = 1;
++pub const QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07: u32 = 1;
++pub const QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10: u32 = 2;
++pub const QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK: u32 = 3;
++pub const QUIC_RESET_STREAM_AT_DIALECTS_VERSION_1: u32 = 1;
+ pub const QUIC_MAX_TICKET_KEY_COUNT: u32 = 16;
+ pub const QUIC_TLS_SECRETS_MAX_SECRET_LEN: u32 = 64;
+ pub const QUIC_PARAM_PREFIX_GLOBAL: u32 = 16777216;
+@@ -176,10 +181,12 @@
+ pub const QUIC_PARAM_GLOBAL_STATISTICS_V2_SIZES: u32 = 16777228;
+ pub const QUIC_PARAM_GLOBAL_STATELESS_RETRY_CONFIG: u32 = 16777229;
+ pub const QUIC_PARAM_GLOBAL_XDP_MAP_CONFIG: u32 = 16777230;
++pub const QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS: u32 = 16777231;
+ pub const QUIC_PARAM_CONFIGURATION_SETTINGS: u32 = 50331648;
+ pub const QUIC_PARAM_CONFIGURATION_TICKET_KEYS: u32 = 50331649;
+ pub const QUIC_PARAM_CONFIGURATION_VERSION_SETTINGS: u32 = 50331650;
+ pub const QUIC_PARAM_CONFIGURATION_SCHANNEL_CREDENTIAL_ATTRIBUTE_W: u32 = 50331651;
++pub const QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK: u32 = 50331652;
+ pub const QUIC_PARAM_LISTENER_LOCAL_ADDRESS: u32 = 67108864;
+ pub const QUIC_PARAM_LISTENER_STATS: u32 = 67108865;
+ pub const QUIC_PARAM_LISTENER_CIBIR_ID: u32 = 67108866;
+@@ -519,6 +526,36 @@
+ };
+ #[repr(C)]
+ #[derive(Debug, Copy, Clone)]
++pub struct QUIC_RESET_STREAM_AT_DIALECTS {
++    pub Version: u32,
++    pub SupportedDialectMask: u32,
++    pub Draft07TransportParameterId: u64,
++    pub Draft10TransportParameterId: u64,
++    pub FrameType: u64,
++}
++#[allow(clippy::unnecessary_operation, clippy::identity_op)]
++const _: () = {
++    ["Size of QUIC_RESET_STREAM_AT_DIALECTS"]
++        [::std::mem::size_of::<QUIC_RESET_STREAM_AT_DIALECTS>() - 32usize];
++    ["Alignment of QUIC_RESET_STREAM_AT_DIALECTS"]
++        [::std::mem::align_of::<QUIC_RESET_STREAM_AT_DIALECTS>() - 8usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::Version"]
++        [::std::mem::offset_of!(QUIC_RESET_STREAM_AT_DIALECTS, Version) - 0usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::SupportedDialectMask"]
++        [::std::mem::offset_of!(QUIC_RESET_STREAM_AT_DIALECTS, SupportedDialectMask) - 4usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::Draft07TransportParameterId"][::std::mem::offset_of!(
++        QUIC_RESET_STREAM_AT_DIALECTS,
++        Draft07TransportParameterId
++    ) - 8usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::Draft10TransportParameterId"][::std::mem::offset_of!(
++        QUIC_RESET_STREAM_AT_DIALECTS,
++        Draft10TransportParameterId
++    ) - 16usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::FrameType"]
++        [::std::mem::offset_of!(QUIC_RESET_STREAM_AT_DIALECTS, FrameType) - 24usize];
++};
++#[repr(C)]
++#[derive(Debug, Copy, Clone)]
+ pub struct QUIC_REGISTRATION_CONFIG {
+     pub AppName: *const ::std::os::raw::c_char,
+     pub ExecutionProfile: QUIC_EXECUTION_PROFILE,
+@@ -5855,18 +5892,36 @@
+ #[derive(Debug, Copy, Clone)]
+ pub struct QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17 {
+     pub IsNegotiated: BOOLEAN,
++    pub RequestedDialectMask: u32,
++    pub PeerDialectMask: u32,
++    pub NegotiatedDialectMask: u32,
+ }
+ #[allow(clippy::unnecessary_operation, clippy::identity_op)]
+ const _: () = {
+     ["Size of QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17"]
+-        [::std::mem::size_of::<QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17>() - 1usize];
++        [::std::mem::size_of::<QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17>() - 16usize];
+     ["Alignment of QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17"]
+-        [::std::mem::align_of::<QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17>() - 1usize];
++        [::std::mem::align_of::<QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17>() - 4usize];
+     ["Offset of field: QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17::IsNegotiated"][::std::mem::offset_of!(
+         QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17,
+         IsNegotiated
+     )
+         - 0usize];
++    ["Offset of field: QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17::RequestedDialectMask"][::std::mem::offset_of!(
++        QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17,
++        RequestedDialectMask
++    )
++        - 4usize];
++    ["Offset of field: QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17::PeerDialectMask"][::std::mem::offset_of!(
++        QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17,
++        PeerDialectMask
++    )
++        - 8usize];
++    ["Offset of field: QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17::NegotiatedDialectMask"]
++        [::std::mem::offset_of!(
++            QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17,
++            NegotiatedDialectMask
++        ) - 12usize];
+ };
+ #[repr(C)]
+ #[derive(Debug, Copy, Clone)]
+--- a/src/rs/ffi/win_bindings.rs
++++ b/src/rs/ffi/win_bindings.rs
+@@ -144,6 +144,11 @@
+ pub const QUIC_MAX_SNI_LENGTH: u32 = 65535;
+ pub const QUIC_MAX_RESUMPTION_APP_DATA_LENGTH: u32 = 1000;
+ pub const QUIC_STATELESS_RESET_KEY_LENGTH: u32 = 32;
++pub const QUIC_API_HAS_RESET_STREAM_AT_DIALECTS: u32 = 1;
++pub const QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07: u32 = 1;
++pub const QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10: u32 = 2;
++pub const QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK: u32 = 3;
++pub const QUIC_RESET_STREAM_AT_DIALECTS_VERSION_1: u32 = 1;
+ pub const QUIC_MAX_TICKET_KEY_COUNT: u32 = 16;
+ pub const QUIC_TLS_SECRETS_MAX_SECRET_LEN: u32 = 64;
+ pub const QUIC_PARAM_PREFIX_GLOBAL: u32 = 16777216;
+@@ -170,10 +175,12 @@
+ pub const QUIC_PARAM_GLOBAL_STATISTICS_V2_SIZES: u32 = 16777228;
+ pub const QUIC_PARAM_GLOBAL_STATELESS_RETRY_CONFIG: u32 = 16777229;
+ pub const QUIC_PARAM_GLOBAL_XDP_MAP_CONFIG: u32 = 16777230;
++pub const QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS: u32 = 16777231;
+ pub const QUIC_PARAM_CONFIGURATION_SETTINGS: u32 = 50331648;
+ pub const QUIC_PARAM_CONFIGURATION_TICKET_KEYS: u32 = 50331649;
+ pub const QUIC_PARAM_CONFIGURATION_VERSION_SETTINGS: u32 = 50331650;
+ pub const QUIC_PARAM_CONFIGURATION_SCHANNEL_CREDENTIAL_ATTRIBUTE_W: u32 = 50331651;
++pub const QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK: u32 = 50331652;
+ pub const QUIC_PARAM_LISTENER_LOCAL_ADDRESS: u32 = 67108864;
+ pub const QUIC_PARAM_LISTENER_STATS: u32 = 67108865;
+ pub const QUIC_PARAM_LISTENER_CIBIR_ID: u32 = 67108866;
+@@ -517,6 +524,36 @@
+ };
+ #[repr(C)]
+ #[derive(Debug, Copy, Clone)]
++pub struct QUIC_RESET_STREAM_AT_DIALECTS {
++    pub Version: u32,
++    pub SupportedDialectMask: u32,
++    pub Draft07TransportParameterId: u64,
++    pub Draft10TransportParameterId: u64,
++    pub FrameType: u64,
++}
++#[allow(clippy::unnecessary_operation, clippy::identity_op)]
++const _: () = {
++    ["Size of QUIC_RESET_STREAM_AT_DIALECTS"]
++        [::std::mem::size_of::<QUIC_RESET_STREAM_AT_DIALECTS>() - 32usize];
++    ["Alignment of QUIC_RESET_STREAM_AT_DIALECTS"]
++        [::std::mem::align_of::<QUIC_RESET_STREAM_AT_DIALECTS>() - 8usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::Version"]
++        [::std::mem::offset_of!(QUIC_RESET_STREAM_AT_DIALECTS, Version) - 0usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::SupportedDialectMask"]
++        [::std::mem::offset_of!(QUIC_RESET_STREAM_AT_DIALECTS, SupportedDialectMask) - 4usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::Draft07TransportParameterId"][::std::mem::offset_of!(
++        QUIC_RESET_STREAM_AT_DIALECTS,
++        Draft07TransportParameterId
++    ) - 8usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::Draft10TransportParameterId"][::std::mem::offset_of!(
++        QUIC_RESET_STREAM_AT_DIALECTS,
++        Draft10TransportParameterId
++    ) - 16usize];
++    ["Offset of field: QUIC_RESET_STREAM_AT_DIALECTS::FrameType"]
++        [::std::mem::offset_of!(QUIC_RESET_STREAM_AT_DIALECTS, FrameType) - 24usize];
++};
++#[repr(C)]
++#[derive(Debug, Copy, Clone)]
+ pub struct QUIC_REGISTRATION_CONFIG {
+     pub AppName: *const ::std::os::raw::c_char,
+     pub ExecutionProfile: QUIC_EXECUTION_PROFILE,
+@@ -5883,18 +5920,36 @@
+ #[derive(Debug, Copy, Clone)]
+ pub struct QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17 {
+     pub IsNegotiated: BOOLEAN,
++    pub RequestedDialectMask: u32,
++    pub PeerDialectMask: u32,
++    pub NegotiatedDialectMask: u32,
+ }
+ #[allow(clippy::unnecessary_operation, clippy::identity_op)]
+ const _: () = {
+     ["Size of QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17"]
+-        [::std::mem::size_of::<QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17>() - 1usize];
++        [::std::mem::size_of::<QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17>() - 16usize];
+     ["Alignment of QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17"]
+-        [::std::mem::align_of::<QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17>() - 1usize];
++        [::std::mem::align_of::<QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17>() - 4usize];
+     ["Offset of field: QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17::IsNegotiated"][::std::mem::offset_of!(
+         QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17,
+         IsNegotiated
+     )
+         - 0usize];
++    ["Offset of field: QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17::RequestedDialectMask"][::std::mem::offset_of!(
++        QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17,
++        RequestedDialectMask
++    )
++        - 4usize];
++    ["Offset of field: QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17::PeerDialectMask"][::std::mem::offset_of!(
++        QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17,
++        PeerDialectMask
++    )
++        - 8usize];
++    ["Offset of field: QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17::NegotiatedDialectMask"]
++        [::std::mem::offset_of!(
++            QUIC_CONNECTION_EVENT__bindgen_ty_1__bindgen_ty_17,
++            NegotiatedDialectMask
++        ) - 12usize];
+ };
+ #[repr(C)]
+ #[derive(Debug, Copy, Clone)]
+--- a/src/rs/types.rs
++++ b/src/rs/types.rs
+@@ -155,8 +155,13 @@
+         deferred_status: crate::Status,
+         chain: *mut crate::ffi::QUIC_CERTIFICATE_CHAIN,
+     },
+-    // TODO: preview features
+-    // ReliableResetNegotiated, // Only indicated if QUIC_SETTINGS.ReliableResetEnabled is TRUE.
++    ReliableResetNegotiated {
++        is_negotiated: bool,
++        requested_dialect_mask: u32,
++        peer_dialect_mask: u32,
++        negotiated_dialect_mask: u32,
++    },
++    // TODO: remaining preview features
+     // OneWayDelayNegotiated,   // Only indicated if QUIC_SETTINGS.OneWayDelayEnabled is TRUE.
+     // NetworkStatistics,       // Only indicated if QUIC_SETTINGS.EnableNetStatsEvent is TRUE.
+ }
+@@ -242,6 +247,15 @@
+                 chain: ev.Chain
+               }
+             }
++            crate::ffi::QUIC_CONNECTION_EVENT_TYPE_QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED => {
++              let ev = unsafe { value.__bindgen_anon_1.RELIABLE_RESET_NEGOTIATED };
++              Self::ReliableResetNegotiated {
++                is_negotiated: ev.IsNegotiated != 0,
++                requested_dialect_mask: ev.RequestedDialectMask,
++                peer_dialect_mask: ev.PeerDialectMask,
++                negotiated_dialect_mask: ev.NegotiatedDialectMask,
++              }
++            }
+             _ => {
+                 todo!("unknown event. maybe preview feature.")
+             }
+--- a/src/test/bin/quic_gtest.cpp
++++ b/src/test/bin/quic_gtest.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <MsQuicTests.h>
+ 
++#include <algorithm>
+ #include <array>
+ #include <vector>
+ 
+@@ -1370,7 +1371,33 @@
+         (args.ClientSupport ? "Client Yes" : "Client No");
+ }
+ 
+-TEST_P(WithFeatureSupportArgs, ReliableResetNegotiation) {
++struct WithResetStreamAtDialectArgs : public testing::Test,
++    public testing::WithParamInterface<ResetStreamAtDialectArgs> {
++
++    static ::std::vector<ResetStreamAtDialectArgs> Generate() {
++        ::std::vector<ResetStreamAtDialectArgs> list;
++        const uint32_t Masks[] = {
++            0,
++            QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07,
++            QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10,
++            QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK
++        };
++        for (int Family : {4, 6})
++        for (uint32_t ServerDialectMask : Masks)
++        for (uint32_t ClientDialectMask : Masks) {
++            list.push_back({Family, ServerDialectMask, ClientDialectMask});
++        }
++        return list;
++    }
++};
++
++std::ostream& operator << (std::ostream& o, const ResetStreamAtDialectArgs& args) {
++    return o <<
++        (args.Family == 4 ? "v4" : "v6") << "/ServerMask=" <<
++        args.ServerDialectMask << "/ClientMask=" << args.ClientDialectMask;
++}
++
++TEST_P(WithResetStreamAtDialectArgs, ReliableResetNegotiation) {
+     TestLoggerT<ParamType> Logger("ReliableResetNegotiation", GetParam());
+     if (TestingKernelMode) {
+         ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestReliableResetNegotiation), GetParam()));
+@@ -1379,6 +1406,11 @@
+     }
+ }
+ 
++INSTANTIATE_TEST_SUITE_P(
++    Handshake,
++    WithResetStreamAtDialectArgs,
++    testing::ValuesIn(WithResetStreamAtDialectArgs::Generate()));
++
+ TEST_P(WithFeatureSupportArgs, OneWayDelayNegotiation) {
+     TestLoggerT<ParamType> Logger("OneWayDelayNegotiation", GetParam());
+     if (TestingKernelMode) {
+--- a/src/test/lib/ApiTest.cpp
++++ b/src/test/lib/ApiTest.cpp
+@@ -2307,6 +2307,65 @@
+     }
+ 
+     //
++    // QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS
++    //
++    {
++        TestScopeLogger LogScope("QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS");
++        using ReliableResetNegotiatedEvent =
++            decltype(((QUIC_CONNECTION_EVENT*)nullptr)->RELIABLE_RESET_NEGOTIATED);
++        static_assert(offsetof(ReliableResetNegotiatedEvent, RequestedDialectMask) == 4);
++        static_assert(offsetof(ReliableResetNegotiatedEvent, PeerDialectMask) == 8);
++        static_assert(offsetof(ReliableResetNegotiatedEvent, NegotiatedDialectMask) == 12);
++
++        uint32_t Length = 0;
++        TEST_QUIC_STATUS(
++            QUIC_STATUS_BUFFER_TOO_SMALL,
++            MsQuic->GetParam(
++                nullptr,
++                QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS,
++                &Length,
++                nullptr));
++        TEST_EQUAL(Length, sizeof(QUIC_RESET_STREAM_AT_DIALECTS));
++
++        Length = sizeof(QUIC_RESET_STREAM_AT_DIALECTS);
++        TEST_QUIC_STATUS(
++            QUIC_STATUS_INVALID_PARAMETER,
++            MsQuic->GetParam(
++                nullptr,
++                QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS,
++                &Length,
++                nullptr));
++
++        uint8_t Buffer[sizeof(QUIC_RESET_STREAM_AT_DIALECTS) + 16] = {0};
++        Length = sizeof(Buffer);
++        TEST_QUIC_SUCCEEDED(
++            MsQuic->GetParam(
++                nullptr,
++                QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS,
++                &Length,
++                Buffer));
++        TEST_EQUAL(Length, sizeof(QUIC_RESET_STREAM_AT_DIALECTS));
++
++        const auto* Descriptor =
++            reinterpret_cast<const QUIC_RESET_STREAM_AT_DIALECTS*>(Buffer);
++        TEST_EQUAL(Descriptor->Version, QUIC_RESET_STREAM_AT_DIALECTS_VERSION_1);
++        TEST_EQUAL(
++            Descriptor->SupportedDialectMask,
++            QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK);
++        TEST_EQUAL(Descriptor->Draft07TransportParameterId, 0x17f7586d2cb571ULL);
++        TEST_EQUAL(Descriptor->Draft10TransportParameterId, 0x1dULL);
++        TEST_EQUAL(Descriptor->FrameType, 0x24ULL);
++
++        TEST_QUIC_STATUS(
++            QUIC_STATUS_INVALID_PARAMETER,
++            MsQuic->SetParam(
++                nullptr,
++                QUIC_PARAM_GLOBAL_RESET_STREAM_AT_DIALECTS,
++                sizeof(*Descriptor),
++                Descriptor));
++    }
++
++    //
+     // QUIC_PARAM_GLOBAL_LOAD_BALACING_MODE
+     //
+     {
+@@ -3398,6 +3457,24 @@
+ #define SETTINGS_SIZE_THRU_FIELD(SettingsType, Field) \
+     (FIELD_OFFSET(SettingsType, Field) + sizeof(((SettingsType*)0)->Field))
+ 
++static
++void
++GetConfigurationResetStreamAtMask(
++    _In_ HQUIC Configuration,
++    _Out_ uint32_t* Mask
++    )
++{
++    uint32_t Length = sizeof(*Mask);
++    *Mask = UINT32_MAX;
++    TEST_QUIC_SUCCEEDED(
++        MsQuic->GetParam(
++            Configuration,
++            QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++            &Length,
++            Mask));
++    TEST_EQUAL(Length, sizeof(*Mask));
++}
++
+ void QuicTestConfigurationParam()
+ {
+     MsQuicRegistration Registration;
+@@ -3476,6 +3553,121 @@
+     }
+ 
+     //
++    // QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK
++    //
++    {
++        TestScopeLogger LogScope0("QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK");
++        MsQuicConfiguration Configuration(Registration, Alpn);
++        TEST_TRUE(Configuration.IsValid());
++
++        uint32_t EffectiveMask = UINT32_MAX;
++        GetConfigurationResetStreamAtMask(Configuration, &EffectiveMask);
++        TEST_EQUAL(EffectiveMask, 0u);
++
++        const uint32_t ValidMasks[] = {
++            0,
++            QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07,
++            QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10,
++            QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK
++        };
++        for (uint32_t Mask : ValidMasks) {
++            TEST_QUIC_SUCCEEDED(
++                MsQuic->SetParam(
++                    Configuration,
++                    QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                    sizeof(Mask),
++                    &Mask));
++            GetConfigurationResetStreamAtMask(Configuration, &EffectiveMask);
++            TEST_EQUAL(EffectiveMask, Mask);
++        }
++
++        uint32_t PreviousMask = QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10;
++        TEST_QUIC_SUCCEEDED(
++            MsQuic->SetParam(
++                Configuration,
++                QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                sizeof(PreviousMask),
++                &PreviousMask));
++        const uint32_t UnsupportedMask = 1u << 31;
++        TEST_QUIC_STATUS(
++            QUIC_STATUS_INVALID_PARAMETER,
++            MsQuic->SetParam(
++                Configuration,
++                QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                sizeof(UnsupportedMask),
++                &UnsupportedMask));
++        GetConfigurationResetStreamAtMask(Configuration, &EffectiveMask);
++        TEST_EQUAL(EffectiveMask, PreviousMask);
++
++        TEST_QUIC_STATUS(
++            QUIC_STATUS_INVALID_PARAMETER,
++            MsQuic->SetParam(
++                Configuration,
++                QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                sizeof(uint32_t),
++                nullptr));
++        for (uint32_t Length : {0u, 3u, 5u}) {
++            TEST_QUIC_STATUS(
++                QUIC_STATUS_INVALID_PARAMETER,
++                MsQuic->SetParam(
++                    Configuration,
++                    QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                    Length,
++                    &PreviousMask));
++        }
++
++        uint32_t Length = 0;
++        TEST_QUIC_STATUS(
++            QUIC_STATUS_BUFFER_TOO_SMALL,
++            MsQuic->GetParam(
++                Configuration,
++                QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                &Length,
++                nullptr));
++        TEST_EQUAL(Length, sizeof(uint32_t));
++        Length = sizeof(uint32_t);
++        TEST_QUIC_STATUS(
++            QUIC_STATUS_INVALID_PARAMETER,
++            MsQuic->GetParam(
++                Configuration,
++                QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                &Length,
++                nullptr));
++
++        MsQuicSettings AliasSettings;
++        AliasSettings.SetReliableResetEnabled(true);
++        MsQuicConfiguration AliasConfiguration(Registration, Alpn, AliasSettings);
++        TEST_TRUE(AliasConfiguration.IsValid());
++        uint32_t AliasMask = 0;
++        Length = sizeof(AliasMask);
++        TEST_QUIC_SUCCEEDED(
++            MsQuic->GetParam(
++                AliasConfiguration,
++                QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                &Length,
++                &AliasMask));
++        TEST_EQUAL(AliasMask, QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK);
++
++        const uint32_t ExplicitZero = 0;
++        TEST_QUIC_SUCCEEDED(
++            MsQuic->SetParam(
++                AliasConfiguration,
++                QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                sizeof(ExplicitZero),
++                &ExplicitZero));
++        AliasSettings.SetReliableResetEnabled(false);
++        TEST_QUIC_SUCCEEDED(AliasConfiguration.SetSettings(AliasSettings));
++        Length = sizeof(AliasMask);
++        TEST_QUIC_SUCCEEDED(
++            MsQuic->GetParam(
++                AliasConfiguration,
++                QUIC_PARAM_CONFIGURATION_RESET_STREAM_AT_DIALECT_MASK,
++                &Length,
++                &AliasMask));
++        TEST_EQUAL(AliasMask, 0u);
++    }
++
++    //
+     // QUIC_PARAM_CONFIGURATION_TICKET_KEYS
+     //
+     {
+--- a/src/test/lib/HandshakeTest.cpp
++++ b/src/test/lib/HandshakeTest.cpp
+@@ -2786,19 +2786,34 @@
+ 
+ void
+ QuicTestReliableResetNegotiation(
+-    const FeatureSupportArgs& Params
++    const ResetStreamAtDialectArgs& Params
+     )
+ {
+     const int Family = Params.Family;
+-    const bool ServerSupport = Params.ServerSupport;
+-    const bool ClientSupport = Params.ClientSupport;
+     struct Context {
+-        bool Negotiated {false};
+-        bool CallbackReceived {false};
++        uint32_t ExpectedRequestedMask {0};
++        uint32_t ExpectedPeerMask {0};
++        uint32_t EventCount {0};
++        uint32_t ObservedRequestedMask {0};
++        uint32_t ObservedPeerMask {0};
++        uint32_t ObservedNegotiatedMask {0};
++        bool ObservedIsNegotiated {false};
++        bool Connected {false};
++        bool EventBeforeConnected {false};
+         QUIC_STATUS ConnectionCallback(_Inout_ QUIC_CONNECTION_EVENT* Event) {
+             if (Event->Type == QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED) {
+-                CallbackReceived = true;
+-                Negotiated = Event->RELIABLE_RESET_NEGOTIATED.IsNegotiated;
++                ++EventCount;
++                EventBeforeConnected = !Connected;
++                ObservedRequestedMask =
++                    Event->RELIABLE_RESET_NEGOTIATED.RequestedDialectMask;
++                ObservedPeerMask =
++                    Event->RELIABLE_RESET_NEGOTIATED.PeerDialectMask;
++                ObservedNegotiatedMask =
++                    Event->RELIABLE_RESET_NEGOTIATED.NegotiatedDialectMask;
++                ObservedIsNegotiated =
++                    Event->RELIABLE_RESET_NEGOTIATED.IsNegotiated;
++            } else if (Event->Type == QUIC_CONNECTION_EVENT_CONNECTED) {
++                Connected = true;
+             }
+             return QUIC_STATUS_SUCCESS;
+         }
+@@ -2808,20 +2823,37 @@
+     };
+ 
+     Context ClientContext, ServerContext;
++    ClientContext.ExpectedRequestedMask = Params.ClientDialectMask;
++    ClientContext.ExpectedPeerMask = Params.ServerDialectMask;
++    ServerContext.ExpectedRequestedMask = Params.ServerDialectMask;
++    ServerContext.ExpectedPeerMask = Params.ClientDialectMask;
+ 
+     MsQuicRegistration Registration(true);
+     TEST_TRUE(Registration.IsValid());
+ 
+-    MsQuicSettings ServerSettings;
+-    MsQuicSettings ClientSettings;
+-    ServerSettings.SetReliableResetEnabled(ServerSupport);
+-    ClientSettings.SetReliableResetEnabled(ClientSupport);
+-
+-    MsQuicConfiguration ServerConfiguration(Registration, "MsQuicTest", ServerSettings, ServerSelfSignedCredConfig);
++    MsQuicConfiguration ServerConfiguration(
++        Registration,
++        "MsQuicTest",
++        ServerSelfSignedCredConfig);
+     TEST_QUIC_SUCCEEDED(ServerConfiguration.GetInitStatus());
+-
+-    MsQuicConfiguration ClientConfiguration(Registration, "MsQuicTest", ClientSettings, MsQuicCredentialConfig());
++    TEST_QUIC_SUCCEEDED(
++        ServerConfiguration.SetResetStreamAtDialectMask(
++            Params.ServerDialectMask));
++
++    MsQuicConfiguration ClientConfiguration(
++        Registration,
++        "MsQuicTest",
++        MsQuicCredentialConfig());
+     TEST_QUIC_SUCCEEDED(ClientConfiguration.GetInitStatus());
++    const bool UsePerConnectionAlias =
++        Family == 4 &&
++        Params.ServerDialectMask == QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK &&
++        Params.ClientDialectMask == QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK;
++    if (!UsePerConnectionAlias) {
++        TEST_QUIC_SUCCEEDED(
++            ClientConfiguration.SetResetStreamAtDialectMask(
++                Params.ClientDialectMask));
++    }
+ 
+     QUIC_ADDRESS_FAMILY QuicAddrFamily = (Family == 4) ? QUIC_ADDRESS_FAMILY_INET : QUIC_ADDRESS_FAMILY_INET6;
+     QuicAddr ServerLocalAddr(QuicAddrFamily);
+@@ -2833,6 +2865,11 @@
+ 
+     MsQuicConnection Connection(Registration, CleanUpManual, Context::s_ConnectionCallback, &ClientContext);
+     TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
++    if (UsePerConnectionAlias) {
++        TEST_QUIC_SUCCEEDED(
++            Connection.SetSettings(
++                MsQuicSettings{}.SetReliableResetEnabled(true)));
++    }
+     TEST_QUIC_SUCCEEDED(Connection.Start(ClientConfiguration, ServerLocalAddr.GetFamily(), QUIC_TEST_LOOPBACK_FOR_AF(ServerLocalAddr.GetFamily()), ServerLocalAddr.GetPort()));
+ 
+     TEST_TRUE(Connection.HandshakeCompleteEvent.WaitTimeout(TestWaitTimeout));
+@@ -2840,21 +2877,29 @@
+     TEST_TRUE(Listener.LastConnection->HandshakeCompleteEvent.WaitTimeout(TestWaitTimeout));
+     TEST_TRUE(Listener.LastConnection->HandshakeComplete);
+ 
+-    MsQuicSettings ListenerServerSettings2;
+-    TEST_QUIC_SUCCEEDED(Listener.LastConnection->GetSettings(&ListenerServerSettings2));
+-    TEST_EQUAL(ListenerServerSettings2.ReliableResetEnabled, (int) ServerSupport);
+-
+-    if (ClientSupport) {
+-        TEST_TRUE(ClientContext.CallbackReceived);
+-        TEST_TRUE(ClientContext.Negotiated == ServerSupport);
+-    } else {
+-        TEST_FALSE(ClientContext.CallbackReceived);
++    TEST_EQUAL(ClientContext.EventCount, Params.ClientDialectMask == 0 ? 0u : 1u);
++    TEST_EQUAL(ServerContext.EventCount, Params.ServerDialectMask == 0 ? 0u : 1u);
++    if (Params.ClientDialectMask != 0) {
++        const uint32_t ExpectedNegotiatedMask =
++            Params.ClientDialectMask & Params.ServerDialectMask;
++        TEST_TRUE(ClientContext.EventBeforeConnected);
++        TEST_EQUAL(ClientContext.ObservedRequestedMask, Params.ClientDialectMask);
++        TEST_EQUAL(ClientContext.ObservedPeerMask, Params.ServerDialectMask);
++        TEST_EQUAL(ClientContext.ObservedNegotiatedMask, ExpectedNegotiatedMask);
++        TEST_EQUAL(
++            ClientContext.ObservedIsNegotiated,
++            (bool)(ExpectedNegotiatedMask != 0));
+     }
+-    if (ServerSupport) {
+-        TEST_TRUE(ServerContext.CallbackReceived);
+-        TEST_TRUE(ServerContext.Negotiated == ClientSupport);
+-    } else {
+-        TEST_FALSE(ServerContext.CallbackReceived);
++    if (Params.ServerDialectMask != 0) {
++        const uint32_t ExpectedNegotiatedMask =
++            Params.ServerDialectMask & Params.ClientDialectMask;
++        TEST_TRUE(ServerContext.EventBeforeConnected);
++        TEST_EQUAL(ServerContext.ObservedRequestedMask, Params.ServerDialectMask);
++        TEST_EQUAL(ServerContext.ObservedPeerMask, Params.ClientDialectMask);
++        TEST_EQUAL(ServerContext.ObservedNegotiatedMask, ExpectedNegotiatedMask);
++        TEST_EQUAL(
++            ServerContext.ObservedIsNegotiated,
++            (bool)(ExpectedNegotiatedMask != 0));
+     }
+ }
+ 
+--- a/src/test/MsQuicTests.h
++++ b/src/test/MsQuicTests.h
+@@ -336,9 +336,15 @@
+     bool ClientSupport;
+ };
+ 
++struct ResetStreamAtDialectArgs {
++    int Family;
++    uint32_t ServerDialectMask;
++    uint32_t ClientDialectMask;
++};
++
+ void
+ QuicTestReliableResetNegotiation(
+-    const FeatureSupportArgs& Params
++    const ResetStreamAtDialectArgs& Params
+ );
+ 
+ void
+--- /dev/null
++++ b/src/core/unittest/StreamResetTest.cpp
+@@ -0,0 +1,597 @@
++/*++
++
++    Copyright (c) Microsoft Corporation.
++    Licensed under the MIT License.
++
++Abstract:
++
++    Focused semantic tests for RESET_STREAM_AT sender and receiver state.
++
++--*/
++
++#include "main.h"
++
++TEST(StreamResetTest, ConnectionAliasDerivesRequestedDialectMask)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_CONFIGURATION Configuration = {};
++
++    Connection.Settings.ReliableResetEnabled = TRUE;
++    EXPECT_EQ(
++        QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK,
++        QuicConnGetResetStreamAtRequestedDialectMask(
++            &Connection,
++            &Configuration));
++
++    Connection.Settings.ReliableResetEnabled = FALSE;
++    EXPECT_EQ(
++        0u,
++        QuicConnGetResetStreamAtRequestedDialectMask(
++            &Connection,
++            &Configuration));
++
++    Configuration.ResetStreamAtDialectMaskExplicit = TRUE;
++    Configuration.ResetStreamAtDialectMask = 0;
++    Connection.Settings.ReliableResetEnabled = TRUE;
++    EXPECT_EQ(
++        0u,
++        QuicConnGetResetStreamAtRequestedDialectMask(
++            &Connection,
++            &Configuration));
++
++    Configuration.ResetStreamAtDialectMask =
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07;
++    Connection.Settings.ReliableResetEnabled = FALSE;
++    EXPECT_EQ(
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07,
++        QuicConnGetResetStreamAtRequestedDialectMask(
++            &Connection,
++            &Configuration));
++}
++
++TEST(StreamResetTest, ResumptionRestoresPeerSendPermissionOnly)
++{
++    QUIC_CONNECTION Connection = {};
++    Connection.ResetStreamAtRequestedDialectMask =
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07;
++    Connection.PeerTransportParams.Flags =
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07 |
++        QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_10;
++
++    QuicConnProcessResetStreamAtNegotiation(&Connection, TRUE);
++
++    EXPECT_EQ(
++        QUIC_RESET_STREAM_AT_SUPPORTED_DIALECT_MASK,
++        Connection.ResetStreamAtPeerDialectMask);
++    EXPECT_EQ(0u, Connection.ResetStreamAtNegotiatedDialectMask);
++    EXPECT_FALSE(Connection.State.ResetStreamAtNegotiationEventEmitted);
++    EXPECT_TRUE(QuicConnCanSendResetStreamAt(&Connection));
++    EXPECT_TRUE(QuicConnCanReceiveResetStreamAt(&Connection));
++}
++
++TEST(StreamResetTest, ResumptionRejectsRemovedReceiveCapability)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_TRANSPORT_PARAMETERS ResumedTP = {};
++
++    ResumedTP.Flags = QUIC_TP_FLAG_RESET_STREAM_AT_DRAFT_07;
++    Connection.ResetStreamAtRequestedDialectMask = 0;
++    EXPECT_FALSE(
++        QuicConnIsResetStreamAtResumptionCompatible(
++            &Connection,
++            &ResumedTP));
++
++    Connection.ResetStreamAtRequestedDialectMask =
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10;
++    EXPECT_TRUE(
++        QuicConnIsResetStreamAtResumptionCompatible(
++            &Connection,
++            &ResumedTP));
++
++    ResumedTP.Flags = 0;
++    Connection.ResetStreamAtRequestedDialectMask = 0;
++    EXPECT_TRUE(
++        QuicConnIsResetStreamAtResumptionCompatible(
++            &Connection,
++            &ResumedTP));
++}
++
++TEST(StreamResetTest, DirectionalAdvertisementsGateFrameUse)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.QueuedSendOffset = 10;
++    Stream.RecvMaxLength = UINT64_MAX;
++    Stream.ReliableOffsetRecv = UINT64_MAX;
++    Stream.MaxAllowedRecvOffset = 10;
++    Connection.Send.MaxData = 10;
++
++    Connection.ResetStreamAtRequestedDialectMask =
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07;
++    Connection.ResetStreamAtPeerDialectMask =
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10;
++    Connection.ResetStreamAtNegotiatedDialectMask = 0;
++
++    EXPECT_TRUE(QuicConnCanSendResetStreamAt(&Connection));
++    EXPECT_TRUE(QuicConnCanReceiveResetStreamAt(&Connection));
++
++    ASSERT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicRecvBufferInitialize(
++            &Stream.RecvBuffer,
++            16,
++            16,
++            QUIC_RECV_BUF_MODE_SINGLE,
++            nullptr));
++    QuicStreamProcessReliableResetFrame(&Stream, 7, 10, 5);
++    EXPECT_TRUE(Stream.Flags.RemoteCloseResetReliable);
++    EXPECT_FALSE(Stream.Flags.RemoteCloseAcked);
++    EXPECT_EQ(10ull, Stream.RecvMaxLength);
++    EXPECT_EQ(5ull, Stream.ReliableOffsetRecv);
++    QuicRecvBufferUninitialize(&Stream.RecvBuffer);
++
++    Connection.ResetStreamAtPeerDialectMask = 0;
++    EXPECT_FALSE(QuicConnCanSendResetStreamAt(&Connection));
++    EXPECT_TRUE(QuicConnCanReceiveResetStreamAt(&Connection));
++}
++
++TEST(StreamResetTest, SenderReservesImmutableFinalSizeOnce)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.MaxAllowedSendOffset = 100;
++    Stream.MaxSentLength = 20;
++    Stream.ReliableResetSendFinalSize = 80;
++    Stream.Flags.ReliableResetSendFinalSizeSet = TRUE;
++    Connection.Send.PeerMaxData = 100;
++    Connection.Send.OrderedStreamBytesSent = 30;
++
++    ASSERT_TRUE(QuicStreamCanSendResetFrame(&Stream));
++    QuicStreamReserveResetFrameFlowControl(&Stream);
++    EXPECT_TRUE(Stream.Flags.ReliableResetSendFinalSizeReserved);
++    EXPECT_EQ(80ull, Stream.MaxSentLength);
++    EXPECT_EQ(90ull, Connection.Send.OrderedStreamBytesSent);
++
++    QuicStreamReserveResetFrameFlowControl(&Stream);
++    EXPECT_EQ(80ull, Stream.MaxSentLength);
++    EXPECT_EQ(90ull, Connection.Send.OrderedStreamBytesSent);
++
++    QUIC_STREAM ConnBlockedStream = {};
++    ConnBlockedStream.Connection = &Connection;
++    ConnBlockedStream.MaxAllowedSendOffset = 100;
++    ConnBlockedStream.MaxSentLength = 20;
++    ConnBlockedStream.ReliableResetSendFinalSize = 40;
++    ConnBlockedStream.Flags.ReliableResetSendFinalSizeSet = TRUE;
++    EXPECT_FALSE(QuicStreamCanSendResetFrame(&ConnBlockedStream));
++
++    QUIC_STREAM StreamBlockedStream = {};
++    StreamBlockedStream.Connection = &Connection;
++    StreamBlockedStream.MaxAllowedSendOffset = 39;
++    StreamBlockedStream.MaxSentLength = 20;
++    StreamBlockedStream.ReliableResetSendFinalSize = 40;
++    StreamBlockedStream.Flags.ReliableResetSendFinalSizeSet = TRUE;
++    EXPECT_FALSE(QuicStreamCanSendResetFrame(&StreamBlockedStream));
++}
++
++TEST(StreamResetTest, SchedulerBlocksOnlyResetUntilFinalSizeHasCredit)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.ID = 0;
++    Stream.SendFlags = QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT;
++    Stream.MaxAllowedSendOffset = 100;
++    Stream.MaxSentLength = 20;
++    Stream.ReliableResetSendFinalSize = 80;
++    Stream.Flags.ReliableResetSendFinalSizeSet = TRUE;
++    Connection.Streams.Types[0].MaxTotalStreamCount = 1;
++    Connection.Send.PeerMaxData = 50;
++    Connection.Send.OrderedStreamBytesSent = 30;
++
++    EXPECT_FALSE(QuicStreamCanSendNow(&Stream, FALSE));
++
++    Connection.Send.PeerMaxData = 100;
++    EXPECT_TRUE(QuicStreamCanSendNow(&Stream, FALSE));
++
++    Connection.Send.PeerMaxData = 50;
++    Stream.SendFlags |= QUIC_STREAM_SEND_FLAG_RECV_ABORT;
++    EXPECT_TRUE(QuicStreamCanSendNow(&Stream, FALSE));
++}
++
++TEST(StreamResetTest, AbortAfterUnsentFinDiscardsQueuedTail)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.Flags.SendEnabled = TRUE;
++    Stream.Flags.LocalCloseFin = TRUE;
++    Stream.Flags.ReliableOffsetSendSet = TRUE;
++    Stream.QueuedSendOffset = 1ull << 30;
++    Stream.MaxSentLength = 64ull << 10;
++    Stream.ReliableOffsetSend = 0;
++    CxPlatDispatchLockInitialize(&Stream.ApiSendRequestLock);
++
++    QuicStreamSendShutdown(&Stream, FALSE, FALSE, FALSE, 9);
++
++    EXPECT_TRUE(Stream.Flags.LocalCloseResetReliable);
++    EXPECT_TRUE(Stream.Flags.ReliableResetSendFinalSizeSet);
++    EXPECT_EQ(64ull << 10, Stream.ReliableResetSendFinalSize);
++    EXPECT_EQ(9ull, Stream.SendShutdownErrorCode);
++
++    CxPlatDispatchLockUninitialize(&Stream.ApiSendRequestLock);
++}
++
++TEST(StreamResetTest, LoweredResetPreservesBlockedSignaling)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.Flags.SendEnabled = TRUE;
++    Stream.Flags.LocalCloseResetReliable = TRUE;
++    Stream.Flags.ReliableOffsetSendSet = TRUE;
++    Stream.Flags.ReliableResetSendFinalSizeSet = TRUE;
++    Stream.ReliableOffsetSend = 40;
++    Stream.ReliableResetSendFinalSize = 80;
++    Stream.MaxSentLength = 20;
++    Stream.MaxAllowedSendOffset = 40;
++    Stream.SendShutdownErrorCode = 7;
++    Stream.SendFlags =
++        QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT |
++        QUIC_STREAM_SEND_FLAG_DATA_BLOCKED;
++    Stream.OutFlowBlockedReasons = QUIC_FLOW_BLOCKED_STREAM_FLOW_CONTROL;
++    Connection.Send.Uninitialized = TRUE;
++    CxPlatDispatchLockInitialize(&Stream.ApiSendRequestLock);
++
++    QuicStreamSendShutdown(&Stream, FALSE, FALSE, FALSE, 9);
++
++    EXPECT_TRUE(Stream.Flags.LocalCloseReset);
++    EXPECT_FALSE(Stream.Flags.LocalCloseResetReliable);
++    EXPECT_EQ(0ull, Stream.ReliableOffsetSend);
++    EXPECT_EQ(80ull, Stream.ReliableResetSendFinalSize);
++    EXPECT_EQ(7ull, Stream.SendShutdownErrorCode);
++    EXPECT_NE(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_SEND_ABORT);
++    EXPECT_NE(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_DATA_BLOCKED);
++    EXPECT_EQ(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT);
++    EXPECT_NE(
++        0u,
++        Stream.OutFlowBlockedReasons &
++            QUIC_FLOW_BLOCKED_STREAM_FLOW_CONTROL);
++
++    CxPlatDispatchLockUninitialize(&Stream.ApiSendRequestLock);
++}
++
++TEST(StreamResetTest, RequeuedEarlyReliableResetDowngradesWithoutLiveSupport)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.Flags.LocalCloseResetReliable = TRUE;
++    Stream.Flags.LocalCloseResetReliableAcked = TRUE;
++    Stream.Flags.ReliableResetSendFinalSizeSet = TRUE;
++    Stream.ReliableOffsetSend = 40;
++    Stream.ReliableResetSendFinalSize = 80;
++    Stream.SendShutdownErrorCode = 7;
++    Stream.RecoveryNextOffset = 20;
++    Stream.RecoveryEndOffset = 40;
++    Stream.SendFlags =
++        QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT |
++        QUIC_STREAM_SEND_FLAG_DATA |
++        QUIC_STREAM_SEND_FLAG_OPEN |
++        QUIC_STREAM_SEND_FLAG_FIN |
++        QUIC_STREAM_SEND_FLAG_DATA_BLOCKED;
++
++    Connection.ResetStreamAtPeerDialectMask = 0;
++    EXPECT_TRUE(QuicStreamDowngradeReliableResetIfUnsupported(&Stream));
++    EXPECT_TRUE(Stream.Flags.LocalCloseReset);
++    EXPECT_FALSE(Stream.Flags.LocalCloseResetReliable);
++    EXPECT_FALSE(Stream.Flags.LocalCloseResetReliableAcked);
++    EXPECT_EQ(0ull, Stream.ReliableOffsetSend);
++    EXPECT_EQ(80ull, Stream.ReliableResetSendFinalSize);
++    EXPECT_EQ(7ull, Stream.SendShutdownErrorCode);
++    EXPECT_EQ(0ull, Stream.RecoveryNextOffset);
++    EXPECT_EQ(0ull, Stream.RecoveryEndOffset);
++    EXPECT_EQ(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT);
++    EXPECT_EQ(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_DATA);
++    EXPECT_EQ(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_OPEN);
++    EXPECT_EQ(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_FIN);
++    EXPECT_NE(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_SEND_ABORT);
++    EXPECT_NE(0u, Stream.SendFlags & QUIC_STREAM_SEND_FLAG_DATA_BLOCKED);
++
++    QUIC_STREAM SupportedStream = {};
++    SupportedStream.Connection = &Connection;
++    SupportedStream.Flags.LocalCloseResetReliable = TRUE;
++    SupportedStream.ReliableOffsetSend = 40;
++    SupportedStream.ReliableResetSendFinalSize = 80;
++    SupportedStream.SendShutdownErrorCode = 7;
++    SupportedStream.RecoveryNextOffset = 20;
++    SupportedStream.RecoveryEndOffset = 40;
++    SupportedStream.SendFlags = QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT;
++    Connection.ResetStreamAtPeerDialectMask =
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_10;
++
++    EXPECT_FALSE(
++        QuicStreamDowngradeReliableResetIfUnsupported(&SupportedStream));
++    EXPECT_TRUE(SupportedStream.Flags.LocalCloseResetReliable);
++    EXPECT_FALSE(SupportedStream.Flags.LocalCloseReset);
++    EXPECT_EQ(40ull, SupportedStream.ReliableOffsetSend);
++    EXPECT_EQ(80ull, SupportedStream.ReliableResetSendFinalSize);
++    EXPECT_EQ(7ull, SupportedStream.SendShutdownErrorCode);
++    EXPECT_EQ(20ull, SupportedStream.RecoveryNextOffset);
++    EXPECT_EQ(40ull, SupportedStream.RecoveryEndOffset);
++    EXPECT_NE(
++        0u,
++        SupportedStream.SendFlags & QUIC_STREAM_SEND_FLAG_RELIABLE_ABORT);
++    EXPECT_EQ(
++        0u,
++        SupportedStream.SendFlags & QUIC_STREAM_SEND_FLAG_SEND_ABORT);
++}
++
++TEST(StreamResetTest, SenderStopsAtReliableSizeUsingReservedCredit)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.ID = 0;
++    Stream.SendFlags = QUIC_STREAM_SEND_FLAG_DATA;
++    Stream.Flags.LocalCloseResetReliable = TRUE;
++    Stream.QueuedSendOffset = 100;
++    Stream.ReliableOffsetSend = 40;
++    Stream.MaxSentLength = 40;
++    Stream.MaxAllowedSendOffset = 100;
++    Stream.NextSendOffset = 20;
++    Connection.Streams.Types[0].MaxTotalStreamCount = 1;
++    Connection.Send.PeerMaxData = 40;
++    Connection.Send.OrderedStreamBytesSent = 40;
++
++    EXPECT_TRUE(QuicStreamHasPendingStreamData(&Stream));
++    EXPECT_TRUE(QuicStreamSendCanWriteDataFrames(&Stream));
++
++    Stream.NextSendOffset = 40;
++    EXPECT_FALSE(QuicStreamHasPendingStreamData(&Stream));
++    EXPECT_FALSE(QuicStreamSendCanWriteDataFrames(&Stream));
++}
++
++TEST(StreamResetTest, ReceiverPreservesFinalAndErrorWhileLoweringReliableSize)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.RecvMaxLength = UINT64_MAX;
++    Stream.ReliableOffsetRecv = UINT64_MAX;
++    Stream.MaxAllowedRecvOffset = 100;
++    Connection.ResetStreamAtRequestedDialectMask = 1;
++    Connection.Send.MaxData = 100;
++
++    ASSERT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicRecvBufferInitialize(
++            &Stream.RecvBuffer,
++            128,
++            128,
++            QUIC_RECV_BUF_MODE_SINGLE,
++            nullptr));
++
++    QuicStreamProcessReliableResetFrame(&Stream, 7, 80, 40);
++    EXPECT_TRUE(Stream.Flags.RemoteCloseResetReliable);
++    EXPECT_TRUE(Stream.Flags.RecvResetErrorCodeSet);
++    EXPECT_TRUE(Stream.Flags.RecvFinalSizeAccounted);
++    EXPECT_FALSE(Stream.Flags.RemoteCloseAcked);
++    EXPECT_EQ(7ull, Stream.RecvResetErrorCode);
++    EXPECT_EQ(80ull, Stream.RecvMaxLength);
++    EXPECT_EQ(40ull, Stream.ReliableOffsetRecv);
++    EXPECT_EQ(80ull, Stream.ReliableResetRecvBytesReserved);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++
++    uint8_t Data[10] = {};
++    QUIC_STREAM_EX Frame = { FALSE, TRUE, 0, 0, sizeof(Data), Data };
++    EXPECT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicStreamProcessStreamFrame(&Stream, FALSE, &Frame));
++    EXPECT_EQ(70ull, Stream.ReliableResetRecvBytesReserved);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++    EXPECT_EQ(80ull, Stream.RecvMaxLength);
++
++    QuicStreamProcessReliableResetFrame(&Stream, 7, 80, 20);
++    EXPECT_EQ(20ull, Stream.ReliableOffsetRecv);
++    EXPECT_EQ(80ull, Stream.RecvMaxLength);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++
++    QuicStreamProcessReliableResetFrame(&Stream, 7, 80, 30);
++    EXPECT_EQ(20ull, Stream.ReliableOffsetRecv);
++    EXPECT_EQ(7ull, Stream.RecvResetErrorCode);
++    EXPECT_EQ(80ull, Stream.RecvMaxLength);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++
++    QuicRecvBufferUninitialize(&Stream.RecvBuffer);
++}
++
++TEST(StreamResetTest, ReceiverDoesNotDoubleCreditPendingAppReceive)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.RecvMaxLength = UINT64_MAX;
++    Stream.ReliableOffsetRecv = UINT64_MAX;
++    Stream.MaxAllowedRecvOffset = 80;
++    Connection.ResetStreamAtRequestedDialectMask =
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07;
++    Connection.Send.MaxData = 100;
++    Connection.Send.OrderedStreamBytesReceived = 20;
++    Connection.Send.Uninitialized = TRUE;
++
++    ASSERT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicRecvBufferInitialize(
++            &Stream.RecvBuffer,
++            128,
++            128,
++            QUIC_RECV_BUF_MODE_SINGLE,
++            nullptr));
++
++    uint8_t Data[20] = {};
++    uint64_t QuotaConsumed = 0;
++    uint64_t BufferSizeNeeded = 0;
++    BOOLEAN NewDataReady = FALSE;
++    ASSERT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicRecvBufferWrite(
++            &Stream.RecvBuffer,
++            0,
++            sizeof(Data),
++            Data,
++            100,
++            &QuotaConsumed,
++            &NewDataReady,
++            &BufferSizeNeeded));
++    ASSERT_EQ(sizeof(Data), QuotaConsumed);
++
++    QUIC_BUFFER Buffer = {};
++    uint32_t BufferCount = 1;
++    uint64_t BufferOffset = 0;
++    QuicRecvBufferRead(
++        &Stream.RecvBuffer,
++        &BufferOffset,
++        &BufferCount,
++        &Buffer);
++    ASSERT_EQ(sizeof(Data), Buffer.Length);
++    Stream.RecvPendingLength = sizeof(Data);
++
++    QuicStreamProcessReliableResetFrame(&Stream, 7, 80, 0);
++
++    EXPECT_TRUE(Stream.Flags.RemoteCloseAcked);
++    EXPECT_TRUE(Stream.Flags.RecvFinalSizeCreditReturned);
++    EXPECT_EQ(20ull, Stream.RecvPendingLength);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++    EXPECT_EQ(160ull, Connection.Send.MaxData);
++
++    QuicRecvBufferResetRead(&Stream.RecvBuffer);
++    QuicRecvBufferUninitialize(&Stream.RecvBuffer);
++}
++
++TEST(StreamResetTest, ReceiverCompletesReliableResetAfterLocalAbort)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.RecvMaxLength = UINT64_MAX;
++    Stream.ReliableOffsetRecv = UINT64_MAX;
++    Stream.MaxAllowedRecvOffset = 100;
++    Stream.Flags.SentStopSending = TRUE;
++    Connection.ResetStreamAtRequestedDialectMask =
++        QUIC_RESET_STREAM_AT_DIALECT_DRAFT_07;
++    Connection.Send.MaxData = 100;
++    Connection.Send.Uninitialized = TRUE;
++
++    ASSERT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicRecvBufferInitialize(
++            &Stream.RecvBuffer,
++            128,
++            128,
++            QUIC_RECV_BUF_MODE_SINGLE,
++            nullptr));
++
++    QuicStreamProcessReliableResetFrame(&Stream, 7, 80, 40);
++
++    EXPECT_TRUE(Stream.Flags.RemoteCloseResetReliable);
++    EXPECT_TRUE(Stream.Flags.RemoteCloseReset);
++    EXPECT_TRUE(Stream.Flags.RemoteCloseAcked);
++    EXPECT_TRUE(Stream.Flags.RecvResetErrorCodeSet);
++    EXPECT_TRUE(Stream.Flags.RecvFinalSizeAccounted);
++    EXPECT_TRUE(Stream.Flags.RecvFinalSizeCreditReturned);
++    EXPECT_EQ(7ull, Stream.RecvResetErrorCode);
++    EXPECT_EQ(80ull, Stream.RecvMaxLength);
++    EXPECT_EQ(40ull, Stream.ReliableOffsetRecv);
++    EXPECT_EQ(0ull, Stream.ReliableResetRecvBytesReserved);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++    EXPECT_EQ(180ull, Connection.Send.MaxData);
++
++    QuicRecvBufferUninitialize(&Stream.RecvBuffer);
++}
++
++TEST(StreamResetTest, FinAfterLocalAbortDoesNotCommitPeerError)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.RecvMaxLength = UINT64_MAX;
++    Stream.ReliableOffsetRecv = UINT64_MAX;
++    Stream.MaxAllowedRecvOffset = 100;
++    Stream.Flags.SentStopSending = TRUE;
++    Connection.Send.MaxData = 100;
++    Connection.Send.Uninitialized = TRUE;
++
++    ASSERT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicRecvBufferInitialize(
++            &Stream.RecvBuffer,
++            128,
++            128,
++            QUIC_RECV_BUF_MODE_SINGLE,
++            nullptr));
++
++    QUIC_STREAM_EX Fin = { TRUE, TRUE, 0, 80, 0, nullptr };
++    EXPECT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicStreamProcessStreamFrame(&Stream, FALSE, &Fin));
++
++    EXPECT_TRUE(Stream.Flags.RemoteCloseAcked);
++    EXPECT_TRUE(Stream.Flags.RecvFinalSizeAccounted);
++    EXPECT_FALSE(Stream.Flags.RecvResetErrorCodeSet);
++    EXPECT_EQ(80ull, Stream.RecvMaxLength);
++
++    QuicStreamProcessResetFrame(&Stream, 80, 7);
++
++    EXPECT_TRUE(Stream.Flags.RecvResetErrorCodeSet);
++    EXPECT_EQ(7ull, Stream.RecvResetErrorCode);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++    EXPECT_EQ(180ull, Connection.Send.MaxData);
++
++    QuicRecvBufferUninitialize(&Stream.RecvBuffer);
++}
++
++TEST(StreamResetTest, LocalAbortAfterFinDoesNotCommitPeerError)
++{
++    QUIC_CONNECTION Connection = {};
++    QUIC_STREAM Stream = {};
++    Stream.Connection = &Connection;
++    Stream.RecvMaxLength = 80;
++    Stream.ReliableOffsetRecv = UINT64_MAX;
++    Stream.MaxAllowedRecvOffset = 100;
++    Stream.Flags.ReceiveEnabled = TRUE;
++    Connection.Send.MaxData = 100;
++    Connection.Send.Uninitialized = TRUE;
++
++    ASSERT_EQ(
++        QUIC_STATUS_SUCCESS,
++        QuicRecvBufferInitialize(
++            &Stream.RecvBuffer,
++            128,
++            128,
++            QUIC_RECV_BUF_MODE_SINGLE,
++            nullptr));
++
++    QuicStreamRecvShutdown(&Stream, FALSE, 11);
++
++    EXPECT_TRUE(Stream.Flags.SentStopSending);
++    EXPECT_TRUE(Stream.Flags.RemoteCloseAcked);
++    EXPECT_TRUE(Stream.Flags.RecvFinalSizeAccounted);
++    EXPECT_TRUE(Stream.Flags.RecvFinalSizeCreditReturned);
++    EXPECT_FALSE(Stream.Flags.RecvResetErrorCodeSet);
++    EXPECT_EQ(11ull, Stream.RecvShutdownErrorCode);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++    EXPECT_EQ(180ull, Connection.Send.MaxData);
++
++    QuicStreamProcessResetFrame(&Stream, 80, 7);
++
++    EXPECT_TRUE(Stream.Flags.RecvResetErrorCodeSet);
++    EXPECT_EQ(7ull, Stream.RecvResetErrorCode);
++    EXPECT_EQ(11ull, Stream.RecvShutdownErrorCode);
++    EXPECT_EQ(80ull, Stream.RecvMaxLength);
++    EXPECT_EQ(80ull, Connection.Send.OrderedStreamBytesReceived);
++    EXPECT_EQ(180ull, Connection.Send.MaxData);
++
++    QuicRecvBufferUninitialize(&Stream.RecvBuffer);
++}

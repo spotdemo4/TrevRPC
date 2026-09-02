@@ -35,6 +35,8 @@ node_modules/
 # c
 core.*
 /trevrpc-c/build/
+/trevrpc-c/build-asan/
+/trevrpc-c/build-tsan/
 
 # cpp
 /trevrpc-cpp/build/
