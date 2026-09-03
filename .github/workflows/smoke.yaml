@@ -61,8 +61,17 @@ jobs:
               }))} | tojson)
             ] | .[]' >> "$GITHUB_OUTPUT"
 
-  prepare-linux:
-    runs-on: ubuntu-24.04
+  prepare:
+    name: prepare-${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+          - platform: macos
+            runner: macos-26
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -76,7 +85,7 @@ jobs:
 
   smoke-linux:
     name: smoke-${{ matrix.cell }}
-    needs: [discover, prepare-linux]
+    needs: [discover, prepare]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -106,22 +115,9 @@ jobs:
               "$CELL" \
               "$RUNNER_TEMP/smoke"
 
-  prepare-macos:
-    runs-on: macos-26
-    timeout-minutes: 90
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
-
-      - name: Build WebKit benchmark suite
-        run: nix build .#trevrpc-webkit-bench-suite --no-link
-
   smoke-webkit:
     name: smoke-${{ matrix.cell }}
-    needs: [discover, prepare-macos]
+    needs: [discover, prepare]
     runs-on: macos-26
     timeout-minutes: 45
     permissions:

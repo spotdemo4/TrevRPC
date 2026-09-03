@@ -7,30 +7,23 @@ generates replayable reports.
 
 ## Build
 
-Build the controller and all six peers as one immutable Linux suite:
+Build the controller, all six language peers, and the host's browser peers as
+one immutable suite:
 
 ```sh
 nix build .#trevrpc-bench-suite
 ```
 
-The complete suite targets `x86_64-linux`. Its `bin` directory contains
-`trevrpc-bench`, one `trevrpc-bench-peer-*` executable for C, C++, Go,
-JavaScript, Kotlin, and Rust, and the Chromium and Firefox WebTransport client
-peers used by the Linux smoke checks.
+The suite supports `x86_64-linux` and `aarch64-darwin`. Its `bin` directory
+contains `trevrpc-bench` and one `trevrpc-bench-peer-*` executable for C, C++,
+Go, JavaScript, Kotlin, and Rust. Linux adds the Chromium and Firefox
+WebTransport client peers; Apple Silicon macOS adds the pinned Playwright Cocoa
+WebKit peer. The macOS target provides focused WebKit interoperability coverage,
+not a claim that every benchmark mode is supported there.
 
-The focused Cocoa WebKit interoperability suite targets native Apple Silicon
-macOS:
-
-```sh
-nix build .#packages.aarch64-darwin.trevrpc-webkit-bench-suite
-```
-
-That suite contains only the controller, the six TrevRPC servers, and the pinned
-Playwright Cocoa WebKit peer required by the WebKit campaign. It is focused CI
-coverage rather than a claim that every TrevRPC package or benchmark mode is
-supported on macOS. The GitHub `smoke.yaml` workflow builds the Linux and WebKit
-suites once per platform before running each client/server cell as a separate
-check, then publishes one stable `smoke` gate for branch protection.
+The GitHub `smoke.yaml` workflow builds the same suite once per platform before
+running each client/server cell as a separate check, then publishes one stable
+`smoke` gate for branch protection.
 
 The benchmark and conformance executables are included in their associated
 `trevrpc-*` packages. The canonical RPC contract and process protocol live under

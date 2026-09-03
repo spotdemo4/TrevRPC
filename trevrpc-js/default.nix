@@ -2,8 +2,9 @@
   lib,
   stdenv,
   buildNpmPackage,
+  callPackage,
   importNpmLock,
-  jsPackage,
+  libmsquic,
   nodejs_24,
   cmake,
   clang-tools,
@@ -13,14 +14,31 @@
   protobuf,
   gnugrep,
   makeWrapper,
-  packageManifestWriter,
   playwright-driver,
   benchProto,
   wireGolden,
   trevrpcC,
-  nativePackage ? null,
 }:
 let
+  jsPackage = builtins.fromJSON (builtins.readFile ./package.json);
+  jsPackageManifestWriter = ./publication-tests/write-package-manifest.mjs;
+  nativePackage =
+    if stdenv.hostPlatform.system == "x86_64-linux" then
+      callPackage ./npm/native-linux-x64-gnu {
+        sourceTree = ../.;
+        trevrpcCSrc = ../trevrpc-c;
+        jsNativeSrc = ./native;
+        jsNativePackageSrc = ./npm/native-linux-x64-gnu;
+        jsLicense = ./LICENSE;
+        inherit jsPackage;
+        packageManifestWriter = jsPackageManifestWriter;
+        publicationVerifier = ./publication-tests/verify.mjs;
+        libmsquic = libmsquic.overrideAttrs {
+          dontPatchELF = true;
+        };
+      }
+    else
+      null;
   packageLock = lib.importJSON ./package-lock.json;
   playwrightManifestVersion = jsPackage.devDependencies.playwright;
   playwrightVersion = packageLock.packages."node_modules/playwright".version;
@@ -45,6 +63,7 @@ buildNpmPackage (final: {
   pname = "trevrpc-js";
   inherit (jsPackage) version;
   outputs = [ "out" ] ++ lib.optional publication "npm";
+  passthru.native = nativePackage;
 
   src = lib.fileset.toSource {
     root = ../.;
@@ -120,7 +139,7 @@ buildNpmPackage (final: {
       cp -R "${nativePackage}/package" "$native_dir"
       installed_manifest="$out/lib/node_modules/@trevrpc/trevrpc-js/package.json"
       chmod u+w "$installed_manifest"
-      node ${packageManifestWriter} core "$installed_manifest" "${final.version}" \
+      node ${jsPackageManifestWriter} core "$installed_manifest" "${final.version}" \
         npm/native-linux-x64-gnu/package.template.json
     ''}
     ${lib.optionalString stdenv.hostPlatform.isDarwin ''
@@ -145,7 +164,7 @@ buildNpmPackage (final: {
       export HOME="$TMPDIR/home"
       mkdir -p "$HOME" "$npm"
 
-      node ${packageManifestWriter} core package.json "${final.version}" \
+      node ${jsPackageManifestWriter} core package.json "${final.version}" \
         npm/native-linux-x64-gnu/package.template.json
 
       core_name="$(npm pack . --silent --pack-destination "$npm")"

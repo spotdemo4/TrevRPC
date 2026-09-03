@@ -104,32 +104,10 @@
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
             };
-            jsPackage = builtins.fromJSON (builtins.readFile ./trevrpc-js/package.json);
-            jsPackageManifestWriter = ./trevrpc-js/publication-tests/write-package-manifest.mjs;
-            jsNative =
-              if system == "x86_64-linux" then
-                pkgs.callPackage ./trevrpc-js/npm/native-linux-x64-gnu {
-                  sourceTree = ./.;
-                  libmsquic = pkgs.libmsquic.overrideAttrs {
-                    dontPatchELF = true;
-                  };
-                  trevrpcCSrc = ./trevrpc-c;
-                  jsNativeSrc = ./trevrpc-js/native;
-                  jsNativePackageSrc = ./trevrpc-js/npm/native-linux-x64-gnu;
-                  jsLicense = ./trevrpc-js/LICENSE;
-                  inherit jsPackage;
-                  packageManifestWriter = jsPackageManifestWriter;
-                  publicationVerifier = ./trevrpc-js/publication-tests/verify.mjs;
-                }
-              else
-                null;
             js = pkgs.callPackage ./trevrpc-js {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = c;
-              inherit jsPackage;
-              packageManifestWriter = jsPackageManifestWriter;
-              nativePackage = jsNative;
             };
             kotlin = pkgs.callPackage ./trevrpc-kotlin {
               licenseFile = ./LICENSE;
@@ -149,20 +127,6 @@
             browserBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
               trevrpcJs = js;
             };
-            webkitBenchSuite = pkgs.symlinkJoin {
-              name = "trevrpc-webkit-bench-suite";
-              paths = [
-                c
-                cpp
-                go
-                js
-                kotlin
-                rust
-                bench
-                browserBenchPeer
-              ];
-              meta.platforms = [ "aarch64-darwin" ];
-            };
           in
           {
             trevrpc-c = c;
@@ -174,7 +138,6 @@
 
             trevrpc-bench = bench;
             trevrpc-browser-bench-peer = browserBenchPeer;
-            trevrpc-webkit-bench-suite = webkitBenchSuite;
             trevrpc-bench-suite = pkgs.symlinkJoin {
               name = "trevrpc-bench-suite";
               paths = [
@@ -187,24 +150,11 @@
                 bench
                 browserBenchPeer
               ];
-              meta.platforms = [ "x86_64-linux" ];
-            };
-            trevrpc-conformance-suite = pkgs.symlinkJoin {
-              name = "trevrpc-conformance-suite";
-              paths = [
-                c
-                cpp
-                go
-                js
-                kotlin
-                rust
-                bench
+              meta.platforms = [
+                "x86_64-linux"
+                "aarch64-darwin"
               ];
-              meta.platforms = [ "x86_64-linux" ];
             };
-          }
-          // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
-            trevrpc-js-native-linux-x64-gnu = jsNative;
           };
       in
       {
