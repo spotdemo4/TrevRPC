@@ -1,7 +1,12 @@
 pluginManagement {
     repositories {
         gradlePluginPortal()
-        mavenCentral()
+        val mirror = System.getenv("TREVRPC_GRADLE_MAVEN_CENTRAL")
+        if (mirror == null) {
+            mavenCentral()
+        } else {
+            maven { url = uri(mirror) }
+        }
     }
     resolutionStrategy {
         eachPlugin {
@@ -37,7 +42,12 @@ dependencyResolutionManagement {
             forRepository { google() }
             filter { includeGroup("org.chromium.net") }
         }
-        mavenCentral()
+        val mirror = System.getenv("TREVRPC_GRADLE_MAVEN_CENTRAL")
+        if (mirror == null) {
+            mavenCentral()
+        } else {
+            maven { url = uri(mirror) }
+        }
     }
 }
 

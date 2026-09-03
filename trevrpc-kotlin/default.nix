@@ -1,7 +1,9 @@
 {
+  androidenv,
+  callPackage,
+  gradle-packages,
   lib,
   stdenvNoCC,
-  gradle_9,
   jdk25,
   makeWrapper,
   maven,
@@ -12,8 +14,72 @@
   licenseFile,
   wireGolden,
   greeterProto,
+  trevrpcBench,
 }:
 let
+  gradleWrapperLines = lib.splitString "\n" (
+    builtins.readFile ./gradle/wrapper/gradle-wrapper.properties
+  );
+  readGradleWrapperProperty =
+    name:
+    let
+      prefix = "${name}=";
+      values = map (line: lib.removePrefix prefix line) (
+        builtins.filter (lib.hasPrefix prefix) gradleWrapperLines
+      );
+    in
+    if builtins.length values == 1 then
+      builtins.head values
+    else
+      throw "expected exactly one ${name} in gradle-wrapper.properties";
+  gradleDistributionUrl = lib.replaceStrings [ "\\:" ] [ ":" ] (
+    readGradleWrapperProperty "distributionUrl"
+  );
+  gradleVersionMatch = builtins.match "https://services[.]gradle[.]org/distributions/gradle-(9[.][0-9]+[.][0-9]+)-bin[.]zip" gradleDistributionUrl;
+  gradleVersion =
+    if gradleVersionMatch == null then
+      throw "gradle-wrapper.properties must use an official Gradle 9 binary distribution"
+    else
+      builtins.head gradleVersionMatch;
+  gradleDistributionSha256 = readGradleWrapperProperty "distributionSha256Sum";
+  gradleHash =
+    if builtins.match "[0-9a-f]{64}" gradleDistributionSha256 == null then
+      throw "distributionSha256Sum in gradle-wrapper.properties must be a lowercase SHA-256 hash"
+    else
+      builtins.convertHash {
+        hash = gradleDistributionSha256;
+        hashAlgo = "sha256";
+        toHashFormat = "sri";
+      };
+  gradle9 =
+    (gradle-packages.mkGradle {
+      version = gradleVersion;
+      hash = gradleHash;
+      defaultJava = jdk25;
+    }).wrapped;
+  benchPeerCronet =
+    if stdenvNoCC.hostPlatform.system == "x86_64-linux" then
+      let
+        androidSdk =
+          (androidenv.composeAndroidPackages {
+            platformVersions = [
+              "33"
+              "36"
+            ];
+            buildToolsVersions = [ "37.0.0" ];
+            includeEmulator = true;
+            includeSystemImages = true;
+            systemImageTypes = [ "google_apis" ];
+            abiVersions = [ "x86_64" ];
+          }).androidsdk;
+      in
+      callPackage ./bench-peer-cronet {
+        inherit androidSdk licenseFile trevrpcBench;
+        androidRunner = ../bench/ci/run-android-smoke-cell.py;
+        gradle_9 = gradle9;
+      }
+    else
+      null;
   nettyNativeClassifier =
     if stdenvNoCC.hostPlatform.system == "x86_64-linux" then
       "linux-x86_64"
@@ -29,6 +95,7 @@ in
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin";
   version = "0.3.3";
+  passthru.benchPeerCronet = benchPeerCronet;
 
   src = lib.fileset.toSource {
     root = ../.;
@@ -42,7 +109,7 @@ stdenvNoCC.mkDerivation (final: {
   sourceRoot = "${final.src.name}/trevrpc-kotlin";
 
   nativeBuildInputs = [
-    gradle_9
+    gradle9
     jdk25
     makeWrapper
     maven
@@ -50,7 +117,7 @@ stdenvNoCC.mkDerivation (final: {
     python3
   ];
 
-  mitmCache = gradle_9.fetchDeps {
+  mitmCache = gradle9.fetchDeps {
     pkg = final.finalPackage;
     data = ./gradle/deps.json;
     bwrapFlags = ''--ro-bind "$PWD" "$PWD" --dir /bin --symlink ${runtimeShell} /bin/sh'';
@@ -64,7 +131,7 @@ stdenvNoCC.mkDerivation (final: {
   gradleBuildTask = [
     "stageMavenRepository"
     ":protoc-gen-trevrpc-kotlin:installDist"
-    ":bench-peer:installDist"
+    ":bench-peer-netty:installDist"
     ":conformance-peer:installDist"
   ];
   gradleUpdateScript = ''
@@ -119,6 +186,7 @@ stdenvNoCC.mkDerivation (final: {
     export TREVRPC_GRADLE_CACHE_SEED="$GRADLE_USER_HOME"
     export TREVRPC_GRADLE_METADATA_MODES=gradle
     if [ -d "''${mitmCache:-}" ]; then
+      export TREVRPC_GRADLE_MAVEN_CENTRAL="file://$mitmCache/https/repo.maven.apache.org/maven2"
       export MAVEN_SETTINGS="$PWD/maven-settings.xml"
       cat > "$MAVEN_SETTINGS" <<EOF
     <?xml version="1.0" encoding="UTF-8"?>
@@ -153,13 +221,14 @@ stdenvNoCC.mkDerivation (final: {
       $out/bin/protoc-gen-trevrpc-kotlin \
       --set JAVA_HOME ${jdk25.home} \
       --prefix PATH : ${lib.makeBinPath [ jdk25 ]}
-    cp -R bench-peer/build/install/trevrpc-bench-peer-kotlin \
-      $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin
+    cp -R bench-peer-netty/build/install/trevrpc-bench-peer-kotlin-netty \
+      $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin-netty
     makeWrapper \
-      $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin/bin/trevrpc-bench-peer-kotlin \
-      $out/bin/trevrpc-bench-peer-kotlin \
+      $out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin-netty/bin/trevrpc-bench-peer-kotlin-netty \
+      $out/bin/trevrpc-bench-peer-kotlin-netty \
       --set JAVA_HOME ${jdk25.home} \
       --prefix PATH : ${lib.makeBinPath [ jdk25 ]}
+    ln -s trevrpc-bench-peer-kotlin-netty $out/bin/trevrpc-bench-peer-kotlin
     cp -R conformance-peer/build/install/trevrpc-conformance-kotlin \
       $out/share/trevrpc-kotlin/trevrpc-conformance-kotlin
     makeWrapper \
@@ -180,7 +249,8 @@ stdenvNoCC.mkDerivation (final: {
       exit 1
     fi
     test -x "$out/bin/trevrpc-bench-peer-kotlin"
-    "$out/bin/trevrpc-bench-peer-kotlin" capabilities > capabilities.json
+    test -x "$out/bin/trevrpc-bench-peer-kotlin-netty"
+    "$out/bin/trevrpc-bench-peer-kotlin-netty" capabilities > capabilities.json
     python3 - <<'PY'
     import json
 
@@ -193,7 +263,7 @@ stdenvNoCC.mkDerivation (final: {
         "server": ["trevrpc_native_quic", "trevrpc_webtransport"],
     }
     PY
-    set -- "$out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin/lib"/netty-codec-native-quic-*-${nettyNativeClassifier}.jar
+    set -- "$out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin-netty/lib"/netty-codec-native-quic-*-${nettyNativeClassifier}.jar
     test "$#" -eq 1
     test -f "$1"
     test -x "$out/bin/trevrpc-conformance-kotlin"

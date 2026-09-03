@@ -18,6 +18,7 @@ jobs:
   discover:
     runs-on: ubuntu-24.04
     outputs:
+      android: ${{ steps.matrix.outputs.android }}
       linux: ${{ steps.matrix.outputs.linux }}
       webkit: ${{ steps.matrix.outputs.webkit }}
     steps:
@@ -58,6 +59,11 @@ jobs:
                 campaign: "bench/campaigns/webkit-smoke.example.json",
                 client_package: "trevrpc-browser-bench-peer",
                 server_package: ("trevrpc-" + .server)
+              }))} | tojson),
+              "android=" + ({include: ($native[0].peers | map({
+                server: .id,
+                server_command: .command[0],
+                server_package: ("trevrpc-" + .id)
               }))} | tojson)
             ] | .[]' >> "$GITHUB_OUTPUT"
 
@@ -82,6 +88,19 @@ jobs:
 
       - name: Build benchmark suite
         run: nix build .#trevrpc-bench-suite --no-link
+
+  prepare-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
+
+      - name: Build Android smoke harness
+        run: nix build .#trevrpc-kotlin.benchPeerCronet --no-link
 
   smoke-linux:
     name: smoke-${{ matrix.cell }}
@@ -115,6 +134,49 @@ jobs:
               "$CELL" \
               "$RUNNER_TEMP/smoke"
 
+  smoke-android:
+    name: smoke-kotlin-cronet-to-${{ matrix.server }}
+    needs: [discover, prepare, prepare-android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.discover.outputs.android) }}
+    env:
+      SERVER: ${{ matrix.server }}
+      SERVER_COMMAND: ${{ matrix.server_command }}
+      SERVER_PACKAGE: ${{ matrix.server_package }}
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
+
+      - name: Allow KVM access
+        run: sudo chown "$USER" /dev/kvm
+
+      - name: Run Android smoke cell
+        env:
+          OUTPUT: ${{ runner.temp }}/smoke-kotlin-cronet-to-${{ matrix.server }}
+        run: |
+          nix shell \
+            .#trevrpc-kotlin.benchPeerCronet \
+            ".#$SERVER_PACKAGE" \
+            --command trevrpc-bench-peer-kotlin-cronet \
+              --server-id "$SERVER" \
+              --server-command "$SERVER_COMMAND" \
+              --output "$OUTPUT"
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-kotlin-cronet-to-${{ matrix.server }}
+          path: ${{ runner.temp }}/smoke-kotlin-cronet-to-${{ matrix.server }}
+          if-no-files-found: ignore
+
   smoke-webkit:
     name: smoke-${{ matrix.cell }}
     needs: [discover, prepare]
@@ -147,14 +209,16 @@ jobs:
               "$RUNNER_TEMP/smoke"
 
   smoke:
-    needs: [smoke-linux, smoke-webkit]
+    needs: [smoke-android, smoke-linux, smoke-webkit]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     steps:
       - name: Require every smoke cell
         env:
+          ANDROID_RESULT: ${{ needs.smoke-android.result }}
           LINUX_RESULT: ${{ needs.smoke-linux.result }}
           WEBKIT_RESULT: ${{ needs.smoke-webkit.result }}
         run: |
+          [[ $ANDROID_RESULT == success ]]
           [[ $LINUX_RESULT == success ]]
           [[ $WEBKIT_RESULT == success ]]

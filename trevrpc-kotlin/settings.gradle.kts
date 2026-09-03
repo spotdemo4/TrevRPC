@@ -1,5 +1,6 @@
 pluginManagement {
     repositories {
+        google()
         mavenCentral()
         gradlePluginPortal()
     }
@@ -17,7 +18,11 @@ dependencyResolutionManagement {
     repositories {
         exclusiveContent {
             forRepository { google() }
-            filter { includeGroup("org.chromium.net") }
+            filter {
+                includeGroupByRegex("androidx\\..*")
+                includeGroupByRegex("com\\.android(\\..*)?")
+                includeGroup("org.chromium.net")
+            }
         }
         mavenCentral()
     }
@@ -31,6 +36,11 @@ include(
     "transport-cronet",
     "protoc-gen-trevrpc-kotlin",
     "examples",
-    "bench-peer",
+    "benchmark-support",
+    "bench-peer-netty",
     "conformance-peer",
 )
+
+if (providers.gradleProperty("trevrpcCronetBenchPeer").map(String::toBoolean).getOrElse(false)) {
+    include("bench-peer-cronet")
+}

@@ -1,7 +1,12 @@
 pluginManagement {
     repositories {
         gradlePluginPortal()
-        mavenCentral()
+        val mirror = System.getenv("TREVRPC_GRADLE_MAVEN_CENTRAL")
+        if (mirror == null) {
+            mavenCentral()
+        } else {
+            maven { url = uri(mirror) }
+        }
     }
 }
 
@@ -11,7 +16,12 @@ dependencyResolutionManagement {
         maven {
             url = uri(providers.gradleProperty("trevrpc.repository").get())
         }
-        mavenCentral()
+        val mirror = System.getenv("TREVRPC_GRADLE_MAVEN_CENTRAL")
+        if (mirror == null) {
+            mavenCentral()
+        } else {
+            maven { url = uri(mirror) }
+        }
     }
 }
 

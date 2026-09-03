@@ -113,6 +113,7 @@
               licenseFile = ./LICENSE;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               greeterProto = ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto;
+              trevrpcBench = bench;
             };
             rust = pkgs.callPackage ./trevrpc-rust {
               benchProto = ./bench/proto;
@@ -307,20 +308,35 @@
 
           update-kotlin-deps = {
             packages = with pkgs; [
+              androidenv.androidPkgs.androidsdk
               jdk25
+              jq
               oxfmt
             ];
             script = ''
+              existing_gradle_deps=$(mktemp)
+              cp trevrpc-kotlin/gradle/deps.json "$existing_gradle_deps"
+
+              export ANDROID_HOME=$(dirname "$(dirname "$(command -v sdkmanager)")")/libexec/android-sdk
+              export ANDROID_SDK_ROOT=$ANDROID_HOME
               trevrpc-kotlin/gradlew \
                 --project-dir trevrpc-kotlin \
                 --no-configuration-cache \
                 --refresh-dependencies \
                 --write-locks \
                 --write-verification-metadata sha256 \
+                -PtrevrpcCronetBenchPeer=true \
                 updateGradleDependencyState
 
-              update_script=$(nix build .#trevrpc-kotlin.mitmCache.updateScript --no-link --print-out-paths)
+              update_script=$(nix build .#trevrpc-kotlin.benchPeerCronet.mitmCache.updateScript --no-link --print-out-paths)
               USE_BWRAP=0 "$update_script"
+
+              merged_gradle_deps=$(mktemp)
+              jq -s '.[0] * .[1]' \
+                "$existing_gradle_deps" \
+                trevrpc-kotlin/gradle/deps.json \
+                > "$merged_gradle_deps"
+              mv "$merged_gradle_deps" trevrpc-kotlin/gradle/deps.json
               oxfmt --write trevrpc-kotlin/gradle/deps.json
             '';
           };
@@ -353,7 +369,7 @@
             packages = [ benchmarkProtoGenerator ];
             script = ''
               cp bench/proto/benchmark.proto trevrpc-c/bench/proto/benchmark.proto
-              cp bench/proto/benchmark.proto trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto
+              cp bench/proto/benchmark.proto trevrpc-kotlin/benchmark-support/src/main/proto/benchmark.proto
               cp bench/proto/benchmark.proto trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto
 
               generated=$(mktemp -d)
@@ -427,7 +443,7 @@
               }
               ''
                 cmp ${./bench/proto/benchmark.proto} ${./trevrpc-c/bench/proto/benchmark.proto}
-                cmp ${./bench/proto/benchmark.proto} ${./trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto}
+                cmp ${./bench/proto/benchmark.proto} ${./trevrpc-kotlin/benchmark-support/src/main/proto/benchmark.proto}
                 cmp ${./bench/proto/benchmark.proto} ${./trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto}
                 generate-trevrpc-benchmark-proto ${./bench/proto} generated
                 cmp generated/benchmark.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go}

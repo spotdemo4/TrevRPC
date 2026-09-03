@@ -39,10 +39,7 @@ pub fn generate(output: &Path, server_ips: &[IpAddr]) -> Result<Certificates, Bo
             ]),
         "generate benchmark CA",
     )?;
-    let subject_alt_name = std::iter::once("DNS:localhost".to_owned())
-        .chain(server_ips.iter().map(|address| format!("IP:{address}")))
-        .collect::<Vec<_>>()
-        .join(",");
+    let subject_alt_name = subject_alt_name(server_ips);
     let mut request = Command::new("openssl");
     request
         .args([
@@ -88,6 +85,13 @@ pub fn generate(output: &Path, server_ips: &[IpAddr]) -> Result<Certificates, Bo
     })
 }
 
+fn subject_alt_name(server_ips: &[IpAddr]) -> String {
+    std::iter::once("DNS:localhost".to_owned())
+        .chain(server_ips.iter().map(|address| format!("IP:{address}")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn run(command: &mut Command, description: &str) -> Result<(), BoxError> {
     let output = command.output()?;
     if !output.status.success() {
@@ -98,4 +102,22 @@ fn run(command: &mut Command, description: &str) -> Result<(), BoxError> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::subject_alt_name;
+
+    #[test]
+    fn subject_alt_name_includes_localhost_and_every_server_ip() {
+        assert_eq!(
+            subject_alt_name(&[
+                IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2)),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ]),
+            "DNS:localhost,IP:10.0.2.2,IP:::1"
+        );
+    }
 }

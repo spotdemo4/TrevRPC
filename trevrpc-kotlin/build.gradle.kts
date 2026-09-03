@@ -8,6 +8,7 @@ import org.gradle.jvm.tasks.Jar
 import org.gradle.plugins.signing.SigningExtension
 
 plugins {
+    alias(libs.plugins.android.application) apply false
     alias(libs.plugins.dokka) apply false
     alias(libs.plugins.kotlin.jvm) apply false
 }
@@ -85,25 +86,27 @@ allprojects {
 subprojects {
     // Tests run on JDK 25 even where published artifacts retain Java 8 compatibility.
     afterEvaluate {
-        listOf("testCompileClasspath", "testRuntimeClasspath").forEach { configurationName ->
-            configurations.named(configurationName) {
+        configurations
+            .matching { it.name == "testCompileClasspath" || it.name == "testRuntimeClasspath" }
+            .configureEach {
                 attributes.attribute(
                     org.gradle.api.attributes.java.TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE,
                     25,
                 )
             }
-        }
     }
 
-    tasks.register("resolveAndLockAll") {
-        notCompatibleWithConfigurationCache("Resolves configurations at execution time")
-        doFirst {
-            require(gradle.startParameter.isWriteDependencyLocks) {
-                "$path must be run with --write-locks"
+    if (name != "bench-peer-cronet") {
+        tasks.register("resolveAndLockAll") {
+            notCompatibleWithConfigurationCache("Resolves configurations at execution time")
+            doFirst {
+                require(gradle.startParameter.isWriteDependencyLocks) {
+                    "$path must be run with --write-locks"
+                }
             }
-        }
-        doLast {
-            configurations.filter { it.isCanBeResolved }.forEach { it.resolve() }
+            doLast {
+                configurations.filter { it.isCanBeResolved }.forEach { it.resolve() }
+            }
         }
     }
 }
@@ -274,6 +277,9 @@ val verifyGradleConsumers =
         environment("TREVRPC_VERSION", project.version.toString())
         environment("TREVRPC_PROTOBUF_VERSION", protobufVersion)
         configuredProtocPath?.let { environment("TREVRPC_PROTOC_PATH", it) }
+        providers.environmentVariable("TREVRPC_GRADLE_MAVEN_CENTRAL").orNull?.let {
+            environment("TREVRPC_GRADLE_MAVEN_CENTRAL", it)
+        }
         commandLine("bash", layout.projectDirectory.file("publication-tests/gradle/verify.sh").asFile)
     }
 
@@ -300,6 +306,9 @@ val verifyCronetConsumers =
         environment("TREVRPC_VERSION", project.version.toString())
         providers.environmentVariable("MAVEN_SETTINGS").orNull?.let { environment("MAVEN_SETTINGS", it) }
         providers.environmentVariable("MAVEN_OPTS").orNull?.let { environment("MAVEN_OPTS", it) }
+        providers.environmentVariable("TREVRPC_GRADLE_MAVEN_CENTRAL").orNull?.let {
+            environment("TREVRPC_GRADLE_MAVEN_CENTRAL", it)
+        }
         commandLine("bash", layout.projectDirectory.file("publication-tests/cronet/verify.sh").asFile)
     }
 
