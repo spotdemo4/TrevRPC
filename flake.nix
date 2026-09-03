@@ -676,18 +676,21 @@
             '';
           };
 
-          python = {
-            root = ./.;
-            filter = file: file.hasExt "py";
-            packages = with pkgs; [
-              ruff
-              basedpyright
-            ];
-            script = ''
-              ruff check
-              basedpyright
-            '';
-          };
+          python =
+            let
+              # basedpyright's Nixpkgs build-time test closure pulls in ffmpeg-headless,
+              # whose FATE tests fail on aarch64-darwin; retain Ruff there.
+              enableBasedpyright = !pkgs.stdenv.hostPlatform.isDarwin;
+            in
+            {
+              root = ./.;
+              filter = file: file.hasExt "py";
+              packages = [ pkgs.ruff ] ++ pkgs.lib.optional enableBasedpyright pkgs.basedpyright;
+              script = ''
+                ruff check
+                ${pkgs.lib.optionalString enableBasedpyright "basedpyright"}
+              '';
+            };
 
           actions-gh = {
             root = ./.github/workflows;
