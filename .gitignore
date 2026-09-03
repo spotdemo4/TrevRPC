@@ -33,6 +33,7 @@ node_modules/
 /trevrpc-kotlin/**/target/
 
 # c
+core.*
 /trevrpc-c/build/
 
 # cpp
