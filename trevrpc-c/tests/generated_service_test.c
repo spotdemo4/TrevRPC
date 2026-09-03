@@ -147,6 +147,9 @@ static void record_finished(void* user_data, const trevrpc_rpc_finished_event* e
 }
 
 static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data, size_t data_len) {
+    if (data_len == 0) {
+        return 0;
+    }
     trevrpc_msquic_chunk* chunk = malloc(sizeof(*chunk) + data_len);
     if (chunk == NULL) {
         return -ENOMEM;
@@ -182,6 +185,7 @@ static void reset_raw_stream(trevrpc_msquic_stream* stream) {
         frame = next;
     }
     trevrpc_frame_parser_reset(&stream->frame_parser);
+    trevrpc_owned_bytes_reset(&stream->pending_frame.body);
     trevrpc_msquic_send* send = stream->send_pool;
     while (send != NULL) {
         trevrpc_msquic_send* next = send->next;
@@ -212,6 +216,34 @@ static int init_raw_stream(trevrpc_msquic_stream* stream, const uint8_t* body, s
         reset_raw_stream(stream);
     }
     return err;
+}
+
+static int test_unbudgeted_raw_receive_injection(void) {
+    int result = 1;
+    trevrpc_msquic_stream stream = {0};
+    bool initialized = false;
+    const uint8_t first[] = {'r', 'a', 'w'};
+    const uint8_t second[] = {'-', 'r', 'x'};
+    const uint8_t* buffers[] = {first, second};
+    const size_t lengths[] = {sizeof(first), sizeof(second)};
+    uint8_t received[sizeof(first) + sizeof(second)] = {0};
+    size_t accepted = 0;
+
+    CHECK_GOTO(init_raw_stream(&stream, first, 0) == 0);
+    initialized = true;
+    stream.recv_mode = TREV_MSQUIC_RECV_BYTES;
+    CHECK_GOTO(trevrpc_msquic_test_receive_inject(
+                   &stream, buffers, lengths, sizeof(buffers) / sizeof(buffers[0]), false, &accepted) == 0);
+    CHECK_GOTO(accepted == sizeof(received));
+    CHECK_GOTO(trevrpc_msquic_stream_read(&stream, received, sizeof(received)) == (intptr_t)sizeof(received));
+    CHECK_GOTO(memcmp(received, "raw-rx", sizeof(received)) == 0);
+    result = 0;
+
+cleanup:
+    if (initialized) {
+        reset_raw_stream(&stream);
+    }
+    return result;
 }
 
 static int say_hello(void* user_data,
@@ -1593,6 +1625,9 @@ cleanup:
 int main(void) {
     int result = 1;
 
+    if (test_unbudgeted_raw_receive_injection() != 0) {
+        goto cleanup;
+    }
     if (test_generator_channel_output() != 0) {
         goto cleanup;
     }

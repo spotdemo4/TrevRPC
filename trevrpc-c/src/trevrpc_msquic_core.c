@@ -4475,6 +4475,13 @@ static int trevrpc_msquic_receive_raw_locked(
             TREV_MSQUIC_RESERVE_OK) {
             return 1;
         }
+    } else if (stream->recv_budget == NULL) {
+        /* Synthetic raw streams predate receive budgets and accept the callback
+         * payload without shared or local admission accounting. */
+        payload = available;
+        if (!trevrpc_msquic_checked_add(sizeof(trevrpc_msquic_chunk), payload, &charge)) {
+            return -EOVERFLOW;
+        }
     } else {
         size_t local_max_bytes = stream->max_recv_owned_bytes;
         size_t local_max_count = stream->max_recv_owned_count;
@@ -4489,11 +4496,6 @@ static int trevrpc_msquic_receive_raw_locked(
         }
         size_t local_payload = local_max_bytes - stream->recv_owned_bytes - sizeof(trevrpc_msquic_chunk);
         trevrpc_msquic_receive_budget* budget = stream->recv_budget;
-        if (budget == NULL) {
-            /* Unbudgeted streams admit against their local caps alone. */
-            charge = sizeof(trevrpc_msquic_chunk) + local_payload;
-            return 0;
-        }
         pthread_mutex_lock(&budget->mutex);
         size_t aggregate_max_bytes = undecided ? budget->undecided_admission_max_bytes : budget->max_owned_bytes;
         size_t aggregate_max_count = undecided ? budget->undecided_admission_max_count : budget->max_owned_count;
@@ -4520,17 +4522,16 @@ static int trevrpc_msquic_receive_raw_locked(
     }
 
     trevrpc_msquic_chunk* chunk =
-        trevrpc_msquic_test_should_fail_receive_allocation(TREV_MSQUIC_TEST_RECV_ALLOC_RAW_CHUNK)
-            ? NULL
-            : malloc(sizeof(*chunk) + payload);
+        trevrpc_msquic_test_should_fail_receive_allocation(TREV_MSQUIC_TEST_RECV_ALLOC_RAW_CHUNK) ? NULL
+                                                                                                  : malloc(charge);
     if (chunk == NULL) {
-        trevrpc_msquic_recv_release_locked(stream, sizeof(*chunk) + payload, 1);
+        trevrpc_msquic_recv_release_locked(stream, charge, 1);
         return -ENOMEM;
     }
     chunk->next = NULL;
     chunk->len = payload;
     chunk->offset = 0;
-    chunk->charge_bytes = sizeof(*chunk) + payload;
+    chunk->charge_bytes = charge;
     chunk->charge_count = 1;
     trevrpc_msquic_receive_copy_prefix(event->RECEIVE.Buffers, event->RECEIVE.BufferCount, chunk->data, payload);
     if (stream->recv_tail != NULL) {

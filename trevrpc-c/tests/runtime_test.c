@@ -533,6 +533,9 @@ static void deferred_signal_state_destroy(deferred_signal_state* state) {
 }
 
 static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data, size_t data_len) {
+    if (data_len == 0) {
+        return 0;
+    }
     trevrpc_msquic_chunk* chunk = malloc(sizeof(*chunk) + data_len);
     if (chunk == NULL) {
         return -ENOMEM;
@@ -568,6 +571,7 @@ static void reset_raw_stream(trevrpc_msquic_stream* stream) {
         frame = next;
     }
     trevrpc_frame_parser_reset(&stream->frame_parser);
+    trevrpc_owned_bytes_reset(&stream->pending_frame.body);
     trevrpc_msquic_send* send = stream->send_pool;
     while (send != NULL) {
         trevrpc_msquic_send* next = send->next;
