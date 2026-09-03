@@ -52,11 +52,13 @@ val protobufVersion =
         .get()
 val kotlinVersion = libs.versions.kotlin.get()
 
+version = "0.3.3"
+providers.gradleProperty("trevrpcVersion").orNull?.let { version = it }
+providers.environmentVariable("TREVRPC_VERSION").orNull?.let { version = it }
+
 allprojects {
     group = "zip.trev.trevrpc"
-    version = "0.3.3"
-    providers.gradleProperty("trevrpcVersion").orNull?.let { version = it }
-    providers.environmentVariable("TREVRPC_VERSION").orNull?.let { version = it }
+    version = rootProject.version
 
     configurations.configureEach {
         resolutionStrategy.eachDependency {

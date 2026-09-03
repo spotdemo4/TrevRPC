@@ -519,7 +519,7 @@
                   git config --global user.email release-contract@example.invalid
                   git config --global user.name "Release Contract"
 
-                  helper=${./scripts/release-nix-package.sh}
+                  helper=${./.forgejo/scripts/release-nix-package.sh}
                   fake_bin="$TMPDIR/fake-bin"
                   mkdir -p "$fake_bin"
 
@@ -600,53 +600,55 @@
                   }
 
                   fixture=$(new_fixture)
-                  git -C "$fixture" tag v1.0.0
                   git -C "$fixture" tag trevrpc-go/v0.2.1
                   git -C "$fixture" tag trevrpc-go/tools/v9.9.9
                   push_fixture "$fixture"
-                  set_event v1.0.0
+                  set_event trevrpc-go/v0.2.1
                   : > "$RELEASE_LOG"
                   TAG=untrusted PACKAGES=untrusted run_release "$fixture" trevrpc-go
                   test "$(wc -l < "$RELEASE_LOG")" -eq 1
                   grep -Fx 'trevrpc-go/v0.2.1|packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl' "$RELEASE_LOG"
 
                   fixture=$(new_fixture)
-                  git -C "$fixture" tag v1.0.0
                   git -C "$fixture" tag trevrpc-rust/v0.1.10
                   git -C "$fixture" tag trevrpc-go/v9.9.9
                   push_fixture "$fixture"
-                  set_event v1.0.0
+                  set_event trevrpc-rust/v0.1.10
                   : > "$RELEASE_LOG"
                   run_release "$fixture" trevrpc-rust
                   test "$(wc -l < "$RELEASE_LOG")" -eq 1
                   grep -Fx 'trevrpc-rust/v0.1.10|packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl' "$RELEASE_LOG"
 
                   fixture=$(new_fixture)
-                  git -C "$fixture" tag trevrpc-go/v0.2.1
-                  add_commit "$fixture" root-release
-                  git -C "$fixture" tag v1.0.1
-                  git -C "$fixture" tag trevrpc-rust/v0.1.10
-                  push_fixture "$fixture"
-                  set_event v1.0.1
-                  : > "$RELEASE_LOG"
-                  run_release "$fixture" trevrpc-go
-                  test ! -s "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag v1.0.0
                   git -C "$fixture" tag trevrpc-go/v9.9.9
                   push_fixture "$fixture"
-                  set_event v1.0.0
+                  set_event trevrpc-go/v9.9.9
                   : > "$RELEASE_LOG"
                   expect_failure run_release "$fixture" trevrpc-go
                   test ! -s "$RELEASE_LOG"
 
                   fixture=$(new_fixture)
-                  git -C "$fixture" tag v1.0.0
                   git -C "$fixture" tag trevrpc-go/v0.2.1
-                  git -C "$fixture" tag trevrpc-go/v0.2.0
+                  add_commit "$fixture" newer-head
                   push_fixture "$fixture"
-                  set_event v1.0.0
+                  set_event trevrpc-go/v0.2.1
+                  : > "$RELEASE_LOG"
+                  expect_failure run_release "$fixture" trevrpc-go
+                  test ! -s "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag trevrpc-go/v0.2.1
+                  git -C "$fixture" tag trevrpc-rust/v0.1.10
+                  push_fixture "$fixture"
+                  set_event trevrpc-rust/v0.1.10
+                  : > "$RELEASE_LOG"
+                  expect_failure run_release "$fixture" trevrpc-go
+                  test ! -s "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  git -C "$fixture" tag trevrpc-go/tools/v0.2.1
+                  push_fixture "$fixture"
+                  set_event trevrpc-go/tools/v0.2.1
                   : > "$RELEASE_LOG"
                   expect_failure run_release "$fixture" trevrpc-go
                   test ! -s "$RELEASE_LOG"
@@ -657,17 +659,23 @@
                   set_event v1.0.0
                   : > "$RELEASE_LOG"
                   expect_failure run_release "$fixture" trevrpc-go
-                  expect_failure run_release "$fixture" trevrpc-python
                   test ! -s "$RELEASE_LOG"
 
                   fixture=$(new_fixture)
-                  git -C "$fixture" tag v1.0.0
                   git -C "$fixture" tag trevrpc-go/v0.2.1
                   push_fixture "$fixture"
                   export GITHUB_REF_NAME=trevrpc-go/v0.2.1
-                  export GITHUB_REF=refs/tags/trevrpc-go/v0.2.1
+                  export GITHUB_REF=refs/heads/main
                   : > "$RELEASE_LOG"
                   expect_failure run_release "$fixture" trevrpc-go
+                  test ! -s "$RELEASE_LOG"
+
+                  fixture=$(new_fixture)
+                  push_fixture "$fixture"
+                  set_event trevrpc-go/v0.2.1
+                  : > "$RELEASE_LOG"
+                  expect_failure run_release "$fixture" trevrpc-go
+                  expect_failure run_release "$fixture" trevrpc-python
                   test ! -s "$RELEASE_LOG"
 
                   touch $out

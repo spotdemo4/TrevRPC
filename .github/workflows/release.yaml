@@ -2,7 +2,7 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["**"]
   workflow_dispatch:
 
 concurrency:
@@ -13,6 +13,9 @@ permissions:
 
 jobs:
   check:
+    if: >-
+      startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
+      startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
@@ -24,15 +27,12 @@ jobs:
         run: nix flake check
 
   github:
+    if: >-
+      startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
+      startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
     needs: check
-    name: github (${{ matrix.package }})
+    name: github
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        package:
-          - trevrpc-go
-          - trevrpc-rust
     permissions:
       id-token: write
       contents: write
@@ -44,7 +44,10 @@ jobs:
           fetch_depth: 0
           shell: release
 
-      - name: Release ${{ matrix.package }} to GitHub
+      - name: Release package to GitHub
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: scripts/release-nix-package.sh "${{ matrix.package }}"
+        run: |
+          set -euo pipefail
+          package="${GITHUB_REF_NAME%%/*}"
+          .forgejo/scripts/release-nix-package.sh "$package"

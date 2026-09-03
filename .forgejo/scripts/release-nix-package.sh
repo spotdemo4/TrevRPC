@@ -22,8 +22,8 @@ esac
 
 ref_name="${GITHUB_REF_NAME-}"
 ref="${GITHUB_REF-}"
-if [[ ! "$ref_name" =~ ^v[^/]+$ ]] || [[ "$ref" != "refs/tags/$ref_name" ]]; then
-  echo "release requires a root v* tag ref; got GITHUB_REF_NAME=$ref_name GITHUB_REF=$ref" >&2
+if [[ ! "$ref_name" =~ ^${package}/v[^/]+$ ]] || [[ "$ref" != "refs/tags/$ref_name" ]]; then
+  echo "release requires a $package/v* tag ref; got GITHUB_REF_NAME=$ref_name GITHUB_REF=$ref" >&2
   exit 1
 fi
 
@@ -45,9 +45,9 @@ fetch_tags() {
 fetch_tags
 
 head_commit="$(git rev-parse --verify 'HEAD^{commit}')"
-root_tag_commit="$(git rev-parse --verify "refs/tags/$ref_name^{commit}")"
-if [[ "$root_tag_commit" != "$head_commit" ]]; then
-  echo "root release tag $ref_name does not point at HEAD" >&2
+tag_commit="$(git rev-parse --verify "refs/tags/$ref_name^{commit}")"
+if [[ "$tag_commit" != "$head_commit" ]]; then
+  echo "release tag $ref_name does not point at HEAD" >&2
   exit 1
 fi
 
@@ -57,31 +57,8 @@ if [[ -z "$version" || "$version" =~ [[:space:]/] ]]; then
   exit 1
 fi
 expected_tag="$package/v$version"
-
-mapfile -t package_tags < <(
-  git tag --points-at HEAD --list "$package/v*" |
-    grep -E "^${package}/v[^/]+$" || true
-)
-
-if [[ "${#package_tags[@]}" -eq 0 ]]; then
-  if git show-ref --verify --quiet "refs/tags/$expected_tag"; then
-    expected_commit="$(git rev-parse --verify "refs/tags/$expected_tag^{commit}")"
-    echo "$package is unchanged at $ref_name; $expected_tag remains at $expected_commit"
-    exit 0
-  fi
-  echo "missing package tag $expected_tag for Nix version $version" >&2
-  exit 1
-fi
-
-if [[ "${#package_tags[@]}" -ne 1 ]]; then
-  printf 'conflicting %s tags at HEAD:' "$package" >&2
-  printf ' %s' "${package_tags[@]}" >&2
-  printf '\n' >&2
-  exit 1
-fi
-
-if [[ "${package_tags[0]}" != "$expected_tag" ]]; then
-  echo "package tag ${package_tags[0]} does not match Nix version $version (expected $expected_tag)" >&2
+if [[ "$ref_name" != "$expected_tag" ]]; then
+  echo "release tag $ref_name does not match Nix version $version (expected $expected_tag)" >&2
   exit 1
 fi
 
