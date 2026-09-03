@@ -27,7 +27,7 @@ jobs:
       - name: Discover smoke cells
         id: matrix
         run: |
-          nix shell nixpkgs#jq --command jq --null-input --raw-output \
+          jq --null-input --raw-output \
             --slurpfile native bench/campaigns/native-smoke.example.json \
             --slurpfile chromium bench/campaigns/chromium-smoke.example.json \
             --slurpfile firefox bench/campaigns/firefox-smoke.example.json \
