@@ -83,7 +83,6 @@ struct trevrpc_msquic_stream {
     HQUIC handle;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    trevrpc_msquic_recv_mode recv_mode;
     trevrpc_msquic_chunk* recv_head;
     trevrpc_msquic_chunk* recv_tail;
     size_t recv_buffered;
@@ -98,43 +97,15 @@ struct trevrpc_msquic_stream {
     size_t recv_owned_count;
     size_t parser_owned_bytes;
     size_t parser_owned_count;
-    bool parser_budgeted;
-    trevrpc_msquic_receive_pause_kind recv_pause_kind;
     size_t recv_pause_need_bytes;
     size_t recv_pause_need_count;
-    bool receive_disabled;
-    bool receive_waiting_on_raw_pump;
-    bool receive_resume_ready;
-    _Atomic bool receive_closing;
-    bool pause_listed;
     _Atomic size_t active_resume_pins;
-#ifdef TREVRPC_MSQUIC_TESTING
-    bool synthetic_receive_fixture;
-#endif
     trevrpc_msquic_stream* pause_prev;
     trevrpc_msquic_stream* pause_next;
     size_t recv_grant_bytes;
     size_t recv_grant_count;
-    trevrpc_msquic_receive_pause_kind recv_grant_kind;
-    bool pending_frame_valid;
+    uint64_t stream_id;
     trevrpc_msquic_frame pending_frame;
-    enum {
-        TREV_MSQUIC_PARSER_ALLOC_NONE,
-        TREV_MSQUIC_PARSER_ALLOC_PRESSURE,
-        TREV_MSQUIC_PARSER_ALLOC_OOM,
-    } parser_alloc_result;
-    bool recv_fin;
-    bool send_closed;
-    bool send_aborted;
-    bool api_closing;
-    bool destroy_requested;
-    bool destroy_started;
-    bool destroy_complete;
-    bool close_shutdown_started;
-    bool shutdown_complete;
-    bool close_pending;
-    bool closed;
-    bool api_ref_acquired;
     size_t active_send_ops;
     size_t active_handle_ops;
     size_t active_send_completions;
@@ -148,9 +119,41 @@ struct trevrpc_msquic_stream {
     size_t max_pending_send_count;
     size_t pending_send_bytes;
     size_t pending_send_count;
-    int err;
     trevrpc_msquic_send* send_pool;
     size_t send_pool_count;
+    trevrpc_msquic_recv_mode recv_mode;
+    trevrpc_msquic_receive_pause_kind recv_pause_kind;
+    trevrpc_msquic_receive_pause_kind recv_grant_kind;
+    enum {
+        TREV_MSQUIC_PARSER_ALLOC_NONE,
+        TREV_MSQUIC_PARSER_ALLOC_PRESSURE,
+        TREV_MSQUIC_PARSER_ALLOC_OOM,
+    } parser_alloc_result;
+    int err;
+    bool parser_budgeted;
+    bool receive_disabled;
+    bool receive_waiting_on_raw_pump;
+    bool receive_resume_ready;
+    _Atomic bool receive_closing;
+    bool pause_listed;
+#ifdef TREVRPC_MSQUIC_TESTING
+    bool synthetic_receive_fixture;
+#endif
+    bool pending_frame_valid;
+    bool recv_fin;
+    bool stream_id_valid;
+    bool receive_capable;
+    bool send_closed;
+    bool send_aborted;
+    bool api_closing;
+    bool destroy_requested;
+    bool destroy_started;
+    bool destroy_complete;
+    bool close_shutdown_started;
+    bool shutdown_complete;
+    bool close_pending;
+    bool closed;
+    bool api_ref_acquired;
 };
 
 struct trevrpc_msquic_conn {

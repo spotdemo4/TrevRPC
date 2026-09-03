@@ -31,8 +31,6 @@ typedef struct fake_stream {
     size_t offset;
     size_t max_read_size;
     size_t observer_set_calls;
-    int id_error;
-    int observer_error;
     intptr_t read_error;
     trevrpc_h3_ingress_observer observer;
     void* observer_context;
@@ -41,8 +39,10 @@ typedef struct fake_stream {
     size_t drain_calls;
     size_t abort_calls;
     uint64_t abort_application_error;
-    int abort_error;
     size_t close_calls;
+    int id_error;
+    int observer_error;
+    int abort_error;
     bool close_observed_abort;
     bool terminal;
     bool block_observer_set;

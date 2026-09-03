@@ -6,6 +6,7 @@
 #include "trevrpc_msquic.h"
 
 #include "trevrpc_frame_internal.h"
+#include "trevrpc_h3_demux_internal.h"
 #include "trevrpc_http3_frame_internal.h"
 #include "trevrpc_http3_headers_internal.h"
 #include "trevrpc_http3_settings_internal.h"
@@ -43,7 +44,9 @@
 #define TREV_H3_MAX_ENCODED_FIELD_SECTION_SIZE (16 * 1024)
 #define TREV_H3_CONTENT_TYPE "application/trevrpc"
 #define TREV_H3_REQUEST_TIMEOUT_STATUS 408
+#define TREV_H3_UNRESOLVED_STREAM_TIMEOUT_NANOS 5000000000ull
 #define TREV_H3_QPACK_SET_CAPACITY_ZERO 0x20
+#define TREV_H3_UNIDI_MONITOR_COUNT TREV_WT_H3_DEFAULT_UNIDI_STREAMS
 
 #define TREV_H3_ERR_QPACK_DECOMPRESSION_FAILED -3101
 #define TREV_H3_ERR_FRAME_UNEXPECTED -3102
@@ -107,12 +110,42 @@ struct trevrpc_wt_stream {
     trevrpc_msquic_stream* msquic_stream;
 };
 
+typedef enum trevrpc_h3_unidi_monitor_state {
+    TREV_H3_UNIDI_MONITOR_FREE = 0,
+    TREV_H3_UNIDI_MONITOR_LIVE,
+    TREV_H3_UNIDI_MONITOR_CLOSING,
+} trevrpc_h3_unidi_monitor_state;
+
+typedef struct trevrpc_h3_unidi_monitor trevrpc_h3_unidi_monitor;
+
+typedef struct trevrpc_h3_unidi_observer_context {
+    trevrpc_h3_unidi_monitor* monitor;
+    uint64_t generation;
+} trevrpc_h3_unidi_observer_context;
+
+struct trevrpc_h3_unidi_monitor {
+    trevrpc_h3_conn* conn;
+    trevrpc_msquic_stream* stream;
+    trevrpc_h3_demux_stream classifier;
+    trevrpc_h3_unidi_observer_context observer_context;
+    uint64_t deadline_nanos;
+    uint64_t generation;
+    uint32_t pending_flags;
+    trevrpc_h3_unidi_monitor_state state;
+    bool observer_installed;
+    bool install_pending;
+    bool processing;
+    bool terminal_seen;
+};
+
 struct trevrpc_h3_conn {
     trevrpc_wt_session session;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    pthread_cond_t unidi_cond;
     pthread_t control_thread;
-    pthread_t unidi_threads[TREV_WT_H3_DEFAULT_UNIDI_STREAMS];
+    pthread_t unidi_pump_thread;
+    trevrpc_h3_unidi_monitor unidi_monitors[TREV_H3_UNIDI_MONITOR_COUNT];
     char* webtransport_path;
     char* webtransport_origin;
     trevrpc_webtransport_admission webtransport_admission;
@@ -125,40 +158,27 @@ struct trevrpc_h3_conn {
     bool webtransport_resolving;
     bool shutting_down;
     bool control_thread_started;
-    bool unidi_thread_started[TREV_WT_H3_DEFAULT_UNIDI_STREAMS];
+    bool unidi_pump_thread_started;
+#ifdef TREVRPC_H3_FRAME_POLICY_TESTING
+    size_t unidi_started_count;
+    size_t unidi_retired_count;
+#endif
     bool qpack_encoder_seen;
     bool qpack_decoder_seen;
 };
 
-typedef struct trevrpc_h3_unidi_monitor_context {
-    trevrpc_h3_conn* conn;
-    size_t index;
-} trevrpc_h3_unidi_monitor_context;
-
 struct trevrpc_h3_stream {
     trevrpc_msquic_stream* msquic_stream;
     trevrpc_h3_conn* conn;
-    uint64_t data_remaining;
-    uint64_t skip_remaining;
-    uint64_t frame_type;
-    uint8_t varint[8];
-    size_t varint_len;
-    size_t varint_need;
-    bool have_frame_type;
+    trevrpc_h3_frame_prefix_parser frame_prefix;
+    trevrpc_h3_request_frame_state frame_state;
     uint8_t* trailer_block;
     size_t trailer_len;
     size_t trailer_offset;
-    trevrpc_h3_unknown_discard_budget unknown_discard;
     trevrpc_frame_parser rpc_parser;
     bool rpc_parser_initialized;
-    bool trailers_seen;
     bool owns_msquic_stream;
 };
-
-typedef struct trevrpc_wt_h3_frame {
-    uint64_t type;
-    uint64_t len;
-} trevrpc_wt_h3_frame;
 
 typedef struct trevrpc_wt_headers {
     bool method_seen;
@@ -175,9 +195,6 @@ typedef struct trevrpc_wt_headers {
     bool content_type_trevrpc;
     bool draft02_request;
     bool draft02_response;
-    bool regular_seen;
-    bool saw_pseudo_header;
-    size_t field_section_size;
     uint8_t* path;
     size_t path_len;
     uint8_t* authority;
@@ -204,8 +221,9 @@ typedef struct trevrpc_wt_connect_response_context {
 } trevrpc_wt_connect_response_context;
 
 static uint64_t trevrpc_h3_monotonic_nanos(void);
-static intptr_t trevrpc_h3_read_varint_incremental(
-    trevrpc_h3_stream* stream, uint64_t* value, trevrpc_h3_read_mode mode, uint64_t deadline_nanos);
+static intptr_t trevrpc_h3_read_msquic(
+    trevrpc_h3_stream* stream, uint8_t* data, size_t len, trevrpc_h3_read_mode mode, uint64_t deadline_nanos);
+static int trevrpc_h3_wait_for_webtransport(trevrpc_h3_conn* conn, uint64_t session_id, uint64_t deadline_nanos);
 
 static uint16_t trevrpc_wt_effective_stream_limit(uint32_t configured) {
     if (configured == 0) {
@@ -319,6 +337,25 @@ static int trevrpc_wt_read_varint(trevrpc_msquic_stream* stream, uint64_t* value
         return TREV_WT_ERR_REJECTED;
     }
     *value = decoded;
+    return 0;
+}
+
+static int trevrpc_wt_read_bounded_varint_payload(
+    trevrpc_msquic_stream* stream, uint64_t payload_len, uint64_t* value) {
+    uint8_t payload[8];
+    if (payload_len == 0 || payload_len > sizeof(payload)) {
+        return TREV_WT_ERR_REJECTED;
+    }
+
+    int err = trevrpc_wt_read_exact(stream, payload, (size_t)payload_len);
+    if (err != 0) {
+        return err;
+    }
+
+    size_t offset = 0;
+    if (trevrpc_quic_varint_read(payload, (size_t)payload_len, &offset, value) != 0 || offset != (size_t)payload_len) {
+        return TREV_WT_ERR_REJECTED;
+    }
     return 0;
 }
 
@@ -508,35 +545,6 @@ static bool trevrpc_h3_ascii_equal_case(const uint8_t* value, size_t value_len, 
 
 static int trevrpc_wt_headers_apply_field(
     trevrpc_wt_headers* headers, const uint8_t* name, size_t name_len, const uint8_t* value, size_t value_len) {
-    if (name_len == 0 || name_len > TREV_H3_MAX_FIELD_SECTION_SIZE || value_len > TREV_H3_MAX_FIELD_SECTION_SIZE) {
-        return TREV_H3_ERR_FIELD_SECTION_TOO_LARGE;
-    }
-    size_t field_size = 32;
-    if (name_len > SIZE_MAX - field_size || value_len > SIZE_MAX - field_size - name_len) {
-        return TREV_H3_ERR_FIELD_SECTION_TOO_LARGE;
-    }
-    field_size += name_len + value_len;
-    if (field_size > TREV_H3_MAX_FIELD_SECTION_SIZE ||
-        headers->field_section_size > TREV_H3_MAX_FIELD_SECTION_SIZE - field_size) {
-        return TREV_H3_ERR_FIELD_SECTION_TOO_LARGE;
-    }
-    headers->field_section_size += field_size;
-    for (size_t i = 0; i < name_len; i++) {
-        if (name[i] >= 'A' && name[i] <= 'Z') {
-            return TREV_H3_ERR_MESSAGE_ERROR;
-        }
-    }
-
-    bool pseudo = name[0] == ':';
-    if (pseudo) {
-        if (headers->regular_seen) {
-            return TREV_H3_ERR_MESSAGE_ERROR;
-        }
-        headers->saw_pseudo_header = true;
-    } else {
-        headers->regular_seen = true;
-    }
-
     if (name_len == 7 && memcmp(name, ":method", 7) == 0) {
         if (headers->method_seen) {
             return TREV_H3_ERR_MESSAGE_ERROR;
@@ -551,9 +559,6 @@ static int trevrpc_wt_headers_apply_field(
         headers->protocol_seen = true;
         headers->protocol_webtransport = value_len == 12 && memcmp(value, "webtransport", 12) == 0;
         headers->protocol_webtransport_h3 = value_len == 15 && memcmp(value, "webtransport-h3", 15) == 0;
-        if (!headers->protocol_webtransport && !headers->protocol_webtransport_h3) {
-            return TREV_H3_ERR_MESSAGE_ERROR;
-        }
     } else if (name_len == 7 && memcmp(name, ":scheme", 7) == 0) {
         if (headers->scheme_seen) {
             return TREV_H3_ERR_MESSAGE_ERROR;
@@ -593,13 +598,6 @@ static int trevrpc_wt_headers_apply_field(
     } else if (name_len == 28 && memcmp(name, "sec-webtransport-http3-draft", 28) == 0 && value_len == 7 &&
                memcmp(value, "draft02", 7) == 0) {
         headers->draft02_response = true;
-    } else if ((name_len == 2 && memcmp(name, "te", 2) == 0 && (value_len != 8 || memcmp(value, "trailers", 8) != 0)) ||
-               pseudo || (name_len == 10 && memcmp(name, "connection", 10) == 0) ||
-               (name_len == 16 && memcmp(name, "proxy-connection", 16) == 0) ||
-               (name_len == 10 && memcmp(name, "keep-alive", 10) == 0) ||
-               (name_len == 17 && memcmp(name, "transfer-encoding", 17) == 0) ||
-               (name_len == 7 && memcmp(name, "upgrade", 7) == 0)) {
-        return TREV_H3_ERR_MESSAGE_ERROR;
     }
     return 0;
 }
@@ -687,31 +685,47 @@ static int trevrpc_wt_write_headers_frame(trevrpc_msquic_stream* stream, const u
 }
 
 static int trevrpc_wt_read_headers_frame(trevrpc_msquic_stream* stream,
+    uint64_t max_encoded_field_section,
     trevrpc_http3_header_block_kind kind,
     trevrpc_wt_headers_validate_fn validate,
     void* context) {
-    uint64_t frame_type = 0;
-    uint64_t frame_len = 0;
-    int err = trevrpc_wt_read_varint(stream, &frame_type);
-    if (err != 0) {
-        return err;
+    trevrpc_h3_frame_prefix_parser parser;
+    trevrpc_h3_frame_prefix prefix = {0};
+    trevrpc_h3_frame_status frame_status = trevrpc_h3_frame_prefix_parser_init(&parser, max_encoded_field_section);
+    if (frame_status == TREV_H3_FRAME_INVALID_ARGUMENT) {
+        return -EINVAL;
     }
-    err = trevrpc_wt_read_varint(stream, &frame_len);
-    if (err != 0) {
-        return err;
+
+    while (frame_status == TREV_H3_FRAME_NEED_INPUT) {
+        uint8_t encoded_byte = 0;
+        intptr_t n = trevrpc_msquic_stream_read_protocol(stream, &encoded_byte, 1);
+        if (n < 0) {
+            return trevrpc_wt_map_msquic_error((int)n);
+        }
+        if (n == 0) {
+            frame_status = trevrpc_h3_frame_prefix_parser_finish(&parser);
+            return frame_status == TREV_H3_FRAME_CLEAN_EOF ? TREV_WT_ERR_CLOSED : TREV_WT_ERR_REJECTED;
+        }
+
+        size_t consumed = 0;
+        frame_status = trevrpc_h3_frame_prefix_parser_feed(&parser, &encoded_byte, 1, &consumed, &prefix);
+        if (frame_status != TREV_H3_FRAME_NEED_INPUT && frame_status != TREV_H3_FRAME_OK) {
+            return TREV_WT_ERR_REJECTED;
+        }
     }
-    if (frame_type != TREV_H3_FRAME_HEADERS || frame_len > TREV_H3_MAX_ENCODED_FIELD_SECTION_SIZE) {
+    if (prefix.type != TREV_H3_FRAME_HEADERS) {
         return TREV_WT_ERR_REJECTED;
     }
 
-    uint8_t* block = malloc((size_t)frame_len);
+    size_t frame_len = (size_t)prefix.length;
+    uint8_t* block = malloc(frame_len);
     if (block == NULL && frame_len > 0) {
         return -ENOMEM;
     }
     trevrpc_wt_headers headers = {0};
-    err = trevrpc_wt_read_exact(stream, block, (size_t)frame_len);
+    int err = trevrpc_wt_read_exact(stream, block, frame_len);
     if (err == 0) {
-        err = trevrpc_wt_header_block_decode(block, (size_t)frame_len, kind, &headers);
+        err = trevrpc_wt_header_block_decode(block, frame_len, kind, &headers);
     }
     if (err == 0 && validate != NULL) {
         err = validate(&headers, context);
@@ -912,8 +926,11 @@ static int trevrpc_wt_open_connect_stream(trevrpc_wt_session* session, const tre
         trevrpc_wt_connect_response_context context = {
             .draft = session->draft,
         };
-        err = trevrpc_wt_read_headers_frame(
-            stream, TREV_HTTP3_HEADERS_RESPONSE, trevrpc_wt_validate_connect_response, &context);
+        err = trevrpc_wt_read_headers_frame(stream,
+            session->frame_policy.max_encoded_field_section,
+            TREV_HTTP3_HEADERS_RESPONSE,
+            trevrpc_wt_validate_connect_response,
+            &context);
     }
     if (err != 0) {
         trevrpc_msquic_stream_close(stream);
@@ -946,8 +963,11 @@ static int trevrpc_wt_accept_connect_stream(trevrpc_wt_session* session, const t
             config != NULL && config->admission != NULL ? config->admission_user_data : &path_origin_policy,
         .draft = session->draft,
     };
-    err = trevrpc_wt_read_headers_frame(
-        stream, TREV_HTTP3_HEADERS_REQUEST, trevrpc_wt_validate_connect_request, &context);
+    err = trevrpc_wt_read_headers_frame(stream,
+        session->frame_policy.max_encoded_field_section,
+        TREV_HTTP3_HEADERS_REQUEST,
+        trevrpc_wt_validate_connect_request,
+        &context);
 
     uint8_t block[64];
     size_t offset = 0;
@@ -1134,25 +1154,42 @@ static int trevrpc_wt_read_peer_control_settings(
         err = TREV_WT_ERR_REJECTED;
     }
 
-    trevrpc_wt_h3_frame frame = {0};
+    trevrpc_h3_frame_prefix_parser parser;
+    trevrpc_h3_frame_prefix prefix = {0};
+    trevrpc_h3_frame_status frame_status = TREV_H3_FRAME_NEED_INPUT;
     if (err == 0) {
         session->h3_error_code = TREV_H3_APP_FRAME_ERROR;
-        err = trevrpc_wt_read_varint(control, &frame.type);
+        frame_status = trevrpc_h3_frame_prefix_parser_init(&parser, session->frame_policy.max_settings_payload);
+        while (frame_status == TREV_H3_FRAME_NEED_INPUT) {
+            uint8_t encoded_byte = 0;
+            intptr_t n = trevrpc_msquic_stream_read_protocol(control, &encoded_byte, 1);
+            if (n < 0) {
+                err = trevrpc_wt_map_msquic_error((int)n);
+                break;
+            }
+            if (n == 0) {
+                frame_status = trevrpc_h3_frame_prefix_parser_finish(&parser);
+                err = frame_status == TREV_H3_FRAME_CLEAN_EOF ? TREV_WT_ERR_CLOSED : TREV_WT_ERR_REJECTED;
+                break;
+            }
+
+            size_t consumed = 0;
+            frame_status = trevrpc_h3_frame_prefix_parser_feed(&parser, &encoded_byte, 1, &consumed, &prefix);
+        }
+        if (frame_status == TREV_H3_FRAME_EXCESSIVE_LOAD) {
+            session->h3_error_code = TREV_H3_APP_EXCESSIVE_LOAD;
+            err = TREV_WT_ERR_REJECTED;
+        } else if (err == 0 && frame_status != TREV_H3_FRAME_OK) {
+            err = TREV_WT_ERR_REJECTED;
+        }
     }
-    if (err == 0) {
-        err = trevrpc_wt_read_varint(control, &frame.len);
-    }
-    if (err == 0 && frame.type != TREV_H3_FRAME_SETTINGS) {
+    if (err == 0 && prefix.type != TREV_H3_FRAME_SETTINGS) {
         session->h3_error_code = TREV_H3_APP_MISSING_SETTINGS;
-        err = TREV_WT_ERR_REJECTED;
-    }
-    if (err == 0 && frame.len > session->frame_policy.max_settings_payload) {
-        session->h3_error_code = TREV_H3_APP_EXCESSIVE_LOAD;
         err = TREV_WT_ERR_REJECTED;
     }
 
     if (err == 0) {
-        err = trevrpc_wt_read_settings_payload(session, control, frame.len, settings);
+        err = trevrpc_wt_read_settings_payload(session, control, prefix.length, settings);
     }
     if (err == 0) {
         trevrpc_wt_profile_negotiation negotiation = {0};
@@ -1294,11 +1331,25 @@ static void* trevrpc_h3_control_monitor(void* context) {
     (void)trevrpc_h3_unknown_discard_budget_init(
         &unknown_discard, conn->session.frame_policy.max_control_unknown_discard);
     for (;;) {
-        uint64_t frame_type = 0;
-        uint64_t frame_len = 0;
-        int err = trevrpc_wt_read_varint(conn->session.peer_control, &frame_type);
-        if (err == 0) {
-            err = trevrpc_wt_read_varint(conn->session.peer_control, &frame_len);
+        trevrpc_h3_frame_prefix_parser parser;
+        trevrpc_h3_frame_prefix prefix = {0};
+        trevrpc_h3_frame_status frame_status = trevrpc_h3_frame_prefix_parser_init(&parser, UINT64_MAX);
+        int err = 0;
+        while (frame_status == TREV_H3_FRAME_NEED_INPUT) {
+            uint8_t encoded_byte = 0;
+            intptr_t n = trevrpc_msquic_stream_read_protocol(conn->session.peer_control, &encoded_byte, 1);
+            if (n < 0) {
+                err = trevrpc_wt_map_msquic_error((int)n);
+                break;
+            }
+            if (n == 0) {
+                frame_status = trevrpc_h3_frame_prefix_parser_finish(&parser);
+                err = frame_status == TREV_H3_FRAME_CLEAN_EOF ? TREV_WT_ERR_CLOSED : TREV_WT_ERR_REJECTED;
+                break;
+            }
+
+            size_t consumed = 0;
+            frame_status = trevrpc_h3_frame_prefix_parser_feed(&parser, &encoded_byte, 1, &consumed, &prefix);
         }
         pthread_mutex_lock(&conn->mutex);
         bool shutting_down = conn->shutting_down;
@@ -1309,34 +1360,37 @@ static void* trevrpc_h3_control_monitor(void* context) {
             }
             return NULL;
         }
-        if (trevrpc_h3_frame_type_is_http2_reserved(frame_type) || frame_type == TREV_H3_FRAME_SETTINGS ||
-            frame_type == TREV_H3_FRAME_DATA || frame_type == TREV_H3_FRAME_HEADERS ||
-            frame_type == TREV_H3_FRAME_PUSH_PROMISE) {
+        if (frame_status == TREV_H3_FRAME_EXCESSIVE_LOAD) {
+            trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_EXCESSIVE_LOAD);
+            return NULL;
+        }
+        if (frame_status != TREV_H3_FRAME_OK) {
+            if (!shutting_down) {
+                trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_CLOSED_CRITICAL_STREAM);
+            }
+            return NULL;
+        }
+        if (trevrpc_h3_frame_type_is_http2_reserved(prefix.type) || prefix.type == TREV_H3_FRAME_SETTINGS ||
+            prefix.type == TREV_H3_FRAME_DATA || prefix.type == TREV_H3_FRAME_HEADERS ||
+            prefix.type == TREV_H3_FRAME_PUSH_PROMISE) {
             trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_FRAME_UNEXPECTED);
             return NULL;
         }
-        if (frame_type == TREV_H3_FRAME_CANCEL_PUSH || frame_type == TREV_H3_FRAME_GOAWAY ||
-            frame_type == TREV_H3_FRAME_MAX_PUSH_ID) {
-            uint8_t payload[8];
-            if (frame_len == 0 || frame_len > sizeof(payload) ||
-                trevrpc_wt_read_exact(conn->session.peer_control, payload, (size_t)frame_len) != 0) {
-                trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_FRAME_ERROR);
-                return NULL;
-            }
-            size_t offset = 0;
+        if (prefix.type == TREV_H3_FRAME_CANCEL_PUSH || prefix.type == TREV_H3_FRAME_GOAWAY ||
+            prefix.type == TREV_H3_FRAME_MAX_PUSH_ID) {
             uint64_t id = 0;
-            if (trevrpc_quic_varint_read(payload, (size_t)frame_len, &offset, &id) != 0 ||
-                offset != (size_t)frame_len) {
+            if (trevrpc_wt_read_bounded_varint_payload(conn->session.peer_control, prefix.length, &id) != 0) {
                 trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_FRAME_ERROR);
                 return NULL;
             }
             continue;
         }
-        if (trevrpc_h3_unknown_discard_budget_charge(&unknown_discard, frame_len) != TREV_H3_FRAME_OK) {
+        if (trevrpc_h3_unknown_discard_budget_charge(&unknown_discard, prefix.length) != TREV_H3_FRAME_OK) {
             trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_EXCESSIVE_LOAD);
             return NULL;
         }
         uint8_t ignored[1024];
+        uint64_t frame_len = prefix.length;
         while (frame_len > 0) {
             size_t chunk = frame_len < sizeof(ignored) ? (size_t)frame_len : sizeof(ignored);
             err = trevrpc_wt_read_exact(conn->session.peer_control, ignored, chunk);
@@ -1349,92 +1403,383 @@ static void* trevrpc_h3_control_monitor(void* context) {
     }
 }
 
-static void* trevrpc_h3_unidi_monitor(void* context) {
-    trevrpc_h3_unidi_monitor_context* monitor = context;
+static void trevrpc_h3_unidi_observer_wake(void* context, uint32_t flags) {
+    trevrpc_h3_unidi_observer_context* observer_context = context;
+    trevrpc_h3_unidi_monitor* monitor = observer_context->monitor;
     trevrpc_h3_conn* conn = monitor->conn;
-    trevrpc_msquic_stream* stream = conn->session.peer_unidi_streams[monitor->index];
-    free(monitor);
-    uint64_t stream_type = 0;
-    int err = trevrpc_wt_read_varint(stream, &stream_type);
-    if (err != 0) {
-        trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_CLOSED_CRITICAL_STREAM);
-        return NULL;
+    pthread_mutex_lock(&conn->mutex);
+    if (monitor->state == TREV_H3_UNIDI_MONITOR_LIVE && monitor->generation == observer_context->generation) {
+        monitor->pending_flags |= flags;
+        pthread_cond_signal(&conn->unidi_cond);
     }
-    if (stream_type == TREV_WT_H3_STREAM_TYPE_CONTROL) {
-        trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_STREAM_CREATION_ERROR);
-        return NULL;
+    pthread_mutex_unlock(&conn->mutex);
+}
+
+static void trevrpc_h3_unidi_monitor_close(trevrpc_h3_conn* conn, size_t index, uint64_t generation) {
+    trevrpc_msquic_stream* stream = NULL;
+    bool observer_installed = false;
+    pthread_mutex_lock(&conn->mutex);
+    trevrpc_h3_unidi_monitor* monitor = &conn->unidi_monitors[index];
+    if (monitor->generation == generation && monitor->state != TREV_H3_UNIDI_MONITOR_FREE) {
+        monitor->state = TREV_H3_UNIDI_MONITOR_CLOSING;
+        monitor->processing = false;
+        stream = monitor->stream;
+        observer_installed = monitor->observer_installed;
     }
-    bool critical = stream_type == 0x02 || stream_type == 0x03;
+    pthread_mutex_unlock(&conn->mutex);
+    if (stream == NULL) {
+        return;
+    }
+    if (observer_installed) {
+        trevrpc_msquic_stream_clear_observer(stream);
+        trevrpc_msquic_stream_drain_observer(stream);
+    }
+    trevrpc_msquic_stream_close(stream);
+    pthread_mutex_lock(&conn->mutex);
+    monitor = &conn->unidi_monitors[index];
+    if (monitor->generation == generation && monitor->state == TREV_H3_UNIDI_MONITOR_CLOSING) {
+        monitor->stream = NULL;
+        monitor->pending_flags = 0;
+        monitor->observer_installed = false;
+        monitor->install_pending = false;
+        monitor->terminal_seen = false;
+        monitor->state = TREV_H3_UNIDI_MONITOR_FREE;
+#ifdef TREVRPC_H3_FRAME_POLICY_TESTING
+        conn->unidi_retired_count++;
+#endif
+        pthread_cond_broadcast(&conn->unidi_cond);
+    }
+    pthread_mutex_unlock(&conn->mutex);
+}
+
+#ifdef TREVRPC_H3_FRAME_POLICY_TESTING
+int trevrpc_h3_test_wait_unidi_progress(
+    trevrpc_h3_conn* conn, size_t minimum_started_count, size_t minimum_retired_count, uint64_t timeout_nanos) {
+    if (conn == NULL || (minimum_started_count == 0 && minimum_retired_count == 0) || timeout_nanos == 0) {
+        return -EINVAL;
+    }
+    struct timespec deadline = {0};
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        return -errno;
+    }
+    deadline.tv_sec += (time_t)(timeout_nanos / 1000000000ull);
+    deadline.tv_nsec += (long)(timeout_nanos % 1000000000ull);
+    if (deadline.tv_nsec >= 1000000000l) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000l;
+    }
+
+    int result = 0;
+    pthread_mutex_lock(&conn->mutex);
+    while (conn->unidi_started_count < minimum_started_count || conn->unidi_retired_count < minimum_retired_count) {
+        int err = pthread_cond_timedwait(&conn->unidi_cond, &conn->mutex, &deadline);
+        if (err != 0) {
+            result = -err;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&conn->mutex);
+    return result;
+}
+#endif
+
+static size_t trevrpc_h3_unidi_read_size(const trevrpc_h3_demux_stream* classifier) {
+    if (classifier->phase == TREV_H3_DEMUX_SKIP_UNKNOWN_PAYLOAD) {
+        return classifier->unknown_payload_remaining < 1024 ? (size_t)classifier->unknown_payload_remaining : 1024;
+    }
+    if (classifier->varint.have == 0 || classifier->varint.need <= classifier->varint.have) {
+        return 1;
+    }
+    return classifier->varint.need - classifier->varint.have;
+}
+
+typedef enum trevrpc_h3_unidi_process_result {
+    TREV_H3_UNIDI_PROCESS_PENDING = 0,
+    TREV_H3_UNIDI_PROCESS_DONE,
+    TREV_H3_UNIDI_PROCESS_FAILED,
+} trevrpc_h3_unidi_process_result;
+
+static trevrpc_h3_unidi_process_result trevrpc_h3_process_unidi_monitor(
+    trevrpc_h3_conn* conn, trevrpc_h3_unidi_monitor* monitor, uint32_t flags, uint64_t* out_error) {
+    trevrpc_h3_demux_result result = {0};
+    trevrpc_h3_demux_profile_capabilities profile = {
+        .resolved = true,
+        .selected_profile = conn->session.draft,
+    };
+    monitor->terminal_seen = monitor->terminal_seen || (flags & TREV_MSQUIC_STREAM_OBSERVER_TERMINAL) != 0;
+    bool terminal = monitor->terminal_seen;
+    trevrpc_h3_demux_status status = trevrpc_h3_demux_stream_feed(&monitor->classifier, &profile, NULL, 0, &result);
+    uint8_t buffer[1024];
+    while (status == TREV_H3_DEMUX_NEED_MORE || status == TREV_H3_DEMUX_WAIT_PROFILE) {
+        uint64_t now = trevrpc_h3_monotonic_nanos();
+        if (now == 0) {
+            *out_error = TREV_H3_APP_INTERNAL_ERROR;
+            return TREV_H3_UNIDI_PROCESS_FAILED;
+        }
+        if (now >= monitor->deadline_nanos) {
+            *out_error = monitor->classifier.phase == TREV_H3_DEMUX_READ_SESSION_ID ? TREV_H3_APP_ID_ERROR
+                                                                                    : TREV_H3_APP_STREAM_CREATION_ERROR;
+            return TREV_H3_UNIDI_PROCESS_FAILED;
+        }
+        size_t read_size = trevrpc_h3_unidi_read_size(&monitor->classifier);
+        intptr_t n = trevrpc_msquic_stream_read_protocol_ready(monitor->stream, buffer, read_size);
+        if (n > 0) {
+            status = trevrpc_h3_demux_stream_feed(&monitor->classifier, &profile, buffer, (size_t)n, &result);
+            continue;
+        }
+        if (n == TREV_MSQUIC_ERR_TIMEOUT && !terminal) {
+            return TREV_H3_UNIDI_PROCESS_PENDING;
+        }
+        if (n == TREV_MSQUIC_ERR_CLOSED) {
+            *out_error = TREV_H3_APP_CLOSED_CRITICAL_STREAM;
+            return TREV_H3_UNIDI_PROCESS_FAILED;
+        }
+        if (n == 0 || n == TREV_MSQUIC_ERR_TIMEOUT) {
+            status = trevrpc_h3_demux_stream_terminal(&monitor->classifier, &profile, &result);
+            break;
+        }
+        *out_error = TREV_H3_APP_INTERNAL_ERROR;
+        return TREV_H3_UNIDI_PROCESS_FAILED;
+    }
+    if (status == TREV_H3_DEMUX_PROTOCOL_ERROR) {
+        *out_error = result.application_error;
+        return TREV_H3_UNIDI_PROCESS_FAILED;
+    }
+    if (status != TREV_H3_DEMUX_ACTION_READY) {
+        *out_error = monitor->classifier.phase == TREV_H3_DEMUX_READ_SESSION_ID ? TREV_H3_APP_ID_ERROR
+                                                                                : TREV_H3_APP_STREAM_CREATION_ERROR;
+        return TREV_H3_UNIDI_PROCESS_FAILED;
+    }
+    if (result.action == TREV_H3_DEMUX_ACTION_RECLAIM_UNCLASSIFIED) {
+        return TREV_H3_UNIDI_PROCESS_DONE;
+    }
+    if (result.action == TREV_H3_DEMUX_ACTION_CONTROL) {
+        *out_error = TREV_H3_APP_STREAM_CREATION_ERROR;
+        return TREV_H3_UNIDI_PROCESS_FAILED;
+    }
+    if (result.action == TREV_H3_DEMUX_ACTION_WEBTRANSPORT) {
+        int err = trevrpc_h3_wait_for_webtransport(conn, result.session_id, monitor->deadline_nanos);
+        if (err != 0) {
+            pthread_mutex_lock(&conn->mutex);
+            bool shutting_down = conn->shutting_down;
+            pthread_mutex_unlock(&conn->mutex);
+            if (shutting_down) {
+                return TREV_H3_UNIDI_PROCESS_DONE;
+            }
+            *out_error = err == TREV_MSQUIC_ERR_TIMEOUT || err == TREV_WT_ERR_REJECTED ? TREV_H3_APP_ID_ERROR
+                                                                                       : TREV_H3_APP_INTERNAL_ERROR;
+            return TREV_H3_UNIDI_PROCESS_FAILED;
+        }
+    }
+
+    bool critical =
+        result.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER || result.action == TREV_H3_DEMUX_ACTION_QPACK_DECODER;
     if (critical) {
         pthread_mutex_lock(&conn->mutex);
-        bool* seen = stream_type == 0x02 ? &conn->qpack_encoder_seen : &conn->qpack_decoder_seen;
+        bool* seen =
+            result.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER ? &conn->qpack_encoder_seen : &conn->qpack_decoder_seen;
         bool duplicate = *seen;
         *seen = true;
         pthread_mutex_unlock(&conn->mutex);
         if (duplicate) {
-            trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_STREAM_CREATION_ERROR);
-            return NULL;
+            *out_error = TREV_H3_APP_STREAM_CREATION_ERROR;
+            return TREV_H3_UNIDI_PROCESS_FAILED;
         }
     }
-    uint8_t ignored[1024];
+
     for (;;) {
-        intptr_t n = trevrpc_msquic_stream_read_protocol(stream, ignored, sizeof(ignored));
-        if (n > 0 && stream_type == 0x02) {
-            bool valid = true;
+        intptr_t n = trevrpc_msquic_stream_read_protocol_ready(monitor->stream, buffer, sizeof(buffer));
+        if (n > 0 && result.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER) {
             for (intptr_t i = 0; i < n; i++) {
-                if (ignored[i] != TREV_H3_QPACK_SET_CAPACITY_ZERO) {
-                    valid = false;
-                    break;
+                if (buffer[i] != TREV_H3_QPACK_SET_CAPACITY_ZERO) {
+                    *out_error = TREV_H3_APP_QPACK_ENCODER_STREAM_ERROR;
+                    return TREV_H3_UNIDI_PROCESS_FAILED;
                 }
             }
-            if (valid) {
-                continue;
-            }
+            continue;
         }
         if (n > 0 && critical) {
-            trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn,
-                stream_type == 0x02 ? TREV_H3_APP_QPACK_ENCODER_STREAM_ERROR : TREV_H3_APP_QPACK_DECODER_STREAM_ERROR);
-            return NULL;
+            *out_error = result.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER ? TREV_H3_APP_QPACK_ENCODER_STREAM_ERROR
+                                                                             : TREV_H3_APP_QPACK_DECODER_STREAM_ERROR;
+            return TREV_H3_UNIDI_PROCESS_FAILED;
         }
-        if (n <= 0) {
+        if (n == TREV_MSQUIC_ERR_TIMEOUT) {
+            return TREV_H3_UNIDI_PROCESS_PENDING;
+        }
+        if (n == 0) {
+            if (critical) {
+                *out_error = TREV_H3_APP_CLOSED_CRITICAL_STREAM;
+                return TREV_H3_UNIDI_PROCESS_FAILED;
+            }
+            return TREV_H3_UNIDI_PROCESS_DONE;
+        }
+        if (n == TREV_MSQUIC_ERR_CLOSED) {
             pthread_mutex_lock(&conn->mutex);
             bool shutting_down = conn->shutting_down;
             pthread_mutex_unlock(&conn->mutex);
             if (critical && !shutting_down) {
-                trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_CLOSED_CRITICAL_STREAM);
+                *out_error = TREV_H3_APP_CLOSED_CRITICAL_STREAM;
+                return TREV_H3_UNIDI_PROCESS_FAILED;
             }
+            return TREV_H3_UNIDI_PROCESS_DONE;
+        }
+        *out_error = TREV_H3_APP_INTERNAL_ERROR;
+        return TREV_H3_UNIDI_PROCESS_FAILED;
+    }
+}
+
+static bool trevrpc_h3_take_unidi_monitor(trevrpc_h3_conn* conn, size_t* out_index, uint32_t* out_flags) {
+    uint64_t now = trevrpc_h3_monotonic_nanos();
+    for (size_t i = 0; i < TREV_H3_UNIDI_MONITOR_COUNT; i++) {
+        trevrpc_h3_unidi_monitor* monitor = &conn->unidi_monitors[i];
+        if (monitor->state == TREV_H3_UNIDI_MONITOR_LIVE && !monitor->install_pending && !monitor->processing &&
+            (monitor->pending_flags != 0 || (now != 0 && now >= monitor->deadline_nanos))) {
+            monitor->processing = true;
+            *out_index = i;
+            *out_flags = monitor->pending_flags;
+            monitor->pending_flags = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+static int trevrpc_h3_unidi_wait(trevrpc_h3_conn* conn) {
+    uint64_t now = trevrpc_h3_monotonic_nanos();
+    uint64_t remaining = UINT64_MAX;
+    if (now != 0) {
+        for (size_t i = 0; i < TREV_H3_UNIDI_MONITOR_COUNT; i++) {
+            trevrpc_h3_unidi_monitor* monitor = &conn->unidi_monitors[i];
+            if (monitor->state != TREV_H3_UNIDI_MONITOR_LIVE || monitor->install_pending || monitor->processing) {
+                continue;
+            }
+            uint64_t value = monitor->deadline_nanos <= now ? 0 : monitor->deadline_nanos - now;
+            if (value < remaining) {
+                remaining = value;
+            }
+        }
+    }
+    if (remaining == UINT64_MAX) {
+        return pthread_cond_wait(&conn->unidi_cond, &conn->mutex);
+    }
+    struct timespec realtime;
+    if (clock_gettime(CLOCK_REALTIME, &realtime) != 0) {
+        return errno;
+    }
+    realtime.tv_sec += (time_t)(remaining / 1000000000ull);
+    realtime.tv_nsec += (long)(remaining % 1000000000ull);
+    if (realtime.tv_nsec >= 1000000000l) {
+        realtime.tv_sec++;
+        realtime.tv_nsec -= 1000000000l;
+    }
+    return pthread_cond_timedwait(&conn->unidi_cond, &conn->mutex, &realtime);
+}
+
+static void* trevrpc_h3_unidi_pump(void* context) {
+    trevrpc_h3_conn* conn = context;
+    for (;;) {
+        pthread_mutex_lock(&conn->mutex);
+        size_t index = 0;
+        uint32_t flags = 0;
+        while (!conn->shutting_down && !trevrpc_h3_take_unidi_monitor(conn, &index, &flags)) {
+            (void)trevrpc_h3_unidi_wait(conn);
+        }
+        bool stopping = conn->shutting_down;
+        pthread_mutex_unlock(&conn->mutex);
+        if (stopping) {
             return NULL;
         }
+
+        trevrpc_h3_unidi_monitor* monitor = &conn->unidi_monitors[index];
+        uint64_t error_code = 0;
+        trevrpc_h3_unidi_process_result result = trevrpc_h3_process_unidi_monitor(conn, monitor, flags, &error_code);
+        if (result == TREV_H3_UNIDI_PROCESS_PENDING) {
+            pthread_mutex_lock(&conn->mutex);
+            if (monitor->state == TREV_H3_UNIDI_MONITOR_LIVE) {
+                monitor->processing = false;
+            }
+            pthread_mutex_unlock(&conn->mutex);
+            continue;
+        }
+        if (result == TREV_H3_UNIDI_PROCESS_FAILED) {
+            pthread_mutex_lock(&conn->mutex);
+            bool shutting_down = conn->shutting_down;
+            if (monitor->state == TREV_H3_UNIDI_MONITOR_LIVE) {
+                monitor->processing = false;
+            }
+            pthread_mutex_unlock(&conn->mutex);
+            if (!shutting_down && error_code != 0) {
+                trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, error_code);
+            }
+        }
+        uint64_t generation;
+        pthread_mutex_lock(&conn->mutex);
+        generation = monitor->generation;
+        pthread_mutex_unlock(&conn->mutex);
+        trevrpc_h3_unidi_monitor_close(conn, index, generation);
     }
 }
 
 static int trevrpc_h3_start_unidi_monitor(trevrpc_h3_conn* conn, trevrpc_msquic_stream* stream) {
-    size_t index = 0;
-    while (index < sizeof(conn->session.peer_unidi_streams) / sizeof(conn->session.peer_unidi_streams[0]) &&
-           conn->session.peer_unidi_streams[index] != NULL) {
-        index++;
+    uint64_t now = trevrpc_h3_monotonic_nanos();
+    if (now == 0 || now > UINT64_MAX - TREV_H3_UNRESOLVED_STREAM_TIMEOUT_NANOS) {
+        trevrpc_msquic_stream_close(stream);
+        return -EOVERFLOW;
     }
-    if (index == sizeof(conn->session.peer_unidi_streams) / sizeof(conn->session.peer_unidi_streams[0])) {
+    size_t index = TREV_H3_UNIDI_MONITOR_COUNT;
+    pthread_mutex_lock(&conn->mutex);
+    if (!conn->shutting_down) {
+        for (size_t i = 0; i < TREV_H3_UNIDI_MONITOR_COUNT; i++) {
+            if (conn->unidi_monitors[i].state == TREV_H3_UNIDI_MONITOR_FREE) {
+                index = i;
+                trevrpc_h3_unidi_monitor* monitor = &conn->unidi_monitors[i];
+                uint64_t generation = monitor->generation + 1;
+                if (generation == 0) {
+                    generation = 1;
+                }
+                monitor->conn = conn;
+                monitor->stream = stream;
+                monitor->deadline_nanos = now + TREV_H3_UNRESOLVED_STREAM_TIMEOUT_NANOS;
+                monitor->generation = generation;
+                monitor->observer_context.monitor = monitor;
+                monitor->observer_context.generation = generation;
+                monitor->pending_flags = 0;
+                monitor->state = TREV_H3_UNIDI_MONITOR_LIVE;
+                monitor->observer_installed = false;
+                monitor->install_pending = true;
+                monitor->processing = false;
+                monitor->terminal_seen = false;
+                (void)trevrpc_h3_demux_stream_init(&monitor->classifier, TREV_H3_DEMUX_UNIDIRECTIONAL);
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&conn->mutex);
+    if (index == TREV_H3_UNIDI_MONITOR_COUNT) {
         trevrpc_msquic_stream_close(stream);
         trevrpc_msquic_conn_shutdown_error(conn->session.msquic_conn, TREV_H3_APP_STREAM_CREATION_ERROR);
         return TREV_WT_ERR_REJECTED;
     }
-    trevrpc_h3_unidi_monitor_context* context = malloc(sizeof(*context));
-    if (context == NULL) {
-        trevrpc_msquic_stream_close(stream);
-        return -ENOMEM;
+
+    trevrpc_h3_unidi_monitor* monitor = &conn->unidi_monitors[index];
+    int err = trevrpc_msquic_stream_set_observer(stream, trevrpc_h3_unidi_observer_wake, &monitor->observer_context);
+    pthread_mutex_lock(&conn->mutex);
+    if (monitor->state == TREV_H3_UNIDI_MONITOR_LIVE) {
+        monitor->install_pending = false;
+        if (err == 0) {
+            monitor->observer_installed = true;
+#ifdef TREVRPC_H3_FRAME_POLICY_TESTING
+            conn->unidi_started_count++;
+#endif
+            pthread_cond_broadcast(&conn->unidi_cond);
+        }
     }
-    conn->session.peer_unidi_streams[index] = stream;
-    context->conn = conn;
-    context->index = index;
-    int err = pthread_create(&conn->unidi_threads[index], NULL, trevrpc_h3_unidi_monitor, context);
+    uint64_t generation = monitor->generation;
+    pthread_mutex_unlock(&conn->mutex);
     if (err != 0) {
-        conn->session.peer_unidi_streams[index] = NULL;
-        trevrpc_msquic_stream_close(stream);
-        free(context);
-        return -err;
+        trevrpc_h3_unidi_monitor_close(conn, index, generation);
+        return trevrpc_wt_map_msquic_error(err);
     }
-    conn->unidi_thread_started[index] = true;
     return 0;
 }
 
@@ -1460,6 +1805,7 @@ int trevrpc_h3_accept_from_msquic(trevrpc_msquic_conn* conn,
     h3_conn->session.msquic_conn = conn;
     pthread_mutex_init(&h3_conn->mutex, NULL);
     pthread_cond_init(&h3_conn->cond, NULL);
+    pthread_cond_init(&h3_conn->unidi_cond, NULL);
     h3_conn->webtransport_path = trevrpc_wt_strdup(webtransport_config->path);
     h3_conn->webtransport_origin = trevrpc_wt_strdup(webtransport_config->origin);
     h3_conn->http3_path = trevrpc_wt_strdup(http3_path);
@@ -1492,6 +1838,12 @@ int trevrpc_h3_accept_from_msquic(trevrpc_msquic_conn* conn,
         return -err;
     }
     h3_conn->control_thread_started = true;
+    err = pthread_create(&h3_conn->unidi_pump_thread, NULL, trevrpc_h3_unidi_pump, h3_conn);
+    if (err != 0) {
+        trevrpc_h3_conn_close(h3_conn);
+        return -err;
+    }
+    h3_conn->unidi_pump_thread_started = true;
     *out_conn = h3_conn;
     return 0;
 }
@@ -1679,11 +2031,18 @@ static trevrpc_h3_stream* trevrpc_h3_stream_alloc(trevrpc_h3_conn* conn, trevrpc
     if (stream == NULL) {
         return NULL;
     }
+    if (trevrpc_h3_frame_prefix_parser_init(&stream->frame_prefix, TREV_QUIC_VARINT_MAX) ==
+            TREV_H3_FRAME_INVALID_ARGUMENT ||
+        trevrpc_h3_request_frame_state_init(&stream->frame_state,
+            true,
+            conn->session.frame_policy.max_encoded_field_section,
+            conn->session.frame_policy.max_request_unknown_discard) != TREV_H3_FRAME_OK) {
+        free(stream);
+        return NULL;
+    }
     stream->msquic_stream = msquic_stream;
     stream->conn = conn;
     stream->owns_msquic_stream = true;
-    (void)trevrpc_h3_unknown_discard_budget_init(
-        &stream->unknown_discard, conn->session.frame_policy.max_request_unknown_discard);
     return stream;
 }
 
@@ -1773,31 +2132,76 @@ int trevrpc_h3_stream_resolve(trevrpc_h3_conn* conn,
         return 0;
     }
     uint64_t deadline = now + timeout_nanos;
-    uint64_t first = 0;
-    intptr_t ready = trevrpc_h3_read_varint_incremental(stream, &first, TREV_H3_READ_DEADLINE, deadline);
-    if (ready == TREV_MSQUIC_ERR_TIMEOUT) {
-        (void)trevrpc_h3_reject_request(stream, TREV_H3_REQUEST_TIMEOUT_STATUS);
-        return 0;
-    }
-    if (ready <= 0) {
-        return ready == 0 || ready == TREV_WT_ERR_CLOSED ? trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR)
-                                                         : (int)ready;
+
+    trevrpc_h3_demux_stream classifier;
+    trevrpc_h3_demux_result demux_result = {0};
+    trevrpc_h3_unknown_discard_budget preamble_unknown_discard;
+    trevrpc_h3_demux_profile_capabilities profile = {
+        .resolved = true,
+        .selected_profile = conn->session.draft,
+    };
+    if (trevrpc_h3_demux_stream_init(&classifier, TREV_H3_DEMUX_BIDIRECTIONAL) != 0 ||
+        trevrpc_h3_unknown_discard_budget_init(
+            &preamble_unknown_discard, conn->session.frame_policy.max_request_unknown_discard) != TREV_H3_FRAME_OK) {
+        return -EINVAL;
     }
 
-    if (first == TREV_WT_STREAM_TYPE_BIDI) {
-        uint64_t session_id = 0;
-        ready = trevrpc_h3_read_varint_incremental(stream, &session_id, TREV_H3_READ_DEADLINE, deadline);
-        if (ready == TREV_MSQUIC_ERR_TIMEOUT) {
+    uint8_t request_type[8] = {0};
+    size_t request_type_len = 0;
+    trevrpc_h3_demux_status demux_status = TREV_H3_DEMUX_NEED_MORE;
+    while (demux_status == TREV_H3_DEMUX_NEED_MORE || demux_status == TREV_H3_DEMUX_WAIT_PROFILE) {
+        uint8_t encoded_byte = 0;
+        intptr_t n = trevrpc_h3_read_msquic(stream, &encoded_byte, 1, TREV_H3_READ_DEADLINE, deadline);
+        if (n == TREV_MSQUIC_ERR_TIMEOUT) {
             (void)trevrpc_h3_reject_request(stream, TREV_H3_REQUEST_TIMEOUT_STATUS);
             return 0;
         }
-        if (ready <= 0) {
+        if (n <= 0) {
             return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
         }
-        if (!trevrpc_wt_profile_valid_session_id(session_id)) {
-            return trevrpc_h3_connection_error(stream, TREV_H3_ERR_ID_ERROR);
+        if (classifier.phase == TREV_H3_DEMUX_READ_FIRST && classifier.varint.have == 0) {
+            request_type_len = 0;
         }
-        int err = trevrpc_h3_wait_for_webtransport(conn, session_id, deadline);
+        if (classifier.phase == TREV_H3_DEMUX_READ_FIRST) {
+            if (request_type_len == sizeof(request_type)) {
+                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
+            }
+            request_type[request_type_len++] = encoded_byte;
+        }
+        trevrpc_h3_demux_phase previous_phase = classifier.phase;
+        demux_status = trevrpc_h3_demux_stream_feed(&classifier, &profile, &encoded_byte, 1, &demux_result);
+        if (previous_phase == TREV_H3_DEMUX_READ_UNKNOWN_LENGTH &&
+            (classifier.phase == TREV_H3_DEMUX_SKIP_UNKNOWN_PAYLOAD || classifier.phase == TREV_H3_DEMUX_READ_FIRST)) {
+            trevrpc_h3_frame_status budget_status = trevrpc_h3_unknown_discard_budget_charge(
+                &preamble_unknown_discard, classifier.unknown_payload_remaining);
+            if (budget_status == TREV_H3_FRAME_EXCESSIVE_LOAD) {
+                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_EXCESSIVE_LOAD);
+            }
+            if (budget_status != TREV_H3_FRAME_OK) {
+                return -EINVAL;
+            }
+        }
+    }
+    if (demux_status == TREV_H3_DEMUX_PROTOCOL_ERROR) {
+        int demux_error = TREV_H3_ERR_FRAME_ERROR;
+        switch (demux_result.application_error) {
+        case TREV_H3_DEMUX_APP_ID_ERROR:
+            demux_error = TREV_H3_ERR_ID_ERROR;
+            break;
+        case TREV_H3_DEMUX_APP_FRAME_UNEXPECTED:
+            demux_error = TREV_H3_ERR_FRAME_UNEXPECTED;
+            break;
+        default:
+            break;
+        }
+        return trevrpc_h3_connection_error(stream, demux_error);
+    }
+    if (demux_status != TREV_H3_DEMUX_ACTION_READY) {
+        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
+    }
+
+    if (demux_result.action == TREV_H3_DEMUX_ACTION_WEBTRANSPORT) {
+        int err = trevrpc_h3_wait_for_webtransport(conn, demux_result.session_id, deadline);
         if (err != 0) {
             trevrpc_msquic_stream_close(stream->msquic_stream);
             stream->msquic_stream = NULL;
@@ -1815,23 +2219,42 @@ int trevrpc_h3_stream_resolve(trevrpc_h3_conn* conn,
         return 0;
     }
 
-    uint64_t frame_len = 0;
-    ready = trevrpc_h3_read_varint_incremental(stream, &frame_len, TREV_H3_READ_DEADLINE, deadline);
-    if (ready == TREV_MSQUIC_ERR_TIMEOUT) {
-        (void)trevrpc_h3_reject_request(stream, TREV_H3_REQUEST_TIMEOUT_STATUS);
-        return 0;
+    stream->frame_state.unknown_discard.used = preamble_unknown_discard.used;
+
+    trevrpc_h3_frame_prefix_parser parser;
+    trevrpc_h3_frame_prefix prefix = {0};
+    trevrpc_h3_frame_status frame_status =
+        trevrpc_h3_frame_prefix_parser_init(&parser, conn->session.frame_policy.max_encoded_field_section);
+    if (frame_status == TREV_H3_FRAME_INVALID_ARGUMENT) {
+        return -EINVAL;
     }
-    if (ready <= 0) {
-        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
+    size_t consumed = 0;
+    frame_status = trevrpc_h3_frame_prefix_parser_feed(&parser, request_type, request_type_len, &consumed, &prefix);
+    while (frame_status == TREV_H3_FRAME_NEED_INPUT) {
+        uint8_t encoded_byte = 0;
+        intptr_t n = trevrpc_h3_read_msquic(stream, &encoded_byte, 1, TREV_H3_READ_DEADLINE, deadline);
+        if (n == TREV_MSQUIC_ERR_TIMEOUT) {
+            (void)trevrpc_h3_reject_request(stream, TREV_H3_REQUEST_TIMEOUT_STATUS);
+            return 0;
+        }
+        if (n <= 0) {
+            (void)trevrpc_h3_frame_prefix_parser_finish(&parser);
+            return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
+        }
+        frame_status = trevrpc_h3_frame_prefix_parser_feed(&parser, &encoded_byte, 1, &consumed, &prefix);
     }
-    if (first != TREV_H3_FRAME_HEADERS) {
-        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_UNEXPECTED);
-    }
-    if (frame_len > conn->session.frame_policy.max_encoded_field_section) {
+    if (frame_status == TREV_H3_FRAME_EXCESSIVE_LOAD) {
         return trevrpc_h3_connection_error(stream, TREV_H3_ERR_EXCESSIVE_LOAD);
     }
+    if (frame_status != TREV_H3_FRAME_OK) {
+        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
+    }
+    if (prefix.type != TREV_H3_FRAME_HEADERS) {
+        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_UNEXPECTED);
+    }
+
     trevrpc_wt_headers headers = {0};
-    int err = trevrpc_h3_read_headers_payload_timeout(stream, frame_len, deadline, &headers);
+    int err = trevrpc_h3_read_headers_payload_timeout(stream, prefix.length, deadline, &headers);
     if (err == TREV_MSQUIC_ERR_TIMEOUT) {
         trevrpc_wt_headers_cleanup(&headers);
         (void)trevrpc_h3_reject_request(stream, TREV_H3_REQUEST_TIMEOUT_STATUS);
@@ -1881,6 +2304,7 @@ void trevrpc_h3_conn_shutdown(trevrpc_h3_conn* conn) {
         pthread_mutex_lock(&conn->mutex);
         conn->shutting_down = true;
         pthread_cond_broadcast(&conn->cond);
+        pthread_cond_broadcast(&conn->unidi_cond);
         pthread_mutex_unlock(&conn->mutex);
         trevrpc_msquic_conn_shutdown(conn->session.msquic_conn);
     }
@@ -1894,22 +2318,28 @@ void trevrpc_h3_conn_close(trevrpc_h3_conn* conn) {
     if (conn->control_thread_started && !pthread_equal(pthread_self(), conn->control_thread)) {
         (void)pthread_join(conn->control_thread, NULL);
     }
-    for (size_t i = 0; i < sizeof(conn->unidi_threads) / sizeof(conn->unidi_threads[0]); i++) {
-        if (conn->unidi_thread_started[i] && !pthread_equal(pthread_self(), conn->unidi_threads[i])) {
-            (void)pthread_join(conn->unidi_threads[i], NULL);
+    if (conn->unidi_pump_thread_started && !pthread_equal(pthread_self(), conn->unidi_pump_thread)) {
+        (void)pthread_join(conn->unidi_pump_thread, NULL);
+    }
+    for (size_t i = 0; i < TREV_H3_UNIDI_MONITOR_COUNT; i++) {
+        uint64_t generation = 0;
+        pthread_mutex_lock(&conn->mutex);
+        if (conn->unidi_monitors[i].state != TREV_H3_UNIDI_MONITOR_FREE) {
+            generation = conn->unidi_monitors[i].generation;
+        }
+        pthread_mutex_unlock(&conn->mutex);
+        if (generation != 0) {
+            trevrpc_h3_unidi_monitor_close(conn, i, generation);
         }
     }
     trevrpc_msquic_stream_close(conn->session.connect_stream);
-    for (size_t i = 0; i < sizeof(conn->session.peer_unidi_streams) / sizeof(conn->session.peer_unidi_streams[0]);
-        i++) {
-        trevrpc_msquic_stream_close(conn->session.peer_unidi_streams[i]);
-    }
     trevrpc_msquic_stream_close(conn->session.peer_control);
     trevrpc_msquic_stream_close(conn->session.local_control);
     trevrpc_msquic_conn_close(conn->session.msquic_conn);
     free(conn->http3_path);
     free(conn->webtransport_origin);
     free(conn->webtransport_path);
+    pthread_cond_destroy(&conn->unidi_cond);
     pthread_cond_destroy(&conn->cond);
     pthread_mutex_destroy(&conn->mutex);
     free(conn);
@@ -2261,31 +2691,6 @@ static intptr_t trevrpc_h3_read_msquic(
     return result < 0 ? trevrpc_wt_map_msquic_error((int)result) : result;
 }
 
-static intptr_t trevrpc_h3_read_varint_incremental(
-    trevrpc_h3_stream* stream, uint64_t* value, trevrpc_h3_read_mode mode, uint64_t deadline_nanos) {
-    while (stream->varint_need == 0 || stream->varint_len < stream->varint_need) {
-        intptr_t n = trevrpc_h3_read_msquic(stream, stream->varint + stream->varint_len, 1, mode, deadline_nanos);
-        if (n <= 0) {
-            return n == 0 && stream->varint_len > 0 ? TREV_WT_ERR_CLOSED : n;
-        }
-        stream->varint_len++;
-        if (stream->varint_need == 0) {
-            stream->varint_need = trevrpc_quic_varint_size_from_first(stream->varint[0]);
-        }
-    }
-
-    size_t offset = 0;
-    uint64_t decoded = 0;
-    int err = trevrpc_quic_varint_read(stream->varint, stream->varint_need, &offset, &decoded);
-    stream->varint_len = 0;
-    stream->varint_need = 0;
-    if (err != 0) {
-        return TREV_H3_ERR_FRAME_ERROR;
-    }
-    *value = decoded;
-    return 1;
-}
-
 static int trevrpc_h3_static_qpack_error(trevrpc_qpack_status status) {
     switch (status) {
     case TREV_QPACK_OK:
@@ -2333,102 +2738,127 @@ static int trevrpc_h3_validate_trailers(trevrpc_h3_stream* stream) {
     return err;
 }
 
+static int trevrpc_h3_frame_status_error(trevrpc_h3_stream* stream, trevrpc_h3_frame_status status) {
+    switch (status) {
+    case TREV_H3_FRAME_EXCESSIVE_LOAD:
+    case TREV_H3_FRAME_FIELD_SECTION_TOO_LARGE:
+        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_EXCESSIVE_LOAD);
+    case TREV_H3_FRAME_UNEXPECTED:
+        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_UNEXPECTED);
+    case TREV_H3_FRAME_TRUNCATED_TYPE:
+    case TREV_H3_FRAME_TYPE_WITHOUT_LENGTH:
+    case TREV_H3_FRAME_TRUNCATED_LENGTH:
+    case TREV_H3_FRAME_TRUNCATED_PAYLOAD:
+        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
+    default:
+        return -EINVAL;
+    }
+}
+
+static intptr_t trevrpc_h3_read_frame_prefix(
+    trevrpc_h3_stream* stream, trevrpc_h3_frame_prefix* prefix, trevrpc_h3_read_mode mode, uint64_t deadline_nanos) {
+    for (;;) {
+        uint8_t encoded_byte = 0;
+        intptr_t n = trevrpc_h3_read_msquic(stream, &encoded_byte, 1, mode, deadline_nanos);
+        if (n == 0) {
+            trevrpc_h3_frame_status status = trevrpc_h3_frame_prefix_parser_finish(&stream->frame_prefix);
+            return status == TREV_H3_FRAME_CLEAN_EOF ? 0 : trevrpc_h3_frame_status_error(stream, status);
+        }
+        if (n < 0) {
+            return n;
+        }
+        size_t consumed = 0;
+        trevrpc_h3_frame_status status =
+            trevrpc_h3_frame_prefix_parser_feed(&stream->frame_prefix, &encoded_byte, (size_t)n, &consumed, prefix);
+        if (status == TREV_H3_FRAME_OK) {
+            return 1;
+        }
+        if (status != TREV_H3_FRAME_NEED_INPUT) {
+            return trevrpc_h3_frame_status_error(stream, status);
+        }
+    }
+}
+
 static intptr_t trevrpc_h3_read_data(
     trevrpc_h3_stream* stream, uint8_t* data, size_t len, trevrpc_h3_read_mode mode, uint64_t deadline_nanos) {
     for (;;) {
-        if (stream->data_remaining > 0) {
-            size_t requested = stream->data_remaining < len ? (size_t)stream->data_remaining : len;
-            intptr_t n = trevrpc_h3_read_msquic(stream, data, requested, mode, deadline_nanos);
-            if (n == 0) {
-                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
-            }
-            if (n < 0) {
-                return n;
-            }
-            stream->data_remaining -= (uint64_t)n;
-            return n;
-        }
-        if (stream->trailer_block != NULL) {
-            size_t remaining = stream->trailer_len - stream->trailer_offset;
-            intptr_t n = trevrpc_h3_read_msquic(
-                stream, stream->trailer_block + stream->trailer_offset, remaining, mode, deadline_nanos);
-            if (n == 0) {
-                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
-            }
-            if (n < 0) {
-                return n;
-            }
-            stream->trailer_offset += (size_t)n;
-            if (stream->trailer_offset == stream->trailer_len) {
-                int err = trevrpc_h3_validate_trailers(stream);
-                if (err != 0) {
-                    return err == -ENOMEM ? err : trevrpc_h3_connection_error(stream, err);
+        trevrpc_h3_request_payload_kind payload_kind = stream->frame_state.active_payload;
+        if (stream->frame_state.payload_remaining > 0) {
+            uint8_t ignored[1024];
+            uint8_t* target = data;
+            size_t requested =
+                stream->frame_state.payload_remaining < len ? (size_t)stream->frame_state.payload_remaining : len;
+            if (payload_kind == TREV_H3_REQUEST_PAYLOAD_TRAILERS) {
+                if (stream->trailer_block == NULL) {
+                    if (stream->trailer_len == 0) {
+                        return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
+                    }
+                    stream->trailer_block = malloc(stream->trailer_len);
+                    if (stream->trailer_block == NULL) {
+                        return -ENOMEM;
+                    }
+                }
+                target = stream->trailer_block + stream->trailer_offset;
+            } else if (payload_kind == TREV_H3_REQUEST_PAYLOAD_UNKNOWN) {
+                target = ignored;
+                if (requested > sizeof(ignored)) {
+                    requested = sizeof(ignored);
                 }
             }
-            continue;
-        }
-        if (stream->skip_remaining > 0) {
-            uint8_t ignored[1024];
-            size_t requested =
-                stream->skip_remaining < sizeof(ignored) ? (size_t)stream->skip_remaining : sizeof(ignored);
-            intptr_t n = trevrpc_h3_read_msquic(stream, ignored, requested, mode, deadline_nanos);
+            intptr_t n = trevrpc_h3_read_msquic(stream, target, requested, mode, deadline_nanos);
             if (n == 0) {
                 return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
             }
             if (n < 0) {
                 return n;
             }
-            stream->skip_remaining -= (uint64_t)n;
+            trevrpc_h3_frame_status frame_status = trevrpc_h3_request_frame_consume(&stream->frame_state, (uint64_t)n);
+            if (frame_status != TREV_H3_FRAME_OK) {
+                return trevrpc_h3_frame_status_error(stream, frame_status);
+            }
+            if (payload_kind == TREV_H3_REQUEST_PAYLOAD_DATA) {
+                return n;
+            }
+            if (payload_kind == TREV_H3_REQUEST_PAYLOAD_TRAILERS) {
+                stream->trailer_offset += (size_t)n;
+                if (stream->trailer_offset == stream->trailer_len) {
+                    int err = trevrpc_h3_validate_trailers(stream);
+                    if (err != 0) {
+                        return err == -ENOMEM ? err : trevrpc_h3_connection_error(stream, err);
+                    }
+                }
+            }
             continue;
         }
 
-        if (!stream->have_frame_type) {
-            intptr_t ready = trevrpc_h3_read_varint_incremental(stream, &stream->frame_type, mode, deadline_nanos);
-            if (ready <= 0) {
-                if (ready == 0 && stream->varint_len == 0) {
-                    return 0;
-                }
-                if (ready == TREV_WT_ERR_CLOSED) {
-                    return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
-                }
-                return ready;
-            }
-            stream->have_frame_type = true;
+        trevrpc_h3_frame_prefix prefix = {0};
+        intptr_t ready = trevrpc_h3_read_frame_prefix(stream, &prefix, mode, deadline_nanos);
+        if (ready == 0) {
+            trevrpc_h3_frame_status frame_status = trevrpc_h3_request_frame_finish(&stream->frame_state);
+            return frame_status == TREV_H3_FRAME_OK ? 0 : trevrpc_h3_frame_status_error(stream, frame_status);
         }
-        uint64_t frame_len = 0;
-        intptr_t ready = trevrpc_h3_read_varint_incremental(stream, &frame_len, mode, deadline_nanos);
-        if (ready <= 0) {
-            if (ready == 0 || ready == TREV_WT_ERR_CLOSED) {
-                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_ERROR);
-            }
+        if (ready < 0) {
             return ready;
         }
-        stream->have_frame_type = false;
-        if (trevrpc_h3_frame_type_is_http2_reserved(stream->frame_type)) {
-            return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_UNEXPECTED);
-        }
 
-        switch (stream->frame_type) {
-        case TREV_H3_FRAME_DATA:
-            if (stream->trailers_seen) {
-                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_UNEXPECTED);
-            }
-            if (frame_len > stream->conn->session.frame_policy.max_data_payload) {
-                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_EXCESSIVE_LOAD);
-            }
-            stream->data_remaining = frame_len;
-            break;
-        case TREV_H3_FRAME_HEADERS:
-            if (stream->trailers_seen) {
-                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_UNEXPECTED);
-            }
-            if (frame_len > stream->conn->session.frame_policy.max_encoded_field_section) {
-                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_EXCESSIVE_LOAD);
-            }
-            stream->trailers_seen = true;
-            stream->trailer_len = (size_t)frame_len;
-            stream->trailer_block = malloc(stream->trailer_len == 0 ? 1 : stream->trailer_len);
-            if (stream->trailer_block == NULL) {
+        trevrpc_h3_request_payload_kind next_payload_kind = TREV_H3_REQUEST_PAYLOAD_NONE;
+        trevrpc_h3_frame_status frame_status =
+            trevrpc_h3_request_frame_begin(&stream->frame_state, &prefix, &next_payload_kind);
+        if (frame_status != TREV_H3_FRAME_OK) {
+            return trevrpc_h3_frame_status_error(stream, frame_status);
+        }
+        if (next_payload_kind == TREV_H3_REQUEST_PAYLOAD_DATA &&
+            prefix.length > stream->conn->session.frame_policy.max_data_payload) {
+            return trevrpc_h3_connection_error(stream, TREV_H3_ERR_EXCESSIVE_LOAD);
+        }
+        if (trevrpc_h3_frame_prefix_parser_reset(&stream->frame_prefix) == TREV_H3_FRAME_INVALID_ARGUMENT) {
+            return -EINVAL;
+        }
+        if (next_payload_kind == TREV_H3_REQUEST_PAYLOAD_TRAILERS) {
+            stream->trailer_len = (size_t)prefix.length;
+            stream->trailer_offset = 0;
+            stream->trailer_block = stream->trailer_len == 0 ? NULL : malloc(stream->trailer_len);
+            if (stream->trailer_len != 0 && stream->trailer_block == NULL) {
                 return -ENOMEM;
             }
             if (stream->trailer_len == 0) {
@@ -2437,19 +2867,6 @@ static intptr_t trevrpc_h3_read_data(
                     return err == -ENOMEM ? err : trevrpc_h3_connection_error(stream, err);
                 }
             }
-            break;
-        case TREV_H3_FRAME_SETTINGS:
-        case TREV_H3_FRAME_CANCEL_PUSH:
-        case TREV_H3_FRAME_PUSH_PROMISE:
-        case TREV_H3_FRAME_GOAWAY:
-        case TREV_H3_FRAME_MAX_PUSH_ID:
-            return trevrpc_h3_connection_error(stream, TREV_H3_ERR_FRAME_UNEXPECTED);
-        default:
-            if (trevrpc_h3_unknown_discard_budget_charge(&stream->unknown_discard, frame_len) != TREV_H3_FRAME_OK) {
-                return trevrpc_h3_connection_error(stream, TREV_H3_ERR_EXCESSIVE_LOAD);
-            }
-            stream->skip_remaining = frame_len;
-            break;
         }
     }
 }

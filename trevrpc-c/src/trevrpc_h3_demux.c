@@ -1,34 +1,9 @@
 #include "trevrpc_h3_demux_internal.h"
 
-#include "trevrpc_quic_varint_internal.h"
 #include "trevrpc_webtransport_profile_internal.h"
 
+// NOLINTNEXTLINE(misc-include-cleaner)
 #include <errno.h>
-#include <string.h>
-
-static int trevrpc_h3_demux_varint_consume(
-    trevrpc_h3_demux_stream* stream, const uint8_t* data, size_t len, size_t* consumed, uint64_t* out_value) {
-    size_t offset = 0;
-    while (offset < len) {
-        stream->varint[stream->varint_len++] = data[offset++];
-        if (stream->varint_len == 1) {
-            stream->varint_need = trevrpc_quic_varint_size_from_first(stream->varint[0]);
-        }
-        if (stream->varint_len == stream->varint_need) {
-            size_t encoded_offset = 0;
-            int err = trevrpc_quic_varint_read(stream->varint, stream->varint_len, &encoded_offset, out_value);
-            if (err != 0 || encoded_offset != stream->varint_len) {
-                return -EPROTO;
-            }
-            stream->varint_len = 0;
-            stream->varint_need = 0;
-            *consumed = offset;
-            return 1;
-        }
-    }
-    *consumed = offset;
-    return 0;
-}
 
 static trevrpc_h3_demux_action trevrpc_h3_demux_unidirectional_action(uint64_t stream_type) {
     switch (stream_type) {
@@ -144,7 +119,7 @@ trevrpc_h3_demux_status trevrpc_h3_demux_stream_feed(trevrpc_h3_demux_stream* st
         uint64_t value = 0;
         size_t consumed = 0;
         int decoded =
-            trevrpc_h3_demux_varint_consume(&next, data + total_consumed, len - total_consumed, &consumed, &value);
+            trevrpc_quic_varint_feed(&next.varint, data + total_consumed, len - total_consumed, &consumed, &value);
         total_consumed += consumed;
         if (decoded < 0) {
             next.phase = TREV_H3_DEMUX_FAILED;
@@ -158,6 +133,8 @@ trevrpc_h3_demux_status trevrpc_h3_demux_stream_feed(trevrpc_h3_demux_stream* st
         }
 
         if (next.phase == TREV_H3_DEMUX_READ_FIRST) {
+            bool initial_value = !next.first_value_seen;
+            next.first_value_seen = true;
             next.first_value = value;
             if (next.direction == TREV_H3_DEMUX_UNIDIRECTIONAL) {
                 if (value == TREV_H3_DEMUX_WEBTRANSPORT_UNI) {
@@ -169,7 +146,7 @@ trevrpc_h3_demux_status trevrpc_h3_demux_stream_feed(trevrpc_h3_demux_stream* st
             } else if (value == TREV_H3_FRAME_HEADERS) {
                 next.action = TREV_H3_DEMUX_ACTION_REQUEST;
                 next.phase = TREV_H3_DEMUX_READY;
-            } else if (value == TREV_H3_DEMUX_WEBTRANSPORT_BIDI) {
+            } else if (initial_value && value == TREV_H3_DEMUX_WEBTRANSPORT_BIDI) {
                 next.phase = TREV_H3_DEMUX_WAIT_NEGOTIATED_PROFILE;
             } else if (value == TREV_H3_FRAME_DATA || trevrpc_h3_frame_type_is_request_prohibited(value)) {
                 next.phase = TREV_H3_DEMUX_FAILED;

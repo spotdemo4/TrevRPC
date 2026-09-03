@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -43,6 +44,20 @@ typedef struct observations {
     uint32_t seen;
     uint32_t client_send_completions;
 } observations;
+
+typedef struct admission_observations {
+    trevrpc_engine_handle_v1 extra_connection;
+    trevrpc_engine_handle_v1 local_streams[2];
+    trevrpc_engine_handle_v1 peer_streams[2];
+    trevrpc_engine_handle_v1 terminal_subjects[8];
+    uint32_t ready_connections;
+    uint32_t failed_connections;
+    uint32_t terminal_count;
+    uint64_t local_operation_ids[2];
+    uint32_t peer_stream_count;
+    uint32_t local_stream_count;
+    uint32_t saw_connection_rejection;
+} admission_observations;
 
 static uint64_t monotonic_millis(void) {
     struct timespec now;
@@ -113,6 +128,9 @@ static void pump_until(
             trevrpc_engine_event_release(event);
         }
     }
+    if ((observed->seen & wanted) != wanted) {
+        fprintf(stderr, "pump timeout (seen=0x%08x wanted=0x%08x)\n", observed->seen, wanted);
+    }
     assert((observed->seen & wanted) == wanted);
 }
 
@@ -141,7 +159,226 @@ static void wait_for_pending_sends(trevrpc_engine* adapter) {
     }
 }
 
+#define ADMISSION_READY_CONNECTIONS 0x01u
+#define ADMISSION_FAILED_CONNECTION 0x02u
+#define ADMISSION_LOCAL_STREAMS 0x04u
+#define ADMISSION_PEER_STREAM 0x08u
+
+static void check_admission_diagnostics(trevrpc_engine* adapter, uint64_t* max_connections, uint64_t* max_streams) {
+    trevrpc_engine_diagnostics_v1 diagnostics;
+    assert(trevrpc_engine_diagnostics_v1_init(&diagnostics, sizeof(diagnostics)) == 0);
+    assert(trevrpc_engine_get_diagnostics_v1(adapter, &diagnostics) == 0);
+    assert(diagnostics.live_connections <= 3);
+    assert(diagnostics.live_streams <= 3);
+    assert(diagnostics.terminal_status == 0);
+    assert(diagnostics.provider_error_code == 0);
+    if (diagnostics.live_connections > *max_connections) {
+        *max_connections = diagnostics.live_connections;
+    }
+    if (diagnostics.live_streams > *max_streams) {
+        *max_streams = diagnostics.live_streams;
+    }
+}
+
+static void admission_record_terminal(admission_observations* observed, trevrpc_engine_handle_v1 subject) {
+    for (uint32_t index = 0; index < observed->terminal_count; index++) {
+        trevrpc_engine_handle_v1 prior = observed->terminal_subjects[index];
+        assert(prior.owner != subject.owner || prior.slot != subject.slot || prior.generation != subject.generation);
+    }
+    assert(observed->terminal_count < sizeof(observed->terminal_subjects) / sizeof(observed->terminal_subjects[0]));
+    observed->terminal_subjects[observed->terminal_count++] = subject;
+}
+
+static void admission_pump(trevrpc_engine* adapter,
+    const trevrpc_engine_wake_source_v1* wake,
+    admission_observations* observed,
+    uint32_t wanted,
+    uint64_t* max_connections,
+    uint64_t* max_streams) {
+    uint64_t deadline = monotonic_millis() + 10000;
+    while (monotonic_millis() < deadline) {
+        check_admission_diagnostics(adapter, max_connections, max_streams);
+        if ((observed->ready_connections >= 2 || (wanted & ADMISSION_READY_CONNECTIONS) == 0) &&
+            (observed->failed_connections >= 1 || (wanted & ADMISSION_FAILED_CONNECTION) == 0) &&
+            (observed->local_stream_count >= 2 || (wanted & ADMISSION_LOCAL_STREAMS) == 0) &&
+            (observed->peer_stream_count >= 1 || (wanted & ADMISSION_PEER_STREAM) == 0)) {
+            return;
+        }
+        struct pollfd descriptor = {.fd = (int)wake->native_handle, .events = POLLIN};
+        assert(poll(&descriptor, 1, 1000) >= 0);
+        for (;;) {
+            trevrpc_engine_event* event = NULL;
+            int result = trevrpc_engine_next_event(adapter, &event);
+            if (result == -EAGAIN || result == -EPIPE) {
+                break;
+            }
+            assert(result == 0);
+            trevrpc_engine_event_info_v1 info;
+            assert(trevrpc_engine_event_info_v1_init(&info, sizeof(info)) == 0);
+            assert(trevrpc_engine_event_get_info_v1(event, &info) == 0);
+            bool terminal = info.kind == TREVRPC_ENGINE_EVENT_CONNECTION_FAILED ||
+                            info.kind == TREVRPC_ENGINE_EVENT_CONNECTION_CLOSED ||
+                            info.kind == TREVRPC_ENGINE_EVENT_STREAM_FAILED ||
+                            info.kind == TREVRPC_ENGINE_EVENT_STREAM_CLOSED;
+            assert(info.status == 0 || (info.flags & TREVRPC_ENGINE_EVENT_FLAG_TERMINAL) != 0 ||
+                   info.kind == TREVRPC_ENGINE_EVENT_SEND_COMPLETE);
+            if (terminal) {
+                admission_record_terminal(observed, info.subject);
+                if (info.kind == TREVRPC_ENGINE_EVENT_CONNECTION_FAILED) {
+                    observed->failed_connections++;
+                }
+                if (info.subject.owner == observed->extra_connection.owner &&
+                    info.subject.slot == observed->extra_connection.slot &&
+                    info.subject.generation == observed->extra_connection.generation &&
+                    info.kind == TREVRPC_ENGINE_EVENT_CONNECTION_FAILED) {
+                    observed->saw_connection_rejection = 1;
+                }
+            } else if (info.kind == TREVRPC_ENGINE_EVENT_CONNECTION_READY) {
+                observed->ready_connections++;
+            } else if (info.kind == TREVRPC_ENGINE_EVENT_STREAM_READY) {
+                if ((info.flags & TREVRPC_ENGINE_EVENT_FLAG_PEER) != 0) {
+                    assert(observed->peer_stream_count < 2);
+                    observed->peer_streams[observed->peer_stream_count++] = info.subject;
+                } else if ((info.flags & TREVRPC_ENGINE_EVENT_FLAG_LOCAL) != 0) {
+                    assert(observed->local_stream_count < 2);
+                    observed->local_operation_ids[observed->local_stream_count] = info.operation_id;
+                    observed->local_streams[observed->local_stream_count++] = info.subject;
+                }
+            }
+            trevrpc_engine_event_release(event);
+        }
+    }
+    assert(false);
+}
+
+static void test_real_bounded_admission(void) {
+    trevrpc_engine_config_v1 engine_config;
+    trevrpc_engine_msquic_config_v1 provider_config;
+    trevrpc_engine* adapter = NULL;
+    trevrpc_engine_handle_v1 listener = {0};
+    trevrpc_engine_wake_source_v1 wake;
+    trevrpc_engine_endpoint_config_v1 endpoint;
+    admission_observations observed = {0};
+    uint64_t max_connections = 0;
+    uint64_t max_streams = 0;
+    uint16_t port = 0;
+
+    assert(trevrpc_engine_config_v1_init(&engine_config, sizeof(engine_config)) == 0);
+    engine_config.event_capacity = 2;
+    engine_config.listener_capacity = 1;
+    engine_config.connection_capacity = 3;
+    engine_config.stream_capacity = 3;
+    engine_config.max_receive_owned_count = 1;
+    assert(trevrpc_engine_msquic_config_v1_init(&provider_config, sizeof(provider_config)) == 0);
+    assert(trevrpc_engine_msquic_create_v1(&engine_config, &provider_config, &adapter) == 0);
+    assert(trevrpc_engine_wake_source_v1_init(&wake, sizeof(wake)) == 0);
+    assert(trevrpc_engine_get_wake_source_v1(adapter, &wake) == 0);
+
+    assert(trevrpc_engine_endpoint_config_v1_init(&endpoint, sizeof(endpoint)) == 0);
+    endpoint.host = "127.0.0.1";
+    endpoint.host_len = 9;
+    endpoint.alpn = (const uint8_t*)"trevrpc/1";
+    endpoint.alpn_len = 9;
+    endpoint.cert_file = TREVRPC_MSQUIC_TEST_CERT;
+    endpoint.cert_file_len = (uint32_t)strlen(endpoint.cert_file);
+    endpoint.key_file = TREVRPC_MSQUIC_TEST_KEY;
+    endpoint.key_file_len = (uint32_t)strlen(endpoint.key_file);
+    assert(trevrpc_engine_listen_v1(adapter, &endpoint, &listener) == 0);
+    assert(trevrpc_engine_listener_get_port_v1(adapter, listener, &port) == 0);
+    assert(port != 0);
+
+    assert(trevrpc_engine_endpoint_config_v1_init(&endpoint, sizeof(endpoint)) == 0);
+    endpoint.host = "127.0.0.1";
+    endpoint.host_len = 9;
+    endpoint.alpn = (const uint8_t*)"trevrpc/1";
+    endpoint.alpn_len = 9;
+    endpoint.port = port;
+    endpoint.flags = TREVRPC_ENGINE_ENDPOINT_SKIP_CERTIFICATE_VALIDATION;
+    trevrpc_engine_handle_v1 first_connection = {0};
+    assert(trevrpc_engine_dial_v1(adapter, &endpoint, 1, &first_connection) == 0);
+    admission_pump(adapter, &wake, &observed, ADMISSION_READY_CONNECTIONS, &max_connections, &max_streams);
+    assert(observed.ready_connections == 2);
+    assert(max_connections <= engine_config.connection_capacity);
+
+    assert(trevrpc_engine_dial_v1(adapter, &endpoint, 2, &observed.extra_connection) == 0);
+    admission_pump(adapter, &wake, &observed, ADMISSION_FAILED_CONNECTION, &max_connections, &max_streams);
+    assert(observed.saw_connection_rejection != 0);
+
+    assert(
+        trevrpc_engine_connection_open_bidi_stream_v1(adapter, first_connection, 10, &observed.local_streams[0]) == 0);
+    assert(
+        trevrpc_engine_connection_open_bidi_stream_v1(adapter, first_connection, 11, &observed.local_streams[1]) == 0);
+    admission_pump(
+        adapter, &wake, &observed, ADMISSION_LOCAL_STREAMS | ADMISSION_PEER_STREAM, &max_connections, &max_streams);
+    assert(observed.local_stream_count == 2);
+    assert(observed.local_operation_ids[0] == 10);
+    assert(observed.local_operation_ids[1] == 11);
+    assert(observed.peer_stream_count == 1);
+    trevrpc_engine_handle_v1 additional_stream = {0};
+    int additional_result =
+        trevrpc_engine_connection_open_bidi_stream_v1(adapter, first_connection, 12, &additional_stream);
+    assert(additional_result == 0 || additional_result == -ENOSPC);
+    if (additional_result == 0) {
+        int abort_result = trevrpc_engine_stream_abort(adapter, additional_stream, 0);
+        assert(abort_result == 0 || abort_result == -EPIPE || abort_result == -ESTALE);
+    }
+
+    assert(trevrpc_engine_stream_abort(adapter, observed.local_streams[0], 0) == 0);
+    assert(trevrpc_engine_stream_abort(adapter, observed.local_streams[1], 0) == 0);
+    assert(trevrpc_engine_stream_abort(adapter, observed.peer_streams[0], 0) == 0);
+    trevrpc_engine_handle_v1 pending_connection = {0};
+    assert(trevrpc_engine_dial_v1(adapter, &endpoint, 4, &pending_connection) == 0);
+    assert(trevrpc_engine_listener_close(adapter, listener) == 0);
+    assert(trevrpc_engine_connection_close(adapter, first_connection, 0) == 0);
+    int extra_close_result = trevrpc_engine_connection_close(adapter, observed.extra_connection, 0);
+    assert(extra_close_result == 0 || extra_close_result == -EPIPE || extra_close_result == -ESTALE);
+    assert(trevrpc_engine_close(adapter) == 0);
+
+    uint64_t deadline = monotonic_millis() + 10000;
+    for (;;) {
+        trevrpc_engine_diagnostics_v1 diagnostics;
+        assert(trevrpc_engine_diagnostics_v1_init(&diagnostics, sizeof(diagnostics)) == 0);
+        assert(trevrpc_engine_get_diagnostics_v1(adapter, &diagnostics) == 0);
+        assert(diagnostics.live_connections <= engine_config.connection_capacity);
+        assert(diagnostics.live_streams <= engine_config.stream_capacity);
+        assert(diagnostics.terminal_status == 0);
+        assert(diagnostics.provider_error_code == 0);
+        if (diagnostics.live_listeners == 0 && diagnostics.live_connections == 0 && diagnostics.live_streams == 0) {
+            break;
+        }
+        struct pollfd descriptor = {.fd = (int)wake.native_handle, .events = POLLIN};
+        assert(poll(&descriptor, 1, 1000) >= 0);
+        for (;;) {
+            trevrpc_engine_event* event = NULL;
+            int result = trevrpc_engine_next_event(adapter, &event);
+            if (result == -EAGAIN || result == -EPIPE) {
+                break;
+            }
+            assert(result == 0);
+            trevrpc_engine_event_info_v1 info;
+            assert(trevrpc_engine_event_info_v1_init(&info, sizeof(info)) == 0);
+            assert(trevrpc_engine_event_get_info_v1(event, &info) == 0);
+            bool terminal = info.kind == TREVRPC_ENGINE_EVENT_CONNECTION_FAILED ||
+                            info.kind == TREVRPC_ENGINE_EVENT_CONNECTION_CLOSED ||
+                            info.kind == TREVRPC_ENGINE_EVENT_STREAM_FAILED ||
+                            info.kind == TREVRPC_ENGINE_EVENT_STREAM_CLOSED;
+            assert(info.status == 0 || (info.flags & TREVRPC_ENGINE_EVENT_FLAG_TERMINAL) != 0 ||
+                   info.kind == TREVRPC_ENGINE_EVENT_SEND_COMPLETE);
+            if (terminal) {
+                admission_record_terminal(&observed, info.subject);
+            }
+            trevrpc_engine_event_release(event);
+        }
+        assert(monotonic_millis() < deadline);
+    }
+    assert(trevrpc_engine_drain(adapter) == 0);
+    assert(observed.terminal_count <= 8);
+    assert(trevrpc_engine_release(adapter) == 0);
+}
+
 int main(void) {
+    test_real_bounded_admission();
+
     trevrpc_engine_config_v1 engine_config;
     trevrpc_engine_msquic_config_v1 provider_config;
     trevrpc_engine* adapter = NULL;
@@ -193,7 +430,7 @@ int main(void) {
     static const uint8_t second_request = 0;
     assert(trevrpc_engine_stream_send_frame_v1(adapter, observed.client_stream, 3, request, sizeof(request) - 1) == 0);
 
-    wait_for_pending_sends(adapter);
+    pump_until(adapter, &wake, &observed, SEEN_CLIENT_SEND);
     assert(trevrpc_engine_stream_send_frame_v1(
                adapter, observed.client_stream, 3, &second_request, sizeof(second_request) - 1) == 0);
 

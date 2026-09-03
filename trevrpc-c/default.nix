@@ -88,6 +88,8 @@ stdenv.mkDerivation (
         -std=c11 \
         -DQUIC_API_ENABLE_PREVIEW_FEATURES \
         -DTREVRPC_GENERATED_TESTING \
+        -DTREVRPC_H3_INGRESS_TESTING \
+        -DTREVRPC_MSQUIC_PROVIDER_CAPABILITIES \
         -Iinclude \
         -Isrc \
         -Ibuild/protoc-gen-trevrpc-c-protos \
@@ -129,6 +131,9 @@ stdenv.mkDerivation (
       test -f "$dev/lib/cmake/trevrpc_engine_msquic/trevrpc_engine_msquicConfig.cmake"
       test -f "$dev/lib/cmake/trevrpc_engine_msquic/trevrpcEngineMsquicTargets.cmake"
       test -f "$dev/lib/pkgconfig/trevrpc.pc"
+      test -f "$dev/lib/pkgconfig/trevrpc_core.pc"
+      test -f "$dev/lib/pkgconfig/trevrpc_msquic.pc"
+      test -f "$dev/lib/pkgconfig/trevrpc_webtransport.pc"
       test -f "$dev/lib/pkgconfig/trevrpc_engine.pc"
       test -f "$dev/lib/pkgconfig/trevrpc_engine_msquic.pc"
       test -f "$lib/lib/libtrevrpc.a"
@@ -136,6 +141,8 @@ stdenv.mkDerivation (
       test -f "$lib/lib/libtrevrpc_engine_msquic.a"
       test -f "$lib/lib/libtrevrpc_msquic_api_owner.a"
       test -f "$lib/lib/libtrevrpc_msquic_native_core.a"
+      test -f "$lib/lib/libtrevrpc_protocol_core.a"
+      ! grep -R 'add_library(trevrpc::trevrpc_protocol_core' "$dev/lib/cmake/trevrpc"
       test ! -e "$out/include"
       test ! -e "$out/lib"
 
@@ -164,6 +171,8 @@ stdenv.mkDerivation (
         -DTREVRPC_C_GENERATOR_EXECUTABLE="$out/bin/protoc-gen-trevrpc-c"
       cmake --build "$TMPDIR/trevrpc-installed-cmake" --parallel $NIX_BUILD_CORES
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-cmake-consumer"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-msquic-cmake-consumer"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-webtransport-cmake-consumer"
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-cmake-consumer"
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-msquic-cmake-consumer"
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-msquic-cmake-cpp-consumer"
@@ -179,6 +188,16 @@ stdenv.mkDerivation (
         -o "$TMPDIR/trevrpc-installed-engine-msquic-pkg-config-consumer" \
         $(pkg-config --static --cflags --libs trevrpc_engine_msquic)
       "$TMPDIR/trevrpc-installed-engine-msquic-pkg-config-consumer"
+      cc $consumer_sanitizer_flags \
+        tests/install/pkg-config/msquic_main.c \
+        -o "$TMPDIR/trevrpc-installed-msquic-pkg-config-consumer" \
+        $(pkg-config --static --cflags --libs trevrpc_msquic)
+      "$TMPDIR/trevrpc-installed-msquic-pkg-config-consumer"
+      cc $consumer_sanitizer_flags \
+        tests/install/pkg-config/webtransport_main.c \
+        -o "$TMPDIR/trevrpc-installed-webtransport-pkg-config-consumer" \
+        $(pkg-config --static --cflags --libs trevrpc_webtransport)
+      "$TMPDIR/trevrpc-installed-webtransport-pkg-config-consumer"
 
       pkg_codegen="$TMPDIR/trevrpc-installed-pkg-config-codegen"
       mkdir -p "$pkg_codegen"

@@ -33,6 +33,8 @@ typedef struct adapter_connection adapter_connection;
 typedef struct adapter_listener adapter_listener;
 typedef struct adapter_send adapter_send;
 typedef struct adapter_receive_node adapter_receive_node;
+typedef struct adapter_pending_connection adapter_pending_connection;
+typedef struct adapter_pending_stream adapter_pending_stream;
 
 typedef struct adapter_slot {
     adapter_object* object;
@@ -114,6 +116,19 @@ struct adapter_connection {
     uint64_t application_error;
     uint64_t transport_error;
     size_t live_streams;
+    adapter_pending_connection* pending_accept_node;
+    adapter_pending_stream* pending_peer_stream_head;
+    adapter_pending_stream* pending_peer_stream_tail;
+    uint64_t pending_peer_stream_count;
+    uint64_t pending_send_count;
+    uint64_t pending_send_bytes;
+    uint64_t max_pending_send_count;
+    uint64_t max_pending_send_bytes;
+    bool on_accept_queue;
+    bool accept_queue_ref_held;
+    bool handshake_in_flight;
+    bool admission_granted;
+    bool construction_ref_held;
 };
 
 struct adapter_receive_node {
@@ -121,18 +136,42 @@ struct adapter_receive_node {
     msquic_receive* receive;
 };
 
+/* Accept queues own one provider lifetime pin until their node is unlinked. */
+struct adapter_pending_connection {
+    adapter_pending_connection* next;
+    adapter_connection* connection;
+    bool release_queue_ref;
+};
+
+struct adapter_pending_stream {
+    adapter_pending_stream* next;
+    adapter_stream* stream;
+    bool release_queue_ref;
+};
+
 struct adapter_stream {
     adapter_object base;
     trevrpc_engine_handle_v1 parent;
+    adapter_pending_stream* pending_peer_node;
+    bool on_peer_queue;
+    bool peer_queue_ref_held;
+    bool stream_admission_granted;
+    bool construction_ref_held;
     pthread_mutex_t mutex;
     pthread_mutex_t send_gate;
     trevrpc_frame_parser parser;
     adapter_receive_node* receive_head;
     adapter_receive_node* receive_tail;
     adapter_send* pending_sends;
+    adapter_send* pending_send_tail;
+    adapter_stream* send_scheduler_next;
+    bool send_scheduler_queued;
+    uint64_t* pending_operation_ids;
     msquic_receive* parser_receive_allocation;
     bool readable_pending;
     uint64_t readable_epoch;
+    uint64_t readable_published_epoch;
+    bool ready_event_committed;
     bool receive_fin_published;
     bool receive_paused;
     bool send_finished;
@@ -148,6 +187,7 @@ struct adapter_send {
     adapter_stream* stream;
     uint64_t operation_id;
     size_t len;
+    bool submitted;
     atomic_bool completed;
     trevrpc_engine_reservation* completion_reservation;
     QUIC_BUFFER buffer;
@@ -169,12 +209,32 @@ struct msquic_provider {
     uint32_t stream_begin;
     uint32_t max_receive_owned_count;
     uint64_t max_receive_owned_bytes;
+    uint64_t connection_capacity;
+    uint64_t stream_capacity;
+    uint64_t connection_budget_used;
+    uint64_t stream_budget_used;
+    uint64_t pending_connection_count;
+    uint64_t pending_stream_count;
+    uint64_t connection_handshakes_in_flight;
+    adapter_pending_connection* pending_connection_head;
+    adapter_pending_connection* pending_connection_tail;
+    bool accept_admission_open;
+    pthread_cond_t scheduler_condition;
+    pthread_t scheduler_thread;
+    bool scheduler_condition_initialized;
+    bool scheduler_thread_started;
+    bool scheduler_requested;
+    bool scheduler_stop;
     uint64_t receive_owned_count;
     uint64_t peak_receive_owned_count;
     uint64_t receive_owned_bytes;
     uint64_t peak_receive_owned_bytes;
     uint64_t pending_send_bytes;
     uint64_t pending_send_count;
+    uint64_t max_pending_send_count;
+    uint64_t max_pending_send_bytes;
+    adapter_stream* send_ready_head;
+    adapter_stream* send_ready_tail;
     uint64_t live_listeners;
     uint64_t live_connections;
     uint64_t live_streams;
@@ -193,6 +253,26 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
 static void publish_listener_terminal(adapter_listener* listener);
 static void publish_connection_terminal(adapter_connection* connection);
 static void publish_stream_terminal(adapter_stream* stream, bool failed, int status);
+static void promote_peer_streams(adapter_connection* connection);
+static void adapter_schedule(msquic_provider* adapter);
+static void* adapter_scheduler_main(void* context);
+static void adapter_scheduler_drain(msquic_provider* adapter);
+static bool reserve_connection_budget(msquic_provider* adapter);
+static void release_connection_admission(msquic_provider* adapter);
+static void release_connection_admission_if_granted(adapter_connection* connection);
+static void release_peer_stream_pending(msquic_provider* adapter, adapter_connection* connection);
+static void release_stream_budget(msquic_provider* adapter);
+static adapter_pending_connection* remove_connection_queue_locked(
+    msquic_provider* adapter, adapter_connection* connection, bool* release_queue_ref);
+static adapter_pending_stream* remove_peer_stream_queue_locked(
+    msquic_provider* adapter, adapter_connection* connection, adapter_stream* stream, bool* release_queue_ref);
+static adapter_pending_connection* detach_pending_connections_locked(
+    msquic_provider* adapter, trevrpc_engine_handle_v1 parent, bool filter_parent);
+static adapter_pending_stream* detach_pending_streams_locked(msquic_provider* adapter, adapter_connection* connection);
+static void drain_detached_connection(
+    msquic_provider* adapter, adapter_connection* connection, bool release_queue_ref, uint64_t application_error_code);
+static void drain_detached_connections(msquic_provider* adapter, adapter_pending_connection* nodes);
+static void discard_detached_connections(msquic_provider* adapter, adapter_pending_connection* nodes);
 static void adapter_object_unpin(adapter_object* object);
 static void adapter_fail_stop(msquic_provider* adapter, int status, const char* message);
 static msquic_event* event_new(uint32_t kind,
@@ -209,15 +289,49 @@ static msquic_event* event_new(uint32_t kind,
 static void* adapter_receive_alloc(size_t size, void* context);
 static void adapter_receive_free(void* ptr, void* context);
 static bool release_receive_credit(adapter_stream* stream, size_t len);
+static int reserve_send_admission(adapter_stream* stream, uint64_t operation_id, size_t len);
+static void release_send_admission(adapter_stream* stream, uint64_t operation_id, size_t len);
+static void cancel_unsent_sends(adapter_stream* stream, int status);
+static bool stream_shutdown_drained(adapter_stream* stream);
 static adapter_object* registry_find_retired_locked(
     msquic_provider* adapter, trevrpc_engine_handle_v1 handle, uint32_t expected_kind);
 static adapter_object* object_reclaim_locked(msquic_provider* adapter, adapter_object* object);
 static void adapter_object_free(adapter_object* object);
+static uint64_t limit_product(uint64_t left, uint64_t right);
 
 static int provider_attach(void* provider_context, trevrpc_engine* engine) {
     msquic_provider* adapter = provider_context;
     adapter->engine = engine;
     return 0;
+}
+
+static void adapter_schedule(msquic_provider* adapter) {
+    if (adapter == NULL || !adapter->scheduler_condition_initialized) {
+        return;
+    }
+    pthread_mutex_lock(&adapter->mutex);
+    adapter->scheduler_requested = true;
+    if (adapter->scheduler_thread_started) {
+        pthread_cond_signal(&adapter->scheduler_condition);
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+}
+
+static void* adapter_scheduler_main(void* context) {
+    msquic_provider* adapter = context;
+    for (;;) {
+        pthread_mutex_lock(&adapter->mutex);
+        while (!adapter->scheduler_requested && !adapter->scheduler_stop) {
+            pthread_cond_wait(&adapter->scheduler_condition, &adapter->mutex);
+        }
+        bool stop = adapter->scheduler_stop;
+        adapter->scheduler_requested = false;
+        pthread_mutex_unlock(&adapter->mutex);
+        if (stop) {
+            return NULL;
+        }
+        adapter_scheduler_drain(adapter);
+    }
 }
 
 static int init_versioned(void* storage, size_t supplied, size_t required) {
@@ -774,10 +888,19 @@ static bool object_retains_tombstone_locked(adapter_object* object) {
     if (object->active_operations != 0) {
         return true;
     }
+    if (object->kind == TREVRPC_ENGINE_OBJECT_CONNECTION) {
+        adapter_connection* connection = (adapter_connection*)object;
+        return connection->on_accept_queue || connection->pending_accept_node != NULL ||
+               connection->pending_peer_stream_head != NULL || connection->pending_peer_stream_count != 0;
+    }
     if (object->kind != TREVRPC_ENGINE_OBJECT_STREAM) {
         return false;
     }
     adapter_stream* stream = (adapter_stream*)object;
+    if (stream->on_peer_queue || stream->pending_peer_node != NULL || stream->peer_queue_ref_held ||
+        stream->send_scheduler_queued) {
+        return true;
+    }
     pthread_mutex_lock(&stream->mutex);
     bool retain = stream->receive_head != NULL || stream->readable_pending || stream->pending_send_count != 0;
     pthread_mutex_unlock(&stream->mutex);
@@ -1004,27 +1127,36 @@ static int provider_dial(msquic_provider* adapter,
     if (adapter == NULL || out_connection == NULL || operation_id == 0) {
         return -EINVAL;
     }
+    if (!reserve_connection_budget(adapter)) {
+        return -EAGAIN;
+    }
     adapter_endpoint* endpoint = NULL;
     int result = endpoint_create(adapter, config, false, adapter->max_receive_owned_bytes, &endpoint);
     if (result != 0) {
+        release_connection_admission(adapter);
         return result;
     }
     adapter_connection* connection = calloc(1, sizeof(*connection));
     if (connection == NULL) {
         endpoint_free(endpoint);
+        release_connection_admission(adapter);
         return -ENOMEM;
     }
     atomic_init(&connection->base.closing, false);
     connection->base.endpoint = endpoint;
     connection->base.owns_endpoint = true;
+    connection->max_pending_send_count = limit_product(endpoint->max_pending_send_count, adapter->stream_capacity);
+    connection->max_pending_send_bytes = limit_product(endpoint->max_pending_send_bytes, adapter->stream_capacity);
     connection->base.operation_id = operation_id;
     connection->base.operation_pending = true;
     connection->base.event_flags = TREVRPC_ENGINE_EVENT_FLAG_CLIENT;
+    connection->admission_granted = true;
     trevrpc_engine_handle_v1 token;
     result = registry_add(adapter, &connection->base, TREVRPC_ENGINE_OBJECT_CONNECTION, &token);
     if (result != 0) {
         endpoint_free(endpoint);
         free(connection);
+        release_connection_admission(adapter);
         return result;
     }
     connection->base.ready_reservation = completion_reservation;
@@ -1035,6 +1167,7 @@ static int provider_dial(msquic_provider* adapter,
     if (QUIC_FAILED(status)) {
         connection->base.terminal_reservation = NULL;
         connection->base.ready_reservation = NULL;
+        release_connection_admission_if_granted(connection);
         registry_remove_unstarted(&connection->base);
         return -EIO;
     }
@@ -1044,6 +1177,7 @@ static int provider_dial(msquic_provider* adapter,
     if (QUIC_FAILED(status)) {
         connection->base.ready_reservation = NULL;
         connection->base.terminal_reservation = NULL;
+        release_connection_admission_if_granted(connection);
         registry_remove_unstarted(&connection->base);
         return -EIO;
     }
@@ -1090,6 +1224,7 @@ static adapter_stream* stream_alloc(adapter_connection* connection,
     HQUIC handle,
     uint64_t operation_id,
     uint32_t flags,
+    bool peer_pending,
     trevrpc_engine_reservation* ready_reservation,
     trevrpc_engine_reservation* terminal_reservation,
     trevrpc_engine_handle_v1* out_token,
@@ -1127,6 +1262,24 @@ static adapter_stream* stream_alloc(adapter_connection* connection,
     stream->base.operation_pending = operation_id != 0;
     stream->base.event_flags = flags;
     stream->parent = connection->base.token;
+    uint32_t send_id_capacity = connection->base.endpoint->max_pending_send_count;
+    if (send_id_capacity != 0) {
+        stream->pending_operation_ids = calloc(send_id_capacity, sizeof(*stream->pending_operation_ids));
+        if (stream->pending_operation_ids == NULL) {
+            pthread_mutex_destroy(&stream->send_gate);
+            pthread_mutex_destroy(&stream->mutex);
+            endpoint_free(stream->base.endpoint);
+            free(stream);
+            if (out_result != NULL)
+                *out_result = -ENOMEM;
+            return NULL;
+        }
+    }
+    if (peer_pending) {
+        stream->stream_admission_granted = true;
+        stream->peer_queue_ref_held = true;
+        stream->base.active_operations++;
+    }
     trevrpc_frame_parser_init_with_allocator(&stream->parser,
         connection->base.endpoint->max_frame_size,
         adapter_receive_alloc,
@@ -1164,6 +1317,7 @@ static adapter_stream* stream_alloc(adapter_connection* connection,
             registry_remove_unstarted(&stream->base);
         } else {
             trevrpc_frame_parser_reset(&stream->parser);
+            free(stream->pending_operation_ids);
             pthread_mutex_destroy(&stream->send_gate);
             pthread_mutex_destroy(&stream->mutex);
             endpoint_free(stream->base.endpoint);
@@ -1205,6 +1359,7 @@ static int provider_connection_open_bidi_stream(msquic_provider* adapter,
         NULL,
         operation_id,
         connection->base.event_flags | TREVRPC_ENGINE_EVENT_FLAG_LOCAL,
+        false,
         completion_reservation,
         terminal_reservation,
         &token,
@@ -1404,8 +1559,20 @@ static void resume_paused_receives(msquic_provider* adapter) {
 }
 
 static int publish_stream_readable(adapter_stream* stream) {
+    msquic_provider* adapter = stream->base.adapter;
+    pthread_mutex_lock(&adapter->mutex);
+    bool ready = stream->base.ready && stream->ready_event_committed && !stream->base.terminal_published;
+    pthread_mutex_unlock(&adapter->mutex);
+    if (!ready) {
+        return 0;
+    }
     pthread_mutex_lock(&stream->mutex);
     uint64_t readable_epoch = stream->readable_epoch;
+    if (!stream->readable_pending || stream->readable_published_epoch == readable_epoch) {
+        pthread_mutex_unlock(&stream->mutex);
+        return 0;
+    }
+    stream->readable_published_epoch = readable_epoch;
     pthread_mutex_unlock(&stream->mutex);
     msquic_event* event = event_new(TREVRPC_ENGINE_EVENT_STREAM_READABLE,
         stream->base.event_flags,
@@ -1424,6 +1591,9 @@ static int publish_stream_readable(adapter_stream* stream) {
     int result = enqueue_event(stream->base.adapter, event, false);
     if (result != 0) {
         pthread_mutex_lock(&stream->mutex);
+        if (stream->readable_published_epoch == readable_epoch) {
+            stream->readable_published_epoch = 0;
+        }
         if (stream->readable_pending && stream->readable_epoch == readable_epoch) {
             stream->readable_pending = false;
         }
@@ -1534,6 +1704,8 @@ static void owned_receive_release(void* owner, void* release_context) {
 
 #ifdef TREVRPC_ENGINE_MSQUIC_TESTING
 static bool AdapterTestFailNextReceiveCreate;
+static bool AdapterTestReceiveDuringReadyPublication;
+static bool AdapterTestShutdownAfterSendAdmission;
 #endif
 
 static int create_owned_receive(msquic_receive* receive, trevrpc_engine_receive** out_receive) {
@@ -1623,35 +1795,129 @@ static int provider_stream_receive_frame(
     return 0;
 }
 
-static int send_operation_reserve(adapter_send* send) {
-    adapter_stream* stream = send->stream;
-    adapter_endpoint* endpoint = stream->base.endpoint;
+static uint64_t limit_product(uint64_t left, uint64_t right) {
+    if (left == 0 || right == 0) {
+        return 0;
+    }
+    return left > UINT64_MAX / right ? UINT64_MAX : left * right;
+}
+
+static adapter_connection* stream_connection_locked(msquic_provider* adapter, adapter_stream* stream) {
+    if (stream->parent.owner != adapter->owner || stream->parent.slot >= adapter->slot_count) {
+        return NULL;
+    }
+    adapter_slot* slot = &adapter->slots[stream->parent.slot];
+    if (slot->object == NULL || slot->kind != TREVRPC_ENGINE_OBJECT_CONNECTION ||
+        slot->generation != stream->parent.generation) {
+        return NULL;
+    }
+    return (adapter_connection*)slot->object;
+}
+
+static void queue_stream_locked(msquic_provider* adapter, adapter_stream* stream) {
+    if (stream->send_scheduler_queued) {
+        return;
+    }
+    stream->send_scheduler_queued = true;
+    stream->send_scheduler_next = NULL;
+    if (adapter->send_ready_tail != NULL) {
+        adapter->send_ready_tail->send_scheduler_next = stream;
+    } else {
+        adapter->send_ready_head = stream;
+    }
+    adapter->send_ready_tail = stream;
+}
+
+static void unqueue_stream_locked(msquic_provider* adapter, adapter_stream* stream) {
+    if (!stream->send_scheduler_queued) {
+        return;
+    }
+    adapter_stream** link = &adapter->send_ready_head;
+    while (*link != NULL && *link != stream) {
+        link = &(*link)->send_scheduler_next;
+    }
+    if (*link == stream) {
+        *link = stream->send_scheduler_next;
+    }
+    adapter->send_ready_tail = NULL;
+    for (adapter_stream* queued = adapter->send_ready_head; queued != NULL; queued = queued->send_scheduler_next) {
+        adapter->send_ready_tail = queued;
+    }
+    stream->send_scheduler_next = NULL;
+    stream->send_scheduler_queued = false;
+}
+
+static bool pending_operation_id_locked(adapter_stream* stream, uint64_t operation_id, uint32_t* slot_out) {
+    if (stream->pending_operation_ids != NULL) {
+        for (uint32_t index = 0; index < stream->base.endpoint->max_pending_send_count; index++) {
+            if (stream->pending_operation_ids[index] == operation_id) {
+                return true;
+            }
+            if (slot_out != NULL && *slot_out == UINT32_MAX && stream->pending_operation_ids[index] == 0) {
+                *slot_out = index;
+            }
+        }
+        return false;
+    }
+    for (adapter_send* pending = stream->pending_sends; pending != NULL; pending = pending->next) {
+        if (pending->operation_id == operation_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int reserve_send_admission(adapter_stream* stream, uint64_t operation_id, size_t len) {
     msquic_provider* adapter = stream->base.adapter;
+    adapter_endpoint* endpoint = stream->base.endpoint;
     int result = 0;
+    uint32_t id_slot = UINT32_MAX;
     pthread_mutex_lock(&stream->send_gate);
     pthread_mutex_lock(&adapter->mutex);
     pthread_mutex_lock(&stream->mutex);
-    if (atomic_load_explicit(&stream->base.closing, memory_order_acquire) || stream->send_finished) {
+    adapter_connection* connection = stream_connection_locked(adapter, stream);
+    if (atomic_load_explicit(&stream->base.closing, memory_order_acquire) || stream->base.shutdown_complete ||
+        stream->send_finished) {
         result = -EPIPE;
+    } else if (pending_operation_id_locked(stream, operation_id, &id_slot)) {
+        result = -EALREADY;
     } else {
-        for (adapter_send* pending = stream->pending_sends; pending != NULL; pending = pending->next) {
-            if (pending->operation_id == send->operation_id) {
-                result = -EALREADY;
-                break;
-            }
+        if (adapter->max_pending_send_count == 0) {
+            adapter->max_pending_send_count = limit_product(endpoint->max_pending_send_count,
+                limit_product(adapter->stream_capacity, adapter->connection_capacity));
         }
-    }
-    if (result == 0 && (stream->pending_send_count >= endpoint->max_pending_send_count ||
-                           send->len > endpoint->max_pending_send_bytes - stream->pending_send_bytes)) {
-        result = -EAGAIN;
-    }
-    if (result == 0) {
-        send->next = stream->pending_sends;
-        stream->pending_sends = send;
-        stream->pending_send_count++;
-        stream->pending_send_bytes += send->len;
-        adapter->pending_send_count++;
-        adapter->pending_send_bytes += send->len;
+        if (adapter->max_pending_send_bytes == 0) {
+            adapter->max_pending_send_bytes = limit_product(endpoint->max_pending_send_bytes,
+                limit_product(adapter->stream_capacity, adapter->connection_capacity));
+        }
+        bool stream_full = len > endpoint->max_pending_send_bytes ||
+                           stream->pending_send_count >= endpoint->max_pending_send_count ||
+                           stream->pending_send_bytes > endpoint->max_pending_send_bytes - len;
+        bool connection_full = connection != NULL && connection->max_pending_send_count != 0 &&
+                               (connection->pending_send_count >= connection->max_pending_send_count ||
+                                   len > connection->max_pending_send_bytes ||
+                                   connection->pending_send_bytes > connection->max_pending_send_bytes - len);
+        bool provider_full =
+            adapter->max_pending_send_count != 0 &&
+            (adapter->pending_send_count >= adapter->max_pending_send_count || len > adapter->max_pending_send_bytes ||
+                adapter->pending_send_bytes > adapter->max_pending_send_bytes - len);
+        if (len > endpoint->max_pending_send_bytes || stream_full || connection_full || provider_full) {
+            result = -EAGAIN;
+        } else if (stream->pending_operation_ids != NULL && id_slot == UINT32_MAX) {
+            result = -EAGAIN;
+        } else {
+            if (stream->pending_operation_ids != NULL) {
+                stream->pending_operation_ids[id_slot] = operation_id;
+            }
+            stream->pending_send_count++;
+            stream->pending_send_bytes += len;
+            if (connection != NULL) {
+                connection->pending_send_count++;
+                connection->pending_send_bytes += len;
+            }
+            adapter->pending_send_count++;
+            adapter->pending_send_bytes += len;
+        }
     }
     pthread_mutex_unlock(&stream->mutex);
     pthread_mutex_unlock(&adapter->mutex);
@@ -1659,7 +1925,55 @@ static int send_operation_reserve(adapter_send* send) {
     return result;
 }
 
-static bool send_operation_release(adapter_send* send, bool completion_committed) {
+static void release_send_admission(adapter_stream* stream, uint64_t operation_id, size_t len) {
+    msquic_provider* adapter = stream->base.adapter;
+    pthread_mutex_lock(&adapter->mutex);
+    pthread_mutex_lock(&stream->mutex);
+    adapter_connection* connection = stream_connection_locked(adapter, stream);
+    if (stream->pending_send_count > 0) {
+        stream->pending_send_count--;
+    }
+    if (stream->pending_send_bytes >= len) {
+        stream->pending_send_bytes -= len;
+    } else {
+        stream->pending_send_bytes = 0;
+    }
+    if (stream->pending_operation_ids != NULL) {
+        for (uint32_t index = 0; index < stream->base.endpoint->max_pending_send_count; index++) {
+            if (stream->pending_operation_ids[index] == operation_id) {
+                stream->pending_operation_ids[index] = 0;
+                break;
+            }
+        }
+    }
+    if (connection != NULL) {
+        if (connection->pending_send_count > 0) {
+            connection->pending_send_count--;
+        }
+        if (connection->pending_send_bytes >= len) {
+            connection->pending_send_bytes -= len;
+        } else {
+            connection->pending_send_bytes = 0;
+        }
+    }
+    if (adapter->pending_send_count > 0) {
+        adapter->pending_send_count--;
+    }
+    if (adapter->pending_send_bytes >= len) {
+        adapter->pending_send_bytes -= len;
+    } else {
+        adapter->pending_send_bytes = 0;
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    pthread_mutex_unlock(&adapter->mutex);
+    if (stream_shutdown_drained(stream)) {
+        publish_stream_terminal(stream, false, 0);
+    } else {
+        adapter_schedule(adapter);
+    }
+}
+
+static bool send_operation_release(adapter_send* send) {
     adapter_stream* stream = send->stream;
     msquic_provider* adapter = stream->base.adapter;
     bool found = false;
@@ -1671,24 +1985,134 @@ static bool send_operation_release(adapter_send* send, bool completion_committed
     }
     if (*link == send) {
         *link = send->next;
+        if (stream->pending_send_tail == send) {
+            stream->pending_send_tail = NULL;
+            for (adapter_send* pending = stream->pending_sends; pending != NULL; pending = pending->next) {
+                stream->pending_send_tail = pending;
+            }
+        }
         found = true;
-        if (stream->pending_send_count > 0) {
+        adapter_connection* connection = stream_connection_locked(adapter, stream);
+        if (stream->pending_send_count > 0)
             stream->pending_send_count--;
-        }
-        if (stream->pending_send_bytes >= send->len) {
+        if (stream->pending_send_bytes >= send->len)
             stream->pending_send_bytes -= send->len;
+        if (connection != NULL) {
+            if (connection->pending_send_count > 0)
+                connection->pending_send_count--;
+            if (connection->pending_send_bytes >= send->len)
+                connection->pending_send_bytes -= send->len;
         }
-        if (adapter->pending_send_count > 0) {
+        if (adapter->pending_send_count > 0)
             adapter->pending_send_count--;
-        }
-        if (adapter->pending_send_bytes >= send->len) {
+        if (adapter->pending_send_bytes >= send->len)
             adapter->pending_send_bytes -= send->len;
+        bool has_unsent = false;
+        for (adapter_send* pending = stream->pending_sends; pending != NULL; pending = pending->next) {
+            if (!pending->submitted) {
+                has_unsent = true;
+                break;
+            }
         }
-        (void)completion_committed;
+        if (has_unsent && adapter->state == TREVRPC_ENGINE_STATE_RUNNING &&
+            !atomic_load_explicit(&stream->base.closing, memory_order_acquire) && !stream->base.shutdown_complete) {
+            queue_stream_locked(adapter, stream);
+        } else if (!has_unsent) {
+            unqueue_stream_locked(adapter, stream);
+        }
     }
     pthread_mutex_unlock(&stream->mutex);
     pthread_mutex_unlock(&adapter->mutex);
+    if (found)
+        adapter_schedule(adapter);
     return found;
+}
+
+static void release_send_operation_id(adapter_stream* stream, uint64_t operation_id) {
+    pthread_mutex_lock(&stream->send_gate);
+    pthread_mutex_lock(&stream->mutex);
+    if (stream->pending_operation_ids != NULL) {
+        for (uint32_t index = 0; index < stream->base.endpoint->max_pending_send_count; index++) {
+            if (stream->pending_operation_ids[index] == operation_id) {
+                stream->pending_operation_ids[index] = 0;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    pthread_mutex_unlock(&stream->send_gate);
+}
+
+static void cancel_unsent_sends(adapter_stream* stream, int status) {
+    msquic_provider* adapter = stream->base.adapter;
+    adapter_send* canceled_head = NULL;
+    adapter_send* canceled_tail = NULL;
+    pthread_mutex_lock(&stream->send_gate);
+    pthread_mutex_lock(&adapter->mutex);
+    pthread_mutex_lock(&stream->mutex);
+    adapter_connection* connection = stream_connection_locked(adapter, stream);
+    adapter_send** link = &stream->pending_sends;
+    while (*link != NULL) {
+        adapter_send* send = *link;
+        if (send->submitted) {
+            link = &send->next;
+            continue;
+        }
+        *link = send->next;
+        send->next = NULL;
+        if (canceled_tail != NULL) {
+            canceled_tail->next = send;
+        } else {
+            canceled_head = send;
+        }
+        canceled_tail = send;
+        atomic_store_explicit(&send->completed, true, memory_order_release);
+        if (stream->pending_send_count > 0)
+            stream->pending_send_count--;
+        if (stream->pending_send_bytes >= send->len)
+            stream->pending_send_bytes -= send->len;
+        if (connection != NULL) {
+            if (connection->pending_send_count > 0)
+                connection->pending_send_count--;
+            if (connection->pending_send_bytes >= send->len)
+                connection->pending_send_bytes -= send->len;
+        }
+        if (adapter->pending_send_count > 0)
+            adapter->pending_send_count--;
+        if (adapter->pending_send_bytes >= send->len)
+            adapter->pending_send_bytes -= send->len;
+    }
+    stream->pending_send_tail = NULL;
+    for (adapter_send* pending = stream->pending_sends; pending != NULL; pending = pending->next) {
+        stream->pending_send_tail = pending;
+    }
+    unqueue_stream_locked(adapter, stream);
+    pthread_mutex_unlock(&stream->mutex);
+    pthread_mutex_unlock(&adapter->mutex);
+    pthread_mutex_unlock(&stream->send_gate);
+
+    while (canceled_head != NULL) {
+        adapter_send* send = canceled_head;
+        canceled_head = send->next;
+        trevrpc_engine_reservation* reservation = send->completion_reservation;
+        send->completion_reservation = NULL;
+        (void)publish_reserved_event(adapter,
+            reservation,
+            TREVRPC_ENGINE_EVENT_SEND_COMPLETE,
+            stream->base.event_flags,
+            status,
+            TREVRPC_ENGINE_OBJECT_STREAM,
+            stream->base.token,
+            stream->parent,
+            send->operation_id,
+            0,
+            0,
+            NULL);
+        release_send_operation_id(stream, send->operation_id);
+        free(send->data);
+        free(send);
+    }
+    adapter_schedule(adapter);
 }
 
 static bool stream_shutdown_drained(adapter_stream* stream) {
@@ -1724,13 +2148,26 @@ static int provider_stream_send_frame(msquic_provider* adapter,
         return -EMSGSIZE;
     }
     size_t wire_len = body_len + 4;
+    result = reserve_send_admission(stream, operation_id, wire_len);
+    if (result != 0) {
+        return result;
+    }
+#ifdef TREVRPC_ENGINE_MSQUIC_TESTING
+    if (AdapterTestShutdownAfterSendAdmission) {
+        AdapterTestShutdownAfterSendAdmission = false;
+        QUIC_STREAM_EVENT event = {.Type = QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE};
+        (void)adapter_stream_callback(stream->base.handle, stream, &event);
+    }
+#endif
     adapter_send* send = calloc(1, sizeof(*send));
     if (send == NULL) {
+        release_send_admission(stream, operation_id, wire_len);
         return -ENOMEM;
     }
     send->data = malloc(wire_len);
     if (send->data == NULL) {
         free(send);
+        release_send_admission(stream, operation_id, wire_len);
         return -ENOMEM;
     }
     send->stream = stream;
@@ -1738,13 +2175,6 @@ static int provider_stream_send_frame(msquic_provider* adapter,
     send->len = wire_len;
     atomic_init(&send->completed, false);
     send->completion_reservation = completion_reservation;
-    result = send_operation_reserve(send);
-    if (result != 0) {
-        send->completion_reservation = NULL;
-        free(send->data);
-        free(send);
-        return result;
-    }
     send->data[0] = (uint8_t)(body_len >> 24);
     send->data[1] = (uint8_t)(body_len >> 16);
     send->data[2] = (uint8_t)(body_len >> 8);
@@ -1754,26 +2184,29 @@ static int provider_stream_send_frame(msquic_provider* adapter,
     }
     send->buffer.Buffer = send->data;
     send->buffer.Length = (uint32_t)wire_len;
-    result = trevrpc_engine_provider_operation_pin(adapter->engine);
-    if (result != 0) {
-        (void)send_operation_release(send, false);
-        send->completion_reservation = NULL;
-        free(send->data);
-        free(send);
-        return result;
-    }
-    QUIC_STATUS status = adapter->api->StreamSend(stream->base.handle, &send->buffer, 1, QUIC_SEND_FLAG_NONE, send);
-    if (QUIC_FAILED(status)) {
-        trevrpc_engine_provider_operation_unpin(adapter->engine);
-        (void)send_operation_release(send, false);
-        send->completion_reservation = NULL;
-        free(send->data);
-        free(send);
-        if (stream_shutdown_drained(stream)) {
-            publish_stream_terminal(stream, false, 0);
+
+    pthread_mutex_lock(&adapter->mutex);
+    pthread_mutex_lock(&stream->mutex);
+    bool closing = atomic_load_explicit(&stream->base.closing, memory_order_acquire) ||
+                   stream->base.shutdown_complete || stream->base.terminal_published || stream->send_finished;
+    if (!closing) {
+        if (stream->pending_send_tail != NULL) {
+            stream->pending_send_tail->next = send;
+        } else {
+            stream->pending_sends = send;
         }
-        return -EIO;
+        stream->pending_send_tail = send;
+        queue_stream_locked(adapter, stream);
     }
+    pthread_mutex_unlock(&stream->mutex);
+    pthread_mutex_unlock(&adapter->mutex);
+    if (closing) {
+        free(send->data);
+        free(send);
+        release_send_admission(stream, operation_id, wire_len);
+        return -EPIPE;
+    }
+    adapter_schedule(adapter);
     return 0;
 }
 
@@ -1848,7 +2281,9 @@ static void publish_connection_ready(adapter_connection* connection, const uint8
                                    NULL) != 0) {
         adapter_fail_stop(adapter, -EIO, "connection readiness publication failed");
     }
-    if (cancel) {
+    if (!cancel) {
+        adapter_schedule(adapter);
+    } else {
         adapter->api->ConnectionShutdown(connection->base.handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
     }
 }
@@ -1861,7 +2296,17 @@ static int publish_stream_ready(adapter_stream* stream) {
         pthread_mutex_unlock(&adapter->mutex);
         return 0;
     }
-    if (atomic_load_explicit(&stream->base.closing, memory_order_acquire)) {
+    adapter_connection* connection = NULL;
+    if (stream->parent.owner == adapter->owner && stream->parent.slot < adapter->slot_count) {
+        adapter_slot* parent_slot = &adapter->slots[stream->parent.slot];
+        if (parent_slot->object != NULL && parent_slot->kind == TREVRPC_ENGINE_OBJECT_CONNECTION &&
+            parent_slot->generation == stream->parent.generation) {
+            connection = (adapter_connection*)parent_slot->object;
+        }
+    }
+    if (adapter->state != TREVRPC_ENGINE_STATE_RUNNING || connection == NULL || !connection->base.ready ||
+        connection->base.terminal_published || atomic_load_explicit(&connection->base.closing, memory_order_acquire) ||
+        stream->base.handle == NULL || atomic_load_explicit(&stream->base.closing, memory_order_acquire)) {
         pthread_mutex_unlock(&adapter->mutex);
         return -ECANCELED;
     }
@@ -1871,7 +2316,20 @@ static int publish_stream_ready(adapter_stream* stream) {
     stream->base.ready_reservation = NULL;
     pthread_mutex_unlock(&adapter->mutex);
 
-    return publish_reserved_event(adapter,
+#ifdef TREVRPC_ENGINE_MSQUIC_TESTING
+    if (AdapterTestReceiveDuringReadyPublication) {
+        AdapterTestReceiveDuringReadyPublication = false;
+        uint8_t frame[4] = {0};
+        QUIC_BUFFER buffer = {.Length = sizeof(frame), .Buffer = frame};
+        QUIC_STREAM_EVENT event = {.Type = QUIC_STREAM_EVENT_RECEIVE};
+        event.RECEIVE.TotalBufferLength = sizeof(frame);
+        event.RECEIVE.BufferCount = 1;
+        event.RECEIVE.Buffers = &buffer;
+        (void)adapter_stream_callback(stream->base.handle, stream, &event);
+    }
+#endif
+
+    int result = publish_reserved_event(adapter,
         reservation,
         TREVRPC_ENGINE_EVENT_STREAM_READY,
         stream->base.event_flags,
@@ -1883,10 +2341,24 @@ static int publish_stream_ready(adapter_stream* stream) {
         0,
         0,
         NULL);
+    if (result == 0) {
+        pthread_mutex_lock(&adapter->mutex);
+        stream->ready_event_committed = true;
+        pthread_mutex_unlock(&adapter->mutex);
+        pthread_mutex_lock(&stream->mutex);
+        bool readable_pending = stream->readable_pending;
+        pthread_mutex_unlock(&stream->mutex);
+        if (readable_pending) {
+            result = publish_stream_readable(stream);
+        }
+    }
+    return result;
 }
 
 static void publish_connection_terminal(adapter_connection* connection) {
     msquic_provider* adapter = connection->base.adapter;
+    adapter_pending_connection* pending_node = NULL;
+    bool release_queue_ref = false;
     trevrpc_engine_reservation* terminal;
     trevrpc_engine_reservation* unused_ready;
     bool failed;
@@ -1899,9 +2371,23 @@ static void publish_connection_terminal(adapter_connection* connection) {
         pthread_mutex_unlock(&adapter->mutex);
         return;
     }
+    if (connection->on_accept_queue) {
+        pending_node = remove_connection_queue_locked(adapter, connection, &release_queue_ref);
+    }
+    if (connection->handshake_in_flight) {
+        connection->handshake_in_flight = false;
+        if (adapter->connection_handshakes_in_flight > 0) {
+            adapter->connection_handshakes_in_flight--;
+        }
+    }
     if (connection->base.active_operations != 0 || connection->live_streams != 0) {
         connection->base.terminal_deferred = true;
         pthread_mutex_unlock(&adapter->mutex);
+        free(pending_node);
+        if (release_queue_ref) {
+            adapter_object_unpin(&connection->base);
+        }
+        adapter_schedule(adapter);
         return;
     }
     connection->base.terminal_deferred = false;
@@ -1923,7 +2409,14 @@ static void publish_connection_terminal(adapter_connection* connection) {
     HQUIC handle = object_take_handle_locked(&connection->base);
     adapter_native_close_begin_locked(adapter, handle);
     (void)object_terminal_locked(&connection->base);
+    if (connection->admission_granted) {
+        connection->admission_granted = false;
+        if (adapter->connection_budget_used > 0) {
+            adapter->connection_budget_used--;
+        }
+    }
     pthread_mutex_unlock(&adapter->mutex);
+    free(pending_node);
 
     if (handle != NULL) {
         adapter->api->ConnectionClose(handle);
@@ -1943,11 +2436,16 @@ static void publish_connection_terminal(adapter_connection* connection) {
         transport_error,
         &connection->base);
     adapter_maybe_stopped(adapter);
+    adapter_schedule(adapter);
 }
 
 static void publish_stream_terminal(adapter_stream* stream, bool failed, int status) {
     msquic_provider* adapter = stream->base.adapter;
     adapter_connection* connection = NULL;
+    adapter_pending_stream* pending_node = NULL;
+    bool release_peer_queue_ref = false;
+    bool release_stream_budget_later = false;
+    bool promote_peer_queue = false;
     bool close_parent = false;
     trevrpc_engine_reservation* terminal;
     trevrpc_engine_reservation* unused_ready;
@@ -1957,9 +2455,24 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
         pthread_mutex_unlock(&adapter->mutex);
         return;
     }
+    adapter_slot* parent_slot = stream->parent.slot < adapter->slot_count ? &adapter->slots[stream->parent.slot] : NULL;
+    connection = parent_slot != NULL && parent_slot->object != NULL &&
+                         parent_slot->generation == stream->parent.generation &&
+                         parent_slot->kind == TREVRPC_ENGINE_OBJECT_CONNECTION
+                     ? (adapter_connection*)parent_slot->object
+                     : NULL;
     pthread_mutex_lock(&stream->mutex);
     bool shutdown_drained = stream->base.shutdown_complete && stream->pending_send_count == 0;
+    if (shutdown_drained) {
+        unqueue_stream_locked(adapter, stream);
+    }
     pthread_mutex_unlock(&stream->mutex);
+    if (connection != NULL && stream->on_peer_queue) {
+        pending_node = remove_peer_stream_queue_locked(adapter, connection, stream, &release_peer_queue_ref);
+        promote_peer_queue = pending_node != NULL && adapter->state == TREVRPC_ENGINE_STATE_RUNNING &&
+                             connection->base.ready && !connection->base.terminal_published &&
+                             !atomic_load_explicit(&connection->base.closing, memory_order_acquire);
+    }
     if (stream->base.active_operations != 0 || !shutdown_drained) {
         stream->base.terminal_deferred = true;
         if (failed || !stream->base.terminal_failed) {
@@ -1967,6 +2480,13 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
             stream->base.terminal_deferred_status = status;
         }
         pthread_mutex_unlock(&adapter->mutex);
+        free(pending_node);
+        if (release_peer_queue_ref) {
+            adapter_object_unpin(&stream->base);
+        }
+        if (promote_peer_queue) {
+            adapter_schedule(adapter);
+        }
         return;
     }
     stream->base.terminal_deferred = false;
@@ -1976,12 +2496,10 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
     stream->base.ready_reservation = NULL;
     unused_receive_fin = stream->receive_fin_reservation;
     stream->receive_fin_reservation = NULL;
-    adapter_slot* parent_slot = stream->parent.slot < adapter->slot_count ? &adapter->slots[stream->parent.slot] : NULL;
-    connection = parent_slot != NULL && parent_slot->object != NULL &&
-                         parent_slot->generation == stream->parent.generation &&
-                         parent_slot->kind == TREVRPC_ENGINE_OBJECT_CONNECTION
-                     ? (adapter_connection*)parent_slot->object
-                     : NULL;
+    if (stream->stream_admission_granted) {
+        stream->stream_admission_granted = false;
+        release_stream_budget_later = true;
+    }
     if (connection != NULL && connection->live_streams > 0) {
         connection->live_streams--;
     }
@@ -1995,6 +2513,10 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
     (void)object_terminal_locked(&stream->base);
     pthread_mutex_unlock(&adapter->mutex);
 
+    if (release_stream_budget_later) {
+        release_stream_budget(adapter);
+    }
+    free(pending_node);
     if (handle != NULL) {
         adapter->api->StreamClose(handle);
     }
@@ -2016,6 +2538,12 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
     adapter_maybe_stopped(adapter);
     if (close_parent) {
         adapter_object_unpin(&connection->base);
+    }
+    if (release_peer_queue_ref) {
+        adapter_object_unpin(&stream->base);
+    }
+    if (promote_peer_queue) {
+        adapter_schedule(adapter);
     }
 }
 
@@ -2067,6 +2595,7 @@ static void adapter_object_unpin(adapter_object* object) {
     if (check_stopped) {
         adapter_maybe_stopped(adapter);
     }
+    adapter_schedule(adapter);
 }
 
 static void publish_receive_fin(adapter_stream* stream, uint32_t event_flags, int status) {
@@ -2099,6 +2628,587 @@ static void publish_receive_fin(adapter_stream* stream, uint32_t event_flags, in
         NULL);
 }
 
+static bool reserve_connection_budget(msquic_provider* adapter) {
+    pthread_mutex_lock(&adapter->mutex);
+    bool available = adapter->state == TREVRPC_ENGINE_STATE_RUNNING &&
+                     adapter->connection_budget_used < adapter->connection_capacity;
+    if (available) {
+        adapter->connection_budget_used++;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    return available;
+}
+
+static bool reserve_connection_admission(msquic_provider* adapter, adapter_listener* listener) {
+    pthread_mutex_lock(&adapter->mutex);
+    bool available = adapter->accept_admission_open && adapter->state == TREVRPC_ENGINE_STATE_RUNNING &&
+                     !atomic_load_explicit(&listener->base.closing, memory_order_acquire) &&
+                     adapter->connection_budget_used < adapter->connection_capacity;
+    if (available) {
+        adapter->connection_budget_used++;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    return available;
+}
+
+static void release_connection_admission(msquic_provider* adapter) {
+    pthread_mutex_lock(&adapter->mutex);
+    if (adapter->connection_budget_used > 0) {
+        adapter->connection_budget_used--;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    adapter_schedule(adapter);
+}
+
+static void release_connection_admission_if_granted(adapter_connection* connection) {
+    msquic_provider* adapter = connection->base.adapter;
+    bool release = false;
+    pthread_mutex_lock(&adapter->mutex);
+    if (connection->admission_granted) {
+        connection->admission_granted = false;
+        release = true;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    if (release) {
+        release_connection_admission(adapter);
+    }
+}
+
+static QUIC_STATUS normalize_accept_failure(int status) {
+    return status == -ENOMEM ? QUIC_STATUS_OUT_OF_MEMORY : QUIC_STATUS_ABORTED;
+}
+
+static adapter_pending_connection* remove_connection_queue_locked(
+    msquic_provider* adapter, adapter_connection* connection, bool* release_queue_ref) {
+    adapter_pending_connection* node = connection->pending_accept_node;
+    if (release_queue_ref != NULL) {
+        *release_queue_ref = connection->accept_queue_ref_held;
+    }
+    connection->pending_accept_node = NULL;
+    connection->accept_queue_ref_held = false;
+    connection->on_accept_queue = false;
+    if (node == NULL) {
+        return NULL;
+    }
+    adapter_pending_connection** link = &adapter->pending_connection_head;
+    while (*link != NULL && *link != node) {
+        link = &(*link)->next;
+    }
+    if (*link != node) {
+        return NULL;
+    }
+    *link = node->next;
+    if (adapter->pending_connection_tail == node) {
+        adapter->pending_connection_tail = NULL;
+        for (adapter_pending_connection* pending = adapter->pending_connection_head; pending != NULL;
+            pending = pending->next) {
+            adapter->pending_connection_tail = pending;
+        }
+    }
+    if (adapter->pending_connection_count > 0) {
+        adapter->pending_connection_count--;
+    }
+    return node;
+}
+
+static adapter_pending_connection* detach_pending_connections_locked(
+    msquic_provider* adapter, trevrpc_engine_handle_v1 parent, bool filter_parent) {
+    adapter_pending_connection* detached_head = NULL;
+    adapter_pending_connection* detached_tail = NULL;
+    adapter_pending_connection** link = &adapter->pending_connection_head;
+    while (*link != NULL) {
+        adapter_pending_connection* node = *link;
+        adapter_connection* connection = node->connection;
+        if (filter_parent &&
+            (connection == NULL || connection->parent.owner != parent.owner || connection->parent.slot != parent.slot ||
+                connection->parent.generation != parent.generation)) {
+            link = &node->next;
+            continue;
+        }
+        *link = node->next;
+        node->next = NULL;
+        if (detached_tail != NULL) {
+            detached_tail->next = node;
+        } else {
+            detached_head = node;
+        }
+        detached_tail = node;
+        if (adapter->pending_connection_count > 0) {
+            adapter->pending_connection_count--;
+        }
+        if (connection != NULL) {
+            node->release_queue_ref = connection->accept_queue_ref_held;
+            connection->pending_accept_node = NULL;
+            connection->accept_queue_ref_held = false;
+            connection->on_accept_queue = false;
+            atomic_store_explicit(&connection->base.closing, true, memory_order_release);
+            if (!connection->base.ready) {
+                connection->base.cancel_requested = true;
+            }
+            if (connection->base.handle == NULL) {
+                connection->base.shutdown_complete = true;
+            }
+        }
+    }
+    adapter->pending_connection_tail = NULL;
+    for (adapter_pending_connection* node = adapter->pending_connection_head; node != NULL; node = node->next) {
+        adapter->pending_connection_tail = node;
+    }
+    return detached_head;
+}
+
+static adapter_pending_stream* detach_pending_streams_locked(msquic_provider* adapter, adapter_connection* connection) {
+    adapter_pending_stream* detached_head = connection->pending_peer_stream_head;
+    connection->pending_peer_stream_head = NULL;
+    connection->pending_peer_stream_tail = NULL;
+    uint64_t detached_count = connection->pending_peer_stream_count;
+    connection->pending_peer_stream_count = 0;
+    if (adapter->pending_stream_count >= detached_count) {
+        adapter->pending_stream_count -= detached_count;
+    } else {
+        adapter->pending_stream_count = 0;
+    }
+    for (adapter_pending_stream* node = detached_head; node != NULL; node = node->next) {
+        adapter_stream* stream = node->stream;
+        if (stream == NULL) {
+            continue;
+        }
+        node->release_queue_ref = stream->peer_queue_ref_held;
+        stream->pending_peer_node = NULL;
+        stream->peer_queue_ref_held = false;
+        stream->on_peer_queue = false;
+        atomic_store_explicit(&stream->base.closing, true, memory_order_release);
+        if (stream->base.handle == NULL) {
+            stream->base.shutdown_complete = true;
+        }
+    }
+    return detached_head;
+}
+
+static void drain_detached_connection(
+    msquic_provider* adapter, adapter_connection* connection, bool release_queue_ref, uint64_t application_error_code) {
+    pthread_mutex_lock(&adapter->mutex);
+    adapter_pending_stream* streams = detach_pending_streams_locked(adapter, connection);
+    HQUIC connection_handle = connection->base.handle;
+    bool connection_shutdown_complete = connection->base.shutdown_complete;
+    pthread_mutex_unlock(&adapter->mutex);
+
+    while (streams != NULL) {
+        adapter_pending_stream* stream_node = streams;
+        adapter_stream* stream = stream_node->stream;
+        streams = stream_node->next;
+        if (stream != NULL) {
+            HQUIC stream_handle = stream->base.handle;
+            publish_stream_terminal(stream, true, -ECANCELED);
+            if (stream_handle != NULL && stream->base.handle == stream_handle) {
+                adapter->api->StreamShutdown(stream_handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+            if (stream_node->release_queue_ref) {
+                adapter_object_unpin(&stream->base);
+            }
+        }
+        free(stream_node);
+    }
+
+    publish_connection_terminal(connection);
+    if (!connection_shutdown_complete && connection_handle != NULL && connection->base.handle == connection_handle) {
+        adapter->api->ConnectionShutdown(connection_handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, application_error_code);
+    }
+    if (release_queue_ref) {
+        adapter_object_unpin(&connection->base);
+    }
+}
+
+static void drain_detached_connections(msquic_provider* adapter, adapter_pending_connection* nodes) {
+    while (nodes != NULL) {
+        adapter_pending_connection* node = nodes;
+        nodes = node->next;
+        if (node->connection != NULL) {
+            drain_detached_connection(adapter, node->connection, node->release_queue_ref, 0);
+        }
+        free(node);
+    }
+}
+
+static void discard_detached_connections(msquic_provider* adapter, adapter_pending_connection* nodes) {
+    while (nodes != NULL) {
+        adapter_pending_connection* node = nodes;
+        adapter_connection* connection = node->connection;
+        nodes = node->next;
+        if (connection != NULL) {
+            pthread_mutex_lock(&adapter->mutex);
+            adapter_pending_stream* streams = detach_pending_streams_locked(adapter, connection);
+            if (node->release_queue_ref && connection->base.active_operations > 0) {
+                connection->base.active_operations--;
+            }
+            if (connection->admission_granted) {
+                connection->admission_granted = false;
+                if (adapter->connection_budget_used > 0) {
+                    adapter->connection_budget_used--;
+                }
+            }
+            for (adapter_pending_stream* stream_node = streams; stream_node != NULL; stream_node = stream_node->next) {
+                adapter_stream* stream = stream_node->stream;
+                if (stream != NULL) {
+                    if (stream_node->release_queue_ref && stream->base.active_operations > 0) {
+                        stream->base.active_operations--;
+                    }
+                    if (stream->stream_admission_granted) {
+                        stream->stream_admission_granted = false;
+                        if (adapter->stream_budget_used > 0) {
+                            adapter->stream_budget_used--;
+                        }
+                    }
+                }
+            }
+            pthread_mutex_unlock(&adapter->mutex);
+            while (streams != NULL) {
+                adapter_pending_stream* stream_node = streams;
+                streams = stream_node->next;
+                free(stream_node);
+            }
+        }
+        free(node);
+    }
+}
+
+static void complete_connection_handshake(adapter_connection* connection) {
+    msquic_provider* adapter = connection->base.adapter;
+    bool release_queue_ref = false;
+    pthread_mutex_lock(&adapter->mutex);
+    if (connection->handshake_in_flight) {
+        connection->handshake_in_flight = false;
+        if (adapter->connection_handshakes_in_flight > 0) {
+            adapter->connection_handshakes_in_flight--;
+        }
+    }
+    if (!connection->on_accept_queue) {
+        release_queue_ref = connection->accept_queue_ref_held;
+        connection->accept_queue_ref_held = false;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    if (release_queue_ref) {
+        adapter_object_unpin(&connection->base);
+    }
+    adapter_schedule(adapter);
+}
+
+static void adapter_scheduler_drain(msquic_provider* adapter) {
+    for (;;) {
+        adapter_connection* connection = NULL;
+        adapter_pending_connection* pending_node = NULL;
+        HQUIC handle = NULL;
+        bool release_queue_ref = false;
+        bool configure = false;
+
+        pthread_mutex_lock(&adapter->mutex);
+        pending_node = adapter->pending_connection_head;
+        if (pending_node == NULL) {
+            pthread_mutex_unlock(&adapter->mutex);
+            break;
+        }
+        connection = pending_node->connection;
+        if (adapter->state == TREVRPC_ENGINE_STATE_RUNNING && adapter->connection_handshakes_in_flight == 0 &&
+            connection != NULL && !connection->base.terminal_published &&
+            !atomic_load_explicit(&connection->base.closing, memory_order_acquire) && connection->base.handle != NULL) {
+            pending_node = remove_connection_queue_locked(adapter, connection, &release_queue_ref);
+            connection->accept_queue_ref_held = release_queue_ref;
+            connection->handshake_in_flight = true;
+            adapter->connection_handshakes_in_flight++;
+            handle = connection->base.handle;
+            configure = true;
+        } else if (adapter->state == TREVRPC_ENGINE_STATE_RUNNING && adapter->connection_handshakes_in_flight != 0) {
+            pthread_mutex_unlock(&adapter->mutex);
+            break;
+        } else {
+            pending_node = remove_connection_queue_locked(adapter, connection, &release_queue_ref);
+            if (connection != NULL) {
+                atomic_store_explicit(&connection->base.closing, true, memory_order_release);
+                if (!connection->base.ready) {
+                    connection->base.cancel_requested = true;
+                }
+                handle = connection->base.handle;
+            }
+        }
+        pthread_mutex_unlock(&adapter->mutex);
+
+        free(pending_node);
+        if (!configure) {
+            if (handle != NULL) {
+                adapter->api->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+            }
+            if (release_queue_ref && connection != NULL) {
+                adapter_object_unpin(&connection->base);
+            }
+            continue;
+        }
+
+        QUIC_STATUS status = adapter->api->ConnectionSetConfiguration(handle, connection->base.endpoint->configuration);
+        if (QUIC_FAILED(status)) {
+            pthread_mutex_lock(&adapter->mutex);
+            connection->transport_error = (uint64_t)(uint32_t)status;
+            atomic_store_explicit(&connection->base.closing, true, memory_order_release);
+            pthread_mutex_unlock(&adapter->mutex);
+            adapter->api->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        }
+        complete_connection_handshake(connection);
+        return;
+    }
+
+    for (uint32_t slot = adapter->connection_begin; slot < adapter->stream_begin; slot++) {
+        adapter_connection* connection = NULL;
+        pthread_mutex_lock(&adapter->mutex);
+        adapter_object* object = adapter->slots[slot].object;
+        if (adapter->state == TREVRPC_ENGINE_STATE_RUNNING && object != NULL &&
+            object->kind == TREVRPC_ENGINE_OBJECT_CONNECTION) {
+            connection = (adapter_connection*)object;
+            if (!connection->base.ready || connection->base.terminal_published ||
+                atomic_load_explicit(&connection->base.closing, memory_order_acquire) ||
+                connection->pending_peer_stream_head == NULL) {
+                connection = NULL;
+            } else {
+                connection->base.active_operations++;
+            }
+        }
+        pthread_mutex_unlock(&adapter->mutex);
+        if (connection != NULL) {
+            promote_peer_streams(connection);
+            adapter_object_unpin(&connection->base);
+        }
+    }
+
+    for (;;) {
+        adapter_stream* stream = NULL;
+        adapter_send* send = NULL;
+        HQUIC handle = NULL;
+        pthread_mutex_lock(&adapter->mutex);
+        stream = adapter->send_ready_head;
+        if (stream != NULL) {
+            adapter->send_ready_head = stream->send_scheduler_next;
+            if (adapter->send_ready_head == NULL)
+                adapter->send_ready_tail = NULL;
+            stream->send_scheduler_next = NULL;
+            stream->send_scheduler_queued = false;
+            stream->base.active_operations++;
+            pthread_mutex_lock(&stream->mutex);
+            if (adapter->state == TREVRPC_ENGINE_STATE_RUNNING && stream->base.handle != NULL &&
+                !stream->base.terminal_published && !stream->base.shutdown_complete &&
+                !atomic_load_explicit(&stream->base.closing, memory_order_acquire)) {
+                for (adapter_send* pending = stream->pending_sends; pending != NULL; pending = pending->next) {
+                    if (!pending->submitted) {
+                        send = pending;
+                        pending->submitted = true;
+                        handle = stream->base.handle;
+                        break;
+                    }
+                }
+                if (send != NULL) {
+                    for (adapter_send* pending = send->next; pending != NULL; pending = pending->next) {
+                        if (!pending->submitted) {
+                            queue_stream_locked(adapter, stream);
+                            break;
+                        }
+                    }
+                }
+            }
+            pthread_mutex_unlock(&stream->mutex);
+        }
+        pthread_mutex_unlock(&adapter->mutex);
+        if (stream == NULL)
+            break;
+        if (send == NULL) {
+            cancel_unsent_sends(stream, -ECANCELED);
+            adapter_object_unpin(&stream->base);
+            continue;
+        }
+
+        int pin_result = trevrpc_engine_provider_operation_pin(adapter->engine);
+        if (pin_result != 0) {
+            bool complete = false;
+            uint64_t operation_id = send->operation_id;
+            trevrpc_engine_reservation* reservation = NULL;
+            pthread_mutex_lock(&stream->send_gate);
+            if (!atomic_exchange_explicit(&send->completed, true, memory_order_acq_rel)) {
+                reservation = send->completion_reservation;
+                send->completion_reservation = NULL;
+                complete = send_operation_release(send);
+            }
+            pthread_mutex_unlock(&stream->send_gate);
+            if (complete) {
+                (void)publish_reserved_event(adapter,
+                    reservation,
+                    TREVRPC_ENGINE_EVENT_SEND_COMPLETE,
+                    stream->base.event_flags,
+                    pin_result,
+                    TREVRPC_ENGINE_OBJECT_STREAM,
+                    stream->base.token,
+                    stream->parent,
+                    operation_id,
+                    0,
+                    0,
+                    NULL);
+                release_send_operation_id(stream, operation_id);
+                free(send->data);
+                free(send);
+            }
+            if (stream_shutdown_drained(stream))
+                publish_stream_terminal(stream, false, 0);
+            adapter_object_unpin(&stream->base);
+            continue;
+        }
+
+        QUIC_STATUS status = adapter->api->StreamSend == NULL
+                                 ? QUIC_STATUS_ABORTED
+                                 : adapter->api->StreamSend(handle, &send->buffer, 1, QUIC_SEND_FLAG_NONE, send);
+        if (QUIC_FAILED(status)) {
+            bool complete = false;
+            uint64_t operation_id = send->operation_id;
+            trevrpc_engine_reservation* reservation = NULL;
+            pthread_mutex_lock(&stream->send_gate);
+            if (!atomic_exchange_explicit(&send->completed, true, memory_order_acq_rel)) {
+                reservation = send->completion_reservation;
+                send->completion_reservation = NULL;
+                complete = send_operation_release(send);
+            }
+            pthread_mutex_unlock(&stream->send_gate);
+            if (complete) {
+                (void)publish_reserved_event(adapter,
+                    reservation,
+                    TREVRPC_ENGINE_EVENT_SEND_COMPLETE,
+                    stream->base.event_flags,
+                    -EIO,
+                    TREVRPC_ENGINE_OBJECT_STREAM,
+                    stream->base.token,
+                    stream->parent,
+                    operation_id,
+                    0,
+                    0,
+                    NULL);
+                release_send_operation_id(stream, operation_id);
+                free(send->data);
+                free(send);
+            }
+            trevrpc_engine_provider_operation_unpin(adapter->engine);
+            if (stream_shutdown_drained(stream))
+                publish_stream_terminal(stream, false, 0);
+        }
+        adapter_object_unpin(&stream->base);
+    }
+}
+
+static bool reserve_peer_stream_admission(msquic_provider* adapter, adapter_connection* connection) {
+    pthread_mutex_lock(&adapter->mutex);
+    bool available = adapter->state == TREVRPC_ENGINE_STATE_RUNNING && !connection->base.terminal_published &&
+                     !atomic_load_explicit(&connection->base.closing, memory_order_acquire) &&
+                     adapter->stream_budget_used < adapter->stream_capacity &&
+                     adapter->pending_stream_count < adapter->stream_capacity &&
+                     connection->pending_peer_stream_count < adapter->stream_capacity;
+    if (available) {
+        adapter->stream_budget_used++;
+        adapter->pending_stream_count++;
+        connection->pending_peer_stream_count++;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    return available;
+}
+
+static void release_peer_stream_pending(msquic_provider* adapter, adapter_connection* connection) {
+    pthread_mutex_lock(&adapter->mutex);
+    if (adapter->pending_stream_count > 0) {
+        adapter->pending_stream_count--;
+    }
+    if (connection->pending_peer_stream_count > 0) {
+        connection->pending_peer_stream_count--;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+}
+
+static void release_stream_budget(msquic_provider* adapter) {
+    pthread_mutex_lock(&adapter->mutex);
+    if (adapter->stream_budget_used > 0) {
+        adapter->stream_budget_used--;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    adapter_schedule(adapter);
+}
+
+static adapter_pending_stream* remove_peer_stream_queue_locked(
+    msquic_provider* adapter, adapter_connection* connection, adapter_stream* stream, bool* release_queue_ref) {
+    adapter_pending_stream* node = stream->pending_peer_node;
+    if (release_queue_ref != NULL) {
+        *release_queue_ref = stream->peer_queue_ref_held;
+    }
+    stream->peer_queue_ref_held = false;
+    stream->pending_peer_node = NULL;
+    stream->on_peer_queue = false;
+    if (node == NULL) {
+        return NULL;
+    }
+    adapter_pending_stream** link = &connection->pending_peer_stream_head;
+    while (*link != NULL && *link != node) {
+        link = &(*link)->next;
+    }
+    if (*link != node) {
+        return NULL;
+    }
+    *link = node->next;
+    if (connection->pending_peer_stream_tail == node) {
+        connection->pending_peer_stream_tail = NULL;
+        for (adapter_pending_stream* pending = connection->pending_peer_stream_head; pending != NULL;
+            pending = pending->next) {
+            connection->pending_peer_stream_tail = pending;
+        }
+    }
+    if (connection->pending_peer_stream_count > 0) {
+        connection->pending_peer_stream_count--;
+    }
+    if (adapter->pending_stream_count > 0) {
+        adapter->pending_stream_count--;
+    }
+    return node;
+}
+
+static void promote_peer_streams(adapter_connection* connection) {
+    msquic_provider* adapter = connection->base.adapter;
+    for (;;) {
+        adapter_stream* stream = NULL;
+        adapter_pending_stream* pending_node = NULL;
+        bool release_queue_ref = false;
+        pthread_mutex_lock(&adapter->mutex);
+        if (adapter->state != TREVRPC_ENGINE_STATE_RUNNING || !connection->base.ready ||
+            connection->base.terminal_published ||
+            atomic_load_explicit(&connection->base.closing, memory_order_acquire)) {
+            pthread_mutex_unlock(&adapter->mutex);
+            return;
+        }
+        pending_node = connection->pending_peer_stream_head;
+        if (pending_node == NULL || pending_node->stream == NULL) {
+            pthread_mutex_unlock(&adapter->mutex);
+            return;
+        }
+        stream = pending_node->stream;
+        pending_node = remove_peer_stream_queue_locked(adapter, connection, stream, &release_queue_ref);
+        pthread_mutex_unlock(&adapter->mutex);
+        free(pending_node);
+
+        int ready_result = publish_stream_ready(stream);
+        if (ready_result != 0) {
+            /* Keep the native handle before terminal publication may take ownership of it. */
+            HQUIC stream_handle = stream->base.handle;
+            publish_stream_terminal(stream, true, ready_result == -ECANCELED ? -ECANCELED : ready_result);
+            if (ready_result != -ECANCELED) {
+                adapter_fail_stop(adapter, ready_result, "peer stream readiness publication failed");
+            }
+            if (stream_handle != NULL) {
+                adapter->api->StreamShutdown(stream_handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
+        if (release_queue_ref) {
+            adapter_object_unpin(&stream->base);
+        }
+    }
+}
+
 static QUIC_STATUS QUIC_API adapter_listener_callback(HQUIC handle, void* context, QUIC_LISTENER_EVENT* event) {
     (void)handle;
     adapter_listener* listener = context;
@@ -2109,25 +3219,30 @@ static QUIC_STATUS QUIC_API adapter_listener_callback(HQUIC handle, void* contex
     QUIC_STATUS result = QUIC_STATUS_SUCCESS;
     switch (event->Type) {
     case QUIC_LISTENER_EVENT_NEW_CONNECTION: {
-        pthread_mutex_lock(&adapter->mutex);
-        bool closing = atomic_load_explicit(&listener->base.closing, memory_order_acquire) ||
-                       adapter->state != TREVRPC_ENGINE_STATE_RUNNING;
-        pthread_mutex_unlock(&adapter->mutex);
-        if (closing) {
+        /* Reserve the provider budget before allocating or taking ownership of the native handle. */
+        if (!reserve_connection_admission(adapter, listener)) {
             result = QUIC_STATUS_ABORTED;
             break;
         }
         adapter_connection* connection = calloc(1, sizeof(*connection));
-        if (connection == NULL) {
+        adapter_pending_connection* node = connection == NULL ? NULL : calloc(1, sizeof(*node));
+        if (connection == NULL || node == NULL) {
+            free(node);
+            free(connection);
+            release_connection_admission(adapter);
             result = QUIC_STATUS_OUT_OF_MEMORY;
             break;
         }
         atomic_init(&connection->base.closing, false);
         connection->base.endpoint = listener->base.endpoint;
         endpoint_retain(connection->base.endpoint);
-        connection->base.handle = event->NEW_CONNECTION.Connection;
+        connection->max_pending_send_count =
+            limit_product(connection->base.endpoint->max_pending_send_count, adapter->stream_capacity);
+        connection->max_pending_send_bytes =
+            limit_product(connection->base.endpoint->max_pending_send_bytes, adapter->stream_capacity);
         connection->base.event_flags = TREVRPC_ENGINE_EVENT_FLAG_SERVER;
         connection->parent = listener->base.token;
+        connection->admission_granted = true;
         trevrpc_engine_handle_v1 token;
         int add_result =
             trevrpc_engine_provider_reserve_mandatory(adapter->engine, &connection->base.ready_reservation);
@@ -2142,29 +3257,65 @@ static QUIC_STATUS QUIC_API adapter_listener_callback(HQUIC handle, void* contex
             trevrpc_engine_provider_cancel_reservation(adapter->engine, connection->base.terminal_reservation);
             trevrpc_engine_provider_cancel_reservation(adapter->engine, connection->base.ready_reservation);
             endpoint_free(connection->base.endpoint);
+            free(node);
             free(connection);
-            result = QUIC_STATUS_OUT_OF_MEMORY;
+            release_connection_admission(adapter);
+            result = normalize_accept_failure(add_result);
             break;
         }
+
+        node->connection = connection;
+        pthread_mutex_lock(&adapter->mutex);
+        if (!adapter->accept_admission_open || adapter->state != TREVRPC_ENGINE_STATE_RUNNING ||
+            atomic_load_explicit(&listener->base.closing, memory_order_acquire)) {
+            pthread_mutex_unlock(&adapter->mutex);
+            connection->base.handle = NULL;
+            registry_remove_unstarted(&connection->base);
+            free(node);
+            result = QUIC_STATUS_ABORTED;
+            break;
+        }
+        node->next = NULL;
+        if (adapter->pending_connection_tail != NULL) {
+            adapter->pending_connection_tail->next = node;
+        } else {
+            adapter->pending_connection_head = node;
+        }
+        adapter->pending_connection_tail = node;
+        adapter->pending_connection_count++;
+        connection->pending_accept_node = node;
+        connection->on_accept_queue = true;
+        connection->accept_queue_ref_held = true;
+        connection->base.active_operations++;
+        connection->base.active_operations++;
+        connection->construction_ref_held = true;
+        pthread_mutex_unlock(&adapter->mutex);
+
         adapter->api->SetCallbackHandler(
             event->NEW_CONNECTION.Connection, (void*)adapter_connection_callback, connection);
-        QUIC_STATUS status = adapter->api->ConnectionSetConfiguration(
-            event->NEW_CONNECTION.Connection, listener->base.endpoint->configuration);
-        if (QUIC_FAILED(status)) {
-            pthread_mutex_lock(&adapter->mutex);
-            connection->transport_error = (uint64_t)(uint32_t)status;
-            atomic_store_explicit(&connection->base.closing, true, memory_order_release);
-            pthread_mutex_unlock(&adapter->mutex);
-            result = status;
+        bool close_requested = object_publish_handle(&connection->base, event->NEW_CONNECTION.Connection);
+        if (close_requested) {
+            adapter->api->ConnectionShutdown(event->NEW_CONNECTION.Connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        } else {
+            adapter_schedule(adapter);
         }
+        pthread_mutex_lock(&adapter->mutex);
+        bool release_construction = connection->construction_ref_held;
+        connection->construction_ref_held = false;
+        pthread_mutex_unlock(&adapter->mutex);
+        if (release_construction)
+            adapter_object_unpin(&connection->base);
         break;
     }
-    case QUIC_LISTENER_EVENT_STOP_COMPLETE:
+    case QUIC_LISTENER_EVENT_STOP_COMPLETE: {
         pthread_mutex_lock(&adapter->mutex);
         listener->base.shutdown_complete = true;
+        adapter_pending_connection* pending = detach_pending_connections_locked(adapter, listener->base.token, true);
         pthread_mutex_unlock(&adapter->mutex);
+        drain_detached_connections(adapter, pending);
         publish_listener_terminal(listener);
         break;
+    }
     default:
         break;
     }
@@ -2176,10 +3327,13 @@ static QUIC_STATUS QUIC_API adapter_connection_callback(HQUIC handle, void* cont
     adapter_connection* connection = context;
     msquic_provider* adapter = connection->base.adapter;
     if (!callback_enter(adapter, &connection->base)) {
+        complete_connection_handshake(connection);
         return QUIC_STATUS_ABORTED;
     }
+    QUIC_STATUS result = QUIC_STATUS_SUCCESS;
     switch (event->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED: {
+        complete_connection_handshake(connection);
         pthread_mutex_lock(&adapter->mutex);
         bool canceled = connection->base.cancel_requested && !connection->base.ready;
         pthread_mutex_unlock(&adapter->mutex);
@@ -2193,46 +3347,87 @@ static QUIC_STATUS QUIC_API adapter_connection_callback(HQUIC handle, void* cont
         break;
     }
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
+        if (!reserve_peer_stream_admission(adapter, connection)) {
+            result = QUIC_STATUS_ABORTED;
+            break;
+        }
+        adapter_pending_stream* node = calloc(1, sizeof(*node));
+        if (node == NULL) {
+            release_stream_budget(adapter);
+            release_peer_stream_pending(adapter, connection);
+            result = QUIC_STATUS_OUT_OF_MEMORY;
+            break;
+        }
         trevrpc_engine_handle_v1 token;
+        int allocation_result = 0;
         adapter_stream* stream = stream_alloc(connection,
-            event->PEER_STREAM_STARTED.Stream,
+            NULL,
             0,
             connection->base.event_flags | TREVRPC_ENGINE_EVENT_FLAG_PEER,
+            true,
             NULL,
             NULL,
             &token,
-            NULL);
+            &allocation_result);
         if (stream == NULL) {
-            callback_leave(adapter, &connection->base);
-            return QUIC_STATUS_OUT_OF_MEMORY;
+            release_stream_budget(adapter);
+            release_peer_stream_pending(adapter, connection);
+            free(node);
+            result = normalize_accept_failure(allocation_result);
+            break;
         }
+        node->stream = stream;
+        pthread_mutex_lock(&adapter->mutex);
+        stream->base.active_operations++;
+        stream->construction_ref_held = true;
+        node->next = NULL;
+        if (connection->pending_peer_stream_tail != NULL) {
+            connection->pending_peer_stream_tail->next = node;
+        } else {
+            connection->pending_peer_stream_head = node;
+        }
+        connection->pending_peer_stream_tail = node;
+        stream->pending_peer_node = node;
+        stream->on_peer_queue = true;
+        pthread_mutex_unlock(&adapter->mutex);
+
         adapter->api->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream, (void*)adapter_stream_callback, stream);
-        int ready_result = publish_stream_ready(stream);
-        if (ready_result != 0) {
-            publish_stream_terminal(stream, true, ready_result == -ECANCELED ? -ECANCELED : ready_result);
-            if (ready_result != -ECANCELED) {
-                adapter_fail_stop(adapter, ready_result, "peer stream readiness publication failed");
-            }
+        bool close_requested = object_publish_handle(&stream->base, event->PEER_STREAM_STARTED.Stream);
+        if (close_requested) {
             adapter->api->StreamShutdown(event->PEER_STREAM_STARTED.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        } else {
+            adapter_schedule(adapter);
         }
+        pthread_mutex_lock(&adapter->mutex);
+        bool release_construction = stream->construction_ref_held;
+        stream->construction_ref_held = false;
+        pthread_mutex_unlock(&adapter->mutex);
+        if (release_construction)
+            adapter_object_unpin(&stream->base);
         break;
     }
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
         pthread_mutex_lock(&adapter->mutex);
         connection->transport_error = (uint64_t)(uint32_t)event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status;
         pthread_mutex_unlock(&adapter->mutex);
+        complete_connection_handshake(connection);
         break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
         pthread_mutex_lock(&adapter->mutex);
         connection->application_error = event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode;
         pthread_mutex_unlock(&adapter->mutex);
+        complete_connection_handshake(connection);
         break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
+        complete_connection_handshake(connection);
         pthread_mutex_lock(&adapter->mutex);
         connection->base.shutdown_complete = true;
         bool no_children = connection->live_streams == 0;
+        bool has_pending_streams = connection->pending_peer_stream_head != NULL;
         pthread_mutex_unlock(&adapter->mutex);
-        if (no_children) {
+        if (has_pending_streams) {
+            drain_detached_connection(adapter, connection, false, 0);
+        } else if (no_children) {
             publish_connection_terminal(connection);
         }
         break;
@@ -2240,8 +3435,9 @@ static QUIC_STATUS QUIC_API adapter_connection_callback(HQUIC handle, void* cont
     default:
         break;
     }
+    complete_connection_handshake(connection);
     callback_leave(adapter, &connection->base);
-    return QUIC_STATUS_SUCCESS;
+    return result;
 }
 
 static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context, QUIC_STREAM_EVENT* event) {
@@ -2330,14 +3526,20 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
     }
     case QUIC_STREAM_EVENT_SEND_COMPLETE: {
         adapter_send* send = event->SEND_COMPLETE.ClientContext;
-        if (send == NULL || atomic_exchange_explicit(&send->completed, true, memory_order_acq_rel)) {
+        if (send == NULL) {
             break;
         }
         int status = event->SEND_COMPLETE.Canceled != FALSE ? -ECANCELED : 0;
+        pthread_mutex_lock(&stream->send_gate);
+        if (atomic_exchange_explicit(&send->completed, true, memory_order_acq_rel)) {
+            pthread_mutex_unlock(&stream->send_gate);
+            break;
+        }
+        uint64_t operation_id = send->operation_id;
         trevrpc_engine_reservation* reservation = send->completion_reservation;
         send->completion_reservation = NULL;
-        pthread_mutex_lock(&stream->send_gate);
-        (void)send_operation_release(send, true);
+        (void)send_operation_release(send);
+        pthread_mutex_unlock(&stream->send_gate);
         (void)publish_reserved_event(adapter,
             reservation,
             TREVRPC_ENGINE_EVENT_SEND_COMPLETE,
@@ -2346,11 +3548,11 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
             TREVRPC_ENGINE_OBJECT_STREAM,
             stream->base.token,
             stream->parent,
-            send->operation_id,
+            operation_id,
             0,
             0,
             NULL);
-        pthread_mutex_unlock(&stream->send_gate);
+        release_send_operation_id(stream, operation_id);
         free(send->data);
         free(send);
         trevrpc_engine_provider_operation_unpin(adapter->engine);
@@ -2372,6 +3574,7 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
         pthread_mutex_lock(&adapter->mutex);
         stream->base.shutdown_complete = true;
         pthread_mutex_unlock(&adapter->mutex);
+        cancel_unsent_sends(stream, -ECANCELED);
         if (stream_shutdown_drained(stream)) {
             publish_stream_terminal(stream, false, 0);
         }
@@ -2432,12 +3635,38 @@ static int provider_stream_abort(
     }
     ADAPTER_OBJECT_SCOPE(object);
     adapter_stream* stream = (adapter_stream*)object;
+    adapter_pending_stream* pending = NULL;
+    bool release_queue_ref = false;
     pthread_mutex_lock(&adapter->mutex);
     bool invoke = !atomic_exchange_explicit(&object->closing, true, memory_order_acq_rel);
     stream->application_error = application_error_code;
     HQUIC handle = object->handle;
+    adapter_connection* connection = NULL;
+    if (stream->parent.slot < adapter->slot_count) {
+        adapter_slot* parent_slot = &adapter->slots[stream->parent.slot];
+        if (parent_slot->object != NULL && parent_slot->kind == TREVRPC_ENGINE_OBJECT_CONNECTION &&
+            parent_slot->generation == stream->parent.generation) {
+            connection = (adapter_connection*)parent_slot->object;
+        }
+    }
+    if (connection != NULL && stream->on_peer_queue) {
+        pending = remove_peer_stream_queue_locked(adapter, connection, stream, &release_queue_ref);
+    }
+    if (pending != NULL && handle == NULL) {
+        stream->base.shutdown_complete = true;
+    }
     pthread_mutex_unlock(&adapter->mutex);
-    if (invoke && handle != NULL) {
+    cancel_unsent_sends(stream, -ECANCELED);
+    if (pending != NULL) {
+        free(pending);
+        publish_stream_terminal(stream, true, -ECANCELED);
+        if (invoke && handle != NULL && stream->base.handle == handle) {
+            adapter->api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, application_error_code);
+        }
+        if (release_queue_ref) {
+            adapter_object_unpin(&stream->base);
+        }
+    } else if (invoke && handle != NULL) {
         adapter->api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, application_error_code);
     }
     return 0;
@@ -2462,6 +3691,8 @@ static int provider_connection_close(
     }
     ADAPTER_OBJECT_SCOPE(object);
     adapter_connection* connection = (adapter_connection*)object;
+    adapter_pending_connection* pending = NULL;
+    bool release_queue_ref = false;
     pthread_mutex_lock(&adapter->mutex);
     bool invoke = !atomic_exchange_explicit(&object->closing, true, memory_order_acq_rel);
     if (!object->ready) {
@@ -2469,8 +3700,16 @@ static int provider_connection_close(
     }
     connection->application_error = application_error_code;
     HQUIC handle = object->handle;
+    pending = remove_connection_queue_locked(adapter, connection, &release_queue_ref);
+    bool drain_children = pending != NULL || release_queue_ref || connection->pending_peer_stream_head != NULL;
+    if (pending != NULL) {
+        pending->release_queue_ref = release_queue_ref;
+    }
     pthread_mutex_unlock(&adapter->mutex);
-    if (invoke && handle != NULL) {
+    if (drain_children) {
+        drain_detached_connection(adapter, connection, release_queue_ref, application_error_code);
+        free(pending);
+    } else if (invoke && handle != NULL) {
         adapter->api->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, application_error_code);
     }
     return 0;
@@ -2489,13 +3728,16 @@ static int provider_listener_close(msquic_provider* adapter, trevrpc_engine_hand
         return result;
     }
     ADAPTER_OBJECT_SCOPE(object);
+    adapter_pending_connection* pending = NULL;
     pthread_mutex_lock(&adapter->mutex);
     bool invoke = !atomic_exchange_explicit(&object->closing, true, memory_order_acq_rel);
     HQUIC handle = object->handle;
+    pending = detach_pending_connections_locked(adapter, object->token, true);
     pthread_mutex_unlock(&adapter->mutex);
     if (invoke && handle != NULL) {
         adapter->api->ListenerStop(handle);
     }
+    drain_detached_connections(adapter, pending);
     return 0;
 }
 
@@ -2503,16 +3745,21 @@ static int provider_close(msquic_provider* adapter) {
     if (adapter == NULL) {
         return -EINVAL;
     }
+    adapter_pending_connection* pending = NULL;
     pthread_mutex_lock(&adapter->mutex);
     if (adapter->state == TREVRPC_ENGINE_STATE_RUNNING) {
         adapter->state = TREVRPC_ENGINE_STATE_STOPPING;
+        adapter->accept_admission_open = false;
     }
     if (adapter->close_initiated || adapter->state >= TREVRPC_ENGINE_STATE_STOPPED) {
         pthread_mutex_unlock(&adapter->mutex);
         return 0;
     }
     adapter->close_initiated = true;
+    pending = detach_pending_connections_locked(adapter, (trevrpc_engine_handle_v1){0}, false);
     pthread_mutex_unlock(&adapter->mutex);
+    drain_detached_connections(adapter, pending);
+    adapter_schedule(adapter);
 
     for (uint32_t index = 0; index < adapter->slot_count; index++) {
         pthread_mutex_lock(&adapter->mutex);
@@ -2563,6 +3810,85 @@ static void adapter_object_free(adapter_object* object) {
         return;
     }
     msquic_provider* adapter = object->adapter;
+    adapter_pending_connection* pending_connection = NULL;
+    adapter_pending_stream* pending_streams = NULL;
+    bool schedule = false;
+    pthread_mutex_lock(&adapter->mutex);
+    if (object->kind == TREVRPC_ENGINE_OBJECT_CONNECTION) {
+        adapter_connection* connection = (adapter_connection*)object;
+        bool release_queue_ref = false;
+        pending_connection = remove_connection_queue_locked(adapter, connection, &release_queue_ref);
+        if (pending_connection != NULL) {
+            pending_connection->release_queue_ref = release_queue_ref;
+        }
+        pending_streams = detach_pending_streams_locked(adapter, connection);
+        if (release_queue_ref && object->active_operations > 0) {
+            object->active_operations--;
+        }
+        if (connection->admission_granted) {
+            connection->admission_granted = false;
+            if (adapter->connection_budget_used > 0) {
+                adapter->connection_budget_used--;
+            }
+            schedule = true;
+        }
+        for (adapter_pending_stream* node = pending_streams; node != NULL; node = node->next) {
+            if (node->release_queue_ref != 0 && node->stream != NULL && node->stream->base.active_operations > 0) {
+                node->stream->base.active_operations--;
+            }
+            if (node->stream != NULL && node->stream->stream_admission_granted) {
+                node->stream->stream_admission_granted = false;
+                if (adapter->stream_budget_used > 0) {
+                    adapter->stream_budget_used--;
+                }
+                schedule = true;
+            }
+        }
+    } else if (object->kind == TREVRPC_ENGINE_OBJECT_STREAM) {
+        adapter_stream* stream = (adapter_stream*)object;
+        unqueue_stream_locked(adapter, stream);
+        if (stream->on_peer_queue || stream->pending_peer_node != NULL) {
+            adapter_connection* connection = NULL;
+            if (stream->parent.slot < adapter->slot_count) {
+                adapter_slot* parent_slot = &adapter->slots[stream->parent.slot];
+                if (parent_slot->object != NULL && parent_slot->kind == TREVRPC_ENGINE_OBJECT_CONNECTION &&
+                    parent_slot->generation == stream->parent.generation) {
+                    connection = (adapter_connection*)parent_slot->object;
+                }
+            }
+            if (connection != NULL) {
+                bool release_queue_ref = false;
+                adapter_pending_stream* node =
+                    remove_peer_stream_queue_locked(adapter, connection, stream, &release_queue_ref);
+                free(node);
+                if (release_queue_ref && object->active_operations > 0) {
+                    object->active_operations--;
+                }
+            } else if (stream->peer_queue_ref_held && object->active_operations > 0) {
+                stream->peer_queue_ref_held = false;
+                object->active_operations--;
+            }
+            stream->on_peer_queue = false;
+            stream->pending_peer_node = NULL;
+        }
+        if (stream->stream_admission_granted) {
+            stream->stream_admission_granted = false;
+            if (adapter->stream_budget_used > 0) {
+                adapter->stream_budget_used--;
+            }
+            schedule = true;
+        }
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    free(pending_connection);
+    while (pending_streams != NULL) {
+        adapter_pending_stream* node = pending_streams;
+        pending_streams = node->next;
+        free(node);
+    }
+    if (schedule) {
+        adapter_schedule(adapter);
+    }
     trevrpc_engine_provider_cancel_reservation(adapter->engine, object->ready_reservation);
     trevrpc_engine_provider_cancel_reservation(adapter->engine, object->terminal_reservation);
     if (object->kind == TREVRPC_ENGINE_OBJECT_STREAM) {
@@ -2589,6 +3915,8 @@ static void adapter_object_free(adapter_object* object) {
         trevrpc_engine_provider_cancel_reservation(adapter->engine, stream->receive_fin_reservation);
         released_receive_credit |= stream->parser_receive_allocation != NULL;
         trevrpc_frame_parser_reset(&stream->parser);
+        free(stream->pending_operation_ids);
+        stream->pending_operation_ids = NULL;
         pthread_mutex_unlock(&stream->mutex);
         if (released_receive_credit) {
             resume_paused_receives(adapter);
@@ -2611,6 +3939,21 @@ static void provider_destroy(msquic_provider* adapter) {
         return;
     }
     pthread_mutex_lock(&adapter->mutex);
+    adapter_pending_connection* pending =
+        detach_pending_connections_locked(adapter, (trevrpc_engine_handle_v1){0}, false);
+    pthread_mutex_unlock(&adapter->mutex);
+    discard_detached_connections(adapter, pending);
+    if (adapter->scheduler_condition_initialized) {
+        pthread_mutex_lock(&adapter->mutex);
+        adapter->scheduler_stop = true;
+        pthread_cond_signal(&adapter->scheduler_condition);
+        pthread_mutex_unlock(&adapter->mutex);
+        if (adapter->scheduler_thread_started) {
+            (void)pthread_join(adapter->scheduler_thread, NULL);
+            adapter->scheduler_thread_started = false;
+        }
+    }
+    pthread_mutex_lock(&adapter->mutex);
     adapter_object* objects = adapter->retired_objects;
     adapter->retired_objects = NULL;
     for (uint32_t index = 0; index < adapter->slot_count; index++) {
@@ -2630,6 +3973,9 @@ static void provider_destroy(msquic_provider* adapter) {
     }
     const QUIC_API_TABLE* api = adapter->api;
     free(adapter->slots);
+    if (adapter->scheduler_condition_initialized) {
+        pthread_cond_destroy(&adapter->scheduler_condition);
+    }
     pthread_mutex_destroy(&adapter->budget_mutex);
     pthread_mutex_destroy(&adapter->mutex);
     free(adapter);
@@ -2785,12 +4131,25 @@ int trevrpc_engine_msquic_create_v1(const trevrpc_engine_config_v1* engine_confi
         trevrpc_msquic_api_owner_release(api);
         return -pthread_result;
     }
+    pthread_result = pthread_cond_init(&adapter->scheduler_condition, NULL);
+    if (pthread_result != 0) {
+        pthread_mutex_destroy(&adapter->budget_mutex);
+        pthread_mutex_destroy(&adapter->mutex);
+        free(adapter->slots);
+        free(adapter);
+        trevrpc_msquic_api_owner_release(api);
+        return -pthread_result;
+    }
+    adapter->scheduler_condition_initialized = true;
     adapter->api = api;
     adapter->state = TREVRPC_ENGINE_STATE_RUNNING;
     adapter->slot_count = (uint32_t)slot_count64 + 1u;
     adapter->listener_begin = 1u;
     adapter->connection_begin = 1u + engine_config->listener_capacity;
     adapter->stream_begin = 1u + engine_config->listener_capacity + engine_config->connection_capacity;
+    adapter->connection_capacity = engine_config->connection_capacity;
+    adapter->stream_capacity = engine_config->stream_capacity;
+    adapter->accept_admission_open = true;
     adapter->max_receive_owned_count = engine_config->max_receive_owned_count;
     adapter->max_receive_owned_bytes = engine_config->max_receive_owned_bytes;
     pthread_mutex_lock(&AdapterOwnerMutex);
@@ -2799,5 +4158,16 @@ int trevrpc_engine_msquic_create_v1(const trevrpc_engine_config_v1* engine_confi
         adapter->owner = AdapterNextOwner++;
     }
     pthread_mutex_unlock(&AdapterOwnerMutex);
+    pthread_result = pthread_create(&adapter->scheduler_thread, NULL, adapter_scheduler_main, adapter);
+    if (pthread_result != 0) {
+        pthread_cond_destroy(&adapter->scheduler_condition);
+        pthread_mutex_destroy(&adapter->budget_mutex);
+        pthread_mutex_destroy(&adapter->mutex);
+        free(adapter->slots);
+        free(adapter);
+        trevrpc_msquic_api_owner_release(api);
+        return -pthread_result;
+    }
+    adapter->scheduler_thread_started = true;
     return trevrpc_engine_provider_create_v1(engine_config, &MsQuicProviderOps, adapter, adapter->owner, out_engine);
 }

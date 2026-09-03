@@ -33,30 +33,12 @@ static trevrpc_wt_capsule_parse_result trevrpc_wt_capsule_fail(
     return failure;
 }
 
-static void trevrpc_wt_capsule_reset_varint(trevrpc_wt_capsule_parser* parser) {
-    parser->varint_have = 0;
-    parser->varint_need = 0;
-}
-
-static bool trevrpc_wt_capsule_read_varint(
+static int trevrpc_wt_capsule_read_varint(
     trevrpc_wt_capsule_parser* parser, const uint8_t* data, size_t data_len, size_t* offset, uint64_t* value) {
-    if (parser->varint_have == 0 && *offset < data_len) {
-        parser->varint_need = (uint8_t)trevrpc_quic_varint_size_from_first(data[*offset]);
-    }
-    while (parser->varint_have < parser->varint_need && *offset < data_len) {
-        parser->varint_bytes[parser->varint_have++] = data[(*offset)++];
-    }
-    if (parser->varint_have != parser->varint_need || parser->varint_need == 0) {
-        return false;
-    }
-
-    size_t varint_offset = 0;
-    int err = trevrpc_quic_varint_read(parser->varint_bytes, parser->varint_need, &varint_offset, value);
-    if (err != 0 || varint_offset != parser->varint_need) {
-        return false;
-    }
-    trevrpc_wt_capsule_reset_varint(parser);
-    return true;
+    size_t consumed = 0;
+    int result = trevrpc_quic_varint_feed(&parser->varint, data + *offset, data_len - *offset, &consumed, value);
+    *offset += consumed;
+    return result;
 }
 
 static bool trevrpc_wt_capsule_valid_utf8(const uint8_t* data, size_t len) {
@@ -374,7 +356,12 @@ trevrpc_wt_capsule_parse_result trevrpc_wt_capsule_parser_feed(trevrpc_wt_capsul
     while (offset < data_len) {
         if (parser->state == TREV_WT_CAPSULE_PARSER_TYPE) {
             uint64_t value = 0;
-            if (!trevrpc_wt_capsule_read_varint(parser, data, data_len, &offset, &value)) {
+            int varint_result = trevrpc_wt_capsule_read_varint(parser, data, data_len, &offset, &value);
+            if (varint_result < 0) {
+                *out_consumed = offset;
+                return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
+            }
+            if (varint_result == 0) {
                 break;
             }
             parser->capsule_type = value;
@@ -384,7 +371,12 @@ trevrpc_wt_capsule_parse_result trevrpc_wt_capsule_parser_feed(trevrpc_wt_capsul
 
         if (parser->state == TREV_WT_CAPSULE_PARSER_LENGTH) {
             uint64_t value = 0;
-            if (!trevrpc_wt_capsule_read_varint(parser, data, data_len, &offset, &value)) {
+            int varint_result = trevrpc_wt_capsule_read_varint(parser, data, data_len, &offset, &value);
+            if (varint_result < 0) {
+                *out_consumed = offset;
+                return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
+            }
+            if (varint_result == 0) {
                 break;
             }
             parser->capsule_length = value;
@@ -421,7 +413,7 @@ trevrpc_wt_capsule_parse_result trevrpc_wt_capsule_parser_feed(trevrpc_wt_capsul
                     *out_consumed = offset;
                     return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
                 }
-                trevrpc_wt_capsule_reset_varint(parser);
+                trevrpc_quic_varint_reset(&parser->varint);
                 parser->state = TREV_WT_CAPSULE_PARSER_NUMERIC_PAYLOAD;
                 continue;
             }
@@ -491,33 +483,53 @@ trevrpc_wt_capsule_parse_result trevrpc_wt_capsule_parser_feed(trevrpc_wt_capsul
         }
 
         if (parser->state == TREV_WT_CAPSULE_PARSER_NUMERIC_PAYLOAD) {
-            if (parser->varint_have == 0 && offset < data_len) {
-                uint8_t first = data[offset++];
-                parser->varint_need = (uint8_t)trevrpc_quic_varint_size_from_first(first);
-                parser->varint_bytes[parser->varint_have++] = first;
-                parser->payload_remaining--;
-                if ((uint64_t)parser->varint_need != parser->capsule_length) {
+            uint64_t maximum = 0;
+            int varint_result = 0;
+            if (parser->varint.have == 0 && offset < data_len) {
+                size_t consumed = 0;
+                varint_result = trevrpc_quic_varint_feed(&parser->varint, data + offset, 1, &consumed, &maximum);
+                parser->payload_remaining -= consumed;
+                offset += consumed;
+                if (varint_result < 0) {
+                    *out_consumed = offset;
+                    return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
+                }
+                if (varint_result == 1) {
+                    if ((uint64_t)consumed != parser->capsule_length) {
+                        *out_consumed = offset;
+                        return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
+                    }
+                } else if ((uint64_t)parser->varint.need != parser->capsule_length) {
                     *out_consumed = offset;
                     return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
                 }
             }
-            while (parser->varint_have < parser->varint_need && parser->varint_have < sizeof(parser->varint_bytes) &&
-                   offset < data_len) {
-                parser->varint_bytes[parser->varint_have++] = data[offset++];
-                parser->payload_remaining--;
+            if (varint_result != 1) {
+                if (parser->payload_remaining == 0) {
+                    *out_consumed = offset;
+                    return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
+                }
+                size_t available = data_len - offset;
+                size_t take = available;
+                if (parser->payload_remaining <= SIZE_MAX && (size_t)parser->payload_remaining < take) {
+                    take = (size_t)parser->payload_remaining;
+                }
+                size_t consumed = 0;
+                varint_result = trevrpc_quic_varint_feed(&parser->varint, data + offset, take, &consumed, &maximum);
+                parser->payload_remaining -= consumed;
+                offset += consumed;
+                if (varint_result < 0) {
+                    *out_consumed = offset;
+                    return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
+                }
             }
             if (parser->payload_remaining != 0) {
                 break;
             }
-
-            size_t varint_offset = 0;
-            uint64_t maximum = 0;
-            if (trevrpc_quic_varint_read(parser->varint_bytes, parser->varint_have, &varint_offset, &maximum) != 0 ||
-                varint_offset != parser->varint_have) {
+            if (varint_result != 1) {
                 *out_consumed = offset;
                 return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
             }
-            trevrpc_wt_capsule_reset_varint(parser);
 
             trevrpc_wt_capsule_event event = {0};
             if (parser->capsule_type == TREV_WT_CAPSULE_MAX_DATA) {
@@ -579,7 +591,7 @@ trevrpc_wt_capsule_parse_result trevrpc_wt_capsule_parser_finish(
     if (parser->state == TREV_WT_CAPSULE_PARSER_CLOSED) {
         return TREV_WT_CAPSULE_PARSE_COMPLETE;
     }
-    if (parser->state != TREV_WT_CAPSULE_PARSER_TYPE || parser->varint_have != 0) {
+    if (parser->state != TREV_WT_CAPSULE_PARSER_TYPE || parser->varint.have != 0) {
         return trevrpc_wt_capsule_fail(parser, TREV_WT_CAPSULE_PARSE_MALFORMED_MESSAGE);
     }
 

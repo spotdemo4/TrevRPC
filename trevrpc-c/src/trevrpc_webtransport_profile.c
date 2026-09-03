@@ -303,7 +303,8 @@ bool trevrpc_wt_profile_accepts_connect_protocol(trevrpc_wt_profile_id profile, 
     if (descriptor == NULL || protocol == NULL) {
         return false;
     }
-    return strcmp(protocol, descriptor->emitted_connect_protocol) == 0;
+    return strcmp(protocol, descriptor->emitted_connect_protocol) == 0 ||
+           (profile == TREV_WT_PROFILE_DRAFT_15 && strcmp(protocol, "webtransport") == 0);
 }
 
 bool trevrpc_wt_profile_requires_draft02_request_marker(trevrpc_wt_profile_id profile) {

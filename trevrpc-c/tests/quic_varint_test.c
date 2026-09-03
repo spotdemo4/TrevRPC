@@ -124,6 +124,46 @@ static int test_nonminimal_encodings(void) {
     return 0;
 }
 
+static int test_incremental_feeder(void) {
+    for (size_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
+        for (size_t split = 0; split <= vectors[i].len; split++) {
+            trevrpc_quic_varint_feeder feeder;
+            trevrpc_quic_varint_reset(&feeder);
+            size_t consumed = SIZE_MAX;
+            uint64_t value = UINT64_MAX;
+
+            if (split != 0) {
+                CHECK(trevrpc_quic_varint_feed(&feeder, vectors[i].bytes, split, &consumed, &value) ==
+                      (split == vectors[i].len ? 1 : 0));
+                CHECK(consumed == split);
+            }
+            if (split < vectors[i].len) {
+                uint8_t suffix[9];
+                memcpy(suffix, vectors[i].bytes + split, vectors[i].len - split);
+                suffix[vectors[i].len - split] = 0xa5;
+                CHECK(trevrpc_quic_varint_feed(&feeder, suffix, vectors[i].len - split + 1, &consumed, &value) == 1);
+                CHECK(consumed == vectors[i].len - split);
+            }
+            CHECK(value == vectors[i].value);
+            CHECK(feeder.have == 0);
+            CHECK(feeder.need == 0);
+        }
+    }
+
+    trevrpc_quic_varint_feeder feeder;
+    trevrpc_quic_varint_reset(&feeder);
+    size_t consumed = SIZE_MAX;
+    uint64_t value = UINT64_MAX;
+    CHECK(trevrpc_quic_varint_feed(&feeder, vectors[0].bytes, 0, &consumed, &value) == 0);
+    CHECK(consumed == 0);
+    CHECK(value == 0);
+    CHECK(trevrpc_quic_varint_feed(NULL, vectors[0].bytes, 1, &consumed, &value) == -EINVAL);
+    CHECK(trevrpc_quic_varint_feed(&feeder, NULL, 1, &consumed, &value) == -EINVAL);
+    CHECK(trevrpc_quic_varint_feed(&feeder, vectors[0].bytes, 1, NULL, &value) == -EINVAL);
+    CHECK(trevrpc_quic_varint_feed(&feeder, vectors[0].bytes, 1, &consumed, NULL) == -EINVAL);
+    return 0;
+}
+
 static int test_read_offsets_and_truncation(void) {
     const uint8_t prefixed[] = {0xaa, 0x80, 0x00, 0x40, 0x00, 0xbb};
     size_t offset = 1;
@@ -166,6 +206,7 @@ int main(void) {
         test_size_boundaries,
         test_write_failures_are_atomic,
         test_nonminimal_encodings,
+        test_incremental_feeder,
         test_read_offsets_and_truncation,
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {

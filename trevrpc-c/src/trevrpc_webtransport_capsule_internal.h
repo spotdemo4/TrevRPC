@@ -1,6 +1,7 @@
 #ifndef TREVRPC_WEBTRANSPORT_CAPSULE_INTERNAL_H
 #define TREVRPC_WEBTRANSPORT_CAPSULE_INTERNAL_H
 
+#include "trevrpc_quic_varint_internal.h"
 #include "trevrpc_webtransport_profile_internal.h"
 
 #include <stdbool.h>
@@ -100,9 +101,14 @@ typedef struct trevrpc_wt_capsule_parser {
     uint64_t capsule_length;
     uint64_t payload_remaining;
 
-    uint8_t varint_bytes[8];
-    uint8_t varint_have;
-    uint8_t varint_need;
+    union {
+        trevrpc_quic_varint_feeder varint;
+        struct {
+            uint8_t varint_bytes[8];
+            uint8_t varint_have;
+            uint8_t varint_need;
+        };
+    };
 
     uint8_t close_code_bytes[4];
     uint8_t close_code_have;

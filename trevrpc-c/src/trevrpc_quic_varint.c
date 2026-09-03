@@ -1,6 +1,46 @@
 #include "trevrpc_quic_varint_internal.h"
 
 #include <errno.h>
+#include <string.h>
+
+void trevrpc_quic_varint_reset(trevrpc_quic_varint_feeder* state) {
+    if (state == NULL) {
+        return;
+    }
+    memset(state, 0, sizeof(*state));
+}
+
+int trevrpc_quic_varint_feed(
+    trevrpc_quic_varint_feeder* state, const uint8_t* data, size_t len, size_t* out_consumed, uint64_t* out_value) {
+    if (state == NULL || data == NULL || out_consumed == NULL || out_value == NULL) {
+        return -EINVAL;
+    }
+
+    *out_consumed = 0;
+    *out_value = 0;
+
+    if (state->need == 0) {
+        if (len == 0) {
+            return 0;
+        }
+        state->need = (uint8_t)trevrpc_quic_varint_size_from_first(data[0]);
+    }
+
+    while (state->have < state->need && *out_consumed < len) {
+        state->bytes[state->have++] = data[(*out_consumed)++];
+    }
+    if (state->have < state->need) {
+        return 0;
+    }
+
+    size_t offset = 0;
+    int err = trevrpc_quic_varint_read(state->bytes, state->need, &offset, out_value);
+    if (err != 0 || offset != state->need) {
+        return -EPROTO;
+    }
+    trevrpc_quic_varint_reset(state);
+    return 1;
+}
 
 int trevrpc_quic_varint_size(uint64_t value, size_t* out_size) {
     if (out_size == NULL) {

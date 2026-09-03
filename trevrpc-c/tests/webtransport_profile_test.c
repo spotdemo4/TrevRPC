@@ -263,7 +263,7 @@ static int test_profile_metadata(void) {
     CHECK(trevrpc_wt_profile_connect_protocol(TREV_WT_PROFILE_DRAFT_16_RESERVED) == NULL);
     CHECK(strcmp(trevrpc_wt_profile_connect_protocol(TREV_WT_PROFILE_DRAFT_15), "webtransport-h3") == 0);
     CHECK(trevrpc_wt_profile_accepts_connect_protocol(TREV_WT_PROFILE_DRAFT_15, "webtransport-h3"));
-    CHECK(!trevrpc_wt_profile_accepts_connect_protocol(TREV_WT_PROFILE_DRAFT_15, "webtransport"));
+    CHECK(trevrpc_wt_profile_accepts_connect_protocol(TREV_WT_PROFILE_DRAFT_15, "webtransport"));
     CHECK(!trevrpc_wt_profile_accepts_connect_protocol(TREV_WT_PROFILE_DRAFT_15, "unrelated"));
     CHECK(!trevrpc_wt_profile_accepts_connect_protocol(TREV_WT_PROFILE_DRAFT_15, NULL));
     CHECK(trevrpc_wt_profile_accepts_connect_protocol(TREV_WT_PROFILE_DRAFT_14, "webtransport"));

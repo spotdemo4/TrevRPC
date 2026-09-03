@@ -512,10 +512,10 @@ static size_t trevrpc_h3_ingress_read_size(const trevrpc_h3_demux_stream* classi
                    ? (size_t)classifier->unknown_payload_remaining
                    : TREV_H3_INGRESS_CLASSIFIER_READ_SIZE;
     }
-    if (classifier->varint_len == 0 || classifier->varint_need <= classifier->varint_len) {
+    if (classifier->varint.have == 0 || classifier->varint.need <= classifier->varint.have) {
         return 1;
     }
-    return classifier->varint_need - classifier->varint_len;
+    return (size_t)(classifier->varint.need - classifier->varint.have);
 }
 
 static trevrpc_h3_demux_status trevrpc_h3_ingress_classify_ready(trevrpc_h3_ingress_runtime* runtime,

@@ -1,5 +1,6 @@
 #include "trevrpc_h3_demux_internal.h"
 
+// NOLINTNEXTLINE(misc-include-cleaner)
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -114,6 +115,15 @@ static int test_unknown_request_frames_are_skipped(void) {
           TREV_H3_DEMUX_ACTION_READY);
     CHECK(result.consumed == 3);
     CHECK(result.action == TREV_H3_DEMUX_ACTION_REQUEST);
+
+    const uint8_t wt_type_after_unknown[] = {0x21, 0x00, 0x40, 0x41, 0x01, 0xaa, 0x01, 0xee};
+    CHECK(trevrpc_h3_demux_stream_init(&stream, TREV_H3_DEMUX_BIDIRECTIONAL) == 0);
+    CHECK(trevrpc_h3_demux_stream_feed(
+              &stream, &webtransport_profile, wt_type_after_unknown, sizeof(wt_type_after_unknown), &result) ==
+          TREV_H3_DEMUX_ACTION_READY);
+    CHECK(result.consumed == 7);
+    CHECK(result.action == TREV_H3_DEMUX_ACTION_REQUEST);
+    CHECK(result.first_value == TREV_H3_FRAME_HEADERS);
     return 0;
 }
 

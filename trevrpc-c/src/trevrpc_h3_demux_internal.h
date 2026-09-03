@@ -2,6 +2,7 @@
 #define TREVRPC_H3_DEMUX_INTERNAL_H
 
 #include "trevrpc_http3_frame_internal.h"
+#include "trevrpc_quic_varint_internal.h"
 #include "trevrpc_webtransport_profile_internal.h"
 
 #include <stdbool.h>
@@ -64,12 +65,11 @@ typedef struct trevrpc_h3_demux_stream {
     trevrpc_h3_demux_direction direction;
     trevrpc_h3_demux_phase phase;
     trevrpc_h3_demux_action action;
+    bool first_value_seen;
     uint64_t first_value;
     uint64_t session_id;
     uint64_t unknown_payload_remaining;
-    uint8_t varint[8];
-    size_t varint_len;
-    size_t varint_need;
+    trevrpc_quic_varint_feeder varint;
 } trevrpc_h3_demux_stream;
 
 typedef struct trevrpc_h3_demux_result {
