@@ -23,13 +23,14 @@ macOS:
 
 ```sh
 nix build .#packages.aarch64-darwin.trevrpc-webkit-bench-suite
-nix build .#checks.aarch64-darwin.benchmark-webkit-smoke
 ```
 
 That suite contains only the controller, the six TrevRPC servers, and the pinned
 Playwright Cocoa WebKit peer required by the WebKit campaign. It is focused CI
 coverage rather than a claim that every TrevRPC package or benchmark mode is
-supported on macOS.
+supported on macOS. The GitHub `smoke.yaml` workflow builds the Linux and WebKit
+suites once per platform before running each client/server cell as a separate
+check, then publishes one stable `smoke` gate for branch protection.
 
 The benchmark and conformance executables are included in their associated
 `trevrpc-*` packages. The canonical RPC contract and process protocol live under
@@ -55,14 +56,20 @@ trevrpc-bench validate bench/campaigns/native-quic.example.json
 trevrpc-bench capabilities bench/campaigns/native-quic.example.json
 trevrpc-bench run bench/campaigns/native-quic.example.json \
   --out target/bench/native-quic
+
+# Run one directed client/server cell from a larger campaign.
+trevrpc-bench run bench/campaigns/native-smoke.example.json \
+  --out target/bench/go-to-c \
+  --cell go-to-c
 ```
 
-`cross-language-smoke.example.json` uses C as both reference client and
-reference server to exercise every peer in both roles. Its deliberately short
-windows validate interoperability and the harness only; they are not suitable
-for performance comparisons. The Nix smoke checks set
-`TREVRPC_BENCH_SERVER_WORKERS=8` to keep concurrent checks within CI task
-limits; normal benchmark runs retain the C peer's 128-worker default.
+`native-smoke.example.json` contains all 36 directed combinations of the six
+native clients and servers. Its deliberately short windows validate
+interoperability and the harness only; they are not suitable for performance
+comparisons. GitHub CI runs every cell as a separate check with four functional
+samples, one for each RPC kind. The smoke helper sets
+`TREVRPC_BENCH_SERVER_WORKERS=8` to keep concurrent jobs within CI task limits;
+normal benchmark runs retain the C peer's 128-worker default.
 
 Campaign runs stop at the first failed sample by default. Set
 `TREVRPC_BENCH_RUN_ENTIRE_CAMPAIGN=true` to attempt every remaining sample and
@@ -77,20 +84,20 @@ advertised stacks, roles, RPC kinds, and histogram before starting a run.
 
 `chromium-smoke.example.json`, `firefox-smoke.example.json`, and
 `webkit-smoke.example.json` each start the respective browser client before
-each RPC server. Chromium and Firefox run against all six server implementations
-for 24 functional samples. WebKit currently runs against five implementations
-for 20 samples, with the Go server using a temporary `webtransport-go` fork to
-test Safari compatibility. Rust remains excluded pending
-[h3#347](https://github.com/hyperium/h3/issues/347). The client first reports its
-prepared browser origin; the controller passes that origin to the server, sends
+each RPC server. Chromium, Firefox, and WebKit run against all six server
+implementations for 24 functional samples. WebKit uses a temporary
+`webtransport-go` fork for the Go server to test Safari compatibility and keeps
+the Rust server covered while [h3#347](https://github.com/hyperium/h3/issues/347)
+remains open. The client first reports its prepared browser origin; the
+controller passes that origin to the server, sends
 the ready server address back with `CONNECT`, waits for `armed`, and then starts
 measurement.
 
-Linux CI runs Chromium and Firefox. Playwright WebKit uses WPE on Linux, whose
-network process does not implement WebTransport, so the WebKit browser bundle is
-not selected and the peer does not advertise WebTransport coverage there.
-`benchmark-webkit-smoke` runs only on
-`aarch64-darwin`, where Playwright launches the pinned Cocoa WebKit build. The
+The GitHub smoke workflow runs Chromium and Firefox cells on Linux and WebKit
+cells on `aarch64-darwin`. Playwright WebKit uses WPE on Linux, whose network
+process does not implement WebTransport, so the WebKit browser bundle is not
+selected and the peer does not advertise WebTransport coverage there. On
+Apple Silicon macOS, Playwright launches the pinned Cocoa WebKit build. The
 Darwin campaign uses the loopback backend; Linux-only `netns` emulation is not
 substituted. Process-group procfs metrics are unavailable on Darwin and are
 recorded explicitly as unavailable with zero-valued metric fields.

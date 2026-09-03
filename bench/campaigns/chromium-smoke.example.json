@@ -34,37 +34,37 @@
   ],
   "cells": [
     {
-      "id": "chromium-c",
+      "id": "chromium-to-c",
       "client": "chromium",
       "server": "c",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "chromium-cpp",
+      "id": "chromium-to-cpp",
       "client": "chromium",
       "server": "cpp",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "chromium-go",
+      "id": "chromium-to-go",
       "client": "chromium",
       "server": "go",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "chromium-js",
+      "id": "chromium-to-js",
       "client": "chromium",
       "server": "js",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "chromium-kotlin",
+      "id": "chromium-to-kotlin",
       "client": "chromium",
       "server": "kotlin",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "chromium-rust",
+      "id": "chromium-to-rust",
       "client": "chromium",
       "server": "rust",
       "stack": "trevrpc_webtransport"

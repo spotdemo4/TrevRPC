@@ -1,0 +1,164 @@
+name: smoke
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    outputs:
+      linux: ${{ steps.matrix.outputs.linux }}
+      webkit: ${{ steps.matrix.outputs.webkit }}
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
+
+      - name: Discover smoke cells
+        id: matrix
+        run: |
+          nix shell nixpkgs#jq --command jq --null-input --raw-output \
+            --slurpfile native bench/campaigns/native-smoke.example.json \
+            --slurpfile chromium bench/campaigns/chromium-smoke.example.json \
+            --slurpfile firefox bench/campaigns/firefox-smoke.example.json \
+            --slurpfile webkit bench/campaigns/webkit-smoke.example.json \
+            '[
+              "linux=" + ({include: (
+                ($native[0].cells | map({
+                  cell: .id,
+                  campaign: "bench/campaigns/native-smoke.example.json",
+                  client_package: ("trevrpc-" + .client),
+                  server_package: ("trevrpc-" + .server)
+                })) +
+                ($chromium[0].cells | map({
+                  cell: .id,
+                  campaign: "bench/campaigns/chromium-smoke.example.json",
+                  client_package: "trevrpc-browser-bench-peer",
+                  server_package: ("trevrpc-" + .server)
+                })) +
+                ($firefox[0].cells | map({
+                  cell: .id,
+                  campaign: "bench/campaigns/firefox-smoke.example.json",
+                  client_package: "trevrpc-browser-bench-peer",
+                  server_package: ("trevrpc-" + .server)
+                }))
+              )} | tojson),
+              "webkit=" + ({include: ($webkit[0].cells | map({
+                cell: .id,
+                campaign: "bench/campaigns/webkit-smoke.example.json",
+                client_package: "trevrpc-browser-bench-peer",
+                server_package: ("trevrpc-" + .server)
+              }))} | tojson)
+            ] | .[]' >> "$GITHUB_OUTPUT"
+
+  prepare-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
+
+      - name: Build benchmark suite
+        run: nix build .#trevrpc-bench-suite --no-link
+
+  smoke-linux:
+    name: smoke-${{ matrix.cell }}
+    needs: [discover, prepare-linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix: ${{ fromJSON(needs.discover.outputs.linux) }}
+    env:
+      CAMPAIGN: ${{ matrix.campaign }}
+      CELL: ${{ matrix.cell }}
+      CLIENT_PACKAGE: ${{ matrix.client_package }}
+      SERVER_PACKAGE: ${{ matrix.server_package }}
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
+
+      - name: Run smoke cell
+        run: |
+          nix shell \
+            .#trevrpc-bench \
+            ".#$CLIENT_PACKAGE" \
+            ".#$SERVER_PACKAGE" \
+            --command ./bench/ci/run-smoke-cell.sh \
+              "$CAMPAIGN" \
+              "$CELL" \
+              "$RUNNER_TEMP/smoke"
+
+  prepare-macos:
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
+
+      - name: Build WebKit benchmark suite
+        run: nix build .#trevrpc-webkit-bench-suite --no-link
+
+  smoke-webkit:
+    name: smoke-${{ matrix.cell }}
+    needs: [discover, prepare-macos]
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.webkit) }}
+    env:
+      CAMPAIGN: ${{ matrix.campaign }}
+      CELL: ${{ matrix.cell }}
+      CLIENT_PACKAGE: ${{ matrix.client_package }}
+      SERVER_PACKAGE: ${{ matrix.server_package }}
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
+
+      - name: Run smoke cell
+        run: |
+          nix shell \
+            .#trevrpc-bench \
+            ".#$CLIENT_PACKAGE" \
+            ".#$SERVER_PACKAGE" \
+            --command ./bench/ci/run-smoke-cell.sh \
+              "$CAMPAIGN" \
+              "$CELL" \
+              "$RUNNER_TEMP/smoke"
+
+  smoke:
+    needs: [smoke-linux, smoke-webkit]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every smoke cell
+        env:
+          LINUX_RESULT: ${{ needs.smoke-linux.result }}
+          WEBKIT_RESULT: ${{ needs.smoke-webkit.result }}
+        run: |
+          [[ $LINUX_RESULT == success ]]
+          [[ $WEBKIT_RESULT == success ]]

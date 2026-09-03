@@ -15,18 +15,11 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
-    permissions:
-      id-token: write
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
-
-      - name: Check
-        run: nix flake check --option log-lines 100
-
-  webkit-macos:
-    runs-on: macos-26
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
     permissions:
       contents: read
       id-token: write
@@ -34,16 +27,5 @@ jobs:
       - name: Initialize
         uses: spotdemo4/nix-init@c7537bc73ce11ca01e53bd9d119d6e46363f9888 # v1.65.0
 
-      - name: Check Kotlin
-        run: nix build .#checks.aarch64-darwin.kotlin --no-link --option log-lines 100
-
-      - name: Check WebKit
-        run: |
-          nix build --impure --expr '
-            let
-              flake = builtins.getFlake (toString ./.);
-            in
-            flake.checks.aarch64-darwin.benchmark-webkit-smoke.overrideAttrs (_: {
-              TREVRPC_BENCH_RUN_ENTIRE_CAMPAIGN = "true";
-            })
-          ' --no-link --option log-lines 100
+      - name: Check
+        run: nix flake check --option log-lines 100

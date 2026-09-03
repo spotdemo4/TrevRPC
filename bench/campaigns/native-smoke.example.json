@@ -1,0 +1,262 @@
+{
+  "schema_version": 4,
+  "campaign_id": "native-quic-all-pairs-smoke",
+  "repetitions": 1,
+  "peers": [
+    {
+      "id": "c",
+      "command": ["trevrpc-bench-peer-c"]
+    },
+    {
+      "id": "cpp",
+      "command": ["trevrpc-bench-peer-cpp"]
+    },
+    {
+      "id": "go",
+      "command": ["trevrpc-bench-peer-go"]
+    },
+    {
+      "id": "rust",
+      "command": ["trevrpc-bench-peer-rust"]
+    },
+    {
+      "id": "js",
+      "command": ["trevrpc-bench-peer-js"]
+    },
+    {
+      "id": "kotlin",
+      "command": ["trevrpc-bench-peer-kotlin"]
+    }
+  ],
+  "cells": [
+    {
+      "id": "c-to-c",
+      "client": "c",
+      "server": "c",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "cpp-to-c",
+      "client": "cpp",
+      "server": "c",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "go-to-c",
+      "client": "go",
+      "server": "c",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "rust-to-c",
+      "client": "rust",
+      "server": "c",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "js-to-c",
+      "client": "js",
+      "server": "c",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "kotlin-to-c",
+      "client": "kotlin",
+      "server": "c",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "c-to-cpp",
+      "client": "c",
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "cpp-to-cpp",
+      "client": "cpp",
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "go-to-cpp",
+      "client": "go",
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "rust-to-cpp",
+      "client": "rust",
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "js-to-cpp",
+      "client": "js",
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "kotlin-to-cpp",
+      "client": "kotlin",
+      "server": "cpp",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "c-to-go",
+      "client": "c",
+      "server": "go",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "cpp-to-go",
+      "client": "cpp",
+      "server": "go",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "go-to-go",
+      "client": "go",
+      "server": "go",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "rust-to-go",
+      "client": "rust",
+      "server": "go",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "js-to-go",
+      "client": "js",
+      "server": "go",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "kotlin-to-go",
+      "client": "kotlin",
+      "server": "go",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "c-to-rust",
+      "client": "c",
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "cpp-to-rust",
+      "client": "cpp",
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "go-to-rust",
+      "client": "go",
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "rust-to-rust",
+      "client": "rust",
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "js-to-rust",
+      "client": "js",
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "kotlin-to-rust",
+      "client": "kotlin",
+      "server": "rust",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "c-to-js",
+      "client": "c",
+      "server": "js",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "cpp-to-js",
+      "client": "cpp",
+      "server": "js",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "go-to-js",
+      "client": "go",
+      "server": "js",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "rust-to-js",
+      "client": "rust",
+      "server": "js",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "js-to-js",
+      "client": "js",
+      "server": "js",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "kotlin-to-js",
+      "client": "kotlin",
+      "server": "js",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "c-to-kotlin",
+      "client": "c",
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "cpp-to-kotlin",
+      "client": "cpp",
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "go-to-kotlin",
+      "client": "go",
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "rust-to-kotlin",
+      "client": "rust",
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "js-to-kotlin",
+      "client": "js",
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
+    },
+    {
+      "id": "kotlin-to-kotlin",
+      "client": "kotlin",
+      "server": "kotlin",
+      "stack": "trevrpc_native_quic"
+    }
+  ],
+  "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
+  "concurrencies": [1],
+  "timing": {
+    "warmup_ms": 50,
+    "measurement_ms": 250
+  },
+  "workload": {
+    "request_bytes": 16,
+    "response_bytes": 16,
+    "messages_per_stream": 4
+  },
+  "startup_timeout_ms": 30000,
+  "drain_timeout_ms": 30000
+}

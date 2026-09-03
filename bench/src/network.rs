@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "linux", test))]
+use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::process::Command;
@@ -237,6 +239,7 @@ pub fn enter_owner_namespace_if_needed(
     network: &Network,
     campaign_path: &Path,
     output: &Path,
+    cell: Option<&str>,
 ) -> Result<(), BoxError> {
     if network.backend != NetworkBackend::Netns {
         return Ok(());
@@ -251,13 +254,25 @@ pub fn enter_owner_namespace_if_needed(
     let error = Command::new("unshare")
         .args(["--user", "--map-root-user", "--net", "--"])
         .arg(executable)
-        .arg("__network-run")
-        .arg(campaign_path)
-        .arg("--out")
-        .arg(output)
+        .args(network_run_arguments(campaign_path, output, cell))
         .env(OWNER_ENV, parent_namespaces)
         .exec();
     Err(format!("failed to start rootless netns backend with unshare: {error}").into())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn network_run_arguments(campaign_path: &Path, output: &Path, cell: Option<&str>) -> Vec<OsString> {
+    let mut arguments = vec![
+        OsString::from("__network-run"),
+        campaign_path.as_os_str().to_owned(),
+        OsString::from("--out"),
+        output.as_os_str().to_owned(),
+    ];
+    if let Some(cell) = cell {
+        arguments.push(OsString::from("--cell"));
+        arguments.push(OsString::from(cell));
+    }
+    arguments
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -265,6 +280,7 @@ pub fn enter_owner_namespace_if_needed(
     network: &Network,
     _campaign_path: &Path,
     _output: &Path,
+    _cell: Option<&str>,
 ) -> Result<(), BoxError> {
     if network.backend == NetworkBackend::Netns {
         Err(NETNS_LINUX_ONLY_ERROR.into())
@@ -612,9 +628,11 @@ fn enter_namespace_before_exec(command: &mut Command, namespace_fd: RawFd) {
 
 #[cfg(test)]
 mod tests {
-    use super::netem_arguments;
+    use std::path::Path;
+
     #[cfg(not(target_os = "linux"))]
     use super::{NETNS_LINUX_ONLY_ERROR, NetworkTopology};
+    use super::{netem_arguments, network_run_arguments};
     use crate::campaign::LinkCondition;
     #[cfg(not(target_os = "linux"))]
     use crate::campaign::{Network, NetworkBackend};
@@ -622,6 +640,29 @@ mod tests {
     #[test]
     fn omits_netem_for_unrestricted_links() {
         assert!(netem_arguments("test0", &LinkCondition::default()).is_empty());
+    }
+
+    #[test]
+    fn preserves_selected_cell_for_network_runner() {
+        let arguments = network_run_arguments(
+            Path::new("campaign.json"),
+            Path::new("run"),
+            Some("go-to-rust"),
+        );
+        assert_eq!(
+            arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy())
+                .collect::<Vec<_>>(),
+            [
+                "__network-run",
+                "campaign.json",
+                "--out",
+                "run",
+                "--cell",
+                "go-to-rust",
+            ]
+        );
     }
 
     #[test]

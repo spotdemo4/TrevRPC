@@ -1,6 +1,6 @@
 {
   "schema_version": 4,
-  "campaign_id": "webkit-webtransport-supported-servers-smoke",
+  "campaign_id": "webkit-webtransport-all-servers-smoke",
   "repetitions": 1,
   "peers": [
     {
@@ -20,6 +20,10 @@
       "command": ["trevrpc-bench-peer-go", "--webtransport-draft07-only"]
     },
     {
+      "id": "rust",
+      "command": ["trevrpc-bench-peer-rust"]
+    },
+    {
       "id": "js",
       "command": ["trevrpc-bench-peer-js"]
     },
@@ -30,31 +34,37 @@
   ],
   "cells": [
     {
-      "id": "webkit-c",
+      "id": "webkit-to-c",
       "client": "webkit",
       "server": "c",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "webkit-cpp",
+      "id": "webkit-to-cpp",
       "client": "webkit",
       "server": "cpp",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "webkit-go",
+      "id": "webkit-to-go",
       "client": "webkit",
       "server": "go",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "webkit-js",
+      "id": "webkit-to-rust",
+      "client": "webkit",
+      "server": "rust",
+      "stack": "trevrpc_webtransport"
+    },
+    {
+      "id": "webkit-to-js",
       "client": "webkit",
       "server": "js",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "webkit-kotlin",
+      "id": "webkit-to-kotlin",
       "client": "webkit",
       "server": "kotlin",
       "stack": "trevrpc_webtransport"

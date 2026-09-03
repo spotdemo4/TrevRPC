@@ -286,6 +286,19 @@ impl Campaign {
         Ok(())
     }
 
+    pub fn select_cell(mut self, id: &str) -> Result<Self, BoxError> {
+        let cell = self
+            .cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .cloned()
+            .ok_or_else(|| format!("unknown campaign cell {id:?}"))?;
+        self.peers
+            .retain(|peer| peer.id == cell.client || peer.id == cell.server);
+        self.cells = vec![cell];
+        Ok(self)
+    }
+
     #[must_use]
     pub fn peer(&self, id: &str) -> Option<&Peer> {
         self.peers.iter().find(|peer| peer.id == id)
@@ -308,6 +321,8 @@ fn validate_id(value: &str, name: &str) -> Result<(), BoxError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         Campaign, Cell, LinkCondition, MAX_CONCURRENCY, MAX_MESSAGES_PER_STREAM, MAX_PAYLOAD_BYTES,
         Network, NetworkBackend, Peer, RpcKind, Stack, Timing, Workload,
@@ -349,6 +364,55 @@ mod tests {
     #[test]
     fn validates_minimal_campaign() {
         campaign().validate().expect("valid campaign");
+    }
+
+    #[test]
+    fn selects_one_cell_and_its_peers() {
+        let mut campaign = campaign();
+        campaign.peers.push(Peer {
+            id: "go".to_owned(),
+            command: vec!["go-peer".to_owned()],
+        });
+        campaign.cells.push(Cell {
+            id: "go-to-rust".to_owned(),
+            client: "go".to_owned(),
+            server: "rust".to_owned(),
+            stack: Stack::TrevrpcNativeQuic,
+        });
+        campaign.validate().expect("valid campaign");
+
+        let selected = campaign
+            .select_cell("go-to-rust")
+            .expect("known campaign cell");
+        selected.validate().expect("valid selected campaign");
+        assert_eq!(selected.cells.len(), 1);
+        assert_eq!(selected.cells[0].id, "go-to-rust");
+        assert_eq!(
+            selected
+                .peers
+                .iter()
+                .map(|peer| peer.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["go", "rust"])
+        );
+        assert_eq!(selected.campaign_id, "smoke");
+        assert_eq!(selected.rpc_kinds, [RpcKind::Unary]);
+        assert_eq!(selected.concurrencies, [1]);
+    }
+
+    #[test]
+    fn selecting_same_peer_cell_keeps_one_peer() {
+        let selected = campaign().select_cell("rust").expect("known campaign cell");
+        assert_eq!(selected.peers.len(), 1);
+        assert_eq!(selected.peers[0].id, "rust");
+    }
+
+    #[test]
+    fn rejects_unknown_selected_cell() {
+        let error = campaign()
+            .select_cell("missing")
+            .expect_err("unknown campaign cell");
+        assert_eq!(error.to_string(), "unknown campaign cell \"missing\"");
     }
 
     #[test]
@@ -444,6 +508,40 @@ mod tests {
     }
 
     #[test]
+    fn native_smoke_covers_every_directed_pair() {
+        let campaign: Campaign =
+            serde_json::from_str(include_str!("../campaigns/native-smoke.example.json"))
+                .expect("native smoke campaign");
+        campaign.validate().expect("valid native smoke campaign");
+
+        let peers = ["c", "cpp", "go", "rust", "js", "kotlin"];
+        let mut expected = BTreeSet::new();
+        for client in peers {
+            for server in peers {
+                expected.insert((client, server));
+            }
+        }
+        let actual = campaign
+            .cells
+            .iter()
+            .map(|cell| (cell.client.as_str(), cell.server.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        assert!(campaign.cells.iter().all(|cell| {
+            cell.id == format!("{}-to-{}", cell.client, cell.server)
+                && cell.stack == Stack::TrevrpcNativeQuic
+        }));
+        assert_eq!(campaign.cells.len(), 36);
+        assert_eq!(
+            usize::try_from(campaign.repetitions).unwrap()
+                * campaign.cells.len()
+                * campaign.rpc_kinds.len()
+                * campaign.concurrencies.len(),
+            144
+        );
+    }
+
+    #[test]
     fn webtransport_smoke_has_expected_servers_and_samples() {
         for (content, browser, expected_servers, expected_samples) in [
             (
@@ -461,30 +559,30 @@ mod tests {
             (
                 include_str!("../campaigns/webkit-smoke.example.json"),
                 "webkit",
-                5,
-                20,
+                6,
+                24,
             ),
         ] {
             let campaign: Campaign =
                 serde_json::from_str(content).expect("WebTransport smoke campaign");
             campaign.validate().expect("valid WebTransport campaign");
             assert_eq!(campaign.cells.len(), expected_servers);
-            assert!(
-                campaign
-                    .cells
-                    .iter()
-                    .all(|cell| cell.client == browser && cell.stack == Stack::TrevrpcWebtransport)
-            );
+            assert!(campaign.cells.iter().all(|cell| {
+                cell.client == browser
+                    && cell.id == format!("{browser}-to-{}", cell.server)
+                    && cell.stack == Stack::TrevrpcWebtransport
+            }));
             let go = campaign.peer("go").expect("Go peer");
             if browser == "webkit" {
                 assert_eq!(
                     go.command,
                     ["trevrpc-bench-peer-go", "--webtransport-draft07-only"]
                 );
-                // Keep the Rust server excluded until upstream Safari compatibility is resolved:
-                // https://github.com/hyperium/h3/issues/347
-                assert!(campaign.peer("rust").is_none());
-                assert!(campaign.cells.iter().all(|cell| cell.server != "rust"));
+                assert_eq!(
+                    campaign.peer("rust").expect("Rust peer").command,
+                    ["trevrpc-bench-peer-rust"]
+                );
+                assert!(campaign.cells.iter().any(|cell| cell.server == "rust"));
             } else {
                 assert_eq!(go.command, ["trevrpc-bench-peer-go"]);
             }

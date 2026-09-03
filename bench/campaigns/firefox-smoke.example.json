@@ -34,37 +34,37 @@
   ],
   "cells": [
     {
-      "id": "firefox-c",
+      "id": "firefox-to-c",
       "client": "firefox",
       "server": "c",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "firefox-cpp",
+      "id": "firefox-to-cpp",
       "client": "firefox",
       "server": "cpp",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "firefox-go",
+      "id": "firefox-to-go",
       "client": "firefox",
       "server": "go",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "firefox-js",
+      "id": "firefox-to-js",
       "client": "firefox",
       "server": "js",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "firefox-kotlin",
+      "id": "firefox-to-kotlin",
       "client": "firefox",
       "server": "kotlin",
       "stack": "trevrpc_webtransport"
     },
     {
-      "id": "firefox-rust",
+      "id": "firefox-to-rust",
       "client": "firefox",
       "server": "rust",
       "stack": "trevrpc_webtransport"
