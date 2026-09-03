@@ -2,6 +2,7 @@
 
 #include "trevrpc_runtime_internal.h"
 #include "trevrpc_msquic.h"
+#include "trevrpc_msquic_objects_internal.h"
 #include "trevrpc_webtransport.h"
 #include "trevrpc_wire_internal.h"
 
@@ -93,64 +94,6 @@ struct trevrpc_stream {
     bool has_recv_limits;
     bool response_idle_started;
     bool request_poll_idle_started;
-};
-
-typedef struct trevrpc_msquic_chunk {
-    struct trevrpc_msquic_chunk* next;
-    size_t len;
-    size_t offset;
-    uint8_t data[];
-} trevrpc_msquic_chunk;
-
-typedef struct trevrpc_msquic_send trevrpc_msquic_send;
-typedef struct trevrpc_msquic_frame trevrpc_msquic_frame;
-
-typedef enum trevrpc_msquic_recv_mode {
-    TREV_MSQUIC_RECV_BYTES = 0,
-    TREV_MSQUIC_RECV_FRAMES = 1,
-} trevrpc_msquic_recv_mode;
-
-struct trevrpc_msquic_send {
-    trevrpc_msquic_send* next;
-};
-
-struct trevrpc_msquic_frame {
-    trevrpc_msquic_frame* next;
-    uint8_t* body;
-    size_t len;
-    intptr_t err;
-};
-
-struct trevrpc_msquic_stream {
-    void* handle;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    trevrpc_msquic_recv_mode recv_mode;
-    trevrpc_msquic_chunk* recv_head;
-    trevrpc_msquic_chunk* recv_tail;
-    size_t recv_buffered;
-    trevrpc_msquic_frame* frame_head;
-    trevrpc_msquic_frame* frame_tail;
-    trevrpc_frame_parser frame_parser;
-    bool recv_fin;
-    bool send_closed;
-    bool send_aborted;
-    bool api_closing;
-    bool shutdown_complete;
-    bool close_pending;
-    bool closed;
-    bool api_ref_acquired;
-    size_t active_send_ops;
-    size_t active_handle_ops;
-    size_t active_send_completions;
-    size_t send_capacity_waiters;
-    size_t max_pending_send_bytes;
-    size_t max_pending_send_count;
-    size_t pending_send_bytes;
-    size_t pending_send_count;
-    int err;
-    trevrpc_msquic_send* send_pool;
-    size_t send_pool_count;
 };
 
 typedef struct trevrpc_conn_stream_limiter_for_test {
@@ -597,6 +540,8 @@ static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data,
     chunk->next = NULL;
     chunk->len = data_len;
     chunk->offset = 0;
+    chunk->charge_bytes = sizeof(*chunk) + data_len;
+    chunk->charge_count = 1;
     memcpy(chunk->data, data, data_len);
     if (stream->recv_tail != NULL) {
         stream->recv_tail->next = chunk;
@@ -618,7 +563,7 @@ static void reset_raw_stream(trevrpc_msquic_stream* stream) {
     trevrpc_msquic_frame* frame = stream->frame_head;
     while (frame != NULL) {
         trevrpc_msquic_frame* next = frame->next;
-        free(frame->body);
+        trevrpc_owned_bytes_reset(&frame->body);
         free(frame);
         frame = next;
     }
@@ -635,6 +580,9 @@ static void reset_raw_stream(trevrpc_msquic_stream* stream) {
 
 static int init_raw_stream(trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len) {
     memset(stream, 0, sizeof(*stream));
+    atomic_init(&stream->receive_closing, false);
+    atomic_init(&stream->active_resume_pins, 0);
+    trevrpc_owned_bytes_init(&stream->pending_frame.body);
     trevrpc_frame_parser_init(&stream->frame_parser, 0);
     int err = pthread_mutex_init(&stream->mutex, NULL);
     if (err != 0) {
@@ -654,6 +602,9 @@ static int init_raw_stream(trevrpc_msquic_stream* stream, const uint8_t* body, s
 
 static int init_empty_raw_stream(trevrpc_msquic_stream* stream) {
     memset(stream, 0, sizeof(*stream));
+    atomic_init(&stream->receive_closing, false);
+    atomic_init(&stream->active_resume_pins, 0);
+    trevrpc_owned_bytes_init(&stream->pending_frame.body);
     trevrpc_frame_parser_init(&stream->frame_parser, 0);
     int err = pthread_mutex_init(&stream->mutex, NULL);
     if (err != 0) {

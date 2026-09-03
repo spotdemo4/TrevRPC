@@ -1058,7 +1058,7 @@ if(TREVRPC_BUILD_TESTS)
 
         add_executable(trevrpc_runtime_test tests/runtime_test.c)
         target_include_directories(trevrpc_runtime_test PRIVATE src)
-        target_link_libraries(trevrpc_runtime_test PRIVATE trevrpc_testing)
+        target_link_libraries(trevrpc_runtime_test PRIVATE trevrpc_testing msquic::msquic)
         trevrpc_c_warnings(trevrpc_runtime_test)
         trevrpc_c_sanitizers(trevrpc_runtime_test)
 
@@ -1141,6 +1141,7 @@ if(TREVRPC_BUILD_TESTS)
         )
         add_dependencies(trevrpc_generated_service_test trevrpc_msquic_test_certificates)
         target_compile_definitions(trevrpc_generated_service_test PRIVATE
+            TREVRPC_MSQUIC_TESTING
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
             TREVRPC_GENERATED_HEADER="${trevrpc_generated_test_dir}/greeter.trevrpc.h"
@@ -1148,7 +1149,8 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_GENERATED_TESTING
         )
         target_include_directories(trevrpc_generated_service_test PRIVATE src "${trevrpc_generated_test_dir}")
-        target_link_libraries(trevrpc_generated_service_test PRIVATE trevrpc_msquic_testing trevrpc_testing protobuf-c)
+        target_link_libraries(
+            trevrpc_generated_service_test PRIVATE trevrpc_msquic_testing trevrpc_testing protobuf-c msquic::msquic)
         trevrpc_c_warnings(trevrpc_generated_service_test)
         trevrpc_c_sanitizers(trevrpc_generated_service_test)
 

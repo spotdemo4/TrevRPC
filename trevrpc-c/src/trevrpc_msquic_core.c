@@ -8,17 +8,13 @@
 #include "trevrpc_msquic.h"
 
 #include "trevrpc_msquic_internal.h"
+#include "trevrpc_msquic_objects_internal.h"
 
 #include "trevrpc_frame_internal.h"
 #include "trevrpc_msquic_api_owner.h"
 
 #include <arpa/inet.h>
 #include <errno.h> // IWYU pragma: keep
-#if __has_include(<msquic.h>)
-#include <msquic.h>
-#else
-#include <inc/msquic.h>
-#endif
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -30,7 +26,6 @@
 #define TREV_MSQUIC_NANOS_PER_SEC 1000000000ull
 #define TREV_MSQUIC_SEND_POOL_LIMIT 64
 #define TREV_MSQUIC_SEND_POOL_MAX_CAPACITY 65536
-#define TREV_MSQUIC_SEND_MAX_BUFFERS 4
 #define TREV_MSQUIC_TREVRPC_ALPN "trevrpc/1"
 #define TREV_MSQUIC_DEFAULT_MAX_FRAME_SIZE (4u * 1024u * 1024u)
 #define TREV_MSQUIC_DEFAULT_STREAM_RECV_BYTES (16u * 1024u * 1024u)
@@ -38,229 +33,11 @@
 #define TREV_MSQUIC_DEFAULT_CONNECTION_RECV_BYTES (64u * 1024u * 1024u)
 #define TREV_MSQUIC_DEFAULT_CONNECTION_RECV_COUNT 4096u
 
-typedef struct trevrpc_msquic_send trevrpc_msquic_send;
-typedef struct trevrpc_msquic_frame trevrpc_msquic_frame;
-
-typedef enum trevrpc_msquic_recv_mode {
-    TREV_MSQUIC_RECV_UNDECIDED = 0,
-    TREV_MSQUIC_RECV_BYTES = 1,
-    TREV_MSQUIC_RECV_FRAMES = 2,
-} trevrpc_msquic_recv_mode;
-
-typedef enum trevrpc_msquic_receive_pause_kind {
-    TREV_MSQUIC_RECV_PAUSE_NONE = 0,
-    TREV_MSQUIC_RECV_PAUSE_RAW_CHUNK,
-    TREV_MSQUIC_RECV_PAUSE_PARSER_BODY,
-    TREV_MSQUIC_RECV_PAUSE_FRAME_NODE,
-} trevrpc_msquic_receive_pause_kind;
-
 typedef enum trevrpc_msquic_reserve_result {
     TREV_MSQUIC_RESERVE_OK = 0,
     TREV_MSQUIC_RESERVE_PRESSURE,
     TREV_MSQUIC_RESERVE_OVERFLOW,
 } trevrpc_msquic_reserve_result;
-
-typedef struct trevrpc_msquic_receive_budget {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    size_t ref_count;
-    size_t owned_bytes;
-    size_t owned_count;
-    size_t max_owned_bytes;
-    size_t max_owned_count;
-    size_t undecided_admission_max_bytes;
-    size_t undecided_admission_max_count;
-    trevrpc_msquic_stream* paused_head;
-    trevrpc_msquic_stream* paused_tail;
-    bool resumer_active;
-    bool kick_pending;
-#ifdef TREVRPC_MSQUIC_TESTING
-    uint64_t resume_scan_count;
-#endif
-} trevrpc_msquic_receive_budget;
-
-typedef struct trevrpc_msquic_chunk {
-    struct trevrpc_msquic_chunk* next;
-    size_t len;
-    size_t offset;
-    size_t charge_bytes;
-    size_t charge_count;
-    uint8_t data[];
-} trevrpc_msquic_chunk;
-
-struct trevrpc_msquic_frame {
-    trevrpc_msquic_frame* next;
-    trevrpc_owned_bytes body;
-    size_t declared_len;
-    intptr_t err;
-    size_t charge_bytes;
-    size_t charge_count;
-};
-
-typedef struct trevrpc_msquic_stream_node {
-    struct trevrpc_msquic_stream_node* next;
-    trevrpc_msquic_stream* stream;
-} trevrpc_msquic_stream_node;
-
-typedef struct trevrpc_msquic_conn_node {
-    struct trevrpc_msquic_conn_node* next;
-    trevrpc_msquic_conn* conn;
-} trevrpc_msquic_conn_node;
-
-struct trevrpc_msquic_stream {
-    HQUIC handle;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    trevrpc_msquic_recv_mode recv_mode;
-    trevrpc_msquic_chunk* recv_head;
-    trevrpc_msquic_chunk* recv_tail;
-    size_t recv_buffered;
-    trevrpc_msquic_frame* frame_head;
-    trevrpc_msquic_frame* frame_tail;
-    trevrpc_frame_parser frame_parser;
-    trevrpc_msquic_receive_budget* recv_budget;
-    size_t configured_max_frame_size;
-    size_t max_recv_owned_bytes;
-    size_t max_recv_owned_count;
-    size_t recv_owned_bytes;
-    size_t recv_owned_count;
-    size_t parser_owned_bytes;
-    size_t parser_owned_count;
-    bool parser_budgeted;
-    trevrpc_msquic_receive_pause_kind recv_pause_kind;
-    size_t recv_pause_need_bytes;
-    size_t recv_pause_need_count;
-    bool receive_disabled;
-    bool receive_waiting_on_raw_pump;
-    bool receive_resume_ready;
-    _Atomic bool receive_closing;
-    bool pause_listed;
-    _Atomic size_t active_resume_pins;
-#ifdef TREVRPC_MSQUIC_TESTING
-    bool synthetic_receive_fixture;
-#endif
-    trevrpc_msquic_stream* pause_prev;
-    trevrpc_msquic_stream* pause_next;
-    size_t recv_grant_bytes;
-    size_t recv_grant_count;
-    trevrpc_msquic_receive_pause_kind recv_grant_kind;
-    bool pending_frame_valid;
-    trevrpc_msquic_frame pending_frame;
-    enum {
-        TREV_MSQUIC_PARSER_ALLOC_NONE,
-        TREV_MSQUIC_PARSER_ALLOC_PRESSURE,
-        TREV_MSQUIC_PARSER_ALLOC_OOM,
-    } parser_alloc_result;
-    bool recv_fin;
-    bool send_closed;
-    bool send_aborted;
-    bool api_closing;
-    bool destroy_requested;
-    bool destroy_started;
-    bool destroy_complete;
-    bool close_shutdown_started;
-    bool shutdown_complete;
-    bool close_pending;
-    bool closed;
-    bool api_ref_acquired;
-    size_t active_send_ops;
-    size_t active_handle_ops;
-    size_t active_send_completions;
-    size_t active_lifecycle_refs;
-    size_t active_close_calls;
-    trevrpc_msquic_stream_observer observer;
-    void* observer_context;
-    size_t active_observer_callbacks;
-    size_t send_capacity_waiters;
-    size_t max_pending_send_bytes;
-    size_t max_pending_send_count;
-    size_t pending_send_bytes;
-    size_t pending_send_count;
-    int err;
-    trevrpc_msquic_send* send_pool;
-    size_t send_pool_count;
-};
-
-struct trevrpc_msquic_conn {
-    HQUIC handle;
-    HQUIC registration;
-    HQUIC configuration;
-    uint8_t negotiated_alpn[UINT8_MAX];
-    uint8_t negotiated_alpn_len;
-    size_t max_frame_size;
-    size_t max_pending_send_bytes;
-    size_t max_pending_send_count;
-    size_t max_stream_recv_owned_bytes;
-    size_t max_stream_recv_owned_count;
-    trevrpc_msquic_receive_budget* recv_budget;
-    bool owns_endpoint;
-    bool api_ref_acquired;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    trevrpc_msquic_stream_node* stream_head;
-    trevrpc_msquic_stream_node* stream_tail;
-    bool connected;
-    bool connected_session_resumed;
-    trevrpc_msquic_feature_state features;
-    bool observer_terminal;
-    bool destroy_requested;
-    bool destroy_started;
-    bool destroy_complete;
-    bool shutdown_complete;
-    bool close_pending;
-    bool closed;
-    size_t active_handle_ops;
-    size_t active_lifecycle_refs;
-    size_t active_close_calls;
-    trevrpc_msquic_conn_observer observer;
-    void* observer_context;
-    size_t active_observer_callbacks;
-    trevrpc_msquic_conn* destroy_next;
-    uint64_t peer_close_error;
-    bool peer_close_error_set;
-    int err;
-};
-
-struct trevrpc_msquic_listener {
-    HQUIC registration;
-    HQUIC configuration;
-    HQUIC listener;
-    size_t max_frame_size;
-    size_t max_pending_send_bytes;
-    size_t max_pending_send_count;
-    trevrpc_msquic_receive_policy receive_policy;
-    trevrpc_msquic_feature_request features;
-    bool api_ref_acquired;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    trevrpc_msquic_conn_node* conn_head;
-    trevrpc_msquic_conn_node* conn_tail;
-    size_t active_callbacks;
-    size_t shutdown_waiters;
-    bool shutdown_in_progress;
-    bool closed;
-    int err;
-};
-
-struct trevrpc_msquic_send {
-    trevrpc_msquic_send* next;
-    QUIC_BUFFER buffers[TREV_MSQUIC_SEND_MAX_BUFFERS];
-    QUIC_BUFFER* dynamic_buffers;
-    trevrpc_msquic_send_completion* completion;
-    uint32_t buffer_count;
-    size_t capacity;
-    size_t pending_len;
-    bool poolable;
-    bool pending_accounted;
-    uint8_t data[];
-};
-
-struct trevrpc_msquic_send_completion {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    bool completed;
-    int result;
-};
 
 static _Atomic(const QUIC_API_TABLE*) TrevMsQuic;
 static pthread_mutex_t TrevMsQuicApiMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -884,6 +661,10 @@ static void trevrpc_msquic_receive_budget_release(trevrpc_msquic_receive_budget*
 
 static bool trevrpc_msquic_recv_local_fits_locked(
     const trevrpc_msquic_stream* stream, size_t bytes, size_t count, bool undecided) {
+    /* Unbudgeted streams predate local receive caps: admit everything. */
+    if (stream->recv_budget == NULL) {
+        return true;
+    }
     size_t max_bytes = stream->max_recv_owned_bytes;
     size_t max_count = stream->max_recv_owned_count;
     if (undecided) {
@@ -906,6 +687,11 @@ static trevrpc_msquic_reserve_result trevrpc_msquic_recv_try_reserve_locked(trev
     trevrpc_msquic_receive_pause_kind kind,
     bool use_undecided_admission_cap) {
     trevrpc_msquic_receive_budget* budget = stream->recv_budget;
+    /* Unbudgeted streams (test raw streams, ABI 6 facade) predate the shared
+     * receive budget: no admission control, no accounting. */
+    if (budget == NULL) {
+        return TREV_MSQUIC_RESERVE_OK;
+    }
     if (stream->recv_grant_kind == kind && stream->recv_grant_bytes == bytes && stream->recv_grant_count == count) {
         stream->recv_grant_kind = TREV_MSQUIC_RECV_PAUSE_NONE;
         stream->recv_grant_bytes = 0;
@@ -931,6 +717,11 @@ static trevrpc_msquic_reserve_result trevrpc_msquic_recv_try_reserve_locked(trev
 }
 
 static void trevrpc_msquic_recv_release_locked(trevrpc_msquic_stream* stream, size_t bytes, size_t count) {
+    /* Unbudgeted streams predate the shared receive budget: no accounting,
+     * and their injected chunks carry no charges to release. */
+    if (stream->recv_budget == NULL) {
+        return;
+    }
     if (bytes > stream->recv_owned_bytes || count > stream->recv_owned_count) {
         abort();
     }
@@ -974,6 +765,10 @@ static void trevrpc_msquic_recv_pause_locked(trevrpc_msquic_stream* stream,
     stream->recv_pause_need_count = needed_count;
     stream->receive_disabled = stream->receive_disabled || receive_disabled;
     trevrpc_msquic_receive_budget* budget = stream->recv_budget;
+    if (budget == NULL) {
+        /* Unbudgeted streams never join a pause list; resume is consumer-driven. */
+        return;
+    }
     pthread_mutex_lock(&budget->mutex);
     if (!stream->receive_closing && !stream->pause_listed) {
         stream->pause_prev = budget->paused_tail;
@@ -991,9 +786,11 @@ static void trevrpc_msquic_recv_pause_locked(trevrpc_msquic_stream* stream,
 
 static void trevrpc_msquic_recv_unpause_locked(trevrpc_msquic_stream* stream) {
     trevrpc_msquic_receive_budget* budget = stream->recv_budget;
-    pthread_mutex_lock(&budget->mutex);
-    trevrpc_msquic_recv_pause_remove_budget_locked(budget, stream);
-    pthread_mutex_unlock(&budget->mutex);
+    if (budget != NULL) {
+        pthread_mutex_lock(&budget->mutex);
+        trevrpc_msquic_recv_pause_remove_budget_locked(budget, stream);
+        pthread_mutex_unlock(&budget->mutex);
+    }
     stream->recv_pause_kind = TREV_MSQUIC_RECV_PAUSE_NONE;
     stream->recv_pause_need_bytes = 0;
     stream->recv_pause_need_count = 0;
@@ -1742,6 +1539,11 @@ static int trevrpc_msquic_stream_append_frame_bytes_locked(
 }
 
 static size_t trevrpc_msquic_stream_frame_max_locked(const trevrpc_msquic_stream* stream, size_t requested) {
+    /* Unbudgeted streams (test raw streams, ABI 6 facade) predate the shared
+     * receive budget: no configured cap, no connection cap, honor the request. */
+    if (stream->recv_budget == NULL || !stream->parser_budgeted) {
+        return requested;
+    }
     size_t result = requested < stream->configured_max_frame_size ? requested : stream->configured_max_frame_size;
     size_t stream_cap = stream->max_recv_owned_bytes - sizeof(trevrpc_msquic_frame);
     size_t connection_cap = stream->recv_budget->max_owned_bytes - sizeof(trevrpc_msquic_frame);
@@ -4186,10 +3988,14 @@ int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream) {
 
 static void trevrpc_msquic_stream_request_deferred_close(trevrpc_msquic_stream* stream) {
     trevrpc_msquic_receive_budget* recv_budget = stream->recv_budget;
-    pthread_mutex_lock(&recv_budget->mutex);
-    stream->receive_closing = true;
-    trevrpc_msquic_recv_pause_remove_budget_locked(recv_budget, stream);
-    pthread_mutex_unlock(&recv_budget->mutex);
+    if (recv_budget != NULL) {
+        pthread_mutex_lock(&recv_budget->mutex);
+        stream->receive_closing = true;
+        trevrpc_msquic_recv_pause_remove_budget_locked(recv_budget, stream);
+        pthread_mutex_unlock(&recv_budget->mutex);
+    } else {
+        stream->receive_closing = true;
+    }
 
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
@@ -4219,13 +4025,17 @@ static void trevrpc_msquic_stream_destroy_owned(trevrpc_msquic_stream* stream, b
     bool release_api = false;
 
     trevrpc_msquic_test_emit_stream_event(TREV_MSQUIC_TEST_STREAM_CLOSE_STARTED);
-    pthread_mutex_lock(&recv_budget->mutex);
-    stream->receive_closing = true;
-    trevrpc_msquic_recv_pause_remove_budget_locked(recv_budget, stream);
-    while (atomic_load_explicit(&stream->active_resume_pins, memory_order_acquire) > 0) {
-        pthread_cond_wait(&recv_budget->cond, &recv_budget->mutex);
+    if (recv_budget != NULL) {
+        pthread_mutex_lock(&recv_budget->mutex);
+        stream->receive_closing = true;
+        trevrpc_msquic_recv_pause_remove_budget_locked(recv_budget, stream);
+        while (atomic_load_explicit(&stream->active_resume_pins, memory_order_acquire) > 0) {
+            pthread_cond_wait(&recv_budget->cond, &recv_budget->mutex);
+        }
+        pthread_mutex_unlock(&recv_budget->mutex);
+    } else {
+        stream->receive_closing = true;
     }
-    pthread_mutex_unlock(&recv_budget->mutex);
 
     pthread_mutex_lock(&stream->mutex);
     while (!trevrpc_msquic_stream_send_ops_idle(stream)) {
@@ -4415,7 +4225,9 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     }
     conn->configuration = configuration;
     conn->registration = registration;
-    trevrpc_msquic_feature_state_init(&conn->features, &listener->features);
+    trevrpc_msquic_feature_request connection_features =
+        trevrpc_msquic_conn_uses_native_frames(conn) ? trevrpc_msquic_generic_feature_request() : listener->features;
+    trevrpc_msquic_feature_state_init(&conn->features, &connection_features);
     conn->max_frame_size = max_frame_size;
     conn->max_pending_send_bytes = max_pending_send_bytes;
     conn->max_pending_send_count = max_pending_send_count;
@@ -4677,6 +4489,11 @@ static int trevrpc_msquic_receive_raw_locked(
         }
         size_t local_payload = local_max_bytes - stream->recv_owned_bytes - sizeof(trevrpc_msquic_chunk);
         trevrpc_msquic_receive_budget* budget = stream->recv_budget;
+        if (budget == NULL) {
+            /* Unbudgeted streams admit against their local caps alone. */
+            charge = sizeof(trevrpc_msquic_chunk) + local_payload;
+            return 0;
+        }
         pthread_mutex_lock(&budget->mutex);
         size_t aggregate_max_bytes = undecided ? budget->undecided_admission_max_bytes : budget->max_owned_bytes;
         size_t aggregate_max_count = undecided ? budget->undecided_admission_max_count : budget->max_owned_count;
@@ -5017,11 +4834,13 @@ void trevrpc_msquic_test_receive_snapshot_get(
     for (trevrpc_msquic_frame* frame = stream->frame_head; frame != NULL; frame = frame->next) {
         snapshot->queued_frames++;
     }
-    pthread_mutex_lock(&stream->recv_budget->mutex);
-    snapshot->connection_owned_bytes = stream->recv_budget->owned_bytes;
-    snapshot->connection_owned_count = stream->recv_budget->owned_count;
-    snapshot->resume_scan_count = stream->recv_budget->resume_scan_count;
-    pthread_mutex_unlock(&stream->recv_budget->mutex);
+    if (stream->recv_budget != NULL) {
+        pthread_mutex_lock(&stream->recv_budget->mutex);
+        snapshot->connection_owned_bytes = stream->recv_budget->owned_bytes;
+        snapshot->connection_owned_count = stream->recv_budget->owned_count;
+        snapshot->resume_scan_count = stream->recv_budget->resume_scan_count;
+        pthread_mutex_unlock(&stream->recv_budget->mutex);
+    }
     pthread_mutex_unlock(&stream->mutex);
 }
 
