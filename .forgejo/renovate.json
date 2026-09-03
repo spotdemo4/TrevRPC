@@ -151,7 +151,7 @@
       "addLabels": ["kotlin"]
     },
     {
-      "matchManagers": ["gradle", "gradle-wrapper"],
+      "matchManagers": ["gradle", "gradle-wrapper", "maven"],
       "postUpgradeTasks": {
         "commands": ["nix run .#update-kotlin-deps"],
         "fileFilters": [
