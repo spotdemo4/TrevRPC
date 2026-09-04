@@ -53,7 +53,7 @@ val protobufVersion =
         .get()
 val kotlinVersion = libs.versions.kotlin.get()
 
-version = "0.3.3"
+version = "0.3.4"
 providers.gradleProperty("trevrpcVersion").orNull?.let { version = it }
 providers.environmentVariable("TREVRPC_VERSION").orNull?.let { version = it }
 

@@ -16,7 +16,7 @@
 }:
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin-bench-peer-cronet";
-  version = "0.3.3";
+  version = "0.3.4";
 
   src = lib.fileset.toSource {
     root = ../../.;

@@ -94,7 +94,7 @@ let
 in
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin";
-  version = "0.3.3";
+  version = "0.3.4";
   passthru.benchPeerCronet = benchPeerCronet;
 
   src = lib.fileset.toSource {
