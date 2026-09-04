@@ -404,6 +404,17 @@
         checks = pkgs.mkChecks {
           benchmark-controller = packageSet.trevrpc-bench;
 
+          android-smoke-runner =
+            pkgs.runCommand "trevrpc-android-smoke-runner-tests"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+              }
+              ''
+                ANDROID_SMOKE_RUNNER=${./bench/ci/run-android-smoke-cell.py} \
+                  python3 ${./bench/ci/tests/test_run_android_smoke_cell.py}
+                touch $out
+              '';
+
           c = packageSet.trevrpc-c;
           c-sanitizers = packageSet.trevrpc-c.override {
             sanitizers = true;

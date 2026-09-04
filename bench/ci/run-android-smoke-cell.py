@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,10 @@ EMULATOR_PORT = 5554
 BOOT_TIMEOUT_SECONDS = 180
 SERVER_TIMEOUT_SECONDS = 30
 INSTRUMENTATION_TIMEOUT_SECONDS = 120
+ADB_PROBE_TIMEOUT_SECONDS = 5
+DATA_PARTITION_MIB = 4096
+MIN_AVD_FREE_BYTES = 6 * 1024 * 1024 * 1024
+EMULATOR_LOG_TAIL_LINES = 80
 
 
 class SmokeFailure(RuntimeError):
@@ -32,6 +37,7 @@ class Arguments:
     app_apk: Path
     test_apk: Path
     output: Path
+    work_dir: Path
     system_image: str
 
 
@@ -42,6 +48,7 @@ def parse_args() -> Arguments:
     _ = parser.add_argument("--app-apk", type=Path, required=True)
     _ = parser.add_argument("--test-apk", type=Path, required=True)
     _ = parser.add_argument("--output", type=Path, required=True)
+    _ = parser.add_argument("--work-dir", type=Path, required=True)
     _ = parser.add_argument(
         "--system-image",
         default="system-images;android-33;google_apis;x86_64",
@@ -53,6 +60,7 @@ def parse_args() -> Arguments:
         app_apk=require_path(values, "app_apk"),
         test_apk=require_path(values, "test_apk"),
         output=require_path(values, "output"),
+        work_dir=require_path(values, "work_dir"),
         system_image=require_string(values, "system_image"),
     )
 
@@ -91,15 +99,20 @@ def run_checked(
     timeout: int = 60,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        command,
-        input=input_text,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        env=env,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SmokeFailure(
+            f"command timed out after {timeout}s: {' '.join(command)}"
+        ) from error
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
         raise SmokeFailure(
@@ -120,26 +133,146 @@ def adb(
     return run_checked(["adb", "-s", serial, *arguments], timeout=timeout)
 
 
-def wait_for_boot(serial: str, timeout: int = BOOT_TIMEOUT_SECONDS) -> None:
-    deadline = time.monotonic() + timeout
-    _ = run_checked(["adb", "-s", serial, "wait-for-device"], timeout=timeout)
-    while time.monotonic() < deadline:
-        result = subprocess.run(
-            ["adb", "-s", serial, "shell", "getprop", "sys.boot_completed"],
+def adb_probe(serial: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["adb", "-s", serial, *arguments],
             text=True,
             capture_output=True,
-            timeout=10,
+            timeout=ADB_PROBE_TIMEOUT_SECONDS,
             check=False,
         )
-        if result.returncode == 0 and result.stdout.strip() == "1":
-            _ = adb(serial, "shell", "input", "keyevent", "82")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def emulator_log_tail(log_path: Path) -> str:
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as error:
+        return f"unable to read emulator log: {error}"
+    return "\n".join(lines[-EMULATOR_LOG_TAIL_LINES:])
+
+
+def require_emulator_running(process: subprocess.Popen[bytes], log_path: Path) -> None:
+    return_code = process.poll()
+    if return_code is None:
+        return
+    tail = emulator_log_tail(log_path)
+    message = (
+        f"emulator exited with {return_code}; see {log_path}\n"
+        + f"last emulator log lines:\n{tail}"
+    )
+    raise SmokeFailure(message)
+
+
+def wait_for_root(
+    serial: str,
+    process: subprocess.Popen[bytes],
+    log_path: Path,
+    timeout: int = 60,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        require_emulator_running(process, log_path)
+        result = adb_probe(serial, "shell", "id", "-u")
+        if (
+            result is not None
+            and result.returncode == 0
+            and result.stdout.strip() == "0"
+        ):
             return
         time.sleep(1)
+    require_emulator_running(process, log_path)
+    raise SmokeFailure(
+        f"emulator {serial} did not restart adbd as root within {timeout}s"
+    )
+
+
+def read_boot_id(serial: str) -> str | None:
+    result = adb_probe(serial, "shell", "cat", "/proc/sys/kernel/random/boot_id")
+    if result is None or result.returncode != 0:
+        return None
+    boot_id = result.stdout.strip()
+    return boot_id or None
+
+
+def wait_for_boot(
+    serial: str,
+    process: subprocess.Popen[bytes],
+    log_path: Path,
+    *,
+    previous_boot_id: str | None = None,
+    timeout: int = BOOT_TIMEOUT_SECONDS,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        require_emulator_running(process, log_path)
+        state = adb_probe(serial, "get-state")
+        if (
+            state is not None
+            and state.returncode == 0
+            and state.stdout.strip() == "device"
+        ):
+            boot_id = read_boot_id(serial)
+            completed = adb_probe(serial, "shell", "getprop", "sys.boot_completed")
+            if (
+                completed is not None
+                and completed.returncode == 0
+                and completed.stdout.strip() == "1"
+                and boot_id is not None
+                and (previous_boot_id is None or boot_id != previous_boot_id)
+            ):
+                _ = adb(serial, "shell", "input", "keyevent", "82")
+                return
+        time.sleep(1)
+    require_emulator_running(process, log_path)
     raise SmokeFailure(f"emulator {serial} did not finish booting within {timeout}s")
 
 
-def create_avd(output: Path, system_image: str) -> tuple[str, dict[str, str]]:
-    avd_home = output / "avd"
+def record_disk_usage(path: Path) -> dict[str, int | str]:
+    usage = shutil.disk_usage(path)
+    return {
+        "path": str(path),
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+    }
+
+
+def prepare_work_dir(work_dir: Path, output: Path) -> None:
+    if work_dir.resolve() == output.resolve():
+        raise SmokeFailure("work directory must be separate from diagnostic output")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.NamedTemporaryFile(dir=work_dir, prefix=".write-probe-") as probe:
+            _ = probe.write(b"ok\n")
+            probe.flush()
+    except OSError as error:
+        raise SmokeFailure(
+            f"work directory is not writable: {work_dir}: {error}"
+        ) from error
+
+    work_usage = record_disk_usage(work_dir)
+    output_usage = record_disk_usage(output)
+    _ = (output / "filesystem-space.json").write_text(
+        json.dumps({"work": work_usage, "output": output_usage}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    free_bytes = work_usage["free_bytes"]
+    assert isinstance(free_bytes, int)
+    if free_bytes < MIN_AVD_FREE_BYTES:
+        message = (
+            f"work directory has {free_bytes} bytes free, "
+            + f"but Android smoke requires at least {MIN_AVD_FREE_BYTES}: {work_dir}"
+        )
+        raise SmokeFailure(message)
+
+
+def create_avd(
+    work_dir: Path, output: Path, system_image: str
+) -> tuple[str, dict[str, str]]:
+    avd_home = work_dir / "avd"
     avd_home.mkdir()
     avd_name = f"trevrpc-smoke-{os.getpid()}"
     env = os.environ.copy()
@@ -161,32 +294,46 @@ def create_avd(output: Path, system_image: str) -> tuple[str, dict[str, str]]:
         timeout=60,
         env=env,
     )
+    config_path = avd_home / f"{avd_name}.avd" / "config.ini"
+    if config_path.is_file():
+        _ = shutil.copyfile(config_path, output / "avd-config.ini")
     return avd_name, env
+
+
+def emulator_command(avd_name: str) -> list[str]:
+    return [
+        "emulator",
+        "-avd",
+        avd_name,
+        "-port",
+        str(EMULATOR_PORT),
+        "-no-window",
+        "-no-audio",
+        "-no-boot-anim",
+        "-no-snapshot",
+        "-wipe-data",
+        "-writable-system",
+        "-partition-size",
+        str(DATA_PARTITION_MIB),
+        "-gpu",
+        "swiftshader_indirect",
+        "-no-metrics",
+    ]
 
 
 def start_emulator(
     avd_name: str,
     env: dict[str, str],
     log_path: Path,
+    output: Path,
 ) -> tuple[subprocess.Popen[bytes], str]:
+    command = emulator_command(avd_name)
+    _ = (output / "emulator-command.json").write_text(
+        json.dumps(command, indent=2) + "\n", encoding="utf-8"
+    )
     log = log_path.open("wb")
     process = subprocess.Popen(
-        [
-            "emulator",
-            "-avd",
-            avd_name,
-            "-port",
-            str(EMULATOR_PORT),
-            "-no-window",
-            "-no-audio",
-            "-no-boot-anim",
-            "-no-snapshot",
-            "-wipe-data",
-            "-writable-system",
-            "-gpu",
-            "swiftshader_indirect",
-            "-no-metrics",
-        ],
+        command,
         stdout=log,
         stderr=subprocess.STDOUT,
         env=env,
@@ -196,15 +343,21 @@ def start_emulator(
     return process, f"emulator-{EMULATOR_PORT}"
 
 
-def install_ca(serial: str, ca_path: Path, output: Path) -> None:
+def install_ca(
+    serial: str,
+    process: subprocess.Popen[bytes],
+    emulator_log: Path,
+    ca_path: Path,
+    work_dir: Path,
+) -> None:
     subject_hash = run_checked(
         ["openssl", "x509", "-subject_hash_old", "-noout", "-in", str(ca_path)]
     ).stdout.splitlines()[0]
-    android_ca = output / f"{subject_hash}.0"
+    android_ca = work_dir / f"{subject_hash}.0"
     _ = shutil.copyfile(ca_path, android_ca)
 
     _ = adb(serial, "root")
-    _ = run_checked(["adb", "-s", serial, "wait-for-device"])
+    wait_for_root(serial, process, emulator_log)
     _ = adb(serial, "remount", timeout=90)
     _ = adb(
         serial,
@@ -219,11 +372,34 @@ def install_ca(serial: str, ca_path: Path, output: Path) -> None:
         "644",
         f"/system/etc/security/cacerts/{android_ca.name}",
     )
+    previous_boot_id = read_boot_id(serial)
+    if previous_boot_id is None:
+        raise SmokeFailure("could not read emulator boot ID before reboot")
     _ = adb(serial, "reboot")
-    wait_for_boot(serial)
+    wait_for_boot(
+        serial,
+        process,
+        emulator_log,
+        previous_boot_id=previous_boot_id,
+    )
     _ = adb(
         serial, "shell", "test", "-f", f"/system/etc/security/cacerts/{android_ca.name}"
     )
+
+
+def parse_server_event(line: str, expected: str, log: TextIO) -> dict[str, object]:
+    _ = log.write(line)
+    log.flush()
+    event = parse_json_object(line, "server event")
+    if event.get("schema_version") != SCHEMA_VERSION:
+        raise SmokeFailure(f"server emitted wrong schema version: {event!r}")
+    if event.get("event") == "error":
+        raise SmokeFailure(f"server reported an error: {event!r}")
+    if event.get("event") != expected:
+        raise SmokeFailure(
+            f"server emitted {event.get('event')!r}, expected {expected!r}"
+        )
+    return event
 
 
 def read_event(
@@ -239,6 +415,9 @@ def read_event(
     try:
         while time.monotonic() < deadline:
             if process.poll() is not None:
+                line = stdout.readline()
+                if line != "":
+                    return parse_server_event(line, expected, log)
                 raise SmokeFailure(
                     f"server exited with {process.returncode} before {expected!r} event"
                 )
@@ -246,20 +425,8 @@ def read_event(
             if not events:
                 continue
             line = stdout.readline()
-            if line == "":
-                continue
-            _ = log.write(line)
-            log.flush()
-            event = parse_json_object(line, "server event")
-            if event.get("schema_version") != SCHEMA_VERSION:
-                raise SmokeFailure(f"server emitted wrong schema version: {event!r}")
-            if event.get("event") == "error":
-                raise SmokeFailure(f"server reported an error: {event!r}")
-            if event.get("event") != expected:
-                raise SmokeFailure(
-                    f"server emitted {event.get('event')!r}, expected {expected!r}"
-                )
-            return event
+            if line != "":
+                return parse_server_event(line, expected, log)
     finally:
         selector.close()
     raise SmokeFailure(f"server did not emit {expected!r} within {timeout}s")
@@ -397,25 +564,65 @@ def stop_process(
     try:
         os.killpg(process.pid, signal.SIGTERM)
         _ = process.wait(timeout=timeout)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        return
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"warning: graceful process cleanup failed: {error}", file=sys.stderr)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
         _ = process.wait(timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"warning: forced process cleanup failed: {error}", file=sys.stderr)
 
 
-def collect_logcat(serial: str, output: Path) -> None:
-    result = subprocess.run(
-        ["adb", "-s", serial, "logcat", "-d", "-v", "threadtime"],
-        text=True,
-        capture_output=True,
-        timeout=30,
-        check=False,
+def device_is_online(serial: str) -> bool:
+    result = adb_probe(serial, "get-state")
+    return (
+        result is not None
+        and result.returncode == 0
+        and result.stdout.strip() == "device"
     )
-    _ = (output / "logcat.log").write_text(
-        result.stdout + result.stderr, encoding="utf-8"
-    )
+
+
+def collect_logcat(
+    serial: str,
+    output: Path,
+    process: subprocess.Popen[bytes] | None,
+) -> None:
+    log_path = output / "logcat.log"
+    if process is None or process.poll() is not None or not device_is_online(serial):
+        _ = log_path.write_text(
+            f"logcat unavailable: {serial} is not an online emulator\n",
+            encoding="utf-8",
+        )
+        return
+    try:
+        result = subprocess.run(
+            ["adb", "-s", serial, "logcat", "-d", "-v", "threadtime"],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        contents = result.stdout + result.stderr
+    except (OSError, subprocess.TimeoutExpired) as error:
+        contents = f"logcat collection failed: {error}\n"
+    _ = log_path.write_text(contents, encoding="utf-8")
+
+
+def stop_emulator_with_adb(
+    serial: str, process: subprocess.Popen[bytes] | None
+) -> None:
+    if process is None or process.poll() is not None or not device_is_online(serial):
+        return
+    try:
+        _ = subprocess.run(
+            ["adb", "-s", serial, "emu", "kill"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"warning: adb emulator cleanup failed: {error}", file=sys.stderr)
 
 
 def main() -> int:
@@ -423,6 +630,9 @@ def main() -> int:
     if arguments.output.exists():
         raise SmokeFailure(f"output path already exists: {arguments.output}")
     arguments.output.mkdir(parents=True)
+    prepare_work_dir(arguments.work_dir, arguments.output)
+    certificate_dir = arguments.work_dir / "certificates"
+    certificate_dir.mkdir()
     for apk in [arguments.app_apk, arguments.test_apk]:
         if not apk.is_file():
             raise SmokeFailure(f"APK does not exist: {apk}")
@@ -448,7 +658,7 @@ def main() -> int:
                 "trevrpc-bench",
                 "certificates",
                 "--out",
-                str(arguments.output),
+                str(certificate_dir),
                 "--server-ip",
                 "127.0.0.1",
                 "--server-ip",
@@ -462,14 +672,24 @@ def main() -> int:
         certificate = Path(require_string(certificates, "certificate"))
         private_key = Path(require_string(certificates, "private_key"))
 
-        avd_name, emulator_env = create_avd(arguments.output, arguments.system_image)
+        avd_name, emulator_env = create_avd(
+            arguments.work_dir, arguments.output, arguments.system_image
+        )
+        emulator_log = arguments.output / "emulator.log"
         emulator_process, serial = start_emulator(
             avd_name,
             emulator_env,
-            arguments.output / "emulator.log",
+            emulator_log,
+            arguments.output,
         )
-        wait_for_boot(serial)
-        install_ca(serial, ca, arguments.output)
+        wait_for_boot(serial, emulator_process, emulator_log)
+        install_ca(
+            serial,
+            emulator_process,
+            emulator_log,
+            ca,
+            arguments.work_dir,
+        )
         for setting in [
             "window_animation_scale",
             "transition_animation_scale",
@@ -507,13 +727,13 @@ def main() -> int:
             raise SmokeFailure(f"server exited with {server_process.returncode}")
         server_stdout.close()
         server_stdout = None
-        collect_logcat(serial, arguments.output)
+        collect_logcat(serial, arguments.output, emulator_process)
         return 0
     except Exception:
         if shutil.which("adb") is not None:
             try:
-                collect_logcat(serial, arguments.output)
-            except (OSError, subprocess.SubprocessError) as error:
+                collect_logcat(serial, arguments.output, emulator_process)
+            except OSError as error:
                 print(f"warning: failed to collect logcat: {error}", file=sys.stderr)
         raise
     finally:
@@ -521,12 +741,7 @@ def main() -> int:
             server_stdout.close()
         stop_process(server_process)
         if shutil.which("adb") is not None:
-            _ = subprocess.run(
-                ["adb", "-s", serial, "emu", "kill"],
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
+            stop_emulator_with_adb(serial, emulator_process)
         stop_process(emulator_process, timeout=30)
 
 
