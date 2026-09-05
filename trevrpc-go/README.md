@@ -27,7 +27,12 @@ Generate with `protoc-gen-trevrpc-go`.
 ## Client
 
 ```go
-channel, _ := trevrpc.Dial(ctx, "127.0.0.1:50051", trevrpc.DialOptions{TLSConfig: tlsConfig})
+channel, _ := trevrpc.Dial(ctx, "127.0.0.1:50051", trevrpc.DialOptions{
+    Credentials: &trevrpc.TransportCredentials{
+        RootCAPEM:  caPEM,
+        ServerName: "localhost",
+    },
+})
 defer channel.Close()
 client := greeter.NewGreeterClient(channel)
 
@@ -83,6 +88,22 @@ func (greeterService) BidiHello(_ context.Context, reqs trevrpc.MessageStream[*g
 
 server := trevrpc.NewServer()
 greeter.RegisterGreeterServer(server, greeterService{})
-listener, _ := quic.ListenAddr("127.0.0.1:50051", tlsConfig, trevrpc.QUICServerConfig(server.Options(), nil))
-trevrpc.ServeQUIC(ctx, listener, server)
+listener, _ := trevrpc.Listen("127.0.0.1:50051", server, trevrpc.ListenOptions{
+    Credentials: &trevrpc.TransportCredentials{
+        CertificateChainPEM: certificatePEM,
+        PrivateKeyPEM:       privateKeyPEM,
+    },
+})
+defer listener.Close()
+listener.Serve(ctx)
 ```
+
+## Transport backends
+
+`DialOptions.Backend` and `ListenOptions.Backend` accept `TransportBackendAuto`,
+`TransportBackendLegacy`, or `TransportBackendNative`. `Auto` resolves
+deterministically to the quic-go/webtransport-go Legacy backend in this release;
+it never probes or falls back at runtime. Explicit `Native` returns an actionable
+unavailable error until the native adapter is built. The `tls.Config`,
+`quic.Config`, and raw quic-go/webtransport-go APIs remain deprecated
+Legacy-only compatibility surfaces.

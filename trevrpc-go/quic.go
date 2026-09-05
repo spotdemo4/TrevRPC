@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
 )
 
 const cancelledStreamCode quic.StreamErrorCode = 1
@@ -18,20 +19,38 @@ const maxMessageFrameBatch = 16
 
 // RawQUICClient sends TrevRPC calls over one caller-owned QUIC connection.
 // Construct one through Advanced.NewRawQUICClient.
+// Deprecated: this client is available only with the Legacy backend.
 type RawQUICClient struct {
-	conn         *quic.Conn
-	maxFrameSize int
+	conn   *quic.Conn
+	client *transportStreamClient
 }
 
 var _ ClientTransport = (*RawQUICClient)(nil)
 
 func newRawQUICClient(conn *quic.Conn) *RawQUICClient {
-	return &RawQUICClient{conn: conn, maxFrameSize: DefaultMaxFrameSize}
+	return newRawQUICClientForEndpoint(
+		conn,
+		newLegacyQUICConnection(conn, TransportBackendAuto),
+	)
+}
+
+func newRawQUICClientForEndpoint(
+	conn *quic.Conn,
+	endpoint *legacyQUICConnection,
+) *RawQUICClient {
+	return &RawQUICClient{
+		conn: conn,
+		client: newTransportStreamClient(
+			endpoint,
+			DefaultMaxFrameSize,
+			transportOrContextStatus,
+		),
+	}
 }
 
 // WithMaxFrameSize sets the maximum TrevRPC frame size for the client.
 func (t *RawQUICClient) WithMaxFrameSize(maxFrameSize int) *RawQUICClient {
-	t.maxFrameSize = maxFrameSize
+	t.client.maxFrameSize = maxFrameSize
 	return t
 }
 
@@ -50,192 +69,12 @@ func (t *RawQUICClient) Close() error {
 
 // Call sends a unary RPC request over QUIC and returns its response.
 func (t *RawQUICClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
-	stream, err := t.conn.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, transportOrContextStatus(ctx, err)
-	}
-	defer stream.CancelRead(cancelledStreamCode)
-	stopCancel := cancelQUICStreamOnContext(ctx, stream)
-	defer stopCancel()
-
-	if err := WriteFrame(stream, request, t.maxFrameSize); err != nil {
-		stream.CancelWrite(cancelledStreamCode)
-		return nil, transportOrContextStatus(ctx, err)
-	}
-
-	if err := stream.Close(); err != nil {
-		return nil, transportOrContextStatus(ctx, err)
-	}
-
-	response := &RpcResponse{}
-	if err := ReadFrame(stream, response, t.maxFrameSize); err != nil {
-		return nil, transportOrContextStatus(ctx, err)
-	}
-
-	return response, nil
+	return t.client.Call(ctx, request)
 }
 
 // StreamingCall sends a streaming RPC request over QUIC and returns response frames.
 func (t *RawQUICClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
-	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := t.conn.OpenStreamSync(streamCtx)
-	if err != nil {
-		cancel()
-		return nil, transportOrContextStatus(streamCtx, err)
-	}
-
-	writerDone := make(chan error, 1)
-	stopCancel := cancelQUICStreamOnContext(streamCtx, stream)
-	go func() {
-		writerDone <- writeStreamingRequest(streamCtx, stream, request, requestBody, t.maxFrameSize)
-	}()
-
-	return &quicResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, stopCancel: stopCancel, maxFrameSize: t.maxFrameSize}, nil
-}
-
-type quicResponseStream struct {
-	stream       *quic.Stream
-	writerDone   <-chan error
-	cancel       context.CancelFunc
-	stopCancel   func()
-	maxFrameSize int
-	done         bool
-}
-
-func (s *quicResponseStream) trevrpcContextCancelsRecv() bool { return true }
-
-func (s *quicResponseStream) SetReadDeadline(deadline time.Time) error {
-	return s.stream.SetReadDeadline(deadline)
-}
-
-func (s *quicResponseStream) Recv() (*RpcStreamFrame, error) {
-	frame, _, err := s.trevrpcRecvStreamFrameFields()
-	if err != nil {
-		return nil, err
-	}
-
-	return frame.rpcStreamFrame(), nil
-}
-
-func (s *quicResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
-	if s.done {
-		return streamFrameFields{}, nil, io.EOF
-	}
-
-	fields, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
-	if err != nil {
-		s.finish(false)
-		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, nil, writerErr
-		}
-		return streamFrameFields{}, nil, transportStatus(err)
-	}
-
-	if !read {
-		s.finish(false)
-		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, nil, writerErr
-		}
-		return streamFrameFields{}, nil, io.EOF
-	}
-
-	if fields.kind == RpcStreamFrameKindStatus {
-		s.finish(false)
-		if fields.statusValue().IsOK() {
-			if err := s.writerError(true); err != nil {
-				return streamFrameFields{}, nil, err
-			}
-		} else {
-			s.ignoreWriterError()
-		}
-	}
-
-	return fields, nil, nil
-}
-
-func (s *quicResponseStream) Close() error {
-	s.finish(true)
-	return s.writerError(true)
-}
-
-func (s *quicResponseStream) finish(cancelRead bool) {
-	if s.done {
-		return
-	}
-
-	s.done = true
-	if s.stopCancel != nil {
-		s.stopCancel()
-		s.stopCancel = nil
-	}
-	if s.cancel != nil {
-		s.cancel()
-	}
-	if cancelRead {
-		s.stream.CancelRead(cancelledStreamCode)
-	}
-	s.stream.CancelWrite(cancelledStreamCode)
-}
-
-func (s *quicResponseStream) writerError(ignoreCancelled bool) error {
-	if s.writerDone == nil {
-		return nil
-	}
-
-	err := <-s.writerDone
-	s.writerDone = nil
-	if err == nil {
-		return nil
-	}
-	if ignoreCancelled && StatusFromError(err).Code == CodeCancelled {
-		return nil
-	}
-
-	return err
-}
-
-func (s *quicResponseStream) ignoreWriterError() {
-	s.writerDone = nil
-}
-
-func cancelQUICStreamOnContext(ctx context.Context, stream *quic.Stream) func() {
-	if ctx.Done() == nil {
-		return func() {}
-	}
-
-	done := make(chan struct{})
-	var closeOnce sync.Once
-	go func() {
-		select {
-		case <-ctx.Done():
-			stream.CancelRead(cancelledStreamCode)
-			stream.CancelWrite(cancelledStreamCode)
-		case <-done:
-		}
-	}()
-
-	return func() { closeOnce.Do(func() { close(done) }) }
-}
-
-func writeStreamingRequest(ctx context.Context, stream *quic.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
-	requestBody = closeStreamOnContext(ctx, requestBody)
-	defer closeMessageStream(requestBody)
-
-	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
-		stream.CancelWrite(cancelledStreamCode)
-		return transportOrContextStatus(ctx, err)
-	}
-
-	if err := writeRequestBodyFrames(ctx, stream, requestBody, maxFrameSize); err != nil {
-		stream.CancelWrite(cancelledStreamCode)
-		return transportOrContextStatus(ctx, err)
-	}
-
-	if err := stream.Close(); err != nil {
-		return transportOrContextStatus(ctx, err)
-	}
-
-	return nil
+	return t.client.StreamingCall(ctx, request, requestBody)
 }
 
 func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody ByteStream, maxFrameSize int) error {
@@ -314,80 +153,59 @@ func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error
 }
 
 // ServeQUIC accepts QUIC connections and serves TrevRPC until ctx is cancelled.
+// Deprecated: use Listen so transport backend selection remains explicit.
 func ServeQUIC(ctx context.Context, listener *quic.Listener, server *Server) error {
-	runtime := server.freeze()
-	connectionLimit := runtime.connectionLimit
-	requestLimit := runtime.requestLimit
-	connectionsCtx, stopConnections := context.WithCancel(context.Background())
-	defer stopConnections()
+	return serveLegacyQUIC(
+		ctx,
+		listener,
+		server,
+		TransportBackendAuto,
+	)
+}
 
-	var connectionTasks sync.WaitGroup
-	var activeMu sync.Mutex
-	active := map[*quic.Conn]struct{}{}
-
-	closeActiveConnections := func(message string) {
-		activeMu.Lock()
-		defer activeMu.Unlock()
-		for conn := range active {
-			conn.CloseWithError(0, message)
-		}
-	}
-
-	go func() {
-		<-ctx.Done()
-		stopConnections()
-		_ = listener.Close()
-	}()
-
-	for {
-		conn, err := listener.Accept(ctx)
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, quic.ErrServerClosed) {
-				break
-			}
-
-			stopConnections()
-			closeActiveConnections("server accept failed")
-			waitForWaitGroup(&connectionTasks, runtime.options.GracefulShutdownTimeout, func() {
-				runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
-				closeActiveConnections("server connection drain timed out")
-			})
-			waitForRuntimeExecutions(runtime)
-			return transportStatus(err)
-		}
-
-		if !tryAcquire(connectionLimit) {
-			conn.CloseWithError(0, "too many concurrent connections")
-			continue
-		}
-
-		activeMu.Lock()
-		active[conn] = struct{}{}
-		activeMu.Unlock()
-		connectionTasks.Go(func() {
-			defer release(connectionLimit)
-			defer func() {
-				activeMu.Lock()
-				delete(active, conn)
-				activeMu.Unlock()
-			}()
-			if isHTTP3QUICConnection(conn, runtime.options) {
-				handleHTTP3Connection(connectionsCtx, conn, server, requestLimit, true)
+func serveLegacyQUIC(
+	ctx context.Context,
+	listener *quic.Listener,
+	server *Server,
+	requestedBackend TransportBackend,
+) error {
+	return serveTransportListener(
+		ctx,
+		&legacyQUICListener{
+			listener:         listener,
+			requestedBackend: requestedBackend,
+		},
+		server,
+		func(
+			connectionsCtx context.Context,
+			conn transportinternal.Connection,
+			server *Server,
+			requestLimit semaphore,
+		) {
+			legacy := conn.(*legacyQUICConnection)
+			if isHTTP3QUICConnection(legacy.conn, server.freeze().options) {
+				handleHTTP3Connection(
+					connectionsCtx,
+					legacy,
+					server,
+					requestLimit,
+					true,
+				)
 				return
 			}
-
-			handleQUICConnection(connectionsCtx, conn, server, requestLimit, true)
-		})
-	}
-
-	stopConnections()
-	waitForWaitGroup(&connectionTasks, runtime.options.GracefulShutdownTimeout, func() {
-		runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
-		closeActiveConnections("server graceful shutdown timed out")
-	})
-	waitForRuntimeExecutions(runtime)
-
-	return nil
+			handleTransportConnection(
+				connectionsCtx,
+				conn,
+				server,
+				requestLimit,
+				true,
+			)
+		},
+		func(err error) bool {
+			return errors.Is(err, quic.ErrServerClosed)
+		},
+		transportStatus,
+	)
 }
 
 func waitForRuntimeExecutions(runtime *serverRuntime) {
@@ -398,93 +216,20 @@ func waitForRuntimeExecutions(runtime *serverRuntime) {
 }
 
 // HandleQUICConnection serves TrevRPC streams on an accepted QUIC connection.
-func HandleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, requestLimit semaphore) {
-	handleQUICConnection(ctx, conn, server, requestLimit, true)
-}
-
-func handleQUICConnection(ctx context.Context, conn *quic.Conn, server *Server, requestLimit semaphore, closeOnShutdown bool) {
-	runtime := server.freeze()
-	if conn.ConnectionState().TLS.NegotiatedProtocol != ALPN {
-		conn.CloseWithError(0, "unsupported ALPN")
-		return
-	}
-
-	streamLimit := newSemaphore(runtime.options.MaxConcurrentStreamsPerConnection)
-	var streamTasks sync.WaitGroup
-
-	for {
-		stream, err := conn.AcceptStream(ctx)
-		if err != nil {
-			break
-		}
-
-		if !tryAcquire(streamLimit) {
-			writeStatusResponse(stream, Unavailable("too many concurrent streams on connection"), runtime.options.MaxFrameSize)
-			continue
-		}
-
-		streamTasks.Go(func() {
-			defer release(streamLimit)
-			streamCtx, cancel := contextWithAdditionalCancel(stream.Context(), ctx)
-			defer cancel()
-			handleQUICStream(streamCtx, server, requestLimit, stream)
-		})
-	}
-
-	waitForWaitGroup(&streamTasks, runtime.options.GracefulShutdownTimeout, func() {
-		runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
-		conn.CloseWithError(0, "server stream drain timed out")
-	})
-
-	if closeOnShutdown && ctx.Err() != nil {
-		conn.CloseWithError(0, "server drained connection")
-	}
-}
-
-func handleQUICStream(ctx context.Context, server *Server, requestLimit semaphore, stream *quic.Stream) {
-	handleRPCStream(ctx, server, requestLimit, quicRPCStream{stream: stream})
-}
-
-type quicRPCStream struct {
-	stream *quic.Stream
-}
-
-func (s quicRPCStream) Read(data []byte) (int, error) {
-	return s.stream.Read(data)
-}
-
-func (s quicRPCStream) Write(data []byte) (int, error) {
-	return s.stream.Write(data)
-}
-
-func (s quicRPCStream) Close() error {
-	return s.stream.Close()
-}
-
-func (s quicRPCStream) SetReadDeadline(ttl time.Time) error {
-	return s.stream.SetReadDeadline(ttl)
-}
-
-func (s quicRPCStream) trevrpcCancelRead() {
-	s.stream.CancelRead(cancelledStreamCode)
-}
-
-func (s quicRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
-	if ctx.Done() == nil {
-		return func() {}
-	}
-
-	done := make(chan struct{})
-	var closeOnce sync.Once
-	go func() {
-		select {
-		case <-ctx.Done():
-			s.stream.CancelRead(cancelledStreamCode)
-		case <-done:
-		}
-	}()
-
-	return func() { closeOnce.Do(func() { close(done) }) }
+// Deprecated: use Listen so transport backend selection remains explicit.
+func HandleQUICConnection(
+	ctx context.Context,
+	conn *quic.Conn,
+	server *Server,
+	requestLimit semaphore,
+) {
+	handleTransportConnection(
+		ctx,
+		newLegacyQUICConnection(conn, TransportBackendLegacy),
+		server,
+		requestLimit,
+		true,
+	)
 }
 
 type rpcStream interface {

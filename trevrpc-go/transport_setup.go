@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 // ClientTransport is a TrevRPC client transport that can release its underlying connection.
@@ -25,15 +26,29 @@ type ServerListener interface {
 
 // ListenOptions configures Listen.
 type ListenOptions struct {
-	Transport  TransportConfig
-	TLSConfig  *tls.Config
+	Backend     TransportBackend
+	Transport   TransportConfig
+	Limits      TransportLimits
+	Credentials *TransportCredentials
+	// TLSConfig is supported only by the Legacy backend.
+	// Deprecated: use Credentials for backend-neutral endpoint configuration.
+	TLSConfig *tls.Config
+	// QUICConfig is supported only by the Legacy backend.
+	// Deprecated: use Transport and Limits for backend-neutral endpoint configuration.
 	QUICConfig *quic.Config
 }
 
 // DialOptions configures Dial.
 type DialOptions struct {
-	Transport    TransportConfig
-	TLSConfig    *tls.Config
+	Backend     TransportBackend
+	Transport   TransportConfig
+	Limits      TransportLimits
+	Credentials *TransportCredentials
+	// TLSConfig is supported only by the Legacy backend.
+	// Deprecated: use Credentials for backend-neutral endpoint configuration.
+	TLSConfig *tls.Config
+	// QUICConfig is supported only by the Legacy backend.
+	// Deprecated: use Transport and Limits for backend-neutral endpoint configuration.
 	QUICConfig   *quic.Config
 	MaxFrameSize int
 	OnEvent      func(ChannelEvent)
@@ -42,6 +57,12 @@ type DialOptions struct {
 
 // WebTransportOptions configures WebTransport targets passed to Dial.
 type WebTransportOptions struct {
+	// RequestHeaders supplies backend-neutral ordered request fields. The
+	// Legacy backend preserves duplicate values, but its upstream http.Header
+	// API cannot preserve ordering between different field names on the wire.
+	RequestHeaders HeaderFields
+	// RequestHeader is supported only by the Legacy backend.
+	// Deprecated: use RequestHeaders for backend-neutral request fields.
 	RequestHeader           http.Header
 	ApplicationProtocols    []string
 	StreamReorderingTimeout time.Duration
@@ -52,24 +73,49 @@ func Listen(addr string, server *Server, options ListenOptions) (ServerListener,
 	if server == nil {
 		return nil, InvalidArgument("server is nil")
 	}
-	runtime := server.freeze()
-	if options.TLSConfig == nil {
-		return nil, InvalidArgument("quic-go listener requires TLSConfig")
+	backend, err := resolveTransportBackend(options.Backend)
+	if err != nil {
+		return nil, err
 	}
+	if backend == TransportBackendNative {
+		if options.TLSConfig != nil || options.QUICConfig != nil {
+			return nil, InvalidArgument("native listener does not accept legacy TLSConfig or QUICConfig")
+		}
+		return nil, nativeBackendUnavailable()
+	}
+	tlsConfig, err := legacyServerTLSConfig(options.TLSConfig, cloneTransportCredentials(options.Credentials))
+	if err != nil {
+		return nil, err
+	}
+	runtime := server.freeze()
 	serverOptions := runtime.options
+	if options.Credentials != nil {
+		tlsConfig.NextProtos = []string{ALPN}
+		if serverOptions.EnableHTTP3 || serverOptions.EnableWebTransport {
+			tlsConfig.NextProtos = append(
+				tlsConfig.NextProtos,
+				http3.NextProtoH3,
+			)
+		}
+	}
 	config := QUICServerConfig(serverOptions, options.QUICConfig)
 	applyDefaultQUICTransportConfig(config, mergeTransportConfig(transportConfigFromServerOptions(serverOptions), options.Transport))
-	listener, err := quic.ListenAddr(addr, options.TLSConfig, config)
+	applyQUICTransportLimits(config, options.Limits)
+	listener, err := quic.ListenAddr(addr, tlsConfig, config)
 	if err != nil {
 		return nil, transportStatus(err)
 	}
-	return &quicServerListener{listener: listener, server: server, runtime: runtime}, nil
+	return &quicServerListener{
+		listener:         listener,
+		server:           server,
+		requestedBackend: options.Backend,
+	}, nil
 }
 
 type quicServerListener struct {
-	listener *quic.Listener
-	server   *Server
-	runtime  *serverRuntime
+	listener         *quic.Listener
+	server           *Server
+	requestedBackend TransportBackend
 }
 
 func (l *quicServerListener) Addr() net.Addr {
@@ -77,7 +123,12 @@ func (l *quicServerListener) Addr() net.Addr {
 }
 
 func (l *quicServerListener) Serve(ctx context.Context) error {
-	return ServeQUIC(ctx, l.listener, l.server)
+	return serveLegacyQUIC(
+		ctx,
+		l.listener,
+		l.server,
+		l.requestedBackend,
+	)
 }
 
 func (l *quicServerListener) Close() error {

@@ -5,16 +5,15 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"runtime/debug"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	webtransport "github.com/quic-go/webtransport-go"
+	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
 )
 
 const (
@@ -23,6 +22,7 @@ const (
 )
 
 // RawWebTransportDialOptions configures an advanced single-session WebTransport client.
+// Deprecated: these options configure only the Legacy backend.
 type RawWebTransportDialOptions struct {
 	TLSClientConfig         *tls.Config
 	QUICConfig              *quic.Config
@@ -33,9 +33,10 @@ type RawWebTransportDialOptions struct {
 
 // RawWebTransportClient sends TrevRPC calls over one WebTransport session.
 // Construct one through Advanced.
+// Deprecated: this client is available only with the Legacy backend.
 type RawWebTransportClient struct {
-	session      *webtransport.Session
-	maxFrameSize int
+	session *webtransport.Session
+	client  *transportStreamClient
 }
 
 var _ ClientTransport = (*RawWebTransportClient)(nil)
@@ -60,12 +61,29 @@ func dialRawWebTransport(ctx context.Context, url string, options RawWebTranspor
 }
 
 func newRawWebTransportClient(session *webtransport.Session) *RawWebTransportClient {
-	return &RawWebTransportClient{session: session, maxFrameSize: DefaultMaxFrameSize}
+	return newRawWebTransportClientForEndpoint(
+		session,
+		newLegacyWebTransportSession(session, TransportBackendAuto),
+	)
+}
+
+func newRawWebTransportClientForEndpoint(
+	session *webtransport.Session,
+	endpoint *legacyWebTransportSession,
+) *RawWebTransportClient {
+	return &RawWebTransportClient{
+		session: session,
+		client: newTransportStreamClient(
+			endpoint,
+			DefaultMaxFrameSize,
+			webTransportOrContextStatus,
+		),
+	}
 }
 
 // WithMaxFrameSize sets the maximum TrevRPC frame size for the client.
 func (t *RawWebTransportClient) WithMaxFrameSize(maxFrameSize int) *RawWebTransportClient {
-	t.maxFrameSize = maxFrameSize
+	t.client.maxFrameSize = maxFrameSize
 	return t
 }
 
@@ -84,47 +102,12 @@ func (t *RawWebTransportClient) Close() error {
 
 // Call sends a unary RPC request over WebTransport and returns its response.
 func (t *RawWebTransportClient) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
-	stream, err := t.session.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, webTransportOrContextStatus(ctx, err)
-	}
-	defer stream.CancelRead(cancelledWebTransportStreamCode)
-	stopCancel := cancelWebTransportStreamOnContext(ctx, stream)
-	defer stopCancel()
-
-	if err := WriteFrame(stream, request, t.maxFrameSize); err != nil {
-		stream.CancelWrite(cancelledWebTransportStreamCode)
-		return nil, webTransportOrContextStatus(ctx, err)
-	}
-
-	if err := stream.Close(); err != nil {
-		return nil, webTransportOrContextStatus(ctx, err)
-	}
-
-	response := &RpcResponse{}
-	if err := ReadFrame(stream, response, t.maxFrameSize); err != nil {
-		return nil, webTransportOrContextStatus(ctx, err)
-	}
-
-	return response, nil
+	return t.client.Call(ctx, request)
 }
 
 // StreamingCall sends a streaming RPC request over WebTransport and returns response frames.
 func (t *RawWebTransportClient) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
-	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := t.session.OpenStreamSync(streamCtx)
-	if err != nil {
-		cancel()
-		return nil, webTransportOrContextStatus(streamCtx, err)
-	}
-
-	writerDone := make(chan error, 1)
-	stopCancel := cancelWebTransportStreamOnContext(streamCtx, stream)
-	go func() {
-		writerDone <- writeWebTransportStreamingRequest(streamCtx, stream, request, requestBody, t.maxFrameSize)
-	}()
-
-	return &webTransportResponseStream{stream: stream, writerDone: writerDone, cancel: cancel, stopCancel: stopCancel, maxFrameSize: t.maxFrameSize}, nil
+	return t.client.StreamingCall(ctx, request, requestBody)
 }
 
 type webTransportChannelConnector struct {
@@ -135,23 +118,39 @@ type webTransportChannelConnector struct {
 	applicationProtocols    []string
 	streamReorderingTimeout time.Duration
 	maxFrameSize            int
+	requestedBackend        TransportBackend
 }
 
 func newWebTransportChannelConnector(url string, options DialOptions) (*webTransportChannelConnector, error) {
-	if options.TLSConfig == nil {
-		return nil, InvalidArgument("WebTransport dial requires TLSConfig")
+	backend, err := resolveTransportBackend(options.Backend)
+	if err != nil {
+		return nil, err
+	}
+	if backend == TransportBackendNative {
+		if options.TLSConfig != nil || options.QUICConfig != nil || len(options.WebTransport.RequestHeader) != 0 {
+			return nil, InvalidArgument("native WebTransport dial does not accept legacy TLSConfig, QUICConfig, or RequestHeader")
+		}
+		return nil, nativeBackendUnavailable()
+	}
+	tlsConfig, err := legacyClientTLSConfig(options.TLSConfig, cloneTransportCredentials(options.Credentials))
+	if err != nil {
+		return nil, err
+	}
+	requestHeader, err := legacyRequestHeaders(options.WebTransport.RequestHeaders, options.WebTransport.RequestHeader)
+	if err != nil {
+		return nil, err
 	}
 	maxFrameSize := options.MaxFrameSize
 	if maxFrameSize <= 0 {
 		maxFrameSize = DefaultMaxFrameSize
 	}
-	tlsConfig := options.TLSConfig.Clone()
 	tlsConfig.NextProtos = []string{http3.NextProtoH3}
 	if tlsConfig.ClientSessionCache == nil {
 		tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(defaultChannelSessionCache)
 	}
 	quicConfig := WebTransportQUICClientConfig(maxFrameSize, options.QUICConfig)
 	applyDefaultQUICTransportConfig(quicConfig, options.Transport)
+	applyQUICTransportLimits(quicConfig, options.Limits)
 	if quicConfig.TokenStore == nil {
 		quicConfig.TokenStore = quic.NewLRUTokenStore(defaultChannelTokenOrigins, defaultChannelTokensPerOrigin)
 	}
@@ -160,10 +159,11 @@ func newWebTransportChannelConnector(url string, options DialOptions) (*webTrans
 		url:                     url,
 		tlsConfig:               tlsConfig,
 		quicConfig:              quicConfig,
-		requestHeader:           options.WebTransport.RequestHeader.Clone(),
+		requestHeader:           requestHeader,
 		applicationProtocols:    slices.Clone(options.WebTransport.ApplicationProtocols),
 		streamReorderingTimeout: options.WebTransport.StreamReorderingTimeout,
 		maxFrameSize:            maxFrameSize,
+		requestedBackend:        options.Backend,
 	}, nil
 }
 
@@ -181,15 +181,17 @@ func (c *webTransportChannelConnector) Connect(ctx context.Context) (channelGene
 	if err != nil {
 		return nil, webTransportOrContextStatus(ctx, err)
 	}
+	endpoint := newLegacyWebTransportSession(session, c.requestedBackend)
 	return &webTransportGeneration{
-		client:  newRawWebTransportClient(session).WithMaxFrameSize(c.maxFrameSize),
-		session: session,
+		client: newRawWebTransportClientForEndpoint(session, endpoint).
+			WithMaxFrameSize(c.maxFrameSize),
+		endpoint: endpoint,
 	}, nil
 }
 
 type webTransportGeneration struct {
-	client  *RawWebTransportClient
-	session *webtransport.Session
+	client   *RawWebTransportClient
+	endpoint *legacyWebTransportSession
 }
 
 func (g *webTransportGeneration) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
@@ -205,163 +207,58 @@ func (g *webTransportGeneration) Close() error {
 }
 
 func (g *webTransportGeneration) Done() <-chan struct{} {
-	return g.session.Context().Done()
+	return g.endpoint.Done()
 }
 
 func (g *webTransportGeneration) Err() error {
-	return context.Cause(g.session.Context())
+	return g.endpoint.Err()
+}
+
+func (g *webTransportGeneration) Info() ConnectionInfo {
+	return g.endpoint.Info()
+}
+
+func (g *webTransportGeneration) CloseReason(err error) TransportCloseReason {
+	return webTransportCloseReason(err)
 }
 
 func (g *webTransportGeneration) RawWebTransportSession() *webtransport.Session {
-	return g.session
+	return g.endpoint.session
 }
 
-type webTransportResponseStream struct {
-	stream       *webtransport.Stream
-	writerDone   <-chan error
-	cancel       context.CancelFunc
-	stopCancel   func()
-	maxFrameSize int
-	done         bool
+func (r *serverRuntime) webTransportAdmitted(
+	request *http.Request,
+) (bool, error) {
+	snapshot := cloneAdmissionRequest(request)
+	return r.invokeWebTransportAdmission(WebTransportAdmissionRequest{
+		Request:   snapshot,
+		Headers:   headerFieldsFromHTTP(snapshot.Header),
+		Path:      snapshot.URL.Path,
+		Authority: snapshot.Host,
+		Origin:    snapshot.Header.Get("Origin"),
+		Secure:    snapshot.TLS != nil,
+	})
 }
 
-func (s *webTransportResponseStream) trevrpcContextCancelsRecv() bool { return true }
-
-func (s *webTransportResponseStream) SetReadDeadline(deadline time.Time) error {
-	return s.stream.SetReadDeadline(deadline)
+func (r *serverRuntime) transportWebTransportAdmitted(
+	request transportinternal.WebTransportRequest,
+) (bool, error) {
+	admission := WebTransportAdmissionRequest{
+		Headers:   request.Headers().Clone(),
+		Path:      request.Path(),
+		Authority: request.Authority(),
+		Origin:    request.Origin(),
+		Secure:    request.Secure(),
+	}
+	if legacy, ok := request.(interface{ legacyRequest() *http.Request }); ok {
+		admission.Request = cloneAdmissionRequest(legacy.legacyRequest())
+	}
+	return r.invokeWebTransportAdmission(admission)
 }
 
-func (s *webTransportResponseStream) Recv() (*RpcStreamFrame, error) {
-	frame, _, err := s.trevrpcRecvStreamFrameFields()
-	if err != nil {
-		return nil, err
-	}
-
-	return frame.rpcStreamFrame(), nil
-}
-
-func (s *webTransportResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
-	if s.done {
-		return streamFrameFields{}, nil, io.EOF
-	}
-
-	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
-	if err != nil {
-		s.finish(false)
-		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, nil, writerErr
-		}
-		return streamFrameFields{}, nil, webTransportStatus(err)
-	}
-
-	if !read {
-		s.finish(false)
-		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, nil, writerErr
-		}
-		return streamFrameFields{}, nil, io.EOF
-	}
-
-	if frame.kind == RpcStreamFrameKindStatus {
-		s.finish(false)
-		if frame.statusValue().IsOK() {
-			if err := s.writerError(true); err != nil {
-				return streamFrameFields{}, nil, err
-			}
-		} else {
-			s.ignoreWriterError()
-		}
-	}
-
-	return frame, nil, nil
-}
-
-func (s *webTransportResponseStream) Close() error {
-	s.finish(true)
-	return s.writerError(true)
-}
-
-func (s *webTransportResponseStream) finish(cancelRead bool) {
-	if s.done {
-		return
-	}
-
-	s.done = true
-	if s.stopCancel != nil {
-		s.stopCancel()
-		s.stopCancel = nil
-	}
-	if s.cancel != nil {
-		s.cancel()
-	}
-	if cancelRead {
-		s.stream.CancelRead(cancelledWebTransportStreamCode)
-	}
-	s.stream.CancelWrite(cancelledWebTransportStreamCode)
-}
-
-func (s *webTransportResponseStream) writerError(ignoreCancelled bool) error {
-	if s.writerDone == nil {
-		return nil
-	}
-
-	err := <-s.writerDone
-	s.writerDone = nil
-	if err == nil {
-		return nil
-	}
-	if ignoreCancelled && StatusFromError(err).Code == CodeCancelled {
-		return nil
-	}
-
-	return err
-}
-
-func (s *webTransportResponseStream) ignoreWriterError() {
-	s.writerDone = nil
-}
-
-func cancelWebTransportStreamOnContext(ctx context.Context, stream *webtransport.Stream) func() {
-	if ctx.Done() == nil {
-		return func() {}
-	}
-
-	done := make(chan struct{})
-	var closeOnce sync.Once
-	go func() {
-		select {
-		case <-ctx.Done():
-			stream.CancelRead(cancelledWebTransportStreamCode)
-			stream.CancelWrite(cancelledWebTransportStreamCode)
-		case <-done:
-		}
-	}()
-
-	return func() { closeOnce.Do(func() { close(done) }) }
-}
-
-func writeWebTransportStreamingRequest(ctx context.Context, stream *webtransport.Stream, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
-	requestBody = closeStreamOnContext(ctx, requestBody)
-	defer closeMessageStream(requestBody)
-
-	if err := WriteFrame(stream, request, maxFrameSize); err != nil {
-		stream.CancelWrite(cancelledWebTransportStreamCode)
-		return webTransportOrContextStatus(ctx, err)
-	}
-
-	if err := writeRequestBodyFrames(ctx, stream, requestBody, maxFrameSize); err != nil {
-		stream.CancelWrite(cancelledWebTransportStreamCode)
-		return webTransportOrContextStatus(ctx, err)
-	}
-
-	if err := stream.Close(); err != nil {
-		return webTransportOrContextStatus(ctx, err)
-	}
-
-	return nil
-}
-
-func (r *serverRuntime) webTransportAdmitted(request *http.Request) (admitted bool, err error) {
+func (r *serverRuntime) invokeWebTransportAdmission(
+	request WebTransportAdmissionRequest,
+) (admitted bool, err error) {
 	callback := r.options.WebTransportAdmission
 	if callback == nil {
 		return false, nil
@@ -372,12 +269,105 @@ func (r *serverRuntime) webTransportAdmitted(request *http.Request) (admitted bo
 	defer release(r.admissionLimit)
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = &serverPanicError{phase: ServerDiagnosticAdmissionPanic, recovered: recovered, stack: debug.Stack()}
-			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticAdmissionPanic, Panic: recovered, Stack: debug.Stack(), Err: err})
+			err = &serverPanicError{
+				phase:     ServerDiagnosticAdmissionPanic,
+				recovered: recovered,
+				stack:     debug.Stack(),
+			}
+			r.emitDiagnostic(ServerDiagnostic{
+				Phase: ServerDiagnosticAdmissionPanic,
+				Panic: recovered,
+				Stack: debug.Stack(),
+				Err:   err,
+			})
 		}
 	}()
-	snapshot := cloneAdmissionRequest(request)
-	return callback(WebTransportAdmissionRequest{Request: snapshot, Path: snapshot.URL.Path, Authority: snapshot.Host, Origin: snapshot.Header.Get("Origin"), Secure: snapshot.TLS != nil}), nil
+	return callback(request), nil
+}
+
+func handleWebTransportRequest(
+	request transportinternal.WebTransportRequest,
+	runtime *serverRuntime,
+) (transportinternal.WebTransportSession, bool) {
+	info := "path=" + request.Path() +
+		" authority=" + request.Authority() +
+		" origin=" + request.Origin() +
+		" remote=" + request.RemoteAddress().String()
+	runtime.emitDiagnostic(ServerDiagnostic{
+		Phase:   ServerDiagnosticWebTransportConnect,
+		Message: info,
+	})
+	admitted, err := runtime.transportWebTransportAdmitted(request)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errAdmissionSaturated) {
+			status = http.StatusServiceUnavailable
+		}
+		runtime.emitDiagnostic(ServerDiagnostic{
+			Phase:   ServerDiagnosticWebTransportAdmission,
+			Message: "error",
+			Err:     err,
+		})
+		request.WriteError("internal server error", status)
+		return nil, false
+	}
+	if !admitted {
+		runtime.emitDiagnostic(ServerDiagnostic{
+			Phase:   ServerDiagnosticWebTransportAdmission,
+			Message: "denied",
+		})
+		request.WriteError(
+			"WebTransport admission denied",
+			http.StatusForbidden,
+		)
+		return nil, false
+	}
+	runtime.emitDiagnostic(ServerDiagnostic{
+		Phase:   ServerDiagnosticWebTransportAdmission,
+		Message: "accepted",
+	})
+
+	session, err := request.Upgrade()
+	if err != nil {
+		runtime.emitDiagnostic(ServerDiagnostic{
+			Phase: ServerDiagnosticWebTransportUpgrade,
+			Err:   err,
+		})
+		request.WriteError(
+			"WebTransport upgrade failed",
+			http.StatusBadRequest,
+		)
+		return nil, false
+	}
+	runtime.emitDiagnostic(ServerDiagnostic{
+		Phase:   ServerDiagnosticWebTransportUpgradeSuccess,
+		Message: "accepted",
+	})
+	return session, true
+}
+
+func webTransportCloseReason(err error) TransportCloseReason {
+	var sessionErr *webtransport.SessionError
+	if errors.As(err, &sessionErr) {
+		return TransportCloseReason{
+			Peer:            sessionErr.Remote,
+			Local:           !sessionErr.Remote,
+			Clean:           sessionErr.ErrorCode == 0,
+			ApplicationCode: uint64(sessionErr.ErrorCode),
+			Message:         sessionErr.Message,
+			Err:             err,
+		}
+	}
+	var streamErr *webtransport.StreamError
+	if errors.As(err, &streamErr) {
+		return TransportCloseReason{
+			Peer:            streamErr.Remote,
+			Local:           !streamErr.Remote,
+			ApplicationCode: uint64(streamErr.ErrorCode),
+			Err:             err,
+		}
+	}
+	return legacyQUICCloseReason(err)
 }
 
 func describeWebTransportSessionError(err error) string {
@@ -389,6 +379,14 @@ func describeWebTransportSessionError(err error) string {
 	if errors.As(err, &h3Err) {
 		return fmt.Sprintf("type=http3 remote=%t code=%#x message=%q", h3Err.Remote, uint64(h3Err.ErrorCode), h3Err.ErrorMessage)
 	}
+	var wtStreamErr *webtransport.StreamError
+	if errors.As(err, &wtStreamErr) {
+		return fmt.Sprintf(
+			"type=webtransport_stream remote=%t code=%d",
+			wtStreamErr.Remote,
+			wtStreamErr.ErrorCode,
+		)
+	}
 	var streamErr *quic.StreamError
 	if errors.As(err, &streamErr) {
 		return fmt.Sprintf("type=quic_stream remote=%t stream=%d code=%d", streamErr.Remote, streamErr.StreamID, streamErr.ErrorCode)
@@ -397,92 +395,55 @@ func describeWebTransportSessionError(err error) string {
 	if errors.As(err, &appErr) {
 		return fmt.Sprintf("type=quic_application remote=%t code=%d message=%q", appErr.Remote, appErr.ErrorCode, appErr.ErrorMessage)
 	}
+	var transportErr *quic.TransportError
+	if errors.As(err, &transportErr) {
+		return fmt.Sprintf(
+			"type=quic_transport remote=%t code=%d message=%q",
+			transportErr.Remote,
+			transportErr.ErrorCode,
+			transportErr.ErrorMessage,
+		)
+	}
 	return fmt.Sprintf("type=%T error=%q", err, err.Error())
 }
 
-func handleWebTransportSession(ctx context.Context, session *webtransport.Session, server *Server, requestLimit semaphore) {
+func handleWebTransportSession(
+	ctx context.Context,
+	session transportinternal.WebTransportSession,
+	server *Server,
+	requestLimit semaphore,
+) {
 	runtime := server.freeze()
-	streamLimit := newSemaphore(runtime.options.MaxConcurrentStreamsPerConnection)
-	var streamTasks sync.WaitGroup
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = session.CloseWithError(cancelledWebTransportSessionCode, "server shutdown")
-		case <-session.Context().Done():
-		}
-	}()
-
-	for {
-		stream, err := session.AcceptStream(ctx)
-		if err != nil {
-			runtime.emitDiagnostic(ServerDiagnostic{
-				Phase:   ServerDiagnosticWebTransportSessionClosed,
-				Message: describeWebTransportSessionError(err),
-				Err:     err,
-			})
-			break
-		}
-
-		if !tryAcquire(streamLimit) {
-			writeStatusResponse(stream, Unavailable("too many concurrent streams on WebTransport session"), runtime.options.MaxFrameSize)
-			continue
-		}
-
-		streamTasks.Go(func() {
-			defer release(streamLimit)
-			streamCtx, cancel := contextWithAdditionalCancel(stream.Context(), ctx)
-			defer cancel()
-			handleRPCStream(streamCtx, server, requestLimit, webTransportRPCStream{stream: stream})
-		})
-	}
-
-	waitForWaitGroup(&streamTasks, runtime.options.GracefulShutdownTimeout, func() {
-		runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
-		_ = session.CloseWithError(cancelledWebTransportSessionCode, "server WebTransport stream drain timed out")
-	})
-}
-
-type webTransportRPCStream struct {
-	stream *webtransport.Stream
-}
-
-func (s webTransportRPCStream) Read(data []byte) (int, error) {
-	return s.stream.Read(data)
-}
-
-func (s webTransportRPCStream) Write(data []byte) (int, error) {
-	return s.stream.Write(data)
-}
-
-func (s webTransportRPCStream) Close() error {
-	return s.stream.Close()
-}
-
-func (s webTransportRPCStream) SetReadDeadline(ttl time.Time) error {
-	return s.stream.SetReadDeadline(ttl)
-}
-
-func (s webTransportRPCStream) trevrpcCancelRead() {
-	s.stream.CancelRead(cancelledWebTransportStreamCode)
-}
-
-func (s webTransportRPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
-	if ctx.Done() == nil {
-		return func() {}
-	}
-
-	done := make(chan struct{})
-	var closeOnce sync.Once
-	go func() {
-		select {
-		case <-ctx.Done():
-			s.stream.CancelRead(cancelledWebTransportStreamCode)
-		case <-done:
-		}
-	}()
-
-	return func() { closeOnce.Do(func() { close(done) }) }
+	handleTransportStreamEndpoint(
+		ctx,
+		session,
+		server,
+		requestLimit,
+		transportStreamEndpointOptions{
+			overloadMessage:          "too many concurrent streams on WebTransport session",
+			drainTimeoutMessage:      "server WebTransport stream drain timed out",
+			shutdownMessage:          "server shutdown",
+			closeImmediatelyOnCancel: true,
+			onAcceptError: func(err error) {
+				reason := webTransportCloseReason(err)
+				if ctx.Err() != nil {
+					reason = TransportCloseReason{
+						Local:   true,
+						Clean:   true,
+						Message: "server shutdown",
+						Err:     err,
+					}
+				}
+				runtime.emitDiagnostic(ServerDiagnostic{
+					Phase:       ServerDiagnosticWebTransportSessionClosed,
+					Message:     describeWebTransportSessionError(err),
+					Err:         err,
+					Connection:  session.Info(),
+					CloseReason: reason,
+				})
+			},
+		},
+	)
 }
 
 func contextWithAdditionalCancel(ctx context.Context, cancelOn context.Context) (context.Context, context.CancelFunc) {

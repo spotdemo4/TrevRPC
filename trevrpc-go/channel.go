@@ -80,6 +80,8 @@ type ChannelEvent struct {
 	Generation     uint64
 	Err            error
 	ReconnectDelay time.Duration
+	Connection     ConnectionInfo
+	CloseReason    TransportCloseReason
 }
 
 type reconnectConfig struct {
@@ -136,6 +138,16 @@ func Dial(ctx context.Context, target string, options DialOptions) (*Channel, er
 }
 
 func newChannelConnector(target string, options DialOptions) (channelConnector, error) {
+	backend, err := resolveTransportBackend(options.Backend)
+	if err != nil {
+		return nil, err
+	}
+	if backend == TransportBackendNative {
+		if options.TLSConfig != nil || options.QUICConfig != nil || len(options.WebTransport.RequestHeader) != 0 {
+			return nil, InvalidArgument("native dial does not accept legacy TLSConfig, QUICConfig, or RequestHeader")
+		}
+		return nil, nativeBackendUnavailable()
+	}
 	if strings.HasPrefix(target, "https://") {
 		return newWebTransportChannelConnector(target, options)
 	}
@@ -249,7 +261,18 @@ func (c *Channel) Close() error {
 		err = generation.Close()
 	}
 	<-c.workerDone
-	c.events.close(ChannelEvent{Type: ChannelEventClosed, State: snapshot.State, Generation: snapshot.Generation})
+	c.events.close(ChannelEvent{
+		Type:       ChannelEventClosed,
+		State:      snapshot.State,
+		Generation: snapshot.Generation,
+		Connection: generationConnectionInfo(generation),
+		CloseReason: TransportCloseReason{
+			Local:   true,
+			Clean:   err == nil,
+			Message: "channel closed",
+			Err:     err,
+		},
+	})
 	return err
 }
 
@@ -290,7 +313,12 @@ func newChannel(initial channelGeneration, connector channelConnector, clock rec
 		backoff:    newReconnectBackoff(reconnect, random),
 		events:     newChannelEventDispatcher(onEvent),
 	}
-	client.events.emit(ChannelEvent{Type: ChannelEventReady, State: ChannelStateReady, Generation: 1})
+	client.events.emit(ChannelEvent{
+		Type:       ChannelEventReady,
+		State:      ChannelStateReady,
+		Generation: 1,
+		Connection: generationConnectionInfo(initial),
+	})
 	go client.run(initial, 1)
 	return client
 }
@@ -304,7 +332,7 @@ func (c *Channel) run(generation channelGeneration, number uint64) {
 		case <-generation.Done():
 		}
 
-		if !c.beginReconnect(number, generation.Err()) {
+		if !c.beginReconnect(number, generation, generation.Err()) {
 			return
 		}
 		c.backoff.Reset()
@@ -334,7 +362,11 @@ func (c *Channel) run(generation channelGeneration, number uint64) {
 	}
 }
 
-func (c *Channel) beginReconnect(number uint64, err error) bool {
+func (c *Channel) beginReconnect(
+	number uint64,
+	generation channelGeneration,
+	err error,
+) bool {
 	c.mu.Lock()
 	if c.state == ChannelStateClosed || c.generation != number {
 		c.mu.Unlock()
@@ -345,7 +377,14 @@ func (c *Channel) beginReconnect(number uint64, err error) bool {
 	c.ready = make(chan struct{})
 	snapshot := ChannelSnapshot{State: c.state, Generation: c.generation}
 	c.mu.Unlock()
-	c.events.emit(ChannelEvent{Type: ChannelEventDisconnected, State: snapshot.State, Generation: snapshot.Generation, Err: err})
+	c.events.emit(ChannelEvent{
+		Type:        ChannelEventDisconnected,
+		State:       snapshot.State,
+		Generation:  snapshot.Generation,
+		Err:         err,
+		Connection:  generationConnectionInfo(generation),
+		CloseReason: generationCloseReason(generation, err),
+	})
 	return true
 }
 
@@ -361,7 +400,12 @@ func (c *Channel) publish(generation channelGeneration) (bool, uint64) {
 	c.state = ChannelStateReady
 	close(c.ready)
 	c.mu.Unlock()
-	c.events.emit(ChannelEvent{Type: ChannelEventReady, State: ChannelStateReady, Generation: number})
+	c.events.emit(ChannelEvent{
+		Type:       ChannelEventReady,
+		State:      ChannelStateReady,
+		Generation: number,
+		Connection: generationConnectionInfo(generation),
+	})
 	return true, number
 }
 
@@ -369,11 +413,30 @@ type channelGeneration interface {
 	ClientTransport
 	Done() <-chan struct{}
 	Err() error
+	Info() ConnectionInfo
+	CloseReason(error) TransportCloseReason
+}
+
+func generationConnectionInfo(generation channelGeneration) ConnectionInfo {
+	if generation == nil {
+		return ConnectionInfo{}
+	}
+	return generation.Info()
+}
+
+func generationCloseReason(
+	generation channelGeneration,
+	err error,
+) TransportCloseReason {
+	if generation == nil {
+		return TransportCloseReason{Err: err}
+	}
+	return generation.CloseReason(err)
 }
 
 type nativeQUICGeneration struct {
-	client *RawQUICClient
-	conn   *quic.Conn
+	client   *RawQUICClient
+	endpoint *legacyQUICConnection
 }
 
 func (g *nativeQUICGeneration) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
@@ -389,15 +452,23 @@ func (g *nativeQUICGeneration) Close() error {
 }
 
 func (g *nativeQUICGeneration) Done() <-chan struct{} {
-	return g.conn.Context().Done()
+	return g.endpoint.Done()
 }
 
 func (g *nativeQUICGeneration) Err() error {
-	return context.Cause(g.conn.Context())
+	return g.endpoint.Err()
+}
+
+func (g *nativeQUICGeneration) Info() ConnectionInfo {
+	return g.endpoint.Info()
+}
+
+func (g *nativeQUICGeneration) CloseReason(err error) TransportCloseReason {
+	return legacyQUICCloseReason(err)
 }
 
 func (g *nativeQUICGeneration) AddPath(transport *quic.Transport) (*quic.Path, error) {
-	return g.conn.AddPath(transport)
+	return g.endpoint.conn.AddPath(transport)
 }
 
 type channelConnector interface {
@@ -405,32 +476,53 @@ type channelConnector interface {
 }
 
 type nativeQUICConnector struct {
-	addr         string
-	tlsConfig    *tls.Config
-	quicConfig   *quic.Config
-	maxFrameSize int
+	addr             string
+	tlsConfig        *tls.Config
+	quicConfig       *quic.Config
+	maxFrameSize     int
+	requestedBackend TransportBackend
 }
 
 func newNativeQUICConnector(addr string, options DialOptions) (*nativeQUICConnector, error) {
-	if options.TLSConfig == nil {
-		return nil, InvalidArgument("quic-go dial requires TLSConfig")
+	backend, err := resolveTransportBackend(options.Backend)
+	if err != nil {
+		return nil, err
+	}
+	if backend == TransportBackendNative {
+		if options.TLSConfig != nil || options.QUICConfig != nil {
+			return nil, InvalidArgument("native dial does not accept legacy TLSConfig or QUICConfig")
+		}
+		return nil, nativeBackendUnavailable()
+	}
+	tlsConfig, err := legacyClientTLSConfig(options.TLSConfig, cloneTransportCredentials(options.Credentials))
+	if err != nil {
+		return nil, err
+	}
+	if options.Credentials != nil {
+		tlsConfig.NextProtos = []string{ALPN}
 	}
 
 	maxFrameSize := options.MaxFrameSize
 	if maxFrameSize <= 0 {
 		maxFrameSize = DefaultMaxFrameSize
 	}
-	tlsConfig := options.TLSConfig.Clone()
 	if tlsConfig.ClientSessionCache == nil {
 		tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(defaultChannelSessionCache)
 	}
 	quicConfig := QUICClientConfig(maxFrameSize, options.QUICConfig)
 	applyDefaultQUICTransportConfig(quicConfig, options.Transport)
+	applyQUICTransportLimits(quicConfig, options.Limits)
 	if quicConfig.TokenStore == nil {
 		quicConfig.TokenStore = quic.NewLRUTokenStore(defaultChannelTokenOrigins, defaultChannelTokensPerOrigin)
 	}
 
-	return &nativeQUICConnector{addr: addr, tlsConfig: tlsConfig, quicConfig: quicConfig, maxFrameSize: maxFrameSize}, nil
+	return &nativeQUICConnector{
+		addr:             addr,
+		tlsConfig:        tlsConfig,
+		quicConfig:       quicConfig,
+		maxFrameSize:     maxFrameSize,
+		requestedBackend: options.Backend,
+	}, nil
 }
 
 func (c *nativeQUICConnector) Connect(ctx context.Context) (channelGeneration, error) {
@@ -439,7 +531,12 @@ func (c *nativeQUICConnector) Connect(ctx context.Context) (channelGeneration, e
 	if err != nil {
 		return nil, transportOrContextStatus(ctx, err)
 	}
-	return &nativeQUICGeneration{client: newRawQUICClient(conn).WithMaxFrameSize(c.maxFrameSize), conn: conn}, nil
+	endpoint := newLegacyQUICConnection(conn, c.requestedBackend)
+	return &nativeQUICGeneration{
+		client: newRawQUICClientForEndpoint(conn, endpoint).
+			WithMaxFrameSize(c.maxFrameSize),
+		endpoint: endpoint,
+	}, nil
 }
 
 type reconnectBackoff struct {

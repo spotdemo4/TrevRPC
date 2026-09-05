@@ -3,6 +3,7 @@ package trevrpc
 import "github.com/quic-go/quic-go"
 
 // QUICTransportLimits contains transport-level QUIC flow-control and stream limits.
+// Deprecated: use TransportLimits for backend-neutral endpoint configuration.
 type QUICTransportLimits struct {
 	StreamReceiveWindow     uint64
 	ConnectionReceiveWindow uint64
@@ -98,6 +99,27 @@ func disableQUICIncomingStreams(config *quic.Config) {
 func disableQUICIncomingUniStreams(config *quic.Config) {
 	if config.MaxIncomingUniStreams >= 0 {
 		config.MaxIncomingUniStreams = -1
+	}
+}
+
+func applyQUICTransportLimits(config *quic.Config, limits TransportLimits) {
+	if limits.StreamReceiveWindow > 0 {
+		capQUICReceiveWindow(&config.InitialStreamReceiveWindow, limits.StreamReceiveWindow)
+		capQUICReceiveWindow(&config.MaxStreamReceiveWindow, limits.StreamReceiveWindow)
+	}
+	if limits.ConnectionReceiveWindow > 0 {
+		capQUICReceiveWindow(&config.InitialConnectionReceiveWindow, limits.ConnectionReceiveWindow)
+		capQUICReceiveWindow(&config.MaxConnectionReceiveWindow, limits.ConnectionReceiveWindow)
+	}
+	if limits.IncomingBidirectionalStreams > 0 {
+		if config.MaxIncomingStreams < 0 {
+			config.MaxIncomingStreams = limits.IncomingBidirectionalStreams
+		} else {
+			capQUICIncomingStreams(
+				&config.MaxIncomingStreams,
+				limits.IncomingBidirectionalStreams,
+			)
+		}
 	}
 }
 

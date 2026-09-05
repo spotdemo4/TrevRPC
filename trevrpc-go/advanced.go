@@ -15,16 +15,19 @@ type AdvancedAPI struct{}
 
 // NewRawQUICClient creates a transport over one caller-owned QUIC connection.
 // It does not reconnect, retry, or replay calls.
+// Deprecated: this is a Legacy-backend compatibility surface.
 func (AdvancedAPI) NewRawQUICClient(conn *quic.Conn) *RawQUICClient {
 	return newRawQUICClient(conn)
 }
 
 // DialRawWebTransport creates one WebTransport session without reconnecting it.
+// Deprecated: this is a Legacy-backend compatibility surface.
 func (AdvancedAPI) DialRawWebTransport(ctx context.Context, url string, options RawWebTransportDialOptions) (*RawWebTransportClient, error) {
 	return dialRawWebTransport(ctx, url, options)
 }
 
 // NewRawWebTransportClient creates a transport over one caller-owned WebTransport session.
+// Deprecated: this is a Legacy-backend compatibility surface.
 func (AdvancedAPI) NewRawWebTransportClient(session *webtransport.Session) *RawWebTransportClient {
 	return newRawWebTransportClient(session)
 }
@@ -41,6 +44,7 @@ type AdvancedChannel struct {
 
 // AddPath adds a migration path to the current native QUIC generation. The
 // caller must probe and switch the returned path according to quic-go's Path API.
+// Deprecated: this is available only for Legacy native-QUIC generations.
 func (a AdvancedChannel) AddPath(transport *quic.Transport) (*quic.Path, error) {
 	if transport == nil {
 		return nil, InvalidArgument("QUIC migration transport is nil")
@@ -59,6 +63,7 @@ func (a AdvancedChannel) AddPath(transport *quic.Transport) (*quic.Path, error) 
 }
 
 // RawWebTransportSession returns the current WebTransport session.
+// Deprecated: this is available only for Legacy WebTransport generations.
 func (a AdvancedChannel) RawWebTransportSession() (*webtransport.Session, error) {
 	generation, err := a.channel.currentGeneration()
 	if err != nil {

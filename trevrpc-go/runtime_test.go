@@ -1578,10 +1578,10 @@ func TestServerResponseBatchWriterPreservesTerminalStatusAfterBatch(t *testing.T
 	}
 }
 
-func TestWebTransportResponseStreamAdvertisesContextCancellation(t *testing.T) {
-	stream := &webTransportResponseStream{}
+func TestTransportResponseStreamAdvertisesContextCancellation(t *testing.T) {
+	stream := &transportResponseStream{stream: &legacyQUICStream{}}
 	if !streamContextCancelsRecv(stream) {
-		t.Fatal("webtransport response stream should cancel pending receives from context")
+		t.Fatal("cancellable transport response stream should cancel pending receives from context")
 	}
 }
 
@@ -2485,6 +2485,165 @@ func TestChannelNativeUnary(t *testing.T) {
 	}
 
 	if response.Value != "hello QUIC" {
+		t.Fatalf("unexpected response: %q", response.Value)
+	}
+}
+
+func TestChannelNativeUnaryWithTransportCredentials(t *testing.T) {
+	server := NewServer()
+	RegisterUnary(
+		server,
+		"example.Greeter",
+		"SayHello",
+		func() *testMessage { return &testMessage{} },
+		func(
+			_ context.Context,
+			request *testMessage,
+		) (*testMessage, error) {
+			return &testMessage{Value: "hello " + request.Value}, nil
+		},
+	)
+
+	certPEM, keyPEM := testCertificateMaterial(t)
+	listener, err := Listen(
+		"127.0.0.1:0",
+		server,
+		ListenOptions{
+			Credentials: &TransportCredentials{
+				CertificateChainPEM: certPEM,
+				PrivateKeyPEM:       keyPEM,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("listen with credentials: %v", err)
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	go func() { _ = listener.Serve(ctx) }()
+
+	events := make(chan ChannelEvent, 1)
+	transport, err := Dial(
+		ctx,
+		listener.Addr().String(),
+		DialOptions{
+			Credentials: &TransportCredentials{
+				RootCAPEM:  certPEM,
+				ServerName: "localhost",
+			},
+			OnEvent: func(event ChannelEvent) {
+				if event.Type == ChannelEventReady {
+					select {
+					case events <- event:
+					default:
+					}
+				}
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("dial with credentials: %v", err)
+	}
+	defer transport.Close()
+
+	select {
+	case event := <-events:
+		if event.Connection.RequestedBackend != TransportBackendAuto ||
+			event.Connection.ResolvedBackend != TransportBackendLegacy ||
+			event.Connection.NegotiatedProtocol != ALPN ||
+			event.Connection.Provider != "quic-go" {
+			t.Fatalf("ready connection info = %+v", event.Connection)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for ready connection metadata")
+	}
+
+	response, err := Unary(
+		ctx,
+		transport,
+		"example.Greeter",
+		"SayHello",
+		&testMessage{Value: "credentials"},
+		func() *testMessage { return &testMessage{} },
+	)
+	if err != nil {
+		t.Fatalf("credential-backed unary RPC failed: %v", err)
+	}
+	if response.Value != "hello credentials" {
+		t.Fatalf("unexpected response: %q", response.Value)
+	}
+}
+
+func TestWebTransportUnaryWithTransportCredentials(t *testing.T) {
+	server := NewServer()
+	options := DefaultServerOptions()
+	options.EnableWebTransport = true
+	options.WebTransportAdmission = func(WebTransportAdmissionRequest) bool {
+		return true
+	}
+	server.SetOptions(options)
+	RegisterUnary(
+		server,
+		"example.Greeter",
+		"SayHello",
+		func() *testMessage { return &testMessage{} },
+		func(
+			_ context.Context,
+			request *testMessage,
+		) (*testMessage, error) {
+			return &testMessage{Value: "hello " + request.Value}, nil
+		},
+	)
+
+	certPEM, keyPEM := testCertificateMaterial(t)
+	listener, err := Listen(
+		"127.0.0.1:0",
+		server,
+		ListenOptions{
+			Credentials: &TransportCredentials{
+				CertificateChainPEM: certPEM,
+				PrivateKeyPEM:       keyPEM,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("listen with credentials: %v", err)
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	go func() { _ = listener.Serve(ctx) }()
+
+	transport, err := Dial(
+		ctx,
+		"https://"+listener.Addr().String()+DefaultHTTP3Path,
+		DialOptions{
+			Credentials: &TransportCredentials{
+				RootCAPEM:  certPEM,
+				ServerName: "localhost",
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("dial WebTransport with credentials: %v", err)
+	}
+	defer transport.Close()
+
+	response, err := Unary(
+		ctx,
+		transport,
+		"example.Greeter",
+		"SayHello",
+		&testMessage{Value: "WebTransport credentials"},
+		func() *testMessage { return &testMessage{} },
+	)
+	if err != nil {
+		t.Fatalf("credential-backed WebTransport RPC failed: %v", err)
+	}
+	if response.Value != "hello WebTransport credentials" {
 		t.Fatalf("unexpected response: %q", response.Value)
 	}
 }
@@ -3720,6 +3879,108 @@ func TestQuicHandlesBoundedMixedLoad(t *testing.T) {
 
 const testServiceName = "example.Greeter"
 
+type semanticTransportFactory struct {
+	name    string
+	backend TransportBackend
+	start   func(*testing.T, func(*Server)) *runningTestQUICServer
+	connect func(*testing.T, *runningTestQUICServer, TransportBackend) Transport
+}
+
+func semanticTransportFactories() []semanticTransportFactory {
+	return []semanticTransportFactory{
+		{
+			name:    "legacy-native-quic",
+			backend: TransportBackendLegacy,
+			start:   startTestQUICServer,
+			connect: func(
+				t *testing.T,
+				running *runningTestQUICServer,
+				backend TransportBackend,
+			) Transport {
+				ctx, cancel := context.WithTimeout(
+					context.Background(),
+					testTimeout,
+				)
+				defer cancel()
+				transport, err := Dial(ctx, running.addr, DialOptions{
+					Backend:   backend,
+					TLSConfig: running.clientTLS.Clone(),
+				})
+				if err != nil {
+					t.Fatalf("dial legacy QUIC: %v", err)
+				}
+				t.Cleanup(func() { _ = transport.Close() })
+				return transport
+			},
+		},
+		{
+			name:    "legacy-http3",
+			backend: TransportBackendLegacy,
+			start: func(t *testing.T, configure func(*Server)) *runningTestQUICServer {
+				return startTestHTTP3Server(t, false, configure)
+			},
+			connect: func(
+				t *testing.T,
+				running *runningTestQUICServer,
+				backend TransportBackend,
+			) Transport {
+				if backend != TransportBackendLegacy {
+					t.Fatalf(
+						"HTTP/3 semantic factory has no backend %d adapter",
+						backend,
+					)
+				}
+				return connectTestHTTP3Client(t, running)
+			},
+		},
+		{
+			name:    "legacy-webtransport",
+			backend: TransportBackendLegacy,
+			start:   startTestWebTransportServer,
+			connect: func(
+				t *testing.T,
+				running *runningTestQUICServer,
+				backend TransportBackend,
+			) Transport {
+				ctx, cancel := context.WithTimeout(
+					context.Background(),
+					testTimeout,
+				)
+				defer cancel()
+				transport, err := Dial(
+					ctx,
+					"https://"+running.addr+DefaultHTTP3Path,
+					DialOptions{
+						Backend:   backend,
+						TLSConfig: running.clientTLS.Clone(),
+					},
+				)
+				if err != nil {
+					t.Fatalf("dial legacy WebTransport: %v", err)
+				}
+				t.Cleanup(func() { _ = transport.Close() })
+				return transport
+			},
+		},
+	}
+}
+
+func TestSemanticTransportFactoriesRoundTripAllRPCShapes(t *testing.T) {
+	for _, factory := range semanticTransportFactories() {
+		t.Run(factory.name, func(t *testing.T) {
+			running := factory.start(t, func(server *Server) {
+				server.SetAuthorizer(BearerAuthorizer(testAuthToken))
+			})
+			transport := factory.connect(t, running, factory.backend)
+			for index := range 4 {
+				if err := runMixedQUICCall(transport, index); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 type runningTestQUICServer struct {
 	addr      string
 	clientTLS *tls.Config
@@ -3750,14 +4011,17 @@ func startTestQUICServerWithTLS(t *testing.T, serverTLS, clientTLS *tls.Config, 
 	registerTestGreeter(server)
 	configure(server)
 
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICServerConfig(server.Options(), nil))
+	listener, err := Listen("127.0.0.1:0", server, ListenOptions{
+		Backend:   TransportBackendLegacy,
+		TLSConfig: serverTLS,
+	})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- ServeQUIC(ctx, listener, server)
+		done <- listener.Serve(ctx)
 	}()
 
 	running := &runningTestQUICServer{
@@ -3795,7 +4059,10 @@ func startTestWebTransportServerWithAdmission(t *testing.T, admission WebTranspo
 	options.WebTransportAdmission = admission
 	server.SetOptions(options)
 
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, QUICServerConfig(server.Options(), nil))
+	listener, err := Listen("127.0.0.1:0", server, ListenOptions{
+		Backend:   TransportBackendLegacy,
+		TLSConfig: serverTLS,
+	})
 	if err != nil {
 		t.Fatalf("listen WebTransport: %v", err)
 	}
@@ -3803,7 +4070,7 @@ func startTestWebTransportServerWithAdmission(t *testing.T, admission WebTranspo
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- ServeQUIC(ctx, listener, server)
+		done <- listener.Serve(ctx)
 	}()
 
 	running := &runningTestQUICServer{
@@ -4480,7 +4747,7 @@ func collectTestMessagesNoFatal(stream MessageStream[*testMessage]) collectedMes
 	}
 }
 
-func testTLSConfig(t *testing.T) (*tls.Config, *tls.Config) {
+func testCertificateMaterial(t *testing.T) ([]byte, []byte) {
 	t.Helper()
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -4499,13 +4766,29 @@ func testTLSConfig(t *testing.T) (*tls.Config, *tls.Config) {
 		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
 	}
 
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(
+		rand.Reader,
+		template,
+		template,
+		&key.PublicKey,
+		key,
+	)
 	if err != nil {
 		t.Fatalf("create certificate: %v", err)
 	}
 
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	return pem.EncodeToMemory(&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: der,
+		}), pem.EncodeToMemory(&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: x509.MarshalPKCS1PrivateKey(key),
+		})
+}
+
+func testTLSConfig(t *testing.T) (*tls.Config, *tls.Config) {
+	t.Helper()
+	certPEM, keyPEM := testCertificateMaterial(t)
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("load certificate: %v", err)

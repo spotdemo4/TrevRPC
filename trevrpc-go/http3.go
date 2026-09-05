@@ -3,17 +3,16 @@ package trevrpc
 import (
 	"context"
 	"errors"
-	"io"
 	"mime"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	webtransport "github.com/quic-go/webtransport-go"
+	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
 )
 
 const (
@@ -27,7 +26,14 @@ func isHTTP3QUICConnection(conn *quic.Conn, options ServerOptions) bool {
 	return (options.EnableHTTP3 || options.EnableWebTransport) && conn.ConnectionState().TLS.NegotiatedProtocol == http3.NextProtoH3
 }
 
-func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server, requestLimit semaphore, closeOnShutdown bool) {
+func handleHTTP3Connection(
+	ctx context.Context,
+	connection *legacyQUICConnection,
+	server *Server,
+	requestLimit semaphore,
+	closeOnShutdown bool,
+) {
+	conn := connection.conn
 	runtime := server.freeze()
 	sessionsCtx, stopSessions := context.WithCancel(ctx)
 	defer stopSessions()
@@ -51,38 +57,23 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 	var wtServer *webtransport.Server
 	h3Server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if runtime.options.EnableWebTransport && r.Method == http.MethodConnect {
-			runtime.emitDiagnostic(ServerDiagnostic{
-				Phase: ServerDiagnosticWebTransportConnect,
-				Message: "path=" + r.URL.Path + " authority=" + r.Host + " origin=" + r.Header.Get("Origin") +
-					" remote=" + r.RemoteAddr,
-			})
-			admitted, err := runtime.webTransportAdmitted(r)
-			if err != nil {
-				status := http.StatusInternalServerError
-				if errors.Is(err, errAdmissionSaturated) {
-					status = http.StatusServiceUnavailable
-				}
-				runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportAdmission, Message: "error", Err: err})
-				http.Error(w, "internal server error", status)
+			request := newLegacyWebTransportRequest(
+				w,
+				r,
+				wtServer,
+				connection.requestedBackend,
+			)
+			session, upgraded := handleWebTransportRequest(request, runtime)
+			if !upgraded {
 				return
 			}
-			if !admitted {
-				runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportAdmission, Message: "denied"})
-				http.Error(w, "WebTransport admission denied", http.StatusForbidden)
-				return
-			}
-			runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportAdmission, Message: "accepted"})
-
-			session, err := wtServer.Upgrade(w, r)
-			if err != nil {
-				runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportUpgrade, Err: err})
-				http.Error(w, "WebTransport upgrade failed", http.StatusBadRequest)
-				return
-			}
-			runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticWebTransportUpgradeSuccess, Message: "accepted"})
-
 			sessionTasks.Go(func() {
-				handleWebTransportSession(sessionsCtx, session, server, requestLimit)
+				handleWebTransportSession(
+					sessionsCtx,
+					session,
+					server,
+					requestLimit,
+				)
 			})
 			return
 		}
@@ -133,10 +124,13 @@ func handleHTTP3Connection(ctx context.Context, conn *quic.Conn, server *Server,
 	}
 	connErr := context.Cause(conn.Context())
 	if serveErr != nil || connErr != nil {
+		closeErr := firstError(serveErr, connErr)
 		runtime.emitDiagnostic(ServerDiagnostic{
-			Phase:   ServerDiagnosticHTTP3ConnectionClosed,
-			Message: "serve_error=" + errorString(serveErr) + " connection_error=" + errorString(connErr),
-			Err:     firstError(serveErr, connErr),
+			Phase:       ServerDiagnosticHTTP3ConnectionClosed,
+			Message:     "serve_error=" + errorString(serveErr) + " connection_error=" + errorString(connErr),
+			Err:         closeErr,
+			Connection:  connection.Info(),
+			CloseReason: legacyQUICCloseReason(closeErr),
 		})
 	}
 	close(serveDone)
@@ -176,52 +170,80 @@ func firstError(errors ...error) error {
 	return nil
 }
 
-func handleHTTP3RPC(w http.ResponseWriter, r *http.Request, server *Server, requestLimit, streamLimit semaphore) {
+func handleHTTP3RPC(
+	w http.ResponseWriter,
+	r *http.Request,
+	server *Server,
+	requestLimit,
+	streamLimit semaphore,
+) {
+	handleTransportHTTP3RPC(
+		newLegacyHTTP3Request(w, r),
+		server,
+		requestLimit,
+		streamLimit,
+	)
+}
+
+func handleTransportHTTP3RPC(
+	request transportinternal.HTTP3Request,
+	server *Server,
+	requestLimit,
+	streamLimit semaphore,
+) {
 	runtime := server.freeze()
-	if !runtime.options.EnableHTTP3 || r.URL.Path != http3Path(runtime.options) {
-		http.NotFound(w, r)
+	if !runtime.options.EnableHTTP3 ||
+		request.Path() != http3Path(runtime.options) {
+		request.WriteError("404 page not found", http.StatusNotFound)
 		return
 	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method must be POST", http.StatusMethodNotAllowed)
+	if request.Method() != http.MethodPost {
+		request.SetResponseHeader("Allow", http.MethodPost)
+		request.WriteError("method must be POST", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isTrevRPCMediaType(r.Header.Values("Content-Type")) {
-		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+	if !isTrevRPCMediaType(
+		headerFieldValues(request.Headers(), "Content-Type"),
+	) {
+		request.WriteError(
+			"unsupported media type",
+			http.StatusUnsupportedMediaType,
+		)
 		return
 	}
-	admitted, err := runtime.http3Admitted(r)
+	admitted, err := runtime.transportHTTP3Admitted(request)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, errAdmissionSaturated) {
 			status = http.StatusServiceUnavailable
 		}
-		http.Error(w, "internal server error", status)
+		request.WriteError("internal server error", status)
 		return
 	}
 	if !admitted {
-		http.Error(w, "HTTP/3 admission denied", http.StatusForbidden)
+		request.WriteError("HTTP/3 admission denied", http.StatusForbidden)
 		return
 	}
 	if !tryAcquire(streamLimit) {
-		http.Error(w, "too many concurrent RPCs on HTTP/3 connection", http.StatusServiceUnavailable)
+		request.WriteError(
+			"too many concurrent RPCs on HTTP/3 connection",
+			http.StatusServiceUnavailable,
+		)
 		return
 	}
 	defer release(streamLimit)
 
-	w.Header().Set("Content-Type", HTTP3ContentType)
-	w.WriteHeader(http.StatusOK)
-	controller := http.NewResponseController(w)
-	if err := controller.Flush(); err != nil {
+	request.SetResponseHeader("Content-Type", HTTP3ContentType)
+	request.WriteResponseHeader(http.StatusOK)
+	if err := request.Flush(); err != nil {
 		return
 	}
-
-	handleRPCStream(r.Context(), server, requestLimit, &http3RPCStream{
-		body:       r.Body,
-		writer:     w,
-		controller: controller,
-	})
+	handleRPCStream(
+		request.Context(),
+		server,
+		requestLimit,
+		newTransportRPCStream(request.Stream()),
+	)
 }
 
 func http3Path(options ServerOptions) string {
@@ -248,7 +270,39 @@ func cloneAdmissionRequest(request *http.Request) *http.Request {
 	return clone
 }
 
-func (r *serverRuntime) http3Admitted(request *http.Request) (admitted bool, err error) {
+func (r *serverRuntime) http3Admitted(
+	request *http.Request,
+) (bool, error) {
+	snapshot := cloneAdmissionRequest(request)
+	return r.invokeHTTP3Admission(HTTP3AdmissionRequest{
+		Request:   snapshot,
+		Headers:   headerFieldsFromHTTP(snapshot.Header),
+		Path:      snapshot.URL.Path,
+		Method:    snapshot.Method,
+		Authority: snapshot.Host,
+		Secure:    snapshot.TLS != nil,
+	})
+}
+
+func (r *serverRuntime) transportHTTP3Admitted(
+	request transportinternal.HTTP3Request,
+) (bool, error) {
+	admission := HTTP3AdmissionRequest{
+		Headers:   request.Headers().Clone(),
+		Path:      request.Path(),
+		Method:    request.Method(),
+		Authority: request.Authority(),
+		Secure:    request.Secure(),
+	}
+	if legacy, ok := request.(interface{ legacyRequest() *http.Request }); ok {
+		admission.Request = cloneAdmissionRequest(legacy.legacyRequest())
+	}
+	return r.invokeHTTP3Admission(admission)
+}
+
+func (r *serverRuntime) invokeHTTP3Admission(
+	request HTTP3AdmissionRequest,
+) (admitted bool, err error) {
 	callback := r.options.HTTP3Admission
 	if callback == nil {
 		return true, nil
@@ -259,64 +313,18 @@ func (r *serverRuntime) http3Admitted(request *http.Request) (admitted bool, err
 	defer release(r.admissionLimit)
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = &serverPanicError{phase: ServerDiagnosticAdmissionPanic, recovered: recovered, stack: debug.Stack()}
-			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticAdmissionPanic, Panic: recovered, Stack: debug.Stack(), Err: err})
+			err = &serverPanicError{
+				phase:     ServerDiagnosticAdmissionPanic,
+				recovered: recovered,
+				stack:     debug.Stack(),
+			}
+			r.emitDiagnostic(ServerDiagnostic{
+				Phase: ServerDiagnosticAdmissionPanic,
+				Panic: recovered,
+				Stack: debug.Stack(),
+				Err:   err,
+			})
 		}
 	}()
-	snapshot := cloneAdmissionRequest(request)
-	return callback(HTTP3AdmissionRequest{Request: snapshot, Path: snapshot.URL.Path, Method: snapshot.Method, Authority: snapshot.Host, Secure: snapshot.TLS != nil}), nil
-}
-
-type http3RPCStream struct {
-	body       io.ReadCloser
-	writer     http.ResponseWriter
-	controller *http.ResponseController
-	closeOnce  sync.Once
-}
-
-func (s *http3RPCStream) Read(data []byte) (int, error) {
-	return s.body.Read(data)
-}
-
-func (s *http3RPCStream) Write(data []byte) (int, error) {
-	written, err := s.writer.Write(data)
-	if err != nil {
-		return written, err
-	}
-	if err := s.controller.Flush(); err != nil {
-		return written, err
-	}
-	return written, nil
-}
-
-func (s *http3RPCStream) Close() error {
-	var err error
-	s.closeOnce.Do(func() { err = s.body.Close() })
-	return err
-}
-
-func (s *http3RPCStream) SetReadDeadline(deadline time.Time) error {
-	return s.controller.SetReadDeadline(deadline)
-}
-
-func (s *http3RPCStream) trevrpcCancelRead() {
-	_ = s.Close()
-}
-
-func (s *http3RPCStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
-	if ctx.Done() == nil {
-		return func() {}
-	}
-
-	done := make(chan struct{})
-	var stopOnce sync.Once
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = s.Close()
-		case <-done:
-		}
-	}()
-
-	return func() { stopOnce.Do(func() { close(done) }) }
+	return callback(request), nil
 }

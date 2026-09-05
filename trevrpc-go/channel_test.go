@@ -43,7 +43,13 @@ func TestChannelWebTransportReconnects(t *testing.T) {
 	running := startTestWebTransportServer(t, func(*Server) {})
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, "https://"+running.addr+"/trevrpc", DialOptions{TLSConfig: running.clientTLS})
+	events := make(chan ChannelEvent, 8)
+	channel, err := Dial(ctx, "https://"+running.addr+"/trevrpc", DialOptions{
+		TLSConfig: running.clientTLS,
+		OnEvent: func(event ChannelEvent) {
+			events <- event
+		},
+	})
 	if err != nil {
 		t.Fatalf("dial WebTransport channel: %v", err)
 	}
@@ -62,6 +68,25 @@ func TestChannelWebTransportReconnects(t *testing.T) {
 	}
 	if generation := channel.Generation(); generation != 2 {
 		t.Fatalf("WebTransport generation = %d, want 2", generation)
+	}
+	if event := waitChannelEvent(t, events); event.Type != ChannelEventReady {
+		t.Fatalf("first event type = %v, want ready", event.Type)
+	}
+	disconnected := waitChannelEvent(t, events)
+	if disconnected.Type != ChannelEventDisconnected {
+		t.Fatalf(
+			"second event type = %v, want disconnected",
+			disconnected.Type,
+		)
+	}
+	if !disconnected.CloseReason.Local || disconnected.CloseReason.Peer ||
+		disconnected.CloseReason.ApplicationCode !=
+			uint64(cancelledWebTransportSessionCode) ||
+		disconnected.CloseReason.Message != "test reconnect" {
+		t.Fatalf(
+			"WebTransport disconnect reason = %+v",
+			disconnected.CloseReason,
+		)
 	}
 
 	reply, err := Unary(ctx, channel, testServiceName, "SayHello", &testMessage{Value: "WebTransport"}, func() *testMessage { return &testMessage{} })
@@ -471,6 +496,14 @@ func (g *fakeChannelGeneration) Err() error {
 	g.errMu.Lock()
 	defer g.errMu.Unlock()
 	return g.err
+}
+
+func (g *fakeChannelGeneration) Info() ConnectionInfo {
+	return ConnectionInfo{Provider: "fake"}
+}
+
+func (g *fakeChannelGeneration) CloseReason(err error) TransportCloseReason {
+	return TransportCloseReason{Err: err, Message: errorString(err)}
 }
 
 func (g *fakeChannelGeneration) AddPath(*quic.Transport) (*quic.Path, error) {

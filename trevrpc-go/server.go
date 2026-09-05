@@ -79,7 +79,12 @@ type ServerOptions struct {
 
 // HTTP3AdmissionRequest contains HTTP/3 request information available before accepting an RPC.
 type HTTP3AdmissionRequest struct {
-	Request   *http.Request
+	// Request is a Legacy-backend compatibility projection.
+	// Deprecated: use the backend-neutral request fields and Headers.
+	Request *http.Request
+	// Headers preserves backend-provided ordering and duplicates. The Legacy
+	// backend's upstream http.Header API cannot retain ordering between names.
+	Headers   HeaderFields
 	Path      string
 	Method    string
 	Authority string
@@ -92,7 +97,12 @@ type HTTP3Admission func(HTTP3AdmissionRequest) bool
 
 // WebTransportAdmissionRequest contains HTTP/3 CONNECT information available before accepting a WebTransport session.
 type WebTransportAdmissionRequest struct {
-	Request   *http.Request
+	// Request is a Legacy-backend compatibility projection.
+	// Deprecated: use the backend-neutral request fields and Headers.
+	Request *http.Request
+	// Headers preserves backend-provided ordering and duplicates. The Legacy
+	// backend's upstream http.Header API cannot retain ordering between names.
+	Headers   HeaderFields
 	Path      string
 	Authority string
 	Origin    string
@@ -130,6 +140,8 @@ const (
 type ServerDiagnostic struct {
 	Phase                  ServerDiagnosticPhase
 	Message                string
+	Connection             ConnectionInfo
+	CloseReason            TransportCloseReason
 	Service                string
 	Method                 string
 	Kind                   RpcKind
