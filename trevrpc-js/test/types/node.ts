@@ -42,6 +42,7 @@ const listenOptions: NodeListenOptions = {
   port: 0,
   certFile: "server.crt",
   keyFile: "server.key",
+  enableNative: true,
 };
 void NodeServer.listen(listenOptions);
 

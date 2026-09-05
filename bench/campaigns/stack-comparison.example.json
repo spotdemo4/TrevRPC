@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "campaign_id": "same-language-native-quic",
   "repetitions": 5,
   "peers": [

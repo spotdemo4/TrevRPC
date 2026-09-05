@@ -116,6 +116,8 @@ export interface NodeListenOptions extends NodeConnectOptions {
   certFile?: string;
   keyFile?: string;
   maxSessionsPerConnection?: number;
+  /** Enables native QUIC RPC connections. Enabled by default. */
+  enableNative?: boolean;
   /** Enables ordinary HTTP/3 POST requests. Disabled by default. */
   enableHttp3?: boolean;
   /** HTTP/3 POST path. Defaults to /trevrpc. */

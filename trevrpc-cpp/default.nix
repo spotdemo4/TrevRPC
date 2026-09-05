@@ -25,6 +25,7 @@ stdenv.mkDerivation (
       root = ../.;
       fileset = fileset.unions [
         benchProto
+        ../bench/http3-lifecycle-test.sh
         ./.
       ];
     };

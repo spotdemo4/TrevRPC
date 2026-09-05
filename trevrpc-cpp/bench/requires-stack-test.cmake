@@ -12,7 +12,7 @@ if(result EQUAL 0)
   message(FATAL_ERROR "${ROLE} accepted a command without --stack")
 endif()
 if(NOT output MATCHES
-    "schema_version.:4.*code.:.invalid_argument.*missing required option --stack")
+    "schema_version.:5.*code.:.invalid_argument.*missing required option --stack")
   message(FATAL_ERROR
     "${ROLE} returned an unexpected error without --stack:\n${diagnostics}${output}")
 endif()

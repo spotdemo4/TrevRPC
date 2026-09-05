@@ -37,6 +37,7 @@ using Clock = std::chrono::steady_clock;
 using Nanoseconds = std::chrono::nanoseconds;
 
 constexpr std::size_t kMaximumControlLine = 1024;
+constexpr std::string_view kHttp3Path = "/trevrpc";
 constexpr std::string_view kWebTransportPath = "/trevrpc";
 
 volatile std::sig_atomic_t stop_requested = 0;
@@ -188,11 +189,14 @@ void reject_unknown(const Arguments& arguments) {
   if (value == "trevrpc_native_quic") {
     return Stack::TrevrpcNativeQuic;
   }
+  if (value == "trevrpc_http3") {
+    return Stack::TrevrpcHttp3;
+  }
   if (value == "trevrpc_webtransport") {
     return Stack::TrevrpcWebTransport;
   }
   throw PeerError("config", "invalid_argument",
-                  "--stack must be trevrpc_native_quic or trevrpc_webtransport");
+                  "--stack must be trevrpc_native_quic, trevrpc_http3, or trevrpc_webtransport");
 }
 
 [[nodiscard]] RpcKind parse_rpc_kind(std::string_view value) {
@@ -253,6 +257,9 @@ void reject_unknown(const Arguments& arguments) {
   Arguments arguments = parse_arguments(argc, argv);
   ClientConfig config;
   config.stack = parse_stack(take_required(arguments, "stack"));
+  if (config.stack == Stack::TrevrpcHttp3) {
+    throw PeerError("config", "invalid_argument", "trevrpc_http3 is server-only");
+  }
   if (config.stack == Stack::TrevrpcWebTransport) {
     throw PeerError("config", "invalid_argument", "trevrpc_webtransport is server-only");
   }
@@ -299,7 +306,7 @@ void reject_unknown(const Arguments& arguments) {
   return config;
 }
 
-class NativeBenchmarkService final : public benchmark::BenchmarkServiceService {
+class BenchmarkService final : public benchmark::BenchmarkServiceService {
 public:
   trevrpc::Result<trevrpc::Response<benchmark::BenchmarkResponse>>
   Unary(const trevrpc::CallContext&, const benchmark::BenchmarkRequest& request) override {
@@ -476,16 +483,16 @@ enum class ControlCommand { Start, Shutdown, EndOfInput, Interrupted, ServeEnded
   }
 }
 
-class NativeBenchmarkServer final : public BenchmarkServer {
+class BenchmarkServerImpl final : public BenchmarkServer {
 public:
-  NativeBenchmarkServer(trevrpc::Server server, std::uint16_t port)
+  BenchmarkServerImpl(trevrpc::Server server, std::uint16_t port)
       : state_(std::make_shared<State>(std::move(server))), port_(port),
         serve_thread_([state = state_] {
           state->serve_result = state->server.serve();
           state->stopped.store(true, std::memory_order_release);
         }) {}
 
-  ~NativeBenchmarkServer() override {
+  ~BenchmarkServerImpl() override {
     shutdown();
     if (serve_thread_.joinable()) {
       serve_thread_.detach();
@@ -543,16 +550,23 @@ private:
   std::thread serve_thread_;
 };
 
-[[nodiscard]] std::unique_ptr<BenchmarkServer>
-start_native_server(const ServerConfig& peer_config) {
+[[nodiscard]] std::unique_ptr<BenchmarkServer> start_server(const ServerConfig& peer_config) {
   trevrpc::ServerConfig config;
   config.host = peer_config.endpoint.host;
   config.port = peer_config.endpoint.port;
   config.cert_file = peer_config.certificate;
   config.key_file = peer_config.private_key;
+  config.enable_native = peer_config.stack == Stack::TrevrpcNativeQuic;
+  config.enable_webtransport = peer_config.stack == Stack::TrevrpcWebTransport;
   if (peer_config.stack == Stack::TrevrpcWebTransport) {
     config.webtransport_path = kWebTransportPath;
     config.webtransport_origin = peer_config.webtransport_origin;
+  } else {
+    config.enable_webtransport = false;
+  }
+  if (peer_config.stack == Stack::TrevrpcHttp3) {
+    config.enable_http3 = true;
+    config.http3_path = kHttp3Path;
   }
   config.peer_bidi_stream_count = kPeerStreamLimit;
   config.max_frame_size = kMaximumFrameSize;
@@ -572,7 +586,7 @@ start_native_server(const ServerConfig& peer_config) {
     throw PeerError("setup", "server_config_failed", describe(configured.error()));
   }
   auto registered =
-      benchmark::RegisterBenchmarkService(server, std::make_shared<NativeBenchmarkService>());
+      benchmark::RegisterBenchmarkService(server, std::make_shared<BenchmarkService>());
   if (!registered) {
     throw PeerError("setup", "registration_failed", describe(registered.error()));
   }
@@ -581,12 +595,12 @@ start_native_server(const ServerConfig& peer_config) {
     throw PeerError("setup", "listen_failed", describe(port.error()));
   }
 
-  return std::make_unique<NativeBenchmarkServer>(std::move(server), port.value());
+  return std::make_unique<BenchmarkServerImpl>(std::move(server), port.value());
 }
 
 int run_server(int argc, char** argv) {
   const ServerConfig config = parse_server_config(argc, argv);
-  std::unique_ptr<BenchmarkServer> server = start_native_server(config);
+  std::unique_ptr<BenchmarkServer> server = start_server(config);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   if (server->stopped()) {
@@ -1157,6 +1171,11 @@ int run_client(int argc, char** argv) {
   const auto elapsed = std::chrono::duration_cast<Nanoseconds>(Clock::now() - phase_start);
   const std::uint64_t elapsed_ns =
       elapsed.count() <= 0 ? 0 : static_cast<std::uint64_t>(elapsed.count());
+  if (result.failed != 0) {
+    throw PeerError("measure", "rpc_failed",
+                    "measurement recorded " + std::to_string(result.failed) +
+                        " failed operation(s)");
+  }
   emit_sample(config, result, elapsed_ns);
   factory->close();
   return 0;
@@ -1180,7 +1199,7 @@ int main(int argc, char** argv) {
       emit("{\"schema_version\":" + std::to_string(kSchemaVersion) +
            ",\"event\":\"capabilities\",\"peer\":\"cpp\","
            "\"roles\":{\"client\":[\"trevrpc_native_quic\"],"
-           "\"server\":[\"trevrpc_native_quic\",\"trevrpc_webtransport\"]},"
+           "\"server\":[\"trevrpc_native_quic\",\"trevrpc_http3\",\"trevrpc_webtransport\"]},"
            "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
            "\"histogram\":\"log_linear_v1\"}");
       return 0;

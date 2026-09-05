@@ -31,7 +31,7 @@ _Static_assert(offsetof(trevrpc_client_config_v1, conn_flow_control_window) == 9
 _Static_assert(offsetof(trevrpc_client_config_v1, msquic_execution_profile) == 96, "client profile");
 _Static_assert(offsetof(trevrpc_client_config_v1, msquic_send_buffering_enabled) == 100, "client buffering");
 
-LAYOUT(trevrpc_server_config_v1, 176, 8);
+LAYOUT(trevrpc_server_config_v1, 184, 8);
 _Static_assert(offsetof(trevrpc_server_config_v1, struct_size) == 0, "server size");
 _Static_assert(offsetof(trevrpc_server_config_v1, struct_version) == 4, "server version");
 _Static_assert(offsetof(trevrpc_server_config_v1, host) == 8, "server host");
@@ -46,20 +46,21 @@ _Static_assert(offsetof(trevrpc_server_config_v1, enable_http3) == 72, "server h
 _Static_assert(offsetof(trevrpc_server_config_v1, http3_path) == 80, "server h3 path");
 _Static_assert(offsetof(trevrpc_server_config_v1, http3_admission) == 88, "server h3 admission");
 _Static_assert(offsetof(trevrpc_server_config_v1, http3_admission_user_data) == 96, "server h3 data");
-_Static_assert(offsetof(trevrpc_server_config_v1, max_idle_timeout_ms) == 104, "server idle");
-_Static_assert(offsetof(trevrpc_server_config_v1, keep_alive_ms) == 112, "server keepalive");
-_Static_assert(offsetof(trevrpc_server_config_v1, peer_bidi_stream_count) == 116, "server streams");
-_Static_assert(offsetof(trevrpc_server_config_v1, max_stateless_operations) == 120, "server stateless");
-_Static_assert(offsetof(trevrpc_server_config_v1, max_binding_stateless_operations) == 124, "server binding");
-_Static_assert(offsetof(trevrpc_server_config_v1, max_pending_send_bytes) == 128, "server send bytes");
-_Static_assert(offsetof(trevrpc_server_config_v1, max_pending_send_count) == 136, "server send count");
-_Static_assert(offsetof(trevrpc_server_config_v1, max_sessions_per_connection) == 144, "server sessions");
-_Static_assert(offsetof(trevrpc_server_config_v1, max_streams_per_session) == 148, "server session streams");
-_Static_assert(offsetof(trevrpc_server_config_v1, stream_recv_window) == 152, "server stream window");
-_Static_assert(offsetof(trevrpc_server_config_v1, conn_flow_control_window) == 156, "server conn window");
-_Static_assert(offsetof(trevrpc_server_config_v1, max_frame_size) == 160, "server frame");
-_Static_assert(offsetof(trevrpc_server_config_v1, msquic_execution_profile) == 168, "server profile");
-_Static_assert(offsetof(trevrpc_server_config_v1, msquic_send_buffering_enabled) == 172, "server buffering");
+_Static_assert(offsetof(trevrpc_server_config_v1, enable_native) == 104, "server native enable");
+_Static_assert(offsetof(trevrpc_server_config_v1, max_idle_timeout_ms) == 112, "server idle");
+_Static_assert(offsetof(trevrpc_server_config_v1, keep_alive_ms) == 120, "server keepalive");
+_Static_assert(offsetof(trevrpc_server_config_v1, peer_bidi_stream_count) == 124, "server streams");
+_Static_assert(offsetof(trevrpc_server_config_v1, max_stateless_operations) == 128, "server stateless");
+_Static_assert(offsetof(trevrpc_server_config_v1, max_binding_stateless_operations) == 132, "server binding");
+_Static_assert(offsetof(trevrpc_server_config_v1, max_pending_send_bytes) == 136, "server send bytes");
+_Static_assert(offsetof(trevrpc_server_config_v1, max_pending_send_count) == 144, "server send count");
+_Static_assert(offsetof(trevrpc_server_config_v1, max_sessions_per_connection) == 152, "server sessions");
+_Static_assert(offsetof(trevrpc_server_config_v1, max_streams_per_session) == 156, "server session streams");
+_Static_assert(offsetof(trevrpc_server_config_v1, stream_recv_window) == 160, "server stream window");
+_Static_assert(offsetof(trevrpc_server_config_v1, conn_flow_control_window) == 164, "server conn window");
+_Static_assert(offsetof(trevrpc_server_config_v1, max_frame_size) == 168, "server frame");
+_Static_assert(offsetof(trevrpc_server_config_v1, msquic_execution_profile) == 176, "server profile");
+_Static_assert(offsetof(trevrpc_server_config_v1, msquic_send_buffering_enabled) == 180, "server buffering");
 
 LAYOUT(trevrpc_server_options_v1, 88, 8);
 _Static_assert(offsetof(trevrpc_server_options_v1, struct_size) == 0, "server options size");

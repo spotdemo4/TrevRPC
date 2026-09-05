@@ -15,7 +15,6 @@ import kotlinx.coroutines.yield
 import org.chromium.net.BidirectionalStream
 import org.chromium.net.CronetEngine
 import org.chromium.net.UrlRequest
-import org.chromium.net.UrlResponseInfo
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -184,6 +183,51 @@ class Http3RpcTransportTest {
             val error = runCatching { stream.send(byteArrayOf(3)) }.exceptionOrNull() as TrevRpcException
             assertEquals(Code.CANCELLED, error.status.code)
             stream.close()
+        }
+
+    @Test
+    fun `remote terminal status makes a later finish idempotent`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    fake,
+                )
+            fake.headers(validHeaders())
+            fake.deliverRead(frame(WireCodec.encode(RpcStreamFrame.status(Status.ok()))))
+            runCurrent()
+
+            stream.finishSend()
+            assertEquals(0, fake.pendingWrites)
+            assertEquals(RpcStreamFrameKind.STATUS, stream.receive()?.kind)
+            assertNull(stream.receive())
+            assertTrue(fake.awaitCancel())
+        }
+
+    @Test
+    fun `remote terminal status completes an in-flight finish`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    fake,
+                )
+            val finish = async { stream.finishSend() }
+            runCurrent()
+            assertTrue(fake.onlyWrite().endOfStream)
+            assertFalse(finish.isCompleted)
+
+            fake.headers(validHeaders())
+            fake.deliverRead(frame(WireCodec.encode(RpcStreamFrame.status(Status.ok()))))
+            runCurrent()
+
+            finish.await()
+            fake.completeWrite()
+            assertEquals(RpcStreamFrameKind.STATUS, stream.receive()?.kind)
+            assertNull(stream.receive())
+            assertTrue(fake.awaitCancel())
         }
 
     @Test
@@ -897,6 +941,26 @@ class Http3RpcTransportTest {
         }
 
     @Test
+    fun `null write response info reaches streaming send and finish`() =
+        runBlocking {
+            val engine = BorrowedCronetEngine()
+            val executor = Executors.newSingleThreadExecutor()
+            val channel = CronetRpcChannel.create(engine, "https://example.com", executor)
+            try {
+                val stream = withTimeout(5.seconds) { channel.openStream(streamRequest()) }
+                withTimeout(5.seconds) {
+                    stream.send(byteArrayOf(1, 2, 3))
+                    stream.finishSend()
+                }
+                assertEquals(3, engine.stream.writeCompletions)
+            } finally {
+                runCatching { channel.close() }
+                executor.shutdown()
+                assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS))
+            }
+        }
+
+    @Test
     fun `channel close never shuts down borrowed engine or executor`() =
         runBlocking {
             val engine = BorrowedCronetEngine()
@@ -1287,6 +1351,7 @@ private class AdapterCronetStream(
     val callbackExecutor: Executor,
 ) : BidirectionalStream() {
     var cancelCalls = 0
+    var writeCompletions = 0
     private var done = false
 
     override fun start() {
@@ -1301,7 +1366,8 @@ private class AdapterCronetStream(
     ) {
         callbackExecutor.execute {
             buffer.position(buffer.limit())
-            callback.onWriteCompleted(this, FakeUrlResponseInfo, buffer, endOfStream)
+            writeCompletions++
+            callback.onWriteCompleted(this, null, buffer, endOfStream)
         }
     }
 
@@ -1314,27 +1380,4 @@ private class AdapterCronetStream(
     }
 
     override fun isDone(): Boolean = done
-}
-
-private object FakeUrlResponseInfo : UrlResponseInfo() {
-    override fun getUrl(): String = "https://example.com/trevrpc"
-
-    override fun getUrlChain(): List<String> = listOf(url)
-
-    override fun getHttpStatusCode(): Int = 200
-
-    override fun getHttpStatusText(): String = "OK"
-
-    override fun getAllHeadersAsList(): List<Map.Entry<String, String>> =
-        listOf(java.util.AbstractMap.SimpleImmutableEntry("content-type", TREV_RPC_CONTENT_TYPE))
-
-    override fun getAllHeaders(): Map<String, List<String>> = mapOf("content-type" to listOf(TREV_RPC_CONTENT_TYPE))
-
-    override fun wasCached(): Boolean = false
-
-    override fun getNegotiatedProtocol(): String = "h3"
-
-    override fun getProxyServer(): String = ""
-
-    override fun getReceivedByteCount(): Long = 0
 }

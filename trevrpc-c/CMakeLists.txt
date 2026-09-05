@@ -484,13 +484,22 @@ if(TREVRPC_BUILD_TESTS)
         add_test(NAME trevrpc_bench_peer_capabilities COMMAND trevrpc_bench_peer_c capabilities)
         set_tests_properties(trevrpc_bench_peer_capabilities PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "\"schema_version\":4.*\"roles\":\\{\"client\":\\[\"trevrpc_native_quic\"\\],\"server\":\\[\"trevrpc_native_quic\",\"trevrpc_webtransport\"\\]\\}.*\"rpc_kinds\":\\[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"\\].*\"histogram\":\"log_linear_v1\""
+                "\"schema_version\":5.*\"roles\":\\{\"client\":\\[\"trevrpc_native_quic\"\\],\"server\":\\[\"trevrpc_native_quic\",\"trevrpc_http3\",\"trevrpc_webtransport\"\\]\\}.*\"rpc_kinds\":\\[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"\\].*\"histogram\":\"log_linear_v1\""
         )
         add_test(NAME trevrpc_bench_peer_webtransport_config
             COMMAND "${CMAKE_COMMAND}"
                 -DPEER=$<TARGET_FILE:trevrpc_bench_peer_c>
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_peer_webtransport_config.cmake"
         )
+        add_test(NAME trevrpc_bench_peer_http3_lifecycle
+            COMMAND sh
+                "${CMAKE_CURRENT_SOURCE_DIR}/../bench/http3-lifecycle-test.sh"
+                "$<TARGET_FILE:trevrpc_bench_peer_c>"
+                "${trevrpc_msquic_test_cert}"
+                "${trevrpc_msquic_test_key}"
+        )
+        set_tests_properties(trevrpc_bench_peer_http3_lifecycle PROPERTIES TIMEOUT 30)
+        trevrpc_c_lsan_suppressions(trevrpc_bench_peer_http3_lifecycle)
         add_test(NAME trevrpc_bench_peer_webtransport_smoke
             COMMAND sh
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_peer_webtransport_smoke.sh"

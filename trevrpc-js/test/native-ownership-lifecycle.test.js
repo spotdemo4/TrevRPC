@@ -498,6 +498,7 @@ const native = require(${JSON.stringify(nativeAddonPath)});
       port: 0,
       certFile: certificate.certFile,
       keyFile: certificate.keyFile,
+      enableNative: false,
       enableHttp3: true,
       http3Path: "/rpc",
       http3Admission: ({ path, authority, secure }) =>

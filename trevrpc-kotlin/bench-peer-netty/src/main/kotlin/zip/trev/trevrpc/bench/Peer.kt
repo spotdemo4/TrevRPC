@@ -146,33 +146,15 @@ private suspend fun runClient(
 }
 
 private suspend fun bindBenchmarkServer(config: PeerCommand.Server): RunningBenchmarkServer {
-    val address = parseAddress(config.listen, allowZeroPort = true)
-    return when (config.stack) {
-        BenchmarkStack.TREVRPC_NATIVE_QUIC -> {
-            val server =
-                NettyRpcServer.bind(
-                    createBenchmarkServer(),
-                    benchmarkNettyServerConfig(config, address),
-                )
-            object : RunningBenchmarkServer {
-                override val localAddress = server.localAddress
+    val server =
+        NettyRpcServer.bind(
+            createBenchmarkServer(),
+            benchmarkNettyServerConfig(config, parseAddress(config.listen, allowZeroPort = true)),
+        )
+    return object : RunningBenchmarkServer {
+        override val localAddress = server.localAddress
 
-                override suspend fun shutdown() = server.shutdown()
-            }
-        }
-
-        BenchmarkStack.TREVRPC_WEBTRANSPORT -> {
-            val server =
-                NettyRpcServer.bind(
-                    createBenchmarkServer(),
-                    benchmarkNettyServerConfig(config, address),
-                )
-            object : RunningBenchmarkServer {
-                override val localAddress = server.localAddress
-
-                override suspend fun shutdown() = server.shutdown()
-            }
-        }
+        override suspend fun shutdown() = server.shutdown()
     }
 }
 
@@ -199,6 +181,10 @@ private suspend fun connectBenchmarkClient(config: PeerCommand.Client): Benchmar
             )
         }
 
+        BenchmarkStack.TREVRPC_HTTP3 -> {
+            throw IllegalArgumentException("trevrpc_http3 is not supported by the Kotlin benchmark client")
+        }
+
         BenchmarkStack.TREVRPC_WEBTRANSPORT -> {
             throw IllegalArgumentException("trevrpc_webtransport is not supported by the Kotlin benchmark client")
         }
@@ -209,6 +195,8 @@ internal fun benchmarkNettyServerConfig(
     config: PeerCommand.Server,
     address: InetSocketAddress,
 ): NettyRpcServerConfig {
+    val native = config.stack == BenchmarkStack.TREVRPC_NATIVE_QUIC
+    val http3 = config.stack == BenchmarkStack.TREVRPC_HTTP3
     val webTransport = config.stack == BenchmarkStack.TREVRPC_WEBTRANSPORT
     val expectedOrigin =
         if (webTransport) {
@@ -221,8 +209,8 @@ internal fun benchmarkNettyServerConfig(
     return NettyRpcServerConfig(
         bindAddress = address,
         tls = NettyServerTls.Pem(config.privateKey.toFile(), config.certificate.toFile()),
-        enableNative = !webTransport,
-        enableHttp3 = webTransport,
+        enableNative = native,
+        enableHttp3 = http3,
         enableWebTransport = webTransport,
         webTransportAdmission =
             if (webTransport) {

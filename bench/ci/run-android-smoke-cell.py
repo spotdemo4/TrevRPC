@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import os
 import selectors
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO, cast
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 EMULATOR_HOST = "10.0.2.2"
 EMULATOR_PORT = 5554
 BOOT_TIMEOUT_SECONDS = 180
@@ -24,6 +25,8 @@ ADB_PROBE_TIMEOUT_SECONDS = 5
 DATA_PARTITION_MIB = 4096
 MIN_AVD_FREE_BYTES = 6 * 1024 * 1024 * 1024
 EMULATOR_LOG_TAIL_LINES = 80
+ANDROID_CA_DIRECTORY = "/system/etc/security/cacerts"
+ANDROID_CA_SETUP_LOG = "android-ca-setup.jsonl"
 
 
 class SmokeFailure(RuntimeError):
@@ -92,6 +95,96 @@ def parse_json_object(text: str, description: str) -> dict[str, object]:
     return cast(dict[str, object], mapping)
 
 
+def execute_command(
+    command: list[str],
+    *,
+    input_text: str | None = None,
+    timeout: int = 60,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+
+
+def validate_command_result(
+    command: list[str], result: subprocess.CompletedProcess[str]
+) -> subprocess.CompletedProcess[str]:
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise SmokeFailure(
+            f"command failed with exit {result.returncode}: {' '.join(command)}\n{message}"
+        )
+    return result
+
+
+def timeout_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
+
+
+def execute_checked(
+    command: list[str],
+    *,
+    input_text: str | None = None,
+    timeout: int = 60,
+    env: dict[str, str] | None = None,
+    log: TextIO | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = execute_command(
+            command,
+            input_text=input_text,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as error:
+        if log is not None:
+            write_command_record(
+                log,
+                command,
+                returncode=None,
+                stdout=timeout_output(error.stdout),
+                stderr=timeout_output(error.stderr),
+                timeout=timeout,
+                error="timed_out",
+            )
+        raise SmokeFailure(
+            f"command timed out after {timeout}s: {' '.join(command)}"
+        ) from error
+    except OSError as error:
+        if log is not None:
+            write_command_record(
+                log,
+                command,
+                returncode=None,
+                stdout="",
+                stderr="",
+                error=str(error),
+            )
+        raise SmokeFailure(
+            f"could not run command: {' '.join(command)}\n{error}"
+        ) from error
+    if log is not None:
+        write_command_record(
+            log,
+            command,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+    return validate_command_result(command, result)
+
+
 def run_checked(
     command: list[str],
     *,
@@ -99,26 +192,12 @@ def run_checked(
     timeout: int = 60,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    try:
-        result = subprocess.run(
-            command,
-            input=input_text,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise SmokeFailure(
-            f"command timed out after {timeout}s: {' '.join(command)}"
-        ) from error
-    if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip()
-        raise SmokeFailure(
-            f"command failed with exit {result.returncode}: {' '.join(command)}\n{message}"
-        )
-    return result
+    return execute_checked(
+        command,
+        input_text=input_text,
+        timeout=timeout,
+        env=env,
+    )
 
 
 def require_tools(names: list[str]) -> None:
@@ -133,14 +212,48 @@ def adb(
     return run_checked(["adb", "-s", serial, *arguments], timeout=timeout)
 
 
+def write_command_record(
+    log: TextIO,
+    command: list[str],
+    *,
+    returncode: int | None,
+    stdout: str,
+    stderr: str,
+    timeout: int | None = None,
+    error: str | None = None,
+) -> None:
+    record: dict[str, object] = {
+        "command": command,
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    if timeout is not None:
+        record["timeout"] = timeout
+    if error is not None:
+        record["error"] = error
+    _ = log.write(json.dumps(record, sort_keys=True) + "\n")
+    log.flush()
+
+
+def recorded_adb(
+    serial: str,
+    log: TextIO,
+    *arguments: str,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[str]:
+    return execute_checked(
+        ["adb", "-s", serial, *arguments],
+        timeout=timeout,
+        log=log,
+    )
+
+
 def adb_probe(serial: str, *arguments: str) -> subprocess.CompletedProcess[str] | None:
     try:
-        return subprocess.run(
+        return execute_command(
             ["adb", "-s", serial, *arguments],
-            text=True,
-            capture_output=True,
             timeout=ADB_PROBE_TIMEOUT_SECONDS,
-            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -349,42 +462,76 @@ def install_ca(
     emulator_log: Path,
     ca_path: Path,
     work_dir: Path,
+    output: Path,
 ) -> None:
     subject_hash = run_checked(
         ["openssl", "x509", "-subject_hash_old", "-noout", "-in", str(ca_path)]
     ).stdout.splitlines()[0]
     android_ca = work_dir / f"{subject_hash}.0"
     _ = shutil.copyfile(ca_path, android_ca)
+    destination = f"{ANDROID_CA_DIRECTORY}/{android_ca.name}"
+    probe_path = f"{ANDROID_CA_DIRECTORY}/.trevrpc-write-probe-{os.getpid()}"
+    probe_command = (
+        f"trap 'rm -f {probe_path}' 0 1 2 15; "
+        + f"printf '%s\\n' trevrpc > {probe_path}"
+    )
+    expected_digest = hashlib.sha256(android_ca.read_bytes()).hexdigest()
 
-    _ = adb(serial, "root")
-    wait_for_root(serial, process, emulator_log)
-    _ = adb(serial, "remount", timeout=90)
-    _ = adb(
-        serial,
-        "push",
-        str(android_ca),
-        f"/system/etc/security/cacerts/{android_ca.name}",
-    )
-    _ = adb(
-        serial,
-        "shell",
-        "chmod",
-        "644",
-        f"/system/etc/security/cacerts/{android_ca.name}",
-    )
-    previous_boot_id = read_boot_id(serial)
-    if previous_boot_id is None:
-        raise SmokeFailure("could not read emulator boot ID before reboot")
-    _ = adb(serial, "reboot")
-    wait_for_boot(
-        serial,
-        process,
-        emulator_log,
-        previous_boot_id=previous_boot_id,
-    )
-    _ = adb(
-        serial, "shell", "test", "-f", f"/system/etc/security/cacerts/{android_ca.name}"
-    )
+    with (output / ANDROID_CA_SETUP_LOG).open("a", encoding="utf-8") as setup_log:
+
+        def setup_adb(
+            *arguments: str, timeout: int = 60
+        ) -> subprocess.CompletedProcess[str]:
+            return recorded_adb(
+                serial,
+                setup_log,
+                *arguments,
+                timeout=timeout,
+            )
+
+        _ = setup_adb("root")
+        wait_for_root(serial, process, emulator_log)
+        _ = setup_adb("disable-verity")
+        verity_boot_id = read_boot_id(serial)
+        if verity_boot_id is None:
+            raise SmokeFailure("could not read emulator boot ID before verity reboot")
+        _ = setup_adb("reboot")
+        wait_for_boot(
+            serial,
+            process,
+            emulator_log,
+            previous_boot_id=verity_boot_id,
+        )
+
+        _ = setup_adb("root")
+        wait_for_root(serial, process, emulator_log)
+        _ = setup_adb("remount", timeout=90)
+        _ = setup_adb("shell", probe_command)
+        _ = setup_adb("push", str(android_ca), destination)
+        _ = setup_adb("shell", "chmod", "644", destination)
+        _ = setup_adb("shell", "chown", "0:0", destination)
+        _ = setup_adb("shell", "restorecon", destination)
+
+        activation_boot_id = read_boot_id(serial)
+        if activation_boot_id is None:
+            raise SmokeFailure(
+                "could not read emulator boot ID before CA activation reboot"
+            )
+        _ = setup_adb("reboot")
+        wait_for_boot(
+            serial,
+            process,
+            emulator_log,
+            previous_boot_id=activation_boot_id,
+        )
+        digest_result = setup_adb("shell", "sha256sum", destination)
+
+    digest_parts = digest_result.stdout.split()
+    actual_digest = digest_parts[0] if digest_parts else ""
+    if actual_digest != expected_digest:
+        raise SmokeFailure(
+            f"installed Android CA digest is {actual_digest!r}, expected {expected_digest!r}"
+        )
 
 
 def parse_server_event(line: str, expected: str, log: TextIO) -> dict[str, object]:
@@ -449,9 +596,9 @@ def verify_server_capabilities(server_id: str, server_command: str) -> None:
     if not isinstance(server_roles, list):
         raise SmokeFailure(f"server capabilities have invalid roles: {capabilities!r}")
     advertised_roles = cast(list[object], server_roles)
-    if "trevrpc_webtransport" not in advertised_roles:
+    if "trevrpc_http3" not in advertised_roles:
         raise SmokeFailure(
-            f"server does not advertise HTTP/3 listener support: {capabilities!r}"
+            f"server does not advertise ordinary HTTP/3 support: {capabilities!r}"
         )
 
 
@@ -468,15 +615,13 @@ def start_server(
             server_command,
             "server",
             "--stack",
-            "trevrpc_webtransport",
+            "trevrpc_http3",
             "--listen",
             "0.0.0.0:0",
             "--cert",
             str(certificate),
             "--key",
             str(private_key),
-            "--webtransport-origin",
-            "https://android-smoke.invalid",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -689,6 +834,7 @@ def main() -> int:
             emulator_log,
             ca,
             arguments.work_dir,
+            arguments.output,
         )
         for setting in [
             "window_animation_scale",

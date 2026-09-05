@@ -1,6 +1,7 @@
 package zip.trev.trevrpc.bench
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import java.io.ByteArrayOutputStream
@@ -95,15 +96,15 @@ class ProtocolTest {
     }
 
     @Test
-    fun `schema 4 capabilities advertise role-specific stacks and commands require one`() {
+    fun `schema 5 capabilities advertise role-specific stacks and commands require one`() {
         val output = ByteArrayOutputStream()
         EventWriter(PrintStream(output, true, Charsets.UTF_8)).capabilities()
 
         val rpcKinds = """["unary","client_stream","server_stream","bidi"]"""
         val expectedCapabilities =
-            """{"schema_version":4,"event":"capabilities","peer":"kotlin","roles":{""" +
+            """{"schema_version":5,"event":"capabilities","peer":"kotlin","roles":{""" +
                 """"client":["trevrpc_native_quic"],""" +
-                """"server":["trevrpc_native_quic","trevrpc_webtransport"]},""" +
+                """"server":["trevrpc_native_quic","trevrpc_http3","trevrpc_webtransport"]},""" +
                 """"rpc_kinds":$rpcKinds,"histogram":"log_linear_v1"}""" +
                 System.lineSeparator()
         assertEquals(
@@ -115,6 +116,44 @@ class ProtocolTest {
         }
         assertThrows(IllegalArgumentException::class.java) {
             clientArgs("--stack", "unknown")
+        }
+    }
+
+    @Test
+    fun `ordinary HTTP3 is server-only and does not require an origin`() {
+        val server =
+            parseCommand(
+                arrayOf(
+                    "server",
+                    "--stack",
+                    "trevrpc_http3",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--cert",
+                    "cert",
+                    "--key",
+                    "key",
+                ),
+            ) as PeerCommand.Server
+        assertEquals(BenchmarkStack.TREVRPC_HTTP3, server.stack)
+        assertNull(server.webTransportOrigin)
+        assertThrows(IllegalArgumentException::class.java) { clientArgs("--stack", "trevrpc_http3") }
+        assertThrows(IllegalArgumentException::class.java) {
+            parseCommand(
+                arrayOf(
+                    "server",
+                    "--stack",
+                    "trevrpc_http3",
+                    "--listen",
+                    "127.0.0.1:0",
+                    "--cert",
+                    "cert",
+                    "--key",
+                    "key",
+                    "--webtransport-origin",
+                    "https://benchmark.example",
+                ),
+            )
         }
     }
 
@@ -204,8 +243,8 @@ class ProtocolTest {
 
         assertEquals(
             listOf(
-                """{"schema_version":4,"event":"ready","peer":"kotlin","address":"127.0.0.1:7","pid":12}""",
-                """{"schema_version":4,"event":"sample","peer":"kotlin","rpc_kind":"unary","admission_ns":"1000000","elapsed_ns":"1000100","drain_ns":"100","completed":"1","failed":"0","request_messages":"1","response_messages":"1","histogram":[{"upper_bound_ns":"100","count":"1"}]}""",
+                """{"schema_version":5,"event":"ready","peer":"kotlin","address":"127.0.0.1:7","pid":12}""",
+                """{"schema_version":5,"event":"sample","peer":"kotlin","rpc_kind":"unary","admission_ns":"1000000","elapsed_ns":"1000100","drain_ns":"100","completed":"1","failed":"0","request_messages":"1","response_messages":"1","histogram":[{"upper_bound_ns":"100","count":"1"}]}""",
             ),
             output
                 .toString(Charsets.UTF_8)

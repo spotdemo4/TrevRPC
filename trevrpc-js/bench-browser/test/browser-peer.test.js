@@ -121,11 +121,11 @@ const peers = [
 for (const { name, file, parse, connect } of peers) {
   const peerPath = fileURLToPath(new URL(file, import.meta.url));
 
-  test(`${name} peer advertises platform-accurate V4 capabilities`, async () => {
+  test(`${name} peer advertises platform-accurate V5 capabilities`, async () => {
     const { stdout, stderr } = await execFileAsync(process.execPath, [peerPath, "capabilities"]);
     assert.equal(stderr, "");
     assert.deepEqual(JSON.parse(stdout), {
-      schema_version: 4,
+      schema_version: 5,
       event: "capabilities",
       roles:
         name === "webkit" && process.platform === "linux"

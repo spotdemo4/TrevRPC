@@ -1,9 +1,9 @@
 # RPC Benchmark Harness
 
 `trevrpc-bench` is the centralized controller for language-owned benchmark
-peers. It runs TrevRPC native QUIC and WebTransport client/server pairs,
-validates their structured results, collects process-group metrics, and
-generates replayable reports.
+peers. It runs TrevRPC native QUIC and WebTransport client/server pairs, models
+ordinary TrevRPC-over-HTTP/3 as a distinct stack, validates structured results,
+collects process-group metrics, and generates replayable reports.
 
 ## Build
 
@@ -34,11 +34,13 @@ package.
 
 ## Run
 
-Campaigns and peers use schema V4. Every cell selects a required `stack`:
-`trevrpc_native_quic` or `trevrpc_webtransport`. A cell may use
-any listed peer as its client and any listed peer as its server, so the same
-controller supports stack and split client/server comparisons. Capabilities are
-validated independently for each role; client support never implies server
+Campaigns and peers use schema V5. Every cell selects a required `stack`:
+`trevrpc_native_quic`, `trevrpc_http3`, or `trevrpc_webtransport`. Ordinary
+HTTP/3 means `POST /trevrpc` with `application/trevrpc`; WebTransport means an
+admitted extended-CONNECT session and does not imply direct POST support. A cell
+may use any listed peer as its client and any listed peer as its server, so the
+same controller supports stack and split client/server comparisons. Capabilities
+are validated independently for each role; client support never implies server
 support or vice versa. Earlier campaign and peer-event schema versions are not
 supported.
 
@@ -73,7 +75,10 @@ generating reports.
 
 `stack-comparison.example.json` contains same-language native QUIC cells for C,
 C++, Go, JavaScript, Kotlin, and Rust. The controller checks each peer's
-advertised stacks, roles, RPC kinds, and histogram before starting a run.
+advertised stacks, roles, RPC kinds, and histogram before starting a run. These
+language peers advertise `trevrpc_http3` for servers only; the Android Cronet
+smoke harness supplies the current direct-HTTP/3 client coverage, so no unusable
+process-peer HTTP/3 campaign is included.
 
 `chromium-smoke.example.json`, `firefox-smoke.example.json`, and
 `webkit-smoke.example.json` each start the respective browser client before
@@ -184,5 +189,5 @@ controller can stop sampling.
 
 Latency is measured for a complete bounded RPC. A streaming RPC contains the
 configured `messages_per_stream`; message throughput is reported separately
-from operation throughput. See `peer-protocol-v4.md` for the peer protocol
+from operation throughput. See `peer-protocol-v5.md` for the peer protocol
 and exact semantics.

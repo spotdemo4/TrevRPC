@@ -8,8 +8,12 @@ import { promisify } from "node:util";
 import { Code, RpcStreamFrameKind, protobuf } from "@trevrpc/trevrpc-js";
 
 import {
+  HTTP3Stack,
   LogLinearHistogram,
+  NativeQUICStack,
+  WebTransportStack,
   createClientOperation,
+  listenOptionsForStack,
   logLinearUpperBound,
   prepareFixedAdmissionPhase,
   root,
@@ -93,7 +97,7 @@ function schemaFields(type) {
   );
 }
 
-test("benchmark peer capabilities use protocol v4 role-specific stacks", async () => {
+test("benchmark peer capabilities use protocol v5 role-specific stacks", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [
     fileURLToPath(new URL("../trevrpc-bench-peer.js", import.meta.url)),
     "capabilities",
@@ -101,11 +105,11 @@ test("benchmark peer capabilities use protocol v4 role-specific stacks", async (
 
   assert.equal(stderr, "");
   assert.deepEqual(JSON.parse(stdout), {
-    schema_version: 4,
+    schema_version: 5,
     event: "capabilities",
     roles: {
       client: ["trevrpc_native_quic"],
-      server: ["trevrpc_native_quic", "trevrpc_webtransport"],
+      server: ["trevrpc_native_quic", "trevrpc_http3", "trevrpc_webtransport"],
     },
     rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
     histogram: "log_linear_v1",
@@ -193,6 +197,26 @@ test("benchmark peer parses required client and IPv6 server options", () => {
       webtransportOrigin: "http://127.0.0.1:8080",
     },
   );
+  assert.deepEqual(
+    parseCommandLine([
+      "server",
+      "--stack",
+      "trevrpc_http3",
+      "--listen",
+      "127.0.0.1:0",
+      "--cert",
+      "server.pem",
+      "--key",
+      "server-key.pem",
+    ]),
+    {
+      command: "server",
+      stack: "trevrpc_http3",
+      listen: { host: "127.0.0.1", port: 0 },
+      cert: "server.pem",
+      key: "server-key.pem",
+    },
+  );
   assert.throws(
     () =>
       parseCommandLine([
@@ -266,6 +290,25 @@ test("benchmark peer parses required client and IPv6 server options", () => {
       ]),
     /only valid with server stack trevrpc_webtransport/u,
   );
+});
+
+test("server listen options keep HTTP/3 and WebTransport exclusive", () => {
+  assert.deepEqual(listenOptionsForStack(NativeQUICStack), {
+    path: "",
+    enableNative: true,
+  });
+  assert.deepEqual(listenOptionsForStack(HTTP3Stack), {
+    path: "",
+    enableNative: false,
+    enableHttp3: true,
+    http3Path: "/trevrpc",
+  });
+  assert.deepEqual(listenOptionsForStack(WebTransportStack, "https://benchmark.example"), {
+    path: "/trevrpc",
+    origin: "https://benchmark.example",
+    enableNative: false,
+  });
+  assert.throws(() => listenOptionsForStack(WebTransportStack), /require an origin/u);
 });
 
 test("log_linear_v1 uses exact low buckets and sorted sparse output", () => {

@@ -47,6 +47,7 @@ impl FromStr for RpcKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Stack {
     TrevrpcNativeQuic,
+    TrevrpcHttp3,
     TrevrpcWebTransport,
 }
 
@@ -56,9 +57,10 @@ impl FromStr for Stack {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "trevrpc_native_quic" => Ok(Self::TrevrpcNativeQuic),
+            "trevrpc_http3" => Ok(Self::TrevrpcHttp3),
             "trevrpc_webtransport" => Ok(Self::TrevrpcWebTransport),
             _ => Err(ConfigError(format!(
-                "invalid --stack value {value:?}; expected trevrpc_native_quic or trevrpc_webtransport"
+                "invalid --stack value {value:?}; expected trevrpc_native_quic, trevrpc_http3, or trevrpc_webtransport"
             ))),
         }
     }
@@ -191,10 +193,18 @@ fn parse_client(mut options: BTreeMap<String, String>) -> Result<ClientConfig, C
         messages_per_stream: take_positive(&mut options, "--messages-per-stream")?,
     };
     reject_unknown(&options)?;
-    if config.stack == Stack::TrevrpcWebTransport {
-        return Err(ConfigError(
-            "trevrpc_webtransport is a server-only stack".to_owned(),
-        ));
+    match config.stack {
+        Stack::TrevrpcNativeQuic => {}
+        Stack::TrevrpcHttp3 => {
+            return Err(ConfigError(
+                "trevrpc_http3 is a server-only stack".to_owned(),
+            ));
+        }
+        Stack::TrevrpcWebTransport => {
+            return Err(ConfigError(
+                "trevrpc_webtransport is a server-only stack".to_owned(),
+            ));
+        }
     }
     if config.concurrency > MAX_BENCHMARK_CONCURRENCY {
         return Err(ConfigError(format!(
@@ -356,6 +366,57 @@ mod tests {
             "client",
             "--address",
             "127.0.0.1:1",
+            "--cert",
+            "ca.pem",
+            "--rpc",
+            "unary",
+            "--concurrency",
+            "1",
+            "--warmup-ms",
+            "0",
+            "--measurement-ms",
+            "1",
+            "--request-bytes",
+            "0",
+            "--response-bytes",
+            "0",
+            "--messages-per-stream",
+            "1",
+        ];
+        assert!(parse(client.map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn http3_is_server_only_and_does_not_accept_origin() {
+        let server = [
+            "server",
+            "--stack",
+            "trevrpc_http3",
+            "--listen",
+            "127.0.0.1:0",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+        ];
+        let Command::Server(config) =
+            parse(server.map(str::to_owned)).expect("HTTP/3 server configuration should parse")
+        else {
+            panic!("expected server command");
+        };
+        assert_eq!(config.stack, Stack::TrevrpcHttp3);
+        assert!(config.webtransport_origin.is_none());
+
+        let mut with_origin = server.to_vec();
+        with_origin.extend(["--webtransport-origin", "https://benchmark.example"]);
+        assert!(parse(with_origin.into_iter().map(str::to_owned)).is_err());
+
+        let client = [
+            "client",
+            "--stack",
+            "trevrpc_http3",
+            "--address",
+            "127.0.0.1:1234",
             "--cert",
             "ca.pem",
             "--rpc",

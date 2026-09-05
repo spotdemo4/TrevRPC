@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "campaign_id": "single-host-netns-smoke",
   "repetitions": 1,
   "peers": [

@@ -218,7 +218,7 @@ fn run_sample(
     let client_peer = campaign.peer(&cell.client).ok_or("missing client peer")?;
 
     let startup_timeout = Duration::from_millis(campaign.startup_timeout_ms);
-    let (mut server, mut client) = if cell.stack == Stack::TrevrpcWebtransport {
+    let (mut server, mut client) = if cell.stack.requires_prepared_client() {
         let mut client = PeerProcess::spawn(
             client_peer,
             &client_arguments(campaign, cell, rpc_kind, concurrency, certificates, None),
@@ -313,7 +313,7 @@ fn run_sample(
     let client_metrics = client_monitor.finish();
     let server_metrics = server_monitor.finish();
 
-    let client_exit_timeout = if cell.stack == Stack::TrevrpcWebtransport {
+    let client_exit_timeout = if cell.stack.requires_prepared_client() {
         Duration::from_secs(20)
     } else {
         Duration::from_secs(5)
@@ -372,7 +372,7 @@ fn client_arguments(
     certificates: &Certificates,
     address: Option<&str>,
 ) -> Vec<String> {
-    let certificate = if cell.stack == Stack::TrevrpcWebtransport {
+    let certificate = if cell.stack.requires_prepared_client() {
         &certificates.certificate
     } else {
         &certificates.ca
@@ -1221,10 +1221,17 @@ mod tests {
     fn sample_ids_distinguish_stacks() {
         let mut cell = campaign().cells.remove(0);
         let native = sample_id(&cell, RpcKind::Unary, 1, 1);
-        cell.id = "other".to_owned();
-        let other = sample_id(&cell, RpcKind::Unary, 1, 1);
-        assert_ne!(native, other);
+        cell.stack = Stack::TrevrpcHttp3;
+        let http3 = sample_id(&cell, RpcKind::Unary, 1, 1);
+        cell.stack = Stack::TrevrpcWebtransport;
+        let webtransport = sample_id(&cell, RpcKind::Unary, 1, 1);
+
+        assert_ne!(native, http3);
+        assert_ne!(native, webtransport);
+        assert_ne!(http3, webtransport);
         assert!(native.contains("trevrpc_native_quic"));
+        assert!(http3.contains("trevrpc_http3"));
+        assert!(webtransport.contains("trevrpc_webtransport"));
     }
 
     #[test]
@@ -1288,26 +1295,31 @@ mod tests {
     }
 
     #[test]
-    fn native_client_arguments_keep_address_and_ca_certificate() {
+    fn address_at_start_client_arguments_use_address_and_ca_certificate() {
         let campaign = campaign();
-        let cell = &campaign.cells[0];
-        let arguments = client_arguments(
-            &campaign,
-            cell,
-            RpcKind::Unary,
-            1,
-            &certificates(),
-            Some("127.0.0.1:43117"),
-        );
-        assert_eq!(
-            option_value(&arguments, "--cert"),
-            Some("/certificates/ca.pem")
-        );
-        assert_eq!(
-            option_value(&arguments, "--address"),
-            Some("127.0.0.1:43117")
-        );
-        assert_eq!(option_value(&arguments, "--webtransport-origin"), None);
+        let certificates = certificates();
+        let topology = NetworkTopology::create(&Network::default()).expect("loopback topology");
+
+        for stack in [Stack::TrevrpcNativeQuic, Stack::TrevrpcHttp3] {
+            let mut cell = campaign.cells[0].clone();
+            cell.stack = stack;
+            let client = client_arguments(
+                &campaign,
+                &cell,
+                RpcKind::Unary,
+                1,
+                &certificates,
+                Some("127.0.0.1:43117"),
+            );
+            assert_eq!(
+                option_value(&client, "--cert"),
+                Some("/certificates/ca.pem")
+            );
+            assert_eq!(option_value(&client, "--address"), Some("127.0.0.1:43117"));
+
+            let server = server_arguments(&cell, &topology, &certificates, None);
+            assert_eq!(option_value(&server, "--webtransport-origin"), None);
+        }
     }
 
     #[test]
@@ -1316,7 +1328,7 @@ mod tests {
         let client_peer = scripted_peer("client", "sleep 10");
         let server_peer = scripted_peer(
             "server",
-            "printf '%s\\n' '{\"schema_version\":4,\"event\":\"error\",\"peer\":\"server\",\"phase\":\"serve\",\"code\":\"worker_failed\",\"message\":\"worker startup failed\"}'",
+            "printf '%s\\n' '{\"schema_version\":5,\"event\":\"error\",\"peer\":\"server\",\"phase\":\"serve\",\"code\":\"worker_failed\",\"message\":\"worker startup failed\"}'",
         );
         let mut client = spawn_scripted_peer(&client_peer, &raw, "client");
         let mut server = spawn_scripted_peer(&server_peer, &raw, "server");

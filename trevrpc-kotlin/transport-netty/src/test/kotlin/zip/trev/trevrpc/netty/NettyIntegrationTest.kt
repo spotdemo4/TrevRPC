@@ -57,6 +57,7 @@ import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
+import zip.trev.trevrpc.RpcStreamFrameKind
 import zip.trev.trevrpc.RpcTransport
 import zip.trev.trevrpc.Server
 import zip.trev.trevrpc.ServerOptions
@@ -65,6 +66,7 @@ import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.UnaryHandler
 import zip.trev.trevrpc.WireCodec
+import zip.trev.trevrpc.netty.advanced.Http3FrameInbox
 import zip.trev.trevrpc.netty.advanced.RawFrameInbox
 import zip.trev.trevrpc.netty.advanced.RawNettyHttp3RpcTransport
 import zip.trev.trevrpc.netty.advanced.RawNettyQuicRpcTransport
@@ -121,6 +123,83 @@ class NettyIntegrationTest {
                 }
                 exerciseWebTransportAndConcurrentPost(config)
             } finally {
+                transportServer.shutdown()
+                certificate.delete()
+            }
+        }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    fun `HTTP3 request FIN completes client streaming without a terminal request frame`() =
+        runBlocking {
+            val certificate = SelfSignedCertificate("localhost")
+            val transportServer =
+                NettyRpcServer.bind(
+                    testServer(),
+                    NettyRpcServerConfig(
+                        bindAddress = InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
+                        tls = NettyServerTls.Pem(certificate.privateKey(), certificate.certificate()),
+                        enableNative = false,
+                    ),
+                )
+            val options = NettyTransportOptions(maxIdleTime = 2.seconds)
+            val config =
+                NettyQuicClientConfig(
+                    remoteAddress = transportServer.localAddress,
+                    tls = NettyClientTls("localhost", trustCertificates = listOf(certificate.cert())),
+                    options = options,
+                )
+            val endpoint = connectQuic(config, HTTP3_ALPN, Http3ClientConnectionHandler())
+            val inbox = Http3FrameInbox(options)
+            val stream = Http3.newRequestStream(endpoint.quicChannel, inbox).awaitValue()
+            try {
+                withTimeout(2.seconds) {
+                    val headers = DefaultHttp3HeadersFrame()
+                    headers
+                        .headers()
+                        .method("POST")
+                        .path(HTTP3_PATH)
+                        .scheme("https")
+                        .authority("localhost:${transportServer.localAddress.port}")
+                        .set("content-type", TREV_RPC_MEDIA_TYPE)
+                    stream.writeAndFlush(headers).awaitCompletion()
+                    writeHttp3Data(
+                        stream,
+                        WireCodec.encode(
+                            RpcRequest(
+                                "test.Service",
+                                "ClientStream",
+                                kindValue = RpcKind.CLIENT_STREAMING.value,
+                            ),
+                        ),
+                        options.maxFrameSize,
+                    )
+                    writeHttp3Data(
+                        stream,
+                        WireCodec.encode(RpcStreamFrame.message(byteArrayOf(5))),
+                        options.maxFrameSize,
+                    )
+                    writeHttp3Data(
+                        stream,
+                        WireCodec.encode(RpcStreamFrame.message(byteArrayOf(6))),
+                        options.maxFrameSize,
+                    )
+                    stream.shutdownOutput().awaitCompletion()
+
+                    inbox.awaitSuccess()
+                    val response = WireCodec.decodeStreamFrame(checkNotNull(inbox.receive()))
+                    assertEquals(RpcStreamFrameKind.MESSAGE, response.kind)
+                    assertArrayEquals(byteArrayOf(5, 6), response.body)
+                    val terminal = WireCodec.decodeStreamFrame(checkNotNull(inbox.receive()))
+                    assertEquals(Status.ok(), terminal.status)
+                    inbox.requireEnd()
+                }
+            } finally {
+                runCatching { stream.close().awaitCompletion() }
+                endpoint.quicChannel.closeApplication(0, "test complete")
+                runCatching { endpoint.quicChannel.closeFuture().awaitCompletion() }
+                runCatching { endpoint.datagramChannel.close().awaitCompletion() }
+                endpoint.group.shutdownNow(2.seconds)
                 transportServer.shutdown()
                 certificate.delete()
             }
@@ -831,6 +910,20 @@ class NettyIntegrationTest {
             connectStream.close().awaitCompletion()
         } finally {
             concurrentHttp3.shutdown()
+        }
+    }
+
+    private suspend fun writeHttp3Data(
+        channel: Channel,
+        body: ByteArray,
+        maxFrameSize: Int,
+    ) {
+        val framed = TrevRpcFrameWriter.encode(channel.alloc(), body, maxFrameSize)
+        try {
+            channel.writeAndFlush(DefaultHttp3DataFrame(framed)).awaitCompletion()
+        } catch (error: Throwable) {
+            framed.release()
+            throw error
         }
     }
 

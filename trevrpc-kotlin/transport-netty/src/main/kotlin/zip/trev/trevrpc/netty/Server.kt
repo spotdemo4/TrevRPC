@@ -516,7 +516,7 @@ class NettyRpcServer private constructor(
                 input.fail(transportException("peer stopped the HTTP/3 response stream"))
                 calls.cancel(channel, "peer stopped the HTTP/3 response stream")
             }
-            context.fireUserEventTriggered(event)
+            super.userEventTriggered(context, event)
         }
 
         override fun channelInactive(context: ChannelHandlerContext) {

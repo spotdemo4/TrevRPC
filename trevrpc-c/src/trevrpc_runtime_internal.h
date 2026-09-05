@@ -45,6 +45,7 @@ typedef struct trevrpc_server_config_internal {
     const char* http3_path;
     trevrpc_http3_admission http3_admission;
     void* http3_admission_user_data;
+    int enable_native;
     uint64_t max_idle_timeout_ms;
     uint32_t keep_alive_ms;
     uint16_t peer_bidi_stream_count;

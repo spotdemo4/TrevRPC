@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
+	"google.golang.org/protobuf/proto"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/internal/benchutil"
@@ -132,6 +133,77 @@ func TestWebTransportServerOperationsAndAdmission(t *testing.T) {
 				t.Fatal("WebTransport admission unexpectedly succeeded")
 			}
 		})
+	}
+}
+
+func TestHTTP3ServerAcceptsPOSTAndWebTransportServerRejectsPOST(t *testing.T) {
+	certFile, keyFile := writeTestCertificate(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	http3Address, stopHTTP3 := startTestBenchmarkServer(t, stackHTTP3, certFile, keyFile)
+	defer stopHTTP3()
+	http3TLS, err := benchutil.VerifiedClientTLSConfigForProtocol(certFile, http3Address, http3.NextProtoH3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTripper := &http3.Transport{TLSClientConfig: http3TLS, QUICConfig: benchutil.QUICConfig()}
+	defer roundTripper.Close()
+	httpClient := &http.Client{Transport: roundTripper}
+	requestBody, err := proto.Marshal(&benchmarkpb.BenchmarkRequest{Sequence: 42, ResponseBytes: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := trevrpc.EncodeFrame(trevrpc.NewRpcRequest(
+		"trevrpc.benchmark.v1.BenchmarkService",
+		"Unary",
+		requestBody,
+	), maxBenchmarkFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+http3Address+trevrpc.DefaultHTTP3Path, bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", trevrpc.HTTP3ContentType)
+	response, err := httpClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP/3 status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	var rpcResponse trevrpc.RpcResponse
+	if err := trevrpc.ReadFrame(response.Body, &rpcResponse, maxBenchmarkFrameSize); err != nil {
+		t.Fatal(err)
+	}
+	if rpcResponse.Status != uint32(trevrpc.CodeOK) {
+		t.Fatalf("RPC status = %d, want %d", rpcResponse.Status, trevrpc.CodeOK)
+	}
+	var benchmarkResponse benchmarkpb.BenchmarkResponse
+	if err := proto.Unmarshal(rpcResponse.Body, &benchmarkResponse); err != nil {
+		t.Fatal(err)
+	}
+	if benchmarkResponse.GetSequence() != 42 || len(benchmarkResponse.GetPayload()) != 3 {
+		t.Fatalf("HTTP/3 response = %+v, want sequence 42 and 3-byte payload", &benchmarkResponse)
+	}
+
+	webTransportAddress, stopWebTransport := startTestBenchmarkServerWithOrigin(t, stackWebTransport, certFile, keyFile, "https://benchmark.example")
+	defer stopWebTransport()
+	webTransportRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+webTransportAddress+trevrpc.DefaultHTTP3Path, bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	webTransportRequest.Header.Set("Content-Type", trevrpc.HTTP3ContentType)
+	webTransportResponse, err := httpClient.Do(webTransportRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer webTransportResponse.Body.Close()
+	if webTransportResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("WebTransport-only POST status = %d, want %d", webTransportResponse.StatusCode, http.StatusNotFound)
 	}
 }
 
@@ -328,7 +400,7 @@ func TestClientSTARTEmitsArmedAndSample(t *testing.T) {
 func TestServerSHUTDOWNEmitsReadyAndStopped(t *testing.T) {
 	certFile, keyFile := writeTestCertificate(t)
 	var output bytes.Buffer
-	for _, stack := range []stackKind{stackNativeQUIC, stackWebTransport} {
+	for _, stack := range []stackKind{stackNativeQUIC, stackHTTP3, stackWebTransport} {
 		t.Run(string(stack), func(t *testing.T) {
 			output.Reset()
 			config := serverConfig{stack: stack, listen: "127.0.0.1:0", certFile: certFile, keyFile: keyFile}
@@ -578,6 +650,6 @@ func Example_runCapabilities() {
 	err := run([]string{"capabilities"}, strings.NewReader(""), newEventEmitter(&output))
 	fmt.Print(output.String(), err)
 	// Output:
-	// {"schema_version":4,"event":"capabilities","peer":"go","roles":{"client":["trevrpc_native_quic"],"server":["trevrpc_native_quic","trevrpc_webtransport"]},"rpc_kinds":["unary","client_stream","server_stream","bidi"],"histogram":"log_linear_v1"}
+	// {"schema_version":5,"event":"capabilities","peer":"go","roles":{"client":["trevrpc_native_quic"],"server":["trevrpc_native_quic","trevrpc_http3","trevrpc_webtransport"]},"rpc_kinds":["unary","client_stream","server_stream","bidi"],"histogram":"log_linear_v1"}
 	// <nil>
 }

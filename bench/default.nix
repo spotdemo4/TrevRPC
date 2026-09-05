@@ -22,7 +22,7 @@ rustPlatform.buildRustPackage (
         ./Cargo.lock
         ./Cargo.toml
         ./campaigns
-        ./peer-protocol-v4.md
+        ./peer-protocol-v5.md
         ./proto
         ./src
         conformanceSrc

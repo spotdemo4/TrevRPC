@@ -35,6 +35,12 @@ fn reject_http3_admission(request: &trevrpc::server::Http3AdmissionRequest<'_>) 
     false
 }
 
+fn reject_webtransport_admission(
+    _request: &trevrpc::server::WebTransportAdmissionRequest<'_>,
+) -> bool {
+    false
+}
+
 fn require_webtransport_admission_header(
     request: &trevrpc::server::WebTransportAdmissionRequest<'_>,
 ) -> bool {
@@ -669,6 +675,34 @@ async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
     assert_eq!(messages, ["echo, left", "echo, right"]);
 
     close_client(endpoint, connection).await;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn direct_http3_rejects_webtransport_connect_without_disabling_post() -> TestResult {
+    let server = spawn_http3_greeter_server(|_| {})?;
+    let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
+
+    assert_eq!(
+        http3_status(
+            &transport,
+            http::Method::POST,
+            "/trevrpc",
+            Some("application/trevrpc"),
+        )
+        .await?,
+        http::StatusCode::OK
+    );
+    close_client(endpoint, connection).await;
+
+    let client = make_webtransport_client(&server)?;
+    let request =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?);
+    assert_webtransport_connect_rejected(
+        expect_webtransport_connect_error(&client, request).await,
+        web_transport_quinn::http::StatusCode::FORBIDDEN,
+    );
+
     server.shutdown().await
 }
 
@@ -3004,11 +3038,15 @@ fn spawn_http3_greeter_server(
     configure: impl FnOnce(&mut Server),
 ) -> TestResult<RunningWebTransportServer> {
     let mut server = Server::new();
-    server.set_options(fast_server_options().with_http3_enabled(true));
+    server.set_options(
+        fast_server_options()
+            .with_http3_enabled(true)
+            .with_webtransport_admission(Some(reject_webtransport_admission)),
+    );
     configure(&mut server);
     let (endpoint, cert_der) = make_server_endpoint_with_alpns(
         &[trevrpc::HTTP3_ALPN],
-        trevrpc::quinn::TransportMode::WebTransport,
+        trevrpc::quinn::TransportMode::Http3,
         server.options(),
     )?;
     let addr = endpoint.local_addr()?;
@@ -3436,7 +3474,7 @@ fn make_http3_client_endpoint(cert_der: CertificateDer<'static>) -> TestResult<q
     trevrpc::quinn::configure_client_config(
         &mut client_config,
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-        trevrpc::quinn::TransportMode::WebTransport,
+        trevrpc::quinn::TransportMode::Http3,
     );
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)

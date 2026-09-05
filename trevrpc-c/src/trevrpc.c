@@ -186,6 +186,7 @@ struct trevrpc_server {
     char* shared_wt_path;
     char* shared_wt_origin;
     char* shared_h3_path;
+    int enable_native;
     int enable_http3;
     trevrpc_http3_admission http3_admission;
     void* http3_admission_user_data;
@@ -388,6 +389,7 @@ static trevrpc_server_config_internal trevrpc_effective_server_config(const trev
         effective.http3_admission = config->http3_admission;
         effective.http3_admission_user_data = config->http3_admission_user_data;
     }
+    effective.enable_native = config->enable_native;
     if (config->max_idle_timeout_ms != 0) {
         effective.max_idle_timeout_ms = config->max_idle_timeout_ms;
     }
@@ -457,7 +459,7 @@ static trevrpc_msquic_config trevrpc_make_server_msquic_config(const trevrpc_ser
     if (wt_stream_count > msquic_config.peer_bidi_stream_count) {
         msquic_config.peer_bidi_stream_count = (uint16_t)wt_stream_count;
     }
-    if (config->webtransport_path != NULL || config->enable_http3) {
+    if ((config->webtransport_path != NULL && config->webtransport_path[0] != '\0') || config->enable_http3) {
         msquic_config.peer_unidi_stream_count = TREVRPC_H3_DEFAULT_UNIDI_STREAMS;
     }
     return msquic_config;
@@ -516,6 +518,7 @@ trevrpc_server_config_internal trevrpc_internal_default_server_config(void) {
     config.host = "127.0.0.1";
     config.webtransport_path = "/trevrpc";
     config.http3_path = "/trevrpc";
+    config.enable_native = 1;
     config.max_idle_timeout_ms = 30000;
     config.keep_alive_ms = 15000;
     config.peer_bidi_stream_count = 128;
@@ -3833,6 +3836,7 @@ int trevrpc_internal_server_listen(const trevrpc_server_config_internal* config,
     wt_config.path = server->shared_wt_path;
     wt_config.origin = server->shared_wt_origin;
     server->shared_wt_config = wt_config;
+    server->enable_native = effective.enable_native;
     server->enable_http3 = effective.enable_http3;
     server->http3_admission = effective.http3_admission;
     server->http3_admission_user_data = effective.http3_admission_user_data;
@@ -3842,16 +3846,26 @@ int trevrpc_internal_server_listen(const trevrpc_server_config_internal* config,
         trevrpc_internal_server_close(server);
         return -EINVAL;
     }
-    const trevrpc_msquic_alpn alpns[] = {
-        {.alpn = TREVRPC_ALPN, .alpn_len = (uint32_t)(sizeof(TREVRPC_ALPN) - 1)},
-        {.alpn = TREVRPC_H3_ALPN, .alpn_len = (uint32_t)(sizeof(TREVRPC_H3_ALPN) - 1)},
-    };
-    err = trevrpc_msquic_listen_alpns(effective.host,
-        effective.port,
-        &msquic_config,
-        alpns,
-        sizeof(alpns) / sizeof(alpns[0]),
-        &server->shared_listener);
+    trevrpc_msquic_alpn alpns[2];
+    size_t alpn_count = 0;
+    if (effective.enable_native) {
+        alpns[alpn_count++] = (trevrpc_msquic_alpn){
+            .alpn = TREVRPC_ALPN,
+            .alpn_len = (uint32_t)(sizeof(TREVRPC_ALPN) - 1),
+        };
+    }
+    if ((effective.webtransport_path != NULL && effective.webtransport_path[0] != '\0') || effective.enable_http3) {
+        alpns[alpn_count++] = (trevrpc_msquic_alpn){
+            .alpn = TREVRPC_H3_ALPN,
+            .alpn_len = (uint32_t)(sizeof(TREVRPC_H3_ALPN) - 1),
+        };
+    }
+    if (alpn_count == 0) {
+        trevrpc_internal_server_close(server);
+        return -EINVAL;
+    }
+    err = trevrpc_msquic_listen_alpns(
+        effective.host, effective.port, &msquic_config, alpns, alpn_count, &server->shared_listener);
     if (err != 0) {
         trevrpc_internal_server_close(server);
         return err;
@@ -6539,6 +6553,10 @@ static int trevrpc_server_serve_shared_transport(trevrpc_server* server) {
         }
 
         if (trevrpc_alpn_equals(alpn, alpn_len, TREVRPC_ALPN)) {
+            if (!server->enable_native) {
+                trevrpc_msquic_conn_close(conn);
+                continue;
+            }
             err = trevrpc_server_start_connection_task(server, conn, NULL, NULL);
             if (err != 0) {
                 result = err;

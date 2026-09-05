@@ -41,7 +41,7 @@ server_pid=$!
 
 IFS= read -r ready <&4
 case "$ready" in
-*'"schema_version":4'*'"event":"ready"'*) ;;
+*'"schema_version":5'*'"event":"ready"'*) ;;
 *)
     printf 'unexpected ready event: %s\n' "$ready" >&2
     exit 1
@@ -51,7 +51,7 @@ esac
 printf 'SHUTDOWN\n' >&3
 IFS= read -r stopped <&4
 case "$stopped" in
-*'"schema_version":4'*'"event":"stopped"'*) ;;
+*'"schema_version":5'*'"event":"stopped"'*) ;;
 *)
     printf 'unexpected stopped event: %s\n' "$stopped" >&2
     exit 1

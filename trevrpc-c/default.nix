@@ -31,6 +31,7 @@ stdenv.mkDerivation (
       fileset = fileset.unions [
         benchProto
         wireGolden
+        ../bench/http3-lifecycle-test.sh
         ./.
       ];
     };
@@ -90,7 +91,7 @@ stdenv.mkDerivation (
         -Ibuild/generated-greeter-example \
         -isystem ${libmsquic}/include
       ctest --test-dir build --output-on-failure -j $NIX_BUILD_CORES \
-        ${optionalString threadSanitizer "-E '^trevrpc_bench_peer_webtransport_smoke$'"}
+        ${optionalString threadSanitizer "-E '^trevrpc_bench_peer_(http3_lifecycle|webtransport_smoke)$'"}
       runHook postCheck
     '';
 

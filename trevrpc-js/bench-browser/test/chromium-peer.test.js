@@ -9,11 +9,11 @@ import { parseCommandLine, parseConnectCommand } from "../trevrpc-bench-peer-chr
 const execFileAsync = promisify(execFile);
 const peer = fileURLToPath(new URL("../trevrpc-bench-peer-chromium.js", import.meta.url));
 
-test("Chromium peer advertises V4 client-only WebTransport capabilities", async () => {
+test("Chromium peer advertises V5 client-only WebTransport capabilities", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [peer, "capabilities"]);
   assert.equal(stderr, "");
   assert.deepEqual(JSON.parse(stdout), {
-    schema_version: 4,
+    schema_version: 5,
     event: "capabilities",
     roles: { client: ["trevrpc_webtransport"] },
     rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],

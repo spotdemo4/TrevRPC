@@ -340,7 +340,10 @@ internal class Http3Exchange(
 
     suspend fun finishSend() {
         sendLock.withLock {
-            if (sendFinished) return
+            if (sendFinished || remoteTerminalSeen.get()) {
+                sendFinished = true
+                return
+            }
             checkSendOpen()
             sendFinished = true
             writeDirect(true, "request finish failed") { byteArrayOf() }
@@ -471,6 +474,10 @@ internal class Http3Exchange(
         bytes: () -> ByteArray,
     ) {
         try {
+            if (remoteTerminalSeen.get()) {
+                if (endOfStream) return
+                throw CancellationException("remote terminal status received")
+            }
             write(bytes(), endOfStream)
         } catch (error: CancellationException) {
             if (!completed.get() && !remoteTerminalSeen.get()) fail(error)
@@ -487,6 +494,10 @@ internal class Http3Exchange(
         endOfStream: Boolean,
     ) {
         writeReady.await()
+        if (remoteTerminalSeen.get()) {
+            if (endOfStream) return
+            throw CancellationException("remote terminal status received")
+        }
         if (completed.get()) throw CancellationException("RPC stream completed")
         val buffer = ByteBuffer.allocateDirect(bytes.size)
         buffer.put(bytes)
@@ -517,7 +528,11 @@ internal class Http3Exchange(
                 }
             if (!installed) {
                 if (continuation.isActive) {
-                    continuation.resumeWithException(CancellationException("RPC stream completed"))
+                    if (endOfStream && remoteTerminalSeen.get()) {
+                        continuation.resume(Unit)
+                    } else {
+                        continuation.resumeWithException(CancellationException("RPC stream completed"))
+                    }
                 }
                 return@suspendCancellableCoroutine
             }
@@ -594,7 +609,7 @@ internal class Http3Exchange(
 
     private fun beginRemoteStatus() {
         if (beginRemoteTerminalOnce()) {
-            cancelPendingWrite(CancellationException("remote terminal status received"))
+            settlePendingWriteOnRemoteTerminal()
             cancelNative()
         }
     }
@@ -626,15 +641,25 @@ internal class Http3Exchange(
         lease.logicalDone()
     }
 
-    private fun cancelPendingWrite(error: Throwable) {
-        val continuation =
-            synchronized(writeLock) {
-                val pending = pendingWrite
-                pendingWrite = null
-                pending?.continuation
-            }
-        continuation?.resumeWithException(error)
+    private fun settlePendingWriteOnRemoteTerminal() {
+        val pending = takePendingWrite() ?: return
+        if (pending.endOfStream) {
+            pending.continuation.resume(Unit)
+        } else {
+            pending.continuation.resumeWithException(CancellationException("remote terminal status received"))
+        }
     }
+
+    private fun cancelPendingWrite(error: Throwable) {
+        takePendingWrite()?.continuation?.resumeWithException(error)
+    }
+
+    private fun takePendingWrite(): PendingWrite? =
+        synchronized(writeLock) {
+            val pending = pendingWrite
+            pendingWrite = null
+            pending
+        }
 
     private fun cancelNative() {
         val streamToCancel =
@@ -681,7 +706,7 @@ internal class Http3Exchange(
         }
 
     private fun checkSendOpen() {
-        if (completed.get() || sendFinished) {
+        if (completed.get() || remoteTerminalSeen.get() || sendFinished) {
             throw TrevRpcException(Status.cancelled("request stream is closed"))
         }
     }

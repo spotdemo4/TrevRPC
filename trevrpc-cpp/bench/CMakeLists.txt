@@ -39,7 +39,7 @@ if(TREVRPC_CPP_BUILD_TESTS)
   add_test(NAME trevrpc_cpp_benchmark_capabilities COMMAND trevrpc_cpp_bench_peer capabilities)
   set_tests_properties(trevrpc_cpp_benchmark_capabilities PROPERTIES
     PASS_REGULAR_EXPRESSION
-      "schema_version.:4.*roles.*client.*trevrpc_native_quic.*server.*trevrpc_native_quic.*trevrpc_webtransport.*rpc_kinds.*unary.*client_stream.*server_stream.*bidi.*histogram.*log_linear_v1")
+      "schema_version.:5.*roles.*client.*trevrpc_native_quic.*server.*trevrpc_native_quic.*trevrpc_http3.*trevrpc_webtransport.*rpc_kinds.*unary.*client_stream.*server_stream.*bidi.*histogram.*log_linear_v1")
 
   add_test(NAME trevrpc_cpp_benchmark_server_requires_stack
     COMMAND "${CMAKE_COMMAND}"
@@ -55,7 +55,6 @@ if(TREVRPC_CPP_BUILD_TESTS)
     COMMAND "${CMAKE_COMMAND}"
       -DPEER=$<TARGET_FILE:trevrpc_cpp_bench_peer>
       -P "${CMAKE_CURRENT_SOURCE_DIR}/webtransport-config-test.cmake")
-
   find_program(trevrpc_cpp_benchmark_openssl openssl REQUIRED)
   set(trevrpc_cpp_benchmark_test_cert "${CMAKE_CURRENT_BINARY_DIR}/test-cert.pem")
   set(trevrpc_cpp_benchmark_test_key "${CMAKE_CURRENT_BINARY_DIR}/test-key.pem")
@@ -73,6 +72,16 @@ if(TREVRPC_CPP_BUILD_TESTS)
     VERBATIM)
   add_custom_target(trevrpc_cpp_benchmark_test_certificates
     DEPENDS "${trevrpc_cpp_benchmark_test_cert}" "${trevrpc_cpp_benchmark_test_key}")
+
+  add_test(NAME trevrpc_cpp_benchmark_http3_lifecycle
+    COMMAND sh
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../bench/http3-lifecycle-test.sh"
+      "$<TARGET_FILE:trevrpc_cpp_bench_peer>"
+      "${trevrpc_cpp_benchmark_test_cert}"
+      "${trevrpc_cpp_benchmark_test_key}"
+      "$<TARGET_FILE:trevrpc_cpp_webtransport_probe>")
+  set_tests_properties(trevrpc_cpp_benchmark_http3_lifecycle PROPERTIES TIMEOUT 30)
+  trevrpc_cpp_bench_lsan_suppressions(trevrpc_cpp_benchmark_http3_lifecycle)
 
   add_executable(trevrpc_cpp_webtransport_probe webtransport_probe.cpp)
   target_link_libraries(trevrpc_cpp_webtransport_probe PRIVATE ${trevrpc_cpp_c_target})

@@ -1,5 +1,6 @@
 #include "trevrpc_runtime_internal.h"
 
+#include <errno.h> // IWYU pragma: keep
 #include <stdio.h>
 
 int trevrpc_test_make_client_msquic_config(
@@ -23,11 +24,16 @@ int main(void) {
     trevrpc_msquic_config client_msquic = {0};
     trevrpc_server_config_internal server = {0};
     trevrpc_server_config_internal effective_server = {0};
+    trevrpc_server_config_internal native_only = defaults;
+    trevrpc_server_config_internal no_transport = defaults;
     trevrpc_msquic_config server_msquic = {0};
+    trevrpc_msquic_config native_only_msquic = {0};
+    trevrpc_wt_config native_only_wt = {0};
     trevrpc_wt_config server_wt = {0};
 
     CHECK(TREVRPC_C_ABI_VERSION == 6u);
     CHECK(trevrpc_c_abi_version() == 6u);
+    CHECK(defaults.enable_native == 1);
     CHECK(defaults.enable_http3 == 0);
     CHECK(defaults.http3_path != NULL);
     client.stream_recv_window = 1024u * 1024u;
@@ -48,11 +54,13 @@ int main(void) {
     server.conn_flow_control_window = 64u * 1024u * 1024u;
     server.msquic_execution_profile = TREV_MSQUIC_EXECUTION_PROFILE_MAX_THROUGHPUT;
     server.msquic_send_buffering_enabled = 1;
+    server.enable_native = 0;
     server.enable_http3 = 1;
     server.http3_path = "/custom-rpc";
     CHECK(trevrpc_test_make_server_msquic_config(&server, &effective_server, &server_msquic, &server_wt) == 0);
     CHECK(effective_server.max_idle_timeout_ms == 30000);
     CHECK(effective_server.max_streams_per_session == 32);
+    CHECK(effective_server.enable_native == 0);
     CHECK(effective_server.enable_http3 == 1);
     CHECK(effective_server.http3_path == server.http3_path);
     CHECK(server_msquic.peer_bidi_stream_count == 32);
@@ -64,5 +72,23 @@ int main(void) {
     CHECK(server_msquic.max_pending_send_bytes == TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_BYTES);
     CHECK(server_msquic.max_pending_send_count == TREV_MSQUIC_DEFAULT_MAX_PENDING_SEND_COUNT);
     CHECK(server_msquic.max_frame_size == TREVRPC_DEFAULT_MAX_FRAME_SIZE);
+
+    native_only.enable_native = 1;
+    native_only.webtransport_path = "";
+    native_only.enable_http3 = 0;
+    CHECK(trevrpc_test_make_server_msquic_config(
+              &native_only, &effective_server, &native_only_msquic, &native_only_wt) == 0);
+    CHECK(effective_server.enable_native == 1);
+    CHECK(effective_server.webtransport_path[0] == '\0');
+    CHECK(native_only_msquic.peer_unidi_stream_count == 0);
+
+    no_transport.enable_native = 0;
+    no_transport.enable_http3 = 0;
+    no_transport.webtransport_path = "";
+    no_transport.cert_file = "unused-cert";
+    no_transport.key_file = "unused-key";
+    trevrpc_server* no_transport_server = NULL;
+    CHECK(trevrpc_internal_server_listen(&no_transport, &no_transport_server) == -EINVAL);
+    CHECK(no_transport_server == NULL);
     return 0;
 }

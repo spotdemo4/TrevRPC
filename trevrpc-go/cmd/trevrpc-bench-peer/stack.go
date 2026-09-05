@@ -19,6 +19,12 @@ func listenBenchmarkServer(config serverConfig) (benchmarkListener, error) {
 	switch config.stack {
 	case stackNativeQUIC:
 		return benchutil.ListenNativeQUIC(config.listen, config.certFile, config.keyFile, newNativeBenchmarkServer())
+	case stackHTTP3:
+		server := newNativeBenchmarkServer()
+		options := server.Options()
+		options.EnableHTTP3 = true
+		server.SetOptions(options)
+		return benchutil.ListenHTTP3(config.listen, config.certFile, config.keyFile, server)
 	case stackWebTransport:
 		server := newNativeBenchmarkServer()
 		options := server.Options()
@@ -28,7 +34,7 @@ func listenBenchmarkServer(config serverConfig) (benchmarkListener, error) {
 			return request.Path == trevrpc.DefaultHTTP3Path && request.Origin == config.webTransportOrigin
 		}
 		server.SetOptions(options)
-		return benchutil.ListenWebTransport(config.listen, config.certFile, config.keyFile, server)
+		return benchutil.ListenHTTP3(config.listen, config.certFile, config.keyFile, server)
 	default:
 		return nil, validateServerStack(config.stack)
 	}

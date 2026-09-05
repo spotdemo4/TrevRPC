@@ -547,9 +547,12 @@ Result<Server> Server::listen(const ServerConfig& config) {
     native.host = config.host.c_str();
   }
   native.port = config.port;
+  native.enable_native = config.enable_native;
   native.cert_file = nullable(config.cert_file);
   native.key_file = nullable(config.key_file);
-  if (!config.webtransport_path.empty()) {
+  if (!config.enable_webtransport) {
+    native.webtransport_path = "";
+  } else if (!config.webtransport_path.empty()) {
     native.webtransport_path = config.webtransport_path.c_str();
   }
   if (!config.webtransport_origin.empty()) {

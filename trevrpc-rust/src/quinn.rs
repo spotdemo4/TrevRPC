@@ -23,6 +23,7 @@ use crate::{
 
 const CANCELLED_STREAM_CODE: u32 = 1;
 const FRAME_HEADER_LEN: u64 = 4;
+const HTTP3_MANDATORY_UNI_STREAMS: u64 = 3;
 
 fn trace_quinn_event(event: &'static str, detail: &'static str) {
     #[cfg(feature = "tracing")]
@@ -202,7 +203,9 @@ pub struct TransportLimits {
 pub enum TransportMode {
     /// Native `TrevRPC` uses bidirectional QUIC streams exclusively.
     Native,
-    /// `WebTransport` requires peer-initiated unidirectional HTTP/3 streams.
+    /// Ordinary HTTP/3 uses its three mandatory peer-initiated unidirectional streams.
+    Http3,
+    /// `WebTransport` requires additional peer-initiated unidirectional HTTP/3 streams.
     WebTransport,
 }
 
@@ -210,6 +213,7 @@ impl TransportMode {
     const fn max_concurrent_uni_streams(self) -> Option<u64> {
         match self {
             Self::Native => Some(0),
+            Self::Http3 => Some(HTTP3_MANDATORY_UNI_STREAMS),
             Self::WebTransport => None,
         }
     }
@@ -231,7 +235,7 @@ pub fn transport_limits_from_server_options(
                 // Keep one stream available for an over-limit RPC status. WebTransport also owns
                 // one long-lived CONNECT stream, so reserve a second transport-level slot there.
                 saturating_usize_to_u64(max_streams).saturating_add(match mode {
-                    TransportMode::Native => 1,
+                    TransportMode::Native | TransportMode::Http3 => 1,
                     TransportMode::WebTransport => 2,
                 })
             },
@@ -1268,6 +1272,15 @@ mod tests {
             }
         );
         assert_eq!(
+            transport_limits_from_server_options(&options, TransportMode::Http3),
+            TransportLimits {
+                stream_receive_window: 1028,
+                connection_receive_window: 4096,
+                max_concurrent_bidi_streams: Some(11),
+                max_concurrent_uni_streams: Some(3),
+            }
+        );
+        assert_eq!(
             transport_limits_from_server_options(&options, TransportMode::WebTransport),
             TransportLimits {
                 stream_receive_window: 1028,
@@ -1279,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn client_transport_limits_reject_unused_peer_initiated_streams() {
+    fn client_transport_limits_match_mode_stream_requirements() {
         assert_eq!(
             client_transport_limits(2048, TransportMode::Native),
             TransportLimits {
@@ -1288,6 +1301,10 @@ mod tests {
                 max_concurrent_bidi_streams: Some(0),
                 max_concurrent_uni_streams: Some(0),
             }
+        );
+        assert_eq!(
+            client_transport_limits(2048, TransportMode::Http3).max_concurrent_uni_streams,
+            Some(3)
         );
         assert_eq!(
             client_transport_limits(2048, TransportMode::WebTransport).max_concurrent_uni_streams,

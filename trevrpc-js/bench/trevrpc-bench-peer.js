@@ -17,11 +17,13 @@ import { RawNodeTransport } from "@trevrpc/trevrpc-js/node/advanced";
 
 import {
   BenchmarkService,
+  HTTP3Stack,
   IdleTimeoutMs,
   MaxConcurrency,
   MaxFrameSize,
   MaxMessagesPerStream,
   MaxPayloadBytes,
+  NativeQUICStack,
   RpcKinds,
   SchemaVersion,
   StreamBatchSize,
@@ -30,6 +32,8 @@ import {
   prepareFixedAdmissionPhase,
   root,
   sampleForResult,
+  WebTransportStack,
+  listenOptionsForStack,
 } from "./common.js";
 
 export {
@@ -39,11 +43,12 @@ export {
   logLinearUpperBound,
   prepareFixedAdmissionPhase,
   root,
+  listenOptionsForStack,
 } from "./common.js";
 
 const Peer = "js";
-const ClientStacks = new Set(["trevrpc_native_quic"]);
-const ServerStacks = new Set(["trevrpc_native_quic", "trevrpc_webtransport"]);
+const ClientStacks = new Set([NativeQUICStack]);
+const ServerStacks = new Set([NativeQUICStack, HTTP3Stack, WebTransportStack]);
 
 const BenchmarkRequest = root.lookupType("trevrpc.benchmark.v1.BenchmarkRequest");
 const BenchmarkResponse = root.lookupType("trevrpc.benchmark.v1.BenchmarkResponse");
@@ -96,21 +101,18 @@ export function parseCommandLine(argv) {
     const options = parseOptions(args, ["stack", "listen", "cert", "key", "webtransport-origin"]);
     const stack = parseStack(options, ServerStacks);
     const webtransportOrigin = options.get("webtransport-origin");
-    if (
-      stack === "trevrpc_webtransport" &&
-      (webtransportOrigin == null || webtransportOrigin === "")
-    ) {
+    if (stack === WebTransportStack && (webtransportOrigin == null || webtransportOrigin === "")) {
       throw new PeerError(
         "configure",
         "invalid_arguments",
         "missing required option --webtransport-origin",
       );
     }
-    if (stack !== "trevrpc_webtransport" && webtransportOrigin != null) {
+    if (stack !== WebTransportStack && webtransportOrigin != null) {
       throw new PeerError(
         "configure",
         "invalid_arguments",
-        "--webtransport-origin is only valid with server stack trevrpc_webtransport",
+        `--webtransport-origin is only valid with server stack ${WebTransportStack}`,
       );
     }
     return {
@@ -261,9 +263,7 @@ async function listenBenchmarkServer(config) {
     port: config.listen.port,
     certFile: config.cert,
     keyFile: config.key,
-    ...(config.stack === "trevrpc_webtransport"
-      ? { path: "/trevrpc", origin: config.webtransportOrigin }
-      : {}),
+    ...listenOptionsForStack(config.stack, config.webtransportOrigin),
     maxSessionsPerConnection: 16,
     maxStreamsPerSession: MaxConcurrency,
     maxStreamMessages: -1,

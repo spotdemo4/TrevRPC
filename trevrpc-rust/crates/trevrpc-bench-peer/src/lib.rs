@@ -28,11 +28,18 @@ use config::{
 use histogram::{HistogramBucket, LogLinearHistogram};
 use workload::{BenchmarkServiceImpl, BenchmarkWorkload, MessageCounts, Workload, WorkloadConfig};
 
-const SCHEMA_VERSION: u8 = 4;
+const SCHEMA_VERSION: u8 = 5;
 const PEER: &str = "rust";
 const SERVER_MAX_STREAMS: usize = 1024;
 const SERVER_MAX_REQUESTS: usize = 4096;
 const WEBTRANSPORT_PATH: &str = "/trevrpc";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerMode {
+    Native,
+    Http3,
+    WebTransport,
+}
 
 static WEBTRANSPORT_ORIGIN: OnceLock<RwLock<String>> = OnceLock::new();
 
@@ -92,22 +99,16 @@ pub fn emit_error(error: &PeerError) {
 }
 
 async fn run_server(config: ServerConfig) -> PeerResult {
-    match config.stack {
-        Stack::TrevrpcNativeQuic => run_native_server(config).await,
-        Stack::TrevrpcWebTransport => run_webtransport_server(config).await,
-    }
-}
-
-async fn run_native_server(config: ServerConfig) -> PeerResult {
-    run_trevrpc_server(config, false).await
-}
-
-async fn run_webtransport_server(config: ServerConfig) -> PeerResult {
-    run_trevrpc_server(config, true).await
+    let mode = match config.stack {
+        Stack::TrevrpcNativeQuic => ServerMode::Native,
+        Stack::TrevrpcHttp3 => ServerMode::Http3,
+        Stack::TrevrpcWebTransport => ServerMode::WebTransport,
+    };
+    run_trevrpc_server(config, mode).await
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_trevrpc_server(config: ServerConfig, webtransport: bool) -> PeerResult {
+async fn run_trevrpc_server(config: ServerConfig, mode: ServerMode) -> PeerResult {
     let mut server = trevrpc::server::Server::new();
     let mut options = trevrpc::server::ServerOptions::new()
         .with_max_frame_size(MAX_ENCODED_FRAME_BYTES)
@@ -116,18 +117,27 @@ async fn run_trevrpc_server(config: ServerConfig, webtransport: bool) -> PeerRes
         .with_max_concurrent_requests(Some(SERVER_MAX_REQUESTS))
         .with_max_stream_messages(Some(MAX_MESSAGES_PER_STREAM as usize))
         .with_max_stream_body_size(None);
-    if webtransport {
-        let origin = config.webtransport_origin.as_deref().ok_or_else(|| {
-            PeerError::new(
-                "config",
-                "invalid_argument",
-                "trevrpc_webtransport server requires --webtransport-origin",
-            )
-        })?;
-        set_webtransport_origin(origin)?;
-        options = options
-            .with_webtransport_path(WEBTRANSPORT_PATH)
-            .with_webtransport_admission(Some(benchmark_webtransport_admission));
+    match mode {
+        ServerMode::Native => {}
+        ServerMode::Http3 => {
+            options = options
+                .with_http3_enabled(true)
+                .with_http3_path(WEBTRANSPORT_PATH)
+                .with_webtransport_admission(Some(reject_webtransport_admission));
+        }
+        ServerMode::WebTransport => {
+            let origin = config.webtransport_origin.as_deref().ok_or_else(|| {
+                PeerError::new(
+                    "config",
+                    "invalid_argument",
+                    "trevrpc_webtransport server requires --webtransport-origin",
+                )
+            })?;
+            set_webtransport_origin(origin)?;
+            options = options
+                .with_webtransport_path(WEBTRANSPORT_PATH)
+                .with_webtransport_admission(Some(benchmark_webtransport_admission));
+        }
     }
     server.set_options(options);
     proto::register_benchmark_service(&mut server, BenchmarkServiceImpl);
@@ -152,10 +162,9 @@ async fn run_trevrpc_server(config: ServerConfig, webtransport: bool) -> PeerRes
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
         .map_err(|error| PeerError::wrap("server", "tls_config_failed", error))?;
-    crypto.alpn_protocols = if webtransport {
-        vec![trevrpc::HTTP3_ALPN.to_vec()]
-    } else {
-        vec![trevrpc::ALPN.to_vec()]
+    crypto.alpn_protocols = match mode {
+        ServerMode::Native => vec![trevrpc::ALPN.to_vec()],
+        ServerMode::Http3 | ServerMode::WebTransport => vec![trevrpc::HTTP3_ALPN.to_vec()],
     };
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(crypto)
@@ -164,10 +173,10 @@ async fn run_trevrpc_server(config: ServerConfig, webtransport: bool) -> PeerRes
     trevrpc::quinn::configure_server_config(
         &mut server_config,
         server.options(),
-        if webtransport {
-            trevrpc::quinn::TransportMode::WebTransport
-        } else {
-            trevrpc::quinn::TransportMode::Native
+        match mode {
+            ServerMode::Native => trevrpc::quinn::TransportMode::Native,
+            ServerMode::Http3 => trevrpc::quinn::TransportMode::Http3,
+            ServerMode::WebTransport => trevrpc::quinn::TransportMode::WebTransport,
         },
     );
     let server_transport = Arc::get_mut(&mut server_config.transport).ok_or_else(|| {
@@ -188,12 +197,14 @@ async fn run_trevrpc_server(config: ServerConfig, webtransport: bool) -> PeerRes
         let shutdown = async {
             let _ = shutdown_rx.await;
         };
-        if webtransport {
-            server
-                .serve_quinn_and_webtransport_with_shutdown(endpoint, shutdown)
-                .await
-        } else {
-            server.serve_quinn_with_shutdown(endpoint, shutdown).await
+        match mode {
+            ServerMode::Native => server.serve_quinn_with_shutdown(endpoint, shutdown).await,
+            ServerMode::Http3 => server.serve_http3_with_shutdown(endpoint, shutdown).await,
+            ServerMode::WebTransport => {
+                server
+                    .serve_quinn_and_webtransport_with_shutdown(endpoint, shutdown)
+                    .await
+            }
         }
     });
 
@@ -221,6 +232,12 @@ async fn run_trevrpc_server(config: ServerConfig, webtransport: bool) -> PeerRes
         }
     };
     finish_server_task(server_result, protocol_shutdown)
+}
+
+fn reject_webtransport_admission(
+    _request: &trevrpc::server::WebTransportAdmissionRequest<'_>,
+) -> bool {
+    false
 }
 
 fn benchmark_webtransport_admission(
@@ -304,6 +321,13 @@ async fn run_client(config: ClientConfig) -> PeerResult {
                 .connection
                 .close(0_u32.into(), b"benchmark complete");
             connected.endpoint.wait_idle().await;
+        }
+        Stack::TrevrpcHttp3 => {
+            return Err(PeerError::new(
+                "config",
+                "invalid_argument",
+                "trevrpc_http3 is a server-only stack",
+            ));
         }
         Stack::TrevrpcWebTransport => {
             return Err(PeerError::new(
@@ -681,7 +705,11 @@ const fn capabilities() -> CapabilitiesEvent {
         peer: PEER,
         roles: RoleCapabilities {
             client: &["trevrpc_native_quic"],
-            server: &["trevrpc_native_quic", "trevrpc_webtransport"],
+            server: &[
+                "trevrpc_native_quic",
+                "trevrpc_http3",
+                "trevrpc_webtransport",
+            ],
         },
         rpc_kinds: ["unary", "client_stream", "server_stream", "bidi"],
         histogram: "log_linear_v1",
@@ -762,12 +790,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(capabilities())?,
             json!({
-                "schema_version": 4,
+                "schema_version": 5,
                 "event": "capabilities",
                 "peer": "rust",
                 "roles": {
                     "client": ["trevrpc_native_quic"],
-                    "server": ["trevrpc_native_quic", "trevrpc_webtransport"]
+                    "server": [
+                        "trevrpc_native_quic",
+                        "trevrpc_http3",
+                        "trevrpc_webtransport"
+                    ]
                 },
                 "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
                 "histogram": "log_linear_v1"

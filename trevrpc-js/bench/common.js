@@ -1,13 +1,32 @@
 import { createRoot } from "@trevrpc/trevrpc-js";
 
-export const SchemaVersion = 4;
+export const SchemaVersion = 5;
 export const RpcKinds = Object.freeze(["unary", "client_stream", "server_stream", "bidi"]);
+export const NativeQUICStack = "trevrpc_native_quic";
+export const HTTP3Stack = "trevrpc_http3";
+export const WebTransportStack = "trevrpc_webtransport";
 export const IdleTimeoutMs = 600_000;
 export const StreamBatchSize = 16;
 export const MaxConcurrency = 1024;
 export const MaxPayloadBytes = 64 * 1024 * 1024;
 export const MaxMessagesPerStream = 1_000_000;
 export const MaxFrameSize = MaxPayloadBytes + 1024;
+
+export function listenOptionsForStack(stack, webtransportOrigin) {
+  switch (stack) {
+    case NativeQUICStack:
+      return { path: "", enableNative: true };
+    case HTTP3Stack:
+      return { path: "", enableNative: false, enableHttp3: true, http3Path: "/trevrpc" };
+    case WebTransportStack:
+      if (webtransportOrigin == null || webtransportOrigin === "") {
+        throw new Error("WebTransport listen options require an origin");
+      }
+      return { path: "/trevrpc", origin: webtransportOrigin, enableNative: false };
+    default:
+      throw new Error(`unsupported server stack ${JSON.stringify(stack)}`);
+  }
+}
 
 export const root = createRoot({
   nested: {

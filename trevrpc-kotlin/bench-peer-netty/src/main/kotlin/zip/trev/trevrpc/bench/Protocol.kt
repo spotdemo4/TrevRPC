@@ -5,6 +5,7 @@ import java.nio.file.Path
 import java.util.TreeMap
 
 internal val PEER_NAME = System.getenv("TREVRPC_BENCH_PEER_NAME") ?: "kotlin"
+internal const val SCHEMA_VERSION = 5
 internal const val MAX_APPLICATION_PAYLOAD_BYTES = 64 * 1024 * 1024
 internal const val MAX_ENCODED_MESSAGE_BYTES = MAX_APPLICATION_PAYLOAD_BYTES + 1024
 internal const val MAX_BENCHMARK_CONCURRENCY = 1024
@@ -45,6 +46,7 @@ internal enum class BenchmarkStack(
     val wireName: String,
 ) {
     TREVRPC_NATIVE_QUIC("trevrpc_native_quic"),
+    TREVRPC_HTTP3("trevrpc_http3"),
     TREVRPC_WEBTRANSPORT("trevrpc_webtransport"),
     ;
 
@@ -52,7 +54,7 @@ internal enum class BenchmarkStack(
         fun parse(value: String): BenchmarkStack =
             entries.firstOrNull { it.wireName == value }
                 ?: throw IllegalArgumentException(
-                    "--stack must be trevrpc_native_quic or trevrpc_webtransport",
+                    "--stack must be trevrpc_native_quic, trevrpc_http3, or trevrpc_webtransport",
                 )
     }
 }
@@ -114,8 +116,8 @@ private fun parseClient(values: Map<String, String>): PeerCommand.Client {
         ),
     )
     val stack = BenchmarkStack.parse(required(values, "stack"))
-    require(stack != BenchmarkStack.TREVRPC_WEBTRANSPORT) {
-        "trevrpc_webtransport is not supported by the Kotlin benchmark client"
+    require(stack == BenchmarkStack.TREVRPC_NATIVE_QUIC) {
+        "${stack.wireName} is not supported by the Kotlin benchmark client"
     }
     val concurrency = positiveInt(values, "concurrency")
     require(concurrency <= MAX_BENCHMARK_CONCURRENCY) {
@@ -262,9 +264,9 @@ internal class EventWriter(
     fun capabilities() {
         val rpcKinds = """["unary","client_stream","server_stream","bidi"]"""
         emit(
-            """{"schema_version":4,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":{""" +
+            """{"schema_version":$SCHEMA_VERSION,"event":"capabilities","peer":${PEER_NAME.jsonString()},"roles":{""" +
                 """"client":["trevrpc_native_quic"],""" +
-                """"server":["trevrpc_native_quic","trevrpc_webtransport"]},""" +
+                """"server":["trevrpc_native_quic","trevrpc_http3","trevrpc_webtransport"]},""" +
                 """"rpc_kinds":$rpcKinds,"histogram":"log_linear_v1"}""",
         )
     }
@@ -321,7 +323,8 @@ internal class EventWriter(
         check(!output.checkError()) { "failed to write benchmark protocol event" }
     }
 
-    private fun base(event: String): String = """{"schema_version":4,"event":${event.jsonString()},"peer":${PEER_NAME.jsonString()}"""
+    private fun base(event: String): String =
+        """{"schema_version":$SCHEMA_VERSION,"event":${event.jsonString()},"peer":${PEER_NAME.jsonString()}"""
 }
 
 private fun String.jsonString(): String =

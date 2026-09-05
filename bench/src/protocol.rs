@@ -428,9 +428,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_schema_v3_peer_events() {
+    fn rejects_schema_v4_peer_events() {
         let mut capabilities = capabilities(vec![Stack::TrevrpcNativeQuic]);
-        capabilities.schema_version = 3;
+        capabilities.schema_version = 4;
         assert!(
             capabilities
                 .validate(
@@ -474,10 +474,10 @@ mod tests {
             .roles
             .get_mut(&Role::Server)
             .expect("server capabilities")
-            .clone_from(&vec![Stack::TrevrpcWebtransport]);
+            .clone_from(&vec![Stack::TrevrpcHttp3]);
         let required = BTreeMap::from([
             (Role::Client, BTreeSet::from([Stack::TrevrpcNativeQuic])),
-            (Role::Server, BTreeSet::from([Stack::TrevrpcWebtransport])),
+            (Role::Server, BTreeSet::from([Stack::TrevrpcHttp3])),
         ]);
         capabilities
             .validate("rust", &required, &[RpcKind::Unary])
@@ -485,9 +485,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_v3_global_capabilities() {
+    fn rejects_v4_global_capabilities() {
         let input = r#"{
-            "schema_version": 3,
+            "schema_version": 4,
             "event": "capabilities",
             "peer": "rust",
             "roles": ["client", "server"],

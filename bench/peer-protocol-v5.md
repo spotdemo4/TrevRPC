@@ -1,4 +1,4 @@
-# Benchmark Peer Protocol V4
+# Benchmark Peer Protocol V5
 
 The benchmark controller starts one server peer and one client peer for every
 sample. Peers exercise the selected stack through its public language API; the
@@ -20,13 +20,13 @@ Configuration is supplied as command-line arguments so peers do not need a
 general-purpose JSON parser. Standard input carries the ASCII commands
 `CONNECT HOST:PORT`, `START`, and `SHUTDOWN` at the phases described below.
 
-All events contain `schema_version: 4`, `event`, and `peer`. Counters and
+All events contain `schema_version: 5`, `event`, and `peer`. Counters and
 nanosecond values are decimal JSON strings so JavaScript can represent them
 without loss.
 
-V4 has no compatibility mode for earlier protocol versions. Campaign cells
-select one of the closed stack values `trevrpc_native_quic` or
-`trevrpc_webtransport`. Both server and client commands receive the selected
+V5 has no compatibility mode for earlier protocol versions. Campaign cells
+select one of the closed stack values `trevrpc_native_quic`, `trevrpc_http3`,
+or `trevrpc_webtransport`. Both server and client commands receive the selected
 value through `--stack`.
 
 The controller starts every peer as a new session and process-group leader.
@@ -41,12 +41,12 @@ the other role. RPC kinds and the client histogram format remain event-wide.
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "event": "capabilities",
   "peer": "rust",
   "roles": {
     "client": ["trevrpc_native_quic"],
-    "server": ["trevrpc_native_quic", "trevrpc_webtransport"]
+    "server": ["trevrpc_native_quic", "trevrpc_http3", "trevrpc_webtransport"]
   },
   "rpc_kinds": ["unary", "client_stream", "server_stream", "bidi"],
   "histogram": "log_linear_v1"
@@ -62,9 +62,14 @@ WebTransport advertises `trevrpc_webtransport` only under `roles.server`.
 Required arguments for every stack:
 
 ```text
---stack trevrpc_native_quic|trevrpc_webtransport
+--stack trevrpc_native_quic|trevrpc_http3|trevrpc_webtransport
 --listen HOST:PORT --cert FILE --key FILE
 ```
+
+For `trevrpc_http3`, the server accepts ordinary HTTP/3 `POST /trevrpc`
+requests whose content type is `application/trevrpc`. It uses the HTTP/3 ALPN,
+does not create a WebTransport session, and receives no origin option. Enabling
+this stack must not enable WebTransport admission.
 
 For `trevrpc_webtransport`, the controller also supplies the origin emitted by
 the prepared client:
@@ -74,12 +79,14 @@ the prepared client:
 ```
 
 The server must allow that exact browser origin for WebTransport admission.
-`PORT` may be zero. The controller may place the peer in an isolated network
+It accepts TrevRPC through an extended `CONNECT /trevrpc` session; selecting
+WebTransport must not also enable ordinary HTTP/3 POST handling. `PORT` may be
+zero. The controller may place the peer in an isolated network
 namespace and supply a non-loopback literal IP. Once the listener can accept
 RPCs, the peer prints:
 
 ```json
-{ "schema_version": 4, "event": "ready", "peer": "rust", "address": "127.0.0.1:43117", "pid": 1234 }
+{ "schema_version": 5, "event": "ready", "peer": "rust", "address": "127.0.0.1:43117", "pid": 1234 }
 ```
 
 The server continues until it reads `SHUTDOWN` or receives a termination
@@ -91,7 +98,7 @@ Required arguments for every stack:
 
 ```text
 --cert FILE
---stack trevrpc_native_quic|trevrpc_webtransport
+--stack trevrpc_native_quic|trevrpc_http3|trevrpc_webtransport
 --rpc unary|client_stream|server_stream|bidi
 --concurrency N
 --warmup-ms N
@@ -101,9 +108,12 @@ Required arguments for every stack:
 --messages-per-stream N
 ```
 
-Native QUIC clients also receive `--address HOST:PORT` at startup. Their
-`--cert` file is the campaign CA. Their startup behavior is unchanged:
-connect, validate one RPC, warm up, create all lanes, and emit `armed`.
+Address-at-start clients, including native QUIC and any future direct HTTP/3
+process client, receive `--address HOST:PORT` at startup. Their `--cert` file is
+the campaign CA. Current language process peers advertise only native QUIC for
+the client role; the Android Cronet smoke harness provides the current direct
+HTTP/3 client coverage outside the normal campaign controller. Address-at-start
+clients connect, validate one RPC, warm up, create all lanes, and emit `armed`.
 
 A WebTransport client starts before its RPC server and does not receive
 `--address`. Its `--cert` file is the exact `server.pem` leaf certificate, which
@@ -112,7 +122,7 @@ After its HTTPS browser page and Chromium process are ready, it emits:
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "event": "prepared",
   "peer": "chromium",
   "origin": "http://127.0.0.1:4443",
@@ -132,7 +142,7 @@ RPC, runs untimed warmup, creates all workload lanes, and emits the same event
 used by native clients:
 
 ```json
-{ "schema_version": 4, "event": "armed", "peer": "chromium", "pid": 1235 }
+{ "schema_version": 5, "event": "armed", "peer": "chromium", "pid": 1235 }
 ```
 
 Every client waits for `START` before measured work. The measurement uses a
@@ -143,7 +153,7 @@ The client prints one `sample` event after drain:
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "event": "sample",
   "peer": "rust",
   "rpc_kind": "unary",
@@ -206,7 +216,7 @@ A fatal peer error is written as an event when stdout remains usable:
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "event": "error",
   "peer": "rust",
   "phase": "measure",

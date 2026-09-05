@@ -50,6 +50,7 @@ pub struct Cell {
 #[serde(rename_all = "snake_case")]
 pub enum Stack {
     TrevrpcNativeQuic,
+    TrevrpcHttp3,
     TrevrpcWebtransport,
 }
 
@@ -58,8 +59,14 @@ impl Stack {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TrevrpcNativeQuic => "trevrpc_native_quic",
+            Self::TrevrpcHttp3 => "trevrpc_http3",
             Self::TrevrpcWebtransport => "trevrpc_webtransport",
         }
+    }
+
+    #[must_use]
+    pub const fn requires_prepared_client(self) -> bool {
+        matches!(self, Self::TrevrpcWebtransport)
     }
 }
 
@@ -416,9 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_schema_v3_campaigns() {
+    fn rejects_schema_v4_campaigns() {
         let mut campaign = campaign();
-        campaign.schema_version = 3;
+        campaign.schema_version = 4;
         assert!(campaign.validate().is_err());
     }
 
@@ -445,6 +452,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Stack::TrevrpcNativeQuic).unwrap(),
             "\"trevrpc_native_quic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Stack::TrevrpcHttp3).unwrap(),
+            "\"trevrpc_http3\""
         );
         assert_eq!(
             serde_json::to_string(&Stack::TrevrpcWebtransport).unwrap(),

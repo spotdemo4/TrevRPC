@@ -211,6 +211,10 @@ struct ServerConfig {
   std::string key_file;
   std::string webtransport_path;
   std::string webtransport_origin;
+  // Preserve the historical defaults while allowing callers to configure
+  // native QUIC and WebTransport independently.
+  bool enable_native = true;
+  bool enable_webtransport = true;
   bool enable_http3 = false;
   std::string http3_path;
   std::chrono::milliseconds max_idle_timeout{0};

@@ -256,11 +256,11 @@ stdenvNoCC.mkDerivation (final: {
 
     with open("capabilities.json", encoding="utf-8") as stream:
         capabilities = json.load(stream)
-    assert capabilities["schema_version"] == 4
+    assert capabilities["schema_version"] == 5
     assert capabilities["peer"] == "kotlin"
     assert capabilities["roles"] == {
         "client": ["trevrpc_native_quic"],
-        "server": ["trevrpc_native_quic", "trevrpc_webtransport"],
+        "server": ["trevrpc_native_quic", "trevrpc_http3", "trevrpc_webtransport"],
     }
     PY
     set -- "$out/share/trevrpc-kotlin/trevrpc-bench-peer-kotlin-netty/lib"/netty-codec-native-quic-*-${nettyNativeClassifier}.jar

@@ -430,6 +430,7 @@ typedef struct listen_work {
     size_t max_pending_send_count;
     uint16_t bound_port;
     bool has_max_stream_messages;
+    bool enable_native;
     bool enable_http3;
     node_http3_admission_state* http3_admission;
 } listen_work;
@@ -4787,6 +4788,7 @@ static void listen_execute(napi_env env, void* data) {
     config.max_binding_stateless_operations = 256;
     config.webtransport_path = work->path;
     config.webtransport_origin = work->origin;
+    config.enable_native = work->enable_native ? 1 : 0;
     config.enable_http3 = work->enable_http3 ? 1 : 0;
     config.http3_path = work->http3_path;
     if (work->http3_admission != NULL) {
@@ -4932,6 +4934,7 @@ static napi_value listen_msquic(napi_env env, napi_callback_info info) {
     work->idle_timeout_ms = get_uint32_property(env, args[0], "idleTimeoutMs", 30000);
     work->stream_idle_timeout_ms = get_uint32_property(env, args[0], "streamIdleTimeoutMs", 0);
     work->initial_request_timeout_ms = get_uint32_property(env, args[0], "initialRequestTimeoutMs", 10000);
+    work->enable_native = get_bool_property(env, args[0], "enableNative", true);
     work->enable_http3 = get_bool_property(env, args[0], "enableHttp3", false);
     work->has_max_stream_messages = get_int64_property(env, args[0], "maxStreamMessages", &work->max_stream_messages);
     get_size_property(env, args[0], "maxFrameSize", &work->max_frame_size);

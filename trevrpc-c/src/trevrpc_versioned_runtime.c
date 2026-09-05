@@ -94,6 +94,7 @@ int trevrpc_server_config_v1_init(trevrpc_server_config_v1* config, size_t struc
     config->http3_path = defaults.http3_path;
     config->http3_admission = defaults.http3_admission;
     config->http3_admission_user_data = defaults.http3_admission_user_data;
+    config->enable_native = defaults.enable_native;
     config->max_idle_timeout_ms = defaults.max_idle_timeout_ms;
     config->keep_alive_ms = defaults.keep_alive_ms;
     config->peer_bidi_stream_count = defaults.peer_bidi_stream_count;
@@ -201,6 +202,7 @@ static int trevrpc_server_config_v1_normalize(
         .http3_path = config->http3_path,
         .http3_admission = config->http3_admission,
         .http3_admission_user_data = config->http3_admission_user_data,
+        .enable_native = config->enable_native,
         .max_idle_timeout_ms = config->max_idle_timeout_ms,
         .keep_alive_ms = config->keep_alive_ms,
         .peer_bidi_stream_count = config->peer_bidi_stream_count,

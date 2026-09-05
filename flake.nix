@@ -658,10 +658,10 @@
               }
               ''
                 check_native_capabilities() {
-                  test "$($1 capabilities | jq -r .schema_version)" = 4
+                  test "$($1 capabilities | jq -r .schema_version)" = 5
                   test "$($1 capabilities | jq -r .peer)" = "$2"
                   test "$($1 capabilities | jq -c '.roles.client | sort')" = '["trevrpc_native_quic"]'
-                  test "$($1 capabilities | jq -c '.roles.server | sort')" = '["trevrpc_native_quic","trevrpc_webtransport"]'
+                  test "$($1 capabilities | jq -c '.roles.server | sort')" = '["trevrpc_http3","trevrpc_native_quic","trevrpc_webtransport"]'
                 }
                 check_native_capabilities ${c}/bin/trevrpc-bench-peer-c c
                 check_native_capabilities ${cpp}/bin/trevrpc-bench-peer-cpp cpp
@@ -669,13 +669,13 @@
                 check_native_capabilities ${js}/bin/trevrpc-bench-peer-js js
                 check_native_capabilities ${kotlin}/bin/trevrpc-bench-peer-kotlin kotlin
                 check_native_capabilities ${rust}/bin/trevrpc-bench-peer-rust rust
-                test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .schema_version)" = 4
+                test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .schema_version)" = 5
                 test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .peer)" = chromium
                 test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
-                test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -r .schema_version)" = 4
+                test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -r .schema_version)" = 5
                 test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -r .peer)" = firefox
                 test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
-                test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .schema_version)" = 4
+                test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .schema_version)" = 5
                 test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .peer)" = webkit
                 test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -c .roles)" = '{}'
                 touch $out

@@ -258,7 +258,7 @@ private class CronetCallback(
 
     override fun onWriteCompleted(
         stream: BidirectionalStream,
-        info: UrlResponseInfo,
+        info: UrlResponseInfo?,
         buffer: ByteBuffer,
         endOfStream: Boolean,
     ) = dispatch { callback.onWrite(facade, buffer, endOfStream) }

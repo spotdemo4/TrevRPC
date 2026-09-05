@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import hashlib
 import io
+import json
 import os
 import runpy
 import shutil
@@ -34,6 +36,18 @@ stop_process = cast(Callable[..., None], NAMESPACE["stop_process"])
 run_checked = cast(
     Callable[..., subprocess.CompletedProcess[str]], NAMESPACE["run_checked"]
 )
+install_ca = cast(Callable[..., None], NAMESPACE["install_ca"])
+recorded_adb = cast(
+    Callable[..., subprocess.CompletedProcess[str]], NAMESPACE["recorded_adb"]
+)
+verify_server_capabilities = cast(
+    Callable[[str, str], None], NAMESPACE["verify_server_capabilities"]
+)
+start_server = cast(
+    Callable[..., tuple[subprocess.Popen[str], TextIO]], NAMESPACE["start_server"]
+)
+ANDROID_CA_DIRECTORY = cast(str, NAMESPACE["ANDROID_CA_DIRECTORY"])
+ANDROID_CA_SETUP_LOG = cast(str, NAMESPACE["ANDROID_CA_SETUP_LOG"])
 
 
 class DiskUsage(NamedTuple):
@@ -63,6 +77,26 @@ class FakeProcess:
 
 def process_as_popen(process: FakeProcess) -> subprocess.Popen[bytes]:
     return cast(subprocess.Popen[bytes], cast(object, process))
+
+
+def noop_wait_for_root(
+    serial: str,
+    process: subprocess.Popen[bytes],
+    log_path: Path,
+    timeout: int = 60,
+) -> None:
+    del serial, process, log_path, timeout
+
+
+def noop_wait_for_boot(
+    serial: str,
+    process: subprocess.Popen[bytes],
+    log_path: Path,
+    *,
+    previous_boot_id: str | None = None,
+    timeout: int = 180,
+) -> None:
+    del serial, process, log_path, previous_boot_id, timeout
 
 
 class AndroidSmokeRunnerTests(unittest.TestCase):
@@ -200,6 +234,504 @@ class AndroidSmokeRunnerTests(unittest.TestCase):
 
         self.assertEqual(adb_calls, [("shell", "input", "keyevent", "82")])
 
+    def test_verify_server_capabilities_requires_http3_server(self) -> None:
+        def capabilities_result(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            self.assertEqual(command, ["peer", "capabilities"])
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "schema_version": 5,
+                        "event": "capabilities",
+                        "peer": "c",
+                        "roles": {
+                            "client": ["trevrpc_native_quic"],
+                            "server": ["trevrpc_http3"],
+                        },
+                    }
+                ),
+                "",
+            )
+
+        with patch.dict(
+            verify_server_capabilities.__globals__, {"run_checked": capabilities_result}
+        ):
+            verify_server_capabilities("c", "peer")
+
+    def test_verify_server_capabilities_rejects_webtransport_only(self) -> None:
+        def capabilities_result(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "schema_version": 5,
+                        "event": "capabilities",
+                        "peer": "c",
+                        "roles": {"server": ["trevrpc_webtransport"]},
+                    }
+                ),
+                "",
+            )
+
+        with (
+            patch.dict(
+                verify_server_capabilities.__globals__,
+                {"run_checked": capabilities_result},
+            ),
+            self.assertRaisesRegex(SmokeFailure, "ordinary HTTP/3 support"),
+        ):
+            verify_server_capabilities("c", "peer")
+
+    def test_start_server_selects_direct_http3_without_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            commands: list[list[str]] = []
+
+            def fake_popen(
+                command: list[str], **kwargs: object
+            ) -> subprocess.Popen[str]:
+                del kwargs
+                commands.append(command)
+                return cast(
+                    subprocess.Popen[str],
+                    cast(object, FakeProcess(None)),
+                )
+
+            with patch.object(subprocess, "Popen", side_effect=fake_popen):
+                _, stdout_log = start_server(
+                    "peer",
+                    output / "server.pem",
+                    output / "server-key.pem",
+                    output,
+                )
+            stdout_log.close()
+
+            self.assertEqual(len(commands), 1)
+            command = commands[0]
+            self.assertEqual(command[command.index("--stack") + 1], "trevrpc_http3")
+            self.assertNotIn("--webtransport-origin", command)
+
+    def test_recorded_adb_logs_nonzero_result_before_raising(self) -> None:
+        log = io.StringIO()
+
+        def failed_command(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            return subprocess.CompletedProcess(
+                command, 1, "probe stdout\n", "probe stderr\n"
+            )
+
+        with (
+            patch.dict(recorded_adb.__globals__, {"execute_command": failed_command}),
+            self.assertRaisesRegex(SmokeFailure, "probe stderr"),
+        ):
+            _ = recorded_adb("emulator-5554", log, "shell", "false")
+
+        entry = cast(dict[str, object], cast(object, json.loads(log.getvalue())))
+        self.assertEqual(entry["returncode"], 1)
+        self.assertEqual(entry["stdout"], "probe stdout\n")
+        self.assertEqual(entry["stderr"], "probe stderr\n")
+
+    def test_recorded_adb_logs_timeout_before_raising(self) -> None:
+        log = io.StringIO()
+
+        def timed_out(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            del kwargs
+            raise subprocess.TimeoutExpired(
+                command,
+                7,
+                output="partial stdout\n",
+                stderr="partial stderr\n",
+            )
+
+        with (
+            patch.dict(recorded_adb.__globals__, {"execute_command": timed_out}),
+            self.assertRaisesRegex(SmokeFailure, "timed out after 7s"),
+        ):
+            _ = recorded_adb("emulator-5554", log, "shell", "sleep", "10", timeout=7)
+
+        entry = cast(dict[str, object], cast(object, json.loads(log.getvalue())))
+        self.assertEqual(entry["returncode"], None)
+        self.assertEqual(entry["timeout"], 7)
+        self.assertEqual(entry["error"], "timed_out")
+        self.assertEqual(entry["stdout"], "partial stdout\n")
+        self.assertEqual(entry["stderr"], "partial stderr\n")
+
+    def test_install_ca_uses_complete_remount_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            output = root / "output"
+            work.mkdir()
+            output.mkdir()
+            ca = root / "ca.pem"
+            ca_bytes = b"test CA\n"
+            _ = ca.write_bytes(ca_bytes)
+            _ = (output / ANDROID_CA_SETUP_LOG).write_text(
+                '{"existing":true}\n', encoding="utf-8"
+            )
+            expected_digest = hashlib.sha256(ca_bytes).hexdigest()
+            destination = f"{ANDROID_CA_DIRECTORY}/2b066fc1.0"
+            process = process_as_popen(FakeProcess(None))
+            events: list[tuple[object, ...]] = []
+            boot_ids = ["before-verity-reboot", "before-activation-reboot"]
+
+            def fake_run_checked(
+                command: list[str],
+                *,
+                input_text: str | None = None,
+                timeout: int = 60,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                del input_text, timeout, env
+                self.assertEqual(
+                    command,
+                    [
+                        "openssl",
+                        "x509",
+                        "-subject_hash_old",
+                        "-noout",
+                        "-in",
+                        str(ca),
+                    ],
+                )
+                return subprocess.CompletedProcess(command, 0, "2b066fc1\n", "")
+
+            def fake_execute_command(
+                command: list[str],
+                *,
+                input_text: str | None = None,
+                timeout: int = 60,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                del input_text, env
+                self.assertEqual(command[:3], ["adb", "-s", "emulator-5554"])
+                arguments = tuple(command[3:])
+                action = arguments[0]
+                if (
+                    len(arguments) == 2
+                    and arguments[0] == "shell"
+                    and ".trevrpc-write-probe-" in arguments[1]
+                ):
+                    action = "write-probe"
+                    self.assertIn(ANDROID_CA_DIRECTORY, arguments[1])
+                    self.assertIn("trap", arguments[1])
+                elif arguments[:1] == ("push",):
+                    action = "push"
+                    self.assertEqual(
+                        arguments[1:], (str(work / "2b066fc1.0"), destination)
+                    )
+                elif arguments[:2] == ("shell", "chmod"):
+                    action = "chmod"
+                    self.assertEqual(arguments[2:], ("644", destination))
+                elif arguments[:2] == ("shell", "chown"):
+                    action = "chown"
+                    self.assertEqual(arguments[2:], ("0:0", destination))
+                elif arguments[:2] == ("shell", "restorecon"):
+                    action = "restorecon"
+                    self.assertEqual(arguments[2:], (destination,))
+                elif arguments[:2] == ("shell", "sha256sum"):
+                    action = "sha256sum"
+                    self.assertEqual(arguments[2:], (destination,))
+                events.append((f"adb:{action}", timeout))
+                stdout = f"{action} stdout\n"
+                if action == "sha256sum":
+                    stdout = f"{expected_digest}  {destination}\n"
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout,
+                    f"{action} stderr\n",
+                )
+
+            def fake_wait_for_root(
+                serial: str,
+                emulator_process: subprocess.Popen[bytes],
+                emulator_log: Path,
+                timeout: int = 60,
+            ) -> None:
+                del emulator_process, emulator_log
+                self.assertEqual(serial, "emulator-5554")
+                events.append(("wait-root", timeout))
+
+            def fake_read_boot_id(serial: str) -> str:
+                self.assertEqual(serial, "emulator-5554")
+                boot_id = boot_ids.pop(0)
+                events.append(("read-boot-id", boot_id))
+                return boot_id
+
+            def fake_wait_for_boot(
+                serial: str,
+                emulator_process: subprocess.Popen[bytes],
+                emulator_log: Path,
+                *,
+                previous_boot_id: str | None = None,
+                timeout: int = 180,
+            ) -> None:
+                del emulator_process, emulator_log, timeout
+                self.assertEqual(serial, "emulator-5554")
+                events.append(("wait-boot", previous_boot_id))
+
+            with patch.dict(
+                install_ca.__globals__,
+                {
+                    "run_checked": fake_run_checked,
+                    "execute_command": fake_execute_command,
+                    "wait_for_root": fake_wait_for_root,
+                    "read_boot_id": fake_read_boot_id,
+                    "wait_for_boot": fake_wait_for_boot,
+                },
+            ):
+                install_ca(
+                    "emulator-5554",
+                    process,
+                    root / "emulator.log",
+                    ca,
+                    work,
+                    output,
+                )
+
+            self.assertEqual(
+                events,
+                [
+                    ("adb:root", 60),
+                    ("wait-root", 60),
+                    ("adb:disable-verity", 60),
+                    ("read-boot-id", "before-verity-reboot"),
+                    ("adb:reboot", 60),
+                    ("wait-boot", "before-verity-reboot"),
+                    ("adb:root", 60),
+                    ("wait-root", 60),
+                    ("adb:remount", 90),
+                    ("adb:write-probe", 60),
+                    ("adb:push", 60),
+                    ("adb:chmod", 60),
+                    ("adb:chown", 60),
+                    ("adb:restorecon", 60),
+                    ("read-boot-id", "before-activation-reboot"),
+                    ("adb:reboot", 60),
+                    ("wait-boot", "before-activation-reboot"),
+                    ("adb:sha256sum", 60),
+                ],
+            )
+            lines = (
+                (output / ANDROID_CA_SETUP_LOG).read_text(encoding="utf-8").splitlines()
+            )
+            self.assertEqual(lines[0], '{"existing":true}')
+            self.assertEqual(len(lines), 13)
+            first_entry = cast(dict[str, object], cast(object, json.loads(lines[1])))
+            last_entry = cast(dict[str, object], cast(object, json.loads(lines[-1])))
+            self.assertEqual(first_entry["stdout"], "root stdout\n")
+            self.assertEqual(first_entry["stderr"], "root stderr\n")
+            self.assertEqual(
+                last_entry["command"],
+                ["adb", "-s", "emulator-5554", "shell", "sha256sum", destination],
+            )
+
+    def test_install_ca_requires_boot_id_before_verity_reboot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            output = root / "output"
+            work.mkdir()
+            output.mkdir()
+            ca = root / "ca.pem"
+            _ = ca.write_text("test CA\n", encoding="utf-8")
+            commands: list[tuple[str, ...]] = []
+
+            def fake_run_checked(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                del kwargs
+                return subprocess.CompletedProcess(command, 0, "2b066fc1\n", "")
+
+            def fake_execute_command(
+                command: list[str],
+                *,
+                input_text: str | None = None,
+                timeout: int = 60,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                del input_text, timeout, env
+                arguments = tuple(command[3:])
+                commands.append(arguments)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def missing_boot_id(serial: str) -> None:
+                del serial
+
+            with (
+                patch.dict(
+                    install_ca.__globals__,
+                    {
+                        "run_checked": fake_run_checked,
+                        "execute_command": fake_execute_command,
+                        "wait_for_root": noop_wait_for_root,
+                        "read_boot_id": missing_boot_id,
+                    },
+                ),
+                self.assertRaisesRegex(SmokeFailure, "before verity reboot"),
+            ):
+                install_ca(
+                    "emulator-5554",
+                    process_as_popen(FakeProcess(None)),
+                    root / "emulator.log",
+                    ca,
+                    work,
+                    output,
+                )
+
+            self.assertNotIn(("reboot",), commands)
+            self.assertNotIn("push", [command[0] for command in commands])
+
+    def test_install_ca_requires_boot_id_before_activation_reboot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            output = root / "output"
+            work.mkdir()
+            output.mkdir()
+            ca = root / "ca.pem"
+            _ = ca.write_text("test CA\n", encoding="utf-8")
+            commands: list[tuple[str, ...]] = []
+            boot_ids: list[str | None] = ["before-verity-reboot", None]
+
+            def fake_run_checked(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                del kwargs
+                return subprocess.CompletedProcess(command, 0, "2b066fc1\n", "")
+
+            def fake_execute_command(
+                command: list[str],
+                *,
+                input_text: str | None = None,
+                timeout: int = 60,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                del input_text, timeout, env
+                arguments = tuple(command[3:])
+                commands.append(arguments)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def fake_read_boot_id(serial: str) -> str | None:
+                del serial
+                return boot_ids.pop(0)
+
+            with (
+                patch.dict(
+                    install_ca.__globals__,
+                    {
+                        "run_checked": fake_run_checked,
+                        "execute_command": fake_execute_command,
+                        "wait_for_root": noop_wait_for_root,
+                        "read_boot_id": fake_read_boot_id,
+                        "wait_for_boot": noop_wait_for_boot,
+                    },
+                ),
+                self.assertRaisesRegex(SmokeFailure, "before CA activation reboot"),
+            ):
+                install_ca(
+                    "emulator-5554",
+                    process_as_popen(FakeProcess(None)),
+                    root / "emulator.log",
+                    ca,
+                    work,
+                    output,
+                )
+
+            self.assertEqual(commands.count(("reboot",)), 1)
+            self.assertIn("push", [command[0] for command in commands])
+
+    def test_install_ca_stops_when_write_probe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            output = root / "output"
+            work.mkdir()
+            output.mkdir()
+            ca = root / "ca.pem"
+            _ = ca.write_text("test CA\n", encoding="utf-8")
+            commands: list[tuple[str, ...]] = []
+
+            def fake_run_checked(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                del kwargs
+                return subprocess.CompletedProcess(command, 0, "2b066fc1\n", "")
+
+            def fake_execute_command(
+                command: list[str],
+                *,
+                input_text: str | None = None,
+                timeout: int = 60,
+                env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                del input_text, timeout, env
+                arguments = tuple(command[3:])
+                commands.append(arguments)
+                if (
+                    len(arguments) == 2
+                    and arguments[0] == "shell"
+                    and ".trevrpc-write-probe-" in arguments[1]
+                ):
+                    return subprocess.CompletedProcess(
+                        command,
+                        1,
+                        "probe stdout\n",
+                        "Read-only file system\n",
+                    )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def fixed_boot_id(serial: str) -> str:
+                del serial
+                return "before-verity-reboot"
+
+            with (
+                patch.dict(
+                    install_ca.__globals__,
+                    {
+                        "run_checked": fake_run_checked,
+                        "execute_command": fake_execute_command,
+                        "wait_for_root": noop_wait_for_root,
+                        "read_boot_id": fixed_boot_id,
+                        "wait_for_boot": noop_wait_for_boot,
+                    },
+                ),
+                self.assertRaisesRegex(SmokeFailure, "Read-only file system"),
+            ):
+                install_ca(
+                    "emulator-5554",
+                    process_as_popen(FakeProcess(None)),
+                    root / "emulator.log",
+                    ca,
+                    work,
+                    output,
+                )
+
+            self.assertNotIn("push", [command[0] for command in commands])
+            lines = (
+                (output / ANDROID_CA_SETUP_LOG).read_text(encoding="utf-8").splitlines()
+            )
+            failed = cast(dict[str, object], cast(object, json.loads(lines[-1])))
+            self.assertEqual(failed["returncode"], 1)
+            self.assertEqual(failed["stdout"], "probe stdout\n")
+            self.assertEqual(failed["stderr"], "Read-only file system\n")
+            self.assertIn(
+                ".trevrpc-write-probe-", cast(list[str], failed["command"])[-1]
+            )
+
     def test_collect_logcat_skips_offline_emulator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
@@ -222,7 +754,7 @@ class AndroidSmokeRunnerTests(unittest.TestCase):
     def test_read_event_drains_stdout_after_process_exit(self) -> None:
         read_fd, write_fd = os.pipe()
         with os.fdopen(write_fd, "w", encoding="utf-8") as writer:
-            _ = writer.write('{"schema_version":4,"event":"stopped","peer":"c"}\n')
+            _ = writer.write('{"schema_version":5,"event":"stopped","peer":"c"}\n')
         stdout = os.fdopen(read_fd, "r", encoding="utf-8")
         process = FakeProcess(0)
         process.stdout = stdout

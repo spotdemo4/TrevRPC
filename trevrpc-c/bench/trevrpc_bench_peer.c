@@ -21,8 +21,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define BENCHMARK_SCHEMA_VERSION 4
+#define BENCHMARK_SCHEMA_VERSION 5
+#define BENCHMARK_HTTP3_PATH "/trevrpc"
 #define BENCHMARK_WEBTRANSPORT_PATH "/trevrpc"
+#define BENCHMARK_DISABLED_WEBTRANSPORT_PATH ""
 
 typedef Trevrpc__Benchmark__V1__BenchmarkRequest BenchmarkRequest;
 typedef Trevrpc__Benchmark__V1__BenchmarkResponse BenchmarkResponse;
@@ -213,7 +215,7 @@ static int emit_capabilities(void) {
     if (fprintf(stdout,
             "{\"schema_version\":%d,\"event\":\"capabilities\",\"peer\":\"c\","
             "\"roles\":{\"client\":[\"trevrpc_native_quic\"],"
-            "\"server\":[\"trevrpc_native_quic\",\"trevrpc_webtransport\"]},"
+            "\"server\":[\"trevrpc_native_quic\",\"trevrpc_http3\",\"trevrpc_webtransport\"]},"
             "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
             "\"histogram\":\"log_linear_v1\"}",
             BENCHMARK_SCHEMA_VERSION) < 0) {
@@ -349,6 +351,8 @@ static int set_once(const char** destination, const char* value) {
 static int parse_stack(const char* value, benchmark_stack* stack, const char** stack_name) {
     if (strcmp(value, "trevrpc_native_quic") == 0) {
         *stack = BENCHMARK_STACK_TREVRPC_NATIVE_QUIC;
+    } else if (strcmp(value, "trevrpc_http3") == 0) {
+        *stack = BENCHMARK_STACK_TREVRPC_HTTP3;
     } else if (strcmp(value, "trevrpc_webtransport") == 0) {
         *stack = BENCHMARK_STACK_TREVRPC_WEBTRANSPORT;
     } else {
@@ -494,6 +498,10 @@ static int parse_client_options(int argc, char** argv, client_options* options, 
     }
     if (parse_stack(stack, &options->stack, &options->stack_name) != 0) {
         snprintf(error, error_len, "invalid --stack value: %s", stack);
+        return -EINVAL;
+    }
+    if (options->stack == BENCHMARK_STACK_TREVRPC_HTTP3) {
+        snprintf(error, error_len, "trevrpc_http3 is server-only");
         return -EINVAL;
     }
     if (options->stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
@@ -1543,6 +1551,7 @@ static int run_server(int argc, char** argv) {
     }
     config.host = options.host;
     config.port = options.port;
+    config.enable_native = options.stack == BENCHMARK_STACK_TREVRPC_NATIVE_QUIC;
     config.cert_file = options.cert;
     config.key_file = options.key;
     config.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;
@@ -1554,6 +1563,12 @@ static int run_server(int argc, char** argv) {
     if (options.stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
         config.webtransport_path = BENCHMARK_WEBTRANSPORT_PATH;
         config.webtransport_origin = options.webtransport_origin;
+    } else {
+        config.webtransport_path = BENCHMARK_DISABLED_WEBTRANSPORT_PATH;
+    }
+    if (options.stack == BENCHMARK_STACK_TREVRPC_HTTP3) {
+        config.enable_http3 = 1;
+        config.http3_path = BENCHMARK_HTTP3_PATH;
     }
     trevrpc_server* server = NULL;
     err = trevrpc_server_listen_v1(&config, &server);
@@ -1814,8 +1829,7 @@ static int run_client(int argc, char** argv) {
 static void print_usage(const char* program) {
     fprintf(stderr,
         "usage: %s capabilities | server --stack STACK --listen HOST:PORT --cert FILE --key FILE "
-        "[--webtransport-origin ORIGIN] | client --stack "
-        "STACK [options]\n",
+        "[--webtransport-origin ORIGIN] | client --stack STACK [options]\n",
         program);
 }
 

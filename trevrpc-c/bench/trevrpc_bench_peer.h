@@ -18,6 +18,7 @@
 
 typedef enum benchmark_stack {
     BENCHMARK_STACK_TREVRPC_NATIVE_QUIC,
+    BENCHMARK_STACK_TREVRPC_HTTP3,
     BENCHMARK_STACK_TREVRPC_WEBTRANSPORT,
 } benchmark_stack;
 

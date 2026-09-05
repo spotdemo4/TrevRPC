@@ -3,10 +3,10 @@
 set -eu
 
 peer=$1
-probe=$2
-certificate=$3
-private_key=$4
-directory=$(mktemp -d "${TMPDIR:-/tmp}/trevrpc-cpp-webtransport-smoke.XXXXXX")
+certificate=$2
+private_key=$3
+probe=${4-}
+directory=$(mktemp -d "${TMPDIR:-/tmp}/trevrpc-http3-lifecycle.XXXXXX")
 server_pid=
 
 cleanup() {
@@ -20,7 +20,15 @@ cleanup() {
   if [ "$status" -eq 0 ]; then
     rm -rf "$directory"
   else
-    printf 'WebTransport smoke failure artifacts: %s\n' "$directory" >&2
+    for artifact in server.err probe.out probe.err; do
+      if [ -s "$directory/$artifact" ]; then
+        printf '%s:\n' "$artifact" >&2
+        while IFS= read -r line || [ -n "$line" ]; do
+          printf '  %s\n' "$line" >&2
+        done <"$directory/$artifact"
+      fi
+    done
+    printf 'HTTP/3 lifecycle failure artifacts: %s\n' "$directory" >&2
   fi
   exit "$status"
 }
@@ -31,11 +39,10 @@ exec 3<>"$directory/control"
 exec 4<>"$directory/events"
 
 "$peer" server \
-  --stack trevrpc_webtransport \
+  --stack trevrpc_http3 \
   --listen 127.0.0.1:0 \
   --cert "$certificate" \
   --key "$private_key" \
-  --webtransport-origin https://benchmark.invalid \
   <&3 >&4 2>"$directory/server.err" &
 server_pid=$!
 
@@ -48,11 +55,16 @@ case "$ready" in
   ;;
 esac
 
-address=${ready#*'"address":"'}
-address=${address%%'"'*}
-host=${address%:*}
-port=${address##*:}
-"$probe" "$host" "$port" https://benchmark.invalid 2>"$directory/probe.err"
+if [ -n "$probe" ]; then
+  address=${ready#*'"address":"'}
+  address=${address%%'"'*}
+  host=${address%:*}
+  port=${address##*:}
+  if "$probe" "$host" "$port" https://benchmark.invalid >"$directory/probe.out" 2>"$directory/probe.err"; then
+    printf 'WebTransport probe unexpectedly succeeded against HTTP/3-only server\n' >&2
+    exit 1
+  fi
+fi
 
 printf 'SHUTDOWN\n' >&3
 IFS= read -r stopped <&4
@@ -65,5 +77,7 @@ case "$stopped" in
 esac
 wait "$server_pid"
 server_pid=
-test ! -s "$directory/server.err"
-test ! -s "$directory/probe.err"
+if [ -s "$directory/server.err" ]; then
+  printf 'HTTP/3 server wrote unexpected stderr output\n' >&2
+  exit 1
+fi

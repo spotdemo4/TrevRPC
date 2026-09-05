@@ -8,7 +8,7 @@ static_assert(TREVRPC_C_ABI_VERSION == 6u);
 static_assert(sizeof(trevrpc_bytes_view) == 16);
 static_assert(alignof(trevrpc_bytes_view) == 8);
 static_assert(sizeof(trevrpc_client_config_v1) == 104);
-static_assert(sizeof(trevrpc_server_config_v1) == 176);
+static_assert(sizeof(trevrpc_server_config_v1) == 184);
 static_assert(sizeof(trevrpc_server_options_v1) == 88);
 static_assert(sizeof(trevrpc_call_options_v1) == 72);
 static_assert(sizeof(trevrpc_response_view_v1) == 56);
