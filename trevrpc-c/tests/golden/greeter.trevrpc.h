@@ -7,11 +7,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <protobuf-c/protobuf-c.h>
-#include "trevrpc.h"
+#include "trevrpc_rpc.h"
 #include "greeter.pb-c.h"
 
-#if TREVRPC_C_ABI_VERSION != 6u
-#error "Generated TrevRPC C bindings require C ABI 6"
+#if TREVRPC_RPC_ABI_VERSION != 1u
+#error "Generated TrevRPC C bindings require RPC ABI 1"
 #endif
 
 #ifdef __cplusplus
@@ -22,117 +22,59 @@ extern "C" {
 void trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(size_t successful_allocations);
 #endif
 
-#define HELLO_V1_GREETER_SAY_HELLO_RESULT_NONE 0u
-#define HELLO_V1_GREETER_SAY_HELLO_RESULT_SUCCESS 1u
-#define HELLO_V1_GREETER_SAY_HELLO_RESULT_RPC_STATUS 2u
-#define HELLO_V1_GREETER_SAY_HELLO_RESULT_RUNTIME_ERROR 3u
-#define HELLO_V1_GREETER_SAY_HELLO_RESULT_DECODE_ERROR 4u
+#define HELLO_V1_GREETER_SAY_HELLO_RPC_KIND TREVRPC_RPC_KIND_UNARY
 
-typedef struct hello_v1_greeter_say_hello_result {
-    uint32_t kind;
-    int error;
-    Hello__V1__HelloReply* response;
-    trevrpc_inbound_response* envelope;
-} hello_v1_greeter_say_hello_result;
+int hello_v1_greeter_say_hello_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size);
+int hello_v1_greeter_say_hello_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const Hello__V1__HelloRequest* initial_or_null, uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream);
+int hello_v1_greeter_say_hello_respond(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, const Hello__V1__HelloReply* message, const trevrpc_rpc_status_v1* status, uint64_t operation_id);
+int hello_v1_greeter_say_hello_decode_request_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloRequest** out_message);
+int hello_v1_greeter_say_hello_decode_response_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloReply** out_message);
+int hello_v1_greeter_say_hello_matches_incoming(const trevrpc_rpc_event_info_v1* info);
+/* On success, atomically transfers call, stream, and initial receive; outputs are unchanged on failure. Client-streaming and bidi initial receives may be empty and should be released without decoding. */
+int hello_v1_greeter_say_hello_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream, trevrpc_rpc_receive** out_initial);
+int hello_v1_greeter_say_hello_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id);
 
-#define HELLO_V1_GREETER_SAY_HELLO_RESULT_INIT {0}
+#define HELLO_V1_GREETER_LOTS_OF_REPLIES_RPC_KIND TREVRPC_RPC_KIND_SERVER_STREAMING
 
-void hello_v1_greeter_say_hello_result_reset(hello_v1_greeter_say_hello_result* result);
+int hello_v1_greeter_lots_of_replies_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size);
+int hello_v1_greeter_lots_of_replies_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const Hello__V1__HelloRequest* initial_or_null, uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream);
+int hello_v1_greeter_lots_of_replies_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const Hello__V1__HelloReply* message, uint64_t operation_id);
+int hello_v1_greeter_lots_of_replies_finish(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id, const trevrpc_rpc_status_v1* status);
+int hello_v1_greeter_lots_of_replies_decode_request_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloRequest** out_message);
+int hello_v1_greeter_lots_of_replies_decode_response_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloReply** out_message);
+int hello_v1_greeter_lots_of_replies_matches_incoming(const trevrpc_rpc_event_info_v1* info);
+/* On success, atomically transfers call, stream, and initial receive; outputs are unchanged on failure. Client-streaming and bidi initial receives may be empty and should be released without decoding. */
+int hello_v1_greeter_lots_of_replies_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream, trevrpc_rpc_receive** out_initial);
+int hello_v1_greeter_lots_of_replies_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id);
 
-typedef struct hello_v1_greeter_say_hello_response_view {
-    const Hello__V1__HelloReply* message;
-    uint32_t status;
-    const char* status_message;
-    size_t status_message_len;
-    const trevrpc_metadata* metadata;
-} hello_v1_greeter_say_hello_response_view;
+#define HELLO_V1_GREETER_LOTS_OF_GREETINGS_RPC_KIND TREVRPC_RPC_KIND_CLIENT_STREAMING
 
-typedef int (*hello_v1_greeter_say_hello_respond_fn)(void* respond_context, const hello_v1_greeter_say_hello_response_view* response);
+int hello_v1_greeter_lots_of_greetings_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size);
+int hello_v1_greeter_lots_of_greetings_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const Hello__V1__HelloRequest* initial_or_null, uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream);
+int hello_v1_greeter_lots_of_greetings_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const Hello__V1__HelloRequest* message, uint64_t operation_id);
+int hello_v1_greeter_lots_of_greetings_finish_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, uint64_t operation_id);
+int hello_v1_greeter_lots_of_greetings_respond(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, const Hello__V1__HelloReply* message, const trevrpc_rpc_status_v1* status, uint64_t operation_id);
+int hello_v1_greeter_lots_of_greetings_decode_request_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloRequest** out_message);
+int hello_v1_greeter_lots_of_greetings_decode_response_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloReply** out_message);
+int hello_v1_greeter_lots_of_greetings_matches_incoming(const trevrpc_rpc_event_info_v1* info);
+/* On success, atomically transfers call, stream, and initial receive; outputs are unchanged on failure. Client-streaming and bidi initial receives may be empty and should be released without decoding. */
+int hello_v1_greeter_lots_of_greetings_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream, trevrpc_rpc_receive** out_initial);
+int hello_v1_greeter_lots_of_greetings_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id);
 
-typedef struct hello_v1_greeter_lots_of_greetings_response_view {
-    const Hello__V1__HelloReply* message;
-    uint32_t status;
-    const char* status_message;
-    size_t status_message_len;
-    const trevrpc_metadata* metadata;
-} hello_v1_greeter_lots_of_greetings_response_view;
+#define HELLO_V1_GREETER_BIDI_HELLO_RPC_KIND TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING
 
-typedef int (*hello_v1_greeter_lots_of_greetings_respond_fn)(void* respond_context, const hello_v1_greeter_lots_of_greetings_response_view* response);
-
-#define HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_NONE 0u
-#define HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_MESSAGE 1u
-#define HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_END 2u
-#define HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_TERMINAL_STATUS 3u
-#define HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_RUNTIME_ERROR 4u
-#define HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_DECODE_ERROR 5u
-
-typedef struct hello_v1_greeter_hello_request_request_event {
-    uint32_t kind;
-    int error;
-    Hello__V1__HelloRequest* message;
-    trevrpc_inbound_stream_frame* frame;
-} hello_v1_greeter_hello_request_request_event;
-
-typedef struct hello_v1_greeter_hello_request_request_receiver {
-    trevrpc_stream* stream;
-    uint32_t state;
-} hello_v1_greeter_hello_request_request_receiver;
-
-#define HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_INIT {0}
-#define HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_RECEIVER_INIT {0}
-
-int hello_v1_greeter_hello_request_request_receiver_init(hello_v1_greeter_hello_request_request_receiver* receiver, trevrpc_stream* stream);
-int hello_v1_greeter_recv_hello_v1_hello_request_request(hello_v1_greeter_hello_request_request_receiver* receiver, hello_v1_greeter_hello_request_request_event* event);
-void hello_v1_greeter_hello_request_request_event_reset(hello_v1_greeter_hello_request_request_event* event);
-void hello_v1_greeter_hello_request_request_receiver_reset(hello_v1_greeter_hello_request_request_receiver* receiver);
-
-#define HELLO_V1_GREETER_HELLO_REPLY_EVENT_NONE 0u
-#define HELLO_V1_GREETER_HELLO_REPLY_EVENT_MESSAGE 1u
-#define HELLO_V1_GREETER_HELLO_REPLY_EVENT_TERMINAL_STATUS 2u
-#define HELLO_V1_GREETER_HELLO_REPLY_EVENT_MISSING_TERMINAL_STATUS 3u
-#define HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR 4u
-#define HELLO_V1_GREETER_HELLO_REPLY_EVENT_DECODE_ERROR 5u
-
-typedef struct hello_v1_greeter_hello_reply_event {
-    uint32_t kind;
-    int error;
-    Hello__V1__HelloReply* message;
-    trevrpc_inbound_stream_frame* frame;
-} hello_v1_greeter_hello_reply_event;
-
-typedef struct hello_v1_greeter_hello_reply_receiver {
-    trevrpc_stream* stream;
-    uint32_t state;
-} hello_v1_greeter_hello_reply_receiver;
-
-#define HELLO_V1_GREETER_HELLO_REPLY_EVENT_INIT {0}
-#define HELLO_V1_GREETER_HELLO_REPLY_RECEIVER_INIT {0}
-
-int hello_v1_greeter_hello_reply_receiver_init(hello_v1_greeter_hello_reply_receiver* receiver, trevrpc_stream* stream);
-int hello_v1_greeter_recv_hello_v1_hello_reply(hello_v1_greeter_hello_reply_receiver* receiver, hello_v1_greeter_hello_reply_event* event);
-void hello_v1_greeter_hello_reply_event_reset(hello_v1_greeter_hello_reply_event* event);
-void hello_v1_greeter_hello_reply_receiver_reset(hello_v1_greeter_hello_reply_receiver* receiver);
-
-typedef struct hello_v1_greeter_server {
-    void* user_data;
-    int (*say_hello)(void* user_data, const trevrpc_call_context* context, const Hello__V1__HelloRequest* request, hello_v1_greeter_say_hello_respond_fn respond, void* respond_context);
-    int (*lots_of_replies)(void* user_data, const trevrpc_call_context* context, const Hello__V1__HelloRequest* request, trevrpc_stream* stream);
-    int (*lots_of_greetings)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream, hello_v1_greeter_lots_of_greetings_respond_fn respond, void* respond_context);
-    int (*bidi_hello)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream);
-} hello_v1_greeter_server;
-
-int hello_v1_greeter_send_hello_v1_hello_reply(trevrpc_stream* stream, const Hello__V1__HelloReply* message);
-int hello_v1_greeter_send_hello_v1_hello_request(trevrpc_stream* stream, const Hello__V1__HelloRequest* message);
-
-int hello_v1_greeter_say_hello(trevrpc_channel* channel, const Hello__V1__HelloRequest* request, hello_v1_greeter_say_hello_result* result);
-int hello_v1_greeter_say_hello_with_options(trevrpc_channel* channel, const Hello__V1__HelloRequest* request, const trevrpc_call_options_v1* options, hello_v1_greeter_say_hello_result* result);
-int hello_v1_greeter_lots_of_replies(trevrpc_channel* channel, const Hello__V1__HelloRequest* request, trevrpc_stream** stream);
-int hello_v1_greeter_lots_of_replies_with_options(trevrpc_channel* channel, const Hello__V1__HelloRequest* request, const trevrpc_call_options_v1* options, trevrpc_stream** stream);
-int hello_v1_greeter_lots_of_greetings_start(trevrpc_channel* channel, trevrpc_stream** stream);
-int hello_v1_greeter_lots_of_greetings_start_with_options(trevrpc_channel* channel, const trevrpc_call_options_v1* options, trevrpc_stream** stream);
-int hello_v1_greeter_bidi_hello_start(trevrpc_channel* channel, trevrpc_stream** stream);
-int hello_v1_greeter_bidi_hello_start_with_options(trevrpc_channel* channel, const trevrpc_call_options_v1* options, trevrpc_stream** stream);
-int hello_v1_greeter_register(trevrpc_server* server, const hello_v1_greeter_server* implementation);
+int hello_v1_greeter_bidi_hello_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size);
+int hello_v1_greeter_bidi_hello_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const Hello__V1__HelloRequest* initial_or_null, uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream);
+int hello_v1_greeter_bidi_hello_send_request(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const Hello__V1__HelloRequest* message, uint64_t operation_id);
+int hello_v1_greeter_bidi_hello_finish_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, uint64_t operation_id);
+int hello_v1_greeter_bidi_hello_send_response(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const Hello__V1__HelloReply* message, uint64_t operation_id);
+int hello_v1_greeter_bidi_hello_finish(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id, const trevrpc_rpc_status_v1* status);
+int hello_v1_greeter_bidi_hello_decode_request_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloRequest** out_message);
+int hello_v1_greeter_bidi_hello_decode_response_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloReply** out_message);
+int hello_v1_greeter_bidi_hello_matches_incoming(const trevrpc_rpc_event_info_v1* info);
+/* On success, atomically transfers call, stream, and initial receive; outputs are unchanged on failure. Client-streaming and bidi initial receives may be empty and should be released without decoding. */
+int hello_v1_greeter_bidi_hello_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream, trevrpc_rpc_receive** out_initial);
+int hello_v1_greeter_bidi_hello_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id);
 
 #ifdef __cplusplus
 }

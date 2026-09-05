@@ -2,367 +2,176 @@
 
 #include "greeter.pb-c.h"
 #include "greeter.trevrpc.h"
-#include "trevrpc_msquic.h"
-#include "trevrpc_msquic_internal.h"
-#include "trevrpc_msquic_objects_internal.h"
-#include "trevrpc_runtime_internal.h"
-#include "trevrpc_raw.h"
-#include "trevrpc_webtransport.h"
-#include "trevrpc_wire_internal.h"
+#include "trevrpc_rpc_msquic.h"
 
-#include "trevrpc_frame_internal.h"
-
+#include <assert.h>
 #include <errno.h> // IWYU pragma: keep
-#include <pthread.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #ifndef TREVRPC_MSQUIC_TEST_CERT
-#define TREVRPC_MSQUIC_TEST_CERT ""
+#error "TREVRPC_MSQUIC_TEST_CERT must be defined"
 #endif
-
 #ifndef TREVRPC_MSQUIC_TEST_KEY
-#define TREVRPC_MSQUIC_TEST_KEY ""
+#error "TREVRPC_MSQUIC_TEST_KEY must be defined"
 #endif
-
 #ifndef TREVRPC_GENERATED_HEADER
-#define TREVRPC_GENERATED_HEADER "build/generated-service-test/greeter.trevrpc.h"
+#error "TREVRPC_GENERATED_HEADER must be defined"
 #endif
-
 #ifndef TREVRPC_GENERATED_SOURCE
-#define TREVRPC_GENERATED_SOURCE "build/generated-service-test/greeter.trevrpc.c"
+#error "TREVRPC_GENERATED_SOURCE must be defined"
 #endif
 
-typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
+#define MAX_PENDING_EVENTS 256u
 
-int trevrpc_test_server_new(const trevrpc_client_config_internal* config, trevrpc_server** out_server);
-void trevrpc_test_server_handle_stream(trevrpc_server* server, trevrpc_msquic_stream* stream);
-void trevrpc_test_server_handle_wt_stream(trevrpc_server* server, trevrpc_wt_stream* stream);
-trevrpc_wt_session* trevrpc_test_client_webtransport_session(trevrpc_raw_client* client);
-int trevrpc_test_server_webtransport_port(trevrpc_server* server, uint16_t* port);
-size_t trevrpc_test_server_stream_status_count(trevrpc_server* server);
-uint32_t trevrpc_test_server_last_stream_status(trevrpc_server* server);
+static uint32_t test_transport = TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE;
 
-#define CHECK_GOTO(condition)                                                                                          \
-    do {                                                                                                               \
-        if (!(condition)) {                                                                                            \
-            fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition);                              \
-            result = 1;                                                                                                \
-            goto cleanup;                                                                                              \
-        }                                                                                                              \
-    } while (0)
+typedef struct pending_event {
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_event_info_v1 info;
+} pending_event;
 
-typedef struct metric_counts {
-    int started;
-    int finished;
-    uint32_t status;
-} metric_counts;
+typedef struct harness {
+    trevrpc_rpc_runtime* runtime;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 listener;
+    trevrpc_rpc_endpoint_v1 client_endpoint;
+    pending_event pending[MAX_PENDING_EVENTS];
+    size_t pending_count;
+} harness;
 
-typedef struct wt_rpc_server_args {
-    trevrpc_wt_listener* listener;
-    trevrpc_server* server;
-    int result;
-} wt_rpc_server_args;
+typedef struct call_pair {
+    trevrpc_rpc_call_v1 client_call;
+    trevrpc_rpc_stream_v1 client_stream;
+    trevrpc_rpc_call_v1 server_call;
+    trevrpc_rpc_stream_v1 server_stream;
+} call_pair;
 
-typedef struct serve_args {
-    trevrpc_server* server;
-    int result;
-} serve_args;
+static bool handle_equal(uint64_t left_owner,
+    uint32_t left_slot,
+    uint32_t left_generation,
+    uint64_t right_owner,
+    uint32_t right_slot,
+    uint32_t right_generation) {
+    return left_owner == right_owner && left_slot == right_slot && left_generation == right_generation;
+}
 
-typedef struct wt_serve_fixture {
-    trevrpc_server* server;
-    trevrpc_raw_client* client;
-    pthread_t thread;
-    bool thread_started;
-    serve_args args;
-} wt_serve_fixture;
-
-typedef struct channel_serve_fixture {
-    trevrpc_server* server;
-    trevrpc_channel* channel;
-    pthread_t thread;
-    bool thread_started;
-    serve_args args;
-} channel_serve_fixture;
-
-typedef int (*wt_fixture_register_fn)(trevrpc_server* server, void* context);
-
-static int stop_and_release_server(trevrpc_server** server_slot) {
-    if (server_slot == NULL || *server_slot == NULL) {
-        return 0;
-    }
-
-    trevrpc_server* server = *server_slot;
-    int result = trevrpc_server_stop(server);
-    int err = trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
-    if (result == 0) {
-        result = err;
-    }
-    if (err == 0) {
-        err = trevrpc_server_release(server);
-        if (result == 0) {
-            result = err;
+static void collect_events(harness* state) {
+    for (;;) {
+        trevrpc_rpc_event* event = NULL;
+        pending_event* pending;
+        int result = trevrpc_rpc_runtime_next_event(state->runtime, &event);
+        if (result == -EAGAIN) {
+            return;
         }
-        if (err == 0) {
-            *server_slot = NULL;
-        }
+        assert(result == 0);
+        assert(state->pending_count < MAX_PENDING_EVENTS);
+        pending = &state->pending[state->pending_count++];
+        pending->event = event;
+        assert(trevrpc_rpc_event_info_v1_init(&pending->info, sizeof(pending->info)) == 0);
+        assert(trevrpc_rpc_event_get_info_v1(event, &pending->info) == 0);
     }
-    return result;
 }
 
-typedef struct shutdown_action_state {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    size_t counts[TREV_MSQUIC_TEST_STREAM_EVENT_COUNT];
-} shutdown_action_state;
-
-typedef struct binding_unary_state {
-    shutdown_action_state* shutdown_actions;
-    const uint8_t* expected_request;
-    size_t expected_request_len;
-    const uint8_t* response_body;
-    size_t response_body_len;
-    uint32_t response_status;
-    bool fail_terminal_send;
-    bool request_matched;
-    bool full_abort_before_return;
-    int called;
-    int respond_result;
-} binding_unary_state;
-
-static void record_started(void* user_data, const trevrpc_rpc_started_event* event) {
-    (void)event;
-    metric_counts* counts = user_data;
-    counts->started++;
-}
-
-static void record_finished(void* user_data, const trevrpc_rpc_finished_event* event) {
-    metric_counts* counts = user_data;
-    counts->finished++;
-    counts->status = event->status;
-}
-
-static int append_recv_bytes(trevrpc_msquic_stream* stream, const uint8_t* data, size_t data_len) {
-    if (data_len == 0) {
-        return 0;
-    }
-    trevrpc_msquic_chunk* chunk = malloc(sizeof(*chunk) + data_len);
-    if (chunk == NULL) {
-        return -ENOMEM;
-    }
-    chunk->next = NULL;
-    chunk->len = data_len;
-    chunk->offset = 0;
-    chunk->charge_bytes = sizeof(*chunk) + data_len;
-    chunk->charge_count = 1;
-    memcpy(chunk->data, data, data_len);
-    if (stream->recv_tail != NULL) {
-        stream->recv_tail->next = chunk;
-    } else {
-        stream->recv_head = chunk;
-    }
-    stream->recv_tail = chunk;
-    stream->recv_buffered += data_len;
-    return 0;
-}
-
-static void reset_raw_stream(trevrpc_msquic_stream* stream) {
-    trevrpc_msquic_chunk* chunk = stream->recv_head;
-    while (chunk != NULL) {
-        trevrpc_msquic_chunk* next = chunk->next;
-        free(chunk);
-        chunk = next;
-    }
-    trevrpc_msquic_frame* frame = stream->frame_head;
-    while (frame != NULL) {
-        trevrpc_msquic_frame* next = frame->next;
-        trevrpc_owned_bytes_reset(&frame->body);
-        free(frame);
-        frame = next;
-    }
-    trevrpc_frame_parser_reset(&stream->frame_parser);
-    trevrpc_owned_bytes_reset(&stream->pending_frame.body);
-    trevrpc_msquic_send* send = stream->send_pool;
-    while (send != NULL) {
-        trevrpc_msquic_send* next = send->next;
-        free(send);
-        send = next;
-    }
-    pthread_cond_destroy(&stream->cond);
-    pthread_mutex_destroy(&stream->mutex);
-}
-
-static int init_raw_stream(trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len) {
-    memset(stream, 0, sizeof(*stream));
-    atomic_init(&stream->receive_closing, false);
-    atomic_init(&stream->active_resume_pins, 0);
-    trevrpc_owned_bytes_init(&stream->pending_frame.body);
-    trevrpc_frame_parser_init(&stream->frame_parser, 0);
-    int err = pthread_mutex_init(&stream->mutex, NULL);
-    if (err != 0) {
-        return -err;
-    }
-    err = pthread_cond_init(&stream->cond, NULL);
-    if (err != 0) {
-        pthread_mutex_destroy(&stream->mutex);
-        return -err;
-    }
-    err = append_recv_bytes(stream, body, body_len);
-    if (err != 0) {
-        reset_raw_stream(stream);
-    }
-    return err;
-}
-
-static int test_unbudgeted_raw_receive_injection(void) {
-    int result = 1;
-    trevrpc_msquic_stream stream = {0};
-    bool initialized = false;
-    const uint8_t first[] = {'r', 'a', 'w'};
-    const uint8_t second[] = {'-', 'r', 'x'};
-    const uint8_t* buffers[] = {first, second};
-    const size_t lengths[] = {sizeof(first), sizeof(second)};
-    uint8_t received[sizeof(first) + sizeof(second)] = {0};
-    size_t accepted = 0;
-
-    CHECK_GOTO(init_raw_stream(&stream, first, 0) == 0);
-    initialized = true;
-    stream.recv_mode = TREV_MSQUIC_RECV_BYTES;
-    CHECK_GOTO(trevrpc_msquic_test_receive_inject(
-                   &stream, buffers, lengths, sizeof(buffers) / sizeof(buffers[0]), false, &accepted) == 0);
-    CHECK_GOTO(accepted == sizeof(received));
-    CHECK_GOTO(trevrpc_msquic_stream_read(&stream, received, sizeof(received)) == (intptr_t)sizeof(received));
-    CHECK_GOTO(memcmp(received, "raw-rx", sizeof(received)) == 0);
-    result = 0;
-
-cleanup:
-    if (initialized) {
-        reset_raw_stream(&stream);
-    }
-    return result;
-}
-
-static int say_hello(void* user_data,
-    const trevrpc_call_context* context,
-    const Hello__V1__HelloRequest* request,
-    hello_v1_greeter_say_hello_respond_fn respond,
-    void* respond_context) {
-    (void)user_data;
-    (void)context;
-    if (request == NULL || respond == NULL) {
-        return -EINVAL;
-    }
-    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
-    reply.message = request->name == NULL ? "hello" : request->name;
-    hello_v1_greeter_say_hello_response_view response = {
-        .message = &reply,
-        .status = TREVRPC_STATUS_OK,
+static void wait_for_events(harness* state) {
+    struct pollfd descriptor = {
+        .fd = (int)state->wake.native_handle,
+        .events = POLLIN,
+        .revents = 0,
     };
-    return respond(respond_context, &response);
-}
-
-static int lots_of_replies(void* user_data,
-    const trevrpc_call_context* context,
-    const Hello__V1__HelloRequest* request,
-    trevrpc_stream* stream) {
-    (void)user_data;
-    (void)context;
-    if (request == NULL) {
-        return -EINVAL;
+    int result = poll(&descriptor, 1, 1000);
+    assert(result >= 0);
+    if (result != 0) {
+        collect_events(state);
     }
-    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
-    reply.message = "reply";
-    return hello_v1_greeter_send_hello_v1_hello_reply(stream, &reply);
 }
 
-static int lots_of_greetings(void* user_data,
-    const trevrpc_call_context* context,
-    trevrpc_stream* stream,
-    hello_v1_greeter_lots_of_greetings_respond_fn respond,
-    void* respond_context) {
-    (void)user_data;
-    (void)context;
-    hello_v1_greeter_hello_request_request_receiver receiver = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_RECEIVER_INIT;
-    hello_v1_greeter_hello_request_request_event event = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_INIT;
-    int err = hello_v1_greeter_hello_request_request_receiver_init(&receiver, stream);
-    while (err == 0) {
-        err = hello_v1_greeter_recv_hello_v1_hello_request_request(&receiver, &event);
-        if (err != 0) {
-            break;
+static trevrpc_rpc_event* take_pending(harness* state, size_t index, trevrpc_rpc_event_info_v1* out_info) {
+    trevrpc_rpc_event* event = state->pending[index].event;
+    *out_info = state->pending[index].info;
+    --state->pending_count;
+    if (index != state->pending_count) {
+        state->pending[index] = state->pending[state->pending_count];
+    }
+    return event;
+}
+
+static trevrpc_rpc_event* wait_kind_operation(
+    harness* state, uint32_t kind, uint64_t operation_id, trevrpc_rpc_event_info_v1* out_info) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        collect_events(state);
+        for (size_t index = 0; index < state->pending_count; ++index) {
+            if (state->pending[index].info.kind == kind && state->pending[index].info.operation_id == operation_id) {
+                return take_pending(state, index, out_info);
+            }
         }
-        if (event.kind == HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_MESSAGE) {
-            hello_v1_greeter_hello_request_request_event_reset(&event);
-            continue;
-        }
-        if (event.kind == HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_END) {
-            hello_v1_greeter_hello_request_request_event_reset(&event);
-            break;
-        }
-        err = event.error != 0 ? event.error : TREVRPC_ERR_INVALID_FRAME;
-        hello_v1_greeter_hello_request_request_event_reset(&event);
-        break;
+        wait_for_events(state);
     }
-    if (err != 0) {
-        return err;
-    }
-    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
-    reply.message = "client stream";
-    hello_v1_greeter_lots_of_greetings_response_view response = {
-        .message = &reply,
-        .status = TREVRPC_STATUS_OK,
-    };
-    return respond(respond_context, &response);
-}
-
-static int bidi_hello(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream) {
-    (void)user_data;
-    (void)context;
-    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
-    reply.message = "bidi";
-    return hello_v1_greeter_send_hello_v1_hello_reply(stream, &reply);
-}
-
-static void* wt_unary_server_thread(void* arg) {
-    wt_rpc_server_args* args = arg;
-    trevrpc_wt_session* session = NULL;
-    trevrpc_wt_stream* stream = NULL;
-    args->result = trevrpc_wt_listener_accept_session(args->listener, &session);
-    if (args->result == 0) {
-        args->result = trevrpc_wt_session_accept_stream(session, &stream);
-    }
-    if (args->result == 0) {
-        trevrpc_test_server_handle_wt_stream(args->server, stream);
-    }
-    trevrpc_wt_stream_close(stream);
-    trevrpc_wt_session_close(session);
+    assert(false);
     return NULL;
 }
 
-static void* serve_thread(void* arg) {
-    serve_args* args = arg;
-    args->result = trevrpc_server_serve(args->server);
+static trevrpc_rpc_event* wait_kind_stream(harness* state,
+    uint32_t kind,
+    trevrpc_rpc_stream_v1 stream,
+    uint64_t operation_id,
+    trevrpc_rpc_event_info_v1* out_info) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        collect_events(state);
+        for (size_t index = 0; index < state->pending_count; ++index) {
+            const trevrpc_rpc_event_info_v1* info = &state->pending[index].info;
+            if (info->kind == kind && info->operation_id == operation_id &&
+                handle_equal(info->stream.owner,
+                    info->stream.slot,
+                    info->stream.generation,
+                    stream.owner,
+                    stream.slot,
+                    stream.generation)) {
+                return take_pending(state, index, out_info);
+            }
+        }
+        wait_for_events(state);
+    }
+    assert(false);
     return NULL;
 }
 
-static const hello_v1_greeter_server GreeterImplementation = {
-    .user_data = NULL,
-    .say_hello = say_hello,
-    .lots_of_replies = lots_of_replies,
-    .lots_of_greetings = lots_of_greetings,
-    .bidi_hello = bidi_hello,
-};
+static trevrpc_rpc_event* wait_kind_call(harness* state,
+    uint32_t kind,
+    trevrpc_rpc_call_v1 call,
+    uint64_t operation_id,
+    trevrpc_rpc_event_info_v1* out_info) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        collect_events(state);
+        for (size_t index = 0; index < state->pending_count; ++index) {
+            const trevrpc_rpc_event_info_v1* info = &state->pending[index].info;
+            if (info->kind == kind && info->operation_id == operation_id &&
+                handle_equal(
+                    info->call.owner, info->call.slot, info->call.generation, call.owner, call.slot, call.generation)) {
+                return take_pending(state, index, out_info);
+            }
+        }
+        wait_for_events(state);
+    }
+    assert(false);
+    return NULL;
+}
+
+static void release_waited(trevrpc_rpc_event* event) {
+    assert(event != NULL);
+    trevrpc_rpc_event_release(event);
+}
 
 static bool text_file_contains(const char* path, const char* needle) {
     FILE* file = fopen(path, "rb");
+    char line[4096];
+    bool found = false;
     if (file == NULL) {
         return false;
     }
-    char line[4096];
-    bool found = false;
     while (fgets(line, sizeof(line), file) != NULL) {
         if (strstr(line, needle) != NULL) {
             found = true;
@@ -373,1311 +182,587 @@ static bool text_file_contains(const char* path, const char* needle) {
     return found;
 }
 
-static int test_generator_channel_output(void) {
-    int result = 1;
-    const char* header_names[] = {
-        "hello_v1_greeter_say_hello(",
-        "hello_v1_greeter_say_hello_with_options(",
-        "hello_v1_greeter_lots_of_replies(",
-        "hello_v1_greeter_lots_of_replies_with_options(",
-        "hello_v1_greeter_lots_of_greetings_start(",
-        "hello_v1_greeter_lots_of_greetings_start_with_options(",
-        "hello_v1_greeter_bidi_hello_start(",
-        "hello_v1_greeter_bidi_hello_start_with_options(",
-    };
-    for (size_t i = 0; i < sizeof(header_names) / sizeof(header_names[0]); i++) {
-        CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_HEADER, header_names[i]));
-    }
-    CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_channel_call_request_inbound_v1("));
-    CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_channel_start_stream_request_v1("));
-    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_HEADER, "_managed"));
-    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_SOURCE, "_managed"));
-    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_HEADER, "trevrpc_client"));
-    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_client"));
-    CHECK_GOTO(!text_file_contains(TREVRPC_GENERATED_HEADER, "trevrpc_raw_client"));
-    CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "hello_v1_greeter_say_hello_respond("));
-    CHECK_GOTO(text_file_contains(TREVRPC_GENERATED_SOURCE, "hello_v1_greeter_lots_of_replies_callback("));
-
-    result = 0;
-
-cleanup:
-    return result;
+static void test_generated_surface(void) {
+    assert(text_file_contains(TREVRPC_GENERATED_HEADER, "#include \"trevrpc_rpc.h\""));
+    assert(text_file_contains(TREVRPC_GENERATED_HEADER, "TREVRPC_RPC_ABI_VERSION != 1u"));
+    assert(text_file_contains(TREVRPC_GENERATED_HEADER, "_decode_request_receive("));
+    assert(text_file_contains(TREVRPC_GENERATED_HEADER, "_decode_response_receive("));
+    assert(text_file_contains(TREVRPC_GENERATED_HEADER, "_take_incoming("));
+    assert(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_rpc_call_open_v1("));
+    assert(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_rpc_event_take_incoming_call("));
+    assert(!text_file_contains(TREVRPC_GENERATED_HEADER, "TREVRPC_C_ABI_VERSION"));
+    assert(!text_file_contains(TREVRPC_GENERATED_HEADER, "trevrpc_channel"));
+    assert(!text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_server_register"));
 }
 
-static int test_generated_helper_signatures(void) {
-    int (*unary)(trevrpc_channel*, const Hello__V1__HelloRequest*, hello_v1_greeter_say_hello_result*) =
-        hello_v1_greeter_say_hello;
-    int (*unary_options)(trevrpc_channel*,
+static void test_unresolved_stream_budget_validation(void) {
+    trevrpc_rpc_msquic_endpoint_config_v1 config;
+    trevrpc_rpc_endpoint_v1 endpoint = {0};
+    assert(trevrpc_rpc_msquic_endpoint_config_v1_init(&config, sizeof(config)) == 0);
+    assert(config.webtransport_profiles == TREVRPC_RPC_MSQUIC_PROFILE_ALL_SUPPORTED);
+    assert(TREVRPC_RPC_MSQUIC_PROFILE_ALL_SUPPORTED == 0x0000000fu);
+    config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_CLIENT;
+    config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT;
+    config.unresolved_stream_bytes = 1;
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(NULL, &config, 1, &endpoint) == -EINVAL);
+    config.unresolved_stream_bytes = 0;
+    config.webtransport_profiles = 0x00000010u;
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(NULL, &config, 1, &endpoint) == -EINVAL);
+}
+
+static void test_generated_signatures(void) {
+    int (*unary_open)(trevrpc_rpc_runtime*,
+        trevrpc_rpc_endpoint_v1,
         const Hello__V1__HelloRequest*,
-        const trevrpc_call_options_v1*,
-        hello_v1_greeter_say_hello_result*) = hello_v1_greeter_say_hello_with_options;
-    int (*server_stream)(trevrpc_channel*, const Hello__V1__HelloRequest*, trevrpc_stream**) =
-        hello_v1_greeter_lots_of_replies;
-    int (*server_stream_options)(
-        trevrpc_channel*, const Hello__V1__HelloRequest*, const trevrpc_call_options_v1*, trevrpc_stream**) =
-        hello_v1_greeter_lots_of_replies_with_options;
-    int (*client_stream)(trevrpc_channel*, trevrpc_stream**) = hello_v1_greeter_lots_of_greetings_start;
-    int (*client_stream_options)(trevrpc_channel*, const trevrpc_call_options_v1*, trevrpc_stream**) =
-        hello_v1_greeter_lots_of_greetings_start_with_options;
-    int (*bidi_stream)(trevrpc_channel*, trevrpc_stream**) = hello_v1_greeter_bidi_hello_start;
-    int (*bidi_stream_options)(trevrpc_channel*, const trevrpc_call_options_v1*, trevrpc_stream**) =
-        hello_v1_greeter_bidi_hello_start_with_options;
-
-    return unary == NULL || unary_options == NULL || server_stream == NULL || server_stream_options == NULL ||
-           client_stream == NULL || client_stream_options == NULL || bidi_stream == NULL ||
-           bidi_stream_options == NULL || TREVRPC_C_ABI_VERSION != 6u;
+        uint64_t,
+        trevrpc_rpc_call_v1*,
+        trevrpc_rpc_stream_v1*) = hello_v1_greeter_say_hello_open;
+    int (*client_send)(trevrpc_rpc_runtime*, trevrpc_rpc_stream_v1, const Hello__V1__HelloRequest*, uint64_t) =
+        hello_v1_greeter_lots_of_greetings_send;
+    int (*server_finish)(trevrpc_rpc_runtime*, trevrpc_rpc_call_v1, uint64_t, const trevrpc_rpc_status_v1*) =
+        hello_v1_greeter_lots_of_replies_finish;
+    int (*take_incoming)(trevrpc_rpc_event*, trevrpc_rpc_call_v1*, trevrpc_rpc_stream_v1*, trevrpc_rpc_receive**) =
+        hello_v1_greeter_bidi_hello_take_incoming;
+    assert(unary_open != NULL);
+    assert(client_send != NULL);
+    assert(server_finish != NULL);
+    assert(take_incoming != NULL);
 }
 
-static void record_shutdown_action(trevrpc_msquic_test_stream_event event, void* context) {
-    shutdown_action_state* state = context;
-    if (event >= TREV_MSQUIC_TEST_STREAM_EVENT_COUNT) {
-        return;
+static void setup_harness(harness* state) {
+    trevrpc_rpc_runtime_config_v1 runtime_config;
+    trevrpc_rpc_msquic_config_v1 provider_config;
+    trevrpc_rpc_msquic_endpoint_config_v1 listener_config;
+    trevrpc_rpc_msquic_endpoint_config_v1 client_config;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_event* event;
+    uint16_t port = 0;
+
+    memset(state, 0, sizeof(*state));
+    assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+    assert(trevrpc_rpc_msquic_config_v1_init(&provider_config, sizeof(provider_config)) == 0);
+    assert(trevrpc_rpc_msquic_create_v1(&runtime_config, &provider_config, &state->runtime) == 0);
+    assert(trevrpc_rpc_wake_source_v1_init(&state->wake, sizeof(state->wake)) == 0);
+    assert(trevrpc_rpc_runtime_get_wake_source_v1(state->runtime, &state->wake) == 0);
+
+    assert(trevrpc_rpc_msquic_endpoint_config_v1_init(&listener_config, sizeof(listener_config)) == 0);
+    listener_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER;
+    listener_config.transport = test_transport;
+    listener_config.host = "127.0.0.1";
+    listener_config.host_len = (uint32_t)strlen(listener_config.host);
+    listener_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
+    listener_config.cert_file_len = (uint32_t)strlen(listener_config.cert_file);
+    listener_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
+    listener_config.key_file_len = (uint32_t)strlen(listener_config.key_file);
+    if (test_transport == TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT)
+        listener_config.unresolved_stream_bytes = 128;
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &listener_config, 1, &state->listener) == 0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_ENDPOINT_READY, 1, &info);
+    release_waited(event);
+    assert(trevrpc_rpc_endpoint_get_port_v1(state->runtime, state->listener, &port) == 0);
+    assert(port != 0);
+
+    assert(trevrpc_rpc_msquic_endpoint_config_v1_init(&client_config, sizeof(client_config)) == 0);
+    client_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_CLIENT;
+    client_config.transport = test_transport;
+    client_config.host = "127.0.0.1";
+    client_config.host_len = (uint32_t)strlen(client_config.host);
+    client_config.port = port;
+    client_config.flags &= ~TREVRPC_RPC_MSQUIC_VERIFY_PEER;
+    if (test_transport == TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT)
+        client_config.unresolved_stream_bytes = 128;
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &client_config, 2, &state->client_endpoint) == 0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_ENDPOINT_READY, 2, &info);
+    release_waited(event);
+}
+
+static trevrpc_rpc_event* wait_incoming(harness* state, trevrpc_rpc_event_info_v1* out_info) {
+    return wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_INCOMING, 0, out_info);
+}
+
+static void verify_request_receive(trevrpc_rpc_receive* receive, const char* expected);
+
+static void verify_initial_request(trevrpc_rpc_receive* receive, const char* expected_name) {
+    Hello__V1__HelloRequest* decoded = (Hello__V1__HelloRequest*)(uintptr_t)1;
+    trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(0);
+    assert(hello_v1_greeter_say_hello_decode_request_receive(receive, &decoded) == -ENOMEM);
+    assert(decoded == (Hello__V1__HelloRequest*)(uintptr_t)1);
+    trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(SIZE_MAX);
+    decoded = NULL;
+    assert(hello_v1_greeter_say_hello_decode_request_receive(receive, &decoded) == 0);
+    assert(decoded != NULL);
+    assert(decoded->name != NULL);
+    assert(strcmp(decoded->name, expected_name) == 0);
+    hello__v1__hello_request__free_unpacked(decoded, NULL);
+}
+
+static call_pair open_unary(harness* state, uint64_t operation_id, const char* name) {
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_receive* initial = NULL;
+    trevrpc_rpc_event* event;
+    call_pair pair = {0};
+    request.name = (char*)name;
+
+    assert(
+        hello_v1_greeter_say_hello_open(
+            state->runtime, state->client_endpoint, &request, operation_id, &pair.client_call, &pair.client_stream) ==
+        0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_READY, operation_id, &info);
+    release_waited(event);
+
+    event = wait_incoming(state, &info);
+    assert(hello_v1_greeter_say_hello_matches_incoming(&info) == 1);
+    trevrpc_rpc_call_v1 unchanged_call = {11, 12, 13};
+    trevrpc_rpc_stream_v1 unchanged_stream = {21, 22, 23};
+    trevrpc_rpc_receive* unchanged_receive = (trevrpc_rpc_receive*)(uintptr_t)1;
+    assert(hello_v1_greeter_lots_of_replies_take_incoming(
+               event, &unchanged_call, &unchanged_stream, &unchanged_receive) == -EPROTO);
+    assert(unchanged_call.owner == 11 && unchanged_call.slot == 12 && unchanged_call.generation == 13);
+    assert(unchanged_stream.owner == 21 && unchanged_stream.slot == 22 && unchanged_stream.generation == 23);
+    assert(unchanged_receive == (trevrpc_rpc_receive*)(uintptr_t)1);
+    assert(hello_v1_greeter_say_hello_take_incoming(event, &pair.server_call, &pair.server_stream, &initial) == 0);
+    verify_initial_request(initial, name);
+    trevrpc_rpc_receive_release(initial);
+    release_waited(event);
+    assert(hello_v1_greeter_say_hello_accept(state->runtime, pair.server_call, operation_id + 1) == 0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_ACCEPTED, operation_id + 1, &info);
+    release_waited(event);
+    event = wait_kind_stream(state, TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN, pair.server_stream, 0, &info);
+    release_waited(event);
+    return pair;
+}
+
+static call_pair open_server_streaming(harness* state, uint64_t operation_id, const char* name) {
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    Hello__V1__HelloRequest* decoded = NULL;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_receive* initial = NULL;
+    trevrpc_rpc_event* event;
+    call_pair pair = {0};
+    request.name = (char*)name;
+
+    assert(
+        hello_v1_greeter_lots_of_replies_open(
+            state->runtime, state->client_endpoint, &request, operation_id, &pair.client_call, &pair.client_stream) ==
+        0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_READY, operation_id, &info);
+    release_waited(event);
+    event = wait_incoming(state, &info);
+    assert(hello_v1_greeter_lots_of_replies_matches_incoming(&info) == 1);
+    assert(
+        hello_v1_greeter_lots_of_replies_take_incoming(event, &pair.server_call, &pair.server_stream, &initial) == 0);
+    assert(hello_v1_greeter_lots_of_replies_decode_request_receive(initial, &decoded) == 0);
+    assert(decoded != NULL && decoded->name != NULL && strcmp(decoded->name, name) == 0);
+    hello__v1__hello_request__free_unpacked(decoded, NULL);
+    trevrpc_rpc_receive_release(initial);
+    release_waited(event);
+    assert(hello_v1_greeter_lots_of_replies_accept(state->runtime, pair.server_call, operation_id + 1) == 0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_ACCEPTED, operation_id + 1, &info);
+    release_waited(event);
+    event = wait_kind_stream(state, TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN, pair.server_stream, 0, &info);
+    release_waited(event);
+    return pair;
+}
+
+static call_pair open_client_streaming(harness* state, uint64_t operation_id) {
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_receive_info_v1 receive_info;
+    trevrpc_rpc_receive* initial = NULL;
+    trevrpc_rpc_event* event;
+    call_pair pair = {0};
+    request.name = "client-initial";
+
+    assert(
+        hello_v1_greeter_lots_of_greetings_open(
+            state->runtime, state->client_endpoint, &request, operation_id, &pair.client_call, &pair.client_stream) ==
+        0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_READY, operation_id, &info);
+    release_waited(event);
+    event = wait_incoming(state, &info);
+    assert(
+        hello_v1_greeter_lots_of_greetings_take_incoming(event, &pair.server_call, &pair.server_stream, &initial) == 0);
+    assert(trevrpc_rpc_receive_info_v1_init(&receive_info, sizeof(receive_info)) == 0);
+    assert(trevrpc_rpc_receive_get_info_v1(initial, &receive_info) == 0);
+    assert(receive_info.kind == TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE);
+    assert(receive_info.data_len > 0);
+    verify_request_receive(initial, request.name);
+    trevrpc_rpc_receive_release(initial);
+    release_waited(event);
+    assert(hello_v1_greeter_lots_of_greetings_accept(state->runtime, pair.server_call, operation_id + 1) == 0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_ACCEPTED, operation_id + 1, &info);
+    release_waited(event);
+    return pair;
+}
+
+static call_pair open_bidi(harness* state, uint64_t operation_id) {
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_receive_info_v1 receive_info;
+    trevrpc_rpc_receive* initial = NULL;
+    trevrpc_rpc_event* event;
+    call_pair pair = {0};
+    request.name = "bidi-initial";
+
+    assert(
+        hello_v1_greeter_bidi_hello_open(
+            state->runtime, state->client_endpoint, &request, operation_id, &pair.client_call, &pair.client_stream) ==
+        0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_READY, operation_id, &info);
+    release_waited(event);
+    event = wait_incoming(state, &info);
+    assert(hello_v1_greeter_bidi_hello_take_incoming(event, &pair.server_call, &pair.server_stream, &initial) == 0);
+    assert(trevrpc_rpc_receive_info_v1_init(&receive_info, sizeof(receive_info)) == 0);
+    assert(trevrpc_rpc_receive_get_info_v1(initial, &receive_info) == 0);
+    assert(receive_info.kind == TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE);
+    assert(receive_info.data_len > 0);
+    verify_request_receive(initial, request.name);
+    trevrpc_rpc_receive_release(initial);
+    release_waited(event);
+    assert(hello_v1_greeter_bidi_hello_accept(state->runtime, pair.server_call, operation_id + 1) == 0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_ACCEPTED, operation_id + 1, &info);
+    release_waited(event);
+    return pair;
+}
+
+#define MAX_READABLE_RECEIVES 4u
+
+static size_t receive_generation(harness* state, trevrpc_rpc_stream_v1 stream, trevrpc_rpc_receive** receives) {
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_event* event = wait_kind_stream(state, TREVRPC_RPC_EVENT_STREAM_READABLE, stream, 0, &info);
+    size_t count = 0;
+    release_waited(event);
+    for (;;) {
+        int result;
+        assert(count < MAX_READABLE_RECEIVES);
+        result = trevrpc_rpc_stream_receive(state->runtime, stream, &receives[count]);
+        if (result == -EAGAIN) {
+            return count;
+        }
+        assert(result == 0);
+        ++count;
     }
-    pthread_mutex_lock(&state->mutex);
-    state->counts[event]++;
-    pthread_cond_broadcast(&state->cond);
-    pthread_mutex_unlock(&state->mutex);
 }
 
-static size_t shutdown_action_count(shutdown_action_state* state, trevrpc_msquic_test_stream_event event) {
-    pthread_mutex_lock(&state->mutex);
-    size_t count = state->counts[event];
-    pthread_mutex_unlock(&state->mutex);
-    return count;
+static trevrpc_rpc_receive* receive_next(harness* state, trevrpc_rpc_stream_v1 stream) {
+    trevrpc_rpc_receive* receives[MAX_READABLE_RECEIVES];
+    size_t count;
+    do {
+        count = receive_generation(state, stream, receives);
+    } while (count == 0);
+    assert(count == 1);
+    return receives[0];
 }
 
-static bool wait_for_shutdown_action(
-    shutdown_action_state* state, trevrpc_msquic_test_stream_event event, size_t minimum_count) {
-    struct timespec deadline = {0};
-    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
-        return false;
+static void wait_send(harness* state, trevrpc_rpc_stream_v1 stream, uint64_t operation_id) {
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_event* event = wait_kind_stream(state, TREVRPC_RPC_EVENT_SEND_COMPLETE, stream, operation_id, &info);
+    release_waited(event);
+}
+
+static void wait_fin(harness* state, trevrpc_rpc_stream_v1 stream) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        trevrpc_rpc_event_info_v1 info;
+        trevrpc_rpc_event* event = NULL;
+        collect_events(state);
+        for (size_t index = 0; index < state->pending_count; ++index) {
+            const trevrpc_rpc_event_info_v1* pending = &state->pending[index].info;
+            if (pending->kind == TREVRPC_RPC_EVENT_STREAM_READABLE && handle_equal(pending->stream.owner,
+                                                                          pending->stream.slot,
+                                                                          pending->stream.generation,
+                                                                          stream.owner,
+                                                                          stream.slot,
+                                                                          stream.generation)) {
+                trevrpc_rpc_receive* receive = NULL;
+                event = take_pending(state, index, &info);
+                release_waited(event);
+                assert(trevrpc_rpc_stream_receive(state->runtime, stream, &receive) == -EAGAIN);
+                assert(receive == NULL);
+                break;
+            }
+        }
+        if (event != NULL) {
+            continue;
+        }
+        for (size_t index = 0; index < state->pending_count; ++index) {
+            const trevrpc_rpc_event_info_v1* pending = &state->pending[index].info;
+            if (pending->kind == TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN && handle_equal(pending->stream.owner,
+                                                                             pending->stream.slot,
+                                                                             pending->stream.generation,
+                                                                             stream.owner,
+                                                                             stream.slot,
+                                                                             stream.generation)) {
+                event = take_pending(state, index, &info);
+                release_waited(event);
+                return;
+            }
+        }
+        wait_for_events(state);
     }
-    deadline.tv_sec += 5;
+    assert(false);
+}
 
-    pthread_mutex_lock(&state->mutex);
-    while (state->counts[event] < minimum_count) {
-        int err = pthread_cond_timedwait(&state->cond, &state->mutex, &deadline);
-        if (err == ETIMEDOUT) {
-            pthread_mutex_unlock(&state->mutex);
-            return false;
+static void verify_request_receive(trevrpc_rpc_receive* receive, const char* expected) {
+    Hello__V1__HelloRequest* decoded = NULL;
+    assert(hello_v1_greeter_lots_of_greetings_decode_request_receive(receive, &decoded) == 0);
+    assert(decoded != NULL && decoded->name != NULL && strcmp(decoded->name, expected) == 0);
+    hello__v1__hello_request__free_unpacked(decoded, NULL);
+}
+
+static void verify_response_receive(trevrpc_rpc_receive* receive, const char* expected) {
+    Hello__V1__HelloReply* decoded = NULL;
+    assert(hello_v1_greeter_bidi_hello_decode_response_receive(receive, &decoded) == 0);
+    assert(decoded != NULL && decoded->message != NULL && strcmp(decoded->message, expected) == 0);
+    hello__v1__hello_reply__free_unpacked(decoded, NULL);
+}
+
+static void verify_status_receive(trevrpc_rpc_receive* receive, uint32_t expected_status) {
+    trevrpc_rpc_receive_info_v1 info;
+    assert(trevrpc_rpc_receive_info_v1_init(&info, sizeof(info)) == 0);
+    assert(trevrpc_rpc_receive_get_info_v1(receive, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_RECEIVE_STATUS);
+    assert(info.rpc_status == expected_status);
+}
+
+static void receive_response_and_status(harness* state, trevrpc_rpc_stream_v1 stream, const char* expected) {
+    bool received_message = false;
+    bool received_status = false;
+    while (!received_status) {
+        trevrpc_rpc_receive* receives[MAX_READABLE_RECEIVES];
+        size_t count = receive_generation(state, stream, receives);
+        for (size_t index = 0; index < count; ++index) {
+            trevrpc_rpc_receive_info_v1 info;
+            assert(trevrpc_rpc_receive_info_v1_init(&info, sizeof(info)) == 0);
+            assert(trevrpc_rpc_receive_get_info_v1(receives[index], &info) == 0);
+            if (info.kind == TREVRPC_RPC_RECEIVE_MESSAGE) {
+                verify_response_receive(receives[index], expected);
+                received_message = true;
+            } else {
+                verify_status_receive(receives[index], TREVRPC_RPC_STATUS_OK);
+                received_status = true;
+            }
+            trevrpc_rpc_receive_release(receives[index]);
         }
     }
-    pthread_mutex_unlock(&state->mutex);
-    return true;
+    assert(received_message);
 }
 
-static int binding_unary_handler(void* user_data, trevrpc_call* call) {
-    binding_unary_state* state = user_data;
-    const trevrpc_request* request = trevrpc_call_request(call);
-    bool request_matched =
-        request != NULL && request->body_len == state->expected_request_len &&
-        (request->body_len == 0 || memcmp(request->body, state->expected_request, request->body_len) == 0);
-
-    pthread_mutex_lock(&state->shutdown_actions->mutex);
-    state->called++;
-    state->request_matched = request_matched;
-    pthread_mutex_unlock(&state->shutdown_actions->mutex);
-
-    trevrpc_response_view_v1 response;
-    int err = trevrpc_response_view_v1_init(&response, sizeof(response));
-    if (err == 0) {
-        response.status = state->response_status;
-        response.body = state->response_body;
-        response.body_len = state->response_body_len;
-        trevrpc_msquic_test_set_stream_hook(record_shutdown_action, state->shutdown_actions);
-        if (state->fail_terminal_send) {
-            trevrpc_msquic_test_fail_next_stream_send();
-        }
-        err = trevrpc_call_respond_borrowed_v1(call, &response);
+static void close_pair(harness* state, call_pair pair, uint64_t operation_id) {
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_event* event;
+    int result = trevrpc_rpc_call_close(state->runtime, pair.client_call, operation_id, TREVRPC_RPC_CLOSE_FLAG_NONE, 0);
+    uint64_t completion_id = operation_id;
+    if (result == -EALREADY || result == -ESTALE) {
+        completion_id = 0;
+    } else {
+        assert(result == 0);
     }
-
-    pthread_mutex_lock(&state->shutdown_actions->mutex);
-    state->respond_result = err;
-    state->full_abort_before_return = state->shutdown_actions->counts[TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT] > 0;
-    pthread_mutex_unlock(&state->shutdown_actions->mutex);
-    return err;
+    event = wait_kind_stream(state, TREVRPC_RPC_EVENT_STREAM_CLOSED, pair.client_stream, 0, &info);
+    release_waited(event);
+    event = wait_kind_call(state, TREVRPC_RPC_EVENT_CALL_CLOSED, pair.client_call, completion_id, &info);
+    release_waited(event);
+    event = wait_kind_stream(state, TREVRPC_RPC_EVENT_STREAM_CLOSED, pair.server_stream, 0, &info);
+    release_waited(event);
+    event = wait_kind_call(state, TREVRPC_RPC_EVENT_CALL_CLOSED, pair.server_call, 0, &info);
+    release_waited(event);
+    assert(trevrpc_rpc_stream_release(state->runtime, pair.client_stream) == 0);
+    assert(trevrpc_rpc_call_release(state->runtime, pair.client_call) == 0);
+    assert(trevrpc_rpc_stream_release(state->runtime, pair.server_stream) == 0);
+    assert(trevrpc_rpc_call_release(state->runtime, pair.server_call) == 0);
 }
 
-static int register_generated_wt_routes(trevrpc_server* server, void* context) {
-    (void)context;
-    return hello_v1_greeter_register(server, &GreeterImplementation);
+static void test_unary(harness* state) {
+    call_pair pair = open_unary(state, 100, "unary-request");
+    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
+    Hello__V1__HelloReply* decoded = NULL;
+    trevrpc_rpc_status_v1 status;
+    trevrpc_rpc_receive* receive;
+    reply.message = "unary-response";
+    assert(trevrpc_rpc_status_v1_init(&status, sizeof(status)) == 0);
+    assert(hello_v1_greeter_say_hello_respond(state->runtime, pair.server_call, &reply, &status, 102) == 0);
+    wait_send(state, pair.server_stream, 102);
+    receive = receive_next(state, pair.client_stream);
+    assert(hello_v1_greeter_say_hello_decode_response_receive(receive, &decoded) == 0);
+    assert(decoded != NULL && decoded->message != NULL && strcmp(decoded->message, reply.message) == 0);
+    hello__v1__hello_reply__free_unpacked(decoded, NULL);
+    trevrpc_rpc_receive_release(receive);
+    wait_fin(state, pair.client_stream);
+    close_pair(state, pair, 103);
 }
 
-static int register_binding_unary_route(trevrpc_server* server, void* context) {
-    return trevrpc_server_register_call(
-        server, "binding.v1.Lifecycle", "Unary", TREVRPC_RPC_KIND_UNARY, binding_unary_handler, context);
+static void test_unary_empty_message(harness* state) {
+    call_pair pair = open_unary(state, 150, "empty-response-request");
+    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
+    Hello__V1__HelloReply* decoded = NULL;
+    trevrpc_rpc_status_v1 status;
+    trevrpc_rpc_receive* receive;
+    assert(trevrpc_rpc_status_v1_init(&status, sizeof(status)) == 0);
+    assert(hello_v1_greeter_say_hello_respond(state->runtime, pair.server_call, &reply, &status, 152) == 0);
+    wait_send(state, pair.server_stream, 152);
+    receive = receive_next(state, pair.client_stream);
+    assert(hello_v1_greeter_say_hello_decode_response_receive(receive, &decoded) == 0);
+    assert(decoded != NULL);
+    assert(decoded->message == NULL || decoded->message[0] == '\0');
+    hello__v1__hello_reply__free_unpacked(decoded, NULL);
+    trevrpc_rpc_receive_release(receive);
+    wait_fin(state, pair.client_stream);
+    close_pair(state, pair, 153);
 }
 
-static int open_binding_unary_request(
-    wt_serve_fixture* fixture, const uint8_t* request_body, size_t request_body_len, trevrpc_wt_stream** out_stream) {
-    if (fixture == NULL || out_stream == NULL) {
-        return -EINVAL;
-    }
-    *out_stream = NULL;
+static void test_server_streaming(harness* state) {
+    call_pair pair = open_server_streaming(state, 200, "server-stream-request");
+    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_status_v1 status;
+    trevrpc_rpc_receive* receive;
+    trevrpc_rpc_event* event;
+    assert(trevrpc_rpc_status_v1_init(&status, sizeof(status)) == 0);
 
-    trevrpc_wt_session* session = trevrpc_test_client_webtransport_session(fixture->client);
-    if (session == NULL) {
-        return -EINVAL;
-    }
+    reply.message = "server-one";
+    assert(hello_v1_greeter_lots_of_replies_send(state->runtime, pair.server_stream, &reply, 202) == 0);
+    wait_send(state, pair.server_stream, 202);
+    receive = receive_next(state, pair.client_stream);
+    verify_response_receive(receive, reply.message);
+    trevrpc_rpc_receive_release(receive);
 
-    trevrpc_wt_stream* stream = NULL;
-    int err = trevrpc_wt_session_open_stream(session, &stream);
-    if (err != 0) {
-        return err;
-    }
+    reply.message = "server-two";
+    assert(hello_v1_greeter_lots_of_replies_send(state->runtime, pair.server_stream, &reply, 203) == 0);
+    wait_send(state, pair.server_stream, 203);
+    receive = receive_next(state, pair.client_stream);
+    verify_response_receive(receive, reply.message);
+    trevrpc_rpc_receive_release(receive);
 
-    uint8_t* request_frame = NULL;
-    size_t request_frame_len = 0;
-    err = trevrpc_wire_encode_request("binding.v1.Lifecycle",
-        "Unary",
-        TREVRPC_RPC_KIND_UNARY,
-        request_body,
-        request_body_len,
-        NULL,
-        0,
-        4096,
-        &request_frame,
-        &request_frame_len);
-    if (err == 0) {
-        intptr_t written = trevrpc_wt_stream_write(stream, request_frame, request_frame_len);
-        if (written < 0) {
-            err = (int)written;
-        } else if ((size_t)written != request_frame_len) {
-            err = TREV_WT_ERR_CLOSED;
-        }
-    }
-    if (err == 0) {
-        err = trevrpc_wt_stream_shutdown_send(stream);
-    }
-    free(request_frame);
-    if (err != 0) {
-        trevrpc_wt_stream_close(stream);
-        return err;
-    }
+    assert(hello_v1_greeter_lots_of_replies_finish(state->runtime, pair.server_call, 204, &status) == 0);
+    event = wait_kind_call(state, TREVRPC_RPC_EVENT_CALL_FINISHED, pair.server_call, 204, &info);
+    release_waited(event);
+    receive = receive_next(state, pair.client_stream);
+    verify_status_receive(receive, TREVRPC_RPC_STATUS_OK);
+    trevrpc_rpc_receive_release(receive);
+    close_pair(state, pair, 205);
+}
 
-    *out_stream = stream;
+static void test_client_streaming(harness* state) {
+    call_pair pair = open_client_streaming(state, 300);
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_status_v1 status;
+    trevrpc_rpc_receive* receive;
+    trevrpc_rpc_event* event;
+    assert(trevrpc_rpc_status_v1_init(&status, sizeof(status)) == 0);
+
+    request.name = "client-one";
+    assert(hello_v1_greeter_lots_of_greetings_send(state->runtime, pair.client_stream, &request, 302) == 0);
+    wait_send(state, pair.client_stream, 302);
+    receive = receive_next(state, pair.server_stream);
+    verify_request_receive(receive, request.name);
+    trevrpc_rpc_receive_release(receive);
+
+    request.name = "client-two";
+    assert(hello_v1_greeter_lots_of_greetings_send(state->runtime, pair.client_stream, &request, 303) == 0);
+    wait_send(state, pair.client_stream, 303);
+    receive = receive_next(state, pair.server_stream);
+    verify_request_receive(receive, request.name);
+    trevrpc_rpc_receive_release(receive);
+
+    assert(hello_v1_greeter_lots_of_greetings_finish_send(state->runtime, pair.client_stream, 304) == 0);
+    event = wait_kind_stream(state, TREVRPC_RPC_EVENT_SEND_FINISHED, pair.client_stream, 304, &info);
+    release_waited(event);
+    wait_fin(state, pair.server_stream);
+
+    reply.message = "client-summary";
+    assert(hello_v1_greeter_lots_of_greetings_respond(state->runtime, pair.server_call, &reply, &status, 305) == 0);
+    wait_send(state, pair.server_stream, 305);
+    receive_response_and_status(state, pair.client_stream, reply.message);
+    wait_fin(state, pair.client_stream);
+    close_pair(state, pair, 306);
+}
+
+static void test_bidirectional(harness* state) {
+    call_pair pair = open_bidi(state, 400);
+    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
+    Hello__V1__HelloReply reply = HELLO__V1__HELLO_REPLY__INIT;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_status_v1 status;
+    trevrpc_rpc_receive* receive;
+    trevrpc_rpc_event* event;
+    assert(trevrpc_rpc_status_v1_init(&status, sizeof(status)) == 0);
+
+    request.name = "bidi-request";
+    assert(hello_v1_greeter_bidi_hello_send_request(state->runtime, pair.client_stream, &request, 402) == 0);
+    wait_send(state, pair.client_stream, 402);
+    receive = receive_next(state, pair.server_stream);
+    verify_request_receive(receive, request.name);
+    trevrpc_rpc_receive_release(receive);
+
+    reply.message = "bidi-response";
+    assert(hello_v1_greeter_bidi_hello_send_response(state->runtime, pair.server_stream, &reply, 403) == 0);
+    wait_send(state, pair.server_stream, 403);
+    receive = receive_next(state, pair.client_stream);
+    verify_response_receive(receive, reply.message);
+    trevrpc_rpc_receive_release(receive);
+
+    assert(hello_v1_greeter_bidi_hello_finish_send(state->runtime, pair.client_stream, 404) == 0);
+    event = wait_kind_stream(state, TREVRPC_RPC_EVENT_SEND_FINISHED, pair.client_stream, 404, &info);
+    release_waited(event);
+    wait_fin(state, pair.server_stream);
+
+    assert(hello_v1_greeter_bidi_hello_finish(state->runtime, pair.server_call, 405, &status) == 0);
+    event = wait_kind_call(state, TREVRPC_RPC_EVENT_CALL_FINISHED, pair.server_call, 405, &info);
+    release_waited(event);
+    receive = receive_next(state, pair.client_stream);
+    verify_status_receive(receive, TREVRPC_RPC_STATUS_OK);
+    trevrpc_rpc_receive_release(receive);
+    close_pair(state, pair, 406);
+}
+
+static void teardown_harness(harness* state) {
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_event* event;
+    assert(trevrpc_rpc_endpoint_close(state->runtime, state->client_endpoint, 900) == 0);
+    assert(trevrpc_rpc_endpoint_close(state->runtime, state->listener, 901) == 0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_ENDPOINT_CLOSED, 900, &info);
+    release_waited(event);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_ENDPOINT_CLOSED, 901, &info);
+    release_waited(event);
+    assert(trevrpc_rpc_endpoint_release(state->runtime, state->client_endpoint) == 0);
+    assert(trevrpc_rpc_endpoint_release(state->runtime, state->listener) == 0);
+    assert(trevrpc_rpc_runtime_close(state->runtime, 902) == 0);
+    event = wait_kind_operation(state, TREVRPC_RPC_EVENT_STOPPED, 902, &info);
+    release_waited(event);
+    collect_events(state);
+    for (size_t index = 0; index < state->pending_count; ++index) {
+        trevrpc_rpc_event_release(state->pending[index].event);
+    }
+    state->pending_count = 0;
+    assert(trevrpc_rpc_runtime_drain(state->runtime) == 0);
+    assert(trevrpc_rpc_runtime_release(state->runtime) == 0);
+}
+
+int main(int argc, char** argv) {
+    harness state;
+    if (argc == 2) {
+        if (strcmp(argv[1], "native") == 0)
+            test_transport = TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE;
+        else if (strcmp(argv[1], "http3") == 0)
+            test_transport = TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3;
+        else if (strcmp(argv[1], "webtransport") == 0)
+            test_transport = TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT;
+        else
+            assert(false);
+    } else {
+        assert(argc == 1);
+    }
+    test_generated_surface();
+    test_unresolved_stream_budget_validation();
+    test_generated_signatures();
+    setup_harness(&state);
+    test_unary(&state);
+    test_unary_empty_message(&state);
+    test_server_streaming(&state);
+    test_client_streaming(&state);
+    test_bidirectional(&state);
+    teardown_harness(&state);
     return 0;
-}
-
-static int read_binding_unary_response(trevrpc_wt_stream* stream, trevrpc_inbound_response** out_response) {
-    if (stream == NULL || out_response == NULL) {
-        return -EINVAL;
-    }
-    *out_response = NULL;
-
-    uint8_t* response_frame = NULL;
-    size_t response_frame_len = 0;
-    intptr_t read_result =
-        trevrpc_wt_stream_read_frame_timeout(stream, &response_frame, &response_frame_len, 4096, 5ull * 1000000000ull);
-    if (read_result != 1) {
-        trevrpc_wt_free(response_frame);
-        return read_result < 0 ? (int)read_result : TREV_WT_ERR_CLOSED;
-    }
-
-    trevrpc_wire_response_values* values = NULL;
-    int err = trevrpc_wire_decode_response(response_frame, response_frame_len, &values);
-    trevrpc_wt_free(response_frame);
-    if (err == 0) {
-        err = trevrpc_inbound_response_create(values, out_response);
-    }
-    trevrpc_internal_response_free(values);
-    return err;
-}
-
-static int start_wt_serve_fixture_registered(wt_serve_fixture* fixture,
-    const trevrpc_client_config_v1* config,
-    wt_fixture_register_fn register_routes,
-    void* register_context) {
-    memset(fixture, 0, sizeof(*fixture));
-    trevrpc_server_config_v1 server_config;
-    int err = trevrpc_server_config_v1_init(&server_config, sizeof(server_config));
-    if (err != 0) {
-        return err;
-    }
-    server_config.host = "127.0.0.1";
-    server_config.port = 0;
-    server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
-    server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
-    server_config.webtransport_path = "/trevrpc";
-    server_config.max_streams_per_session = 8;
-    server_config.max_idle_timeout_ms = 1000;
-    err = trevrpc_server_listen_v1(&server_config, &fixture->server);
-    if (err != 0) {
-        return err;
-    }
-    err = register_routes(fixture->server, register_context);
-    if (err != 0) {
-        return err;
-    }
-    err = trevrpc_server_freeze(fixture->server);
-    if (err != 0) {
-        return err;
-    }
-    fixture->args.server = fixture->server;
-    err = pthread_create(&fixture->thread, NULL, serve_thread, &fixture->args);
-    if (err != 0) {
-        return -err;
-    }
-    fixture->thread_started = true;
-
-    uint16_t port = 0;
-    err = trevrpc_test_server_webtransport_port(fixture->server, &port);
-    if (err != 0) {
-        return err;
-    }
-    trevrpc_wt_config client_config = {
-        .host = "127.0.0.1",
-        .port = port,
-        .path = "/trevrpc",
-        .skip_certificate_validation = 1,
-        .max_streams_per_session = 8,
-        .idle_timeout_ms = 1000,
-    };
-    return trevrpc_raw_client_connect_webtransport_v1(&client_config, config, &fixture->client);
-}
-
-static int start_wt_serve_fixture(wt_serve_fixture* fixture, const trevrpc_client_config_v1* config) {
-    return start_wt_serve_fixture_registered(fixture, config, register_generated_wt_routes, NULL);
-}
-
-static int stop_wt_serve_fixture(wt_serve_fixture* fixture) {
-    trevrpc_raw_client_close(fixture->client);
-    fixture->client = NULL;
-    int result = trevrpc_server_stop(fixture->server);
-    if (fixture->thread_started) {
-        int err = pthread_join(fixture->thread, NULL);
-        fixture->thread_started = false;
-        if (result == 0 && err != 0) {
-            result = -err;
-        }
-    }
-    int err = trevrpc_server_wait_until(fixture->server, TREVRPC_DEADLINE_INFINITE);
-    if (result == 0) {
-        result = err;
-    }
-    return result == 0 ? fixture->args.result : result;
-}
-
-static int close_wt_serve_fixture(wt_serve_fixture* fixture) {
-    trevrpc_raw_client_close(fixture->client);
-    fixture->client = NULL;
-    int result = trevrpc_server_stop(fixture->server);
-    if (fixture->thread_started) {
-        int err = pthread_join(fixture->thread, NULL);
-        fixture->thread_started = false;
-        if (result == 0 && err != 0) {
-            result = -err;
-        }
-    }
-    int err = stop_and_release_server(&fixture->server);
-    return result == 0 ? err : result;
-}
-
-static int start_channel_serve_fixture(channel_serve_fixture* fixture) {
-    memset(fixture, 0, sizeof(*fixture));
-    trevrpc_server_config_v1 server_config;
-    int err = trevrpc_server_config_v1_init(&server_config, sizeof(server_config));
-    if (err != 0) {
-        return err;
-    }
-    server_config.host = "127.0.0.1";
-    server_config.port = 0;
-    server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
-    server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
-    server_config.max_idle_timeout_ms = 1000;
-    server_config.peer_bidi_stream_count = 8;
-    err = trevrpc_server_listen_v1(&server_config, &fixture->server);
-    if (err != 0) {
-        return err;
-    }
-    err = hello_v1_greeter_register(fixture->server, &GreeterImplementation);
-    if (err != 0) {
-        return err;
-    }
-    err = trevrpc_server_freeze(fixture->server);
-    if (err != 0) {
-        return err;
-    }
-    fixture->args.server = fixture->server;
-    err = pthread_create(&fixture->thread, NULL, serve_thread, &fixture->args);
-    if (err != 0) {
-        return -err;
-    }
-    fixture->thread_started = true;
-
-    uint16_t port = 0;
-    err = trevrpc_server_port(fixture->server, &port);
-    if (err != 0) {
-        return err;
-    }
-    trevrpc_client_config_v1 client_config;
-    err = trevrpc_client_config_v1_init(&client_config, sizeof(client_config));
-    if (err != 0) {
-        return err;
-    }
-    client_config.skip_certificate_validation = 1;
-    return trevrpc_channel_connect_v1("127.0.0.1", port, &client_config, NULL, 5000000000ull, NULL, &fixture->channel);
-}
-
-static int stop_channel_serve_fixture(channel_serve_fixture* fixture) {
-    trevrpc_channel_close(fixture->channel);
-    trevrpc_channel_release(fixture->channel);
-    fixture->channel = NULL;
-    int result = trevrpc_server_stop(fixture->server);
-    if (fixture->thread_started) {
-        int err = pthread_join(fixture->thread, NULL);
-        fixture->thread_started = false;
-        if (result == 0 && err != 0) {
-            result = -err;
-        }
-    }
-    int err = trevrpc_server_wait_until(fixture->server, TREVRPC_DEADLINE_INFINITE);
-    if (result == 0) {
-        result = err;
-    }
-    return result == 0 ? fixture->args.result : result;
-}
-
-static int close_channel_serve_fixture(channel_serve_fixture* fixture) {
-    trevrpc_channel_close(fixture->channel);
-    trevrpc_channel_release(fixture->channel);
-    fixture->channel = NULL;
-    int result = trevrpc_server_stop(fixture->server);
-    if (fixture->thread_started) {
-        int err = pthread_join(fixture->thread, NULL);
-        fixture->thread_started = false;
-        if (result == 0 && err != 0) {
-            result = -err;
-        }
-    }
-    int err = stop_and_release_server(&fixture->server);
-    return result == 0 ? err : result;
-}
-
-static int expect_single_stream_reply(trevrpc_stream* stream, const char* expected) {
-    int result = 1;
-    hello_v1_greeter_hello_reply_receiver receiver = HELLO_V1_GREETER_HELLO_REPLY_RECEIVER_INIT;
-    hello_v1_greeter_hello_reply_event event = HELLO_V1_GREETER_HELLO_REPLY_EVENT_INIT;
-    if (hello_v1_greeter_hello_reply_receiver_init(&receiver, stream) != 0) {
-        goto cleanup;
-    }
-    if (hello_v1_greeter_recv_hello_v1_hello_reply(&receiver, &event) != 0 ||
-        event.kind != HELLO_V1_GREETER_HELLO_REPLY_EVENT_MESSAGE || event.message == NULL ||
-        event.message->message == NULL || strcmp(event.message->message, expected) != 0) {
-        goto cleanup;
-    }
-    hello_v1_greeter_hello_reply_event_reset(&event);
-    if (hello_v1_greeter_recv_hello_v1_hello_reply(&receiver, &event) != 0 ||
-        event.kind != HELLO_V1_GREETER_HELLO_REPLY_EVENT_TERMINAL_STATUS) {
-        goto cleanup;
-    }
-    uint32_t status = TREVRPC_STATUS_UNKNOWN;
-    if (trevrpc_inbound_stream_frame_get_status(event.frame, &status) != 0 || status != TREVRPC_STATUS_OK) {
-        goto cleanup;
-    }
-    result = 0;
-
-cleanup:
-    hello_v1_greeter_hello_reply_event_reset(&event);
-    trevrpc_stream_close(stream);
-    return result;
-}
-
-static int finish_channel_client_stream(trevrpc_stream* stream, const Hello__V1__HelloRequest* request) {
-    if (hello_v1_greeter_send_hello_v1_hello_request(stream, request) != 0 || trevrpc_stream_finish_send(stream) != 0) {
-        trevrpc_stream_close(stream);
-        return 1;
-    }
-    return expect_single_stream_reply(stream, "client stream");
-}
-
-static int finish_channel_bidi_stream(trevrpc_stream* stream) {
-    if (trevrpc_stream_finish_send(stream) != 0) {
-        trevrpc_stream_close(stream);
-        return 1;
-    }
-    return expect_single_stream_reply(stream, "bidi");
-}
-
-static int test_generated_channel_helpers_all_rpc_shapes(void) {
-    int result = 1;
-    channel_serve_fixture fixture = {0};
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    hello_v1_greeter_say_hello_result response = HELLO_V1_GREETER_SAY_HELLO_RESULT_INIT;
-    trevrpc_stream* stream = NULL;
-    trevrpc_call_options_v1 options;
-    CHECK_GOTO(trevrpc_call_options_v1_init(&options, sizeof(options)) == 0);
-    options.timeout_nanos = 5000000000ull;
-    request.name = "channel";
-
-    CHECK_GOTO(start_channel_serve_fixture(&fixture) == 0);
-
-    CHECK_GOTO(hello_v1_greeter_say_hello(fixture.channel, &request, &response) == 0);
-    CHECK_GOTO(response.kind == HELLO_V1_GREETER_SAY_HELLO_RESULT_SUCCESS && response.response != NULL &&
-               response.response->message != NULL && strcmp(response.response->message, request.name) == 0);
-    hello_v1_greeter_say_hello_result_reset(&response);
-    CHECK_GOTO(hello_v1_greeter_say_hello_with_options(fixture.channel, &request, &options, &response) == 0);
-    CHECK_GOTO(response.kind == HELLO_V1_GREETER_SAY_HELLO_RESULT_SUCCESS && response.response != NULL &&
-               response.response->message != NULL && strcmp(response.response->message, request.name) == 0);
-    hello_v1_greeter_say_hello_result_reset(&response);
-
-    CHECK_GOTO(hello_v1_greeter_lots_of_replies(fixture.channel, &request, &stream) == 0);
-    int stream_result = expect_single_stream_reply(stream, "reply");
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(hello_v1_greeter_lots_of_replies_with_options(fixture.channel, &request, &options, &stream) == 0);
-    stream_result = expect_single_stream_reply(stream, "reply");
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-
-    CHECK_GOTO(hello_v1_greeter_lots_of_greetings_start(fixture.channel, &stream) == 0);
-    stream_result = finish_channel_client_stream(stream, &request);
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(hello_v1_greeter_lots_of_greetings_start_with_options(fixture.channel, &options, &stream) == 0);
-    stream_result = finish_channel_client_stream(stream, &request);
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-
-    CHECK_GOTO(hello_v1_greeter_bidi_hello_start(fixture.channel, &stream) == 0);
-    stream_result = finish_channel_bidi_stream(stream);
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(hello_v1_greeter_bidi_hello_start_with_options(fixture.channel, &options, &stream) == 0);
-    stream_result = finish_channel_bidi_stream(stream);
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-
-    CHECK_GOTO(stop_channel_serve_fixture(&fixture) == 0);
-    result = 0;
-
-cleanup:
-    hello_v1_greeter_say_hello_result_reset(&response);
-    trevrpc_stream_close(stream);
-    if (close_channel_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_generated_allocator_failures(void) {
-    int result = 1;
-    channel_serve_fixture fixture = {0};
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    hello_v1_greeter_say_hello_result unary = HELLO_V1_GREETER_SAY_HELLO_RESULT_INIT;
-    trevrpc_stream* stream = NULL;
-    hello_v1_greeter_hello_reply_receiver receiver = HELLO_V1_GREETER_HELLO_REPLY_RECEIVER_INIT;
-    hello_v1_greeter_hello_reply_event event = HELLO_V1_GREETER_HELLO_REPLY_EVENT_INIT;
-    request.name = "allocation failure";
-
-    CHECK_GOTO(start_channel_serve_fixture(&fixture) == 0);
-    trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(fixture.channel, &request, &unary) == 0);
-    CHECK_GOTO(unary.kind == HELLO_V1_GREETER_SAY_HELLO_RESULT_RUNTIME_ERROR);
-    CHECK_GOTO(unary.error == -ENOMEM);
-    hello_v1_greeter_say_hello_result_reset(&unary);
-    trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(SIZE_MAX);
-
-    CHECK_GOTO(hello_v1_greeter_lots_of_replies(fixture.channel, &request, &stream) == 0);
-    CHECK_GOTO(hello_v1_greeter_hello_reply_receiver_init(&receiver, stream) == 0);
-    trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(0);
-    CHECK_GOTO(hello_v1_greeter_recv_hello_v1_hello_reply(&receiver, &event) == 0);
-    CHECK_GOTO(event.kind == HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR);
-    CHECK_GOTO(event.error == -ENOMEM);
-    hello_v1_greeter_hello_reply_event_reset(&event);
-    trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(SIZE_MAX);
-    trevrpc_stream_close(stream);
-    stream = NULL;
-
-    CHECK_GOTO(stop_channel_serve_fixture(&fixture) == 0);
-    result = 0;
-
-cleanup:
-    trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(SIZE_MAX);
-    hello_v1_greeter_say_hello_result_reset(&unary);
-    hello_v1_greeter_hello_reply_event_reset(&event);
-    trevrpc_stream_close(stream);
-    if (close_channel_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int raw_say_hello(
-    trevrpc_raw_client* client, const Hello__V1__HelloRequest* request, Hello__V1__HelloReply** response) {
-    *response = NULL;
-    size_t body_len = hello__v1__hello_request__get_packed_size(request);
-    uint8_t* body = body_len == 0 ? NULL : malloc(body_len);
-    if (body_len > 0 && body == NULL) {
-        return -ENOMEM;
-    }
-    hello__v1__hello_request__pack(request, body);
-    trevrpc_request rpc_request = {
-        .service = "hello.v1.Greeter",
-        .service_len = sizeof("hello.v1.Greeter") - 1,
-        .method = "SayHello",
-        .method_len = sizeof("SayHello") - 1,
-        .body = body,
-        .body_len = body_len,
-        .kind = TREVRPC_RPC_KIND_UNARY,
-        .version = TREVRPC_WIRE_VERSION,
-    };
-    trevrpc_inbound_response* raw_response = NULL;
-    int err = trevrpc_raw_client_call_request_inbound_v1(client, &rpc_request, NULL, &raw_response);
-    free(body);
-    uint32_t status = TREVRPC_STATUS_UNKNOWN;
-    if (err == 0) {
-        err = trevrpc_inbound_response_get_status(raw_response, &status);
-    }
-    if (err == 0 && status != TREVRPC_STATUS_OK) {
-        err = (int)status;
-    }
-    trevrpc_bytes_view body_view = {0};
-    if (err == 0) {
-        err = trevrpc_inbound_response_get_body(raw_response, &body_view);
-    }
-    if (err == 0) {
-        *response = hello__v1__hello_reply__unpack(NULL, body_view.len, body_view.data);
-        if (*response == NULL) {
-            err = TREVRPC_ERR_INVALID_FRAME;
-        }
-    }
-    trevrpc_inbound_response_release(raw_response);
-    return err;
-}
-
-static int raw_start_stream(trevrpc_raw_client* client,
-    const char* method,
-    uint32_t kind,
-    const uint8_t* body,
-    size_t body_len,
-    trevrpc_stream** stream) {
-    trevrpc_request request = {
-        .service = "hello.v1.Greeter",
-        .service_len = sizeof("hello.v1.Greeter") - 1,
-        .method = method,
-        .method_len = strlen(method),
-        .body = body,
-        .body_len = body_len,
-        .kind = kind,
-        .version = TREVRPC_WIRE_VERSION,
-    };
-    return trevrpc_raw_client_start_stream_request_v1(client, &request, NULL, stream);
-}
-
-static int raw_lots_of_replies(
-    trevrpc_raw_client* client, const Hello__V1__HelloRequest* request, trevrpc_stream** stream) {
-    size_t body_len = hello__v1__hello_request__get_packed_size(request);
-    uint8_t* body = body_len == 0 ? NULL : malloc(body_len);
-    if (body_len > 0 && body == NULL) {
-        return -ENOMEM;
-    }
-    hello__v1__hello_request__pack(request, body);
-    int err = raw_start_stream(client, "LotsOfReplies", TREVRPC_RPC_KIND_SERVER_STREAMING, body, body_len, stream);
-    free(body);
-    if (err == 0) {
-        err = trevrpc_stream_finish_send(*stream);
-    }
-    return err;
-}
-
-static int raw_lots_of_greetings_start(trevrpc_raw_client* client, trevrpc_stream** stream) {
-    return raw_start_stream(client, "LotsOfGreetings", TREVRPC_RPC_KIND_CLIENT_STREAMING, NULL, 0, stream);
-}
-
-static int raw_bidi_hello_start(trevrpc_raw_client* client, trevrpc_stream** stream) {
-    return raw_start_stream(client, "BidiHello", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, stream);
-}
-
-static int run_generated_case(
-    const char* method, uint32_t kind, const uint8_t* request_body, size_t request_body_len, metric_counts* counts) {
-    int result = 1;
-    uint8_t* frame = NULL;
-    size_t frame_len = 0;
-    trevrpc_server* server = NULL;
-    trevrpc_msquic_stream stream = {0};
-    bool stream_initialized = false;
-    trevrpc_metrics metrics = {
-        .rpc_started = record_started,
-        .rpc_finished = record_finished,
-        .user_data = counts,
-    };
-
-    CHECK_GOTO(
-        trevrpc_wire_encode_request(
-            "hello.v1.Greeter", method, kind, request_body, request_body_len, NULL, 0, 4096, &frame, &frame_len) == 0);
-    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
-    CHECK_GOTO(trevrpc_server_set_metrics(server, &metrics) == 0);
-    CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
-    CHECK_GOTO(init_raw_stream(&stream, frame, frame_len) == 0);
-    stream_initialized = true;
-    stream.recv_fin = true;
-
-    trevrpc_test_server_handle_stream(server, &stream);
-
-    result = 0;
-
-cleanup:
-    if (stream_initialized) {
-        reset_raw_stream(&stream);
-    }
-    if (stop_and_release_server(&server) != 0) {
-        result = 1;
-    }
-    free(frame);
-    return result;
-}
-
-static int test_webtransport_unary_round_trip(void) {
-    int result = 1;
-    trevrpc_server* server = NULL;
-    trevrpc_raw_client* client = NULL;
-    trevrpc_wt_listener* listener = NULL;
-    Hello__V1__HelloReply* response = NULL;
-    pthread_t thread = {0};
-    bool thread_started = false;
-    wt_rpc_server_args args = {0};
-    trevrpc_wt_config server_config = {
-        .host = "127.0.0.1",
-        .path = "/trevrpc",
-        .cert_file = TREVRPC_MSQUIC_TEST_CERT,
-        .key_file = TREVRPC_MSQUIC_TEST_KEY,
-        .max_streams_per_session = 8,
-        .idle_timeout_ms = 1000,
-    };
-    trevrpc_client_config_v1 config;
-    CHECK_GOTO(trevrpc_client_config_v1_init(&config, sizeof(config)) == 0);
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    request.name = "Trev";
-
-    CHECK_GOTO(trevrpc_test_server_new(NULL, &server) == 0);
-    CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
-    CHECK_GOTO(trevrpc_server_freeze(server) == 0);
-    CHECK_GOTO(trevrpc_wt_listen(&server_config, &listener) == 0);
-    args.server = server;
-    args.listener = listener;
-    CHECK_GOTO(pthread_create(&thread, NULL, wt_unary_server_thread, &args) == 0);
-    thread_started = true;
-
-    uint16_t port = 0;
-    CHECK_GOTO(trevrpc_wt_listener_port(listener, &port) == 0);
-    trevrpc_wt_config client_config = {
-        .host = "127.0.0.1",
-        .port = port,
-        .path = "/trevrpc",
-        .skip_certificate_validation = 1,
-        .max_streams_per_session = 8,
-        .idle_timeout_ms = 1000,
-    };
-    CHECK_GOTO(trevrpc_raw_client_connect_webtransport_v1(&client_config, &config, &client) == 0);
-    CHECK_GOTO(raw_say_hello(client, &request, &response) == 0);
-    CHECK_GOTO(response != NULL);
-    CHECK_GOTO(response->message != NULL);
-    CHECK_GOTO(strcmp(response->message, "Trev") == 0);
-    trevrpc_raw_client_close(client);
-    client = NULL;
-    CHECK_GOTO(pthread_join(thread, NULL) == 0);
-    thread_started = false;
-    CHECK_GOTO(args.result == 0);
-
-    result = 0;
-
-cleanup:
-    if (response != NULL) {
-        hello__v1__hello_reply__free_unpacked(response, NULL);
-    }
-    trevrpc_raw_client_close(client);
-    if (thread_started) {
-        trevrpc_wt_listener_shutdown(listener);
-        (void)pthread_join(thread, NULL);
-    }
-    trevrpc_wt_listener_close(listener);
-    if (stop_and_release_server(&server) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_webtransport_serve_loop_unary_shutdown(void) {
-    int result = 1;
-    Hello__V1__HelloReply* response = NULL;
-    wt_serve_fixture fixture = {0};
-    trevrpc_client_config_v1 config;
-    CHECK_GOTO(trevrpc_client_config_v1_init(&config, sizeof(config)) == 0);
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    request.name = "Trev";
-
-    CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(raw_say_hello(fixture.client, &request, &response) == 0);
-    CHECK_GOTO(response != NULL && response->message != NULL && strcmp(response->message, "Trev") == 0);
-    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
-
-    result = 0;
-
-cleanup:
-    if (response != NULL) {
-        hello__v1__hello_reply__free_unpacked(response, NULL);
-    }
-    if (close_wt_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_binding_webtransport_unary_graceful_cleanup(void) {
-    int result = 1;
-    wt_serve_fixture fixture = {0};
-    trevrpc_client_config_v1 config;
-    trevrpc_wt_stream* client_stream = NULL;
-    trevrpc_inbound_response* response = NULL;
-    shutdown_action_state actions = {0};
-    bool actions_initialized = false;
-    const uint8_t request_body[] = {'b', 'i', 'n', 'd', 'i', 'n', 'g'};
-    const uint8_t response_body[] = {'r', 'e', 's', 'p', 'o', 'n', 's', 'e'};
-    binding_unary_state state = {
-        .shutdown_actions = &actions,
-        .expected_request = request_body,
-        .expected_request_len = sizeof(request_body),
-        .response_body = response_body,
-        .response_body_len = sizeof(response_body),
-        .response_status = TREVRPC_STATUS_OK,
-    };
-
-    CHECK_GOTO(trevrpc_client_config_v1_init(&config, sizeof(config)) == 0);
-    CHECK_GOTO(pthread_mutex_init(&actions.mutex, NULL) == 0);
-    CHECK_GOTO(pthread_cond_init(&actions.cond, NULL) == 0);
-    actions_initialized = true;
-    CHECK_GOTO(start_wt_serve_fixture_registered(&fixture, &config, register_binding_unary_route, &state) == 0);
-    CHECK_GOTO(open_binding_unary_request(&fixture, request_body, sizeof(request_body), &client_stream) == 0);
-    CHECK_GOTO(read_binding_unary_response(client_stream, &response) == 0);
-    uint32_t response_status = TREVRPC_STATUS_UNKNOWN;
-    trevrpc_bytes_view response_view = {0};
-    CHECK_GOTO(response != NULL && trevrpc_inbound_response_get_status(response, &response_status) == 0 &&
-               response_status == TREVRPC_STATUS_OK);
-    CHECK_GOTO(trevrpc_inbound_response_get_body(response, &response_view) == 0);
-    CHECK_GOTO(response_view.len == sizeof(response_body));
-    CHECK_GOTO(memcmp(response_view.data, response_body, sizeof(response_body)) == 0);
-    trevrpc_inbound_response_release(response);
-    response = NULL;
-    CHECK_GOTO(wait_for_shutdown_action(&actions, TREV_MSQUIC_TEST_STREAM_CLOSE_COMPLETED, 1));
-
-    pthread_mutex_lock(&actions.mutex);
-    bool handler_ok = state.called == 1 && state.request_matched && state.respond_result == 0;
-    pthread_mutex_unlock(&actions.mutex);
-    CHECK_GOTO(handler_ok);
-    CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_SHUTDOWN_GRACEFUL) > 0);
-    CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT) == 0);
-    CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_CLOSE_STARTED) > 0);
-
-    trevrpc_msquic_test_set_stream_hook(NULL, NULL);
-    trevrpc_wt_stream_close(client_stream);
-    client_stream = NULL;
-    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
-    result = 0;
-
-cleanup:
-    trevrpc_msquic_test_set_stream_hook(NULL, NULL);
-    trevrpc_inbound_response_release(response);
-    trevrpc_wt_stream_close(client_stream);
-    if (close_wt_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    if (actions_initialized) {
-        pthread_cond_destroy(&actions.cond);
-        pthread_mutex_destroy(&actions.mutex);
-    }
-    return result;
-}
-
-static int test_binding_webtransport_unary_failed_terminal_submission_aborts(void) {
-    int result = 1;
-    wt_serve_fixture fixture = {0};
-    trevrpc_client_config_v1 config;
-    trevrpc_wt_stream* client_stream = NULL;
-    trevrpc_inbound_response* response = NULL;
-    shutdown_action_state actions = {0};
-    bool actions_initialized = false;
-    const uint8_t request_body[] = {'f', 'a', 'i', 'l'};
-    const uint8_t response_body[] = {'n', 'o', 't', '-', 's', 'e', 'n', 't'};
-    binding_unary_state state = {
-        .shutdown_actions = &actions,
-        .expected_request = request_body,
-        .expected_request_len = sizeof(request_body),
-        .response_body = response_body,
-        .response_body_len = sizeof(response_body),
-        .response_status = TREVRPC_STATUS_OK,
-        .fail_terminal_send = true,
-    };
-
-    CHECK_GOTO(trevrpc_client_config_v1_init(&config, sizeof(config)) == 0);
-    CHECK_GOTO(pthread_mutex_init(&actions.mutex, NULL) == 0);
-    CHECK_GOTO(pthread_cond_init(&actions.cond, NULL) == 0);
-    actions_initialized = true;
-    CHECK_GOTO(start_wt_serve_fixture_registered(&fixture, &config, register_binding_unary_route, &state) == 0);
-    CHECK_GOTO(open_binding_unary_request(&fixture, request_body, sizeof(request_body), &client_stream) == 0);
-    int call_err = read_binding_unary_response(client_stream, &response);
-    CHECK_GOTO(call_err != 0);
-    CHECK_GOTO(wait_for_shutdown_action(&actions, TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT, 1));
-    CHECK_GOTO(wait_for_shutdown_action(&actions, TREV_MSQUIC_TEST_STREAM_CLOSE_COMPLETED, 1));
-
-    pthread_mutex_lock(&actions.mutex);
-    bool handler_failed =
-        state.called == 1 && state.request_matched && state.respond_result != 0 && state.full_abort_before_return;
-    pthread_mutex_unlock(&actions.mutex);
-    CHECK_GOTO(handler_failed);
-    CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT) > 0);
-    CHECK_GOTO(shutdown_action_count(&actions, TREV_MSQUIC_TEST_STREAM_CLOSE_STARTED) > 0);
-
-    trevrpc_msquic_test_set_stream_hook(NULL, NULL);
-    trevrpc_wt_stream_close(client_stream);
-    client_stream = NULL;
-    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
-    result = 0;
-
-cleanup:
-    trevrpc_msquic_test_set_stream_hook(NULL, NULL);
-    trevrpc_inbound_response_release(response);
-    trevrpc_wt_stream_close(client_stream);
-    if (close_wt_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    if (actions_initialized) {
-        pthread_cond_destroy(&actions.cond);
-        pthread_mutex_destroy(&actions.mutex);
-    }
-    return result;
-}
-
-static int test_webtransport_serve_loop_server_streaming(void) {
-    int result = 1;
-    wt_serve_fixture fixture = {0};
-    trevrpc_stream* stream = NULL;
-    trevrpc_client_config_v1 config;
-    CHECK_GOTO(trevrpc_client_config_v1_init(&config, sizeof(config)) == 0);
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    request.name = "Trev";
-
-    CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(raw_lots_of_replies(fixture.client, &request, &stream) == 0);
-    int stream_result = expect_single_stream_reply(stream, "reply");
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
-
-    result = 0;
-
-cleanup:
-    trevrpc_stream_close(stream);
-    if (close_wt_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_webtransport_serve_loop_client_streaming(void) {
-    int result = 1;
-    wt_serve_fixture fixture = {0};
-    trevrpc_stream* stream = NULL;
-    trevrpc_client_config_v1 config;
-    CHECK_GOTO(trevrpc_client_config_v1_init(&config, sizeof(config)) == 0);
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    request.name = "Trev";
-
-    CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(raw_lots_of_greetings_start(fixture.client, &stream) == 0);
-    CHECK_GOTO(hello_v1_greeter_send_hello_v1_hello_request(stream, &request) == 0);
-    CHECK_GOTO(trevrpc_stream_finish_send(stream) == 0);
-    int stream_result = expect_single_stream_reply(stream, "client stream");
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
-
-    result = 0;
-
-cleanup:
-    trevrpc_stream_close(stream);
-    if (close_wt_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_webtransport_serve_loop_bidi_streaming(void) {
-    int result = 1;
-    wt_serve_fixture fixture = {0};
-    trevrpc_stream* stream = NULL;
-    trevrpc_client_config_v1 config;
-    CHECK_GOTO(trevrpc_client_config_v1_init(&config, sizeof(config)) == 0);
-
-    CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    CHECK_GOTO(raw_bidi_hello_start(fixture.client, &stream) == 0);
-    CHECK_GOTO(trevrpc_stream_finish_send(stream) == 0);
-    int stream_result = expect_single_stream_reply(stream, "bidi");
-    stream = NULL;
-    CHECK_GOTO(stream_result == 0);
-    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
-
-    result = 0;
-
-cleanup:
-    trevrpc_stream_close(stream);
-    if (close_wt_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_webtransport_serve_loop_partial_request_close(void) {
-    int result = 1;
-    wt_serve_fixture fixture = {0};
-    trevrpc_wt_session* session = NULL;
-    trevrpc_wt_stream* stream = NULL;
-    trevrpc_client_config_v1 config;
-    CHECK_GOTO(trevrpc_client_config_v1_init(&config, sizeof(config)) == 0);
-    const uint8_t partial_frame[] = {0x40, 0x10};
-
-    CHECK_GOTO(start_wt_serve_fixture(&fixture, &config) == 0);
-    session = trevrpc_test_client_webtransport_session(fixture.client);
-    CHECK_GOTO(session != NULL);
-    CHECK_GOTO(trevrpc_wt_session_open_stream(session, &stream) == 0);
-    CHECK_GOTO(
-        trevrpc_wt_stream_write(stream, partial_frame, sizeof(partial_frame)) == (intptr_t)sizeof(partial_frame));
-    trevrpc_wt_stream_close(stream);
-    stream = NULL;
-    CHECK_GOTO(stop_wt_serve_fixture(&fixture) == 0);
-
-    result = 0;
-
-cleanup:
-    trevrpc_wt_stream_close(stream);
-    if (close_wt_serve_fixture(&fixture) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_shared_listener_native_and_webtransport_unary(void) {
-    int result = 1;
-    trevrpc_server* server = NULL;
-    trevrpc_raw_client* native_client = NULL;
-    trevrpc_raw_client* wt_client = NULL;
-    Hello__V1__HelloReply* native_response = NULL;
-    Hello__V1__HelloReply* wt_response = NULL;
-    serve_args args = {0};
-    pthread_t thread = {0};
-    bool thread_started = false;
-    trevrpc_server_config_v1 server_config;
-    int err = trevrpc_server_config_v1_init(&server_config, sizeof(server_config));
-    if (err != 0) {
-        return err;
-    }
-    server_config.host = "127.0.0.1";
-    server_config.port = 0;
-    server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
-    server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
-    server_config.max_idle_timeout_ms = 1000;
-    server_config.peer_bidi_stream_count = 8;
-    server_config.webtransport_path = "/trevrpc";
-    server_config.max_streams_per_session = 8;
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    request.name = "shared";
-
-    CHECK_GOTO(trevrpc_server_listen_v1(&server_config, &server) == 0);
-    CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
-    CHECK_GOTO(trevrpc_server_freeze(server) == 0);
-    args.server = server;
-    CHECK_GOTO(pthread_create(&thread, NULL, serve_thread, &args) == 0);
-    thread_started = true;
-
-    uint16_t port = 0;
-    CHECK_GOTO(trevrpc_test_server_webtransport_port(server, &port) == 0);
-    trevrpc_client_config_v1 client_config;
-    CHECK_GOTO(trevrpc_client_config_v1_init(&client_config, sizeof(client_config)) == 0);
-    client_config.skip_certificate_validation = 1;
-    CHECK_GOTO(trevrpc_raw_client_connect_v1("127.0.0.1", port, &client_config, NULL, &native_client) == 0);
-    CHECK_GOTO(raw_say_hello(native_client, &request, &native_response) == 0);
-    CHECK_GOTO(
-        native_response != NULL && native_response->message != NULL && strcmp(native_response->message, "shared") == 0);
-
-    trevrpc_wt_config wt_client_config = {
-        .host = "127.0.0.1",
-        .port = port,
-        .path = "/trevrpc",
-        .skip_certificate_validation = 1,
-        .max_streams_per_session = 8,
-        .idle_timeout_ms = 1000,
-    };
-    CHECK_GOTO(trevrpc_raw_client_connect_webtransport_v1(&wt_client_config, &client_config, &wt_client) == 0);
-    CHECK_GOTO(raw_say_hello(wt_client, &request, &wt_response) == 0);
-    CHECK_GOTO(wt_response != NULL && wt_response->message != NULL && strcmp(wt_response->message, "shared") == 0);
-
-    trevrpc_raw_client_close(native_client);
-    native_client = NULL;
-    trevrpc_raw_client_close(wt_client);
-    wt_client = NULL;
-    trevrpc_server_stop(server);
-    CHECK_GOTO(pthread_join(thread, NULL) == 0);
-    thread_started = false;
-    CHECK_GOTO(args.result == 0);
-
-    result = 0;
-
-cleanup:
-    if (native_response != NULL) {
-        hello__v1__hello_reply__free_unpacked(native_response, NULL);
-    }
-    if (wt_response != NULL) {
-        hello__v1__hello_reply__free_unpacked(wt_response, NULL);
-    }
-    trevrpc_raw_client_close(native_client);
-    trevrpc_raw_client_close(wt_client);
-    if (thread_started) {
-        trevrpc_server_stop(server);
-        (void)pthread_join(thread, NULL);
-    }
-    if (stop_and_release_server(&server) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_generated_native_unary_stack_and_heap_protobuf_buffers(void) {
-    int result = 1;
-    trevrpc_server* server = NULL;
-    trevrpc_channel* channel = NULL;
-    hello_v1_greeter_say_hello_result stack_response = HELLO_V1_GREETER_SAY_HELLO_RESULT_INIT;
-    hello_v1_greeter_say_hello_result heap_response = HELLO_V1_GREETER_SAY_HELLO_RESULT_INIT;
-    serve_args args = {0};
-    pthread_t thread = {0};
-    bool thread_started = false;
-    trevrpc_server_config_v1 server_config;
-    int err = trevrpc_server_config_v1_init(&server_config, sizeof(server_config));
-    if (err != 0) {
-        return err;
-    }
-    server_config.host = "127.0.0.1";
-    server_config.port = 0;
-    server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
-    server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
-    server_config.max_idle_timeout_ms = 1000;
-    server_config.peer_bidi_stream_count = 8;
-    trevrpc_client_config_v1 client_config;
-    CHECK_GOTO(trevrpc_client_config_v1_init(&client_config, sizeof(client_config)) == 0);
-    client_config.skip_certificate_validation = 1;
-    Hello__V1__HelloRequest stack_request = HELLO__V1__HELLO_REQUEST__INIT;
-    Hello__V1__HelloRequest heap_request = HELLO__V1__HELLO_REQUEST__INIT;
-    char heap_name[700];
-
-    memset(heap_name, 'h', sizeof(heap_name) - 1);
-    heap_name[sizeof(heap_name) - 1] = '\0';
-    stack_request.name = "stack-buffer";
-    heap_request.name = heap_name;
-
-    CHECK_GOTO(trevrpc_server_listen_v1(&server_config, &server) == 0);
-    CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
-    CHECK_GOTO(trevrpc_server_freeze(server) == 0);
-    args.server = server;
-    CHECK_GOTO(pthread_create(&thread, NULL, serve_thread, &args) == 0);
-    thread_started = true;
-
-    uint16_t port = 0;
-    CHECK_GOTO(trevrpc_server_port(server, &port) == 0);
-    CHECK_GOTO(trevrpc_channel_connect_v1("127.0.0.1", port, &client_config, NULL, 5000000000ull, NULL, &channel) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(channel, &stack_request, &stack_response) == 0);
-    CHECK_GOTO(stack_response.kind == HELLO_V1_GREETER_SAY_HELLO_RESULT_SUCCESS && stack_response.response != NULL &&
-               stack_response.response->message != NULL);
-    CHECK_GOTO(strcmp(stack_response.response->message, stack_request.name) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(channel, &heap_request, &heap_response) == 0);
-    CHECK_GOTO(heap_response.kind == HELLO_V1_GREETER_SAY_HELLO_RESULT_SUCCESS && heap_response.response != NULL &&
-               heap_response.response->message != NULL);
-    CHECK_GOTO(strcmp(heap_response.response->message, heap_request.name) == 0);
-
-    trevrpc_channel_close(channel);
-    trevrpc_channel_release(channel);
-    channel = NULL;
-    trevrpc_server_stop(server);
-    CHECK_GOTO(pthread_join(thread, NULL) == 0);
-    thread_started = false;
-    CHECK_GOTO(args.result == 0);
-
-    result = 0;
-
-cleanup:
-    hello_v1_greeter_say_hello_result_reset(&stack_response);
-    hello_v1_greeter_say_hello_result_reset(&heap_response);
-    trevrpc_channel_close(channel);
-    trevrpc_channel_release(channel);
-    if (thread_started) {
-        trevrpc_server_stop(server);
-        (void)pthread_join(thread, NULL);
-    }
-    if (stop_and_release_server(&server) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_generated_native_helper_pending_send_resource_exhausted(void) {
-    int result = 1;
-    trevrpc_server* server = NULL;
-    trevrpc_channel* channel = NULL;
-    serve_args args = {0};
-    pthread_t thread = {0};
-    bool thread_started = false;
-    trevrpc_server_config_v1 server_config;
-    int err = trevrpc_server_config_v1_init(&server_config, sizeof(server_config));
-    if (err != 0) {
-        return err;
-    }
-    server_config.host = "127.0.0.1";
-    server_config.port = 0;
-    server_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
-    server_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
-    server_config.max_idle_timeout_ms = 1000;
-    server_config.peer_bidi_stream_count = 8;
-    trevrpc_client_config_v1 client_config;
-    err = trevrpc_client_config_v1_init(&client_config, sizeof(client_config));
-    if (err != 0) {
-        return err;
-    }
-    client_config.skip_certificate_validation = 1;
-    client_config.max_pending_send_bytes = 4;
-    client_config.max_pending_send_count = 1;
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    hello_v1_greeter_say_hello_result response = HELLO_V1_GREETER_SAY_HELLO_RESULT_INIT;
-    request.name = "tiny-budget";
-
-    CHECK_GOTO(trevrpc_server_listen_v1(&server_config, &server) == 0);
-    CHECK_GOTO(hello_v1_greeter_register(server, &GreeterImplementation) == 0);
-    CHECK_GOTO(trevrpc_server_freeze(server) == 0);
-    args.server = server;
-    CHECK_GOTO(pthread_create(&thread, NULL, serve_thread, &args) == 0);
-    thread_started = true;
-
-    uint16_t port = 0;
-    CHECK_GOTO(trevrpc_server_port(server, &port) == 0);
-    CHECK_GOTO(trevrpc_channel_connect_v1("127.0.0.1", port, &client_config, NULL, 5000000000ull, NULL, &channel) == 0);
-    CHECK_GOTO(hello_v1_greeter_say_hello(channel, &request, &response) == 0);
-    CHECK_GOTO(response.kind == HELLO_V1_GREETER_SAY_HELLO_RESULT_RUNTIME_ERROR);
-    CHECK_GOTO(response.error == TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED);
-    CHECK_GOTO(response.response == NULL);
-
-    trevrpc_channel_close(channel);
-    trevrpc_channel_release(channel);
-    channel = NULL;
-    trevrpc_server_stop(server);
-    CHECK_GOTO(pthread_join(thread, NULL) == 0);
-    thread_started = false;
-
-    result = 0;
-
-cleanup:
-    hello_v1_greeter_say_hello_result_reset(&response);
-    trevrpc_channel_close(channel);
-    trevrpc_channel_release(channel);
-    if (thread_started) {
-        trevrpc_server_stop(server);
-        (void)pthread_join(thread, NULL);
-    }
-    if (stop_and_release_server(&server) != 0) {
-        result = 1;
-    }
-    return result;
-}
-
-static int test_generated_services_all_rpc_shapes(void) {
-    int result = 1;
-    Hello__V1__HelloRequest request = HELLO__V1__HELLO_REQUEST__INIT;
-    request.name = "Trev";
-    size_t body_len = hello__v1__hello_request__get_packed_size(&request);
-    uint8_t* body = malloc(body_len);
-    CHECK_GOTO(body != NULL || body_len == 0);
-    hello__v1__hello_request__pack(&request, body);
-
-    metric_counts counts = {0};
-    CHECK_GOTO(run_generated_case("SayHello", TREVRPC_RPC_KIND_UNARY, body, body_len, &counts) == 0);
-    CHECK_GOTO(counts.started == 1);
-    CHECK_GOTO(counts.finished == 1);
-    CHECK_GOTO(counts.status == TREVRPC_STATUS_OK);
-
-    memset(&counts, 0, sizeof(counts));
-    CHECK_GOTO(run_generated_case("LotsOfReplies", TREVRPC_RPC_KIND_SERVER_STREAMING, body, body_len, &counts) == 0);
-    CHECK_GOTO(counts.status == TREVRPC_STATUS_CANCELLED || counts.status == TREVRPC_STATUS_INTERNAL ||
-               counts.status == TREVRPC_STATUS_OK);
-
-    memset(&counts, 0, sizeof(counts));
-    CHECK_GOTO(run_generated_case("LotsOfGreetings", TREVRPC_RPC_KIND_CLIENT_STREAMING, NULL, 0, &counts) == 0);
-    CHECK_GOTO(counts.status == TREVRPC_STATUS_CANCELLED || counts.status == TREVRPC_STATUS_INTERNAL ||
-               counts.status == TREVRPC_STATUS_OK);
-
-    memset(&counts, 0, sizeof(counts));
-    CHECK_GOTO(run_generated_case("BidiHello", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, NULL, 0, &counts) == 0);
-    CHECK_GOTO(counts.status == TREVRPC_STATUS_CANCELLED || counts.status == TREVRPC_STATUS_INTERNAL ||
-               counts.status == TREVRPC_STATUS_OK);
-
-    result = 0;
-
-cleanup:
-    free(body);
-    return result;
-}
-
-int main(void) {
-    int result = 1;
-
-    if (test_unbudgeted_raw_receive_injection() != 0) {
-        goto cleanup;
-    }
-    if (test_generator_channel_output() != 0) {
-        goto cleanup;
-    }
-    if (test_generated_helper_signatures() != 0) {
-        goto cleanup;
-    }
-    if (test_generated_channel_helpers_all_rpc_shapes() != 0) {
-        goto cleanup;
-    }
-    if (test_generated_allocator_failures() != 0) {
-        goto cleanup;
-    }
-    if (test_generated_services_all_rpc_shapes() != 0) {
-        goto cleanup;
-    }
-    if (test_webtransport_serve_loop_unary_shutdown() != 0) {
-        goto cleanup;
-    }
-    if (test_binding_webtransport_unary_graceful_cleanup() != 0) {
-        goto cleanup;
-    }
-    if (test_binding_webtransport_unary_failed_terminal_submission_aborts() != 0) {
-        goto cleanup;
-    }
-    if (test_webtransport_unary_round_trip() != 0) {
-        goto cleanup;
-    }
-    if (test_webtransport_serve_loop_server_streaming() != 0) {
-        goto cleanup;
-    }
-    if (test_webtransport_serve_loop_client_streaming() != 0) {
-        goto cleanup;
-    }
-    if (test_webtransport_serve_loop_bidi_streaming() != 0) {
-        goto cleanup;
-    }
-    if (test_webtransport_serve_loop_partial_request_close() != 0) {
-        goto cleanup;
-    }
-    if (test_shared_listener_native_and_webtransport_unary() != 0) {
-        goto cleanup;
-    }
-    if (test_generated_native_unary_stack_and_heap_protobuf_buffers() != 0) {
-        goto cleanup;
-    }
-    if (test_generated_native_helper_pending_send_resource_exhausted() != 0) {
-        goto cleanup;
-    }
-    result = 0;
-
-cleanup:
-    return result;
 }

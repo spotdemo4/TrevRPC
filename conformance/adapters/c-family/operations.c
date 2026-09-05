@@ -1,7 +1,7 @@
 #include "operations.h"
 
-#include "trevrpc.h"
 #include "trevrpc_frame_internal.h"
+#include "trevrpc_rpc.h"
 #include "trevrpc_wire_internal.h"
 
 #include <errno.h>
@@ -25,31 +25,34 @@ static const char *cf_rpc_kind_token(uint32_t kind) {
 }
 
 static const char *cf_frame_kind_token(uint32_t kind) {
-  return kind == TREVRPC_STREAM_FRAME_KIND_STATUS ? "status" : "message";
+  return kind == CF_STREAM_FRAME_KIND_STATUS ? "status" : "message";
 }
 
 static void cf_classify_wire_error(cf_message_type type, int native_error,
                                    trevrpc_wire_diagnostic_reason reason,
                                    cf_error *error) {
-  if (native_error == TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION) {
+  if (native_error == CF_WIRE_ERR_UNSUPPORTED_WIRE_VERSION) {
     cf_error_set(error, "unsupported_wire_version",
-                 TREVRPC_STATUS_FAILED_PRECONDITION);
-  } else if (native_error == TREVRPC_ERR_UNSUPPORTED_RPC_KIND) {
+                 TREVRPC_RPC_STATUS_FAILED_PRECONDITION);
+  } else if (native_error == CF_WIRE_ERR_UNSUPPORTED_RPC_KIND) {
     cf_error_set(error, "unsupported_rpc_kind",
-                 TREVRPC_STATUS_INVALID_ARGUMENT);
-  } else if (native_error == TREVRPC_ERR_FRAME_TOO_LARGE) {
-    cf_error_set(error, "frame_too_large", TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+                 TREVRPC_RPC_STATUS_INVALID_ARGUMENT);
+  } else if (native_error == CF_WIRE_ERR_FRAME_TOO_LARGE) {
+    cf_error_set(error, "frame_too_large",
+                 TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED);
   } else if (reason == TREVRPC_WIRE_DIAGNOSTIC_INVALID_METADATA) {
     cf_error_set(error, "invalid_metadata",
-                 type == CF_MESSAGE_REQUEST ? TREVRPC_STATUS_INVALID_ARGUMENT
-                                            : TREVRPC_STATUS_INTERNAL);
+                 type == CF_MESSAGE_REQUEST
+                     ? TREVRPC_RPC_STATUS_INVALID_ARGUMENT
+                     : TREVRPC_RPC_STATUS_INTERNAL);
   } else if (reason == TREVRPC_WIRE_DIAGNOSTIC_UNSUPPORTED_FRAME_KIND) {
     cf_error_set(error, "unsupported_frame_kind",
-                 TREVRPC_STATUS_INVALID_ARGUMENT);
+                 TREVRPC_RPC_STATUS_INVALID_ARGUMENT);
   } else {
     cf_error_set(error, "malformed_protobuf",
-                 type == CF_MESSAGE_REQUEST ? TREVRPC_STATUS_INVALID_ARGUMENT
-                                            : TREVRPC_STATUS_INTERNAL);
+                 type == CF_MESSAGE_REQUEST
+                     ? TREVRPC_RPC_STATUS_INVALID_ARGUMENT
+                     : TREVRPC_RPC_STATUS_INTERNAL);
   }
 }
 
@@ -84,8 +87,8 @@ static int cf_encode_message(const cf_message *message, size_t max_frame_size,
   if (cf_native_metadata(source_metadata, &metadata) != 0) {
     cf_error_set(error, "invalid_metadata",
                  message->type == CF_MESSAGE_REQUEST
-                     ? TREVRPC_STATUS_INVALID_ARGUMENT
-                     : TREVRPC_STATUS_INTERNAL);
+                     ? TREVRPC_RPC_STATUS_INVALID_ARGUMENT
+                     : TREVRPC_RPC_STATUS_INTERNAL);
     return -1;
   }
 
@@ -133,7 +136,7 @@ static int cf_codec_encode(const cf_command *command, cf_json *payload,
                            cf_error *error) {
   size_t max_frame_size = strcmp(command->operation, "framing.encode") == 0
                               ? command->max_frame_size
-                              : TREVRPC_DEFAULT_MAX_FRAME_SIZE;
+                              : TREVRPC_RPC_DEFAULT_MAX_MESSAGE_SIZE;
   uint8_t *frame = NULL;
   size_t frame_len = 0;
   if (cf_encode_message(&command->message, max_frame_size, &frame, &frame_len,
@@ -143,7 +146,7 @@ static int cf_codec_encode(const cf_command *command, cf_json *payload,
   }
   if (frame_len < 4) {
     free(frame);
-    cf_error_set(error, "malformed_protobuf", TREVRPC_STATUS_INTERNAL);
+    cf_error_set(error, "malformed_protobuf", TREVRPC_RPC_STATUS_INTERNAL);
     return -1;
   }
   cf_json_append(payload, ",\"body_hex\":");
@@ -289,8 +292,7 @@ static void cf_append_response(cf_json *payload,
                  ",\"message\":{\"type\":\"rpc_response\",\"status_raw\":");
   cf_json_append_u64_string(payload, response->status);
   cf_json_append(payload, ",\"status_code\":");
-  cf_json_append_u32(payload,
-                     trevrpc_status_code_from_uint32(response->status));
+  cf_json_append_u32(payload, cf_status_code_from_uint32(response->status));
   cf_json_append(payload, ",\"message_hex\":");
   cf_json_append_hex(payload, (const uint8_t *)response->message,
                      response->message_len);
@@ -312,7 +314,7 @@ cf_append_stream_frame(cf_json *payload,
   cf_json_append(payload, ",\"status_raw\":");
   cf_json_append_u64_string(payload, frame->status);
   cf_json_append(payload, ",\"status_code\":");
-  cf_json_append_u32(payload, trevrpc_status_code_from_uint32(frame->status));
+  cf_json_append_u32(payload, cf_status_code_from_uint32(frame->status));
   cf_json_append(payload, ",\"message_hex\":");
   cf_json_append_hex(payload, (const uint8_t *)frame->message,
                      frame->message_len);
@@ -342,7 +344,7 @@ static int cf_codec_decode(const cf_command *command, cf_json *payload,
           request.service, request.service_len, request.method,
           request.method_len, request.kind, request.version, request.body,
           request.body_len, &request.metadata, request.timeout_nanos,
-          TREVRPC_DEFAULT_MAX_FRAME_SIZE, &canonical_frame,
+          TREVRPC_RPC_DEFAULT_MAX_MESSAGE_SIZE, &canonical_frame,
           &canonical_frame_len);
     }
     if (native_error == 0) {
@@ -369,9 +371,9 @@ static int cf_codec_decode(const cf_command *command, cf_json *payload,
       native_error = cf_inbound_response_values(response, &values);
     }
     if (native_error == 0) {
-      native_error =
-          trevrpc_wire_encode_response(&values, TREVRPC_DEFAULT_MAX_FRAME_SIZE,
-                                       &canonical_frame, &canonical_frame_len);
+      native_error = trevrpc_wire_encode_response(
+          &values, TREVRPC_RPC_DEFAULT_MAX_MESSAGE_SIZE, &canonical_frame,
+          &canonical_frame_len);
     }
     if (native_error == 0) {
       cf_append_response(payload, &values);
@@ -397,7 +399,7 @@ static int cf_codec_decode(const cf_command *command, cf_json *payload,
       native_error = trevrpc_wire_encode_stream_frame(
           values.kind, values.status, values.message, values.message_len,
           values.body.data, values.body.len, &values.metadata,
-          TREVRPC_DEFAULT_MAX_FRAME_SIZE, &canonical_frame,
+          TREVRPC_RPC_DEFAULT_MAX_MESSAGE_SIZE, &canonical_frame,
           &canonical_frame_len);
     }
     if (native_error == 0) {
@@ -450,17 +452,17 @@ static int cf_framing_decode(const cf_command *command, cf_json *payload,
       if (result == TREVRPC_FRAME_TOO_LARGE) {
         trevrpc_frame_parser_reset(&parser);
         cf_error_set(error, "frame_too_large",
-                     TREVRPC_STATUS_RESOURCE_EXHAUSTED);
+                     TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED);
         return -1;
       }
       if (result == TREVRPC_FRAME_ALLOCATION_FAILURE) {
         trevrpc_frame_parser_reset(&parser);
-        cf_error_set(error, "malformed_protobuf", TREVRPC_STATUS_INTERNAL);
+        cf_error_set(error, "malformed_protobuf", TREVRPC_RPC_STATUS_INTERNAL);
         return -1;
       }
       if (consumed == 0) {
         trevrpc_frame_parser_reset(&parser);
-        cf_error_set(error, "incomplete_frame", TREVRPC_STATUS_INTERNAL);
+        cf_error_set(error, "incomplete_frame", TREVRPC_RPC_STATUS_INTERNAL);
         return -1;
       }
     }
@@ -468,7 +470,7 @@ static int cf_framing_decode(const cf_command *command, cf_json *payload,
   trevrpc_frame_result finished = trevrpc_frame_parser_finish(&parser);
   trevrpc_frame_parser_reset(&parser);
   if (finished == TREVRPC_FRAME_INCOMPLETE) {
-    cf_error_set(error, "incomplete_frame", TREVRPC_STATUS_INTERNAL);
+    cf_error_set(error, "incomplete_frame", TREVRPC_RPC_STATUS_INTERNAL);
     return -1;
   }
   cf_json_append(payload, "],\"eof\":true");
@@ -490,7 +492,7 @@ int cf_dispatch_operation(const cf_command *command,
              strcmp(command->operation, "state.client_stream") == 0) {
     result = state_dispatch(command, payload, error);
   } else {
-    cf_error_set(error, "malformed_protobuf", TREVRPC_STATUS_INTERNAL);
+    cf_error_set(error, "malformed_protobuf", TREVRPC_RPC_STATUS_INTERNAL);
   }
 
   if (result != 0 && !payload->failed &&

@@ -283,6 +283,36 @@ static int test_profile_metadata(void) {
     return 0;
 }
 
+static int test_application_error_mapping(void) {
+    const uint64_t first = UINT64_C(0x52e4a40fa8db);
+    uint64_t encoded = 0;
+    uint64_t decoded = 0;
+
+    CHECK(trevrpc_wt_profile_encode_application_error(TREV_WT_PROFILE_DRAFT_02, 0, &encoded) == 0);
+    CHECK(encoded == first);
+    CHECK(trevrpc_wt_profile_encode_application_error(TREV_WT_PROFILE_DRAFT_02, 29, &encoded) == 0);
+    CHECK(encoded == first + 29);
+    CHECK(trevrpc_wt_profile_encode_application_error(TREV_WT_PROFILE_DRAFT_02, 30, &encoded) == 0);
+    CHECK(encoded == first + 31);
+    CHECK(trevrpc_wt_profile_encode_application_error(TREV_WT_PROFILE_DRAFT_02, UINT8_MAX, &encoded) == 0);
+    CHECK(encoded == UINT64_C(0x52e4a40fa9e2));
+    CHECK(trevrpc_wt_profile_encode_application_error(TREV_WT_PROFILE_DRAFT_02, UINT8_MAX + UINT64_C(1), &encoded) ==
+          -ERANGE);
+
+    CHECK(trevrpc_wt_profile_encode_application_error(TREV_WT_PROFILE_DRAFT_15, UINT32_MAX, &encoded) == 0);
+    CHECK(encoded == UINT64_C(0x52e5ac983162));
+    CHECK(trevrpc_wt_profile_decode_application_error(TREV_WT_PROFILE_DRAFT_15, encoded, &decoded) == 0);
+    CHECK(decoded == UINT32_MAX);
+    CHECK(trevrpc_wt_profile_decode_application_error(TREV_WT_PROFILE_DRAFT_07, first + 1, &decoded) == 0);
+    CHECK(decoded == 1);
+    CHECK(trevrpc_wt_profile_decode_application_error(TREV_WT_PROFILE_DRAFT_14, first + 30, &decoded) == -ERANGE);
+    CHECK(trevrpc_wt_profile_decode_application_error(TREV_WT_PROFILE_DRAFT_02, first - 1, &decoded) == -ERANGE);
+    CHECK(trevrpc_wt_profile_encode_application_error(TREV_WT_PROFILE_NONE, 0, &encoded) == -EINVAL);
+    CHECK(trevrpc_wt_profile_decode_application_error(TREV_WT_PROFILE_DRAFT_16_RESERVED, first, &decoded) == -EINVAL);
+    CHECK(trevrpc_wt_profile_encode_application_error(TREV_WT_PROFILE_DRAFT_15, 0, NULL) == -EINVAL);
+    return 0;
+}
+
 static int test_settings_materialization(void) {
     trevrpc_wt_profile_setting_pair settings[16];
     size_t settings_len = 0;
@@ -373,6 +403,7 @@ int main(void) {
         test_flow_control_intent,
         test_capability_filtering,
         test_profile_metadata,
+        test_application_error_mapping,
         test_settings_materialization,
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {

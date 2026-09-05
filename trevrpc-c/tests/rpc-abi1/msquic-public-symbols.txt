@@ -1,0 +1,6 @@
+trevrpc_rpc_msquic_abi_1_anchor
+trevrpc_rpc_msquic_abi_version
+trevrpc_rpc_msquic_config_v1_init
+trevrpc_rpc_msquic_create_v1
+trevrpc_rpc_msquic_endpoint_config_v1_init
+trevrpc_rpc_msquic_endpoint_start_v1

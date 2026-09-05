@@ -325,6 +325,52 @@ bool trevrpc_wt_profile_peer_stream_is_unidirectional(uint64_t stream_id) {
     return (stream_id & 0x02u) != 0;
 }
 
+/* WebTransport stream errors occupy a reserved HTTP/3 range and skip H3 GREASE values. */
+#define TREV_WT_APPLICATION_ERROR_FIRST UINT64_C(0x52e4a40fa8db)
+#define TREV_WT_APPLICATION_ERROR_GREASE_MODULUS UINT64_C(0x1f)
+#define TREV_WT_APPLICATION_ERROR_GREASE_REMAINDER UINT64_C(0x21)
+
+static uint64_t trevrpc_wt_profile_application_error_max(trevrpc_wt_profile_id profile) {
+    if (!trevrpc_wt_profile_is_supported(profile)) {
+        return 0;
+    }
+    return profile == TREV_WT_PROFILE_DRAFT_02 ? UINT8_MAX : UINT32_MAX;
+}
+
+int trevrpc_wt_profile_encode_application_error(
+    trevrpc_wt_profile_id profile, uint64_t application_error, uint64_t* out_http3_error) {
+    uint64_t maximum;
+    if (out_http3_error == NULL || (maximum = trevrpc_wt_profile_application_error_max(profile)) == 0) {
+        return -EINVAL;
+    }
+    if (application_error > maximum) {
+        return -ERANGE;
+    }
+    *out_http3_error = TREV_WT_APPLICATION_ERROR_FIRST + application_error + application_error / UINT64_C(0x1e);
+    return 0;
+}
+
+int trevrpc_wt_profile_decode_application_error(
+    trevrpc_wt_profile_id profile, uint64_t http3_error, uint64_t* out_application_error) {
+    uint64_t maximum;
+    uint64_t shifted;
+    uint64_t application_error;
+    if (out_application_error == NULL || (maximum = trevrpc_wt_profile_application_error_max(profile)) == 0) {
+        return -EINVAL;
+    }
+    if (http3_error < TREV_WT_APPLICATION_ERROR_FIRST ||
+        (http3_error - TREV_WT_APPLICATION_ERROR_GREASE_REMAINDER) % TREV_WT_APPLICATION_ERROR_GREASE_MODULUS == 0) {
+        return -ERANGE;
+    }
+    shifted = http3_error - TREV_WT_APPLICATION_ERROR_FIRST;
+    application_error = shifted - shifted / TREV_WT_APPLICATION_ERROR_GREASE_MODULUS;
+    if (application_error > maximum) {
+        return -ERANGE;
+    }
+    *out_application_error = application_error;
+    return 0;
+}
+
 uint64_t trevrpc_wt_profile_effective_session_limit(uint32_t configured_limit) {
     (void)configured_limit;
     return 1;

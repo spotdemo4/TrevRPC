@@ -45,6 +45,7 @@ typedef struct fake_stream {
     int abort_error;
     bool close_observed_abort;
     bool terminal;
+    bool notify_on_observer_install;
     bool block_observer_set;
     bool observer_set_entered;
     bool release_observer_set;
@@ -207,6 +208,7 @@ static int fake_stream_init(fake_stream* stream, uint64_t id, const uint8_t* byt
     }
     stream->len = len;
     stream->terminal = terminal;
+    stream->notify_on_observer_install = true;
     return 0;
 }
 
@@ -364,7 +366,7 @@ static int fake_set_observer(void* context, trevrpc_h3_ingress_observer observer
     }
     pthread_cond_broadcast(&stream->cond);
     pthread_mutex_unlock(&stream->mutex);
-    if (flags != 0) {
+    if (flags != 0 && stream->notify_on_observer_install) {
         fake_stream_notify(stream, flags);
     }
     return 0;
@@ -1357,6 +1359,8 @@ static int test_unknown_and_terminal_unidirectional_are_reclaimed(void) {
     unknown_initialized = true;
     CHECK_GOTO(fake_stream_init(&partial, 6, partial_type, sizeof(partial_type), true) == 0);
     partial_initialized = true;
+    unknown.notify_on_observer_install = false;
+    partial.notify_on_observer_install = false;
     CHECK_GOTO(fake_conn_enqueue(&conn, &unknown) == 0);
     CHECK_GOTO(fake_conn_enqueue(&conn, &partial) == 0);
     trevrpc_h3_ingress_config config = test_config(2, 1);

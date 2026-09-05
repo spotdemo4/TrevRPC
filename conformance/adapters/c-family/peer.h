@@ -11,6 +11,13 @@ extern "C" {
 #define CF_MAX_COMMAND_BYTES 262144u
 #define CF_MAX_EVENT_BYTES 65536u
 
+/* Wire-core diagnostics predate RPC ABI 1 and are not part of its public API.
+ */
+#define CF_WIRE_ERR_UNSUPPORTED_WIRE_VERSION (-2002)
+#define CF_WIRE_ERR_UNSUPPORTED_RPC_KIND (-2003)
+#define CF_WIRE_ERR_FRAME_TOO_LARGE (-2005)
+#define CF_STREAM_FRAME_KIND_STATUS 1u
+
 typedef struct cf_bytes {
   uint8_t *data;
   size_t len;
@@ -108,6 +115,7 @@ void cf_json_append_u64_string(cf_json *json, uint64_t value);
 void cf_json_append_hex(cf_json *json, const uint8_t *data, size_t len);
 void cf_json_append_metadata(cf_json *json, const cf_metadata *metadata);
 void cf_json_append_native_metadata(cf_json *json, const void *metadata);
+uint32_t cf_status_code_from_uint32(uint32_t code);
 void cf_error_set(cf_error *error, const char *category, uint32_t status_code);
 
 #ifdef __cplusplus

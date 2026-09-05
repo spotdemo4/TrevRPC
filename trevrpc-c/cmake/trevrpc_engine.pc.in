@@ -1,4 +1,4 @@
-prefix=${pcfiledir}/../..
+prefix=@trevrpc_pc_prefix@
 exec_prefix=${prefix}
 libdir=@trevrpc_pc_libdir@
 includedir=@trevrpc_pc_includedir@

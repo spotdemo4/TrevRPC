@@ -2,19 +2,15 @@
 // clang-format off
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "greeter.trevrpc.h"
 
-#define TREVRPC_C_STACK_BODY_LEN 512u
-#define TREVRPC_GENERATED_RECEIVER_OPEN 1u
-#define TREVRPC_GENERATED_RECEIVER_DONE 2u
+#define TREVRPC_GENERATED_STACK_BODY_LEN 512u
 
 #ifdef TREVRPC_GENERATED_TESTING
 static size_t trevrpc_generated_allocation_budget = SIZE_MAX;
-void trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(size_t successful_allocations) {
-    trevrpc_generated_allocation_budget = successful_allocations;
-}
 #endif
 
 typedef struct trevrpc_generated_allocator_state { int failed; } trevrpc_generated_allocator_state;
@@ -35,414 +31,406 @@ static void trevrpc_generated_free(void* allocator_data, void* value) { (void)al
 static ProtobufCAllocator trevrpc_generated_allocator(trevrpc_generated_allocator_state* state) {
     return (ProtobufCAllocator){.alloc = trevrpc_generated_alloc, .free = trevrpc_generated_free, .allocator_data = state};
 }
+#ifdef TREVRPC_GENERATED_TESTING
+void trevrpc_hello_v1_greeter_proto_test_fail_allocation_after(size_t successful_allocations) { trevrpc_generated_allocation_budget = successful_allocations; }
+#endif
 
-static int trevrpc_generated_event_empty(uint32_t kind, int error, const void* message, const void* frame) {
-    return kind == 0 && error == 0 && message == NULL && frame == NULL;
+int hello_v1_greeter_say_hello_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size) {
+    int err = trevrpc_rpc_call_config_v1_init(config, struct_size);
+    if (err != 0) { return err; }
+    config->kind = TREVRPC_RPC_KIND_UNARY; config->service = "hello.v1.Greeter"; config->service_len = sizeof("hello.v1.Greeter") - 1;
+    config->method = "SayHello"; config->method_len = sizeof("SayHello") - 1; return 0;
 }
 
-static int trevrpc_generated_result_empty(uint32_t kind, int error, const void* response, const void* envelope) {
-    return kind == 0 && error == 0 && response == NULL && envelope == NULL;
+int hello_v1_greeter_say_hello_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const Hello__V1__HelloRequest* initial_or_null, uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE || out_call == NULL || out_stream == NULL) { return -EINVAL; }
+    trevrpc_rpc_call_config_v1 config; int err = hello_v1_greeter_say_hello_call_config_init(&config, sizeof(config));
+    if (err != 0) { return err; }
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN]; uint8_t* body = NULL; size_t body_len = 0;
+    if (initial_or_null != NULL) {
+        body_len = hello__v1__hello_request__get_packed_size(initial_or_null);
+        body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+        if (body_len > 0 && body == NULL) { return -ENOMEM; }
+        hello__v1__hello_request__pack(initial_or_null, body); config.initial_message = body; config.initial_message_len = body_len;
+    }
+    err = trevrpc_rpc_call_open_v1(runtime, endpoint, &config, operation_id, out_call, out_stream);
+    if (initial_or_null != NULL) { if (body != stack_body) { free(body); } }
+    return err;
 }
 
-int hello_v1_greeter_send_hello_v1_hello_reply(trevrpc_stream* stream, const Hello__V1__HelloReply* message) {
-    if (stream == NULL || message == NULL) { return -EINVAL; }
-    size_t body_len = hello__v1__hello_reply__get_packed_size(message);
-    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];
-    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
-    if (body_len > 0 && body == NULL) { return -ENOMEM; }
-    hello__v1__hello_reply__pack(message, body);
-    int err = trevrpc_stream_send_message_borrowed_wait(stream, body, body_len);
+int hello_v1_greeter_say_hello_respond(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, const Hello__V1__HelloReply* message, const trevrpc_rpc_status_v1* status, uint64_t operation_id) {
+    if (runtime == NULL || status == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN]; uint8_t* body = NULL; size_t body_len = 0;
+    if (message != NULL) {
+        body_len = hello__v1__hello_reply__get_packed_size(message);
+        body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+        if (body_len > 0 && body == NULL) { return -ENOMEM; }
+        hello__v1__hello_reply__pack(message, body);
+    }
+    int err = trevrpc_rpc_call_respond_copy_v1(runtime, call, operation_id, status, body, body_len);
     if (body != stack_body) { free(body); }
     return err;
 }
 
-int hello_v1_greeter_send_hello_v1_hello_request(trevrpc_stream* stream, const Hello__V1__HelloRequest* message) {
-    if (stream == NULL || message == NULL) { return -EINVAL; }
-    size_t body_len = hello__v1__hello_request__get_packed_size(message);
-    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];
-    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
-    if (body_len > 0 && body == NULL) { return -ENOMEM; }
-    hello__v1__hello_request__pack(message, body);
-    int err = trevrpc_stream_send_message_borrowed_wait(stream, body, body_len);
-    if (body != stack_body) { free(body); }
-    return err;
-}
-
-int hello_v1_greeter_hello_request_request_receiver_init(hello_v1_greeter_hello_request_request_receiver* receiver, trevrpc_stream* stream) {
-    if (receiver == NULL || stream == NULL || receiver->stream != NULL || receiver->state != 0) { return -EINVAL; }
-    receiver->stream = stream;
-    receiver->state = TREVRPC_GENERATED_RECEIVER_OPEN;
-    return 0;
-}
-
-void hello_v1_greeter_hello_request_request_event_reset(hello_v1_greeter_hello_request_request_event* event) {
-    if (event == NULL) { return; }
-    if (event->message != NULL) { hello__v1__hello_request__free_unpacked(event->message, NULL); }
-    trevrpc_inbound_stream_frame_release(event->frame);
-    memset(event, 0, sizeof(*event));
-}
-
-void hello_v1_greeter_hello_request_request_receiver_reset(hello_v1_greeter_hello_request_request_receiver* receiver) {
-    if (receiver != NULL) { memset(receiver, 0, sizeof(*receiver)); }
-}
-
-int hello_v1_greeter_recv_hello_v1_hello_request_request(hello_v1_greeter_hello_request_request_receiver* receiver, hello_v1_greeter_hello_request_request_event* event) {
-    if (receiver == NULL || receiver->stream == NULL || event == NULL || !trevrpc_generated_event_empty(event->kind, event->error, event->message, event->frame)) { return -EINVAL; }
-    if (receiver->state == TREVRPC_GENERATED_RECEIVER_DONE) { return 0; }
-    trevrpc_inbound_stream_frame* frame = NULL;
-    int err = trevrpc_stream_recv_inbound(receiver->stream, &frame);
-    if (err != 0) {
-        event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_RUNTIME_ERROR;
-        event->error = err;
-        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;
-        return 0;
-    }
-    if (frame == NULL) {
-        event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_END;
-        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;
-        return 0;
-    }
-    uint32_t kind = 0;
-    err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);
-    if (err != 0) {
-        trevrpc_inbound_stream_frame_release(frame);
-        event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_RUNTIME_ERROR;
-        event->error = err; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-    }
-    if (kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
-        trevrpc_bytes_view body_view = {0};
-        err = trevrpc_inbound_stream_frame_get_body(frame, &body_view);
-        if (err != 0) {
-            trevrpc_inbound_stream_frame_release(frame);
-            event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_RUNTIME_ERROR;
-            event->error = err; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-        }
-        trevrpc_generated_allocator_state allocator_state = {0};
-        ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
-        event->message = hello__v1__hello_request__unpack(&allocator, body_view.len, body_view.data);
-        event->frame = frame;
-        if (event->message == NULL) {
-            event->kind = allocator_state.failed ? HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_RUNTIME_ERROR : HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_DECODE_ERROR;
-            event->error = allocator_state.failed ? -ENOMEM : TREVRPC_ERR_INVALID_FRAME;
-            trevrpc_stream_cancel(receiver->stream);
-            receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;
-        } else {
-            event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_MESSAGE;
-        }
-        return 0;
-    }
-    if (kind != TREVRPC_STREAM_FRAME_KIND_STATUS) {
-        trevrpc_inbound_stream_frame_release(frame);
-        event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_RUNTIME_ERROR;
-        event->error = TREVRPC_ERR_INVALID_FRAME; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-    }
-    trevrpc_inbound_stream_frame* trailing = NULL;
-    err = trevrpc_stream_recv_inbound(receiver->stream, &trailing);
-    if (trailing != NULL) {
-        trevrpc_inbound_stream_frame_release(trailing);
-        trevrpc_inbound_stream_frame_release(frame);
-        event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_RUNTIME_ERROR;
-        event->error = TREVRPC_ERR_INVALID_FRAME; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-    }
-    if (err != 0) {
-        trevrpc_inbound_stream_frame_release(frame);
-        event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_RUNTIME_ERROR;
-        event->error = (err == TREVRPC_ERR_INVALID_FRAME || err == TREVRPC_ERR_FRAME_TOO_LARGE) ? TREVRPC_ERR_INVALID_FRAME : err;
-        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-    }
-    event->kind = HELLO_V1_GREETER_HELLO_REQUEST_REQUEST_EVENT_TERMINAL_STATUS;
-    event->frame = frame;
-    receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;
-    return 0;
-}
-
-int hello_v1_greeter_hello_reply_receiver_init(hello_v1_greeter_hello_reply_receiver* receiver, trevrpc_stream* stream) {
-    if (receiver == NULL || stream == NULL || receiver->stream != NULL || receiver->state != 0) { return -EINVAL; }
-    receiver->stream = stream;
-    receiver->state = TREVRPC_GENERATED_RECEIVER_OPEN;
-    return 0;
-}
-
-void hello_v1_greeter_hello_reply_event_reset(hello_v1_greeter_hello_reply_event* event) {
-    if (event == NULL) { return; }
-    if (event->message != NULL) { hello__v1__hello_reply__free_unpacked(event->message, NULL); }
-    trevrpc_inbound_stream_frame_release(event->frame);
-    memset(event, 0, sizeof(*event));
-}
-
-void hello_v1_greeter_hello_reply_receiver_reset(hello_v1_greeter_hello_reply_receiver* receiver) {
-    if (receiver != NULL) { memset(receiver, 0, sizeof(*receiver)); }
-}
-
-int hello_v1_greeter_recv_hello_v1_hello_reply(hello_v1_greeter_hello_reply_receiver* receiver, hello_v1_greeter_hello_reply_event* event) {
-    if (receiver == NULL || receiver->stream == NULL || event == NULL || !trevrpc_generated_event_empty(event->kind, event->error, event->message, event->frame)) { return -EINVAL; }
-    if (receiver->state == TREVRPC_GENERATED_RECEIVER_DONE) { return 0; }
-    trevrpc_inbound_stream_frame* frame = NULL;
-    int err = trevrpc_stream_recv_inbound(receiver->stream, &frame);
-    if (err != 0) {
-        event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR;
-        event->error = err;
-        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;
-        return 0;
-    }
-    if (frame == NULL) {
-        event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_MISSING_TERMINAL_STATUS;
-        event->error = TREVRPC_ERR_INVALID_FRAME;
-        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;
-        return 0;
-    }
-    uint32_t kind = 0;
-    err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);
-    if (err != 0) {
-        trevrpc_inbound_stream_frame_release(frame);
-        event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR;
-        event->error = err; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-    }
-    if (kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
-        trevrpc_bytes_view body_view = {0};
-        err = trevrpc_inbound_stream_frame_get_body(frame, &body_view);
-        if (err != 0) {
-            trevrpc_inbound_stream_frame_release(frame);
-            event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR;
-            event->error = err; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-        }
-        trevrpc_generated_allocator_state allocator_state = {0};
-        ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
-        event->message = hello__v1__hello_reply__unpack(&allocator, body_view.len, body_view.data);
-        event->frame = frame;
-        if (event->message == NULL) {
-            event->kind = allocator_state.failed ? HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR : HELLO_V1_GREETER_HELLO_REPLY_EVENT_DECODE_ERROR;
-            event->error = allocator_state.failed ? -ENOMEM : TREVRPC_ERR_INVALID_FRAME;
-            trevrpc_stream_cancel(receiver->stream);
-            receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;
-        } else {
-            event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_MESSAGE;
-        }
-        return 0;
-    }
-    if (kind != TREVRPC_STREAM_FRAME_KIND_STATUS) {
-        trevrpc_inbound_stream_frame_release(frame);
-        event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR;
-        event->error = TREVRPC_ERR_INVALID_FRAME; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-    }
-    trevrpc_inbound_stream_frame* trailing = NULL;
-    err = trevrpc_stream_recv_inbound(receiver->stream, &trailing);
-    if (trailing != NULL) {
-        trevrpc_inbound_stream_frame_release(trailing);
-        trevrpc_inbound_stream_frame_release(frame);
-        event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR;
-        event->error = TREVRPC_ERR_INVALID_FRAME; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-    }
-    if (err != 0) {
-        trevrpc_inbound_stream_frame_release(frame);
-        event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_RUNTIME_ERROR;
-        event->error = (err == TREVRPC_ERR_INVALID_FRAME || err == TREVRPC_ERR_FRAME_TOO_LARGE) ? TREVRPC_ERR_INVALID_FRAME : err;
-        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;
-    }
-    event->kind = HELLO_V1_GREETER_HELLO_REPLY_EVENT_TERMINAL_STATUS;
-    event->frame = frame;
-    receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;
-    return 0;
-}
-
-void hello_v1_greeter_say_hello_result_reset(hello_v1_greeter_say_hello_result* result) {
-    if (result == NULL) { return; }
-    if (result->response != NULL) { hello__v1__hello_reply__free_unpacked(result->response, NULL); }
-    trevrpc_inbound_response_release(result->envelope);
-    memset(result, 0, sizeof(*result));
-}
-
-int hello_v1_greeter_say_hello(trevrpc_channel* channel, const Hello__V1__HelloRequest* request, hello_v1_greeter_say_hello_result* result) {
-    return hello_v1_greeter_say_hello_with_options(channel, request, NULL, result);
-}
-
-int hello_v1_greeter_say_hello_with_options(trevrpc_channel* channel, const Hello__V1__HelloRequest* request, const trevrpc_call_options_v1* options, hello_v1_greeter_say_hello_result* result) {
-    if (channel == NULL || request == NULL || result == NULL || !trevrpc_generated_result_empty(result->kind, result->error, result->response, result->envelope)) { return -EINVAL; }
-    size_t body_len = hello__v1__hello_request__get_packed_size(request);
-    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];
-    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
-    if (body_len > 0 && body == NULL) { result->kind = HELLO_V1_GREETER_SAY_HELLO_RESULT_RUNTIME_ERROR; result->error = -ENOMEM; return 0; }
-    hello__v1__hello_request__pack(request, body);
-    trevrpc_request rpc_request = {.service = "hello.v1.Greeter", .service_len = sizeof("hello.v1.Greeter") - 1, .method = "SayHello", .method_len = sizeof("SayHello") - 1, .body = body, .body_len = body_len, .kind = TREVRPC_RPC_KIND_UNARY, .version = TREVRPC_WIRE_VERSION};
-    int err = trevrpc_channel_call_request_inbound_v1(channel, &rpc_request, options, &result->envelope);
-    if (body != stack_body) { free(body); }
-    if (err != 0) { result->kind = HELLO_V1_GREETER_SAY_HELLO_RESULT_RUNTIME_ERROR; result->error = err; return 0; }
-    uint32_t status = TREVRPC_STATUS_OK;
-    err = trevrpc_inbound_response_get_status(result->envelope, &status);
-    if (err != 0) { result->kind = HELLO_V1_GREETER_SAY_HELLO_RESULT_RUNTIME_ERROR; result->error = err; return 0; }
-    if (status != TREVRPC_STATUS_OK) { result->kind = HELLO_V1_GREETER_SAY_HELLO_RESULT_RPC_STATUS; return 0; }
-    trevrpc_bytes_view body_view = {0};
-    err = trevrpc_inbound_response_get_body(result->envelope, &body_view);
-    if (err != 0) { result->kind = HELLO_V1_GREETER_SAY_HELLO_RESULT_RUNTIME_ERROR; result->error = err; return 0; }
+int hello_v1_greeter_say_hello_decode_request_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloRequest** out_message) {
+    if (receive == NULL || out_message == NULL) { return -EINVAL; }
+    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }
+    if (err != 0) { return err; }
+    if (info.kind != TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE) { return -EPROTO; }
+    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }
     trevrpc_generated_allocator_state allocator_state = {0};
     ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
-    result->response = hello__v1__hello_reply__unpack(&allocator, body_view.len, body_view.data);
-    if (result->response == NULL) { result->kind = allocator_state.failed ? HELLO_V1_GREETER_SAY_HELLO_RESULT_RUNTIME_ERROR : HELLO_V1_GREETER_SAY_HELLO_RESULT_DECODE_ERROR;
-        result->error = allocator_state.failed ? -ENOMEM : TREVRPC_ERR_INVALID_FRAME; return 0; }
-    result->kind = HELLO_V1_GREETER_SAY_HELLO_RESULT_SUCCESS;
+    Hello__V1__HelloRequest* message = hello__v1__hello_request__unpack(&allocator, (size_t)info.data_len, info.data);
+    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }
+    *out_message = message;
     return 0;
 }
 
-typedef struct hello_v1_greeter_say_hello_respond_context { trevrpc_call* call; int attempted; int submitted; int error; } hello_v1_greeter_say_hello_respond_context;
+int hello_v1_greeter_say_hello_decode_response_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloReply** out_message) {
+    if (receive == NULL || out_message == NULL) { return -EINVAL; }
+    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }
+    if (err != 0) { return err; }
+    if (info.kind != TREVRPC_RPC_RECEIVE_MESSAGE) { return -EPROTO; }
+    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }
+    trevrpc_generated_allocator_state allocator_state = {0};
+    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
+    Hello__V1__HelloReply* message = hello__v1__hello_reply__unpack(&allocator, (size_t)info.data_len, info.data);
+    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }
+    *out_message = message;
+    return 0;
+}
 
-static int hello_v1_greeter_say_hello_respond(void* context_value, const hello_v1_greeter_say_hello_response_view* response) {
-    hello_v1_greeter_say_hello_respond_context* context = (hello_v1_greeter_say_hello_respond_context*)context_value;
-    if (context == NULL || context->call == NULL || response == NULL) { return -EINVAL; }
-    if (context->attempted) { return -EALREADY; }
-    if ((response->status == TREVRPC_STATUS_OK && response->message == NULL) || (response->status != TREVRPC_STATUS_OK && response->message != NULL) || (response->status_message == NULL && response->status_message_len > 0)) { return -EINVAL; }
-    context->attempted = 1;
-    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];
-    uint8_t* body = NULL;
-    size_t body_len = 0;
-    if (response->message != NULL) {
-        body_len = hello__v1__hello_reply__get_packed_size(response->message);
-        body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
-        if (body_len > 0 && body == NULL) { context->error = -ENOMEM; return context->error; }
-        hello__v1__hello_reply__pack(response->message, body);
+int hello_v1_greeter_say_hello_matches_incoming(const trevrpc_rpc_event_info_v1* info) {
+    if (info == NULL || info->kind != TREVRPC_RPC_EVENT_CALL_INCOMING || info->rpc_kind != TREVRPC_RPC_KIND_UNARY) { return 0; }
+    return info->service != NULL && info->method != NULL && info->service_len == sizeof("hello.v1.Greeter") - 1 && memcmp(info->service, "hello.v1.Greeter", sizeof("hello.v1.Greeter") - 1) == 0 && info->method_len == sizeof("SayHello") - 1 && memcmp(info->method, "SayHello", sizeof("SayHello") - 1) == 0;
+}
+
+int hello_v1_greeter_say_hello_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream, trevrpc_rpc_receive** out_initial) {
+    if (event == NULL || out_call == NULL || out_stream == NULL || out_initial == NULL) { return -EINVAL; }
+    trevrpc_rpc_event_info_v1 info; int err = trevrpc_rpc_event_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_event_get_info_v1(event, &info); }
+    if (err == 0 && !hello_v1_greeter_say_hello_matches_incoming(&info)) { err = -EPROTO; }
+    if (err != 0) { return err; }
+    trevrpc_rpc_call_v1 call = {0}; trevrpc_rpc_stream_v1 stream = {0}; trevrpc_rpc_receive* initial = NULL;
+    err = trevrpc_rpc_event_take_incoming_call(event, &call, &stream, &initial);
+    if (err != 0) { return err; }
+    *out_call = call; *out_stream = stream; *out_initial = initial;
+    return 0;
+}
+
+int hello_v1_greeter_say_hello_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    return trevrpc_rpc_call_accept(runtime, call, operation_id);
+}
+
+int hello_v1_greeter_lots_of_replies_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size) {
+    int err = trevrpc_rpc_call_config_v1_init(config, struct_size);
+    if (err != 0) { return err; }
+    config->kind = TREVRPC_RPC_KIND_SERVER_STREAMING; config->service = "hello.v1.Greeter"; config->service_len = sizeof("hello.v1.Greeter") - 1;
+    config->method = "LotsOfReplies"; config->method_len = sizeof("LotsOfReplies") - 1; return 0;
+}
+
+int hello_v1_greeter_lots_of_replies_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const Hello__V1__HelloRequest* initial_or_null, uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE || out_call == NULL || out_stream == NULL) { return -EINVAL; }
+    trevrpc_rpc_call_config_v1 config; int err = hello_v1_greeter_lots_of_replies_call_config_init(&config, sizeof(config));
+    if (err != 0) { return err; }
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN]; uint8_t* body = NULL; size_t body_len = 0;
+    if (initial_or_null != NULL) {
+        body_len = hello__v1__hello_request__get_packed_size(initial_or_null);
+        body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+        if (body_len > 0 && body == NULL) { return -ENOMEM; }
+        hello__v1__hello_request__pack(initial_or_null, body); config.initial_message = body; config.initial_message_len = body_len;
     }
-    trevrpc_response_view_v1 view;
-    int err = trevrpc_response_view_v1_init(&view, sizeof(view));
-    if (err == 0) {
-        view.status = response->status; view.message = response->status_message; view.message_len = response->status_message_len; view.body = body; view.body_len = body_len; view.metadata = response->metadata;
-        err = trevrpc_call_respond_borrowed_v1(context->call, &view);
-    }
-    if (body != stack_body) { free(body); }
-    context->error = err;
-    context->submitted = err == 0;
+    err = trevrpc_rpc_call_open_v1(runtime, endpoint, &config, operation_id, out_call, out_stream);
+    if (initial_or_null != NULL) { if (body != stack_body) { free(body); } }
     return err;
 }
 
-static int hello_v1_greeter_say_hello_callback(void* user_data, trevrpc_call* call) {
-    const hello_v1_greeter_server* implementation = (const hello_v1_greeter_server*)user_data;
-    const trevrpc_call_context* context = trevrpc_call_get_context(call);
-    const trevrpc_request* request = trevrpc_call_request(call);
-    Hello__V1__HelloRequest* decoded = request == NULL ? NULL : hello__v1__hello_request__unpack(NULL, request->body_len, request->body);
-    if (decoded == NULL) { return TREVRPC_ERR_INVALID_FRAME; }
-    hello_v1_greeter_say_hello_respond_context respond_context = {.call = call};
-    int err = implementation->say_hello(implementation->user_data, context, decoded, hello_v1_greeter_say_hello_respond, &respond_context);
-    hello__v1__hello_request__free_unpacked(decoded, NULL);
-    if (respond_context.submitted) { return 0; }
-    if (respond_context.attempted && respond_context.error != 0) { return respond_context.error; }
-    return err != 0 ? err : TREVRPC_ERR_HANDLER_FAILED;
-}
-
-int hello_v1_greeter_lots_of_replies(trevrpc_channel* channel, const Hello__V1__HelloRequest* request, trevrpc_stream** stream) { return hello_v1_greeter_lots_of_replies_with_options(channel, request, NULL, stream); }
-
-int hello_v1_greeter_lots_of_replies_with_options(trevrpc_channel* channel, const Hello__V1__HelloRequest* request, const trevrpc_call_options_v1* options, trevrpc_stream** stream) {
-    if (channel == NULL || request == NULL || stream == NULL) { return -EINVAL; }
-    size_t body_len = hello__v1__hello_request__get_packed_size(request);
-    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];
-    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+int hello_v1_greeter_lots_of_replies_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const Hello__V1__HelloReply* message, uint64_t operation_id) {
+    if (runtime == NULL || message == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    size_t body_len = hello__v1__hello_reply__get_packed_size(message);
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN];
+    uint8_t* body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
     if (body_len > 0 && body == NULL) { return -ENOMEM; }
-    hello__v1__hello_request__pack(request, body);
-    trevrpc_request rpc_request = {.service = "hello.v1.Greeter", .service_len = sizeof("hello.v1.Greeter") - 1, .method = "LotsOfReplies", .method_len = sizeof("LotsOfReplies") - 1, .body = body, .body_len = body_len, .kind = TREVRPC_RPC_KIND_SERVER_STREAMING, .version = TREVRPC_WIRE_VERSION};
-    int err = trevrpc_channel_start_stream_request_v1(channel, &rpc_request, options, stream);
+    hello__v1__hello_reply__pack(message, body);
+    int err = trevrpc_rpc_stream_send_copy_v1(runtime, stream, operation_id, body, body_len, TREVRPC_RPC_SEND_FLAG_NONE);
     if (body != stack_body) { free(body); }
-    if (err == 0) { err = trevrpc_stream_finish_send(*stream); }
-    if (err != 0 && *stream != NULL) { trevrpc_stream_close(*stream); *stream = NULL; }
     return err;
 }
 
-static int hello_v1_greeter_lots_of_replies_callback(void* user_data, trevrpc_call* call) {
-    const hello_v1_greeter_server* implementation = (const hello_v1_greeter_server*)user_data;
-    const trevrpc_call_context* context = trevrpc_call_get_context(call);
-    trevrpc_stream* stream = trevrpc_call_stream(call);
-    const trevrpc_request* request = trevrpc_call_request(call);
-    Hello__V1__HelloRequest* decoded = request == NULL ? NULL : hello__v1__hello_request__unpack(NULL, request->body_len, request->body);
-    if (decoded == NULL) { return TREVRPC_ERR_INVALID_FRAME; }
-    int err = implementation->lots_of_replies(implementation->user_data, context, decoded, stream);
-    hello__v1__hello_request__free_unpacked(decoded, NULL);
+int hello_v1_greeter_lots_of_replies_finish(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id, const trevrpc_rpc_status_v1* status) {
+    if (runtime == NULL || status == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    return trevrpc_rpc_call_finish_v1(runtime, call, operation_id, status);
+}
+
+int hello_v1_greeter_lots_of_replies_decode_request_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloRequest** out_message) {
+    if (receive == NULL || out_message == NULL) { return -EINVAL; }
+    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }
     if (err != 0) { return err; }
-    trevrpc_status_view_v1 status;
-    err = trevrpc_status_view_v1_init(&status, sizeof(status));
-    return err == 0 ? trevrpc_call_finish_stream_borrowed_v1(call, &status) : err;
-}
-
-int hello_v1_greeter_lots_of_greetings_start(trevrpc_channel* channel, trevrpc_stream** stream) { return hello_v1_greeter_lots_of_greetings_start_with_options(channel, NULL, stream); }
-
-int hello_v1_greeter_lots_of_greetings_start_with_options(trevrpc_channel* channel, const trevrpc_call_options_v1* options, trevrpc_stream** stream) {
-    if (channel == NULL || stream == NULL) { return -EINVAL; }
-    trevrpc_request request = {.service = "hello.v1.Greeter", .service_len = sizeof("hello.v1.Greeter") - 1, .method = "LotsOfGreetings", .method_len = sizeof("LotsOfGreetings") - 1, .kind = TREVRPC_RPC_KIND_CLIENT_STREAMING, .version = TREVRPC_WIRE_VERSION};
-    return trevrpc_channel_start_stream_request_v1(channel, &request, options, stream);
-}
-
-typedef struct hello_v1_greeter_lots_of_greetings_respond_context { trevrpc_call* call; int attempted; int submitted; int error; } hello_v1_greeter_lots_of_greetings_respond_context;
-
-static int hello_v1_greeter_lots_of_greetings_respond(void* context_value, const hello_v1_greeter_lots_of_greetings_response_view* response) {
-    hello_v1_greeter_lots_of_greetings_respond_context* context = (hello_v1_greeter_lots_of_greetings_respond_context*)context_value;
-    if (context == NULL || context->call == NULL || response == NULL) { return -EINVAL; }
-    if (context->attempted) { return -EALREADY; }
-    if ((response->status == TREVRPC_STATUS_OK && response->message == NULL) || (response->status != TREVRPC_STATUS_OK && response->message != NULL) || (response->status_message == NULL && response->status_message_len > 0)) { return -EINVAL; }
-    context->attempted = 1;
-    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];
-    uint8_t* body = NULL;
-    size_t body_len = 0;
-    if (response->message != NULL) {
-        body_len = hello__v1__hello_reply__get_packed_size(response->message);
-        body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
-        if (body_len > 0 && body == NULL) { context->error = -ENOMEM; return context->error; }
-        hello__v1__hello_reply__pack(response->message, body);
-    }
-    trevrpc_stream* stream = trevrpc_call_stream(context->call);
-    int err = stream == NULL ? -EINVAL : 0;
-    if (err == 0 && response->message != NULL) {
-        err = trevrpc_stream_send_message_borrowed_wait(stream, body, body_len);
-    }
-    trevrpc_status_view_v1 status;
-    if (err == 0) { err = trevrpc_status_view_v1_init(&status, sizeof(status)); }
-    if (err == 0) {
-        status.status = response->status; status.message = response->status_message; status.message_len = response->status_message_len; status.metadata = response->metadata;
-        err = trevrpc_call_finish_stream_borrowed_v1(context->call, &status);
-    }
-    if (body != stack_body) { free(body); }
-    context->error = err;
-    context->submitted = err == 0;
-    return err;
-}
-
-static int hello_v1_greeter_lots_of_greetings_callback(void* user_data, trevrpc_call* call) {
-    const hello_v1_greeter_server* implementation = (const hello_v1_greeter_server*)user_data;
-    const trevrpc_call_context* context = trevrpc_call_get_context(call);
-    trevrpc_stream* stream = trevrpc_call_stream(call);
-    hello_v1_greeter_lots_of_greetings_respond_context respond_context = {.call = call};
-    int err = implementation->lots_of_greetings(implementation->user_data, context, stream, hello_v1_greeter_lots_of_greetings_respond, &respond_context);
-    if (respond_context.submitted) { return 0; }
-    if (respond_context.attempted && respond_context.error != 0) { return respond_context.error; }
-    return err != 0 ? err : TREVRPC_ERR_HANDLER_FAILED;
-}
-
-int hello_v1_greeter_bidi_hello_start(trevrpc_channel* channel, trevrpc_stream** stream) { return hello_v1_greeter_bidi_hello_start_with_options(channel, NULL, stream); }
-
-int hello_v1_greeter_bidi_hello_start_with_options(trevrpc_channel* channel, const trevrpc_call_options_v1* options, trevrpc_stream** stream) {
-    if (channel == NULL || stream == NULL) { return -EINVAL; }
-    trevrpc_request request = {.service = "hello.v1.Greeter", .service_len = sizeof("hello.v1.Greeter") - 1, .method = "BidiHello", .method_len = sizeof("BidiHello") - 1, .kind = TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, .version = TREVRPC_WIRE_VERSION};
-    return trevrpc_channel_start_stream_request_v1(channel, &request, options, stream);
-}
-
-static int hello_v1_greeter_bidi_hello_callback(void* user_data, trevrpc_call* call) {
-    const hello_v1_greeter_server* implementation = (const hello_v1_greeter_server*)user_data;
-    const trevrpc_call_context* context = trevrpc_call_get_context(call);
-    trevrpc_stream* stream = trevrpc_call_stream(call);
-    int err = implementation->bidi_hello(implementation->user_data, context, stream);
-    if (err != 0) { return err; }
-    trevrpc_status_view_v1 status;
-    err = trevrpc_status_view_v1_init(&status, sizeof(status));
-    return err == 0 ? trevrpc_call_finish_stream_borrowed_v1(call, &status) : err;
-}
-
-int hello_v1_greeter_register(trevrpc_server* server, const hello_v1_greeter_server* implementation) {
-    if (server == NULL || implementation == NULL) { return -EINVAL; }
-    if (implementation->say_hello == NULL) { return -EINVAL; }
-    if (implementation->lots_of_replies == NULL) { return -EINVAL; }
-    if (implementation->lots_of_greetings == NULL) { return -EINVAL; }
-    if (implementation->bidi_hello == NULL) { return -EINVAL; }
-    int err_say_hello = trevrpc_server_register_call(server, "hello.v1.Greeter", "SayHello", TREVRPC_RPC_KIND_UNARY, hello_v1_greeter_say_hello_callback, (void*)implementation);
-    if (err_say_hello != 0) { return err_say_hello; }
-    int err_lots_of_replies = trevrpc_server_register_call(server, "hello.v1.Greeter", "LotsOfReplies", TREVRPC_RPC_KIND_SERVER_STREAMING, hello_v1_greeter_lots_of_replies_callback, (void*)implementation);
-    if (err_lots_of_replies != 0) { return err_lots_of_replies; }
-    int err_lots_of_greetings = trevrpc_server_register_call(server, "hello.v1.Greeter", "LotsOfGreetings", TREVRPC_RPC_KIND_CLIENT_STREAMING, hello_v1_greeter_lots_of_greetings_callback, (void*)implementation);
-    if (err_lots_of_greetings != 0) { return err_lots_of_greetings; }
-    int err_bidi_hello = trevrpc_server_register_call(server, "hello.v1.Greeter", "BidiHello", TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, hello_v1_greeter_bidi_hello_callback, (void*)implementation);
-    if (err_bidi_hello != 0) { return err_bidi_hello; }
+    if (info.kind != TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE) { return -EPROTO; }
+    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }
+    trevrpc_generated_allocator_state allocator_state = {0};
+    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
+    Hello__V1__HelloRequest* message = hello__v1__hello_request__unpack(&allocator, (size_t)info.data_len, info.data);
+    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }
+    *out_message = message;
     return 0;
+}
+
+int hello_v1_greeter_lots_of_replies_decode_response_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloReply** out_message) {
+    if (receive == NULL || out_message == NULL) { return -EINVAL; }
+    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }
+    if (err != 0) { return err; }
+    if (info.kind != TREVRPC_RPC_RECEIVE_MESSAGE) { return -EPROTO; }
+    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }
+    trevrpc_generated_allocator_state allocator_state = {0};
+    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
+    Hello__V1__HelloReply* message = hello__v1__hello_reply__unpack(&allocator, (size_t)info.data_len, info.data);
+    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }
+    *out_message = message;
+    return 0;
+}
+
+int hello_v1_greeter_lots_of_replies_matches_incoming(const trevrpc_rpc_event_info_v1* info) {
+    if (info == NULL || info->kind != TREVRPC_RPC_EVENT_CALL_INCOMING || info->rpc_kind != TREVRPC_RPC_KIND_SERVER_STREAMING) { return 0; }
+    return info->service != NULL && info->method != NULL && info->service_len == sizeof("hello.v1.Greeter") - 1 && memcmp(info->service, "hello.v1.Greeter", sizeof("hello.v1.Greeter") - 1) == 0 && info->method_len == sizeof("LotsOfReplies") - 1 && memcmp(info->method, "LotsOfReplies", sizeof("LotsOfReplies") - 1) == 0;
+}
+
+int hello_v1_greeter_lots_of_replies_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream, trevrpc_rpc_receive** out_initial) {
+    if (event == NULL || out_call == NULL || out_stream == NULL || out_initial == NULL) { return -EINVAL; }
+    trevrpc_rpc_event_info_v1 info; int err = trevrpc_rpc_event_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_event_get_info_v1(event, &info); }
+    if (err == 0 && !hello_v1_greeter_lots_of_replies_matches_incoming(&info)) { err = -EPROTO; }
+    if (err != 0) { return err; }
+    trevrpc_rpc_call_v1 call = {0}; trevrpc_rpc_stream_v1 stream = {0}; trevrpc_rpc_receive* initial = NULL;
+    err = trevrpc_rpc_event_take_incoming_call(event, &call, &stream, &initial);
+    if (err != 0) { return err; }
+    *out_call = call; *out_stream = stream; *out_initial = initial;
+    return 0;
+}
+
+int hello_v1_greeter_lots_of_replies_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    return trevrpc_rpc_call_accept(runtime, call, operation_id);
+}
+
+int hello_v1_greeter_lots_of_greetings_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size) {
+    int err = trevrpc_rpc_call_config_v1_init(config, struct_size);
+    if (err != 0) { return err; }
+    config->kind = TREVRPC_RPC_KIND_CLIENT_STREAMING; config->service = "hello.v1.Greeter"; config->service_len = sizeof("hello.v1.Greeter") - 1;
+    config->method = "LotsOfGreetings"; config->method_len = sizeof("LotsOfGreetings") - 1; return 0;
+}
+
+int hello_v1_greeter_lots_of_greetings_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const Hello__V1__HelloRequest* initial_or_null, uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE || out_call == NULL || out_stream == NULL) { return -EINVAL; }
+    trevrpc_rpc_call_config_v1 config; int err = hello_v1_greeter_lots_of_greetings_call_config_init(&config, sizeof(config));
+    if (err != 0) { return err; }
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN]; uint8_t* body = NULL; size_t body_len = 0;
+    if (initial_or_null != NULL) {
+        body_len = hello__v1__hello_request__get_packed_size(initial_or_null);
+        body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+        if (body_len > 0 && body == NULL) { return -ENOMEM; }
+        hello__v1__hello_request__pack(initial_or_null, body); config.initial_message = body; config.initial_message_len = body_len;
+    }
+    err = trevrpc_rpc_call_open_v1(runtime, endpoint, &config, operation_id, out_call, out_stream);
+    if (initial_or_null != NULL) { if (body != stack_body) { free(body); } }
+    return err;
+}
+
+int hello_v1_greeter_lots_of_greetings_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const Hello__V1__HelloRequest* message, uint64_t operation_id) {
+    if (runtime == NULL || message == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    size_t body_len = hello__v1__hello_request__get_packed_size(message);
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN];
+    uint8_t* body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+    if (body_len > 0 && body == NULL) { return -ENOMEM; }
+    hello__v1__hello_request__pack(message, body);
+    int err = trevrpc_rpc_stream_send_copy_v1(runtime, stream, operation_id, body, body_len, TREVRPC_RPC_SEND_FLAG_NONE);
+    if (body != stack_body) { free(body); }
+    return err;
+}
+
+int hello_v1_greeter_lots_of_greetings_finish_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, uint64_t operation_id) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    return trevrpc_rpc_stream_finish_send(runtime, stream, operation_id);
+}
+
+int hello_v1_greeter_lots_of_greetings_respond(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, const Hello__V1__HelloReply* message, const trevrpc_rpc_status_v1* status, uint64_t operation_id) {
+    if (runtime == NULL || status == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN]; uint8_t* body = NULL; size_t body_len = 0;
+    if (message != NULL) {
+        body_len = hello__v1__hello_reply__get_packed_size(message);
+        body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+        if (body_len > 0 && body == NULL) { return -ENOMEM; }
+        hello__v1__hello_reply__pack(message, body);
+    }
+    int err = trevrpc_rpc_call_respond_copy_v1(runtime, call, operation_id, status, body, body_len);
+    if (body != stack_body) { free(body); }
+    return err;
+}
+
+int hello_v1_greeter_lots_of_greetings_decode_request_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloRequest** out_message) {
+    if (receive == NULL || out_message == NULL) { return -EINVAL; }
+    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }
+    if (err != 0) { return err; }
+    if (info.kind != TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE && info.kind != TREVRPC_RPC_RECEIVE_MESSAGE) { return -EPROTO; }
+    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }
+    trevrpc_generated_allocator_state allocator_state = {0};
+    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
+    Hello__V1__HelloRequest* message = hello__v1__hello_request__unpack(&allocator, (size_t)info.data_len, info.data);
+    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }
+    *out_message = message;
+    return 0;
+}
+
+int hello_v1_greeter_lots_of_greetings_decode_response_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloReply** out_message) {
+    if (receive == NULL || out_message == NULL) { return -EINVAL; }
+    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }
+    if (err != 0) { return err; }
+    if (info.kind != TREVRPC_RPC_RECEIVE_MESSAGE) { return -EPROTO; }
+    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }
+    trevrpc_generated_allocator_state allocator_state = {0};
+    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
+    Hello__V1__HelloReply* message = hello__v1__hello_reply__unpack(&allocator, (size_t)info.data_len, info.data);
+    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }
+    *out_message = message;
+    return 0;
+}
+
+int hello_v1_greeter_lots_of_greetings_matches_incoming(const trevrpc_rpc_event_info_v1* info) {
+    if (info == NULL || info->kind != TREVRPC_RPC_EVENT_CALL_INCOMING || info->rpc_kind != TREVRPC_RPC_KIND_CLIENT_STREAMING) { return 0; }
+    return info->service != NULL && info->method != NULL && info->service_len == sizeof("hello.v1.Greeter") - 1 && memcmp(info->service, "hello.v1.Greeter", sizeof("hello.v1.Greeter") - 1) == 0 && info->method_len == sizeof("LotsOfGreetings") - 1 && memcmp(info->method, "LotsOfGreetings", sizeof("LotsOfGreetings") - 1) == 0;
+}
+
+int hello_v1_greeter_lots_of_greetings_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream, trevrpc_rpc_receive** out_initial) {
+    if (event == NULL || out_call == NULL || out_stream == NULL || out_initial == NULL) { return -EINVAL; }
+    trevrpc_rpc_event_info_v1 info; int err = trevrpc_rpc_event_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_event_get_info_v1(event, &info); }
+    if (err == 0 && !hello_v1_greeter_lots_of_greetings_matches_incoming(&info)) { err = -EPROTO; }
+    if (err != 0) { return err; }
+    trevrpc_rpc_call_v1 call = {0}; trevrpc_rpc_stream_v1 stream = {0}; trevrpc_rpc_receive* initial = NULL;
+    err = trevrpc_rpc_event_take_incoming_call(event, &call, &stream, &initial);
+    if (err != 0) { return err; }
+    *out_call = call; *out_stream = stream; *out_initial = initial;
+    return 0;
+}
+
+int hello_v1_greeter_lots_of_greetings_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    return trevrpc_rpc_call_accept(runtime, call, operation_id);
+}
+
+int hello_v1_greeter_bidi_hello_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size) {
+    int err = trevrpc_rpc_call_config_v1_init(config, struct_size);
+    if (err != 0) { return err; }
+    config->kind = TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING; config->service = "hello.v1.Greeter"; config->service_len = sizeof("hello.v1.Greeter") - 1;
+    config->method = "BidiHello"; config->method_len = sizeof("BidiHello") - 1; return 0;
+}
+
+int hello_v1_greeter_bidi_hello_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const Hello__V1__HelloRequest* initial_or_null, uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE || out_call == NULL || out_stream == NULL) { return -EINVAL; }
+    trevrpc_rpc_call_config_v1 config; int err = hello_v1_greeter_bidi_hello_call_config_init(&config, sizeof(config));
+    if (err != 0) { return err; }
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN]; uint8_t* body = NULL; size_t body_len = 0;
+    if (initial_or_null != NULL) {
+        body_len = hello__v1__hello_request__get_packed_size(initial_or_null);
+        body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+        if (body_len > 0 && body == NULL) { return -ENOMEM; }
+        hello__v1__hello_request__pack(initial_or_null, body); config.initial_message = body; config.initial_message_len = body_len;
+    }
+    err = trevrpc_rpc_call_open_v1(runtime, endpoint, &config, operation_id, out_call, out_stream);
+    if (initial_or_null != NULL) { if (body != stack_body) { free(body); } }
+    return err;
+}
+
+int hello_v1_greeter_bidi_hello_send_request(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const Hello__V1__HelloRequest* message, uint64_t operation_id) {
+    if (runtime == NULL || message == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    size_t body_len = hello__v1__hello_request__get_packed_size(message);
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN];
+    uint8_t* body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+    if (body_len > 0 && body == NULL) { return -ENOMEM; }
+    hello__v1__hello_request__pack(message, body);
+    int err = trevrpc_rpc_stream_send_copy_v1(runtime, stream, operation_id, body, body_len, TREVRPC_RPC_SEND_FLAG_NONE);
+    if (body != stack_body) { free(body); }
+    return err;
+}
+
+int hello_v1_greeter_bidi_hello_finish_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, uint64_t operation_id) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    return trevrpc_rpc_stream_finish_send(runtime, stream, operation_id);
+}
+
+int hello_v1_greeter_bidi_hello_send_response(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const Hello__V1__HelloReply* message, uint64_t operation_id) {
+    if (runtime == NULL || message == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    size_t body_len = hello__v1__hello_reply__get_packed_size(message);
+    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN];
+    uint8_t* body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));
+    if (body_len > 0 && body == NULL) { return -ENOMEM; }
+    hello__v1__hello_reply__pack(message, body);
+    int err = trevrpc_rpc_stream_send_copy_v1(runtime, stream, operation_id, body, body_len, TREVRPC_RPC_SEND_FLAG_NONE);
+    if (body != stack_body) { free(body); }
+    return err;
+}
+
+int hello_v1_greeter_bidi_hello_finish(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id, const trevrpc_rpc_status_v1* status) {
+    if (runtime == NULL || status == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    return trevrpc_rpc_call_finish_v1(runtime, call, operation_id, status);
+}
+
+int hello_v1_greeter_bidi_hello_decode_request_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloRequest** out_message) {
+    if (receive == NULL || out_message == NULL) { return -EINVAL; }
+    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }
+    if (err != 0) { return err; }
+    if (info.kind != TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE && info.kind != TREVRPC_RPC_RECEIVE_MESSAGE) { return -EPROTO; }
+    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }
+    trevrpc_generated_allocator_state allocator_state = {0};
+    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
+    Hello__V1__HelloRequest* message = hello__v1__hello_request__unpack(&allocator, (size_t)info.data_len, info.data);
+    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }
+    *out_message = message;
+    return 0;
+}
+
+int hello_v1_greeter_bidi_hello_decode_response_receive(const trevrpc_rpc_receive* receive, Hello__V1__HelloReply** out_message) {
+    if (receive == NULL || out_message == NULL) { return -EINVAL; }
+    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }
+    if (err != 0) { return err; }
+    if (info.kind != TREVRPC_RPC_RECEIVE_MESSAGE) { return -EPROTO; }
+    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }
+    trevrpc_generated_allocator_state allocator_state = {0};
+    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);
+    Hello__V1__HelloReply* message = hello__v1__hello_reply__unpack(&allocator, (size_t)info.data_len, info.data);
+    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }
+    *out_message = message;
+    return 0;
+}
+
+int hello_v1_greeter_bidi_hello_matches_incoming(const trevrpc_rpc_event_info_v1* info) {
+    if (info == NULL || info->kind != TREVRPC_RPC_EVENT_CALL_INCOMING || info->rpc_kind != TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) { return 0; }
+    return info->service != NULL && info->method != NULL && info->service_len == sizeof("hello.v1.Greeter") - 1 && memcmp(info->service, "hello.v1.Greeter", sizeof("hello.v1.Greeter") - 1) == 0 && info->method_len == sizeof("BidiHello") - 1 && memcmp(info->method, "BidiHello", sizeof("BidiHello") - 1) == 0;
+}
+
+int hello_v1_greeter_bidi_hello_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream, trevrpc_rpc_receive** out_initial) {
+    if (event == NULL || out_call == NULL || out_stream == NULL || out_initial == NULL) { return -EINVAL; }
+    trevrpc_rpc_event_info_v1 info; int err = trevrpc_rpc_event_info_v1_init(&info, sizeof(info));
+    if (err == 0) { err = trevrpc_rpc_event_get_info_v1(event, &info); }
+    if (err == 0 && !hello_v1_greeter_bidi_hello_matches_incoming(&info)) { err = -EPROTO; }
+    if (err != 0) { return err; }
+    trevrpc_rpc_call_v1 call = {0}; trevrpc_rpc_stream_v1 stream = {0}; trevrpc_rpc_receive* initial = NULL;
+    err = trevrpc_rpc_event_take_incoming_call(event, &call, &stream, &initial);
+    if (err != 0) { return err; }
+    *out_call = call; *out_stream = stream; *out_initial = initial;
+    return 0;
+}
+
+int hello_v1_greeter_bidi_hello_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id) {
+    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }
+    return trevrpc_rpc_call_accept(runtime, call, operation_id);
 }

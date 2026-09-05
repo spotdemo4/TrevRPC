@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(msquic CONFIG)
+find_dependency(trevrpc_rpc @PROJECT_VERSION@ EXACT CONFIG)
+find_dependency(trevrpc_engine_msquic @PROJECT_VERSION@ EXACT CONFIG)
+
+set(TREVRPC_RPC_MSQUIC_ABI_VERSION @TREVRPC_RPC_MSQUIC_ABI_VERSION@)
+include("${CMAKE_CURRENT_LIST_DIR}/trevrpcRpcMsquicTargets.cmake")
+check_required_components(trevrpc_rpc_msquic)

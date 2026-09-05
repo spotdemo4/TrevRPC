@@ -960,16 +960,23 @@ int trevrpc_engine_provider_reserve_mandatory(trevrpc_engine* engine, trevrpc_en
 int trevrpc_engine_provider_publish_reserved(
     trevrpc_engine* engine, trevrpc_engine_reservation* reservation, const trevrpc_engine_event_spec* spec) {
     trevrpc_engine_event* event;
+    bool abort_publication = false;
     bool call_provider = false;
     int result = 0;
     int wake_result;
     if (engine == NULL || reservation == NULL || spec == NULL) {
+        if (spec != NULL && spec->mandatory_abort_hook != NULL) {
+            spec->mandatory_abort_hook(engine != NULL ? engine->provider_context : NULL, spec->mandatory_hook_context);
+        }
         if (engine != NULL && reservation != NULL) {
             trevrpc_engine_provider_cancel_reservation(engine, reservation);
         }
         return -EINVAL;
     }
     if (!trevrpc_engine_reservation_consume(reservation)) {
+        if (spec->mandatory_abort_hook != NULL) {
+            spec->mandatory_abort_hook(engine->provider_context, spec->mandatory_hook_context);
+        }
         return -EALREADY;
     }
     event = reservation->event;
@@ -998,15 +1005,24 @@ int trevrpc_engine_provider_publish_reserved(
     if (result == 0 && engine->state < TREVRPC_ENGINE_STATE_STOPPED) {
         wake_result = trevrpc_engine_queue_event_locked(engine, event);
         event = NULL;
+        if (spec->mandatory_commit_hook != NULL) {
+            spec->mandatory_commit_hook(engine->provider_context, spec->mandatory_hook_context);
+        }
         if (wake_result != 0) {
             call_provider = trevrpc_engine_record_failure_locked(engine, wake_result, spec->provider_error_code);
         }
-    } else if (result == 0) {
-        result = -EPIPE;
+    } else {
+        if (result == 0) {
+            result = -EPIPE;
+        }
+        abort_publication = true;
     }
     trevrpc_engine_maybe_publish_stopped_locked(engine);
     pthread_cond_broadcast(&engine->condition);
     pthread_mutex_unlock(&engine->mutex);
+    if (abort_publication && spec->mandatory_abort_hook != NULL) {
+        spec->mandatory_abort_hook(engine->provider_context, spec->mandatory_hook_context);
+    }
     trevrpc_engine_event_destroy(event);
     trevrpc_engine_reservation_release(reservation);
     if (call_provider) {

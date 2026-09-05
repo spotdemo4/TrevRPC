@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package identifier_collision;
+
+message Empty {}
+
+service FooBar {
+  rpc Call(Empty) returns (Empty);
+}
+
+service foo_bar {
+  rpc Call(Empty) returns (Empty);
+}

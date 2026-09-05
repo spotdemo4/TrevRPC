@@ -27,6 +27,10 @@ typedef struct trevrpc_engine_event_spec {
     trevrpc_engine_detach_hook dequeue_hook;
     trevrpc_engine_detach_hook drop_hook;
     void* hook_context;
+    /* Mandatory publication commits while the queue mutex still excludes consumers. */
+    trevrpc_engine_detach_hook mandatory_commit_hook;
+    trevrpc_engine_detach_hook mandatory_abort_hook;
+    void* mandatory_hook_context;
 } trevrpc_engine_event_spec;
 
 typedef struct trevrpc_engine_provider_diagnostics {

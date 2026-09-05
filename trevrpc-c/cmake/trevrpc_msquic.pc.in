@@ -1,4 +1,4 @@
-prefix=${pcfiledir}/../..
+prefix=@trevrpc_pc_prefix@
 exec_prefix=${prefix}
 libdir=@trevrpc_pc_libdir@
 includedir=@trevrpc_pc_includedir@
@@ -9,5 +9,5 @@ Description: TrevRPC C low-level MsQuic transport wrapper
 Version: @PROJECT_VERSION@
 Requires.private: trevrpc_core = @PROJECT_VERSION@
 Libs: -L${libdir} -ltrevrpc_msquic
-Libs.private: -ltrevrpc_msquic_native_core -ltrevrpc_protocol_core -ltrevrpc_msquic_api_owner -lmsquic -lpthread
+Libs.private: -ltrevrpc_msquic_native_core -ltrevrpc_protocol_core -ltrevrpc_msquic_api_owner -lmsquic @CMAKE_THREAD_LIBS_INIT@
 Cflags: -I${includedir}

@@ -1,0 +1,12 @@
+prefix=@trevrpc_pc_prefix@
+exec_prefix=${prefix}
+libdir=@trevrpc_pc_libdir@
+includedir=@trevrpc_pc_includedir@
+trevrpc_rpc_abi_version=@TREVRPC_RPC_ABI_VERSION@
+
+Name: trevrpc_rpc
+Description: TrevRPC asynchronous RPC runtime
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ltrevrpc_rpc
+Libs.private: -L${libdir}/trevrpc/rpc-abi1 -ltrevrpc_rpc_private_core @CMAKE_THREAD_LIBS_INIT@
+Cflags: -I${includedir}

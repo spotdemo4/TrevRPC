@@ -3,7 +3,8 @@
 #include "peer.h"
 
 #include "operations.h"
-#include "trevrpc.h"
+#include "trevrpc_rpc.h"
+#include "trevrpc_wire_internal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -47,6 +48,12 @@ void cf_json_append(cf_json *json, const char *value) {
 
 void cf_json_append_char(cf_json *json, char value) {
   cf_json_append_bytes(json, &value, 1);
+}
+
+uint32_t cf_status_code_from_uint32(uint32_t code) {
+  return code <= TREVRPC_RPC_STATUS_UNAUTHENTICATED
+             ? code
+             : TREVRPC_RPC_STATUS_UNKNOWN;
 }
 
 static void cf_json_append_uint(cf_json *json, uint64_t value) {
@@ -730,7 +737,7 @@ int cf_peer_main(const char *peer, int argc, char **argv,
     cf_json payload;
     cf_json_init(&payload, payload_buffer, sizeof(payload_buffer));
     cf_error error = {.category = "malformed_protobuf",
-                      .status_code = TREVRPC_STATUS_INTERNAL};
+                      .status_code = TREVRPC_RPC_STATUS_INTERNAL};
     int operation_result =
         cf_dispatch_operation(&command, state_dispatch, &payload, &error);
     if (payload.failed) {

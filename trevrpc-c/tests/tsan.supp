@@ -1,7 +1,9 @@
-# libmsquic 2.5.8 teardown paths. Revalidate when the pinned version changes.
+# libmsquic 2.6.0 teardown paths. Revalidate when the pinned version changes.
 race:^CxPlatSocketContextUninitializeComplete$
+race:^CxPlatProcessEvents$
 race:^QuicDatagramUninitialize$
+race:^QuicLookupUninitialize$
 
-# OpenSSL teardown paths statically embedded in libmsquic 2.5.8.
+# OpenSSL teardown paths statically embedded in libmsquic 2.6.0.
 race:^ossl_init_register_atexit_ossl_$
 race:^EVP_CIPHER_CTX_reset$

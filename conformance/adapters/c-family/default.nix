@@ -9,6 +9,7 @@
   trevrpcCSrc,
   trevrpcCppSrc,
   sanitizers ? false,
+  cOnly ? false,
 }:
 stdenv.mkDerivation (final: {
   pname = "trevrpc-c-family-conformance-peers";
@@ -16,11 +17,13 @@ stdenv.mkDerivation (final: {
 
   src = lib.fileset.toSource {
     root = ../../../.;
-    fileset = lib.fileset.unions [
-      ./.
-      trevrpcCSrc
-      trevrpcCppSrc
-    ];
+    fileset = lib.fileset.unions (
+      [
+        ./.
+        trevrpcCSrc
+      ]
+      ++ lib.optionals (!cOnly) [ trevrpcCppSrc ]
+    );
   };
   sourceRoot = "${final.src.name}/conformance/adapters/c-family";
 
@@ -41,7 +44,8 @@ stdenv.mkDerivation (final: {
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX="$out" \
       -DCMAKE_INSTALL_BINDIR=bin \
-      -DTREVRPC_C_FAMILY_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"}
+      -DTREVRPC_C_FAMILY_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
+      -DTREVRPC_C_FAMILY_C_ONLY=${if cOnly then "ON" else "OFF"}
     runHook postConfigure
   '';
 
@@ -68,14 +72,23 @@ stdenv.mkDerivation (final: {
   installCheckPhase = ''
     runHook preInstallCheck
     test -x "$out/bin/trevrpc-conformance-c"
-    test -x "$out/bin/trevrpc-conformance-cpp"
+    ${lib.optionalString cOnly ''
+      test ! -e "$out/bin/trevrpc-conformance-cpp"
+    ''}
+    ${lib.optionalString (!cOnly) ''
+      test -x "$out/bin/trevrpc-conformance-cpp"
+    ''}
     runHook postInstallCheck
   '';
 
   passthru.msquicProvider = libmsquic;
 
   meta = {
-    description = "C and C++ TrevRPC conformance process peers";
+    description =
+      if cOnly then
+        "C TrevRPC RPC ABI 1 conformance process peer"
+      else
+        "C and C++ TrevRPC conformance process peers";
     license = lib.licenses.mit;
     platforms = lib.platforms.linux;
   };

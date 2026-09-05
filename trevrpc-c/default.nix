@@ -14,6 +14,7 @@
   peerBinaries ? [ ],
   sanitizers ? false,
   threadSanitizer ? false,
+  legacyCompatibility ? false,
 }:
 assert !(sanitizers && threadSanitizer);
 stdenv.mkDerivation (
@@ -48,11 +49,19 @@ stdenv.mkDerivation (
         -DTREVRPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc" \
         -DTREVRPC_ENGINE_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_engine" \
         -DTREVRPC_ENGINE_MSQUIC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_engine_msquic" \
-        -DTREVRPC_MSQUIC_NATIVE_CORE_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_msquic_native_core" \
+        -DTREVRPC_RPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_rpc" \
+        -DTREVRPC_RPC_MSQUIC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_rpc_msquic" \
         -DTREVRPC_INSTALL_PKGCONFIGDIR="$dev/lib/pkgconfig" \
-        -DTREVRPC_BUILD_BENCHMARKS=ON \
-        -DTREVRPC_BUILD_TESTS=ON \
-        -DTREVRPC_BUILD_ENGINE_MSQUIC=ON \
+        -DTREVRPC_BUILD_BENCHMARKS=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_TESTS=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_CODEGEN=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_ENGINE=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_MSQUIC=${if legacyCompatibility then "ON" else "OFF"} \
+        -DTREVRPC_BUILD_WEBTRANSPORT=${if legacyCompatibility then "ON" else "OFF"} \
+        -DTREVRPC_BUILD_RUNTIME=${if legacyCompatibility then "ON" else "OFF"} \
+        -DTREVRPC_BUILD_ENGINE_MSQUIC=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_RPC=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_RPC_MSQUIC=${if legacyCompatibility then "OFF" else "ON"} \
         -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
         -DTREVRPC_ENABLE_THREAD_SANITIZER=${if threadSanitizer then "ON" else "OFF"}
       runHook postConfigure
@@ -75,7 +84,8 @@ stdenv.mkDerivation (
       runHook postBuild
     '';
 
-    doCheck = true;
+    # The legacy lane is an internal build input for C++/Node migration only.
+    doCheck = !legacyCompatibility;
     checkPhase = ''
       runHook preCheck
       export HOME=$TMPDIR
@@ -89,7 +99,12 @@ stdenv.mkDerivation (
         -DQUIC_API_ENABLE_PREVIEW_FEATURES \
         -DTREVRPC_GENERATED_TESTING \
         -DTREVRPC_H3_INGRESS_TESTING \
+        -DTREVRPC_RPC_TRANSPORT_H3_TESTING \
         -DTREVRPC_MSQUIC_PROVIDER_CAPABILITIES \
+        '-DTREVRPC_MSQUIC_TEST_CERT="build/msquic-test-cert.pem"' \
+        '-DTREVRPC_MSQUIC_TEST_KEY="build/msquic-test-key.pem"' \
+        '-DTREVRPC_GENERATED_HEADER="build/generated-service-test/greeter.trevrpc.h"' \
+        '-DTREVRPC_GENERATED_SOURCE="build/generated-service-test/greeter.trevrpc.c"' \
         -Iinclude \
         -Isrc \
         -Ibuild/protoc-gen-trevrpc-c-protos \
@@ -107,13 +122,16 @@ stdenv.mkDerivation (
       runHook postInstall
     '';
 
-    postInstall = optionalString stdenv.hostPlatform.isLinux (
-      concatMapStringsSep "\n" (
-        peer: "install -Dm755 ${peer.package}/bin/${peer.binary} $out/bin/${peer.binary}"
-      ) peerBinaries
-    );
+    postInstall = ''
+      mkdir -p "$out"
+      ${optionalString stdenv.hostPlatform.isLinux (
+        concatMapStringsSep "\n" (
+          peer: "install -Dm755 ${peer.package}/bin/${peer.binary} $out/bin/${peer.binary}"
+        ) peerBinaries
+      )}
+    '';
 
-    doInstallCheck = true;
+    doInstallCheck = !legacyCompatibility;
     installCheckPhase = ''
       runHook preInstallCheck
       test -x "$out/bin/protoc-gen-trevrpc-c"
@@ -121,46 +139,61 @@ stdenv.mkDerivation (
       ${optionalString stdenv.hostPlatform.isLinux ''
         test -x "$out/bin/trevrpc-conformance-c"
       ''}
-      test -f "$dev/include/trevrpc_binding.h"
+      test ! -e "$dev/include/trevrpc.h"
+      test ! -e "$dev/include/trevrpc_binding.h"
       test -f "$dev/include/trevrpc_engine.h"
       test -f "$dev/include/trevrpc_engine_msquic.h"
+      test -f "$dev/include/trevrpc_rpc.h"
+      test -f "$dev/include/trevrpc_rpc_msquic.h"
+      test ! -e "$dev/include/trevrpc_msquic.h"
+      test ! -e "$dev/include/trevrpc_raw.h"
+      test ! -e "$dev/include/trevrpc_webtransport.h"
       test ! -e "$dev/include/trevrpc_preview.h"
-      test -f "$dev/lib/cmake/trevrpc/trevrpcConfig.cmake"
+      test ! -e "$dev/lib/cmake/trevrpc"
       test -f "$dev/lib/cmake/trevrpc_engine/trevrpc_engineConfig.cmake"
       test -f "$dev/lib/cmake/trevrpc_engine/trevrpcEngineTargets.cmake"
       test -f "$dev/lib/cmake/trevrpc_engine_msquic/trevrpc_engine_msquicConfig.cmake"
       test -f "$dev/lib/cmake/trevrpc_engine_msquic/trevrpcEngineMsquicTargets.cmake"
-      test -f "$dev/lib/pkgconfig/trevrpc.pc"
-      test -f "$dev/lib/pkgconfig/trevrpc_core.pc"
-      test -f "$dev/lib/pkgconfig/trevrpc_msquic.pc"
-      test -f "$dev/lib/pkgconfig/trevrpc_webtransport.pc"
+      test -f "$dev/lib/cmake/trevrpc_rpc/trevrpc_rpcConfig.cmake"
+      test -f "$dev/lib/cmake/trevrpc_rpc/trevrpcRpcTargets.cmake"
+      test -f "$dev/lib/cmake/trevrpc_rpc_msquic/trevrpc_rpc_msquicConfig.cmake"
+      test -f "$dev/lib/cmake/trevrpc_rpc_msquic/trevrpcRpcMsquicTargets.cmake"
+      test ! -e "$dev/lib/pkgconfig/trevrpc.pc"
+      test ! -e "$dev/lib/pkgconfig/trevrpc_core.pc"
+      test ! -e "$dev/lib/pkgconfig/trevrpc_msquic.pc"
+      test ! -e "$dev/lib/pkgconfig/trevrpc_webtransport.pc"
       test -f "$dev/lib/pkgconfig/trevrpc_engine.pc"
       test -f "$dev/lib/pkgconfig/trevrpc_engine_msquic.pc"
-      test -f "$lib/lib/libtrevrpc.a"
+      test -f "$dev/lib/pkgconfig/trevrpc_rpc.pc"
+      test -f "$dev/lib/pkgconfig/trevrpc_rpc_msquic.pc"
+      test ! -e "$lib/lib/libtrevrpc.a"
       test -f "$lib/lib/libtrevrpc_engine.a"
       test -f "$lib/lib/libtrevrpc_engine_msquic.a"
+      test -f "$lib/lib/libtrevrpc_rpc.a"
+      test -f "$lib/lib/libtrevrpc_rpc_msquic.a"
       test -f "$lib/lib/libtrevrpc_msquic_api_owner.a"
-      test -f "$lib/lib/libtrevrpc_msquic_native_core.a"
-      test -f "$lib/lib/libtrevrpc_protocol_core.a"
-      ! grep -R 'add_library(trevrpc::trevrpc_protocol_core' "$dev/lib/cmake/trevrpc"
+      test -f "$lib/lib/trevrpc/rpc-abi1/libtrevrpc_rpc_private_core.a"
+      test -f "$lib/lib/trevrpc/rpc-abi1/libtrevrpc_rpc_private_msquic_native.a"
+      test -f "$lib/lib/trevrpc/rpc-abi1/libtrevrpc_rpc_private_protocol.a"
+      test ! -e "$lib/lib/libtrevrpc_core.a"
+      test ! -e "$lib/lib/libtrevrpc_msquic_native_core.a"
+      test ! -e "$lib/lib/libtrevrpc_protocol_core.a"
+      ! grep -R -E 'add_library\(trevrpc::(trevrpc_core|trevrpc_protocol_core|trevrpc_msquic_native_core|trevrpc_rpc_private_[A-Za-z0-9_]+)' "$dev/lib/cmake"
       test ! -e "$out/include"
       test ! -e "$out/lib"
 
-      test "$(pkg-config \
-        --define-prefix \
-        --variable=libdir "$dev/lib/pkgconfig/trevrpc.pc")" = "$lib/lib"
-      test "$(pkg-config \
-        --define-prefix \
-        --variable=includedir "$dev/lib/pkgconfig/trevrpc.pc")" = "$dev/include"
-      test "$(pkg-config \
-        --define-prefix \
-        --variable=trevrpc_c_abi_version "$dev/lib/pkgconfig/trevrpc.pc")" = "6"
       test "$(pkg-config \
         --define-prefix \
         --variable=trevrpc_engine_abi_version "$dev/lib/pkgconfig/trevrpc_engine.pc")" = "1"
       test "$(pkg-config \
         --define-prefix \
         --variable=trevrpc_engine_msquic_abi_version "$dev/lib/pkgconfig/trevrpc_engine_msquic.pc")" = "1"
+      test "$(pkg-config \
+        --define-prefix \
+        --variable=trevrpc_rpc_abi_version "$dev/lib/pkgconfig/trevrpc_rpc.pc")" = "1"
+      test "$(pkg-config \
+        --define-prefix \
+        --variable=trevrpc_rpc_msquic_abi_version "$dev/lib/pkgconfig/trevrpc_rpc_msquic.pc")" = "1"
 
       consumer_sanitizer_flags="${optionalString sanitizers "-fsanitize=address,undefined -fno-omit-frame-pointer"}${optionalString threadSanitizer "-fsanitize=thread -fno-omit-frame-pointer"}"
       export CFLAGS="$consumer_sanitizer_flags''${CFLAGS:+ $CFLAGS}"
@@ -170,12 +203,12 @@ stdenv.mkDerivation (
         -DCMAKE_PREFIX_PATH="$dev;$lib" \
         -DTREVRPC_C_GENERATOR_EXECUTABLE="$out/bin/protoc-gen-trevrpc-c"
       cmake --build "$TMPDIR/trevrpc-installed-cmake" --parallel $NIX_BUILD_CORES
-      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-cmake-consumer"
-      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-msquic-cmake-consumer"
-      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-webtransport-cmake-consumer"
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-cmake-consumer"
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-msquic-cmake-consumer"
       "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-engine-msquic-cmake-cpp-consumer"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-rpc-cmake-consumer"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-rpc-msquic-cmake-consumer"
+      "$TMPDIR/trevrpc-installed-cmake/trevrpc-installed-cmake-consumer"
 
       export PKG_CONFIG_PATH="$dev/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
       cc $consumer_sanitizer_flags \
@@ -189,15 +222,15 @@ stdenv.mkDerivation (
         $(pkg-config --static --cflags --libs trevrpc_engine_msquic)
       "$TMPDIR/trevrpc-installed-engine-msquic-pkg-config-consumer"
       cc $consumer_sanitizer_flags \
-        tests/install/pkg-config/msquic_main.c \
-        -o "$TMPDIR/trevrpc-installed-msquic-pkg-config-consumer" \
-        $(pkg-config --static --cflags --libs trevrpc_msquic)
-      "$TMPDIR/trevrpc-installed-msquic-pkg-config-consumer"
+        tests/install/pkg-config/rpc_main.c \
+        -o "$TMPDIR/trevrpc-installed-rpc-pkg-config-consumer" \
+        $(pkg-config --static --cflags --libs trevrpc_rpc)
+      "$TMPDIR/trevrpc-installed-rpc-pkg-config-consumer"
       cc $consumer_sanitizer_flags \
-        tests/install/pkg-config/webtransport_main.c \
-        -o "$TMPDIR/trevrpc-installed-webtransport-pkg-config-consumer" \
-        $(pkg-config --static --cflags --libs trevrpc_webtransport)
-      "$TMPDIR/trevrpc-installed-webtransport-pkg-config-consumer"
+        tests/install/pkg-config/rpc_msquic_main.c \
+        -o "$TMPDIR/trevrpc-installed-rpc-msquic-pkg-config-consumer" \
+        $(pkg-config --static --cflags --libs trevrpc_rpc_msquic)
+      "$TMPDIR/trevrpc-installed-rpc-msquic-pkg-config-consumer"
 
       pkg_codegen="$TMPDIR/trevrpc-installed-pkg-config-codegen"
       mkdir -p "$pkg_codegen"
@@ -211,7 +244,7 @@ stdenv.mkDerivation (
         "$pkg_codegen/greeter.pb-c.c" \
         "$pkg_codegen/greeter.trevrpc.c" \
         -o "$TMPDIR/trevrpc-installed-pkg-config-consumer" \
-        $(pkg-config --static --cflags --libs trevrpc libprotobuf-c)
+        $(pkg-config --static --cflags --libs trevrpc_rpc libprotobuf-c)
       "$TMPDIR/trevrpc-installed-pkg-config-consumer"
 
       syntax_codegen="$TMPDIR/trevrpc-installed-direct-codegen"
@@ -224,7 +257,7 @@ stdenv.mkDerivation (
         ${optionalString stdenv.cc.isClang "-Wno-unused-command-line-argument"} \
         -fsyntax-only \
         -I"$syntax_codegen" \
-        $(pkg-config --cflags trevrpc libprotobuf-c) \
+        $(pkg-config --cflags trevrpc_rpc libprotobuf-c) \
         tests/install/codegen/main.c \
         "$syntax_codegen/greeter.pb-c.c" \
         "$syntax_codegen/greeter.trevrpc.c"

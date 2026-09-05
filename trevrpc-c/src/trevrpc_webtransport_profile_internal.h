@@ -98,6 +98,10 @@ bool trevrpc_wt_profile_requires_draft02_request_marker(trevrpc_wt_profile_id pr
 bool trevrpc_wt_profile_requires_draft02_response_marker(trevrpc_wt_profile_id profile);
 bool trevrpc_wt_profile_valid_session_id(uint64_t stream_id);
 bool trevrpc_wt_profile_peer_stream_is_unidirectional(uint64_t stream_id);
+int trevrpc_wt_profile_encode_application_error(
+    trevrpc_wt_profile_id profile, uint64_t application_error, uint64_t* out_http3_error);
+int trevrpc_wt_profile_decode_application_error(
+    trevrpc_wt_profile_id profile, uint64_t http3_error, uint64_t* out_application_error);
 
 /* Current transport ownership supports one session; profile wire output is truthful. */
 uint64_t trevrpc_wt_profile_effective_session_limit(uint32_t configured_limit);

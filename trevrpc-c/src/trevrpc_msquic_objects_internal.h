@@ -79,6 +79,22 @@ typedef struct trevrpc_msquic_conn_node {
     trevrpc_msquic_conn* conn;
 } trevrpc_msquic_conn_node;
 
+typedef enum trevrpc_msquic_finalizer_kind {
+    TREV_MSQUIC_FINALIZE_CONN_DESTROY = 0,
+    TREV_MSQUIC_FINALIZE_STREAM_CLOSE,
+    TREV_MSQUIC_FINALIZE_STREAM_CLOSE_IMMEDIATE,
+    TREV_MSQUIC_FINALIZE_STREAM_DESTROY,
+    TREV_MSQUIC_FINALIZE_CONN_CLOSE,
+    TREV_MSQUIC_FINALIZE_LISTENER_STOP,
+    TREV_MSQUIC_FINALIZE_LISTENER_CLOSE,
+} trevrpc_msquic_finalizer_kind;
+
+typedef struct trevrpc_msquic_finalizer_item {
+    struct trevrpc_msquic_finalizer_item* next;
+    void* object;
+    trevrpc_msquic_finalizer_kind kind;
+} trevrpc_msquic_finalizer_item;
+
 struct trevrpc_msquic_stream {
     HQUIC handle;
     pthread_mutex_t mutex;
@@ -114,6 +130,11 @@ struct trevrpc_msquic_stream {
     trevrpc_msquic_stream_observer observer;
     void* observer_context;
     size_t active_observer_callbacks;
+    trevrpc_msquic_stream_start_observer start_observer;
+    void* start_observer_context;
+    size_t active_start_observer_callbacks;
+    int start_status;
+    bool start_complete;
     size_t send_capacity_waiters;
     size_t max_pending_send_bytes;
     size_t max_pending_send_count;
@@ -130,6 +151,10 @@ struct trevrpc_msquic_stream {
         TREV_MSQUIC_PARSER_ALLOC_OOM,
     } parser_alloc_result;
     int err;
+    uint64_t peer_send_error;
+    uint64_t peer_receive_error;
+    bool peer_send_error_set;
+    bool peer_receive_error_set;
     bool parser_budgeted;
     bool receive_disabled;
     bool receive_waiting_on_raw_pump;
@@ -154,6 +179,9 @@ struct trevrpc_msquic_stream {
     bool close_pending;
     bool closed;
     bool api_ref_acquired;
+    bool deferred_finalizer_owned;
+    trevrpc_msquic_finalizer_item close_finalizer;
+    trevrpc_msquic_finalizer_item destroy_finalizer;
 };
 
 struct trevrpc_msquic_conn {
@@ -190,7 +218,7 @@ struct trevrpc_msquic_conn {
     trevrpc_msquic_conn_observer observer;
     void* observer_context;
     size_t active_observer_callbacks;
-    trevrpc_msquic_conn* destroy_next;
+    trevrpc_msquic_finalizer_item close_finalizer;
     uint64_t peer_close_error;
     bool peer_close_error_set;
     int err;
@@ -210,10 +238,16 @@ struct trevrpc_msquic_listener {
     pthread_cond_t cond;
     trevrpc_msquic_conn_node* conn_head;
     trevrpc_msquic_conn_node* conn_tail;
+    trevrpc_msquic_listener_observer observer;
+    void* observer_context;
+    size_t active_observer_callbacks;
     size_t active_callbacks;
     size_t shutdown_waiters;
     bool shutdown_in_progress;
     bool closed;
+    trevrpc_msquic_listener* deferred_close_next;
+    trevrpc_msquic_finalizer_item stop_finalizer;
+    trevrpc_msquic_finalizer_item close_finalizer;
     int err;
 };
 

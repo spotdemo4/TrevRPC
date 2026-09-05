@@ -180,6 +180,7 @@ static receive_fixture fixture_create_with_capacities(
 
     fixture.adapter = calloc(1, sizeof(*fixture.adapter));
     assert(fixture.adapter != NULL);
+    atomic_init(&fixture.adapter->readable_retry_count, 0);
     uint32_t slot_count = 1u + config.listener_capacity + config.connection_capacity + config.stream_capacity + 1u;
     fixture.adapter->slots = calloc(slot_count, sizeof(*fixture.adapter->slots));
     assert(fixture.adapter->slots != NULL);
@@ -212,6 +213,12 @@ static receive_fixture fixture_create_with_capacities(
     assert(fixture.stream != NULL);
     assert(pthread_mutex_init(&fixture.stream->mutex, NULL) == 0);
     assert(pthread_mutex_init(&fixture.stream->send_gate, NULL) == 0);
+    fixture.stream->pending_operation_ids =
+        calloc(endpoint->max_pending_send_count, sizeof(*fixture.stream->pending_operation_ids));
+    assert(fixture.stream->pending_operation_ids != NULL);
+    for (uint32_t index = 0; index < endpoint->max_pending_send_count; index++) {
+        atomic_init(&fixture.stream->pending_operation_ids[index], 0);
+    }
     atomic_init(&fixture.stream->base.closing, false);
     fixture.stream->base.endpoint = endpoint;
     fixture.stream->base.handle = TEST_STREAM_HANDLE;
@@ -235,6 +242,21 @@ static receive_fixture fixture_create_with_capacities(
 
 static receive_fixture fixture_create(uint64_t max_frame_size) {
     return fixture_create_with_capacities(max_frame_size, 1, 1);
+}
+
+static bool stream_has_pending_operation_id(adapter_stream* stream, uint64_t operation_id) {
+    bool found = false;
+    pthread_mutex_lock(&stream->mutex);
+    if (stream->pending_operation_ids != NULL) {
+        for (uint32_t index = 0; index < stream->base.endpoint->max_pending_send_count; index++) {
+            if (atomic_load_explicit(&stream->pending_operation_ids[index], memory_order_acquire) == operation_id) {
+                found = true;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    return found;
 }
 
 static void fixture_discard_events(receive_fixture* fixture) {
@@ -540,6 +562,65 @@ static void test_synchronous_send_failure_releases_budget(void) {
     fixture_destroy(&fixture);
 }
 
+static void test_send_operation_id_reuse_waits_for_completion_delivery(void) {
+    receive_fixture fixture = fixture_create(1024);
+    uint8_t body = 7;
+    const uint64_t operation_id = 23;
+    assert(trevrpc_engine_stream_send_frame_v1(fixture.engine, fixture.stream_handle, operation_id, &body, 1) == 0);
+    adapter_scheduler_drain(fixture.adapter);
+    assert(FakeMsQuic.send_calls == 1);
+
+    assert(stream_has_pending_operation_id(fixture.stream, operation_id));
+    QUIC_STREAM_EVENT completion = {.Type = QUIC_STREAM_EVENT_SEND_COMPLETE};
+    completion.SEND_COMPLETE.ClientContext = FakeMsQuic.send_contexts[0];
+    assert(adapter_stream_callback(fixture.stream->base.handle, fixture.stream, &completion) == QUIC_STATUS_SUCCESS);
+    assert(!stream_has_pending_operation_id(fixture.stream, operation_id));
+
+    trevrpc_engine_event* event = NULL;
+    assert(trevrpc_engine_next_event(fixture.engine, &event) == 0);
+    trevrpc_engine_event_info_v1 info;
+    assert(trevrpc_engine_event_info_v1_init(&info, sizeof(info)) == 0);
+    assert(trevrpc_engine_event_get_info_v1(event, &info) == 0);
+    assert(info.kind == TREVRPC_ENGINE_EVENT_SEND_COMPLETE);
+    assert(info.operation_id == operation_id);
+    assert(!stream_has_pending_operation_id(fixture.stream, operation_id));
+    assert(trevrpc_engine_stream_send_frame_v1(fixture.engine, fixture.stream_handle, operation_id, &body, 1) == 0);
+    trevrpc_engine_event_release(event);
+
+    adapter_scheduler_drain(fixture.adapter);
+    assert(FakeMsQuic.send_calls == 2);
+    completion.SEND_COMPLETE.ClientContext = FakeMsQuic.send_contexts[1];
+    assert(adapter_stream_callback(fixture.stream->base.handle, fixture.stream, &completion) == QUIC_STATUS_SUCCESS);
+    assert(trevrpc_engine_next_event(fixture.engine, &event) == 0);
+    trevrpc_engine_event_release(event);
+    assert(!stream_has_pending_operation_id(fixture.stream, operation_id));
+    fixture_destroy(&fixture);
+}
+
+static void test_send_completion_wake_failure_does_not_hold_send_gate(void) {
+    receive_fixture fixture = fixture_create(1024);
+    uint8_t body = 7;
+    assert(trevrpc_engine_stream_send_frame_v1(fixture.engine, fixture.stream_handle, 17, &body, 1) == 0);
+    adapter_scheduler_drain(fixture.adapter);
+    assert(FakeMsQuic.send_calls == 1);
+    assert(trevrpc_engine_internal_test_force_wake_failure(fixture.engine, 2u, 0) == 0);
+
+    QUIC_STREAM_EVENT event = {.Type = QUIC_STREAM_EVENT_SEND_COMPLETE};
+    event.SEND_COMPLETE.ClientContext = FakeMsQuic.send_contexts[0];
+    assert(adapter_stream_callback(fixture.stream->base.handle, fixture.stream, &event) == QUIC_STATUS_SUCCESS);
+    assert(FakeMsQuic.shutdown_calls == 1);
+    assert(fixture.adapter->pending_send_count == 0);
+    assert(fixture.adapter->pending_send_bytes == 0);
+    assert(fixture.stream->pending_send_count == 0);
+    assert(fixture.stream->pending_send_bytes == 0);
+    assert(!stream_has_pending_operation_id(fixture.stream, 17));
+
+    QUIC_STREAM_EVENT shutdown = {.Type = QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE};
+    assert(adapter_stream_callback(fixture.stream->base.handle, fixture.stream, &shutdown) == QUIC_STATUS_SUCCESS);
+    fixture.stream = NULL;
+    fixture_destroy_stopped(&fixture);
+}
+
 static void test_cancel_unsent_unlinks_scheduler_stream(void) {
     receive_fixture fixture = fixture_create_with_capacities(1024, 1, 2);
     adapter_stream* stream = fixture_extra_stream(&fixture, 12u);
@@ -685,6 +766,48 @@ static void test_receive_create_failure_preserves_queue(void) {
     assert(fixture.adapter->receive_owned_count == 0);
     assert(fixture.adapter->receive_owned_bytes == 0);
     trevrpc_engine_receive_release(receive);
+    fixture_destroy(&fixture);
+}
+
+static void test_readable_publication_failure_retries(void) {
+    receive_fixture fixture = fixture_create(1024);
+    uint8_t frame[] = {0, 0, 0, 1, 42};
+    uint64_t accepted = UINT64_MAX;
+    AdapterTestFailNextReadablePublication = true;
+    assert(indicate_receive(&fixture, frame, sizeof(frame), &accepted) == QUIC_STATUS_SUCCESS);
+    assert(accepted == sizeof(frame));
+    assert(fixture.stream->receive_head != NULL);
+    assert(fixture.adapter->receive_owned_count == 1);
+    assert(fixture.adapter->receive_owned_bytes == 1);
+    assert(fixture.stream->readable_pending);
+    assert(fixture.stream->readable_retry_pending);
+    assert(fixture.stream->readable_published_epoch == 0);
+    assert(atomic_load_explicit(&fixture.adapter->readable_retry_count, memory_order_relaxed) == 1);
+
+    trevrpc_engine_event* readable = NULL;
+    assert(trevrpc_engine_next_event(fixture.engine, &readable) == -EAGAIN);
+    adapter_scheduler_drain(fixture.adapter);
+    assert(!fixture.stream->readable_retry_pending);
+    assert(fixture.stream->readable_published_epoch == fixture.stream->readable_epoch);
+    assert(atomic_load_explicit(&fixture.adapter->readable_retry_count, memory_order_relaxed) == 0);
+
+    assert(trevrpc_engine_next_event(fixture.engine, &readable) == 0);
+    trevrpc_engine_event_info_v1 event_info;
+    assert(trevrpc_engine_event_info_v1_init(&event_info, sizeof(event_info)) == 0);
+    assert(trevrpc_engine_event_get_info_v1(readable, &event_info) == 0);
+    assert(event_info.kind == TREVRPC_ENGINE_EVENT_STREAM_READABLE);
+    trevrpc_engine_event_release(readable);
+
+    trevrpc_engine_receive* receive = pop_receive(&fixture);
+    trevrpc_engine_receive_info_v1 receive_info;
+    assert(trevrpc_engine_receive_info_v1_init(&receive_info, sizeof(receive_info)) == 0);
+    assert(trevrpc_engine_receive_get_info_v1(receive, &receive_info) == 0);
+    assert(receive_info.data_len == 1);
+    assert(receive_info.data[0] == 42);
+    assert(fixture.adapter->receive_owned_count == 0);
+    assert(fixture.adapter->receive_owned_bytes == 0);
+    trevrpc_engine_receive_release(receive);
+    assert(fixture.adapter->terminal_status == 0);
     fixture_destroy(&fixture);
 }
 
@@ -961,6 +1084,59 @@ static void test_peer_readable_waits_for_ready_commit(void) {
     fixture_destroy(&fixture);
 }
 
+static void test_peer_stream_waits_for_native_handle_publication(void) {
+    receive_fixture fixture = fixture_create_with_capacities(1024, 1, 2);
+    adapter_listener* listener = fixture_add_listener(&fixture);
+    assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 7u) == QUIC_STATUS_SUCCESS);
+    adapter_connection* connection = fixture_queued_connection(&fixture, 0);
+    adapter_scheduler_drain(fixture.adapter);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_CONNECTED) == QUIC_STATUS_SUCCESS);
+    fixture_discard_events(&fixture);
+
+    AdapterTestPeerStreamStayedQueued = false;
+    AdapterTestPromoteBeforePeerHandlePublication = true;
+    assert(fixture_peer_stream(connection, TEST_PEER_STREAM_HANDLE_BASE + 5u) == QUIC_STATUS_SUCCESS);
+    assert(AdapterTestPeerStreamStayedQueued);
+    assert(connection->pending_peer_stream_count == 1);
+    adapter_stream* stream = connection->pending_peer_stream_head->stream;
+    assert(stream->base.handle == (HQUIC)(TEST_PEER_STREAM_HANDLE_BASE + 5u));
+    assert(!stream->base.ready);
+    assert(!stream->base.terminal_published);
+
+    uint8_t frame[4] = {0};
+    uint64_t accepted = UINT64_MAX;
+    assert(indicate_stream_receive(stream, frame, sizeof(frame), QUIC_RECEIVE_FLAG_NONE, &accepted) ==
+           QUIC_STATUS_SUCCESS);
+    assert(accepted == sizeof(frame));
+    accept_event_counts before_promotion = drain_accept_events(&fixture);
+    assert(before_promotion.order_count == 0);
+
+    adapter_scheduler_drain(fixture.adapter);
+    assert(connection->pending_peer_stream_count == 0);
+    accept_event_counts counts = drain_accept_events(&fixture);
+    assert(counts.stream_ready == 1);
+    assert(counts.stream_readable == 1);
+    assert(counts.stream_failed == 0);
+    assert(counts.stream_closed == 0);
+    assert(counts.order_count == 2);
+    assert(counts.order[0] == TREVRPC_ENGINE_EVENT_STREAM_READY);
+    assert(counts.order[1] == TREVRPC_ENGINE_EVENT_STREAM_READABLE);
+    assert(counts.order_subjects[0].slot == stream->base.token.slot);
+    assert(counts.order_subjects[1].slot == stream->base.token.slot);
+
+    trevrpc_engine_receive* receive = NULL;
+    assert(trevrpc_engine_stream_receive_frame(fixture.engine, stream->base.token, &receive) == 0);
+    trevrpc_engine_receive_release(receive);
+    assert(adapter_stream_callback(stream->base.handle,
+               stream,
+               &(QUIC_STREAM_EVENT){.Type = QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE}) == QUIC_STATUS_SUCCESS);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) == QUIC_STATUS_SUCCESS);
+    fixture_discard_events(&fixture);
+    assert(fixture.adapter->live_connections == 0);
+    assert(fixture.adapter->live_streams == 1);
+    fixture_destroy(&fixture);
+}
+
 static void test_peer_stream_queue_is_bounded_and_fifo(void) {
     receive_fixture fixture = fixture_create_with_capacities(1024, 1, 2);
     adapter_listener* listener = fixture_add_listener(&fixture);
@@ -1050,6 +1226,7 @@ static void test_peer_stream_close_while_queued_publishes_once(void) {
 int main(void) {
     test_partial_zero_and_resume();
     test_receive_create_failure_preserves_queue();
+    test_readable_publication_failure_retries();
     test_exact_header_boundary_is_backpressure();
     test_exact_header_boundary_fin_is_truncation();
     test_peer_send_abort_retires_pause();
@@ -1062,12 +1239,15 @@ int main(void) {
     test_connection_promotion_is_fifo();
     test_pending_send_round_robin_three_streams();
     test_synchronous_send_failure_releases_budget();
+    test_send_operation_id_reuse_waits_for_completion_delivery();
+    test_send_completion_wake_failure_does_not_hold_send_gate();
     test_cancel_unsent_unlinks_scheduler_stream();
     test_cancel_unsent_restores_pending_tail();
     test_send_reservation_release_finishes_shutdown();
     test_shutdown_after_send_admission_rejects_and_reclaims();
     test_fatal_receive_error_aborts_after_unlock();
     test_peer_readable_waits_for_ready_commit();
+    test_peer_stream_waits_for_native_handle_publication();
     test_peer_stream_queue_is_bounded_and_fifo();
     test_peer_stream_close_while_queued_publishes_once();
     return 0;

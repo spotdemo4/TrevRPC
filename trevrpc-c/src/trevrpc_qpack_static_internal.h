@@ -42,8 +42,25 @@ typedef struct trevrpc_qpack_field_section {
     void* allocation;
 } trevrpc_qpack_field_section;
 
+typedef struct trevrpc_qpack_static_encoder {
+    uint8_t* output;
+    size_t capacity;
+    size_t length;
+} trevrpc_qpack_static_encoder;
+
 void trevrpc_qpack_field_section_init(trevrpc_qpack_field_section* section);
 void trevrpc_qpack_field_section_release(trevrpc_qpack_field_section* section);
+
+/* Writes the required-insert-count/base prefix for a static-only field section. */
+int trevrpc_qpack_static_encoder_init(trevrpc_qpack_static_encoder* encoder, uint8_t* output, size_t capacity);
+int trevrpc_qpack_static_encoder_put_indexed(trevrpc_qpack_static_encoder* encoder, uint64_t static_index);
+int trevrpc_qpack_static_encoder_put_literal_name_reference(
+    trevrpc_qpack_static_encoder* encoder, uint64_t static_name_index, const uint8_t* value, size_t value_len);
+int trevrpc_qpack_static_encoder_put_literal(trevrpc_qpack_static_encoder* encoder,
+    const uint8_t* name,
+    size_t name_len,
+    const uint8_t* value,
+    size_t value_len);
 
 /*
  * Decodes a complete field section using no dynamic-table state. out_section

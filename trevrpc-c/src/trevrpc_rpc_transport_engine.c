@@ -1,0 +1,350 @@
+#include "trevrpc_rpc_transport_engine_internal.h"
+
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct trevrpc_rpc_transport_engine {
+    trevrpc_rpc_transport base;
+    trevrpc_engine* engine;
+} trevrpc_rpc_transport_engine;
+
+static trevrpc_rpc_transport_engine* trevrpc_rpc_transport_engine_from_base(trevrpc_rpc_transport* transport) {
+    return (trevrpc_rpc_transport_engine*)transport;
+}
+
+static trevrpc_engine_handle_v1 trevrpc_rpc_transport_engine_handle(trevrpc_rpc_transport_handle handle) {
+    trevrpc_engine_handle_v1 result = {handle.owner, handle.slot, handle.generation};
+    return result;
+}
+
+static trevrpc_rpc_transport_handle trevrpc_rpc_transport_handle_from_engine(trevrpc_engine_handle_v1 handle) {
+    trevrpc_rpc_transport_handle result = {handle.owner, handle.slot, handle.generation};
+    return result;
+}
+
+static void trevrpc_rpc_transport_engine_endpoint_config(
+    const trevrpc_rpc_transport_endpoint_config* source, trevrpc_engine_endpoint_config_v1* destination) {
+    (void)trevrpc_engine_endpoint_config_v1_init(destination, sizeof(*destination));
+    destination->host = source->host;
+    destination->host_len = source->host_len;
+    destination->port = source->port;
+    destination->peer_bidi_stream_count = source->peer_bidi_stream_count;
+    destination->alpn = source->alpn;
+    destination->alpn_len = source->alpn_len;
+    destination->flags = source->flags & TREVRPC_RPC_TRANSPORT_ENDPOINT_SKIP_CERTIFICATE_VALIDATION
+                             ? TREVRPC_ENGINE_ENDPOINT_SKIP_CERTIFICATE_VALIDATION
+                             : 0;
+    destination->cert_file = source->cert_file;
+    destination->cert_file_len = source->cert_file_len;
+    destination->key_file = source->key_file;
+    destination->key_file_len = source->key_file_len;
+    destination->ca_cert_file = source->ca_cert_file;
+    destination->ca_cert_file_len = source->ca_cert_file_len;
+    destination->max_pending_send_count = source->max_pending_send_count;
+    destination->max_pending_send_bytes = source->max_pending_send_bytes;
+    destination->max_frame_size = source->max_frame_size;
+    destination->max_idle_timeout_ms = source->max_idle_timeout_ms;
+    destination->keep_alive_ms = source->keep_alive_ms;
+    destination->stream_recv_window = source->stream_recv_window;
+    destination->conn_flow_control_window = source->conn_flow_control_window;
+}
+
+static int trevrpc_rpc_transport_engine_get_wake_source(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_wake* wake) {
+    trevrpc_engine_wake_source_v1 source;
+    int result = trevrpc_engine_wake_source_v1_init(&source, sizeof(source));
+    if (result != 0) {
+        return result;
+    }
+    result = trevrpc_engine_get_wake_source_v1(trevrpc_rpc_transport_engine_from_base(transport)->engine, &source);
+    if (result == 0) {
+        wake->kind = source.kind;
+        wake->flags = source.flags;
+        wake->native_handle = source.native_handle;
+    }
+    return result;
+}
+
+static int trevrpc_rpc_transport_engine_next_event(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_event** out_event) {
+    trevrpc_engine_event* event = NULL;
+    int result = trevrpc_engine_next_event(trevrpc_rpc_transport_engine_from_base(transport)->engine, &event);
+    if (result == 0) {
+        *out_event = (trevrpc_rpc_transport_event*)event;
+    }
+    return result;
+}
+
+static int trevrpc_rpc_transport_engine_event_get_info(
+    const trevrpc_rpc_transport_event* event, trevrpc_rpc_transport_event_info* info) {
+    trevrpc_engine_event_info_v1 source;
+    int result = trevrpc_engine_event_info_v1_init(&source, sizeof(source));
+    if (result != 0) {
+        return result;
+    }
+    result = trevrpc_engine_event_get_info_v1((const trevrpc_engine_event*)event, &source);
+    if (result != 0) {
+        return result;
+    }
+    info->kind = source.kind;
+    info->flags = source.flags;
+    info->status = source.status;
+    info->subject_kind = source.subject_kind;
+    info->sequence = source.sequence;
+    info->subject = trevrpc_rpc_transport_handle_from_engine(source.subject);
+    info->parent = trevrpc_rpc_transport_handle_from_engine(source.parent);
+    info->operation_id = source.operation_id;
+    info->application_error_code = source.application_error_code;
+    info->provider_error_code = source.provider_error_code;
+    info->data = source.data;
+    info->data_len = source.data_len;
+    return 0;
+}
+
+static void trevrpc_rpc_transport_engine_event_release(trevrpc_rpc_transport_event* event) {
+    trevrpc_engine_event_release((trevrpc_engine_event*)event);
+}
+
+static int trevrpc_rpc_transport_engine_receive_get_info(
+    const trevrpc_rpc_transport_receive* receive, trevrpc_rpc_transport_receive_info* info) {
+    trevrpc_engine_receive_info_v1 source;
+    int result = trevrpc_engine_receive_info_v1_init(&source, sizeof(source));
+    if (result != 0) {
+        return result;
+    }
+    result = trevrpc_engine_receive_get_info_v1((const trevrpc_engine_receive*)receive, &source);
+    if (result == 0) {
+        info->flags = source.flags;
+        info->data = source.data;
+        info->data_len = source.data_len;
+    }
+    return result;
+}
+
+static void trevrpc_rpc_transport_engine_receive_release(trevrpc_rpc_transport_receive* receive) {
+    trevrpc_engine_receive_release((trevrpc_engine_receive*)receive);
+}
+
+static int trevrpc_rpc_transport_engine_get_diagnostics(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_diagnostics* diagnostics) {
+    trevrpc_engine_diagnostics_v1 source;
+    int result = trevrpc_engine_diagnostics_v1_init(&source, sizeof(source));
+    if (result != 0) {
+        return result;
+    }
+    result = trevrpc_engine_get_diagnostics_v1(trevrpc_rpc_transport_engine_from_base(transport)->engine, &source);
+    if (result != 0) {
+        return result;
+    }
+    diagnostics->state = source.state;
+    diagnostics->terminal_status = source.terminal_status;
+    diagnostics->event_capacity = source.event_capacity;
+    diagnostics->queue_depth = source.queue_depth;
+    diagnostics->ordinary_queue_depth = source.ordinary_queue_depth;
+    diagnostics->events_enqueued = source.events_enqueued;
+    diagnostics->events_dequeued = source.events_dequeued;
+    diagnostics->events_rejected = source.events_rejected;
+    diagnostics->receive_owned_count = source.receive_owned_count;
+    diagnostics->peak_receive_owned_count = source.peak_receive_owned_count;
+    diagnostics->receive_owned_bytes = source.receive_owned_bytes;
+    diagnostics->peak_receive_owned_bytes = source.peak_receive_owned_bytes;
+    diagnostics->pending_send_bytes = source.pending_send_bytes;
+    diagnostics->pending_send_count = source.pending_send_count;
+    diagnostics->live_listeners = source.live_listeners;
+    diagnostics->live_connections = source.live_connections;
+    diagnostics->live_streams = source.live_streams;
+    diagnostics->active_callbacks = source.active_callbacks;
+    diagnostics->active_api_calls = source.active_api_calls;
+    diagnostics->wake_signals = source.wake_signals;
+    diagnostics->wake_write_eagain = source.wake_write_eagain;
+    diagnostics->wake_failures = source.wake_failures;
+    diagnostics->provider_error_code = source.provider_error_code;
+    diagnostics->mandatory_reservations = source.mandatory_reservations;
+    return 0;
+}
+
+static int trevrpc_rpc_transport_engine_endpoint_listen(trevrpc_rpc_transport* transport,
+    const trevrpc_rpc_transport_endpoint_config* config,
+    trevrpc_rpc_transport_handle* listener) {
+    trevrpc_engine_endpoint_config_v1 source;
+    trevrpc_engine_handle_v1 target;
+    if (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_AUTO &&
+        config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE) {
+        return -ENOTSUP;
+    }
+    trevrpc_rpc_transport_engine_endpoint_config(config, &source);
+    int result = trevrpc_engine_listen_v1(trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, &target);
+    if (result == 0) {
+        *listener = trevrpc_rpc_transport_handle_from_engine(target);
+    }
+    return result;
+}
+
+static int trevrpc_rpc_transport_engine_endpoint_get_port(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle listener, uint16_t* port) {
+    return trevrpc_engine_listener_get_port_v1(
+        trevrpc_rpc_transport_engine_from_base(transport)->engine, trevrpc_rpc_transport_engine_handle(listener), port);
+}
+
+static int trevrpc_rpc_transport_engine_endpoint_dial(trevrpc_rpc_transport* transport,
+    const trevrpc_rpc_transport_endpoint_config* config,
+    uint64_t operation_id,
+    trevrpc_rpc_transport_handle* connection) {
+    trevrpc_engine_endpoint_config_v1 source;
+    trevrpc_engine_handle_v1 target;
+    if (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_AUTO &&
+        config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE) {
+        return -ENOTSUP;
+    }
+    trevrpc_rpc_transport_engine_endpoint_config(config, &source);
+    int result = trevrpc_engine_dial_v1(
+        trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, operation_id, &target);
+    if (result == 0) {
+        *connection = trevrpc_rpc_transport_handle_from_engine(target);
+    }
+    return result;
+}
+
+static int trevrpc_rpc_transport_engine_dial_cancel(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle connection) {
+    return trevrpc_engine_dial_cancel(
+        trevrpc_rpc_transport_engine_from_base(transport)->engine, trevrpc_rpc_transport_engine_handle(connection));
+}
+
+static int trevrpc_rpc_transport_engine_stream_open(trevrpc_rpc_transport* transport,
+    trevrpc_rpc_transport_handle connection,
+    uint64_t operation_id,
+    trevrpc_rpc_transport_handle* stream) {
+    trevrpc_engine_handle_v1 target;
+    int result =
+        trevrpc_engine_connection_open_bidi_stream_v1(trevrpc_rpc_transport_engine_from_base(transport)->engine,
+            trevrpc_rpc_transport_engine_handle(connection),
+            operation_id,
+            &target);
+    if (result == 0) {
+        *stream = trevrpc_rpc_transport_handle_from_engine(target);
+    }
+    return result;
+}
+
+static int trevrpc_rpc_transport_engine_stream_send(trevrpc_rpc_transport* transport,
+    trevrpc_rpc_transport_handle stream,
+    uint64_t operation_id,
+    const uint8_t* body,
+    size_t body_len) {
+    return trevrpc_engine_stream_send_frame_v1(trevrpc_rpc_transport_engine_from_base(transport)->engine,
+        trevrpc_rpc_transport_engine_handle(stream),
+        operation_id,
+        body,
+        body_len);
+}
+
+static int trevrpc_rpc_transport_engine_stream_receive(trevrpc_rpc_transport* transport,
+    trevrpc_rpc_transport_handle stream,
+    trevrpc_rpc_transport_receive** out_receive) {
+    trevrpc_engine_receive* receive = NULL;
+    int result = trevrpc_engine_stream_receive_frame(trevrpc_rpc_transport_engine_from_base(transport)->engine,
+        trevrpc_rpc_transport_engine_handle(stream),
+        &receive);
+    if (result == 0) {
+        *out_receive = (trevrpc_rpc_transport_receive*)receive;
+    }
+    return result;
+}
+
+static int trevrpc_rpc_transport_engine_stream_finish_send(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream) {
+    return trevrpc_engine_stream_finish_send(
+        trevrpc_rpc_transport_engine_from_base(transport)->engine, trevrpc_rpc_transport_engine_handle(stream));
+}
+
+static int trevrpc_rpc_transport_engine_stream_abort(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
+    return trevrpc_engine_stream_abort(trevrpc_rpc_transport_engine_from_base(transport)->engine,
+        trevrpc_rpc_transport_engine_handle(stream),
+        error_code);
+}
+
+static int trevrpc_rpc_transport_engine_stream_close(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream) {
+    return trevrpc_engine_stream_close(
+        trevrpc_rpc_transport_engine_from_base(transport)->engine, trevrpc_rpc_transport_engine_handle(stream));
+}
+
+static int trevrpc_rpc_transport_engine_connection_close(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle connection, uint64_t error_code) {
+    return trevrpc_engine_connection_close(trevrpc_rpc_transport_engine_from_base(transport)->engine,
+        trevrpc_rpc_transport_engine_handle(connection),
+        error_code);
+}
+
+static int trevrpc_rpc_transport_engine_listener_close(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle listener) {
+    return trevrpc_engine_listener_close(
+        trevrpc_rpc_transport_engine_from_base(transport)->engine, trevrpc_rpc_transport_engine_handle(listener));
+}
+
+static int trevrpc_rpc_transport_engine_close(trevrpc_rpc_transport* transport) {
+    trevrpc_engine* engine = trevrpc_rpc_transport_engine_from_base(transport)->engine;
+    trevrpc_engine_diagnostics_v1 diagnostics;
+    int result = trevrpc_engine_close(engine);
+    if (result == 0 || trevrpc_engine_diagnostics_v1_init(&diagnostics, sizeof(diagnostics)) != 0 ||
+        trevrpc_engine_get_diagnostics_v1(engine, &diagnostics) != 0) {
+        return result;
+    }
+    return diagnostics.state >= TREVRPC_ENGINE_STATE_STOPPING ? 0 : result;
+}
+
+static int trevrpc_rpc_transport_engine_drain(trevrpc_rpc_transport* transport) {
+    return trevrpc_engine_drain(trevrpc_rpc_transport_engine_from_base(transport)->engine);
+}
+
+static void trevrpc_rpc_transport_engine_destroy(trevrpc_rpc_transport* transport) {
+    trevrpc_rpc_transport_engine* adapter = trevrpc_rpc_transport_engine_from_base(transport);
+    (void)trevrpc_engine_release(adapter->engine);
+    free(adapter);
+}
+
+static const trevrpc_rpc_transport_ops trevrpc_rpc_transport_engine_ops = {
+    .get_wake_source = trevrpc_rpc_transport_engine_get_wake_source,
+    .next_event = trevrpc_rpc_transport_engine_next_event,
+    .event_get_info = trevrpc_rpc_transport_engine_event_get_info,
+    .event_release = trevrpc_rpc_transport_engine_event_release,
+    .receive_get_info = trevrpc_rpc_transport_engine_receive_get_info,
+    .receive_release = trevrpc_rpc_transport_engine_receive_release,
+    .get_diagnostics = trevrpc_rpc_transport_engine_get_diagnostics,
+    .poll_timeout_ms = NULL,
+    .endpoint_listen = trevrpc_rpc_transport_engine_endpoint_listen,
+    .endpoint_get_port = trevrpc_rpc_transport_engine_endpoint_get_port,
+    .endpoint_dial = trevrpc_rpc_transport_engine_endpoint_dial,
+    .dial_cancel = trevrpc_rpc_transport_engine_dial_cancel,
+    .stream_open = trevrpc_rpc_transport_engine_stream_open,
+    .stream_send = trevrpc_rpc_transport_engine_stream_send,
+    .stream_receive = trevrpc_rpc_transport_engine_stream_receive,
+    .stream_finish_send = trevrpc_rpc_transport_engine_stream_finish_send,
+    .stream_abort = trevrpc_rpc_transport_engine_stream_abort,
+    .stream_close = trevrpc_rpc_transport_engine_stream_close,
+    .connection_close = trevrpc_rpc_transport_engine_connection_close,
+    .listener_close = trevrpc_rpc_transport_engine_listener_close,
+    .close = trevrpc_rpc_transport_engine_close,
+    .drain = trevrpc_rpc_transport_engine_drain,
+    .destroy = trevrpc_rpc_transport_engine_destroy,
+    .get_wake_sources = NULL,
+    .release_handle = NULL,
+};
+
+int trevrpc_rpc_transport_engine_adopt(trevrpc_engine* engine, trevrpc_rpc_transport** out_transport) {
+    trevrpc_rpc_transport_engine* adapter;
+    if (engine == NULL || out_transport == NULL) {
+        return -EINVAL;
+    }
+    adapter = calloc(1, sizeof(*adapter));
+    if (adapter == NULL) {
+        return -ENOMEM;
+    }
+    adapter->base.ops = &trevrpc_rpc_transport_engine_ops;
+    adapter->engine = engine;
+    *out_transport = &adapter->base;
+    return 0;
+}

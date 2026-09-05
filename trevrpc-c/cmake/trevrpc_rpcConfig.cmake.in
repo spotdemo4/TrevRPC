@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+set(TREVRPC_RPC_ABI_VERSION @TREVRPC_RPC_ABI_VERSION@)
+include("${CMAKE_CURRENT_LIST_DIR}/trevrpcRpcTargets.cmake")
+check_required_components(trevrpc_rpc)

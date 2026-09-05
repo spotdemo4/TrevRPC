@@ -62,9 +62,10 @@ trevrpc-bench run bench/campaigns/native-smoke.example.json \
 native clients and servers. Its deliberately short windows validate
 interoperability and the harness only; they are not suitable for performance
 comparisons. GitHub CI runs every cell as a separate check with four functional
-samples, one for each RPC kind. The smoke helper sets
-`TREVRPC_BENCH_SERVER_WORKERS=8` to keep concurrent jobs within CI task limits;
-normal benchmark runs retain the C peer's 128-worker default.
+samples, one for each RPC kind. The RPC ABI 1 C peer uses one event-driver
+thread per runtime and no per-call worker pool. The smoke helper still sets
+`TREVRPC_BENCH_SERVER_WORKERS=8`; the C peer parses and range-validates this
+compatibility option, but it does not control request execution.
 
 Campaign runs stop at the first failed sample by default. Set
 `TREVRPC_BENCH_RUN_ENTIRE_CAMPAIGN=true` to attempt every remaining sample and

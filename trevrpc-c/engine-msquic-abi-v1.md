@@ -69,7 +69,7 @@ The companion package consists of:
 - CMake target `trevrpc::trevrpc_engine_msquic`;
 - pkg-config module `trevrpc_engine_msquic`.
 
-`TREVRPC_BUILD_ENGINE_MSQUIC` defaults to `OFF`. Enabling it requires `TREVRPC_BUILD_ENGINE=ON`, a POSIX platform with file descriptors and pthreads, and an available `msquic CONFIG` package. The provider shares only the process-wide MsQuic API owner with the C ABI 6 MsQuic facade; it does not link the legacy `trevrpc_msquic_native_core` or open an independent MsQuic API table.
+`TREVRPC_BUILD_ENGINE_MSQUIC` follows `TREVRPC_BUILD_ENGINE`, so both default to `ON` for a standalone POSIX build. Set the companion option to `OFF` for an Engine-only package. Enabling it requires `TREVRPC_BUILD_ENGINE=ON`, a POSIX platform with file descriptors and pthreads, and an available `msquic CONFIG` package. The provider shares only the process-wide MsQuic API owner with the temporary internal C ABI 6 compatibility lane; it does not link the legacy `trevrpc_msquic_native_core` or open an independent MsQuic API table.
 
 CMake consumers use:
 

@@ -377,18 +377,23 @@ static void trevrpc_h3_ingress_invoke_shutdown(
     trevrpc_h3_ingress_finish_shutdown_call(runtime);
 }
 
+static void trevrpc_h3_ingress_mark_stopping_locked(trevrpc_h3_ingress_runtime* runtime) {
+    if (runtime->stopping) {
+        return;
+    }
+    runtime->stopping = true;
+    if (runtime->settings_status == TREV_H3_INGRESS_SETTINGS_PENDING) {
+        runtime->settings_status = TREV_H3_INGRESS_SETTINGS_FAILED;
+        runtime->settings_error = runtime->fatal ? runtime->fatal_error : 0;
+    }
+    pthread_cond_broadcast(&runtime->cond);
+    pthread_cond_broadcast(&runtime->pump_cond);
+}
+
 static void trevrpc_h3_ingress_stop_without_error(trevrpc_h3_ingress_runtime* runtime) {
     bool send_shutdown = false;
     pthread_mutex_lock(&runtime->mutex);
-    if (!runtime->stopping) {
-        runtime->stopping = true;
-        if (runtime->settings_status == TREV_H3_INGRESS_SETTINGS_PENDING) {
-            runtime->settings_status = TREV_H3_INGRESS_SETTINGS_FAILED;
-            runtime->settings_error = 0;
-        }
-        pthread_cond_broadcast(&runtime->cond);
-        pthread_cond_broadcast(&runtime->pump_cond);
-    }
+    trevrpc_h3_ingress_mark_stopping_locked(runtime);
     if (!runtime->connection_shutdown_sent) {
         runtime->connection_shutdown_sent = true;
         runtime->connection_shutdown_calls_in_progress++;
@@ -797,6 +802,7 @@ static void* trevrpc_h3_ingress_accept_main(void* context) {
         entry->install_pending = false;
         if (err == 0) {
             entry->observer_installed = true;
+            entry->pending_flags |= TREV_MSQUIC_STREAM_OBSERVER_READABLE;
             pthread_cond_signal(&runtime->pump_cond);
         }
         pthread_mutex_unlock(&runtime->mutex);
@@ -1539,11 +1545,7 @@ static void trevrpc_h3_ingress_shutdown_internal(trevrpc_h3_ingress_runtime* run
         return;
     }
     runtime->teardown_started = true;
-    runtime->stopping = true;
-    if (runtime->settings_status == TREV_H3_INGRESS_SETTINGS_PENDING) {
-        runtime->settings_status = TREV_H3_INGRESS_SETTINGS_FAILED;
-        runtime->settings_error = runtime->fatal ? runtime->fatal_error : 0;
-    }
+    trevrpc_h3_ingress_mark_stopping_locked(runtime);
     bool fatal = runtime->fatal;
     uint64_t fatal_error = runtime->fatal_error;
     bool send_shutdown = !runtime->connection_shutdown_sent;
@@ -1625,6 +1627,13 @@ void trevrpc_h3_ingress_release(trevrpc_h3_ingress* handle) {
     }
     trevrpc_h3_ingress_runtime* runtime = handle->runtime;
     bool callback_reentry = runtime == trevrpc_h3_ingress_shutdown_callback_runtime;
+    /* Close admission and the runtime state as one ordered transition.  Calls
+     * admitted before release may still hold a runtime reference, so mark the
+     * runtime stopping before the detach becomes observable to the release
+     * waiter or those calls can race ahead and publish new state. */
+    pthread_mutex_lock(&runtime->mutex);
+    trevrpc_h3_ingress_mark_stopping_locked(runtime);
+    pthread_mutex_unlock(&runtime->mutex);
     handle->runtime = NULL;
     handle->retired_runtime = runtime;
     handle->retired_reclaim_deferred = callback_reentry;

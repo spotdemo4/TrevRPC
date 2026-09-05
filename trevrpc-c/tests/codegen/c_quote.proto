@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package c_quote;
+
+message Empty {}
+
+service Service {
+  rpc Call(Empty) returns (Empty);
+}

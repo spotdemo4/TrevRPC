@@ -35,6 +35,8 @@ stdenv.mkDerivation (final: {
       -DTREVRPC_BUILD_ENGINE=ON \
       -DTREVRPC_BUILD_MSQUIC=OFF \
       -DTREVRPC_BUILD_ENGINE_MSQUIC=ON \
+      -DTREVRPC_BUILD_RPC=OFF \
+      -DTREVRPC_BUILD_RPC_MSQUIC=OFF \
       -DTREVRPC_BUILD_WEBTRANSPORT=OFF \
       -DTREVRPC_BUILD_RUNTIME=OFF \
       -DTREVRPC_BUILD_CODEGEN=OFF \
@@ -75,6 +77,8 @@ stdenv.mkDerivation (final: {
     runHook preInstallCheck
     test -f "$out/include/trevrpc_engine.h"
     test -f "$out/include/trevrpc_engine_msquic.h"
+    test ! -e "$out/include/trevrpc_rpc.h"
+    test ! -e "$out/include/trevrpc_rpc_msquic.h"
     test -f "$out/lib/libtrevrpc_engine.a"
     test -f "$out/lib/libtrevrpc_engine_msquic.a"
     test -f "$out/lib/libtrevrpc_msquic_api_owner.a"
@@ -85,10 +89,16 @@ stdenv.mkDerivation (final: {
     test ! -e "$out/include/trevrpc_raw.h"
     test ! -e "$out/include/trevrpc_webtransport.h"
     test ! -e "$out/lib/libtrevrpc_core.a"
+    test ! -e "$out/lib/libtrevrpc_rpc.a"
+    test ! -e "$out/lib/libtrevrpc_rpc_msquic.a"
     test ! -e "$out/lib/libtrevrpc_msquic_native_core.a"
     test ! -e "$out/lib/libtrevrpc_msquic.a"
     test ! -e "$out/lib/pkgconfig/trevrpc_core.pc"
+    test ! -e "$out/lib/pkgconfig/trevrpc_rpc.pc"
+    test ! -e "$out/lib/pkgconfig/trevrpc_rpc_msquic.pc"
     test ! -e "$out/lib/cmake/trevrpc"
+    test ! -e "$out/lib/cmake/trevrpc_rpc"
+    test ! -e "$out/lib/cmake/trevrpc_rpc_msquic"
     test -f "$out/lib/pkgconfig/trevrpc_engine.pc"
     test -f "$out/lib/pkgconfig/trevrpc_engine_msquic.pc"
     test -f "$out/lib/cmake/trevrpc_engine/trevrpc_engineConfig.cmake"

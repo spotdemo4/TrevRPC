@@ -227,6 +227,36 @@ static int test_event_metadata_and_detachment(void) {
     return 0;
 }
 
+static int test_mandatory_publication_commit_barrier(void) {
+    trevrpc_engine* engine = NULL;
+    trevrpc_engine_event* event = NULL;
+    trevrpc_engine_event_spec spec;
+    trevrpc_engine_reservation* reservation = NULL;
+    unsigned hooks = 0;
+    CHECK(create_engine(2, 0, &engine) == 0);
+
+    CHECK(trevrpc_engine_provider_reserve_mandatory(engine, &reservation) == 0);
+    memset(&spec, 0, sizeof(spec));
+    spec.kind = TREVRPC_ENGINE_EVENT_SEND_COMPLETE;
+    spec.mandatory_commit_hook = count_dequeue;
+    spec.mandatory_abort_hook = count_drop;
+    spec.mandatory_hook_context = &hooks;
+    CHECK(trevrpc_engine_provider_publish_reserved(engine, reservation, &spec) == 0);
+    CHECK(hooks == 1);
+    CHECK(trevrpc_engine_next_event(engine, &event) == 0);
+    CHECK(hooks == 1);
+    trevrpc_engine_event_release(event);
+
+    reservation = NULL;
+    CHECK(trevrpc_engine_provider_reserve_mandatory(engine, &reservation) == 0);
+    spec.data = &hooks;
+    spec.data_len = 1;
+    CHECK(trevrpc_engine_provider_publish_reserved(engine, reservation, &spec) == -EMSGSIZE);
+    CHECK(hooks == 101);
+    CHECK(trevrpc_engine_release(engine) == 0);
+    return 0;
+}
+
 static int test_event_survives_engine_release(void) {
     trevrpc_engine* engine = NULL;
     trevrpc_engine_event* event = NULL;
@@ -308,6 +338,7 @@ int main(void) {
     CHECK(test_fifo_wraparound_and_copy() == 0);
     CHECK(test_overflow_terminal_sequence() == 0);
     CHECK(test_event_metadata_and_detachment() == 0);
+    CHECK(test_mandatory_publication_commit_barrier() == 0);
     CHECK(test_event_survives_engine_release() == 0);
     CHECK(test_receive_detachment() == 0);
     CHECK(test_structure_failures_leave_outputs() == 0);

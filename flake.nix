@@ -48,6 +48,13 @@
           consumer:
           assert consumer.passthru.msquicProvider == libmsquic;
           consumer;
+        # Internal compatibility lane for C++/Node migration. It is not
+        # exported through packageSet or the public package outputs.
+        cLegacy = callPackage ./trevrpc-c {
+          benchProto = ./bench/proto;
+          wireGolden = ./testdata/wire-golden-vectors.txt;
+          legacyCompatibility = true;
+        };
         benchmarkProtoGenerator = pkgs.writeShellApplication {
           name = "generate-trevrpc-benchmark-proto";
           runtimeInputs = with pkgs; [
@@ -111,7 +118,7 @@
             };
             cpp = callPackage ./trevrpc-cpp {
               benchProto = ./bench/proto;
-              trevrpcC = c;
+              trevrpcC = cLegacy;
               peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 {
                   package = cFamilyConformancePeers;
@@ -126,7 +133,7 @@
             js = pkgs.callPackage ./trevrpc-js {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
-              trevrpcC = c;
+              trevrpcC = cLegacy;
             };
             kotlin = callPackage ./trevrpc-kotlin {
               licenseFile = ./LICENSE;
@@ -482,6 +489,15 @@
             c = packageSet.trevrpc-c;
             c-engine = callPackage ./trevrpc-c/engine-check.nix { };
             c-engine-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/engine-msquic-check.nix { });
+            c-rpc = callPackage ./trevrpc-c/rpc-check.nix { };
+            c-rpc-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/rpc-msquic-check.nix { });
+            c-conformance-rpc = requireCanonicalMsquic (
+              callPackage ./conformance/adapters/c-family {
+                trevrpcCSrc = ./trevrpc-c;
+                trevrpcCppSrc = ./trevrpc-cpp;
+                cOnly = true;
+              }
+            );
             c-sanitizers = packageSet.trevrpc-c.override {
               sanitizers = true;
             };
@@ -508,7 +524,7 @@
           cpp = packageSet.trevrpc-cpp;
           cpp-sanitizers = packageSet.trevrpc-cpp.override {
             sanitizers = true;
-            trevrpcC = packageSet.trevrpc-c.override {
+            trevrpcC = cLegacy.override {
               sanitizers = true;
             };
           };

@@ -166,9 +166,10 @@ struct adapter_stream {
     adapter_send* pending_send_tail;
     adapter_stream* send_scheduler_next;
     bool send_scheduler_queued;
-    uint64_t* pending_operation_ids;
+    atomic_uint_fast64_t* pending_operation_ids;
     msquic_receive* parser_receive_allocation;
     bool readable_pending;
+    bool readable_retry_pending;
     uint64_t readable_epoch;
     uint64_t readable_published_epoch;
     bool ready_event_committed;
@@ -233,6 +234,7 @@ struct msquic_provider {
     uint64_t pending_send_count;
     uint64_t max_pending_send_count;
     uint64_t max_pending_send_bytes;
+    atomic_uint_fast64_t readable_retry_count;
     adapter_stream* send_ready_head;
     adapter_stream* send_ready_tail;
     uint64_t live_listeners;
@@ -273,6 +275,7 @@ static void drain_detached_connection(
     msquic_provider* adapter, adapter_connection* connection, bool release_queue_ref, uint64_t application_error_code);
 static void drain_detached_connections(msquic_provider* adapter, adapter_pending_connection* nodes);
 static void discard_detached_connections(msquic_provider* adapter, adapter_pending_connection* nodes);
+static void adapter_object_pin(adapter_object* object);
 static void adapter_object_unpin(adapter_object* object);
 static void adapter_fail_stop(msquic_provider* adapter, int status, const char* message);
 static msquic_event* event_new(uint32_t kind,
@@ -408,6 +411,7 @@ static msquic_event* event_new(uint32_t kind,
 }
 
 static void event_detach(void* provider_context, void* hook_context);
+static void event_drop(void* provider_context, void* hook_context);
 static void object_event_detach(void* provider_context, void* hook_context);
 
 static int publish_reserved_event(msquic_provider* adapter,
@@ -447,12 +451,9 @@ static int enqueue_event(msquic_provider* adapter, msquic_event* event, bool man
         return -ENOMEM;
     }
     event->adapter = adapter;
-    bool has_hook = event->reclaim_object != NULL || event->readable_epoch != 0;
-    if (has_hook) {
-        event->spec.dequeue_hook = event_detach;
-        event->spec.drop_hook = event_detach;
-        event->spec.hook_context = event;
-    }
+    event->spec.dequeue_hook = event_detach;
+    event->spec.drop_hook = event_drop;
+    event->spec.hook_context = event;
     int result;
     if (event->reservation != NULL) {
         trevrpc_engine_reservation* reservation = event->reservation;
@@ -460,9 +461,6 @@ static int enqueue_event(msquic_provider* adapter, msquic_event* event, bool man
         result = trevrpc_engine_provider_publish_reserved(adapter->engine, reservation, &event->spec);
     } else {
         result = trevrpc_engine_provider_publish_event(adapter->engine, &event->spec);
-    }
-    if (!has_hook) {
-        free(event);
     }
     return result;
 }
@@ -844,13 +842,18 @@ static void adapter_native_close_complete(msquic_provider* adapter, HQUIC handle
     pthread_mutex_unlock(&adapter->mutex);
 }
 
+static void adapter_object_pin(adapter_object* object) {
+    msquic_provider* adapter = object->adapter;
+    pthread_mutex_lock(&adapter->mutex);
+    object->active_operations++;
+    pthread_mutex_unlock(&adapter->mutex);
+}
+
 static bool callback_enter(msquic_provider* adapter, adapter_object* object) {
     if (trevrpc_engine_provider_callback_enter(adapter->engine) != 0) {
         return false;
     }
-    pthread_mutex_lock(&adapter->mutex);
-    object->active_operations++;
-    pthread_mutex_unlock(&adapter->mutex);
+    adapter_object_pin(object);
     return true;
 }
 
@@ -949,9 +952,19 @@ static adapter_object* object_reclaim_locked(msquic_provider* adapter, adapter_o
     return object;
 }
 
-static void event_detach(void* provider_context, void* hook_context) {
-    (void)provider_context;
-    msquic_event* event = hook_context;
+static void set_readable_retry_locked(adapter_stream* stream, bool pending) {
+    if (stream->readable_retry_pending == pending) {
+        return;
+    }
+    stream->readable_retry_pending = pending;
+    if (pending) {
+        (void)atomic_fetch_add_explicit(&stream->base.adapter->readable_retry_count, 1, memory_order_relaxed);
+    } else {
+        (void)atomic_fetch_sub_explicit(&stream->base.adapter->readable_retry_count, 1, memory_order_relaxed);
+    }
+}
+
+static void event_finish(msquic_event* event, bool dequeued) {
     msquic_provider* adapter = event->adapter;
     adapter_object* readable_object = NULL;
     adapter_object* reclaimed = NULL;
@@ -964,8 +977,20 @@ static void event_detach(void* provider_context, void* hook_context) {
         if (readable_object != NULL && readable_object->kind == TREVRPC_ENGINE_OBJECT_STREAM) {
             adapter_stream* stream = (adapter_stream*)readable_object;
             pthread_mutex_lock(&stream->mutex);
-            if (stream->readable_pending && stream->readable_epoch == event->readable_epoch) {
-                stream->readable_pending = false;
+            if (stream->readable_epoch == event->readable_epoch) {
+                if (stream->readable_published_epoch == event->readable_epoch) {
+                    stream->readable_published_epoch = 0;
+                }
+                if (dequeued) {
+                    stream->readable_pending = false;
+                    set_readable_retry_locked(stream, false);
+                } else if (stream->receive_head != NULL && !stream->base.terminal_published) {
+                    stream->readable_pending = true;
+                    set_readable_retry_locked(stream, true);
+                } else {
+                    stream->readable_pending = false;
+                    set_readable_retry_locked(stream, false);
+                }
             }
             pthread_mutex_unlock(&stream->mutex);
         }
@@ -978,6 +1003,19 @@ static void event_detach(void* provider_context, void* hook_context) {
     pthread_mutex_unlock(&adapter->mutex);
     adapter_object_free(reclaimed);
     free(event);
+    if (dequeued && atomic_load_explicit(&adapter->readable_retry_count, memory_order_relaxed) != 0) {
+        adapter_schedule(adapter);
+    }
+}
+
+static void event_detach(void* provider_context, void* hook_context) {
+    (void)provider_context;
+    event_finish(hook_context, true);
+}
+
+static void event_drop(void* provider_context, void* hook_context) {
+    (void)provider_context;
+    event_finish(hook_context, false);
 }
 
 static void object_event_detach(void* provider_context, void* hook_context) {
@@ -1274,6 +1312,9 @@ static adapter_stream* stream_alloc(adapter_connection* connection,
                 *out_result = -ENOMEM;
             return NULL;
         }
+        for (uint32_t index = 0; index < send_id_capacity; index++) {
+            atomic_init(&stream->pending_operation_ids[index], 0);
+        }
     }
     if (peer_pending) {
         stream->stream_admission_granted = true;
@@ -1558,7 +1599,15 @@ static void resume_paused_receives(msquic_provider* adapter) {
     }
 }
 
-static int publish_stream_readable(adapter_stream* stream) {
+#ifdef TREVRPC_ENGINE_MSQUIC_TESTING
+static bool AdapterTestFailNextReadablePublication;
+#endif
+
+static bool readable_publication_retryable(int result) {
+    return result == -ENOMEM;
+}
+
+static int publish_stream_readable(adapter_stream* stream, bool schedule_retry) {
     msquic_provider* adapter = stream->base.adapter;
     pthread_mutex_lock(&adapter->mutex);
     bool ready = stream->base.ready && stream->ready_event_committed && !stream->base.terminal_published;
@@ -1573,6 +1622,7 @@ static int publish_stream_readable(adapter_stream* stream) {
         return 0;
     }
     stream->readable_published_epoch = readable_epoch;
+    set_readable_retry_locked(stream, true);
     pthread_mutex_unlock(&stream->mutex);
     msquic_event* event = event_new(TREVRPC_ENGINE_EVENT_STREAM_READABLE,
         stream->base.event_flags,
@@ -1588,16 +1638,37 @@ static int publish_stream_readable(adapter_stream* stream) {
     if (event != NULL) {
         event->readable_epoch = readable_epoch;
     }
+#ifdef TREVRPC_ENGINE_MSQUIC_TESTING
+    int result;
+    if (AdapterTestFailNextReadablePublication) {
+        AdapterTestFailNextReadablePublication = false;
+        free(event);
+        result = -ENOMEM;
+    } else {
+        result = enqueue_event(stream->base.adapter, event, false);
+    }
+#else
     int result = enqueue_event(stream->base.adapter, event, false);
-    if (result != 0) {
-        pthread_mutex_lock(&stream->mutex);
+#endif
+    pthread_mutex_lock(&stream->mutex);
+    if (result == 0 && stream->readable_epoch == readable_epoch && stream->readable_published_epoch == readable_epoch) {
+        set_readable_retry_locked(stream, false);
+    } else if (result != 0 && stream->readable_epoch == readable_epoch) {
         if (stream->readable_published_epoch == readable_epoch) {
             stream->readable_published_epoch = 0;
         }
-        if (stream->readable_pending && stream->readable_epoch == readable_epoch) {
+        if (stream->receive_head != NULL) {
+            stream->readable_pending = true;
+            set_readable_retry_locked(stream, readable_publication_retryable(result));
+        } else {
             stream->readable_pending = false;
+            set_readable_retry_locked(stream, false);
         }
-        pthread_mutex_unlock(&stream->mutex);
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    if (result != 0 && readable_publication_retryable(result) && schedule_retry) {
+        adapter_schedule(adapter);
+        return 0;
     }
     return result;
 }
@@ -1706,6 +1777,8 @@ static void owned_receive_release(void* owner, void* release_context) {
 static bool AdapterTestFailNextReceiveCreate;
 static bool AdapterTestReceiveDuringReadyPublication;
 static bool AdapterTestShutdownAfterSendAdmission;
+static bool AdapterTestPromoteBeforePeerHandlePublication;
+static bool AdapterTestPeerStreamStayedQueued;
 #endif
 
 static int create_owned_receive(msquic_receive* receive, trevrpc_engine_receive** out_receive) {
@@ -1771,7 +1844,7 @@ static int provider_stream_receive_frame(
             rearm = true;
         }
         pthread_mutex_unlock(&stream->mutex);
-        if (rearm && publish_stream_readable(stream) != 0) {
+        if (rearm && publish_stream_readable(stream, true) != 0) {
             adapter_fail_stop(adapter, -ENOSPC, "receive readiness publication failed");
         }
         return result;
@@ -1779,6 +1852,8 @@ static int provider_stream_receive_frame(
     stream->receive_head = node->next;
     if (stream->receive_head == NULL) {
         stream->receive_tail = NULL;
+        stream->readable_pending = false;
+        set_readable_retry_locked(stream, false);
     } else if (!stream->readable_pending) {
         stream->readable_pending = true;
         stream->readable_epoch++;
@@ -1788,7 +1863,7 @@ static int provider_stream_receive_frame(
     release_receive_credit(stream, node->receive->len);
     free(node);
     resume_paused_receives(adapter);
-    if (rearm && publish_stream_readable(stream) != 0) {
+    if (rearm && publish_stream_readable(stream, true) != 0) {
         adapter_fail_stop(adapter, -ENOSPC, "receive readiness publication failed");
     }
     *out_receive = detached;
@@ -1850,10 +1925,11 @@ static void unqueue_stream_locked(msquic_provider* adapter, adapter_stream* stre
 static bool pending_operation_id_locked(adapter_stream* stream, uint64_t operation_id, uint32_t* slot_out) {
     if (stream->pending_operation_ids != NULL) {
         for (uint32_t index = 0; index < stream->base.endpoint->max_pending_send_count; index++) {
-            if (stream->pending_operation_ids[index] == operation_id) {
+            uint64_t pending = atomic_load_explicit(&stream->pending_operation_ids[index], memory_order_acquire);
+            if (pending == operation_id) {
                 return true;
             }
-            if (slot_out != NULL && *slot_out == UINT32_MAX && stream->pending_operation_ids[index] == 0) {
+            if (slot_out != NULL && *slot_out == UINT32_MAX && pending == 0) {
                 *slot_out = index;
             }
         }
@@ -1907,7 +1983,7 @@ static int reserve_send_admission(adapter_stream* stream, uint64_t operation_id,
             result = -EAGAIN;
         } else {
             if (stream->pending_operation_ids != NULL) {
-                stream->pending_operation_ids[id_slot] = operation_id;
+                atomic_store_explicit(&stream->pending_operation_ids[id_slot], operation_id, memory_order_release);
             }
             stream->pending_send_count++;
             stream->pending_send_bytes += len;
@@ -1940,8 +2016,9 @@ static void release_send_admission(adapter_stream* stream, uint64_t operation_id
     }
     if (stream->pending_operation_ids != NULL) {
         for (uint32_t index = 0; index < stream->base.endpoint->max_pending_send_count; index++) {
-            if (stream->pending_operation_ids[index] == operation_id) {
-                stream->pending_operation_ids[index] = 0;
+            uint64_t pending = atomic_load_explicit(&stream->pending_operation_ids[index], memory_order_acquire);
+            if (pending == operation_id) {
+                atomic_store_explicit(&stream->pending_operation_ids[index], 0, memory_order_release);
                 break;
             }
         }
@@ -2029,18 +2106,44 @@ static bool send_operation_release(adapter_send* send) {
 }
 
 static void release_send_operation_id(adapter_stream* stream, uint64_t operation_id) {
-    pthread_mutex_lock(&stream->send_gate);
-    pthread_mutex_lock(&stream->mutex);
     if (stream->pending_operation_ids != NULL) {
         for (uint32_t index = 0; index < stream->base.endpoint->max_pending_send_count; index++) {
-            if (stream->pending_operation_ids[index] == operation_id) {
-                stream->pending_operation_ids[index] = 0;
+            uint64_t pending = atomic_load_explicit(&stream->pending_operation_ids[index], memory_order_acquire);
+            if (pending == operation_id) {
+                atomic_store_explicit(&stream->pending_operation_ids[index], 0, memory_order_release);
                 break;
             }
         }
     }
-    pthread_mutex_unlock(&stream->mutex);
-    pthread_mutex_unlock(&stream->send_gate);
+}
+
+static void send_completion_commit(void* provider_context, void* hook_context) {
+    (void)provider_context;
+    adapter_send* send = hook_context;
+    release_send_operation_id(send->stream, send->operation_id);
+}
+
+static int publish_send_completion(adapter_send* send, int status) {
+    adapter_stream* stream = send->stream;
+    msquic_provider* adapter = stream->base.adapter;
+    trevrpc_engine_event_spec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.kind = TREVRPC_ENGINE_EVENT_SEND_COMPLETE;
+    spec.flags = stream->base.event_flags;
+    spec.status = status;
+    spec.subject_kind = TREVRPC_ENGINE_OBJECT_STREAM;
+    spec.subject = stream->base.token;
+    spec.parent = stream->parent;
+    spec.operation_id = send->operation_id;
+    spec.mandatory_commit_hook = send_completion_commit;
+    spec.mandatory_abort_hook = send_completion_commit;
+    spec.mandatory_hook_context = send;
+    trevrpc_engine_reservation* reservation = send->completion_reservation;
+    send->completion_reservation = NULL;
+    int result = trevrpc_engine_provider_publish_reserved(adapter->engine, reservation, &spec);
+    free(send->data);
+    free(send);
+    return result;
 }
 
 static void cancel_unsent_sends(adapter_stream* stream, int status) {
@@ -2094,23 +2197,8 @@ static void cancel_unsent_sends(adapter_stream* stream, int status) {
     while (canceled_head != NULL) {
         adapter_send* send = canceled_head;
         canceled_head = send->next;
-        trevrpc_engine_reservation* reservation = send->completion_reservation;
-        send->completion_reservation = NULL;
-        (void)publish_reserved_event(adapter,
-            reservation,
-            TREVRPC_ENGINE_EVENT_SEND_COMPLETE,
-            stream->base.event_flags,
-            status,
-            TREVRPC_ENGINE_OBJECT_STREAM,
-            stream->base.token,
-            stream->parent,
-            send->operation_id,
-            0,
-            0,
-            NULL);
-        release_send_operation_id(stream, send->operation_id);
-        free(send->data);
-        free(send);
+        send->next = NULL;
+        (void)publish_send_completion(send, status);
     }
     adapter_schedule(adapter);
 }
@@ -2349,7 +2437,7 @@ static int publish_stream_ready(adapter_stream* stream) {
         bool readable_pending = stream->readable_pending;
         pthread_mutex_unlock(&stream->mutex);
         if (readable_pending) {
-            result = publish_stream_readable(stream);
+            result = publish_stream_readable(stream, true);
         }
     }
     return result;
@@ -2977,6 +3065,36 @@ static void adapter_scheduler_drain(msquic_provider* adapter) {
         }
     }
 
+    if (atomic_load_explicit(&adapter->readable_retry_count, memory_order_relaxed) != 0) {
+        for (uint32_t slot = adapter->stream_begin; slot < adapter->slot_count; ++slot) {
+            adapter_stream* stream = NULL;
+            pthread_mutex_lock(&adapter->mutex);
+            adapter_object* object = adapter->slots[slot].object;
+            if (adapter->state == TREVRPC_ENGINE_STATE_RUNNING && object != NULL &&
+                object->kind == TREVRPC_ENGINE_OBJECT_STREAM && !object->terminal_published &&
+                !atomic_load_explicit(&object->closing, memory_order_acquire)) {
+                stream = (adapter_stream*)object;
+                pthread_mutex_lock(&stream->mutex);
+                bool retry = stream->readable_retry_pending && stream->readable_pending &&
+                             stream->readable_published_epoch == 0 && stream->receive_head != NULL;
+                pthread_mutex_unlock(&stream->mutex);
+                if (retry) {
+                    object->active_operations++;
+                } else {
+                    stream = NULL;
+                }
+            }
+            pthread_mutex_unlock(&adapter->mutex);
+            if (stream != NULL) {
+                int result = publish_stream_readable(stream, false);
+                if (result != 0) {
+                    adapter_fail_stop(adapter, result, "receive readiness retry failed");
+                }
+                adapter_object_unpin(&stream->base);
+            }
+        }
+    }
+
     for (;;) {
         adapter_stream* stream = NULL;
         adapter_send* send = NULL;
@@ -3025,31 +3143,13 @@ static void adapter_scheduler_drain(msquic_provider* adapter) {
         int pin_result = trevrpc_engine_provider_operation_pin(adapter->engine);
         if (pin_result != 0) {
             bool complete = false;
-            uint64_t operation_id = send->operation_id;
-            trevrpc_engine_reservation* reservation = NULL;
             pthread_mutex_lock(&stream->send_gate);
             if (!atomic_exchange_explicit(&send->completed, true, memory_order_acq_rel)) {
-                reservation = send->completion_reservation;
-                send->completion_reservation = NULL;
                 complete = send_operation_release(send);
             }
             pthread_mutex_unlock(&stream->send_gate);
             if (complete) {
-                (void)publish_reserved_event(adapter,
-                    reservation,
-                    TREVRPC_ENGINE_EVENT_SEND_COMPLETE,
-                    stream->base.event_flags,
-                    pin_result,
-                    TREVRPC_ENGINE_OBJECT_STREAM,
-                    stream->base.token,
-                    stream->parent,
-                    operation_id,
-                    0,
-                    0,
-                    NULL);
-                release_send_operation_id(stream, operation_id);
-                free(send->data);
-                free(send);
+                (void)publish_send_completion(send, pin_result);
             }
             if (stream_shutdown_drained(stream))
                 publish_stream_terminal(stream, false, 0);
@@ -3062,31 +3162,13 @@ static void adapter_scheduler_drain(msquic_provider* adapter) {
                                  : adapter->api->StreamSend(handle, &send->buffer, 1, QUIC_SEND_FLAG_NONE, send);
         if (QUIC_FAILED(status)) {
             bool complete = false;
-            uint64_t operation_id = send->operation_id;
-            trevrpc_engine_reservation* reservation = NULL;
             pthread_mutex_lock(&stream->send_gate);
             if (!atomic_exchange_explicit(&send->completed, true, memory_order_acq_rel)) {
-                reservation = send->completion_reservation;
-                send->completion_reservation = NULL;
                 complete = send_operation_release(send);
             }
             pthread_mutex_unlock(&stream->send_gate);
             if (complete) {
-                (void)publish_reserved_event(adapter,
-                    reservation,
-                    TREVRPC_ENGINE_EVENT_SEND_COMPLETE,
-                    stream->base.event_flags,
-                    -EIO,
-                    TREVRPC_ENGINE_OBJECT_STREAM,
-                    stream->base.token,
-                    stream->parent,
-                    operation_id,
-                    0,
-                    0,
-                    NULL);
-                release_send_operation_id(stream, operation_id);
-                free(send->data);
-                free(send);
+                (void)publish_send_completion(send, -EIO);
             }
             trevrpc_engine_provider_operation_unpin(adapter->engine);
             if (stream_shutdown_drained(stream))
@@ -3187,6 +3269,10 @@ static void promote_peer_streams(adapter_connection* connection) {
             return;
         }
         stream = pending_node->stream;
+        if (stream->base.handle == NULL) {
+            pthread_mutex_unlock(&adapter->mutex);
+            return;
+        }
         pending_node = remove_peer_stream_queue_locked(adapter, connection, stream, &release_queue_ref);
         pthread_mutex_unlock(&adapter->mutex);
         free(pending_node);
@@ -3391,6 +3477,17 @@ static QUIC_STATUS QUIC_API adapter_connection_callback(HQUIC handle, void* cont
         stream->on_peer_queue = true;
         pthread_mutex_unlock(&adapter->mutex);
 
+#ifdef TREVRPC_ENGINE_MSQUIC_TESTING
+        if (AdapterTestPromoteBeforePeerHandlePublication) {
+            AdapterTestPromoteBeforePeerHandlePublication = false;
+            promote_peer_streams(connection);
+            pthread_mutex_lock(&adapter->mutex);
+            AdapterTestPeerStreamStayedQueued = stream->on_peer_queue && stream->pending_peer_node == node &&
+                                                !stream->base.terminal_published && stream->base.handle == NULL;
+            pthread_mutex_unlock(&adapter->mutex);
+        }
+#endif
+
         adapter->api->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream, (void*)adapter_stream_callback, stream);
         bool close_requested = object_publish_handle(&stream->base, event->PEER_STREAM_STARTED.Stream);
         if (close_requested) {
@@ -3496,7 +3593,7 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
         }
         pthread_mutex_unlock(&stream->mutex);
         if (publish) {
-            int publish_result = publish_stream_readable(stream);
+            int publish_result = publish_stream_readable(stream, true);
             if (publish_result != 0) {
                 result = publish_result;
                 parser_backpressured = false;
@@ -3535,26 +3632,9 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
             pthread_mutex_unlock(&stream->send_gate);
             break;
         }
-        uint64_t operation_id = send->operation_id;
-        trevrpc_engine_reservation* reservation = send->completion_reservation;
-        send->completion_reservation = NULL;
         (void)send_operation_release(send);
         pthread_mutex_unlock(&stream->send_gate);
-        (void)publish_reserved_event(adapter,
-            reservation,
-            TREVRPC_ENGINE_EVENT_SEND_COMPLETE,
-            stream->base.event_flags,
-            status,
-            TREVRPC_ENGINE_OBJECT_STREAM,
-            stream->base.token,
-            stream->parent,
-            operation_id,
-            0,
-            0,
-            NULL);
-        release_send_operation_id(stream, operation_id);
-        free(send->data);
-        free(send);
+        (void)publish_send_completion(send, status);
         trevrpc_engine_provider_operation_unpin(adapter->engine);
         if (stream_shutdown_drained(stream)) {
             publish_stream_terminal(stream, false, 0);
@@ -3898,6 +3978,7 @@ static void adapter_object_free(adapter_object* object) {
         }
         bool released_receive_credit = false;
         pthread_mutex_lock(&stream->mutex);
+        set_readable_retry_locked(stream, false);
         while (stream->receive_head != NULL) {
             adapter_receive_node* node = stream->receive_head;
             stream->receive_head = node->next;
@@ -4141,6 +4222,7 @@ int trevrpc_engine_msquic_create_v1(const trevrpc_engine_config_v1* engine_confi
         return -pthread_result;
     }
     adapter->scheduler_condition_initialized = true;
+    atomic_init(&adapter->readable_retry_count, 0);
     adapter->api = api;
     adapter->state = TREVRPC_ENGINE_STATE_RUNNING;
     adapter->slot_count = (uint32_t)slot_count64 + 1u;
@@ -4168,6 +4250,11 @@ int trevrpc_engine_msquic_create_v1(const trevrpc_engine_config_v1* engine_confi
         trevrpc_msquic_api_owner_release(api);
         return -pthread_result;
     }
+    pthread_mutex_lock(&adapter->mutex);
     adapter->scheduler_thread_started = true;
+    if (adapter->scheduler_requested) {
+        pthread_cond_signal(&adapter->scheduler_condition);
+    }
+    pthread_mutex_unlock(&adapter->mutex);
     return trevrpc_engine_provider_create_v1(engine_config, &MsQuicProviderOps, adapter, adapter->owner, out_engine);
 }

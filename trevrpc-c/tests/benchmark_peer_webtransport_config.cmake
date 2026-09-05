@@ -9,7 +9,7 @@ execute_process(
     ERROR_VARIABLE diagnostics
 )
 if(result EQUAL 0 OR NOT output MATCHES
-    "schema_version.:5.*code.:.invalid_argument.*requires --webtransport-origin")
+    "schema_version.:5.*code.:.invalid_argument.*trevrpc_webtransport server requires --webtransport-origin")
     message(FATAL_ERROR
         "WebTransport server accepted a missing origin or returned an unexpected error:\n${diagnostics}${output}")
 endif()
@@ -70,7 +70,7 @@ execute_process(
     ERROR_VARIABLE diagnostics
 )
 if(result EQUAL 0 OR NOT output MATCHES
-    "schema_version.:5.*code.:.invalid_argument.*trevrpc_webtransport is server-only")
+    "schema_version.:5.*code.:.unsupported.*trevrpc_webtransport is unsupported by the RPC ABI 1 peer")
     message(FATAL_ERROR
-        "Client accepted WebTransport or returned an unexpected error:\n${diagnostics}${output}")
+        "WebTransport client did not return the expected unsupported result:\n${diagnostics}${output}")
 endif()

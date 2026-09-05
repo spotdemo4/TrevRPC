@@ -1,4 +1,4 @@
-prefix=${pcfiledir}/../..
+prefix=@trevrpc_pc_prefix@
 exec_prefix=${prefix}
 libdir=@trevrpc_pc_libdir@
 includedir=@trevrpc_pc_includedir@
@@ -9,5 +9,5 @@ Description: TrevRPC MsQuic provider for the callback-native Engine ABI
 Version: @PROJECT_VERSION@
 Requires: trevrpc_engine = @PROJECT_VERSION@
 Libs: -L${libdir} -ltrevrpc_engine_msquic
-Libs.private: -ltrevrpc_msquic_api_owner -ltrevrpc_engine_msquic_support -lmsquic -lpthread
+Libs.private: -ltrevrpc_msquic_api_owner -ltrevrpc_engine_msquic_support -lmsquic @CMAKE_THREAD_LIBS_INIT@
 Cflags: -I${includedir}

@@ -1,5 +1,6 @@
 #include "trevrpc_qpack_static_internal.h"
 
+#include <errno.h> // IWYU pragma: keep
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -859,6 +860,86 @@ uint64_t trevrpc_qpack_status_error_code(trevrpc_qpack_status status) {
         return 0;
     }
     return 0;
+}
+
+static int trevrpc_qpack_encoder_integer(
+    trevrpc_qpack_static_encoder* encoder, unsigned prefix_bits, uint8_t flags, uint64_t value) {
+    uint64_t prefix_max;
+    if (encoder == NULL || encoder->output == NULL || prefix_bits == 0 || prefix_bits > 8 ||
+        encoder->length >= encoder->capacity || value > TREV_QPACK_MAX_INTEGER)
+        return -EINVAL;
+    prefix_max = (UINT64_C(1) << prefix_bits) - 1u;
+    if (value < prefix_max) {
+        encoder->output[encoder->length++] = (uint8_t)(flags | value);
+        return 0;
+    }
+    encoder->output[encoder->length++] = (uint8_t)(flags | prefix_max);
+    value -= prefix_max;
+    while (value >= 128) {
+        if (encoder->length >= encoder->capacity)
+            return -ENOBUFS;
+        encoder->output[encoder->length++] = (uint8_t)(0x80u | (value & 0x7fu));
+        value >>= 7;
+    }
+    if (encoder->length >= encoder->capacity)
+        return -ENOBUFS;
+    encoder->output[encoder->length++] = (uint8_t)value;
+    return 0;
+}
+
+static int trevrpc_qpack_encoder_bytes(trevrpc_qpack_static_encoder* encoder, const uint8_t* value, size_t value_len) {
+    int result;
+    if (encoder == NULL || (value == NULL && value_len != 0))
+        return -EINVAL;
+    result = trevrpc_qpack_encoder_integer(encoder, 7, 0, value_len);
+    if (result != 0)
+        return result;
+    if (value_len > encoder->capacity - encoder->length)
+        return -ENOBUFS;
+    if (value_len != 0)
+        memcpy(encoder->output + encoder->length, value, value_len);
+    encoder->length += value_len;
+    return 0;
+}
+
+int trevrpc_qpack_static_encoder_init(trevrpc_qpack_static_encoder* encoder, uint8_t* output, size_t capacity) {
+    if (encoder == NULL || output == NULL || capacity < 2)
+        return -EINVAL;
+    output[0] = 0;
+    output[1] = 0;
+    encoder->output = output;
+    encoder->capacity = capacity;
+    encoder->length = 2;
+    return 0;
+}
+
+int trevrpc_qpack_static_encoder_put_indexed(trevrpc_qpack_static_encoder* encoder, uint64_t static_index) {
+    return trevrpc_qpack_encoder_integer(encoder, 6, 0xc0, static_index);
+}
+
+int trevrpc_qpack_static_encoder_put_literal_name_reference(
+    trevrpc_qpack_static_encoder* encoder, uint64_t static_name_index, const uint8_t* value, size_t value_len) {
+    int result = trevrpc_qpack_encoder_integer(encoder, 4, 0x50, static_name_index);
+    return result != 0 ? result : trevrpc_qpack_encoder_bytes(encoder, value, value_len);
+}
+
+int trevrpc_qpack_static_encoder_put_literal(trevrpc_qpack_static_encoder* encoder,
+    const uint8_t* name,
+    size_t name_len,
+    const uint8_t* value,
+    size_t value_len) {
+    int result;
+    if (name == NULL && name_len != 0)
+        return -EINVAL;
+    result = trevrpc_qpack_encoder_integer(encoder, 3, 0x20, name_len);
+    if (result != 0)
+        return result;
+    if (name_len > encoder->capacity - encoder->length)
+        return -ENOBUFS;
+    if (name_len != 0)
+        memcpy(encoder->output + encoder->length, name, name_len);
+    encoder->length += name_len;
+    return trevrpc_qpack_encoder_bytes(encoder, value, value_len);
 }
 
 const trevrpc_qpack_field* trevrpc_qpack_field_at(const trevrpc_qpack_field_section* section, size_t index) {

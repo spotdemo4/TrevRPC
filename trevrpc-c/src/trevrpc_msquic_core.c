@@ -44,14 +44,19 @@ static pthread_mutex_t TrevMsQuicApiMutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t TrevMsQuicApiLeases;
 static pthread_mutex_t TrevMsQuicFinalizerMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t TrevMsQuicFinalizerCond = PTHREAD_COND_INITIALIZER;
-static trevrpc_msquic_conn* TrevMsQuicFinalizerHead;
-static trevrpc_msquic_conn* TrevMsQuicFinalizerTail;
+static trevrpc_msquic_finalizer_item* TrevMsQuicFinalizerHead;
+static trevrpc_msquic_finalizer_item* TrevMsQuicFinalizerTail;
+static trevrpc_msquic_listener* TrevMsQuicDeferredListenerHead;
+static trevrpc_msquic_listener* TrevMsQuicDeferredListenerTail;
+static size_t TrevMsQuicFinalizerPending;
 static pthread_t TrevMsQuicFinalizerThread;
 static bool TrevMsQuicFinalizerStarted;
 static bool TrevMsQuicFinalizerStopping;
 static bool TrevMsQuicFinalizerAtExitRegistered;
 static _Thread_local trevrpc_msquic_conn* TrevMsQuicObserverConn;
+static _Thread_local trevrpc_msquic_listener* TrevMsQuicObserverListener;
 static _Thread_local trevrpc_msquic_stream* TrevMsQuicObserverStream;
+static _Thread_local trevrpc_msquic_stream* TrevMsQuicStartObserverStream;
 
 static const QUIC_API_TABLE* trevrpc_msquic_api(void) {
     return atomic_load_explicit(&TrevMsQuic, memory_order_acquire);
@@ -59,6 +64,9 @@ static const QUIC_API_TABLE* trevrpc_msquic_api(void) {
 
 #ifdef TREVRPC_MSQUIC_TESTING
 static pthread_mutex_t TrevMsQuicTestStreamHookMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t TrevMsQuicTestAbortMutex = PTHREAD_MUTEX_INITIALIZER;
+static trevrpc_msquic_stream* TrevMsQuicTestLastAbortStream;
+static uint64_t TrevMsQuicTestLastAbortError;
 static trevrpc_msquic_test_stream_hook TrevMsQuicTestStreamHook;
 static void* TrevMsQuicTestStreamHookContext;
 static bool TrevMsQuicTestFailNextStreamSend;
@@ -82,10 +90,15 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(HQUIC listener, voi
 static QUIC_STATUS QUIC_API trevrpc_msquic_conn_callback(HQUIC connection, void* context, QUIC_CONNECTION_EVENT* event);
 static QUIC_STATUS QUIC_API trevrpc_msquic_stream_callback(HQUIC stream, void* context, QUIC_STREAM_EVENT* event);
 static void trevrpc_msquic_stream_complete_close(trevrpc_msquic_stream* stream, HQUIC handle);
-static void trevrpc_msquic_stream_destroy_owned(trevrpc_msquic_stream* stream, bool owns_close_call);
+static void trevrpc_msquic_stream_destroy_owned(
+    trevrpc_msquic_stream* stream, bool owns_close_call, bool force_handle_close);
+static void trevrpc_msquic_stream_begin_deferred_close_owned(trevrpc_msquic_stream* stream);
 static void trevrpc_msquic_stream_try_destroy_deferred(trevrpc_msquic_stream* stream);
 static void trevrpc_msquic_conn_destroy_owned(trevrpc_msquic_conn* conn, bool owns_close_call);
-static int trevrpc_msquic_conn_finalizer_ensure_started(void);
+static void trevrpc_msquic_finalizer_schedule_transferred(
+    trevrpc_msquic_finalizer_item* item, void* object, trevrpc_msquic_finalizer_kind kind);
+static int trevrpc_msquic_finalizer_ensure_started(void);
+static void trevrpc_msquic_listener_stop_deferred_worker(trevrpc_msquic_listener* listener);
 static void trevrpc_msquic_stream_send_op_release(trevrpc_msquic_stream* stream);
 static void trevrpc_msquic_receive_budget_kick(trevrpc_msquic_receive_budget* budget);
 static int trevrpc_msquic_materialize_pending_frame_locked(trevrpc_msquic_stream* stream);
@@ -179,6 +192,38 @@ int trevrpc_msquic_test_inject_peer_send_aborted(trevrpc_msquic_stream* stream, 
     return (int)trevrpc_msquic_stream_callback(handle, stream, &event);
 }
 
+int trevrpc_msquic_test_inject_peer_receive_aborted(trevrpc_msquic_stream* stream, uint64_t error_code) {
+    if (stream == NULL) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    HQUIC handle = stream->handle;
+    pthread_mutex_unlock(&stream->mutex);
+    QUIC_STREAM_EVENT event = {.Type = QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED};
+    event.PEER_RECEIVE_ABORTED.ErrorCode = error_code;
+    return (int)trevrpc_msquic_stream_callback(handle, stream, &event);
+}
+
+int trevrpc_msquic_test_stream_last_abort_error(trevrpc_msquic_stream* stream, uint64_t* out_error) {
+    if (stream == NULL || out_error == NULL)
+        return -EINVAL;
+    pthread_mutex_lock(&TrevMsQuicTestAbortMutex);
+    if (TrevMsQuicTestLastAbortStream != stream) {
+        pthread_mutex_unlock(&TrevMsQuicTestAbortMutex);
+        return -ENOENT;
+    }
+    *out_error = TrevMsQuicTestLastAbortError;
+    pthread_mutex_unlock(&TrevMsQuicTestAbortMutex);
+    return 0;
+}
+
+void trevrpc_msquic_test_stream_clear_abort_error(trevrpc_msquic_stream* stream) {
+    pthread_mutex_lock(&TrevMsQuicTestAbortMutex);
+    if (TrevMsQuicTestLastAbortStream == stream)
+        TrevMsQuicTestLastAbortStream = NULL;
+    pthread_mutex_unlock(&TrevMsQuicTestAbortMutex);
+}
+
 static void trevrpc_msquic_test_emit_stream_event(trevrpc_msquic_test_stream_event event) {
     pthread_mutex_lock(&TrevMsQuicTestStreamHookMutex);
     trevrpc_msquic_test_stream_hook hook = TrevMsQuicTestStreamHook;
@@ -206,6 +251,8 @@ static QUIC_STATUS trevrpc_msquic_test_stream_shutdown(
         event = TREV_MSQUIC_TEST_STREAM_SHUTDOWN_GRACEFUL;
     } else if (flags == QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE) {
         event = TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT_RECEIVE;
+    } else if (flags == QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND) {
+        event = TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT_SEND;
     } else if (flags == QUIC_STREAM_SHUTDOWN_FLAG_ABORT) {
         event = TREV_MSQUIC_TEST_STREAM_SHUTDOWN_ABORT;
     }
@@ -235,7 +282,7 @@ static QUIC_STATUS trevrpc_msquic_test_stream_shutdown(
 #endif
 
 static int trevrpc_msquic_api_acquire(void) {
-    int result = trevrpc_msquic_conn_finalizer_ensure_started();
+    int result = trevrpc_msquic_finalizer_ensure_started();
     if (result != 0) {
         return result;
     }
@@ -289,6 +336,36 @@ static void trevrpc_msquic_listener_callback_finish(trevrpc_msquic_listener* lis
     }
     pthread_cond_broadcast(&listener->cond);
     pthread_mutex_unlock(&listener->mutex);
+}
+
+static void trevrpc_msquic_listener_observer_finish(trevrpc_msquic_listener* listener) {
+    pthread_mutex_lock(&listener->mutex);
+    if (listener->active_observer_callbacks > 0) {
+        listener->active_observer_callbacks--;
+    }
+    pthread_cond_broadcast(&listener->cond);
+    pthread_mutex_unlock(&listener->mutex);
+}
+
+static void trevrpc_msquic_listener_notify(trevrpc_msquic_listener* listener) {
+    trevrpc_msquic_listener_observer observer = NULL;
+    void* observer_context = NULL;
+    pthread_mutex_lock(&listener->mutex);
+    observer = listener->observer;
+    observer_context = listener->observer_context;
+    if (observer != NULL) {
+        listener->active_observer_callbacks++;
+    }
+    pthread_mutex_unlock(&listener->mutex);
+
+    if (observer == NULL) {
+        return;
+    }
+    trevrpc_msquic_listener* previous = TrevMsQuicObserverListener;
+    TrevMsQuicObserverListener = listener;
+    observer(observer_context);
+    TrevMsQuicObserverListener = previous;
+    trevrpc_msquic_listener_observer_finish(listener);
 }
 
 static void trevrpc_msquic_conn_notify(trevrpc_msquic_conn* conn, const trevrpc_msquic_conn_event* event) {
@@ -349,17 +426,6 @@ static void trevrpc_msquic_conn_publish_ready(trevrpc_msquic_conn* conn) {
     }
 }
 
-static uint32_t trevrpc_msquic_stream_observer_flags_locked(const trevrpc_msquic_stream* stream) {
-    uint32_t flags = 0;
-    if (stream->recv_head != NULL || stream->frame_head != NULL) {
-        flags |= TREV_MSQUIC_STREAM_OBSERVER_READABLE;
-    }
-    if (stream->recv_fin || stream->closed || stream->shutdown_complete || stream->err != 0) {
-        flags |= TREV_MSQUIC_STREAM_OBSERVER_TERMINAL;
-    }
-    return flags;
-}
-
 static int trevrpc_msquic_stream_api_lifecycle_acquire(trevrpc_msquic_stream* stream) {
     if (stream == NULL) {
         return -EINVAL;
@@ -385,92 +451,189 @@ static void trevrpc_msquic_stream_lifecycle_retain(trevrpc_msquic_stream* stream
 
 static void trevrpc_msquic_stream_lifecycle_release(trevrpc_msquic_stream* stream) {
     bool destroy = false;
+    bool deferred_finalizer_owned = false;
     pthread_mutex_lock(&stream->mutex);
     if (stream->active_lifecycle_refs > 0) {
         stream->active_lifecycle_refs--;
     }
     if (stream->destroy_requested && !stream->destroy_started && stream->active_observer_callbacks == 0 &&
-        stream->active_lifecycle_refs == 0 && stream->active_send_ops == 0 && stream->active_handle_ops == 0 &&
-        stream->active_send_completions == 0 && stream->active_close_calls == 0 &&
+        stream->active_start_observer_callbacks == 0 && stream->active_lifecycle_refs == 0 &&
+        stream->active_send_ops == 0 && stream->active_handle_ops == 0 && stream->active_send_completions == 0 &&
+        stream->active_close_calls == 0 &&
         atomic_load_explicit(&stream->active_resume_pins, memory_order_acquire) == 0 &&
         stream->pending_send_count == 0 && stream->send_capacity_waiters == 0 && stream->shutdown_complete &&
         stream->handle == NULL && !stream->close_pending) {
         stream->destroy_started = true;
         destroy = true;
+        deferred_finalizer_owned = stream->deferred_finalizer_owned;
     }
     pthread_cond_broadcast(&stream->cond);
     pthread_mutex_unlock(&stream->mutex);
-    if (destroy) {
-        trevrpc_msquic_stream_destroy_owned(stream, false);
+    if (destroy && deferred_finalizer_owned) {
+        trevrpc_msquic_finalizer_schedule_transferred(
+            &stream->destroy_finalizer, stream, TREV_MSQUIC_FINALIZE_STREAM_DESTROY);
+    } else if (destroy) {
+        trevrpc_msquic_stream_destroy_owned(stream, false, false);
     }
 }
 
-static void* trevrpc_msquic_conn_finalizer_worker(void* context) {
+static void trevrpc_msquic_finalizer_enqueue(
+    trevrpc_msquic_finalizer_item* item, void* object, trevrpc_msquic_finalizer_kind kind, bool add_pending) {
+    item->next = NULL;
+    item->object = object;
+    item->kind = kind;
+    pthread_mutex_lock(&TrevMsQuicFinalizerMutex);
+    if (add_pending)
+        TrevMsQuicFinalizerPending++;
+    if (TrevMsQuicFinalizerTail != NULL)
+        TrevMsQuicFinalizerTail->next = item;
+    else
+        TrevMsQuicFinalizerHead = item;
+    TrevMsQuicFinalizerTail = item;
+    pthread_cond_signal(&TrevMsQuicFinalizerCond);
+    pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
+}
+
+static void trevrpc_msquic_finalizer_schedule(
+    trevrpc_msquic_finalizer_item* item, void* object, trevrpc_msquic_finalizer_kind kind) {
+    trevrpc_msquic_finalizer_enqueue(item, object, kind, true);
+}
+
+static void trevrpc_msquic_finalizer_schedule_transferred(
+    trevrpc_msquic_finalizer_item* item, void* object, trevrpc_msquic_finalizer_kind kind) {
+    trevrpc_msquic_finalizer_enqueue(item, object, kind, false);
+}
+
+static void trevrpc_msquic_finalizer_promote_listeners_locked(void) {
+    while (TrevMsQuicDeferredListenerHead != NULL) {
+        trevrpc_msquic_listener* listener = TrevMsQuicDeferredListenerHead;
+        TrevMsQuicDeferredListenerHead = listener->deferred_close_next;
+        if (TrevMsQuicDeferredListenerHead == NULL)
+            TrevMsQuicDeferredListenerTail = NULL;
+        listener->deferred_close_next = NULL;
+        listener->close_finalizer.next = NULL;
+        listener->close_finalizer.object = listener;
+        listener->close_finalizer.kind = TREV_MSQUIC_FINALIZE_LISTENER_CLOSE;
+        if (TrevMsQuicFinalizerTail != NULL)
+            TrevMsQuicFinalizerTail->next = &listener->close_finalizer;
+        else
+            TrevMsQuicFinalizerHead = &listener->close_finalizer;
+        TrevMsQuicFinalizerTail = &listener->close_finalizer;
+    }
+    pthread_cond_signal(&TrevMsQuicFinalizerCond);
+}
+
+static void* trevrpc_msquic_finalizer_worker(void* context) {
     (void)context;
     for (;;) {
         pthread_mutex_lock(&TrevMsQuicFinalizerMutex);
-        while (TrevMsQuicFinalizerHead == NULL && !TrevMsQuicFinalizerStopping) {
+        while (TrevMsQuicFinalizerHead == NULL && !TrevMsQuicFinalizerStopping)
             pthread_cond_wait(&TrevMsQuicFinalizerCond, &TrevMsQuicFinalizerMutex);
-        }
         if (TrevMsQuicFinalizerHead == NULL) {
             pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
             return NULL;
         }
-        trevrpc_msquic_conn* conn = TrevMsQuicFinalizerHead;
-        TrevMsQuicFinalizerHead = conn->destroy_next;
-        if (TrevMsQuicFinalizerHead == NULL) {
+        trevrpc_msquic_finalizer_item* item = TrevMsQuicFinalizerHead;
+        trevrpc_msquic_finalizer_kind kind = item->kind;
+        void* object = item->object;
+        bool completes_pending = kind != TREV_MSQUIC_FINALIZE_STREAM_CLOSE;
+        TrevMsQuicFinalizerHead = item->next;
+        if (TrevMsQuicFinalizerHead == NULL)
             TrevMsQuicFinalizerTail = NULL;
-        }
-        conn->destroy_next = NULL;
+        item->next = NULL;
         pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
 
-        trevrpc_msquic_conn_destroy_owned(conn, false);
+        switch (kind) {
+        case TREV_MSQUIC_FINALIZE_CONN_DESTROY:
+            trevrpc_msquic_conn_destroy_owned(object, false);
+            break;
+        case TREV_MSQUIC_FINALIZE_STREAM_CLOSE:
+            trevrpc_msquic_stream_begin_deferred_close_owned(object);
+            break;
+        case TREV_MSQUIC_FINALIZE_STREAM_CLOSE_IMMEDIATE:
+            trevrpc_msquic_stream_close_immediate(object);
+            break;
+        case TREV_MSQUIC_FINALIZE_STREAM_DESTROY:
+            trevrpc_msquic_stream_destroy_owned(object, false, false);
+            break;
+        case TREV_MSQUIC_FINALIZE_CONN_CLOSE:
+            trevrpc_msquic_conn_close(object);
+            break;
+        case TREV_MSQUIC_FINALIZE_LISTENER_STOP:
+            trevrpc_msquic_listener_stop_deferred_worker(object);
+            break;
+        case TREV_MSQUIC_FINALIZE_LISTENER_CLOSE:
+            trevrpc_msquic_listener_close(object);
+            break;
+        }
+        if (completes_pending) {
+            pthread_mutex_lock(&TrevMsQuicFinalizerMutex);
+            assert(TrevMsQuicFinalizerPending != 0);
+            TrevMsQuicFinalizerPending--;
+            pthread_cond_broadcast(&TrevMsQuicFinalizerCond);
+            pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
+        }
     }
 }
 
-static void trevrpc_msquic_conn_finalizer_shutdown(void) {
+static void trevrpc_msquic_finalizer_shutdown(void) {
     pthread_mutex_lock(&TrevMsQuicFinalizerMutex);
     bool join = TrevMsQuicFinalizerStarted;
+    trevrpc_msquic_finalizer_promote_listeners_locked();
     TrevMsQuicFinalizerStopping = true;
     pthread_cond_broadcast(&TrevMsQuicFinalizerCond);
     pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
 
-    if (join) {
+    if (join)
         (void)pthread_join(TrevMsQuicFinalizerThread, NULL);
-    }
 }
 
-static int trevrpc_msquic_conn_finalizer_ensure_started(void) {
+static int trevrpc_msquic_finalizer_ensure_started(void) {
     int err = 0;
     pthread_mutex_lock(&TrevMsQuicFinalizerMutex);
     if (!TrevMsQuicFinalizerAtExitRegistered) {
-        if (atexit(trevrpc_msquic_conn_finalizer_shutdown) != 0) {
+        if (atexit(trevrpc_msquic_finalizer_shutdown) != 0)
             err = ENOMEM;
-        } else {
+        else
             TrevMsQuicFinalizerAtExitRegistered = true;
-        }
     }
     if (err == 0 && !TrevMsQuicFinalizerStarted) {
-        err = pthread_create(&TrevMsQuicFinalizerThread, NULL, trevrpc_msquic_conn_finalizer_worker, NULL);
-        if (err == 0) {
+        err = pthread_create(&TrevMsQuicFinalizerThread, NULL, trevrpc_msquic_finalizer_worker, NULL);
+        if (err == 0)
             TrevMsQuicFinalizerStarted = true;
-        }
     }
     pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
     return err == 0 ? 0 : -err;
 }
 
 static void trevrpc_msquic_conn_schedule_destroy(trevrpc_msquic_conn* conn) {
+    trevrpc_msquic_finalizer_schedule(&conn->close_finalizer, conn, TREV_MSQUIC_FINALIZE_CONN_DESTROY);
+}
+
+void trevrpc_msquic_finalizer_drain(void) {
     pthread_mutex_lock(&TrevMsQuicFinalizerMutex);
-    conn->destroy_next = NULL;
-    if (TrevMsQuicFinalizerTail != NULL) {
-        TrevMsQuicFinalizerTail->destroy_next = conn;
-    } else {
-        TrevMsQuicFinalizerHead = conn;
+    while (TrevMsQuicFinalizerPending != 0) {
+        trevrpc_msquic_finalizer_promote_listeners_locked();
+        pthread_cond_wait(&TrevMsQuicFinalizerCond, &TrevMsQuicFinalizerMutex);
     }
-    TrevMsQuicFinalizerTail = conn;
-    pthread_cond_signal(&TrevMsQuicFinalizerCond);
     pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
+}
+
+static int trevrpc_msquic_conn_api_lifecycle_acquire(trevrpc_msquic_conn* conn) {
+    if (conn == NULL) {
+        return -EINVAL;
+    }
+    int result = 0;
+    pthread_mutex_lock(&conn->mutex);
+    if (conn->destroy_requested) {
+        result = -ECANCELED;
+    } else if (conn->active_lifecycle_refs == SIZE_MAX) {
+        result = -EOVERFLOW;
+    } else {
+        conn->active_lifecycle_refs++;
+    }
+    pthread_mutex_unlock(&conn->mutex);
+    return result;
 }
 
 static void trevrpc_msquic_conn_lifecycle_retain(trevrpc_msquic_conn* conn) {
@@ -505,6 +668,36 @@ static void trevrpc_msquic_stream_observer_finish(trevrpc_msquic_stream* stream)
     }
     pthread_cond_broadcast(&stream->cond);
     pthread_mutex_unlock(&stream->mutex);
+}
+
+static void trevrpc_msquic_stream_start_observer_finish(trevrpc_msquic_stream* stream) {
+    pthread_mutex_lock(&stream->mutex);
+    if (stream->active_start_observer_callbacks > 0) {
+        stream->active_start_observer_callbacks--;
+    }
+    pthread_cond_broadcast(&stream->cond);
+    pthread_mutex_unlock(&stream->mutex);
+}
+
+static void trevrpc_msquic_stream_start_notify(trevrpc_msquic_stream* stream) {
+    trevrpc_msquic_stream_start_observer observer = NULL;
+    void* observer_context = NULL;
+    pthread_mutex_lock(&stream->mutex);
+    observer = stream->start_observer;
+    observer_context = stream->start_observer_context;
+    if (observer != NULL) {
+        stream->active_start_observer_callbacks++;
+    }
+    pthread_mutex_unlock(&stream->mutex);
+
+    if (observer == NULL) {
+        return;
+    }
+    trevrpc_msquic_stream* previous = TrevMsQuicStartObserverStream;
+    TrevMsQuicStartObserverStream = stream;
+    observer(observer_context);
+    TrevMsQuicStartObserverStream = previous;
+    trevrpc_msquic_stream_start_observer_finish(stream);
 }
 
 static void trevrpc_msquic_stream_notify(trevrpc_msquic_stream* stream, uint32_t flags) {
@@ -548,6 +741,10 @@ static bool trevrpc_msquic_checked_add(size_t left, size_t right, size_t* out) {
     return true;
 }
 
+size_t trevrpc_msquic_receive_minimum_raw_bytes(void) {
+    return sizeof(trevrpc_msquic_chunk) + 1u;
+}
+
 static bool trevrpc_msquic_receive_minimum_bytes_checked(size_t max_frame_size, size_t* out) {
     size_t required = sizeof(trevrpc_msquic_chunk);
     if (!trevrpc_msquic_checked_add(required, sizeof(uint32_t), &required) ||
@@ -574,6 +771,12 @@ static int trevrpc_msquic_receive_policy_effective(
     effective->max_connection_owned_count = configured != NULL && configured->max_connection_owned_count != 0
                                                 ? configured->max_connection_owned_count
                                                 : TREV_MSQUIC_DEFAULT_CONNECTION_RECV_COUNT;
+    effective->max_undecided_owned_bytes = configured != NULL ? configured->max_undecided_owned_bytes : 0;
+    effective->max_undecided_owned_count = configured != NULL ? configured->max_undecided_owned_count : 0;
+    if (effective->max_undecided_owned_bytes != 0 &&
+        effective->max_undecided_owned_bytes < trevrpc_msquic_receive_minimum_raw_bytes()) {
+        return EINVAL;
+    }
 
     size_t required = 0;
     if (!trevrpc_msquic_receive_minimum_bytes_checked(max_frame_size, &required)) {
@@ -627,6 +830,14 @@ static trevrpc_msquic_receive_budget* trevrpc_msquic_receive_budget_new(
     }
     budget->undecided_admission_max_bytes = budget->max_owned_bytes - conversion_bytes;
     budget->undecided_admission_max_count = budget->max_owned_count - 2;
+    if (policy->max_undecided_owned_bytes != 0 &&
+        policy->max_undecided_owned_bytes < budget->undecided_admission_max_bytes) {
+        budget->undecided_admission_max_bytes = policy->max_undecided_owned_bytes;
+    }
+    if (policy->max_undecided_owned_count != 0 &&
+        policy->max_undecided_owned_count < budget->undecided_admission_max_count) {
+        budget->undecided_admission_max_count = policy->max_undecided_owned_count;
+    }
     return budget;
 }
 
@@ -1256,6 +1467,27 @@ static bool trevrpc_msquic_stream_pending_send_has_capacity_locked(const trevrpc
            len <= stream->max_pending_send_bytes - stream->pending_send_bytes;
 }
 
+static int trevrpc_msquic_stream_pending_send_reserve_raw_locked(trevrpc_msquic_stream* stream, size_t len) {
+    if (!trevrpc_msquic_stream_pending_send_has_capacity_locked(stream, len)) {
+        return -EAGAIN;
+    }
+    stream->pending_send_count++;
+    stream->pending_send_bytes += len;
+    return 0;
+}
+
+static void trevrpc_msquic_stream_pending_send_unreserve_raw_locked(trevrpc_msquic_stream* stream, size_t len) {
+    if (stream->pending_send_count > 0) {
+        stream->pending_send_count--;
+    }
+    if (stream->pending_send_bytes >= len) {
+        stream->pending_send_bytes -= len;
+    } else {
+        stream->pending_send_bytes = 0;
+    }
+    pthread_cond_broadcast(&stream->cond);
+}
+
 static HQUIC trevrpc_msquic_stream_pending_send_complete_locked(
     trevrpc_msquic_stream* stream, trevrpc_msquic_send* send) {
     if (send->pending_accounted) {
@@ -1318,6 +1550,11 @@ static void trevrpc_msquic_stream_send_complete_end(trevrpc_msquic_stream* strea
 static void trevrpc_msquic_stream_send_complete(
     trevrpc_msquic_stream* stream, trevrpc_msquic_send* send, bool canceled) {
     HQUIC close_handle = NULL;
+    bool tracked;
+    if (send == NULL) {
+        abort();
+    }
+    tracked = send->completion != NULL;
     trevrpc_msquic_stream_send_complete_begin(stream);
     trevrpc_msquic_test_emit_stream_event(TREV_MSQUIC_TEST_STREAM_SEND_COMPLETE_ENTERED);
 
@@ -1330,6 +1567,9 @@ static void trevrpc_msquic_stream_send_complete(
     trevrpc_msquic_send_release(stream, send);
     if (close_handle != NULL) {
         trevrpc_msquic_stream_complete_close(stream, close_handle);
+    }
+    if (tracked) {
+        trevrpc_msquic_stream_notify(stream, TREV_MSQUIC_STREAM_OBSERVER_SEND_COMPLETE);
     }
 
     trevrpc_msquic_stream_send_complete_end(stream);
@@ -1908,12 +2148,21 @@ static intptr_t trevrpc_msquic_stream_send_buffers_with_flags(trevrpc_msquic_str
     size_t len,
     QUIC_SEND_FLAGS flags,
     trevrpc_msquic_send_completion** out_completion,
-    bool wait_for_capacity) {
+    bool wait_for_capacity,
+    bool capacity_reserved) {
     if (out_completion != NULL) {
         *out_completion = NULL;
         send->completion = trevrpc_msquic_send_completion_new();
         if (send->completion == NULL) {
+            HQUIC close_handle = NULL;
+            pthread_mutex_lock(&stream->mutex);
+            close_handle = trevrpc_msquic_stream_pending_send_complete_locked(stream, send);
+            pthread_cond_broadcast(&stream->cond);
+            pthread_mutex_unlock(&stream->mutex);
             trevrpc_msquic_send_release(stream, send);
+            if (close_handle != NULL) {
+                trevrpc_msquic_stream_complete_close(stream, close_handle);
+            }
             return -ENOMEM;
         }
     }
@@ -1923,11 +2172,12 @@ static intptr_t trevrpc_msquic_stream_send_buffers_with_flags(trevrpc_msquic_str
     bool waited_for_capacity = false;
     bool cleanup_ref = false;
     pthread_mutex_lock(&stream->mutex);
-    if (wait_for_capacity && stream->handle != NULL && !stream->send_closed && !stream->send_aborted &&
-        !stream->api_closing && !stream->close_pending && !stream->closed && len > stream->max_pending_send_bytes) {
+    if (!capacity_reserved && wait_for_capacity && stream->handle != NULL && !stream->send_closed &&
+        !stream->send_aborted && !stream->api_closing && !stream->close_pending && !stream->closed &&
+        len > stream->max_pending_send_bytes) {
         reserve_err = TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED;
     }
-    if (wait_for_capacity && reserve_err == 0 && stream->handle != NULL && !stream->send_closed &&
+    if (!capacity_reserved && wait_for_capacity && reserve_err == 0 && stream->handle != NULL && !stream->send_closed &&
         !stream->send_aborted && !stream->api_closing && !stream->close_pending && !stream->closed &&
         !trevrpc_msquic_stream_pending_send_has_capacity_locked(stream, len)) {
         stream->send_capacity_waiters++;
@@ -1949,7 +2199,9 @@ static intptr_t trevrpc_msquic_stream_send_buffers_with_flags(trevrpc_msquic_str
     bool stream_closed = stream->closed;
     if (reserve_err == 0 && handle != NULL && !send_closed && !send_cancelled && !stream->close_pending &&
         !stream_closed) {
-        reserve_err = trevrpc_msquic_stream_pending_send_reserve_locked(stream, send, len);
+        if (!capacity_reserved) {
+            reserve_err = trevrpc_msquic_stream_pending_send_reserve_locked(stream, send, len);
+        }
         if (reserve_err == 0) {
             if (waited_for_capacity) {
                 stream->send_capacity_waiters--;
@@ -1979,11 +2231,21 @@ static intptr_t trevrpc_msquic_stream_send_buffers_with_flags(trevrpc_msquic_str
         }
     }
     if (handle == NULL || send_closed || send_cancelled || stream_closed || reserve_err != 0) {
+        HQUIC close_handle = NULL;
+        if (capacity_reserved && send->pending_accounted) {
+            pthread_mutex_lock(&stream->mutex);
+            close_handle = trevrpc_msquic_stream_pending_send_complete_locked(stream, send);
+            pthread_cond_broadcast(&stream->cond);
+            pthread_mutex_unlock(&stream->mutex);
+        }
         trevrpc_msquic_send_completion_free(send->completion);
         send->completion = NULL;
         trevrpc_msquic_send_release(stream, send);
         if (cleanup_ref) {
             trevrpc_msquic_stream_handle_release(stream);
+        }
+        if (close_handle != NULL) {
+            trevrpc_msquic_stream_complete_close(stream, close_handle);
         }
         if (reserve_err != 0) {
             return reserve_err;
@@ -2026,7 +2288,7 @@ static intptr_t trevrpc_msquic_stream_send_buffer_with_flags(trevrpc_msquic_stre
     bool wait_for_capacity) {
     send->buffers[0].Buffer = send->data;
     send->buffers[0].Length = (uint32_t)len;
-    return trevrpc_msquic_stream_send_buffers_with_flags(stream, send, 1, len, flags, NULL, wait_for_capacity);
+    return trevrpc_msquic_stream_send_buffers_with_flags(stream, send, 1, len, flags, NULL, wait_for_capacity, false);
 }
 
 static intptr_t trevrpc_msquic_stream_send_buffer(
@@ -2453,6 +2715,71 @@ int trevrpc_msquic_listener_accept(trevrpc_msquic_listener* listener, trevrpc_ms
     return 0;
 }
 
+int trevrpc_msquic_listener_set_observer(
+    trevrpc_msquic_listener* listener, trevrpc_msquic_listener_observer observer, void* context) {
+    if (listener == NULL || observer == NULL) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&listener->mutex);
+    if (listener->closed) {
+        pthread_mutex_unlock(&listener->mutex);
+        return -ECANCELED;
+    }
+    if (listener->observer != NULL || listener->active_observer_callbacks != 0) {
+        pthread_mutex_unlock(&listener->mutex);
+        return -EBUSY;
+    }
+    listener->observer = observer;
+    listener->observer_context = context;
+    pthread_mutex_unlock(&listener->mutex);
+    return 0;
+}
+
+void trevrpc_msquic_listener_clear_observer(trevrpc_msquic_listener* listener) {
+    if (listener == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&listener->mutex);
+    listener->observer = NULL;
+    listener->observer_context = NULL;
+    pthread_mutex_unlock(&listener->mutex);
+}
+
+void trevrpc_msquic_listener_drain_observer(trevrpc_msquic_listener* listener) {
+    if (listener == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&listener->mutex);
+    while (listener->active_observer_callbacks > 0 && TrevMsQuicObserverListener != listener) {
+        pthread_cond_wait(&listener->cond, &listener->mutex);
+    }
+    pthread_mutex_unlock(&listener->mutex);
+}
+
+int trevrpc_msquic_listener_accept_ready(trevrpc_msquic_listener* listener, trevrpc_msquic_conn** out_conn) {
+    if (listener == NULL || out_conn == NULL) {
+        return -EINVAL;
+    }
+    *out_conn = NULL;
+    pthread_mutex_lock(&listener->mutex);
+    if (listener->conn_head == NULL) {
+        int result = listener->closed
+                         ? (listener->err != 0 ? trevrpc_msquic_error_result(listener->err) : TREV_MSQUIC_ERR_CLOSED)
+                         : -EAGAIN;
+        pthread_mutex_unlock(&listener->mutex);
+        return result;
+    }
+    trevrpc_msquic_conn_node* node = listener->conn_head;
+    listener->conn_head = node->next;
+    if (listener->conn_head == NULL) {
+        listener->conn_tail = NULL;
+    }
+    pthread_mutex_unlock(&listener->mutex);
+    *out_conn = node->conn;
+    free(node);
+    return 0;
+}
+
 int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* out_port) {
     if (listener == NULL || out_port == NULL) {
         return EINVAL;
@@ -2470,12 +2797,16 @@ int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* ou
 }
 
 void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
-    if (listener == NULL) {
+    if (listener == NULL)
+        return;
+    if (TrevMsQuicObserverListener == listener) {
+        trevrpc_msquic_listener_close_deferred_owned(listener);
         return;
     }
 
     trevrpc_msquic_listener_shutdown(listener);
 
+    trevrpc_msquic_conn_node* connections = NULL;
     pthread_mutex_lock(&listener->mutex);
     while (listener->shutdown_waiters > 0) {
         pthread_cond_wait(&listener->cond, &listener->mutex);
@@ -2488,14 +2819,19 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
     }
 
     pthread_mutex_lock(&listener->mutex);
-    while (listener->active_callbacks > 0) {
+    while (listener->active_callbacks > 0 || listener->active_observer_callbacks > 0) {
         pthread_cond_wait(&listener->cond, &listener->mutex);
     }
+    listener->observer = NULL;
+    listener->observer_context = NULL;
+    connections = listener->conn_head;
+    listener->conn_head = NULL;
+    listener->conn_tail = NULL;
     pthread_mutex_unlock(&listener->mutex);
 
-    while (listener->conn_head != NULL) {
-        trevrpc_msquic_conn_node* node = listener->conn_head;
-        listener->conn_head = node->next;
+    while (connections != NULL) {
+        trevrpc_msquic_conn_node* node = connections;
+        connections = node->next;
         trevrpc_msquic_conn_close(node->conn);
         free(node);
     }
@@ -2518,10 +2854,63 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
     free(listener);
 }
 
-void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener) {
-    if (listener == NULL) {
+static void trevrpc_msquic_listener_stop_deferred_worker(trevrpc_msquic_listener* listener) {
+    HQUIC handle;
+    pthread_mutex_lock(&listener->mutex);
+    handle = listener->shutdown_in_progress ? listener->listener : NULL;
+    pthread_mutex_unlock(&listener->mutex);
+    if (handle == NULL)
         return;
+
+    trevrpc_msquic_api()->ListenerStop(handle);
+    pthread_mutex_lock(&listener->mutex);
+    listener->shutdown_in_progress = false;
+    pthread_cond_broadcast(&listener->cond);
+    pthread_mutex_unlock(&listener->mutex);
+}
+
+void trevrpc_msquic_listener_shutdown_deferred(trevrpc_msquic_listener* listener) {
+    if (listener == NULL)
+        return;
+
+    bool schedule = false;
+    pthread_mutex_lock(&listener->mutex);
+    if (!listener->closed) {
+        listener->closed = true;
+        listener->shutdown_in_progress = listener->listener != NULL;
+        schedule = listener->shutdown_in_progress;
+        pthread_cond_broadcast(&listener->cond);
     }
+    pthread_mutex_unlock(&listener->mutex);
+
+    if (schedule) {
+        trevrpc_msquic_finalizer_schedule(&listener->stop_finalizer, listener, TREV_MSQUIC_FINALIZE_LISTENER_STOP);
+    }
+}
+
+void trevrpc_msquic_listener_close_deferred_owned(trevrpc_msquic_listener* listener) {
+    if (listener == NULL)
+        return;
+    trevrpc_msquic_listener_shutdown_deferred(listener);
+
+    /* RegistrationClose may wait for every accepted connection. Preserve final
+     * ownership here, but promote the physical close only at a drain barrier,
+     * after the H3 owner has queued its connection shutdown work. */
+    listener->deferred_close_next = NULL;
+    pthread_mutex_lock(&TrevMsQuicFinalizerMutex);
+    TrevMsQuicFinalizerPending++;
+    if (TrevMsQuicDeferredListenerTail != NULL)
+        TrevMsQuicDeferredListenerTail->deferred_close_next = listener;
+    else
+        TrevMsQuicDeferredListenerHead = listener;
+    TrevMsQuicDeferredListenerTail = listener;
+    pthread_cond_broadcast(&TrevMsQuicFinalizerCond);
+    pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
+}
+
+void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener) {
+    if (listener == NULL)
+        return;
 
     HQUIC handle = NULL;
     pthread_mutex_lock(&listener->mutex);
@@ -2532,9 +2921,8 @@ void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener) {
         pthread_cond_broadcast(&listener->cond);
     } else if (listener->shutdown_in_progress) {
         listener->shutdown_waiters++;
-        while (listener->shutdown_in_progress) {
+        while (listener->shutdown_in_progress)
             pthread_cond_wait(&listener->cond, &listener->mutex);
-        }
         listener->shutdown_waiters--;
         pthread_cond_broadcast(&listener->cond);
     }
@@ -2613,9 +3001,10 @@ int trevrpc_msquic_dial_observed_features(const char* host,
         out_conn);
 }
 
-int trevrpc_msquic_dial_observed_features_with_receive_policy(const char* host,
+int trevrpc_msquic_dial_start_observed_features_with_receive_policy(const char* host,
     uint16_t port,
     const trevrpc_msquic_config* config,
+    const char* server_name,
     const trevrpc_msquic_feature_request* features,
     trevrpc_msquic_cancelled_fn cancelled,
     void* cancellation_context,
@@ -2690,8 +3079,8 @@ int trevrpc_msquic_dial_observed_features_with_receive_policy(const char* host,
         trevrpc_msquic_conn_close(conn);
         return TREV_MSQUIC_ERR_CLOSED;
     }
-    status =
-        trevrpc_msquic_api()->ConnectionStart(connection_handle, configuration, QUIC_ADDRESS_FAMILY_UNSPEC, host, port);
+    status = trevrpc_msquic_api()->ConnectionStart(
+        connection_handle, configuration, QUIC_ADDRESS_FAMILY_UNSPEC, server_name != NULL ? server_name : host, port);
     trevrpc_msquic_conn_handle_release(conn);
     if (QUIC_FAILED(status)) {
         if (cancelled != NULL && cancelled(cancellation_context)) {
@@ -2702,6 +3091,40 @@ int trevrpc_msquic_dial_observed_features_with_receive_policy(const char* host,
         return (int)status;
     }
 
+    *out_conn = conn;
+    return 0;
+}
+
+int trevrpc_msquic_dial_observed_features_with_receive_policy(const char* host,
+    uint16_t port,
+    const trevrpc_msquic_config* config,
+    const trevrpc_msquic_feature_request* features,
+    trevrpc_msquic_cancelled_fn cancelled,
+    void* cancellation_context,
+    const uint8_t* resumption_ticket,
+    size_t resumption_ticket_len,
+    trevrpc_msquic_conn_observer observer,
+    void* observer_context,
+    const trevrpc_msquic_receive_policy* receive_policy,
+    trevrpc_msquic_conn** out_conn) {
+    int err = trevrpc_msquic_dial_start_observed_features_with_receive_policy(host,
+        port,
+        config,
+        NULL,
+        features,
+        cancelled,
+        cancellation_context,
+        resumption_ticket,
+        resumption_ticket_len,
+        observer,
+        observer_context,
+        receive_policy,
+        out_conn);
+    if (err != 0) {
+        return err;
+    }
+
+    trevrpc_msquic_conn* conn = *out_conn;
     pthread_mutex_lock(&conn->mutex);
     bool was_cancelled = false;
     int wait_err = 0;
@@ -2729,15 +3152,16 @@ int trevrpc_msquic_dial_observed_features_with_receive_policy(const char* host,
     if (was_cancelled || (cancelled != NULL && cancelled(cancellation_context))) {
         trevrpc_msquic_conn_shutdown(conn);
         trevrpc_msquic_conn_close(conn);
+        *out_conn = NULL;
         return -ECANCELED;
     }
 
     if (!connected) {
         trevrpc_msquic_conn_close(conn);
+        *out_conn = NULL;
         return err != 0 ? err : TREV_MSQUIC_ERR_CLOSED;
     }
 
-    *out_conn = conn;
     return 0;
 }
 
@@ -2774,6 +3198,25 @@ int trevrpc_msquic_conn_feature_snapshot(trevrpc_msquic_conn* conn, trevrpc_msqu
     return result;
 }
 
+int trevrpc_msquic_conn_set_observer(trevrpc_msquic_conn* conn, trevrpc_msquic_conn_observer observer, void* context) {
+    if (conn == NULL || observer == NULL) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&conn->mutex);
+    if (conn->destroy_requested) {
+        pthread_mutex_unlock(&conn->mutex);
+        return -ECANCELED;
+    }
+    if (conn->observer != NULL || conn->active_observer_callbacks != 0) {
+        pthread_mutex_unlock(&conn->mutex);
+        return -EBUSY;
+    }
+    conn->observer = observer;
+    conn->observer_context = context;
+    pthread_mutex_unlock(&conn->mutex);
+    return 0;
+}
+
 void trevrpc_msquic_conn_clear_observer(trevrpc_msquic_conn* conn) {
     if (conn == NULL) {
         return;
@@ -2787,13 +3230,41 @@ void trevrpc_msquic_conn_clear_observer(trevrpc_msquic_conn* conn) {
     pthread_mutex_unlock(&conn->mutex);
 }
 
+void trevrpc_msquic_conn_drain_observer(trevrpc_msquic_conn* conn) {
+    if (conn == NULL || trevrpc_msquic_conn_api_lifecycle_acquire(conn) != 0) {
+        return;
+    }
+    pthread_mutex_lock(&conn->mutex);
+    while (conn->active_observer_callbacks > 0 && TrevMsQuicObserverConn != conn) {
+        pthread_cond_wait(&conn->cond, &conn->mutex);
+    }
+    pthread_mutex_unlock(&conn->mutex);
+    trevrpc_msquic_conn_lifecycle_release(conn);
+}
+
+int trevrpc_msquic_conn_ready(trevrpc_msquic_conn* conn) {
+    if (conn == NULL) {
+        return -EINVAL;
+    }
+    int lifecycle_err = trevrpc_msquic_conn_api_lifecycle_acquire(conn);
+    if (lifecycle_err != 0) {
+        return lifecycle_err;
+    }
+    pthread_mutex_lock(&conn->mutex);
+    int result = conn->connected ? 0
+                                 : (conn->err != 0 ? trevrpc_msquic_error_result(conn->err)
+                                                   : (conn->shutdown_complete ? TREV_MSQUIC_ERR_CLOSED : -EAGAIN));
+    pthread_mutex_unlock(&conn->mutex);
+    trevrpc_msquic_conn_lifecycle_release(conn);
+    return result;
+}
+
 int trevrpc_msquic_stream_set_observer(
     trevrpc_msquic_stream* stream, trevrpc_msquic_stream_observer observer, void* context) {
     if (stream == NULL || observer == NULL) {
         return -EINVAL;
     }
 
-    uint32_t flags = 0;
     int result = 0;
     pthread_mutex_lock(&stream->mutex);
     if (stream->api_closing) {
@@ -2803,22 +3274,8 @@ int trevrpc_msquic_stream_set_observer(
     } else {
         stream->observer = observer;
         stream->observer_context = context;
-        flags = trevrpc_msquic_stream_observer_flags_locked(stream);
-        if (flags != 0) {
-            stream->active_observer_callbacks++;
-            stream->active_lifecycle_refs++;
-        }
     }
     pthread_mutex_unlock(&stream->mutex);
-
-    if (result == 0 && flags != 0) {
-        trevrpc_msquic_stream* previous = TrevMsQuicObserverStream;
-        TrevMsQuicObserverStream = stream;
-        observer(context, flags);
-        TrevMsQuicObserverStream = previous;
-        trevrpc_msquic_stream_observer_finish(stream);
-        trevrpc_msquic_stream_lifecycle_release(stream);
-    }
     return result;
 }
 
@@ -2845,7 +3302,124 @@ void trevrpc_msquic_stream_drain_observer(trevrpc_msquic_stream* stream) {
     trevrpc_msquic_stream_lifecycle_release(stream);
 }
 
+int trevrpc_msquic_stream_set_start_observer(
+    trevrpc_msquic_stream* stream, trevrpc_msquic_stream_start_observer observer, void* context) {
+    if (stream == NULL || observer == NULL) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    if (stream->api_closing) {
+        pthread_mutex_unlock(&stream->mutex);
+        return -ECANCELED;
+    }
+    if (stream->start_observer != NULL || stream->active_start_observer_callbacks != 0) {
+        pthread_mutex_unlock(&stream->mutex);
+        return -EBUSY;
+    }
+    stream->start_observer = observer;
+    stream->start_observer_context = context;
+    pthread_mutex_unlock(&stream->mutex);
+    return 0;
+}
+
+void trevrpc_msquic_stream_clear_start_observer(trevrpc_msquic_stream* stream) {
+    if (stream == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    stream->start_observer = NULL;
+    stream->start_observer_context = NULL;
+    pthread_mutex_unlock(&stream->mutex);
+}
+
+void trevrpc_msquic_stream_drain_start_observer(trevrpc_msquic_stream* stream) {
+    if (stream == NULL || trevrpc_msquic_stream_api_lifecycle_acquire(stream) != 0) {
+        return;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    while (stream->active_start_observer_callbacks > 0 && TrevMsQuicStartObserverStream != stream) {
+        pthread_cond_wait(&stream->cond, &stream->mutex);
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    trevrpc_msquic_stream_lifecycle_release(stream);
+}
+
+int trevrpc_msquic_stream_start_status(trevrpc_msquic_stream* stream, uint64_t* out_stream_id) {
+    if (stream == NULL || out_stream_id == NULL) {
+        return -EINVAL;
+    }
+    *out_stream_id = 0;
+    int lifecycle_err = trevrpc_msquic_stream_api_lifecycle_acquire(stream);
+    if (lifecycle_err != 0) {
+        return lifecycle_err;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    int result = -EAGAIN;
+    if (stream->start_complete) {
+        result = stream->start_status == 0 ? 0 : trevrpc_msquic_error_result(stream->start_status);
+        if (result == 0) {
+            *out_stream_id = stream->stream_id;
+        }
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    trevrpc_msquic_stream_lifecycle_release(stream);
+    return result;
+}
+
+int trevrpc_msquic_stream_state(trevrpc_msquic_stream* stream, trevrpc_msquic_stream_state_snapshot* out_state) {
+    int lifecycle_err;
+    if (stream == NULL || out_state == NULL)
+        return -EINVAL;
+    lifecycle_err = trevrpc_msquic_stream_api_lifecycle_acquire(stream);
+    if (lifecycle_err != 0)
+        return lifecycle_err;
+    pthread_mutex_lock(&stream->mutex);
+    out_state->recv_fin = stream->recv_fin;
+    out_state->closed = stream->closed;
+    out_state->shutdown_complete = stream->shutdown_complete;
+    out_state->error_code = stream->err;
+    out_state->peer_send_aborted = stream->peer_send_error_set;
+    out_state->peer_send_error = stream->peer_send_error;
+    out_state->peer_receive_aborted = stream->peer_receive_error_set;
+    out_state->peer_receive_error = stream->peer_receive_error;
+    pthread_mutex_unlock(&stream->mutex);
+    trevrpc_msquic_stream_lifecycle_release(stream);
+    return 0;
+}
+
+int trevrpc_msquic_conn_accept_stream_ready(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
+    if (conn == NULL || out_stream == NULL) {
+        return -EINVAL;
+    }
+    *out_stream = NULL;
+    int lifecycle_err = trevrpc_msquic_conn_api_lifecycle_acquire(conn);
+    if (lifecycle_err != 0) {
+        return lifecycle_err;
+    }
+    pthread_mutex_lock(&conn->mutex);
+    if (conn->stream_head == NULL) {
+        int result = conn->err != 0 ? trevrpc_msquic_error_result(conn->err)
+                                    : ((conn->closed || conn->shutdown_complete) ? TREV_MSQUIC_ERR_CLOSED : -EAGAIN);
+        pthread_mutex_unlock(&conn->mutex);
+        trevrpc_msquic_conn_lifecycle_release(conn);
+        return result;
+    }
+    trevrpc_msquic_stream_node* node = conn->stream_head;
+    conn->stream_head = node->next;
+    if (conn->stream_head == NULL) {
+        conn->stream_tail = NULL;
+    }
+    pthread_mutex_unlock(&conn->mutex);
+    *out_stream = node->stream;
+    free(node);
+    trevrpc_msquic_conn_lifecycle_release(conn);
+    return 0;
+}
+
 int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
+    if (conn == NULL || out_stream == NULL) {
+        return -EINVAL;
+    }
     *out_stream = NULL;
     pthread_mutex_lock(&conn->mutex);
     while (conn->stream_head == NULL && !conn->closed && !conn->shutdown_complete && conn->err == 0) {
@@ -3091,6 +3665,12 @@ void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn) {
     pthread_mutex_unlock(&conn->mutex);
 }
 
+void trevrpc_msquic_conn_close_deferred_owned(trevrpc_msquic_conn* conn) {
+    if (conn == NULL)
+        return;
+    trevrpc_msquic_finalizer_schedule(&conn->close_finalizer, conn, TREV_MSQUIC_FINALIZE_CONN_CLOSE);
+}
+
 void trevrpc_msquic_conn_shutdown_error(trevrpc_msquic_conn* conn, uint64_t error_code) {
     if (conn == NULL) {
         return;
@@ -3209,6 +3789,41 @@ intptr_t trevrpc_msquic_stream_read_protocol_timeout(
 
 intptr_t trevrpc_msquic_stream_read_protocol_ready(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
     return trevrpc_msquic_stream_read_until(stream, data, len, NULL, true, false);
+}
+
+int trevrpc_msquic_stream_select_protocol_bytes(trevrpc_msquic_stream* stream) {
+    trevrpc_msquic_receive_budget* budget;
+    bool changed = false;
+    int result;
+    if (stream == NULL) {
+        return -EINVAL;
+    }
+    result = trevrpc_msquic_stream_api_lifecycle_acquire(stream);
+    if (result != 0) {
+        return result;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    if (stream->recv_mode == TREV_MSQUIC_RECV_FRAMES) {
+        result = TREV_MSQUIC_ERR_CLOSED;
+    } else {
+        if (stream->recv_mode == TREV_MSQUIC_RECV_UNDECIDED) {
+            stream->recv_mode = TREV_MSQUIC_RECV_BYTES;
+            changed = true;
+        }
+        budget = stream->recv_budget;
+        if (changed && budget != NULL && stream->recv_pause_kind != TREV_MSQUIC_RECV_PAUSE_NONE) {
+            pthread_mutex_lock(&budget->mutex);
+            budget->kick_pending = true;
+            pthread_mutex_unlock(&budget->mutex);
+        }
+        result = 0;
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    if (result == 0 && changed) {
+        trevrpc_msquic_stream_receive_progress(stream, budget);
+    }
+    trevrpc_msquic_stream_lifecycle_release(stream);
+    return result;
 }
 
 intptr_t trevrpc_msquic_stream_read_timeout(
@@ -3542,6 +4157,72 @@ intptr_t trevrpc_msquic_stream_write_fin(trevrpc_msquic_stream* stream, const ui
     return result;
 }
 
+intptr_t trevrpc_msquic_stream_write_raw_with_completion(trevrpc_msquic_stream* stream,
+    const uint8_t* data,
+    size_t len,
+    bool fin,
+    trevrpc_msquic_send_completion** completion) {
+    if (completion == NULL) {
+        return -EINVAL;
+    }
+    *completion = NULL;
+    if (data == NULL && len > 0) {
+        return -EINVAL;
+    }
+    if (len > UINT32_MAX) {
+        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
+    }
+
+    int op_err = trevrpc_msquic_stream_send_op_acquire(stream);
+    if (op_err != 0) {
+        return op_err;
+    }
+
+    intptr_t result = 0;
+    pthread_mutex_lock(&stream->mutex);
+    HQUIC handle = stream->handle;
+    bool send_cancelled = stream->send_aborted || stream->api_closing;
+    bool stream_closed = stream->closed;
+    if (handle == NULL || stream->close_pending || stream_closed) {
+        result = TREV_MSQUIC_ERR_CLOSED;
+    } else if (send_cancelled) {
+        result = -ECANCELED;
+    } else if (stream->send_closed) {
+        result = TREV_MSQUIC_ERR_CLOSED;
+    } else {
+        result = trevrpc_msquic_stream_pending_send_reserve_raw_locked(stream, len);
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    if (result != 0) {
+        trevrpc_msquic_stream_send_op_release(stream);
+        return result;
+    }
+
+    trevrpc_msquic_send* send = trevrpc_msquic_send_acquire(stream, len);
+    if (send == NULL) {
+        pthread_mutex_lock(&stream->mutex);
+        trevrpc_msquic_stream_pending_send_unreserve_raw_locked(stream, len);
+        pthread_mutex_unlock(&stream->mutex);
+        trevrpc_msquic_stream_send_op_release(stream);
+        return -ENOMEM;
+    }
+    send->pending_len = len;
+    send->pending_accounted = true;
+    if (len > 0) {
+        memcpy(send->data, data, len);
+    }
+    send->buffers[0].Buffer = send->data;
+    send->buffers[0].Length = (uint32_t)len;
+    result = trevrpc_msquic_stream_send_buffers_with_flags(
+        stream, send, 1, len, fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE, completion, false, true);
+    if (result == TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED) {
+        result = -EAGAIN;
+    }
+
+    trevrpc_msquic_stream_send_op_release(stream);
+    return result;
+}
+
 static intptr_t trevrpc_msquic_stream_write_frame_parts_with_flags(trevrpc_msquic_stream* stream,
     const trevrpc_msquic_frame_part* parts,
     size_t parts_len,
@@ -3612,7 +4293,7 @@ static intptr_t trevrpc_msquic_stream_write_frame_parts_with_flags(trevrpc_msqui
     }
 
     result = trevrpc_msquic_stream_send_buffers_with_flags(
-        stream, send, buffer_count, 4 + frame_body_len, flags, completion, wait_for_capacity);
+        stream, send, buffer_count, 4 + frame_body_len, flags, completion, wait_for_capacity, false);
 cleanup:
     trevrpc_msquic_stream_send_op_release(stream);
     return result;
@@ -3885,9 +4566,19 @@ intptr_t trevrpc_msquic_stream_write_message_frames_borrowed(trevrpc_msquic_stre
     }
 
     result = trevrpc_msquic_stream_send_buffers_with_flags(
-        stream, send, buffer_count, frame_len, QUIC_SEND_FLAG_NONE, completion, true);
+        stream, send, buffer_count, frame_len, QUIC_SEND_FLAG_NONE, completion, true, false);
 cleanup:
     trevrpc_msquic_stream_send_op_release(stream);
+    return result;
+}
+
+int trevrpc_msquic_send_completion_status(trevrpc_msquic_send_completion* completion) {
+    if (completion == NULL) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&completion->mutex);
+    int result = completion->completed ? completion->result : -EAGAIN;
+    pthread_mutex_unlock(&completion->mutex);
     return result;
 }
 
@@ -3979,8 +4670,17 @@ int trevrpc_msquic_stream_abort_with_error(trevrpc_msquic_stream* stream, uint64
     if (stream == NULL) {
         return -EINVAL;
     }
+#ifdef TREVRPC_MSQUIC_TESTING
+    pthread_mutex_lock(&TrevMsQuicTestAbortMutex);
+    TrevMsQuicTestLastAbortStream = stream;
+    TrevMsQuicTestLastAbortError = error_code;
+    pthread_mutex_unlock(&TrevMsQuicTestAbortMutex);
+#endif
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
+    QUIC_STREAM_SHUTDOWN_FLAGS shutdown_flags = !stream->receive_capable ? QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND
+                                                : stream->send_closed    ? QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE
+                                                                         : QUIC_STREAM_SHUTDOWN_FLAG_ABORT;
     if (handle == NULL || stream->close_pending) {
         stream->send_aborted = true;
         pthread_cond_broadcast(&stream->cond);
@@ -3992,7 +4692,7 @@ int trevrpc_msquic_stream_abort_with_error(trevrpc_msquic_stream* stream, uint64
     pthread_cond_broadcast(&stream->cond);
     pthread_mutex_unlock(&stream->mutex);
 
-    QUIC_STATUS status = trevrpc_msquic_test_stream_shutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, error_code);
+    QUIC_STATUS status = trevrpc_msquic_test_stream_shutdown(handle, shutdown_flags, error_code);
     trevrpc_msquic_stream_handle_release(stream);
     return QUIC_FAILED(status) ? (int)status : 0;
 }
@@ -4017,8 +4717,11 @@ int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream) {
 }
 
 static QUIC_STREAM_SHUTDOWN_FLAGS trevrpc_msquic_stream_close_flags_locked(const trevrpc_msquic_stream* stream) {
+    if (stream->send_closed && (!stream->receive_capable || stream->recv_fin)) {
+        return QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL;
+    }
     if (!stream->receive_capable) {
-        return stream->send_closed ? QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL : QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND;
+        return QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND;
     }
     return stream->send_closed ? QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE : QUIC_STREAM_SHUTDOWN_FLAG_ABORT;
 }
@@ -4055,8 +4758,10 @@ static void trevrpc_msquic_stream_request_deferred_close(trevrpc_msquic_stream* 
     }
 }
 
-static void trevrpc_msquic_stream_destroy_owned(trevrpc_msquic_stream* stream, bool owns_close_call) {
+static void trevrpc_msquic_stream_destroy_owned(
+    trevrpc_msquic_stream* stream, bool owns_close_call, bool force_handle_close) {
     trevrpc_msquic_receive_budget* recv_budget = stream->recv_budget;
+    HQUIC force_close_handle = NULL;
     bool release_api = false;
 
     trevrpc_msquic_test_emit_stream_event(TREV_MSQUIC_TEST_STREAM_CLOSE_STARTED);
@@ -4085,10 +4790,28 @@ static void trevrpc_msquic_stream_destroy_owned(trevrpc_msquic_stream* stream, b
         trevrpc_msquic_stream_handle_release(stream);
         pthread_mutex_lock(&stream->mutex);
     }
+    if (force_handle_close) {
+        trevrpc_msquic_test_emit_stream_event(TREV_MSQUIC_TEST_STREAM_CLOSE_IMMEDIATE);
+        while (!trevrpc_msquic_stream_send_ops_idle(stream) || stream->active_handle_ops > 0 ||
+               stream->pending_send_count > 0 || stream->active_send_completions > 0 ||
+               stream->active_observer_callbacks > 0 || stream->active_start_observer_callbacks > 0 ||
+               stream->active_lifecycle_refs > 0 || stream->send_capacity_waiters > 0) {
+            pthread_cond_wait(&stream->cond, &stream->mutex);
+        }
+        if (stream->handle != NULL && !stream->close_pending) {
+            force_close_handle = stream->handle;
+            stream->handle = NULL;
+        }
+        pthread_mutex_unlock(&stream->mutex);
+        if (force_close_handle != NULL) {
+            trevrpc_msquic_stream_complete_close(stream, force_close_handle);
+        }
+        pthread_mutex_lock(&stream->mutex);
+    }
     while (!trevrpc_msquic_stream_send_ops_idle(stream) || stream->handle != NULL || stream->close_pending ||
            stream->active_handle_ops > 0 || stream->pending_send_count > 0 || stream->active_send_completions > 0 ||
-           stream->active_observer_callbacks > 0 || stream->active_lifecycle_refs > 0 ||
-           stream->send_capacity_waiters > 0) {
+           stream->active_observer_callbacks > 0 || stream->active_start_observer_callbacks > 0 ||
+           stream->active_lifecycle_refs > 0 || stream->send_capacity_waiters > 0) {
         pthread_cond_wait(&stream->cond, &stream->mutex);
     }
     trevrpc_msquic_recv_release_grant_locked(stream);
@@ -4124,30 +4847,57 @@ static void trevrpc_msquic_stream_destroy_owned(trevrpc_msquic_stream* stream, b
     free(stream);
 }
 
+static void trevrpc_msquic_stream_begin_deferred_close_owned(trevrpc_msquic_stream* stream) {
+    bool request_shutdown = false;
+
+    pthread_mutex_lock(&stream->mutex);
+    request_shutdown = !stream->close_shutdown_started;
+    stream->close_shutdown_started = true;
+    stream->api_closing = true;
+    stream->destroy_requested = true;
+    stream->deferred_finalizer_owned = true;
+    stream->observer = NULL;
+    stream->observer_context = NULL;
+    stream->start_observer = NULL;
+    stream->start_observer_context = NULL;
+    pthread_cond_broadcast(&stream->cond);
+    pthread_mutex_unlock(&stream->mutex);
+
+    if (request_shutdown)
+        trevrpc_msquic_stream_request_deferred_close(stream);
+    trevrpc_msquic_stream_try_destroy_deferred(stream);
+}
+
 static void trevrpc_msquic_stream_try_destroy_deferred(trevrpc_msquic_stream* stream) {
     bool destroy = false;
+    bool deferred_finalizer_owned = false;
     pthread_mutex_lock(&stream->mutex);
     if (stream->destroy_requested && !stream->destroy_started && stream->active_observer_callbacks == 0 &&
-        stream->active_lifecycle_refs == 0 && stream->active_send_ops == 0 && stream->active_handle_ops == 0 &&
-        stream->active_send_completions == 0 && stream->active_close_calls == 0 &&
+        stream->active_start_observer_callbacks == 0 && stream->active_lifecycle_refs == 0 &&
+        stream->active_send_ops == 0 && stream->active_handle_ops == 0 && stream->active_send_completions == 0 &&
+        stream->active_close_calls == 0 &&
         atomic_load_explicit(&stream->active_resume_pins, memory_order_acquire) == 0 &&
         stream->pending_send_count == 0 && stream->send_capacity_waiters == 0 && stream->shutdown_complete &&
         stream->handle == NULL && !stream->close_pending) {
         stream->destroy_started = true;
         destroy = true;
+        deferred_finalizer_owned = stream->deferred_finalizer_owned;
     }
     pthread_mutex_unlock(&stream->mutex);
-    if (destroy) {
-        trevrpc_msquic_stream_destroy_owned(stream, false);
+    if (destroy && deferred_finalizer_owned) {
+        trevrpc_msquic_finalizer_schedule_transferred(
+            &stream->destroy_finalizer, stream, TREV_MSQUIC_FINALIZE_STREAM_DESTROY);
+    } else if (destroy) {
+        trevrpc_msquic_stream_destroy_owned(stream, false, false);
     }
 }
 
-void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
+static void trevrpc_msquic_stream_close_mode(trevrpc_msquic_stream* stream, bool force_handle_close) {
     if (stream == NULL) {
         return;
     }
 
-    bool observer_reentry = TrevMsQuicObserverStream == stream;
+    bool observer_reentry = TrevMsQuicObserverStream == stream || TrevMsQuicStartObserverStream == stream;
     bool request_shutdown = false;
     bool destroy = false;
     pthread_mutex_lock(&stream->mutex);
@@ -4164,6 +4914,8 @@ void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
     stream->destroy_requested = true;
     stream->observer = NULL;
     stream->observer_context = NULL;
+    stream->start_observer = NULL;
+    stream->start_observer_context = NULL;
     if (!observer_reentry && !stream->destroy_started) {
         stream->destroy_started = true;
         destroy = true;
@@ -4178,7 +4930,7 @@ void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
         trevrpc_msquic_stream_request_deferred_close(stream);
     }
     if (destroy) {
-        trevrpc_msquic_stream_destroy_owned(stream, true);
+        trevrpc_msquic_stream_destroy_owned(stream, true, force_handle_close);
         return;
     }
     if (observer_reentry) {
@@ -4195,6 +4947,22 @@ void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
     }
     pthread_cond_broadcast(&stream->cond);
     pthread_mutex_unlock(&stream->mutex);
+}
+
+void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
+    trevrpc_msquic_stream_close_mode(stream, false);
+}
+
+void trevrpc_msquic_stream_close_immediate(trevrpc_msquic_stream* stream) {
+    trevrpc_msquic_stream_close_mode(stream, true);
+}
+
+void trevrpc_msquic_stream_close_deferred_owned(trevrpc_msquic_stream* stream, bool immediate) {
+    if (stream == NULL)
+        return;
+    trevrpc_msquic_finalizer_schedule(&stream->close_finalizer,
+        stream,
+        immediate ? TREV_MSQUIC_FINALIZE_STREAM_CLOSE_IMMEDIATE : TREV_MSQUIC_FINALIZE_STREAM_CLOSE);
 }
 
 void trevrpc_msquic_free(void* ptr) {
@@ -4306,6 +5074,7 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     pthread_cond_signal(&listener->cond);
     pthread_mutex_unlock(&listener->mutex);
 
+    trevrpc_msquic_listener_notify(listener);
     trevrpc_msquic_listener_callback_finish(listener);
     return QUIC_STATUS_SUCCESS;
 }
@@ -4369,6 +5138,10 @@ static QUIC_STATUS trevrpc_msquic_conn_callback_impl(
         conn->stream_tail = node;
         pthread_cond_signal(&conn->cond);
         pthread_mutex_unlock(&conn->mutex);
+        trevrpc_msquic_conn_event stream_event = {
+            .kind = TREV_MSQUIC_CONN_EVENT_PEER_STREAM_AVAILABLE,
+        };
+        trevrpc_msquic_conn_notify(conn, &stream_event);
         return QUIC_STATUS_SUCCESS;
     }
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
@@ -4592,15 +5365,18 @@ static QUIC_STATUS trevrpc_msquic_stream_callback_impl(
     switch (event->Type) {
     case QUIC_STREAM_EVENT_START_COMPLETE:
         pthread_mutex_lock(&stream->mutex);
+        stream->start_complete = true;
+        stream->start_status = (int)event->START_COMPLETE.Status;
         if (QUIC_SUCCEEDED(event->START_COMPLETE.Status)) {
             stream->stream_id = event->START_COMPLETE.ID;
             stream->stream_id_valid = true;
-            pthread_cond_broadcast(&stream->cond);
-            pthread_mutex_unlock(&stream->mutex);
         } else {
             stream->err = (int)event->START_COMPLETE.Status;
-            pthread_cond_broadcast(&stream->cond);
-            pthread_mutex_unlock(&stream->mutex);
+        }
+        pthread_cond_broadcast(&stream->cond);
+        pthread_mutex_unlock(&stream->mutex);
+        trevrpc_msquic_stream_start_notify(stream);
+        if (QUIC_FAILED(event->START_COMPLETE.Status)) {
             trevrpc_msquic_stream_shutdown_complete(stream, stream_handle);
         }
         return QUIC_STATUS_SUCCESS;
@@ -4734,6 +5510,17 @@ static QUIC_STATUS trevrpc_msquic_stream_callback_impl(
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
         pthread_mutex_lock(&stream->mutex);
         stream->err = TREV_MSQUIC_ERR_CLOSED;
+        stream->peer_send_error = event->PEER_SEND_ABORTED.ErrorCode;
+        stream->peer_send_error_set = true;
+        pthread_cond_broadcast(&stream->cond);
+        pthread_mutex_unlock(&stream->mutex);
+        trevrpc_msquic_stream_notify(stream, TREV_MSQUIC_STREAM_OBSERVER_TERMINAL);
+        return QUIC_STATUS_SUCCESS;
+    case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+        pthread_mutex_lock(&stream->mutex);
+        stream->send_aborted = true;
+        stream->peer_receive_error = event->PEER_RECEIVE_ABORTED.ErrorCode;
+        stream->peer_receive_error_set = true;
         pthread_cond_broadcast(&stream->cond);
         pthread_mutex_unlock(&stream->mutex);
         trevrpc_msquic_stream_notify(stream, TREV_MSQUIC_STREAM_OBSERVER_TERMINAL);
@@ -4769,6 +5556,9 @@ int trevrpc_msquic_test_receive_fixture_create(const trevrpc_msquic_receive_poli
         return -EINVAL;
     }
     *out_fixture = NULL;
+    int finalizer_result = trevrpc_msquic_finalizer_ensure_started();
+    if (finalizer_result != 0)
+        return finalizer_result;
     max_frame_size = trevrpc_msquic_effective_max_frame_size(max_frame_size);
     trevrpc_msquic_receive_policy effective;
     int err = trevrpc_msquic_receive_policy_effective(policy, max_frame_size, &effective);
@@ -4906,6 +5696,39 @@ void trevrpc_msquic_test_receive_fixture_drop_connection(trevrpc_msquic_test_rec
         fixture->connection_ref = false;
         trevrpc_msquic_receive_budget_release(fixture->budget);
     }
+}
+
+void trevrpc_msquic_test_receive_fixture_set_handle_present(trevrpc_msquic_stream* stream, bool present) {
+    if (stream == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    stream->handle = present ? (HQUIC)stream : NULL;
+    pthread_mutex_unlock(&stream->mutex);
+}
+
+void trevrpc_msquic_test_receive_fixture_prepare_graceful_close(trevrpc_msquic_stream* stream) {
+    if (stream == NULL)
+        return;
+    pthread_mutex_lock(&stream->mutex);
+    stream->handle = (HQUIC)stream;
+    stream->receive_capable = true;
+    stream->send_closed = true;
+    stream->recv_fin = true;
+    pthread_mutex_unlock(&stream->mutex);
+}
+
+void trevrpc_msquic_test_receive_fixture_complete_shutdown(trevrpc_msquic_stream* stream) {
+    if (stream == NULL)
+        return;
+    pthread_mutex_lock(&stream->mutex);
+    stream->handle = NULL;
+    stream->shutdown_complete = true;
+    stream->close_pending = false;
+    stream->closed = true;
+    pthread_cond_broadcast(&stream->cond);
+    pthread_mutex_unlock(&stream->mutex);
+    trevrpc_msquic_stream_try_destroy_deferred(stream);
 }
 
 void trevrpc_msquic_test_receive_simulate_handle_loss(trevrpc_msquic_stream* stream) {

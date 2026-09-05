@@ -83,6 +83,18 @@ typedef struct {
 } generated_file_list;
 
 typedef struct {
+    char* name;
+    char* declaration;
+    bool macro;
+} generated_identifier;
+
+typedef struct {
+    generated_identifier* items;
+    size_t len;
+    size_t cap;
+} generated_identifier_list;
+
+typedef struct {
     char* data;
     size_t len;
     size_t cap;
@@ -330,7 +342,24 @@ static bool write_all(FILE* output, const uint8_t* data, size_t len) {
     return !ferror(output);
 }
 
-static bool type_index_append(type_index* index, char* proto_name, char* c_type, char* c_prefix) {
+static bool type_index_append(type_index* index, char* proto_name, char* c_type, char* c_prefix, char** error) {
+    for (size_t i = 0; i < index->len; i++) {
+        const type_ref* existing = &index->items[i];
+        if (strcmp(existing->proto_name, proto_name) != 0 && strcmp(existing->c_type, c_type) == 0) {
+            return set_error(error,
+                "protobuf messages \"%s\" and \"%s\" normalize to duplicate C type \"%s\"",
+                existing->proto_name,
+                proto_name,
+                c_type);
+        }
+        if (strcmp(existing->proto_name, proto_name) != 0 && strcmp(existing->c_prefix, c_prefix) == 0) {
+            return set_error(error,
+                "protobuf messages \"%s\" and \"%s\" normalize to duplicate C symbol prefix \"%s\"",
+                existing->proto_name,
+                proto_name,
+                c_prefix);
+        }
+    }
     if (index->len == index->cap) {
         size_t next = index->cap == 0 ? 16 : index->cap * 2;
         type_ref* items = realloc(index->items, next * sizeof(*items));
@@ -486,6 +515,55 @@ static void generated_file_list_free(generated_file_list* list) {
     list->items = NULL;
     list->len = 0;
     list->cap = 0;
+}
+
+static void generated_identifier_list_free(generated_identifier_list* list) {
+    for (size_t i = 0; i < list->len; i++) {
+        free(list->items[i].name);
+        free(list->items[i].declaration);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+static bool generated_identifier_list_add(
+    generated_identifier_list* list, const char* name, const char* declaration, bool macro, char** error) {
+    for (size_t i = 0; i < list->len; i++) {
+        const generated_identifier* existing = &list->items[i];
+        if (existing->macro == macro && strcmp(existing->name, name) == 0) {
+            return set_error(error,
+                "generated declarations %s and %s normalize to duplicate C %s \"%s\"",
+                existing->declaration,
+                declaration,
+                macro ? "macro" : "symbol",
+                name);
+        }
+    }
+
+    if (list->len == list->cap) {
+        size_t next = list->cap == 0 ? 16 : list->cap * 2;
+        generated_identifier* items = realloc(list->items, next * sizeof(*items));
+        if (items == NULL) {
+            return set_oom(error);
+        }
+        list->items = items;
+        list->cap = next;
+    }
+    char* owned_name = duplicate_string(name);
+    char* owned_declaration = duplicate_string(declaration);
+    if (owned_name == NULL || owned_declaration == NULL) {
+        free(owned_name);
+        free(owned_declaration);
+        return set_oom(error);
+    }
+    list->items[list->len++] = (generated_identifier){
+        .name = owned_name,
+        .declaration = owned_declaration,
+        .macro = macro,
+    };
+    return true;
 }
 
 static char* path_extension(const char* name) {
@@ -782,7 +860,7 @@ static bool index_message(type_index* index,
         free(c_prefix);
         return set_oom(error);
     }
-    if (!type_index_append(index, proto_name, c_type, c_prefix)) {
+    if (!type_index_append(index, proto_name, c_type, c_prefix, error)) {
         free(names);
         free(proto_name);
         free(c_type);
@@ -971,39 +1049,6 @@ static bool describe_services(
     return true;
 }
 
-static char* type_helper_name(const type_ref* ref) {
-    string_builder builder;
-    string_builder_init(&builder);
-    for (size_t i = 0; ref->c_prefix[i] != '\0'; i++) {
-        if (ref->c_prefix[i] == '_' && ref->c_prefix[i + 1] == '_') {
-            string_builder_append_char(&builder, '_');
-            i++;
-        } else {
-            string_builder_append_char(&builder, ref->c_prefix[i]);
-        }
-    }
-    return string_builder_steal(&builder);
-}
-
-static bool service_message_types(const service_info* service, type_ref_list* out) {
-    for (size_t i = 0; i < service->inputs.len; i++) {
-        if (!type_ref_list_contains(out, service->inputs.items[i]->proto_name) &&
-            !type_ref_list_append(out, service->inputs.items[i])) {
-            return false;
-        }
-    }
-    for (size_t i = 0; i < service->outputs.len; i++) {
-        if (!type_ref_list_contains(out, service->outputs.items[i]->proto_name) &&
-            !type_ref_list_append(out, service->outputs.items[i])) {
-            return false;
-        }
-    }
-    if (out->len > 1) {
-        qsort(out->items, out->len, sizeof(*out->items), compare_type_ref_by_c_type);
-    }
-    return true;
-}
-
 static char* c_quote(const char* value) {
     string_builder builder;
     string_builder_init(&builder);
@@ -1046,14 +1091,6 @@ static char* method_base_name(const service_info* service, const method_info* me
     return format_string("%s_%s", service->c_name, method->c_name);
 }
 
-static char* type_short_helper_name(const type_ref* ref) {
-    const char* short_name = ref->c_type;
-    for (const char* cursor = ref->c_type; (cursor = strstr(cursor, "__")) != NULL; cursor += 2) {
-        short_name = cursor + 2;
-    }
-    return to_snake(short_name);
-}
-
 static char* generated_test_prefix(const file_descriptor_proto* file) {
     char* package_name = to_snake(str_or_empty(file->package));
     char* file_name = to_snake(str_or_empty(file->name));
@@ -1070,77 +1107,127 @@ static char* generated_test_prefix(const file_descriptor_proto* file) {
     return prefix;
 }
 
-static void generate_header_event(
-    string_builder* buffer, const service_info* service, const type_ref* message, bool request_side) {
-    char* helper = type_helper_name(message);
-    char* short_helper = type_short_helper_name(message);
-    char* base = short_helper == NULL
-                     ? NULL
-                     : format_string("%s_%s%s", service->c_name, short_helper, request_side ? "_request" : "");
-    char* macro = base == NULL ? NULL : macro_name(base);
-    if (helper == NULL || short_helper == NULL || base == NULL || macro == NULL) {
-        free(helper);
-        free(short_helper);
-        free(base);
-        free(macro);
-        buffer->failed = true;
-        return;
-    }
-    string_builder_appendf(buffer, "#define %s_EVENT_NONE 0u\n", macro);
-    string_builder_appendf(buffer, "#define %s_EVENT_MESSAGE 1u\n", macro);
-    if (request_side) {
-        string_builder_appendf(buffer, "#define %s_EVENT_END 2u\n", macro);
-        string_builder_appendf(buffer, "#define %s_EVENT_TERMINAL_STATUS 3u\n", macro);
-        string_builder_appendf(buffer, "#define %s_EVENT_RUNTIME_ERROR 4u\n", macro);
-        string_builder_appendf(buffer, "#define %s_EVENT_DECODE_ERROR 5u\n\n", macro);
-    } else {
-        string_builder_appendf(buffer, "#define %s_EVENT_TERMINAL_STATUS 2u\n", macro);
-        string_builder_appendf(buffer, "#define %s_EVENT_MISSING_TERMINAL_STATUS 3u\n", macro);
-        string_builder_appendf(buffer, "#define %s_EVENT_RUNTIME_ERROR 4u\n", macro);
-        string_builder_appendf(buffer, "#define %s_EVENT_DECODE_ERROR 5u\n\n", macro);
-    }
-    string_builder_appendf(buffer,
-        "typedef struct %s_event {\n"
-        "    uint32_t kind;\n"
-        "    int error;\n"
-        "    %s* message;\n"
-        "    trevrpc_inbound_stream_frame* frame;\n"
-        "} %s_event;\n\n",
-        base,
-        message->c_type,
-        base);
-    string_builder_appendf(buffer,
-        "typedef struct %s_receiver {\n"
-        "    trevrpc_stream* stream;\n"
-        "    uint32_t state;\n"
-        "} %s_receiver;\n\n",
-        base,
-        base);
-    string_builder_appendf(buffer, "#define %s_EVENT_INIT {0}\n", macro);
-    string_builder_appendf(buffer, "#define %s_RECEIVER_INIT {0}\n\n", macro);
-    string_builder_appendf(
-        buffer, "int %s_receiver_init(%s_receiver* receiver, trevrpc_stream* stream);\n", base, base);
-    if (request_side) {
-        string_builder_appendf(buffer,
-            "int %s_recv_%s_request(%s_receiver* receiver, %s_event* event);\n",
-            service->c_name,
-            helper,
-            base,
-            base);
-    } else {
-        string_builder_appendf(
-            buffer, "int %s_recv_%s(%s_receiver* receiver, %s_event* event);\n", service->c_name, helper, base, base);
-    }
-    string_builder_appendf(buffer, "void %s_event_reset(%s_event* event);\n", base, base);
-    string_builder_appendf(buffer, "void %s_receiver_reset(%s_receiver* receiver);\n\n", base, base);
-    free(helper);
-    free(short_helper);
-    free(base);
-    free(macro);
+static char* method_declaration(const service_info* service, const method_info* method) {
+    return format_string("protobuf method \".%s.%s\"", str_or_empty(service->proto_name), str_or_empty(method->name));
 }
 
-static void generate_header_method_types(
-    string_builder* buffer, const service_info* service, const method_info* method) {
+static bool register_method_symbol(generated_identifier_list* identifiers,
+    const char* base,
+    const char* suffix,
+    const char* declaration,
+    char** error) {
+    char* name = format_string("%s%s", base, suffix);
+    if (name == NULL) {
+        return set_oom(error);
+    }
+    bool ok = generated_identifier_list_add(identifiers, name, declaration, false, error);
+    free(name);
+    return ok;
+}
+
+static bool validate_generated_identifiers(const file_descriptor_proto* file,
+    const service_list* services,
+    const plugin_options* options,
+    generated_identifier_list* identifiers,
+    char** error) {
+    char* header_name = output_file_name(str_or_empty(file->name), options->header_suffix);
+    char* guard = header_name == NULL ? NULL : header_guard(header_name);
+    char* file_declaration = format_string("protobuf file \"%s\"", str_or_empty(file->name));
+    char* test_prefix = generated_test_prefix(file);
+    if (header_name == NULL || guard == NULL || file_declaration == NULL || test_prefix == NULL) {
+        free(header_name);
+        free(guard);
+        free(file_declaration);
+        free(test_prefix);
+        return set_oom(error);
+    }
+
+    bool ok = generated_identifier_list_add(identifiers, guard, file_declaration, true, error);
+    if (ok) {
+        char* test_symbol = format_string("%s_test_fail_allocation_after", test_prefix);
+        if (test_symbol == NULL) {
+            ok = set_oom(error);
+        } else {
+            ok = generated_identifier_list_add(identifiers, test_symbol, file_declaration, false, error);
+            free(test_symbol);
+        }
+    }
+    free(header_name);
+    free(guard);
+    free(file_declaration);
+    free(test_prefix);
+    if (!ok) {
+        return false;
+    }
+
+    for (size_t i = 0; i < services->len; i++) {
+        const service_info* service = &services->items[i];
+        for (size_t j = 0; j < service->methods.len; j++) {
+            const method_info* method = &service->methods.items[j];
+            char* base = method_base_name(service, method);
+            char* macro = base == NULL ? NULL : macro_name(base);
+            char* declaration = base == NULL ? NULL : method_declaration(service, method);
+            if (base == NULL || macro == NULL || declaration == NULL) {
+                free(base);
+                free(macro);
+                free(declaration);
+                return set_oom(error);
+            }
+
+            ok = generated_identifier_list_add(identifiers, macro, declaration, true, error);
+            if (ok) {
+                static const char* const common_suffixes[] = {
+                    "_call_config_init",
+                    "_open",
+                    "_decode_request_receive",
+                    "_decode_response_receive",
+                    "_matches_incoming",
+                    "_take_incoming",
+                    "_accept",
+                };
+                for (size_t k = 0; ok && k < sizeof(common_suffixes) / sizeof(common_suffixes[0]); k++) {
+                    ok = register_method_symbol(identifiers, base, common_suffixes[k], declaration, error);
+                }
+                if (ok && method->client_streaming) {
+                    ok = register_method_symbol(
+                        identifiers, base, method->server_streaming ? "_send_request" : "_send", declaration, error);
+                    if (ok) {
+                        ok = register_method_symbol(identifiers, base, "_finish_send", declaration, error);
+                    }
+                }
+                if (ok && method->server_streaming) {
+                    ok = register_method_symbol(
+                        identifiers, base, method->client_streaming ? "_send_response" : "_send", declaration, error);
+                    if (ok) {
+                        ok = register_method_symbol(identifiers, base, "_finish", declaration, error);
+                    }
+                }
+                if (ok && !method->server_streaming) {
+                    ok = register_method_symbol(identifiers, base, "_respond", declaration, error);
+                }
+            }
+            free(base);
+            free(macro);
+            free(declaration);
+            if (!ok) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static char* method_rpc_kind(const method_info* method) {
+    if (method->client_streaming && method->server_streaming)
+        return duplicate_string("TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING");
+    if (method->client_streaming)
+        return duplicate_string("TREVRPC_RPC_KIND_CLIENT_STREAMING");
+    if (method->server_streaming)
+        return duplicate_string("TREVRPC_RPC_KIND_SERVER_STREAMING");
+    return duplicate_string("TREVRPC_RPC_KIND_UNARY");
+}
+
+static void generate_header_method(string_builder* buffer, const service_info* service, const method_info* method) {
     char* base = method_base_name(service, method);
     char* macro = base == NULL ? NULL : macro_name(base);
     if (base == NULL || macro == NULL) {
@@ -1149,158 +1236,394 @@ static void generate_header_method_types(
         buffer->failed = true;
         return;
     }
-    if (!method->client_streaming && !method->server_streaming) {
-        string_builder_appendf(buffer, "#define %s_RESULT_NONE 0u\n", macro);
-        string_builder_appendf(buffer, "#define %s_RESULT_SUCCESS 1u\n", macro);
-        string_builder_appendf(buffer, "#define %s_RESULT_RPC_STATUS 2u\n", macro);
-        string_builder_appendf(buffer, "#define %s_RESULT_RUNTIME_ERROR 3u\n", macro);
-        string_builder_appendf(buffer, "#define %s_RESULT_DECODE_ERROR 4u\n\n", macro);
+    char* kind = method_rpc_kind(method);
+    if (kind == NULL) {
+        free(base);
+        free(macro);
+        buffer->failed = true;
+        return;
+    }
+    string_builder_appendf(buffer, "#define %s_RPC_KIND %s\n\n", macro, kind);
+    string_builder_appendf(buffer,
+        "int %s_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size);\n"
+        "int %s_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const %s* initial_or_null, "
+        "uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream);\n",
+        base,
+        base,
+        method->input->c_type);
+    if (method->client_streaming) {
+        if (method->server_streaming) {
+            string_builder_appendf(buffer,
+                "int %s_send_request(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const %s* message, "
+                "uint64_t operation_id);\n",
+                base,
+                method->input->c_type);
+        } else {
+            string_builder_appendf(buffer,
+                "int %s_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const %s* message, uint64_t "
+                "operation_id);\n",
+                base,
+                method->input->c_type);
+        }
         string_builder_appendf(buffer,
-            "typedef struct %s_result {\n"
-            "    uint32_t kind;\n"
-            "    int error;\n"
-            "    %s* response;\n"
-            "    trevrpc_inbound_response* envelope;\n"
-            "} %s_result;\n\n",
-            base,
-            method->output->c_type,
+            "int %s_finish_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, uint64_t operation_id);\n",
             base);
-        string_builder_appendf(buffer, "#define %s_RESULT_INIT {0}\n\n", macro);
-        string_builder_appendf(buffer, "void %s_result_reset(%s_result* result);\n\n", base, base);
+    }
+    if (method->server_streaming) {
+        if (method->client_streaming) {
+            string_builder_appendf(buffer,
+                "int %s_send_response(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const %s* message, "
+                "uint64_t operation_id);\n",
+                base,
+                method->output->c_type);
+        } else {
+            string_builder_appendf(buffer,
+                "int %s_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const %s* message, uint64_t "
+                "operation_id);\n",
+                base,
+                method->output->c_type);
+        }
+        string_builder_appendf(buffer,
+            "int %s_finish(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id, "
+            "const trevrpc_rpc_status_v1* status);\n",
+            base);
     }
     if (!method->server_streaming) {
         string_builder_appendf(buffer,
-            "typedef struct %s_response_view {\n"
-            "    const %s* message;\n"
-            "    uint32_t status;\n"
-            "    const char* status_message;\n"
-            "    size_t status_message_len;\n"
-            "    const trevrpc_metadata* metadata;\n"
-            "} %s_response_view;\n\n",
+            "int %s_respond(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, const %s* message, "
+            "const trevrpc_rpc_status_v1* status, uint64_t operation_id);\n",
             base,
-            method->output->c_type,
-            base);
-        string_builder_appendf(buffer,
-            "typedef int (*%s_respond_fn)(void* respond_context, const %s_response_view* response);\n\n",
-            base,
-            base);
+            method->output->c_type);
     }
+    string_builder_appendf(buffer,
+        "int %s_decode_request_receive(const trevrpc_rpc_receive* receive, %s** out_message);\n"
+        "int %s_decode_response_receive(const trevrpc_rpc_receive* receive, %s** out_message);\n"
+        "int %s_matches_incoming(const trevrpc_rpc_event_info_v1* info);\n"
+        "/* On success, atomically transfers call, stream, and initial receive; "
+        "outputs are unchanged on failure. Client-streaming and bidi initial "
+        "receives may be empty and should be released without decoding. */\n"
+        "int %s_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* "
+        "out_stream, trevrpc_rpc_receive** out_initial);\n"
+        "int %s_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id);\n\n",
+        base,
+        method->input->c_type,
+        base,
+        method->output->c_type,
+        base,
+        base,
+        base);
     free(base);
     free(macro);
+    free(kind);
 }
 
 static void generate_header_service(string_builder* buffer, const service_info* service) {
     for (size_t i = 0; i < service->methods.len; i++) {
-        generate_header_method_types(buffer, service, &service->methods.items[i]);
+        generate_header_method(buffer, service, &service->methods.items[i]);
     }
-    for (size_t i = 0; i < service->inputs.len; i++) {
-        generate_header_event(buffer, service, service->inputs.items[i], true);
-    }
-    for (size_t i = 0; i < service->outputs.len; i++) {
-        generate_header_event(buffer, service, service->outputs.items[i], false);
-    }
+}
 
-    string_builder_appendf(buffer, "typedef struct %s {\n", service->type_name);
-    string_builder_append(buffer, "    void* user_data;\n");
-    for (size_t i = 0; i < service->methods.len; i++) {
-        const method_info* method = &service->methods.items[i];
-        char* base = method_base_name(service, method);
-        if (base == NULL) {
-            buffer->failed = true;
-            return;
-        }
-        if (!method->client_streaming && !method->server_streaming) {
-            string_builder_appendf(buffer,
-                "    int (*%s)(void* user_data, const trevrpc_call_context* context, const %s* request, "
-                "%s_respond_fn respond, void* respond_context);\n",
-                method->c_name,
-                method->input->c_type,
-                base);
-        } else if (method->client_streaming && !method->server_streaming) {
-            string_builder_appendf(buffer,
-                "    int (*%s)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream, "
-                "%s_respond_fn respond, void* respond_context);\n",
-                method->c_name,
-                base);
-        } else if (!method->client_streaming && method->server_streaming) {
-            string_builder_appendf(buffer,
-                "    int (*%s)(void* user_data, const trevrpc_call_context* context, const %s* request, "
-                "trevrpc_stream* stream);\n",
-                method->c_name,
-                method->input->c_type);
-        } else {
-            string_builder_appendf(buffer,
-                "    int (*%s)(void* user_data, const trevrpc_call_context* context, trevrpc_stream* stream);\n",
-                method->c_name);
-        }
+static void generate_pack_body(string_builder* buffer, const type_ref* message, const char* expression) {
+    string_builder_appendf(buffer,
+        "    size_t body_len = %s__get_packed_size(%s);\n"
+        "    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN];\n"
+        "    uint8_t* body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : "
+        "malloc(body_len));\n"
+        "    if (body_len > 0 && body == NULL) { return -ENOMEM; }\n"
+        "    %s__pack(%s, body);\n",
+        message->c_prefix,
+        expression,
+        message->c_prefix,
+        expression);
+}
+
+static void generate_send_function(string_builder* buffer,
+    const service_info* service,
+    const method_info* method,
+    const type_ref* message,
+    const char* suffix) {
+    char* base = method_base_name(service, method);
+    char* name = base == NULL || suffix == NULL ? NULL : format_string("%s_send%s", base, suffix);
+    if (base == NULL || name == NULL) {
         free(base);
-    }
-    string_builder_appendf(buffer, "} %s;\n\n", service->type_name);
-
-    type_ref_list message_types = {0};
-    if (!service_message_types(service, &message_types)) {
+        free(name);
         buffer->failed = true;
         return;
     }
-    for (size_t i = 0; i < message_types.len; i++) {
-        char* helper = type_helper_name(message_types.items[i]);
-        if (helper == NULL) {
-            buffer->failed = true;
-            type_ref_list_free(&message_types);
-            return;
-        }
-        string_builder_appendf(buffer,
-            "int %s_send_%s(trevrpc_stream* stream, const %s* message);\n",
-            service->c_name,
-            helper,
-            message_types.items[i]->c_type);
-        free(helper);
-    }
-    type_ref_list_free(&message_types);
-    string_builder_append_char(buffer, '\n');
+    string_builder_appendf(buffer,
+        "int %s(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, const %s* message, uint64_t operation_id) "
+        "{\n"
+        "    if (runtime == NULL || message == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return "
+        "-EINVAL; }\n",
+        name,
+        message->c_type);
+    generate_pack_body(buffer, message, "message");
+    string_builder_append(buffer,
+        "    int err = trevrpc_rpc_stream_send_copy_v1(runtime, stream, operation_id, body, body_len, "
+        "TREVRPC_RPC_SEND_FLAG_NONE);\n"
+        "    if (body != stack_body) { free(body); }\n"
+        "    return err;\n}\n\n");
+    free(base);
+    free(name);
+}
 
-    for (size_t i = 0; i < service->methods.len; i++) {
-        const method_info* method = &service->methods.items[i];
-        char* base = method_base_name(service, method);
-        if (base == NULL) {
-            buffer->failed = true;
-            return;
-        }
-        if (!method->client_streaming && !method->server_streaming) {
-            string_builder_appendf(buffer,
-                "int %s(trevrpc_channel* channel, const %s* request, %s_result* result);\n",
-                base,
-                method->input->c_type,
-                base);
-            string_builder_appendf(buffer,
-                "int %s_with_options(trevrpc_channel* channel, const %s* request, "
-                "const trevrpc_call_options_v1* options, %s_result* result);\n",
-                base,
-                method->input->c_type,
-                base);
-        } else if (method->client_streaming) {
-            string_builder_appendf(buffer, "int %s_start(trevrpc_channel* channel, trevrpc_stream** stream);\n", base);
-            string_builder_appendf(buffer,
-                "int %s_start_with_options(trevrpc_channel* channel, const trevrpc_call_options_v1* options, "
-                "trevrpc_stream** stream);\n",
-                base);
-        } else {
-            string_builder_appendf(buffer,
-                "int %s(trevrpc_channel* channel, const %s* request, trevrpc_stream** stream);\n",
-                base,
-                method->input->c_type);
-            string_builder_appendf(buffer,
-                "int %s_with_options(trevrpc_channel* channel, const %s* request, "
-                "const trevrpc_call_options_v1* options, trevrpc_stream** stream);\n",
-                base,
-                method->input->c_type);
-        }
-        free(base);
+static void generate_finish_send_function(
+    string_builder* buffer, const service_info* service, const method_info* method) {
+    char* base = method_base_name(service, method);
+    if (base == NULL) {
+        buffer->failed = true;
+        return;
     }
     string_builder_appendf(buffer,
-        "int %s_register(trevrpc_server* server, const %s* implementation);\n\n",
-        service->c_name,
-        service->type_name);
+        "int %s_finish_send(trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream, uint64_t operation_id) {\n"
+        "    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }\n"
+        "    return trevrpc_rpc_stream_finish_send(runtime, stream, operation_id);\n}\n\n",
+        base);
+    free(base);
+}
+
+static void generate_finish_function(string_builder* buffer, const service_info* service, const method_info* method) {
+    char* base = method_base_name(service, method);
+    if (base == NULL) {
+        buffer->failed = true;
+        return;
+    }
+    string_builder_appendf(buffer,
+        "int %s_finish(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id, "
+        "const trevrpc_rpc_status_v1* status) {\n"
+        "    if (runtime == NULL || status == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; "
+        "}\n"
+        "    return trevrpc_rpc_call_finish_v1(runtime, call, operation_id, status);\n}\n\n",
+        base);
+    free(base);
+}
+
+static void generate_config_and_open(string_builder* buffer, const service_info* service, const method_info* method) {
+    char* base = method_base_name(service, method);
+    char* service_name = c_quote(service->proto_name);
+    char* method_name = c_quote(method->name);
+    char* kind = method_rpc_kind(method);
+    if (base == NULL || service_name == NULL || method_name == NULL || kind == NULL) {
+        free(base);
+        free(service_name);
+        free(method_name);
+        free(kind);
+        buffer->failed = true;
+        return;
+    }
+    string_builder_appendf(buffer,
+        "int %s_call_config_init(trevrpc_rpc_call_config_v1* config, size_t struct_size) {\n"
+        "    int err = trevrpc_rpc_call_config_v1_init(config, struct_size);\n"
+        "    if (err != 0) { return err; }\n"
+        "    config->kind = %s; config->service = %s; config->service_len = sizeof(%s) - 1;\n"
+        "    config->method = %s; config->method_len = sizeof(%s) - 1; return 0;\n}\n\n",
+        base,
+        kind,
+        service_name,
+        service_name,
+        method_name,
+        method_name);
+    string_builder_appendf(buffer,
+        "int %s_open(trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, const %s* initial_or_null, "
+        "uint64_t operation_id, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* out_stream) {\n"
+        "    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE || out_call == NULL || out_stream == "
+        "NULL) { return -EINVAL; }\n"
+        "    trevrpc_rpc_call_config_v1 config; int err = %s_call_config_init(&config, sizeof(config));\n"
+        "    if (err != 0) { return err; }\n",
+        base,
+        method->input->c_type,
+        base);
+    string_builder_append(buffer,
+        "    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN]; uint8_t* body = NULL; size_t body_len = 0;\n"
+        "    if (initial_or_null != NULL) {\n");
+    string_builder_appendf(buffer,
+        "        body_len = %s__get_packed_size(initial_or_null);\n"
+        "        body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : "
+        "malloc(body_len));\n"
+        "        if (body_len > 0 && body == NULL) { return -ENOMEM; }\n"
+        "        %s__pack(initial_or_null, body); config.initial_message = body; config.initial_message_len = "
+        "body_len;\n"
+        "    }\n",
+        method->input->c_prefix,
+        method->input->c_prefix);
+    string_builder_append(buffer,
+        "    err = trevrpc_rpc_call_open_v1(runtime, endpoint, &config, operation_id, out_call, out_stream);\n"
+        "    if (initial_or_null != NULL) { if (body != stack_body) { free(body); } }\n");
+    string_builder_append(buffer, "    return err;\n}\n\n");
+    free(base);
+    free(service_name);
+    free(method_name);
+    free(kind);
+}
+
+static void generate_respond_function(string_builder* buffer, const service_info* service, const method_info* method) {
+    if (method->server_streaming) {
+        return;
+    }
+    char* base = method_base_name(service, method);
+    if (base == NULL) {
+        buffer->failed = true;
+        return;
+    }
+    string_builder_appendf(buffer,
+        "int %s_respond(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, const %s* message, "
+        "const trevrpc_rpc_status_v1* status, uint64_t operation_id) {\n"
+        "    if (runtime == NULL || status == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; "
+        "}\n"
+        "    uint8_t stack_body[TREVRPC_GENERATED_STACK_BODY_LEN]; uint8_t* body = NULL; size_t body_len = 0;\n"
+        "    if (message != NULL) {\n",
+        base,
+        method->output->c_type);
+    string_builder_appendf(buffer,
+        "        body_len = %s__get_packed_size(message);\n"
+        "        body = body_len == 0 ? stack_body : (body_len <= sizeof(stack_body) ? stack_body : "
+        "malloc(body_len));\n"
+        "        if (body_len > 0 && body == NULL) { return -ENOMEM; }\n"
+        "        %s__pack(message, body);\n"
+        "    }\n"
+        "    int err = trevrpc_rpc_call_respond_copy_v1(runtime, call, operation_id, status, body, body_len);\n"
+        "    if (body != stack_body) { free(body); }\n"
+        "    return err;\n}\n\n",
+        method->output->c_prefix,
+        method->output->c_prefix);
+    free(base);
+}
+
+static void generate_decode_receive_function(
+    string_builder* buffer, const service_info* service, const method_info* method, bool request_side) {
+    char* base = method_base_name(service, method);
+    char* suffix =
+        request_side ? duplicate_string("_decode_request_receive") : duplicate_string("_decode_response_receive");
+    const type_ref* message = request_side ? method->input : method->output;
+    const char* expected_kind_check = request_side && method->client_streaming
+                                          ? "info.kind != TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE && info.kind != "
+                                            "TREVRPC_RPC_RECEIVE_MESSAGE"
+                                      : request_side ? "info.kind != TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE"
+                                                     : "info.kind != TREVRPC_RPC_RECEIVE_MESSAGE";
+    char* name = base == NULL || suffix == NULL ? NULL : format_string("%s%s", base, suffix);
+    if (base == NULL || suffix == NULL || name == NULL) {
+        free(base);
+        free(suffix);
+        free(name);
+        buffer->failed = true;
+        return;
+    }
+    string_builder_appendf(buffer,
+        "int %s(const trevrpc_rpc_receive* receive, %s** out_message) {\n"
+        "    if (receive == NULL || out_message == NULL) { return -EINVAL; }\n"
+        "    trevrpc_rpc_receive_info_v1 info; int err = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));\n"
+        "    if (err == 0) { err = trevrpc_rpc_receive_get_info_v1(receive, &info); }\n"
+        "    if (err != 0) { return err; }\n"
+        "    if (%s) { return -EPROTO; }\n"
+        "    if (info.data_len > SIZE_MAX) { return -EOVERFLOW; }\n"
+        "    trevrpc_generated_allocator_state allocator_state = {0};\n"
+        "    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);\n"
+        "    %s* message = %s__unpack(&allocator, (size_t)info.data_len, info.data);\n"
+        "    if (message == NULL) { return allocator_state.failed ? -ENOMEM : -EPROTO; }\n"
+        "    *out_message = message;\n"
+        "    return 0;\n}\n\n",
+        name,
+        message->c_type,
+        expected_kind_check,
+        message->c_type,
+        message->c_prefix);
+    free(base);
+    free(suffix);
+    free(name);
+}
+
+static void generate_matches_function(string_builder* buffer, const service_info* service, const method_info* method) {
+    char* base = method_base_name(service, method);
+    char* service_name = c_quote(service->proto_name);
+    char* method_name = c_quote(method->name);
+    char* kind = method_rpc_kind(method);
+    if (base == NULL || service_name == NULL || method_name == NULL || kind == NULL) {
+        free(base);
+        free(service_name);
+        free(method_name);
+        free(kind);
+        buffer->failed = true;
+        return;
+    }
+    string_builder_appendf(buffer,
+        "int %s_matches_incoming(const trevrpc_rpc_event_info_v1* info) {\n"
+        "    if (info == NULL || info->kind != TREVRPC_RPC_EVENT_CALL_INCOMING || info->rpc_kind != %s) { return 0; }\n"
+        "    return info->service != NULL && info->method != NULL && info->service_len == sizeof(%s) - 1 && "
+        "memcmp(info->service, %s, sizeof(%s) - 1) == 0 && info->method_len == sizeof(%s) - 1 && memcmp(info->method, "
+        "%s, sizeof(%s) - 1) == 0;\n}\n\n",
+        base,
+        kind,
+        service_name,
+        service_name,
+        service_name,
+        method_name,
+        method_name,
+        method_name);
+    free(base);
+    free(service_name);
+    free(method_name);
+    free(kind);
+}
+
+static void generate_take_incoming_function(
+    string_builder* buffer, const service_info* service, const method_info* method) {
+    char* base = method_base_name(service, method);
+    if (base == NULL) {
+        buffer->failed = true;
+        return;
+    }
+    string_builder_appendf(buffer,
+        "int %s_take_incoming(trevrpc_rpc_event* event, trevrpc_rpc_call_v1* out_call, trevrpc_rpc_stream_v1* "
+        "out_stream, trevrpc_rpc_receive** out_initial) {\n"
+        "    if (event == NULL || out_call == NULL || out_stream == NULL || out_initial == NULL) { return -EINVAL; }\n"
+        "    trevrpc_rpc_event_info_v1 info; int err = trevrpc_rpc_event_info_v1_init(&info, sizeof(info));\n"
+        "    if (err == 0) { err = trevrpc_rpc_event_get_info_v1(event, &info); }\n"
+        "    if (err == 0 && !%s_matches_incoming(&info)) { err = -EPROTO; }\n"
+        "    if (err != 0) { return err; }\n"
+        "    trevrpc_rpc_call_v1 call = {0}; trevrpc_rpc_stream_v1 stream = {0}; trevrpc_rpc_receive* initial = NULL;\n"
+        "    err = trevrpc_rpc_event_take_incoming_call(event, &call, &stream, &initial);\n"
+        "    if (err != 0) { return err; }\n"
+        "    *out_call = call; *out_stream = stream; *out_initial = initial;\n"
+        "    return 0;\n}\n\n",
+        base,
+        base);
+    free(base);
+}
+
+static void generate_accept_function(string_builder* buffer, const service_info* service, const method_info* method) {
+    char* base = method_base_name(service, method);
+    if (base == NULL) {
+        buffer->failed = true;
+        return;
+    }
+    string_builder_appendf(buffer,
+        "int %s_accept(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, uint64_t operation_id) {\n"
+        "    if (runtime == NULL || operation_id == TREVRPC_RPC_OPERATION_ID_NONE) { return -EINVAL; }\n"
+        "    return trevrpc_rpc_call_accept(runtime, call, operation_id);\n}\n\n",
+        base);
+    free(base);
+}
+
+static void generate_source_service(string_builder* buffer, const service_info* service) {
+    for (size_t i = 0; i < service->methods.len; i++) {
+        const method_info* method = &service->methods.items[i];
+        generate_config_and_open(buffer, service, method);
+        if (method->client_streaming) {
+            generate_send_function(buffer, service, method, method->input, method->server_streaming ? "_request" : "");
+            generate_finish_send_function(buffer, service, method);
+        }
+        if (method->server_streaming) {
+            generate_send_function(
+                buffer, service, method, method->output, method->client_streaming ? "_response" : "");
+            generate_finish_function(buffer, service, method);
+        }
+        generate_respond_function(buffer, service, method);
+        generate_decode_receive_function(buffer, service, method, true);
+        generate_decode_receive_function(buffer, service, method, false);
+        generate_matches_function(buffer, service, method);
+        generate_take_incoming_function(buffer, service, method);
+        generate_accept_function(buffer, service, method);
+    }
 }
 
 static char* generate_header(
@@ -1325,23 +1648,17 @@ static char* generate_header(
     string_builder_init(&buffer);
     string_builder_append(&buffer, "// Code generated by protoc-gen-trevrpc-c. DO NOT EDIT.\n// clang-format off\n\n");
     string_builder_appendf(&buffer, "#ifndef %s\n#define %s\n\n", guard, guard);
-    string_builder_append(&buffer, "#include <stddef.h>\n#include <stdint.h>\n");
-    string_builder_append(&buffer, "#include <protobuf-c/protobuf-c.h>\n");
-    string_builder_appendf(&buffer, "#include %s\n", runtime_include);
-    string_builder_appendf(&buffer, "#include %s\n\n", pb_include);
+    string_builder_append(&buffer, "#include <stddef.h>\n#include <stdint.h>\n#include <protobuf-c/protobuf-c.h>\n");
+    string_builder_appendf(&buffer, "#include %s\n#include %s\n\n", runtime_include, pb_include);
     string_builder_append(&buffer,
-        "#if TREVRPC_C_ABI_VERSION != 6u\n"
-        "#error \"Generated TrevRPC C bindings require C ABI 6\"\n"
-        "#endif\n\n");
-    string_builder_append(&buffer, "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+        "#if TREVRPC_RPC_ABI_VERSION != 1u\n#error \"Generated TrevRPC C bindings require RPC ABI "
+        "1\"\n#endif\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
     string_builder_appendf(&buffer,
-        "#ifdef TREVRPC_GENERATED_TESTING\n"
-        "void %s_test_fail_allocation_after(size_t successful_allocations);\n"
-        "#endif\n\n",
+        "#ifdef TREVRPC_GENERATED_TESTING\nvoid %s_test_fail_allocation_after(size_t "
+        "successful_allocations);\n#endif\n\n",
         test_prefix);
-    for (size_t i = 0; i < services->len; i++) {
+    for (size_t i = 0; i < services->len; i++)
         generate_header_service(&buffer, &services->items[i]);
-    }
     string_builder_append(&buffer, "#ifdef __cplusplus\n}\n#endif\n\n#endif\n");
     free(header_name);
     free(guard);
@@ -1350,586 +1667,6 @@ static char* generate_header(
     free(pb_include);
     free(test_prefix);
     return string_builder_steal(&buffer);
-}
-
-static void write_pack_message(string_builder* buffer, const type_ref* message, const char* expression) {
-    string_builder_appendf(buffer, "    size_t body_len = %s__get_packed_size(%s);\n", message->c_prefix, expression);
-    string_builder_append(buffer,
-        "    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];\n"
-        "    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : "
-        "malloc(body_len));\n");
-    string_builder_appendf(buffer, "    if (body_len > 0 && body == NULL) { return -ENOMEM; }\n");
-    string_builder_appendf(buffer, "    %s__pack(%s, body);\n", message->c_prefix, expression);
-}
-
-static void write_free_packed_body(string_builder* buffer) {
-    string_builder_append(buffer, "    if (body != stack_body) { free(body); }\n");
-}
-
-static void generate_send_helper(string_builder* buffer, const service_info* service, const type_ref* message) {
-    char* helper = type_helper_name(message);
-    if (helper == NULL) {
-        buffer->failed = true;
-        return;
-    }
-    string_builder_appendf(buffer,
-        "int %s_send_%s(trevrpc_stream* stream, const %s* message) {\n",
-        service->c_name,
-        helper,
-        message->c_type);
-    string_builder_append(buffer, "    if (stream == NULL || message == NULL) { return -EINVAL; }\n");
-    write_pack_message(buffer, message, "message");
-    string_builder_append(buffer, "    int err = trevrpc_stream_send_message_borrowed_wait(stream, body, body_len);\n");
-    write_free_packed_body(buffer);
-    string_builder_append(buffer, "    return err;\n}\n\n");
-    free(helper);
-}
-
-static void generate_event_source(
-    string_builder* buffer, const service_info* service, const type_ref* message, bool request_side) {
-    char* helper = type_helper_name(message);
-    char* short_helper = type_short_helper_name(message);
-    char* base = short_helper == NULL
-                     ? NULL
-                     : format_string("%s_%s%s", service->c_name, short_helper, request_side ? "_request" : "");
-    char* macro = base == NULL ? NULL : macro_name(base);
-    if (helper == NULL || short_helper == NULL || base == NULL || macro == NULL) {
-        free(helper);
-        free(short_helper);
-        free(base);
-        free(macro);
-        buffer->failed = true;
-        return;
-    }
-    string_builder_appendf(buffer,
-        "int %s_receiver_init(%s_receiver* receiver, trevrpc_stream* stream) {\n"
-        "    if (receiver == NULL || stream == NULL || receiver->stream != NULL || receiver->state != 0) { return "
-        "-EINVAL; }\n"
-        "    receiver->stream = stream;\n"
-        "    receiver->state = TREVRPC_GENERATED_RECEIVER_OPEN;\n"
-        "    return 0;\n"
-        "}\n\n",
-        base,
-        base);
-    string_builder_appendf(buffer,
-        "void %s_event_reset(%s_event* event) {\n"
-        "    if (event == NULL) { return; }\n"
-        "    if (event->message != NULL) { %s__free_unpacked(event->message, NULL); }\n"
-        "    trevrpc_inbound_stream_frame_release(event->frame);\n"
-        "    memset(event, 0, sizeof(*event));\n"
-        "}\n\n",
-        base,
-        base,
-        message->c_prefix);
-    string_builder_appendf(buffer,
-        "void %s_receiver_reset(%s_receiver* receiver) {\n"
-        "    if (receiver != NULL) { memset(receiver, 0, sizeof(*receiver)); }\n"
-        "}\n\n",
-        base,
-        base);
-    if (request_side) {
-        string_builder_appendf(buffer,
-            "int %s_recv_%s_request(%s_receiver* receiver, %s_event* event) {\n",
-            service->c_name,
-            helper,
-            base,
-            base);
-    } else {
-        string_builder_appendf(
-            buffer, "int %s_recv_%s(%s_receiver* receiver, %s_event* event) {\n", service->c_name, helper, base, base);
-    }
-    string_builder_append(buffer,
-        "    if (receiver == NULL || receiver->stream == NULL || event == NULL || "
-        "!trevrpc_generated_event_empty(event->kind, event->error, event->message, event->frame)) { return -EINVAL; }\n"
-        "    if (receiver->state == TREVRPC_GENERATED_RECEIVER_DONE) { return 0; }\n"
-        "    trevrpc_inbound_stream_frame* frame = NULL;\n"
-        "    int err = trevrpc_stream_recv_inbound(receiver->stream, &frame);\n"
-        "    if (err != 0) {\n"
-        "        event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_RUNTIME_ERROR;\n", macro);
-    string_builder_append(buffer,
-        "        event->error = err;\n"
-        "        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;\n"
-        "        return 0;\n"
-        "    }\n"
-        "    if (frame == NULL) {\n"
-        "        event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_%s;\n", macro, request_side ? "END" : "MISSING_TERMINAL_STATUS");
-    if (!request_side) {
-        string_builder_append(buffer, "        event->error = TREVRPC_ERR_INVALID_FRAME;\n");
-    }
-    string_builder_append(buffer,
-        "        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;\n"
-        "        return 0;\n"
-        "    }\n"
-        "    uint32_t kind = 0;\n"
-        "    err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);\n"
-        "    if (err != 0) {\n"
-        "        trevrpc_inbound_stream_frame_release(frame);\n"
-        "        event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_RUNTIME_ERROR;\n", macro);
-    string_builder_append(buffer,
-        "        event->error = err; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;\n"
-        "    }\n"
-        "    if (kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {\n"
-        "        trevrpc_bytes_view body_view = {0};\n"
-        "        err = trevrpc_inbound_stream_frame_get_body(frame, &body_view);\n"
-        "        if (err != 0) {\n"
-        "            trevrpc_inbound_stream_frame_release(frame);\n"
-        "            event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_RUNTIME_ERROR;\n", macro);
-    string_builder_append(buffer,
-        "            event->error = err; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;\n"
-        "        }\n"
-        "        trevrpc_generated_allocator_state allocator_state = {0};\n"
-        "        ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);\n");
-    string_builder_appendf(
-        buffer, "        event->message = %s__unpack(&allocator, body_view.len, body_view.data);\n", message->c_prefix);
-    string_builder_append(buffer,
-        "        event->frame = frame;\n"
-        "        if (event->message == NULL) {\n"
-        "            event->kind = allocator_state.failed ? ");
-    string_builder_appendf(buffer, "%s_EVENT_RUNTIME_ERROR : %s_EVENT_DECODE_ERROR;\n", macro, macro);
-    string_builder_append(buffer,
-        "            event->error = allocator_state.failed ? -ENOMEM : TREVRPC_ERR_INVALID_FRAME;\n"
-        "            trevrpc_stream_cancel(receiver->stream);\n"
-        "            receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;\n"
-        "        } else {\n"
-        "            event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_MESSAGE;\n", macro);
-    string_builder_append(buffer,
-        "        }\n"
-        "        return 0;\n"
-        "    }\n"
-        "    if (kind != TREVRPC_STREAM_FRAME_KIND_STATUS) {\n"
-        "        trevrpc_inbound_stream_frame_release(frame);\n"
-        "        event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_RUNTIME_ERROR;\n", macro);
-    string_builder_append(buffer,
-        "        event->error = TREVRPC_ERR_INVALID_FRAME; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return "
-        "0;\n"
-        "    }\n"
-        "    trevrpc_inbound_stream_frame* trailing = NULL;\n"
-        "    err = trevrpc_stream_recv_inbound(receiver->stream, &trailing);\n"
-        "    if (trailing != NULL) {\n"
-        "        trevrpc_inbound_stream_frame_release(trailing);\n"
-        "        trevrpc_inbound_stream_frame_release(frame);\n"
-        "        event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_RUNTIME_ERROR;\n", macro);
-    string_builder_append(buffer,
-        "        event->error = TREVRPC_ERR_INVALID_FRAME; receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return "
-        "0;\n"
-        "    }\n"
-        "    if (err != 0) {\n"
-        "        trevrpc_inbound_stream_frame_release(frame);\n"
-        "        event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_RUNTIME_ERROR;\n", macro);
-    string_builder_append(buffer,
-        "        event->error = (err == TREVRPC_ERR_INVALID_FRAME || err == TREVRPC_ERR_FRAME_TOO_LARGE) ? "
-        "TREVRPC_ERR_INVALID_FRAME : err;\n"
-        "        receiver->state = TREVRPC_GENERATED_RECEIVER_DONE; return 0;\n"
-        "    }\n"
-        "    event->kind = ");
-    string_builder_appendf(buffer, "%s_EVENT_TERMINAL_STATUS;\n", macro);
-    string_builder_append(buffer,
-        "    event->frame = frame;\n"
-        "    receiver->state = TREVRPC_GENERATED_RECEIVER_DONE;\n"
-        "    return 0;\n"
-        "}\n\n");
-    free(helper);
-    free(short_helper);
-    free(base);
-    free(macro);
-}
-
-static const char* rpc_kind_for_method(const method_info* method) {
-    if (method->client_streaming && method->server_streaming) {
-        return "TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING";
-    }
-    if (method->client_streaming) {
-        return "TREVRPC_RPC_KIND_CLIENT_STREAMING";
-    }
-    return "TREVRPC_RPC_KIND_SERVER_STREAMING";
-}
-
-static void generate_unary_client(string_builder* buffer, const service_info* service, const method_info* method) {
-    char* base = method_base_name(service, method);
-    char* macro = base == NULL ? NULL : macro_name(base);
-    char* service_name = c_quote(service->proto_name);
-    char* method_name = c_quote(method->name);
-    if (base == NULL || macro == NULL || service_name == NULL || method_name == NULL) {
-        free(base);
-        free(macro);
-        free(service_name);
-        free(method_name);
-        buffer->failed = true;
-        return;
-    }
-    string_builder_appendf(buffer,
-        "void %s_result_reset(%s_result* result) {\n"
-        "    if (result == NULL) { return; }\n"
-        "    if (result->response != NULL) { %s__free_unpacked(result->response, NULL); }\n"
-        "    trevrpc_inbound_response_release(result->envelope);\n"
-        "    memset(result, 0, sizeof(*result));\n"
-        "}\n\n",
-        base,
-        base,
-        method->output->c_prefix);
-    string_builder_appendf(buffer,
-        "int %s(trevrpc_channel* channel, const %s* request, %s_result* result) {\n"
-        "    return %s_with_options(channel, request, NULL, result);\n"
-        "}\n\n",
-        base,
-        method->input->c_type,
-        base,
-        base);
-    string_builder_appendf(buffer,
-        "int %s_with_options(trevrpc_channel* channel, const %s* request, const trevrpc_call_options_v1* options, "
-        "%s_result* result) {\n",
-        base,
-        method->input->c_type,
-        base);
-    string_builder_append(buffer,
-        "    if (channel == NULL || request == NULL || result == NULL || !trevrpc_generated_result_empty(result->kind, "
-        "result->error, result->response, result->envelope)) { return -EINVAL; }\n");
-    string_builder_appendf(buffer, "    size_t body_len = %s__get_packed_size(request);\n", method->input->c_prefix);
-    string_builder_append(buffer,
-        "    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];\n"
-        "    uint8_t* body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));\n"
-        "    if (body_len > 0 && body == NULL) { result->kind = ");
-    string_builder_appendf(buffer, "%s_RESULT_RUNTIME_ERROR; result->error = -ENOMEM; return 0; }\n", macro);
-    string_builder_appendf(buffer, "    %s__pack(request, body);\n", method->input->c_prefix);
-    string_builder_appendf(buffer,
-        "    trevrpc_request rpc_request = {.service = %s, .service_len = sizeof(%s) - 1, .method = %s, "
-        ".method_len = sizeof(%s) - 1, .body = body, .body_len = body_len, .kind = TREVRPC_RPC_KIND_UNARY, "
-        ".version = TREVRPC_WIRE_VERSION};\n",
-        service_name,
-        service_name,
-        method_name,
-        method_name);
-    string_builder_append(buffer,
-        "    int err = trevrpc_channel_call_request_inbound_v1(channel, &rpc_request, options, &result->envelope);\n");
-    write_free_packed_body(buffer);
-    string_builder_append(buffer, "    if (err != 0) { result->kind = ");
-    string_builder_appendf(buffer, "%s_RESULT_RUNTIME_ERROR; result->error = err; return 0; }\n", macro);
-    string_builder_append(buffer,
-        "    uint32_t status = TREVRPC_STATUS_OK;\n"
-        "    err = trevrpc_inbound_response_get_status(result->envelope, &status);\n"
-        "    if (err != 0) { result->kind = ");
-    string_builder_appendf(buffer, "%s_RESULT_RUNTIME_ERROR; result->error = err; return 0; }\n", macro);
-    string_builder_append(buffer, "    if (status != TREVRPC_STATUS_OK) { result->kind = ");
-    string_builder_appendf(buffer, "%s_RESULT_RPC_STATUS; return 0; }\n", macro);
-    string_builder_append(buffer,
-        "    trevrpc_bytes_view body_view = {0};\n"
-        "    err = trevrpc_inbound_response_get_body(result->envelope, &body_view);\n"
-        "    if (err != 0) { result->kind = ");
-    string_builder_appendf(buffer, "%s_RESULT_RUNTIME_ERROR; result->error = err; return 0; }\n", macro);
-    string_builder_append(buffer,
-        "    trevrpc_generated_allocator_state allocator_state = {0};\n"
-        "    ProtobufCAllocator allocator = trevrpc_generated_allocator(&allocator_state);\n");
-    string_builder_appendf(buffer,
-        "    result->response = %s__unpack(&allocator, body_view.len, body_view.data);\n",
-        method->output->c_prefix);
-    string_builder_append(buffer, "    if (result->response == NULL) { result->kind = allocator_state.failed ? ");
-    string_builder_appendf(buffer, "%s_RESULT_RUNTIME_ERROR : %s_RESULT_DECODE_ERROR;\n", macro, macro);
-    string_builder_append(buffer,
-        "        result->error = allocator_state.failed ? -ENOMEM : TREVRPC_ERR_INVALID_FRAME; return 0; }\n"
-        "    result->kind = ");
-    string_builder_appendf(buffer, "%s_RESULT_SUCCESS;\n    return 0;\n}\n\n", macro);
-    free(base);
-    free(macro);
-    free(service_name);
-    free(method_name);
-}
-
-static void generate_stream_client(string_builder* buffer, const service_info* service, const method_info* method) {
-    char* base = method_base_name(service, method);
-    char* service_name = c_quote(service->proto_name);
-    char* method_name = c_quote(method->name);
-    if (base == NULL || service_name == NULL || method_name == NULL) {
-        free(base);
-        free(service_name);
-        free(method_name);
-        buffer->failed = true;
-        return;
-    }
-    if (method->client_streaming) {
-        string_builder_appendf(buffer,
-            "int %s_start(trevrpc_channel* channel, trevrpc_stream** stream) { return %s_start_with_options(channel, "
-            "NULL, stream); }\n\n",
-            base,
-            base);
-        string_builder_appendf(buffer,
-            "int %s_start_with_options(trevrpc_channel* channel, const trevrpc_call_options_v1* options, "
-            "trevrpc_stream** stream) {\n"
-            "    if (channel == NULL || stream == NULL) { return -EINVAL; }\n"
-            "    trevrpc_request request = {.service = %s, .service_len = sizeof(%s) - 1, .method = %s, "
-            ".method_len = sizeof(%s) - 1, .kind = %s, .version = TREVRPC_WIRE_VERSION};\n"
-            "    return trevrpc_channel_start_stream_request_v1(channel, &request, options, stream);\n"
-            "}\n\n",
-            base,
-            service_name,
-            service_name,
-            method_name,
-            method_name,
-            rpc_kind_for_method(method));
-    } else {
-        string_builder_appendf(buffer,
-            "int %s(trevrpc_channel* channel, const %s* request, trevrpc_stream** stream) { return "
-            "%s_with_options(channel, request, NULL, stream); }\n\n",
-            base,
-            method->input->c_type,
-            base);
-        string_builder_appendf(buffer,
-            "int %s_with_options(trevrpc_channel* channel, const %s* request, const trevrpc_call_options_v1* options, "
-            "trevrpc_stream** stream) {\n",
-            base,
-            method->input->c_type);
-        string_builder_append(
-            buffer, "    if (channel == NULL || request == NULL || stream == NULL) { return -EINVAL; }\n");
-        write_pack_message(buffer, method->input, "request");
-        string_builder_appendf(buffer,
-            "    trevrpc_request rpc_request = {.service = %s, .service_len = sizeof(%s) - 1, .method = %s, "
-            ".method_len = sizeof(%s) - 1, .body = body, .body_len = body_len, .kind = "
-            "TREVRPC_RPC_KIND_SERVER_STREAMING, "
-            ".version = TREVRPC_WIRE_VERSION};\n",
-            service_name,
-            service_name,
-            method_name,
-            method_name);
-        string_builder_append(
-            buffer, "    int err = trevrpc_channel_start_stream_request_v1(channel, &rpc_request, options, stream);\n");
-        write_free_packed_body(buffer);
-        string_builder_append(buffer,
-            "    if (err == 0) { err = trevrpc_stream_finish_send(*stream); }\n"
-            "    if (err != 0 && *stream != NULL) { trevrpc_stream_close(*stream); *stream = NULL; }\n"
-            "    return err;\n"
-            "}\n\n");
-    }
-    free(base);
-    free(service_name);
-    free(method_name);
-}
-
-static void generate_responder(string_builder* buffer, const service_info* service, const method_info* method) {
-    char* base = method_base_name(service, method);
-    if (base == NULL) {
-        buffer->failed = true;
-        return;
-    }
-    string_builder_appendf(buffer,
-        "typedef struct %s_respond_context { trevrpc_call* call; int attempted; int submitted; int error; } "
-        "%s_respond_context;\n\n",
-        base,
-        base);
-    string_builder_appendf(
-        buffer, "static int %s_respond(void* context_value, const %s_response_view* response) {\n", base, base);
-    string_builder_appendf(
-        buffer, "    %s_respond_context* context = (%s_respond_context*)context_value;\n", base, base);
-    string_builder_append(buffer,
-        "    if (context == NULL || context->call == NULL || response == NULL) { return -EINVAL; }\n"
-        "    if (context->attempted) { return -EALREADY; }\n"
-        "    if ((response->status == TREVRPC_STATUS_OK && response->message == NULL) || "
-        "(response->status != TREVRPC_STATUS_OK && response->message != NULL) || "
-        "(response->status_message == NULL && response->status_message_len > 0)) { return -EINVAL; }\n"
-        "    context->attempted = 1;\n"
-        "    uint8_t stack_body[TREVRPC_C_STACK_BODY_LEN];\n"
-        "    uint8_t* body = NULL;\n"
-        "    size_t body_len = 0;\n"
-        "    if (response->message != NULL) {\n");
-    string_builder_appendf(
-        buffer, "        body_len = %s__get_packed_size(response->message);\n", method->output->c_prefix);
-    string_builder_append(buffer,
-        "        body = body_len == 0 ? NULL : (body_len <= sizeof(stack_body) ? stack_body : malloc(body_len));\n"
-        "        if (body_len > 0 && body == NULL) { context->error = -ENOMEM; return context->error; }\n");
-    string_builder_appendf(buffer, "        %s__pack(response->message, body);\n", method->output->c_prefix);
-    string_builder_append(buffer, "    }\n");
-    if (method->client_streaming) {
-        string_builder_append(buffer,
-            "    trevrpc_stream* stream = trevrpc_call_stream(context->call);\n"
-            "    int err = stream == NULL ? -EINVAL : 0;\n"
-            "    if (err == 0 && response->message != NULL) {\n"
-            "        err = trevrpc_stream_send_message_borrowed_wait(stream, body, body_len);\n"
-            "    }\n"
-            "    trevrpc_status_view_v1 status;\n"
-            "    if (err == 0) { err = trevrpc_status_view_v1_init(&status, sizeof(status)); }\n"
-            "    if (err == 0) {\n"
-            "        status.status = response->status; status.message = response->status_message; "
-            "status.message_len = response->status_message_len; status.metadata = response->metadata;\n"
-            "        err = trevrpc_call_finish_stream_borrowed_v1(context->call, &status);\n"
-            "    }\n");
-    } else {
-        string_builder_append(buffer,
-            "    trevrpc_response_view_v1 view;\n"
-            "    int err = trevrpc_response_view_v1_init(&view, sizeof(view));\n"
-            "    if (err == 0) {\n"
-            "        view.status = response->status; view.message = response->status_message; "
-            "view.message_len = response->status_message_len; view.body = body; view.body_len = body_len; "
-            "view.metadata = response->metadata;\n"
-            "        err = trevrpc_call_respond_borrowed_v1(context->call, &view);\n"
-            "    }\n");
-    }
-    string_builder_append(buffer,
-        "    if (body != stack_body) { free(body); }\n"
-        "    context->error = err;\n"
-        "    context->submitted = err == 0;\n"
-        "    return err;\n"
-        "}\n\n");
-    free(base);
-}
-
-static void generate_server_callback(string_builder* buffer, const service_info* service, const method_info* method) {
-    char* base = method_base_name(service, method);
-    char* callback = base == NULL ? NULL : format_string("%s_callback", base);
-    if (base == NULL || callback == NULL) {
-        free(base);
-        free(callback);
-        buffer->failed = true;
-        return;
-    }
-    if (!method->server_streaming) {
-        generate_responder(buffer, service, method);
-    }
-    string_builder_appendf(buffer, "static int %s(void* user_data, trevrpc_call* call) {\n", callback);
-    string_builder_appendf(buffer,
-        "    const %s* implementation = (const %s*)user_data;\n"
-        "    const trevrpc_call_context* context = trevrpc_call_get_context(call);\n",
-        service->type_name,
-        service->type_name);
-    if (method->client_streaming || method->server_streaming) {
-        string_builder_append(buffer, "    trevrpc_stream* stream = trevrpc_call_stream(call);\n");
-    }
-    if (!method->client_streaming) {
-        string_builder_append(buffer, "    const trevrpc_request* request = trevrpc_call_request(call);\n");
-        string_builder_appendf(buffer,
-            "    %s* decoded = request == NULL ? NULL : %s__unpack(NULL, request->body_len, request->body);\n"
-            "    if (decoded == NULL) { return TREVRPC_ERR_INVALID_FRAME; }\n",
-            method->input->c_type,
-            method->input->c_prefix);
-    }
-    if (!method->client_streaming && !method->server_streaming) {
-        string_builder_appendf(buffer,
-            "    %s_respond_context respond_context = {.call = call};\n"
-            "    int err = implementation->%s(implementation->user_data, context, decoded, %s_respond, "
-            "&respond_context);\n"
-            "    %s__free_unpacked(decoded, NULL);\n"
-            "    if (respond_context.submitted) { return 0; }\n"
-            "    if (respond_context.attempted && respond_context.error != 0) { return respond_context.error; }\n"
-            "    return err != 0 ? err : TREVRPC_ERR_HANDLER_FAILED;\n",
-            base,
-            method->c_name,
-            base,
-            method->input->c_prefix);
-    } else if (method->client_streaming && !method->server_streaming) {
-        string_builder_appendf(buffer,
-            "    %s_respond_context respond_context = {.call = call};\n"
-            "    int err = implementation->%s(implementation->user_data, context, stream, %s_respond, "
-            "&respond_context);\n"
-            "    if (respond_context.submitted) { return 0; }\n"
-            "    if (respond_context.attempted && respond_context.error != 0) { return respond_context.error; }\n"
-            "    return err != 0 ? err : TREVRPC_ERR_HANDLER_FAILED;\n",
-            base,
-            method->c_name,
-            base);
-    } else if (!method->client_streaming) {
-        string_builder_appendf(buffer,
-            "    int err = implementation->%s(implementation->user_data, context, decoded, stream);\n"
-            "    %s__free_unpacked(decoded, NULL);\n"
-            "    if (err != 0) { return err; }\n",
-            method->c_name,
-            method->input->c_prefix);
-        string_builder_append(buffer,
-            "    trevrpc_status_view_v1 status;\n"
-            "    err = trevrpc_status_view_v1_init(&status, sizeof(status));\n"
-            "    return err == 0 ? trevrpc_call_finish_stream_borrowed_v1(call, &status) : err;\n");
-    } else {
-        string_builder_appendf(buffer,
-            "    int err = implementation->%s(implementation->user_data, context, stream);\n"
-            "    if (err != 0) { return err; }\n",
-            method->c_name);
-        string_builder_append(buffer,
-            "    trevrpc_status_view_v1 status;\n"
-            "    err = trevrpc_status_view_v1_init(&status, sizeof(status));\n"
-            "    return err == 0 ? trevrpc_call_finish_stream_borrowed_v1(call, &status) : err;\n");
-    }
-    string_builder_append(buffer, "}\n\n");
-    free(base);
-    free(callback);
-}
-
-static void generate_register_function(string_builder* buffer, const service_info* service) {
-    char* service_name = c_quote(service->proto_name);
-    if (service_name == NULL) {
-        buffer->failed = true;
-        return;
-    }
-    string_builder_appendf(buffer,
-        "int %s_register(trevrpc_server* server, const %s* implementation) {\n"
-        "    if (server == NULL || implementation == NULL) { return -EINVAL; }\n",
-        service->c_name,
-        service->type_name);
-    for (size_t i = 0; i < service->methods.len; i++) {
-        const method_info* method = &service->methods.items[i];
-        string_builder_appendf(buffer, "    if (implementation->%s == NULL) { return -EINVAL; }\n", method->c_name);
-    }
-    for (size_t i = 0; i < service->methods.len; i++) {
-        const method_info* method = &service->methods.items[i];
-        char* method_name = c_quote(method->name);
-        char* base = method_base_name(service, method);
-        char* callback = base == NULL ? NULL : format_string("%s_callback", base);
-        const char* kind = !method->client_streaming && !method->server_streaming ? "TREVRPC_RPC_KIND_UNARY"
-                                                                                  : rpc_kind_for_method(method);
-        if (method_name == NULL || base == NULL || callback == NULL) {
-            free(method_name);
-            free(base);
-            free(callback);
-            buffer->failed = true;
-            break;
-        }
-        string_builder_appendf(buffer,
-            "    int err_%s = trevrpc_server_register_call(server, %s, %s, %s, %s, (void*)implementation);\n"
-            "    if (err_%s != 0) { return err_%s; }\n",
-            method->c_name,
-            service_name,
-            method_name,
-            kind,
-            callback,
-            method->c_name,
-            method->c_name);
-        free(method_name);
-        free(base);
-        free(callback);
-    }
-    string_builder_append(buffer, "    return 0;\n}\n\n");
-    free(service_name);
-}
-
-static void generate_source_service(string_builder* buffer, const service_info* service) {
-    type_ref_list message_types = {0};
-    if (!service_message_types(service, &message_types)) {
-        buffer->failed = true;
-        return;
-    }
-    for (size_t i = 0; i < message_types.len; i++) {
-        generate_send_helper(buffer, service, message_types.items[i]);
-    }
-    type_ref_list_free(&message_types);
-    for (size_t i = 0; i < service->inputs.len; i++) {
-        generate_event_source(buffer, service, service->inputs.items[i], true);
-    }
-    for (size_t i = 0; i < service->outputs.len; i++) {
-        generate_event_source(buffer, service, service->outputs.items[i], false);
-    }
-    for (size_t i = 0; i < service->methods.len; i++) {
-        const method_info* method = &service->methods.items[i];
-        if (!method->client_streaming && !method->server_streaming) {
-            generate_unary_client(buffer, service, method);
-        } else {
-            generate_stream_client(buffer, service, method);
-        }
-        generate_server_callback(buffer, service, method);
-    }
-    generate_register_function(buffer, service);
 }
 
 static char* generate_source(
@@ -1947,53 +1684,31 @@ static char* generate_source(
     }
     string_builder buffer;
     string_builder_init(&buffer);
-    string_builder_append(&buffer, "// Code generated by protoc-gen-trevrpc-c. DO NOT EDIT.\n// clang-format off\n\n");
-    string_builder_append(&buffer, "#include <errno.h>\n#include <stdlib.h>\n#include <string.h>\n");
+    string_builder_append(&buffer,
+        "// Code generated by protoc-gen-trevrpc-c. DO NOT EDIT.\n// clang-format off\n\n#include <errno.h>\n#include "
+        "<stdint.h>\n#include <stdlib.h>\n#include <string.h>\n");
     string_builder_appendf(&buffer, "#include %s\n\n", header_include);
     string_builder_append(&buffer,
-        "#define TREVRPC_C_STACK_BODY_LEN 512u\n"
-        "#define TREVRPC_GENERATED_RECEIVER_OPEN 1u\n"
-        "#define TREVRPC_GENERATED_RECEIVER_DONE 2u\n\n");
+        "#define TREVRPC_GENERATED_STACK_BODY_LEN 512u\n\n#ifdef TREVRPC_GENERATED_TESTING\nstatic size_t "
+        "trevrpc_generated_allocation_budget = SIZE_MAX;\n#endif\n\ntypedef struct trevrpc_generated_allocator_state { "
+        "int failed; } trevrpc_generated_allocator_state;\n\nstatic void* trevrpc_generated_alloc(void* "
+        "allocator_data, size_t size) {\n    trevrpc_generated_allocator_state* state = "
+        "(trevrpc_generated_allocator_state*)allocator_data;\n#ifdef TREVRPC_GENERATED_TESTING\n    if (size != 0 && "
+        "trevrpc_generated_allocation_budget == 0) { state->failed = 1; return NULL; }\n    if (size != 0 && "
+        "trevrpc_generated_allocation_budget != SIZE_MAX) { trevrpc_generated_allocation_budget--; }\n#endif\n    "
+        "void* value = malloc(size);\n    if (value == NULL && size != 0) { state->failed = 1; }\n    return "
+        "value;\n}\n\nstatic void trevrpc_generated_free(void* allocator_data, void* value) { (void)allocator_data; "
+        "free(value); }\n\nstatic ProtobufCAllocator trevrpc_generated_allocator(trevrpc_generated_allocator_state* "
+        "state) {\n    return (ProtobufCAllocator){.alloc = trevrpc_generated_alloc, .free = trevrpc_generated_free, "
+        ".allocator_data = state};\n}\n");
     string_builder_appendf(&buffer,
-        "#ifdef TREVRPC_GENERATED_TESTING\n"
-        "static size_t trevrpc_generated_allocation_budget = SIZE_MAX;\n"
-        "void %s_test_fail_allocation_after(size_t successful_allocations) {\n"
-        "    trevrpc_generated_allocation_budget = successful_allocations;\n"
-        "}\n"
-        "#endif\n\n",
+        "#ifdef TREVRPC_GENERATED_TESTING\nvoid %s_test_fail_allocation_after(size_t successful_allocations) { "
+        "trevrpc_generated_allocation_budget = successful_allocations; }\n#endif\n\n",
         test_prefix);
-    string_builder_append(&buffer,
-        "typedef struct trevrpc_generated_allocator_state { int failed; } trevrpc_generated_allocator_state;\n\n"
-        "static void* trevrpc_generated_alloc(void* allocator_data, size_t size) {\n"
-        "    trevrpc_generated_allocator_state* state = (trevrpc_generated_allocator_state*)allocator_data;\n"
-        "#ifdef TREVRPC_GENERATED_TESTING\n"
-        "    if (size != 0 && trevrpc_generated_allocation_budget == 0) { state->failed = 1; return NULL; }\n"
-        "    if (size != 0 && trevrpc_generated_allocation_budget != SIZE_MAX) { "
-        "trevrpc_generated_allocation_budget--; }\n"
-        "#endif\n"
-        "    void* value = malloc(size);\n"
-        "    if (value == NULL && size != 0) { state->failed = 1; }\n"
-        "    return value;\n"
-        "}\n\n"
-        "static void trevrpc_generated_free(void* allocator_data, void* value) { (void)allocator_data; free(value); "
-        "}\n\n"
-        "static ProtobufCAllocator trevrpc_generated_allocator(trevrpc_generated_allocator_state* state) {\n"
-        "    return (ProtobufCAllocator){.alloc = trevrpc_generated_alloc, .free = trevrpc_generated_free, "
-        ".allocator_data = state};\n"
-        "}\n\n"
-        "static int trevrpc_generated_event_empty(uint32_t kind, int error, const void* message, const void* frame) {\n"
-        "    return kind == 0 && error == 0 && message == NULL && frame == NULL;\n"
-        "}\n\n"
-        "static int trevrpc_generated_result_empty(uint32_t kind, int error, const void* response, const void* "
-        "envelope) {\n"
-        "    return kind == 0 && error == 0 && response == NULL && envelope == NULL;\n"
-        "}\n\n");
-    for (size_t i = 0; i < services->len; i++) {
+    for (size_t i = 0; i < services->len; i++)
         generate_source_service(&buffer, &services->items[i]);
-    }
-    while (buffer.len > 1 && buffer.data[buffer.len - 1] == '\n' && buffer.data[buffer.len - 2] == '\n') {
+    while (buffer.len > 1 && buffer.data[buffer.len - 1] == '\n' && buffer.data[buffer.len - 2] == '\n')
         buffer.data[--buffer.len] = '\0';
-    }
     free(header_name);
     free(header_base);
     free(header_include);
@@ -2004,6 +1719,7 @@ static char* generate_source(
 static bool generate_file(const file_descriptor_proto* file,
     const type_index* index,
     const plugin_options* options,
+    generated_identifier_list* identifiers,
     generated_file_list* files,
     char** error) {
     service_list services = {0};
@@ -2011,13 +1727,15 @@ static bool generate_file(const file_descriptor_proto* file,
         service_list_free(&services);
         return false;
     }
-
+    if (!validate_generated_identifiers(file, &services, options, identifiers, error)) {
+        service_list_free(&services);
+        return false;
+    }
     char* header = generate_header(file, &services, options);
     char* source = generate_source(file, &services, options);
     char* header_name = output_file_name(str_or_empty(file->name), options->header_suffix);
     char* source_name = output_file_name(str_or_empty(file->name), options->source_suffix);
     service_list_free(&services);
-
     if (header == NULL || source == NULL || header_name == NULL || source_name == NULL) {
         free(header);
         free(source);
@@ -2033,6 +1751,8 @@ static bool generate_file(const file_descriptor_proto* file,
         return set_oom(error);
     }
     if (!generated_file_list_append(files, source_name, source)) {
+        free(source_name);
+        free(source);
         return set_oom(error);
     }
     return true;
@@ -2046,118 +1766,98 @@ static void plugin_options_free(plugin_options* options) {
     options->source_suffix = NULL;
     options->runtime_include = NULL;
 }
-
 static bool default_plugin_options(plugin_options* options, char** error) {
     options->header_suffix = duplicate_string(".trevrpc.h");
     options->source_suffix = duplicate_string(".trevrpc.c");
-    options->runtime_include = duplicate_string("trevrpc.h");
+    options->runtime_include = duplicate_string("trevrpc_rpc.h");
     if (options->header_suffix == NULL || options->source_suffix == NULL || options->runtime_include == NULL) {
         plugin_options_free(options);
         return set_oom(error);
     }
     return true;
 }
-
 static bool replace_option_value(char** target, const char* value, size_t value_len, char** error) {
     char* next = duplicate_range(value, value_len);
-    if (next == NULL) {
+    if (next == NULL)
         return set_oom(error);
-    }
     free(*target);
     *target = next;
     return true;
 }
-
 static bool parse_options(const char* parameter, plugin_options* options, char** error) {
-    if (!default_plugin_options(options, error)) {
+    if (!default_plugin_options(options, error))
         return false;
-    }
     parameter = str_or_empty(parameter);
-    if (parameter[0] == '\0') {
+    if (parameter[0] == '\0')
         return true;
-    }
-
     const char* start = parameter;
     for (const char* p = parameter;; p++) {
         if (*p == ',' || *p == '\0') {
             if (p > start) {
                 const char* equals = memchr(start, '=', (size_t)(p - start));
-                if (equals == NULL) {
+                if (equals == NULL)
                     return set_error(
                         error, "invalid trevrpc-c option \"%.*s\"; expected key=value", (int)(p - start), start);
-                }
                 size_t key_len = (size_t)(equals - start);
                 const char* value = equals + 1;
                 size_t value_len = (size_t)(p - value);
-                if (key_len == strlen("header_suffix") && strncmp(start, "header_suffix", key_len) == 0) {
-                    if (!replace_option_value(&options->header_suffix, value, value_len, error)) {
-                        return false;
-                    }
-                } else if (key_len == strlen("source_suffix") && strncmp(start, "source_suffix", key_len) == 0) {
-                    if (!replace_option_value(&options->source_suffix, value, value_len, error)) {
-                        return false;
-                    }
-                } else if (key_len == strlen("runtime_include") && strncmp(start, "runtime_include", key_len) == 0) {
-                    if (!replace_option_value(&options->runtime_include, value, value_len, error)) {
-                        return false;
-                    }
-                } else {
+                char** target = NULL;
+                if (key_len == strlen("header_suffix") && strncmp(start, "header_suffix", key_len) == 0)
+                    target = &options->header_suffix;
+                else if (key_len == strlen("source_suffix") && strncmp(start, "source_suffix", key_len) == 0)
+                    target = &options->source_suffix;
+                else if (key_len == strlen("runtime_include") && strncmp(start, "runtime_include", key_len) == 0)
+                    target = &options->runtime_include;
+                else
                     return set_error(error, "unknown trevrpc-c option \"%.*s\"", (int)key_len, start);
-                }
+                if (!replace_option_value(target, value, value_len, error))
+                    return false;
             }
-            if (*p == '\0') {
+            if (*p == '\0')
                 break;
-            }
             start = p + 1;
         }
     }
     return true;
 }
-
 static bool file_should_generate(const code_generator_request* request, const char* file_name) {
-    for (size_t i = 0; i < request->n_file_to_generate; i++) {
-        if (strcmp(str_or_empty(request->file_to_generate[i]), file_name) == 0) {
+    for (size_t i = 0; i < request->n_file_to_generate; i++)
+        if (strcmp(str_or_empty(request->file_to_generate[i]), file_name) == 0)
             return true;
-        }
-    }
     return false;
 }
-
 static bool generate_response_files(const code_generator_request* request, generated_file_list* files, char** error) {
     plugin_options options = {0};
     if (!parse_options(request->parameter, &options, error)) {
         plugin_options_free(&options);
         return false;
     }
-
     type_index index = {0};
     if (!build_type_index(request, &index, error)) {
         type_index_free(&index);
         plugin_options_free(&options);
         return false;
     }
-
+    generated_identifier_list identifiers = {0};
     for (size_t i = 0; i < request->n_proto_file; i++) {
         const file_descriptor_proto* file = request->proto_file[i];
-        if (!file_should_generate(request, str_or_empty(file->name)) || file->n_service == 0) {
+        if (!file_should_generate(request, str_or_empty(file->name)) || file->n_service == 0)
             continue;
-        }
-        if (!generate_file(file, &index, &options, files, error)) {
+        if (!generate_file(file, &index, &options, &identifiers, files, error)) {
+            generated_identifier_list_free(&identifiers);
             type_index_free(&index);
             plugin_options_free(&options);
             return false;
         }
     }
-
+    generated_identifier_list_free(&identifiers);
     type_index_free(&index);
     plugin_options_free(&options);
     return true;
 }
-
 static bool write_response(FILE* output, const generated_file_list* files, const char* error) {
     code_generator_response response = GOOGLE__PROTOBUF__COMPILER__CODE_GENERATOR_RESPONSE__INIT;
     response.error = (char*)error;
-
     code_generator_response_file** file_ptrs = NULL;
     code_generator_response_file* file_values = NULL;
     if (error == NULL && files->len > 0) {
@@ -2177,7 +1877,6 @@ static bool write_response(FILE* output, const generated_file_list* files, const
         response.n_file = files->len;
         response.file = file_ptrs;
     }
-
     size_t packed_len = google__protobuf__compiler__code_generator_response__get_packed_size(&response);
     uint8_t* packed = malloc(packed_len == 0 ? 1 : packed_len);
     if (packed == NULL) {
@@ -2192,7 +1891,6 @@ static bool write_response(FILE* output, const generated_file_list* files, const
     free(file_values);
     return ok;
 }
-
 int main(void) {
     uint8_t* input = NULL;
     size_t input_len = 0;
@@ -2200,7 +1898,6 @@ int main(void) {
         fprintf(stderr, "protoc-gen-trevrpc-c: read stdin: %s\n", strerror(errno));
         return 1;
     }
-
     code_generator_request* request =
         google__protobuf__compiler__code_generator_request__unpack(NULL, input_len, input);
     free(input);
@@ -2208,12 +1905,10 @@ int main(void) {
         fprintf(stderr, "protoc-gen-trevrpc-c: decode CodeGeneratorRequest\n");
         return 1;
     }
-
     generated_file_list files = {0};
     char* error = NULL;
     generate_response_files(request, &files, &error);
     google__protobuf__compiler__code_generator_request__free_unpacked(request, NULL);
-
     bool ok = write_response(stdout, &files, error);
     generated_file_list_free(&files);
     free(error);

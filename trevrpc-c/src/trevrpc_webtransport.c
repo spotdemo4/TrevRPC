@@ -162,6 +162,7 @@ struct trevrpc_h3_conn {
 #ifdef TREVRPC_H3_FRAME_POLICY_TESTING
     size_t unidi_started_count;
     size_t unidi_retired_count;
+    size_t unidi_qpack_pending_count;
 #endif
     bool qpack_encoder_seen;
     bool qpack_decoder_seen;
@@ -443,74 +444,32 @@ static int trevrpc_wt_write_all(trevrpc_msquic_stream* stream, const uint8_t* da
     return n == (intptr_t)len ? 0 : TREV_WT_ERR_CLOSED;
 }
 
-static int trevrpc_wt_qpack_varint_write(
-    uint8_t* out, size_t out_len, size_t* offset, uint8_t prefix_bits, uint8_t flags, uint64_t value) {
-    if (prefix_bits == 0 || prefix_bits > 8 || *offset >= out_len) {
-        return -ENOBUFS;
-    }
-
-    uint64_t prefix_max = ((uint64_t)1 << prefix_bits) - 1;
-    if (value < prefix_max) {
-        out[(*offset)++] = (uint8_t)(flags | value);
-        return 0;
-    }
-
-    out[(*offset)++] = (uint8_t)(flags | prefix_max);
-    value -= prefix_max;
-    while (value >= 128) {
-        if (*offset >= out_len) {
-            return -ENOBUFS;
-        }
-        out[(*offset)++] = (uint8_t)(0x80 | (value & 0x7f));
-        value >>= 7;
-    }
-    if (*offset >= out_len) {
-        return -ENOBUFS;
-    }
-    out[(*offset)++] = (uint8_t)value;
-    return 0;
-}
-
-static int trevrpc_wt_qpack_put_string(uint8_t* out, size_t out_len, size_t* offset, const char* value) {
-    size_t value_len = strlen(value);
-    int err = trevrpc_wt_qpack_varint_write(out, out_len, offset, 7, 0, value_len);
-    if (err != 0) {
-        return err;
-    }
-    if (out_len - *offset < value_len) {
-        return -ENOBUFS;
-    }
-    memcpy(out + *offset, value, value_len);
-    *offset += value_len;
-    return 0;
-}
-
 static int trevrpc_wt_qpack_put_indexed_static(uint8_t* out, size_t out_len, size_t* offset, uint64_t index) {
-    return trevrpc_wt_qpack_varint_write(out, out_len, offset, 6, 0xc0, index);
+    trevrpc_qpack_static_encoder encoder = {out, out_len, *offset};
+    int result = trevrpc_qpack_static_encoder_put_indexed(&encoder, index);
+    if (result == 0)
+        *offset = encoder.length;
+    return result;
 }
 
 static int trevrpc_wt_qpack_put_literal_static_name(
     uint8_t* out, size_t out_len, size_t* offset, uint64_t name_index, const char* value) {
-    int err = trevrpc_wt_qpack_varint_write(out, out_len, offset, 4, 0x50, name_index);
-    if (err != 0) {
-        return err;
-    }
-    return trevrpc_wt_qpack_put_string(out, out_len, offset, value);
+    trevrpc_qpack_static_encoder encoder = {out, out_len, *offset};
+    int result = trevrpc_qpack_static_encoder_put_literal_name_reference(
+        &encoder, name_index, (const uint8_t*)value, strlen(value));
+    if (result == 0)
+        *offset = encoder.length;
+    return result;
 }
 
 static int trevrpc_wt_qpack_put_literal(
     uint8_t* out, size_t out_len, size_t* offset, const char* name, const char* value) {
-    size_t name_len = strlen(name);
-    int err = trevrpc_wt_qpack_varint_write(out, out_len, offset, 3, 0x20, name_len);
-    if (err != 0) {
-        return err;
-    }
-    if (out_len - *offset < name_len) {
-        return -ENOBUFS;
-    }
-    memcpy(out + *offset, name, name_len);
-    *offset += name_len;
-    return trevrpc_wt_qpack_put_string(out, out_len, offset, value);
+    trevrpc_qpack_static_encoder encoder = {out, out_len, *offset};
+    int result = trevrpc_qpack_static_encoder_put_literal(
+        &encoder, (const uint8_t*)name, strlen(name), (const uint8_t*)value, strlen(value));
+    if (result == 0)
+        *offset = encoder.length;
+    return result;
 }
 
 static int trevrpc_wt_headers_store_value(uint8_t** field, size_t* field_len, const uint8_t* value, size_t value_len) {
@@ -1481,6 +1440,34 @@ int trevrpc_h3_test_wait_unidi_progress(
     pthread_mutex_unlock(&conn->mutex);
     return result;
 }
+
+int trevrpc_h3_test_wait_qpack_pending(trevrpc_h3_conn* conn, size_t minimum_pending_count, uint64_t timeout_nanos) {
+    if (conn == NULL || minimum_pending_count == 0 || timeout_nanos == 0) {
+        return -EINVAL;
+    }
+    struct timespec deadline = {0};
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        return -errno;
+    }
+    deadline.tv_sec += (time_t)(timeout_nanos / 1000000000ull);
+    deadline.tv_nsec += (long)(timeout_nanos % 1000000000ull);
+    if (deadline.tv_nsec >= 1000000000l) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000l;
+    }
+
+    int result = 0;
+    pthread_mutex_lock(&conn->mutex);
+    while (conn->unidi_qpack_pending_count < minimum_pending_count) {
+        int err = pthread_cond_timedwait(&conn->unidi_cond, &conn->mutex, &deadline);
+        if (err != 0) {
+            result = -err;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&conn->mutex);
+    return result;
+}
 #endif
 
 static size_t trevrpc_h3_unidi_read_size(const trevrpc_h3_demux_stream* classifier) {
@@ -1501,95 +1488,101 @@ typedef enum trevrpc_h3_unidi_process_result {
 
 static trevrpc_h3_unidi_process_result trevrpc_h3_process_unidi_monitor(
     trevrpc_h3_conn* conn, trevrpc_h3_unidi_monitor* monitor, uint32_t flags, uint64_t* out_error) {
-    trevrpc_h3_demux_result result = {0};
     trevrpc_h3_demux_profile_capabilities profile = {
         .resolved = true,
         .selected_profile = conn->session.draft,
     };
     monitor->terminal_seen = monitor->terminal_seen || (flags & TREV_MSQUIC_STREAM_OBSERVER_TERMINAL) != 0;
     bool terminal = monitor->terminal_seen;
-    trevrpc_h3_demux_status status = trevrpc_h3_demux_stream_feed(&monitor->classifier, &profile, NULL, 0, &result);
+    trevrpc_h3_demux_action action = monitor->classifier.action;
+    bool newly_classified = monitor->classifier.phase != TREV_H3_DEMUX_READY;
     uint8_t buffer[1024];
-    while (status == TREV_H3_DEMUX_NEED_MORE || status == TREV_H3_DEMUX_WAIT_PROFILE) {
-        uint64_t now = trevrpc_h3_monotonic_nanos();
-        if (now == 0) {
+    if (newly_classified) {
+        trevrpc_h3_demux_result result = {0};
+        trevrpc_h3_demux_status status = trevrpc_h3_demux_stream_feed(&monitor->classifier, &profile, NULL, 0, &result);
+        while (status == TREV_H3_DEMUX_NEED_MORE || status == TREV_H3_DEMUX_WAIT_PROFILE) {
+            uint64_t now = trevrpc_h3_monotonic_nanos();
+            if (now == 0) {
+                *out_error = TREV_H3_APP_INTERNAL_ERROR;
+                return TREV_H3_UNIDI_PROCESS_FAILED;
+            }
+            if (now >= monitor->deadline_nanos) {
+                *out_error = monitor->classifier.phase == TREV_H3_DEMUX_READ_SESSION_ID
+                                 ? TREV_H3_APP_ID_ERROR
+                                 : TREV_H3_APP_STREAM_CREATION_ERROR;
+                return TREV_H3_UNIDI_PROCESS_FAILED;
+            }
+            size_t read_size = trevrpc_h3_unidi_read_size(&monitor->classifier);
+            intptr_t n = trevrpc_msquic_stream_read_protocol_ready(monitor->stream, buffer, read_size);
+            if (n > 0) {
+                status = trevrpc_h3_demux_stream_feed(&monitor->classifier, &profile, buffer, (size_t)n, &result);
+                continue;
+            }
+            if (n == TREV_MSQUIC_ERR_TIMEOUT && !terminal) {
+                return TREV_H3_UNIDI_PROCESS_PENDING;
+            }
+            if (n == TREV_MSQUIC_ERR_CLOSED) {
+                *out_error = TREV_H3_APP_CLOSED_CRITICAL_STREAM;
+                return TREV_H3_UNIDI_PROCESS_FAILED;
+            }
+            if (n == 0 || n == TREV_MSQUIC_ERR_TIMEOUT) {
+                status = trevrpc_h3_demux_stream_terminal(&monitor->classifier, &profile, &result);
+                break;
+            }
             *out_error = TREV_H3_APP_INTERNAL_ERROR;
             return TREV_H3_UNIDI_PROCESS_FAILED;
         }
-        if (now >= monitor->deadline_nanos) {
+        if (status == TREV_H3_DEMUX_PROTOCOL_ERROR) {
+            *out_error = result.application_error;
+            return TREV_H3_UNIDI_PROCESS_FAILED;
+        }
+        if (status != TREV_H3_DEMUX_ACTION_READY) {
             *out_error = monitor->classifier.phase == TREV_H3_DEMUX_READ_SESSION_ID ? TREV_H3_APP_ID_ERROR
                                                                                     : TREV_H3_APP_STREAM_CREATION_ERROR;
             return TREV_H3_UNIDI_PROCESS_FAILED;
         }
-        size_t read_size = trevrpc_h3_unidi_read_size(&monitor->classifier);
-        intptr_t n = trevrpc_msquic_stream_read_protocol_ready(monitor->stream, buffer, read_size);
-        if (n > 0) {
-            status = trevrpc_h3_demux_stream_feed(&monitor->classifier, &profile, buffer, (size_t)n, &result);
-            continue;
+        action = result.action;
+        if (action == TREV_H3_DEMUX_ACTION_RECLAIM_UNCLASSIFIED) {
+            return TREV_H3_UNIDI_PROCESS_DONE;
         }
-        if (n == TREV_MSQUIC_ERR_TIMEOUT && !terminal) {
-            return TREV_H3_UNIDI_PROCESS_PENDING;
-        }
-        if (n == TREV_MSQUIC_ERR_CLOSED) {
-            *out_error = TREV_H3_APP_CLOSED_CRITICAL_STREAM;
-            return TREV_H3_UNIDI_PROCESS_FAILED;
-        }
-        if (n == 0 || n == TREV_MSQUIC_ERR_TIMEOUT) {
-            status = trevrpc_h3_demux_stream_terminal(&monitor->classifier, &profile, &result);
-            break;
-        }
-        *out_error = TREV_H3_APP_INTERNAL_ERROR;
-        return TREV_H3_UNIDI_PROCESS_FAILED;
-    }
-    if (status == TREV_H3_DEMUX_PROTOCOL_ERROR) {
-        *out_error = result.application_error;
-        return TREV_H3_UNIDI_PROCESS_FAILED;
-    }
-    if (status != TREV_H3_DEMUX_ACTION_READY) {
-        *out_error = monitor->classifier.phase == TREV_H3_DEMUX_READ_SESSION_ID ? TREV_H3_APP_ID_ERROR
-                                                                                : TREV_H3_APP_STREAM_CREATION_ERROR;
-        return TREV_H3_UNIDI_PROCESS_FAILED;
-    }
-    if (result.action == TREV_H3_DEMUX_ACTION_RECLAIM_UNCLASSIFIED) {
-        return TREV_H3_UNIDI_PROCESS_DONE;
-    }
-    if (result.action == TREV_H3_DEMUX_ACTION_CONTROL) {
-        *out_error = TREV_H3_APP_STREAM_CREATION_ERROR;
-        return TREV_H3_UNIDI_PROCESS_FAILED;
-    }
-    if (result.action == TREV_H3_DEMUX_ACTION_WEBTRANSPORT) {
-        int err = trevrpc_h3_wait_for_webtransport(conn, result.session_id, monitor->deadline_nanos);
-        if (err != 0) {
-            pthread_mutex_lock(&conn->mutex);
-            bool shutting_down = conn->shutting_down;
-            pthread_mutex_unlock(&conn->mutex);
-            if (shutting_down) {
-                return TREV_H3_UNIDI_PROCESS_DONE;
-            }
-            *out_error = err == TREV_MSQUIC_ERR_TIMEOUT || err == TREV_WT_ERR_REJECTED ? TREV_H3_APP_ID_ERROR
-                                                                                       : TREV_H3_APP_INTERNAL_ERROR;
-            return TREV_H3_UNIDI_PROCESS_FAILED;
-        }
-    }
-
-    bool critical =
-        result.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER || result.action == TREV_H3_DEMUX_ACTION_QPACK_DECODER;
-    if (critical) {
-        pthread_mutex_lock(&conn->mutex);
-        bool* seen =
-            result.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER ? &conn->qpack_encoder_seen : &conn->qpack_decoder_seen;
-        bool duplicate = *seen;
-        *seen = true;
-        pthread_mutex_unlock(&conn->mutex);
-        if (duplicate) {
+        if (action == TREV_H3_DEMUX_ACTION_CONTROL) {
             *out_error = TREV_H3_APP_STREAM_CREATION_ERROR;
             return TREV_H3_UNIDI_PROCESS_FAILED;
         }
+        if (action == TREV_H3_DEMUX_ACTION_WEBTRANSPORT) {
+            int err = trevrpc_h3_wait_for_webtransport(conn, result.session_id, monitor->deadline_nanos);
+            if (err != 0) {
+                pthread_mutex_lock(&conn->mutex);
+                bool shutting_down = conn->shutting_down;
+                pthread_mutex_unlock(&conn->mutex);
+                if (shutting_down) {
+                    return TREV_H3_UNIDI_PROCESS_DONE;
+                }
+                *out_error = err == TREV_MSQUIC_ERR_TIMEOUT || err == TREV_WT_ERR_REJECTED ? TREV_H3_APP_ID_ERROR
+                                                                                           : TREV_H3_APP_INTERNAL_ERROR;
+                return TREV_H3_UNIDI_PROCESS_FAILED;
+            }
+        }
+
+        bool critical = action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER || action == TREV_H3_DEMUX_ACTION_QPACK_DECODER;
+        if (critical) {
+            pthread_mutex_lock(&conn->mutex);
+            bool* seen =
+                action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER ? &conn->qpack_encoder_seen : &conn->qpack_decoder_seen;
+            bool duplicate = *seen;
+            *seen = true;
+            pthread_mutex_unlock(&conn->mutex);
+            if (duplicate) {
+                *out_error = TREV_H3_APP_STREAM_CREATION_ERROR;
+                return TREV_H3_UNIDI_PROCESS_FAILED;
+            }
+        }
     }
 
+    bool critical = action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER || action == TREV_H3_DEMUX_ACTION_QPACK_DECODER;
     for (;;) {
         intptr_t n = trevrpc_msquic_stream_read_protocol_ready(monitor->stream, buffer, sizeof(buffer));
-        if (n > 0 && result.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER) {
+        if (n > 0 && action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER) {
             for (intptr_t i = 0; i < n; i++) {
                 if (buffer[i] != TREV_H3_QPACK_SET_CAPACITY_ZERO) {
                     *out_error = TREV_H3_APP_QPACK_ENCODER_STREAM_ERROR;
@@ -1599,8 +1592,8 @@ static trevrpc_h3_unidi_process_result trevrpc_h3_process_unidi_monitor(
             continue;
         }
         if (n > 0 && critical) {
-            *out_error = result.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER ? TREV_H3_APP_QPACK_ENCODER_STREAM_ERROR
-                                                                             : TREV_H3_APP_QPACK_DECODER_STREAM_ERROR;
+            *out_error = action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER ? TREV_H3_APP_QPACK_ENCODER_STREAM_ERROR
+                                                                      : TREV_H3_APP_QPACK_DECODER_STREAM_ERROR;
             return TREV_H3_UNIDI_PROCESS_FAILED;
         }
         if (n == TREV_MSQUIC_ERR_TIMEOUT) {
@@ -1633,7 +1626,8 @@ static bool trevrpc_h3_take_unidi_monitor(trevrpc_h3_conn* conn, size_t* out_ind
     for (size_t i = 0; i < TREV_H3_UNIDI_MONITOR_COUNT; i++) {
         trevrpc_h3_unidi_monitor* monitor = &conn->unidi_monitors[i];
         if (monitor->state == TREV_H3_UNIDI_MONITOR_LIVE && !monitor->install_pending && !monitor->processing &&
-            (monitor->pending_flags != 0 || (now != 0 && now >= monitor->deadline_nanos))) {
+            (monitor->pending_flags != 0 ||
+                (monitor->classifier.phase != TREV_H3_DEMUX_READY && now != 0 && now >= monitor->deadline_nanos))) {
             monitor->processing = true;
             *out_index = i;
             *out_flags = monitor->pending_flags;
@@ -1650,7 +1644,8 @@ static int trevrpc_h3_unidi_wait(trevrpc_h3_conn* conn) {
     if (now != 0) {
         for (size_t i = 0; i < TREV_H3_UNIDI_MONITOR_COUNT; i++) {
             trevrpc_h3_unidi_monitor* monitor = &conn->unidi_monitors[i];
-            if (monitor->state != TREV_H3_UNIDI_MONITOR_LIVE || monitor->install_pending || monitor->processing) {
+            if (monitor->state != TREV_H3_UNIDI_MONITOR_LIVE || monitor->install_pending || monitor->processing ||
+                monitor->classifier.phase == TREV_H3_DEMUX_READY) {
                 continue;
             }
             uint64_t value = monitor->deadline_nanos <= now ? 0 : monitor->deadline_nanos - now;
@@ -1696,6 +1691,14 @@ static void* trevrpc_h3_unidi_pump(void* context) {
         if (result == TREV_H3_UNIDI_PROCESS_PENDING) {
             pthread_mutex_lock(&conn->mutex);
             if (monitor->state == TREV_H3_UNIDI_MONITOR_LIVE) {
+#ifdef TREVRPC_H3_FRAME_POLICY_TESTING
+                if (monitor->classifier.phase == TREV_H3_DEMUX_READY &&
+                    (monitor->classifier.action == TREV_H3_DEMUX_ACTION_QPACK_ENCODER ||
+                        monitor->classifier.action == TREV_H3_DEMUX_ACTION_QPACK_DECODER)) {
+                    conn->unidi_qpack_pending_count++;
+                    pthread_cond_broadcast(&conn->unidi_cond);
+                }
+#endif
                 monitor->processing = false;
             }
             pthread_mutex_unlock(&conn->mutex);
@@ -1768,6 +1771,7 @@ static int trevrpc_h3_start_unidi_monitor(trevrpc_h3_conn* conn, trevrpc_msquic_
         monitor->install_pending = false;
         if (err == 0) {
             monitor->observer_installed = true;
+            monitor->pending_flags |= TREV_MSQUIC_STREAM_OBSERVER_READABLE;
 #ifdef TREVRPC_H3_FRAME_POLICY_TESTING
             conn->unidi_started_count++;
 #endif
