@@ -58,6 +58,7 @@
 #define H3_PENDING_OPEN_CONNECT 0x00000080u
 #define H3_PENDING_ACCEPT_CONNECT 0x00000100u
 #define H3_PENDING_REEMIT_READABLE 0x00000200u
+#define H3_PENDING_ACCEPT_REQUEST 0x00000400u
 
 typedef struct h3_entry h3_entry;
 typedef struct h3_source h3_source;
@@ -203,6 +204,7 @@ struct h3_entry {
      * are queued.  This makes completion and terminal publication allocation
      * free. */
     trevrpc_rpc_transport_event* ready_event;
+    trevrpc_rpc_transport_event* accepted_event;
     trevrpc_rpc_transport_event* terminal_event;
     trevrpc_rpc_transport_event* fin_event;
     trevrpc_rpc_transport_event* send_stop_event;
@@ -583,12 +585,14 @@ static h3_entry* h3_alloc_entry_locked(
          * are only used by streams, but reserving them here keeps admission
          * uniform. */
         entry->ready_event = h3_mandatory_event_alloc(source);
+        entry->accepted_event = h3_mandatory_event_alloc(source);
         entry->terminal_event = h3_mandatory_event_alloc(source);
         entry->fin_event = h3_mandatory_event_alloc(source);
         entry->send_stop_event = h3_mandatory_event_alloc(source);
-        if (entry->ready_event == NULL || entry->terminal_event == NULL || entry->fin_event == NULL ||
-            entry->send_stop_event == NULL) {
+        if (entry->ready_event == NULL || entry->accepted_event == NULL || entry->terminal_event == NULL ||
+            entry->fin_event == NULL || entry->send_stop_event == NULL) {
             h3_mandatory_event_free(source, &entry->ready_event);
+            h3_mandatory_event_free(source, &entry->accepted_event);
             h3_mandatory_event_free(source, &entry->terminal_event);
             h3_mandatory_event_free(source, &entry->fin_event);
             h3_mandatory_event_free(source, &entry->send_stop_event);
@@ -953,9 +957,9 @@ static int h3_emit_locked(h3_source* source,
     bool mandatory =
         (flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL) != 0 || kind == TREVRPC_RPC_TRANSPORT_EVENT_STOPPED ||
         kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE || kind == TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN ||
-        kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED || kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY ||
-        kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_FAILED || kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY ||
-        kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_FAILED;
+        kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED || kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_ACCEPTED ||
+        kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY || kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_FAILED ||
+        kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY || kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_FAILED;
     info.kind = kind;
     info.flags = flags;
     info.status = status;
@@ -981,6 +985,11 @@ static int h3_emit_locked(h3_source* source,
         if (owner == NULL)
             owner = h3_find_retired_locked(source, subject);
         reserved_event = owner != NULL ? owner->send_stop_event : NULL;
+    } else if (kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_ACCEPTED) {
+        owner = h3_find_any_locked(source, subject);
+        if (owner == NULL)
+            owner = h3_find_retired_locked(source, subject);
+        reserved_event = owner != NULL ? owner->accepted_event : NULL;
     } else if (object_terminal) {
         terminal_entry = h3_find_any_locked(source, subject);
         if (terminal_entry == NULL)
@@ -1028,6 +1037,8 @@ static int h3_emit_locked(h3_source* source,
                     owner->fin_event = NULL;
                 else if (kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED)
                     owner->send_stop_event = NULL;
+                else if (kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_ACCEPTED)
+                    owner->accepted_event = NULL;
                 else if (object_terminal)
                     owner->terminal_event = NULL;
                 else if (owner->ready_event == reserved_event)
@@ -1251,7 +1262,12 @@ static void h3_schedule_connection_waiters_locked(h3_source* source, const h3_en
         if (entry->live && entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM && entry->parent.owner == parent.owner &&
             entry->parent.slot == parent.slot && entry->parent.generation == parent.generation &&
             entry->stream.headers_received) {
-            h3_maybe_emit_stream_ready_locked(source, entry);
+            if ((entry->side_flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) != 0 && !entry->stream.connect_control &&
+                !entry->stream.admission_pending && !entry->stream.headers_sent) {
+                entry->pending |= H3_PENDING_ACCEPT_REQUEST;
+            } else {
+                h3_maybe_emit_stream_ready_locked(source, entry);
+            }
             entry->pending |= H3_PENDING_READABLE;
         }
     }
@@ -2582,7 +2598,20 @@ static int h3_parse_stream_locked(h3_source* source, h3_entry* entry, const uint
                     h3_maybe_emit_connection_ready_locked(connection);
                     h3_schedule_waiting_wt_locked(source, connection);
                 } else if ((entry->side_flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) != 0 && !defer_admission) {
-                    h3_maybe_emit_stream_ready_locked(source, entry);
+                    if (connection->ready_reported) {
+                        entry->pending |= H3_PENDING_ACCEPT_REQUEST;
+                        h3_signal_locked(source);
+                    }
+                } else if ((entry->side_flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL) != 0) {
+                    (void)h3_emit_locked(source,
+                        TREVRPC_RPC_TRANSPORT_EVENT_STREAM_ACCEPTED,
+                        entry->side_flags,
+                        0,
+                        TREVRPC_RPC_TRANSPORT_OBJECT_STREAM,
+                        h3_handle(entry),
+                        entry->parent,
+                        entry->operation_id,
+                        0);
                 }
                 if (defer_admission) {
                     result = h3_publish_admission_locked(source, entry, connection, admission_event, is_connect);
@@ -2909,6 +2938,54 @@ static int h3_accept_connect(h3_source* source, h3_entry* stream) {
     return result;
 }
 
+static int h3_accept_request(h3_source* source, h3_entry* stream) {
+    trevrpc_msquic_stream* object = NULL;
+    int result;
+
+    pthread_mutex_lock(&source->mutex);
+    if (!stream->live || stream->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM ||
+        (stream->side_flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) == 0 || stream->stream.connect_control ||
+        stream->stream.admission_pending || !stream->stream.headers_received || stream->stream.headers_sent ||
+        stream->stream.headers_sending) {
+        pthread_mutex_unlock(&source->mutex);
+        return -EPROTO;
+    }
+    if (h3_pin_object_locked(source, stream, (void**)&object) != 0) {
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+        if (stream->object == NULL) {
+            stream->stream.headers_sent = true;
+            h3_maybe_emit_stream_ready_locked(source, stream);
+            stream->pending |= H3_PENDING_READABLE;
+            h3_signal_locked(source);
+            pthread_mutex_unlock(&source->mutex);
+            return 0;
+        }
+#endif
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    stream->stream.headers_sending = true;
+    pthread_mutex_unlock(&source->mutex);
+
+    result = h3_send_response_headers(stream);
+
+    pthread_mutex_lock(&source->mutex);
+    h3_unpin_object_locked(source, stream);
+    stream->stream.headers_sending = false;
+    if (result == -EAGAIN && stream->live) {
+        stream->pending |= H3_PENDING_ACCEPT_REQUEST;
+        h3_signal_locked(source);
+        result = 0;
+    } else if (result == 0 && stream->live) {
+        stream->stream.headers_sent = true;
+        h3_maybe_emit_stream_ready_locked(source, stream);
+        stream->pending |= H3_PENDING_READABLE;
+        h3_signal_locked(source);
+    }
+    pthread_mutex_unlock(&source->mutex);
+    return result;
+}
+
 static int h3_process_stream_readable(h3_source* source, h3_entry* entry) {
     uint8_t buffer[16384];
     trevrpc_msquic_stream* stream = NULL;
@@ -3147,6 +3224,8 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
     }
     if ((pending & H3_PENDING_ACCEPT_CONNECT) != 0 && entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM)
         stream_error = h3_accept_connect(source, entry);
+    if ((pending & H3_PENDING_ACCEPT_REQUEST) != 0 && entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM)
+        stream_error = h3_accept_request(source, entry);
     if (pending & H3_PENDING_START) {
         bool start_needed;
         pthread_mutex_lock(&source->mutex);
@@ -4866,6 +4945,7 @@ static void h3_free_entry_mode(h3_entry* entry, bool force_stream_close) {
         h3_close_entry_object_mode(entry, force_stream_close);
     }
     h3_mandatory_event_free(entry->source, &entry->ready_event);
+    h3_mandatory_event_free(entry->source, &entry->accepted_event);
     h3_mandatory_event_free(entry->source, &entry->terminal_event);
     h3_mandatory_event_free(entry->source, &entry->fin_event);
     h3_mandatory_event_free(entry->source, &entry->send_stop_event);

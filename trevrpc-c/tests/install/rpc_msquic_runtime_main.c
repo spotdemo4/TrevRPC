@@ -4,6 +4,8 @@
 #include <poll.h>
 #include <stdbool.h>
 
+_Static_assert(TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS == 0x00000004u, "MsQuic admission events flag");
+
 int main(void) {
     trevrpc_rpc_runtime_config_v1 runtime_config;
     trevrpc_rpc_msquic_config_v1 provider_config;

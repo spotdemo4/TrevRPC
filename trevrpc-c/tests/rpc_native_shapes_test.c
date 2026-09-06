@@ -236,6 +236,37 @@ static void release_waited(trevrpc_rpc_event* event) {
     trevrpc_rpc_event_release(event);
 }
 
+#if TREVRPC_RPC_TEST_TRANSPORT != TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE
+static uint64_t accept_admission(harness* state, uint32_t expected_event, uint32_t expected_protocol) {
+    trevrpc_rpc_admission_info_v1 admission;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_event* event = wait_kind_operation(state, expected_event, 0, &info);
+    uint64_t sequence = info.sequence;
+
+    assert(trevrpc_rpc_admission_info_v1_init(&admission, sizeof(admission)) == 0);
+    assert(trevrpc_rpc_event_get_admission_info_v1(event, &admission) == 0);
+    assert(admission.protocol == expected_protocol);
+    assert((admission.flags & TREVRPC_RPC_ADMISSION_FLAG_SECURE) != 0);
+    assert(handle_equal(admission.listener.owner,
+        admission.listener.slot,
+        admission.listener.generation,
+        state->listener.owner,
+        state->listener.slot,
+        state->listener.generation));
+    assert(admission.path_len == strlen("/rpc"));
+    assert(memcmp(admission.path, "/rpc", admission.path_len) == 0);
+    assert(admission.authority != NULL);
+    assert(admission.authority_len != 0);
+    if (expected_protocol == TREVRPC_RPC_ADMISSION_PROTOCOL_WEBTRANSPORT) {
+        assert(admission.origin_len == strlen("https://127.0.0.1"));
+        assert(memcmp(admission.origin, "https://127.0.0.1", admission.origin_len) == 0);
+    }
+    assert(trevrpc_rpc_admission_respond_v1(event, 200) == 0);
+    release_waited(event);
+    return sequence;
+}
+#endif
+
 static void setup_harness(harness* state) {
     trevrpc_rpc_runtime_config_v1 runtime_config;
     trevrpc_rpc_msquic_config_v1 provider_config;
@@ -243,6 +274,9 @@ static void setup_harness(harness* state) {
     trevrpc_rpc_msquic_endpoint_config_v1 client_config;
     trevrpc_rpc_event_info_v1 info;
     trevrpc_rpc_event* event;
+#if TREVRPC_RPC_TEST_TRANSPORT == TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT
+    uint64_t admission_sequence;
+#endif
     uint16_t port = 0;
 
     memset(state, 0, sizeof(*state));
@@ -259,6 +293,21 @@ static void setup_harness(harness* state) {
         listener_config.webtransport_profiles = test_webtransport_profiles;
     listener_config.host = "127.0.0.1";
     listener_config.host_len = (uint32_t)strlen(listener_config.host);
+    listener_config.path = "/rpc";
+    listener_config.path_len = (uint32_t)strlen(listener_config.path);
+    listener_config.origin = "https://127.0.0.1";
+    listener_config.origin_len = (uint32_t)strlen(listener_config.origin);
+    {
+        trevrpc_rpc_msquic_endpoint_config_v1 invalid_config = listener_config;
+        invalid_config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_AUTO;
+        invalid_config.flags |= TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS;
+        assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &invalid_config, 999, &state->listener) == -EINVAL);
+        invalid_config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE;
+        assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &invalid_config, 999, &state->listener) == -EINVAL);
+    }
+#if TREVRPC_RPC_TEST_TRANSPORT != TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE
+    listener_config.flags |= TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS;
+#endif
     listener_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
     listener_config.cert_file_len = (uint32_t)strlen(listener_config.cert_file);
     listener_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
@@ -285,9 +334,26 @@ static void setup_harness(harness* state) {
     client_config.host = "127.0.0.1";
     client_config.host_len = (uint32_t)strlen(client_config.host);
     client_config.port = port;
+    client_config.path = "/rpc";
+    client_config.path_len = (uint32_t)strlen(client_config.path);
+    client_config.origin = "https://127.0.0.1";
+    client_config.origin_len = (uint32_t)strlen(client_config.origin);
     client_config.flags &= ~TREVRPC_RPC_MSQUIC_VERIFY_PEER;
+    {
+        trevrpc_rpc_msquic_endpoint_config_v1 invalid_config = client_config;
+        invalid_config.flags |= TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS;
+        assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &invalid_config, 999, &state->client_endpoint) ==
+               -EINVAL);
+    }
     assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &client_config, 2, &state->client_endpoint) == 0);
+#if TREVRPC_RPC_TEST_TRANSPORT == TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT
+    admission_sequence =
+        accept_admission(state, TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION, TREVRPC_RPC_ADMISSION_PROTOCOL_WEBTRANSPORT);
+#endif
     event = wait_kind_operation(state, TREVRPC_RPC_EVENT_ENDPOINT_READY, 2, &info);
+#if TREVRPC_RPC_TEST_TRANSPORT == TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT
+    assert(info.sequence > admission_sequence);
+#endif
     release_waited(event);
 }
 
@@ -297,6 +363,9 @@ static call_pair open_call(harness* state, uint32_t kind, const char* method, ui
     trevrpc_rpc_receive_info_v1 receive_info;
     trevrpc_rpc_receive* receive = NULL;
     trevrpc_rpc_event* event;
+#if TREVRPC_RPC_TEST_TRANSPORT == TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3
+    uint64_t admission_sequence;
+#endif
     call_pair pair = {0};
 
     assert(trevrpc_rpc_call_config_v1_init(&config, sizeof(config)) == 0);
@@ -310,7 +379,14 @@ static call_pair open_call(harness* state, uint32_t kind, const char* method, ui
     assert(trevrpc_rpc_call_open_v1(
                state->runtime, state->client_endpoint, &config, operation_id, &pair.client_call, &pair.client_stream) ==
            0);
+#if TREVRPC_RPC_TEST_TRANSPORT == TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3
+    admission_sequence =
+        accept_admission(state, TREVRPC_RPC_EVENT_HTTP3_ADMISSION, TREVRPC_RPC_ADMISSION_PROTOCOL_HTTP3);
+#endif
     event = wait_kind_operation(state, TREVRPC_RPC_EVENT_CALL_READY, operation_id, &info);
+#if TREVRPC_RPC_TEST_TRANSPORT == TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3
+    assert(info.sequence > admission_sequence);
+#endif
     assert(handle_equal(info.call.owner,
         info.call.slot,
         info.call.generation,

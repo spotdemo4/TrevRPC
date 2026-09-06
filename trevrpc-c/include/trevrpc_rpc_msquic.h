@@ -29,6 +29,7 @@ extern "C" {
 
 #define TREVRPC_RPC_MSQUIC_VERIFY_PEER 0x00000001u
 #define TREVRPC_RPC_MSQUIC_REQUIRE_CLIENT_CERTIFICATE 0x00000002u
+#define TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS 0x00000004u
 
 typedef struct trevrpc_rpc_msquic_config_v1 {
     uint32_t struct_size;

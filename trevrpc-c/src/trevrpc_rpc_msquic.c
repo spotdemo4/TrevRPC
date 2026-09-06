@@ -88,7 +88,12 @@ static int trevrpc_rpc_msquic_validate_endpoint_config(const trevrpc_rpc_msquic_
     }
     if ((config->mode != TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER && config->mode != TREVRPC_RPC_MSQUIC_ENDPOINT_CLIENT) ||
         config->transport > TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT ||
-        (config->flags & ~(TREVRPC_RPC_MSQUIC_VERIFY_PEER | TREVRPC_RPC_MSQUIC_REQUIRE_CLIENT_CERTIFICATE)) != 0 ||
+        (config->flags & ~(TREVRPC_RPC_MSQUIC_VERIFY_PEER | TREVRPC_RPC_MSQUIC_REQUIRE_CLIENT_CERTIFICATE |
+                             TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS)) != 0 ||
+        ((config->flags & TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS) != 0 &&
+            (config->mode != TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER ||
+                (config->transport != TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3 &&
+                    config->transport != TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT))) ||
         config->reserved0 != 0 || config->reserved1 != 0 || config->reserved2 != 0 ||
         (config->host == NULL && config->host_len != 0) ||
         (config->server_name == NULL && config->server_name_len != 0) ||
@@ -218,6 +223,9 @@ int trevrpc_rpc_msquic_endpoint_start_v1(trevrpc_rpc_runtime* runtime,
     transport_config.unresolved_stream_timeout_ms = config->unresolved_stream_timeout_ms;
     if ((config->flags & TREVRPC_RPC_MSQUIC_VERIFY_PEER) == 0) {
         transport_config.flags |= TREVRPC_RPC_TRANSPORT_ENDPOINT_SKIP_CERTIFICATE_VALIDATION;
+    }
+    if ((config->flags & TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS) != 0) {
+        transport_config.flags |= TREVRPC_RPC_TRANSPORT_ENDPOINT_DEFER_ADMISSION;
     }
     return trevrpc_rpc_runtime_start_transport_endpoint_v1(runtime,
         &transport_config,

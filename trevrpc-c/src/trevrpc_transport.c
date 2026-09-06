@@ -267,9 +267,30 @@ int trevrpc_transport_poll_timeout_ms(trevrpc_transport* transport) {
 }
 
 int trevrpc_transport_next_event(trevrpc_transport* transport, trevrpc_transport_event_v1** out_event) {
-    return transport == NULL || out_event == NULL
-               ? -EINVAL
-               : trevrpc_transport_normalize_result(trevrpc_rpc_transport_next_event(transport, out_event));
+    trevrpc_rpc_transport_event_info info;
+    int result;
+    if (transport == NULL || out_event == NULL) {
+        return -EINVAL;
+    }
+    for (;;) {
+        result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_next_event(transport, out_event));
+        if (result != 0 || *out_event == NULL) {
+            return result;
+        }
+        result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_event_get_info(transport, *out_event, &info));
+        if (result != 0) {
+            trevrpc_rpc_transport_event_release(transport, *out_event);
+            *out_event = NULL;
+            return result;
+        }
+        if (info.kind != TREVRPC_RPC_TRANSPORT_EVENT_STREAM_ACCEPTED) {
+            return 0;
+        }
+        /* This event coordinates the RPC runtime with HTTP/3 and is not part of
+         * the canonical Transport ABI event vocabulary. */
+        trevrpc_rpc_transport_event_release(transport, *out_event);
+        *out_event = NULL;
+    }
 }
 
 int trevrpc_transport_event_get_info_v1(

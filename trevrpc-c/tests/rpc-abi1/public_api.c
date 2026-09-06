@@ -17,19 +17,31 @@
             return 1;                                                                                                  \
     } while (0)
 
+_Static_assert(TREVRPC_RPC_EVENT_HTTP3_ADMISSION == 18u, "HTTP/3 admission event");
+_Static_assert(TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION == 19u, "WebTransport admission event");
+_Static_assert(TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE == 1u, "call context deadline flag");
+_Static_assert(TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED == 2u, "call context expired flag");
+_Static_assert(TREVRPC_RPC_CALL_CONTEXT_CANCELLED == 4u, "call context cancelled flag");
+_Static_assert(TREVRPC_RPC_ADMISSION_PROTOCOL_HTTP3 == 1u, "HTTP/3 admission protocol");
+_Static_assert(TREVRPC_RPC_ADMISSION_PROTOCOL_WEBTRANSPORT == 2u, "WebTransport admission protocol");
+_Static_assert(TREVRPC_RPC_ADMISSION_FLAG_SECURE == 1u, "secure admission flag");
+
 LAYOUT(trevrpc_rpc_endpoint_v1, 16, 8);
 LAYOUT(trevrpc_rpc_call_v1, 16, 8);
 LAYOUT(trevrpc_rpc_stream_v1, 16, 8);
 LAYOUT(trevrpc_rpc_cancellation_v1, 16, 8);
-LAYOUT(trevrpc_rpc_runtime_config_v1, 96, 8);
+LAYOUT(trevrpc_rpc_runtime_config_v1, 128, 8);
 LAYOUT(trevrpc_rpc_wake_source_v1, 48, 8);
 LAYOUT(trevrpc_rpc_metadata_entry_v1, 32, 8);
-LAYOUT(trevrpc_rpc_call_config_v1, 120, 8);
+LAYOUT(trevrpc_rpc_call_config_v1, 152, 8);
+LAYOUT(trevrpc_rpc_call_context_info_v1, 56, 8);
+LAYOUT(trevrpc_rpc_admission_info_v1, 112, 8);
 LAYOUT(trevrpc_rpc_status_v1, 72, 8);
 LAYOUT(trevrpc_rpc_event_info_v1, 192, 8);
 LAYOUT(trevrpc_rpc_receive_info_v1, 96, 8);
 LAYOUT(trevrpc_rpc_diagnostics_v1, 208, 8);
 #ifdef TREVRPC_RPC_TEST_MSQUIC
+_Static_assert(TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS == 0x00000004u, "MsQuic admission events flag");
 LAYOUT(trevrpc_rpc_msquic_config_v1, 64, 8);
 LAYOUT(trevrpc_rpc_msquic_endpoint_config_v1, 296, 8);
 #endif
@@ -56,7 +68,11 @@ OFFSET(trevrpc_rpc_runtime_config_v1, max_status_message_size, 36);
 OFFSET(trevrpc_rpc_runtime_config_v1, max_receive_owned_bytes, 40);
 OFFSET(trevrpc_rpc_runtime_config_v1, max_message_size, 48);
 OFFSET(trevrpc_rpc_runtime_config_v1, max_metadata_bytes, 56);
-OFFSET(trevrpc_rpc_runtime_config_v1, reserved, 64);
+OFFSET(trevrpc_rpc_runtime_config_v1, initial_request_timeout_nanos, 64);
+OFFSET(trevrpc_rpc_runtime_config_v1, max_stream_messages, 72);
+OFFSET(trevrpc_rpc_runtime_config_v1, max_stream_body_size, 80);
+OFFSET(trevrpc_rpc_runtime_config_v1, stream_idle_timeout_nanos, 88);
+OFFSET(trevrpc_rpc_runtime_config_v1, reserved, 96);
 
 OFFSET(trevrpc_rpc_wake_source_v1, struct_size, 0);
 OFFSET(trevrpc_rpc_wake_source_v1, struct_version, 4);
@@ -86,7 +102,31 @@ OFFSET(trevrpc_rpc_call_config_v1, timeout_nanos, 56);
 OFFSET(trevrpc_rpc_call_config_v1, cancellation, 64);
 OFFSET(trevrpc_rpc_call_config_v1, initial_message, 80);
 OFFSET(trevrpc_rpc_call_config_v1, initial_message_len, 88);
-OFFSET(trevrpc_rpc_call_config_v1, reserved, 96);
+OFFSET(trevrpc_rpc_call_config_v1, max_response_body_size, 96);
+OFFSET(trevrpc_rpc_call_config_v1, max_response_messages, 104);
+OFFSET(trevrpc_rpc_call_config_v1, max_response_stream_body_size, 112);
+OFFSET(trevrpc_rpc_call_config_v1, response_idle_timeout_nanos, 120);
+OFFSET(trevrpc_rpc_call_config_v1, reserved, 128);
+
+OFFSET(trevrpc_rpc_call_context_info_v1, struct_size, 0);
+OFFSET(trevrpc_rpc_call_context_info_v1, struct_version, 4);
+OFFSET(trevrpc_rpc_call_context_info_v1, flags, 8);
+OFFSET(trevrpc_rpc_call_context_info_v1, reserved0, 12);
+OFFSET(trevrpc_rpc_call_context_info_v1, time_remaining_nanos, 16);
+OFFSET(trevrpc_rpc_call_context_info_v1, reserved, 24);
+
+OFFSET(trevrpc_rpc_admission_info_v1, struct_size, 0);
+OFFSET(trevrpc_rpc_admission_info_v1, struct_version, 4);
+OFFSET(trevrpc_rpc_admission_info_v1, protocol, 8);
+OFFSET(trevrpc_rpc_admission_info_v1, flags, 12);
+OFFSET(trevrpc_rpc_admission_info_v1, listener, 16);
+OFFSET(trevrpc_rpc_admission_info_v1, path, 32);
+OFFSET(trevrpc_rpc_admission_info_v1, path_len, 40);
+OFFSET(trevrpc_rpc_admission_info_v1, authority, 48);
+OFFSET(trevrpc_rpc_admission_info_v1, authority_len, 56);
+OFFSET(trevrpc_rpc_admission_info_v1, origin, 64);
+OFFSET(trevrpc_rpc_admission_info_v1, origin_len, 72);
+OFFSET(trevrpc_rpc_admission_info_v1, reserved, 80);
 
 OFFSET(trevrpc_rpc_status_v1, struct_size, 0);
 OFFSET(trevrpc_rpc_status_v1, struct_version, 4);
@@ -226,6 +266,8 @@ static int check_signatures(void) {
     SIGNATURE(trevrpc_rpc_runtime_config_v1_init, int, trevrpc_rpc_runtime_config_v1*, size_t);
     SIGNATURE(trevrpc_rpc_wake_source_v1_init, int, trevrpc_rpc_wake_source_v1*, size_t);
     SIGNATURE(trevrpc_rpc_call_config_v1_init, int, trevrpc_rpc_call_config_v1*, size_t);
+    SIGNATURE(trevrpc_rpc_call_context_info_v1_init, int, trevrpc_rpc_call_context_info_v1*, size_t);
+    SIGNATURE(trevrpc_rpc_admission_info_v1_init, int, trevrpc_rpc_admission_info_v1*, size_t);
     SIGNATURE(trevrpc_rpc_status_v1_init, int, trevrpc_rpc_status_v1*, size_t);
     SIGNATURE(trevrpc_rpc_event_info_v1_init, int, trevrpc_rpc_event_info_v1*, size_t);
     SIGNATURE(trevrpc_rpc_receive_info_v1_init, int, trevrpc_rpc_receive_info_v1*, size_t);
@@ -233,6 +275,8 @@ static int check_signatures(void) {
     SIGNATURE(trevrpc_rpc_runtime_get_wake_source_v1, int, trevrpc_rpc_runtime*, trevrpc_rpc_wake_source_v1*);
     SIGNATURE(trevrpc_rpc_runtime_next_event, int, trevrpc_rpc_runtime*, trevrpc_rpc_event**);
     SIGNATURE(trevrpc_rpc_event_get_info_v1, int, const trevrpc_rpc_event*, trevrpc_rpc_event_info_v1*);
+    SIGNATURE(trevrpc_rpc_event_get_admission_info_v1, int, const trevrpc_rpc_event*, trevrpc_rpc_admission_info_v1*);
+    SIGNATURE(trevrpc_rpc_admission_respond_v1, int, const trevrpc_rpc_event*, uint16_t);
     SIGNATURE(trevrpc_rpc_event_take_incoming_call,
         int,
         trevrpc_rpc_event*,
@@ -243,6 +287,11 @@ static int check_signatures(void) {
     SIGNATURE(trevrpc_rpc_receive_get_info_v1, int, const trevrpc_rpc_receive*, trevrpc_rpc_receive_info_v1*);
     SIGNATURE(trevrpc_rpc_receive_release, void, trevrpc_rpc_receive*);
     SIGNATURE(trevrpc_rpc_runtime_get_diagnostics_v1, int, trevrpc_rpc_runtime*, trevrpc_rpc_diagnostics_v1*);
+    SIGNATURE(trevrpc_rpc_call_get_context_v1,
+        int,
+        trevrpc_rpc_runtime*,
+        trevrpc_rpc_call_v1,
+        trevrpc_rpc_call_context_info_v1*);
     SIGNATURE(trevrpc_rpc_endpoint_get_port_v1, int, trevrpc_rpc_runtime*, trevrpc_rpc_endpoint_v1, uint16_t*);
     SIGNATURE(trevrpc_rpc_call_open_v1,
         int,
@@ -314,6 +363,8 @@ int main(void) {
     trevrpc_rpc_runtime_config_v1 runtime_config;
     trevrpc_rpc_wake_source_v1 wake_source;
     trevrpc_rpc_call_config_v1 call_config;
+    trevrpc_rpc_call_context_info_v1 call_context_info;
+    trevrpc_rpc_admission_info_v1 admission_info;
     trevrpc_rpc_status_v1 status;
     trevrpc_rpc_event_info_v1 event_info;
     trevrpc_rpc_receive_info_v1 receive_info;
@@ -327,6 +378,8 @@ int main(void) {
         trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) != 0 ||
         trevrpc_rpc_wake_source_v1_init(&wake_source, sizeof(wake_source)) != 0 ||
         trevrpc_rpc_call_config_v1_init(&call_config, sizeof(call_config)) != 0 ||
+        trevrpc_rpc_call_context_info_v1_init(&call_context_info, sizeof(call_context_info)) != 0 ||
+        trevrpc_rpc_admission_info_v1_init(&admission_info, sizeof(admission_info)) != 0 ||
         trevrpc_rpc_status_v1_init(&status, sizeof(status)) != 0 ||
         trevrpc_rpc_event_info_v1_init(&event_info, sizeof(event_info)) != 0 ||
         trevrpc_rpc_receive_info_v1_init(&receive_info, sizeof(receive_info)) != 0 ||
@@ -343,7 +396,12 @@ int main(void) {
     return runtime_config.max_metadata_count == TREVRPC_RPC_DEFAULT_MAX_METADATA_COUNT &&
                    runtime_config.max_metadata_bytes == TREVRPC_RPC_DEFAULT_MAX_METADATA_BYTES &&
                    runtime_config.max_status_message_size == TREVRPC_RPC_DEFAULT_MAX_STATUS_MESSAGE_SIZE &&
-                   call_config.timeout_nanos == TREVRPC_RPC_DEADLINE_INFINITE && status.code == TREVRPC_RPC_STATUS_OK
+                   runtime_config.initial_request_timeout_nanos == 0 && runtime_config.max_stream_messages == -1 &&
+                   runtime_config.max_stream_body_size == -1 && runtime_config.stream_idle_timeout_nanos == 0 &&
+                   call_config.timeout_nanos == TREVRPC_RPC_DEADLINE_INFINITE &&
+                   call_config.max_response_body_size == -1 && call_config.max_response_messages == -1 &&
+                   call_config.max_response_stream_body_size == -1 && call_config.response_idle_timeout_nanos == 0 &&
+                   status.code == TREVRPC_RPC_STATUS_OK
 #ifdef TREVRPC_RPC_TEST_MSQUIC
                    && endpoint_config.webtransport_profiles == TREVRPC_RPC_MSQUIC_PROFILE_ALL_SUPPORTED
 #endif

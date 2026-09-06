@@ -27,6 +27,19 @@ static void* rpc_receive_thread(void* context) {
     return NULL;
 }
 
+typedef struct endpoint_close_args {
+    trevrpc_rpc_runtime* runtime;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    uint64_t operation_id;
+    int result;
+} endpoint_close_args;
+
+static void* endpoint_close_thread(void* context) {
+    endpoint_close_args* args = context;
+    args->result = trevrpc_rpc_endpoint_close(args->runtime, args->endpoint, args->operation_id);
+    return NULL;
+}
+
 static trevrpc_rpc_event* wait_next_event(trevrpc_rpc_runtime* runtime, const trevrpc_rpc_wake_source_v1* wake) {
     int attempt;
     for (attempt = 0; attempt < 1000; ++attempt) {
@@ -163,6 +176,122 @@ static void setup_client_call(fake_transport* fake,
         assert(poll(NULL, 0, 1) >= 0);
     }
     assert(false);
+}
+
+static void setup_ready_client_call_with_config(fake_transport* fake,
+    const trevrpc_rpc_runtime_config_v1* runtime_config,
+    trevrpc_rpc_call_config_v1* call_config,
+    trevrpc_rpc_runtime** out_runtime,
+    trevrpc_rpc_wake_source_v1* wake,
+    trevrpc_rpc_endpoint_v1* endpoint,
+    trevrpc_rpc_call_v1* call,
+    trevrpc_rpc_stream_v1* stream) {
+    trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+    trevrpc_rpc_event* event;
+    int attempt;
+
+    assert(trevrpc_rpc_runtime_adopt_transport_v1(runtime_config, &fake->base, out_runtime) == 0);
+    assert(trevrpc_rpc_wake_source_v1_init(wake, sizeof(*wake)) == 0);
+    assert(trevrpc_rpc_runtime_get_wake_source_v1(*out_runtime, wake) == 0);
+    assert(trevrpc_rpc_runtime_start_transport_endpoint_v1(
+               *out_runtime, &endpoint_config, TREVRPC_RPC_ENDPOINT_CLIENT, 1, endpoint) == 0);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+               fake_connection_handle,
+               (trevrpc_rpc_transport_handle){0}) == 0);
+    consume_endpoint_ready(*out_runtime, wake, *endpoint);
+    assert(trevrpc_rpc_call_open_v1(*out_runtime, *endpoint, call_config, 2, call, stream) == 0);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+               fake_stream_handle,
+               fake_connection_handle) == 0);
+    for (attempt = 0; attempt < 1000; ++attempt) {
+        if (atomic_load_explicit(&fake->stream_send_calls, memory_order_acquire) == 1) {
+            break;
+        }
+        assert(poll(NULL, 0, 1) >= 0);
+    }
+    assert(attempt != 1000);
+    assert(fake_push_operation_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+               fake_stream_handle,
+               fake_connection_handle,
+               2) == 0);
+    event = wait_next_event(*out_runtime, wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_READY);
+    trevrpc_rpc_event_release(event);
+}
+
+static void setup_accepted_peer_call(fake_transport* fake,
+    const trevrpc_rpc_runtime_config_v1* runtime_config,
+    uint32_t kind,
+    trevrpc_rpc_runtime** out_runtime,
+    trevrpc_rpc_wake_source_v1* wake,
+    trevrpc_rpc_endpoint_v1* endpoint,
+    trevrpc_rpc_call_v1* call,
+    trevrpc_rpc_stream_v1* stream) {
+    trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_receive* receive = NULL;
+    uint8_t* request = NULL;
+    size_t request_len = 0;
+
+    assert(trevrpc_rpc_runtime_adopt_transport_v1(runtime_config, &fake->base, out_runtime) == 0);
+    assert(trevrpc_rpc_wake_source_v1_init(wake, sizeof(*wake)) == 0);
+    assert(trevrpc_rpc_runtime_get_wake_source_v1(*out_runtime, wake) == 0);
+    assert(trevrpc_rpc_runtime_start_transport_endpoint_v1(
+               *out_runtime, &endpoint_config, TREVRPC_RPC_ENDPOINT_SERVER, 1, endpoint) == 0);
+    consume_endpoint_ready(*out_runtime, wake, *endpoint);
+    make_request_kind("ServerLimit", kind, TREVRPC_RPC_DEADLINE_INFINITE, &request, &request_len);
+    assert(fake_push_receive(fake, request, request_len) == 0);
+    free(request);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
+               fake_stream_handle,
+               fake_listener_handle) == 0);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
+               fake_stream_handle,
+               fake_listener_handle) == 0);
+    event = wait_next_event(*out_runtime, wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_INCOMING);
+    assert(trevrpc_rpc_event_take_incoming_call(event, call, stream, &receive) == 0);
+    trevrpc_rpc_receive_release(receive);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_call_accept(*out_runtime, *call, 2) == 0);
+    event = wait_next_event(*out_runtime, wake);
+    if (event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_READABLE) {
+        trevrpc_rpc_event_release(event);
+        event = wait_next_event(*out_runtime, wake);
+    }
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_ACCEPTED);
+    trevrpc_rpc_event_release(event);
+}
+
+static void close_ready_client_call(trevrpc_rpc_runtime* runtime,
+    const trevrpc_rpc_wake_source_v1* wake,
+    trevrpc_rpc_endpoint_v1 endpoint,
+    trevrpc_rpc_call_v1 call,
+    trevrpc_rpc_stream_v1 stream) {
+    trevrpc_rpc_event* event;
+    assert(trevrpc_rpc_stream_release(runtime, stream) == 0);
+    assert(trevrpc_rpc_call_release(runtime, call) == 0);
+    assert(trevrpc_rpc_endpoint_close(runtime, endpoint, 3) == 0);
+    event = wait_next_event(runtime, wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_endpoint_release(runtime, endpoint) == 0);
+    assert(trevrpc_rpc_runtime_close(runtime, 4) == 0);
+    event = wait_next_event(runtime, wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STOPPED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_runtime_drain(runtime) == 0);
+    assert(trevrpc_rpc_runtime_release(runtime) == 0);
 }
 
 static void wait_for_receive_terminals_processed(fake_transport* fake) {
@@ -1621,6 +1750,7 @@ static void run_outgoing_deadline_before_stream_ready(void) {
     trevrpc_rpc_stream_v1 stream;
     trevrpc_rpc_event* event;
     trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_call_context_info_v1 context;
     fake_transport* fake = fake_create();
 
     assert(trevrpc_rpc_runtime_config_v1_init(&config, sizeof(config)) == 0);
@@ -1647,10 +1777,26 @@ static void run_outgoing_deadline_before_stream_ready(void) {
     call_config.initial_message = (const uint8_t*)"request";
     call_config.initial_message_len = strlen("request");
     assert(trevrpc_rpc_call_open_v1(runtime, endpoint, &call_config, 2, &call, &stream) == 0);
+    assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE) != 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED) == 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) == 0);
+    assert(context.time_remaining_nanos != 0);
+    context.reserved0 = 1;
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == -EINVAL);
+    context.reserved0 = 0;
 
     event = wait_next_event(runtime, &wake);
     info = event_info(event);
     assert(info.kind == TREVRPC_RPC_EVENT_CALL_FAILED);
+    assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+    assert((context.flags & (TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE | TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED |
+                                TREVRPC_RPC_CALL_CONTEXT_CANCELLED)) ==
+           (TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE | TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED |
+               TREVRPC_RPC_CALL_CONTEXT_CANCELLED));
+    assert(context.time_remaining_nanos == 0);
     assert(info.operation_id == 2);
     assert((info.flags & TREVRPC_RPC_EVENT_FLAG_LOCAL) != 0);
     assert(info.status == -ETIMEDOUT);
@@ -2803,7 +2949,860 @@ static void run_stopped_with_retained_endpoint(void) {
     assert(trevrpc_rpc_runtime_release(runtime) == 0);
 }
 
+static void close_listener_runtime(fake_transport* fake,
+    trevrpc_rpc_runtime* runtime,
+    const trevrpc_rpc_wake_source_v1* wake,
+    trevrpc_rpc_endpoint_v1 endpoint) {
+    trevrpc_rpc_event* event;
+    assert(trevrpc_rpc_endpoint_close(runtime, endpoint, 2) == 0);
+    event = wait_next_event(runtime, wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_endpoint_release(runtime, endpoint) == 0);
+    assert(trevrpc_rpc_runtime_close(runtime, 3) == 0);
+    event = wait_next_event(runtime, wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STOPPED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_runtime_drain(runtime) == 0);
+    assert(trevrpc_rpc_runtime_release(runtime) == 0);
+    (void)fake;
+}
+
+static void run_admission_events(void) {
+    static const uint8_t path[] = "/fake.Service/Test";
+    static const uint8_t authority[] = "localhost:4242";
+    static const uint8_t origin[] = "https://localhost:4242";
+    const uint32_t transport_kinds[] = {
+        TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION, TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION};
+    const uint32_t rpc_kinds[] = {TREVRPC_RPC_EVENT_HTTP3_ADMISSION, TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION};
+    const uint32_t protocols[] = {TREVRPC_RPC_ADMISSION_PROTOCOL_HTTP3, TREVRPC_RPC_ADMISSION_PROTOCOL_WEBTRANSPORT};
+    size_t index;
+
+    for (index = 0; index < sizeof(transport_kinds) / sizeof(transport_kinds[0]); ++index) {
+        fake_transport* fake = fake_create();
+        trevrpc_rpc_runtime_config_v1 config;
+        trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+        trevrpc_rpc_runtime* runtime = NULL;
+        trevrpc_rpc_wake_source_v1 wake;
+        trevrpc_rpc_endpoint_v1 endpoint;
+        trevrpc_rpc_event* event;
+        trevrpc_rpc_event_info_v1 general;
+        trevrpc_rpc_admission_info_v1 admission;
+
+        assert(trevrpc_rpc_runtime_config_v1_init(&config, sizeof(config)) == 0);
+        assert(trevrpc_rpc_runtime_adopt_transport_v1(&config, &fake->base, &runtime) == 0);
+        assert(trevrpc_rpc_wake_source_v1_init(&wake, sizeof(wake)) == 0);
+        assert(trevrpc_rpc_runtime_get_wake_source_v1(runtime, &wake) == 0);
+        assert(trevrpc_rpc_runtime_start_transport_endpoint_v1(
+                   runtime, &endpoint_config, TREVRPC_RPC_ENDPOINT_SERVER, 1, &endpoint) == 0);
+        consume_endpoint_ready(runtime, &wake, endpoint);
+        assert(fake_push_admission_event(fake,
+                   transport_kinds[index],
+                   path,
+                   sizeof(path) - 1,
+                   authority,
+                   sizeof(authority) - 1,
+                   origin,
+                   sizeof(origin) - 1) == 0);
+        event = wait_next_event(runtime, &wake);
+        general = event_info(event);
+        assert(general.kind == rpc_kinds[index]);
+        assert(general.subject_kind == TREVRPC_RPC_OBJECT_ENDPOINT);
+        assert(general.endpoint.owner == endpoint.owner);
+        assert(trevrpc_rpc_admission_info_v1_init(&admission, sizeof(admission)) == 0);
+        assert(trevrpc_rpc_event_get_admission_info_v1(event, &admission) == 0);
+        assert(admission.protocol == protocols[index]);
+        assert(admission.flags == TREVRPC_RPC_ADMISSION_FLAG_SECURE);
+        assert(admission.listener.owner == endpoint.owner);
+        assert(admission.listener.slot == endpoint.slot);
+        assert(admission.listener.generation == endpoint.generation);
+        assert(admission.path_len == sizeof(path) - 1);
+        assert(memcmp(admission.path, path, sizeof(path) - 1) == 0);
+        assert(admission.authority_len == sizeof(authority) - 1);
+        assert(memcmp(admission.authority, authority, sizeof(authority) - 1) == 0);
+        assert(admission.origin_len == sizeof(origin) - 1);
+        assert(memcmp(admission.origin, origin, sizeof(origin) - 1) == 0);
+        assert(trevrpc_rpc_admission_respond_v1(event, 201) == -EINVAL);
+        assert(atomic_load_explicit(&fake->admission_response_calls, memory_order_acquire) == 0);
+        assert(trevrpc_rpc_admission_respond_v1(event, index == 0 ? 200 : 403) == 0);
+        assert(atomic_load_explicit(&fake->admission_response_calls, memory_order_acquire) == 1);
+        assert(atomic_load_explicit(&fake->admission_last_status, memory_order_acquire) == (index == 0 ? 200u : 403u));
+        assert(trevrpc_rpc_admission_respond_v1(event, 500) == -EALREADY);
+        trevrpc_rpc_event_release(event);
+        assert(atomic_load_explicit(&fake->admission_undecided_release_calls, memory_order_acquire) == 0);
+        close_listener_runtime(fake, runtime, &wake, endpoint);
+    }
+
+    {
+        fake_transport* fake = fake_create();
+        trevrpc_rpc_runtime_config_v1 config;
+        trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+        trevrpc_rpc_runtime* runtime = NULL;
+        trevrpc_rpc_wake_source_v1 wake;
+        trevrpc_rpc_endpoint_v1 endpoint;
+        trevrpc_rpc_event* event;
+        endpoint_close_args close_args = {0};
+        pthread_t close_thread;
+        unsigned attempt;
+
+        assert(trevrpc_rpc_runtime_config_v1_init(&config, sizeof(config)) == 0);
+        assert(trevrpc_rpc_runtime_adopt_transport_v1(&config, &fake->base, &runtime) == 0);
+        assert(trevrpc_rpc_wake_source_v1_init(&wake, sizeof(wake)) == 0);
+        assert(trevrpc_rpc_runtime_get_wake_source_v1(runtime, &wake) == 0);
+        assert(trevrpc_rpc_runtime_start_transport_endpoint_v1(
+                   runtime, &endpoint_config, TREVRPC_RPC_ENDPOINT_SERVER, 1, &endpoint) == 0);
+        consume_endpoint_ready(runtime, &wake, endpoint);
+
+        pthread_mutex_lock(&fake->mutex);
+        fake->admission_info_blocked = true;
+        fake->listener_close_blocked = true;
+        pthread_mutex_unlock(&fake->mutex);
+        assert(fake_push_admission_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION,
+                   path,
+                   sizeof(path) - 1,
+                   authority,
+                   sizeof(authority) - 1,
+                   NULL,
+                   0) == 0);
+        pthread_mutex_lock(&fake->mutex);
+        while (!fake->admission_info_entered) {
+            pthread_cond_wait(&fake->condition, &fake->mutex);
+        }
+        pthread_mutex_unlock(&fake->mutex);
+
+        close_args.runtime = runtime;
+        close_args.endpoint = endpoint;
+        close_args.operation_id = 2;
+        assert(pthread_create(&close_thread, NULL, endpoint_close_thread, &close_args) == 0);
+        pthread_mutex_lock(&fake->mutex);
+        while (!fake->listener_close_entered) {
+            pthread_cond_wait(&fake->condition, &fake->mutex);
+        }
+        fake->admission_info_release = true;
+        fake->listener_close_release = true;
+        pthread_cond_broadcast(&fake->condition);
+        pthread_mutex_unlock(&fake->mutex);
+        assert(pthread_join(close_thread, NULL) == 0);
+        assert(close_args.result == 0);
+
+        for (attempt = 0; attempt < 1000; ++attempt) {
+            if (atomic_load_explicit(&fake->admission_response_calls, memory_order_acquire) == 1) {
+                break;
+            }
+            assert(poll(NULL, 0, 1) >= 0);
+        }
+        assert(attempt != 1000);
+        assert(atomic_load_explicit(&fake->admission_undecided_release_calls, memory_order_acquire) == 1);
+        assert(atomic_load_explicit(&fake->admission_last_status, memory_order_acquire) == 500);
+
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED);
+        assert(event_info(event).operation_id == 2);
+        trevrpc_rpc_event_release(event);
+        assert(trevrpc_rpc_endpoint_release(runtime, endpoint) == 0);
+        assert(trevrpc_rpc_runtime_close(runtime, 3) == 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_STOPPED);
+        trevrpc_rpc_event_release(event);
+        assert(trevrpc_rpc_runtime_drain(runtime) == 0);
+        assert(trevrpc_rpc_runtime_release(runtime) == 0);
+    }
+
+    {
+        fake_transport* fake = fake_create();
+        trevrpc_rpc_runtime_config_v1 config;
+        trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+        trevrpc_rpc_runtime* runtime = NULL;
+        trevrpc_rpc_wake_source_v1 wake;
+        trevrpc_rpc_endpoint_v1 endpoint;
+        trevrpc_rpc_event* event;
+        unsigned attempt;
+
+        assert(trevrpc_rpc_runtime_config_v1_init(&config, sizeof(config)) == 0);
+        config.event_capacity = 1;
+        assert(trevrpc_rpc_runtime_adopt_transport_v1(&config, &fake->base, &runtime) == 0);
+        assert(trevrpc_rpc_wake_source_v1_init(&wake, sizeof(wake)) == 0);
+        assert(trevrpc_rpc_runtime_get_wake_source_v1(runtime, &wake) == 0);
+        assert(trevrpc_rpc_runtime_start_transport_endpoint_v1(
+                   runtime, &endpoint_config, TREVRPC_RPC_ENDPOINT_SERVER, 1, &endpoint) == 0);
+        consume_endpoint_ready(runtime, &wake, endpoint);
+
+        assert(fake_push_admission_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION,
+                   path,
+                   sizeof(path) - 1,
+                   authority,
+                   sizeof(authority) - 1,
+                   origin,
+                   sizeof(origin) - 1) == 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION);
+        trevrpc_rpc_event_release(event);
+        assert(atomic_load_explicit(&fake->admission_undecided_release_calls, memory_order_acquire) == 1);
+        assert(atomic_load_explicit(&fake->admission_last_status, memory_order_acquire) == 500);
+
+        assert(fake_push_admission_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION,
+                   path,
+                   sizeof(path) - 1,
+                   authority,
+                   sizeof(authority) - 1,
+                   NULL,
+                   0) == 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_HTTP3_ADMISSION);
+        atomic_store_explicit(&fake->admission_respond_result, -EIO, memory_order_release);
+        assert(trevrpc_rpc_admission_respond_v1(event, 200) == -EIO);
+        assert(atomic_load_explicit(&fake->admission_response_calls, memory_order_acquire) == 2);
+        assert(trevrpc_rpc_admission_respond_v1(event, 403) == -EALREADY);
+        trevrpc_rpc_event_release(event);
+        assert(atomic_load_explicit(&fake->admission_undecided_release_calls, memory_order_acquire) == 1);
+
+        atomic_store_explicit(&fake->admission_get_info_result, -EIO, memory_order_release);
+        assert(fake_push_admission_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION,
+                   path,
+                   sizeof(path) - 1,
+                   authority,
+                   sizeof(authority) - 1,
+                   NULL,
+                   0) == 0);
+        for (attempt = 0; attempt < 1000; ++attempt) {
+            if (atomic_load_explicit(&fake->admission_response_calls, memory_order_acquire) == 3) {
+                break;
+            }
+            assert(poll(NULL, 0, 1) >= 0);
+        }
+        assert(attempt != 1000);
+        assert(atomic_load_explicit(&fake->admission_undecided_release_calls, memory_order_acquire) == 2);
+        event = NULL;
+        assert(trevrpc_rpc_runtime_next_event(runtime, &event) == -EAGAIN);
+
+        assert(fake_push_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC,
+                   0,
+                   (trevrpc_rpc_transport_handle){0},
+                   (trevrpc_rpc_transport_handle){0}) == 0);
+        assert(fake_push_admission_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION,
+                   path,
+                   sizeof(path) - 1,
+                   authority,
+                   sizeof(authority) - 1,
+                   NULL,
+                   0) == 0);
+        for (attempt = 0; attempt < 1000; ++attempt) {
+            if (atomic_load_explicit(&fake->admission_response_calls, memory_order_acquire) == 4) {
+                break;
+            }
+            assert(poll(NULL, 0, 1) >= 0);
+        }
+        assert(attempt != 1000);
+        assert(atomic_load_explicit(&fake->admission_undecided_release_calls, memory_order_acquire) == 3);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_DIAGNOSTIC);
+        trevrpc_rpc_event_release(event);
+        close_listener_runtime(fake, runtime, &wake, endpoint);
+    }
+}
+
+static void run_success_before_deadline_is_not_cancelled(void) {
+    trevrpc_rpc_runtime_config_v1 runtime_config;
+    trevrpc_rpc_call_config_v1 call_config;
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_call_context_info_v1 context;
+    fake_transport* fake = fake_create();
+
+    assert(fake != NULL);
+    assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+    assert(trevrpc_rpc_call_config_v1_init(&call_config, sizeof(call_config)) == 0);
+    call_config.kind = TREVRPC_RPC_KIND_UNARY;
+    call_config.service = "fake.Service";
+    call_config.service_len = (uint32_t)strlen(call_config.service);
+    call_config.method = "CleanDeadline";
+    call_config.method_len = (uint32_t)strlen(call_config.method);
+    call_config.initial_message = (const uint8_t*)"request";
+    call_config.initial_message_len = strlen("request");
+    call_config.timeout_nanos = UINT64_C(500000000);
+    setup_ready_client_call_with_config(
+        fake, &runtime_config, &call_config, &runtime, &wake, &endpoint, &call, &stream);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER |
+                   TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLEAN_FIN,
+               fake_stream_handle,
+               fake_connection_handle) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_CLOSED);
+    trevrpc_rpc_event_release(event);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_CLOSED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE) != 0);
+    assert((context.flags & (TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED | TREVRPC_RPC_CALL_CONTEXT_CANCELLED)) == 0);
+    close_ready_client_call(runtime, &wake, endpoint, call, stream);
+}
+
+static void run_context_cancellation_is_durable(void) {
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_event_info_v1 info;
+    trevrpc_rpc_call_context_info_v1 context;
+    fake_transport* fake = fake_create();
+
+    assert(fake != NULL);
+    setup_client_call(fake, &runtime, &wake, &endpoint, &call, &stream, TREVRPC_RPC_KIND_UNARY, 2);
+    assert(trevrpc_rpc_call_cancel(runtime, call, 3, 77) == 0);
+    event = wait_next_event(runtime, &wake);
+    info = event_info(event);
+    assert(info.kind == TREVRPC_RPC_EVENT_CANCELLED);
+    assert(info.operation_id == 3);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) != 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED) == 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE) == 0);
+    /* The fake provider records aborts but does not synthesize the eventual
+     * peer terminal notification; drive the normal terminal path explicitly. */
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER,
+               fake_stream_handle,
+               fake_connection_handle) == 0);
+    event = wait_next_event(runtime, &wake);
+    info = event_info(event);
+    if (info.kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+        trevrpc_rpc_event_release(event);
+        event = wait_next_event(runtime, &wake);
+        info = event_info(event);
+    }
+    assert(info.kind == TREVRPC_RPC_EVENT_STREAM_CLOSED);
+    trevrpc_rpc_event_release(event);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_CLOSED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_call_release(runtime, call) == 0);
+    assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == -ESTALE);
+    assert(trevrpc_rpc_stream_release(runtime, stream) == 0);
+    assert(trevrpc_rpc_endpoint_close(runtime, endpoint, 4) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_endpoint_release(runtime, endpoint) == 0);
+    assert(trevrpc_rpc_runtime_close(runtime, 5) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STOPPED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_runtime_drain(runtime) == 0);
+    assert(trevrpc_rpc_runtime_release(runtime) == 0);
+}
+
+static void run_rejected_abort_does_not_cancel(void) {
+    trevrpc_rpc_runtime_config_v1 runtime_config;
+    trevrpc_rpc_call_config_v1 call_config;
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_call_context_info_v1 context;
+    fake_transport* fake = fake_create();
+
+    assert(fake != NULL);
+    assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+    assert(trevrpc_rpc_call_config_v1_init(&call_config, sizeof(call_config)) == 0);
+    call_config.kind = TREVRPC_RPC_KIND_UNARY;
+    call_config.service = "fake.Service";
+    call_config.service_len = (uint32_t)strlen(call_config.service);
+    call_config.method = "RejectedAbort";
+    call_config.method_len = (uint32_t)strlen(call_config.method);
+    call_config.initial_message = (const uint8_t*)"request";
+    call_config.initial_message_len = strlen("request");
+    setup_ready_client_call_with_config(
+        fake, &runtime_config, &call_config, &runtime, &wake, &endpoint, &call, &stream);
+
+    fake->stream_abort_result = -EIO;
+    assert(trevrpc_rpc_call_cancel(runtime, call, 3, 77) == -EIO);
+    assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) == 0);
+    assert(trevrpc_rpc_call_close(runtime, call, 4, TREVRPC_RPC_CLOSE_FLAG_ABORT, 78) == -EIO);
+    assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) == 0);
+
+    fake->stream_abort_result = 0;
+    assert(trevrpc_rpc_call_cancel(runtime, call, 5, 79) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CANCELLED);
+    trevrpc_rpc_event_release(event);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER,
+               fake_stream_handle,
+               fake_connection_handle) == 0);
+    event = wait_next_event(runtime, &wake);
+    if (event_info(event).kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+        trevrpc_rpc_event_release(event);
+        event = wait_next_event(runtime, &wake);
+    }
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_CLOSED);
+    trevrpc_rpc_event_release(event);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_CLOSED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_stream_release(runtime, stream) == 0);
+    assert(trevrpc_rpc_call_release(runtime, call) == 0);
+    assert(trevrpc_rpc_endpoint_close(runtime, endpoint, 6) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_endpoint_release(runtime, endpoint) == 0);
+    assert(trevrpc_rpc_runtime_close(runtime, 7) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STOPPED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_runtime_drain(runtime) == 0);
+    assert(trevrpc_rpc_runtime_release(runtime) == 0);
+}
+
+static void run_runtime_shutdown_is_durable_cancellation(void) {
+    trevrpc_rpc_runtime_config_v1 runtime_config;
+    trevrpc_rpc_call_config_v1 call_config;
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_call_context_info_v1 context;
+    fake_transport* fake = fake_create();
+
+    assert(fake != NULL);
+    assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+    assert(trevrpc_rpc_call_config_v1_init(&call_config, sizeof(call_config)) == 0);
+    call_config.kind = TREVRPC_RPC_KIND_UNARY;
+    call_config.service = "fake.Service";
+    call_config.service_len = (uint32_t)strlen(call_config.service);
+    call_config.method = "RuntimeShutdown";
+    call_config.method_len = (uint32_t)strlen(call_config.method);
+    call_config.initial_message = (const uint8_t*)"request";
+    call_config.initial_message_len = strlen("request");
+    setup_ready_client_call_with_config(
+        fake, &runtime_config, &call_config, &runtime, &wake, &endpoint, &call, &stream);
+
+    atomic_store_explicit(&fake->next_event_result, -EAGAIN, memory_order_release);
+    assert(trevrpc_rpc_runtime_close(runtime, 3) == 0);
+    assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+    assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+    assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) != 0);
+    atomic_store_explicit(&fake->next_event_result, 0, memory_order_release);
+
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_CLOSED);
+    trevrpc_rpc_event_release(event);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_CLOSED);
+    trevrpc_rpc_event_release(event);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED);
+    trevrpc_rpc_event_release(event);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STOPPED);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_stream_release(runtime, stream) == 0);
+    assert(trevrpc_rpc_call_release(runtime, call) == 0);
+    assert(trevrpc_rpc_endpoint_release(runtime, endpoint) == 0);
+    assert(trevrpc_rpc_runtime_drain(runtime) == 0);
+    assert(trevrpc_rpc_runtime_release(runtime) == 0);
+}
+
+static void run_initial_request_timeout_is_silent(void) {
+    trevrpc_rpc_runtime_config_v1 config;
+    trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_event* event = NULL;
+    fake_transport* fake = fake_create();
+    unsigned attempt;
+
+    assert(fake != NULL);
+    assert(trevrpc_rpc_runtime_config_v1_init(&config, sizeof(config)) == 0);
+    config.initial_request_timeout_nanos = UINT64_C(20000000);
+    assert(trevrpc_rpc_runtime_adopt_transport_v1(&config, &fake->base, &runtime) == 0);
+    assert(trevrpc_rpc_wake_source_v1_init(&wake, sizeof(wake)) == 0);
+    assert(trevrpc_rpc_runtime_get_wake_source_v1(runtime, &wake) == 0);
+    assert(trevrpc_rpc_runtime_start_transport_endpoint_v1(
+               runtime, &endpoint_config, TREVRPC_RPC_ENDPOINT_SERVER, 1, &endpoint) == 0);
+    consume_endpoint_ready(runtime, &wake, endpoint);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
+               fake_stream_handle,
+               fake_listener_handle) == 0);
+    for (attempt = 0; attempt < 1000; ++attempt) {
+        if (atomic_load_explicit(&fake->stream_abort_calls, memory_order_acquire) != 0) {
+            break;
+        }
+        assert(poll(NULL, 0, 1) >= 0);
+    }
+    assert(attempt != 1000);
+    assert(trevrpc_rpc_runtime_next_event(runtime, &event) == -EAGAIN);
+    close_listener_runtime(fake, runtime, &wake, endpoint);
+}
+
+static void run_task240_config_limit_validation(void) {
+    trevrpc_rpc_runtime_config_v1 runtime_config;
+    trevrpc_rpc_call_config_v1 call_config;
+    assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+    runtime_config.max_stream_messages = -2;
+    runtime_config.max_stream_body_size = INT64_MIN;
+    assert(trevrpc_rpc_validate_runtime_config(&runtime_config) == 0);
+    runtime_config.max_stream_messages = 0;
+    runtime_config.max_stream_body_size = 0;
+    assert(trevrpc_rpc_validate_runtime_config(&runtime_config) == 0);
+    assert(trevrpc_rpc_call_config_v1_init(&call_config, sizeof(call_config)) == 0);
+    assert(call_config.max_response_body_size == -1);
+    assert(call_config.max_response_messages == -1);
+    assert(call_config.max_response_stream_body_size == -1);
+}
+
+static void run_server_idle_timers(void) {
+    const uint32_t kinds[] = {TREVRPC_RPC_KIND_CLIENT_STREAMING, TREVRPC_RPC_KIND_SERVER_STREAMING};
+    unsigned index;
+
+    for (index = 0; index < sizeof(kinds) / sizeof(kinds[0]); ++index) {
+        trevrpc_rpc_runtime_config_v1 runtime_config;
+        trevrpc_rpc_runtime* runtime = NULL;
+        trevrpc_rpc_wake_source_v1 wake;
+        trevrpc_rpc_endpoint_v1 endpoint;
+        trevrpc_rpc_call_v1 call;
+        trevrpc_rpc_stream_v1 stream;
+        trevrpc_rpc_event* event;
+        trevrpc_rpc_call_context_info_v1 context;
+        fake_transport* fake = fake_create();
+        unsigned attempt;
+
+        assert(fake != NULL);
+        assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+        runtime_config.stream_idle_timeout_nanos = UINT64_C(20000000);
+        setup_accepted_peer_call(fake, &runtime_config, kinds[index], &runtime, &wake, &endpoint, &call, &stream);
+        for (attempt = 0; attempt != 1000; ++attempt) {
+            if (atomic_load_explicit(&fake->stream_abort_calls, memory_order_acquire) != 0) {
+                break;
+            }
+            assert(poll(NULL, 0, 1) >= 0);
+        }
+        assert(attempt != 1000);
+        assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+        assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+        assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) != 0);
+        assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED) == 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_CLOSED);
+        trevrpc_rpc_event_release(event);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_CLOSED);
+        trevrpc_rpc_event_release(event);
+        close_ready_client_call(runtime, &wake, endpoint, call, stream);
+    }
+}
+
+static void run_idle_disabled_and_receive_finish_disarm(void) {
+    trevrpc_rpc_runtime_config_v1 runtime_config;
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_receive* receive = NULL;
+    trevrpc_rpc_status_v1 status;
+    uint64_t send_operation;
+    fake_transport* fake = fake_create();
+
+    assert(fake != NULL);
+    assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+    setup_accepted_peer_call(
+        fake, &runtime_config, TREVRPC_RPC_KIND_SERVER_STREAMING, &runtime, &wake, &endpoint, &call, &stream);
+    assert(poll(NULL, 0, 40) >= 0);
+    assert(atomic_load_explicit(&fake->stream_abort_calls, memory_order_acquire) == 0);
+    finish_call_and_runtime(fake, runtime, &wake, endpoint, call, stream, TREVRPC_RPC_CLOSE_FLAG_ABORT, 0);
+
+    fake = fake_create();
+    assert(fake != NULL);
+    runtime = NULL;
+    assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+    runtime_config.stream_idle_timeout_nanos = UINT64_C(100000000);
+    setup_accepted_peer_call(
+        fake, &runtime_config, TREVRPC_RPC_KIND_CLIENT_STREAMING, &runtime, &wake, &endpoint, &call, &stream);
+    assert(trevrpc_rpc_status_v1_init(&status, sizeof(status)) == 0);
+    status.code = TREVRPC_RPC_STATUS_CANCELLED;
+    assert(trevrpc_rpc_call_respond_copy_v1(runtime, call, 3, &status, NULL, 0) == 0);
+    send_operation = atomic_load_explicit(&fake->last_send_operation_id, memory_order_acquire);
+    assert(fake_push_operation_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
+               fake_stream_handle,
+               fake_listener_handle,
+               send_operation) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_SEND_COMPLETE);
+    trevrpc_rpc_event_release(event);
+    push_stream_frame(fake, TREVRPC_STREAM_FRAME_KIND_STATUS, TREVRPC_RPC_STATUS_OK, NULL, 0);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
+               fake_stream_handle,
+               fake_listener_handle) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_READABLE);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_stream_receive(runtime, stream, &receive) == -EAGAIN);
+    assert(receive == NULL);
+    assert(poll(NULL, 0, 150) >= 0);
+    assert(atomic_load_explicit(&fake->stream_abort_calls, memory_order_acquire) == 0);
+    finish_call_and_runtime(fake, runtime, &wake, endpoint, call, stream, TREVRPC_RPC_CLOSE_FLAG_ABORT, 0);
+}
+
+static void run_server_receive_limits(void) {
+    const uint8_t body[] = "next";
+    unsigned body_limit;
+
+    for (body_limit = 0; body_limit != 2; ++body_limit) {
+        trevrpc_rpc_runtime_config_v1 runtime_config;
+        trevrpc_rpc_runtime* runtime = NULL;
+        trevrpc_rpc_wake_source_v1 wake;
+        trevrpc_rpc_endpoint_v1 endpoint;
+        trevrpc_rpc_call_v1 call;
+        trevrpc_rpc_stream_v1 stream;
+        trevrpc_rpc_event* event;
+        trevrpc_rpc_receive* receive = NULL;
+        trevrpc_rpc_call_context_info_v1 context;
+        fake_transport* fake = fake_create();
+
+        assert(fake != NULL);
+        assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+        runtime_config.max_stream_messages = body_limit == 0 ? 1 : -1;
+        runtime_config.max_stream_body_size = body_limit == 0 ? -1 : 10;
+        setup_accepted_peer_call(
+            fake, &runtime_config, TREVRPC_RPC_KIND_CLIENT_STREAMING, &runtime, &wake, &endpoint, &call, &stream);
+        push_stream_frame(fake, TREVRPC_STREAM_FRAME_KIND_MESSAGE, TREVRPC_RPC_STATUS_OK, body, sizeof(body) - 1);
+        assert(fake_push_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE,
+                   TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
+                   fake_stream_handle,
+                   fake_listener_handle) == 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_READABLE);
+        trevrpc_rpc_event_release(event);
+        assert(trevrpc_rpc_stream_receive(runtime, stream, &receive) == -EMSGSIZE);
+        assert(receive == NULL);
+        assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+        assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+        assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) != 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_CLOSED);
+        trevrpc_rpc_event_release(event);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_CLOSED);
+        trevrpc_rpc_event_release(event);
+        close_ready_client_call(runtime, &wake, endpoint, call, stream);
+    }
+}
+
+static void run_server_send_limits(void) {
+    const uint8_t message[] = "one";
+    unsigned body_limit;
+
+    for (body_limit = 0; body_limit != 2; ++body_limit) {
+        trevrpc_rpc_runtime_config_v1 runtime_config;
+        trevrpc_rpc_runtime* runtime = NULL;
+        trevrpc_rpc_wake_source_v1 wake;
+        trevrpc_rpc_endpoint_v1 endpoint;
+        trevrpc_rpc_call_v1 call;
+        trevrpc_rpc_stream_v1 stream;
+        trevrpc_rpc_event* event;
+        fake_transport* fake = fake_create();
+        uint64_t send_operation;
+
+        assert(fake != NULL);
+        assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+        runtime_config.max_stream_messages = body_limit == 0 ? 1 : -1;
+        runtime_config.max_stream_body_size = body_limit == 0 ? -1 : (int64_t)(sizeof(message) - 1);
+        setup_accepted_peer_call(
+            fake, &runtime_config, TREVRPC_RPC_KIND_SERVER_STREAMING, &runtime, &wake, &endpoint, &call, &stream);
+        assert(trevrpc_rpc_stream_send_copy_v1(runtime, stream, 3, message, sizeof(message) - 1, 0) == 0);
+        send_operation = atomic_load_explicit(&fake->last_send_operation_id, memory_order_acquire);
+        assert(fake_push_operation_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE,
+                   TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
+                   fake_stream_handle,
+                   fake_listener_handle,
+                   send_operation) == 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_SEND_COMPLETE);
+        trevrpc_rpc_event_release(event);
+        assert(trevrpc_rpc_stream_send_copy_v1(runtime, stream, 4, message, sizeof(message) - 1, 0) == -EMSGSIZE);
+        finish_call_and_runtime(fake, runtime, &wake, endpoint, call, stream, TREVRPC_RPC_CLOSE_FLAG_ABORT, 0);
+    }
+}
+
+static void run_server_client_streaming_response_limits(void) {
+    const uint8_t message[] = "123456789";
+    unsigned body_limit;
+
+    for (body_limit = 0; body_limit != 1; ++body_limit) {
+        trevrpc_rpc_runtime_config_v1 runtime_config;
+        trevrpc_rpc_runtime* runtime = NULL;
+        trevrpc_rpc_wake_source_v1 wake;
+        trevrpc_rpc_endpoint_v1 endpoint;
+        trevrpc_rpc_call_v1 call;
+        trevrpc_rpc_stream_v1 stream;
+        trevrpc_rpc_status_v1 status;
+        fake_transport* fake = fake_create();
+
+        assert(fake != NULL);
+        assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+        runtime_config.max_stream_messages = -1;
+        runtime_config.max_stream_body_size = 8;
+        setup_accepted_peer_call(
+            fake, &runtime_config, TREVRPC_RPC_KIND_CLIENT_STREAMING, &runtime, &wake, &endpoint, &call, &stream);
+        assert(trevrpc_rpc_status_v1_init(&status, sizeof(status)) == 0);
+        status.code = TREVRPC_RPC_STATUS_OK;
+        assert(trevrpc_rpc_call_respond_copy_v1(runtime, call, 3, &status, message, sizeof(message) - 1) == -EMSGSIZE);
+        finish_call_and_runtime(fake, runtime, &wake, endpoint, call, stream, TREVRPC_RPC_CLOSE_FLAG_ABORT, 0);
+    }
+}
+
+static void run_client_response_limits(void) {
+    const uint8_t body[] = "response";
+    const uint8_t second_body[] = "again";
+    const uint32_t kinds[] = {TREVRPC_RPC_KIND_UNARY,
+        TREVRPC_RPC_KIND_CLIENT_STREAMING,
+        TREVRPC_RPC_KIND_SERVER_STREAMING,
+        TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING};
+    unsigned index;
+
+    for (index = 0; index < sizeof(kinds) / sizeof(kinds[0]); ++index) {
+        trevrpc_rpc_runtime_config_v1 runtime_config;
+        trevrpc_rpc_call_config_v1 call_config;
+        trevrpc_rpc_runtime* runtime = NULL;
+        trevrpc_rpc_wake_source_v1 wake;
+        trevrpc_rpc_endpoint_v1 endpoint;
+        trevrpc_rpc_call_v1 call;
+        trevrpc_rpc_stream_v1 stream;
+        trevrpc_rpc_event* event;
+        trevrpc_rpc_receive* receive = NULL;
+        trevrpc_rpc_call_context_info_v1 context;
+        fake_transport* fake = fake_create();
+        uint8_t* response_frame = NULL;
+        size_t response_frame_len = 0;
+
+        assert(fake != NULL);
+        assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
+        /* Exercise public ingestion: every negative value, not only -1, is unlimited. */
+        runtime_config.max_stream_messages = -2;
+        runtime_config.max_stream_body_size = INT64_MIN;
+        assert(trevrpc_rpc_call_config_v1_init(&call_config, sizeof(call_config)) == 0);
+        call_config.max_response_body_size = -2;
+        call_config.max_response_messages = INT64_MIN;
+        call_config.max_response_stream_body_size = -2;
+        call_config.kind = kinds[index];
+        call_config.service = "fake.Service";
+        call_config.service_len = (uint32_t)strlen(call_config.service);
+        call_config.method = "ResponseLimit";
+        call_config.method_len = (uint32_t)strlen(call_config.method);
+        call_config.initial_message = (const uint8_t*)"request";
+        call_config.initial_message_len = strlen("request");
+        if (kinds[index] == TREVRPC_RPC_KIND_UNARY) {
+            call_config.max_response_body_size = (int64_t)(sizeof(body) - 2);
+        } else if (kinds[index] == TREVRPC_RPC_KIND_SERVER_STREAMING) {
+            call_config.max_response_messages = 1;
+        } else {
+            call_config.max_response_stream_body_size = (int64_t)(sizeof(body) - 2);
+        }
+        setup_ready_client_call_with_config(
+            fake, &runtime_config, &call_config, &runtime, &wake, &endpoint, &call, &stream);
+        if (kinds[index] == TREVRPC_RPC_KIND_UNARY) {
+            trevrpc_wire_response_values response = {0};
+            response.status = TREVRPC_RPC_STATUS_OK;
+            response.body.data = (uint8_t*)body;
+            response.body.len = sizeof(body) - 1;
+            assert(trevrpc_wire_encode_response(&response, 1024u * 1024u, &response_frame, &response_frame_len) == 0);
+            assert(fake_push_receive(fake, response_frame + 4, response_frame_len - 4) == 0);
+            free(response_frame);
+        } else {
+            push_stream_frame(fake, TREVRPC_STREAM_FRAME_KIND_MESSAGE, TREVRPC_RPC_STATUS_OK, body, sizeof(body) - 1);
+        }
+        assert(fake_push_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE,
+                   TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+                   fake_stream_handle,
+                   fake_connection_handle) == 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_READABLE);
+        trevrpc_rpc_event_release(event);
+        if (kinds[index] == TREVRPC_RPC_KIND_SERVER_STREAMING) {
+            assert(trevrpc_rpc_stream_receive(runtime, stream, &receive) == 0);
+            trevrpc_rpc_receive_release(receive);
+            receive = NULL;
+            push_stream_frame(
+                fake, TREVRPC_STREAM_FRAME_KIND_MESSAGE, TREVRPC_RPC_STATUS_OK, second_body, sizeof(second_body) - 1);
+            assert(fake_push_event(fake,
+                       TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE,
+                       TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+                       fake_stream_handle,
+                       fake_connection_handle) == 0);
+            event = wait_next_event(runtime, &wake);
+            assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_READABLE);
+            trevrpc_rpc_event_release(event);
+        }
+        assert(trevrpc_rpc_stream_receive(runtime, stream, &receive) == -EMSGSIZE);
+        assert(receive == NULL);
+        assert(trevrpc_rpc_call_context_info_v1_init(&context, sizeof(context)) == 0);
+        assert(trevrpc_rpc_call_get_context_v1(runtime, call, &context) == 0);
+        assert((context.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) != 0);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_STREAM_CLOSED);
+        trevrpc_rpc_event_release(event);
+        event = wait_next_event(runtime, &wake);
+        assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_CLOSED);
+        trevrpc_rpc_event_release(event);
+        close_ready_client_call(runtime, &wake, endpoint, call, stream);
+    }
+}
+
 int main(void) {
+    run_task240_config_limit_validation();
+    run_success_before_deadline_is_not_cancelled();
+    run_context_cancellation_is_durable();
+    run_rejected_abort_does_not_cancel();
+    run_runtime_shutdown_is_durable_cancellation();
+    run_initial_request_timeout_is_silent();
+    run_server_idle_timers();
+    run_idle_disabled_and_receive_finish_disarm();
+    run_server_receive_limits();
+    run_server_send_limits();
+    run_server_client_streaming_response_limits();
+    run_client_response_limits();
+    run_admission_events();
     run_finish_send_status_then_fin();
     run_lifecycle_operation_id_scope();
     run_late_reused_operation_id();

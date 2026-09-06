@@ -65,6 +65,8 @@ extern "C" {
 #define TREVRPC_RPC_EVENT_CANCELLED 15u
 #define TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN 16u
 #define TREVRPC_RPC_EVENT_STREAM_CLOSED 17u
+#define TREVRPC_RPC_EVENT_HTTP3_ADMISSION 18u
+#define TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION 19u
 
 #define TREVRPC_RPC_EVENT_FLAG_FATAL 0x00000001u
 #define TREVRPC_RPC_EVENT_FLAG_TERMINAL 0x00000002u
@@ -78,6 +80,14 @@ extern "C" {
 #define TREVRPC_RPC_EVENT_FLAG_PEER_RESET 0x00000200u
 #define TREVRPC_RPC_EVENT_FLAG_HAS_RECEIVE 0x00000400u
 #define TREVRPC_RPC_EVENT_FLAG_HAS_INCOMING_CALL 0x00000800u
+
+#define TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE 0x00000001u
+#define TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED 0x00000002u
+#define TREVRPC_RPC_CALL_CONTEXT_CANCELLED 0x00000004u
+
+#define TREVRPC_RPC_ADMISSION_PROTOCOL_HTTP3 1u
+#define TREVRPC_RPC_ADMISSION_PROTOCOL_WEBTRANSPORT 2u
+#define TREVRPC_RPC_ADMISSION_FLAG_SECURE 0x00000001u
 
 #define TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE 1u
 #define TREVRPC_RPC_RECEIVE_MESSAGE 2u
@@ -149,6 +159,13 @@ typedef struct trevrpc_rpc_runtime_config_v1 {
     uint64_t max_receive_owned_bytes;
     uint64_t max_message_size;
     uint64_t max_metadata_bytes;
+    /* Zero disables the initial-request timer. */
+    uint64_t initial_request_timeout_nanos;
+    /* Any negative value disables the limit; zero permits no messages/bytes. */
+    int64_t max_stream_messages;
+    int64_t max_stream_body_size;
+    /* Zero disables the per-direction stream idle timers. */
+    uint64_t stream_idle_timeout_nanos;
     uint64_t reserved[4];
 } trevrpc_rpc_runtime_config_v1;
 
@@ -186,8 +203,39 @@ typedef struct trevrpc_rpc_call_config_v1 {
     trevrpc_rpc_cancellation_v1 cancellation;
     const uint8_t* initial_message;
     uint64_t initial_message_len;
+    /* Unary body, then streaming message-count and cumulative-body limits.
+     * Any negative value disables that limit; zero permits no messages/bytes. */
+    int64_t max_response_body_size;
+    int64_t max_response_messages;
+    int64_t max_response_stream_body_size;
+    /* Zero disables the response-direction idle timer. */
+    uint64_t response_idle_timeout_nanos;
     uint64_t reserved[3];
 } trevrpc_rpc_call_config_v1;
+
+typedef struct trevrpc_rpc_call_context_info_v1 {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint32_t flags;
+    uint32_t reserved0;
+    uint64_t time_remaining_nanos;
+    uint64_t reserved[4];
+} trevrpc_rpc_call_context_info_v1;
+
+typedef struct trevrpc_rpc_admission_info_v1 {
+    uint32_t struct_size;
+    uint32_t struct_version;
+    uint32_t protocol;
+    uint32_t flags;
+    trevrpc_rpc_endpoint_v1 listener;
+    const uint8_t* path;
+    uint64_t path_len;
+    const uint8_t* authority;
+    uint64_t authority_len;
+    const uint8_t* origin;
+    uint64_t origin_len;
+    uint64_t reserved[4];
+} trevrpc_rpc_admission_info_v1;
 
 typedef struct trevrpc_rpc_status_v1 {
     uint32_t struct_size;
@@ -280,6 +328,8 @@ void trevrpc_rpc_abi_1_anchor(void);
 int trevrpc_rpc_runtime_config_v1_init(trevrpc_rpc_runtime_config_v1* config, size_t struct_size);
 int trevrpc_rpc_wake_source_v1_init(trevrpc_rpc_wake_source_v1* wake_source, size_t struct_size);
 int trevrpc_rpc_call_config_v1_init(trevrpc_rpc_call_config_v1* config, size_t struct_size);
+int trevrpc_rpc_call_context_info_v1_init(trevrpc_rpc_call_context_info_v1* info, size_t struct_size);
+int trevrpc_rpc_admission_info_v1_init(trevrpc_rpc_admission_info_v1* info, size_t struct_size);
 int trevrpc_rpc_status_v1_init(trevrpc_rpc_status_v1* status, size_t struct_size);
 int trevrpc_rpc_event_info_v1_init(trevrpc_rpc_event_info_v1* info, size_t struct_size);
 int trevrpc_rpc_receive_info_v1_init(trevrpc_rpc_receive_info_v1* info, size_t struct_size);
@@ -301,6 +351,33 @@ int trevrpc_rpc_diagnostics_v1_init(trevrpc_rpc_diagnostics_v1* diagnostics, siz
  * take transfers the call, stream, and initial receive atomically; a second take
  * returns -EALREADY. Releasing an untaken incoming event releases its provisional
  * ownership. Output objects and handles are unchanged on synchronous failure.
+ *
+ * Call-context info is a fresh snapshot: time_remaining_nanos is monotonic,
+ * becomes zero when no deadline exists or it expires, and remains queryable
+ * while the caller owns the call handle. HAS_DEADLINE remains set after expiry;
+ * DEADLINE_EXPIRED reports runtime termination at that deadline, rather than
+ * later wall-clock passage after successful completion, while CANCELLED reports
+ * deadline, cancellation, abort, or shutdown cancellation. A released call
+ * handle is stale and context queries return -ESTALE.
+ *
+ * Signed message and body limits are disabled by any negative value; zero
+ * permits none, and positive values are exact maxima. The initial request of a
+ * client-streaming or bidirectional call counts as the first streaming request
+ * message and toward that direction's cumulative body size. Unary responses
+ * use the response-body limit; every non-unary response uses the streaming
+ * count and cumulative-body limits. Zero timeout values disable their
+ * corresponding timers. Idle timers are
+ * direction-specific and are disarmed permanently when that direction completes.
+ *
+ * Admission-info byte strings are copied into the event and borrowed until
+ * event release; they are not NUL-terminated. Admission events are one-shot
+ * response capabilities: HTTP 200 accepts, HTTP 400 through 599 rejects, and
+ * all other statuses return -EINVAL without consuming the capability. The first
+ * valid response consumes it even when response delivery reports an error; a
+ * duplicate returns -EALREADY. Releasing an undecided admission fails closed
+ * with HTTP 500. Admission response and event release must be serialized, and
+ * no accessor or response may begin after
+ * release begins.
  *
  * A CALL_INCOMING event owns its provisional call, stream, and initial receive.
  * event_take_incoming_call transfers all three atomically. Releasing the event
@@ -326,6 +403,8 @@ int trevrpc_rpc_diagnostics_v1_init(trevrpc_rpc_diagnostics_v1* diagnostics, siz
 int trevrpc_rpc_runtime_get_wake_source_v1(trevrpc_rpc_runtime* runtime, trevrpc_rpc_wake_source_v1* wake_source);
 int trevrpc_rpc_runtime_next_event(trevrpc_rpc_runtime* runtime, trevrpc_rpc_event** out_event);
 int trevrpc_rpc_event_get_info_v1(const trevrpc_rpc_event* event, trevrpc_rpc_event_info_v1* info);
+int trevrpc_rpc_event_get_admission_info_v1(const trevrpc_rpc_event* event, trevrpc_rpc_admission_info_v1* info);
+int trevrpc_rpc_admission_respond_v1(const trevrpc_rpc_event* event, uint16_t http_status);
 int trevrpc_rpc_event_take_incoming_call(trevrpc_rpc_event* event,
     trevrpc_rpc_call_v1* out_call,
     trevrpc_rpc_stream_v1* out_stream,
@@ -334,6 +413,8 @@ void trevrpc_rpc_event_release(trevrpc_rpc_event* event);
 int trevrpc_rpc_receive_get_info_v1(const trevrpc_rpc_receive* receive, trevrpc_rpc_receive_info_v1* info);
 void trevrpc_rpc_receive_release(trevrpc_rpc_receive* receive);
 int trevrpc_rpc_runtime_get_diagnostics_v1(trevrpc_rpc_runtime* runtime, trevrpc_rpc_diagnostics_v1* diagnostics);
+int trevrpc_rpc_call_get_context_v1(
+    trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, trevrpc_rpc_call_context_info_v1* info);
 
 int trevrpc_rpc_endpoint_get_port_v1(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint, uint16_t* out_port);

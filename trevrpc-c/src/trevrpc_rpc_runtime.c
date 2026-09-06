@@ -55,6 +55,8 @@ struct trevrpc_rpc_receive {
 struct trevrpc_rpc_event {
     struct trevrpc_rpc_event* next;
     struct trevrpc_rpc_runtime* runtime;
+    trevrpc_rpc_transport* admission_transport;
+    trevrpc_rpc_transport_event* admission_event;
     uint32_t kind;
     uint32_t flags;
     int32_t status;
@@ -74,6 +76,15 @@ struct trevrpc_rpc_event {
     char* method;
     uint32_t method_len;
     trevrpc_rpc_receive* receive;
+    trevrpc_rpc_endpoint_v1 admission_listener;
+    uint32_t admission_protocol;
+    uint32_t admission_flags;
+    uint8_t* admission_path;
+    uint64_t admission_path_len;
+    uint8_t* admission_authority;
+    uint64_t admission_authority_len;
+    uint8_t* admission_origin;
+    uint64_t admission_origin_len;
     bool incoming_taken;
     bool mandatory;
     bool reserved;
@@ -142,6 +153,23 @@ struct trevrpc_rpc_call_record {
     uint8_t* request_frame;
     size_t request_frame_len;
     uint64_t deadline_nanos;
+    uint64_t call_deadline_nanos;
+    uint64_t initial_request_deadline_nanos;
+    uint64_t send_idle_deadline_nanos;
+    uint64_t receive_idle_deadline_nanos;
+    uint64_t response_idle_timeout_nanos;
+    int64_t max_send_messages;
+    int64_t max_send_body_size;
+    int64_t max_receive_messages;
+    int64_t max_receive_body_size;
+    int64_t max_response_messages;
+    int64_t max_response_body_size;
+    int64_t max_response_stream_body_size;
+    uint64_t request_message_count;
+    uint64_t response_message_count;
+    uint64_t request_body_size;
+    uint64_t response_body_size;
+    bool has_deadline;
     uint64_t readable_epoch;
     uint64_t readable_drained_epoch;
     uint32_t readable_flags;
@@ -149,11 +177,16 @@ struct trevrpc_rpc_call_record {
     uint32_t receive_in_flight;
     bool deferred_stream_terminal_valid;
     bool request_send_pending;
+    bool awaiting_transport_acceptance;
+    bool transport_accepted;
     bool waiting_for_request;
     bool local;
     bool accepted;
     bool closing;
     bool deadline_expired;
+    bool cancelled;
+    bool runtime_close_target;
+    bool suppress_terminals;
     bool send_finish_pending;
     bool send_closed;
     bool peer_status_received;
@@ -211,6 +244,10 @@ struct trevrpc_rpc_runtime {
     uint64_t cancellation_sequence;
     uint64_t max_message_size;
     uint64_t max_metadata_bytes;
+    uint64_t initial_request_timeout_nanos;
+    int64_t max_stream_messages;
+    int64_t max_stream_body_size;
+    uint64_t stream_idle_timeout_nanos;
     uint64_t mandatory_reservations;
     bool wake_armed;
     bool driver_started;
@@ -392,6 +429,64 @@ static int trevrpc_rpc_deadline_after(uint64_t timeout_nanos, uint64_t* out_dead
     return 0;
 }
 
+static uint64_t trevrpc_rpc_saturating_add_u64(uint64_t left, uint64_t right) {
+    return right > UINT64_MAX - left ? UINT64_MAX : left + right;
+}
+
+static uint64_t trevrpc_rpc_idle_deadline(uint64_t timeout_nanos) {
+    uint64_t now = 0;
+    if (timeout_nanos == 0) {
+        return 0;
+    }
+    if (trevrpc_rpc_monotonic_nanos(&now) != 0 || timeout_nanos >= UINT64_MAX - now) {
+        return UINT64_MAX - 1u;
+    }
+    return now + timeout_nanos;
+}
+
+static void trevrpc_rpc_reset_idle_locked(
+    trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_record* record, bool send_direction) {
+    uint64_t timeout;
+    if (record == NULL || record->call_terminal_committed) {
+        return;
+    }
+    timeout = runtime->stream_idle_timeout_nanos;
+    if (record->local && !send_direction) {
+        timeout = record->response_idle_timeout_nanos;
+    }
+    if (record->local && send_direction) {
+        timeout = 0;
+    }
+    if (timeout == 0) {
+        if (send_direction) {
+            record->send_idle_deadline_nanos = 0;
+        } else {
+            record->receive_idle_deadline_nanos = 0;
+        }
+        return;
+    }
+    if (send_direction) {
+        record->send_idle_deadline_nanos = trevrpc_rpc_idle_deadline(timeout);
+    } else {
+        record->receive_idle_deadline_nanos = trevrpc_rpc_idle_deadline(timeout);
+    }
+}
+
+static int trevrpc_rpc_reserve_message_locked(
+    uint64_t* count, uint64_t* body_size, int64_t message_limit, int64_t body_limit, size_t body_len) {
+    uint64_t next_body;
+    if (message_limit >= 0 && *count >= (uint64_t)message_limit) {
+        return -EMSGSIZE;
+    }
+    next_body = trevrpc_rpc_saturating_add_u64(*body_size, (uint64_t)body_len);
+    if (body_limit >= 0 && next_body > (uint64_t)body_limit) {
+        return -EMSGSIZE;
+    }
+    ++*count;
+    *body_size = next_body;
+    return 0;
+}
+
 static void trevrpc_rpc_signal_driver_locked(trevrpc_rpc_runtime* runtime) {
     uint8_t byte = 1;
     ssize_t written;
@@ -562,18 +657,27 @@ static trevrpc_rpc_event* trevrpc_rpc_event_allocate(uint32_t kind) {
 
 static void trevrpc_rpc_event_destroy(trevrpc_rpc_event* event) {
     trevrpc_rpc_runtime* runtime;
+    trevrpc_rpc_transport* admission_transport;
+    trevrpc_rpc_transport_event* admission_event;
     bool reject = false;
     trevrpc_rpc_transport_handle transport_stream = {0};
     if (event == NULL) {
         return;
     }
     runtime = event->runtime;
+    admission_transport = event->admission_transport;
+    admission_event = event->admission_event;
+    event->admission_event = NULL;
+    if (admission_event != NULL) {
+        trevrpc_rpc_transport_event_release(admission_transport, admission_event);
+    }
     if (runtime != NULL && event->kind == TREVRPC_RPC_EVENT_CALL_INCOMING && !event->incoming_taken) {
         pthread_mutex_lock(&runtime->mutex);
         {
             trevrpc_rpc_call_record* record = trevrpc_rpc_find_call_locked(runtime, event->call);
             if (record != NULL && !record->closing) {
                 record->closing = true;
+                record->cancelled = true;
                 transport_stream = record->transport_stream;
                 reject = true;
             }
@@ -586,6 +690,9 @@ static void trevrpc_rpc_event_destroy(trevrpc_rpc_event* event) {
     trevrpc_rpc_receive_destroy(event->receive);
     free(event->service);
     free(event->method);
+    free(event->admission_path);
+    free(event->admission_authority);
+    free(event->admission_origin);
     free(event);
     if (runtime != NULL) {
         trevrpc_rpc_runtime_unref(runtime);
@@ -938,6 +1045,95 @@ static trevrpc_rpc_event* trevrpc_rpc_event_from_transport(
     return event;
 }
 
+static int trevrpc_rpc_copy_admission_bytes(const uint8_t* source, uint64_t source_len, uint8_t** out_copy) {
+    uint8_t* copy;
+    *out_copy = NULL;
+    if (source_len == 0) {
+        return 0;
+    }
+    if (source == NULL || source_len > SIZE_MAX) {
+        return -EINVAL;
+    }
+    copy = malloc((size_t)source_len);
+    if (copy == NULL) {
+        return -ENOMEM;
+    }
+    memcpy(copy, source, (size_t)source_len);
+    *out_copy = copy;
+    return 0;
+}
+
+static void trevrpc_rpc_promote_admission_event(trevrpc_rpc_runtime* runtime,
+    trevrpc_rpc_transport_event* transport_event,
+    const trevrpc_rpc_transport_event_info* transport_info) {
+    trevrpc_rpc_transport_admission_info admission = {0};
+    trevrpc_rpc_endpoint_record* listener;
+    trevrpc_rpc_event* event = NULL;
+    uint32_t expected_protocol;
+    uint32_t event_kind;
+    int result;
+
+    event_kind = transport_info->kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION
+                     ? TREVRPC_RPC_EVENT_HTTP3_ADMISSION
+                     : TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION;
+    expected_protocol = transport_info->kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION
+                            ? TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3
+                            : TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT;
+    result = trevrpc_rpc_transport_event_get_admission_info(runtime->transport, transport_event, &admission);
+    if (result != 0 || admission.protocol != expected_protocol || (admission.path == NULL && admission.path_len != 0) ||
+        (admission.authority == NULL && admission.authority_len != 0) ||
+        (admission.origin == NULL && admission.origin_len != 0)) {
+        trevrpc_rpc_transport_event_release(runtime->transport, transport_event);
+        return;
+    }
+    event = trevrpc_rpc_event_allocate(event_kind);
+    if (event == NULL) {
+        trevrpc_rpc_transport_event_release(runtime->transport, transport_event);
+        return;
+    }
+    event->admission_transport = runtime->transport;
+    event->admission_event = transport_event;
+    event->admission_protocol = event_kind == TREVRPC_RPC_EVENT_HTTP3_ADMISSION
+                                    ? TREVRPC_RPC_ADMISSION_PROTOCOL_HTTP3
+                                    : TREVRPC_RPC_ADMISSION_PROTOCOL_WEBTRANSPORT;
+    event->admission_flags = TREVRPC_RPC_ADMISSION_FLAG_SECURE;
+    event->admission_path_len = admission.path_len;
+    event->admission_authority_len = admission.authority_len;
+    event->admission_origin_len = admission.origin_len;
+    result = trevrpc_rpc_copy_admission_bytes(admission.path, admission.path_len, &event->admission_path);
+    if (result == 0) {
+        result =
+            trevrpc_rpc_copy_admission_bytes(admission.authority, admission.authority_len, &event->admission_authority);
+    }
+    if (result == 0) {
+        result = trevrpc_rpc_copy_admission_bytes(admission.origin, admission.origin_len, &event->admission_origin);
+    }
+    if (result != 0) {
+        trevrpc_rpc_event_destroy(event);
+        return;
+    }
+
+    pthread_mutex_lock(&runtime->mutex);
+    listener = trevrpc_rpc_find_endpoint_by_transport_locked(runtime, admission.listener);
+    if (runtime->state != TREVRPC_RPC_STATE_RUNNING || listener == NULL || listener->terminal_committed ||
+        listener->close_operation != NULL || listener->transport_kind != TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER) {
+        pthread_mutex_unlock(&runtime->mutex);
+        trevrpc_rpc_event_destroy(event);
+        return;
+    }
+    event->flags = trevrpc_rpc_map_transport_flags(transport_info->flags);
+    event->subject_kind = TREVRPC_RPC_OBJECT_ENDPOINT;
+    event->endpoint = listener->endpoint;
+    event->admission_listener = listener->endpoint;
+    result = trevrpc_rpc_publish_locked(runtime, event, false);
+    pthread_mutex_unlock(&runtime->mutex);
+    if (result == 0) {
+        return;
+    }
+    /* trevrpc_rpc_publish_locked destroys rejected ordinary events, including
+     * their retained fail-closed transport admission capability. */
+}
+
 static trevrpc_rpc_call_record* trevrpc_rpc_call_record_allocate(void) {
     trevrpc_rpc_call_record* record = calloc(1, sizeof(*record));
     if (record == NULL) {
@@ -954,6 +1150,17 @@ static trevrpc_rpc_call_record* trevrpc_rpc_call_record_allocate(void) {
     record->stream_terminal_event->reserved = true;
     record->call_terminal_event->reserved = true;
     record->deadline_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
+    record->call_deadline_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
+    record->initial_request_deadline_nanos = 0;
+    record->send_idle_deadline_nanos = 0;
+    record->receive_idle_deadline_nanos = 0;
+    record->max_send_messages = -1;
+    record->max_send_body_size = -1;
+    record->max_receive_messages = -1;
+    record->max_receive_body_size = -1;
+    record->max_response_messages = -1;
+    record->max_response_body_size = -1;
+    record->max_response_stream_body_size = -1;
     return record;
 }
 
@@ -1095,6 +1302,11 @@ static int trevrpc_rpc_find_or_create_peer_call_locked(
     record->transport_stream = info->subject;
     record->kind = TREVRPC_RPC_KIND_UNARY;
     record->waiting_for_request = true;
+    record->max_send_messages = runtime->max_stream_messages;
+    record->max_send_body_size = runtime->max_stream_body_size;
+    record->max_receive_messages = runtime->max_stream_messages;
+    record->max_receive_body_size = runtime->max_stream_body_size;
+    record->initial_request_deadline_nanos = trevrpc_rpc_idle_deadline(runtime->initial_request_timeout_nanos);
     result = trevrpc_rpc_insert_call_locked(runtime, record);
     if (result != 0) {
         trevrpc_rpc_event_destroy(record->stream_terminal_event);
@@ -1132,7 +1344,11 @@ static int trevrpc_rpc_copy_request_event(trevrpc_rpc_runtime* runtime,
     }
     if (request.kind > TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING || request.service_len > UINT32_MAX ||
         request.method_len > UINT32_MAX || request.body_len > runtime->max_message_size ||
-        trevrpc_rpc_validate_metadata_limits(runtime, &request.metadata) != 0) {
+        trevrpc_rpc_validate_metadata_limits(runtime, &request.metadata) != 0 ||
+        ((request.kind == TREVRPC_RPC_KIND_CLIENT_STREAMING ||
+             request.kind == TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) &&
+            ((runtime->max_stream_messages >= 0 && runtime->max_stream_messages == 0) ||
+                (runtime->max_stream_body_size >= 0 && request.body_len > (uint64_t)runtime->max_stream_body_size)))) {
         trevrpc_request_reset(&request);
         trevrpc_rpc_transport_receive_release(runtime->transport, transport_receive);
         trevrpc_rpc_abort_or_terminal(runtime, transport_stream, TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED, -EMSGSIZE);
@@ -1208,9 +1424,21 @@ static int trevrpc_rpc_copy_request_event(trevrpc_rpc_runtime* runtime,
     record = trevrpc_rpc_find_call_locked(runtime, call);
     if (record != NULL && !record->closing && !record->stream_terminal_committed && !record->call_terminal_committed) {
         record->kind = request.kind;
+        record->call_deadline_nanos = deadline_nanos;
+        record->has_deadline = deadline_nanos != TREVRPC_RPC_DEADLINE_INFINITE;
         record->deadline_nanos = deadline_nanos;
+        record->initial_request_deadline_nanos = 0;
         record->waiting_for_request = false;
-        if (record->deadline_nanos != TREVRPC_RPC_DEADLINE_INFINITE) {
+        if (request.kind == TREVRPC_RPC_KIND_CLIENT_STREAMING ||
+            request.kind == TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
+            record->request_message_count = 1;
+            record->request_body_size = request.body_len;
+        }
+        if (request.kind == TREVRPC_RPC_KIND_CLIENT_STREAMING ||
+            request.kind == TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
+            trevrpc_rpc_reset_idle_locked(runtime, record, false);
+        }
+        if (record->deadline_nanos != TREVRPC_RPC_DEADLINE_INFINITE || record->receive_idle_deadline_nanos != 0) {
             trevrpc_rpc_signal_driver_locked(runtime);
         }
         if (readable_event != NULL) {
@@ -1360,6 +1588,7 @@ static void trevrpc_rpc_fail_call_operations_locked(
     record->request_send_pending = false;
     record->send_finish_pending = false;
     record->send_closed = true;
+    record->send_idle_deadline_nanos = 0;
 }
 
 static bool trevrpc_rpc_operation_uses_send_direction(const trevrpc_rpc_operation* operation) {
@@ -1411,6 +1640,7 @@ static void trevrpc_rpc_handle_send_stopped_locked(
     record->request_send_pending = false;
     record->send_finish_pending = false;
     record->send_closed = true;
+    record->send_idle_deadline_nanos = 0;
 }
 
 static void trevrpc_rpc_handle_send_stopped(
@@ -1432,6 +1662,28 @@ static void trevrpc_rpc_publish_call_terminals_locked(
     uint64_t close_application_error_code =
         close_operation != NULL && close_operation->event != NULL ? close_operation->event->application_error_code : 0;
     if (record->stream_terminal_committed || record->call_terminal_committed) {
+        return;
+    }
+    if (record->suppress_terminals) {
+        trevrpc_rpc_event_destroy(record->deferred_receive_fin);
+        record->deferred_receive_fin = NULL;
+        trevrpc_rpc_drop_pending_receive_locked(runtime, record);
+        record->stream_terminal_committed = true;
+        record->call_terminal_committed = true;
+        record->stream_terminal_dequeued = true;
+        record->call_terminal_dequeued = true;
+        record->closing = true;
+        record->deadline_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
+        record->initial_request_deadline_nanos = 0;
+        trevrpc_rpc_release_reserved_event_locked(runtime, &record->stream_terminal_event);
+        trevrpc_rpc_release_reserved_event_locked(runtime, &record->call_terminal_event);
+        if (runtime->live_streams != 0) {
+            --runtime->live_streams;
+        }
+        if (runtime->live_calls != 0) {
+            --runtime->live_calls;
+        }
+        trevrpc_rpc_call_maybe_reclaim_locked(runtime, record);
         return;
     }
     if (record->deferred_receive_fin != NULL) {
@@ -1464,6 +1716,11 @@ static void trevrpc_rpc_publish_call_terminals_locked(
     }
     if (stream_event == NULL || call_event == NULL) {
         abort();
+    }
+    if ((info->flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET) != 0 ||
+        ((info->flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) != 0 &&
+            (info->flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLEAN_FIN) == 0)) {
+        record->cancelled = true;
     }
     trevrpc_rpc_fill_event_from_transport(stream_event, info);
     stream_event->kind = TREVRPC_RPC_EVENT_STREAM_CLOSED;
@@ -1611,6 +1868,7 @@ static void trevrpc_rpc_abort_or_terminal(trevrpc_rpc_runtime* runtime,
     record = trevrpc_rpc_find_call_by_transport_locked(runtime, stream);
     if (record != NULL && !record->stream_terminal_committed) {
         record->closing = true;
+        record->cancelled = true;
     }
     pthread_mutex_unlock(&runtime->mutex);
     abort_result = trevrpc_rpc_transport_stream_abort(runtime->transport, stream, application_error_code);
@@ -1651,6 +1909,7 @@ static void trevrpc_rpc_handle_send_complete(
         if (trevrpc_rpc_send_direction_stopped_status(status)) {
             status = 0;
             record->send_closed = true;
+            record->send_idle_deadline_nanos = 0;
         }
         if (status == 0 && !record->send_closed &&
             (record->kind == TREVRPC_RPC_KIND_UNARY || record->kind == TREVRPC_RPC_KIND_SERVER_STREAMING)) {
@@ -1671,7 +1930,13 @@ static void trevrpc_rpc_handle_send_complete(
             trevrpc_rpc_publish_call_terminals_locked(runtime, record, &failure);
             request_failed = true;
         } else {
-            trevrpc_rpc_complete_call_open_locked(runtime, record, info, TREVRPC_RPC_EVENT_CALL_READY, status);
+            trevrpc_rpc_reset_idle_locked(runtime, record, false);
+            if (record->receive_idle_deadline_nanos != 0) {
+                trevrpc_rpc_signal_driver_locked(runtime);
+            }
+            if (!record->awaiting_transport_acceptance || record->transport_accepted) {
+                trevrpc_rpc_complete_call_open_locked(runtime, record, info, TREVRPC_RPC_EVENT_CALL_READY, status);
+            }
         }
         pthread_mutex_unlock(&runtime->mutex);
         if (request_failed) {
@@ -1751,6 +2016,7 @@ static void trevrpc_rpc_handle_send_complete(
         operation->kind == TREVRPC_RPC_OPERATION_STREAM_FINISH) {
         record->send_finish_pending = false;
         record->send_closed = true;
+        record->send_idle_deadline_nanos = 0;
         finish_result = trevrpc_rpc_transport_stream_finish_send(runtime->transport, info->subject);
         if (record->local && operation->kind == TREVRPC_RPC_OPERATION_STREAM_FINISH &&
             trevrpc_rpc_send_direction_stopped_status(finish_result)) {
@@ -1856,6 +2122,10 @@ static int trevrpc_rpc_handle_transport_event(
     case TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC:
         event = trevrpc_rpc_event_from_transport(&info, TREVRPC_RPC_EVENT_DIAGNOSTIC);
         break;
+    case TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION:
+    case TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION:
+        trevrpc_rpc_promote_admission_event(runtime, transport_event, &info);
+        return 0;
     case TREVRPC_RPC_TRANSPORT_EVENT_STOPPED:
         pthread_mutex_lock(&runtime->mutex);
         if (runtime->live_calls != 0 || runtime->live_endpoints != 0 || runtime->operations != NULL) {
@@ -1933,6 +2203,9 @@ static int trevrpc_rpc_handle_transport_event(
     }
     case TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY: {
         trevrpc_rpc_call_record* record = NULL;
+        trevrpc_rpc_transport_event_protocol_info protocol = {0};
+        int protocol_result =
+            trevrpc_rpc_transport_event_get_protocol_info(runtime->transport, transport_event, &protocol);
         int32_t send_failure = 0;
         pthread_mutex_lock(&runtime->mutex);
         (void)trevrpc_rpc_find_or_create_peer_call_locked(runtime, &info, &record);
@@ -1945,6 +2218,8 @@ static int trevrpc_rpc_handle_transport_event(
             return 0;
         }
         if (record != NULL && !record->closing && record->request_frame != NULL && record->open_operation != NULL) {
+            record->awaiting_transport_acceptance =
+                protocol_result == 0 && protocol.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3;
             result = trevrpc_rpc_transport_stream_send(runtime->transport,
                 info.subject,
                 record->open_operation->transport_operation_id,
@@ -1963,6 +2238,20 @@ static int trevrpc_rpc_handle_transport_event(
         if (send_failure != 0) {
             trevrpc_rpc_abort_or_terminal(runtime, info.subject, TREVRPC_RPC_STATUS_INTERNAL, send_failure);
         }
+        trevrpc_rpc_transport_event_release(runtime->transport, transport_event);
+        return 0;
+    }
+    case TREVRPC_RPC_TRANSPORT_EVENT_STREAM_ACCEPTED: {
+        trevrpc_rpc_call_record* record;
+        pthread_mutex_lock(&runtime->mutex);
+        record = trevrpc_rpc_find_call_by_transport_locked(runtime, info.subject);
+        if (record != NULL && record->local && record->awaiting_transport_acceptance && !record->closing) {
+            record->transport_accepted = true;
+            if (record->open_operation != NULL && !record->request_send_pending && record->request_frame == NULL) {
+                trevrpc_rpc_complete_call_open_locked(runtime, record, &info, TREVRPC_RPC_EVENT_CALL_READY, 0);
+            }
+        }
+        pthread_mutex_unlock(&runtime->mutex);
         trevrpc_rpc_transport_event_release(runtime->transport, transport_event);
         return 0;
     }
@@ -2008,6 +2297,10 @@ static int trevrpc_rpc_handle_transport_event(
                 stream = record->stream;
                 transport_stream = record->transport_stream;
             } else {
+                trevrpc_rpc_reset_idle_locked(runtime, record, false);
+                if (record->receive_idle_deadline_nanos != 0) {
+                    trevrpc_rpc_signal_driver_locked(runtime);
+                }
                 event = trevrpc_rpc_event_from_transport(&info, TREVRPC_RPC_EVENT_STREAM_READABLE);
                 if (event == NULL) {
                     peer_result = -ENOMEM;
@@ -2071,6 +2364,7 @@ static int trevrpc_rpc_handle_transport_event(
         pthread_mutex_lock(&runtime->mutex);
         peer_result = trevrpc_rpc_find_or_create_peer_call_locked(runtime, &info, &record);
         if (record != NULL && !record->closing) {
+            record->receive_idle_deadline_nanos = 0;
             event = trevrpc_rpc_event_from_transport(&info, TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN);
             if (event == NULL) {
                 peer_result = -ENOMEM;
@@ -2152,8 +2446,20 @@ static int trevrpc_rpc_deadline_poll_timeout_locked(trevrpc_rpc_runtime* runtime
         return -1;
     }
     for (record = runtime->calls; record != NULL; record = record->next) {
-        if (!record->closing && !record->call_terminal_committed && record->deadline_nanos < earliest) {
+        if (record->closing || record->call_terminal_committed) {
+            continue;
+        }
+        if (record->deadline_nanos < earliest) {
             earliest = record->deadline_nanos;
+        }
+        if (record->initial_request_deadline_nanos != 0 && record->initial_request_deadline_nanos < earliest) {
+            earliest = record->initial_request_deadline_nanos;
+        }
+        if (record->send_idle_deadline_nanos != 0 && record->send_idle_deadline_nanos < earliest) {
+            earliest = record->send_idle_deadline_nanos;
+        }
+        if (record->receive_idle_deadline_nanos != 0 && record->receive_idle_deadline_nanos < earliest) {
+            earliest = record->receive_idle_deadline_nanos;
         }
     }
     if (earliest == TREVRPC_RPC_DEADLINE_INFINITE) {
@@ -2171,10 +2477,14 @@ static int trevrpc_rpc_deadline_poll_timeout_locked(trevrpc_rpc_runtime* runtime
 }
 
 static bool trevrpc_rpc_expire_one_deadline(trevrpc_rpc_runtime* runtime) {
+    enum timer_kind { TIMER_NONE, TIMER_CALL, TIMER_INITIAL, TIMER_SEND_IDLE, TIMER_RECEIVE_IDLE };
     trevrpc_rpc_transport_event_info info = {0};
     trevrpc_rpc_transport_handle transport_stream = {0};
     trevrpc_rpc_call_record* record;
+    trevrpc_rpc_call_record* selected_record = NULL;
+    enum timer_kind timer = TIMER_NONE;
     uint64_t now = 0;
+    uint64_t earliest;
     int abort_result;
     pthread_mutex_lock(&runtime->mutex);
     if (runtime->state != TREVRPC_RPC_STATE_RUNNING) {
@@ -2184,23 +2494,51 @@ static bool trevrpc_rpc_expire_one_deadline(trevrpc_rpc_runtime* runtime) {
     if (trevrpc_rpc_monotonic_nanos(&now) != 0) {
         now = UINT64_MAX;
     }
+    earliest = UINT64_MAX;
     for (record = runtime->calls; record != NULL; record = record->next) {
-        if (!record->closing && !record->call_terminal_committed &&
-            record->deadline_nanos != TREVRPC_RPC_DEADLINE_INFINITE && record->deadline_nanos <= now) {
+        if (record->closing || record->call_terminal_committed) {
+            continue;
+        }
+#define TREVRPC_RPC_PICK_TIMER(value, kind)                                                                            \
+    do {                                                                                                               \
+        if ((value) != 0 && (value) <= now && (value) < earliest) {                                                    \
+            earliest = (value);                                                                                        \
+            timer = (kind);                                                                                            \
+            selected_record = record;                                                                                  \
+        }                                                                                                              \
+    } while (0)
+        TREVRPC_RPC_PICK_TIMER(record->deadline_nanos, TIMER_CALL);
+        TREVRPC_RPC_PICK_TIMER(record->initial_request_deadline_nanos, TIMER_INITIAL);
+        TREVRPC_RPC_PICK_TIMER(record->send_idle_deadline_nanos, TIMER_SEND_IDLE);
+        TREVRPC_RPC_PICK_TIMER(record->receive_idle_deadline_nanos, TIMER_RECEIVE_IDLE);
+#undef TREVRPC_RPC_PICK_TIMER
+        if (timer != TIMER_NONE && earliest == 0) {
             break;
         }
     }
-    if (record == NULL) {
+    if (timer == TIMER_NONE || selected_record == NULL) {
         pthread_mutex_unlock(&runtime->mutex);
         return false;
     }
-    record->deadline_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
-    record->deadline_expired = true;
+    record = selected_record;
+    if (timer == TIMER_CALL) {
+        record->deadline_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
+    } else if (timer == TIMER_INITIAL) {
+        record->initial_request_deadline_nanos = 0;
+    } else if (timer == TIMER_SEND_IDLE) {
+        record->send_idle_deadline_nanos = 0;
+    } else {
+        record->receive_idle_deadline_nanos = 0;
+    }
     record->closing = true;
+    record->suppress_terminals = timer == TIMER_INITIAL && record->waiting_for_request;
+    record->deadline_expired = timer == TIMER_CALL;
+    record->cancelled = true;
     transport_stream = record->transport_stream;
     info.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL;
     info.status = -ETIMEDOUT;
-    info.application_error_code = TREVRPC_RPC_STATUS_DEADLINE_EXCEEDED;
+    info.application_error_code =
+        record->deadline_expired ? TREVRPC_RPC_STATUS_DEADLINE_EXCEEDED : TREVRPC_RPC_STATUS_UNAVAILABLE;
     if (record->open_operation != NULL) {
         trevrpc_rpc_complete_call_open_locked(runtime, record, &info, TREVRPC_RPC_EVENT_CALL_FAILED, -ETIMEDOUT);
     }
@@ -2212,7 +2550,7 @@ static bool trevrpc_rpc_expire_one_deadline(trevrpc_rpc_runtime* runtime) {
     pthread_mutex_unlock(&runtime->mutex);
 
     abort_result =
-        trevrpc_rpc_transport_stream_abort(runtime->transport, transport_stream, TREVRPC_RPC_STATUS_DEADLINE_EXCEEDED);
+        trevrpc_rpc_transport_stream_abort(runtime->transport, transport_stream, info.application_error_code);
     if (abort_result != 0 && abort_result != -EALREADY) {
         pthread_mutex_lock(&runtime->mutex);
         record = trevrpc_rpc_find_call_by_transport_locked(runtime, transport_stream);
@@ -2268,6 +2606,7 @@ static void trevrpc_rpc_transition_fatal_locked(trevrpc_rpc_runtime* runtime, in
     for (call = runtime->calls; call != NULL; call = call->next) {
         if (!call->stream_terminal_committed) {
             call->closing = true;
+            call->cancelled = true;
             trevrpc_rpc_publish_call_terminals_locked(runtime, call, &info);
         }
     }
@@ -2483,6 +2822,10 @@ int trevrpc_rpc_runtime_adopt_transport_v1(
     runtime->max_status_message_size = config->max_status_message_size;
     runtime->max_message_size = config->max_message_size;
     runtime->max_metadata_bytes = config->max_metadata_bytes;
+    runtime->initial_request_timeout_nanos = config->initial_request_timeout_nanos;
+    runtime->max_stream_messages = config->max_stream_messages;
+    runtime->max_stream_body_size = config->max_stream_body_size;
+    runtime->stream_idle_timeout_nanos = config->stream_idle_timeout_nanos;
     runtime->next_sequence = 1;
     runtime->next_transport_operation_id = 1;
     runtime->cancellation_sequence = 1;
@@ -2685,6 +3028,105 @@ int trevrpc_rpc_event_get_info_v1(const trevrpc_rpc_event* event, trevrpc_rpc_ev
     info->application_error_code = event->application_error_code;
     info->provider_error_code = event->provider_error_code;
     return 0;
+}
+
+static int trevrpc_rpc_call_get_context_v1_impl(
+    trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, trevrpc_rpc_call_context_info_v1* info) {
+    trevrpc_rpc_call_record* record;
+    uint64_t now = 0;
+    uint64_t remaining = 0;
+    int clock_result = 0;
+    if (runtime == NULL || info == NULL || info->struct_size < sizeof(*info)) {
+        return -EINVAL;
+    }
+    if (info->struct_version != TREVRPC_RPC_STRUCT_VERSION_1) {
+        return -ENOTSUP;
+    }
+    if (info->reserved0 != 0 || !trevrpc_rpc_u64_fields_zero(info->reserved, 4)) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&runtime->mutex);
+    record = trevrpc_rpc_find_call_locked(runtime, call);
+    if (record == NULL) {
+        pthread_mutex_unlock(&runtime->mutex);
+        return -ESTALE;
+    }
+    if (!record->caller_owns_call) {
+        int result = record->call_terminal_dequeued ? -ESTALE : -EACCES;
+        pthread_mutex_unlock(&runtime->mutex);
+        return result;
+    }
+    info->flags = 0;
+    if (record->has_deadline) {
+        info->flags |= TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE;
+        clock_result = trevrpc_rpc_monotonic_nanos(&now);
+        if (clock_result != 0) {
+            pthread_mutex_unlock(&runtime->mutex);
+            return clock_result;
+        }
+        if (record->deadline_expired) {
+            info->flags |= TREVRPC_RPC_CALL_CONTEXT_DEADLINE_EXPIRED;
+        } else if (record->call_deadline_nanos > now) {
+            remaining = record->call_deadline_nanos - now;
+        }
+    }
+    if (record->cancelled) {
+        info->flags |= TREVRPC_RPC_CALL_CONTEXT_CANCELLED;
+    }
+    info->time_remaining_nanos = remaining;
+    pthread_mutex_unlock(&runtime->mutex);
+    return 0;
+}
+
+int trevrpc_rpc_event_get_admission_info_v1(const trevrpc_rpc_event* event_const, trevrpc_rpc_admission_info_v1* info) {
+    trevrpc_rpc_event* event = (trevrpc_rpc_event*)event_const;
+    int result = 0;
+    if (event == NULL || info == NULL || info->struct_size < sizeof(*info)) {
+        return -EINVAL;
+    }
+    if (info->struct_version != TREVRPC_RPC_STRUCT_VERSION_1) {
+        return -ENOTSUP;
+    }
+    if (!trevrpc_rpc_u64_fields_zero(info->reserved, 4)) {
+        return -EINVAL;
+    }
+    if (event->admission_event == NULL) {
+        result =
+            event->kind == TREVRPC_RPC_EVENT_HTTP3_ADMISSION || event->kind == TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION
+                ? -ESTALE
+                : -ENOTSUP;
+    } else if (event->kind != TREVRPC_RPC_EVENT_HTTP3_ADMISSION &&
+               event->kind != TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION) {
+        result = -ENOTSUP;
+    } else {
+        info->protocol = event->admission_protocol;
+        info->flags = event->admission_flags;
+        info->listener = event->admission_listener;
+        info->path = event->admission_path;
+        info->path_len = event->admission_path_len;
+        info->authority = event->admission_authority;
+        info->authority_len = event->admission_authority_len;
+        info->origin = event->admission_origin;
+        info->origin_len = event->admission_origin_len;
+    }
+    return result;
+}
+
+int trevrpc_rpc_admission_respond_v1(const trevrpc_rpc_event* event_const, uint16_t http_status) {
+    trevrpc_rpc_event* event = (trevrpc_rpc_event*)event_const;
+    int result;
+    if (event == NULL || (http_status != 200 && (http_status < 400 || http_status > 599))) {
+        return -EINVAL;
+    }
+    if (event->kind != TREVRPC_RPC_EVENT_HTTP3_ADMISSION && event->kind != TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION) {
+        result = -ENOTSUP;
+    } else if (event->admission_event == NULL) {
+        result = -ESTALE;
+    } else {
+        result =
+            trevrpc_rpc_transport_admission_respond(event->admission_transport, event->admission_event, http_status);
+    }
+    return result;
 }
 
 int trevrpc_rpc_event_take_incoming_call(trevrpc_rpc_event* event,
@@ -3035,7 +3477,13 @@ static int trevrpc_rpc_call_open_v1_impl(trevrpc_rpc_runtime* runtime,
         record->open_operation = operation;
         record->request_frame = request_frame;
         record->request_frame_len = request_frame_len;
+        record->call_deadline_nanos = deadline_nanos;
+        record->has_deadline = deadline_nanos != TREVRPC_RPC_DEADLINE_INFINITE;
         record->deadline_nanos = deadline_nanos;
+        record->max_response_messages = config->max_response_messages;
+        record->max_response_body_size = config->max_response_body_size;
+        record->max_response_stream_body_size = config->max_response_stream_body_size;
+        record->response_idle_timeout_nanos = config->response_idle_timeout_nanos;
         record->local = true;
         record->caller_owns_call = true;
         record->caller_owns_stream = true;
@@ -3103,6 +3551,10 @@ static int trevrpc_rpc_call_accept_impl(trevrpc_rpc_runtime* runtime, trevrpc_rp
     }
     if (result == 0) {
         record->accepted = true;
+        trevrpc_rpc_reset_idle_locked(runtime, record, true);
+        if (record->send_idle_deadline_nanos != 0) {
+            trevrpc_rpc_signal_driver_locked(runtime);
+        }
         operation->event->subject_kind = TREVRPC_RPC_OBJECT_CALL;
         operation->event->endpoint = record->endpoint;
         operation->event->call = call;
@@ -3128,6 +3580,9 @@ static int trevrpc_rpc_stream_send_copy_v1_impl(trevrpc_rpc_runtime* runtime,
     trevrpc_rpc_operation* operation;
     uint8_t* frame = NULL;
     size_t frame_len = 0;
+    uint64_t previous_message_count = 0;
+    uint64_t previous_body_size = 0;
+    bool reserved_limit = false;
     int result;
     if (runtime == NULL || operation_id == 0 || flags != 0 || (message == NULL && message_len != 0) ||
         message_len > runtime->max_message_size || runtime->max_message_size > SIZE_MAX - (64u * 1024u)) {
@@ -3161,20 +3616,43 @@ static int trevrpc_rpc_stream_send_copy_v1_impl(trevrpc_rpc_runtime* runtime,
     } else if (!record->local && !record->accepted) {
         result = -EACCES;
     } else {
-        result = trevrpc_rpc_operation_admit_locked(runtime,
-            operation,
-            TREVRPC_RPC_OBJECT_STREAM,
-            stream.owner,
-            stream.slot,
-            stream.generation,
-            TREVRPC_RPC_OBJECT_CALL,
-            record->call.owner,
-            record->call.slot,
-            record->call.generation);
+        previous_message_count = record->response_message_count;
+        previous_body_size = record->response_body_size;
+        if (!record->local && record->kind != TREVRPC_RPC_KIND_UNARY) {
+            result = trevrpc_rpc_reserve_message_locked(&record->response_message_count,
+                &record->response_body_size,
+                record->max_send_messages,
+                record->max_send_body_size,
+                message_len);
+            reserved_limit = result == 0;
+        } else {
+            result = 0;
+        }
+        if (result == 0) {
+            result = trevrpc_rpc_operation_admit_locked(runtime,
+                operation,
+                TREVRPC_RPC_OBJECT_STREAM,
+                stream.owner,
+                stream.slot,
+                stream.generation,
+                TREVRPC_RPC_OBJECT_CALL,
+                record->call.owner,
+                record->call.slot,
+                record->call.generation);
+        }
     }
     if (result == 0) {
         result = trevrpc_rpc_transport_stream_send(
             runtime->transport, record->transport_stream, operation->transport_operation_id, frame + 4, frame_len - 4);
+    }
+    if (result == 0) {
+        trevrpc_rpc_reset_idle_locked(runtime, record, true);
+        if (record->send_idle_deadline_nanos != 0) {
+            trevrpc_rpc_signal_driver_locked(runtime);
+        }
+    } else if (reserved_limit && record != NULL) {
+        record->response_message_count = previous_message_count;
+        record->response_body_size = previous_body_size;
     }
     if (result != 0 && operation->subject_owner != 0) {
         trevrpc_rpc_operation_remove_locked(runtime, operation, true);
@@ -3303,6 +3781,9 @@ static int trevrpc_rpc_stream_receive_impl(
     uint64_t readable_epoch;
     trevrpc_wire_diagnostic diagnostic = {0};
     bool abort_stream = false;
+    bool receive_limit_reserved = false;
+    uint64_t previous_receive_message_count = 0;
+    uint64_t previous_receive_body_size = 0;
     int result;
     if (runtime == NULL || out_receive == NULL) {
         return -EINVAL;
@@ -3404,11 +3885,45 @@ receive_next:
         record->last_receive_diagnostic = diagnostic.reason;
     }
     pthread_mutex_unlock(&runtime->mutex);
+    if (result == 0) {
+        pthread_mutex_lock(&runtime->mutex);
+        record = trevrpc_rpc_find_stream_locked(runtime, stream);
+        if (record == NULL) {
+            result = -ESTALE;
+        } else if (decode_unary_response) {
+            if (record->max_response_body_size >= 0 && response->body.len > (uint64_t)record->max_response_body_size) {
+                result = -EMSGSIZE;
+            }
+        } else if (frame->kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
+            previous_receive_message_count =
+                record->local ? record->response_message_count : record->request_message_count;
+            previous_receive_body_size = record->local ? record->response_body_size : record->request_body_size;
+            result = trevrpc_rpc_reserve_message_locked(
+                record->local ? &record->response_message_count : &record->request_message_count,
+                record->local ? &record->response_body_size : &record->request_body_size,
+                record->local ? record->max_response_messages : record->max_receive_messages,
+                record->local ? record->max_response_stream_body_size : record->max_receive_body_size,
+                frame->body.len);
+            receive_limit_reserved = result == 0;
+        }
+        pthread_mutex_unlock(&runtime->mutex);
+        if (result == -EMSGSIZE) {
+            abort_stream = true;
+        }
+    }
     if (consume_peer_status) {
         trevrpc_internal_stream_frame_free(frame);
         frame = NULL;
         trevrpc_rpc_transport_receive_release(runtime->transport, transport_receive);
         transport_receive = NULL;
+        pthread_mutex_lock(&runtime->mutex);
+        record = trevrpc_rpc_find_stream_locked(runtime, stream);
+        if (record != NULL) {
+            /* A successful peer status closes the request direction; a
+             * delayed transport FIN must not rearm an already-complete idle timer. */
+            record->receive_idle_deadline_nanos = 0;
+        }
+        pthread_mutex_unlock(&runtime->mutex);
         consume_peer_status = false;
         goto receive_next;
     }
@@ -3458,6 +3973,20 @@ receive_next:
         }
         trevrpc_internal_stream_frame_free(frame);
     }
+    if (result != 0 && receive_limit_reserved) {
+        pthread_mutex_lock(&runtime->mutex);
+        record = trevrpc_rpc_find_stream_locked(runtime, stream);
+        if (record != NULL) {
+            if (record->local) {
+                record->response_message_count = previous_receive_message_count;
+                record->response_body_size = previous_receive_body_size;
+            } else {
+                record->request_message_count = previous_receive_message_count;
+                record->request_body_size = previous_receive_body_size;
+            }
+        }
+        pthread_mutex_unlock(&runtime->mutex);
+    }
     if (result == -ENOMEM) {
         int restore_result = trevrpc_rpc_stream_receive_restore(runtime, stream, transport_receive, readable_epoch);
         if (restore_result != 0 && restore_result != -ESTALE) {
@@ -3486,9 +4015,23 @@ receive_next:
         record = trevrpc_rpc_find_stream_locked(runtime, stream);
         if (record != NULL) {
             record->peer_status_received = true;
+            record->receive_idle_deadline_nanos = 0;
         }
         pthread_mutex_unlock(&runtime->mutex);
     }
+    pthread_mutex_lock(&runtime->mutex);
+    record = trevrpc_rpc_find_stream_locked(runtime, stream);
+    if (record != NULL) {
+        if (decode_unary_response || receive->kind == TREVRPC_RPC_RECEIVE_STATUS) {
+            record->receive_idle_deadline_nanos = 0;
+        } else {
+            trevrpc_rpc_reset_idle_locked(runtime, record, false);
+            if (record->receive_idle_deadline_nanos != 0) {
+                trevrpc_rpc_signal_driver_locked(runtime);
+            }
+        }
+    }
+    pthread_mutex_unlock(&runtime->mutex);
     *out_receive = receive;
     trevrpc_rpc_stream_receive_leave(runtime, stream);
     return 0;
@@ -3566,6 +4109,7 @@ static int trevrpc_rpc_stream_finish_send_impl(
     }
     if (result == 0) {
         record->send_finish_pending = true;
+        trevrpc_rpc_reset_idle_locked(runtime, record, true);
         result = trevrpc_rpc_transport_stream_send(
             runtime->transport, record->transport_stream, operation->transport_operation_id, frame + 4, frame_len - 4);
     }
@@ -3615,6 +4159,9 @@ static int trevrpc_rpc_call_respond_copy_v1_impl(trevrpc_rpc_runtime* runtime,
     uint8_t* continuation_frame = NULL;
     size_t continuation_frame_len = 0;
     uint32_t call_kind;
+    uint64_t previous_message_count = 0;
+    uint64_t previous_body_size = 0;
+    bool reserved_limit = false;
     int result;
     if (runtime == NULL || status == NULL || operation_id == 0 || status->struct_size < sizeof(*status) ||
         status->struct_version != TREVRPC_RPC_STRUCT_VERSION_1 || status->code > TREVRPC_RPC_STATUS_UNAUTHENTICATED ||
@@ -3713,26 +4260,49 @@ static int trevrpc_rpc_call_respond_copy_v1_impl(trevrpc_rpc_runtime* runtime,
     } else if (record->closing || record->send_finish_pending || record->send_closed) {
         result = -EPIPE;
     } else {
-        result = trevrpc_rpc_operation_admit_locked(runtime,
-            operation,
-            TREVRPC_RPC_OBJECT_STREAM,
-            call.owner,
-            call.slot,
-            call.generation,
-            TREVRPC_RPC_OBJECT_CALL,
-            call.owner,
-            call.slot,
-            call.generation);
+        previous_message_count = record->response_message_count;
+        previous_body_size = record->response_body_size;
+        if (status->code == TREVRPC_RPC_STATUS_OK && record->kind == TREVRPC_RPC_KIND_CLIENT_STREAMING) {
+            result = trevrpc_rpc_reserve_message_locked(&record->response_message_count,
+                &record->response_body_size,
+                record->max_send_messages,
+                record->max_send_body_size,
+                message_len);
+            reserved_limit = result == 0;
+        } else {
+            result = 0;
+        }
+        if (result == 0) {
+            result = trevrpc_rpc_operation_admit_locked(runtime,
+                operation,
+                TREVRPC_RPC_OBJECT_STREAM,
+                call.owner,
+                call.slot,
+                call.generation,
+                TREVRPC_RPC_OBJECT_CALL,
+                call.owner,
+                call.slot,
+                call.generation);
+        }
     }
     if (result == 0) {
         record->send_finish_pending = true;
+        trevrpc_rpc_reset_idle_locked(runtime, record, true);
         result = trevrpc_rpc_transport_stream_send(
             runtime->transport, record->transport_stream, operation->transport_operation_id, frame + 4, frame_len - 4);
     }
-    if (result != 0 && operation->subject_owner != 0) {
-        record->send_finish_pending = false;
-        trevrpc_rpc_operation_remove_locked(runtime, operation, true);
-        operation = NULL;
+    if (result != 0) {
+        if (record != NULL) {
+            record->send_finish_pending = false;
+            if (reserved_limit) {
+                record->response_message_count = previous_message_count;
+                record->response_body_size = previous_body_size;
+            }
+        }
+        if (operation->subject_owner != 0) {
+            trevrpc_rpc_operation_remove_locked(runtime, operation, true);
+            operation = NULL;
+        }
     }
     pthread_mutex_unlock(&runtime->mutex);
     free(frame);
@@ -3810,6 +4380,10 @@ static int trevrpc_rpc_call_finish_v1_impl(trevrpc_rpc_runtime* runtime,
     }
     if (result == 0) {
         record->send_finish_pending = true;
+        trevrpc_rpc_reset_idle_locked(runtime, record, true);
+        if (record->send_idle_deadline_nanos != 0) {
+            trevrpc_rpc_signal_driver_locked(runtime);
+        }
         operation->event->rpc_status = status->code;
         result = trevrpc_rpc_transport_stream_send(
             runtime->transport, record->transport_stream, operation->transport_operation_id, frame + 4, frame_len - 4);
@@ -3834,6 +4408,7 @@ static int trevrpc_rpc_call_cancel_impl(
     trevrpc_rpc_operation* operation;
     trevrpc_rpc_transport_event_info deferred_terminal = {0};
     bool publish_deferred_terminal = false;
+    bool was_cancelled = false;
     int result;
     if (runtime == NULL || operation_id == 0) {
         return -EINVAL;
@@ -3863,6 +4438,8 @@ static int trevrpc_rpc_call_cancel_impl(
     }
     if (result == 0) {
         record->closing = true;
+        was_cancelled = record->cancelled;
+        record->cancelled = true;
         if (record->deferred_stream_terminal_valid) {
             deferred_terminal = record->deferred_stream_terminal;
             publish_deferred_terminal = true;
@@ -3884,6 +4461,7 @@ static int trevrpc_rpc_call_cancel_impl(
         }
     } else if (operation->subject_owner != 0) {
         record->closing = false;
+        record->cancelled = was_cancelled;
         trevrpc_rpc_operation_remove_locked(runtime, operation, true);
         operation = NULL;
     }
@@ -3906,6 +4484,7 @@ static int trevrpc_rpc_close_call(trevrpc_rpc_runtime* runtime,
     trevrpc_rpc_operation* operation;
     uint32_t subject_kind =
         operation_kind == TREVRPC_RPC_OPERATION_STREAM_CLOSE ? TREVRPC_RPC_OBJECT_STREAM : TREVRPC_RPC_OBJECT_CALL;
+    bool was_cancelled = false;
     int result;
     if (runtime == NULL || operation_id == 0 || (flags & ~TREVRPC_RPC_CLOSE_FLAG_ABORT) != 0) {
         return -EINVAL;
@@ -3934,6 +4513,10 @@ static int trevrpc_rpc_close_call(trevrpc_rpc_runtime* runtime,
     }
     if (result == 0) {
         record->closing = true;
+        was_cancelled = record->cancelled;
+        if ((flags & TREVRPC_RPC_CLOSE_FLAG_ABORT) != 0) {
+            record->cancelled = true;
+        }
         record->close_operation = operation;
         operation->event->application_error_code = application_error_code;
         if (record->deferred_stream_terminal_valid) {
@@ -3948,6 +4531,7 @@ static int trevrpc_rpc_close_call(trevrpc_rpc_runtime* runtime,
     }
     if (result != 0 && operation->subject_owner != 0) {
         record->closing = false;
+        record->cancelled = was_cancelled;
         record->close_operation = NULL;
         trevrpc_rpc_operation_remove_locked(runtime, operation, true);
         operation = NULL;
@@ -4225,6 +4809,7 @@ static int trevrpc_rpc_cancellation_cancel_impl(
                     abort();
                 }
                 call->closing = true;
+                call->cancelled = true;
                 streams[stream_count++] = call->transport_stream;
             }
         }
@@ -4298,6 +4883,7 @@ static int trevrpc_rpc_cancellation_release_impl(
 }
 
 static int trevrpc_rpc_runtime_close_impl(trevrpc_rpc_runtime* runtime, uint64_t operation_id) {
+    trevrpc_rpc_call_record* call;
     trevrpc_rpc_event* event;
     int result;
     if (runtime == NULL || operation_id == 0) {
@@ -4311,17 +4897,26 @@ static int trevrpc_rpc_runtime_close_impl(trevrpc_rpc_runtime* runtime, uint64_t
     event = runtime->close_event;
     runtime->state = TREVRPC_RPC_STATE_STOPPING;
     runtime->close_operation_id = operation_id;
+    for (call = runtime->calls; call != NULL; call = call->next) {
+        call->runtime_close_target = !call->stream_terminal_committed;
+    }
     pthread_cond_broadcast(&runtime->condition);
     pthread_mutex_unlock(&runtime->mutex);
     result = trevrpc_rpc_transport_close(runtime->transport);
-    if (result != 0) {
-        pthread_mutex_lock(&runtime->mutex);
-        if (runtime->state == TREVRPC_RPC_STATE_STOPPING && runtime->close_event == event) {
-            runtime->state = TREVRPC_RPC_STATE_RUNNING;
-            runtime->close_operation_id = 0;
-        }
-        pthread_mutex_unlock(&runtime->mutex);
+    pthread_mutex_lock(&runtime->mutex);
+    if (result != 0 && runtime->state == TREVRPC_RPC_STATE_STOPPING && runtime->close_event == event) {
+        runtime->state = TREVRPC_RPC_STATE_RUNNING;
+        runtime->close_operation_id = 0;
     }
+    for (call = runtime->calls; call != NULL; call = call->next) {
+        if (call->runtime_close_target) {
+            if (result == 0) {
+                call->cancelled = true;
+            }
+            call->runtime_close_target = false;
+        }
+    }
+    pthread_mutex_unlock(&runtime->mutex);
     return result;
 }
 
@@ -4363,6 +4958,11 @@ int trevrpc_rpc_runtime_next_event(trevrpc_rpc_runtime* runtime, trevrpc_rpc_eve
 
 int trevrpc_rpc_runtime_get_diagnostics_v1(trevrpc_rpc_runtime* runtime, trevrpc_rpc_diagnostics_v1* diagnostics) {
     TREVRPC_RPC_API_FORWARD(runtime, trevrpc_rpc_runtime_get_diagnostics_v1_impl(runtime, diagnostics));
+}
+
+int trevrpc_rpc_call_get_context_v1(
+    trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call, trevrpc_rpc_call_context_info_v1* info) {
+    TREVRPC_RPC_API_FORWARD(runtime, trevrpc_rpc_call_get_context_v1_impl(runtime, call, info));
 }
 
 int trevrpc_rpc_runtime_start_transport_endpoint_v1(trevrpc_rpc_runtime* runtime,

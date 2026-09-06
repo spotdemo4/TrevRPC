@@ -18,6 +18,11 @@ const trevrpc_rpc_transport_handle fake_second_stream_handle = {UINT64_C(0x3333)
 struct fake_event {
     fake_transport* transport;
     trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_admission_info admission;
+    uint8_t* admission_path;
+    uint8_t* admission_authority;
+    uint8_t* admission_origin;
+    bool admission_decided;
 };
 
 struct fake_receive {
@@ -51,7 +56,7 @@ void fake_drain_wake_locked(fake_transport* transport) {
 }
 
 int fake_enqueue_event(fake_transport* transport, const trevrpc_rpc_transport_event_info* info) {
-    fake_event* event = malloc(sizeof(*event));
+    fake_event* event = calloc(1, sizeof(*event));
     if (event == NULL) {
         return -ENOMEM;
     }
@@ -143,6 +148,91 @@ int fake_push_operation_event(fake_transport* transport,
     trevrpc_rpc_transport_handle parent,
     uint64_t operation_id) {
     return fake_push_operation_status_event(transport, kind, flags, subject, parent, operation_id, 0);
+}
+
+static int fake_copy_bytes(const uint8_t* source, size_t source_len, uint8_t** out_copy) {
+    *out_copy = NULL;
+    if (source_len == 0) {
+        return 0;
+    }
+    if (source == NULL) {
+        return -EINVAL;
+    }
+    *out_copy = malloc(source_len);
+    if (*out_copy == NULL) {
+        return -ENOMEM;
+    }
+    memcpy(*out_copy, source, source_len);
+    return 0;
+}
+
+int fake_push_admission_event(fake_transport* transport,
+    uint32_t kind,
+    const uint8_t* path,
+    size_t path_len,
+    const uint8_t* authority,
+    size_t authority_len,
+    const uint8_t* origin,
+    size_t origin_len) {
+    fake_event* event;
+    int result;
+    if (kind != TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION &&
+        kind != TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION) {
+        return -EINVAL;
+    }
+    event = calloc(1, sizeof(*event));
+    if (event == NULL) {
+        return -ENOMEM;
+    }
+    result = fake_copy_bytes(path, path_len, &event->admission_path);
+    if (result == 0) {
+        result = fake_copy_bytes(authority, authority_len, &event->admission_authority);
+    }
+    if (result == 0) {
+        result = fake_copy_bytes(origin, origin_len, &event->admission_origin);
+    }
+    if (result != 0) {
+        free(event->admission_path);
+        free(event->admission_authority);
+        free(event->admission_origin);
+        free(event);
+        return result;
+    }
+    event->transport = transport;
+    event->info.kind = kind;
+    event->info.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER;
+    event->info.subject_kind = TREVRPC_RPC_TRANSPORT_OBJECT_STREAM;
+    event->info.subject = fake_stream_handle;
+    event->info.parent = fake_listener_handle;
+    event->admission.protocol = kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION
+                                    ? TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3
+                                    : TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT;
+    event->admission.listener = fake_listener_handle;
+    event->admission.path = event->admission_path;
+    event->admission.path_len = path_len;
+    event->admission.authority = event->admission_authority;
+    event->admission.authority_len = authority_len;
+    event->admission.origin = event->admission_origin;
+    event->admission.origin_len = origin_len;
+    pthread_mutex_lock(&transport->mutex);
+    if (transport->event_count == FAKE_EVENT_CAPACITY) {
+        pthread_mutex_unlock(&transport->mutex);
+        free(event->admission_path);
+        free(event->admission_authority);
+        free(event->admission_origin);
+        free(event);
+        return -EAGAIN;
+    }
+    transport->events[transport->event_tail] = event;
+    transport->event_tail = (transport->event_tail + 1u) % FAKE_EVENT_CAPACITY;
+    ++transport->event_count;
+    {
+        uint8_t byte = 1;
+        ssize_t written = write(transport->wake_write_fd, &byte, sizeof(byte));
+        (void)written;
+    }
+    pthread_mutex_unlock(&transport->mutex);
+    return 0;
 }
 
 int fake_push_receive(fake_transport* transport, const uint8_t* data, size_t data_len) {
@@ -286,10 +376,67 @@ int fake_event_get_info(const trevrpc_rpc_transport_event* transport_event, trev
     return 0;
 }
 
+static int fake_event_get_admission_info(
+    const trevrpc_rpc_transport_event* transport_event, trevrpc_rpc_transport_admission_info* info) {
+    const fake_event* event = (const fake_event*)transport_event;
+    fake_transport* transport = event->transport;
+    int result;
+    if (event->info.kind != TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION &&
+        event->info.kind != TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION) {
+        return -ENOTSUP;
+    }
+    pthread_mutex_lock(&transport->mutex);
+    if (transport->admission_info_blocked) {
+        transport->admission_info_entered = true;
+        pthread_cond_broadcast(&transport->condition);
+        while (!transport->admission_info_release) {
+            pthread_cond_wait(&transport->condition, &transport->mutex);
+        }
+    }
+    pthread_mutex_unlock(&transport->mutex);
+    result = atomic_exchange_explicit(&transport->admission_get_info_result, 0, memory_order_acq_rel);
+    if (result != 0) {
+        return result;
+    }
+    *info = event->admission;
+    return 0;
+}
+
+static int fake_admission_respond(const trevrpc_rpc_transport_event* transport_event, uint16_t status) {
+    fake_event* event = (fake_event*)transport_event;
+    fake_transport* transport;
+    int result;
+    if (event == NULL || (status != 200 && (status < 400 || status > 599))) {
+        return -EINVAL;
+    }
+    if (event->info.kind != TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION &&
+        event->info.kind != TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION) {
+        return -ENOTSUP;
+    }
+    transport = event->transport;
+    pthread_mutex_lock(&transport->mutex);
+    if (event->admission_decided) {
+        pthread_mutex_unlock(&transport->mutex);
+        return -EALREADY;
+    }
+    event->admission_decided = true;
+    atomic_store_explicit(&transport->admission_last_status, status, memory_order_relaxed);
+    atomic_fetch_add_explicit(&transport->admission_response_calls, 1, memory_order_release);
+    result = atomic_exchange_explicit(&transport->admission_respond_result, 0, memory_order_acq_rel);
+    pthread_cond_broadcast(&transport->condition);
+    pthread_mutex_unlock(&transport->mutex);
+    return result;
+}
+
 void fake_event_release(trevrpc_rpc_transport_event* transport_event) {
     fake_event* event = (fake_event*)transport_event;
     if (event == NULL) {
         return;
+    }
+    if (!event->admission_decided && (event->info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION ||
+                                         event->info.kind == TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION)) {
+        atomic_fetch_add_explicit(&event->transport->admission_undecided_release_calls, 1, memory_order_release);
+        (void)fake_admission_respond(transport_event, 500);
     }
     pthread_mutex_lock(&event->transport->mutex);
     if (event->info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE) {
@@ -302,6 +449,9 @@ void fake_event_release(trevrpc_rpc_transport_event* transport_event) {
     }
     pthread_cond_broadcast(&event->transport->condition);
     pthread_mutex_unlock(&event->transport->mutex);
+    free(event->admission_path);
+    free(event->admission_authority);
+    free(event->admission_origin);
     free(event);
 }
 
@@ -592,6 +742,13 @@ int fake_listener_close(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_
         return -ESTALE;
     }
     pthread_mutex_lock(&fake->mutex);
+    if (fake->listener_close_blocked) {
+        fake->listener_close_entered = true;
+        pthread_cond_broadcast(&fake->condition);
+        while (!fake->listener_close_release) {
+            pthread_cond_wait(&fake->condition, &fake->mutex);
+        }
+    }
     if (fake->listener_closed) {
         pthread_mutex_unlock(&fake->mutex);
         return -EALREADY;
@@ -647,8 +804,13 @@ void fake_destroy(trevrpc_rpc_transport* transport) {
     size_t index;
     pthread_mutex_lock(&fake->mutex);
     for (index = 0; index < FAKE_EVENT_CAPACITY; ++index) {
-        free(fake->events[index]);
-        fake->events[index] = NULL;
+        if (fake->events[index] != NULL) {
+            free(fake->events[index]->admission_path);
+            free(fake->events[index]->admission_authority);
+            free(fake->events[index]->admission_origin);
+            free(fake->events[index]);
+            fake->events[index] = NULL;
+        }
     }
     while (fake->stream_receive_head != NULL) {
         fake_receive* receive = fake->stream_receive_head;
@@ -676,6 +838,8 @@ static const trevrpc_rpc_transport_ops fake_ops = {
     .get_wake_source = fake_get_wake_source,
     .next_event = fake_next_event,
     .event_get_info = fake_event_get_info,
+    .event_get_admission_info = fake_event_get_admission_info,
+    .admission_respond = fake_admission_respond,
     .event_release = fake_event_release,
     .receive_get_info = fake_receive_get_info,
     .receive_release = fake_receive_release,
@@ -780,12 +944,17 @@ fake_transport* fake_create(void) {
     atomic_init(&fake->stream_close_calls, 0);
     atomic_init(&fake->stream_send_calls, 0);
     atomic_init(&fake->stream_finish_send_calls, 0);
+    atomic_init(&fake->admission_response_calls, 0);
+    atomic_init(&fake->admission_undecided_release_calls, 0);
+    atomic_init(&fake->admission_last_status, 0);
     atomic_init(&fake->next_event_result, 0);
     atomic_init(&fake->poll_timeout_ms, -1);
     atomic_init(&fake->poll_deadline_nanos, 0);
     atomic_init(&fake->poll_timeout_fires, 0);
     atomic_init(&fake->stream_receive_result, 0);
     atomic_init(&fake->event_get_info_result, 0);
+    atomic_init(&fake->admission_get_info_result, 0);
+    atomic_init(&fake->admission_respond_result, 0);
     atomic_init(&fake->receive_get_info_result, 0);
     atomic_init(&fake->stream_send_result, 0);
     atomic_init(&fake->release_handle_result, 0);
