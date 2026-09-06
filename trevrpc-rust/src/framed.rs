@@ -59,8 +59,10 @@ pub(crate) trait FrameTrace {
     }
 }
 
+#[cfg(any(feature = "http3", feature = "webtransport-client", test))]
 pub(crate) struct NoopFrameTrace;
 
+#[cfg(any(feature = "http3", feature = "webtransport-client", test))]
 impl FrameTrace for NoopFrameTrace {}
 
 pub(crate) async fn write_frame<W, T, M>(

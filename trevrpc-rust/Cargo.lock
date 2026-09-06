@@ -1984,6 +1984,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "trevrpc-native",
  "url",
  "web-transport-quinn",
 ]
@@ -2010,12 +2011,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "trevrpc-c-sys"
+version = "0.1.0"
+
+[[package]]
 name = "trevrpc-conformance-rust"
 version = "0.1.11"
 dependencies = [
  "prost",
  "serde_json",
  "trevrpc",
+]
+
+[[package]]
+name = "trevrpc-native"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "libc",
+ "tokio",
+ "trevrpc-c-sys",
 ]
 
 [[package]]

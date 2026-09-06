@@ -23,18 +23,7 @@ where
     M: Message,
 {
     let encoded_len = message.encoded_len();
-
-    if encoded_len > max_frame_size {
-        return Err(Error::FrameTooLarge {
-            len: encoded_len,
-            max: max_frame_size,
-        });
-    }
-
-    let frame_len = u32::try_from(encoded_len).map_err(|_| Error::FrameTooLarge {
-        len: encoded_len,
-        max: max_frame_size,
-    })?;
+    let frame_len = validate_frame_body_len(encoded_len, max_frame_size)?;
 
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + encoded_len);
     frame.extend_from_slice(&frame_len.to_be_bytes());
@@ -43,13 +32,48 @@ where
     Ok(frame)
 }
 
+/// Encodes a protobuf message body with the default `TrevRPC` frame size limit.
+pub fn encode_frame_body<M>(message: &M) -> Result<Vec<u8>>
+where
+    M: Message,
+{
+    encode_frame_body_with_max(message, DEFAULT_MAX_FRAME_SIZE)
+}
+
+/// Encodes only the protobuf body of a `TrevRPC` frame.
+pub fn encode_frame_body_with_max<M>(message: &M, max_frame_size: usize) -> Result<Vec<u8>>
+where
+    M: Message,
+{
+    let encoded_len = message.encoded_len();
+    validate_frame_body_len(encoded_len, max_frame_size)?;
+
+    let mut body = Vec::with_capacity(encoded_len);
+    message.encode(&mut body)?;
+
+    Ok(body)
+}
+
+/// Encodes an `RpcStreamFrame` body with the default `TrevRPC` frame size limit.
+pub fn encode_stream_frame_body(frame: &RpcStreamFrame) -> Result<Vec<u8>> {
+    encode_stream_frame_body_with_max(frame, DEFAULT_MAX_FRAME_SIZE)
+}
+
+/// Encodes only the protobuf body of an `RpcStreamFrame`.
+pub fn encode_stream_frame_body_with_max(
+    frame: &RpcStreamFrame,
+    max_frame_size: usize,
+) -> Result<Vec<u8>> {
+    encode_frame_body_with_max(frame, max_frame_size)
+}
+
 /// Encodes one stream message frame carrying an already-encoded protobuf body.
 pub fn encode_message_stream_frame(body: &[u8], max_frame_size: usize) -> Result<Vec<u8>> {
     let body_len = message_stream_frame_body_len(body.len());
-    check_frame_body_len(body_len, max_frame_size)?;
+    let frame_len = validate_frame_body_len(body_len, max_frame_size)?;
 
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + body_len);
-    frame.extend_from_slice(&frame_len(body_len, max_frame_size)?.to_be_bytes());
+    frame.extend_from_slice(&frame_len.to_be_bytes());
     append_message_stream_frame_body(&mut frame, body);
 
     Ok(frame)
@@ -62,10 +86,10 @@ pub(crate) fn encode_message_stream_frame_prefix(
     frame: &mut Vec<u8>,
 ) -> Result<()> {
     let frame_body_len = message_stream_frame_body_len(body_len);
-    check_frame_body_len(frame_body_len, max_frame_size)?;
+    let frame_len = validate_frame_body_len(frame_body_len, max_frame_size)?;
 
     frame.clear();
-    frame.extend_from_slice(&frame_len(frame_body_len, max_frame_size)?.to_be_bytes());
+    frame.extend_from_slice(&frame_len.to_be_bytes());
     if body_len != 0 {
         frame.push(STREAM_FRAME_BODY_TAG);
         append_varint_usize(frame, body_len);
@@ -79,14 +103,15 @@ pub fn encode_message_stream_frames(bodies: &[Vec<u8>], max_frame_size: usize) -
     let mut total_len = 0_usize;
     for body in bodies {
         let body_len = message_stream_frame_body_len(body.len());
-        check_frame_body_len(body_len, max_frame_size)?;
+        validate_frame_body_len(body_len, max_frame_size)?;
         total_len = total_len.saturating_add(FRAME_HEADER_LEN + body_len);
     }
 
     let mut frames = Vec::with_capacity(total_len);
     for body in bodies {
         let body_len = message_stream_frame_body_len(body.len());
-        frames.extend_from_slice(&frame_len(body_len, max_frame_size)?.to_be_bytes());
+        let frame_len = validate_frame_body_len(body_len, max_frame_size)?;
+        frames.extend_from_slice(&frame_len.to_be_bytes());
         append_message_stream_frame_body(&mut frames, body);
     }
 
@@ -113,6 +138,9 @@ pub fn decode_stream_frame_body(body: &[u8]) -> Result<RpcStreamFrame> {
         }
 
         let field = tag >> 3;
+        if field == 0 {
+            return Err(invalid_stream_frame("invalid stream frame field number"));
+        }
         let wire_type = tag & 0x7;
         match field {
             1 => {
@@ -139,7 +167,7 @@ pub fn decode_stream_frame_body(body: &[u8]) -> Result<RpcStreamFrame> {
                 frame_body = consume_length_delimited(body, &mut offset)?.to_vec();
             }
             5 => return decode_frame::<RpcStreamFrame>(body),
-            _ => skip_proto_field(body, &mut offset, wire_type)?,
+            _ => skip_proto_field(body, &mut offset, field, wire_type)?,
         }
     }
 
@@ -247,20 +275,40 @@ fn preflight_wire_message(
     Ok(())
 }
 
-fn consume_proto_varint(data: &[u8], offset: &mut usize) -> Result<u64> {
+#[derive(Clone, Copy)]
+enum VarintDecodeError {
+    Truncated,
+    Overflow,
+}
+
+fn consume_u64_varint(
+    data: &[u8],
+    offset: &mut usize,
+) -> std::result::Result<u64, VarintDecodeError> {
     let mut value = 0_u64;
-    for shift in (0..64).step_by(7) {
-        let byte = data
-            .get(*offset)
-            .copied()
-            .ok_or_else(|| malformed_protobuf("truncated protobuf varint"))?;
+    for index in 0..10 {
+        let Some(byte) = data.get(*offset).copied() else {
+            return Err(VarintDecodeError::Truncated);
+        };
         *offset += 1;
-        value |= u64::from(byte & 0x7f) << shift;
+
+        if index == 9 && byte > 1 {
+            return Err(VarintDecodeError::Overflow);
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
         if byte < 0x80 {
             return Ok(value);
         }
     }
-    Err(malformed_protobuf("protobuf varint exceeded 64 bits"))
+
+    Err(VarintDecodeError::Overflow)
+}
+
+fn consume_proto_varint(data: &[u8], offset: &mut usize) -> Result<u64> {
+    consume_u64_varint(data, offset).map_err(|error| match error {
+        VarintDecodeError::Truncated => malformed_protobuf("truncated protobuf varint"),
+        VarintDecodeError::Overflow => malformed_protobuf("protobuf varint exceeded 64 bits"),
+    })
 }
 
 fn consume_proto_bytes<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
@@ -318,7 +366,7 @@ fn malformed_protobuf(message: &'static str) -> Error {
     Error::from(Status::invalid_argument(message))
 }
 
-fn check_frame_body_len(len: usize, max_frame_size: usize) -> Result<()> {
+fn validate_frame_body_len(len: usize, max_frame_size: usize) -> Result<u32> {
     if len > max_frame_size {
         return Err(Error::FrameTooLarge {
             len,
@@ -326,10 +374,6 @@ fn check_frame_body_len(len: usize, max_frame_size: usize) -> Result<()> {
         });
     }
 
-    Ok(())
-}
-
-fn frame_len(len: usize, max_frame_size: usize) -> Result<u32> {
     u32::try_from(len).map_err(|_| Error::FrameTooLarge {
         len,
         max: max_frame_size,
@@ -373,19 +417,10 @@ fn varint_len_usize(mut value: usize) -> usize {
 }
 
 fn consume_varint(data: &[u8], offset: &mut usize) -> Result<u64> {
-    let mut value = 0_u64;
-    for shift in (0..64).step_by(7) {
-        let Some(byte) = data.get(*offset).copied() else {
-            return Err(invalid_stream_frame("truncated stream frame varint"));
-        };
-        *offset += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte < 0x80 {
-            return Ok(value);
-        }
-    }
-
-    Err(invalid_stream_frame("stream frame varint exceeded 64 bits"))
+    consume_u64_varint(data, offset).map_err(|error| match error {
+        VarintDecodeError::Truncated => invalid_stream_frame("truncated stream frame varint"),
+        VarintDecodeError::Overflow => invalid_stream_frame("stream frame varint exceeded 64 bits"),
+    })
 }
 
 fn require_wire_type(actual: u64, expected: u64, message: &'static str) -> Result<()> {
@@ -411,7 +446,7 @@ fn consume_length_delimited<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'
     Ok(&data[start..end])
 }
 
-fn skip_proto_field(data: &[u8], offset: &mut usize, wire_type: u64) -> Result<()> {
+fn skip_proto_field(data: &[u8], offset: &mut usize, field: u64, wire_type: u64) -> Result<()> {
     match wire_type {
         0 => {
             let _ = consume_varint(data, offset)?;
@@ -422,6 +457,22 @@ fn skip_proto_field(data: &[u8], offset: &mut usize, wire_type: u64) -> Result<(
             let _ = consume_length_delimited(data, offset)?;
             Ok(())
         }
+        3 => loop {
+            let tag = consume_varint(data, offset)?;
+            let nested_field = tag >> 3;
+            if nested_field == 0 {
+                return Err(invalid_stream_frame("invalid protobuf group tag"));
+            }
+            let nested_wire_type = tag & 7;
+            if nested_wire_type == 4 {
+                if nested_field != field {
+                    return Err(invalid_stream_frame("mismatched protobuf end group"));
+                }
+                break Ok(());
+            }
+            skip_proto_field(data, offset, nested_field, nested_wire_type)?;
+        },
+        4 => Err(invalid_stream_frame("unexpected protobuf end group")),
         5 => skip_fixed(data, offset, 4),
         _ => Err(invalid_stream_frame(
             "stream frame contained an unsupported wire type",
@@ -466,8 +517,10 @@ mod tests {
     use crate::{Code, RpcRequest, RpcStreamFrame, Status};
 
     use super::{
-        decode_frame, decode_stream_frame_body, decode_stream_frame_body_owned, encode_frame,
-        encode_message_stream_frame, encode_message_stream_frames, frame_body_len,
+        FRAME_HEADER_LEN, decode_frame, decode_stream_frame_body, decode_stream_frame_body_owned,
+        encode_frame, encode_frame_body, encode_frame_body_with_max, encode_message_stream_frame,
+        encode_message_stream_frames, encode_stream_frame_body, encode_stream_frame_body_with_max,
+        frame_body_len,
     };
 
     #[test]
@@ -483,6 +536,47 @@ mod tests {
         assert_eq!(decoded.method, request.method);
         assert_eq!(decoded.body, request.body);
         assert_eq!(decoded.metadata, request.metadata);
+    }
+
+    #[test]
+    fn frame_body_helpers_match_length_prefixed_frames_and_validate_size() {
+        let request = RpcRequest::new("hello.Greeter", "SayHello", b"trev".to_vec());
+        let framed = encode_frame(&request).expect("request should encode");
+        let body = encode_frame_body(&request).expect("request body should encode");
+
+        assert_eq!(&framed[FRAME_HEADER_LEN..], body);
+
+        let max_frame_size = body.len();
+        assert!(encode_frame_body_with_max(&request, max_frame_size).is_ok());
+        let error = encode_frame_body_with_max(&request, max_frame_size - 1)
+            .expect_err("one-over frame body should be rejected");
+        assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn stream_frame_body_helpers_match_length_prefixed_frames_and_validate_size() {
+        let stream_frame = RpcStreamFrame::status(Status::unavailable("later"));
+        let framed = encode_frame(&stream_frame).expect("stream frame should encode");
+        let body = encode_stream_frame_body(&stream_frame).expect("stream body should encode");
+
+        assert_eq!(&framed[FRAME_HEADER_LEN..], body);
+
+        let max_frame_size = body.len();
+        assert!(encode_stream_frame_body_with_max(&stream_frame, max_frame_size).is_ok());
+        let error = encode_stream_frame_body_with_max(&stream_frame, max_frame_size - 1)
+            .expect_err("one-over stream frame body should be rejected");
+        assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn empty_stream_frame_body_helper_succeeds() {
+        let stream_frame = RpcStreamFrame::message(Vec::new());
+        let framed = encode_frame(&stream_frame).expect("empty stream frame should encode");
+        let body = encode_stream_frame_body_with_max(&stream_frame, 0)
+            .expect("empty stream frame body should encode");
+
+        assert!(body.is_empty());
+        assert_eq!(&framed[FRAME_HEADER_LEN..], body);
     }
 
     #[test]
@@ -509,6 +603,41 @@ mod tests {
 
             assert_eq!(status.code(), Code::InvalidArgument);
         }
+    }
+
+    #[test]
+    fn stream_frame_fast_decoder_rejects_overflowing_varints() {
+        let body = [
+            0x08, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02,
+        ];
+
+        let status = decode_stream_frame_body(&body)
+            .expect_err("overflowing varint should fail")
+            .into_status();
+        assert_eq!(status.code(), Code::InvalidArgument);
+
+        let status = decode_frame::<RpcStreamFrame>(&body)
+            .expect_err("generic decoder should reject the same varint")
+            .into_status();
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn stream_frame_fast_decoder_rejects_field_number_zero() {
+        let body = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let status = decode_stream_frame_body(&body)
+            .expect_err("field number zero should fail")
+            .into_status();
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn stream_frame_fast_decoder_skips_unknown_groups() {
+        let decoded = decode_stream_frame_body(&[0x53, 0x54])
+            .expect("well-formed unknown group should be skipped");
+
+        assert_eq!(decoded, RpcStreamFrame::message(Vec::new()));
     }
 
     #[test]

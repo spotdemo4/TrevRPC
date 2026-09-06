@@ -675,6 +675,17 @@ impl RequestPumpReader for H3BodyReader {
         // cannot guarantee TrevRPC cancellation code 1 on unified HTTP/3.
     }
 
+    async fn read_unary_end(&mut self) -> Result<()> {
+        framed::drain_unary_request_end(self).await
+    }
+
+    async fn read_stream_frame_or_eof(
+        &mut self,
+        max_frame_size: usize,
+    ) -> Result<Option<RpcStreamFrame>> {
+        framed::read_stream_frame_or_eof::<_, NoopFrameTrace>(self, max_frame_size).await
+    }
+
     async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
         Some(RequestTransportEvent::ConnectionLost(
             Error::transport(self.connection.closed().await).into_status(),
@@ -793,6 +804,17 @@ impl RequestPumpReader for IoBodyReader {
         // cancellation operation.
     }
 
+    async fn read_unary_end(&mut self) -> Result<()> {
+        framed::drain_unary_request_end(self).await
+    }
+
+    async fn read_stream_frame_or_eof(
+        &mut self,
+        max_frame_size: usize,
+    ) -> Result<Option<RpcStreamFrame>> {
+        framed::read_stream_frame_or_eof::<_, NoopFrameTrace>(self, max_frame_size).await
+    }
+
     async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
         Some(RequestTransportEvent::ConnectionLost(
             Error::transport(self.connection.closed().await).into_status(),
@@ -814,7 +836,7 @@ async fn handle_rpc_stream<W, R>(
     mut shutdown: watch::Receiver<bool>,
 ) where
     W: RpcBodyWriter,
-    R: RequestPumpReader,
+    R: RequestPumpReader + FrameRead,
 {
     let request = match read_initial_request(&server, &mut recv).await {
         Ok(request) => request,
@@ -844,7 +866,7 @@ async fn handle_rpc_stream<W, R>(
         server.options().max_stream_body_size(),
     );
     let (request_body, mut request_pump) =
-        start_request_pump::<_, NoopFrameTrace>(recv, input_kind, server.max_frame_size());
+        start_request_pump(recv, input_kind, server.max_frame_size());
 
     if request.rpc_kind() == RpcKind::Unary {
         let response = server.handle_request_with_cancellation(request, cancellation.clone());

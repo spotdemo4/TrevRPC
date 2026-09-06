@@ -35,6 +35,7 @@ typedef struct fake_msquic_state {
     QUIC_STATUS enable_status;
     QUIC_STATUS configure_status;
     QUIC_STATUS send_status;
+    QUIC_STATUS shutdown_status;
     bool close_during_enable;
     bool peer_abort_during_enable;
     bool deliver_shutdown_complete;
@@ -80,6 +81,9 @@ static QUIC_STATUS QUIC_API fake_stream_shutdown(
         pthread_mutex_unlock(&FakeMsQuic.stream->mutex);
     } else {
         FakeMsQuic.lock_held_across_shutdown = true;
+    }
+    if (QUIC_FAILED(FakeMsQuic.shutdown_status)) {
+        return FakeMsQuic.shutdown_status;
     }
     if (stream_handle == TEST_STREAM_HANDLE && FakeMsQuic.deliver_shutdown_complete &&
         !FakeMsQuic.shutdown_complete_delivered) {
@@ -229,6 +233,7 @@ static receive_fixture fixture_create_with_capacities(
     trevrpc_frame_parser_set_retain_on_allocation_failure(&fixture.stream->parser, true);
     assert(trevrpc_engine_provider_reserve_mandatory(fixture.engine, &fixture.stream->base.terminal_reservation) == 0);
     assert(trevrpc_engine_provider_reserve_mandatory(fixture.engine, &fixture.stream->receive_fin_reservation) == 0);
+    assert(trevrpc_engine_provider_reserve_mandatory(fixture.engine, &fixture.stream->send_stopped_reservation) == 0);
     assert(registry_add(fixture.adapter, &fixture.stream->base, TREVRPC_ENGINE_OBJECT_STREAM, &fixture.stream_handle) ==
            0);
 
@@ -237,6 +242,7 @@ static receive_fixture fixture_create_with_capacities(
     FakeMsQuic.enable_status = QUIC_STATUS_SUCCESS;
     FakeMsQuic.configure_status = QUIC_STATUS_SUCCESS;
     FakeMsQuic.send_status = QUIC_STATUS_SUCCESS;
+    FakeMsQuic.shutdown_status = QUIC_STATUS_SUCCESS;
     return fixture;
 }
 
@@ -284,8 +290,11 @@ static void fixture_destroy(receive_fixture* fixture) {
         fixture->stream->base.terminal_reservation = NULL;
         trevrpc_engine_reservation* receive_fin_reservation = fixture->stream->receive_fin_reservation;
         fixture->stream->receive_fin_reservation = NULL;
+        trevrpc_engine_reservation* send_stopped_reservation = fixture->stream->send_stopped_reservation;
+        fixture->stream->send_stopped_reservation = NULL;
         trevrpc_engine_provider_cancel_reservation(fixture->engine, terminal_reservation);
         trevrpc_engine_provider_cancel_reservation(fixture->engine, receive_fin_reservation);
+        trevrpc_engine_provider_cancel_reservation(fixture->engine, send_stopped_reservation);
     }
     if (fixture->listener != NULL) {
         QUIC_LISTENER_EVENT event = {.Type = QUIC_LISTENER_EVENT_STOP_COMPLETE};
@@ -395,6 +404,10 @@ typedef struct stream_event_counts {
     uint32_t receive_fin_flags;
     int receive_fin_status;
     uint64_t receive_fin_application_error;
+    uint32_t send_stopped;
+    uint32_t send_stopped_flags;
+    int send_stopped_status;
+    uint64_t send_stopped_application_error;
 } stream_event_counts;
 
 static stream_event_counts drain_stream_events(receive_fixture* fixture) {
@@ -420,6 +433,11 @@ static stream_event_counts drain_stream_events(receive_fixture* fixture) {
             counts.receive_fin_flags = info.flags;
             counts.receive_fin_status = info.status;
             counts.receive_fin_application_error = info.application_error_code;
+        } else if (same_stream && info.kind == TREVRPC_ENGINE_EVENT_SEND_STOPPED) {
+            counts.send_stopped++;
+            counts.send_stopped_flags = info.flags;
+            counts.send_stopped_status = info.status;
+            counts.send_stopped_application_error = info.application_error_code;
         }
         trevrpc_engine_event_release(event);
     }
@@ -897,6 +915,61 @@ static void test_peer_send_abort_retires_pause(void) {
     fixture_destroy(&fixture);
 }
 
+static void test_peer_receive_abort_publishes_send_stopped_once(void) {
+    receive_fixture fixture = fixture_create(1024);
+    QUIC_STREAM_EVENT aborted = {.Type = QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED};
+    aborted.PEER_RECEIVE_ABORTED.ErrorCode = 23;
+
+    assert(adapter_stream_callback(TEST_STREAM_HANDLE, fixture.stream, &aborted) == QUIC_STATUS_SUCCESS);
+    assert(adapter_stream_callback(TEST_STREAM_HANDLE, fixture.stream, &aborted) == QUIC_STATUS_SUCCESS);
+    assert(fixture.stream->send_aborted);
+    assert(fixture.stream->send_stopped_published);
+
+    stream_event_counts counts = drain_stream_events(&fixture);
+    assert(counts.send_stopped == 1);
+    assert(counts.send_stopped_status == -ECANCELED);
+    assert((counts.send_stopped_flags & TREVRPC_ENGINE_EVENT_FLAG_TERMINAL) != 0);
+    assert((counts.send_stopped_flags & TREVRPC_ENGINE_EVENT_FLAG_PEER) != 0);
+    assert((counts.send_stopped_flags & TREVRPC_ENGINE_EVENT_FLAG_LOCAL) == 0);
+    assert((counts.send_stopped_flags & TREVRPC_ENGINE_EVENT_FLAG_PEER_RESET) != 0);
+    assert(counts.send_stopped_application_error == 23);
+    fixture_destroy(&fixture);
+}
+
+static void test_receive_abort_failure_preserves_retryable_state(void) {
+    receive_fixture fixture = fixture_create(1024);
+    uint8_t frame[4] = {0};
+    uint64_t accepted = UINT64_MAX;
+    assert(indicate_receive(&fixture, frame, sizeof(frame), &accepted) == QUIC_STATUS_SUCCESS);
+    assert(accepted == sizeof(frame));
+
+    FakeMsQuic.shutdown_status = QUIC_STATUS_INVALID_STATE;
+    assert(trevrpc_engine_stream_abort_receive(fixture.engine, fixture.stream_handle, 7) == -EIO);
+    assert(!fixture.stream->receive_aborted);
+    trevrpc_engine_receive* receive = pop_receive(&fixture);
+    trevrpc_engine_receive_release(receive);
+
+    FakeMsQuic.shutdown_status = QUIC_STATUS_SUCCESS;
+    assert(trevrpc_engine_stream_abort_receive(fixture.engine, fixture.stream_handle, 7) == 0);
+    assert(fixture.stream->receive_aborted);
+    assert(FakeMsQuic.shutdown_calls == 2);
+    fixture_destroy(&fixture);
+}
+
+static void test_local_receive_abort_suppresses_late_peer_fin(void) {
+    receive_fixture fixture = fixture_create(1024);
+    assert(trevrpc_engine_stream_abort_receive(fixture.engine, fixture.stream_handle, 9) == 0);
+    assert(fixture.stream->receive_aborted);
+
+    QUIC_STREAM_EVENT aborted = {.Type = QUIC_STREAM_EVENT_PEER_SEND_ABORTED};
+    aborted.PEER_SEND_ABORTED.ErrorCode = 17;
+    assert(adapter_stream_callback(TEST_STREAM_HANDLE, fixture.stream, &aborted) == QUIC_STATUS_SUCCESS);
+    assert(!fixture.stream->receive_fin_published);
+    stream_event_counts counts = drain_stream_events(&fixture);
+    assert(counts.receive_fin == 0);
+    fixture_destroy(&fixture);
+}
+
 static void test_peer_abort_resume_race_is_nonfatal(void) {
     receive_fixture fixture = fixture_create(1024);
     uint8_t frames[8] = {0};
@@ -922,6 +995,8 @@ static void test_callback_entry_failure_aborts_explicitly(void) {
     fixture.stream->base.terminal_reservation = NULL;
     trevrpc_engine_provider_cancel_reservation(fixture.engine, fixture.stream->receive_fin_reservation);
     fixture.stream->receive_fin_reservation = NULL;
+    trevrpc_engine_provider_cancel_reservation(fixture.engine, fixture.stream->send_stopped_reservation);
+    fixture.stream->send_stopped_reservation = NULL;
     trevrpc_engine_provider_stopped(fixture.engine, 0, 0);
     uint8_t frame[4] = {0};
     uint64_t accepted = UINT64_MAX;
@@ -1230,6 +1305,9 @@ int main(void) {
     test_exact_header_boundary_is_backpressure();
     test_exact_header_boundary_fin_is_truncation();
     test_peer_send_abort_retires_pause();
+    test_peer_receive_abort_publishes_send_stopped_once();
+    test_receive_abort_failure_preserves_retryable_state();
+    test_local_receive_abort_suppresses_late_peer_fin();
     test_peer_abort_resume_race_is_nonfatal();
     test_callback_entry_failure_aborts_explicitly();
     test_closing_stream_is_not_resumed();

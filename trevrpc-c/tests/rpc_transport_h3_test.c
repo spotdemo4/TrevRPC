@@ -1142,15 +1142,28 @@ static void test_h3_peer_receive_abort_after_request_fin_closes_stream(void) {
     assert(trevrpc_rpc_transport_next_event(transport, &event) == -EAGAIN);
     assert(event == NULL);
 
+    trevrpc_rpc_transport_h3_test_fail_event_alloc_after(transport, 0);
     assert(trevrpc_msquic_test_inject_peer_receive_aborted(object, 0) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED);
+    assert(handle_equal(info.subject, stream));
+    assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL) != 0);
+    assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) != 0);
+    assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL) == 0);
+    assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET) != 0);
+    assert(info.status == -ECANCELED);
+    assert(info.application_error_code == 0);
+    assert(info.provider_error_code == 0);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+
     assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
     assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
     assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED);
     assert(handle_equal(info.subject, stream));
     assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET) != 0);
     assert(info.status == -ECANCELED);
-    assert(info.application_error_code == 0);
-    assert(info.provider_error_code == 0);
     trevrpc_rpc_transport_event_release(transport, event);
     event = NULL;
     assert(trevrpc_rpc_transport_next_event(transport, &event) == -EAGAIN);

@@ -1,14 +1,19 @@
 //! Low-level transports and operational controls for applications that manage transport details.
 
+#[cfg(feature = "quinn")]
 use std::io;
+#[cfg(feature = "quinn")]
 use std::net::{SocketAddr, UdpSocket};
 #[cfg(feature = "webtransport-client")]
 use std::sync::Arc;
 
 #[cfg(feature = "quinn")]
+use crate::client::Channel;
+#[cfg(any(feature = "quinn", feature = "native-c"))]
+use crate::client::ChannelConfig;
+#[cfg(any(feature = "quinn", feature = "native-c"))]
 pub use crate::client::channel::{ExponentialBackoff, ReconnectBackoff};
 #[cfg(feature = "quinn")]
-use crate::client::{Channel, ChannelConfig};
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 
 /// A raw `TrevRPC` transport over one established Quinn connection.
@@ -124,14 +129,14 @@ impl ChannelOperations for Channel {
 }
 
 /// Reconnect-policy controls intentionally excluded from the routine [`ChannelConfig`] API.
-#[cfg(feature = "quinn")]
+#[cfg(any(feature = "quinn", feature = "native-c"))]
 pub trait ChannelConfigOperations {
     /// Replaces the fixed bounded reconnect delay strategy.
     #[must_use]
     fn with_reconnect_backoff(self, reconnect_backoff: impl ReconnectBackoff) -> ChannelConfig;
 }
 
-#[cfg(feature = "quinn")]
+#[cfg(any(feature = "quinn", feature = "native-c"))]
 impl ChannelConfigOperations for ChannelConfig {
     fn with_reconnect_backoff(self, reconnect_backoff: impl ReconnectBackoff) -> ChannelConfig {
         self.with_reconnect_backoff_advanced(reconnect_backoff)

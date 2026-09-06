@@ -130,6 +130,7 @@ impl CancellationToken {
         })
     }
 
+    #[cfg(any(feature = "quinn", feature = "native-c"))]
     pub(crate) fn set_completion_code(&self, code: Code) {
         let mut completion_code = self
             .state
@@ -270,7 +271,7 @@ pub struct WebTransportAdmissionRequest<'a> {
 
 pub type WebTransportAdmission = for<'a> fn(&WebTransportAdmissionRequest<'a>) -> bool;
 
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "native-c"))]
 #[derive(Clone, Copy)]
 pub struct Http3AdmissionRequest<'a> {
     pub request: &'a http::Request<()>,
@@ -280,7 +281,7 @@ pub struct Http3AdmissionRequest<'a> {
     pub headers: &'a [AdmissionHeader<'a>],
 }
 
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "native-c"))]
 pub type Http3Admission = for<'a> fn(&Http3AdmissionRequest<'a>) -> bool;
 
 #[derive(Debug, Clone)]
@@ -294,11 +295,11 @@ pub struct ServerOptions {
     stream_messages: Option<usize>,
     stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     http3_enabled: bool,
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     http3_path: String,
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     http3_admission: Option<Http3Admission>,
     webtransport_path: String,
     webtransport_allowed_authorities: Vec<String>,
@@ -318,11 +319,11 @@ impl Default for ServerOptions {
             stream_messages: Some(4096),
             stream_body_size: Some(16 * 1024 * 1024),
             stream_idle_timeout: Some(Duration::from_secs(30)),
-            #[cfg(feature = "http3")]
+            #[cfg(any(feature = "http3", feature = "native-c"))]
             http3_enabled: false,
-            #[cfg(feature = "http3")]
+            #[cfg(any(feature = "http3", feature = "native-c"))]
             http3_path: "/trevrpc".to_owned(),
-            #[cfg(feature = "http3")]
+            #[cfg(any(feature = "http3", feature = "native-c"))]
             http3_admission: None,
             webtransport_path: "/trevrpc".to_owned(),
             webtransport_allowed_authorities: Vec::new(),
@@ -394,21 +395,21 @@ impl ServerOptions {
     }
 
     /// Returns whether ordinary HTTP/3 POST requests are accepted.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[must_use]
     pub const fn http3_enabled(&self) -> bool {
         self.http3_enabled
     }
 
     /// Returns the HTTP/3 POST path accepted by the server.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[must_use]
     pub fn http3_path(&self) -> &str {
         &self.http3_path
     }
 
     /// Returns the HTTP/3 POST admission callback, if configured.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[must_use]
     pub const fn http3_admission(&self) -> Option<Http3Admission> {
         self.http3_admission
@@ -517,7 +518,7 @@ impl ServerOptions {
     }
 
     /// Enables or disables ordinary HTTP/3 POST requests.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[must_use]
     pub const fn with_http3_enabled(mut self, http3_enabled: bool) -> Self {
         self.http3_enabled = http3_enabled;
@@ -525,7 +526,7 @@ impl ServerOptions {
     }
 
     /// Sets the HTTP/3 POST request path accepted by the server.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[must_use]
     pub fn with_http3_path(mut self, http3_path: impl Into<String>) -> Self {
         self.http3_path = http3_path.into();
@@ -533,7 +534,7 @@ impl ServerOptions {
     }
 
     /// Sets the HTTP/3 POST admission callback.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[must_use]
     pub const fn with_http3_admission(mut self, http3_admission: Option<Http3Admission>) -> Self {
         self.http3_admission = http3_admission;
@@ -800,21 +801,21 @@ impl Server {
     }
 
     /// Enables or disables ordinary HTTP/3 POST requests.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     pub fn set_http3_enabled(&mut self, http3_enabled: bool) -> &mut Self {
         self.options.http3_enabled = http3_enabled;
         self
     }
 
     /// Sets the HTTP/3 POST request path accepted by the server.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     pub fn set_http3_path(&mut self, http3_path: impl Into<String>) -> &mut Self {
         self.options.http3_path = http3_path.into();
         self
     }
 
     /// Sets the HTTP/3 POST admission callback.
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     pub fn set_http3_admission(&mut self, http3_admission: Option<Http3Admission>) -> &mut Self {
         self.options.http3_admission = http3_admission;
         self
@@ -1361,6 +1362,7 @@ impl Server {
         status_stream(status)
     }
 
+    #[cfg(any(feature = "quinn", feature = "native-c"))]
     pub(crate) fn record_rejected_request(&self, request: &RpcRequest, status: &Status) {
         let started_at = Instant::now();
         record_rpc_started(
@@ -1379,6 +1381,7 @@ impl Server {
         );
     }
 
+    #[cfg(any(feature = "quinn", feature = "native-c"))]
     pub(crate) fn record_active_request_failure(&self, request: &RpcRequest, status: &Status) {
         self.finish_streaming_response(
             &request.service,
@@ -1390,6 +1393,7 @@ impl Server {
         );
     }
 
+    #[cfg(any(feature = "quinn", feature = "native-c"))]
     pub(crate) fn record_pre_handler_failure(&self, status: &Status) {
         let started_at = Instant::now();
         record_rpc_started(self.metrics.as_ref(), "", "", 0);
@@ -2386,7 +2390,7 @@ mod tests {
             Some(Duration::from_secs(10))
         );
         assert_eq!(options.max_stream_body_size(), Some(16 * 1024 * 1024));
-        #[cfg(feature = "http3")]
+        #[cfg(any(feature = "http3", feature = "native-c"))]
         {
             assert!(!options.http3_enabled());
             assert_eq!(options.http3_path(), "/trevrpc");
@@ -2394,7 +2398,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[test]
     fn options_own_runtime_paths_and_allowlists() {
         let http3_path = String::from("/owned-http3");

@@ -1,0 +1,12 @@
+prefix=@CMAKE_CURRENT_BINARY_DIR@
+exec_prefix=${prefix}
+libdir=${prefix}
+includedir=@CMAKE_CURRENT_SOURCE_DIR@/include
+testincludedir=@CMAKE_CURRENT_SOURCE_DIR@/tests
+trevrpc_transport_testing_abi_version=1
+
+Name: trevrpc_transport_testing
+Description: TrevRPC deterministic Transport ABI test provider (build-tree only)
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ltrevrpc_transport_testing -ltrevrpc_transport -pthread
+Cflags: -I${includedir} -I${testincludedir}

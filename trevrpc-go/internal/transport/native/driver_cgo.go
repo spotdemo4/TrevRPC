@@ -29,6 +29,7 @@ const (
 	eventReceiveFIN       uint32 = 10
 	eventSendComplete     uint32 = 11
 	eventStreamClosed     uint32 = 12
+	eventSendStopped      uint32 = 15
 
 	eventFlagFatal          uint32 = 1 << 0
 	eventFlagTerminal       uint32 = 1 << 1
@@ -104,6 +105,7 @@ type driverState struct {
 	listeners          map[nativeHandle]*Listener
 	connections        map[nativeHandle]*Connection
 	streams            map[nativeHandle]*Stream
+	earlySendStops     map[nativeHandle]error
 	pendingDials       map[uint64]pendingDial
 	pendingOpens       map[uint64]pendingOpen
 	pendingSends       map[uint64]chan error
@@ -472,6 +474,7 @@ func (e *Engine) run() {
 		listeners:         make(map[nativeHandle]*Listener),
 		connections:       make(map[nativeHandle]*Connection),
 		streams:           make(map[nativeHandle]*Stream),
+		earlySendStops:    make(map[nativeHandle]error),
 		pendingDials:      make(map[uint64]pendingDial),
 		pendingOpens:      make(map[uint64]pendingOpen),
 		pendingSends:      make(map[uint64]chan error),
@@ -853,6 +856,8 @@ func (state *driverState) handleEvent(event nativeEvent) {
 			state.drainReadable()
 			state.finishReadWaiter(stream)
 		}
+	case eventSendStopped:
+		state.sendStopped(event)
 	case AdmissionHTTP3, AdmissionWebTransport:
 		state.admit(event)
 	case eventSendComplete:
@@ -867,6 +872,33 @@ func (state *driverState) handleEvent(event nativeEvent) {
 	default:
 		state.startShutdown(fmt.Errorf("unknown native event kind %d", event.kind))
 	}
+}
+
+func (state *driverState) sendStopped(event nativeEvent) {
+	err := eventError(event, "native stream send stopped")
+	stream := state.streams[event.subject]
+	if stream == nil {
+		if state.earlySendStops == nil {
+			state.earlySendStops = make(map[nativeHandle]error)
+		}
+		if _, present := state.earlySendStops[event.subject]; !present {
+			state.earlySendStops[event.subject] = err
+		}
+		return
+	}
+	state.applyEarlySendStop(stream, err)
+}
+
+func (state *driverState) applyEarlySendStop(stream *Stream, eventErr error) {
+	if eventErr == nil {
+		eventErr = state.earlySendStops[stream.handle]
+		delete(state.earlySendStops, stream.handle)
+	}
+	if eventErr == nil || stream.sendDone {
+		return
+	}
+	stream.sendDone = true
+	stream.writer.fail(eventErr)
 }
 
 func (state *driverState) connectionReady(event nativeEvent) {
@@ -995,6 +1027,7 @@ func (state *driverState) streamReady(event nativeEvent) {
 			state.startShutdown(err)
 			return
 		}
+		state.applyEarlySendStop(stream, nil)
 		pending.result <- streamResult{stream: stream}
 		return
 	}
@@ -1005,12 +1038,14 @@ func (state *driverState) streamReady(event nativeEvent) {
 	}
 	stream := newStream(state.engine, event.subject, connection.info, connection.maxFrameSize)
 	state.streams[event.subject] = stream
+	state.applyEarlySendStop(stream, nil)
 	if !connection.accept.push(stream) {
 		_ = state.engine.runtime.abortStream(event.subject, 0)
 	}
 }
 
 func (state *driverState) streamTerminal(event nativeEvent) {
+	delete(state.earlySendStops, event.subject)
 	stream := state.streams[event.subject]
 	if pending, present := state.pendingOpens[event.operationID]; present {
 		delete(state.pendingOpens, event.operationID)
@@ -1298,6 +1333,7 @@ func (state *driverState) failRemaining() {
 	clear(state.listeners)
 	clear(state.connections)
 	clear(state.streams)
+	clear(state.earlySendStops)
 }
 
 func newConnection(engine *Engine, handle nativeHandle, config EndpointConfig, server bool) *Connection {

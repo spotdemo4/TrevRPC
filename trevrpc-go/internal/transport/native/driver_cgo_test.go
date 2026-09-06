@@ -228,6 +228,109 @@ func TestUnknownEventInitiatesShutdown(t *testing.T) {
 	}
 }
 
+func TestSendStoppedTerminatesOnlyWriteDirection(t *testing.T) {
+	handle := nativeHandle{owner: 1, slot: 2, generation: 3}
+	runtime := &scriptedDriverRuntime{}
+	engine := &Engine{runtime: runtime}
+	stream := newStream(engine, handle, transportinternal.ConnectionInfo{}, 1024)
+	state := &driverState{
+		engine:  engine,
+		streams: map[nativeHandle]*Stream{handle: stream},
+	}
+
+	state.handleEvent(nativeEvent{
+		kind:                 eventSendStopped,
+		flags:                eventFlagTerminal | eventFlagPeer | eventFlagPeerReset,
+		status:               -1,
+		subject:              handle,
+		applicationErrorCode: 17,
+	})
+
+	if !stream.sendDone || stream.receiveDone {
+		t.Fatalf("stream half state = sendDone %t, receiveDone %t", stream.sendDone, stream.receiveDone)
+	}
+	if _, err := stream.Write([]byte{0, 0, 0, 0}); err == nil {
+		t.Fatal("Write() after peer send stop succeeded")
+	} else {
+		var eventErr *EventError
+		if !errors.As(err, &eventErr) {
+			t.Fatalf("Write() error = %T %v, want *EventError", err, err)
+		}
+		if !eventErr.Peer || !eventErr.PeerReset || eventErr.ApplicationErrorCode != 17 {
+			t.Fatalf("Write() event error = %+v", eventErr)
+		}
+	}
+	select {
+	case <-stream.lifecycle.Done():
+		t.Fatal("send stop completed the whole stream lifecycle")
+	default:
+	}
+	select {
+	case <-stream.Context().Done():
+		t.Fatal("send stop canceled the whole stream context")
+	default:
+	}
+	if state.closingStarted || engine.closing.Load() || runtime.beginCloseCalls != 0 {
+		t.Fatal("send stop initiated Engine shutdown")
+	}
+}
+
+func TestSendStoppedBeforeStreamReadyIsAppliedOnAdmission(t *testing.T) {
+	handle := nativeHandle{owner: 1, slot: 2, generation: 3}
+	parent := nativeHandle{owner: 1, slot: 1, generation: 1}
+	runtime := &scriptedDriverRuntime{}
+	engine := &Engine{runtime: runtime}
+	connection := newConnection(engine, parent, DefaultEndpointConfig(), true)
+	state := &driverState{
+		engine:         engine,
+		connections:    map[nativeHandle]*Connection{parent: connection},
+		streams:        make(map[nativeHandle]*Stream),
+		earlySendStops: make(map[nativeHandle]error),
+	}
+
+	state.handleEvent(nativeEvent{
+		kind:                 eventSendStopped,
+		flags:                eventFlagTerminal | eventFlagPeer | eventFlagPeerReset,
+		status:               -1,
+		subject:              handle,
+		applicationErrorCode: 23,
+	})
+	if len(state.earlySendStops) != 1 {
+		t.Fatalf("early send stops = %d, want 1", len(state.earlySendStops))
+	}
+
+	state.handleEvent(nativeEvent{
+		kind:    eventStreamReady,
+		flags:   eventFlagPeer,
+		subject: handle,
+		parent:  parent,
+	})
+
+	stream := state.streams[handle]
+	if stream == nil {
+		t.Fatal("peer stream was not admitted")
+	}
+	if !stream.sendDone || stream.receiveDone {
+		t.Fatalf("stream half state = sendDone %t, receiveDone %t", stream.sendDone, stream.receiveDone)
+	}
+	if len(state.earlySendStops) != 0 {
+		t.Fatalf("early send stops = %d, want 0", len(state.earlySendStops))
+	}
+	if _, err := stream.Write([]byte{0, 0, 0, 0}); err == nil {
+		t.Fatal("Write() after early peer send stop succeeded")
+	} else {
+		var eventErr *EventError
+		if !errors.As(err, &eventErr) || eventErr.ApplicationErrorCode != 23 {
+			t.Fatalf("Write() error = %T %v, want application code 23", err, err)
+		}
+	}
+	select {
+	case <-stream.Context().Done():
+		t.Fatal("early send stop canceled the whole stream context")
+	default:
+	}
+}
+
 func TestReadyEventsValidatePendingHandles(t *testing.T) {
 	t.Run("connection", func(t *testing.T) {
 		runtime := &scriptedDriverRuntime{}

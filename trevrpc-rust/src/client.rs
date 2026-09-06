@@ -18,10 +18,10 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-#[cfg(feature = "quinn")]
+#[cfg(any(feature = "quinn", feature = "native-c"))]
 pub(crate) mod channel;
 
-#[cfg(feature = "quinn")]
+#[cfg(any(feature = "quinn", feature = "native-c"))]
 pub use channel::{Channel, ChannelConfig, ChannelEvent, ChannelPhase, ChannelState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

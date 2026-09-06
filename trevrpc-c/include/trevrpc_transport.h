@@ -55,6 +55,7 @@ extern "C" {
 #define TREVRPC_TRANSPORT_EVENT_STREAM_CLOSED 12u
 #define TREVRPC_TRANSPORT_EVENT_HTTP3_ADMISSION 13u
 #define TREVRPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION 14u
+#define TREVRPC_TRANSPORT_EVENT_SEND_STOPPED 15u
 
 #define TREVRPC_TRANSPORT_EVENT_FLAG_FATAL 0x00000001u
 #define TREVRPC_TRANSPORT_EVENT_FLAG_TERMINAL 0x00000002u
@@ -295,6 +296,8 @@ int trevrpc_transport_event_get_protocol_info_v1(trevrpc_transport* transport,
     trevrpc_transport_event_protocol_info_v1* info);
 /* Admission events are one-shot response capabilities. HTTP status 200 accepts;
  * 400 through 599 reject. Releasing an undecided event fails closed with 500.
+ * A valid response attempt consumes the capability even when the function returns
+ * a nonzero status reporting response-delivery or transport failure; do not retry.
  *
  * The caller must serialize every operation on a returned event. In particular,
  * admission_respond and event_release must not execute concurrently for the same

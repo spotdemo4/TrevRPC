@@ -178,6 +178,7 @@ struct adapter_stream {
     uint64_t readable_published_epoch;
     bool ready_event_committed;
     bool receive_fin_published;
+    bool send_stopped_published;
     bool receive_paused;
     bool receive_aborted;
     bool send_finished;
@@ -187,6 +188,7 @@ struct adapter_stream {
     uint64_t pending_send_bytes;
     uint32_t pending_send_count;
     trevrpc_engine_reservation* receive_fin_reservation;
+    trevrpc_engine_reservation* send_stopped_reservation;
 };
 
 struct adapter_send {
@@ -1393,12 +1395,17 @@ static adapter_stream* stream_alloc(adapter_connection* connection,
         result = trevrpc_engine_provider_reserve_mandatory(adapter->engine, &stream->receive_fin_reservation);
     }
     if (result == 0) {
+        result = trevrpc_engine_provider_reserve_mandatory(adapter->engine, &stream->send_stopped_reservation);
+    }
+    if (result == 0) {
         result = registry_add(adapter, &stream->base, TREVRPC_ENGINE_OBJECT_STREAM, out_token);
     }
     if (result == 0) {
         stream->base.ready_reservation = ready_reservation;
         stream->base.terminal_reservation = terminal_reservation;
     } else {
+        trevrpc_engine_provider_cancel_reservation(adapter->engine, stream->send_stopped_reservation);
+        stream->send_stopped_reservation = NULL;
         trevrpc_engine_provider_cancel_reservation(adapter->engine, stream->receive_fin_reservation);
         stream->receive_fin_reservation = NULL;
         if (owns_terminal) {
@@ -2592,6 +2599,7 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
     trevrpc_engine_reservation* terminal;
     trevrpc_engine_reservation* unused_ready;
     trevrpc_engine_reservation* unused_receive_fin;
+    trevrpc_engine_reservation* unused_send_stopped;
     pthread_mutex_lock(&adapter->mutex);
     if (stream->base.terminal_published) {
         pthread_mutex_unlock(&adapter->mutex);
@@ -2638,6 +2646,8 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
     stream->base.ready_reservation = NULL;
     unused_receive_fin = stream->receive_fin_reservation;
     stream->receive_fin_reservation = NULL;
+    unused_send_stopped = stream->send_stopped_reservation;
+    stream->send_stopped_reservation = NULL;
     if (stream->stream_admission_granted) {
         stream->stream_admission_granted = false;
         release_stream_budget_later = true;
@@ -2665,6 +2675,7 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
     adapter_native_close_complete(adapter, handle);
     trevrpc_engine_provider_cancel_reservation(adapter->engine, unused_ready);
     trevrpc_engine_provider_cancel_reservation(adapter->engine, unused_receive_fin);
+    trevrpc_engine_provider_cancel_reservation(adapter->engine, unused_send_stopped);
     (void)publish_reserved_event(adapter,
         terminal,
         failed ? TREVRPC_ENGINE_EVENT_STREAM_FAILED : TREVRPC_ENGINE_EVENT_STREAM_CLOSED,
@@ -2761,6 +2772,36 @@ static void publish_receive_fin(adapter_stream* stream, uint32_t event_flags, in
         TREVRPC_ENGINE_EVENT_RECEIVE_FIN,
         stream->base.event_flags | TREVRPC_ENGINE_EVENT_FLAG_TERMINAL | event_flags,
         status,
+        TREVRPC_ENGINE_OBJECT_STREAM,
+        stream->base.token,
+        stream->parent,
+        0,
+        application_error,
+        0,
+        NULL);
+}
+
+static void publish_send_stopped(adapter_stream* stream) {
+    msquic_provider* adapter = stream->base.adapter;
+    pthread_mutex_lock(&adapter->mutex);
+    if (stream->send_stopped_published || stream->send_stopped_reservation == NULL) {
+        pthread_mutex_unlock(&adapter->mutex);
+        return;
+    }
+    stream->send_stopped_published = true;
+    trevrpc_engine_reservation* reservation = stream->send_stopped_reservation;
+    stream->send_stopped_reservation = NULL;
+    uint64_t application_error = stream->application_error;
+    uint32_t event_flags =
+        stream->base.event_flags & ~(TREVRPC_ENGINE_EVENT_FLAG_LOCAL | TREVRPC_ENGINE_EVENT_FLAG_PEER);
+    pthread_mutex_unlock(&adapter->mutex);
+
+    (void)publish_reserved_event(adapter,
+        reservation,
+        TREVRPC_ENGINE_EVENT_SEND_STOPPED,
+        event_flags | TREVRPC_ENGINE_EVENT_FLAG_TERMINAL | TREVRPC_ENGINE_EVENT_FLAG_PEER |
+            TREVRPC_ENGINE_EVENT_FLAG_PEER_RESET,
+        -ECANCELED,
         TREVRPC_ENGINE_OBJECT_STREAM,
         stream->base.token,
         stream->parent,
@@ -3713,15 +3754,27 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
         }
         break;
     }
-    case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
-        publish_receive_fin(stream, TREVRPC_ENGINE_EVENT_FLAG_CLEAN_FIN, 0);
+    case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN: {
+        pthread_mutex_lock(&stream->mutex);
+        bool receive_aborted = stream->receive_aborted;
+        pthread_mutex_unlock(&stream->mutex);
+        if (!receive_aborted) {
+            publish_receive_fin(stream, TREVRPC_ENGINE_EVENT_FLAG_CLEAN_FIN, 0);
+        }
         break;
-    case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
-        pthread_mutex_lock(&adapter->mutex);
-        stream->application_error = event->PEER_SEND_ABORTED.ErrorCode;
-        pthread_mutex_unlock(&adapter->mutex);
-        publish_receive_fin(stream, TREVRPC_ENGINE_EVENT_FLAG_PEER_RESET, -ECANCELED);
+    }
+    case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
+        pthread_mutex_lock(&stream->mutex);
+        bool receive_aborted = stream->receive_aborted;
+        pthread_mutex_unlock(&stream->mutex);
+        if (!receive_aborted) {
+            pthread_mutex_lock(&adapter->mutex);
+            stream->application_error = event->PEER_SEND_ABORTED.ErrorCode;
+            pthread_mutex_unlock(&adapter->mutex);
+            publish_receive_fin(stream, TREVRPC_ENGINE_EVENT_FLAG_PEER_RESET, -ECANCELED);
+        }
         break;
+    }
     case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
         pthread_mutex_lock(&adapter->mutex);
         stream->application_error = event->PEER_RECEIVE_ABORTED.ErrorCode;
@@ -3729,6 +3782,7 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
         pthread_mutex_lock(&stream->mutex);
         stream->send_aborted = true;
         pthread_mutex_unlock(&stream->mutex);
+        publish_send_stopped(stream);
         cancel_unsent_sends(stream, -ECANCELED);
         break;
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
@@ -3827,17 +3881,23 @@ static int provider_stream_abort_receive(
     }
     ADAPTER_OBJECT_SCOPE(object);
     adapter_stream* stream = (adapter_stream*)object;
-    bool released_receive_credit = false;
-    bool invoke = discard_stream_receives(stream, &released_receive_credit);
-    if (released_receive_credit) {
-        resume_paused_receives(adapter);
-    }
+    pthread_mutex_lock(&stream->mutex);
+    bool invoke = !stream->receive_aborted;
+    pthread_mutex_unlock(&stream->mutex);
     if (!invoke || object->handle == NULL) {
         return 0;
     }
     QUIC_STATUS status =
         adapter->api->StreamShutdown(object->handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, application_error_code);
-    return QUIC_FAILED(status) ? -EIO : 0;
+    if (QUIC_FAILED(status)) {
+        return -EIO;
+    }
+    bool released_receive_credit = false;
+    (void)discard_stream_receives(stream, &released_receive_credit);
+    if (released_receive_credit) {
+        resume_paused_receives(adapter);
+    }
+    return 0;
 }
 
 static int provider_stream_abort_send(
@@ -4163,6 +4223,7 @@ static void adapter_object_free(adapter_object* object) {
             free(send);
         }
         trevrpc_engine_provider_cancel_reservation(adapter->engine, stream->receive_fin_reservation);
+        trevrpc_engine_provider_cancel_reservation(adapter->engine, stream->send_stopped_reservation);
         released_receive_credit |= stream->parser_receive_allocation != NULL;
         trevrpc_frame_parser_reset(&stream->parser);
         free(stream->pending_operation_ids);

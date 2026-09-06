@@ -1362,6 +1362,68 @@ static void trevrpc_rpc_fail_call_operations_locked(
     record->send_closed = true;
 }
 
+static bool trevrpc_rpc_operation_uses_send_direction(const trevrpc_rpc_operation* operation) {
+    return operation->kind == TREVRPC_RPC_OPERATION_SEND || operation->kind == TREVRPC_RPC_OPERATION_RESPOND ||
+           operation->kind == TREVRPC_RPC_OPERATION_STREAM_FINISH ||
+           operation->kind == TREVRPC_RPC_OPERATION_CALL_FINISH;
+}
+
+static void trevrpc_rpc_handle_send_stopped_locked(
+    trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_record* record, const trevrpc_rpc_transport_event_info* info) {
+    trevrpc_rpc_operation* operation;
+    int32_t failure_status = info->status != 0 ? info->status : -EPIPE;
+    if (record->request_send_pending && record->open_operation != NULL) {
+        trevrpc_rpc_transport_event_info ready = *info;
+        ready.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT;
+        ready.status = 0;
+        ready.application_error_code = 0;
+        ready.provider_error_code = 0;
+        trevrpc_rpc_complete_call_open_locked(runtime, record, &ready, TREVRPC_RPC_EVENT_CALL_READY, 0);
+    }
+    for (;;) {
+        operation = runtime->operations;
+        while (operation != NULL) {
+            bool belongs =
+                operation->scope_kind == TREVRPC_RPC_OBJECT_CALL &&
+                trevrpc_rpc_call_equal(
+                    (trevrpc_rpc_call_v1){operation->scope_owner, operation->scope_slot, operation->scope_generation},
+                    record->call);
+            if (belongs && operation != record->close_operation &&
+                trevrpc_rpc_operation_uses_send_direction(operation)) {
+                bool peer_settles_local_finish =
+                    record->local && operation->kind == TREVRPC_RPC_OPERATION_STREAM_FINISH;
+                trevrpc_rpc_fill_event_from_transport(operation->event, info);
+                operation->event->status = peer_settles_local_finish ? 0 : failure_status;
+                operation->event->subject_kind = trevrpc_rpc_operation_completion_subject(operation);
+                operation->event->endpoint = record->endpoint;
+                operation->event->call = record->call;
+                operation->event->stream = record->stream;
+                operation->event->operation_id = operation->operation_id;
+                (void)trevrpc_rpc_complete_operation_locked(runtime, operation);
+                break;
+            }
+            operation = operation->next;
+        }
+        if (operation == NULL) {
+            break;
+        }
+    }
+    record->request_send_pending = false;
+    record->send_finish_pending = false;
+    record->send_closed = true;
+}
+
+static void trevrpc_rpc_handle_send_stopped(
+    trevrpc_rpc_runtime* runtime, const trevrpc_rpc_transport_event_info* info) {
+    trevrpc_rpc_call_record* record;
+    pthread_mutex_lock(&runtime->mutex);
+    record = trevrpc_rpc_find_call_by_transport_locked(runtime, info->subject);
+    if (record != NULL) {
+        trevrpc_rpc_handle_send_stopped_locked(runtime, record, info);
+    }
+    pthread_mutex_unlock(&runtime->mutex);
+}
+
 static void trevrpc_rpc_publish_call_terminals_locked(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_record* record, const trevrpc_rpc_transport_event_info* info) {
     trevrpc_rpc_event* stream_event;
@@ -1567,6 +1629,10 @@ static void trevrpc_rpc_abort_or_terminal(trevrpc_rpc_runtime* runtime,
     }
 }
 
+static bool trevrpc_rpc_send_direction_stopped_status(int32_t status) {
+    return status == -ECANCELED || status == -EPIPE || status == -EALREADY;
+}
+
 static void trevrpc_rpc_handle_send_complete(
     trevrpc_rpc_runtime* runtime, const trevrpc_rpc_transport_event_info* info) {
     trevrpc_rpc_call_record* record;
@@ -1582,10 +1648,15 @@ static void trevrpc_rpc_handle_send_complete(
         free(record->request_frame);
         record->request_frame = NULL;
         record->request_frame_len = 0;
-        if (status == 0 &&
+        if (trevrpc_rpc_send_direction_stopped_status(status)) {
+            status = 0;
+            record->send_closed = true;
+        }
+        if (status == 0 && !record->send_closed &&
             (record->kind == TREVRPC_RPC_KIND_UNARY || record->kind == TREVRPC_RPC_KIND_SERVER_STREAMING)) {
             status = trevrpc_rpc_transport_stream_finish_send(runtime->transport, info->subject);
-            if (status == 0) {
+            if (status == 0 || trevrpc_rpc_send_direction_stopped_status(status)) {
+                status = 0;
                 record->send_closed = true;
             } else {
                 record->closing = true;
@@ -1654,10 +1725,15 @@ static void trevrpc_rpc_handle_send_complete(
     } else {
         trevrpc_rpc_fill_event_from_transport(operation->event, info);
     }
+    operation->event->subject_kind = trevrpc_rpc_operation_completion_subject(operation);
     operation->event->endpoint = record->endpoint;
     operation->event->call = record->call;
     operation->event->stream = record->stream;
     operation->event->operation_id = operation->operation_id;
+    if (record->local && operation->kind == TREVRPC_RPC_OPERATION_STREAM_FINISH &&
+        trevrpc_rpc_send_direction_stopped_status(operation->event->status)) {
+        operation->event->status = 0;
+    }
     if ((operation->kind == TREVRPC_RPC_OPERATION_RESPOND || operation->kind == TREVRPC_RPC_OPERATION_CALL_FINISH ||
             operation->kind == TREVRPC_RPC_OPERATION_STREAM_FINISH) &&
         operation->event->status != 0) {
@@ -1676,6 +1752,10 @@ static void trevrpc_rpc_handle_send_complete(
         record->send_finish_pending = false;
         record->send_closed = true;
         finish_result = trevrpc_rpc_transport_stream_finish_send(runtime->transport, info->subject);
+        if (record->local && operation->kind == TREVRPC_RPC_OPERATION_STREAM_FINISH &&
+            trevrpc_rpc_send_direction_stopped_status(finish_result)) {
+            finish_result = 0;
+        }
         if (finish_result != 0) {
             operation->event->status = finish_result;
         }
@@ -2021,6 +2101,10 @@ static int trevrpc_rpc_handle_transport_event(
     }
     case TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE:
         trevrpc_rpc_handle_send_complete(runtime, &info);
+        trevrpc_rpc_transport_event_release(runtime->transport, transport_event);
+        return 0;
+    case TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED:
+        trevrpc_rpc_handle_send_stopped(runtime, &info);
         trevrpc_rpc_transport_event_release(runtime->transport, transport_event);
         return 0;
     case TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED: {
@@ -3485,7 +3569,21 @@ static int trevrpc_rpc_stream_finish_send_impl(
         result = trevrpc_rpc_transport_stream_send(
             runtime->transport, record->transport_stream, operation->transport_operation_id, frame + 4, frame_len - 4);
     }
-    if (result != 0 && operation->subject_owner != 0) {
+    if (trevrpc_rpc_send_direction_stopped_status(result) && operation->subject_owner != 0 && record != NULL &&
+        record->local) {
+        operation->event->flags = TREVRPC_RPC_EVENT_FLAG_LOCAL | TREVRPC_RPC_EVENT_FLAG_CLIENT;
+        operation->event->status = 0;
+        operation->event->subject_kind = TREVRPC_RPC_OBJECT_STREAM;
+        operation->event->endpoint = record->endpoint;
+        operation->event->call = record->call;
+        operation->event->stream = record->stream;
+        operation->event->operation_id = operation->operation_id;
+        record->send_finish_pending = false;
+        record->send_closed = true;
+        (void)trevrpc_rpc_complete_operation_locked(runtime, operation);
+        operation = NULL;
+        result = 0;
+    } else if (result != 0 && operation->subject_owner != 0) {
         if (record != NULL) {
             record->send_finish_pending = false;
         }

@@ -131,6 +131,7 @@ typedef struct h3_stream_state {
     bool send_aborted;
     bool peer_reset;
     bool fin_reported;
+    bool send_stop_reported;
     bool control;
     bool settings_received;
     bool headers_received;
@@ -204,6 +205,7 @@ struct h3_entry {
     trevrpc_rpc_transport_event* ready_event;
     trevrpc_rpc_transport_event* terminal_event;
     trevrpc_rpc_transport_event* fin_event;
+    trevrpc_rpc_transport_event* send_stop_event;
     trevrpc_rpc_transport_event* send_event;
     size_t api_refs;
     size_t process_refs;
@@ -577,15 +579,19 @@ static h3_entry* h3_alloc_entry_locked(
             return NULL;
         }
         /* Reserve every mandatory notification which may be needed by this
-         * object.  A single ready node covers READY/FAILED; FIN is only used
-         * by streams, but reserving it here keeps admission uniform. */
+         * object.  A single ready node covers READY/FAILED; directional nodes
+         * are only used by streams, but reserving them here keeps admission
+         * uniform. */
         entry->ready_event = h3_mandatory_event_alloc(source);
         entry->terminal_event = h3_mandatory_event_alloc(source);
         entry->fin_event = h3_mandatory_event_alloc(source);
-        if (entry->ready_event == NULL || entry->terminal_event == NULL || entry->fin_event == NULL) {
+        entry->send_stop_event = h3_mandatory_event_alloc(source);
+        if (entry->ready_event == NULL || entry->terminal_event == NULL || entry->fin_event == NULL ||
+            entry->send_stop_event == NULL) {
             h3_mandatory_event_free(source, &entry->ready_event);
             h3_mandatory_event_free(source, &entry->terminal_event);
             h3_mandatory_event_free(source, &entry->fin_event);
+            h3_mandatory_event_free(source, &entry->send_stop_event);
             free(entry);
             slot->next_free = source->free_head;
             source->free_head = slot_number;
@@ -947,8 +953,9 @@ static int h3_emit_locked(h3_source* source,
     bool mandatory =
         (flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL) != 0 || kind == TREVRPC_RPC_TRANSPORT_EVENT_STOPPED ||
         kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE || kind == TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN ||
-        kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY || kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_FAILED ||
-        kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY || kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_FAILED;
+        kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED || kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY ||
+        kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_FAILED || kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY ||
+        kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_FAILED;
     info.kind = kind;
     info.flags = flags;
     info.status = status;
@@ -969,6 +976,11 @@ static int h3_emit_locked(h3_source* source,
         if (owner == NULL)
             owner = h3_find_retired_locked(source, subject);
         reserved_event = owner != NULL ? owner->fin_event : NULL;
+    } else if (kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED) {
+        owner = h3_find_any_locked(source, subject);
+        if (owner == NULL)
+            owner = h3_find_retired_locked(source, subject);
+        reserved_event = owner != NULL ? owner->send_stop_event : NULL;
     } else if (object_terminal) {
         terminal_entry = h3_find_any_locked(source, subject);
         if (terminal_entry == NULL)
@@ -1014,6 +1026,8 @@ static int h3_emit_locked(h3_source* source,
                     owner->send_event = NULL;
                 else if (kind == TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN)
                     owner->fin_event = NULL;
+                else if (kind == TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED)
+                    owner->send_stop_event = NULL;
                 else if (object_terminal)
                     owner->terminal_event = NULL;
                 else if (owner->ready_event == reserved_event)
@@ -1050,6 +1064,7 @@ static void h3_maybe_emit_stream_closed_locked(h3_entry* entry) {
     h3_source* source = entry->source;
     if (!entry->live || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM || entry->close_reported ||
         entry->stream.connect_control || !entry->stream.recv_fin || !entry->stream.send_fin ||
+        (entry->stream.send_aborted && entry->stream.peer_reset && !entry->stream.send_stop_reported) ||
         entry->send_event != NULL || entry->stream.pending_completion != NULL ||
         (entry->stream.action != TREV_H3_DEMUX_ACTION_REQUEST &&
             entry->stream.action != TREV_H3_DEMUX_ACTION_WEBTRANSPORT))
@@ -3339,6 +3354,8 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                 pthread_mutex_unlock(&source->mutex);
             }
             if (state.peer_receive_aborted) {
+                uint64_t application_error = 0;
+                uint64_t diagnostic_error = 0;
                 peer_reset = true;
                 peer_error = state.peer_receive_error;
                 pthread_mutex_lock(&source->mutex);
@@ -3348,6 +3365,28 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                     entry->stream.peer_reset = true;
                     if (!state.peer_send_aborted)
                         entry->stream.peer_reset_error = state.peer_receive_error;
+                    if (!entry->stream.send_stop_reported) {
+                        h3_decode_peer_reset_locked(
+                            source, entry, state.peer_receive_error, &application_error, &diagnostic_error);
+                        uint32_t event_flags = entry->side_flags & ~(TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL |
+                                                                       TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER);
+                        if (h3_emit_with_provider_locked(source,
+                                TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED,
+                                event_flags | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL |
+                                    TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET,
+                                -ECANCELED,
+                                TREVRPC_RPC_TRANSPORT_OBJECT_STREAM,
+                                h3_handle(entry),
+                                entry->parent,
+                                0,
+                                application_error,
+                                diagnostic_error) == 0)
+                            entry->stream.send_stop_reported = true;
+                        else {
+                            entry->pending |= H3_PENDING_TERMINAL;
+                            h3_signal_locked(source);
+                        }
+                    }
                     h3_maybe_emit_stream_closed_locked(entry);
                 }
                 pthread_mutex_unlock(&source->mutex);
@@ -4829,6 +4868,7 @@ static void h3_free_entry_mode(h3_entry* entry, bool force_stream_close) {
     h3_mandatory_event_free(entry->source, &entry->ready_event);
     h3_mandatory_event_free(entry->source, &entry->terminal_event);
     h3_mandatory_event_free(entry->source, &entry->fin_event);
+    h3_mandatory_event_free(entry->source, &entry->send_stop_event);
     h3_mandatory_event_free(entry->source, &entry->send_event);
     h3_stream_free(&entry->stream);
     h3_endpoint_free(&entry->endpoint);

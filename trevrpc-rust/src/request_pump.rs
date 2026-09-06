@@ -3,7 +3,6 @@ use std::future::Future;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::framed::{self, FrameRead, FrameTrace};
 use crate::server::{CancellationSource, check_stream_message_body_limits};
 use crate::{BoxStream, Code, Error, Result, RpcStreamFrameKind, Status};
 
@@ -97,10 +96,17 @@ pub(crate) enum RequestTransportEvent {
     ConnectionLost(Status),
 }
 
-pub(crate) trait RequestPumpReader: FrameRead + Send + 'static {
+pub(crate) trait RequestPumpReader: Send + 'static {
     fn stop_trevrpc(&mut self);
 
     fn backpressure_event(&mut self) -> impl Future<Output = Option<RequestTransportEvent>> + Send;
+
+    fn read_unary_end(&mut self) -> impl Future<Output = Result<()>> + Send;
+
+    fn read_stream_frame_or_eof(
+        &mut self,
+        max_frame_size: usize,
+    ) -> impl Future<Output = Result<Option<crate::RpcStreamFrame>>> + Send;
 
     fn validate_transport_end(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
@@ -176,19 +182,18 @@ impl Drop for RequestPump {
     }
 }
 
-pub(crate) fn start_request_pump<R, T>(
+pub(crate) fn start_request_pump<R>(
     reader: R,
     input_kind: RequestInputKind,
     max_frame_size: usize,
 ) -> (BoxStream<Vec<u8>>, RequestPump)
 where
     R: RequestPumpReader,
-    T: FrameTrace + Send + 'static,
 {
     let (body_tx, body_rx) = mpsc::channel(REQUEST_BODY_CHANNEL_CAPACITY);
     let (state_tx, state_rx) = watch::channel(RequestPumpState::Receiving);
     let (settle_tx, settle_rx) = watch::channel(None);
-    let task = tokio::spawn(run_request_pump::<R, T>(
+    let task = tokio::spawn(run_request_pump::<R>(
         reader,
         input_kind,
         max_frame_size,
@@ -210,7 +215,7 @@ where
     )
 }
 
-async fn run_request_pump<R, T>(
+async fn run_request_pump<R>(
     reader: R,
     input_kind: RequestInputKind,
     max_frame_size: usize,
@@ -220,7 +225,6 @@ async fn run_request_pump<R, T>(
 ) -> RequestPumpOutcome
 where
     R: RequestPumpReader,
-    T: FrameTrace,
 {
     let mut reader = PumpReaderGuard::new(reader);
     let outcome = match input_kind {
@@ -231,7 +235,7 @@ where
             max_messages,
             max_body_size,
         } => {
-            run_streaming_pump::<R, T>(
+            run_streaming_pump::<R>(
                 &mut reader,
                 max_frame_size,
                 max_messages,
@@ -255,9 +259,9 @@ async fn run_unary_pump<R>(
 where
     R: RequestPumpReader,
 {
-    let mut byte = [0_u8; 1];
+    let mut read = Box::pin(reader.reader.read_unary_end());
     loop {
-        let read = tokio::select! {
+        let result = tokio::select! {
             biased;
             changed = settle_rx.changed() => {
                 let _ = changed;
@@ -267,25 +271,20 @@ where
                 if matches!(reason, RequestPumpSettle::ResponseCommitted) {
                     continue;
                 }
+                drop(read);
                 return settle_reader(reader, reason);
             }
-            read = reader.reader.read_frame_bytes(&mut byte) => read,
+            result = &mut read => result,
         };
-        match read {
-            Ok(None) => {
+        drop(read);
+        match result {
+            Ok(()) => {
                 if let Err(error) = reader.reader.validate_transport_end().await {
                     return fail_and_wait(reader, classify_error(error), state_tx, settle_rx, None)
                         .await;
                 }
                 reader.settled = true;
                 return RequestPumpOutcome::CleanFin;
-            }
-            Ok(Some(0)) => {}
-            Ok(Some(_)) => {
-                let failure = RequestPumpFailure::Protocol(Status::invalid_argument(
-                    "unary request stream contained data after the initial request frame",
-                ));
-                return fail_and_wait(reader, failure, state_tx, settle_rx, None).await;
             }
             Err(error) => {
                 return fail_and_wait(reader, classify_error(error), state_tx, settle_rx, None)
@@ -296,7 +295,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn run_streaming_pump<R, T>(
+async fn run_streaming_pump<R>(
     reader: &mut PumpReaderGuard<R>,
     max_frame_size: usize,
     max_messages: Option<usize>,
@@ -307,7 +306,6 @@ async fn run_streaming_pump<R, T>(
 ) -> RequestPumpOutcome
 where
     R: RequestPumpReader,
-    T: FrameTrace,
 {
     let mut messages = 0_usize;
     let mut body_size = 0_usize;
@@ -361,7 +359,7 @@ where
                 drop(permit);
                 return settle_reader(reader, settle_rx.borrow_and_update().unwrap_or(RequestPumpSettle::ResponseStopped));
             }
-            frame = framed::read_stream_frame_or_eof::<_, T>(&mut reader.reader, max_frame_size) => frame,
+            frame = reader.reader.read_stream_frame_or_eof(max_frame_size) => frame,
         };
 
         match frame {
@@ -385,7 +383,7 @@ where
                     drop(permit);
                     let status = frame.status_value();
                     let _ = state_tx.send(RequestPumpState::DrainingTerminalFin);
-                    match drain_terminal::<R, T>(reader, max_frame_size, settle_rx).await {
+                    match drain_terminal::<R>(reader, max_frame_size, settle_rx).await {
                         Ok(RequestPumpOutcome::CleanFin) if status.is_ok() => {
                             reader.settled = true;
                             return RequestPumpOutcome::CleanFin;
@@ -444,14 +442,13 @@ where
     }
 }
 
-async fn drain_terminal<R, T>(
+async fn drain_terminal<R>(
     reader: &mut PumpReaderGuard<R>,
     max_frame_size: usize,
     settle_rx: &mut watch::Receiver<Option<RequestPumpSettle>>,
 ) -> Result<RequestPumpOutcome>
 where
     R: RequestPumpReader,
-    T: FrameTrace,
 {
     loop {
         let frame = tokio::select! {
@@ -463,7 +460,7 @@ where
                     reason => return Ok(settle_reader(reader, reason)),
                 }
             }
-            frame = framed::read_stream_frame_or_eof::<_, T>(&mut reader.reader, max_frame_size) => frame?,
+            frame = reader.reader.read_stream_frame_or_eof(max_frame_size) => frame?,
         };
         if frame.is_some() {
             return Err(Error::from(Status::internal(
@@ -616,22 +613,36 @@ fn transport_failure_kind(error: &Error) -> Option<TransportFailureKind> {
         });
     }
 
+    #[cfg(feature = "native-c")]
+    if let Some(error) = error.downcast_ref::<trevrpc_native::NativeError>() {
+        return Some(if error.is_peer_reset() {
+            TransportFailureKind::PeerReset
+        } else if error.is_message_too_large() {
+            TransportFailureKind::Protocol
+        } else {
+            TransportFailureKind::ConnectionLost
+        });
+    }
+
     error
         .downcast_ref::<std::io::Error>()
         .map(|_| TransportFailureKind::ConnectionLost)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "quinn"))]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
-    use crate::framed::{FrameRead, NoopFrameTrace};
+    use crate::framed::{self, FrameRead, NoopFrameTrace};
     use crate::{Code, Error, Result, RpcStreamFrame, Status};
 
     use super::{
@@ -662,6 +673,17 @@ mod tests {
             self.stops.fetch_add(1, Ordering::SeqCst);
         }
 
+        async fn read_unary_end(&mut self) -> Result<()> {
+            framed::drain_unary_request_end(self).await
+        }
+
+        async fn read_stream_frame_or_eof(
+            &mut self,
+            max_frame_size: usize,
+        ) -> Result<Option<crate::RpcStreamFrame>> {
+            framed::read_stream_frame_or_eof::<_, NoopFrameTrace>(self, max_frame_size).await
+        }
+
         async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
             self.events.recv().await
         }
@@ -686,6 +708,78 @@ mod tests {
     impl RequestPumpReader for PanicReader {
         fn stop_trevrpc(&mut self) {
             self.stops.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn read_unary_end(&mut self) -> Result<()> {
+            panic!("request reader panic");
+        }
+
+        async fn read_stream_frame_or_eof(
+            &mut self,
+            _max_frame_size: usize,
+        ) -> Result<Option<crate::RpcStreamFrame>> {
+            panic!("request reader panic");
+        }
+
+        async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
+            std::future::pending().await
+        }
+
+        async fn validate_transport_end(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TrackedUnaryRead {
+        completion: oneshot::Receiver<()>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for TrackedUnaryRead {
+        type Output = Result<()>;
+
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+            match Pin::new(&mut self.completion).poll(context) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(_)) => Poll::Ready(Err(Error::from(Status::cancelled(
+                    "tracked unary read was cancelled",
+                )))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for TrackedUnaryRead {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedUnaryReader {
+        completion: Option<oneshot::Receiver<()>>,
+        starts: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl RequestPumpReader for TrackedUnaryReader {
+        fn stop_trevrpc(&mut self) {}
+
+        fn read_unary_end(&mut self) -> impl Future<Output = Result<()>> + Send {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            TrackedUnaryRead {
+                completion: self
+                    .completion
+                    .take()
+                    .expect("unary read future should start once"),
+                drops: Arc::clone(&self.drops),
+            }
+        }
+
+        async fn read_stream_frame_or_eof(
+            &mut self,
+            _max_frame_size: usize,
+        ) -> Result<Option<crate::RpcStreamFrame>> {
+            panic!("stream read should not run for unary request");
         }
 
         async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
@@ -744,6 +838,37 @@ mod tests {
             .expect("message frame should encode")
     }
 
+    #[tokio::test]
+    async fn unary_response_commit_does_not_restart_logical_read() {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let reader = TrackedUnaryReader {
+            completion: Some(completion_rx),
+            starts: Arc::clone(&starts),
+            drops: Arc::clone(&drops),
+        };
+        let (_body, pump) = start_request_pump(reader, RequestInputKind::Unary, 1024);
+
+        wait_for(&starts, 1).await;
+        let settlement = tokio::spawn(pump.settle(RequestPumpSettle::ResponseCommitted));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        completion_tx
+            .send(())
+            .expect("tracked unary read should still be pending");
+        assert_eq!(
+            settlement.await.unwrap(),
+            super::RequestPumpOutcome::CleanFin
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
     fn streaming() -> RequestInputKind {
         RequestInputKind::Streaming {
             max_messages: None,
@@ -760,8 +885,7 @@ mod tests {
             .write_all(&[first.clone(), second.clone()].concat())
             .await
             .expect("frames should be written");
-        let (mut body, pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (mut body, pump) = start_request_pump(io.reader, streaming(), 1024);
 
         wait_for(&io.reads, first.len()).await;
         for _ in 0..20 {
@@ -783,8 +907,7 @@ mod tests {
             .write_all(&[first.clone(), second.clone()].concat())
             .await
             .unwrap();
-        let (mut body, pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (mut body, pump) = start_request_pump(io.reader, streaming(), 1024);
 
         wait_for(&io.reads, first.len()).await;
         assert_eq!(io.reads.load(Ordering::SeqCst), first.len());
@@ -800,8 +923,7 @@ mod tests {
         let mut io = test_io(None);
         let first = message(b"queued");
         io.writer.write_all(&first).await.unwrap();
-        let (mut body, mut pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (mut body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
         wait_for(&io.reads, first.len()).await;
         io.events
             .send(RequestTransportEvent::PeerReset(Status::cancelled("reset")))
@@ -825,8 +947,7 @@ mod tests {
         let mut io = test_io(None);
         let first = message(b"queued");
         io.writer.write_all(&first).await.unwrap();
-        let (_body, mut pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
         wait_for(&io.reads, first.len()).await;
         io.events
             .send(RequestTransportEvent::ConnectionLost(Status::unavailable(
@@ -879,7 +1000,7 @@ mod tests {
     async fn observed_limit_error_wakes_control_before_body_poll() {
         let mut io = test_io(None);
         io.writer.write_all(&message(b"over limit")).await.unwrap();
-        let (_body, mut pump) = start_request_pump::<_, NoopFrameTrace>(
+        let (_body, mut pump) = start_request_pump(
             io.reader,
             RequestInputKind::Streaming {
                 max_messages: Some(0),
@@ -898,8 +1019,7 @@ mod tests {
     async fn malformed_frame_wakes_control_before_body_poll() {
         let mut io = test_io(None);
         io.writer.write_all(&[0, 0, 0, 1, 0xff]).await.unwrap();
-        let (_body, mut pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
 
         let failure = pump.failure().await;
         assert_eq!(failure.status().code(), Code::InvalidArgument);
@@ -911,8 +1031,7 @@ mod tests {
         let mut io = test_io(None);
         let terminal = crate::framing::encode_frame(&RpcStreamFrame::status(Status::ok())).unwrap();
         io.writer.write_all(&terminal).await.unwrap();
-        let (_body, mut pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if matches!(*pump.state.borrow(), RequestPumpState::DrainingTerminalFin) {
@@ -947,8 +1066,7 @@ mod tests {
             .await
             .unwrap();
         io.writer.shutdown().await.unwrap();
-        let (_body, mut pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
 
         let failure = pump.failure().await;
         assert_eq!(failure.status().code(), Code::Internal);
@@ -962,7 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn response_commit_stops_nonterminal_request_with_code_one() {
         let io = test_io(None);
-        let (_body, pump) = start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (_body, pump) = start_request_pump(io.reader, streaming(), 1024);
         let outcome = pump.settle(RequestPumpSettle::ResponseCommitted).await;
 
         assert_eq!(outcome, super::RequestPumpOutcome::LocallyStopped);
@@ -972,7 +1090,7 @@ mod tests {
     #[tokio::test]
     async fn pump_drop_stops_request_with_code_one() {
         let io = test_io(None);
-        let (_body, pump) = start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (_body, pump) = start_request_pump(io.reader, streaming(), 1024);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !io.read_started.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
@@ -993,7 +1111,7 @@ mod tests {
     #[tokio::test]
     async fn request_pump_task_panic_wakes_control_and_settles() {
         let stops = Arc::new(AtomicUsize::new(0));
-        let (_body, mut pump) = start_request_pump::<_, NoopFrameTrace>(
+        let (_body, mut pump) = start_request_pump(
             PanicReader {
                 stops: Arc::clone(&stops),
             },
@@ -1019,8 +1137,7 @@ mod tests {
     async fn clean_fin_never_sends_stop_sending() {
         let mut io = test_io(None);
         io.writer.shutdown().await.unwrap();
-        let (_body, mut pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if matches!(
@@ -1046,8 +1163,7 @@ mod tests {
             "HTTP/3 request trailers are not supported",
         )));
         io.writer.shutdown().await.unwrap();
-        let (_body, mut pump) =
-            start_request_pump::<_, NoopFrameTrace>(io.reader, streaming(), 1024);
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
 
         let failure = pump.failure().await;
         assert_eq!(failure.status().code(), Code::InvalidArgument);

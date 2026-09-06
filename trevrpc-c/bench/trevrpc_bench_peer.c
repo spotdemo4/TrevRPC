@@ -1036,9 +1036,12 @@ static int run_client_stream(benchmark_client* c, const client_options* o) {
     trevrpc_rpc_call_v1 call = {0};
     trevrpc_rpc_stream_v1 s = {0};
     uint64_t op = next_client_operation(c);
+    const char* stage = "open";
     int e = trevrpc_benchmark_v1_benchmark_service_client_stream_open(c->runtime, c->endpoint, NULL, op, &call, &s);
-    if (!e)
+    if (!e) {
+        stage = "call_ready";
         e = client_wait_call(c, op);
+    }
     uint8_t* p = NULL;
     if (!e) {
         p = new_payload(o->request_bytes, 0);
@@ -1052,20 +1055,28 @@ static int run_client_stream(benchmark_client* c, const client_options* o) {
         q.payload.data = p;
         q.response_bytes = o->response_bytes;
         uint64_t x = next_client_operation(c);
+        stage = "send";
         e = trevrpc_benchmark_v1_benchmark_service_client_stream_send(c->runtime, s, &q, x);
-        if (!e)
+        if (!e) {
+            stage = "send_complete";
             e = client_wait_stream(c, TREVRPC_RPC_EVENT_SEND_COMPLETE, s, x);
+        }
     }
     free(p);
     if (!e) {
         op = next_client_operation(c);
+        stage = "finish_send";
         e = trevrpc_benchmark_v1_benchmark_service_client_stream_finish_send(c->runtime, s, op);
-        if (!e)
+        if (!e) {
+            stage = "send_finished";
             e = client_wait_stream(c, TREVRPC_RPC_EVENT_SEND_FINISHED, s, op);
+        }
     }
     BenchmarkSummary* sum = NULL;
-    if (!e)
+    if (!e) {
+        stage = "response";
         e = client_read_message(c, s, decode_summary, (void**)&sum);
+    }
     if (!e && (!sum || sum->message_count != o->messages_per_stream ||
                   sum->payload_bytes != (uint64_t)o->request_bytes * o->messages_per_stream)) {
         fprintf(stderr,
@@ -1077,15 +1088,21 @@ static int run_client_stream(benchmark_client* c, const client_options* o) {
         e = -EPROTO;
     }
     trevrpc__benchmark__v1__benchmark_summary__free_unpacked(sum, NULL);
-    if (!e)
+    if (!e) {
+        stage = "status";
         e = receive_status_ok(c, s);
-    if (!e)
+    }
+    if (!e) {
+        stage = "receive_fin";
         e = client_wait_receive_fin(c, s);
+    }
     if (call.owner) {
         int x = close_client_call(c, call, s);
         if (!e)
             e = x;
     }
+    if (e)
+        fprintf(stderr, "client_stream %s failed: %s (%d)\n", stage, rpc_error_string(e), e);
     return e;
 }
 static int run_server_stream(benchmark_client* c, const client_options* o) {

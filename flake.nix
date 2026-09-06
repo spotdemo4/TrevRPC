@@ -48,6 +48,10 @@
           consumer:
           assert consumer.passthru.msquicProvider == libmsquic;
           consumer;
+        cTransportCheck = callPackage ./trevrpc-c/transport-check.nix { };
+        cTransportSanitizerCheck = cTransportCheck.override {
+          sanitizers = true;
+        };
         # Internal compatibility lane for C++/Node migration. It is not
         # exported through packageSet or the public package outputs.
         cLegacy = callPackage ./trevrpc-c {
@@ -145,6 +149,8 @@
             rust = callPackage ./trevrpc-rust {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
+              trevrpcC = c;
+              trevrpcCTransportTesting = cTransportCheck.testing;
             };
             bench = callPackage ./bench {
               conformanceSrc = ./conformance;
@@ -494,7 +500,7 @@
             c = packageSet.trevrpc-c;
             c-engine = callPackage ./trevrpc-c/engine-check.nix { };
             c-engine-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/engine-msquic-check.nix { });
-            c-transport = callPackage ./trevrpc-c/transport-check.nix { };
+            c-transport = cTransportCheck;
             c-transport-msquic = requireCanonicalMsquic (
               callPackage ./trevrpc-c/transport-msquic-check.nix { }
             );
@@ -538,7 +544,13 @@
             };
           };
 
-          rust = packageSet.trevrpc-rust;
+            rust = packageSet.trevrpc-rust;
+            ${if system == "x86_64-linux" then "rust-native-ffi-sanitizers" else null} =
+              packageSet.trevrpc-rust.override
+                {
+                  trevrpcCTransportTesting = cTransportSanitizerCheck.testing;
+                  nativeFfiSanitizers = true;
+                };
 
           go = packageSet.trevrpc-go;
 

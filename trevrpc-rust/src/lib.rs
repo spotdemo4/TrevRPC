@@ -5,16 +5,20 @@
 extern crate self as trevrpc;
 
 #[cfg(feature = "client")]
+mod client_transport;
+#[cfg(feature = "client")]
 mod client_upload;
 pub mod error;
 #[cfg(feature = "quinn")]
 pub(crate) mod framed;
 pub mod framing;
-#[cfg(feature = "quinn")]
+#[cfg(all(feature = "server", any(feature = "quinn", feature = "native-c")))]
 mod request_pump;
 pub mod response;
 #[cfg(feature = "client")]
 mod response_state;
+#[cfg(all(feature = "server", any(feature = "quinn", feature = "native-c")))]
+mod server_transport;
 pub mod status;
 pub mod stream;
 pub mod wire;
@@ -26,11 +30,14 @@ pub const HTTP3_ALPN: &[u8] = b"h3";
 #[cfg(feature = "client")]
 pub mod client;
 
-#[cfg(feature = "quinn")]
+#[cfg(any(feature = "quinn", feature = "native-c"))]
 pub mod advanced;
 
 #[cfg(feature = "quinn")]
 pub mod quinn;
+
+#[cfg(feature = "native-c")]
+pub mod native;
 
 #[cfg(feature = "http3")]
 pub mod http3;

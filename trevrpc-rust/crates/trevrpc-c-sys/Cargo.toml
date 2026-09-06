@@ -1,0 +1,18 @@
+[package]
+name = "trevrpc-c-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "Raw FFI bindings for the TrevRPC native Transport ABI"
+repository = "https://trev.zip/llc/TrevRPC"
+license = "MIT"
+links = "trevrpc_transport_msquic"
+build = "build.rs"
+
+[features]
+default = []
+system-native = []
+testing = []
+
+[lints.clippy]
+pedantic = "warn"

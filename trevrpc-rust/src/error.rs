@@ -22,6 +22,7 @@ impl Error {
         Self::Transport(Box::new(error))
     }
 
+    #[cfg(any(feature = "quinn", all(feature = "native-c", feature = "server")))]
     pub(crate) fn transport_code(&self) -> Option<crate::Code> {
         match self {
             Self::Transport(error) => Some(transport_status(error.as_ref()).code()),
@@ -107,6 +108,11 @@ fn transport_status(error: &(dyn StdError + Send + Sync + 'static)) -> Status {
         return h3_quic_stream_status(error);
     }
 
+    #[cfg(feature = "native-c")]
+    if let Some(error) = error.downcast_ref::<trevrpc_native::NativeError>() {
+        return native_status(error);
+    }
+
     if let Some(error) = error.downcast_ref::<io::Error>() {
         return io_status(error);
     }
@@ -145,6 +151,27 @@ fn io_status(error: &io::Error) -> Status {
         | io::ErrorKind::UnexpectedEof => transport_unavailable(error),
         _ => Status::internal(error.to_string()),
     }
+}
+
+#[cfg(feature = "native-c")]
+fn native_status(error: &trevrpc_native::NativeError) -> Status {
+    if error.is_message_too_large() {
+        return Status::resource_exhausted(error.to_string());
+    }
+    if error.is_peer_reset()
+        || matches!(
+            error.origin(),
+            trevrpc_native::ErrorOrigin::Local | trevrpc_native::ErrorOrigin::Peer
+        )
+    {
+        return Status::cancelled(error.to_string());
+    }
+    if error.code() != 0 {
+        return io_status(&io::Error::from_raw_os_error(
+            error.code().unsigned_abs().cast_signed(),
+        ));
+    }
+    transport_unavailable(error)
 }
 
 #[cfg(feature = "quinn")]

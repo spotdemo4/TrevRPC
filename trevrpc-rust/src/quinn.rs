@@ -2,24 +2,19 @@ use std::future::{Future, pending};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures_util::{FutureExt, StreamExt};
 use prost::Message;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::advanced::RawQuinnTransport;
 use crate::client::{RpcTransport, StreamingRpcTransport};
+use crate::client_transport::{ClientResponseBackend, read_unary_response, streaming_response};
 use crate::client_upload::UploadWriter;
-use crate::framed::{self, FrameRead, FrameTrace, FrameWrite, MESSAGE_FRAME_BATCH};
-use crate::request_pump::{
-    RequestInputKind, RequestPumpReader, RequestPumpSettle, RequestTransportEvent,
-    start_request_pump,
-};
-use crate::server::{CancellationSource, CancellationToken, ServerOptions};
-use crate::{
-    BoxStream, Error, Result, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, RpcStreamFrameKind,
-    Status,
-};
+use crate::framed::{self, FrameRead, FrameTrace, FrameWrite};
+use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
+use crate::server::ServerOptions;
+use crate::server_transport::{self, ResponseWriter, try_acquire_permit};
+use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
 const CANCELLED_STREAM_CODE: u32 = 1;
 const FRAME_HEADER_LEN: u64 = 4;
@@ -156,18 +151,76 @@ impl FrameRead for quinn::RecvStream {
     }
 }
 
-struct QuinnPumpReader(quinn::RecvStream);
+struct QuinnResponseWriter {
+    send: quinn::SendStream,
+    max_frame_size: usize,
+}
 
-impl FrameRead for QuinnPumpReader {
-    async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
-        self.0.read(bytes).await.map_err(Error::transport)
+impl QuinnResponseWriter {
+    const fn new(send: quinn::SendStream, max_frame_size: usize) -> Self {
+        Self {
+            send,
+            max_frame_size,
+        }
     }
 }
+
+impl ResponseWriter for QuinnResponseWriter {
+    async fn write_response(&mut self, response: &RpcResponse) -> Result<()> {
+        framed::write_frame::<_, QuinnFrameTrace, _>(&mut self.send, response, self.max_frame_size)
+            .await
+    }
+
+    async fn write_message_stream_frames(&mut self, bodies: &mut Vec<Vec<u8>>) -> Result<()> {
+        framed::write_message_stream_frames::<_, QuinnFrameTrace>(
+            &mut self.send,
+            bodies,
+            self.max_frame_size,
+        )
+        .await
+    }
+
+    async fn write_stream_frame(&mut self, frame: RpcStreamFrame) -> Result<()> {
+        framed::write_stream_frame::<_, QuinnFrameTrace>(&mut self.send, frame, self.max_frame_size)
+            .await
+    }
+
+    async fn stopped(&mut self) -> Result<()> {
+        self.send
+            .stopped()
+            .await
+            .map(|_| ())
+            .map_err(Error::transport)
+    }
+
+    fn reset(&mut self) {
+        let _ = self.send.reset(CANCELLED_STREAM_CODE.into());
+    }
+
+    async fn finish(&mut self, detail: &'static str) -> Result<()> {
+        let result = self.send.finish().map_err(Error::transport);
+        trace_quinn_event("tx_fin", detail);
+        result
+    }
+}
+
+struct QuinnPumpReader(quinn::RecvStream);
 
 impl RequestPumpReader for QuinnPumpReader {
     fn stop_trevrpc(&mut self) {
         trace_quinn_event("tx_stop_sending", "request_pump_stop");
         let _ = self.0.stop(CANCELLED_STREAM_CODE.into());
+    }
+
+    async fn read_unary_end(&mut self) -> Result<()> {
+        framed::drain_unary_request_end(&mut self.0).await
+    }
+
+    async fn read_stream_frame_or_eof(
+        &mut self,
+        max_frame_size: usize,
+    ) -> Result<Option<RpcStreamFrame>> {
+        framed::read_stream_frame_or_eof::<_, QuinnFrameTrace>(&mut self.0, max_frame_size).await
     }
 
     async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
@@ -335,16 +388,13 @@ impl RpcTransport for RawQuinnTransport {
             .open_bi()
             .await
             .map_err(Error::transport)?;
-        let mut streams = CancellableBiStream::new(send, recv);
+        let mut streams = CancellableBiStream::new(send, recv, self.max_frame_size());
 
         write_frame(streams.send_mut(), &request, self.max_frame_size()).await?;
         streams.send_mut().finish().map_err(Error::transport)?;
         trace_quinn_event("tx_fin", "client_unary_request");
 
-        let response = read_frame(streams.recv_mut(), self.max_frame_size()).await?;
-        streams.complete();
-
-        Ok(response)
+        read_unary_response(streams).await
     }
 }
 
@@ -365,21 +415,27 @@ impl StreamingRpcTransport for RawQuinnTransport {
             write_streaming_request(send, request, request_body, max_frame_size).await
         });
 
-        Ok(quinn_response_stream(recv, writer, self.max_frame_size()))
+        Ok(streaming_response(QuinnResponseBackend::with_writer(
+            recv,
+            writer,
+            self.max_frame_size(),
+        )))
     }
 }
 
 struct CancellableBiStream {
     send: Option<quinn::SendStream>,
     recv: Option<quinn::RecvStream>,
+    max_frame_size: usize,
     complete: bool,
 }
 
 impl CancellableBiStream {
-    fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+    fn new(send: quinn::SendStream, recv: quinn::RecvStream, max_frame_size: usize) -> Self {
         Self {
             send: Some(send),
             recv: Some(recv),
+            max_frame_size,
             complete: false,
         }
     }
@@ -394,10 +450,6 @@ impl CancellableBiStream {
         self.recv
             .as_mut()
             .expect("recv stream should be present until completion")
-    }
-
-    fn complete(mut self) {
-        self.complete = true;
     }
 }
 
@@ -456,18 +508,22 @@ impl Drop for CancellableSendStream {
     }
 }
 
-struct QuinnResponseStream {
+struct QuinnResponseBackend {
     recv: Option<quinn::RecvStream>,
-    writer: UploadWriter,
+    writer: Option<UploadWriter>,
     max_frame_size: usize,
     complete: bool,
 }
 
-impl QuinnResponseStream {
-    const fn new(recv: quinn::RecvStream, writer: UploadWriter, max_frame_size: usize) -> Self {
+impl QuinnResponseBackend {
+    const fn with_writer(
+        recv: quinn::RecvStream,
+        writer: UploadWriter,
+        max_frame_size: usize,
+    ) -> Self {
         Self {
             recv: Some(recv),
-            writer,
+            writer: Some(writer),
             max_frame_size,
             complete: false,
         }
@@ -480,56 +536,86 @@ impl QuinnResponseStream {
     }
 }
 
-fn quinn_response_stream(
-    recv: quinn::RecvStream,
-    writer: UploadWriter,
-    max_frame_size: usize,
-) -> BoxStream<RpcStreamFrame> {
-    Box::pin(futures_util::stream::unfold(
-        QuinnResponseStream::new(recv, writer, max_frame_size),
-        |mut stream| async move {
-            if stream.complete {
-                return None;
-            }
+impl ClientResponseBackend for CancellableBiStream {
+    async fn read_unary_response(&mut self) -> Result<RpcResponse> {
+        let max_frame_size = self.max_frame_size;
+        read_frame(self.recv_mut(), max_frame_size).await
+    }
 
-            let max_frame_size = stream.max_frame_size;
-            let item = match read_stream_frame_or_eof(stream.recv_mut(), max_frame_size).await {
-                Ok(Some(frame)) if frame.frame_kind() == Some(RpcStreamFrameKind::Status) => {
-                    let status = frame.status_value();
-                    let writer_result = stream.writer.abort_and_settle().await;
-                    let drain_result = drain_fin_after_terminal_status(
-                        stream.recv_mut(),
-                        max_frame_size,
-                        "response stream",
-                    )
-                    .await;
-                    stream.complete = true;
-                    if let Err(error) = drain_result {
-                        Err(error)
-                    } else if status.is_ok() {
-                        writer_result.map(|()| frame)
-                    } else {
-                        Ok(frame)
-                    }
-                }
-                Ok(Some(frame)) => Ok(frame),
-                Ok(None) => {
-                    let _ = stream.writer.abort_and_settle().await;
-                    return None;
-                }
-                Err(error) => {
-                    let _ = stream.writer.abort_and_settle().await;
-                    stream.complete = true;
-                    Err(error)
-                }
-            };
+    async fn read_unary_end(&mut self) -> Result<()> {
+        let max_frame_size = self.max_frame_size;
+        if framed::read_raw_frame_or_eof(self.recv_mut(), max_frame_size)
+            .await?
+            .is_some()
+        {
+            return Err(Error::from(Status::internal(
+                "unary response contained more than one response frame",
+            )));
+        }
+        Ok(())
+    }
 
-            Some((item, stream))
-        },
-    ))
+    async fn read_stream_frame(&mut self) -> Result<Option<RpcStreamFrame>> {
+        let max_frame_size = self.max_frame_size;
+        read_stream_frame_or_eof(self.recv_mut(), max_frame_size).await
+    }
+
+    async fn abort_upload_and_settle(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn drain_after_terminal_status(&mut self) -> Result<()> {
+        let max_frame_size = self.max_frame_size;
+        drain_fin_after_terminal_status(self.recv_mut(), max_frame_size, "response stream").await
+    }
+
+    fn mark_complete(&mut self) {
+        self.complete = true;
+    }
 }
 
-impl Drop for QuinnResponseStream {
+impl ClientResponseBackend for QuinnResponseBackend {
+    async fn read_unary_response(&mut self) -> Result<RpcResponse> {
+        let max_frame_size = self.max_frame_size;
+        read_frame(self.recv_mut(), max_frame_size).await
+    }
+
+    async fn read_unary_end(&mut self) -> Result<()> {
+        let max_frame_size = self.max_frame_size;
+        if framed::read_raw_frame_or_eof(self.recv_mut(), max_frame_size)
+            .await?
+            .is_some()
+        {
+            return Err(Error::from(Status::internal(
+                "unary response contained more than one response frame",
+            )));
+        }
+        Ok(())
+    }
+
+    async fn read_stream_frame(&mut self) -> Result<Option<RpcStreamFrame>> {
+        let max_frame_size = self.max_frame_size;
+        read_stream_frame_or_eof(self.recv_mut(), max_frame_size).await
+    }
+
+    async fn abort_upload_and_settle(&mut self) -> Result<()> {
+        match &mut self.writer {
+            Some(writer) => writer.abort_and_settle().await,
+            None => Ok(()),
+        }
+    }
+
+    async fn drain_after_terminal_status(&mut self) -> Result<()> {
+        let max_frame_size = self.max_frame_size;
+        drain_fin_after_terminal_status(self.recv_mut(), max_frame_size, "response stream").await
+    }
+
+    fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for QuinnResponseBackend {
     fn drop(&mut self) {
         if !self.complete
             && let Some(recv) = &mut self.recv
@@ -550,26 +636,6 @@ where
     M: Message,
 {
     framed::write_frame::<_, QuinnFrameTrace, M>(send, message, max_frame_size).await
-}
-
-async fn write_message_stream_frames(
-    send: &mut quinn::SendStream,
-    bodies: &mut Vec<Vec<u8>>,
-    max_frame_size: usize,
-) -> Result<()> {
-    framed::write_message_stream_frames::<_, QuinnFrameTrace>(send, bodies, max_frame_size).await
-}
-
-async fn write_stream_frame(
-    send: &mut quinn::SendStream,
-    frame: RpcStreamFrame,
-    max_frame_size: usize,
-) -> Result<()> {
-    framed::write_stream_frame::<_, QuinnFrameTrace>(send, frame, max_frame_size).await
-}
-
-fn is_plain_message_frame(frame: &RpcStreamFrame) -> bool {
-    framed::is_plain_message_frame(frame)
 }
 
 /// Reads and decodes one length-prefixed protobuf frame from a `Quinn` receive stream.
@@ -797,121 +863,60 @@ pub(crate) async fn handle_connection(
 
 async fn reject_stream(
     server: crate::server::Server,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
 ) {
-    let request = match read_initial_request(&server, &mut recv).await {
+    let max_frame_size = server.max_frame_size();
+    let mut recv = QuinnPumpReader(recv);
+    let request = match read_initial_request(&server, &mut recv.0).await {
         Ok(request) => request,
         Err(error) => {
-            let _ = recv.stop(CANCELLED_STREAM_CODE.into());
+            let _ = recv.0.stop(CANCELLED_STREAM_CODE.into());
             let status = error.into_status();
             server.record_pre_handler_failure(&status);
-            write_status(send, status, server.max_frame_size()).await;
+            server_transport::write_status(QuinnResponseWriter::new(send, max_frame_size), status)
+                .await;
             return;
         }
     };
-    let status = Status::unavailable("too many concurrent streams on connection");
-    server.record_rejected_request(&request, &status);
-    if write_rpc_status(&mut send, &request, status, server.max_frame_size()).await {
-        if request.rpc_kind() == RpcKind::Unary {
-            drain_unary_request_end_or_stop(&server, &mut recv).await;
-        }
-        let _ = send.finish();
-        trace_quinn_event("tx_fin", "server_stream_status");
-    }
+    server_transport::reject_stream(
+        server,
+        QuinnResponseWriter::new(send, max_frame_size),
+        recv,
+        request,
+    )
+    .await;
 }
 
 async fn handle_stream(
     server: crate::server::Server,
     request_limit: Option<Arc<Semaphore>>,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-    mut shutdown: watch::Receiver<bool>,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    shutdown: watch::Receiver<bool>,
 ) {
-    let request = match read_initial_request(&server, &mut recv).await {
+    let max_frame_size = server.max_frame_size();
+    let mut recv = QuinnPumpReader(recv);
+    let request = match read_initial_request(&server, &mut recv.0).await {
         Ok(request) => request,
         Err(error) => {
-            let _ = recv.stop(CANCELLED_STREAM_CODE.into());
+            let _ = recv.0.stop(CANCELLED_STREAM_CODE.into());
             let status = error.into_status();
             server.record_pre_handler_failure(&status);
-            write_status(send, status, server.max_frame_size()).await;
-            return;
-        }
-    };
-
-    let Some(request_permit) = try_acquire_permit(request_limit.as_ref()) else {
-        let status = Status::unavailable("too many concurrent RPCs");
-        server.record_rejected_request(&request, &status);
-        if write_rpc_status(&mut send, &request, status, server.max_frame_size()).await {
-            if request.rpc_kind() == RpcKind::Unary {
-                drain_unary_request_end_or_stop(&server, &mut recv).await;
-            }
-            let _ = send.finish();
-            trace_quinn_event("tx_fin", "server_rpc_status");
-        }
-        return;
-    };
-
-    let cancellation = CancellationToken::new();
-    if request.rpc_kind() != RpcKind::Unary {
-        handle_streaming_rpc(server, send, recv, request, cancellation, shutdown).await;
-        return;
-    }
-
-    let request_for_failure = request.clone();
-    let (_request_body, mut request_pump) = start_request_pump::<_, QuinnFrameTrace>(
-        QuinnPumpReader(recv),
-        RequestInputKind::Unary,
-        server.max_frame_size(),
-    );
-    let response = tokio::select! {
-        biased;
-        response = server.handle_request_with_cancellation(request, cancellation.clone()) => response,
-        failure = request_pump.failure() => {
-            server.record_active_request_failure(&request_for_failure, failure.status());
-            if let Some(source) = failure.cancellation_source() {
-                cancellation.cancel(source);
-            }
-            if !failure.response_writable() {
-                let _ = send.reset(CANCELLED_STREAM_CODE.into());
-                let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-                return;
-            }
-            failure.status().clone().into_response(Vec::new())
-        },
-        stopped = send.stopped() => {
-            cancellation.cancel(if stopped.is_ok() {
-                CancellationSource::PeerReset
-            } else {
-                CancellationSource::ConnectionLost
-            });
-            let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-            #[cfg(feature = "tracing")]
-            tracing::debug!("client stopped response stream before RPC completed");
-            return;
-        }
-        changed = shutdown.changed() => {
-            let _ = changed;
-            cancellation.cancel(CancellationSource::ServerShutdown);
-            let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
-            return;
-        }
-    };
-
-    match write_frame(&mut send, &response, server.max_frame_size()).await {
-        Ok(()) => {
-            drop(request_permit);
-            let _ = request_pump
-                .settle(RequestPumpSettle::ResponseCommitted)
+            server_transport::write_status(QuinnResponseWriter::new(send, max_frame_size), status)
                 .await;
-            let _ = send.finish();
-            trace_quinn_event("tx_fin", "server_unary_response");
+            return;
         }
-        Err(error) => {
-            cancel_from_transport_error(&cancellation, &error);
-            let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
-        }
-    }
+    };
+    server_transport::handle_stream(
+        server,
+        request_limit,
+        QuinnResponseWriter::new(send, max_frame_size),
+        recv,
+        request,
+        shutdown,
+    )
+    .await;
 }
 
 async fn read_initial_request(
@@ -925,250 +930,6 @@ async fn read_initial_request(
             .map_err(|_| Error::from(Status::deadline_exceeded("initial request frame timeout")))?
     } else {
         read.await
-    }
-}
-
-async fn read_unary_request_end(
-    server: &crate::server::Server,
-    recv: &mut quinn::RecvStream,
-) -> Result<()> {
-    let read = framed::drain_unary_request_end(recv);
-    if let Some(timeout) = server.options().initial_request_timeout() {
-        tokio::time::timeout(timeout, read).await.map_err(|_| {
-            Error::from(Status::deadline_exceeded(
-                "unary request stream finish timeout",
-            ))
-        })?
-    } else {
-        read.await
-    }
-}
-
-fn cancel_from_transport_error(cancellation: &CancellationToken, error: &Error) {
-    if let Some(code) = error.transport_code() {
-        cancellation.cancel(if code == crate::Code::Cancelled {
-            CancellationSource::PeerReset
-        } else {
-            CancellationSource::ConnectionLost
-        });
-    }
-}
-
-async fn drain_unary_request_end_or_stop(
-    server: &crate::server::Server,
-    recv: &mut quinn::RecvStream,
-) {
-    if let Err(error) = read_unary_request_end(server, recv).await {
-        let _ = &error;
-        let _ = recv.stop(CANCELLED_STREAM_CODE.into());
-        #[cfg(feature = "tracing")]
-        tracing::debug!(%error, "failed to drain Quinn unary request stream");
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-async fn handle_streaming_rpc(
-    server: crate::server::Server,
-    mut send: quinn::SendStream,
-    recv: quinn::RecvStream,
-    request: RpcRequest,
-    cancellation: CancellationToken,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let max_frame_size = server.max_frame_size();
-    let request_for_failure = request.clone();
-    let (request_body, mut request_pump) = start_request_pump::<_, QuinnFrameTrace>(
-        QuinnPumpReader(recv),
-        RequestInputKind::for_rpc_kind(
-            request.rpc_kind(),
-            server.options().max_stream_messages(),
-            server.options().max_stream_body_size(),
-        ),
-        max_frame_size,
-    );
-    let mut response = tokio::select! {
-        biased;
-        response = server.handle_streaming_request_with_cancellation(
-            request,
-            request_body,
-            cancellation.clone(),
-        ) => response,
-        failure = request_pump.failure() => {
-            server.record_active_request_failure(&request_for_failure, failure.status());
-            if let Some(source) = failure.cancellation_source() {
-                cancellation.cancel(source);
-            }
-            if !failure.response_writable() {
-                let _ = send.reset(CANCELLED_STREAM_CODE.into());
-                let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-                return;
-            }
-            crate::stream::from_iter([RpcStreamFrame::status(failure.status().clone())])
-        },
-        stopped = send.stopped() => {
-            cancellation.cancel(if stopped.is_ok() {
-                CancellationSource::PeerReset
-            } else {
-                CancellationSource::ConnectionLost
-            });
-            let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-            #[cfg(feature = "tracing")]
-            tracing::debug!("client stopped response stream before streaming RPC handler completed");
-            return;
-        }
-        changed = shutdown.changed() => {
-            let _ = changed;
-            cancellation.cancel(CancellationSource::ServerShutdown);
-            let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
-            return;
-        }
-    };
-
-    let mut message_batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
-    loop {
-        let frame = tokio::select! {
-            biased;
-            failure = request_pump.failure() => {
-                cancellation.set_completion_code(failure.status().code());
-                if let Some(source) = failure.cancellation_source() {
-                    cancellation.cancel(source);
-                }
-                if !failure.response_writable() {
-                    let _ = send.reset(CANCELLED_STREAM_CODE.into());
-                    let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-                    return;
-                }
-                Some(Ok(RpcStreamFrame::status(failure.status().clone())))
-            },
-            frame = response.next() => frame,
-            stopped = send.stopped() => {
-                cancellation.cancel(if stopped.is_ok() {
-                    CancellationSource::PeerReset
-                } else {
-                    CancellationSource::ConnectionLost
-                });
-                let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-                #[cfg(feature = "tracing")]
-                tracing::debug!("client stopped response stream before streaming RPC completed");
-                return;
-            }
-            changed = shutdown.changed() => {
-                let _ = changed;
-                cancellation.cancel(CancellationSource::ServerShutdown);
-                let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
-                return;
-            }
-        };
-
-        let Some(frame) = frame else {
-            break;
-        };
-
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(error) => RpcStreamFrame::status(error.into_status()),
-        };
-
-        if is_plain_message_frame(&frame) {
-            message_batch.push(frame.body);
-            let mut next_frame = None;
-            while message_batch.len() < MESSAGE_FRAME_BATCH {
-                match response.next().now_or_never() {
-                    Some(Some(Ok(frame))) if is_plain_message_frame(&frame) => {
-                        message_batch.push(frame.body);
-                    }
-                    Some(Some(Ok(frame))) => {
-                        next_frame = Some(frame);
-                        break;
-                    }
-                    Some(Some(Err(error))) => {
-                        next_frame = Some(RpcStreamFrame::status(error.into_status()));
-                        break;
-                    }
-                    Some(None) | None => break,
-                }
-            }
-
-            if let Err(error) =
-                write_message_stream_frames(&mut send, &mut message_batch, max_frame_size).await
-            {
-                cancel_from_transport_error(&cancellation, &error);
-                let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
-                return;
-            }
-
-            let Some(frame) = next_frame else {
-                continue;
-            };
-            let is_status = frame.frame_kind() == Some(RpcStreamFrameKind::Status);
-            if let Err(error) = write_stream_frame(&mut send, frame, max_frame_size).await {
-                cancel_from_transport_error(&cancellation, &error);
-                let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
-                return;
-            }
-            if is_status {
-                break;
-            }
-            continue;
-        }
-
-        let is_status = frame.frame_kind() == Some(RpcStreamFrameKind::Status);
-
-        if let Err(error) = write_stream_frame(&mut send, frame, max_frame_size).await {
-            cancel_from_transport_error(&cancellation, &error);
-            let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
-            return;
-        }
-
-        if is_status {
-            break;
-        }
-    }
-
-    let _ = request_pump
-        .settle(RequestPumpSettle::ResponseCommitted)
-        .await;
-    let _ = send.finish();
-    trace_quinn_event("tx_fin", "server_streaming_response");
-}
-
-async fn write_rpc_status(
-    send: &mut quinn::SendStream,
-    request: &RpcRequest,
-    status: Status,
-    max_frame_size: usize,
-) -> bool {
-    let result = if request.rpc_kind() == RpcKind::Unary {
-        write_frame(send, &status.into_response(Vec::new()), max_frame_size).await
-    } else {
-        write_frame(send, &RpcStreamFrame::status(status), max_frame_size).await
-    };
-
-    result.is_ok()
-}
-
-#[allow(dead_code)]
-struct Permit(Option<OwnedSemaphorePermit>);
-
-fn try_acquire_permit(limit: Option<&Arc<Semaphore>>) -> Option<Permit> {
-    limit.map_or(Some(Permit(None)), |semaphore| {
-        semaphore
-            .clone()
-            .try_acquire_owned()
-            .ok()
-            .map(|permit| Permit(Some(permit)))
-    })
-}
-
-async fn write_status(mut send: quinn::SendStream, status: Status, max_frame_size: usize) {
-    let response = status.into_response(Vec::new());
-
-    if write_frame(&mut send, &response, max_frame_size)
-        .await
-        .is_ok()
-    {
-        let _ = send.finish();
-        trace_quinn_event("tx_fin", "server_status");
     }
 }
 

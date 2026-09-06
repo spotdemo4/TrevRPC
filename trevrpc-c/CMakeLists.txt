@@ -252,6 +252,22 @@ if(TREVRPC_BUILD_TRANSPORT)
     )
     trevrpc_c_warnings(trevrpc_transport)
     trevrpc_c_sanitizers(trevrpc_transport)
+
+    if(TREVRPC_BUILD_TESTS)
+        add_library(trevrpc_transport_testing STATIC tests/trevrpc_transport_testing.c)
+        target_include_directories(trevrpc_transport_testing
+            PUBLIC tests
+            PRIVATE src
+        )
+        target_link_libraries(trevrpc_transport_testing PUBLIC trevrpc_transport Threads::Threads)
+        trevrpc_c_warnings(trevrpc_transport_testing)
+        trevrpc_c_sanitizers(trevrpc_transport_testing)
+        configure_file(
+            cmake/trevrpc_transport_testing.pc.in
+            "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_transport_testing.pc"
+            @ONLY
+        )
+    endif()
 endif()
 
 if(TREVRPC_BUILD_RPC)
@@ -1421,6 +1437,15 @@ if(TREVRPC_BUILD_TESTS)
                 "-DTREVRPC_PUBLIC_HEADERS=${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_transport.h"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/transport-abi1/check_symbols.cmake"
         )
+
+        if(TARGET trevrpc_transport_testing)
+            add_executable(trevrpc_transport_testing_test tests/transport_testing_test.c)
+            target_link_libraries(trevrpc_transport_testing_test PRIVATE trevrpc_transport_testing)
+            trevrpc_c_warnings(trevrpc_transport_testing_test)
+            trevrpc_c_sanitizers(trevrpc_transport_testing_test)
+            add_test(NAME trevrpc_transport_testing COMMAND trevrpc_transport_testing_test)
+            set_tests_properties(trevrpc_transport_testing PROPERTIES TIMEOUT 30)
+        endif()
     endif()
 
     if(TARGET trevrpc_transport_msquic)

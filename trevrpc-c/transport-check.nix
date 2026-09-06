@@ -4,9 +4,14 @@
   cmake,
   ninja,
   pkg-config,
+  sanitizers ? false,
 }:
 stdenv.mkDerivation (final: {
   pname = "trevrpc-c-transport-check";
+  outputs = [
+    "out"
+    "testing"
+  ];
   version = "0.2.2";
 
   src = lib.fileset.toSource {
@@ -28,6 +33,7 @@ stdenv.mkDerivation (final: {
       -DCMAKE_INSTALL_PREFIX="$out" \
       -DCMAKE_INSTALL_LIBDIR=lib \
       -DTREVRPC_BUILD_TESTS=ON \
+      -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
       -DTREVRPC_BUILD_ENGINE=OFF \
       -DTREVRPC_BUILD_MSQUIC=OFF \
       -DTREVRPC_BUILD_ENGINE_MSQUIC=OFF \
@@ -48,7 +54,8 @@ stdenv.mkDerivation (final: {
     cmake --build build --parallel $NIX_BUILD_CORES --target \
       trevrpc_transport \
       trevrpc_transport_api_test \
-      trevrpc_transport_api_cpp_test
+      trevrpc_transport_api_cpp_test \
+      trevrpc_transport_testing_test
     runHook postBuild
   '';
 
@@ -56,17 +63,31 @@ stdenv.mkDerivation (final: {
   checkPhase = ''
     runHook preCheck
     ctest --test-dir build --output-on-failure \
-      -R '^trevrpc_transport_(api|api_cpp|abi1_symbols)$'
+      -R '^trevrpc_transport_(api|api_cpp|abi1_symbols|testing)$'
     runHook postCheck
   '';
 
   installPhase = ''
     runHook preInstall
     cmake --install build
+
+    testing_root="$testing/share/trevrpc-transport-testing"
+    testing_lib="$testing/lib/trevrpc-transport-testing"
+    mkdir -p "$testing_root/include" "$testing_root/pkgconfig" "$testing_lib"
+    cp build/libtrevrpc_transport_testing.a "$testing_lib/"
+    cp build/libtrevrpc_transport.a "$testing_lib/"
+    cp include/trevrpc_transport.h "$testing_root/include/"
+    cp tests/trevrpc_transport_testing.h "$testing_root/include/"
+    substitute build/trevrpc_transport_testing.pc \
+      "$testing_root/pkgconfig/trevrpc_transport_testing.pc" \
+      --replace-fail "prefix=$PWD/build" "prefix=$testing_root" \
+      --replace-fail 'libdir=''${prefix}' "libdir=$testing_lib" \
+      --replace-fail "includedir=$PWD/include" 'includedir=''${prefix}/include' \
+      --replace-fail "testincludedir=$PWD/tests" 'testincludedir=''${prefix}/include'
     runHook postInstall
   '';
 
-  doInstallCheck = true;
+  doInstallCheck = !sanitizers;
   installCheckPhase = ''
     runHook preInstallCheck
     test -f "$out/include/trevrpc_transport.h"
@@ -80,6 +101,15 @@ stdenv.mkDerivation (final: {
     test ! -e "$out/lib/libtrevrpc_engine.a"
     test ! -e "$out/lib/libtrevrpc_transport_msquic.a"
     test ! -e "$out/lib/libtrevrpc_rpc.a"
+    testing_root="$testing/share/trevrpc-transport-testing"
+    testing_lib="$testing/lib/trevrpc-transport-testing"
+    test -f "$testing_root/include/trevrpc_transport.h"
+    test -f "$testing_root/include/trevrpc_transport_testing.h"
+    test -f "$testing_lib/libtrevrpc_transport.a"
+    test -f "$testing_lib/libtrevrpc_transport_testing.a"
+    test -f "$testing_root/pkgconfig/trevrpc_transport_testing.pc"
+    PKG_CONFIG_PATH="$testing_root/pkgconfig" \
+      pkg-config --static --exists trevrpc_transport_testing
 
     cmake -S tests/install/cmake -B "$TMPDIR/transport-cmake-consumer" -G Ninja \
       -DCMAKE_PREFIX_PATH="$out" \

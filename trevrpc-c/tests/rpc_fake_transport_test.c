@@ -545,6 +545,173 @@ static void run_failed_request_send_complete(void) {
     assert(trevrpc_rpc_runtime_release(runtime) == 0);
 }
 
+static void run_send_stopped_preserves_receive_direction(void) {
+    static const uint8_t outbound[] = "outbound";
+    static const uint8_t inbound[] = "inbound";
+    fake_transport* fake = fake_create();
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_receive* receive = NULL;
+    trevrpc_rpc_receive_info_v1 receive_info;
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_event_info_v1 info;
+    uint64_t transport_operation_id;
+    int attempt;
+
+    setup_client_call(fake, &runtime, &wake, &endpoint, &call, &stream, TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, 2);
+    transport_operation_id = atomic_load_explicit(&fake->last_send_operation_id, memory_order_acquire);
+    assert(transport_operation_id != 0);
+    assert(fake_push_operation_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+               fake_stream_handle,
+               fake_connection_handle,
+               transport_operation_id) == 0);
+    event = wait_next_event(runtime, &wake);
+    info = event_info(event);
+    assert(info.kind == TREVRPC_RPC_EVENT_CALL_READY);
+    assert(info.operation_id == 2);
+    trevrpc_rpc_event_release(event);
+
+    assert(trevrpc_rpc_stream_send_copy_v1(runtime, stream, 6, outbound, sizeof(outbound) - 1, 0) == 0);
+    for (attempt = 0; attempt < 1000; ++attempt) {
+        if (atomic_load_explicit(&fake->stream_send_calls, memory_order_acquire) == 2) {
+            break;
+        }
+        assert(poll(NULL, 0, 1) >= 0);
+    }
+    assert(attempt < 1000);
+    assert(fake_push_operation_status_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT |
+                   TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET,
+               fake_stream_handle,
+               fake_connection_handle,
+               0,
+               -ECANCELED) == 0);
+    event = wait_next_event(runtime, &wake);
+    info = event_info(event);
+    assert(info.kind == TREVRPC_RPC_EVENT_SEND_COMPLETE);
+    assert(info.subject_kind == TREVRPC_RPC_OBJECT_STREAM);
+    assert(info.operation_id == 6);
+    assert(info.status == -ECANCELED);
+    assert((info.flags & TREVRPC_RPC_EVENT_FLAG_TERMINAL) != 0);
+    assert((info.flags & TREVRPC_RPC_EVENT_FLAG_PEER_RESET) != 0);
+    assert((info.flags & TREVRPC_RPC_EVENT_FLAG_PEER_CANCELLED) != 0);
+    trevrpc_rpc_event_release(event);
+    event = NULL;
+    assert(trevrpc_rpc_runtime_next_event(runtime, &event) == -EAGAIN);
+    assert(event == NULL);
+    assert(trevrpc_rpc_stream_send_copy_v1(runtime, stream, 7, outbound, sizeof(outbound) - 1, 0) == -EPIPE);
+
+    push_stream_frame(fake, TREVRPC_STREAM_FRAME_KIND_MESSAGE, TREVRPC_RPC_STATUS_OK, inbound, sizeof(inbound) - 1);
+    assert(fake_push_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+               fake_stream_handle,
+               fake_connection_handle) == 0);
+    event = wait_next_event(runtime, &wake);
+    info = event_info(event);
+    assert(info.kind == TREVRPC_RPC_EVENT_STREAM_READABLE);
+    trevrpc_rpc_event_release(event);
+    assert(trevrpc_rpc_stream_receive(runtime, stream, &receive) == 0);
+    assert(trevrpc_rpc_receive_info_v1_init(&receive_info, sizeof(receive_info)) == 0);
+    assert(trevrpc_rpc_receive_get_info_v1(receive, &receive_info) == 0);
+    assert(receive_info.kind == TREVRPC_RPC_RECEIVE_MESSAGE);
+    assert(receive_info.data_len == sizeof(inbound) - 1);
+    assert(memcmp(receive_info.data, inbound, sizeof(inbound) - 1) == 0);
+    trevrpc_rpc_receive_release(receive);
+
+    finish_call_and_runtime(fake, runtime, &wake, endpoint, call, stream, TREVRPC_RPC_CLOSE_FLAG_NONE, 0);
+}
+
+static void run_peer_stopped_local_finish_is_settled(bool synchronous_failure) {
+    fake_transport* fake = fake_create();
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_event_info_v1 info;
+    uint64_t transport_operation_id;
+
+    setup_client_call(fake, &runtime, &wake, &endpoint, &call, &stream, TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, 2);
+    transport_operation_id = atomic_load_explicit(&fake->last_send_operation_id, memory_order_acquire);
+    assert(transport_operation_id != 0);
+    assert(fake_push_operation_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+               fake_stream_handle,
+               fake_connection_handle,
+               transport_operation_id) == 0);
+    event = wait_next_event(runtime, &wake);
+    assert(event_info(event).kind == TREVRPC_RPC_EVENT_CALL_READY);
+    trevrpc_rpc_event_release(event);
+
+    if (synchronous_failure) {
+        atomic_store_explicit(&fake->stream_send_result, -EPIPE, memory_order_release);
+    }
+    assert(trevrpc_rpc_stream_finish_send(runtime, stream, 6) == 0);
+    if (!synchronous_failure) {
+        transport_operation_id = atomic_load_explicit(&fake->last_send_operation_id, memory_order_acquire);
+        assert(fake_push_operation_status_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE,
+                   TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
+                   fake_stream_handle,
+                   fake_connection_handle,
+                   transport_operation_id,
+                   -EPIPE) == 0);
+    }
+    event = wait_next_event(runtime, &wake);
+    info = event_info(event);
+    assert(info.kind == TREVRPC_RPC_EVENT_SEND_FINISHED);
+    assert(info.subject_kind == TREVRPC_RPC_OBJECT_STREAM);
+    assert(info.operation_id == 6);
+    assert(info.status == 0);
+    assert(info.flags == (TREVRPC_RPC_EVENT_FLAG_LOCAL | TREVRPC_RPC_EVENT_FLAG_CLIENT));
+    trevrpc_rpc_event_release(event);
+
+    finish_call_and_runtime(fake, runtime, &wake, endpoint, call, stream, TREVRPC_RPC_CLOSE_FLAG_NONE, 0);
+}
+
+static void run_send_stopped_readies_initial_request(void) {
+    fake_transport* fake = fake_create();
+    trevrpc_rpc_runtime* runtime = NULL;
+    trevrpc_rpc_wake_source_v1 wake;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_event* event;
+    trevrpc_rpc_event_info_v1 info;
+
+    setup_client_call(fake, &runtime, &wake, &endpoint, &call, &stream, TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING, 2);
+    assert(fake_push_operation_status_event(fake,
+               TREVRPC_RPC_TRANSPORT_EVENT_SEND_STOPPED,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT |
+                   TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET,
+               fake_stream_handle,
+               fake_connection_handle,
+               0,
+               -ECANCELED) == 0);
+    event = wait_next_event(runtime, &wake);
+    info = event_info(event);
+    assert(info.kind == TREVRPC_RPC_EVENT_CALL_READY);
+    assert(info.subject_kind == TREVRPC_RPC_OBJECT_CALL);
+    assert(info.operation_id == 2);
+    assert(info.status == 0);
+    assert(info.flags == (TREVRPC_RPC_EVENT_FLAG_LOCAL | TREVRPC_RPC_EVENT_FLAG_CLIENT));
+    trevrpc_rpc_event_release(event);
+    event = NULL;
+    assert(trevrpc_rpc_runtime_next_event(runtime, &event) == -EAGAIN);
+    assert(event == NULL);
+
+    finish_call_and_runtime(fake, runtime, &wake, endpoint, call, stream, TREVRPC_RPC_CLOSE_FLAG_NONE, 0);
+}
+
 static void run_coalesced_streaming_response_before_terminal(void) {
     fake_transport* fake = fake_create();
     trevrpc_rpc_runtime* runtime = NULL;
@@ -2641,6 +2808,10 @@ int main(void) {
     run_lifecycle_operation_id_scope();
     run_late_reused_operation_id();
     run_failed_request_send_complete();
+    run_send_stopped_preserves_receive_direction();
+    run_peer_stopped_local_finish_is_settled(false);
+    run_peer_stopped_local_finish_is_settled(true);
+    run_send_stopped_readies_initial_request();
     run_coalesced_streaming_response_before_terminal();
     run_trailing_response_after_status();
     run_receive_allocation_failure_rearms_readable(false);
