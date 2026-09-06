@@ -7,7 +7,6 @@ trevrpc_rpc_msquic_abi_version=@TREVRPC_RPC_MSQUIC_ABI_VERSION@
 Name: trevrpc_rpc_msquic
 Description: TrevRPC MsQuic RPC runtime companion
 Version: @PROJECT_VERSION@
-Requires: trevrpc_rpc = @PROJECT_VERSION@ trevrpc_engine_msquic = @PROJECT_VERSION@
+Requires: trevrpc_rpc = @PROJECT_VERSION@ trevrpc_transport_msquic = @PROJECT_VERSION@
 Libs: -L${libdir} -ltrevrpc_rpc_msquic
-Libs.private: -L${libdir}/trevrpc/rpc-abi1 -ltrevrpc_rpc_private_msquic_native -ltrevrpc_rpc_private_protocol -ltrevrpc_msquic_api_owner -lmsquic @CMAKE_THREAD_LIBS_INIT@
 Cflags: -I${includedir}

@@ -1,0 +1,5 @@
+@PACKAGE_INIT@
+
+set(TREVRPC_TRANSPORT_ABI_VERSION @TREVRPC_TRANSPORT_ABI_VERSION@)
+include("${CMAKE_CURRENT_LIST_DIR}/trevrpcTransportTargets.cmake")
+check_required_components(trevrpc_transport)

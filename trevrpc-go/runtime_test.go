@@ -4621,10 +4621,14 @@ func waitForMetricCode(t *testing.T, metrics *recordingMetrics, code Code) {
 }
 
 func runMixedQUICCall(transport Transport, index int) error {
+	return runMixedQUICCallWithOptions(transport, index, authenticatedOptions())
+}
+
+func runMixedQUICCallWithOptions(transport Transport, index int, options []CallOption) error {
 	switch index % 4 {
 	case 0:
 		name := fmt.Sprintf("load-unary-%d", index)
-		response, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: name}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		response, err := Unary(context.Background(), transport, testServiceName, "SayHello", &testMessage{Value: name}, func() *testMessage { return &testMessage{} }, options...)
 		if err != nil {
 			return err
 		}
@@ -4633,7 +4637,7 @@ func runMixedQUICCall(transport Transport, index int) error {
 		}
 	case 1:
 		name := fmt.Sprintf("load-server-%d", index)
-		responses, err := ServerStreaming(context.Background(), transport, testServiceName, "LotsOfReplies", &testMessage{Value: name}, func() *testMessage { return &testMessage{} }, authenticatedOptions()...)
+		responses, err := ServerStreaming(context.Background(), transport, testServiceName, "LotsOfReplies", &testMessage{Value: name}, func() *testMessage { return &testMessage{} }, options...)
 		if err != nil {
 			return err
 		}
@@ -4648,7 +4652,7 @@ func runMixedQUICCall(transport Transport, index int) error {
 		response, err := runTestClientStreaming(context.Background(), transport, testServiceName, "LotsOfGreetings", []string{
 			fmt.Sprintf("load-client-%d-a", index),
 			fmt.Sprintf("load-client-%d-b", index),
-		}, authenticatedOptions()...)
+		}, options...)
 		if err != nil {
 			return err
 		}
@@ -4660,7 +4664,7 @@ func runMixedQUICCall(transport Transport, index int) error {
 		responses, err := runTestBidiStreaming(context.Background(), transport, testServiceName, "BidiHello", []string{
 			fmt.Sprintf("load-bidi-%d-a", index),
 			fmt.Sprintf("load-bidi-%d-b", index),
-		}, authenticatedOptions()...)
+		}, options...)
 		if err != nil {
 			return err
 		}

@@ -1,11 +1,9 @@
 #include "trevrpc_rpc_msquic.h"
 
-#include "trevrpc_engine_msquic.h"
+#include "trevrpc_transport_msquic.h"
+
 #include "trevrpc_msquic_internal.h"
 #include "trevrpc_rpc_internal.h"
-#include "trevrpc_rpc_transport_engine_internal.h"
-#include "trevrpc_rpc_transport_h3_internal.h"
-#include "trevrpc_rpc_transport_msquic_internal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -121,13 +119,9 @@ static int trevrpc_rpc_msquic_validate_endpoint_config(const trevrpc_rpc_msquic_
 int trevrpc_rpc_msquic_create_v1(const trevrpc_rpc_runtime_config_v1* runtime_config,
     const trevrpc_rpc_msquic_config_v1* provider_config,
     trevrpc_rpc_runtime** out_runtime) {
-    trevrpc_engine_config_v1 engine_config;
-    trevrpc_engine_msquic_config_v1 engine_provider_config;
-    trevrpc_engine* engine = NULL;
-    trevrpc_rpc_transport* native_transport = NULL;
-    trevrpc_rpc_transport* h3_transport = NULL;
-    trevrpc_rpc_transport* transport = NULL;
-    trevrpc_rpc_transport_config transport_config;
+    trevrpc_transport_config_v1 transport_config;
+    trevrpc_transport_msquic_config_v1 transport_provider_config;
+    trevrpc_transport* transport = NULL;
     int result;
     if (runtime_config == NULL || out_runtime == NULL) {
         return -EINVAL;
@@ -140,27 +134,8 @@ int trevrpc_rpc_msquic_create_v1(const trevrpc_rpc_runtime_config_v1* runtime_co
     if (result != 0) {
         return result;
     }
-    result = trevrpc_engine_config_v1_init(&engine_config, sizeof(engine_config));
+    result = trevrpc_transport_config_v1_init(&transport_config, sizeof(transport_config));
     if (result != 0) {
-        return result;
-    }
-    engine_config.event_capacity = runtime_config->event_capacity;
-    engine_config.listener_capacity = runtime_config->endpoint_capacity;
-    engine_config.connection_capacity = runtime_config->endpoint_capacity;
-    engine_config.stream_capacity = runtime_config->stream_capacity;
-    engine_config.max_receive_owned_count = runtime_config->max_receive_owned_count;
-    engine_config.max_receive_owned_bytes = runtime_config->max_receive_owned_bytes;
-    result = trevrpc_engine_msquic_config_v1_init(&engine_provider_config, sizeof(engine_provider_config));
-    if (result != 0) {
-        return result;
-    }
-    result = trevrpc_engine_msquic_create_v1(&engine_config, &engine_provider_config, &engine);
-    if (result != 0) {
-        return result;
-    }
-    result = trevrpc_rpc_transport_engine_adopt(engine, &native_transport);
-    if (result != 0) {
-        (void)trevrpc_engine_release(engine);
         return result;
     }
     transport_config.event_capacity = runtime_config->event_capacity;
@@ -169,15 +144,12 @@ int trevrpc_rpc_msquic_create_v1(const trevrpc_rpc_runtime_config_v1* runtime_co
     transport_config.stream_capacity = runtime_config->stream_capacity;
     transport_config.max_receive_owned_count = runtime_config->max_receive_owned_count;
     transport_config.max_receive_owned_bytes = runtime_config->max_receive_owned_bytes;
-    result = trevrpc_rpc_transport_h3_create(&transport_config, &h3_transport);
+    result = trevrpc_transport_msquic_config_v1_init(&transport_provider_config, sizeof(transport_provider_config));
     if (result != 0) {
-        trevrpc_rpc_transport_destroy(native_transport);
         return result;
     }
-    result = trevrpc_rpc_transport_msquic_adopt(native_transport, h3_transport, &transport_config, &transport);
+    result = trevrpc_transport_msquic_create_v1(&transport_config, &transport_provider_config, &transport);
     if (result != 0) {
-        trevrpc_rpc_transport_destroy(native_transport);
-        trevrpc_rpc_transport_destroy(h3_transport);
         return result;
     }
     result = trevrpc_rpc_runtime_adopt_transport_v1(runtime_config, transport, out_runtime);

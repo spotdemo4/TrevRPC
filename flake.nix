@@ -129,6 +129,7 @@
             go = callPackage ./trevrpc-go {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
+              trevrpcC = c;
             };
             js = pkgs.callPackage ./trevrpc-js {
               benchProto = ./bench/proto;
@@ -263,7 +264,11 @@
                 fix-hash
                 jq
               ])
-              ++ [ libmsquic ];
+              ++ [
+                libmsquic
+                packageSet.trevrpc-c.dev
+                packageSet.trevrpc-c.lib
+              ];
           };
 
           bump = pkgs.mkShell {
@@ -489,6 +494,10 @@
             c = packageSet.trevrpc-c;
             c-engine = callPackage ./trevrpc-c/engine-check.nix { };
             c-engine-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/engine-msquic-check.nix { });
+            c-transport = callPackage ./trevrpc-c/transport-check.nix { };
+            c-transport-msquic = requireCanonicalMsquic (
+              callPackage ./trevrpc-c/transport-msquic-check.nix { }
+            );
             c-rpc = callPackage ./trevrpc-c/rpc-check.nix { };
             c-rpc-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/rpc-msquic-check.nix { });
             c-conformance-rpc = requireCanonicalMsquic (

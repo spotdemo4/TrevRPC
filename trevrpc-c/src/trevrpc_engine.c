@@ -1702,25 +1702,29 @@ int trevrpc_engine_stream_receive_frame(
     return result;
 }
 
-int trevrpc_engine_stream_abort(
-    trevrpc_engine* engine, trevrpc_engine_handle_v1 stream, uint64_t application_error_code) {
-    int (*operation)(void*, trevrpc_engine_handle_v1, uint64_t);
-    int result = trevrpc_engine_prepare_command(engine);
-    if (result == 0) {
-        operation = engine->provider_ops.stream_abort;
-        if (operation == NULL) {
-            trevrpc_engine_api_leave_unlocked(engine);
-            return -ENOTSUP;
-        }
-        result = trevrpc_engine_validate_handle(engine, stream);
-        if (result == 0) {
-            result = trevrpc_engine_normalize_provider_result(
-                operation(engine->provider_context, stream, application_error_code));
-        }
-        trevrpc_engine_api_leave_unlocked(engine);
+#define TREVRPC_ENGINE_ERROR_HANDLE_COMMAND(name, member)                                                              \
+    int name(trevrpc_engine* engine, trevrpc_engine_handle_v1 handle, uint64_t application_error_code) {               \
+        int (*operation)(void*, trevrpc_engine_handle_v1, uint64_t);                                                   \
+        int result = trevrpc_engine_prepare_command(engine);                                                           \
+        if (result == 0) {                                                                                             \
+            operation = engine->provider_ops.member;                                                                   \
+            if (operation == NULL) {                                                                                   \
+                trevrpc_engine_api_leave_unlocked(engine);                                                             \
+                return -ENOTSUP;                                                                                       \
+            }                                                                                                          \
+            result = trevrpc_engine_validate_handle(engine, handle);                                                   \
+            if (result == 0) {                                                                                         \
+                result = trevrpc_engine_normalize_provider_result(                                                     \
+                    operation(engine->provider_context, handle, application_error_code));                              \
+            }                                                                                                          \
+            trevrpc_engine_api_leave_unlocked(engine);                                                                 \
+        }                                                                                                              \
+        return result;                                                                                                 \
     }
-    return result;
-}
+
+TREVRPC_ENGINE_ERROR_HANDLE_COMMAND(trevrpc_engine_stream_abort_receive, stream_abort_receive)
+TREVRPC_ENGINE_ERROR_HANDLE_COMMAND(trevrpc_engine_stream_abort_send, stream_abort_send)
+TREVRPC_ENGINE_ERROR_HANDLE_COMMAND(trevrpc_engine_stream_abort, stream_abort)
 
 int trevrpc_engine_connection_close(
     trevrpc_engine* engine, trevrpc_engine_handle_v1 connection, uint64_t application_error_code) {

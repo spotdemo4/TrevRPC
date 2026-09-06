@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(msquic CONFIG)
+find_dependency(trevrpc_transport @PROJECT_VERSION@ EXACT CONFIG)
+find_dependency(trevrpc_engine_msquic @PROJECT_VERSION@ EXACT CONFIG)
+
+set(TREVRPC_TRANSPORT_MSQUIC_ABI_VERSION @TREVRPC_TRANSPORT_MSQUIC_ABI_VERSION@)
+include("${CMAKE_CURRENT_LIST_DIR}/trevrpcTransportMsquicTargets.cmake")
+check_required_components(trevrpc_transport_msquic)

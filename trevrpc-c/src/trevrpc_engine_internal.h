@@ -74,6 +74,9 @@ typedef struct trevrpc_engine_provider_ops {
     int (*stream_receive_frame)(
         void* provider_context, trevrpc_engine_handle_v1 stream, trevrpc_engine_receive** out_receive);
     int (*stream_finish_send)(void* provider_context, trevrpc_engine_handle_v1 stream);
+    int (*stream_abort_receive)(
+        void* provider_context, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
+    int (*stream_abort_send)(void* provider_context, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
     int (*stream_abort)(void* provider_context, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
     int (*stream_close)(void* provider_context, trevrpc_engine_handle_v1 stream);
     int (*connection_close)(

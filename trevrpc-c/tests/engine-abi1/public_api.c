@@ -152,6 +152,8 @@ static int check_signatures(void) {
     int (*receive)(trevrpc_engine*, trevrpc_engine_handle_v1, trevrpc_engine_receive**) =
         trevrpc_engine_stream_receive_frame;
     int (*finish)(trevrpc_engine*, trevrpc_engine_handle_v1) = trevrpc_engine_stream_finish_send;
+    int (*abort_receive)(trevrpc_engine*, trevrpc_engine_handle_v1, uint64_t) = trevrpc_engine_stream_abort_receive;
+    int (*abort_send)(trevrpc_engine*, trevrpc_engine_handle_v1, uint64_t) = trevrpc_engine_stream_abort_send;
     int (*abort_stream)(trevrpc_engine*, trevrpc_engine_handle_v1, uint64_t) = trevrpc_engine_stream_abort;
     int (*close_stream)(trevrpc_engine*, trevrpc_engine_handle_v1) = trevrpc_engine_stream_close;
     int (*close_connection)(trevrpc_engine*, trevrpc_engine_handle_v1, uint64_t) = trevrpc_engine_connection_close;
@@ -165,8 +167,9 @@ static int check_signatures(void) {
            next_event == NULL || event_get_info == NULL || event_release == NULL || receive_get_info == NULL ||
            receive_release == NULL || diagnostics == NULL || listen == NULL || listener_port == NULL || dial == NULL ||
            dial_cancel == NULL || open_stream == NULL || send == NULL || receive == NULL || finish == NULL ||
-           abort_stream == NULL || close_stream == NULL || close_connection == NULL || close_listener == NULL ||
-           close_engine == NULL || drain == NULL || release == NULL;
+           abort_receive == NULL || abort_send == NULL || abort_stream == NULL || close_stream == NULL ||
+           close_connection == NULL || close_listener == NULL || close_engine == NULL || drain == NULL ||
+           release == NULL;
 }
 
 int main(void) {

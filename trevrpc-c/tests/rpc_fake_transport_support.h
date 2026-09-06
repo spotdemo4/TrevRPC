@@ -64,6 +64,8 @@ struct fake_transport {
     atomic_uint receive_fin_release_calls;
     atomic_uint receive_release_calls;
     atomic_uint stream_terminal_release_calls;
+    atomic_uint stream_abort_receive_calls;
+    atomic_uint stream_abort_send_calls;
     atomic_uint stream_abort_calls;
     atomic_uint stream_close_calls;
     atomic_uint stream_send_calls;

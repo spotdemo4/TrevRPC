@@ -1,4 +1,5 @@
 #include "trevrpc_rpc_transport_engine_internal.h"
+#include "trevrpc_engine_msquic_internal.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -50,6 +51,23 @@ static void trevrpc_rpc_transport_engine_endpoint_config(
     destination->conn_flow_control_window = source->conn_flow_control_window;
 }
 
+int trevrpc_rpc_transport_engine_adopt_accepted_connection(trevrpc_rpc_transport* transport,
+    const trevrpc_rpc_transport_endpoint_config* config,
+    trevrpc_msquic_accepted_connection* accepted,
+    trevrpc_rpc_transport_handle* out_connection) {
+    trevrpc_engine_endpoint_config_v1 source;
+    trevrpc_engine_handle_v1 target;
+    int result;
+    if (transport == NULL || config == NULL || accepted == NULL || out_connection == NULL)
+        return -EINVAL;
+    trevrpc_rpc_transport_engine_endpoint_config(config, &source);
+    result = trevrpc_engine_msquic_adopt_accepted_connection_v1(
+        trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, accepted, &target);
+    if (result == 0)
+        *out_connection = trevrpc_rpc_transport_handle_from_engine(target);
+    return result;
+}
+
 static int trevrpc_rpc_transport_engine_get_wake_source(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_wake* wake) {
     trevrpc_engine_wake_source_v1 source;
@@ -99,6 +117,24 @@ static int trevrpc_rpc_transport_engine_event_get_info(
     info->provider_error_code = source.provider_error_code;
     info->data = source.data;
     info->data_len = source.data_len;
+    return 0;
+}
+
+static int trevrpc_rpc_transport_engine_event_get_protocol_info(
+    const trevrpc_rpc_transport_event* event, trevrpc_rpc_transport_event_protocol_info* info) {
+    trevrpc_engine_event_info_v1 source;
+    int result;
+    if (event == NULL || info == NULL)
+        return -EINVAL;
+    result = trevrpc_engine_event_info_v1_init(&source, sizeof(source));
+    if (result != 0)
+        return result;
+    result = trevrpc_engine_event_get_info_v1((const trevrpc_engine_event*)event, &source);
+    if (result != 0)
+        return result;
+    if (source.subject_kind == TREVRPC_ENGINE_OBJECT_NONE)
+        return -ENOTSUP;
+    info->protocol = TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE;
     return 0;
 }
 
@@ -259,6 +295,20 @@ static int trevrpc_rpc_transport_engine_stream_finish_send(
         trevrpc_rpc_transport_engine_from_base(transport)->engine, trevrpc_rpc_transport_engine_handle(stream));
 }
 
+static int trevrpc_rpc_transport_engine_stream_abort_receive(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
+    return trevrpc_engine_stream_abort_receive(trevrpc_rpc_transport_engine_from_base(transport)->engine,
+        trevrpc_rpc_transport_engine_handle(stream),
+        error_code);
+}
+
+static int trevrpc_rpc_transport_engine_stream_abort_send(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
+    return trevrpc_engine_stream_abort_send(trevrpc_rpc_transport_engine_from_base(transport)->engine,
+        trevrpc_rpc_transport_engine_handle(stream),
+        error_code);
+}
+
 static int trevrpc_rpc_transport_engine_stream_abort(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
     return trevrpc_engine_stream_abort(trevrpc_rpc_transport_engine_from_base(transport)->engine,
@@ -323,6 +373,8 @@ static const trevrpc_rpc_transport_ops trevrpc_rpc_transport_engine_ops = {
     .stream_send = trevrpc_rpc_transport_engine_stream_send,
     .stream_receive = trevrpc_rpc_transport_engine_stream_receive,
     .stream_finish_send = trevrpc_rpc_transport_engine_stream_finish_send,
+    .stream_abort_receive = trevrpc_rpc_transport_engine_stream_abort_receive,
+    .stream_abort_send = trevrpc_rpc_transport_engine_stream_abort_send,
     .stream_abort = trevrpc_rpc_transport_engine_stream_abort,
     .stream_close = trevrpc_rpc_transport_engine_stream_close,
     .connection_close = trevrpc_rpc_transport_engine_connection_close,
@@ -332,6 +384,8 @@ static const trevrpc_rpc_transport_ops trevrpc_rpc_transport_engine_ops = {
     .destroy = trevrpc_rpc_transport_engine_destroy,
     .get_wake_sources = NULL,
     .release_handle = NULL,
+    .event_get_protocol_info = trevrpc_rpc_transport_engine_event_get_protocol_info,
+    .adopt_accepted_connection = trevrpc_rpc_transport_engine_adopt_accepted_connection,
 };
 
 int trevrpc_rpc_transport_engine_adopt(trevrpc_engine* engine, trevrpc_rpc_transport** out_transport) {

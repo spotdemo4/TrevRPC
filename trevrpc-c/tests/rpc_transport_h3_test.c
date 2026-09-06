@@ -55,6 +55,29 @@ static size_t build_request_headers_frame(uint8_t* output, size_t capacity, cons
     return type_len + length_len + encoder.length;
 }
 
+static size_t build_connect_headers_frame(uint8_t* output, size_t capacity) {
+    static const uint8_t authority[] = "host";
+    static const uint8_t protocol[] = "webtransport-h3";
+    uint8_t block[256];
+    trevrpc_qpack_static_encoder encoder;
+    size_t type_len = 0;
+    size_t length_len = 0;
+    assert(trevrpc_qpack_static_encoder_init(&encoder, block, sizeof(block)) == 0);
+    assert(trevrpc_qpack_static_encoder_put_indexed(&encoder, 15) == 0);
+    assert(trevrpc_qpack_static_encoder_put_literal(
+               &encoder, (const uint8_t*)":protocol", sizeof(":protocol") - 1u, protocol, sizeof(protocol) - 1u) == 0);
+    assert(
+        trevrpc_qpack_static_encoder_put_literal(
+            &encoder, (const uint8_t*)":authority", sizeof(":authority") - 1u, authority, sizeof(authority) - 1u) == 0);
+    assert(trevrpc_qpack_static_encoder_put_indexed(&encoder, 23) == 0);
+    assert(trevrpc_qpack_static_encoder_put_indexed(&encoder, 1) == 0);
+    assert(trevrpc_quic_varint_write(output, capacity, 1, &type_len) == 0);
+    assert(trevrpc_quic_varint_write(output + type_len, capacity - type_len, encoder.length, &length_len) == 0);
+    assert(encoder.length <= capacity - type_len - length_len);
+    memcpy(output + type_len + length_len, block, encoder.length);
+    return type_len + length_len + encoder.length;
+}
+
 typedef struct h3_stream_close_hook_state {
     size_t immediate_closes;
 } h3_stream_close_hook_state;
@@ -321,6 +344,47 @@ static void test_fragmented_h3_data_and_rpc_frame(void) {
     assert(trevrpc_rpc_transport_event_get_info(transport, event, &event_info) == 0);
     assert(event_info.kind == TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN);
     trevrpc_rpc_transport_event_release(transport, event);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void test_h3_readable_reemits_after_event_pressure(void) {
+    static const uint8_t frame[] = {0x00, 0x07, 0x00, 0x00, 0x00, 0x03, 'a', 'b', 'c'};
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_receive* receive = NULL;
+    trevrpc_rpc_transport_receive_info receive_info;
+
+    config.event_capacity = 1;
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_connection(transport, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_stream(transport, connection, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_emit(transport,
+               TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC,
+               0,
+               0,
+               connection,
+               (trevrpc_rpc_transport_handle){0},
+               0) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, frame, sizeof(frame), false) == 0);
+
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE);
+    assert(handle_equal(info.subject, stream));
+    trevrpc_rpc_transport_event_release(transport, event);
+    assert(trevrpc_rpc_transport_stream_receive(transport, stream, &receive) == 0);
+    assert(trevrpc_rpc_transport_receive_get_info(transport, receive, &receive_info) == 0);
+    assert(receive_info.data_len == 3 && memcmp(receive_info.data, "abc", 3) == 0);
+    trevrpc_rpc_transport_receive_release(transport, receive);
     trevrpc_rpc_transport_destroy(transport);
 }
 
@@ -875,12 +939,15 @@ static void test_h3_abort_wire_codes_and_peer_reset_decode(void) {
     assert(trevrpc_msquic_test_inject_peer_send_aborted(object, UINT64_C(0x1ff)) == 0);
     assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
     assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
-    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_FAILED);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN);
     assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET) != 0);
     assert(info.status == -ECANCELED);
     assert(info.application_error_code == 0);
     assert(info.provider_error_code == UINT64_C(0x1ff));
     trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == -EAGAIN);
+    assert(event == NULL);
     trevrpc_rpc_transport_destroy(transport);
     trevrpc_msquic_test_receive_fixture_destroy(fixture);
     transport = NULL;
@@ -920,7 +987,7 @@ static void test_h3_abort_wire_codes_and_peer_reset_decode(void) {
     assert(trevrpc_msquic_test_inject_peer_send_aborted(object, UINT64_C(0x10c)) == 0);
     assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
     assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
-    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_FAILED);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN);
     assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET) != 0);
     assert(info.status == -ECANCELED);
     assert(info.application_error_code == 1);
@@ -952,7 +1019,7 @@ static void test_h3_abort_wire_codes_and_peer_reset_decode(void) {
         assert(trevrpc_msquic_test_inject_peer_send_aborted(object, expected_wire) == 0);
         assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
         assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
-        assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED);
+        assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN);
         assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET) != 0);
         assert(info.status == -ECANCELED);
         assert(info.application_error_code == caller_code);
@@ -986,7 +1053,7 @@ static void test_h3_abort_wire_codes_and_peer_reset_decode(void) {
         assert(trevrpc_msquic_test_inject_peer_send_aborted(object, UINT64_C(0x10c)) == 0);
         assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
         assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
-        assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED);
+        assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN);
         assert((info.flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET) != 0);
         assert(info.status == -ECANCELED);
         assert(info.application_error_code == 0);
@@ -1935,6 +2002,619 @@ static void test_h3_terminal_dequeue_controls_slot_reuse(void) {
     trevrpc_rpc_transport_destroy(transport);
 }
 
+static void test_composite_translates_admission_listener(void) {
+    trevrpc_rpc_transport* source = NULL;
+    trevrpc_rpc_transport* other = NULL;
+    trevrpc_rpc_transport* composite = NULL;
+    trevrpc_rpc_transport_handle local_listener;
+    trevrpc_rpc_transport_handle local_connection;
+    trevrpc_rpc_transport_handle local_stream;
+    trevrpc_rpc_transport_handle public_listener;
+    trevrpc_rpc_transport_handle public_connection;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_admission_info admission;
+    trevrpc_rpc_transport_config config = test_config();
+    uint32_t event_refs = 0;
+    uint8_t frame[512];
+    size_t frame_len = build_request_headers_frame(frame, sizeof(frame), "/rpc");
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &source) == 0);
+    assert(trevrpc_rpc_transport_h3_create(&config, &other) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(source, &local_listener, &local_connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(source, local_connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               source, local_connection, "/rpc", sizeof("/rpc") - 1u, &local_stream) == 0);
+    assert(trevrpc_rpc_transport_msquic_adopt(source, other, &config, &composite) == 0);
+
+    assert(trevrpc_rpc_transport_h3_test_emit(source,
+               TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC,
+               0,
+               0,
+               local_listener,
+               (trevrpc_rpc_transport_handle){0},
+               0) == 0);
+    public_listener = next_subject(composite, TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC);
+    assert(trevrpc_rpc_transport_h3_test_emit(
+               source, TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC, 0, 0, local_connection, local_listener, 0) == 0);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(composite, event, &info) == 0);
+    public_connection = info.subject;
+    assert(handle_equal(info.parent, public_listener));
+    trevrpc_rpc_transport_event_release(composite, event);
+    event = NULL;
+
+    assert(trevrpc_rpc_transport_h3_test_inject_data(source, local_stream, frame, frame_len, false) == 0);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(composite, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION);
+    assert(handle_equal(info.parent, public_connection));
+    assert(trevrpc_rpc_transport_event_get_admission_info(composite, event, &admission) == 0);
+    assert(handle_equal(admission.listener, public_listener));
+    assert(trevrpc_rpc_transport_msquic_test_event_refs(composite, public_listener, &event_refs) == 0);
+    assert(event_refs == 1);
+    assert(trevrpc_rpc_transport_admission_respond(composite, event, 200) == 0);
+    trevrpc_rpc_transport_event_release(composite, event);
+    assert(trevrpc_rpc_transport_msquic_test_event_refs(composite, public_listener, &event_refs) == 0);
+    assert(event_refs == 0);
+    trevrpc_rpc_transport_destroy(composite);
+}
+
+static void test_h3_deferred_admission_snapshot_and_accept(void) {
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_admission_info admission;
+    trevrpc_rpc_transport_event_protocol_info protocol;
+    trevrpc_rpc_transport_config config = test_config();
+    uint8_t frame[512];
+    size_t frame_len = build_request_headers_frame(frame, sizeof(frame), "/rpc");
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, frame, frame_len, false) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION);
+    assert(info.subject_kind == TREVRPC_RPC_TRANSPORT_OBJECT_NONE);
+    assert(handle_equal(info.subject, (trevrpc_rpc_transport_handle){0}));
+    assert(handle_equal(info.parent, connection));
+    assert(trevrpc_rpc_transport_event_get_admission_info(transport, event, &admission) == 0);
+    assert(admission.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3);
+    assert(handle_equal(admission.listener, listener));
+    assert(admission.header_count == 5);
+    assert(admission.method_len == 4 && memcmp(admission.method, "POST", 4) == 0);
+    assert(admission.path_len == 4 && memcmp(admission.path, "/rpc", 4) == 0);
+    assert(admission.authority_len == 4 && memcmp(admission.authority, "host", 4) == 0);
+    assert(admission.origin == NULL && admission.origin_len == 0);
+    assert(trevrpc_rpc_transport_event_get_protocol_info(transport, event, &protocol) == 0);
+    assert(protocol.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 200) == 0);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 200) == -EALREADY);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY);
+    assert(handle_equal(info.subject, stream));
+    trevrpc_rpc_transport_event_release(transport, event);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void run_h3_deferred_admission_buffers_body(bool coalesced) {
+    static const uint8_t data_frame[] = {0x00, 0x07, 0x00, 0x00, 0x00, 0x03, 'a', 'b', 'c'};
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_msquic_test_receive_fixture* fixture = NULL;
+    trevrpc_msquic_stream* object;
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event* extra_event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_receive* receive = NULL;
+    trevrpc_rpc_transport_receive_info receive_info;
+    uint8_t headers[512];
+    uint8_t wire[sizeof(headers) + sizeof(data_frame)];
+    size_t headers_len = build_request_headers_frame(headers, sizeof(headers), "/rpc");
+
+    assert(trevrpc_msquic_test_receive_fixture_create(NULL, 1024, 1, &fixture) == 0);
+    object = trevrpc_msquic_test_receive_fixture_take_stream(fixture, 0);
+    assert(object != NULL);
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_attach_stream_object(transport, stream, object) == 0);
+    trevrpc_rpc_transport_h3_test_capture_acceptances(transport, true);
+
+    if (coalesced) {
+        memcpy(wire, headers, headers_len);
+        memcpy(wire + headers_len, data_frame, sizeof(data_frame));
+        assert(trevrpc_rpc_transport_h3_test_inject_data(
+                   transport, stream, wire, headers_len + sizeof(data_frame), false) == 0);
+    } else {
+        assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, headers, headers_len, false) == 0);
+    }
+
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION);
+    if (!coalesced)
+        assert(
+            trevrpc_rpc_transport_h3_test_inject_data(transport, stream, data_frame, sizeof(data_frame), false) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &extra_event) == -EAGAIN);
+    assert(extra_event == NULL);
+
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 200) == 0);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY);
+    assert(handle_equal(info.subject, stream));
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE);
+    assert(handle_equal(info.subject, stream));
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_stream_receive(transport, stream, &receive) == 0);
+    assert(trevrpc_rpc_transport_receive_get_info(transport, receive, &receive_info) == 0);
+    assert(receive_info.data_len == 3 && memcmp(receive_info.data, "abc", 3) == 0);
+    trevrpc_rpc_transport_receive_release(transport, receive);
+    trevrpc_rpc_transport_destroy(transport);
+    trevrpc_msquic_test_receive_fixture_destroy(fixture);
+}
+
+static void test_h3_deferred_admission_buffers_body(void) {
+    run_h3_deferred_admission_buffers_body(false);
+    run_h3_deferred_admission_buffers_body(true);
+}
+
+static void test_h3_parent_ready_precedes_stream_readability(void) {
+    static const uint8_t data_frame[] = {0x00, 0x07, 0x00, 0x00, 0x00, 0x03, 'a', 'b', 'c'};
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_receive* receive = NULL;
+    trevrpc_rpc_transport_receive_info receive_info;
+    uint8_t headers[512];
+    uint8_t wire[sizeof(headers) + sizeof(data_frame)];
+    size_t headers_len = build_request_headers_frame(headers, sizeof(headers), "/rpc");
+
+    memcpy(wire, headers, headers_len);
+    memcpy(wire + headers_len, data_frame, sizeof(data_frame));
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_peer_settings_ready(transport, connection, false) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(
+               transport, stream, wire, headers_len + sizeof(data_frame), false) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == -EAGAIN);
+    assert(event == NULL);
+
+    assert(trevrpc_rpc_transport_h3_test_set_peer_settings_ready(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY);
+    assert(handle_equal(info.subject, connection));
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY);
+    assert(handle_equal(info.subject, stream));
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE);
+    assert(handle_equal(info.subject, stream));
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_stream_receive(transport, stream, &receive) == 0);
+    assert(trevrpc_rpc_transport_receive_get_info(transport, receive, &receive_info) == 0);
+    assert(receive_info.data_len == 3 && memcmp(receive_info.data, "abc", 3) == 0);
+    trevrpc_rpc_transport_receive_release(transport, receive);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void test_h3_deferred_admission_retries_after_event_capacity_returns(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_msquic_test_receive_fixture* fixture = NULL;
+    trevrpc_msquic_stream* object;
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    uint8_t frame[512];
+    size_t frame_len = build_request_headers_frame(frame, sizeof(frame), "/rpc");
+
+    config.event_capacity = 1;
+    assert(trevrpc_msquic_test_receive_fixture_create(NULL, 1024, 1, &fixture) == 0);
+    object = trevrpc_msquic_test_receive_fixture_take_stream(fixture, 0);
+    assert(object != NULL);
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_attach_stream_object(transport, stream, object) == 0);
+    trevrpc_rpc_transport_h3_test_capture_acceptances(transport, true);
+    assert(
+        trevrpc_rpc_transport_h3_test_emit(
+            transport, TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC, 0, 0, listener, (trevrpc_rpc_transport_handle){0}, 0) ==
+        0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, frame, frame_len, false) == -EAGAIN);
+
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 200) == 0);
+    assert(trevrpc_rpc_transport_h3_test_acceptance_count(transport) == 1);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY);
+    trevrpc_rpc_transport_event_release(transport, event);
+    trevrpc_rpc_transport_destroy(transport);
+    trevrpc_msquic_test_receive_fixture_destroy(fixture);
+}
+
+static void test_h3_deferred_admission_reject_and_fail_closed(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    uint8_t frame[512];
+    size_t frame_len = build_request_headers_frame(frame, sizeof(frame), "/rpc");
+    uint16_t status = 0;
+    size_t count = 0;
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    trevrpc_rpc_transport_h3_test_capture_rejections(transport, true);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, frame, frame_len, false) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 403) == 0);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 403) == -EALREADY);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_h3_test_last_rejection(transport, &status, &count) == 0);
+    assert(status == 403 && count == 1);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == -EAGAIN);
+    assert(event == NULL);
+    assert(trevrpc_rpc_transport_stream_close(transport, stream) == -ESTALE);
+    trevrpc_rpc_transport_destroy(transport);
+
+    transport = NULL;
+    event = NULL;
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    trevrpc_rpc_transport_h3_test_capture_rejections(transport, true);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, frame, frame_len, false) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_h3_test_last_rejection(transport, &status, &count) == 0);
+    assert(status == 500 && count == 1);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == -EAGAIN);
+    assert(event == NULL);
+    assert(trevrpc_rpc_transport_stream_close(transport, stream) == -ESTALE);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void test_h3_deferred_webtransport_admission(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_admission_info admission;
+    trevrpc_rpc_transport_event_protocol_info protocol;
+    uint8_t frame[512];
+    size_t frame_len = build_connect_headers_frame(frame, sizeof(frame));
+    uint16_t status = 0;
+    size_t count = 0;
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    trevrpc_rpc_transport_h3_test_capture_rejections(transport, true);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_connection_protocol(
+               transport, connection, TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_resolve_webtransport_profile(
+               transport, connection, TREV_WT_PROFILE_DRAFT_15) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/", sizeof("/") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, frame, frame_len, false) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION);
+    assert(handle_equal(info.parent, connection));
+    assert(trevrpc_rpc_transport_event_get_admission_info(transport, event, &admission) == 0);
+    assert(admission.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT);
+    assert(handle_equal(admission.listener, listener));
+    assert(admission.method_len == sizeof("CONNECT") - 1u &&
+           memcmp(admission.method, "CONNECT", sizeof("CONNECT") - 1u) == 0);
+    assert(admission.path_len == sizeof("/") - 1u && memcmp(admission.path, "/", sizeof("/") - 1u) == 0);
+    assert(trevrpc_rpc_transport_event_get_protocol_info(transport, event, &protocol) == 0);
+    assert(protocol.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 403) == 0);
+    trevrpc_rpc_transport_event_release(transport, event);
+    assert(trevrpc_rpc_transport_h3_test_last_rejection(transport, &status, &count) == 0);
+    assert(status == 403 && count == 1);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void test_h3_multiplexed_selects_http3_and_rejects_connect(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_event_protocol_info protocol;
+    uint8_t post[512];
+    uint8_t connect[512];
+    size_t post_len = build_request_headers_frame(post, sizeof(post), "/rpc");
+    size_t connect_len = build_connect_headers_frame(connect, sizeof(connect));
+    size_t index;
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_connection_protocol(
+               transport, connection, TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    for (index = 0; index < 2; ++index) {
+        assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+                   transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+        assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, post, post_len, false) == 0);
+        assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+        assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+        if (index == 0) {
+            assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY);
+            assert(handle_equal(info.subject, connection));
+            assert(trevrpc_rpc_transport_event_get_protocol_info(transport, event, &protocol) == 0);
+            assert(protocol.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3);
+            trevrpc_rpc_transport_event_release(transport, event);
+            event = NULL;
+            assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+            assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+        }
+        assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION);
+        assert(trevrpc_rpc_transport_admission_respond(transport, event, 200) == 0);
+        trevrpc_rpc_transport_event_release(transport, event);
+        event = NULL;
+        assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+        assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+        assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY);
+        assert(handle_equal(info.subject, stream));
+        trevrpc_rpc_transport_event_release(transport, event);
+        event = NULL;
+        assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+        assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+        assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED);
+        assert(handle_equal(info.subject, stream));
+        trevrpc_rpc_transport_event_release(transport, event);
+        event = NULL;
+        assert(trevrpc_rpc_transport_release_handle(transport, stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM) == 0);
+    }
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/", sizeof("/") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, connect, connect_len, false) == -EPROTO);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void test_h3_multiplexed_selects_webtransport_and_rejects_post(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle second_listener;
+    trevrpc_rpc_transport_handle second_connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_event_protocol_info protocol;
+    uint8_t connect[512];
+    uint8_t post[512];
+    size_t connect_len = build_connect_headers_frame(connect, sizeof(connect));
+    size_t post_len = build_request_headers_frame(post, sizeof(post), "/rpc");
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    trevrpc_rpc_transport_h3_test_capture_rejections(transport, true);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_connection_protocol(
+               transport, connection, TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_resolve_webtransport_profile(
+               transport, connection, TREV_WT_PROFILE_DRAFT_15) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/", sizeof("/") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, connect, connect_len, false) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 403) == 0);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, post, post_len, false) == -EPROTO);
+
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &second_listener, &second_connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_connection_protocol(
+               transport, second_connection, TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, second_connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, second_connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, post, post_len, false) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY);
+    assert(handle_equal(info.subject, second_connection));
+    assert(trevrpc_rpc_transport_event_get_protocol_info(transport, event, &protocol) == 0);
+    assert(protocol.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 403) == 0);
+    trevrpc_rpc_transport_event_release(transport, event);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void test_h3_multiplexed_post_waits_for_settings(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_event_protocol_info protocol;
+    uint8_t post[512];
+    size_t post_len = build_request_headers_frame(post, sizeof(post), "/rpc");
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    trevrpc_rpc_transport_h3_test_capture_rejections(transport, true);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_connection_protocol(
+               transport, connection, TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_peer_settings_ready(transport, connection, false) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/rpc", sizeof("/rpc") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, post, post_len, false) == -EAGAIN);
+    assert(trevrpc_rpc_transport_h3_test_set_peer_settings_ready(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_retry_buffered_stream(transport, stream) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY);
+    assert(handle_equal(info.subject, connection));
+    assert(trevrpc_rpc_transport_event_get_protocol_info(transport, event, &protocol) == 0);
+    assert(protocol.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3);
+    trevrpc_rpc_transport_event_release(transport, event);
+    event = NULL;
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 403) == 0);
+    trevrpc_rpc_transport_event_release(transport, event);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void test_h3_multiplexed_connect_waits_for_settings(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    uint8_t connect[512];
+    size_t connect_len = build_connect_headers_frame(connect, sizeof(connect));
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    trevrpc_rpc_transport_h3_test_capture_rejections(transport, true);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_connection_protocol(
+               transport, connection, TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_peer_settings_ready(transport, connection, false) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/", sizeof("/") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, connect, connect_len, false) == -EAGAIN);
+    assert(trevrpc_rpc_transport_h3_test_resolve_webtransport_profile(
+               transport, connection, TREV_WT_PROFILE_DRAFT_15) == 0);
+    assert(trevrpc_rpc_transport_h3_test_retry_buffered_stream(transport, stream) == 0);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION);
+    assert(trevrpc_rpc_transport_admission_respond(transport, event, 403) == 0);
+    trevrpc_rpc_transport_event_release(transport, event);
+    trevrpc_rpc_transport_destroy(transport);
+
+    transport = NULL;
+    event = NULL;
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    trevrpc_rpc_transport_h3_test_capture_rejections(transport, true);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_connection_protocol(
+               transport, connection, TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_peer_settings_ready(transport, connection, false) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_deferred_admission(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/", sizeof("/") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, connect, connect_len, false) == -EAGAIN);
+    assert(trevrpc_rpc_transport_h3_test_set_peer_settings_ready(transport, connection, true) == 0);
+    assert(trevrpc_rpc_transport_h3_test_retry_buffered_stream(transport, stream) == -EPROTO);
+    assert(trevrpc_rpc_transport_next_event(transport, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(transport, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_FAILED);
+    trevrpc_rpc_transport_event_release(transport, event);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
+static void test_h3_multiplexed_http3_only_rejects_connect(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    uint8_t connect[512];
+    size_t connect_len = build_connect_headers_frame(connect, sizeof(connect));
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(transport, &listener, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_connection_protocol(
+               transport, connection, TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) == 0);
+    assert(trevrpc_rpc_transport_h3_test_set_multiplexed_webtransport(transport, connection, false) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_peer_request_stream(
+               transport, connection, "/", sizeof("/") - 1u, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_inject_data(transport, stream, connect, connect_len, false) == -EPROTO);
+    trevrpc_rpc_transport_destroy(transport);
+}
+
 static void test_h3_shutdown_orders_pending_send_before_terminals_and_stopped(void) {
     trevrpc_rpc_transport* transport = NULL;
     trevrpc_rpc_transport_handle connection;
@@ -1977,6 +2657,7 @@ static void test_h3_shutdown_orders_pending_send_before_terminals_and_stopped(vo
 
 int main(void) {
     test_fragmented_h3_data_and_rpc_frame();
+    test_h3_readable_reemits_after_event_pressure();
     test_h3_post_requires_configured_path();
     test_h3_parser_commits_headers_before_receive_retry();
     test_peer_wt_stream_replays_after_profile_and_session_resolution(false);
@@ -2011,6 +2692,18 @@ int main(void) {
     test_h3_mandatory_events_survive_allocation_pressure();
     test_h3_reserved_send_and_terminal_order_under_pressure();
     test_h3_terminal_dequeue_controls_slot_reuse();
+    test_h3_deferred_admission_snapshot_and_accept();
+    test_h3_deferred_admission_buffers_body();
+    test_h3_parent_ready_precedes_stream_readability();
+    test_h3_deferred_admission_retries_after_event_capacity_returns();
+    test_h3_deferred_admission_reject_and_fail_closed();
+    test_h3_deferred_webtransport_admission();
+    test_h3_multiplexed_selects_http3_and_rejects_connect();
+    test_h3_multiplexed_selects_webtransport_and_rejects_post();
+    test_h3_multiplexed_post_waits_for_settings();
+    test_h3_multiplexed_connect_waits_for_settings();
+    test_h3_multiplexed_http3_only_rejects_connect();
+    test_composite_translates_admission_listener();
     test_h3_shutdown_orders_pending_send_before_terminals_and_stopped();
     puts("rpc_transport_h3_test: ok");
     return 0;

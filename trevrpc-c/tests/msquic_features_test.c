@@ -238,27 +238,39 @@ static int test_requested_event_permutations(void) {
     for (size_t permutation = 0; permutation < sizeof(permutations) / sizeof(permutations[0]); permutation++) {
         trevrpc_msquic_feature_state state;
         trevrpc_msquic_feature_snapshot snapshot;
+        bool connected = false;
+        bool datagram_resolved = false;
+        bool reset_resolved = false;
         trevrpc_msquic_feature_state_init(&state, &request);
         for (size_t index = 0; index < 3; index++) {
             switch (permutations[permutation][index]) {
             case 0:
                 reduce_connected(&state);
+                connected = true;
                 break;
             case 1:
                 reduce_datagram(&state, true, 1200);
+                datagram_resolved = true;
                 break;
             case 2:
                 reduce_reset(&state,
                     TREV_MSQUIC_RESET_DIALECT_DRAFT_07_BIT,
                     TREV_MSQUIC_RESET_DIALECT_DRAFT_07_BIT,
                     TREV_MSQUIC_RESET_DIALECT_DRAFT_07_BIT);
+                reset_resolved = true;
                 break;
             default:
                 CHECK(false);
             }
-            if (index < 2) {
-                CHECK(!trevrpc_msquic_feature_ready(&state));
-                CHECK(trevrpc_msquic_feature_snapshot_get(&state, &snapshot) == -EAGAIN);
+            CHECK(trevrpc_msquic_feature_ready(&state) == (connected && reset_resolved));
+            CHECK(
+                trevrpc_msquic_feature_snapshot_get(&state, &snapshot) == (connected && reset_resolved ? 0 : -EAGAIN));
+            if (connected && reset_resolved && !datagram_resolved) {
+                CHECK(snapshot.local_datagram_receive);
+                CHECK(!snapshot.peer_datagram_receive);
+                CHECK(!snapshot.datagram_send_enabled);
+                CHECK(snapshot.datagram_max_send_length == 0);
+                CHECK(snapshot.datagram_epoch == 0);
             }
         }
         CHECK(trevrpc_msquic_feature_ready(&state));
@@ -275,6 +287,48 @@ static int test_requested_event_permutations(void) {
         CHECK(trevrpc_msquic_feature_snapshot_has_reset_dialect(&snapshot, TREV_MSQUIC_RESET_STREAM_AT_DRAFT_07));
         CHECK(!trevrpc_msquic_feature_snapshot_has_reset_dialect(&snapshot, TREV_MSQUIC_RESET_STREAM_AT_DRAFT_10));
     }
+    return 0;
+}
+
+static int test_connected_without_datagram_notification(void) {
+    const trevrpc_msquic_feature_request request = {
+        .datagram_receive = true,
+        .requested_reset_dialects = TREV_MSQUIC_RESET_DIALECT_DRAFT_07_BIT,
+    };
+    trevrpc_msquic_feature_state state;
+    trevrpc_msquic_feature_snapshot snapshot;
+    trevrpc_msquic_feature_state_init(&state, &request);
+
+    reduce_reset(&state,
+        TREV_MSQUIC_RESET_DIALECT_DRAFT_07_BIT,
+        TREV_MSQUIC_RESET_DIALECT_DRAFT_07_BIT,
+        TREV_MSQUIC_RESET_DIALECT_DRAFT_07_BIT);
+    reduce_connected(&state);
+
+    CHECK(trevrpc_msquic_feature_ready(&state));
+    CHECK(trevrpc_msquic_feature_snapshot_get(&state, &snapshot) == 0);
+    CHECK(snapshot.local_datagram_receive);
+    CHECK(!snapshot.peer_datagram_receive);
+    CHECK(!snapshot.datagram_send_enabled);
+    CHECK(snapshot.datagram_max_send_length == 0);
+    CHECK(snapshot.datagram_epoch == 0);
+    CHECK(snapshot.negotiated_reset_dialects == TREV_MSQUIC_RESET_DIALECT_DRAFT_07_BIT);
+    CHECK(!trevrpc_msquic_feature_snapshot_negotiated_datagrams(&snapshot));
+
+    reduce_datagram(&state, true, 0);
+    CHECK(trevrpc_msquic_feature_snapshot_get(&state, &snapshot) == 0);
+    CHECK(snapshot.peer_datagram_receive);
+    CHECK(snapshot.datagram_send_enabled);
+    CHECK(snapshot.datagram_max_send_length == 0);
+    CHECK(snapshot.datagram_epoch == 1);
+    CHECK(trevrpc_msquic_feature_snapshot_negotiated_datagrams(&snapshot));
+    CHECK(!trevrpc_msquic_feature_snapshot_usable_datagrams(&snapshot));
+
+    reduce_datagram(&state, true, 1232);
+    CHECK(trevrpc_msquic_feature_snapshot_get(&state, &snapshot) == 0);
+    CHECK(snapshot.datagram_max_send_length == 1232);
+    CHECK(snapshot.datagram_epoch == 2);
+    CHECK(trevrpc_msquic_feature_snapshot_usable_datagrams(&snapshot));
     return 0;
 }
 
@@ -412,6 +466,7 @@ int main(void) {
         test_attestation_and_request_policy,
         test_generic_ready_at_connected,
         test_requested_event_permutations,
+        test_connected_without_datagram_notification,
         test_replacement_and_finalization,
         test_exact_mismatch_and_first_result_finalization,
         test_terminal_status_and_event_suppression,

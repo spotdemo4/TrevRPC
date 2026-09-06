@@ -243,6 +243,10 @@ int trevrpc_engine_stream_send_frame_v1(trevrpc_engine* engine,
 int trevrpc_engine_stream_receive_frame(
     trevrpc_engine* engine, trevrpc_engine_handle_v1 stream, trevrpc_engine_receive** out_receive);
 int trevrpc_engine_stream_finish_send(trevrpc_engine* engine, trevrpc_engine_handle_v1 stream);
+int trevrpc_engine_stream_abort_receive(
+    trevrpc_engine* engine, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
+int trevrpc_engine_stream_abort_send(
+    trevrpc_engine* engine, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
 int trevrpc_engine_stream_abort(
     trevrpc_engine* engine, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
 int trevrpc_engine_stream_close(trevrpc_engine* engine, trevrpc_engine_handle_v1 stream);

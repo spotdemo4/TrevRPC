@@ -32,9 +32,13 @@ libtrevrpc_engine_msquic_support.a
 libtrevrpc_msquic_api_owner.a
 libtrevrpc_rpc.a
 libtrevrpc_rpc_msquic.a
+libtrevrpc_transport.a
+libtrevrpc_transport_msquic.a
 trevrpc/rpc-abi1/libtrevrpc_rpc_private_core.a
-trevrpc/rpc-abi1/libtrevrpc_rpc_private_msquic_native.a
-trevrpc/rpc-abi1/libtrevrpc_rpc_private_protocol.a
+trevrpc/transport-abi1/libtrevrpc_transport_msquic_private.a
+trevrpc/transport-abi1/libtrevrpc_transport_private_core.a
+trevrpc/transport-abi1/libtrevrpc_transport_private_msquic_native.a
+trevrpc/transport-abi1/libtrevrpc_transport_private_protocol.a
 EOF
     check_msquic=true
     ;;

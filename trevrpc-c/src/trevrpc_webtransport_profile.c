@@ -277,7 +277,8 @@ bool trevrpc_wt_profile_is_supported(trevrpc_wt_profile_id profile) {
 
 bool trevrpc_wt_profile_is_usable(trevrpc_wt_profile_id profile, const trevrpc_msquic_feature_snapshot* capabilities) {
     const trevrpc_wt_profile_descriptor* descriptor = trevrpc_wt_profile_descriptor_find(profile);
-    if (descriptor == NULL || capabilities == NULL || !trevrpc_msquic_feature_snapshot_usable_datagrams(capabilities)) {
+    if (descriptor == NULL || capabilities == NULL ||
+        !trevrpc_msquic_feature_snapshot_negotiated_datagrams(capabilities)) {
         return false;
     }
     return !descriptor->requires_reset_stream_at_draft07 ||

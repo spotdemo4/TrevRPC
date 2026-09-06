@@ -143,10 +143,7 @@ func newChannelConnector(target string, options DialOptions) (channelConnector, 
 		return nil, err
 	}
 	if backend == TransportBackendNative {
-		if options.TLSConfig != nil || options.QUICConfig != nil || len(options.WebTransport.RequestHeader) != 0 {
-			return nil, InvalidArgument("native dial does not accept legacy TLSConfig, QUICConfig, or RequestHeader")
-		}
-		return nil, nativeBackendUnavailable()
+		return newNativeChannelConnector(target, options)
 	}
 	if strings.HasPrefix(target, "https://") {
 		return newWebTransportChannelConnector(target, options)
@@ -335,6 +332,9 @@ func (c *Channel) run(generation channelGeneration, number uint64) {
 		if !c.beginReconnect(number, generation, generation.Err()) {
 			return
 		}
+		if releaser, ok := generation.(disconnectedGenerationReleaser); ok {
+			releaser.releaseDisconnected()
+		}
 		c.backoff.Reset()
 		delay := c.backoff.Next()
 		for {
@@ -415,6 +415,10 @@ type channelGeneration interface {
 	Err() error
 	Info() ConnectionInfo
 	CloseReason(error) TransportCloseReason
+}
+
+type disconnectedGenerationReleaser interface {
+	releaseDisconnected()
 }
 
 func generationConnectionInfo(generation channelGeneration) ConnectionInfo {

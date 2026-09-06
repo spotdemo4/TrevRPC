@@ -33,14 +33,16 @@ int main() {
     auto* open_stream = &trevrpc_engine_connection_open_bidi_stream_v1;
     auto* send = &trevrpc_engine_stream_send_frame_v1;
     auto* receive = &trevrpc_engine_stream_receive_frame;
+    auto* abort_receive = &trevrpc_engine_stream_abort_receive;
+    auto* abort_send = &trevrpc_engine_stream_abort_send;
     auto* next = &trevrpc_engine_next_event;
     auto* release = &trevrpc_engine_release;
     trevrpc_engine_config_v1 config{};
     trevrpc_engine_endpoint_config_v1 endpoint{};
     anchor();
     if (abi_version() != 1u || listen == nullptr || dial == nullptr || open_stream == nullptr || send == nullptr ||
-        receive == nullptr || next == nullptr || release == nullptr ||
-        trevrpc_engine_config_v1_init(&config, sizeof(config)) != 0 ||
+        receive == nullptr || abort_receive == nullptr || abort_send == nullptr || next == nullptr ||
+        release == nullptr || trevrpc_engine_config_v1_init(&config, sizeof(config)) != 0 ||
         trevrpc_engine_endpoint_config_v1_init(&endpoint, sizeof(endpoint)) != 0 ||
         config.event_capacity != TREVRPC_ENGINE_DEFAULT_EVENT_CAPACITY ||
         config.listener_capacity != TREVRPC_ENGINE_DEFAULT_LISTENER_CAPACITY ||

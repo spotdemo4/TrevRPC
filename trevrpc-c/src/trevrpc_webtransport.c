@@ -964,11 +964,11 @@ static int trevrpc_wt_write_control_settings(trevrpc_wt_session* session, const 
     size_t settings_len = 0;
     settings[settings_len++] = (trevrpc_wt_profile_setting_pair){TREV_WT_H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0};
     settings[settings_len++] = (trevrpc_wt_profile_setting_pair){TREV_WT_H3_SETTINGS_QPACK_BLOCKED_STREAMS, 0};
-    bool usable_datagrams = trevrpc_msquic_feature_snapshot_usable_datagrams(&session->transport_capabilities);
+    bool negotiated_datagrams = trevrpc_msquic_feature_snapshot_negotiated_datagrams(&session->transport_capabilities);
     if (trevrpc_wt_profile_any_usable(&session->transport_capabilities)) {
         settings[settings_len++] = (trevrpc_wt_profile_setting_pair){TREV_WT_H3_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1};
     }
-    if (usable_datagrams) {
+    if (negotiated_datagrams) {
         settings[settings_len++] = (trevrpc_wt_profile_setting_pair){TREV_WT_H3_SETTINGS_H3_DATAGRAM, 1};
     }
 

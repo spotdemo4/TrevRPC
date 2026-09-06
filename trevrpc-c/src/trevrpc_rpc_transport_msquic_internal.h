@@ -8,4 +8,9 @@ int trevrpc_rpc_transport_msquic_adopt(trevrpc_rpc_transport* native_transport,
     const trevrpc_rpc_transport_config* config,
     trevrpc_rpc_transport** out_transport);
 
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+int trevrpc_rpc_transport_msquic_test_event_refs(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint32_t* out_refs);
+#endif
+
 #endif

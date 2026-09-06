@@ -10,6 +10,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	webtransport "github.com/quic-go/webtransport-go"
 	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
+	"trev.zip/llc/trevrpc/trevrpc-go/internal/transport/native"
 )
 
 func TestTransportBackendResolution(t *testing.T) {
@@ -44,11 +45,17 @@ func TestTransportBackendResolution(t *testing.T) {
 }
 
 func TestNativeBackendDoesNotFallBack(t *testing.T) {
-	_, err := newChannelConnector("127.0.0.1:1", DialOptions{
-		Backend:     TransportBackendNative,
-		Credentials: &TransportCredentials{ServerName: "example.test"},
+	connector, err := newChannelConnector("127.0.0.1:1", DialOptions{
+		Backend: TransportBackendNative,
 	})
-	if StatusFromError(err).Code != CodeUnimplemented {
+	if native.Available() {
+		if err != nil {
+			t.Fatalf("native connector error = %v", err)
+		}
+		if _, ok := connector.(*nativeEngineQUICConnector); !ok {
+			t.Fatalf("native connector type = %T", connector)
+		}
+	} else if StatusFromError(err).Code != CodeUnimplemented {
 		t.Fatalf("native connector error = %v, want Unimplemented", err)
 	}
 
@@ -63,11 +70,25 @@ func TestNativeBackendDoesNotFallBack(t *testing.T) {
 
 func TestNativeListenerDoesNotFallBack(t *testing.T) {
 	server := NewServer()
-	_, err := Listen("127.0.0.1:0", server, ListenOptions{
-		Backend:     TransportBackendNative,
-		Credentials: &TransportCredentials{},
+	certificate, key := testCertificateMaterial(t)
+	listener, err := Listen("127.0.0.1:0", server, ListenOptions{
+		Backend: TransportBackendNative,
+		Credentials: &TransportCredentials{
+			CertificateChainPEM: certificate,
+			PrivateKeyPEM:       key,
+		},
 	})
-	if StatusFromError(err).Code != CodeUnimplemented {
+	if native.Available() {
+		if err != nil {
+			t.Fatalf("native listener error = %v", err)
+		}
+		if _, ok := listener.(*nativeQUICServerListener); !ok {
+			t.Fatalf("native listener type = %T", listener)
+		}
+		if err := listener.Close(); err != nil {
+			t.Fatalf("native listener close error = %v", err)
+		}
+	} else if StatusFromError(err).Code != CodeUnimplemented {
 		t.Fatalf("native listener error = %v, want Unimplemented", err)
 	}
 

@@ -1,14 +1,22 @@
 {
+  stdenv,
   lib,
   buildGoModule,
   go-tools,
   gotools,
   gnugrep,
+  pkg-config,
+  trevrpcC,
   benchProto,
   wireGolden,
 }:
 let
   goSource = lib.fileset.difference ./. ./default.nix;
+  nativeSupported =
+    (stdenv.hostPlatform.isLinux || stdenv.hostPlatform.isDarwin)
+    && (stdenv.hostPlatform.isx86_64 || stdenv.hostPlatform.isAarch64);
+  canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
+  nativeTagArgs = lib.optionalString nativeSupported "-tags=trevrpc_native";
 in
 buildGoModule (final: {
   pname = "trevrpc-go";
@@ -24,6 +32,9 @@ buildGoModule (final: {
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
   vendorHash = "sha256-yOGuL+KfNDMO/gkzVQUa0MgaNh88Taw9hLhHtZnjazo=";
+  tags = lib.optionals nativeSupported [ "trevrpc_native" ];
+  nativeBuildInputs = lib.optionals nativeSupported [ pkg-config ];
+  buildInputs = lib.optionals nativeSupported [ trevrpcC ];
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
     "cmd/trevrpc-bench-peer"
@@ -34,7 +45,7 @@ buildGoModule (final: {
     mv "$out/bin/trevrpc-bench-peer" "$out/bin/trevrpc-bench-peer-go"
   '';
 
-  doCheck = true;
+  doCheck = canExecute;
   nativeCheckInputs = [
     go-tools
     gotools
@@ -42,14 +53,14 @@ buildGoModule (final: {
   checkPhase = ''
     runHook preCheck
     export HOME=$(mktemp -d)
-    go test ./...
-    go vet ./...
-    staticcheck ./...
-    modernize ./...
+    go test ${nativeTagArgs} ./...
+    go vet ${nativeTagArgs} ./...
+    staticcheck ${nativeTagArgs} ./...
+    modernize ${nativeTagArgs} ./...
     runHook postCheck
   '';
 
-  doInstallCheck = true;
+  doInstallCheck = canExecute;
   nativeInstallCheckInputs = [ gnugrep ];
   installCheckPhase = ''
     runHook preInstallCheck

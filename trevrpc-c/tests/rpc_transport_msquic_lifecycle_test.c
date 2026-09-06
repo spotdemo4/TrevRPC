@@ -492,6 +492,34 @@ static void test_parent_registration_rolls_back_on_subject_capacity(void) {
     trevrpc_rpc_transport_destroy(composite);
 }
 
+static void test_listener_close_linearizes_before_terminal_dequeue(void) {
+    fake_transport* source = fake_create();
+    fake_transport* other = fake_create();
+    trevrpc_rpc_transport* composite = NULL;
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+    uint16_t port = 0;
+
+    assert(source != NULL && other != NULL);
+    assert(trevrpc_rpc_transport_msquic_adopt(&source->base, &other->base, &config, &composite) == 0);
+    assert(trevrpc_rpc_transport_endpoint_listen(composite, &endpoint_config, &listener) == 0);
+    assert(trevrpc_rpc_transport_listener_close(composite, listener) == 0);
+
+    /* The close call is the admission linearization point.  Do not permit a
+     * new operation while the child terminal event is still queued. */
+    assert(trevrpc_rpc_transport_endpoint_get_port(composite, listener, &port) == -ESTALE);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(composite, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_LISTENER_STOPPED);
+    assert(handle_equal(info.subject, listener));
+    trevrpc_rpc_transport_event_release(composite, event);
+    assert(trevrpc_rpc_transport_release_handle(composite, listener, TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER) == 0);
+    trevrpc_rpc_transport_destroy(composite);
+}
+
 static void test_endpoint_admission_rejects_before_child_creation_when_mapping_full(void) {
     fake_transport* source = fake_create();
     fake_transport* other = fake_create();
@@ -674,6 +702,40 @@ static void test_runtime_driver_observes_composite_timeout(void) {
     assert(trevrpc_rpc_runtime_release(runtime) == 0);
 }
 
+static void test_directional_stream_abort_routes_without_terminal(void) {
+    fake_transport* source = fake_create();
+    fake_transport* other = fake_create();
+    trevrpc_rpc_transport* composite = NULL;
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+
+    assert(source != NULL && other != NULL);
+    assert(trevrpc_rpc_transport_msquic_adopt(&source->base, &other->base, &config, &composite) == 0);
+    assert(fake_push_event(
+               source, TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY, 0, fake_stream_handle, fake_connection_handle) == 0);
+    stream = next_subject(composite, TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY);
+
+    assert(trevrpc_rpc_transport_stream_abort_receive(composite, stream, 11) == 0);
+    assert(atomic_load_explicit(&source->stream_abort_receive_calls, memory_order_acquire) == 1);
+    assert(atomic_load_explicit(&source->stream_abort_send_calls, memory_order_acquire) == 0);
+    assert(atomic_load_explicit(&source->stream_abort_calls, memory_order_acquire) == 0);
+    assert(atomic_load_explicit(&source->last_abort_error, memory_order_acquire) == 11);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == -EAGAIN);
+    assert(event == NULL);
+
+    assert(trevrpc_rpc_transport_stream_abort_send(composite, stream, 12) == 0);
+    assert(atomic_load_explicit(&source->stream_abort_receive_calls, memory_order_acquire) == 1);
+    assert(atomic_load_explicit(&source->stream_abort_send_calls, memory_order_acquire) == 1);
+    assert(atomic_load_explicit(&source->stream_abort_calls, memory_order_acquire) == 0);
+    assert(atomic_load_explicit(&source->last_abort_error, memory_order_acquire) == 12);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == -EAGAIN);
+    assert(event == NULL);
+
+    assert(trevrpc_rpc_transport_release_handle(composite, stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM) == 0);
+    trevrpc_rpc_transport_destroy(composite);
+}
+
 static void test_release_retries_after_downstream_failure(void) {
     fake_transport* source = fake_create();
     fake_transport* other = fake_create();
@@ -710,9 +772,11 @@ int main(void) {
     test_retained_event_signals_retry_wake();
     test_retired_parent_is_not_resurrected();
     test_parent_registration_rolls_back_on_subject_capacity();
+    test_listener_close_linearizes_before_terminal_dequeue();
     test_endpoint_admission_rejects_before_child_creation_when_mapping_full();
     test_rpc_terminal_releases_restored_composite_receive();
     test_runtime_driver_observes_composite_timeout();
+    test_directional_stream_abort_routes_without_terminal();
     test_release_retries_after_downstream_failure();
     puts("rpc_transport_msquic_lifecycle_test: ok");
     return 0;

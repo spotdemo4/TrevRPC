@@ -1,0 +1,5 @@
+set(TREVRPC_ABI_LABEL "Transport MsQuic ABI 1")
+set(TREVRPC_PUBLIC_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/public-symbols.txt")
+set(TREVRPC_INTERNAL_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/internal-symbols.txt")
+set(TREVRPC_REMOVED_MANIFEST "${CMAKE_CURRENT_LIST_DIR}/removed-symbols.txt")
+include("${CMAKE_CURRENT_LIST_DIR}/../abi/check_symbols.cmake")

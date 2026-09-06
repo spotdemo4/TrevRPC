@@ -1,8 +1,10 @@
 #include "trevrpc_rpc_transport_msquic_internal.h"
+#include "trevrpc_rpc_transport_h3_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -11,6 +13,10 @@
 
 #define COMPOSITE_HASH_EMPTY 0u
 #define COMPOSITE_HASH_TOMBSTONE UINT32_MAX
+
+static atomic_uint_fast64_t composite_owner_sequence = ATOMIC_VAR_INIT(UINT64_C(0x200000));
+
+typedef struct composite_shared_listener composite_shared_listener;
 
 typedef struct composite_entry {
     trevrpc_rpc_transport* source;
@@ -24,7 +30,9 @@ typedef struct composite_entry {
     uint32_t event_refs;
     uint32_t receive_refs;
     uint32_t release_refs;
+    uint32_t protocol_override;
     bool occupied;
+    bool close_requested;
     bool terminal_seen;
     bool semantic_released;
 } composite_entry;
@@ -41,6 +49,7 @@ typedef struct trevrpc_rpc_transport_msquic {
     size_t entry_capacity;
     size_t local_hash_capacity;
     uint32_t free_head;
+    uint64_t next_sequence;
     unsigned turn;
     trevrpc_rpc_transport_event* pending_events[2];
     int capacity_wake_read_fd;
@@ -50,7 +59,16 @@ typedef struct trevrpc_rpc_transport_msquic {
     int stop_status;
     bool native_stopped;
     bool h3_stopped;
+    bool closing;
+    size_t shared_listens_in_progress;
 } trevrpc_rpc_transport_msquic;
+
+struct composite_shared_listener {
+    trevrpc_rpc_transport_msquic* composite;
+    uint32_t slot;
+    uint32_t generation;
+    trevrpc_rpc_transport_endpoint_config native_config;
+};
 
 typedef struct composite_pin {
     uint32_t slot;
@@ -62,8 +80,12 @@ typedef struct composite_event {
     trevrpc_rpc_transport* source;
     trevrpc_rpc_transport_event* inner;
     trevrpc_rpc_transport_event_info info;
-    composite_pin pins[2];
+    trevrpc_rpc_transport_admission_info admission;
+    trevrpc_rpc_transport_event_protocol_info protocol;
+    composite_pin pins[3];
     size_t pin_count;
+    bool has_admission;
+    bool has_protocol;
 } composite_event;
 
 typedef struct composite_receive {
@@ -316,7 +338,9 @@ static composite_entry* register_locked(trevrpc_rpc_transport_msquic* c,
     entry->event_refs = 0;
     entry->receive_refs = 0;
     entry->release_refs = 0;
+    entry->protocol_override = 0;
     entry->occupied = true;
+    entry->close_requested = false;
     entry->terminal_seen = false;
     entry->semantic_released = false;
     if (parent != NULL) {
@@ -402,12 +426,12 @@ static trevrpc_rpc_transport_handle route_locked(
 static bool route_snapshot_locked(
     trevrpc_rpc_transport_msquic* c, trevrpc_rpc_transport_handle external, composite_route* out) {
     composite_entry* entry = find_external_locked(c, external);
-    if (entry == NULL)
+    if (entry == NULL || entry->semantic_released || entry->release_refs != 0)
         return false;
     out->source = entry->source;
     out->local = entry->local;
     out->kind = entry->kind;
-    out->terminal_seen = entry->terminal_seen;
+    out->terminal_seen = entry->close_requested || entry->terminal_seen;
     return true;
 }
 
@@ -494,6 +518,11 @@ static int composite_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tr
          * otherwise a synchronously completed dial can have its READY or
          * FAILED event consumed before the composite mapping exists. */
         pthread_mutex_lock(&c->mutex);
+        if (index == 1u && c->shared_listens_in_progress) {
+            pthread_mutex_unlock(&c->mutex);
+            deferred_result = -EAGAIN;
+            continue;
+        }
         inner = c->pending_events[index];
         if (inner == NULL) {
             result = trevrpc_rpc_transport_next_event(sources[index], &inner);
@@ -519,11 +548,15 @@ static int composite_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tr
 
             result = trevrpc_rpc_transport_event_get_info(sources[index], inner, &source_info);
             if (result != 0) {
-                pthread_mutex_unlock(&c->mutex);
                 if (result == -ENOMEM || result == -EAGAIN) {
+                    pthread_mutex_unlock(&c->mutex);
                     deferred_result = result;
                     continue;
                 }
+                c->pending_events[index] = NULL;
+                c->turn = (unsigned)(index + 1u) & 1u;
+                pthread_mutex_unlock(&c->mutex);
+                trevrpc_rpc_transport_event_release(sources[index], inner);
                 return result;
             }
             event = calloc(1, sizeof(*event));
@@ -590,11 +623,46 @@ static int composite_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tr
                     result = -EAGAIN;
                 else {
                     event->info.subject = composite_external(c, subject_slot, subject);
+                    if (subject->parent_slot != 0 && subject->parent_slot <= c->entry_capacity) {
+                        composite_entry* mapped_parent = &c->entries[(size_t)subject->parent_slot - 1u];
+                        if (mapped_parent->occupied && mapped_parent->generation == subject->parent_generation) {
+                            parent = mapped_parent;
+                            parent_slot = subject->parent_slot;
+                            event->info.parent = composite_external(c, parent_slot, parent);
+                        }
+                    }
                     if (composite_event_is_object_terminal(&source_info))
                         subject->terminal_seen = true;
                 }
             }
+            if (result == 0 && (source_info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION ||
+                                   source_info.kind == TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION)) {
+                composite_entry* listener;
+                uint32_t listener_slot = 0;
+                result = trevrpc_rpc_transport_event_get_admission_info(event->source, event->inner, &event->admission);
+                if (result == 0) {
+                    listener = find_local_locked(c, event->source, event->admission.listener, &listener_slot);
+                    if (listener == NULL || listener->kind != TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER) {
+                        result = -ESTALE;
+                    } else {
+                        event->admission.listener = composite_external(c, listener_slot, listener);
+                        event->has_admission = true;
+                        composite_event_pin_locked(event, listener_slot, listener);
+                    }
+                }
+            }
             if (result == 0) {
+                int protocol_result =
+                    trevrpc_rpc_transport_event_get_protocol_info(event->source, event->inner, &event->protocol);
+                if (protocol_result == 0) {
+                    if (subject != NULL && subject->protocol_override != 0)
+                        event->protocol.protocol = subject->protocol_override;
+                    event->has_protocol = true;
+                } else if (protocol_result != -ENOTSUP)
+                    result = protocol_result;
+            }
+            if (result == 0) {
+                event->info.sequence = c->next_sequence++;
                 composite_event_pin_locked(event, parent_slot, parent);
                 composite_event_pin_locked(event, subject_slot, subject);
                 c->pending_events[index] = NULL;
@@ -613,6 +681,18 @@ static int composite_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tr
                 composite_wait_for_capacity_locked(c);
             } else {
                 composite_clear_capacity_wait_locked(c);
+            }
+            if (result != 0 && event->pin_count != 0) {
+                size_t pin_index;
+                for (pin_index = 0; pin_index < event->pin_count; ++pin_index) {
+                    composite_pin pin = event->pins[pin_index];
+                    composite_entry* pinned =
+                        pin.slot != 0 && pin.slot <= c->entry_capacity ? &c->entries[(size_t)pin.slot - 1u] : NULL;
+                    if (pinned != NULL && pinned->occupied && pinned->generation == pin.generation &&
+                        pinned->event_refs != 0)
+                        --pinned->event_refs;
+                }
+                event->pin_count = 0;
             }
             pthread_mutex_unlock(&c->mutex);
             if (result != 0) {
@@ -647,6 +727,35 @@ static int composite_event_get_info(
         return -EINVAL;
     *info = event->info;
     return 0;
+}
+
+static int composite_event_get_admission_info(
+    const trevrpc_rpc_transport_event* event_base, trevrpc_rpc_transport_admission_info* info) {
+    const composite_event* event = (const composite_event*)event_base;
+    if (event == NULL || info == NULL)
+        return -EINVAL;
+    if (!event->has_admission)
+        return -ENOTSUP;
+    *info = event->admission;
+    return 0;
+}
+
+static int composite_event_get_protocol_info(
+    const trevrpc_rpc_transport_event* event_base, trevrpc_rpc_transport_event_protocol_info* info) {
+    const composite_event* event = (const composite_event*)event_base;
+    if (event == NULL || info == NULL)
+        return -EINVAL;
+    if (!event->has_protocol)
+        return -ENOTSUP;
+    *info = event->protocol;
+    return 0;
+}
+
+static int composite_admission_respond(const trevrpc_rpc_transport_event* event_base, uint16_t status) {
+    const composite_event* event = (const composite_event*)event_base;
+    if (event == NULL)
+        return -EINVAL;
+    return trevrpc_rpc_transport_admission_respond(event->source, event->inner, status);
 }
 
 static void composite_event_release(trevrpc_rpc_transport_event* event_base) {
@@ -722,8 +831,15 @@ static int composite_get_diagnostics(trevrpc_rpc_transport* transport, trevrpc_r
     if (r != 0)
         return r;
     *d = a;
-    d->state = a.state > b.state ? a.state : b.state;
+    if (a.state == TREVRPC_RPC_TRANSPORT_STATE_STOPPED && b.state == TREVRPC_RPC_TRANSPORT_STATE_STOPPED)
+        d->state = TREVRPC_RPC_TRANSPORT_STATE_STOPPED;
+    else if (a.state != TREVRPC_RPC_TRANSPORT_STATE_RUNNING || b.state != TREVRPC_RPC_TRANSPORT_STATE_RUNNING)
+        d->state = TREVRPC_RPC_TRANSPORT_STATE_STOPPING;
+    else
+        d->state = TREVRPC_RPC_TRANSPORT_STATE_RUNNING;
     d->terminal_status = a.terminal_status ? a.terminal_status : b.terminal_status;
+    d->event_capacity = a.event_capacity + b.event_capacity;
+    d->provider_error_code = a.provider_error_code ? a.provider_error_code : b.provider_error_code;
     d->queue_depth = a.queue_depth + b.queue_depth;
     d->ordinary_queue_depth = a.ordinary_queue_depth + b.ordinary_queue_depth;
 #define SUM(field) d->field = a.field + b.field
@@ -749,6 +865,110 @@ static int composite_get_diagnostics(trevrpc_rpc_transport* transport, trevrpc_r
     return 0;
 }
 
+static composite_entry* composite_reserve_listener_locked(trevrpc_rpc_transport_msquic* c, uint32_t* out_slot) {
+    composite_entry* entry;
+    uint32_t slot;
+    if (c->free_head == 0)
+        return NULL;
+    slot = c->free_head;
+    entry = &c->entries[(size_t)slot - 1u];
+    c->free_head = entry->next_free;
+    entry->source = NULL;
+    entry->local = (trevrpc_rpc_transport_handle){0};
+    entry->kind = TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER;
+    entry->next_free = 0;
+    entry->parent_slot = 0;
+    entry->parent_generation = 0;
+    entry->child_refs = 0;
+    entry->event_refs = 0;
+    entry->receive_refs = 0;
+    entry->release_refs = 0;
+    entry->protocol_override = TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED;
+    entry->occupied = true;
+    entry->close_requested = false;
+    entry->terminal_seen = false;
+    entry->semantic_released = false;
+    *out_slot = slot;
+    return entry;
+}
+
+static void composite_bind_reserved_listener_locked(trevrpc_rpc_transport_msquic* c,
+    composite_entry* entry,
+    uint32_t slot,
+    trevrpc_rpc_transport* source,
+    trevrpc_rpc_transport_handle local) {
+    if (entry == NULL || !entry->occupied || !handle_zero(entry->local) || handle_zero(local))
+        abort();
+    entry->source = source;
+    entry->local = local;
+    if (composite_hash_insert_locked(c, source, local, slot) != 0)
+        abort();
+}
+
+static trevrpc_msquic_accept_disposition composite_shared_accept_dispatch(
+    void* context, trevrpc_msquic_accepted_connection* accepted) {
+    static const uint8_t native_alpn[] = "trevrpc/1";
+    static const uint8_t h3_alpn[] = "h3";
+    composite_shared_listener* shared = context;
+    trevrpc_rpc_transport_msquic* c;
+    const uint8_t* alpn = NULL;
+    size_t alpn_len = 0;
+    trevrpc_rpc_transport_handle local;
+    composite_entry* parent;
+    composite_entry* child;
+    uint32_t child_slot;
+    bool adopted = false;
+    int result;
+    if (shared == NULL || accepted == NULL ||
+        trevrpc_msquic_accepted_connection_get_alpn(accepted, &alpn, &alpn_len) != 0)
+        return TREV_MSQUIC_ACCEPT_REJECTED;
+    if (alpn_len == sizeof(h3_alpn) - 1u && memcmp(alpn, h3_alpn, alpn_len) == 0)
+        return TREV_MSQUIC_ACCEPT_FALLTHROUGH;
+    if (alpn_len != sizeof(native_alpn) - 1u || memcmp(alpn, native_alpn, alpn_len) != 0)
+        return TREV_MSQUIC_ACCEPT_REJECTED;
+    c = shared->composite;
+    pthread_mutex_lock(&c->mutex);
+    parent = shared->slot != 0 && shared->slot <= c->entry_capacity ? &c->entries[(size_t)shared->slot - 1u] : NULL;
+    if (parent == NULL || !parent->occupied || parent->generation != shared->generation || c->closing ||
+        parent->close_requested || parent->terminal_seen || c->free_head == 0) {
+        pthread_mutex_unlock(&c->mutex);
+        return TREV_MSQUIC_ACCEPT_REJECTED;
+    }
+    child_slot = c->free_head;
+    child = &c->entries[(size_t)child_slot - 1u];
+    c->free_head = child->next_free;
+    child->source = c->native_transport;
+    child->local = (trevrpc_rpc_transport_handle){0};
+    child->kind = TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION;
+    child->next_free = 0;
+    child->parent_slot = shared->slot;
+    child->parent_generation = parent->generation;
+    child->child_refs = 0;
+    child->event_refs = 0;
+    child->receive_refs = 0;
+    child->release_refs = 0;
+    child->protocol_override = 0;
+    child->occupied = true;
+    child->close_requested = false;
+    child->terminal_seen = false;
+    child->semantic_released = false;
+    ++parent->child_refs;
+    result = c->native_transport->ops->adopt_accepted_connection != NULL
+                 ? c->native_transport->ops->adopt_accepted_connection(
+                       c->native_transport, &shared->native_config, accepted, &local)
+                 : -ENOTSUP;
+    if (result == 0) {
+        adopted = true;
+        child->local = local;
+        if (composite_hash_insert_locked(c, c->native_transport, local, child_slot) != 0)
+            abort();
+    } else {
+        composite_discard_entry_locked(c, child_slot);
+    }
+    pthread_mutex_unlock(&c->mutex);
+    return adopted ? TREV_MSQUIC_ACCEPT_ADOPTED : TREV_MSQUIC_ACCEPT_REJECTED;
+}
+
 static trevrpc_rpc_transport* select_endpoint(trevrpc_rpc_transport_msquic* c, uint32_t protocol) {
     return protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3 || protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT
                ? c->h3_transport
@@ -756,14 +976,94 @@ static trevrpc_rpc_transport* select_endpoint(trevrpc_rpc_transport_msquic* c, u
 }
 static int composite_endpoint_listen(
     trevrpc_rpc_transport* t, const trevrpc_rpc_transport_endpoint_config* cfg, trevrpc_rpc_transport_handle* out) {
+    static const char shared_host[] = "shared";
+    static const uint8_t native_alpn[] = "trevrpc/1";
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
     trevrpc_rpc_transport* source = select_endpoint(c, cfg->protocol);
-    trevrpc_rpc_transport_handle local;
+    trevrpc_rpc_transport_handle local = {0};
     composite_entry* entry;
+    composite_shared_listener* shared = NULL;
     uint32_t slot = 0;
     int r;
+    if (cfg->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) {
+        shared = calloc(1, sizeof(*shared));
+        if (shared == NULL)
+            return -ENOMEM;
+        pthread_mutex_lock(&c->mutex);
+        if (c->closing) {
+            pthread_mutex_unlock(&c->mutex);
+            free(shared);
+            return -ESHUTDOWN;
+        }
+        entry = composite_reserve_listener_locked(c, &slot);
+        if (entry == NULL) {
+            composite_wait_for_capacity_locked(c);
+            pthread_mutex_unlock(&c->mutex);
+            free(shared);
+            return -EAGAIN;
+        }
+        shared->composite = c;
+        shared->slot = slot;
+        shared->generation = entry->generation;
+        shared->native_config = *cfg;
+        shared->native_config.protocol = TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE;
+        shared->native_config.host = shared_host;
+        shared->native_config.host_len = sizeof(shared_host) - 1u;
+        shared->native_config.alpn = native_alpn;
+        shared->native_config.alpn_len = sizeof(native_alpn) - 1u;
+        shared->native_config.server_name = NULL;
+        shared->native_config.server_name_len = 0;
+        shared->native_config.cert_file = NULL;
+        shared->native_config.cert_file_len = 0;
+        shared->native_config.key_file = NULL;
+        shared->native_config.key_file_len = 0;
+        shared->native_config.ca_cert_file = NULL;
+        shared->native_config.ca_cert_file_len = 0;
+        shared->native_config.cert_data = NULL;
+        shared->native_config.cert_data_len = 0;
+        shared->native_config.key_data = NULL;
+        shared->native_config.key_data_len = 0;
+        shared->native_config.ca_cert_data = NULL;
+        shared->native_config.ca_cert_data_len = 0;
+        shared->native_config.path = NULL;
+        shared->native_config.path_len = 0;
+        shared->native_config.origin = NULL;
+        shared->native_config.origin_len = 0;
+        ++c->shared_listens_in_progress;
+        pthread_mutex_unlock(&c->mutex);
+        r = trevrpc_rpc_transport_h3_listen_shared(
+            c->h3_transport, cfg, composite_shared_accept_dispatch, shared, free, &local);
+        pthread_mutex_lock(&c->mutex);
+        entry = &c->entries[(size_t)slot - 1u];
+        if (r == 0 && c->closing)
+            r = -ESHUTDOWN;
+        if (r == 0)
+            composite_bind_reserved_listener_locked(c, entry, slot, c->h3_transport, local);
+        if (c->shared_listens_in_progress != 0)
+            --c->shared_listens_in_progress;
+        pthread_cond_broadcast(&c->condition);
+        composite_signal_capacity_locked(c);
+        if (r == 0) {
+            *out = composite_external(c, slot, entry);
+        } else if (entry->child_refs == 0) {
+            composite_discard_entry_locked(c, slot);
+        } else {
+            entry->terminal_seen = true;
+            entry->semantic_released = true;
+            composite_try_retire_locked(c, slot);
+        }
+        pthread_mutex_unlock(&c->mutex);
+        if (r != 0 && !handle_zero(local))
+            (void)trevrpc_rpc_transport_listener_close(c->h3_transport, local);
+        return r;
+    }
     pthread_mutex_lock(&c->mutex);
+    if (c->closing) {
+        pthread_mutex_unlock(&c->mutex);
+        return -ESHUTDOWN;
+    }
     if (c->free_head == 0) {
+        composite_wait_for_capacity_locked(c);
         pthread_mutex_unlock(&c->mutex);
         return -EAGAIN;
     }
@@ -807,6 +1107,7 @@ static int composite_endpoint_dial(trevrpc_rpc_transport* t,
     int r;
     pthread_mutex_lock(&c->mutex);
     if (c->free_head == 0) {
+        composite_wait_for_capacity_locked(c);
         pthread_mutex_unlock(&c->mutex);
         return -EAGAIN;
     }
@@ -854,13 +1155,31 @@ static int composite_connection_close(trevrpc_rpc_transport* t, trevrpc_rpc_tran
 static int composite_listener_close(trevrpc_rpc_transport* t, trevrpc_rpc_transport_handle h) {
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
     composite_route route;
-    bool found;
+    composite_entry* entry;
+    int result;
     pthread_mutex_lock(&c->mutex);
-    found = route_snapshot_locked(c, h, &route);
-    pthread_mutex_unlock(&c->mutex);
-    if (!found || route.kind != TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER || route.terminal_seen)
+    entry = find_external_locked(c, h);
+    if (entry == NULL || entry->semantic_released || entry->release_refs != 0 ||
+        entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER || entry->close_requested || entry->terminal_seen) {
+        pthread_mutex_unlock(&c->mutex);
         return -ESTALE;
-    return trevrpc_rpc_transport_listener_close(route.source, route.local);
+    }
+    entry->close_requested = true;
+    route.source = entry->source;
+    route.local = entry->local;
+    route.kind = entry->kind;
+    route.terminal_seen = false;
+    pthread_mutex_unlock(&c->mutex);
+
+    result = trevrpc_rpc_transport_listener_close(route.source, route.local);
+    if (result != 0) {
+        pthread_mutex_lock(&c->mutex);
+        entry = find_external_locked(c, h);
+        if (entry != NULL && !entry->terminal_seen)
+            entry->close_requested = false;
+        pthread_mutex_unlock(&c->mutex);
+    }
+    return result;
 }
 
 static int composite_stream_open(
@@ -878,6 +1197,11 @@ static int composite_stream_open(
     if (!found || route.kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION || route.terminal_seen) {
         pthread_mutex_unlock(&c->mutex);
         return -ESTALE;
+    }
+    if (c->free_head == 0) {
+        composite_wait_for_capacity_locked(c);
+        pthread_mutex_unlock(&c->mutex);
+        return -EAGAIN;
     }
     result = trevrpc_rpc_transport_stream_open(route.source, route.local, op, &child);
     if (result != 0) {
@@ -987,6 +1311,21 @@ static int composite_stream_receive(
     }
 STREAM_ROUTED(finish_send)
 STREAM_ROUTED(close)
+#define STREAM_ABORT_ROUTED(name)                                                                                      \
+    static int composite_stream_abort_##name(                                                                          \
+        trevrpc_rpc_transport* t, trevrpc_rpc_transport_handle h, uint64_t code) {                                     \
+        trevrpc_rpc_transport_msquic* c = composite_from_base(t);                                                      \
+        composite_route route;                                                                                         \
+        bool found;                                                                                                    \
+        pthread_mutex_lock(&c->mutex);                                                                                 \
+        found = route_snapshot_locked(c, h, &route);                                                                   \
+        pthread_mutex_unlock(&c->mutex);                                                                               \
+        if (!found || route.kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM || route.terminal_seen)                        \
+            return -ESTALE;                                                                                            \
+        return trevrpc_rpc_transport_stream_abort_##name(route.source, route.local, code);                             \
+    }
+STREAM_ABORT_ROUTED(receive)
+STREAM_ABORT_ROUTED(send)
 static int composite_stream_abort(trevrpc_rpc_transport* t, trevrpc_rpc_transport_handle h, uint64_t code) {
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
     composite_route route;
@@ -1014,9 +1353,21 @@ static int composite_release_handle(trevrpc_rpc_transport* t, trevrpc_rpc_transp
         pthread_mutex_unlock(&c->mutex);
         return -ESTALE;
     }
-    if (entry->semantic_released || entry->release_refs != 0) {
+    if (entry->semantic_released) {
         pthread_mutex_unlock(&c->mutex);
         return 0;
+    }
+    while (entry->release_refs != 0) {
+        pthread_cond_wait(&c->condition, &c->mutex);
+        entry = find_external_locked(c, handle);
+        if (entry == NULL || entry->semantic_released) {
+            pthread_mutex_unlock(&c->mutex);
+            return 0;
+        }
+        if (entry->kind != kind) {
+            pthread_mutex_unlock(&c->mutex);
+            return -ESTALE;
+        }
     }
     /* Block new receives before waiting for already-admitted receives.  A
      * receive wrapper owns the child source handle until it is released. */
@@ -1050,19 +1401,36 @@ static int composite_release_handle(trevrpc_rpc_transport* t, trevrpc_rpc_transp
 
 static int composite_close(trevrpc_rpc_transport* t) {
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
-    int a = trevrpc_rpc_transport_close(c->native_transport);
-    int b = trevrpc_rpc_transport_close(c->h3_transport);
+    int a;
+    int b;
+    pthread_mutex_lock(&c->mutex);
+    c->closing = true;
+    pthread_cond_broadcast(&c->condition);
+    pthread_mutex_unlock(&c->mutex);
+    a = trevrpc_rpc_transport_close(c->native_transport);
+    b = trevrpc_rpc_transport_close(c->h3_transport);
     return a ? a : b;
 }
 static int composite_drain(trevrpc_rpc_transport* t) {
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
+    bool listen_in_progress;
     int a = trevrpc_rpc_transport_drain(c->native_transport);
     int b = trevrpc_rpc_transport_drain(c->h3_transport);
-    return a && a != -EAGAIN ? a : (b && b != -EAGAIN ? b : (a == -EAGAIN || b == -EAGAIN ? -EAGAIN : 0));
+    pthread_mutex_lock(&c->mutex);
+    listen_in_progress = c->shared_listens_in_progress != 0;
+    pthread_mutex_unlock(&c->mutex);
+    return a && a != -EAGAIN
+               ? a
+               : (b && b != -EAGAIN ? b : (listen_in_progress || a == -EAGAIN || b == -EAGAIN ? -EAGAIN : 0));
 }
 static void composite_destroy(trevrpc_rpc_transport* t) {
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
     size_t index;
+    pthread_mutex_lock(&c->mutex);
+    c->closing = true;
+    while (c->shared_listens_in_progress != 0)
+        pthread_cond_wait(&c->condition, &c->mutex);
+    pthread_mutex_unlock(&c->mutex);
     for (index = 0; index < sizeof(c->pending_events) / sizeof(c->pending_events[0]); ++index) {
         if (c->pending_events[index] != NULL) {
             trevrpc_rpc_transport_event_release(
@@ -1070,8 +1438,12 @@ static void composite_destroy(trevrpc_rpc_transport* t) {
             c->pending_events[index] = NULL;
         }
     }
-    trevrpc_rpc_transport_destroy(c->native_transport);
+    /* Shared H3 listener callbacks retain the composite dispatch context and may
+     * adopt into the native transport. Destroy H3 first so its listener callback
+     * barrier has completed before the native child source or composite state is
+     * reclaimed. */
     trevrpc_rpc_transport_destroy(c->h3_transport);
+    trevrpc_rpc_transport_destroy(c->native_transport);
     close(c->capacity_wake_read_fd);
     close(c->capacity_wake_write_fd);
     pthread_cond_destroy(&c->condition);
@@ -1098,6 +1470,8 @@ static const trevrpc_rpc_transport_ops composite_ops = {
     .stream_send = composite_stream_send,
     .stream_receive = composite_stream_receive,
     .stream_finish_send = composite_stream_finish_send,
+    .stream_abort_receive = composite_stream_abort_receive,
+    .stream_abort_send = composite_stream_abort_send,
     .stream_abort = composite_stream_abort,
     .stream_close = composite_stream_close,
     .connection_close = composite_connection_close,
@@ -1107,6 +1481,9 @@ static const trevrpc_rpc_transport_ops composite_ops = {
     .destroy = composite_destroy,
     .get_wake_sources = composite_get_wake_sources,
     .release_handle = composite_release_handle,
+    .event_get_admission_info = composite_event_get_admission_info,
+    .event_get_protocol_info = composite_event_get_protocol_info,
+    .admission_respond = composite_admission_respond,
 };
 
 int trevrpc_rpc_transport_msquic_adopt(trevrpc_rpc_transport* native_transport,
@@ -1123,7 +1500,7 @@ int trevrpc_rpc_transport_msquic_adopt(trevrpc_rpc_transport* native_transport,
     if (native_transport == NULL || h3_transport == NULL || config == NULL || out_transport == NULL)
         return -EINVAL;
     total_capacity = (uint64_t)config->listener_capacity + config->connection_capacity + config->stream_capacity;
-    if (total_capacity == 0 || total_capacity > UINT32_MAX / 2u || total_capacity > SIZE_MAX / 2u)
+    if (total_capacity == 0 || total_capacity > UINT32_MAX / 2u || total_capacity > SIZE_MAX / 4u)
         return -EOVERFLOW;
     per_source_capacity = (size_t)total_capacity;
     c = calloc(1, sizeof(*c));
@@ -1151,6 +1528,7 @@ int trevrpc_rpc_transport_msquic_adopt(trevrpc_rpc_transport* native_transport,
         c->entries[index].next_free = index + 1u < c->entry_capacity ? (uint32_t)index + 2u : 0;
     }
     c->free_head = 1;
+    c->next_sequence = 1;
     if (pthread_mutex_init(&c->mutex, NULL) != 0) {
         free(c->local_hash);
         free(c->entries);
@@ -1175,12 +1553,31 @@ int trevrpc_rpc_transport_msquic_adopt(trevrpc_rpc_transport* native_transport,
     }
     c->capacity_wake_read_fd = capacity_wakes[0];
     c->capacity_wake_write_fd = capacity_wakes[1];
-    c->owner = (uint64_t)(uintptr_t)c ^ UINT64_C(0x9e3779b97f4a7c15);
-    if (c->owner == 0)
-        c->owner = 1;
+    do {
+        c->owner = atomic_fetch_add_explicit(&composite_owner_sequence, 1, memory_order_relaxed);
+    } while (c->owner == 0);
     c->native_transport = native_transport;
     c->h3_transport = h3_transport;
     c->base.ops = &composite_ops;
     *out_transport = &c->base;
     return 0;
 }
+
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+int trevrpc_rpc_transport_msquic_test_event_refs(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint32_t* out_refs) {
+    trevrpc_rpc_transport_msquic* c = composite_from_base(transport);
+    composite_entry* entry;
+    if (out_refs == NULL)
+        return -EINVAL;
+    pthread_mutex_lock(&c->mutex);
+    entry = find_external_locked(c, handle);
+    if (entry == NULL) {
+        pthread_mutex_unlock(&c->mutex);
+        return -ESTALE;
+    }
+    *out_refs = entry->event_refs;
+    pthread_mutex_unlock(&c->mutex);
+    return 0;
+}
+#endif

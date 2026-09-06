@@ -2578,6 +2578,36 @@ trevrpc_msquic_feature_request trevrpc_msquic_default_h3_features(void) {
     return trevrpc_msquic_h3_feature_request(&provider);
 }
 
+static trevrpc_msquic_endpoint_lease* trevrpc_msquic_endpoint_lease_create(HQUIC registration, HQUIC configuration) {
+    trevrpc_msquic_endpoint_lease* lease = calloc(1, sizeof(*lease));
+    if (lease == NULL)
+        return NULL;
+    atomic_init(&lease->refs, 1);
+    lease->api = trevrpc_msquic_api();
+    lease->registration = registration;
+    lease->configuration = configuration;
+    lease->api_ref_acquired = true;
+    return lease;
+}
+
+static void trevrpc_msquic_endpoint_lease_retain(trevrpc_msquic_endpoint_lease* lease) {
+    if (lease != NULL)
+        (void)atomic_fetch_add_explicit(&lease->refs, 1, memory_order_relaxed);
+}
+
+static void trevrpc_msquic_endpoint_lease_release_impl(void* context) {
+    trevrpc_msquic_endpoint_lease* lease = context;
+    if (lease == NULL || atomic_fetch_sub_explicit(&lease->refs, 1, memory_order_acq_rel) != 1)
+        return;
+    if (lease->configuration != NULL)
+        lease->api->ConfigurationClose(lease->configuration);
+    if (lease->registration != NULL)
+        lease->api->RegistrationClose(lease->registration);
+    if (lease->api_ref_acquired)
+        trevrpc_msquic_api_release();
+    free(lease);
+}
+
 int trevrpc_msquic_listen(
     const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** out_listener) {
     return trevrpc_msquic_listen_alpns(host, port, config, NULL, 0, out_listener);
@@ -2612,7 +2642,25 @@ int trevrpc_msquic_listen_alpns_features_with_receive_policy(const char* host,
     const trevrpc_msquic_feature_request* features,
     const trevrpc_msquic_receive_policy* receive_policy,
     trevrpc_msquic_listener** out_listener) {
-    if (host == NULL || config == NULL || features == NULL || out_listener == NULL) {
+    return trevrpc_msquic_listen_alpns_features_with_dispatch(
+        host, port, config, alpns, alpns_len, features, receive_policy, NULL, NULL, NULL, out_listener);
+}
+
+int trevrpc_msquic_listen_alpns_features_with_dispatch(const char* host,
+    uint16_t port,
+    const trevrpc_msquic_config* config,
+    const trevrpc_msquic_alpn* alpns,
+    size_t alpns_len,
+    const trevrpc_msquic_feature_request* features,
+    const trevrpc_msquic_receive_policy* receive_policy,
+    trevrpc_msquic_accept_dispatch dispatch,
+    void* dispatch_context,
+    trevrpc_msquic_context_destroy dispatch_context_destroy,
+    trevrpc_msquic_listener** out_listener) {
+    if (host == NULL || config == NULL || features == NULL || out_listener == NULL ||
+        (dispatch == NULL) != (dispatch_context_destroy == NULL)) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
         return EINVAL;
     }
     *out_listener = NULL;
@@ -2620,10 +2668,14 @@ int trevrpc_msquic_listen_alpns_features_with_receive_policy(const char* host,
     trevrpc_msquic_receive_policy effective_policy;
     int policy_err = trevrpc_msquic_receive_policy_effective(receive_policy, max_frame_size, &effective_policy);
     if (policy_err != 0) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
         return policy_err;
     }
     trevrpc_msquic_listener* listener = calloc(1, sizeof(*listener));
     if (listener == NULL) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
         return ENOMEM;
     }
 
@@ -2634,6 +2686,9 @@ int trevrpc_msquic_listen_alpns_features_with_receive_policy(const char* host,
     listener->max_pending_send_count = trevrpc_msquic_effective_max_pending_send_count(config->max_pending_send_count);
     listener->receive_policy = effective_policy;
     listener->features = *features;
+    listener->accept_dispatch = dispatch;
+    listener->accept_dispatch_context = dispatch_context;
+    listener->accept_dispatch_context_destroy = dispatch_context_destroy;
 
     int err = trevrpc_msquic_configure_endpoint_with_alpns(
         config, alpns, alpns_len, features, true, &listener->registration, &listener->configuration);
@@ -2642,6 +2697,12 @@ int trevrpc_msquic_listen_alpns_features_with_receive_policy(const char* host,
         return err;
     }
     listener->api_ref_acquired = true;
+    listener->endpoint_lease = trevrpc_msquic_endpoint_lease_create(listener->registration, listener->configuration);
+    if (listener->endpoint_lease == NULL) {
+        trevrpc_msquic_listener_close(listener);
+        return ENOMEM;
+    }
+    listener->api_ref_acquired = false;
 
     QUIC_STATUS status = trevrpc_msquic_api()->ListenerOpen(
         listener->registration, trevrpc_msquic_listener_callback, listener, &listener->listener);
@@ -2797,6 +2858,9 @@ int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* ou
 }
 
 void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
+    void* dispatch_context = NULL;
+    trevrpc_msquic_context_destroy dispatch_context_destroy = NULL;
+    trevrpc_msquic_endpoint_lease* endpoint_lease = NULL;
     if (listener == NULL)
         return;
     if (TrevMsQuicObserverListener == listener) {
@@ -2824,6 +2888,13 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
     }
     listener->observer = NULL;
     listener->observer_context = NULL;
+    dispatch_context = listener->accept_dispatch_context;
+    dispatch_context_destroy = listener->accept_dispatch_context_destroy;
+    listener->accept_dispatch = NULL;
+    listener->accept_dispatch_context = NULL;
+    listener->accept_dispatch_context_destroy = NULL;
+    endpoint_lease = listener->endpoint_lease;
+    listener->endpoint_lease = NULL;
     connections = listener->conn_head;
     listener->conn_head = NULL;
     listener->conn_tail = NULL;
@@ -2836,18 +2907,26 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
         free(node);
     }
 
-    if (listener->configuration != NULL) {
-        trevrpc_msquic_api()->ConfigurationClose(listener->configuration);
+    if (endpoint_lease != NULL) {
         listener->configuration = NULL;
-    }
-    if (listener->registration != NULL) {
-        trevrpc_msquic_api()->RegistrationClose(listener->registration);
         listener->registration = NULL;
+        trevrpc_msquic_endpoint_lease_release_impl(endpoint_lease);
+    } else {
+        if (listener->configuration != NULL) {
+            trevrpc_msquic_api()->ConfigurationClose(listener->configuration);
+            listener->configuration = NULL;
+        }
+        if (listener->registration != NULL) {
+            trevrpc_msquic_api()->RegistrationClose(listener->registration);
+            listener->registration = NULL;
+        }
+        if (listener->api_ref_acquired) {
+            listener->api_ref_acquired = false;
+            trevrpc_msquic_api_release();
+        }
     }
-    if (listener->api_ref_acquired) {
-        listener->api_ref_acquired = false;
-        trevrpc_msquic_api_release();
-    }
+    if (dispatch_context_destroy != NULL)
+        dispatch_context_destroy(dispatch_context);
 
     pthread_cond_destroy(&listener->cond);
     pthread_mutex_destroy(&listener->mutex);
@@ -3550,6 +3629,8 @@ static void trevrpc_msquic_conn_destroy_owned(trevrpc_msquic_conn* conn, bool ow
     trevrpc_msquic_receive_budget* recv_budget = NULL;
     HQUIC configuration = NULL;
     HQUIC registration = NULL;
+    void* endpoint_lease = NULL;
+    trevrpc_msquic_endpoint_lease_release endpoint_lease_release = NULL;
     bool owns_endpoint = false;
     bool release_api = false;
 
@@ -3569,6 +3650,10 @@ static void trevrpc_msquic_conn_destroy_owned(trevrpc_msquic_conn* conn, bool ow
     conn->configuration = NULL;
     registration = conn->registration;
     conn->registration = NULL;
+    endpoint_lease = conn->endpoint_lease;
+    conn->endpoint_lease = NULL;
+    endpoint_lease_release = conn->endpoint_lease_release;
+    conn->endpoint_lease_release = NULL;
     owns_endpoint = conn->owns_endpoint;
     conn->owns_endpoint = false;
     release_api = conn->api_ref_acquired;
@@ -3591,6 +3676,8 @@ static void trevrpc_msquic_conn_destroy_owned(trevrpc_msquic_conn* conn, bool ow
         }
         trevrpc_msquic_api_release();
     }
+    if (endpoint_lease_release != NULL)
+        endpoint_lease_release(endpoint_lease);
     trevrpc_msquic_receive_budget_release(recv_budget);
     if (release_api) {
         trevrpc_msquic_api_release();
@@ -4701,7 +4788,19 @@ int trevrpc_msquic_stream_abort(trevrpc_msquic_stream* stream) {
     return trevrpc_msquic_stream_abort_with_error(stream, 0);
 }
 
-int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream) {
+int trevrpc_msquic_stream_abort_receive_with_error(trevrpc_msquic_stream* stream, uint64_t error_code) {
+    if (stream == NULL) {
+        return -EINVAL;
+    }
+    trevrpc_msquic_receive_budget* recv_budget = stream->recv_budget;
+    if (recv_budget != NULL) {
+        pthread_mutex_lock(&recv_budget->mutex);
+        stream->receive_closing = true;
+        trevrpc_msquic_recv_pause_remove_budget_locked(recv_budget, stream);
+        pthread_mutex_unlock(&recv_budget->mutex);
+    } else {
+        stream->receive_closing = true;
+    }
     pthread_mutex_lock(&stream->mutex);
     HQUIC handle = stream->handle;
     if (handle == NULL || stream->close_pending) {
@@ -4711,7 +4810,32 @@ int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream) {
     stream->active_handle_ops++;
     pthread_mutex_unlock(&stream->mutex);
 
-    QUIC_STATUS status = trevrpc_msquic_test_stream_shutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, 0);
+    QUIC_STATUS status =
+        trevrpc_msquic_test_stream_shutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, error_code);
+    trevrpc_msquic_stream_handle_release(stream);
+    return QUIC_FAILED(status) ? (int)status : 0;
+}
+
+int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream) {
+    return trevrpc_msquic_stream_abort_receive_with_error(stream, 0);
+}
+
+int trevrpc_msquic_stream_abort_send_with_error(trevrpc_msquic_stream* stream, uint64_t error_code) {
+    if (stream == NULL) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&stream->mutex);
+    HQUIC handle = stream->handle;
+    stream->send_aborted = true;
+    pthread_cond_broadcast(&stream->cond);
+    if (handle == NULL || stream->close_pending) {
+        pthread_mutex_unlock(&stream->mutex);
+        return 0;
+    }
+    stream->active_handle_ops++;
+    pthread_mutex_unlock(&stream->mutex);
+
+    QUIC_STATUS status = trevrpc_msquic_test_stream_shutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND, error_code);
     trevrpc_msquic_stream_handle_release(stream);
     return QUIC_FAILED(status) ? (int)status : 0;
 }
@@ -4992,13 +5116,71 @@ const char* trevrpc_msquic_error(int code) {
     }
 }
 
+int trevrpc_msquic_accepted_connection_wrap(
+    trevrpc_msquic_accepted_connection* accepted, trevrpc_msquic_conn** out_connection) {
+    trevrpc_msquic_listener* listener;
+    trevrpc_msquic_conn* conn;
+    HQUIC connection_handle;
+    QUIC_STATUS status;
+    if (accepted == NULL || out_connection == NULL || accepted->claimed)
+        return EINVAL;
+    *out_connection = NULL;
+    listener = accepted->listener;
+    conn = trevrpc_msquic_conn_alloc(accepted->connection, listener->max_frame_size, &listener->receive_policy);
+    if (conn == NULL)
+        return ENOMEM;
+    if (accepted->negotiated_alpn != NULL && accepted->negotiated_alpn_len > 0) {
+        conn->negotiated_alpn_len = accepted->negotiated_alpn_len;
+        memcpy(conn->negotiated_alpn, accepted->negotiated_alpn, conn->negotiated_alpn_len);
+    }
+    conn->configuration = accepted->configuration;
+    conn->registration = accepted->registration;
+    if (trevrpc_msquic_accepted_connection_take_endpoint_lease(
+            accepted, &conn->endpoint_lease, &conn->endpoint_lease_release) != 0) {
+        trevrpc_msquic_conn_close(conn);
+        return ECANCELED;
+    }
+    trevrpc_msquic_feature_request connection_features =
+        trevrpc_msquic_conn_uses_native_frames(conn) ? trevrpc_msquic_generic_feature_request() : listener->features;
+    trevrpc_msquic_feature_state_init(&conn->features, &connection_features);
+    conn->max_frame_size = listener->max_frame_size;
+    conn->max_pending_send_bytes = listener->max_pending_send_bytes;
+    conn->max_pending_send_count = listener->max_pending_send_count;
+    accepted->claimed = true;
+    connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
+    if (connection_handle == NULL) {
+        trevrpc_msquic_conn_close(conn);
+        return ECANCELED;
+    }
+    trevrpc_msquic_api()->SetCallbackHandler(connection_handle, (void*)trevrpc_msquic_conn_callback, conn);
+    status = trevrpc_msquic_api()->ConnectionSetConfiguration(connection_handle, accepted->configuration);
+    trevrpc_msquic_conn_handle_release(conn);
+    if (QUIC_FAILED(status)) {
+        trevrpc_msquic_conn_close(conn);
+        return (int)status;
+    }
+    *out_connection = conn;
+    return 0;
+}
+
+static void trevrpc_msquic_accepted_connection_release_endpoint_lease(trevrpc_msquic_accepted_connection* accepted) {
+    if (accepted->endpoint_lease_release != NULL)
+        accepted->endpoint_lease_release(accepted->endpoint_lease);
+    accepted->endpoint_lease = NULL;
+    accepted->endpoint_lease_release = NULL;
+}
+
 static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     HQUIC listener_handle, void* context, QUIC_LISTENER_EVENT* event) {
     (void)listener_handle;
     trevrpc_msquic_listener* listener = context;
-    if (event->Type != QUIC_LISTENER_EVENT_NEW_CONNECTION) {
+    trevrpc_msquic_accepted_connection accepted;
+    trevrpc_msquic_accept_disposition disposition = TREV_MSQUIC_ACCEPT_FALLTHROUGH;
+    trevrpc_msquic_conn* conn = NULL;
+    trevrpc_msquic_conn_node* node;
+    int wrap_result;
+    if (event->Type != QUIC_LISTENER_EVENT_NEW_CONNECTION)
         return QUIC_STATUS_SUCCESS;
-    }
 
     pthread_mutex_lock(&listener->mutex);
     if (listener->closed) {
@@ -5006,49 +5188,41 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
         return QUIC_STATUS_ABORTED;
     }
     listener->active_callbacks++;
-    HQUIC configuration = listener->configuration;
-    HQUIC registration = listener->registration;
-    size_t max_frame_size = listener->max_frame_size;
-    size_t max_pending_send_bytes = listener->max_pending_send_bytes;
-    size_t max_pending_send_count = listener->max_pending_send_count;
-    trevrpc_msquic_receive_policy receive_policy = listener->receive_policy;
+    trevrpc_msquic_endpoint_lease_retain(listener->endpoint_lease);
+    accepted = (trevrpc_msquic_accepted_connection){
+        .listener = listener,
+        .connection = event->NEW_CONNECTION.Connection,
+        .registration = listener->registration,
+        .configuration = listener->configuration,
+        .negotiated_alpn = event->NEW_CONNECTION.Info != NULL ? event->NEW_CONNECTION.Info->NegotiatedAlpn : NULL,
+        .negotiated_alpn_len =
+            event->NEW_CONNECTION.Info != NULL ? event->NEW_CONNECTION.Info->NegotiatedAlpnLength : 0,
+        .endpoint_lease = listener->endpoint_lease,
+        .endpoint_lease_release = trevrpc_msquic_endpoint_lease_release_impl,
+    };
     pthread_mutex_unlock(&listener->mutex);
 
-    trevrpc_msquic_conn* conn =
-        trevrpc_msquic_conn_alloc(event->NEW_CONNECTION.Connection, max_frame_size, &receive_policy);
-    if (conn == NULL) {
+    if (listener->accept_dispatch != NULL)
+        disposition = listener->accept_dispatch(listener->accept_dispatch_context, &accepted);
+    if (disposition == TREV_MSQUIC_ACCEPT_ADOPTED) {
+        bool transferred = accepted.claimed && accepted.endpoint_lease == NULL;
+        trevrpc_msquic_accepted_connection_release_endpoint_lease(&accepted);
         trevrpc_msquic_listener_callback_finish(listener);
-        return QUIC_STATUS_OUT_OF_MEMORY;
+        return transferred ? QUIC_STATUS_SUCCESS : QUIC_STATUS_ABORTED;
     }
-    if (event->NEW_CONNECTION.Info != NULL && event->NEW_CONNECTION.Info->NegotiatedAlpnLength > 0) {
-        conn->negotiated_alpn_len = event->NEW_CONNECTION.Info->NegotiatedAlpnLength;
-        memcpy(conn->negotiated_alpn, event->NEW_CONNECTION.Info->NegotiatedAlpn, conn->negotiated_alpn_len);
-    }
-    conn->configuration = configuration;
-    conn->registration = registration;
-    trevrpc_msquic_feature_request connection_features =
-        trevrpc_msquic_conn_uses_native_frames(conn) ? trevrpc_msquic_generic_feature_request() : listener->features;
-    trevrpc_msquic_feature_state_init(&conn->features, &connection_features);
-    conn->max_frame_size = max_frame_size;
-    conn->max_pending_send_bytes = max_pending_send_bytes;
-    conn->max_pending_send_count = max_pending_send_count;
-    HQUIC connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
-    if (connection_handle == NULL) {
-        trevrpc_msquic_conn_close(conn);
+    if (disposition == TREV_MSQUIC_ACCEPT_REJECTED) {
+        trevrpc_msquic_accepted_connection_release_endpoint_lease(&accepted);
         trevrpc_msquic_listener_callback_finish(listener);
         return QUIC_STATUS_ABORTED;
     }
-    trevrpc_msquic_api()->SetCallbackHandler(connection_handle, (void*)trevrpc_msquic_conn_callback, conn);
 
-    QUIC_STATUS status = trevrpc_msquic_api()->ConnectionSetConfiguration(connection_handle, configuration);
-    trevrpc_msquic_conn_handle_release(conn);
-    if (QUIC_FAILED(status)) {
-        trevrpc_msquic_conn_close(conn);
+    wrap_result = trevrpc_msquic_accepted_connection_wrap(&accepted, &conn);
+    if (wrap_result != 0) {
+        trevrpc_msquic_accepted_connection_release_endpoint_lease(&accepted);
         trevrpc_msquic_listener_callback_finish(listener);
-        return status;
+        return wrap_result == ENOMEM ? QUIC_STATUS_OUT_OF_MEMORY : QUIC_STATUS_ABORTED;
     }
-
-    trevrpc_msquic_conn_node* node = malloc(sizeof(*node));
+    node = malloc(sizeof(*node));
     if (node == NULL) {
         trevrpc_msquic_conn_close(conn);
         trevrpc_msquic_listener_callback_finish(listener);
@@ -5065,11 +5239,10 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
         trevrpc_msquic_listener_callback_finish(listener);
         return QUIC_STATUS_ABORTED;
     }
-    if (listener->conn_tail != NULL) {
+    if (listener->conn_tail != NULL)
         listener->conn_tail->next = node;
-    } else {
+    else
         listener->conn_head = node;
-    }
     listener->conn_tail = node;
     pthread_cond_signal(&listener->cond);
     pthread_mutex_unlock(&listener->mutex);
@@ -5083,15 +5256,31 @@ static QUIC_STATUS trevrpc_msquic_conn_callback_impl(
     HQUIC connection_handle, trevrpc_msquic_conn* conn, QUIC_CONNECTION_EVENT* event) {
     switch (event->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED: {
+        uint8_t datagram_send_enabled = FALSE;
+        uint32_t datagram_send_enabled_len = sizeof(datagram_send_enabled);
+        QUIC_STATUS datagram_status = QUIC_STATUS_NOT_SUPPORTED;
         if (!conn->owns_endpoint && trevrpc_msquic_conn_uses_native_frames(conn)) {
             (void)trevrpc_msquic_api()->ConnectionSendResumptionTicket(
                 connection_handle, QUIC_SEND_RESUMPTION_FLAG_NONE, 0, NULL);
+        }
+        if (conn->features.request.datagram_receive) {
+            datagram_status = trevrpc_msquic_api()->GetParam(connection_handle,
+                QUIC_PARAM_CONN_DATAGRAM_SEND_ENABLED,
+                &datagram_send_enabled_len,
+                &datagram_send_enabled);
         }
         trevrpc_msquic_feature_event feature_event = {
             .kind = TREV_MSQUIC_FEATURE_EVENT_CONNECTED,
         };
         pthread_mutex_lock(&conn->mutex);
         conn->connected_session_resumed = event->CONNECTED.SessionResumed != FALSE;
+        if (!conn->features.datagram_event_seen && QUIC_SUCCEEDED(datagram_status)) {
+            trevrpc_msquic_feature_event datagram_event = {
+                .kind = TREV_MSQUIC_FEATURE_EVENT_DATAGRAM_STATE_CHANGED,
+                .value = datagram_send_enabled != FALSE,
+            };
+            trevrpc_msquic_feature_reduce(&conn->features, &datagram_event);
+        }
         trevrpc_msquic_feature_reduce(&conn->features, &feature_event);
         pthread_mutex_unlock(&conn->mutex);
         trevrpc_msquic_conn_publish_ready(conn);

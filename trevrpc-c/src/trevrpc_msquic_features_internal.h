@@ -114,6 +114,7 @@ void trevrpc_msquic_feature_reduce(trevrpc_msquic_feature_state* state, const tr
 bool trevrpc_msquic_feature_ready(const trevrpc_msquic_feature_state* state);
 int trevrpc_msquic_feature_snapshot_get(
     const trevrpc_msquic_feature_state* state, trevrpc_msquic_feature_snapshot* snapshot);
+bool trevrpc_msquic_feature_snapshot_negotiated_datagrams(const trevrpc_msquic_feature_snapshot* snapshot);
 bool trevrpc_msquic_feature_snapshot_usable_datagrams(const trevrpc_msquic_feature_snapshot* snapshot);
 bool trevrpc_msquic_feature_snapshot_has_reset_dialect(
     const trevrpc_msquic_feature_snapshot* snapshot, trevrpc_msquic_reset_dialect dialect);

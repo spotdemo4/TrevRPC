@@ -3,7 +3,33 @@ project(trevrpc-installed-cmake-consumer LANGUAGES C CXX)
 
 option(TREVRPC_INSTALL_TEST_ENGINE_ONLY "Build only the installed engine consumer" OFF)
 option(TREVRPC_INSTALL_TEST_ENGINE_MSQUIC_ONLY "Build only the installed Engine consumers" OFF)
+option(TREVRPC_INSTALL_TEST_TRANSPORT_ONLY "Build only the installed transport consumer" OFF)
+option(TREVRPC_INSTALL_TEST_TRANSPORT_MSQUIC_ONLY "Build only the installed transport consumers" OFF)
 option(TREVRPC_INSTALL_TEST_RPC_MSQUIC_ONLY "Build only the installed Engine and RPC consumers" OFF)
+
+if(TREVRPC_INSTALL_TEST_TRANSPORT_ONLY)
+    find_package(trevrpc_transport CONFIG REQUIRED)
+    if(NOT TREVRPC_TRANSPORT_ABI_VERSION EQUAL 1)
+        message(FATAL_ERROR "installed TrevRPC transport package does not expose Transport ABI 1")
+    endif()
+    add_executable(trevrpc-installed-transport-cmake-consumer transport_main.c)
+    target_link_libraries(trevrpc-installed-transport-cmake-consumer PRIVATE trevrpc::trevrpc_transport)
+    return()
+endif()
+
+if(TREVRPC_INSTALL_TEST_TRANSPORT_MSQUIC_ONLY)
+    find_package(trevrpc_transport_msquic CONFIG REQUIRED)
+    if(NOT TREVRPC_TRANSPORT_MSQUIC_ABI_VERSION EQUAL 1)
+        message(FATAL_ERROR "installed TrevRPC transport MsQuic package does not expose companion ABI 1")
+    endif()
+    add_executable(trevrpc-installed-transport-cmake-consumer transport_main.c)
+    target_link_libraries(trevrpc-installed-transport-cmake-consumer PRIVATE trevrpc::trevrpc_transport)
+    add_executable(trevrpc-installed-transport-msquic-cmake-consumer transport_msquic_main.c)
+    target_link_libraries(trevrpc-installed-transport-msquic-cmake-consumer PRIVATE
+        trevrpc::trevrpc_transport_msquic
+    )
+    return()
+endif()
 
 find_package(trevrpc_engine CONFIG REQUIRED)
 if(NOT TREVRPC_ENGINE_ABI_VERSION EQUAL 1)
@@ -32,6 +58,22 @@ target_link_libraries(trevrpc-installed-engine-msquic-cmake-cpp-consumer PRIVATE
 if(TREVRPC_INSTALL_TEST_ENGINE_MSQUIC_ONLY)
     return()
 endif()
+
+find_package(trevrpc_transport CONFIG REQUIRED)
+if(NOT TREVRPC_TRANSPORT_ABI_VERSION EQUAL 1)
+    message(FATAL_ERROR "installed TrevRPC transport package does not expose Transport ABI 1")
+endif()
+add_executable(trevrpc-installed-transport-cmake-consumer transport_main.c)
+target_link_libraries(trevrpc-installed-transport-cmake-consumer PRIVATE trevrpc::trevrpc_transport)
+
+find_package(trevrpc_transport_msquic CONFIG REQUIRED)
+if(NOT TREVRPC_TRANSPORT_MSQUIC_ABI_VERSION EQUAL 1)
+    message(FATAL_ERROR "installed TrevRPC transport MsQuic package does not expose companion ABI 1")
+endif()
+add_executable(trevrpc-installed-transport-msquic-cmake-consumer transport_msquic_main.c)
+target_link_libraries(trevrpc-installed-transport-msquic-cmake-consumer PRIVATE
+    trevrpc::trevrpc_transport_msquic
+)
 
 find_package(trevrpc_rpc CONFIG REQUIRED)
 if(NOT TREVRPC_RPC_ABI_VERSION EQUAL 1)

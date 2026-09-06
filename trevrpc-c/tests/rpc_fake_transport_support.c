@@ -487,6 +487,35 @@ int fake_stream_finish_send(trevrpc_rpc_transport* transport, trevrpc_rpc_transp
     return 0;
 }
 
+static int fake_stream_abort_half(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code, atomic_uint* calls) {
+    fake_transport* fake = fake_from_base(transport);
+    if (!fake_stream_handle_valid(stream)) {
+        return -ESTALE;
+    }
+    if (fake->stream_abort_result != 0) {
+        return fake->stream_abort_result;
+    }
+    atomic_fetch_add_explicit(calls, 1, memory_order_release);
+    atomic_store_explicit(&fake->last_abort_error, error_code, memory_order_release);
+    pthread_mutex_lock(&fake->mutex);
+    pthread_cond_broadcast(&fake->condition);
+    pthread_mutex_unlock(&fake->mutex);
+    return 0;
+}
+
+static int fake_stream_abort_receive(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
+    fake_transport* fake = fake_from_base(transport);
+    return fake_stream_abort_half(transport, stream, error_code, &fake->stream_abort_receive_calls);
+}
+
+static int fake_stream_abort_send(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
+    fake_transport* fake = fake_from_base(transport);
+    return fake_stream_abort_half(transport, stream, error_code, &fake->stream_abort_send_calls);
+}
+
 int fake_stream_abort(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
     fake_transport* fake = fake_from_base(transport);
     if (!fake_stream_handle_valid(stream)) {
@@ -660,6 +689,8 @@ static const trevrpc_rpc_transport_ops fake_ops = {
     .stream_send = fake_stream_send,
     .stream_receive = fake_stream_receive,
     .stream_finish_send = fake_stream_finish_send,
+    .stream_abort_receive = fake_stream_abort_receive,
+    .stream_abort_send = fake_stream_abort_send,
     .stream_abort = fake_stream_abort,
     .stream_close = fake_stream_close,
     .connection_close = fake_connection_close,
@@ -743,6 +774,8 @@ fake_transport* fake_create(void) {
     atomic_init(&fake->readable_info_calls, 0);
     atomic_init(&fake->readable_release_calls, 0);
     atomic_init(&fake->receive_release_calls, 0);
+    atomic_init(&fake->stream_abort_receive_calls, 0);
+    atomic_init(&fake->stream_abort_send_calls, 0);
     atomic_init(&fake->stream_abort_calls, 0);
     atomic_init(&fake->stream_close_calls, 0);
     atomic_init(&fake->stream_send_calls, 0);

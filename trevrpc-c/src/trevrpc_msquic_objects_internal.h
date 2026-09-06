@@ -79,6 +79,14 @@ typedef struct trevrpc_msquic_conn_node {
     trevrpc_msquic_conn* conn;
 } trevrpc_msquic_conn_node;
 
+typedef struct trevrpc_msquic_endpoint_lease {
+    atomic_size_t refs;
+    const QUIC_API_TABLE* api;
+    HQUIC registration;
+    HQUIC configuration;
+    bool api_ref_acquired;
+} trevrpc_msquic_endpoint_lease;
+
 typedef enum trevrpc_msquic_finalizer_kind {
     TREV_MSQUIC_FINALIZE_CONN_DESTROY = 0,
     TREV_MSQUIC_FINALIZE_STREAM_CLOSE,
@@ -196,6 +204,8 @@ struct trevrpc_msquic_conn {
     size_t max_stream_recv_owned_bytes;
     size_t max_stream_recv_owned_count;
     trevrpc_msquic_receive_budget* recv_budget;
+    void* endpoint_lease;
+    trevrpc_msquic_endpoint_lease_release endpoint_lease_release;
     bool owns_endpoint;
     bool api_ref_acquired;
     pthread_mutex_t mutex;
@@ -240,6 +250,10 @@ struct trevrpc_msquic_listener {
     trevrpc_msquic_conn_node* conn_tail;
     trevrpc_msquic_listener_observer observer;
     void* observer_context;
+    trevrpc_msquic_accept_dispatch accept_dispatch;
+    void* accept_dispatch_context;
+    trevrpc_msquic_context_destroy accept_dispatch_context_destroy;
+    trevrpc_msquic_endpoint_lease* endpoint_lease;
     size_t active_observer_callbacks;
     size_t active_callbacks;
     size_t shutdown_waiters;

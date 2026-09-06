@@ -217,8 +217,8 @@ static int test_capability_filtering(void) {
     draft10_capabilities.configured_reset_dialects = TREV_MSQUIC_RESET_DIALECT_DRAFT_10_BIT;
     draft10_capabilities.peer_reset_dialects = TREV_MSQUIC_RESET_DIALECT_DRAFT_10_BIT;
     draft10_capabilities.negotiated_reset_dialects = TREV_MSQUIC_RESET_DIALECT_DRAFT_10_BIT;
-    trevrpc_msquic_feature_snapshot zero_max_capabilities = no_reset_capabilities;
-    zero_max_capabilities.datagram_max_send_length = 0;
+    trevrpc_msquic_feature_snapshot negotiated_no_max_capabilities = no_reset_capabilities;
+    negotiated_no_max_capabilities.datagram_max_send_length = 0;
 
     CHECK(trevrpc_wt_profile_is_usable(TREV_WT_PROFILE_DRAFT_02, &no_reset_capabilities));
     CHECK(trevrpc_wt_profile_is_usable(TREV_WT_PROFILE_DRAFT_07, &no_reset_capabilities));
@@ -226,7 +226,7 @@ static int test_capability_filtering(void) {
     CHECK(!trevrpc_wt_profile_is_usable(TREV_WT_PROFILE_DRAFT_15, &no_reset_capabilities));
     CHECK(!trevrpc_wt_profile_is_usable(TREV_WT_PROFILE_DRAFT_14, &draft10_capabilities));
     CHECK(!trevrpc_wt_profile_is_usable(TREV_WT_PROFILE_DRAFT_07, &no_datagram_capabilities));
-    CHECK(!trevrpc_wt_profile_is_usable(TREV_WT_PROFILE_DRAFT_07, &zero_max_capabilities));
+    CHECK(trevrpc_wt_profile_is_usable(TREV_WT_PROFILE_DRAFT_07, &negotiated_no_max_capabilities));
     CHECK(trevrpc_wt_profile_any_usable(&full_capabilities));
     CHECK(trevrpc_wt_profile_any_usable(&no_reset_capabilities));
     CHECK(!trevrpc_wt_profile_any_usable(&no_datagram_capabilities));

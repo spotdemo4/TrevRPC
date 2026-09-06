@@ -1,9 +1,13 @@
 #ifndef TREVRPC_RPC_TRANSPORT_INTERNAL_H
 #define TREVRPC_RPC_TRANSPORT_INTERNAL_H
 
+#include "trevrpc_transport.h"
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+
+typedef struct trevrpc_msquic_accepted_connection trevrpc_msquic_accepted_connection;
 
 /* Private RPC transport vocabulary.  This header is never installed. */
 #define TREVRPC_RPC_TRANSPORT_STATE_RUNNING 0u
@@ -32,6 +36,8 @@
 #define TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN 10u
 #define TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE 11u
 #define TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED 12u
+#define TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION 13u
+#define TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION 14u
 
 #define TREVRPC_RPC_TRANSPORT_EVENT_FLAG_FATAL 0x00000001u
 #define TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL 0x00000002u
@@ -43,11 +49,13 @@
 #define TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TRANSPORT_ERROR 0x00000080u
 #define TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLEAN_FIN 0x00000100u
 #define TREVRPC_RPC_TRANSPORT_ENDPOINT_SKIP_CERTIFICATE_VALIDATION 0x00000001u
+#define TREVRPC_RPC_TRANSPORT_ENDPOINT_DEFER_ADMISSION 0x00000002u
 
 #define TREVRPC_RPC_TRANSPORT_PROTOCOL_AUTO 0u
 #define TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE 1u
 #define TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3 2u
 #define TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT 3u
+#define TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED 4u
 
 typedef struct trevrpc_rpc_transport trevrpc_rpc_transport;
 typedef struct trevrpc_rpc_transport_event trevrpc_rpc_transport_event;
@@ -139,6 +147,27 @@ typedef struct trevrpc_rpc_transport_receive_info {
     uint64_t data_len;
 } trevrpc_rpc_transport_receive_info;
 
+typedef trevrpc_transport_header_field_v1 trevrpc_rpc_transport_header_field;
+
+typedef struct trevrpc_rpc_transport_admission_info {
+    uint32_t protocol;
+    trevrpc_rpc_transport_handle listener;
+    const trevrpc_rpc_transport_header_field* headers;
+    uint64_t header_count;
+    const uint8_t* method;
+    uint64_t method_len;
+    const uint8_t* path;
+    uint64_t path_len;
+    const uint8_t* authority;
+    uint64_t authority_len;
+    const uint8_t* origin;
+    uint64_t origin_len;
+} trevrpc_rpc_transport_admission_info;
+
+typedef struct trevrpc_rpc_transport_event_protocol_info {
+    uint32_t protocol;
+} trevrpc_rpc_transport_event_protocol_info;
+
 typedef struct trevrpc_rpc_transport_diagnostics {
     uint32_t state;
     int32_t terminal_status;
@@ -185,6 +214,8 @@ typedef struct trevrpc_rpc_transport_ops {
     int (*stream_send)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle, uint64_t, const uint8_t*, size_t);
     int (*stream_receive)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle, trevrpc_rpc_transport_receive**);
     int (*stream_finish_send)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle);
+    int (*stream_abort_receive)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle, uint64_t);
+    int (*stream_abort_send)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle, uint64_t);
     int (*stream_abort)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle, uint64_t);
     int (*stream_close)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle);
     int (*connection_close)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle, uint64_t);
@@ -194,6 +225,13 @@ typedef struct trevrpc_rpc_transport_ops {
     void (*destroy)(trevrpc_rpc_transport*);
     int (*get_wake_sources)(trevrpc_rpc_transport*, trevrpc_rpc_transport_wake*, size_t, size_t*);
     int (*release_handle)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle, uint32_t);
+    int (*event_get_admission_info)(const trevrpc_rpc_transport_event*, trevrpc_rpc_transport_admission_info*);
+    int (*event_get_protocol_info)(const trevrpc_rpc_transport_event*, trevrpc_rpc_transport_event_protocol_info*);
+    int (*admission_respond)(const trevrpc_rpc_transport_event*, uint16_t);
+    int (*adopt_accepted_connection)(trevrpc_rpc_transport*,
+        const trevrpc_rpc_transport_endpoint_config*,
+        trevrpc_msquic_accepted_connection*,
+        trevrpc_rpc_transport_handle*);
 } trevrpc_rpc_transport_ops;
 
 struct trevrpc_rpc_transport {
@@ -227,6 +265,22 @@ static inline int trevrpc_rpc_transport_event_get_info(trevrpc_rpc_transport* tr
     const trevrpc_rpc_transport_event* event,
     trevrpc_rpc_transport_event_info* info) {
     return transport->ops->event_get_info(event, info);
+}
+static inline int trevrpc_rpc_transport_event_get_admission_info(trevrpc_rpc_transport* transport,
+    const trevrpc_rpc_transport_event* event,
+    trevrpc_rpc_transport_admission_info* info) {
+    return transport->ops->event_get_admission_info != NULL ? transport->ops->event_get_admission_info(event, info)
+                                                            : -ENOTSUP;
+}
+static inline int trevrpc_rpc_transport_event_get_protocol_info(trevrpc_rpc_transport* transport,
+    const trevrpc_rpc_transport_event* event,
+    trevrpc_rpc_transport_event_protocol_info* info) {
+    return transport->ops->event_get_protocol_info != NULL ? transport->ops->event_get_protocol_info(event, info)
+                                                           : -ENOTSUP;
+}
+static inline int trevrpc_rpc_transport_admission_respond(
+    trevrpc_rpc_transport* transport, const trevrpc_rpc_transport_event* event, uint16_t status) {
+    return transport->ops->admission_respond != NULL ? transport->ops->admission_respond(event, status) : -ENOTSUP;
 }
 static inline void trevrpc_rpc_transport_event_release(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_event* event) {
@@ -287,6 +341,17 @@ static inline int trevrpc_rpc_transport_stream_receive(
 static inline int trevrpc_rpc_transport_stream_finish_send(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream) {
     return transport->ops->stream_finish_send(transport, stream);
+}
+static inline int trevrpc_rpc_transport_stream_abort_receive(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
+    return transport->ops->stream_abort_receive != NULL
+               ? transport->ops->stream_abort_receive(transport, stream, error_code)
+               : -ENOTSUP;
+}
+static inline int trevrpc_rpc_transport_stream_abort_send(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
+    return transport->ops->stream_abort_send != NULL ? transport->ops->stream_abort_send(transport, stream, error_code)
+                                                     : -ENOTSUP;
 }
 static inline int trevrpc_rpc_transport_stream_abort(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {

@@ -1,0 +1,13 @@
+prefix=@trevrpc_pc_prefix@
+exec_prefix=${prefix}
+libdir=@trevrpc_pc_libdir@
+includedir=@trevrpc_pc_includedir@
+trevrpc_transport_msquic_abi_version=@TREVRPC_TRANSPORT_MSQUIC_ABI_VERSION@
+
+Name: trevrpc_transport_msquic
+Description: TrevRPC MsQuic native, HTTP/3, and WebTransport companion
+Version: @PROJECT_VERSION@
+Requires: trevrpc_transport = @PROJECT_VERSION@ trevrpc_engine_msquic = @PROJECT_VERSION@
+Libs: -L${libdir} -ltrevrpc_transport_msquic
+Libs.private: -L@trevrpc_transport_private_pc_libdir@ -ltrevrpc_transport_msquic_private -ltrevrpc_transport_private_msquic_native -ltrevrpc_transport_private_protocol -ltrevrpc_transport_private_core -L${libdir} -ltrevrpc_msquic_api_owner -lmsquic @CMAKE_THREAD_LIBS_INIT@
+Cflags: -I${includedir}

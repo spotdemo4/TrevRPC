@@ -1,3 +1,0 @@
-trevrpc_rpc_transport_engine_adopt
-trevrpc_rpc_transport_h3_create
-trevrpc_rpc_transport_msquic_adopt

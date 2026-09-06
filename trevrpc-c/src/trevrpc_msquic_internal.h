@@ -6,6 +6,9 @@
 #include "trevrpc_msquic_features_internal.h"
 #include "trevrpc_owned_bytes_internal.h"
 
+#include <errno.h>
+#include <stdbool.h>
+
 #define TREV_MSQUIC_CONN_EVENT_CONNECTED 0u
 #define TREV_MSQUIC_CONN_EVENT_SHUTDOWN_COMPLETE 1u
 #define TREV_MSQUIC_CONN_EVENT_LOCAL_ADDRESS_CHANGED 2u
@@ -25,6 +28,29 @@ typedef void (*trevrpc_msquic_conn_observer)(void* context, const trevrpc_msquic
 typedef void (*trevrpc_msquic_wake_observer)(void* context);
 typedef trevrpc_msquic_wake_observer trevrpc_msquic_listener_observer;
 typedef trevrpc_msquic_wake_observer trevrpc_msquic_stream_start_observer;
+typedef void (*trevrpc_msquic_endpoint_lease_release)(void* lease);
+
+typedef struct trevrpc_msquic_accepted_connection {
+    trevrpc_msquic_listener* listener;
+    void* connection;
+    void* registration;
+    void* configuration;
+    const uint8_t* negotiated_alpn;
+    size_t negotiated_alpn_len;
+    void* endpoint_lease;
+    trevrpc_msquic_endpoint_lease_release endpoint_lease_release;
+    bool claimed;
+} trevrpc_msquic_accepted_connection;
+
+typedef enum trevrpc_msquic_accept_disposition {
+    TREV_MSQUIC_ACCEPT_FALLTHROUGH = 0,
+    TREV_MSQUIC_ACCEPT_ADOPTED = 1,
+    TREV_MSQUIC_ACCEPT_REJECTED = 2,
+} trevrpc_msquic_accept_disposition;
+
+typedef trevrpc_msquic_accept_disposition (*trevrpc_msquic_accept_dispatch)(
+    void* context, trevrpc_msquic_accepted_connection* accepted);
+typedef void (*trevrpc_msquic_context_destroy)(void* context);
 
 typedef struct trevrpc_msquic_receive_policy {
     size_t max_stream_owned_bytes;
@@ -99,6 +125,57 @@ int trevrpc_msquic_listen_alpns_features_with_receive_policy(const char* host,
     const trevrpc_msquic_feature_request* features,
     const trevrpc_msquic_receive_policy* receive_policy,
     trevrpc_msquic_listener** out_listener);
+int trevrpc_msquic_listen_alpns_features_with_dispatch(const char* host,
+    uint16_t port,
+    const trevrpc_msquic_config* config,
+    const trevrpc_msquic_alpn* alpns,
+    size_t alpns_len,
+    const trevrpc_msquic_feature_request* features,
+    const trevrpc_msquic_receive_policy* receive_policy,
+    trevrpc_msquic_accept_dispatch dispatch,
+    void* dispatch_context,
+    trevrpc_msquic_context_destroy dispatch_context_destroy,
+    trevrpc_msquic_listener** out_listener);
+static inline int trevrpc_msquic_accepted_connection_get_native(trevrpc_msquic_accepted_connection* accepted,
+    void** out_connection,
+    void** out_registration,
+    void** out_configuration) {
+    if (accepted == NULL || out_connection == NULL || out_registration == NULL || out_configuration == NULL ||
+        accepted->claimed)
+        return EINVAL;
+    *out_connection = accepted->connection;
+    *out_registration = accepted->registration;
+    *out_configuration = accepted->configuration;
+    return 0;
+}
+static inline int trevrpc_msquic_accepted_connection_take_endpoint_lease(trevrpc_msquic_accepted_connection* accepted,
+    void** out_lease,
+    trevrpc_msquic_endpoint_lease_release* out_release) {
+    if (accepted == NULL || out_lease == NULL || out_release == NULL || accepted->claimed ||
+        accepted->endpoint_lease == NULL || accepted->endpoint_lease_release == NULL)
+        return EINVAL;
+    *out_lease = accepted->endpoint_lease;
+    *out_release = accepted->endpoint_lease_release;
+    accepted->endpoint_lease = NULL;
+    accepted->endpoint_lease_release = NULL;
+    return 0;
+}
+static inline int trevrpc_msquic_accepted_connection_get_alpn(
+    const trevrpc_msquic_accepted_connection* accepted, const uint8_t** out_alpn, size_t* out_alpn_len) {
+    if (accepted == NULL || out_alpn == NULL || out_alpn_len == NULL)
+        return EINVAL;
+    *out_alpn = accepted->negotiated_alpn;
+    *out_alpn_len = accepted->negotiated_alpn_len;
+    return 0;
+}
+static inline int trevrpc_msquic_accepted_connection_claim_raw(trevrpc_msquic_accepted_connection* accepted) {
+    if (accepted == NULL || accepted->claimed)
+        return EINVAL;
+    accepted->claimed = true;
+    return 0;
+}
+int trevrpc_msquic_accepted_connection_wrap(
+    trevrpc_msquic_accepted_connection* accepted, trevrpc_msquic_conn** out_connection);
 trevrpc_msquic_provider_features trevrpc_msquic_provider_features_current(void);
 int trevrpc_msquic_conn_feature_snapshot(trevrpc_msquic_conn* conn, trevrpc_msquic_feature_snapshot* snapshot);
 int trevrpc_msquic_listener_set_observer(
@@ -151,6 +228,8 @@ intptr_t trevrpc_msquic_stream_write_raw_with_completion(trevrpc_msquic_stream* 
     trevrpc_msquic_send_completion** completion);
 int trevrpc_msquic_send_completion_status(trevrpc_msquic_send_completion* completion);
 int trevrpc_msquic_stream_abort_with_error(trevrpc_msquic_stream* stream, uint64_t error_code);
+int trevrpc_msquic_stream_abort_receive_with_error(trevrpc_msquic_stream* stream, uint64_t error_code);
+int trevrpc_msquic_stream_abort_send_with_error(trevrpc_msquic_stream* stream, uint64_t error_code);
 void trevrpc_msquic_stream_close_immediate(trevrpc_msquic_stream* stream);
 /* These ownership-transfer helpers return immediately after scheduling native teardown. */
 void trevrpc_msquic_stream_close_deferred_owned(trevrpc_msquic_stream* stream, bool immediate);

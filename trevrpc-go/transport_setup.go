@@ -78,10 +78,7 @@ func Listen(addr string, server *Server, options ListenOptions) (ServerListener,
 		return nil, err
 	}
 	if backend == TransportBackendNative {
-		if options.TLSConfig != nil || options.QUICConfig != nil {
-			return nil, InvalidArgument("native listener does not accept legacy TLSConfig or QUICConfig")
-		}
-		return nil, nativeBackendUnavailable()
+		return newNativeQUICServerListener(addr, server, options)
 	}
 	tlsConfig, err := legacyServerTLSConfig(options.TLSConfig, cloneTransportCredentials(options.Credentials))
 	if err != nil {

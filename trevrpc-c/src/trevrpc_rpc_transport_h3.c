@@ -57,13 +57,22 @@
 #define H3_PENDING_START 0x00000040u
 #define H3_PENDING_OPEN_CONNECT 0x00000080u
 #define H3_PENDING_ACCEPT_CONNECT 0x00000100u
+#define H3_PENDING_REEMIT_READABLE 0x00000200u
 
 typedef struct h3_entry h3_entry;
+typedef struct h3_source h3_source;
 
 struct trevrpc_rpc_transport_event {
     struct trevrpc_rpc_transport_event* next;
     trevrpc_rpc_transport_event_info info;
+    trevrpc_rpc_transport_admission_info admission;
+    trevrpc_rpc_transport_header_field* admission_headers;
+    uint8_t* admission_storage;
+    h3_source* source;
+    trevrpc_rpc_transport_handle admission_stream;
+    uint32_t protocol;
     h3_entry* terminal_entry;
+    bool admission_decided;
     bool mandatory;
 };
 
@@ -86,8 +95,6 @@ typedef struct h3_endpoint_copy {
     uint8_t* ca_cert_data;
     trevrpc_rpc_transport_endpoint_config value;
 } h3_endpoint_copy;
-
-typedef struct h3_source h3_source;
 
 static _Thread_local h3_entry* h3_processing_entry;
 
@@ -120,6 +127,9 @@ typedef struct h3_stream_state {
     bool classified;
     bool recv_fin;
     bool send_fin;
+    bool recv_aborted;
+    bool send_aborted;
+    bool peer_reset;
     bool fin_reported;
     bool control;
     bool settings_received;
@@ -134,14 +144,22 @@ typedef struct h3_stream_state {
     bool wt_wait_session;
     bool frame_unexpected;
     bool receive_blocked;
+    bool event_blocked;
+    bool admission_pending;
+    bool admission_rejected;
     trevrpc_msquic_send_completion* pending_completion;
     uint64_t pending_operation_id;
+    uint64_t local_abort_error;
+    uint64_t peer_reset_error;
     size_t pending_send_bytes;
     uint64_t unresolved_deadline_nanos;
     uint64_t unresolved_abort_error;
     int unresolved_error;
     bool unresolved_counted;
     bool provider_bytes_selected;
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+    bool ready_bypass;
+#endif
 } h3_stream_state;
 
 struct h3_entry {
@@ -237,13 +255,23 @@ struct h3_source {
 #ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
     size_t event_alloc_budget;
     uint64_t monotonic_nanos;
+    uint16_t last_rejection_status;
+    size_t rejection_count;
+    size_t acceptance_count;
     bool monotonic_override;
+    bool capture_rejections;
+    bool capture_acceptances;
 #endif
 };
 
 static atomic_uint_fast64_t h3_owner_sequence = ATOMIC_VAR_INIT(UINT64_C(0x100000));
 
 static void h3_free_entry(h3_entry* entry);
+static void h3_decode_peer_reset_locked(h3_source* source,
+    h3_entry* entry,
+    uint64_t provider_error,
+    uint64_t* application_error,
+    uint64_t* diagnostic_error);
 
 static trevrpc_rpc_transport_event* h3_event_node_alloc(h3_source* source) {
     (void)source;
@@ -258,6 +286,8 @@ static trevrpc_rpc_transport_event* h3_event_node_alloc(h3_source* source) {
 
 static void h3_event_node_free(trevrpc_rpc_transport_event** node) {
     if (node != NULL && *node != NULL) {
+        free((*node)->admission_headers);
+        free((*node)->admission_storage);
         free(*node);
         *node = NULL;
     }
@@ -318,6 +348,7 @@ static void h3_unpin_object_locked(h3_source* source, h3_entry* entry) {
 static void h3_schedule_waiting_wt_locked(h3_source* source, const h3_entry* connection);
 static h3_entry* h3_find_retired_locked(h3_source* source, trevrpc_rpc_transport_handle handle);
 static void h3_schedule_connection_waiters_locked(h3_source* source, const h3_entry* connection);
+static void h3_emit_stream_readable_locked(h3_source* source, h3_entry* entry);
 static void h3_maybe_emit_stream_ready_locked(h3_source* source, h3_entry* stream);
 static void h3_maybe_publish_stopped_locked(h3_source* source);
 
@@ -452,6 +483,10 @@ static char* h3_str_copy(const char* value, uint32_t length) {
         return NULL;
     if (value == NULL)
         return NULL;
+#if SIZE_MAX <= UINT32_MAX
+    if (length == UINT32_MAX)
+        return NULL;
+#endif
     result = malloc((size_t)length + 1u);
     if (result == NULL)
         return NULL;
@@ -596,6 +631,8 @@ static bool h3_stream_waits_for_resolution_locked(h3_source* source, h3_entry* e
     h3_entry* parent;
     if (!entry->live || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM)
         return false;
+    if (entry->stream.admission_pending)
+        return true;
     parent = h3_parent_connection_locked(source, entry);
     if (parent == NULL)
         return false;
@@ -956,6 +993,17 @@ static int h3_emit_locked(h3_source* source,
         }
         reserved_event = h3_event_node_alloc(source);
     }
+    if (reserved_event != NULL) {
+        h3_entry* protocol_entry = owner;
+        if (protocol_entry == NULL && !h3_handle_equal(parent, (trevrpc_rpc_transport_handle){0})) {
+            protocol_entry = h3_find_any_locked(source, parent);
+            if (protocol_entry == NULL)
+                protocol_entry = h3_find_retired_locked(source, parent);
+        }
+        reserved_event->source = source;
+        if (protocol_entry != NULL)
+            reserved_event->protocol = protocol_entry->endpoint.value.protocol;
+    }
     {
         int result = h3_publish_locked(source, &info, reserved_event, mandatory, terminal_entry);
         if (result == 0) {
@@ -1006,15 +1054,24 @@ static void h3_maybe_emit_stream_closed_locked(h3_entry* entry) {
         (entry->stream.action != TREV_H3_DEMUX_ACTION_REQUEST &&
             entry->stream.action != TREV_H3_DEMUX_ACTION_WEBTRANSPORT))
         return;
-    if (h3_emit_locked(source,
+    bool aborted = entry->stream.recv_aborted || entry->stream.send_aborted || entry->stream.peer_reset;
+    uint64_t application_error = aborted ? entry->stream.local_abort_error : 0;
+    uint64_t diagnostic_error = 0;
+    if (entry->stream.peer_reset)
+        h3_decode_peer_reset_locked(
+            source, entry, entry->stream.peer_reset_error, &application_error, &diagnostic_error);
+    if (h3_emit_with_provider_locked(source,
             TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED,
-            entry->side_flags | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLEAN_FIN,
-            0,
+            entry->side_flags | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL |
+                (entry->stream.peer_reset ? TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET : 0) |
+                (aborted ? 0 : TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLEAN_FIN),
+            aborted ? -ECANCELED : 0,
             TREVRPC_RPC_TRANSPORT_OBJECT_STREAM,
             h3_handle(entry),
             entry->parent,
             0,
-            0) == 0) {
+            application_error,
+            diagnostic_error) == 0) {
         entry->close_reported = true;
         h3_mark_dead_locked(entry);
     } else {
@@ -1025,6 +1082,15 @@ static void h3_maybe_emit_stream_closed_locked(h3_entry* entry) {
 
 static bool h3_is_webtransport(const h3_entry* entry) {
     return entry->endpoint.value.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT;
+}
+
+static bool h3_is_multiplexed(const h3_entry* entry) {
+    return entry->endpoint.value.protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED;
+}
+
+static bool h3_allows_webtransport(const h3_entry* entry) {
+    return h3_is_webtransport(entry) || (h3_is_multiplexed(entry) && entry->endpoint.value.webtransport_profiles != 0 &&
+                                            entry->endpoint.value.max_sessions != 0);
 }
 
 static int h3_monotonic_nanos(uint64_t* out) {
@@ -1145,6 +1211,21 @@ static void h3_schedule_receive_retries_locked(h3_source* source) {
         h3_signal_locked(source);
 }
 
+static void h3_schedule_event_retries_locked(h3_source* source) {
+    size_t i;
+    bool signaled = false;
+    for (i = 0; i < source->entry_capacity; ++i) {
+        h3_entry* entry = source->entries[i].entry;
+        if (entry == NULL || !entry->live || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM ||
+            !entry->stream.event_blocked || entry->stream.parse_len == 0)
+            continue;
+        entry->pending |= H3_PENDING_READABLE;
+        signaled = true;
+    }
+    if (signaled)
+        h3_signal_locked(source);
+}
+
 static void h3_schedule_connection_waiters_locked(h3_source* source, const h3_entry* connection) {
     trevrpc_rpc_transport_handle parent = h3_handle(connection);
     size_t i;
@@ -1154,8 +1235,10 @@ static void h3_schedule_connection_waiters_locked(h3_source* source, const h3_en
             continue;
         if (entry->live && entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM && entry->parent.owner == parent.owner &&
             entry->parent.slot == parent.slot && entry->parent.generation == parent.generation &&
-            entry->stream.headers_received)
+            entry->stream.headers_received) {
+            h3_maybe_emit_stream_ready_locked(source, entry);
             entry->pending |= H3_PENDING_READABLE;
+        }
     }
     h3_signal_locked(source);
 }
@@ -1163,6 +1246,7 @@ static void h3_schedule_connection_waiters_locked(h3_source* source, const h3_en
 static void h3_maybe_emit_stream_ready_locked(h3_source* source, h3_entry* stream) {
     h3_entry* connection;
     if (!stream->live || stream->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM || stream->stream.ready_reported ||
+        stream->stream.admission_pending || stream->stream.admission_rejected || stream->stream.headers_sending ||
         !stream->stream.headers_received || stream->stream.connect_control ||
         (stream->side_flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) == 0 ||
         (stream->stream.action != TREV_H3_DEMUX_ACTION_REQUEST &&
@@ -1179,10 +1263,12 @@ static void h3_maybe_emit_stream_ready_locked(h3_source* source, h3_entry* strea
             h3_handle(stream),
             stream->parent,
             stream->operation_id,
-            0) == 0)
+            0) == 0) {
         stream->stream.ready_reported = true;
-    else
+        h3_emit_stream_readable_locked(source, stream);
+    } else {
         h3_signal_locked(source);
+    }
 }
 
 static void h3_schedule_profile_waiters_locked(h3_source* source, const h3_entry* connection) {
@@ -1192,11 +1278,12 @@ static void h3_schedule_profile_waiters_locked(h3_source* source, const h3_entry
         h3_entry* entry = source->entries[i].entry;
         if (entry == NULL)
             continue;
-        if (entry->live && entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM && entry->parent.owner == parent.owner &&
-            entry->parent.slot == parent.slot && entry->parent.generation == parent.generation &&
-            !entry->stream.classified && entry->stream.classifier_initialized)
+        if (entry->live && entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM &&
+            h3_handle_equal(entry->parent, parent) &&
+            ((!entry->stream.classified && entry->stream.classifier_initialized) || entry->stream.parse_len != 0))
             entry->pending |= H3_PENDING_READABLE;
     }
+    h3_signal_locked(source);
 }
 
 static bool h3_profile_enabled(uint32_t profiles, trevrpc_wt_profile_id profile) {
@@ -1218,7 +1305,7 @@ static bool h3_profile_enabled(uint32_t profiles, trevrpc_wt_profile_id profile)
 
 static void h3_maybe_emit_connection_ready_locked(h3_entry* entry) {
     if (!entry->live || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION || entry->ready_reported ||
-        !entry->connected || !entry->local_control_ready || !entry->peer_settings_ready ||
+        h3_is_multiplexed(entry) || !entry->connected || !entry->local_control_ready || !entry->peer_settings_ready ||
         (h3_is_webtransport(entry) && !entry->wt_session_ready))
         return;
     if (h3_emit_locked(entry->source,
@@ -1264,6 +1351,15 @@ static void h3_listener_observer(void* context) {
     if (entry->live)
         entry->pending |= H3_PENDING_ACCEPT;
     h3_signal_locked(source);
+    pthread_mutex_unlock(&source->mutex);
+}
+
+static void h3_reschedule_accept(h3_source* source, h3_entry* entry) {
+    pthread_mutex_lock(&source->mutex);
+    if (entry->live) {
+        entry->pending |= H3_PENDING_ACCEPT;
+        h3_signal_locked(source);
+    }
     pthread_mutex_unlock(&source->mutex);
 }
 
@@ -1353,7 +1449,7 @@ static int h3_admit_peer_stream_locked(h3_source* source,
     trevrpc_h3_demux_direction direction,
     h3_entry** out_entry,
     bool* out_quota_rejected) {
-    bool unresolved = h3_is_webtransport(parent) && !parent->wt_session_ready;
+    bool unresolved = h3_allows_webtransport(parent) && !parent->wt_session_ready;
     uint64_t now = 0;
     h3_entry* entry;
     int result;
@@ -1429,10 +1525,11 @@ static int h3_send_control(h3_entry* entry) {
     size_t prefix_len = 0;
     size_t i;
     int result;
-    if (h3_is_webtransport(entry)) {
+    if (h3_allows_webtransport(entry)) {
         bool advertised = false;
+        size_t webtransport_settings_start = settings_count;
         settings[settings_count++] = (trevrpc_h3_settings_pair){TREV_WT_PROFILE_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1};
-        if (trevrpc_msquic_feature_snapshot_usable_datagrams(&entry->capabilities))
+        if (trevrpc_msquic_feature_snapshot_negotiated_datagrams(&entry->capabilities))
             settings[settings_count++] = (trevrpc_h3_settings_pair){TREV_WT_PROFILE_SETTINGS_H3_DATAGRAM, 1};
         for (i = 0; i < sizeof(profiles) / sizeof(profiles[0]); ++i) {
             trevrpc_wt_profile_setting_pair materialized[4];
@@ -1460,8 +1557,15 @@ static int h3_send_control(h3_entry* entry) {
             }
             advertised = true;
         }
-        if (!advertised)
-            return -ENOTSUP;
+        if (!advertised) {
+            /*
+             * A multiplexed listener must still accept an ordinary HTTP/3
+             * peer that did not negotiate the QUIC features required by any
+             * enabled WebTransport profile. Keep this connection's SETTINGS
+             * truthful and let a separate capable connection select WT.
+             */
+            settings_count = webtransport_settings_start;
+        }
     }
     if (trevrpc_h3_settings_build(settings, settings_count, settings_payload, sizeof(settings_payload), &payload_len) !=
         TREV_H3_SETTINGS_OK)
@@ -1551,6 +1655,42 @@ static int h3_build_request_headers(
     if (result == 0)
         *out_len = encoder.length;
     return result;
+}
+
+static int h3_build_status_headers(uint16_t status, uint8_t* output, size_t capacity, size_t* out_len) {
+    uint8_t digits[3] = {
+        (uint8_t)('0' + status / 100u),
+        (uint8_t)('0' + (status / 10u) % 10u),
+        (uint8_t)('0' + status % 10u),
+    };
+    trevrpc_qpack_static_encoder encoder;
+    int result = trevrpc_qpack_static_encoder_init(&encoder, output, capacity);
+    if (result == 0)
+        result = trevrpc_qpack_static_encoder_put_literal_name_reference(&encoder, 24, digits, sizeof(digits));
+    if (result == 0)
+        *out_len = encoder.length;
+    return result;
+}
+
+static int h3_send_rejection_response(trevrpc_msquic_stream* stream, uint16_t status) {
+    uint8_t block[64];
+    uint8_t prefix[16];
+    uint8_t frame[sizeof(prefix) + sizeof(block)];
+    size_t block_len = 0;
+    size_t prefix_len = 0;
+    intptr_t written;
+    int result = h3_build_status_headers(status, block, sizeof(block), &block_len);
+    if (result != 0)
+        return result;
+    if (trevrpc_h3_frame_prefix_build(TREV_H3_FRAME_HEADERS, block_len, prefix, sizeof(prefix), &prefix_len) !=
+        TREV_H3_FRAME_OK)
+        return -EINVAL;
+    memcpy(frame, prefix, prefix_len);
+    memcpy(frame + prefix_len, block, block_len);
+    written = trevrpc_msquic_stream_write_fin(stream, frame, prefix_len + block_len);
+    if (written < 0)
+        return (int)written;
+    return (size_t)written == prefix_len + block_len ? 0 : -EPIPE;
 }
 
 static int h3_build_response_headers(uint8_t* output, size_t capacity, size_t* out_len) {
@@ -1675,7 +1815,7 @@ static int h3_append_bytes(uint8_t** target, size_t* length, size_t* capacity, c
     size_t needed, capacity_new;
     if (len == 0)
         return 0;
-    if (data == NULL || *length > H3_MAX_PARSE_BUFFER - len)
+    if (data == NULL || len > H3_MAX_PARSE_BUFFER || *length > H3_MAX_PARSE_BUFFER - len)
         return -EMSGSIZE;
     needed = *length + len;
     if (needed > *capacity) {
@@ -1731,8 +1871,9 @@ static int h3_negotiate_peer_locked(h3_source* source, h3_entry* connection) {
     int result;
     if (!connection->peer_settings_received || !connection->local_control_ready)
         return 0;
-    if (!h3_is_webtransport(connection)) {
+    if (!h3_allows_webtransport(connection)) {
         connection->peer_settings_ready = true;
+        h3_schedule_profile_waiters_locked(source, connection);
         h3_maybe_emit_connection_ready_locked(connection);
         return 0;
     }
@@ -1740,14 +1881,15 @@ static int h3_negotiate_peer_locked(h3_source* source, h3_entry* connection) {
     h3_filter_peer_profiles(&settings, connection->endpoint.value.webtransport_profiles);
     role = (connection->side_flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT) != 0 ? TREV_WT_ROLE_CLIENT
                                                                                    : TREV_WT_ROLE_SERVER;
-    result = trevrpc_wt_profile_negotiate(role, &settings, &connection->capabilities, true, &connection->negotiation);
+    result = trevrpc_wt_profile_negotiate(
+        role, &settings, &connection->capabilities, h3_is_webtransport(connection), &connection->negotiation);
     if (result != 0)
         return -EPROTO;
     connection->peer_settings = settings;
-    connection->profile_resolved = true;
+    connection->profile_resolved = connection->negotiation.profile != TREV_WT_PROFILE_NONE;
     connection->peer_settings_ready = true;
     h3_schedule_profile_waiters_locked(source, connection);
-    if (role == TREV_WT_ROLE_CLIENT && !connection->connect_open_started)
+    if (h3_is_webtransport(connection) && role == TREV_WT_ROLE_CLIENT && !connection->connect_open_started)
         connection->pending |= H3_PENDING_OPEN_CONNECT;
     h3_maybe_emit_connection_ready_locked(connection);
     h3_signal_locked(source);
@@ -1802,8 +1944,8 @@ static int h3_parse_control_locked(h3_source* source, h3_entry* entry, bool fin)
                     max_field_section_size,
                     seen_ids,
                     seen_capacity,
-                    h3_is_webtransport(connection) ? h3_apply_peer_setting : NULL,
-                    h3_is_webtransport(connection) ? &parsed_settings : NULL,
+                    h3_allows_webtransport(connection) ? h3_apply_peer_setting : NULL,
+                    h3_allows_webtransport(connection) ? &parsed_settings : NULL,
                     &report);
                 free(seen_ids);
                 if (status != TREV_H3_SETTINGS_OK)
@@ -1875,12 +2017,63 @@ static size_t h3_max_field_section_size(const h3_entry* connection) {
     return configured > SIZE_MAX ? SIZE_MAX : (size_t)configured;
 }
 
+static int h3_copy_admission_headers(trevrpc_rpc_transport_event* event, const trevrpc_qpack_field_section* section) {
+    size_t bytes = 0;
+    size_t index;
+    uint8_t* cursor;
+    if (event == NULL)
+        return 0;
+    for (index = 0; index < section->field_count; ++index) {
+        const trevrpc_qpack_field* field = &section->fields[index];
+        if (field->name.len > SIZE_MAX - bytes || field->value.len > SIZE_MAX - bytes - field->name.len)
+            return -EOVERFLOW;
+        bytes += field->name.len + field->value.len;
+    }
+    if (section->field_count > SIZE_MAX / sizeof(*event->admission_headers))
+        return -EOVERFLOW;
+    if (section->field_count != 0)
+        event->admission_headers = calloc(section->field_count, sizeof(*event->admission_headers));
+    event->admission_storage = malloc(bytes != 0 ? bytes : 1u);
+    if ((section->field_count != 0 && event->admission_headers == NULL) || event->admission_storage == NULL)
+        return -ENOMEM;
+    cursor = event->admission_storage;
+    for (index = 0; index < section->field_count; ++index) {
+        const trevrpc_qpack_field* field = &section->fields[index];
+        trevrpc_rpc_transport_header_field* copy = &event->admission_headers[index];
+        copy->name = cursor;
+        copy->name_len = field->name.len;
+        memcpy(cursor, field->name.data, field->name.len);
+        cursor += field->name.len;
+        copy->value = cursor;
+        copy->value_len = field->value.len;
+        memcpy(cursor, field->value.data, field->value.len);
+        cursor += field->value.len;
+        if (trevrpc_qpack_field_name_equal(field, (const uint8_t*)":method", 7)) {
+            event->admission.method = copy->value;
+            event->admission.method_len = copy->value_len;
+        } else if (trevrpc_qpack_field_name_equal(field, (const uint8_t*)":path", 5)) {
+            event->admission.path = copy->value;
+            event->admission.path_len = copy->value_len;
+        } else if (trevrpc_qpack_field_name_equal(field, (const uint8_t*)":authority", 10)) {
+            event->admission.authority = copy->value;
+            event->admission.authority_len = copy->value_len;
+        } else if (trevrpc_qpack_field_name_equal(field, (const uint8_t*)"origin", 6)) {
+            event->admission.origin = copy->value;
+            event->admission.origin_len = copy->value_len;
+        }
+    }
+    event->admission.headers = event->admission_headers;
+    event->admission.header_count = section->field_count;
+    return 0;
+}
+
 static int h3_validate_headers(const uint8_t* encoded,
     size_t encoded_len,
     trevrpc_http3_header_block_kind kind,
     const h3_entry* connection,
     bool connect_control,
-    bool* out_connect) {
+    bool* out_connect,
+    trevrpc_rpc_transport_event* admission_event) {
     static const uint8_t root_path[] = "/";
     size_t max_field_section_size = h3_max_field_section_size(connection);
     trevrpc_qpack_field_section section;
@@ -1932,8 +2125,14 @@ static int h3_validate_headers(const uint8_t* encoded,
         goto done;
     if (trevrpc_qpack_bytes_equal(field->value, (const uint8_t*)"CONNECT", sizeof("CONNECT") - 1u)) {
         const trevrpc_qpack_field* path;
-        if (connection == NULL || !h3_is_webtransport(connection) || !connection->profile_resolved)
+        if (out_connect != NULL)
+            *out_connect = true;
+        if (connection == NULL || !h3_allows_webtransport(connection))
             goto done;
+        if (!connection->profile_resolved) {
+            result = connection->peer_settings_ready ? -EPROTO : -EAGAIN;
+            goto done;
+        }
         field = h3_find_header(&section, ":protocol");
         if (field == NULL || !h3_wt_protocol_valid(field->value, connection->negotiation.profile))
             goto done;
@@ -1995,8 +2194,36 @@ static int h3_validate_headers(const uint8_t* encoded,
         goto done;
     result = 0;
 done:
+    if (result == 0 && kind == TREV_HTTP3_HEADERS_REQUEST && admission_event != NULL)
+        result = h3_copy_admission_headers(admission_event, &section);
     trevrpc_qpack_field_section_release(&section);
     return result;
+}
+
+static bool h3_stream_can_emit_readable_locked(const h3_entry* entry) {
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+    if (entry->stream.ready_bypass)
+        return true;
+#endif
+    return entry->stream.ready_reported;
+}
+
+static void h3_emit_stream_readable_locked(h3_source* source, h3_entry* entry) {
+    if (!entry->live || !h3_stream_can_emit_readable_locked(entry) || entry->stream.admission_pending ||
+        entry->stream.admission_rejected || entry->stream.receive_head == NULL)
+        return;
+    if (h3_emit_locked(source,
+            TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE,
+            entry->side_flags,
+            0,
+            TREVRPC_RPC_TRANSPORT_OBJECT_STREAM,
+            h3_handle(entry),
+            entry->parent,
+            0,
+            0) != 0) {
+        entry->pending |= H3_PENDING_REEMIT_READABLE;
+        h3_signal_locked(source);
+    }
 }
 
 static int h3_queue_receive_locked(h3_source* source, h3_entry* entry, const uint8_t* data, size_t len) {
@@ -2030,22 +2257,8 @@ static int h3_queue_receive_locked(h3_source* source, h3_entry* entry, const uin
         source->peak_receive_owned_count = source->receive_owned_count;
     if (source->receive_owned_bytes > source->peak_receive_owned_bytes)
         source->peak_receive_owned_bytes = source->receive_owned_bytes;
-    result = h3_emit_locked(source,
-        TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE,
-        entry->side_flags,
-        0,
-        TREVRPC_RPC_TRANSPORT_OBJECT_STREAM,
-        h3_handle(entry),
-        entry->parent,
-        0,
-        0);
-    if (result != 0) {
-        /* The receive remains owned by the stream.  Keep a level-triggered
-         * retry pending instead of dropping the only readability indication. */
-        entry->pending |= H3_PENDING_READABLE;
-        h3_signal_locked(source);
-        result = 0;
-    }
+    h3_emit_stream_readable_locked(source, entry);
+    result = 0;
     (void)previous_tail;
     return result;
 }
@@ -2058,6 +2271,8 @@ static int h3_parse_rpc_locked(h3_source* source, h3_entry* entry, const uint8_t
     size_t available_count;
     size_t available_bytes;
     size_t body_len;
+    uint64_t max_frame_size =
+        entry->endpoint.value.max_frame_size != 0 ? entry->endpoint.value.max_frame_size : H3_DEFAULT_MAX_FRAME;
     int result = h3_append_bytes(&entry->stream.rpc, &entry->stream.rpc_len, &entry->stream.rpc_cap, data, len);
     if (result != 0)
         return result;
@@ -2068,7 +2283,8 @@ static int h3_parse_rpc_locked(h3_source* source, h3_entry* entry, const uint8_t
     while (entry->stream.rpc_len - cursor >= 4u) {
         body_len = ((size_t)entry->stream.rpc[cursor] << 24) | ((size_t)entry->stream.rpc[cursor + 1] << 16) |
                    ((size_t)entry->stream.rpc[cursor + 2] << 8) | entry->stream.rpc[cursor + 3];
-        if (body_len > source->config.max_receive_owned_bytes) {
+        if ((uint64_t)body_len > max_frame_size || body_len > source->config.max_receive_owned_bytes ||
+            body_len > SIZE_MAX - 4u) {
             entry->stream.rpc_len = original_len;
             return -EMSGSIZE;
         }
@@ -2209,6 +2425,54 @@ static int h3_finish_connect_capsules_locked(h3_source* source, h3_entry* entry)
     return -EPROTO;
 }
 
+static int h3_select_connection_protocol_locked(
+    h3_source* source, h3_entry* connection, h3_entry* stream, bool is_connect) {
+    uint32_t selected;
+    trevrpc_rpc_transport_handle parent;
+    size_t i;
+    if (connection == NULL || stream == NULL)
+        return -ESTALE;
+    if (!h3_is_multiplexed(connection))
+        return is_connect == h3_is_webtransport(connection) ? 0 : -EPROTO;
+    if (!connection->peer_settings_ready || (is_connect && !connection->profile_resolved))
+        return -EAGAIN;
+    selected = is_connect ? TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT : TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3;
+    connection->endpoint.value.protocol = selected;
+    parent = h3_handle(connection);
+    for (i = 0; i < source->entry_capacity; ++i) {
+        h3_entry* child = source->entries[i].entry;
+        if (child != NULL && child->live && child->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM &&
+            h3_handle_equal(child->parent, parent))
+            child->endpoint.value.protocol = selected;
+    }
+    stream->endpoint.value.protocol = selected;
+    h3_maybe_emit_connection_ready_locked(connection);
+    return 0;
+}
+
+static int h3_publish_admission_locked(h3_source* source,
+    h3_entry* stream,
+    const h3_entry* connection,
+    trevrpc_rpc_transport_event* event,
+    bool is_connect) {
+    trevrpc_rpc_transport_event_info info = {0};
+    int result;
+    event->source = source;
+    event->admission_stream = h3_handle(stream);
+    event->protocol = is_connect ? TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT : TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3;
+    event->admission.protocol = event->protocol;
+    event->admission.listener = connection->parent;
+    info.kind =
+        is_connect ? TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION : TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION;
+    info.flags = stream->side_flags;
+    info.subject_kind = TREVRPC_RPC_TRANSPORT_OBJECT_NONE;
+    info.parent = stream->parent;
+    result = h3_publish_locked(source, &info, event, false, NULL);
+    if (result == 0)
+        stream->stream.admission_pending = true;
+    return result;
+}
+
 static int h3_parse_stream_locked(h3_source* source, h3_entry* entry, const uint8_t* data, size_t len, bool fin) {
     size_t offset = 0, consumed;
     uint64_t type, payload_len;
@@ -2230,7 +2494,9 @@ static int h3_parse_stream_locked(h3_source* source, h3_entry* entry, const uint
         if (type == TREV_H3_FRAME_HEADERS) {
             trevrpc_http3_header_block_kind kind;
             h3_entry* connection = h3_parent_connection_locked(source, entry);
+            trevrpc_rpc_transport_event* admission_event = NULL;
             bool is_connect = false;
+            bool defer_admission;
             if (connection == NULL) {
                 result = -ESTALE;
                 goto parsed;
@@ -2241,14 +2507,34 @@ static int h3_parse_stream_locked(h3_source* source, h3_entry* entry, const uint
             } else {
                 kind = TREV_HTTP3_HEADERS_TRAILERS;
             }
+            defer_admission = kind == TREV_HTTP3_HEADERS_REQUEST &&
+                              (connection->endpoint.value.flags & TREVRPC_RPC_TRANSPORT_ENDPOINT_DEFER_ADMISSION) != 0;
+            if (defer_admission) {
+                if (source->ordinary_depth >= source->config.event_capacity) {
+                    entry->stream.event_blocked = true;
+                    result = -EAGAIN;
+                    goto parsed;
+                }
+                entry->stream.event_blocked = false;
+                admission_event = h3_event_node_alloc(source);
+                if (admission_event == NULL) {
+                    result = -ENOMEM;
+                    goto parsed;
+                }
+            }
             result = h3_validate_headers(entry->stream.parse + consumed,
                 (size_t)payload_len,
                 kind,
                 connection,
                 entry->stream.connect_control,
-                &is_connect);
-            if (result != 0)
+                &is_connect,
+                admission_event);
+            if (result == 0 && kind == TREV_HTTP3_HEADERS_REQUEST)
+                result = h3_select_connection_protocol_locked(source, connection, entry, is_connect);
+            if (result != 0) {
+                h3_event_node_free(&admission_event);
                 goto parsed;
+            }
             if (!entry->stream.headers_received) {
                 entry->stream.headers_received = true;
                 if (is_connect) {
@@ -2262,21 +2548,34 @@ static int h3_parse_stream_locked(h3_source* source, h3_entry* entry, const uint
                         (connection->resolving_connect.owner != 0 &&
                             !h3_handle_equal(connection->resolving_connect, stream_handle))) {
                         result = -EPROTO;
+                        h3_event_node_free(&admission_event);
                         goto parsed;
                     }
                     result = h3_init_connect_capsules_locked(entry, connection);
-                    if (result != 0)
+                    if (result != 0) {
+                        h3_event_node_free(&admission_event);
                         goto parsed;
+                    }
                     connection->resolving_connect = stream_handle;
-                    entry->stream.connect_accept_pending = true;
-                    entry->pending |= H3_PENDING_ACCEPT_CONNECT;
-                    h3_signal_locked(source);
+                    entry->stream.connect_accept_pending = !defer_admission;
+                    if (!defer_admission) {
+                        entry->pending |= H3_PENDING_ACCEPT_CONNECT;
+                        h3_signal_locked(source);
+                    }
                 } else if (entry->stream.connect_control) {
                     connection->wt_session_ready = true;
                     h3_maybe_emit_connection_ready_locked(connection);
                     h3_schedule_waiting_wt_locked(source, connection);
-                } else if ((entry->side_flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) != 0) {
+                } else if ((entry->side_flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) != 0 && !defer_admission) {
                     h3_maybe_emit_stream_ready_locked(source, entry);
+                }
+                if (defer_admission) {
+                    result = h3_publish_admission_locked(source, entry, connection, admission_event, is_connect);
+                    if (result != 0) {
+                        h3_event_node_free(&admission_event);
+                        goto parsed;
+                    }
+                    admission_event = NULL;
                 }
             }
         } else if (type == TREV_H3_FRAME_DATA) {
@@ -2297,6 +2596,8 @@ static int h3_parse_stream_locked(h3_source* source, h3_entry* entry, const uint
             goto parsed;
         }
         offset = consumed + (size_t)payload_len;
+        if (entry->stream.admission_pending)
+            break;
     }
 parsed:
     if (offset != 0) {
@@ -2305,6 +2606,8 @@ parsed:
     }
     if (result != 0)
         return result;
+    if (entry->stream.admission_pending)
+        return 0;
     if (fin) {
         entry->stream.recv_fin = true;
         if (!entry->stream.headers_received || entry->stream.rpc_len != 0 || entry->stream.parse_len != 0)
@@ -2578,6 +2881,7 @@ static int h3_accept_connect(h3_source* source, h3_entry* stream) {
     if (connection != NULL && h3_handle_equal(connection->resolving_connect, stream_handle))
         connection->resolving_connect = (trevrpc_rpc_transport_handle){0};
     if (result == 0 && stream->live && connection != NULL && connection->live && !connection->wt_session_ready) {
+        stream->stream.admission_pending = false;
         connection->connect_stream_id = stream_id;
         connection->wt_session_ready = true;
         stream->stream.headers_sent = true;
@@ -2603,13 +2907,19 @@ static int h3_process_stream_readable(h3_source* source, h3_entry* entry) {
         pthread_mutex_unlock(&source->mutex);
         return -ESTALE;
     }
+    if (entry->stream.recv_aborted) {
+        h3_unpin_object_locked(source, entry);
+        pthread_mutex_unlock(&source->mutex);
+        return 0;
+    }
+    h3_maybe_emit_stream_ready_locked(source, entry);
     if (h3_stream_waits_for_resolution_locked(source, entry)) {
         pthread_mutex_unlock(&source->mutex);
         goto done;
     }
     pthread_mutex_unlock(&source->mutex);
     pthread_mutex_lock(&source->mutex);
-    if (entry->live &&
+    if (entry->live && !entry->stream.recv_aborted &&
         ((!entry->stream.classified && (entry->stream.parse_len != entry->stream.classifier_consumed ||
                                            entry->stream.classifier.phase == TREV_H3_DEMUX_WAIT_NEGOTIATED_PROFILE)) ||
             (entry->stream.classified && (entry->stream.parse_len != 0 || entry->stream.wt_wait_session)))) {
@@ -2628,21 +2938,26 @@ static int h3_process_stream_readable(h3_source* source, h3_entry* entry) {
     } else {
         pthread_mutex_unlock(&source->mutex);
     }
-    result = h3_select_provider_bytes_if_ready(source, entry, stream);
-    if (result != 0)
-        goto done;
     pthread_mutex_lock(&source->mutex);
     if (h3_stream_waits_for_resolution_locked(source, entry)) {
         pthread_mutex_unlock(&source->mutex);
         goto done;
     }
     pthread_mutex_unlock(&source->mutex);
+    result = h3_select_provider_bytes_if_ready(source, entry, stream);
+    if (result != 0)
+        goto done;
     for (;;) {
         size_t read_capacity = sizeof(buffer);
         bool wait_for_profile = false;
         bool wait_for_session = false;
+        bool wait_for_resolution = false;
         pthread_mutex_lock(&source->mutex);
-        if (entry->live && entry->stream.unresolved_counted && !entry->stream.classified)
+        if (!entry->live || entry->stream.recv_aborted) {
+            pthread_mutex_unlock(&source->mutex);
+            goto done;
+        }
+        if (entry->stream.unresolved_counted && !entry->stream.classified)
             read_capacity = 1;
         pthread_mutex_unlock(&source->mutex);
         intptr_t n = trevrpc_msquic_stream_read_protocol_ready(stream, buffer, read_capacity);
@@ -2652,7 +2967,7 @@ static int h3_process_stream_readable(h3_source* source, h3_entry* entry) {
             goto done;
         }
         pthread_mutex_lock(&source->mutex);
-        if (entry->live) {
+        if (entry->live && !entry->stream.recv_aborted) {
             h3_maybe_emit_stream_ready_locked(source, entry);
             result = entry->stream.classified
                          ? h3_process_classified_stream_locked(source, entry, buffer, n > 0 ? (size_t)n : 0, fin)
@@ -2662,23 +2977,23 @@ static int h3_process_stream_readable(h3_source* source, h3_entry* entry) {
                 wait_for_profile = parent != NULL && !parent->profile_resolved;
             }
             wait_for_session = entry->stream.wt_wait_session;
+            wait_for_resolution = h3_stream_waits_for_resolution_locked(source, entry);
         }
         pthread_mutex_unlock(&source->mutex);
-        if (result == 0) {
-            result = h3_select_provider_bytes_if_ready(source, entry, stream);
-        }
-        if (result == 0 && (wait_for_profile || wait_for_session))
+        if (result == 0 && (wait_for_profile || wait_for_session || wait_for_resolution))
             goto done;
+        if (result == 0)
+            result = h3_select_provider_bytes_if_ready(source, entry, stream);
         if (result == -EAGAIN) {
             pthread_mutex_lock(&source->mutex);
-            if (entry->live)
+            if (entry->live && !entry->stream.recv_aborted)
                 entry->stream.receive_blocked = true;
             h3_unpin_object_locked(source, entry);
             pthread_mutex_unlock(&source->mutex);
             return 0;
         }
         pthread_mutex_lock(&source->mutex);
-        if (entry->live)
+        if (entry->live && !entry->stream.recv_aborted)
             entry->stream.receive_blocked = false;
         pthread_mutex_unlock(&source->mutex);
         if (result == -ENOTSUP)
@@ -2909,6 +3224,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                 if (child == NULL) {
                     pthread_mutex_unlock(&source->mutex);
                     trevrpc_msquic_conn_shutdown_error(conn, H3_APP_INTERNAL_ERROR);
+                    h3_reschedule_accept(source, entry);
                     break;
                 }
                 result = h3_endpoint_copy_make(&entry->endpoint.value, &child->endpoint);
@@ -2923,6 +3239,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                     h3_detach_entry_locked(child);
                     pthread_mutex_unlock(&source->mutex);
                     h3_close_entry_object(child);
+                    h3_reschedule_accept(source, entry);
                     break;
                 }
             } else {
@@ -2934,6 +3251,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                 result = trevrpc_msquic_stream_id(stream, &stream_id);
                 if (result != 0) {
                     trevrpc_msquic_stream_close(stream);
+                    h3_reschedule_accept(source, entry);
                     break;
                 }
                 direction = trevrpc_h3_demux_stream_id_is_unidirectional(stream_id) ? TREV_H3_DEMUX_UNIDIRECTIONAL
@@ -2953,6 +3271,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                         trevrpc_msquic_stream_close(stream);
                     if (quota_rejected)
                         continue;
+                    h3_reschedule_accept(source, entry);
                     break;
                 }
                 result = h3_install_stream(source, child);
@@ -2961,10 +3280,17 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                     h3_detach_entry_locked(child);
                     pthread_mutex_unlock(&source->mutex);
                     h3_close_entry_object(child);
+                    h3_reschedule_accept(source, entry);
                     break;
                 }
             }
         }
+    }
+    if (entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM && (pending & H3_PENDING_REEMIT_READABLE) != 0) {
+        pthread_mutex_lock(&source->mutex);
+        if (entry->live)
+            h3_emit_stream_readable_locked(source, entry);
+        pthread_mutex_unlock(&source->mutex);
     }
     if (stream_error == 0 && entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM &&
         (pending & (H3_PENDING_READABLE | H3_PENDING_TERMINAL)) != 0)
@@ -2972,15 +3298,62 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
     if (entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM && (pending & H3_PENDING_TERMINAL) != 0) {
         trevrpc_msquic_stream_state_snapshot state;
         int state_result = trevrpc_msquic_stream_state(entry->object, &state);
-        if (state_result != 0 || state.shutdown_complete || state.error_code != 0)
+        if (state_result != 0) {
             stream_object_terminal = true;
-        if (state_result == 0 && state.peer_send_aborted) {
-            peer_reset = true;
-            peer_error = state.peer_send_error;
-        } else if (state_result == 0 && state.peer_receive_aborted && state.recv_fin) {
-            stream_object_terminal = true;
-            peer_reset = true;
-            peer_error = state.peer_receive_error;
+        } else {
+            bool explained_receive_abort = state.peer_send_aborted && state.error_code == TREV_MSQUIC_ERR_CLOSED;
+            if (state.peer_send_aborted) {
+                uint64_t application_error = 0;
+                uint64_t diagnostic_error = 0;
+                peer_reset = true;
+                peer_error = state.peer_send_error;
+                if (stream_error == TREV_MSQUIC_ERR_CLOSED)
+                    stream_error = 0;
+                pthread_mutex_lock(&source->mutex);
+                if (entry->live) {
+                    entry->stream.peer_reset = true;
+                    entry->stream.peer_reset_error = state.peer_send_error;
+                }
+                if (entry->live && !entry->stream.fin_reported) {
+                    entry->stream.recv_fin = true;
+                    h3_decode_peer_reset_locked(
+                        source, entry, state.peer_send_error, &application_error, &diagnostic_error);
+                    if (h3_emit_with_provider_locked(source,
+                            TREVRPC_RPC_TRANSPORT_EVENT_RECEIVE_FIN,
+                            entry->side_flags | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL |
+                                TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET,
+                            -ECANCELED,
+                            TREVRPC_RPC_TRANSPORT_OBJECT_STREAM,
+                            h3_handle(entry),
+                            entry->parent,
+                            0,
+                            application_error,
+                            diagnostic_error) == 0)
+                        entry->stream.fin_reported = true;
+                    else {
+                        entry->pending |= H3_PENDING_TERMINAL;
+                        h3_signal_locked(source);
+                    }
+                    h3_maybe_emit_stream_closed_locked(entry);
+                }
+                pthread_mutex_unlock(&source->mutex);
+            }
+            if (state.peer_receive_aborted) {
+                peer_reset = true;
+                peer_error = state.peer_receive_error;
+                pthread_mutex_lock(&source->mutex);
+                if (entry->live) {
+                    entry->stream.send_fin = true;
+                    entry->stream.send_aborted = true;
+                    entry->stream.peer_reset = true;
+                    if (!state.peer_send_aborted)
+                        entry->stream.peer_reset_error = state.peer_receive_error;
+                    h3_maybe_emit_stream_closed_locked(entry);
+                }
+                pthread_mutex_unlock(&source->mutex);
+            }
+            if (state.shutdown_complete || (state.error_code != 0 && !explained_receive_abort))
+                stream_object_terminal = true;
         }
     }
     if (pending & H3_PENDING_SEND_COMPLETE) {
@@ -3027,6 +3400,18 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                     trevrpc_msquic_send_completion_free(completion);
             }
         }
+    }
+    if (entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM && entry->stream.admission_rejected &&
+        ((pending & H3_PENDING_TERMINAL) != 0 || stream_error != 0 || stream_object_terminal)) {
+        pthread_mutex_lock(&source->mutex);
+        h3_entry* parent = h3_parent_connection_locked(source, entry);
+        trevrpc_rpc_transport_handle stream_handle = h3_handle(entry);
+        if (parent != NULL && h3_handle_equal(parent->resolving_connect, stream_handle))
+            parent->resolving_connect = (trevrpc_rpc_transport_handle){0};
+        h3_detach_entry_locked(entry);
+        pthread_mutex_unlock(&source->mutex);
+        h3_close_entry_object(entry);
+        return;
     }
     if (entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM && entry->stream.connect_control &&
         (stream_error != 0 || stream_object_terminal)) {
@@ -3120,7 +3505,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                     entry->kind,
                     h3_handle(entry),
                     entry->parent,
-                    0,
+                    entry->operation_id,
                     application_error,
                     diagnostic_error) == 0)
                 h3_mark_dead_locked(entry);
@@ -3139,6 +3524,21 @@ static bool h3_has_pending_locked(const h3_source* source) {
     for (i = 0; i < source->entry_capacity; ++i) {
         if (source->entries[i].entry != NULL && source->entries[i].entry->live &&
             source->entries[i].entry->pending != 0)
+            return true;
+    }
+    return false;
+}
+
+static bool h3_has_multiplexed_request_retry_locked(h3_source* source) {
+    size_t i;
+    for (i = 0; i < source->entry_capacity; ++i) {
+        h3_entry* entry = source->entries[i].entry;
+        h3_entry* parent;
+        if (entry == NULL || !entry->live || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM ||
+            (entry->pending & H3_PENDING_READABLE) == 0 || !entry->stream.classified || entry->stream.parse_len == 0)
+            continue;
+        parent = h3_parent_connection_locked(source, entry);
+        if (parent != NULL && h3_is_multiplexed(parent) && parent->peer_settings_ready)
             return true;
     }
     return false;
@@ -3209,6 +3609,11 @@ static int h3_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_transport
     }
     h3_process_pending(source);
     pthread_mutex_lock(&source->mutex);
+    bool retry_multiplexed_request = source->event_head == NULL && h3_has_multiplexed_request_retry_locked(source);
+    pthread_mutex_unlock(&source->mutex);
+    if (retry_multiplexed_request)
+        h3_process_pending(source);
+    pthread_mutex_lock(&source->mutex);
     event = source->event_head;
     if (event == NULL) {
         if (!h3_has_pending_locked(source) &&
@@ -3233,6 +3638,7 @@ static int h3_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_transport
     if (!event->mandatory) {
         assert(source->ordinary_depth != 0);
         --source->ordinary_depth;
+        h3_schedule_event_retries_locked(source);
     }
     ++source->events_dequeued;
     if (event->terminal_entry != NULL) {
@@ -3251,8 +3657,163 @@ static int h3_event_get_info(const trevrpc_rpc_transport_event* event, trevrpc_r
     *info = event->info;
     return 0;
 }
+
+static int h3_event_get_admission_info(
+    const trevrpc_rpc_transport_event* event, trevrpc_rpc_transport_admission_info* info) {
+    if (event == NULL || info == NULL)
+        return -EINVAL;
+    if (event->info.kind != TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION &&
+        event->info.kind != TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION)
+        return -ENOTSUP;
+    *info = event->admission;
+    return 0;
+}
+
+static int h3_event_get_protocol_info(
+    const trevrpc_rpc_transport_event* event, trevrpc_rpc_transport_event_protocol_info* info) {
+    if (event == NULL || info == NULL)
+        return -EINVAL;
+    if (event->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_AUTO)
+        return -ENOTSUP;
+    info->protocol = event->protocol;
+    return 0;
+}
+
+static int h3_admission_respond(const trevrpc_rpc_transport_event* event_const, uint16_t status) {
+    trevrpc_rpc_transport_event* event = (trevrpc_rpc_transport_event*)event_const;
+    h3_source* source;
+    h3_entry* stream;
+    h3_entry* pinned_stream = NULL;
+    trevrpc_msquic_stream* object = NULL;
+    bool accept;
+    bool connect;
+    bool response_attempted = false;
+    int result = 0;
+    if (event == NULL || (status != 200 && (status < 400 || status > 599)))
+        return -EINVAL;
+    if (event->info.kind != TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION &&
+        event->info.kind != TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION)
+        return -ENOTSUP;
+    source = event->source;
+    if (source == NULL)
+        return -ESTALE;
+    pthread_mutex_lock(&source->mutex);
+    if (event->admission_decided) {
+        pthread_mutex_unlock(&source->mutex);
+        return -EALREADY;
+    }
+    event->admission_decided = true;
+    stream = h3_find_locked(source, event->admission_stream);
+    if (stream == NULL || stream->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM || !stream->stream.admission_pending) {
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    accept = status == 200;
+    connect = event->info.kind == TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION;
+    if (accept) {
+        if (connect) {
+            stream->stream.connect_accept_pending = true;
+            stream->pending |= H3_PENDING_ACCEPT_CONNECT | H3_PENDING_READABLE;
+            h3_signal_locked(source);
+            pthread_mutex_unlock(&source->mutex);
+            return 0;
+        }
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+        if (source->capture_acceptances) {
+            ++source->acceptance_count;
+            stream->stream.admission_pending = false;
+            stream->stream.headers_sent = true;
+            h3_maybe_emit_stream_ready_locked(source, stream);
+            stream->pending |= H3_PENDING_READABLE;
+            h3_signal_locked(source);
+            pthread_mutex_unlock(&source->mutex);
+            return 0;
+        }
+#endif
+        if (h3_pin_object_locked(source, stream, (void**)&object) != 0) {
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+            if (stream->object == NULL) {
+                stream->stream.admission_pending = false;
+                stream->stream.headers_sent = true;
+                h3_maybe_emit_stream_ready_locked(source, stream);
+                stream->pending |= H3_PENDING_READABLE;
+                h3_signal_locked(source);
+                pthread_mutex_unlock(&source->mutex);
+                return 0;
+            }
+#endif
+            stream->stream.admission_rejected = true;
+            stream->pending |= H3_PENDING_TERMINAL;
+            h3_signal_locked(source);
+            pthread_mutex_unlock(&source->mutex);
+            return -ESTALE;
+        }
+        pinned_stream = stream;
+        stream->stream.headers_sending = true;
+        pthread_mutex_unlock(&source->mutex);
+
+        result = h3_send_response_headers(stream);
+        if (result != 0)
+            (void)trevrpc_msquic_stream_abort_with_error(object, H3_APP_INTERNAL_ERROR);
+
+        pthread_mutex_lock(&source->mutex);
+        stream = h3_find_locked(source, event->admission_stream);
+        h3_unpin_object_locked(source, pinned_stream);
+        if (stream != NULL)
+            stream->stream.headers_sending = false;
+        if (result == 0 && stream != NULL) {
+            stream->stream.admission_pending = false;
+            stream->stream.headers_sent = true;
+            h3_maybe_emit_stream_ready_locked(source, stream);
+            stream->pending |= H3_PENDING_READABLE;
+            h3_signal_locked(source);
+        } else if (stream != NULL) {
+            stream->stream.admission_rejected = true;
+            stream->pending |= H3_PENDING_TERMINAL;
+            h3_signal_locked(source);
+        }
+        pthread_mutex_unlock(&source->mutex);
+        return result;
+    }
+    stream->stream.admission_rejected = true;
+    if (h3_pin_object_locked(source, stream, (void**)&object) != 0)
+        object = NULL;
+    else
+        pinned_stream = stream;
+    pthread_mutex_unlock(&source->mutex);
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+    pthread_mutex_lock(&source->mutex);
+    if (source->capture_rejections) {
+        source->last_rejection_status = status;
+        ++source->rejection_count;
+        response_attempted = true;
+    }
+    pthread_mutex_unlock(&source->mutex);
+#endif
+    if (!response_attempted && object != NULL) {
+        response_attempted = true;
+        result = h3_send_rejection_response(object, status);
+    }
+    pthread_mutex_lock(&source->mutex);
+    stream = h3_find_locked(source, event->admission_stream);
+    if (pinned_stream != NULL)
+        h3_unpin_object_locked(source, pinned_stream);
+    if (stream != NULL) {
+        stream->stream.send_fin = result == 0;
+        stream->pending |= H3_PENDING_TERMINAL;
+        h3_signal_locked(source);
+    }
+    pthread_mutex_unlock(&source->mutex);
+    return response_attempted ? result : -ESTALE;
+}
+
 static void h3_event_release(trevrpc_rpc_transport_event* event) {
-    free(event);
+    if (event == NULL)
+        return;
+    if (!event->admission_decided && (event->info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION ||
+                                         event->info.kind == TREVRPC_RPC_TRANSPORT_EVENT_WEBTRANSPORT_ADMISSION))
+        (void)h3_admission_respond(event, 500);
+    h3_event_node_free(&event);
 }
 static int h3_receive_get_info(const trevrpc_rpc_transport_receive* receive, trevrpc_rpc_transport_receive_info* info) {
     if (receive == NULL || info == NULL)
@@ -3295,6 +3856,13 @@ static int h3_get_diagnostics(trevrpc_rpc_transport* transport, trevrpc_rpc_tran
     return 0;
 }
 
+static int h3_validate_endpoint_sizes(const trevrpc_rpc_transport_endpoint_config* config) {
+    if (config->max_pending_send_bytes > SIZE_MAX || config->max_pending_receive_bytes > SIZE_MAX ||
+        config->max_frame_size > SIZE_MAX || config->unresolved_stream_bytes > SIZE_MAX)
+        return -EOVERFLOW;
+    return 0;
+}
+
 static void h3_msquic_config(const trevrpc_rpc_transport_endpoint_config* c, trevrpc_msquic_config* out) {
     memset(out, 0, sizeof(*out));
     out->alpn = (const char*)(c->alpn ? c->alpn : (const uint8_t*)"h3");
@@ -3315,22 +3883,62 @@ static void h3_msquic_config(const trevrpc_rpc_transport_endpoint_config* c, tre
     out->send_buffering_enabled = 1;
 }
 
-static int h3_endpoint_listen(trevrpc_rpc_transport* transport,
+static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
     const trevrpc_rpc_transport_endpoint_config* config,
+    trevrpc_msquic_accept_dispatch dispatch,
+    void* dispatch_context,
+    trevrpc_msquic_context_destroy dispatch_context_destroy,
     trevrpc_rpc_transport_handle* out) {
+    static const trevrpc_msquic_alpn shared_alpns[] = {
+        {.alpn = "trevrpc/1", .alpn_len = sizeof("trevrpc/1") - 1u},
+        {.alpn = "h3", .alpn_len = sizeof("h3") - 1u},
+    };
     h3_source* source = h3_from_base(transport);
     trevrpc_msquic_config ms;
     trevrpc_msquic_alpn alpn;
+    const trevrpc_msquic_alpn* alpns;
+    size_t alpn_count;
     trevrpc_msquic_listener* listener = NULL;
+    h3_endpoint_copy endpoint;
     h3_entry* entry;
     int result;
     trevrpc_msquic_feature_request features;
     trevrpc_msquic_receive_policy policy = {0};
     if (config == NULL || out == NULL ||
         (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3 &&
-            config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT))
+            config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT &&
+            config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED)) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
         return -ENOTSUP;
-    h3_msquic_config(config, &ms);
+    }
+    if ((config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) != (dispatch != NULL) ||
+        (dispatch == NULL) != (dispatch_context_destroy == NULL)) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
+        return -EINVAL;
+    }
+    if ((config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT ||
+            config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) &&
+        config->unresolved_stream_bytes != 0 &&
+        config->unresolved_stream_bytes < trevrpc_msquic_receive_minimum_raw_bytes()) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
+        return -EINVAL;
+    }
+    result = h3_validate_endpoint_sizes(config);
+    if (result != 0) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
+        return result;
+    }
+    result = h3_endpoint_copy_make(config, &endpoint);
+    if (result != 0) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
+        return result;
+    }
+    h3_msquic_config(&endpoint.value, &ms);
     alpn.alpn = ms.alpn;
     alpn.alpn_len = ms.alpn_len;
     features = trevrpc_msquic_default_h3_features();
@@ -3338,32 +3946,49 @@ static int h3_endpoint_listen(trevrpc_rpc_transport* transport,
     policy.max_stream_owned_count = config->max_pending_receive_count;
     policy.max_connection_owned_bytes = config->max_pending_receive_bytes;
     policy.max_connection_owned_count = config->max_pending_receive_count;
-    if (config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
+    if (config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT ||
+        config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) {
         policy.max_undecided_owned_bytes = config->unresolved_stream_bytes;
     }
-    result = trevrpc_msquic_listen_alpns_features_with_receive_policy(
-        config->host, config->port, &ms, &alpn, 1, &features, &policy, &listener);
-    if (result != 0)
-        return result;
+    alpns = config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED ? shared_alpns : &alpn;
+    alpn_count = config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED ? 2u : 1u;
     pthread_mutex_lock(&source->mutex);
     entry = h3_alloc_entry_locked(source,
         TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER,
         TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL,
-        listener,
+        NULL,
         (trevrpc_rpc_transport_handle){0});
+    pthread_mutex_unlock(&source->mutex);
     if (entry == NULL) {
-        pthread_mutex_unlock(&source->mutex);
-        trevrpc_msquic_listener_close(listener);
+        h3_endpoint_free(&endpoint);
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
         return -EAGAIN;
     }
-    result = h3_endpoint_copy_make(config, &entry->endpoint);
-    if (result != 0)
-        h3_detach_entry_locked(entry);
-    pthread_mutex_unlock(&source->mutex);
+    result = trevrpc_msquic_listen_alpns_features_with_dispatch(endpoint.value.host,
+        endpoint.value.port,
+        &ms,
+        alpns,
+        alpn_count,
+        &features,
+        &policy,
+        dispatch,
+        dispatch_context,
+        dispatch_context_destroy,
+        &listener);
     if (result != 0) {
+        pthread_mutex_lock(&source->mutex);
+        h3_detach_entry_locked(entry);
+        pthread_mutex_unlock(&source->mutex);
         h3_close_entry_object(entry);
+        h3_endpoint_free(&endpoint);
         return result;
     }
+    pthread_mutex_lock(&source->mutex);
+    entry->object = listener;
+    entry->endpoint = endpoint;
+    memset(&endpoint, 0, sizeof(endpoint));
+    pthread_mutex_unlock(&source->mutex);
     result = trevrpc_msquic_listener_set_observer(listener, h3_listener_observer, entry);
     if (result == 0) {
         pthread_mutex_lock(&source->mutex);
@@ -3383,6 +4008,22 @@ static int h3_endpoint_listen(trevrpc_rpc_transport* transport,
     }
     *out = h3_handle(entry);
     return 0;
+}
+
+static int h3_endpoint_listen(trevrpc_rpc_transport* transport,
+    const trevrpc_rpc_transport_endpoint_config* config,
+    trevrpc_rpc_transport_handle* out) {
+    return h3_endpoint_listen_impl(transport, config, NULL, NULL, NULL, out);
+}
+
+int trevrpc_rpc_transport_h3_listen_shared(trevrpc_rpc_transport* transport,
+    const trevrpc_rpc_transport_endpoint_config* config,
+    trevrpc_msquic_accept_dispatch dispatch,
+    void* dispatch_context,
+    trevrpc_msquic_context_destroy dispatch_context_destroy,
+    trevrpc_rpc_transport_handle* out_listener) {
+    return h3_endpoint_listen_impl(
+        transport, config, dispatch, dispatch_context, dispatch_context_destroy, out_listener);
 }
 
 static int h3_endpoint_get_port(
@@ -3417,13 +4058,23 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
     trevrpc_msquic_feature_request features;
     trevrpc_msquic_receive_policy policy = {0};
     trevrpc_msquic_conn* conn = NULL;
+    h3_endpoint_copy endpoint;
     h3_entry* entry;
     int result;
     if (config == NULL || out == NULL || operation_id == 0 ||
         (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3 &&
             config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT))
         return -ENOTSUP;
-    h3_msquic_config(config, &ms);
+    if (config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT && config->unresolved_stream_bytes != 0 &&
+        config->unresolved_stream_bytes < trevrpc_msquic_receive_minimum_raw_bytes())
+        return -EINVAL;
+    result = h3_validate_endpoint_sizes(config);
+    if (result != 0)
+        return result;
+    result = h3_endpoint_copy_make(config, &endpoint);
+    if (result != 0)
+        return result;
+    h3_msquic_config(&endpoint.value, &ms);
     features = trevrpc_msquic_default_h3_features();
     policy.max_stream_owned_bytes = config->max_pending_receive_bytes;
     policy.max_stream_owned_count = config->max_pending_receive_count;
@@ -3432,10 +4083,10 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
     if (config->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
         policy.max_undecided_owned_bytes = config->unresolved_stream_bytes;
     }
-    result = trevrpc_msquic_dial_start_observed_features_with_receive_policy(config->host,
-        config->port,
+    result = trevrpc_msquic_dial_start_observed_features_with_receive_policy(endpoint.value.host,
+        endpoint.value.port,
         &ms,
-        config->server_name_len != 0 ? config->server_name : NULL,
+        endpoint.value.server_name_len != 0 ? endpoint.value.server_name : NULL,
         &features,
         NULL,
         NULL,
@@ -3445,8 +4096,10 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
         NULL,
         &policy,
         &conn);
-    if (result != 0)
+    if (result != 0) {
+        h3_endpoint_free(&endpoint);
         return result;
+    }
     pthread_mutex_lock(&source->mutex);
     entry = h3_alloc_entry_locked(source,
         TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION,
@@ -3456,17 +4109,13 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
     if (entry == NULL) {
         pthread_mutex_unlock(&source->mutex);
         trevrpc_msquic_conn_close(conn);
+        h3_endpoint_free(&endpoint);
         return -EAGAIN;
     }
     entry->operation_id = operation_id;
-    result = h3_endpoint_copy_make(config, &entry->endpoint);
-    if (result != 0)
-        h3_detach_entry_locked(entry);
+    entry->endpoint = endpoint;
+    memset(&endpoint, 0, sizeof(endpoint));
     pthread_mutex_unlock(&source->mutex);
-    if (result != 0) {
-        h3_close_entry_object(entry);
-        return result;
-    }
     /* The callback context is installed after the entry has a stable address. */
     result = h3_install_conn(entry);
     if (result != 0) {
@@ -3543,14 +4192,23 @@ static int h3_stream_open(trevrpc_rpc_transport* transport,
     }
     entry = h3_alloc_entry_locked(source, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, side_flags, stream, connection);
     if (entry != NULL) {
-        entry->operation_id = operation_id;
-        entry->stream.action = webtransport ? TREV_H3_DEMUX_ACTION_WEBTRANSPORT : TREV_H3_DEMUX_ACTION_REQUEST;
-        entry->stream.classified = true;
+        result = h3_endpoint_copy_make(&parent->endpoint.value, &entry->endpoint);
+        if (result == 0) {
+            entry->operation_id = operation_id;
+            entry->stream.action = webtransport ? TREV_H3_DEMUX_ACTION_WEBTRANSPORT : TREV_H3_DEMUX_ACTION_REQUEST;
+            entry->stream.classified = true;
+        } else {
+            h3_detach_entry_locked(entry);
+        }
     }
     pthread_mutex_unlock(&source->mutex);
     if (entry == NULL) {
         trevrpc_msquic_stream_close(stream);
         return -EAGAIN;
+    }
+    if (result != 0) {
+        h3_close_entry_object(entry);
+        return result;
     }
     result = h3_install_stream(source, entry);
     if (result != 0) {
@@ -3577,6 +4235,7 @@ static int h3_stream_send(trevrpc_rpc_transport* transport,
     size_t a = 0, b = 0, c;
     bool send_response_headers;
     bool webtransport;
+    uint64_t max_frame_size;
     intptr_t result;
     if (operation_id == 0 || (body == NULL && body_len != 0))
         return -EINVAL;
@@ -3588,6 +4247,13 @@ static int h3_stream_send(trevrpc_rpc_transport* transport,
         h3_pin_object_locked(source, entry, (void**)&stream) != 0) {
         pthread_mutex_unlock(&source->mutex);
         return -ESTALE;
+    }
+    max_frame_size =
+        entry->endpoint.value.max_frame_size != 0 ? entry->endpoint.value.max_frame_size : H3_DEFAULT_MAX_FRAME;
+    if ((uint64_t)body_len > max_frame_size) {
+        h3_unpin_object_locked(source, entry);
+        pthread_mutex_unlock(&source->mutex);
+        return -EMSGSIZE;
     }
     if (entry->stream.pending_completion != NULL || entry->stream.headers_sending || entry->send_event != NULL) {
         h3_unpin_object_locked(source, entry);
@@ -3767,6 +4433,111 @@ static bool h3_request_stream_terminal_locked(h3_entry* entry) {
     entry->pending |= H3_PENDING_TERMINAL;
     h3_signal_locked(source);
     return true;
+}
+
+static void h3_discard_stream_receives_locked(h3_source* source, h3_entry* entry) {
+    trevrpc_rpc_transport_receive* receive;
+    while ((receive = entry->stream.receive_head) != NULL) {
+        entry->stream.receive_head = receive->next;
+        if (source->receive_owned_count != 0)
+            --source->receive_owned_count;
+        if (source->receive_owned_bytes >= receive->info.data_len)
+            source->receive_owned_bytes -= receive->info.data_len;
+        free(receive);
+    }
+    entry->stream.receive_tail = NULL;
+    free(entry->stream.parse);
+    entry->stream.parse = NULL;
+    entry->stream.parse_len = 0;
+    entry->stream.parse_cap = 0;
+    free(entry->stream.rpc);
+    entry->stream.rpc = NULL;
+    entry->stream.rpc_len = 0;
+    entry->stream.rpc_cap = 0;
+    entry->stream.receive_blocked = false;
+    entry->pending &= ~(H3_PENDING_READABLE | H3_PENDING_REEMIT_READABLE);
+    h3_schedule_receive_retries_locked(source);
+}
+
+static int h3_stream_abort_half(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint64_t code, bool receive) {
+    h3_source* source = h3_from_base(transport);
+    h3_entry* entry;
+    h3_entry* parent;
+    trevrpc_msquic_stream* stream = NULL;
+    uint64_t wire_code = H3_APP_REQUEST_CANCELLED;
+    uint64_t previous_abort_error;
+    bool previous_fin;
+    int result;
+
+    pthread_mutex_lock(&source->mutex);
+    entry = h3_find_locked(source, handle);
+    if (entry == NULL || h3_pin_object_locked(source, entry, (void**)&stream) != 0) {
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    if ((receive && entry->stream.recv_aborted) || (!receive && entry->stream.send_aborted)) {
+        h3_unpin_object_locked(source, entry);
+        pthread_mutex_unlock(&source->mutex);
+        return 0;
+    }
+    parent = h3_parent_connection_locked(source, entry);
+    if (parent != NULL && h3_is_webtransport(parent)) {
+        if (!parent->profile_resolved) {
+            h3_unpin_object_locked(source, entry);
+            pthread_mutex_unlock(&source->mutex);
+            return -EAGAIN;
+        }
+        result = trevrpc_wt_profile_encode_application_error(parent->negotiation.profile, code, &wire_code);
+        if (result != 0) {
+            h3_unpin_object_locked(source, entry);
+            pthread_mutex_unlock(&source->mutex);
+            return result;
+        }
+    }
+
+    previous_abort_error = entry->stream.local_abort_error;
+    if (receive) {
+        previous_fin = entry->stream.recv_fin;
+        entry->stream.recv_fin = true;
+        entry->stream.recv_aborted = true;
+        h3_discard_stream_receives_locked(source, entry);
+    } else {
+        previous_fin = entry->stream.send_fin;
+        entry->stream.send_fin = true;
+        entry->stream.send_aborted = true;
+    }
+    entry->stream.local_abort_error = code;
+    pthread_mutex_unlock(&source->mutex);
+
+    result = receive ? trevrpc_msquic_stream_abort_receive_with_error(stream, wire_code)
+                     : trevrpc_msquic_stream_abort_send_with_error(stream, wire_code);
+
+    pthread_mutex_lock(&source->mutex);
+    if (result != 0 && entry->live) {
+        if (receive) {
+            entry->stream.recv_fin = previous_fin;
+            entry->stream.recv_aborted = false;
+        } else {
+            entry->stream.send_fin = previous_fin;
+            entry->stream.send_aborted = false;
+        }
+        entry->stream.local_abort_error = previous_abort_error;
+    } else if (result == 0 && entry->live) {
+        h3_maybe_emit_stream_closed_locked(entry);
+    }
+    h3_unpin_object_locked(source, entry);
+    pthread_mutex_unlock(&source->mutex);
+    return result;
+}
+
+static int h3_stream_abort_receive(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint64_t code) {
+    return h3_stream_abort_half(transport, handle, code, true);
+}
+
+static int h3_stream_abort_send(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint64_t code) {
+    return h3_stream_abort_half(transport, handle, code, false);
 }
 
 static int h3_stream_abort(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint64_t code) {
@@ -4032,10 +4803,7 @@ static int h3_drain(trevrpc_rpc_transport* transport) {
     h3_source* source = h3_from_base(transport);
     h3_process_pending(source);
     pthread_mutex_lock(&source->mutex);
-    int result =
-        source->event_depth || (source->state == TREVRPC_RPC_TRANSPORT_STATE_STOPPING && !source->stop_event_published)
-            ? -EAGAIN
-            : 0;
+    int result = source->event_depth || source->state != TREVRPC_RPC_TRANSPORT_STATE_STOPPED ? -EAGAIN : 0;
     pthread_mutex_unlock(&source->mutex);
     return result;
 }
@@ -4119,7 +4887,7 @@ static void h3_destroy(trevrpc_rpc_transport* transport) {
         source->event_head = event->next;
         if (event->terminal_entry != NULL)
             h3_detach_entry_locked(event->terminal_entry);
-        free(event);
+        h3_event_node_free(&event);
     }
     source->event_tail = NULL;
     pthread_mutex_unlock(&source->mutex);
@@ -4155,6 +4923,8 @@ static const trevrpc_rpc_transport_ops h3_ops = {
     .stream_send = h3_stream_send,
     .stream_receive = h3_stream_receive,
     .stream_finish_send = h3_stream_finish_send,
+    .stream_abort_receive = h3_stream_abort_receive,
+    .stream_abort_send = h3_stream_abort_send,
     .stream_abort = h3_stream_abort,
     .stream_close = h3_stream_close,
     .connection_close = h3_connection_close,
@@ -4163,6 +4933,9 @@ static const trevrpc_rpc_transport_ops h3_ops = {
     .drain = h3_drain,
     .destroy = h3_destroy,
     .get_wake_sources = NULL,
+    .event_get_admission_info = h3_event_get_admission_info,
+    .event_get_protocol_info = h3_event_get_protocol_info,
+    .admission_respond = h3_admission_respond,
 };
 
 int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, trevrpc_rpc_transport** out_transport) {
@@ -4270,6 +5043,127 @@ int trevrpc_rpc_transport_h3_test_make_connection(
     return 0;
 }
 
+int trevrpc_rpc_transport_h3_test_make_server_connection(trevrpc_rpc_transport* transport,
+    trevrpc_rpc_transport_handle* out_listener,
+    trevrpc_rpc_transport_handle* out_connection) {
+    h3_source* source = h3_from_base(transport);
+    h3_entry* listener;
+    h3_entry* connection;
+    if (out_listener == NULL || out_connection == NULL)
+        return -EINVAL;
+    pthread_mutex_lock(&source->mutex);
+    listener = h3_alloc_entry_locked(source,
+        TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER,
+        TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL,
+        NULL,
+        (trevrpc_rpc_transport_handle){0});
+    connection = listener != NULL ? h3_alloc_entry_locked(source,
+                                        TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION,
+                                        TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER,
+                                        NULL,
+                                        h3_handle(listener))
+                                  : NULL;
+    if (connection != NULL) {
+        connection->endpoint.value.protocol = TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3;
+        connection->connected = true;
+        connection->local_control_ready = true;
+        connection->peer_settings_received = true;
+        connection->peer_settings_ready = true;
+        connection->start_reported = true;
+        connection->ready_reported = true;
+    } else if (listener != NULL) {
+        h3_detach_entry_locked(listener);
+    }
+    pthread_mutex_unlock(&source->mutex);
+    if (connection == NULL)
+        return -EAGAIN;
+    *out_listener = h3_handle(listener);
+    *out_connection = h3_handle(connection);
+    return 0;
+}
+
+int trevrpc_rpc_transport_h3_test_set_deferred_admission(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle connection, bool enabled) {
+    h3_source* source = h3_from_base(transport);
+    h3_entry* entry;
+    pthread_mutex_lock(&source->mutex);
+    entry = h3_find_locked(source, connection);
+    if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION) {
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    if (enabled)
+        entry->endpoint.value.flags |= TREVRPC_RPC_TRANSPORT_ENDPOINT_DEFER_ADMISSION;
+    else
+        entry->endpoint.value.flags &= ~TREVRPC_RPC_TRANSPORT_ENDPOINT_DEFER_ADMISSION;
+    pthread_mutex_unlock(&source->mutex);
+    return 0;
+}
+
+int trevrpc_rpc_transport_h3_test_set_connection_protocol(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle connection, uint32_t protocol) {
+    h3_source* source = h3_from_base(transport);
+    h3_entry* entry;
+    if (protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3 && protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT &&
+        protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED)
+        return -EINVAL;
+    pthread_mutex_lock(&source->mutex);
+    entry = h3_find_locked(source, connection);
+    if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION) {
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    entry->endpoint.value.protocol = protocol;
+    if (protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) {
+        entry->endpoint.value.webtransport_profiles = H3_WT_PROFILE_ALL_SUPPORTED;
+        entry->endpoint.value.max_sessions = 1;
+        entry->ready_reported = false;
+    }
+    pthread_mutex_unlock(&source->mutex);
+    return 0;
+}
+
+int trevrpc_rpc_transport_h3_test_set_multiplexed_webtransport(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle connection, bool enabled) {
+    h3_source* source = h3_from_base(transport);
+    h3_entry* entry;
+    pthread_mutex_lock(&source->mutex);
+    entry = h3_find_locked(source, connection);
+    if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION || !h3_is_multiplexed(entry)) {
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    entry->endpoint.value.webtransport_profiles = enabled ? H3_WT_PROFILE_ALL_SUPPORTED : 0;
+    entry->endpoint.value.max_sessions = enabled ? 1 : 0;
+    pthread_mutex_unlock(&source->mutex);
+    return 0;
+}
+
+int trevrpc_rpc_transport_h3_test_set_peer_settings_ready(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle connection, bool ready) {
+    h3_source* source = h3_from_base(transport);
+    h3_entry* entry;
+    pthread_mutex_lock(&source->mutex);
+    entry = h3_find_locked(source, connection);
+    if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION) {
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    entry->peer_settings_received = ready;
+    entry->peer_settings_ready = ready;
+    if (!ready) {
+        entry->ready_reported = false;
+        entry->profile_resolved = false;
+        memset(&entry->negotiation, 0, sizeof(entry->negotiation));
+    } else {
+        h3_maybe_emit_connection_ready_locked(entry);
+        h3_schedule_profile_waiters_locked(source, entry);
+    }
+    h3_signal_locked(source);
+    pthread_mutex_unlock(&source->mutex);
+    return 0;
+}
+
 int trevrpc_rpc_transport_h3_test_make_unresolved_webtransport_connection(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle* out_connection) {
     h3_source* source = h3_from_base(transport);
@@ -4325,6 +5219,7 @@ int trevrpc_rpc_transport_h3_test_adopt_peer_stream(trevrpc_rpc_transport* trans
             entry->stream.classified = true;
             entry->stream.headers_received = true;
             entry->stream.headers_sent = true;
+            entry->stream.ready_bypass = true;
             result = 0;
         } else {
             result = -EAGAIN;
@@ -4400,7 +5295,7 @@ int trevrpc_rpc_transport_h3_test_resolve_webtransport_profile(
         return -EINVAL;
     pthread_mutex_lock(&source->mutex);
     entry = h3_find_locked(source, connection);
-    if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION || !h3_is_webtransport(entry) ||
+    if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION || !h3_allows_webtransport(entry) ||
         entry->profile_resolved) {
         pthread_mutex_unlock(&source->mutex);
         return -ESTALE;
@@ -4483,6 +5378,35 @@ int trevrpc_rpc_transport_h3_test_make_peer_request_stream(trevrpc_rpc_transport
     return result;
 }
 
+int trevrpc_rpc_transport_h3_test_attach_stream_object(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, trevrpc_msquic_stream* object) {
+    h3_source* source = h3_from_base(transport);
+    h3_entry* entry;
+    int result;
+    if (object == NULL)
+        return -EINVAL;
+    pthread_mutex_lock(&source->mutex);
+    entry = h3_find_locked(source, stream);
+    if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM) {
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    if (entry->object != NULL) {
+        pthread_mutex_unlock(&source->mutex);
+        return -EALREADY;
+    }
+    entry->object = object;
+    pthread_mutex_unlock(&source->mutex);
+    result = h3_install_stream(source, entry);
+    if (result != 0) {
+        pthread_mutex_lock(&source->mutex);
+        if (entry->object == object)
+            entry->object = NULL;
+        pthread_mutex_unlock(&source->mutex);
+    }
+    return result;
+}
+
 int trevrpc_rpc_transport_h3_test_make_stream(trevrpc_rpc_transport* transport,
     trevrpc_rpc_transport_handle connection,
     trevrpc_rpc_transport_handle* out_stream) {
@@ -4508,6 +5432,7 @@ int trevrpc_rpc_transport_h3_test_make_stream(trevrpc_rpc_transport* transport,
         entry->stream.classified = true;
         entry->stream.headers_received = true;
         entry->stream.headers_sent = true;
+        entry->stream.ready_bypass = true;
     }
     pthread_mutex_unlock(&source->mutex);
     if (!entry)
@@ -4686,6 +5611,28 @@ int trevrpc_rpc_transport_h3_test_inject_data(trevrpc_rpc_transport* transport,
     pthread_mutex_unlock(&source->mutex);
     return result;
 }
+
+int trevrpc_rpc_transport_h3_test_retry_buffered_stream(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream) {
+    h3_source* source = h3_from_base(transport);
+    h3_entry* entry;
+    int result;
+    pthread_mutex_lock(&source->mutex);
+    entry = h3_find_locked(source, stream);
+    if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM || !entry->stream.classified) {
+        pthread_mutex_unlock(&source->mutex);
+        return -ESTALE;
+    }
+    entry->pending &= ~H3_PENDING_READABLE;
+    result = h3_process_classified_stream_locked(source, entry, NULL, 0, false);
+    if (result != 0 && result != -EAGAIN) {
+        entry->pending |= H3_PENDING_TERMINAL;
+        h3_signal_locked(source);
+    }
+    pthread_mutex_unlock(&source->mutex);
+    return result;
+}
+
 int trevrpc_rpc_transport_h3_test_emit(trevrpc_rpc_transport* transport,
     uint32_t kind,
     uint32_t flags,
@@ -4702,7 +5649,7 @@ int trevrpc_rpc_transport_h3_test_emit(trevrpc_rpc_transport* transport,
     pthread_mutex_lock(&source->mutex);
     previous_tail = source->event_tail;
     previous_enqueued = source->events_enqueued;
-    entry = h3_find_receive_locked(source, subject);
+    entry = h3_find_any_locked(source, subject);
     if (entry != NULL)
         subject_kind = entry->kind;
     result = h3_emit_locked(source, kind, flags, status, subject_kind, subject, parent, operation_id, 0);
@@ -4827,5 +5774,39 @@ void trevrpc_rpc_transport_h3_test_fail_event_alloc_after(
     pthread_mutex_lock(&source->mutex);
     source->event_alloc_budget = successful_allocations;
     pthread_mutex_unlock(&source->mutex);
+}
+
+void trevrpc_rpc_transport_h3_test_capture_acceptances(trevrpc_rpc_transport* transport, bool enabled) {
+    h3_source* source = h3_from_base(transport);
+    pthread_mutex_lock(&source->mutex);
+    source->capture_acceptances = enabled;
+    pthread_mutex_unlock(&source->mutex);
+}
+
+size_t trevrpc_rpc_transport_h3_test_acceptance_count(trevrpc_rpc_transport* transport) {
+    h3_source* source = h3_from_base(transport);
+    pthread_mutex_lock(&source->mutex);
+    size_t count = source->acceptance_count;
+    pthread_mutex_unlock(&source->mutex);
+    return count;
+}
+
+void trevrpc_rpc_transport_h3_test_capture_rejections(trevrpc_rpc_transport* transport, bool enabled) {
+    h3_source* source = h3_from_base(transport);
+    pthread_mutex_lock(&source->mutex);
+    source->capture_rejections = enabled;
+    pthread_mutex_unlock(&source->mutex);
+}
+
+int trevrpc_rpc_transport_h3_test_last_rejection(
+    trevrpc_rpc_transport* transport, uint16_t* out_status, size_t* out_count) {
+    h3_source* source = h3_from_base(transport);
+    if (out_status == NULL || out_count == NULL)
+        return -EINVAL;
+    pthread_mutex_lock(&source->mutex);
+    *out_status = source->last_rejection_status;
+    *out_count = source->rejection_count;
+    pthread_mutex_unlock(&source->mutex);
+    return 0;
 }
 #endif

@@ -1,0 +1,11 @@
+prefix=@trevrpc_pc_prefix@
+exec_prefix=${prefix}
+libdir=@trevrpc_pc_libdir@
+includedir=@trevrpc_pc_includedir@
+trevrpc_transport_abi_version=@TREVRPC_TRANSPORT_ABI_VERSION@
+
+Name: trevrpc_transport
+Description: TrevRPC provider-neutral native transport ABI
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ltrevrpc_transport
+Cflags: -I${includedir}

@@ -103,7 +103,21 @@ listener.Serve(ctx)
 `DialOptions.Backend` and `ListenOptions.Backend` accept `TransportBackendAuto`,
 `TransportBackendLegacy`, or `TransportBackendNative`. `Auto` resolves
 deterministically to the quic-go/webtransport-go Legacy backend in this release;
-it never probes or falls back at runtime. Explicit `Native` returns an actionable
-unavailable error until the native adapter is built. The `tls.Config`,
-`quic.Config`, and raw quic-go/webtransport-go APIs remain deprecated
-Legacy-only compatibility surfaces.
+it never probes or falls back at runtime.
+
+Build with the `trevrpc_native` tag and cgo on a supported target to enable the
+canonical C/MsQuic backend. With explicit `Native`, address targets use native
+QUIC and `https://` targets use WebTransport. A Native listener advertises native
+QUIC and, when enabled in `ServerOptions`, HTTP/3 and WebTransport on the same UDP
+port. Each native `h3` connection is classified by its first validated request as
+ordinary HTTP/3 or WebTransport; a connection cannot switch or mix those modes.
+Multiple ordinary POST requests remain supported, and separate HTTP/3 and
+WebTransport connections can coexist on the listener. Backend selection is fixed
+when the endpoint is created; Go continues to own reconnect generations and never
+replays an in-flight call.
+
+The `tls.Config`, `quic.Config`, arbitrary WebTransport request headers, custom
+WebTransport application protocols, and raw quic-go/webtransport-go APIs remain
+deprecated Legacy-only compatibility surfaces. Native selection rejects supplied
+Legacy-only options rather than silently ignoring them. Unsupported builds return
+an actionable native-backend-unavailable error.
