@@ -57,15 +57,15 @@ stdenv.mkDerivation (
         -DTREVRPC_BUILD_BENCHMARKS=${if legacyCompatibility then "OFF" else "ON"} \
         -DTREVRPC_BUILD_TESTS=${if legacyCompatibility then "OFF" else "ON"} \
         -DTREVRPC_BUILD_CODEGEN=${if legacyCompatibility then "OFF" else "ON"} \
-        -DTREVRPC_BUILD_ENGINE=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_ENGINE=ON \
         -DTREVRPC_BUILD_MSQUIC=${if legacyCompatibility then "ON" else "OFF"} \
         -DTREVRPC_BUILD_WEBTRANSPORT=${if legacyCompatibility then "ON" else "OFF"} \
         -DTREVRPC_BUILD_RUNTIME=${if legacyCompatibility then "ON" else "OFF"} \
-        -DTREVRPC_BUILD_ENGINE_MSQUIC=${if legacyCompatibility then "OFF" else "ON"} \
-        -DTREVRPC_BUILD_TRANSPORT=${if legacyCompatibility then "OFF" else "ON"} \
-        -DTREVRPC_BUILD_TRANSPORT_MSQUIC=${if legacyCompatibility then "OFF" else "ON"} \
-        -DTREVRPC_BUILD_RPC=${if legacyCompatibility then "OFF" else "ON"} \
-        -DTREVRPC_BUILD_RPC_MSQUIC=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_ENGINE_MSQUIC=ON \
+        -DTREVRPC_BUILD_TRANSPORT=ON \
+        -DTREVRPC_BUILD_TRANSPORT_MSQUIC=ON \
+        -DTREVRPC_BUILD_RPC=ON \
+        -DTREVRPC_BUILD_RPC_MSQUIC=ON \
         -DTREVRPC_ENABLE_SANITIZERS=${if sanitizers then "ON" else "OFF"} \
         -DTREVRPC_ENABLE_THREAD_SANITIZER=${if threadSanitizer then "ON" else "OFF"}
       runHook postConfigure

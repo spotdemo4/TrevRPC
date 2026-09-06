@@ -32,6 +32,9 @@ struct fake_transport {
     bool connection_closed;
     bool stream_closed;
     bool close_requested;
+    bool close_blocked;
+    bool close_entered;
+    bool close_release;
     bool diagnostics_blocked;
     bool diagnostics_entered;
     bool diagnostics_release;
@@ -56,6 +59,8 @@ struct fake_transport {
     int wake_sources_result;
     uint32_t wake_source_kind;
     atomic_int next_event_result;
+    atomic_int close_result;
+    atomic_int close_status;
     atomic_int poll_timeout_ms;
     atomic_uint_fast64_t poll_deadline_nanos;
     atomic_uint poll_timeout_fires;
@@ -76,6 +81,7 @@ struct fake_transport {
     atomic_uint stream_abort_send_calls;
     atomic_uint stream_abort_calls;
     atomic_uint stream_close_calls;
+    atomic_uint stream_open_calls;
     atomic_uint stream_send_calls;
     atomic_uint stream_finish_send_calls;
     atomic_uint admission_response_calls;
@@ -129,6 +135,7 @@ int fake_push_admission_event(fake_transport* transport,
     const uint8_t* origin,
     size_t origin_len);
 int fake_push_receive(fake_transport* transport, const uint8_t* data, size_t data_len);
+int fake_push_incoming_stream(fake_transport* transport, const uint8_t* data, size_t data_len);
 size_t fake_close_count(const fake_transport* transport);
 size_t fake_release_handle_count(const fake_transport* transport);
 

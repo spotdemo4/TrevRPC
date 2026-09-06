@@ -137,9 +137,57 @@ trevrpc_cpp_warnings(trevrpc_cpp_generated_service_test)
 trevrpc_cpp_sanitizers(trevrpc_cpp_generated_service_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_generated_service_test)
 add_test(NAME trevrpc_cpp_generated_service COMMAND trevrpc_cpp_generated_service_test)
-set_tests_properties(trevrpc_cpp_generated_service PROPERTIES TIMEOUT 30)
+set_tests_properties(trevrpc_cpp_generated_service PROPERTIES
+  RESOURCE_LOCK trevrpc_msquic_loopback
+  TIMEOUT 30)
 trevrpc_cpp_lsan_suppressions(trevrpc_cpp_generated_service)
 
+
+add_executable(trevrpc_cpp_rpc_event_runtime_test rpc_event_runtime_test.cpp)
+target_include_directories(trevrpc_cpp_rpc_event_runtime_test PRIVATE ../src)
+target_link_libraries(trevrpc_cpp_rpc_event_runtime_test PRIVATE trevrpc_cpp)
+trevrpc_cpp_warnings(trevrpc_cpp_rpc_event_runtime_test)
+trevrpc_cpp_sanitizers(trevrpc_cpp_rpc_event_runtime_test)
+trevrpc_cpp_test_assertions(trevrpc_cpp_rpc_event_runtime_test)
+add_test(NAME trevrpc_cpp_rpc_event_runtime COMMAND trevrpc_cpp_rpc_event_runtime_test)
+set_tests_properties(trevrpc_cpp_rpc_event_runtime PROPERTIES
+  RESOURCE_LOCK trevrpc_msquic_loopback
+  TIMEOUT 15)
+
+if(TARGET trevrpc_rpc_fake_transport_support)
+  add_executable(trevrpc_cpp_rpc_event_runtime_fake_test
+    rpc_event_runtime_fake_test.cpp
+    rpc_event_runtime_fake_fixture.c)
+  target_include_directories(trevrpc_cpp_rpc_event_runtime_fake_test PRIVATE
+    ../src
+    ../../trevrpc-c/src
+    ../../trevrpc-c/tests)
+  target_link_libraries(trevrpc_cpp_rpc_event_runtime_fake_test PRIVATE
+    trevrpc_cpp
+    trevrpc_rpc_fake_transport_support)
+  trevrpc_cpp_warnings(trevrpc_cpp_rpc_event_runtime_fake_test)
+  trevrpc_cpp_sanitizers(trevrpc_cpp_rpc_event_runtime_fake_test)
+  trevrpc_cpp_test_assertions(trevrpc_cpp_rpc_event_runtime_fake_test)
+  add_test(NAME trevrpc_cpp_rpc_event_runtime_fake
+    COMMAND trevrpc_cpp_rpc_event_runtime_fake_test)
+  set_tests_properties(trevrpc_cpp_rpc_event_runtime_fake PROPERTIES TIMEOUT 20)
+endif()
+
+add_executable(trevrpc_cpp_rpc_sync_client_test rpc_sync_client_test.cpp)
+add_dependencies(trevrpc_cpp_rpc_sync_client_test trevrpc_cpp_test_certificates)
+target_include_directories(trevrpc_cpp_rpc_sync_client_test PRIVATE ../src)
+target_compile_definitions(trevrpc_cpp_rpc_sync_client_test PRIVATE
+  TREVRPC_CPP_TEST_CERT="${trevrpc_cpp_test_cert}"
+  TREVRPC_CPP_TEST_KEY="${trevrpc_cpp_test_key}")
+target_link_libraries(trevrpc_cpp_rpc_sync_client_test PRIVATE trevrpc_cpp_test_generated)
+trevrpc_cpp_warnings(trevrpc_cpp_rpc_sync_client_test)
+trevrpc_cpp_sanitizers(trevrpc_cpp_rpc_sync_client_test)
+trevrpc_cpp_test_assertions(trevrpc_cpp_rpc_sync_client_test)
+add_test(NAME trevrpc_cpp_rpc_sync_client COMMAND trevrpc_cpp_rpc_sync_client_test)
+set_tests_properties(trevrpc_cpp_rpc_sync_client PROPERTIES
+  RESOURCE_LOCK trevrpc_msquic_loopback
+  TIMEOUT 30)
+trevrpc_cpp_lsan_suppressions(trevrpc_cpp_rpc_sync_client)
 
 add_executable(trevrpc_cpp_async_core_test async_core_test.cpp)
 target_link_libraries(trevrpc_cpp_async_core_test PRIVATE trevrpc_cpp)
@@ -178,7 +226,9 @@ trevrpc_cpp_warnings(trevrpc_cpp_callbacks_test)
 trevrpc_cpp_sanitizers(trevrpc_cpp_callbacks_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_callbacks_test)
 add_test(NAME trevrpc_cpp_callbacks COMMAND trevrpc_cpp_callbacks_test)
-set_tests_properties(trevrpc_cpp_callbacks PROPERTIES TIMEOUT 20)
+set_tests_properties(trevrpc_cpp_callbacks PROPERTIES
+  RESOURCE_LOCK trevrpc_msquic_loopback
+  TIMEOUT 20)
 trevrpc_cpp_lsan_suppressions(trevrpc_cpp_callbacks)
 
 add_executable(trevrpc_cpp_server_lifecycle_test server_lifecycle_test.cpp)
@@ -192,7 +242,9 @@ trevrpc_cpp_warnings(trevrpc_cpp_server_lifecycle_test)
 trevrpc_cpp_sanitizers(trevrpc_cpp_server_lifecycle_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_server_lifecycle_test)
 add_test(NAME trevrpc_cpp_server_lifecycle COMMAND trevrpc_cpp_server_lifecycle_test)
-set_tests_properties(trevrpc_cpp_server_lifecycle PROPERTIES TIMEOUT 15)
+set_tests_properties(trevrpc_cpp_server_lifecycle PROPERTIES
+  RESOURCE_LOCK trevrpc_msquic_loopback
+  TIMEOUT 15)
 trevrpc_cpp_lsan_suppressions(trevrpc_cpp_server_lifecycle)
 
 add_executable(trevrpc_cpp_generated_async_service_test generated_async_service_test.cpp)
@@ -205,5 +257,7 @@ trevrpc_cpp_warnings(trevrpc_cpp_generated_async_service_test)
 trevrpc_cpp_sanitizers(trevrpc_cpp_generated_async_service_test)
 trevrpc_cpp_test_assertions(trevrpc_cpp_generated_async_service_test)
 add_test(NAME trevrpc_cpp_generated_async_service COMMAND trevrpc_cpp_generated_async_service_test)
-set_tests_properties(trevrpc_cpp_generated_async_service PROPERTIES TIMEOUT 30)
+set_tests_properties(trevrpc_cpp_generated_async_service PROPERTIES
+  RESOURCE_LOCK trevrpc_msquic_loopback
+  TIMEOUT 30)
 trevrpc_cpp_lsan_suppressions(trevrpc_cpp_generated_async_service)

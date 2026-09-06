@@ -235,28 +235,102 @@ int fake_push_admission_event(fake_transport* transport,
     return 0;
 }
 
-int fake_push_receive(fake_transport* transport, const uint8_t* data, size_t data_len) {
+static fake_receive* fake_receive_create(fake_transport* transport, const uint8_t* data, size_t data_len) {
     fake_receive* receive = calloc(1, sizeof(*receive));
     if (receive == NULL) {
-        return -ENOMEM;
+        return NULL;
     }
     if (data_len != 0) {
         receive->data = malloc(data_len);
         if (receive->data == NULL) {
             free(receive);
-            return -ENOMEM;
+            return NULL;
         }
         memcpy(receive->data, data, data_len);
     }
     receive->transport = transport;
     receive->data_len = data_len;
-    pthread_mutex_lock(&transport->mutex);
+    return receive;
+}
+
+static void fake_receive_enqueue_locked(fake_transport* transport, fake_receive* receive) {
     if (transport->stream_receive_tail != NULL) {
         transport->stream_receive_tail->next = receive;
     } else {
         transport->stream_receive_head = receive;
     }
     transport->stream_receive_tail = receive;
+}
+
+int fake_push_receive(fake_transport* transport, const uint8_t* data, size_t data_len) {
+    fake_receive* receive;
+    if (transport == NULL || (data == NULL && data_len != 0)) {
+        return -EINVAL;
+    }
+    receive = fake_receive_create(transport, data, data_len);
+    if (receive == NULL) {
+        return -ENOMEM;
+    }
+    pthread_mutex_lock(&transport->mutex);
+    fake_receive_enqueue_locked(transport, receive);
+    pthread_mutex_unlock(&transport->mutex);
+    return 0;
+}
+
+int fake_push_incoming_stream(fake_transport* transport, const uint8_t* data, size_t data_len) {
+    fake_receive* receive;
+    fake_event* ready;
+    fake_event* readable;
+    if (transport == NULL || (data == NULL && data_len != 0)) {
+        return -EINVAL;
+    }
+    receive = fake_receive_create(transport, data, data_len);
+    ready = calloc(1, sizeof(*ready));
+    readable = calloc(1, sizeof(*readable));
+    if (receive == NULL || ready == NULL || readable == NULL) {
+        if (receive != NULL) {
+            free(receive->data);
+            free(receive);
+        }
+        free(ready);
+        free(readable);
+        return -ENOMEM;
+    }
+
+    ready->transport = transport;
+    ready->info.kind = TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY;
+    ready->info.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER;
+    ready->info.subject_kind = TREVRPC_RPC_TRANSPORT_OBJECT_STREAM;
+    ready->info.subject = fake_stream_handle;
+    ready->info.parent = fake_listener_handle;
+    readable->transport = transport;
+    readable->info.kind = TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE;
+    readable->info.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER;
+    readable->info.subject_kind = TREVRPC_RPC_TRANSPORT_OBJECT_STREAM;
+    readable->info.subject = fake_stream_handle;
+    readable->info.parent = fake_listener_handle;
+
+    pthread_mutex_lock(&transport->mutex);
+    if (transport->event_count > FAKE_EVENT_CAPACITY - 2u) {
+        pthread_mutex_unlock(&transport->mutex);
+        free(receive->data);
+        free(receive);
+        free(ready);
+        free(readable);
+        return -EAGAIN;
+    }
+    fake_receive_enqueue_locked(transport, receive);
+    transport->events[transport->event_tail] = ready;
+    transport->event_tail = (transport->event_tail + 1u) % FAKE_EVENT_CAPACITY;
+    transport->events[transport->event_tail] = readable;
+    transport->event_tail = (transport->event_tail + 1u) % FAKE_EVENT_CAPACITY;
+    transport->event_count += 2u;
+    {
+        uint8_t byte = 1;
+        int wake_fd = transport->signal_alternate_wake ? transport->alternate_wake_write_fd : transport->wake_write_fd;
+        ssize_t written = write(wake_fd, &byte, sizeof(byte));
+        (void)written;
+    }
     pthread_mutex_unlock(&transport->mutex);
     return 0;
 }
@@ -545,12 +619,16 @@ int fake_stream_open(trevrpc_rpc_transport* transport,
     trevrpc_rpc_transport_handle connection,
     uint64_t operation_id,
     trevrpc_rpc_transport_handle* stream) {
-    (void)transport;
+    fake_transport* fake = fake_from_base(transport);
     (void)operation_id;
     if (!fake_handle_equal(connection, fake_connection_handle)) {
         return -ESTALE;
     }
     *stream = fake_stream_handle;
+    atomic_fetch_add_explicit(&fake->stream_open_calls, 1, memory_order_release);
+    pthread_mutex_lock(&fake->mutex);
+    pthread_cond_broadcast(&fake->condition);
+    pthread_mutex_unlock(&fake->mutex);
     return 0;
 }
 
@@ -766,19 +844,29 @@ int fake_listener_close(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_
 
 int fake_close(trevrpc_rpc_transport* transport) {
     fake_transport* fake = fake_from_base(transport);
-    int result;
+    int result = atomic_exchange_explicit(&fake->close_result, 0, memory_order_acq_rel);
+    if (result != 0) {
+        return result;
+    }
     pthread_mutex_lock(&fake->mutex);
+    if (fake->close_blocked) {
+        fake->close_entered = true;
+        pthread_cond_broadcast(&fake->condition);
+        while (!fake->close_release)
+            pthread_cond_wait(&fake->condition, &fake->mutex);
+    }
     if (fake->close_requested) {
         pthread_mutex_unlock(&fake->mutex);
         return -EALREADY;
     }
     fake->close_requested = true;
     pthread_mutex_unlock(&fake->mutex);
-    result = fake_push_event(fake,
+    result = fake_push_status_event(fake,
         TREVRPC_RPC_TRANSPORT_EVENT_STOPPED,
         TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL,
         (trevrpc_rpc_transport_handle){0},
-        (trevrpc_rpc_transport_handle){0});
+        (trevrpc_rpc_transport_handle){0},
+        atomic_load_explicit(&fake->close_status, memory_order_acquire));
     return result;
 }
 
@@ -942,12 +1030,15 @@ fake_transport* fake_create(void) {
     atomic_init(&fake->stream_abort_send_calls, 0);
     atomic_init(&fake->stream_abort_calls, 0);
     atomic_init(&fake->stream_close_calls, 0);
+    atomic_init(&fake->stream_open_calls, 0);
     atomic_init(&fake->stream_send_calls, 0);
     atomic_init(&fake->stream_finish_send_calls, 0);
     atomic_init(&fake->admission_response_calls, 0);
     atomic_init(&fake->admission_undecided_release_calls, 0);
     atomic_init(&fake->admission_last_status, 0);
     atomic_init(&fake->next_event_result, 0);
+    atomic_init(&fake->close_result, 0);
+    atomic_init(&fake->close_status, 0);
     atomic_init(&fake->poll_timeout_ms, -1);
     atomic_init(&fake->poll_deadline_nanos, 0);
     atomic_init(&fake->poll_timeout_fires, 0);

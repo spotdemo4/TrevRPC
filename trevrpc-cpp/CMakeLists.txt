@@ -71,10 +71,23 @@ elseif(TREVRPC_CPP_TREVRPC_C_ROOT)
   set(TREVRPC_BUILD_BENCHMARKS OFF)
   set(TREVRPC_BUILD_EXAMPLES OFF)
   set(TREVRPC_BUILD_CODEGEN OFF)
-  set(TREVRPC_BUILD_ENGINE OFF)
-  set(TREVRPC_BUILD_ENGINE_MSQUIC OFF)
-  set(TREVRPC_BUILD_RPC OFF)
-  set(TREVRPC_BUILD_RPC_MSQUIC OFF)
+  set(TREVRPC_BUILD_ENGINE ON)
+  set(TREVRPC_BUILD_ENGINE_MSQUIC ON)
+  set(TREVRPC_BUILD_TRANSPORT ON)
+  set(TREVRPC_BUILD_TRANSPORT_MSQUIC ON)
+  set(TREVRPC_BUILD_RPC ON)
+  set(TREVRPC_BUILD_RPC_MSQUIC ON)
+  if(TREVRPC_CPP_ENABLE_SANITIZERS AND TREVRPC_ENABLE_THREAD_SANITIZER)
+    message(FATAL_ERROR
+      "TREVRPC_CPP_ENABLE_SANITIZERS cannot be combined with TrevRPC C ThreadSanitizer")
+  endif()
+  if(TREVRPC_CPP_ENABLE_SANITIZERS)
+    set(TREVRPC_ENABLE_SANITIZERS ON)
+  endif()
+  if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND TREVRPC_CPP_BUILD_TESTS)
+    enable_language(C)
+    set(TREVRPC_BUILD_RPC_TEST_SUPPORT ON)
+  endif()
   set(TREVRPC_BUILD_MSQUIC ON)
   set(TREVRPC_BUILD_WEBTRANSPORT ON)
   set(TREVRPC_BUILD_RUNTIME ON)
@@ -82,11 +95,20 @@ elseif(TREVRPC_CPP_TREVRPC_C_ROOT)
                    "${CMAKE_CURRENT_BINARY_DIR}/trevrpc-c")
   set(trevrpc_cpp_c_target trevrpc)
 else()
-  find_package(trevrpc 0.1 CONFIG REQUIRED)
+  find_package(trevrpc 0.2.2 EXACT CONFIG REQUIRED)
   if(NOT TREVRPC_C_ABI_VERSION EQUAL 6)
     message(FATAL_ERROR "trevrpc-cpp requires TrevRPC C ABI 6")
   endif()
   set(trevrpc_cpp_c_target trevrpc::trevrpc)
+endif()
+
+if(TARGET trevrpc::trevrpc_rpc_msquic)
+  set(trevrpc_cpp_rpc_target trevrpc::trevrpc_rpc_msquic)
+elseif(TARGET trevrpc_rpc_msquic)
+  set(trevrpc_cpp_rpc_target trevrpc_rpc_msquic)
+else()
+  find_package(trevrpc_rpc_msquic 0.2.2 EXACT CONFIG REQUIRED)
+  set(trevrpc_cpp_rpc_target trevrpc::trevrpc_rpc_msquic)
 endif()
 
 add_library(trevrpc_cpp STATIC
@@ -95,7 +117,9 @@ add_library(trevrpc_cpp STATIC
   src/callbacks.cpp
   src/detail/abi6_bridge.cpp
   src/detail/async_core.cpp
-  src/detail/lifecycle.cpp)
+  src/detail/lifecycle.cpp
+  src/detail/rpc_client.cpp
+  src/detail/rpc_event_runtime.cpp)
 add_library(trevrpc::cpp ALIAS trevrpc_cpp)
 target_include_directories(trevrpc_cpp
   PUBLIC
@@ -106,7 +130,10 @@ target_link_libraries(trevrpc_cpp
   PUBLIC
     $<BUILD_INTERFACE:${trevrpc_cpp_c_target}>
     $<INSTALL_INTERFACE:trevrpc::trevrpc>
-    Threads::Threads)
+    Threads::Threads
+  PRIVATE
+    $<BUILD_INTERFACE:${trevrpc_cpp_rpc_target}>
+    $<INSTALL_INTERFACE:trevrpc::trevrpc_rpc_msquic>)
 set_target_properties(trevrpc_cpp PROPERTIES EXPORT_NAME cpp)
 trevrpc_cpp_warnings(trevrpc_cpp)
 trevrpc_cpp_sanitizers(trevrpc_cpp)

@@ -96,7 +96,9 @@ if(TREVRPC_CPP_BUILD_TESTS)
       "${trevrpc_cpp_benchmark_test_cert}"
       "${trevrpc_cpp_benchmark_test_key}")
   add_dependencies(trevrpc_cpp_bench_peer trevrpc_cpp_benchmark_test_certificates)
-  set_tests_properties(trevrpc_cpp_benchmark_webtransport_smoke PROPERTIES TIMEOUT 30)
+  set_tests_properties(trevrpc_cpp_benchmark_webtransport_smoke PROPERTIES
+    RESOURCE_LOCK trevrpc_msquic_loopback
+    TIMEOUT 30)
   trevrpc_cpp_bench_lsan_suppressions(trevrpc_cpp_benchmark_webtransport_smoke)
 
 endif()

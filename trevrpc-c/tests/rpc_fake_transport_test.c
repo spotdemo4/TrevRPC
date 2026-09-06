@@ -3789,7 +3789,40 @@ static void run_client_response_limits(void) {
     }
 }
 
+static void run_atomic_incoming_enqueue(void) {
+    static const uint8_t body[] = "incoming";
+    fake_transport* fake = fake_create();
+    size_t index;
+
+    assert(fake != NULL);
+    for (index = 0; index < FAKE_EVENT_CAPACITY - 1u; ++index) {
+        assert(fake_push_event(fake,
+                   TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC,
+                   0,
+                   (trevrpc_rpc_transport_handle){0},
+                   (trevrpc_rpc_transport_handle){0}) == 0);
+    }
+    assert(fake_push_incoming_stream(fake, body, sizeof(body)) == -EAGAIN);
+    assert(fake->event_count == FAKE_EVENT_CAPACITY - 1u);
+    assert(fake->stream_receive_head == NULL);
+    assert(fake->stream_receive_tail == NULL);
+    fake_destroy(&fake->base);
+
+    fake = fake_create();
+    assert(fake != NULL);
+    assert(fake_push_incoming_stream(fake, NULL, sizeof(body)) == -EINVAL);
+    assert(fake->event_count == 0);
+    assert(fake->stream_receive_head == NULL);
+    assert(fake->stream_receive_tail == NULL);
+    assert(fake_push_incoming_stream(fake, body, sizeof(body)) == 0);
+    assert(fake->event_count == 2u);
+    assert(fake->stream_receive_head != NULL);
+    assert(fake->stream_receive_head == fake->stream_receive_tail);
+    fake_destroy(&fake->base);
+}
+
 int main(void) {
+    run_atomic_incoming_enqueue();
     run_task240_config_limit_validation();
     run_success_before_deadline_is_not_cancelled();
     run_context_cancellation_is_durable();
