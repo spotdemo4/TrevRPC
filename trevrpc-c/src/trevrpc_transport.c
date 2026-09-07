@@ -1,6 +1,9 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "trevrpc_transport.h"
 
 #include "trevrpc_rpc_transport_internal.h"
+#include "trevrpc_credential_internal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -55,7 +58,7 @@ static trevrpc_transport_handle_v1 trevrpc_transport_public_handle(trevrpc_rpc_t
     return result;
 }
 
-static int trevrpc_transport_validate_endpoint_config(const trevrpc_transport_endpoint_config_v1* config) {
+static int trevrpc_transport_validate_endpoint_config(const trevrpc_transport_endpoint_config_v1* config, int dialing) {
     int result;
     if (config == NULL) {
         return -EINVAL;
@@ -83,12 +86,25 @@ static int trevrpc_transport_validate_endpoint_config(const trevrpc_transport_en
     if (!trevrpc_transport_reserved_is_zero(config->reserved, sizeof(config->reserved) / sizeof(config->reserved[0]))) {
         return -EINVAL;
     }
-    if (config->cert_data_len != 0 || config->key_data_len != 0 || config->ca_cert_data_len != 0) {
-        return -ENOTSUP;
-    }
+    result = trevrpc_credential_validate_pointers(config->cert_file,
+        config->cert_file_len,
+        config->key_file,
+        config->key_file_len,
+        config->ca_cert_file,
+        config->ca_cert_file_len,
+        config->cert_data,
+        config->cert_data_len,
+        config->key_data,
+        config->key_data_len,
+        config->ca_cert_data,
+        config->ca_cert_data_len);
+    if (result != 0)
+        return result;
     if ((config->protocol == TREVRPC_TRANSPORT_PROTOCOL_AUTO ||
             config->protocol == TREVRPC_TRANSPORT_PROTOCOL_NATIVE) &&
-        config->server_name_len != 0) {
+        config->server_name_len != 0 &&
+        (!dialing || config->server_name_len != config->host_len ||
+            memcmp(config->server_name, config->host, config->host_len) != 0)) {
         return -ENOTSUP;
     }
     if ((config->flags & TREVRPC_TRANSPORT_ENDPOINT_DEFER_ADMISSION) != 0 &&
@@ -477,7 +493,7 @@ int trevrpc_transport_listen_v1(trevrpc_transport* transport,
     if (transport == NULL || out_listener == NULL) {
         return -EINVAL;
     }
-    result = trevrpc_transport_validate_endpoint_config(config);
+    result = trevrpc_transport_validate_endpoint_config(config, 0);
     if (result != 0) {
         return result;
     }
@@ -509,7 +525,7 @@ int trevrpc_transport_dial_v1(trevrpc_transport* transport,
     if (transport == NULL || out_connection == NULL || operation_id == 0) {
         return -EINVAL;
     }
-    result = trevrpc_transport_validate_endpoint_config(config);
+    result = trevrpc_transport_validate_endpoint_config(config, 1);
     if (result != 0) {
         return result;
     }

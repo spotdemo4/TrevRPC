@@ -118,6 +118,8 @@ typedef struct trevrpc_transport_endpoint_config_v1 {
     uint16_t port;
     uint16_t peer_bidi_stream_count;
 
+    /* Native/AUTO dialing currently uses host as SNI and accepts only an
+     * identical server_name; native/AUTO listeners reject server_name. */
     const char* server_name;
     uint32_t server_name_len;
     uint32_t reserved0;
@@ -136,6 +138,10 @@ typedef struct trevrpc_transport_endpoint_config_v1 {
     uint32_t ca_cert_file_len;
     uint32_t reserved4;
 
+    /* Memory credential blobs are copied before endpoint creation returns.  For
+     * the MsQuic provider they are PEM-encoded certificate/key/CA bytes.
+     * Each blob is mutually exclusive with its corresponding file field. CA
+     * credentials on listeners are currently unsupported. */
     const uint8_t* cert_data;
     uint64_t cert_data_len;
     const uint8_t* key_data;

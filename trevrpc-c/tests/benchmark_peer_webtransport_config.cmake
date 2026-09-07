@@ -70,7 +70,7 @@ execute_process(
     ERROR_VARIABLE diagnostics
 )
 if(result EQUAL 0 OR NOT output MATCHES
-    "schema_version.:5.*code.:.unsupported.*trevrpc_webtransport is unsupported by the RPC ABI 1 peer")
+    "schema_version.:5.*code.:.invalid_argument.*--address is only valid for a trevrpc_native_quic client")
     message(FATAL_ERROR
-        "WebTransport client did not return the expected unsupported result:\n${diagnostics}${output}")
+        "WebTransport client accepted startup --address or returned an unexpected error:\n${diagnostics}${output}")
 endif()

@@ -148,6 +148,8 @@ Readability means that at least one event may be available. Consumers integrate 
 
 The engine writes one byte only on an empty-to-nonempty arm transition. `EINTR` is retried and write-side `EAGAIN` counts as a successful arm because the pipe is already readable. The last dequeue drains and disarms the pipe while holding the queue mutex, preventing an enqueue into a drain gap.
 
+A non-`EAGAIN` arm failure preserves the event already queued, records a fatal wake failure, and permanently closes the engine-owned write end. The borrowed read descriptor then reports persistent hangup/error readiness so poll-based consumers can drain the queued event, fatal diagnostic, and stopped event rather than sleeping indefinitely. Consumers must treat descriptor readability, hangup, or error as a prompt to drain `trevrpc_engine_next_event()` until `-EAGAIN`.
+
 If wake draining fails while dequeuing the stopped event, the engine returns a fatal diagnostic first and requeues an updated fatal stopped event with a later sequence. No event is published after that stopped event.
 
 On platforms with `pipe2`, both descriptors are created atomically with `O_NONBLOCK | O_CLOEXEC`. The portable POSIX fallback applies both flags immediately with `fcntl`; applications on those platforms must serialize engine creation with process-wide `fork`/`exec` activity because POSIX has no portable atomic equivalent.

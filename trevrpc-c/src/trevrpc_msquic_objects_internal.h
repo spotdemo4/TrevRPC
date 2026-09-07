@@ -101,10 +101,24 @@ typedef struct trevrpc_msquic_finalizer_item {
     struct trevrpc_msquic_finalizer_item* next;
     void* object;
     trevrpc_msquic_finalizer_kind kind;
+    trevrpc_msquic_finalizer_scope* scope;
 } trevrpc_msquic_finalizer_item;
+
+struct trevrpc_msquic_finalizer_scope {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    trevrpc_msquic_finalizer_item* head;
+    trevrpc_msquic_finalizer_item* tail;
+    size_t pending;
+    size_t active;
+    pthread_t thread;
+    bool started;
+    bool stopping;
+};
 
 struct trevrpc_msquic_stream {
     HQUIC handle;
+    trevrpc_msquic_finalizer_scope* finalizer_scope;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     trevrpc_msquic_chunk* recv_head;
@@ -194,6 +208,7 @@ struct trevrpc_msquic_stream {
 
 struct trevrpc_msquic_conn {
     HQUIC handle;
+    trevrpc_msquic_finalizer_scope* finalizer_scope;
     HQUIC registration;
     HQUIC configuration;
     uint8_t negotiated_alpn[UINT8_MAX];
@@ -236,6 +251,7 @@ struct trevrpc_msquic_conn {
 
 struct trevrpc_msquic_listener {
     HQUIC registration;
+    trevrpc_msquic_finalizer_scope* finalizer_scope;
     HQUIC configuration;
     HQUIC listener;
     size_t max_frame_size;

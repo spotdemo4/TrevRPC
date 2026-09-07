@@ -1,5 +1,6 @@
 #include "trevrpc_h3_demux_internal.h"
 #include "trevrpc_msquic_internal.h"
+#include "trevrpc_msquic_objects_internal.h" // IWYU pragma: keep
 #include "trevrpc_rpc_transport_h3_internal.h"
 #include "trevrpc_rpc_transport_internal.h"
 #include "trevrpc_rpc_transport_msquic_internal.h"
@@ -89,18 +90,35 @@ static void h3_stream_close_hook(trevrpc_msquic_test_stream_event event, void* c
 }
 
 typedef struct h3_finalizer_progress_state {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    bool immediate_close_observed;
+    size_t immediate_closes;
+    size_t completed_closes;
 } h3_finalizer_progress_state;
 
 static void h3_finalizer_progress_hook(trevrpc_msquic_test_stream_event event, void* context) {
     h3_finalizer_progress_state* state = context;
-    if (event != TREV_MSQUIC_TEST_STREAM_CLOSE_IMMEDIATE)
+    if (event == TREV_MSQUIC_TEST_STREAM_CLOSE_IMMEDIATE) {
+        ++state->immediate_closes;
+    } else if (event == TREV_MSQUIC_TEST_STREAM_CLOSE_COMPLETED) {
+        ++state->completed_closes;
+    }
+}
+
+typedef struct h3_finalizer_isolation_state {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool close_started;
+    bool release_close;
+} h3_finalizer_isolation_state;
+
+static void h3_finalizer_isolation_hook(trevrpc_msquic_test_stream_event event, void* context) {
+    h3_finalizer_isolation_state* state = context;
+    if (event != TREV_MSQUIC_TEST_STREAM_CLOSE_STARTED)
         return;
     pthread_mutex_lock(&state->mutex);
-    state->immediate_close_observed = true;
+    state->close_started = true;
     pthread_cond_broadcast(&state->cond);
+    while (!state->release_close)
+        pthread_cond_wait(&state->cond, &state->mutex);
     pthread_mutex_unlock(&state->mutex);
 }
 
@@ -166,7 +184,6 @@ static void test_h3_stream_close_modes(void) {
     assert(trevrpc_rpc_transport_stream_close(transport, stream) == 0);
     assert(hook.immediate_closes == 0);
     trevrpc_rpc_transport_destroy(transport);
-    trevrpc_msquic_finalizer_drain();
     trevrpc_msquic_test_set_stream_hook(NULL, NULL);
     trevrpc_msquic_test_receive_fixture_destroy(fixture);
 
@@ -182,7 +199,6 @@ static void test_h3_stream_close_modes(void) {
     assert(trevrpc_rpc_transport_h3_test_adopt_peer_bidi_stream(transport, connection, object, &stream) == 0);
     trevrpc_msquic_test_set_stream_hook(h3_stream_close_hook, &hook);
     trevrpc_rpc_transport_destroy(transport);
-    trevrpc_msquic_finalizer_drain();
     assert(hook.immediate_closes == 1);
     trevrpc_msquic_test_set_stream_hook(NULL, NULL);
     trevrpc_msquic_test_receive_fixture_destroy(fixture);
@@ -192,13 +208,8 @@ static void test_msquic_finalizer_avoids_graceful_stream_convoy(void) {
     trevrpc_msquic_test_receive_fixture* fixture = NULL;
     trevrpc_msquic_stream* blocked = NULL;
     trevrpc_msquic_stream* following = NULL;
-    h3_finalizer_progress_state state;
-    struct timespec deadline;
-    bool progressed;
+    h3_finalizer_progress_state state = {0};
 
-    assert(pthread_mutex_init(&state.mutex, NULL) == 0);
-    assert(pthread_cond_init(&state.cond, NULL) == 0);
-    state.immediate_close_observed = false;
     assert(trevrpc_msquic_test_receive_fixture_create(NULL, 1024, 2, &fixture) == 0);
     blocked = trevrpc_msquic_test_receive_fixture_take_stream(fixture, 0);
     following = trevrpc_msquic_test_receive_fixture_take_stream(fixture, 1);
@@ -209,26 +220,63 @@ static void test_msquic_finalizer_avoids_graceful_stream_convoy(void) {
     trevrpc_msquic_test_fail_next_graceful_shutdown();
     trevrpc_msquic_stream_close_deferred_owned(blocked, false);
     trevrpc_msquic_stream_close_deferred_owned(following, true);
+    trevrpc_msquic_finalizer_drain();
+
+    trevrpc_msquic_test_set_stream_hook(NULL, NULL);
+    trevrpc_msquic_test_receive_fixture_destroy(fixture);
+    assert(state.immediate_closes == 1);
+    assert(state.completed_closes == 2);
+}
+
+static void test_h3_destroy_isolated_from_other_finalizer_scope(void) {
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_msquic_finalizer_scope blocked_scope = {0};
+    trevrpc_msquic_test_receive_fixture* fixture = NULL;
+    trevrpc_msquic_stream* stream = NULL;
+    trevrpc_rpc_transport* independent = NULL;
+    h3_finalizer_isolation_state state = {0};
+    struct timespec deadline;
+    bool close_started;
+
+    assert(trevrpc_msquic_finalizer_scope_init(&blocked_scope) == 0);
+    assert(pthread_mutex_init(&state.mutex, NULL) == 0);
+    assert(pthread_cond_init(&state.cond, NULL) == 0);
+    assert(trevrpc_msquic_test_receive_fixture_create(NULL, 1024, 1, &fixture) == 0);
+    stream = trevrpc_msquic_test_receive_fixture_take_stream(fixture, 0);
+    assert(stream != NULL);
+    trevrpc_msquic_test_receive_fixture_prepare_graceful_close(stream);
+    trevrpc_msquic_stream_set_finalizer_scope(stream, &blocked_scope);
+    trevrpc_msquic_test_set_stream_hook(h3_finalizer_isolation_hook, &state);
+    trevrpc_msquic_test_fail_next_graceful_shutdown();
+    trevrpc_msquic_stream_close_deferred_owned(stream, false);
 
     assert(timespec_get(&deadline, TIME_UTC) == TIME_UTC);
     deadline.tv_sec += 2;
     pthread_mutex_lock(&state.mutex);
-    while (!state.immediate_close_observed) {
+    while (!state.close_started) {
         int wait_result = pthread_cond_timedwait(&state.cond, &state.mutex, &deadline);
         if (wait_result == ETIMEDOUT)
             break;
         assert(wait_result == 0);
     }
-    progressed = state.immediate_close_observed;
+    close_started = state.close_started;
     pthread_mutex_unlock(&state.mutex);
+    assert(close_started);
 
-    trevrpc_msquic_test_receive_fixture_complete_shutdown(blocked);
-    trevrpc_msquic_finalizer_drain();
+    assert(trevrpc_rpc_transport_h3_create(&config, &independent) == 0);
+    trevrpc_rpc_transport_destroy(independent);
+    independent = NULL;
+
+    pthread_mutex_lock(&state.mutex);
+    state.release_close = true;
+    pthread_cond_broadcast(&state.cond);
+    pthread_mutex_unlock(&state.mutex);
+    trevrpc_msquic_finalizer_scope_drain(&blocked_scope);
     trevrpc_msquic_test_set_stream_hook(NULL, NULL);
+    trevrpc_msquic_finalizer_scope_destroy(&blocked_scope);
     trevrpc_msquic_test_receive_fixture_destroy(fixture);
     pthread_cond_destroy(&state.cond);
     pthread_mutex_destroy(&state.mutex);
-    assert(progressed);
 }
 
 static void test_h3_destroy_waits_for_provider_owned_send_completion(void) {
@@ -280,6 +328,87 @@ static void test_h3_destroy_waits_for_provider_owned_send_completion(void) {
     pthread_cond_destroy(&state.cond);
     pthread_mutex_destroy(&state.mutex);
     assert(destroy_waited);
+}
+
+typedef struct h3_send_capture_state {
+    uint8_t data[20000];
+    size_t len;
+} h3_send_capture_state;
+
+static h3_send_capture_state* h3_send_capture;
+
+static void h3_capture_send(const uint8_t* data, size_t len) {
+    assert(h3_send_capture != NULL);
+    assert(len <= sizeof(h3_send_capture->data));
+    memcpy(h3_send_capture->data, data, len);
+    h3_send_capture->len = len;
+}
+
+static size_t h3_expected_data_frame(uint8_t* output, size_t capacity, const uint8_t* body, size_t body_len) {
+    size_t type_len = 0;
+    size_t length_len = 0;
+    assert(trevrpc_quic_varint_size(TREV_H3_FRAME_DATA, &type_len) == 0);
+    assert(trevrpc_quic_varint_size(body_len + 4, &length_len) == 0);
+    assert(trevrpc_quic_varint_write(output, capacity, TREV_H3_FRAME_DATA, &type_len) == 0);
+    assert(trevrpc_quic_varint_write(output + type_len,
+               capacity - type_len,
+               body_len + 4,
+               &length_len) == 0);
+    output[type_len + length_len] = (uint8_t)(body_len >> 24);
+    output[type_len + length_len + 1] = (uint8_t)(body_len >> 16);
+    output[type_len + length_len + 2] = (uint8_t)(body_len >> 8);
+    output[type_len + length_len + 3] = (uint8_t)body_len;
+    if (body_len != 0)
+        memcpy(output + type_len + length_len + 4, body, body_len);
+    return type_len + length_len + 4 + body_len;
+}
+
+static void test_h3_send_encoding_boundaries_and_rejection_cleanup(void) {
+    static const size_t body_lengths[] = {0, 60, 16380};
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_msquic_test_receive_fixture* fixture = NULL;
+    trevrpc_msquic_stream* object = NULL;
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    h3_send_capture_state capture = {0};
+    uint8_t body[16380];
+    uint8_t expected[20000];
+
+    assert(trevrpc_msquic_test_receive_fixture_create(NULL, 1024, 1, &fixture) == 0);
+    object = trevrpc_msquic_test_receive_fixture_take_stream(fixture, 0);
+    assert(object != NULL);
+    assert(trevrpc_rpc_transport_h3_create(&config, &transport) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_connection(transport, &connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_stream(transport, connection, &stream) == 0);
+    assert(trevrpc_rpc_transport_h3_test_attach_stream_object(transport, stream, object) == 0);
+    trevrpc_msquic_test_receive_fixture_set_handle_present(object, true);
+    h3_send_capture = &capture;
+    trevrpc_rpc_transport_h3_test_set_send_capture(h3_capture_send);
+
+    for (size_t index = 0; index < sizeof(body_lengths) / sizeof(body_lengths[0]); ++index) {
+        size_t body_len = body_lengths[index];
+        for (size_t offset = 0; offset < body_len; ++offset)
+            body[offset] = (uint8_t)(offset ^ (index * 0x31u));
+        capture.len = 0;
+        trevrpc_msquic_test_fail_next_stream_send();
+        assert(trevrpc_rpc_transport_stream_send(transport, stream, index + 1, body, body_len) == -EIO);
+        size_t expected_len = h3_expected_data_frame(expected, sizeof(expected), body, body_len);
+        memset(body, 0xa5, body_len);
+        assert(capture.len == expected_len);
+        assert(memcmp(capture.data, expected, expected_len) == 0);
+        pthread_mutex_lock(&object->mutex);
+        assert(object->pending_send_count == 0);
+        assert(object->pending_send_bytes == 0);
+        pthread_mutex_unlock(&object->mutex);
+        assert(trevrpc_rpc_transport_h3_test_pending_events(transport) == 0);
+    }
+
+    trevrpc_rpc_transport_h3_test_set_send_capture(NULL);
+    h3_send_capture = NULL;
+    trevrpc_msquic_test_receive_fixture_set_handle_present(object, false);
+    trevrpc_rpc_transport_destroy(transport);
+    trevrpc_msquic_test_receive_fixture_destroy(fixture);
 }
 
 static void test_h3_finish_publishes_fin_before_provider_shutdown(void) {
@@ -2015,6 +2144,78 @@ static void test_h3_terminal_dequeue_controls_slot_reuse(void) {
     trevrpc_rpc_transport_destroy(transport);
 }
 
+typedef struct rollback_native_transport {
+    trevrpc_rpc_transport base;
+    unsigned close_calls;
+    unsigned release_calls;
+} rollback_native_transport;
+
+static int rollback_native_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_event** out_event) {
+    (void)transport;
+    *out_event = NULL;
+    return -EAGAIN;
+}
+
+static int rollback_native_connection_close(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle connection, uint64_t code) {
+    rollback_native_transport* native = (rollback_native_transport*)transport;
+    (void)connection;
+    (void)code;
+    ++native->close_calls;
+    return 0;
+}
+
+static int rollback_native_release_handle(
+    trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint32_t kind) {
+    rollback_native_transport* native = (rollback_native_transport*)transport;
+    (void)handle;
+    assert(kind == TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
+    ++native->release_calls;
+    return 0;
+}
+
+static void rollback_native_destroy(trevrpc_rpc_transport* transport) {
+    (void)transport;
+}
+
+static const trevrpc_rpc_transport_ops rollback_native_ops = {
+    .next_event = rollback_native_next_event,
+    .connection_close = rollback_native_connection_close,
+    .release_handle = rollback_native_release_handle,
+    .destroy = rollback_native_destroy,
+};
+
+static void test_shared_listener_rollback_closes_and_releases_child(void) {
+    rollback_native_transport native = {.base = {.ops = &rollback_native_ops}};
+    trevrpc_rpc_transport* h3 = NULL;
+    trevrpc_rpc_transport* composite = NULL;
+    trevrpc_rpc_transport_handle local_listener;
+    trevrpc_rpc_transport_handle ignored_connection;
+    trevrpc_rpc_transport_handle local_child = {UINT64_C(0x7777), 1u, 1u};
+    trevrpc_rpc_transport_handle public_listener;
+    trevrpc_rpc_transport_handle public_child = {0};
+    trevrpc_rpc_transport_config config = test_config();
+
+    assert(trevrpc_rpc_transport_h3_create(&config, &h3) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(
+               h3, &local_listener, &ignored_connection) == 0);
+    assert(trevrpc_rpc_transport_msquic_adopt(&native.base, h3, &config, &composite) == 0);
+
+    assert(trevrpc_rpc_transport_h3_test_emit(
+               h3, TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC, 0, 0, local_listener, (trevrpc_rpc_transport_handle){0}, 0) ==
+           0);
+    public_listener = next_subject(composite, TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC);
+    assert(trevrpc_rpc_transport_msquic_test_rollback_shared_listener(
+               composite, public_listener, local_child, &public_child) == 0);
+    assert(public_child.owner != 0 && public_child.slot != 0 && public_child.generation != 0);
+    assert(native.close_calls == 1);
+    assert(native.release_calls == 1);
+    assert(trevrpc_rpc_transport_release_handle(
+               composite, public_child, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION) == 0);
+    assert(trevrpc_rpc_transport_endpoint_get_port(composite, public_listener, &(uint16_t){0}) == -ESTALE);
+    trevrpc_rpc_transport_destroy(composite);
+}
+
 static void test_composite_translates_admission_listener(void) {
     trevrpc_rpc_transport* source = NULL;
     trevrpc_rpc_transport* other = NULL;
@@ -2684,7 +2885,9 @@ int main(void) {
     test_h3_retired_receive_drains_after_reuse();
     test_h3_stream_close_modes();
     test_msquic_finalizer_avoids_graceful_stream_convoy();
+    test_h3_destroy_isolated_from_other_finalizer_scope();
     test_h3_destroy_waits_for_provider_owned_send_completion();
+    test_h3_send_encoding_boundaries_and_rejection_cleanup();
     test_h3_finish_publishes_fin_before_provider_shutdown();
     test_h3_shutdown_orders_terminals_before_stopped();
     test_h3_abort_wire_codes_and_peer_reset_decode();
@@ -2716,6 +2919,7 @@ int main(void) {
     test_h3_multiplexed_post_waits_for_settings();
     test_h3_multiplexed_connect_waits_for_settings();
     test_h3_multiplexed_http3_only_rejects_connect();
+    test_shared_listener_rollback_closes_and_releases_child();
     test_composite_translates_admission_listener();
     test_h3_shutdown_orders_pending_send_before_terminals_and_stopped();
     puts("rpc_transport_h3_test: ok");

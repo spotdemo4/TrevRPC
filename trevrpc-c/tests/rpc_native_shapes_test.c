@@ -1,5 +1,6 @@
 #include "trevrpc_rpc_msquic.h"
 
+#include <dirent.h>
 #include <assert.h>
 #include <errno.h> // IWYU pragma: keep
 #include <poll.h>
@@ -25,6 +26,46 @@
 #endif
 
 static uint32_t test_webtransport_profiles;
+static int credential_cleanup_failures;
+
+int trevrpc_credential_test_fail_cleanup(void) {
+    if (credential_cleanup_failures == 0)
+        return 0;
+    --credential_cleanup_failures;
+    return 1;
+}
+
+static size_t credential_bundle_count(void) {
+    DIR* directory = opendir("/tmp");
+    struct dirent* entry;
+    size_t count = 0;
+    if (directory == NULL)
+        return 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strncmp(entry->d_name, "trevrpc-credentials-", sizeof("trevrpc-credentials-") - 1u) == 0)
+            ++count;
+    }
+    assert(closedir(directory) == 0);
+    return count;
+}
+
+static uint8_t* read_file(const char* path, size_t* out_len) {
+    FILE* file = fopen(path, "rb");
+    long length;
+    uint8_t* data;
+    if (file == NULL)
+        return NULL;
+    assert(fseek(file, 0, SEEK_END) == 0);
+    length = ftell(file);
+    assert(length > 0);
+    assert(fseek(file, 0, SEEK_SET) == 0);
+    data = malloc((size_t)length);
+    assert(data != NULL);
+    assert(fread(data, 1, (size_t)length, file) == (size_t)length);
+    assert(fclose(file) == 0);
+    *out_len = (size_t)length;
+    return data;
+}
 
 typedef struct pending_event {
     trevrpc_rpc_event* event;
@@ -278,6 +319,14 @@ static void setup_harness(harness* state) {
     uint64_t admission_sequence;
 #endif
     uint16_t port = 0;
+    uint8_t* listener_cert = NULL;
+    uint8_t* listener_key = NULL;
+    uint8_t* client_cert = NULL;
+    uint8_t* client_key = NULL;
+    size_t listener_cert_len = 0;
+    size_t listener_key_len = 0;
+    size_t client_cert_len = 0;
+    size_t client_key_len = 0;
 
     memset(state, 0, sizeof(*state));
     assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
@@ -308,11 +357,26 @@ static void setup_harness(harness* state) {
 #if TREVRPC_RPC_TEST_TRANSPORT != TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE
     listener_config.flags |= TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS;
 #endif
-    listener_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
-    listener_config.cert_file_len = (uint32_t)strlen(listener_config.cert_file);
-    listener_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
-    listener_config.key_file_len = (uint32_t)strlen(listener_config.key_file);
+    listener_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &listener_cert_len);
+    listener_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &listener_key_len);
+    assert(listener_cert != NULL && listener_key != NULL);
+    listener_config.cert_data = listener_cert;
+    listener_config.cert_data_len = listener_cert_len;
+    listener_config.key_data = listener_key;
+    listener_config.key_data_len = listener_key_len;
+    {
+        size_t bundles_before = credential_bundle_count();
+        credential_cleanup_failures = 1;
+        assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &listener_config, 999, &state->listener) == -EIO);
+        assert(credential_bundle_count() == bundles_before);
+    }
     int start_result = trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &listener_config, 1, &state->listener);
+    memset(listener_cert, 0, listener_cert_len);
+    memset(listener_key, 0, listener_key_len);
+    free(listener_cert);
+    free(listener_key);
+    listener_cert = NULL;
+    listener_key = NULL;
     if (start_result != 0)
         fprintf(stderr,
             "listener endpoint start failed: %d frame=%llu receive_bytes=%llu receive_count=%u\n",
@@ -345,7 +409,27 @@ static void setup_harness(harness* state) {
         assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &invalid_config, 999, &state->client_endpoint) ==
                -EINVAL);
     }
+    client_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &client_cert_len);
+    client_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &client_key_len);
+    assert(client_cert != NULL && client_key != NULL);
+    client_config.cert_data = client_cert;
+    client_config.cert_data_len = client_cert_len;
+    client_config.key_data = client_key;
+    client_config.key_data_len = client_key_len;
+    {
+        size_t bundles_before = credential_bundle_count();
+        credential_cleanup_failures = 1;
+        assert(
+            trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &client_config, 999, &state->client_endpoint) == -EIO);
+        assert(credential_bundle_count() == bundles_before);
+    }
     assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &client_config, 2, &state->client_endpoint) == 0);
+    memset(client_cert, 0, client_cert_len);
+    memset(client_key, 0, client_key_len);
+    free(client_cert);
+    free(client_key);
+    client_cert = NULL;
+    client_key = NULL;
 #if TREVRPC_RPC_TEST_TRANSPORT == TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT
     admission_sequence =
         accept_admission(state, TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION, TREVRPC_RPC_ADMISSION_PROTOCOL_WEBTRANSPORT);

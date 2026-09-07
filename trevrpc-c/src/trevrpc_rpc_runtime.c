@@ -4,6 +4,7 @@
 
 #include "trevrpc_wire_internal.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -13,6 +14,7 @@
 #include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -24,6 +26,10 @@ typedef struct trevrpc_rpc_transport_connection_record trevrpc_rpc_transport_con
 typedef struct trevrpc_rpc_call_record trevrpc_rpc_call_record;
 typedef struct trevrpc_rpc_cancellation_record trevrpc_rpc_cancellation_record;
 typedef struct trevrpc_rpc_retired_handle trevrpc_rpc_retired_handle;
+typedef struct trevrpc_rpc_registry_value trevrpc_rpc_registry_value;
+typedef struct trevrpc_rpc_registry_entry trevrpc_rpc_registry_entry;
+typedef struct trevrpc_rpc_registry trevrpc_rpc_registry;
+typedef struct trevrpc_rpc_deadline_entry trevrpc_rpc_deadline_entry;
 
 enum trevrpc_rpc_operation_kind {
     TREVRPC_RPC_OPERATION_ENDPOINT_START = 1,
@@ -95,6 +101,41 @@ struct trevrpc_rpc_retired_handle {
     trevrpc_rpc_retired_handle* next;
     trevrpc_rpc_transport_handle handle;
     uint32_t kind;
+};
+
+struct trevrpc_rpc_registry_value {
+    trevrpc_rpc_registry_value* next;
+    void* value;
+};
+
+struct trevrpc_rpc_registry_entry {
+    uint64_t key[6];
+    uint64_t hash;
+    trevrpc_rpc_registry_value* values;
+    uint8_t count;
+    uint8_t state;
+};
+
+struct trevrpc_rpc_registry {
+    trevrpc_rpc_registry_entry* entries;
+    size_t capacity;
+    size_t size;
+    size_t tombstones;
+};
+
+enum trevrpc_rpc_timer_kind {
+    TREVRPC_RPC_TIMER_NONE,
+    TREVRPC_RPC_TIMER_CALL,
+    TREVRPC_RPC_TIMER_INITIAL,
+    TREVRPC_RPC_TIMER_SEND_IDLE,
+    TREVRPC_RPC_TIMER_RECEIVE_IDLE,
+};
+
+struct trevrpc_rpc_deadline_entry {
+    trevrpc_rpc_call_record* record;
+    uint64_t deadline;
+    uint32_t kind;
+    size_t index;
 };
 
 struct trevrpc_rpc_operation {
@@ -190,6 +231,7 @@ struct trevrpc_rpc_call_record {
     bool send_finish_pending;
     bool send_closed;
     bool peer_status_received;
+    bool receive_fin_observed;
     bool caller_owns_call;
     bool caller_owns_stream;
     bool transport_stream_released;
@@ -198,6 +240,7 @@ struct trevrpc_rpc_call_record {
     bool stream_terminal_dequeued;
     bool call_terminal_dequeued;
     trevrpc_wire_diagnostic_reason last_receive_diagnostic;
+    trevrpc_rpc_deadline_entry deadline_entry;
 };
 
 struct trevrpc_rpc_cancellation_record {
@@ -216,6 +259,8 @@ struct trevrpc_rpc_runtime {
     atomic_size_t references;
     atomic_uint_fast64_t api_gate;
     atomic_bool test_fail_next_receive_copy;
+    atomic_int test_call_release_result;
+    atomic_bool test_call_release_result_persistent;
     trevrpc_rpc_transport* transport;
     uint64_t owner_cookie;
     uint32_t state;
@@ -253,6 +298,7 @@ struct trevrpc_rpc_runtime {
     bool driver_started;
     bool driver_stopped;
     bool public_released;
+    uint32_t test_malformed_incoming_kind;
     int wake_read_fd;
     int wake_write_fd;
     int driver_wake_read_fd;
@@ -264,6 +310,15 @@ struct trevrpc_rpc_runtime {
     trevrpc_rpc_operation* operations;
     trevrpc_rpc_endpoint_record* endpoints;
     trevrpc_rpc_transport_connection_record* transport_connections;
+    trevrpc_rpc_registry call_registry;
+    trevrpc_rpc_registry endpoint_registry;
+    trevrpc_rpc_registry transport_registry;
+    trevrpc_rpc_registry cancellation_registry;
+    trevrpc_rpc_registry operation_transport_registry;
+    trevrpc_rpc_registry operation_scope_registry;
+    trevrpc_rpc_deadline_entry** deadline_heap;
+    size_t deadline_heap_count;
+    size_t deadline_heap_capacity;
     trevrpc_rpc_retired_handle* retired_handles;
     trevrpc_rpc_retired_handle* retired_pool;
     size_t retired_pool_capacity;
@@ -444,6 +499,130 @@ static uint64_t trevrpc_rpc_idle_deadline(uint64_t timeout_nanos) {
     return now + timeout_nanos;
 }
 
+static uint64_t trevrpc_rpc_next_deadline(const trevrpc_rpc_call_record* record, uint32_t* out_kind) {
+    uint64_t earliest = TREVRPC_RPC_DEADLINE_INFINITE;
+    uint32_t kind = TREVRPC_RPC_TIMER_NONE;
+#define TREVRPC_RPC_PICK_NEXT(value, timer_kind) \
+    do { \
+        if ((value) != 0 && (value) < earliest) { \
+            earliest = (value); \
+            kind = (timer_kind); \
+        } \
+    } while (0)
+    TREVRPC_RPC_PICK_NEXT(record->deadline_nanos, TREVRPC_RPC_TIMER_CALL);
+    TREVRPC_RPC_PICK_NEXT(record->initial_request_deadline_nanos, TREVRPC_RPC_TIMER_INITIAL);
+    TREVRPC_RPC_PICK_NEXT(record->send_idle_deadline_nanos, TREVRPC_RPC_TIMER_SEND_IDLE);
+    TREVRPC_RPC_PICK_NEXT(record->receive_idle_deadline_nanos, TREVRPC_RPC_TIMER_RECEIVE_IDLE);
+#undef TREVRPC_RPC_PICK_NEXT
+    if (out_kind != NULL) {
+        *out_kind = kind;
+    }
+    return earliest;
+}
+
+static bool trevrpc_rpc_deadline_before(
+    const trevrpc_rpc_deadline_entry* left, const trevrpc_rpc_deadline_entry* right) {
+    return left->deadline < right->deadline ||
+           (left->deadline == right->deadline && (uintptr_t)left->record < (uintptr_t)right->record);
+}
+
+static void trevrpc_rpc_deadline_swap(trevrpc_rpc_runtime* runtime, size_t left, size_t right) {
+    trevrpc_rpc_deadline_entry* entry = runtime->deadline_heap[left];
+    runtime->deadline_heap[left] = runtime->deadline_heap[right];
+    runtime->deadline_heap[right] = entry;
+    runtime->deadline_heap[left]->index = left;
+    runtime->deadline_heap[right]->index = right;
+}
+
+static void trevrpc_rpc_deadline_sift_up(trevrpc_rpc_runtime* runtime, size_t index) {
+    while (index != 0) {
+        size_t parent = (index - 1) / 2;
+        if (!trevrpc_rpc_deadline_before(runtime->deadline_heap[index], runtime->deadline_heap[parent])) {
+            break;
+        }
+        trevrpc_rpc_deadline_swap(runtime, index, parent);
+        index = parent;
+    }
+}
+
+static void trevrpc_rpc_deadline_sift_down(trevrpc_rpc_runtime* runtime, size_t index) {
+    for (;;) {
+        size_t left = index * 2 + 1;
+        size_t right = left + 1;
+        size_t smallest = index;
+        if (left < runtime->deadline_heap_count &&
+            trevrpc_rpc_deadline_before(runtime->deadline_heap[left], runtime->deadline_heap[smallest])) {
+            smallest = left;
+        }
+        if (right < runtime->deadline_heap_count &&
+            trevrpc_rpc_deadline_before(runtime->deadline_heap[right], runtime->deadline_heap[smallest])) {
+            smallest = right;
+        }
+        if (smallest == index) {
+            return;
+        }
+        trevrpc_rpc_deadline_swap(runtime, index, smallest);
+        index = smallest;
+    }
+}
+
+static void trevrpc_rpc_deadline_remove_locked(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_record* record) {
+    size_t index = record->deadline_entry.index;
+    if (index == SIZE_MAX) {
+        return;
+    }
+    record->deadline_entry.index = SIZE_MAX;
+    --runtime->deadline_heap_count;
+    if (index != runtime->deadline_heap_count) {
+        runtime->deadline_heap[index] = runtime->deadline_heap[runtime->deadline_heap_count];
+        runtime->deadline_heap[index]->index = index;
+        trevrpc_rpc_deadline_sift_down(runtime, index);
+        trevrpc_rpc_deadline_sift_up(runtime, index);
+    }
+}
+
+static int trevrpc_rpc_deadline_refresh_locked(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_record* record) {
+    uint32_t kind;
+    uint64_t deadline;
+    size_t index;
+    if (record == NULL) {
+        return -EINVAL;
+    }
+    deadline = record->closing || record->call_terminal_committed ? TREVRPC_RPC_DEADLINE_INFINITE
+                                                                    : trevrpc_rpc_next_deadline(record, &kind);
+    if (deadline == TREVRPC_RPC_DEADLINE_INFINITE) {
+        trevrpc_rpc_deadline_remove_locked(runtime, record);
+        return 0;
+    }
+    record->deadline_entry.record = record;
+    record->deadline_entry.deadline = deadline;
+    record->deadline_entry.kind = kind;
+    if (record->deadline_entry.index == SIZE_MAX) {
+        if (runtime->deadline_heap_count == runtime->deadline_heap_capacity) {
+            size_t capacity = runtime->deadline_heap_capacity == 0 ? 64 : runtime->deadline_heap_capacity * 2;
+            trevrpc_rpc_deadline_entry** heap;
+            if (capacity < runtime->deadline_heap_capacity || capacity > SIZE_MAX / sizeof(*heap)) {
+                return -EOVERFLOW;
+            }
+            heap = realloc(runtime->deadline_heap, capacity * sizeof(*heap));
+            if (heap == NULL) {
+                return -ENOMEM;
+            }
+            runtime->deadline_heap = heap;
+            runtime->deadline_heap_capacity = capacity;
+        }
+        index = runtime->deadline_heap_count++;
+        runtime->deadline_heap[index] = &record->deadline_entry;
+        record->deadline_entry.index = index;
+        trevrpc_rpc_deadline_sift_up(runtime, index);
+    } else {
+        index = record->deadline_entry.index;
+        trevrpc_rpc_deadline_sift_down(runtime, index);
+        trevrpc_rpc_deadline_sift_up(runtime, index);
+    }
+    return 0;
+}
+
 static void trevrpc_rpc_reset_idle_locked(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_record* record, bool send_direction) {
     uint64_t timeout;
@@ -463,6 +642,7 @@ static void trevrpc_rpc_reset_idle_locked(
         } else {
             record->receive_idle_deadline_nanos = 0;
         }
+        (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
         return;
     }
     if (send_direction) {
@@ -470,6 +650,7 @@ static void trevrpc_rpc_reset_idle_locked(
     } else {
         record->receive_idle_deadline_nanos = trevrpc_rpc_idle_deadline(timeout);
     }
+    (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
 }
 
 static int trevrpc_rpc_reserve_message_locked(
@@ -506,9 +687,11 @@ static void trevrpc_rpc_receive_destroy(trevrpc_rpc_receive* receive) {
     if (receive == NULL) {
         return;
     }
-    for (index = 0; index < receive->metadata_count; ++index) {
-        free((void*)receive->metadata[index].key);
-        free((void*)receive->metadata[index].value);
+    if (receive->metadata != NULL) {
+        for (index = 0; index < receive->metadata_count; ++index) {
+            free((void*)receive->metadata[index].key);
+            free((void*)receive->metadata[index].value);
+        }
     }
     free(receive->metadata);
     free(receive->data);
@@ -521,10 +704,6 @@ static bool trevrpc_rpc_call_equal(trevrpc_rpc_call_v1 left, trevrpc_rpc_call_v1
 }
 
 static bool trevrpc_rpc_stream_equal(trevrpc_rpc_stream_v1 left, trevrpc_rpc_stream_v1 right) {
-    return left.owner == right.owner && left.slot == right.slot && left.generation == right.generation;
-}
-
-static bool trevrpc_rpc_endpoint_equal(trevrpc_rpc_endpoint_v1 left, trevrpc_rpc_endpoint_v1 right) {
     return left.owner == right.owner && left.slot == right.slot && left.generation == right.generation;
 }
 
@@ -548,69 +727,455 @@ static int trevrpc_rpc_allocate_handle_locked(trevrpc_rpc_runtime* runtime,
     return 0;
 }
 
-static trevrpc_rpc_call_record* trevrpc_rpc_find_call_locked(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call) {
-    trevrpc_rpc_call_record* record;
-    for (record = runtime->calls; record != NULL; record = record->next) {
-        if (trevrpc_rpc_call_equal(record->call, call)) {
-            return record;
+static uint64_t trevrpc_rpc_registry_hash(const uint64_t* key, uint8_t count) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    uint8_t index;
+    for (index = 0; index < count; ++index) {
+        uint64_t value = key[index];
+        uint8_t byte;
+        for (byte = 0; byte < sizeof(value); ++byte) {
+            hash ^= (value >> (byte * 8u)) & UINT64_C(0xff);
+            hash *= UINT64_C(1099511628211);
         }
     }
+    return hash == 0 ? 1 : hash;
+}
+
+static bool trevrpc_rpc_registry_key_equal(
+    const trevrpc_rpc_registry_entry* entry, const uint64_t* key, uint8_t count, uint64_t hash) {
+    return entry->state == 1 && entry->hash == hash && entry->count == count &&
+           memcmp(entry->key, key, (size_t)count * sizeof(*key)) == 0;
+}
+
+static int trevrpc_rpc_registry_rehash(trevrpc_rpc_registry* registry, size_t capacity) {
+    trevrpc_rpc_registry_entry* old_entries = registry->entries;
+    size_t old_capacity = registry->capacity;
+    trevrpc_rpc_registry_entry* entries;
+    size_t index;
+    if (capacity < 16 || capacity > SIZE_MAX / 2 || (capacity & (capacity - 1)) != 0) {
+        return -EINVAL;
+    }
+    entries = calloc(capacity, sizeof(*entries));
+    if (entries == NULL) {
+        return -ENOMEM;
+    }
+    registry->entries = entries;
+    registry->capacity = capacity;
+    registry->size = 0;
+    registry->tombstones = 0;
+    for (index = 0; index < old_capacity; ++index) {
+        if (old_entries[index].state == 1) {
+            size_t position = old_entries[index].hash & (capacity - 1);
+            while (entries[position].state == 1) {
+                position = (position + 1) & (capacity - 1);
+            }
+            entries[position] = old_entries[index];
+            ++registry->size;
+        }
+    }
+    free(old_entries);
+    return 0;
+}
+
+static int trevrpc_rpc_registry_init(trevrpc_rpc_registry* registry) {
+    memset(registry, 0, sizeof(*registry));
+    return trevrpc_rpc_registry_rehash(registry, 16);
+}
+
+static void trevrpc_rpc_registry_destroy(trevrpc_rpc_registry* registry) {
+    size_t index;
+    if (registry == NULL) {
+        return;
+    }
+    for (index = 0; index < registry->capacity; ++index) {
+        trevrpc_rpc_registry_value* node = registry->entries[index].values;
+        while (node != NULL) {
+            trevrpc_rpc_registry_value* next = node->next;
+            free(node);
+            node = next;
+        }
+    }
+    free(registry->entries);
+    memset(registry, 0, sizeof(*registry));
+}
+
+static void* trevrpc_rpc_registry_find(const trevrpc_rpc_registry* registry, const uint64_t* key, uint8_t count) {
+    uint64_t hash;
+    size_t position;
+    size_t probes = 0;
+    if (registry->capacity == 0) {
+        return NULL;
+    }
+    hash = trevrpc_rpc_registry_hash(key, count);
+    position = hash & (registry->capacity - 1);
+    while (probes++ < registry->capacity) {
+        const trevrpc_rpc_registry_entry* entry = &registry->entries[position];
+        if (entry->state == 0) {
+            return NULL;
+        }
+        if (trevrpc_rpc_registry_key_equal(entry, key, count, hash)) {
+            return entry->values == NULL ? NULL : entry->values->value;
+        }
+        position = (position + 1) & (registry->capacity - 1);
+    }
     return NULL;
+}
+
+static int trevrpc_rpc_registry_insert(trevrpc_rpc_registry* registry,
+    const uint64_t* key, uint8_t count, void* value) {
+    uint64_t hash;
+    size_t position;
+    size_t first_tombstone = SIZE_MAX;
+    size_t probes = 0;
+    if (count == 0 || count > 6 || value == NULL) {
+        return -EINVAL;
+    }
+    if (registry->capacity == 0) {
+        int result = trevrpc_rpc_registry_init(registry);
+        if (result != 0) {
+            return result;
+        }
+    }
+    if ((registry->size + registry->tombstones + 1) * 10 >= registry->capacity * 7) {
+        size_t capacity = registry->tombstones > registry->size ? registry->capacity : registry->capacity * 2;
+        int result = trevrpc_rpc_registry_rehash(registry, capacity);
+        if (result != 0) {
+            return result;
+        }
+    }
+    hash = trevrpc_rpc_registry_hash(key, count);
+    position = hash & (registry->capacity - 1);
+    while (probes++ < registry->capacity) {
+        trevrpc_rpc_registry_entry* entry = &registry->entries[position];
+        if (entry->state == 0) {
+            if (first_tombstone != SIZE_MAX) {
+                position = first_tombstone;
+                entry = &registry->entries[position];
+                --registry->tombstones;
+            }
+            trevrpc_rpc_registry_value* node = malloc(sizeof(*node));
+            if (node == NULL) {
+                return -ENOMEM;
+            }
+            node->value = value;
+            node->next = NULL;
+            memcpy(entry->key, key, (size_t)count * sizeof(*key));
+            entry->hash = hash;
+            entry->values = node;
+            entry->count = count;
+            entry->state = 1;
+            ++registry->size;
+            return 0;
+        }
+        if (entry->state == 2) {
+            if (first_tombstone == SIZE_MAX) {
+                first_tombstone = position;
+            }
+        } else if (trevrpc_rpc_registry_key_equal(entry, key, count, hash)) {
+            return -EEXIST;
+        }
+        position = (position + 1) & (registry->capacity - 1);
+    }
+    return -ENOSPC;
+}
+
+static void* trevrpc_rpc_registry_remove(trevrpc_rpc_registry* registry, const uint64_t* key, uint8_t count) {
+    uint64_t hash;
+    size_t position;
+    size_t probes = 0;
+    if (registry->capacity == 0) {
+        return NULL;
+    }
+    hash = trevrpc_rpc_registry_hash(key, count);
+    position = hash & (registry->capacity - 1);
+    while (probes++ < registry->capacity) {
+        trevrpc_rpc_registry_entry* entry = &registry->entries[position];
+        if (entry->state == 0) {
+            return NULL;
+        }
+        if (trevrpc_rpc_registry_key_equal(entry, key, count, hash)) {
+            trevrpc_rpc_registry_value* node = entry->values;
+            void* value;
+            if (node == NULL) {
+                return NULL;
+            }
+            entry->values = node->next;
+            value = node->value;
+            free(node);
+            if (entry->values == NULL) {
+                entry->state = 2;
+                --registry->size;
+                ++registry->tombstones;
+            }
+            return value;
+        }
+        position = (position + 1) & (registry->capacity - 1);
+    }
+    return NULL;
+}
+
+static int trevrpc_rpc_registry_rekey(
+    trevrpc_rpc_registry* registry, const uint64_t* old_key, const uint64_t* new_key, uint8_t count, void* value) {
+    uint64_t old_hash;
+    uint64_t new_hash;
+    size_t old_position;
+    size_t new_position;
+    size_t first_tombstone = SIZE_MAX;
+    size_t probes = 0;
+    trevrpc_rpc_registry_entry* old_entry = NULL;
+    trevrpc_rpc_registry_entry* new_entry;
+    if (registry->capacity == 0 || count == 0 || count > 6 || value == NULL) {
+        return -EINVAL;
+    }
+    old_hash = trevrpc_rpc_registry_hash(old_key, count);
+    old_position = old_hash & (registry->capacity - 1);
+    while (probes++ < registry->capacity) {
+        trevrpc_rpc_registry_entry* entry = &registry->entries[old_position];
+        if (entry->state == 0) {
+            return -ENOENT;
+        }
+        if (trevrpc_rpc_registry_key_equal(entry, old_key, count, old_hash)) {
+            if (entry->values == NULL || entry->values->next != NULL || entry->values->value != value) {
+                return -EIO;
+            }
+            old_entry = entry;
+            break;
+        }
+        old_position = (old_position + 1) & (registry->capacity - 1);
+    }
+    if (old_entry == NULL) {
+        return -ENOENT;
+    }
+    new_hash = trevrpc_rpc_registry_hash(new_key, count);
+    new_position = new_hash & (registry->capacity - 1);
+    probes = 0;
+    while (probes++ < registry->capacity) {
+        new_entry = &registry->entries[new_position];
+        if (new_entry->state == 0) {
+            if (first_tombstone != SIZE_MAX) {
+                new_position = first_tombstone;
+                new_entry = &registry->entries[new_position];
+                --registry->tombstones;
+            }
+            break;
+        }
+        if (new_entry->state == 2) {
+            if (first_tombstone == SIZE_MAX) {
+                first_tombstone = new_position;
+            }
+        } else if (trevrpc_rpc_registry_key_equal(new_entry, new_key, count, new_hash)) {
+            return -EEXIST;
+        }
+        new_position = (new_position + 1) & (registry->capacity - 1);
+    }
+    if (probes > registry->capacity) {
+        if (first_tombstone == SIZE_MAX) {
+            return -ENOSPC;
+        }
+        new_entry = &registry->entries[first_tombstone];
+        --registry->tombstones;
+    } else if (new_entry->state == 2) {
+        --registry->tombstones;
+    }
+    new_entry->values = old_entry->values;
+    memcpy(new_entry->key, new_key, (size_t)count * sizeof(*new_key));
+    new_entry->hash = new_hash;
+    new_entry->count = count;
+    new_entry->state = 1;
+    old_entry->values = NULL;
+    old_entry->state = 2;
+    ++registry->tombstones;
+    return 0;
+}
+
+static int trevrpc_rpc_registry_insert_alias(
+    trevrpc_rpc_registry* registry, const uint64_t* key, uint8_t count, void* value) {
+    uint64_t hash;
+    size_t position;
+    size_t first_tombstone = SIZE_MAX;
+    size_t probes = 0;
+    if (count == 0 || count > 6 || value == NULL) {
+        return -EINVAL;
+    }
+    if (registry->capacity == 0) {
+        int result = trevrpc_rpc_registry_init(registry);
+        if (result != 0) {
+            return result;
+        }
+    }
+    if ((registry->size + registry->tombstones + 1) * 10 >= registry->capacity * 7) {
+        size_t capacity = registry->tombstones > registry->size ? registry->capacity : registry->capacity * 2;
+        int result = trevrpc_rpc_registry_rehash(registry, capacity);
+        if (result != 0) {
+            return result;
+        }
+    }
+    hash = trevrpc_rpc_registry_hash(key, count);
+    position = hash & (registry->capacity - 1);
+    while (probes++ < registry->capacity) {
+        trevrpc_rpc_registry_entry* entry = &registry->entries[position];
+        if (entry->state == 0) {
+            if (first_tombstone != SIZE_MAX) {
+                position = first_tombstone;
+                entry = &registry->entries[position];
+                --registry->tombstones;
+            }
+            {
+                trevrpc_rpc_registry_value* node = malloc(sizeof(*node));
+                if (node == NULL) {
+                    return -ENOMEM;
+                }
+                node->value = value;
+                node->next = NULL;
+                memcpy(entry->key, key, (size_t)count * sizeof(*key));
+                entry->hash = hash;
+                entry->values = node;
+                entry->count = count;
+                entry->state = 1;
+                ++registry->size;
+            }
+            return 0;
+        }
+        if (entry->state == 2) {
+            if (first_tombstone == SIZE_MAX) {
+                first_tombstone = position;
+            }
+        } else if (trevrpc_rpc_registry_key_equal(entry, key, count, hash)) {
+            trevrpc_rpc_registry_value* existing = entry->values;
+            trevrpc_rpc_registry_value* node;
+            while (existing != NULL) {
+                if (existing->value == value) {
+                    return -EEXIST;
+                }
+                existing = existing->next;
+            }
+            node = malloc(sizeof(*node));
+            if (node == NULL) {
+                return -ENOMEM;
+            }
+            node->value = value;
+            node->next = entry->values;
+            entry->values = node;
+            return 0;
+        }
+        position = (position + 1) & (registry->capacity - 1);
+    }
+    return -ENOSPC;
+}
+
+static void* trevrpc_rpc_registry_remove_value(
+    trevrpc_rpc_registry* registry, const uint64_t* key, uint8_t count, void* value) {
+    uint64_t hash;
+    size_t position;
+    size_t probes = 0;
+    if (registry->capacity == 0) {
+        return NULL;
+    }
+    hash = trevrpc_rpc_registry_hash(key, count);
+    position = hash & (registry->capacity - 1);
+    while (probes++ < registry->capacity) {
+        trevrpc_rpc_registry_entry* entry = &registry->entries[position];
+        if (entry->state == 0) {
+            return NULL;
+        }
+        if (trevrpc_rpc_registry_key_equal(entry, key, count, hash)) {
+            trevrpc_rpc_registry_value** cursor = &entry->values;
+            while (*cursor != NULL && (*cursor)->value != value) {
+                cursor = &(*cursor)->next;
+            }
+            if (*cursor == NULL) {
+                return NULL;
+            }
+            {
+                trevrpc_rpc_registry_value* node = *cursor;
+                *cursor = node->next;
+                free(node);
+            }
+            if (entry->values == NULL) {
+                entry->state = 2;
+                --registry->size;
+                ++registry->tombstones;
+            }
+            return value;
+        }
+        position = (position + 1) & (registry->capacity - 1);
+    }
+    return NULL;
+}
+
+static void trevrpc_rpc_handle_key(uint64_t* key, uint8_t* count, uint64_t owner, uint32_t slot, uint32_t generation) {
+    key[0] = owner;
+    key[1] = slot;
+    key[2] = generation;
+    *count = 3;
+}
+
+enum trevrpc_rpc_transport_registry_role {
+    TREVRPC_RPC_TRANSPORT_ROLE_ENDPOINT = 1,
+    TREVRPC_RPC_TRANSPORT_ROLE_CONNECTION = 2,
+    TREVRPC_RPC_TRANSPORT_ROLE_CALL = 3,
+};
+
+static void trevrpc_rpc_transport_key(
+    uint64_t* key, uint8_t* count, trevrpc_rpc_transport_handle handle, uint32_t kind, uint32_t role) {
+    trevrpc_rpc_handle_key(key, count, handle.owner, handle.slot, handle.generation);
+    key[3] = kind;
+    key[4] = role;
+    *count = 5;
+}
+
+static trevrpc_rpc_call_record* trevrpc_rpc_find_call_locked(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_v1 call) {
+    uint64_t key[6];
+    uint8_t count;
+    trevrpc_rpc_handle_key(key, &count, call.owner, call.slot, call.generation);
+    return trevrpc_rpc_registry_find(&runtime->call_registry, key, count);
 }
 
 static trevrpc_rpc_call_record* trevrpc_rpc_find_stream_locked(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream) {
-    trevrpc_rpc_call_record* record;
-    for (record = runtime->calls; record != NULL; record = record->next) {
-        if (trevrpc_rpc_stream_equal(record->stream, stream)) {
-            return record;
-        }
-    }
-    return NULL;
+    return trevrpc_rpc_find_call_locked(runtime, (trevrpc_rpc_call_v1){stream.owner, stream.slot, stream.generation});
 }
 
 static trevrpc_rpc_endpoint_record* trevrpc_rpc_find_endpoint_locked(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_endpoint_v1 endpoint) {
-    trevrpc_rpc_endpoint_record* record;
-    for (record = runtime->endpoints; record != NULL; record = record->next) {
-        if (trevrpc_rpc_endpoint_equal(record->endpoint, endpoint)) {
-            return record;
-        }
-    }
-    return NULL;
+    uint64_t key[6];
+    uint8_t count;
+    trevrpc_rpc_handle_key(key, &count, endpoint.owner, endpoint.slot, endpoint.generation);
+    return trevrpc_rpc_registry_find(&runtime->endpoint_registry, key, count);
 }
 
 static trevrpc_rpc_call_record* trevrpc_rpc_find_call_by_transport_locked(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_transport_handle stream) {
-    trevrpc_rpc_call_record* record;
-    for (record = runtime->calls; record != NULL; record = record->next) {
-        if (trevrpc_rpc_transport_handle_equal(record->transport_stream, stream)) {
-            return record;
-        }
-    }
-    return NULL;
+    uint64_t key[6];
+    uint8_t count;
+    trevrpc_rpc_transport_key(
+        key, &count, stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, TREVRPC_RPC_TRANSPORT_ROLE_CALL);
+    return trevrpc_rpc_registry_find(&runtime->transport_registry, key, count);
 }
 
 static trevrpc_rpc_endpoint_record* trevrpc_rpc_find_endpoint_by_transport_locked(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_transport_handle endpoint) {
+    uint64_t key[6];
+    uint8_t count;
     trevrpc_rpc_endpoint_record* record;
-    for (record = runtime->endpoints; record != NULL; record = record->next) {
-        if (trevrpc_rpc_transport_handle_equal(record->transport_endpoint, endpoint)) {
-            return record;
-        }
+    trevrpc_rpc_transport_key(
+        key, &count, endpoint, TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER, TREVRPC_RPC_TRANSPORT_ROLE_ENDPOINT);
+    record = trevrpc_rpc_registry_find(&runtime->transport_registry, key, count);
+    if (record == NULL) {
+        trevrpc_rpc_transport_key(
+            key, &count, endpoint, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION, TREVRPC_RPC_TRANSPORT_ROLE_ENDPOINT);
+        record = trevrpc_rpc_registry_find(&runtime->transport_registry, key, count);
     }
-    return NULL;
+    return record;
 }
 
 static trevrpc_rpc_transport_connection_record* trevrpc_rpc_find_transport_connection_locked(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_transport_handle connection) {
-    trevrpc_rpc_transport_connection_record* record;
-    for (record = runtime->transport_connections; record != NULL; record = record->next) {
-        if (trevrpc_rpc_transport_handle_equal(record->transport_connection, connection)) {
-            return record;
-        }
-    }
-    return NULL;
+    uint64_t key[6];
+    uint8_t count;
+    trevrpc_rpc_transport_key(
+        key, &count, connection, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION, TREVRPC_RPC_TRANSPORT_ROLE_CONNECTION);
+    return trevrpc_rpc_registry_find(&runtime->transport_registry, key, count);
 }
 
 static bool trevrpc_rpc_remove_transport_connection_locked(
@@ -624,6 +1189,16 @@ static bool trevrpc_rpc_remove_transport_connection_locked(
         int result = trevrpc_rpc_transport_release_handle(
             runtime->transport, record->transport_connection, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
         *cursor = record->next;
+        {
+            uint64_t key[6];
+            uint8_t count;
+            trevrpc_rpc_transport_key(key,
+                &count,
+                record->transport_connection,
+                TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION,
+                TREVRPC_RPC_TRANSPORT_ROLE_CONNECTION);
+            (void)trevrpc_rpc_registry_remove_value(&runtime->transport_registry, key, count, record);
+        }
         if (result != 0) {
             trevrpc_rpc_retire_handle_locked(
                 runtime, record->transport_connection, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
@@ -636,14 +1211,10 @@ static bool trevrpc_rpc_remove_transport_connection_locked(
 
 static trevrpc_rpc_cancellation_record* trevrpc_rpc_find_cancellation_locked(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_cancellation_v1 cancellation) {
-    trevrpc_rpc_cancellation_record* record;
-    for (record = runtime->cancellations; record != NULL; record = record->next) {
-        if (record->cancellation.owner == cancellation.owner && record->cancellation.slot == cancellation.slot &&
-            record->cancellation.generation == cancellation.generation) {
-            return record;
-        }
-    }
-    return NULL;
+    uint64_t key[6];
+    uint8_t count;
+    trevrpc_rpc_handle_key(key, &count, cancellation.owner, cancellation.slot, cancellation.generation);
+    return trevrpc_rpc_registry_find(&runtime->cancellation_registry, key, count);
 }
 
 static trevrpc_rpc_event* trevrpc_rpc_event_allocate(uint32_t kind) {
@@ -831,16 +1402,6 @@ static trevrpc_rpc_operation* trevrpc_rpc_operation_allocate(
     return operation;
 }
 
-static bool trevrpc_rpc_operation_matches_scope(const trevrpc_rpc_operation* operation,
-    uint32_t scope_kind,
-    uint64_t owner,
-    uint32_t slot,
-    uint32_t generation,
-    uint64_t operation_id) {
-    return operation->scope_kind == scope_kind && operation->scope_owner == owner && operation->scope_slot == slot &&
-           operation->scope_generation == generation && operation->operation_id == operation_id;
-}
-
 static int trevrpc_rpc_operation_admit_locked(trevrpc_rpc_runtime* runtime,
     trevrpc_rpc_operation* operation,
     uint32_t subject_kind,
@@ -851,18 +1412,22 @@ static int trevrpc_rpc_operation_admit_locked(trevrpc_rpc_runtime* runtime,
     uint64_t scope_owner,
     uint32_t scope_slot,
     uint32_t scope_generation) {
-    trevrpc_rpc_operation* current;
+    uint64_t scope_key[6];
+    uint64_t transport_key[6];
+    uint8_t key_count;
+    int result;
     if (runtime->state != TREVRPC_RPC_STATE_RUNNING) {
         return -ESHUTDOWN;
     }
     if (runtime->next_transport_operation_id == UINT64_MAX) {
         return -EOVERFLOW;
     }
-    for (current = runtime->operations; current != NULL; current = current->next) {
-        if (trevrpc_rpc_operation_matches_scope(
-                current, scope_kind, scope_owner, scope_slot, scope_generation, operation->operation_id)) {
-            return -EALREADY;
-        }
+    trevrpc_rpc_handle_key(scope_key, &key_count, scope_owner, scope_slot, scope_generation);
+    scope_key[3] = scope_kind;
+    scope_key[4] = operation->operation_id;
+    key_count = 5;
+    if (trevrpc_rpc_registry_find(&runtime->operation_scope_registry, scope_key, key_count) != NULL) {
+        return -EALREADY;
     }
     operation->subject_kind = subject_kind;
     operation->subject_owner = subject_owner;
@@ -873,11 +1438,45 @@ static int trevrpc_rpc_operation_admit_locked(trevrpc_rpc_runtime* runtime,
     operation->scope_slot = scope_slot;
     operation->scope_generation = scope_generation;
     operation->transport_operation_id = runtime->next_transport_operation_id++;
+    trevrpc_rpc_handle_key(transport_key, &key_count, subject_owner, subject_slot, subject_generation);
+    transport_key[3] = subject_kind;
+    transport_key[4] = operation->transport_operation_id;
+    key_count = 5;
+    result = trevrpc_rpc_registry_insert(&runtime->operation_transport_registry, transport_key, key_count, operation);
+    if (result != 0) {
+        return result;
+    }
+    result = trevrpc_rpc_registry_insert(&runtime->operation_scope_registry, scope_key, 5, operation);
+    if (result != 0) {
+        (void)trevrpc_rpc_registry_remove(&runtime->operation_transport_registry, transport_key, key_count);
+        return result;
+    }
     operation->event->reserved = true;
     operation->next = runtime->operations;
     runtime->operations = operation;
     ++runtime->mandatory_reservations;
     return 0;
+}
+
+static int trevrpc_rpc_operation_rekey_transport_locked(
+    trevrpc_rpc_runtime* runtime, trevrpc_rpc_operation* operation, uint64_t transport_operation_id) {
+    uint64_t old_key[6];
+    uint64_t new_key[6];
+    uint8_t key_count;
+    trevrpc_rpc_handle_key(old_key, &key_count, operation->subject_owner, operation->subject_slot,
+        operation->subject_generation);
+    old_key[3] = operation->subject_kind;
+    old_key[4] = operation->transport_operation_id;
+    trevrpc_rpc_handle_key(new_key, &key_count, operation->subject_owner, operation->subject_slot,
+        operation->subject_generation);
+    new_key[3] = operation->subject_kind;
+    new_key[4] = transport_operation_id;
+    int result =
+        trevrpc_rpc_registry_rekey(&runtime->operation_transport_registry, old_key, new_key, 5, operation);
+    if (result == 0) {
+        operation->transport_operation_id = transport_operation_id;
+    }
+    return result;
 }
 
 static void trevrpc_rpc_operation_remove_locked(
@@ -888,6 +1487,19 @@ static void trevrpc_rpc_operation_remove_locked(
     }
     if (*cursor == operation) {
         *cursor = operation->next;
+    }
+    {
+        uint64_t key[6];
+        uint8_t count;
+        trevrpc_rpc_handle_key(key, &count, operation->subject_owner, operation->subject_slot,
+            operation->subject_generation);
+        key[3] = operation->subject_kind;
+        key[4] = operation->transport_operation_id;
+        (void)trevrpc_rpc_registry_remove(&runtime->operation_transport_registry, key, 5);
+        trevrpc_rpc_handle_key(key, &count, operation->scope_owner, operation->scope_slot, operation->scope_generation);
+        key[3] = operation->scope_kind;
+        key[4] = operation->operation_id;
+        (void)trevrpc_rpc_registry_remove(&runtime->operation_scope_registry, key, 5);
     }
     if (destroy_event && operation->event != NULL) {
         if (operation->event->reserved) {
@@ -908,15 +1520,12 @@ static trevrpc_rpc_operation* trevrpc_rpc_find_transport_operation_locked(trevrp
     uint32_t slot,
     uint32_t generation,
     uint64_t transport_operation_id) {
-    trevrpc_rpc_operation* operation;
-    for (operation = runtime->operations; operation != NULL; operation = operation->next) {
-        if (operation->subject_kind == subject_kind && operation->subject_owner == owner &&
-            operation->subject_slot == slot && operation->subject_generation == generation &&
-            operation->transport_operation_id == transport_operation_id) {
-            return operation;
-        }
-    }
-    return NULL;
+    uint64_t key[6];
+    uint8_t count;
+    trevrpc_rpc_handle_key(key, &count, owner, slot, generation);
+    key[3] = subject_kind;
+    key[4] = transport_operation_id;
+    return trevrpc_rpc_registry_find(&runtime->operation_transport_registry, key, 5);
 }
 
 static void trevrpc_rpc_signal_locked(trevrpc_rpc_runtime* runtime) {
@@ -1154,6 +1763,8 @@ static trevrpc_rpc_call_record* trevrpc_rpc_call_record_allocate(void) {
     record->initial_request_deadline_nanos = 0;
     record->send_idle_deadline_nanos = 0;
     record->receive_idle_deadline_nanos = 0;
+    record->deadline_entry.record = record;
+    record->deadline_entry.index = SIZE_MAX;
     record->max_send_messages = -1;
     record->max_send_body_size = -1;
     record->max_receive_messages = -1;
@@ -1203,6 +1814,16 @@ static void trevrpc_rpc_call_record_destroy_locked(trevrpc_rpc_runtime* runtime,
     if (*cursor == record) {
         *cursor = record->next;
     }
+    trevrpc_rpc_deadline_remove_locked(runtime, record);
+    {
+        uint64_t key[6];
+        uint8_t count;
+        trevrpc_rpc_handle_key(key, &count, record->call.owner, record->call.slot, record->call.generation);
+        (void)trevrpc_rpc_registry_remove(&runtime->call_registry, key, count);
+        trevrpc_rpc_transport_key(
+        key, &count, record->transport_stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, TREVRPC_RPC_TRANSPORT_ROLE_CALL);
+        (void)trevrpc_rpc_registry_remove_value(&runtime->transport_registry, key, count, record);
+    }
     trevrpc_rpc_drop_pending_receive_locked(runtime, record);
     if (!record->transport_stream_released &&
         trevrpc_rpc_transport_release_handle(
@@ -1233,6 +1854,15 @@ static void trevrpc_rpc_endpoint_record_destroy_locked(
     if (*cursor == record) {
         *cursor = record->next;
     }
+    {
+        uint64_t key[6];
+        uint8_t count;
+        trevrpc_rpc_handle_key(key, &count, record->endpoint.owner, record->endpoint.slot, record->endpoint.generation);
+        (void)trevrpc_rpc_registry_remove(&runtime->endpoint_registry, key, count);
+        trevrpc_rpc_transport_key(
+            key, &count, record->transport_endpoint, record->transport_kind, TREVRPC_RPC_TRANSPORT_ROLE_ENDPOINT);
+        (void)trevrpc_rpc_registry_remove_value(&runtime->transport_registry, key, count, record);
+    }
     if (!record->transport_released &&
         trevrpc_rpc_transport_release_handle(runtime->transport, record->transport_endpoint, record->transport_kind) !=
             0) {
@@ -1250,14 +1880,45 @@ static void trevrpc_rpc_endpoint_maybe_reclaim_locked(
 }
 
 static int trevrpc_rpc_insert_call_locked(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_record* record) {
+    uint64_t key[6];
+    uint8_t count;
+    int result;
     if (runtime->live_calls >= runtime->call_capacity || runtime->live_streams >= runtime->stream_capacity) {
         return -EAGAIN;
+    }
+    trevrpc_rpc_handle_key(key, &count, record->call.owner, record->call.slot, record->call.generation);
+    result = trevrpc_rpc_registry_insert(&runtime->call_registry, key, count, record);
+    if (result != 0) {
+        return result;
+    }
+    trevrpc_rpc_transport_key(
+        key, &count, record->transport_stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, TREVRPC_RPC_TRANSPORT_ROLE_CALL);
+    result = trevrpc_rpc_registry_insert_alias(&runtime->transport_registry, key, count, record);
+    if (result != 0) {
+        (void)trevrpc_rpc_registry_remove(&runtime->call_registry, (uint64_t[3]){record->call.owner, record->call.slot,
+            record->call.generation}, 3);
+        return result;
     }
     record->next = runtime->calls;
     runtime->calls = record;
     ++runtime->live_calls;
     ++runtime->live_streams;
     runtime->mandatory_reservations += 2;
+    result = trevrpc_rpc_deadline_refresh_locked(runtime, record);
+    if (result != 0) {
+        trevrpc_rpc_call_record** cursor = &runtime->calls;
+        while (*cursor != record) cursor = &(*cursor)->next;
+        *cursor = record->next;
+        (void)trevrpc_rpc_registry_remove(&runtime->call_registry,
+            (uint64_t[3]){record->call.owner, record->call.slot, record->call.generation}, 3);
+        trevrpc_rpc_transport_key(
+        key, &count, record->transport_stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, TREVRPC_RPC_TRANSPORT_ROLE_CALL);
+        (void)trevrpc_rpc_registry_remove_value(&runtime->transport_registry, key, count, record);
+        --runtime->live_calls;
+        --runtime->live_streams;
+        runtime->mandatory_reservations -= 2;
+        return result;
+    }
     return 0;
 }
 
@@ -1431,12 +2092,14 @@ static int trevrpc_rpc_copy_request_event(trevrpc_rpc_runtime* runtime,
         record->waiting_for_request = false;
         if (request.kind == TREVRPC_RPC_KIND_CLIENT_STREAMING ||
             request.kind == TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
-            record->request_message_count = 1;
+            record->request_message_count = request.body_len == 0 ? 0 : 1;
             record->request_body_size = request.body_len;
         }
         if (request.kind == TREVRPC_RPC_KIND_CLIENT_STREAMING ||
             request.kind == TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
             trevrpc_rpc_reset_idle_locked(runtime, record, false);
+        } else {
+            (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
         }
         if (record->deadline_nanos != TREVRPC_RPC_DEADLINE_INFINITE || record->receive_idle_deadline_nanos != 0) {
             trevrpc_rpc_signal_driver_locked(runtime);
@@ -1589,6 +2252,7 @@ static void trevrpc_rpc_fail_call_operations_locked(
     record->send_finish_pending = false;
     record->send_closed = true;
     record->send_idle_deadline_nanos = 0;
+    (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
 }
 
 static bool trevrpc_rpc_operation_uses_send_direction(const trevrpc_rpc_operation* operation) {
@@ -1641,6 +2305,7 @@ static void trevrpc_rpc_handle_send_stopped_locked(
     record->send_finish_pending = false;
     record->send_closed = true;
     record->send_idle_deadline_nanos = 0;
+    (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
 }
 
 static void trevrpc_rpc_handle_send_stopped(
@@ -1675,6 +2340,7 @@ static void trevrpc_rpc_publish_call_terminals_locked(
         record->closing = true;
         record->deadline_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
         record->initial_request_deadline_nanos = 0;
+        trevrpc_rpc_deadline_remove_locked(runtime, record);
         trevrpc_rpc_release_reserved_event_locked(runtime, &record->stream_terminal_event);
         trevrpc_rpc_release_reserved_event_locked(runtime, &record->call_terminal_event);
         if (runtime->live_streams != 0) {
@@ -1760,6 +2426,7 @@ static void trevrpc_rpc_publish_call_terminals_locked(
     record->call_terminal_committed = true;
     record->closing = true;
     record->deadline_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
+    trevrpc_rpc_deadline_remove_locked(runtime, record);
     trevrpc_rpc_call_release_cancellation_locked(record);
     if (runtime->live_streams != 0) {
         --runtime->live_streams;
@@ -1815,6 +2482,7 @@ static void trevrpc_rpc_publish_endpoint_terminal_locked(
         trevrpc_rpc_complete_endpoint_start_locked(runtime, record, info, TREVRPC_RPC_EVENT_ENDPOINT_FAILED);
     }
     if (operation != NULL) {
+        assert(operation->event != NULL);
         event = operation->event;
         operation->event = NULL;
         trevrpc_rpc_release_reserved_event_locked(runtime, &record->terminal_event);
@@ -1822,6 +2490,7 @@ static void trevrpc_rpc_publish_endpoint_terminal_locked(
         event = record->terminal_event;
         record->terminal_event = NULL;
     }
+    assert(event != NULL);
     trevrpc_rpc_fill_event_from_transport(event, info);
     event->kind = TREVRPC_RPC_EVENT_ENDPOINT_CLOSED;
     event->subject_kind = TREVRPC_RPC_OBJECT_ENDPOINT;
@@ -1968,12 +2637,16 @@ static void trevrpc_rpc_handle_send_complete(
             if (runtime->next_transport_operation_id == UINT64_MAX) {
                 continuation_result = -EOVERFLOW;
             } else {
-                operation->transport_operation_id = runtime->next_transport_operation_id++;
-                continuation_result = trevrpc_rpc_transport_stream_send(runtime->transport,
-                    info->subject,
-                    operation->transport_operation_id,
-                    continuation_frame + 4,
-                    continuation_frame_len - 4);
+                uint64_t transport_operation_id = runtime->next_transport_operation_id++;
+                continuation_result =
+                    trevrpc_rpc_operation_rekey_transport_locked(runtime, operation, transport_operation_id);
+                if (continuation_result == 0) {
+                    continuation_result = trevrpc_rpc_transport_stream_send(runtime->transport,
+                        info->subject,
+                        operation->transport_operation_id,
+                        continuation_frame + 4,
+                        continuation_frame_len - 4);
+                }
             }
             free(continuation_frame);
             if (continuation_result == 0) {
@@ -2182,11 +2855,24 @@ static int trevrpc_rpc_handle_transport_event(
                     connection = calloc(1, sizeof(*connection));
                 }
                 if (connection != NULL) {
+                    uint64_t key[6];
+                    uint8_t key_count;
                     connection->transport_connection = info.subject;
                     connection->endpoint = listener->endpoint;
-                    connection->next = runtime->transport_connections;
-                    runtime->transport_connections = connection;
-                } else {
+                    trevrpc_rpc_transport_key(key,
+                        &key_count,
+                        info.subject,
+                        TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION,
+                        TREVRPC_RPC_TRANSPORT_ROLE_CONNECTION);
+                    if (trevrpc_rpc_registry_insert_alias(&runtime->transport_registry, key, key_count, connection) == 0) {
+                        connection->next = runtime->transport_connections;
+                        runtime->transport_connections = connection;
+                    } else {
+                        free(connection);
+                        connection = NULL;
+                    }
+                }
+                if (connection == NULL) {
                     close_connection = true;
                 }
             }
@@ -2365,6 +3051,7 @@ static int trevrpc_rpc_handle_transport_event(
         peer_result = trevrpc_rpc_find_or_create_peer_call_locked(runtime, &info, &record);
         if (record != NULL && !record->closing) {
             record->receive_idle_deadline_nanos = 0;
+            (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
             event = trevrpc_rpc_event_from_transport(&info, TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN);
             if (event == NULL) {
                 peer_result = -ENOMEM;
@@ -2373,14 +3060,14 @@ static int trevrpc_rpc_handle_transport_event(
                 event->endpoint = record->endpoint;
                 event->call = record->call;
                 event->stream = record->stream;
-                if (record->waiting_for_request || record->readable_drained_epoch != record->readable_epoch) {
-                    if (record->deferred_receive_fin == NULL) {
-                        record->deferred_receive_fin = event;
-                    } else {
-                        trevrpc_rpc_event_destroy(event);
-                    }
-                    event = NULL;
+                record->receive_fin_observed = true;
+                if (record->deferred_receive_fin == NULL) {
+                    record->deferred_receive_fin = event;
+                } else {
+                    trevrpc_rpc_event_destroy(event);
                 }
+                event = NULL;
+                trevrpc_rpc_flush_receive_barrier_locked(runtime, record);
             }
         }
         pthread_mutex_unlock(&runtime->mutex);
@@ -2408,8 +3095,15 @@ static int trevrpc_rpc_handle_transport_event(
         record = trevrpc_rpc_find_call_by_transport_locked(runtime, info.subject);
         release_stream = record == NULL;
         if (record != NULL) {
+            bool successful_response_waits_for_fin = !record->closing && info.status == 0 &&
+                                                     record->peer_status_received &&
+                                                     !record->receive_fin_observed &&
+                                                     record->close_operation == NULL &&
+                                                     !record->cancelled && !record->deadline_expired &&
+                                                     !record->runtime_close_target;
             if (!record->closing &&
-                (record->waiting_for_request || record->readable_drained_epoch != record->readable_epoch)) {
+                (record->waiting_for_request || record->readable_drained_epoch != record->readable_epoch ||
+                    successful_response_waits_for_fin)) {
                 record->deferred_stream_terminal = info;
                 record->deferred_stream_terminal_valid = true;
             } else {
@@ -2437,34 +3131,21 @@ static int trevrpc_rpc_handle_transport_event(
 }
 
 static int trevrpc_rpc_deadline_poll_timeout_locked(trevrpc_rpc_runtime* runtime) {
-    trevrpc_rpc_call_record* record;
-    uint64_t earliest = TREVRPC_RPC_DEADLINE_INFINITE;
     uint64_t now = 0;
+    uint64_t earliest;
     uint64_t remaining;
     uint64_t milliseconds;
     if (runtime->state != TREVRPC_RPC_STATE_RUNNING) {
         return -1;
     }
-    for (record = runtime->calls; record != NULL; record = record->next) {
-        if (record->closing || record->call_terminal_committed) {
-            continue;
-        }
-        if (record->deadline_nanos < earliest) {
-            earliest = record->deadline_nanos;
-        }
-        if (record->initial_request_deadline_nanos != 0 && record->initial_request_deadline_nanos < earliest) {
-            earliest = record->initial_request_deadline_nanos;
-        }
-        if (record->send_idle_deadline_nanos != 0 && record->send_idle_deadline_nanos < earliest) {
-            earliest = record->send_idle_deadline_nanos;
-        }
-        if (record->receive_idle_deadline_nanos != 0 && record->receive_idle_deadline_nanos < earliest) {
-            earliest = record->receive_idle_deadline_nanos;
-        }
+    while (runtime->deadline_heap_count != 0 &&
+           (runtime->deadline_heap[0]->record->closing || runtime->deadline_heap[0]->record->call_terminal_committed)) {
+        trevrpc_rpc_deadline_remove_locked(runtime, runtime->deadline_heap[0]->record);
     }
-    if (earliest == TREVRPC_RPC_DEADLINE_INFINITE) {
+    if (runtime->deadline_heap_count == 0) {
         return -1;
     }
+    earliest = runtime->deadline_heap[0]->deadline;
     if (trevrpc_rpc_monotonic_nanos(&now) != 0 || earliest <= now) {
         return 0;
     }
@@ -2477,62 +3158,47 @@ static int trevrpc_rpc_deadline_poll_timeout_locked(trevrpc_rpc_runtime* runtime
 }
 
 static bool trevrpc_rpc_expire_one_deadline(trevrpc_rpc_runtime* runtime) {
-    enum timer_kind { TIMER_NONE, TIMER_CALL, TIMER_INITIAL, TIMER_SEND_IDLE, TIMER_RECEIVE_IDLE };
     trevrpc_rpc_transport_event_info info = {0};
     trevrpc_rpc_transport_handle transport_stream = {0};
     trevrpc_rpc_call_record* record;
-    trevrpc_rpc_call_record* selected_record = NULL;
-    enum timer_kind timer = TIMER_NONE;
+    uint32_t timer;
     uint64_t now = 0;
-    uint64_t earliest;
     int abort_result;
     pthread_mutex_lock(&runtime->mutex);
     if (runtime->state != TREVRPC_RPC_STATE_RUNNING) {
         pthread_mutex_unlock(&runtime->mutex);
         return false;
     }
-    if (trevrpc_rpc_monotonic_nanos(&now) != 0) {
-        now = UINT64_MAX;
+    while (runtime->deadline_heap_count != 0 &&
+           (runtime->deadline_heap[0]->record->closing || runtime->deadline_heap[0]->record->call_terminal_committed)) {
+        trevrpc_rpc_deadline_remove_locked(runtime, runtime->deadline_heap[0]->record);
     }
-    earliest = UINT64_MAX;
-    for (record = runtime->calls; record != NULL; record = record->next) {
-        if (record->closing || record->call_terminal_committed) {
-            continue;
-        }
-#define TREVRPC_RPC_PICK_TIMER(value, kind)                                                                            \
-    do {                                                                                                               \
-        if ((value) != 0 && (value) <= now && (value) < earliest) {                                                    \
-            earliest = (value);                                                                                        \
-            timer = (kind);                                                                                            \
-            selected_record = record;                                                                                  \
-        }                                                                                                              \
-    } while (0)
-        TREVRPC_RPC_PICK_TIMER(record->deadline_nanos, TIMER_CALL);
-        TREVRPC_RPC_PICK_TIMER(record->initial_request_deadline_nanos, TIMER_INITIAL);
-        TREVRPC_RPC_PICK_TIMER(record->send_idle_deadline_nanos, TIMER_SEND_IDLE);
-        TREVRPC_RPC_PICK_TIMER(record->receive_idle_deadline_nanos, TIMER_RECEIVE_IDLE);
-#undef TREVRPC_RPC_PICK_TIMER
-        if (timer != TIMER_NONE && earliest == 0) {
-            break;
-        }
-    }
-    if (timer == TIMER_NONE || selected_record == NULL) {
+    if (runtime->deadline_heap_count == 0) {
         pthread_mutex_unlock(&runtime->mutex);
         return false;
     }
-    record = selected_record;
-    if (timer == TIMER_CALL) {
+    if (trevrpc_rpc_monotonic_nanos(&now) != 0) {
+        now = UINT64_MAX;
+    }
+    if (runtime->deadline_heap[0]->deadline > now) {
+        pthread_mutex_unlock(&runtime->mutex);
+        return false;
+    }
+    record = runtime->deadline_heap[0]->record;
+    timer = runtime->deadline_heap[0]->kind;
+    trevrpc_rpc_deadline_remove_locked(runtime, record);
+    if (timer == TREVRPC_RPC_TIMER_CALL) {
         record->deadline_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
-    } else if (timer == TIMER_INITIAL) {
+    } else if (timer == TREVRPC_RPC_TIMER_INITIAL) {
         record->initial_request_deadline_nanos = 0;
-    } else if (timer == TIMER_SEND_IDLE) {
+    } else if (timer == TREVRPC_RPC_TIMER_SEND_IDLE) {
         record->send_idle_deadline_nanos = 0;
     } else {
         record->receive_idle_deadline_nanos = 0;
     }
     record->closing = true;
-    record->suppress_terminals = timer == TIMER_INITIAL && record->waiting_for_request;
-    record->deadline_expired = timer == TIMER_CALL;
+    record->suppress_terminals = timer == TREVRPC_RPC_TIMER_INITIAL && record->waiting_for_request;
+    record->deadline_expired = timer == TREVRPC_RPC_TIMER_CALL;
     record->cancelled = true;
     transport_stream = record->transport_stream;
     info.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL;
@@ -2818,6 +3484,23 @@ int trevrpc_rpc_runtime_adopt_transport_v1(
         free(runtime);
         return -ENOMEM;
     }
+    result = trevrpc_rpc_registry_init(&runtime->call_registry);
+    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->endpoint_registry);
+    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->transport_registry);
+    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->cancellation_registry);
+    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->operation_transport_registry);
+    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->operation_scope_registry);
+    if (result != 0) {
+        trevrpc_rpc_registry_destroy(&runtime->call_registry);
+        trevrpc_rpc_registry_destroy(&runtime->endpoint_registry);
+        trevrpc_rpc_registry_destroy(&runtime->transport_registry);
+        trevrpc_rpc_registry_destroy(&runtime->cancellation_registry);
+        trevrpc_rpc_registry_destroy(&runtime->operation_transport_registry);
+        trevrpc_rpc_registry_destroy(&runtime->operation_scope_registry);
+        free(runtime->retired_pool);
+        free(runtime);
+        return result;
+    }
     runtime->max_metadata_count = config->max_metadata_count;
     runtime->max_status_message_size = config->max_status_message_size;
     runtime->max_message_size = config->max_message_size;
@@ -2831,6 +3514,12 @@ int trevrpc_rpc_runtime_adopt_transport_v1(
     runtime->cancellation_sequence = 1;
     runtime->close_event = trevrpc_rpc_event_allocate(TREVRPC_RPC_EVENT_STOPPED);
     if (runtime->close_event == NULL) {
+        trevrpc_rpc_registry_destroy(&runtime->call_registry);
+        trevrpc_rpc_registry_destroy(&runtime->endpoint_registry);
+        trevrpc_rpc_registry_destroy(&runtime->transport_registry);
+        trevrpc_rpc_registry_destroy(&runtime->cancellation_registry);
+        trevrpc_rpc_registry_destroy(&runtime->operation_transport_registry);
+        trevrpc_rpc_registry_destroy(&runtime->operation_scope_registry);
         free(runtime->retired_pool);
         free(runtime);
         return -ENOMEM;
@@ -2844,6 +3533,8 @@ int trevrpc_rpc_runtime_adopt_transport_v1(
     atomic_init(&runtime->references, 1);
     atomic_init(&runtime->api_gate, 0);
     atomic_init(&runtime->test_fail_next_receive_copy, false);
+    atomic_init(&runtime->test_call_release_result, 0);
+    atomic_init(&runtime->test_call_release_result_persistent, false);
     result = pthread_mutex_init(&runtime->lifetime_mutex, NULL);
     if (result != 0) {
         result = -result;
@@ -2910,6 +3601,12 @@ int trevrpc_rpc_runtime_adopt_transport_v1(
     return 0;
 fail:
     trevrpc_rpc_event_destroy(runtime->close_event);
+    trevrpc_rpc_registry_destroy(&runtime->call_registry);
+    trevrpc_rpc_registry_destroy(&runtime->endpoint_registry);
+    trevrpc_rpc_registry_destroy(&runtime->transport_registry);
+    trevrpc_rpc_registry_destroy(&runtime->cancellation_registry);
+    trevrpc_rpc_registry_destroy(&runtime->operation_transport_registry);
+    trevrpc_rpc_registry_destroy(&runtime->operation_scope_registry);
     free(runtime->retired_pool);
     free(runtime);
     return result;
@@ -2957,6 +3654,47 @@ static void trevrpc_rpc_note_terminal_dequeue_locked(trevrpc_rpc_runtime* runtim
     }
 }
 
+static void trevrpc_rpc_internal_test_mutate_incoming(trevrpc_rpc_event* event, uint32_t kind) {
+    uint32_t index;
+    if (event == NULL || event->kind != TREVRPC_RPC_EVENT_CALL_INCOMING) {
+        return;
+    }
+    switch (kind) {
+    case TREVRPC_RPC_INTERNAL_TEST_MALFORMED_SERVICE:
+        free(event->service);
+        event->service = NULL;
+        event->service_len = 1;
+        break;
+    case TREVRPC_RPC_INTERNAL_TEST_MALFORMED_METHOD:
+        free(event->method);
+        event->method = NULL;
+        event->method_len = 1;
+        break;
+    case TREVRPC_RPC_INTERNAL_TEST_MALFORMED_DATA:
+        if (event->receive != NULL) {
+            free(event->receive->data);
+            event->receive->data = NULL;
+            event->receive->data_len = 1;
+        }
+        break;
+    case TREVRPC_RPC_INTERNAL_TEST_MALFORMED_METADATA:
+        if (event->receive != NULL) {
+            if (event->receive->metadata != NULL) {
+                for (index = 0; index < event->receive->metadata_count; ++index) {
+                    free((void*)event->receive->metadata[index].key);
+                    free((void*)event->receive->metadata[index].value);
+                }
+                free(event->receive->metadata);
+            }
+            event->receive->metadata = NULL;
+            event->receive->metadata_count = 1;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static int trevrpc_rpc_runtime_next_event_impl(trevrpc_rpc_runtime* runtime, trevrpc_rpc_event** out_event) {
     trevrpc_rpc_event* event;
     if (runtime == NULL || out_event == NULL) {
@@ -2996,8 +3734,15 @@ static int trevrpc_rpc_runtime_next_event_impl(trevrpc_rpc_runtime* runtime, tre
         }
     }
     trevrpc_rpc_note_terminal_dequeue_locked(runtime, event);
+    const uint32_t malformed_kind = event->kind == TREVRPC_RPC_EVENT_CALL_INCOMING
+                                         ? runtime->test_malformed_incoming_kind
+                                         : 0;
+    if (malformed_kind != 0) {
+        runtime->test_malformed_incoming_kind = 0;
+    }
     pthread_cond_broadcast(&runtime->condition);
     pthread_mutex_unlock(&runtime->mutex);
+    trevrpc_rpc_internal_test_mutate_incoming(event, malformed_kind);
     *out_event = event;
     return 0;
 }
@@ -3300,8 +4045,24 @@ static int trevrpc_rpc_runtime_start_transport_endpoint_v1_impl(trevrpc_rpc_runt
                 : trevrpc_rpc_transport_endpoint_dial(runtime->transport, config, operation_id, &transport_endpoint);
     }
     if (result == 0) {
+        uint64_t key[6];
+        uint8_t key_count;
         record->transport_endpoint = transport_endpoint;
         record->transport_kind = transport_kind;
+        trevrpc_rpc_handle_key(key, &key_count, record->endpoint.owner, record->endpoint.slot, record->endpoint.generation);
+        result = trevrpc_rpc_registry_insert(&runtime->endpoint_registry, key, key_count, record);
+        if (result == 0) {
+            trevrpc_rpc_transport_key(
+                key, &key_count, transport_endpoint, transport_kind, TREVRPC_RPC_TRANSPORT_ROLE_ENDPOINT);
+            result = trevrpc_rpc_registry_insert_alias(&runtime->transport_registry, key, key_count, record);
+            if (result != 0) {
+                trevrpc_rpc_handle_key(key, &key_count, record->endpoint.owner, record->endpoint.slot,
+                    record->endpoint.generation);
+                (void)trevrpc_rpc_registry_remove(&runtime->endpoint_registry, key, key_count);
+            }
+        }
+    }
+    if (result == 0) {
         record->start_operation = operation;
         record->caller_owned = true;
         record->next = runtime->endpoints;
@@ -3322,6 +4083,9 @@ static int trevrpc_rpc_runtime_start_transport_endpoint_v1_impl(trevrpc_rpc_runt
     }
     pthread_mutex_unlock(&runtime->mutex);
     if (result != 0) {
+        if (record->transport_endpoint.owner != 0) {
+            (void)trevrpc_rpc_transport_release_handle(runtime->transport, record->transport_endpoint, transport_kind);
+        }
         if (operation != NULL) {
             trevrpc_rpc_event_destroy(operation->event);
             free(operation);
@@ -3922,6 +4686,7 @@ receive_next:
             /* A successful peer status closes the request direction; a
              * delayed transport FIN must not rearm an already-complete idle timer. */
             record->receive_idle_deadline_nanos = 0;
+            (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
         }
         pthread_mutex_unlock(&runtime->mutex);
         consume_peer_status = false;
@@ -4016,6 +4781,7 @@ receive_next:
         if (record != NULL) {
             record->peer_status_received = true;
             record->receive_idle_deadline_nanos = 0;
+            (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
         }
         pthread_mutex_unlock(&runtime->mutex);
     }
@@ -4024,6 +4790,7 @@ receive_next:
     if (record != NULL) {
         if (decode_unary_response || receive->kind == TREVRPC_RPC_RECEIVE_STATUS) {
             record->receive_idle_deadline_nanos = 0;
+            (void)trevrpc_rpc_deadline_refresh_locked(runtime, record);
         } else {
             trevrpc_rpc_reset_idle_locked(runtime, record, false);
             if (record->receive_idle_deadline_nanos != 0) {
@@ -4040,6 +4807,21 @@ receive_next:
 void trevrpc_rpc_internal_test_fail_next_receive_copy(trevrpc_rpc_runtime* runtime) {
     if (runtime != NULL) {
         atomic_store_explicit(&runtime->test_fail_next_receive_copy, true, memory_order_release);
+    }
+}
+
+void trevrpc_rpc_internal_test_set_call_release_result(trevrpc_rpc_runtime* runtime, int result, bool persistent) {
+    if (runtime != NULL) {
+        atomic_store_explicit(&runtime->test_call_release_result, result, memory_order_release);
+        atomic_store_explicit(&runtime->test_call_release_result_persistent, persistent, memory_order_release);
+    }
+}
+
+void trevrpc_rpc_internal_test_malformed_next_incoming(trevrpc_rpc_runtime* runtime, uint32_t kind) {
+    if (runtime != NULL) {
+        pthread_mutex_lock(&runtime->mutex);
+        runtime->test_malformed_incoming_kind = kind;
+        pthread_mutex_unlock(&runtime->mutex);
     }
 }
 
@@ -4276,9 +5058,9 @@ static int trevrpc_rpc_call_respond_copy_v1_impl(trevrpc_rpc_runtime* runtime,
             result = trevrpc_rpc_operation_admit_locked(runtime,
                 operation,
                 TREVRPC_RPC_OBJECT_STREAM,
-                call.owner,
-                call.slot,
-                call.generation,
+                record->stream.owner,
+                record->stream.slot,
+                record->stream.generation,
                 TREVRPC_RPC_OBJECT_CALL,
                 call.owner,
                 call.slot,
@@ -4370,9 +5152,9 @@ static int trevrpc_rpc_call_finish_v1_impl(trevrpc_rpc_runtime* runtime,
         result = trevrpc_rpc_operation_admit_locked(runtime,
             operation,
             TREVRPC_RPC_OBJECT_STREAM,
-            call.owner,
-            call.slot,
-            call.generation,
+            record->stream.owner,
+            record->stream.slot,
+            record->stream.generation,
             TREVRPC_RPC_OBJECT_CALL,
             call.owner,
             call.slot,
@@ -4680,6 +5462,21 @@ static int trevrpc_rpc_call_release_impl(trevrpc_rpc_runtime* runtime, trevrpc_r
         pthread_mutex_unlock(&runtime->mutex);
         return -ESTALE;
     }
+    {
+        int injected = atomic_load_explicit(&runtime->test_call_release_result, memory_order_acquire);
+        if (atomic_load_explicit(&runtime->test_call_release_result_persistent, memory_order_acquire)) {
+            if (injected != 0) {
+                pthread_mutex_unlock(&runtime->mutex);
+                return injected;
+            }
+        } else {
+            injected = atomic_exchange_explicit(&runtime->test_call_release_result, 0, memory_order_acq_rel);
+            if (injected != 0) {
+                pthread_mutex_unlock(&runtime->mutex);
+                return injected;
+            }
+        }
+    }
     record->caller_owns_call = false;
     trevrpc_rpc_call_maybe_reclaim_locked(runtime, record);
     pthread_mutex_unlock(&runtime->mutex);
@@ -4744,6 +5541,19 @@ static int trevrpc_rpc_cancellation_create_impl(
         pthread_mutex_unlock(&runtime->mutex);
         free(record);
         return -EOVERFLOW;
+    }
+    {
+        uint64_t key[6];
+        uint8_t count;
+        int result;
+        trevrpc_rpc_handle_key(key, &count, record->cancellation.owner, record->cancellation.slot,
+            record->cancellation.generation);
+        result = trevrpc_rpc_registry_insert(&runtime->cancellation_registry, key, count, record);
+        if (result != 0) {
+            pthread_mutex_unlock(&runtime->mutex);
+            free(record);
+            return result;
+        }
     }
     record->next = runtime->cancellations;
     runtime->cancellations = record;
@@ -4855,30 +5665,31 @@ static int trevrpc_rpc_cancellation_cancel_impl(
 static int trevrpc_rpc_cancellation_release_impl(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_cancellation_v1 cancellation) {
     trevrpc_rpc_cancellation_record** cursor;
+    trevrpc_rpc_cancellation_record* record;
+    uint64_t key[6];
+    uint8_t count;
     if (runtime == NULL) {
         return -EINVAL;
     }
     pthread_mutex_lock(&runtime->mutex);
-    cursor = &runtime->cancellations;
-    while (*cursor != NULL &&
-           ((*cursor)->cancellation.owner != cancellation.owner || (*cursor)->cancellation.slot != cancellation.slot ||
-               (*cursor)->cancellation.generation != cancellation.generation)) {
-        cursor = &(*cursor)->next;
-    }
-    if (*cursor == NULL) {
+    record = trevrpc_rpc_find_cancellation_locked(runtime, cancellation);
+    if (record == NULL) {
         pthread_mutex_unlock(&runtime->mutex);
         return -ESTALE;
     }
-    if ((*cursor)->attached_calls != 0) {
+    if (record->attached_calls != 0) {
         pthread_mutex_unlock(&runtime->mutex);
         return -EBUSY;
     }
-    {
-        trevrpc_rpc_cancellation_record* record = *cursor;
-        *cursor = record->next;
-        pthread_mutex_unlock(&runtime->mutex);
-        free(record);
+    cursor = &runtime->cancellations;
+    while (*cursor != record) {
+        cursor = &(*cursor)->next;
     }
+    *cursor = record->next;
+    trevrpc_rpc_handle_key(key, &count, cancellation.owner, cancellation.slot, cancellation.generation);
+    (void)trevrpc_rpc_registry_remove(&runtime->cancellation_registry, key, count);
+    pthread_mutex_unlock(&runtime->mutex);
+    free(record);
     return 0;
 }
 
@@ -5153,6 +5964,13 @@ static void trevrpc_rpc_runtime_destroy(trevrpc_rpc_runtime* runtime) {
     pthread_mutex_destroy(&runtime->mutex);
     pthread_cond_destroy(&runtime->lifetime_condition);
     pthread_mutex_destroy(&runtime->lifetime_mutex);
+    free(runtime->deadline_heap);
+    trevrpc_rpc_registry_destroy(&runtime->call_registry);
+    trevrpc_rpc_registry_destroy(&runtime->endpoint_registry);
+    trevrpc_rpc_registry_destroy(&runtime->transport_registry);
+    trevrpc_rpc_registry_destroy(&runtime->cancellation_registry);
+    trevrpc_rpc_registry_destroy(&runtime->operation_transport_registry);
+    trevrpc_rpc_registry_destroy(&runtime->operation_scope_registry);
     free(runtime);
 }
 

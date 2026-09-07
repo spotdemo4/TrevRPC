@@ -131,6 +131,7 @@ struct adapter_connection {
     bool on_accept_queue;
     bool accept_queue_ref_held;
     bool handshake_in_flight;
+    bool configuration_set;
     bool admission_granted;
     bool construction_ref_held;
 };
@@ -140,7 +141,9 @@ struct adapter_receive_node {
     msquic_receive* receive;
 };
 
-/* Accept queues own one provider lifetime pin until their node is unlinked. */
+/* Accept queues own one provider lifetime pin until their node is unlinked. The native
+ * connection is configured before NEW_CONNECTION returns; the queue only tracks
+ * configured connections whose handshake has not completed. */
 struct adapter_pending_connection {
     adapter_pending_connection* next;
     adapter_connection* connection;
@@ -178,6 +181,7 @@ struct adapter_stream {
     uint64_t readable_published_epoch;
     bool ready_event_committed;
     bool receive_fin_published;
+    bool receive_fin_optional;
     bool send_stopped_published;
     bool receive_paused;
     bool receive_aborted;
@@ -545,8 +549,12 @@ static int validate_endpoint_config(
             config->key_file_len == 0 || (config->flags & TREVRPC_ENGINE_ENDPOINT_SKIP_CERTIFICATE_VALIDATION) != 0) {
             return -EINVAL;
         }
-    } else if (config->port == 0 || config->cert_file != NULL || config->cert_file_len != 0 ||
-               config->key_file != NULL || config->key_file_len != 0) {
+    } else if (config->port == 0) {
+        return -EINVAL;
+    }
+    if (!server && ((config->cert_file == NULL) != (config->cert_file_len == 0) ||
+                       (config->key_file == NULL) != (config->key_file_len == 0) ||
+                       (config->cert_file_len == 0) != (config->key_file_len == 0))) {
         return -EINVAL;
     }
     if ((config->cert_file == NULL) != (config->cert_file_len == 0) ||
@@ -648,21 +656,22 @@ static int endpoint_create(msquic_provider* adapter,
     }
     QUIC_CREDENTIAL_CONFIG credential = {0};
     QUIC_CERTIFICATE_FILE certificate = {0};
-    if (server) {
+    if (server || endpoint->cert_file != NULL || endpoint->key_file != NULL) {
         certificate.CertificateFile = endpoint->cert_file;
         certificate.PrivateKeyFile = endpoint->key_file;
         credential.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_FILE;
         credential.CertificateFile = &certificate;
+        credential.Flags = server ? QUIC_CREDENTIAL_FLAG_NONE : QUIC_CREDENTIAL_FLAG_CLIENT;
     } else {
         credential.Type = QUIC_CREDENTIAL_TYPE_NONE;
         credential.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
-        if ((endpoint->flags & TREVRPC_ENGINE_ENDPOINT_SKIP_CERTIFICATE_VALIDATION) != 0) {
-            credential.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
-        }
-        if (endpoint->ca_cert_file != NULL) {
-            credential.Flags |= QUIC_CREDENTIAL_FLAG_SET_CA_CERTIFICATE_FILE;
-            credential.CaCertificateFile = endpoint->ca_cert_file;
-        }
+    }
+    if (!server && (endpoint->flags & TREVRPC_ENGINE_ENDPOINT_SKIP_CERTIFICATE_VALIDATION) != 0) {
+        credential.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
+    }
+    if (!server && endpoint->ca_cert_file != NULL) {
+        credential.Flags |= QUIC_CREDENTIAL_FLAG_SET_CA_CERTIFICATE_FILE;
+        credential.CaCertificateFile = endpoint->ca_cert_file;
     }
     status = adapter->api->ConfigurationLoadCredential(endpoint->configuration, &credential);
     if (QUIC_FAILED(status)) {
@@ -2264,11 +2273,19 @@ static void cancel_unsent_sends(adapter_stream* stream, int status) {
     adapter_schedule(adapter);
 }
 
+static bool stream_receive_terminal_locked(adapter_stream* stream, bool failed) {
+    bool clean_shutdown = stream->send_finished && !stream->send_aborted && !stream->receive_aborted &&
+                          !stream->receive_fin_optional && !failed && !stream->base.terminal_failed &&
+                          !atomic_load_explicit(&stream->base.closing, memory_order_acquire);
+    return !clean_shutdown || stream->receive_fin_published;
+}
+
 static bool stream_shutdown_drained(adapter_stream* stream) {
     msquic_provider* adapter = stream->base.adapter;
     pthread_mutex_lock(&adapter->mutex);
     pthread_mutex_lock(&stream->mutex);
-    bool ready = stream->base.shutdown_complete && stream->pending_send_count == 0;
+    bool ready = stream->base.shutdown_complete && stream->pending_send_count == 0 &&
+                 stream_receive_terminal_locked(stream, false);
     pthread_mutex_unlock(&stream->mutex);
     pthread_mutex_unlock(&adapter->mutex);
     return ready;
@@ -2612,7 +2629,8 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
                      ? (adapter_connection*)parent_slot->object
                      : NULL;
     pthread_mutex_lock(&stream->mutex);
-    bool shutdown_drained = stream->base.shutdown_complete && stream->pending_send_count == 0;
+    bool shutdown_drained = stream->base.shutdown_complete && stream->pending_send_count == 0 &&
+                            stream_receive_terminal_locked(stream, failed);
     if (shutdown_drained) {
         unqueue_stream_locked(adapter, stream);
     }
@@ -2767,7 +2785,7 @@ static void publish_receive_fin(adapter_stream* stream, uint32_t event_flags, in
     uint64_t application_error = stream->application_error;
     pthread_mutex_unlock(&adapter->mutex);
 
-    (void)publish_reserved_event(adapter,
+    int publish_result = publish_reserved_event(adapter,
         reservation,
         TREVRPC_ENGINE_EVENT_RECEIVE_FIN,
         stream->base.event_flags | TREVRPC_ENGINE_EVENT_FLAG_TERMINAL | event_flags,
@@ -2779,6 +2797,9 @@ static void publish_receive_fin(adapter_stream* stream, uint32_t event_flags, in
         application_error,
         0,
         NULL);
+    if (publish_result == 0 && stream_shutdown_drained(stream)) {
+        publish_stream_terminal(stream, false, 0);
+    }
 }
 
 static void publish_send_stopped(adapter_stream* stream) {
@@ -2974,6 +2995,7 @@ static void drain_detached_connection(
     adapter_pending_stream* streams = detach_pending_streams_locked(adapter, connection);
     HQUIC connection_handle = connection->base.handle;
     bool connection_shutdown_complete = connection->base.shutdown_complete;
+    bool configuration_in_flight = connection->handshake_in_flight && !connection->configuration_set;
     pthread_mutex_unlock(&adapter->mutex);
 
     while (streams != NULL) {
@@ -2994,7 +3016,8 @@ static void drain_detached_connection(
     }
 
     publish_connection_terminal(connection);
-    if (!connection_shutdown_complete && connection_handle != NULL && connection->base.handle == connection_handle) {
+    if (!configuration_in_flight && !connection_shutdown_complete && connection_handle != NULL &&
+        connection->base.handle == connection_handle) {
         adapter->api->ConnectionShutdown(connection_handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, application_error_code);
     }
     if (release_queue_ref) {
@@ -3057,6 +3080,7 @@ static void discard_detached_connections(msquic_provider* adapter, adapter_pendi
 
 static void complete_connection_handshake(adapter_connection* connection) {
     msquic_provider* adapter = connection->base.adapter;
+    adapter_pending_connection* pending_node = NULL;
     bool release_queue_ref = false;
     pthread_mutex_lock(&adapter->mutex);
     if (connection->handshake_in_flight) {
@@ -3065,11 +3089,14 @@ static void complete_connection_handshake(adapter_connection* connection) {
             adapter->connection_handshakes_in_flight--;
         }
     }
-    if (!connection->on_accept_queue) {
+    if (connection->on_accept_queue) {
+        pending_node = remove_connection_queue_locked(adapter, connection, &release_queue_ref);
+    } else {
         release_queue_ref = connection->accept_queue_ref_held;
         connection->accept_queue_ref_held = false;
     }
     pthread_mutex_unlock(&adapter->mutex);
+    free(pending_node);
     if (release_queue_ref) {
         adapter_object_unpin(&connection->base);
     }
@@ -3091,8 +3118,12 @@ static void adapter_scheduler_drain(msquic_provider* adapter) {
             break;
         }
         connection = pending_node->connection;
+        if (connection != NULL && connection->configuration_set) {
+            pthread_mutex_unlock(&adapter->mutex);
+            break;
+        }
         if (adapter->state == TREVRPC_ENGINE_STATE_RUNNING && adapter->connection_handshakes_in_flight == 0 &&
-            connection != NULL && !connection->base.terminal_published &&
+            connection != NULL && !connection->configuration_set && !connection->base.terminal_published &&
             !atomic_load_explicit(&connection->base.closing, memory_order_acquire) && connection->base.handle != NULL) {
             pending_node = remove_connection_queue_locked(adapter, connection, &release_queue_ref);
             connection->accept_queue_ref_held = release_queue_ref;
@@ -3461,25 +3492,42 @@ static int adapter_adopt_accepted_connection(msquic_provider* adapter,
     connection->pending_accept_node = node;
     connection->on_accept_queue = true;
     connection->accept_queue_ref_held = true;
+    connection->handshake_in_flight = true;
+    adapter->connection_handshakes_in_flight++;
     connection->base.active_operations += 2;
     connection->construction_ref_held = true;
     pthread_mutex_unlock(&adapter->mutex);
 
     adapter->api->SetCallbackHandler(handle, (void*)adapter_connection_callback, connection);
     bool close_requested = object_publish_handle(&connection->base, handle);
-    if (close_requested)
+    QUIC_STATUS configure_status =
+        adapter->api->ConnectionSetConfiguration(handle, connection->base.endpoint->configuration);
+    int result = 0;
+    if (QUIC_SUCCEEDED(configure_status)) {
+        pthread_mutex_lock(&adapter->mutex);
+        connection->configuration_set = true;
+        bool shutdown_requested = close_requested || atomic_load_explicit(&connection->base.closing, memory_order_acquire);
+        pthread_mutex_unlock(&adapter->mutex);
+        if (shutdown_requested)
+            adapter->api->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+    } else {
+        pthread_mutex_lock(&adapter->mutex);
+        connection->transport_error = (uint64_t)(uint32_t)configure_status;
+        atomic_store_explicit(&connection->base.closing, true, memory_order_release);
+        pthread_mutex_unlock(&adapter->mutex);
         adapter->api->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-    else
-        adapter_schedule(adapter);
+        complete_connection_handshake(connection);
+        result = -EIO;
+    }
     pthread_mutex_lock(&adapter->mutex);
     bool release_construction = connection->construction_ref_held;
     connection->construction_ref_held = false;
     pthread_mutex_unlock(&adapter->mutex);
     if (release_construction)
         adapter_object_unpin(&connection->base);
-    if (out_connection != NULL)
+    if (out_connection != NULL && result == 0)
         *out_connection = token;
-    return 0;
+    return result;
 }
 
 static QUIC_STATUS QUIC_API adapter_listener_callback(HQUIC handle, void* context, QUIC_LISTENER_EVENT* event) {
@@ -3722,6 +3770,9 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
                 }
             }
         } else if (result != 0) {
+            pthread_mutex_lock(&adapter->mutex);
+            stream->receive_fin_optional = true;
+            pthread_mutex_unlock(&adapter->mutex);
             adapter_fail_stop(adapter, result, "receive processing failed");
             adapter->api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         } else if (fin) {
@@ -3788,6 +3839,9 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
         pthread_mutex_lock(&adapter->mutex);
         stream->base.shutdown_complete = true;
+        stream->receive_fin_optional |= event->SHUTDOWN_COMPLETE.ConnectionShutdown != FALSE ||
+                                        event->SHUTDOWN_COMPLETE.AppCloseInProgress != FALSE ||
+                                        event->SHUTDOWN_COMPLETE.ConnectionShutdownByApp != FALSE;
         pthread_mutex_unlock(&adapter->mutex);
         cancel_unsent_sends(stream, -ECANCELED);
         if (stream_shutdown_drained(stream)) {
@@ -4009,6 +4063,7 @@ static int provider_connection_close(
     }
     connection->application_error = application_error_code;
     HQUIC handle = object->handle;
+    bool configuration_in_flight = connection->handshake_in_flight && !connection->configuration_set;
     pending = remove_connection_queue_locked(adapter, connection, &release_queue_ref);
     bool drain_children = pending != NULL || release_queue_ref || connection->pending_peer_stream_head != NULL;
     if (pending != NULL) {
@@ -4018,8 +4073,10 @@ static int provider_connection_close(
     if (drain_children) {
         drain_detached_connection(adapter, connection, release_queue_ref, application_error_code);
         free(pending);
-    } else if (invoke && handle != NULL) {
+    } else if (invoke && !configuration_in_flight && handle != NULL) {
         adapter->api->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, application_error_code);
+    } else if (configuration_in_flight) {
+        adapter_schedule(adapter);
     }
     return 0;
 }

@@ -31,6 +31,8 @@ struct fake_transport {
     bool listener_closed;
     bool connection_closed;
     bool stream_closed;
+    bool second_stream_created;
+    bool second_stream_closed;
     bool close_requested;
     bool close_blocked;
     bool close_entered;
@@ -53,6 +55,9 @@ struct fake_transport {
     bool receive_blocked;
     bool receive_entered;
     bool receive_release;
+    bool send_blocked;
+    bool send_entered;
+    bool send_release;
     pthread_mutex_t next_event_probe_mutex;
     pthread_cond_t next_event_probe_condition;
     bool next_event_attempted;
@@ -60,7 +65,10 @@ struct fake_transport {
     uint32_t wake_source_kind;
     atomic_int next_event_result;
     atomic_int close_result;
+    atomic_bool close_result_persistent;
     atomic_int close_status;
+    atomic_int connection_close_result;
+    atomic_bool connection_close_result_persistent;
     atomic_int poll_timeout_ms;
     atomic_uint_fast64_t poll_deadline_nanos;
     atomic_uint poll_timeout_fires;
@@ -89,6 +97,10 @@ struct fake_transport {
     atomic_uint admission_last_status;
     atomic_uint release_handle_calls;
     atomic_int release_handle_result;
+    atomic_int stream_release_handle_result;
+    atomic_bool stream_release_handle_result_persistent;
+    atomic_int call_release_handle_result;
+    atomic_bool call_release_handle_result_persistent;
     atomic_uint_fast64_t last_abort_error;
     atomic_uint_fast64_t last_send_operation_id;
     uint8_t* last_send_body;
@@ -136,6 +148,8 @@ int fake_push_admission_event(fake_transport* transport,
     size_t origin_len);
 int fake_push_receive(fake_transport* transport, const uint8_t* data, size_t data_len);
 int fake_push_incoming_stream(fake_transport* transport, const uint8_t* data, size_t data_len);
+int fake_push_incoming_stream_for_handle(
+    fake_transport* transport, trevrpc_rpc_transport_handle stream, const uint8_t* data, size_t data_len);
 size_t fake_close_count(const fake_transport* transport);
 size_t fake_release_handle_count(const fake_transport* transport);
 

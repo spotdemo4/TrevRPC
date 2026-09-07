@@ -1,5 +1,8 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "trevrpc_rpc_transport_engine_internal.h"
 #include "trevrpc_engine_msquic_internal.h"
+#include "trevrpc_credential_internal.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -24,8 +27,34 @@ static trevrpc_rpc_transport_handle trevrpc_rpc_transport_handle_from_engine(tre
     return result;
 }
 
-static void trevrpc_rpc_transport_engine_endpoint_config(
-    const trevrpc_rpc_transport_endpoint_config* source, trevrpc_engine_endpoint_config_v1* destination) {
+static int trevrpc_rpc_transport_engine_endpoint_config(const trevrpc_rpc_transport_endpoint_config* source,
+    trevrpc_engine_endpoint_config_v1* destination,
+    trevrpc_credential_files* credential_files,
+    int server) {
+    int result = trevrpc_credential_validate_endpoint(source->cert_file,
+        source->cert_file_len,
+        source->key_file,
+        source->key_file_len,
+        source->ca_cert_file,
+        source->ca_cert_file_len,
+        source->cert_data,
+        source->cert_data_len,
+        source->key_data,
+        source->key_data_len,
+        source->ca_cert_data,
+        source->ca_cert_data_len,
+        server);
+    if (result != 0)
+        return result;
+    result = trevrpc_credential_files_prepare(credential_files,
+        source->cert_data,
+        source->cert_data_len,
+        source->key_data,
+        source->key_data_len,
+        source->ca_cert_data,
+        source->ca_cert_data_len);
+    if (result != 0)
+        return result;
     (void)trevrpc_engine_endpoint_config_v1_init(destination, sizeof(*destination));
     destination->host = source->host;
     destination->host_len = source->host_len;
@@ -36,12 +65,19 @@ static void trevrpc_rpc_transport_engine_endpoint_config(
     destination->flags = source->flags & TREVRPC_RPC_TRANSPORT_ENDPOINT_SKIP_CERTIFICATE_VALIDATION
                              ? TREVRPC_ENGINE_ENDPOINT_SKIP_CERTIFICATE_VALIDATION
                              : 0;
-    destination->cert_file = source->cert_file;
-    destination->cert_file_len = source->cert_file_len;
-    destination->key_file = source->key_file;
-    destination->key_file_len = source->key_file_len;
-    destination->ca_cert_file = source->ca_cert_file;
-    destination->ca_cert_file_len = source->ca_cert_file_len;
+    destination->cert_file = credential_files->cert_created ? credential_files->cert_file
+                                                            : (source->cert_file_len != 0 ? source->cert_file : NULL);
+    destination->cert_file_len =
+        credential_files->cert_created ? (uint32_t)strlen(credential_files->cert_file) : source->cert_file_len;
+    destination->key_file = credential_files->key_created ? credential_files->key_file
+                                                          : (source->key_file_len != 0 ? source->key_file : NULL);
+    destination->key_file_len =
+        credential_files->key_created ? (uint32_t)strlen(credential_files->key_file) : source->key_file_len;
+    destination->ca_cert_file = credential_files->ca_cert_created
+                                    ? credential_files->ca_cert_file
+                                    : (source->ca_cert_file_len != 0 ? source->ca_cert_file : NULL);
+    destination->ca_cert_file_len =
+        credential_files->ca_cert_created ? (uint32_t)strlen(credential_files->ca_cert_file) : source->ca_cert_file_len;
     destination->max_pending_send_count = source->max_pending_send_count;
     destination->max_pending_send_bytes = source->max_pending_send_bytes;
     destination->max_frame_size = source->max_frame_size;
@@ -49,6 +85,7 @@ static void trevrpc_rpc_transport_engine_endpoint_config(
     destination->keep_alive_ms = source->keep_alive_ms;
     destination->stream_recv_window = source->stream_recv_window;
     destination->conn_flow_control_window = source->conn_flow_control_window;
+    return 0;
 }
 
 int trevrpc_rpc_transport_engine_adopt_accepted_connection(trevrpc_rpc_transport* transport,
@@ -57,12 +94,21 @@ int trevrpc_rpc_transport_engine_adopt_accepted_connection(trevrpc_rpc_transport
     trevrpc_rpc_transport_handle* out_connection) {
     trevrpc_engine_endpoint_config_v1 source;
     trevrpc_engine_handle_v1 target;
+    trevrpc_credential_files credential_files;
     int result;
+    int cleanup_result;
     if (transport == NULL || config == NULL || accepted == NULL || out_connection == NULL)
         return -EINVAL;
-    trevrpc_rpc_transport_engine_endpoint_config(config, &source);
+    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 0);
+    if (result != 0)
+        return result;
     result = trevrpc_engine_msquic_adopt_accepted_connection_v1(
         trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, accepted, &target);
+    cleanup_result = trevrpc_credential_files_cleanup(&credential_files);
+    if (result == 0 && cleanup_result != 0) {
+        (void)trevrpc_engine_connection_close(trevrpc_rpc_transport_engine_from_base(transport)->engine, target, 0);
+        result = cleanup_result;
+    }
     if (result == 0)
         *out_connection = trevrpc_rpc_transport_handle_from_engine(target);
     return result;
@@ -205,12 +251,22 @@ static int trevrpc_rpc_transport_engine_endpoint_listen(trevrpc_rpc_transport* t
     trevrpc_rpc_transport_handle* listener) {
     trevrpc_engine_endpoint_config_v1 source;
     trevrpc_engine_handle_v1 target;
+    trevrpc_credential_files credential_files;
+    int result;
+    int cleanup_result;
     if (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_AUTO &&
         config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE) {
         return -ENOTSUP;
     }
-    trevrpc_rpc_transport_engine_endpoint_config(config, &source);
-    int result = trevrpc_engine_listen_v1(trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, &target);
+    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 1);
+    if (result != 0)
+        return result;
+    result = trevrpc_engine_listen_v1(trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, &target);
+    cleanup_result = trevrpc_credential_files_cleanup(&credential_files);
+    if (result == 0 && cleanup_result != 0) {
+        (void)trevrpc_engine_listener_close(trevrpc_rpc_transport_engine_from_base(transport)->engine, target);
+        result = cleanup_result;
+    }
     if (result == 0) {
         *listener = trevrpc_rpc_transport_handle_from_engine(target);
     }
@@ -229,13 +285,23 @@ static int trevrpc_rpc_transport_engine_endpoint_dial(trevrpc_rpc_transport* tra
     trevrpc_rpc_transport_handle* connection) {
     trevrpc_engine_endpoint_config_v1 source;
     trevrpc_engine_handle_v1 target;
+    trevrpc_credential_files credential_files;
+    int result;
+    int cleanup_result;
     if (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_AUTO &&
         config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE) {
         return -ENOTSUP;
     }
-    trevrpc_rpc_transport_engine_endpoint_config(config, &source);
-    int result = trevrpc_engine_dial_v1(
+    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 0);
+    if (result != 0)
+        return result;
+    result = trevrpc_engine_dial_v1(
         trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, operation_id, &target);
+    cleanup_result = trevrpc_credential_files_cleanup(&credential_files);
+    if (result == 0 && cleanup_result != 0) {
+        (void)trevrpc_engine_connection_close(trevrpc_rpc_transport_engine_from_base(transport)->engine, target, 0);
+        result = cleanup_result;
+    }
     if (result == 0) {
         *connection = trevrpc_rpc_transport_handle_from_engine(target);
     }
@@ -336,14 +402,7 @@ static int trevrpc_rpc_transport_engine_listener_close(
 }
 
 static int trevrpc_rpc_transport_engine_close(trevrpc_rpc_transport* transport) {
-    trevrpc_engine* engine = trevrpc_rpc_transport_engine_from_base(transport)->engine;
-    trevrpc_engine_diagnostics_v1 diagnostics;
-    int result = trevrpc_engine_close(engine);
-    if (result == 0 || trevrpc_engine_diagnostics_v1_init(&diagnostics, sizeof(diagnostics)) != 0 ||
-        trevrpc_engine_get_diagnostics_v1(engine, &diagnostics) != 0) {
-        return result;
-    }
-    return diagnostics.state >= TREVRPC_ENGINE_STATE_STOPPING ? 0 : result;
+    return trevrpc_engine_close(trevrpc_rpc_transport_engine_from_base(transport)->engine);
 }
 
 static int trevrpc_rpc_transport_engine_drain(trevrpc_rpc_transport* transport) {

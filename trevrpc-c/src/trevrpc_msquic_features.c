@@ -190,16 +190,6 @@ void trevrpc_msquic_feature_reduce(trevrpc_msquic_feature_state* state, const tr
     switch (event->kind) {
     case TREV_MSQUIC_FEATURE_EVENT_CONNECTED:
         state->connected = true;
-        /*
-         * MsQuic does not publish DATAGRAM_STATE_CHANGED when the peer did
-         * not negotiate datagrams. Handshake completion therefore finalizes
-         * an absent datagram event as an unusable peer capability instead of
-         * leaving connection readiness blocked forever. A real state-change
-         * event received before or after this point still replaces the
-         * snapshot and advances its epoch.
-         */
-        if (state->request.datagram_receive && !state->datagram_event_seen)
-            state->datagram_event_seen = true;
         break;
     case TREV_MSQUIC_FEATURE_EVENT_DATAGRAM_STATE_CHANGED:
         state->datagram_event_seen = true;

@@ -1,20 +1,19 @@
 #ifndef TREVRPC_OWNED_BYTES_INTERNAL_H
 #define TREVRPC_OWNED_BYTES_INTERNAL_H
 
-#include "trevrpc.h"
+#include "trevrpc_values_internal.h"
 
-#include <stddef.h>
-#include <stdint.h>
+#ifndef TREVRPC_OWNERSHIP_TYPES_DEFINED
+#define TREVRPC_OWNERSHIP_TYPES_DEFINED
 
-typedef void (*trevrpc_owned_bytes_release_fn)(void* owner, void* context);
+typedef struct trevrpc_body_owner trevrpc_body_owner;
 
-typedef struct trevrpc_owned_bytes {
+typedef struct trevrpc_bytes_view {
     const uint8_t* data;
     size_t len;
-    void* owner;
-    trevrpc_owned_bytes_release_fn release;
-    void* release_context;
-} trevrpc_owned_bytes;
+} trevrpc_bytes_view;
+
+#endif
 
 static inline void trevrpc_owned_bytes_init(trevrpc_owned_bytes* bytes) {
     if (bytes == NULL) {
@@ -45,25 +44,40 @@ static inline void trevrpc_owned_bytes_move(trevrpc_owned_bytes* destination, tr
     trevrpc_owned_bytes_init(source);
 }
 
-typedef struct trevrpc_wire_response_values {
-    uint32_t status;
-    char* message;
-    size_t message_len;
-    trevrpc_owned_bytes body;
-    trevrpc_metadata metadata;
-} trevrpc_wire_response_values;
-
-typedef struct trevrpc_wire_stream_frame_values {
-    uint32_t kind;
-    uint32_t status;
-    char* message;
-    size_t message_len;
-    trevrpc_owned_bytes body;
-    trevrpc_metadata metadata;
-} trevrpc_wire_stream_frame_values;
+#ifndef TREVRPC_OWNERSHIP_INTERNAL_FUNCTIONS_DEFINED
+#define TREVRPC_OWNERSHIP_INTERNAL_FUNCTIONS_DEFINED
 
 int trevrpc_inbound_response_create(trevrpc_wire_response_values* values, trevrpc_inbound_response** inbound);
 int trevrpc_inbound_stream_frame_create(
     trevrpc_wire_stream_frame_values* values, trevrpc_inbound_stream_frame** inbound);
+
+#endif
+
+#ifndef TREVRPC_OWNERSHIP_FUNCTIONS_DEFINED
+#define TREVRPC_OWNERSHIP_FUNCTIONS_DEFINED
+
+int trevrpc_inbound_response_get_status(const trevrpc_inbound_response* response, uint32_t* status);
+int trevrpc_inbound_response_get_message(const trevrpc_inbound_response* response, trevrpc_bytes_view* message);
+int trevrpc_inbound_response_get_body(const trevrpc_inbound_response* response, trevrpc_bytes_view* body);
+size_t trevrpc_inbound_response_metadata_count(const trevrpc_inbound_response* response);
+int trevrpc_inbound_response_metadata_at(
+    const trevrpc_inbound_response* response, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* value);
+int trevrpc_inbound_response_take_body(trevrpc_inbound_response* response, trevrpc_body_owner** owner);
+void trevrpc_inbound_response_release(trevrpc_inbound_response* response);
+
+int trevrpc_inbound_stream_frame_get_kind(const trevrpc_inbound_stream_frame* frame, uint32_t* kind);
+int trevrpc_inbound_stream_frame_get_status(const trevrpc_inbound_stream_frame* frame, uint32_t* status);
+int trevrpc_inbound_stream_frame_get_message(const trevrpc_inbound_stream_frame* frame, trevrpc_bytes_view* message);
+int trevrpc_inbound_stream_frame_get_body(const trevrpc_inbound_stream_frame* frame, trevrpc_bytes_view* body);
+size_t trevrpc_inbound_stream_frame_metadata_count(const trevrpc_inbound_stream_frame* frame);
+int trevrpc_inbound_stream_frame_metadata_at(
+    const trevrpc_inbound_stream_frame* frame, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* value);
+int trevrpc_inbound_stream_frame_take_body(trevrpc_inbound_stream_frame* frame, trevrpc_body_owner** owner);
+void trevrpc_inbound_stream_frame_release(trevrpc_inbound_stream_frame* frame);
+
+int trevrpc_body_owner_get_view(const trevrpc_body_owner* owner, trevrpc_bytes_view* body);
+void trevrpc_body_owner_release(trevrpc_body_owner* owner);
+
+#endif
 
 #endif

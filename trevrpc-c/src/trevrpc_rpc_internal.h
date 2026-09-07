@@ -12,6 +12,13 @@ int trevrpc_rpc_runtime_adopt_transport_v1(
 trevrpc_wire_diagnostic_reason trevrpc_rpc_stream_last_receive_diagnostic(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_stream_v1 stream);
 void trevrpc_rpc_internal_test_fail_next_receive_copy(trevrpc_rpc_runtime* runtime);
+void trevrpc_rpc_internal_test_set_call_release_result(trevrpc_rpc_runtime* runtime, int result, bool persistent);
+void trevrpc_rpc_internal_test_malformed_next_incoming(trevrpc_rpc_runtime* runtime, uint32_t kind);
+
+#define TREVRPC_RPC_INTERNAL_TEST_MALFORMED_SERVICE 1u
+#define TREVRPC_RPC_INTERNAL_TEST_MALFORMED_METHOD 2u
+#define TREVRPC_RPC_INTERNAL_TEST_MALFORMED_DATA 3u
+#define TREVRPC_RPC_INTERNAL_TEST_MALFORMED_METADATA 4u
 
 int trevrpc_rpc_runtime_start_transport_endpoint_v1(trevrpc_rpc_runtime* runtime,
     const trevrpc_rpc_transport_endpoint_config* config,

@@ -101,6 +101,8 @@ int trevrpc_rpc_transport_h3_test_stage_pending_send(trevrpc_rpc_transport* tran
     uint64_t operation_id,
     size_t bytes,
     trevrpc_msquic_send_completion** out_completion);
+typedef void (*trevrpc_rpc_transport_h3_test_send_capture)(const uint8_t* data, size_t len);
+void trevrpc_rpc_transport_h3_test_set_send_capture(trevrpc_rpc_transport_h3_test_send_capture capture);
 void trevrpc_rpc_transport_h3_test_signal_send_completion(trevrpc_msquic_send_completion* completion, int status);
 int trevrpc_rpc_transport_h3_test_complete_pending_send(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, int status);

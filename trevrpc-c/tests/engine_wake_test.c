@@ -44,7 +44,7 @@ static int get_read_fd(trevrpc_engine* engine) {
     return (int)wake.native_handle;
 }
 
-static int readable(int descriptor, int timeout_ms) {
+static int poll_revents(int descriptor, int timeout_ms) {
     struct pollfd poll_descriptor = {
         .fd = descriptor,
         .events = POLLIN,
@@ -57,7 +57,15 @@ static int readable(int descriptor, int timeout_ms) {
     if (result <= 0) {
         return result;
     }
-    return (poll_descriptor.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
+    return poll_descriptor.revents;
+}
+
+static int readable(int descriptor, int timeout_ms) {
+    int revents = poll_revents(descriptor, timeout_ms);
+    if (revents <= 0) {
+        return revents;
+    }
+    return (revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
 }
 
 static int pop_release(trevrpc_engine* engine) {
@@ -231,6 +239,69 @@ static int test_wake_failures(void) {
     return 0;
 }
 
+static int test_failed_arm_wakes_poll_and_preserves_failure(void) {
+    trevrpc_engine* engine = NULL;
+    trevrpc_engine_diagnostics_v1 diagnostics;
+    trevrpc_engine_event* event = NULL;
+    trevrpc_engine_event_info_v1 info;
+    uint32_t value = 1;
+    int descriptor;
+    int revents;
+
+    CHECK(create_engine(1, &engine) == 0);
+    descriptor = get_read_fd(engine);
+    CHECK(descriptor >= 0);
+    CHECK(readable(descriptor, 0) == 0);
+    CHECK(trevrpc_engine_testing_force_wake_failure(engine, TREVRPC_ENGINE_TEST_WAKE_FAILURE_WRITE_ONCE, 0) == 0);
+    CHECK(readable(descriptor, 0) == 0);
+
+    CHECK(trevrpc_engine_testing_enqueue_diagnostic_copy(engine, &value, sizeof(value)) == 0);
+    revents = poll_revents(descriptor, 1000);
+    CHECK(revents > 0);
+    CHECK((revents & (POLLHUP | POLLERR | POLLNVAL)) != 0);
+
+    CHECK(trevrpc_engine_next_event(engine, &event) == 0);
+    CHECK(trevrpc_engine_event_info_v1_init(&info, sizeof(info)) == 0);
+    CHECK(trevrpc_engine_event_get_info_v1(event, &info) == 0);
+    CHECK(info.kind == TREVRPC_ENGINE_EVENT_DIAGNOSTIC);
+    CHECK(info.flags == 0);
+    CHECK(info.status == 0);
+    trevrpc_engine_event_release(event);
+    event = NULL;
+
+    CHECK(trevrpc_engine_next_event(engine, &event) == 0);
+    CHECK(trevrpc_engine_event_info_v1_init(&info, sizeof(info)) == 0);
+    CHECK(trevrpc_engine_event_get_info_v1(event, &info) == 0);
+    CHECK(info.kind == TREVRPC_ENGINE_EVENT_DIAGNOSTIC);
+    CHECK(info.flags == TREVRPC_ENGINE_EVENT_FLAG_FATAL);
+    CHECK(info.status == -EBADF);
+    trevrpc_engine_event_release(event);
+    event = NULL;
+
+    CHECK(trevrpc_engine_next_event(engine, &event) == 0);
+    CHECK(trevrpc_engine_event_info_v1_init(&info, sizeof(info)) == 0);
+    CHECK(trevrpc_engine_event_get_info_v1(event, &info) == 0);
+    CHECK(info.kind == TREVRPC_ENGINE_EVENT_STOPPED);
+    CHECK(info.flags == (TREVRPC_ENGINE_EVENT_FLAG_FATAL | TREVRPC_ENGINE_EVENT_FLAG_TERMINAL));
+    CHECK(info.status == -EBADF);
+    trevrpc_engine_event_release(event);
+    event = NULL;
+    CHECK(trevrpc_engine_next_event(engine, &event) == -EAGAIN);
+    CHECK(event == NULL);
+    CHECK(readable(descriptor, 0) == 1);
+
+    CHECK(trevrpc_engine_diagnostics_v1_init(&diagnostics, sizeof(diagnostics)) == 0);
+    CHECK(trevrpc_engine_get_diagnostics_v1(engine, &diagnostics) == 0);
+    CHECK(diagnostics.state == TREVRPC_ENGINE_STATE_STOPPED);
+    CHECK(diagnostics.terminal_status == -EBADF);
+    CHECK(diagnostics.wake_failures == 1);
+    CHECK(diagnostics.events_enqueued == 3);
+    CHECK(diagnostics.events_dequeued == 3);
+    CHECK(diagnostics.queue_depth == 0);
+    CHECK(trevrpc_engine_release(engine) == 0);
+    return 0;
+}
+
 static int descriptor_is_closed(const char* descriptor_text) {
     char* end = NULL;
     long descriptor;
@@ -368,6 +439,7 @@ int main(int argc, char** argv) {
     CHECK(test_last_pop_drain_window() == 0);
     CHECK(test_pipe_full_eagain() == 0);
     CHECK(test_wake_failures() == 0);
+    CHECK(test_failed_arm_wakes_poll_and_preserves_failure() == 0);
     CHECK(test_descriptor_flags_and_exec(argv[0]) == 0);
     CHECK(test_terminal_drain_failure_ordering() == 0);
     CHECK(test_close_terminal_and_descriptor_lifetime() == 0);

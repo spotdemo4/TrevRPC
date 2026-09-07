@@ -41,6 +41,9 @@ typedef struct fake_msquic_state {
     bool deliver_shutdown_complete;
     bool shutdown_complete_delivered;
     bool lock_held_across_shutdown;
+    msquic_provider* adapter;
+    bool close_during_configuration;
+    bool close_triggered;
 } fake_msquic_state;
 
 typedef struct receive_fixture {
@@ -137,6 +140,11 @@ static QUIC_STATUS QUIC_API fake_connection_set_configuration(HQUIC handle, HQUI
     FakeMsQuic.connection_configure_calls++;
     if (FakeMsQuic.configured_handle_count < 8) {
         FakeMsQuic.configured_handles[FakeMsQuic.configured_handle_count++] = handle;
+    }
+    if (FakeMsQuic.close_during_configuration && !FakeMsQuic.close_triggered) {
+        FakeMsQuic.close_triggered = true;
+        assert(FakeMsQuic.adapter != NULL);
+        assert(provider_close(FakeMsQuic.adapter) == 0);
     }
     return FakeMsQuic.configure_status;
 }
@@ -408,6 +416,8 @@ typedef struct stream_event_counts {
     uint32_t send_stopped_flags;
     int send_stopped_status;
     uint64_t send_stopped_application_error;
+    uint32_t order[8];
+    uint32_t order_count;
 } stream_event_counts;
 
 static stream_event_counts drain_stream_events(receive_fixture* fixture) {
@@ -425,6 +435,9 @@ static stream_event_counts drain_stream_events(receive_fixture* fixture) {
         bool same_stream = info.subject.owner == fixture->stream_handle.owner &&
                            info.subject.slot == fixture->stream_handle.slot &&
                            info.subject.generation == fixture->stream_handle.generation;
+        if (same_stream && counts.order_count < 8) {
+            counts.order[counts.order_count++] = info.kind;
+        }
         if (same_stream &&
             (info.kind == TREVRPC_ENGINE_EVENT_STREAM_CLOSED || info.kind == TREVRPC_ENGINE_EVENT_STREAM_FAILED)) {
             counts.terminal++;
@@ -716,6 +729,42 @@ static void test_shutdown_after_send_admission_rejects_and_reclaims(void) {
     fixture_discard_events(&fixture);
     assert(fixture.adapter->live_streams == 1);
     fixture_destroy(&fixture);
+}
+
+static void test_clean_shutdown_waits_for_receive_fin(void) {
+    receive_fixture fixture = fixture_create(1024);
+    fixture.stream->send_finished = true;
+    trevrpc_engine_reservation* receive_fin_reservation = fixture.stream->receive_fin_reservation;
+    assert(receive_fin_reservation != NULL);
+
+    QUIC_STREAM_EVENT shutdown = {.Type = QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE};
+    assert(adapter_stream_callback(TEST_STREAM_HANDLE, fixture.stream, &shutdown) == QUIC_STATUS_SUCCESS);
+    assert(fixture.stream->base.shutdown_complete);
+    assert(!fixture.stream->base.terminal_published);
+    assert(!fixture.stream->receive_fin_published);
+    assert(fixture.stream->receive_fin_reservation == receive_fin_reservation);
+    trevrpc_engine_event* event = NULL;
+    assert(trevrpc_engine_next_event(fixture.engine, &event) == -EAGAIN);
+
+    QUIC_STREAM_EVENT peer_fin = {.Type = QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN};
+    assert(adapter_stream_callback(TEST_STREAM_HANDLE, fixture.stream, &peer_fin) == QUIC_STATUS_SUCCESS);
+    assert(fixture.stream->receive_fin_published);
+    assert(fixture.stream->receive_fin_reservation == NULL);
+    assert(fixture.stream->base.terminal_published);
+
+    stream_event_counts counts = drain_stream_events(&fixture);
+    assert(counts.receive_fin == 1);
+    assert(counts.terminal == 1);
+    assert(counts.order_count == 2);
+    assert(counts.order[0] == TREVRPC_ENGINE_EVENT_RECEIVE_FIN);
+    assert(counts.order[1] == TREVRPC_ENGINE_EVENT_STREAM_CLOSED);
+
+    trevrpc_engine_diagnostics_v1 diagnostics;
+    assert(trevrpc_engine_diagnostics_v1_init(&diagnostics, sizeof(diagnostics)) == 0);
+    assert(trevrpc_engine_get_diagnostics_v1(fixture.engine, &diagnostics) == 0);
+    assert(diagnostics.mandatory_reservations == 0);
+    fixture.stream = NULL;
+    fixture_destroy_stopped(&fixture);
 }
 
 static void test_partial_zero_and_resume(void) {
@@ -1060,18 +1109,66 @@ static void test_connection_accept_queue_is_bounded(void) {
 static void test_connection_setup_failure_is_terminal_without_engine_failure(void) {
     receive_fixture fixture = fixture_create_with_capacities(1024, 1, 1);
     adapter_listener* listener = fixture_add_listener(&fixture);
-    assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 2u) == QUIC_STATUS_SUCCESS);
-    adapter_connection* connection = fixture_queued_connection(&fixture, 0);
     FakeMsQuic.configure_status = QUIC_STATUS_INTERNAL_ERROR;
-    adapter_scheduler_drain(fixture.adapter);
+    assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 2u) == QUIC_STATUS_ABORTED);
+    adapter_connection* connection = (adapter_connection*)fixture.adapter->slots[fixture.adapter->connection_begin].object;
+    assert(connection != NULL);
     assert(FakeMsQuic.connection_configure_calls == 1);
     assert(FakeMsQuic.connection_shutdown_calls == 1);
+    assert(fixture.adapter->pending_connection_count == 0);
     assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) == QUIC_STATUS_SUCCESS);
     assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) == QUIC_STATUS_SUCCESS);
     accept_event_counts counts = drain_accept_events(&fixture);
     assert(counts.connection_failed == 1);
     assert(counts.connection_closed == 0);
     assert(fixture.adapter->terminal_status == 0);
+    assert(fixture.adapter->live_connections == 0);
+    fixture_destroy(&fixture);
+}
+
+static void test_connection_is_configured_before_callback_returns(void) {
+    receive_fixture fixture = fixture_create_with_capacities(1024, 1, 1);
+    adapter_listener* listener = fixture_add_listener(&fixture);
+    assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 6u) == QUIC_STATUS_SUCCESS);
+    adapter_connection* connection = fixture_queued_connection(&fixture, 0);
+    assert(FakeMsQuic.connection_configure_calls == 1);
+    assert(FakeMsQuic.configured_handles[0] == connection->base.handle);
+    assert(connection->configuration_set);
+    assert(fixture.adapter->connection_handshakes_in_flight == 1);
+    adapter_scheduler_drain(fixture.adapter);
+    assert(FakeMsQuic.connection_configure_calls == 1);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_CONNECTED) == QUIC_STATUS_SUCCESS);
+    assert(fixture.adapter->connection_handshakes_in_flight == 0);
+    assert(fixture.adapter->pending_connection_count == 0);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) == QUIC_STATUS_SUCCESS);
+    assert(fixture.adapter->live_connections == 0);
+    fixture_destroy(&fixture);
+}
+
+static void test_close_during_configuration_defers_native_shutdown(void) {
+    receive_fixture fixture = fixture_create_with_capacities(1024, 1, 1);
+    adapter_listener* listener = fixture_add_listener(&fixture);
+    FakeMsQuic.adapter = fixture.adapter;
+    FakeMsQuic.close_during_configuration = true;
+    assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 7u) == QUIC_STATUS_SUCCESS);
+    adapter_connection* connection = (adapter_connection*)fixture.adapter->slots[fixture.adapter->connection_begin].object;
+    assert(connection != NULL);
+    assert(FakeMsQuic.close_triggered);
+    assert(FakeMsQuic.connection_configure_calls == 1);
+    assert(connection->configuration_set);
+    assert(FakeMsQuic.connection_shutdown_calls == 1);
+    assert(fixture.adapter->state == TREVRPC_ENGINE_STATE_STOPPING);
+    assert(fixture.adapter->connection_handshakes_in_flight == 0);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) == QUIC_STATUS_SUCCESS);
+    assert(fixture.adapter->connection_handshakes_in_flight == 0);
+    assert(fixture.adapter->pending_connection_count == 0);
+    assert(adapter_listener_callback(TEST_LISTENER_HANDLE,
+               listener,
+               &(QUIC_LISTENER_EVENT){.Type = QUIC_LISTENER_EVENT_STOP_COMPLETE}) == QUIC_STATUS_SUCCESS);
+    fixture.listener = NULL;
+    accept_event_counts counts = drain_accept_events(&fixture);
+    assert(counts.connection_ready == 0);
+    assert(counts.connection_failed + counts.connection_closed == 1);
     assert(fixture.adapter->live_connections == 0);
     fixture_destroy(&fixture);
 }
@@ -1083,15 +1180,16 @@ static void test_connection_promotion_is_fifo(void) {
     assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 4u) == QUIC_STATUS_SUCCESS);
     adapter_connection* first = fixture_queued_connection(&fixture, 0);
     adapter_connection* second = fixture_queued_connection(&fixture, 1);
-    adapter_scheduler_drain(fixture.adapter);
-    assert(FakeMsQuic.connection_configure_calls == 1);
+    assert(FakeMsQuic.connection_configure_calls == 2);
     assert(FakeMsQuic.configured_handles[0] == first->base.handle);
-    assert(fixture.adapter->pending_connection_count == 1);
+    assert(FakeMsQuic.configured_handles[1] == second->base.handle);
+    adapter_scheduler_drain(fixture.adapter);
+    assert(FakeMsQuic.connection_configure_calls == 2);
+    assert(fixture.adapter->pending_connection_count == 2);
     assert(fixture_connection_event(first, QUIC_CONNECTION_EVENT_CONNECTED) == QUIC_STATUS_SUCCESS);
     adapter_scheduler_drain(fixture.adapter);
     assert(FakeMsQuic.connection_configure_calls == 2);
-    assert(FakeMsQuic.configured_handles[1] == second->base.handle);
-    assert(fixture.adapter->pending_connection_count == 0);
+    assert(fixture.adapter->pending_connection_count == 1);
     assert(fixture_connection_event(second, QUIC_CONNECTION_EVENT_CONNECTED) == QUIC_STATUS_SUCCESS);
     accept_event_counts counts = drain_accept_events(&fixture);
     assert(counts.connection_ready == 2);
@@ -1299,6 +1397,7 @@ static void test_peer_stream_close_while_queued_publishes_once(void) {
 }
 
 int main(void) {
+    test_clean_shutdown_waits_for_receive_fin();
     test_partial_zero_and_resume();
     test_receive_create_failure_preserves_queue();
     test_readable_publication_failure_retries();
@@ -1313,7 +1412,9 @@ int main(void) {
     test_closing_stream_is_not_resumed();
     test_resume_close_race_is_nonfatal();
     test_connection_accept_queue_is_bounded();
+    test_connection_is_configured_before_callback_returns();
     test_connection_setup_failure_is_terminal_without_engine_failure();
+    test_close_during_configuration_defers_native_shutdown();
     test_connection_promotion_is_fifo();
     test_pending_send_round_robin_three_streams();
     test_synchronous_send_failure_releases_budget();

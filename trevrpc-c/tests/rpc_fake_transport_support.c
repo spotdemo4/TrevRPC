@@ -277,11 +277,12 @@ int fake_push_receive(fake_transport* transport, const uint8_t* data, size_t dat
     return 0;
 }
 
-int fake_push_incoming_stream(fake_transport* transport, const uint8_t* data, size_t data_len) {
+int fake_push_incoming_stream_for_handle(
+    fake_transport* transport, trevrpc_rpc_transport_handle stream, const uint8_t* data, size_t data_len) {
     fake_receive* receive;
     fake_event* ready;
     fake_event* readable;
-    if (transport == NULL || (data == NULL && data_len != 0)) {
+    if (transport == NULL || !fake_stream_handle_valid(stream) || (data == NULL && data_len != 0)) {
         return -EINVAL;
     }
     receive = fake_receive_create(transport, data, data_len);
@@ -301,13 +302,13 @@ int fake_push_incoming_stream(fake_transport* transport, const uint8_t* data, si
     ready->info.kind = TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READY;
     ready->info.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER;
     ready->info.subject_kind = TREVRPC_RPC_TRANSPORT_OBJECT_STREAM;
-    ready->info.subject = fake_stream_handle;
+    ready->info.subject = stream;
     ready->info.parent = fake_listener_handle;
     readable->transport = transport;
     readable->info.kind = TREVRPC_RPC_TRANSPORT_EVENT_STREAM_READABLE;
     readable->info.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER;
     readable->info.subject_kind = TREVRPC_RPC_TRANSPORT_OBJECT_STREAM;
-    readable->info.subject = fake_stream_handle;
+    readable->info.subject = stream;
     readable->info.parent = fake_listener_handle;
 
     pthread_mutex_lock(&transport->mutex);
@@ -318,6 +319,9 @@ int fake_push_incoming_stream(fake_transport* transport, const uint8_t* data, si
         free(ready);
         free(readable);
         return -EAGAIN;
+    }
+    if (fake_handle_equal(stream, fake_second_stream_handle)) {
+        transport->second_stream_created = true;
     }
     fake_receive_enqueue_locked(transport, receive);
     transport->events[transport->event_tail] = ready;
@@ -333,6 +337,10 @@ int fake_push_incoming_stream(fake_transport* transport, const uint8_t* data, si
     }
     pthread_mutex_unlock(&transport->mutex);
     return 0;
+}
+
+int fake_push_incoming_stream(fake_transport* transport, const uint8_t* data, size_t data_len) {
+    return fake_push_incoming_stream_for_handle(transport, fake_stream_handle, data, data_len);
 }
 
 int fake_get_wake_source(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_wake* wake) {
@@ -567,7 +575,8 @@ int fake_get_diagnostics(trevrpc_rpc_transport* transport, trevrpc_rpc_transport
     diagnostics->ordinary_queue_depth = 0;
     diagnostics->live_listeners = fake->listener_closed ? 0 : 1;
     diagnostics->live_connections = fake->connection_closed ? 0 : 1;
-    diagnostics->live_streams = fake->stream_closed ? 0 : 1;
+    diagnostics->live_streams = (fake->stream_closed ? 0 : 1) +
+                                 (fake->second_stream_created && !fake->second_stream_closed ? 1 : 0);
     pthread_mutex_unlock(&fake->mutex);
     return 0;
 }
@@ -653,6 +662,13 @@ int fake_stream_send(trevrpc_rpc_transport* transport,
         }
     }
     pthread_mutex_lock(&fake->mutex);
+    if (fake->send_blocked) {
+        fake->send_entered = true;
+        pthread_cond_broadcast(&fake->condition);
+        while (!fake->send_release) {
+            pthread_cond_wait(&fake->condition, &fake->mutex);
+        }
+    }
     if (result == 0) {
         free(fake->last_send_body);
         fake->last_send_body = body_copy;
@@ -673,7 +689,7 @@ int fake_stream_receive(trevrpc_rpc_transport* transport,
     fake_transport* fake = fake_from_base(transport);
     fake_receive* receive;
     int result;
-    if (!fake_handle_equal(stream, fake_stream_handle)) {
+    if (!fake_stream_handle_valid(stream)) {
         return -ESTALE;
     }
     result = atomic_exchange_explicit(&fake->stream_receive_result, 0, memory_order_acq_rel);
@@ -746,6 +762,7 @@ static int fake_stream_abort_send(
 
 int fake_stream_abort(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle stream, uint64_t error_code) {
     fake_transport* fake = fake_from_base(transport);
+    bool* stream_closed;
     if (!fake_stream_handle_valid(stream)) {
         return -ESTALE;
     }
@@ -753,11 +770,12 @@ int fake_stream_abort(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_ha
         return fake->stream_abort_result;
     }
     pthread_mutex_lock(&fake->mutex);
-    if (fake->stream_closed) {
+    stream_closed = fake_handle_equal(stream, fake_second_stream_handle) ? &fake->second_stream_closed : &fake->stream_closed;
+    if (*stream_closed) {
         pthread_mutex_unlock(&fake->mutex);
         return -EALREADY;
     }
-    fake->stream_closed = true;
+    *stream_closed = true;
     atomic_fetch_add_explicit(&fake->stream_abort_calls, 1, memory_order_release);
     atomic_store_explicit(&fake->last_abort_error, error_code, memory_order_release);
     pthread_cond_broadcast(&fake->condition);
@@ -794,9 +812,18 @@ int fake_stream_close(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_ha
 int fake_connection_close(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle connection, uint64_t error_code) {
     fake_transport* fake = fake_from_base(transport);
+    int result;
     (void)error_code;
     if (!fake_handle_equal(connection, fake_connection_handle)) {
         return -ESTALE;
+    }
+    if (atomic_load_explicit(&fake->connection_close_result_persistent, memory_order_acquire)) {
+        result = atomic_load_explicit(&fake->connection_close_result, memory_order_acquire);
+    } else {
+        result = atomic_exchange_explicit(&fake->connection_close_result, 0, memory_order_acq_rel);
+    }
+    if (result != 0) {
+        return result;
     }
     pthread_mutex_lock(&fake->mutex);
     if (fake->connection_closed) {
@@ -844,16 +871,22 @@ int fake_listener_close(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_
 
 int fake_close(trevrpc_rpc_transport* transport) {
     fake_transport* fake = fake_from_base(transport);
-    int result = atomic_exchange_explicit(&fake->close_result, 0, memory_order_acq_rel);
-    if (result != 0) {
-        return result;
-    }
+    int result;
     pthread_mutex_lock(&fake->mutex);
     if (fake->close_blocked) {
         fake->close_entered = true;
         pthread_cond_broadcast(&fake->condition);
         while (!fake->close_release)
             pthread_cond_wait(&fake->condition, &fake->mutex);
+    }
+    if (atomic_load_explicit(&fake->close_result_persistent, memory_order_acquire)) {
+        result = atomic_load_explicit(&fake->close_result, memory_order_acquire);
+    } else {
+        result = atomic_exchange_explicit(&fake->close_result, 0, memory_order_acq_rel);
+    }
+    if (result != 0) {
+        pthread_mutex_unlock(&fake->mutex);
+        return result;
     }
     if (fake->close_requested) {
         pthread_mutex_unlock(&fake->mutex);
@@ -872,9 +905,18 @@ int fake_close(trevrpc_rpc_transport* transport) {
 
 static int fake_release_handle(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint32_t kind) {
     fake_transport* fake = fake_from_base(transport);
-    int result = atomic_load_explicit(&fake->release_handle_result, memory_order_acquire);
+    int result;
+    atomic_int* result_slot = kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM ? &fake->stream_release_handle_result
+                                                                          : &fake->call_release_handle_result;
+    atomic_bool* persistent_slot = kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM
+                                       ? &fake->stream_release_handle_result_persistent
+                                       : &fake->call_release_handle_result_persistent;
+    if (atomic_load_explicit(persistent_slot, memory_order_acquire)) {
+        result = atomic_load_explicit(result_slot, memory_order_acquire);
+    } else {
+        result = atomic_exchange_explicit(result_slot, 0, memory_order_acq_rel);
+    }
     (void)handle;
-    (void)kind;
     atomic_fetch_add_explicit(&fake->release_handle_calls, 1, memory_order_release);
     pthread_mutex_lock(&fake->mutex);
     pthread_cond_broadcast(&fake->condition);
@@ -1038,7 +1080,10 @@ fake_transport* fake_create(void) {
     atomic_init(&fake->admission_last_status, 0);
     atomic_init(&fake->next_event_result, 0);
     atomic_init(&fake->close_result, 0);
+    atomic_init(&fake->close_result_persistent, false);
     atomic_init(&fake->close_status, 0);
+    atomic_init(&fake->connection_close_result, 0);
+    atomic_init(&fake->connection_close_result_persistent, false);
     atomic_init(&fake->poll_timeout_ms, -1);
     atomic_init(&fake->poll_deadline_nanos, 0);
     atomic_init(&fake->poll_timeout_fires, 0);
@@ -1049,6 +1094,10 @@ fake_transport* fake_create(void) {
     atomic_init(&fake->receive_get_info_result, 0);
     atomic_init(&fake->stream_send_result, 0);
     atomic_init(&fake->release_handle_result, 0);
+    atomic_init(&fake->stream_release_handle_result, 0);
+    atomic_init(&fake->stream_release_handle_result_persistent, false);
+    atomic_init(&fake->call_release_handle_result, 0);
+    atomic_init(&fake->call_release_handle_result_persistent, false);
     atomic_init(&fake->last_abort_error, 0);
     atomic_init(&fake->last_send_operation_id, 0);
     fake->base.ops = &fake_ops;

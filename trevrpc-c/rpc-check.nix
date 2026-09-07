@@ -57,7 +57,7 @@ stdenv.mkDerivation (final: {
   doCheck = true;
   checkPhase = ''
     runHook preCheck
-    ctest --test-dir build --output-on-failure -R '^trevrpc_rpc_(api|api_cpp|fake_transport|abi1_symbols)$'
+    ctest --test-dir build --output-on-failure -R '^trevrpc_rpc_(api|api_cpp|fake_transport|registry|abi1_symbols)$'
     runHook postCheck
   '';
 

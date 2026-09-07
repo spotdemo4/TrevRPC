@@ -519,6 +519,26 @@ if(TREVRPC_BUILD_TRANSPORT_MSQUIC)
     trevrpc_c_warnings(trevrpc_transport_msquic_private)
     trevrpc_c_sanitizers(trevrpc_transport_msquic_private)
 
+    if(TREVRPC_BUILD_TESTS)
+        add_library(trevrpc_transport_msquic_private_testing STATIC
+            src/trevrpc_rpc_transport_engine.c
+            src/trevrpc_rpc_transport_h3.c
+            src/trevrpc_rpc_transport_msquic.c
+        )
+    target_include_directories(trevrpc_transport_msquic_private_testing PRIVATE include src)
+    target_compile_definitions(trevrpc_transport_msquic_private_testing PRIVATE TREVRPC_CREDENTIAL_TESTING)
+    target_link_libraries(trevrpc_transport_msquic_private_testing PRIVATE
+        trevrpc_engine_msquic
+        trevrpc_msquic_native_core
+        trevrpc_protocol_core
+        trevrpc_msquic_api_owner
+        msquic::msquic
+        Threads::Threads
+    )
+        trevrpc_c_warnings(trevrpc_transport_msquic_private_testing)
+        trevrpc_c_sanitizers(trevrpc_transport_msquic_private_testing)
+    endif()
+
     add_library(trevrpc_transport_msquic STATIC src/trevrpc_transport_msquic.c)
     target_include_directories(trevrpc_transport_msquic
         PUBLIC
@@ -547,6 +567,16 @@ if(TREVRPC_BUILD_TRANSPORT_MSQUIC)
     trevrpc_c_warnings(trevrpc_transport_msquic)
     trevrpc_c_sanitizers(trevrpc_transport_msquic)
 
+    if(TREVRPC_BUILD_TESTS)
+        add_library(trevrpc_transport_msquic_testing STATIC src/trevrpc_transport_msquic.c)
+        target_include_directories(trevrpc_transport_msquic_testing PRIVATE include src)
+        target_link_libraries(trevrpc_transport_msquic_testing PUBLIC trevrpc_transport trevrpc_engine_msquic
+            PRIVATE trevrpc_transport_msquic_private_testing trevrpc_msquic_native_core trevrpc_protocol_core
+                trevrpc_msquic_api_owner msquic::msquic)
+        trevrpc_c_warnings(trevrpc_transport_msquic_testing)
+        trevrpc_c_sanitizers(trevrpc_transport_msquic_testing)
+    endif()
+
     list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_transport_msquic.pc")
     configure_file(cmake/trevrpc_transport_msquic.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_transport_msquic.pc" @ONLY)
@@ -563,6 +593,14 @@ if(TREVRPC_BUILD_RPC_MSQUIC)
     target_link_libraries(trevrpc_rpc_msquic PUBLIC trevrpc_rpc trevrpc_transport_msquic)
     trevrpc_c_warnings(trevrpc_rpc_msquic)
     trevrpc_c_sanitizers(trevrpc_rpc_msquic)
+
+    if(TREVRPC_BUILD_TESTS)
+        add_library(trevrpc_rpc_msquic_testing STATIC src/trevrpc_rpc_msquic.c)
+        target_include_directories(trevrpc_rpc_msquic_testing PRIVATE include src)
+        target_link_libraries(trevrpc_rpc_msquic_testing PUBLIC trevrpc_rpc trevrpc_transport_msquic_testing)
+        trevrpc_c_warnings(trevrpc_rpc_msquic_testing)
+        trevrpc_c_sanitizers(trevrpc_rpc_msquic_testing)
+    endif()
 
     list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_rpc_msquic.pc")
     configure_file(cmake/trevrpc_rpc_msquic.pc.in
@@ -1090,6 +1128,11 @@ if(TARGET trevrpc_bench_peer_c)
         COMPONENT benchmark-peer
     )
 endif()
+if(TARGET trevrpc_greeter_server)
+    install(TARGETS trevrpc_greeter_server
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
 if(trevrpc_pkg_config_files)
     install(FILES ${trevrpc_pkg_config_files}
         DESTINATION "${TREVRPC_INSTALL_PKGCONFIGDIR}"
@@ -1137,6 +1180,7 @@ if(TREVRPC_BUILD_MSQUIC)
     if(TREVRPC_INSTALL_INTERNAL_HEADERS)
         install(FILES
             src/trevrpc_owned_bytes_internal.h
+            src/trevrpc_values_internal.h
             src/trevrpc_wire_internal.h
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/trevrpc/internal
         )
@@ -1352,7 +1396,10 @@ if(TREVRPC_BUILD_TESTS)
         set_tests_properties(trevrpc_engine_lifecycle PROPERTIES TIMEOUT 60)
         trevrpc_c_tsan_suppressions(trevrpc_engine_lifecycle)
 
-        add_executable(trevrpc_engine_dispatch_test tests/engine_dispatch_test.c)
+        add_executable(trevrpc_engine_dispatch_test
+            tests/engine_dispatch_test.c
+            src/trevrpc_rpc_transport_engine.c
+        )
         target_include_directories(trevrpc_engine_dispatch_test PRIVATE src)
         target_link_libraries(trevrpc_engine_dispatch_test PRIVATE trevrpc_engine)
         trevrpc_c_warnings(trevrpc_engine_dispatch_test)
@@ -1472,7 +1519,7 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
-        target_link_libraries(trevrpc_transport_native_roundtrip_test PRIVATE trevrpc_transport_msquic)
+        target_link_libraries(trevrpc_transport_native_roundtrip_test PRIVATE trevrpc_transport_msquic_testing)
         trevrpc_c_warnings(trevrpc_transport_native_roundtrip_test)
         trevrpc_c_sanitizers(trevrpc_transport_native_roundtrip_test)
         add_test(NAME trevrpc_transport_native_roundtrip COMMAND trevrpc_transport_native_roundtrip_test)
@@ -1480,6 +1527,22 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_msquic_loopback_test(trevrpc_transport_native_roundtrip)
         trevrpc_c_lsan_suppressions(trevrpc_transport_native_roundtrip)
         trevrpc_c_tsan_suppressions(trevrpc_transport_native_roundtrip)
+
+        add_executable(trevrpc_transport_h3_memory_roundtrip_test tests/transport_native_roundtrip_test.c)
+        add_dependencies(trevrpc_transport_h3_memory_roundtrip_test trevrpc_msquic_test_certificates)
+        target_compile_definitions(trevrpc_transport_h3_memory_roundtrip_test PRIVATE
+            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
+            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
+            TREVRPC_TRANSPORT_TEST_PROTOCOL=TREVRPC_TRANSPORT_PROTOCOL_HTTP3
+        )
+        target_link_libraries(trevrpc_transport_h3_memory_roundtrip_test PRIVATE trevrpc_transport_msquic_testing)
+        trevrpc_c_warnings(trevrpc_transport_h3_memory_roundtrip_test)
+        trevrpc_c_sanitizers(trevrpc_transport_h3_memory_roundtrip_test)
+        add_test(NAME trevrpc_transport_h3_memory_roundtrip COMMAND trevrpc_transport_h3_memory_roundtrip_test)
+        set_tests_properties(trevrpc_transport_h3_memory_roundtrip PROPERTIES TIMEOUT 30)
+        trevrpc_c_msquic_loopback_test(trevrpc_transport_h3_memory_roundtrip)
+        trevrpc_c_lsan_suppressions(trevrpc_transport_h3_memory_roundtrip)
+        trevrpc_c_tsan_suppressions(trevrpc_transport_h3_memory_roundtrip)
     endif()
 
     if(TARGET trevrpc_rpc)
@@ -1514,6 +1577,14 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_sanitizers(trevrpc_rpc_fake_transport_test)
         add_test(NAME trevrpc_rpc_fake_transport COMMAND trevrpc_rpc_fake_transport_test)
         set_tests_properties(trevrpc_rpc_fake_transport PROPERTIES TIMEOUT 30)
+
+        add_executable(trevrpc_rpc_registry_test tests/rpc_registry_test.c)
+        target_include_directories(trevrpc_rpc_registry_test PRIVATE src tests)
+        target_link_libraries(trevrpc_rpc_registry_test PRIVATE trevrpc_rpc_fake_transport_support)
+        trevrpc_c_warnings(trevrpc_rpc_registry_test)
+        trevrpc_c_sanitizers(trevrpc_rpc_registry_test)
+        add_test(NAME trevrpc_rpc_registry COMMAND trevrpc_rpc_registry_test)
+        set_tests_properties(trevrpc_rpc_registry PROPERTIES TIMEOUT 30)
 
         add_test(NAME trevrpc_rpc_abi1_symbols
             COMMAND "${CMAKE_COMMAND}"
@@ -1581,7 +1652,7 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
-        target_link_libraries(trevrpc_rpc_native_roundtrip_test PRIVATE trevrpc_rpc_msquic)
+        target_link_libraries(trevrpc_rpc_native_roundtrip_test PRIVATE trevrpc_rpc_msquic_testing)
         trevrpc_c_warnings(trevrpc_rpc_native_roundtrip_test)
         trevrpc_c_sanitizers(trevrpc_rpc_native_roundtrip_test)
         add_test(NAME trevrpc_rpc_native_roundtrip COMMAND trevrpc_rpc_native_roundtrip_test)
@@ -1596,7 +1667,7 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
-        target_link_libraries(trevrpc_rpc_native_shapes_test PRIVATE trevrpc_rpc_msquic)
+        target_link_libraries(trevrpc_rpc_native_shapes_test PRIVATE trevrpc_rpc_msquic_testing)
         trevrpc_c_warnings(trevrpc_rpc_native_shapes_test)
         trevrpc_c_sanitizers(trevrpc_rpc_native_shapes_test)
         add_test(NAME trevrpc_rpc_native_shapes COMMAND trevrpc_rpc_native_shapes_test)
@@ -1612,7 +1683,7 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
             TREVRPC_RPC_TEST_TRANSPORT=TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3
         )
-        target_link_libraries(trevrpc_rpc_h3_shapes_test PRIVATE trevrpc_rpc_msquic)
+        target_link_libraries(trevrpc_rpc_h3_shapes_test PRIVATE trevrpc_rpc_msquic_testing)
         trevrpc_c_warnings(trevrpc_rpc_h3_shapes_test)
         trevrpc_c_sanitizers(trevrpc_rpc_h3_shapes_test)
         add_test(NAME trevrpc_rpc_h3_shapes COMMAND trevrpc_rpc_h3_shapes_test)
@@ -1628,7 +1699,7 @@ if(TREVRPC_BUILD_TESTS)
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
             TREVRPC_RPC_TEST_TRANSPORT=TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT
         )
-        target_link_libraries(trevrpc_rpc_wt_shapes_test PRIVATE trevrpc_rpc_msquic)
+        target_link_libraries(trevrpc_rpc_wt_shapes_test PRIVATE trevrpc_rpc_msquic_testing)
         trevrpc_c_warnings(trevrpc_rpc_wt_shapes_test)
         trevrpc_c_sanitizers(trevrpc_rpc_wt_shapes_test)
         add_test(NAME trevrpc_rpc_wt_shapes COMMAND trevrpc_rpc_wt_shapes_test)
@@ -1703,7 +1774,7 @@ if(TREVRPC_BUILD_TESTS)
         add_test(NAME trevrpc_bench_peer_capabilities COMMAND trevrpc_bench_peer_c capabilities)
         set_tests_properties(trevrpc_bench_peer_capabilities PROPERTIES
             PASS_REGULAR_EXPRESSION
-                "\"schema_version\":5.*\"roles\":\\{\"client\":\\[\"trevrpc_native_quic\"\\],\"server\":\\[\"trevrpc_native_quic\",\"trevrpc_http3\",\"trevrpc_webtransport\"\\]\\}.*\"rpc_kinds\":\\[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"\\].*\"histogram\":\"log_linear_v1\""
+                "\"schema_version\":5.*\"roles\":\\{\"client\":\\[\"trevrpc_native_quic\",\"trevrpc_webtransport\"\\],\"server\":\\[\"trevrpc_native_quic\",\"trevrpc_http3\",\"trevrpc_webtransport\"\\]\\}.*\"rpc_kinds\":\\[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"\\].*\"histogram\":\"log_linear_v1\""
         )
         add_test(NAME trevrpc_bench_peer_native_smoke
             COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_peer_native_smoke.sh"
@@ -1735,7 +1806,7 @@ if(TREVRPC_BUILD_TESTS)
                 "${trevrpc_msquic_test_cert}"
                 "${trevrpc_msquic_test_key}"
         )
-        set_tests_properties(trevrpc_bench_peer_webtransport_smoke PROPERTIES TIMEOUT 30)
+        set_tests_properties(trevrpc_bench_peer_webtransport_smoke PROPERTIES TIMEOUT 90)
         trevrpc_c_msquic_loopback_test(trevrpc_bench_peer_webtransport_smoke)
         trevrpc_c_lsan_suppressions(trevrpc_bench_peer_webtransport_smoke)
         trevrpc_c_tsan_suppressions(trevrpc_bench_peer_webtransport_smoke)

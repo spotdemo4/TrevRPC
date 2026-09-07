@@ -79,7 +79,10 @@ typedef struct trevrpc_channel_options trevrpc_channel_options;
 typedef struct trevrpc_server trevrpc_server;
 typedef struct trevrpc_stream trevrpc_stream;
 typedef struct trevrpc_call trevrpc_call;
+#ifndef TREVRPC_CALL_CONTEXT_TYPE_DEFINED
+#define TREVRPC_CALL_CONTEXT_TYPE_DEFINED
 typedef struct trevrpc_call_context trevrpc_call_context;
+#endif
 typedef struct trevrpc_cancellation trevrpc_cancellation;
 
 #ifndef TREVRPC_WEBTRANSPORT_ADMISSION_DEFINED
@@ -112,6 +115,9 @@ typedef int (*trevrpc_http3_admission)(void* user_data, const trevrpc_http3_admi
 
 #define TREVRPC_CALL_DEFERRED 1
 
+#ifndef TREVRPC_VALUE_TYPES_DEFINED
+#define TREVRPC_VALUE_TYPES_DEFINED
+
 typedef struct trevrpc_metadata_entry {
     char* key;
     size_t key_len;
@@ -143,6 +149,8 @@ typedef struct trevrpc_request {
     uint64_t timeout_nanos;
 } trevrpc_request;
 
+#endif
+
 #define TREVRPC_STRUCT_VERSION_1 1u
 #define TREVRPC_DEADLINE_INFINITE UINT64_MAX
 
@@ -163,8 +171,11 @@ typedef struct trevrpc_request {
  * released. Getters, body take, and release must not be called concurrently on
  * the same object. Shell release functions accept NULL.
  */
+#ifndef TREVRPC_INBOUND_VALUE_TYPES_DEFINED
+#define TREVRPC_INBOUND_VALUE_TYPES_DEFINED
 typedef struct trevrpc_inbound_response trevrpc_inbound_response;
 typedef struct trevrpc_inbound_stream_frame trevrpc_inbound_stream_frame;
+#endif
 
 /*
  * A body-owner view remains valid until owner release. Releasing an owner
@@ -172,12 +183,17 @@ typedef struct trevrpc_inbound_stream_frame trevrpc_inbound_stream_frame;
  * allocation owner and release context. Owner release accepts NULL and must not
  * be called concurrently with a getter or another release on the same owner.
  */
+#ifndef TREVRPC_OWNERSHIP_TYPES_DEFINED
+#define TREVRPC_OWNERSHIP_TYPES_DEFINED
+
 typedef struct trevrpc_body_owner trevrpc_body_owner;
 
 typedef struct trevrpc_bytes_view {
     const uint8_t* data;
     size_t len;
 } trevrpc_bytes_view;
+
+#endif
 
 typedef struct trevrpc_client_config_v1 {
     uint32_t struct_size;
@@ -304,6 +320,9 @@ typedef int (*trevrpc_call_handler)(void* user_data, trevrpc_call* call);
 typedef int (*trevrpc_authorizer)(
     void* user_data, const trevrpc_call_context* context, const trevrpc_request* request, trevrpc_status* status);
 
+#ifndef TREVRPC_AUTHORIZER_TYPES_DEFINED
+#define TREVRPC_AUTHORIZER_TYPES_DEFINED
+
 typedef struct trevrpc_metadata_value_authorizer {
     const char* key;
     size_t key_len;
@@ -315,6 +334,8 @@ typedef struct trevrpc_bearer_authorizer {
     const char* token;
     size_t token_len;
 } trevrpc_bearer_authorizer;
+
+#endif
 
 typedef struct trevrpc_rpc_started_event {
     const char* service;
@@ -449,6 +470,9 @@ int trevrpc_channel_options_set_lifecycle_callback(
 void trevrpc_channel_options_free(trevrpc_channel_options* options);
 /* Blocks until the initial connection is ready. A zero timeout waits indefinitely. */
 
+#ifndef TREVRPC_OWNERSHIP_FUNCTIONS_DEFINED
+#define TREVRPC_OWNERSHIP_FUNCTIONS_DEFINED
+
 int trevrpc_inbound_response_get_status(const trevrpc_inbound_response* response, uint32_t* status);
 int trevrpc_inbound_response_get_message(const trevrpc_inbound_response* response, trevrpc_bytes_view* message);
 int trevrpc_inbound_response_get_body(const trevrpc_inbound_response* response, trevrpc_bytes_view* body);
@@ -470,6 +494,8 @@ void trevrpc_inbound_stream_frame_release(trevrpc_inbound_stream_frame* frame);
 
 int trevrpc_body_owner_get_view(const trevrpc_body_owner* owner, trevrpc_bytes_view* body);
 void trevrpc_body_owner_release(trevrpc_body_owner* owner);
+
+#endif
 
 int trevrpc_client_config_v1_init(trevrpc_client_config_v1* config, size_t struct_size);
 int trevrpc_server_config_v1_init(trevrpc_server_config_v1* config, size_t struct_size);

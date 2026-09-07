@@ -56,7 +56,7 @@ stdenv.mkDerivation (final: {
 
   buildPhase = ''
     runHook preBuild
-    build_targets="protoc-gen-trevrpc-c trevrpc_engine trevrpc_engine_msquic_support trevrpc_engine_msquic trevrpc_msquic_api_owner trevrpc_rpc trevrpc_rpc_msquic trevrpc_rpc_api_test trevrpc_rpc_api_cpp_test trevrpc_rpc_fake_transport_test trevrpc_rpc_msquic_smoke_test trevrpc_rpc_transport_h3_test trevrpc_rpc_transport_msquic_lifecycle_test trevrpc_rpc_native_roundtrip_test trevrpc_rpc_native_shapes_test trevrpc_rpc_h3_shapes_test trevrpc_rpc_wt_shapes_test trevrpc_generated_service_test trevrpc_greeter_server trevrpc_greeter_client trevrpc_bench_peer_c"
+    build_targets="protoc-gen-trevrpc-c trevrpc_engine trevrpc_engine_msquic_support trevrpc_engine_msquic trevrpc_msquic_api_owner trevrpc_rpc trevrpc_rpc_msquic trevrpc_rpc_api_test trevrpc_rpc_api_cpp_test trevrpc_rpc_fake_transport_test trevrpc_rpc_registry_test trevrpc_rpc_msquic_smoke_test trevrpc_rpc_transport_h3_test trevrpc_rpc_transport_msquic_lifecycle_test trevrpc_rpc_native_roundtrip_test trevrpc_rpc_native_shapes_test trevrpc_rpc_h3_shapes_test trevrpc_rpc_wt_shapes_test trevrpc_generated_service_test trevrpc_greeter_server trevrpc_greeter_client trevrpc_bench_peer_c"
     cmake --build build --parallel $NIX_BUILD_CORES --target $build_targets
     runHook postBuild
   '';
@@ -65,7 +65,7 @@ stdenv.mkDerivation (final: {
   checkPhase = ''
     runHook preCheck
     ctest --test-dir build --output-on-failure \
-      -R '^(trevrpc_rpc_(api|api_cpp|fake_transport|abi1_symbols|msquic_abi1_symbols|msquic_smoke|native_roundtrip|native_shapes|h3_shapes|wt_shapes.*|transport_h3.*|transport_msquic_lifecycle)|trevrpc_generated_service_.*|trevrpc_greeter_(native|http3|webtransport)_smoke|trevrpc_bench_peer_(capabilities|native_smoke|webtransport_config|webtransport_smoke))$'
+      -R '^(trevrpc_rpc_(api|api_cpp|fake_transport|registry|abi1_symbols|msquic_abi1_symbols|msquic_smoke|native_roundtrip|native_shapes|h3_shapes|wt_shapes.*|transport_h3.*|transport_msquic_lifecycle)|trevrpc_generated_service_.*|trevrpc_codegen_golden_(header|source)|trevrpc_greeter_(native|http3|webtransport)_smoke|trevrpc_bench_peer_(capabilities|native_smoke|webtransport_config|webtransport_smoke))$'
     runHook postCheck
   '';
 

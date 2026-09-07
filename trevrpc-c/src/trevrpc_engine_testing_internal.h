@@ -8,6 +8,7 @@
 
 #define TREVRPC_ENGINE_TEST_WAKE_FAILURE_READ 1u
 #define TREVRPC_ENGINE_TEST_WAKE_FAILURE_WRITE 2u
+#define TREVRPC_ENGINE_TEST_WAKE_FAILURE_WRITE_ONCE 3u
 
 int trevrpc_engine_testing_create(const trevrpc_engine_config_v1* config, trevrpc_engine** out_engine);
 int trevrpc_engine_testing_enqueue_diagnostic_copy(trevrpc_engine* engine, const void* data, size_t data_len);

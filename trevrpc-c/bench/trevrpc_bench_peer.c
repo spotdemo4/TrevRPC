@@ -25,6 +25,7 @@
 #define BENCHMARK_HTTP3_PATH "/trevrpc"
 #define BENCHMARK_WEBTRANSPORT_PATH "/trevrpc"
 #define BENCHMARK_DISABLED_WEBTRANSPORT_PATH ""
+#define BENCHMARK_WEBTRANSPORT_ORIGIN "https://benchmark.invalid"
 #define BENCHMARK_SHUTDOWN_REPORT_MARGIN_NS UINT64_C(500000000)
 
 typedef Trevrpc__Benchmark__V1__BenchmarkRequest BenchmarkRequest;
@@ -225,7 +226,7 @@ static int flush_event(void) {
 static int emit_capabilities(void) {
     if (fprintf(stdout,
             "{\"schema_version\":%d,\"event\":\"capabilities\",\"peer\":\"c\","
-            "\"roles\":{\"client\":[\"trevrpc_native_quic\"],"
+            "\"roles\":{\"client\":[\"trevrpc_native_quic\",\"trevrpc_webtransport\"],"
             "\"server\":[\"trevrpc_native_quic\",\"trevrpc_http3\",\"trevrpc_webtransport\"]},"
             "\"rpc_kinds\":[\"unary\",\"client_stream\",\"server_stream\",\"bidi\"],"
             "\"histogram\":\"log_linear_v1\"}",
@@ -270,6 +271,16 @@ static int emit_ready(const char* host, uint16_t port, const char* stack) {
     if (length < 0 || (size_t)length >= sizeof(address) || write_json_string(stdout, address) != 0 ||
         fputs(",\"stack\":", stdout) == EOF || write_json_string(stdout, stack) != 0 ||
         fprintf(stdout, ",\"pid\":%ld}", (long)getpid()) < 0) {
+        return -EIO;
+    }
+    return flush_event();
+}
+
+static int emit_prepared(const char* origin) {
+    if (fprintf(stdout,
+            "{\"schema_version\":%d,\"event\":\"prepared\",\"peer\":\"c\",\"origin\":",
+            BENCHMARK_SCHEMA_VERSION) < 0 ||
+        write_json_string(stdout, origin) != 0 || fprintf(stdout, ",\"pid\":%ld}", (long)getpid()) < 0) {
         return -EIO;
     }
     return flush_event();
@@ -511,9 +522,8 @@ static int parse_client_options(int argc, char** argv, client_options* options, 
             return err;
         }
     }
-    if (address == NULL || stack == NULL || options->cert == NULL || rpc == NULL || concurrency == NULL ||
-        warmup_ms == NULL || measurement_ms == NULL || request_bytes == NULL || response_bytes == NULL ||
-        messages_per_stream == NULL) {
+    if (stack == NULL || options->cert == NULL || rpc == NULL || concurrency == NULL || warmup_ms == NULL ||
+        measurement_ms == NULL || request_bytes == NULL || response_bytes == NULL || messages_per_stream == NULL) {
         snprintf(error, error_len, "client requires all peer protocol options");
         return -EINVAL;
     }
@@ -525,18 +535,25 @@ static int parse_client_options(int argc, char** argv, client_options* options, 
         snprintf(error, error_len, "trevrpc_http3 is server-only");
         return -EINVAL;
     }
-    if (options->stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
-        snprintf(error, error_len, "trevrpc_webtransport is unsupported by the RPC ABI 1 peer");
-        return -EOPNOTSUPP;
+    if (options->stack == BENCHMARK_STACK_TREVRPC_NATIVE_QUIC && address == NULL) {
+        snprintf(error, error_len, "trevrpc_native_quic client requires --address");
+        return -EINVAL;
     }
     if (parse_rpc_kind(rpc, options) != 0) {
         snprintf(error, error_len, "invalid --rpc value: %s", rpc);
         return -EINVAL;
     }
-    int err = split_address(address, false, &options->host, &options->port);
-    if (err != 0) {
-        snprintf(error, error_len, "invalid --address: %s", address);
-        return err;
+    int err = 0;
+    if (address != NULL) {
+        if (options->stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
+            snprintf(error, error_len, "--address is only valid for a trevrpc_native_quic client");
+            return -EINVAL;
+        }
+        err = split_address(address, false, &options->host, &options->port);
+        if (err != 0) {
+            snprintf(error, error_len, "invalid --address: %s", address);
+            return err;
+        }
     }
 
     uint64_t parsed = 0;
@@ -2108,7 +2125,21 @@ static int run_client(int argc, char** argv) {
     int e = parse_client_options(argc, argv, &o, pe, sizeof(pe));
     if (e) {
         free(o.host);
-        return fail_with_error("config", e == -EOPNOTSUPP ? "unsupported" : "invalid_argument", "%s", pe);
+        return fail_with_error("config", "invalid_argument", "%s", pe);
+    }
+    if (o.stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
+        char command[512];
+        e = emit_prepared(BENCHMARK_WEBTRANSPORT_ORIGIN);
+        if (!e)
+            e = read_control_command(command, sizeof(command));
+        if (!e && strncmp(command, "CONNECT ", 8) != 0)
+            e = -EINVAL;
+        if (!e)
+            e = split_address(command + 8, false, &o.host, &o.port);
+        if (e) {
+            free(o.host);
+            return fail_with_error("connect", "connect_failed", "expected CONNECT HOST:PORT (%d)", e);
+        }
     }
     benchmark_client c = {0};
     trevrpc_rpc_event_info_v1 endpoint_event = {0};
@@ -2122,7 +2153,7 @@ static int run_client(int argc, char** argv) {
         e = trevrpc_rpc_msquic_endpoint_config_v1_init(&q, sizeof(q));
     if (!e) {
         q.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_CLIENT;
-        q.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE;
+        q.transport = transport_for_stack(o.stack);
         q.host = o.host;
         q.host_len = (uint32_t)strlen(o.host);
         q.port = o.port;
@@ -2130,6 +2161,12 @@ static int run_client(int argc, char** argv) {
         q.ca_cert_file = o.cert;
         q.ca_cert_file_len = (uint32_t)strlen(o.cert);
         q.flags = TREVRPC_RPC_MSQUIC_VERIFY_PEER;
+        if (o.stack == BENCHMARK_STACK_TREVRPC_WEBTRANSPORT) {
+            q.path = BENCHMARK_WEBTRANSPORT_PATH;
+            q.path_len = (uint32_t)strlen(BENCHMARK_WEBTRANSPORT_PATH);
+            q.origin = BENCHMARK_WEBTRANSPORT_ORIGIN;
+            q.origin_len = (uint32_t)strlen(BENCHMARK_WEBTRANSPORT_ORIGIN);
+        }
         q.max_frame_size = BENCHMARK_MAX_FRAME_SIZE;
         q.max_pending_receive_bytes = (uint64_t)BENCHMARK_MAX_FRAME_SIZE * 2u + 4096u;
         q.max_idle_timeout_ms = BENCHMARK_IDLE_TIMEOUT_MS;

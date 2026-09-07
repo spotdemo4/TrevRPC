@@ -1,7 +1,6 @@
 #ifndef TREVRPC_WIRE_INTERNAL_H
 #define TREVRPC_WIRE_INTERNAL_H
 
-#include "trevrpc.h"
 #include "trevrpc_owned_bytes_internal.h"
 
 #include <stdbool.h>

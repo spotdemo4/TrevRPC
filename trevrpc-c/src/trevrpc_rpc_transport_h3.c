@@ -1,15 +1,14 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc_rpc_transport_h3_internal.h"
+#include "trevrpc_credential_internal.h"
 
 #include "trevrpc_h3_demux_internal.h"
 #include "trevrpc_http3_frame_internal.h"
 #include "trevrpc_http3_headers_internal.h"
 #include "trevrpc_http3_settings_internal.h"
 #include "trevrpc_msquic_internal.h"
-#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
 #include "trevrpc_msquic_objects_internal.h" // IWYU pragma: keep
-#endif
 #include "trevrpc_qpack_static_internal.h"
 #include "trevrpc_quic_varint_internal.h"
 #include "trevrpc_webtransport_capsule_internal.h"
@@ -98,6 +97,9 @@ typedef struct h3_endpoint_copy {
 } h3_endpoint_copy;
 
 static _Thread_local h3_entry* h3_processing_entry;
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+static trevrpc_rpc_transport_h3_test_send_capture h3_test_send_capture;
+#endif
 
 typedef struct h3_capsule_state {
     trevrpc_wt_capsule_parser parser;
@@ -219,6 +221,7 @@ struct h3_entry {
 
 struct h3_source {
     trevrpc_rpc_transport base;
+    trevrpc_msquic_finalizer_scope finalizer_scope;
     pthread_mutex_t mutex;
     pthread_cond_t object_cond;
     int wake_read_fd;
@@ -475,6 +478,8 @@ static void h3_endpoint_free(h3_endpoint_copy* copy) {
     free(copy->ca_cert_file);
     free(copy->path);
     free(copy->origin);
+    if (copy->key_data != NULL)
+        trevrpc_credential_secure_zero(copy->key_data, (size_t)copy->value.key_data_len);
     free(copy->cert_data);
     free(copy->key_data);
     free(copy->ca_cert_data);
@@ -535,8 +540,11 @@ static int h3_endpoint_copy_make(const trevrpc_rpc_transport_endpoint_config* so
     out->value.host = out->host;
     out->value.server_name = out->server_name;
     out->value.cert_file = out->cert_file;
+    out->value.cert_file_len = source->cert_file_len;
     out->value.key_file = out->key_file;
+    out->value.key_file_len = source->key_file_len;
     out->value.ca_cert_file = out->ca_cert_file;
+    out->value.ca_cert_file_len = source->ca_cert_file_len;
     out->value.path = out->path;
     out->value.origin = out->origin;
     out->value.cert_data = out->cert_data;
@@ -1504,6 +1512,7 @@ static int h3_admit_peer_stream_locked(h3_source* source,
     if (entry == NULL)
         return -EAGAIN;
     *out_entry = entry;
+    entry->endpoint.value.protocol = parent->endpoint.value.protocol;
     result = trevrpc_h3_demux_stream_init(&entry->stream.classifier, direction);
     if (result != 0) {
         h3_detach_entry_locked(entry);
@@ -3981,6 +3990,22 @@ static int h3_validate_endpoint_sizes(const trevrpc_rpc_transport_endpoint_confi
     return 0;
 }
 
+static int h3_validate_credentials(const trevrpc_rpc_transport_endpoint_config* config, int server) {
+    return trevrpc_credential_validate_endpoint(config->cert_file,
+        config->cert_file_len,
+        config->key_file,
+        config->key_file_len,
+        config->ca_cert_file,
+        config->ca_cert_file_len,
+        config->cert_data,
+        config->cert_data_len,
+        config->key_data,
+        config->key_data_len,
+        config->ca_cert_data,
+        config->ca_cert_data_len,
+        server);
+}
+
 static void h3_msquic_config(const trevrpc_rpc_transport_endpoint_config* c, trevrpc_msquic_config* out) {
     memset(out, 0, sizeof(*out));
     out->alpn = (const char*)(c->alpn ? c->alpn : (const uint8_t*)"h3");
@@ -4001,6 +4026,47 @@ static void h3_msquic_config(const trevrpc_rpc_transport_endpoint_config* c, tre
     out->send_buffering_enabled = 1;
 }
 
+static int h3_msquic_config_prepare_credentials(
+    const h3_endpoint_copy* endpoint, trevrpc_msquic_config* out, trevrpc_credential_files* files) {
+    int result;
+    h3_msquic_config(&endpoint->value, out);
+    result = trevrpc_credential_files_prepare(files,
+        endpoint->cert_data,
+        endpoint->value.cert_data_len,
+        endpoint->key_data,
+        endpoint->value.key_data_len,
+        endpoint->ca_cert_data,
+        endpoint->value.ca_cert_data_len);
+    if (result != 0)
+        return result;
+    if (files->cert_created != 0)
+        out->cert_file = files->cert_file;
+    if (files->key_created != 0)
+        out->key_file = files->key_file;
+    if (files->ca_cert_created != 0)
+        out->ca_cert_file = files->ca_cert_file;
+    return 0;
+}
+
+static int h3_endpoint_discard_credentials(h3_endpoint_copy* endpoint, trevrpc_credential_files* files) {
+    int result = trevrpc_credential_files_cleanup(files);
+    if (endpoint->key_data != NULL)
+        trevrpc_credential_secure_zero(endpoint->key_data, (size_t)endpoint->value.key_data_len);
+    free(endpoint->cert_data);
+    free(endpoint->key_data);
+    free(endpoint->ca_cert_data);
+    endpoint->cert_data = NULL;
+    endpoint->key_data = NULL;
+    endpoint->ca_cert_data = NULL;
+    endpoint->value.cert_data = NULL;
+    endpoint->value.key_data = NULL;
+    endpoint->value.ca_cert_data = NULL;
+    endpoint->value.cert_data_len = 0;
+    endpoint->value.key_data_len = 0;
+    endpoint->value.ca_cert_data_len = 0;
+    return result;
+}
+
 static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
     const trevrpc_rpc_transport_endpoint_config* config,
     trevrpc_msquic_accept_dispatch dispatch,
@@ -4018,8 +4084,10 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
     size_t alpn_count;
     trevrpc_msquic_listener* listener = NULL;
     h3_endpoint_copy endpoint;
+    trevrpc_credential_files credential_files;
     h3_entry* entry;
     int result;
+    int cleanup_result;
     trevrpc_msquic_feature_request features;
     trevrpc_msquic_receive_policy policy = {0};
     if (config == NULL || out == NULL ||
@@ -4050,13 +4118,25 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
             dispatch_context_destroy(dispatch_context);
         return result;
     }
+    result = h3_validate_credentials(config, 1);
+    if (result != 0) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
+        return result;
+    }
     result = h3_endpoint_copy_make(config, &endpoint);
     if (result != 0) {
         if (dispatch_context_destroy != NULL)
             dispatch_context_destroy(dispatch_context);
         return result;
     }
-    h3_msquic_config(&endpoint.value, &ms);
+    result = h3_msquic_config_prepare_credentials(&endpoint, &ms, &credential_files);
+    if (result != 0) {
+        h3_endpoint_free(&endpoint);
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
+        return result;
+    }
     alpn.alpn = ms.alpn;
     alpn.alpn_len = ms.alpn_len;
     features = trevrpc_msquic_default_h3_features();
@@ -4078,10 +4158,11 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
         (trevrpc_rpc_transport_handle){0});
     pthread_mutex_unlock(&source->mutex);
     if (entry == NULL) {
+        cleanup_result = h3_endpoint_discard_credentials(&endpoint, &credential_files);
         h3_endpoint_free(&endpoint);
         if (dispatch_context_destroy != NULL)
             dispatch_context_destroy(dispatch_context);
-        return -EAGAIN;
+        return cleanup_result != 0 ? cleanup_result : -EAGAIN;
     }
     result = trevrpc_msquic_listen_alpns_features_with_dispatch(endpoint.value.host,
         endpoint.value.port,
@@ -4094,6 +4175,7 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
         dispatch_context,
         dispatch_context_destroy,
         &listener);
+    cleanup_result = h3_endpoint_discard_credentials(&endpoint, &credential_files);
     if (result != 0) {
         pthread_mutex_lock(&source->mutex);
         h3_detach_entry_locked(entry);
@@ -4101,6 +4183,15 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
         h3_close_entry_object(entry);
         h3_endpoint_free(&endpoint);
         return result;
+    }
+    trevrpc_msquic_listener_set_finalizer_scope(listener, &source->finalizer_scope);
+    if (cleanup_result != 0) {
+        trevrpc_msquic_listener_close(listener);
+        pthread_mutex_lock(&source->mutex);
+        h3_detach_entry_locked(entry);
+        pthread_mutex_unlock(&source->mutex);
+        h3_endpoint_free(&endpoint);
+        return cleanup_result;
     }
     pthread_mutex_lock(&source->mutex);
     entry->object = listener;
@@ -4177,8 +4268,10 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
     trevrpc_msquic_receive_policy policy = {0};
     trevrpc_msquic_conn* conn = NULL;
     h3_endpoint_copy endpoint;
+    trevrpc_credential_files credential_files;
     h3_entry* entry;
     int result;
+    int cleanup_result;
     if (config == NULL || out == NULL || operation_id == 0 ||
         (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3 &&
             config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT))
@@ -4189,10 +4282,17 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
     result = h3_validate_endpoint_sizes(config);
     if (result != 0)
         return result;
+    result = h3_validate_credentials(config, 0);
+    if (result != 0)
+        return result;
     result = h3_endpoint_copy_make(config, &endpoint);
     if (result != 0)
         return result;
-    h3_msquic_config(&endpoint.value, &ms);
+    result = h3_msquic_config_prepare_credentials(&endpoint, &ms, &credential_files);
+    if (result != 0) {
+        h3_endpoint_free(&endpoint);
+        return result;
+    }
     features = trevrpc_msquic_default_h3_features();
     policy.max_stream_owned_bytes = config->max_pending_receive_bytes;
     policy.max_stream_owned_count = config->max_pending_receive_count;
@@ -4214,9 +4314,17 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
         NULL,
         &policy,
         &conn);
+    cleanup_result = h3_endpoint_discard_credentials(&endpoint, &credential_files);
     if (result != 0) {
         h3_endpoint_free(&endpoint);
         return result;
+    }
+    trevrpc_msquic_conn_set_finalizer_scope(conn, &source->finalizer_scope);
+    if (cleanup_result != 0) {
+        if (conn != NULL)
+            trevrpc_msquic_conn_close(conn);
+        h3_endpoint_free(&endpoint);
+        return cleanup_result;
     }
     pthread_mutex_lock(&source->mutex);
     entry = h3_alloc_entry_locked(source,
@@ -4340,6 +4448,49 @@ static int h3_stream_open(trevrpc_rpc_transport* transport,
     return 0;
 }
 
+typedef struct h3_send_encode_context {
+    const uint8_t* body;
+    size_t body_len;
+    bool webtransport;
+} h3_send_encode_context;
+
+static int h3_encode_data_frame(uint8_t* frame, size_t frame_len, void* context) {
+    const h3_send_encode_context* encode = context;
+    size_t type_len = 0;
+    size_t length_len = 0;
+    size_t expected_len;
+    if (frame == NULL || encode == NULL || (encode->body == NULL && encode->body_len != 0))
+        return -EINVAL;
+    if (!encode->webtransport &&
+        (trevrpc_quic_varint_size(TREV_H3_FRAME_DATA, &type_len) != 0 ||
+            trevrpc_quic_varint_size(encode->body_len + 4, &length_len) != 0))
+        return -EOVERFLOW;
+    if (encode->body_len > SIZE_MAX - type_len - length_len - 4u)
+        return -EOVERFLOW;
+    expected_len = type_len + length_len + 4u + encode->body_len;
+    if (frame_len != expected_len)
+        return -EINVAL;
+    if (!encode->webtransport) {
+        if (trevrpc_quic_varint_write(frame, frame_len, TREV_H3_FRAME_DATA, &type_len) != 0 ||
+            trevrpc_quic_varint_write(frame + type_len,
+                frame_len - type_len,
+                encode->body_len + 4,
+                &length_len) != 0)
+            return -EOVERFLOW;
+    }
+    frame[type_len + length_len] = (uint8_t)(encode->body_len >> 24);
+    frame[type_len + length_len + 1] = (uint8_t)(encode->body_len >> 16);
+    frame[type_len + length_len + 2] = (uint8_t)(encode->body_len >> 8);
+    frame[type_len + length_len + 3] = (uint8_t)encode->body_len;
+    if (encode->body_len != 0)
+        memcpy(frame + type_len + length_len + 4, encode->body, encode->body_len);
+#ifdef TREVRPC_RPC_TRANSPORT_H3_TESTING
+    if (h3_test_send_capture != NULL)
+        h3_test_send_capture(frame, frame_len);
+#endif
+    return 0;
+}
+
 static int h3_stream_send(trevrpc_rpc_transport* transport,
     trevrpc_rpc_transport_handle handle,
     uint64_t operation_id,
@@ -4349,7 +4500,7 @@ static int h3_stream_send(trevrpc_rpc_transport* transport,
     h3_entry* entry;
     trevrpc_msquic_stream* stream = NULL;
     trevrpc_msquic_send_completion* completion = NULL;
-    uint8_t* frame;
+    h3_send_encode_context encode_context;
     size_t a = 0, b = 0, c;
     bool send_response_headers;
     bool webtransport;
@@ -4420,26 +4571,11 @@ static int h3_stream_send(trevrpc_rpc_transport* transport,
         return -EOVERFLOW;
     }
     c = a + b + 4 + body_len;
-    frame = malloc(c);
-    if (frame == NULL) {
-        pthread_mutex_lock(&source->mutex);
-        h3_mandatory_event_free(source, &entry->send_event);
-        h3_unpin_object_locked(source, entry);
-        pthread_mutex_unlock(&source->mutex);
-        return -ENOMEM;
-    }
-    if (!webtransport) {
-        (void)trevrpc_quic_varint_write(frame, c, TREV_H3_FRAME_DATA, &a);
-        (void)trevrpc_quic_varint_write(frame + a, c - a, body_len + 4, &b);
-    }
-    frame[a + b] = (uint8_t)(body_len >> 24);
-    frame[a + b + 1] = (uint8_t)(body_len >> 16);
-    frame[a + b + 2] = (uint8_t)(body_len >> 8);
-    frame[a + b + 3] = (uint8_t)body_len;
-    if (body_len)
-        memcpy(frame + a + b + 4, body, body_len);
-    result = trevrpc_msquic_stream_write_raw_with_completion(stream, frame, c, false, &completion);
-    free(frame);
+    encode_context.body = body;
+    encode_context.body_len = body_len;
+    encode_context.webtransport = webtransport;
+    result = trevrpc_msquic_stream_write_raw_encoded_with_completion(
+        stream, c, false, h3_encode_data_frame, &encode_context, &completion);
     if (result < 0) {
         pthread_mutex_lock(&source->mutex);
         h3_mandatory_event_free(source, &entry->send_event);
@@ -5014,7 +5150,7 @@ static void h3_destroy(trevrpc_rpc_transport* transport) {
     h3_free_entries_of_kind(source, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM);
     h3_free_entries_of_kind(source, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
     h3_free_entries_of_kind(source, TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER);
-    trevrpc_msquic_finalizer_drain();
+    trevrpc_msquic_finalizer_scope_drain(&source->finalizer_scope);
     assert(source->retired_entries == NULL);
     assert(source->reap_entries == NULL);
     h3_mandatory_event_free(source, &source->stopped_event);
@@ -5022,6 +5158,7 @@ static void h3_destroy(trevrpc_rpc_transport* transport) {
     close(source->wake_write_fd);
     pthread_cond_destroy(&source->object_cond);
     pthread_mutex_destroy(&source->mutex);
+    trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
     free(source->entries);
     free(source);
 }
@@ -5064,6 +5201,7 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
     int result;
     uint64_t entry_capacity;
     bool mutex_initialized = false;
+    bool finalizer_scope_initialized = false;
     if (config == NULL || out_transport == NULL || config->event_capacity == 0 || config->listener_capacity == 0 ||
         config->connection_capacity == 0 || config->stream_capacity == 0)
         return -EINVAL;
@@ -5073,6 +5211,12 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
     source = calloc(1, sizeof(*source));
     if (source == NULL)
         return -ENOMEM;
+    result = trevrpc_msquic_finalizer_scope_init(&source->finalizer_scope);
+    if (result != 0) {
+        free(source);
+        return result;
+    }
+    finalizer_scope_initialized = true;
     atomic_init(&source->mandatory_reservations, 0);
     source->config = *config;
     if (source->config.max_receive_owned_bytes == 0)
@@ -5082,6 +5226,8 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
     source->entry_capacity = (size_t)entry_capacity;
     source->entries = calloc(source->entry_capacity, sizeof(*source->entries));
     if (source->entries == NULL) {
+        if (finalizer_scope_initialized)
+            trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
         free(source);
         return -ENOMEM;
     }
@@ -5097,6 +5243,8 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
     result = h3_make_pipe(fds);
     if (result != 0) {
         free(source->entries);
+        if (finalizer_scope_initialized)
+            trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
         free(source);
         return result;
     }
@@ -5122,6 +5270,8 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
         close(source->wake_read_fd);
         close(source->wake_write_fd);
         free(source->entries);
+        if (finalizer_scope_initialized)
+            trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
         free(source);
         return -ENOMEM;
     }
@@ -5132,6 +5282,8 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
 synchronization_init_failed:
     if (mutex_initialized)
         pthread_mutex_destroy(&source->mutex);
+    if (finalizer_scope_initialized)
+        trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
     close(source->wake_read_fd);
     close(source->wake_write_fd);
     free(source->entries);
@@ -5353,6 +5505,8 @@ int trevrpc_rpc_transport_h3_test_adopt_peer_stream(trevrpc_rpc_transport* trans
             &quota_rejected);
     }
     pthread_mutex_unlock(&source->mutex);
+    if (result == 0)
+        trevrpc_msquic_stream_set_finalizer_scope(object, &source->finalizer_scope);
     if (result != 0) {
         if (quota_rejected)
             (void)trevrpc_msquic_stream_abort_with_error(object, TREV_H3_DEMUX_APP_STREAM_CREATION_ERROR);
@@ -5785,6 +5939,11 @@ int trevrpc_rpc_transport_h3_test_emit(trevrpc_rpc_transport* transport,
     pthread_mutex_unlock(&source->mutex);
     return result;
 }
+
+void trevrpc_rpc_transport_h3_test_set_send_capture(trevrpc_rpc_transport_h3_test_send_capture capture) {
+    h3_test_send_capture = capture;
+}
+
 int trevrpc_rpc_transport_h3_test_stage_pending_send(trevrpc_rpc_transport* transport,
     trevrpc_rpc_transport_handle stream,
     uint64_t operation_id,

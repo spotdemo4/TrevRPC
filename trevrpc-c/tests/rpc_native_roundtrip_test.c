@@ -1,10 +1,13 @@
 #include "trevrpc_rpc_msquic.h"
 
+#include <dirent.h>
 #include <assert.h>
 #include <errno.h> // IWYU pragma: keep
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef TREVRPC_MSQUIC_TEST_CERT
@@ -13,6 +16,29 @@
 #ifndef TREVRPC_MSQUIC_TEST_KEY
 #error "TREVRPC_MSQUIC_TEST_KEY must be defined"
 #endif
+
+static int credential_cleanup_failures;
+
+int trevrpc_credential_test_fail_cleanup(void) {
+    if (credential_cleanup_failures == 0)
+        return 0;
+    --credential_cleanup_failures;
+    return 1;
+}
+
+static size_t credential_bundle_count(void) {
+    DIR* directory = opendir("/tmp");
+    struct dirent* entry;
+    size_t count = 0;
+    if (directory == NULL)
+        return 0;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strncmp(entry->d_name, "trevrpc-credentials-", sizeof("trevrpc-credentials-") - 1u) == 0)
+            ++count;
+    }
+    assert(closedir(directory) == 0);
+    return count;
+}
 
 typedef struct observed_state {
     trevrpc_rpc_endpoint_v1 listener;
@@ -188,6 +214,24 @@ static void pump_until(trevrpc_rpc_runtime* runtime,
     assert(*condition);
 }
 
+static uint8_t* read_file(const char* path, size_t* out_len) {
+    FILE* file = fopen(path, "rb");
+    long length;
+    uint8_t* data;
+    if (file == NULL)
+        return NULL;
+    assert(fseek(file, 0, SEEK_END) == 0);
+    length = ftell(file);
+    assert(length > 0);
+    assert(fseek(file, 0, SEEK_SET) == 0);
+    data = malloc((size_t)length);
+    assert(data != NULL);
+    assert(fread(data, 1, (size_t)length, file) == (size_t)length);
+    assert(fclose(file) == 0);
+    *out_len = (size_t)length;
+    return data;
+}
+
 int main(void) {
     trevrpc_rpc_runtime_config_v1 runtime_config;
     trevrpc_rpc_msquic_config_v1 provider_config;
@@ -201,7 +245,23 @@ int main(void) {
     trevrpc_rpc_runtime* runtime = NULL;
     observed_state observed = {0};
     uint16_t port = 0;
+    uint8_t* server_cert;
+    uint8_t* server_key;
+    uint8_t* client_cert;
+    uint8_t* client_key;
+    uint8_t* client_ca;
+    size_t server_cert_len;
+    size_t server_key_len;
+    size_t client_cert_len;
+    size_t client_key_len;
+    size_t client_ca_len;
 
+    server_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &server_cert_len);
+    server_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &server_key_len);
+    client_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &client_cert_len);
+    client_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &client_key_len);
+    client_ca = read_file(TREVRPC_MSQUIC_TEST_CERT, &client_ca_len);
+    assert(server_cert != NULL && server_key != NULL && client_cert != NULL && client_key != NULL && client_ca != NULL);
     assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
     assert(trevrpc_rpc_msquic_config_v1_init(&provider_config, sizeof(provider_config)) == 0);
     assert(trevrpc_rpc_msquic_create_v1(&runtime_config, &provider_config, &runtime) == 0);
@@ -212,11 +272,68 @@ int main(void) {
     listener_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER;
     listener_config.host = "127.0.0.1";
     listener_config.host_len = (uint32_t)strlen(listener_config.host);
+    listener_config.cert_data_len = 1;
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 99, &observed.listener) == -EINVAL);
+    listener_config.cert_data = server_cert;
+    listener_config.cert_data_len = server_cert_len;
+    listener_config.key_data_len = 1;
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 99, &observed.listener) == -EINVAL);
+    listener_config.key_data = server_key;
+    listener_config.key_data_len = server_key_len;
+    listener_config.cert_data = NULL;
+    listener_config.cert_data_len = 0;
+    listener_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
+    listener_config.cert_file_len = 0;
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 99, &observed.listener) == -EINVAL);
+    listener_config.cert_data = server_cert;
+    listener_config.cert_data_len = server_cert_len;
     listener_config.cert_file = TREVRPC_MSQUIC_TEST_CERT;
     listener_config.cert_file_len = (uint32_t)strlen(listener_config.cert_file);
-    listener_config.key_file = TREVRPC_MSQUIC_TEST_KEY;
-    listener_config.key_file_len = (uint32_t)strlen(listener_config.key_file);
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 99, &observed.listener) == -EINVAL);
+    listener_config.cert_file = NULL;
+    listener_config.cert_file_len = 0;
+    listener_config.ca_cert_data = server_cert;
+    listener_config.ca_cert_data_len = server_cert_len;
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 99, &observed.listener) == -ENOTSUP);
+
+    assert(trevrpc_rpc_msquic_endpoint_config_v1_init(&listener_config, sizeof(listener_config)) == 0);
+    listener_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER;
+    listener_config.host = "127.0.0.1";
+    listener_config.host_len = (uint32_t)strlen(listener_config.host);
+    listener_config.server_name = "127.0.0.1";
+    listener_config.server_name_len = (uint32_t)strlen(listener_config.server_name);
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 99, &observed.listener) == -ENOTSUP);
+
+    assert(trevrpc_rpc_msquic_endpoint_config_v1_init(&listener_config, sizeof(listener_config)) == 0);
+    listener_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER;
+    listener_config.host = "127.0.0.1";
+    listener_config.host_len = (uint32_t)strlen(listener_config.host);
+    listener_config.cert_data = server_cert;
+    listener_config.cert_data_len = server_cert_len;
+    listener_config.key_data = server_key;
+    listener_config.key_data_len = server_key_len;
+    {
+        size_t bundles_before = credential_bundle_count();
+        credential_cleanup_failures = 1;
+        assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 99, &observed.listener) == -EIO);
+        assert(credential_bundle_count() == bundles_before);
+    }
+
+    assert(trevrpc_rpc_msquic_endpoint_config_v1_init(&listener_config, sizeof(listener_config)) == 0);
+    listener_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER;
+    listener_config.host = "127.0.0.1";
+    listener_config.host_len = (uint32_t)strlen(listener_config.host);
+    listener_config.cert_data = server_cert;
+    listener_config.cert_data_len = server_cert_len;
+    listener_config.key_data = server_key;
+    listener_config.key_data_len = server_key_len;
     assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 1, &observed.listener) == 0);
+    memset(server_cert, 0, server_cert_len);
+    memset(server_key, 0, server_key_len);
+    free(server_cert);
+    free(server_key);
+    server_cert = NULL;
+    server_key = NULL;
     assert(trevrpc_rpc_endpoint_get_port_v1(runtime, observed.listener, &port) == 0);
     assert(port != 0);
     drain_events(runtime, &observed);
@@ -226,9 +343,50 @@ int main(void) {
     client_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_CLIENT;
     client_config.host = "127.0.0.1";
     client_config.host_len = (uint32_t)strlen(client_config.host);
+    client_config.server_name = "127.0.0.1";
+    client_config.server_name_len = (uint32_t)strlen(client_config.server_name);
     client_config.port = port;
-    client_config.flags &= ~TREVRPC_RPC_MSQUIC_VERIFY_PEER;
+    client_config.cert_data = client_cert;
+    client_config.cert_data_len = client_cert_len;
+    client_config.key_data = client_key;
+    client_config.key_data_len = client_key_len;
+    client_config.ca_cert_data = client_ca;
+    client_config.ca_cert_data_len = client_ca_len;
+    client_config.server_name = "localhost";
+    client_config.server_name_len = (uint32_t)strlen(client_config.server_name);
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &client_config, 99, &observed.client_endpoint) == -ENOTSUP);
+    client_config.server_name = "127.0.0.1";
+    client_config.server_name_len = (uint32_t)strlen(client_config.server_name);
+    {
+        size_t bundles_before = credential_bundle_count();
+        credential_cleanup_failures = 1;
+        assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &client_config, 99, &observed.client_endpoint) == -EIO);
+        assert(credential_bundle_count() == bundles_before);
+    }
+
+    assert(trevrpc_rpc_msquic_endpoint_config_v1_init(&client_config, sizeof(client_config)) == 0);
+    client_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_CLIENT;
+    client_config.host = "127.0.0.1";
+    client_config.host_len = (uint32_t)strlen(client_config.host);
+    client_config.server_name = "127.0.0.1";
+    client_config.server_name_len = (uint32_t)strlen(client_config.server_name);
+    client_config.port = port;
+    client_config.cert_data = client_cert;
+    client_config.cert_data_len = client_cert_len;
+    client_config.key_data = client_key;
+    client_config.key_data_len = client_key_len;
+    client_config.ca_cert_data = client_ca;
+    client_config.ca_cert_data_len = client_ca_len;
     assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &client_config, 2, &observed.client_endpoint) == 0);
+    memset(client_cert, 0, client_cert_len);
+    memset(client_key, 0, client_key_len);
+    memset(client_ca, 0, client_ca_len);
+    free(client_cert);
+    free(client_key);
+    free(client_ca);
+    client_cert = NULL;
+    client_key = NULL;
+    client_ca = NULL;
     pump_until(runtime, &wake, &observed, &observed.client_ready);
 
     assert(trevrpc_rpc_call_config_v1_init(&call_config, sizeof(call_config)) == 0);

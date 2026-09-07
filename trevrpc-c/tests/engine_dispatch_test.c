@@ -1,6 +1,7 @@
 #include "trevrpc_engine.h"
 #include "trevrpc_engine_internal.h"
 #include "trevrpc_engine_testing_internal.h"
+#include "trevrpc_rpc_transport_engine_internal.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -27,6 +28,17 @@ struct test_provider {
     int close_result;
     bool* destroyed;
 };
+
+int trevrpc_engine_msquic_adopt_accepted_connection_v1(trevrpc_engine* engine,
+    const trevrpc_engine_endpoint_config_v1* config,
+    trevrpc_msquic_accepted_connection* accepted,
+    trevrpc_engine_handle_v1* out_connection) {
+    (void)engine;
+    (void)config;
+    (void)accepted;
+    (void)out_connection;
+    return -ENOTSUP;
+}
 
 static int attach_provider(void* context, trevrpc_engine* engine) {
     struct test_provider* provider = context;
@@ -141,6 +153,9 @@ int main(void) {
     trevrpc_engine_receive* receive = NULL;
     trevrpc_engine_event_info_v1 info;
     trevrpc_engine* engine = NULL;
+    trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_event* transport_event = NULL;
+    trevrpc_rpc_transport_event_info transport_info;
     bool destroyed = false;
     uint8_t byte = 1;
     CHECK(provider != NULL);
@@ -185,7 +200,28 @@ int main(void) {
     provider->destroyed = &destroyed;
     engine = NULL;
     CHECK(trevrpc_engine_provider_create_v1(&config, &operations, provider, TEST_OWNER, &engine) == 0);
-    CHECK(trevrpc_engine_release(engine) == -EIO);
+    CHECK(trevrpc_rpc_transport_engine_adopt(engine, &transport) == 0);
+    CHECK(trevrpc_rpc_transport_close(transport) == -EIO);
+    CHECK(trevrpc_rpc_transport_next_event(transport, &transport_event) == 0);
+    CHECK(trevrpc_rpc_transport_event_get_info(transport, transport_event, &transport_info) == 0);
+    CHECK(transport_info.kind == TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC);
+    CHECK(transport_info.flags == TREVRPC_RPC_TRANSPORT_EVENT_FLAG_FATAL);
+    CHECK(transport_info.status == -EIO);
+    trevrpc_rpc_transport_event_release(transport, transport_event);
+    transport_event = NULL;
+    CHECK(trevrpc_rpc_transport_next_event(transport, &transport_event) == 0);
+    CHECK(trevrpc_rpc_transport_event_get_info(transport, transport_event, &transport_info) == 0);
+    CHECK(transport_info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STOPPED);
+    CHECK(transport_info.flags == (TREVRPC_RPC_TRANSPORT_EVENT_FLAG_FATAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL));
+    CHECK(transport_info.status == -EIO);
+    trevrpc_rpc_transport_event_release(transport, transport_event);
+    transport_event = NULL;
+    CHECK(trevrpc_rpc_transport_next_event(transport, &transport_event) == -EAGAIN);
+    CHECK(transport_event == NULL);
+    CHECK(trevrpc_rpc_transport_drain(transport) == 0);
+    trevrpc_rpc_transport_destroy(transport);
+    transport = NULL;
+    engine = NULL;
     CHECK(destroyed);
 
     provider = calloc(1, sizeof(*provider));

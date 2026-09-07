@@ -223,6 +223,12 @@ static int finish_call(server_state* state, server_call* call) {
         return rc;
     }
     if (call->kind == TREVRPC_RPC_KIND_SERVER_STREAMING) {
+        if (call->name != NULL && strcmp(call->name, "non-ok") == 0) {
+            static const char message[] = "fixture terminal status";
+            status.code = TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED;
+            status.message = message;
+            status.message_len = (uint32_t)(sizeof(message) - 1u);
+        }
         return hello_v1_greeter_lots_of_replies_finish(state->runtime, call->call, operation, &status);
     }
     if (call->kind == TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
@@ -534,7 +540,13 @@ static int drain_events(server_state* state) {
                 call->call_closed = true;
                 release_call(state, call);
             }
-        } else if ((info.flags & TREVRPC_RPC_EVENT_FLAG_FATAL) != 0 || info.kind == TREVRPC_RPC_EVENT_CALL_FAILED ||
+        } else if (info.kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+            server_call* call = find_call(state, info.call);
+            if (call != NULL) {
+                call->call_closed = true;
+                release_call(state, call);
+            }
+        } else if ((info.flags & TREVRPC_RPC_EVENT_FLAG_FATAL) != 0 ||
                    info.kind == TREVRPC_RPC_EVENT_ENDPOINT_FAILED) {
             set_error(state, info.status != 0 ? info.status : -ECONNABORTED);
         } else if (info.kind == TREVRPC_RPC_EVENT_STOPPED) {

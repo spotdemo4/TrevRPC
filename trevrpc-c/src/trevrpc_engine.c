@@ -89,6 +89,7 @@ struct trevrpc_engine {
     uint64_t mandatory_reservations;
     uint64_t provider_close_in_flight;
     bool wake_armed;
+    bool test_fail_next_wake_write;
     bool provider_close_started;
     bool provider_stop_reported;
     int wake_read_fd;
@@ -430,6 +431,11 @@ static int trevrpc_engine_arm_wake_locked(trevrpc_engine* engine) {
     if (engine->wake_read_fd < 0) {
         return -EBADF;
     }
+    if (engine->test_fail_next_wake_write) {
+        engine->test_fail_next_wake_write = false;
+        trevrpc_engine_counter_increment(&engine->wake_failures);
+        return -EBADF;
+    }
     if (engine->wake_write_fd < 0) {
         trevrpc_engine_counter_increment(&engine->wake_failures);
         return -EBADF;
@@ -455,18 +461,29 @@ static int trevrpc_engine_arm_wake_locked(trevrpc_engine* engine) {
     }
 }
 
+static void trevrpc_engine_terminalize_wake_locked(trevrpc_engine* engine) {
+    int descriptor = engine->wake_write_fd;
+    engine->wake_write_fd = -1;
+    engine->wake_armed = false;
+    if (descriptor >= 0) {
+        close(descriptor);
+    }
+}
+
 static int trevrpc_engine_queue_event_locked(trevrpc_engine* engine, trevrpc_engine_event* event) {
     int result = 0;
     bool was_empty = engine->queue_depth == 0;
     trevrpc_engine_queue_push_locked(engine, event);
     if (was_empty) {
         result = trevrpc_engine_arm_wake_locked(engine);
+        if (result != 0) {
+            trevrpc_engine_terminalize_wake_locked(engine);
+        }
     }
     return result;
 }
 
 static bool trevrpc_engine_record_failure_locked(trevrpc_engine* engine, int32_t status, uint64_t provider_error_code) {
-    int wake_result;
     if (engine->state >= TREVRPC_ENGINE_STATE_STOPPED) {
         return false;
     }
@@ -483,10 +500,7 @@ static bool trevrpc_engine_record_failure_locked(trevrpc_engine* engine, int32_t
             fatal->flags = TREVRPC_ENGINE_EVENT_FLAG_FATAL;
             fatal->status = status;
             fatal->provider_error_code = provider_error_code;
-            wake_result = trevrpc_engine_queue_event_locked(engine, fatal);
-            if (wake_result != 0 && engine->terminal_status == 0) {
-                engine->terminal_status = wake_result;
-            }
+            (void)trevrpc_engine_queue_event_locked(engine, fatal);
         }
     }
     if (engine->state == TREVRPC_ENGINE_STATE_RUNNING) {
@@ -1853,7 +1867,7 @@ int trevrpc_engine_internal_test_get_write_fd(trevrpc_engine* engine) {
 }
 
 int trevrpc_engine_internal_test_force_wake_failure(trevrpc_engine* engine, uint32_t operation, uint64_t counter_seed) {
-    int descriptor;
+    int descriptor = -1;
     if (engine == NULL) {
         return -EINVAL;
     }
@@ -1865,6 +1879,8 @@ int trevrpc_engine_internal_test_force_wake_failure(trevrpc_engine* engine, uint
     } else if (operation == 2u) {
         descriptor = engine->wake_write_fd;
         engine->wake_write_fd = -1;
+    } else if (operation == 3u) {
+        engine->test_fail_next_wake_write = true;
     } else {
         pthread_mutex_unlock(&engine->mutex);
         return -EINVAL;

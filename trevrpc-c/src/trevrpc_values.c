@@ -1,3 +1,4 @@
+#include "trevrpc_values_internal.h"
 #include "trevrpc_wire_internal.h"
 
 #include <errno.h> // IWYU pragma: keep

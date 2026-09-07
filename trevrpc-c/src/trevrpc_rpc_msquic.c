@@ -1,9 +1,12 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "trevrpc_rpc_msquic.h"
 
 #include "trevrpc_transport_msquic.h"
 
 #include "trevrpc_msquic_internal.h"
 #include "trevrpc_rpc_internal.h"
+#include "trevrpc_credential_internal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -80,6 +83,7 @@ static int trevrpc_rpc_msquic_validate_provider_config(const trevrpc_rpc_msquic_
 
 static int trevrpc_rpc_msquic_validate_endpoint_config(const trevrpc_rpc_msquic_endpoint_config_v1* config) {
     size_t index;
+    int result;
     if (config == NULL || config->struct_size < sizeof(*config)) {
         return -EINVAL;
     }
@@ -114,11 +118,29 @@ static int trevrpc_rpc_msquic_validate_endpoint_config(const trevrpc_rpc_msquic_
             return -EINVAL;
         }
     }
-    if (config->cert_data_len != 0 || config->key_data_len != 0 || config->ca_cert_data_len != 0 ||
-        (config->flags & TREVRPC_RPC_MSQUIC_REQUIRE_CLIENT_CERTIFICATE) != 0) {
-        return -ENOTSUP;
+    if (config->transport == TREVRPC_RPC_MSQUIC_TRANSPORT_AUTO ||
+        config->transport == TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE) {
+        if (config->server_name_len != 0 &&
+            (config->mode == TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER || config->server_name_len != config->host_len ||
+                memcmp(config->server_name, config->host, config->host_len) != 0))
+            return -ENOTSUP;
     }
-    return 0;
+    if ((config->flags & TREVRPC_RPC_MSQUIC_REQUIRE_CLIENT_CERTIFICATE) != 0)
+        return -ENOTSUP;
+    result = trevrpc_credential_validate_endpoint(config->cert_file,
+        config->cert_file_len,
+        config->key_file,
+        config->key_file_len,
+        config->ca_cert_file,
+        config->ca_cert_file_len,
+        config->cert_data,
+        config->cert_data_len,
+        config->key_data,
+        config->key_data_len,
+        config->ca_cert_data,
+        config->ca_cert_data_len,
+        config->mode == TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER);
+    return result;
 }
 
 int trevrpc_rpc_msquic_create_v1(const trevrpc_rpc_runtime_config_v1* runtime_config,

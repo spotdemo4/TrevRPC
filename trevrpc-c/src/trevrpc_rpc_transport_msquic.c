@@ -368,10 +368,13 @@ static composite_entry* translate_locked(trevrpc_rpc_transport_msquic* c,
     composite_entry* parent,
     uint32_t* out_slot,
     bool* out_created,
+    bool* out_attached,
     bool* out_capacity_blocked) {
     composite_entry* entry = find_local_locked(c, source, local, out_slot);
     if (out_created != NULL)
         *out_created = false;
+    if (out_attached != NULL)
+        *out_attached = false;
     if (entry == NULL) {
         if (c->free_head == 0) {
             if (out_capacity_blocked != NULL)
@@ -387,6 +390,8 @@ static composite_entry* translate_locked(trevrpc_rpc_transport_msquic* c,
         entry->parent_slot = (uint32_t)(parent - c->entries) + 1u;
         entry->parent_generation = parent->generation;
         ++parent->child_refs;
+        if (out_attached != NULL)
+            *out_attached = true;
     }
     return entry;
 }
@@ -413,6 +418,63 @@ static void composite_discard_entry_locked(trevrpc_rpc_transport_msquic* c, uint
     c->free_head = slot;
     composite_signal_capacity_locked(c);
     composite_release_parent_locked(c, &snapshot);
+}
+
+static void composite_close_release_native_child(
+    trevrpc_rpc_transport_msquic* c, trevrpc_rpc_transport_handle local) {
+    if (handle_zero(local))
+        return;
+    (void)trevrpc_rpc_transport_connection_close(c->native_transport, local, 0);
+    (void)trevrpc_rpc_transport_release_handle(
+        c->native_transport, local, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
+}
+
+static void composite_rollback_shared_children(
+    trevrpc_rpc_transport_msquic* c, uint32_t parent_slot, uint32_t parent_generation) {
+    for (;;) {
+        trevrpc_rpc_transport_handle local = {0};
+        uint32_t child_slot = 0;
+        uint32_t child_generation = 0;
+        bool found = false;
+        size_t index;
+
+        pthread_mutex_lock(&c->mutex);
+        for (index = 0; index < c->entry_capacity; ++index) {
+            composite_entry* candidate = &c->entries[index];
+            if (candidate->occupied && !candidate->semantic_released && candidate->source == c->native_transport &&
+                candidate->kind == TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION &&
+                candidate->parent_slot == parent_slot && candidate->parent_generation == parent_generation) {
+                found = true;
+                child_slot = (uint32_t)index + 1u;
+                child_generation = candidate->generation;
+                local = candidate->local;
+                /* Keep the mapping alive while the source close/release calls run,
+                 * but block API users from racing a rollback-owned child. */
+                ++candidate->release_refs;
+                candidate->close_requested = true;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&c->mutex);
+        if (!found)
+            return;
+
+        composite_close_release_native_child(c, local);
+
+        pthread_mutex_lock(&c->mutex);
+        composite_entry* child =
+            child_slot != 0 && child_slot <= c->entry_capacity ? &c->entries[(size_t)child_slot - 1u] : NULL;
+        if (child != NULL && child->occupied && child->generation == child_generation &&
+            handle_equal(child->local, local)) {
+            if (child->release_refs != 0)
+                --child->release_refs;
+            child->terminal_seen = true;
+            child->semantic_released = true;
+            pthread_cond_broadcast(&c->condition);
+            composite_try_retire_locked(c, child_slot);
+        }
+        pthread_mutex_unlock(&c->mutex);
+    }
 }
 
 static trevrpc_rpc_transport_handle route_locked(
@@ -543,6 +605,8 @@ static int composite_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tr
             composite_entry* parent = NULL;
             composite_entry* subject = NULL;
             bool parent_created = false;
+            bool subject_created = false;
+            bool subject_attached = false;
             uint32_t parent_slot = 0;
             uint32_t subject_slot = 0;
 
@@ -603,6 +667,7 @@ static int composite_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tr
                         NULL,
                         &parent_slot,
                         &parent_created,
+                        NULL,
                         &capacity_blocked);
                     if (parent == NULL)
                         result = -EAGAIN;
@@ -617,7 +682,8 @@ static int composite_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tr
                     source_info.subject_kind,
                     parent,
                     &subject_slot,
-                    NULL,
+                    &subject_created,
+                    &subject_attached,
                     &capacity_blocked);
                 if (subject == NULL)
                     result = -EAGAIN;
@@ -671,16 +737,24 @@ static int composite_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tr
                 else
                     composite_clear_capacity_wait_locked(c);
                 c->turn = (unsigned)(index + 1u) & 1u;
-            } else if (parent_created) {
-                composite_discard_entry_locked(c, parent_slot);
+            } else {
+                if (subject_attached && subject != NULL && subject->parent_slot == parent_slot && parent_slot != 0) {
+                    composite_entry* attached_parent = &c->entries[(size_t)parent_slot - 1u];
+                    if (attached_parent->occupied && attached_parent->generation == subject->parent_generation) {
+                        if (attached_parent->child_refs != 0)
+                            --attached_parent->child_refs;
+                        subject->parent_slot = 0;
+                        subject->parent_generation = 0;
+                    }
+                }
+                if (subject_created)
+                    composite_discard_entry_locked(c, subject_slot);
+                if (parent_created)
+                    composite_discard_entry_locked(c, parent_slot);
                 if (capacity_blocked)
                     composite_wait_for_capacity_locked(c);
                 else
                     composite_clear_capacity_wait_locked(c);
-            } else if (capacity_blocked) {
-                composite_wait_for_capacity_locked(c);
-            } else {
-                composite_clear_capacity_wait_locked(c);
             }
             if (result != 0 && event->pin_count != 0) {
                 size_t pin_index;
@@ -918,6 +992,7 @@ static trevrpc_msquic_accept_disposition composite_shared_accept_dispatch(
     composite_entry* child;
     uint32_t child_slot;
     bool adopted = false;
+    trevrpc_rpc_transport_handle cleanup_local = {0};
     int result;
     if (shared == NULL || accepted == NULL ||
         trevrpc_msquic_accepted_connection_get_alpn(accepted, &alpn, &alpn_len) != 0)
@@ -958,14 +1033,23 @@ static trevrpc_msquic_accept_disposition composite_shared_accept_dispatch(
                        c->native_transport, &shared->native_config, accepted, &local)
                  : -ENOTSUP;
     if (result == 0) {
-        adopted = true;
         child->local = local;
-        if (composite_hash_insert_locked(c, c->native_transport, local, child_slot) != 0)
-            abort();
+        if (!handle_zero(local) && composite_hash_insert_locked(c, c->native_transport, local, child_slot) == 0) {
+            adopted = true;
+        } else {
+            /* Adoption transferred ownership, but the composite registry could
+             * not publish the local handle.  Roll back the source object after
+             * dropping the reserved mapping; aborting here would leak a live
+             * native connection with no externally reachable handle. */
+            cleanup_local = local;
+            composite_discard_entry_locked(c, child_slot);
+        }
     } else {
         composite_discard_entry_locked(c, child_slot);
     }
     pthread_mutex_unlock(&c->mutex);
+    if (!adopted)
+        composite_close_release_native_child(c, cleanup_local);
     return adopted ? TREV_MSQUIC_ACCEPT_ADOPTED : TREV_MSQUIC_ACCEPT_REJECTED;
 }
 
@@ -984,6 +1068,7 @@ static int composite_endpoint_listen(
     composite_entry* entry;
     composite_shared_listener* shared = NULL;
     uint32_t slot = 0;
+    uint32_t parent_generation = 0;
     int r;
     if (cfg->protocol == TREVRPC_RPC_TRANSPORT_PROTOCOL_MULTIPLEXED) {
         shared = calloc(1, sizeof(*shared));
@@ -1005,6 +1090,7 @@ static int composite_endpoint_listen(
         shared->composite = c;
         shared->slot = slot;
         shared->generation = entry->generation;
+        parent_generation = entry->generation;
         shared->native_config = *cfg;
         shared->native_config.protocol = TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE;
         shared->native_config.host = shared_host;
@@ -1043,18 +1129,26 @@ static int composite_endpoint_listen(
             --c->shared_listens_in_progress;
         pthread_cond_broadcast(&c->condition);
         composite_signal_capacity_locked(c);
-        if (r == 0) {
+        if (r == 0)
             *out = composite_external(c, slot, entry);
-        } else if (entry->child_refs == 0) {
-            composite_discard_entry_locked(c, slot);
-        } else {
-            entry->terminal_seen = true;
-            entry->semantic_released = true;
-            composite_try_retire_locked(c, slot);
-        }
         pthread_mutex_unlock(&c->mutex);
-        if (r != 0 && !handle_zero(local))
-            (void)trevrpc_rpc_transport_listener_close(c->h3_transport, local);
+
+        if (r != 0) {
+            /* Stop the H3 listener before touching adopted native children.  The
+             * listener close is the callback barrier, so no new child can be
+             * added while the rollback walks the parent-owned mappings. */
+            if (!handle_zero(local))
+                (void)trevrpc_rpc_transport_listener_close(c->h3_transport, local);
+            composite_rollback_shared_children(c, slot, parent_generation);
+            pthread_mutex_lock(&c->mutex);
+            entry = &c->entries[(size_t)slot - 1u];
+            if (entry->occupied) {
+                entry->terminal_seen = true;
+                entry->semantic_released = true;
+                composite_try_retire_locked(c, slot);
+            }
+            pthread_mutex_unlock(&c->mutex);
+        }
         return r;
     }
     pthread_mutex_lock(&c->mutex);
@@ -1577,6 +1671,52 @@ int trevrpc_rpc_transport_msquic_test_event_refs(
         return -ESTALE;
     }
     *out_refs = entry->event_refs;
+    pthread_mutex_unlock(&c->mutex);
+    return 0;
+}
+
+int trevrpc_rpc_transport_msquic_test_rollback_shared_listener(
+    trevrpc_rpc_transport* transport,
+    trevrpc_rpc_transport_handle listener,
+    trevrpc_rpc_transport_handle local_child,
+    trevrpc_rpc_transport_handle* out_child) {
+    trevrpc_rpc_transport_msquic* c = composite_from_base(transport);
+    composite_entry* parent;
+    composite_entry* child;
+    uint32_t parent_slot;
+    uint32_t child_slot = 0;
+    uint32_t parent_generation;
+    pthread_mutex_lock(&c->mutex);
+    parent = find_external_locked(c, listener);
+    if (parent == NULL || parent->kind != TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER) {
+        pthread_mutex_unlock(&c->mutex);
+        return -ESTALE;
+    }
+    parent_slot = (uint32_t)(parent - c->entries) + 1u;
+    parent_generation = parent->generation;
+    child = register_locked(c,
+        c->native_transport,
+        local_child,
+        TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION,
+        parent,
+        &child_slot);
+    if (child == NULL) {
+        pthread_mutex_unlock(&c->mutex);
+        return -EAGAIN;
+    }
+    if (out_child != NULL)
+        *out_child = composite_external(c, child_slot, child);
+    pthread_mutex_unlock(&c->mutex);
+
+    composite_rollback_shared_children(c, parent_slot, parent_generation);
+
+    pthread_mutex_lock(&c->mutex);
+    parent = parent_slot <= c->entry_capacity ? &c->entries[(size_t)parent_slot - 1u] : NULL;
+    if (parent != NULL && parent->occupied && parent->generation == parent_generation) {
+        parent->terminal_seen = true;
+        parent->semantic_released = true;
+        composite_try_retire_locked(c, parent_slot);
+    }
     pthread_mutex_unlock(&c->mutex);
     return 0;
 }

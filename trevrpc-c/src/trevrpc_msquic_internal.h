@@ -29,6 +29,7 @@ typedef void (*trevrpc_msquic_wake_observer)(void* context);
 typedef trevrpc_msquic_wake_observer trevrpc_msquic_listener_observer;
 typedef trevrpc_msquic_wake_observer trevrpc_msquic_stream_start_observer;
 typedef void (*trevrpc_msquic_endpoint_lease_release)(void* lease);
+typedef struct trevrpc_msquic_finalizer_scope trevrpc_msquic_finalizer_scope;
 
 typedef struct trevrpc_msquic_accepted_connection {
     trevrpc_msquic_listener* listener;
@@ -221,6 +222,13 @@ typedef struct trevrpc_msquic_stream_state_snapshot {
 } trevrpc_msquic_stream_state_snapshot;
 int trevrpc_msquic_stream_state(trevrpc_msquic_stream* stream, trevrpc_msquic_stream_state_snapshot* out_state);
 
+typedef int (*trevrpc_msquic_send_encode_fn)(uint8_t* data, size_t len, void* context);
+intptr_t trevrpc_msquic_stream_write_raw_encoded_with_completion(trevrpc_msquic_stream* stream,
+    size_t len,
+    bool fin,
+    trevrpc_msquic_send_encode_fn encode,
+    void* encode_context,
+    trevrpc_msquic_send_completion** completion);
 intptr_t trevrpc_msquic_stream_write_raw_with_completion(trevrpc_msquic_stream* stream,
     const uint8_t* data,
     size_t len,
@@ -239,6 +247,15 @@ void trevrpc_msquic_listener_shutdown_deferred(trevrpc_msquic_listener* listener
 void trevrpc_msquic_listener_close_deferred_owned(trevrpc_msquic_listener* listener);
 /* Waits for all native finalizer work queued before and during the wait. */
 void trevrpc_msquic_finalizer_drain(void);
+int trevrpc_msquic_finalizer_scope_init(trevrpc_msquic_finalizer_scope* scope);
+void trevrpc_msquic_finalizer_scope_drain(trevrpc_msquic_finalizer_scope* scope);
+void trevrpc_msquic_finalizer_scope_destroy(trevrpc_msquic_finalizer_scope* scope);
+void trevrpc_msquic_stream_set_finalizer_scope(
+    trevrpc_msquic_stream* stream, trevrpc_msquic_finalizer_scope* scope);
+void trevrpc_msquic_conn_set_finalizer_scope(
+    trevrpc_msquic_conn* conn, trevrpc_msquic_finalizer_scope* scope);
+void trevrpc_msquic_listener_set_finalizer_scope(
+    trevrpc_msquic_listener* listener, trevrpc_msquic_finalizer_scope* scope);
 intptr_t trevrpc_msquic_stream_read_protocol(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
 intptr_t trevrpc_msquic_stream_read_protocol_timeout(
     trevrpc_msquic_stream* stream, uint8_t* data, size_t len, uint64_t timeout_nanos);

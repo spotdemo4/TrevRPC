@@ -492,6 +492,42 @@ static void test_parent_registration_rolls_back_on_subject_capacity(void) {
     trevrpc_rpc_transport_destroy(composite);
 }
 
+static void test_subject_mapping_rolls_back_after_admission_translation_failure(void) {
+    fake_transport* source = fake_create();
+    fake_transport* other = fake_create();
+    trevrpc_rpc_transport* composite = NULL;
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+    trevrpc_rpc_transport_handle listener;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+
+    assert(source != NULL && other != NULL);
+    assert(trevrpc_rpc_transport_msquic_adopt(&source->base, &other->base, &config, &composite) == 0);
+    assert(trevrpc_rpc_transport_endpoint_listen(composite, &endpoint_config, &listener) == 0);
+    atomic_store_explicit(&source->admission_get_info_result, -EIO, memory_order_release);
+    assert(fake_push_admission_event(source,
+               TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION,
+               (const uint8_t*)"/rpc",
+               sizeof("/rpc") - 1u,
+               NULL,
+               0,
+               NULL,
+               0) == 0);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == -EIO);
+    assert(event == NULL);
+
+    atomic_store_explicit(&source->admission_get_info_result, 0, memory_order_release);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(composite, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_HTTP3_ADMISSION);
+    /* The failed first translation retired the stream mapping.  Retrying the
+     * retained source event therefore reuses the slot with a new generation. */
+    assert(info.subject.generation > 1);
+    trevrpc_rpc_transport_event_release(composite, event);
+    trevrpc_rpc_transport_destroy(composite);
+}
+
 static void test_listener_close_linearizes_before_terminal_dequeue(void) {
     fake_transport* source = fake_create();
     fake_transport* other = fake_create();
@@ -751,11 +787,11 @@ static void test_release_retries_after_downstream_failure(void) {
                source, TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY, 0, local, (trevrpc_rpc_transport_handle){0}) == 0);
     external = next_subject(composite, TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_READY);
 
-    source->release_handle_result = -EIO;
+    source->call_release_handle_result = -EIO;
     result = trevrpc_rpc_transport_release_handle(composite, external, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
     assert(result == -EIO);
     assert(fake_release_handle_count(source) == 1);
-    source->release_handle_result = 0;
+    source->call_release_handle_result = 0;
     result = trevrpc_rpc_transport_release_handle(composite, external, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
     assert(result == 0);
     assert(fake_release_handle_count(source) == 2);
@@ -772,6 +808,7 @@ int main(void) {
     test_retained_event_signals_retry_wake();
     test_retired_parent_is_not_resurrected();
     test_parent_registration_rolls_back_on_subject_capacity();
+    test_subject_mapping_rolls_back_after_admission_translation_failure();
     test_listener_close_linearizes_before_terminal_dequeue();
     test_endpoint_admission_rejects_before_child_creation_when_mapping_full();
     test_rpc_terminal_releases_restored_composite_receive();
