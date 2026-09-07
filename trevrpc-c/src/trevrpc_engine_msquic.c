@@ -11,6 +11,7 @@
 #include "trevrpc_engine_msquic_internal.h"
 #include "trevrpc_engine_internal.h"
 #include "trevrpc_frame_internal.h"
+#include "trevrpc_msquic_internal.h"
 #include "trevrpc_msquic_api_owner.h"
 
 #include <arpa/inet.h>

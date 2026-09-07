@@ -8,6 +8,9 @@
 extern "C" {
 #endif
 
+#ifndef TREVRPC_MSQUIC_TYPES_DEFINED
+#define TREVRPC_MSQUIC_TYPES_DEFINED
+
 typedef struct trevrpc_msquic_listener trevrpc_msquic_listener;
 typedef struct trevrpc_msquic_conn trevrpc_msquic_conn;
 typedef struct trevrpc_msquic_stream trevrpc_msquic_stream;
@@ -60,6 +63,8 @@ typedef struct trevrpc_msquic_config {
     trevrpc_msquic_execution_profile execution_profile;
     int send_buffering_enabled;
 } trevrpc_msquic_config;
+
+#endif /* TREVRPC_MSQUIC_TYPES_DEFINED */
 
 int trevrpc_msquic_listen(
     const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** listener);

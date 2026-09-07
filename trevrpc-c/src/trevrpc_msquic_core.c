@@ -5,8 +5,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define QUIC_API_ENABLE_VERSIONED_FEATURES 1
 
-#include "trevrpc_msquic.h"
-
 #include "trevrpc_msquic_internal.h"
 #include "trevrpc_msquic_objects_internal.h"
 
