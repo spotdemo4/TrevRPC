@@ -111,11 +111,12 @@ buildNpmPackage (final: {
     oxlint --deny-warnings
     npm run typecheck
     npm run build:native:test
+    test -x "${trevrpcC}/bin/trevrpc_greeter_server"
     clang-format --dry-run --Werror native/trevrpc_node.c
     clang-tidy -p build/native native/trevrpc_node.c
     cp bin/protoc-gen-trevrpc-js.js "$TMPDIR/protoc-gen-trevrpc-js.js"
     patchShebangs bin/protoc-gen-trevrpc-js.js
-    npm test
+    TREVRPC_GREETER_SERVER="${trevrpcC}/bin/trevrpc_greeter_server" npm test
     cp "$TMPDIR/protoc-gen-trevrpc-js.js" bin/protoc-gen-trevrpc-js.js
     rm -rf bench/node_modules
     mkdir -p bench/node_modules/@trevrpc

@@ -1244,6 +1244,54 @@ test("Node transport returns native response bodies with terminal status", async
   assert.equal(recvBodyBatchCalls, 2);
 });
 
+test("Node transport preserves status when native body batch reaches EOF", async () => {
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
+  let recvCalls = 0;
+  let closed = false;
+  const nativeClient = {
+    async startStream() {
+      return {
+        async sendMessage() {},
+        async finishSend() {},
+        async recvBodyBatch() {
+          recvCalls += 1;
+          return recvCalls === 1
+            ? {
+                bodies: [new Uint8Array([4, 5])],
+                status: { status: Code.ResourceExhausted, message: "terminal", metadata: {} },
+                eof: true,
+              }
+            : null;
+        },
+        close() {
+          closed = true;
+        },
+      };
+    },
+  };
+  const transport = new RawNodeTransport(nativeClient);
+  const responses = await transport.streamingCall(
+    {
+      service: "test",
+      method: "bodyBatchEof",
+      kind: RpcKind.ServerStreaming,
+      body: new Uint8Array(),
+    },
+    emptyAsyncIterable(),
+  );
+  const iterator = responses[Symbol.asyncIterator]();
+  const first = await iterator.nextBodyBatch();
+  assert.equal(first.done, false);
+  assert.deepEqual(
+    first.value.bodies.map((body) => Array.from(body)),
+    [[4, 5]],
+  );
+  assert.equal(first.value.status.status, Code.ResourceExhausted);
+  assert.equal(first.value.status.message, "terminal");
+  assert.deepEqual(await iterator.nextBodyBatch(), { done: true, value: undefined });
+  assert.equal(closed, true);
+});
+
 test("Node transport terminal OK reports already-settled local upload errors", async () => {
   const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const uploadError = invalidArgument("local upload failed");

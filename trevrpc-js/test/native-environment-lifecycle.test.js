@@ -1,251 +1,329 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import test from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 const require = createRequire(import.meta.url);
 const nativeAddonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
-const thisFile = fileURLToPath(import.meta.url);
-const childMode = process.env.TREVRPC_NATIVE_ENVIRONMENT_LIFECYCLE_CHILD;
-const childMarker = "native environment lifecycle child completed";
-const lifecycleFields = [
-  "allocations",
-  "closes",
-  "destroys",
-  "tsfnFinalizers",
-  "instanceFinalizers",
-  "tsfnAcceptances",
-  "envNullAbandons",
-  "callbackEnvNullAbandons",
-  "stoppingAbandons",
-  "finalizerAbandons",
-  "gatedAllocations",
-  "gatedAbandons",
-  "gatedFrees",
-];
+const nativeSourcePath = join(import.meta.dirname, "..", "native", "trevrpc_node.c");
+const nativeTestHooksAvailable =
+  existsSync(nativeAddonPath) &&
+  readFileSync(nativeAddonPath).includes(Buffer.from("trevrpc-node-test:"));
 
-if (childMode == null) {
-  const native = existsSync(nativeAddonPath) ? require(nativeAddonPath) : null;
-  const nativeTestHooks =
-    typeof native?._debugCompletionRuntimeStats === "function" &&
-    typeof native?._debugQueueGatedCompletion === "function" &&
-    typeof native?._debugCompletionGateReached === "function" &&
-    typeof native?._debugReleaseCompletionGate === "function" &&
-    typeof native?._debugCloseGatedCompletionRuntime === "function" &&
-    typeof native?._debugBlockCompletionJs === "function" &&
-    typeof native?._debugCompletionJsBlocked === "function" &&
-    typeof native?._debugReleaseCompletionJs === "function" &&
-    typeof native?._debugResetCompletionGate === "function";
-
-  for (const [mode, name, timeout] of [
-    ["idle", "idle native completion runtime tears down exactly once", 15_000],
-    ["queued", "Worker termination abandons an accepted blocked completion exactly once", 30_000],
-  ]) {
-    test(name, { skip: !nativeTestHooks, timeout }, () => {
-      const childEnvironment = {
-        ...process.env,
-        TREVRPC_NATIVE_ENVIRONMENT_LIFECYCLE_CHILD: mode,
-      };
-      delete childEnvironment.NODE_TEST_CONTEXT;
-      const result = spawnSync(process.execPath, [thisFile], {
-        encoding: "utf8",
-        env: childEnvironment,
-        timeout: timeout - 1_000,
-      });
-      const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-
-      assert.equal(result.error, undefined, output);
-      assert.equal(result.signal, null, output);
-      assert.equal(result.status, 0, output);
-      assert.match(output, new RegExp(`${childMarker}: ${mode}`, "u"));
-    });
+function nativeOrSkip(t) {
+  if (!existsSync(nativeAddonPath)) {
+    t.skip("focused native addon has not been built");
+    return null;
   }
-} else {
-  const native = require(nativeAddonPath);
+  return require(nativeAddonPath);
+}
 
-  if (childMode === "idle") {
-    test("idle Worker runtime lifecycle", { timeout: 10_000 }, async () => {
-      const before = native._debugCompletionRuntimeStats();
-      const worker = new Worker(
-        `
-const { parentPort, workerData } = require("node:worker_threads");
-require(workerData.nativeAddonPath);
-parentPort.postMessage("ready");
-setInterval(() => {}, 1_000);
-`,
-        { eval: true, workerData: { nativeAddonPath } },
-      );
+function runNativeChild(source, extraEnvironment = {}, args = []) {
+  return spawnSync(process.execPath, [...args, "--input-type=commonjs", "-e", source], {
+    encoding: "utf8",
+    timeout: 10_000,
+    env: { ...process.env, ...extraEnvironment },
+  });
+}
 
-      try {
-        await settlesWithin(
-          waitForWorkerMessage(worker, (message) => message === "ready"),
-          3_000,
-        );
-        await settlesWithin(worker.terminate(), 3_000);
-      } finally {
-        await terminateWorker(worker, 3_000);
-      }
+function traceLines(result) {
+  return `${result.stderr ?? ""}`
+    .split("\n")
+    .filter((line) => line.startsWith("trevrpc-node-test:"))
+    .map((line) => line.slice("trevrpc-node-test:".length));
+}
 
-      const expected = lifecycleDelta({
-        allocations: 1,
-        closes: 1,
-        destroys: 1,
-        tsfnFinalizers: 1,
-        instanceFinalizers: 1,
-      });
-      await waitForLifecycleDelta(native, before, expected, 3_000);
-      await assertStableLifecycleDelta(native, before, expected);
-      console.log(`${childMarker}: idle`);
-    });
-  } else if (childMode === "queued") {
-    test(
-      "accepted blocked Worker completions abandon during teardown",
-      { timeout: 25_000 },
-      async () => {
-        const iterations = 4;
-        for (let iteration = 0; iteration < iterations; iteration++) {
-          native._debugResetCompletionGate();
-          const before = native._debugCompletionRuntimeStats();
-          const worker = new Worker(
-            `
-const { parentPort, workerData } = require("node:worker_threads");
-const native = require(workerData.nativeAddonPath);
-const pending = native._debugQueueGatedCompletion();
-pending.catch(() => {});
-globalThis.heldPending = pending;
-parentPort.postMessage("queued");
-native._debugBlockCompletionJs();
-`,
-            { eval: true, workerData: { nativeAddonPath } },
-          );
-
-          try {
-            await settlesWithin(
-              waitForWorkerMessage(worker, (message) => message === "queued"),
-              3_000,
-            );
-            await waitUntil(() => native._debugCompletionGateReached(), 3_000);
-            await waitUntil(() => native._debugCompletionJsBlocked(), 3_000);
-            native._debugReleaseCompletionGate();
-            await waitUntil(
-              () =>
-                native._debugCompletionRuntimeStats().tsfnAcceptances ===
-                before.tsfnAcceptances + 1,
-              3_000,
-            );
-            const termination = worker.terminate();
-            assert.equal(native._debugCloseGatedCompletionRuntime(), true);
-            native._debugReleaseCompletionJs();
-            await settlesWithin(termination, 3_000);
-          } finally {
-            native._debugCloseGatedCompletionRuntime();
-            native._debugReleaseCompletionGate();
-            native._debugReleaseCompletionJs();
-            await terminateWorker(worker, 3_000);
-          }
-
-          const expected = lifecycleDelta({
-            allocations: 1,
-            closes: 1,
-            destroys: 1,
-            tsfnFinalizers: 1,
-            instanceFinalizers: 1,
-            tsfnAcceptances: 1,
-            envNullAbandons: 1,
-            callbackEnvNullAbandons: 1,
-            gatedAllocations: 1,
-            gatedAbandons: 1,
-            gatedFrees: 1,
-          });
-          await waitForLifecycleDelta(native, before, expected, 3_000);
-          await assertStableLifecycleDelta(native, before, expected);
-        }
-        console.log(`${childMarker}: queued`);
-      },
-    );
-  } else {
-    throw new Error(`unknown lifecycle child mode: ${childMode}`);
+function assertInOrder(values, expected) {
+  let cursor = -1;
+  for (const value of expected) {
+    const next = values.indexOf(value, cursor + 1);
+    assert.notEqual(next, -1, `missing ordered trace ${value}: ${values.join(",")}`);
+    cursor = next;
   }
 }
 
-function lifecycleDelta(overrides) {
-  return Object.fromEntries(lifecycleFields.map((field) => [field, overrides[field] ?? 0]));
-}
-
-async function waitForLifecycleDelta(native, before, expected, timeoutMs) {
-  await waitUntil(() => {
-    const current = native._debugCompletionRuntimeStats();
-    return lifecycleFields.every((field) => current[field] >= before[field] + expected[field]);
-  }, timeoutMs);
-}
-
-async function assertStableLifecycleDelta(native, before, expected) {
-  assertLifecycleDelta(native._debugCompletionRuntimeStats(), before, expected);
-  await delay(25, undefined, { ref: false });
-  assertLifecycleDelta(native._debugCompletionRuntimeStats(), before, expected);
-}
-
-function assertLifecycleDelta(current, before, expected) {
-  for (const field of lifecycleFields) {
-    assert.equal(
-      current[field] - before[field],
-      expected[field],
-      `${field} delta from ${JSON.stringify(before)} to ${JSON.stringify(current)}`,
-    );
+test("native addon import is process-liveness neutral", (t) => {
+  if (!existsSync(nativeAddonPath)) {
+    t.skip("focused native addon has not been built");
+    return;
   }
-}
+  const result = runNativeChild(`require(${JSON.stringify(nativeAddonPath)})`);
+  assert.equal(result.error, undefined, result.stderr);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.signal, null, result.stderr);
+});
 
-async function waitUntil(predicate, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) {
-      throw new Error(`condition did not become true within ${timeoutMs}ms`);
+test("one environment runtime is shared by cancellation wrappers and Worker teardown is bounded", async (t) => {
+  const native = nativeOrSkip(t);
+  if (native == null) return;
+  const first = native.createCancellation();
+  const second = native.createCancellation();
+  assert.equal(typeof first.cancel, "function");
+  assert.equal(typeof second.cancel, "function");
+  first.cancel();
+  second.cancel();
+
+  const worker = new Worker(
+    `
+      const { parentPort } = require("node:worker_threads");
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      const first = native.createCancellation();
+      const second = native.createCancellation();
+      first.cancel();
+      second.cancel();
+      parentPort.postMessage("ready");
+      setInterval(() => {}, 1000);
+    `,
+    { eval: true },
+  );
+  let terminationPromise;
+  const terminateWorker = () => {
+    if (terminationPromise == null) {
+      let timeout;
+      terminationPromise = Promise.race([
+        worker.terminate(),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Worker cleanup did not settle")), 3_000);
+        }),
+      ]).finally(() => clearTimeout(timeout));
     }
-    await delay(10, undefined, { ref: false });
+    return terminationPromise;
+  };
+  try {
+    await waitForWorkerReady(worker, 3_000);
+    await terminateWorker();
+  } finally {
+    await terminateWorker().catch(() => {});
   }
-}
+});
 
-async function settlesWithin(promise, timeoutMs) {
-  return await Promise.race([
-    promise,
-    delay(timeoutMs, undefined, { ref: false }).then(() => {
-      throw new Error(`operation did not settle within ${timeoutMs}ms`);
-    }),
+test("test-hook traces prove drain, STOPPED, release, poll close, and free ordering", (t) => {
+  if (!nativeTestHooksAvailable) {
+    t.skip("native addon was built without lifecycle test hooks");
+    return;
+  }
+  const result = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      const cancellation = native.createCancellation();
+      cancellation.cancel();
+      cancellation.cancel();
+      setTimeout(() => {}, 30);
+    `,
+  );
+  assert.equal(result.error, undefined, result.stderr);
+  assert.equal(result.status, 0, result.stderr);
+  assertInOrder(traceLines(result), [
+    "poll-init",
+    "poll-start",
+    "close-submitted",
+    "stopped",
+    "release",
+    "poll-closed",
+    "free",
   ]);
-}
+  assert.ok(traceLines(result).includes("drain-eagain"));
+});
 
-async function terminateWorker(worker, timeoutMs) {
-  if (worker.threadId !== -1) {
-    await settlesWithin(worker.terminate(), timeoutMs);
+test("construction and operation failure injections remain bounded and release in order", (t) => {
+  if (!nativeTestHooksAvailable) {
+    t.skip("native addon was built without lifecycle test hooks");
+    return;
   }
-}
+  for (const failure of [
+    "TREVRPC_NODE_FAIL_WAKE_SOURCE",
+    "TREVRPC_NODE_FAIL_UV_POLL_INIT",
+    "TREVRPC_NODE_FAIL_UV_POLL_START",
+    "TREVRPC_NODE_FAIL_NAPI_INSTANCE_DATA",
+    "TREVRPC_NODE_FAIL_NAPI_CLEANUP_HOOK",
+    "TREVRPC_NODE_FAIL_POLL_ERROR",
+    "TREVRPC_NODE_FAIL_INVALID_EVENT",
+  ]) {
+    const result = runNativeChild(
+      `
+        const native = require(${JSON.stringify(nativeAddonPath)});
+        try { native.createCancellation(); } catch (error) { console.log(error.nativeCode); }
+      `,
+      { [failure]: "1" },
+    );
+    assert.equal(result.error, undefined, `${failure}: ${result.stderr}`);
+    assert.equal(result.status, 0, `${failure}: ${result.stderr}`);
+    assertInOrder(traceLines(result), ["close-submitted", "stopped", "release", "free"]);
+  }
 
-function waitForWorkerMessage(worker, predicate) {
+  const allocation = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      const cancellation = native.createCancellation();
+      try { cancellation.cancel(); } catch (error) { console.log(error.nativeCode); }
+    `,
+    { TREVRPC_NODE_FAIL_OPERATION_ALLOCATION: "1" },
+  );
+  assert.equal(allocation.error, undefined, allocation.stderr);
+  assert.equal(allocation.status, 0, allocation.stderr);
+  assertInOrder(traceLines(allocation), ["close-submitted", "stopped", "release", "free"]);
+
+  const closeFailure = runNativeChild(
+    `require(${JSON.stringify(nativeAddonPath)}).createCancellation();`,
+    { TREVRPC_NODE_FAIL_CLOSE_SUBMISSION: "1" },
+  );
+  assert.equal(closeFailure.error, undefined, closeFailure.stderr);
+  assert.notEqual(closeFailure.status, 0, closeFailure.stderr);
+  assert.ok(traceLines(closeFailure).includes("close-failed-bounded"));
+
+  const transientCloseFailure = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      native.createCancellation();
+      setTimeout(() => {}, 80);
+    `,
+    { TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_ONCE: "1" },
+  );
+  assert.equal(transientCloseFailure.error, undefined, transientCloseFailure.stderr);
+  assert.equal(transientCloseFailure.status, 0, transientCloseFailure.stderr);
+  assertInOrder(traceLines(transientCloseFailure), [
+    "close-submitted",
+    "stopped",
+    "release",
+    "free",
+  ]);
+
+  const delayedCloseFailure = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      native.createCancellation();
+    `,
+    { TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_FIVE: "1" },
+  );
+  assert.equal(delayedCloseFailure.error, undefined, delayedCloseFailure.stderr);
+  assert.equal(delayedCloseFailure.status, 0, delayedCloseFailure.stderr);
+  const delayedTraces = traceLines(delayedCloseFailure);
+  assert.ok(
+    delayedTraces.filter((event) => event === "close-admission-retry").length >= 5,
+    delayedCloseFailure.stderr,
+  );
+  assertInOrder(delayedTraces, ["close-submitted", "stopped", "release", "free"]);
+});
+
+test("GC after cancellation completion releases the native cancellation handle", (t) => {
+  if (!nativeTestHooksAvailable) {
+    t.skip("native addon was built without lifecycle test hooks");
+    return;
+  }
+  const result = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      let cancellation = native.createCancellation();
+      cancellation.cancel();
+      setTimeout(() => { cancellation = null; global.gc(); }, 50);
+      setTimeout(() => {}, 120);
+    `,
+    {},
+    ["--expose-gc"],
+  );
+  assert.equal(result.error, undefined, result.stderr);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(traceLines(result).includes("cancellation-release"), result.stderr);
+});
+
+test("GC before cancellation releases an uncancelled native handle", (t) => {
+  if (!nativeTestHooksAvailable) {
+    t.skip("native addon was built without lifecycle test hooks");
+    return;
+  }
+  const result = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      let cancellation = native.createCancellation();
+      cancellation = null;
+      global.gc();
+      setTimeout(() => {}, 120);
+    `,
+    {},
+    ["--expose-gc"],
+  );
+  assert.equal(result.error, undefined, result.stderr);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(traceLines(result).includes("cancellation-release"), result.stderr);
+});
+
+test("EBUSY cancellation release is retried after terminal cleanup", (t) => {
+  if (!nativeTestHooksAvailable) {
+    t.skip("native addon was built without lifecycle test hooks");
+    return;
+  }
+  const result = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      let cancellation = native.createCancellation();
+      cancellation.cancel();
+      setTimeout(() => { cancellation = null; global.gc(); }, 30);
+      setTimeout(() => {}, 120);
+    `,
+    { TREVRPC_NODE_FAIL_CANCELLATION_RELEASE_BUSY: "1" },
+    ["--expose-gc"],
+  );
+  assert.equal(result.error, undefined, result.stderr);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(traceLines(result).includes("cancellation-release"), result.stderr);
+});
+
+test("persistent release retry eventually succeeds after delayed passes", (t) => {
+  if (!nativeTestHooksAvailable) {
+    t.skip("native addon was built without lifecycle test hooks");
+    return;
+  }
+  const result = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      const cancellation = native.createCancellation();
+      cancellation.cancel();
+    `,
+    { TREVRPC_NODE_FAIL_CANCELLATION_RELEASE_FIVE: "1" },
+  );
+  assert.equal(result.error, undefined, result.stderr);
+  assert.equal(result.status, 0, result.stderr);
+  const traces = traceLines(result);
+  const passes = traces.filter((event) => event === "failure-progress-pass").length;
+  const busyResponses = traces.filter((event) => event === "cancellation-release-busy").length;
+  assert.ok(passes >= 2, result.stderr);
+  assert.ok(busyResponses >= 5, result.stderr);
+  assert.ok(traces.includes("cancellation-release"), result.stderr);
+});
+
+test("native source contains one embedded poll and typed full-key routing", async () => {
+  const source = await (await import("node:fs/promises")).readFile(nativeSourcePath, "utf8");
+  assert.equal((source.match(/uv_poll_t\s+poll\b/gu) ?? []).length, 1);
+  assert.match(source, /uv_timer_t\s+failure_progress\b/u);
+  assert.match(source, /node_runtime_start_failure_progress\(runtime\)/u);
+  assert.match(source, /node_key_equal\(operation->subject, event_key\)/u);
+  assert.match(source, /napi_set_instance_data\(runtime->env, NULL, NULL, NULL\)/u);
+  assert.match(source, /napi_remove_async_cleanup_hook\(hook\)/u);
+});
+
+function waitForWorkerReady(worker, timeoutMs) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => finish(new Error("Worker did not become ready")), timeoutMs);
     const onMessage = (message) => {
-      if (!predicate(message)) {
-        return;
-      }
-      cleanup();
-      resolve(message);
+      finish(
+        message === "ready" ? null : new Error(`unexpected Worker message: ${String(message)}`),
+      );
     };
-    const onError = (error) => {
-      cleanup();
-      reject(error);
-    };
-    const onExit = (code) => {
-      cleanup();
-      reject(new Error(`Worker exited before the expected message: ${code}`));
-    };
-    const cleanup = () => {
+    const onError = (error) => finish(error);
+    const onExit = (code) => finish(new Error(`Worker exited before ready: ${code}`));
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       worker.off("message", onMessage);
       worker.off("error", onError);
       worker.off("exit", onExit);
+      if (error == null) resolve();
+      else reject(error);
     };
     worker.on("message", onMessage);
     worker.once("error", onError);

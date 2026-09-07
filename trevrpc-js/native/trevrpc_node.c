@@ -1,7437 +1,5846 @@
 #define _POSIX_C_SOURCE 200809L
-#if defined(__APPLE__)
-#define _DARWIN_C_SOURCE
-#endif
 
-#include "trevrpc_binding.h"
-#include "trevrpc.h"
+#include "trevrpc_rpc.h"
+#include "trevrpc_rpc_msquic.h"
 
-#include <errno.h> // IWYU pragma: keep
-#include <limits.h>
+#include <errno.h>
 #include <node_api.h>
-#include <pthread.h>
+#include <poll.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
+#include <uv.h>
 
-#define TREV_NODE_ERR_CLOSED -4001
-#define TREV_NODE_COMPLETION_WORKERS 4u
-#define TREV_NODE_COMPLETION_POLL_MIN_NANOS (250 * 1000)
-#define TREV_NODE_COMPLETION_POLL_MAX_NANOS (8 * 1000 * 1000)
-#define TREV_NODE_NANOS_PER_SEC 1000000000ull
-#define TREV_NODE_RECV_MANY_DEFAULT 16u
-#define TREV_NODE_RECV_MANY_LIMIT 256u
-
-typedef struct base_work base_work;
-typedef struct native_async_work native_async_work;
-typedef struct native_completion_runtime native_completion_runtime;
-typedef struct native_client native_client;
-typedef struct native_client_observer native_client_observer;
-typedef struct native_stream native_stream;
-typedef struct native_server native_server;
-typedef struct native_call native_call;
-typedef struct native_cancellation native_cancellation;
-typedef struct server_route server_route;
-typedef struct node_http3_admission_state node_http3_admission_state;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-typedef struct debug_client_close_race debug_client_close_race;
-typedef struct debug_http3_admission_work debug_http3_admission_work;
-
-typedef enum debug_outbound_gate_state {
-    DEBUG_OUTBOUND_GATE_IDLE = 0,
-    DEBUG_OUTBOUND_GATE_ARMED = 1,
-    DEBUG_OUTBOUND_GATE_REACHED = 2,
-} debug_outbound_gate_state;
-
-typedef struct debug_outbound_gate {
-    pthread_cond_t cond;
-    debug_outbound_gate_state state;
-} debug_outbound_gate;
+#if !defined(TREVRPC_RPC_ABI_VERSION) || TREVRPC_RPC_ABI_VERSION != 1u
+#error "The native addon requires TrevRPC RPC ABI 1"
+#endif
+#if !defined(TREVRPC_RPC_MSQUIC_ABI_VERSION) || TREVRPC_RPC_MSQUIC_ABI_VERSION != 1u
+#error "The native addon requires TrevRPC RPC MsQuic ABI 1"
 #endif
 
-static void http3_admission_state_shutdown(node_http3_admission_state* state);
-static void http3_admission_state_release(node_http3_admission_state* state);
+_Static_assert(TREVRPC_RPC_ABI_VERSION == 1u, "RPC ABI anchor must be version 1");
+_Static_assert(TREVRPC_RPC_MSQUIC_ABI_VERSION == 1u, "RPC MsQuic ABI anchor must be version 1");
 
-static int native_condition_init(pthread_cond_t* condition, clockid_t* out_clock) {
-    pthread_condattr_t attributes;
-    int err = pthread_condattr_init(&attributes);
-    if (err != 0) {
-        return err;
-    }
+#define TREV_NODE_INITIAL_OPERATION_ID 1u
 
-    clockid_t clock_id = CLOCK_REALTIME;
-#if defined(_POSIX_CLOCK_SELECTION) && _POSIX_CLOCK_SELECTION >= 0
-    if (pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0) {
-        clock_id = CLOCK_MONOTONIC;
-    }
-#endif
-    err = pthread_cond_init(condition, &attributes);
-    pthread_condattr_destroy(&attributes);
-    if (err == 0) {
-        *out_clock = clock_id;
-    }
-    return err;
-}
+/* The JavaScript wrapper deliberately owns no provider pointers.  These cores
+ * are detached from wrappers and remain in the registry until the RPC ABI has
+ * committed and delivered their terminal event. */
+typedef struct node_handle_key {
+    uint64_t owner;
+    uint32_t slot;
+    uint32_t generation;
+} node_handle_key;
 
-static int native_timespec_from_nanos(uint64_t nanos, struct timespec* out_timespec) {
-    uint64_t seconds = nanos / TREV_NODE_NANOS_PER_SEC;
-    if (seconds > (uint64_t)INT64_MAX) {
-        return EOVERFLOW;
-    }
-    out_timespec->tv_sec = (time_t)seconds;
-    out_timespec->tv_nsec = (long)(nanos % TREV_NODE_NANOS_PER_SEC);
-    return 0;
-}
+typedef struct node_subject node_subject;
+typedef struct node_operation node_operation;
+typedef struct node_runtime node_runtime;
+typedef struct node_runtime_instance_holder node_runtime_instance_holder;
+typedef struct node_cancellation node_cancellation;
+typedef struct node_registry node_registry;
+typedef struct node_server node_server;
+typedef struct node_server_route node_server_route;
+typedef struct node_client node_client;
+typedef struct node_call node_call;
+typedef struct node_send_batch node_send_batch;
+typedef struct node_receive_waiter node_receive_waiter;
+typedef struct node_receive_item node_receive_item;
 
-static int native_monotonic_now_nanos(uint64_t* out_now_nanos) {
-    struct timespec now = {0};
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-        return errno == 0 ? EIO : errno;
-    }
-    if (now.tv_sec < 0 || (uint64_t)now.tv_sec > UINT64_MAX / TREV_NODE_NANOS_PER_SEC) {
-        return EOVERFLOW;
-    }
-    uint64_t seconds = (uint64_t)now.tv_sec * TREV_NODE_NANOS_PER_SEC;
-    if (seconds > UINT64_MAX - (uint64_t)now.tv_nsec) {
-        return EOVERFLOW;
-    }
-    *out_now_nanos = seconds + (uint64_t)now.tv_nsec;
-    return 0;
-}
+typedef enum node_operation_action {
+    NODE_OPERATION_NONE = 0,
+    NODE_OPERATION_ENDPOINT_START,
+    NODE_OPERATION_ENDPOINT_LISTEN,
+    NODE_OPERATION_ENDPOINT_CLOSE,
+    NODE_OPERATION_CALL_OPEN,
+    NODE_OPERATION_CALL_ACCEPT,
+    NODE_OPERATION_CALL_CLOSE,
+    NODE_OPERATION_STREAM_CLOSE,
+    NODE_OPERATION_CALL_RESPOND,
+    NODE_OPERATION_CALL_FINISH,
+    NODE_OPERATION_SEND,
+    NODE_OPERATION_FINISH_SEND,
+} node_operation_action;
 
-static int native_monotonic_deadline_after(uint64_t duration_nanos, uint64_t* out_deadline_nanos) {
-    uint64_t now_nanos = 0;
-    int err = native_monotonic_now_nanos(&now_nanos);
-    if (err != 0) {
-        return err;
-    }
-    if (now_nanos > UINT64_MAX - duration_nanos) {
-        return EOVERFLOW;
-    }
-    *out_deadline_nanos = now_nanos + duration_nanos;
-    return 0;
-}
+typedef enum node_lifecycle_state {
+    NODE_LIFECYCLE_RUNNING = 0,
+    NODE_LIFECYCLE_CLOSING = 1,
+    NODE_LIFECYCLE_STOPPED = 2,
+    NODE_LIFECYCLE_RELEASED = 3,
+} node_lifecycle_state;
 
-#if !defined(__APPLE__)
-static int native_deadline_after(clockid_t clock_id, uint64_t duration_nanos, struct timespec* out_deadline) {
-    struct timespec now = {0};
-    if (clock_gettime(clock_id, &now) != 0) {
-        return errno == 0 ? EIO : errno;
-    }
+typedef enum node_subject_kind {
+    NODE_SUBJECT_ENDPOINT = TREVRPC_RPC_OBJECT_ENDPOINT,
+    NODE_SUBJECT_CALL = TREVRPC_RPC_OBJECT_CALL,
+    NODE_SUBJECT_STREAM = TREVRPC_RPC_OBJECT_STREAM,
+    NODE_SUBJECT_CANCELLATION = TREVRPC_RPC_OBJECT_CANCELLATION,
+} node_subject_kind;
 
-    uint64_t seconds = duration_nanos / TREV_NODE_NANOS_PER_SEC;
-    uint64_t nanos = duration_nanos % TREV_NODE_NANOS_PER_SEC;
-    if (now.tv_sec < 0 || seconds > (uint64_t)(INT64_MAX - now.tv_sec)) {
-        return EOVERFLOW;
-    }
-    out_deadline->tv_sec = now.tv_sec + (time_t)seconds;
-    out_deadline->tv_nsec = now.tv_nsec + (long)nanos;
-    if (out_deadline->tv_nsec >= (long)TREV_NODE_NANOS_PER_SEC) {
-        if (out_deadline->tv_sec == INT64_MAX) {
-            return EOVERFLOW;
-        }
-        out_deadline->tv_sec++;
-        out_deadline->tv_nsec -= (long)TREV_NODE_NANOS_PER_SEC;
-    }
-    return 0;
-}
+typedef struct node_metadata_value {
+    char* key;
+    uint8_t* value;
+    size_t value_len;
+} node_metadata_value;
 
-static int native_condition_deadline_from_monotonic_due(
-    clockid_t condition_clock, uint64_t due_nanos, uint64_t now_nanos, struct timespec* out_deadline) {
-    if (condition_clock == CLOCK_MONOTONIC) {
-        return native_timespec_from_nanos(due_nanos, out_deadline);
-    }
-    return native_deadline_after(condition_clock, due_nanos - now_nanos, out_deadline);
-}
-#endif
+typedef struct node_status_value {
+    uint32_t code;
+    char* message;
+    node_metadata_value* metadata;
+    size_t metadata_count;
+} node_status_value;
 
-static int native_condition_timedwait_until(pthread_cond_t* condition,
-    pthread_mutex_t* mutex,
-    clockid_t condition_clock,
-    uint64_t due_nanos,
-    uint64_t now_nanos) {
-    if (due_nanos <= now_nanos) {
-        return ETIMEDOUT;
-    }
-    struct timespec deadline = {0};
-#if defined(__APPLE__)
-    (void)condition_clock;
-    int err = native_timespec_from_nanos(due_nanos - now_nanos, &deadline);
-    if (err != 0) {
-        return err;
-    }
-    return pthread_cond_timedwait_relative_np(condition, mutex, &deadline);
-#else
-    int err = native_condition_deadline_from_monotonic_due(condition_clock, due_nanos, now_nanos, &deadline);
-    if (err != 0) {
-        return err;
-    }
-    return pthread_cond_timedwait(condition, mutex, &deadline);
-#endif
-}
-
-struct native_client {
-    trevrpc_raw_client* client;
-    native_client_observer* observer;
-    pthread_mutex_t mutex;
-    size_t refs;
-    bool closing;
-    bool js_alive;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_client_close_race* debug_close_race;
-#endif
+struct node_subject {
+    node_subject* next;
+    node_handle_key key;
+    node_subject_kind kind;
+    trevrpc_rpc_cancellation_v1 cancellation;
+    node_cancellation* wrapper;
+    node_client* client_head;
+    bool terminal_event_seen;
+    bool release_requested;
+    bool release_retry_pending;
+    bool native_released;
+    bool cancel_submitted;
+    bool cancel_completed;
+    void* core;
 };
 
-struct native_client_observer {
-    napi_env env;
+struct node_operation {
+    node_operation* next;
+    uint64_t id;
+    node_handle_key subject;
+    uint32_t subject_kind;
+    bool subject_bound;
+    node_operation_action action;
+    void* context;
     napi_deferred deferred;
-    napi_ref promise_ref;
-    _Atomic(napi_threadsafe_function) tsfn;
-    atomic_size_t refs;
-    atomic_bool notified;
-    int error_code;
+    bool has_deferred;
+    bool completion_seen;
 };
 
-struct native_stream {
-    trevrpc_stream* stream;
-    native_client* owner;
-    pthread_mutex_t mutex;
-    pthread_mutex_t operation_mutex;
-    base_work* outbound_head;
-    base_work* outbound_tail;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate debug_outbound_gate;
-#endif
-    size_t refs;
-    bool closing;
-    bool js_alive;
-    bool owner_released;
+struct node_receive_item {
+    node_receive_item* next;
+    trevrpc_rpc_receive* receive;
 };
 
-struct server_route {
-    server_route* next;
-    native_server* server;
-    napi_ref handler_ref;
+struct node_receive_waiter {
+    node_receive_waiter* next;
+    napi_deferred deferred;
+    uint32_t max_items;
+    bool body_batch;
+};
+
+struct node_send_batch {
+    node_send_batch* next;
+    node_call* call;
+    uint8_t** bodies;
+    size_t* body_lengths;
+    size_t count;
+    size_t index;
+    bool finish;
+    napi_deferred deferred;
+    bool has_deferred;
+    uint64_t operation_id;
+};
+
+struct node_server_route {
+    node_server_route* next;
+    node_server* server;
     char* service;
     char* method;
     uint32_t kind;
+    napi_ref handler_ref;
+    size_t active_calls;
 };
 
-struct native_server {
-    trevrpc_server* server;
-    pthread_mutex_t mutex;
-    server_route* routes;
-    native_call* calls;
-    napi_env env;
-    napi_threadsafe_function call_tsfn;
-    node_http3_admission_state* http3_admission;
-    uint16_t port;
-    size_t refs;
-    bool closing;
-    bool cancel_on_close;
-    bool serving;
-    bool js_alive;
-    bool destroying;
-};
-
-struct native_call {
-    trevrpc_call* call;
-    pthread_mutex_t mutex;
-    pthread_mutex_t operation_mutex;
-    base_work* outbound_head;
-    base_work* outbound_tail;
-    native_server* server;
-    native_call* server_next;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate debug_outbound_gate;
-#endif
-    size_t refs;
-    size_t pins;
-    bool completing;
-    bool js_alive;
-    bool registered;
-    bool destroying;
-};
-
-struct native_cancellation {
-    trevrpc_cancellation* cancellation;
-    bool js_alive;
-};
-
-struct base_work {
-    napi_env env;
-    napi_deferred deferred;
-    native_async_work* work;
-    napi_ref receiver_ref;
-    int err;
-    bool retry;
-    bool completion_started;
-    trevrpc_call* completion_call;
-    uint64_t queued_at_nanos;
-    void* owner;
-    void (*owner_release)(void* owner);
-    base_work* outbound_next;
-    bool outbound_registered;
-};
-
-struct native_async_work {
-    native_completion_runtime* runtime;
-    base_work* base;
-    napi_async_execute_callback execute;
-    napi_async_complete_callback complete;
-    napi_async_complete_callback abandon;
-    void (*cancel)(void* data);
-    native_async_work* next;
-    native_async_work* active_next;
-    native_async_work* tsfn_prev;
-    native_async_work* tsfn_next;
-    uint64_t retry_delay_nanos;
-    uint64_t retry_due_nanos;
-};
-
-struct native_completion_runtime {
-    napi_env env;
-    atomic_uint refs;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    clockid_t cond_clock;
-    bool mutex_initialized;
-    bool cond_initialized;
-    pthread_t workers[TREV_NODE_COMPLETION_WORKERS];
-    size_t worker_count;
-    pthread_t scheduler;
-    bool scheduler_started;
-    native_async_work* head;
-    native_async_work* tail;
-    native_async_work* active;
-    native_async_work* tsfn_pending;
-    native_async_work** retry_heap;
-    size_t retry_heap_len;
-    size_t retry_heap_cap;
-    napi_threadsafe_function tsfn;
-    napi_ref client_constructor;
-    napi_ref stream_constructor;
-    napi_ref server_constructor;
-    napi_ref call_constructor;
-    napi_ref cancellation_constructor;
-    size_t loop_ref_count;
-    bool stopping;
-    bool closing;
-    bool closed;
-};
-
-typedef struct connect_work {
-    base_work base;
-    trevrpc_raw_client* client;
-    trevrpc_cancellation* cancellation;
-    napi_ref cancellation_ref;
-    native_client_observer* observer;
-    char* host;
-    char* ca_cert_file;
-    uint16_t port;
-    int skip_certificate_validation;
-    uint32_t max_streams_per_session;
-    uint32_t idle_timeout_ms;
-    size_t max_frame_size;
-    size_t max_pending_send_bytes;
-    size_t max_pending_send_count;
-} connect_work;
-
-typedef struct call_work {
-    base_work base;
-    native_client* client;
-    bool acquired;
-    trevrpc_cancellation* cancellation;
-    napi_ref cancellation_ref;
-    trevrpc_request request;
-    char* service;
-    char* method;
-    uint8_t* body;
-    trevrpc_inbound_response* response;
-} call_work;
-
-typedef struct start_stream_work {
-    base_work base;
-    native_client* client;
-    bool acquired;
-    trevrpc_cancellation* cancellation;
-    napi_ref cancellation_ref;
-    trevrpc_request request;
-    char* service;
-    char* method;
-    uint8_t* body;
-    trevrpc_stream* stream;
-} start_stream_work;
-
-typedef struct stream_recv_work {
-    base_work base;
-    native_stream* stream;
-    bool acquired;
-    trevrpc_inbound_stream_frame* frame;
-} stream_recv_work;
-
-typedef struct stream_recv_many_work {
-    base_work base;
-    native_stream* stream;
-    bool acquired;
-    size_t max_frames;
-    trevrpc_inbound_stream_frame** frames;
-    size_t frames_len;
-    size_t frames_cap;
-    bool eof;
-} stream_recv_many_work;
-
-typedef struct stream_send_work {
-    base_work base;
-    native_stream* stream;
-    bool acquired;
-    uint8_t* body;
-    size_t body_len;
-} stream_send_work;
-
-typedef struct stream_send_many_work {
-    base_work base;
-    native_stream* stream;
-    bool acquired;
-    uint8_t* bodies;
-    size_t* body_lens;
-    size_t count;
-} stream_send_many_work;
-
-typedef struct stream_finish_work {
-    base_work base;
-    native_stream* stream;
-    bool acquired;
-} stream_finish_work;
-
-typedef struct listen_work {
-    base_work base;
-    trevrpc_server* server;
-    char* host;
-    char* path;
-    char* origin;
-    char* http3_path;
-    char* cert_file;
-    char* key_file;
-    uint16_t port;
-    uint32_t max_sessions_per_connection;
-    uint32_t max_streams_per_session;
-    uint32_t idle_timeout_ms;
-    uint32_t stream_idle_timeout_ms;
-    uint32_t initial_request_timeout_ms;
-    int64_t max_stream_messages;
-    size_t max_frame_size;
-    size_t max_pending_send_bytes;
-    size_t max_pending_send_count;
-    uint16_t bound_port;
-    bool has_max_stream_messages;
-    bool enable_native;
+struct node_server {
+    node_runtime* runtime;
+    node_client* endpoint;
+    node_server_route* routes;
+    napi_ref wrapper_ref;
+    napi_ref serve_promise_ref;
+    napi_ref admission_ref;
+    napi_deferred serve_deferred;
     bool enable_http3;
-    node_http3_admission_state* http3_admission;
-} listen_work;
-
-typedef struct serve_work {
-    base_work base;
-    native_server* server;
-    bool server_closed;
-} serve_work;
-
-typedef struct call_response_work {
-    base_work base;
-    native_call* call;
-    bool acquired;
-    trevrpc_call* c_call;
-    uint32_t status;
-    char* message;
-    size_t message_len;
-    uint8_t* body;
-    size_t body_len;
-    trevrpc_metadata metadata;
-    bool terminal_released;
-} call_response_work;
-
-typedef struct call_finish_work {
-    base_work base;
-    native_call* call;
-    bool acquired;
-    trevrpc_call* c_call;
-    uint32_t status;
-    char* message;
-    size_t message_len;
-    trevrpc_metadata metadata;
-    bool terminal_released;
-} call_finish_work;
-
-typedef struct call_recv_work {
-    base_work base;
-    native_call* call;
-    bool acquired;
-    trevrpc_call* c_call;
-    trevrpc_inbound_stream_frame* frame;
-} call_recv_work;
-
-typedef struct call_recv_many_work {
-    base_work base;
-    native_call* call;
-    bool acquired;
-    trevrpc_call* c_call;
-    size_t max_frames;
-    trevrpc_inbound_stream_frame** frames;
-    size_t frames_len;
-    size_t frames_cap;
-    bool eof;
-} call_recv_many_work;
-
-typedef struct call_send_work {
-    base_work base;
-    native_call* call;
-    bool acquired;
-    trevrpc_call* c_call;
-    uint8_t* body;
-    size_t body_len;
-} call_send_work;
-
-typedef struct call_send_many_work {
-    base_work base;
-    native_call* call;
-    bool acquired;
-    trevrpc_call* c_call;
-    uint8_t* bodies;
-    size_t* body_lens;
-    size_t count;
-} call_send_many_work;
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-typedef struct debug_pending_resource {
-    pthread_mutex_t mutex;
-    size_t refs;
+    bool wrapper_alive;
+    bool ready;
+    bool serve_called;
     bool closing;
-    bool js_alive;
     bool closed;
-} debug_pending_resource;
-
-typedef struct debug_pending_wait_work {
-    base_work base;
-    debug_pending_resource* resource;
-    bool acquired;
-    uint32_t delay_ms;
-} debug_pending_wait_work;
-
-typedef struct debug_gated_completion_work {
-    base_work base;
-    atomic_bool cancelled;
-} debug_gated_completion_work;
-
-typedef struct debug_completion_gate {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    native_completion_runtime* runtime;
-    size_t waiters;
-    size_t js_waiters;
-    bool reached;
-    bool released;
-    bool js_blocked;
-    bool js_released;
-} debug_completion_gate;
-
-typedef struct debug_bounded_barrier {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    clockid_t clock_id;
-    size_t arrived;
-    bool released;
-    bool failed;
-} debug_bounded_barrier;
-
-struct debug_client_close_race {
-    pthread_mutex_t mutex;
-    debug_bounded_barrier close_unlocked;
-    debug_bounded_barrier close_resume;
-    debug_bounded_barrier release_done;
-    debug_bounded_barrier close_done;
-    size_t destroy_attempts;
-    size_t destroy_count;
-    size_t premature_destroy_count;
-    bool close_transaction_active;
+    bool serve_settled;
+    uint16_t port;
 };
 
-typedef struct debug_client_close_thread {
-    native_client* client;
-    debug_client_close_race* race;
-    bool finalizing;
-} debug_client_close_thread;
+struct node_client {
+    node_runtime* runtime;
+    node_subject* subject;
+    node_server* server;
+    node_subject* cancellation_subject;
+    node_client* cancellation_next;
+    trevrpc_rpc_endpoint_v1 endpoint;
+    napi_ref wrapper_ref;
+    napi_deferred closed_deferred;
+    bool wrapper_alive;
+    bool invalidated;
+    bool ready;
+    bool close_submitted;
+    bool close_retry_pending;
+    bool release_retry_pending;
+    bool closed;
+    bool terminal_settled;
+};
 
-typedef struct debug_client_release_thread {
-    native_client* client;
-    debug_client_close_race* race;
-} debug_client_release_thread;
+struct node_call {
+    node_runtime* runtime;
+    node_client* client;
+    node_server* server;
+    node_server_route* route;
+    node_subject* call_subject;
+    node_subject* stream_subject;
+    trevrpc_rpc_call_v1 call;
+    trevrpc_rpc_stream_v1 stream;
+    trevrpc_rpc_cancellation_v1 cancellation;
+    uint32_t kind;
+    napi_ref wrapper_ref;
+    bool wrapper_alive;
+    bool server_side;
+    bool accepted;
+    bool accept_submitted;
+    bool request_finished;
+    bool response_submitted;
+    bool invalidated;
+    bool ready;
+    bool close_submitted;
+    bool stream_close_submitted;
+    bool close_retry_pending;
+    bool stream_close_retry_pending;
+    bool call_release_retry_pending;
+    bool stream_release_retry_pending;
+    bool call_closed;
+    bool stream_closed;
+    bool fin_seen;
+    bool fin_clean;
+    bool status_seen;
+    bool message_seen;
+    bool receive_finished;
+    bool response_settled;
+    bool terminal_settled;
+    bool close_requested;
+    bool close_abort;
+    bool send_finished;
+    bool finish_enqueued;
+    bool failed;
+    int failure_code;
+    napi_deferred response_deferred;
+    bool has_response_deferred;
+    node_status_value status;
+    trevrpc_rpc_receive* unary_message;
+    node_receive_item* receive_head;
+    node_receive_item* receive_tail;
+    node_receive_waiter* waiter_head;
+    node_receive_waiter* waiter_tail;
+    node_send_batch* send_head;
+    node_send_batch* send_tail;
+    node_send_batch* send_inflight;
+    uint8_t* server_response_body;
+    size_t server_response_body_len;
+    bool server_response_body_set;
+};
 
-typedef struct debug_client_close_race_result {
-    bool pin_observed;
-    bool state_observed;
-    bool no_destroy_before_resume;
-    size_t destroy_attempts;
-    size_t destroy_count;
-    size_t premature_destroy_count;
-    bool barriers_ok;
-} debug_client_close_race_result;
-#endif
+struct node_registry {
+    node_subject* head;
+    size_t length;
+};
 
-typedef struct server_call_event {
-    server_route* route;
-    native_call* call;
-} server_call_event;
+struct node_cancellation {
+    node_runtime* runtime;
+    node_subject* subject;
+    trevrpc_rpc_cancellation_v1 handle;
+    bool wrapper_alive;
+    bool cancel_submitted;
+    bool cancel_completed;
+};
+
+struct node_runtime_instance_holder {
+    node_runtime* runtime;
+};
+
+struct node_runtime {
+    napi_env env;
+    uv_loop_t* loop;
+    uv_poll_t poll;
+    uv_timer_t failure_progress;
+    uint64_t failure_progress_delay_ms;
+    uv_handle_t* liveness_handle;
+    bool poll_initialized;
+    bool poll_started;
+    bool poll_closing;
+    bool poll_closed;
+    bool failure_progress_initialized;
+    bool failure_progress_started;
+    bool failure_progress_closing;
+    bool cleanup_hook_registered;
+    bool instance_data_registered;
+    bool environment_teardown;
+    bool cleanup_started;
+    bool close_submitted;
+    bool close_retry_pending;
+    bool stopped_seen;
+    bool runtime_released;
+    bool impossible_event;
+    bool construction_failed;
+    bool poll_start_failed;
+    bool test_failure_consumed;
+    bool cancellation_release_busy_injected;
+    uint32_t cancellation_release_failures_remaining;
+    bool close_submission_failure_injected;
+    uint32_t close_submission_failures_remaining;
+    bool send_operation_id_failure_injected;
+    bool send_operation_record_failure_injected;
+    bool shutdown_operation_in_use;
+    uint32_t close_attempts;
+    node_lifecycle_state state;
+    trevrpc_rpc_runtime* rpc;
+    trevrpc_rpc_wake_source_v1 wake;
+    uint64_t next_operation_id;
+    uint64_t last_event_sequence;
+    node_operation shutdown_operation;
+    node_operation* operations;
+    node_registry endpoints;
+    node_registry calls;
+    node_registry streams;
+    node_registry cancellations;
+    napi_async_cleanup_hook_handle cleanup_hook;
+    node_runtime_instance_holder* instance_holder;
+};
+
+static void node_runtime_free(node_runtime* runtime);
+static void node_runtime_finalize_free(node_runtime* runtime);
+static void node_runtime_begin_cleanup(node_runtime* runtime);
+static void node_runtime_poll_close(node_runtime* runtime);
+static void node_runtime_start_failure_progress(node_runtime* runtime);
+static void node_runtime_stop_failure_progress(node_runtime* runtime);
+static void node_runtime_close_failure_progress(node_runtime* runtime);
+static bool node_runtime_has_pending_progress(node_runtime* runtime);
+static void node_runtime_update_liveness(node_runtime* runtime);
+static void node_runtime_detach_instance_data(node_runtime* runtime);
+static int node_runtime_shutdown_sync(node_runtime* runtime);
+static int node_complete_operation(
+    node_runtime* runtime, node_operation* operation, const trevrpc_rpc_event_info_v1* info);
+static int node_route_incoming_call(
+    node_runtime* runtime, trevrpc_rpc_event* event, const trevrpc_rpc_event_info_v1* info);
+static int node_route_admission(node_runtime* runtime, trevrpc_rpc_event* event, const trevrpc_rpc_event_info_v1* info);
+static void node_process_call(node_call* call);
+static void node_call_request_close(node_call* call);
+static void node_call_maybe_release(node_call* call);
+static int node_client_request_close(node_client* client);
+static void node_resolve_undefined(napi_env env, napi_deferred deferred);
+static int node_reject_deferred_native(napi_env env, napi_deferred deferred, int error_code, const char* operation);
+static void node_send_batch_free(node_send_batch* batch);
+static void node_send_batch_remove(node_call* call, node_send_batch* batch);
+static void node_call_dispose_buffers(node_call* call);
+static void node_status_free(node_status_value* status);
+static bool node_close_retryable(int result);
+static napi_value node_make_server_call_object(napi_env env, node_call* call);
+static int node_call_server_fail(node_call* call, uint32_t status, const char* message);
+static void node_server_free_routes(napi_env env, node_server* server);
 
 #ifdef TREVRPC_NODE_TEST_HOOKS
-typedef enum debug_body_conversion_failure {
-    DEBUG_BODY_CONVERSION_FAILURE_NONE = 0,
-    DEBUG_BODY_CONVERSION_FAILURE_BEFORE_EXTERNAL = 1,
-    DEBUG_BODY_CONVERSION_FAILURE_AFTER_EXTERNAL = 2,
-    DEBUG_BODY_CONVERSION_FAILURE_AFTER_TYPED_ARRAY = 3,
-} debug_body_conversion_failure;
-
-static atomic_uint_least64_t ExternalArrayBufferFinalizers = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t NodeBodyOwnerReleases = ATOMIC_VAR_INIT(0);
-static atomic_int NextBodyConversionFailure = ATOMIC_VAR_INIT(DEBUG_BODY_CONVERSION_FAILURE_NONE);
-static atomic_uint_least64_t DebugPendingResourceCloses = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugPendingResourceFinalizers = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeAllocations = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeCloses = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeDestroys = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeTsfnFinalizers = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeInstanceFinalizers = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeTsfnAcceptances = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeEnvNullAbandons = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeCallbackEnvNullAbandons = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeStoppingAbandons = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugCompletionRuntimeFinalizerAbandons = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugGatedCompletionAllocations = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugGatedCompletionAbandons = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugGatedCompletionFrees = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugNativeCallAllocations = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugNativeCallDestroys = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugNativeCallOwnerRetains = ATOMIC_VAR_INIT(0);
-static atomic_uint_least64_t DebugNativeCallOwnerReleases = ATOMIC_VAR_INIT(0);
-static debug_completion_gate DebugCompletionGate = {
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .cond = PTHREAD_COND_INITIALIZER,
-};
-
-static int debug_outbound_gate_init(debug_outbound_gate* gate) {
-    return pthread_cond_init(&gate->cond, NULL);
+static bool node_test_flag(const char* name) {
+    const char* value = getenv(name);
+    return value != NULL && strcmp(value, "1") == 0;
 }
 
-static void debug_outbound_gate_destroy(debug_outbound_gate* gate) {
-    pthread_cond_destroy(&gate->cond);
-}
-
-static bool debug_outbound_gate_arm_locked(debug_outbound_gate* gate) {
-    if (gate->state != DEBUG_OUTBOUND_GATE_IDLE) {
-        return false;
+static void node_test_trace(const char* event) {
+    fprintf(stderr, "trevrpc-node-test:%s\n", event);
+    fflush(stderr);
+    const char* trace_file = getenv("TREVRPC_NODE_TRACE_FILE");
+    if (trace_file != NULL) {
+        FILE* file = fopen(trace_file, "a");
+        if (file != NULL) {
+            fprintf(file, "%s\n", event);
+            fclose(file);
+        }
     }
-    gate->state = DEBUG_OUTBOUND_GATE_ARMED;
-    return true;
+}
+#else
+static bool node_test_flag(const char* name) {
+    (void)name;
+    return false;
 }
 
-static bool debug_outbound_gate_reached_locked(const debug_outbound_gate* gate) {
-    return gate->state == DEBUG_OUTBOUND_GATE_REACHED;
-}
-
-static void debug_outbound_gate_release_locked(debug_outbound_gate* gate) {
-    if (gate->state == DEBUG_OUTBOUND_GATE_IDLE) {
-        return;
-    }
-    gate->state = DEBUG_OUTBOUND_GATE_IDLE;
-    pthread_cond_broadcast(&gate->cond);
-}
-
-static void debug_outbound_gate_wait(debug_outbound_gate* gate, pthread_mutex_t* owner_mutex) {
-    pthread_mutex_lock(owner_mutex);
-    if (gate->state != DEBUG_OUTBOUND_GATE_ARMED) {
-        pthread_mutex_unlock(owner_mutex);
-        return;
-    }
-    gate->state = DEBUG_OUTBOUND_GATE_REACHED;
-    while (gate->state == DEBUG_OUTBOUND_GATE_REACHED) {
-        pthread_cond_wait(&gate->cond, owner_mutex);
-    }
-    pthread_mutex_unlock(owner_mutex);
+static void node_test_trace(const char* event) {
+    (void)event;
 }
 #endif
 
-static napi_value noop_js_callback(napi_env env, napi_callback_info info);
-static void native_client_release(native_client* client);
-static void native_stream_close_request(native_stream* stream);
-static void native_server_release(native_server* server);
-static void native_server_close_request(native_server* server, bool force_cancel);
-static void native_call_close_request(native_call* call);
-static void native_call_release(native_call* call, trevrpc_call* acquired_call);
-static void native_call_release_keep_wrapper(native_call* call, trevrpc_call* acquired_call);
-static void clear_pending_exception(napi_env env) {
-    bool pending = false;
-    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
-        napi_value ignored = NULL;
-        napi_get_and_clear_last_exception(env, &ignored);
+static bool node_send_test_failure(node_runtime* runtime, bool record_failure) {
+    if (runtime == NULL) {
+        return false;
+    }
+    bool* injected = record_failure ? &runtime->send_operation_record_failure_injected
+                                    : &runtime->send_operation_id_failure_injected;
+    const char* flag =
+        record_failure ? "TREVRPC_NODE_FAIL_SEND_OPERATION_RECORD" : "TREVRPC_NODE_FAIL_SEND_OPERATION_ID";
+    if (!*injected && node_test_flag(flag)) {
+        *injected = true;
+        return true;
+    }
+    return false;
+}
+
+static bool node_key_equal(node_handle_key left, node_handle_key right) {
+    return left.owner == right.owner && left.slot == right.slot && left.generation == right.generation;
+}
+
+static node_handle_key node_key_from_endpoint(trevrpc_rpc_endpoint_v1 value) {
+    node_handle_key key = {value.owner, value.slot, value.generation};
+    return key;
+}
+
+static node_handle_key node_key_from_call(trevrpc_rpc_call_v1 value) {
+    node_handle_key key = {value.owner, value.slot, value.generation};
+    return key;
+}
+
+static node_handle_key node_key_from_stream(trevrpc_rpc_stream_v1 value) {
+    node_handle_key key = {value.owner, value.slot, value.generation};
+    return key;
+}
+
+static node_handle_key node_key_from_cancellation(trevrpc_rpc_cancellation_v1 value) {
+    node_handle_key key = {value.owner, value.slot, value.generation};
+    return key;
+}
+
+static bool node_runtime_napi_legal(const node_runtime* runtime) {
+    return runtime != NULL && !runtime->environment_teardown;
+}
+
+static void node_client_detach_cancellation(node_client* client);
+static void node_client_maybe_release(node_client* client);
+static void node_call_settle_terminal(node_call* call, int error_code, const char* operation);
+static void node_call_delete_wrapper_ref(node_call* call);
+static void node_client_delete_wrapper_ref(node_client* client);
+
+static bool node_client_usable(const node_client* client) {
+    return client != NULL && client->wrapper_alive && !client->invalidated && client->runtime != NULL &&
+           client->runtime->rpc != NULL && client->runtime->state == NODE_LIFECYCLE_RUNNING;
+}
+
+static bool node_call_usable(const node_call* call) {
+    return call != NULL && call->wrapper_alive && !call->invalidated && call->runtime != NULL &&
+           call->runtime->rpc != NULL && call->runtime->state == NODE_LIFECYCLE_RUNNING;
+}
+
+static node_registry* node_registry_for_kind(node_runtime* runtime, uint32_t kind) {
+    switch (kind) {
+    case TREVRPC_RPC_OBJECT_ENDPOINT:
+        return &runtime->endpoints;
+    case TREVRPC_RPC_OBJECT_CALL:
+        return &runtime->calls;
+    case TREVRPC_RPC_OBJECT_STREAM:
+        return &runtime->streams;
+    case TREVRPC_RPC_OBJECT_CANCELLATION:
+        return &runtime->cancellations;
+    default:
+        return NULL;
     }
 }
 
-static void throw_if_no_pending_exception(napi_env env, const char* message) {
-    bool pending = false;
-    if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) {
-        napi_throw_error(env, NULL, message);
+static node_subject* node_registry_find(node_registry* registry, node_handle_key key) {
+    for (node_subject* subject = registry->head; subject != NULL; subject = subject->next) {
+        if (node_key_equal(subject->key, key)) {
+            return subject;
+        }
+    }
+    return NULL;
+}
+
+static node_subject* node_subject_allocate(uint32_t kind, node_handle_key key) {
+    node_subject* subject = calloc(1, sizeof(*subject));
+    if (subject != NULL) {
+        subject->key = key;
+        subject->kind = (node_subject_kind)kind;
+    }
+    return subject;
+}
+
+static void node_registry_insert(node_runtime* runtime, node_subject* subject) {
+    node_registry* registry = node_registry_for_kind(runtime, subject->kind);
+    subject->next = registry->head;
+    registry->head = subject;
+    registry->length++;
+}
+
+static node_subject* node_registry_add(node_runtime* runtime, uint32_t kind, node_handle_key key) {
+    node_registry* registry = node_registry_for_kind(runtime, kind);
+    if (registry == NULL || node_registry_find(registry, key) != NULL) {
+        return NULL;
+    }
+    node_subject* subject = node_subject_allocate(kind, key);
+    if (subject == NULL) {
+        return NULL;
+    }
+    node_registry_insert(runtime, subject);
+    return subject;
+}
+
+static void node_registry_remove(node_runtime* runtime, node_subject* target) {
+    node_registry* registry = node_registry_for_kind(runtime, target->kind);
+    if (registry == NULL) {
+        return;
+    }
+    node_subject** link = &registry->head;
+    while (*link != NULL) {
+        if (*link == target) {
+            *link = target->next;
+            registry->length--;
+            free(target);
+            return;
+        }
+        link = &(*link)->next;
     }
 }
 
-static void reject_native_error(napi_env env, napi_deferred deferred, int err, const char* operation) {
-    char message[256];
-    const char* detail = err == TREV_NODE_ERR_CLOSED ? "native object is closed" : trevrpc_error(err);
-    snprintf(message, sizeof(message), "%s failed: %s", operation, detail != NULL ? detail : "native operation failed");
-
-    napi_value message_value = NULL;
-    napi_value error = NULL;
-    napi_value native_code = NULL;
-    napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &message_value);
-    napi_create_error(env, NULL, message_value, &error);
-    napi_create_int32(env, err, &native_code);
-    napi_set_named_property(env, error, "nativeCode", native_code);
-    napi_reject_deferred(env, deferred, error);
+static void node_registry_discard_all(node_registry* registry) {
+    node_subject* subject = registry->head;
+    while (subject != NULL) {
+        node_subject* next = subject->next;
+        free(subject);
+        subject = next;
+    }
+    registry->head = NULL;
+    registry->length = 0;
 }
 
-static void throw_native_error(napi_env env, int err, const char* operation) {
-    char message[256];
-    const char* detail = err == TREV_NODE_ERR_CLOSED ? "native object is closed" : trevrpc_error(err);
-    snprintf(message, sizeof(message), "%s failed: %s", operation, detail != NULL ? detail : "native operation failed");
+static void node_client_attach_cancellation(node_client* client, node_subject* subject) {
+    if (client == NULL || client->cancellation_subject == subject) {
+        return;
+    }
+    node_client_detach_cancellation(client);
+    if (subject == NULL || subject->kind != NODE_SUBJECT_CANCELLATION) {
+        return;
+    }
+    client->cancellation_subject = subject;
+    client->cancellation_next = subject->client_head;
+    subject->client_head = client;
+}
 
-    napi_value message_value = NULL;
-    napi_value error = NULL;
-    napi_value native_code = NULL;
-    napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &message_value);
-    napi_create_error(env, NULL, message_value, &error);
-    napi_create_int32(env, err, &native_code);
-    napi_set_named_property(env, error, "nativeCode", native_code);
+static void node_client_detach_cancellation(node_client* client) {
+    if (client == NULL || client->cancellation_subject == NULL) {
+        return;
+    }
+    node_subject* subject = client->cancellation_subject;
+    node_client** link = &subject->client_head;
+    while (*link != NULL) {
+        if (*link == client) {
+            *link = client->cancellation_next;
+            break;
+        }
+        link = &(*link)->cancellation_next;
+    }
+    client->cancellation_subject = NULL;
+    client->cancellation_next = NULL;
+}
+
+static bool node_event_key(const trevrpc_rpc_event_info_v1* info, node_handle_key* out_key) {
+    switch (info->subject_kind) {
+    case TREVRPC_RPC_OBJECT_ENDPOINT:
+        *out_key = node_key_from_endpoint(info->endpoint);
+        return true;
+    case TREVRPC_RPC_OBJECT_CALL:
+        *out_key = node_key_from_call(info->call);
+        return true;
+    case TREVRPC_RPC_OBJECT_STREAM:
+        *out_key = node_key_from_stream(info->stream);
+        return true;
+    case TREVRPC_RPC_OBJECT_CANCELLATION:
+        *out_key = node_key_from_cancellation(info->cancellation);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static node_subject* node_subject_from_event(node_runtime* runtime, const trevrpc_rpc_event_info_v1* info) {
+    node_handle_key key;
+    if (!node_event_key(info, &key)) {
+        return NULL;
+    }
+    node_registry* registry = node_registry_for_kind(runtime, info->subject_kind);
+    return registry == NULL ? NULL : node_registry_find(registry, key);
+}
+
+static void node_cancellation_try_release(node_runtime* runtime, node_subject* subject) {
+    if (runtime == NULL || runtime->rpc == NULL || subject == NULL || subject->kind != NODE_SUBJECT_CANCELLATION ||
+        subject->native_released || !subject->release_requested || !subject->cancel_completed) {
+        return;
+    }
+    int result;
+    if (node_test_flag("TREVRPC_NODE_FAIL_CANCELLATION_RELEASE_PERSISTENT")) {
+        node_test_trace("cancellation-release-busy");
+        result = -EBUSY;
+    } else {
+        if (!runtime->cancellation_release_busy_injected &&
+            node_test_flag("TREVRPC_NODE_FAIL_CANCELLATION_RELEASE_FIVE")) {
+            runtime->cancellation_release_busy_injected = true;
+            runtime->cancellation_release_failures_remaining = 5u;
+        }
+        if (runtime->cancellation_release_failures_remaining > 0) {
+            runtime->cancellation_release_failures_remaining--;
+            node_test_trace("cancellation-release-busy");
+            result = -EBUSY;
+        } else if (!runtime->cancellation_release_busy_injected &&
+                   node_test_flag("TREVRPC_NODE_FAIL_CANCELLATION_RELEASE_BUSY")) {
+            runtime->cancellation_release_busy_injected = true;
+            node_test_trace("cancellation-release-busy");
+            result = -EBUSY;
+        } else {
+            result = trevrpc_rpc_cancellation_release(runtime->rpc, subject->cancellation);
+        }
+    }
+    if (result == 0 || result == -ESTALE) {
+        while (subject->client_head != NULL) {
+            node_client_detach_cancellation(subject->client_head);
+        }
+        if (subject->wrapper != NULL) {
+            subject->wrapper->subject = NULL;
+            subject->wrapper->runtime = NULL;
+            subject->wrapper = NULL;
+        }
+        subject->native_released = true;
+        subject->release_retry_pending = false;
+        node_registry_remove(runtime, subject);
+        node_runtime_update_liveness(runtime);
+        node_test_trace("cancellation-release");
+    } else {
+        subject->release_retry_pending = true;
+        node_runtime_start_failure_progress(runtime);
+    }
+}
+
+static void node_runtime_release_pending_cancellations(node_runtime* runtime) {
+    node_subject* subject = runtime->cancellations.head;
+    while (subject != NULL) {
+        node_subject* next = subject->next;
+        node_cancellation_try_release(runtime, subject);
+        subject = next;
+    }
+}
+
+static node_operation* node_operation_find(node_runtime* runtime, uint64_t id) {
+    for (node_operation* operation = runtime->operations; operation != NULL; operation = operation->next) {
+        if (operation->id == id) {
+            return operation;
+        }
+    }
+    return NULL;
+}
+
+static void node_operation_remove(node_runtime* runtime, node_operation* target) {
+    node_operation** link = &runtime->operations;
+    while (*link != NULL) {
+        if (*link == target) {
+            *link = target->next;
+            if (target == &runtime->shutdown_operation) {
+                runtime->shutdown_operation_in_use = false;
+                memset(target, 0, sizeof(*target));
+            } else {
+                free(target);
+            }
+            node_runtime_update_liveness(runtime);
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
+static uint64_t node_operation_allocate(node_runtime* runtime) {
+    uint64_t id = runtime->next_operation_id++;
+    while (id == TREVRPC_RPC_OPERATION_ID_NONE || id == runtime->shutdown_operation.id ||
+           node_operation_find(runtime, id) != NULL) {
+        id = runtime->next_operation_id++;
+        if (id == TREVRPC_RPC_OPERATION_ID_NONE) {
+            return TREVRPC_RPC_OPERATION_ID_NONE;
+        }
+    }
+    return id;
+}
+
+static node_operation* node_operation_add_id(node_runtime* runtime,
+    uint64_t id,
+    uint32_t subject_kind,
+    node_handle_key subject,
+    node_operation_action action,
+    void* context,
+    napi_deferred deferred,
+    bool has_deferred) {
+    if (id == TREVRPC_RPC_OPERATION_ID_NONE || node_operation_find(runtime, id) != NULL) {
+        return NULL;
+    }
+    node_operation* operation = calloc(1, sizeof(*operation));
+    if (operation == NULL) {
+        return NULL;
+    }
+    operation->id = id;
+    operation->subject = subject;
+    operation->subject_kind = subject_kind;
+    operation->subject_bound = subject_kind == TREVRPC_RPC_OBJECT_NONE ||
+                               !(subject.owner == 0 && subject.slot == 0 && subject.generation == 0);
+    operation->action = action;
+    operation->context = context;
+    operation->deferred = deferred;
+    operation->has_deferred = has_deferred;
+    operation->next = runtime->operations;
+    runtime->operations = operation;
+    node_runtime_update_liveness(runtime);
+    return operation;
+}
+
+static node_operation* node_operation_add(node_runtime* runtime, uint32_t subject_kind, node_handle_key subject) {
+    if (node_test_flag("TREVRPC_NODE_FAIL_OPERATION_ALLOCATION")) {
+        return NULL;
+    }
+    uint64_t id = node_operation_allocate(runtime);
+    return node_operation_add_id(runtime, id, subject_kind, subject, NODE_OPERATION_NONE, NULL, NULL, false);
+}
+
+static int node_copy_event_info(node_runtime* runtime,
+    const trevrpc_rpc_event* event,
+    trevrpc_rpc_event_info_v1* out_info,
+    char** out_service,
+    char** out_method) {
+    int result = trevrpc_rpc_event_info_v1_init(out_info, sizeof(*out_info));
+    if (result != 0) {
+        return result;
+    }
+    result = trevrpc_rpc_event_get_info_v1(event, out_info);
+    if (result != 0) {
+        return result;
+    }
+    if (out_info->sequence <= runtime->last_event_sequence) {
+        return -EILSEQ;
+    }
+    runtime->last_event_sequence = out_info->sequence;
+    if (out_info->service_len != 0) {
+        if (out_info->service == NULL) {
+            return -EPROTO;
+        }
+        *out_service = malloc((size_t)out_info->service_len + 1u);
+        if (*out_service == NULL) {
+            return -ENOMEM;
+        }
+        memcpy(*out_service, out_info->service, out_info->service_len);
+        (*out_service)[out_info->service_len] = '\0';
+    }
+    if (out_info->method_len != 0) {
+        if (out_info->method == NULL) {
+            free(*out_service);
+            *out_service = NULL;
+            return -EPROTO;
+        }
+        *out_method = malloc((size_t)out_info->method_len + 1u);
+        if (*out_method == NULL) {
+            free(*out_service);
+            *out_service = NULL;
+            return -ENOMEM;
+        }
+        memcpy(*out_method, out_info->method, out_info->method_len);
+        (*out_method)[out_info->method_len] = '\0';
+    }
+    return 0;
+}
+
+static bool node_event_kind_known(uint32_t kind) {
+    return kind >= TREVRPC_RPC_EVENT_DIAGNOSTIC && kind <= TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION;
+}
+
+static bool node_event_releases_subject(uint32_t kind) {
+    return kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED || kind == TREVRPC_RPC_EVENT_ENDPOINT_FAILED ||
+           kind == TREVRPC_RPC_EVENT_CALL_CLOSED || kind == TREVRPC_RPC_EVENT_CALL_FAILED ||
+           kind == TREVRPC_RPC_EVENT_STREAM_CLOSED;
+}
+
+static int node_route_cleanup_event(node_runtime* runtime, const trevrpc_rpc_event_info_v1* info) {
+    if (!node_event_kind_known(info->kind)) {
+        return -EPROTO;
+    }
+    if (info->kind == TREVRPC_RPC_EVENT_STOPPED) {
+        runtime->stopped_seen = true;
+        runtime->state = NODE_LIFECYCLE_STOPPED;
+        node_test_trace("stopped");
+        return 0;
+    }
+    node_subject* subject = node_subject_from_event(runtime, info);
+    if (subject == NULL) {
+        if (info->operation_id != TREVRPC_RPC_OPERATION_ID_NONE) {
+            node_operation* operation = node_operation_find(runtime, info->operation_id);
+            if (operation != NULL) {
+                node_operation_remove(runtime, operation);
+            }
+            return 0;
+        }
+        return -ESTALE;
+    }
+    if ((info->flags & TREVRPC_RPC_EVENT_FLAG_TERMINAL) != 0 && node_event_releases_subject(info->kind)) {
+        if (subject->terminal_event_seen) {
+            return -EALREADY;
+        }
+        subject->terminal_event_seen = true;
+    }
+    if (info->operation_id != TREVRPC_RPC_OPERATION_ID_NONE) {
+        node_operation* operation = node_operation_find(runtime, info->operation_id);
+        if (operation != NULL) {
+            if ((operation->action == NODE_OPERATION_SEND || operation->action == NODE_OPERATION_FINISH_SEND) &&
+                operation->context != NULL) {
+                node_send_batch* batch = operation->context;
+                node_call* call = batch->call;
+                if (call != NULL) {
+                    if (call->send_inflight == batch) {
+                        call->send_inflight = NULL;
+                    }
+                    node_send_batch_remove(call, batch);
+                }
+                node_send_batch_free(batch);
+            }
+            node_operation_remove(runtime, operation);
+        }
+    }
+    if (subject->kind == NODE_SUBJECT_ENDPOINT && subject->core != NULL) {
+        node_client* client = subject->core;
+        if (info->kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED || info->kind == TREVRPC_RPC_EVENT_ENDPOINT_FAILED) {
+            client->closed = true;
+            client->invalidated = true;
+            node_client_maybe_release(client);
+            node_runtime_update_liveness(runtime);
+        }
+    } else if ((subject->kind == NODE_SUBJECT_CALL || subject->kind == NODE_SUBJECT_STREAM) && subject->core != NULL) {
+        node_call* call = subject->core;
+        if (info->kind == TREVRPC_RPC_EVENT_CALL_CLOSED || info->kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+            call->call_closed = true;
+            call->failed = call->failed || info->kind == TREVRPC_RPC_EVENT_CALL_FAILED;
+        } else if (info->kind == TREVRPC_RPC_EVENT_STREAM_CLOSED) {
+            call->stream_closed = true;
+        } else if (info->kind == TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN) {
+            call->fin_seen = true;
+            call->fin_clean = (info->flags & TREVRPC_RPC_EVENT_FLAG_CLEAN_FIN) != 0;
+        }
+        node_call_maybe_release(call);
+    }
+    return 0;
+}
+
+static int node_route_event(node_runtime* runtime, trevrpc_rpc_event* event, const trevrpc_rpc_event_info_v1* info) {
+    if (runtime->cleanup_started) {
+        return node_route_cleanup_event(runtime, info);
+    }
+    if (!node_event_kind_known(info->kind)) {
+        return -EPROTO;
+    }
+    if (info->kind == TREVRPC_RPC_EVENT_CALL_INCOMING) {
+        return event == NULL ? -EPROTO : node_route_incoming_call(runtime, event, info);
+    }
+    if (info->kind == TREVRPC_RPC_EVENT_HTTP3_ADMISSION || info->kind == TREVRPC_RPC_EVENT_WEBTRANSPORT_ADMISSION) {
+        return event == NULL ? -EPROTO : node_route_admission(runtime, event, info);
+    }
+    if ((info->flags & TREVRPC_RPC_EVENT_FLAG_TERMINAL) != 0 && node_event_releases_subject(info->kind)) {
+        node_subject* subject = node_subject_from_event(runtime, info);
+        if (subject == NULL) {
+            return -ESTALE;
+        }
+        if (subject->terminal_event_seen) {
+            return -EALREADY;
+        }
+        subject->terminal_event_seen = true;
+    }
+    if (info->operation_id != TREVRPC_RPC_OPERATION_ID_NONE) {
+        node_operation* operation = node_operation_find(runtime, info->operation_id);
+        if (operation == NULL || operation->completion_seen) {
+            return -EALREADY;
+        }
+        if (operation->subject_kind != info->subject_kind) {
+            return -EPROTO;
+        }
+        node_handle_key event_key = {0, 0, 0};
+        if (operation->subject_kind != TREVRPC_RPC_OBJECT_NONE && operation->subject_bound &&
+            (!node_event_key(info, &event_key) || !node_key_equal(operation->subject, event_key))) {
+            return -EPROTO;
+        }
+        operation->completion_seen = true;
+        int completion_result = node_complete_operation(runtime, operation, info);
+        if (operation->subject_kind == TREVRPC_RPC_OBJECT_CANCELLATION) {
+            node_subject* subject = node_subject_from_event(runtime, info);
+            if (subject != NULL) {
+                subject->cancel_completed = true;
+                if (subject->wrapper != NULL) {
+                    subject->wrapper->cancel_completed = true;
+                }
+                node_runtime_update_liveness(runtime);
+            }
+        }
+        node_operation_remove(runtime, operation);
+        if (completion_result != 0) {
+            return completion_result;
+        }
+    }
+    if (info->kind == TREVRPC_RPC_EVENT_STOPPED) {
+        runtime->stopped_seen = true;
+        runtime->state = NODE_LIFECYCLE_STOPPED;
+        node_test_trace("stopped");
+        return 0;
+    }
+    node_subject* event_subject = node_subject_from_event(runtime, info);
+    if (event_subject != NULL && event_subject->core != NULL && event_subject->kind == NODE_SUBJECT_ENDPOINT) {
+        node_client* client = event_subject->core;
+        if (info->kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED || info->kind == TREVRPC_RPC_EVENT_ENDPOINT_FAILED) {
+            client->closed = true;
+            if (client->closed_deferred != NULL) {
+                node_resolve_undefined(runtime->env, client->closed_deferred);
+                client->closed_deferred = NULL;
+                node_runtime_update_liveness(runtime);
+            }
+            node_client_maybe_release(client);
+            node_runtime_update_liveness(runtime);
+        }
+    } else if (event_subject != NULL && event_subject->kind == NODE_SUBJECT_CANCELLATION) {
+        for (node_client* client = event_subject->client_head; client != NULL; client = client->cancellation_next) {
+            if (!client->ready && client->runtime == runtime && !client->closed) {
+                client->invalidated = true;
+                for (node_operation* pending = runtime->operations; pending != NULL; pending = pending->next) {
+                    if (pending->context == client && pending->action == NODE_OPERATION_ENDPOINT_START &&
+                        pending->has_deferred) {
+                        (void)node_reject_deferred_native(runtime->env, pending->deferred, -ECANCELED, "connectMsQuic");
+                        pending->has_deferred = false;
+                        pending->deferred = NULL;
+                        break;
+                    }
+                }
+                (void)node_client_request_close(client);
+            }
+        }
+    } else if (event_subject != NULL && event_subject->core != NULL &&
+               (event_subject->kind == NODE_SUBJECT_CALL || event_subject->kind == NODE_SUBJECT_STREAM)) {
+        node_call* call = event_subject->core;
+        if (info->kind == TREVRPC_RPC_EVENT_CALL_CLOSED || info->kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+            call->call_closed = true;
+            call->failed = call->failed || info->kind == TREVRPC_RPC_EVENT_CALL_FAILED;
+        } else if (info->kind == TREVRPC_RPC_EVENT_STREAM_CLOSED) {
+            call->stream_closed = true;
+        } else if (info->kind == TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN) {
+            call->fin_seen = true;
+            call->fin_clean = (info->flags & TREVRPC_RPC_EVENT_FLAG_CLEAN_FIN) != 0;
+            if (call->server_side) {
+                call->request_finished = true;
+            }
+        }
+        if (info->kind == TREVRPC_RPC_EVENT_STREAM_CLOSED &&
+            (call->cancellation.owner != 0 || call->cancellation.slot != 0 || call->cancellation.generation != 0)) {
+            node_subject* cancellation_subject =
+                node_registry_find(&runtime->cancellations, node_key_from_cancellation(call->cancellation));
+            if (cancellation_subject != NULL && cancellation_subject->cancel_submitted) {
+                node_call_settle_terminal(call, -ECANCELED, "RPC call cancelled");
+            }
+        }
+        node_process_call(call);
+        if (info->kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+            node_call_delete_wrapper_ref(call);
+            node_call_settle_terminal(call, -EIO, "RPC call failed");
+        } else if (info->kind == TREVRPC_RPC_EVENT_CALL_CLOSED || info->kind == TREVRPC_RPC_EVENT_STREAM_CLOSED) {
+            node_call_delete_wrapper_ref(call);
+            /* Clean terminal events can race buffered response delivery. Preserve
+             * queued messages and status; synthesize EPIPE only when there is no
+             * authoritative terminal status left to deliver. */
+            if (call->kind == TREVRPC_RPC_KIND_UNARY && call->receive_head == NULL &&
+                !(call->fin_seen && call->status_seen)) {
+                node_call_settle_terminal(
+                    call, -EPIPE, info->kind == TREVRPC_RPC_EVENT_STREAM_CLOSED ? "stream closed" : "RPC call closed");
+            }
+        }
+        node_call_maybe_release(call);
+    }
+    return 0;
+}
+
+static void node_runtime_retry_call_cleanup(node_runtime* runtime) {
+    node_subject* endpoint_subject = runtime->endpoints.head;
+    while (endpoint_subject != NULL) {
+        node_subject* next = endpoint_subject->next;
+        node_client* client = endpoint_subject->core;
+        if (client != NULL) {
+            if (client->close_retry_pending) {
+                (void)node_client_request_close(client);
+                /* An already-closed endpoint may be released by the request
+                 * itself, including freeing a wrapperless client. */
+                endpoint_subject = next;
+                continue;
+            }
+            if (client->release_retry_pending || client->closed) {
+                node_client_maybe_release(client);
+            }
+        }
+        endpoint_subject = next;
+    }
+    node_subject* subject = runtime->calls.head;
+    while (subject != NULL) {
+        node_subject* next = subject->next;
+        node_call* call = subject->core;
+        if (call != NULL) {
+            if (call->close_retry_pending || call->stream_close_retry_pending) {
+                node_call_request_close(call);
+            }
+            node_call_maybe_release(call);
+        }
+        subject = next;
+    }
+    subject = runtime->streams.head;
+    while (subject != NULL) {
+        node_subject* next = subject->next;
+        node_call* call = subject->core;
+        if (call != NULL) {
+            if (call->close_retry_pending || call->stream_close_retry_pending) {
+                node_call_request_close(call);
+            }
+            node_call_maybe_release(call);
+        }
+        subject = next;
+    }
+}
+
+static bool node_runtime_has_pending_progress(node_runtime* runtime) {
+    if (runtime == NULL) {
+        return false;
+    }
+    if (runtime->cleanup_started && !runtime->close_submitted) {
+        return true;
+    }
+    if (runtime->close_retry_pending) {
+        return true;
+    }
+    for (node_subject* subject = runtime->endpoints.head; subject != NULL; subject = subject->next) {
+        node_client* client = subject->core;
+        if (client != NULL && (client->close_retry_pending || client->release_retry_pending)) {
+            return true;
+        }
+    }
+    for (node_subject* subject = runtime->calls.head; subject != NULL; subject = subject->next) {
+        node_call* call = subject->core;
+        if (call != NULL && (call->close_retry_pending || call->stream_close_retry_pending ||
+                                call->call_release_retry_pending || call->stream_release_retry_pending)) {
+            return true;
+        }
+    }
+    for (node_subject* subject = runtime->cancellations.head; subject != NULL; subject = subject->next) {
+        if (subject->release_retry_pending || subject->release_requested ||
+            (subject->cancel_submitted && !subject->cancel_completed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool node_runtime_needs_liveness(const node_runtime* runtime) {
+    if (runtime == NULL || runtime->rpc == NULL || runtime->state == NODE_LIFECYCLE_RELEASED) {
+        return false;
+    }
+    if (runtime->environment_teardown || runtime->operations != NULL || runtime->close_retry_pending) {
+        return true;
+    }
+    for (node_subject* subject = runtime->endpoints.head; subject != NULL; subject = subject->next) {
+        const node_client* client = subject->core;
+        if (client != NULL && ((client->ready && !client->closed) || client->closed_deferred != NULL ||
+                                  client->close_retry_pending || client->release_retry_pending)) {
+            return true;
+        }
+    }
+    for (node_subject* subject = runtime->calls.head; subject != NULL; subject = subject->next) {
+        const node_call* call = subject->core;
+        if (call == NULL || call->runtime != runtime) {
+            continue;
+        }
+        if (!call->call_closed || !call->stream_closed || call->has_response_deferred || call->waiter_head != NULL ||
+            call->send_inflight != NULL || call->close_retry_pending || call->stream_close_retry_pending ||
+            call->call_release_retry_pending || call->stream_release_retry_pending ||
+            (!call->server_side && call->kind != TREVRPC_RPC_KIND_UNARY &&
+                !(call->receive_finished || call->terminal_settled))) {
+            return true;
+        }
+    }
+    for (node_subject* subject = runtime->cancellations.head; subject != NULL; subject = subject->next) {
+        if (subject->release_retry_pending || subject->release_requested ||
+            (subject->cancel_submitted && !subject->cancel_completed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void node_runtime_update_liveness(node_runtime* runtime) {
+    if (runtime == NULL) {
+        return;
+    }
+    bool needed = node_runtime_needs_liveness(runtime);
+    uv_handle_t* desired = NULL;
+    if (needed) {
+        if (runtime->poll_initialized && !runtime->poll_closing) {
+            desired = (uv_handle_t*)&runtime->poll;
+        } else if (runtime->failure_progress_initialized && !runtime->failure_progress_closing &&
+                   runtime->failure_progress_started) {
+            desired = (uv_handle_t*)&runtime->failure_progress;
+        }
+    }
+    if (runtime->liveness_handle == desired) {
+        return;
+    }
+    if (runtime->liveness_handle != NULL) {
+        uv_unref(runtime->liveness_handle);
+    }
+    runtime->liveness_handle = desired;
+    if (desired != NULL) {
+        uv_ref(desired);
+    }
+}
+
+static int node_runtime_drain(node_runtime* runtime) {
+    for (;;) {
+        trevrpc_rpc_event* event = NULL;
+        int result = trevrpc_rpc_runtime_next_event(runtime->rpc, &event);
+        if (result == -EAGAIN) {
+            node_test_trace("drain-eagain");
+            return 0;
+        }
+        if (result != 0 || event == NULL) {
+            return result == 0 ? -EPROTO : result;
+        }
+        trevrpc_rpc_event_info_v1 info;
+        char* service = NULL;
+        char* method = NULL;
+        result = node_copy_event_info(runtime, event, &info, &service, &method);
+        if (result == 0) {
+            result = node_route_event(runtime, event, &info);
+        }
+        free(service);
+        free(method);
+        trevrpc_rpc_event_release(event);
+        if (result == 0) {
+            node_runtime_retry_call_cleanup(runtime);
+        }
+        node_runtime_release_pending_cancellations(runtime);
+        if (result != 0) {
+            return result;
+        }
+        if (!runtime->test_failure_consumed && node_test_flag("TREVRPC_NODE_FAIL_INVALID_EVENT")) {
+            runtime->test_failure_consumed = true;
+            trevrpc_rpc_event_info_v1 invalid_info = info;
+            invalid_info.kind = UINT32_MAX;
+            result = node_route_event(runtime, NULL, &invalid_info);
+            if (result == 0) {
+                return -EPROTO;
+            }
+            return result;
+        }
+    }
+}
+
+static void node_runtime_invalidate_wrappers(node_runtime* runtime) {
+    if (runtime == NULL) {
+        return;
+    }
+    bool napi_legal = node_runtime_napi_legal(runtime);
+    for (node_operation* operation = runtime->operations; operation != NULL; operation = operation->next) {
+        if (operation->has_deferred) {
+            if (napi_legal) {
+                (void)node_reject_deferred_native(runtime->env, operation->deferred, -ESHUTDOWN, "runtime cleanup");
+            }
+            operation->has_deferred = false;
+            operation->deferred = NULL;
+        }
+    }
+    for (node_subject* subject = runtime->endpoints.head; subject != NULL; subject = subject->next) {
+        node_client* client = subject->core;
+        if (client == NULL) {
+            continue;
+        }
+        client->invalidated = true;
+        if (napi_legal) {
+            node_client_delete_wrapper_ref(client);
+        }
+        if (client->closed_deferred != NULL) {
+            if (napi_legal) {
+                (void)node_reject_deferred_native(runtime->env, client->closed_deferred, -ESHUTDOWN, "client.close");
+            }
+            client->closed_deferred = NULL;
+        }
+    }
+    for (node_subject* subject = runtime->calls.head; subject != NULL; subject = subject->next) {
+        node_call* call = subject->core;
+        if (call == NULL || call->runtime != runtime) {
+            continue;
+        }
+        call->invalidated = true;
+        call->close_abort = true;
+        node_call_settle_terminal(call, -ESHUTDOWN, "RPC call");
+    }
+    for (node_subject* subject = runtime->cancellations.head; subject != NULL; subject = subject->next) {
+        while (subject->client_head != NULL) {
+            node_client_detach_cancellation(subject->client_head);
+        }
+        if (subject->wrapper != NULL) {
+            subject->wrapper->runtime = NULL;
+            subject->wrapper->subject = NULL;
+            subject->wrapper->wrapper_alive = false;
+            subject->wrapper = NULL;
+        }
+        subject->release_requested = true;
+        if (!subject->cancel_submitted) {
+            subject->cancel_completed = true;
+        }
+    }
+    node_runtime_release_pending_cancellations(runtime);
+}
+
+static void node_runtime_controlled_shutdown(node_runtime* runtime) {
+    runtime->impossible_event = true;
+    node_runtime_begin_cleanup(runtime);
+    node_runtime_start_failure_progress(runtime);
+}
+
+static void node_runtime_finalize_free(node_runtime* runtime) {
+    if (runtime == NULL || !runtime->poll_closed || runtime->failure_progress_initialized ||
+        (runtime->rpc != NULL && !runtime->runtime_released)) {
+        return;
+    }
+    runtime->state = NODE_LIFECYCLE_RELEASED;
+    node_runtime_detach_instance_data(runtime);
+    if (runtime->cleanup_hook_registered && runtime->cleanup_hook != NULL) {
+        napi_async_cleanup_hook_handle hook = runtime->cleanup_hook;
+        runtime->cleanup_hook = NULL;
+        runtime->cleanup_hook_registered = false;
+        (void)napi_remove_async_cleanup_hook(hook);
+    }
+    node_runtime_free(runtime);
+}
+
+static void node_runtime_failure_progress_closed(uv_handle_t* handle) {
+    node_runtime* runtime = handle->data;
+    if (runtime == NULL) {
+        return;
+    }
+    runtime->failure_progress_closing = false;
+    runtime->failure_progress_initialized = false;
+    runtime->failure_progress_started = false;
+    node_test_trace("failure-progress-closed");
+    napi_env env = runtime->env;
+    napi_handle_scope scope = NULL;
+    if (node_runtime_napi_legal(runtime)) {
+        (void)napi_open_handle_scope(env, &scope);
+    }
+    node_runtime_finalize_free(runtime);
+    if (scope != NULL) {
+        (void)napi_close_handle_scope(env, scope);
+    }
+}
+
+static void node_runtime_failure_progress_cb(uv_timer_t* handle) {
+    node_runtime* runtime = handle->data;
+    runtime->failure_progress_started = false;
+    node_test_trace("failure-progress-pass");
+    if (runtime == NULL || runtime->rpc == NULL || runtime->state == NODE_LIFECYCLE_RELEASED) {
+        return;
+    }
+    if (!runtime->cleanup_started) {
+        node_runtime_retry_call_cleanup(runtime);
+        node_runtime_release_pending_cancellations(runtime);
+    } else {
+        if (!runtime->close_submitted) {
+            node_runtime_begin_cleanup(runtime);
+        }
+        int result = node_runtime_drain(runtime);
+        if (result != 0 && result != -EAGAIN) {
+            runtime->impossible_event = true;
+            if (!runtime->close_submitted) {
+                node_runtime_begin_cleanup(runtime);
+            }
+        }
+        node_runtime_release_pending_cancellations(runtime);
+    }
+    if (runtime->stopped_seen && !node_runtime_has_pending_progress(runtime)) {
+        node_runtime_poll_close(runtime);
+        return;
+    }
+    if (node_runtime_has_pending_progress(runtime)) {
+        if (runtime->failure_progress_delay_ms < 1000u) {
+            runtime->failure_progress_delay_ms *= 2u;
+            if (runtime->failure_progress_delay_ms > 1000u) {
+                runtime->failure_progress_delay_ms = 1000u;
+            }
+        }
+        node_runtime_start_failure_progress(runtime);
+    } else {
+        runtime->failure_progress_delay_ms = 1u;
+    }
+}
+
+static void node_runtime_start_failure_progress(node_runtime* runtime) {
+    if (runtime == NULL || runtime->loop == NULL || runtime->state == NODE_LIFECYCLE_RELEASED) {
+        return;
+    }
+    if (!runtime->failure_progress_initialized) {
+        int result = uv_timer_init(runtime->loop, &runtime->failure_progress);
+        if (result != 0) {
+            runtime->impossible_event = true;
+            if (!runtime->environment_teardown) {
+                napi_fatal_error("TrevRPC native runtime cleanup",
+                    NAPI_AUTO_LENGTH,
+                    "failure cleanup progress handle initialization failed",
+                    NAPI_AUTO_LENGTH);
+            }
+            return;
+        }
+        runtime->failure_progress_initialized = true;
+        runtime->failure_progress.data = runtime;
+        runtime->failure_progress_delay_ms = 1u;
+        uv_unref((uv_handle_t*)&runtime->failure_progress);
+        node_test_trace("failure-progress-init");
+    }
+    if (!runtime->failure_progress_started) {
+        int result = uv_timer_start(
+            &runtime->failure_progress, node_runtime_failure_progress_cb, runtime->failure_progress_delay_ms, 0);
+        if (result != 0) {
+            runtime->impossible_event = true;
+            if (!runtime->environment_teardown) {
+                napi_fatal_error("TrevRPC native runtime cleanup",
+                    NAPI_AUTO_LENGTH,
+                    "failure cleanup progress handle start failed",
+                    NAPI_AUTO_LENGTH);
+            }
+            return;
+        }
+        runtime->failure_progress_started = true;
+        node_test_trace("failure-progress-start");
+    }
+    node_runtime_update_liveness(runtime);
+}
+
+static void node_runtime_stop_failure_progress(node_runtime* runtime) {
+    if (runtime == NULL || !runtime->failure_progress_initialized || runtime->failure_progress_closing) {
+        return;
+    }
+    if (runtime->failure_progress_started) {
+        uv_timer_stop(&runtime->failure_progress);
+        runtime->failure_progress_started = false;
+    }
+    node_runtime_update_liveness(runtime);
+}
+
+static void node_runtime_close_failure_progress(node_runtime* runtime) {
+    if (runtime == NULL || !runtime->failure_progress_initialized || runtime->failure_progress_closing) {
+        return;
+    }
+    node_runtime_stop_failure_progress(runtime);
+    runtime->failure_progress_closing = true;
+    node_runtime_update_liveness(runtime);
+    uv_close((uv_handle_t*)&runtime->failure_progress, node_runtime_failure_progress_closed);
+}
+
+static void node_runtime_poll_cb(uv_poll_t* handle, int status, int events) {
+    node_runtime* runtime = handle->data;
+    if (runtime == NULL || runtime->rpc == NULL || runtime->state == NODE_LIFECYCLE_RELEASED) {
+        return;
+    }
+    if (runtime->environment_teardown) {
+        if (!runtime->cleanup_started || !runtime->close_submitted) {
+            node_runtime_begin_cleanup(runtime);
+        }
+        (void)node_runtime_drain(runtime);
+        if (runtime->stopped_seen && !node_runtime_has_pending_progress(runtime)) {
+            node_runtime_poll_close(runtime);
+        }
+        return;
+    }
+    napi_handle_scope scope = NULL;
+    (void)napi_open_handle_scope(runtime->env, &scope);
+    if (status < 0 || (events & (UV_READABLE | UV_DISCONNECT | UV_PRIORITIZED)) == 0) {
+        if (status < 0 || (events & UV_DISCONNECT) != 0) {
+            node_runtime_controlled_shutdown(runtime);
+        }
+        goto done;
+    }
+    if (runtime->cleanup_started && !runtime->close_submitted) {
+        node_runtime_begin_cleanup(runtime);
+    }
+    int result = node_runtime_drain(runtime);
+    if (result != 0) {
+        node_runtime_controlled_shutdown(runtime);
+        goto done;
+    }
+    if (runtime->cleanup_started && runtime->stopped_seen && !node_runtime_has_pending_progress(runtime)) {
+        node_runtime_poll_close(runtime);
+    }
+done:
+    if (scope != NULL) {
+        (void)napi_close_handle_scope(runtime->env, scope);
+    }
+}
+
+static void node_runtime_poll_closed(uv_handle_t* handle) {
+    node_runtime* runtime = handle->data;
+    if (runtime == NULL) {
+        return;
+    }
+    runtime->poll_closing = false;
+    runtime->poll_initialized = false;
+    runtime->poll_closed = true;
+    if (runtime->rpc != NULL && !runtime->runtime_released) {
+        if (!runtime->stopped_seen && node_runtime_shutdown_sync(runtime) != 0) {
+            runtime->impossible_event = true;
+        }
+        node_runtime_release_pending_cancellations(runtime);
+        if (runtime->stopped_seen && !runtime->runtime_released) {
+            int result = trevrpc_rpc_runtime_drain(runtime->rpc);
+            if (result == 0) {
+                result = trevrpc_rpc_runtime_release(runtime->rpc);
+            }
+            if (result == 0) {
+                runtime->rpc = NULL;
+                runtime->runtime_released = true;
+                node_test_trace("release");
+            } else {
+                runtime->impossible_event = true;
+            }
+        }
+    }
+    node_test_trace("poll-closed");
+    node_runtime_close_failure_progress(runtime);
+    napi_env env = runtime->env;
+    napi_handle_scope scope = NULL;
+    if (node_runtime_napi_legal(runtime)) {
+        (void)napi_open_handle_scope(env, &scope);
+    }
+    node_runtime_finalize_free(runtime);
+    if (scope != NULL) {
+        (void)napi_close_handle_scope(env, scope);
+    }
+}
+
+static void node_runtime_poll_close(node_runtime* runtime) {
+    if (!runtime->poll_initialized || runtime->poll_closing) {
+        return;
+    }
+    runtime->poll_closing = true;
+    uv_poll_stop(&runtime->poll);
+    node_runtime_update_liveness(runtime);
+    uv_close((uv_handle_t*)&runtime->poll, node_runtime_poll_closed);
+}
+
+static node_operation* node_runtime_reserve_shutdown_operation(node_runtime* runtime) {
+    if (runtime->shutdown_operation_in_use) {
+        return &runtime->shutdown_operation;
+    }
+    memset(&runtime->shutdown_operation, 0, sizeof(runtime->shutdown_operation));
+    runtime->shutdown_operation.id = TREV_NODE_INITIAL_OPERATION_ID;
+    runtime->shutdown_operation.subject_kind = TREVRPC_RPC_OBJECT_NONE;
+    runtime->shutdown_operation_in_use = true;
+    runtime->shutdown_operation.next = runtime->operations;
+    runtime->operations = &runtime->shutdown_operation;
+    return &runtime->shutdown_operation;
+}
+
+static int node_runtime_submit_close(node_runtime* runtime) {
+    if (runtime->rpc == NULL || runtime->close_submitted) {
+        return 0;
+    }
+    node_operation* operation = node_runtime_reserve_shutdown_operation(runtime);
+    if (operation == NULL) {
+        return -ENOMEM;
+    }
+    int result;
+    if (node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION")) {
+        node_test_trace("close-admission-retry");
+        result = -EIO;
+    } else {
+        if (!runtime->close_submission_failure_injected && node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_FIVE")) {
+            runtime->close_submission_failure_injected = true;
+            runtime->close_submission_failures_remaining = 5u;
+        }
+        if (runtime->close_submission_failures_remaining > 0) {
+            runtime->close_submission_failures_remaining--;
+            node_test_trace("close-admission-retry");
+            result = -EIO;
+        } else if (!runtime->close_submission_failure_injected &&
+                   node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_ONCE")) {
+            runtime->close_submission_failure_injected = true;
+            result = -EIO;
+        } else {
+            result = trevrpc_rpc_runtime_close(runtime->rpc, operation->id);
+        }
+    }
+    runtime->close_attempts++;
+    if (result == 0 || result == -EALREADY) {
+        runtime->close_submitted = true;
+        if (result == -EALREADY) {
+            node_operation_remove(runtime, operation);
+        }
+        node_test_trace("close-submitted");
+        return 0;
+    }
+    node_operation_remove(runtime, operation);
+    return result;
+}
+
+static void node_runtime_begin_cleanup(node_runtime* runtime) {
+    if (runtime == NULL || runtime->rpc == NULL) {
+        return;
+    }
+    if (!runtime->cleanup_started) {
+        runtime->state = NODE_LIFECYCLE_CLOSING;
+        node_runtime_invalidate_wrappers(runtime);
+        runtime->cleanup_started = true;
+    }
+    if (!runtime->close_submitted) {
+        int result = node_runtime_submit_close(runtime);
+        if (result != 0) {
+            runtime->close_retry_pending = true;
+            node_runtime_start_failure_progress(runtime);
+            uint32_t close_attempt_limit = node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_FIVE") ? 8u : 3u;
+            if (runtime->close_attempts >= close_attempt_limit) {
+                node_test_trace("close-failed-bounded");
+                if (!runtime->environment_teardown) {
+                    napi_fatal_error("TrevRPC native runtime cleanup",
+                        NAPI_AUTO_LENGTH,
+                        "runtime_close admission failed after bounded retries",
+                        NAPI_AUTO_LENGTH);
+                }
+                return;
+            }
+            return;
+        }
+        runtime->close_retry_pending = false;
+    }
+    int result = node_runtime_drain(runtime);
+    if (result != 0 && result != -EAGAIN) {
+        runtime->impossible_event = true;
+        node_runtime_start_failure_progress(runtime);
+    }
+    node_runtime_release_pending_cancellations(runtime);
+    if (runtime->stopped_seen && !node_runtime_has_pending_progress(runtime)) {
+        node_runtime_poll_close(runtime);
+    }
+    node_runtime_update_liveness(runtime);
+}
+
+static int node_runtime_shutdown_sync(node_runtime* runtime) {
+    if (runtime->rpc == NULL) {
+        return 0;
+    }
+    for (unsigned attempt = 0; attempt < 3u && !runtime->close_submitted; ++attempt) {
+        if (node_runtime_submit_close(runtime) == 0) {
+            break;
+        }
+    }
+    if (!runtime->close_submitted) {
+        return -EIO;
+    }
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return -EIO;
+    }
+    for (;;) {
+        int result = node_runtime_drain(runtime);
+        if (result != 0 && result != -EAGAIN) {
+            return result;
+        }
+        if (runtime->stopped_seen) {
+            result = trevrpc_rpc_runtime_drain(runtime->rpc);
+            if (result != 0) {
+                return result;
+            }
+            result = trevrpc_rpc_runtime_release(runtime->rpc);
+            if (result != 0) {
+                return result;
+            }
+            runtime->rpc = NULL;
+            runtime->runtime_released = true;
+            node_test_trace("release");
+            return 0;
+        }
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            return -EIO;
+        }
+        time_t elapsed_seconds = now.tv_sec - start.tv_sec;
+        long elapsed_nanos = now.tv_nsec - start.tv_nsec;
+        if (elapsed_nanos < 0) {
+            elapsed_seconds--;
+        }
+        if (elapsed_seconds >= 5) {
+            return -ETIMEDOUT;
+        }
+        struct pollfd descriptor = {.fd = (int)runtime->wake.native_handle, .events = POLLIN};
+        if (descriptor.fd >= 0) {
+            int wait_result = poll(&descriptor, 1, 25);
+            if (wait_result < 0 && errno != EINTR) {
+                return -errno;
+            }
+        } else {
+            sched_yield();
+        }
+    }
+}
+
+static void node_async_cleanup_hook(napi_async_cleanup_hook_handle handle, void* data) {
+    node_runtime* runtime = data;
+    if (runtime == NULL) {
+        return;
+    }
+    runtime->cleanup_hook = handle;
+    runtime->environment_teardown = true;
+    node_runtime_begin_cleanup(runtime);
+    if (runtime->poll_initialized && !runtime->poll_closing) {
+        /* Keep the loop alive until STOPPED is observed.  The borrowed fd
+         * remains owned by the RPC runtime; libuv only polls it. */
+        uv_ref((uv_handle_t*)&runtime->poll);
+    } else if (!runtime->poll_initialized) {
+        if (runtime->rpc != NULL && node_runtime_shutdown_sync(runtime) != 0) {
+            runtime->impossible_event = true;
+            return;
+        }
+        node_runtime_free(runtime);
+    }
+}
+
+static void node_runtime_instance_finalizer(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    node_runtime_instance_holder* holder = data;
+    if (holder == NULL) {
+        return;
+    }
+    node_runtime* runtime = holder->runtime;
+    if (runtime != NULL) {
+        runtime->instance_holder = NULL;
+        runtime->instance_data_registered = false;
+    }
+    holder->runtime = NULL;
+    free(holder);
+    if (runtime != NULL) {
+        runtime->environment_teardown = true;
+        node_runtime_begin_cleanup(runtime);
+    }
+}
+
+static void node_runtime_detach_instance_data(node_runtime* runtime) {
+    if (runtime == NULL || !runtime->instance_data_registered || runtime->environment_teardown) {
+        return;
+    }
+    void* current = NULL;
+    if (napi_get_instance_data(runtime->env, &current) == napi_ok && current == runtime->instance_holder) {
+        (void)napi_set_instance_data(runtime->env, NULL, NULL, NULL);
+    }
+    runtime->instance_data_registered = false;
+    if (runtime->instance_holder != NULL) {
+        runtime->instance_holder->runtime = NULL;
+        free(runtime->instance_holder);
+        runtime->instance_holder = NULL;
+    }
+}
+
+static void node_runtime_free(node_runtime* runtime) {
+    if (runtime == NULL) {
+        return;
+    }
+    for (node_subject* subject = runtime->endpoints.head; subject != NULL; subject = subject->next) {
+        if (subject->core != NULL) {
+            node_client* client = subject->core;
+            node_client_detach_cancellation(client);
+            if (client->server != NULL) {
+                node_server* server = client->server;
+                server->runtime = NULL;
+                server->endpoint = NULL;
+                node_server_free_routes(runtime->env, server);
+                client->server = NULL;
+                if (!server->wrapper_alive) {
+                    free(server);
+                }
+            }
+            client->runtime = NULL;
+        }
+    }
+    for (node_subject* subject = runtime->calls.head; subject != NULL; subject = subject->next) {
+        node_call* call = subject->core;
+        if (call == NULL) {
+            continue;
+        }
+        call->runtime = NULL;
+        node_call_dispose_buffers(call);
+        subject->core = NULL;
+        if (call->stream_subject != NULL) {
+            call->stream_subject->core = NULL;
+        }
+        if (!call->wrapper_alive) {
+            free(call);
+        }
+    }
+    for (node_subject* subject = runtime->streams.head; subject != NULL; subject = subject->next) {
+        subject->core = NULL;
+    }
+    if (runtime->instance_holder != NULL) {
+        runtime->instance_holder->runtime = NULL;
+        runtime->instance_holder = NULL;
+    }
+    node_operation* operation = runtime->operations;
+    while (operation != NULL) {
+        node_operation* next = operation->next;
+        if (operation != &runtime->shutdown_operation) {
+            free(operation);
+        }
+        operation = next;
+    }
+    node_registry_discard_all(&runtime->endpoints);
+    node_registry_discard_all(&runtime->calls);
+    node_registry_discard_all(&runtime->streams);
+    node_registry_discard_all(&runtime->cancellations);
+    node_test_trace("free");
+    free(runtime);
+}
+
+static int node_runtime_fail_construction(node_runtime* runtime, int error_code) {
+    runtime->construction_failed = true;
+    runtime->state = NODE_LIFECYCLE_CLOSING;
+    if (!runtime->cleanup_started) {
+        node_runtime_invalidate_wrappers(runtime);
+        runtime->cleanup_started = true;
+    }
+    if (runtime->cleanup_hook_registered && runtime->cleanup_hook != NULL) {
+        napi_async_cleanup_hook_handle hook = runtime->cleanup_hook;
+        runtime->cleanup_hook = NULL;
+        runtime->cleanup_hook_registered = false;
+        (void)napi_remove_async_cleanup_hook(hook);
+    }
+    node_runtime_detach_instance_data(runtime);
+    if (runtime->poll_initialized) {
+        node_runtime_poll_close(runtime);
+        return error_code;
+    }
+    if (runtime->rpc != NULL) {
+        int result = node_runtime_shutdown_sync(runtime);
+        if (result != 0) {
+            napi_fatal_error("TrevRPC native addon construction",
+                NAPI_AUTO_LENGTH,
+                "runtime close failed during construction failure",
+                NAPI_AUTO_LENGTH);
+            return result;
+        }
+    }
+    node_runtime_free(runtime);
+    return error_code;
+}
+
+static int node_runtime_create(napi_env env, node_runtime** out_runtime) {
+    *out_runtime = NULL;
+    node_runtime* runtime = calloc(1, sizeof(*runtime));
+    if (runtime == NULL) {
+        return -ENOMEM;
+    }
+    runtime->env = env;
+    runtime->next_operation_id = TREV_NODE_INITIAL_OPERATION_ID + 1u;
+    runtime->shutdown_operation.id = TREV_NODE_INITIAL_OPERATION_ID;
+    runtime->state = NODE_LIFECYCLE_RUNNING;
+    int result = napi_get_uv_event_loop(env, &runtime->loop) == napi_ok ? 0 : -EIO;
+    if (result != 0) {
+        node_runtime_free(runtime);
+        return result;
+    }
+    trevrpc_rpc_runtime_config_v1 config;
+    trevrpc_rpc_msquic_config_v1 provider_config;
+    result = trevrpc_rpc_runtime_config_v1_init(&config, sizeof(config));
+    if (result == 0) {
+        result = trevrpc_rpc_msquic_config_v1_init(&provider_config, sizeof(provider_config));
+    }
+    if (result == 0) {
+        trevrpc_rpc_abi_1_anchor();
+        trevrpc_rpc_msquic_abi_1_anchor();
+        result = trevrpc_rpc_msquic_create_v1(&config, &provider_config, &runtime->rpc);
+    }
+    if (result != 0) {
+        node_runtime_free(runtime);
+        return result;
+    }
+    result = trevrpc_rpc_wake_source_v1_init(&runtime->wake, sizeof(runtime->wake));
+    if (result == 0 && node_test_flag("TREVRPC_NODE_FAIL_WAKE_SOURCE")) {
+        runtime->wake.kind = TREVRPC_RPC_WAKE_SOURCE_POSIX_FD;
+        runtime->wake.flags = TREVRPC_RPC_WAKE_FLAG_BORROWED;
+        runtime->wake.native_handle = -1;
+        result = -EPROTO;
+    }
+    if (result == 0) {
+        result = trevrpc_rpc_runtime_get_wake_source_v1(runtime->rpc, &runtime->wake);
+    }
+    if (result != 0 || runtime->wake.kind != TREVRPC_RPC_WAKE_SOURCE_POSIX_FD ||
+        (runtime->wake.flags & (TREVRPC_RPC_WAKE_FLAG_BORROWED | TREVRPC_RPC_WAKE_FLAG_LEVEL_TRIGGERED)) !=
+            (TREVRPC_RPC_WAKE_FLAG_BORROWED | TREVRPC_RPC_WAKE_FLAG_LEVEL_TRIGGERED) ||
+        runtime->wake.native_handle < 0) {
+        return node_runtime_fail_construction(runtime, result != 0 ? result : -EPROTO);
+    }
+    if (node_test_flag("TREVRPC_NODE_FAIL_UV_POLL_INIT")) {
+        return node_runtime_fail_construction(runtime, -EIO);
+    }
+    result = uv_poll_init(runtime->loop, &runtime->poll, (int)runtime->wake.native_handle);
+    if (result != 0) {
+        return node_runtime_fail_construction(runtime, -result);
+    }
+    runtime->poll_initialized = true;
+    runtime->poll.data = runtime;
+    node_test_trace("poll-init");
+    if (node_test_flag("TREVRPC_NODE_FAIL_NAPI_INSTANCE_DATA")) {
+        return node_runtime_fail_construction(runtime, -EIO);
+    }
+    runtime->instance_holder = calloc(1, sizeof(*runtime->instance_holder));
+    if (runtime->instance_holder == NULL) {
+        return node_runtime_fail_construction(runtime, -ENOMEM);
+    }
+    runtime->instance_holder->runtime = runtime;
+    if (napi_set_instance_data(env, runtime->instance_holder, node_runtime_instance_finalizer, NULL) != napi_ok) {
+        free(runtime->instance_holder);
+        runtime->instance_holder = NULL;
+        return node_runtime_fail_construction(runtime, -EIO);
+    }
+    runtime->instance_data_registered = true;
+    if (node_test_flag("TREVRPC_NODE_FAIL_NAPI_CLEANUP_HOOK") ||
+        napi_add_async_cleanup_hook(env, node_async_cleanup_hook, runtime, &runtime->cleanup_hook) != napi_ok) {
+        return node_runtime_fail_construction(runtime, -EIO);
+    }
+    runtime->cleanup_hook_registered = true;
+    if (node_test_flag("TREVRPC_NODE_FAIL_UV_POLL_START")) {
+        runtime->poll_start_failed = true;
+        return node_runtime_fail_construction(runtime, -EIO);
+    }
+    result = uv_poll_start(&runtime->poll, UV_READABLE, node_runtime_poll_cb);
+    if (result != 0) {
+        runtime->poll_start_failed = true;
+        return node_runtime_fail_construction(runtime, -result);
+    }
+    runtime->poll_started = true;
+    node_test_trace("poll-start");
+    if (node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION")) {
+        node_runtime_controlled_shutdown(runtime);
+        for (unsigned attempt = 0; attempt < 3u && !runtime->close_submitted; ++attempt) {
+            node_runtime_begin_cleanup(runtime);
+        }
+    }
+    if (node_test_flag("TREVRPC_NODE_FAIL_POLL_ERROR")) {
+        uv_poll_stop(&runtime->poll);
+        node_runtime_poll_cb(&runtime->poll, UV_EIO, 0);
+    }
+    /* A lazily-created runtime must not make an otherwise idle Node process
+     * immortal.  The poll remains active whenever the loop is running. */
+    uv_unref((uv_handle_t*)&runtime->poll);
+    *out_runtime = runtime;
+    return 0;
+}
+
+static int node_runtime_get(napi_env env, node_runtime** out_runtime) {
+    node_runtime_instance_holder* holder = NULL;
+    napi_status status = napi_get_instance_data(env, (void**)&holder);
+    if (status != napi_ok) {
+        return -EIO;
+    }
+    if (holder != NULL && holder->runtime != NULL) {
+        *out_runtime = holder->runtime;
+        return (*out_runtime)->state == NODE_LIFECYCLE_RUNNING ? 0 : -ESHUTDOWN;
+    }
+    *out_runtime = NULL;
+    return node_runtime_create(env, out_runtime);
+}
+
+static napi_value node_throw_error(napi_env env, int error_code, const char* operation) {
+    napi_value message;
+    napi_value error;
+    char text[160];
+    int written = snprintf(text, sizeof(text), "%s failed (%d)", operation, error_code);
+    if (written < 0 || napi_create_string_utf8(env, text, NAPI_AUTO_LENGTH, &message) != napi_ok ||
+        napi_create_error(env, NULL, message, &error) != napi_ok) {
+        napi_throw_error(env, NULL, operation);
+        return NULL;
+    }
+    napi_value code;
+    if (napi_create_int32(env, error_code, &code) == napi_ok) {
+        (void)napi_set_named_property(env, error, "nativeCode", code);
+    }
     napi_throw(env, error);
+    return NULL;
 }
 
-static bool get_bool_property(napi_env env, napi_value object, const char* name, bool default_value) {
-    bool has_property = false;
-    napi_has_named_property(env, object, name, &has_property);
-    if (!has_property) {
-        return default_value;
+static void node_cancellation_finalizer(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    node_cancellation* cancellation = data;
+    if (cancellation == NULL) {
+        return;
     }
-
-    napi_value value = NULL;
-    napi_get_named_property(env, object, name, &value);
-    bool result = default_value;
-    napi_get_value_bool(env, value, &result);
-    return result;
+    node_runtime* runtime = cancellation->runtime;
+    node_subject* subject = cancellation->subject;
+    cancellation->wrapper_alive = false;
+    if (subject != NULL) {
+        subject->wrapper = NULL;
+    }
+    if (runtime != NULL && runtime->rpc != NULL && subject != NULL) {
+        subject->release_requested = true;
+        if (!subject->cancel_submitted) {
+            subject->cancel_completed = true;
+        }
+        node_cancellation_try_release(runtime, subject);
+        cancellation->subject = NULL;
+    }
+    cancellation->runtime = NULL;
+    cancellation->subject = NULL;
+    free(cancellation);
 }
 
-static uint32_t get_uint32_property(napi_env env, napi_value object, const char* name, uint32_t default_value) {
-    bool has_property = false;
-    napi_has_named_property(env, object, name, &has_property);
-    if (!has_property) {
-        return default_value;
+static napi_value node_cancellation_cancel(napi_env env, napi_callback_info info) {
+    napi_value this_value;
+    size_t argc = 0;
+    if (napi_get_cb_info(env, info, &argc, NULL, &this_value, NULL) != napi_ok) {
+        return node_throw_error(env, -EIO, "cancellation.cancel");
     }
-
-    napi_value value = NULL;
-    napi_get_named_property(env, object, name, &value);
-    uint32_t result = default_value;
-    napi_get_value_uint32(env, value, &result);
-    return result;
+    node_cancellation* cancellation = NULL;
+    if (napi_unwrap(env, this_value, (void**)&cancellation) != napi_ok || cancellation == NULL ||
+        cancellation->runtime == NULL || cancellation->runtime->rpc == NULL || cancellation->subject == NULL ||
+        !cancellation->wrapper_alive) {
+        return node_throw_error(env, -ESTALE, "cancellation.cancel");
+    }
+    if (cancellation->cancel_submitted) {
+        napi_value undefined;
+        (void)napi_get_undefined(env, &undefined);
+        return undefined;
+    }
+    node_runtime* runtime = cancellation->runtime;
+    node_operation* operation =
+        node_operation_add(runtime, TREVRPC_RPC_OBJECT_CANCELLATION, cancellation->subject->key);
+    if (operation == NULL) {
+        return node_throw_error(env, -EOVERFLOW, "cancellation.cancel");
+    }
+    int result = trevrpc_rpc_cancellation_cancel(runtime->rpc, cancellation->handle, operation->id);
+    if (result != 0) {
+        node_operation_remove(runtime, operation);
+        return node_throw_error(env, result, "cancellation.cancel");
+    }
+    cancellation->cancel_submitted = true;
+    cancellation->subject->cancel_submitted = true;
+    napi_value undefined;
+    (void)napi_get_undefined(env, &undefined);
+    return undefined;
 }
 
-static bool get_int64_property(napi_env env, napi_value object, const char* name, int64_t* out_value) {
-    bool has_property = false;
-    napi_has_named_property(env, object, name, &has_property);
-    if (!has_property) {
-        return false;
+static napi_value node_create_cancellation(napi_env env, napi_callback_info info) {
+    (void)info;
+    node_runtime* runtime = NULL;
+    int result = node_runtime_get(env, &runtime);
+    if (result != 0 || runtime == NULL || runtime->rpc == NULL) {
+        return node_throw_error(env, result != 0 ? result : -EIO, "createCancellation");
     }
-
-    napi_value value = NULL;
-    napi_get_named_property(env, object, name, &value);
-    return napi_get_value_int64(env, value, out_value) == napi_ok;
+    node_cancellation* cancellation = calloc(1, sizeof(*cancellation));
+    if (cancellation == NULL) {
+        return node_throw_error(env, -ENOMEM, "createCancellation");
+    }
+    result = trevrpc_rpc_cancellation_create(runtime->rpc, &cancellation->handle);
+    if (result != 0) {
+        free(cancellation);
+        return node_throw_error(env, result, "createCancellation");
+    }
+    cancellation->runtime = runtime;
+    cancellation->subject =
+        node_registry_add(runtime, TREVRPC_RPC_OBJECT_CANCELLATION, node_key_from_cancellation(cancellation->handle));
+    if (cancellation->subject == NULL) {
+        (void)trevrpc_rpc_cancellation_release(runtime->rpc, cancellation->handle);
+        free(cancellation);
+        return node_throw_error(env, -ENOMEM, "createCancellation");
+    }
+    cancellation->subject->cancellation = cancellation->handle;
+    cancellation->subject->wrapper = cancellation;
+    cancellation->subject->cancel_submitted = false;
+    cancellation->subject->cancel_completed = false;
+    cancellation->wrapper_alive = true;
+    napi_value object;
+    napi_value cancel;
+    if (napi_create_object(env, &object) != napi_ok ||
+        napi_create_function(env, "cancel", NAPI_AUTO_LENGTH, node_cancellation_cancel, NULL, &cancel) != napi_ok ||
+        napi_set_named_property(env, object, "cancel", cancel) != napi_ok ||
+        napi_wrap(env, object, cancellation, node_cancellation_finalizer, NULL, NULL) != napi_ok) {
+        cancellation->subject->wrapper = NULL;
+        if (trevrpc_rpc_cancellation_release(runtime->rpc, cancellation->handle) == 0) {
+            node_registry_remove(runtime, cancellation->subject);
+        }
+        free(cancellation);
+        return node_throw_error(env, -EIO, "createCancellation");
+    }
+    return object;
 }
 
-static bool get_size_property(napi_env env, napi_value object, const char* name, size_t* out_value) {
-    bool has_property = false;
-    napi_has_named_property(env, object, name, &has_property);
-    if (!has_property) {
-        return false;
-    }
+typedef struct node_js_metadata {
+    node_metadata_value* values;
+    trevrpc_rpc_metadata_entry_v1* entries;
+    size_t count;
+} node_js_metadata;
 
-    napi_value value = NULL;
-    napi_get_named_property(env, object, name, &value);
-    double number = 0;
-    if (napi_get_value_double(env, value, &number) != napi_ok || number < 0) {
-        return false;
+typedef struct node_js_request {
+    char* service;
+    uint32_t service_len;
+    char* method;
+    uint32_t method_len;
+    uint8_t* body;
+    size_t body_len;
+    node_js_metadata metadata;
+    uint32_t kind;
+    uint64_t timeout_nanos;
+    int64_t max_response_body_size;
+    int64_t max_response_messages;
+    int64_t max_response_stream_body_size;
+    uint64_t response_idle_timeout_nanos;
+    trevrpc_rpc_cancellation_v1 cancellation;
+} node_js_request;
+
+typedef struct node_external_receive_owner {
+    trevrpc_rpc_receive* receive;
+    void* data;
+} node_external_receive_owner;
+
+static void node_metadata_free(node_js_metadata* metadata) {
+    if (metadata == NULL) {
+        return;
     }
-    *out_value = (size_t)number;
-    return true;
+    if (metadata->values != NULL) {
+        for (size_t index = 0; index < metadata->count; ++index) {
+            free(metadata->values[index].key);
+            free(metadata->values[index].value);
+        }
+    }
+    free(metadata->values);
+    free(metadata->entries);
+    memset(metadata, 0, sizeof(*metadata));
 }
 
-static char* copy_string_value(napi_env env, napi_value value) {
-    size_t len = 0;
-    if (napi_get_value_string_utf8(env, value, NULL, 0, &len) != napi_ok) {
-        return NULL;
+static void node_request_free(node_js_request* request) {
+    if (request == NULL) {
+        return;
     }
-    char* result = malloc(len + 1);
+    free(request->service);
+    free(request->method);
+    free(request->body);
+    node_metadata_free(&request->metadata);
+    memset(request, 0, sizeof(*request));
+}
+
+static int node_copy_js_string(napi_env env, napi_value value, char** out, uint32_t* out_len) {
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type != napi_string) {
+        return -EINVAL;
+    }
+    size_t length = 0;
+    if (napi_get_value_string_utf8(env, value, NULL, 0, &length) != napi_ok || length > UINT32_MAX) {
+        return -EOVERFLOW;
+    }
+    char* result = malloc(length + 1u);
     if (result == NULL) {
-        return NULL;
+        return -ENOMEM;
     }
-    if (napi_get_value_string_utf8(env, value, result, len + 1, &len) != napi_ok) {
+    if (napi_get_value_string_utf8(env, value, result, length + 1u, &length) != napi_ok) {
         free(result);
-        return NULL;
+        return -EINVAL;
     }
-    return result;
+    result[length] = '\0';
+    *out = result;
+    *out_len = (uint32_t)length;
+    return 0;
 }
 
-static char* get_string_property(napi_env env, napi_value object, const char* name) {
-    bool has_property = false;
-    napi_has_named_property(env, object, name, &has_property);
-    if (!has_property) {
-        return NULL;
-    }
-
-    napi_value value = NULL;
-    napi_get_named_property(env, object, name, &value);
-    napi_valuetype type = napi_undefined;
-    napi_typeof(env, value, &type);
-    if (type == napi_undefined || type == napi_null) {
-        return NULL;
-    }
-    return copy_string_value(env, value);
-}
-
-static int copy_string_arg(napi_env env, napi_value value, char** out) {
-    *out = copy_string_value(env, value);
-    return *out == NULL ? -ENOMEM : 0;
-}
-
-static int copy_bytes_arg(napi_env env, napi_value value, uint8_t** out, size_t* out_len) {
-    *out = NULL;
-    *out_len = 0;
-
-    bool is_typedarray = false;
-    napi_is_typedarray(env, value, &is_typedarray);
-    if (is_typedarray) {
-        napi_typedarray_type type = napi_uint8_array;
-        size_t len = 0;
-        void* data = NULL;
-        napi_value arraybuffer = NULL;
-        size_t byte_offset = 0;
-        if (napi_get_typedarray_info(env, value, &type, &len, &data, &arraybuffer, &byte_offset) != napi_ok ||
-            type != napi_uint8_array) {
-            return -EINVAL;
-        }
-        if (len == 0) {
-            return 0;
-        }
-        if (data == NULL) {
-            return -EINVAL;
-        }
-        *out = malloc(len);
-        if (*out == NULL) {
-            return -ENOMEM;
-        }
-        memcpy(*out, data, len);
-        *out_len = len;
-        return 0;
-    }
-
+static int node_copy_js_bytes(napi_env env, napi_value value, uint8_t** out, size_t* out_len) {
     bool is_arraybuffer = false;
-    napi_is_arraybuffer(env, value, &is_arraybuffer);
+    if (napi_is_arraybuffer(env, value, &is_arraybuffer) != napi_ok) {
+        return -EINVAL;
+    }
     if (is_arraybuffer) {
         void* data = NULL;
-        size_t len = 0;
-        if (napi_get_arraybuffer_info(env, value, &data, &len) != napi_ok) {
+        size_t length = 0;
+        if (napi_get_arraybuffer_info(env, value, &data, &length) != napi_ok) {
             return -EINVAL;
         }
-        if (len == 0) {
-            return 0;
-        }
-        if (data == NULL) {
-            return -EINVAL;
-        }
-        *out = malloc(len);
-        if (*out == NULL) {
+        uint8_t* copy = length == 0 ? NULL : malloc(length);
+        if (length != 0 && copy == NULL) {
             return -ENOMEM;
         }
-        memcpy(*out, data, len);
-        *out_len = len;
+        if (length != 0) {
+            memcpy(copy, data, length);
+        }
+        *out = copy;
+        *out_len = length;
         return 0;
     }
-
-    return -EINVAL;
-}
-
-static int bytes_arg_view(napi_env env, napi_value value, const uint8_t** out, size_t* out_len) {
-    *out = NULL;
-    *out_len = 0;
-
     bool is_typedarray = false;
-    napi_is_typedarray(env, value, &is_typedarray);
+    if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok) {
+        return -EINVAL;
+    }
     if (is_typedarray) {
-        napi_typedarray_type type = napi_uint8_array;
-        size_t len = 0;
+        napi_typedarray_type type;
+        size_t length = 0;
         void* data = NULL;
         napi_value arraybuffer = NULL;
-        size_t byte_offset = 0;
-        if (napi_get_typedarray_info(env, value, &type, &len, &data, &arraybuffer, &byte_offset) != napi_ok ||
-            type != napi_uint8_array) {
+        size_t offset = 0;
+        if (napi_get_typedarray_info(env, value, &type, &length, &data, &arraybuffer, &offset) != napi_ok ||
+            type == napi_bigint64_array || type == napi_biguint64_array) {
             return -EINVAL;
         }
-        if (data == NULL && len > 0) {
-            return -EINVAL;
+        size_t element_size = 1;
+        switch (type) {
+        case napi_int16_array:
+        case napi_uint16_array:
+            element_size = 2;
+            break;
+        case napi_int32_array:
+        case napi_uint32_array:
+        case napi_float32_array:
+            element_size = 4;
+            break;
+        case napi_float64_array:
+            element_size = 8;
+            break;
+        default:
+            break;
         }
-        *out = data;
-        *out_len = len;
+        if (length > SIZE_MAX / element_size) {
+            return -EOVERFLOW;
+        }
+        size_t bytes = length * element_size;
+        uint8_t* copy = bytes == 0 ? NULL : malloc(bytes);
+        if (bytes != 0 && copy == NULL) {
+            return -ENOMEM;
+        }
+        if (bytes != 0) {
+            memcpy(copy, data, bytes);
+        }
+        *out = copy;
+        *out_len = bytes;
         return 0;
     }
-
-    bool is_arraybuffer = false;
-    napi_is_arraybuffer(env, value, &is_arraybuffer);
-    if (is_arraybuffer) {
-        void* data = NULL;
-        size_t len = 0;
-        if (napi_get_arraybuffer_info(env, value, &data, &len) != napi_ok) {
-            return -EINVAL;
-        }
-        if (data == NULL && len > 0) {
-            return -EINVAL;
-        }
-        *out = data;
-        *out_len = len;
-        return 0;
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) {
+        return -EINVAL;
     }
-
-    return -EINVAL;
-}
-
-static int copy_bytes_array_arg(napi_env env, napi_value value, uint8_t** out, size_t** out_lens, size_t* out_count) {
-    *out = NULL;
-    *out_lens = NULL;
-    *out_count = 0;
-
     bool is_array = false;
     if (napi_is_array(env, value, &is_array) != napi_ok || !is_array) {
         return -EINVAL;
     }
-
     uint32_t length = 0;
     if (napi_get_array_length(env, value, &length) != napi_ok) {
         return -EINVAL;
     }
-    if (length == 0) {
+    uint8_t* copy = length == 0 ? NULL : malloc(length);
+    if (length != 0 && copy == NULL) {
+        return -ENOMEM;
+    }
+    for (uint32_t index = 0; index < length; ++index) {
+        napi_value element;
+        int32_t number;
+        if (napi_get_element(env, value, index, &element) != napi_ok ||
+            napi_get_value_int32(env, element, &number) != napi_ok || number < 0 || number > 255) {
+            free(copy);
+            return -EINVAL;
+        }
+        copy[index] = (uint8_t)number;
+    }
+    *out = copy;
+    *out_len = length;
+    return 0;
+}
+
+static int node_copy_js_metadata(napi_env env, napi_value value, node_js_metadata* out) {
+    node_js_metadata parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    memset(out, 0, sizeof(*out));
+    napi_valuetype type;
+    if (value == NULL || napi_typeof(env, value, &type) != napi_ok || type == napi_undefined || type == napi_null) {
         return 0;
     }
-
-    size_t* lens = calloc(length, sizeof(*lens));
-    if (lens == NULL) {
-        return -ENOMEM;
-    }
-
-    size_t total_len = 0;
-    for (uint32_t i = 0; i < length; i++) {
-        napi_value element = NULL;
-        const uint8_t* body = NULL;
-        size_t body_len = 0;
-        if (napi_get_element(env, value, i, &element) != napi_ok ||
-            bytes_arg_view(env, element, &body, &body_len) != 0) {
-            free(lens);
-            return -EINVAL;
-        }
-        if (body_len > SIZE_MAX - total_len) {
-            free(lens);
-            return -EOVERFLOW;
-        }
-        lens[i] = body_len;
-        total_len += body_len;
-    }
-
-    uint8_t* bodies = NULL;
-    if (total_len > 0) {
-        bodies = malloc(total_len);
-        if (bodies == NULL) {
-            free(lens);
-            return -ENOMEM;
-        }
-    }
-
-    size_t offset = 0;
-    for (uint32_t i = 0; i < length; i++) {
-        if (lens[i] == 0) {
-            continue;
-        }
-        napi_value element = NULL;
-        const uint8_t* body = NULL;
-        size_t body_len = 0;
-        if (napi_get_element(env, value, i, &element) != napi_ok ||
-            bytes_arg_view(env, element, &body, &body_len) != 0 || body_len != lens[i]) {
-            free(bodies);
-            free(lens);
-            return -EINVAL;
-        }
-        if (bodies == NULL || body == NULL) {
-            free(bodies);
-            free(lens);
-            return -EINVAL;
-        }
-        memcpy(bodies + offset, body, body_len);
-        offset += body_len;
-    }
-
-    *out = bodies;
-    *out_lens = lens;
-    *out_count = length;
-    return 0;
-}
-
-static int make_uint8_array(napi_env env, const uint8_t* data, size_t len, napi_value* out) {
-    *out = NULL;
-    if (len > 0 && data == NULL) {
+    if (type != napi_object) {
         return -EINVAL;
     }
-    napi_value arraybuffer = NULL;
-    void* buffer = NULL;
-    if (napi_create_arraybuffer(env, len, &buffer, &arraybuffer) != napi_ok) {
+    napi_value names;
+    uint32_t count = 0;
+    if (napi_get_property_names(env, value, &names) != napi_ok ||
+        napi_get_array_length(env, names, &count) != napi_ok) {
+        return -EINVAL;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    parsed.values = calloc(count, sizeof(*parsed.values));
+    parsed.entries = calloc(count, sizeof(*parsed.entries));
+    if (parsed.values == NULL || parsed.entries == NULL) {
+        node_metadata_free(&parsed);
         return -ENOMEM;
     }
-    if (len > 0) {
-        memcpy(buffer, data, len);
+    for (uint32_t index = 0; index < count; ++index) {
+        napi_value key;
+        napi_value item;
+        uint32_t key_len = 0;
+        if (napi_get_element(env, names, index, &key) != napi_ok ||
+            node_copy_js_string(env, key, &parsed.values[index].key, &key_len) != 0 ||
+            napi_get_property(env, value, key, &item) != napi_ok) {
+            node_metadata_free(&parsed);
+            return -EINVAL;
+        }
+        int result = node_copy_js_bytes(env, item, &parsed.values[index].value, &parsed.values[index].value_len);
+        if (result != 0) {
+            node_metadata_free(&parsed);
+            return result;
+        }
+        parsed.entries[index].key = parsed.values[index].key;
+        parsed.entries[index].key_len = key_len;
+        parsed.entries[index].value = parsed.values[index].value;
+        parsed.entries[index].value_len = parsed.values[index].value_len;
+        parsed.count++;
     }
-    if (napi_create_typedarray(env, napi_uint8_array, len, arraybuffer, 0, out) != napi_ok) {
-        return -ENOMEM;
-    }
+    *out = parsed;
     return 0;
 }
 
-static void node_body_owner_release(trevrpc_body_owner* owner) {
-    if (owner == NULL) {
-        return;
+static int node_get_named_value(napi_env env, napi_value object, const char* name, napi_value* out, bool* present) {
+    bool has = false;
+    if (napi_has_named_property(env, object, name, &has) != napi_ok) {
+        return -EINVAL;
     }
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&NodeBodyOwnerReleases, 1, memory_order_relaxed);
-#endif
-    trevrpc_body_owner_release(owner);
+    *present = has;
+    if (!has) {
+        *out = NULL;
+        return 0;
+    }
+    return napi_get_named_property(env, object, name, out) == napi_ok ? 0 : -EINVAL;
 }
 
-#ifdef TREVRPC_NODE_TEST_HOOKS
-static bool debug_consume_body_conversion_failure(debug_body_conversion_failure stage) {
-    int expected = stage;
-    return atomic_compare_exchange_strong_explicit(&NextBodyConversionFailure,
-        &expected,
-        DEBUG_BODY_CONVERSION_FAILURE_NONE,
-        memory_order_relaxed,
-        memory_order_relaxed);
+static int node_get_named_u64(napi_env env, napi_value object, const char* name, uint64_t* out) {
+    napi_value value;
+    bool present;
+    int result = node_get_named_value(env, object, name, &value, &present);
+    if (result != 0 || !present) {
+        return result;
+    }
+    double number;
+    if (napi_get_value_double(env, value, &number) != napi_ok || number < 0 || number > (double)UINT64_MAX) {
+        return -EINVAL;
+    }
+    *out = (uint64_t)number;
+    return 0;
 }
-#endif
 
-static void external_arraybuffer_finalize(napi_env env, void* data, void* hint) {
+static int node_get_named_i64(napi_env env, napi_value object, const char* name, int64_t* out) {
+    napi_value value;
+    bool present;
+    int result = node_get_named_value(env, object, name, &value, &present);
+    if (result != 0 || !present) {
+        return result;
+    }
+    double number;
+    if (napi_get_value_double(env, value, &number) != napi_ok || number < (double)INT64_MIN ||
+        number > (double)INT64_MAX) {
+        return -EINVAL;
+    }
+    *out = (int64_t)number;
+    return 0;
+}
+
+static int node_get_named_bool(napi_env env, napi_value object, const char* name, bool* out, bool* present) {
+    napi_value value;
+    int result = node_get_named_value(env, object, name, &value, present);
+    if (result != 0 || !*present) {
+        return result;
+    }
+    return napi_get_value_bool(env, value, out) == napi_ok ? 0 : -EINVAL;
+}
+
+static int node_parse_request(napi_env env, napi_value value, uint32_t default_kind, node_js_request* out) {
+    memset(out, 0, sizeof(*out));
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) {
+        return -EINVAL;
+    }
+    napi_value item;
+    bool present;
+    if (node_get_named_value(env, value, "service", &item, &present) != 0 || !present ||
+        node_copy_js_string(env, item, &out->service, &out->service_len) != 0 || out->service_len == 0 ||
+        node_get_named_value(env, value, "method", &item, &present) != 0 || !present ||
+        node_copy_js_string(env, item, &out->method, &out->method_len) != 0 || out->method_len == 0) {
+        node_request_free(out);
+        return -EINVAL;
+    }
+    if (node_get_named_value(env, value, "body", &item, &present) != 0) {
+        node_request_free(out);
+        return -EINVAL;
+    }
+    if (present && node_copy_js_bytes(env, item, &out->body, &out->body_len) != 0) {
+        node_request_free(out);
+        return -EINVAL;
+    }
+    if (node_get_named_value(env, value, "metadata", &item, &present) != 0 ||
+        (present && node_copy_js_metadata(env, item, &out->metadata) != 0)) {
+        node_request_free(out);
+        return -EINVAL;
+    }
+    out->kind = default_kind;
+    if (node_get_named_value(env, value, "kind", &item, &present) != 0) {
+        node_request_free(out);
+        return -EINVAL;
+    }
+    if (present) {
+        uint32_t kind;
+        if (napi_get_value_uint32(env, item, &kind) != napi_ok || kind > TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
+            node_request_free(out);
+            return -EINVAL;
+        }
+        out->kind = kind;
+    }
+    out->timeout_nanos = TREVRPC_RPC_DEADLINE_INFINITE;
+    out->max_response_body_size = (int64_t)TREVRPC_RPC_DEFAULT_MAX_MESSAGE_SIZE;
+    out->max_response_messages = 4096;
+    out->max_response_stream_body_size = 16 * 1024 * 1024;
+    (void)node_get_named_u64(env, value, "timeoutNanos", &out->timeout_nanos);
+    (void)node_get_named_i64(env, value, "maxResponseBodySize", &out->max_response_body_size);
+    (void)node_get_named_i64(env, value, "maxResponseMessages", &out->max_response_messages);
+    (void)node_get_named_i64(env, value, "maxResponseStreamBodySize", &out->max_response_stream_body_size);
+    (void)node_get_named_u64(env, value, "responseIdleTimeoutNanos", &out->response_idle_timeout_nanos);
+    return 0;
+}
+
+static void node_external_receive_finalizer(napi_env env, void* data, void* hint) {
     (void)env;
     (void)data;
-    node_body_owner_release(hint);
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&ExternalArrayBufferFinalizers, 1, memory_order_relaxed);
-#endif
+    node_external_receive_owner* owner = hint;
+    if (owner != NULL) {
+        if (owner->receive != NULL) {
+            trevrpc_rpc_receive_release(owner->receive);
+        }
+        free(owner->data);
+        free(owner);
+    }
 }
 
-static int body_owner_to_js(
-    napi_env env, trevrpc_bytes_view borrowed_body, trevrpc_body_owner** owner_slot, napi_value* out) {
-    *out = NULL;
-    trevrpc_body_owner* owner = owner_slot != NULL ? *owner_slot : NULL;
-    trevrpc_bytes_view body = borrowed_body;
-    if (owner != NULL) {
-        int err = trevrpc_body_owner_get_view(owner, &body);
-        if (err != 0) {
-            node_body_owner_release(owner);
-            *owner_slot = NULL;
-            return err;
-        }
-    }
-    if (body.len == 0) {
-        node_body_owner_release(owner);
-        if (owner_slot != NULL) {
-            *owner_slot = NULL;
-        }
-        return make_uint8_array(env, NULL, 0, out);
-    }
-    if (body.data == NULL) {
-        node_body_owner_release(owner);
-        if (owner_slot != NULL) {
-            *owner_slot = NULL;
-        }
-        return -EINVAL;
-    }
-    if (owner == NULL) {
-        return make_uint8_array(env, body.data, body.len, out);
-    }
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    if (debug_consume_body_conversion_failure(DEBUG_BODY_CONVERSION_FAILURE_BEFORE_EXTERNAL)) {
-        int err = make_uint8_array(env, body.data, body.len, out);
-        node_body_owner_release(owner);
-        *owner_slot = NULL;
-        return err;
-    }
-#endif
-
-    napi_value arraybuffer = NULL;
-    if (napi_create_external_arraybuffer(
-            env, (void*)body.data, body.len, external_arraybuffer_finalize, owner, &arraybuffer) != napi_ok) {
-        clear_pending_exception(env);
-        int err = make_uint8_array(env, body.data, body.len, out);
-        node_body_owner_release(owner);
-        *owner_slot = NULL;
-        return err;
-    }
-    *owner_slot = NULL;
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    if (debug_consume_body_conversion_failure(DEBUG_BODY_CONVERSION_FAILURE_AFTER_EXTERNAL)) {
-        return make_uint8_array(env, body.data, body.len, out);
-    }
-#endif
-
-    napi_value typedarray = NULL;
-    if (napi_create_typedarray(env, napi_uint8_array, body.len, arraybuffer, 0, &typedarray) != napi_ok) {
-        clear_pending_exception(env);
-        return make_uint8_array(env, body.data, body.len, out);
-    }
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    if (debug_consume_body_conversion_failure(DEBUG_BODY_CONVERSION_FAILURE_AFTER_TYPED_ARRAY)) {
+static int node_copy_receive_status(const trevrpc_rpc_receive_info_v1* info, node_status_value* out) {
+    memset(out, 0, sizeof(*out));
+    out->code = info->rpc_status;
+    out->message = calloc((size_t)info->message_len + 1u, 1u);
+    if (out->message == NULL) {
         return -ENOMEM;
     }
-#endif
-    *out = typedarray;
+    if (info->message_len != 0) {
+        if (info->message == NULL) {
+            free(out->message);
+            out->message = NULL;
+            return -EPROTO;
+        }
+        memcpy(out->message, info->message, info->message_len);
+    }
+    if (info->metadata_count != 0) {
+        if (info->metadata == NULL) {
+            free(out->message);
+            out->message = NULL;
+            return -EPROTO;
+        }
+        out->metadata = calloc(info->metadata_count, sizeof(*out->metadata));
+        if (out->metadata == NULL) {
+            free(out->message);
+            out->message = NULL;
+            return -ENOMEM;
+        }
+        for (uint32_t index = 0; index < info->metadata_count; ++index) {
+            const trevrpc_rpc_metadata_entry_v1* entry = &info->metadata[index];
+            out->metadata[index].key = calloc((size_t)entry->key_len + 1u, 1u);
+            out->metadata[index].value = entry->value_len == 0 ? NULL : malloc((size_t)entry->value_len);
+            if (out->metadata[index].key == NULL || (entry->value_len != 0 && out->metadata[index].value == NULL) ||
+                (entry->key_len != 0 && entry->key == NULL) || (entry->value_len != 0 && entry->value == NULL)) {
+                for (uint32_t cleanup = 0; cleanup <= index; ++cleanup) {
+                    free(out->metadata[cleanup].key);
+                    free(out->metadata[cleanup].value);
+                }
+                free(out->metadata);
+                free(out->message);
+                memset(out, 0, sizeof(*out));
+                return -ENOMEM;
+            }
+            memcpy(out->metadata[index].key, entry->key, entry->key_len);
+            if (entry->value_len != 0) {
+                memcpy(out->metadata[index].value, entry->value, (size_t)entry->value_len);
+            }
+            out->metadata[index].value_len = (size_t)entry->value_len;
+            out->metadata_count++;
+        }
+    }
     return 0;
 }
 
-static napi_status set_uint32(napi_env env, napi_value object, const char* name, uint32_t value) {
-    napi_value js_value = NULL;
-    napi_create_uint32(env, value, &js_value);
-    return napi_set_named_property(env, object, name, js_value);
-}
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-static napi_status set_bool(napi_env env, napi_value object, const char* name, bool value) {
-    napi_value js_value = NULL;
-    napi_get_boolean(env, value, &js_value);
-    return napi_set_named_property(env, object, name, js_value);
-}
-#endif
-
-static napi_status set_uint64_string(napi_env env, napi_value object, const char* name, uint64_t value) {
-    char buffer[32];
-    snprintf(buffer, sizeof(buffer), "%llu", (unsigned long long)value);
-    napi_value js_value = NULL;
-    napi_create_string_utf8(env, buffer, NAPI_AUTO_LENGTH, &js_value);
-    return napi_set_named_property(env, object, name, js_value);
-}
-
-static napi_status set_string_bytes(napi_env env, napi_value object, const char* name, const char* value, size_t len) {
-    napi_value js_value = NULL;
-    napi_create_string_utf8(env, value != NULL ? value : "", len, &js_value);
-    return napi_set_named_property(env, object, name, js_value);
-}
-
-static napi_status set_bytes(napi_env env, napi_value object, const char* name, const uint8_t* value, size_t len) {
-    napi_value bytes = NULL;
-    if (make_uint8_array(env, value, len, &bytes) != 0) {
-        return napi_generic_failure;
+static void node_status_free(node_status_value* status) {
+    if (status == NULL) {
+        return;
     }
-    return napi_set_named_property(env, object, name, bytes);
+    free(status->message);
+    for (size_t index = 0; index < status->metadata_count; ++index) {
+        free(status->metadata[index].key);
+        free(status->metadata[index].value);
+    }
+    free(status->metadata);
+    memset(status, 0, sizeof(*status));
 }
 
-static napi_value legacy_request_metadata_to_js(napi_env env, const trevrpc_metadata* metadata) {
-    napi_value object = NULL;
-    if (napi_create_object(env, &object) != napi_ok) {
+static int node_make_bytes_value(napi_env env, const uint8_t* data, size_t length, napi_value* out) {
+    napi_value arraybuffer;
+    void* storage = NULL;
+    if (napi_create_arraybuffer(env, length, &storage, &arraybuffer) != napi_ok) {
+        return -ENOMEM;
+    }
+    if (length != 0 && data != NULL) {
+        memcpy(storage, data, length);
+    }
+    return napi_create_typedarray(env, napi_uint8_array, length, arraybuffer, 0, out) == napi_ok ? 0 : -ENOMEM;
+}
+
+static int node_make_metadata_value(napi_env env, const node_metadata_value* metadata, size_t count, napi_value* out) {
+    if (napi_create_object(env, out) != napi_ok) {
+        return -ENOMEM;
+    }
+    for (size_t index = 0; index < count; ++index) {
+        napi_value key;
+        napi_value value;
+        if (napi_create_string_utf8(env, metadata[index].key, NAPI_AUTO_LENGTH, &key) != napi_ok ||
+            node_make_bytes_value(env, metadata[index].value, metadata[index].value_len, &value) != 0 ||
+            napi_set_property(env, *out, key, value) != napi_ok) {
+            return -ENOMEM;
+        }
+    }
+    return 0;
+}
+
+static int node_make_metadata_entries_value(
+    napi_env env, const trevrpc_rpc_metadata_entry_v1* entries, uint32_t count, napi_value* out) {
+    if (napi_create_object(env, out) != napi_ok) {
+        return -ENOMEM;
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+        const trevrpc_rpc_metadata_entry_v1* entry = &entries[index];
+        napi_value key;
+        napi_value value;
+        char* name = calloc((size_t)entry->key_len + 1u, 1u);
+        if (name == NULL) {
+            return -ENOMEM;
+        }
+        if (entry->key_len != 0 && entry->key == NULL) {
+            free(name);
+            return -EPROTO;
+        }
+        memcpy(name, entry->key, entry->key_len);
+        int result = node_make_bytes_value(env, entry->value, (size_t)entry->value_len, &value);
+        if (result == 0 && napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &key) != napi_ok) {
+            result = -ENOMEM;
+        }
+        free(name);
+        if (result != 0 || napi_set_property(env, *out, key, value) != napi_ok) {
+            return result == 0 ? -ENOMEM : result;
+        }
+    }
+    return 0;
+}
+
+static int node_make_status_object(napi_env env, const node_status_value* status, napi_value* out) {
+    napi_value code;
+    napi_value message;
+    napi_value metadata;
+    if (napi_create_object(env, out) != napi_ok || napi_create_uint32(env, status->code, &code) != napi_ok ||
+        napi_create_string_utf8(env, status->message == NULL ? "" : status->message, NAPI_AUTO_LENGTH, &message) !=
+            napi_ok ||
+        node_make_metadata_value(env, status->metadata, status->metadata_count, &metadata) != 0 ||
+        napi_set_named_property(env, *out, "status", code) != napi_ok ||
+        napi_set_named_property(env, *out, "message", message) != napi_ok ||
+        napi_set_named_property(env, *out, "metadata", metadata) != napi_ok) {
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+static int node_reject_deferred_native(napi_env env, napi_deferred deferred, int error_code, const char* operation) {
+    napi_value message;
+    napi_value error;
+    char text[192];
+    int written = snprintf(text, sizeof(text), "%s failed (%d)", operation, error_code);
+    if (written < 0 || napi_create_string_utf8(env, text, NAPI_AUTO_LENGTH, &message) != napi_ok ||
+        napi_create_error(env, NULL, message, &error) != napi_ok) {
+        return -EIO;
+    }
+    napi_value native_code;
+    if (napi_create_int32(env, error_code, &native_code) == napi_ok) {
+        (void)napi_set_named_property(env, error, "nativeCode", native_code);
+    }
+    (void)napi_reject_deferred(env, deferred, error);
+    return 0;
+}
+
+static void node_resolve_undefined(napi_env env, napi_deferred deferred) {
+    napi_value undefined;
+    if (napi_get_undefined(env, &undefined) == napi_ok) {
+        (void)napi_resolve_deferred(env, deferred, undefined);
+    }
+}
+
+static bool node_handle_is_null_endpoint(trevrpc_rpc_endpoint_v1 value) {
+    return value.owner == 0 && value.slot == 0 && value.generation == 0;
+}
+
+static bool node_handle_is_null_call(trevrpc_rpc_call_v1 value) {
+    return value.owner == 0 && value.slot == 0 && value.generation == 0;
+}
+
+static bool node_handle_is_null_stream(trevrpc_rpc_stream_v1 value) {
+    return value.owner == 0 && value.slot == 0 && value.generation == 0;
+}
+
+typedef struct node_endpoint_config_storage {
+    trevrpc_rpc_msquic_endpoint_config_v1 config;
+    char* host;
+    char* server_name;
+    char* ca_cert_file;
+} node_endpoint_config_storage;
+
+static void node_endpoint_config_free(node_endpoint_config_storage* storage) {
+    free(storage->host);
+    free(storage->server_name);
+    free(storage->ca_cert_file);
+    memset(storage, 0, sizeof(*storage));
+}
+
+static int node_parse_endpoint_config(
+    napi_env env, napi_value options, node_endpoint_config_storage* out, bool allow_zero_port) {
+    memset(out, 0, sizeof(*out));
+    napi_valuetype type;
+    if (napi_typeof(env, options, &type) != napi_ok || type != napi_object) {
+        return -EINVAL;
+    }
+    napi_value value;
+    bool present;
+    if (node_get_named_value(env, options, "host", &value, &present) != 0 || !present ||
+        node_copy_js_string(env, value, &out->host, &(uint32_t){0}) != 0) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    uint32_t host_len = (uint32_t)strlen(out->host);
+    if (host_len == 0 || host_len > UINT32_MAX) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    uint64_t port = 0;
+    if (node_get_named_u64(env, options, "port", &port) != 0 || (!allow_zero_port && port == 0) || port > 65535) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (node_get_named_value(env, options, "serverName", &value, &present) != 0 ||
+        (present && node_copy_js_string(env, value, &out->server_name, &(uint32_t){0}) != 0)) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (out->server_name == NULL) {
+        out->server_name = strdup(out->host);
+        if (out->server_name == NULL) {
+            node_endpoint_config_free(out);
+            return -ENOMEM;
+        }
+    }
+    if (node_get_named_value(env, options, "caCertFile", &value, &present) != 0 ||
+        (present && node_copy_js_string(env, value, &out->ca_cert_file, &(uint32_t){0}) != 0)) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (trevrpc_rpc_msquic_endpoint_config_v1_init(&out->config, sizeof(out->config)) != 0) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    out->config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_CLIENT;
+    out->config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_AUTO;
+    if (node_get_named_value(env, options, "transport", &value, &present) != 0) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (present) {
+        napi_valuetype transport_type;
+        if (napi_typeof(env, value, &transport_type) != napi_ok) {
+            node_endpoint_config_free(out);
+            return -EINVAL;
+        }
+        if (transport_type == napi_string) {
+            char* transport_name = NULL;
+            uint32_t transport_len = 0;
+            if (node_copy_js_string(env, value, &transport_name, &transport_len) != 0) {
+                node_endpoint_config_free(out);
+                return -EINVAL;
+            }
+            if (strcmp(transport_name, "native") == 0) {
+                out->config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE;
+            } else if (strcmp(transport_name, "http3") == 0) {
+                out->config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3;
+            } else if (strcmp(transport_name, "webtransport") == 0) {
+                out->config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT;
+            } else if (strcmp(transport_name, "auto") != 0) {
+                free(transport_name);
+                node_endpoint_config_free(out);
+                return -EINVAL;
+            }
+            free(transport_name);
+        } else {
+            uint32_t transport = 0;
+            if (napi_get_value_uint32(env, value, &transport) != napi_ok ||
+                transport > TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT) {
+                node_endpoint_config_free(out);
+                return -EINVAL;
+            }
+            out->config.transport = transport;
+        }
+    }
+    out->config.host = out->host;
+    out->config.host_len = host_len;
+    out->config.port = (uint16_t)port;
+    out->config.server_name = out->server_name;
+    out->config.server_name_len = (uint32_t)strlen(out->server_name);
+    out->config.ca_cert_file = out->ca_cert_file;
+    out->config.ca_cert_file_len = out->ca_cert_file == NULL ? 0 : (uint32_t)strlen(out->ca_cert_file);
+    bool skip_validation = false;
+    if (node_get_named_bool(env, options, "skipCertificateValidation", &skip_validation, &present) != 0) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (skip_validation) {
+        out->config.flags &= ~TREVRPC_RPC_MSQUIC_VERIFY_PEER;
+    } else {
+        out->config.flags |= TREVRPC_RPC_MSQUIC_VERIFY_PEER;
+    }
+    uint64_t idle_timeout = 0;
+    if (node_get_named_u64(env, options, "idleTimeoutMs", &idle_timeout) == 0) {
+        out->config.max_idle_timeout_ms = idle_timeout;
+    }
+    return 0;
+}
+
+static void node_receive_item_free(node_receive_item* item) {
+    if (item == NULL) {
+        return;
+    }
+    trevrpc_rpc_receive_release(item->receive);
+    free(item);
+}
+
+static void node_call_clear_receives(node_call* call) {
+    node_receive_item* item = call->receive_head;
+    while (item != NULL) {
+        node_receive_item* next = item->next;
+        node_receive_item_free(item);
+        item = next;
+    }
+    call->receive_head = NULL;
+    call->receive_tail = NULL;
+    if (call->unary_message != NULL) {
+        trevrpc_rpc_receive_release(call->unary_message);
+        call->unary_message = NULL;
+    }
+}
+
+static void node_call_dispose_buffers(node_call* call) {
+    if (call == NULL) {
+        return;
+    }
+    node_call_clear_receives(call);
+    node_receive_waiter* waiter = call->waiter_head;
+    while (waiter != NULL) {
+        node_receive_waiter* next = waiter->next;
+        free(waiter);
+        waiter = next;
+    }
+    call->waiter_head = NULL;
+    call->waiter_tail = NULL;
+    node_send_batch* batch = call->send_head;
+    call->send_head = NULL;
+    call->send_tail = NULL;
+    while (batch != NULL) {
+        node_send_batch* next = batch->next;
+        batch->next = NULL;
+        node_send_batch_free(batch);
+        batch = next;
+    }
+    call->send_inflight = NULL;
+    node_status_free(&call->status);
+}
+
+static int node_call_append_receive(node_call* call, trevrpc_rpc_receive* receive) {
+    node_receive_item* item = calloc(1, sizeof(*item));
+    if (item == NULL) {
+        trevrpc_rpc_receive_release(receive);
+        return -ENOMEM;
+    }
+    item->receive = receive;
+    if (call->receive_tail == NULL) {
+        call->receive_head = item;
+    } else {
+        call->receive_tail->next = item;
+    }
+    call->receive_tail = item;
+    return 0;
+}
+
+static node_receive_item* node_call_take_receive(node_call* call) {
+    node_receive_item* item = call->receive_head;
+    if (item == NULL) {
         return NULL;
     }
-    if (metadata == NULL) {
-        return object;
+    call->receive_head = item->next;
+    if (call->receive_head == NULL) {
+        call->receive_tail = NULL;
     }
-
-    for (size_t i = 0; i < metadata->entries_len; i++) {
-        const trevrpc_metadata_entry* entry = &metadata->entries[i];
-        napi_value key = NULL;
-        napi_value value = NULL;
-        if (make_uint8_array(env, entry->value, entry->value_len, &value) != 0 ||
-            napi_create_string_utf8(env, entry->key, entry->key_len, &key) != napi_ok ||
-            napi_set_property(env, object, key, value) != napi_ok) {
-            return NULL;
-        }
-    }
-    return object;
+    item->next = NULL;
+    return item;
 }
 
-static int metadata_from_js(napi_env env, napi_value value, trevrpc_metadata* metadata) {
-    napi_valuetype type = napi_undefined;
-    napi_typeof(env, value, &type);
-    if (type == napi_undefined || type == napi_null) {
-        return 0;
-    }
-    if (type != napi_object) {
-        return -EINVAL;
-    }
-
-    napi_value names = NULL;
-    uint32_t length = 0;
-    if (napi_get_property_names(env, value, &names) != napi_ok ||
-        napi_get_array_length(env, names, &length) != napi_ok) {
-        return -EINVAL;
-    }
-    for (uint32_t i = 0; i < length; i++) {
-        napi_value key_value = NULL;
-        napi_value entry_value = NULL;
-        char* key = NULL;
-        uint8_t* bytes = NULL;
-        size_t bytes_len = 0;
-        int err = 0;
-        if (napi_get_element(env, names, i, &key_value) != napi_ok ||
-            napi_get_property(env, value, key_value, &entry_value) != napi_ok) {
-            return -EINVAL;
+static void node_call_reject_waiters(node_call* call, int error_code, const char* operation) {
+    node_receive_waiter* waiter = call->waiter_head;
+    call->waiter_head = NULL;
+    call->waiter_tail = NULL;
+    while (waiter != NULL) {
+        node_receive_waiter* next = waiter->next;
+        if (node_runtime_napi_legal(call->runtime)) {
+            (void)node_reject_deferred_native(call->runtime->env, waiter->deferred, error_code, operation);
         }
-        key = copy_string_value(env, key_value);
-        if (key == NULL) {
+        free(waiter);
+        waiter = next;
+    }
+}
+
+static void node_call_delete_wrapper_ref(node_call* call) {
+    if (call != NULL && call->wrapper_ref != NULL && node_runtime_napi_legal(call->runtime)) {
+        (void)napi_delete_reference(call->runtime->env, call->wrapper_ref);
+        call->wrapper_ref = NULL;
+    }
+}
+
+static void node_client_delete_wrapper_ref(node_client* client) {
+    if (client != NULL && client->wrapper_ref != NULL && node_runtime_napi_legal(client->runtime)) {
+        (void)napi_delete_reference(client->runtime->env, client->wrapper_ref);
+        client->wrapper_ref = NULL;
+    }
+}
+
+static void node_call_clear_open_deferred(node_call* call) {
+    if (call == NULL || call->runtime == NULL) {
+        return;
+    }
+    for (node_operation* operation = call->runtime->operations; operation != NULL; operation = operation->next) {
+        if (operation->context == call && operation->action == NODE_OPERATION_CALL_OPEN) {
+            operation->has_deferred = false;
+            operation->deferred = NULL;
+        }
+    }
+}
+
+static void node_client_maybe_release(node_client* client) {
+    if (client == NULL || !client->closed || client->subject == NULL || client->runtime == NULL ||
+        client->runtime->rpc == NULL) {
+        return;
+    }
+    node_runtime* runtime = client->runtime;
+    int result = trevrpc_rpc_endpoint_release(runtime->rpc, client->endpoint);
+    if (result != 0 && result != -ESTALE) {
+        client->release_retry_pending = true;
+        node_runtime_start_failure_progress(runtime);
+        return;
+    }
+    node_client_detach_cancellation(client);
+    node_subject* subject = client->subject;
+    client->subject = NULL;
+    client->release_retry_pending = false;
+    node_registry_remove(runtime, subject);
+    node_runtime_update_liveness(runtime);
+    client->runtime = NULL;
+    if (!client->wrapper_alive) {
+        free(client);
+    }
+}
+
+static void node_call_settle_terminal(node_call* call, int error_code, const char* operation) {
+    if (call == NULL) {
+        return;
+    }
+    if (call->terminal_settled) {
+        return;
+    }
+    call->terminal_settled = true;
+    node_call_delete_wrapper_ref(call);
+    call->failed = true;
+    call->receive_finished = true;
+    call->failure_code = error_code == 0 ? -EIO : error_code;
+    node_call_reject_waiters(call, call->failure_code, operation);
+    node_send_batch* batch = call->send_head;
+    node_send_batch* previous = NULL;
+    while (batch != NULL) {
+        node_send_batch* next = batch->next;
+        if (batch != call->send_inflight) {
+            if (batch->has_deferred && node_runtime_napi_legal(call->runtime)) {
+                (void)node_reject_deferred_native(call->runtime->env, batch->deferred, call->failure_code, operation);
+            }
+            if (previous == NULL) {
+                call->send_head = next;
+            } else {
+                previous->next = next;
+            }
+            node_send_batch_free(batch);
+        } else {
+            previous = batch;
+        }
+        batch = next;
+    }
+    call->send_tail = NULL;
+    for (batch = call->send_head; batch != NULL; batch = batch->next) {
+        call->send_tail = batch;
+    }
+    if (!call->response_settled && call->has_response_deferred) {
+        if (node_runtime_napi_legal(call->runtime)) {
+            (void)node_reject_deferred_native(
+                call->runtime->env, call->response_deferred, call->failure_code, operation);
+        }
+        call->has_response_deferred = false;
+        call->response_deferred = NULL;
+    }
+}
+
+static int node_call_receive_info(
+    node_runtime* runtime, trevrpc_rpc_receive* receive, trevrpc_rpc_receive_info_v1* out_info) {
+    int result = trevrpc_rpc_receive_info_v1_init(out_info, sizeof(*out_info));
+    if (result == 0) {
+        result = trevrpc_rpc_receive_get_info_v1(receive, out_info);
+    }
+    (void)runtime;
+    return result;
+}
+
+static int node_make_body_from_receive(napi_env env,
+    trevrpc_rpc_receive* receive,
+    const trevrpc_rpc_receive_info_v1* info,
+    napi_value* out,
+    bool* transferred) {
+    *transferred = false;
+    if (node_test_flag("TREVRPC_NODE_FAIL_BODY_CONVERSION")) {
+        trevrpc_rpc_receive_release(receive);
+        return -EPROTO;
+    }
+    if (info->data_len == 0) {
+        if (node_make_bytes_value(env, NULL, 0, out) != 0) {
+            trevrpc_rpc_receive_release(receive);
             return -ENOMEM;
         }
-        err = copy_bytes_arg(env, entry_value, &bytes, &bytes_len);
-        if (err == 0) {
-            err = trevrpc_metadata_set(metadata, key, strlen(key), bytes, bytes_len);
-        }
-        free(key);
-        free(bytes);
-        if (err != 0) {
-            return err;
-        }
-    }
-    return 0;
-}
-
-static int parse_uint64_decimal(const char* value, uint64_t* out) {
-    if (value == NULL || value[0] == '\0') {
-        return -EINVAL;
-    }
-    uint64_t result = 0;
-    for (const char* cursor = value; *cursor != '\0'; cursor++) {
-        if (*cursor < '0' || *cursor > '9') {
-            return -EINVAL;
-        }
-        uint64_t digit = (uint64_t)(*cursor - '0');
-        if (result > (UINT64_MAX - digit) / 10u) {
-            return -EOVERFLOW;
-        }
-        result = result * 10u + digit;
-    }
-    *out = result;
-    return 0;
-}
-
-static int uint64_from_js(napi_env env, napi_value value, uint64_t* out) {
-    napi_valuetype type = napi_undefined;
-    napi_typeof(env, value, &type);
-    if (type == napi_undefined || type == napi_null) {
-        *out = 0;
+        trevrpc_rpc_receive_release(receive);
         return 0;
     }
-    if (type == napi_number) {
-        double number = 0;
-        if (napi_get_value_double(env, value, &number) != napi_ok || !(number >= 0) || number > (double)UINT64_MAX) {
-            return -EINVAL;
+    if (info->data == NULL || info->data_len > SIZE_MAX) {
+        trevrpc_rpc_receive_release(receive);
+        return -EPROTO;
+    }
+    node_external_receive_owner* owner = calloc(1, sizeof(*owner));
+    if (owner != NULL) {
+        napi_value arraybuffer;
+        owner->data = malloc((size_t)info->data_len);
+        if (owner->data != NULL) {
+            memcpy(owner->data, info->data, (size_t)info->data_len);
         }
-        *out = (uint64_t)number;
-        return 0;
-    }
-
-    napi_value string_value = NULL;
-    if (napi_coerce_to_string(env, value, &string_value) != napi_ok) {
-        return -EINVAL;
-    }
-    char* string = copy_string_value(env, string_value);
-    if (string == NULL) {
-        return -ENOMEM;
-    }
-    int err = parse_uint64_decimal(string, out);
-    free(string);
-    return err;
-}
-
-static int uint32_property_from_js(napi_env env, napi_value object, const char* name, uint32_t* value) {
-    bool has_property = false;
-    napi_has_named_property(env, object, name, &has_property);
-    if (!has_property) {
-        return 0;
-    }
-    napi_value property = NULL;
-    napi_get_named_property(env, object, name, &property);
-    return napi_get_value_uint32(env, property, value) == napi_ok ? 0 : -EINVAL;
-}
-
-static int copy_required_string_property(napi_env env, napi_value object, const char* name, char** out) {
-    bool has_property = false;
-    napi_has_named_property(env, object, name, &has_property);
-    if (!has_property) {
-        return -EINVAL;
-    }
-    napi_value property = NULL;
-    napi_get_named_property(env, object, name, &property);
-    *out = copy_string_value(env, property);
-    return *out == NULL ? -ENOMEM : 0;
-}
-
-static int request_body_from_js(napi_env env, napi_value object, uint8_t** body, size_t* body_len) {
-    bool has_property = false;
-    napi_has_named_property(env, object, "body", &has_property);
-    if (!has_property) {
-        *body = NULL;
-        *body_len = 0;
-        return 0;
-    }
-    napi_value property = NULL;
-    napi_get_named_property(env, object, "body", &property);
-    return copy_bytes_arg(env, property, body, body_len);
-}
-
-static int request_metadata_from_js(napi_env env, napi_value object, trevrpc_metadata* metadata) {
-    bool has_property = false;
-    napi_has_named_property(env, object, "metadata", &has_property);
-    if (!has_property) {
-        return 0;
-    }
-    napi_value property = NULL;
-    napi_get_named_property(env, object, "metadata", &property);
-    return metadata_from_js(env, property, metadata);
-}
-
-static int request_timeout_from_js(napi_env env, napi_value object, uint64_t* timeout_nanos) {
-    bool has_property = false;
-    napi_has_named_property(env, object, "timeoutNanos", &has_property);
-    if (!has_property) {
-        *timeout_nanos = 0;
-        return 0;
-    }
-    napi_value property = NULL;
-    napi_get_named_property(env, object, "timeoutNanos", &property);
-    return uint64_from_js(env, property, timeout_nanos);
-}
-
-static int client_request_from_js(napi_env env,
-    napi_value value,
-    uint32_t default_kind,
-    trevrpc_request* request,
-    char** service,
-    char** method,
-    uint8_t** body) {
-    napi_valuetype type = napi_undefined;
-    napi_typeof(env, value, &type);
-    if (type != napi_object) {
-        return -EINVAL;
-    }
-
-    memset(request, 0, sizeof(*request));
-    request->kind = default_kind;
-    request->version = TREVRPC_WIRE_VERSION;
-
-    int err = copy_required_string_property(env, value, "service", service);
-    if (err == 0) {
-        request->service = *service;
-        request->service_len = strlen(*service);
-        err = copy_required_string_property(env, value, "method", method);
-    }
-    if (err == 0) {
-        request->method = *method;
-        request->method_len = strlen(*method);
-        err = request_body_from_js(env, value, body, &request->body_len);
-    }
-    if (err == 0) {
-        request->body = *body;
-        err = request_metadata_from_js(env, value, &request->metadata);
-    }
-    if (err == 0) {
-        err = uint32_property_from_js(env, value, "kind", &request->kind);
-    }
-    if (err == 0) {
-        err = uint32_property_from_js(env, value, "version", &request->version);
-    }
-    if (err == 0) {
-        err = request_timeout_from_js(env, value, &request->timeout_nanos);
-    }
-    return err;
-}
-
-static napi_value request_to_js(napi_env env, const trevrpc_request* request) {
-    napi_value object = NULL;
-    napi_create_object(env, &object);
-    if (request == NULL) {
-        return object;
-    }
-    set_string_bytes(env, object, "service", request->service, request->service_len);
-    set_string_bytes(env, object, "method", request->method, request->method_len);
-    set_bytes(env, object, "body", request->body, request->body_len);
-    set_uint32(env, object, "kind", request->kind);
-    set_uint32(env, object, "version", request->version);
-    if (request->timeout_nanos > 0) {
-        set_uint64_string(env, object, "timeoutNanos", request->timeout_nanos);
-    }
-    napi_value metadata = legacy_request_metadata_to_js(env, &request->metadata);
-    napi_set_named_property(env, object, "metadata", metadata);
-    return object;
-}
-
-static int server_response_from_js(napi_env env, napi_value value, call_response_work* work) {
-    work->status = TREVRPC_STATUS_OK;
-    napi_valuetype type = napi_undefined;
-    if (napi_typeof(env, value, &type) != napi_ok) {
-        return -EINVAL;
-    }
-    if (type == napi_undefined || type == napi_null) {
-        return 0;
-    }
-    if (type != napi_object) {
-        return -EINVAL;
-    }
-
-    work->status = get_uint32_property(env, value, "status", TREVRPC_STATUS_OK);
-
-    bool has_property = false;
-    if (napi_has_named_property(env, value, "message", &has_property) != napi_ok) {
-        return -EINVAL;
-    }
-    if (has_property) {
-        napi_value message = NULL;
-        if (napi_get_named_property(env, value, "message", &message) != napi_ok) {
-            return -EINVAL;
+        if (owner->data != NULL &&
+            napi_create_external_arraybuffer(
+                env, owner->data, (size_t)info->data_len, node_external_receive_finalizer, owner, &arraybuffer) ==
+                napi_ok) {
+            if (napi_create_typedarray(env, napi_uint8_array, (size_t)info->data_len, arraybuffer, 0, out) == napi_ok) {
+                trevrpc_rpc_receive_release(receive);
+                owner->receive = NULL;
+                *transferred = true;
+                return 0;
+            }
+            /* The ArrayBuffer now owns owner through its finalizer.  Keep that
+             * owner alive while returning the independent copied fallback. */
+            int result = node_make_bytes_value(env, owner->data, (size_t)info->data_len, out);
+            trevrpc_rpc_receive_release(receive);
+            owner->receive = NULL;
+            return result;
         }
-        work->message = copy_string_value(env, message);
-        if (work->message == NULL) {
-            return -ENOMEM;
-        }
-        work->message_len = strlen(work->message);
+        free(owner->data);
+        free(owner);
     }
-
-    if (napi_has_named_property(env, value, "body", &has_property) != napi_ok) {
-        return -EINVAL;
-    }
-    if (has_property) {
-        napi_value body = NULL;
-        if (napi_get_named_property(env, value, "body", &body) != napi_ok) {
-            return -EINVAL;
-        }
-        int err = copy_bytes_arg(env, body, &work->body, &work->body_len);
-        if (err != 0) {
-            return err;
-        }
-    }
-
-    if (napi_has_named_property(env, value, "metadata", &has_property) != napi_ok) {
-        return -EINVAL;
-    }
-    if (has_property) {
-        napi_value metadata = NULL;
-        if (napi_get_named_property(env, value, "metadata", &metadata) != napi_ok) {
-            return -EINVAL;
-        }
-        return metadata_from_js(env, metadata, &work->metadata);
-    }
-    return 0;
+    int result = node_make_bytes_value(env, info->data, (size_t)info->data_len, out);
+    trevrpc_rpc_receive_release(receive);
+    return result;
 }
 
-typedef size_t (*inbound_metadata_count_fn)(const void* value);
-typedef int (*inbound_metadata_at_fn)(
-    const void* value, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* entry_value);
-typedef int (*inbound_body_get_fn)(const void* value, trevrpc_bytes_view* body);
-typedef int (*inbound_body_take_fn)(void* value, trevrpc_body_owner** owner);
-
-static size_t inbound_response_metadata_count(const void* value) {
-    return trevrpc_inbound_response_metadata_count(value);
-}
-
-static int inbound_response_metadata_at(
-    const void* value, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* entry_value) {
-    return trevrpc_inbound_response_metadata_at(value, index, key, entry_value);
-}
-
-static int inbound_response_get_body(const void* value, trevrpc_bytes_view* body) {
-    return trevrpc_inbound_response_get_body(value, body);
-}
-
-static int inbound_response_take_body(void* value, trevrpc_body_owner** owner) {
-    return trevrpc_inbound_response_take_body(value, owner);
-}
-
-static size_t inbound_stream_frame_metadata_count(const void* value) {
-    return trevrpc_inbound_stream_frame_metadata_count(value);
-}
-
-static int inbound_stream_frame_metadata_at(
-    const void* value, size_t index, trevrpc_bytes_view* key, trevrpc_bytes_view* entry_value) {
-    return trevrpc_inbound_stream_frame_metadata_at(value, index, key, entry_value);
-}
-
-static int inbound_stream_frame_get_body(const void* value, trevrpc_bytes_view* body) {
-    return trevrpc_inbound_stream_frame_get_body(value, body);
-}
-
-static int inbound_stream_frame_take_body(void* value, trevrpc_body_owner** owner) {
-    return trevrpc_inbound_stream_frame_take_body(value, owner);
-}
-
-static int inbound_metadata_to_js(napi_env env,
-    const void* value,
-    inbound_metadata_count_fn count_fn,
-    inbound_metadata_at_fn at_fn,
+static int node_make_message_frame(napi_env env,
+    node_call* call,
+    trevrpc_rpc_receive* receive,
+    const trevrpc_rpc_receive_info_v1* info,
     napi_value* out) {
-    *out = NULL;
-    napi_value object = NULL;
-    if (napi_create_object(env, &object) != napi_ok) {
-        return -ENOMEM;
+    if (call->status_seen) {
+        trevrpc_rpc_receive_release(receive);
+        return -EPROTO;
     }
-    size_t count = count_fn(value);
-    for (size_t i = 0; i < count; i++) {
-        trevrpc_bytes_view key_view = {0};
-        trevrpc_bytes_view value_view = {0};
-        int err = at_fn(value, i, &key_view, &value_view);
-        if (err != 0) {
-            return err;
-        }
-        if ((key_view.data == NULL && key_view.len > 0) || (value_view.data == NULL && value_view.len > 0)) {
-            return -EINVAL;
-        }
-        napi_value key = NULL;
-        napi_value entry_value = NULL;
-        if (napi_create_string_utf8(env, (const char*)key_view.data, key_view.len, &key) != napi_ok) {
-            return -ENOMEM;
-        }
-        err = make_uint8_array(env, value_view.data, value_view.len, &entry_value);
-        if (err != 0) {
-            return err;
-        }
-        if (napi_set_property(env, object, key, entry_value) != napi_ok) {
-            return -ENOMEM;
-        }
+    call->message_seen = true;
+    napi_value kind;
+    napi_value body;
+    bool transferred = false;
+    int result = node_make_body_from_receive(env, receive, info, &body, &transferred);
+    (void)transferred;
+    if (result != 0) {
+        return result;
     }
-    *out = object;
-    return 0;
-}
-
-static int inbound_body_to_js(
-    napi_env env, void* value, inbound_body_get_fn get_fn, inbound_body_take_fn take_fn, napi_value* out) {
-    trevrpc_bytes_view borrowed_body = {0};
-    int err = get_fn(value, &borrowed_body);
-    if (err != 0) {
-        return err;
-    }
-    if (borrowed_body.data == NULL && borrowed_body.len > 0) {
-        return -EINVAL;
-    }
-
-    trevrpc_body_owner* owner = NULL;
-    err = take_fn(value, &owner);
-    if (err == -ENOMEM) {
-        return make_uint8_array(env, borrowed_body.data, borrowed_body.len, out);
-    }
-    if (err != 0) {
-        return err;
-    }
-    return body_owner_to_js(env, borrowed_body, &owner, out);
-}
-
-static int set_uint32_checked(napi_env env, napi_value object, const char* name, uint32_t value) {
-    napi_value property = NULL;
-    if (napi_create_uint32(env, value, &property) != napi_ok ||
-        napi_set_named_property(env, object, name, property) != napi_ok) {
+    if (napi_create_object(env, out) != napi_ok || napi_create_uint32(env, 0, &kind) != napi_ok ||
+        napi_set_named_property(env, *out, "kind", kind) != napi_ok ||
+        napi_set_named_property(env, *out, "body", body) != napi_ok) {
         return -ENOMEM;
     }
     return 0;
 }
 
-static int set_string_checked(
-    napi_env env, napi_value object, const char* name, const uint8_t* value, size_t value_len) {
-    if (value == NULL && value_len > 0) {
-        return -EINVAL;
+static int node_make_status_frame(napi_env env,
+    node_call* call,
+    trevrpc_rpc_receive* receive,
+    const trevrpc_rpc_receive_info_v1* info,
+    napi_value* out) {
+    if (call->status_seen) {
+        trevrpc_rpc_receive_release(receive);
+        return -EPROTO;
     }
-    napi_value property = NULL;
-    if (napi_create_string_utf8(env, (const char*)(value != NULL ? value : (const uint8_t*)""), value_len, &property) !=
-            napi_ok ||
-        napi_set_named_property(env, object, name, property) != napi_ok) {
+    node_status_value status;
+    int result = node_copy_receive_status(info, &status);
+    trevrpc_rpc_receive_release(receive);
+    if (result != 0) {
+        return result;
+    }
+    if (napi_create_object(env, out) != napi_ok) {
+        node_status_free(&status);
         return -ENOMEM;
     }
+    napi_value kind;
+    napi_value status_object;
+    if (napi_create_uint32(env, 1, &kind) != napi_ok || napi_set_named_property(env, *out, "kind", kind) != napi_ok ||
+        node_make_status_object(env, &status, &status_object) != 0) {
+        node_status_free(&status);
+        return -ENOMEM;
+    }
+    const char* names[] = {"status", "message", "metadata"};
+    for (size_t index = 0; index < 3; ++index) {
+        napi_value property;
+        if (napi_get_named_property(env, status_object, names[index], &property) != napi_ok ||
+            napi_set_named_property(env, *out, names[index], property) != napi_ok) {
+            node_status_free(&status);
+            return -ENOMEM;
+        }
+    }
+    node_status_free(&call->status);
+    call->status = status;
+    call->status_seen = true;
     return 0;
 }
 
-static int inbound_response_to_js(napi_env env, trevrpc_inbound_response* response, napi_value* out) {
-    *out = NULL;
-    if (response == NULL) {
-        return -EINVAL;
-    }
-    uint32_t status = TREVRPC_STATUS_UNKNOWN;
-    trevrpc_bytes_view message = {0};
-    int err = trevrpc_inbound_response_get_status(response, &status);
-    if (err == 0) {
-        err = trevrpc_inbound_response_get_message(response, &message);
-    }
-    if (err != 0) {
-        return err;
-    }
-
-    napi_value object = NULL;
-    if (napi_create_object(env, &object) != napi_ok) {
-        return -ENOMEM;
-    }
-    err = set_uint32_checked(env, object, "status", status);
-    if (err == 0) {
-        err = set_string_checked(env, object, "message", message.data, message.len);
-    }
-    napi_value metadata = NULL;
-    if (err == 0) {
-        err = inbound_metadata_to_js(
-            env, response, inbound_response_metadata_count, inbound_response_metadata_at, &metadata);
-    }
-    if (err == 0 && napi_set_named_property(env, object, "metadata", metadata) != napi_ok) {
-        err = -ENOMEM;
-    }
-    napi_value body = NULL;
-    if (err == 0) {
-        err = inbound_body_to_js(env, response, inbound_response_get_body, inbound_response_take_body, &body);
-    }
-    if (err == 0 && napi_set_named_property(env, object, "body", body) != napi_ok) {
-        err = -ENOMEM;
-    }
-    if (err == 0) {
-        *out = object;
-    }
-    return err;
-}
-
-static int inbound_stream_frame_to_js(napi_env env, trevrpc_inbound_stream_frame* frame, napi_value* out) {
-    *out = NULL;
-    if (frame == NULL) {
-        return -EINVAL;
-    }
-    uint32_t kind = 0;
-    uint32_t status = TREVRPC_STATUS_UNKNOWN;
-    trevrpc_bytes_view message = {0};
-    int err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);
-    if (err == 0) {
-        err = trevrpc_inbound_stream_frame_get_status(frame, &status);
-    }
-    if (err == 0) {
-        err = trevrpc_inbound_stream_frame_get_message(frame, &message);
-    }
-    if (err != 0) {
-        return err;
-    }
-
-    napi_value object = NULL;
-    if (napi_create_object(env, &object) != napi_ok) {
-        return -ENOMEM;
-    }
-    err = set_uint32_checked(env, object, "kind", kind);
-    if (err == 0) {
-        err = set_uint32_checked(env, object, "status", status);
-    }
-    if (err == 0) {
-        err = set_string_checked(env, object, "message", message.data, message.len);
-    }
-    napi_value metadata = NULL;
-    if (err == 0) {
-        err = inbound_metadata_to_js(
-            env, frame, inbound_stream_frame_metadata_count, inbound_stream_frame_metadata_at, &metadata);
-    }
-    if (err == 0 && napi_set_named_property(env, object, "metadata", metadata) != napi_ok) {
-        err = -ENOMEM;
-    }
-    napi_value body = NULL;
-    if (err == 0) {
-        err = inbound_body_to_js(env, frame, inbound_stream_frame_get_body, inbound_stream_frame_take_body, &body);
-    }
-    if (err == 0 && napi_set_named_property(env, object, "body", body) != napi_ok) {
-        err = -ENOMEM;
-    }
-    if (err == 0) {
-        *out = object;
-    }
-    return err;
-}
-
-static void inbound_stream_frame_list_reset(trevrpc_inbound_stream_frame** frames, size_t frames_len) {
-    for (size_t i = 0; i < frames_len; i++) {
-        trevrpc_inbound_stream_frame_release(frames[i]);
-    }
-    free(frames);
-}
-
-static int inbound_stream_frame_list_append(trevrpc_inbound_stream_frame*** frames,
-    size_t* frames_len,
-    size_t* frames_cap,
-    trevrpc_inbound_stream_frame* frame) {
-    if (*frames_len == *frames_cap) {
-        size_t next_cap = *frames_cap == 0 ? 4 : *frames_cap * 2;
-        if (next_cap < *frames_cap || next_cap > TREV_NODE_RECV_MANY_LIMIT) {
-            next_cap = TREV_NODE_RECV_MANY_LIMIT;
-        }
-        if (*frames_len == next_cap) {
-            return -ENOMEM;
-        }
-        trevrpc_inbound_stream_frame** next = realloc(*frames, next_cap * sizeof(**frames));
-        if (next == NULL) {
-            return -ENOMEM;
-        }
-        *frames = next;
-        *frames_cap = next_cap;
-    }
-    (*frames)[(*frames_len)++] = frame;
-    return 0;
-}
-
-static int recv_many_ready_from_stream(trevrpc_stream* stream,
-    size_t max_frames,
-    trevrpc_inbound_stream_frame*** frames,
-    size_t* frames_len,
-    size_t* frames_cap,
-    bool* eof,
-    int* ready,
-    uint64_t wait_started_nanos) {
-    trevrpc_inbound_stream_frame* frame = NULL;
-    int err = trevrpc_stream_recv_inbound_ready_since(stream, &frame, ready, wait_started_nanos);
-    if (err != 0) {
-        return err;
-    }
-    if (!*ready) {
+static int node_call_fetch_receives(node_call* call) {
+    if (!call->ready || call->receive_finished || call->failed) {
         return 0;
     }
-    if (frame == NULL) {
-        *eof = true;
-        return 0;
-    }
-
-    uint32_t kind = 0;
-    err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);
-    if (err != 0) {
-        trevrpc_inbound_stream_frame_release(frame);
-        return err;
-    }
-    err = inbound_stream_frame_list_append(frames, frames_len, frames_cap, frame);
-    if (err != 0) {
-        trevrpc_inbound_stream_frame_release(frame);
-        return err;
-    }
-    if (kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
-        return 0;
-    }
-
-    while (*frames_len < max_frames) {
-        int next_ready = 0;
-        frame = NULL;
-        err = trevrpc_stream_recv_inbound_ready(stream, &frame, &next_ready);
-        if (err != 0) {
-            return err;
-        }
-        if (!next_ready) {
+    for (;;) {
+        trevrpc_rpc_receive* receive = NULL;
+        int result = trevrpc_rpc_stream_receive(call->runtime->rpc, call->stream, &receive);
+        if (result == -EAGAIN) {
             return 0;
         }
-        if (frame == NULL) {
-            *eof = true;
-            return 0;
+        if (result != 0 || receive == NULL) {
+            int error = result == 0 ? -EPROTO : result;
+            bool cancellation_requested = false;
+            if (call->cancellation.owner != 0 || call->cancellation.slot != 0 || call->cancellation.generation != 0) {
+                node_subject* cancellation_subject =
+                    node_registry_find(&call->runtime->cancellations, node_key_from_cancellation(call->cancellation));
+                cancellation_requested = cancellation_subject != NULL && cancellation_subject->cancel_submitted;
+            }
+            if (error == -EPIPE && call->stream_closed && !cancellation_requested &&
+                (call->client == NULL || !call->client->invalidated)) {
+                return 0;
+            }
+            return error;
         }
-        err = trevrpc_inbound_stream_frame_get_kind(frame, &kind);
-        if (err != 0) {
-            trevrpc_inbound_stream_frame_release(frame);
-            return err;
-        }
-        err = inbound_stream_frame_list_append(frames, frames_len, frames_cap, frame);
-        if (err != 0) {
-            trevrpc_inbound_stream_frame_release(frame);
-            return err;
-        }
-        if (kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
-            return 0;
+        result = node_call_append_receive(call, receive);
+        if (result != 0) {
+            return result;
         }
     }
-    return 0;
 }
 
-static int inbound_stream_frame_list_to_js(
-    napi_env env, trevrpc_inbound_stream_frame** frames, size_t frames_len, bool eof, napi_value* out) {
-    *out = NULL;
-    napi_value array = NULL;
-    if (napi_create_array_with_length(env, frames_len + (eof ? 1 : 0), &array) != napi_ok) {
+static void node_call_fail(node_call* call, int error_code, const char* operation) {
+    if (call == NULL) {
+        return;
+    }
+    node_call_settle_terminal(call, error_code, operation);
+    call->close_abort = true;
+    node_call_request_close(call);
+}
+
+static int node_call_make_unary_response(node_call* call, napi_value* out) {
+    napi_env env = call->runtime->env;
+    if (napi_create_object(env, out) != napi_ok) {
         return -ENOMEM;
     }
-    for (size_t i = 0; i < frames_len; i++) {
-        napi_value value = NULL;
-        int err = inbound_stream_frame_to_js(env, frames[i], &value);
-        if (err != 0) {
-            return err;
-        }
-        if (napi_set_element(env, array, (uint32_t)i, value) != napi_ok) {
+    napi_value status_object;
+    if (node_make_status_object(env, &call->status, &status_object) != 0) {
+        return -ENOMEM;
+    }
+    const char* names[] = {"status", "message", "metadata"};
+    for (size_t index = 0; index < 3; ++index) {
+        napi_value property;
+        if (napi_get_named_property(env, status_object, names[index], &property) != napi_ok ||
+            napi_set_named_property(env, *out, names[index], property) != napi_ok) {
             return -ENOMEM;
         }
     }
-    if (eof) {
-        napi_value null_value = NULL;
-        if (napi_get_null(env, &null_value) != napi_ok ||
-            napi_set_element(env, array, (uint32_t)frames_len, null_value) != napi_ok) {
-            return -ENOMEM;
+    napi_value body;
+    if (call->unary_message != NULL) {
+        trevrpc_rpc_receive_info_v1 info;
+        int result = node_call_receive_info(call->runtime, call->unary_message, &info);
+        if (result != 0) {
+            trevrpc_rpc_receive_release(call->unary_message);
+            call->unary_message = NULL;
+            return result;
         }
+        bool transferred = false;
+        result = node_make_body_from_receive(env, call->unary_message, &info, &body, &transferred);
+        call->unary_message = NULL;
+        if (result != 0) {
+            return result;
+        }
+    } else if (node_make_bytes_value(env, NULL, 0, &body) != 0) {
+        return -ENOMEM;
     }
-    *out = array;
+    if (napi_set_named_property(env, *out, "body", body) != napi_ok) {
+        return -ENOMEM;
+    }
     return 0;
 }
 
-static int inbound_stream_body_batch_to_js(
-    napi_env env, trevrpc_inbound_stream_frame** frames, size_t frames_len, bool eof, napi_value* out) {
-    *out = NULL;
-    if (frames_len == 0 && eof) {
-        return napi_get_null(env, out) == napi_ok ? 0 : -ENOMEM;
-    }
-
-    size_t body_count = 0;
-    trevrpc_inbound_stream_frame* terminal = NULL;
-    uint32_t terminal_kind = 0;
-    for (size_t i = 0; i < frames_len; i++) {
-        uint32_t kind = 0;
-        int err = trevrpc_inbound_stream_frame_get_kind(frames[i], &kind);
-        if (err != 0) {
-            return err;
+static int node_call_process_unary(node_call* call) {
+    while (call->receive_head != NULL) {
+        node_receive_item* item = node_call_take_receive(call);
+        trevrpc_rpc_receive_info_v1 info;
+        int result = node_call_receive_info(call->runtime, item->receive, &info);
+        if (result != 0) {
+            node_receive_item_free(item);
+            return result;
         }
-        if (kind != TREVRPC_STREAM_FRAME_KIND_MESSAGE) {
-            terminal = frames[i];
-            terminal_kind = kind;
+        if (info.kind == TREVRPC_RPC_RECEIVE_MESSAGE || info.kind == TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE) {
+            if (call->status_seen || call->message_seen) {
+                node_receive_item_free(item);
+                return -EPROTO;
+            }
+            result = node_copy_receive_status(&info, &call->status);
+            if (result != 0) {
+                node_receive_item_free(item);
+                return result;
+            }
+            call->status_seen = true;
+            call->message_seen = true;
+            call->unary_message = item->receive;
+            item->receive = NULL;
+            free(item);
+        } else if (info.kind == TREVRPC_RPC_RECEIVE_STATUS) {
+            if (call->status_seen) {
+                node_receive_item_free(item);
+                return -EPROTO;
+            }
+            result = node_copy_receive_status(&info, &call->status);
+            node_receive_item_free(item);
+            if (result != 0) {
+                return result;
+            }
+            call->status_seen = true;
+        } else {
+            node_receive_item_free(item);
+            return -EPROTO;
+        }
+    }
+    if (!call->fin_seen || call->response_settled || !call->status_seen) {
+        return 0;
+    }
+    if (!call->fin_clean || (call->status.code == TREVRPC_RPC_STATUS_OK && !call->message_seen)) {
+        return -EPROTO;
+    }
+    napi_value response;
+    int result = node_call_make_unary_response(call, &response);
+    if (result != 0) {
+        return result;
+    }
+    call->response_settled = true;
+    if (call->has_response_deferred) {
+        (void)napi_resolve_deferred(call->runtime->env, call->response_deferred, response);
+    }
+    node_call_request_close(call);
+    return 0;
+}
+
+static int node_call_take_stream_frame(node_call* call, node_receive_item* item, napi_value* out) {
+    trevrpc_rpc_receive_info_v1 info;
+    int result = node_call_receive_info(call->runtime, item->receive, &info);
+    if (result != 0) {
+        node_receive_item_free(item);
+        return result;
+    }
+    if (info.kind == TREVRPC_RPC_RECEIVE_MESSAGE || info.kind == TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE) {
+        result = node_make_message_frame(call->runtime->env, call, item->receive, &info, out);
+        item->receive = NULL;
+        free(item);
+        return result;
+    }
+    if (info.kind == TREVRPC_RPC_RECEIVE_STATUS) {
+        result = node_make_status_frame(call->runtime->env, call, item->receive, &info, out);
+        item->receive = NULL;
+        free(item);
+        return result;
+    }
+    node_receive_item_free(item);
+    return -EPROTO;
+}
+
+static int node_call_make_body_batch(node_call* call, node_receive_waiter* waiter, napi_value* out) {
+    napi_env env = call->runtime->env;
+    napi_value bodies;
+    if (napi_create_array(env, &bodies) != napi_ok) {
+        return -ENOMEM;
+    }
+    uint32_t count = 0;
+    napi_value status = NULL;
+    while (call->receive_head != NULL && count < waiter->max_items) {
+        node_receive_item* item = node_call_take_receive(call);
+        trevrpc_rpc_receive_info_v1 info;
+        int result = node_call_receive_info(call->runtime, item->receive, &info);
+        if (result != 0) {
+            node_receive_item_free(item);
+            return result;
+        }
+        if (info.kind == TREVRPC_RPC_RECEIVE_STATUS) {
+            result = node_make_status_frame(env, call, item->receive, &info, &status);
+            item->receive = NULL;
+            free(item);
+            if (result != 0) {
+                return result;
+            }
             break;
         }
-        body_count++;
+        if (info.kind != TREVRPC_RPC_RECEIVE_MESSAGE && info.kind != TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE) {
+            node_receive_item_free(item);
+            return -EPROTO;
+        }
+        napi_value body;
+        bool transferred = false;
+        result = node_make_body_from_receive(env, item->receive, &info, &body, &transferred);
+        item->receive = NULL;
+        free(item);
+        if (result != 0 || napi_set_element(env, bodies, count++, body) != napi_ok) {
+            return result == 0 ? -ENOMEM : result;
+        }
+        call->message_seen = true;
     }
-
-    napi_value object = NULL;
-    napi_value bodies = NULL;
-    if (napi_create_object(env, &object) != napi_ok ||
-        napi_create_array_with_length(env, body_count, &bodies) != napi_ok) {
+    if (napi_create_object(env, out) != napi_ok || napi_set_named_property(env, *out, "bodies", bodies) != napi_ok) {
         return -ENOMEM;
     }
-    for (size_t i = 0; i < body_count; i++) {
-        napi_value body = NULL;
-        int err =
-            inbound_body_to_js(env, frames[i], inbound_stream_frame_get_body, inbound_stream_frame_take_body, &body);
-        if (err != 0) {
-            return err;
-        }
-        if (napi_set_element(env, bodies, (uint32_t)i, body) != napi_ok) {
-            return -ENOMEM;
-        }
-    }
-    if (napi_set_named_property(env, object, "bodies", bodies) != napi_ok) {
+    if (status != NULL && napi_set_named_property(env, *out, "status", status) != napi_ok) {
         return -ENOMEM;
     }
-
-    if (terminal != NULL && terminal_kind == TREVRPC_STREAM_FRAME_KIND_STATUS) {
-        napi_value status = NULL;
-        int err = inbound_stream_frame_to_js(env, terminal, &status);
-        if (err != 0) {
-            return err;
-        }
-        if (napi_set_named_property(env, object, "status", status) != napi_ok) {
-            return -ENOMEM;
-        }
-    } else {
-        napi_value null_value = NULL;
-        if (napi_get_null(env, &null_value) != napi_ok ||
-            napi_set_named_property(env, object, "status", null_value) != napi_ok) {
-            return -ENOMEM;
-        }
-    }
-    if (terminal != NULL && terminal_kind != TREVRPC_STREAM_FRAME_KIND_STATUS) {
-        int err = set_uint32_checked(env, object, "unknownFrameKind", terminal_kind);
-        if (err != 0) {
-            return err;
-        }
-    }
-    napi_value eof_value = NULL;
+    bool eof = call->fin_seen && call->receive_head == NULL && call->status_seen;
+    napi_value eof_value;
     if (napi_get_boolean(env, eof, &eof_value) != napi_ok ||
-        napi_set_named_property(env, object, "eof", eof_value) != napi_ok) {
+        napi_set_named_property(env, *out, "eof", eof_value) != napi_ok) {
+        return -ENOMEM;
+    }
+    if (eof) {
+        call->receive_finished = true;
+        node_call_request_close(call);
+    }
+    return 0;
+}
+
+static void node_call_process_stream_waiters(node_call* call) {
+    while (call->waiter_head != NULL) {
+        node_receive_waiter* waiter = call->waiter_head;
+        napi_value value = NULL;
+        int result = 0;
+        if (waiter->body_batch) {
+            if (call->receive_head == NULL && !(call->fin_seen && call->status_seen)) {
+                break;
+            }
+            result = node_call_make_body_batch(call, waiter, &value);
+        } else if (call->receive_head != NULL) {
+            if (waiter->max_items <= 1) {
+                node_receive_item* item = node_call_take_receive(call);
+                result = node_call_take_stream_frame(call, item, &value);
+            } else {
+                if (napi_create_array(call->runtime->env, &value) != napi_ok) {
+                    result = -ENOMEM;
+                } else {
+                    uint32_t frame_count = 0;
+                    while (call->receive_head != NULL && frame_count < waiter->max_items) {
+                        node_receive_item* item = node_call_take_receive(call);
+                        napi_value frame = NULL;
+                        result = node_call_take_stream_frame(call, item, &frame);
+                        if (result != 0 ||
+                            napi_set_element(call->runtime->env, value, frame_count++, frame) != napi_ok) {
+                            if (result == 0) {
+                                result = -ENOMEM;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (call->fin_seen) {
+            if (!call->status_seen) {
+                break;
+            }
+            if (!call->fin_clean) {
+                result = -EPROTO;
+            } else {
+                if (waiter->max_items <= 1) {
+                    if (napi_get_null(call->runtime->env, &value) != napi_ok) {
+                        result = -ENOMEM;
+                    }
+                } else {
+                    napi_value array = NULL;
+                    napi_value null_value = NULL;
+                    if (napi_create_array(call->runtime->env, &array) != napi_ok ||
+                        napi_get_null(call->runtime->env, &null_value) != napi_ok ||
+                        napi_set_element(call->runtime->env, array, 0, null_value) != napi_ok) {
+                        result = -ENOMEM;
+                    } else {
+                        value = array;
+                    }
+                }
+                call->receive_finished = true;
+                node_call_request_close(call);
+            }
+        } else {
+            break;
+        }
+        call->waiter_head = waiter->next;
+        if (call->waiter_head == NULL) {
+            call->waiter_tail = NULL;
+        }
+        if (result == 0) {
+            if (!waiter->body_batch && call->fin_seen && call->status_seen && call->receive_head == NULL) {
+                call->receive_finished = true;
+            }
+            (void)napi_resolve_deferred(call->runtime->env, waiter->deferred, value);
+        } else {
+            (void)node_reject_deferred_native(call->runtime->env, waiter->deferred, result, "receive response stream");
+            node_call_fail(call, result, "receive response stream");
+        }
+        free(waiter);
+    }
+    node_call_maybe_release(call);
+}
+
+static int node_make_request_frame(napi_env env, node_call* call, node_receive_item* item, napi_value* out) {
+    trevrpc_rpc_receive_info_v1 info;
+    int result = node_call_receive_info(call->runtime, item->receive, &info);
+    if (result != 0) {
+        node_receive_item_free(item);
+        return result;
+    }
+    if (info.kind == TREVRPC_RPC_RECEIVE_MESSAGE || info.kind == TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE) {
+        napi_value body;
+        bool transferred = false;
+        result = node_make_body_from_receive(env, item->receive, &info, &body, &transferred);
+        (void)transferred;
+        item->receive = NULL;
+        free(item);
+        if (result != 0) {
+            return result;
+        }
+        napi_value kind;
+        if (napi_create_object(env, out) != napi_ok || napi_create_uint32(env, 0, &kind) != napi_ok ||
+            napi_set_named_property(env, *out, "kind", kind) != napi_ok ||
+            napi_set_named_property(env, *out, "body", body) != napi_ok) {
+            return -ENOMEM;
+        }
+        return 0;
+    }
+    if (info.kind == TREVRPC_RPC_RECEIVE_STATUS) {
+        node_status_value status;
+        result = node_copy_receive_status(&info, &status);
+        node_receive_item_free(item);
+        if (result != 0) {
+            return result;
+        }
+        napi_value status_object;
+        if (napi_create_object(env, out) != napi_ok || node_make_status_object(env, &status, &status_object) != 0) {
+            node_status_free(&status);
+            return -ENOMEM;
+        }
+        napi_value kind;
+        if (napi_create_uint32(env, 1, &kind) != napi_ok ||
+            napi_set_named_property(env, *out, "kind", kind) != napi_ok) {
+            node_status_free(&status);
+            return -ENOMEM;
+        }
+        const char* names[] = {"status", "message", "metadata"};
+        for (size_t index = 0; index < 3; ++index) {
+            napi_value property;
+            if (napi_get_named_property(env, status_object, names[index], &property) != napi_ok ||
+                napi_set_named_property(env, *out, names[index], property) != napi_ok) {
+                node_status_free(&status);
+                return -ENOMEM;
+            }
+        }
+        if (status.code == TREVRPC_RPC_STATUS_OK) {
+            call->request_finished = true;
+        }
+        node_status_free(&status);
+        return 0;
+    }
+    node_receive_item_free(item);
+    return -EPROTO;
+}
+
+static void node_call_discard_empty_initial_request(node_call* call) {
+    if (call == NULL ||
+        (call->kind != TREVRPC_RPC_KIND_CLIENT_STREAMING && call->kind != TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING)) {
+        return;
+    }
+    while (call->receive_head != NULL) {
+        trevrpc_rpc_receive_info_v1 info;
+        node_receive_item* item = call->receive_head;
+        if (node_call_receive_info(call->runtime, item->receive, &info) != 0 ||
+            info.kind != TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE || info.data_len != 0) {
+            return;
+        }
+        (void)node_call_take_receive(call);
+        node_receive_item_free(item);
+    }
+}
+
+static void node_call_process_server_waiters(node_call* call) {
+    while (call->waiter_head != NULL) {
+        node_call_discard_empty_initial_request(call);
+        node_receive_waiter* waiter = call->waiter_head;
+        napi_value value = NULL;
+        int result = 0;
+        if (call->receive_head != NULL) {
+            if (waiter->max_items <= 1) {
+                result = node_make_request_frame(call->runtime->env, call, node_call_take_receive(call), &value);
+            } else {
+                if (napi_create_array(call->runtime->env, &value) != napi_ok) {
+                    result = -ENOMEM;
+                } else {
+                    uint32_t count = 0;
+                    while (call->receive_head != NULL && count < waiter->max_items) {
+                        napi_value frame = NULL;
+                        result =
+                            node_make_request_frame(call->runtime->env, call, node_call_take_receive(call), &frame);
+                        if (result != 0 || napi_set_element(call->runtime->env, value, count++, frame) != napi_ok) {
+                            if (result == 0) {
+                                result = -ENOMEM;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (call->request_finished && call->fin_seen) {
+            if (waiter->max_items <= 1) {
+                if (napi_get_null(call->runtime->env, &value) != napi_ok) {
+                    result = -ENOMEM;
+                }
+            } else {
+                napi_value array = NULL;
+                napi_value null_value = NULL;
+                if (napi_create_array(call->runtime->env, &array) != napi_ok ||
+                    napi_get_null(call->runtime->env, &null_value) != napi_ok ||
+                    napi_set_element(call->runtime->env, array, 0, null_value) != napi_ok) {
+                    result = -ENOMEM;
+                } else {
+                    value = array;
+                }
+            }
+            call->receive_finished = true;
+        } else {
+            break;
+        }
+        call->waiter_head = waiter->next;
+        if (call->waiter_head == NULL) {
+            call->waiter_tail = NULL;
+        }
+        if (result == 0) {
+            (void)napi_resolve_deferred(call->runtime->env, waiter->deferred, value);
+        } else {
+            (void)node_reject_deferred_native(call->runtime->env, waiter->deferred, result, "receive request stream");
+            node_call_fail(call, result, "receive request stream");
+        }
+        free(waiter);
+    }
+}
+
+static void node_process_call(node_call* call) {
+    if (call == NULL || call->runtime == NULL || call->runtime->rpc == NULL || call->failed || call->receive_finished ||
+        (call->kind == TREVRPC_RPC_KIND_UNARY && call->response_settled)) {
+        return;
+    }
+    int result = node_call_fetch_receives(call);
+    if (result != 0) {
+        node_call_fail(call, result, "receive response stream");
+        return;
+    }
+    if (call->server_side) {
+        node_call_process_server_waiters(call);
+        return;
+    }
+    result = call->kind == TREVRPC_RPC_KIND_UNARY ? node_call_process_unary(call) : 0;
+    if (result != 0) {
+        node_call_fail(call, result, "receive response stream");
+        return;
+    }
+    if (call->kind != TREVRPC_RPC_KIND_UNARY) {
+        node_call_process_stream_waiters(call);
+        return;
+    }
+    if (call->call_closed && !call->response_settled) {
+        node_call_fail(call, -EPIPE, "RPC call closed before response completion");
+    }
+}
+
+static napi_value node_connect_msquic(napi_env env, napi_callback_info info);
+static napi_value node_client_call(napi_env env, napi_callback_info info);
+static int node_client_request_close(node_client* client);
+static napi_value node_make_client_object(napi_env env, node_client* client);
+static napi_value node_make_stream_object(napi_env env, node_call* call);
+static int node_parse_cancellation(
+    napi_env env, napi_value value, node_runtime* runtime, trevrpc_rpc_cancellation_v1* out);
+static int node_call_register_handles(node_call* call);
+static napi_value node_client_start_stream(napi_env env, napi_callback_info info);
+static napi_value node_client_close(napi_env env, napi_callback_info info);
+static napi_value node_client_create_cancellation(napi_env env, napi_callback_info info);
+static napi_value node_stream_send_message(napi_env env, napi_callback_info info);
+static napi_value node_stream_send_messages(napi_env env, napi_callback_info info);
+static napi_value node_stream_finish_send(napi_env env, napi_callback_info info);
+static napi_value node_stream_recv(napi_env env, napi_callback_info info);
+static napi_value node_stream_recv_many(napi_env env, napi_callback_info info);
+static napi_value node_stream_recv_body_batch(napi_env env, napi_callback_info info);
+static napi_value node_stream_close(napi_env env, napi_callback_info info);
+static void node_client_finalizer(napi_env env, void* data, void* hint);
+static void node_call_finalizer(napi_env env, void* data, void* hint);
+
+static void node_call_maybe_release(node_call* call) {
+    if (call == NULL || !call->call_closed || !call->stream_closed || call->runtime == NULL ||
+        call->runtime->rpc == NULL || call->send_inflight != NULL || call->receive_head != NULL ||
+        call->waiter_head != NULL ||
+        (!call->server_side && call->kind != TREVRPC_RPC_KIND_UNARY &&
+            !(call->receive_finished || call->terminal_settled))) {
+        return;
+    }
+    node_runtime* runtime = call->runtime;
+    if (call->stream_subject != NULL) {
+        int result = trevrpc_rpc_stream_release(runtime->rpc, call->stream);
+        if (result != 0 && result != -ESTALE) {
+            call->stream_release_retry_pending = true;
+            node_runtime_start_failure_progress(runtime);
+            return;
+        }
+        call->stream_release_retry_pending = false;
+        node_subject* subject = call->stream_subject;
+        call->stream_subject = NULL;
+        node_registry_remove(runtime, subject);
+        node_test_trace("stream-release");
+    }
+    if (call->call_subject != NULL) {
+        int result = trevrpc_rpc_call_release(runtime->rpc, call->call);
+        if (result != 0 && result != -ESTALE) {
+            call->call_release_retry_pending = true;
+            node_runtime_start_failure_progress(runtime);
+            return;
+        }
+        call->call_release_retry_pending = false;
+        node_subject* subject = call->call_subject;
+        call->call_subject = NULL;
+        node_registry_remove(runtime, subject);
+        node_test_trace("call-release");
+    }
+    node_call_clear_receives(call);
+    free(call->server_response_body);
+    call->server_response_body = NULL;
+    call->server_response_body_len = 0;
+    call->server_response_body_set = false;
+    node_status_free(&call->status);
+    node_server* route_server = call->server;
+    if (call->route != NULL && call->route->active_calls > 0) {
+        call->route->active_calls--;
+    }
+    if (route_server != NULL && route_server->closed) {
+        node_server_free_routes(runtime->env, route_server);
+    }
+    node_runtime_update_liveness(runtime);
+    call->runtime = NULL;
+    if (!call->wrapper_alive) {
+        free(call);
+    }
+}
+
+static bool node_close_retryable(int result) {
+    return result == -EAGAIN || result == -EBUSY || result == -EINPROGRESS;
+}
+
+static void node_call_request_close_with_flags(node_call* call, uint32_t flags) {
+    if (call == NULL || call->runtime == NULL || call->runtime->rpc == NULL || node_handle_is_null_call(call->call) ||
+        node_handle_is_null_stream(call->stream)) {
+        return;
+    }
+    call->close_requested = true;
+    bool response_complete = call->response_settled || (call->fin_seen && call->fin_clean && call->status_seen);
+    bool close_stream = flags == TREVRPC_RPC_CLOSE_FLAG_ABORT || !response_complete;
+    for (unsigned attempt = 0; close_stream && attempt < 8u && !call->stream_close_submitted; ++attempt) {
+        uint64_t id = node_operation_allocate(call->runtime);
+        if (id == TREVRPC_RPC_OPERATION_ID_NONE) {
+            call->stream_close_retry_pending = true;
+            node_runtime_start_failure_progress(call->runtime);
+            break;
+        }
+        node_operation* operation = node_operation_add_id(call->runtime,
+            id,
+            TREVRPC_RPC_OBJECT_STREAM,
+            node_key_from_stream(call->stream),
+            NODE_OPERATION_STREAM_CLOSE,
+            call,
+            NULL,
+            false);
+        if (operation == NULL) {
+            call->stream_close_retry_pending = true;
+            node_runtime_start_failure_progress(call->runtime);
+            break;
+        }
+        int result = trevrpc_rpc_stream_close(call->runtime->rpc, call->stream, id, flags, 0);
+        if (result == 0 || result == -EALREADY) {
+            if (result == -EALREADY) {
+                node_operation_remove(call->runtime, operation);
+                call->stream_closed = true;
+            }
+            call->stream_close_submitted = true;
+            call->stream_close_retry_pending = false;
+            break;
+        }
+        node_operation_remove(call->runtime, operation);
+        if (!node_close_retryable(result)) {
+            call->stream_close_retry_pending = false;
+            node_call_settle_terminal(call, result, "close RPC stream");
+            break;
+        }
+        call->stream_close_retry_pending = true;
+    }
+    for (unsigned attempt = 0; attempt < 8u && !call->close_submitted; ++attempt) {
+        uint64_t id = node_operation_allocate(call->runtime);
+        if (id == TREVRPC_RPC_OPERATION_ID_NONE) {
+            call->close_retry_pending = true;
+            node_runtime_start_failure_progress(call->runtime);
+            break;
+        }
+        node_operation* operation = node_operation_add_id(call->runtime,
+            id,
+            TREVRPC_RPC_OBJECT_CALL,
+            node_key_from_call(call->call),
+            NODE_OPERATION_CALL_CLOSE,
+            call,
+            NULL,
+            false);
+        if (operation == NULL) {
+            call->close_retry_pending = true;
+            node_runtime_start_failure_progress(call->runtime);
+            break;
+        }
+        int result = trevrpc_rpc_call_close(call->runtime->rpc, call->call, id, flags, 0);
+        if (result == 0 || result == -EALREADY) {
+            if (result == -EALREADY) {
+                node_operation_remove(call->runtime, operation);
+                call->call_closed = true;
+            }
+            call->close_submitted = true;
+            call->close_retry_pending = false;
+            break;
+        }
+        node_operation_remove(call->runtime, operation);
+        if (!node_close_retryable(result)) {
+            call->close_retry_pending = false;
+            node_call_settle_terminal(call, result, "close RPC call");
+            break;
+        }
+        call->close_retry_pending = true;
+    }
+    bool retry_pending = call->close_retry_pending || call->stream_close_retry_pending ||
+                         call->call_release_retry_pending || call->stream_release_retry_pending;
+    if (call->runtime != NULL && retry_pending) {
+        node_runtime_start_failure_progress(call->runtime);
+    }
+}
+
+static void node_call_request_close(node_call* call) {
+    node_call_request_close_with_flags(
+        call, call != NULL && call->close_abort ? TREVRPC_RPC_CLOSE_FLAG_ABORT : TREVRPC_RPC_CLOSE_FLAG_NONE);
+}
+
+static void node_send_pump(node_call* call);
+
+static napi_value node_new_promise(napi_env env, napi_deferred* deferred) {
+    napi_value promise;
+    if (napi_create_promise(env, deferred, &promise) != napi_ok) {
+        return NULL;
+    }
+    return promise;
+}
+
+static void node_send_batch_remove(node_call* call, node_send_batch* batch) {
+    if (call->send_head == batch) {
+        call->send_head = batch->next;
+    } else {
+        node_send_batch* previous = call->send_head;
+        while (previous != NULL && previous->next != batch) {
+            previous = previous->next;
+        }
+        if (previous != NULL) {
+            previous->next = batch->next;
+        }
+    }
+    if (call->send_tail == batch) {
+        call->send_tail = NULL;
+        for (node_send_batch* item = call->send_head; item != NULL; item = item->next) {
+            call->send_tail = item;
+        }
+    }
+    batch->next = NULL;
+}
+
+static void node_send_batch_free(node_send_batch* batch) {
+    if (batch == NULL) {
+        return;
+    }
+    for (size_t index = batch->index; index < batch->count; ++index) {
+        free(batch->bodies[index]);
+    }
+    free(batch->bodies);
+    free(batch->body_lengths);
+    free(batch);
+}
+
+static void node_send_batch_fail_admission(
+    node_call* call, node_send_batch* batch, int error_code, const char* operation) {
+    if (call == NULL || batch == NULL) {
+        return;
+    }
+    node_runtime* runtime = call->runtime;
+    node_send_batch_remove(call, batch);
+    if (batch->has_deferred && runtime != NULL && node_runtime_napi_legal(runtime)) {
+        (void)node_reject_deferred_native(runtime->env, batch->deferred, error_code, operation);
+    }
+    node_send_batch_free(batch);
+    node_call_fail(call, error_code, operation);
+}
+
+static void node_send_pump(node_call* call) {
+    if (call == NULL || call->runtime == NULL || call->runtime->rpc == NULL || !call->ready || call->failed ||
+        call->send_inflight != NULL || call->send_head == NULL) {
+        return;
+    }
+    node_send_batch* batch = call->send_head;
+    if (batch->finish) {
+        uint64_t id = node_send_test_failure(call->runtime, false) ? TREVRPC_RPC_OPERATION_ID_NONE
+                                                                   : node_operation_allocate(call->runtime);
+        if (id == TREVRPC_RPC_OPERATION_ID_NONE) {
+            node_send_batch_fail_admission(call, batch, -ENOMEM, "finishSend operation allocation");
+            return;
+        }
+        node_operation* operation = node_send_test_failure(call->runtime, true)
+                                        ? NULL
+                                        : node_operation_add_id(call->runtime,
+                                              id,
+                                              TREVRPC_RPC_OBJECT_STREAM,
+                                              node_key_from_stream(call->stream),
+                                              NODE_OPERATION_FINISH_SEND,
+                                              batch,
+                                              batch->deferred,
+                                              batch->has_deferred);
+        if (operation == NULL) {
+            node_send_batch_fail_admission(call, batch, -ENOMEM, "finishSend operation record");
+            return;
+        }
+        int result = trevrpc_rpc_stream_finish_send(call->runtime->rpc, call->stream, id);
+        if (result == -EALREADY) {
+            node_operation_remove(call->runtime, operation);
+            node_send_batch_remove(call, batch);
+            if (batch->has_deferred) {
+                node_resolve_undefined(call->runtime->env, batch->deferred);
+            }
+            node_send_batch_free(batch);
+            call->send_finished = true;
+            return;
+        }
+        if (result != 0) {
+            node_operation_remove(call->runtime, operation);
+            node_send_batch_remove(call, batch);
+            if (batch->has_deferred) {
+                (void)node_reject_deferred_native(call->runtime->env, batch->deferred, result, "finishSend");
+            }
+            node_send_batch_free(batch);
+            node_call_fail(call, result, "finishSend");
+            return;
+        }
+        batch->operation_id = id;
+        call->send_inflight = batch;
+        return;
+    }
+    if (batch->index >= batch->count) {
+        node_send_batch_remove(call, batch);
+        if (batch->has_deferred) {
+            node_resolve_undefined(call->runtime->env, batch->deferred);
+        }
+        node_send_batch_free(batch);
+        node_send_pump(call);
+        return;
+    }
+    uint64_t id = node_send_test_failure(call->runtime, false) ? TREVRPC_RPC_OPERATION_ID_NONE
+                                                               : node_operation_allocate(call->runtime);
+    if (id == TREVRPC_RPC_OPERATION_ID_NONE) {
+        node_send_batch_fail_admission(call, batch, -ENOMEM, "sendMessage operation allocation");
+        return;
+    }
+    node_operation* operation = node_send_test_failure(call->runtime, true) ? NULL
+                                                                            : node_operation_add_id(call->runtime,
+                                                                                  id,
+                                                                                  TREVRPC_RPC_OBJECT_STREAM,
+                                                                                  node_key_from_stream(call->stream),
+                                                                                  NODE_OPERATION_SEND,
+                                                                                  batch,
+                                                                                  NULL,
+                                                                                  false);
+    if (operation == NULL) {
+        node_send_batch_fail_admission(call, batch, -ENOMEM, "sendMessage operation record");
+        return;
+    }
+    int result = trevrpc_rpc_stream_send_copy_v1(call->runtime->rpc,
+        call->stream,
+        id,
+        batch->bodies[batch->index],
+        batch->body_lengths[batch->index],
+        TREVRPC_RPC_SEND_FLAG_NONE);
+    if (result != 0) {
+        node_operation_remove(call->runtime, operation);
+        node_send_batch_remove(call, batch);
+        if (batch->has_deferred) {
+            (void)node_reject_deferred_native(call->runtime->env, batch->deferred, result, "sendMessage");
+        }
+        node_send_batch_free(batch);
+        node_call_fail(call, result, "sendMessage");
+        return;
+    }
+    batch->operation_id = id;
+    call->send_inflight = batch;
+}
+
+static int node_complete_operation(
+    node_runtime* runtime, node_operation* operation, const trevrpc_rpc_event_info_v1* info) {
+    napi_env env = runtime->env;
+    switch (operation->action) {
+    case NODE_OPERATION_ENDPOINT_START: {
+        node_client* client = operation->context;
+        if (client == NULL) {
+            return -ESTALE;
+        }
+        if (info->kind == TREVRPC_RPC_EVENT_ENDPOINT_READY && info->status == 0) {
+            client->ready = true;
+            node_runtime_update_liveness(runtime);
+            bool delivered = false;
+            if (operation->has_deferred) {
+                napi_value object;
+                if (client->wrapper_ref != NULL &&
+                    napi_get_reference_value(env, client->wrapper_ref, &object) == napi_ok) {
+                    (void)napi_resolve_deferred(env, operation->deferred, object);
+                    delivered = true;
+                } else {
+                    (void)node_reject_deferred_native(env, operation->deferred, -EIO, "connectMsQuic");
+                }
+            }
+            node_client_delete_wrapper_ref(client);
+            if (!delivered) {
+                client->invalidated = true;
+                (void)node_client_request_close(client);
+            }
+            return 0;
+        }
+        int error = info->status == 0 ? -EIO : info->status;
+        if (info->provider_error_code != 0 && info->provider_error_code <= (uint64_t)INT32_MAX) {
+            error = -(int)info->provider_error_code;
+        }
+        if (operation->has_deferred) {
+            (void)node_reject_deferred_native(env, operation->deferred, error, "connectMsQuic");
+        }
+        client->closed = true;
+        if (client->closed_deferred != NULL) {
+            node_resolve_undefined(env, client->closed_deferred);
+            client->closed_deferred = NULL;
+        }
+        node_client_delete_wrapper_ref(client);
+        node_client_maybe_release(client);
+        return 0;
+    }
+    case NODE_OPERATION_ENDPOINT_LISTEN: {
+        node_server* server = operation->context;
+        if (server == NULL) {
+            return -ESTALE;
+        }
+        if (info->kind != TREVRPC_RPC_EVENT_ENDPOINT_READY || info->status != 0) {
+            int error = info->status == 0 ? -EIO : info->status;
+            if (operation->has_deferred) {
+                (void)node_reject_deferred_native(env, operation->deferred, error, "listenMsQuic");
+            }
+            server->closed = true;
+            return 0;
+        }
+        server->ready = true;
+        (void)trevrpc_rpc_endpoint_get_port_v1(runtime->rpc, server->endpoint->endpoint, &server->port);
+        napi_value object = NULL;
+        if (server->wrapper_ref == NULL || napi_get_reference_value(env, server->wrapper_ref, &object) != napi_ok) {
+            if (operation->has_deferred)
+                (void)node_reject_deferred_native(env, operation->deferred, -EIO, "listenMsQuic");
+            server->closing = true;
+            (void)node_client_request_close(server->endpoint);
+        } else {
+            napi_value port;
+            if (napi_create_uint32(env, server->port, &port) == napi_ok) {
+                (void)napi_set_named_property(env, object, "port", port);
+            }
+            if (operation->has_deferred)
+                (void)napi_resolve_deferred(env, operation->deferred, object);
+        }
+        return 0;
+    }
+    case NODE_OPERATION_ENDPOINT_CLOSE: {
+        node_client* client = operation->context;
+        if (client == NULL) {
+            return -ESTALE;
+        }
+        if (info->kind != TREVRPC_RPC_EVENT_ENDPOINT_CLOSED && info->kind != TREVRPC_RPC_EVENT_ENDPOINT_FAILED) {
+            return -EPROTO;
+        }
+        client->closed = true;
+        if (client->server != NULL) {
+            node_server* server = client->server;
+            server->closed = true;
+            if (server->serve_deferred != NULL && node_runtime_napi_legal(runtime)) {
+                node_resolve_undefined(env, server->serve_deferred);
+                server->serve_deferred = NULL;
+                if (server->serve_promise_ref != NULL) {
+                    (void)napi_delete_reference(env, server->serve_promise_ref);
+                    server->serve_promise_ref = NULL;
+                }
+            }
+            node_server_free_routes(env, server);
+        }
+        if (client->closed_deferred != NULL) {
+            node_resolve_undefined(env, client->closed_deferred);
+            client->closed_deferred = NULL;
+            node_runtime_update_liveness(runtime);
+        }
+        node_client_maybe_release(client);
+        node_runtime_update_liveness(runtime);
+        return 0;
+    }
+    case NODE_OPERATION_CALL_OPEN: {
+        node_call* call = operation->context;
+        if (call == NULL) {
+            return -ESTALE;
+        }
+        if (info->kind == TREVRPC_RPC_EVENT_CALL_READY && info->status == 0) {
+            call->ready = true;
+            if (operation->has_deferred) {
+                napi_value object;
+                if (call->wrapper_ref == NULL || napi_get_reference_value(env, call->wrapper_ref, &object) != napi_ok) {
+                    (void)node_reject_deferred_native(env, operation->deferred, -EIO, "startStream");
+                } else {
+                    (void)napi_resolve_deferred(env, operation->deferred, object);
+                }
+                node_call_delete_wrapper_ref(call);
+            }
+            node_process_call(call);
+            return 0;
+        }
+        int error = info->status == 0 ? -EIO : info->status;
+        if (operation->has_deferred && call->kind == TREVRPC_RPC_KIND_UNARY) {
+            call->has_response_deferred = false;
+            call->response_deferred = NULL;
+        }
+        napi_deferred open_deferred = operation->deferred;
+        bool has_open_deferred = operation->has_deferred;
+        operation->has_deferred = false;
+        operation->deferred = NULL;
+        node_call_fail(call, error, has_open_deferred ? "startStream" : "call");
+        if (has_open_deferred) {
+            (void)node_reject_deferred_native(env, open_deferred, error, "startStream");
+        }
+        node_call_delete_wrapper_ref(call);
+        return 0;
+    }
+    case NODE_OPERATION_CALL_ACCEPT: {
+        node_call* call = operation->context;
+        if (call == NULL || info->kind != TREVRPC_RPC_EVENT_CALL_ACCEPTED) {
+            return call == NULL ? -ESTALE : -EPROTO;
+        }
+        if (info->status != 0) {
+            node_call_settle_terminal(call, info->status, "accept incoming call");
+            return 0;
+        }
+        call->accepted = true;
+        call->ready = true;
+        if (call->route == NULL || call->route->handler_ref == NULL) {
+            call->response_submitted = false;
+            return node_call_server_fail(call, TREVRPC_RPC_STATUS_UNIMPLEMENTED, "method not registered");
+        }
+        napi_value handler = NULL;
+        napi_value call_object = NULL;
+        napi_value global = NULL;
+        napi_status status = napi_get_reference_value(env, call->route->handler_ref, &handler);
+        if (status == napi_ok) {
+            if (node_make_server_call_object(env, call) == NULL ||
+                napi_get_reference_value(env, call->wrapper_ref, &call_object) != napi_ok) {
+                status = napi_generic_failure;
+            }
+        }
+        if (status == napi_ok)
+            status = napi_get_global(env, &global);
+        if (status == napi_ok) {
+            napi_value ignored = NULL;
+            status = napi_call_function(env, global, handler, 1, &call_object, &ignored);
+        }
+        if (status != napi_ok) {
+            napi_value exception = NULL;
+            (void)napi_get_and_clear_last_exception(env, &exception);
+            return node_call_server_fail(call, TREVRPC_RPC_STATUS_INTERNAL, "server handler failed");
+        }
+        node_process_call(call);
+        return 0;
+    }
+    case NODE_OPERATION_CALL_RESPOND: {
+        node_call* call = operation->context;
+        if (call == NULL ||
+            (info->kind != TREVRPC_RPC_EVENT_SEND_COMPLETE && info->kind != TREVRPC_RPC_EVENT_SEND_FINISHED)) {
+            return call == NULL ? -ESTALE : -EPROTO;
+        }
+        if (info->status != 0) {
+            node_call_settle_terminal(call, info->status, "respond");
+            if (operation->has_deferred) {
+                (void)node_reject_deferred_native(env, operation->deferred, info->status, "respond");
+            }
+            call->close_abort = true;
+            node_call_request_close(call);
+        } else if (operation->has_deferred) {
+            node_resolve_undefined(env, operation->deferred);
+        }
+        call->response_settled = info->status == 0;
+        call->response_submitted = false;
+        return 0;
+    }
+    case NODE_OPERATION_CALL_FINISH: {
+        node_call* call = operation->context;
+        if (call == NULL || info->kind != TREVRPC_RPC_EVENT_CALL_FINISHED) {
+            return call == NULL ? -ESTALE : -EPROTO;
+        }
+        if (info->status != 0) {
+            node_call_settle_terminal(call, info->status, "finishStream");
+            if (operation->has_deferred) {
+                (void)node_reject_deferred_native(env, operation->deferred, info->status, "finishStream");
+            }
+            call->close_abort = true;
+            node_call_request_close(call);
+        } else if (operation->has_deferred) {
+            node_resolve_undefined(env, operation->deferred);
+        }
+        call->response_settled = info->status == 0;
+        call->response_submitted = false;
+        return 0;
+    }
+    case NODE_OPERATION_CALL_CLOSE: {
+        node_call* call = operation->context;
+        if (call == NULL) {
+            return -ESTALE;
+        }
+        if (info->kind != TREVRPC_RPC_EVENT_CALL_CLOSED && info->kind != TREVRPC_RPC_EVENT_CALL_FAILED) {
+            return -EPROTO;
+        }
+        call->call_closed = true;
+        if (info->kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+            node_call_settle_terminal(call, info->status == 0 ? -EIO : info->status, "RPC call failed");
+        }
+        node_call_maybe_release(call);
+        return 0;
+    }
+    case NODE_OPERATION_STREAM_CLOSE: {
+        node_call* call = operation->context;
+        if (call == NULL || info->kind != TREVRPC_RPC_EVENT_STREAM_CLOSED) {
+            return call == NULL ? -ESTALE : -EPROTO;
+        }
+        call->stream_closed = true;
+        node_call_settle_terminal(call, info->status == 0 ? -EPIPE : info->status, "stream closed");
+        node_call_maybe_release(call);
+        return 0;
+    }
+    case NODE_OPERATION_SEND: {
+        node_send_batch* batch = operation->context;
+        if (batch == NULL || batch->call == NULL) {
+            return -ESTALE;
+        }
+        if (info->kind != TREVRPC_RPC_EVENT_SEND_COMPLETE || info->status != 0) {
+            int error = info->status == 0 ? -EIO : info->status;
+            if (batch->has_deferred) {
+                (void)node_reject_deferred_native(env, batch->deferred, error, "sendMessage");
+            }
+            node_call* call = batch->call;
+            call->send_inflight = NULL;
+            node_send_batch_remove(call, batch);
+            node_send_batch_free(batch);
+            node_call_fail(call, error, "sendMessage");
+            node_call_maybe_release(call);
+            return 0;
+        }
+        free(batch->bodies[batch->index]);
+        batch->bodies[batch->index] = NULL;
+        batch->index++;
+        batch->operation_id = 0;
+        batch->call->send_inflight = NULL;
+        if (batch->index >= batch->count) {
+            node_call* call = batch->call;
+            node_send_batch_remove(call, batch);
+            if (batch->has_deferred) {
+                node_resolve_undefined(env, batch->deferred);
+            }
+            node_send_batch_free(batch);
+            node_send_pump(call);
+            node_call_maybe_release(call);
+        } else {
+            node_send_pump(batch->call);
+            node_call_maybe_release(batch->call);
+        }
+        return 0;
+    }
+    case NODE_OPERATION_FINISH_SEND: {
+        node_send_batch* batch = operation->context;
+        if (batch == NULL || batch->call == NULL) {
+            return -ESTALE;
+        }
+        int error = (info->kind == TREVRPC_RPC_EVENT_SEND_FINISHED && info->status == 0) || info->status == -EALREADY
+                        ? 0
+                        : (info->status == 0 ? -EIO : info->status);
+        node_call* call = batch->call;
+        call->send_inflight = NULL;
+        if (error == 0) {
+            node_send_batch_remove(call, batch);
+            if (batch->has_deferred) {
+                node_resolve_undefined(env, batch->deferred);
+            }
+            call->send_finished = true;
+            node_send_batch_free(batch);
+            node_call_maybe_release(call);
+        } else {
+            if (batch->has_deferred) {
+                (void)node_reject_deferred_native(env, batch->deferred, error, "finishSend");
+            }
+            node_send_batch_remove(call, batch);
+            node_send_batch_free(batch);
+            node_call_fail(call, error, "finishSend");
+            node_call_maybe_release(call);
+        }
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}
+
+static napi_value node_rejected_native_promise(napi_env env, int error_code, const char* operation) {
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        return NULL;
+    }
+    (void)node_reject_deferred_native(env, deferred, error_code, operation);
+    return promise;
+}
+
+static int node_make_call_config(const node_js_request* request, trevrpc_rpc_call_config_v1* config) {
+    int result = trevrpc_rpc_call_config_v1_init(config, sizeof(*config));
+    if (result != 0) {
+        return result;
+    }
+    config->kind = request->kind;
+    config->service = request->service;
+    config->service_len = request->service_len;
+    config->method = request->method;
+    config->method_len = request->method_len;
+    config->metadata = request->metadata.entries;
+    config->metadata_count = (uint32_t)request->metadata.count;
+    config->timeout_nanos = request->timeout_nanos;
+    config->cancellation = request->cancellation;
+    config->initial_message = request->body;
+    config->initial_message_len = request->body_len;
+    config->max_response_body_size = request->max_response_body_size;
+    config->max_response_messages = request->max_response_messages;
+    config->max_response_stream_body_size = request->max_response_stream_body_size;
+    config->response_idle_timeout_nanos = request->response_idle_timeout_nanos;
+    return 0;
+}
+
+static int node_enqueue_send_batch(node_call* call, node_send_batch* batch) {
+    if (batch->finish) {
+        if (call->finish_enqueued || call->send_finished) {
+            return -EALREADY;
+        }
+        call->finish_enqueued = true;
+    }
+    if (call->send_tail == NULL) {
+        call->send_head = batch;
+    } else {
+        call->send_tail->next = batch;
+    }
+    call->send_tail = batch;
+    node_send_pump(call);
+    return 0;
+}
+
+static int node_make_send_batch(napi_env env,
+    node_call* call,
+    napi_value value,
+    bool finish,
+    napi_deferred deferred,
+    bool has_deferred,
+    node_send_batch** out_batch) {
+    node_send_batch* batch = calloc(1, sizeof(*batch));
+    if (batch == NULL) {
+        return -ENOMEM;
+    }
+    batch->call = call;
+    batch->finish = finish;
+    batch->deferred = deferred;
+    batch->has_deferred = has_deferred;
+    if (finish) {
+        *out_batch = batch;
+        return 0;
+    }
+    bool is_array = false;
+    if (napi_is_array(env, value, &is_array) != napi_ok || is_array) {
+        free(batch);
+        return -EINVAL;
+    }
+    batch->count = 1;
+    batch->bodies = calloc(1, sizeof(*batch->bodies));
+    batch->body_lengths = calloc(1, sizeof(*batch->body_lengths));
+    if (batch->bodies == NULL || batch->body_lengths == NULL) {
+        node_send_batch_free(batch);
+        return -ENOMEM;
+    }
+    int result = node_copy_js_bytes(env, value, &batch->bodies[0], &batch->body_lengths[0]);
+    if (result != 0) {
+        node_send_batch_free(batch);
+        return result;
+    }
+    *out_batch = batch;
+    return 0;
+}
+
+static int node_make_send_batch_array(
+    napi_env env, node_call* call, napi_value value, napi_deferred deferred, node_send_batch** out_batch) {
+    bool is_array = false;
+    if (napi_is_array(env, value, &is_array) != napi_ok || !is_array) {
+        return -EINVAL;
+    }
+    uint32_t count = 0;
+    if (napi_get_array_length(env, value, &count) != napi_ok) {
+        return -EINVAL;
+    }
+    node_send_batch* batch = calloc(1, sizeof(*batch));
+    if (batch == NULL) {
+        return -ENOMEM;
+    }
+    batch->call = call;
+    batch->count = count;
+    batch->deferred = deferred;
+    batch->has_deferred = true;
+    batch->bodies = count == 0 ? NULL : calloc(count, sizeof(*batch->bodies));
+    batch->body_lengths = count == 0 ? NULL : calloc(count, sizeof(*batch->body_lengths));
+    if (count != 0 && (batch->bodies == NULL || batch->body_lengths == NULL)) {
+        node_send_batch_free(batch);
+        return -ENOMEM;
+    }
+    for (uint32_t index = 0; index < count; ++index) {
+        napi_value item;
+        if (napi_get_element(env, value, index, &item) != napi_ok ||
+            node_copy_js_bytes(env, item, &batch->bodies[index], &batch->body_lengths[index]) != 0) {
+            node_send_batch_free(batch);
+            return -EINVAL;
+        }
+    }
+    *out_batch = batch;
+    return 0;
+}
+
+static int node_buffer_server_response_body(napi_env env, node_call* call, napi_value value) {
+    if (call->server_response_body_set) {
+        return -EALREADY;
+    }
+    uint8_t* body = NULL;
+    size_t body_len = 0;
+    int result = node_copy_js_bytes(env, value, &body, &body_len);
+    if (result != 0) {
+        return result;
+    }
+    call->server_response_body = body;
+    call->server_response_body_len = body_len;
+    call->server_response_body_set = true;
+    return 0;
+}
+
+static int node_start_call(napi_env env,
+    node_client* client,
+    node_js_request* request,
+    bool stream_result,
+    napi_deferred deferred,
+    node_call** out_call) {
+    (void)env;
+    node_runtime* runtime = client->runtime;
+    trevrpc_rpc_call_config_v1 config;
+    int result = node_make_call_config(request, &config);
+    if (result != 0) {
+        return result;
+    }
+    uint64_t operation_id = node_operation_allocate(runtime);
+    if (operation_id == TREVRPC_RPC_OPERATION_ID_NONE) {
+        return -EOVERFLOW;
+    }
+    node_call* call = calloc(1, sizeof(*call));
+    if (call == NULL) {
+        return -ENOMEM;
+    }
+    call->runtime = runtime;
+    call->client = client;
+    call->cancellation = request->cancellation;
+    call->kind = request->kind;
+    call->response_deferred = deferred;
+    call->has_response_deferred = !stream_result;
+    call->call_subject = node_subject_allocate(TREVRPC_RPC_OBJECT_CALL, (node_handle_key){0, 0, 0});
+    call->stream_subject = node_subject_allocate(TREVRPC_RPC_OBJECT_STREAM, (node_handle_key){0, 0, 0});
+    if (call->call_subject == NULL || call->stream_subject == NULL) {
+        free(call->call_subject);
+        free(call->stream_subject);
+        free(call);
+        return -ENOMEM;
+    }
+    node_operation* operation = node_operation_add_id(runtime,
+        operation_id,
+        TREVRPC_RPC_OBJECT_CALL,
+        (node_handle_key){0, 0, 0},
+        NODE_OPERATION_CALL_OPEN,
+        call,
+        deferred,
+        stream_result);
+    if (operation == NULL) {
+        free(call->call_subject);
+        free(call->stream_subject);
+        free(call);
+        return -ENOMEM;
+    }
+    result =
+        trevrpc_rpc_call_open_v1(runtime->rpc, client->endpoint, &config, operation_id, &call->call, &call->stream);
+    if (result != 0) {
+        node_operation_remove(runtime, operation);
+        free(call->call_subject);
+        free(call->stream_subject);
+        free(call);
+        return result;
+    }
+    if (node_handle_is_null_call(call->call) || node_handle_is_null_stream(call->stream)) {
+        operation->subject_bound = false;
+        call->failed = true;
+        call->close_abort = true;
+        (void)node_reject_deferred_native(runtime->env, deferred, -EPROTO, "call");
+        return -EPROTO;
+    }
+    if (node_call_register_handles(call) != 0) {
+        call->failed = true;
+        call->close_abort = true;
+        (void)node_call_request_close(call);
+        return -ENOMEM;
+    }
+    operation->subject = call->call_subject->key;
+    operation->subject_bound = true;
+    *out_call = call;
+    return 0;
+}
+
+static napi_value node_connect_msquic(napi_env env, napi_callback_info info) {
+    napi_value argv[2] = {NULL, NULL};
+    napi_value this_value;
+    size_t argc = 2;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok || argc < 1) {
+        return node_rejected_native_promise(env, -EINVAL, "connectMsQuic");
+    }
+    node_runtime* runtime = NULL;
+    int result = node_runtime_get(env, &runtime);
+    if (result != 0) {
+        return node_rejected_native_promise(env, result, "connectMsQuic");
+    }
+    node_endpoint_config_storage endpoint;
+    result = node_parse_endpoint_config(env, argv[0], &endpoint, false);
+    if (result != 0) {
+        return node_rejected_native_promise(env, result, "connectMsQuic");
+    }
+    trevrpc_rpc_cancellation_v1 cancellation;
+    result = node_parse_cancellation(env, argc > 1 ? argv[1] : NULL, runtime, &cancellation);
+    if (result != 0) {
+        node_endpoint_config_free(&endpoint);
+        return node_rejected_native_promise(env, result, "connectMsQuic");
+    }
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        node_endpoint_config_free(&endpoint);
+        return NULL;
+    }
+    node_client* client = calloc(1, sizeof(*client));
+    if (client == NULL) {
+        node_endpoint_config_free(&endpoint);
+        (void)node_reject_deferred_native(env, deferred, -ENOMEM, "connectMsQuic");
+        return promise;
+    }
+    client->runtime = runtime;
+    node_subject* reserved_subject = node_subject_allocate(TREVRPC_RPC_OBJECT_ENDPOINT, (node_handle_key){0, 0, 0});
+    if (reserved_subject == NULL) {
+        free(client);
+        node_endpoint_config_free(&endpoint);
+        (void)node_reject_deferred_native(env, deferred, -ENOMEM, "connectMsQuic");
+        return promise;
+    }
+    uint64_t operation_id = node_operation_allocate(runtime);
+    if (operation_id == TREVRPC_RPC_OPERATION_ID_NONE) {
+        free(reserved_subject);
+        free(client);
+        node_endpoint_config_free(&endpoint);
+        (void)node_reject_deferred_native(env, deferred, -EOVERFLOW, "connectMsQuic");
+        return promise;
+    }
+    node_operation* operation = node_operation_add_id(runtime,
+        operation_id,
+        TREVRPC_RPC_OBJECT_ENDPOINT,
+        (node_handle_key){0, 0, 0},
+        NODE_OPERATION_ENDPOINT_START,
+        client,
+        deferred,
+        true);
+    if (operation == NULL) {
+        free(reserved_subject);
+        free(client);
+        node_endpoint_config_free(&endpoint);
+        (void)node_reject_deferred_native(env, deferred, -ENOMEM, "connectMsQuic");
+        return promise;
+    }
+    result = trevrpc_rpc_msquic_endpoint_start_v1(runtime->rpc, &endpoint.config, operation_id, &client->endpoint);
+    node_endpoint_config_free(&endpoint);
+    if (result != 0) {
+        node_operation_remove(runtime, operation);
+        free(reserved_subject);
+        free(client);
+        (void)node_reject_deferred_native(env, deferred, result, "connectMsQuic");
+        return promise;
+    }
+    reserved_subject->key = node_key_from_endpoint(client->endpoint);
+    reserved_subject->core = client;
+    client->subject = reserved_subject;
+    node_registry_insert(runtime, reserved_subject);
+    if (cancellation.owner != 0 || cancellation.slot != 0 || cancellation.generation != 0) {
+        node_client_attach_cancellation(
+            client, node_registry_find(&runtime->cancellations, node_key_from_cancellation(cancellation)));
+    }
+    operation->subject = reserved_subject->key;
+    operation->subject_bound = true;
+    napi_value object = node_make_client_object(env, client);
+    if (object == NULL) {
+        client->invalidated = true;
+        operation->has_deferred = false;
+        operation->deferred = NULL;
+        (void)node_reject_deferred_native(env, deferred, -EIO, "connectMsQuic");
+        (void)node_client_request_close(client);
+        return promise;
+    }
+    (void)object;
+    return promise;
+}
+
+static napi_value node_client_call(napi_env env, napi_callback_info info) {
+    napi_value argv[2] = {NULL, NULL};
+    napi_value this_value;
+    size_t argc = 2;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok || argc < 1) {
+        return node_rejected_native_promise(env, -EINVAL, "call");
+    }
+    node_client* client = NULL;
+    if (napi_unwrap(env, this_value, (void**)&client) != napi_ok || !node_client_usable(client) || !client->ready ||
+        client->closed) {
+        return node_rejected_native_promise(env, -EPIPE, "call");
+    }
+    node_js_request request;
+    int result = node_parse_request(env, argv[0], TREVRPC_RPC_KIND_UNARY, &request);
+    if (result != 0) {
+        return node_rejected_native_promise(env, result, "call");
+    }
+    result = node_parse_cancellation(env, argc > 1 ? argv[1] : NULL, client->runtime, &request.cancellation);
+    if (result != 0) {
+        node_request_free(&request);
+        return node_rejected_native_promise(env, result, "call");
+    }
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        node_request_free(&request);
+        return NULL;
+    }
+    node_call* call = NULL;
+    result = node_start_call(env, client, &request, false, deferred, &call);
+    node_request_free(&request);
+    if (result != 0) {
+        (void)node_reject_deferred_native(env, deferred, result, "call");
+    }
+    return promise;
+}
+
+static napi_value node_client_start_stream(napi_env env, napi_callback_info info) {
+    napi_value argv[2] = {NULL, NULL};
+    napi_value this_value;
+    size_t argc = 2;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok || argc < 1) {
+        return node_rejected_native_promise(env, -EINVAL, "startStream");
+    }
+    node_client* client = NULL;
+    if (napi_unwrap(env, this_value, (void**)&client) != napi_ok || !node_client_usable(client) || !client->ready ||
+        client->closed) {
+        return node_rejected_native_promise(env, -EPIPE, "startStream");
+    }
+    node_js_request request;
+    int result = node_parse_request(env, argv[0], TREVRPC_RPC_KIND_SERVER_STREAMING, &request);
+    if (result != 0) {
+        return node_rejected_native_promise(env, result, "startStream");
+    }
+    result = node_parse_cancellation(env, argc > 1 ? argv[1] : NULL, client->runtime, &request.cancellation);
+    if (result != 0) {
+        node_request_free(&request);
+        return node_rejected_native_promise(env, result, "startStream");
+    }
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        node_request_free(&request);
+        return NULL;
+    }
+    node_call* call = NULL;
+    result = node_start_call(env, client, &request, true, deferred, &call);
+    node_request_free(&request);
+    if (result != 0) {
+        (void)node_reject_deferred_native(env, deferred, result, "startStream");
+        return promise;
+    }
+    napi_value stream = node_make_stream_object(env, call);
+    if (stream == NULL) {
+        node_call_clear_open_deferred(call);
+        node_call_fail(call, -ENOMEM, "startStream");
+        (void)node_reject_deferred_native(env, deferred, -ENOMEM, "startStream");
+        return promise;
+    }
+    return promise;
+}
+
+static napi_value node_stream_send_message(napi_env env, napi_callback_info info) {
+    napi_value argv[1] = {NULL};
+    napi_value this_value;
+    size_t argc = 1;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok || argc < 1) {
+        return node_rejected_native_promise(env, -EINVAL, "sendMessage");
+    }
+    node_call* call = NULL;
+    if (napi_unwrap(env, this_value, (void**)&call) != napi_ok || !node_call_usable(call) || !call->ready ||
+        call->failed || call->send_finished || call->finish_enqueued) {
+        return node_rejected_native_promise(env, -EPIPE, "sendMessage");
+    }
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        return NULL;
+    }
+    if (call->server_side && call->kind == TREVRPC_RPC_KIND_CLIENT_STREAMING) {
+        int result = node_buffer_server_response_body(env, call, argv[0]);
+        if (result == 0) {
+            node_resolve_undefined(env, deferred);
+        } else {
+            (void)node_reject_deferred_native(env, deferred, result, "sendMessage");
+        }
+        return promise;
+    }
+    node_send_batch* batch = NULL;
+    int result = node_make_send_batch(env, call, argv[0], false, deferred, true, &batch);
+    if (result == 0) {
+        result = node_enqueue_send_batch(call, batch);
+    }
+    if (result != 0) {
+        if (batch != NULL) {
+            node_send_batch_free(batch);
+        }
+        (void)node_reject_deferred_native(env, deferred, result, "sendMessage");
+    }
+    return promise;
+}
+
+static napi_value node_stream_send_messages(napi_env env, napi_callback_info info) {
+    napi_value argv[1] = {NULL};
+    napi_value this_value;
+    size_t argc = 1;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok || argc < 1) {
+        return node_rejected_native_promise(env, -EINVAL, "sendMessages");
+    }
+    node_call* call = NULL;
+    if (napi_unwrap(env, this_value, (void**)&call) != napi_ok || !node_call_usable(call) || !call->ready ||
+        call->failed || call->send_finished || call->finish_enqueued) {
+        return node_rejected_native_promise(env, -EPIPE, "sendMessages");
+    }
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        return NULL;
+    }
+    if (call->server_side && call->kind == TREVRPC_RPC_KIND_CLIENT_STREAMING) {
+        bool is_array = false;
+        uint32_t count = 0;
+        int result = napi_is_array(env, argv[0], &is_array) == napi_ok && is_array
+                         ? napi_get_array_length(env, argv[0], &count) == napi_ok ? 0 : -EINVAL
+                         : -EINVAL;
+        if (result == 0 && count > 1) {
+            result = -EINVAL;
+        }
+        if (result == 0 && count == 1) {
+            napi_value item;
+            result = napi_get_element(env, argv[0], 0, &item) == napi_ok
+                         ? node_buffer_server_response_body(env, call, item)
+                         : -EINVAL;
+        }
+        if (result == 0) {
+            node_resolve_undefined(env, deferred);
+        } else {
+            (void)node_reject_deferred_native(env, deferred, result, "sendMessages");
+        }
+        return promise;
+    }
+    node_send_batch* batch = NULL;
+    int result = node_make_send_batch_array(env, call, argv[0], deferred, &batch);
+    if (result == 0 && batch->count == 0) {
+        free(batch->bodies);
+        free(batch->body_lengths);
+        free(batch);
+        node_resolve_undefined(env, deferred);
+        return promise;
+    }
+    if (result == 0) {
+        result = node_enqueue_send_batch(call, batch);
+    }
+    if (result != 0) {
+        if (batch != NULL) {
+            node_send_batch_free(batch);
+        }
+        (void)node_reject_deferred_native(env, deferred, result, "sendMessages");
+    }
+    return promise;
+}
+
+static napi_value node_stream_finish_send(napi_env env, napi_callback_info info) {
+    napi_value this_value;
+    size_t argc = 0;
+    if (napi_get_cb_info(env, info, &argc, NULL, &this_value, NULL) != napi_ok) {
+        return node_rejected_native_promise(env, -EIO, "finishSend");
+    }
+    node_call* call = NULL;
+    if (napi_unwrap(env, this_value, (void**)&call) != napi_ok || !node_call_usable(call) || !call->ready ||
+        call->failed) {
+        return node_rejected_native_promise(env, -EPIPE, "finishSend");
+    }
+    if (call->send_finished || call->finish_enqueued) {
+        return node_rejected_native_promise(env, -EALREADY, "finishSend");
+    }
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        return NULL;
+    }
+    node_send_batch* batch = calloc(1, sizeof(*batch));
+    if (batch == NULL) {
+        (void)node_reject_deferred_native(env, deferred, -ENOMEM, "finishSend");
+        return promise;
+    }
+    batch->call = call;
+    batch->finish = true;
+    batch->deferred = deferred;
+    batch->has_deferred = true;
+    int result = node_enqueue_send_batch(call, batch);
+    if (result != 0) {
+        node_send_batch_free(batch);
+        (void)node_reject_deferred_native(env, deferred, result, "finishSend");
+    }
+    return promise;
+}
+
+static napi_value node_stream_recv_common(
+    napi_env env, napi_callback_info info, bool body_batch, bool many, uint32_t default_max) {
+    napi_value argv[1] = {NULL};
+    napi_value this_value;
+    size_t argc = 1;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok) {
+        return node_rejected_native_promise(env, -EIO, "receive");
+    }
+    node_call* call = NULL;
+    if (napi_unwrap(env, this_value, (void**)&call) != napi_ok || call == NULL) {
+        return node_rejected_native_promise(env, -EPIPE, "receive");
+    }
+    bool cached_eof =
+        !call->server_side && call->kind != TREVRPC_RPC_KIND_UNARY && !call->failed && call->receive_finished;
+    if (!cached_eof && (!node_call_usable(call) || call->failed)) {
+        return node_rejected_native_promise(env, -EPIPE, "receive");
+    }
+    uint32_t max_items = default_max;
+    if (argc > 0 && argv[0] != NULL) {
+        uint32_t supplied = 0;
+        if (napi_get_value_uint32(env, argv[0], &supplied) == napi_ok && supplied > 0) {
+            max_items = supplied;
+        }
+    }
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        return NULL;
+    }
+    if (cached_eof) {
+        napi_value terminal = NULL;
+        if (body_batch) {
+            if (napi_get_null(env, &terminal) != napi_ok) {
+                (void)node_reject_deferred_native(env, deferred, -ENOMEM, "receive");
+                return promise;
+            }
+        } else if (!many) {
+            if (napi_get_null(env, &terminal) != napi_ok) {
+                (void)node_reject_deferred_native(env, deferred, -ENOMEM, "receive");
+                return promise;
+            }
+        } else {
+            napi_value null_value = NULL;
+            if (napi_create_array(env, &terminal) != napi_ok || napi_get_null(env, &null_value) != napi_ok ||
+                napi_set_element(env, terminal, 0, null_value) != napi_ok) {
+                (void)node_reject_deferred_native(env, deferred, -ENOMEM, "receive");
+                return promise;
+            }
+        }
+        (void)napi_resolve_deferred(env, deferred, terminal);
+        return promise;
+    }
+    node_receive_waiter* waiter = calloc(1, sizeof(*waiter));
+    if (waiter == NULL) {
+        (void)node_reject_deferred_native(env, deferred, -ENOMEM, "receive");
+        return promise;
+    }
+    waiter->deferred = deferred;
+    waiter->max_items = max_items;
+    waiter->body_batch = body_batch;
+    if (call->waiter_tail == NULL) {
+        call->waiter_head = waiter;
+    } else {
+        call->waiter_tail->next = waiter;
+    }
+    call->waiter_tail = waiter;
+    node_process_call(call);
+    return promise;
+}
+
+static napi_value node_stream_recv(napi_env env, napi_callback_info info) {
+    return node_stream_recv_common(env, info, false, false, 1);
+}
+
+static napi_value node_stream_recv_many(napi_env env, napi_callback_info info) {
+    return node_stream_recv_common(env, info, false, true, 32);
+}
+
+static napi_value node_stream_recv_body_batch(napi_env env, napi_callback_info info) {
+    return node_stream_recv_common(env, info, true, false, 32);
+}
+
+static int node_client_request_close(node_client* client) {
+    if (client == NULL || client->runtime == NULL || client->runtime->rpc == NULL || client->closed ||
+        client->close_submitted || node_handle_is_null_endpoint(client->endpoint)) {
+        return 0;
+    }
+    for (unsigned attempt = 0; attempt < 8u; ++attempt) {
+        uint64_t id = node_operation_allocate(client->runtime);
+        if (id == TREVRPC_RPC_OPERATION_ID_NONE) {
+            client->close_retry_pending = true;
+            node_runtime_start_failure_progress(client->runtime);
+            return 0;
+        }
+        node_operation* operation = node_operation_add_id(client->runtime,
+            id,
+            TREVRPC_RPC_OBJECT_ENDPOINT,
+            node_key_from_endpoint(client->endpoint),
+            NODE_OPERATION_ENDPOINT_CLOSE,
+            client,
+            NULL,
+            false);
+        if (operation == NULL) {
+            client->close_retry_pending = true;
+            node_runtime_start_failure_progress(client->runtime);
+            return 0;
+        }
+        int result = trevrpc_rpc_endpoint_close(client->runtime->rpc, client->endpoint, id);
+        if (result == 0) {
+            client->close_submitted = true;
+            client->close_retry_pending = false;
+            return 0;
+        }
+        if (result == -EALREADY) {
+            node_operation_remove(client->runtime, operation);
+            client->closed = true;
+            client->close_submitted = true;
+            client->close_retry_pending = false;
+            if (client->closed_deferred != NULL && node_runtime_napi_legal(client->runtime)) {
+                node_resolve_undefined(client->runtime->env, client->closed_deferred);
+                client->closed_deferred = NULL;
+                node_runtime_update_liveness(client->runtime);
+            }
+            node_runtime* runtime = client->runtime;
+            node_client_maybe_release(client);
+            node_runtime_update_liveness(runtime);
+            return 0;
+        }
+        node_operation_remove(client->runtime, operation);
+        if (!node_close_retryable(result)) {
+            client->close_retry_pending = false;
+            return result;
+        }
+        client->close_retry_pending = true;
+    }
+    if (client->close_retry_pending) {
+        node_runtime_start_failure_progress(client->runtime);
+    }
+    return 0;
+}
+
+static napi_value node_make_client_object(napi_env env, node_client* client) {
+    napi_value object;
+    napi_value method;
+    napi_value closed;
+    if (napi_create_object(env, &object) != napi_ok ||
+        napi_create_function(env, "call", NAPI_AUTO_LENGTH, node_client_call, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "call", method) != napi_ok ||
+        napi_create_function(env, "startStream", NAPI_AUTO_LENGTH, node_client_start_stream, NULL, &method) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "startStream", method) != napi_ok ||
+        napi_create_function(env, "close", NAPI_AUTO_LENGTH, node_client_close, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "close", method) != napi_ok ||
+        napi_create_function(
+            env, "createCancellation", NAPI_AUTO_LENGTH, node_client_create_cancellation, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "createCancellation", method) != napi_ok) {
+        return NULL;
+    }
+    closed = node_new_promise(env, &client->closed_deferred);
+    if (closed == NULL || napi_set_named_property(env, object, "closed", closed) != napi_ok) {
+        if (client->closed_deferred != NULL) {
+            (void)node_reject_deferred_native(env, client->closed_deferred, -EIO, "client.close");
+            client->closed_deferred = NULL;
+        }
+        return NULL;
+    }
+    if (napi_create_reference(env, object, 1, &client->wrapper_ref) != napi_ok) {
+        (void)node_reject_deferred_native(env, client->closed_deferred, -EIO, "client.close");
+        client->closed_deferred = NULL;
+        client->wrapper_ref = NULL;
+        return NULL;
+    }
+    if (napi_wrap(env, object, client, node_client_finalizer, NULL, NULL) != napi_ok) {
+        (void)napi_delete_reference(env, client->wrapper_ref);
+        client->wrapper_ref = NULL;
+        (void)node_reject_deferred_native(env, client->closed_deferred, -EIO, "client.close");
+        client->closed_deferred = NULL;
+        return NULL;
+    }
+    client->wrapper_alive = true;
+    return object;
+}
+
+static napi_value node_make_stream_object(napi_env env, node_call* call) {
+    napi_value object;
+    napi_value method;
+    if (napi_create_object(env, &object) != napi_ok ||
+        napi_create_function(env, "sendMessage", NAPI_AUTO_LENGTH, node_stream_send_message, NULL, &method) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "sendMessage", method) != napi_ok ||
+        napi_create_function(env, "sendMessages", NAPI_AUTO_LENGTH, node_stream_send_messages, NULL, &method) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "sendMessages", method) != napi_ok ||
+        napi_create_function(env, "finishSend", NAPI_AUTO_LENGTH, node_stream_finish_send, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "finishSend", method) != napi_ok ||
+        napi_create_function(env, "recv", NAPI_AUTO_LENGTH, node_stream_recv, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "recv", method) != napi_ok ||
+        napi_create_function(env, "recvMany", NAPI_AUTO_LENGTH, node_stream_recv_many, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "recvMany", method) != napi_ok ||
+        napi_create_function(env, "recvBodyBatch", NAPI_AUTO_LENGTH, node_stream_recv_body_batch, NULL, &method) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "recvBodyBatch", method) != napi_ok ||
+        napi_create_function(env, "close", NAPI_AUTO_LENGTH, node_stream_close, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "close", method) != napi_ok) {
+        return NULL;
+    }
+    if (napi_create_reference(env, object, 1, &call->wrapper_ref) != napi_ok) {
+        call->wrapper_ref = NULL;
+        return NULL;
+    }
+    if (napi_wrap(env, object, call, node_call_finalizer, NULL, NULL) != napi_ok) {
+        (void)napi_delete_reference(env, call->wrapper_ref);
+        call->wrapper_ref = NULL;
+        return NULL;
+    }
+    call->wrapper_alive = true;
+    return object;
+}
+
+static int node_parse_cancellation(
+    napi_env env, napi_value value, node_runtime* runtime, trevrpc_rpc_cancellation_v1* out) {
+    memset(out, 0, sizeof(*out));
+    if (value == NULL) {
+        return 0;
+    }
+    napi_valuetype value_type;
+    if (napi_typeof(env, value, &value_type) != napi_ok || value_type == napi_undefined || value_type == napi_null) {
+        return 0;
+    }
+    node_cancellation* cancellation = NULL;
+    if (napi_unwrap(env, value, (void**)&cancellation) != napi_ok || cancellation == NULL ||
+        cancellation->runtime != runtime || cancellation->subject == NULL) {
+        return -EINVAL;
+    }
+    *out = cancellation->handle;
+    return 0;
+}
+
+static int node_call_register_handles(node_call* call) {
+    node_runtime* runtime = call->runtime;
+    if (call->call_subject == NULL) {
+        call->call_subject = node_registry_add(runtime, TREVRPC_RPC_OBJECT_CALL, node_key_from_call(call->call));
+    } else {
+        call->call_subject->key = node_key_from_call(call->call);
+        node_registry_insert(runtime, call->call_subject);
+    }
+    if (call->stream_subject == NULL) {
+        call->stream_subject =
+            node_registry_add(runtime, TREVRPC_RPC_OBJECT_STREAM, node_key_from_stream(call->stream));
+    } else {
+        call->stream_subject->key = node_key_from_stream(call->stream);
+        node_registry_insert(runtime, call->stream_subject);
+    }
+    if (call->call_subject == NULL || call->stream_subject == NULL) {
+        return -ENOMEM;
+    }
+    call->call_subject->core = call;
+    call->stream_subject->core = call;
+    return 0;
+}
+
+static void node_client_finalizer(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    node_client* client = data;
+    if (client == NULL) {
+        return;
+    }
+    client->wrapper_alive = false;
+    if (client->wrapper_ref != NULL && (client->runtime == NULL || !client->runtime->environment_teardown)) {
+        (void)napi_delete_reference(env, client->wrapper_ref);
+        client->wrapper_ref = NULL;
+    }
+    if (client->runtime == NULL) {
+        free(client);
+        return;
+    }
+    if (client->invalidated || client->runtime->cleanup_started) {
+        return;
+    }
+    (void)node_client_request_close(client);
+}
+
+static void node_call_finalizer(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    node_call* call = data;
+    if (call == NULL) {
+        return;
+    }
+    call->wrapper_alive = false;
+    if (call->wrapper_ref != NULL && (call->runtime == NULL || !call->runtime->environment_teardown)) {
+        (void)napi_delete_reference(env, call->wrapper_ref);
+        call->wrapper_ref = NULL;
+    }
+    if (call->runtime == NULL) {
+        free(call);
+        return;
+    }
+    if (call->invalidated || call->runtime->cleanup_started) {
+        return;
+    }
+    call->close_abort = true;
+    node_call_settle_terminal(call, -ECANCELED, "stream finalizer");
+    node_call_request_close(call);
+    node_call_maybe_release(call);
+}
+
+static napi_value node_client_create_cancellation(napi_env env, napi_callback_info info) {
+    (void)info;
+    return node_create_cancellation(env, info);
+}
+
+static napi_value node_client_close(napi_env env, napi_callback_info info) {
+    napi_value this_value;
+    size_t argc = 0;
+    if (napi_get_cb_info(env, info, &argc, NULL, &this_value, NULL) != napi_ok) {
+        return node_throw_error(env, -EIO, "client.close");
+    }
+    node_client* client = NULL;
+    if (napi_unwrap(env, this_value, (void**)&client) != napi_ok || client == NULL) {
+        return node_throw_error(env, -ESTALE, "client.close");
+    }
+    if (client->closed || client->runtime == NULL) {
+        napi_value undefined;
+        (void)napi_get_undefined(env, &undefined);
+        return undefined;
+    }
+    if (!node_client_usable(client)) {
+        return node_throw_error(env, -ESTALE, "client.close");
+    }
+    int result = node_client_request_close(client);
+    if (result != 0) {
+        return node_throw_error(env, result, "client.close");
+    }
+    napi_value undefined;
+    (void)napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static napi_value node_stream_close(napi_env env, napi_callback_info info) {
+    napi_value this_value;
+    size_t argc = 0;
+    if (napi_get_cb_info(env, info, &argc, NULL, &this_value, NULL) != napi_ok) {
+        return node_throw_error(env, -EIO, "stream.close");
+    }
+    node_call* call = NULL;
+    if (napi_unwrap(env, this_value, (void**)&call) != napi_ok || call == NULL) {
+        return node_throw_error(env, -ESTALE, "stream.close");
+    }
+    if (call->runtime == NULL || call->terminal_settled) {
+        napi_value undefined;
+        (void)napi_get_undefined(env, &undefined);
+        return undefined;
+    }
+    if (!node_call_usable(call)) {
+        return node_throw_error(env, -ESTALE, "stream.close");
+    }
+    call->close_abort = true;
+    node_call_settle_terminal(call, -ECANCELED, "stream.close");
+    node_call_request_close(call);
+    napi_value undefined;
+    (void)napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+typedef struct node_server_response_input {
+    node_status_value status;
+    node_js_metadata metadata;
+    uint8_t* body;
+    size_t body_len;
+} node_server_response_input;
+
+static void node_server_response_input_free(node_server_response_input* input) {
+    if (input == NULL) {
+        return;
+    }
+    node_status_free(&input->status);
+    node_metadata_free(&input->metadata);
+    free(input->body);
+    memset(input, 0, sizeof(*input));
+}
+
+static int node_parse_server_response(napi_env env, napi_value value, node_server_response_input* out) {
+    memset(out, 0, sizeof(*out));
+    if (value == NULL || napi_typeof(env, value, &(napi_valuetype){0}) != napi_ok) {
+        return -EINVAL;
+    }
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) {
+        return -EINVAL;
+    }
+    napi_value item;
+    bool present = false;
+    uint32_t code = TREVRPC_RPC_STATUS_OK;
+    if (node_get_named_value(env, value, "status", &item, &present) != 0) {
+        return -EINVAL;
+    }
+    if (present) {
+        napi_valuetype property_type;
+        if (napi_typeof(env, item, &property_type) != napi_ok) {
+            return -EINVAL;
+        }
+        if (property_type == napi_undefined || property_type == napi_null) {
+            present = false;
+        } else if (napi_get_value_uint32(env, item, &code) != napi_ok) {
+            return -EINVAL;
+        }
+    }
+    if (!present && node_get_named_value(env, value, "code", &item, &present) != 0) {
+        return -EINVAL;
+    }
+    if (present) {
+        napi_valuetype property_type;
+        if (napi_typeof(env, item, &property_type) != napi_ok) {
+            return -EINVAL;
+        }
+        if (property_type == napi_undefined || property_type == napi_null) {
+            present = false;
+        } else if (napi_get_value_uint32(env, item, &code) != napi_ok) {
+            return -EINVAL;
+        }
+    }
+    if (code > TREVRPC_RPC_STATUS_UNAUTHENTICATED) {
+        return -EINVAL;
+    }
+    out->status.code = code;
+    if (node_get_named_value(env, value, "message", &item, &present) != 0) {
+        return -EINVAL;
+    }
+    if (present && node_copy_js_string(env, item, &out->status.message, &(uint32_t){0}) != 0) {
+        return -EINVAL;
+    }
+    if (node_get_named_value(env, value, "metadata", &item, &present) != 0 ||
+        (present && node_copy_js_metadata(env, item, &out->metadata) != 0)) {
+        node_server_response_input_free(out);
+        return -EINVAL;
+    }
+    out->status.metadata = NULL;
+    out->status.metadata_count = 0;
+    if (node_get_named_value(env, value, "body", &item, &present) != 0) {
+        node_server_response_input_free(out);
+        return -EINVAL;
+    }
+    if (out->status.code == TREVRPC_RPC_STATUS_OK) {
+        if (!present || node_copy_js_bytes(env, item, &out->body, &out->body_len) != 0) {
+            node_server_response_input_free(out);
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+static node_server_route* node_server_find_route(
+    node_server* server, const char* service, const char* method, uint32_t kind) {
+    for (node_server_route* route = server == NULL ? NULL : server->routes; route != NULL; route = route->next) {
+        if (route->kind == kind && strcmp(route->service, service) == 0 && strcmp(route->method, method) == 0) {
+            return route;
+        }
+    }
+    return NULL;
+}
+
+static int node_make_server_call_request(napi_env env, node_call* call, napi_value* out) {
+    napi_value object;
+    napi_value value;
+    if (napi_create_object(env, &object) != napi_ok ||
+        napi_create_string_utf8(env, call->route == NULL ? "" : call->route->service, NAPI_AUTO_LENGTH, &value) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "service", value) != napi_ok ||
+        napi_create_string_utf8(env, call->route == NULL ? "" : call->route->method, NAPI_AUTO_LENGTH, &value) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "method", value) != napi_ok ||
+        napi_create_uint32(env, call->kind, &value) != napi_ok ||
+        napi_set_named_property(env, object, "kind", value) != napi_ok ||
+        napi_create_uint32(env, 1, &value) != napi_ok ||
+        napi_set_named_property(env, object, "version", value) != napi_ok) {
+        return -ENOMEM;
+    }
+    napi_value body = NULL;
+    napi_value metadata = NULL;
+    if (call->receive_head != NULL) {
+        trevrpc_rpc_receive_info_v1 info;
+        if (node_call_receive_info(call->runtime, call->receive_head->receive, &info) != 0 ||
+            node_make_bytes_value(env, info.data, (size_t)info.data_len, &body) != 0 ||
+            node_make_metadata_entries_value(env, info.metadata, info.metadata_count, &metadata) != 0) {
+            return -EPROTO;
+        }
+    } else if (node_make_bytes_value(env, NULL, 0, &body) != 0 ||
+               node_make_metadata_entries_value(env, NULL, 0, &metadata) != 0) {
+        return -ENOMEM;
+    }
+    if (napi_set_named_property(env, object, "body", body) != napi_ok ||
+        napi_set_named_property(env, object, "metadata", metadata) != napi_ok) {
+        return -ENOMEM;
+    }
+    trevrpc_rpc_call_context_info_v1 context_info;
+    if (trevrpc_rpc_call_context_info_v1_init(&context_info, sizeof(context_info)) != 0 ||
+        trevrpc_rpc_call_get_context_v1(call->runtime->rpc, call->call, &context_info) != 0) {
+        return -EIO;
+    }
+    napi_value context;
+    napi_value boolean;
+    napi_value remaining;
+    if (napi_create_object(env, &context) != napi_ok ||
+        napi_get_boolean(env, (context_info.flags & TREVRPC_RPC_CALL_CONTEXT_HAS_DEADLINE) != 0, &boolean) != napi_ok ||
+        napi_set_named_property(env, context, "hasDeadline", boolean) != napi_ok ||
+        napi_create_bigint_uint64(env, context_info.time_remaining_nanos, &remaining) != napi_ok ||
+        napi_set_named_property(env, context, "timeRemainingNanos", remaining) != napi_ok ||
+        napi_get_boolean(env, (context_info.flags & TREVRPC_RPC_CALL_CONTEXT_CANCELLED) != 0, &boolean) != napi_ok ||
+        napi_set_named_property(env, context, "cancelled", boolean) != napi_ok ||
+        napi_set_named_property(env, object, "context", context) != napi_ok) {
         return -ENOMEM;
     }
     *out = object;
     return 0;
 }
 
-static bool recv_batch_max_arg(napi_env env, size_t argc, napi_value* args, size_t* max_frames, const char* operation) {
-    *max_frames = TREV_NODE_RECV_MANY_DEFAULT;
-    if (argc == 0) {
-        return true;
+static napi_value node_server_call_respond(napi_env env, napi_callback_info info) {
+    napi_value argv[1] = {NULL};
+    napi_value this_value;
+    size_t argc = 1;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok || argc < 1) {
+        return node_rejected_native_promise(env, -EINVAL, "respond");
     }
-    uint32_t value = 0;
-    if (napi_get_value_uint32(env, args[0], &value) != napi_ok || value == 0) {
-        char message[96];
-        snprintf(message, sizeof(message), "%s requires a positive frame count", operation);
-        napi_throw_type_error(env, NULL, message);
-        return false;
+    node_call* call = NULL;
+    if (napi_unwrap(env, this_value, (void**)&call) != napi_ok || !node_call_usable(call) || !call->server_side ||
+        call->response_submitted || call->terminal_settled) {
+        return node_rejected_native_promise(env, -EPIPE, "respond");
     }
-    *max_frames = value > TREV_NODE_RECV_MANY_LIMIT ? TREV_NODE_RECV_MANY_LIMIT : value;
-    return true;
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        return NULL;
+    }
+    node_server_response_input input;
+    int result = node_parse_server_response(env, argv[0], &input);
+    if (result == 0) {
+        uint64_t id = node_operation_allocate(call->runtime);
+        node_operation* operation = id == TREVRPC_RPC_OPERATION_ID_NONE ? NULL
+                                                                        : node_operation_add_id(call->runtime,
+                                                                              id,
+                                                                              TREVRPC_RPC_OBJECT_STREAM,
+                                                                              node_key_from_stream(call->stream),
+                                                                              NODE_OPERATION_CALL_RESPOND,
+                                                                              call,
+                                                                              deferred,
+                                                                              true);
+        if (operation == NULL) {
+            result = -ENOMEM;
+        } else {
+            trevrpc_rpc_status_v1 status;
+            result = trevrpc_rpc_status_v1_init(&status, sizeof(status));
+            if (result == 0) {
+                status.code = input.status.code;
+                status.message = input.status.message;
+                status.message_len = (input.status.message == NULL ? 0u : (uint32_t)strlen(input.status.message));
+                status.metadata = input.metadata.entries;
+                status.metadata_count = (uint32_t)input.metadata.count;
+                const uint8_t* body = input.status.code == TREVRPC_RPC_STATUS_OK
+                                          ? (input.body_len == 0 ? (const uint8_t*)"" : input.body)
+                                          : NULL;
+                result =
+                    trevrpc_rpc_call_respond_copy_v1(call->runtime->rpc, call->call, id, &status, body, input.body_len);
+            }
+            if (result == 0) {
+                call->response_submitted = true;
+            } else {
+                node_operation_remove(call->runtime, operation);
+            }
+        }
+    }
+    node_server_response_input_free(&input);
+    if (result != 0) {
+        (void)node_reject_deferred_native(env, deferred, result, "respond");
+    }
+    return promise;
 }
 
-static bool recv_many_max_arg(napi_env env, size_t argc, napi_value* args, size_t* max_frames) {
-    return recv_batch_max_arg(env, argc, args, max_frames, "recvMany");
-}
-
-static bool recv_body_batch_max_arg(napi_env env, size_t argc, napi_value* args, size_t* max_frames) {
-    return recv_batch_max_arg(env, argc, args, max_frames, "recvBodyBatch");
-}
-
-static bool unwrap_native_client(napi_env env, napi_value receiver, native_client** out_client) {
-    *out_client = NULL;
-    if (napi_unwrap(env, receiver, (void**)out_client) != napi_ok || *out_client == NULL) {
-        napi_throw_type_error(env, NULL, "invalid native client receiver");
-        return false;
+static napi_value node_server_call_finish(napi_env env, napi_callback_info info) {
+    napi_value argv[3] = {NULL, NULL, NULL};
+    napi_value this_value;
+    size_t argc = 3;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok) {
+        return node_rejected_native_promise(env, -EINVAL, "finishStream");
     }
-    return true;
+    node_call* call = NULL;
+    if (napi_unwrap(env, this_value, (void**)&call) != napi_ok || !node_call_usable(call) || !call->server_side ||
+        call->response_submitted || call->terminal_settled) {
+        return node_rejected_native_promise(env, -EPIPE, "finishStream");
+    }
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        return NULL;
+    }
+    node_server_response_input input;
+    memset(&input, 0, sizeof(input));
+    input.status.code = TREVRPC_RPC_STATUS_OK;
+    if (argc > 0 && argv[0] != NULL && napi_get_value_uint32(env, argv[0], &input.status.code) != napi_ok) {
+        (void)node_reject_deferred_native(env, deferred, -EINVAL, "finishStream");
+        return promise;
+    }
+    if (input.status.code > TREVRPC_RPC_STATUS_UNAUTHENTICATED) {
+        (void)node_reject_deferred_native(env, deferred, -EINVAL, "finishStream");
+        return promise;
+    }
+    if (argc > 1 && argv[1] != NULL && node_copy_js_string(env, argv[1], &input.status.message, &(uint32_t){0}) != 0) {
+        (void)node_reject_deferred_native(env, deferred, -EINVAL, "finishStream");
+        return promise;
+    }
+    if (argc > 2 && argv[2] != NULL && node_copy_js_metadata(env, argv[2], &input.metadata) != 0) {
+        node_server_response_input_free(&input);
+        (void)node_reject_deferred_native(env, deferred, -EINVAL, "finishStream");
+        return promise;
+    }
+    bool client_stream = call->kind == TREVRPC_RPC_KIND_CLIENT_STREAMING;
+    uint64_t id = node_operation_allocate(call->runtime);
+    node_operation* operation =
+        id == TREVRPC_RPC_OPERATION_ID_NONE
+            ? NULL
+            : node_operation_add_id(call->runtime,
+                  id,
+                  client_stream ? TREVRPC_RPC_OBJECT_STREAM : TREVRPC_RPC_OBJECT_CALL,
+                  client_stream ? node_key_from_stream(call->stream) : node_key_from_call(call->call),
+                  client_stream ? NODE_OPERATION_CALL_RESPOND : NODE_OPERATION_CALL_FINISH,
+                  call,
+                  deferred,
+                  true);
+    int result = operation == NULL ? -ENOMEM : 0;
+    if (result == 0) {
+        trevrpc_rpc_status_v1 status;
+        result = trevrpc_rpc_status_v1_init(&status, sizeof(status));
+        if (result == 0) {
+            status.code = input.status.code;
+            status.message = input.status.message;
+            status.message_len = (input.status.message == NULL ? 0u : (uint32_t)strlen(input.status.message));
+            status.metadata = input.metadata.entries;
+            status.metadata_count = (uint32_t)input.metadata.count;
+            if (client_stream) {
+                const uint8_t* body = NULL;
+                size_t body_len = 0;
+                if (input.status.code == TREVRPC_RPC_STATUS_OK) {
+                    body = call->server_response_body_set ? call->server_response_body : (const uint8_t*)"";
+                    body_len = call->server_response_body_set ? call->server_response_body_len : 0;
+                }
+                result = trevrpc_rpc_call_respond_copy_v1(call->runtime->rpc, call->call, id, &status, body, body_len);
+            } else {
+                result = trevrpc_rpc_call_finish_v1(call->runtime->rpc, call->call, id, &status);
+            }
+        }
+        if (result == 0) {
+            call->response_submitted = true;
+        } else {
+            node_operation_remove(call->runtime, operation);
+        }
+    }
+    node_server_response_input_free(&input);
+    if (result != 0) {
+        (void)node_reject_deferred_native(env, deferred, result, "finishStream");
+    }
+    return promise;
 }
 
-static bool unwrap_native_stream(napi_env env, napi_value receiver, native_stream** out_stream) {
-    *out_stream = NULL;
-    if (napi_unwrap(env, receiver, (void**)out_stream) != napi_ok || *out_stream == NULL) {
-        napi_throw_type_error(env, NULL, "invalid native stream receiver");
-        return false;
-    }
-    return true;
-}
-
-static bool unwrap_native_server(napi_env env, napi_value receiver, native_server** out_server) {
-    *out_server = NULL;
-    if (napi_unwrap(env, receiver, (void**)out_server) != napi_ok || *out_server == NULL) {
-        napi_throw_type_error(env, NULL, "invalid native server receiver");
-        return false;
-    }
-    return true;
-}
-
-static bool unwrap_native_call(napi_env env, napi_value receiver, native_call** out_call) {
-    *out_call = NULL;
-    if (napi_unwrap(env, receiver, (void**)out_call) != napi_ok || *out_call == NULL) {
-        napi_throw_type_error(env, NULL, "invalid native call receiver");
-        return false;
-    }
-    return true;
-}
-
-static bool unwrap_native_cancellation(napi_env env, napi_value receiver, native_cancellation** out_cancellation) {
-    *out_cancellation = NULL;
-    if (napi_unwrap(env, receiver, (void**)out_cancellation) != napi_ok || *out_cancellation == NULL ||
-        (*out_cancellation)->cancellation == NULL) {
-        napi_throw_type_error(env, NULL, "invalid native cancellation receiver");
-        return false;
-    }
-    return true;
-}
-
-static int optional_cancellation_arg(napi_env env,
-    size_t argc,
-    napi_value* args,
-    size_t index,
-    trevrpc_cancellation** out_cancellation,
-    napi_ref* out_ref) {
-    *out_cancellation = NULL;
-    *out_ref = NULL;
-    if (argc <= index) {
-        return 0;
-    }
-
-    napi_valuetype type = napi_undefined;
-    if (napi_typeof(env, args[index], &type) != napi_ok) {
+static int node_call_server_fail(node_call* call, uint32_t status_code, const char* message) {
+    if (call == NULL || call->runtime == NULL || call->response_submitted || call->terminal_settled) {
         return -EINVAL;
     }
-    if (type == napi_undefined || type == napi_null) {
-        return 0;
+    trevrpc_rpc_status_v1 status;
+    int result = trevrpc_rpc_status_v1_init(&status, sizeof(status));
+    if (result != 0) {
+        return result;
     }
-    native_cancellation* wrapper = NULL;
-    if (!unwrap_native_cancellation(env, args[index], &wrapper)) {
-        return -EINVAL;
-    }
-    if (napi_create_reference(env, args[index], 1, out_ref) != napi_ok) {
+    status.code = status_code;
+    status.message = message == NULL ? "" : message;
+    status.message_len = (uint32_t)strlen(status.message);
+    uint64_t operation_id = node_operation_allocate(call->runtime);
+    node_operation* operation = operation_id == TREVRPC_RPC_OPERATION_ID_NONE ? NULL
+                                                                              : node_operation_add_id(call->runtime,
+                                                                                    operation_id,
+                                                                                    TREVRPC_RPC_OBJECT_CALL,
+                                                                                    node_key_from_call(call->call),
+                                                                                    NODE_OPERATION_CALL_FINISH,
+                                                                                    call,
+                                                                                    NULL,
+                                                                                    false);
+    if (operation == NULL) {
         return -ENOMEM;
     }
-    int err = trevrpc_cancellation_retain(wrapper->cancellation);
-    if (err != 0) {
-        napi_delete_reference(env, *out_ref);
-        *out_ref = NULL;
-        return err;
+    result = trevrpc_rpc_call_finish_v1(call->runtime->rpc, call->call, operation_id, &status);
+    if (result != 0) {
+        node_operation_remove(call->runtime, operation);
+        return result;
     }
-    *out_cancellation = wrapper->cancellation;
+    call->response_submitted = true;
     return 0;
 }
 
-static bool create_receiver_ref(napi_env env, napi_value receiver, napi_ref* out_ref) {
-    *out_ref = NULL;
-    if (napi_create_reference(env, receiver, 1, out_ref) != napi_ok) {
-        napi_throw_error(env, NULL, "failed to hold native receiver");
-        return false;
-    }
-    return true;
-}
-
-static void native_client_observer_unref(native_client_observer* observer) {
-    if (atomic_fetch_sub_explicit(&observer->refs, 1, memory_order_acq_rel) == 1) {
-        free(observer);
-    }
-}
-
-static void native_client_observer_finalize(napi_env env, void* data, void* hint) {
-    (void)hint;
-    native_client_observer* observer = data;
-    atomic_store_explicit(&observer->tsfn, NULL, memory_order_release);
-    if (env != NULL && observer->promise_ref != NULL) {
-        napi_delete_reference(env, observer->promise_ref);
-    }
-    native_client_observer_unref(observer);
-}
-
-static void native_client_closed_js(napi_env env, napi_value callback, void* context, void* data) {
-    (void)callback;
-    (void)data;
-    native_client_observer* observer = context;
-    if (env == NULL || observer->deferred == NULL) {
-        return;
-    }
-
-    napi_value close_info = NULL;
-    napi_value native_code = NULL;
-    if (napi_create_object(env, &close_info) == napi_ok &&
-        napi_create_int32(env, observer->error_code, &native_code) == napi_ok &&
-        napi_set_named_property(env, close_info, "nativeCode", native_code) == napi_ok) {
-        napi_resolve_deferred(env, observer->deferred, close_info);
-        observer->deferred = NULL;
-    } else {
-        clear_pending_exception(env);
-    }
-}
-
-static native_client_observer* native_client_observer_create(napi_env env) {
-    native_client_observer* observer = calloc(1, sizeof(*observer));
-    if (observer == NULL) {
+static napi_value node_make_server_call_object(napi_env env, node_call* call) {
+    napi_value object;
+    napi_value method;
+    napi_value request;
+    if (napi_create_object(env, &object) != napi_ok || node_make_server_call_request(env, call, &request) != 0 ||
+        napi_set_named_property(env, object, "request", request) != napi_ok ||
+        napi_create_function(env, "respond", NAPI_AUTO_LENGTH, node_server_call_respond, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "respond", method) != napi_ok ||
+        napi_create_function(env, "finishStream", NAPI_AUTO_LENGTH, node_server_call_finish, NULL, &method) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "finishStream", method) != napi_ok ||
+        napi_create_function(env, "sendMessage", NAPI_AUTO_LENGTH, node_stream_send_message, NULL, &method) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "sendMessage", method) != napi_ok ||
+        napi_create_function(env, "sendMessages", NAPI_AUTO_LENGTH, node_stream_send_messages, NULL, &method) !=
+            napi_ok ||
+        napi_set_named_property(env, object, "sendMessages", method) != napi_ok ||
+        napi_create_function(env, "finishSend", NAPI_AUTO_LENGTH, node_stream_finish_send, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "finishSend", method) != napi_ok ||
+        napi_create_function(env, "recv", NAPI_AUTO_LENGTH, node_stream_recv, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "recv", method) != napi_ok ||
+        napi_create_function(env, "recvMany", NAPI_AUTO_LENGTH, node_stream_recv_many, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "recvMany", method) != napi_ok ||
+        napi_create_function(env, "close", NAPI_AUTO_LENGTH, node_stream_close, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "close", method) != napi_ok) {
         return NULL;
     }
-    observer->env = env;
-    atomic_init(&observer->refs, 2);
-    atomic_init(&observer->notified, false);
-    atomic_init(&observer->tsfn, NULL);
-
-    napi_value promise = NULL;
-    napi_value callback = NULL;
-    napi_value resource_name = NULL;
-    napi_threadsafe_function tsfn = NULL;
-    napi_status status = napi_create_promise(env, &observer->deferred, &promise);
-    if (status == napi_ok) {
-        status = napi_create_reference(env, promise, 1, &observer->promise_ref);
-    }
-    if (status == napi_ok) {
-        status = napi_create_function(env, "nativeClientClosed", NAPI_AUTO_LENGTH, noop_js_callback, NULL, &callback);
-    }
-    if (status == napi_ok) {
-        status = napi_create_string_utf8(env, "TrevRpcNativeClientClosed", NAPI_AUTO_LENGTH, &resource_name);
-    }
-    if (status == napi_ok) {
-        status = napi_create_threadsafe_function(env,
-            callback,
-            NULL,
-            resource_name,
-            0,
-            1,
-            observer,
-            native_client_observer_finalize,
-            observer,
-            native_client_closed_js,
-            &tsfn);
-    }
-    if (status != napi_ok) {
-        if (observer->promise_ref != NULL) {
-            napi_delete_reference(env, observer->promise_ref);
-        }
-        free(observer);
+    if (napi_create_reference(env, object, 1, &call->wrapper_ref) != napi_ok ||
+        napi_wrap(env, object, call, node_call_finalizer, NULL, NULL) != napi_ok) {
         return NULL;
     }
-    atomic_store_explicit(&observer->tsfn, tsfn, memory_order_release);
-    (void)napi_unref_threadsafe_function(env, tsfn);
-    return observer;
-}
-
-static void native_client_observer_notify(native_client_observer* observer, int error_code) {
-    if (observer == NULL || atomic_exchange_explicit(&observer->notified, true, memory_order_acq_rel)) {
-        return;
-    }
-    observer->error_code = error_code;
-    napi_threadsafe_function tsfn = atomic_load_explicit(&observer->tsfn, memory_order_acquire);
-    if (tsfn != NULL && napi_acquire_threadsafe_function(tsfn) == napi_ok) {
-        (void)napi_call_threadsafe_function(tsfn, NULL, napi_tsfn_nonblocking);
-        (void)napi_release_threadsafe_function(tsfn, napi_tsfn_release);
-    }
-}
-
-static void native_client_observer_release(native_client_observer* observer) {
-    if (observer == NULL) {
-        return;
-    }
-    napi_threadsafe_function tsfn = atomic_load_explicit(&observer->tsfn, memory_order_acquire);
-    if (tsfn != NULL) {
-        (void)napi_release_threadsafe_function(tsfn, napi_tsfn_release);
-    }
-    native_client_observer_unref(observer);
-}
-
-static void native_client_connection_shutdown(void* context, int error_code) {
-    native_client_observer_notify(context, error_code);
-}
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-static bool debug_bounded_barrier_init(debug_bounded_barrier* barrier) {
-    if (pthread_mutex_init(&barrier->mutex, NULL) != 0) {
-        return false;
-    }
-    if (native_condition_init(&barrier->cond, &barrier->clock_id) != 0) {
-        pthread_mutex_destroy(&barrier->mutex);
-        return false;
-    }
-    return true;
-}
-
-static void debug_bounded_barrier_destroy(debug_bounded_barrier* barrier) {
-    pthread_cond_destroy(&barrier->cond);
-    pthread_mutex_destroy(&barrier->mutex);
-}
-
-static bool debug_bounded_barrier_wait(debug_bounded_barrier* barrier) {
-    uint64_t due_nanos = 0;
-    if (native_monotonic_deadline_after(5 * TREV_NODE_NANOS_PER_SEC, &due_nanos) != 0) {
-        return false;
-    }
-
-    pthread_mutex_lock(&barrier->mutex);
-    if (barrier->failed) {
-        pthread_mutex_unlock(&barrier->mutex);
-        return false;
-    }
-    barrier->arrived++;
-    if (barrier->arrived == 2) {
-        barrier->released = true;
-        pthread_cond_broadcast(&barrier->cond);
-    }
-    while (!barrier->released && !barrier->failed) {
-        uint64_t now_nanos = 0;
-        int err = native_monotonic_now_nanos(&now_nanos);
-        if (err == 0) {
-            err = native_condition_timedwait_until(
-                &barrier->cond, &barrier->mutex, barrier->clock_id, due_nanos, now_nanos);
-        }
-        if (err != 0) {
-            barrier->failed = true;
-            pthread_cond_broadcast(&barrier->cond);
-        }
-    }
-    bool released = barrier->released && !barrier->failed;
-    pthread_mutex_unlock(&barrier->mutex);
-    return released;
-}
-
-static void debug_client_close_pause(native_client* client) {
-    debug_client_close_race* race = client->debug_close_race;
-    if (race == NULL) {
-        return;
-    }
-
-    pthread_mutex_lock(&race->mutex);
-    race->close_transaction_active = true;
-    pthread_mutex_unlock(&race->mutex);
-    bool unlocked = debug_bounded_barrier_wait(&race->close_unlocked);
-    if (unlocked) {
-        (void)debug_bounded_barrier_wait(&race->close_resume);
-    }
-    pthread_mutex_lock(&race->mutex);
-    race->close_transaction_active = false;
-    pthread_mutex_unlock(&race->mutex);
-}
-#endif
-
-static void native_client_destroy(native_client* client) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_client_close_race* race = client->debug_close_race;
-    if (race != NULL) {
-        pthread_mutex_lock(&race->mutex);
-        race->destroy_attempts++;
-        if (race->close_transaction_active) {
-            race->premature_destroy_count++;
-            pthread_mutex_unlock(&race->mutex);
-            return;
-        }
-        race->destroy_count++;
-        pthread_mutex_unlock(&race->mutex);
-    }
-#endif
-    pthread_mutex_destroy(&client->mutex);
-    free(client);
-}
-
-static int native_client_acquire(native_client* client, trevrpc_raw_client** out_client) {
-    if (client == NULL) {
-        return TREV_NODE_ERR_CLOSED;
-    }
-    pthread_mutex_lock(&client->mutex);
-    if (client->client == NULL || client->closing) {
-        pthread_mutex_unlock(&client->mutex);
-        return TREV_NODE_ERR_CLOSED;
-    }
-    client->refs++;
-    *out_client = client->client;
-    pthread_mutex_unlock(&client->mutex);
-    return 0;
-}
-
-static void native_client_release(native_client* client) {
-    trevrpc_raw_client* close_client = NULL;
-    bool destroy = false;
-    pthread_mutex_lock(&client->mutex);
-    if (client->refs > 0) {
-        client->refs--;
-    }
-    if (client->closing && client->refs == 0 && client->client != NULL) {
-        close_client = client->client;
-        client->client = NULL;
-    }
-    destroy = !client->js_alive && client->refs == 0 && client->client == NULL;
-    pthread_mutex_unlock(&client->mutex);
-
-    trevrpc_raw_client_close(close_client);
-    if (destroy) {
-        native_client_destroy(client);
-    }
-}
-
-static void native_client_work_release(void* owner) {
-    native_client_release(owner);
-}
-
-static int native_client_work_reserve(native_client* client, base_work* work) {
-    trevrpc_raw_client* ignored = NULL;
-    int err = native_client_acquire(client, &ignored);
-    if (err == 0) {
-        work->owner = client;
-        work->owner_release = native_client_work_release;
-    }
-    return err;
-}
-
-static void native_client_close_request(native_client* client, bool finalizing) {
-    if (client == NULL) {
-        return;
-    }
-    trevrpc_raw_client* close_client = NULL;
-    trevrpc_raw_client* shutdown_client = NULL;
-    native_client_observer* observer = NULL;
-    bool first_close = false;
-    pthread_mutex_lock(&client->mutex);
-    client->refs++;
-    if (finalizing) {
-        client->js_alive = false;
-    }
-    if (!client->closing) {
-        first_close = true;
-        client->closing = true;
-        observer = client->observer;
-        client->observer = NULL;
-        if (client->refs == 1 && client->client != NULL) {
-            close_client = client->client;
-            client->client = NULL;
-        } else if (client->client != NULL) {
-            shutdown_client = client->client;
-        }
-    }
-    pthread_mutex_unlock(&client->mutex);
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_client_close_pause(client);
-#endif
-    if (first_close) {
-        trevrpc_raw_client_clear_shutdown_callback(close_client != NULL ? close_client : shutdown_client);
-        native_client_observer_notify(observer, 0);
-        native_client_observer_release(observer);
-        trevrpc_raw_client_shutdown(shutdown_client);
-        trevrpc_raw_client_close(close_client);
-    }
-    native_client_release(client);
-}
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-static bool debug_client_close_race_init(debug_client_close_race* race) {
-    memset(race, 0, sizeof(*race));
-    if (pthread_mutex_init(&race->mutex, NULL) != 0) {
-        return false;
-    }
-    if (!debug_bounded_barrier_init(&race->close_unlocked)) {
-        pthread_mutex_destroy(&race->mutex);
-        return false;
-    }
-    if (!debug_bounded_barrier_init(&race->close_resume)) {
-        debug_bounded_barrier_destroy(&race->close_unlocked);
-        pthread_mutex_destroy(&race->mutex);
-        return false;
-    }
-    if (!debug_bounded_barrier_init(&race->release_done)) {
-        debug_bounded_barrier_destroy(&race->close_resume);
-        debug_bounded_barrier_destroy(&race->close_unlocked);
-        pthread_mutex_destroy(&race->mutex);
-        return false;
-    }
-    if (!debug_bounded_barrier_init(&race->close_done)) {
-        debug_bounded_barrier_destroy(&race->release_done);
-        debug_bounded_barrier_destroy(&race->close_resume);
-        debug_bounded_barrier_destroy(&race->close_unlocked);
-        pthread_mutex_destroy(&race->mutex);
-        return false;
-    }
-    return true;
-}
-
-static void debug_client_close_race_destroy(debug_client_close_race* race) {
-    debug_bounded_barrier_destroy(&race->close_done);
-    debug_bounded_barrier_destroy(&race->release_done);
-    debug_bounded_barrier_destroy(&race->close_resume);
-    debug_bounded_barrier_destroy(&race->close_unlocked);
-    pthread_mutex_destroy(&race->mutex);
-}
-
-static void* debug_client_close_thread_main(void* data) {
-    debug_client_close_thread* thread = data;
-    native_client_close_request(thread->client, thread->finalizing);
-    (void)debug_bounded_barrier_wait(&thread->race->close_done);
-    return NULL;
-}
-
-static void* debug_client_release_thread_main(void* data) {
-    debug_client_release_thread* thread = data;
-    native_client_release(thread->client);
-    (void)debug_bounded_barrier_wait(&thread->race->release_done);
-    return NULL;
-}
-
-static bool debug_client_close_race_passed(const debug_client_close_race_result* result) {
-    return result->pin_observed && result->state_observed && result->no_destroy_before_resume &&
-           result->destroy_attempts == 1 && result->destroy_count == 1 && result->premature_destroy_count == 0 &&
-           result->barriers_ok;
-}
-
-static debug_client_close_race_result debug_run_client_close_race(bool finalizing) {
-    debug_client_close_race_result result = {0};
-    debug_client_close_race race;
-    if (!debug_client_close_race_init(&race)) {
-        return result;
-    }
-
-    native_client* client = calloc(1, sizeof(*client));
-    if (client == NULL || pthread_mutex_init(&client->mutex, NULL) != 0) {
-        free(client);
-        debug_client_close_race_destroy(&race);
-        return result;
-    }
-    client->refs = 1;
-    client->closing = finalizing;
-    client->js_alive = finalizing;
-    client->debug_close_race = &race;
-
-    debug_client_close_thread close_thread = {
-        .client = client,
-        .race = &race,
-        .finalizing = finalizing,
-    };
-    pthread_t close_thread_id;
-    bool close_started = pthread_create(&close_thread_id, NULL, debug_client_close_thread_main, &close_thread) == 0;
-    bool release_started = false;
-    pthread_t release_thread_id;
-    if (close_started) {
-        bool close_unlocked = debug_bounded_barrier_wait(&race.close_unlocked);
-        result.barriers_ok = close_unlocked;
-        if (close_unlocked) {
-            pthread_mutex_lock(&client->mutex);
-            result.pin_observed = client->refs == 2;
-            result.state_observed = client->closing && !client->js_alive;
-            pthread_mutex_unlock(&client->mutex);
-
-            debug_client_release_thread release_thread = {
-                .client = client,
-                .race = &race,
-            };
-            release_started =
-                pthread_create(&release_thread_id, NULL, debug_client_release_thread_main, &release_thread) == 0;
-            if (release_started) {
-                result.barriers_ok = debug_bounded_barrier_wait(&race.release_done) && result.barriers_ok;
-                pthread_mutex_lock(&race.mutex);
-                result.no_destroy_before_resume = race.destroy_attempts == 0;
-                pthread_mutex_unlock(&race.mutex);
-            }
-            result.barriers_ok = debug_bounded_barrier_wait(&race.close_resume) && result.barriers_ok;
-            if (release_started) {
-                pthread_join(release_thread_id, NULL);
-            }
-        }
-        result.barriers_ok = debug_bounded_barrier_wait(&race.close_done) && result.barriers_ok;
-        pthread_join(close_thread_id, NULL);
-    }
-
-    if (!release_started) {
-        native_client_release(client);
-    }
-
-    pthread_mutex_lock(&race.mutex);
-    result.destroy_attempts = race.destroy_attempts;
-    result.destroy_count = race.destroy_count;
-    result.premature_destroy_count = race.premature_destroy_count;
-    pthread_mutex_unlock(&race.mutex);
-    debug_client_close_race_destroy(&race);
-    return result;
-}
-
-static napi_value debug_client_close_race_result_to_js(napi_env env, const debug_client_close_race_result* result) {
-    napi_value object = NULL;
-    napi_create_object(env, &object);
-    set_bool(env, object, "passed", debug_client_close_race_passed(result));
-    set_bool(env, object, "pinObserved", result->pin_observed);
-    set_bool(env, object, "stateObserved", result->state_observed);
-    set_bool(env, object, "noDestroyBeforeResume", result->no_destroy_before_resume);
-    set_uint32(env, object, "destroyAttempts", (uint32_t)result->destroy_attempts);
-    set_uint32(env, object, "destructionCount", (uint32_t)result->destroy_count);
-    set_uint32(env, object, "prematureDestructionCount", (uint32_t)result->premature_destroy_count);
-    set_bool(env, object, "barriersOk", result->barriers_ok);
+    call->wrapper_alive = true;
     return object;
 }
 
-static napi_value debug_client_close_release_race(napi_env env, napi_callback_info info) {
-    (void)info;
-    debug_client_close_race_result first_close = debug_run_client_close_race(false);
-    debug_client_close_race_result finalizer = debug_run_client_close_race(true);
-
-    napi_value result = NULL;
-    napi_value first_close_result = debug_client_close_race_result_to_js(env, &first_close);
-    napi_value finalizer_result = debug_client_close_race_result_to_js(env, &finalizer);
-    napi_create_object(env, &result);
-    set_bool(env,
-        result,
-        "passed",
-        debug_client_close_race_passed(&first_close) && debug_client_close_race_passed(&finalizer));
-    napi_set_named_property(env, result, "firstCloseVsFinalRelease", first_close_result);
-    napi_set_named_property(env, result, "finalizerAfterExplicitClose", finalizer_result);
-    return result;
-}
-#endif
-
-static int native_stream_acquire(native_stream* stream, trevrpc_stream** out_stream) {
-    if (stream == NULL) {
-        return TREV_NODE_ERR_CLOSED;
-    }
-    pthread_mutex_lock(&stream->mutex);
-    if (stream->stream == NULL || stream->closing) {
-        pthread_mutex_unlock(&stream->mutex);
-        return TREV_NODE_ERR_CLOSED;
-    }
-    stream->refs++;
-    *out_stream = stream->stream;
-    pthread_mutex_unlock(&stream->mutex);
-    return 0;
-}
-
-static void native_stream_maybe_destroy(native_stream* stream) {
-    bool destroy = false;
-    pthread_mutex_lock(&stream->mutex);
-    destroy = !stream->js_alive && stream->refs == 0 && stream->stream == NULL;
-    pthread_mutex_unlock(&stream->mutex);
-    if (destroy) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        debug_outbound_gate_destroy(&stream->debug_outbound_gate);
-#endif
-        pthread_mutex_destroy(&stream->operation_mutex);
-        pthread_mutex_destroy(&stream->mutex);
-        free(stream);
-    }
-}
-
-static void native_stream_release(native_stream* stream) {
-    trevrpc_stream* close_stream = NULL;
-    bool should_release_owner = false;
-    bool destroy = false;
-    pthread_mutex_lock(&stream->mutex);
-    if (stream->refs > 0) {
-        stream->refs--;
-    }
-    if (stream->closing && stream->refs == 0 && stream->stream != NULL) {
-        close_stream = stream->stream;
-        stream->stream = NULL;
-        should_release_owner = !stream->owner_released;
-        stream->owner_released = true;
-    }
-    destroy = !stream->js_alive && stream->refs == 0 && stream->stream == NULL;
-    pthread_mutex_unlock(&stream->mutex);
-
-    trevrpc_stream_close(close_stream);
-    if (should_release_owner && stream->owner != NULL) {
-        native_client_release(stream->owner);
-    }
-    if (destroy) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        debug_outbound_gate_destroy(&stream->debug_outbound_gate);
-#endif
-        pthread_mutex_destroy(&stream->operation_mutex);
-        pthread_mutex_destroy(&stream->mutex);
-        free(stream);
-    }
-}
-
-static void native_stream_work_release(void* owner) {
-    native_stream_release(owner);
-}
-
-static int native_stream_work_reserve(native_stream* stream, base_work* work) {
-    trevrpc_stream* ignored = NULL;
-    int err = native_stream_acquire(stream, &ignored);
-    if (err == 0) {
-        work->owner = stream;
-        work->owner_release = native_stream_work_release;
-    }
-    return err;
-}
-
-static int native_stream_outbound_work_reserve(native_stream* stream, base_work* work) {
-    pthread_mutex_lock(&stream->mutex);
-    if (stream->stream == NULL || stream->closing) {
-        pthread_mutex_unlock(&stream->mutex);
-        return TREV_NODE_ERR_CLOSED;
-    }
-    stream->refs++;
-    work->owner = stream;
-    work->owner_release = native_stream_work_release;
-    work->outbound_registered = true;
-    if (stream->outbound_tail == NULL) {
-        stream->outbound_head = work;
-    } else {
-        stream->outbound_tail->outbound_next = work;
-    }
-    stream->outbound_tail = work;
-    pthread_mutex_unlock(&stream->mutex);
-    return 0;
-}
-
-static bool native_stream_outbound_is_head(native_stream* stream, base_work* work) {
-    pthread_mutex_lock(&stream->mutex);
-    bool is_head = work->outbound_registered && stream->outbound_head == work;
-    pthread_mutex_unlock(&stream->mutex);
-    return is_head;
-}
-
-static void native_stream_outbound_finish(native_stream* stream, base_work* work) {
-    pthread_mutex_lock(&stream->mutex);
-    if (!work->outbound_registered) {
-        pthread_mutex_unlock(&stream->mutex);
-        return;
-    }
-    base_work* previous = NULL;
-    base_work** link = &stream->outbound_head;
-    while (*link != NULL && *link != work) {
-        previous = *link;
-        link = &(*link)->outbound_next;
-    }
-    if (*link == work) {
-        *link = work->outbound_next;
-        if (stream->outbound_tail == work) {
-            stream->outbound_tail = previous;
+static void node_server_free_routes(napi_env env, node_server* server) {
+    node_server_route* route = server == NULL ? NULL : server->routes;
+    for (node_server_route* pending = route; pending != NULL; pending = pending->next) {
+        if (pending->active_calls != 0) {
+            return;
         }
     }
-    work->outbound_next = NULL;
-    work->outbound_registered = false;
-    pthread_mutex_unlock(&stream->mutex);
-}
-
-static int native_stream_operation_acquire(native_stream* stream, trevrpc_stream** out_stream) {
-    int err = native_stream_acquire(stream, out_stream);
-    if (err != 0) {
-        // The caller already reserved this operation before close. Distinguish its
-        // cancellation from a new operation rejected after the object closed.
-        return err == TREV_NODE_ERR_CLOSED ? -ECANCELED : err;
-    }
-    err = pthread_mutex_trylock(&stream->operation_mutex);
-    if (err == EBUSY) {
-        native_stream_release(stream);
-        return -EAGAIN;
-    }
-    if (err != 0) {
-        native_stream_release(stream);
-        return -err;
-    }
-
-    pthread_mutex_lock(&stream->mutex);
-    bool closing = stream->closing || stream->stream != *out_stream;
-    pthread_mutex_unlock(&stream->mutex);
-    if (closing) {
-        pthread_mutex_unlock(&stream->operation_mutex);
-        native_stream_release(stream);
-        return -ECANCELED;
-    }
-    return 0;
-}
-
-static void native_stream_operation_release(native_stream* stream) {
-    pthread_mutex_unlock(&stream->operation_mutex);
-    native_stream_release(stream);
-}
-
-static bool native_stream_cancel_requested(native_stream* stream) {
-    pthread_mutex_lock(&stream->mutex);
-    bool closing = stream->closing;
-    native_client* owner = stream->owner;
-    pthread_mutex_unlock(&stream->mutex);
-    if (closing || owner == NULL) {
-        return closing;
-    }
-    pthread_mutex_lock(&owner->mutex);
-    closing = owner->closing;
-    pthread_mutex_unlock(&owner->mutex);
-    return closing;
-}
-
-static int native_stream_normalize_cancelled_error(native_stream* stream, int err) {
-    return err != 0 && native_stream_cancel_requested(stream) ? -ECANCELED : err;
-}
-
-static void native_stream_close_request(native_stream* stream) {
-    if (stream == NULL) {
-        return;
-    }
-    trevrpc_stream* close_stream = NULL;
-    trevrpc_stream* cancel_stream = NULL;
-    bool should_release_owner = false;
-    pthread_mutex_lock(&stream->mutex);
-    stream->closing = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_release_locked(&stream->debug_outbound_gate);
-#endif
-    if (stream->refs == 0 && stream->stream != NULL) {
-        close_stream = stream->stream;
-        stream->stream = NULL;
-        should_release_owner = !stream->owner_released;
-        stream->owner_released = true;
-    } else if (stream->stream != NULL) {
-        cancel_stream = stream->stream;
-    }
-    pthread_mutex_unlock(&stream->mutex);
-
-    trevrpc_stream_cancel(cancel_stream);
-    trevrpc_stream_close(close_stream);
-    if (should_release_owner && stream->owner != NULL) {
-        native_client_release(stream->owner);
-    }
-    native_stream_maybe_destroy(stream);
-}
-
-static int native_call_acquire_internal(native_call* call, bool allow_completing, trevrpc_call** out_call) {
-    if (call == NULL) {
-        return TREV_NODE_ERR_CLOSED;
-    }
-    pthread_mutex_lock(&call->mutex);
-    if (call->call == NULL || (call->completing && !allow_completing)) {
-        pthread_mutex_unlock(&call->mutex);
-        return TREV_NODE_ERR_CLOSED;
-    }
-    int err = trevrpc_call_retain(call->call);
-    if (err != 0) {
-        pthread_mutex_unlock(&call->mutex);
-        return err;
-    }
-    call->refs++;
-    *out_call = call->call;
-    pthread_mutex_unlock(&call->mutex);
-    return 0;
-}
-
-static int native_call_acquire(native_call* call, trevrpc_call** out_call) {
-    return native_call_acquire_internal(call, false, out_call);
-}
-
-static int native_call_start_completion(native_call* call, trevrpc_call** out_call) {
-    if (call == NULL) {
-        return TREV_NODE_ERR_CLOSED;
-    }
-    pthread_mutex_lock(&call->mutex);
-    if (call->call == NULL || call->completing) {
-        pthread_mutex_unlock(&call->mutex);
-        return TREV_NODE_ERR_CLOSED;
-    }
-    int err = trevrpc_call_retain(call->call);
-    if (err != 0) {
-        pthread_mutex_unlock(&call->mutex);
-        return err;
-    }
-    call->completing = true;
-    call->refs++;
-    *out_call = call->call;
-    pthread_mutex_unlock(&call->mutex);
-    return 0;
-}
-
-static int native_call_operation_acquire(native_call* call, bool completion, trevrpc_call** out_call, base_work* work) {
-    if (completion && !work->completion_started) {
-        int start_err = native_call_start_completion(call, &work->completion_call);
-        if (start_err != 0) {
-            return start_err;
-        }
-        work->completion_started = true;
-    }
-    int err = native_call_acquire_internal(call, completion, out_call);
-    if (err != 0) {
-        return err;
-    }
-    err = pthread_mutex_trylock(&call->operation_mutex);
-    if (err == EBUSY) {
-        trevrpc_call* acquired = *out_call;
-        *out_call = NULL;
-        native_call_release_keep_wrapper(call, acquired);
-        work->retry = true;
-        return 0;
-    }
-    if (err != 0) {
-        trevrpc_call* acquired = *out_call;
-        *out_call = NULL;
-        native_call_release_keep_wrapper(call, acquired);
-        return -err;
-    }
-    return 0;
-}
-
-static void native_call_destroy(native_call* call) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&DebugNativeCallDestroys, 1, memory_order_relaxed);
-#endif
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_destroy(&call->debug_outbound_gate);
-#endif
-    pthread_mutex_destroy(&call->operation_mutex);
-    pthread_mutex_destroy(&call->mutex);
-    free(call);
-}
-
-static bool native_call_claim_destroy_locked(native_call* call) {
-    if (call->destroying || call->js_alive || call->refs != 0 || call->pins != 0 || call->call != NULL) {
-        return false;
-    }
-    call->destroying = true;
-    return true;
-}
-
-static void native_call_maybe_destroy(native_call* call) {
-    pthread_mutex_lock(&call->mutex);
-    bool destroy = native_call_claim_destroy_locked(call);
-    pthread_mutex_unlock(&call->mutex);
-    if (destroy) {
-        native_call_destroy(call);
-    }
-}
-
-static void native_call_release_pin(native_call* call) {
-    pthread_mutex_lock(&call->mutex);
-    if (call->pins > 0) {
-        call->pins--;
-    }
-    bool destroy = native_call_claim_destroy_locked(call);
-    pthread_mutex_unlock(&call->mutex);
-    if (destroy) {
-        native_call_destroy(call);
-    }
-}
-
-static bool native_call_unregister(native_call* call) {
-    pthread_mutex_lock(&call->mutex);
-    native_server* server = call->registered ? call->server : NULL;
-    if (server == NULL) {
-        pthread_mutex_unlock(&call->mutex);
-        return false;
-    }
-
-    bool removed = false;
-    pthread_mutex_lock(&server->mutex);
-    native_call** link = &server->calls;
-    while (*link != NULL && *link != call) {
-        link = &(*link)->server_next;
-    }
-    if (*link == call) {
-        *link = call->server_next;
-        call->server = NULL;
-        call->server_next = NULL;
-        call->registered = false;
-        removed = true;
-    }
-    pthread_mutex_unlock(&server->mutex);
-    pthread_mutex_unlock(&call->mutex);
-    if (!removed) {
-        return false;
-    }
-
-    native_call_release_pin(call);
-    native_server_release(server);
-    return true;
-}
-
-static void native_call_release_owner(trevrpc_call* call, bool cancel) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&DebugNativeCallOwnerReleases, 1, memory_order_relaxed);
-#endif
-    if (cancel) {
-        trevrpc_call_cancel(call);
-    }
-    trevrpc_call_close(call);
-    trevrpc_call_release(call);
-}
-
-static void native_call_release(native_call* call, trevrpc_call* acquired_call) {
-    trevrpc_call* owner_call = NULL;
-    pthread_mutex_lock(&call->mutex);
-    if (call->refs > 0) {
-        call->refs--;
-    }
-    if (call->completing && call->refs == 0 && call->call != NULL) {
-        owner_call = call->call;
-        call->call = NULL;
-    }
-    pthread_mutex_unlock(&call->mutex);
-
-    trevrpc_call_release(acquired_call);
-    if (owner_call != NULL) {
-        native_call_release_owner(owner_call, false);
-        (void)native_call_unregister(call);
-        return;
-    }
-    native_call_maybe_destroy(call);
-}
-
-static void native_call_work_release(void* owner) {
-    native_call_release(owner, NULL);
-}
-
-static int native_call_work_reserve(native_call* call, base_work* work) {
-    pthread_mutex_lock(&call->mutex);
-    if (call->call == NULL || call->completing) {
-        pthread_mutex_unlock(&call->mutex);
-        return TREV_NODE_ERR_CLOSED;
-    }
-    call->refs++;
-    pthread_mutex_unlock(&call->mutex);
-    work->owner = call;
-    work->owner_release = native_call_work_release;
-    return 0;
-}
-
-static int native_call_outbound_work_reserve(native_call* call, base_work* work) {
-    pthread_mutex_lock(&call->mutex);
-    if (call->call == NULL || call->completing) {
-        pthread_mutex_unlock(&call->mutex);
-        return TREV_NODE_ERR_CLOSED;
-    }
-    call->refs++;
-    work->owner = call;
-    work->owner_release = native_call_work_release;
-    work->outbound_registered = true;
-    if (call->outbound_tail == NULL) {
-        call->outbound_head = work;
-    } else {
-        call->outbound_tail->outbound_next = work;
-    }
-    call->outbound_tail = work;
-    pthread_mutex_unlock(&call->mutex);
-    return 0;
-}
-
-static bool native_call_outbound_is_head(native_call* call, base_work* work) {
-    pthread_mutex_lock(&call->mutex);
-    bool is_head = work->outbound_registered && call->outbound_head == work;
-    pthread_mutex_unlock(&call->mutex);
-    return is_head;
-}
-
-static void native_call_outbound_finish(native_call* call, base_work* work) {
-    pthread_mutex_lock(&call->mutex);
-    if (!work->outbound_registered) {
-        pthread_mutex_unlock(&call->mutex);
-        return;
-    }
-    base_work* previous = NULL;
-    base_work** link = &call->outbound_head;
-    while (*link != NULL && *link != work) {
-        previous = *link;
-        link = &(*link)->outbound_next;
-    }
-    if (*link == work) {
-        *link = work->outbound_next;
-        if (call->outbound_tail == work) {
-            call->outbound_tail = previous;
-        }
-    }
-    work->outbound_next = NULL;
-    work->outbound_registered = false;
-    pthread_mutex_unlock(&call->mutex);
-}
-
-static void native_call_release_keep_wrapper(native_call* call, trevrpc_call* acquired_call) {
-    trevrpc_call* owner_call = NULL;
-    pthread_mutex_lock(&call->mutex);
-    if (call->refs > 0) {
-        call->refs--;
-    }
-    if (call->completing && call->refs == 0 && call->call != NULL) {
-        owner_call = call->call;
-        call->call = NULL;
-    }
-    pthread_mutex_unlock(&call->mutex);
-    trevrpc_call_release(acquired_call);
-    if (owner_call != NULL) {
-        native_call_release_owner(owner_call, false);
-        (void)native_call_unregister(call);
-    }
-}
-
-static void native_call_work_operation_release(native_call* call, trevrpc_call* acquired_call) {
-    pthread_mutex_unlock(&call->operation_mutex);
-    native_call_release_keep_wrapper(call, acquired_call);
-}
-
-static void native_call_terminal_operation_complete(native_call* call, trevrpc_call* acquired_call, base_work* work) {
-    trevrpc_call* completion_call = work->completion_call;
-    trevrpc_call* owner_call = NULL;
-    work->completion_call = NULL;
-    pthread_mutex_unlock(&call->operation_mutex);
-
-    pthread_mutex_lock(&call->mutex);
-    if (call->call == completion_call) {
-        owner_call = call->call;
-        call->call = NULL;
-    }
-    if (call->refs > 0) {
-        call->refs--;
-    }
-    if (completion_call != NULL && call->refs > 0) {
-        call->refs--;
-    }
-    pthread_mutex_unlock(&call->mutex);
-
-    trevrpc_call_release(acquired_call);
-    trevrpc_call_release(completion_call);
-    if (owner_call != NULL) {
-        native_call_release_owner(owner_call, false);
-        (void)native_call_unregister(call);
-    }
-}
-
-static void native_call_terminal_abandon(native_call* call, base_work* work) {
-    if (!work->completion_started) {
-        return;
-    }
-    trevrpc_call* completion_call = work->completion_call;
-    work->completion_call = NULL;
-    trevrpc_call* owner_call = NULL;
-
-    pthread_mutex_lock(&call->mutex);
-    call->completing = true;
-    owner_call = call->call;
-    call->call = NULL;
-    if (completion_call != NULL && call->refs > 0) {
-        call->refs--;
-    }
-    pthread_mutex_unlock(&call->mutex);
-
-    trevrpc_call_release(completion_call);
-    if (owner_call != NULL) {
-        native_call_release_owner(owner_call, true);
-        (void)native_call_unregister(call);
-    }
-}
-
-static void native_call_close_request_internal(native_call* call, bool finalizing) {
-    if (call == NULL) {
-        return;
-    }
-    trevrpc_call* owner_call = NULL;
-    trevrpc_call* cancel_call = NULL;
-    pthread_mutex_lock(&call->mutex);
-    call->pins++;
-    if (finalizing) {
-        call->js_alive = false;
-    }
-    call->completing = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_release_locked(&call->debug_outbound_gate);
-#endif
-    if (call->refs == 0 && call->call != NULL) {
-        owner_call = call->call;
-        call->call = NULL;
-    } else if (call->call != NULL && trevrpc_call_retain(call->call) == 0) {
-        cancel_call = call->call;
-    }
-    pthread_mutex_unlock(&call->mutex);
-
-    trevrpc_call_cancel(cancel_call);
-    trevrpc_call_release(cancel_call);
-    if (owner_call != NULL) {
-        native_call_release_owner(owner_call, false);
-        (void)native_call_unregister(call);
-    }
-    native_call_release_pin(call);
-}
-
-static void native_call_close_request(native_call* call) {
-    native_call_close_request_internal(call, false);
-}
-
-static void free_server_routes(napi_env env, server_route* route) {
     while (route != NULL) {
-        server_route* next = route->next;
-        if (env != NULL && route->handler_ref != NULL) {
-            napi_delete_reference(env, route->handler_ref);
+        node_server_route* next = route->next;
+        if (route->handler_ref != NULL && node_runtime_napi_legal(server->runtime)) {
+            (void)napi_delete_reference(env, route->handler_ref);
         }
         free(route->service);
         free(route->method);
         free(route);
         route = next;
     }
+    if (server != NULL) {
+        server->routes = NULL;
+    }
 }
 
-static void native_server_maybe_destroy(native_server* server) {
-    bool destroy = false;
-    pthread_mutex_lock(&server->mutex);
-    if (!server->destroying && !server->js_alive && server->refs == 0 && server->server == NULL &&
-        server->call_tsfn == NULL && server->http3_admission == NULL && server->routes == NULL &&
-        server->calls == NULL) {
-        server->destroying = true;
-        destroy = true;
+static napi_value node_server_register(napi_env env, napi_callback_info info) {
+    napi_value argv[4] = {NULL, NULL, NULL, NULL};
+    napi_value this_value;
+    size_t argc = 4;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_value, NULL) != napi_ok || argc != 4) {
+        return node_throw_error(env, -EINVAL, "register");
     }
-    pthread_mutex_unlock(&server->mutex);
-    if (destroy) {
-        pthread_mutex_destroy(&server->mutex);
+    node_server* server = NULL;
+    if (napi_unwrap(env, this_value, (void**)&server) != napi_ok || server == NULL || server->closing ||
+        server->closed) {
+        return node_throw_error(env, -ESHUTDOWN, "register");
+    }
+    node_server_route* route = calloc(1, sizeof(*route));
+    if (route == NULL) {
+        return node_throw_error(env, -ENOMEM, "register");
+    }
+    uint32_t service_len = 0;
+    uint32_t method_len = 0;
+    if (node_copy_js_string(env, argv[0], &route->service, &service_len) != 0 ||
+        node_copy_js_string(env, argv[1], &route->method, &method_len) != 0 ||
+        napi_get_value_uint32(env, argv[2], &route->kind) != napi_ok ||
+        route->kind > TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
+        free(route->service);
+        free(route->method);
+        free(route);
+        return node_throw_error(env, -EINVAL, "register");
+    }
+    napi_valuetype type;
+    if (napi_typeof(env, argv[3], &type) != napi_ok || type != napi_function ||
+        napi_create_reference(env, argv[3], 1, &route->handler_ref) != napi_ok) {
+        free(route->service);
+        free(route->method);
+        free(route);
+        return node_throw_error(env, -EINVAL, "register");
+    }
+    route->server = server;
+    route->next = server->routes;
+    server->routes = route;
+    napi_value undefined;
+    (void)napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static napi_value node_server_serve(napi_env env, napi_callback_info info) {
+    napi_value this_value;
+    size_t argc = 0;
+    if (napi_get_cb_info(env, info, &argc, NULL, &this_value, NULL) != napi_ok) {
+        return node_rejected_native_promise(env, -EIO, "serve");
+    }
+    node_server* server = NULL;
+    if (napi_unwrap(env, this_value, (void**)&server) != napi_ok || server == NULL) {
+        return node_rejected_native_promise(env, -ESTALE, "serve");
+    }
+    if (server->serve_promise_ref != NULL) {
+        napi_value promise = NULL;
+        if (napi_get_reference_value(env, server->serve_promise_ref, &promise) == napi_ok) {
+            return promise;
+        }
+        return node_rejected_native_promise(env, -EIO, "serve");
+    }
+    napi_value promise = node_new_promise(env, &server->serve_deferred);
+    if (promise == NULL || napi_create_reference(env, promise, 1, &server->serve_promise_ref) != napi_ok) {
+        return promise == NULL ? NULL : node_rejected_native_promise(env, -ENOMEM, "serve");
+    }
+    server->serve_called = true;
+    if (server->closed) {
+        node_resolve_undefined(env, server->serve_deferred);
+        server->serve_deferred = NULL;
+    }
+    return promise;
+}
+
+static napi_value node_server_close(napi_env env, napi_callback_info info) {
+    napi_value this_value;
+    size_t argc = 0;
+    if (napi_get_cb_info(env, info, &argc, NULL, &this_value, NULL) != napi_ok) {
+        return node_throw_error(env, -EIO, "server.close");
+    }
+    node_server* server = NULL;
+    if (napi_unwrap(env, this_value, (void**)&server) != napi_ok || server == NULL) {
+        return node_throw_error(env, -ESTALE, "server.close");
+    }
+    server->closing = true;
+    if (server->endpoint != NULL) {
+        (void)node_client_request_close(server->endpoint);
+    }
+    napi_value undefined;
+    (void)napi_get_undefined(env, &undefined);
+    return undefined;
+}
+
+static void node_server_finalizer(napi_env env, void* data, void* hint) {
+    (void)hint;
+    node_server* server = data;
+    if (server == NULL)
+        return;
+    server->wrapper_alive = false;
+    if (server->wrapper_ref != NULL && node_runtime_napi_legal(server->runtime)) {
+        (void)napi_delete_reference(env, server->wrapper_ref);
+        server->wrapper_ref = NULL;
+    }
+    if (server->serve_promise_ref != NULL && node_runtime_napi_legal(server->runtime)) {
+        (void)napi_delete_reference(env, server->serve_promise_ref);
+        server->serve_promise_ref = NULL;
+    }
+    if (server->admission_ref != NULL && node_runtime_napi_legal(server->runtime)) {
+        (void)napi_delete_reference(env, server->admission_ref);
+        server->admission_ref = NULL;
+    }
+    if (server->runtime != NULL && !server->runtime->cleanup_started) {
+        server->closing = true;
+        if (server->endpoint != NULL)
+            (void)node_client_request_close(server->endpoint);
+    }
+    if (server->runtime == NULL) {
+        node_server_free_routes(env, server);
         free(server);
     }
 }
 
-static void native_server_release_count(native_server* server, size_t count) {
-    pthread_mutex_lock(&server->mutex);
-    if (count >= server->refs) {
-        server->refs = 0;
-    } else {
-        server->refs -= count;
-    }
-    pthread_mutex_unlock(&server->mutex);
-    native_server_maybe_destroy(server);
-}
-
-static void native_server_release(native_server* server) {
-    native_server_release_count(server, 1);
-}
-
-static int native_server_shutdown_and_release(trevrpc_server* server, bool force_cancel) {
-    if (server == NULL) {
-        return 0;
-    }
-    int result = force_cancel ? trevrpc_server_cancel(server) : trevrpc_server_stop(server);
-    int err = trevrpc_server_wait_until(server, TREVRPC_DEADLINE_INFINITE);
-    if (result == 0) {
-        result = err;
-    }
-    if (err == 0) {
-        err = trevrpc_server_release(server);
-        if (result == 0) {
-            result = err;
-        }
-    }
-    return result;
-}
-
-static int native_server_cancel_and_release(trevrpc_server* server) {
-    return native_server_shutdown_and_release(server, true);
-}
-
-static void native_server_close_request(native_server* server, bool force_cancel) {
-    if (server == NULL) {
-        return;
-    }
-    trevrpc_server* release_server = NULL;
-    trevrpc_server* shutdown_server = NULL;
-    napi_env env = NULL;
-    bool cancel_on_close = force_cancel;
-    size_t call_refs = 0;
-    native_call* calls = NULL;
-    pthread_mutex_lock(&server->mutex);
-    server->refs++;
-    server->closing = true;
-    server->cancel_on_close = server->cancel_on_close || force_cancel;
-    cancel_on_close = server->cancel_on_close;
-    node_http3_admission_state* admission = server->http3_admission;
-    if (cancel_on_close) {
-        calls = server->calls;
-        server->calls = NULL;
-    }
-    if (!server->serving && server->server != NULL) {
-        release_server = server->server;
-        server->server = NULL;
-    } else {
-        shutdown_server = server->server;
-    }
-    env = server->env;
-    pthread_mutex_unlock(&server->mutex);
-
-    while (calls != NULL) {
-        native_call* next = calls->server_next;
-        pthread_mutex_lock(&calls->mutex);
-        calls->server = NULL;
-        calls->server_next = NULL;
-        calls->registered = false;
-        pthread_mutex_unlock(&calls->mutex);
-        native_call_close_request(calls);
-        native_call_release_pin(calls);
-        call_refs++;
-        calls = next;
-    }
-
-    http3_admission_state_shutdown(admission);
-    if (cancel_on_close) {
-        (void)trevrpc_server_cancel(shutdown_server);
-    } else {
-        (void)trevrpc_server_stop(shutdown_server);
-    }
-    (void)native_server_shutdown_and_release(release_server, cancel_on_close);
-    if (release_server != NULL) {
-        napi_threadsafe_function tsfn = NULL;
-        node_http3_admission_state* admission_state = NULL;
-        pthread_mutex_lock(&server->mutex);
-        tsfn = server->call_tsfn;
-        server->call_tsfn = NULL;
-        admission_state = server->http3_admission;
-        server->http3_admission = NULL;
-        pthread_mutex_unlock(&server->mutex);
-        if (tsfn != NULL) {
-            napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
-        }
-        free_server_routes(env, server->routes);
-        server->routes = NULL;
-        http3_admission_state_release(admission_state);
-    }
-    native_server_release_count(server, call_refs + 1);
-}
-
-static void native_server_close_after_serve(native_server* server, napi_env env, bool server_closed) {
-    trevrpc_server* release_server = NULL;
-    napi_threadsafe_function tsfn = NULL;
-    node_http3_admission_state* admission_state = NULL;
-    bool cancel_on_close = false;
-    pthread_mutex_lock(&server->mutex);
-    server->serving = false;
-    if (!server_closed && server->closing && server->server != NULL) {
-        release_server = server->server;
-        server->server = NULL;
-        cancel_on_close = server->cancel_on_close;
-    }
-    if (server_closed || release_server != NULL) {
-        tsfn = server->call_tsfn;
-        server->call_tsfn = NULL;
-        admission_state = server->http3_admission;
-        server->http3_admission = NULL;
-    }
-    pthread_mutex_unlock(&server->mutex);
-    (void)native_server_shutdown_and_release(release_server, cancel_on_close);
-    if (tsfn != NULL) {
-        napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
-    }
-    http3_admission_state_release(admission_state);
-    if (server_closed || release_server != NULL) {
-        free_server_routes(env, server->routes);
-        server->routes = NULL;
-    }
-}
-
-static void native_work_release_owner(base_work* work) {
-    if (work != NULL && work->owner_release != NULL) {
-        void (*release)(void*) = work->owner_release;
-        void* owner = work->owner;
-        work->owner_release = NULL;
-        work->owner = NULL;
-        release(owner);
-    }
-}
-
-static void native_work_delete(native_async_work* work) {
-    if (work != NULL) {
-        native_work_release_owner(work->base);
-    }
-    free(work);
-}
-
-static void native_completion_runtime_retain(native_completion_runtime* runtime) {
-    atomic_fetch_add_explicit(&runtime->refs, 1, memory_order_relaxed);
-}
-
-static void native_completion_runtime_destroy(native_completion_runtime* runtime) {
-    free(runtime->retry_heap);
-    runtime->retry_heap = NULL;
-    runtime->retry_heap_len = 0;
-    runtime->retry_heap_cap = 0;
-    if (runtime->cond_initialized) {
-        pthread_cond_destroy(&runtime->cond);
-        runtime->cond_initialized = false;
-    }
-    if (runtime->mutex_initialized) {
-        pthread_mutex_destroy(&runtime->mutex);
-        runtime->mutex_initialized = false;
-    }
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&DebugCompletionRuntimeDestroys, 1, memory_order_relaxed);
-#endif
-    free(runtime);
-}
-
-static void native_completion_runtime_release(native_completion_runtime* runtime) {
-    if (runtime != NULL && atomic_fetch_sub_explicit(&runtime->refs, 1, memory_order_acq_rel) == 1) {
-        native_completion_runtime_destroy(runtime);
-    }
-}
-
-static void native_completion_runtime_delete_constructor_refs(napi_env env, native_completion_runtime* runtime) {
-    napi_ref* refs[] = {
-        &runtime->client_constructor,
-        &runtime->stream_constructor,
-        &runtime->server_constructor,
-        &runtime->call_constructor,
-        &runtime->cancellation_constructor,
-    };
-    for (size_t i = 0; i < sizeof(refs) / sizeof(refs[0]); i++) {
-        if (*refs[i] != NULL) {
-            (void)napi_delete_reference(env, *refs[i]);
-            *refs[i] = NULL;
-        }
-    }
-}
-
-static void native_completion_runtime_unref_loop(napi_env env, native_completion_runtime* runtime) {
-    if (runtime == NULL || runtime->tsfn == NULL) {
-        return;
-    }
-
-    bool should_unref = false;
-    pthread_mutex_lock(&runtime->mutex);
-    if (runtime->loop_ref_count > 0) {
-        runtime->loop_ref_count--;
-        should_unref = runtime->loop_ref_count == 0;
-    }
-    pthread_mutex_unlock(&runtime->mutex);
-
-    if (should_unref) {
-        (void)napi_unref_threadsafe_function(env, runtime->tsfn);
-    }
-}
-
-static int native_completion_runtime_ref_loop(napi_env env, native_completion_runtime* runtime) {
-    if (runtime == NULL || runtime->tsfn == NULL) {
-        return -EINVAL;
-    }
-
-    bool should_ref = false;
-    pthread_mutex_lock(&runtime->mutex);
-    if (runtime->stopping) {
-        pthread_mutex_unlock(&runtime->mutex);
-        return -ECANCELED;
-    }
-    if (runtime->loop_ref_count == 0) {
-        should_ref = true;
-    }
-    runtime->loop_ref_count++;
-    pthread_mutex_unlock(&runtime->mutex);
-
-    if (should_ref && napi_ref_threadsafe_function(env, runtime->tsfn) != napi_ok) {
-        pthread_mutex_lock(&runtime->mutex);
-        if (runtime->loop_ref_count > 0) {
-            runtime->loop_ref_count--;
-        }
-        pthread_mutex_unlock(&runtime->mutex);
-        return -ENOMEM;
-    }
-    return 0;
-}
-
-static void native_completion_enqueue_locked(native_completion_runtime* runtime, native_async_work* work);
-
-static int native_completion_enqueue(native_completion_runtime* runtime, native_async_work* work) {
-    pthread_mutex_lock(&runtime->mutex);
-    if (runtime->stopping) {
-        pthread_mutex_unlock(&runtime->mutex);
-        return -ECANCELED;
-    }
-    native_completion_enqueue_locked(runtime, work);
-    pthread_cond_broadcast(&runtime->cond);
-    pthread_mutex_unlock(&runtime->mutex);
-    return 0;
-}
-
-static void native_completion_enqueue_locked(native_completion_runtime* runtime, native_async_work* work) {
-    work->next = NULL;
-    if (runtime->tail == NULL) {
-        runtime->head = work;
-    } else {
-        runtime->tail->next = work;
-    }
-    runtime->tail = work;
-}
-
-static void native_completion_retry_heap_swap(native_async_work** left, native_async_work** right) {
-    native_async_work* value = *left;
-    *left = *right;
-    *right = value;
-}
-
-static int native_completion_retry_heap_push_locked(native_completion_runtime* runtime, native_async_work* work) {
-    if (runtime->retry_heap_len == runtime->retry_heap_cap) {
-        size_t next_cap = runtime->retry_heap_cap == 0 ? 64 : runtime->retry_heap_cap * 2;
-        if (next_cap < runtime->retry_heap_cap || next_cap > SIZE_MAX / sizeof(*runtime->retry_heap)) {
-            return -ENOMEM;
-        }
-        native_async_work** next = realloc(runtime->retry_heap, next_cap * sizeof(*next));
-        if (next == NULL) {
-            return -ENOMEM;
-        }
-        runtime->retry_heap = next;
-        runtime->retry_heap_cap = next_cap;
-    }
-
-    size_t index = runtime->retry_heap_len++;
-    runtime->retry_heap[index] = work;
-    while (index > 0) {
-        size_t parent = (index - 1) / 2;
-        if (runtime->retry_heap[parent]->retry_due_nanos <= work->retry_due_nanos) {
-            break;
-        }
-        native_completion_retry_heap_swap(&runtime->retry_heap[parent], &runtime->retry_heap[index]);
-        index = parent;
-    }
-    if (runtime->cond_initialized) {
-        pthread_cond_broadcast(&runtime->cond);
-    }
-    return 0;
-}
-
-static native_async_work* native_completion_retry_heap_pop_locked(native_completion_runtime* runtime) {
-    if (runtime->retry_heap_len == 0) {
-        return NULL;
-    }
-    native_async_work* result = runtime->retry_heap[0];
-    runtime->retry_heap_len--;
-    if (runtime->retry_heap_len == 0) {
-        return result;
-    }
-
-    runtime->retry_heap[0] = runtime->retry_heap[runtime->retry_heap_len];
-    size_t index = 0;
-    for (;;) {
-        size_t left = index * 2 + 1;
-        size_t right = left + 1;
-        if (left >= runtime->retry_heap_len) {
-            break;
-        }
-        size_t next = right < runtime->retry_heap_len &&
-                              runtime->retry_heap[right]->retry_due_nanos < runtime->retry_heap[left]->retry_due_nanos
-                          ? right
-                          : left;
-        if (runtime->retry_heap[index]->retry_due_nanos <= runtime->retry_heap[next]->retry_due_nanos) {
-            break;
-        }
-        native_completion_retry_heap_swap(&runtime->retry_heap[index], &runtime->retry_heap[next]);
-        index = next;
-    }
-    return result;
-}
-
-static void native_completion_active_remove_locked(native_completion_runtime* runtime, native_async_work* work) {
-    native_async_work** link = &runtime->active;
-    while (*link != NULL) {
-        if (*link == work) {
-            *link = work->active_next;
-            work->active_next = NULL;
-            return;
-        }
-        link = &(*link)->active_next;
-    }
-}
-
-static void native_completion_tsfn_remove_locked(native_completion_runtime* runtime, native_async_work* work) {
-    if (work->tsfn_prev == NULL) {
-        if (runtime->tsfn_pending != work) {
-            return;
-        }
-        runtime->tsfn_pending = work->tsfn_next;
-    } else {
-        work->tsfn_prev->tsfn_next = work->tsfn_next;
-    }
-    if (work->tsfn_next != NULL) {
-        work->tsfn_next->tsfn_prev = work->tsfn_prev;
-    }
-    work->tsfn_prev = NULL;
-    work->tsfn_next = NULL;
-}
-
-static void native_completion_abandon(native_async_work* work) {
-    if (work->abandon != NULL) {
-        work->abandon(NULL, napi_cancelled, work->base);
-    } else {
-        native_work_delete(work);
-    }
-}
-
-static void native_completion_complete_js(napi_env env, napi_value js_callback, void* context, void* data) {
-    (void)context;
-    native_async_work* work = data;
-    if (work == NULL) {
-        return;
-    }
-
-    native_completion_runtime* runtime = work->runtime;
-    pthread_mutex_lock(&runtime->mutex);
-    native_completion_tsfn_remove_locked(runtime, work);
-    bool stopping = runtime->stopping;
-    pthread_mutex_unlock(&runtime->mutex);
-    if (env == NULL || js_callback == NULL || stopping) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        atomic_fetch_add_explicit(&DebugCompletionRuntimeEnvNullAbandons, 1, memory_order_relaxed);
-        atomic_uint_least64_t* cause = env == NULL || js_callback == NULL
-                                           ? &DebugCompletionRuntimeCallbackEnvNullAbandons
-                                           : &DebugCompletionRuntimeStoppingAbandons;
-        atomic_fetch_add_explicit(cause, 1, memory_order_relaxed);
-#endif
-        native_completion_abandon(work);
-        return;
-    }
-    work->complete(env, napi_ok, work->base);
-    native_completion_runtime_unref_loop(env, runtime);
-}
-
-static void* native_completion_worker_main(void* data) {
-    native_completion_runtime* runtime = data;
-    for (;;) {
-        pthread_mutex_lock(&runtime->mutex);
-        while (runtime->head == NULL && !runtime->stopping) {
-            pthread_cond_wait(&runtime->cond, &runtime->mutex);
-        }
-        if (runtime->head == NULL && runtime->stopping) {
-            pthread_mutex_unlock(&runtime->mutex);
-            break;
-        }
-
-        native_async_work* work = runtime->head;
-        runtime->head = work->next;
-        if (runtime->head == NULL) {
-            runtime->tail = NULL;
-        }
-        work->next = NULL;
-        work->active_next = runtime->active;
-        runtime->active = work;
-        pthread_mutex_unlock(&runtime->mutex);
-
-        if (work->base->err == 0) {
-            work->execute(runtime->env, work->base);
-        }
-        pthread_mutex_lock(&runtime->mutex);
-        native_completion_active_remove_locked(runtime, work);
-        bool stopping = runtime->stopping;
-        bool queued_for_retry = false;
-        int retry_err = 0;
-        if (work->base->retry && !stopping) {
-            work->base->retry = false;
-            work->retry_delay_nanos =
-                work->retry_delay_nanos == 0 ? TREV_NODE_COMPLETION_POLL_MIN_NANOS : work->retry_delay_nanos * 2;
-            if (work->retry_delay_nanos > TREV_NODE_COMPLETION_POLL_MAX_NANOS) {
-                work->retry_delay_nanos = TREV_NODE_COMPLETION_POLL_MAX_NANOS;
-            }
-            uint64_t now_nanos = 0;
-            int clock_err = native_monotonic_now_nanos(&now_nanos);
-            if (clock_err != 0) {
-                retry_err = -clock_err;
-            } else {
-                work->retry_due_nanos =
-                    now_nanos > UINT64_MAX - work->retry_delay_nanos ? UINT64_MAX : now_nanos + work->retry_delay_nanos;
-                retry_err = native_completion_retry_heap_push_locked(runtime, work);
-                queued_for_retry = retry_err == 0;
-            }
-        }
-        pthread_mutex_unlock(&runtime->mutex);
-        if (queued_for_retry) {
-            continue;
-        }
-        work->retry_due_nanos = 0;
-        if (retry_err != 0) {
-            work->base->err = retry_err;
-        }
-        if (stopping) {
-            native_completion_abandon(work);
-            continue;
-        }
-        pthread_mutex_lock(&runtime->mutex);
-        if (runtime->stopping) {
-            pthread_mutex_unlock(&runtime->mutex);
-            native_completion_abandon(work);
-            continue;
-        }
-        work->tsfn_prev = NULL;
-        work->tsfn_next = runtime->tsfn_pending;
-        if (runtime->tsfn_pending != NULL) {
-            runtime->tsfn_pending->tsfn_prev = work;
-        }
-        runtime->tsfn_pending = work;
-        pthread_mutex_unlock(&runtime->mutex);
-
-        napi_status status = napi_call_threadsafe_function(runtime->tsfn, work, napi_tsfn_blocking);
-        if (status != napi_ok) {
-            pthread_mutex_lock(&runtime->mutex);
-            native_completion_tsfn_remove_locked(runtime, work);
-            pthread_mutex_unlock(&runtime->mutex);
-            native_completion_abandon(work);
-            continue;
-        }
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        atomic_fetch_add_explicit(&DebugCompletionRuntimeTsfnAcceptances, 1, memory_order_relaxed);
-#endif
-    }
-
-    if (runtime->tsfn != NULL) {
-        (void)napi_release_threadsafe_function(runtime->tsfn, napi_tsfn_release);
-    }
-    return NULL;
-}
-
-static void* native_completion_scheduler_main(void* data) {
-    native_completion_runtime* runtime = data;
-    pthread_mutex_lock(&runtime->mutex);
-    while (!runtime->stopping) {
-        if (runtime->retry_heap_len == 0) {
-            pthread_cond_wait(&runtime->cond, &runtime->mutex);
-            continue;
-        }
-
-        uint64_t now_nanos = 0;
-        int clock_err = native_monotonic_now_nanos(&now_nanos);
-        if (clock_err != 0) {
-            native_async_work* work = native_completion_retry_heap_pop_locked(runtime);
-            work->retry_due_nanos = 0;
-            work->base->err = -clock_err;
-            native_completion_enqueue_locked(runtime, work);
-            pthread_cond_broadcast(&runtime->cond);
-            continue;
-        }
-
-        uint64_t due_nanos = runtime->retry_heap[0]->retry_due_nanos;
-        if (due_nanos > now_nanos) {
-            int wait_err = native_condition_timedwait_until(
-                &runtime->cond, &runtime->mutex, runtime->cond_clock, due_nanos, now_nanos);
-            if (wait_err == 0 || wait_err == ETIMEDOUT) {
-                continue;
-            }
-            native_async_work* work = native_completion_retry_heap_pop_locked(runtime);
-            work->retry_due_nanos = 0;
-            work->base->err = -wait_err;
-            native_completion_enqueue_locked(runtime, work);
-            pthread_cond_broadcast(&runtime->cond);
-            continue;
-        }
-
-        do {
-            native_async_work* work = native_completion_retry_heap_pop_locked(runtime);
-            work->retry_due_nanos = 0;
-            native_completion_enqueue_locked(runtime, work);
-            clock_err = native_monotonic_now_nanos(&now_nanos);
-        } while (clock_err == 0 && runtime->retry_heap_len > 0 && runtime->retry_heap[0]->retry_due_nanos <= now_nanos);
-        pthread_cond_broadcast(&runtime->cond);
-    }
-    pthread_mutex_unlock(&runtime->mutex);
-    return NULL;
-}
-
-static void native_completion_runtime_close(native_completion_runtime* runtime) {
-    if (runtime == NULL) {
-        return;
-    }
-    if (!runtime->mutex_initialized) {
-        if (!runtime->closed) {
-            runtime->closed = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-            atomic_fetch_add_explicit(&DebugCompletionRuntimeCloses, 1, memory_order_relaxed);
-#endif
-        }
-        return;
-    }
-
-    pthread_mutex_lock(&runtime->mutex);
-    while (runtime->closing && !runtime->closed) {
-        pthread_cond_wait(&runtime->cond, &runtime->mutex);
-    }
-    if (runtime->closed) {
-        pthread_mutex_unlock(&runtime->mutex);
-        return;
-    }
-    runtime->closing = true;
-    runtime->stopping = true;
-    native_async_work* abandoned = runtime->head;
-    runtime->head = NULL;
-    runtime->tail = NULL;
-    while (runtime->retry_heap_len > 0) {
-        native_async_work* work = native_completion_retry_heap_pop_locked(runtime);
-        work->next = abandoned;
-        abandoned = work;
-    }
-    for (native_async_work* work = runtime->active; work != NULL; work = work->active_next) {
-        if (work->cancel != NULL) {
-            work->cancel(work->base);
-        }
-    }
-    if (runtime->cond_initialized) {
-        pthread_cond_broadcast(&runtime->cond);
-    }
-    pthread_mutex_unlock(&runtime->mutex);
-
-    while (abandoned != NULL) {
-        native_async_work* next = abandoned->next;
-        abandoned->next = NULL;
-        if (abandoned->cancel != NULL) {
-            abandoned->cancel(abandoned->base);
-        }
-        native_completion_abandon(abandoned);
-        abandoned = next;
-    }
-
-    if (runtime->scheduler_started) {
-        pthread_join(runtime->scheduler, NULL);
-        runtime->scheduler_started = false;
-    }
-    for (size_t i = 0; i < runtime->worker_count; i++) {
-        pthread_join(runtime->workers[i], NULL);
-    }
-    runtime->worker_count = 0;
-    if (runtime->tsfn != NULL) {
-        (void)napi_release_threadsafe_function(runtime->tsfn, napi_tsfn_abort);
-        runtime->tsfn = NULL;
-    }
-
-    pthread_mutex_lock(&runtime->mutex);
-    runtime->loop_ref_count = 0;
-    runtime->closed = true;
-    runtime->closing = false;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&DebugCompletionRuntimeCloses, 1, memory_order_relaxed);
-#endif
-    if (runtime->cond_initialized) {
-        pthread_cond_broadcast(&runtime->cond);
-    }
-    pthread_mutex_unlock(&runtime->mutex);
-}
-
-static void native_completion_runtime_tsfn_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
-    (void)hint;
-    native_completion_runtime* runtime = data;
-    pthread_mutex_lock(&runtime->mutex);
-    native_async_work* abandoned = runtime->tsfn_pending;
-    runtime->tsfn_pending = NULL;
-    pthread_mutex_unlock(&runtime->mutex);
-    while (abandoned != NULL) {
-        native_async_work* next = abandoned->tsfn_next;
-        abandoned->tsfn_prev = NULL;
-        abandoned->tsfn_next = NULL;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        atomic_fetch_add_explicit(&DebugCompletionRuntimeEnvNullAbandons, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&DebugCompletionRuntimeFinalizerAbandons, 1, memory_order_relaxed);
-#endif
-        native_completion_abandon(abandoned);
-        abandoned = next;
-    }
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&DebugCompletionRuntimeTsfnFinalizers, 1, memory_order_relaxed);
-#endif
-    native_completion_runtime_release(runtime);
-}
-
-static void native_completion_runtime_instance_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
-    (void)hint;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&DebugCompletionRuntimeInstanceFinalizers, 1, memory_order_relaxed);
-#endif
-    native_completion_runtime_release(data);
-}
-
-static void native_completion_runtime_cleanup(void* data) {
-    native_completion_runtime_close(data);
-}
-
-static int native_completion_runtime_init(napi_env env, native_completion_runtime* runtime) {
-    runtime->env = env;
-    if (pthread_mutex_init(&runtime->mutex, NULL) != 0) {
-        return -ENOMEM;
-    }
-    runtime->mutex_initialized = true;
-    int cond_err = native_condition_init(&runtime->cond, &runtime->cond_clock);
-    if (cond_err != 0) {
-        return -cond_err;
-    }
-    runtime->cond_initialized = true;
-
-    napi_value callback = NULL;
-    napi_value resource_name = NULL;
-    if (napi_create_function(env, "nativeCompletion", NAPI_AUTO_LENGTH, noop_js_callback, NULL, &callback) != napi_ok ||
-        napi_create_string_utf8(env, "TrevRpcNativeCompletion", NAPI_AUTO_LENGTH, &resource_name) != napi_ok ||
-        napi_create_threadsafe_function(env,
-            callback,
-            NULL,
-            resource_name,
-            0,
-            1,
-            runtime,
-            native_completion_runtime_tsfn_finalize,
-            NULL,
-            native_completion_complete_js,
-            &runtime->tsfn) != napi_ok) {
-        return -ENOMEM;
-    }
-    native_completion_runtime_retain(runtime);
-    if (napi_unref_threadsafe_function(env, runtime->tsfn) != napi_ok) {
-        return -ENOMEM;
-    }
-
-    if (pthread_create(&runtime->scheduler, NULL, native_completion_scheduler_main, runtime) != 0) {
-        return -ENOMEM;
-    }
-    runtime->scheduler_started = true;
-
-    for (size_t i = 0; i < TREV_NODE_COMPLETION_WORKERS; i++) {
-        if (napi_acquire_threadsafe_function(runtime->tsfn) != napi_ok) {
-            return -ENOMEM;
-        }
-        if (pthread_create(&runtime->workers[runtime->worker_count], NULL, native_completion_worker_main, runtime) !=
-            0) {
-            (void)napi_release_threadsafe_function(runtime->tsfn, napi_tsfn_release);
-            return -ENOMEM;
-        }
-        runtime->worker_count++;
-    }
-
-    return 0;
-}
-
-static native_completion_runtime* native_completion_runtime_for_env(napi_env env) {
-    native_completion_runtime* runtime = NULL;
-    if (napi_get_instance_data(env, (void**)&runtime) != napi_ok) {
-        return NULL;
-    }
-    return runtime;
-}
-
-static napi_value queue_work_managed(napi_env env,
-    base_work* work,
-    const char* name,
-    napi_async_execute_callback execute,
-    napi_async_complete_callback complete,
-    napi_async_complete_callback abandon,
-    void (*cancel)(void* data)) {
-    (void)name;
-    napi_value promise = NULL;
-    work->env = env;
-    work->queued_at_nanos = 0;
-    (void)native_monotonic_now_nanos(&work->queued_at_nanos);
-    napi_create_promise(env, &work->deferred, &promise);
-
-    native_completion_runtime* runtime = native_completion_runtime_for_env(env);
-    native_async_work* native_work = calloc(1, sizeof(*native_work));
-    if (runtime == NULL || native_work == NULL) {
-        free(native_work);
-        void* owner = work->owner;
-        void (*owner_release)(void*) = work->owner_release;
-        work->owner = NULL;
-        work->owner_release = NULL;
-        work->work = NULL;
-        work->err = -ENOMEM;
-        complete(env, napi_cancelled, work);
-        if (owner_release != NULL) {
-            owner_release(owner);
-        }
-        return promise;
-    }
-
-    native_work->runtime = runtime;
-    native_work->base = work;
-    native_work->execute = execute;
-    native_work->complete = complete;
-    native_work->abandon = abandon;
-    native_work->cancel = cancel;
-    work->work = native_work;
-
-    int err = native_completion_runtime_ref_loop(env, runtime);
-    if (err == 0) {
-        err = native_completion_enqueue(runtime, native_work);
-        if (err != 0) {
-            native_completion_runtime_unref_loop(env, runtime);
-        }
-    }
-    if (err != 0) {
-        work->work = NULL;
-        void* owner = work->owner;
-        void (*owner_release)(void*) = work->owner_release;
-        work->owner = NULL;
-        work->owner_release = NULL;
-        free(native_work);
-        work->err = err;
-        complete(env, napi_cancelled, work);
-        if (owner_release != NULL) {
-            owner_release(owner);
-        }
-    }
-    return promise;
-}
-
-static napi_value queue_work(napi_env env,
-    base_work* work,
-    const char* name,
-    napi_async_execute_callback execute,
-    napi_async_complete_callback complete) {
-    return queue_work_managed(env, work, name, execute, complete, complete, NULL);
-}
-
-static void native_client_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
-    (void)hint;
-    native_client* client = data;
-    native_client_close_request(client, true);
-}
-
-static void native_stream_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
-    (void)hint;
-    native_stream* stream = data;
-    pthread_mutex_lock(&stream->mutex);
-    stream->js_alive = false;
-    pthread_mutex_unlock(&stream->mutex);
-    native_stream_close_request(stream);
-}
-
-static void native_server_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
-    (void)hint;
-    native_server* server = data;
-    pthread_mutex_lock(&server->mutex);
-    server->js_alive = false;
-    pthread_mutex_unlock(&server->mutex);
-    native_server_close_request(server, true);
-}
-
-static void native_call_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
-    (void)hint;
-    native_call_close_request_internal(data, true);
-}
-
-static void native_cancellation_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
-    (void)hint;
-    native_cancellation* cancellation = data;
-    if (cancellation == NULL) {
-        return;
-    }
-    cancellation->js_alive = false;
-    trevrpc_cancellation_release(cancellation->cancellation);
-    cancellation->cancellation = NULL;
-    free(cancellation);
-}
-
-static napi_value native_client_constructor(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    if (napi_get_cb_info(env, info, &argc, args, &this_arg, NULL) != napi_ok) {
-        return NULL;
-    }
-
-    native_client* client = NULL;
-    if (argc != 1 || napi_get_value_external(env, args[0], (void**)&client) != napi_ok || client == NULL) {
-        napi_throw_type_error(env, NULL, "native clients cannot be constructed directly");
-        return NULL;
-    }
-
-    if (napi_wrap(env, this_arg, client, native_client_finalize, NULL, NULL) != napi_ok) {
-        throw_if_no_pending_exception(env, "failed to wrap native client");
-        return NULL;
-    }
-    client->js_alive = true;
-    return this_arg;
-}
-
-static napi_value native_stream_constructor(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    if (napi_get_cb_info(env, info, &argc, args, &this_arg, NULL) != napi_ok) {
-        return NULL;
-    }
-
-    native_stream* stream = NULL;
-    if (argc != 1 || napi_get_value_external(env, args[0], (void**)&stream) != napi_ok || stream == NULL) {
-        napi_throw_type_error(env, NULL, "native streams cannot be constructed directly");
-        return NULL;
-    }
-
-    if (napi_wrap(env, this_arg, stream, native_stream_finalize, NULL, NULL) != napi_ok) {
-        throw_if_no_pending_exception(env, "failed to wrap native stream");
-        return NULL;
-    }
-    stream->js_alive = true;
-    return this_arg;
-}
-
-static napi_value native_server_constructor(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    if (napi_get_cb_info(env, info, &argc, args, &this_arg, NULL) != napi_ok) {
-        return NULL;
-    }
-
-    native_server* server = NULL;
-    if (argc != 1 || napi_get_value_external(env, args[0], (void**)&server) != napi_ok || server == NULL) {
-        napi_throw_type_error(env, NULL, "native servers cannot be constructed directly");
-        return NULL;
-    }
-
-    if (napi_wrap(env, this_arg, server, native_server_finalize, NULL, NULL) != napi_ok) {
-        throw_if_no_pending_exception(env, "failed to wrap native server");
-        return NULL;
-    }
-    server->js_alive = true;
-
-    napi_value port = NULL;
-    napi_create_uint32(env, server->port, &port);
-    napi_set_named_property(env, this_arg, "port", port);
-    return this_arg;
-}
-
-static napi_value native_call_constructor(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    if (napi_get_cb_info(env, info, &argc, args, &this_arg, NULL) != napi_ok) {
-        return NULL;
-    }
-
-    native_call* call = NULL;
-    if (argc != 1 || napi_get_value_external(env, args[0], (void**)&call) != napi_ok || call == NULL) {
-        napi_throw_type_error(env, NULL, "native calls cannot be constructed directly");
-        return NULL;
-    }
-
-    if (napi_wrap(env, this_arg, call, native_call_finalize, NULL, NULL) != napi_ok) {
-        throw_if_no_pending_exception(env, "failed to wrap native call");
-        return NULL;
-    }
-    call->js_alive = true;
-
-    trevrpc_call* c_call = NULL;
-    if (native_call_acquire(call, &c_call) == 0) {
-        napi_value request = request_to_js(env, trevrpc_call_request(c_call));
-        napi_set_named_property(env, this_arg, "request", request);
-
-        const trevrpc_call_context* context = trevrpc_call_get_context(c_call);
-        uint64_t remaining_nanos = 0;
-        int has_deadline = trevrpc_call_context_has_deadline(context);
-        if (has_deadline) {
-            (void)trevrpc_call_context_time_remaining_nanos(context, &remaining_nanos);
-        }
-        napi_value context_object = NULL;
-        napi_value has_deadline_value = NULL;
-        napi_value remaining_nanos_value = NULL;
-        napi_value cancelled_value = NULL;
-        if (napi_create_object(env, &context_object) == napi_ok &&
-            napi_get_boolean(env, has_deadline != 0, &has_deadline_value) == napi_ok &&
-            napi_create_bigint_uint64(env, remaining_nanos, &remaining_nanos_value) == napi_ok &&
-            napi_get_boolean(env, trevrpc_call_context_cancelled(context) != 0, &cancelled_value) == napi_ok) {
-            napi_set_named_property(env, context_object, "hasDeadline", has_deadline_value);
-            napi_set_named_property(env, context_object, "timeRemainingNanos", remaining_nanos_value);
-            napi_set_named_property(env, context_object, "cancelled", cancelled_value);
-            napi_set_named_property(env, this_arg, "context", context_object);
-        }
-        native_call_release(call, c_call);
-    }
-    return this_arg;
-}
-
-static napi_value native_cancellation_constructor(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    if (napi_get_cb_info(env, info, &argc, args, &this_arg, NULL) != napi_ok) {
-        return NULL;
-    }
-
-    native_cancellation* cancellation = NULL;
-    if (argc != 1 || napi_get_value_external(env, args[0], (void**)&cancellation) != napi_ok || cancellation == NULL) {
-        napi_throw_type_error(env, NULL, "native cancellations cannot be constructed directly");
-        return NULL;
-    }
-
-    if (napi_wrap(env, this_arg, cancellation, native_cancellation_finalize, NULL, NULL) != napi_ok) {
-        throw_if_no_pending_exception(env, "failed to wrap native cancellation");
-        return NULL;
-    }
-    cancellation->js_alive = true;
-    return this_arg;
-}
-
-static void server_call_event_close(server_call_event* event) {
-    if (event == NULL) {
-        return;
-    }
-    native_call* call = event->call;
-    free(event);
-    native_call_close_request(call);
-    native_call_release_pin(call);
-}
-
-static void server_call_js(napi_env env, napi_value js_callback, void* context, void* data) {
-    (void)js_callback;
-    (void)context;
-    server_call_event* event = data;
-    if (env == NULL || event == NULL) {
-        server_call_event_close(event);
-        return;
-    }
-
-    native_call* call = event->call;
-    trevrpc_call* acquired_call = NULL;
-    if (native_call_acquire(call, &acquired_call) != 0) {
-        free(event);
-        native_call_release_pin(call);
-        return;
-    }
-
-    napi_value handler = NULL;
-    napi_value ctor = NULL;
-    napi_value external = NULL;
-    napi_value call_object = NULL;
-    napi_value global = NULL;
-    napi_status status = napi_get_reference_value(env, event->route->handler_ref, &handler);
-    if (status == napi_ok) {
-        native_completion_runtime* runtime = native_completion_runtime_for_env(env);
-        status =
-            runtime == NULL ? napi_generic_failure : napi_get_reference_value(env, runtime->call_constructor, &ctor);
-    }
-    if (status == napi_ok) {
-        status = napi_create_external(env, call, NULL, NULL, &external);
-    }
-    if (status == napi_ok) {
-        status = napi_new_instance(env, ctor, 1, &external, &call_object);
-    }
-    if (status == napi_ok) {
-        status = napi_get_global(env, &global);
-    }
-    if (status == napi_ok) {
-        napi_value ignored = NULL;
-        status = napi_call_function(env, global, handler, 1, &call_object, &ignored);
-    }
-    if (status != napi_ok) {
-        clear_pending_exception(env);
-        native_call_close_request(call);
-    }
-    native_call_release(call, acquired_call);
-    free(event);
-    native_call_release_pin(call);
-}
-
-static int native_server_call_handler(void* user_data, trevrpc_call* call) {
-    server_route* route = user_data;
-    if (route == NULL || route->server == NULL || call == NULL) {
-        return -EINVAL;
-    }
-    int err = trevrpc_call_defer(call);
-    if (err != 0) {
-        return err;
-    }
-
-    native_call* native = calloc(1, sizeof(*native));
-    server_call_event* event = calloc(1, sizeof(*event));
-    if (native == NULL || event == NULL) {
-        free(native);
-        free(event);
-        trevrpc_call_close(call);
-        return TREVRPC_CALL_DEFERRED;
-    }
-    int mutex_err = pthread_mutex_init(&native->mutex, NULL);
-    int operation_mutex_err = mutex_err == 0 ? pthread_mutex_init(&native->operation_mutex, NULL) : mutex_err;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    int gate_err =
-        operation_mutex_err == 0 ? debug_outbound_gate_init(&native->debug_outbound_gate) : operation_mutex_err;
-    if (mutex_err != 0 || operation_mutex_err != 0 || gate_err != 0) {
-#else
-    if (mutex_err != 0 || operation_mutex_err != 0) {
-#endif
-        if (operation_mutex_err == 0) {
-            pthread_mutex_destroy(&native->operation_mutex);
-        }
-        if (mutex_err == 0) {
-            pthread_mutex_destroy(&native->mutex);
-        }
-        free(native);
-        free(event);
-        trevrpc_call_close(call);
-        return TREVRPC_CALL_DEFERRED;
-    }
-    if (trevrpc_call_retain(call) != 0) {
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        debug_outbound_gate_destroy(&native->debug_outbound_gate);
-#endif
-        pthread_mutex_destroy(&native->operation_mutex);
-        pthread_mutex_destroy(&native->mutex);
-        free(native);
-        free(event);
-        trevrpc_call_close(call);
-        return TREVRPC_CALL_DEFERRED;
-    }
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&DebugNativeCallAllocations, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&DebugNativeCallOwnerRetains, 1, memory_order_relaxed);
-#endif
-    native->call = call;
-    native->pins = 1;
-    event->route = route;
-    event->call = native;
-
-    napi_status status = napi_closing;
-    napi_threadsafe_function tsfn = NULL;
-    pthread_mutex_lock(&route->server->mutex);
-    if (!route->server->closing && route->server->call_tsfn != NULL) {
-        tsfn = route->server->call_tsfn;
-        status = napi_acquire_threadsafe_function(tsfn);
-        if (status == napi_ok) {
-            native->server = route->server;
-            native->server_next = route->server->calls;
-            native->registered = true;
-            native->pins++;
-            route->server->refs++;
-            route->server->calls = native;
-        }
-    }
-    pthread_mutex_unlock(&route->server->mutex);
-    if (status == napi_ok) {
-        status = napi_call_threadsafe_function(tsfn, event, napi_tsfn_nonblocking);
-        napi_release_threadsafe_function(tsfn, napi_tsfn_release);
-    }
-    if (status != napi_ok) {
-        native_call_close_request(native);
-        free(event);
-        native_call_release_pin(native);
-    }
-    return TREVRPC_CALL_DEFERRED;
-}
-
-static napi_value noop_js_callback(napi_env env, napi_callback_info info) {
-    (void)info;
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static void connect_execute(napi_env env, void* data) {
-    (void)env;
-    connect_work* work = data;
-    trevrpc_client_config_v1 config;
-    work->base.err = trevrpc_client_config_v1_init(&config, sizeof(config));
-    if (work->base.err != 0) {
-        return;
-    }
-    if (work->idle_timeout_ms > 0) {
-        config.max_idle_timeout_ms = work->idle_timeout_ms;
-    }
-    if (work->max_streams_per_session > 0) {
-        config.peer_bidi_stream_count =
-            work->max_streams_per_session > UINT16_MAX ? UINT16_MAX : (uint16_t)work->max_streams_per_session;
-    }
-    config.max_stateless_operations = 1024;
-    config.max_binding_stateless_operations = 256;
-    if (work->max_frame_size > 0) {
-        config.max_frame_size = work->max_frame_size;
-    }
-    if (work->max_pending_send_bytes > 0) {
-        config.max_pending_send_bytes = work->max_pending_send_bytes;
-    }
-    if (work->max_pending_send_count > 0) {
-        config.max_pending_send_count = work->max_pending_send_count;
-    }
-    config.ca_cert_file = work->ca_cert_file;
-    config.skip_certificate_validation = work->skip_certificate_validation;
-    work->base.err = trevrpc_raw_client_connect_v1_with_shutdown_callback(work->host,
-        work->port,
-        &config,
-        work->cancellation,
-        native_client_connection_shutdown,
-        work->observer,
-        &work->client);
-}
-
-static void connect_cancel(void* data) {
-    connect_work* work = data;
-    trevrpc_cancellation_cancel(work->cancellation);
-}
-
-static void connect_complete(napi_env env, napi_status status, void* data) {
-    connect_work* work = data;
-    if (work->base.err == 0 && trevrpc_cancellation_cancelled(work->cancellation)) {
-        trevrpc_raw_client_clear_shutdown_callback(work->client);
-        trevrpc_raw_client_close(work->client);
-        work->client = NULL;
-        work->base.err = -ECANCELED;
-    }
-    if (env == NULL) {
-        trevrpc_raw_client_clear_shutdown_callback(work->client);
-        trevrpc_raw_client_close(work->client);
-    } else if (status != napi_ok) {
-        trevrpc_raw_client_clear_shutdown_callback(work->client);
-        trevrpc_raw_client_close(work->client);
-        work->client = NULL;
-        reject_native_error(env, work->base.deferred, -ECANCELED, "connectMsQuic");
-    } else if (work->base.err != 0) {
-        reject_native_error(env, work->base.deferred, work->base.err, "connectMsQuic");
-    } else {
-        native_client* client = calloc(1, sizeof(*client));
-        if (client == NULL) {
-            trevrpc_raw_client_clear_shutdown_callback(work->client);
-            trevrpc_raw_client_close(work->client);
-            reject_native_error(env, work->base.deferred, -ENOMEM, "connectMsQuic");
-        } else {
-            pthread_mutex_init(&client->mutex, NULL);
-            client->client = work->client;
-            client->observer = work->observer;
-            work->observer = NULL;
-
-            napi_value ctor = NULL;
-            napi_value external = NULL;
-            napi_value instance = NULL;
-            native_completion_runtime* runtime = native_completion_runtime_for_env(env);
-            napi_status wrap_status = runtime == NULL
-                                          ? napi_generic_failure
-                                          : napi_get_reference_value(env, runtime->client_constructor, &ctor);
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_create_external(env, client, NULL, NULL, &external);
-            }
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_new_instance(env, ctor, 1, &external, &instance);
-            }
-            napi_value closed = NULL;
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_get_reference_value(env, client->observer->promise_ref, &closed);
-            }
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_set_named_property(env, instance, "closed", closed);
-            }
-            if (wrap_status != napi_ok) {
-                clear_pending_exception(env);
-                native_client_close_request(client, false);
-                reject_native_error(env, work->base.deferred, -ENOMEM, "connectMsQuic");
-            } else {
-                napi_resolve_deferred(env, work->base.deferred, instance);
-            }
-        }
-    }
-
-    free(work->host);
-    free(work->ca_cert_file);
-    if (env != NULL && work->cancellation_ref != NULL) {
-        napi_delete_reference(env, work->cancellation_ref);
-    }
-    trevrpc_cancellation_release(work->cancellation);
-    native_client_observer_release(work->observer);
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value connect_msquic(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
-    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    if (argc != 1 && argc != 2) {
-        napi_throw_type_error(env, NULL, "connectMsQuic requires an options object and optional cancellation");
-        return NULL;
-    }
-
-    connect_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate connect work");
-        return NULL;
-    }
-    work->observer = native_client_observer_create(env);
-    if (work->observer == NULL) {
-        free(work);
-        napi_throw_error(env, NULL, "failed to create native client close observer");
-        return NULL;
-    }
-    work->host = get_string_property(env, args[0], "host");
-    work->ca_cert_file = get_string_property(env, args[0], "caCertFile");
-    work->port = (uint16_t)get_uint32_property(env, args[0], "port", 0);
-    work->skip_certificate_validation = get_bool_property(env, args[0], "skipCertificateValidation", false) ? 1 : 0;
-    work->max_streams_per_session = get_uint32_property(env, args[0], "maxStreamsPerSession", 0);
-    work->idle_timeout_ms = get_uint32_property(env, args[0], "idleTimeoutMs", 0);
-    get_size_property(env, args[0], "maxFrameSize", &work->max_frame_size);
-    get_size_property(env, args[0], "maxPendingSendBytes", &work->max_pending_send_bytes);
-    get_size_property(env, args[0], "maxPendingSendCount", &work->max_pending_send_count);
-    int cancellation_err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
-    if (cancellation_err == 0 && work->cancellation == NULL) {
-        work->cancellation = trevrpc_cancellation_new();
-        if (work->cancellation == NULL) {
-            cancellation_err = -ENOMEM;
-        }
-    }
-
-    bool invalid_options = work->host == NULL || work->port == 0;
-    if (invalid_options || cancellation_err != 0) {
-        free(work->host);
-        free(work->ca_cert_file);
-        if (work->cancellation_ref != NULL) {
-            napi_delete_reference(env, work->cancellation_ref);
-        }
-        trevrpc_cancellation_release(work->cancellation);
-        native_client_observer_release(work->observer);
-        free(work);
-        if (invalid_options) {
-            napi_throw_type_error(env, NULL, "connectMsQuic requires host and port");
-        } else if (cancellation_err == -ENOMEM) {
-            napi_throw_error(env, NULL, "failed to allocate connect cancellation");
-        }
-        return NULL;
-    }
-
-    return queue_work_managed(
-        env, &work->base, "connectMsQuic", connect_execute, connect_complete, connect_complete, connect_cancel);
-}
-
-typedef struct http3_admission_call {
-    struct http3_admission_call* next;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    atomic_size_t refs;
-    char* path;
-    size_t path_len;
-    char* authority;
-    size_t authority_len;
-    bool secure;
-    clockid_t clock_id;
-    uint64_t due_nanos;
-    bool completed;
-    bool admitted;
-    bool cancelled;
-} http3_admission_call;
-
-struct node_http3_admission_state {
-    pthread_mutex_t mutex;
-    http3_admission_call* active_calls;
-    napi_threadsafe_function tsfn;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_http3_admission_work* debug_work;
-    bool debug_callback_queued;
-#endif
-    uint64_t timeout_nanos;
-    bool shutting_down;
-};
-
-static void http3_admission_js(napi_env env, napi_value callback, void* context, void* data);
-#ifdef TREVRPC_NODE_TEST_HOOKS
-static void debug_http3_admission_finish(napi_env env, debug_http3_admission_work* work, bool callback_queued);
-#endif
-
-static void http3_admission_call_destroy(http3_admission_call* call) {
-    pthread_cond_destroy(&call->cond);
-    pthread_mutex_destroy(&call->mutex);
-    free(call->authority);
-    free(call->path);
-    free(call);
-}
-
-static void http3_admission_call_release_count(http3_admission_call* call, size_t count) {
-    if (atomic_fetch_sub_explicit(&call->refs, count, memory_order_acq_rel) == count) {
-        http3_admission_call_destroy(call);
-    }
-}
-
-static void http3_admission_call_release(http3_admission_call* call) {
-    http3_admission_call_release_count(call, 1);
-}
-
-static void http3_admission_call_cancel_locked(http3_admission_call* call) {
-    call->admitted = false;
-    call->cancelled = true;
-    call->completed = true;
-    pthread_cond_signal(&call->cond);
-}
-
-static void http3_admission_call_complete_locked(http3_admission_call* call, bool admitted) {
-    if (call->completed) {
-        return;
-    }
-    call->admitted = admitted;
-    call->completed = true;
-    pthread_cond_signal(&call->cond);
-}
-
-static bool http3_admission_call_deadline_expired_locked(http3_admission_call* call) {
-    uint64_t now_nanos = 0;
-    return native_monotonic_now_nanos(&now_nanos) != 0 || now_nanos >= call->due_nanos;
-}
-
-static void http3_admission_state_finalize(napi_env env, void* data, void* hint) {
-    (void)hint;
-    node_http3_admission_state* state = data;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_http3_admission_work* debug_work = state->debug_work;
-    bool debug_callback_queued = state->debug_callback_queued;
-#endif
-    pthread_mutex_destroy(&state->mutex);
-    free(state);
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    if (debug_work != NULL) {
-        debug_http3_admission_finish(env, debug_work, debug_callback_queued);
-    }
-#else
-    (void)env;
-#endif
-}
-
-static void http3_admission_state_shutdown(node_http3_admission_state* state) {
-    if (state == NULL) {
-        return;
-    }
-    pthread_mutex_lock(&state->mutex);
-    state->shutting_down = true;
-    for (http3_admission_call* call = state->active_calls; call != NULL; call = call->next) {
-        pthread_mutex_lock(&call->mutex);
-        http3_admission_call_cancel_locked(call);
-        pthread_mutex_unlock(&call->mutex);
-    }
-    pthread_mutex_unlock(&state->mutex);
-}
-
-static void http3_admission_state_release(node_http3_admission_state* state) {
-    if (state != NULL) {
-        napi_release_threadsafe_function(state->tsfn, napi_tsfn_abort);
-    }
-}
-
-static napi_status http3_admission_state_create(napi_env env,
-    napi_value callback,
-    napi_value resource_name,
-    uint64_t timeout_nanos,
-    node_http3_admission_state** out_state) {
-    *out_state = NULL;
-    node_http3_admission_state* state = calloc(1, sizeof(*state));
-    if (state == NULL) {
-        return napi_generic_failure;
-    }
-    pthread_mutex_init(&state->mutex, NULL);
-    state->timeout_nanos = timeout_nanos == 0 ? 10000000000ull : timeout_nanos;
-    napi_status status = napi_create_threadsafe_function(env,
-        callback,
-        NULL,
-        resource_name,
-        0,
-        1,
-        state,
-        http3_admission_state_finalize,
-        NULL,
-        http3_admission_js,
-        &state->tsfn);
-    if (status != napi_ok) {
-        pthread_mutex_destroy(&state->mutex);
-        free(state);
-        return status;
-    }
-    *out_state = state;
-    return napi_ok;
-}
-
-static void http3_admission_js(napi_env env, napi_value callback, void* context, void* data) {
-    (void)context;
-    http3_admission_call* call = data;
-    bool invoke = false;
-    pthread_mutex_lock(&call->mutex);
-    if (!call->completed) {
-        if (env == NULL || callback == NULL || http3_admission_call_deadline_expired_locked(call)) {
-            http3_admission_call_cancel_locked(call);
-        } else {
-            invoke = true;
-        }
-    }
-    pthread_mutex_unlock(&call->mutex);
-
-    bool admitted = false;
-    napi_status status = invoke ? napi_ok : napi_cancelled;
-    napi_value request = NULL;
-    if (invoke) {
-        napi_value path = NULL;
-        napi_value authority = NULL;
-        napi_value secure = NULL;
-        napi_value global = NULL;
-        napi_value result = NULL;
-        status = napi_create_object(env, &request);
-        if (status == napi_ok) {
-            status = napi_create_string_utf8(env, call->path, call->path_len, &path);
-        }
-        if (status == napi_ok) {
-            status = napi_create_string_utf8(env, call->authority, call->authority_len, &authority);
-        }
-        if (status == napi_ok) {
-            status = napi_get_boolean(env, call->secure, &secure);
-        }
-        if (status == napi_ok) {
-            status = napi_set_named_property(env, request, "path", path);
-        }
-        if (status == napi_ok) {
-            status = napi_set_named_property(env, request, "authority", authority);
-        }
-        if (status == napi_ok) {
-            status = napi_set_named_property(env, request, "secure", secure);
-        }
-        if (status == napi_ok) {
-            status = napi_get_global(env, &global);
-        }
-        if (status == napi_ok) {
-            status = napi_call_function(env, global, callback, 1, &request, &result);
-        }
-        if (status == napi_ok) {
-            status = napi_get_value_bool(env, result, &admitted);
-        }
-        if (status != napi_ok) {
-            clear_pending_exception(env);
-        }
-    }
-
-    pthread_mutex_lock(&call->mutex);
-    if (!call->completed) {
-        if (status != napi_ok || http3_admission_call_deadline_expired_locked(call)) {
-            http3_admission_call_cancel_locked(call);
-        } else {
-            http3_admission_call_complete_locked(call, admitted);
-        }
-    }
-    pthread_mutex_unlock(&call->mutex);
-    http3_admission_call_release(call);
-}
-
-static int node_http3_admission(void* user_data, const trevrpc_http3_admission_request* request) {
-    node_http3_admission_state* state = user_data;
-    if (state == NULL || request == NULL || request->path_len == SIZE_MAX || request->authority_len == SIZE_MAX) {
-        return -1;
-    }
-    uint64_t due_nanos = 0;
-    if (native_monotonic_deadline_after(state->timeout_nanos, &due_nanos) != 0) {
-        return -1;
-    }
-    http3_admission_call* call = calloc(1, sizeof(*call));
-    if (call == NULL) {
-        return -1;
-    }
-    call->path = malloc(request->path_len + 1);
-    call->authority = malloc(request->authority_len + 1);
-    if (call->path == NULL || call->authority == NULL) {
-        free(call->authority);
-        free(call->path);
-        free(call);
-        return -1;
-    }
-    memcpy(call->path, request->path, request->path_len);
-    call->path[request->path_len] = 0;
-    call->path_len = request->path_len;
-    memcpy(call->authority, request->authority, request->authority_len);
-    call->authority[request->authority_len] = 0;
-    call->authority_len = request->authority_len;
-    call->secure = request->secure != 0;
-    if (pthread_mutex_init(&call->mutex, NULL) != 0) {
-        free(call->authority);
-        free(call->path);
-        free(call);
-        return -1;
-    }
-    if (native_condition_init(&call->cond, &call->clock_id) != 0) {
-        pthread_mutex_destroy(&call->mutex);
-        free(call->authority);
-        free(call->path);
-        free(call);
-        return -1;
-    }
-    call->due_nanos = due_nanos;
-    atomic_init(&call->refs, 2);
-
-    pthread_mutex_lock(&state->mutex);
-    if (state->shutting_down) {
-        pthread_mutex_unlock(&state->mutex);
-        http3_admission_call_release_count(call, 2);
-        return -1;
-    }
-    call->next = state->active_calls;
-    state->active_calls = call;
-    pthread_mutex_unlock(&state->mutex);
-
-    napi_status status = napi_call_threadsafe_function(state->tsfn, call, napi_tsfn_nonblocking);
-    bool callback_queued = status == napi_ok;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    if (callback_queued) {
-        pthread_mutex_lock(&state->mutex);
-        state->debug_callback_queued = true;
-        pthread_mutex_unlock(&state->mutex);
-    }
-#endif
-    if (!callback_queued) {
-        pthread_mutex_lock(&call->mutex);
-        http3_admission_call_cancel_locked(call);
-        pthread_mutex_unlock(&call->mutex);
-    }
-
-    pthread_mutex_lock(&call->mutex);
-    while (!call->completed) {
-        uint64_t now_nanos = 0;
-        int err = native_monotonic_now_nanos(&now_nanos);
-        if (err != 0 || now_nanos >= call->due_nanos) {
-            http3_admission_call_cancel_locked(call);
-            break;
-        }
-        err = native_condition_timedwait_until(&call->cond, &call->mutex, call->clock_id, call->due_nanos, now_nanos);
-        if (err != 0) {
-            http3_admission_call_cancel_locked(call);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&call->mutex);
-
-    pthread_mutex_lock(&state->mutex);
-    pthread_mutex_lock(&call->mutex);
-    if (state->shutting_down ||
-        (!call->cancelled && call->admitted && http3_admission_call_deadline_expired_locked(call))) {
-        http3_admission_call_cancel_locked(call);
-    }
-    bool admitted = call->completed && !call->cancelled && call->admitted;
-    http3_admission_call** link = &state->active_calls;
-    while (*link != NULL) {
-        if (*link == call) {
-            *link = call->next;
-            break;
-        }
-        link = &(*link)->next;
-    }
-    pthread_mutex_unlock(&call->mutex);
-    pthread_mutex_unlock(&state->mutex);
-    http3_admission_call_release_count(call, callback_queued ? 1 : 2);
-    return admitted ? 0 : -1;
-}
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-struct debug_http3_admission_work {
-    napi_async_work work;
-    napi_deferred deferred;
-    node_http3_admission_state* state;
-    debug_bounded_barrier timeout_committed;
-    bool timeout_committed_initialized;
-    bool shutdown_first;
-    napi_status completion_status;
-    int result;
-};
-
-static void debug_http3_admission_execute(napi_env env, void* data) {
-    (void)env;
-    debug_http3_admission_work* work = data;
-    if (work->shutdown_first) {
-        http3_admission_state_shutdown(work->state);
-    }
-    const trevrpc_http3_admission_request request = {
-        .path = "/rpc",
-        .path_len = 4,
-        .authority = "localhost",
-        .authority_len = 9,
-        .secure = 1,
-    };
-    work->result = node_http3_admission(work->state, &request);
-    if (work->timeout_committed_initialized) {
-        (void)debug_bounded_barrier_wait(&work->timeout_committed);
-    }
-}
-
-static void debug_http3_admission_barrier_destroy(debug_http3_admission_work* work) {
-    if (!work->timeout_committed_initialized) {
-        return;
-    }
-    debug_bounded_barrier_destroy(&work->timeout_committed);
-    work->timeout_committed_initialized = false;
-}
-
-static void debug_http3_admission_finish(napi_env env, debug_http3_admission_work* work, bool callback_queued) {
-    if (env == NULL) {
-        free(work);
-        return;
-    }
-    if (work->completion_status == napi_ok && (work->shutdown_first || callback_queued)) {
-        napi_value admitted = NULL;
-        napi_get_boolean(env, work->result == 0, &admitted);
-        napi_resolve_deferred(env, work->deferred, admitted);
-    } else {
-        const char* text = callback_queued || work->shutdown_first ? "debug HTTP/3 admission work failed"
-                                                                   : "debug HTTP/3 admission callback was not queued";
-        napi_value message = NULL;
-        napi_value error = NULL;
-        napi_create_string_utf8(env, text, NAPI_AUTO_LENGTH, &message);
-        napi_create_error(env, NULL, message, &error);
-        napi_reject_deferred(env, work->deferred, error);
-    }
-    free(work);
-}
-
-static void debug_http3_admission_complete(napi_env env, napi_status status, void* data) {
-    debug_http3_admission_work* work = data;
-    work->completion_status = status;
-    http3_admission_state_shutdown(work->state);
-    debug_http3_admission_barrier_destroy(work);
-    napi_delete_async_work(env, work->work);
-    work->work = NULL;
-    (void)napi_release_threadsafe_function(work->state->tsfn, napi_tsfn_release);
-}
-
-static napi_value debug_http3_admission(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value args[3];
-    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    napi_valuetype callback_type = napi_undefined;
-    if (argc < 2 || napi_typeof(env, args[0], &callback_type) != napi_ok || callback_type != napi_function) {
-        napi_throw_type_error(env, NULL, "_debugHttp3Admission requires a callback and timeout");
-        return NULL;
-    }
-    uint32_t timeout_ms = 0;
-    bool shutdown_first = false;
-    if (napi_get_value_uint32(env, args[1], &timeout_ms) != napi_ok || timeout_ms == 0 ||
-        (argc > 2 && napi_get_value_bool(env, args[2], &shutdown_first) != napi_ok)) {
-        napi_throw_type_error(env, NULL, "_debugHttp3Admission requires a positive timeout");
-        return NULL;
-    }
-    debug_http3_admission_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate debug HTTP/3 admission work");
-        return NULL;
-    }
-    napi_value resource_name = NULL;
-    napi_value promise = NULL;
-    napi_status status = napi_create_string_utf8(env, "TrevRpcDebugHttp3Admission", NAPI_AUTO_LENGTH, &resource_name);
-    if (status == napi_ok) {
-        status =
-            http3_admission_state_create(env, args[0], resource_name, (uint64_t)timeout_ms * 1000000ull, &work->state);
-    }
-    if (status == napi_ok) {
-        status = napi_create_promise(env, &work->deferred, &promise);
-    }
-    if (status == napi_ok) {
-        status = napi_create_async_work(
-            env, NULL, resource_name, debug_http3_admission_execute, debug_http3_admission_complete, work, &work->work);
-    }
-    work->shutdown_first = shutdown_first;
-    if (status == napi_ok && !shutdown_first) {
-        if (!debug_bounded_barrier_init(&work->timeout_committed)) {
-            status = napi_generic_failure;
-        } else {
-            work->timeout_committed_initialized = true;
-        }
-    }
-    if (status == napi_ok) {
-        status = napi_queue_async_work(env, work->work);
-    }
-    if (status == napi_ok) {
-        pthread_mutex_lock(&work->state->mutex);
-        work->state->debug_work = work;
-        pthread_mutex_unlock(&work->state->mutex);
-    }
-    if (status != napi_ok) {
-        if (work->work != NULL) {
-            napi_delete_async_work(env, work->work);
-        }
-        http3_admission_state_shutdown(work->state);
-        debug_http3_admission_barrier_destroy(work);
-        http3_admission_state_release(work->state);
-        free(work);
-        napi_throw_error(env, NULL, "failed to queue debug HTTP/3 admission work");
-        return NULL;
-    }
-    if (work->timeout_committed_initialized && !debug_bounded_barrier_wait(&work->timeout_committed)) {
-        http3_admission_state_shutdown(work->state);
-    }
-    return promise;
-}
-#endif
-
-static void listen_execute(napi_env env, void* data) {
-    (void)env;
-    listen_work* work = data;
-    trevrpc_server_config_v1 config;
-    work->base.err = trevrpc_server_config_v1_init(&config, sizeof(config));
-    if (work->base.err != 0) {
-        return;
-    }
-    config.host = work->host;
-    config.port = work->port;
-    config.cert_file = work->cert_file;
-    config.key_file = work->key_file;
-    config.keep_alive_ms = 15000;
-    config.peer_bidi_stream_count = 128;
-    config.max_stateless_operations = 1024;
-    config.max_binding_stateless_operations = 256;
-    config.webtransport_path = work->path;
-    config.webtransport_origin = work->origin;
-    config.enable_native = work->enable_native ? 1 : 0;
-    config.enable_http3 = work->enable_http3 ? 1 : 0;
-    config.http3_path = work->http3_path;
-    if (work->http3_admission != NULL) {
-        config.http3_admission = node_http3_admission;
-        config.http3_admission_user_data = work->http3_admission;
-    }
-    config.max_sessions_per_connection = work->max_sessions_per_connection;
-    config.max_streams_per_session = work->max_streams_per_session;
-    config.max_idle_timeout_ms = work->idle_timeout_ms;
-    if (work->max_frame_size > 0) {
-        config.max_frame_size = work->max_frame_size;
-    }
-    if (work->max_pending_send_bytes > 0) {
-        config.max_pending_send_bytes = work->max_pending_send_bytes;
-    }
-    if (work->max_pending_send_count > 0) {
-        config.max_pending_send_count = work->max_pending_send_count;
-    }
-    work->base.err = trevrpc_server_listen_v1(&config, &work->server);
-    if (work->base.err == 0) {
-        work->base.err = trevrpc_server_port(work->server, &work->bound_port);
-    }
-    if (work->base.err == 0 &&
-        (work->has_max_stream_messages || work->stream_idle_timeout_ms > 0 || work->initial_request_timeout_ms > 0)) {
-        trevrpc_server_options_v1 options;
-        work->base.err = trevrpc_server_options_v1_init(&options, sizeof(options));
-        if (work->base.err != 0) {
-            return;
-        }
-        if (work->has_max_stream_messages) {
-            options.max_stream_messages = work->max_stream_messages;
-        }
-        if (work->stream_idle_timeout_ms > 0) {
-            options.stream_idle_timeout_nanos = (uint64_t)work->stream_idle_timeout_ms * 1000000ull;
-        }
-        if (work->initial_request_timeout_ms > 0) {
-            options.initial_request_timeout_nanos = (uint64_t)work->initial_request_timeout_ms * 1000000ull;
-        }
-        work->base.err = trevrpc_server_set_options_v1(work->server, &options);
-    }
-}
-
-static void listen_complete(napi_env env, napi_status status, void* data) {
-    listen_work* work = data;
-    if (env == NULL) {
-        (void)native_server_cancel_and_release(work->server);
-    } else if (status != napi_ok) {
-        reject_native_error(env, work->base.deferred, -ECANCELED, "listenMsQuic");
-    } else if (work->base.err != 0) {
-        (void)native_server_cancel_and_release(work->server);
-        reject_native_error(env, work->base.deferred, work->base.err, "listenMsQuic");
-    } else {
-        native_server* server = calloc(1, sizeof(*server));
-        if (server == NULL) {
-            (void)native_server_cancel_and_release(work->server);
-            reject_native_error(env, work->base.deferred, -ENOMEM, "listenMsQuic");
-        } else {
-            pthread_mutex_init(&server->mutex, NULL);
-            server->server = work->server;
-            server->env = env;
-            server->port = work->bound_port;
-            server->http3_admission = work->http3_admission;
-            work->http3_admission = NULL;
-
-            napi_value callback = NULL;
-            napi_value resource_name = NULL;
-            napi_status wrap_status =
-                napi_create_function(env, "serverCall", NAPI_AUTO_LENGTH, noop_js_callback, NULL, &callback);
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_create_string_utf8(env, "TrevRpcServerCall", NAPI_AUTO_LENGTH, &resource_name);
-            }
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_create_threadsafe_function(
-                    env, callback, NULL, resource_name, 0, 1, NULL, NULL, NULL, server_call_js, &server->call_tsfn);
-            }
-
-            napi_value ctor = NULL;
-            napi_value external = NULL;
-            napi_value instance = NULL;
-            if (wrap_status == napi_ok) {
-                native_completion_runtime* runtime = native_completion_runtime_for_env(env);
-                wrap_status = runtime == NULL ? napi_generic_failure
-                                              : napi_get_reference_value(env, runtime->server_constructor, &ctor);
-            }
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_create_external(env, server, NULL, NULL, &external);
-            }
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_new_instance(env, ctor, 1, &external, &instance);
-            }
-            if (wrap_status != napi_ok) {
-                clear_pending_exception(env);
-                if (server->call_tsfn != NULL) {
-                    napi_release_threadsafe_function(server->call_tsfn, napi_tsfn_abort);
-                }
-                http3_admission_state_shutdown(server->http3_admission);
-                http3_admission_state_release(server->http3_admission);
-                (void)native_server_cancel_and_release(work->server);
-                pthread_mutex_destroy(&server->mutex);
-                free(server);
-                reject_native_error(env, work->base.deferred, -ENOMEM, "listenMsQuic");
-            } else {
-                napi_resolve_deferred(env, work->base.deferred, instance);
-            }
-        }
-    }
-
-    free(work->host);
-    free(work->path);
-    free(work->origin);
-    free(work->http3_path);
-    free(work->cert_file);
-    free(work->key_file);
-    http3_admission_state_shutdown(work->http3_admission);
-    http3_admission_state_release(work->http3_admission);
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value listen_msquic(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "listenMsQuic requires an options object");
-        return NULL;
-    }
-
-    listen_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate listen work");
-        return NULL;
-    }
-    work->host = get_string_property(env, args[0], "host");
-    work->path = get_string_property(env, args[0], "path");
-    work->origin = get_string_property(env, args[0], "origin");
-    work->http3_path = get_string_property(env, args[0], "http3Path");
-    work->cert_file = get_string_property(env, args[0], "certFile");
-    work->key_file = get_string_property(env, args[0], "keyFile");
-    work->port = (uint16_t)get_uint32_property(env, args[0], "port", 0);
-    work->max_sessions_per_connection = get_uint32_property(env, args[0], "maxSessionsPerConnection", 16);
-    work->max_streams_per_session = get_uint32_property(env, args[0], "maxStreamsPerSession", 128);
-    work->idle_timeout_ms = get_uint32_property(env, args[0], "idleTimeoutMs", 30000);
-    work->stream_idle_timeout_ms = get_uint32_property(env, args[0], "streamIdleTimeoutMs", 0);
-    work->initial_request_timeout_ms = get_uint32_property(env, args[0], "initialRequestTimeoutMs", 10000);
-    work->enable_native = get_bool_property(env, args[0], "enableNative", true);
-    work->enable_http3 = get_bool_property(env, args[0], "enableHttp3", false);
-    work->has_max_stream_messages = get_int64_property(env, args[0], "maxStreamMessages", &work->max_stream_messages);
-    get_size_property(env, args[0], "maxFrameSize", &work->max_frame_size);
-    get_size_property(env, args[0], "maxPendingSendBytes", &work->max_pending_send_bytes);
-    get_size_property(env, args[0], "maxPendingSendCount", &work->max_pending_send_count);
-
-    bool has_http3_admission = false;
-    napi_has_named_property(env, args[0], "http3Admission", &has_http3_admission);
-    bool invalid_http3_admission = false;
-    if (has_http3_admission) {
-        napi_value callback = NULL;
-        napi_value resource_name = NULL;
-        napi_valuetype callback_type = napi_undefined;
-        napi_status status = napi_get_named_property(env, args[0], "http3Admission", &callback);
-        if (status == napi_ok) {
-            status = napi_typeof(env, callback, &callback_type);
-        }
-        if (status == napi_ok && callback_type == napi_function) {
-            status = napi_create_string_utf8(env, "TrevRpcHttp3Admission", NAPI_AUTO_LENGTH, &resource_name);
-        } else {
-            invalid_http3_admission = true;
-        }
-        if (!invalid_http3_admission && status == napi_ok) {
-            status = http3_admission_state_create(env,
-                callback,
-                resource_name,
-                (uint64_t)work->initial_request_timeout_ms * 1000000ull,
-                &work->http3_admission);
-        }
-        invalid_http3_admission = invalid_http3_admission || status != napi_ok;
-    }
-
-    if (work->host == NULL || work->cert_file == NULL || work->key_file == NULL || invalid_http3_admission) {
-        free(work->host);
-        free(work->path);
-        free(work->origin);
-        free(work->http3_path);
-        free(work->cert_file);
-        free(work->key_file);
-        http3_admission_state_shutdown(work->http3_admission);
-        http3_admission_state_release(work->http3_admission);
-        free(work);
-        napi_throw_type_error(env,
-            NULL,
-            invalid_http3_admission ? "http3Admission must be a function"
-                                    : "listenMsQuic requires host, certFile, and keyFile");
-        return NULL;
-    }
-
-    return queue_work(env, &work->base, "listenMsQuic", listen_execute, listen_complete);
-}
-
-static napi_value native_server_register(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value args[4];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 4) {
-        napi_throw_type_error(env, NULL, "register requires service, method, kind, and handler");
-        return NULL;
-    }
-
-    native_server* server = NULL;
-    if (!unwrap_native_server(env, this_arg, &server)) {
-        return NULL;
-    }
-    server_route* route = calloc(1, sizeof(*route));
-    if (route == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate server route");
-        return NULL;
-    }
-    int err = copy_string_arg(env, args[0], &route->service);
-    if (err == 0) {
-        err = copy_string_arg(env, args[1], &route->method);
-    }
-    if (err == 0 && napi_get_value_uint32(env, args[2], &route->kind) != napi_ok) {
-        err = -EINVAL;
-    }
-    napi_valuetype handler_type = napi_undefined;
-    if (err == 0) {
-        napi_typeof(env, args[3], &handler_type);
-        if (handler_type != napi_function) {
-            err = -EINVAL;
-        }
-    }
-    if (err == 0 && napi_create_reference(env, args[3], 1, &route->handler_ref) != napi_ok) {
-        err = -ENOMEM;
-    }
-    if (err == 0) {
-        route->server = server;
-        pthread_mutex_lock(&server->mutex);
-        trevrpc_server* c_server = server->server;
-        bool closing = server->closing || c_server == NULL;
-        pthread_mutex_unlock(&server->mutex);
-        err = closing ? TREV_NODE_ERR_CLOSED
-                      : trevrpc_server_register_call(
-                            c_server, route->service, route->method, route->kind, native_server_call_handler, route);
-    }
-    if (err != 0) {
-        if (route->handler_ref != NULL) {
-            napi_delete_reference(env, route->handler_ref);
-        }
-        free(route->service);
-        free(route->method);
-        free(route);
-        throw_native_error(env, err, "register");
-        return NULL;
-    }
-
-    pthread_mutex_lock(&server->mutex);
-    route->next = server->routes;
-    server->routes = route;
-    pthread_mutex_unlock(&server->mutex);
-
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static void serve_execute(napi_env env, void* data) {
-    (void)env;
-    serve_work* work = data;
-    native_server* server = work->server;
-    trevrpc_server* c_server = NULL;
-    pthread_mutex_lock(&server->mutex);
-    c_server = server->server;
-    pthread_mutex_unlock(&server->mutex);
-    work->base.err = c_server == NULL ? TREV_NODE_ERR_CLOSED : trevrpc_server_serve(c_server);
-    trevrpc_server* release_server = NULL;
-    bool cancel_on_close = false;
-    pthread_mutex_lock(&server->mutex);
-    if (server->closing && server->server == c_server) {
-        release_server = server->server;
-        server->server = NULL;
-        cancel_on_close = server->cancel_on_close;
-    }
-    server->serving = false;
-    pthread_mutex_unlock(&server->mutex);
-    if (release_server != NULL) {
-        int release_err = native_server_shutdown_and_release(release_server, cancel_on_close);
-        if (work->base.err == 0) {
-            work->base.err = release_err;
-        }
-    }
-    work->server_closed = release_server != NULL;
-}
-
-static void serve_complete(napi_env env, napi_status status, void* data) {
-    serve_work* work = data;
-    native_server_close_after_serve(work->server, env, work->server_closed);
-    if (env != NULL && status != napi_ok) {
-        reject_native_error(env, work->base.deferred, -ECANCELED, "serve");
-    } else if (env != NULL && work->base.err != 0) {
-        reject_native_error(env, work->base.deferred, work->base.err, "serve");
-    } else if (env != NULL) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_server_release(work->server);
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static void serve_work_cancel(void* data) {
-    serve_work* work = data;
-    pthread_mutex_lock(&work->server->mutex);
-    work->server->env = NULL;
-    pthread_mutex_unlock(&work->server->mutex);
-    native_server_close_request(work->server, true);
-}
-
-static napi_value native_server_serve(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_server* server = NULL;
-    if (!unwrap_native_server(env, this_arg, &server)) {
-        return NULL;
-    }
-    serve_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate serve work");
-        return NULL;
-    }
-    if (!create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int freeze_err = 0;
-    pthread_mutex_lock(&server->mutex);
-    bool can_start = !server->closing && !server->serving && server->server != NULL;
-    if (can_start) {
-        freeze_err = trevrpc_server_freeze(server->server);
-        can_start = freeze_err == 0;
-    }
-    if (can_start) {
-        server->serving = true;
-        server->refs++;
-    }
-    pthread_mutex_unlock(&server->mutex);
-    if (!can_start) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        free(work);
-        if (freeze_err != 0) {
-            throw_native_error(env, freeze_err, "serve");
-        } else {
-            napi_throw_error(env, NULL, "server is closed or already serving");
-        }
-        return NULL;
-    }
-    work->server = server;
-    return queue_work_managed(
-        env, &work->base, "serve", serve_execute, serve_complete, serve_complete, serve_work_cancel);
-}
-
-static napi_value native_server_close(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_server* server = NULL;
-    if (!unwrap_native_server(env, this_arg, &server)) {
-        return NULL;
-    }
-    native_server_close_request(server, false);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_value create_native_cancellation(napi_env env) {
-    native_cancellation* cancellation = calloc(1, sizeof(*cancellation));
-    if (cancellation == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate cancellation");
-        return NULL;
-    }
-    cancellation->cancellation = trevrpc_cancellation_new();
-    if (cancellation->cancellation == NULL) {
-        free(cancellation);
-        napi_throw_error(env, NULL, "failed to allocate cancellation");
-        return NULL;
-    }
-
-    napi_value ctor = NULL;
-    napi_value external = NULL;
-    napi_value instance = NULL;
-    native_completion_runtime* runtime = native_completion_runtime_for_env(env);
-    napi_status status = runtime == NULL ? napi_generic_failure
-                                         : napi_get_reference_value(env, runtime->cancellation_constructor, &ctor);
-    if (status == napi_ok) {
-        status = napi_create_external(env, cancellation, NULL, NULL, &external);
-    }
-    if (status == napi_ok) {
-        status = napi_new_instance(env, ctor, 1, &external, &instance);
-    }
-    if (status != napi_ok) {
-        clear_pending_exception(env);
-        trevrpc_cancellation_release(cancellation->cancellation);
-        free(cancellation);
-        napi_throw_error(env, NULL, "failed to create cancellation");
-        return NULL;
-    }
-    return instance;
-}
-
-static napi_value native_create_cancellation(napi_env env, napi_callback_info info) {
-    (void)info;
-    return create_native_cancellation(env);
-}
-
-static napi_value native_client_create_cancellation(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_client* client = NULL;
-    if (!unwrap_native_client(env, this_arg, &client)) {
-        return NULL;
-    }
-    return create_native_cancellation(env);
-}
-
-static napi_value native_cancellation_cancel(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_cancellation* cancellation = NULL;
-    if (!unwrap_native_cancellation(env, this_arg, &cancellation)) {
-        return NULL;
-    }
-    trevrpc_cancellation_cancel(cancellation->cancellation);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static void call_execute(napi_env env, void* data) {
-    (void)env;
-    call_work* work = data;
-    trevrpc_raw_client* client = NULL;
-    work->base.err = native_client_acquire(work->client, &client);
-    if (work->base.err != 0) {
-        return;
-    }
-    work->acquired = true;
-    trevrpc_call_options_v1 options = {0};
-    work->base.err = trevrpc_call_options_v1_init(&options, sizeof(options));
-    if (work->base.err != 0) {
-        return;
-    }
-    options.cancellation = work->cancellation;
-    options.max_response_body_size = -1;
-    options.max_response_messages = -1;
-    options.max_response_stream_body_size = -1;
-    options.response_idle_timeout_nanos = 0;
-    options.request_body_lifetime = TREVRPC_REQUEST_BODY_BORROW_UNTIL_RETURN;
-    work->base.err = trevrpc_raw_client_call_request_inbound_v1(client, &work->request, &options, &work->response);
-}
-
-static void call_complete(napi_env env, napi_status status, void* data) {
-    call_work* work = data;
-    if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value response = NULL;
-        int conversion_err = inbound_response_to_js(env, work->response, &response);
-        if (conversion_err == 0) {
-            napi_resolve_deferred(env, work->base.deferred, response);
-        } else {
-            clear_pending_exception(env);
-            reject_native_error(env, work->base.deferred, conversion_err, "call");
-        }
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "call");
-    }
-    trevrpc_inbound_response_release(work->response);
-    if (work->acquired) {
-        native_client_release(work->client);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    if (env != NULL && work->cancellation_ref != NULL) {
-        napi_delete_reference(env, work->cancellation_ref);
-    }
-    trevrpc_cancellation_release(work->cancellation);
-    native_work_delete(work->base.work);
-    trevrpc_metadata_reset(&work->request.metadata);
-    free(work->service);
-    free(work->method);
-    free(work->body);
-    free(work);
-}
-
-static void call_work_cancel(void* data) {
-    call_work* work = data;
-    trevrpc_cancellation_cancel(work->cancellation);
-}
-
-static napi_value native_client_call(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1 && argc != 2) {
-        napi_throw_type_error(env, NULL, "call requires a request object and optional cancellation");
-        return NULL;
-    }
-    call_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate call work");
-        return NULL;
-    }
-    if (!unwrap_native_client(env, this_arg, &work->client) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int err = client_request_from_js(
-        env, args[0], TREVRPC_RPC_KIND_UNARY, &work->request, &work->service, &work->method, &work->body);
-    if (err == 0) {
-        err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
-    }
-    if (err == 0 && work->cancellation == NULL) {
-        work->cancellation = trevrpc_cancellation_new();
-        if (work->cancellation == NULL) {
-            err = -ENOMEM;
-        }
-    }
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        if (work->cancellation_ref != NULL) {
-            napi_delete_reference(env, work->cancellation_ref);
-        }
-        trevrpc_cancellation_release(work->cancellation);
-        trevrpc_metadata_reset(&work->request.metadata);
-        free(work->service);
-        free(work->method);
-        free(work->body);
-        free(work);
-        napi_throw_type_error(env, NULL, "invalid call arguments");
-        return NULL;
-    }
-    work->base.err = native_client_work_reserve(work->client, &work->base);
-    return queue_work_managed(env, &work->base, "call", call_execute, call_complete, call_complete, call_work_cancel);
-}
-
-static void start_stream_execute(napi_env env, void* data) {
-    (void)env;
-    start_stream_work* work = data;
-    trevrpc_raw_client* client = NULL;
-    work->base.err = native_client_acquire(work->client, &client);
-    if (work->base.err != 0) {
-        return;
-    }
-    work->acquired = true;
-    trevrpc_call_options_v1 options = {0};
-    work->base.err = trevrpc_call_options_v1_init(&options, sizeof(options));
-    if (work->base.err != 0) {
-        return;
-    }
-    options.cancellation = work->cancellation;
-    options.max_response_body_size = -1;
-    options.max_response_messages = -1;
-    options.max_response_stream_body_size = -1;
-    options.response_idle_timeout_nanos = 0;
-    options.request_body_lifetime = TREVRPC_REQUEST_BODY_BORROW_UNTIL_RETURN;
-    work->base.err = trevrpc_raw_client_start_stream_request_v1(client, &work->request, &options, &work->stream);
-}
-
-static void start_stream_complete(napi_env env, napi_status status, void* data) {
-    start_stream_work* work = data;
-    bool owner_transferred = false;
-    if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        native_stream* stream = calloc(1, sizeof(*stream));
-        if (stream == NULL) {
-            reject_native_error(env, work->base.deferred, -ENOMEM, "startStream");
-        } else {
-            int mutex_err = pthread_mutex_init(&stream->mutex, NULL);
-            int operation_mutex_err = mutex_err == 0 ? pthread_mutex_init(&stream->operation_mutex, NULL) : mutex_err;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-            int gate_err =
-                operation_mutex_err == 0 ? debug_outbound_gate_init(&stream->debug_outbound_gate) : operation_mutex_err;
-            if (mutex_err != 0 || operation_mutex_err != 0 || gate_err != 0) {
-#else
-            if (mutex_err != 0 || operation_mutex_err != 0) {
-#endif
-                if (operation_mutex_err == 0) {
-                    pthread_mutex_destroy(&stream->operation_mutex);
-                }
-                if (mutex_err == 0) {
-                    pthread_mutex_destroy(&stream->mutex);
-                }
-                free(stream);
-                reject_native_error(env, work->base.deferred, -ENOMEM, "startStream");
-                stream = NULL;
-            }
-        }
-        if (stream != NULL) {
-            stream->stream = work->stream;
-            stream->owner = work->client;
-
-            napi_value ctor = NULL;
-            napi_value external = NULL;
-            napi_value instance = NULL;
-            native_completion_runtime* runtime = native_completion_runtime_for_env(env);
-            napi_status wrap_status = runtime == NULL
-                                          ? napi_generic_failure
-                                          : napi_get_reference_value(env, runtime->stream_constructor, &ctor);
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_create_external(env, stream, NULL, NULL, &external);
-            }
-            if (wrap_status == napi_ok) {
-                wrap_status = napi_new_instance(env, ctor, 1, &external, &instance);
-            }
-            if (wrap_status != napi_ok) {
-                clear_pending_exception(env);
-                native_stream_close_request(stream);
-                owner_transferred = true;
-                work->stream = NULL;
-                reject_native_error(env, work->base.deferred, -ENOMEM, "startStream");
-            } else {
-                owner_transferred = true;
-                work->stream = NULL;
-                napi_resolve_deferred(env, work->base.deferred, instance);
-            }
-        }
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "startStream");
-    }
-
-    if (work->stream != NULL) {
-        trevrpc_stream_close(work->stream);
-        work->stream = NULL;
-    }
-    if (work->acquired && !owner_transferred) {
-        native_client_release(work->client);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    if (env != NULL && work->cancellation_ref != NULL) {
-        napi_delete_reference(env, work->cancellation_ref);
-    }
-    trevrpc_cancellation_release(work->cancellation);
-    native_work_delete(work->base.work);
-    trevrpc_metadata_reset(&work->request.metadata);
-    free(work->service);
-    free(work->method);
-    free(work->body);
-    free(work);
-}
-
-static void start_stream_work_cancel(void* data) {
-    start_stream_work* work = data;
-    trevrpc_cancellation_cancel(work->cancellation);
-}
-
-static napi_value native_client_start_stream(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1 && argc != 2) {
-        napi_throw_type_error(env, NULL, "startStream requires a request object and optional cancellation");
-        return NULL;
-    }
-    start_stream_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate startStream work");
-        return NULL;
-    }
-    if (!unwrap_native_client(env, this_arg, &work->client) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int err = client_request_from_js(
-        env, args[0], TREVRPC_RPC_KIND_SERVER_STREAMING, &work->request, &work->service, &work->method, &work->body);
-    if (err == 0) {
-        err = optional_cancellation_arg(env, argc, args, 1, &work->cancellation, &work->cancellation_ref);
-    }
-    if (err == 0 && work->cancellation == NULL) {
-        work->cancellation = trevrpc_cancellation_new();
-        if (work->cancellation == NULL) {
-            err = -ENOMEM;
-        }
-    }
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        if (work->cancellation_ref != NULL) {
-            napi_delete_reference(env, work->cancellation_ref);
-        }
-        trevrpc_cancellation_release(work->cancellation);
-        trevrpc_metadata_reset(&work->request.metadata);
-        free(work->service);
-        free(work->method);
-        free(work->body);
-        free(work);
-        napi_throw_type_error(env, NULL, "invalid startStream arguments");
-        return NULL;
-    }
-    work->base.err = native_client_work_reserve(work->client, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "startStream",
-        start_stream_execute,
-        start_stream_complete,
-        start_stream_complete,
-        start_stream_work_cancel);
-}
-
-static napi_value native_client_close(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_client* client = NULL;
-    if (!unwrap_native_client(env, this_arg, &client)) {
-        return NULL;
-    }
-    native_client_close_request(client, false);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-typedef struct native_stream_work_prefix {
-    base_work base;
-    native_stream* stream;
-} native_stream_work_prefix;
-
-static void native_stream_work_cancel(void* data) {
-    native_stream_work_prefix* work = data;
-    native_stream_close_request(work->stream);
-}
-
-static void stream_send_execute(napi_env env, void* data);
-static void stream_send_complete(napi_env env, napi_status status, void* data);
-static void stream_send_many_execute(napi_env env, void* data);
-static void stream_send_many_complete(napi_env env, napi_status status, void* data);
-
-static napi_value native_stream_send_message(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "sendMessage requires a body");
-        return NULL;
-    }
-    stream_send_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate send work");
-        return NULL;
-    }
-    if (!unwrap_native_stream(env, this_arg, &work->stream) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int err = copy_bytes_arg(env, args[0], &work->body, &work->body_len);
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        free(work->body);
-        free(work);
-        if (err == -ENOMEM) {
-            napi_throw_error(env, NULL, "failed to allocate sendMessage body");
-        } else {
-            napi_throw_type_error(env, NULL, "invalid sendMessage body");
-        }
-        return NULL;
-    }
-    work->base.err = native_stream_outbound_work_reserve(work->stream, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "sendMessage",
-        stream_send_execute,
-        stream_send_complete,
-        stream_send_complete,
-        native_stream_work_cancel);
-}
-
-static void stream_send_execute(napi_env env, void* data) {
-    (void)env;
-    stream_send_work* work = data;
-    if (!native_stream_outbound_is_head(work->stream, &work->base)) {
-        work->base.retry = true;
-        return;
-    }
-    trevrpc_stream* stream = NULL;
-    work->base.err = native_stream_operation_acquire(work->stream, &stream);
-    if (work->base.err == -EAGAIN) {
-        work->base.err = 0;
-        work->base.retry = true;
-        return;
-    }
-    if (work->base.err != 0) {
-        native_stream_outbound_finish(work->stream, &work->base);
-        return;
-    }
-    work->acquired = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_wait(&work->stream->debug_outbound_gate, &work->stream->mutex);
-#endif
-    if (native_stream_cancel_requested(work->stream)) {
-        work->base.err = -ECANCELED;
-    } else {
-        work->base.err = trevrpc_stream_send_message(stream, work->body, work->body_len);
-        work->base.err = native_stream_normalize_cancelled_error(work->stream, work->base.err);
-    }
-    native_stream_operation_release(work->stream);
-    work->acquired = false;
-    native_stream_outbound_finish(work->stream, &work->base);
-}
-
-static void stream_send_complete(napi_env env, napi_status status, void* data) {
-    stream_send_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessage");
-    }
-    if (work->acquired) {
-        native_stream_operation_release(work->stream);
-    }
-    native_stream_outbound_finish(work->stream, &work->base);
-    free(work->body);
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value native_stream_send_messages(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "sendMessages requires an array of bodies");
-        return NULL;
-    }
-    stream_send_many_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate sendMessages work");
-        return NULL;
-    }
-    if (!unwrap_native_stream(env, this_arg, &work->stream) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int err = copy_bytes_array_arg(env, args[0], &work->bodies, &work->body_lens, &work->count);
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        free(work->bodies);
-        free(work->body_lens);
-        free(work);
-        if (err == -ENOMEM) {
-            napi_throw_error(env, NULL, "failed to allocate sendMessages bodies");
-        } else {
-            napi_throw_type_error(env, NULL, "invalid sendMessages bodies");
-        }
-        return NULL;
-    }
-    work->base.err = native_stream_outbound_work_reserve(work->stream, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "sendMessages",
-        stream_send_many_execute,
-        stream_send_many_complete,
-        stream_send_many_complete,
-        native_stream_work_cancel);
-}
-
-static void stream_send_many_execute(napi_env env, void* data) {
-    (void)env;
-    stream_send_many_work* work = data;
-    if (!native_stream_outbound_is_head(work->stream, &work->base)) {
-        work->base.retry = true;
-        return;
-    }
-    trevrpc_stream* stream = NULL;
-    work->base.err = native_stream_operation_acquire(work->stream, &stream);
-    if (work->base.err == -EAGAIN) {
-        work->base.err = 0;
-        work->base.retry = true;
-        return;
-    }
-    if (work->base.err != 0) {
-        native_stream_outbound_finish(work->stream, &work->base);
-        return;
-    }
-    work->acquired = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_wait(&work->stream->debug_outbound_gate, &work->stream->mutex);
-#endif
-    if (native_stream_cancel_requested(work->stream)) {
-        work->base.err = -ECANCELED;
-    } else {
-        work->base.err = trevrpc_stream_send_messages(stream, work->bodies, work->body_lens, work->count);
-        work->base.err = native_stream_normalize_cancelled_error(work->stream, work->base.err);
-    }
-    native_stream_operation_release(work->stream);
-    work->acquired = false;
-    native_stream_outbound_finish(work->stream, &work->base);
-}
-
-static void stream_send_many_complete(napi_env env, napi_status status, void* data) {
-    stream_send_many_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessages");
-    }
-    if (work->acquired) {
-        native_stream_operation_release(work->stream);
-    }
-    native_stream_outbound_finish(work->stream, &work->base);
-    free(work->bodies);
-    free(work->body_lens);
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static void stream_finish_execute(napi_env env, void* data) {
-    (void)env;
-    stream_finish_work* work = data;
-    if (!native_stream_outbound_is_head(work->stream, &work->base)) {
-        work->base.retry = true;
-        return;
-    }
-    trevrpc_stream* stream = NULL;
-    work->base.err = native_stream_operation_acquire(work->stream, &stream);
-    if (work->base.err == -EAGAIN) {
-        work->base.err = 0;
-        work->base.retry = true;
-        return;
-    }
-    if (work->base.err != 0) {
-        native_stream_outbound_finish(work->stream, &work->base);
-        return;
-    }
-    work->acquired = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_wait(&work->stream->debug_outbound_gate, &work->stream->mutex);
-#endif
-    if (native_stream_cancel_requested(work->stream)) {
-        work->base.err = -ECANCELED;
-    } else {
-        work->base.err = trevrpc_stream_finish_send(stream);
-        work->base.err = native_stream_normalize_cancelled_error(work->stream, work->base.err);
-    }
-    native_stream_operation_release(work->stream);
-    work->acquired = false;
-    native_stream_outbound_finish(work->stream, &work->base);
-}
-
-static void stream_finish_complete(napi_env env, napi_status status, void* data) {
-    stream_finish_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "finishSend");
-    }
-    if (work->acquired) {
-        native_stream_operation_release(work->stream);
-    }
-    native_stream_outbound_finish(work->stream, &work->base);
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value native_stream_finish_send(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    stream_finish_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate finishSend work");
-        return NULL;
-    }
-    if (!unwrap_native_stream(env, this_arg, &work->stream) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    work->base.err = native_stream_outbound_work_reserve(work->stream, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "finishSend",
-        stream_finish_execute,
-        stream_finish_complete,
-        stream_finish_complete,
-        native_stream_work_cancel);
-}
-
-static void stream_recv_execute(napi_env env, void* data) {
-    (void)env;
-    stream_recv_work* work = data;
-    trevrpc_stream* stream = NULL;
-    work->base.err = native_stream_operation_acquire(work->stream, &stream);
-    if (work->base.err == -EAGAIN) {
-        work->base.err = 0;
-        work->base.retry = true;
-        return;
-    }
-    if (work->base.err != 0) {
-        return;
-    }
-    work->acquired = true;
-    int ready = 0;
-    work->base.err = trevrpc_stream_recv_inbound_ready_since(stream, &work->frame, &ready, work->base.queued_at_nanos);
-    native_stream_operation_release(work->stream);
-    work->acquired = false;
-    if (work->base.err == TREVRPC_ERR_STREAM_IDLE_TIMEOUT) {
-        native_stream_close_request(work->stream);
-    }
-    if (work->base.err == 0 && !ready) {
-        work->base.retry = true;
-    }
-}
-
-static void stream_recv_complete(napi_env env, napi_status status, void* data) {
-    stream_recv_work* work = data;
-    if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value value = NULL;
-        int conversion_err = work->frame == NULL ? (napi_get_null(env, &value) == napi_ok ? 0 : -ENOMEM)
-                                                 : inbound_stream_frame_to_js(env, work->frame, &value);
-        if (conversion_err == 0) {
-            napi_resolve_deferred(env, work->base.deferred, value);
-        } else {
-            clear_pending_exception(env);
-            reject_native_error(env, work->base.deferred, conversion_err, "recv");
-        }
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recv");
-    }
-    trevrpc_inbound_stream_frame_release(work->frame);
-    if (work->acquired) {
-        native_stream_operation_release(work->stream);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value native_stream_recv(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    stream_recv_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate recv work");
-        return NULL;
-    }
-    if (!unwrap_native_stream(env, this_arg, &work->stream) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    work->base.err = native_stream_work_reserve(work->stream, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "recv",
-        stream_recv_execute,
-        stream_recv_complete,
-        stream_recv_complete,
-        native_stream_work_cancel);
-}
-
-static void stream_recv_many_execute(napi_env env, void* data) {
-    (void)env;
-    stream_recv_many_work* work = data;
-    trevrpc_stream* stream = NULL;
-    work->base.err = native_stream_operation_acquire(work->stream, &stream);
-    if (work->base.err == -EAGAIN) {
-        work->base.err = 0;
-        work->base.retry = true;
-        return;
-    }
-    if (work->base.err != 0) {
-        return;
-    }
-    work->acquired = true;
-    int ready = 0;
-    work->base.err = recv_many_ready_from_stream(stream,
-        work->max_frames,
-        &work->frames,
-        &work->frames_len,
-        &work->frames_cap,
-        &work->eof,
-        &ready,
-        work->base.queued_at_nanos);
-    native_stream_operation_release(work->stream);
-    work->acquired = false;
-    if (work->base.err == TREVRPC_ERR_STREAM_IDLE_TIMEOUT) {
-        native_stream_close_request(work->stream);
-    }
-    if (work->base.err == 0 && !ready) {
-        work->base.retry = true;
-    }
-}
-
-static void stream_recv_many_complete(napi_env env, napi_status status, void* data) {
-    stream_recv_many_work* work = data;
-    if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value frames = NULL;
-        int conversion_err = inbound_stream_frame_list_to_js(env, work->frames, work->frames_len, work->eof, &frames);
-        if (conversion_err == 0) {
-            napi_resolve_deferred(env, work->base.deferred, frames);
-        } else {
-            clear_pending_exception(env);
-            reject_native_error(env, work->base.deferred, conversion_err, "recvMany");
-        }
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recvMany");
-    }
-    inbound_stream_frame_list_reset(work->frames, work->frames_len);
-    if (work->acquired) {
-        native_stream_operation_release(work->stream);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value native_stream_recv_many(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    stream_recv_many_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate recvMany work");
-        return NULL;
-    }
-    if (!recv_many_max_arg(env, argc, args, &work->max_frames) || !unwrap_native_stream(env, this_arg, &work->stream) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    work->base.err = native_stream_work_reserve(work->stream, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "recvMany",
-        stream_recv_many_execute,
-        stream_recv_many_complete,
-        stream_recv_many_complete,
-        native_stream_work_cancel);
-}
-
-static void stream_recv_body_batch_complete(napi_env env, napi_status status, void* data) {
-    stream_recv_many_work* work = data;
-    if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value batch = NULL;
-        int conversion_err = inbound_stream_body_batch_to_js(env, work->frames, work->frames_len, work->eof, &batch);
-        if (conversion_err == 0) {
-            napi_resolve_deferred(env, work->base.deferred, batch);
-        } else {
-            clear_pending_exception(env);
-            reject_native_error(env, work->base.deferred, conversion_err, "recvBodyBatch");
-        }
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recvBodyBatch");
-    }
-    inbound_stream_frame_list_reset(work->frames, work->frames_len);
-    if (work->acquired) {
-        native_stream_operation_release(work->stream);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value native_stream_recv_body_batch(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    stream_recv_many_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate recvBodyBatch work");
-        return NULL;
-    }
-    if (!recv_body_batch_max_arg(env, argc, args, &work->max_frames) ||
-        !unwrap_native_stream(env, this_arg, &work->stream) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    work->base.err = native_stream_work_reserve(work->stream, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "recvBodyBatch",
-        stream_recv_many_execute,
-        stream_recv_body_batch_complete,
-        stream_recv_body_batch_complete,
-        native_stream_work_cancel);
-}
-
-static napi_value native_stream_close(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_stream* stream = NULL;
-    if (!unwrap_native_stream(env, this_arg, &stream)) {
-        return NULL;
-    }
-    native_stream_close_request(stream);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-static napi_value native_stream_debug_arm_outbound_gate(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_stream* stream = NULL;
-    if (!unwrap_native_stream(env, this_arg, &stream)) {
-        return NULL;
-    }
-    pthread_mutex_lock(&stream->mutex);
-    bool armed =
-        stream->stream != NULL && !stream->closing && debug_outbound_gate_arm_locked(&stream->debug_outbound_gate);
-    pthread_mutex_unlock(&stream->mutex);
-    if (!armed) {
-        napi_throw_error(env, NULL, "failed to arm native stream outbound gate");
-        return NULL;
-    }
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_value native_stream_debug_outbound_gate_reached(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_stream* stream = NULL;
-    if (!unwrap_native_stream(env, this_arg, &stream)) {
-        return NULL;
-    }
-    pthread_mutex_lock(&stream->mutex);
-    bool reached = debug_outbound_gate_reached_locked(&stream->debug_outbound_gate);
-    pthread_mutex_unlock(&stream->mutex);
-    napi_value result = NULL;
-    napi_get_boolean(env, reached, &result);
-    return result;
-}
-
-static napi_value native_stream_debug_release_outbound_gate(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_stream* stream = NULL;
-    if (!unwrap_native_stream(env, this_arg, &stream)) {
-        return NULL;
-    }
-    pthread_mutex_lock(&stream->mutex);
-    debug_outbound_gate_release_locked(&stream->debug_outbound_gate);
-    pthread_mutex_unlock(&stream->mutex);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-#endif
-
-typedef struct native_call_work_prefix {
-    base_work base;
-    native_call* call;
-} native_call_work_prefix;
-
-static void native_call_work_cancel(void* data) {
-    native_call_work_prefix* work = data;
-    native_call_close_request(work->call);
-}
-
-static void call_send_execute(napi_env env, void* data);
-static void call_send_complete(napi_env env, napi_status status, void* data);
-static void call_send_many_execute(napi_env env, void* data);
-static void call_send_many_complete(napi_env env, napi_status status, void* data);
-
-static void call_respond_execute(napi_env env, void* data) {
-    (void)env;
-    call_response_work* work = data;
-    if (!native_call_outbound_is_head(work->call, &work->base)) {
-        work->base.retry = true;
-        return;
-    }
-    work->base.err = native_call_operation_acquire(work->call, true, &work->c_call, &work->base);
-    if (work->base.err != 0) {
-        native_call_outbound_finish(work->call, &work->base);
-        return;
-    }
-    if (work->base.retry) {
-        return;
-    }
-    work->acquired = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_wait(&work->call->debug_outbound_gate, &work->call->mutex);
-#endif
-    trevrpc_response_view_v1 response = {0};
-    work->base.err = trevrpc_response_view_v1_init(&response, sizeof(response));
-    if (work->base.err == 0) {
-        response.status = work->status;
-        response.message = work->message;
-        response.message_len = work->message_len;
-        response.body = work->body;
-        response.body_len = work->body_len;
-        response.metadata = &work->metadata;
-        work->base.err = trevrpc_call_respond_borrowed_v1(work->c_call, &response);
-    }
-    trevrpc_call_close(work->c_call);
-    native_call_terminal_operation_complete(work->call, work->c_call, &work->base);
-    work->c_call = NULL;
-    work->acquired = false;
-    work->terminal_released = true;
-    native_call_outbound_finish(work->call, &work->base);
-}
-
-static void call_respond_complete(napi_env env, napi_status status, void* data) {
-    call_response_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "respond");
-    }
-    if (work->acquired) {
-        native_call_work_operation_release(work->call, work->c_call);
-    }
-    if (!work->terminal_released) {
-        native_call_terminal_abandon(work->call, &work->base);
-    }
-    native_call_outbound_finish(work->call, &work->base);
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    trevrpc_metadata_reset(&work->metadata);
-    free(work->message);
-    free(work->body);
-    free(work);
-}
-
-static napi_value native_call_respond(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "respond requires a response object");
-        return NULL;
-    }
-    call_response_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate respond work");
-        return NULL;
-    }
-    if (!unwrap_native_call(env, this_arg, &work->call) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int err = server_response_from_js(env, args[0], work);
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        trevrpc_metadata_reset(&work->metadata);
-        free(work->message);
-        free(work->body);
-        free(work);
-        throw_if_no_pending_exception(env, "invalid response object");
-        return NULL;
-    }
-    work->base.err = native_call_outbound_work_reserve(work->call, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "respond",
-        call_respond_execute,
-        call_respond_complete,
-        call_respond_complete,
-        native_call_work_cancel);
-}
-
-static napi_value native_call_send_message(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "sendMessage requires a body");
-        return NULL;
-    }
-    call_send_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate send work");
-        return NULL;
-    }
-    if (!unwrap_native_call(env, this_arg, &work->call) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int err = copy_bytes_arg(env, args[0], &work->body, &work->body_len);
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        free(work->body);
-        free(work);
-        if (err == -ENOMEM) {
-            napi_throw_error(env, NULL, "failed to allocate sendMessage body");
-        } else {
-            napi_throw_type_error(env, NULL, "invalid sendMessage body");
-        }
-        return NULL;
-    }
-    work->base.err = native_call_outbound_work_reserve(work->call, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "sendMessage",
-        call_send_execute,
-        call_send_complete,
-        call_send_complete,
-        native_call_work_cancel);
-}
-
-static void call_send_execute(napi_env env, void* data) {
-    (void)env;
-    call_send_work* work = data;
-    if (!native_call_outbound_is_head(work->call, &work->base)) {
-        work->base.retry = true;
-        return;
-    }
-    work->base.err = native_call_operation_acquire(work->call, false, &work->c_call, &work->base);
-    if (work->base.err != 0) {
-        native_call_outbound_finish(work->call, &work->base);
-        return;
-    }
-    if (work->base.retry) {
-        return;
-    }
-    work->acquired = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_wait(&work->call->debug_outbound_gate, &work->call->mutex);
-#endif
-    trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
-    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
-                                    : trevrpc_stream_send_message(stream, work->body, work->body_len);
-    native_call_work_operation_release(work->call, work->c_call);
-    work->c_call = NULL;
-    work->acquired = false;
-    native_call_outbound_finish(work->call, &work->base);
-}
-
-static void call_send_complete(napi_env env, napi_status status, void* data) {
-    call_send_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessage");
-    }
-    if (work->acquired) {
-        native_call_work_operation_release(work->call, work->c_call);
-    }
-    native_call_outbound_finish(work->call, &work->base);
-    free(work->body);
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value native_call_send_messages(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    if (argc != 1) {
-        napi_throw_type_error(env, NULL, "sendMessages requires an array of bodies");
-        return NULL;
-    }
-    call_send_many_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate sendMessages work");
-        return NULL;
-    }
-    if (!unwrap_native_call(env, this_arg, &work->call) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    int err = copy_bytes_array_arg(env, args[0], &work->bodies, &work->body_lens, &work->count);
-    if (err != 0) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        free(work->bodies);
-        free(work->body_lens);
-        free(work);
-        if (err == -ENOMEM) {
-            napi_throw_error(env, NULL, "failed to allocate sendMessages bodies");
-        } else {
-            napi_throw_type_error(env, NULL, "invalid sendMessages bodies");
-        }
-        return NULL;
-    }
-    work->base.err = native_call_outbound_work_reserve(work->call, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "sendMessages",
-        call_send_many_execute,
-        call_send_many_complete,
-        call_send_many_complete,
-        native_call_work_cancel);
-}
-
-static void call_send_many_execute(napi_env env, void* data) {
-    (void)env;
-    call_send_many_work* work = data;
-    if (!native_call_outbound_is_head(work->call, &work->base)) {
-        work->base.retry = true;
-        return;
-    }
-    work->base.err = native_call_operation_acquire(work->call, false, &work->c_call, &work->base);
-    if (work->base.err != 0) {
-        native_call_outbound_finish(work->call, &work->base);
-        return;
-    }
-    if (work->base.retry) {
-        return;
-    }
-    work->acquired = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_wait(&work->call->debug_outbound_gate, &work->call->mutex);
-#endif
-    trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
-    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
-                                    : trevrpc_stream_send_messages(stream, work->bodies, work->body_lens, work->count);
-    native_call_work_operation_release(work->call, work->c_call);
-    work->c_call = NULL;
-    work->acquired = false;
-    native_call_outbound_finish(work->call, &work->base);
-}
-
-static void call_send_many_complete(napi_env env, napi_status status, void* data) {
-    call_send_many_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "sendMessages");
-    }
-    if (work->acquired) {
-        native_call_work_operation_release(work->call, work->c_call);
-    }
-    native_call_outbound_finish(work->call, &work->base);
-    free(work->bodies);
-    free(work->body_lens);
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static void call_finish_execute(napi_env env, void* data) {
-    (void)env;
-    call_finish_work* work = data;
-    if (!native_call_outbound_is_head(work->call, &work->base)) {
-        work->base.retry = true;
-        return;
-    }
-    work->base.err = native_call_operation_acquire(work->call, true, &work->c_call, &work->base);
-    if (work->base.err != 0) {
-        native_call_outbound_finish(work->call, &work->base);
-        return;
-    }
-    if (work->base.retry) {
-        return;
-    }
-    work->acquired = true;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    debug_outbound_gate_wait(&work->call->debug_outbound_gate, &work->call->mutex);
-#endif
-    trevrpc_status_view_v1 status = {0};
-    work->base.err = trevrpc_status_view_v1_init(&status, sizeof(status));
-    if (work->base.err == 0) {
-        status.status = work->status;
-        status.message = work->message;
-        status.message_len = work->message_len;
-        status.metadata = &work->metadata;
-        work->base.err = trevrpc_call_finish_stream_borrowed_v1(work->c_call, &status);
-    }
-    trevrpc_call_close(work->c_call);
-    native_call_terminal_operation_complete(work->call, work->c_call, &work->base);
-    work->c_call = NULL;
-    work->acquired = false;
-    work->terminal_released = true;
-    native_call_outbound_finish(work->call, &work->base);
-}
-
-static void call_finish_complete(napi_env env, napi_status status, void* data) {
-    call_finish_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "finishStream");
-    }
-    if (work->acquired) {
-        native_call_work_operation_release(work->call, work->c_call);
-    }
-    if (!work->terminal_released) {
-        native_call_terminal_abandon(work->call, &work->base);
-    }
-    native_call_outbound_finish(work->call, &work->base);
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    trevrpc_metadata_reset(&work->metadata);
-    free(work->message);
-    free(work);
-}
-
-static napi_value native_call_finish_stream(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value args[3];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    call_finish_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate finishStream work");
-        return NULL;
-    }
-    if (!unwrap_native_call(env, this_arg, &work->call) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    work->status = TREVRPC_STATUS_OK;
-    if (argc > 0 && napi_get_value_uint32(env, args[0], &work->status) != napi_ok) {
-        napi_delete_reference(env, work->base.receiver_ref);
-        free(work);
-        napi_throw_type_error(env, NULL, "invalid finishStream status");
-        return NULL;
-    }
-    if (argc > 1) {
-        work->message = copy_string_value(env, args[1]);
-        if (work->message == NULL) {
-            napi_delete_reference(env, work->base.receiver_ref);
-            free(work);
-            napi_throw_type_error(env, NULL, "invalid finishStream message");
-            return NULL;
-        }
-        work->message_len = strlen(work->message);
-    }
-    if (argc > 2) {
-        int err = metadata_from_js(env, args[2], &work->metadata);
-        if (err != 0) {
-            napi_delete_reference(env, work->base.receiver_ref);
-            trevrpc_metadata_reset(&work->metadata);
-            free(work->message);
-            free(work);
-            napi_throw_type_error(env, NULL, "invalid finishStream metadata");
-            return NULL;
-        }
-    }
-    work->base.err = native_call_outbound_work_reserve(work->call, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "finishStream",
-        call_finish_execute,
-        call_finish_complete,
-        call_finish_complete,
-        native_call_work_cancel);
-}
-
-static void call_recv_execute(napi_env env, void* data) {
-    (void)env;
-    call_recv_work* work = data;
-    work->base.err = native_call_operation_acquire(work->call, false, &work->c_call, &work->base);
-    if (work->base.err != 0) {
-        return;
-    }
-    if (work->base.retry) {
-        return;
-    }
-    work->acquired = true;
-    trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
-    int ready = 0;
-    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
-                                    : trevrpc_stream_recv_inbound_ready_since(
-                                          stream, &work->frame, &ready, work->base.queued_at_nanos);
-    native_call_work_operation_release(work->call, work->c_call);
-    work->c_call = NULL;
-    work->acquired = false;
-    if (work->base.err == TREVRPC_ERR_STREAM_IDLE_TIMEOUT) {
-        native_call_close_request(work->call);
-    }
-    if (work->base.err == 0 && !ready) {
-        work->base.retry = true;
-    }
-}
-
-static void call_recv_complete(napi_env env, napi_status status, void* data) {
-    call_recv_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value value = NULL;
-        int conversion_err = work->frame == NULL ? (napi_get_null(env, &value) == napi_ok ? 0 : -ENOMEM)
-                                                 : inbound_stream_frame_to_js(env, work->frame, &value);
-        if (conversion_err == 0) {
-            napi_resolve_deferred(env, work->base.deferred, value);
-        } else {
-            clear_pending_exception(env);
-            reject_native_error(env, work->base.deferred, conversion_err, "recv");
-        }
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recv");
-    }
-    trevrpc_inbound_stream_frame_release(work->frame);
-    if (work->acquired) {
-        native_call_work_operation_release(work->call, work->c_call);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value native_call_recv(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    call_recv_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate recv work");
-        return NULL;
-    }
-    if (!unwrap_native_call(env, this_arg, &work->call) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    work->base.err = native_call_work_reserve(work->call, &work->base);
-    return queue_work_managed(
-        env, &work->base, "recv", call_recv_execute, call_recv_complete, call_recv_complete, native_call_work_cancel);
-}
-
-static void call_recv_many_execute(napi_env env, void* data) {
-    (void)env;
-    call_recv_many_work* work = data;
-    work->base.err = native_call_operation_acquire(work->call, false, &work->c_call, &work->base);
-    if (work->base.err != 0) {
-        return;
-    }
-    if (work->base.retry) {
-        return;
-    }
-    work->acquired = true;
-    trevrpc_stream* stream = trevrpc_call_stream(work->c_call);
-    int ready = 0;
-    work->base.err = stream == NULL ? TREVRPC_ERR_UNSUPPORTED_RPC_KIND
-                                    : recv_many_ready_from_stream(stream,
-                                          work->max_frames,
-                                          &work->frames,
-                                          &work->frames_len,
-                                          &work->frames_cap,
-                                          &work->eof,
-                                          &ready,
-                                          work->base.queued_at_nanos);
-    native_call_work_operation_release(work->call, work->c_call);
-    work->c_call = NULL;
-    work->acquired = false;
-    if (work->base.err == TREVRPC_ERR_STREAM_IDLE_TIMEOUT) {
-        native_call_close_request(work->call);
-    }
-    if (work->base.err == 0 && !ready) {
-        work->base.retry = true;
-    }
-}
-
-static void call_recv_many_complete(napi_env env, napi_status status, void* data) {
-    call_recv_many_work* work = data;
-    if (env != NULL && work->base.err == 0 && status == napi_ok) {
-        napi_value frames = NULL;
-        int conversion_err = inbound_stream_frame_list_to_js(env, work->frames, work->frames_len, work->eof, &frames);
-        if (conversion_err == 0) {
-            napi_resolve_deferred(env, work->base.deferred, frames);
-        } else {
-            clear_pending_exception(env);
-            reject_native_error(env, work->base.deferred, conversion_err, "recvMany");
-        }
-    } else if (env != NULL) {
-        reject_native_error(env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "recvMany");
-    }
-    inbound_stream_frame_list_reset(work->frames, work->frames_len);
-    if (work->acquired) {
-        native_call_work_operation_release(work->call, work->c_call);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value native_call_recv_many(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-    call_recv_many_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate recvMany work");
-        return NULL;
-    }
-    if (!recv_many_max_arg(env, argc, args, &work->max_frames) || !unwrap_native_call(env, this_arg, &work->call) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    work->base.err = native_call_work_reserve(work->call, &work->base);
-    return queue_work_managed(env,
-        &work->base,
-        "recvMany",
-        call_recv_many_execute,
-        call_recv_many_complete,
-        call_recv_many_complete,
-        native_call_work_cancel);
-}
-
-static napi_value native_call_close(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_call* call = NULL;
-    if (!unwrap_native_call(env, this_arg, &call)) {
-        return NULL;
-    }
-    native_call_close_request(call);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-#ifdef TREVRPC_NODE_TEST_HOOKS
-static napi_value native_call_debug_arm_outbound_gate(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_call* call = NULL;
-    if (!unwrap_native_call(env, this_arg, &call)) {
-        return NULL;
-    }
-    pthread_mutex_lock(&call->mutex);
-    bool armed = call->call != NULL && !call->completing && debug_outbound_gate_arm_locked(&call->debug_outbound_gate);
-    pthread_mutex_unlock(&call->mutex);
-    if (!armed) {
-        napi_throw_error(env, NULL, "failed to arm native call outbound gate");
-        return NULL;
-    }
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_value native_call_debug_outbound_gate_reached(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_call* call = NULL;
-    if (!unwrap_native_call(env, this_arg, &call)) {
-        return NULL;
-    }
-    pthread_mutex_lock(&call->mutex);
-    bool reached = debug_outbound_gate_reached_locked(&call->debug_outbound_gate);
-    pthread_mutex_unlock(&call->mutex);
-    napi_value result = NULL;
-    napi_get_boolean(env, reached, &result);
-    return result;
-}
-
-static napi_value native_call_debug_release_outbound_gate(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    native_call* call = NULL;
-    if (!unwrap_native_call(env, this_arg, &call)) {
-        return NULL;
-    }
-    pthread_mutex_lock(&call->mutex);
-    debug_outbound_gate_release_locked(&call->debug_outbound_gate);
-    pthread_mutex_unlock(&call->mutex);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static void debug_pending_resource_destroy(debug_pending_resource* resource) {
-    pthread_mutex_destroy(&resource->mutex);
-    free(resource);
-}
-
-static void debug_pending_resource_maybe_destroy(debug_pending_resource* resource) {
-    bool destroy = false;
-    pthread_mutex_lock(&resource->mutex);
-    destroy = !resource->js_alive && resource->refs == 0 && resource->closed;
-    pthread_mutex_unlock(&resource->mutex);
-    if (destroy) {
-        debug_pending_resource_destroy(resource);
-    }
-}
-
-static int debug_pending_resource_acquire(debug_pending_resource* resource) {
-    pthread_mutex_lock(&resource->mutex);
-    if (resource->closing || resource->closed) {
-        pthread_mutex_unlock(&resource->mutex);
-        return TREV_NODE_ERR_CLOSED;
-    }
-    resource->refs++;
-    pthread_mutex_unlock(&resource->mutex);
-    return 0;
-}
-
-static void debug_pending_resource_release(debug_pending_resource* resource) {
-    bool closed_now = false;
-    bool destroy = false;
-    pthread_mutex_lock(&resource->mutex);
-    if (resource->refs > 0) {
-        resource->refs--;
-    }
-    if (resource->closing && resource->refs == 0 && !resource->closed) {
-        resource->closed = true;
-        closed_now = true;
-    }
-    destroy = !resource->js_alive && resource->refs == 0 && resource->closed;
-    pthread_mutex_unlock(&resource->mutex);
-    if (closed_now) {
-        atomic_fetch_add_explicit(&DebugPendingResourceCloses, 1, memory_order_relaxed);
-    }
-    if (destroy) {
-        debug_pending_resource_destroy(resource);
-    }
-}
-
-static void debug_pending_resource_close_request(debug_pending_resource* resource) {
-    bool closed_now = false;
-    pthread_mutex_lock(&resource->mutex);
-    resource->closing = true;
-    if (resource->refs == 0 && !resource->closed) {
-        resource->closed = true;
-        closed_now = true;
-    }
-    pthread_mutex_unlock(&resource->mutex);
-    if (closed_now) {
-        atomic_fetch_add_explicit(&DebugPendingResourceCloses, 1, memory_order_relaxed);
-    }
-    debug_pending_resource_maybe_destroy(resource);
-}
-
-static void debug_pending_resource_finalize(napi_env env, void* data, void* hint) {
-    (void)env;
-    (void)hint;
-    debug_pending_resource* resource = data;
-    atomic_fetch_add_explicit(&DebugPendingResourceFinalizers, 1, memory_order_relaxed);
-    pthread_mutex_lock(&resource->mutex);
-    resource->js_alive = false;
-    pthread_mutex_unlock(&resource->mutex);
-    debug_pending_resource_close_request(resource);
-}
-
-static bool unwrap_debug_pending_resource(napi_env env, napi_value receiver, debug_pending_resource** out_resource) {
-    *out_resource = NULL;
-    if (napi_unwrap(env, receiver, (void**)out_resource) != napi_ok || *out_resource == NULL) {
-        napi_throw_type_error(env, NULL, "invalid debug pending resource receiver");
-        return false;
-    }
-    return true;
-}
-
-static void debug_sleep_ms(uint32_t delay_ms) {
-    struct timespec remaining = {
-        .tv_sec = delay_ms / 1000u,
-        .tv_nsec = (long)(delay_ms % 1000u) * 1000 * 1000,
-    };
-    while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
-    }
-}
-
-static void debug_pending_wait_execute(napi_env env, void* data) {
-    (void)env;
-    debug_pending_wait_work* work = data;
-    work->base.err = debug_pending_resource_acquire(work->resource);
-    if (work->base.err != 0) {
-        return;
-    }
-    work->acquired = true;
-    debug_sleep_ms(work->delay_ms);
-    debug_pending_resource_release(work->resource);
-    work->acquired = false;
-}
-
-static void debug_pending_wait_complete(napi_env env, napi_status status, void* data) {
-    debug_pending_wait_work* work = data;
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(
-            env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "debugPendingWait");
-    }
-    if (work->acquired) {
-        debug_pending_resource_release(work->resource);
-    }
-    if (env != NULL && work->base.receiver_ref != NULL) {
-        napi_delete_reference(env, work->base.receiver_ref);
-    }
-    native_work_delete(work->base.work);
-    free(work);
-}
-
-static napi_value debug_pending_resource_wait(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &argc, args, &this_arg, NULL);
-
-    debug_pending_wait_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate debug pending wait work");
-        return NULL;
-    }
-    work->delay_ms = 50;
-    if (argc > 0) {
-        (void)napi_get_value_uint32(env, args[0], &work->delay_ms);
-    }
-    if (!unwrap_debug_pending_resource(env, this_arg, &work->resource) ||
-        !create_receiver_ref(env, this_arg, &work->base.receiver_ref)) {
-        free(work);
-        return NULL;
-    }
-    return queue_work(env, &work->base, "debugPendingWait", debug_pending_wait_execute, debug_pending_wait_complete);
-}
-
-static napi_value debug_pending_resource_close(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    debug_pending_resource* resource = NULL;
-    if (!unwrap_debug_pending_resource(env, this_arg, &resource)) {
-        return NULL;
-    }
-    debug_pending_resource_close_request(resource);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_value debug_pending_resource_closed(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    debug_pending_resource* resource = NULL;
-    if (!unwrap_debug_pending_resource(env, this_arg, &resource)) {
-        return NULL;
-    }
-
-    pthread_mutex_lock(&resource->mutex);
-    bool closed = resource->closed;
-    pthread_mutex_unlock(&resource->mutex);
-    napi_value result = NULL;
-    napi_get_boolean(env, closed, &result);
-    return result;
-}
-
-static napi_value debug_pending_resource_refs(napi_env env, napi_callback_info info) {
-    napi_value this_arg = NULL;
-    napi_get_cb_info(env, info, &(size_t){0}, NULL, &this_arg, NULL);
-    debug_pending_resource* resource = NULL;
-    if (!unwrap_debug_pending_resource(env, this_arg, &resource)) {
-        return NULL;
-    }
-
-    pthread_mutex_lock(&resource->mutex);
-    uint32_t refs = resource->refs > UINT32_MAX ? UINT32_MAX : (uint32_t)resource->refs;
-    pthread_mutex_unlock(&resource->mutex);
-    napi_value result = NULL;
-    napi_create_uint32(env, refs, &result);
-    return result;
-}
-
-static napi_value debug_create_pending_resource(napi_env env, napi_callback_info info) {
-    (void)info;
-    debug_pending_resource* resource = calloc(1, sizeof(*resource));
-    if (resource == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate debug pending resource");
-        return NULL;
-    }
-    pthread_mutex_init(&resource->mutex, NULL);
-    resource->js_alive = true;
-
-    napi_value object = NULL;
-    if (napi_create_object(env, &object) != napi_ok ||
-        napi_wrap(env, object, resource, debug_pending_resource_finalize, NULL, NULL) != napi_ok) {
-        debug_pending_resource_destroy(resource);
-        napi_throw_error(env, NULL, "failed to create debug pending resource");
-        return NULL;
-    }
-
-    napi_property_descriptor methods[] = {
-        {"wait", NULL, debug_pending_resource_wait, NULL, NULL, NULL, napi_default, NULL},
-        {"close", NULL, debug_pending_resource_close, NULL, NULL, NULL, napi_default, NULL},
-        {"closed", NULL, debug_pending_resource_closed, NULL, NULL, NULL, napi_default, NULL},
-        {"refs", NULL, debug_pending_resource_refs, NULL, NULL, NULL, napi_default, NULL},
-    };
-    napi_define_properties(env, object, sizeof(methods) / sizeof(methods[0]), methods);
+static napi_value node_make_server_object(napi_env env, node_server* server) {
+    napi_value object;
+    napi_value method;
+    napi_value port;
+    if (napi_create_object(env, &object) != napi_ok || napi_create_uint32(env, server->port, &port) != napi_ok ||
+        napi_set_named_property(env, object, "port", port) != napi_ok ||
+        napi_create_function(env, "register", NAPI_AUTO_LENGTH, node_server_register, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "register", method) != napi_ok ||
+        napi_create_function(env, "serve", NAPI_AUTO_LENGTH, node_server_serve, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "serve", method) != napi_ok ||
+        napi_create_function(env, "close", NAPI_AUTO_LENGTH, node_server_close, NULL, &method) != napi_ok ||
+        napi_set_named_property(env, object, "close", method) != napi_ok ||
+        napi_create_reference(env, object, 1, &server->wrapper_ref) != napi_ok ||
+        napi_wrap(env, object, server, node_server_finalizer, NULL, NULL) != napi_ok) {
+        return NULL;
+    }
+    server->wrapper_alive = true;
     return object;
 }
 
-static napi_value debug_pending_resource_closes(napi_env env, napi_callback_info info) {
-    (void)info;
-    uint64_t count = atomic_load_explicit(&DebugPendingResourceCloses, memory_order_relaxed);
-    napi_value value = NULL;
-    napi_create_double(env, (double)count, &value);
-    return value;
+static int node_route_incoming_call(
+    node_runtime* runtime, trevrpc_rpc_event* event, const trevrpc_rpc_event_info_v1* info) {
+    node_subject* endpoint_subject = node_registry_find(&runtime->endpoints, node_key_from_endpoint(info->endpoint));
+    node_client* endpoint = endpoint_subject == NULL ? NULL : endpoint_subject->core;
+    node_server* server = endpoint == NULL ? NULL : endpoint->server;
+    char* service = info->service_len == 0 ? strdup("") : strndup(info->service, info->service_len);
+    char* method = info->method_len == 0 ? strdup("") : strndup(info->method, info->method_len);
+    node_call* call = calloc(1, sizeof(*call));
+    node_subject* call_subject = node_subject_allocate(TREVRPC_RPC_OBJECT_CALL, (node_handle_key){0, 0, 0});
+    node_subject* stream_subject = node_subject_allocate(TREVRPC_RPC_OBJECT_STREAM, (node_handle_key){0, 0, 0});
+    node_receive_item* initial_item = calloc(1, sizeof(*initial_item));
+    if (service == NULL || method == NULL || call == NULL || call_subject == NULL || stream_subject == NULL ||
+        initial_item == NULL) {
+        free(service);
+        free(method);
+        free(call);
+        free(call_subject);
+        free(stream_subject);
+        free(initial_item);
+        return -ENOMEM;
+    }
+    trevrpc_rpc_call_v1 call_handle;
+    trevrpc_rpc_stream_v1 stream_handle;
+    trevrpc_rpc_receive* initial = NULL;
+    int result = trevrpc_rpc_event_take_incoming_call(event, &call_handle, &stream_handle, &initial);
+    if (result != 0) {
+        free(service);
+        free(method);
+        free(call);
+        free(call_subject);
+        free(stream_subject);
+        free(initial_item);
+        return result;
+    }
+    node_server_route* route = server == NULL ? NULL : node_server_find_route(server, service, method, info->rpc_kind);
+    call->runtime = runtime;
+    call->server = server;
+    call->server_side = true;
+    call->kind = info->rpc_kind;
+    call->call = call_handle;
+    call->stream = stream_handle;
+    call->route = route;
+    call->call_subject = call_subject;
+    call->stream_subject = stream_subject;
+    call_subject->key = node_key_from_call(call_handle);
+    stream_subject->key = node_key_from_stream(stream_handle);
+    call_subject->core = call;
+    stream_subject->core = call;
+    node_registry_insert(runtime, call_subject);
+    node_registry_insert(runtime, stream_subject);
+    if (route != NULL) {
+        route->active_calls++;
+    }
+    if (initial != NULL) {
+        initial_item->receive = initial;
+        call->receive_head = initial_item;
+        call->receive_tail = initial_item;
+    } else {
+        free(initial_item);
+    }
+    free(service);
+    free(method);
+    uint64_t id = node_operation_allocate(runtime);
+    node_operation* operation = id == TREVRPC_RPC_OPERATION_ID_NONE ? NULL
+                                                                    : node_operation_add_id(runtime,
+                                                                          id,
+                                                                          TREVRPC_RPC_OBJECT_CALL,
+                                                                          node_key_from_call(call_handle),
+                                                                          NODE_OPERATION_CALL_ACCEPT,
+                                                                          call,
+                                                                          NULL,
+                                                                          false);
+    if (operation == NULL) {
+        node_call_settle_terminal(call, -ENOMEM, "accept incoming call");
+        call->close_abort = true;
+        node_call_request_close(call);
+        node_call_maybe_release(call);
+        return -ENOMEM;
+    }
+    result = trevrpc_rpc_call_accept(runtime->rpc, call_handle, id);
+    if (result != 0) {
+        node_operation_remove(runtime, operation);
+        node_call_settle_terminal(call, result, "accept incoming call");
+        call->close_abort = true;
+        node_call_request_close(call);
+        node_call_maybe_release(call);
+        return result;
+    }
+    call->accept_submitted = true;
+    return 0;
 }
 
-static napi_value debug_pending_resource_finalizers(napi_env env, napi_callback_info info) {
-    (void)info;
-    uint64_t count = atomic_load_explicit(&DebugPendingResourceFinalizers, memory_order_relaxed);
-    napi_value value = NULL;
-    napi_create_double(env, (double)count, &value);
-    return value;
+static int node_route_admission(
+    node_runtime* runtime, trevrpc_rpc_event* event, const trevrpc_rpc_event_info_v1* info) {
+    node_subject* subject = node_registry_find(&runtime->endpoints, node_key_from_endpoint(info->endpoint));
+    node_client* endpoint = subject == NULL ? NULL : subject->core;
+    node_server* server = endpoint == NULL ? NULL : endpoint->server;
+    uint16_t response = 500;
+    if (server != NULL && server->admission_ref != NULL) {
+        trevrpc_rpc_admission_info_v1 admission;
+        if (trevrpc_rpc_admission_info_v1_init(&admission, sizeof(admission)) == 0 &&
+            trevrpc_rpc_event_get_admission_info_v1(event, &admission) == 0) {
+            napi_value callback = NULL;
+            napi_value global = NULL;
+            napi_value request = NULL;
+            napi_value result_value = NULL;
+            if (napi_get_reference_value(runtime->env, server->admission_ref, &callback) == napi_ok &&
+                napi_get_global(runtime->env, &global) == napi_ok &&
+                napi_create_object(runtime->env, &request) == napi_ok) {
+                napi_value path;
+                napi_value authority;
+                napi_value origin;
+                napi_value secure;
+                if (napi_create_string_utf8(runtime->env,
+                        admission.path == NULL ? "" : (const char*)admission.path,
+                        admission.path_len,
+                        &path) == napi_ok &&
+                    napi_create_string_utf8(runtime->env,
+                        admission.authority == NULL ? "" : (const char*)admission.authority,
+                        admission.authority_len,
+                        &authority) == napi_ok &&
+                    napi_create_string_utf8(runtime->env,
+                        admission.origin == NULL ? "" : (const char*)admission.origin,
+                        admission.origin_len,
+                        &origin) == napi_ok &&
+                    napi_get_boolean(
+                        runtime->env, (admission.flags & TREVRPC_RPC_ADMISSION_FLAG_SECURE) != 0, &secure) == napi_ok &&
+                    napi_set_named_property(runtime->env, request, "path", path) == napi_ok &&
+                    napi_set_named_property(runtime->env, request, "authority", authority) == napi_ok &&
+                    napi_set_named_property(runtime->env, request, "origin", origin) == napi_ok &&
+                    napi_set_named_property(runtime->env, request, "secure", secure) == napi_ok &&
+                    napi_call_function(runtime->env, global, callback, 1, &request, &result_value) == napi_ok) {
+                    bool is_promise = false;
+                    if (napi_is_promise(runtime->env, result_value, &is_promise) != napi_ok || is_promise) {
+                        response = 400;
+                    } else {
+                        bool allowed = false;
+                        if (napi_get_value_bool(runtime->env, result_value, &allowed) == napi_ok) {
+                            response = allowed ? 200 : 403;
+                        } else {
+                            uint32_t status = 0;
+                            if (napi_get_value_uint32(runtime->env, result_value, &status) == napi_ok &&
+                                (status == 200 || (status >= 400 && status <= 599))) {
+                                response = (uint16_t)status;
+                            } else {
+                                response = 400;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return trevrpc_rpc_admission_respond_v1(event, response);
 }
 
-static napi_value debug_external_arraybuffer_finalizers(napi_env env, napi_callback_info info) {
-    (void)info;
-    uint64_t count = atomic_load_explicit(&ExternalArrayBufferFinalizers, memory_order_relaxed);
-    napi_value value = NULL;
-    napi_create_double(env, (double)count, &value);
-    return value;
-}
-
-static napi_value debug_body_owner_releases(napi_env env, napi_callback_info info) {
-    (void)info;
-    uint64_t count = atomic_load_explicit(&NodeBodyOwnerReleases, memory_order_relaxed);
-    napi_value value = NULL;
-    napi_create_double(env, (double)count, &value);
-    return value;
-}
-
-static napi_value debug_body_conversion_failure_stage(napi_env env, napi_callback_info info) {
-    (void)info;
-    int stage = atomic_load_explicit(&NextBodyConversionFailure, memory_order_relaxed);
-    napi_value value = NULL;
-    napi_create_int32(env, stage, &value);
-    return value;
-}
-
-static napi_value debug_set_next_body_conversion_failure(napi_env env, napi_callback_info info) {
+static napi_value node_listen_msquic(napi_env env, napi_callback_info info) {
+    napi_value argv[1] = {NULL};
     size_t argc = 1;
-    napi_value args[1];
-    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-    uint32_t stage = 0;
-    if (argc != 1 || napi_get_value_uint32(env, args[0], &stage) != napi_ok ||
-        stage > DEBUG_BODY_CONVERSION_FAILURE_AFTER_TYPED_ARRAY) {
-        napi_throw_type_error(env, NULL, "invalid body conversion failure stage");
+    if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok || argc < 1) {
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    node_runtime* runtime = NULL;
+    int result = node_runtime_get(env, &runtime);
+    if (result != 0 || runtime == NULL) {
+        return node_rejected_native_promise(env, result == 0 ? -EIO : result, "listenMsQuic");
+    }
+    node_endpoint_config_storage storage;
+    result = node_parse_endpoint_config(env, argv[0], &storage, true);
+    if (result != 0) {
+        return node_rejected_native_promise(env, result, "listenMsQuic");
+    }
+    storage.config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER;
+    storage.config.server_name = NULL;
+    storage.config.server_name_len = 0;
+    napi_value value;
+    bool present = false;
+    napi_valuetype value_type;
+    if (node_get_named_value(env, argv[0], "http3Admission", &value, &present) != 0) {
+        node_endpoint_config_free(&storage);
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    if (present && (napi_typeof(env, value, &value_type) != napi_ok || value_type != napi_function)) {
+        node_endpoint_config_free(&storage);
+        napi_throw_type_error(env, NULL, "http3Admission must be a function");
         return NULL;
     }
-    atomic_store_explicit(&NextBodyConversionFailure, (int)stage, memory_order_relaxed);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_status debug_set_counter(
-    napi_env env, napi_value object, const char* name, atomic_uint_least64_t* counter) {
-    uint64_t count = atomic_load_explicit(counter, memory_order_relaxed);
-    napi_value value = NULL;
-    if (napi_create_double(env, (double)count, &value) != napi_ok) {
-        return napi_generic_failure;
+    bool has_admission = present;
+    bool enable_http3 = false;
+    if (node_get_named_bool(env, argv[0], "enableHttp3", &enable_http3, &present) != 0) {
+        node_endpoint_config_free(&storage);
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
     }
-    return napi_set_named_property(env, object, name, value);
-}
-
-static napi_value debug_completion_runtime_stats(napi_env env, napi_callback_info info) {
-    (void)info;
-    napi_value result = NULL;
-    if (napi_create_object(env, &result) != napi_ok ||
-        debug_set_counter(env, result, "allocations", &DebugCompletionRuntimeAllocations) != napi_ok ||
-        debug_set_counter(env, result, "closes", &DebugCompletionRuntimeCloses) != napi_ok ||
-        debug_set_counter(env, result, "destroys", &DebugCompletionRuntimeDestroys) != napi_ok ||
-        debug_set_counter(env, result, "tsfnFinalizers", &DebugCompletionRuntimeTsfnFinalizers) != napi_ok ||
-        debug_set_counter(env, result, "instanceFinalizers", &DebugCompletionRuntimeInstanceFinalizers) != napi_ok ||
-        debug_set_counter(env, result, "tsfnAcceptances", &DebugCompletionRuntimeTsfnAcceptances) != napi_ok ||
-        debug_set_counter(env, result, "envNullAbandons", &DebugCompletionRuntimeEnvNullAbandons) != napi_ok ||
-        debug_set_counter(env, result, "callbackEnvNullAbandons", &DebugCompletionRuntimeCallbackEnvNullAbandons) !=
-            napi_ok ||
-        debug_set_counter(env, result, "stoppingAbandons", &DebugCompletionRuntimeStoppingAbandons) != napi_ok ||
-        debug_set_counter(env, result, "finalizerAbandons", &DebugCompletionRuntimeFinalizerAbandons) != napi_ok ||
-        debug_set_counter(env, result, "gatedAllocations", &DebugGatedCompletionAllocations) != napi_ok ||
-        debug_set_counter(env, result, "gatedAbandons", &DebugGatedCompletionAbandons) != napi_ok ||
-        debug_set_counter(env, result, "gatedFrees", &DebugGatedCompletionFrees) != napi_ok) {
-        napi_throw_error(env, NULL, "failed to read native completion runtime stats");
+    char* cert_file = NULL;
+    char* key_file = NULL;
+    if (node_get_named_value(env, argv[0], "certFile", &value, &present) != 0 || !present ||
+        node_copy_js_string(env, value, &cert_file, &(uint32_t){0}) != 0 ||
+        node_get_named_value(env, argv[0], "keyFile", &value, &present) != 0 || !present ||
+        node_copy_js_string(env, value, &key_file, &(uint32_t){0}) != 0) {
+        free(cert_file);
+        free(key_file);
+        node_endpoint_config_free(&storage);
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    storage.config.cert_file = cert_file;
+    storage.config.cert_file_len = (uint32_t)strlen(cert_file);
+    storage.config.key_file = key_file;
+    storage.config.key_file_len = (uint32_t)strlen(key_file);
+    storage.config.ca_cert_file = NULL;
+    storage.config.ca_cert_file_len = 0;
+    storage.config.transport = enable_http3 ? TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3 : TREVRPC_RPC_MSQUIC_TRANSPORT_AUTO;
+    storage.config.flags = TREVRPC_RPC_MSQUIC_VERIFY_PEER |
+                           (enable_http3 && has_admission ? TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS : 0);
+    char* path = NULL;
+    int path_result = 0;
+    if (node_get_named_value(env, argv[0], "http3Path", &value, &present) != 0) {
+        free(cert_file);
+        free(key_file);
+        node_endpoint_config_free(&storage);
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    if (present) {
+        path_result = node_copy_js_string(env, value, &path, &(uint32_t){0});
+    }
+    if (path_result == 0 && path == NULL) {
+        if (node_get_named_value(env, argv[0], "path", &value, &present) != 0) {
+            free(cert_file);
+            free(key_file);
+            free(path);
+            node_endpoint_config_free(&storage);
+            return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+        }
+        if (present) {
+            path_result = node_copy_js_string(env, value, &path, &(uint32_t){0});
+        }
+    }
+    if (path_result != 0) {
+        free(cert_file);
+        free(key_file);
+        free(path);
+        node_endpoint_config_free(&storage);
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    storage.config.path = path;
+    storage.config.path_len = path == NULL ? 0 : (uint32_t)strlen(path);
+    napi_deferred deferred;
+    napi_value promise = node_new_promise(env, &deferred);
+    if (promise == NULL) {
+        free(cert_file);
+        free(key_file);
+        free(path);
+        node_endpoint_config_free(&storage);
         return NULL;
     }
-    return result;
+    node_server* server = calloc(1, sizeof(*server));
+    node_client* endpoint = calloc(1, sizeof(*endpoint));
+    node_subject* reserved = node_subject_allocate(TREVRPC_RPC_OBJECT_ENDPOINT, (node_handle_key){0, 0, 0});
+    uint64_t id = node_operation_allocate(runtime);
+    node_operation* operation = id == TREVRPC_RPC_OPERATION_ID_NONE ? NULL
+                                                                    : node_operation_add_id(runtime,
+                                                                          id,
+                                                                          TREVRPC_RPC_OBJECT_ENDPOINT,
+                                                                          (node_handle_key){0, 0, 0},
+                                                                          NODE_OPERATION_ENDPOINT_LISTEN,
+                                                                          server,
+                                                                          deferred,
+                                                                          true);
+    if (server == NULL || endpoint == NULL || reserved == NULL || operation == NULL) {
+        free(server);
+        free(endpoint);
+        free(reserved);
+        if (operation != NULL)
+            node_operation_remove(runtime, operation);
+        free(cert_file);
+        free(key_file);
+        free(path);
+        node_endpoint_config_free(&storage);
+        (void)node_reject_deferred_native(env, deferred, -ENOMEM, "listenMsQuic");
+        return promise;
+    }
+    server->runtime = runtime;
+    server->endpoint = endpoint;
+    server->enable_http3 = enable_http3;
+    endpoint->runtime = runtime;
+    endpoint->server = server;
+    endpoint->subject = reserved;
+    if (has_admission) {
+        napi_value admission_callback;
+        if (napi_get_named_property(env, argv[0], "http3Admission", &admission_callback) != napi_ok ||
+            napi_create_reference(env, admission_callback, 1, &server->admission_ref) != napi_ok) {
+            node_operation_remove(runtime, operation);
+            free(server);
+            free(endpoint);
+            free(reserved);
+            free(cert_file);
+            free(key_file);
+            free(path);
+            node_endpoint_config_free(&storage);
+            (void)node_reject_deferred_native(env, deferred, -ENOMEM, "listenMsQuic");
+            return promise;
+        }
+    }
+    int start = trevrpc_rpc_msquic_endpoint_start_v1(runtime->rpc, &storage.config, id, &endpoint->endpoint);
+    free(cert_file);
+    free(key_file);
+    free(path);
+    node_endpoint_config_free(&storage);
+    if (start != 0) {
+        if (server->admission_ref != NULL)
+            (void)napi_delete_reference(env, server->admission_ref);
+        node_operation_remove(runtime, operation);
+        free(server);
+        free(endpoint);
+        free(reserved);
+        (void)node_reject_deferred_native(env, deferred, start, "listenMsQuic");
+        return promise;
+    }
+    reserved->key = node_key_from_endpoint(endpoint->endpoint);
+    reserved->core = endpoint;
+    node_registry_insert(runtime, reserved);
+    operation->subject = reserved->key;
+    operation->subject_bound = true;
+    napi_value object = node_make_server_object(env, server);
+    if (object == NULL) {
+        (void)node_client_request_close(endpoint);
+        (void)node_reject_deferred_native(env, deferred, -ENOMEM, "listenMsQuic");
+    }
+    return promise;
 }
 
-static napi_value debug_native_call_stats(napi_env env, napi_callback_info info) {
-    (void)info;
-    napi_value result = NULL;
-    if (napi_create_object(env, &result) != napi_ok ||
-        debug_set_counter(env, result, "allocations", &DebugNativeCallAllocations) != napi_ok ||
-        debug_set_counter(env, result, "destroys", &DebugNativeCallDestroys) != napi_ok ||
-        debug_set_counter(env, result, "ownerRetains", &DebugNativeCallOwnerRetains) != napi_ok ||
-        debug_set_counter(env, result, "ownerReleases", &DebugNativeCallOwnerReleases) != napi_ok) {
-        napi_throw_error(env, NULL, "failed to read native call stats");
-        return NULL;
-    }
-    return result;
-}
-
-static void debug_gated_completion_execute(napi_env env, void* data) {
-    (void)env;
-    debug_gated_completion_work* work = data;
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    if (DebugCompletionGate.runtime != NULL) {
-        pthread_mutex_unlock(&DebugCompletionGate.mutex);
-        work->base.err = -EBUSY;
-        return;
-    }
-    DebugCompletionGate.runtime = work->base.work->runtime;
-    native_completion_runtime_retain(DebugCompletionGate.runtime);
-    DebugCompletionGate.waiters++;
-    DebugCompletionGate.reached = true;
-    pthread_cond_broadcast(&DebugCompletionGate.cond);
-    while (!DebugCompletionGate.released && !atomic_load_explicit(&work->cancelled, memory_order_acquire)) {
-        pthread_cond_wait(&DebugCompletionGate.cond, &DebugCompletionGate.mutex);
-    }
-    DebugCompletionGate.waiters--;
-    pthread_cond_broadcast(&DebugCompletionGate.cond);
-    bool cancelled = atomic_load_explicit(&work->cancelled, memory_order_acquire);
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-    work->base.err = cancelled ? -ECANCELED : 0;
-}
-
-static void debug_gated_completion_cancel(void* data) {
-    debug_gated_completion_work* work = data;
-    atomic_store_explicit(&work->cancelled, true, memory_order_release);
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    pthread_cond_broadcast(&DebugCompletionGate.cond);
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-}
-
-static void debug_gated_completion_complete(napi_env env, napi_status status, void* data) {
-    debug_gated_completion_work* work = data;
-    if (env == NULL) {
-        atomic_fetch_add_explicit(&DebugGatedCompletionAbandons, 1, memory_order_relaxed);
-    }
-    if (env != NULL && status == napi_ok && work->base.err == 0) {
-        napi_value undefined = NULL;
-        napi_get_undefined(env, &undefined);
-        napi_resolve_deferred(env, work->base.deferred, undefined);
-    } else if (env != NULL) {
-        reject_native_error(
-            env, work->base.deferred, status == napi_ok ? work->base.err : -ECANCELED, "debugGatedCompletion");
-    }
-    native_work_delete(work->base.work);
-    free(work);
-    atomic_fetch_add_explicit(&DebugGatedCompletionFrees, 1, memory_order_relaxed);
-}
-
-static napi_value debug_queue_gated_completion(napi_env env, napi_callback_info info) {
-    (void)info;
-    debug_gated_completion_work* work = calloc(1, sizeof(*work));
-    if (work == NULL) {
-        napi_throw_error(env, NULL, "failed to allocate gated completion work");
-        return NULL;
-    }
-    atomic_fetch_add_explicit(&DebugGatedCompletionAllocations, 1, memory_order_relaxed);
-    atomic_init(&work->cancelled, false);
-    return queue_work_managed(env,
-        &work->base,
-        "debugGatedCompletion",
-        debug_gated_completion_execute,
-        debug_gated_completion_complete,
-        debug_gated_completion_complete,
-        debug_gated_completion_cancel);
-}
-
-static napi_value debug_completion_gate_reached(napi_env env, napi_callback_info info) {
-    (void)info;
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    bool reached = DebugCompletionGate.reached;
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-    napi_value result = NULL;
-    napi_get_boolean(env, reached, &result);
-    return result;
-}
-
-static napi_value debug_release_completion_gate(napi_env env, napi_callback_info info) {
-    (void)info;
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    DebugCompletionGate.released = true;
-    pthread_cond_broadcast(&DebugCompletionGate.cond);
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_value debug_close_gated_completion_runtime(napi_env env, napi_callback_info info) {
-    (void)info;
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    native_completion_runtime* runtime = DebugCompletionGate.runtime;
-    DebugCompletionGate.runtime = NULL;
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-    if (runtime != NULL) {
-        native_completion_runtime_close(runtime);
-        native_completion_runtime_release(runtime);
-    }
-    napi_value closed = NULL;
-    napi_get_boolean(env, runtime != NULL, &closed);
-    return closed;
-}
-
-static napi_value debug_block_completion_js(napi_env env, napi_callback_info info) {
-    (void)info;
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    DebugCompletionGate.js_waiters++;
-    DebugCompletionGate.js_blocked = true;
-    pthread_cond_broadcast(&DebugCompletionGate.cond);
-    while (!DebugCompletionGate.js_released) {
-        pthread_cond_wait(&DebugCompletionGate.cond, &DebugCompletionGate.mutex);
-    }
-    DebugCompletionGate.js_waiters--;
-    pthread_cond_broadcast(&DebugCompletionGate.cond);
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_value debug_completion_js_blocked(napi_env env, napi_callback_info info) {
-    (void)info;
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    bool blocked = DebugCompletionGate.js_blocked;
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-    napi_value result = NULL;
-    napi_get_boolean(env, blocked, &result);
-    return result;
-}
-
-static napi_value debug_release_completion_js(napi_env env, napi_callback_info info) {
-    (void)info;
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    DebugCompletionGate.js_released = true;
-    pthread_cond_broadcast(&DebugCompletionGate.cond);
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-static napi_value debug_reset_completion_gate(napi_env env, napi_callback_info info) {
-    (void)info;
-    pthread_mutex_lock(&DebugCompletionGate.mutex);
-    if (DebugCompletionGate.runtime != NULL || DebugCompletionGate.waiters != 0 ||
-        DebugCompletionGate.js_waiters != 0) {
-        pthread_mutex_unlock(&DebugCompletionGate.mutex);
-        napi_throw_error(env, NULL, "cannot reset an active completion gate");
-        return NULL;
-    }
-    DebugCompletionGate.reached = false;
-    DebugCompletionGate.released = false;
-    DebugCompletionGate.js_blocked = false;
-    DebugCompletionGate.js_released = false;
-    pthread_mutex_unlock(&DebugCompletionGate.mutex);
-    napi_value undefined = NULL;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-}
-
-#endif
-
-static napi_value init(napi_env env, napi_value exports) {
-    native_completion_runtime* runtime = calloc(1, sizeof(*runtime));
-    if (runtime == NULL) {
-        napi_throw_error(env, NULL, "failed to initialize native completion runtime");
-        return NULL;
-    }
-    atomic_init(&runtime->refs, 1);
-    bool instance_data_installed = false;
-    bool cleanup_hook_installed = false;
-#ifdef TREVRPC_NODE_TEST_HOOKS
-    atomic_fetch_add_explicit(&DebugCompletionRuntimeAllocations, 1, memory_order_relaxed);
-#endif
-    if (native_completion_runtime_init(env, runtime) != 0) {
-        goto fail;
-    }
-    if (napi_set_instance_data(env, runtime, native_completion_runtime_instance_finalize, runtime) != napi_ok) {
-        goto fail;
-    }
-    native_completion_runtime_retain(runtime);
-    instance_data_installed = true;
-    if (napi_add_env_cleanup_hook(env, native_completion_runtime_cleanup, runtime) != napi_ok) {
-        goto fail;
-    }
-    cleanup_hook_installed = true;
-
-    napi_property_descriptor client_methods[] = {
-        {"call", NULL, native_client_call, NULL, NULL, NULL, napi_default, NULL},
-        {"startStream", NULL, native_client_start_stream, NULL, NULL, NULL, napi_default, NULL},
-        {"createCancellation", NULL, native_client_create_cancellation, NULL, NULL, NULL, napi_default, NULL},
-        {"close", NULL, native_client_close, NULL, NULL, NULL, napi_default, NULL},
-    };
-    napi_value client_ctor = NULL;
-    if (napi_define_class(env,
-            "NativeClient",
-            NAPI_AUTO_LENGTH,
-            native_client_constructor,
-            NULL,
-            sizeof(client_methods) / sizeof(client_methods[0]),
-            client_methods,
-            &client_ctor) != napi_ok ||
-        napi_create_reference(env, client_ctor, 1, &runtime->client_constructor) != napi_ok) {
-        goto fail;
-    }
-
-    napi_property_descriptor stream_methods[] = {
-        {"sendMessage", NULL, native_stream_send_message, NULL, NULL, NULL, napi_default, NULL},
-        {"sendMessages", NULL, native_stream_send_messages, NULL, NULL, NULL, napi_default, NULL},
-        {"finishSend", NULL, native_stream_finish_send, NULL, NULL, NULL, napi_default, NULL},
-        {"recv", NULL, native_stream_recv, NULL, NULL, NULL, napi_default, NULL},
-        {"recvMany", NULL, native_stream_recv_many, NULL, NULL, NULL, napi_default, NULL},
-        {"recvBodyBatch", NULL, native_stream_recv_body_batch, NULL, NULL, NULL, napi_default, NULL},
-        {"close", NULL, native_stream_close, NULL, NULL, NULL, napi_default, NULL},
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        {"_debugArmOutboundGate", NULL, native_stream_debug_arm_outbound_gate, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugOutboundGateReached",
-            NULL,
-            native_stream_debug_outbound_gate_reached,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-        {"_debugReleaseOutboundGate",
-            NULL,
-            native_stream_debug_release_outbound_gate,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-#endif
-    };
-    napi_value stream_ctor = NULL;
-    if (napi_define_class(env,
-            "NativeStream",
-            NAPI_AUTO_LENGTH,
-            native_stream_constructor,
-            NULL,
-            sizeof(stream_methods) / sizeof(stream_methods[0]),
-            stream_methods,
-            &stream_ctor) != napi_ok ||
-        napi_create_reference(env, stream_ctor, 1, &runtime->stream_constructor) != napi_ok) {
-        goto fail;
-    }
-
-    napi_property_descriptor server_methods[] = {
-        {"register", NULL, native_server_register, NULL, NULL, NULL, napi_default, NULL},
-        {"serve", NULL, native_server_serve, NULL, NULL, NULL, napi_default, NULL},
-        {"close", NULL, native_server_close, NULL, NULL, NULL, napi_default, NULL},
-    };
-    napi_value server_ctor = NULL;
-    if (napi_define_class(env,
-            "NativeServer",
-            NAPI_AUTO_LENGTH,
-            native_server_constructor,
-            NULL,
-            sizeof(server_methods) / sizeof(server_methods[0]),
-            server_methods,
-            &server_ctor) != napi_ok ||
-        napi_create_reference(env, server_ctor, 1, &runtime->server_constructor) != napi_ok) {
-        goto fail;
-    }
-
-    napi_property_descriptor call_methods[] = {
-        {"respond", NULL, native_call_respond, NULL, NULL, NULL, napi_default, NULL},
-        {"sendMessage", NULL, native_call_send_message, NULL, NULL, NULL, napi_default, NULL},
-        {"sendMessages", NULL, native_call_send_messages, NULL, NULL, NULL, napi_default, NULL},
-        {"finishStream", NULL, native_call_finish_stream, NULL, NULL, NULL, napi_default, NULL},
-        {"recv", NULL, native_call_recv, NULL, NULL, NULL, napi_default, NULL},
-        {"recvMany", NULL, native_call_recv_many, NULL, NULL, NULL, napi_default, NULL},
-        {"close", NULL, native_call_close, NULL, NULL, NULL, napi_default, NULL},
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        {"_debugArmOutboundGate", NULL, native_call_debug_arm_outbound_gate, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugOutboundGateReached",
-            NULL,
-            native_call_debug_outbound_gate_reached,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-        {"_debugReleaseOutboundGate",
-            NULL,
-            native_call_debug_release_outbound_gate,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-#endif
-    };
-    napi_value call_ctor = NULL;
-    if (napi_define_class(env,
-            "NativeCall",
-            NAPI_AUTO_LENGTH,
-            native_call_constructor,
-            NULL,
-            sizeof(call_methods) / sizeof(call_methods[0]),
-            call_methods,
-            &call_ctor) != napi_ok ||
-        napi_create_reference(env, call_ctor, 1, &runtime->call_constructor) != napi_ok) {
-        goto fail;
-    }
-
-    napi_property_descriptor cancellation_methods[] = {
-        {"cancel", NULL, native_cancellation_cancel, NULL, NULL, NULL, napi_default, NULL},
-    };
-    napi_value cancellation_ctor = NULL;
-    if (napi_define_class(env,
-            "NativeCancellation",
-            NAPI_AUTO_LENGTH,
-            native_cancellation_constructor,
-            NULL,
-            sizeof(cancellation_methods) / sizeof(cancellation_methods[0]),
-            cancellation_methods,
-            &cancellation_ctor) != napi_ok ||
-        napi_create_reference(env, cancellation_ctor, 1, &runtime->cancellation_constructor) != napi_ok) {
-        goto fail;
-    }
-
-    napi_property_descriptor exports_desc[] = {
-        {"createCancellation", NULL, native_create_cancellation, NULL, NULL, NULL, napi_default, NULL},
-        {"connectMsQuic", NULL, connect_msquic, NULL, NULL, NULL, napi_default, NULL},
-        {"listenMsQuic", NULL, listen_msquic, NULL, NULL, NULL, napi_default, NULL},
-#ifdef TREVRPC_NODE_TEST_HOOKS
-        {"_debugClientCloseReleaseRace", NULL, debug_client_close_release_race, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugHttp3Admission", NULL, debug_http3_admission, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugExternalArrayBufferFinalizers",
-            NULL,
-            debug_external_arraybuffer_finalizers,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-        {"_debugBodyOwnerReleases", NULL, debug_body_owner_releases, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugBodyConversionFailureStage",
-            NULL,
-            debug_body_conversion_failure_stage,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-        {"_debugSetNextBodyConversionFailure",
-            NULL,
-            debug_set_next_body_conversion_failure,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-        {"_debugCreatePendingResource", NULL, debug_create_pending_resource, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugPendingResourceCloses", NULL, debug_pending_resource_closes, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugPendingResourceFinalizers",
-            NULL,
-            debug_pending_resource_finalizers,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-        {"_debugCompletionRuntimeStats", NULL, debug_completion_runtime_stats, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugNativeCallStats", NULL, debug_native_call_stats, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugQueueGatedCompletion", NULL, debug_queue_gated_completion, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugCompletionGateReached", NULL, debug_completion_gate_reached, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugReleaseCompletionGate", NULL, debug_release_completion_gate, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugCloseGatedCompletionRuntime",
-            NULL,
-            debug_close_gated_completion_runtime,
-            NULL,
-            NULL,
-            NULL,
-            napi_default,
-            NULL},
-        {"_debugBlockCompletionJs", NULL, debug_block_completion_js, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugCompletionJsBlocked", NULL, debug_completion_js_blocked, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugReleaseCompletionJs", NULL, debug_release_completion_js, NULL, NULL, NULL, napi_default, NULL},
-        {"_debugResetCompletionGate", NULL, debug_reset_completion_gate, NULL, NULL, NULL, napi_default, NULL},
-#endif
-    };
-    if (napi_define_properties(env, exports, sizeof(exports_desc) / sizeof(exports_desc[0]), exports_desc) != napi_ok) {
-        goto fail;
-    }
-    native_completion_runtime_release(runtime);
-    return exports;
-
-fail:
-    native_completion_runtime_close(runtime);
-    native_completion_runtime_delete_constructor_refs(env, runtime);
-    if (cleanup_hook_installed &&
-        napi_remove_env_cleanup_hook(env, native_completion_runtime_cleanup, runtime) == napi_ok) {
-        cleanup_hook_installed = false;
-    }
-    if (instance_data_installed && !cleanup_hook_installed &&
-        napi_set_instance_data(env, NULL, NULL, NULL) == napi_ok) {
-        native_completion_runtime_release(runtime);
-    }
-    native_completion_runtime_release(runtime);
-    napi_throw_error(env, NULL, "failed to initialize native completion runtime");
+static napi_value node_init(napi_env env, napi_value exports) {
+#if defined(_WIN32) || defined(WIN32)
+    napi_throw_error(env,
+        "ERR_PLATFORM_NOT_SUPPORTED",
+        "the native addon is unsupported on WIN32: RPC ABI1 exposes POSIX FD wake sources");
     return NULL;
+#else
+    napi_property_descriptor descriptors[] = {
+        {"connectMsQuic", NULL, node_connect_msquic, NULL, NULL, NULL, napi_default, NULL},
+        {"createCancellation", NULL, node_create_cancellation, NULL, NULL, NULL, napi_default, NULL},
+        {"listenMsQuic", NULL, node_listen_msquic, NULL, NULL, NULL, napi_default, NULL},
+    };
+    if (napi_define_properties(env, exports, sizeof(descriptors) / sizeof(descriptors[0]), descriptors) != napi_ok) {
+        return node_throw_error(env, -EIO, "native addon initialization");
+    }
+    return exports;
+#endif
 }
 
-NAPI_MODULE(NODE_GYP_MODULE_NAME, init)
+NAPI_MODULE(NODE_GYP_MODULE_NAME, node_init)

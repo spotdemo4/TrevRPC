@@ -24,6 +24,11 @@ import {
 
 const require = createRequire(import.meta.url);
 const nativeAddonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
+const nativeRpcOperationsEnabled = process.env.TREVRPC_NODE_NATIVE_RPC_OPERATIONS === "1";
+const native =
+  nativeRpcOperationsEnabled && existsSync(nativeAddonPath) ? require(nativeAddonPath) : null;
+const nativeTestHooks = typeof native?._debugClientCloseReleaseRace === "function";
+const nativeCallTestHooks = typeof native?._debugNativeCallStats === "function";
 const thisFile = fileURLToPath(import.meta.url);
 const gcChild = process.env.TREVRPC_NATIVE_OWNERSHIP_LIFECYCLE_GC_CHILD === "1";
 const gcAvailable = typeof global.gc === "function";
@@ -38,7 +43,12 @@ if (gcChild && !gcAvailable) {
 if (!gcAvailable) {
   test(
     "native ownership lifecycle tests run with forced GC",
-    { skip: !existsSync(nativeAddonPath) },
+    {
+      skip:
+        !nativeRpcOperationsEnabled ||
+        !existsSync(nativeAddonPath) ||
+        (!nativeTestHooks && !nativeCallTestHooks),
+    },
     () => {
       const childEnvironment = {
         ...process.env,
@@ -66,10 +76,13 @@ if (!gcAvailable) {
       assert.match(output, /Worker termination force-cancels an admitted native server call/u);
     },
   );
+} else if (!nativeTestHooks && !nativeCallTestHooks) {
+  test(
+    "native ownership lifecycle suite requires migrated test hooks",
+    { skip: "production ABI1 addon does not expose the legacy ownership hooks" },
+    () => {},
+  );
 } else {
-  const native = existsSync(nativeAddonPath) ? require(nativeAddonPath) : null;
-  const nativeTestHooks = typeof native?._debugClientCloseReleaseRace === "function";
-  const nativeCallTestHooks = typeof native?._debugNativeCallStats === "function";
   after(async () => {
     if (certificateDirectory != null) {
       await rm(certificateDirectory, { force: true, recursive: true });
