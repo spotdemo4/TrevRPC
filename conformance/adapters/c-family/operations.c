@@ -1,8 +1,9 @@
 #include "operations.h"
 
+#include "trevrpc.h"
 #include "trevrpc_frame_internal.h"
 #include "trevrpc_rpc.h"
-#include "trevrpc_wire_internal.h"
+#include "trevrpc_wire_abi6_internal.h"
 
 #include <errno.h>
 #include <stdbool.h>

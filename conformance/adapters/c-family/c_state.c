@@ -252,11 +252,11 @@ static int cf_copy_receive_metadata(const trevrpc_rpc_receive_info_v1 *info,
                                     trevrpc_metadata *metadata) {
   memset(metadata, 0, sizeof(*metadata));
   for (uint32_t i = 0; i < info->metadata_count; ++i) {
-    int result = trevrpc_metadata_set(
+    int result = trevrpc_internal_metadata_set(
         metadata, info->metadata[i].key, info->metadata[i].key_len,
         info->metadata[i].value, (size_t)info->metadata[i].value_len);
     if (result != 0) {
-      trevrpc_metadata_reset(metadata);
+      trevrpc_internal_metadata_reset(metadata);
       return result;
     }
   }
@@ -351,7 +351,7 @@ static int cf_run_state(const cf_command *command, cf_json *payload,
         cf_json_append(payload, ",\"metadata\":");
         cf_json_append_native_metadata(payload, &metadata);
         cf_json_append_char(payload, '}');
-        trevrpc_metadata_reset(&metadata);
+        trevrpc_internal_metadata_reset(&metadata);
         result = payload->failed ? -1 : 0;
       }
       if (!server_stream) {
