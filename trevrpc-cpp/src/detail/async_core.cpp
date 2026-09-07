@@ -1,129 +1,747 @@
 #include "async_core.hpp"
 
+#include "rpc_client.hpp"
+#include "rpc_metadata.hpp"
+
+#include <trevrpc/trevrpc.hpp>
+
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
+#include <new>
 
 namespace trevrpc::detail {
+
+struct AsyncChannelAccess {
+  static std::shared_ptr<ChannelCore> core(const std::shared_ptr<Channel>& channel) noexcept {
+    if (!channel) {
+      return nullptr;
+    }
+    std::lock_guard lock(channel->mutex_);
+    return channel->core_;
+  }
+};
+
+struct AsyncStreamAccess {
+  static std::shared_ptr<RpcClientStream> take(ClientStream&& stream) noexcept {
+    return std::move(stream.stream_);
+  }
+};
+
 namespace {
 
-class Abi6NativeOps final : public NativeOps {
+std::atomic_bool injected_server_call_allocation_failure{false};
+
+class Abi1ClientNativeOps final : public NativeOps {
 public:
-  int send(trevrpc_stream* stream, std::span<const std::byte> body) noexcept override {
-    return trevrpc_stream_send_message_borrowed_wait(
-        stream, reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+  explicit Abi1ClientNativeOps(std::shared_ptr<RpcClientStream> stream) noexcept
+      : stream_(std::move(stream)) {}
+
+  Result<void> start_send(std::span<const std::byte> body,
+                          NativeCompletion completion) noexcept override {
+    auto stream = acquire_stream();
+    if (!stream) {
+      return Error::runtime(-ESHUTDOWN, "async stream is closed");
+    }
+    return stream->start_send(body, [completion = std::move(completion)](Result<void> result) {
+      completion(result ? 0 : result.error().code());
+    });
   }
 
-  int finish_send(trevrpc_stream* stream) noexcept override {
-    return trevrpc_stream_finish_send(stream);
+  Result<void> start_finish_send(NativeCompletion completion) noexcept override {
+    auto stream = acquire_stream();
+    if (!stream) {
+      return Error::runtime(-ESHUTDOWN, "async stream is closed");
+    }
+    return stream->start_finish_send([completion = std::move(completion)](Result<void> result) {
+      completion(result ? 0 : result.error().code());
+    });
   }
 
-  Result<std::optional<StreamFrame>>
-  receive_ready_since(trevrpc_stream* stream, std::uint64_t wait_started) noexcept override {
-    trevrpc_inbound_stream_frame* frame = nullptr;
-    int ready = 0;
-    const int error = trevrpc_stream_recv_inbound_ready_since(stream, &frame, &ready, wait_started);
-    if (error != 0) {
-      trevrpc_inbound_stream_frame_release(frame);
-      return Error::runtime(error);
+  Result<void> start_receive(NativeReceiveCompletion completion) noexcept override {
+    auto stream = acquire_stream();
+    if (!stream) {
+      return Error::runtime(-ESHUTDOWN, "async stream is closed");
     }
-    if (ready == 0) {
-      trevrpc_inbound_stream_frame_release(frame);
-      return std::optional<StreamFrame>{};
-    }
-    auto decoded = decode_inbound_frame(stream, frame);
-    if (!decoded) {
-      return decoded.error();
-    }
-    return std::optional<StreamFrame>(std::move(decoded).value());
+    return stream->start_receive(std::move(completion));
   }
 
-  void cancel(trevrpc_stream* stream) noexcept override { trevrpc_stream_cancel(stream); }
+  Result<void> schedule_at(Deadline deadline, Work work) noexcept override {
+    auto stream = acquire_stream();
+    if (!stream) {
+      return Error::runtime(-ESHUTDOWN, "async stream is closed");
+    }
+    return stream->schedule_at(deadline, std::move(work));
+  }
 
-  void close(trevrpc_stream* stream) noexcept override { trevrpc_stream_close(stream); }
-};
+  void cancel() noexcept override {
+    if (auto stream = acquire_stream()) {
+      stream->cancel();
+    }
+  }
 
-class Abi6ServerCallOps final : public ServerCallOps {
-public:
-  int defer(trevrpc_call* call) noexcept override { return trevrpc_call_defer(call); }
-  int retain(trevrpc_call* call) noexcept override { return trevrpc_call_retain(call); }
-  void release(trevrpc_call* call) noexcept override { trevrpc_call_release(call); }
-  trevrpc_stream* stream(trevrpc_call* call) noexcept override { return trevrpc_call_stream(call); }
-  int respond(trevrpc_call* call, const Status& status, std::span<const std::byte> body,
-              const Metadata& metadata) noexcept override {
-    const trevrpc_request* request = trevrpc_call_request(call);
-    if (request != nullptr && request->kind == TREVRPC_RPC_KIND_CLIENT_STREAMING) {
-      trevrpc_stream* stream = trevrpc_call_stream(call);
-      const int send_error = trevrpc_stream_send_message_borrowed_wait(
-          stream, reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
-      if (send_error != 0) {
-        return send_error;
-      }
-      return finish(call, Status(status.code(), status.message(), metadata));
+  Result<void> close() noexcept override {
+    std::shared_ptr<RpcClientStream> stream;
+    {
+      std::lock_guard lock(mutex_);
+      stream = std::move(stream_);
     }
-    NativeMetadata native_metadata;
-    const int metadata_error = native_metadata.assign(metadata);
-    if (metadata_error != 0) {
-      return metadata_error;
+    if (!stream) {
+      return {};
     }
-    return respond_borrowed(call, static_cast<std::uint32_t>(status.code()), status.message(), body,
-                            native_metadata.get());
+    auto closed = stream->close_result();
+    if (!closed) {
+      RpcClientStream::schedule_cleanup(std::move(stream));
+    }
+    return {};
   }
-  int finish(trevrpc_call* call, const Status& status) noexcept override {
-    NativeMetadata native_metadata;
-    const int metadata_error = native_metadata.assign(status.metadata());
-    if (metadata_error != 0) {
-      return metadata_error;
-    }
-    return finish_borrowed(call, static_cast<std::uint32_t>(status.code()), status.message(),
-                           native_metadata.get());
-  }
-  void cancel(trevrpc_call* call) noexcept override { trevrpc_call_cancel(call); }
-  void close(trevrpc_call* call) noexcept override { trevrpc_call_close(call); }
-};
-
-class ServerStreamNativeOps final : public NativeOps {
-public:
-  ServerStreamNativeOps(trevrpc_call* call, std::shared_ptr<ServerCallOps> call_ops)
-      : call_(call), call_ops_(std::move(call_ops)) {}
-
-  int send(trevrpc_stream* stream, std::span<const std::byte> body) noexcept override {
-    return trevrpc_stream_send_message_borrowed_wait(
-        stream, reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
-  }
-  int finish_send(trevrpc_stream* stream) noexcept override {
-    return trevrpc_stream_finish_send(stream);
-  }
-  Result<std::optional<StreamFrame>>
-  receive_ready_since(trevrpc_stream* stream, std::uint64_t wait_started) noexcept override {
-    trevrpc_inbound_stream_frame* frame = nullptr;
-    int ready = 0;
-    const int error = trevrpc_stream_recv_inbound_ready_since(stream, &frame, &ready, wait_started);
-    if (error != 0) {
-      trevrpc_inbound_stream_frame_release(frame);
-      return Error::runtime(error);
-    }
-    if (ready == 0) {
-      trevrpc_inbound_stream_frame_release(frame);
-      return std::optional<StreamFrame>{};
-    }
-    if (frame == nullptr) {
-      StreamFrame end;
-      end.terminal = true;
-      end.status = Status::ok();
-      return std::optional<StreamFrame>(std::move(end));
-    }
-    auto decoded = decode_inbound_frame(stream, frame);
-    if (!decoded) {
-      return decoded.error();
-    }
-    return std::optional<StreamFrame>(std::move(decoded).value());
-  }
-  void cancel(trevrpc_stream*) noexcept override { call_ops_->cancel(call_); }
-  void close(trevrpc_stream*) noexcept override {}
 
 private:
-  trevrpc_call* call_;
-  std::shared_ptr<ServerCallOps> call_ops_;
+  [[nodiscard]] std::shared_ptr<RpcClientStream> acquire_stream() noexcept {
+    std::lock_guard lock(mutex_);
+    return stream_;
+  }
+
+  std::mutex mutex_;
+  std::shared_ptr<RpcClientStream> stream_;
+};
+
+[[nodiscard]] int wait_rpc_operation(const std::shared_ptr<RpcEventRuntime>& runtime,
+                                     std::uint64_t operation_id) noexcept;
+[[nodiscard]] int reserve_rpc_operation(const std::shared_ptr<RpcEventRuntime>& runtime,
+                                        std::uint64_t* operation_id) noexcept;
+
+struct Abi1ServerCallHandle final {
+  std::shared_ptr<RpcEventRuntime> runtime;
+  trevrpc_rpc_call_v1 call{};
+  trevrpc_rpc_stream_v1 stream{};
+  std::atomic<bool> cleanup_started{false};
+  std::atomic<bool> stream_released{false};
+  std::atomic<bool> terminal_success{false};
+
+  struct CleanupState final : RpcCleanupWork {
+    explicit CleanupState(std::shared_ptr<Abi1ServerCallHandle> handle_value,
+                          bool force_close_value, Work completion_value) noexcept
+        : handle(std::move(handle_value)), force_close(force_close_value),
+          completion(std::move(completion_value)) {}
+
+    [[nodiscard]] Result<void> cleanup_step() override {
+      if (!handle || abandoned) {
+        complete();
+        return {};
+      }
+      auto& native = *handle;
+
+      if (force_close && !close_completion_consumed) {
+        if (close_operation == 0) {
+          auto operation = native.runtime->reserve_operation();
+          if (!operation) {
+            return operation.error();
+          }
+          close_operation = operation.value();
+        }
+        if (!close_submitted) {
+          const int close_error =
+              trevrpc_rpc_stream_close(native.runtime->native_handle(), native.stream,
+                                       close_operation, TREVRPC_RPC_CLOSE_FLAG_ABORT, 0);
+          if (close_error != 0) {
+            native.runtime->reject_operation(close_operation);
+            close_operation = 0;
+            if (terminal_close_error(close_error)) {
+              close_completion_consumed = true;
+            } else {
+              return Error::runtime(close_error);
+            }
+          } else {
+            close_submitted = true;
+          }
+        }
+        if (close_submitted) {
+          auto completion = native.runtime->try_wait_operation(close_operation);
+          if (!completion) {
+            return completion.error();
+          }
+          if (!completion.value()) {
+            return Error::runtime(-EAGAIN);
+          }
+          note_event(completion.value().value());
+          if (completion.value()->status != 0 &&
+              !terminal_close_error(completion.value()->status)) {
+            return Error::runtime(completion.value()->status);
+          }
+          close_completion_consumed = true;
+        }
+      }
+
+      constexpr std::size_t max_receives_per_step = 32;
+      constexpr std::size_t max_events_per_step = 16;
+      std::size_t receive_count = 0;
+      for (std::size_t event_count = 0;
+           event_count < max_events_per_step && !(stream_closed && call_closed); ++event_count) {
+        for (;;) {
+          trevrpc_rpc_receive* receive = nullptr;
+          const int receive_error =
+              trevrpc_rpc_stream_receive(native.runtime->native_handle(), native.stream, &receive);
+          if (receive_error == -EAGAIN) {
+            break;
+          }
+          if ((receive_error == -ESTALE && stream_closed && call_closed) ||
+              terminal_transport_error(receive_error)) {
+            break;
+          }
+          if (receive_error != 0) {
+            return Error::runtime(receive_error);
+          }
+          if (receive != nullptr) {
+            trevrpc_rpc_receive_release(receive);
+          }
+          if (++receive_count == max_receives_per_step) {
+            return Error::runtime(-EAGAIN);
+          }
+        }
+
+        auto event = native.runtime->try_wait_stream(native.stream);
+        if (!event) {
+          return event.error();
+        }
+        if (!event.value()) {
+          return Error::runtime(-EAGAIN);
+        }
+        note_event(event.value().value());
+      }
+      if (!stream_closed || !call_closed) {
+        return Error::runtime(-EAGAIN);
+      }
+
+      if (!stream_unregistered) {
+        native.runtime->unregister_stream(native.stream);
+        stream_unregistered = true;
+      }
+      if (!stream_released) {
+        const int stream_error =
+            trevrpc_rpc_stream_release(native.runtime->native_handle(), native.stream);
+        if (stream_error != 0 && stream_error != -ESTALE) {
+          return Error::runtime(stream_error);
+        }
+        stream_released = true;
+        native.stream_released.store(true, std::memory_order_release);
+      }
+      if (!call_released) {
+        const int call_error =
+            trevrpc_rpc_call_release(native.runtime->native_handle(), native.call);
+        if (call_error != 0 && call_error != -ESTALE) {
+          return Error::runtime(call_error);
+        }
+        call_released = true;
+      }
+      handle.reset();
+      complete();
+      return {};
+    }
+
+    void interrupt_cleanup() noexcept override {
+      if (!handle || abandoned) {
+        return;
+      }
+      if (close_operation != 0 && !close_submitted) {
+        handle->runtime->reject_operation(close_operation);
+        close_operation = 0;
+      }
+      handle->runtime->request_abandon();
+    }
+
+    void abandon_cleanup() noexcept override {
+      if (!handle || abandoned) {
+        return;
+      }
+      abandoned = true;
+      if (!stream_unregistered) {
+        handle->runtime->unregister_stream(handle->stream);
+        stream_unregistered = true;
+      }
+      handle.reset();
+      complete();
+    }
+
+  private:
+    void complete() noexcept {
+      Work notify = std::move(completion);
+      if (!notify) {
+        return;
+      }
+      try {
+        notify();
+      } catch (...) {
+        (void)std::current_exception();
+      }
+    }
+
+    [[nodiscard]] static bool terminal_transport_error(int error) noexcept {
+      return error == -ECANCELED || error == -EPIPE || error == -ESHUTDOWN;
+    }
+
+    [[nodiscard]] static bool terminal_close_error(int error) noexcept {
+      return terminal_transport_error(error) || error == -EALREADY || error == -ESTALE;
+    }
+
+    void note_event(const RpcEvent& event) noexcept {
+      if (event.kind == TREVRPC_RPC_EVENT_STREAM_CLOSED) {
+        stream_closed = true;
+      } else if (event.kind == TREVRPC_RPC_EVENT_CALL_CLOSED) {
+        call_closed = true;
+      }
+    }
+
+    std::shared_ptr<Abi1ServerCallHandle> handle;
+    std::uint64_t close_operation = 0;
+    bool force_close = false;
+    bool close_submitted = false;
+    bool close_completion_consumed = false;
+    bool stream_closed = false;
+    bool call_closed = false;
+    bool stream_unregistered = false;
+    bool stream_released = false;
+    bool call_released = false;
+    bool abandoned = false;
+    Work completion;
+  };
+
+  static void begin_cleanup(const std::shared_ptr<Abi1ServerCallHandle>& handle, bool force_close,
+                            Work completion) noexcept {
+    if (!handle || handle->cleanup_started.exchange(true)) {
+      return;
+    }
+    try {
+      handle->runtime->schedule_cleanup(
+          std::make_shared<CleanupState>(handle, force_close, std::move(completion)));
+    } catch (...) {
+      handle->runtime->request_abandon();
+      handle->runtime->unregister_stream(handle->stream);
+      if (completion) {
+        try {
+          completion();
+        } catch (...) {
+          (void)std::current_exception();
+        }
+      }
+    }
+  }
+};
+
+[[nodiscard]] int wait_rpc_operation(const std::shared_ptr<RpcEventRuntime>& runtime,
+                                     std::uint64_t operation_id) noexcept {
+  if (!runtime) {
+    return -ESHUTDOWN;
+  }
+  auto event = runtime->wait_operation(operation_id);
+  if (!event) {
+    return event.error().code();
+  }
+  return event.value().status;
+}
+
+[[nodiscard]] int reserve_rpc_operation(const std::shared_ptr<RpcEventRuntime>& runtime,
+                                        std::uint64_t* operation_id) noexcept {
+  if (!runtime || operation_id == nullptr) {
+    return -EINVAL;
+  }
+  auto reserved = runtime->reserve_operation();
+  if (!reserved) {
+    return reserved.error().code();
+  }
+  *operation_id = reserved.value();
+  return 0;
+}
+
+class Abi1ServerStreamNativeOps final
+    : public NativeOps,
+      public std::enable_shared_from_this<Abi1ServerStreamNativeOps> {
+public:
+  explicit Abi1ServerStreamNativeOps(std::shared_ptr<Abi1ServerCallHandle> handle)
+      : handle_(std::move(handle)) {}
+
+  Result<void> start_send(std::span<const std::byte> body,
+                          NativeCompletion completion) noexcept override {
+    return start_operation(TREVRPC_RPC_EVENT_SEND_COMPLETE, std::move(completion),
+                           [this, body](std::uint64_t operation) {
+                             return trevrpc_rpc_stream_send_copy_v1(
+                                 handle_->runtime->native_handle(), handle_->stream, operation,
+                                 reinterpret_cast<const std::uint8_t*>(body.data()), body.size(),
+                                 TREVRPC_RPC_SEND_FLAG_NONE);
+                           });
+  }
+
+  Result<void> start_finish_send(NativeCompletion completion) noexcept override {
+    return start_operation(TREVRPC_RPC_EVENT_SEND_FINISHED, std::move(completion),
+                           [this](std::uint64_t operation) {
+                             return trevrpc_rpc_stream_finish_send(
+                                 handle_->runtime->native_handle(), handle_->stream, operation);
+                           });
+  }
+
+  Result<void> start_receive(NativeReceiveCompletion completion) noexcept override {
+    if (!completion) {
+      return Error::runtime(-EINVAL, "async receive callback must not be empty");
+    }
+    try {
+      receive_step(completion);
+      return {};
+    } catch (...) {
+      return Error::runtime(-ENOMEM, "failed to start async server receive");
+    }
+  }
+
+  Result<void> schedule_at(Deadline deadline, Work work) noexcept override {
+    return handle_->runtime->schedule_at(deadline, std::move(work));
+  }
+
+  void cancel() noexcept override {
+    std::uint64_t operation = 0;
+    if (reserve_rpc_operation(handle_->runtime, &operation) != 0) {
+      return;
+    }
+    const int error =
+        trevrpc_rpc_call_cancel(handle_->runtime->native_handle(), handle_->call, operation, 0);
+    if (error != 0) {
+      handle_->runtime->reject_operation(operation);
+      return;
+    }
+    auto subscribed =
+        handle_->runtime->subscribe_operation(operation, [](const Result<RpcEvent>&) noexcept {});
+    if (!subscribed) {
+      handle_->runtime->reject_operation(operation);
+    }
+  }
+
+  Result<void> close() noexcept override { return {}; }
+
+private:
+  template <typename Start>
+  Result<void> start_operation(std::uint32_t expected_kind, NativeCompletion completion,
+                               Start&& start) noexcept {
+    if (!completion) {
+      return Error::runtime(-EINVAL, "async native completion must not be empty");
+    }
+    std::uint64_t operation = 0;
+    const int reserve_error = reserve_rpc_operation(handle_->runtime, &operation);
+    if (reserve_error != 0) {
+      return Error::runtime(reserve_error);
+    }
+    const int start_error = std::invoke(std::forward<Start>(start), operation);
+    if (start_error != 0) {
+      handle_->runtime->reject_operation(operation);
+      return Error::runtime(start_error);
+    }
+    auto subscribed = handle_->runtime->subscribe_operation(
+        operation, [expected_kind, completion = std::move(completion)](Result<RpcEvent> result) {
+          if (!result) {
+            completion(result.error().code());
+          } else if (result.value().kind != expected_kind) {
+            completion(-EIO);
+          } else {
+            completion(result.value().status);
+          }
+        });
+    if (!subscribed) {
+      handle_->runtime->reject_operation(operation);
+      return subscribed.error();
+    }
+    return {};
+  }
+
+  Result<std::optional<StreamFrame>> try_receive_frame() noexcept {
+    constexpr std::size_t max_receives_per_attempt = 32;
+    for (std::size_t count = 0; count < max_receives_per_attempt; ++count) {
+      trevrpc_rpc_receive* receive = nullptr;
+      const int error =
+          trevrpc_rpc_stream_receive(handle_->runtime->native_handle(), handle_->stream, &receive);
+      if (error == -EAGAIN) {
+        return std::optional<StreamFrame>{};
+      }
+      if (error != 0) {
+        return Error::runtime(error);
+      }
+      if (receive == nullptr) {
+        continue;
+      }
+      trevrpc_rpc_receive_info_v1 info{};
+      int info_error = trevrpc_rpc_receive_info_v1_init(&info, sizeof(info));
+      if (info_error == 0) {
+        info_error = trevrpc_rpc_receive_get_info_v1(receive, &info);
+      }
+      if (info_error != 0) {
+        trevrpc_rpc_receive_release(receive);
+        return Error::runtime(info_error);
+      }
+      StreamFrame frame;
+      if (info.kind == TREVRPC_RPC_RECEIVE_STATUS) {
+        frame.terminal = true;
+        frame.status = Status(static_cast<StatusCode>(info.rpc_status),
+                              info.message == nullptr ? std::string{}
+                                                      : std::string(info.message, info.message_len),
+                              copy_rpc_metadata(info.metadata, info.metadata_count));
+      } else if (info.kind == TREVRPC_RPC_RECEIVE_INITIAL_MESSAGE ||
+                 info.kind == TREVRPC_RPC_RECEIVE_MESSAGE) {
+        if (info.data == nullptr && info.data_len != 0) {
+          trevrpc_rpc_receive_release(receive);
+          return Error::runtime(-EINVAL, "RPC receive returned an invalid body view");
+        }
+        frame.body.resize(info.data_len);
+        if (info.data_len != 0) {
+          std::memcpy(frame.body.data(), info.data, info.data_len);
+        }
+        frame.message = true;
+      } else {
+        trevrpc_rpc_receive_release(receive);
+        return Error::runtime(-EPROTO, "RPC receive returned an unknown frame kind");
+      }
+      trevrpc_rpc_receive_release(receive);
+      return std::optional<StreamFrame>(std::move(frame));
+    }
+    return Error::runtime(-ENOBUFS, "RPC receive burst exceeded the async drain bound");
+  }
+
+  void receive_step(const NativeReceiveCompletion& completion) noexcept {
+    auto ready = try_receive_frame();
+    if (!ready) {
+      completion(ready.error());
+      return;
+    }
+    if (ready.value()) {
+      completion(std::move(ready.value()).value());
+      return;
+    }
+    for (;;) {
+      auto event = handle_->runtime->try_wait_stream(handle_->stream);
+      if (!event) {
+        completion(event.error());
+        return;
+      }
+      if (!event.value()) {
+        break;
+      }
+      const RpcEvent& stream_event = event.value().value();
+      if (stream_event.kind == TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN) {
+        StreamFrame terminal;
+        terminal.terminal = true;
+        terminal.status = Status::ok();
+        completion(std::move(terminal));
+        return;
+      }
+      if (stream_event.kind == TREVRPC_RPC_EVENT_CALL_CLOSED ||
+          stream_event.kind == TREVRPC_RPC_EVENT_STREAM_CLOSED ||
+          stream_event.kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+        completion(Error::runtime(stream_event.status == 0 ? -ECONNRESET : stream_event.status));
+        return;
+      }
+      if (stream_event.kind == TREVRPC_RPC_EVENT_STREAM_READABLE) {
+        ready = try_receive_frame();
+        if (!ready) {
+          completion(ready.error());
+          return;
+        }
+        if (ready.value()) {
+          completion(std::move(ready.value()).value());
+          return;
+        }
+      }
+    }
+    std::shared_ptr<NativeReceiveCompletion> retained_completion;
+    try {
+      retained_completion = std::make_shared<NativeReceiveCompletion>(completion);
+    } catch (...) {
+      completion(Error::runtime(-ENOMEM, "failed to retain async receive completion"));
+      return;
+    }
+    auto self = shared_from_this();
+    auto subscribed = handle_->runtime->subscribe_stream(
+        handle_->stream,
+        [self = std::move(self), retained_completion](Result<RpcEvent> event) mutable {
+          if (!event) {
+            (*retained_completion)(event.error());
+            return;
+          }
+          const RpcEvent& stream_event = event.value();
+          if (stream_event.kind == TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN) {
+            StreamFrame terminal;
+            terminal.terminal = true;
+            terminal.status = Status::ok();
+            (*retained_completion)(std::move(terminal));
+            return;
+          }
+          if (stream_event.kind == TREVRPC_RPC_EVENT_CALL_CLOSED ||
+              stream_event.kind == TREVRPC_RPC_EVENT_STREAM_CLOSED ||
+              stream_event.kind == TREVRPC_RPC_EVENT_CALL_FAILED) {
+            (*retained_completion)(
+                Error::runtime(stream_event.status == 0 ? -ECONNRESET : stream_event.status));
+            return;
+          }
+          self->receive_step(*retained_completion);
+        });
+    if (!subscribed) {
+      (*retained_completion)(subscribed.error());
+    }
+  }
+
+  std::shared_ptr<Abi1ServerCallHandle> handle_;
+};
+
+class Abi1ServerCallOps final : public RpcServerCallOps {
+public:
+  explicit Abi1ServerCallOps(std::shared_ptr<Abi1ServerCallHandle> handle)
+      : handle_(std::move(handle)) {}
+
+  void release(Work completion) noexcept override {
+    if (released_) {
+      return;
+    }
+    released_ = true;
+    const auto handle = handle_;
+    Abi1ServerCallHandle::begin_cleanup(
+        handle, !handle->terminal_success.load(std::memory_order_acquire), std::move(completion));
+  }
+  Result<void> start_respond(const Status& status, std::span<const std::byte> body,
+                             const Metadata& metadata,
+                             NativeCompletion completion) noexcept override {
+    trevrpc_rpc_status_v1 native_status{};
+    int error = trevrpc_rpc_status_v1_init(&native_status, sizeof(native_status));
+    if (error != 0) {
+      return Error::runtime(error);
+    }
+    const bool metadata_valid = valid_rpc_metadata(metadata);
+    const Metadata empty_metadata;
+    const Metadata& effective_metadata = metadata_valid ? metadata : empty_metadata;
+    const StatusCode effective_code = metadata_valid ? status.code() : StatusCode::Internal;
+    const std::string_view effective_message = metadata_valid
+                                                   ? std::string_view(status.message())
+                                                   : std::string_view("invalid response metadata");
+    std::vector<trevrpc_rpc_metadata_entry_v1> entries;
+    entries.reserve(effective_metadata.entries().size());
+    for (const auto& entry : effective_metadata.entries()) {
+      entries.push_back({entry.key.data(), static_cast<std::uint32_t>(entry.key.size()), 0,
+                         reinterpret_cast<const std::uint8_t*>(entry.value.data()),
+                         entry.value.size()});
+    }
+    native_status.code = static_cast<std::uint32_t>(effective_code);
+    native_status.message = effective_message.empty() ? nullptr : effective_message.data();
+    native_status.message_len = effective_message.size();
+    native_status.metadata_count = static_cast<std::uint32_t>(entries.size());
+    native_status.metadata = entries.empty() ? nullptr : entries.data();
+    std::uint64_t operation = 0;
+    error = reserve_rpc_operation(handle_->runtime, &operation);
+    if (error != 0) {
+      return Error::runtime(error);
+    }
+    const std::byte empty{};
+    const auto* message = body.empty() && effective_code != StatusCode::Ok
+                              ? nullptr
+                              : (body.empty() ? reinterpret_cast<const std::uint8_t*>(&empty)
+                                              : reinterpret_cast<const std::uint8_t*>(body.data()));
+    error = trevrpc_rpc_call_respond_copy_v1(handle_->runtime->native_handle(), handle_->call,
+                                             operation, &native_status, message, body.size());
+    if (error != 0) {
+      handle_->runtime->reject_operation(operation);
+      return Error::runtime(error);
+    }
+    return consume_terminal(operation, std::move(completion));
+  }
+
+  Result<void> start_finish(const Status& status, NativeCompletion completion) noexcept override {
+    trevrpc_rpc_status_v1 native_status{};
+    int error = trevrpc_rpc_status_v1_init(&native_status, sizeof(native_status));
+    if (error != 0) {
+      return Error::runtime(error);
+    }
+    const bool metadata_valid = valid_rpc_metadata(status.metadata());
+    const Metadata empty_metadata;
+    const Metadata& effective_metadata = metadata_valid ? status.metadata() : empty_metadata;
+    const StatusCode effective_code = metadata_valid ? status.code() : StatusCode::Internal;
+    const std::string_view effective_message = metadata_valid
+                                                   ? std::string_view(status.message())
+                                                   : std::string_view("invalid response metadata");
+    std::vector<trevrpc_rpc_metadata_entry_v1> entries;
+    entries.reserve(effective_metadata.entries().size());
+    for (const auto& entry : effective_metadata.entries()) {
+      entries.push_back({entry.key.data(), static_cast<std::uint32_t>(entry.key.size()), 0,
+                         reinterpret_cast<const std::uint8_t*>(entry.value.data()),
+                         entry.value.size()});
+    }
+    native_status.code = static_cast<std::uint32_t>(effective_code);
+    native_status.message = effective_message.empty() ? nullptr : effective_message.data();
+    native_status.message_len = effective_message.size();
+    native_status.metadata_count = static_cast<std::uint32_t>(entries.size());
+    native_status.metadata = entries.empty() ? nullptr : entries.data();
+    std::uint64_t operation = 0;
+    error = reserve_rpc_operation(handle_->runtime, &operation);
+    if (error != 0) {
+      return Error::runtime(error);
+    }
+    error = trevrpc_rpc_call_finish_v1(handle_->runtime->native_handle(), handle_->call, operation,
+                                       &native_status);
+    if (error != 0) {
+      handle_->runtime->reject_operation(operation);
+      return Error::runtime(error);
+    }
+    return consume_terminal(operation, std::move(completion));
+  }
+
+  void cancel() noexcept override {
+    std::uint64_t operation = 0;
+    if (reserve_rpc_operation(handle_->runtime, &operation) != 0) {
+      return;
+    }
+    const int error =
+        trevrpc_rpc_call_cancel(handle_->runtime->native_handle(), handle_->call, operation, 0);
+    if (error != 0) {
+      handle_->runtime->reject_operation(operation);
+      return;
+    }
+    auto subscribed =
+        handle_->runtime->subscribe_operation(operation, [](const Result<RpcEvent>&) noexcept {});
+    if (!subscribed) {
+      handle_->runtime->reject_operation(operation);
+    }
+  }
+
+  void close() noexcept override {
+    std::uint64_t operation = 0;
+    if (reserve_rpc_operation(handle_->runtime, &operation) != 0) {
+      return;
+    }
+    const int error = trevrpc_rpc_call_close(handle_->runtime->native_handle(), handle_->call,
+                                             operation, TREVRPC_RPC_CLOSE_FLAG_NONE, 0);
+    if (error != 0) {
+      handle_->runtime->reject_operation(operation);
+      return;
+    }
+    auto subscribed =
+        handle_->runtime->subscribe_operation(operation, [](const Result<RpcEvent>&) noexcept {});
+    if (!subscribed) {
+      handle_->runtime->reject_operation(operation);
+    }
+  }
+
+private:
+  Result<void> consume_terminal(std::uint64_t operation, NativeCompletion completion) noexcept {
+    auto handle = handle_;
+    auto subscribed = handle_->runtime->subscribe_operation(
+        operation,
+        [handle = std::move(handle), completion = std::move(completion)](Result<RpcEvent> result) {
+          const int error = !result ? result.error().code() : result.value().status;
+          if (error == 0) {
+            handle->terminal_success.store(true, std::memory_order_release);
+          }
+          completion(error);
+        });
+    if (!subscribed) {
+      handle_->runtime->reject_operation(operation);
+      return subscribed.error();
+    }
+    return {};
+  }
+
+  std::shared_ptr<Abi1ServerCallHandle> handle_;
+  bool released_ = false;
 };
 
 [[nodiscard]] std::optional<Deadline> earliest_deadline(std::optional<Deadline> first,
@@ -186,108 +804,35 @@ void CancellationState::unregister_callback(std::uint64_t id) noexcept {
 }
 
 AsyncRuntimeState::AsyncRuntimeState(std::shared_ptr<Executor> continuation,
-                                     std::shared_ptr<ThreadPoolExecutor> native_io,
-                                     AsyncRuntimeOptions options)
-    : continuation_(std::move(continuation)), native_io_(std::move(native_io)), options_(options),
-      timer_thread_([this] { timer_loop(); }) {}
-
-AsyncRuntimeState::~AsyncRuntimeState() {
-  {
-    std::lock_guard lock(timer_mutex_);
-    timer_stop_ = true;
-    timers_.clear();
-  }
-  timer_condition_.notify_all();
-  if (timer_thread_.joinable()) {
-    timer_thread_.join();
-  }
-  native_io_->request_stop();
-  if (!native_io_->running_in_this_executor()) {
-    (void)native_io_->drain_until(Deadline::max());
-  }
-}
-
-Result<void> AsyncRuntimeState::submit_native(Work work) noexcept {
-  return native_io_->execute(std::move(work));
-}
-
-Result<void> AsyncRuntimeState::schedule_at(Deadline deadline, Work work) noexcept {
-  try {
-    std::lock_guard lock(timer_mutex_);
-    if (timer_stop_) {
-      return Error::runtime(-ESHUTDOWN, "async runtime timer is stopping");
-    }
-    timers_.emplace(deadline, std::move(work));
-    timer_condition_.notify_all();
-    return {};
-  } catch (...) {
-    return Error::runtime(-ENOMEM, "failed to schedule async timer");
-  }
-}
-
-void AsyncRuntimeState::timer_loop() noexcept {
-  for (;;) {
-    Work work;
-    {
-      std::unique_lock lock(timer_mutex_);
-      if (timers_.empty() && !timer_stop_) {
-        timer_condition_.wait(lock, [this] { return timer_stop_ || !timers_.empty(); });
-      }
-      if (timer_stop_) {
-        return;
-      }
-      auto next = timers_.begin();
-      const Deadline next_deadline = next->first;
-      if (timer_condition_.wait_until(lock, next_deadline) != std::cv_status::timeout) {
-        continue;
-      }
-      next = timers_.begin();
-      if (next == timers_.end() || next->first > Deadline::clock::now()) {
-        continue;
-      }
-      work = std::move(next->second);
-      timers_.erase(next);
-    }
-    try {
-      work();
-    } catch (...) {
-      (void)std::current_exception();
-    }
-  }
-}
-
-std::shared_ptr<NativeOps> production_native_ops() {
-  static auto instance = std::make_shared<Abi6NativeOps>();
-  return instance;
-}
-
-std::shared_ptr<ServerCallOps> production_server_call_ops() {
-  static auto instance = std::make_shared<Abi6ServerCallOps>();
-  return instance;
-}
+                                     AsyncRuntimeOptions options) noexcept
+    : continuation_(std::move(continuation)), options_(options) {}
 
 std::shared_ptr<OperationState>
-OperationState::create(trevrpc_stream* stream, const std::shared_ptr<AsyncRuntime>& runtime,
+OperationState::create(const std::shared_ptr<AsyncRuntime>& runtime,
                        std::shared_ptr<NativeOps> native_ops, std::optional<Deadline> deadline,
                        std::shared_ptr<Cancellation> cancellation_bridge,
                        std::shared_ptr<CancellationState> cancellation_state,
                        std::uint64_t cancellation_registration, bool terminal_stops_send) {
-  if (!runtime || !runtime->state_) {
+  if (!runtime || !runtime->state_ || !native_ops) {
     return nullptr;
   }
-  return std::make_shared<OperationState>(
-      stream, runtime->state_, std::move(native_ops), deadline, std::move(cancellation_bridge),
-      std::move(cancellation_state), cancellation_registration, terminal_stops_send);
+  try {
+    return std::make_shared<OperationState>(
+        runtime->state_, std::move(native_ops), deadline, std::move(cancellation_bridge),
+        std::move(cancellation_state), cancellation_registration, terminal_stops_send);
+  } catch (...) {
+    return nullptr;
+  }
 }
 
-OperationState::OperationState(trevrpc_stream* stream, std::shared_ptr<AsyncRuntimeState> runtime,
+OperationState::OperationState(std::shared_ptr<AsyncRuntimeState> runtime,
                                std::shared_ptr<NativeOps> native_ops,
                                std::optional<Deadline> deadline,
                                std::shared_ptr<Cancellation> cancellation_bridge,
                                std::shared_ptr<CancellationState> cancellation_state,
                                std::uint64_t cancellation_registration, bool terminal_stops_send)
-    : stream_(stream), runtime_(std::move(runtime)), native_ops_(std::move(native_ops)),
-      deadline_(deadline), cancellation_bridge_(std::move(cancellation_bridge)),
+    : runtime_(std::move(runtime)), native_ops_(std::move(native_ops)), deadline_(deadline),
+      cancellation_bridge_(std::move(cancellation_bridge)),
       cancellation_state_(std::move(cancellation_state)),
       cancellation_registration_(cancellation_registration),
       terminal_stops_send_(terminal_stops_send) {}
@@ -314,14 +859,14 @@ Task<Result<void>> OperationState::send(std::size_t encoded_size,
                                         SendOptions options, bool finish) {
   NativeSendAction action;
   if (finish) {
-    action = [native_ops = native_ops_](trevrpc_stream* stream,
-                                        std::span<const std::byte>) noexcept {
-      return native_ops->finish_send(stream);
+    action = [native_ops = native_ops_](std::span<const std::byte>,
+                                        NativeCompletion completion) noexcept {
+      return native_ops->start_finish_send(std::move(completion));
     };
   } else {
-    action = [native_ops = native_ops_](trevrpc_stream* stream,
-                                        std::span<const std::byte> body) noexcept {
-      return native_ops->send(stream, body);
+    action = [native_ops = native_ops_](std::span<const std::byte> body,
+                                        NativeCompletion completion) noexcept {
+      return native_ops->start_send(body, std::move(completion));
     };
   }
   co_return co_await send_action(encoded_size, std::move(serializer), options, finish,
@@ -397,7 +942,7 @@ OperationState::send_action(std::size_t encoded_size,
       prepare_admitted_item(item, serializer);
     } else if (waiter->deadline) {
       std::weak_ptr<OperationState> weak = self;
-      auto scheduled = runtime_->schedule_at(*waiter->deadline, [weak, waiter] {
+      auto scheduled = native_ops_->schedule_at(*waiter->deadline, [weak, waiter] {
         if (auto operation = weak.lock()) {
           operation->timeout_waiter(waiter);
         }
@@ -462,13 +1007,12 @@ void OperationState::start_send_if_ready() noexcept {
     return;
   }
   auto self = shared_from_this();
-  auto submitted = runtime_->submit_native([self = std::move(self), item] {
-    const int error = item->action(self->stream_, item->bytes);
+  auto started = item->action(item->bytes, [self = std::move(self), item](int error) {
     self->finish_send_item(item, error);
     self->finish_native_work();
   });
-  if (!submitted) {
-    finish_send_item(item, submitted.error().code());
+  if (!started) {
+    finish_send_item(item, started.error().code());
     finish_native_work();
   }
 }
@@ -561,8 +1105,54 @@ void OperationState::collect_idle_callbacks_locked(std::vector<Work>& callbacks)
   }
 }
 
+void OperationState::close_native_once() noexcept {
+  {
+    std::lock_guard lock(mutex_);
+    if (native_closed_ || native_close_in_progress_) {
+      return;
+    }
+    native_close_in_progress_ = true;
+    ++native_close_attempts_;
+  }
+
+  const auto result = native_ops_->close();
+  bool retry = false;
+  {
+    std::lock_guard lock(mutex_);
+    native_close_in_progress_ = false;
+    if (result) {
+      native_closed_ = true;
+    } else {
+      const int error = result.error().code();
+      constexpr std::size_t max_close_attempts = 32;
+      retry = (error == -EAGAIN || error == -EBUSY || error == -EDEADLK) &&
+              native_close_attempts_ < max_close_attempts;
+      if (!retry) {
+        native_closed_ = true;
+      }
+    }
+  }
+  if (!retry) {
+    return;
+  }
+
+  auto self = weak_from_this().lock();
+  if (!self) {
+    std::lock_guard lock(mutex_);
+    native_closed_ = true;
+    return;
+  }
+  const auto scheduled =
+      native_ops_->schedule_at(Deadline::clock::now() + std::chrono::milliseconds(1),
+                               [self = std::move(self)] { self->close_native_once(); });
+  if (!scheduled) {
+    std::lock_guard lock(mutex_);
+    native_closed_ = true;
+  }
+}
+
 void OperationState::finish_native_work() noexcept {
-  trevrpc_stream* stream = nullptr;
+  bool close_requested = false;
   std::vector<Work> idle_callbacks;
   {
     std::lock_guard lock(mutex_);
@@ -571,13 +1161,13 @@ void OperationState::finish_native_work() noexcept {
     }
     --native_work_;
     if (native_work_ == 0 && close_requested_) {
-      stream = std::exchange(stream_, nullptr);
       close_requested_ = false;
+      close_requested = true;
     }
     collect_idle_callbacks_locked(idle_callbacks);
   }
-  if (stream != nullptr) {
-    native_ops_->close(stream);
+  if (close_requested) {
+    close_native_once();
   }
   for (Work& callback : idle_callbacks) {
     try {
@@ -617,7 +1207,6 @@ Task<Result<StreamFrame>> OperationState::receive() {
     co_return created_completion.error();
   }
   auto completion = std::move(created_completion).value();
-  std::uint64_t wait_started = 0;
   {
     std::lock_guard lock(mutex_);
     if (closed_ || cancelled_) {
@@ -632,86 +1221,36 @@ Task<Result<StreamFrame>> OperationState::receive() {
     receive_pending_ = true;
     receive_completion_ = completion;
   }
-  const int clock_error = trevrpc_monotonic_now_nanos(&wait_started);
-  if (clock_error != 0) {
-    settle_receive(completion, Error::runtime(clock_error));
-  } else {
-    start_receive_attempt(completion, wait_started, runtime_->options().receive_poll_min);
-  }
-  co_return co_await *completion;
-}
 
-void OperationState::start_receive_attempt(
-    std::shared_ptr<AsyncCompletion<Result<StreamFrame>>> completion, std::uint64_t wait_started,
-    std::chrono::nanoseconds delay) noexcept {
-  bool active = false;
-  bool stopped = false;
-  {
-    std::lock_guard lock(mutex_);
-    active = receive_pending_ && receive_completion_ == completion;
-    stopped = closed_ || cancelled_;
-    if (active && !stopped) {
-      ++native_work_;
+  if (deadline_) {
+    if (Deadline::clock::now() >= *deadline_) {
+      settle_receive(completion, Error::runtime(-ETIMEDOUT, "async call deadline exceeded"));
+      cancel();
+      co_return co_await *completion;
     }
-  }
-  if (!active) {
-    return;
-  }
-  if (stopped) {
-    settle_receive(completion, Error::runtime(-ECANCELED, "async stream was cancelled"));
-    return;
+    std::weak_ptr<OperationState> weak = shared_from_this();
+    auto scheduled = native_ops_->schedule_at(*deadline_, [weak, completion] {
+      if (auto operation = weak.lock()) {
+        operation->settle_receive(completion,
+                                  Error::runtime(-ETIMEDOUT, "async call deadline exceeded"));
+        operation->cancel();
+      }
+    });
+    if (!scheduled) {
+      settle_receive(completion, scheduled.error());
+      co_return co_await *completion;
+    }
   }
 
   auto self = shared_from_this();
-  std::weak_ptr<OperationState> weak = self;
-  auto submitted = runtime_->submit_native([self = std::move(self), weak,
-                                            completion = std::move(completion), wait_started,
-                                            delay] {
-    auto& operation = self;
-    bool attempt_active = false;
-    bool attempt_stopped = false;
-    {
-      std::lock_guard lock(operation->mutex_);
-      attempt_active = operation->receive_pending_ && operation->receive_completion_ == completion;
-      attempt_stopped = operation->closed_ || operation->cancelled_;
-    }
-    if (attempt_active && attempt_stopped) {
-      operation->settle_receive(completion,
-                                Error::runtime(-ECANCELED, "async stream was cancelled"));
-    } else if (attempt_active && operation->deadline_ &&
-               Deadline::clock::now() >= *operation->deadline_) {
-      operation->settle_receive(completion,
-                                Error::runtime(-ETIMEDOUT, "async call deadline exceeded"));
-      operation->cancel();
-    } else if (attempt_active) {
-      auto ready = operation->native_ops_->receive_ready_since(operation->stream_, wait_started);
-      if (!ready) {
-        operation->settle_receive(completion, ready.error());
-      } else if (ready.value().has_value()) {
-        operation->settle_receive(completion, std::move(ready.value()).value());
-      } else {
-        const auto next_delay =
-            std::min(delay * 2, operation->runtime_->options().receive_poll_max);
-        auto scheduled = operation->runtime_->schedule_at(
-            Deadline::clock::now() + delay, [weak, completion, wait_started, next_delay] {
-              if (auto current = weak.lock()) {
-                current->start_receive_attempt(completion, wait_started, next_delay);
-              } else {
-                completion->complete(Result<StreamFrame>(
-                    Error::runtime(-ECANCELED, "async operation was released")));
-              }
-            });
-        if (!scheduled) {
-          operation->settle_receive(completion, scheduled.error());
-        }
-      }
-    }
-    operation->finish_native_work();
-  });
-  if (!submitted) {
-    settle_receive(completion, submitted.error());
-    finish_native_work();
+  auto started =
+      native_ops_->start_receive([self = std::move(self), completion](Result<StreamFrame> result) {
+        self->settle_receive(completion, std::move(result));
+      });
+  if (!started) {
+    settle_receive(completion, started.error());
   }
+  co_return co_await *completion;
 }
 
 void OperationState::settle_receive(
@@ -719,7 +1258,8 @@ void OperationState::settle_receive(
     Result<StreamFrame> result) noexcept {
   std::vector<std::shared_ptr<AsyncCompletion<Result<void>>>> send_completions;
   std::vector<Work> idle_callbacks;
-  trevrpc_stream* stream_to_cancel = nullptr;
+  bool cancel_native = false;
+  bool close_native = false;
   bool settled = false;
   const bool terminal = result && result.value().terminal;
   {
@@ -729,6 +1269,13 @@ void OperationState::settle_receive(
       receive_completion_.reset();
       receive_terminal_ = terminal;
       settled = true;
+      if (terminal) {
+        close_requested_ = true;
+        if (native_work_ == 0) {
+          close_native = true;
+          close_requested_ = false;
+        }
+      }
       if (terminal && terminal_stops_send_ && !send_cancelled_) {
         send_cancelled_ = true;
         send_sealed_ = true;
@@ -750,14 +1297,17 @@ void OperationState::settle_receive(
         }
         send_waiters_.clear();
         if (send_running_) {
-          stream_to_cancel = stream_;
+          cancel_native = true;
         }
         collect_idle_callbacks_locked(idle_callbacks);
       }
     }
   }
-  if (stream_to_cancel != nullptr) {
-    native_ops_->cancel(stream_to_cancel);
+  if (cancel_native) {
+    native_ops_->cancel();
+  }
+  if (close_native) {
+    close_native_once();
   }
   for (const auto& send_completion : send_completions) {
     send_completion->complete(Result<void>(
@@ -777,7 +1327,6 @@ void OperationState::settle_receive(
 
 void OperationState::cancel() noexcept {
   std::shared_ptr<AsyncCompletion<Result<StreamFrame>>> receive_completion;
-  trevrpc_stream* stream = nullptr;
   {
     std::lock_guard lock(mutex_);
     if (cancelled_) {
@@ -788,9 +1337,8 @@ void OperationState::cancel() noexcept {
       receive_pending_ = false;
       receive_completion = std::move(receive_completion_);
     }
-    stream = stream_;
   }
-  native_ops_->cancel(stream);
+  native_ops_->cancel();
 
   for (;;) {
     std::shared_ptr<AsyncCompletion<Result<void>>> completion;
@@ -835,7 +1383,7 @@ void OperationState::close() noexcept {
     }
   }
   cancel();
-  trevrpc_stream* stream = nullptr;
+  bool close_now = false;
   std::shared_ptr<CancellationState> cancellation_state;
   std::uint64_t cancellation_registration = 0;
   {
@@ -847,7 +1395,7 @@ void OperationState::close() noexcept {
     cancellation_state = std::move(cancellation_state_);
     cancellation_registration = std::exchange(cancellation_registration_, 0);
     if (native_work_ == 0) {
-      stream = std::exchange(stream_, nullptr);
+      close_now = true;
     } else {
       close_requested_ = true;
     }
@@ -855,8 +1403,8 @@ void OperationState::close() noexcept {
   if (cancellation_state) {
     cancellation_state->unregister_callback(cancellation_registration);
   }
-  if (stream != nullptr) {
-    native_ops_->close(stream);
+  if (close_now) {
+    close_native_once();
   }
 }
 
@@ -872,7 +1420,7 @@ void OperationState::retire(const Error& reason) noexcept {
     }
     closed_ = true;
     cancelled_ = true;
-    stream_ = nullptr;
+    native_closed_ = true;
     close_requested_ = false;
     cancellation_state = std::move(cancellation_state_);
     cancellation_registration = std::exchange(cancellation_registration_, 0);
@@ -954,35 +1502,88 @@ Task<Result<ByteResponse>> OperationState::run_unary(std::shared_ptr<Channel> ch
     bridge = options.retained_cancellation;
     options.call_options.cancellation = bridge.get();
   }
-  auto runtime_state = runtime->state_;
-  auto submitted = runtime_state->submit_native(
-      [channel = std::move(channel), service = std::move(service), method = std::move(method),
-       request = std::move(request), options = std::move(options), completion, cancellation_state,
-       registration]() mutable {
-        if (options.deadline) {
-          const auto now = Deadline::clock::now();
-          if (now >= *options.deadline) {
-            if (cancellation_state) {
-              cancellation_state->unregister_callback(registration);
-            }
-            completion->complete(
-                Result<ByteResponse>(Error::runtime(-ETIMEDOUT, "async call deadline exceeded")));
-            return;
-          }
-          options.call_options.timeout =
-              std::chrono::duration_cast<std::chrono::nanoseconds>(*options.deadline - now);
-        }
-        auto result = channel->call_unary(service, method, request, options.call_options);
-        if (cancellation_state) {
-          cancellation_state->unregister_callback(registration);
-        }
-        completion->complete(std::move(result));
-      });
-  if (!submitted) {
+  if (options.deadline) {
+    const auto now = Deadline::clock::now();
+    if (now >= *options.deadline) {
+      if (cancellation_state) {
+        cancellation_state->unregister_callback(registration);
+      }
+      co_return Error::runtime(-ETIMEDOUT, "async call deadline exceeded");
+    }
+    options.call_options.timeout =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(*options.deadline - now);
+  }
+  auto core = AsyncChannelAccess::core(channel);
+  if (!core) {
     if (cancellation_state) {
       cancellation_state->unregister_callback(registration);
     }
-    co_return submitted.error();
+    co_return Error::runtime(-EINVAL, "async client channel is closed");
+  }
+  auto started = RpcClientStream::open_async(
+      core, std::move(service), std::move(method), TREVRPC_RPC_KIND_UNARY, std::move(request),
+      std::move(options.call_options),
+      [completion, cancellation_state, registration,
+       bridge](Result<std::shared_ptr<RpcClientStream>> stream_result) mutable noexcept {
+        try {
+          if (!stream_result) {
+            if (cancellation_state) {
+              cancellation_state->unregister_callback(registration);
+            }
+            completion->complete(stream_result.error());
+            return;
+          }
+          auto stream = std::move(stream_result).value();
+          auto receive_started =
+              stream->start_receive([stream, completion, cancellation_state, registration,
+                                     bridge](Result<StreamFrame> frame) mutable noexcept {
+                try {
+                  if (cancellation_state) {
+                    cancellation_state->unregister_callback(registration);
+                  }
+                  Result<ByteResponse> result =
+                      Error::protobuf("unary RPC did not return exactly one response message");
+                  if (!frame) {
+                    result = frame.error();
+                  } else if (frame.value().terminal &&
+                             (!frame.value().status.is_ok() || frame.value().message)) {
+                    ByteResponse response;
+                    response.status = std::move(frame.value().status);
+                    response.metadata = response.status.metadata();
+                    response.body = std::move(frame.value().body);
+                    result = std::move(response);
+                  }
+                  stream->close();
+                  completion->complete(std::move(result));
+                } catch (...) {
+                  if (cancellation_state) {
+                    cancellation_state->unregister_callback(registration);
+                  }
+                  stream->close();
+                  completion->complete(
+                      Error::runtime(-ENOMEM, "failed to complete asynchronous unary RPC"));
+                }
+              });
+          if (!receive_started) {
+            if (cancellation_state) {
+              cancellation_state->unregister_callback(registration);
+            }
+            stream->close();
+            completion->complete(receive_started.error());
+          }
+        } catch (...) {
+          if (cancellation_state) {
+            cancellation_state->unregister_callback(registration);
+          }
+          completion->complete(
+              Error::runtime(-ENOMEM, "failed to start asynchronous unary receive"));
+        }
+      });
+  if (!started) {
+    if (cancellation_state) {
+      cancellation_state->unregister_callback(registration);
+    }
+    co_return started.error();
   }
   co_return co_await *completion;
 }
@@ -1017,156 +1618,294 @@ OperationState::start_stream(std::shared_ptr<Channel> channel,
     bridge = options.retained_cancellation;
     options.call_options.cancellation = bridge.get();
   }
-  auto runtime_state = runtime->state_;
-  auto submitted = runtime_state->submit_native(
-      [channel = std::move(channel), runtime = std::move(runtime), service = std::move(service),
-       method = std::move(method), kind, request = std::move(request), options = std::move(options),
-       completion, cancellation_state, bridge, registration]() mutable {
-        if (options.deadline) {
-          const auto now = Deadline::clock::now();
-          if (now >= *options.deadline) {
-            if (cancellation_state) {
-              cancellation_state->unregister_callback(registration);
-            }
-            completion->complete(Result<std::shared_ptr<OperationState>>(
-                Error::runtime(-ETIMEDOUT, "async call deadline exceeded")));
-            return;
-          }
-          options.call_options.timeout =
-              std::chrono::duration_cast<std::chrono::nanoseconds>(*options.deadline - now);
-        }
-        auto stream = channel->start_stream(service, method, kind, request, options.call_options);
-        if (!stream) {
-          if (cancellation_state) {
-            cancellation_state->unregister_callback(registration);
-          }
-          completion->complete(Result<std::shared_ptr<OperationState>>(stream.error()));
-          return;
-        }
-        auto operation = OperationState::create(stream.value().release_native_handle(), runtime,
-                                                production_native_ops(), options.deadline, bridge,
-                                                cancellation_state, 0, true);
-        if (!operation) {
-          if (cancellation_state) {
-            cancellation_state->unregister_callback(registration);
-          }
-          completion->complete(Result<std::shared_ptr<OperationState>>(
-              Error::runtime(-ENOMEM, "failed to create async stream state")));
-          return;
-        }
-        if (cancellation_state) {
-          cancellation_state->unregister_callback(registration);
-          try {
-            std::weak_ptr<OperationState> weak = operation;
-            registration = cancellation_state->register_callback([bridge, weak] {
-              bridge->cancel();
-              if (auto current = weak.lock()) {
-                current->cancel();
-              }
-            });
-            operation->set_cancellation_registration(registration);
-          } catch (...) {
-            operation->close();
-            completion->complete(Result<std::shared_ptr<OperationState>>(
-                Error::runtime(-ENOMEM, "failed to attach async stream cancellation")));
-            return;
-          }
-        }
-        completion->complete(std::move(operation));
-      });
-  if (!submitted) {
+  if (options.deadline) {
+    const auto now = Deadline::clock::now();
+    if (now >= *options.deadline) {
+      if (cancellation_state) {
+        cancellation_state->unregister_callback(registration);
+      }
+      co_return Error::runtime(-ETIMEDOUT, "async call deadline exceeded");
+    }
+    options.call_options.timeout =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(*options.deadline - now);
+  }
+  auto core = AsyncChannelAccess::core(channel);
+  if (!core) {
     if (cancellation_state) {
       cancellation_state->unregister_callback(registration);
     }
-    co_return submitted.error();
+    co_return Error::runtime(-EINVAL, "async client channel is closed");
+  }
+  const auto deadline = options.deadline;
+  auto started = RpcClientStream::open_async(
+      core, std::move(service), std::move(method), kind, std::move(request),
+      std::move(options.call_options),
+      [runtime = std::move(runtime), completion, cancellation_state, bridge, registration,
+       deadline](Result<std::shared_ptr<RpcClientStream>> stream_result) mutable noexcept {
+        try {
+          if (!stream_result) {
+            if (cancellation_state) {
+              cancellation_state->unregister_callback(registration);
+            }
+            completion->complete(stream_result.error());
+            return;
+          }
+          auto native_ops = std::make_shared<Abi1ClientNativeOps>(std::move(stream_result).value());
+          auto operation = OperationState::create(runtime, std::move(native_ops), deadline, bridge,
+                                                  cancellation_state, 0, true);
+          if (!operation) {
+            if (cancellation_state) {
+              cancellation_state->unregister_callback(registration);
+            }
+            completion->complete(Error::runtime(-ENOMEM, "failed to create async stream state"));
+            return;
+          }
+          if (cancellation_state) {
+            cancellation_state->unregister_callback(registration);
+            try {
+              std::weak_ptr<OperationState> weak = operation;
+              registration = cancellation_state->register_callback([bridge, weak] {
+                bridge->cancel();
+                if (auto current = weak.lock()) {
+                  current->cancel();
+                }
+              });
+              operation->set_cancellation_registration(registration);
+            } catch (...) {
+              operation->close();
+              completion->complete(
+                  Error::runtime(-ENOMEM, "failed to attach async stream cancellation"));
+              return;
+            }
+          }
+          completion->complete(std::move(operation));
+        } catch (...) {
+          if (cancellation_state) {
+            cancellation_state->unregister_callback(registration);
+          }
+          completion->complete(Error::runtime(-ENOMEM, "failed to create async stream state"));
+        }
+      });
+  if (!started) {
+    if (cancellation_state) {
+      cancellation_state->unregister_callback(registration);
+    }
+    co_return started.error();
   }
   co_return co_await *completion;
 }
 
-ServerCallState::ServerCallState(trevrpc_call* call, std::uint32_t kind,
-                                 std::shared_ptr<ServerCallOps> call_ops) noexcept
-    : call_(call), kind_(kind), call_ops_(std::move(call_ops)) {}
+CallContext ServerCallState::context() const {
+  return incoming_.has_value() ? CallContext(incoming_->context, incoming_->metadata)
+                               : CallContext{};
+}
+
+CallContext server_call_context(const std::shared_ptr<ServerCallState>& state) {
+  return state ? state->context() : CallContext{};
+}
+
+std::span<const std::byte>
+server_initial_message(const std::shared_ptr<ServerCallState>& state) noexcept {
+  return state ? state->initial_message() : std::span<const std::byte>{};
+}
+
+Result<std::optional<std::vector<std::byte>>> ServerCallState::receive_message() {
+  std::vector<std::byte> initial;
+  {
+    std::lock_guard lock(mutex_);
+    if (!initial_message_consumed_ && incoming_.has_value()) {
+      initial_message_consumed_ = true;
+      initial = incoming_->initial_message;
+      const bool streaming_request = kind_ == TREVRPC_RPC_KIND_CLIENT_STREAMING ||
+                                     kind_ == TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING;
+      if (!streaming_request || !initial.empty()) {
+        return std::optional<std::vector<std::byte>>(std::move(initial));
+      }
+    }
+  }
+  if (!operation_) {
+    return Error::runtime(-EINVAL, "server call state is empty");
+  }
+  auto frame = sync_wait(operation_->receive());
+  if (!frame) {
+    return frame.error();
+  }
+  if (frame.value().terminal) {
+    if (!frame.value().status.is_ok()) {
+      return Error::rpc(std::move(frame.value().status));
+    }
+    return std::optional<std::vector<std::byte>>{};
+  }
+  return std::optional<std::vector<std::byte>>(std::move(frame.value().body));
+}
+
+Result<void> send_server_message(const std::shared_ptr<ServerCallState>& state,
+                                 std::span<const std::byte> body) {
+  if (!state || !state->operation()) {
+    return Error::runtime(-EINVAL, "server call state is empty");
+  }
+  std::vector<std::byte> owned(body.begin(), body.end());
+  const std::size_t encoded_size = owned.size();
+  auto result = sync_wait(state->operation()->send(
+      encoded_size,
+      [owned = std::move(owned)]() mutable {
+        return Result<std::vector<std::byte>>(std::move(owned));
+      },
+      {}, false));
+  return result;
+}
+
+Result<std::optional<std::vector<std::byte>>>
+receive_server_message(const std::shared_ptr<ServerCallState>& state) {
+  if (!state) {
+    return Error::runtime(-EINVAL, "server call state is empty");
+  }
+  return state->receive_message();
+}
 
 Result<std::shared_ptr<ServerCallState>>
-ServerCallState::create(trevrpc_call* call, std::uint32_t kind,
-                        const std::shared_ptr<AsyncRuntime>& runtime,
-                        const std::shared_ptr<ServerCallOps>& call_ops,
-                        std::shared_ptr<NativeOps> stream_ops, bool* deferred) {
-  if (deferred != nullptr) {
-    *deferred = false;
+ServerCallState::create_for_test(std::uint32_t kind, const std::shared_ptr<AsyncRuntime>& runtime,
+                                 std::shared_ptr<RpcServerCallOps> call_ops,
+                                 std::shared_ptr<NativeOps> stream_ops) {
+  if (!runtime || !call_ops || !stream_ops) {
+    return Error::runtime(-EINVAL, "invalid test server call state");
   }
-  if (call == nullptr || !runtime || !call_ops) {
-    return Error::runtime(-EINVAL, "async server call inputs must not be null");
-  }
-  if (kind != TREVRPC_RPC_KIND_UNARY && kind != TREVRPC_RPC_KIND_CLIENT_STREAMING &&
-      kind != TREVRPC_RPC_KIND_SERVER_STREAMING &&
-      kind != TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) {
-    return Error::runtime(TREVRPC_ERR_UNSUPPORTED_RPC_KIND);
-  }
-  const int defer_error = call_ops->defer(call);
-  if (defer_error != 0) {
-    return Error::runtime(defer_error, "failed to defer async server call");
-  }
-  if (deferred != nullptr) {
-    *deferred = true;
-  }
-  const int retain_error = call_ops->retain(call);
-  if (retain_error != 0) {
-    call_ops->close(call);
-    return Error::runtime(retain_error, "failed to retain async server call");
+  auto operation = OperationState::create(runtime, std::move(stream_ops), std::nullopt);
+  if (!operation) {
+    return Error::runtime(-ENOMEM, "failed to create test server operation");
   }
   try {
-    if (!stream_ops) {
-      stream_ops = std::make_shared<ServerStreamNativeOps>(call, call_ops);
-    }
-    trevrpc_stream* stream = call_ops->stream(call);
-    if (kind != TREVRPC_RPC_KIND_UNARY && stream == nullptr) {
-      call_ops->close(call);
-      call_ops->release(call);
-      return Error::runtime(-EINVAL, "streaming server call has no native stream");
-    }
-    auto operation = OperationState::create(stream, runtime, std::move(stream_ops), std::nullopt);
-    if (!operation) {
-      call_ops->close(call);
-      call_ops->release(call);
-      return Error::runtime(-ENOMEM, "failed to create async server operation");
-    }
-    auto state = std::shared_ptr<ServerCallState>(new ServerCallState(call, kind, call_ops));
+    auto state = std::shared_ptr<ServerCallState>(new ServerCallState(kind));
     state->operation_ = std::move(operation);
+    state->rpc_call_ops_ = std::move(call_ops);
     return state;
   } catch (...) {
-    call_ops->close(call);
-    call_ops->release(call);
-    return Error::runtime(-ENOMEM, "failed to allocate async server call state");
+    call_ops->close();
+    call_ops->release({});
+    return Error::runtime(-ENOMEM, "failed to allocate test server call state");
   }
 }
 
+void ServerCallState::test_fail_next_rpc_allocation() noexcept {
+  injected_server_call_allocation_failure.store(true, std::memory_order_release);
+}
+
+Result<std::shared_ptr<ServerCallState>>
+ServerCallState::create_rpc(RpcIncomingCall incoming, std::shared_ptr<RpcEventRuntime> rpc_runtime,
+                            const std::shared_ptr<AsyncRuntime>& runtime, bool* accepted) {
+  if (accepted != nullptr) {
+    *accepted = false;
+  }
+  if (!rpc_runtime || !runtime || incoming.call.owner == 0 || incoming.stream.owner == 0) {
+    return Error::runtime(-EINVAL, "invalid ABI1 incoming server call");
+  }
+
+  std::shared_ptr<Abi1ServerCallHandle> handle;
+  std::shared_ptr<Abi1ServerCallOps> call_ops;
+  std::shared_ptr<Abi1ServerStreamNativeOps> stream_ops;
+  std::shared_ptr<ServerCallState> state;
+  try {
+    if (injected_server_call_allocation_failure.exchange(false, std::memory_order_acq_rel)) {
+      throw std::bad_alloc();
+    }
+    handle = std::make_shared<Abi1ServerCallHandle>();
+    handle->runtime = rpc_runtime;
+    handle->call = incoming.call;
+    handle->stream = incoming.stream;
+    call_ops = std::make_shared<Abi1ServerCallOps>(handle);
+    stream_ops = std::make_shared<Abi1ServerStreamNativeOps>(handle);
+    state = std::shared_ptr<ServerCallState>(new ServerCallState(incoming.rpc_kind));
+  } catch (...) {
+    (void)rpc_runtime->reject_incoming(incoming);
+    return Error::runtime(-ENOMEM, "failed to allocate ABI1 incoming call state");
+  }
+
+  auto registered = rpc_runtime->register_stream(incoming.stream);
+  if (!registered) {
+    call_ops->close();
+    call_ops->release({});
+    return registered.error();
+  }
+  if (incoming.preparation_status != 0) {
+    call_ops->close();
+    call_ops->release({});
+    return Error::runtime(incoming.preparation_status, "failed to prepare ABI1 incoming call");
+  }
+  std::uint64_t accept_operation = 0;
+  int error = reserve_rpc_operation(rpc_runtime, &accept_operation);
+  if (error == 0) {
+    error = trevrpc_rpc_call_accept(rpc_runtime->native_handle(), incoming.call, accept_operation);
+    if (error == 0) {
+      error = wait_rpc_operation(rpc_runtime, accept_operation);
+    } else {
+      rpc_runtime->reject_operation(accept_operation);
+    }
+  }
+  if (error != 0) {
+    call_ops->close();
+    call_ops->release({});
+    return Error::runtime(error, "failed to accept ABI1 incoming call");
+  }
+
+  auto operation = OperationState::create(runtime, std::move(stream_ops), std::nullopt);
+  if (!operation) {
+    call_ops->close();
+    call_ops->release({});
+    return Error::runtime(-ENOMEM, "failed to create ABI1 server operation");
+  }
+  try {
+    state->incoming_.emplace(std::move(incoming));
+  } catch (...) {
+    call_ops->close();
+    call_ops->release({});
+    return Error::runtime(-ENOMEM, "failed to allocate ABI1 server call state");
+  }
+  state->operation_ = std::move(operation);
+  state->rpc_call_ops_ = std::move(call_ops);
+  state->rpc_runtime_ = std::move(rpc_runtime);
+  state->rpc_call_owner_ = std::move(handle);
+  if (accepted != nullptr) {
+    *accepted = true;
+  }
+  return state;
+}
+
 ServerCallState::~ServerCallState() {
-  trevrpc_call* call = nullptr;
   std::shared_ptr<OperationState> operation;
-  std::shared_ptr<ServerCallOps> call_ops;
+  std::shared_ptr<RpcServerCallOps> rpc_call_ops;
+  ServerCallTerminalObserver observer;
+  std::optional<ServerCallTerminal> terminal;
   {
     std::lock_guard lock(mutex_);
-    if (pin_released_ || call_ == nullptr) {
+    if (pin_released_ || !rpc_call_ops_) {
       return;
     }
+    if (!terminal_result_) {
+      terminal_phase_ = ServerTerminalPhase::Settled;
+      final_selected_ = true;
+      final_error_ = Error::runtime(-ECANCELED, "async server call was abandoned");
+      terminal_result_ = ServerCallTerminal{StatusCode::Cancelled, 0};
+    }
+    claim_terminal_observer_locked(observer, terminal);
     pin_released_ = true;
-    call = std::exchange(call_, nullptr);
     operation = operation_;
-    call_ops = call_ops_;
+    rpc_call_ops = rpc_call_ops_;
+  }
+  if (terminal) {
+    notify_terminal(observer, *terminal);
   }
   if (operation) {
     operation->cancel();
   }
-  call_ops->close(call);
+  rpc_call_ops->close();
   if (operation) {
     operation->when_send_idle(
-        [operation = std::move(operation), call_ops = std::move(call_ops), call] {
+        [operation = std::move(operation), rpc_call_ops = std::move(rpc_call_ops)] {
           operation->retire(Error::runtime(-ECANCELED, "async server call was abandoned"));
-          call_ops->release(call);
+          rpc_call_ops->release({});
         });
   } else {
-    call_ops->release(call);
+    rpc_call_ops->release({});
   }
 }
 
@@ -1179,32 +1918,33 @@ Task<Result<void>> ServerCallState::respond_owned(std::shared_ptr<ServerCallStat
                                                   std::vector<std::byte> body, Status status,
                                                   Metadata metadata) {
   if (self->kind_ != TREVRPC_RPC_KIND_UNARY && self->kind_ != TREVRPC_RPC_KIND_CLIENT_STREAMING) {
-    co_return Error::runtime(TREVRPC_ERR_UNSUPPORTED_RPC_KIND,
-                             "server call does not use a unary response");
+    co_return Error::runtime(-ENOTSUP, "server call does not use a unary response");
   }
-  trevrpc_call* call = nullptr;
-  std::shared_ptr<ServerCallOps> call_ops;
+  std::shared_ptr<RpcServerCallOps> rpc_call_ops;
   {
     std::lock_guard lock(self->mutex_);
-    call = self->call_;
-    call_ops = self->call_ops_;
+    rpc_call_ops = self->rpc_call_ops_;
   }
   std::weak_ptr<ServerCallState> weak = self;
-  NativeSendAction action = [call, call_ops = std::move(call_ops), status = std::move(status),
+  const StatusCode status_code = status.code();
+  NativeSendAction action = [rpc_call_ops = std::move(rpc_call_ops), status = std::move(status),
                              metadata = std::move(metadata),
-                             weak](trevrpc_stream*, std::span<const std::byte> encoded) noexcept {
-    if (call == nullptr) {
-      return -EALREADY;
+                             weak](std::span<const std::byte> encoded,
+                                   NativeCompletion completion) noexcept -> Result<void> {
+    if (!rpc_call_ops) {
+      return Error::runtime(-EALREADY);
     }
-    const int error = call_ops->respond(call, status, encoded, metadata);
-    if (auto state = weak.lock()) {
-      state->record_native_terminal_result(error);
-    }
-    return error;
+    return rpc_call_ops->start_respond(status, encoded, metadata,
+                                       [weak, completion = std::move(completion)](int error) {
+                                         if (auto state = weak.lock()) {
+                                           state->record_native_terminal_result(error);
+                                         }
+                                         completion(error);
+                                       });
   };
   const std::size_t encoded_size = body.size();
   co_return co_await self->terminal(
-      encoded_size,
+      status_code, encoded_size,
       [body = std::move(body)]() mutable {
         return Result<std::vector<std::byte>>(std::move(body));
       },
@@ -1218,35 +1958,80 @@ Task<Result<void>> ServerCallState::finish(Status status) {
 Task<Result<void>> ServerCallState::finish_owned(std::shared_ptr<ServerCallState> self,
                                                  Status status) {
   if (self->kind_ == TREVRPC_RPC_KIND_UNARY || self->kind_ == TREVRPC_RPC_KIND_CLIENT_STREAMING) {
-    co_return Error::runtime(TREVRPC_ERR_UNSUPPORTED_RPC_KIND,
-                             "server call requires a unary response");
+    co_return Error::runtime(-ENOTSUP, "server call requires a unary response");
   }
-  trevrpc_call* call = nullptr;
-  std::shared_ptr<ServerCallOps> call_ops;
+  std::shared_ptr<RpcServerCallOps> rpc_call_ops;
   {
     std::lock_guard lock(self->mutex_);
-    call = self->call_;
-    call_ops = self->call_ops_;
+    rpc_call_ops = self->rpc_call_ops_;
   }
   std::weak_ptr<ServerCallState> weak = self;
-  NativeSendAction action = [call, call_ops = std::move(call_ops), status = std::move(status),
-                             weak](trevrpc_stream*, std::span<const std::byte>) noexcept {
-    if (call == nullptr) {
-      return -EALREADY;
+  const StatusCode status_code = status.code();
+  NativeSendAction action = [rpc_call_ops = std::move(rpc_call_ops), status = std::move(status),
+                             weak](std::span<const std::byte>,
+                                   NativeCompletion completion) noexcept -> Result<void> {
+    if (!rpc_call_ops) {
+      return Error::runtime(-EALREADY);
     }
-    const int error = call_ops->finish(call, status);
-    if (auto state = weak.lock()) {
-      state->record_native_terminal_result(error);
-    }
-    return error;
+    return rpc_call_ops->start_finish(status,
+                                      [weak, completion = std::move(completion)](int error) {
+                                        if (auto state = weak.lock()) {
+                                          state->record_native_terminal_result(error);
+                                        }
+                                        completion(error);
+                                      });
   };
   co_return co_await self->terminal(
-      0, [] { return Result<std::vector<std::byte>>(std::vector<std::byte>{}); },
+      status_code, 0, [] { return Result<std::vector<std::byte>>(std::vector<std::byte>{}); },
       std::move(action));
 }
 
+void ServerCallState::set_terminal_observer(ServerCallTerminalObserver observer) noexcept {
+  if (!observer) {
+    return;
+  }
+  ServerCallTerminalObserver notify;
+  std::optional<ServerCallTerminal> terminal;
+  {
+    std::lock_guard lock(mutex_);
+    if (terminal_observer_called_ || terminal_observer_) {
+      return;
+    }
+    terminal_observer_ = std::move(observer);
+    claim_terminal_observer_locked(notify, terminal);
+  }
+  if (terminal) {
+    notify_terminal(notify, *terminal);
+  }
+}
+
+void ServerCallState::set_cleanup_observer(Work observer) noexcept {
+  if (!observer) {
+    return;
+  }
+  Work notify;
+  {
+    std::lock_guard lock(mutex_);
+    if (cleanup_observer_called_ || cleanup_observer_) {
+      return;
+    }
+    cleanup_observer_ = std::move(observer);
+    if (cleanup_completed_) {
+      cleanup_observer_called_ = true;
+      notify = std::move(cleanup_observer_);
+    }
+  }
+  if (notify) {
+    try {
+      notify();
+    } catch (...) {
+      (void)std::current_exception();
+    }
+  }
+}
+
 Task<Result<void>>
-ServerCallState::terminal(std::size_t encoded_size,
+ServerCallState::terminal(StatusCode status, std::size_t encoded_size,
                           std::function<Result<std::vector<std::byte>>()> serializer,
                           NativeSendAction action) {
   auto created_completion = make_completion<Result<void>>(operation_->continuation_executor());
@@ -1262,6 +2047,8 @@ ServerCallState::terminal(std::size_t encoded_size,
     terminal_waiters_.push_back(completion);
     if (terminal_phase_ == ServerTerminalPhase::Open && !final_selected_) {
       terminal_phase_ = ServerTerminalPhase::ApplicationPending;
+      selected_status_ = status;
+      selected_response_body_size_ = encoded_size;
       winner = true;
     } else if (terminal_phase_ == ServerTerminalPhase::Settled) {
       immediate_error = final_error_;
@@ -1276,7 +2063,7 @@ ServerCallState::terminal(std::size_t encoded_size,
     co_return co_await *completion;
   }
 
-  auto result = co_await operation_->send_action(encoded_size, std::move(serializer), {}, true,
+  auto result = co_await operation_->send_action(encoded_size, std::move(serializer), {}, false,
                                                  std::move(action));
   settle_application(std::move(result));
   co_return co_await *completion;
@@ -1298,6 +2085,8 @@ void ServerCallState::record_native_terminal_result(int error) noexcept {
 void ServerCallState::settle_application(Result<void> result) noexcept {
   std::vector<std::shared_ptr<AsyncCompletion<Result<void>>>> waiters;
   std::optional<Error> final_error;
+  ServerCallTerminalObserver observer;
+  std::optional<ServerCallTerminal> terminal;
   bool close_call = false;
   Error retire_reason = Error::runtime(-ECANCELED, "async server call completed");
   {
@@ -1314,10 +2103,18 @@ void ServerCallState::settle_application(Result<void> result) noexcept {
         }
       }
     }
+    terminal_result_ =
+        external_stop_
+            ? ServerCallTerminal{stop_status(*external_stop_), 0}
+            : ServerCallTerminal{selected_status_, result ? selected_response_body_size_ : 0};
+    claim_terminal_observer_locked(observer, terminal);
     publish_final_locked(waiters, final_error);
     if (final_error_) {
       retire_reason = *final_error_;
     }
+  }
+  if (terminal) {
+    notify_terminal(observer, *terminal);
   }
   cleanup_after_settlement(close_call, retire_reason);
   for (const auto& waiter : waiters) {
@@ -1328,6 +2125,8 @@ void ServerCallState::settle_application(Result<void> result) noexcept {
 void ServerCallState::settle_without_application(const Error& result) noexcept {
   std::vector<std::shared_ptr<AsyncCompletion<Result<void>>>> waiters;
   std::optional<Error> final_error;
+  ServerCallTerminalObserver observer;
+  std::optional<ServerCallTerminal> terminal;
   {
     std::lock_guard lock(mutex_);
     terminal_phase_ = ServerTerminalPhase::Settled;
@@ -1335,7 +2134,13 @@ void ServerCallState::settle_without_application(const Error& result) noexcept {
       final_selected_ = true;
       final_error_ = result;
     }
+    terminal_result_ =
+        ServerCallTerminal{external_stop_ ? stop_status(*external_stop_) : StatusCode::Unknown, 0};
+    claim_terminal_observer_locked(observer, terminal);
     publish_final_locked(waiters, final_error);
+  }
+  if (terminal) {
+    notify_terminal(observer, *terminal);
   }
   cleanup_after_settlement(false, result);
   for (const auto& waiter : waiters) {
@@ -1350,31 +2155,77 @@ void ServerCallState::publish_final_locked(
   error = final_error_;
 }
 
-void ServerCallState::cleanup_after_settlement(bool close_call, Error retire_reason) noexcept {
-  trevrpc_call* call = nullptr;
-  std::shared_ptr<OperationState> operation;
-  std::shared_ptr<ServerCallOps> call_ops;
+void ServerCallState::claim_terminal_observer_locked(
+    ServerCallTerminalObserver& observer, std::optional<ServerCallTerminal>& terminal) noexcept {
+  if (terminal_observer_called_ || !terminal_result_ || !terminal_observer_) {
+    return;
+  }
+  terminal_observer_called_ = true;
+  observer = std::move(terminal_observer_);
+  terminal = terminal_result_;
+}
+
+void ServerCallState::notify_terminal(const ServerCallTerminalObserver& observer,
+                                      ServerCallTerminal terminal) noexcept {
+  if (!observer) {
+    return;
+  }
+  try {
+    observer(terminal);
+  } catch (...) {
+    (void)std::current_exception();
+  }
+}
+
+void ServerCallState::finish_cleanup() noexcept {
+  Work observer;
   {
     std::lock_guard lock(mutex_);
-    if (pin_released_ || call_ == nullptr) {
+    cleanup_completed_ = true;
+    if (!cleanup_observer_called_ && cleanup_observer_) {
+      cleanup_observer_called_ = true;
+      observer = std::move(cleanup_observer_);
+    }
+  }
+  if (observer) {
+    try {
+      observer();
+    } catch (...) {
+      (void)std::current_exception();
+    }
+  }
+}
+
+void ServerCallState::cleanup_after_settlement(bool close_call, Error retire_reason) noexcept {
+  std::shared_ptr<OperationState> operation;
+  std::shared_ptr<RpcServerCallOps> rpc_call_ops;
+  {
+    std::lock_guard lock(mutex_);
+    if (pin_released_ || !rpc_call_ops_) {
       return;
     }
     pin_released_ = true;
-    call = std::exchange(call_, nullptr);
     operation = operation_;
-    call_ops = call_ops_;
+    rpc_call_ops = rpc_call_ops_;
   }
   if (close_call) {
-    call_ops->close(call);
+    rpc_call_ops->close();
   }
+  std::weak_ptr<ServerCallState> weak = weak_from_this();
+  Work completion = [weak] {
+    if (auto state = weak.lock()) {
+      state->finish_cleanup();
+    }
+  };
   if (operation) {
-    operation->when_send_idle([operation = std::move(operation), call_ops = std::move(call_ops),
-                               call, retire_reason = std::move(retire_reason)]() mutable {
-      operation->retire(retire_reason);
-      call_ops->release(call);
-    });
+    operation->when_send_idle(
+        [operation = std::move(operation), rpc_call_ops = std::move(rpc_call_ops),
+         retire_reason = std::move(retire_reason), completion = std::move(completion)]() mutable {
+          operation->retire(retire_reason);
+          rpc_call_ops->release(std::move(completion));
+        });
   } else {
-    call_ops->release(call);
+    rpc_call_ops->release(std::move(completion));
   }
 }
 
@@ -1392,10 +2243,23 @@ Error ServerCallState::stop_error(ServerStopReason reason) {
   return Error::runtime(-ECANCELED, "async server call was cancelled");
 }
 
+StatusCode ServerCallState::stop_status(ServerStopReason reason) noexcept {
+  switch (reason) {
+  case ServerStopReason::Deadline:
+    return StatusCode::DeadlineExceeded;
+  case ServerStopReason::PeerCancellation:
+  case ServerStopReason::LocalClose:
+  case ServerStopReason::ServerCancellation:
+    return StatusCode::Cancelled;
+  }
+  return StatusCode::Cancelled;
+}
+
 void ServerCallState::stop(ServerStopReason reason) noexcept {
   bool pending_application = false;
   bool settle_now = false;
-  trevrpc_call* call = nullptr;
+  std::shared_ptr<OperationState> operation;
+  std::shared_ptr<RpcServerCallOps> rpc_call_ops;
   const Error selected = stop_error(reason);
   {
     std::lock_guard lock(mutex_);
@@ -1407,10 +2271,32 @@ void ServerCallState::stop(ServerStopReason reason) noexcept {
     final_error_ = selected;
     pending_application = terminal_phase_ == ServerTerminalPhase::ApplicationPending;
     settle_now = terminal_phase_ == ServerTerminalPhase::Open;
-    call = call_;
+    operation = operation_;
+    rpc_call_ops = rpc_call_ops_;
+    pin_released_ = true;
   }
-  operation_->cancel();
-  call_ops_->close(call);
+  if (operation) {
+    operation->cancel();
+  }
+  if (rpc_call_ops) {
+    rpc_call_ops->close();
+    std::weak_ptr<ServerCallState> weak = weak_from_this();
+    Work completion = [weak] {
+      if (auto state = weak.lock()) {
+        state->finish_cleanup();
+      }
+    };
+    if (operation) {
+      operation->when_send_idle([operation = std::move(operation),
+                                 rpc_call_ops = std::move(rpc_call_ops), selected,
+                                 completion = std::move(completion)]() mutable {
+        operation->retire(selected);
+        rpc_call_ops->release(std::move(completion));
+      });
+    } else {
+      rpc_call_ops->release(std::move(completion));
+    }
+  }
   if (settle_now) {
     settle_without_application(selected);
   } else if (!pending_application) {
@@ -1495,11 +2381,10 @@ std::size_t ServerScope::active() const noexcept {
   return calls_.size();
 }
 
-std::shared_ptr<OperationState> create_operation(trevrpc_stream* stream,
-                                                 const std::shared_ptr<AsyncRuntime>& runtime,
+std::shared_ptr<OperationState> create_operation(const std::shared_ptr<AsyncRuntime>& runtime,
                                                  std::shared_ptr<NativeOps> native_ops,
                                                  std::optional<Deadline> deadline) {
-  return OperationState::create(stream, runtime, std::move(native_ops), deadline);
+  return OperationState::create(runtime, std::move(native_ops), deadline);
 }
 
 } // namespace trevrpc::detail

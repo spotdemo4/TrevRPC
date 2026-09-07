@@ -4,7 +4,6 @@
 
 #include <cassert>
 #include <chrono>
-#include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -183,10 +182,6 @@ int main() {
   assert(trevrpc::sync_wait(client_stream.value().requests.send(request("one"))));
   assert(trevrpc::sync_wait(client_stream.value().requests.send(request("two"))));
   auto client_response = trevrpc::sync_wait(client_stream.value().finish_and_receive());
-  if (!client_response) {
-    std::cerr << "client-streaming failure: " << client_response.error().code() << ": "
-              << client_response.error().message() << '\n';
-  }
   assert(client_response);
   assert(client_response.value().message.message() == "one,two");
   assert(client_response.value().metadata.get("response-key").has_value());

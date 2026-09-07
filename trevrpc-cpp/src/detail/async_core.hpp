@@ -2,18 +2,18 @@
 
 #include <trevrpc/async.hpp>
 
-#include "abi6_bridge.hpp"
 #include "lifecycle.hpp"
+#include "rpc_event_runtime.hpp"
 
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -115,6 +115,14 @@ private:
 template <typename T>
 void AsyncCompletion<T>::schedule(std::coroutine_handle<> continuation) noexcept {
   if (!continuation) {
+    std::optional<ExecutorReservation> reservation;
+    {
+      std::lock_guard lock(mutex_);
+      reservation = std::move(reservation_);
+    }
+    if (reservation) {
+      reservation->cancel();
+    }
     return;
   }
   if (!executor_ || executor_->running_in_this_executor()) {
@@ -157,52 +165,43 @@ private:
 
 class AsyncRuntimeState final {
 public:
-  AsyncRuntimeState(std::shared_ptr<Executor> continuation,
-                    std::shared_ptr<ThreadPoolExecutor> native_io, AsyncRuntimeOptions options);
-  ~AsyncRuntimeState();
+  AsyncRuntimeState(std::shared_ptr<Executor> continuation, AsyncRuntimeOptions options) noexcept;
+  ~AsyncRuntimeState() = default;
   AsyncRuntimeState(const AsyncRuntimeState&) = delete;
   AsyncRuntimeState& operator=(const AsyncRuntimeState&) = delete;
 
-  [[nodiscard]] Result<void> submit_native(Work work) noexcept;
-  [[nodiscard]] Result<void> schedule_at(Deadline deadline, Work work) noexcept;
   [[nodiscard]] std::shared_ptr<Executor> continuation() const noexcept { return continuation_; }
   [[nodiscard]] const AsyncRuntimeOptions& options() const noexcept { return options_; }
 
 private:
-  void timer_loop() noexcept;
-
   std::shared_ptr<Executor> continuation_;
-  std::shared_ptr<ThreadPoolExecutor> native_io_;
   AsyncRuntimeOptions options_;
-  std::mutex timer_mutex_;
-  std::condition_variable timer_condition_;
-  std::multimap<Deadline, Work> timers_;
-  bool timer_stop_ = false;
-  std::thread timer_thread_;
 };
+
+[[nodiscard]] std::shared_ptr<Executor> make_inline_executor();
+
+using NativeCompletion = std::function<void(int)>;
+using NativeReceiveCompletion = std::function<void(Result<StreamFrame>)>;
 
 class NativeOps {
 public:
   virtual ~NativeOps() = default;
-  [[nodiscard]] virtual int send(trevrpc_stream* stream,
-                                 std::span<const std::byte> body) noexcept = 0;
-  [[nodiscard]] virtual int finish_send(trevrpc_stream* stream) noexcept = 0;
-  [[nodiscard]] virtual Result<std::optional<StreamFrame>>
-  receive_ready_since(trevrpc_stream* stream, std::uint64_t wait_started) noexcept = 0;
-  virtual void cancel(trevrpc_stream* stream) noexcept = 0;
-  virtual void close(trevrpc_stream* stream) noexcept = 0;
+  [[nodiscard]] virtual Result<void> start_send(std::span<const std::byte> body,
+                                                NativeCompletion completion) noexcept = 0;
+  [[nodiscard]] virtual Result<void> start_finish_send(NativeCompletion completion) noexcept = 0;
+  [[nodiscard]] virtual Result<void> start_receive(NativeReceiveCompletion completion) noexcept = 0;
+  [[nodiscard]] virtual Result<void> schedule_at(Deadline deadline, Work work) noexcept = 0;
+  virtual void cancel() noexcept = 0;
+  [[nodiscard]] virtual Result<void> close() noexcept = 0;
 };
 
-using NativeSendAction = std::function<int(trevrpc_stream*, std::span<const std::byte>)>;
-
-[[nodiscard]] std::shared_ptr<NativeOps> production_native_ops();
+using NativeSendAction = std::function<Result<void>(std::span<const std::byte>, NativeCompletion)>;
 
 class OperationState final : public std::enable_shared_from_this<OperationState> {
 public:
   [[nodiscard]] static std::shared_ptr<OperationState>
-  create(trevrpc_stream* stream, const std::shared_ptr<AsyncRuntime>& runtime,
-         std::shared_ptr<NativeOps> native_ops, std::optional<Deadline> deadline,
-         std::shared_ptr<Cancellation> cancellation_bridge = {},
+  create(const std::shared_ptr<AsyncRuntime>& runtime, std::shared_ptr<NativeOps> native_ops,
+         std::optional<Deadline> deadline, std::shared_ptr<Cancellation> cancellation_bridge = {},
          std::shared_ptr<CancellationState> cancellation_state = {},
          std::uint64_t cancellation_registration = 0, bool terminal_stops_send = false);
   [[nodiscard]] static Task<Result<ByteResponse>> run_unary(std::shared_ptr<Channel> channel,
@@ -215,8 +214,8 @@ public:
                std::string service, std::string method, std::uint32_t kind,
                std::vector<std::byte> request, OwnedAsyncCallOptions options);
 
-  OperationState(trevrpc_stream* stream, std::shared_ptr<AsyncRuntimeState> runtime,
-                 std::shared_ptr<NativeOps> native_ops, std::optional<Deadline> deadline = {},
+  OperationState(std::shared_ptr<AsyncRuntimeState> runtime, std::shared_ptr<NativeOps> native_ops,
+                 std::optional<Deadline> deadline = {},
                  std::shared_ptr<Cancellation> cancellation_bridge = {},
                  std::shared_ptr<CancellationState> cancellation_state = {},
                  std::uint64_t cancellation_registration = 0, bool terminal_stops_send = false);
@@ -267,14 +266,12 @@ private:
   void finish_send_item(const std::shared_ptr<SendItem>& item, int error) noexcept;
   void admit_waiters_locked(std::vector<std::shared_ptr<SendWaiter>>& admitted);
   void timeout_waiter(const std::shared_ptr<SendWaiter>& waiter) noexcept;
-  void start_receive_attempt(std::shared_ptr<AsyncCompletion<Result<StreamFrame>>> completion,
-                             std::uint64_t wait_started, std::chrono::nanoseconds delay) noexcept;
   void settle_receive(const std::shared_ptr<AsyncCompletion<Result<StreamFrame>>>& completion,
                       Result<StreamFrame> result) noexcept;
   void finish_native_work() noexcept;
+  void close_native_once() noexcept;
   void collect_idle_callbacks_locked(std::vector<Work>& callbacks);
 
-  trevrpc_stream* stream_;
   std::shared_ptr<AsyncRuntimeState> runtime_;
   std::shared_ptr<NativeOps> native_ops_;
   std::optional<Deadline> deadline_;
@@ -296,9 +293,12 @@ private:
   std::vector<Work> send_idle_callbacks_;
   bool cancelled_ = false;
   bool closed_ = false;
+  bool native_close_in_progress_ = false;
+  std::size_t native_close_attempts_ = 0;
   bool send_sealed_ = false;
   bool send_cancelled_ = false;
   bool terminal_stops_send_ = false;
+  bool native_closed_ = false;
 };
 
 enum class ServerStopReason { Deadline, PeerCancellation, LocalClose, ServerCancellation };
@@ -312,29 +312,36 @@ struct ServerCallSnapshot {
   bool pin_released = false;
 };
 
-class ServerCallOps {
-public:
-  virtual ~ServerCallOps() = default;
-  [[nodiscard]] virtual int defer(trevrpc_call* call) noexcept = 0;
-  [[nodiscard]] virtual int retain(trevrpc_call* call) noexcept = 0;
-  virtual void release(trevrpc_call* call) noexcept = 0;
-  [[nodiscard]] virtual trevrpc_stream* stream(trevrpc_call* call) noexcept = 0;
-  [[nodiscard]] virtual int respond(trevrpc_call* call, const Status& status,
-                                    std::span<const std::byte> body,
-                                    const Metadata& metadata) noexcept = 0;
-  [[nodiscard]] virtual int finish(trevrpc_call* call, const Status& status) noexcept = 0;
-  virtual void cancel(trevrpc_call* call) noexcept = 0;
-  virtual void close(trevrpc_call* call) noexcept = 0;
+struct ServerCallTerminal {
+  StatusCode status = StatusCode::Unknown;
+  std::size_t response_body_size = 0;
 };
 
-[[nodiscard]] std::shared_ptr<ServerCallOps> production_server_call_ops();
+using ServerCallTerminalObserver = std::function<void(ServerCallTerminal)>;
+
+class RpcServerCallOps {
+public:
+  virtual ~RpcServerCallOps() = default;
+  virtual void release(Work completion) noexcept = 0;
+  [[nodiscard]] virtual Result<void> start_respond(const Status& status,
+                                                   std::span<const std::byte> body,
+                                                   const Metadata& metadata,
+                                                   NativeCompletion completion) noexcept = 0;
+  [[nodiscard]] virtual Result<void> start_finish(const Status& status,
+                                                  NativeCompletion completion) noexcept = 0;
+  virtual void cancel() noexcept = 0;
+  virtual void close() noexcept = 0;
+};
 
 class ServerCallState final : public std::enable_shared_from_this<ServerCallState> {
 public:
   [[nodiscard]] static Result<std::shared_ptr<ServerCallState>>
-  create(trevrpc_call* call, std::uint32_t kind, const std::shared_ptr<AsyncRuntime>& runtime,
-         const std::shared_ptr<ServerCallOps>& call_ops = production_server_call_ops(),
-         std::shared_ptr<NativeOps> stream_ops = {}, bool* deferred = nullptr);
+  create_rpc(RpcIncomingCall incoming, std::shared_ptr<RpcEventRuntime> rpc_runtime,
+             const std::shared_ptr<AsyncRuntime>& runtime, bool* accepted = nullptr);
+  [[nodiscard]] static Result<std::shared_ptr<ServerCallState>>
+  create_for_test(std::uint32_t kind, const std::shared_ptr<AsyncRuntime>& runtime,
+                  std::shared_ptr<RpcServerCallOps> call_ops,
+                  std::shared_ptr<NativeOps> stream_ops);
   ~ServerCallState();
   ServerCallState(const ServerCallState&) = delete;
   ServerCallState& operator=(const ServerCallState&) = delete;
@@ -342,38 +349,68 @@ public:
   [[nodiscard]] Task<Result<void>> respond(std::vector<std::byte> body, Status status,
                                            Metadata metadata = {});
   [[nodiscard]] Task<Result<void>> finish(Status status);
+  void set_terminal_observer(ServerCallTerminalObserver observer) noexcept;
+  void set_cleanup_observer(Work observer) noexcept;
   void stop(ServerStopReason reason) noexcept;
   [[nodiscard]] std::shared_ptr<OperationState> operation() const noexcept { return operation_; }
   [[nodiscard]] ServerCallSnapshot snapshot() const noexcept;
+  [[nodiscard]] const RpcIncomingCall* incoming() const noexcept {
+    return incoming_.has_value() ? &incoming_.value() : nullptr;
+  }
+  [[nodiscard]] std::span<const std::byte> initial_message() const noexcept {
+    return incoming_.has_value() ? std::span<const std::byte>(incoming_->initial_message)
+                                 : std::span<const std::byte>{};
+  }
+  [[nodiscard]] CallContext context() const;
+  [[nodiscard]] Result<std::optional<std::vector<std::byte>>> receive_message();
 
 private:
-  ServerCallState(trevrpc_call* call, std::uint32_t kind,
-                  std::shared_ptr<ServerCallOps> call_ops) noexcept;
+  friend class ServerCallStateTestPeer;
+
+  explicit ServerCallState(std::uint32_t kind) noexcept : kind_(kind) {}
+  static void test_fail_next_rpc_allocation() noexcept;
   [[nodiscard]] static Task<Result<void>> respond_owned(std::shared_ptr<ServerCallState> self,
                                                         std::vector<std::byte> body, Status status,
                                                         Metadata metadata);
   [[nodiscard]] static Task<Result<void>> finish_owned(std::shared_ptr<ServerCallState> self,
                                                        Status status);
   [[nodiscard]] Task<Result<void>>
-  terminal(std::size_t encoded_size, std::function<Result<std::vector<std::byte>>()> serializer,
-           NativeSendAction action);
+  terminal(StatusCode status, std::size_t encoded_size,
+           std::function<Result<std::vector<std::byte>>()> serializer, NativeSendAction action);
   void record_native_terminal_result(int error) noexcept;
   void settle_application(Result<void> result) noexcept;
   void settle_without_application(const Error& result) noexcept;
   void publish_final_locked(std::vector<std::shared_ptr<AsyncCompletion<Result<void>>>>& waiters,
                             std::optional<Error>& error) noexcept;
+  void claim_terminal_observer_locked(ServerCallTerminalObserver& observer,
+                                      std::optional<ServerCallTerminal>& terminal) noexcept;
+  static void notify_terminal(const ServerCallTerminalObserver& observer,
+                              ServerCallTerminal terminal) noexcept;
+  void finish_cleanup() noexcept;
   void cleanup_after_settlement(bool close_call, Error retire_reason) noexcept;
   [[nodiscard]] static Error stop_error(ServerStopReason reason);
+  [[nodiscard]] static StatusCode stop_status(ServerStopReason reason) noexcept;
 
-  trevrpc_call* call_ = nullptr;
   std::uint32_t kind_ = 0;
-  std::shared_ptr<ServerCallOps> call_ops_;
+  std::shared_ptr<RpcServerCallOps> rpc_call_ops_;
   std::shared_ptr<OperationState> operation_;
+  std::optional<RpcIncomingCall> incoming_;
+  std::shared_ptr<RpcEventRuntime> rpc_runtime_;
+  std::shared_ptr<void> rpc_call_owner_;
+  bool initial_message_consumed_ = false;
 
   mutable std::mutex mutex_;
   ServerTerminalPhase terminal_phase_ = ServerTerminalPhase::Open;
   std::optional<ServerStopReason> external_stop_;
   std::optional<Error> final_error_;
+  StatusCode selected_status_ = StatusCode::Unknown;
+  std::size_t selected_response_body_size_ = 0;
+  std::optional<ServerCallTerminal> terminal_result_;
+  ServerCallTerminalObserver terminal_observer_;
+  Work cleanup_observer_;
+  bool terminal_observer_called_ = false;
+  bool cleanup_completed_ = false;
+  bool cleanup_observer_called_ = false;
   bool final_selected_ = false;
   bool pin_released_ = false;
   std::vector<std::shared_ptr<AsyncCompletion<Result<void>>>> terminal_waiters_;
@@ -397,8 +434,7 @@ private:
 };
 
 [[nodiscard]] std::shared_ptr<OperationState>
-create_operation(trevrpc_stream* stream, const std::shared_ptr<AsyncRuntime>& runtime,
-                 std::shared_ptr<NativeOps> native_ops = production_native_ops(),
-                 std::optional<Deadline> deadline = {});
+create_operation(const std::shared_ptr<AsyncRuntime>& runtime,
+                 std::shared_ptr<NativeOps> native_ops, std::optional<Deadline> deadline = {});
 
 } // namespace trevrpc::detail

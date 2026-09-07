@@ -53,20 +53,14 @@ if(TREVRPC_C_FAMILY_C_ONLY)
   set(TREVRPC_BUILD_ENGINE_MSQUIC OFF CACHE BOOL "" FORCE)
   set(TREVRPC_BUILD_RPC ON CACHE BOOL "" FORCE)
   set(TREVRPC_BUILD_RPC_MSQUIC OFF CACHE BOOL "" FORCE)
-  set(TREVRPC_BUILD_RUNTIME OFF CACHE BOOL "" FORCE)
-  set(TREVRPC_BUILD_MSQUIC OFF CACHE BOOL "" FORCE)
-  set(TREVRPC_BUILD_WEBTRANSPORT OFF CACHE BOOL "" FORCE)
 else()
-  # The sibling C++ peer temporarily links ABI 6 and RPC ABI 1 during migration.
+  # The C++ peer uses RPC ABI 1 and the canonical MsQuic RPC provider.
   set(TREVRPC_BUILD_ENGINE ON CACHE BOOL "" FORCE)
   set(TREVRPC_BUILD_ENGINE_MSQUIC ON CACHE BOOL "" FORCE)
   set(TREVRPC_BUILD_TRANSPORT ON CACHE BOOL "" FORCE)
   set(TREVRPC_BUILD_TRANSPORT_MSQUIC ON CACHE BOOL "" FORCE)
   set(TREVRPC_BUILD_RPC ON CACHE BOOL "" FORCE)
   set(TREVRPC_BUILD_RPC_MSQUIC ON CACHE BOOL "" FORCE)
-  set(TREVRPC_BUILD_RUNTIME ON CACHE BOOL "" FORCE)
-  set(TREVRPC_BUILD_MSQUIC ON CACHE BOOL "" FORCE)
-  set(TREVRPC_BUILD_WEBTRANSPORT ON CACHE BOOL "" FORCE)
 endif()
 add_subdirectory("${TREVRPC_C_FAMILY_C_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/trevrpc-c")
 
@@ -96,6 +90,24 @@ if(NOT TREVRPC_C_FAMILY_C_ONLY)
   target_link_libraries(cf_state_payload PUBLIC protobuf::libprotobuf)
   cf_cpp_warnings(cf_state_payload)
   cf_sanitizers(cf_state_payload)
+
+  add_library(cf_cpp_rpc_harness STATIC
+    cpp_rpc_harness.cpp
+    cpp_rpc_harness_support.c
+    "${TREVRPC_C_FAMILY_CPP_ROOT}/tests/rpc_event_runtime_fake_fixture.c")
+  target_include_directories(cf_cpp_rpc_harness
+    PUBLIC
+      "${CMAKE_CURRENT_SOURCE_DIR}"
+      "${TREVRPC_C_FAMILY_C_ROOT}/src"
+    PRIVATE
+      "${TREVRPC_C_FAMILY_C_ROOT}/tests"
+      "${TREVRPC_C_FAMILY_CPP_ROOT}/src"
+      "${TREVRPC_C_FAMILY_CPP_ROOT}/tests")
+  target_link_libraries(cf_cpp_rpc_harness PUBLIC trevrpc_cpp)
+  target_link_libraries(cf_cpp_rpc_harness PRIVATE
+    trevrpc_rpc_fake_transport_support)
+  cf_cpp_warnings(cf_cpp_rpc_harness)
+  cf_sanitizers(cf_cpp_rpc_harness)
 endif()
 
 add_library(cf_common STATIC protocol.c operations.c)
@@ -121,12 +133,11 @@ if(NOT TREVRPC_C_FAMILY_C_ONLY)
   add_executable(trevrpc_conformance_cpp cpp_main.cpp cpp_state.cpp)
   set_target_properties(trevrpc_conformance_cpp PROPERTIES OUTPUT_NAME "trevrpc-conformance-cpp")
   target_include_directories(trevrpc_conformance_cpp PRIVATE
-    "${TREVRPC_C_FAMILY_C_ROOT}/src"
     "${cf_generated_dir}")
   target_link_libraries(trevrpc_conformance_cpp PRIVATE
     cf_common
-    cf_state_payload
-    trevrpc_cpp)
+    cf_cpp_rpc_harness
+    cf_state_payload)
   cf_cpp_warnings(trevrpc_conformance_cpp)
   cf_sanitizers(trevrpc_conformance_cpp)
 endif()
@@ -150,11 +161,10 @@ if(BUILD_TESTING)
 
     add_executable(trevrpc_conformance_cpp_stream_test tests/cpp_stream_test.cpp)
     target_include_directories(trevrpc_conformance_cpp_stream_test PRIVATE
-      "${TREVRPC_C_FAMILY_C_ROOT}/src"
       "${cf_generated_dir}")
     target_link_libraries(trevrpc_conformance_cpp_stream_test PRIVATE
-      cf_state_payload
-      trevrpc_cpp)
+      cf_cpp_rpc_harness
+      cf_state_payload)
     cf_cpp_warnings(trevrpc_conformance_cpp_stream_test)
     cf_sanitizers(trevrpc_conformance_cpp_stream_test)
     add_test(NAME trevrpc_conformance_cpp_stream

@@ -1,81 +1,25 @@
 #include "generator.trevrpc.hpp"
 
+#include <trevrpc/callbacks.hpp>
 #include <trevrpc/trevrpc.hpp>
 
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace fixture = trevrpc::cpp::test::v1;
 namespace common = trevrpc::cpp::test::common;
 using namespace std::chrono_literals;
 
 constexpr std::size_t kStreamMessageCount = 128;
-
-struct InboundResponseDeleter {
-  void operator()(trevrpc_inbound_response* response) const noexcept {
-    trevrpc_inbound_response_release(response);
-  }
-};
-
-struct InboundFrameDeleter {
-  void operator()(trevrpc_inbound_stream_frame* frame) const noexcept {
-    trevrpc_inbound_stream_frame_release(frame);
-  }
-};
-
-using InboundResponse = std::unique_ptr<trevrpc_inbound_response, InboundResponseDeleter>;
-using InboundFrame = std::unique_ptr<trevrpc_inbound_stream_frame, InboundFrameDeleter>;
-
-int raw_call_options(trevrpc_call_options_v1* options) {
-  const int error = trevrpc_call_options_v1_init(options, sizeof(*options));
-  if (error == 0) {
-    options->request_body_lifetime = TREVRPC_REQUEST_BODY_BORROW_UNTIL_RETURN;
-  }
-  return error;
-}
-
-trevrpc_request raw_request(std::string_view service, std::string_view method, std::uint32_t kind,
-                            const std::uint8_t* body, std::size_t body_len) {
-  trevrpc_request request{};
-  request.service = service.data();
-  request.service_len = service.size();
-  request.method = method.data();
-  request.method_len = method.size();
-  request.body = body;
-  request.body_len = body_len;
-  request.kind = kind;
-  request.version = TREVRPC_WIRE_VERSION;
-  return request;
-}
-
-int raw_unary(trevrpc_channel* channel, std::string_view service, std::string_view method,
-              const std::uint8_t* body, std::size_t body_len, trevrpc_inbound_response** response) {
-  trevrpc_call_options_v1 options{};
-  const int error = raw_call_options(&options);
-  if (error != 0) {
-    return error;
-  }
-  const trevrpc_request request =
-      raw_request(service, method, TREVRPC_RPC_KIND_UNARY, body, body_len);
-  return trevrpc_channel_call_request_inbound_v1(channel, &request, &options, response);
-}
-
-int raw_start_stream(trevrpc_channel* channel, std::string_view service, std::string_view method,
-                     std::uint32_t kind, const std::uint8_t* body, std::size_t body_len,
-                     trevrpc_stream** stream) {
-  trevrpc_call_options_v1 options{};
-  const int error = raw_call_options(&options);
-  if (error != 0) {
-    return error;
-  }
-  const trevrpc_request request = raw_request(service, method, kind, body, body_len);
-  return trevrpc_channel_start_stream_request_v1(channel, &request, &options, stream);
-}
 
 fixture::Outer::Request make_request(const std::string& name) {
   fixture::Outer::Request request;
@@ -109,6 +53,59 @@ std::string join_messages(const std::vector<std::string>& messages) {
   return joined;
 }
 
+class SelectiveAuthorizer final : public trevrpc::Authorizer {
+public:
+  trevrpc::Status authorize(const trevrpc::CallContext&,
+                            const trevrpc::AuthorizationRequest& request) override {
+    if (request.service == "denied.Service") {
+      return trevrpc::Status(trevrpc::StatusCode::PermissionDenied, "denied by authorizer");
+    }
+    return trevrpc::Status::ok();
+  }
+};
+
+class RecordingMetrics final : public trevrpc::MetricsObserver {
+public:
+  void rpc_started(const trevrpc::RpcStartedEvent& event) override {
+    {
+      std::lock_guard lock(mutex_);
+      started_.push_back(event);
+    }
+    condition_.notify_all();
+  }
+
+  void rpc_finished(const trevrpc::RpcFinishedEvent& event) override {
+    {
+      std::lock_guard lock(mutex_);
+      finished_.push_back(event);
+    }
+    condition_.notify_all();
+  }
+
+  [[nodiscard]] std::size_t started_count() const {
+    std::lock_guard lock(mutex_);
+    return started_.size();
+  }
+
+  [[nodiscard]] std::size_t finished_count() const {
+    std::lock_guard lock(mutex_);
+    return finished_.size();
+  }
+
+  trevrpc::RpcFinishedEvent wait_for_finished(std::size_t count) {
+    std::unique_lock lock(mutex_);
+    const bool completed = condition_.wait_for(lock, 5s, [&] { return finished_.size() >= count; });
+    assert(completed);
+    return finished_[count - 1];
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  std::vector<trevrpc::RpcStartedEvent> started_;
+  std::vector<trevrpc::RpcFinishedEvent> finished_;
+};
+
 class FixtureService final : public fixture::FixtureService {
 public:
   trevrpc::Result<trevrpc::Response<common::ImportedReply>>
@@ -140,7 +137,7 @@ public:
     }
     if (request.name() == "invalid-metadata") {
       trevrpc::Metadata metadata;
-      metadata.set(std::string(TREVRPC_MAX_METADATA_KEY_LEN + 1, 'x'), "invalid");
+      metadata.set(std::string(trevrpc::Metadata::max_key_size + 1, 'x'), "invalid");
       return trevrpc::Status(trevrpc::StatusCode::PermissionDenied, "invalid metadata",
                              std::move(metadata));
     }
@@ -233,6 +230,9 @@ int main() {
   auto listening = trevrpc::Server::listen(server_config);
   assert(listening);
   trevrpc::Server server = std::move(listening).value();
+  auto metrics = std::make_shared<RecordingMetrics>();
+  assert(server.set_authorizer(std::make_shared<SelectiveAuthorizer>()));
+  assert(server.set_metrics(metrics));
   auto registered = fixture::RegisterFixture(server, std::make_shared<FixtureService>());
   assert(registered);
   auto port = server.port();
@@ -252,10 +252,39 @@ int main() {
 
   fixture::Outer::Request request;
   request.set_name("unary");
+  const std::size_t unary_started_before = metrics->started_count();
+  const std::size_t unary_finished_before = metrics->finished_count();
   auto unary = client.Unary(request);
   assert(unary);
   assert(unary.value().message.message() == "hello, unary");
   assert(unary.value().metadata.get("response-key").has_value());
+  const auto unary_metrics = metrics->wait_for_finished(unary_finished_before + 1);
+  assert(metrics->started_count() == unary_started_before + 1);
+  assert(unary_metrics.service == "trevrpc.cpp.test.v1.Fixture");
+  assert(unary_metrics.method == "Unary");
+  assert(unary_metrics.request_body_size == request.ByteSizeLong());
+  assert(unary_metrics.response_body_size == unary.value().message.ByteSizeLong());
+  assert(unary_metrics.status == trevrpc::StatusCode::Ok);
+  assert(unary_metrics.elapsed >= 0ns);
+  std::this_thread::sleep_for(10ms);
+  assert(metrics->finished_count() == unary_finished_before + 1);
+
+  const std::byte denied_body[] = {std::byte{1}, std::byte{2}, std::byte{3}};
+  const std::size_t denied_started_before = metrics->started_count();
+  const std::size_t denied_finished_before = metrics->finished_count();
+  auto denied_response = channel->call_unary("denied.Service", "Method", denied_body, {});
+  assert(denied_response);
+  assert(denied_response.value().status.code() == trevrpc::StatusCode::PermissionDenied);
+  const auto denied_metrics = metrics->wait_for_finished(denied_finished_before + 1);
+  assert(metrics->started_count() == denied_started_before + 1);
+  assert(denied_metrics.service == "denied.Service");
+  assert(denied_metrics.method == "Method");
+  assert(denied_metrics.request_body_size == std::size(denied_body));
+  assert(denied_metrics.response_body_size == 0);
+  assert(denied_metrics.status == trevrpc::StatusCode::PermissionDenied);
+  assert(denied_metrics.elapsed >= 0ns);
+  std::this_thread::sleep_for(10ms);
+  assert(metrics->finished_count() == denied_finished_before + 1);
 
   request.set_name("metadata");
   trevrpc::CallOptions metadata_options;
@@ -270,18 +299,11 @@ int main() {
   assert(thrown.error().status().has_value());
   assert(thrown.error().status().value().code() == trevrpc::StatusCode::Internal);
 
-  const std::uint8_t malformed_body[] = {0xff};
-  trevrpc_inbound_response* raw_malformed_response = nullptr;
-  const int malformed_error =
-      raw_unary(channel->native_handle(), "trevrpc.cpp.test.v1.Fixture", "Unary", malformed_body,
-                sizeof(malformed_body), &raw_malformed_response);
-  InboundResponse malformed_response(raw_malformed_response);
-  assert(malformed_error == 0);
-  assert(malformed_response != nullptr);
-  std::uint32_t malformed_status = TREVRPC_STATUS_UNKNOWN;
-  assert(trevrpc_inbound_response_get_status(malformed_response.get(), &malformed_status) == 0);
-  assert(malformed_status == TREVRPC_STATUS_INVALID_ARGUMENT);
-  malformed_response.reset();
+  const std::byte malformed_body[] = {std::byte{0xff}};
+  auto malformed_response = channel->call_unary("trevrpc.cpp.test.v1.Fixture", "Unary",
+                                                std::span<const std::byte>(malformed_body), {});
+  assert(malformed_response);
+  assert(malformed_response.value().status.code() == trevrpc::StatusCode::InvalidArgument);
 
   request.set_name("server");
   auto server_stream = client.ServerStreaming(request);
@@ -319,10 +341,6 @@ int main() {
   assert(negative_timeout.error().kind() == trevrpc::Error::Kind::Runtime);
   assert(!channel->wait_ready(-1ns));
 
-  trevrpc::ServerOptions negative_server_options;
-  negative_server_options.stream_idle_timeout = -1ns;
-  assert(!server.set_options(negative_server_options));
-
   auto client_stream = client.ClientStreaming();
   assert(client_stream);
   const auto client_messages = indexed_messages("client-");
@@ -334,49 +352,27 @@ int main() {
   assert(client_stream_response.value().message.message() == join_messages(client_messages));
   assert(client_stream_response.value().metadata.get("response-key").has_value());
 
-  trevrpc_stream* status_terminated_stream = nullptr;
-  assert(raw_start_stream(channel->native_handle(), "trevrpc.cpp.test.v1.Fixture",
-                          "ClientStreaming", TREVRPC_RPC_KIND_CLIENT_STREAMING, nullptr, 0,
-                          &status_terminated_stream) == 0);
-  const std::string status_terminated_body = make_request("status-terminated").SerializeAsString();
-  assert(trevrpc_stream_send_message_copy_wait(
-             status_terminated_stream,
-             reinterpret_cast<const std::uint8_t*>(status_terminated_body.data()),
-             status_terminated_body.size()) == 0);
-  assert(trevrpc_stream_send_status(status_terminated_stream, TREVRPC_STATUS_OK, nullptr, 0) == 0);
-  assert(trevrpc_stream_finish_send(status_terminated_stream) == 0);
-
-  trevrpc_inbound_stream_frame* raw_status_terminated_response = nullptr;
-  assert(trevrpc_stream_recv_inbound(status_terminated_stream, &raw_status_terminated_response) ==
-         0);
-  InboundFrame status_terminated_response(raw_status_terminated_response);
-  assert(status_terminated_response != nullptr);
-  std::uint32_t response_kind = 0;
-  assert(trevrpc_inbound_stream_frame_get_kind(status_terminated_response.get(), &response_kind) ==
-         0);
-  assert(response_kind == TREVRPC_STREAM_FRAME_KIND_MESSAGE);
-  trevrpc_bytes_view response_body{};
-  assert(trevrpc_inbound_stream_frame_get_body(status_terminated_response.get(), &response_body) ==
-         0);
+  auto status_terminated_stream = channel->start_stream(
+      "trevrpc.cpp.test.v1.Fixture", "ClientStreaming", TREVRPC_RPC_KIND_CLIENT_STREAMING, {}, {});
+  assert(status_terminated_stream);
+  const auto status_terminated_body = trevrpc::detail::serialize(make_request("status-terminated"));
+  assert(status_terminated_body);
+  assert(status_terminated_stream.value().send(status_terminated_body.value()));
+  assert(status_terminated_stream.value().finish_send());
+  auto status_terminated_message = status_terminated_stream.value().receive();
+  assert(status_terminated_message);
+  assert(!status_terminated_message.value().terminal);
+  assert(status_terminated_message.value().message);
   common::ImportedReply status_terminated_reply;
-  assert(status_terminated_reply.ParseFromArray(response_body.data,
-                                                static_cast<int>(response_body.len)));
+  assert(status_terminated_reply.ParseFromArray(
+      status_terminated_message.value().body.data(),
+      static_cast<int>(status_terminated_message.value().body.size())));
   assert(status_terminated_reply.message() == "status-terminated");
-
-  raw_status_terminated_response = nullptr;
-  assert(trevrpc_stream_recv_inbound(status_terminated_stream, &raw_status_terminated_response) ==
-         0);
-  status_terminated_response.reset(raw_status_terminated_response);
-  assert(status_terminated_response != nullptr);
-  assert(trevrpc_inbound_stream_frame_get_kind(status_terminated_response.get(), &response_kind) ==
-         0);
-  assert(response_kind == TREVRPC_STREAM_FRAME_KIND_STATUS);
-  std::uint32_t response_status = TREVRPC_STATUS_UNKNOWN;
-  assert(trevrpc_inbound_stream_frame_get_status(status_terminated_response.get(),
-                                                 &response_status) == 0);
-  assert(response_status == TREVRPC_STATUS_OK);
-  status_terminated_response.reset();
-  trevrpc_stream_close(status_terminated_stream);
+  auto status_terminated_response = status_terminated_stream.value().receive();
+  assert(status_terminated_response);
+  assert(status_terminated_response.value().terminal);
+  assert(!status_terminated_response.value().message);
+  assert(status_terminated_response.value().status.is_ok());
 
   auto bidi = client.BidirectionalStreaming();
   assert(bidi);
@@ -392,10 +388,30 @@ int main() {
   }
   expect_messages(bidi.value(), bidi_responses);
 
-  channel->close();
+  request.set_name("stress");
+  auto live_stream_result = client.ServerStreaming(request);
+  assert(live_stream_result);
+  auto live_stream = std::move(live_stream_result).value();
+  auto close_future = std::async(std::launch::async, [&] {
+    channel->close();
+    return true;
+  });
+  assert(close_future.wait_for(2s) == std::future_status::ready);
+  assert(close_future.get());
+  auto rejected_call = client.Unary(request);
+  assert(!rejected_call);
+  live_stream.close();
+
   channel.reset();
   assert(server.request_stop());
   server_thread.join();
   assert(serve_result);
+  trevrpc::ShutdownOptions shutdown_options;
+  shutdown_options.graceful_timeout = 0ns;
+  shutdown_options.cancellation_timeout = 5s;
+  auto shutdown = server.shutdown(shutdown_options);
+  assert(shutdown);
+  assert(shutdown.value().released);
+  assert(metrics->finished_count() == metrics->started_count());
   return 0;
 }

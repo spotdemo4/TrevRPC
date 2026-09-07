@@ -1,8 +1,6 @@
 #include "common.pb.h"
 #include "generator.pb.h"
 
-#include "detail/rpc_client.hpp"
-
 #include <trevrpc/trevrpc.hpp>
 
 #include <cassert>
@@ -63,10 +61,9 @@ int main() {
 
   trevrpc::ChannelConfig client_config;
   client_config.skip_certificate_validation = true;
-  auto connected =
-      trevrpc::detail::RpcSyncClient::connect("127.0.0.1", port.value(), client_config);
+  auto connected = trevrpc::Channel::connect("127.0.0.1", port.value(), client_config);
   assert(connected);
-  std::unique_ptr<trevrpc::detail::RpcSyncClient> client = std::move(connected).value();
+  auto client = std::move(connected).value();
 
   fixture::Outer::Request request;
   request.set_name("foundation");
@@ -75,8 +72,7 @@ int main() {
   trevrpc::CallOptions options;
   options.metadata.set("request-key", "request-value");
   options.metadata.set("empty-request", std::span<const std::byte>{});
-  auto response = client->call_unary("trevrpc.cpp.test.v1.Fixture", "Unary", request_body,
-                                     options);
+  auto response = client->call_unary("trevrpc.cpp.test.v1.Fixture", "Unary", request_body, options);
   assert(response);
   assert(response.value().status.is_ok());
   const auto response_metadata = response.value().metadata.get("response-key");
@@ -95,11 +91,10 @@ int main() {
   fixture::Outer::Request blocked_request;
   blocked_request.set_name("blocked");
   std::vector<std::byte> blocked_body(blocked_request.ByteSizeLong());
-  assert(blocked_request.SerializeToArray(
-      blocked_body.data(), static_cast<int>(blocked_body.size())));
+  assert(
+      blocked_request.SerializeToArray(blocked_body.data(), static_cast<int>(blocked_body.size())));
   auto blocked_call = std::async(std::launch::async, [&] {
-    return client->call_unary(
-        "trevrpc.cpp.test.v1.Fixture", "Unary", blocked_body, options);
+    return client->call_unary("trevrpc.cpp.test.v1.Fixture", "Unary", blocked_body, options);
   });
   {
     std::unique_lock lock(handler_mutex);
@@ -109,7 +104,8 @@ int main() {
   auto close_entered = close_started.get_future();
   auto concurrent_close = std::async(std::launch::async, [&] {
     close_started.set_value();
-    return client->close();
+    client->close();
+    return true;
   });
   close_entered.wait();
   {

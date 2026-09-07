@@ -1,9 +1,9 @@
 #include "operations.h"
 
-#include "trevrpc.h"
 #include "trevrpc_frame_internal.h"
 #include "trevrpc_rpc.h"
-#include "trevrpc_wire_abi6_internal.h"
+#include "trevrpc_values_internal.h"
+#include "trevrpc_wire_internal.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -61,12 +61,12 @@ static int cf_native_metadata(const cf_metadata *source,
                               trevrpc_metadata *target) {
   memset(target, 0, sizeof(*target));
   for (size_t i = 0; i < source->count; i++) {
-    int error = trevrpc_metadata_set(
+    int error = trevrpc_internal_metadata_set(
         target, (const char *)source->entries[i].key.data,
         source->entries[i].key.len, source->entries[i].value.data,
         source->entries[i].value.len);
     if (error != 0) {
-      trevrpc_metadata_reset(target);
+      trevrpc_internal_metadata_reset(target);
       return error;
     }
   }
@@ -124,7 +124,7 @@ static int cf_encode_message(const cf_message *message, size_t max_frame_size,
         stream_frame->body.data, stream_frame->body.len, &metadata,
         max_frame_size, frame, frame_len);
   }
-  trevrpc_metadata_reset(&metadata);
+  trevrpc_internal_metadata_reset(&metadata);
   if (native_error != 0) {
     cf_classify_wire_error(message->type, native_error,
                            TREVRPC_WIRE_DIAGNOSTIC_NONE, error);
@@ -159,7 +159,7 @@ static int cf_codec_encode(const cf_command *command, cf_json *payload,
 }
 
 static void cf_append_request(cf_json *payload,
-                              const trevrpc_request *request) {
+                              const trevrpc_wire_request_values *request) {
   cf_json_append(payload,
                  ",\"message\":{\"type\":\"rpc_request\",\"service_hex\":");
   cf_json_append_hex(payload, (const uint8_t *)request->service,
@@ -178,113 +178,6 @@ static void cf_append_request(cf_json *payload,
   cf_json_append(payload, ",\"timeout_nanos\":");
   cf_json_append_u64_string(payload, request->timeout_nanos);
   cf_json_append_char(payload, '}');
-}
-
-typedef size_t (*cf_inbound_metadata_count_fn)(const void *value);
-typedef int (*cf_inbound_metadata_at_fn)(const void *value, size_t index,
-                                         trevrpc_bytes_view *key,
-                                         trevrpc_bytes_view *entry_value);
-
-static size_t cf_inbound_response_metadata_count(const void *value) {
-  return trevrpc_inbound_response_metadata_count(value);
-}
-
-static int cf_inbound_response_metadata_at(const void *value, size_t index,
-                                           trevrpc_bytes_view *key,
-                                           trevrpc_bytes_view *entry_value) {
-  return trevrpc_inbound_response_metadata_at(value, index, key, entry_value);
-}
-
-static size_t cf_inbound_stream_frame_metadata_count(const void *value) {
-  return trevrpc_inbound_stream_frame_metadata_count(value);
-}
-
-static int
-cf_inbound_stream_frame_metadata_at(const void *value, size_t index,
-                                    trevrpc_bytes_view *key,
-                                    trevrpc_bytes_view *entry_value) {
-  return trevrpc_inbound_stream_frame_metadata_at(value, index, key,
-                                                  entry_value);
-}
-
-static int cf_copy_inbound_metadata(const void *value,
-                                    cf_inbound_metadata_count_fn count_fn,
-                                    cf_inbound_metadata_at_fn at_fn,
-                                    trevrpc_metadata *metadata) {
-  memset(metadata, 0, sizeof(*metadata));
-  size_t count = count_fn(value);
-  for (size_t i = 0; i < count; i++) {
-    trevrpc_bytes_view key = {0};
-    trevrpc_bytes_view entry_value = {0};
-    int error = at_fn(value, i, &key, &entry_value);
-    if (error == 0) {
-      error = trevrpc_metadata_set(metadata, (const char *)key.data, key.len,
-                                   entry_value.data, entry_value.len);
-    }
-    if (error != 0) {
-      trevrpc_metadata_reset(metadata);
-      return error;
-    }
-  }
-  return 0;
-}
-
-static int cf_inbound_response_values(const trevrpc_inbound_response *response,
-                                      trevrpc_wire_response_values *values) {
-  memset(values, 0, sizeof(*values));
-  trevrpc_bytes_view message = {0};
-  trevrpc_bytes_view body = {0};
-  int error = trevrpc_inbound_response_get_status(response, &values->status);
-  if (error == 0) {
-    error = trevrpc_inbound_response_get_message(response, &message);
-  }
-  if (error == 0) {
-    error = trevrpc_inbound_response_get_body(response, &body);
-  }
-  if (error == 0) {
-    error = cf_copy_inbound_metadata(
-        response, cf_inbound_response_metadata_count,
-        cf_inbound_response_metadata_at, &values->metadata);
-  }
-  if (error != 0) {
-    return error;
-  }
-  values->message = (char *)message.data;
-  values->message_len = message.len;
-  values->body.data = body.data;
-  values->body.len = body.len;
-  return 0;
-}
-
-static int
-cf_inbound_stream_frame_values(const trevrpc_inbound_stream_frame *frame,
-                               trevrpc_wire_stream_frame_values *values) {
-  memset(values, 0, sizeof(*values));
-  trevrpc_bytes_view message = {0};
-  trevrpc_bytes_view body = {0};
-  int error = trevrpc_inbound_stream_frame_get_kind(frame, &values->kind);
-  if (error == 0) {
-    error = trevrpc_inbound_stream_frame_get_status(frame, &values->status);
-  }
-  if (error == 0) {
-    error = trevrpc_inbound_stream_frame_get_message(frame, &message);
-  }
-  if (error == 0) {
-    error = trevrpc_inbound_stream_frame_get_body(frame, &body);
-  }
-  if (error == 0) {
-    error = cf_copy_inbound_metadata(
-        frame, cf_inbound_stream_frame_metadata_count,
-        cf_inbound_stream_frame_metadata_at, &values->metadata);
-  }
-  if (error != 0) {
-    return error;
-  }
-  values->message = (char *)message.data;
-  values->message_len = message.len;
-  values->body.data = body.data;
-  values->body.len = body.len;
-  return 0;
 }
 
 static void cf_append_response(cf_json *payload,
@@ -335,7 +228,7 @@ static int cf_codec_decode(const cf_command *command, cf_json *payload,
   trevrpc_wire_diagnostic_reason reason = TREVRPC_WIRE_DIAGNOSTIC_NONE;
 
   if (command->message_type == CF_MESSAGE_REQUEST) {
-    trevrpc_request request = {0};
+    trevrpc_wire_request_values request = {0};
     trevrpc_wire_request_diagnostic diagnostic = {0};
     native_error = trevrpc_wire_decode_request_diagnostic(
         body->data, body->len, &request, &diagnostic);
@@ -351,64 +244,39 @@ static int cf_codec_decode(const cf_command *command, cf_json *payload,
     if (native_error == 0) {
       cf_append_request(payload, &request);
     }
-    trevrpc_request_reset(&request);
+    trevrpc_internal_request_reset(&request);
   } else if (command->message_type == CF_MESSAGE_RESPONSE) {
-    trevrpc_owned_bytes owned = {
-        .data = body->data,
-        .len = body->len,
-    };
-    trevrpc_inbound_response *response = NULL;
-    native_error = trevrpc_wire_decode_response_owned(&owned, &response);
-    if (native_error != 0) {
-      trevrpc_wire_response_values *diagnostic_response = NULL;
-      trevrpc_wire_diagnostic diagnostic = {0};
-      (void)trevrpc_wire_decode_response_diagnostic(
-          body->data, body->len, &diagnostic_response, &diagnostic);
-      reason = diagnostic.reason;
-      trevrpc_internal_response_free(diagnostic_response);
-    }
-    trevrpc_wire_response_values values = {0};
-    if (native_error == 0) {
-      native_error = cf_inbound_response_values(response, &values);
-    }
+    trevrpc_wire_response_values *response = NULL;
+    trevrpc_wire_diagnostic diagnostic = {0};
+    native_error = trevrpc_wire_decode_response_diagnostic(
+        body->data, body->len, &response, &diagnostic);
+    reason = diagnostic.reason;
     if (native_error == 0) {
       native_error = trevrpc_wire_encode_response(
-          &values, TREVRPC_RPC_DEFAULT_MAX_MESSAGE_SIZE, &canonical_frame,
+          response, TREVRPC_RPC_DEFAULT_MAX_MESSAGE_SIZE, &canonical_frame,
           &canonical_frame_len);
     }
     if (native_error == 0) {
-      cf_append_response(payload, &values);
+      cf_append_response(payload, response);
     }
-    trevrpc_metadata_reset(&values.metadata);
-    trevrpc_inbound_response_release(response);
-    trevrpc_owned_bytes_reset(&owned);
+    trevrpc_internal_response_free(response);
   } else {
-    trevrpc_owned_bytes owned = {
-        .data = body->data,
-        .len = body->len,
-    };
-    trevrpc_inbound_stream_frame *frame = NULL;
+    trevrpc_wire_stream_frame_values *frame = NULL;
     trevrpc_wire_diagnostic diagnostic = {0};
-    native_error = trevrpc_wire_decode_stream_frame_owned_diagnostic(
-        &owned, &frame, &diagnostic);
+    native_error = trevrpc_wire_decode_stream_frame_diagnostic(
+        body->data, body->len, &frame, &diagnostic);
     reason = diagnostic.reason;
-    trevrpc_wire_stream_frame_values values = {0};
-    if (native_error == 0) {
-      native_error = cf_inbound_stream_frame_values(frame, &values);
-    }
     if (native_error == 0) {
       native_error = trevrpc_wire_encode_stream_frame(
-          values.kind, values.status, values.message, values.message_len,
-          values.body.data, values.body.len, &values.metadata,
+          frame->kind, frame->status, frame->message, frame->message_len,
+          frame->body.data, frame->body.len, &frame->metadata,
           TREVRPC_RPC_DEFAULT_MAX_MESSAGE_SIZE, &canonical_frame,
           &canonical_frame_len);
     }
     if (native_error == 0) {
-      cf_append_stream_frame(payload, &values);
+      cf_append_stream_frame(payload, frame);
     }
-    trevrpc_metadata_reset(&values.metadata);
-    trevrpc_inbound_stream_frame_release(frame);
-    trevrpc_owned_bytes_reset(&owned);
+    trevrpc_internal_stream_frame_free(frame);
   }
 
   if (native_error != 0 || canonical_frame_len < 4) {

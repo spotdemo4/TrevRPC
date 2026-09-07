@@ -1,57 +1,63 @@
 #include <trevrpc/callbacks.hpp>
+#include <trevrpc/trevrpc.hpp>
 
 #include "detail/callbacks.hpp"
 #include "detail/lifecycle.hpp"
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
-#include <cerrno>
-#include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <span>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace {
 
 using namespace std::chrono_literals;
 
+struct EmptyMessage {
+  [[nodiscard]] std::size_t ByteSizeLong() const noexcept { return 0; }
+  [[nodiscard]] bool SerializeToArray(void*, int size) const noexcept { return size == 0; }
+  [[nodiscard]] bool ParseFromArray(const void*, int size) noexcept { return size == 0; }
+};
+
 class RecordingSink final : public trevrpc::CallbackExceptionSink {
 public:
   void callback_exception(std::string_view callback, std::exception_ptr exception) override {
     assert(exception != nullptr);
-    last_callback = callback;
-    ++count;
+    {
+      std::lock_guard lock(mutex_);
+      callbacks_.emplace_back(callback);
+    }
+    condition_.notify_all();
   }
 
-  std::string last_callback;
-  int count = 0;
-};
-
-class ThrowingSink final : public trevrpc::CallbackExceptionSink {
-public:
-  void callback_exception(std::string_view, std::exception_ptr) override {
-    throw std::runtime_error("exception sink threw");
+  [[nodiscard]] bool wait_for_count(std::size_t count) {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, 5s, [this, count] { return callbacks_.size() >= count; });
   }
-};
 
-class DenyingAuthorizer final : public trevrpc::Authorizer {
-public:
-  trevrpc::Status authorize(const trevrpc::CallContext&,
-                            const trevrpc::AuthorizationRequest& request) override {
-    assert(request.service == "example.Service");
-    assert(request.method == "Method");
-    assert(request.body_size == 17);
-    assert(request.kind == TREVRPC_RPC_KIND_UNARY);
-    const auto token = request.metadata.get("token");
-    assert(token.has_value());
-    const std::string_view value(reinterpret_cast<const char*>(token->data()), token->size());
-    assert(value == "secret");
-    return trevrpc::Status(trevrpc::StatusCode::PermissionDenied, "denied");
+  [[nodiscard]] bool contains(std::string_view callback) const {
+    std::lock_guard lock(mutex_);
+    for (const auto& value : callbacks_) {
+      if (value == callback) {
+        return true;
+      }
+    }
+    return false;
   }
+
+private:
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  std::vector<std::string> callbacks_;
 };
 
 class ThrowingAuthorizer final : public trevrpc::Authorizer {
@@ -67,6 +73,7 @@ public:
   void rpc_started(const trevrpc::RpcStartedEvent&) override {
     throw std::runtime_error("metrics started threw");
   }
+
   void rpc_finished(const trevrpc::RpcFinishedEvent&) override {
     throw std::runtime_error("metrics finished threw");
   }
@@ -75,35 +82,6 @@ public:
 class ThrowingLogger final : public trevrpc::Logger {
 public:
   void log(const trevrpc::LogEvent&) override { throw std::runtime_error("logger threw"); }
-};
-
-class ThrowingTransportObserver final : public trevrpc::TransportObserver {
-public:
-  void transport_event(const trevrpc::TransportEvent&) override {
-    throw std::runtime_error("transport observer threw");
-  }
-};
-
-class ThrowingWebTransportAdmission final : public trevrpc::WebTransportAdmission {
-public:
-  bool admit(const trevrpc::WebTransportAdmissionRequest&) override {
-    throw std::runtime_error("WebTransport admission threw");
-  }
-};
-
-class ThrowingHttp3Admission final : public trevrpc::Http3Admission {
-public:
-  bool admit(const trevrpc::Http3AdmissionRequest&) override {
-    throw std::runtime_error("HTTP/3 admission threw");
-  }
-};
-
-class ThrowingChannelObserver final : public trevrpc::ChannelLifecycleObserver {
-public:
-  void channel_event(const trevrpc::ChannelLifecycleEvent&) override {
-    assert(trevrpc::detail::running_in_channel_callback());
-    throw std::runtime_error("channel observer threw");
-  }
 };
 
 class NoopAuthorizer final : public trevrpc::Authorizer {
@@ -123,11 +101,6 @@ public:
 class NoopLogger final : public trevrpc::Logger {
 public:
   void log(const trevrpc::LogEvent&) override {}
-};
-
-class NoopTransportObserver final : public trevrpc::TransportObserver {
-public:
-  void transport_event(const trevrpc::TransportEvent&) override {}
 };
 
 class DropChannelOwner final : public trevrpc::ChannelLifecycleObserver {
@@ -152,7 +125,7 @@ public:
     condition_.notify_all();
   }
 
-  bool wait_for_drop() {
+  [[nodiscard]] bool wait_for_drop() {
     std::unique_lock lock(mutex_);
     return condition_.wait_for(lock, 5s, [this] { return dropped_; });
   }
@@ -179,106 +152,80 @@ trevrpc::Server make_server() {
 void wait_until_serving(trevrpc::Server& server) {
   const auto deadline = std::chrono::steady_clock::now() + 5s;
   for (;;) {
-    std::uint32_t phase = 0;
-    const int error = trevrpc_server_get_phase(server.native_handle(), &phase);
-    assert(error == 0);
-    if (phase == TREVRPC_SERVER_PHASE_SERVING) {
+    auto phase = server.phase();
+    assert(phase);
+    if (phase.value() == trevrpc::ServerPhase::Serving) {
       return;
     }
-    assert(phase < TREVRPC_SERVER_PHASE_SERVING);
+    assert(phase.value() != trevrpc::ServerPhase::Released);
     assert(std::chrono::steady_clock::now() < deadline);
     std::this_thread::sleep_for(1ms);
   }
 }
 
-void test_authorizer_callbacks() {
-  std::string service = "example.Service";
-  std::string method = "Method";
-  std::string key = "token";
-  std::string value = "secret";
-  trevrpc_metadata_entry entry{key.data(), key.size(),
-                               reinterpret_cast<std::uint8_t*>(value.data()), value.size()};
-  trevrpc_request request{};
-  request.service = service.data();
-  request.service_len = service.size();
-  request.method = method.data();
-  request.method_len = method.size();
-  request.body_len = 17;
-  request.metadata = {&entry, 1};
-  request.kind = TREVRPC_RPC_KIND_UNARY;
-
-  auto denying = trevrpc::detail::make_authorizer_state(std::make_shared<DenyingAuthorizer>(), {});
-  trevrpc_status status{};
-  const int denied =
-      trevrpc::detail::authorizer_trampoline(denying.get(), nullptr, &request, &status);
-  assert(denied == 0);
-  assert(status.code == TREVRPC_STATUS_PERMISSION_DENIED);
-  assert(std::string_view(status.message, status.message_len) == "denied");
-
+void test_callback_factories() {
+  auto authorizer = std::make_shared<NoopAuthorizer>();
+  auto metrics = std::make_shared<NoopMetrics>();
+  auto logger = std::make_shared<NoopLogger>();
+  auto observer = std::make_shared<DropChannelOwner>();
   auto sink = std::make_shared<RecordingSink>();
-  auto throwing =
-      trevrpc::detail::make_authorizer_state(std::make_shared<ThrowingAuthorizer>(), sink);
-  const int failed =
-      trevrpc::detail::authorizer_trampoline(throwing.get(), nullptr, &request, &status);
-  assert(failed == 0);
-  assert(status.code == TREVRPC_STATUS_INTERNAL);
-  assert(std::string_view(status.message, status.message_len) == "authorizer callback threw");
-  assert(sink->count == 1);
-  assert(sink->last_callback == "authorizer");
+
+  auto authorizer_state =
+      trevrpc::detail::make_authorizer_state(authorizer, sink);
+  auto metrics_state = trevrpc::detail::make_metrics_state(metrics, sink);
+  auto logger_state = trevrpc::detail::make_logger_state(logger, sink);
+  auto lifecycle_state = trevrpc::detail::make_channel_lifecycle_state(observer, sink);
+
+  assert(authorizer_state->callback == authorizer);
+  assert(metrics_state->callback == metrics);
+  assert(logger_state->callback == logger);
+  assert(lifecycle_state->callback == observer);
+  assert(authorizer_state->sink == sink);
+  assert(metrics_state->sink == sink);
+  assert(logger_state->sink == sink);
+  assert(lifecycle_state->sink == sink);
 }
 
-void test_observer_exception_containment() {
+void test_direct_dispatch_exception_containment() {
+  auto server = make_server();
+  assert((server.register_unary<EmptyMessage, EmptyMessage>(
+      "example.Service", "Method",
+      [](const trevrpc::CallContext&, const EmptyMessage&) {
+        return trevrpc::Result<EmptyMessage>(EmptyMessage{});
+      })));
+
   auto sink = std::make_shared<RecordingSink>();
-  auto metrics = trevrpc::detail::make_metrics_state(std::make_shared<ThrowingMetrics>(), sink);
-  const trevrpc_rpc_started_event started{"Service", 7, "Method", 6, 11};
-  metrics->native.rpc_started(metrics->native.user_data, &started);
-  assert(sink->count == 1);
-  assert(sink->last_callback == "metrics.rpc_started");
-  const trevrpc_rpc_finished_event finished{
-      "Service", 7, "Method", 6, 11, 13, TREVRPC_STATUS_UNAVAILABLE, 19};
-  metrics->native.rpc_finished(metrics->native.user_data, &finished);
-  assert(sink->count == 2);
-  assert(sink->last_callback == "metrics.rpc_finished");
+  assert(server.set_authorizer(std::make_shared<ThrowingAuthorizer>(), sink));
+  assert(server.set_metrics(std::make_shared<ThrowingMetrics>(), sink));
+  assert(server.set_logger(std::make_shared<ThrowingLogger>(), sink));
 
-  auto logger = trevrpc::detail::make_logger_state(std::make_shared<ThrowingLogger>(), sink);
-  const trevrpc_log_event log{
-      TREVRPC_LOG_LEVEL_ERROR, "event", 5, "message", 7, "Service", 7, "Method", 6, -5};
-  logger->native.log(logger->native.user_data, &log);
-  assert(sink->count == 3);
-  assert(sink->last_callback == "logger");
+  trevrpc::Result<void> serve_result;
+  std::thread server_thread([&] { serve_result = server.serve(); });
+  wait_until_serving(server);
 
-  auto transport =
-      trevrpc::detail::make_transport_state(std::make_shared<ThrowingTransportObserver>(), sink);
-  const trevrpc_transport_event event{TREVRPC_TRANSPORT_EVENT_CONNECTION_ERROR, 1, -9, "failed", 6};
-  transport->native.transport_event(transport->native.user_data, &event);
-  assert(sink->count == 4);
-  assert(sink->last_callback == "transport_observer");
-}
+  trevrpc::ChannelConfig channel_config;
+  channel_config.skip_certificate_validation = true;
+  auto connected = trevrpc::Channel::connect("127.0.0.1", server.port().value(), channel_config, 5s);
+  assert(connected);
+  auto channel = std::move(connected).value();
+  auto response = channel->call_unary("example.Service", "Method", std::span<const std::byte>{}, {});
+  assert(response);
+  assert(response.value().status.code() == trevrpc::StatusCode::Internal);
+  assert(sink->wait_for_count(4));
+  assert(sink->contains("authorizer"));
+  assert(sink->contains("metrics.rpc_started"));
+  assert(sink->contains("metrics.rpc_finished"));
+  assert(sink->contains("logger"));
 
-void test_admission_and_recursive_exception_containment() {
-  auto sink = std::make_shared<RecordingSink>();
-  auto webtransport = trevrpc::detail::make_webtransport_admission_state(
-      std::make_shared<ThrowingWebTransportAdmission>(), sink);
-  const trevrpc_webtransport_admission_request webtransport_request{"/rpc",   4, "host", 4,
-                                                                    "origin", 6, 1};
-  const int webtransport_result =
-      trevrpc::detail::webtransport_admission_trampoline(webtransport.get(), &webtransport_request);
-  assert(webtransport_result != 0);
-  assert(sink->last_callback == "webtransport_admission");
-
-  auto http3 =
-      trevrpc::detail::make_http3_admission_state(std::make_shared<ThrowingHttp3Admission>(), sink);
-  const trevrpc_http3_admission_request http3_request{"/rpc", 4, "host", 4, 1};
-  const int http3_result = trevrpc::detail::http3_admission_trampoline(http3.get(), &http3_request);
-  assert(http3_result != 0);
-  assert(sink->last_callback == "http3_admission");
-
-  auto channel = trevrpc::detail::make_channel_lifecycle_state(
-      std::make_shared<ThrowingChannelObserver>(), std::make_shared<ThrowingSink>());
-  const trevrpc_channel_event channel_event{TREVRPC_CHANNEL_EVENT_CONNECT_FAILED,
-                                            TREVRPC_CHANNEL_RECONNECTING, 3, -7};
-  trevrpc::detail::channel_lifecycle_trampoline(channel.get(), &channel_event);
-  assert(!trevrpc::detail::running_in_channel_callback());
+  channel->close();
+  trevrpc::ShutdownOptions options;
+  options.graceful_timeout = 2s;
+  options.cancellation_timeout = 2s;
+  const auto report = server.shutdown(options);
+  assert(report);
+  assert(report.value().released);
+  server_thread.join();
+  assert(serve_result);
 }
 
 void test_server_callback_configuration() {
@@ -286,16 +233,13 @@ void test_server_callback_configuration() {
   assert(server.set_authorizer(std::make_shared<NoopAuthorizer>()));
   assert(server.set_metrics(std::make_shared<NoopMetrics>()));
   assert(server.set_logger(std::make_shared<NoopLogger>()));
-  assert(server.set_transport_observer(std::make_shared<NoopTransportObserver>()));
   assert(server.clear_authorizer());
   assert(server.clear_metrics());
   assert(server.clear_logger());
-  assert(server.clear_transport_observer());
 
   assert(server.set_authorizer(std::make_shared<NoopAuthorizer>()));
   assert(server.set_metrics(std::make_shared<NoopMetrics>()));
   assert(server.set_logger(std::make_shared<NoopLogger>()));
-  assert(server.set_transport_observer(std::make_shared<NoopTransportObserver>()));
   trevrpc::Result<void> serve_result;
   std::thread server_thread([&] { serve_result = server.serve(); });
   wait_until_serving(server);
@@ -312,6 +256,19 @@ void test_server_callback_configuration() {
   server_thread.join();
   assert(serve_result);
   assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() + 5s));
+}
+
+void test_server_final_owner_drop() {
+  trevrpc::Result<void> serve_result;
+  {
+    auto server = make_server();
+    std::thread server_thread([&] { serve_result = server.serve(); });
+    wait_until_serving(server);
+    server_thread.join();
+    assert(serve_result);
+  }
+  assert(trevrpc::detail::drain_lifecycle_reaper_until(
+      std::chrono::steady_clock::now() + 5s));
 }
 
 void test_channel_final_owner_drop_from_callback() {
@@ -350,10 +307,10 @@ void test_channel_final_owner_drop_from_callback() {
 } // namespace
 
 int main() {
-  test_authorizer_callbacks();
-  test_observer_exception_containment();
-  test_admission_and_recursive_exception_containment();
+  test_callback_factories();
+  test_direct_dispatch_exception_containment();
   test_server_callback_configuration();
+  test_server_final_owner_drop();
   test_channel_final_owner_drop_from_callback();
   assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() + 5s));
   return 0;

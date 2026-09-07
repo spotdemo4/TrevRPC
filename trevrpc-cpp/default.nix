@@ -79,9 +79,12 @@ stdenv.mkDerivation (
           src/trevrpc.cpp \
           src/async.cpp \
           src/callbacks.cpp \
-          src/detail/abi6_bridge.cpp \
           src/detail/async_core.cpp \
+          src/detail/channel_core.cpp \
           src/detail/lifecycle.cpp \
+          src/detail/rpc_client.cpp \
+          src/detail/rpc_event_runtime.cpp \
+          src/detail/rpc_server_core.cpp \
           tools/protoc-gen-trevrpc-cpp/generator.cpp \
           tools/protoc-gen-trevrpc-cpp/main.cpp \
           tests/codec_test.cpp \
@@ -130,8 +133,30 @@ stdenv.mkDerivation (
       test -f "$dev/include/trevrpc/trevrpc.hpp"
       test -f "$dev/include/trevrpc/async.hpp"
       test -f "$dev/include/trevrpc/callbacks.hpp"
+      for legacy_header in \
+        trevrpc.h \
+        trevrpc_binding.h \
+        trevrpc_msquic.h \
+        trevrpc_raw.h \
+        trevrpc_webtransport.h; do
+        test ! -e "$dev/include/$legacy_header"
+      done
       test -f "$dev/lib/cmake/trevrpc-cpp/trevrpc-cppConfig.cmake"
+      ! grep -RE 'trevrpc::(trevrpc|trevrpc_core|trevrpc_msquic|trevrpc_webtransport)([^_[:alnum:]]|$)' \
+        "$dev/lib/cmake/trevrpc-cpp"
       test -f "$lib/lib/libtrevrpc_cpp.a"
+      if ar t "$lib/lib/libtrevrpc_cpp.a" | grep -Ei 'abi.?6|abi6_bridge'; then
+        echo "trevrpc-cpp retains an ABI 6 archive member" >&2
+        exit 1
+      fi
+      if nm -u "$lib/lib/libtrevrpc_cpp.a" | grep ' U trevrpc_' | grep -v ' U trevrpc_rpc_'; then
+        echo "trevrpc-cpp retains a non-RPC TrevRPC dependency" >&2
+        exit 1
+      fi
+      if nm -g "$lib/lib/libtrevrpc_cpp.a" | grep -Ei 'trevrpc_c_abi|abi.?6|TREVRPC_C_ABI_VERSION'; then
+        echo "trevrpc-cpp retains an ABI 6 symbol" >&2
+        exit 1
+      fi
       test ! -e "$out/include"
       test ! -e "$out/lib"
       runHook postInstallCheck

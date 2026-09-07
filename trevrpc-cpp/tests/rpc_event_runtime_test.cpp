@@ -15,7 +15,7 @@ int main() {
 
   trevrpc_rpc_runtime* raw_runtime = nullptr;
   assert(trevrpc_rpc_msquic_create_v1(&runtime_config, &provider_config, &raw_runtime) == 0);
-  auto adopted = trevrpc::detail::RpcEventRuntime::adopt(raw_runtime);
+  auto adopted = trevrpc::detail::RpcEventRuntime::adopt(raw_runtime, runtime_config);
   assert(adopted);
   std::shared_ptr<trevrpc::detail::RpcEventRuntime> runtime = std::move(adopted).value();
 

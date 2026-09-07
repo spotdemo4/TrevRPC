@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <deque>
+#include <exception>
 #include <thread>
 #include <vector>
 
@@ -125,14 +126,51 @@ private:
   bool stopping_ = false;
 };
 
+class InlineExecutorState final : public std::enable_shared_from_this<InlineExecutorState> {
+public:
+  [[nodiscard]] Result<std::shared_ptr<ExecutorReservationState>> reserve() noexcept;
+  [[nodiscard]] Result<void> commit(const Work& work) noexcept;
+  void cancel_reservation() noexcept;
+
+  void request_stop() noexcept {
+    std::lock_guard lock(mutex_);
+    stopping_ = true;
+    drained_.notify_all();
+  }
+
+  [[nodiscard]] Result<void> drain_until(Deadline deadline) noexcept {
+    std::unique_lock lock(mutex_);
+    const auto drained = [this] { return running_ == 0 && reserved_ == 0; };
+    if (deadline == Deadline::max()) {
+      drained_.wait(lock, drained);
+      return {};
+    }
+    if (!drained_.wait_until(lock, deadline, drained)) {
+      return Error::runtime(-ETIMEDOUT, "inline executor drain timed out");
+    }
+    return {};
+  }
+
+private:
+  friend class ExecutorReservationState;
+  mutable std::mutex mutex_;
+  std::condition_variable drained_;
+  std::size_t reserved_ = 0;
+  std::size_t running_ = 0;
+  bool stopping_ = false;
+};
+
 class ExecutorReservationState final {
 public:
   explicit ExecutorReservationState(std::shared_ptr<ThreadPoolState> pool)
       : pool_(std::move(pool)) {}
+  explicit ExecutorReservationState(std::shared_ptr<InlineExecutorState> inline_executor)
+      : inline_executor_(std::move(inline_executor)) {}
   ~ExecutorReservationState() { cancel(); }
 
   [[nodiscard]] Result<void> commit(Work work) noexcept {
     std::shared_ptr<ThreadPoolState> pool;
+    std::shared_ptr<InlineExecutorState> inline_executor;
     {
       std::lock_guard lock(mutex_);
       if (consumed_) {
@@ -140,16 +178,22 @@ public:
       }
       consumed_ = true;
       pool = std::move(pool_);
+      inline_executor = std::move(inline_executor_);
     }
     if (!work) {
-      pool->cancel_reservation();
+      if (pool) {
+        pool->cancel_reservation();
+      } else {
+        inline_executor->cancel_reservation();
+      }
       return Error::runtime(-EINVAL, "executor work must not be empty");
     }
-    return pool->commit(std::move(work));
+    return pool ? pool->commit(std::move(work)) : inline_executor->commit(work);
   }
 
   void cancel() noexcept {
     std::shared_ptr<ThreadPoolState> pool;
+    std::shared_ptr<InlineExecutorState> inline_executor;
     {
       std::lock_guard lock(mutex_);
       if (consumed_) {
@@ -157,9 +201,12 @@ public:
       }
       consumed_ = true;
       pool = std::move(pool_);
+      inline_executor = std::move(inline_executor_);
     }
     if (pool) {
       pool->cancel_reservation();
+    } else if (inline_executor) {
+      inline_executor->cancel_reservation();
     }
   }
 
@@ -167,6 +214,7 @@ private:
   std::mutex mutex_;
   bool consumed_ = false;
   std::shared_ptr<ThreadPoolState> pool_;
+  std::shared_ptr<InlineExecutorState> inline_executor_;
 };
 
 Result<std::shared_ptr<ExecutorReservationState>> ThreadPoolState::reserve() noexcept {
@@ -213,6 +261,102 @@ void ThreadPoolState::cancel_reservation() noexcept {
   }
   condition_.notify_all();
   drained_.notify_all();
+}
+
+Result<std::shared_ptr<ExecutorReservationState>> InlineExecutorState::reserve() noexcept {
+  try {
+    std::lock_guard lock(mutex_);
+    if (stopping_) {
+      return Error::runtime(-ESHUTDOWN, "inline executor is stopping");
+    }
+    ++reserved_;
+    try {
+      return std::make_shared<ExecutorReservationState>(shared_from_this());
+    } catch (...) {
+      --reserved_;
+      drained_.notify_all();
+      throw;
+    }
+  } catch (...) {
+    return Error::runtime(-ENOMEM, "failed to allocate inline executor reservation");
+  }
+}
+
+Result<void> InlineExecutorState::commit(const Work& work) noexcept {
+  {
+    std::lock_guard lock(mutex_);
+    if (reserved_ == 0) {
+      return Error::runtime(-EINVAL, "inline executor reservation accounting underflow");
+    }
+    --reserved_;
+    ++running_;
+  }
+  {
+    ExecutorContextGuard context(this);
+    try {
+      work();
+    } catch (...) {
+      (void)std::current_exception();
+    }
+  }
+  {
+    std::lock_guard lock(mutex_);
+    --running_;
+    drained_.notify_all();
+  }
+  return {};
+}
+
+void InlineExecutorState::cancel_reservation() noexcept {
+  std::lock_guard lock(mutex_);
+  if (reserved_ > 0) {
+    --reserved_;
+  }
+  drained_.notify_all();
+}
+
+class InlineExecutor final : public Executor {
+public:
+  InlineExecutor() : state_(std::make_shared<InlineExecutorState>()) {}
+  ~InlineExecutor() override {
+    request_stop();
+    if (state_ && !running_in_executor_context(state_.get())) {
+      (void)state_->drain_until(Deadline::max());
+    }
+  }
+
+  [[nodiscard]] Result<ExecutorReservation> try_reserve() noexcept override {
+    auto reservation = state_->reserve();
+    if (!reservation) {
+      return reservation.error();
+    }
+    return ExecutorReservation(std::move(reservation).value());
+  }
+
+  [[nodiscard]] Result<void> execute(Work work) noexcept override {
+    auto reservation = try_reserve();
+    if (!reservation) {
+      return reservation.error();
+    }
+    return std::move(reservation).value().commit(std::move(work));
+  }
+
+  void request_stop() noexcept override { state_->request_stop(); }
+
+  [[nodiscard]] Result<void> drain_until(Deadline deadline) noexcept override {
+    return state_->drain_until(deadline);
+  }
+
+  [[nodiscard]] bool running_in_this_executor() const noexcept override {
+    return running_in_executor_context(state_.get());
+  }
+
+private:
+  std::shared_ptr<InlineExecutorState> state_;
+};
+
+std::shared_ptr<Executor> make_inline_executor() {
+  return std::make_shared<InlineExecutor>();
 }
 
 } // namespace trevrpc::detail
@@ -302,21 +446,14 @@ AsyncRuntime::~AsyncRuntime() = default;
 Result<std::shared_ptr<AsyncRuntime>>
 AsyncRuntime::create(std::shared_ptr<Executor> continuation_executor,
                      const AsyncRuntimeOptions& options) {
-  if (!continuation_executor || options.native_io_worker_count == 0 ||
-      options.native_io_queue_capacity == 0 || options.max_pending_sends_per_stream == 0 ||
+  if (!continuation_executor || options.max_pending_sends_per_stream == 0 ||
       options.max_pending_send_bytes_per_stream == 0 ||
-      options.max_waiting_senders_per_stream == 0 || options.receive_poll_min.count() <= 0 ||
-      options.receive_poll_max < options.receive_poll_min) {
+      options.max_waiting_senders_per_stream == 0) {
     return Error::runtime(-EINVAL, "invalid asynchronous runtime options");
-  }
-  auto native = ThreadPoolExecutor::create(
-      {options.native_io_worker_count, options.native_io_queue_capacity});
-  if (!native) {
-    return native.error();
   }
   try {
     auto state = std::make_shared<detail::AsyncRuntimeState>(std::move(continuation_executor),
-                                                             std::move(native).value(), options);
+                                                             options);
     return std::shared_ptr<AsyncRuntime>(new AsyncRuntime(std::move(state)));
   } catch (...) {
     return Error::runtime(-ENOMEM, "failed to create asynchronous runtime");
@@ -436,17 +573,16 @@ void operation_close(const std::shared_ptr<OperationState>& operation) noexcept 
   }
 }
 
-CallContext AsyncRegistrationAccess::context(const trevrpc_call_context* context,
-                                             const trevrpc_request* request) {
-  return CallContext(context, request);
-}
-
-Result<void> AsyncRegistrationAccess::register_route(
+Result<void> AsyncRegistrationAccess::register_rpc_route(
     Server& server, std::string_view service, std::string_view method, std::uint32_t kind,
-    trevrpc_call_handler callback, const std::shared_ptr<void>& route, void* user_data,
-    const std::shared_ptr<AsyncServerScopeControl>& async_scope) {
-  return server.register_native_route(service, method, kind, callback, route, user_data,
-                                      async_scope);
+    std::function<void(std::shared_ptr<ServerCallState>)> callback,
+    const std::shared_ptr<void>& route,
+    const std::shared_ptr<AsyncServerScopeControl>& scope) {
+  if (!server.state_) {
+    return Error::runtime(-EINVAL, "server is moved from");
+  }
+  return server.state_->register_rpc_route(service, method, kind, std::move(callback), route,
+                                           scope);
 }
 
 namespace {
@@ -463,98 +599,52 @@ public:
 
   [[nodiscard]] std::shared_ptr<ServerScope> scope() const noexcept { return scope_; }
 
-  [[nodiscard]] int dispatch(trevrpc_call* call) noexcept {
-    ServerCallbackContextGuard callback_context;
+  void dispatch_rpc(std::shared_ptr<ServerCallState> call_state) noexcept {
+    if (!call_state) {
+      return;
+    }
     auto executor = runtime_->continuation_executor();
     auto reservation = executor->try_reserve();
     if (!reservation) {
-      complete_immediately(
-          call, Status(StatusCode::ResourceExhausted, "async service executor is saturated"));
-      return 0;
+      call_state->stop(ServerStopReason::ServerCancellation);
+      return;
     }
-
-    const trevrpc_request* request = trevrpc_call_request(call);
-    if (request == nullptr || request->kind != kind_) {
-      complete_immediately(call, Status::internal("async service request kind mismatch"));
-      return 0;
-    }
-
-    std::vector<std::byte> body;
-    std::optional<CallContext> context;
-    try {
-      context.emplace(AsyncRegistrationAccess::context(trevrpc_call_get_context(call), request));
-      const auto* begin = reinterpret_cast<const std::byte*>(request->body);
-      body.assign(begin, begin + request->body_len);
-    } catch (...) {
-      complete_immediately(call, Status::internal("failed to copy async service request"));
-      return 0;
-    }
-
-    bool deferred = false;
-    auto state =
-        ServerCallState::create(call, kind_, runtime_, production_server_call_ops(), {}, &deferred);
-    if (!state) {
-      if (!deferred) {
-        complete_immediately(call, Status::internal("failed to defer async service call"));
-        return 0;
-      }
-      return TREVRPC_CALL_DEFERRED;
-    }
-    auto call_state = std::move(state).value();
+    std::vector<std::byte> body(detail::server_initial_message(call_state).begin(),
+                                 detail::server_initial_message(call_state).end());
+    auto context = detail::server_call_context(call_state);
     auto scope_id = scope_->add(call_state);
     if (!scope_id) {
       call_state->stop(ServerStopReason::ServerCancellation);
-      return TREVRPC_CALL_DEFERRED;
+      return;
     }
-
-    Work starter;
     try {
-      starter = [self = shared_from_this(), state = call_state, scope_id = scope_id.value(),
-                 context = std::move(context).value(), body = std::move(body)]() mutable {
-        if (state->snapshot().final_selected) {
-          self->scope_->complete(scope_id);
-          return;
-        }
-        auto terminal_state = state;
+      auto starter = [self = shared_from_this(), state = std::move(call_state),
+                      scope_id = scope_id.value(), context = std::move(context),
+                      body = std::move(body)]() mutable {
         auto task = self->run(std::move(state), std::move(context), std::move(body));
         task.associate_executor(self->runtime_->continuation_executor());
-        auto started =
-            spawn(std::move(task),
-                  [self, scope_id, terminal_state](const TaskCompletion<void>& completion) {
-                    if (completion.exception) {
-                      terminal_state->stop(ServerStopReason::LocalClose);
-                    }
-                    self->scope_->complete(scope_id);
-                  });
+        auto started = spawn(
+            std::move(task), [self, scope_id](const TaskCompletion<void>& completion) {
+              if (completion.exception) {
+                self->scope_->request_stop(ServerStopReason::LocalClose);
+              }
+              self->scope_->complete(scope_id);
+            });
         if (!started) {
-          terminal_state->stop(ServerStopReason::LocalClose);
           self->scope_->complete(scope_id);
         }
       };
+      auto committed = std::move(reservation).value().commit(std::move(starter));
+      if (!committed) {
+        scope_->complete(scope_id.value());
+      }
     } catch (...) {
-      call_state->stop(ServerStopReason::LocalClose);
       scope_->complete(scope_id.value());
-      return TREVRPC_CALL_DEFERRED;
-    }
-
-    auto committed = std::move(reservation).value().commit(std::move(starter));
-    if (!committed) {
       call_state->stop(ServerStopReason::LocalClose);
-      scope_->complete(scope_id.value());
     }
-    return TREVRPC_CALL_DEFERRED;
   }
 
 private:
-  void complete_immediately(trevrpc_call* call, const Status& status) noexcept {
-    auto call_ops = production_server_call_ops();
-    if (kind_ == TREVRPC_RPC_KIND_UNARY || kind_ == TREVRPC_RPC_KIND_CLIENT_STREAMING) {
-      (void)call_ops->respond(call, status, {}, status.metadata());
-    } else {
-      (void)call_ops->finish(call, status);
-    }
-  }
-
   [[nodiscard]] Task<void> run(std::shared_ptr<ServerCallState> state, CallContext context,
                                std::vector<std::byte> body) {
     std::optional<ByteResponse> response;
@@ -618,10 +708,6 @@ private:
   std::shared_ptr<ServerScope> scope_;
 };
 
-int dispatch_async_route(void* user_data, trevrpc_call* call) noexcept {
-  return static_cast<AsyncRoute*>(user_data)->dispatch(call);
-}
-
 template <typename Handler>
 Result<void> register_async_route(Server& server, std::string_view service, std::string_view method,
                                   std::uint32_t kind, std::shared_ptr<AsyncRuntime> runtime,
@@ -632,8 +718,10 @@ Result<void> register_async_route(Server& server, std::string_view service, std:
   try {
     auto route = std::make_shared<AsyncRoute>(kind, std::move(runtime),
                                               AsyncRouteHandler(std::move(handler)));
-    return AsyncRegistrationAccess::register_route(
-        server, service, method, kind, dispatch_async_route, route, route.get(), route->scope());
+    return AsyncRegistrationAccess::register_rpc_route(
+        server, service, method, kind,
+        [route](std::shared_ptr<ServerCallState> state) { route->dispatch_rpc(std::move(state)); },
+        route, route->scope());
   } catch (...) {
     return Error::runtime(-ENOMEM, "failed to allocate async service route");
   }

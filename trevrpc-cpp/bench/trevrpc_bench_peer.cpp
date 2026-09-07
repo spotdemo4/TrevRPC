@@ -570,21 +570,16 @@ private:
   }
   config.peer_bidi_stream_count = kPeerStreamLimit;
   config.max_frame_size = kMaximumFrameSize;
+  config.initial_request_timeout = kConnectTimeout;
+  config.max_stream_messages = kMaximumMessagesPerStream;
+  config.max_stream_body_size = std::numeric_limits<std::int64_t>::max();
+  config.worker_queue_capacity = std::numeric_limits<std::size_t>::max();
   auto listening = trevrpc::Server::listen(config);
   if (!listening) {
     throw PeerError("setup", "listen_failed", describe(listening.error()));
   }
   trevrpc::Server server = std::move(listening).value();
 
-  trevrpc::ServerOptions options;
-  options.worker_queue_capacity = std::numeric_limits<std::int64_t>::max();
-  options.initial_request_timeout = kConnectTimeout;
-  options.max_stream_messages = kMaximumMessagesPerStream;
-  options.max_stream_body_size = std::numeric_limits<std::int64_t>::max();
-  auto configured = server.set_options(options);
-  if (!configured) {
-    throw PeerError("setup", "server_config_failed", describe(configured.error()));
-  }
   auto registered =
       benchmark::RegisterBenchmarkService(server, std::make_shared<BenchmarkService>());
   if (!registered) {

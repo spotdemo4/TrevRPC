@@ -26,6 +26,7 @@ using Work = std::function<void()>;
 namespace detail {
 class ExecutorReservationState;
 class ThreadPoolState;
+class InlineExecutor;
 class AsyncRuntimeState;
 class OperationState;
 class CancellationState;
@@ -46,6 +47,7 @@ public:
 
 private:
   friend class ThreadPoolExecutor;
+  friend class detail::InlineExecutor;
   explicit ExecutorReservation(std::shared_ptr<detail::ExecutorReservationState> state) noexcept
       : state_(std::move(state)) {}
   std::shared_ptr<detail::ExecutorReservationState> state_;
@@ -98,13 +100,9 @@ private:
 };
 
 struct AsyncRuntimeOptions {
-  std::size_t native_io_worker_count = 4;
-  std::size_t native_io_queue_capacity = 1024;
   std::size_t max_pending_sends_per_stream = 64;
   std::size_t max_pending_send_bytes_per_stream = std::size_t{16} * 1024 * 1024;
   std::size_t max_waiting_senders_per_stream = 64;
-  std::chrono::nanoseconds receive_poll_min{std::chrono::microseconds(250)};
-  std::chrono::nanoseconds receive_poll_max{std::chrono::milliseconds(8)};
 };
 
 class AsyncRuntime {
@@ -274,8 +272,7 @@ public:
           promise.continuation_executor_ = continuation.promise().continuation_executor_;
         }
       }
-      if (promise.continuation_executor_ &&
-          !promise.continuation_executor_->running_in_this_executor()) {
+      if (promise.continuation_executor_) {
         auto reserved = promise.continuation_executor_->try_reserve();
         if (!reserved) {
           throw std::system_error(-reserved.error().code(), std::generic_category(),
@@ -485,13 +482,12 @@ using AsyncBidirectionalBytesHandler =
     std::function<Task<Status>(CallContext, std::shared_ptr<OperationState>)>;
 
 struct AsyncRegistrationAccess {
-  [[nodiscard]] static CallContext context(const trevrpc_call_context* context,
-                                           const trevrpc_request* request);
   [[nodiscard]] static Result<void>
-  register_route(Server& server, std::string_view service, std::string_view method,
-                 std::uint32_t kind, trevrpc_call_handler callback,
-                 const std::shared_ptr<void>& route, void* user_data,
-                 const std::shared_ptr<AsyncServerScopeControl>& async_scope);
+  register_rpc_route(Server& server, std::string_view service, std::string_view method,
+                     std::uint32_t kind,
+                     std::function<void(std::shared_ptr<detail::ServerCallState>)> callback,
+                     const std::shared_ptr<void>& route,
+                     const std::shared_ptr<AsyncServerScopeControl>& scope);
 };
 
 [[nodiscard]] Result<void> register_async_unary_bytes(Server& server, std::string_view service,

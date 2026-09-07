@@ -1,14 +1,14 @@
 #pragma once
 
-#include <trevrpc.h>
+#include <trevrpc_rpc.h>
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -23,39 +23,46 @@ namespace trevrpc {
 class Authorizer;
 class MetricsObserver;
 class Logger;
-class TransportObserver;
-class WebTransportAdmission;
-class Http3Admission;
+class Channel;
 class ChannelLifecycleObserver;
 class CallbackExceptionSink;
 
 namespace detail {
+struct AsyncChannelAccess;
 struct AsyncRegistrationAccess;
+struct AsyncStreamAccess;
 struct CallbackAccess;
+class RpcCancellation;
+class ChannelCore;
+class RpcClientStream;
+class ServerCallState;
 } // namespace detail
 
 enum class StatusCode : std::uint32_t {
-  Ok = TREVRPC_STATUS_OK,
-  Cancelled = TREVRPC_STATUS_CANCELLED,
-  Unknown = TREVRPC_STATUS_UNKNOWN,
-  InvalidArgument = TREVRPC_STATUS_INVALID_ARGUMENT,
-  DeadlineExceeded = TREVRPC_STATUS_DEADLINE_EXCEEDED,
-  NotFound = TREVRPC_STATUS_NOT_FOUND,
-  AlreadyExists = TREVRPC_STATUS_ALREADY_EXISTS,
-  PermissionDenied = TREVRPC_STATUS_PERMISSION_DENIED,
-  ResourceExhausted = TREVRPC_STATUS_RESOURCE_EXHAUSTED,
-  FailedPrecondition = TREVRPC_STATUS_FAILED_PRECONDITION,
-  Aborted = TREVRPC_STATUS_ABORTED,
-  OutOfRange = TREVRPC_STATUS_OUT_OF_RANGE,
-  Unimplemented = TREVRPC_STATUS_UNIMPLEMENTED,
-  Internal = TREVRPC_STATUS_INTERNAL,
-  Unavailable = TREVRPC_STATUS_UNAVAILABLE,
-  DataLoss = TREVRPC_STATUS_DATA_LOSS,
-  Unauthenticated = TREVRPC_STATUS_UNAUTHENTICATED,
+  Ok = 0,
+  Cancelled = 1,
+  Unknown = 2,
+  InvalidArgument = 3,
+  DeadlineExceeded = 4,
+  NotFound = 5,
+  AlreadyExists = 6,
+  PermissionDenied = 7,
+  ResourceExhausted = 8,
+  FailedPrecondition = 9,
+  Aborted = 10,
+  OutOfRange = 11,
+  Unimplemented = 12,
+  Internal = 13,
+  Unavailable = 14,
+  DataLoss = 15,
+  Unauthenticated = 16,
 };
 
 class Metadata {
 public:
+  static constexpr std::size_t max_key_size = 128;
+  static constexpr std::size_t max_value_size = std::size_t{8} * 1024;
+
   struct Entry {
     std::string key;
     std::vector<std::byte> value;
@@ -162,17 +169,22 @@ class Cancellation {
 public:
   Cancellation();
   ~Cancellation();
-  Cancellation(const Cancellation& other);
-  Cancellation& operator=(const Cancellation& other);
-  Cancellation(Cancellation&& other) noexcept;
-  Cancellation& operator=(Cancellation&& other) noexcept;
+  Cancellation(const Cancellation&) noexcept = default;
+  Cancellation& operator=(const Cancellation&) noexcept = default;
+  Cancellation(Cancellation&&) noexcept = default;
+  Cancellation& operator=(Cancellation&&) noexcept = default;
 
   void cancel() noexcept;
   [[nodiscard]] bool cancelled() const noexcept;
-  [[nodiscard]] trevrpc_cancellation* native_handle() const noexcept { return cancellation_; }
 
 private:
-  trevrpc_cancellation* cancellation_ = nullptr;
+  friend class detail::RpcClientStream;
+  friend class Channel;
+  [[nodiscard]] const detail::RpcCancellation* detail_state() const noexcept {
+    return state_.get();
+  }
+
+  std::shared_ptr<detail::RpcCancellation> state_;
 };
 
 struct ChannelConfig {
@@ -183,8 +195,6 @@ struct ChannelConfig {
   std::chrono::milliseconds max_idle_timeout{0};
   std::chrono::milliseconds keep_alive{0};
   std::uint16_t peer_bidi_stream_count = 0;
-  std::uint32_t max_stateless_operations = 0;
-  std::uint16_t max_binding_stateless_operations = 0;
   std::size_t max_pending_send_bytes = 0;
   std::size_t max_pending_send_count = 0;
   std::size_t max_frame_size = 0;
@@ -220,41 +230,29 @@ struct ServerConfig {
   std::chrono::milliseconds max_idle_timeout{0};
   std::chrono::milliseconds keep_alive{0};
   std::uint16_t peer_bidi_stream_count = 0;
-  std::uint32_t max_stateless_operations = 0;
-  std::uint16_t max_binding_stateless_operations = 0;
   std::size_t max_pending_send_bytes = 0;
   std::size_t max_pending_send_count = 0;
   std::uint32_t max_sessions_per_connection = 0;
-  std::uint32_t max_streams_per_session = 0;
   std::uint32_t stream_recv_window = 0;
   std::uint32_t conn_flow_control_window = 0;
   std::size_t max_frame_size = 0;
-  std::shared_ptr<WebTransportAdmission> webtransport_admission;
-  std::shared_ptr<Http3Admission> http3_admission;
+  std::chrono::nanoseconds initial_request_timeout{0};
+  std::int64_t max_stream_messages = -1;
+  std::int64_t max_stream_body_size = -1;
+  std::chrono::nanoseconds stream_idle_timeout{0};
+  std::size_t worker_count = 16;
+  std::size_t worker_queue_capacity = 1024;
   std::shared_ptr<CallbackExceptionSink> callback_exception_sink;
 };
 
-struct ServerOptions {
-  std::optional<std::int64_t> max_concurrent_connections;
-  std::optional<std::int64_t> max_concurrent_streams_per_connection;
-  std::optional<std::int64_t> max_concurrent_requests;
-  std::optional<std::int64_t> worker_count;
-  std::optional<std::int64_t> worker_queue_capacity;
-  std::optional<std::chrono::nanoseconds> graceful_shutdown_timeout;
-  std::optional<std::chrono::nanoseconds> initial_request_timeout;
-  std::optional<std::int64_t> max_stream_messages;
-  std::optional<std::int64_t> max_stream_body_size;
-  std::optional<std::chrono::nanoseconds> stream_idle_timeout;
-};
-
 enum class ServerPhase : std::uint32_t {
-  Configuring = TREVRPC_SERVER_PHASE_CONFIGURING,
-  Frozen = TREVRPC_SERVER_PHASE_FROZEN,
-  Serving = TREVRPC_SERVER_PHASE_SERVING,
-  Stopping = TREVRPC_SERVER_PHASE_STOPPING,
-  Cancelling = TREVRPC_SERVER_PHASE_CANCELLING,
-  Stopped = TREVRPC_SERVER_PHASE_STOPPED,
-  Released,
+  Configuring = 0,
+  Frozen = 1,
+  Serving = 2,
+  Stopping = 3,
+  Cancelling = 4,
+  Stopped = 5,
+  Released = 6,
 };
 
 enum class ShutdownOutcome { Graceful, Cancelled, TimedOut };
@@ -272,6 +270,7 @@ struct ShutdownReport {
 
 class CallContext {
 public:
+  CallContext() = default;
   [[nodiscard]] bool has_deadline() const noexcept;
   [[nodiscard]] bool deadline_expired() const noexcept;
   [[nodiscard]] bool cancelled() const noexcept;
@@ -280,19 +279,21 @@ public:
 
 private:
   friend class Server;
+  friend class detail::ServerCallState;
   friend struct detail::AsyncRegistrationAccess;
   friend struct detail::CallbackAccess;
-  CallContext(const trevrpc_call_context* context, const trevrpc_request* request);
+  CallContext(const trevrpc_rpc_call_context_info_v1& context, Metadata metadata)
+      : rpc_context_(context), metadata_(std::move(metadata)) {}
 
-  const trevrpc_call_context* context_ = nullptr;
+  trevrpc_rpc_call_context_info_v1 rpc_context_{};
   Metadata metadata_;
 };
 
 namespace detail {
 
 class AsyncServerScopeControl;
-class ChannelState;
 class ServerState;
+class ClientStream;
 
 struct ByteResponse {
   Status status;
@@ -302,6 +303,7 @@ struct ByteResponse {
 
 struct StreamFrame {
   bool terminal = false;
+  bool message = false;
   Status status;
   std::vector<std::byte> body;
 };
@@ -309,7 +311,6 @@ struct StreamFrame {
 class ClientStream {
 public:
   ClientStream() = default;
-  explicit ClientStream(trevrpc_stream* stream) noexcept : stream_(stream) {}
   ~ClientStream();
   ClientStream(const ClientStream&) = delete;
   ClientStream& operator=(const ClientStream&) = delete;
@@ -321,14 +322,16 @@ public:
   [[nodiscard]] Result<StreamFrame> receive();
   void cancel() noexcept;
   void close() noexcept;
-  [[nodiscard]] trevrpc_stream* release_native_handle() noexcept {
-    return std::exchange(stream_, nullptr);
-  }
 
 private:
-  trevrpc_stream* stream_ = nullptr;
-  bool send_finished_ = false;
-  bool receive_finished_ = false;
+  friend class ::trevrpc::Channel;
+  friend struct AsyncStreamAccess;
+  friend struct RpcClientStreamTestPeer;
+  friend class RpcClientStream;
+  explicit ClientStream(std::shared_ptr<RpcClientStream> stream) noexcept
+      : stream_(std::move(stream)) {}
+
+  std::shared_ptr<RpcClientStream> stream_;
 };
 
 template <typename Message>
@@ -497,10 +500,13 @@ template <typename Message>
   return message;
 }
 
-[[nodiscard]] Result<void> send_server_message(trevrpc_stream* stream,
+[[nodiscard]] CallContext server_call_context(const std::shared_ptr<ServerCallState>& state);
+[[nodiscard]] std::span<const std::byte>
+server_initial_message(const std::shared_ptr<ServerCallState>& state) noexcept;
+[[nodiscard]] Result<void> send_server_message(const std::shared_ptr<ServerCallState>& state,
                                                std::span<const std::byte> body);
 [[nodiscard]] Result<std::optional<std::vector<std::byte>>>
-receive_server_message(trevrpc_stream* stream);
+receive_server_message(const std::shared_ptr<ServerCallState>& state);
 [[nodiscard]] Status error_status(const Error& error);
 
 template <typename T> [[nodiscard]] const auto& response_message(const T& value) {
@@ -542,7 +548,6 @@ public:
   wait_ready(std::chrono::nanoseconds timeout = std::chrono::nanoseconds{0},
              Cancellation* cancellation = nullptr);
   void close() noexcept;
-  [[nodiscard]] trevrpc_channel* native_handle() const noexcept;
 
   [[nodiscard]] Result<detail::ByteResponse> call_unary(std::string_view service,
                                                         std::string_view method,
@@ -553,9 +558,10 @@ public:
                std::span<const std::byte> body, const CallOptions& options);
 
 private:
-  explicit Channel(std::shared_ptr<detail::ChannelState> state) noexcept
-      : state_(std::move(state)) {}
-  std::shared_ptr<detail::ChannelState> state_;
+  friend struct detail::AsyncChannelAccess;
+  explicit Channel(std::shared_ptr<detail::ChannelCore> core) noexcept : core_(std::move(core)) {}
+  mutable std::mutex mutex_;
+  std::shared_ptr<detail::ChannelCore> core_;
 };
 
 template <typename T> struct Response {
@@ -693,20 +699,21 @@ public:
     if (!body) {
       return body.error();
     }
-    return detail::send_server_message(stream_, body.value());
+    return detail::send_server_message(state_, body.value());
   }
 
 private:
   friend class Server;
   template <typename, typename> friend class ServerReaderWriter;
-  explicit ServerWriter(trevrpc_stream* stream) noexcept : stream_(stream) {}
-  trevrpc_stream* stream_;
+  explicit ServerWriter(std::shared_ptr<detail::ServerCallState> state) noexcept
+      : state_(std::move(state)) {}
+  std::shared_ptr<detail::ServerCallState> state_;
 };
 
 template <typename Request> class ServerReader {
 public:
   [[nodiscard]] Result<std::optional<Request>> receive() {
-    auto body = detail::receive_server_message(stream_);
+    auto body = detail::receive_server_message(state_);
     if (!body) {
       return body.error();
     }
@@ -723,8 +730,9 @@ public:
 private:
   friend class Server;
   template <typename, typename> friend class ServerReaderWriter;
-  explicit ServerReader(trevrpc_stream* stream) noexcept : stream_(stream) {}
-  trevrpc_stream* stream_;
+  explicit ServerReader(std::shared_ptr<detail::ServerCallState> state) noexcept
+      : state_(std::move(state)) {}
+  std::shared_ptr<detail::ServerCallState> state_;
 };
 
 template <typename Request, typename Response> class ServerReaderWriter {
@@ -734,7 +742,8 @@ public:
 
 private:
   friend class Server;
-  explicit ServerReaderWriter(trevrpc_stream* stream) noexcept : reader_(stream), writer_(stream) {}
+  explicit ServerReaderWriter(const std::shared_ptr<detail::ServerCallState>& state)
+      : reader_(state), writer_(state) {}
   ServerReader<Request> reader_;
   ServerWriter<Response> writer_;
 };
@@ -817,7 +826,6 @@ public:
 
   [[nodiscard]] static Result<Server> listen(const ServerConfig& config);
   [[nodiscard]] Result<std::uint16_t> port() const;
-  [[nodiscard]] Result<void> set_options(const ServerOptions& options);
   [[nodiscard]] Result<void>
   set_authorizer(std::shared_ptr<Authorizer> callback,
                  std::shared_ptr<CallbackExceptionSink> exception_sink = {});
@@ -826,46 +834,41 @@ public:
               std::shared_ptr<CallbackExceptionSink> exception_sink = {});
   [[nodiscard]] Result<void> set_logger(std::shared_ptr<Logger> callback,
                                         std::shared_ptr<CallbackExceptionSink> exception_sink = {});
-  [[nodiscard]] Result<void>
-  set_transport_observer(std::shared_ptr<TransportObserver> callback,
-                         std::shared_ptr<CallbackExceptionSink> exception_sink = {});
   [[nodiscard]] Result<void> clear_authorizer();
   [[nodiscard]] Result<void> clear_metrics();
   [[nodiscard]] Result<void> clear_logger();
-  [[nodiscard]] Result<void> clear_transport_observer();
   [[nodiscard]] Result<void> serve();
   [[nodiscard]] Result<void> request_stop();
   [[nodiscard]] Result<ShutdownReport> shutdown(const ShutdownOptions& options);
   [[deprecated("use request_stop() or shutdown(ShutdownOptions)")]] void shutdown() noexcept;
   [[deprecated("use shutdown(ShutdownOptions)")]] void close() noexcept;
-  [[nodiscard]] trevrpc_server* native_handle() const noexcept;
+  [[nodiscard]] Result<ServerPhase> phase() const;
 
   template <typename Request, typename Response, typename Handler>
   [[nodiscard]] Result<void> register_unary(std::string_view service, std::string_view method,
                                             Handler handler) {
-    return register_route(
+    return register_rpc_route(
         service, method, TREVRPC_RPC_KIND_UNARY,
-        [handler = std::move(handler)](trevrpc_call* call) mutable {
-          const trevrpc_request* request = trevrpc_call_request(call);
-          CallContext context(trevrpc_call_get_context(call), request);
-          auto decoded = detail::parse<Request>(
-              std::span(reinterpret_cast<const std::byte*>(request->body), request->body_len),
-              "failed to parse unary request");
+        [handler = std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
+          CallContext context = detail::server_call_context(state);
+          auto decoded = detail::parse<Request>(detail::server_initial_message(state),
+                                                "failed to parse unary request");
           if (!decoded) {
-            respond(call, Status::invalid_argument(decoded.error().message()), {});
+            respond(state, Status::invalid_argument(decoded.error().message()), {});
             return;
           }
           auto response = handler(context, decoded.value());
           if (!response) {
-            respond(call, detail::error_status(response.error()), {});
+            respond(state, detail::error_status(response.error()), {});
             return;
           }
           auto body = detail::serialize(detail::response_message(response.value()));
           if (!body) {
-            respond(call, Status::internal(body.error().message()), {});
+            respond(state, Status::internal(body.error().message()), {});
             return;
           }
-          respond(call, Status(StatusCode::Ok, {}, detail::response_metadata(response.value())),
+          respond(state,
+                  Status(StatusCode::Ok, {}, detail::response_metadata(response.value())),
                   body.value());
         });
   }
@@ -873,46 +876,42 @@ public:
   template <typename Request, typename Response, typename Handler>
   [[nodiscard]] Result<void> register_server_streaming(std::string_view service,
                                                        std::string_view method, Handler handler) {
-    return register_route(
+    return register_rpc_route(
         service, method, TREVRPC_RPC_KIND_SERVER_STREAMING,
-        [handler = std::move(handler)](trevrpc_call* call) mutable {
-          const trevrpc_request* request = trevrpc_call_request(call);
-          CallContext context(trevrpc_call_get_context(call), request);
-          auto decoded = detail::parse<Request>(
-              std::span(reinterpret_cast<const std::byte*>(request->body), request->body_len),
-              "failed to parse server-streaming request");
+        [handler = std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
+          CallContext context = detail::server_call_context(state);
+          auto decoded = detail::parse<Request>(detail::server_initial_message(state),
+                                                "failed to parse server-streaming request");
           if (!decoded) {
-            finish(call, Status::invalid_argument(decoded.error().message()));
+            finish(state, Status::invalid_argument(decoded.error().message()));
             return;
           }
-          ServerWriter<Response> writer(trevrpc_call_stream(call));
-          finish(call, handler(context, decoded.value(), writer));
+          ServerWriter<Response> writer(state);
+          finish(state, handler(context, decoded.value(), writer));
         });
   }
 
   template <typename Request, typename Response, typename Handler>
   [[nodiscard]] Result<void> register_client_streaming(std::string_view service,
                                                        std::string_view method, Handler handler) {
-    return register_route(
+    return register_rpc_route(
         service, method, TREVRPC_RPC_KIND_CLIENT_STREAMING,
-        [handler = std::move(handler)](trevrpc_call* call) mutable {
-          const trevrpc_request* request = trevrpc_call_request(call);
-          CallContext context(trevrpc_call_get_context(call), request);
-          ServerReader<Request> reader(trevrpc_call_stream(call));
+        [handler = std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
+          CallContext context = detail::server_call_context(state);
+          ServerReader<Request> reader(state);
           auto response = handler(context, reader);
           if (!response) {
-            finish(call, detail::error_status(response.error()));
+            finish(state, detail::error_status(response.error()));
             return;
           }
           auto body = detail::serialize(detail::response_message(response.value()));
           if (!body) {
-            finish(call, Status::internal(body.error().message()));
+            finish(state, Status::internal(body.error().message()));
             return;
           }
-          auto sent = detail::send_server_message(trevrpc_call_stream(call), body.value());
-          finish(call, sent
-                           ? Status(StatusCode::Ok, {}, detail::response_metadata(response.value()))
-                           : detail::error_status(sent.error()));
+          respond(state,
+                  Status(StatusCode::Ok, {}, detail::response_metadata(response.value())),
+                  body.value());
         });
   }
 
@@ -920,32 +919,27 @@ public:
   [[nodiscard]] Result<void> register_bidirectional_streaming(std::string_view service,
                                                               std::string_view method,
                                                               Handler handler) {
-    return register_route(service, method, TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
-                          [handler = std::move(handler)](trevrpc_call* call) mutable {
-                            const trevrpc_request* request = trevrpc_call_request(call);
-                            CallContext context(trevrpc_call_get_context(call), request);
-                            ServerReaderWriter<Request, Response> stream(trevrpc_call_stream(call));
-                            finish(call, handler(context, stream));
+    return register_rpc_route(service, method, TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
+                          [handler = std::move(handler)](
+                              const std::shared_ptr<detail::ServerCallState>& state) mutable {
+                            CallContext context = detail::server_call_context(state);
+                            ServerReaderWriter<Request, Response> stream(state);
+                            finish(state, handler(context, stream));
                           });
   }
 
 private:
   friend struct detail::AsyncRegistrationAccess;
-  using Handler = std::function<void(trevrpc_call*)>;
-  struct Route;
+  using RpcHandler = std::function<void(std::shared_ptr<detail::ServerCallState>)>;
 
   explicit Server(std::shared_ptr<detail::ServerState> state) noexcept;
-  [[nodiscard]] Result<void> register_route(std::string_view service, std::string_view method,
-                                            std::uint32_t kind, Handler handler);
   [[nodiscard]] Result<void>
-  register_native_route(std::string_view service, std::string_view method, std::uint32_t kind,
-                        trevrpc_call_handler callback, const std::shared_ptr<void>& route,
-                        void* user_data,
-                        const std::shared_ptr<detail::AsyncServerScopeControl>& async_scope = {});
-  static int dispatch_route(void* user_data, trevrpc_call* call) noexcept;
-  static void respond(trevrpc_call* call, const Status& status,
-                      std::span<const std::byte> body) noexcept;
-  static void finish(trevrpc_call* call, const Status& status) noexcept;
+  register_rpc_route(std::string_view service, std::string_view method, std::uint32_t kind,
+                     RpcHandler handler);
+  static void respond(const std::shared_ptr<detail::ServerCallState>& state,
+                      const Status& status, std::span<const std::byte> body) noexcept;
+  static void finish(const std::shared_ptr<detail::ServerCallState>& state,
+                     const Status& status) noexcept;
 
   std::shared_ptr<detail::ServerState> state_;
 };

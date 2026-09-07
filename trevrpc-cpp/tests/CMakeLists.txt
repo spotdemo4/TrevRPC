@@ -170,7 +170,29 @@ if(TARGET trevrpc_rpc_fake_transport_support)
   trevrpc_cpp_test_assertions(trevrpc_cpp_rpc_event_runtime_fake_test)
   add_test(NAME trevrpc_cpp_rpc_event_runtime_fake
     COMMAND trevrpc_cpp_rpc_event_runtime_fake_test)
-  set_tests_properties(trevrpc_cpp_rpc_event_runtime_fake PROPERTIES TIMEOUT 20)
+  add_test(NAME trevrpc_cpp_rpc_server_scope_fake
+    COMMAND trevrpc_cpp_rpc_event_runtime_fake_test server-core-active)
+  set_tests_properties(
+    trevrpc_cpp_rpc_event_runtime_fake
+    trevrpc_cpp_rpc_server_scope_fake
+    PROPERTIES TIMEOUT 20)
+
+  add_executable(trevrpc_cpp_channel_core_fake_test
+    channel_core_fake_test.cpp
+    rpc_event_runtime_fake_fixture.c)
+  target_include_directories(trevrpc_cpp_channel_core_fake_test PRIVATE
+    ../src
+    ../../trevrpc-c/src
+    ../../trevrpc-c/tests)
+  target_link_libraries(trevrpc_cpp_channel_core_fake_test PRIVATE
+    trevrpc_cpp
+    trevrpc_rpc_fake_transport_support)
+  trevrpc_cpp_warnings(trevrpc_cpp_channel_core_fake_test)
+  trevrpc_cpp_sanitizers(trevrpc_cpp_channel_core_fake_test)
+  trevrpc_cpp_test_assertions(trevrpc_cpp_channel_core_fake_test)
+  add_test(NAME trevrpc_cpp_channel_core_fake
+    COMMAND trevrpc_cpp_channel_core_fake_test)
+  set_tests_properties(trevrpc_cpp_channel_core_fake PROPERTIES TIMEOUT 20)
 endif()
 
 add_executable(trevrpc_cpp_rpc_sync_client_test rpc_sync_client_test.cpp)

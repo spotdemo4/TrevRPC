@@ -1,12 +1,6 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-find_dependency(trevrpc 0.2.2 EXACT CONFIG)
-if(NOT TREVRPC_C_ABI_VERSION EQUAL 6)
-    set(trevrpc-cpp_FOUND FALSE)
-    set(trevrpc-cpp_NOT_FOUND_MESSAGE "trevrpc-cpp transition build requires TrevRPC C ABI 6")
-    return()
-endif()
 find_dependency(trevrpc_rpc_msquic 0.2.2 EXACT CONFIG)
 if(NOT TREVRPC_RPC_ABI_VERSION EQUAL 1 OR NOT TREVRPC_RPC_MSQUIC_ABI_VERSION EQUAL 1)
     set(trevrpc-cpp_FOUND FALSE)
