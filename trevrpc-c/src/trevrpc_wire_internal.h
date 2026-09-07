@@ -110,15 +110,25 @@ int trevrpc_wire_decode_response_diagnostic(
 int trevrpc_wire_decode_response(const uint8_t* data, size_t len, trevrpc_wire_response_values** out_response);
 int trevrpc_wire_decode_response_take(
     uint8_t* data, size_t len, trevrpc_wire_response_values** out_response, bool* took_body);
-int trevrpc_wire_decode_response_owned(trevrpc_owned_bytes* data, trevrpc_inbound_response** out_response);
+int trevrpc_internal_wire_decode_response_values(const uint8_t* data,
+    size_t len,
+    trevrpc_wire_response_values** out_response,
+    uint8_t* body_owner,
+    bool* took_body,
+    const uint8_t** body_view,
+    size_t* body_view_len,
+    trevrpc_wire_diagnostic* diagnostic);
 int trevrpc_wire_decode_stream_frame_diagnostic(
     const uint8_t* data, size_t len, trevrpc_wire_stream_frame_values** out_frame, trevrpc_wire_diagnostic* diagnostic);
 int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_wire_stream_frame_values** out_frame);
 int trevrpc_wire_decode_stream_frame_take(
     uint8_t* data, size_t len, trevrpc_wire_stream_frame_values** out_frame, bool* took_body);
-int trevrpc_wire_decode_stream_frame_owned(trevrpc_owned_bytes* data, trevrpc_inbound_stream_frame** out_frame);
-int trevrpc_wire_decode_stream_frame_owned_diagnostic(
-    trevrpc_owned_bytes* data, trevrpc_inbound_stream_frame** out_frame, trevrpc_wire_diagnostic* diagnostic);
+int trevrpc_internal_wire_decode_stream_frame_values(const uint8_t* data,
+    size_t len,
+    trevrpc_wire_stream_frame_values** out_frame,
+    const uint8_t** body_view,
+    size_t* body_view_len,
+    trevrpc_wire_diagnostic* diagnostic);
 int trevrpc_wire_canonicalize_bytes_field(
     const uint8_t* data, size_t len, uint32_t field_number, uint8_t** canonical, size_t* canonical_len);
 

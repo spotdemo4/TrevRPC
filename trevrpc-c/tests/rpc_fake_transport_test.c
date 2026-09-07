@@ -113,7 +113,7 @@ static void assert_initial_request_uses_infinite_wire_timeout(fake_transport* fa
     assert(fake->last_send_body != NULL);
     assert(trevrpc_wire_decode_request(fake->last_send_body, fake->last_send_body_len, &request) == 0);
     assert(request.timeout_nanos == 0);
-    trevrpc_request_reset(&request);
+    trevrpc_internal_request_reset(&request);
     pthread_mutex_unlock(&fake->mutex);
 }
 

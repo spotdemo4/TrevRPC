@@ -1,5 +1,5 @@
-#include "trevrpc_owned_bytes_internal.h"
-#include "trevrpc_wire_internal.h"
+#include "trevrpc_ownership_abi6_internal.h"
+#include "trevrpc_wire_abi6_internal.h"
 
 #include <errno.h> // IWYU pragma: keep
 #include <stdint.h>
@@ -34,7 +34,7 @@ static int test_response_interior_take(void) {
     trevrpc_wire_response_values values = {0};
     CHECK(trevrpc_internal_response_set_message(&values, "ok", 2) == 0);
     const uint8_t metadata_value[] = {1, 2, 3};
-    CHECK(trevrpc_metadata_set(&values.metadata, "key", 3, metadata_value, sizeof(metadata_value)) == 0);
+    CHECK(trevrpc_internal_metadata_set(&values.metadata, "key", 3, metadata_value, sizeof(metadata_value)) == 0);
 
     uint8_t* allocation = malloc(16);
     if (allocation == NULL) {

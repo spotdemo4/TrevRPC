@@ -1,4 +1,4 @@
-#include "trevrpc_owned_bytes_internal.h"
+#include "trevrpc_ownership_abi6_internal.h"
 
 #include <errno.h> // IWYU pragma: keep
 #include <stdbool.h>
@@ -177,7 +177,7 @@ void trevrpc_inbound_response_release(trevrpc_inbound_response* response) {
         return;
     }
     free(response->message);
-    trevrpc_metadata_reset(&response->metadata);
+    trevrpc_internal_metadata_reset(&response->metadata);
     trevrpc_owned_bytes_reset(&response->body);
     free(response);
 }
@@ -248,7 +248,7 @@ void trevrpc_inbound_stream_frame_release(trevrpc_inbound_stream_frame* frame) {
         return;
     }
     free(frame->message);
-    trevrpc_metadata_reset(&frame->metadata);
+    trevrpc_internal_metadata_reset(&frame->metadata);
     trevrpc_owned_bytes_reset(&frame->body);
     free(frame);
 }

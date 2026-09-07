@@ -136,7 +136,9 @@ if(TREVRPC_BUILD_MSQUIC OR TREVRPC_BUILD_RPC OR TREVRPC_BUILD_TRANSPORT_MSQUIC)
         src/trevrpc_frame.c
         src/trevrpc_ownership.c
         src/trevrpc_values.c
+        src/trevrpc_values_abi6.c
         src/trevrpc_wire.c
+        src/trevrpc_wire_abi6.c
     )
     target_include_directories(trevrpc_core
         PUBLIC
@@ -215,6 +217,16 @@ if(TARGET trevrpc_core)
     trevrpc_c_sanitizers(trevrpc_core)
 endif()
 
+if(TREVRPC_BUILD_RPC)
+    add_library(trevrpc_rpc_private_core STATIC
+        src/trevrpc_values.c
+        src/trevrpc_wire.c
+    )
+    target_include_directories(trevrpc_rpc_private_core PRIVATE include src)
+    trevrpc_c_warnings(trevrpc_rpc_private_core)
+    trevrpc_c_sanitizers(trevrpc_rpc_private_core)
+endif()
+
 if(TREVRPC_BUILD_ENGINE)
     add_library(trevrpc_engine STATIC src/trevrpc_engine.c)
     target_include_directories(trevrpc_engine
@@ -284,7 +296,7 @@ if(TREVRPC_BUILD_RPC)
     target_link_libraries(trevrpc_rpc
         PUBLIC Threads::Threads
         PRIVATE
-            $<BUILD_INTERFACE:trevrpc_core>
+            $<BUILD_INTERFACE:trevrpc_rpc_private_core>
             $<INSTALL_INTERFACE:-ltrevrpc_rpc_private_core>
     )
     target_link_directories(trevrpc_rpc INTERFACE
@@ -1074,8 +1086,8 @@ if(TARGET trevrpc_core)
             RENAME "${CMAKE_STATIC_LIBRARY_PREFIX}trevrpc_transport_private_core${CMAKE_STATIC_LIBRARY_SUFFIX}"
         )
     endif()
-    if(TREVRPC_BUILD_RPC)
-        install(FILES $<TARGET_FILE:trevrpc_core>
+    if(TARGET trevrpc_rpc_private_core)
+        install(FILES $<TARGET_FILE:trevrpc_rpc_private_core>
             DESTINATION ${TREVRPC_RPC_PRIVATE_INSTALL_LIBDIR}
             RENAME "${CMAKE_STATIC_LIBRARY_PREFIX}trevrpc_rpc_private_core${CMAKE_STATIC_LIBRARY_SUFFIX}"
         )
@@ -1180,7 +1192,9 @@ if(TREVRPC_BUILD_MSQUIC)
     if(TREVRPC_INSTALL_INTERNAL_HEADERS)
         install(FILES
             src/trevrpc_owned_bytes_internal.h
+            src/trevrpc_ownership_abi6_internal.h
             src/trevrpc_values_internal.h
+            src/trevrpc_wire_abi6_internal.h
             src/trevrpc_wire_internal.h
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/trevrpc/internal
         )
@@ -1593,6 +1607,16 @@ if(TREVRPC_BUILD_TESTS)
                 -DTREVRPC_PUBLIC_HEADERS=${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_rpc.h
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc-abi1/check_symbols.cmake"
         )
+
+        if(TARGET trevrpc_rpc_private_core)
+            add_test(NAME trevrpc_rpc_private_core_symbols
+                COMMAND "${CMAKE_COMMAND}"
+                    -DTREVRPC_NM=${CMAKE_NM}
+                    -DTREVRPC_ARCHIVE=$<TARGET_FILE:trevrpc_rpc_private_core>
+                    -DTREVRPC_FORBIDDEN_MANIFEST=${CMAKE_CURRENT_SOURCE_DIR}/tests/abi6/public-symbols.txt
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc-abi1/check_private_core.cmake"
+            )
+        endif()
     endif()
 
     if(TARGET trevrpc_rpc_msquic)

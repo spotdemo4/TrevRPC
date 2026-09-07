@@ -9,7 +9,7 @@
 #include "trevrpc_raw.h"
 #include "trevrpc_runtime_internal.h"
 #include "trevrpc_webtransport.h"
-#include "trevrpc_wire_internal.h"
+#include "trevrpc_wire_abi6_internal.h"
 
 #include <errno.h> // IWYU pragma: keep
 #include <limits.h>

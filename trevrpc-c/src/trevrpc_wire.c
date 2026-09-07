@@ -214,7 +214,7 @@ int trevrpc_wire_encode_request_view(const char* service,
     if (service == NULL || method == NULL || (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
-    int err = trevrpc_metadata_validate(metadata);
+    int err = trevrpc_internal_metadata_validate(metadata);
     if (err != 0) {
         return err;
     }
@@ -248,7 +248,7 @@ int trevrpc_wire_encode_request_parts(
         return -EINVAL;
     }
     memset(parts, 0, sizeof(*parts));
-    int err = trevrpc_metadata_validate(&request->metadata);
+    int err = trevrpc_internal_metadata_validate(&request->metadata);
     if (err != 0) {
         return err;
     }
@@ -310,7 +310,7 @@ int trevrpc_wire_encode_response(
     if (response == NULL) {
         return -EINVAL;
     }
-    int err = trevrpc_metadata_validate(&response->metadata);
+    int err = trevrpc_internal_metadata_validate(&response->metadata);
     if (err != 0) {
         return err;
     }
@@ -350,7 +350,7 @@ int trevrpc_wire_encode_response_parts(
         return -EINVAL;
     }
     memset(parts, 0, sizeof(*parts));
-    int err = trevrpc_metadata_validate(&response->metadata);
+    int err = trevrpc_internal_metadata_validate(&response->metadata);
     if (err != 0) {
         return err;
     }
@@ -408,7 +408,7 @@ int trevrpc_wire_encode_stream_frame(uint32_t kind,
     if ((message == NULL && message_len > 0) || (body == NULL && body_len > 0)) {
         return -EINVAL;
     }
-    int err = trevrpc_metadata_validate(metadata);
+    int err = trevrpc_internal_metadata_validate(metadata);
     if (err != 0) {
         return err;
     }
@@ -442,7 +442,7 @@ int trevrpc_wire_encode_stream_status_parts(uint32_t status,
         return -EINVAL;
     }
     memset(parts, 0, sizeof(*parts));
-    int err = trevrpc_metadata_validate(metadata);
+    int err = trevrpc_internal_metadata_validate(metadata);
     if (err != 0) {
         return err;
     }
@@ -796,7 +796,7 @@ static int trevrpc_wire_parse_metadata_entry(
         }
     }
 
-    int err = trevrpc_metadata_set(metadata, (const char*)key, key_len, value, value_len);
+    int err = trevrpc_internal_metadata_set(metadata, (const char*)key, key_len, value, value_len);
     if (err == -ENOMEM) {
         trevrpc_wire_set_diagnostic(reason, TREVRPC_WIRE_DIAGNOSTIC_ALLOCATION_FAILURE);
         return err;
@@ -809,7 +809,7 @@ static int trevrpc_wire_parse_metadata_entry(
 }
 
 static int trevrpc_wire_request_decode_error(trevrpc_request* request, int err) {
-    trevrpc_request_reset(request);
+    trevrpc_internal_request_reset(request);
     return err;
 }
 
@@ -914,7 +914,7 @@ int trevrpc_wire_decode_request_diagnostic(
     if (deferred_metadata_err != 0) {
         return trevrpc_wire_request_decode_error(request, deferred_metadata_err);
     }
-    if (trevrpc_metadata_validate(&request->metadata) != 0) {
+    if (trevrpc_internal_metadata_validate(&request->metadata) != 0) {
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_INVALID_METADATA;
         return trevrpc_wire_request_decode_error(request, TREVRPC_ERR_INVALID_FRAME);
     }
@@ -941,7 +941,7 @@ int trevrpc_wire_decode_request(const uint8_t* data, size_t len, trevrpc_request
     return trevrpc_wire_decode_request_diagnostic(data, len, request, &diagnostic);
 }
 
-static int trevrpc_wire_decode_response_internal(const uint8_t* data,
+int trevrpc_internal_wire_decode_response_values(const uint8_t* data,
     size_t len,
     trevrpc_wire_response_values** out_response,
     uint8_t* body_owner,
@@ -1056,7 +1056,7 @@ static int trevrpc_wire_decode_response_internal(const uint8_t* data,
         }
     }
 
-    if (trevrpc_metadata_validate(&response->metadata) != 0) {
+    if (trevrpc_internal_metadata_validate(&response->metadata) != 0) {
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_INVALID_METADATA;
         trevrpc_internal_response_free(response);
         return TREVRPC_ERR_INVALID_FRAME;
@@ -1070,7 +1070,7 @@ static int trevrpc_wire_decode_response_internal(const uint8_t* data,
 
 int trevrpc_wire_decode_response_diagnostic(
     const uint8_t* data, size_t len, trevrpc_wire_response_values** out_response, trevrpc_wire_diagnostic* diagnostic) {
-    return trevrpc_wire_decode_response_internal(data, len, out_response, NULL, NULL, NULL, NULL, diagnostic);
+    return trevrpc_internal_wire_decode_response_values(data, len, out_response, NULL, NULL, NULL, NULL, diagnostic);
 }
 
 int trevrpc_wire_decode_response(const uint8_t* data, size_t len, trevrpc_wire_response_values** out_response) {
@@ -1084,10 +1084,10 @@ int trevrpc_wire_decode_response_take(
         return -EINVAL;
     }
     trevrpc_wire_diagnostic diagnostic = {0};
-    return trevrpc_wire_decode_response_internal(data, len, out_response, data, took_body, NULL, NULL, &diagnostic);
+    return trevrpc_internal_wire_decode_response_values(data, len, out_response, data, took_body, NULL, NULL, &diagnostic);
 }
 
-static int trevrpc_wire_decode_stream_frame_internal(const uint8_t* data,
+int trevrpc_internal_wire_decode_stream_frame_values(const uint8_t* data,
     size_t len,
     trevrpc_wire_stream_frame_values** out_frame,
     const uint8_t** body_view,
@@ -1192,7 +1192,7 @@ static int trevrpc_wire_decode_stream_frame_internal(const uint8_t* data,
         }
     }
 
-    if (trevrpc_metadata_validate(&frame->metadata) != 0) {
+    if (trevrpc_internal_metadata_validate(&frame->metadata) != 0) {
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_INVALID_METADATA;
         trevrpc_internal_stream_frame_free(frame);
         return TREVRPC_ERR_INVALID_FRAME;
@@ -1214,7 +1214,7 @@ int trevrpc_wire_decode_stream_frame_diagnostic(const uint8_t* data,
     size_t len,
     trevrpc_wire_stream_frame_values** out_frame,
     trevrpc_wire_diagnostic* diagnostic) {
-    return trevrpc_wire_decode_stream_frame_internal(data, len, out_frame, NULL, NULL, diagnostic);
+    return trevrpc_internal_wire_decode_stream_frame_values(data, len, out_frame, NULL, NULL, diagnostic);
 }
 
 int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_wire_stream_frame_values** out_frame) {
@@ -1242,75 +1242,4 @@ int trevrpc_wire_decode_stream_frame_take(
     }
 
     return trevrpc_wire_decode_stream_frame(data, len, out_frame);
-}
-
-int trevrpc_wire_decode_response_owned(trevrpc_owned_bytes* data, trevrpc_inbound_response** out_response) {
-    if (data == NULL) {
-        return -EINVAL;
-    }
-    trevrpc_owned_bytes owned = {0};
-    trevrpc_owned_bytes_move(&owned, data);
-    if (out_response == NULL || (owned.data == NULL && owned.len > 0)) {
-        trevrpc_owned_bytes_reset(&owned);
-        return -EINVAL;
-    }
-    *out_response = NULL;
-
-    const uint8_t* visible_body = NULL;
-    size_t visible_body_len = 0;
-    trevrpc_wire_response_values* values = NULL;
-    trevrpc_wire_diagnostic diagnostic = {0};
-    int err = trevrpc_wire_decode_response_internal(
-        owned.data, owned.len, &values, NULL, NULL, &visible_body, &visible_body_len, &diagnostic);
-    if (err != 0) {
-        trevrpc_owned_bytes_reset(&owned);
-        return err;
-    }
-    owned.data = visible_body;
-    owned.len = visible_body_len;
-    trevrpc_owned_bytes_move(&values->body, &owned);
-    err = trevrpc_inbound_response_create(values, out_response);
-    trevrpc_internal_response_free(values);
-    if (err != 0) {
-        trevrpc_owned_bytes_reset(&owned);
-    }
-    return err;
-}
-
-int trevrpc_wire_decode_stream_frame_owned_diagnostic(
-    trevrpc_owned_bytes* data, trevrpc_inbound_stream_frame** out_frame, trevrpc_wire_diagnostic* diagnostic) {
-    if (data == NULL) {
-        return -EINVAL;
-    }
-    trevrpc_owned_bytes owned = {0};
-    trevrpc_owned_bytes_move(&owned, data);
-    if (out_frame == NULL || diagnostic == NULL || (owned.data == NULL && owned.len > 0)) {
-        trevrpc_owned_bytes_reset(&owned);
-        return -EINVAL;
-    }
-    *out_frame = NULL;
-
-    const uint8_t* visible_body = NULL;
-    size_t visible_body_len = 0;
-    trevrpc_wire_stream_frame_values* values = NULL;
-    int err = trevrpc_wire_decode_stream_frame_internal(
-        owned.data, owned.len, &values, &visible_body, &visible_body_len, diagnostic);
-    if (err != 0) {
-        trevrpc_owned_bytes_reset(&owned);
-        return err;
-    }
-    owned.data = visible_body;
-    owned.len = visible_body_len;
-    trevrpc_owned_bytes_move(&values->body, &owned);
-    err = trevrpc_inbound_stream_frame_create(values, out_frame);
-    trevrpc_internal_stream_frame_free(values);
-    if (err != 0) {
-        trevrpc_owned_bytes_reset(&owned);
-    }
-    return err;
-}
-
-int trevrpc_wire_decode_stream_frame_owned(trevrpc_owned_bytes* data, trevrpc_inbound_stream_frame** out_frame) {
-    trevrpc_wire_diagnostic diagnostic = {0};
-    return trevrpc_wire_decode_stream_frame_owned_diagnostic(data, out_frame, &diagnostic);
 }

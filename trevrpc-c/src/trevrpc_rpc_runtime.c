@@ -1377,7 +1377,7 @@ static int trevrpc_rpc_metadata_view(trevrpc_rpc_runtime* runtime,
     }
     metadata->entries = *storage;
     metadata->entries_len = count;
-    if (trevrpc_metadata_validate(metadata) != 0) {
+    if (trevrpc_internal_metadata_validate(metadata) != 0) {
         free(*storage);
         *storage = NULL;
         *metadata = (trevrpc_metadata){0};
@@ -2010,14 +2010,14 @@ static int trevrpc_rpc_copy_request_event(trevrpc_rpc_runtime* runtime,
              request.kind == TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING) &&
             ((runtime->max_stream_messages >= 0 && runtime->max_stream_messages == 0) ||
                 (runtime->max_stream_body_size >= 0 && request.body_len > (uint64_t)runtime->max_stream_body_size)))) {
-        trevrpc_request_reset(&request);
+        trevrpc_internal_request_reset(&request);
         trevrpc_rpc_transport_receive_release(runtime->transport, transport_receive);
         trevrpc_rpc_abort_or_terminal(runtime, transport_stream, TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED, -EMSGSIZE);
         return -EMSGSIZE;
     }
     result = trevrpc_rpc_deadline_after(request.timeout_nanos, &deadline_nanos);
     if (result != 0) {
-        trevrpc_request_reset(&request);
+        trevrpc_internal_request_reset(&request);
         trevrpc_rpc_transport_receive_release(runtime->transport, transport_receive);
         trevrpc_rpc_abort_or_terminal(
             runtime, transport_stream, TREVRPC_RPC_STATUS_INTERNAL, result != 0 ? result : -EIO);
@@ -2038,7 +2038,7 @@ static int trevrpc_rpc_copy_request_event(trevrpc_rpc_runtime* runtime,
         trevrpc_rpc_event_destroy(event);
         trevrpc_rpc_event_destroy(readable_event);
         trevrpc_rpc_receive_destroy(receive);
-        trevrpc_request_reset(&request);
+        trevrpc_internal_request_reset(&request);
         trevrpc_rpc_transport_receive_release(runtime->transport, transport_receive);
         trevrpc_rpc_abort_or_terminal(runtime, transport_stream, TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED, -ENOMEM);
         return -ENOMEM;
@@ -2057,7 +2057,7 @@ static int trevrpc_rpc_copy_request_event(trevrpc_rpc_runtime* runtime,
         trevrpc_rpc_event_destroy(event);
         trevrpc_rpc_event_destroy(readable_event);
         trevrpc_rpc_receive_destroy(receive);
-        trevrpc_request_reset(&request);
+        trevrpc_internal_request_reset(&request);
         trevrpc_rpc_transport_receive_release(runtime->transport, transport_receive);
         trevrpc_rpc_abort_or_terminal(runtime, transport_stream, TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED, -ENOMEM);
         return result;
@@ -2145,7 +2145,7 @@ static int trevrpc_rpc_copy_request_event(trevrpc_rpc_runtime* runtime,
         }
     }
     pthread_mutex_unlock(&runtime->mutex);
-    trevrpc_request_reset(&request);
+    trevrpc_internal_request_reset(&request);
     trevrpc_rpc_transport_receive_release(runtime->transport, transport_receive);
     if (!admitted) {
         trevrpc_rpc_event_destroy(event);

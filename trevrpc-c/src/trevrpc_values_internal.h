@@ -82,12 +82,6 @@ typedef struct trevrpc_request {
 
 #endif
 
-#ifndef TREVRPC_INBOUND_VALUE_TYPES_DEFINED
-#define TREVRPC_INBOUND_VALUE_TYPES_DEFINED
-typedef struct trevrpc_inbound_response trevrpc_inbound_response;
-typedef struct trevrpc_inbound_stream_frame trevrpc_inbound_stream_frame;
-#endif
-
 #ifndef TREVRPC_CALL_CONTEXT_TYPE_DEFINED
 #define TREVRPC_CALL_CONTEXT_TYPE_DEFINED
 typedef struct trevrpc_call_context trevrpc_call_context;
@@ -137,10 +131,13 @@ typedef struct trevrpc_wire_stream_frame_values {
     trevrpc_metadata metadata;
 } trevrpc_wire_stream_frame_values;
 
-int trevrpc_metadata_set(
+uint32_t trevrpc_internal_status_code_from_uint32(uint32_t code);
+int trevrpc_internal_metadata_set(
     trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
-int trevrpc_metadata_validate(const trevrpc_metadata* metadata);
-void trevrpc_metadata_reset(trevrpc_metadata* metadata);
-void trevrpc_request_reset(trevrpc_request* request);
+int trevrpc_internal_metadata_set_normalized(
+    trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
+int trevrpc_internal_metadata_validate(const trevrpc_metadata* metadata);
+void trevrpc_internal_metadata_reset(trevrpc_metadata* metadata);
+void trevrpc_internal_request_reset(trevrpc_request* request);
 
 #endif
