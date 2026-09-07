@@ -922,6 +922,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_receive_errors_leave_direction_retryable() {
+        let provider = TestingProvider::create(TransportConfig::default())
+            .await
+            .expect("create testing provider");
+        let connection_handle = handle(2);
+        let connection = dial_connection(&provider, connection_handle).await;
+        let stream = open_stream(&provider, &connection, connection_handle, handle(3)).await;
+
+        for (status, body) in [
+            (-libc::EIO, b"after-io".as_slice()),
+            (-libc::ESHUTDOWN, b"after-shutdown".as_slice()),
+        ] {
+            provider
+                .script_status(status)
+                .expect("script transient receive error");
+            let error = stream.receive().await.expect_err("transient receive error");
+            assert_eq!(error.code(), status);
+
+            provider
+                .control
+                .push_receive_data(handle(3), body)
+                .expect("inject retry body");
+            let received = stream
+                .receive()
+                .await
+                .expect("retry receive")
+                .expect("retry body");
+            assert_eq!(received.as_bytes(), body);
+        }
+
+        drop(stream);
+        drop(connection);
+        wait_for_operation(
+            &provider,
+            sys::TREVRPC_TRANSPORT_TESTING_OPERATION_CLOSE_CONNECTION,
+        )
+        .await;
+        provider.push_stopped(0).expect("inject stopped event");
+        provider
+            .transport
+            .close()
+            .await
+            .expect("close testing transport");
+    }
+
+    #[tokio::test]
     async fn receive_fin_before_abort_keeps_the_direction_terminal() {
         let provider = TestingProvider::create(TransportConfig::default())
             .await

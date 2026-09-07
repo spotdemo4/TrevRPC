@@ -217,11 +217,33 @@ struct Shared {
     operations: Arc<AtomicU64>,
     active_operations: Arc<StdMutex<HashSet<u64>>>,
     accepting_commands: Arc<AtomicBool>,
+    command_reservations: Arc<AtomicU64>,
     shutdown_started: watch::Sender<bool>,
+}
+
+struct CommandReservation {
+    count: Arc<AtomicU64>,
+}
+
+impl CommandReservation {
+    fn new(count: Arc<AtomicU64>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self { count }
+    }
+}
+
+impl Drop for CommandReservation {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Shared {
     async fn send(&self, command: Command) -> Result<()> {
+        if !self.accepting_commands.load(Ordering::Acquire) {
+            return Err(NativeError::message("native transport is shutting down"));
+        }
+        let _reservation = CommandReservation::new(self.command_reservations.clone());
         if !self.accepting_commands.load(Ordering::Acquire) {
             return Err(NativeError::message("native transport is shutting down"));
         }
@@ -333,6 +355,7 @@ impl NativeTransport {
             operations: Arc::new(AtomicU64::new(1)),
             active_operations: Arc::new(StdMutex::new(HashSet::new())),
             accepting_commands: Arc::new(AtomicBool::new(true)),
+            command_reservations: Arc::new(AtomicU64::new(0)),
             shutdown_started,
         };
         let inner = Arc::new(TransportInner {
@@ -1666,6 +1689,10 @@ async fn wait_for_wake(
     result
 }
 
+fn command_queue_is_drained(shared: &Shared, commands_empty: bool) -> bool {
+    commands_empty && shared.command_reservations.load(Ordering::Acquire) == 0
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn owner_loop(
     shared: Shared,
@@ -1759,7 +1786,9 @@ async fn owner_loop(
                 }
             }
         }
-        if owner.shutdown_barrier_requested && commands.is_empty() {
+        if owner.shutdown_barrier_requested
+            && command_queue_is_drained(&owner.shared, commands.is_empty())
+        {
             owner.begin_shutdown();
         }
         owner.cancel_abandoned_operations();
@@ -3212,8 +3241,8 @@ mod tests {
     use super::{
         Command, ObjectKind, ObjectState, ReceiveDirectionState, RetiredReceive,
         SendDirectionState, Shared, StreamDirections, abort_half_guarded, clear_closed_reply,
-        is_remote_setup_failure, next_unused_id, receive_body_guarded, receive_result_is_terminal,
-        send_body, settle_receive_abort, take_cached_receive,
+        command_queue_is_drained, is_remote_setup_failure, next_unused_id, receive_body_guarded,
+        receive_result_is_terminal, send_body, settle_receive_abort, take_cached_receive,
     };
     use crate::ffi::Handle;
 
@@ -3231,6 +3260,7 @@ mod tests {
                 operations: Arc::new(AtomicU64::new(1)),
                 active_operations: Arc::new(StdMutex::new(std::collections::HashSet::new())),
                 accepting_commands: Arc::new(AtomicBool::new(true)),
+                command_reservations: Arc::new(AtomicU64::new(0)),
                 shutdown_started: watch::channel(false).0,
             },
             command_rx,
@@ -3302,8 +3332,42 @@ mod tests {
     async fn command_gate_rejects_work_after_shutdown() {
         let (shared, _commands, _cleanup) = shared();
         shared.begin_shutdown();
-        let (reply, _wait) = oneshot::channel();
+        let (reply, wait) = oneshot::channel();
         assert!(shared.send(Command::Diagnostics { reply }).await.is_err());
+        assert!(wait.await.is_err(), "rejected command must drop its reply");
+    }
+
+    #[tokio::test]
+    async fn shutdown_barrier_waits_for_reserved_command_permit() {
+        let (shared, mut commands, _cleanup) = shared();
+        let (first_reply, first_wait) = oneshot::channel();
+        shared
+            .send(Command::Diagnostics { reply: first_reply })
+            .await
+            .expect("fill bounded command queue");
+
+        let (reply, wait) = oneshot::channel();
+        let pending_shared = shared.clone();
+        let pending =
+            tokio::spawn(async move { pending_shared.send(Command::Diagnostics { reply }).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while shared.command_reservations.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("command reservation did not become observable");
+        assert!(!command_queue_is_drained(&shared, true));
+
+        shared.begin_shutdown();
+        assert!(commands.recv().await.is_some(), "queued command");
+        assert!(pending.await.expect("pending send task").is_err());
+        assert!(wait.await.is_err(), "dropped command must cancel its reply");
+        assert!(
+            first_wait.await.is_err(),
+            "consumed command must drop its reply"
+        );
+        assert!(command_queue_is_drained(&shared, true));
     }
 
     #[tokio::test]
