@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
 )
 
@@ -33,6 +34,152 @@ func TestStoppedErrorIsNonNilAfterCleanShutdown(t *testing.T) {
 	engine.closeErr = expected
 	if err := engine.stoppedError(); !errors.Is(err, expected) {
 		t.Fatalf("stoppedError() = %v, want %v", err, expected)
+	}
+}
+
+func TestEnqueueRejectsCommandAfterWakeFailure(t *testing.T) {
+	engine := newScriptedDriverEngine(t, &scriptedDriverRuntime{})
+	failure := errors.New("injected command wake failure")
+	wakeEntered := make(chan struct{})
+	releaseWake := make(chan struct{})
+	var releaseWakeOnce sync.Once
+	release := func() {
+		releaseWakeOnce.Do(func() { close(releaseWake) })
+	}
+	t.Cleanup(release)
+	engine.commandWriteFn = func(int, []byte) (int, error) {
+		close(wakeEntered)
+		<-releaseWake
+		return 0, failure
+	}
+
+	admissionAttempted := make(chan struct{})
+	admissionHeld := make(chan bool, 1)
+	engine.commandAdmissionAttemptFn = func() {
+		if engine.commandAdmission.TryLock() {
+			engine.commandAdmission.Unlock()
+			admissionHeld <- false
+		} else {
+			admissionHeld <- true
+		}
+		close(admissionAttempted)
+	}
+
+	executed := false
+	enqueueResult := make(chan error, 1)
+	go func() {
+		enqueueResult <- engine.enqueue(context.Background(), func(*driverState) {
+			executed = true
+		})
+	}()
+	select {
+	case <-wakeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("enqueue did not publish the command before wake failure")
+	}
+
+	processDone := make(chan struct{})
+	go func() {
+		engine.processCommands(&driverState{engine: engine})
+		close(processDone)
+	}()
+	select {
+	case <-admissionAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("processCommands did not reach commandAdmission")
+	}
+	if !<-admissionHeld {
+		t.Fatal("processCommands reached admission boundary without enqueue holding commandAdmission")
+	}
+	select {
+	case <-processDone:
+		t.Fatal("processCommands bypassed commandAdmission during wake failure")
+	default:
+	}
+	release()
+
+	select {
+	case err := <-enqueueResult:
+		if !errors.Is(err, failure) {
+			t.Fatalf("enqueue() error = %v, want %v", err, failure)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("enqueue did not settle after wake failure")
+	}
+	select {
+	case <-processDone:
+	case <-time.After(time.Second):
+		t.Fatal("processCommands did not settle rejected command")
+	}
+	if executed {
+		t.Fatal("command executed after synchronous wake rejection")
+	}
+	if !engine.closing.Load() {
+		t.Fatal("wake failure did not enter shutdown")
+	}
+}
+
+func TestCommandWakeRetriesEINTR(t *testing.T) {
+	engine := newScriptedDriverEngine(t, &scriptedDriverRuntime{})
+	calls := 0
+	engine.commandWriteFn = func(fd int, signal []byte) (int, error) {
+		calls++
+		if calls == 1 {
+			return 0, unix.EINTR
+		}
+		return unix.Write(fd, signal)
+	}
+
+	executed := 0
+	if err := engine.enqueue(context.Background(), func(*driverState) {
+		executed++
+	}); err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	engine.processCommands(&driverState{engine: engine})
+	if calls != 2 {
+		t.Fatalf("command wake write calls = %d, want 2", calls)
+	}
+	if executed != 1 {
+		t.Fatalf("command executions = %d, want 1", executed)
+	}
+}
+
+func TestCloseWakeFailureWakesInfinitePoll(t *testing.T) {
+	runtime := &scriptedDriverRuntime{stopOnBeginClose: true}
+	engine := newScriptedDriverEngine(t, runtime)
+	wakeRead, wakeWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	defer wakeRead.Close()
+	defer wakeWrite.Close()
+	engine.wakeDescriptors = []int{int(wakeRead.Fd())}
+	pollEntered := make(chan struct{})
+	engine.pollNativeWakeFn = func(wakeDescriptors []int, commandDescriptor, timeoutMilliseconds int) (uint32, error) {
+		close(pollEntered)
+		return pollNativeWake(wakeDescriptors, commandDescriptor, timeoutMilliseconds)
+	}
+	failure := errors.New("injected close wake failure")
+	engine.commandWriteFn = func(int, []byte) (int, error) {
+		return 0, failure
+	}
+	go engine.run()
+	select {
+	case <-pollEntered:
+	case <-time.After(time.Second):
+		t.Fatal("engine.run did not enter the infinite native poll")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- engine.Close() }()
+	select {
+	case err := <-closed:
+		if !errors.Is(err, failure) {
+			t.Fatalf("Close() error = %v, want %v", err, failure)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close() hung behind an un-woken infinite poll")
 	}
 }
 
@@ -185,6 +332,48 @@ func TestRuntimeReaperRetriesHandlesBeforeRuntimeRelease(t *testing.T) {
 	runtime.mu.Unlock()
 	if handleCalls != 2 || releaseCalls != 1 {
 		t.Fatalf("cleanup calls = handle %d, runtime %d, want 2, 1", handleCalls, releaseCalls)
+	}
+}
+
+func TestFinishStoppedBoundsPermanentHandleRelease(t *testing.T) {
+	handle := nativeHandle{owner: 2, slot: 3, generation: 4}
+	failure := errors.New("permanent handle release failure")
+	runtime := &scriptedDriverRuntime{
+		releaseHandleErrors: []error{failure, failure, failure, failure, failure},
+	}
+	engine := &Engine{runtime: runtime}
+	state := &driverState{
+		engine:          engine,
+		pendingReleases: make(map[handleReleaseKey]struct{}),
+	}
+	state.releaseHandle(handle, transportObjectStream)
+	state.finishStopped()
+	if !state.released {
+		t.Fatal("driver did not finish after permanent handle release failure")
+	}
+	deadline := time.After(time.Second)
+	for {
+		runtime.mu.Lock()
+		handleCalls := len(runtime.releaseHandleCalls)
+		runtime.mu.Unlock()
+		if handleCalls == runtimeReaperMaxAttempts+1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("permanent handle release was not bounded at %d calls", handleCalls)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if !errors.Is(engine.Err(), failure) {
+		t.Fatalf("Engine error = %v, want permanent handle failure", engine.Err())
+	}
+	runtime.mu.Lock()
+	handleCalls := len(runtime.releaseHandleCalls)
+	releaseCalls := runtime.releaseCalls
+	runtime.mu.Unlock()
+	if handleCalls != runtimeReaperMaxAttempts+1 || releaseCalls != 0 {
+		t.Fatalf("cleanup calls = handle %d, runtime %d, want %d, 0", handleCalls, releaseCalls, runtimeReaperMaxAttempts+1)
 	}
 }
 
@@ -603,6 +792,121 @@ func TestStreamHalfCancellationIsDirectional(t *testing.T) {
 			t.Fatalf("Close() after CancelWrite issued whole abort %+v", runtime.abortStreamCalls)
 		}
 	})
+}
+
+func TestReadableSchedulingRemainsFairWithManyStreams(t *testing.T) {
+	const unrelatedStreams = 10000
+	aHandle := nativeHandle{owner: 1, slot: 1, generation: 1}
+	bHandle := nativeHandle{owner: 1, slot: 2, generation: 1}
+	aBody := []byte("a")
+	bBody := []byte("b")
+	runtime := &scriptedDriverRuntime{
+		frames: map[nativeHandle][][]byte{
+			aHandle: {aBody},
+			bHandle: {bBody},
+		},
+	}
+	engine := &Engine{runtime: runtime, maxQueuedCount: 1, maxQueuedBytes: 1024}
+	streamA := newStream(engine, aHandle, transportinternal.ConnectionInfo{}, 1024)
+	streamB := newStream(engine, bHandle, transportinternal.ConnectionInfo{}, 1024)
+	state := &driverState{
+		engine:  engine,
+		streams: make(map[nativeHandle]*Stream, unrelatedStreams+2),
+	}
+	state.streams[aHandle] = streamA
+	state.streams[bHandle] = streamB
+	for index := 0; index < unrelatedStreams; index++ {
+		handle := nativeHandle{owner: 2, slot: uint32(index + 1), generation: 1}
+		state.streams[handle] = newStream(engine, handle, transportinternal.ConnectionInfo{}, 1024)
+	}
+
+	state.scheduleReadable(streamA)
+	state.scheduleReadable(streamB)
+	state.drainReadable()
+	if len(state.readableBlocked) != 1 || state.readableBlocked[0] != streamB {
+		t.Fatalf("blocked readable queue = %p, want stream B", state.readableBlocked)
+	}
+	if len(streamA.queuedBodies) != 1 || string(streamA.queuedBodies[0]) != string(aBody) {
+		t.Fatalf("stream A queued bodies = %q, want %q", streamA.queuedBodies, aBody)
+	}
+
+	streamA.queuedBodies = nil
+	streamA.queuedBytes = 0
+	streamA.queuedAccounted = false
+	state.queuedReceiveCount = 0
+	state.scheduleBlockedReadable()
+	state.scheduleReadable(streamA)
+	state.drainReadable()
+	if len(streamB.queuedBodies) != 1 || string(streamB.queuedBodies[0]) != string(bBody) {
+		t.Fatalf("stream B queued bodies = %q, want %q", streamB.queuedBodies, bBody)
+	}
+}
+
+func TestConcurrentStreamHalfCancellationIsDirectional(t *testing.T) {
+	runtime := &scriptedDriverRuntime{}
+	engine := newScriptedDriverEngine(t, runtime)
+	handle := nativeHandle{owner: 1, slot: 12, generation: 1}
+	stream := newStream(engine, handle, transportinternal.ConnectionInfo{}, 1024)
+	state := &driverState{
+		engine:  engine,
+		streams: map[nativeHandle]*Stream{handle: stream},
+	}
+
+	start := make(chan struct{})
+	readDone := make(chan struct{})
+	writeDone := make(chan struct{})
+	go func() {
+		<-start
+		stream.CancelRead(transportinternal.CloseReason{ApplicationCode: 41})
+		close(readDone)
+	}()
+	go func() {
+		<-start
+		stream.CancelWrite(transportinternal.CloseReason{ApplicationCode: 43})
+		close(writeDone)
+	}()
+	close(start)
+
+	commands := make([]driverCommand, 0, 2)
+	for len(commands) != cap(commands) {
+		select {
+		case command := <-engine.commands:
+			commands = append(commands, command)
+		case <-time.After(time.Second):
+			t.Fatal("concurrent half cancellation did not enqueue both commands")
+		}
+	}
+	for _, command := range commands {
+		command(state)
+	}
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("CancelRead did not complete")
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("CancelWrite did not complete")
+	}
+
+	if len(runtime.abortReadCalls) != 1 || runtime.abortReadCalls[0] != (abortCall{handle: handle, code: 41}) {
+		t.Fatalf("read abort calls = %+v", runtime.abortReadCalls)
+	}
+	if len(runtime.abortWriteCalls) != 1 || runtime.abortWriteCalls[0] != (abortCall{handle: handle, code: 43}) {
+		t.Fatalf("write abort calls = %+v", runtime.abortWriteCalls)
+	}
+	if len(runtime.abortStreamCalls) != 0 {
+		t.Fatalf("whole-stream abort calls = %+v", runtime.abortStreamCalls)
+	}
+	if !stream.receiveDone || !stream.readCancelled || !stream.sendDone {
+		t.Fatalf("stream half state = receiveDone %t, readCancelled %t, sendDone %t", stream.receiveDone, stream.readCancelled, stream.sendDone)
+	}
+	select {
+	case <-stream.Context().Done():
+		t.Fatal("directional cancellation canceled the whole stream context")
+	default:
+	}
 }
 
 func TestStreamHalfCancellationLoopback(t *testing.T) {
@@ -1368,6 +1672,7 @@ type scriptedDriverRuntime struct {
 	abortStreamCalls    []abortCall
 	nextEventErr        error
 	waitDrainedErr      error
+	stopOnBeginClose    bool
 	beginCloseCalls     int
 	releaseCalls        int
 }
@@ -1477,6 +1782,9 @@ func (runtime *scriptedDriverRuntime) releaseHandle(handle nativeHandle, kind ui
 
 func (runtime *scriptedDriverRuntime) beginClose() error {
 	runtime.beginCloseCalls++
+	if runtime.stopOnBeginClose {
+		runtime.events = append(runtime.events, nativeEvent{kind: eventStopped})
+	}
 	return nil
 }
 

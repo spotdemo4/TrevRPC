@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,24 +75,41 @@ type driverRuntime interface {
 
 type driverCommand func(*driverState)
 
+type nativeWakePoll func([]int, int, int) (uint32, error)
+
+type admittedCommand struct {
+	command  driverCommand
+	rejected atomic.Bool
+}
+
+func (command *admittedCommand) invoke(state *driverState) {
+	if command.rejected.Load() {
+		return
+	}
+	command.command(state)
+}
+
 type Engine struct {
-	runtime          driverRuntime
-	wakeDescriptors  []int
-	commandRead      *os.File
-	commandWrite     *os.File
-	commandPipeMu    sync.Mutex
-	commandAdmission sync.Mutex
-	commands         chan driverCommand
-	done             chan struct{}
-	closing          atomic.Bool
-	closeOnce        sync.Once
-	closeMu          sync.Mutex
-	closeErr         error
-	capacityMu       sync.Mutex
-	capacityChanged  chan struct{}
-	maxQueuedCount   uint32
-	maxQueuedBytes   uint64
-	requestedBackend transportinternal.Backend
+	runtime                   driverRuntime
+	wakeDescriptors           []int
+	commandRead               *os.File
+	commandWrite              *os.File
+	commandWriteFn            func(int, []byte) (int, error)
+	pollNativeWakeFn          nativeWakePoll
+	commandAdmissionAttemptFn func()
+	commandPipeMu             sync.Mutex
+	commandAdmission          sync.Mutex
+	commands                  chan driverCommand
+	done                      chan struct{}
+	closing                   atomic.Bool
+	closeOnce                 sync.Once
+	closeMu                   sync.Mutex
+	closeErr                  error
+	capacityMu                sync.Mutex
+	capacityChanged           chan struct{}
+	maxQueuedCount            uint32
+	maxQueuedBytes            uint64
+	requestedBackend          transportinternal.Backend
 }
 
 type handleReleaseKey struct {
@@ -112,6 +130,7 @@ type driverState struct {
 	pendingAdmissions  map[*transportAdmission]struct{}
 	pendingReleases    map[handleReleaseKey]struct{}
 	readable           []*Stream
+	readableBlocked    []*Stream
 	queuedReceiveCount uint32
 	queuedReceiveBytes uint64
 	closingStarted     bool
@@ -204,6 +223,7 @@ type Stream struct {
 	readWaiter      chan receiveResult
 	readable        bool
 	scheduled       bool
+	readableBlocked bool
 	readCancelled   bool
 	receiveDone     bool
 	receiveErr      error
@@ -334,43 +354,91 @@ func closeUnstartedRuntime(runtime driverRuntime) error {
 	return errors.Join(result, releaseErr)
 }
 
+const (
+	runtimeReaperMinimumDelay = 10 * time.Millisecond
+	runtimeReaperMaximumDelay = time.Second
+	runtimeReaperMaxAttempts  = 4
+)
+
 // startRuntimeReaper transfers retained native ownership out of the operational
-// driver so reconnect can proceed without leaking or spinning on failed release.
+// driver so reconnect can proceed without spinning on failed release. If a
+// child handle remains permanently unreleasable, the runtime is quarantined
+// rather than freed behind that live handle. The reaper is deliberately
+// bounded so a provider cannot keep a goroutine alive forever.
 func startRuntimeReaper(
 	runtime driverRuntime,
 	pending map[handleReleaseKey]struct{},
+) {
+	startRuntimeReaperWithReport(runtime, pending, nil)
+}
+
+func startRuntimeReaperWithReport(
+	runtime driverRuntime,
+	pending map[handleReleaseKey]struct{},
+	report func(error),
 ) {
 	owned := make(map[handleReleaseKey]struct{}, len(pending))
 	for key := range pending {
 		owned[key] = struct{}{}
 	}
-	go reapRuntime(runtime, owned)
+	go func() {
+		if err := reapRuntime(runtime, owned); err != nil && report != nil {
+			report(err)
+		}
+	}()
+}
+
+func sortedReleaseKeys(pending map[handleReleaseKey]struct{}) []handleReleaseKey {
+	keys := make([]handleReleaseKey, 0, len(pending))
+	for key := range pending {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(left, right int) bool {
+		a, b := keys[left], keys[right]
+		if a.handle.owner != b.handle.owner {
+			return a.handle.owner < b.handle.owner
+		}
+		if a.handle.slot != b.handle.slot {
+			return a.handle.slot < b.handle.slot
+		}
+		if a.handle.generation != b.handle.generation {
+			return a.handle.generation < b.handle.generation
+		}
+		return a.kind < b.kind
+	})
+	return keys
 }
 
 func reapRuntime(
 	runtime driverRuntime,
 	pending map[handleReleaseKey]struct{},
-) {
-	const (
-		minimumDelay = 10 * time.Millisecond
-		maximumDelay = time.Second
-	)
-	delay := minimumDelay
-	for {
+) error {
+	delay := runtimeReaperMinimumDelay
+	releaseErrors := make(map[handleReleaseKey]error, len(pending))
+	var waitDrainedErr error
+	var runtimeReleaseErr error
+	for attempt := 0; attempt < runtimeReaperMaxAttempts; attempt++ {
 		timer := time.NewTimer(delay)
 		<-timer.C
 		progress := false
 
-		for key := range pending {
+		for _, key := range sortedReleaseKeys(pending) {
 			err := runtime.releaseHandle(key.handle, key.kind)
 			if err == nil || nativeStatusIs(err, -int(unix.ESTALE)) {
 				delete(pending, key)
+				delete(releaseErrors, key)
 				progress = true
+			} else {
+				releaseErrors[key] = err
 			}
 		}
 		for {
 			event, present, err := runtime.nextEvent()
-			if err != nil || !present {
+			if err != nil {
+				waitDrainedErr = err
+				break
+			}
+			if !present {
 				break
 			}
 			progress = true
@@ -379,21 +447,58 @@ func reapRuntime(
 			}
 		}
 		if len(pending) == 0 {
-			_ = runtime.waitDrained()
-			consumed, _ := runtime.release()
+			waitDrainedErr = runtime.waitDrained()
+			consumed, err := runtime.release()
+			runtimeReleaseErr = err
 			if consumed {
-				return
+				if err != nil {
+					return fmt.Errorf("native runtime release completed with error: %w", err)
+				}
+				return nil
 			}
 		}
+		if attempt+1 == runtimeReaperMaxAttempts {
+			break
+		}
 		if progress {
-			delay = minimumDelay
-		} else if delay < maximumDelay {
+			delay = runtimeReaperMinimumDelay
+		} else if delay < runtimeReaperMaximumDelay {
 			delay *= 2
-			if delay > maximumDelay {
-				delay = maximumDelay
+			if delay > runtimeReaperMaximumDelay {
+				delay = runtimeReaperMaximumDelay
 			}
 		}
 	}
+
+	// Never release the runtime while child handles remain live. The provider
+	// may safely release the runtime only after all child releases complete;
+	// otherwise quarantine the runtime ownership and return a stable teardown
+	// diagnostic instead of freeing memory behind those handles.
+	causes := make([]error, 0, len(releaseErrors)+2)
+	releaseErrorKeys := make(map[handleReleaseKey]struct{}, len(releaseErrors))
+	for key := range releaseErrors {
+		releaseErrorKeys[key] = struct{}{}
+	}
+	for _, key := range sortedReleaseKeys(releaseErrorKeys) {
+		causes = append(causes, releaseErrors[key])
+	}
+	if waitDrainedErr != nil {
+		causes = append(causes, waitDrainedErr)
+	}
+	if runtimeReleaseErr != nil {
+		causes = append(causes, runtimeReleaseErr)
+	}
+	if len(pending) != 0 {
+		causes = append(causes, fmt.Errorf("%d native handle release(s) remained pending", len(pending)))
+	}
+	if len(causes) == 0 {
+		causes = append(causes, errors.New("native runtime release remained unconsumed"))
+	}
+	return fmt.Errorf(
+		"native runtime cleanup exhausted after %d attempts: %w",
+		runtimeReaperMaxAttempts,
+		errors.Join(causes...),
+	)
 }
 
 func normalizeEngineConfig(config EngineConfig) EngineConfig {
@@ -509,7 +614,11 @@ func (e *Engine) run() {
 		}
 
 		timeout := e.runtime.pollTimeoutMilliseconds()
-		ready, err := pollNativeWake(
+		pollWake := e.pollNativeWakeFn
+		if pollWake == nil {
+			pollWake = pollNativeWake
+		}
+		ready, err := pollWake(
 			e.wakeDescriptors,
 			int(e.commandRead.Fd()),
 			timeout,
@@ -529,7 +638,18 @@ func (e *Engine) run() {
 	}
 }
 
+// processCommands shares commandAdmission with enqueue so a command cannot be
+// observed by the driver until its wake signal has been accepted or rejected.
 func (e *Engine) processCommands(state *driverState) {
+	if attempt := e.commandAdmissionAttemptFn; attempt != nil {
+		attempt()
+	}
+	e.commandAdmission.Lock()
+	defer e.commandAdmission.Unlock()
+	e.processCommandsLocked(state)
+}
+
+func (e *Engine) processCommandsLocked(state *driverState) {
 	for {
 		select {
 		case command := <-e.commands:
@@ -555,17 +675,27 @@ func (e *Engine) enqueue(ctx context.Context, command driverCommand) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Keep admission held through the queue send and wake write. If signaling
+	// fails, the ticket is rejected before the driver can observe it.
 	e.commandAdmission.Lock()
 	defer e.commandAdmission.Unlock()
 	if e.closing.Load() {
 		return errEngineClosed
 	}
+	admitted := &admittedCommand{command: command}
 	select {
-	case e.commands <- command:
+	case e.commands <- admitted.invoke:
 	default:
 		return errNativeWouldBlock
 	}
-	return e.signalCommands()
+	if err := e.signalCommands(); err != nil {
+		admitted.rejected.Store(true)
+		e.closing.Store(true)
+		e.setCloseError(err)
+		e.forceCommandWake()
+		return err
+	}
+	return nil
 }
 
 // enqueueCleanup waits for driver capacity because an internal ownership transfer
@@ -577,7 +707,11 @@ func (e *Engine) enqueueCleanup(command driverCommand) {
 	}
 	select {
 	case e.commands <- command:
-		_ = e.signalCommands()
+		if err := e.signalCommands(); err != nil {
+			e.closing.Store(true)
+			e.setCloseError(err)
+			e.forceCommandWake()
+		}
 	case <-e.done:
 	}
 }
@@ -585,15 +719,38 @@ func (e *Engine) enqueueCleanup(command driverCommand) {
 func (e *Engine) signalCommands() error {
 	e.commandPipeMu.Lock()
 	defer e.commandPipeMu.Unlock()
+	if e.commandWrite == nil {
+		return errors.New("signal native Engine command: command pipe is unavailable")
+	}
+	write := e.commandWriteFn
+	if write == nil {
+		write = unix.Write
+	}
 	var signal [1]byte
-	_, err := unix.Write(int(e.commandWrite.Fd()), signal[:])
-	if err == nil || errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
-		return nil
+	for {
+		written, err := write(int(e.commandWrite.Fd()), signal[:])
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err == nil {
+			if written == len(signal) {
+				return nil
+			}
+			return io.ErrShortWrite
+		}
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			return nil
+		}
+		return fmt.Errorf("signal native Engine command: %w", err)
 	}
-	if e.closing.Load() {
-		return errEngineClosed
+}
+
+func (e *Engine) forceCommandWake() {
+	e.commandPipeMu.Lock()
+	defer e.commandPipeMu.Unlock()
+	if e.commandWrite != nil {
+		_ = e.commandWrite.Close()
 	}
-	return fmt.Errorf("signal native Engine command: %w", err)
 }
 
 func (e *Engine) Listen(ctx context.Context, config EndpointConfig) (*Listener, error) {
@@ -727,8 +884,9 @@ func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
 		e.commandAdmission.Lock()
 		if !e.closing.Swap(true) {
-			if err := e.signalCommands(); err != nil && !errors.Is(err, errEngineClosed) {
+			if err := e.signalCommands(); err != nil {
 				e.setCloseError(err)
+				e.forceCommandWake()
 			}
 		}
 		e.commandAdmission.Unlock()
@@ -1067,11 +1225,33 @@ func (state *driverState) streamTerminal(event nativeEvent) {
 
 func (state *driverState) scheduleReadable(stream *Stream) {
 	stream.readable = true
-	if stream.scheduled {
+	if stream.scheduled || stream.readableBlocked {
 		return
 	}
 	stream.scheduled = true
 	state.readable = append(state.readable, stream)
+}
+
+func (state *driverState) deferReadable(stream *Stream) {
+	if !stream.readable || stream.scheduled || stream.readableBlocked {
+		return
+	}
+	stream.readableBlocked = true
+	state.readableBlocked = append(state.readableBlocked, stream)
+}
+
+func (state *driverState) scheduleBlockedReadable() {
+	for len(state.readableBlocked) != 0 {
+		stream := state.readableBlocked[0]
+		state.readableBlocked[0] = nil
+		state.readableBlocked = state.readableBlocked[1:]
+		stream.readableBlocked = false
+		if !stream.readable || stream.scheduled {
+			continue
+		}
+		state.scheduleReadable(stream)
+		return
+	}
 }
 
 func (state *driverState) drainReadable() {
@@ -1084,6 +1264,7 @@ func (state *driverState) drainReadable() {
 			continue
 		}
 		if stream.readWaiter == nil && state.queuedReceiveCount >= state.engine.maxQueuedCount {
+			state.deferReadable(stream)
 			return
 		}
 		body, err := state.engine.runtime.receiveFrame(stream.handle)
@@ -1117,6 +1298,7 @@ func (state *driverState) drainReadable() {
 
 		state.deliverReceivedBody(stream, body)
 		if state.queuedReceiveBytes >= state.engine.maxQueuedBytes {
+			state.deferReadable(stream)
 			return
 		}
 		state.scheduleReadable(stream)
@@ -1160,14 +1342,6 @@ func (state *driverState) drainTerminalReceive(stream *Stream) {
 	}
 }
 
-func (state *driverState) scheduleAllReadable() {
-	for _, stream := range state.streams {
-		if stream.readable && !stream.scheduled {
-			state.scheduleReadable(stream)
-		}
-	}
-}
-
 func (state *driverState) detachQueuedReceiveAccounting(stream *Stream) {
 	if !stream.queuedAccounted {
 		return
@@ -1175,7 +1349,7 @@ func (state *driverState) detachQueuedReceiveAccounting(stream *Stream) {
 	state.queuedReceiveCount -= uint32(len(stream.queuedBodies))
 	state.queuedReceiveBytes -= stream.queuedBytes
 	stream.queuedAccounted = false
-	state.scheduleAllReadable()
+	state.scheduleBlockedReadable()
 }
 
 func (state *driverState) discardQueuedBodies(stream *Stream) {
@@ -1268,13 +1442,17 @@ func (state *driverState) finishStopped() {
 	}
 	state.engine.commandAdmission.Lock()
 	state.engine.closing.Store(true)
-	state.engine.processCommands(state)
+	state.engine.processCommandsLocked(state)
 	state.engine.commandAdmission.Unlock()
 	state.failPendingAdmissions(503)
 	state.failRemaining()
 	state.retryPendingReleases()
 	if len(state.pendingReleases) != 0 {
-		startRuntimeReaper(state.engine.runtime, state.pendingReleases)
+		startRuntimeReaperWithReport(
+			state.engine.runtime,
+			state.pendingReleases,
+			state.engine.setCloseError,
+		)
 		state.pendingReleases = nil
 		state.released = true
 		state.engine.setCloseError(state.terminalErr)
@@ -1288,7 +1466,11 @@ func (state *driverState) finishStopped() {
 		state.terminalErr = errors.Join(state.terminalErr, err)
 	}
 	if !consumed {
-		startRuntimeReaper(state.engine.runtime, nil)
+		startRuntimeReaperWithReport(
+			state.engine.runtime,
+			nil,
+			state.engine.setCloseError,
+		)
 	}
 	state.released = true
 	state.engine.setCloseError(state.terminalErr)
@@ -1755,7 +1937,8 @@ func (s *Stream) receiveFrame() ([]byte, error) {
 				state.queuedReceiveBytes -= uint64(len(body))
 			}
 			result <- receiveResult{body: body}
-			state.scheduleAllReadable()
+			state.scheduleBlockedReadable()
+			state.scheduleReadable(s)
 			state.drainReadable()
 			return
 		}
