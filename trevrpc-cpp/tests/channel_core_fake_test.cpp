@@ -1,4 +1,5 @@
 #include "detail/channel_core.hpp"
+#include "detail/lifecycle.hpp"
 #include "rpc_event_runtime_fake_fixture.h"
 
 #include <trevrpc_rpc.h>
@@ -543,6 +544,30 @@ void test_close_fences_admission_and_waits_for_pins() {
   assert(channel->close());
 }
 
+void test_final_owner_destruction_does_not_wait_for_pins() {
+  auto test = make_runtime();
+  auto control = std::make_shared<StarterControl>();
+  auto channel = make_channel(test, control);
+  ChannelCoreTestPeer::wait_for_attempts(*channel, 1);
+  wait_for_started_endpoints(control, 1);
+  assert(trevrpc_cpp_rpc_fake_push_connection_ready(test.fake) == 0);
+  assert(channel->wait_ready(std::chrono::seconds(1)));
+  auto lease_result = channel->acquire_generation();
+  assert(lease_result);
+  std::optional<ChannelCore::GenerationLease> lease(std::move(lease_result).value());
+
+  std::weak_ptr<ChannelCore> weak = channel;
+  auto destroying = std::async(std::launch::async, [channel = std::move(channel)] {});
+  const bool destruction_finished =
+      destroying.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+  lease.reset();
+  assert(destruction_finished);
+  destroying.get();
+  assert(weak.expired());
+  assert(trevrpc::detail::drain_lifecycle_reaper_until(
+      std::chrono::steady_clock::now() + std::chrono::seconds(1)));
+}
+
 void test_external_endpoint_close_is_observed() {
   auto test = make_runtime();
   auto control = std::make_shared<StarterControl>();
@@ -722,6 +747,7 @@ int main() {
   test_cancellation_submission_retries_after_reservation_failure();
   test_lifecycle_callbacks_are_off_driver_and_coalesced();
   test_close_fences_admission_and_waits_for_pins();
+  test_final_owner_destruction_does_not_wait_for_pins();
   test_external_endpoint_close_is_observed();
   test_persistent_endpoint_close_error_is_retryable();
   test_persistent_duplicate_endpoint_close_is_retryable();

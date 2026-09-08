@@ -111,6 +111,19 @@ public:
     armed_ = true;
   }
 
+  void hold_callback() {
+    std::lock_guard lock(mutex_);
+    hold_callback_ = true;
+  }
+
+  void release_callback() {
+    {
+      std::lock_guard lock(mutex_);
+      hold_callback_ = false;
+    }
+    condition_.notify_all();
+  }
+
   void channel_event(const trevrpc::ChannelLifecycleEvent&) override {
     std::shared_ptr<trevrpc::Channel> owner;
     {
@@ -123,11 +136,22 @@ public:
     }
     owner.reset();
     condition_.notify_all();
+
+    std::unique_lock lock(mutex_);
+    condition_.wait(lock, [this] { return !hold_callback_; });
+    callback_exited_ = true;
+    lock.unlock();
+    condition_.notify_all();
   }
 
   [[nodiscard]] bool wait_for_drop() {
     std::unique_lock lock(mutex_);
     return condition_.wait_for(lock, 5s, [this] { return dropped_; });
+  }
+
+  [[nodiscard]] bool wait_for_callback_exit() {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, 5s, [this] { return callback_exited_; });
   }
 
 private:
@@ -136,6 +160,8 @@ private:
   std::shared_ptr<trevrpc::Channel> owner_;
   bool armed_ = false;
   bool dropped_ = false;
+  bool hold_callback_ = false;
+  bool callback_exited_ = false;
 };
 
 trevrpc::Server make_server() {
@@ -290,6 +316,7 @@ void test_channel_final_owner_drop_from_callback() {
   assert(ready);
   std::weak_ptr<trevrpc::Channel> weak = channel;
   observer->arm(std::move(channel));
+  observer->hold_callback();
 
   trevrpc::ShutdownOptions options;
   options.graceful_timeout = 0ns;
@@ -301,6 +328,8 @@ void test_channel_final_owner_drop_from_callback() {
   assert(serve_result);
   assert(observer->wait_for_drop());
   assert(weak.expired());
+  observer->release_callback();
+  assert(observer->wait_for_callback_exit());
   assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() + 5s));
 }
 

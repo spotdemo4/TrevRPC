@@ -310,7 +310,7 @@ struct ChannelCore::SharedState final
       : runtime(std::move(runtime_value)), config(std::move(config_value)),
         endpoint_starter(std::move(endpoint_starter_value)), backoff(std::move(backoff_value)) {}
 
-  [[nodiscard]] Result<void> start() {
+  [[nodiscard]] Result<void> start(std::thread& worker) {
     const int injected_error = injected_channel_start_error.exchange(0, std::memory_order_acq_rel);
     if (injected_error != 0) {
       {
@@ -324,7 +324,7 @@ struct ChannelCore::SharedState final
       return Error::runtime(injected_error, "injected RPC channel coordinator start failure");
     }
     try {
-      std::thread([state = shared_from_this()] { state->worker_loop(); }).detach();
+      worker = std::thread([state = shared_from_this()] { state->worker_loop(); });
     } catch (...) {
       {
         std::lock_guard lock(mutex);
@@ -1078,7 +1078,7 @@ Result<std::shared_ptr<ChannelCore>> ChannelCore::create(std::shared_ptr<RpcEven
   } catch (...) {
     return Error::runtime(-ENOMEM, "failed to allocate RPC channel state");
   }
-  auto started = state->start();
+  auto started = state->start(core->worker_);
   if (!started) {
     return started.error();
   }
@@ -1175,7 +1175,15 @@ Result<std::shared_ptr<ChannelCore>> ChannelCore::connect(ChannelCoreConfig conf
   return core;
 }
 
-ChannelCore::~ChannelCore() { (void)request_close(); }
+ChannelCore::~ChannelCore() {
+  (void)request_close();
+  // ChannelCore can be destroyed while a client stream still owns a
+  // generation lease. The worker cannot finish until that lease is released,
+  // so never make destruction wait on user-owned stream lifetime. The reaper
+  // owns the join handle and provides bounded, deterministic test/application
+  // shutdown through drain_lifecycle_reaper_until().
+  reap_thread(std::move(worker_));
+}
 
 ChannelCorePhase ChannelCore::phase() const noexcept {
   auto state = state_;

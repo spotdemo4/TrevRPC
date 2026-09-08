@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace trevrpc::detail {
 
@@ -184,6 +185,7 @@ private:
   void test_enqueue_lifecycle(ChannelCoreEvent event);
   [[nodiscard]] std::size_t test_live_generations() const noexcept;
 
+  std::thread worker_;
   std::shared_ptr<SharedState> state_;
 };
 

@@ -326,6 +326,16 @@ bool drain_lifecycle_reaper_until(std::chrono::steady_clock::time_point deadline
   return lifecycle_reaper().drain_until(deadline);
 }
 
+void reap_thread(std::thread worker) noexcept {
+  // A worker may be the final owner of its ChannelCore. Keep its join handle
+  // on a different thread so the owner can finish without self-joining.
+  if (!worker.joinable()) {
+    return;
+  }
+  auto holder = std::make_shared<std::thread>(std::move(worker));
+  lifecycle_reaper().submit([holder = std::move(holder)] { holder->join(); });
+}
+
 void abandon_server(std::shared_ptr<ServerState> state) noexcept {
   if (!state) {
     return;

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 namespace trevrpc::detail {
 
@@ -64,6 +65,7 @@ private:
 
 [[nodiscard]] bool
 drain_lifecycle_reaper_until(std::chrono::steady_clock::time_point deadline) noexcept;
+void reap_thread(std::thread worker) noexcept;
 void abandon_server(std::shared_ptr<ServerState> state) noexcept;
 
 class ServerCallbackContextGuard final {
