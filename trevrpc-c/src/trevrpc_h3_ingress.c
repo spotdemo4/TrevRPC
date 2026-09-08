@@ -1,3 +1,6 @@
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc_h3_ingress_internal.h"
@@ -210,6 +213,51 @@ static int trevrpc_h3_ingress_deadline(
     return 0;
 }
 
+static int trevrpc_h3_ingress_condition_init(pthread_cond_t* cond) {
+#if defined(__APPLE__)
+    return pthread_cond_init(cond, NULL);
+#else
+    pthread_condattr_t attributes;
+    int err = pthread_condattr_init(&attributes);
+    if (err != 0) {
+        return err;
+    }
+    err = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    if (err == 0) {
+        err = pthread_cond_init(cond, &attributes);
+    }
+    pthread_condattr_destroy(&attributes);
+    return err;
+#endif
+}
+
+static int trevrpc_h3_ingress_platform_cond_timedwait(trevrpc_h3_ingress_runtime* runtime,
+    pthread_cond_t* cond,
+    pthread_mutex_t* mutex,
+    const struct timespec* deadline) {
+#if defined(__APPLE__)
+    struct timespec now;
+    struct timespec remaining;
+    if (trevrpc_h3_ingress_clock(runtime, CLOCK_MONOTONIC, &now) != 0) {
+        return errno;
+    }
+    if (now.tv_sec > deadline->tv_sec || (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)) {
+        return ETIMEDOUT;
+    }
+    remaining.tv_sec = deadline->tv_sec - now.tv_sec;
+    if (deadline->tv_nsec < now.tv_nsec) {
+        remaining.tv_sec--;
+        remaining.tv_nsec = 1000000000L + deadline->tv_nsec - now.tv_nsec;
+    } else {
+        remaining.tv_nsec = deadline->tv_nsec - now.tv_nsec;
+    }
+    return pthread_cond_timedwait_relative_np(cond, mutex, &remaining);
+#else
+    (void)runtime;
+    return pthread_cond_timedwait(cond, mutex, deadline);
+#endif
+}
+
 #ifdef TREVRPC_H3_INGRESS_TESTING
 void trevrpc_h3_ingress_test_force_next_timed_wait_timeout(void) {
     pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
@@ -226,8 +274,10 @@ void trevrpc_h3_ingress_test_wait_timed_wait_entered(void) {
     pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
 }
 
-static int trevrpc_h3_ingress_cond_timedwait(
-    pthread_cond_t* cond, pthread_mutex_t* mutex, const struct timespec* deadline) {
+static int trevrpc_h3_ingress_cond_timedwait(trevrpc_h3_ingress_runtime* runtime,
+    pthread_cond_t* cond,
+    pthread_mutex_t* mutex,
+    const struct timespec* deadline) {
     pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
     bool force_timeout = trevrpc_h3_ingress_test_force_timed_wait_timeout;
     if (force_timeout) {
@@ -236,7 +286,7 @@ static int trevrpc_h3_ingress_cond_timedwait(
     }
     pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
 
-    int err = pthread_cond_timedwait(cond, mutex, deadline);
+    int err = trevrpc_h3_ingress_platform_cond_timedwait(runtime, cond, mutex, deadline);
     pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
     if (force_timeout && trevrpc_h3_ingress_test_force_timed_wait_timeout && err == 0) {
         trevrpc_h3_ingress_test_force_timed_wait_timeout = false;
@@ -246,9 +296,11 @@ static int trevrpc_h3_ingress_cond_timedwait(
     return err;
 }
 #else
-static int trevrpc_h3_ingress_cond_timedwait(
-    pthread_cond_t* cond, pthread_mutex_t* mutex, const struct timespec* deadline) {
-    return pthread_cond_timedwait(cond, mutex, deadline);
+static int trevrpc_h3_ingress_cond_timedwait(trevrpc_h3_ingress_runtime* runtime,
+    pthread_cond_t* cond,
+    pthread_mutex_t* mutex,
+    const struct timespec* deadline) {
+    return trevrpc_h3_ingress_platform_cond_timedwait(runtime, cond, mutex, deadline);
 }
 #endif
 
@@ -926,17 +978,7 @@ int trevrpc_h3_ingress_create_with_ops(void* conn,
     if (err != 0) {
         goto fail_runtime_storage;
     }
-    pthread_condattr_t cond_attr;
-    err = pthread_condattr_init(&cond_attr);
-    if (err != 0) {
-        pthread_mutex_destroy(&runtime->mutex);
-        goto fail_runtime_storage;
-    }
-    err = pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
-    if (err == 0) {
-        err = pthread_cond_init(&runtime->cond, &cond_attr);
-    }
-    pthread_condattr_destroy(&cond_attr);
+    err = trevrpc_h3_ingress_condition_init(&runtime->cond);
     if (err != 0) {
         pthread_mutex_destroy(&runtime->mutex);
         goto fail_runtime_storage;
@@ -1247,8 +1289,9 @@ static int trevrpc_h3_ingress_pop_internal(trevrpc_h3_ingress* handle,
     runtime->active_waiters++;
     size_t queue_index = 0;
     while (!trevrpc_h3_ingress_select_queue(runtime, kind, action_queue_index, &queue_index) && !runtime->stopping) {
-        int err = timeout_nanos == 0 ? pthread_cond_wait(&runtime->cond, &runtime->mutex)
-                                     : trevrpc_h3_ingress_cond_timedwait(&runtime->cond, &runtime->mutex, &deadline);
+        int err = timeout_nanos == 0
+                      ? pthread_cond_wait(&runtime->cond, &runtime->mutex)
+                      : trevrpc_h3_ingress_cond_timedwait(runtime, &runtime->cond, &runtime->mutex, &deadline);
         if (err == ETIMEDOUT && !trevrpc_h3_ingress_select_queue(runtime, kind, action_queue_index, &queue_index) &&
             !runtime->stopping) {
             runtime->active_waiters--;
