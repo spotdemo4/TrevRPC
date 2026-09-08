@@ -464,6 +464,7 @@ typedef struct accept_event_counts {
     uint32_t stream_readable;
     uint32_t stream_failed;
     uint32_t stream_closed;
+    uint32_t receive_fin;
     uint32_t order[16];
     trevrpc_engine_handle_v1 order_subjects[16];
     uint32_t order_count;
@@ -507,6 +508,9 @@ static accept_event_counts drain_accept_events(receive_fixture* fixture) {
             break;
         case TREVRPC_ENGINE_EVENT_STREAM_CLOSED:
             counts.stream_closed++;
+            break;
+        case TREVRPC_ENGINE_EVENT_RECEIVE_FIN:
+            counts.receive_fin++;
             break;
         default:
             break;
@@ -1257,6 +1261,92 @@ static void test_peer_readable_waits_for_ready_commit(void) {
     fixture_destroy(&fixture);
 }
 
+static void test_peer_receive_fin_waits_for_ready_commit(void) {
+    receive_fixture fixture = fixture_create_with_capacities(1024, 1, 2);
+    adapter_listener* listener = fixture_add_listener(&fixture);
+    assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 6u) == QUIC_STATUS_SUCCESS);
+    adapter_connection* connection = fixture_queued_connection(&fixture, 0);
+    adapter_scheduler_drain(fixture.adapter);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_CONNECTED) == QUIC_STATUS_SUCCESS);
+    fixture_discard_events(&fixture);
+
+    assert(fixture_peer_stream(connection, TEST_PEER_STREAM_HANDLE_BASE + 1u) == QUIC_STATUS_SUCCESS);
+    adapter_stream* stream = connection->pending_peer_stream_head->stream;
+    AdapterTestReceiveDuringReadyPublication = true;
+    AdapterTestReceiveFINDuringReadyPublication = true;
+    adapter_scheduler_drain(fixture.adapter);
+    accept_event_counts counts = drain_accept_events(&fixture);
+    assert(counts.stream_ready == 1);
+    assert(counts.stream_readable == 1);
+    assert(counts.order_count == 3);
+    assert(counts.order[0] == TREVRPC_ENGINE_EVENT_STREAM_READY);
+    assert(counts.order[1] == TREVRPC_ENGINE_EVENT_STREAM_READABLE);
+    assert(counts.order[2] == TREVRPC_ENGINE_EVENT_RECEIVE_FIN);
+
+    trevrpc_engine_receive* receive = NULL;
+    assert(trevrpc_engine_stream_receive_frame(fixture.engine, stream->base.token, &receive) == 0);
+    trevrpc_engine_receive_release(receive);
+    assert(adapter_stream_callback(stream->base.handle,
+               stream,
+               &(QUIC_STREAM_EVENT){.Type = QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE}) == QUIC_STATUS_SUCCESS);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) == QUIC_STATUS_SUCCESS);
+    fixture_discard_events(&fixture);
+    assert(fixture.adapter->live_connections == 0);
+    assert(fixture.adapter->live_streams == 1);
+    fixture_destroy(&fixture);
+}
+
+static void test_peer_readiness_flush_failure_preserves_fin(void) {
+    receive_fixture fixture = fixture_create_with_capacities(1024, 1, 2);
+    adapter_listener* listener = fixture_add_listener(&fixture);
+    assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 8u) == QUIC_STATUS_SUCCESS);
+    adapter_connection* connection = fixture_queued_connection(&fixture, 0);
+    adapter_scheduler_drain(fixture.adapter);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_CONNECTED) == QUIC_STATUS_SUCCESS);
+    fixture_discard_events(&fixture);
+
+    assert(fixture_peer_stream(connection, TEST_PEER_STREAM_HANDLE_BASE + 6u) == QUIC_STATUS_SUCCESS);
+    adapter_stream* stream = connection->pending_peer_stream_head->stream;
+    AdapterTestReceiveDuringReadyPublication = true;
+    AdapterTestReceiveFINAfterReadyCommit = true;
+    AdapterTestFailNextReadablePublication = true;
+    AdapterTestSkipNextReadableRetry = true;
+    adapter_scheduler_drain(fixture.adapter);
+
+    accept_event_counts counts = drain_accept_events(&fixture);
+    assert(!AdapterTestFailNextReadablePublication);
+    assert(counts.stream_ready == 1);
+    assert(counts.stream_readable == 0);
+    assert(counts.receive_fin == 0);
+    assert(counts.order_count == 1);
+    assert(counts.order[0] == TREVRPC_ENGINE_EVENT_STREAM_READY);
+    assert(stream->readable_pending);
+    assert(stream->receive_fin_pending);
+    assert(stream->readiness_flush_in_progress);
+
+    adapter_scheduler_drain(fixture.adapter);
+    counts = drain_accept_events(&fixture);
+    assert(counts.stream_readable == 1);
+    assert(counts.receive_fin == 1);
+    assert(counts.order_count == 2);
+    assert(counts.order[0] == TREVRPC_ENGINE_EVENT_STREAM_READABLE);
+    assert(counts.order[1] == TREVRPC_ENGINE_EVENT_RECEIVE_FIN);
+    assert(stream->receive_fin_published);
+    assert(!stream->readiness_flush_in_progress);
+
+    trevrpc_engine_receive* receive = NULL;
+    assert(trevrpc_engine_stream_receive_frame(fixture.engine, stream->base.token, &receive) == 0);
+    trevrpc_engine_receive_release(receive);
+    assert(adapter_stream_callback(stream->base.handle,
+               stream,
+               &(QUIC_STREAM_EVENT){.Type = QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE}) == QUIC_STATUS_SUCCESS);
+    assert(fixture_connection_event(connection, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) == QUIC_STATUS_SUCCESS);
+    fixture_discard_events(&fixture);
+    assert(fixture.adapter->live_connections == 0);
+    assert(fixture.adapter->live_streams == 1);
+    fixture_destroy(&fixture);
+}
+
 static void test_peer_stream_waits_for_native_handle_publication(void) {
     receive_fixture fixture = fixture_create_with_capacities(1024, 1, 2);
     adapter_listener* listener = fixture_add_listener(&fixture);
@@ -1426,6 +1516,8 @@ int main(void) {
     test_shutdown_after_send_admission_rejects_and_reclaims();
     test_fatal_receive_error_aborts_after_unlock();
     test_peer_readable_waits_for_ready_commit();
+    test_peer_receive_fin_waits_for_ready_commit();
+    test_peer_readiness_flush_failure_preserves_fin();
     test_peer_stream_waits_for_native_handle_publication();
     test_peer_stream_queue_is_bounded_and_fifo();
     test_peer_stream_close_while_queued_publishes_once();

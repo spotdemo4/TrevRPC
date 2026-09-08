@@ -11,7 +11,6 @@
 #include "trevrpc_engine_msquic_internal.h"
 #include "trevrpc_engine_internal.h"
 #include "trevrpc_frame_internal.h"
-#include "trevrpc_msquic_internal.h"
 #include "trevrpc_msquic_api_owner.h"
 
 #include <arpa/inet.h>
@@ -181,7 +180,12 @@ struct adapter_stream {
     uint64_t readable_epoch;
     uint64_t readable_published_epoch;
     bool ready_event_committed;
+    bool readiness_flush_in_progress;
+    uint32_t receive_callbacks_in_progress;
     bool receive_fin_published;
+    bool receive_fin_pending;
+    uint32_t receive_fin_pending_flags;
+    int receive_fin_pending_status;
     bool receive_fin_optional;
     bool send_stopped_published;
     bool receive_paused;
@@ -268,6 +272,10 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
 static void publish_listener_terminal(adapter_listener* listener);
 static void publish_connection_terminal(adapter_connection* connection);
 static void publish_stream_terminal(adapter_stream* stream, bool failed, int status);
+static void publish_receive_fin(adapter_stream* stream, uint32_t event_flags, int status);
+static void maybe_finish_readiness_flush(adapter_stream* stream);
+static void leave_receive_callback(adapter_stream* stream);
+static int flush_stream_readiness(adapter_stream* stream);
 static void promote_peer_streams(adapter_connection* connection);
 static void adapter_schedule(msquic_provider* adapter);
 static void* adapter_scheduler_main(void* context);
@@ -1672,6 +1680,7 @@ static void resume_paused_receives(msquic_provider* adapter) {
 
 #ifdef TREVRPC_ENGINE_MSQUIC_TESTING
 static bool AdapterTestFailNextReadablePublication;
+static bool AdapterTestSkipNextReadableRetry;
 #endif
 
 static bool readable_publication_retryable(int result) {
@@ -1737,6 +1746,9 @@ static int publish_stream_readable(adapter_stream* stream, bool schedule_retry) 
         }
     }
     pthread_mutex_unlock(&stream->mutex);
+    if (result == 0) {
+        maybe_finish_readiness_flush(stream);
+    }
     if (result != 0 && readable_publication_retryable(result) && schedule_retry) {
         adapter_schedule(adapter);
         return 0;
@@ -1847,6 +1859,8 @@ static void owned_receive_release(void* owner, void* release_context) {
 #ifdef TREVRPC_ENGINE_MSQUIC_TESTING
 static bool AdapterTestFailNextReceiveCreate;
 static bool AdapterTestReceiveDuringReadyPublication;
+static bool AdapterTestReceiveFINDuringReadyPublication;
+static bool AdapterTestReceiveFINAfterReadyCommit;
 static bool AdapterTestShutdownAfterSendAdmission;
 static bool AdapterTestPromoteBeforePeerHandlePublication;
 static bool AdapterTestPeerStreamStayedQueued;
@@ -2479,6 +2493,7 @@ static int publish_stream_ready(adapter_stream* stream) {
     }
     stream->base.ready = true;
     stream->base.operation_pending = false;
+    stream->readiness_flush_in_progress = true;
     reservation = stream->base.ready_reservation;
     stream->base.ready_reservation = NULL;
     pthread_mutex_unlock(&adapter->mutex);
@@ -2492,6 +2507,11 @@ static int publish_stream_ready(adapter_stream* stream) {
         event.RECEIVE.TotalBufferLength = sizeof(frame);
         event.RECEIVE.BufferCount = 1;
         event.RECEIVE.Buffers = &buffer;
+        (void)adapter_stream_callback(stream->base.handle, stream, &event);
+    }
+    if (AdapterTestReceiveFINDuringReadyPublication) {
+        AdapterTestReceiveFINDuringReadyPublication = false;
+        QUIC_STREAM_EVENT event = {.Type = QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN};
         (void)adapter_stream_callback(stream->base.handle, stream, &event);
     }
 #endif
@@ -2512,12 +2532,63 @@ static int publish_stream_ready(adapter_stream* stream) {
         pthread_mutex_lock(&adapter->mutex);
         stream->ready_event_committed = true;
         pthread_mutex_unlock(&adapter->mutex);
-        pthread_mutex_lock(&stream->mutex);
-        bool readable_pending = stream->readable_pending;
-        pthread_mutex_unlock(&stream->mutex);
-        if (readable_pending) {
-            result = publish_stream_readable(stream, true);
+#ifdef TREVRPC_ENGINE_MSQUIC_TESTING
+        if (AdapterTestReceiveFINAfterReadyCommit) {
+            AdapterTestReceiveFINAfterReadyCommit = false;
+            QUIC_STREAM_EVENT event = {.Type = QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN};
+            (void)adapter_stream_callback(stream->base.handle, stream, &event);
         }
+#endif
+        result = flush_stream_readiness(stream);
+    } else {
+        pthread_mutex_lock(&adapter->mutex);
+        stream->readiness_flush_in_progress = false;
+        pthread_mutex_unlock(&adapter->mutex);
+    }
+    return result;
+}
+
+static bool stream_readable_flush_committed(adapter_stream* stream) {
+    pthread_mutex_lock(&stream->mutex);
+    bool committed = !stream->readable_pending || stream->readable_published_epoch == stream->readable_epoch;
+    pthread_mutex_unlock(&stream->mutex);
+    return committed;
+}
+
+static void maybe_finish_readiness_flush(adapter_stream* stream) {
+    msquic_provider* adapter = stream->base.adapter;
+    pthread_mutex_lock(&adapter->mutex);
+    if (!stream->ready_event_committed || !stream->readiness_flush_in_progress ||
+        stream->receive_callbacks_in_progress != 0 || !stream_readable_flush_committed(stream)) {
+        pthread_mutex_unlock(&adapter->mutex);
+        return;
+    }
+    bool receive_fin_pending = stream->receive_fin_pending;
+    stream->readiness_flush_in_progress = false;
+    pthread_mutex_unlock(&adapter->mutex);
+    if (receive_fin_pending) {
+        publish_receive_fin(stream, 0, 0);
+    }
+}
+
+static void leave_receive_callback(adapter_stream* stream) {
+    msquic_provider* adapter = stream->base.adapter;
+    pthread_mutex_lock(&adapter->mutex);
+    if (stream->receive_callbacks_in_progress != 0) {
+        stream->receive_callbacks_in_progress--;
+    }
+    pthread_mutex_unlock(&adapter->mutex);
+    maybe_finish_readiness_flush(stream);
+}
+
+static int flush_stream_readiness(adapter_stream* stream) {
+    int result = publish_stream_readable(stream, false);
+    if (result == 0) {
+        maybe_finish_readiness_flush(stream);
+    } else if (readable_publication_retryable(result)) {
+        maybe_finish_readiness_flush(stream);
+        adapter_schedule(stream->base.adapter);
+        result = 0;
     }
     return result;
 }
@@ -2776,6 +2847,27 @@ static void publish_receive_fin(adapter_stream* stream, uint32_t event_flags, in
     if (stream->receive_fin_published || stream->receive_fin_reservation == NULL) {
         pthread_mutex_unlock(&adapter->mutex);
         return;
+    }
+    if (!stream->ready_event_committed || stream->readiness_flush_in_progress) {
+        stream->receive_fin_pending = true;
+        stream->receive_fin_pending_flags |= event_flags;
+        if (stream->receive_fin_pending_status == 0 || status != 0) {
+            stream->receive_fin_pending_status = status;
+        }
+        pthread_mutex_lock(&stream->mutex);
+        stream->receive_paused = false;
+        pthread_mutex_unlock(&stream->mutex);
+        pthread_mutex_unlock(&adapter->mutex);
+        return;
+    }
+    if (stream->receive_fin_pending) {
+        event_flags |= stream->receive_fin_pending_flags;
+        if (status == 0) {
+            status = stream->receive_fin_pending_status;
+        }
+        stream->receive_fin_pending = false;
+        stream->receive_fin_pending_flags = 0;
+        stream->receive_fin_pending_status = 0;
     }
     stream->receive_fin_published = true;
     pthread_mutex_lock(&stream->mutex);
@@ -3192,18 +3284,27 @@ static void adapter_scheduler_drain(msquic_provider* adapter) {
         }
     }
 
-    if (atomic_load_explicit(&adapter->readable_retry_count, memory_order_relaxed) != 0) {
+#ifdef TREVRPC_ENGINE_MSQUIC_TESTING
+    bool skip_readable_retry = AdapterTestSkipNextReadableRetry;
+    AdapterTestSkipNextReadableRetry = false;
+#else
+    bool skip_readable_retry = false;
+#endif
+    if (!skip_readable_retry && atomic_load_explicit(&adapter->readable_retry_count, memory_order_relaxed) != 0) {
         for (uint32_t slot = adapter->stream_begin; slot < adapter->slot_count; ++slot) {
             adapter_stream* stream = NULL;
+            bool readiness_flush = false;
             pthread_mutex_lock(&adapter->mutex);
             adapter_object* object = adapter->slots[slot].object;
             if (adapter->state == TREVRPC_ENGINE_STATE_RUNNING && object != NULL &&
                 object->kind == TREVRPC_ENGINE_OBJECT_STREAM && !object->terminal_published &&
                 !atomic_load_explicit(&object->closing, memory_order_acquire)) {
                 stream = (adapter_stream*)object;
+                readiness_flush = stream->readiness_flush_in_progress;
                 pthread_mutex_lock(&stream->mutex);
-                bool retry = stream->readable_retry_pending && stream->readable_pending &&
-                             stream->readable_published_epoch == 0 && stream->receive_head != NULL;
+                bool retry = readiness_flush ||
+                             (stream->readable_retry_pending && stream->readable_pending &&
+                              stream->readable_published_epoch == 0 && stream->receive_head != NULL);
                 pthread_mutex_unlock(&stream->mutex);
                 if (retry) {
                     object->active_operations++;
@@ -3213,7 +3314,7 @@ static void adapter_scheduler_drain(msquic_provider* adapter) {
             }
             pthread_mutex_unlock(&adapter->mutex);
             if (stream != NULL) {
-                int result = publish_stream_readable(stream, false);
+                int result = readiness_flush ? flush_stream_readiness(stream) : publish_stream_readable(stream, false);
                 if (result != 0) {
                     adapter_fail_stop(adapter, result, "receive readiness retry failed");
                 }
@@ -3733,9 +3834,16 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
         bool publish = false;
         int result = 0;
         uint64_t accepted_total = 0;
+        /* MsQuic does not provide a per-stream callback serialization contract. Keep FIN
+         * behind this receive callback until any resulting READABLE is committed. */
+        pthread_mutex_lock(&adapter->mutex);
+        stream->receive_callbacks_in_progress++;
+        stream->readiness_flush_in_progress = true;
+        pthread_mutex_unlock(&adapter->mutex);
         pthread_mutex_lock(&stream->mutex);
         if (stream->receive_aborted) {
             pthread_mutex_unlock(&stream->mutex);
+            leave_receive_callback(stream);
             break;
         }
         for (uint32_t index = 0; index < event->RECEIVE.BufferCount && result == 0; index++) {
@@ -3784,6 +3892,7 @@ static QUIC_STATUS QUIC_API adapter_stream_callback(HQUIC handle, void* context,
                 adapter->api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
             }
         }
+        leave_receive_callback(stream);
         break;
     }
     case QUIC_STREAM_EVENT_SEND_COMPLETE: {
