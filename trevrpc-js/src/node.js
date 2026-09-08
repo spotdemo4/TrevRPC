@@ -783,15 +783,15 @@ class NativeResponseFrameStream {
       }
 
       const status = batch.status ?? null;
-      if (batch.eof && bodies.length === 0) {
-        return await this.#finishEof();
-      }
-      if (batch.eof && bodies.length > 0) {
+      if (batch.eof) {
         this.pendingBodyEof = true;
         if (status != null) {
           await this.#finishStatus(status);
         }
-        return { done: false, value: { bodies, status } };
+        if (bodies.length > 0 || status != null) {
+          return { done: false, value: { bodies, status } };
+        }
+        return await this.#finishEof();
       }
       if (status != null) {
         await this.#finishStatus(status);

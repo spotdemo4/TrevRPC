@@ -41,6 +41,39 @@ if (!available) {
   });
 
   test(
+    "production ABI1 WebTransport listener and client negotiate path and origin",
+    { timeout: 15_000 },
+    async () => {
+      const native = require(addonPath);
+      const certificate = await makeCertificate();
+      const origin = "http://127.0.0.1:8080";
+      const webtransportServer = await native.listenMsQuic({
+        host: "127.0.0.1",
+        port: 0,
+        certFile: certificate.cert,
+        keyFile: certificate.key,
+        transport: "webtransport",
+        path: "/trevrpc",
+        origin,
+      });
+      let client;
+      try {
+        client = await native.connectMsQuic({
+          host: "127.0.0.1",
+          port: webtransportServer.port,
+          transport: "webtransport",
+          path: "/trevrpc",
+          origin,
+          skipCertificateValidation: true,
+        });
+      } finally {
+        client?.close();
+        webtransportServer.close();
+      }
+    },
+  );
+
+  test(
     "production ABI1 endpoint, calls, streams, cancellation, and teardown",
     { timeout: 30_000 },
     async () => {

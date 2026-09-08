@@ -27,7 +27,15 @@ export interface NodeEndpoint {
   port: number;
 }
 
+export type NodeMsQuicTransport = "auto" | "native" | "http3" | "webtransport";
+
 export interface NodeConnectOptions {
+  /** Selects the native, HTTP/3, or WebTransport MsQuic protocol. */
+  transport?: NodeMsQuicTransport;
+  /** HTTP/3 or WebTransport request path. */
+  path?: string;
+  /** WebTransport Origin request header. */
+  origin?: string;
   caCertFile?: string;
   skipCertificateValidation?: boolean;
   maxStreamsPerSession?: number;
@@ -111,8 +119,6 @@ export type NodeHttp3Admission = (request: NodeHttp3AdmissionRequest) => boolean
 export interface NodeListenOptions extends NodeConnectOptions {
   host?: string;
   port?: number;
-  path?: string;
-  origin?: string;
   certFile?: string;
   keyFile?: string;
   maxSessionsPerConnection?: number;

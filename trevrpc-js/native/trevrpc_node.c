@@ -2507,12 +2507,16 @@ typedef struct node_endpoint_config_storage {
     char* host;
     char* server_name;
     char* ca_cert_file;
+    char* path;
+    char* origin;
 } node_endpoint_config_storage;
 
 static void node_endpoint_config_free(node_endpoint_config_storage* storage) {
     free(storage->host);
     free(storage->server_name);
     free(storage->ca_cert_file);
+    free(storage->path);
+    free(storage->origin);
     memset(storage, 0, sizeof(*storage));
 }
 
@@ -2554,6 +2558,24 @@ static int node_parse_endpoint_config(
     }
     if (node_get_named_value(env, options, "caCertFile", &value, &present) != 0 ||
         (present && node_copy_js_string(env, value, &out->ca_cert_file, &(uint32_t){0}) != 0)) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (node_get_named_value(env, options, "http3Path", &value, &present) != 0) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (present && node_copy_js_string(env, value, &out->path, &(uint32_t){0}) != 0) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (out->path == NULL && (node_get_named_value(env, options, "path", &value, &present) != 0 ||
+                                 (present && node_copy_js_string(env, value, &out->path, &(uint32_t){0}) != 0))) {
+        node_endpoint_config_free(out);
+        return -EINVAL;
+    }
+    if (node_get_named_value(env, options, "origin", &value, &present) != 0 ||
+        (present && node_copy_js_string(env, value, &out->origin, &(uint32_t){0}) != 0)) {
         node_endpoint_config_free(out);
         return -EINVAL;
     }
@@ -2609,6 +2631,10 @@ static int node_parse_endpoint_config(
     out->config.server_name_len = (uint32_t)strlen(out->server_name);
     out->config.ca_cert_file = out->ca_cert_file;
     out->config.ca_cert_file_len = out->ca_cert_file == NULL ? 0 : (uint32_t)strlen(out->ca_cert_file);
+    out->config.path = out->path;
+    out->config.path_len = out->path == NULL ? 0 : (uint32_t)strlen(out->path);
+    out->config.origin = out->origin;
+    out->config.origin_len = out->origin == NULL ? 0 : (uint32_t)strlen(out->origin);
     bool skip_validation = false;
     if (node_get_named_bool(env, options, "skipCertificateValidation", &skip_validation, &present) != 0) {
         node_endpoint_config_free(out);
@@ -5704,47 +5730,16 @@ static napi_value node_listen_msquic(napi_env env, napi_callback_info info) {
     storage.config.key_file_len = (uint32_t)strlen(key_file);
     storage.config.ca_cert_file = NULL;
     storage.config.ca_cert_file_len = 0;
-    storage.config.transport = enable_http3 ? TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3 : TREVRPC_RPC_MSQUIC_TRANSPORT_AUTO;
+    if (enable_http3) {
+        storage.config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3;
+    }
     storage.config.flags = TREVRPC_RPC_MSQUIC_VERIFY_PEER |
                            (enable_http3 && has_admission ? TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS : 0);
-    char* path = NULL;
-    int path_result = 0;
-    if (node_get_named_value(env, argv[0], "http3Path", &value, &present) != 0) {
-        free(cert_file);
-        free(key_file);
-        node_endpoint_config_free(&storage);
-        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
-    }
-    if (present) {
-        path_result = node_copy_js_string(env, value, &path, &(uint32_t){0});
-    }
-    if (path_result == 0 && path == NULL) {
-        if (node_get_named_value(env, argv[0], "path", &value, &present) != 0) {
-            free(cert_file);
-            free(key_file);
-            free(path);
-            node_endpoint_config_free(&storage);
-            return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
-        }
-        if (present) {
-            path_result = node_copy_js_string(env, value, &path, &(uint32_t){0});
-        }
-    }
-    if (path_result != 0) {
-        free(cert_file);
-        free(key_file);
-        free(path);
-        node_endpoint_config_free(&storage);
-        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
-    }
-    storage.config.path = path;
-    storage.config.path_len = path == NULL ? 0 : (uint32_t)strlen(path);
     napi_deferred deferred;
     napi_value promise = node_new_promise(env, &deferred);
     if (promise == NULL) {
         free(cert_file);
         free(key_file);
-        free(path);
         node_endpoint_config_free(&storage);
         return NULL;
     }
@@ -5769,7 +5764,6 @@ static napi_value node_listen_msquic(napi_env env, napi_callback_info info) {
             node_operation_remove(runtime, operation);
         free(cert_file);
         free(key_file);
-        free(path);
         node_endpoint_config_free(&storage);
         (void)node_reject_deferred_native(env, deferred, -ENOMEM, "listenMsQuic");
         return promise;
@@ -5790,7 +5784,6 @@ static napi_value node_listen_msquic(napi_env env, napi_callback_info info) {
             free(reserved);
             free(cert_file);
             free(key_file);
-            free(path);
             node_endpoint_config_free(&storage);
             (void)node_reject_deferred_native(env, deferred, -ENOMEM, "listenMsQuic");
             return promise;
@@ -5799,7 +5792,6 @@ static napi_value node_listen_msquic(napi_env env, napi_callback_info info) {
     int start = trevrpc_rpc_msquic_endpoint_start_v1(runtime->rpc, &storage.config, id, &endpoint->endpoint);
     free(cert_file);
     free(key_file);
-    free(path);
     node_endpoint_config_free(&storage);
     if (start != 0) {
         if (server->admission_ref != NULL)

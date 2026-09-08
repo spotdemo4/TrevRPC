@@ -6,15 +6,24 @@ import test from "node:test";
 const nativeSourcePath = join(import.meta.dirname, "..", "native", "trevrpc_node.c");
 const nativeCMakePath = join(import.meta.dirname, "..", "native", "CMakeLists.txt");
 
-const forbidden = [
-  ["ABI6 public header", /#include\s+[<"]trevrpc\.h[>"]/u],
+const forbiddenSource = [
+  ["removed aggregate public header", /#include\s+[<"]trevrpc\.h[>"]/u],
   ["binding header", /trevrpc_binding/u],
   ["legacy raw API", /trevrpc_raw_/u],
   ["legacy worker implementation", /pthread_|pthread\s*\(/u],
   ["thread-safe function", /napi_(?:create|call|release|acquire|ref|unref)_threadsafe_function/u],
   ["N-API async work", /napi_(?:create|queue|delete|cancel)_async_work/u],
-  ["ABI6 runtime target", /TREVRPC_BUILD_RUNTIME\s+ON/u],
-  ["ABI6 provider target", /TREVRPC_BUILD_MSQUIC\s+ON/u],
+];
+
+const forbiddenCmake = [
+  ["removed aggregate runtime option", /TREVRPC_BUILD_RUNTIME/u],
+  ["removed aggregate provider option", /TREVRPC_BUILD_MSQUIC/u],
+  ["removed WebTransport facade option", /TREVRPC_BUILD_WEBTRANSPORT/u],
+  ["removed internal-header install option", /TREVRPC_INSTALL_INTERNAL_HEADERS/u],
+  ["removed aggregate CMake install option", /TREVRPC_INSTALL_CMAKEDIR/u],
+  ["removed aggregate ABI version", /TREVRPC_C_ABI_VERSION/u],
+  ["removed aggregate package lookup", /find_package\s*\(\s*trevrpc(?:\s|\))/u],
+  ["removed aggregate imported target", /trevrpc::trevrpc(?:\s|[)"'])/u],
 ];
 
 const required = [
@@ -54,8 +63,11 @@ test("native addon uses only the RPC ABI1 public boundary", async () => {
   const source = await readFile(nativeSourcePath, "utf8");
   const cmake = await readFile(nativeCMakePath, "utf8");
 
-  for (const [name, pattern] of forbidden) {
+  for (const [name, pattern] of forbiddenSource) {
     assert.doesNotMatch(source, pattern, `${name} remains in ${nativeSourcePath}`);
+  }
+  for (const [name, pattern] of forbiddenCmake) {
+    assert.doesNotMatch(cmake, pattern, `${name} remains in ${nativeCMakePath}`);
   }
   for (const symbol of required) {
     assert.match(

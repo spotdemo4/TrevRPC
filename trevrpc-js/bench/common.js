@@ -15,14 +15,14 @@ export const MaxFrameSize = MaxPayloadBytes + 1024;
 export function listenOptionsForStack(stack, webtransportOrigin) {
   switch (stack) {
     case NativeQUICStack:
-      return { path: "", enableNative: true };
+      return { transport: "native" };
     case HTTP3Stack:
-      return { path: "", enableNative: false, enableHttp3: true, http3Path: "/trevrpc" };
+      return { transport: "http3", path: "/trevrpc" };
     case WebTransportStack:
       if (webtransportOrigin == null || webtransportOrigin === "") {
         throw new Error("WebTransport listen options require an origin");
       }
-      return { path: "/trevrpc", origin: webtransportOrigin, enableNative: false };
+      return { transport: "webtransport", path: "/trevrpc", origin: webtransportOrigin };
     default:
       throw new Error(`unsupported server stack ${JSON.stringify(stack)}`);
   }

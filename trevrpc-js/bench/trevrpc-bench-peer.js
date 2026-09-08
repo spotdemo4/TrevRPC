@@ -257,8 +257,8 @@ async function runServer(config, io) {
   }
 }
 
-async function listenBenchmarkServer(config) {
-  const server = await NodeServer.listen({
+export function benchmarkServerOptions(config) {
+  return {
     host: config.listen.host,
     port: config.listen.port,
     certFile: config.cert,
@@ -271,7 +271,11 @@ async function listenBenchmarkServer(config) {
     streamIdleTimeoutMs: IdleTimeoutMs,
     maxFrameSize: MaxFrameSize,
     maxPendingSendBytes: MaxFrameSize,
-  });
+  };
+}
+
+async function listenBenchmarkServer(config) {
+  const server = await NodeServer.listen(benchmarkServerOptions(config));
   server.registerService(BenchmarkService, createBenchmarkHandlers());
   const done = server.serve();
   return {

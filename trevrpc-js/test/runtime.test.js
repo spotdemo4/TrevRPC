@@ -1292,6 +1292,52 @@ test("Node transport preserves status when native body batch reaches EOF", async
   assert.equal(closed, true);
 });
 
+test("Node transport preserves a status-only native EOF body batch", async () => {
+  const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
+  let recvCalls = 0;
+  let closed = false;
+  const nativeClient = {
+    async startStream() {
+      return {
+        async sendMessage() {},
+        async finishSend() {},
+        async recvBodyBatch() {
+          recvCalls += 1;
+          return recvCalls === 1
+            ? {
+                bodies: [],
+                status: { status: Code.Ok, message: "complete", metadata: {} },
+                eof: true,
+              }
+            : null;
+        },
+        close() {
+          closed = true;
+        },
+      };
+    },
+  };
+  const transport = new RawNodeTransport(nativeClient);
+  const responses = await transport.streamingCall(
+    {
+      service: "test",
+      method: "statusOnlyBodyBatchEof",
+      kind: RpcKind.ServerStreaming,
+      body: new Uint8Array(),
+    },
+    emptyAsyncIterable(),
+  );
+  const iterator = responses[Symbol.asyncIterator]();
+  const first = await iterator.nextBodyBatch();
+  assert.equal(first.done, false);
+  assert.deepEqual(first.value.bodies, []);
+  assert.equal(first.value.status.status, Code.Ok);
+  assert.equal(first.value.status.message, "complete");
+  assert.deepEqual(await iterator.nextBodyBatch(), { done: true, value: undefined });
+  assert.equal(closed, true);
+  assert.equal(recvCalls, 1);
+});
+
 test("Node transport terminal OK reports already-settled local upload errors", async () => {
   const { RawNodeTransport } = await import("@trevrpc/trevrpc-js/node/advanced");
   const uploadError = invalidArgument("local upload failed");

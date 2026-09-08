@@ -9,7 +9,10 @@ import { Code, RpcStreamFrameKind, protobuf } from "@trevrpc/trevrpc-js";
 
 import {
   HTTP3Stack,
+  IdleTimeoutMs,
   LogLinearHistogram,
+  MaxConcurrency,
+  MaxFrameSize,
   NativeQUICStack,
   WebTransportStack,
   createClientOperation,
@@ -18,7 +21,11 @@ import {
   prepareFixedAdmissionPhase,
   root,
 } from "../common.js";
-import { createBenchmarkHandlers, parseCommandLine } from "../trevrpc-bench-peer.js";
+import {
+  benchmarkServerOptions,
+  createBenchmarkHandlers,
+  parseCommandLine,
+} from "../trevrpc-bench-peer.js";
 
 const execFileAsync = promisify(execFile);
 const BenchmarkRequest = root.lookupType("trevrpc.benchmark.v1.BenchmarkRequest");
@@ -292,23 +299,48 @@ test("benchmark peer parses required client and IPv6 server options", () => {
   );
 });
 
-test("server listen options keep HTTP/3 and WebTransport exclusive", () => {
+test("server listen options select one canonical native protocol", () => {
   assert.deepEqual(listenOptionsForStack(NativeQUICStack), {
-    path: "",
-    enableNative: true,
+    transport: "native",
   });
   assert.deepEqual(listenOptionsForStack(HTTP3Stack), {
-    path: "",
-    enableNative: false,
-    enableHttp3: true,
-    http3Path: "/trevrpc",
+    transport: "http3",
+    path: "/trevrpc",
   });
   assert.deepEqual(listenOptionsForStack(WebTransportStack, "https://benchmark.example"), {
+    transport: "webtransport",
     path: "/trevrpc",
     origin: "https://benchmark.example",
-    enableNative: false,
   });
   assert.throws(() => listenOptionsForStack(WebTransportStack), /require an origin/u);
+});
+
+test("WebTransport benchmark servers select the WebTransport native protocol", () => {
+  assert.deepEqual(
+    benchmarkServerOptions({
+      stack: "trevrpc_webtransport",
+      listen: { host: "127.0.0.1", port: 0 },
+      cert: "server.pem",
+      key: "server-key.pem",
+      webtransportOrigin: "http://127.0.0.1:8080",
+    }),
+    {
+      host: "127.0.0.1",
+      port: 0,
+      certFile: "server.pem",
+      keyFile: "server-key.pem",
+      transport: "webtransport",
+      path: "/trevrpc",
+      origin: "http://127.0.0.1:8080",
+      maxSessionsPerConnection: 16,
+      maxStreamsPerSession: MaxConcurrency,
+      maxStreamMessages: -1,
+      idleTimeoutMs: IdleTimeoutMs,
+      streamIdleTimeoutMs: IdleTimeoutMs,
+      maxFrameSize: MaxFrameSize,
+      maxPendingSendBytes: MaxFrameSize,
+    },
+  );
 });
 
 test("log_linear_v1 uses exact low buckets and sorted sparse output", () => {
