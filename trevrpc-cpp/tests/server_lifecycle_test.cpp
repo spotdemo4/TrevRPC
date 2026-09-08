@@ -45,6 +45,7 @@ void test_large_frame_webtransport_server_starts() {
   config.port = 0;
   config.cert_file = TREVRPC_CPP_TEST_CERT;
   config.key_file = TREVRPC_CPP_TEST_KEY;
+  config.enable_native = false;
   config.webtransport_path = "/trevrpc";
   config.webtransport_origin = "http://127.0.0.1:4443";
   config.max_frame_size = 64u * 1024u * 1024u + 1024u;

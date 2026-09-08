@@ -5721,10 +5721,40 @@ static napi_value node_listen_msquic(napi_env env, napi_callback_info info) {
         return NULL;
     }
     bool has_admission = present;
-    bool enable_http3 = false;
-    if (node_get_named_bool(env, argv[0], "enableHttp3", &enable_http3, &present) != 0) {
+    bool transport_present = false;
+    if (node_get_named_value(env, argv[0], "transport", &value, &transport_present) != 0) {
         node_endpoint_config_free(&storage);
         return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    bool enable_native = true;
+    bool enable_native_present = false;
+    if (node_get_named_bool(env, argv[0], "enableNative", &enable_native, &enable_native_present) != 0) {
+        node_endpoint_config_free(&storage);
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    bool enable_http3 = false;
+    bool enable_http3_present = false;
+    if (node_get_named_bool(env, argv[0], "enableHttp3", &enable_http3, &enable_http3_present) != 0) {
+        node_endpoint_config_free(&storage);
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    if (transport_present && (enable_native_present || enable_http3_present)) {
+        node_endpoint_config_free(&storage);
+        return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+    }
+    if (!transport_present) {
+        if (enable_http3) {
+            if (enable_native) {
+                node_endpoint_config_free(&storage);
+                return node_rejected_native_promise(env, -ENOTSUP, "listenMsQuic");
+            }
+            storage.config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3;
+        } else if (!enable_native) {
+            node_endpoint_config_free(&storage);
+            return node_rejected_native_promise(env, -EINVAL, "listenMsQuic");
+        } else {
+            storage.config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE;
+        }
     }
     char* cert_file = NULL;
     char* key_file = NULL;
@@ -5743,11 +5773,9 @@ static napi_value node_listen_msquic(napi_env env, napi_callback_info info) {
     storage.config.key_file_len = (uint32_t)strlen(key_file);
     storage.config.ca_cert_file = NULL;
     storage.config.ca_cert_file_len = 0;
-    if (enable_http3) {
-        storage.config.transport = TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3;
-    }
+    const bool http3_selected = storage.config.transport == TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3;
     storage.config.flags = TREVRPC_RPC_MSQUIC_VERIFY_PEER |
-                           (enable_http3 && has_admission ? TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS : 0);
+                           (http3_selected && has_admission ? TREVRPC_RPC_MSQUIC_ENABLE_ADMISSION_EVENTS : 0);
     napi_deferred deferred;
     napi_value promise = node_new_promise(env, &deferred);
     if (promise == NULL) {

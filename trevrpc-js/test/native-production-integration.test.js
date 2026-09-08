@@ -73,6 +73,32 @@ if (!available) {
     },
   );
 
+  test("legacy listener selectors map to one canonical transport", async () => {
+    const native = require(addonPath);
+    const certificate = await makeCertificate();
+    const http3Server = await native.listenMsQuic({
+      host: "127.0.0.1",
+      port: 0,
+      certFile: certificate.cert,
+      keyFile: certificate.key,
+      enableNative: false,
+      enableHttp3: true,
+      http3Path: "/trevrpc",
+    });
+    http3Server.close();
+
+    await assert.rejects(
+      native.listenMsQuic({
+        host: "127.0.0.1",
+        port: 0,
+        certFile: certificate.cert,
+        keyFile: certificate.key,
+        transport: "http3",
+        enableNative: false,
+      }),
+    );
+  });
+
   test(
     "production ABI1 endpoint, calls, streams, cancellation, and teardown",
     { timeout: 30_000 },

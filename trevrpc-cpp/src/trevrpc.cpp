@@ -341,14 +341,24 @@ Server& Server::operator=(Server&& other) noexcept {
 }
 
 Result<Server> Server::listen(const ServerConfig& config) {
-  if (config.enable_http3 && !config.webtransport_path.empty()) {
+  const bool webtransport_enabled = config.enable_webtransport && !config.webtransport_path.empty();
+  if (config.enable_http3 && webtransport_enabled) {
     return Error::runtime(-ENOTSUP, "server cannot combine HTTP/3 and WebTransport listeners");
   }
   if (!config.enable_http3 && !config.http3_path.empty()) {
     return Error::runtime(-EINVAL, "HTTP/3 path requires HTTP/3 to be enabled");
   }
-  if (config.webtransport_path.empty() && !config.webtransport_origin.empty()) {
-    return Error::runtime(-EINVAL, "WebTransport origin requires a WebTransport path");
+  if (!webtransport_enabled && !config.webtransport_origin.empty()) {
+    return Error::runtime(-EINVAL, "WebTransport origin requires WebTransport to be enabled");
+  }
+  const unsigned int enabled_transport_count = (config.enable_native ? 1u : 0u) +
+                                               (config.enable_http3 ? 1u : 0u) +
+                                               (webtransport_enabled ? 1u : 0u);
+  if (enabled_transport_count == 0) {
+    return Error::runtime(-EINVAL, "server requires one enabled transport");
+  }
+  if (enabled_transport_count > 1) {
+    return Error::runtime(-ENOTSUP, "server cannot combine native transport protocols");
   }
   if (config.max_idle_timeout.count() < 0 || config.keep_alive.count() < 0 ||
       config.initial_request_timeout.count() < 0 || config.stream_idle_timeout.count() < 0 ||
@@ -416,10 +426,10 @@ Result<Server> Server::listen(const ServerConfig& config) {
     return Error::runtime(error);
   }
   endpoint_config.mode = TREVRPC_RPC_MSQUIC_ENDPOINT_LISTENER;
-  endpoint_config.transport = config.webtransport_path.empty()
-                                  ? (config.enable_http3 ? TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3
-                                                         : TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE)
-                                  : TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT;
+  endpoint_config.transport = webtransport_enabled
+                                  ? TREVRPC_RPC_MSQUIC_TRANSPORT_WEBTRANSPORT
+                                  : (config.enable_http3 ? TREVRPC_RPC_MSQUIC_TRANSPORT_HTTP3
+                                                         : TREVRPC_RPC_MSQUIC_TRANSPORT_NATIVE);
   endpoint_config.host = config.host.empty() ? nullptr : config.host.data();
   endpoint_config.host_len = static_cast<std::uint32_t>(config.host.size());
   endpoint_config.port = config.port;
@@ -430,12 +440,11 @@ Result<Server> Server::listen(const ServerConfig& config) {
   endpoint_config.cert_file_len = static_cast<std::uint32_t>(config.cert_file.size());
   endpoint_config.key_file = config.key_file.empty() ? nullptr : config.key_file.data();
   endpoint_config.key_file_len = static_cast<std::uint32_t>(config.key_file.size());
-  endpoint_config.path = config.webtransport_path.empty()
-                             ? (config.http3_path.empty() ? nullptr : config.http3_path.data())
-                             : config.webtransport_path.data();
-  endpoint_config.path_len = static_cast<std::uint32_t>(config.webtransport_path.empty()
-                                                            ? config.http3_path.size()
-                                                            : config.webtransport_path.size());
+  endpoint_config.path = webtransport_enabled
+                             ? config.webtransport_path.data()
+                             : (config.http3_path.empty() ? nullptr : config.http3_path.data());
+  endpoint_config.path_len = static_cast<std::uint32_t>(
+      webtransport_enabled ? config.webtransport_path.size() : config.http3_path.size());
   endpoint_config.origin =
       config.webtransport_origin.empty() ? nullptr : config.webtransport_origin.data();
   endpoint_config.origin_len = static_cast<std::uint32_t>(config.webtransport_origin.size());
