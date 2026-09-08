@@ -2439,7 +2439,7 @@ static void run_receive_failure_aborts_stream(bool fail_receive_info) {
                TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT,
                fake_stream_handle,
                fake_connection_handle) == 0);
-    wait_for_readable_info_calls(fake, 2);
+    wait_for_readable_release_calls(fake, 2);
     pthread_mutex_lock(&fake->mutex);
     fake->receive_release = true;
     pthread_cond_broadcast(&fake->condition);
