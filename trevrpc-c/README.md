@@ -59,8 +59,6 @@ Generated headers include `trevrpc_rpc.h` and require `TREVRPC_RPC_ABI_VERSION =
 - direction-specific `*_decode_request_receive` and `*_decode_response_receive` functions;
 - `*_matches_incoming`, `*_take_incoming`, and `*_accept` server helpers.
 
-There is no ABI 6 generator mode.
-
 ## Client flow
 
 Create one runtime, obtain its wake source, and start a client endpoint:

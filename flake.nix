@@ -52,13 +52,6 @@
         cTransportSanitizerCheck = cTransportCheck.override {
           sanitizers = true;
         };
-        # Internal compatibility lane for C++/Node migration. It is not
-        # exported through packageSet or the public package outputs.
-        cLegacy = callPackage ./trevrpc-c {
-          benchProto = ./bench/proto;
-          wireGolden = ./testdata/wire-golden-vectors.txt;
-          legacyCompatibility = true;
-        };
         benchmarkProtoGenerator = pkgs.writeShellApplication {
           name = "generate-trevrpc-benchmark-proto";
           runtimeInputs = with pkgs; [
@@ -120,9 +113,18 @@
                 }
               ];
             };
+            # The Node check needs the canonical ABI 1 C installation and its
+            # greeter fixture, but not the full CTest/conformance closure. Keep
+            # this as a canonical (non-legacy) package input while avoiding
+            # unrelated peer-build failures in the JS derivation.
+            cNode = (c.override { peerBinaries = [ ]; }).overrideAttrs (_: {
+              pname = "trevrpc-c-node";
+              doCheck = false;
+              doInstallCheck = false;
+            });
             cpp = callPackage ./trevrpc-cpp {
               benchProto = ./bench/proto;
-              trevrpcC = cLegacy;
+              trevrpcC = c;
               peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 {
                   package = cFamilyConformancePeers;
@@ -138,7 +140,7 @@
             js = pkgs.callPackage ./trevrpc-js {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
-              trevrpcC = cLegacy;
+              trevrpcC = cNode;
             };
             kotlin = callPackage ./trevrpc-kotlin {
               licenseFile = ./LICENSE;
@@ -539,7 +541,7 @@
           cpp = packageSet.trevrpc-cpp;
           cpp-sanitizers = packageSet.trevrpc-cpp.override {
             sanitizers = true;
-            trevrpcC = cLegacy.override {
+            trevrpcC = packageSet.trevrpc-c.override {
               sanitizers = true;
             };
           };

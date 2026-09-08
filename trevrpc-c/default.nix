@@ -14,7 +14,6 @@
   peerBinaries ? [ ],
   sanitizers ? false,
   threadSanitizer ? false,
-  legacyCompatibility ? false,
 }:
 assert !(sanitizers && threadSanitizer);
 stdenv.mkDerivation (
@@ -46,7 +45,6 @@ stdenv.mkDerivation (
         -DCMAKE_INSTALL_INCLUDEDIR="$dev/include" \
         -DCMAKE_INSTALL_LIBDIR="$lib/lib" \
         -DCMAKE_INSTALL_LIBEXECDIR="$lib/libexec" \
-        -DTREVRPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc" \
         -DTREVRPC_ENGINE_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_engine" \
         -DTREVRPC_ENGINE_MSQUIC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_engine_msquic" \
         -DTREVRPC_TRANSPORT_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_transport" \
@@ -54,13 +52,10 @@ stdenv.mkDerivation (
         -DTREVRPC_RPC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_rpc" \
         -DTREVRPC_RPC_MSQUIC_INSTALL_CMAKEDIR="$dev/lib/cmake/trevrpc_rpc_msquic" \
         -DTREVRPC_INSTALL_PKGCONFIGDIR="$dev/lib/pkgconfig" \
-        -DTREVRPC_BUILD_BENCHMARKS=${if legacyCompatibility then "OFF" else "ON"} \
-        -DTREVRPC_BUILD_TESTS=${if legacyCompatibility then "OFF" else "ON"} \
-        -DTREVRPC_BUILD_CODEGEN=${if legacyCompatibility then "OFF" else "ON"} \
+        -DTREVRPC_BUILD_BENCHMARKS=ON \
+        -DTREVRPC_BUILD_TESTS=ON \
+        -DTREVRPC_BUILD_CODEGEN=ON \
         -DTREVRPC_BUILD_ENGINE=ON \
-        -DTREVRPC_BUILD_MSQUIC=${if legacyCompatibility then "ON" else "OFF"} \
-        -DTREVRPC_BUILD_WEBTRANSPORT=${if legacyCompatibility then "ON" else "OFF"} \
-        -DTREVRPC_BUILD_RUNTIME=${if legacyCompatibility then "ON" else "OFF"} \
         -DTREVRPC_BUILD_ENGINE_MSQUIC=ON \
         -DTREVRPC_BUILD_TRANSPORT=ON \
         -DTREVRPC_BUILD_TRANSPORT_MSQUIC=ON \
@@ -88,13 +83,11 @@ stdenv.mkDerivation (
       runHook postBuild
     '';
 
-    # The legacy lane is an internal build input for C++/Node migration only.
-    doCheck = !legacyCompatibility && stdenv.buildPlatform.canExecute stdenv.hostPlatform;
+    doCheck = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
     checkPhase = ''
       runHook preCheck
       export HOME=$TMPDIR
       find examples src tests tools -name '*.c' \
-        ! -path 'tests/abi5/*' \
         ! -path 'tests/golden/*' \
         ! -path 'tests/install/*' -print0 | \
         xargs -0 -P $NIX_BUILD_CORES -I{} clang-tidy --quiet {} -- \
@@ -135,7 +128,7 @@ stdenv.mkDerivation (
       )}
     '';
 
-    doInstallCheck = !legacyCompatibility && stdenv.buildPlatform.canExecute stdenv.hostPlatform;
+    doInstallCheck = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
     installCheckPhase = ''
       runHook preInstallCheck
       test -x "$out/bin/protoc-gen-trevrpc-c"
@@ -195,6 +188,12 @@ stdenv.mkDerivation (
       test ! -e "$lib/lib/libtrevrpc_msquic_native_core.a"
       test ! -e "$lib/lib/libtrevrpc_protocol_core.a"
       ! grep -R -E 'add_library\(trevrpc::(trevrpc_core|trevrpc_protocol_core|trevrpc_msquic_native_core|trevrpc_rpc_private_[A-Za-z0-9_]+)' "$dev/lib/cmake"
+      cmake \
+        -DTREVRPC_NM="$(command -v nm)" \
+        -DTREVRPC_AR="$(command -v ar)" \
+        "-DTREVRPC_INSTALL_PREFIXES=$out;$dev;$lib" \
+        -DTREVRPC_SOURCE_DIR="$PWD" \
+        -P tests/abi/check_removed_abi6.cmake
       test ! -e "$out/include"
       test ! -e "$out/lib"
 

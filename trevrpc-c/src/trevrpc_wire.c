@@ -7,11 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void trevrpc_wire_owned_free(void* owner, void* context) {
-    (void)context;
-    free(owner);
-}
-
 static atomic_int trevrpc_wire_trace_state = ATOMIC_VAR_INIT(0);
 
 static bool trevrpc_wire_trace_env_enabled(void) {
@@ -92,15 +87,6 @@ static uint8_t* trevrpc_wire_append_bytes_field(uint8_t* out, uint32_t field_num
     return out + len;
 }
 
-static uint8_t* trevrpc_wire_append_bytes_field_header(uint8_t* out, uint32_t field_number, size_t len) {
-    if (len == 0) {
-        return out;
-    }
-
-    out = trevrpc_wire_append_varint(out, (uint64_t)(field_number << 3u | 2u));
-    return trevrpc_wire_append_varint(out, (uint64_t)len);
-}
-
 static uint8_t* trevrpc_wire_append_varint_field(uint8_t* out, uint32_t field_number, uint64_t value) {
     if (value == 0) {
         return out;
@@ -169,35 +155,6 @@ static int trevrpc_wire_alloc_frame(size_t body_len, size_t max_frame_size, uint
     return 0;
 }
 
-int trevrpc_wire_encode_request(const char* service,
-    const char* method,
-    uint32_t kind,
-    const uint8_t* body,
-    size_t body_len,
-    const trevrpc_metadata* metadata,
-    uint64_t timeout_nanos,
-    size_t max_frame_size,
-    uint8_t** frame,
-    size_t* frame_len) {
-    if (service == NULL || method == NULL || (body == NULL && body_len > 0)) {
-        return -EINVAL;
-    }
-
-    return trevrpc_wire_encode_request_view(service,
-        strlen(service),
-        method,
-        strlen(method),
-        kind,
-        TREVRPC_WIRE_VERSION,
-        body,
-        body_len,
-        metadata,
-        timeout_nanos,
-        max_frame_size,
-        frame,
-        frame_len);
-}
-
 int trevrpc_wire_encode_request_view(const char* service,
     size_t service_len,
     const char* method,
@@ -237,71 +194,7 @@ int trevrpc_wire_encode_request_view(const char* service,
     out = trevrpc_wire_append_varint_field(out, 6, version);
     out = trevrpc_wire_append_varint_field(out, 7, timeout_nanos);
     (void)out;
-    trevrpc_wire_trace_frame("tx", "RpcRequest", kind, TREVRPC_STATUS_OK, body_len, body_frame_len);
-    return 0;
-}
-
-int trevrpc_wire_encode_request_parts(
-    const trevrpc_request* request, size_t max_frame_size, trevrpc_wire_frame_parts* parts) {
-    if (request == NULL || parts == NULL || request->service == NULL || request->method == NULL ||
-        (request->body == NULL && request->body_len > 0)) {
-        return -EINVAL;
-    }
-    memset(parts, 0, sizeof(*parts));
-    int err = trevrpc_internal_metadata_validate(&request->metadata);
-    if (err != 0) {
-        return err;
-    }
-
-    size_t body_header_len = request->body_len == 0 ? 0
-                                                    : trevrpc_wire_varint_len((uint64_t)(3u << 3u | 2u)) +
-                                                          trevrpc_wire_varint_len((uint64_t)request->body_len);
-    size_t prefix_len = trevrpc_wire_bytes_field_len(1, request->service_len) +
-                        trevrpc_wire_bytes_field_len(2, request->method_len) + body_header_len;
-    size_t suffix_len =
-        trevrpc_wire_metadata_field_len(4, &request->metadata) + trevrpc_wire_varint_field_len(5, request->kind) +
-        trevrpc_wire_varint_field_len(6, request->version) + trevrpc_wire_varint_field_len(7, request->timeout_nanos);
-    if (prefix_len > SIZE_MAX - request->body_len || suffix_len > SIZE_MAX - prefix_len - request->body_len) {
-        return TREVRPC_ERR_FRAME_TOO_LARGE;
-    }
-    size_t body_frame_len = prefix_len + request->body_len + suffix_len;
-    if (body_frame_len > max_frame_size || body_frame_len > UINT32_MAX) {
-        return TREVRPC_ERR_FRAME_TOO_LARGE;
-    }
-
-    uint8_t* out = NULL;
-    if (prefix_len > 0) {
-        parts->prefix = malloc(prefix_len);
-        if (parts->prefix == NULL) {
-            return -ENOMEM;
-        }
-        out = parts->prefix;
-        out = trevrpc_wire_append_bytes_field(out, 1, (const uint8_t*)request->service, request->service_len);
-        out = trevrpc_wire_append_bytes_field(out, 2, (const uint8_t*)request->method, request->method_len);
-        out = trevrpc_wire_append_bytes_field_header(out, 3, request->body_len);
-        (void)out;
-    }
-
-    if (suffix_len > 0) {
-        parts->suffix = malloc(suffix_len);
-        if (parts->suffix == NULL) {
-            trevrpc_wire_frame_parts_reset(parts);
-            return -ENOMEM;
-        }
-        out = parts->suffix;
-        out = trevrpc_wire_append_metadata_field(out, 4, &request->metadata);
-        out = trevrpc_wire_append_varint_field(out, 5, request->kind);
-        out = trevrpc_wire_append_varint_field(out, 6, request->version);
-        out = trevrpc_wire_append_varint_field(out, 7, request->timeout_nanos);
-        (void)out;
-    }
-
-    parts->prefix_len = prefix_len;
-    parts->body = request->body;
-    parts->body_len = request->body_len;
-    parts->suffix_len = suffix_len;
-    parts->frame_body_len = body_frame_len;
-    trevrpc_wire_trace_frame("tx", "RpcRequest", request->kind, TREVRPC_STATUS_OK, request->body_len, body_frame_len);
+    trevrpc_wire_trace_frame("tx", "RpcRequest", kind, TREVRPC_WIRE_STATUS_OK, body_len, body_frame_len);
     return 0;
 }
 
@@ -329,68 +222,6 @@ int trevrpc_wire_encode_response(
     out = trevrpc_wire_append_bytes_field(out, 3, response->body.data, response->body.len);
     out = trevrpc_wire_append_metadata_field(out, 4, &response->metadata);
     (void)out;
-    trevrpc_wire_trace_frame("tx", "RpcResponse", 0, response->status, response->body.len, body_frame_len);
-    return 0;
-}
-
-void trevrpc_wire_frame_parts_reset(trevrpc_wire_frame_parts* parts) {
-    if (parts == NULL) {
-        return;
-    }
-
-    free(parts->prefix);
-    free(parts->suffix);
-    memset(parts, 0, sizeof(*parts));
-}
-
-int trevrpc_wire_encode_response_parts(
-    const trevrpc_wire_response_values* response, size_t max_frame_size, trevrpc_wire_frame_parts* parts) {
-    if (response == NULL || parts == NULL || (response->message == NULL && response->message_len > 0) ||
-        (response->body.data == NULL && response->body.len > 0)) {
-        return -EINVAL;
-    }
-    memset(parts, 0, sizeof(*parts));
-    int err = trevrpc_internal_metadata_validate(&response->metadata);
-    if (err != 0) {
-        return err;
-    }
-
-    size_t body_header_len = response->body.len == 0 ? 0
-                                                     : trevrpc_wire_varint_len((uint64_t)(3u << 3u | 2u)) +
-                                                           trevrpc_wire_varint_len((uint64_t)response->body.len);
-    size_t prefix_len = trevrpc_wire_varint_field_len(1, response->status) +
-                        trevrpc_wire_bytes_field_len(2, response->message_len) + body_header_len;
-    size_t suffix_len = trevrpc_wire_metadata_field_len(4, &response->metadata);
-    size_t body_frame_len = prefix_len + response->body.len + suffix_len;
-    if (body_frame_len > max_frame_size || body_frame_len > UINT32_MAX) {
-        return TREVRPC_ERR_FRAME_TOO_LARGE;
-    }
-
-    if (prefix_len > 0) {
-        parts->prefix = malloc(prefix_len);
-        if (parts->prefix == NULL) {
-            return -ENOMEM;
-        }
-        uint8_t* out = parts->prefix;
-        out = trevrpc_wire_append_varint_field(out, 1, response->status);
-        out = trevrpc_wire_append_bytes_field(out, 2, (const uint8_t*)response->message, response->message_len);
-        out = trevrpc_wire_append_bytes_field_header(out, 3, response->body.len);
-        (void)out;
-    }
-    if (suffix_len > 0) {
-        parts->suffix = malloc(suffix_len);
-        if (parts->suffix == NULL) {
-            trevrpc_wire_frame_parts_reset(parts);
-            return -ENOMEM;
-        }
-        uint8_t* out = trevrpc_wire_append_metadata_field(parts->suffix, 4, &response->metadata);
-        (void)out;
-    }
-    parts->prefix_len = prefix_len;
-    parts->body = response->body.data;
-    parts->body_len = response->body.len;
-    parts->suffix_len = suffix_len;
-    parts->frame_body_len = body_frame_len;
     trevrpc_wire_trace_frame("tx", "RpcResponse", 0, response->status, response->body.len, body_frame_len);
     return 0;
 }
@@ -429,81 +260,6 @@ int trevrpc_wire_encode_stream_frame(uint32_t kind,
     out = trevrpc_wire_append_metadata_field(out, 5, metadata);
     (void)out;
     trevrpc_wire_trace_frame("tx", "RpcStreamFrame", kind, status, body_len, body_frame_len);
-    return 0;
-}
-
-int trevrpc_wire_encode_stream_status_parts(uint32_t status,
-    const char* message,
-    size_t message_len,
-    const trevrpc_metadata* metadata,
-    size_t max_frame_size,
-    trevrpc_wire_frame_parts* parts) {
-    if (parts == NULL || (message == NULL && message_len > 0)) {
-        return -EINVAL;
-    }
-    memset(parts, 0, sizeof(*parts));
-    int err = trevrpc_internal_metadata_validate(metadata);
-    if (err != 0) {
-        return err;
-    }
-
-    size_t body_frame_len = trevrpc_wire_varint_field_len(1, TREVRPC_STREAM_FRAME_KIND_STATUS) +
-                            trevrpc_wire_varint_field_len(2, status) + trevrpc_wire_bytes_field_len(3, message_len) +
-                            trevrpc_wire_metadata_field_len(5, metadata);
-    if (body_frame_len > max_frame_size || body_frame_len > UINT32_MAX) {
-        return TREVRPC_ERR_FRAME_TOO_LARGE;
-    }
-
-    if (body_frame_len > 0) {
-        parts->prefix = malloc(body_frame_len);
-        if (parts->prefix == NULL) {
-            return -ENOMEM;
-        }
-        uint8_t* out = parts->prefix;
-        out = trevrpc_wire_append_varint_field(out, 1, TREVRPC_STREAM_FRAME_KIND_STATUS);
-        out = trevrpc_wire_append_varint_field(out, 2, status);
-        out = trevrpc_wire_append_bytes_field(out, 3, (const uint8_t*)message, message_len);
-        out = trevrpc_wire_append_metadata_field(out, 5, metadata);
-        (void)out;
-    }
-    parts->prefix_len = body_frame_len;
-    parts->frame_body_len = body_frame_len;
-    trevrpc_wire_trace_frame("tx", "RpcStreamFrame", TREVRPC_STREAM_FRAME_KIND_STATUS, status, 0, body_frame_len);
-    return 0;
-}
-
-int trevrpc_wire_encode_stream_message_parts(
-    const uint8_t* body, size_t body_len, size_t max_frame_size, trevrpc_wire_frame_parts* parts) {
-    if (parts == NULL || (body == NULL && body_len > 0)) {
-        return -EINVAL;
-    }
-    memset(parts, 0, sizeof(*parts));
-
-    size_t prefix_len = 0;
-    if (body_len > 0) {
-        prefix_len = trevrpc_wire_varint_len((uint64_t)(4u << 3u | 2u)) + trevrpc_wire_varint_len((uint64_t)body_len);
-    }
-    size_t body_frame_len = prefix_len + body_len;
-    if (body_frame_len > max_frame_size || body_frame_len > UINT32_MAX) {
-        return TREVRPC_ERR_FRAME_TOO_LARGE;
-    }
-
-    if (prefix_len > 0) {
-        parts->prefix = malloc(prefix_len);
-        if (parts->prefix == NULL) {
-            return -ENOMEM;
-        }
-        uint8_t* out = parts->prefix;
-        out = trevrpc_wire_append_bytes_field_header(out, 4, body_len);
-        (void)out;
-    }
-
-    parts->prefix_len = prefix_len;
-    parts->body = body;
-    parts->body_len = body_len;
-    parts->frame_body_len = body_frame_len;
-    trevrpc_wire_trace_frame(
-        "tx", "RpcStreamFrame", TREVRPC_STREAM_FRAME_KIND_MESSAGE, TREVRPC_STATUS_OK, body_len, body_frame_len);
     return 0;
 }
 
@@ -698,56 +454,9 @@ static trevrpc_wire_stream_frame_values* trevrpc_wire_alloc_stream_frame(void) {
     trevrpc_wire_stream_frame_values* frame = calloc(1, sizeof(*frame));
     if (frame != NULL) {
         frame->kind = TREVRPC_STREAM_FRAME_KIND_MESSAGE;
-        frame->status = TREVRPC_STATUS_OK;
+        frame->status = TREVRPC_WIRE_STATUS_OK;
     }
     return frame;
-}
-
-static int trevrpc_wire_try_decode_message_stream_frame_take(
-    uint8_t* data, size_t len, trevrpc_wire_stream_frame_values** out_frame, bool* matched) {
-    *matched = false;
-    if (len == 0) {
-        trevrpc_wire_stream_frame_values* frame = trevrpc_wire_alloc_stream_frame();
-        if (frame == NULL) {
-            return -ENOMEM;
-        }
-        frame->body = (trevrpc_owned_bytes){.owner = data, .release = trevrpc_wire_owned_free};
-        *out_frame = frame;
-        *matched = true;
-        return 0;
-    }
-
-    size_t offset = 0;
-    uint64_t tag = 0;
-    if (!trevrpc_wire_consume_varint(data, len, &offset, &tag)) {
-        return 0;
-    }
-    if (tag != 0x22) {
-        return 0;
-    }
-
-    const uint8_t* value = NULL;
-    size_t value_len = 0;
-    if (!trevrpc_wire_consume_bytes(data, len, &offset, &value, &value_len)) {
-        return TREVRPC_ERR_INVALID_FRAME;
-    }
-    if (offset != len) {
-        return 0;
-    }
-
-    trevrpc_wire_stream_frame_values* frame = trevrpc_wire_alloc_stream_frame();
-    if (frame == NULL) {
-        return -ENOMEM;
-    }
-    frame->body = (trevrpc_owned_bytes){
-        .data = value_len == 0 ? NULL : value,
-        .len = value_len,
-        .owner = data,
-        .release = trevrpc_wire_owned_free,
-    };
-    *out_frame = frame;
-    *matched = true;
-    return 0;
 }
 
 static int trevrpc_wire_parse_metadata_entry(
@@ -808,13 +517,13 @@ static int trevrpc_wire_parse_metadata_entry(
     return 0;
 }
 
-static int trevrpc_wire_request_decode_error(trevrpc_request* request, int err) {
+static int trevrpc_wire_request_decode_error(trevrpc_wire_request_values* request, int err) {
     trevrpc_internal_request_reset(request);
     return err;
 }
 
 int trevrpc_wire_decode_request_diagnostic(
-    const uint8_t* data, size_t len, trevrpc_request* request, trevrpc_wire_request_diagnostic* diagnostic) {
+    const uint8_t* data, size_t len, trevrpc_wire_request_values* request, trevrpc_wire_request_diagnostic* diagnostic) {
     if (diagnostic != NULL) {
         diagnostic->response_kind = TREVRPC_WIRE_REQUEST_KIND_UNKNOWN;
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_NONE;
@@ -932,22 +641,13 @@ int trevrpc_wire_decode_request_diagnostic(
         request->method = "";
     }
 
-    trevrpc_wire_trace_frame("rx", "RpcRequest", request->kind, TREVRPC_STATUS_OK, request->body_len, len);
+    trevrpc_wire_trace_frame("rx", "RpcRequest", request->kind, TREVRPC_WIRE_STATUS_OK, request->body_len, len);
     return 0;
 }
 
-int trevrpc_wire_decode_request(const uint8_t* data, size_t len, trevrpc_request* request) {
-    trevrpc_wire_request_diagnostic diagnostic = {0};
-    return trevrpc_wire_decode_request_diagnostic(data, len, request, &diagnostic);
-}
-
-int trevrpc_internal_wire_decode_response_values(const uint8_t* data,
+static int trevrpc_internal_wire_decode_response_values(const uint8_t* data,
     size_t len,
     trevrpc_wire_response_values** out_response,
-    uint8_t* body_owner,
-    bool* took_body,
-    const uint8_t** body_view,
-    size_t* body_view_len,
     trevrpc_wire_diagnostic* diagnostic) {
     if (diagnostic != NULL) {
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_NONE;
@@ -956,16 +656,6 @@ int trevrpc_internal_wire_decode_response_values(const uint8_t* data,
         return -EINVAL;
     }
     *out_response = NULL;
-    if (took_body != NULL) {
-        *took_body = false;
-    }
-    if (body_view != NULL) {
-        if (body_view_len == NULL) {
-            return -EINVAL;
-        }
-        *body_view = NULL;
-        *body_view_len = 0;
-    }
     trevrpc_wire_response_values* response = calloc(1, sizeof(*response));
     if (response == NULL) {
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_ALLOCATION_FAILURE;
@@ -1020,19 +710,6 @@ int trevrpc_internal_wire_decode_response_values(const uint8_t* data,
                     return TREVRPC_ERR_INVALID_FRAME;
                 }
                 err = trevrpc_internal_response_set_message(response, (const char*)value, value_len);
-            } else if (field == 3 && body_view != NULL) {
-                *body_view = value_len == 0 ? NULL : value;
-                *body_view_len = value_len;
-            } else if (field == 3 && body_owner != NULL) {
-                response->body = (trevrpc_owned_bytes){
-                    .data = value_len == 0 ? NULL : value,
-                    .len = value_len,
-                    .owner = body_owner,
-                    .release = trevrpc_wire_owned_free,
-                };
-                if (took_body != NULL) {
-                    *took_body = true;
-                }
             } else if (field == 3) {
                 err = trevrpc_internal_response_set_body(response, value, value_len);
             } else {
@@ -1063,35 +740,18 @@ int trevrpc_internal_wire_decode_response_values(const uint8_t* data,
     }
 
     *out_response = response;
-    trevrpc_wire_trace_frame(
-        "rx", "RpcResponse", 0, response->status, body_view != NULL ? *body_view_len : response->body.len, len);
+    trevrpc_wire_trace_frame("rx", "RpcResponse", 0, response->status, response->body.len, len);
     return 0;
 }
 
 int trevrpc_wire_decode_response_diagnostic(
     const uint8_t* data, size_t len, trevrpc_wire_response_values** out_response, trevrpc_wire_diagnostic* diagnostic) {
-    return trevrpc_internal_wire_decode_response_values(data, len, out_response, NULL, NULL, NULL, NULL, diagnostic);
+    return trevrpc_internal_wire_decode_response_values(data, len, out_response, diagnostic);
 }
 
-int trevrpc_wire_decode_response(const uint8_t* data, size_t len, trevrpc_wire_response_values** out_response) {
-    trevrpc_wire_diagnostic diagnostic = {0};
-    return trevrpc_wire_decode_response_diagnostic(data, len, out_response, &diagnostic);
-}
-
-int trevrpc_wire_decode_response_take(
-    uint8_t* data, size_t len, trevrpc_wire_response_values** out_response, bool* took_body) {
-    if (took_body == NULL) {
-        return -EINVAL;
-    }
-    trevrpc_wire_diagnostic diagnostic = {0};
-    return trevrpc_internal_wire_decode_response_values(data, len, out_response, data, took_body, NULL, NULL, &diagnostic);
-}
-
-int trevrpc_internal_wire_decode_stream_frame_values(const uint8_t* data,
+static int trevrpc_internal_wire_decode_stream_frame_values(const uint8_t* data,
     size_t len,
     trevrpc_wire_stream_frame_values** out_frame,
-    const uint8_t** body_view,
-    size_t* body_view_len,
     trevrpc_wire_diagnostic* diagnostic) {
     if (diagnostic != NULL) {
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_NONE;
@@ -1100,13 +760,6 @@ int trevrpc_internal_wire_decode_stream_frame_values(const uint8_t* data,
         return -EINVAL;
     }
     *out_frame = NULL;
-    if (body_view != NULL) {
-        if (body_view_len == NULL) {
-            return -EINVAL;
-        }
-        *body_view = NULL;
-        *body_view_len = 0;
-    }
     trevrpc_wire_stream_frame_values* frame = trevrpc_wire_alloc_stream_frame();
     if (frame == NULL) {
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_ALLOCATION_FAILURE;
@@ -1166,9 +819,6 @@ int trevrpc_internal_wire_decode_stream_frame_values(const uint8_t* data,
                     return TREVRPC_ERR_INVALID_FRAME;
                 }
                 err = trevrpc_internal_stream_frame_set_message(frame, (const char*)value, value_len);
-            } else if (field == 4 && body_view != NULL) {
-                *body_view = value_len == 0 ? NULL : value;
-                *body_view_len = value_len;
             } else if (field == 4) {
                 err = trevrpc_internal_stream_frame_set_body(frame, value, value_len);
             } else {
@@ -1205,8 +855,7 @@ int trevrpc_internal_wire_decode_stream_frame_values(const uint8_t* data,
     }
 
     *out_frame = frame;
-    trevrpc_wire_trace_frame(
-        "rx", "RpcStreamFrame", frame->kind, frame->status, body_view != NULL ? *body_view_len : frame->body.len, len);
+    trevrpc_wire_trace_frame("rx", "RpcStreamFrame", frame->kind, frame->status, frame->body.len, len);
     return 0;
 }
 
@@ -1214,32 +863,5 @@ int trevrpc_wire_decode_stream_frame_diagnostic(const uint8_t* data,
     size_t len,
     trevrpc_wire_stream_frame_values** out_frame,
     trevrpc_wire_diagnostic* diagnostic) {
-    return trevrpc_internal_wire_decode_stream_frame_values(data, len, out_frame, NULL, NULL, diagnostic);
-}
-
-int trevrpc_wire_decode_stream_frame(const uint8_t* data, size_t len, trevrpc_wire_stream_frame_values** out_frame) {
-    trevrpc_wire_diagnostic diagnostic = {0};
-    return trevrpc_wire_decode_stream_frame_diagnostic(data, len, out_frame, &diagnostic);
-}
-
-int trevrpc_wire_decode_stream_frame_take(
-    uint8_t* data, size_t len, trevrpc_wire_stream_frame_values** out_frame, bool* took_body) {
-    if (took_body == NULL) {
-        return -EINVAL;
-    }
-    *took_body = false;
-
-    bool matched = false;
-    int err = trevrpc_wire_try_decode_message_stream_frame_take(data, len, out_frame, &matched);
-    if (err != 0) {
-        return err;
-    }
-    if (matched) {
-        *took_body = true;
-        trevrpc_wire_trace_frame(
-            "rx", "RpcStreamFrame", (*out_frame)->kind, (*out_frame)->status, (*out_frame)->body.len, len);
-        return 0;
-    }
-
-    return trevrpc_wire_decode_stream_frame(data, len, out_frame);
+    return trevrpc_internal_wire_decode_stream_frame_values(data, len, out_frame, diagnostic);
 }

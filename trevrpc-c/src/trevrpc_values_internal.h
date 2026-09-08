@@ -12,23 +12,7 @@
 #define TREVRPC_MAX_METADATA_TOTAL_SIZE (64u * 1024u)
 #define TREVRPC_RESERVED_METADATA_PREFIX "trevrpc-"
 
-#define TREVRPC_STATUS_OK 0u
-#define TREVRPC_STATUS_CANCELLED 1u
-#define TREVRPC_STATUS_UNKNOWN 2u
-#define TREVRPC_STATUS_INVALID_ARGUMENT 3u
-#define TREVRPC_STATUS_DEADLINE_EXCEEDED 4u
-#define TREVRPC_STATUS_NOT_FOUND 5u
-#define TREVRPC_STATUS_ALREADY_EXISTS 6u
-#define TREVRPC_STATUS_PERMISSION_DENIED 7u
-#define TREVRPC_STATUS_RESOURCE_EXHAUSTED 8u
-#define TREVRPC_STATUS_FAILED_PRECONDITION 9u
-#define TREVRPC_STATUS_ABORTED 10u
-#define TREVRPC_STATUS_OUT_OF_RANGE 11u
-#define TREVRPC_STATUS_UNIMPLEMENTED 12u
-#define TREVRPC_STATUS_INTERNAL 13u
-#define TREVRPC_STATUS_UNAVAILABLE 14u
-#define TREVRPC_STATUS_DATA_LOSS 15u
-#define TREVRPC_STATUS_UNAUTHENTICATED 16u
+#define TREVRPC_WIRE_STATUS_OK 0u
 
 #define TREVRPC_RPC_KIND_UNARY 0u
 #define TREVRPC_RPC_KIND_CLIENT_STREAMING 1u
@@ -41,13 +25,7 @@
 #define TREVRPC_ERR_INVALID_FRAME -2001
 #define TREVRPC_ERR_UNSUPPORTED_WIRE_VERSION -2002
 #define TREVRPC_ERR_UNSUPPORTED_RPC_KIND -2003
-#define TREVRPC_ERR_HANDLER_FAILED -2004
 #define TREVRPC_ERR_FRAME_TOO_LARGE -2005
-#define TREVRPC_ERR_STREAM_LIMIT_EXCEEDED -2006
-#define TREVRPC_ERR_STREAM_IDLE_TIMEOUT -2007
-
-#ifndef TREVRPC_VALUE_TYPES_DEFINED
-#define TREVRPC_VALUE_TYPES_DEFINED
 
 typedef struct trevrpc_metadata_entry {
     char* key;
@@ -61,13 +39,7 @@ typedef struct trevrpc_metadata {
     size_t entries_len;
 } trevrpc_metadata;
 
-typedef struct trevrpc_status {
-    uint32_t code;
-    const char* message;
-    size_t message_len;
-} trevrpc_status;
-
-typedef struct trevrpc_request {
+typedef struct trevrpc_wire_request_values {
     const char* service;
     size_t service_len;
     const char* method;
@@ -78,31 +50,7 @@ typedef struct trevrpc_request {
     uint32_t kind;
     uint32_t version;
     uint64_t timeout_nanos;
-} trevrpc_request;
-
-#endif
-
-#ifndef TREVRPC_CALL_CONTEXT_TYPE_DEFINED
-#define TREVRPC_CALL_CONTEXT_TYPE_DEFINED
-typedef struct trevrpc_call_context trevrpc_call_context;
-#endif
-
-#ifndef TREVRPC_AUTHORIZER_TYPES_DEFINED
-#define TREVRPC_AUTHORIZER_TYPES_DEFINED
-
-typedef struct trevrpc_metadata_value_authorizer {
-    const char* key;
-    size_t key_len;
-    const uint8_t* value;
-    size_t value_len;
-} trevrpc_metadata_value_authorizer;
-
-typedef struct trevrpc_bearer_authorizer {
-    const char* token;
-    size_t token_len;
-} trevrpc_bearer_authorizer;
-
-#endif
+} trevrpc_wire_request_values;
 
 typedef void (*trevrpc_owned_bytes_release_fn)(void* owner, void* context);
 
@@ -131,13 +79,17 @@ typedef struct trevrpc_wire_stream_frame_values {
     trevrpc_metadata metadata;
 } trevrpc_wire_stream_frame_values;
 
-uint32_t trevrpc_internal_status_code_from_uint32(uint32_t code);
 int trevrpc_internal_metadata_set(
-    trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
-int trevrpc_internal_metadata_set_normalized(
     trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len);
 int trevrpc_internal_metadata_validate(const trevrpc_metadata* metadata);
 void trevrpc_internal_metadata_reset(trevrpc_metadata* metadata);
-void trevrpc_internal_request_reset(trevrpc_request* request);
+void trevrpc_internal_request_reset(trevrpc_wire_request_values* request);
+int trevrpc_internal_response_set_message(
+    trevrpc_wire_response_values* response, const char* message, size_t message_len);
+int trevrpc_internal_response_set_body(trevrpc_wire_response_values* response, const uint8_t* body, size_t body_len);
+int trevrpc_internal_stream_frame_set_message(
+    trevrpc_wire_stream_frame_values* frame, const char* message, size_t message_len);
+int trevrpc_internal_stream_frame_set_body(
+    trevrpc_wire_stream_frame_values* frame, const uint8_t* body, size_t body_len);
 
 #endif

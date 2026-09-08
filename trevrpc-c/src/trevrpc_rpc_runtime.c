@@ -1987,7 +1987,7 @@ static int trevrpc_rpc_copy_request_event(trevrpc_rpc_runtime* runtime,
     trevrpc_rpc_transport_receive* transport_receive,
     const trevrpc_rpc_transport_receive_info* receive_info) {
     trevrpc_wire_request_diagnostic diagnostic;
-    trevrpc_request request = {0};
+    trevrpc_wire_request_values request = {0};
     trevrpc_rpc_event* event = NULL;
     trevrpc_rpc_event* readable_event = NULL;
     trevrpc_rpc_event* deferred_receive_fin = NULL;

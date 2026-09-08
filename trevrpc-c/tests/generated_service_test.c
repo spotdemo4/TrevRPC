@@ -190,9 +190,6 @@ static void test_generated_surface(void) {
     assert(text_file_contains(TREVRPC_GENERATED_HEADER, "_take_incoming("));
     assert(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_rpc_call_open_v1("));
     assert(text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_rpc_event_take_incoming_call("));
-    assert(!text_file_contains(TREVRPC_GENERATED_HEADER, "TREVRPC_C_ABI_VERSION"));
-    assert(!text_file_contains(TREVRPC_GENERATED_HEADER, "trevrpc_channel"));
-    assert(!text_file_contains(TREVRPC_GENERATED_SOURCE, "trevrpc_server_register"));
 }
 
 static void test_unresolved_stream_budget_validation(void) {

@@ -40,14 +40,11 @@ stdenv.mkDerivation (final: {
       -DCMAKE_INSTALL_LIBDIR=lib \
       -DTREVRPC_BUILD_TESTS=ON \
       -DTREVRPC_BUILD_ENGINE=ON \
-      -DTREVRPC_BUILD_MSQUIC=OFF \
       -DTREVRPC_BUILD_ENGINE_MSQUIC=ON \
       -DTREVRPC_BUILD_TRANSPORT=ON \
       -DTREVRPC_BUILD_TRANSPORT_MSQUIC=ON \
       -DTREVRPC_BUILD_RPC=ON \
       -DTREVRPC_BUILD_RPC_MSQUIC=ON \
-      -DTREVRPC_BUILD_WEBTRANSPORT=OFF \
-      -DTREVRPC_BUILD_RUNTIME=OFF \
       -DTREVRPC_BUILD_CODEGEN=ON \
       -DTREVRPC_BUILD_BENCHMARKS=ON \
       -DTREVRPC_BUILD_EXAMPLES=ON
@@ -65,7 +62,7 @@ stdenv.mkDerivation (final: {
   checkPhase = ''
     runHook preCheck
     ctest --test-dir build --output-on-failure \
-      -R '^(trevrpc_rpc_(api|api_cpp|fake_transport|registry|abi1_symbols|msquic_abi1_symbols|msquic_smoke|native_roundtrip|native_shapes|h3_shapes|wt_shapes.*|transport_h3.*|transport_msquic_lifecycle)|trevrpc_generated_service_.*|trevrpc_codegen_golden_(header|source)|trevrpc_greeter_(native|http3|webtransport)_smoke|trevrpc_bench_peer_(capabilities|native_smoke|webtransport_config|webtransport_smoke))$'
+      -R '^(trevrpc_rpc_(api|api_cpp|fake_transport|registry|abi1_symbols|msquic_abi1_symbols|msquic_smoke|native_roundtrip|native_shapes|h3_shapes|wt_shapes.*|transport_h3.*|transport_msquic_lifecycle)|trevrpc_generated_service_.*|trevrpc_codegen_golden_(header|source)|trevrpc_greeter_(native|http3|webtransport)_smoke|trevrpc_bench_peer_(capabilities|native_smoke|webtransport_config|webtransport_smoke)|trevrpc_removed_abi6_surface)$'
     runHook postCheck
   '';
 
@@ -116,8 +113,8 @@ stdenv.mkDerivation (final: {
     test -f "$out/lib/cmake/trevrpc_rpc_msquic/trevrpc_rpc_msquicConfig.cmake"
     test -f "$out/lib/cmake/trevrpc_rpc_msquic/trevrpcRpcMsquicTargets.cmake"
 
-    # The aggregate ABI-6 facade and its legacy transport artifacts are not
-    # part of the independently versioned Engine/RPC package set.
+    # Only the independently versioned Engine, Transport, and RPC packages
+    # are installed.
     test ! -e "$out/include/trevrpc.h"
     test ! -e "$out/include/trevrpc_binding.h"
     test ! -e "$out/include/trevrpc_msquic.h"

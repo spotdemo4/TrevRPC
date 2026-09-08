@@ -51,31 +51,6 @@ static int trevrpc_copy_chars(char** dst, size_t* dst_len, const char* src, size
     return 0;
 }
 
-uint32_t trevrpc_internal_status_code_from_uint32(uint32_t code) {
-    switch (code) {
-    case TREVRPC_STATUS_OK:
-    case TREVRPC_STATUS_CANCELLED:
-    case TREVRPC_STATUS_UNKNOWN:
-    case TREVRPC_STATUS_INVALID_ARGUMENT:
-    case TREVRPC_STATUS_DEADLINE_EXCEEDED:
-    case TREVRPC_STATUS_NOT_FOUND:
-    case TREVRPC_STATUS_ALREADY_EXISTS:
-    case TREVRPC_STATUS_PERMISSION_DENIED:
-    case TREVRPC_STATUS_RESOURCE_EXHAUSTED:
-    case TREVRPC_STATUS_FAILED_PRECONDITION:
-    case TREVRPC_STATUS_ABORTED:
-    case TREVRPC_STATUS_OUT_OF_RANGE:
-    case TREVRPC_STATUS_UNIMPLEMENTED:
-    case TREVRPC_STATUS_INTERNAL:
-    case TREVRPC_STATUS_UNAVAILABLE:
-    case TREVRPC_STATUS_DATA_LOSS:
-    case TREVRPC_STATUS_UNAUTHENTICATED:
-        return code;
-    default:
-        return TREVRPC_STATUS_UNKNOWN;
-    }
-}
-
 int trevrpc_internal_metadata_set(
     trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len) {
     if (metadata == NULL || key == NULL || key_len == 0 || (value == NULL && value_len > 0)) {
@@ -172,30 +147,6 @@ int trevrpc_internal_metadata_set(
     return 0;
 }
 
-int trevrpc_internal_metadata_set_normalized(
-    trevrpc_metadata* metadata, const char* key, size_t key_len, const uint8_t* value, size_t value_len) {
-    if (metadata == NULL || key == NULL || key_len == 0 || (value == NULL && value_len > 0)) {
-        return -EINVAL;
-    }
-    if (key_len == SIZE_MAX) {
-        return -EINVAL;
-    }
-
-    char* normalized_key = malloc(key_len + 1);
-    if (normalized_key == NULL) {
-        return -ENOMEM;
-    }
-    for (size_t i = 0; i < key_len; i++) {
-        char ch = key[i];
-        normalized_key[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
-    }
-    normalized_key[key_len] = '\0';
-
-    int err = trevrpc_internal_metadata_set(metadata, normalized_key, key_len, value, value_len);
-    free(normalized_key);
-    return err;
-}
-
 int trevrpc_internal_metadata_validate(const trevrpc_metadata* metadata) {
     if (metadata == NULL) {
         return 0;
@@ -242,7 +193,7 @@ void trevrpc_internal_metadata_reset(trevrpc_metadata* metadata) {
     metadata->entries_len = 0;
 }
 
-void trevrpc_internal_request_reset(trevrpc_request* request) {
+void trevrpc_internal_request_reset(trevrpc_wire_request_values* request) {
     if (request == NULL) {
         return;
     }
@@ -279,18 +230,6 @@ int trevrpc_internal_response_set_body(trevrpc_wire_response_values* response, c
     trevrpc_owned_bytes_reset(&response->body);
     response->body = (trevrpc_owned_bytes){
         .data = copy, .len = body_len, .owner = copy, .release = trevrpc_internal_owned_free, .release_context = NULL};
-    return 0;
-}
-
-int trevrpc_internal_response_set_status(trevrpc_wire_response_values* response, trevrpc_status status) {
-    if (response == NULL) {
-        return -EINVAL;
-    }
-    int err = trevrpc_internal_response_set_message(response, status.message, status.message_len);
-    if (err != 0) {
-        return err;
-    }
-    response->status = trevrpc_internal_status_code_from_uint32(status.code);
     return 0;
 }
 
@@ -336,23 +275,6 @@ int trevrpc_internal_stream_frame_set_body(
     trevrpc_owned_bytes_reset(&frame->body);
     frame->body = (trevrpc_owned_bytes){
         .data = copy, .len = body_len, .owner = copy, .release = trevrpc_internal_owned_free, .release_context = NULL};
-    return 0;
-}
-
-int trevrpc_internal_stream_frame_set_status(trevrpc_wire_stream_frame_values* frame, trevrpc_status status) {
-    if (frame == NULL) {
-        return -EINVAL;
-    }
-    int err = trevrpc_internal_stream_frame_set_message(frame, status.message, status.message_len);
-    if (err != 0) {
-        return err;
-    }
-    err = trevrpc_internal_stream_frame_set_body(frame, NULL, 0);
-    if (err != 0) {
-        return err;
-    }
-    frame->kind = TREVRPC_STREAM_FRAME_KIND_STATUS;
-    frame->status = trevrpc_internal_status_code_from_uint32(status.code);
     return 0;
 }
 

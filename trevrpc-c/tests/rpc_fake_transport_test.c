@@ -108,10 +108,12 @@ static void make_request(const char* method, uint64_t timeout_nanos, uint8_t** o
 }
 
 static void assert_initial_request_uses_infinite_wire_timeout(fake_transport* fake) {
-    trevrpc_request request = {0};
+    trevrpc_wire_request_values request = {0};
+    trevrpc_wire_request_diagnostic diagnostic = {0};
     pthread_mutex_lock(&fake->mutex);
     assert(fake->last_send_body != NULL);
-    assert(trevrpc_wire_decode_request(fake->last_send_body, fake->last_send_body_len, &request) == 0);
+    assert(trevrpc_wire_decode_request_diagnostic(
+               fake->last_send_body, fake->last_send_body_len, &request, &diagnostic) == 0);
     assert(request.timeout_nanos == 0);
     trevrpc_internal_request_reset(&request);
     pthread_mutex_unlock(&fake->mutex);
@@ -119,9 +121,11 @@ static void assert_initial_request_uses_infinite_wire_timeout(fake_transport* fa
 
 static void assert_last_send_is_ok_status(fake_transport* fake) {
     trevrpc_wire_stream_frame_values* frame = NULL;
+    trevrpc_wire_diagnostic diagnostic = {0};
     pthread_mutex_lock(&fake->mutex);
     assert(fake->last_send_body != NULL);
-    assert(trevrpc_wire_decode_stream_frame(fake->last_send_body, fake->last_send_body_len, &frame) == 0);
+    assert(trevrpc_wire_decode_stream_frame_diagnostic(
+               fake->last_send_body, fake->last_send_body_len, &frame, &diagnostic) == 0);
     assert(frame->kind == TREVRPC_STREAM_FRAME_KIND_STATUS);
     assert(frame->status == TREVRPC_RPC_STATUS_OK);
     assert(frame->body.len == 0);

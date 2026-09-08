@@ -569,13 +569,13 @@ static void trevrpc_msquic_finalizer_process_item(trevrpc_msquic_finalizer_item*
         trevrpc_msquic_stream_destroy_owned(item->object, false, false);
         break;
     case TREV_MSQUIC_FINALIZE_CONN_CLOSE:
-        trevrpc_msquic_conn_close(item->object);
+        trevrpc_msquic_native_conn_close(item->object);
         break;
     case TREV_MSQUIC_FINALIZE_LISTENER_STOP:
         trevrpc_msquic_listener_stop_deferred_worker(item->object);
         break;
     case TREV_MSQUIC_FINALIZE_LISTENER_CLOSE:
-        trevrpc_msquic_listener_close(item->object);
+        trevrpc_msquic_native_listener_close(item->object);
         break;
     }
 }
@@ -1040,8 +1040,8 @@ static trevrpc_msquic_reserve_result trevrpc_msquic_recv_try_reserve_locked(trev
     trevrpc_msquic_receive_pause_kind kind,
     bool use_undecided_admission_cap) {
     trevrpc_msquic_receive_budget* budget = stream->recv_budget;
-    /* Unbudgeted streams (test raw streams, ABI 6 facade) predate the shared
-     * receive budget: no admission control, no accounting. */
+    /* Unbudgeted test streams bypass the shared receive budget: no admission
+     * control and no accounting. */
     if (budget == NULL) {
         return TREV_MSQUIC_RESERVE_OK;
     }
@@ -1592,13 +1592,6 @@ static QUIC_BUFFER* trevrpc_msquic_send_buffers(trevrpc_msquic_send* send) {
     return send->dynamic_buffers != NULL ? send->dynamic_buffers : send->buffers;
 }
 
-static int trevrpc_msquic_send_prepare_buffers(trevrpc_msquic_send* send, uint32_t buffer_count) {
-    if (buffer_count <= TREV_MSQUIC_SEND_MAX_BUFFERS) {
-        return 0;
-    }
-    send->dynamic_buffers = calloc(buffer_count, sizeof(*send->dynamic_buffers));
-    return send->dynamic_buffers == NULL ? -ENOMEM : 0;
-}
 
 static trevrpc_msquic_send_completion* trevrpc_msquic_send_completion_new(void) {
     trevrpc_msquic_send_completion* completion = calloc(1, sizeof(*completion));
@@ -1963,8 +1956,7 @@ static int trevrpc_msquic_stream_append_frame_bytes_locked(
 }
 
 static size_t trevrpc_msquic_stream_frame_max_locked(const trevrpc_msquic_stream* stream, size_t requested) {
-    /* Unbudgeted streams (test raw streams, ABI 6 facade) predate the shared
-     * receive budget: no configured cap, no connection cap, honor the request. */
+    /* Unbudgeted test streams have no configured or connection receive cap. */
     if (stream->recv_budget == NULL || !stream->parser_budgeted) {
         return requested;
     }
@@ -2272,7 +2264,7 @@ static void trevrpc_msquic_receive_budget_kick(trevrpc_msquic_receive_budget* bu
             trevrpc_msquic_stream_handle_release(selected);
         } else if (fatal) {
             trevrpc_msquic_stream_notify(selected, TREV_MSQUIC_STREAM_OBSERVER_TERMINAL);
-            (void)trevrpc_msquic_stream_abort_receive(selected);
+            (void)trevrpc_msquic_native_stream_abort_receive(selected);
         }
 
         trevrpc_msquic_stream_lifecycle_retain(selected);
@@ -2420,7 +2412,7 @@ static intptr_t trevrpc_msquic_stream_send_buffers_with_flags(trevrpc_msquic_str
             pthread_cond_broadcast(&stream->cond);
             pthread_mutex_unlock(&stream->mutex);
         }
-        trevrpc_msquic_send_completion_free(send->completion);
+        trevrpc_msquic_native_send_completion_free(send->completion);
         send->completion = NULL;
         trevrpc_msquic_send_release(stream, send);
         if (cleanup_ref) {
@@ -2448,7 +2440,7 @@ static intptr_t trevrpc_msquic_stream_send_buffers_with_flags(trevrpc_msquic_str
         close_handle = trevrpc_msquic_stream_pending_send_complete_locked(stream, send);
         pthread_cond_broadcast(&stream->cond);
         pthread_mutex_unlock(&stream->mutex);
-        trevrpc_msquic_send_completion_free(send->completion);
+        trevrpc_msquic_native_send_completion_free(send->completion);
         send->completion = NULL;
         trevrpc_msquic_send_release(stream, send);
         if (close_handle != NULL) {
@@ -2478,23 +2470,7 @@ static intptr_t trevrpc_msquic_stream_send_buffer(
     return trevrpc_msquic_stream_send_buffer_with_flags(stream, send, len, QUIC_SEND_FLAG_NONE, false);
 }
 
-static size_t trevrpc_msquic_varint_len(size_t value) {
-    size_t len = 1;
-    while (value >= 0x80) {
-        len++;
-        value >>= 7;
-    }
-    return len;
-}
 
-static uint8_t* trevrpc_msquic_append_varint(uint8_t* out, size_t value) {
-    while (value >= 0x80) {
-        *out++ = (uint8_t)value | 0x80;
-        value >>= 7;
-    }
-    *out++ = (uint8_t)value;
-    return out;
-}
 
 static int trevrpc_msquic_build_alpn_buffers(const trevrpc_msquic_config* config,
     const trevrpc_msquic_alpn* alpns,
@@ -2580,28 +2556,8 @@ static int trevrpc_msquic_configure_endpoint_with_alpns(const trevrpc_msquic_con
         return err;
     }
 
-    QUIC_EXECUTION_PROFILE execution_profile;
-    switch (config->execution_profile) {
-    case TREV_MSQUIC_EXECUTION_PROFILE_LOW_LATENCY:
-        execution_profile = QUIC_EXECUTION_PROFILE_LOW_LATENCY;
-        break;
-    case TREV_MSQUIC_EXECUTION_PROFILE_MAX_THROUGHPUT:
-        execution_profile = QUIC_EXECUTION_PROFILE_TYPE_MAX_THROUGHPUT;
-        break;
-    case TREV_MSQUIC_EXECUTION_PROFILE_SCAVENGER:
-        execution_profile = QUIC_EXECUTION_PROFILE_TYPE_SCAVENGER;
-        break;
-    case TREV_MSQUIC_EXECUTION_PROFILE_REAL_TIME:
-        execution_profile = QUIC_EXECUTION_PROFILE_TYPE_REAL_TIME;
-        break;
-    default:
-        trevrpc_msquic_api_release();
-        return EINVAL;
-    }
-
     QUIC_REGISTRATION_CONFIG registration_config = {0};
     registration_config.AppName = server ? "trevrpc-c-server" : "trevrpc-c-client";
-    registration_config.ExecutionProfile = execution_profile;
 
     QUIC_STATUS status = trevrpc_msquic_api()->RegistrationOpen(&registration_config, registration);
     if (QUIC_FAILED(status)) {
@@ -2635,14 +2591,6 @@ static int trevrpc_msquic_configure_endpoint_with_alpns(const trevrpc_msquic_con
     if (config->peer_unidi_stream_count > 0) {
         settings.IsSet.PeerUnidiStreamCount = TRUE;
         settings.PeerUnidiStreamCount = config->peer_unidi_stream_count;
-    }
-    if (config->max_stateless_operations > 0) {
-        settings.IsSet.MaxStatelessOperations = TRUE;
-        settings.MaxStatelessOperations = config->max_stateless_operations;
-    }
-    if (config->max_binding_stateless_operations > 0) {
-        settings.IsSet.MaxBindingStatelessOperations = TRUE;
-        settings.MaxBindingStatelessOperations = config->max_binding_stateless_operations;
     }
     if (config->stream_recv_window > 0) {
         settings.IsSet.StreamRecvWindowDefault = TRUE;
@@ -2790,20 +2738,7 @@ static void trevrpc_msquic_endpoint_lease_release_impl(void* context) {
     free(lease);
 }
 
-int trevrpc_msquic_listen(
-    const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** out_listener) {
-    return trevrpc_msquic_listen_alpns(host, port, config, NULL, 0, out_listener);
-}
 
-int trevrpc_msquic_listen_alpns(const char* host,
-    uint16_t port,
-    const trevrpc_msquic_config* config,
-    const trevrpc_msquic_alpn* alpns,
-    size_t alpns_len,
-    trevrpc_msquic_listener** out_listener) {
-    trevrpc_msquic_feature_request features = trevrpc_msquic_generic_feature_request();
-    return trevrpc_msquic_listen_alpns_features(host, port, config, alpns, alpns_len, &features, out_listener);
-}
 
 int trevrpc_msquic_listen_alpns_features(const char* host,
     uint16_t port,
@@ -2875,13 +2810,13 @@ int trevrpc_msquic_listen_alpns_features_with_dispatch(const char* host,
     int err = trevrpc_msquic_configure_endpoint_with_alpns(
         config, alpns, alpns_len, features, true, &listener->registration, &listener->configuration);
     if (err != 0) {
-        trevrpc_msquic_listener_close(listener);
+        trevrpc_msquic_native_listener_close(listener);
         return err;
     }
     listener->api_ref_acquired = true;
     listener->endpoint_lease = trevrpc_msquic_endpoint_lease_create(listener->registration, listener->configuration);
     if (listener->endpoint_lease == NULL) {
-        trevrpc_msquic_listener_close(listener);
+        trevrpc_msquic_native_listener_close(listener);
         return ENOMEM;
     }
     listener->api_ref_acquired = false;
@@ -2889,14 +2824,14 @@ int trevrpc_msquic_listen_alpns_features_with_dispatch(const char* host,
     QUIC_STATUS status = trevrpc_msquic_api()->ListenerOpen(
         listener->registration, trevrpc_msquic_listener_callback, listener, &listener->listener);
     if (QUIC_FAILED(status)) {
-        trevrpc_msquic_listener_close(listener);
+        trevrpc_msquic_native_listener_close(listener);
         return (int)status;
     }
 
     QUIC_ADDR addr = {0};
     err = trevrpc_msquic_addr(host, port, &addr);
     if (err != 0) {
-        trevrpc_msquic_listener_close(listener);
+        trevrpc_msquic_native_listener_close(listener);
         return err;
     }
 
@@ -2904,13 +2839,13 @@ int trevrpc_msquic_listen_alpns_features_with_dispatch(const char* host,
     uint32_t alpn_count = 0;
     err = trevrpc_msquic_build_alpn_buffers(config, alpns, alpns_len, &alpn_buffers, &alpn_count);
     if (err != 0) {
-        trevrpc_msquic_listener_close(listener);
+        trevrpc_msquic_native_listener_close(listener);
         return err;
     }
     status = trevrpc_msquic_api()->ListenerStart(listener->listener, alpn_buffers, alpn_count, &addr);
     free(alpn_buffers);
     if (QUIC_FAILED(status)) {
-        trevrpc_msquic_listener_close(listener);
+        trevrpc_msquic_native_listener_close(listener);
         return (int)status;
     }
 
@@ -2918,45 +2853,6 @@ int trevrpc_msquic_listen_alpns_features_with_dispatch(const char* host,
     return 0;
 }
 
-int trevrpc_msquic_listener_accept(trevrpc_msquic_listener* listener, trevrpc_msquic_conn** out_conn) {
-    *out_conn = NULL;
-    pthread_mutex_lock(&listener->mutex);
-    while (listener->conn_head == NULL && !listener->closed) {
-        pthread_cond_wait(&listener->cond, &listener->mutex);
-    }
-
-    if (listener->conn_head == NULL) {
-        int err = listener->err != 0 ? listener->err : TREV_MSQUIC_ERR_CLOSED;
-        pthread_mutex_unlock(&listener->mutex);
-        return err;
-    }
-
-    trevrpc_msquic_conn_node* node = listener->conn_head;
-    listener->conn_head = node->next;
-    if (listener->conn_head == NULL) {
-        listener->conn_tail = NULL;
-    }
-    pthread_mutex_unlock(&listener->mutex);
-
-    trevrpc_msquic_conn* conn = node->conn;
-    free(node);
-
-    pthread_mutex_lock(&conn->mutex);
-    while (!conn->connected && !conn->shutdown_complete && conn->err == 0) {
-        pthread_cond_wait(&conn->cond, &conn->mutex);
-    }
-    int err = conn->err;
-    bool connected = conn->connected;
-    pthread_mutex_unlock(&conn->mutex);
-
-    if (!connected) {
-        trevrpc_msquic_conn_close(conn);
-        return err != 0 ? err : TREV_MSQUIC_ERR_CLOSED;
-    }
-
-    *out_conn = conn;
-    return 0;
-}
 
 int trevrpc_msquic_listener_set_observer(
     trevrpc_msquic_listener* listener, trevrpc_msquic_listener_observer observer, void* context) {
@@ -3023,7 +2919,7 @@ int trevrpc_msquic_listener_accept_ready(trevrpc_msquic_listener* listener, trev
     return 0;
 }
 
-int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* out_port) {
+int trevrpc_msquic_native_listener_port(trevrpc_msquic_listener* listener, uint16_t* out_port) {
     if (listener == NULL || out_port == NULL) {
         return EINVAL;
     }
@@ -3039,7 +2935,7 @@ int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* ou
     return 0;
 }
 
-void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
+void trevrpc_msquic_native_listener_close(trevrpc_msquic_listener* listener) {
     void* dispatch_context = NULL;
     trevrpc_msquic_context_destroy dispatch_context_destroy = NULL;
     trevrpc_msquic_endpoint_lease* endpoint_lease = NULL;
@@ -3050,7 +2946,7 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
         return;
     }
 
-    trevrpc_msquic_listener_shutdown(listener);
+    trevrpc_msquic_native_listener_shutdown(listener);
 
     trevrpc_msquic_conn_node* connections = NULL;
     pthread_mutex_lock(&listener->mutex);
@@ -3085,7 +2981,7 @@ void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener) {
     while (connections != NULL) {
         trevrpc_msquic_conn_node* node = connections;
         connections = node->next;
-        trevrpc_msquic_conn_close(node->conn);
+        trevrpc_msquic_native_conn_close(node->conn);
         free(node);
     }
 
@@ -3174,7 +3070,7 @@ void trevrpc_msquic_listener_close_deferred_owned(trevrpc_msquic_listener* liste
     pthread_mutex_unlock(&TrevMsQuicFinalizerMutex);
 }
 
-void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener) {
+void trevrpc_msquic_native_listener_shutdown(trevrpc_msquic_listener* listener) {
     if (listener == NULL)
         return;
 
@@ -3203,20 +3099,7 @@ void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener) {
     }
 }
 
-int trevrpc_msquic_dial(
-    const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_conn** out_conn) {
-    return trevrpc_msquic_dial_cancellable(host, port, config, NULL, NULL, out_conn);
-}
 
-int trevrpc_msquic_dial_cancellable(const char* host,
-    uint16_t port,
-    const trevrpc_msquic_config* config,
-    trevrpc_msquic_cancelled_fn cancelled,
-    void* cancellation_context,
-    trevrpc_msquic_conn** out_conn) {
-    return trevrpc_msquic_dial_observed(
-        host, port, config, cancelled, cancellation_context, NULL, 0, NULL, NULL, out_conn);
-}
 
 int trevrpc_msquic_dial_observed(const char* host,
     uint16_t port,
@@ -3322,7 +3205,7 @@ int trevrpc_msquic_dial_start_observed_features_with_receive_policy(const char* 
     QUIC_STATUS status =
         trevrpc_msquic_api()->ConnectionOpen(registration, trevrpc_msquic_conn_callback, conn, &conn->handle);
     if (QUIC_FAILED(status)) {
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         return (int)status;
     }
 
@@ -3330,19 +3213,19 @@ int trevrpc_msquic_dial_start_observed_features_with_receive_policy(const char* 
         status = trevrpc_msquic_api()->SetParam(
             conn->handle, QUIC_PARAM_CONN_RESUMPTION_TICKET, (uint32_t)resumption_ticket_len, resumption_ticket);
         if (QUIC_FAILED(status)) {
-            trevrpc_msquic_conn_close(conn);
+            trevrpc_msquic_native_conn_close(conn);
             return (int)status;
         }
     }
 
     if (cancelled != NULL && cancelled(cancellation_context)) {
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         return -ECANCELED;
     }
 
     HQUIC connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
     if (connection_handle == NULL) {
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         return TREV_MSQUIC_ERR_CLOSED;
     }
     status = trevrpc_msquic_api()->ConnectionStart(
@@ -3350,10 +3233,10 @@ int trevrpc_msquic_dial_start_observed_features_with_receive_policy(const char* 
     trevrpc_msquic_conn_handle_release(conn);
     if (QUIC_FAILED(status)) {
         if (cancelled != NULL && cancelled(cancellation_context)) {
-            trevrpc_msquic_conn_close(conn);
+            trevrpc_msquic_native_conn_close(conn);
             return -ECANCELED;
         }
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         return (int)status;
     }
 
@@ -3416,14 +3299,14 @@ int trevrpc_msquic_dial_observed_features_with_receive_policy(const char* host,
     pthread_mutex_unlock(&conn->mutex);
 
     if (was_cancelled || (cancelled != NULL && cancelled(cancellation_context))) {
-        trevrpc_msquic_conn_shutdown(conn);
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_shutdown_error(conn, 0);
+        trevrpc_msquic_native_conn_close(conn);
         *out_conn = NULL;
         return -ECANCELED;
     }
 
     if (!connected) {
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         *out_conn = NULL;
         return err != 0 ? err : TREV_MSQUIC_ERR_CLOSED;
     }
@@ -3431,28 +3314,7 @@ int trevrpc_msquic_dial_observed_features_with_receive_policy(const char* host,
     return 0;
 }
 
-int trevrpc_msquic_conn_negotiated_alpn(trevrpc_msquic_conn* conn, const uint8_t** alpn, size_t* alpn_len) {
-    if (conn == NULL || alpn == NULL || alpn_len == NULL) {
-        return EINVAL;
-    }
-    if (conn->negotiated_alpn_len == 0) {
-        return EINVAL;
-    }
-    *alpn = conn->negotiated_alpn;
-    *alpn_len = conn->negotiated_alpn_len;
-    return 0;
-}
 
-int trevrpc_msquic_conn_peer_close_error(trevrpc_msquic_conn* conn, uint64_t* error_code) {
-    if (conn == NULL || error_code == NULL) {
-        return -EINVAL;
-    }
-    pthread_mutex_lock(&conn->mutex);
-    bool available = conn->peer_close_error_set;
-    *error_code = conn->peer_close_error;
-    pthread_mutex_unlock(&conn->mutex);
-    return available ? 0 : -EAGAIN;
-}
 
 int trevrpc_msquic_conn_feature_snapshot(trevrpc_msquic_conn* conn, trevrpc_msquic_feature_snapshot* snapshot) {
     if (conn == NULL || snapshot == NULL) {
@@ -3682,33 +3544,6 @@ int trevrpc_msquic_conn_accept_stream_ready(trevrpc_msquic_conn* conn, trevrpc_m
     return 0;
 }
 
-int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
-    if (conn == NULL || out_stream == NULL) {
-        return -EINVAL;
-    }
-    *out_stream = NULL;
-    pthread_mutex_lock(&conn->mutex);
-    while (conn->stream_head == NULL && !conn->closed && !conn->shutdown_complete && conn->err == 0) {
-        pthread_cond_wait(&conn->cond, &conn->mutex);
-    }
-
-    if (conn->stream_head == NULL) {
-        int err = conn->err != 0 ? conn->err : TREV_MSQUIC_ERR_CLOSED;
-        pthread_mutex_unlock(&conn->mutex);
-        return err;
-    }
-
-    trevrpc_msquic_stream_node* node = conn->stream_head;
-    conn->stream_head = node->next;
-    if (conn->stream_head == NULL) {
-        conn->stream_tail = NULL;
-    }
-    pthread_mutex_unlock(&conn->mutex);
-
-    *out_stream = node->stream;
-    free(node);
-    return 0;
-}
 
 static int trevrpc_msquic_conn_open_stream_with_flags(
     trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream, QUIC_STREAM_OPEN_FLAGS flags) {
@@ -3730,7 +3565,7 @@ static int trevrpc_msquic_conn_open_stream_with_flags(
 
     HQUIC connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
     if (connection_handle == NULL) {
-        trevrpc_msquic_stream_close(stream);
+        trevrpc_msquic_native_stream_close(stream);
         return TREV_MSQUIC_ERR_CLOSED;
     }
 
@@ -3738,13 +3573,13 @@ static int trevrpc_msquic_conn_open_stream_with_flags(
         connection_handle, flags, trevrpc_msquic_stream_callback, stream, &stream->handle);
     trevrpc_msquic_conn_handle_release(conn);
     if (QUIC_FAILED(status)) {
-        trevrpc_msquic_stream_close(stream);
+        trevrpc_msquic_native_stream_close(stream);
         return (int)status;
     }
 
     HQUIC stream_handle = trevrpc_msquic_stream_handle_acquire(stream);
     if (stream_handle == NULL) {
-        trevrpc_msquic_stream_close(stream);
+        trevrpc_msquic_native_stream_close(stream);
         return TREV_MSQUIC_ERR_CLOSED;
     }
     status = trevrpc_msquic_api()->StreamStart(stream_handle, QUIC_STREAM_START_FLAG_IMMEDIATE);
@@ -3757,7 +3592,7 @@ static int trevrpc_msquic_conn_open_stream_with_flags(
         if (failed_handle != NULL) {
             trevrpc_msquic_stream_complete_close(stream, failed_handle);
         }
-        trevrpc_msquic_stream_close(stream);
+        trevrpc_msquic_native_stream_close(stream);
         return (int)status;
     }
 
@@ -3765,15 +3600,15 @@ static int trevrpc_msquic_conn_open_stream_with_flags(
     return 0;
 }
 
-int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
+int trevrpc_msquic_native_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
     return trevrpc_msquic_conn_open_stream_with_flags(conn, out_stream, QUIC_STREAM_OPEN_FLAG_NONE);
 }
 
-int trevrpc_msquic_conn_open_uni_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
+int trevrpc_msquic_native_conn_open_uni_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** out_stream) {
     return trevrpc_msquic_conn_open_stream_with_flags(conn, out_stream, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL);
 }
 
-int trevrpc_msquic_stream_id(trevrpc_msquic_stream* stream, uint64_t* out_stream_id) {
+int trevrpc_msquic_native_stream_id(trevrpc_msquic_stream* stream, uint64_t* out_stream_id) {
     if (stream == NULL || out_stream_id == NULL) {
         return EINVAL;
     }
@@ -3851,7 +3686,7 @@ static void trevrpc_msquic_conn_destroy_owned(trevrpc_msquic_conn* conn, bool ow
     while (streams != NULL) {
         trevrpc_msquic_stream_node* node = streams;
         streams = node->next;
-        trevrpc_msquic_stream_close(node->stream);
+        trevrpc_msquic_native_stream_close(node->stream);
         free(node);
     }
 
@@ -3888,7 +3723,7 @@ static void trevrpc_msquic_conn_destroy_owned(trevrpc_msquic_conn* conn, bool ow
     free(conn);
 }
 
-void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn) {
+void trevrpc_msquic_native_conn_close(trevrpc_msquic_conn* conn) {
     if (conn == NULL) {
         return;
     }
@@ -3919,7 +3754,7 @@ void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn) {
     pthread_mutex_unlock(&conn->mutex);
 
     if (request_shutdown) {
-        trevrpc_msquic_conn_shutdown(conn);
+        trevrpc_msquic_native_conn_shutdown_error(conn, 0);
     }
     if (destroy) {
         trevrpc_msquic_conn_destroy_owned(conn, true);
@@ -3946,7 +3781,7 @@ void trevrpc_msquic_conn_close_deferred_owned(trevrpc_msquic_conn* conn) {
     trevrpc_msquic_finalizer_schedule(&conn->close_finalizer, conn, TREV_MSQUIC_FINALIZE_CONN_CLOSE);
 }
 
-void trevrpc_msquic_conn_shutdown_error(trevrpc_msquic_conn* conn, uint64_t error_code) {
+void trevrpc_msquic_native_conn_shutdown_error(trevrpc_msquic_conn* conn, uint64_t error_code) {
     if (conn == NULL) {
         return;
     }
@@ -3967,9 +3802,6 @@ void trevrpc_msquic_conn_shutdown_error(trevrpc_msquic_conn* conn, uint64_t erro
     }
 }
 
-void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn) {
-    trevrpc_msquic_conn_shutdown_error(conn, 0);
-}
 
 static intptr_t trevrpc_msquic_stream_read_until(trevrpc_msquic_stream* stream,
     uint8_t* data,
@@ -4041,9 +3873,6 @@ static intptr_t trevrpc_msquic_stream_read_until(trevrpc_msquic_stream* stream,
     return (intptr_t)copied;
 }
 
-intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
-    return trevrpc_msquic_stream_read_until(stream, data, len, NULL, false, true);
-}
 
 intptr_t trevrpc_msquic_stream_read_protocol(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
     return trevrpc_msquic_stream_read_until(stream, data, len, NULL, false, false);
@@ -4101,22 +3930,7 @@ int trevrpc_msquic_stream_select_protocol_bytes(trevrpc_msquic_stream* stream) {
     return result;
 }
 
-intptr_t trevrpc_msquic_stream_read_timeout(
-    trevrpc_msquic_stream* stream, uint8_t* data, size_t len, uint64_t timeout_nanos) {
-    if (timeout_nanos == 0) {
-        return trevrpc_msquic_stream_read(stream, data, len);
-    }
-    struct timespec deadline = {0};
-    int err = trevrpc_msquic_realtime_deadline(timeout_nanos, &deadline);
-    if (err != 0) {
-        return err;
-    }
-    return trevrpc_msquic_stream_read_until(stream, data, len, &deadline, false, true);
-}
 
-intptr_t trevrpc_msquic_stream_read_ready(trevrpc_msquic_stream* stream, uint8_t* data, size_t len) {
-    return trevrpc_msquic_stream_read_until(stream, data, len, NULL, true, true);
-}
 
 static void trevrpc_msquic_stream_receive_progress(
     trevrpc_msquic_stream* stream, trevrpc_msquic_receive_budget* budget) {
@@ -4162,54 +3976,7 @@ static intptr_t trevrpc_msquic_stream_dequeue_frame(trevrpc_msquic_stream* strea
     return ready;
 }
 
-static intptr_t trevrpc_msquic_frame_take_bytes(
-    trevrpc_msquic_frame* frame, uint8_t** body, size_t* len, size_t max_len) {
-    *len = frame->declared_len;
-    if (frame->err != 0) {
-        intptr_t result = frame->err;
-        trevrpc_owned_bytes_reset(&frame->body);
-        free(frame);
-        return result;
-    }
-    if (frame->body.len > max_len) {
-        trevrpc_owned_bytes_reset(&frame->body);
-        free(frame);
-        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-    }
-    if (frame->body.owner == (void*)frame->body.data && frame->body.release == trevrpc_frame_default_free &&
-        frame->body.release_context == NULL) {
-        *body = (uint8_t*)frame->body.data;
-        trevrpc_owned_bytes_init(&frame->body);
-    } else if (frame->body.len > 0) {
-        *body = malloc(frame->body.len);
-        if (*body == NULL) {
-            trevrpc_owned_bytes_reset(&frame->body);
-            free(frame);
-            return -ENOMEM;
-        }
-        memcpy(*body, frame->body.data, frame->body.len);
-        trevrpc_owned_bytes_reset(&frame->body);
-    }
-    free(frame);
-    return 1;
-}
 
-static intptr_t trevrpc_msquic_stream_read_frame_until(
-    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, const struct timespec* deadline) {
-    if (stream == NULL || body == NULL || len == NULL) {
-        return -EINVAL;
-    }
-    *body = NULL;
-    *len = 0;
-
-    trevrpc_msquic_frame* frame = NULL;
-    intptr_t ready =
-        trevrpc_msquic_stream_dequeue_frame(stream, max_len, deadline, TREV_MSQUIC_FRAME_WAIT_BLOCKING, &frame);
-    if (ready != 0 || frame == NULL) {
-        return ready;
-    }
-    return trevrpc_msquic_frame_take_bytes(frame, body, len, max_len);
-}
 
 static intptr_t trevrpc_msquic_stream_read_frame_owned_until(
     trevrpc_msquic_stream* stream, trevrpc_owned_bytes* body, size_t max_len, const struct timespec* deadline) {
@@ -4255,24 +4022,7 @@ intptr_t trevrpc_msquic_stream_read_frame_owned_timeout(
     return err == 0 ? trevrpc_msquic_stream_read_frame_owned_until(stream, body, max_len, &deadline) : err;
 }
 
-intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
-    return trevrpc_msquic_stream_read_frame_until(stream, body, len, max_len, NULL);
-}
 
-intptr_t trevrpc_msquic_stream_read_frame_timeout(
-    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos) {
-    if (timeout_nanos == 0) {
-        return trevrpc_msquic_stream_read_frame(stream, body, len, max_len);
-    }
-
-    struct timespec deadline = {0};
-    int err = trevrpc_msquic_realtime_deadline(timeout_nanos, &deadline);
-    if (err != 0) {
-        return err;
-    }
-
-    return trevrpc_msquic_stream_read_frame_until(stream, body, len, max_len, &deadline);
-}
 
 intptr_t trevrpc_msquic_stream_read_frame_owned_ready(
     trevrpc_msquic_stream* stream, trevrpc_owned_bytes* body, size_t max_len) {
@@ -4302,21 +4052,6 @@ intptr_t trevrpc_msquic_stream_read_frame_owned_ready(
     return 1;
 }
 
-intptr_t trevrpc_msquic_stream_read_frame_ready(
-    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len) {
-    if (stream == NULL || body == NULL || len == NULL) {
-        return -EINVAL;
-    }
-    *body = NULL;
-    *len = 0;
-
-    trevrpc_msquic_frame* frame = NULL;
-    intptr_t ready = trevrpc_msquic_stream_dequeue_frame(stream, max_len, NULL, TREV_MSQUIC_FRAME_WAIT_READY, &frame);
-    if (ready != 0 || frame == NULL) {
-        return ready;
-    }
-    return trevrpc_msquic_frame_take_bytes(frame, body, len, max_len);
-}
 
 int trevrpc_msquic_test_parse_frame_owned(const uint8_t* data,
     size_t len,
@@ -4376,7 +4111,7 @@ int trevrpc_msquic_test_parse_frame_owned(const uint8_t* data,
     return err;
 }
 
-intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
+intptr_t trevrpc_msquic_native_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
     if (len == 0) {
         return 0;
     }
@@ -4404,9 +4139,9 @@ intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_
     return result;
 }
 
-intptr_t trevrpc_msquic_stream_write_fin(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
+intptr_t trevrpc_msquic_native_stream_write_fin(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
     if (len == 0) {
-        return trevrpc_msquic_stream_shutdown_send(stream);
+        return trevrpc_msquic_native_stream_shutdown_send(stream);
     }
     if (data == NULL) {
         return -EINVAL;
@@ -4572,356 +4307,19 @@ intptr_t trevrpc_msquic_stream_write_raw_with_completion(trevrpc_msquic_stream* 
     return result;
 }
 
-static intptr_t trevrpc_msquic_stream_write_frame_parts_with_flags(trevrpc_msquic_stream* stream,
-    const trevrpc_msquic_frame_part* parts,
-    size_t parts_len,
-    size_t max_len,
-    QUIC_SEND_FLAGS flags,
-    trevrpc_msquic_send_completion** completion,
-    bool wait_for_capacity) {
-    if (completion != NULL) {
-        *completion = NULL;
-    }
-    if (parts == NULL && parts_len > 0) {
-        return -EINVAL;
-    }
-    if (parts_len > TREV_MSQUIC_SEND_MAX_BUFFERS - 1) {
-        return -EINVAL;
-    }
 
-    size_t frame_body_len = 0;
-    uint32_t buffer_count = 1;
-    for (size_t i = 0; i < parts_len; i++) {
-        if (parts[i].data == NULL && parts[i].len > 0) {
-            return -EINVAL;
-        }
-        if (parts[i].len > UINT32_MAX) {
-            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-        }
-        if (frame_body_len > SIZE_MAX - parts[i].len) {
-            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-        }
-        frame_body_len += parts[i].len;
-        if (parts[i].len > 0) {
-            buffer_count++;
-        }
-    }
-    if (frame_body_len > max_len || frame_body_len > UINT32_MAX) {
-        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-    }
-    if (frame_body_len > SIZE_MAX - 4) {
-        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-    }
 
-    int op_err = trevrpc_msquic_stream_send_op_acquire(stream);
-    if (op_err != 0) {
-        return op_err;
-    }
 
-    intptr_t result = 0;
-    trevrpc_msquic_send* send = trevrpc_msquic_send_alloc(4, false);
-    if (send == NULL) {
-        result = -ENOMEM;
-        goto cleanup;
-    }
 
-    send->data[0] = (uint8_t)(frame_body_len >> 24);
-    send->data[1] = (uint8_t)(frame_body_len >> 16);
-    send->data[2] = (uint8_t)(frame_body_len >> 8);
-    send->data[3] = (uint8_t)frame_body_len;
-    send->buffers[0].Buffer = send->data;
-    send->buffers[0].Length = 4;
-    uint32_t out = 1;
-    for (size_t i = 0; i < parts_len; i++) {
-        if (parts[i].len == 0) {
-            continue;
-        }
-        send->buffers[out].Buffer = (uint8_t*)parts[i].data;
-        send->buffers[out].Length = (uint32_t)parts[i].len;
-        out++;
-    }
 
-    result = trevrpc_msquic_stream_send_buffers_with_flags(
-        stream, send, buffer_count, 4 + frame_body_len, flags, completion, wait_for_capacity, false);
-cleanup:
-    trevrpc_msquic_stream_send_op_release(stream);
-    return result;
-}
 
-intptr_t trevrpc_msquic_stream_write_frame_parts(
-    trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len) {
-    return trevrpc_msquic_stream_write_frame_parts_with_flags(
-        stream, parts, parts_len, max_len, QUIC_SEND_FLAG_NONE, NULL, false);
-}
 
-intptr_t trevrpc_msquic_stream_write_frame_parts_fin(
-    trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len) {
-    return trevrpc_msquic_stream_write_frame_parts_with_flags(
-        stream, parts, parts_len, max_len, QUIC_SEND_FLAG_FIN, NULL, false);
-}
 
-intptr_t trevrpc_msquic_stream_write_frame_parts_with_completion(trevrpc_msquic_stream* stream,
-    const trevrpc_msquic_frame_part* parts,
-    size_t parts_len,
-    size_t max_len,
-    trevrpc_msquic_send_completion** completion) {
-    if (completion == NULL) {
-        return -EINVAL;
-    }
-    return trevrpc_msquic_stream_write_frame_parts_with_flags(
-        stream, parts, parts_len, max_len, QUIC_SEND_FLAG_NONE, completion, true);
-}
 
-intptr_t trevrpc_msquic_stream_write_frame_parts_fin_with_completion(trevrpc_msquic_stream* stream,
-    const trevrpc_msquic_frame_part* parts,
-    size_t parts_len,
-    size_t max_len,
-    trevrpc_msquic_send_completion** completion) {
-    if (completion == NULL) {
-        return -EINVAL;
-    }
-    return trevrpc_msquic_stream_write_frame_parts_with_flags(
-        stream, parts, parts_len, max_len, QUIC_SEND_FLAG_FIN, completion, true);
-}
 
-static bool trevrpc_msquic_message_frame_layout(size_t body_len, size_t* field_header_len, size_t* frame_body_len) {
-    *field_header_len = 0;
-    *frame_body_len = 0;
-    if (body_len == 0) {
-        return true;
-    }
-    size_t header_len = 0;
-    if (!trevrpc_msquic_checked_add(1, trevrpc_msquic_varint_len(body_len), &header_len) ||
-        !trevrpc_msquic_checked_add(header_len, body_len, frame_body_len)) {
-        return false;
-    }
-    *field_header_len = header_len;
-    return true;
-}
 
-static uint8_t* trevrpc_msquic_append_message_field_header(uint8_t* out, size_t body_len) {
-    if (body_len > 0) {
-        *out++ = 0x22;
-        out = trevrpc_msquic_append_varint(out, body_len);
-    }
-    return out;
-}
 
-static intptr_t trevrpc_msquic_stream_write_message_frame_internal(
-    trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len, bool wait_for_capacity) {
-    if (body == NULL && body_len > 0) {
-        return -EINVAL;
-    }
-    size_t field_header_len = 0;
-    size_t frame_body_len = 0;
-    if (!trevrpc_msquic_message_frame_layout(body_len, &field_header_len, &frame_body_len)) {
-        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-    }
-    if (frame_body_len > max_len || frame_body_len > UINT32_MAX - 4) {
-        return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-    }
-
-    int op_err = trevrpc_msquic_stream_send_op_acquire(stream);
-    if (op_err != 0) {
-        return op_err;
-    }
-
-    intptr_t result = 0;
-    size_t frame_len = 4 + frame_body_len;
-    trevrpc_msquic_send* send = trevrpc_msquic_send_acquire(stream, frame_len);
-    if (send == NULL) {
-        result = -ENOMEM;
-        goto cleanup;
-    }
-
-    send->data[0] = (uint8_t)(frame_body_len >> 24);
-    send->data[1] = (uint8_t)(frame_body_len >> 16);
-    send->data[2] = (uint8_t)(frame_body_len >> 8);
-    send->data[3] = (uint8_t)frame_body_len;
-    if (body_len > 0) {
-        uint8_t* out = trevrpc_msquic_append_message_field_header(send->data + 4, body_len);
-        memcpy(out, body, body_len);
-    }
-
-    result =
-        trevrpc_msquic_stream_send_buffer_with_flags(stream, send, frame_len, QUIC_SEND_FLAG_NONE, wait_for_capacity);
-cleanup:
-    trevrpc_msquic_stream_send_op_release(stream);
-    return result;
-}
-
-intptr_t trevrpc_msquic_stream_write_message_frame(
-    trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len) {
-    return trevrpc_msquic_stream_write_message_frame_internal(stream, body, body_len, max_len, false);
-}
-
-intptr_t trevrpc_msquic_stream_write_message_frame_wait_capacity(
-    trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len) {
-    return trevrpc_msquic_stream_write_message_frame_internal(stream, body, body_len, max_len, true);
-}
-
-intptr_t trevrpc_msquic_stream_write_message_frames(
-    trevrpc_msquic_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count, size_t max_len) {
-    if (count == 0) {
-        return 0;
-    }
-    if (bodies == NULL || body_lens == NULL) {
-        return -EINVAL;
-    }
-
-    size_t frame_len = 0;
-    for (size_t i = 0; i < count; i++) {
-        size_t field_header_len = 0;
-        size_t frame_body_len = 0;
-        if (!trevrpc_msquic_message_frame_layout(body_lens[i], &field_header_len, &frame_body_len)) {
-            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-        }
-        if (frame_body_len > max_len || frame_body_len > UINT32_MAX - 4) {
-            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-        }
-        if (frame_len > SIZE_MAX - 4 - frame_body_len) {
-            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-        }
-        frame_len += 4 + frame_body_len;
-    }
-
-    int op_err = trevrpc_msquic_stream_send_op_acquire(stream);
-    if (op_err != 0) {
-        return op_err;
-    }
-
-    intptr_t result = 0;
-    trevrpc_msquic_send* send = trevrpc_msquic_send_acquire(stream, frame_len);
-    if (send == NULL) {
-        result = -ENOMEM;
-        goto cleanup;
-    }
-
-    uint8_t* out = send->data;
-    size_t body_offset = 0;
-    for (size_t i = 0; i < count; i++) {
-        size_t field_header_len = 0;
-        size_t frame_body_len = 0;
-        if (!trevrpc_msquic_message_frame_layout(body_lens[i], &field_header_len, &frame_body_len)) {
-            trevrpc_msquic_send_release(stream, send);
-            result = TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-            goto cleanup;
-        }
-
-        *out++ = (uint8_t)(frame_body_len >> 24);
-        *out++ = (uint8_t)(frame_body_len >> 16);
-        *out++ = (uint8_t)(frame_body_len >> 8);
-        *out++ = (uint8_t)frame_body_len;
-        if (body_lens[i] > 0) {
-            out = trevrpc_msquic_append_message_field_header(out, body_lens[i]);
-            memcpy(out, bodies + body_offset, body_lens[i]);
-            out += body_lens[i];
-            body_offset += body_lens[i];
-        }
-    }
-
-    result = trevrpc_msquic_stream_send_buffer(stream, send, frame_len);
-cleanup:
-    trevrpc_msquic_stream_send_op_release(stream);
-    return result;
-}
-
-intptr_t trevrpc_msquic_stream_write_message_frames_borrowed(trevrpc_msquic_stream* stream,
-    const uint8_t* const* bodies,
-    const size_t* body_lens,
-    size_t count,
-    size_t max_len,
-    trevrpc_msquic_send_completion** completion) {
-    if (stream == NULL || completion == NULL || (body_lens == NULL && count > 0) || (bodies == NULL && count > 0)) {
-        return -EINVAL;
-    }
-    *completion = NULL;
-    if (count == 0) {
-        return 0;
-    }
-    if (count > UINT32_MAX / 2u) {
-        return -EOVERFLOW;
-    }
-
-    size_t header_data_len = 0;
-    size_t frame_len = 0;
-    uint32_t buffer_count = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (bodies[i] == NULL && body_lens[i] > 0) {
-            return -EINVAL;
-        }
-        size_t field_header_len = 0;
-        size_t frame_body_len = 0;
-        if (!trevrpc_msquic_message_frame_layout(body_lens[i], &field_header_len, &frame_body_len)) {
-            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-        }
-        if (frame_body_len > max_len || frame_body_len > UINT32_MAX) {
-            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-        }
-        if (header_data_len > SIZE_MAX - 4 - field_header_len || frame_len > SIZE_MAX - 4 - frame_body_len) {
-            return TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-        }
-        header_data_len += 4 + field_header_len;
-        frame_len += 4 + frame_body_len;
-        buffer_count++;
-        if (body_lens[i] > 0) {
-            buffer_count++;
-        }
-    }
-
-    int op_err = trevrpc_msquic_stream_send_op_acquire(stream);
-    if (op_err != 0) {
-        return op_err;
-    }
-
-    intptr_t result = 0;
-    trevrpc_msquic_send* send = trevrpc_msquic_send_alloc(header_data_len, false);
-    if (send == NULL) {
-        result = -ENOMEM;
-        goto cleanup;
-    }
-    int err = trevrpc_msquic_send_prepare_buffers(send, buffer_count);
-    if (err != 0) {
-        trevrpc_msquic_send_release(stream, send);
-        result = err;
-        goto cleanup;
-    }
-
-    QUIC_BUFFER* buffers = trevrpc_msquic_send_buffers(send);
-    uint8_t* out = send->data;
-    uint32_t buffer_index = 0;
-    for (size_t i = 0; i < count; i++) {
-        size_t field_header_len = 0;
-        size_t frame_body_len = 0;
-        if (!trevrpc_msquic_message_frame_layout(body_lens[i], &field_header_len, &frame_body_len)) {
-            result = TREV_MSQUIC_ERR_FRAME_TOO_LARGE;
-            trevrpc_msquic_send_release(stream, send);
-            goto cleanup;
-        }
-        uint8_t* header = out;
-        *out++ = (uint8_t)(frame_body_len >> 24);
-        *out++ = (uint8_t)(frame_body_len >> 16);
-        *out++ = (uint8_t)(frame_body_len >> 8);
-        *out++ = (uint8_t)frame_body_len;
-        out = trevrpc_msquic_append_message_field_header(out, body_lens[i]);
-        buffers[buffer_index].Buffer = header;
-        buffers[buffer_index].Length = (uint32_t)(4 + field_header_len);
-        buffer_index++;
-        if (body_lens[i] > 0) {
-            buffers[buffer_index].Buffer = (uint8_t*)bodies[i];
-            buffers[buffer_index].Length = (uint32_t)body_lens[i];
-            buffer_index++;
-        }
-    }
-
-    result = trevrpc_msquic_stream_send_buffers_with_flags(
-        stream, send, buffer_count, frame_len, QUIC_SEND_FLAG_NONE, completion, true, false);
-cleanup:
-    trevrpc_msquic_stream_send_op_release(stream);
-    return result;
-}
-
-int trevrpc_msquic_send_completion_status(trevrpc_msquic_send_completion* completion) {
+int trevrpc_msquic_native_send_completion_status(trevrpc_msquic_send_completion* completion) {
     if (completion == NULL) {
         return -EINVAL;
     }
@@ -4931,7 +4329,7 @@ int trevrpc_msquic_send_completion_status(trevrpc_msquic_send_completion* comple
     return result;
 }
 
-int trevrpc_msquic_send_completion_wait(trevrpc_msquic_send_completion* completion) {
+int trevrpc_msquic_native_send_completion_wait(trevrpc_msquic_send_completion* completion) {
     if (completion == NULL) {
         return EINVAL;
     }
@@ -4944,7 +4342,7 @@ int trevrpc_msquic_send_completion_wait(trevrpc_msquic_send_completion* completi
     return result;
 }
 
-void trevrpc_msquic_send_completion_free(trevrpc_msquic_send_completion* completion) {
+void trevrpc_msquic_native_send_completion_free(trevrpc_msquic_send_completion* completion) {
     if (completion == NULL) {
         return;
     }
@@ -4953,26 +4351,8 @@ void trevrpc_msquic_send_completion_free(trevrpc_msquic_send_completion* complet
     free(completion);
 }
 
-int trevrpc_msquic_stream_wait_pending_sends(trevrpc_msquic_stream* stream) {
-    if (stream == NULL) {
-        return EINVAL;
-    }
-    int err = trevrpc_msquic_stream_api_lifecycle_acquire(stream);
-    if (err != 0) {
-        return err;
-    }
-    trevrpc_msquic_test_emit_stream_event(TREV_MSQUIC_TEST_STREAM_WAIT_SENDS_PINNED);
 
-    pthread_mutex_lock(&stream->mutex);
-    while (stream->pending_send_count > 0 || stream->active_send_completions > 0) {
-        pthread_cond_wait(&stream->cond, &stream->mutex);
-    }
-    pthread_mutex_unlock(&stream->mutex);
-    trevrpc_msquic_stream_lifecycle_release(stream);
-    return 0;
-}
-
-int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream) {
+int trevrpc_msquic_native_stream_shutdown_send(trevrpc_msquic_stream* stream) {
     int err = trevrpc_msquic_stream_send_op_acquire(stream);
     if (err != 0) {
         return err;
@@ -5046,7 +4426,7 @@ int trevrpc_msquic_stream_abort_with_error(trevrpc_msquic_stream* stream, uint64
     return QUIC_FAILED(status) ? (int)status : 0;
 }
 
-int trevrpc_msquic_stream_abort(trevrpc_msquic_stream* stream) {
+int trevrpc_msquic_native_stream_abort(trevrpc_msquic_stream* stream) {
     return trevrpc_msquic_stream_abort_with_error(stream, 0);
 }
 
@@ -5078,7 +4458,7 @@ int trevrpc_msquic_stream_abort_receive_with_error(trevrpc_msquic_stream* stream
     return QUIC_FAILED(status) ? (int)status : 0;
 }
 
-int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream) {
+int trevrpc_msquic_native_stream_abort_receive(trevrpc_msquic_stream* stream) {
     return trevrpc_msquic_stream_abort_receive_with_error(stream, 0);
 }
 
@@ -5341,7 +4721,7 @@ static void trevrpc_msquic_stream_close_mode(trevrpc_msquic_stream* stream, bool
     pthread_mutex_unlock(&stream->mutex);
 }
 
-void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream) {
+void trevrpc_msquic_native_stream_close(trevrpc_msquic_stream* stream) {
     trevrpc_msquic_stream_close_mode(stream, false);
 }
 
@@ -5357,32 +4737,7 @@ void trevrpc_msquic_stream_close_deferred_owned(trevrpc_msquic_stream* stream, b
         immediate ? TREV_MSQUIC_FINALIZE_STREAM_CLOSE_IMMEDIATE : TREV_MSQUIC_FINALIZE_STREAM_CLOSE);
 }
 
-void trevrpc_msquic_free(void* ptr) {
-    free(ptr);
-}
 
-const char* trevrpc_msquic_error(int code) {
-    switch (code) {
-    case 0:
-        return "ok";
-    case TREV_MSQUIC_ERR_CLOSED:
-        return "closed";
-    case TREV_MSQUIC_ERR_FRAME_TOO_LARGE:
-        return "frame too large";
-    case TREV_MSQUIC_ERR_TIMEOUT:
-        return "timed out";
-    case TREV_MSQUIC_ERR_RESOURCE_EXHAUSTED:
-        return "resource exhausted";
-    case ENOMEM:
-    case -ENOMEM:
-        return "out of memory";
-    case EINVAL:
-    case -EINVAL:
-        return "invalid argument";
-    default:
-        return "MsQuic operation failed";
-    }
-}
 
 int trevrpc_msquic_accepted_connection_wrap(
     trevrpc_msquic_accepted_connection* accepted, trevrpc_msquic_conn** out_connection) {
@@ -5406,7 +4761,7 @@ int trevrpc_msquic_accepted_connection_wrap(
     conn->registration = accepted->registration;
     if (trevrpc_msquic_accepted_connection_take_endpoint_lease(
             accepted, &conn->endpoint_lease, &conn->endpoint_lease_release) != 0) {
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         return ECANCELED;
     }
     trevrpc_msquic_feature_request connection_features =
@@ -5418,14 +4773,14 @@ int trevrpc_msquic_accepted_connection_wrap(
     accepted->claimed = true;
     connection_handle = trevrpc_msquic_conn_handle_acquire(conn);
     if (connection_handle == NULL) {
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         return ECANCELED;
     }
     trevrpc_msquic_api()->SetCallbackHandler(connection_handle, (void*)trevrpc_msquic_conn_callback, conn);
     status = trevrpc_msquic_api()->ConnectionSetConfiguration(connection_handle, accepted->configuration);
     trevrpc_msquic_conn_handle_release(conn);
     if (QUIC_FAILED(status)) {
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         return (int)status;
     }
     *out_connection = conn;
@@ -5493,7 +4848,7 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     }
     node = malloc(sizeof(*node));
     if (node == NULL) {
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         trevrpc_msquic_listener_callback_finish(listener);
         return QUIC_STATUS_OUT_OF_MEMORY;
     }
@@ -5504,7 +4859,7 @@ static QUIC_STATUS QUIC_API trevrpc_msquic_listener_callback(
     if (listener->closed) {
         pthread_mutex_unlock(&listener->mutex);
         free(node);
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         trevrpc_msquic_listener_callback_finish(listener);
         return QUIC_STATUS_ABORTED;
     }
@@ -5577,15 +4932,15 @@ static QUIC_STATUS trevrpc_msquic_conn_callback_impl(
             stream->send_closed = true;
         }
         uint64_t stream_id = 0;
-        if (trevrpc_msquic_stream_id(stream, &stream_id) != 0) {
-            trevrpc_msquic_stream_close(stream);
+        if (trevrpc_msquic_native_stream_id(stream, &stream_id) != 0) {
+            trevrpc_msquic_native_stream_close(stream);
             return QUIC_STATUS_ABORTED;
         }
         trevrpc_msquic_api()->SetCallbackHandler(
             event->PEER_STREAM_STARTED.Stream, (void*)trevrpc_msquic_stream_callback, stream);
         trevrpc_msquic_stream_node* node = malloc(sizeof(*node));
         if (node == NULL) {
-            trevrpc_msquic_stream_close(stream);
+            trevrpc_msquic_native_stream_close(stream);
             return QUIC_STATUS_OUT_OF_MEMORY;
         }
         node->stream = stream;
@@ -6208,7 +5563,7 @@ void trevrpc_msquic_test_receive_fixture_destroy(trevrpc_msquic_test_receive_fix
         return;
     }
     for (size_t index = 0; index < fixture->stream_count; index++) {
-        trevrpc_msquic_stream_close(fixture->streams[index]);
+        trevrpc_msquic_native_stream_close(fixture->streams[index]);
     }
     if (fixture->connection_ref) {
         trevrpc_msquic_receive_budget_release(fixture->budget);

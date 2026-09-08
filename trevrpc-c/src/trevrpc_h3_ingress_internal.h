@@ -66,8 +66,6 @@ typedef struct trevrpc_h3_ingress_item {
     void* _transport_stream;
 } trevrpc_h3_ingress_item;
 
-int trevrpc_h3_ingress_create(
-    trevrpc_msquic_conn* conn, const trevrpc_h3_ingress_config* config, trevrpc_h3_ingress** out_runtime);
 int trevrpc_h3_ingress_create_with_ops(void* conn,
     const trevrpc_h3_ingress_transport_ops* ops,
     const trevrpc_h3_ingress_config* config,

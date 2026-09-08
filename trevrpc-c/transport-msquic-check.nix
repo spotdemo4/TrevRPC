@@ -34,14 +34,11 @@ stdenv.mkDerivation (final: {
       -DTREVRPC_TRANSPORT_PRIVATE_INSTALL_LIBDIR="$out/lib/trevrpc/transport-private-check" \
       -DTREVRPC_BUILD_TESTS=ON \
       -DTREVRPC_BUILD_ENGINE=ON \
-      -DTREVRPC_BUILD_MSQUIC=OFF \
       -DTREVRPC_BUILD_ENGINE_MSQUIC=ON \
       -DTREVRPC_BUILD_TRANSPORT=ON \
       -DTREVRPC_BUILD_TRANSPORT_MSQUIC=ON \
       -DTREVRPC_BUILD_RPC=OFF \
       -DTREVRPC_BUILD_RPC_MSQUIC=OFF \
-      -DTREVRPC_BUILD_WEBTRANSPORT=OFF \
-      -DTREVRPC_BUILD_RUNTIME=OFF \
       -DTREVRPC_BUILD_CODEGEN=OFF \
       -DTREVRPC_BUILD_BENCHMARKS=OFF \
       -DTREVRPC_BUILD_EXAMPLES=OFF
@@ -66,7 +63,7 @@ stdenv.mkDerivation (final: {
   checkPhase = ''
     runHook preCheck
     ctest --test-dir build --output-on-failure \
-      -R '^trevrpc_transport_(api|api_cpp|abi1_symbols|msquic_abi1_symbols|msquic_smoke|native_roundtrip)$'
+      -R '^(trevrpc_transport_(api|api_cpp|abi1_symbols|msquic_abi1_symbols|msquic_smoke|native_roundtrip)|trevrpc_removed_abi6_surface)$'
     runHook postCheck
   '';
 
@@ -95,6 +92,12 @@ stdenv.mkDerivation (final: {
     test ! -e "$out/include/trevrpc_rpc_msquic.h"
     test ! -e "$out/lib/libtrevrpc_rpc.a"
     test ! -e "$out/lib/libtrevrpc_rpc_msquic.a"
+    cmake \
+      -DTREVRPC_NM="$(command -v nm)" \
+      -DTREVRPC_AR="$(command -v ar)" \
+      -DTREVRPC_INSTALL_PREFIXES="$out" \
+      -DTREVRPC_SOURCE_DIR="$PWD" \
+      -P tests/abi/check_removed_abi6.cmake
 
     cmake -S tests/install/cmake -B "$TMPDIR/transport-msquic-cmake-consumer" -G Ninja \
       -DCMAKE_PREFIX_PATH="$out" \

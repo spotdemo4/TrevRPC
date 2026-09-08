@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.20)
 
 project(trevrpc-c VERSION 0.2.2 LANGUAGES C)
 
-set(TREVRPC_C_ABI_VERSION 6)
 set(TREVRPC_ENGINE_ABI_VERSION 1)
 set(TREVRPC_ENGINE_MSQUIC_ABI_VERSION 1)
 set(TREVRPC_TRANSPORT_ABI_VERSION 1)
@@ -51,9 +50,6 @@ option(TREVRPC_BUILD_TRANSPORT_MSQUIC
     "${TREVRPC_BUILD_ENGINE_MSQUIC}"
 )
 option(TREVRPC_BUILD_RPC_MSQUIC "Build the MsQuic RPC runtime companion" "${TREVRPC_BUILD_TRANSPORT_MSQUIC}")
-option(TREVRPC_BUILD_MSQUIC "Build the internal legacy ABI 6 MsQuic compatibility transport" OFF)
-option(TREVRPC_BUILD_WEBTRANSPORT "Build the internal legacy ABI 6 WebTransport compatibility transport" OFF)
-option(TREVRPC_BUILD_RUNTIME "Build the internal legacy trevrpc-c ABI 6 compatibility runtime" OFF)
 option(TREVRPC_BUILD_CODEGEN "Build protoc-gen-trevrpc-c" "${trevrpc_default_build_codegen}")
 set(trevrpc_default_build_rpc_test_support OFF)
 if(TREVRPC_BUILD_TESTS AND TREVRPC_BUILD_RPC)
@@ -63,7 +59,6 @@ option(TREVRPC_BUILD_RPC_TEST_SUPPORT
     "Build the private RPC fake transport support library"
     "${trevrpc_default_build_rpc_test_support}"
 )
-option(TREVRPC_INSTALL_INTERNAL_HEADERS "Install trevrpc-c internal headers for tests and development" OFF)
 option(TREVRPC_ENABLE_SANITIZERS "Build trevrpc-c with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(TREVRPC_ENABLE_THREAD_SANITIZER "Build trevrpc-c with ThreadSanitizer" OFF)
 if(TREVRPC_BUILD_ENGINE AND NOT UNIX)
@@ -96,8 +91,6 @@ endif()
 if(TREVRPC_ENABLE_SANITIZERS AND TREVRPC_ENABLE_THREAD_SANITIZER)
     message(FATAL_ERROR "TREVRPC_ENABLE_SANITIZERS and TREVRPC_ENABLE_THREAD_SANITIZER are mutually exclusive")
 endif()
-set(TREVRPC_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc" CACHE PATH
-    "Install directory for trevrpc CMake package files")
 set(TREVRPC_ENGINE_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc_engine" CACHE PATH
     "Install directory for trevrpc_engine CMake package files")
 set(TREVRPC_ENGINE_MSQUIC_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/trevrpc_engine_msquic" CACHE PATH
@@ -131,14 +124,11 @@ int main(void) {
 ]=] TREVRPC_ENGINE_HAVE_PIPE2)
 endif()
 
-if(TREVRPC_BUILD_MSQUIC OR TREVRPC_BUILD_RPC OR TREVRPC_BUILD_TRANSPORT_MSQUIC)
+if(TREVRPC_BUILD_RPC OR TREVRPC_BUILD_TRANSPORT_MSQUIC)
     add_library(trevrpc_core STATIC
         src/trevrpc_frame.c
-        src/trevrpc_ownership.c
         src/trevrpc_values.c
-        src/trevrpc_values_abi6.c
         src/trevrpc_wire.c
-        src/trevrpc_wire_abi6.c
     )
     target_include_directories(trevrpc_core
         PUBLIC
@@ -196,18 +186,6 @@ function(trevrpc_c_configure_msquic target)
     )
     target_link_libraries(${target} PUBLIC Threads::Threads PRIVATE msquic::msquic trevrpc_core)
     target_compile_definitions(${target} PRIVATE QUIC_API_ENABLE_PREVIEW_FEATURES)
-    trevrpc_c_warnings(${target})
-    trevrpc_c_sanitizers(${target})
-endfunction()
-
-function(trevrpc_c_configure_runtime target)
-    target_include_directories(${target}
-        PUBLIC
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE src
-    )
-    target_link_libraries(${target} PUBLIC ${ARGN} trevrpc_core Threads::Threads)
     trevrpc_c_warnings(${target})
     trevrpc_c_sanitizers(${target})
 endfunction()
@@ -316,7 +294,6 @@ if(TREVRPC_BUILD_RPC_TEST_SUPPORT)
     trevrpc_c_sanitizers(trevrpc_rpc_fake_transport_support)
 endif()
 
-set(trevrpc_install_targets)
 set(trevrpc_pkg_config_files)
 
 if(IS_ABSOLUTE "${TREVRPC_INSTALL_PKGCONFIGDIR}")
@@ -356,13 +333,6 @@ set(trevrpc_transport_private_pc_libdir
     "\${pcfiledir}/${trevrpc_transport_private_lib_from_pc}"
 )
 
-if(TARGET trevrpc_core)
-    list(APPEND trevrpc_install_targets trevrpc_core)
-    if(TREVRPC_BUILD_MSQUIC)
-        list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_core.pc")
-        configure_file(cmake/trevrpc_core.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_core.pc" @ONLY)
-    endif()
-endif()
 if(TREVRPC_BUILD_ENGINE)
     list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_engine.pc")
     configure_file(cmake/trevrpc_engine.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_engine.pc" @ONLY)
@@ -376,7 +346,7 @@ if(TREVRPC_BUILD_RPC)
     configure_file(cmake/trevrpc_rpc.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_rpc.pc" @ONLY)
 endif()
 
-if(TREVRPC_BUILD_MSQUIC OR TREVRPC_BUILD_ENGINE_MSQUIC OR TREVRPC_BUILD_TRANSPORT_MSQUIC)
+if(TREVRPC_BUILD_ENGINE_MSQUIC)
     find_package(msquic CONFIG REQUIRED)
 
     add_library(trevrpc_msquic_api_owner STATIC src/trevrpc_msquic_api_owner.c)
@@ -386,11 +356,7 @@ if(TREVRPC_BUILD_MSQUIC OR TREVRPC_BUILD_ENGINE_MSQUIC OR TREVRPC_BUILD_TRANSPOR
     trevrpc_c_sanitizers(trevrpc_msquic_api_owner)
 endif()
 
-if(TREVRPC_BUILD_MSQUIC OR TREVRPC_BUILD_TRANSPORT_MSQUIC)
-    if(TREVRPC_BUILD_MSQUIC)
-        list(APPEND trevrpc_install_targets trevrpc_msquic_api_owner)
-    endif()
-
+if(TREVRPC_BUILD_TRANSPORT_MSQUIC)
     add_library(trevrpc_protocol_core STATIC
         src/trevrpc_quic_varint.c
         src/trevrpc_qpack_static.c
@@ -440,10 +406,6 @@ if(TREVRPC_BUILD_MSQUIC OR TREVRPC_BUILD_TRANSPORT_MSQUIC)
     )
     trevrpc_c_warnings(trevrpc_msquic_native_core)
     trevrpc_c_sanitizers(trevrpc_msquic_native_core)
-    if(TREVRPC_BUILD_MSQUIC)
-        list(APPEND trevrpc_install_targets trevrpc_msquic_native_core)
-    endif()
-
     if(TREVRPC_BUILD_TESTS)
         add_library(trevrpc_msquic_testing STATIC
             src/trevrpc_msquic_core.c
@@ -458,24 +420,6 @@ if(TREVRPC_BUILD_MSQUIC OR TREVRPC_BUILD_TRANSPORT_MSQUIC)
         target_link_libraries(trevrpc_msquic_testing PRIVATE trevrpc_protocol_core trevrpc_msquic_api_owner)
     endif()
 
-    if(TREVRPC_BUILD_MSQUIC)
-        add_library(trevrpc_msquic STATIC src/trevrpc_msquic.c)
-        target_include_directories(trevrpc_msquic
-            PUBLIC
-                $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-                $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        )
-        target_link_libraries(trevrpc_msquic
-            PUBLIC trevrpc_msquic_native_core
-            PRIVATE trevrpc_core
-        )
-        trevrpc_c_warnings(trevrpc_msquic)
-        trevrpc_c_sanitizers(trevrpc_msquic)
-
-        list(APPEND trevrpc_install_targets trevrpc_msquic)
-        list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_msquic.pc")
-        configure_file(cmake/trevrpc_msquic.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_msquic.pc" @ONLY)
-    endif()
 endif()
 
 if(TREVRPC_BUILD_ENGINE_MSQUIC)
@@ -619,79 +563,6 @@ if(TREVRPC_BUILD_RPC_MSQUIC)
         "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_rpc_msquic.pc" @ONLY)
 endif()
 
-if(TREVRPC_BUILD_WEBTRANSPORT)
-    if(NOT TREVRPC_BUILD_MSQUIC)
-        message(FATAL_ERROR "TREVRPC_BUILD_WEBTRANSPORT requires TREVRPC_BUILD_MSQUIC")
-    endif()
-
-    set(trevrpc_webtransport_sources
-        src/trevrpc_webtransport.c
-    )
-    add_library(trevrpc_webtransport STATIC ${trevrpc_webtransport_sources})
-    target_include_directories(trevrpc_webtransport
-        PUBLIC
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-    )
-    target_link_libraries(trevrpc_webtransport
-        PUBLIC trevrpc_msquic Threads::Threads
-        PRIVATE
-            $<BUILD_INTERFACE:trevrpc_protocol_core>
-            $<INSTALL_INTERFACE:-ltrevrpc_protocol_core>
-            trevrpc_core
-    )
-    target_link_directories(trevrpc_webtransport INTERFACE
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_LIBDIR}>
-    )
-    trevrpc_c_warnings(trevrpc_webtransport)
-    trevrpc_c_sanitizers(trevrpc_webtransport)
-    list(APPEND trevrpc_install_targets trevrpc_webtransport)
-    list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_webtransport.pc")
-    configure_file(cmake/trevrpc_webtransport.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc_webtransport.pc" @ONLY)
-endif()
-
-if(TREVRPC_BUILD_RUNTIME)
-    if(NOT TREVRPC_BUILD_MSQUIC)
-        message(FATAL_ERROR "TREVRPC_BUILD_RUNTIME requires TREVRPC_BUILD_MSQUIC")
-    endif()
-    if(NOT TREVRPC_BUILD_WEBTRANSPORT)
-        message(FATAL_ERROR "TREVRPC_BUILD_RUNTIME requires TREVRPC_BUILD_WEBTRANSPORT")
-    endif()
-
-    add_library(trevrpc STATIC
-        src/trevrpc.c
-        src/trevrpc_channel.c
-        src/trevrpc_lifetime.c
-        src/trevrpc_versioned_runtime.c
-    )
-    trevrpc_c_configure_runtime(trevrpc trevrpc_msquic trevrpc_webtransport)
-    list(APPEND trevrpc_install_targets trevrpc)
-    list(APPEND trevrpc_pkg_config_files "${CMAKE_CURRENT_BINARY_DIR}/trevrpc.pc")
-    configure_file(cmake/trevrpc.pc.in "${CMAKE_CURRENT_BINARY_DIR}/trevrpc.pc" @ONLY)
-
-    if(TREVRPC_BUILD_TESTS)
-        add_library(trevrpc_testing STATIC
-            src/trevrpc.c
-            src/trevrpc_channel.c
-            src/trevrpc_lifetime.c
-            src/trevrpc_versioned_runtime.c
-        )
-        target_compile_definitions(trevrpc_testing PRIVATE TREVRPC_TESTING)
-        trevrpc_c_configure_runtime(trevrpc_testing trevrpc_msquic trevrpc_webtransport)
-
-        add_library(trevrpc_msquic_testing_runtime STATIC
-            src/trevrpc.c
-            src/trevrpc_channel.c
-            src/trevrpc_lifetime.c
-            src/trevrpc_versioned_runtime.c
-            ${trevrpc_webtransport_sources}
-        )
-        target_compile_definitions(trevrpc_msquic_testing_runtime PRIVATE TREVRPC_H3_FRAME_POLICY_TESTING)
-        trevrpc_c_configure_runtime(trevrpc_msquic_testing_runtime trevrpc_msquic_testing)
-        target_link_libraries(trevrpc_msquic_testing_runtime PRIVATE trevrpc_protocol_core)
-    endif()
-endif()
-
 set(trevrpc_needs_generated_test_bindings OFF)
 if(TREVRPC_BUILD_RPC_MSQUIC AND TREVRPC_BUILD_TESTS)
     set(trevrpc_needs_generated_test_bindings ON)
@@ -707,9 +578,8 @@ if(TREVRPC_BUILD_CODEGEN OR trevrpc_needs_generated_test_bindings
     set(trevrpc_needs_generated_bindings ON)
 endif()
 
-if((TREVRPC_BUILD_RUNTIME AND (TREVRPC_BUILD_TESTS OR TREVRPC_BUILD_BENCHMARKS))
-    OR (TREVRPC_BUILD_ENGINE_MSQUIC AND TREVRPC_BUILD_TESTS)
-    OR (TREVRPC_BUILD_RPC_MSQUIC AND TREVRPC_BUILD_EXAMPLES))
+if((TREVRPC_BUILD_ENGINE_MSQUIC AND TREVRPC_BUILD_TESTS)
+    OR (TREVRPC_BUILD_RPC_MSQUIC AND (TREVRPC_BUILD_EXAMPLES OR TREVRPC_BUILD_BENCHMARKS)))
     find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
     set(trevrpc_msquic_test_cert "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-cert.pem")
     set(trevrpc_msquic_test_key "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-key.pem")
@@ -930,11 +800,9 @@ if(TREVRPC_BUILD_ENGINE_MSQUIC)
     install(TARGETS trevrpc_engine_msquic_support
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
-    if(NOT TREVRPC_BUILD_MSQUIC)
-        install(TARGETS trevrpc_msquic_api_owner
-            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        )
-    endif()
+    install(TARGETS trevrpc_msquic_api_owner
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
     install(EXPORT trevrpcEngineMsquicTargets
         NAMESPACE trevrpc::
         DESTINATION "${TREVRPC_ENGINE_MSQUIC_INSTALL_CMAKEDIR}"
@@ -1094,41 +962,6 @@ if(TARGET trevrpc_core)
     endif()
 endif()
 
-if(TREVRPC_BUILD_MSQUIC)
-    install(TARGETS trevrpc_protocol_core
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    )
-    install(TARGETS ${trevrpc_install_targets}
-        EXPORT trevrpcTargets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
-    install(EXPORT trevrpcTargets
-        NAMESPACE trevrpc::
-        DESTINATION "${TREVRPC_INSTALL_CMAKEDIR}"
-    )
-    if(TREVRPC_BUILD_ENGINE)
-        set(TREVRPC_ENGINE_FIND_DEPENDENCY "find_dependency(trevrpc_engine CONFIG)")
-    else()
-        set(TREVRPC_ENGINE_FIND_DEPENDENCY "")
-    endif()
-    configure_package_config_file(
-        cmake/trevrpcConfig.cmake.in
-        "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfig.cmake"
-        INSTALL_DESTINATION "${TREVRPC_INSTALL_CMAKEDIR}"
-    )
-    write_basic_package_version_file(
-        "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfigVersion.cmake"
-        VERSION ${PROJECT_VERSION}
-        COMPATIBILITY SameMajorVersion
-    )
-    install(FILES
-        "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfig.cmake"
-        "${CMAKE_CURRENT_BINARY_DIR}/trevrpcConfigVersion.cmake"
-        DESTINATION "${TREVRPC_INSTALL_CMAKEDIR}"
-    )
-endif()
 if(TARGET protoc-gen-trevrpc-c)
     install(TARGETS protoc-gen-trevrpc-c
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -1180,27 +1013,6 @@ if(TREVRPC_BUILD_RPC_MSQUIC)
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
 endif()
-if(TREVRPC_BUILD_MSQUIC)
-    install(FILES
-        include/trevrpc_binding.h
-        include/trevrpc.h
-        include/trevrpc_msquic.h
-        include/trevrpc_raw.h
-        include/trevrpc_webtransport.h
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    )
-    if(TREVRPC_INSTALL_INTERNAL_HEADERS)
-        install(FILES
-            src/trevrpc_owned_bytes_internal.h
-            src/trevrpc_ownership_abi6_internal.h
-            src/trevrpc_values_internal.h
-            src/trevrpc_wire_abi6_internal.h
-            src/trevrpc_wire_internal.h
-            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/trevrpc/internal
-        )
-    endif()
-endif()
-
 if(TREVRPC_BUILD_TESTS)
     enable_testing()
     enable_language(CXX)
@@ -1267,15 +1079,6 @@ if(TREVRPC_BUILD_TESTS)
     trevrpc_c_warnings(trevrpc_http3_frame_test)
     trevrpc_c_sanitizers(trevrpc_http3_frame_test)
     add_test(NAME trevrpc_http3_frame COMMAND trevrpc_http3_frame_test)
-
-    if(TREVRPC_BUILD_RUNTIME)
-        add_executable(trevrpc_http3_frame_policy_test tests/http3_frame_policy_test.c)
-        target_include_directories(trevrpc_http3_frame_policy_test PRIVATE include src)
-        target_link_libraries(trevrpc_http3_frame_policy_test PRIVATE trevrpc_msquic_testing_runtime)
-        trevrpc_c_warnings(trevrpc_http3_frame_policy_test)
-        trevrpc_c_sanitizers(trevrpc_http3_frame_policy_test)
-        add_test(NAME trevrpc_http3_frame_policy COMMAND trevrpc_http3_frame_policy_test)
-    endif()
 
     add_executable(trevrpc_http3_headers_test tests/http3_headers_test.c)
     if(TARGET trevrpc_protocol_core)
@@ -1362,6 +1165,17 @@ if(TREVRPC_BUILD_TESTS)
     trevrpc_c_warnings(trevrpc_webtransport_capsule_test)
     trevrpc_c_sanitizers(trevrpc_webtransport_capsule_test)
     add_test(NAME trevrpc_webtransport_capsule COMMAND trevrpc_webtransport_capsule_test)
+
+    if(TARGET trevrpc_msquic_native_core)
+        add_test(NAME trevrpc_removed_abi6_surface
+            COMMAND "${CMAKE_COMMAND}"
+                -DTREVRPC_NM=${CMAKE_NM}
+                -DTREVRPC_AR=${CMAKE_AR}
+                "-DTREVRPC_ARCHIVES=$<TARGET_FILE:trevrpc_msquic_native_core>"
+                -DTREVRPC_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/abi/check_removed_abi6.cmake"
+        )
+    endif()
 
     if(TREVRPC_BUILD_ENGINE)
         add_executable(trevrpc_engine_api_test tests/engine-abi1/public_api.c)
@@ -1608,15 +1422,6 @@ if(TREVRPC_BUILD_TESTS)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc-abi1/check_symbols.cmake"
         )
 
-        if(TARGET trevrpc_rpc_private_core)
-            add_test(NAME trevrpc_rpc_private_core_symbols
-                COMMAND "${CMAKE_COMMAND}"
-                    -DTREVRPC_NM=${CMAKE_NM}
-                    -DTREVRPC_ARCHIVE=$<TARGET_FILE:trevrpc_rpc_private_core>
-                    -DTREVRPC_FORBIDDEN_MANIFEST=${CMAKE_CURRENT_SOURCE_DIR}/tests/abi6/public-symbols.txt
-                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc-abi1/check_private_core.cmake"
-            )
-        endif()
     endif()
 
     if(TARGET trevrpc_rpc_msquic)
@@ -1743,12 +1548,6 @@ if(TREVRPC_BUILD_TESTS)
         endforeach()
     endif()
 
-    add_test(NAME trevrpc_abi6_source_surface
-        COMMAND "${CMAKE_COMMAND}"
-            -DTREVRPC_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/..
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/abi6/check_surface.cmake"
-    )
-
     if(TARGET trevrpc_core)
         add_executable(trevrpc_frame_test tests/frame_test.c)
         target_include_directories(trevrpc_frame_test PRIVATE src)
@@ -1757,23 +1556,6 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_sanitizers(trevrpc_frame_test)
 
         add_test(NAME trevrpc_frame COMMAND trevrpc_frame_test)
-
-        add_executable(trevrpc_wire_test tests/wire_test.c)
-        target_include_directories(trevrpc_wire_test PRIVATE src)
-        target_compile_definitions(trevrpc_wire_test PRIVATE TREVRPC_WIRE_GOLDEN_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/../testdata/wire-golden-vectors.txt")
-        target_link_libraries(trevrpc_wire_test PRIVATE trevrpc_core)
-        trevrpc_c_warnings(trevrpc_wire_test)
-        trevrpc_c_sanitizers(trevrpc_wire_test)
-
-        add_test(NAME trevrpc_wire COMMAND trevrpc_wire_test)
-
-        add_executable(trevrpc_ownership_test tests/ownership_test.c)
-        target_include_directories(trevrpc_ownership_test PRIVATE src)
-        target_link_libraries(trevrpc_ownership_test PRIVATE trevrpc_core)
-        trevrpc_c_warnings(trevrpc_ownership_test)
-        trevrpc_c_sanitizers(trevrpc_ownership_test)
-
-        add_test(NAME trevrpc_ownership COMMAND trevrpc_ownership_test)
     endif()
 
     if(TARGET trevrpc_greeter_server AND TARGET trevrpc_greeter_client)
@@ -1834,148 +1616,6 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_msquic_loopback_test(trevrpc_bench_peer_webtransport_smoke)
         trevrpc_c_lsan_suppressions(trevrpc_bench_peer_webtransport_smoke)
         trevrpc_c_tsan_suppressions(trevrpc_bench_peer_webtransport_smoke)
-    endif()
-
-    if(TREVRPC_BUILD_RUNTIME)
-        add_executable(trevrpc_api_test tests/abi6/public_api.c)
-        target_link_libraries(trevrpc_api_test PRIVATE trevrpc)
-        trevrpc_c_warnings(trevrpc_api_test)
-        trevrpc_c_sanitizers(trevrpc_api_test)
-
-        add_test(NAME trevrpc_api COMMAND trevrpc_api_test)
-
-        add_executable(trevrpc_api_cpp_test tests/abi6/public_api.cpp)
-        target_link_libraries(trevrpc_api_cpp_test PRIVATE trevrpc)
-        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-            target_compile_options(trevrpc_api_cpp_test PRIVATE -Wall -Wextra -Werror)
-        endif()
-        trevrpc_c_sanitizers(trevrpc_api_cpp_test)
-
-        add_test(NAME trevrpc_api_cpp COMMAND trevrpc_api_cpp_test)
-
-        add_test(NAME trevrpc_abi6_symbols
-            COMMAND "${CMAKE_COMMAND}"
-                -DTREVRPC_NM=${CMAKE_NM}
-                "-DTREVRPC_ARCHIVES=$<TARGET_FILE:trevrpc>;$<TARGET_FILE:trevrpc_core>;$<TARGET_FILE:trevrpc_msquic>;$<TARGET_FILE:trevrpc_msquic_native_core>;$<TARGET_FILE:trevrpc_protocol_core>;$<TARGET_FILE:trevrpc_webtransport>"
-                "-DTREVRPC_PUBLIC_HEADERS=${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc.h;${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_raw.h;${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_binding.h;${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_msquic.h;${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_webtransport.h"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/abi6/check_symbols.cmake"
-        )
-
-
-        add_executable(trevrpc_cancellation_lifecycle_test tests/cancellation_lifecycle_test.c)
-        target_link_libraries(trevrpc_cancellation_lifecycle_test PRIVATE trevrpc)
-        trevrpc_c_warnings(trevrpc_cancellation_lifecycle_test)
-        trevrpc_c_sanitizers(trevrpc_cancellation_lifecycle_test)
-
-        add_test(NAME trevrpc_cancellation_lifecycle COMMAND trevrpc_cancellation_lifecycle_test)
-
-        add_executable(trevrpc_stream_lifecycle_test tests/stream_lifecycle_test.c)
-        target_include_directories(trevrpc_stream_lifecycle_test PRIVATE src)
-        target_link_libraries(trevrpc_stream_lifecycle_test PRIVATE trevrpc_testing)
-        trevrpc_c_warnings(trevrpc_stream_lifecycle_test)
-        trevrpc_c_sanitizers(trevrpc_stream_lifecycle_test)
-
-        add_test(NAME trevrpc_stream_lifecycle COMMAND trevrpc_stream_lifecycle_test)
-
-        add_executable(trevrpc_versioned_api_test tests/versioned_api_test.c)
-        target_include_directories(trevrpc_versioned_api_test PRIVATE src)
-        target_link_libraries(trevrpc_versioned_api_test PRIVATE trevrpc)
-        trevrpc_c_warnings(trevrpc_versioned_api_test)
-        trevrpc_c_sanitizers(trevrpc_versioned_api_test)
-
-        add_test(NAME trevrpc_versioned_api COMMAND trevrpc_versioned_api_test)
-        trevrpc_c_tsan_suppressions(trevrpc_versioned_api)
-
-        add_executable(trevrpc_server_lifecycle_test tests/server_lifecycle_test.c)
-        target_include_directories(trevrpc_server_lifecycle_test PRIVATE src)
-        target_link_libraries(trevrpc_server_lifecycle_test PRIVATE trevrpc_testing)
-        trevrpc_c_warnings(trevrpc_server_lifecycle_test)
-        trevrpc_c_sanitizers(trevrpc_server_lifecycle_test)
-
-        add_test(NAME trevrpc_server_lifecycle COMMAND trevrpc_server_lifecycle_test)
-        set_tests_properties(trevrpc_server_lifecycle PROPERTIES TIMEOUT 30)
-
-        add_executable(trevrpc_runtime_test tests/runtime_test.c)
-        target_include_directories(trevrpc_runtime_test PRIVATE src)
-        target_link_libraries(trevrpc_runtime_test PRIVATE trevrpc_testing msquic::msquic)
-        trevrpc_c_warnings(trevrpc_runtime_test)
-        trevrpc_c_sanitizers(trevrpc_runtime_test)
-
-        add_test(NAME trevrpc_runtime COMMAND trevrpc_runtime_test)
-
-        add_executable(trevrpc_msquic_transport_test tests/msquic_transport_test.c)
-        add_dependencies(trevrpc_msquic_transport_test trevrpc_msquic_test_certificates)
-        target_include_directories(trevrpc_msquic_transport_test PRIVATE src)
-        target_compile_definitions(trevrpc_msquic_transport_test PRIVATE
-            TREVRPC_MSQUIC_TESTING
-            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
-            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
-        )
-        target_link_libraries(trevrpc_msquic_transport_test PRIVATE trevrpc_msquic_testing_runtime)
-        trevrpc_c_warnings(trevrpc_msquic_transport_test)
-        trevrpc_c_sanitizers(trevrpc_msquic_transport_test)
-
-        add_test(NAME trevrpc_msquic_transport COMMAND trevrpc_msquic_transport_test)
-        trevrpc_c_msquic_loopback_test(trevrpc_msquic_transport)
-        trevrpc_c_lsan_suppressions(trevrpc_msquic_transport)
-        trevrpc_c_tsan_suppressions(trevrpc_msquic_transport)
-
-        add_executable(trevrpc_channel_test tests/channel_test.c)
-        add_dependencies(trevrpc_channel_test trevrpc_msquic_test_certificates)
-        target_compile_definitions(trevrpc_channel_test PRIVATE
-            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
-            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
-        )
-        target_link_libraries(trevrpc_channel_test PRIVATE trevrpc)
-        trevrpc_c_warnings(trevrpc_channel_test)
-        trevrpc_c_sanitizers(trevrpc_channel_test)
-
-        add_test(NAME trevrpc_channel COMMAND trevrpc_channel_test)
-        set_tests_properties(trevrpc_channel PROPERTIES TIMEOUT 30)
-        trevrpc_c_msquic_loopback_test(trevrpc_channel)
-        trevrpc_c_lsan_suppressions(trevrpc_channel)
-        trevrpc_c_tsan_suppressions(trevrpc_channel)
-
-        add_executable(trevrpc_buffering_config_test tests/buffering_config_test.c)
-        target_include_directories(trevrpc_buffering_config_test PRIVATE src)
-        target_link_libraries(trevrpc_buffering_config_test PRIVATE trevrpc_testing)
-        trevrpc_c_warnings(trevrpc_buffering_config_test)
-        trevrpc_c_sanitizers(trevrpc_buffering_config_test)
-
-        add_test(NAME trevrpc_buffering_config COMMAND trevrpc_buffering_config_test)
-
-        add_executable(trevrpc_buffering_memory_test tests/buffering_memory_test.c)
-        add_dependencies(trevrpc_buffering_memory_test trevrpc_msquic_test_certificates)
-        target_compile_definitions(trevrpc_buffering_memory_test PRIVATE
-            TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
-            TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
-        )
-        target_link_libraries(trevrpc_buffering_memory_test PRIVATE trevrpc)
-        trevrpc_c_warnings(trevrpc_buffering_memory_test)
-        trevrpc_c_sanitizers(trevrpc_buffering_memory_test)
-
-        set(trevrpc_buffering_fast_cases
-            "safe-slow-reader|slow-reader|4|4096|16384|262144|65536|1"
-            "safe-stalled-handler|stalled-handler|8|32768|4096|524288|0|10"
-            "safe-reset|reset|8|32768|4096|262144|0|5"
-            "safe-close|close|8|32768|8192|262144|65536|5"
-            "safe-overload|overload|12|32768|4096|262144|0|10"
-            "safe-body-limit|body-limit|4|32768|4096|262144|0|5"
-        )
-        foreach(trevrpc_buffering_case IN LISTS trevrpc_buffering_fast_cases)
-            string(REPLACE "|" ";" trevrpc_buffering_args "${trevrpc_buffering_case}")
-            list(POP_FRONT trevrpc_buffering_args trevrpc_buffering_name)
-            add_test(NAME trevrpc_buffering_memory_${trevrpc_buffering_name}
-                COMMAND trevrpc_buffering_memory_test ${trevrpc_buffering_args}
-            )
-            set_tests_properties(trevrpc_buffering_memory_${trevrpc_buffering_name}
-                PROPERTIES LABELS "buffering" TIMEOUT 30
-            )
-            trevrpc_c_msquic_loopback_test(trevrpc_buffering_memory_${trevrpc_buffering_name})
-            trevrpc_c_lsan_suppressions(trevrpc_buffering_memory_${trevrpc_buffering_name})
-            trevrpc_c_tsan_suppressions(trevrpc_buffering_memory_${trevrpc_buffering_name})
-        endforeach()
-
     endif()
 
     if(TARGET trevrpc_rpc_msquic AND trevrpc_needs_generated_test_bindings)

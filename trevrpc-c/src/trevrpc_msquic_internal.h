@@ -11,81 +11,22 @@
 #include <stdbool.h>
 
 /* Private declarations for the callback-native MsQuic implementation. */
-int trevrpc_msquic_listen(
-    const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_listener** listener);
-int trevrpc_msquic_listen_alpns(const char* host,
-    uint16_t port,
-    const trevrpc_msquic_config* config,
-    const trevrpc_msquic_alpn* alpns,
-    size_t alpns_len,
-    trevrpc_msquic_listener** listener);
-int trevrpc_msquic_listener_port(trevrpc_msquic_listener* listener, uint16_t* port);
-int trevrpc_msquic_listener_accept(trevrpc_msquic_listener* listener, trevrpc_msquic_conn** conn);
-void trevrpc_msquic_listener_shutdown(trevrpc_msquic_listener* listener);
-void trevrpc_msquic_listener_close(trevrpc_msquic_listener* listener);
-int trevrpc_msquic_dial(
-    const char* host, uint16_t port, const trevrpc_msquic_config* config, trevrpc_msquic_conn** conn);
-int trevrpc_msquic_dial_cancellable(const char* host,
-    uint16_t port,
-    const trevrpc_msquic_config* config,
-    trevrpc_msquic_cancelled_fn cancelled,
-    void* cancellation_context,
-    trevrpc_msquic_conn** conn);
-int trevrpc_msquic_conn_negotiated_alpn(trevrpc_msquic_conn* conn, const uint8_t** alpn, size_t* alpn_len);
-int trevrpc_msquic_conn_peer_close_error(trevrpc_msquic_conn* conn, uint64_t* error_code);
-int trevrpc_msquic_conn_accept_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
-int trevrpc_msquic_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
-int trevrpc_msquic_conn_open_uni_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
-void trevrpc_msquic_conn_shutdown(trevrpc_msquic_conn* conn);
-void trevrpc_msquic_conn_shutdown_error(trevrpc_msquic_conn* conn, uint64_t error_code);
-void trevrpc_msquic_conn_close(trevrpc_msquic_conn* conn);
-int trevrpc_msquic_stream_id(trevrpc_msquic_stream* stream, uint64_t* stream_id);
-intptr_t trevrpc_msquic_stream_read(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
-intptr_t trevrpc_msquic_stream_read_timeout(
-    trevrpc_msquic_stream* stream, uint8_t* data, size_t len, uint64_t timeout_nanos);
-intptr_t trevrpc_msquic_stream_read_ready(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);
-intptr_t trevrpc_msquic_stream_read_frame(trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
-intptr_t trevrpc_msquic_stream_read_frame_timeout(
-    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len, uint64_t timeout_nanos);
-intptr_t trevrpc_msquic_stream_read_frame_ready(
-    trevrpc_msquic_stream* stream, uint8_t** body, size_t* len, size_t max_len);
-intptr_t trevrpc_msquic_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
-intptr_t trevrpc_msquic_stream_write_fin(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
-intptr_t trevrpc_msquic_stream_write_frame_parts(
-    trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len);
-intptr_t trevrpc_msquic_stream_write_frame_parts_fin(
-    trevrpc_msquic_stream* stream, const trevrpc_msquic_frame_part* parts, size_t parts_len, size_t max_len);
-intptr_t trevrpc_msquic_stream_write_frame_parts_with_completion(trevrpc_msquic_stream* stream,
-    const trevrpc_msquic_frame_part* parts,
-    size_t parts_len,
-    size_t max_len,
-    trevrpc_msquic_send_completion** completion);
-intptr_t trevrpc_msquic_stream_write_frame_parts_fin_with_completion(trevrpc_msquic_stream* stream,
-    const trevrpc_msquic_frame_part* parts,
-    size_t parts_len,
-    size_t max_len,
-    trevrpc_msquic_send_completion** completion);
-intptr_t trevrpc_msquic_stream_write_message_frame(
-    trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);
-intptr_t trevrpc_msquic_stream_write_message_frame_wait_capacity(
-    trevrpc_msquic_stream* stream, const uint8_t* body, size_t body_len, size_t max_len);
-intptr_t trevrpc_msquic_stream_write_message_frames(
-    trevrpc_msquic_stream* stream, const uint8_t* bodies, const size_t* body_lens, size_t count, size_t max_len);
-intptr_t trevrpc_msquic_stream_write_message_frames_borrowed(trevrpc_msquic_stream* stream,
-    const uint8_t* const* bodies,
-    const size_t* body_lens,
-    size_t count,
-    size_t max_len,
-    trevrpc_msquic_send_completion** completion);
-int trevrpc_msquic_send_completion_wait(trevrpc_msquic_send_completion* completion);
-void trevrpc_msquic_send_completion_free(trevrpc_msquic_send_completion* completion);
-int trevrpc_msquic_stream_wait_pending_sends(trevrpc_msquic_stream* stream);
-int trevrpc_msquic_stream_shutdown_send(trevrpc_msquic_stream* stream);
-int trevrpc_msquic_stream_abort(trevrpc_msquic_stream* stream);
-int trevrpc_msquic_stream_abort_receive(trevrpc_msquic_stream* stream);
-void trevrpc_msquic_stream_close(trevrpc_msquic_stream* stream);
-void trevrpc_msquic_free(void* ptr);
-const char* trevrpc_msquic_error(int code);
+int trevrpc_msquic_native_listener_port(trevrpc_msquic_listener* listener, uint16_t* port);
+void trevrpc_msquic_native_listener_shutdown(trevrpc_msquic_listener* listener);
+void trevrpc_msquic_native_listener_close(trevrpc_msquic_listener* listener);
+int trevrpc_msquic_native_conn_open_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
+int trevrpc_msquic_native_conn_open_uni_stream(trevrpc_msquic_conn* conn, trevrpc_msquic_stream** stream);
+void trevrpc_msquic_native_conn_shutdown_error(trevrpc_msquic_conn* conn, uint64_t error_code);
+void trevrpc_msquic_native_conn_close(trevrpc_msquic_conn* conn);
+int trevrpc_msquic_native_stream_id(trevrpc_msquic_stream* stream, uint64_t* stream_id);
+intptr_t trevrpc_msquic_native_stream_write(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
+intptr_t trevrpc_msquic_native_stream_write_fin(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len);
+int trevrpc_msquic_native_send_completion_wait(trevrpc_msquic_send_completion* completion);
+void trevrpc_msquic_native_send_completion_free(trevrpc_msquic_send_completion* completion);
+int trevrpc_msquic_native_stream_shutdown_send(trevrpc_msquic_stream* stream);
+int trevrpc_msquic_native_stream_abort(trevrpc_msquic_stream* stream);
+int trevrpc_msquic_native_stream_abort_receive(trevrpc_msquic_stream* stream);
+void trevrpc_msquic_native_stream_close(trevrpc_msquic_stream* stream);
 
 #define TREV_MSQUIC_CONN_EVENT_CONNECTED 0u
 #define TREV_MSQUIC_CONN_EVENT_SHUTDOWN_COMPLETE 1u
@@ -249,7 +190,7 @@ intptr_t trevrpc_msquic_stream_write_raw_with_completion(trevrpc_msquic_stream* 
     size_t len,
     bool fin,
     trevrpc_msquic_send_completion** completion);
-int trevrpc_msquic_send_completion_status(trevrpc_msquic_send_completion* completion);
+int trevrpc_msquic_native_send_completion_status(trevrpc_msquic_send_completion* completion);
 int trevrpc_msquic_stream_abort_with_error(trevrpc_msquic_stream* stream, uint64_t error_code);
 int trevrpc_msquic_stream_abort_receive_with_error(trevrpc_msquic_stream* stream, uint64_t error_code);
 int trevrpc_msquic_stream_abort_send_with_error(trevrpc_msquic_stream* stream, uint64_t error_code);

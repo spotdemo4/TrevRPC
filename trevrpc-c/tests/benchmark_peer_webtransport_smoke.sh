@@ -1,6 +1,7 @@
 #!/bin/sh
 
 set -eu
+# shellcheck disable=SC3045 # Supported by the target shells; suppress crash artifacts.
 ulimit -c 0
 
 peer=$1

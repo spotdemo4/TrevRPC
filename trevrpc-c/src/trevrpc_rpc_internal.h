@@ -5,6 +5,8 @@
 #include "trevrpc_rpc_transport_internal.h"
 #include "trevrpc_wire_internal.h"
 
+#include <stdbool.h>
+
 int trevrpc_rpc_validate_runtime_config(const trevrpc_rpc_runtime_config_v1* config);
 
 int trevrpc_rpc_runtime_adopt_transport_v1(

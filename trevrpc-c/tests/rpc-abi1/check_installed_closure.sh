@@ -14,8 +14,7 @@ expected=$(mktemp)
 actual=$(mktemp)
 definitions=$(mktemp)
 undefined=$(mktemp)
-forbidden=$(mktemp)
-trap 'rm -f "$expected" "$actual" "$definitions" "$undefined" "$forbidden"' EXIT
+trap 'rm -f "$expected" "$actual" "$definitions" "$undefined"' EXIT
 
 case "$mode" in
 rpc)
@@ -72,15 +71,6 @@ if [ "$check_msquic" = true ]; then
         -DTREVRPC_ARCHIVES="$libdir/libtrevrpc_rpc_msquic.a" \
         -DTREVRPC_PUBLIC_HEADERS="$prefix/include/trevrpc_rpc_msquic.h" \
         -P "$source_root/tests/rpc-abi1/check_msquic_symbols.cmake"
-else
-    find "$libdir/libtrevrpc_rpc.a" "$libdir/trevrpc/rpc-abi1/libtrevrpc_rpc_private_core.a" -print0 |
-        xargs -0 nm -g --defined-only -P |
-        awk '$1 ~ /^trevrpc_[A-Za-z0-9_]+$/ { print $1 }' |
-        sort -u >"$forbidden"
-    if grep -Fxf "$source_root/tests/abi6/public-symbols.txt" "$forbidden"; then
-        echo "canonical RPC archive closure defines forbidden ABI6 public symbols" >&2
-        exit 1
-    fi
 fi
 
 find "$libdir" -type f -name '*.a' -print0 |
@@ -98,3 +88,10 @@ while IFS= read -r symbol; do
         exit 1
     fi
 done <"$undefined"
+
+cmake \
+    -DTREVRPC_NM="$(command -v nm)" \
+    -DTREVRPC_AR="$(command -v ar)" \
+    -DTREVRPC_INSTALL_PREFIXES="$prefix" \
+    -DTREVRPC_SOURCE_DIR="$source_root" \
+    -P "$source_root/tests/abi/check_removed_abi6.cmake"

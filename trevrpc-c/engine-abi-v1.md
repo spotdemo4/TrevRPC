@@ -16,7 +16,7 @@ Engine ABI 1 is provider-neutral. It defines:
 - close, drain, and final-release coordination;
 - provider-neutral and provider-supplied diagnostics.
 
-`TREVRPC_ENGINE_ABI_VERSION` is `1`. Compile-time consumers test that macro, runtime consumers call `trevrpc_engine_abi_version()`, and link-time consumers reference `trevrpc_engine_abi_1_anchor()`. Engine ABI 1 and TrevRPC C ABI 6 are independently versioned; neither version implies the other.
+`TREVRPC_ENGINE_ABI_VERSION` is `1`. Compile-time consumers test that macro, runtime consumers call `trevrpc_engine_abi_version()`, and link-time consumers reference `trevrpc_engine_abi_1_anchor()`.
 
 The engine currently requires a POSIX platform with file descriptors and pthreads. It invokes no application or binding callback and creates no dispatcher thread. A provider may receive native transport callbacks, but those callbacks enter the engine through the private provider contract and publish public Engine ABI events.
 
@@ -194,7 +194,7 @@ find_package(trevrpc_engine CONFIG REQUIRED)
 target_link_libraries(application PRIVATE trevrpc::trevrpc_engine)
 ```
 
-The package exports `TREVRPC_ENGINE_ABI_VERSION=1` and finds `Threads`. It does not require MsQuic, WebTransport, protobuf, or TrevRPC C ABI 6.
+The package exports `TREVRPC_ENGINE_ABI_VERSION=1` and finds `Threads`. It does not require MsQuic, WebTransport, or protobuf.
 
 pkg-config consumers use `trevrpc_engine`; the module exports `trevrpc_engine_abi_version=1`, the engine archive and include directory, and private thread flags.
 

@@ -31,9 +31,6 @@ cmake -S trevrpc-c -B build \
   -DTREVRPC_BUILD_ENGINE_MSQUIC=ON \
   -DTREVRPC_BUILD_RPC=ON \
   -DTREVRPC_BUILD_RPC_MSQUIC=ON \
-  -DTREVRPC_BUILD_MSQUIC=OFF \
-  -DTREVRPC_BUILD_WEBTRANSPORT=OFF \
-  -DTREVRPC_BUILD_RUNTIME=OFF \
   -DTREVRPC_BUILD_EXAMPLES=ON
 cmake --build build --target trevrpc_greeter_server trevrpc_greeter_client
 ```

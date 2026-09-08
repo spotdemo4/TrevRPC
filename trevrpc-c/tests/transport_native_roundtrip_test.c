@@ -87,30 +87,28 @@ static void observe_event(observations* observed, const trevrpc_transport_event_
         observed->failed_client_connection = info->subject;
     }
     if (info->kind == TREVRPC_TRANSPORT_EVENT_CONNECTION_READY) {
-        assert(info->operation_id != 1);
         assert(info->subject_kind == TREVRPC_TRANSPORT_OBJECT_CONNECTION);
-        assert(!same_handle(info->subject, observed->failed_client_connection));
-        if (same_handle(info->subject, observed->client_connection)) {
-            /* The injected credential-cleanup failure happens after dial has
-             * admitted operation 1; use a fresh ID while its terminal event is
-             * still pending. */
+        if (info->operation_id == 1) {
+            /* Credential cleanup can fail after the first dial is admitted.
+             * Its client and peer may therefore become ready before the
+             * wrapper-driven close reaches the provider. */
+            observed->failed_client_connection = info->subject;
+        } else if (same_handle(info->subject, observed->client_connection)) {
             assert(info->operation_id == 2);
             observed->seen |= SEEN_CLIENT_CONNECTION;
         } else {
+            /* Select the successful dial's peer causally from its accepted
+             * stream below, not from an earlier admitted dial's peer READY. */
             assert(info->operation_id == 0);
-            if (observed->server_connection.owner == 0)
-                observed->server_connection = info->subject;
-            else
-                assert(same_handle(info->subject, observed->server_connection));
-            observed->seen |= SEEN_SERVER_CONNECTION;
         }
     } else if (info->kind == TREVRPC_TRANSPORT_EVENT_STREAM_READY) {
         if (same_handle(info->subject, observed->client_stream)) {
             assert(info->operation_id == 2);
             observed->seen |= SEEN_CLIENT_STREAM;
         } else {
+            observed->server_connection = info->parent;
             observed->server_stream = info->subject;
-            observed->seen |= SEEN_SERVER_STREAM;
+            observed->seen |= SEEN_SERVER_CONNECTION | SEEN_SERVER_STREAM;
         }
     } else if (info->kind == TREVRPC_TRANSPORT_EVENT_SEND_COMPLETE && info->operation_id == 3) {
         assert(info->status == 0);
@@ -397,7 +395,7 @@ int main(void) {
     client_cert = NULL;
     client_key = NULL;
     client_ca = NULL;
-    pump_until(transport, wakes, wake_count, &observed, SEEN_CLIENT_CONNECTION | SEEN_SERVER_CONNECTION);
+    pump_until(transport, wakes, wake_count, &observed, SEEN_CLIENT_CONNECTION);
 
     assert(trevrpc_transport_connection_open_bidi_stream_v1(
                transport, observed.client_connection, 2, &observed.client_stream) == 0);
@@ -405,7 +403,11 @@ int main(void) {
 
     static const uint8_t request[] = "request";
     assert(trevrpc_transport_stream_send_v1(transport, observed.client_stream, 3, request, sizeof(request) - 1) == 0);
-    pump_until(transport, wakes, wake_count, &observed, SEEN_SERVER_STREAM | SEEN_SEND_COMPLETE | SEEN_SERVER_READABLE);
+    pump_until(transport,
+        wakes,
+        wake_count,
+        &observed,
+        SEEN_SERVER_CONNECTION | SEEN_SERVER_STREAM | SEEN_SEND_COMPLETE | SEEN_SERVER_READABLE);
 
     trevrpc_transport_receive_v1* receive = NULL;
     trevrpc_transport_receive_info_v1 receive_info;

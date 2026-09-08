@@ -1107,67 +1107,6 @@ size_t trevrpc_h3_ingress_test_registry_size(void) {
 }
 #endif
 
-#ifndef TREVRPC_H3_INGRESS_TESTING
-static int trevrpc_h3_ingress_msquic_accept(void* conn, void** out_stream) {
-    return trevrpc_msquic_conn_accept_stream(conn, (trevrpc_msquic_stream**)out_stream);
-}
-
-static void trevrpc_h3_ingress_msquic_shutdown(void* conn) {
-    trevrpc_msquic_conn_shutdown(conn);
-}
-
-static void trevrpc_h3_ingress_msquic_shutdown_error(void* conn, uint64_t application_error) {
-    trevrpc_msquic_conn_shutdown_error(conn, application_error);
-}
-
-static int trevrpc_h3_ingress_msquic_stream_id(void* stream, uint64_t* out_stream_id) {
-    return trevrpc_msquic_stream_id(stream, out_stream_id);
-}
-
-static int trevrpc_h3_ingress_msquic_set_observer(
-    void* stream, trevrpc_h3_ingress_observer observer, void* observer_context) {
-    return trevrpc_msquic_stream_set_observer(stream, observer, observer_context);
-}
-
-static void trevrpc_h3_ingress_msquic_clear_observer(void* stream) {
-    trevrpc_msquic_stream_clear_observer(stream);
-}
-
-static void trevrpc_h3_ingress_msquic_drain_observer(void* stream) {
-    trevrpc_msquic_stream_drain_observer(stream);
-}
-
-static intptr_t trevrpc_h3_ingress_msquic_read_ready(void* stream, uint8_t* data, size_t len) {
-    return trevrpc_msquic_stream_read_protocol_ready(stream, data, len);
-}
-
-static int trevrpc_h3_ingress_msquic_stream_abort_with_error(void* stream, uint64_t application_error) {
-    return trevrpc_msquic_stream_abort_with_error(stream, application_error);
-}
-
-static void trevrpc_h3_ingress_msquic_stream_close(void* stream) {
-    trevrpc_msquic_stream_close(stream);
-}
-
-static const trevrpc_h3_ingress_transport_ops trevrpc_h3_ingress_msquic_ops = {
-    .conn_accept_stream = trevrpc_h3_ingress_msquic_accept,
-    .conn_shutdown = trevrpc_h3_ingress_msquic_shutdown,
-    .conn_shutdown_error = trevrpc_h3_ingress_msquic_shutdown_error,
-    .stream_id = trevrpc_h3_ingress_msquic_stream_id,
-    .stream_set_observer = trevrpc_h3_ingress_msquic_set_observer,
-    .stream_clear_observer = trevrpc_h3_ingress_msquic_clear_observer,
-    .stream_drain_observer = trevrpc_h3_ingress_msquic_drain_observer,
-    .stream_read_protocol_ready = trevrpc_h3_ingress_msquic_read_ready,
-    .stream_abort_with_error = trevrpc_h3_ingress_msquic_stream_abort_with_error,
-    .stream_close = trevrpc_h3_ingress_msquic_stream_close,
-};
-
-int trevrpc_h3_ingress_create(
-    trevrpc_msquic_conn* conn, const trevrpc_h3_ingress_config* config, trevrpc_h3_ingress** out_runtime) {
-    return trevrpc_h3_ingress_create_with_ops(conn, &trevrpc_h3_ingress_msquic_ops, config, out_runtime);
-}
-#endif
-
 int trevrpc_h3_ingress_start(trevrpc_h3_ingress* handle) {
     trevrpc_h3_ingress_runtime* runtime = NULL;
     int result = trevrpc_h3_ingress_api_enter(handle, &runtime);

@@ -560,8 +560,8 @@ static void h3_stream_free(h3_stream_state* stream) {
         free(receive);
     }
     if (stream->pending_completion != NULL) {
-        (void)trevrpc_msquic_send_completion_wait(stream->pending_completion);
-        trevrpc_msquic_send_completion_free(stream->pending_completion);
+        (void)trevrpc_msquic_native_send_completion_wait(stream->pending_completion);
+        trevrpc_msquic_native_send_completion_free(stream->pending_completion);
     }
     free(stream->parse);
     free(stream->rpc);
@@ -800,8 +800,8 @@ static trevrpc_msquic_send_completion* h3_detach_pending_send_locked(h3_entry* e
 static void h3_release_detached_pending_send(trevrpc_msquic_send_completion* completion) {
     if (completion == NULL)
         return;
-    (void)trevrpc_msquic_send_completion_wait(completion);
-    trevrpc_msquic_send_completion_free(completion);
+    (void)trevrpc_msquic_native_send_completion_wait(completion);
+    trevrpc_msquic_native_send_completion_free(completion);
 }
 
 static void h3_close_entry_object_mode(h3_entry* entry, bool force_stream_close) {
@@ -1531,7 +1531,7 @@ static int h3_admit_peer_stream_locked(h3_source* source,
 }
 
 static int h3_write_all(trevrpc_msquic_stream* stream, const uint8_t* data, size_t len) {
-    intptr_t result = trevrpc_msquic_stream_write(stream, data, len);
+    intptr_t result = trevrpc_msquic_native_stream_write(stream, data, len);
     if (result < 0)
         return (int)result;
     return (size_t)result == len ? 0 : -EPIPE;
@@ -1624,12 +1624,12 @@ static int h3_send_control(h3_entry* entry) {
     values[2] = qpack_decoder;
     lengths[2] = sizeof(qpack_decoder);
     for (i = 0; i < 3; ++i) {
-        result = trevrpc_msquic_conn_open_uni_stream(conn, &stream);
+        result = trevrpc_msquic_native_conn_open_uni_stream(conn, &stream);
         if (result != 0)
             break;
         result = h3_write_all(stream, values[i], lengths[i]);
         if (result != 0) {
-            trevrpc_msquic_stream_close(stream);
+            trevrpc_msquic_native_stream_close(stream);
             stream = NULL;
             break;
         }
@@ -1640,7 +1640,7 @@ static int h3_send_control(h3_entry* entry) {
         return 0;
     while (i != 0) {
         --i;
-        trevrpc_msquic_stream_close(entry->control_streams[i]);
+        trevrpc_msquic_native_stream_close(entry->control_streams[i]);
         entry->control_streams[i] = NULL;
     }
     return result;
@@ -1727,7 +1727,7 @@ static int h3_send_rejection_response(trevrpc_msquic_stream* stream, uint16_t st
         return -EINVAL;
     memcpy(frame, prefix, prefix_len);
     memcpy(frame + prefix_len, block, block_len);
-    written = trevrpc_msquic_stream_write_fin(stream, frame, prefix_len + block_len);
+    written = trevrpc_msquic_native_stream_write_fin(stream, frame, prefix_len + block_len);
     if (written < 0)
         return (int)written;
     return (size_t)written == prefix_len + block_len ? 0 : -EPIPE;
@@ -2912,7 +2912,7 @@ static int h3_accept_connect(h3_source* source, h3_entry* stream) {
     profile = connection->negotiation.profile;
     pthread_mutex_unlock(&source->mutex);
 
-    result = trevrpc_msquic_stream_id(stream_object, &stream_id);
+    result = trevrpc_msquic_native_stream_id(stream_object, &stream_id);
     if (result == 0 && !trevrpc_wt_profile_valid_session_id(stream_id))
         result = -EPROTO;
     if (result == 0)
@@ -3127,14 +3127,14 @@ static int h3_open_connect(h3_source* source, h3_entry* connection) {
     parent = h3_handle(connection);
     side_flags = connection->side_flags;
     pthread_mutex_unlock(&source->mutex);
-    result = trevrpc_msquic_conn_open_stream(conn, &stream);
+    result = trevrpc_msquic_native_conn_open_stream(conn, &stream);
     if (result != 0)
         return result;
     pthread_mutex_lock(&source->mutex);
     connection = h3_find_locked(source, parent);
     if (connection == NULL || connection->object != conn || connection->wt_session_ready) {
         pthread_mutex_unlock(&source->mutex);
-        trevrpc_msquic_stream_close(stream);
+        trevrpc_msquic_native_stream_close(stream);
         return -ESTALE;
     }
     child = h3_alloc_entry_locked(source, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, side_flags, stream, parent);
@@ -3148,7 +3148,7 @@ static int h3_open_connect(h3_source* source, h3_entry* connection) {
     }
     pthread_mutex_unlock(&source->mutex);
     if (child == NULL) {
-        trevrpc_msquic_stream_close(stream);
+        trevrpc_msquic_native_stream_close(stream);
         return -EAGAIN;
     }
     if (result != 0) {
@@ -3219,7 +3219,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
         }
         pthread_mutex_unlock(&source->mutex);
         if (result != 0)
-            trevrpc_msquic_conn_shutdown_error(entry->object, H3_APP_INTERNAL_ERROR);
+            trevrpc_msquic_native_conn_shutdown_error(entry->object, H3_APP_INTERNAL_ERROR);
     }
     if (pending & H3_PENDING_OPEN_CONNECT) {
         int result = h3_open_connect(source, entry);
@@ -3228,7 +3228,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
             if (entry->live)
                 entry->pending |= H3_PENDING_TERMINAL;
             pthread_mutex_unlock(&source->mutex);
-            trevrpc_msquic_conn_shutdown_error(entry->object, H3_APP_INTERNAL_ERROR);
+            trevrpc_msquic_native_conn_shutdown_error(entry->object, H3_APP_INTERNAL_ERROR);
         }
     }
     if ((pending & H3_PENDING_ACCEPT_CONNECT) != 0 && entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_STREAM)
@@ -3326,7 +3326,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                     h3_handle(entry));
                 if (child == NULL) {
                     pthread_mutex_unlock(&source->mutex);
-                    trevrpc_msquic_conn_shutdown_error(conn, H3_APP_INTERNAL_ERROR);
+                    trevrpc_msquic_native_conn_shutdown_error(conn, H3_APP_INTERNAL_ERROR);
                     h3_reschedule_accept(source, entry);
                     break;
                 }
@@ -3337,7 +3337,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                 if (result == 0)
                     result = h3_install_conn(child);
                 if (result != 0) {
-                    trevrpc_msquic_conn_shutdown_error(conn, H3_APP_INTERNAL_ERROR);
+                    trevrpc_msquic_native_conn_shutdown_error(conn, H3_APP_INTERNAL_ERROR);
                     pthread_mutex_lock(&source->mutex);
                     h3_detach_entry_locked(child);
                     pthread_mutex_unlock(&source->mutex);
@@ -3351,9 +3351,9 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                 result = trevrpc_msquic_conn_accept_stream_ready(entry->object, &stream);
                 if (result != 0)
                     break;
-                result = trevrpc_msquic_stream_id(stream, &stream_id);
+                result = trevrpc_msquic_native_stream_id(stream, &stream_id);
                 if (result != 0) {
-                    trevrpc_msquic_stream_close(stream);
+                    trevrpc_msquic_native_stream_close(stream);
                     h3_reschedule_accept(source, entry);
                     break;
                 }
@@ -3371,7 +3371,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                     if (child != NULL)
                         h3_close_entry_object(child);
                     else
-                        trevrpc_msquic_stream_close(stream);
+                        trevrpc_msquic_native_stream_close(stream);
                     if (quota_rejected)
                         continue;
                     h3_reschedule_accept(source, entry);
@@ -3492,7 +3492,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
         operation_id = entry->stream.pending_operation_id;
         pthread_mutex_unlock(&source->mutex);
         if (completion != NULL) {
-            result = trevrpc_msquic_send_completion_status(completion);
+            result = trevrpc_msquic_native_send_completion_status(completion);
             if (result != -EAGAIN) {
                 pthread_mutex_lock(&source->mutex);
                 if (entry->stream.pending_completion == completion) {
@@ -3524,7 +3524,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
                 bool release_completion = entry->stream.pending_completion != completion;
                 pthread_mutex_unlock(&source->mutex);
                 if (release_completion)
-                    trevrpc_msquic_send_completion_free(completion);
+                    trevrpc_msquic_native_send_completion_free(completion);
             }
         }
     }
@@ -3558,7 +3558,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
         h3_detach_entry_locked(entry);
         pthread_mutex_unlock(&source->mutex);
         if (conn != NULL)
-            trevrpc_msquic_conn_shutdown_error(conn, H3_APP_INTERNAL_ERROR);
+            trevrpc_msquic_native_conn_shutdown_error(conn, H3_APP_INTERNAL_ERROR);
         h3_close_entry_object(entry);
         return;
     }
@@ -3584,7 +3584,7 @@ static void h3_process_entry(h3_source* source, h3_entry* entry) {
         }
         pthread_mutex_unlock(&source->mutex);
         if (conn != NULL)
-            trevrpc_msquic_conn_shutdown_error(conn, app_error);
+            trevrpc_msquic_native_conn_shutdown_error(conn, app_error);
         h3_close_entry_object(entry);
         return;
     }
@@ -4186,7 +4186,7 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
     }
     trevrpc_msquic_listener_set_finalizer_scope(listener, &source->finalizer_scope);
     if (cleanup_result != 0) {
-        trevrpc_msquic_listener_close(listener);
+        trevrpc_msquic_native_listener_close(listener);
         pthread_mutex_lock(&source->mutex);
         h3_detach_entry_locked(entry);
         pthread_mutex_unlock(&source->mutex);
@@ -4251,7 +4251,7 @@ static int h3_endpoint_get_port(
         return -ESTALE;
     }
     pthread_mutex_unlock(&source->mutex);
-    result = trevrpc_msquic_listener_port(object, port);
+    result = trevrpc_msquic_native_listener_port(object, port);
     pthread_mutex_lock(&source->mutex);
     h3_unpin_object_locked(source, entry);
     pthread_mutex_unlock(&source->mutex);
@@ -4322,7 +4322,7 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
     trevrpc_msquic_conn_set_finalizer_scope(conn, &source->finalizer_scope);
     if (cleanup_result != 0) {
         if (conn != NULL)
-            trevrpc_msquic_conn_close(conn);
+            trevrpc_msquic_native_conn_close(conn);
         h3_endpoint_free(&endpoint);
         return cleanup_result;
     }
@@ -4334,7 +4334,7 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
         (trevrpc_rpc_transport_handle){0});
     if (entry == NULL) {
         pthread_mutex_unlock(&source->mutex);
-        trevrpc_msquic_conn_close(conn);
+        trevrpc_msquic_native_conn_close(conn);
         h3_endpoint_free(&endpoint);
         return -EAGAIN;
     }
@@ -4367,7 +4367,7 @@ static int h3_dial_cancel(trevrpc_rpc_transport* transport, trevrpc_rpc_transpor
         return -ESTALE;
     }
     pthread_mutex_unlock(&source->mutex);
-    trevrpc_msquic_conn_shutdown_error(object, H3_APP_REQUEST_CANCELLED);
+    trevrpc_msquic_native_conn_shutdown_error(object, H3_APP_REQUEST_CANCELLED);
     pthread_mutex_lock(&source->mutex);
     h3_unpin_object_locked(source, entry);
     pthread_mutex_unlock(&source->mutex);
@@ -4402,7 +4402,7 @@ static int h3_stream_open(trevrpc_rpc_transport* transport,
     side_flags = parent->side_flags;
     webtransport = h3_is_webtransport(parent);
     pthread_mutex_unlock(&source->mutex);
-    result = trevrpc_msquic_conn_open_stream(conn, &stream);
+    result = trevrpc_msquic_native_conn_open_stream(conn, &stream);
     pthread_mutex_lock(&source->mutex);
     h3_unpin_object_locked(source, parent);
     if (result != 0) {
@@ -4413,7 +4413,7 @@ static int h3_stream_open(trevrpc_rpc_transport* transport,
     if (parent == NULL || parent->object != conn || !parent->ready_reported ||
         webtransport != h3_is_webtransport(parent)) {
         pthread_mutex_unlock(&source->mutex);
-        trevrpc_msquic_stream_close(stream);
+        trevrpc_msquic_native_stream_close(stream);
         return -ESTALE;
     }
     entry = h3_alloc_entry_locked(source, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, side_flags, stream, connection);
@@ -4429,7 +4429,7 @@ static int h3_stream_open(trevrpc_rpc_transport* transport,
     }
     pthread_mutex_unlock(&source->mutex);
     if (entry == NULL) {
-        trevrpc_msquic_stream_close(stream);
+        trevrpc_msquic_native_stream_close(stream);
         return -EAGAIN;
     }
     if (result != 0) {
@@ -4592,7 +4592,7 @@ static int h3_stream_send(trevrpc_rpc_transport* transport,
     entry->stream.pending_send_bytes = c;
     ++source->pending_send_count;
     source->pending_send_bytes += c;
-    if (trevrpc_msquic_send_completion_status(completion) != -EAGAIN)
+    if (trevrpc_msquic_native_send_completion_status(completion) != -EAGAIN)
         entry->pending |= H3_PENDING_SEND_COMPLETE;
     h3_signal_locked(source);
     h3_unpin_object_locked(source, entry);
@@ -4651,7 +4651,7 @@ static int h3_stream_finish_send(trevrpc_rpc_transport* transport, trevrpc_rpc_t
      * terminal processing cannot misclassify its synchronous completion. */
     entry->stream.send_fin = true;
     pthread_mutex_unlock(&source->mutex);
-    result = trevrpc_msquic_stream_shutdown_send(stream);
+    result = trevrpc_msquic_native_stream_shutdown_send(stream);
     pthread_mutex_lock(&source->mutex);
     if (result != 0 && entry->live)
         entry->stream.send_fin = false;
@@ -4902,7 +4902,7 @@ static int h3_connection_close(trevrpc_rpc_transport* transport, trevrpc_rpc_tra
     pthread_mutex_unlock(&source->mutex);
     if (entry == NULL)
         return -ESTALE;
-    trevrpc_msquic_conn_shutdown_error(object, code);
+    trevrpc_msquic_native_conn_shutdown_error(object, code);
     pthread_mutex_lock(&source->mutex);
     h3_unpin_object_locked(source, entry);
     pthread_mutex_unlock(&source->mutex);
@@ -5042,7 +5042,7 @@ static int h3_close(trevrpc_rpc_transport* transport) {
     for (i = 0; i < shutdown_count; ++i) {
         h3_entry* entry = shutdown_entries[i];
         if (entry->kind == TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION)
-            trevrpc_msquic_conn_shutdown_error(entry->object, 0);
+            trevrpc_msquic_native_conn_shutdown_error(entry->object, 0);
     }
     pthread_mutex_lock(&source->mutex);
     for (i = 0; i < shutdown_count; ++i)
@@ -5513,7 +5513,7 @@ int trevrpc_rpc_transport_h3_test_adopt_peer_stream(trevrpc_rpc_transport* trans
         if (entry != NULL)
             h3_close_entry_object(entry);
         else if (quota_rejected)
-            trevrpc_msquic_stream_close(object);
+            trevrpc_msquic_native_stream_close(object);
         return result;
     }
     result = h3_install_stream(source, entry);
@@ -5973,13 +5973,13 @@ int trevrpc_rpc_transport_h3_test_stage_pending_send(trevrpc_rpc_transport* tran
     if (entry == NULL || entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_STREAM ||
         entry->stream.pending_completion != NULL) {
         pthread_mutex_unlock(&source->mutex);
-        trevrpc_msquic_send_completion_free(completion);
+        trevrpc_msquic_native_send_completion_free(completion);
         return -ESTALE;
     }
     entry->send_event = h3_mandatory_event_alloc(source);
     if (entry->send_event == NULL) {
         pthread_mutex_unlock(&source->mutex);
-        trevrpc_msquic_send_completion_free(completion);
+        trevrpc_msquic_native_send_completion_free(completion);
         return -ENOMEM;
     }
     entry->stream.pending_completion = completion;
