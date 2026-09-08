@@ -665,7 +665,8 @@ static int shutdown_server(server_state* state) {
         if (rc == 0 && release_rc != 0) {
             rc = release_rc;
         }
-        state->runtime = NULL;
+        if (release_rc == 0)
+            state->runtime = NULL;
     }
     return rc;
 }

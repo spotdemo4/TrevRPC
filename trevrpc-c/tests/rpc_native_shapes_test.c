@@ -364,13 +364,10 @@ static void setup_harness(harness* state) {
     listener_config.cert_data_len = listener_cert_len;
     listener_config.key_data = listener_key;
     listener_config.key_data_len = listener_key_len;
-    {
-        size_t bundles_before = credential_bundle_count();
-        credential_cleanup_failures = 1;
-        assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &listener_config, 999, &state->listener) == -EIO);
-        assert(credential_bundle_count() == bundles_before);
-    }
+    size_t bundles_before = credential_bundle_count();
+    credential_cleanup_failures = 1;
     int start_result = trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &listener_config, 1, &state->listener);
+    assert(credential_bundle_count() == bundles_before);
     memset(listener_cert, 0, listener_cert_len);
     memset(listener_key, 0, listener_key_len);
     free(listener_cert);
@@ -416,14 +413,10 @@ static void setup_harness(harness* state) {
     client_config.cert_data_len = client_cert_len;
     client_config.key_data = client_key;
     client_config.key_data_len = client_key_len;
-    {
-        size_t bundles_before = credential_bundle_count();
-        credential_cleanup_failures = 1;
-        assert(
-            trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &client_config, 999, &state->client_endpoint) == -EIO);
-        assert(credential_bundle_count() == bundles_before);
-    }
+    bundles_before = credential_bundle_count();
+    credential_cleanup_failures = 1;
     assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &client_config, 2, &state->client_endpoint) == 0);
+    assert(credential_bundle_count() == bundles_before);
     memset(client_cert, 0, client_cert_len);
     memset(client_key, 0, client_key_len);
     free(client_cert);

@@ -225,6 +225,7 @@ struct h3_entry {
 struct h3_source {
     trevrpc_rpc_transport base;
     trevrpc_msquic_finalizer_scope finalizer_scope;
+    trevrpc_credential_cleanup_owner credential_cleanup;
     pthread_mutex_t mutex;
     pthread_cond_t object_cond;
     int wake_read_fd;
@@ -471,6 +472,8 @@ static h3_entry* h3_parent_connection_locked(h3_source* source, const h3_entry* 
     return parent != NULL && parent->kind == TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION ? parent : NULL;
 }
 
+static void h3_endpoint_discard_credential_memory(h3_endpoint_copy* endpoint);
+
 static void h3_endpoint_free(h3_endpoint_copy* copy) {
     if (copy == NULL)
         return;
@@ -481,11 +484,7 @@ static void h3_endpoint_free(h3_endpoint_copy* copy) {
     free(copy->ca_cert_file);
     free(copy->path);
     free(copy->origin);
-    if (copy->key_data != NULL)
-        trevrpc_credential_secure_zero(copy->key_data, (size_t)copy->value.key_data_len);
-    free(copy->cert_data);
-    free(copy->key_data);
-    free(copy->ca_cert_data);
+    h3_endpoint_discard_credential_memory(copy);
     memset(copy, 0, sizeof(*copy));
 }
 
@@ -4051,8 +4050,7 @@ static int h3_msquic_config_prepare_credentials(
     return 0;
 }
 
-static int h3_endpoint_discard_credentials(h3_endpoint_copy* endpoint, trevrpc_credential_files* files) {
-    int result = trevrpc_credential_files_cleanup(files);
+static void h3_endpoint_discard_credential_memory(h3_endpoint_copy* endpoint) {
     if (endpoint->key_data != NULL)
         trevrpc_credential_secure_zero(endpoint->key_data, (size_t)endpoint->value.key_data_len);
     free(endpoint->cert_data);
@@ -4067,7 +4065,6 @@ static int h3_endpoint_discard_credentials(h3_endpoint_copy* endpoint, trevrpc_c
     endpoint->value.cert_data_len = 0;
     endpoint->value.key_data_len = 0;
     endpoint->value.ca_cert_data_len = 0;
-    return result;
 }
 
 static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
@@ -4087,10 +4084,10 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
     size_t alpn_count;
     trevrpc_msquic_listener* listener = NULL;
     h3_endpoint_copy endpoint;
-    trevrpc_credential_files credential_files;
+    trevrpc_credential_files credential_files = {0};
+    trevrpc_credential_cleanup_lease* cleanup_lease = NULL;
     h3_entry* entry;
     int result;
-    int cleanup_result;
     trevrpc_msquic_feature_request features;
     trevrpc_msquic_receive_policy policy = {0};
     if (config == NULL || out == NULL ||
@@ -4127,14 +4124,24 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
             dispatch_context_destroy(dispatch_context);
         return result;
     }
+    result = trevrpc_credential_cleanup_owner_prepare_lease(&source->credential_cleanup,
+        trevrpc_credential_cleanup_required(config->cert_data_len, config->key_data_len, config->ca_cert_data_len),
+        &cleanup_lease);
+    if (result != 0) {
+        if (dispatch_context_destroy != NULL)
+            dispatch_context_destroy(dispatch_context);
+        return result;
+    }
     result = h3_endpoint_copy_make(config, &endpoint);
     if (result != 0) {
+        trevrpc_credential_cleanup_owner_finish(&source->credential_cleanup, &credential_files, &cleanup_lease);
         if (dispatch_context_destroy != NULL)
             dispatch_context_destroy(dispatch_context);
         return result;
     }
     result = h3_msquic_config_prepare_credentials(&endpoint, &ms, &credential_files);
     if (result != 0) {
+        trevrpc_credential_cleanup_owner_finish(&source->credential_cleanup, &credential_files, &cleanup_lease);
         h3_endpoint_free(&endpoint);
         if (dispatch_context_destroy != NULL)
             dispatch_context_destroy(dispatch_context);
@@ -4161,11 +4168,11 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
         (trevrpc_rpc_transport_handle){0});
     pthread_mutex_unlock(&source->mutex);
     if (entry == NULL) {
-        cleanup_result = h3_endpoint_discard_credentials(&endpoint, &credential_files);
+        trevrpc_credential_cleanup_owner_finish(&source->credential_cleanup, &credential_files, &cleanup_lease);
         h3_endpoint_free(&endpoint);
         if (dispatch_context_destroy != NULL)
             dispatch_context_destroy(dispatch_context);
-        return cleanup_result != 0 ? cleanup_result : -EAGAIN;
+        return -EAGAIN;
     }
     result = trevrpc_msquic_listen_alpns_features_with_dispatch(endpoint.value.host,
         endpoint.value.port,
@@ -4178,7 +4185,8 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
         dispatch_context,
         dispatch_context_destroy,
         &listener);
-    cleanup_result = h3_endpoint_discard_credentials(&endpoint, &credential_files);
+    trevrpc_credential_cleanup_owner_finish(&source->credential_cleanup, &credential_files, &cleanup_lease);
+    h3_endpoint_discard_credential_memory(&endpoint);
     if (result != 0) {
         pthread_mutex_lock(&source->mutex);
         h3_detach_entry_locked(entry);
@@ -4188,14 +4196,6 @@ static int h3_endpoint_listen_impl(trevrpc_rpc_transport* transport,
         return result;
     }
     trevrpc_msquic_listener_set_finalizer_scope(listener, &source->finalizer_scope);
-    if (cleanup_result != 0) {
-        trevrpc_msquic_native_listener_close(listener);
-        pthread_mutex_lock(&source->mutex);
-        h3_detach_entry_locked(entry);
-        pthread_mutex_unlock(&source->mutex);
-        h3_endpoint_free(&endpoint);
-        return cleanup_result;
-    }
     pthread_mutex_lock(&source->mutex);
     entry->object = listener;
     entry->endpoint = endpoint;
@@ -4271,10 +4271,10 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
     trevrpc_msquic_receive_policy policy = {0};
     trevrpc_msquic_conn* conn = NULL;
     h3_endpoint_copy endpoint;
-    trevrpc_credential_files credential_files;
+    trevrpc_credential_files credential_files = {0};
+    trevrpc_credential_cleanup_lease* cleanup_lease = NULL;
     h3_entry* entry;
     int result;
-    int cleanup_result;
     if (config == NULL || out == NULL || operation_id == 0 ||
         (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_HTTP3 &&
             config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_WEBTRANSPORT))
@@ -4288,11 +4288,19 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
     result = h3_validate_credentials(config, 0);
     if (result != 0)
         return result;
-    result = h3_endpoint_copy_make(config, &endpoint);
+    result = trevrpc_credential_cleanup_owner_prepare_lease(&source->credential_cleanup,
+        trevrpc_credential_cleanup_required(config->cert_data_len, config->key_data_len, config->ca_cert_data_len),
+        &cleanup_lease);
     if (result != 0)
         return result;
+    result = h3_endpoint_copy_make(config, &endpoint);
+    if (result != 0) {
+        trevrpc_credential_cleanup_owner_finish(&source->credential_cleanup, &credential_files, &cleanup_lease);
+        return result;
+    }
     result = h3_msquic_config_prepare_credentials(&endpoint, &ms, &credential_files);
     if (result != 0) {
+        trevrpc_credential_cleanup_owner_finish(&source->credential_cleanup, &credential_files, &cleanup_lease);
         h3_endpoint_free(&endpoint);
         return result;
     }
@@ -4317,18 +4325,13 @@ static int h3_endpoint_dial(trevrpc_rpc_transport* transport,
         NULL,
         &policy,
         &conn);
-    cleanup_result = h3_endpoint_discard_credentials(&endpoint, &credential_files);
+    trevrpc_credential_cleanup_owner_finish(&source->credential_cleanup, &credential_files, &cleanup_lease);
+    h3_endpoint_discard_credential_memory(&endpoint);
     if (result != 0) {
         h3_endpoint_free(&endpoint);
         return result;
     }
     trevrpc_msquic_conn_set_finalizer_scope(conn, &source->finalizer_scope);
-    if (cleanup_result != 0) {
-        if (conn != NULL)
-            trevrpc_msquic_native_conn_close(conn);
-        h3_endpoint_free(&endpoint);
-        return cleanup_result;
-    }
     pthread_mutex_lock(&source->mutex);
     entry = h3_alloc_entry_locked(source,
         TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION,
@@ -5054,12 +5057,19 @@ static int h3_close(trevrpc_rpc_transport* transport) {
 }
 static int h3_drain(trevrpc_rpc_transport* transport) {
     h3_source* source = h3_from_base(transport);
+    int result;
     h3_process_pending(source);
+    trevrpc_credential_cleanup_owner_progress(&source->credential_cleanup);
     pthread_mutex_lock(&source->mutex);
-    int result = source->event_depth || source->state != TREVRPC_RPC_TRANSPORT_STATE_STOPPED ? -EAGAIN : 0;
+    result = source->event_depth || source->state != TREVRPC_RPC_TRANSPORT_STATE_STOPPED ? -EAGAIN : 0;
     pthread_mutex_unlock(&source->mutex);
     return result;
 }
+
+static int h3_prepare_release(trevrpc_rpc_transport* transport) {
+    return trevrpc_credential_cleanup_owner_prepare_release(&h3_from_base(transport)->credential_cleanup);
+}
+
 static void h3_free_entry_mode(h3_entry* entry, bool force_stream_close) {
     size_t control_index;
     if (entry == NULL)
@@ -5158,6 +5168,7 @@ static void h3_destroy(trevrpc_rpc_transport* transport) {
     pthread_cond_destroy(&source->object_cond);
     pthread_mutex_destroy(&source->mutex);
     trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
+    trevrpc_credential_cleanup_owner_destroy(&source->credential_cleanup);
     free(source->entries);
     free(source);
 }
@@ -5187,6 +5198,7 @@ static const trevrpc_rpc_transport_ops h3_ops = {
     .listener_close = h3_listener_close,
     .close = h3_close,
     .drain = h3_drain,
+    .prepare_release = h3_prepare_release,
     .destroy = h3_destroy,
     .get_wake_sources = NULL,
     .event_get_admission_info = h3_event_get_admission_info,
@@ -5210,8 +5222,14 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
     source = calloc(1, sizeof(*source));
     if (source == NULL)
         return -ENOMEM;
+    result = trevrpc_credential_cleanup_owner_init(&source->credential_cleanup);
+    if (result != 0) {
+        free(source);
+        return result;
+    }
     result = trevrpc_msquic_finalizer_scope_init(&source->finalizer_scope);
     if (result != 0) {
+        trevrpc_credential_cleanup_owner_destroy(&source->credential_cleanup);
         free(source);
         return result;
     }
@@ -5227,6 +5245,7 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
     if (source->entries == NULL) {
         if (finalizer_scope_initialized)
             trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
+        trevrpc_credential_cleanup_owner_destroy(&source->credential_cleanup);
         free(source);
         return -ENOMEM;
     }
@@ -5244,6 +5263,7 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
         free(source->entries);
         if (finalizer_scope_initialized)
             trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
+        trevrpc_credential_cleanup_owner_destroy(&source->credential_cleanup);
         free(source);
         return result;
     }
@@ -5271,6 +5291,7 @@ int trevrpc_rpc_transport_h3_create(const trevrpc_rpc_transport_config* config, 
         free(source->entries);
         if (finalizer_scope_initialized)
             trevrpc_msquic_finalizer_scope_destroy(&source->finalizer_scope);
+        trevrpc_credential_cleanup_owner_destroy(&source->credential_cleanup);
         free(source);
         return -ENOMEM;
     }
@@ -5286,6 +5307,7 @@ synchronization_init_failed:
     close(source->wake_read_fd);
     close(source->wake_write_fd);
     free(source->entries);
+    trevrpc_credential_cleanup_owner_destroy(&source->credential_cleanup);
     free(source);
     return -ENOMEM;
 }

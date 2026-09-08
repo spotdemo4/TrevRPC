@@ -29,11 +29,18 @@ function runNativeChild(source, extraEnvironment = {}, args = []) {
   });
 }
 
-function traceLines(result) {
+function traceRecords(result) {
   return `${result.stderr ?? ""}`
     .split("\n")
-    .filter((line) => line.startsWith("trevrpc-node-test:"))
-    .map((line) => line.slice("trevrpc-node-test:".length));
+    .filter((line) => line.startsWith("trevrpc-node-test:"));
+}
+
+function traceLines(result) {
+  return traceRecords(result).map((line) => {
+    const event = line.match(/\bevent=([^\s]+)/u)?.[1];
+    assert.notEqual(event, undefined, `legacy or malformed native trace: ${line}`);
+    return event;
+  });
 }
 
 function assertInOrder(values, expected) {
@@ -126,6 +133,12 @@ test("test-hook traces prove drain, STOPPED, release, poll close, and free order
     "free",
   ]);
   assert.ok(traceLines(result).includes("drain-eagain"));
+  assert.match(result.stderr, /trevrpc-node-test:pid=\d+ runtime=\d+ event=key-(?:insert|bind)/u);
+  assert.match(
+    result.stderr,
+    /trevrpc-node-test:pid=\d+ runtime=\d+ event=cleanup-owner-(?:async|instance)/u,
+  );
+  assert.match(result.stderr, /trevrpc-node-test:pid=\d+ runtime=\d+ event=cleanup-complete/u);
 });
 
 test("construction and operation failure injections remain bounded and release in order", (t) => {
@@ -174,6 +187,31 @@ test("construction and operation failure injections remain bounded and release i
   assert.notEqual(closeFailure.status, 0, closeFailure.stderr);
   assert.ok(traceLines(closeFailure).includes("close-failed-bounded"));
 
+  for (const failure of [
+    "TREVRPC_NODE_FAIL_FAILURE_PROGRESS_INIT",
+    "TREVRPC_NODE_FAIL_FAILURE_PROGRESS_START",
+  ]) {
+    const result = runNativeChild(
+      `require(${JSON.stringify(nativeAddonPath)}).createCancellation();`,
+      {
+        TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_ONCE: "1",
+        [failure]: "1",
+      },
+    );
+    assert.equal(result.error, undefined, `${failure}: ${result.stderr}`);
+    assert.notEqual(result.status, 0, `${failure}: ${result.stderr}`);
+  }
+
+  const pollClosureFailure = runNativeChild(
+    `try { require(${JSON.stringify(nativeAddonPath)}).createCancellation(); } catch {}`,
+    {
+      TREVRPC_NODE_FAIL_NAPI_INSTANCE_DATA: "1",
+      TREVRPC_NODE_FAIL_CLOSE_SUBMISSION: "1",
+    },
+  );
+  assert.equal(pollClosureFailure.error, undefined, pollClosureFailure.stderr);
+  assert.notEqual(pollClosureFailure.status, 0, pollClosureFailure.stderr);
+
   const transientCloseFailure = runNativeChild(
     `
       const native = require(${JSON.stringify(nativeAddonPath)});
@@ -206,6 +244,30 @@ test("construction and operation failure injections remain bounded and release i
     delayedCloseFailure.stderr,
   );
   assertInOrder(delayedTraces, ["close-submitted", "stopped", "release", "free"]);
+
+  const delayedRuntimeRelease = runNativeChild(
+    `
+      const native = require(${JSON.stringify(nativeAddonPath)});
+      native.createCancellation();
+    `,
+    { TREVRPC_NODE_FAIL_RUNTIME_RELEASE_FIVE: "1" },
+  );
+  assert.equal(delayedRuntimeRelease.error, undefined, delayedRuntimeRelease.stderr);
+  assert.equal(delayedRuntimeRelease.status, 0, delayedRuntimeRelease.stderr);
+  const releaseTraces = traceLines(delayedRuntimeRelease);
+  assert.ok(
+    releaseTraces.filter((event) => event === "release-retry").length >= 5,
+    delayedRuntimeRelease.stderr,
+  );
+  assertInOrder(releaseTraces, [
+    "close-submitted",
+    "stopped",
+    "release-retry",
+    "poll-closed",
+    "release",
+    "failure-progress-closed",
+    "free",
+  ]);
 });
 
 test("GC after cancellation completion releases the native cancellation handle", (t) => {

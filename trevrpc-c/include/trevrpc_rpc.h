@@ -470,7 +470,10 @@ int trevrpc_rpc_runtime_close(trevrpc_rpc_runtime* runtime, uint64_t operation_i
 int trevrpc_rpc_runtime_drain(trevrpc_rpc_runtime* runtime);
 /*
  * Final release closes API admission and waits for already-admitted calls.
- * Callers must not attempt raw-pointer API entry after release returns.
+ * For the sole release caller, a nonzero result leaves the runtime owned and
+ * eligible for a later release attempt. Concurrent release calls are invalid;
+ * their errors do not grant ownership. Callers must not attempt raw-pointer API
+ * entry after release returns zero.
  */
 int trevrpc_rpc_runtime_release(trevrpc_rpc_runtime* runtime);
 

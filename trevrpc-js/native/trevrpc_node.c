@@ -7,10 +7,12 @@
 #include "trevrpc_rpc_msquic.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <node_api.h>
 #include <poll.h>
 #include <sched.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +76,18 @@ typedef enum node_lifecycle_state {
     NODE_LIFECYCLE_STOPPED = 2,
     NODE_LIFECYCLE_RELEASED = 3,
 } node_lifecycle_state;
+
+typedef enum node_cleanup_owner {
+    NODE_CLEANUP_OWNER_NONE = 0,
+    NODE_CLEANUP_OWNER_ASYNC_HOOK = 1,
+    NODE_CLEANUP_OWNER_INSTANCE_FINALIZER = 2,
+} node_cleanup_owner;
+
+typedef enum node_cleanup_state {
+    NODE_CLEANUP_OPEN = 0,
+    NODE_CLEANUP_CLAIMED = 1,
+    NODE_CLEANUP_COMPLETE = 2,
+} node_cleanup_state;
 
 typedef enum node_subject_kind {
     NODE_SUBJECT_ENDPOINT = TREVRPC_RPC_OBJECT_ENDPOINT,
@@ -290,7 +304,11 @@ struct node_runtime {
     bool environment_teardown;
     bool cleanup_started;
     bool close_submitted;
+    node_cleanup_owner cleanup_owner;
+    node_cleanup_state cleanup_state;
+    uint64_t test_runtime_id;
     bool close_retry_pending;
+    bool runtime_release_retry_pending;
     bool stopped_seen;
     bool runtime_released;
     bool impossible_event;
@@ -301,10 +319,12 @@ struct node_runtime {
     uint32_t cancellation_release_failures_remaining;
     bool close_submission_failure_injected;
     uint32_t close_submission_failures_remaining;
+    uint32_t runtime_release_failures_remaining;
     bool send_operation_id_failure_injected;
     bool send_operation_record_failure_injected;
     bool shutdown_operation_in_use;
     uint32_t close_attempts;
+    uint32_t release_attempts;
     node_lifecycle_state state;
     trevrpc_rpc_runtime* rpc;
     trevrpc_rpc_wake_source_v1 wake;
@@ -327,6 +347,7 @@ static void node_runtime_poll_close(node_runtime* runtime);
 static void node_runtime_start_failure_progress(node_runtime* runtime);
 static void node_runtime_stop_failure_progress(node_runtime* runtime);
 static void node_runtime_close_failure_progress(node_runtime* runtime);
+static bool node_runtime_claim_cleanup(node_runtime* runtime, node_cleanup_owner owner);
 static bool node_runtime_has_pending_progress(node_runtime* runtime);
 static void node_runtime_update_liveness(node_runtime* runtime);
 static void node_runtime_detach_instance_data(node_runtime* runtime);
@@ -357,27 +378,74 @@ static bool node_test_flag(const char* name) {
     return value != NULL && strcmp(value, "1") == 0;
 }
 
-static void node_test_trace(const char* event) {
-    fprintf(stderr, "trevrpc-node-test:%s\n", event);
+static _Atomic uint64_t node_test_next_runtime_id = 1u;
+
+static void node_test_trace_runtime(const node_runtime* runtime, const char* event) {
+    uint64_t runtime_id = runtime == NULL ? 0u : runtime->test_runtime_id;
+    long process_id = (long)uv_os_getpid();
+    fprintf(stderr, "trevrpc-node-test:pid=%ld runtime=%" PRIu64 " event=%s\n", process_id, runtime_id, event);
     fflush(stderr);
     const char* trace_file = getenv("TREVRPC_NODE_TRACE_FILE");
     if (trace_file != NULL) {
         FILE* file = fopen(trace_file, "a");
         if (file != NULL) {
-            fprintf(file, "%s\n", event);
+            fprintf(file, "pid=%ld runtime=%" PRIu64 " event=%s\n", process_id, runtime_id, event);
             fclose(file);
         }
     }
 }
+
+static void node_test_trace_key(const node_runtime* runtime, const char* event, uint32_t kind, node_handle_key key) {
+    uint64_t runtime_id = runtime == NULL ? 0u : runtime->test_runtime_id;
+    long process_id = (long)uv_os_getpid();
+    fprintf(stderr,
+        "trevrpc-node-test:pid=%ld runtime=%" PRIu64 " event=%s kind=%" PRIu32 " owner=%" PRIu64 " slot=%" PRIu32
+        " generation=%" PRIu32 "\n",
+        process_id,
+        runtime_id,
+        event,
+        kind,
+        key.owner,
+        key.slot,
+        key.generation);
+    fflush(stderr);
+    const char* trace_file = getenv("TREVRPC_NODE_TRACE_FILE");
+    if (trace_file != NULL) {
+        FILE* file = fopen(trace_file, "a");
+        if (file != NULL) {
+            fprintf(file,
+                "pid=%ld runtime=%" PRIu64 " event=%s kind=%" PRIu32 " owner=%" PRIu64 " slot=%" PRIu32
+                " generation=%" PRIu32 "\n",
+                process_id,
+                runtime_id,
+                event,
+                kind,
+                key.owner,
+                key.slot,
+                key.generation);
+            fclose(file);
+        }
+    }
+}
+
 #else
 static bool node_test_flag(const char* name) {
     (void)name;
     return false;
 }
 
-static void node_test_trace(const char* event) {
+static void node_test_trace_runtime(const node_runtime* runtime, const char* event) {
+    (void)runtime;
     (void)event;
 }
+
+static void node_test_trace_key(const node_runtime* runtime, const char* event, uint32_t kind, node_handle_key key) {
+    (void)runtime;
+    (void)event;
+    (void)kind;
+    (void)key;
+}
+
 #endif
 
 static bool node_send_test_failure(node_runtime* runtime, bool record_failure) {
@@ -477,6 +545,7 @@ static void node_registry_insert(node_runtime* runtime, node_subject* subject) {
     subject->next = registry->head;
     registry->head = subject;
     registry->length++;
+    node_test_trace_key(runtime, "key-insert", (uint32_t)subject->kind, subject->key);
 }
 
 static node_subject* node_registry_add(node_runtime* runtime, uint32_t kind, node_handle_key key) {
@@ -502,6 +571,7 @@ static void node_registry_remove(node_runtime* runtime, node_subject* target) {
         if (*link == target) {
             *link = target->next;
             registry->length--;
+            node_test_trace_key(runtime, "key-remove", (uint32_t)target->kind, target->key);
             free(target);
             return;
         }
@@ -585,7 +655,7 @@ static void node_cancellation_try_release(node_runtime* runtime, node_subject* s
     }
     int result;
     if (node_test_flag("TREVRPC_NODE_FAIL_CANCELLATION_RELEASE_PERSISTENT")) {
-        node_test_trace("cancellation-release-busy");
+        node_test_trace_runtime(runtime, "cancellation-release-busy");
         result = -EBUSY;
     } else {
         if (!runtime->cancellation_release_busy_injected &&
@@ -595,12 +665,12 @@ static void node_cancellation_try_release(node_runtime* runtime, node_subject* s
         }
         if (runtime->cancellation_release_failures_remaining > 0) {
             runtime->cancellation_release_failures_remaining--;
-            node_test_trace("cancellation-release-busy");
+            node_test_trace_runtime(runtime, "cancellation-release-busy");
             result = -EBUSY;
         } else if (!runtime->cancellation_release_busy_injected &&
                    node_test_flag("TREVRPC_NODE_FAIL_CANCELLATION_RELEASE_BUSY")) {
             runtime->cancellation_release_busy_injected = true;
-            node_test_trace("cancellation-release-busy");
+            node_test_trace_runtime(runtime, "cancellation-release-busy");
             result = -EBUSY;
         } else {
             result = trevrpc_rpc_cancellation_release(runtime->rpc, subject->cancellation);
@@ -619,7 +689,7 @@ static void node_cancellation_try_release(node_runtime* runtime, node_subject* s
         subject->release_retry_pending = false;
         node_registry_remove(runtime, subject);
         node_runtime_update_liveness(runtime);
-        node_test_trace("cancellation-release");
+        node_test_trace_runtime(runtime, "cancellation-release");
     } else {
         subject->release_retry_pending = true;
         node_runtime_start_failure_progress(runtime);
@@ -649,6 +719,7 @@ static void node_operation_remove(node_runtime* runtime, node_operation* target)
     while (*link != NULL) {
         if (*link == target) {
             *link = target->next;
+            node_test_trace_key(runtime, "key-unbind", target->subject_kind, target->subject);
             if (target == &runtime->shutdown_operation) {
                 runtime->shutdown_operation_in_use = false;
                 memset(target, 0, sizeof(*target));
@@ -700,6 +771,7 @@ static node_operation* node_operation_add_id(node_runtime* runtime,
     operation->has_deferred = has_deferred;
     operation->next = runtime->operations;
     runtime->operations = operation;
+    node_test_trace_key(runtime, "key-bind", subject_kind, subject);
     node_runtime_update_liveness(runtime);
     return operation;
 }
@@ -775,7 +847,7 @@ static int node_route_cleanup_event(node_runtime* runtime, const trevrpc_rpc_eve
     if (info->kind == TREVRPC_RPC_EVENT_STOPPED) {
         runtime->stopped_seen = true;
         runtime->state = NODE_LIFECYCLE_STOPPED;
-        node_test_trace("stopped");
+        node_test_trace_runtime(runtime, "stopped");
         return 0;
     }
     node_subject* subject = node_subject_from_event(runtime, info);
@@ -893,7 +965,7 @@ static int node_route_event(node_runtime* runtime, trevrpc_rpc_event* event, con
     if (info->kind == TREVRPC_RPC_EVENT_STOPPED) {
         runtime->stopped_seen = true;
         runtime->state = NODE_LIFECYCLE_STOPPED;
-        node_test_trace("stopped");
+        node_test_trace_runtime(runtime, "stopped");
         return 0;
     }
     node_subject* event_subject = node_subject_from_event(runtime, info);
@@ -1020,7 +1092,7 @@ static bool node_runtime_has_pending_progress(node_runtime* runtime) {
     if (runtime->cleanup_started && !runtime->close_submitted) {
         return true;
     }
-    if (runtime->close_retry_pending) {
+    if (runtime->close_retry_pending || runtime->runtime_release_retry_pending) {
         return true;
     }
     for (node_subject* subject = runtime->endpoints.head; subject != NULL; subject = subject->next) {
@@ -1049,7 +1121,8 @@ static bool node_runtime_needs_liveness(const node_runtime* runtime) {
     if (runtime == NULL || runtime->rpc == NULL || runtime->state == NODE_LIFECYCLE_RELEASED) {
         return false;
     }
-    if (runtime->environment_teardown || runtime->operations != NULL || runtime->close_retry_pending) {
+    if (runtime->environment_teardown || runtime->operations != NULL || runtime->close_retry_pending ||
+        runtime->runtime_release_retry_pending) {
         return true;
     }
     for (node_subject* subject = runtime->endpoints.head; subject != NULL; subject = subject->next) {
@@ -1112,7 +1185,7 @@ static int node_runtime_drain(node_runtime* runtime) {
         trevrpc_rpc_event* event = NULL;
         int result = trevrpc_rpc_runtime_next_event(runtime->rpc, &event);
         if (result == -EAGAIN) {
-            node_test_trace("drain-eagain");
+            node_test_trace_runtime(runtime, "drain-eagain");
             return 0;
         }
         if (result != 0 || event == NULL) {
@@ -1211,12 +1284,31 @@ static void node_runtime_controlled_shutdown(node_runtime* runtime) {
     node_runtime_start_failure_progress(runtime);
 }
 
+static bool node_runtime_claim_cleanup(node_runtime* runtime, node_cleanup_owner owner) {
+    if (runtime == NULL || runtime->cleanup_state == NODE_CLEANUP_COMPLETE) {
+        return false;
+    }
+    if (runtime->cleanup_state == NODE_CLEANUP_CLAIMED) {
+        return runtime->cleanup_owner == owner;
+    }
+    runtime->cleanup_owner = owner;
+    runtime->cleanup_state = NODE_CLEANUP_CLAIMED;
+    runtime->environment_teardown = true;
+    node_test_trace_runtime(
+        runtime, owner == NODE_CLEANUP_OWNER_ASYNC_HOOK ? "cleanup-owner-async" : "cleanup-owner-instance");
+    return true;
+}
+
 static void node_runtime_finalize_free(node_runtime* runtime) {
     if (runtime == NULL || !runtime->poll_closed || runtime->failure_progress_initialized ||
         (runtime->rpc != NULL && !runtime->runtime_released)) {
         return;
     }
     runtime->state = NODE_LIFECYCLE_RELEASED;
+    if (runtime->cleanup_state == NODE_CLEANUP_CLAIMED) {
+        runtime->cleanup_state = NODE_CLEANUP_COMPLETE;
+        node_test_trace_runtime(runtime, "cleanup-complete");
+    }
     node_runtime_detach_instance_data(runtime);
     if (runtime->cleanup_hook_registered && runtime->cleanup_hook != NULL) {
         napi_async_cleanup_hook_handle hook = runtime->cleanup_hook;
@@ -1235,7 +1327,7 @@ static void node_runtime_failure_progress_closed(uv_handle_t* handle) {
     runtime->failure_progress_closing = false;
     runtime->failure_progress_initialized = false;
     runtime->failure_progress_started = false;
-    node_test_trace("failure-progress-closed");
+    node_test_trace_runtime(runtime, "failure-progress-closed");
     napi_env env = runtime->env;
     napi_handle_scope scope = NULL;
     if (node_runtime_napi_legal(runtime)) {
@@ -1247,13 +1339,68 @@ static void node_runtime_failure_progress_closed(uv_handle_t* handle) {
     }
 }
 
+static int node_runtime_try_release(node_runtime* runtime) {
+    int result;
+    if (runtime == NULL || runtime->rpc == NULL || runtime->runtime_released)
+        return 0;
+    if (!runtime->stopped_seen)
+        return -EAGAIN;
+    result = trevrpc_rpc_runtime_drain(runtime->rpc);
+    if (result == 0) {
+        if (runtime->release_attempts == 0 && node_test_flag("TREVRPC_NODE_FAIL_RUNTIME_RELEASE_FIVE"))
+            runtime->runtime_release_failures_remaining = 5u;
+        if (runtime->runtime_release_failures_remaining != 0) {
+            --runtime->runtime_release_failures_remaining;
+            result = -EIO;
+            node_test_trace_runtime(runtime, "release-retry");
+        } else {
+            result = trevrpc_rpc_runtime_release(runtime->rpc);
+        }
+    }
+    ++runtime->release_attempts;
+    if (result == 0) {
+        runtime->rpc = NULL;
+        runtime->runtime_released = true;
+        runtime->runtime_release_retry_pending = false;
+        node_test_trace_runtime(runtime, "release");
+    }
+    return result;
+}
+
+static void node_runtime_retry_failure_progress(node_runtime* runtime) {
+    if (runtime->failure_progress_delay_ms < 1000u) {
+        runtime->failure_progress_delay_ms *= 2u;
+        if (runtime->failure_progress_delay_ms > 1000u)
+            runtime->failure_progress_delay_ms = 1000u;
+    }
+    node_runtime_start_failure_progress(runtime);
+}
+
 static void node_runtime_failure_progress_cb(uv_timer_t* handle) {
     node_runtime* runtime = handle->data;
+    if (runtime == NULL)
+        return;
     runtime->failure_progress_started = false;
-    node_test_trace("failure-progress-pass");
-    if (runtime == NULL || runtime->rpc == NULL || runtime->state == NODE_LIFECYCLE_RELEASED) {
+    node_test_trace_runtime(runtime, "failure-progress-pass");
+    if (runtime->state == NODE_LIFECYCLE_RELEASED)
+        return;
+    if (runtime->runtime_release_retry_pending) {
+        int result = node_runtime_try_release(runtime);
+        if (result == 0) {
+            node_runtime_close_failure_progress(runtime);
+            return;
+        }
+        if (runtime->release_attempts >= 16u) {
+            napi_fatal_error("TrevRPC native runtime cleanup",
+                NAPI_AUTO_LENGTH,
+                "runtime release failed after bounded retries",
+                NAPI_AUTO_LENGTH);
+        }
+        node_runtime_retry_failure_progress(runtime);
         return;
     }
+    if (runtime->rpc == NULL)
+        return;
     if (!runtime->cleanup_started) {
         node_runtime_retry_call_cleanup(runtime);
         node_runtime_release_pending_cancellations(runtime);
@@ -1292,38 +1439,40 @@ static void node_runtime_start_failure_progress(node_runtime* runtime) {
         return;
     }
     if (!runtime->failure_progress_initialized) {
-        int result = uv_timer_init(runtime->loop, &runtime->failure_progress);
+        int result = node_test_flag("TREVRPC_NODE_FAIL_FAILURE_PROGRESS_INIT")
+                         ? UV_EIO
+                         : uv_timer_init(runtime->loop, &runtime->failure_progress);
         if (result != 0) {
             runtime->impossible_event = true;
-            if (!runtime->environment_teardown) {
-                napi_fatal_error("TrevRPC native runtime cleanup",
-                    NAPI_AUTO_LENGTH,
-                    "failure cleanup progress handle initialization failed",
-                    NAPI_AUTO_LENGTH);
-            }
+            napi_fatal_error("TrevRPC native runtime cleanup",
+                NAPI_AUTO_LENGTH,
+                "failure cleanup progress handle initialization failed",
+                NAPI_AUTO_LENGTH);
             return;
         }
         runtime->failure_progress_initialized = true;
         runtime->failure_progress.data = runtime;
         runtime->failure_progress_delay_ms = 1u;
         uv_unref((uv_handle_t*)&runtime->failure_progress);
-        node_test_trace("failure-progress-init");
+        node_test_trace_runtime(runtime, "failure-progress-init");
     }
     if (!runtime->failure_progress_started) {
-        int result = uv_timer_start(
-            &runtime->failure_progress, node_runtime_failure_progress_cb, runtime->failure_progress_delay_ms, 0);
+        int result = node_test_flag("TREVRPC_NODE_FAIL_FAILURE_PROGRESS_START")
+                         ? UV_EIO
+                         : uv_timer_start(&runtime->failure_progress,
+                               node_runtime_failure_progress_cb,
+                               runtime->failure_progress_delay_ms,
+                               0);
         if (result != 0) {
             runtime->impossible_event = true;
-            if (!runtime->environment_teardown) {
-                napi_fatal_error("TrevRPC native runtime cleanup",
-                    NAPI_AUTO_LENGTH,
-                    "failure cleanup progress handle start failed",
-                    NAPI_AUTO_LENGTH);
-            }
+            napi_fatal_error("TrevRPC native runtime cleanup",
+                NAPI_AUTO_LENGTH,
+                "failure cleanup progress handle start failed",
+                NAPI_AUTO_LENGTH);
             return;
         }
         runtime->failure_progress_started = true;
-        node_test_trace("failure-progress-start");
+        node_test_trace_runtime(runtime, "failure-progress-start");
     }
     node_runtime_update_liveness(runtime);
 }
@@ -1400,24 +1549,26 @@ static void node_runtime_poll_closed(uv_handle_t* handle) {
     if (runtime->rpc != NULL && !runtime->runtime_released) {
         if (!runtime->stopped_seen && node_runtime_shutdown_sync(runtime) != 0) {
             runtime->impossible_event = true;
+            napi_fatal_error("TrevRPC native runtime cleanup",
+                NAPI_AUTO_LENGTH,
+                "runtime shutdown failed after poll closure",
+                NAPI_AUTO_LENGTH);
+            return;
         }
         node_runtime_release_pending_cancellations(runtime);
         if (runtime->stopped_seen && !runtime->runtime_released) {
-            int result = trevrpc_rpc_runtime_drain(runtime->rpc);
-            if (result == 0) {
-                result = trevrpc_rpc_runtime_release(runtime->rpc);
-            }
-            if (result == 0) {
-                runtime->rpc = NULL;
-                runtime->runtime_released = true;
-                node_test_trace("release");
-            } else {
+            int result = node_runtime_try_release(runtime);
+            if (result != 0) {
                 runtime->impossible_event = true;
+                runtime->runtime_release_retry_pending = true;
             }
         }
     }
-    node_test_trace("poll-closed");
-    node_runtime_close_failure_progress(runtime);
+    node_test_trace_runtime(runtime, "poll-closed");
+    if (runtime->runtime_release_retry_pending)
+        node_runtime_start_failure_progress(runtime);
+    else
+        node_runtime_close_failure_progress(runtime);
     napi_env env = runtime->env;
     napi_handle_scope scope = NULL;
     if (node_runtime_napi_legal(runtime)) {
@@ -1462,7 +1613,7 @@ static int node_runtime_submit_close(node_runtime* runtime) {
     }
     int result;
     if (node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION")) {
-        node_test_trace("close-admission-retry");
+        node_test_trace_runtime(runtime, "close-admission-retry");
         result = -EIO;
     } else {
         if (!runtime->close_submission_failure_injected && node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_FIVE")) {
@@ -1471,7 +1622,7 @@ static int node_runtime_submit_close(node_runtime* runtime) {
         }
         if (runtime->close_submission_failures_remaining > 0) {
             runtime->close_submission_failures_remaining--;
-            node_test_trace("close-admission-retry");
+            node_test_trace_runtime(runtime, "close-admission-retry");
             result = -EIO;
         } else if (!runtime->close_submission_failure_injected &&
                    node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_ONCE")) {
@@ -1487,7 +1638,7 @@ static int node_runtime_submit_close(node_runtime* runtime) {
         if (result == -EALREADY) {
             node_operation_remove(runtime, operation);
         }
-        node_test_trace("close-submitted");
+        node_test_trace_runtime(runtime, "close-submitted");
         return 0;
     }
     node_operation_remove(runtime, operation);
@@ -1510,13 +1661,11 @@ static void node_runtime_begin_cleanup(node_runtime* runtime) {
             node_runtime_start_failure_progress(runtime);
             uint32_t close_attempt_limit = node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION_FIVE") ? 8u : 3u;
             if (runtime->close_attempts >= close_attempt_limit) {
-                node_test_trace("close-failed-bounded");
-                if (!runtime->environment_teardown) {
-                    napi_fatal_error("TrevRPC native runtime cleanup",
-                        NAPI_AUTO_LENGTH,
-                        "runtime_close admission failed after bounded retries",
-                        NAPI_AUTO_LENGTH);
-                }
+                node_test_trace_runtime(runtime, "close-failed-bounded");
+                napi_fatal_error("TrevRPC native runtime cleanup",
+                    NAPI_AUTO_LENGTH,
+                    "runtime_close admission failed after bounded retries",
+                    NAPI_AUTO_LENGTH);
                 return;
             }
             return;
@@ -1557,18 +1706,11 @@ static int node_runtime_shutdown_sync(node_runtime* runtime) {
             return result;
         }
         if (runtime->stopped_seen) {
-            result = trevrpc_rpc_runtime_drain(runtime->rpc);
-            if (result != 0) {
+            result = node_runtime_try_release(runtime);
+            if (result == 0)
+                return 0;
+            if (runtime->release_attempts >= 16u)
                 return result;
-            }
-            result = trevrpc_rpc_runtime_release(runtime->rpc);
-            if (result != 0) {
-                return result;
-            }
-            runtime->rpc = NULL;
-            runtime->runtime_released = true;
-            node_test_trace("release");
-            return 0;
         }
         struct timespec now;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
@@ -1600,7 +1742,9 @@ static void node_async_cleanup_hook(napi_async_cleanup_hook_handle handle, void*
         return;
     }
     runtime->cleanup_hook = handle;
-    runtime->environment_teardown = true;
+    if (!node_runtime_claim_cleanup(runtime, NODE_CLEANUP_OWNER_ASYNC_HOOK)) {
+        return;
+    }
     node_runtime_begin_cleanup(runtime);
     if (runtime->poll_initialized && !runtime->poll_closing) {
         /* Keep the loop alive until STOPPED is observed.  The borrowed fd
@@ -1609,9 +1753,14 @@ static void node_async_cleanup_hook(napi_async_cleanup_hook_handle handle, void*
     } else if (!runtime->poll_initialized) {
         if (runtime->rpc != NULL && node_runtime_shutdown_sync(runtime) != 0) {
             runtime->impossible_event = true;
+            napi_fatal_error("TrevRPC native runtime cleanup",
+                NAPI_AUTO_LENGTH,
+                "synchronous runtime shutdown failed",
+                NAPI_AUTO_LENGTH);
             return;
         }
-        node_runtime_free(runtime);
+        runtime->poll_closed = true;
+        node_runtime_finalize_free(runtime);
     }
 }
 
@@ -1629,9 +1778,21 @@ static void node_runtime_instance_finalizer(napi_env env, void* data, void* hint
     }
     holder->runtime = NULL;
     free(holder);
-    if (runtime != NULL) {
-        runtime->environment_teardown = true;
+    if (runtime != NULL && runtime->state != NODE_LIFECYCLE_RELEASED && !runtime->cleanup_hook_registered &&
+        node_runtime_claim_cleanup(runtime, NODE_CLEANUP_OWNER_INSTANCE_FINALIZER)) {
         node_runtime_begin_cleanup(runtime);
+        if (!runtime->poll_initialized) {
+            if (runtime->rpc != NULL && node_runtime_shutdown_sync(runtime) != 0) {
+                runtime->impossible_event = true;
+                napi_fatal_error("TrevRPC native runtime cleanup",
+                    NAPI_AUTO_LENGTH,
+                    "synchronous instance-finalizer shutdown failed",
+                    NAPI_AUTO_LENGTH);
+                return;
+            }
+            runtime->poll_closed = true;
+            node_runtime_finalize_free(runtime);
+        }
     }
 }
 
@@ -1706,7 +1867,7 @@ static void node_runtime_free(node_runtime* runtime) {
     node_registry_discard_all(&runtime->calls);
     node_registry_discard_all(&runtime->streams);
     node_registry_discard_all(&runtime->cancellations);
-    node_test_trace("free");
+    node_test_trace_runtime(runtime, "free");
     free(runtime);
 }
 
@@ -1749,6 +1910,9 @@ static int node_runtime_create(napi_env env, node_runtime** out_runtime) {
         return -ENOMEM;
     }
     runtime->env = env;
+#ifdef TREVRPC_NODE_TEST_HOOKS
+    runtime->test_runtime_id = atomic_fetch_add_explicit(&node_test_next_runtime_id, 1u, memory_order_relaxed);
+#endif
     runtime->next_operation_id = TREV_NODE_INITIAL_OPERATION_ID + 1u;
     runtime->shutdown_operation.id = TREV_NODE_INITIAL_OPERATION_ID;
     runtime->state = NODE_LIFECYCLE_RUNNING;
@@ -1797,7 +1961,7 @@ static int node_runtime_create(napi_env env, node_runtime** out_runtime) {
     }
     runtime->poll_initialized = true;
     runtime->poll.data = runtime;
-    node_test_trace("poll-init");
+    node_test_trace_runtime(runtime, "poll-init");
     if (node_test_flag("TREVRPC_NODE_FAIL_NAPI_INSTANCE_DATA")) {
         return node_runtime_fail_construction(runtime, -EIO);
     }
@@ -1827,7 +1991,7 @@ static int node_runtime_create(napi_env env, node_runtime** out_runtime) {
         return node_runtime_fail_construction(runtime, -result);
     }
     runtime->poll_started = true;
-    node_test_trace("poll-start");
+    node_test_trace_runtime(runtime, "poll-start");
     if (node_test_flag("TREVRPC_NODE_FAIL_CLOSE_SUBMISSION")) {
         node_runtime_controlled_shutdown(runtime);
         for (unsigned attempt = 0; attempt < 3u && !runtime->close_submitted; ++attempt) {
@@ -3495,8 +3659,8 @@ static void node_call_maybe_release(node_call* call) {
         call->stream_release_retry_pending = false;
         node_subject* subject = call->stream_subject;
         call->stream_subject = NULL;
+        node_test_trace_key(runtime, "stream-release", (uint32_t)subject->kind, subject->key);
         node_registry_remove(runtime, subject);
-        node_test_trace("stream-release");
     }
     if (call->call_subject != NULL) {
         int result = trevrpc_rpc_call_release(runtime->rpc, call->call);
@@ -3508,8 +3672,8 @@ static void node_call_maybe_release(node_call* call) {
         call->call_release_retry_pending = false;
         node_subject* subject = call->call_subject;
         call->call_subject = NULL;
+        node_test_trace_key(runtime, "call-release", (uint32_t)subject->kind, subject->key);
         node_registry_remove(runtime, subject);
-        node_test_trace("call-release");
     }
     node_call_clear_receives(call);
     free(call->server_response_body);
@@ -4320,6 +4484,7 @@ static int node_start_call(napi_env env,
         return -ENOMEM;
     }
     operation->subject = call->call_subject->key;
+    node_test_trace_key(runtime, "key-rebind", operation->subject_kind, operation->subject);
     operation->subject_bound = true;
     *out_call = call;
     return 0;
@@ -4409,6 +4574,7 @@ static napi_value node_connect_msquic(napi_env env, napi_callback_info info) {
             client, node_registry_find(&runtime->cancellations, node_key_from_cancellation(cancellation)));
     }
     operation->subject = reserved_subject->key;
+    node_test_trace_key(runtime, "key-rebind", operation->subject_kind, operation->subject);
     operation->subject_bound = true;
     napi_value object = node_make_client_object(env, client);
     if (object == NULL) {
@@ -5851,6 +6017,7 @@ static napi_value node_listen_msquic(napi_env env, napi_callback_info info) {
     reserved->core = endpoint;
     node_registry_insert(runtime, reserved);
     operation->subject = reserved->key;
+    node_test_trace_key(runtime, "key-rebind", operation->subject_kind, operation->subject);
     operation->subject_bound = true;
     napi_value object = node_make_server_object(env, server);
     if (object == NULL) {

@@ -6008,6 +6008,7 @@ static void trevrpc_rpc_runtime_unref(trevrpc_rpc_runtime* runtime) {
 
 int trevrpc_rpc_runtime_release(trevrpc_rpc_runtime* runtime) {
     uint_fast64_t gate;
+    int result;
     if (runtime == NULL) {
         return -EINVAL;
     }
@@ -6034,6 +6035,16 @@ int trevrpc_rpc_runtime_release(trevrpc_rpc_runtime* runtime) {
         pthread_cond_wait(&runtime->lifetime_condition, &runtime->lifetime_mutex);
     }
     pthread_mutex_unlock(&runtime->lifetime_mutex);
+    pthread_mutex_lock(&runtime->mutex);
+    result = trevrpc_rpc_transport_prepare_release(runtime->transport);
+    if (result != 0) {
+        runtime->state = TREVRPC_RPC_STATE_STOPPED;
+        runtime->public_released = false;
+        pthread_mutex_unlock(&runtime->mutex);
+        atomic_fetch_and_explicit(&runtime->api_gate, ~TREVRPC_RPC_API_GATE_CLOSED, memory_order_release);
+        return result;
+    }
+    pthread_mutex_unlock(&runtime->mutex);
     if (runtime->driver_started) {
         pthread_join(runtime->driver_thread, NULL);
         runtime->driver_started = false;

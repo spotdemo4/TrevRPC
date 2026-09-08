@@ -29,6 +29,17 @@ struct test_provider {
     bool* destroyed;
 };
 
+static int credential_cleanup_failures;
+static int accepted_connection_result;
+static unsigned accepted_connection_calls;
+
+int trevrpc_credential_test_fail_cleanup(void) {
+    if (credential_cleanup_failures == 0)
+        return 0;
+    --credential_cleanup_failures;
+    return 1;
+}
+
 int trevrpc_engine_msquic_adopt_accepted_connection_v1(trevrpc_engine* engine,
     const trevrpc_engine_endpoint_config_v1* config,
     trevrpc_msquic_accepted_connection* accepted,
@@ -36,8 +47,10 @@ int trevrpc_engine_msquic_adopt_accepted_connection_v1(trevrpc_engine* engine,
     (void)engine;
     (void)config;
     (void)accepted;
-    (void)out_connection;
-    return -ENOTSUP;
+    ++accepted_connection_calls;
+    if (accepted_connection_result == 0)
+        *out_connection = (trevrpc_engine_handle_v1){TEST_OWNER, 123, 456};
+    return accepted_connection_result;
 }
 
 static int attach_provider(void* context, trevrpc_engine* engine) {
@@ -154,6 +167,8 @@ int main(void) {
     trevrpc_engine_event_info_v1 info;
     trevrpc_engine* engine = NULL;
     trevrpc_rpc_transport* transport = NULL;
+    trevrpc_rpc_transport_endpoint_config transport_endpoint = {0};
+    trevrpc_rpc_transport_handle adopted_connection = {0};
     trevrpc_rpc_transport_event* transport_event = NULL;
     trevrpc_rpc_transport_event_info transport_info;
     bool destroyed = false;
@@ -201,6 +216,25 @@ int main(void) {
     engine = NULL;
     CHECK(trevrpc_engine_provider_create_v1(&config, &operations, provider, TEST_OWNER, &engine) == 0);
     CHECK(trevrpc_rpc_transport_engine_adopt(engine, &transport) == 0);
+    transport_endpoint.cert_data = &byte;
+    transport_endpoint.cert_data_len = sizeof(byte);
+    transport_endpoint.key_data = &byte;
+    transport_endpoint.key_data_len = sizeof(byte);
+    credential_cleanup_failures = 1;
+    accepted_connection_result = 0;
+    accepted_connection_calls = 0;
+    CHECK(trevrpc_rpc_transport_engine_adopt_accepted_connection(
+              transport, &transport_endpoint, (trevrpc_msquic_accepted_connection*)(uintptr_t)1, &adopted_connection) ==
+          0);
+    CHECK(accepted_connection_calls == 1);
+    CHECK(adopted_connection.owner == TEST_OWNER && adopted_connection.slot == 123 &&
+          adopted_connection.generation == 456);
+    credential_cleanup_failures = 1;
+    accepted_connection_result = -EALREADY;
+    CHECK(trevrpc_rpc_transport_engine_adopt_accepted_connection(
+              transport, &transport_endpoint, (trevrpc_msquic_accepted_connection*)(uintptr_t)1, &adopted_connection) ==
+          -EALREADY);
+    CHECK(accepted_connection_calls == 2);
     CHECK(trevrpc_rpc_transport_close(transport) == -EIO);
     CHECK(trevrpc_rpc_transport_next_event(transport, &transport_event) == 0);
     CHECK(trevrpc_rpc_transport_event_get_info(transport, transport_event, &transport_info) == 0);

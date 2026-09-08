@@ -224,6 +224,7 @@ typedef struct trevrpc_rpc_transport_ops {
     int (*listener_close)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle);
     int (*close)(trevrpc_rpc_transport*);
     int (*drain)(trevrpc_rpc_transport*);
+    int (*prepare_release)(trevrpc_rpc_transport*);
     void (*destroy)(trevrpc_rpc_transport*);
     int (*get_wake_sources)(trevrpc_rpc_transport*, trevrpc_rpc_transport_wake*, size_t, size_t*);
     int (*release_handle)(trevrpc_rpc_transport*, trevrpc_rpc_transport_handle, uint32_t);
@@ -376,6 +377,9 @@ static inline int trevrpc_rpc_transport_close(trevrpc_rpc_transport* transport) 
 }
 static inline int trevrpc_rpc_transport_drain(trevrpc_rpc_transport* transport) {
     return transport->ops->drain(transport);
+}
+static inline int trevrpc_rpc_transport_prepare_release(trevrpc_rpc_transport* transport) {
+    return transport->ops->prepare_release != NULL ? transport->ops->prepare_release(transport) : 0;
 }
 static inline int trevrpc_rpc_transport_release_handle(
     trevrpc_rpc_transport* transport, trevrpc_rpc_transport_handle handle, uint32_t kind) {

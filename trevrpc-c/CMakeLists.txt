@@ -1229,6 +1229,7 @@ if(TREVRPC_BUILD_TESTS)
             src/trevrpc_rpc_transport_engine.c
         )
         target_include_directories(trevrpc_engine_dispatch_test PRIVATE src)
+        target_compile_definitions(trevrpc_engine_dispatch_test PRIVATE TREVRPC_CREDENTIAL_TESTING)
         target_link_libraries(trevrpc_engine_dispatch_test PRIVATE trevrpc_engine)
         trevrpc_c_warnings(trevrpc_engine_dispatch_test)
         trevrpc_c_sanitizers(trevrpc_engine_dispatch_test)

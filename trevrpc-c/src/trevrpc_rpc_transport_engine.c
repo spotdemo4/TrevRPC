@@ -14,6 +14,7 @@
 typedef struct trevrpc_rpc_transport_engine {
     trevrpc_rpc_transport base;
     trevrpc_engine* engine;
+    trevrpc_credential_cleanup_owner credential_cleanup;
 } trevrpc_rpc_transport_engine;
 
 static trevrpc_rpc_transport_engine* trevrpc_rpc_transport_engine_from_base(trevrpc_rpc_transport* transport) {
@@ -97,21 +98,24 @@ int trevrpc_rpc_transport_engine_adopt_accepted_connection(trevrpc_rpc_transport
     trevrpc_rpc_transport_handle* out_connection) {
     trevrpc_engine_endpoint_config_v1 source;
     trevrpc_engine_handle_v1 target;
-    trevrpc_credential_files credential_files;
+    trevrpc_credential_files credential_files = {0};
+    trevrpc_credential_cleanup_lease* cleanup_lease = NULL;
+    trevrpc_rpc_transport_engine* adapter = trevrpc_rpc_transport_engine_from_base(transport);
     int result;
-    int cleanup_result;
     if (transport == NULL || config == NULL || accepted == NULL || out_connection == NULL)
         return -EINVAL;
-    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 0);
+    result = trevrpc_credential_cleanup_owner_prepare_lease(&adapter->credential_cleanup,
+        trevrpc_credential_cleanup_required(config->cert_data_len, config->key_data_len, config->ca_cert_data_len),
+        &cleanup_lease);
     if (result != 0)
         return result;
-    result = trevrpc_engine_msquic_adopt_accepted_connection_v1(
-        trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, accepted, &target);
-    cleanup_result = trevrpc_credential_files_cleanup(&credential_files);
-    if (result == 0 && cleanup_result != 0) {
-        (void)trevrpc_engine_connection_close(trevrpc_rpc_transport_engine_from_base(transport)->engine, target, 0);
-        result = cleanup_result;
+    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 0);
+    if (result != 0) {
+        trevrpc_credential_cleanup_owner_finish(&adapter->credential_cleanup, &credential_files, &cleanup_lease);
+        return result;
     }
+    result = trevrpc_engine_msquic_adopt_accepted_connection_v1(adapter->engine, &source, accepted, &target);
+    trevrpc_credential_cleanup_owner_finish(&adapter->credential_cleanup, &credential_files, &cleanup_lease);
     if (result == 0)
         *out_connection = trevrpc_rpc_transport_handle_from_engine(target);
     return result;
@@ -254,22 +258,26 @@ static int trevrpc_rpc_transport_engine_endpoint_listen(trevrpc_rpc_transport* t
     trevrpc_rpc_transport_handle* listener) {
     trevrpc_engine_endpoint_config_v1 source;
     trevrpc_engine_handle_v1 target;
-    trevrpc_credential_files credential_files;
+    trevrpc_credential_files credential_files = {0};
+    trevrpc_credential_cleanup_lease* cleanup_lease = NULL;
+    trevrpc_rpc_transport_engine* adapter = trevrpc_rpc_transport_engine_from_base(transport);
     int result;
-    int cleanup_result;
     if (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_AUTO &&
         config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE) {
         return -ENOTSUP;
     }
-    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 1);
+    result = trevrpc_credential_cleanup_owner_prepare_lease(&adapter->credential_cleanup,
+        trevrpc_credential_cleanup_required(config->cert_data_len, config->key_data_len, config->ca_cert_data_len),
+        &cleanup_lease);
     if (result != 0)
         return result;
-    result = trevrpc_engine_listen_v1(trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, &target);
-    cleanup_result = trevrpc_credential_files_cleanup(&credential_files);
-    if (result == 0 && cleanup_result != 0) {
-        (void)trevrpc_engine_listener_close(trevrpc_rpc_transport_engine_from_base(transport)->engine, target);
-        result = cleanup_result;
+    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 1);
+    if (result != 0) {
+        trevrpc_credential_cleanup_owner_finish(&adapter->credential_cleanup, &credential_files, &cleanup_lease);
+        return result;
     }
+    result = trevrpc_engine_listen_v1(adapter->engine, &source, &target);
+    trevrpc_credential_cleanup_owner_finish(&adapter->credential_cleanup, &credential_files, &cleanup_lease);
     if (result == 0) {
         *listener = trevrpc_rpc_transport_handle_from_engine(target);
     }
@@ -288,23 +296,26 @@ static int trevrpc_rpc_transport_engine_endpoint_dial(trevrpc_rpc_transport* tra
     trevrpc_rpc_transport_handle* connection) {
     trevrpc_engine_endpoint_config_v1 source;
     trevrpc_engine_handle_v1 target;
-    trevrpc_credential_files credential_files;
+    trevrpc_credential_files credential_files = {0};
+    trevrpc_credential_cleanup_lease* cleanup_lease = NULL;
+    trevrpc_rpc_transport_engine* adapter = trevrpc_rpc_transport_engine_from_base(transport);
     int result;
-    int cleanup_result;
     if (config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_AUTO &&
         config->protocol != TREVRPC_RPC_TRANSPORT_PROTOCOL_NATIVE) {
         return -ENOTSUP;
     }
-    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 0);
+    result = trevrpc_credential_cleanup_owner_prepare_lease(&adapter->credential_cleanup,
+        trevrpc_credential_cleanup_required(config->cert_data_len, config->key_data_len, config->ca_cert_data_len),
+        &cleanup_lease);
     if (result != 0)
         return result;
-    result = trevrpc_engine_dial_v1(
-        trevrpc_rpc_transport_engine_from_base(transport)->engine, &source, operation_id, &target);
-    cleanup_result = trevrpc_credential_files_cleanup(&credential_files);
-    if (result == 0 && cleanup_result != 0) {
-        (void)trevrpc_engine_connection_close(trevrpc_rpc_transport_engine_from_base(transport)->engine, target, 0);
-        result = cleanup_result;
+    result = trevrpc_rpc_transport_engine_endpoint_config(config, &source, &credential_files, 0);
+    if (result != 0) {
+        trevrpc_credential_cleanup_owner_finish(&adapter->credential_cleanup, &credential_files, &cleanup_lease);
+        return result;
     }
+    result = trevrpc_engine_dial_v1(adapter->engine, &source, operation_id, &target);
+    trevrpc_credential_cleanup_owner_finish(&adapter->credential_cleanup, &credential_files, &cleanup_lease);
     if (result == 0) {
         *connection = trevrpc_rpc_transport_handle_from_engine(target);
     }
@@ -409,12 +420,21 @@ static int trevrpc_rpc_transport_engine_close(trevrpc_rpc_transport* transport) 
 }
 
 static int trevrpc_rpc_transport_engine_drain(trevrpc_rpc_transport* transport) {
-    return trevrpc_engine_drain(trevrpc_rpc_transport_engine_from_base(transport)->engine);
+    trevrpc_rpc_transport_engine* adapter = trevrpc_rpc_transport_engine_from_base(transport);
+    int result = trevrpc_engine_drain(adapter->engine);
+    trevrpc_credential_cleanup_owner_progress(&adapter->credential_cleanup);
+    return result;
+}
+
+static int trevrpc_rpc_transport_engine_prepare_release(trevrpc_rpc_transport* transport) {
+    return trevrpc_credential_cleanup_owner_prepare_release(
+        &trevrpc_rpc_transport_engine_from_base(transport)->credential_cleanup);
 }
 
 static void trevrpc_rpc_transport_engine_destroy(trevrpc_rpc_transport* transport) {
     trevrpc_rpc_transport_engine* adapter = trevrpc_rpc_transport_engine_from_base(transport);
     (void)trevrpc_engine_release(adapter->engine);
+    trevrpc_credential_cleanup_owner_destroy(&adapter->credential_cleanup);
     free(adapter);
 }
 
@@ -443,6 +463,7 @@ static const trevrpc_rpc_transport_ops trevrpc_rpc_transport_engine_ops = {
     .listener_close = trevrpc_rpc_transport_engine_listener_close,
     .close = trevrpc_rpc_transport_engine_close,
     .drain = trevrpc_rpc_transport_engine_drain,
+    .prepare_release = trevrpc_rpc_transport_engine_prepare_release,
     .destroy = trevrpc_rpc_transport_engine_destroy,
     .get_wake_sources = NULL,
     .release_handle = NULL,
@@ -461,6 +482,10 @@ int trevrpc_rpc_transport_engine_adopt(trevrpc_engine* engine, trevrpc_rpc_trans
     }
     adapter->base.ops = &trevrpc_rpc_transport_engine_ops;
     adapter->engine = engine;
+    if (trevrpc_credential_cleanup_owner_init(&adapter->credential_cleanup) != 0) {
+        free(adapter);
+        return -ENOMEM;
+    }
     *out_transport = &adapter->base;
     return 0;
 }

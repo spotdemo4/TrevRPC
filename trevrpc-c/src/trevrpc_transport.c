@@ -660,6 +660,10 @@ int trevrpc_transport_release(trevrpc_transport* transport) {
     if (result != 0) {
         return result;
     }
+    result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_prepare_release(transport));
+    if (result != 0) {
+        return result;
+    }
     trevrpc_rpc_transport_destroy(transport);
     return 0;
 }

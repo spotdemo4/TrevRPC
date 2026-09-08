@@ -1145,14 +1145,10 @@ static int composite_endpoint_listen(
         entry = &c->entries[(size_t)slot - 1u];
         if (r == 0 && c->closing)
             r = -ESHUTDOWN;
-        if (r == 0)
+        if (r == 0) {
             composite_bind_reserved_listener_locked(c, entry, slot, c->h3_transport, local);
-        if (c->shared_listens_in_progress != 0)
-            --c->shared_listens_in_progress;
-        pthread_cond_broadcast(&c->condition);
-        composite_signal_capacity_locked(c);
-        if (r == 0)
             *out = composite_external(c, slot, entry);
+        }
         pthread_mutex_unlock(&c->mutex);
 
         if (r != 0) {
@@ -1162,15 +1158,21 @@ static int composite_endpoint_listen(
             if (!handle_zero(local))
                 (void)trevrpc_rpc_transport_listener_close(c->h3_transport, local);
             composite_rollback_shared_children(c, slot, parent_generation);
-            pthread_mutex_lock(&c->mutex);
+        }
+        pthread_mutex_lock(&c->mutex);
+        if (r != 0) {
             entry = &c->entries[(size_t)slot - 1u];
             if (entry->occupied) {
                 entry->terminal_seen = true;
                 entry->semantic_released = true;
                 composite_try_retire_locked(c, slot);
             }
-            pthread_mutex_unlock(&c->mutex);
         }
+        if (c->shared_listens_in_progress != 0)
+            --c->shared_listens_in_progress;
+        pthread_cond_broadcast(&c->condition);
+        composite_signal_capacity_locked(c);
+        pthread_mutex_unlock(&c->mutex);
         return r;
     }
     pthread_mutex_lock(&c->mutex);
@@ -1531,6 +1533,13 @@ static int composite_drain(trevrpc_rpc_transport* t) {
                ? a
                : (b && b != -EAGAIN ? b : (listen_in_progress || a == -EAGAIN || b == -EAGAIN ? -EAGAIN : 0));
 }
+static int composite_prepare_release(trevrpc_rpc_transport* t) {
+    trevrpc_rpc_transport_msquic* c = composite_from_base(t);
+    int a = trevrpc_rpc_transport_prepare_release(c->native_transport);
+    int b = trevrpc_rpc_transport_prepare_release(c->h3_transport);
+    return a != 0 ? a : b;
+}
+
 static void composite_destroy(trevrpc_rpc_transport* t) {
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
     size_t index;
@@ -1586,6 +1595,7 @@ static const trevrpc_rpc_transport_ops composite_ops = {
     .listener_close = composite_listener_close,
     .close = composite_close,
     .drain = composite_drain,
+    .prepare_release = composite_prepare_release,
     .destroy = composite_destroy,
     .get_wake_sources = composite_get_wake_sources,
     .release_handle = composite_release_handle,

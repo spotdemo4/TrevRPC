@@ -125,6 +125,7 @@ buildNpmPackage (final: {
     rm -rf bench/node_modules
     npm run build:native
     npm run verify:native:production
+    TREVRPC_GREETER_SERVER="${trevrpcC}/bin/trevrpc_greeter_server" npm run test:native:production
     ! grep -q '@grpc/' package.json
     runHook postCheck
   '';
