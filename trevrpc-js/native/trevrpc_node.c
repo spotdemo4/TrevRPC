@@ -2730,6 +2730,17 @@ static node_receive_item* node_call_take_receive(node_call* call) {
     return item;
 }
 
+static void node_call_detach_waiter(node_call* call, node_receive_waiter* waiter) {
+    if (call == NULL || waiter == NULL || call->waiter_head != waiter) {
+        return;
+    }
+    call->waiter_head = waiter->next;
+    if (call->waiter_tail == waiter) {
+        call->waiter_tail = NULL;
+    }
+    waiter->next = NULL;
+}
+
 static void node_call_reject_waiters(node_call* call, int error_code, const char* operation) {
     node_receive_waiter* waiter = call->waiter_head;
     call->waiter_head = NULL;
@@ -3201,8 +3212,13 @@ static void node_call_process_stream_waiters(node_call* call) {
             if (call->receive_head == NULL && !(call->fin_seen && call->status_seen)) {
                 break;
             }
+            /* The body-batch completion path may submit close, which can synchronously
+             * settle the call and reject every still-linked waiter. Detach this waiter
+             * before entering that path so it cannot be freed underneath us. */
+            node_call_detach_waiter(call, waiter);
             result = node_call_make_body_batch(call, waiter, &value);
         } else if (call->receive_head != NULL) {
+            node_call_detach_waiter(call, waiter);
             if (waiter->max_items <= 1) {
                 node_receive_item* item = node_call_take_receive(call);
                 result = node_call_take_stream_frame(call, item, &value);
@@ -3229,6 +3245,7 @@ static void node_call_process_stream_waiters(node_call* call) {
             if (!call->status_seen) {
                 break;
             }
+            node_call_detach_waiter(call, waiter);
             if (!call->fin_clean) {
                 result = -EPROTO;
             } else {
@@ -3252,10 +3269,6 @@ static void node_call_process_stream_waiters(node_call* call) {
             }
         } else {
             break;
-        }
-        call->waiter_head = waiter->next;
-        if (call->waiter_head == NULL) {
-            call->waiter_tail = NULL;
         }
         if (result == 0) {
             if (!waiter->body_batch && call->fin_seen && call->status_seen && call->receive_head == NULL) {

@@ -205,6 +205,38 @@ if (!available) {
           }
           assert.equal(await bodyStream.recvBodyBatch(), null);
           bodyStream.close();
+
+          // Closing after a body-batch EOF can synchronously reject the active
+          // native receive waiter. Keep the client-stream path exercised across
+          // fresh calls, matching the cross-language benchmark workload.
+          const { clientStreaming } = await import("../src/client.js");
+          const { RawNodeTransport } = await import("../src/node.js");
+          const messageType = {
+            encode(value) {
+              return { finish: () => helloRequest(value.value) };
+            },
+            decode(body) {
+              return body;
+            },
+          };
+          const transport = new RawNodeTransport(client);
+          for (let index = 0; index < 32; index += 1) {
+            const repeatedCall = await clientStreaming(
+              transport,
+              "hello.v1.Greeter",
+              "LotsOfGreetings",
+              messageType,
+              messageType,
+              { streamIdleTimeoutMs: undefined },
+            );
+            await repeatedCall.sendMany([
+              { value: `body-eof-${index}-one` },
+              { value: `body-eof-${index}-two` },
+            ]);
+            const response = await repeatedCall.closeAndRecv();
+            assert.ok(response instanceof Uint8Array);
+            assert.ok(response.byteLength > 0);
+          }
         } finally {
           if (previousTraceFile == null) {
             delete process.env.TREVRPC_NODE_TRACE_FILE;
