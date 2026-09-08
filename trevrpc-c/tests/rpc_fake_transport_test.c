@@ -2987,7 +2987,7 @@ static void run_api_admission_barrier(void) {
     for (attempt = 0; attempt < 5000; ++attempt) {
         trevrpc_rpc_event* probe = NULL;
         int result = trevrpc_rpc_runtime_next_event(runtime, &probe);
-        if (result == -EPIPE) {
+        if (result == -EPIPE || result == -ESHUTDOWN) {
             break;
         }
         assert(result == -EAGAIN);
