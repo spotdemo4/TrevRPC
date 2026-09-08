@@ -552,9 +552,9 @@ int main(void) {
         trevrpc_rpc_receive_release(receive);
         finish_readable(runtime, observed.server_stream);
     }
+    assert(trevrpc_rpc_cancellation_release(runtime, observed.cancellation) == -EBUSY);
     assert(trevrpc_rpc_cancellation_cancel(runtime, observed.cancellation, 14) == 0);
     assert(trevrpc_rpc_cancellation_cancel(runtime, observed.cancellation, 15) == -EALREADY);
-    assert(trevrpc_rpc_cancellation_release(runtime, observed.cancellation) == -EBUSY);
     pump_until(runtime, &wake, &observed, &observed.cancellation_completed);
     pump_until(runtime, &wake, &observed, &observed.client_stream_closed);
     pump_until(runtime, &wake, &observed, &observed.client_call_closed);
