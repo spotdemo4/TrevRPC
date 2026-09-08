@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <assert.h>
 #include <errno.h> // IWYU pragma: keep
+#include <inttypes.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -74,6 +75,37 @@ typedef struct observed_state {
     bool stopped;
 } observed_state;
 
+static void assert_operation_id(const trevrpc_rpc_event_info_v1* info, uint64_t expected) {
+    if (info->operation_id != expected) {
+        fprintf(stderr,
+            "operation ID mismatch: expected=%" PRIu64 " actual=%" PRIu64 " kind=%" PRIu32 " subject_kind=%" PRIu32
+            " status=%" PRId32 " flags=0x%08" PRIx32 " sequence=%" PRIu64 " endpoint={owner=%" PRIu64 ",slot=%" PRIu32
+            ",generation=%" PRIu32 "}"
+            " call={owner=%" PRIu64 ",slot=%" PRIu32 ",generation=%" PRIu32 "}"
+            " stream={owner=%" PRIu64 ",slot=%" PRIu32 ",generation=%" PRIu32 "}"
+            " application_error=%" PRIu64 " provider_error=%" PRIu64 "\n",
+            expected,
+            info->operation_id,
+            info->kind,
+            info->subject_kind,
+            info->status,
+            info->flags,
+            info->sequence,
+            info->endpoint.owner,
+            info->endpoint.slot,
+            info->endpoint.generation,
+            info->call.owner,
+            info->call.slot,
+            info->call.generation,
+            info->stream.owner,
+            info->stream.slot,
+            info->stream.generation,
+            info->application_error_code,
+            info->provider_error_code);
+    }
+    assert(info->operation_id == expected);
+}
+
 static void drain_events(trevrpc_rpc_runtime* runtime, observed_state* observed) {
     for (;;) {
         trevrpc_rpc_event_info_v1 info;
@@ -141,7 +173,7 @@ static void drain_events(trevrpc_rpc_runtime* runtime, observed_state* observed)
         } else if (info.kind == TREVRPC_RPC_EVENT_STREAM_CLOSED && info.stream.owner == observed->client_stream.owner &&
                    info.stream.slot == observed->client_stream.slot &&
                    info.stream.generation == observed->client_stream.generation) {
-            assert(info.operation_id == 0);
+            assert_operation_id(&info, 0);
             if (observed->expect_deadline) {
                 assert(info.status == -ETIMEDOUT);
                 assert(info.rpc_status == TREVRPC_RPC_STATUS_DEADLINE_EXCEEDED);
@@ -151,7 +183,7 @@ static void drain_events(trevrpc_rpc_runtime* runtime, observed_state* observed)
         } else if (info.kind == TREVRPC_RPC_EVENT_CALL_CLOSED && info.call.owner == observed->client_call.owner &&
                    info.call.slot == observed->client_call.slot &&
                    info.call.generation == observed->client_call.generation) {
-            assert(info.operation_id == observed->call_close_operation_id);
+            assert_operation_id(&info, observed->call_close_operation_id);
             if (observed->expect_deadline) {
                 assert(info.status == -ETIMEDOUT);
                 assert(info.rpc_status == TREVRPC_RPC_STATUS_DEADLINE_EXCEEDED);
@@ -161,23 +193,23 @@ static void drain_events(trevrpc_rpc_runtime* runtime, observed_state* observed)
         } else if (info.kind == TREVRPC_RPC_EVENT_STREAM_CLOSED && info.stream.owner == observed->server_stream.owner &&
                    info.stream.slot == observed->server_stream.slot &&
                    info.stream.generation == observed->server_stream.generation) {
-            assert(info.operation_id == 0);
+            assert_operation_id(&info, 0);
             observed->server_stream_closed = true;
         } else if (info.kind == TREVRPC_RPC_EVENT_CALL_CLOSED && info.call.owner == observed->server_call.owner &&
                    info.call.slot == observed->server_call.slot &&
                    info.call.generation == observed->server_call.generation) {
-            assert(info.operation_id == 0);
+            assert_operation_id(&info, 0);
             observed->server_call_closed = true;
         } else if (info.kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED &&
                    info.endpoint.owner == observed->client_endpoint.owner &&
                    info.endpoint.slot == observed->client_endpoint.slot &&
                    info.endpoint.generation == observed->client_endpoint.generation) {
-            assert(info.operation_id == 7);
+            assert_operation_id(&info, 7);
             observed->client_endpoint_closed = true;
         } else if (info.kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED && info.endpoint.owner == observed->listener.owner &&
                    info.endpoint.slot == observed->listener.slot &&
                    info.endpoint.generation == observed->listener.generation) {
-            assert(info.operation_id == 8);
+            assert_operation_id(&info, 8);
             observed->listener_closed = true;
         } else if (info.kind == TREVRPC_RPC_EVENT_CANCELLED && info.operation_id == 14) {
             assert(info.cancellation.owner == observed->cancellation.owner);
@@ -185,7 +217,7 @@ static void drain_events(trevrpc_rpc_runtime* runtime, observed_state* observed)
             assert(info.cancellation.generation == observed->cancellation.generation);
             observed->cancellation_completed = true;
         } else if (info.kind == TREVRPC_RPC_EVENT_STOPPED) {
-            assert(info.operation_id == 10);
+            assert_operation_id(&info, 10);
             observed->stopped = true;
         }
         if (release_event) {

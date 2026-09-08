@@ -4,7 +4,7 @@ import { createSocket } from "node:dgram";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -282,7 +282,10 @@ if (!available) {
               body: helloRequest("conversion-failure"),
               metadata: {},
             });
-            await assert.rejects(conversionFailure.recv(), (error) => error?.nativeCode === -71);
+            await assert.rejects(
+              conversionFailure.recv(),
+              (error) => error instanceof Error && error.nativeCode === -osConstants.errno.EPROTO,
+            );
             conversionFailure.close();
           } finally {
             delete process.env.TREVRPC_NODE_FAIL_BODY_CONVERSION;

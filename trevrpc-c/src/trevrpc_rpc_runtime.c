@@ -2452,16 +2452,35 @@ static void trevrpc_rpc_publish_call_terminals_locked(
     }
 }
 
+static bool trevrpc_rpc_should_defer_stream_terminal_locked(
+    const trevrpc_rpc_call_record* record, const trevrpc_rpc_transport_event_info* info) {
+    bool successful_response_waits_for_fin;
+    if (record->closing) {
+        return false;
+    }
+    if (record->waiting_for_request || record->readable_drained_epoch != record->readable_epoch) {
+        return true;
+    }
+    successful_response_waits_for_fin =
+        info->kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED &&
+        (info->flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLEAN_FIN) != 0 && info->status == 0 &&
+        record->peer_status_received && !record->receive_fin_observed && record->close_operation == NULL &&
+        !record->cancelled && !record->deadline_expired && !record->runtime_close_target;
+    return successful_response_waits_for_fin;
+}
+
 static void trevrpc_rpc_flush_receive_barrier_locked(trevrpc_rpc_runtime* runtime, trevrpc_rpc_call_record* record) {
     trevrpc_rpc_event* receive_fin;
     trevrpc_rpc_transport_event_info terminal_info;
-    bool terminal_valid;
+    bool terminal_valid = record->deferred_stream_terminal_valid;
     if (record->waiting_for_request || record->readable_drained_epoch != record->readable_epoch) {
+        return;
+    }
+    if (terminal_valid && trevrpc_rpc_should_defer_stream_terminal_locked(record, &record->deferred_stream_terminal)) {
         return;
     }
     receive_fin = record->deferred_receive_fin;
     record->deferred_receive_fin = NULL;
-    terminal_valid = record->deferred_stream_terminal_valid;
     terminal_info = record->deferred_stream_terminal;
     record->deferred_stream_terminal_valid = false;
     if (receive_fin != NULL) {
@@ -2959,8 +2978,7 @@ static int trevrpc_rpc_handle_transport_event(
         release_stream = record == NULL;
         if (record != NULL) {
             trevrpc_rpc_complete_call_open_locked(runtime, record, &info, TREVRPC_RPC_EVENT_CALL_FAILED, info.status);
-            if (!record->closing &&
-                (record->waiting_for_request || record->readable_drained_epoch != record->readable_epoch)) {
+            if (trevrpc_rpc_should_defer_stream_terminal_locked(record, &info)) {
                 record->deferred_stream_terminal = info;
                 record->deferred_stream_terminal_valid = true;
             } else {
@@ -3105,13 +3123,7 @@ static int trevrpc_rpc_handle_transport_event(
         record = trevrpc_rpc_find_call_by_transport_locked(runtime, info.subject);
         release_stream = record == NULL;
         if (record != NULL) {
-            bool successful_response_waits_for_fin = !record->closing && info.status == 0 &&
-                                                     record->peer_status_received && !record->receive_fin_observed &&
-                                                     record->close_operation == NULL && !record->cancelled &&
-                                                     !record->deadline_expired && !record->runtime_close_target;
-            if (!record->closing &&
-                (record->waiting_for_request || record->readable_drained_epoch != record->readable_epoch ||
-                    successful_response_waits_for_fin)) {
+            if (trevrpc_rpc_should_defer_stream_terminal_locked(record, &info)) {
                 record->deferred_stream_terminal = info;
                 record->deferred_stream_terminal_valid = true;
             } else {
@@ -4734,6 +4746,7 @@ receive_next:
                 response->body.data,
                 response->body.len,
                 &response->metadata);
+            mark_peer_status = result == 0;
         }
         trevrpc_internal_response_free(response);
     } else {

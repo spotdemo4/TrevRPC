@@ -556,6 +556,75 @@ static void test_listener_close_linearizes_before_terminal_dequeue(void) {
     trevrpc_rpc_transport_destroy(composite);
 }
 
+static void test_connection_close_linearizes_before_terminal_dequeue(void) {
+    fake_transport* source = fake_create();
+    fake_transport* other = fake_create();
+    trevrpc_rpc_transport* composite = NULL;
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+
+    assert(source != NULL && other != NULL);
+    assert(trevrpc_rpc_transport_msquic_adopt(&source->base, &other->base, &config, &composite) == 0);
+    assert(trevrpc_rpc_transport_endpoint_dial(composite, &endpoint_config, 1, &connection) == 0);
+    assert(trevrpc_rpc_transport_connection_close(composite, connection, 0) == 0);
+
+    /* The close call is the admission linearization point.  Do not permit a
+     * new child while the source terminal event is still queued. */
+    assert(trevrpc_rpc_transport_stream_open(composite, connection, 2, &stream) == -ESTALE);
+    assert(atomic_load_explicit(&source->stream_open_calls, memory_order_acquire) == 0);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(composite, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_CLOSED);
+    assert(handle_equal(info.subject, connection));
+    trevrpc_rpc_transport_event_release(composite, event);
+    assert(trevrpc_rpc_transport_release_handle(composite, connection, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION) == 0);
+    trevrpc_rpc_transport_destroy(composite);
+}
+
+static void test_connection_close_failure_restores_admission(void) {
+    fake_transport* source = fake_create();
+    fake_transport* other = fake_create();
+    trevrpc_rpc_transport* composite = NULL;
+    trevrpc_rpc_transport_config config = test_config();
+    trevrpc_rpc_transport_endpoint_config endpoint_config = {0};
+    trevrpc_rpc_transport_handle connection;
+    trevrpc_rpc_transport_handle stream;
+    trevrpc_rpc_transport_event* event = NULL;
+    trevrpc_rpc_transport_event_info info;
+
+    assert(source != NULL && other != NULL);
+    assert(trevrpc_rpc_transport_msquic_adopt(&source->base, &other->base, &config, &composite) == 0);
+    assert(trevrpc_rpc_transport_endpoint_dial(composite, &endpoint_config, 1, &connection) == 0);
+    atomic_store_explicit(&source->connection_close_result, -EIO, memory_order_release);
+    assert(trevrpc_rpc_transport_connection_close(composite, connection, 0) == -EIO);
+
+    assert(trevrpc_rpc_transport_stream_open(composite, connection, 2, &stream) == 0);
+    assert(atomic_load_explicit(&source->stream_open_calls, memory_order_acquire) == 1);
+    assert(fake_push_event(source,
+               TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED,
+               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL,
+               fake_stream_handle,
+               fake_connection_handle) == 0);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(composite, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_STREAM_CLOSED);
+    assert(handle_equal(info.subject, stream));
+    trevrpc_rpc_transport_event_release(composite, event);
+    assert(trevrpc_rpc_transport_release_handle(composite, stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM) == 0);
+    assert(trevrpc_rpc_transport_connection_close(composite, connection, 0) == 0);
+    assert(trevrpc_rpc_transport_next_event(composite, &event) == 0);
+    assert(trevrpc_rpc_transport_event_get_info(composite, event, &info) == 0);
+    assert(info.kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_CLOSED);
+    assert(handle_equal(info.subject, connection));
+    trevrpc_rpc_transport_event_release(composite, event);
+    assert(trevrpc_rpc_transport_release_handle(composite, connection, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION) == 0);
+    trevrpc_rpc_transport_destroy(composite);
+}
+
 static void test_endpoint_admission_rejects_before_child_creation_when_mapping_full(void) {
     fake_transport* source = fake_create();
     fake_transport* other = fake_create();
@@ -690,9 +759,11 @@ static void test_rpc_terminal_releases_restored_composite_receive(void) {
     assert(trevrpc_rpc_stream_release(runtime, stream) == 0);
     assert(fake_release_handle_count(source) == 1);
     assert(trevrpc_rpc_call_release(runtime, call) == 0);
-    assert(trevrpc_rpc_endpoint_close(runtime, endpoint, 4) == 0);
+    assert(trevrpc_rpc_endpoint_close(runtime, endpoint, 7) == 0);
     event = wait_rpc_event(runtime, &wake);
-    assert(rpc_event_info(event).kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED);
+    info = rpc_event_info(event);
+    assert(info.kind == TREVRPC_RPC_EVENT_ENDPOINT_CLOSED);
+    assert(info.operation_id == 7);
     trevrpc_rpc_event_release(event);
     assert(trevrpc_rpc_endpoint_release(runtime, endpoint) == 0);
     assert(trevrpc_rpc_runtime_close(runtime, 5) == 0);
@@ -810,6 +881,8 @@ int main(void) {
     test_parent_registration_rolls_back_on_subject_capacity();
     test_subject_mapping_rolls_back_after_admission_translation_failure();
     test_listener_close_linearizes_before_terminal_dequeue();
+    test_connection_close_linearizes_before_terminal_dequeue();
+    test_connection_close_failure_restores_admission();
     test_endpoint_admission_rejects_before_child_creation_when_mapping_full();
     test_rpc_terminal_releases_restored_composite_receive();
     test_runtime_driver_observes_composite_timeout();

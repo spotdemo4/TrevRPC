@@ -495,6 +495,30 @@ static bool route_snapshot_locked(
     return true;
 }
 
+static bool composite_begin_close_locked(
+    trevrpc_rpc_transport_msquic* c, trevrpc_rpc_transport_handle external, uint32_t kind, composite_route* out) {
+    composite_entry* entry = find_external_locked(c, external);
+    if (entry == NULL || entry->semantic_released || entry->release_refs != 0 || entry->kind != kind ||
+        entry->close_requested || entry->terminal_seen) {
+        return false;
+    }
+    entry->close_requested = true;
+    out->source = entry->source;
+    out->local = entry->local;
+    out->kind = entry->kind;
+    out->terminal_seen = false;
+    return true;
+}
+
+static void composite_rollback_close(trevrpc_rpc_transport_msquic* c, trevrpc_rpc_transport_handle external) {
+    composite_entry* entry;
+    pthread_mutex_lock(&c->mutex);
+    entry = find_external_locked(c, external);
+    if (entry != NULL && !entry->terminal_seen)
+        entry->close_requested = false;
+    pthread_mutex_unlock(&c->mutex);
+}
+
 static bool composite_event_is_object_terminal(const trevrpc_rpc_transport_event_info* info) {
     return info->kind == TREVRPC_RPC_TRANSPORT_EVENT_LISTENER_STOPPED ||
            info->kind == TREVRPC_RPC_TRANSPORT_EVENT_CONNECTION_FAILED ||
@@ -1235,42 +1259,34 @@ static int composite_dial_cancel(trevrpc_rpc_transport* t, trevrpc_rpc_transport
 static int composite_connection_close(trevrpc_rpc_transport* t, trevrpc_rpc_transport_handle h, uint64_t code) {
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
     composite_route route;
-    bool found;
+    int result;
     pthread_mutex_lock(&c->mutex);
-    found = route_snapshot_locked(c, h, &route);
-    pthread_mutex_unlock(&c->mutex);
-    if (!found || route.kind != TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION || route.terminal_seen)
+    if (!composite_begin_close_locked(c, h, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION, &route)) {
+        pthread_mutex_unlock(&c->mutex);
         return -ESTALE;
-    return trevrpc_rpc_transport_connection_close(route.source, route.local, code);
+    }
+    pthread_mutex_unlock(&c->mutex);
+
+    result = trevrpc_rpc_transport_connection_close(route.source, route.local, code);
+    if (result != 0)
+        composite_rollback_close(c, h);
+    return result;
 }
 
 static int composite_listener_close(trevrpc_rpc_transport* t, trevrpc_rpc_transport_handle h) {
     trevrpc_rpc_transport_msquic* c = composite_from_base(t);
     composite_route route;
-    composite_entry* entry;
     int result;
     pthread_mutex_lock(&c->mutex);
-    entry = find_external_locked(c, h);
-    if (entry == NULL || entry->semantic_released || entry->release_refs != 0 ||
-        entry->kind != TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER || entry->close_requested || entry->terminal_seen) {
+    if (!composite_begin_close_locked(c, h, TREVRPC_RPC_TRANSPORT_OBJECT_LISTENER, &route)) {
         pthread_mutex_unlock(&c->mutex);
         return -ESTALE;
     }
-    entry->close_requested = true;
-    route.source = entry->source;
-    route.local = entry->local;
-    route.kind = entry->kind;
-    route.terminal_seen = false;
     pthread_mutex_unlock(&c->mutex);
 
     result = trevrpc_rpc_transport_listener_close(route.source, route.local);
-    if (result != 0) {
-        pthread_mutex_lock(&c->mutex);
-        entry = find_external_locked(c, h);
-        if (entry != NULL && !entry->terminal_seen)
-            entry->close_requested = false;
-        pthread_mutex_unlock(&c->mutex);
-    }
+    if (result != 0)
+        composite_rollback_close(c, h);
     return result;
 }
 

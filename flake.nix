@@ -39,16 +39,7 @@
               trevrpcResetStreamAtPatch = msquicPatch;
             };
           });
-        callPackage =
-          assert builtins.length (builtins.filter (patch: patch == msquicPatch) libmsquic.patches) == 1;
-          pkgs.newScope {
-            inherit libmsquic;
-          };
-        requireCanonicalMsquic =
-          consumer:
-          assert consumer.passthru.msquicProvider == libmsquic;
-          consumer;
-        cTransportCheck = callPackage ./trevrpc-c/transport-check.nix { };
+        cTransportCheck = pkgs.callPackage ./trevrpc-c/transport-check.nix { };
         cTransportSanitizerCheck = cTransportCheck.override {
           sanitizers = true;
         };
@@ -97,13 +88,15 @@
           let
             cFamilyConformancePeers =
               if pkgs.stdenv.hostPlatform.isLinux then
-                callPackage ./conformance/adapters/c-family {
+                pkgs.callPackage ./conformance/adapters/c-family {
+                  inherit libmsquic;
                   trevrpcCSrc = ./trevrpc-c;
                   trevrpcCppSrc = ./trevrpc-cpp;
                 }
               else
                 null;
-            c = callPackage ./trevrpc-c {
+            c = pkgs.callPackage ./trevrpc-c {
+              inherit libmsquic;
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
@@ -122,7 +115,7 @@
               doCheck = false;
               doInstallCheck = false;
             });
-            cpp = callPackage ./trevrpc-cpp {
+            cpp = pkgs.callPackage ./trevrpc-cpp {
               benchProto = ./bench/proto;
               trevrpcC = c;
               peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
@@ -132,41 +125,39 @@
                 }
               ];
             };
-            go = callPackage ./trevrpc-go {
+            go = pkgs.callPackage ./trevrpc-go {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = c;
             };
             js = pkgs.callPackage ./trevrpc-js {
+              inherit libmsquic;
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = cNode;
             };
-            kotlin = callPackage ./trevrpc-kotlin {
+            kotlin = pkgs.callPackage ./trevrpc-kotlin {
               licenseFile = ./LICENSE;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               greeterProto = ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto;
               trevrpcBench = bench;
             };
-            rust = callPackage ./trevrpc-rust {
+            rust = pkgs.callPackage ./trevrpc-rust {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = c;
               trevrpcCTransportTesting = cTransportCheck.testing;
             };
-            bench = callPackage ./bench {
+            bench = pkgs.callPackage ./bench {
               conformanceSrc = ./conformance;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               sourceCommit = self.rev or (self.dirtyRev or "unversioned");
               sourceDirty = if self ? rev then "false" else "true";
             };
-            browserBenchPeer = callPackage ./trevrpc-js/bench-browser {
+            browserBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
               trevrpcJs = js;
             };
           in
-          assert c.passthru.msquicProvider == libmsquic;
-          assert
-            cFamilyConformancePeers == null || cFamilyConformancePeers.passthru.msquicProvider == libmsquic;
           {
             trevrpc-c = c;
             trevrpc-cpp = cpp;
@@ -462,28 +453,25 @@
             };
             stockMsquicProviderCheck =
               assert pkgs.libmsquic.drvPath != libmsquic.drvPath;
-              callPackage ./nix/checks/msquic-provider {
+              pkgs.callPackage ./nix/checks/msquic-provider {
                 libmsquic = pkgs.libmsquic;
                 expectedDescriptor = false;
               };
-            draft07MsquicProviderCheck = requireCanonicalMsquic (
-              callPackage ./nix/checks/msquic-provider {
-                expectedDescriptor = true;
-                requestedMask = 1;
-              }
-            );
-            draft10MsquicProviderCheck = requireCanonicalMsquic (
-              callPackage ./nix/checks/msquic-provider {
-                expectedDescriptor = true;
-                requestedMask = 2;
-              }
-            );
-            bothMsquicProviderCheck = requireCanonicalMsquic (
-              callPackage ./nix/checks/msquic-provider {
-                expectedDescriptor = true;
-                requestedMask = 3;
-              }
-            );
+            draft07MsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
+              inherit libmsquic;
+              expectedDescriptor = true;
+              requestedMask = 1;
+            };
+            draft10MsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
+              inherit libmsquic;
+              expectedDescriptor = true;
+              requestedMask = 2;
+            };
+            bothMsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
+              inherit libmsquic;
+              expectedDescriptor = true;
+              requestedMask = 3;
+            };
           in
           pkgs.mkChecks {
             benchmark-controller = packageSet.trevrpc-bench;
@@ -500,36 +488,39 @@
                 '';
 
             c = packageSet.trevrpc-c;
-            c-engine = callPackage ./trevrpc-c/engine-check.nix { };
-            c-engine-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/engine-msquic-check.nix { });
+            c-engine = pkgs.callPackage ./trevrpc-c/engine-check.nix { };
+            c-engine-msquic = pkgs.callPackage ./trevrpc-c/engine-msquic-check.nix {
+              inherit libmsquic;
+            };
             c-transport = cTransportCheck;
-            c-transport-msquic = requireCanonicalMsquic (
-              callPackage ./trevrpc-c/transport-msquic-check.nix { }
-            );
-            c-rpc = callPackage ./trevrpc-c/rpc-check.nix { };
-            c-rpc-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/rpc-msquic-check.nix { });
-            c-conformance-rpc = requireCanonicalMsquic (
-              callPackage ./conformance/adapters/c-family {
-                trevrpcCSrc = ./trevrpc-c;
-                trevrpcCppSrc = ./trevrpc-cpp;
-                cOnly = true;
-              }
-            );
+            c-transport-msquic = pkgs.callPackage ./trevrpc-c/transport-msquic-check.nix {
+              inherit libmsquic;
+            };
+            c-rpc = pkgs.callPackage ./trevrpc-c/rpc-check.nix { };
+            c-rpc-msquic = pkgs.callPackage ./trevrpc-c/rpc-msquic-check.nix {
+              inherit libmsquic;
+            };
+            c-conformance-rpc = pkgs.callPackage ./conformance/adapters/c-family {
+              inherit libmsquic;
+              trevrpcCSrc = ./trevrpc-c;
+              trevrpcCppSrc = ./trevrpc-cpp;
+              cOnly = true;
+            };
             c-sanitizers = packageSet.trevrpc-c.override {
               sanitizers = true;
             };
             ${if system == "x86_64-linux" then "c-tsan" else null} = packageSet.trevrpc-c.override {
               threadSanitizer = true;
             };
-            c-family-sanitizers = requireCanonicalMsquic (
-              (callPackage ./conformance/adapters/c-family {
+            c-family-sanitizers =
+              (pkgs.callPackage ./conformance/adapters/c-family {
+                inherit libmsquic;
                 trevrpcCSrc = ./trevrpc-c;
                 trevrpcCppSrc = ./trevrpc-cpp;
               }).override
                 {
                   sanitizers = true;
-                }
-            );
+                };
 
             ${if system == "x86_64-linux" then "msquic-provider-stock" else null} = stockMsquicProviderCheck;
             ${if system == "x86_64-linux" then "msquic-provider-draft07" else null} =

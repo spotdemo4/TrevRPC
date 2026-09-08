@@ -2685,6 +2685,7 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
     bool release_stream_budget_later = false;
     bool promote_peer_queue = false;
     bool close_parent = false;
+    uint32_t terminal_flags;
     trevrpc_engine_reservation* terminal;
     trevrpc_engine_reservation* unused_ready;
     trevrpc_engine_reservation* unused_receive_fin;
@@ -2730,6 +2731,10 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
         return;
     }
     stream->base.terminal_deferred = false;
+    terminal_flags = stream->base.event_flags | TREVRPC_ENGINE_EVENT_FLAG_TERMINAL;
+    if (!failed && stream->receive_fin_published) {
+        terminal_flags |= TREVRPC_ENGINE_EVENT_FLAG_CLEAN_FIN;
+    }
     terminal = stream->base.terminal_reservation;
     stream->base.terminal_reservation = NULL;
     unused_ready = stream->base.ready_reservation;
@@ -2769,7 +2774,7 @@ static void publish_stream_terminal(adapter_stream* stream, bool failed, int sta
     (void)publish_reserved_event(adapter,
         terminal,
         failed ? TREVRPC_ENGINE_EVENT_STREAM_FAILED : TREVRPC_ENGINE_EVENT_STREAM_CLOSED,
-        stream->base.event_flags | TREVRPC_ENGINE_EVENT_FLAG_TERMINAL,
+        terminal_flags,
         status,
         TREVRPC_ENGINE_OBJECT_STREAM,
         stream->base.token,
