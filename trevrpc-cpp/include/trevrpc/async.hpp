@@ -482,12 +482,10 @@ using AsyncBidirectionalBytesHandler =
     std::function<Task<Status>(CallContext, std::shared_ptr<OperationState>)>;
 
 struct AsyncRegistrationAccess {
-  [[nodiscard]] static Result<void>
-  register_rpc_route(Server& server, std::string_view service, std::string_view method,
-                     std::uint32_t kind,
-                     std::function<void(std::shared_ptr<detail::ServerCallState>)> callback,
-                     const std::shared_ptr<void>& route,
-                     const std::shared_ptr<AsyncServerScopeControl>& scope);
+  [[nodiscard]] static Result<void> register_rpc_route(
+      Server& server, std::string_view service, std::string_view method, std::uint32_t kind,
+      std::function<void(std::shared_ptr<detail::ServerCallState>)> callback,
+      const std::shared_ptr<void>& route, const std::shared_ptr<AsyncServerScopeControl>& scope);
 };
 
 [[nodiscard]] Result<void> register_async_unary_bytes(Server& server, std::string_view service,

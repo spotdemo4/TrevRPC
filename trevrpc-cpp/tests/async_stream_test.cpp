@@ -18,9 +18,8 @@ using namespace std::chrono_literals;
 
 class FakeNativeOps final : public trevrpc::detail::NativeOps {
 public:
-  trevrpc::Result<void>
-  start_send(std::span<const std::byte> body,
-             trevrpc::detail::NativeCompletion completion) noexcept override {
+  trevrpc::Result<void> start_send(std::span<const std::byte> body,
+                                   trevrpc::detail::NativeCompletion completion) noexcept override {
     std::lock_guard lock(mutex_);
     sends_.emplace_back(body.begin(), body.end());
     send_entered_ = true;
@@ -56,8 +55,8 @@ public:
     return {};
   }
 
-  trevrpc::Result<void>
-  schedule_at(trevrpc::Deadline deadline, trevrpc::Work work) noexcept override {
+  trevrpc::Result<void> schedule_at(trevrpc::Deadline deadline,
+                                    trevrpc::Work work) noexcept override {
     if (!work) {
       return trevrpc::Error::runtime(-EINVAL);
     }
@@ -150,9 +149,7 @@ public:
 
   [[nodiscard]] bool wait_for_close_calls(int expected) {
     std::unique_lock lock(mutex_);
-    return condition_.wait_for(lock, 2s, [this, expected] {
-      return close_calls_ >= expected;
-    });
+    return condition_.wait_for(lock, 2s, [this, expected] { return close_calls_ >= expected; });
   }
 
   [[nodiscard]] int close_calls() const noexcept {
@@ -160,9 +157,7 @@ public:
     return close_calls_;
   }
 
-  [[nodiscard]] int receive_subscriptions() const noexcept {
-    return receive_subscriptions_.load();
-  }
+  [[nodiscard]] int receive_subscriptions() const noexcept { return receive_subscriptions_.load(); }
 
   [[nodiscard]] bool send_entered() noexcept {
     std::lock_guard lock(mutex_);
@@ -312,8 +307,7 @@ int main() {
   assert(native->closed());
 
   auto close_native = std::make_shared<FakeNativeOps>();
-  auto close_operation =
-      trevrpc::detail::OperationState::create(runtime, close_native, {});
+  auto close_operation = trevrpc::detail::OperationState::create(runtime, close_native, {});
   assert(close_operation);
 
   bool close_send_done = false;
@@ -400,8 +394,8 @@ int main() {
   auto terminal_native = std::make_shared<FakeNativeOps>();
   terminal_native->set_receive(trevrpc::detail::StreamFrame{
       true, false, trevrpc::Status(trevrpc::StatusCode::PermissionDenied, "terminal"), {}});
-  auto terminal_operation = trevrpc::detail::OperationState::create(
-      runtime, terminal_native, {}, {}, {}, 0, true);
+  auto terminal_operation =
+      trevrpc::detail::OperationState::create(runtime, terminal_native, {}, {}, {}, 0, true);
   assert(terminal_operation);
   bool terminal_send_done = false;
   int terminal_send_error = 0;
@@ -501,8 +495,7 @@ int main() {
   assert(event_receive_native->closed());
 
   auto stop_native = std::make_shared<FakeNativeOps>();
-  auto stop_operation =
-      trevrpc::detail::OperationState::create(runtime, stop_native, {});
+  auto stop_operation = trevrpc::detail::OperationState::create(runtime, stop_native, {});
   assert(stop_operation);
   bool stop_send_done = false;
   auto stop_sender = trevrpc::spawn(stop_operation->send(

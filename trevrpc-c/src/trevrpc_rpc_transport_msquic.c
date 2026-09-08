@@ -420,13 +420,11 @@ static void composite_discard_entry_locked(trevrpc_rpc_transport_msquic* c, uint
     composite_release_parent_locked(c, &snapshot);
 }
 
-static void composite_close_release_native_child(
-    trevrpc_rpc_transport_msquic* c, trevrpc_rpc_transport_handle local) {
+static void composite_close_release_native_child(trevrpc_rpc_transport_msquic* c, trevrpc_rpc_transport_handle local) {
     if (handle_zero(local))
         return;
     (void)trevrpc_rpc_transport_connection_close(c->native_transport, local, 0);
-    (void)trevrpc_rpc_transport_release_handle(
-        c->native_transport, local, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
+    (void)trevrpc_rpc_transport_release_handle(c->native_transport, local, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION);
 }
 
 static void composite_rollback_shared_children(
@@ -442,8 +440,8 @@ static void composite_rollback_shared_children(
         for (index = 0; index < c->entry_capacity; ++index) {
             composite_entry* candidate = &c->entries[index];
             if (candidate->occupied && !candidate->semantic_released && candidate->source == c->native_transport &&
-                candidate->kind == TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION &&
-                candidate->parent_slot == parent_slot && candidate->parent_generation == parent_generation) {
+                candidate->kind == TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION && candidate->parent_slot == parent_slot &&
+                candidate->parent_generation == parent_generation) {
                 found = true;
                 child_slot = (uint32_t)index + 1u;
                 child_generation = candidate->generation;
@@ -1675,8 +1673,7 @@ int trevrpc_rpc_transport_msquic_test_event_refs(
     return 0;
 }
 
-int trevrpc_rpc_transport_msquic_test_rollback_shared_listener(
-    trevrpc_rpc_transport* transport,
+int trevrpc_rpc_transport_msquic_test_rollback_shared_listener(trevrpc_rpc_transport* transport,
     trevrpc_rpc_transport_handle listener,
     trevrpc_rpc_transport_handle local_child,
     trevrpc_rpc_transport_handle* out_child) {
@@ -1694,12 +1691,8 @@ int trevrpc_rpc_transport_msquic_test_rollback_shared_listener(
     }
     parent_slot = (uint32_t)(parent - c->entries) + 1u;
     parent_generation = parent->generation;
-    child = register_locked(c,
-        c->native_transport,
-        local_child,
-        TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION,
-        parent,
-        &child_slot);
+    child = register_locked(
+        c, c->native_transport, local_child, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION, parent, &child_slot);
     if (child == NULL) {
         pthread_mutex_unlock(&c->mutex);
         return -EAGAIN;

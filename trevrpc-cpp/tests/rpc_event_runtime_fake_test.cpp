@@ -875,7 +875,8 @@ void test_client_receive_returns_terminal_before_cleanup_retry() {
   auto test = make_runtime();
   auto channel = make_client_channel(test);
   auto stream = open_client_stream(test, channel);
-  trevrpc_cpp_rpc_fake_set_call_release_result(test.fake, test.runtime->native_handle(), -EIO, false);
+  trevrpc_cpp_rpc_fake_set_call_release_result(test.fake, test.runtime->native_handle(), -EIO,
+                                               false);
   assert(trevrpc_cpp_rpc_fake_push_response_status(test.fake, TREVRPC_RPC_STATUS_OK) == 0);
   assert(trevrpc_cpp_rpc_fake_push_stream_readable(test.fake) == 0);
   assert(trevrpc_cpp_rpc_fake_push_stream_receive_fin(test.fake) == 0);
@@ -2295,8 +2296,7 @@ void test_rejected_incoming_cleanup_failure_abandons_runtime() {
   auto rejected = test.runtime->reject_incoming(incoming.value());
   assert(!rejected);
   assert(rejected.error().code() == -ENOBUFS);
-  for (unsigned int attempt = 0;
-       attempt != 2000 && test.runtime->native_handle() != nullptr;
+  for (unsigned int attempt = 0; attempt != 2000 && test.runtime->native_handle() != nullptr;
        ++attempt) {
     std::this_thread::yield();
   }
@@ -2315,7 +2315,9 @@ void test_server_call_allocation_failure_rejects_native_handles() {
   std::atomic_bool handler_called{false};
   assert(server->register_route(
       "fake.Service", "AllocationFailure", TREVRPC_RPC_KIND_UNARY,
-      [&](std::shared_ptr<ServerCallState>) { handler_called.store(true, std::memory_order_release); },
+      [&](std::shared_ptr<ServerCallState>) {
+        handler_called.store(true, std::memory_order_release);
+      },
       lifetime));
   assert(server->start());
 
@@ -2323,9 +2325,8 @@ void test_server_call_allocation_failure_rejects_native_handles() {
   ServerCallStateTestPeer::fail_next_rpc_allocation();
   assert(trevrpc_cpp_rpc_fake_push_incoming(test.fake, "fake.Service", "AllocationFailure",
                                             TREVRPC_RPC_KIND_UNARY, nullptr, 0) == 0);
-  for (unsigned int attempt = 0;
-       attempt != 2000 &&
-       trevrpc_cpp_rpc_fake_release_handle_count(test.fake) < releases_before + 1;
+  for (unsigned int attempt = 0; attempt != 2000 && trevrpc_cpp_rpc_fake_release_handle_count(
+                                                        test.fake) < releases_before + 1;
        ++attempt) {
     std::this_thread::yield();
   }

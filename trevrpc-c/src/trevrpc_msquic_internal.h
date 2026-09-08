@@ -206,10 +206,8 @@ void trevrpc_msquic_finalizer_drain(void);
 int trevrpc_msquic_finalizer_scope_init(trevrpc_msquic_finalizer_scope* scope);
 void trevrpc_msquic_finalizer_scope_drain(trevrpc_msquic_finalizer_scope* scope);
 void trevrpc_msquic_finalizer_scope_destroy(trevrpc_msquic_finalizer_scope* scope);
-void trevrpc_msquic_stream_set_finalizer_scope(
-    trevrpc_msquic_stream* stream, trevrpc_msquic_finalizer_scope* scope);
-void trevrpc_msquic_conn_set_finalizer_scope(
-    trevrpc_msquic_conn* conn, trevrpc_msquic_finalizer_scope* scope);
+void trevrpc_msquic_stream_set_finalizer_scope(trevrpc_msquic_stream* stream, trevrpc_msquic_finalizer_scope* scope);
+void trevrpc_msquic_conn_set_finalizer_scope(trevrpc_msquic_conn* conn, trevrpc_msquic_finalizer_scope* scope);
 void trevrpc_msquic_listener_set_finalizer_scope(
     trevrpc_msquic_listener* listener, trevrpc_msquic_finalizer_scope* scope);
 intptr_t trevrpc_msquic_stream_read_protocol(trevrpc_msquic_stream* stream, uint8_t* data, size_t len);

@@ -16,17 +16,19 @@ class RpcStreamHarness final {
 public:
   RpcStreamHarness();
   ~RpcStreamHarness();
-  RpcStreamHarness(const RpcStreamHarness&) = delete;
-  RpcStreamHarness& operator=(const RpcStreamHarness&) = delete;
+  RpcStreamHarness(const RpcStreamHarness &) = delete;
+  RpcStreamHarness &operator=(const RpcStreamHarness &) = delete;
 
-  [[nodiscard]] trevrpc::Result<trevrpc::detail::ClientStream> start(std::uint32_t kind);
+  [[nodiscard]] trevrpc::Result<trevrpc::detail::ClientStream>
+  start(std::uint32_t kind);
   [[nodiscard]] int push_frame(std::span<const std::uint8_t> frame);
   [[nodiscard]] int finish_response();
   [[nodiscard]] int fail_receive(int error);
-  [[nodiscard]] bool
-  wait_terminal_status_seen(std::chrono::milliseconds timeout = std::chrono::seconds(1)) const;
+  [[nodiscard]] bool wait_terminal_status_seen(
+      std::chrono::milliseconds timeout = std::chrono::seconds(1)) const;
   [[nodiscard]] bool terminal_status_seen() const noexcept;
-  [[nodiscard]] trevrpc_wire_diagnostic_reason receive_diagnostic() const noexcept;
+  [[nodiscard]] trevrpc_wire_diagnostic_reason
+  receive_diagnostic() const noexcept;
   [[nodiscard]] std::size_t close_count() const noexcept;
   void shutdown() noexcept;
 

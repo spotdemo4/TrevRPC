@@ -54,7 +54,7 @@ int trevrpc_cpp_rpc_fake_push_stream_ready(trevrpc_cpp_rpc_fake_fixture* fixture
 int trevrpc_cpp_rpc_fake_push_stream_readable(trevrpc_cpp_rpc_fake_fixture* fixture);
 int trevrpc_cpp_rpc_fake_push_last_send_complete(trevrpc_cpp_rpc_fake_fixture* fixture);
 int trevrpc_cpp_rpc_fake_push_last_server_send_complete(trevrpc_cpp_rpc_fake_fixture* fixture,
-                                                       bool second_stream);
+                                                        bool second_stream);
 int trevrpc_cpp_rpc_fake_push_receive(trevrpc_cpp_rpc_fake_fixture* fixture, const uint8_t* data,
                                       size_t data_len);
 int trevrpc_cpp_rpc_fake_push_response_message(trevrpc_cpp_rpc_fake_fixture* fixture,

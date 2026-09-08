@@ -502,12 +502,12 @@ static uint64_t trevrpc_rpc_idle_deadline(uint64_t timeout_nanos) {
 static uint64_t trevrpc_rpc_next_deadline(const trevrpc_rpc_call_record* record, uint32_t* out_kind) {
     uint64_t earliest = TREVRPC_RPC_DEADLINE_INFINITE;
     uint32_t kind = TREVRPC_RPC_TIMER_NONE;
-#define TREVRPC_RPC_PICK_NEXT(value, timer_kind) \
-    do { \
-        if ((value) != 0 && (value) < earliest) { \
-            earliest = (value); \
-            kind = (timer_kind); \
-        } \
+#define TREVRPC_RPC_PICK_NEXT(value, timer_kind)                                                                       \
+    do {                                                                                                               \
+        if ((value) != 0 && (value) < earliest) {                                                                      \
+            earliest = (value);                                                                                        \
+            kind = (timer_kind);                                                                                       \
+        }                                                                                                              \
     } while (0)
     TREVRPC_RPC_PICK_NEXT(record->deadline_nanos, TREVRPC_RPC_TIMER_CALL);
     TREVRPC_RPC_PICK_NEXT(record->initial_request_deadline_nanos, TREVRPC_RPC_TIMER_INITIAL);
@@ -589,7 +589,7 @@ static int trevrpc_rpc_deadline_refresh_locked(trevrpc_rpc_runtime* runtime, tre
         return -EINVAL;
     }
     deadline = record->closing || record->call_terminal_committed ? TREVRPC_RPC_DEADLINE_INFINITE
-                                                                    : trevrpc_rpc_next_deadline(record, &kind);
+                                                                  : trevrpc_rpc_next_deadline(record, &kind);
     if (deadline == TREVRPC_RPC_DEADLINE_INFINITE) {
         trevrpc_rpc_deadline_remove_locked(runtime, record);
         return 0;
@@ -821,8 +821,8 @@ static void* trevrpc_rpc_registry_find(const trevrpc_rpc_registry* registry, con
     return NULL;
 }
 
-static int trevrpc_rpc_registry_insert(trevrpc_rpc_registry* registry,
-    const uint64_t* key, uint8_t count, void* value) {
+static int trevrpc_rpc_registry_insert(
+    trevrpc_rpc_registry* registry, const uint64_t* key, uint8_t count, void* value) {
     uint64_t hash;
     size_t position;
     size_t first_tombstone = SIZE_MAX;
@@ -1463,16 +1463,15 @@ static int trevrpc_rpc_operation_rekey_transport_locked(
     uint64_t old_key[6];
     uint64_t new_key[6];
     uint8_t key_count;
-    trevrpc_rpc_handle_key(old_key, &key_count, operation->subject_owner, operation->subject_slot,
-        operation->subject_generation);
+    trevrpc_rpc_handle_key(
+        old_key, &key_count, operation->subject_owner, operation->subject_slot, operation->subject_generation);
     old_key[3] = operation->subject_kind;
     old_key[4] = operation->transport_operation_id;
-    trevrpc_rpc_handle_key(new_key, &key_count, operation->subject_owner, operation->subject_slot,
-        operation->subject_generation);
+    trevrpc_rpc_handle_key(
+        new_key, &key_count, operation->subject_owner, operation->subject_slot, operation->subject_generation);
     new_key[3] = operation->subject_kind;
     new_key[4] = transport_operation_id;
-    int result =
-        trevrpc_rpc_registry_rekey(&runtime->operation_transport_registry, old_key, new_key, 5, operation);
+    int result = trevrpc_rpc_registry_rekey(&runtime->operation_transport_registry, old_key, new_key, 5, operation);
     if (result == 0) {
         operation->transport_operation_id = transport_operation_id;
     }
@@ -1491,8 +1490,8 @@ static void trevrpc_rpc_operation_remove_locked(
     {
         uint64_t key[6];
         uint8_t count;
-        trevrpc_rpc_handle_key(key, &count, operation->subject_owner, operation->subject_slot,
-            operation->subject_generation);
+        trevrpc_rpc_handle_key(
+            key, &count, operation->subject_owner, operation->subject_slot, operation->subject_generation);
         key[3] = operation->subject_kind;
         key[4] = operation->transport_operation_id;
         (void)trevrpc_rpc_registry_remove(&runtime->operation_transport_registry, key, 5);
@@ -1820,8 +1819,11 @@ static void trevrpc_rpc_call_record_destroy_locked(trevrpc_rpc_runtime* runtime,
         uint8_t count;
         trevrpc_rpc_handle_key(key, &count, record->call.owner, record->call.slot, record->call.generation);
         (void)trevrpc_rpc_registry_remove(&runtime->call_registry, key, count);
-        trevrpc_rpc_transport_key(
-        key, &count, record->transport_stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, TREVRPC_RPC_TRANSPORT_ROLE_CALL);
+        trevrpc_rpc_transport_key(key,
+            &count,
+            record->transport_stream,
+            TREVRPC_RPC_TRANSPORT_OBJECT_STREAM,
+            TREVRPC_RPC_TRANSPORT_ROLE_CALL);
         (void)trevrpc_rpc_registry_remove_value(&runtime->transport_registry, key, count, record);
     }
     trevrpc_rpc_drop_pending_receive_locked(runtime, record);
@@ -1895,8 +1897,8 @@ static int trevrpc_rpc_insert_call_locked(trevrpc_rpc_runtime* runtime, trevrpc_
         key, &count, record->transport_stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, TREVRPC_RPC_TRANSPORT_ROLE_CALL);
     result = trevrpc_rpc_registry_insert_alias(&runtime->transport_registry, key, count, record);
     if (result != 0) {
-        (void)trevrpc_rpc_registry_remove(&runtime->call_registry, (uint64_t[3]){record->call.owner, record->call.slot,
-            record->call.generation}, 3);
+        (void)trevrpc_rpc_registry_remove(
+            &runtime->call_registry, (uint64_t[3]){record->call.owner, record->call.slot, record->call.generation}, 3);
         return result;
     }
     record->next = runtime->calls;
@@ -1907,12 +1909,16 @@ static int trevrpc_rpc_insert_call_locked(trevrpc_rpc_runtime* runtime, trevrpc_
     result = trevrpc_rpc_deadline_refresh_locked(runtime, record);
     if (result != 0) {
         trevrpc_rpc_call_record** cursor = &runtime->calls;
-        while (*cursor != record) cursor = &(*cursor)->next;
+        while (*cursor != record)
+            cursor = &(*cursor)->next;
         *cursor = record->next;
-        (void)trevrpc_rpc_registry_remove(&runtime->call_registry,
-            (uint64_t[3]){record->call.owner, record->call.slot, record->call.generation}, 3);
-        trevrpc_rpc_transport_key(
-        key, &count, record->transport_stream, TREVRPC_RPC_TRANSPORT_OBJECT_STREAM, TREVRPC_RPC_TRANSPORT_ROLE_CALL);
+        (void)trevrpc_rpc_registry_remove(
+            &runtime->call_registry, (uint64_t[3]){record->call.owner, record->call.slot, record->call.generation}, 3);
+        trevrpc_rpc_transport_key(key,
+            &count,
+            record->transport_stream,
+            TREVRPC_RPC_TRANSPORT_OBJECT_STREAM,
+            TREVRPC_RPC_TRANSPORT_ROLE_CALL);
         (void)trevrpc_rpc_registry_remove_value(&runtime->transport_registry, key, count, record);
         --runtime->live_calls;
         --runtime->live_streams;
@@ -2864,7 +2870,8 @@ static int trevrpc_rpc_handle_transport_event(
                         info.subject,
                         TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION,
                         TREVRPC_RPC_TRANSPORT_ROLE_CONNECTION);
-                    if (trevrpc_rpc_registry_insert_alias(&runtime->transport_registry, key, key_count, connection) == 0) {
+                    if (trevrpc_rpc_registry_insert_alias(&runtime->transport_registry, key, key_count, connection) ==
+                        0) {
                         connection->next = runtime->transport_connections;
                         runtime->transport_connections = connection;
                     } else {
@@ -3096,11 +3103,9 @@ static int trevrpc_rpc_handle_transport_event(
         release_stream = record == NULL;
         if (record != NULL) {
             bool successful_response_waits_for_fin = !record->closing && info.status == 0 &&
-                                                     record->peer_status_received &&
-                                                     !record->receive_fin_observed &&
-                                                     record->close_operation == NULL &&
-                                                     !record->cancelled && !record->deadline_expired &&
-                                                     !record->runtime_close_target;
+                                                     record->peer_status_received && !record->receive_fin_observed &&
+                                                     record->close_operation == NULL && !record->cancelled &&
+                                                     !record->deadline_expired && !record->runtime_close_target;
             if (!record->closing &&
                 (record->waiting_for_request || record->readable_drained_epoch != record->readable_epoch ||
                     successful_response_waits_for_fin)) {
@@ -3485,11 +3490,16 @@ int trevrpc_rpc_runtime_adopt_transport_v1(
         return -ENOMEM;
     }
     result = trevrpc_rpc_registry_init(&runtime->call_registry);
-    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->endpoint_registry);
-    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->transport_registry);
-    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->cancellation_registry);
-    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->operation_transport_registry);
-    if (result == 0) result = trevrpc_rpc_registry_init(&runtime->operation_scope_registry);
+    if (result == 0)
+        result = trevrpc_rpc_registry_init(&runtime->endpoint_registry);
+    if (result == 0)
+        result = trevrpc_rpc_registry_init(&runtime->transport_registry);
+    if (result == 0)
+        result = trevrpc_rpc_registry_init(&runtime->cancellation_registry);
+    if (result == 0)
+        result = trevrpc_rpc_registry_init(&runtime->operation_transport_registry);
+    if (result == 0)
+        result = trevrpc_rpc_registry_init(&runtime->operation_scope_registry);
     if (result != 0) {
         trevrpc_rpc_registry_destroy(&runtime->call_registry);
         trevrpc_rpc_registry_destroy(&runtime->endpoint_registry);
@@ -3734,9 +3744,8 @@ static int trevrpc_rpc_runtime_next_event_impl(trevrpc_rpc_runtime* runtime, tre
         }
     }
     trevrpc_rpc_note_terminal_dequeue_locked(runtime, event);
-    const uint32_t malformed_kind = event->kind == TREVRPC_RPC_EVENT_CALL_INCOMING
-                                         ? runtime->test_malformed_incoming_kind
-                                         : 0;
+    const uint32_t malformed_kind =
+        event->kind == TREVRPC_RPC_EVENT_CALL_INCOMING ? runtime->test_malformed_incoming_kind : 0;
     if (malformed_kind != 0) {
         runtime->test_malformed_incoming_kind = 0;
     }
@@ -4049,15 +4058,16 @@ static int trevrpc_rpc_runtime_start_transport_endpoint_v1_impl(trevrpc_rpc_runt
         uint8_t key_count;
         record->transport_endpoint = transport_endpoint;
         record->transport_kind = transport_kind;
-        trevrpc_rpc_handle_key(key, &key_count, record->endpoint.owner, record->endpoint.slot, record->endpoint.generation);
+        trevrpc_rpc_handle_key(
+            key, &key_count, record->endpoint.owner, record->endpoint.slot, record->endpoint.generation);
         result = trevrpc_rpc_registry_insert(&runtime->endpoint_registry, key, key_count, record);
         if (result == 0) {
             trevrpc_rpc_transport_key(
                 key, &key_count, transport_endpoint, transport_kind, TREVRPC_RPC_TRANSPORT_ROLE_ENDPOINT);
             result = trevrpc_rpc_registry_insert_alias(&runtime->transport_registry, key, key_count, record);
             if (result != 0) {
-                trevrpc_rpc_handle_key(key, &key_count, record->endpoint.owner, record->endpoint.slot,
-                    record->endpoint.generation);
+                trevrpc_rpc_handle_key(
+                    key, &key_count, record->endpoint.owner, record->endpoint.slot, record->endpoint.generation);
                 (void)trevrpc_rpc_registry_remove(&runtime->endpoint_registry, key, key_count);
             }
         }
@@ -5546,8 +5556,8 @@ static int trevrpc_rpc_cancellation_create_impl(
         uint64_t key[6];
         uint8_t count;
         int result;
-        trevrpc_rpc_handle_key(key, &count, record->cancellation.owner, record->cancellation.slot,
-            record->cancellation.generation);
+        trevrpc_rpc_handle_key(
+            key, &count, record->cancellation.owner, record->cancellation.slot, record->cancellation.generation);
         result = trevrpc_rpc_registry_insert(&runtime->cancellation_registry, key, count, record);
         if (result != 0) {
             pthread_mutex_unlock(&runtime->mutex);

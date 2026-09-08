@@ -546,8 +546,7 @@ static int drain_events(server_state* state) {
                 call->call_closed = true;
                 release_call(state, call);
             }
-        } else if ((info.flags & TREVRPC_RPC_EVENT_FLAG_FATAL) != 0 ||
-                   info.kind == TREVRPC_RPC_EVENT_ENDPOINT_FAILED) {
+        } else if ((info.flags & TREVRPC_RPC_EVENT_FLAG_FATAL) != 0 || info.kind == TREVRPC_RPC_EVENT_ENDPOINT_FAILED) {
             set_error(state, info.status != 0 ? info.status : -ECONNABORTED);
         } else if (info.kind == TREVRPC_RPC_EVENT_STOPPED) {
             state->runtime_stopped = true;

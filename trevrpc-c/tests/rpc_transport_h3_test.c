@@ -350,10 +350,7 @@ static size_t h3_expected_data_frame(uint8_t* output, size_t capacity, const uin
     assert(trevrpc_quic_varint_size(TREV_H3_FRAME_DATA, &type_len) == 0);
     assert(trevrpc_quic_varint_size(body_len + 4, &length_len) == 0);
     assert(trevrpc_quic_varint_write(output, capacity, TREV_H3_FRAME_DATA, &type_len) == 0);
-    assert(trevrpc_quic_varint_write(output + type_len,
-               capacity - type_len,
-               body_len + 4,
-               &length_len) == 0);
+    assert(trevrpc_quic_varint_write(output + type_len, capacity - type_len, body_len + 4, &length_len) == 0);
     output[type_len + length_len] = (uint8_t)(body_len >> 24);
     output[type_len + length_len + 1] = (uint8_t)(body_len >> 16);
     output[type_len + length_len + 2] = (uint8_t)(body_len >> 8);
@@ -2197,21 +2194,20 @@ static void test_shared_listener_rollback_closes_and_releases_child(void) {
     trevrpc_rpc_transport_config config = test_config();
 
     assert(trevrpc_rpc_transport_h3_create(&config, &h3) == 0);
-    assert(trevrpc_rpc_transport_h3_test_make_server_connection(
-               h3, &local_listener, &ignored_connection) == 0);
+    assert(trevrpc_rpc_transport_h3_test_make_server_connection(h3, &local_listener, &ignored_connection) == 0);
     assert(trevrpc_rpc_transport_msquic_adopt(&native.base, h3, &config, &composite) == 0);
 
-    assert(trevrpc_rpc_transport_h3_test_emit(
-               h3, TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC, 0, 0, local_listener, (trevrpc_rpc_transport_handle){0}, 0) ==
-           0);
+    assert(
+        trevrpc_rpc_transport_h3_test_emit(
+            h3, TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC, 0, 0, local_listener, (trevrpc_rpc_transport_handle){0}, 0) ==
+        0);
     public_listener = next_subject(composite, TREVRPC_RPC_TRANSPORT_EVENT_DIAGNOSTIC);
     assert(trevrpc_rpc_transport_msquic_test_rollback_shared_listener(
                composite, public_listener, local_child, &public_child) == 0);
     assert(public_child.owner != 0 && public_child.slot != 0 && public_child.generation != 0);
     assert(native.close_calls == 1);
     assert(native.release_calls == 1);
-    assert(trevrpc_rpc_transport_release_handle(
-               composite, public_child, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION) == 0);
+    assert(trevrpc_rpc_transport_release_handle(composite, public_child, TREVRPC_RPC_TRANSPORT_OBJECT_CONNECTION) == 0);
     assert(trevrpc_rpc_transport_endpoint_get_port(composite, public_listener, &(uint16_t){0}) == -ESTALE);
     trevrpc_rpc_transport_destroy(composite);
 }

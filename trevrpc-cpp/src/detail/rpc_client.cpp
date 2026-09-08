@@ -109,14 +109,12 @@ void abandon_cleanup_owner(const std::shared_ptr<RpcClientStream>& stream) noexc
 
 class AsyncClientOpen final : public std::enable_shared_from_this<AsyncClientOpen> {
 public:
-  AsyncClientOpen(std::shared_ptr<RpcEventRuntime> runtime,
-                  std::shared_ptr<RpcClientStream> owner,
+  AsyncClientOpen(std::shared_ptr<RpcEventRuntime> runtime, std::shared_ptr<RpcClientStream> owner,
                   trevrpc_rpc_endpoint_v1 endpoint, trevrpc_rpc_call_config_v1 config,
                   Metadata metadata_owner, std::string service, std::string method,
-                  std::vector<std::byte> initial_message,
-                  RpcClientStream::OpenCallback callback)
-      : runtime_(std::move(runtime)), owner_(std::move(owner)), endpoint_(endpoint), config_(config),
-        metadata_owner_(std::move(metadata_owner)), service_(std::move(service)),
+                  std::vector<std::byte> initial_message, RpcClientStream::OpenCallback callback)
+      : runtime_(std::move(runtime)), owner_(std::move(owner)), endpoint_(endpoint),
+        config_(config), metadata_owner_(std::move(metadata_owner)), service_(std::move(service)),
         method_(std::move(method)), initial_message_(std::move(initial_message)),
         callback_(std::move(callback)) {
     metadata_.reserve(metadata_owner_.entries().size());
@@ -157,14 +155,14 @@ public:
         const auto now = std::chrono::steady_clock::now();
         if (error == -EALREADY && now < retry_deadline_) {
           auto self = shared_from_this();
-          auto scheduled = runtime_->schedule_at(
-              std::min(now + std::chrono::milliseconds(1), retry_deadline_),
-              [self = std::move(self)]() mutable {
-                auto started = self->start();
-                if (!started) {
-                  self->complete(Result<RpcEvent>(started.error()));
-                }
-              });
+          auto scheduled =
+              runtime_->schedule_at(std::min(now + std::chrono::milliseconds(1), retry_deadline_),
+                                    [self = std::move(self)]() mutable {
+                                      auto started = self->start();
+                                      if (!started) {
+                                        self->complete(Result<RpcEvent>(started.error()));
+                                      }
+                                    });
           return scheduled;
         }
       }
@@ -210,8 +208,7 @@ private:
         Error::runtime(-EIO, "RPC call failed to become ready");
     if (!result) {
       completion = result.error();
-    } else if (result.value().kind != TREVRPC_RPC_EVENT_CALL_READY ||
-               result.value().status != 0) {
+    } else if (result.value().kind != TREVRPC_RPC_EVENT_CALL_READY || result.value().status != 0) {
       completion = Error::runtime(result.value().status == 0 ? -EIO : result.value().status,
                                   "RPC call failed to become ready");
     } else {
@@ -425,8 +422,7 @@ RpcClientStream::open(const std::shared_ptr<ChannelCore>& channel, std::string_v
 
 Result<void> RpcClientStream::open_async(const std::shared_ptr<ChannelCore>& channel,
                                          std::string service, std::string method,
-                                         std::uint32_t kind,
-                                         std::vector<std::byte> initial_message,
+                                         std::uint32_t kind, std::vector<std::byte> initial_message,
                                          CallOptions options, OpenCallback callback) {
   if (!channel || !callback || !fits_u32(service.size()) || service.empty() ||
       !fits_u32(method.size()) || method.empty() || options.timeout.count() < 0 ||
@@ -494,9 +490,9 @@ Result<void> RpcClientStream::open_async(const std::shared_ptr<ChannelCore>& cha
     }
 
     const auto endpoint = generation.value().endpoint();
-    auto owner = std::make_shared<RpcClientStream>(
-        runtime, std::move(generation).value(), trevrpc_rpc_call_v1{}, trevrpc_rpc_stream_v1{}, 0,
-        std::move(cancellation), kind, false);
+    auto owner = std::make_shared<RpcClientStream>(runtime, std::move(generation).value(),
+                                                   trevrpc_rpc_call_v1{}, trevrpc_rpc_stream_v1{},
+                                                   0, std::move(cancellation), kind, false);
     auto state = std::make_shared<AsyncClientOpen>(
         runtime, std::move(owner), endpoint, config, std::move(options.metadata),
         std::move(service), std::move(method), std::move(initial_message), std::move(callback));
@@ -1163,8 +1159,8 @@ Result<void> RpcClientStream::start_send(std::span<const std::byte> body,
     }
     auto self = shared_from_this();
     auto subscribed = snapshot.runtime->subscribe_operation(
-        operation.value(), [self = std::move(self), callback = std::move(callback)](
-                               Result<RpcEvent> event) mutable {
+        operation.value(),
+        [self = std::move(self), callback = std::move(callback)](Result<RpcEvent> event) mutable {
           Result<void> result;
           if (!event) {
             result = event.error();
@@ -1234,8 +1230,8 @@ Result<void> RpcClientStream::start_finish_send(CompletionCallback callback) noe
     }
     auto self = shared_from_this();
     auto subscribed = snapshot.runtime->subscribe_operation(
-        operation.value(), [self = std::move(self), callback = std::move(callback)](
-                               Result<RpcEvent> event) mutable {
+        operation.value(),
+        [self = std::move(self), callback = std::move(callback)](Result<RpcEvent> event) mutable {
           Result<void> result;
           if (!event) {
             result = event.error();
@@ -1309,8 +1305,7 @@ std::optional<Result<StreamFrame>> RpcClientStream::finish_deferred_receive_term
       (!terminal_status_.has_value() || (terminal_status_->is_ok() && !unary_message_seen_))) {
     return Error::protobuf("unary RPC ended before response message");
   }
-  if (kind_ != TREVRPC_RPC_KIND_UNARY &&
-      (!status_seen_ || !terminal_status_.has_value())) {
+  if (kind_ != TREVRPC_RPC_KIND_UNARY && (!status_seen_ || !terminal_status_.has_value())) {
     return Error::protobuf("response stream ended before terminal status");
   }
 
@@ -1591,7 +1586,7 @@ void RpcClientStream::finish_async_receive(const ReceiveCallback& callback,
 }
 
 bool RpcClientStream::handle_async_receive_event(ReceiveCallback&,
-                                                  const RpcEvent& received) noexcept {
+                                                 const RpcEvent& received) noexcept {
   if (received.kind == TREVRPC_RPC_EVENT_STREAM_RECEIVE_FIN ||
       received.kind == TREVRPC_RPC_EVENT_CALL_FAILED ||
       received.kind == TREVRPC_RPC_EVENT_STREAM_CLOSED) {
@@ -1602,12 +1597,11 @@ bool RpcClientStream::handle_async_receive_event(ReceiveCallback&,
   return false;
 }
 
-void RpcClientStream::receive_async_step(NativeSnapshot native,
-                                         ReceiveCallback callback) noexcept {
+void RpcClientStream::receive_async_step(NativeSnapshot native, ReceiveCallback callback) noexcept {
   for (;;) {
     trevrpc_rpc_receive* raw_receive = nullptr;
-    const int error = trevrpc_rpc_stream_receive(native.runtime->native_handle(), native.stream,
-                                                 &raw_receive);
+    const int error =
+        trevrpc_rpc_stream_receive(native.runtime->native_handle(), native.stream, &raw_receive);
     if (error == 0) {
       auto frame = decode_receive(raw_receive);
       if (!frame) {
@@ -1654,8 +1648,8 @@ void RpcClientStream::receive_async_step(NativeSnapshot native,
           finish_async_receive(callback, subscribed.error());
         }
       } catch (...) {
-        finish_async_receive(
-            callback, Error::runtime(-ENOMEM, "failed to subscribe RPC async receive"));
+        finish_async_receive(callback,
+                             Error::runtime(-ENOMEM, "failed to subscribe RPC async receive"));
       }
       return;
     }

@@ -522,8 +522,10 @@ static int trevrpc_wire_request_decode_error(trevrpc_wire_request_values* reques
     return err;
 }
 
-int trevrpc_wire_decode_request_diagnostic(
-    const uint8_t* data, size_t len, trevrpc_wire_request_values* request, trevrpc_wire_request_diagnostic* diagnostic) {
+int trevrpc_wire_decode_request_diagnostic(const uint8_t* data,
+    size_t len,
+    trevrpc_wire_request_values* request,
+    trevrpc_wire_request_diagnostic* diagnostic) {
     if (diagnostic != NULL) {
         diagnostic->response_kind = TREVRPC_WIRE_REQUEST_KIND_UNKNOWN;
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_NONE;
@@ -645,10 +647,8 @@ int trevrpc_wire_decode_request_diagnostic(
     return 0;
 }
 
-static int trevrpc_internal_wire_decode_response_values(const uint8_t* data,
-    size_t len,
-    trevrpc_wire_response_values** out_response,
-    trevrpc_wire_diagnostic* diagnostic) {
+static int trevrpc_internal_wire_decode_response_values(
+    const uint8_t* data, size_t len, trevrpc_wire_response_values** out_response, trevrpc_wire_diagnostic* diagnostic) {
     if (diagnostic != NULL) {
         diagnostic->reason = TREVRPC_WIRE_DIAGNOSTIC_NONE;
     }

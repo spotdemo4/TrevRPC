@@ -24,19 +24,19 @@ namespace trevrpc::detail {
 class RpcClientStream final : public RpcCleanupWork,
                               public std::enable_shared_from_this<RpcClientStream> {
 public:
-  using OpenCallback =
-      std::function<void(Result<std::shared_ptr<RpcClientStream>>) >;
+  using OpenCallback = std::function<void(Result<std::shared_ptr<RpcClientStream>>)>;
   using CompletionCallback = std::function<void(Result<void>)>;
   using ReceiveCallback = std::function<void(Result<StreamFrame>)>;
 
   [[nodiscard]] static Result<std::shared_ptr<RpcClientStream>>
   open(const std::shared_ptr<ChannelCore>& channel, std::string_view service,
-       std::string_view method, std::uint32_t kind,
-       std::span<const std::byte> initial_message, const CallOptions& options);
-  [[nodiscard]] static Result<void>
-  open_async(const std::shared_ptr<ChannelCore>& channel, std::string service,
-             std::string method, std::uint32_t kind,
-             std::vector<std::byte> initial_message, CallOptions options, OpenCallback callback);
+       std::string_view method, std::uint32_t kind, std::span<const std::byte> initial_message,
+       const CallOptions& options);
+  [[nodiscard]] static Result<void> open_async(const std::shared_ptr<ChannelCore>& channel,
+                                               std::string service, std::string method,
+                                               std::uint32_t kind,
+                                               std::vector<std::byte> initial_message,
+                                               CallOptions options, OpenCallback callback);
 
   ~RpcClientStream() override;
   RpcClientStream(const RpcClientStream&) = delete;
@@ -119,11 +119,10 @@ private:
                                                    trevrpc_rpc_stream_v1 stream);
   void receive_async_step(NativeSnapshot native, ReceiveCallback callback) noexcept;
   [[nodiscard]] bool handle_async_receive_event(ReceiveCallback& callback,
-                                                 const RpcEvent& event) noexcept;
+                                                const RpcEvent& event) noexcept;
   void defer_receive_terminal(const RpcEvent& event) noexcept;
   [[nodiscard]] std::optional<Result<StreamFrame>> finish_deferred_receive_terminal();
-  void finish_async_receive(const ReceiveCallback& callback,
-                            Result<StreamFrame> result) noexcept;
+  void finish_async_receive(const ReceiveCallback& callback, Result<StreamFrame> result) noexcept;
   void note_event(const RpcEvent& event) noexcept;
   static void test_fail_next_receive_allocation() noexcept;
   static void test_fail_next_cleanup_owner_allocation() noexcept;

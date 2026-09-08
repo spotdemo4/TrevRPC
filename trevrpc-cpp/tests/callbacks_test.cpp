@@ -196,8 +196,7 @@ void test_callback_factories() {
   auto observer = std::make_shared<DropChannelOwner>();
   auto sink = std::make_shared<RecordingSink>();
 
-  auto authorizer_state =
-      trevrpc::detail::make_authorizer_state(authorizer, sink);
+  auto authorizer_state = trevrpc::detail::make_authorizer_state(authorizer, sink);
   auto metrics_state = trevrpc::detail::make_metrics_state(metrics, sink);
   auto logger_state = trevrpc::detail::make_logger_state(logger, sink);
   auto lifecycle_state = trevrpc::detail::make_channel_lifecycle_state(observer, sink);
@@ -215,8 +214,7 @@ void test_callback_factories() {
 void test_direct_dispatch_exception_containment() {
   auto server = make_server();
   assert((server.register_unary<EmptyMessage, EmptyMessage>(
-      "example.Service", "Method",
-      [](const trevrpc::CallContext&, const EmptyMessage&) {
+      "example.Service", "Method", [](const trevrpc::CallContext&, const EmptyMessage&) {
         return trevrpc::Result<EmptyMessage>(EmptyMessage{});
       })));
 
@@ -231,10 +229,12 @@ void test_direct_dispatch_exception_containment() {
 
   trevrpc::ChannelConfig channel_config;
   channel_config.skip_certificate_validation = true;
-  auto connected = trevrpc::Channel::connect("127.0.0.1", server.port().value(), channel_config, 5s);
+  auto connected =
+      trevrpc::Channel::connect("127.0.0.1", server.port().value(), channel_config, 5s);
   assert(connected);
   auto channel = std::move(connected).value();
-  auto response = channel->call_unary("example.Service", "Method", std::span<const std::byte>{}, {});
+  auto response =
+      channel->call_unary("example.Service", "Method", std::span<const std::byte>{}, {});
   assert(response);
   assert(response.value().status.code() == trevrpc::StatusCode::Internal);
   assert(sink->wait_for_count(4));
@@ -293,8 +293,7 @@ void test_server_final_owner_drop() {
     server_thread.join();
     assert(serve_result);
   }
-  assert(trevrpc::detail::drain_lifecycle_reaper_until(
-      std::chrono::steady_clock::now() + 5s));
+  assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() + 5s));
 }
 
 void test_channel_final_owner_drop_from_callback() {

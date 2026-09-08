@@ -4461,9 +4461,8 @@ static int h3_encode_data_frame(uint8_t* frame, size_t frame_len, void* context)
     size_t expected_len;
     if (frame == NULL || encode == NULL || (encode->body == NULL && encode->body_len != 0))
         return -EINVAL;
-    if (!encode->webtransport &&
-        (trevrpc_quic_varint_size(TREV_H3_FRAME_DATA, &type_len) != 0 ||
-            trevrpc_quic_varint_size(encode->body_len + 4, &length_len) != 0))
+    if (!encode->webtransport && (trevrpc_quic_varint_size(TREV_H3_FRAME_DATA, &type_len) != 0 ||
+                                     trevrpc_quic_varint_size(encode->body_len + 4, &length_len) != 0))
         return -EOVERFLOW;
     if (encode->body_len > SIZE_MAX - type_len - length_len - 4u)
         return -EOVERFLOW;
@@ -4472,10 +4471,7 @@ static int h3_encode_data_frame(uint8_t* frame, size_t frame_len, void* context)
         return -EINVAL;
     if (!encode->webtransport) {
         if (trevrpc_quic_varint_write(frame, frame_len, TREV_H3_FRAME_DATA, &type_len) != 0 ||
-            trevrpc_quic_varint_write(frame + type_len,
-                frame_len - type_len,
-                encode->body_len + 4,
-                &length_len) != 0)
+            trevrpc_quic_varint_write(frame + type_len, frame_len - type_len, encode->body_len + 4, &length_len) != 0)
             return -EOVERFLOW;
     }
     frame[type_len + length_len] = (uint8_t)(encode->body_len >> 24);

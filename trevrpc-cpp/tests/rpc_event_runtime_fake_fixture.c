@@ -219,17 +219,17 @@ int trevrpc_cpp_rpc_fake_push_last_send_complete(trevrpc_cpp_rpc_fake_fixture* f
 }
 
 int trevrpc_cpp_rpc_fake_push_last_server_send_complete(trevrpc_cpp_rpc_fake_fixture* fixture,
-                                                       bool second_stream) {
+                                                        bool second_stream) {
   fake_transport* fake = fixture_transport(fixture);
   uint64_t operation_id = atomic_load_explicit(&fake->last_send_operation_id, memory_order_acquire);
   if (operation_id == 0) {
     return -EAGAIN;
   }
-  return fake_push_operation_event(
-      fake, TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE,
-      TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
-      second_stream ? fake_second_stream_handle : fake_stream_handle, fake_listener_handle,
-      operation_id);
+  return fake_push_operation_event(fake, TREVRPC_RPC_TRANSPORT_EVENT_SEND_COMPLETE,
+                                   TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL |
+                                       TREVRPC_RPC_TRANSPORT_EVENT_FLAG_SERVER,
+                                   second_stream ? fake_second_stream_handle : fake_stream_handle,
+                                   fake_listener_handle, operation_id);
 }
 
 int trevrpc_cpp_rpc_fake_push_receive(trevrpc_cpp_rpc_fake_fixture* fixture, const uint8_t* data,
@@ -250,9 +250,9 @@ int trevrpc_cpp_rpc_fake_push_response_message(trevrpc_cpp_rpc_fake_fixture* fix
     return -EINVAL;
   }
   fake = fixture_transport(fixture);
-  result =
-      trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE, TREVRPC_RPC_STATUS_OK, NULL,
-                                       0, data, data_len, NULL, 1024u * 1024u, &frame, &frame_len);
+  result = trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE,
+                                            TREVRPC_RPC_STATUS_OK, NULL, 0, data, data_len, NULL,
+                                            1024u * 1024u, &frame, &frame_len);
   if (result != 0) {
     return result;
   }

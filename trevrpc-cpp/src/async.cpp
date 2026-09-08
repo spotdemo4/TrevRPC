@@ -355,9 +355,7 @@ private:
   std::shared_ptr<InlineExecutorState> state_;
 };
 
-std::shared_ptr<Executor> make_inline_executor() {
-  return std::make_shared<InlineExecutor>();
-}
+std::shared_ptr<Executor> make_inline_executor() { return std::make_shared<InlineExecutor>(); }
 
 } // namespace trevrpc::detail
 
@@ -452,8 +450,8 @@ AsyncRuntime::create(std::shared_ptr<Executor> continuation_executor,
     return Error::runtime(-EINVAL, "invalid asynchronous runtime options");
   }
   try {
-    auto state = std::make_shared<detail::AsyncRuntimeState>(std::move(continuation_executor),
-                                                             options);
+    auto state =
+        std::make_shared<detail::AsyncRuntimeState>(std::move(continuation_executor), options);
     return std::shared_ptr<AsyncRuntime>(new AsyncRuntime(std::move(state)));
   } catch (...) {
     return Error::runtime(-ENOMEM, "failed to create asynchronous runtime");
@@ -576,8 +574,7 @@ void operation_close(const std::shared_ptr<OperationState>& operation) noexcept 
 Result<void> AsyncRegistrationAccess::register_rpc_route(
     Server& server, std::string_view service, std::string_view method, std::uint32_t kind,
     std::function<void(std::shared_ptr<ServerCallState>)> callback,
-    const std::shared_ptr<void>& route,
-    const std::shared_ptr<AsyncServerScopeControl>& scope) {
+    const std::shared_ptr<void>& route, const std::shared_ptr<AsyncServerScopeControl>& scope) {
   if (!server.state_) {
     return Error::runtime(-EINVAL, "server is moved from");
   }
@@ -610,7 +607,7 @@ public:
       return;
     }
     std::vector<std::byte> body(detail::server_initial_message(call_state).begin(),
-                                 detail::server_initial_message(call_state).end());
+                                detail::server_initial_message(call_state).end());
     auto context = detail::server_call_context(call_state);
     auto scope_id = scope_->add(call_state);
     if (!scope_id) {
@@ -623,8 +620,8 @@ public:
                       body = std::move(body)]() mutable {
         auto task = self->run(std::move(state), std::move(context), std::move(body));
         task.associate_executor(self->runtime_->continuation_executor());
-        auto started = spawn(
-            std::move(task), [self, scope_id](const TaskCompletion<void>& completion) {
+        auto started =
+            spawn(std::move(task), [self, scope_id](const TaskCompletion<void>& completion) {
               if (completion.exception) {
                 self->scope_->request_stop(ServerStopReason::LocalClose);
               }

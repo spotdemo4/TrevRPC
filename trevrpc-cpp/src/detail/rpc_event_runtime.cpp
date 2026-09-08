@@ -66,8 +66,7 @@ void abandon_cleanup_owner(const std::shared_ptr<RpcCleanupWork>& work) noexcept
 
 class UnadoptedRuntimeReaper final {
 public:
-  UnadoptedRuntimeReaper()
-      : worker_([this](std::stop_token stop) { run(std::move(stop)); }) {}
+  UnadoptedRuntimeReaper() : worker_([this](std::stop_token stop) { run(std::move(stop)); }) {}
 
   ~UnadoptedRuntimeReaper() {
     worker_.request_stop();
@@ -1118,9 +1117,8 @@ struct RpcEventRuntime::SharedState final {
       if (incoming_count == 0 && driver_error != 0) {
         return Error::runtime(driver_error, "RPC event driver failed");
       }
-      if (incoming_count == 0 &&
-          (incoming_stopped || lifecycle == Lifecycle::Stopped ||
-           lifecycle == Lifecycle::Released)) {
+      if (incoming_count == 0 && (incoming_stopped || lifecycle == Lifecycle::Stopped ||
+                                  lifecycle == Lifecycle::Released)) {
         return Error::runtime(-ESHUTDOWN, "RPC incoming-call delivery is stopped");
       }
       if (incoming_count == 0 && blocking_wait_forbidden_locked()) {
@@ -1198,9 +1196,9 @@ struct RpcEventRuntime::SharedState final {
     if (!operation) {
       return operation.error();
     }
-    const int close_error = trevrpc_rpc_call_close(
-        native, incoming.call, operation.value(), TREVRPC_RPC_CLOSE_FLAG_ABORT,
-        TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED);
+    const int close_error =
+        trevrpc_rpc_call_close(native, incoming.call, operation.value(),
+                               TREVRPC_RPC_CLOSE_FLAG_ABORT, TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED);
     if (close_error != 0) {
       reject_operation(operation.value());
       return Error::runtime(close_error, "failed to close rejected incoming RPC call");
@@ -1236,9 +1234,8 @@ struct RpcEventRuntime::SharedState final {
       if (driver_error != 0) {
         return Error::runtime(driver_error, "RPC event driver failed");
       }
-      if (incoming_count == 0 &&
-          (incoming_stopped || lifecycle == Lifecycle::Stopped ||
-           lifecycle == Lifecycle::Released)) {
+      if (incoming_count == 0 && (incoming_stopped || lifecycle == Lifecycle::Stopped ||
+                                  lifecycle == Lifecycle::Released)) {
         return Error::runtime(-ESHUTDOWN, "RPC incoming-call delivery is stopped");
       }
       incoming_callback = std::move(callback);
@@ -1385,11 +1382,9 @@ struct RpcEventRuntime::SharedState final {
       std::lock_guard lock(mutex);
       operation_id = next_rejected_operation_id_locked();
     }
-    const int error = trevrpc_rpc_call_close(runtime,
-                                             info.call,
-                                             operation_id,
-                                             TREVRPC_RPC_CLOSE_FLAG_ABORT,
-                                             TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED);
+    const int error =
+        trevrpc_rpc_call_close(runtime, info.call, operation_id, TREVRPC_RPC_CLOSE_FLAG_ABORT,
+                               TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED);
     if (error == 0 || error == -EALREADY || error == -ESTALE || error == -ESHUTDOWN) {
       return 0;
     }
@@ -2456,8 +2451,8 @@ struct RpcEventRuntime::SharedState final {
         // close/release its endpoint and will then perform runtime shutdown.
         // Only an explicit runtime abandonment may initiate an automatic
         // close while the runtime is still open.
-        need_abandon_close = abandon_requested && lifecycle == Lifecycle::Open &&
-                             !cleanup_abandon_requested;
+        need_abandon_close =
+            abandon_requested && lifecycle == Lifecycle::Open && !cleanup_abandon_requested;
         need_failure_close = !need_abandon_close && driver_error != 0 &&
                              lifecycle == Lifecycle::Open &&
                              (!strict_attempt || strict_attempt->completed);

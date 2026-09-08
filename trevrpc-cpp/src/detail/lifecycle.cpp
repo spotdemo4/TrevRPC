@@ -445,8 +445,8 @@ void abandon_server(std::shared_ptr<ServerState> state) noexcept {
         return;
       }
       const int error = report ? -ETIMEDOUT : report.error().code();
-      if (error != -EAGAIN && error != -EBUSY && error != -EDEADLK &&
-          error != -ETIMEDOUT && error != -ESHUTDOWN) {
+      if (error != -EAGAIN && error != -EBUSY && error != -EDEADLK && error != -ETIMEDOUT &&
+          error != -ESHUTDOWN) {
         std::terminate();
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -467,9 +467,7 @@ ChannelCallbackContextGuard::ChannelCallbackContextGuard() noexcept
   in_channel_callback = true;
 }
 
-ChannelCallbackContextGuard::~ChannelCallbackContextGuard() {
-  in_channel_callback = previous_;
-}
+ChannelCallbackContextGuard::~ChannelCallbackContextGuard() { in_channel_callback = previous_; }
 
 bool running_in_channel_callback() noexcept { return in_channel_callback; }
 

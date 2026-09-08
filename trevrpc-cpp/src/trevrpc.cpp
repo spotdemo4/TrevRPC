@@ -123,19 +123,16 @@ std::optional<std::chrono::nanoseconds> CallContext::time_remaining() const noex
   if (!has_deadline()) {
     return std::nullopt;
   }
-  constexpr auto maximum = static_cast<std::uint64_t>(
-      std::chrono::nanoseconds::max().count());
-  return std::chrono::nanoseconds(
-      static_cast<std::chrono::nanoseconds::rep>(
-          std::min(rpc_context_.time_remaining_nanos, maximum)));
+  constexpr auto maximum = static_cast<std::uint64_t>(std::chrono::nanoseconds::max().count());
+  return std::chrono::nanoseconds(static_cast<std::chrono::nanoseconds::rep>(
+      std::min(rpc_context_.time_remaining_nanos, maximum)));
 }
 
 namespace detail {
 
 ClientStream::~ClientStream() { close(); }
 
-ClientStream::ClientStream(ClientStream&& other) noexcept
-    : stream_(std::move(other.stream_)) {}
+ClientStream::ClientStream(ClientStream&& other) noexcept : stream_(std::move(other.stream_)) {}
 
 ClientStream& ClientStream::operator=(ClientStream&& other) noexcept {
   if (this != &other) {
@@ -284,8 +281,8 @@ Result<detail::ByteResponse> Channel::call_unary(std::string_view service, std::
   if (!core) {
     return Error::runtime(-EINVAL, "channel must not be null");
   }
-  auto stream = detail::RpcClientStream::open(core, service, method, TREVRPC_RPC_KIND_UNARY, body,
-                                              options);
+  auto stream =
+      detail::RpcClientStream::open(core, service, method, TREVRPC_RPC_KIND_UNARY, body, options);
   if (!stream) {
     return stream.error();
   }
@@ -345,8 +342,7 @@ Server& Server::operator=(Server&& other) noexcept {
 
 Result<Server> Server::listen(const ServerConfig& config) {
   if (config.enable_http3 && !config.webtransport_path.empty()) {
-    return Error::runtime(-ENOTSUP,
-                          "server cannot combine HTTP/3 and WebTransport listeners");
+    return Error::runtime(-ENOTSUP, "server cannot combine HTTP/3 and WebTransport listeners");
   }
   if (!config.enable_http3 && !config.http3_path.empty()) {
     return Error::runtime(-EINVAL, "HTTP/3 path requires HTTP/3 to be enabled");
@@ -437,9 +433,9 @@ Result<Server> Server::listen(const ServerConfig& config) {
   endpoint_config.path = config.webtransport_path.empty()
                              ? (config.http3_path.empty() ? nullptr : config.http3_path.data())
                              : config.webtransport_path.data();
-  endpoint_config.path_len = static_cast<std::uint32_t>(
-      config.webtransport_path.empty() ? config.http3_path.size()
-                                       : config.webtransport_path.size());
+  endpoint_config.path_len = static_cast<std::uint32_t>(config.webtransport_path.empty()
+                                                            ? config.http3_path.size()
+                                                            : config.webtransport_path.size());
   endpoint_config.origin =
       config.webtransport_origin.empty() ? nullptr : config.webtransport_origin.data();
   endpoint_config.origin_len = static_cast<std::uint32_t>(config.webtransport_origin.size());
@@ -484,7 +480,7 @@ Result<Server> Server::listen(const ServerConfig& config) {
   }
   trevrpc_rpc_endpoint_v1 endpoint{};
   error = trevrpc_rpc_msquic_endpoint_start_v1(rpc_runtime->native_handle(), &endpoint_config,
-                                                operation.value(), &endpoint);
+                                               operation.value(), &endpoint);
   if (error != 0) {
     rpc_runtime->reject_operation(operation.value());
     (void)rpc_runtime->shutdown();
@@ -568,8 +564,7 @@ Result<void> Server::clear_logger() {
 }
 
 Result<void> Server::serve() {
-  return state_ ? state_->freeze()
-                : Result<void>{Error::runtime(-EINVAL, "server is moved from")};
+  return state_ ? state_->freeze() : Result<void>{Error::runtime(-EINVAL, "server is moved from")};
 }
 
 Result<void> Server::request_stop() {
@@ -618,8 +613,8 @@ Result<void> Server::register_rpc_route(std::string_view service, std::string_vi
   return state_->register_rpc_route(service, method, kind, std::move(callback), route);
 }
 
-void Server::respond(const std::shared_ptr<detail::ServerCallState>& state,
-                     const Status& status, std::span<const std::byte> body) noexcept {
+void Server::respond(const std::shared_ptr<detail::ServerCallState>& state, const Status& status,
+                     std::span<const std::byte> body) noexcept {
   if (!state) {
     return;
   }

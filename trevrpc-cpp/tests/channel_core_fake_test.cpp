@@ -129,35 +129,36 @@ std::shared_ptr<ChannelCore> make_channel(TestRuntime& test,
                                           std::shared_ptr<StarterControl> control,
                                           ChannelCoreConfig config = test_config(),
                                           ChannelCore::Backoff backoff = {}) {
-  auto created =
-      ChannelCore::create(test.runtime, std::move(config),
-                          [fake = test.fake, control = std::move(control)](
-                              trevrpc_rpc_runtime* runtime, std::uint64_t operation_id,
-                              trevrpc_rpc_endpoint_v1* endpoint) {
-                            int injected_error = 0;
-                            bool throw_now = false;
-                            {
-                              std::lock_guard lock(control->mutex);
-                              ++control->calls;
-                              injected_error = std::exchange(control->next_error, 0);
-                              throw_now = std::exchange(control->throw_next, false);
-                              control->condition.notify_all();
-                            }
-                            if (throw_now) {
-                              throw std::bad_alloc();
-                            }
-                            if (injected_error != 0) {
-                              return injected_error;
-                            }
-                            const int error = trevrpc_cpp_rpc_fake_start_endpoint(
-                                fake, runtime, TREVRPC_RPC_ENDPOINT_CLIENT, operation_id, endpoint);
-                            if (error == 0) {
-                              std::lock_guard lock(control->mutex);
-                              control->endpoints.push_back(*endpoint);
-                              control->condition.notify_all();
-                            }
-                            return error;
-                          }, std::move(backoff));
+  auto created = ChannelCore::create(
+      test.runtime, std::move(config),
+      [fake = test.fake, control = std::move(control)](trevrpc_rpc_runtime* runtime,
+                                                       std::uint64_t operation_id,
+                                                       trevrpc_rpc_endpoint_v1* endpoint) {
+        int injected_error = 0;
+        bool throw_now = false;
+        {
+          std::lock_guard lock(control->mutex);
+          ++control->calls;
+          injected_error = std::exchange(control->next_error, 0);
+          throw_now = std::exchange(control->throw_next, false);
+          control->condition.notify_all();
+        }
+        if (throw_now) {
+          throw std::bad_alloc();
+        }
+        if (injected_error != 0) {
+          return injected_error;
+        }
+        const int error = trevrpc_cpp_rpc_fake_start_endpoint(
+            fake, runtime, TREVRPC_RPC_ENDPOINT_CLIENT, operation_id, endpoint);
+        if (error == 0) {
+          std::lock_guard lock(control->mutex);
+          control->endpoints.push_back(*endpoint);
+          control->condition.notify_all();
+        }
+        return error;
+      },
+      std::move(backoff));
   assert(created);
   return std::move(created).value();
 }

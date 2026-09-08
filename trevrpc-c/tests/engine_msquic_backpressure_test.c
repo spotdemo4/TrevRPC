@@ -1115,7 +1115,8 @@ static void test_connection_setup_failure_is_terminal_without_engine_failure(voi
     adapter_listener* listener = fixture_add_listener(&fixture);
     FakeMsQuic.configure_status = QUIC_STATUS_INTERNAL_ERROR;
     assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 2u) == QUIC_STATUS_ABORTED);
-    adapter_connection* connection = (adapter_connection*)fixture.adapter->slots[fixture.adapter->connection_begin].object;
+    adapter_connection* connection =
+        (adapter_connection*)fixture.adapter->slots[fixture.adapter->connection_begin].object;
     assert(connection != NULL);
     assert(FakeMsQuic.connection_configure_calls == 1);
     assert(FakeMsQuic.connection_shutdown_calls == 1);
@@ -1155,7 +1156,8 @@ static void test_close_during_configuration_defers_native_shutdown(void) {
     FakeMsQuic.adapter = fixture.adapter;
     FakeMsQuic.close_during_configuration = true;
     assert(fixture_new_connection(&fixture, listener, TEST_CONNECTION_HANDLE_BASE + 7u) == QUIC_STATUS_SUCCESS);
-    adapter_connection* connection = (adapter_connection*)fixture.adapter->slots[fixture.adapter->connection_begin].object;
+    adapter_connection* connection =
+        (adapter_connection*)fixture.adapter->slots[fixture.adapter->connection_begin].object;
     assert(connection != NULL);
     assert(FakeMsQuic.close_triggered);
     assert(FakeMsQuic.connection_configure_calls == 1);

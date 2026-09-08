@@ -575,8 +575,8 @@ int fake_get_diagnostics(trevrpc_rpc_transport* transport, trevrpc_rpc_transport
     diagnostics->ordinary_queue_depth = 0;
     diagnostics->live_listeners = fake->listener_closed ? 0 : 1;
     diagnostics->live_connections = fake->connection_closed ? 0 : 1;
-    diagnostics->live_streams = (fake->stream_closed ? 0 : 1) +
-                                 (fake->second_stream_created && !fake->second_stream_closed ? 1 : 0);
+    diagnostics->live_streams =
+        (fake->stream_closed ? 0 : 1) + (fake->second_stream_created && !fake->second_stream_closed ? 1 : 0);
     pthread_mutex_unlock(&fake->mutex);
     return 0;
 }
@@ -770,7 +770,8 @@ int fake_stream_abort(trevrpc_rpc_transport* transport, trevrpc_rpc_transport_ha
         return fake->stream_abort_result;
     }
     pthread_mutex_lock(&fake->mutex);
-    stream_closed = fake_handle_equal(stream, fake_second_stream_handle) ? &fake->second_stream_closed : &fake->stream_closed;
+    stream_closed =
+        fake_handle_equal(stream, fake_second_stream_handle) ? &fake->second_stream_closed : &fake->stream_closed;
     if (*stream_closed) {
         pthread_mutex_unlock(&fake->mutex);
         return -EALREADY;

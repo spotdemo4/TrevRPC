@@ -736,19 +736,18 @@ struct ChannelCore::SharedState final
     Result<void> consumed = Error::runtime(-ENOMEM);
     try {
       auto weak = weak_from_this();
-      consumed =
-          runtime->subscribe_operation(
-              operation.value(), [weak, request_generation](Result<RpcEvent> result) noexcept {
-                if (auto state = weak.lock()) {
-                  std::lock_guard lock(state->mutex);
-                  if (!result) {
-                    state->record_close_failure_locked(result.error().code(), request_generation);
-                  } else if (result.value().status != 0) {
-                    state->record_close_failure_locked(result.value().status, request_generation);
-                  }
-                  state->condition.notify_all();
-                }
-              });
+      consumed = runtime->subscribe_operation(
+          operation.value(), [weak, request_generation](Result<RpcEvent> result) noexcept {
+            if (auto state = weak.lock()) {
+              std::lock_guard lock(state->mutex);
+              if (!result) {
+                state->record_close_failure_locked(result.error().code(), request_generation);
+              } else if (result.value().status != 0) {
+                state->record_close_failure_locked(result.value().status, request_generation);
+              }
+              state->condition.notify_all();
+            }
+          });
     } catch (...) {
       consumed = Error::runtime(-ENOMEM, "failed to allocate RPC close callback");
     }
@@ -963,7 +962,8 @@ struct ChannelCore::SharedState final
         // full while deferred stream cleanup is still being drained. Retry
         // those submission errors without publishing a premature channel
         // failure; unlike -EBUSY, they are not a strict-shutdown result.
-        if (!result && (result.error().code() == -EAGAIN || result.error().code() == -EINPROGRESS)) {
+        if (!result &&
+            (result.error().code() == -EAGAIN || result.error().code() == -EINPROGRESS)) {
           std::lock_guard lock(mutex);
           if (shutdown_attempt++ < 2) {
             shutdown_retry_error = result.error().code();

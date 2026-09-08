@@ -849,7 +849,8 @@ public:
                                             Handler handler) {
     return register_rpc_route(
         service, method, TREVRPC_RPC_KIND_UNARY,
-        [handler = std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
+        [handler =
+             std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
           CallContext context = detail::server_call_context(state);
           auto decoded = detail::parse<Request>(detail::server_initial_message(state),
                                                 "failed to parse unary request");
@@ -867,8 +868,7 @@ public:
             respond(state, Status::internal(body.error().message()), {});
             return;
           }
-          respond(state,
-                  Status(StatusCode::Ok, {}, detail::response_metadata(response.value())),
+          respond(state, Status(StatusCode::Ok, {}, detail::response_metadata(response.value())),
                   body.value());
         });
   }
@@ -878,7 +878,8 @@ public:
                                                        std::string_view method, Handler handler) {
     return register_rpc_route(
         service, method, TREVRPC_RPC_KIND_SERVER_STREAMING,
-        [handler = std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
+        [handler =
+             std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
           CallContext context = detail::server_call_context(state);
           auto decoded = detail::parse<Request>(detail::server_initial_message(state),
                                                 "failed to parse server-streaming request");
@@ -896,7 +897,8 @@ public:
                                                        std::string_view method, Handler handler) {
     return register_rpc_route(
         service, method, TREVRPC_RPC_KIND_CLIENT_STREAMING,
-        [handler = std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
+        [handler =
+             std::move(handler)](const std::shared_ptr<detail::ServerCallState>& state) mutable {
           CallContext context = detail::server_call_context(state);
           ServerReader<Request> reader(state);
           auto response = handler(context, reader);
@@ -909,8 +911,7 @@ public:
             finish(state, Status::internal(body.error().message()));
             return;
           }
-          respond(state,
-                  Status(StatusCode::Ok, {}, detail::response_metadata(response.value())),
+          respond(state, Status(StatusCode::Ok, {}, detail::response_metadata(response.value())),
                   body.value());
         });
   }
@@ -920,12 +921,12 @@ public:
                                                               std::string_view method,
                                                               Handler handler) {
     return register_rpc_route(service, method, TREVRPC_RPC_KIND_BIDIRECTIONAL_STREAMING,
-                          [handler = std::move(handler)](
-                              const std::shared_ptr<detail::ServerCallState>& state) mutable {
-                            CallContext context = detail::server_call_context(state);
-                            ServerReaderWriter<Request, Response> stream(state);
-                            finish(state, handler(context, stream));
-                          });
+                              [handler = std::move(handler)](
+                                  const std::shared_ptr<detail::ServerCallState>& state) mutable {
+                                CallContext context = detail::server_call_context(state);
+                                ServerReaderWriter<Request, Response> stream(state);
+                                finish(state, handler(context, stream));
+                              });
   }
 
 private:
@@ -933,11 +934,10 @@ private:
   using RpcHandler = std::function<void(std::shared_ptr<detail::ServerCallState>)>;
 
   explicit Server(std::shared_ptr<detail::ServerState> state) noexcept;
-  [[nodiscard]] Result<void>
-  register_rpc_route(std::string_view service, std::string_view method, std::uint32_t kind,
-                     RpcHandler handler);
-  static void respond(const std::shared_ptr<detail::ServerCallState>& state,
-                      const Status& status, std::span<const std::byte> body) noexcept;
+  [[nodiscard]] Result<void> register_rpc_route(std::string_view service, std::string_view method,
+                                                std::uint32_t kind, RpcHandler handler);
+  static void respond(const std::shared_ptr<detail::ServerCallState>& state, const Status& status,
+                      std::span<const std::byte> body) noexcept;
   static void finish(const std::shared_ptr<detail::ServerCallState>& state,
                      const Status& status) noexcept;
 

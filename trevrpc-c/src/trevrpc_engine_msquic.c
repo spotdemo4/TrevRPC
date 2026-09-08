@@ -3302,9 +3302,9 @@ static void adapter_scheduler_drain(msquic_provider* adapter) {
                 stream = (adapter_stream*)object;
                 readiness_flush = stream->readiness_flush_in_progress;
                 pthread_mutex_lock(&stream->mutex);
-                bool retry = readiness_flush ||
-                             (stream->readable_retry_pending && stream->readable_pending &&
-                              stream->readable_published_epoch == 0 && stream->receive_head != NULL);
+                bool retry =
+                    readiness_flush || (stream->readable_retry_pending && stream->readable_pending &&
+                                           stream->readable_published_epoch == 0 && stream->receive_head != NULL);
                 pthread_mutex_unlock(&stream->mutex);
                 if (retry) {
                     object->active_operations++;
@@ -3608,7 +3608,8 @@ static int adapter_adopt_accepted_connection(msquic_provider* adapter,
     if (QUIC_SUCCEEDED(configure_status)) {
         pthread_mutex_lock(&adapter->mutex);
         connection->configuration_set = true;
-        bool shutdown_requested = close_requested || atomic_load_explicit(&connection->base.closing, memory_order_acquire);
+        bool shutdown_requested =
+            close_requested || atomic_load_explicit(&connection->base.closing, memory_order_acquire);
         pthread_mutex_unlock(&adapter->mutex);
         if (shutdown_requested)
             adapter->api->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
